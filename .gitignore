@@ -1,0 +1,98 @@
+# Build artifacts
+build/
+cmake-build-*/
+.cache/
+python/
+*.o
+*.so
+*.a
+*.dylib
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+dist/
+eggs/
+.eggs/
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Python environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# IDE
+.vscode/
+.clangd
+CMakePresets.json
+.idea/
+*.swp
+*.swo
+*~
+.project
+.cproject
+.settings/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Documentation
+docs/_build/
+site/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CUDA
+*.cubin
+*.fatbin
+*.ptx
+
+# Compiled extensions
+python/oasr/_C*.so
+python/oasr/*.so
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Third party (if not committed)
+third_party/cutlass/
+third_party/pybind11/
+
+# Model weights and data
+*.bin
+*.onnx
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+data/
+models/
+checkpoints/
+
+# Logs
+*.log
+logs/
