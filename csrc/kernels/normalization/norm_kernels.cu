@@ -2,55 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "kernels/normalization/norm_kernels.h"
-#include "common/cuda_utils.h"
+#include "kernels/reduction/allreduce.h"
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <algorithm>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cudnn.h>
+#include <stdexcept>
 
 namespace oasr {
 namespace kernels {
 
 // =============================================================================
-// Constants and helpers
+// Constants
 // =============================================================================
 
-constexpr int WARP_SIZE = 32;
 constexpr int MAX_THREADS_PER_BLOCK = 1024;
-
-// Warp-level reduction for sum
-template <typename T>
-__device__ __forceinline__ T warpReduceSum(T val) {
-    #pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        val += __shfl_xor_sync(0xffffffff, val, offset);
-    }
-    return val;
-}
-
-// Block-level reduction for sum
-template <typename T>
-__device__ __forceinline__ T blockReduceSum(T val) {
-    __shared__ T shared[32];  // One slot per warp
-    
-    int lane = threadIdx.x % WARP_SIZE;
-    int wid = threadIdx.x / WARP_SIZE;
-    
-    val = warpReduceSum(val);
-    
-    if (lane == 0) {
-        shared[wid] = val;
-    }
-    __syncthreads();
-    
-    // Only first warp does the final reduction
-    val = (threadIdx.x < blockDim.x / WARP_SIZE) ? shared[lane] : T(0);
-    if (wid == 0) {
-        val = warpReduceSum(val);
-    }
-    
-    return val;
-}
 
 // =============================================================================
 // LayerNorm Kernels
