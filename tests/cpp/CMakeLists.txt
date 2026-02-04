@@ -1,8 +1,9 @@
 # Tests CMake configuration
 
-# Test sources - only norm_kernels for now
+# Test sources
 set(TEST_SOURCES
     test_norm_kernels.cu
+    test_gemm.cu
     # TODO: Add these when ready
     # test_tensor.cpp
     # test_attention.cpp

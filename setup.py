@@ -58,12 +58,6 @@ class CMakeBuild(build_ext):
         cuda_arch = os.environ.get("CUDA_ARCHITECTURES", "70;75;80;86;89;90")
         cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}")
         
-        # Optional features
-        if os.environ.get("OASR_USE_CUTLASS", "0") == "1":
-            cmake_args.append("-DUSE_CUTLASS=ON")
-        else:
-            cmake_args.append("-DUSE_CUTLASS=OFF")
-        
         if os.environ.get("OASR_USE_FLASH_ATTENTION", "0") == "1":
             cmake_args.append("-DUSE_FLASH_ATTENTION=ON")
         else:

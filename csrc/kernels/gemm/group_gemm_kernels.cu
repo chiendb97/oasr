@@ -86,19 +86,21 @@ struct CutlassGroupGemmSM80 {
     {
         typename EpilogueOutputOp::Params epilogue_params(1.0f, 0.0f);
         
+        // CUTLASS Arguments expects non-const pointer types (Element* **); kernel only reads A/B/ld*
         typename GemmGrouped::Arguments args(
-            reinterpret_cast<cutlass::gemm::GemmCoord*>(problems),
+            problems,
             num_problems,
             4,  // threadblock count
             epilogue_params,
-            A_array,
-            B_array,
-            D_array,
-            D_array,
-            lda_array,
-            ldb_array,
-            ldd_array,
-            ldd_array
+            const_cast<DType**>(A_array),
+            const_cast<DType**>(B_array),
+            const_cast<DType**>(D_array),
+            const_cast<DType**>(D_array),
+            const_cast<int64_t*>(lda_array),
+            const_cast<int64_t*>(ldb_array),
+            const_cast<int64_t*>(ldd_array),
+            const_cast<int64_t*>(ldd_array),
+            nullptr  // host_problem_sizes (optional)
         );
         
         GemmGrouped gemm;
@@ -125,24 +127,35 @@ GemmStatus invokeGroupGemm(const GroupGemmParams& params) {
     if (params.problems == nullptr || params.num_problems <= 0) {
         return GemmStatus::INVALID_ARGUMENT;
     }
-    if (params.A_array == nullptr || params.B_array == nullptr || 
+    if (params.A_array == nullptr || params.B_array == nullptr ||
         params.D_array == nullptr) {
         return GemmStatus::INVALID_ARGUMENT;
     }
-    
-    // Allocate device memory for problem descriptors
+
+    // Allocate device memory for problem descriptors (CUTLASS GemmCoord)
     cutlass::DeviceAllocation<cutlass::gemm::GemmCoord> problems_device(params.num_problems);
-    
-    // Convert GemmProblemDesc to cutlass::gemm::GemmCoord on host, then copy
+
+    // params.problems may be on device (e.g. from Python tensor.data_ptr()); copy to host first
+    std::vector<GemmProblemDesc> problems_desc_host(params.num_problems);
+    OASR_CUDA_CHECK(cudaMemcpyAsync(
+        problems_desc_host.data(),
+        params.problems,
+        params.num_problems * sizeof(GemmProblemDesc),
+        cudaMemcpyDeviceToHost,
+        params.stream
+    ));
+    OASR_CUDA_CHECK(cudaStreamSynchronize(params.stream));
+
+    // Convert GemmProblemDesc to cutlass::gemm::GemmCoord
     std::vector<cutlass::gemm::GemmCoord> problems_host(params.num_problems);
     for (int i = 0; i < params.num_problems; ++i) {
         problems_host[i] = cutlass::gemm::GemmCoord(
-            params.problems[i].M,
-            params.problems[i].N,
-            params.problems[i].K
+            problems_desc_host[i].M,
+            problems_desc_host[i].N,
+            problems_desc_host[i].K
         );
     }
-    
+
     OASR_CUDA_CHECK(cudaMemcpyAsync(
         problems_device.get(),
         problems_host.data(),
