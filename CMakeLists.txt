@@ -8,8 +8,7 @@ project(oasr LANGUAGES CXX CUDA)
 option(BUILD_PYTHON "Build Python bindings" ON)
 option(BUILD_TESTS "Build unit tests" OFF)  # Disabled for now - enable when ready
 option(BUILD_EXAMPLES "Build examples" OFF)
-option(USE_CUTLASS "Use CUTLASS for GEMM operations" OFF)  # Disabled for now - enable when needed
-option(USE_FLASH_ATTENTION "Use FlashAttention kernels" ON)
+option(USE_FLASH_ATTENTION "Use FlashAttention kernels" OFF)
 option(ENABLE_FP16 "Enable FP16 support" ON)
 option(ENABLE_BF16 "Enable BF16 support" ON)
 
@@ -35,6 +34,9 @@ message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 # CUDA configuration
 # =============================================================================
 find_package(CUDAToolkit REQUIRED)
+
+# Put -I flags in compile command (not in .rsp) so compile_commands.json and IntelliSense see them
+set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES OFF)
 
 # Set CUDA architectures if not specified
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -67,24 +69,25 @@ if(NOT CUDNN_LIB)
     message(WARNING "cuDNN not found. Some features may be disabled.")
 endif()
 
+# =============================================================================
 # CUTLASS
-if(USE_CUTLASS)
-    set(CUTLASS_DIR "${CMAKE_SOURCE_DIR}/third_party/cutlass" CACHE PATH "CUTLASS directory")
-    if(EXISTS ${CUTLASS_DIR})
-        message(STATUS "Using CUTLASS from: ${CUTLASS_DIR}")
-        add_compile_definitions(OASR_USE_CUTLASS)
-    else()
-        message(STATUS "CUTLASS not found at ${CUTLASS_DIR}. Fetching from GitHub...")
-        include(FetchContent)
-        FetchContent_Declare(
-            cutlass
-            GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-            GIT_TAG v3.4.0
-        )
-        FetchContent_MakeAvailable(cutlass)
-        set(CUTLASS_DIR ${cutlass_SOURCE_DIR})
-        add_compile_definitions(OASR_USE_CUTLASS)
-    endif()
+# =============================================================================
+set(CUTLASS_DIR "${CMAKE_SOURCE_DIR}/third_party/cutlass" CACHE PATH "CUTLASS directory (header-only)")
+if(EXISTS ${CUTLASS_DIR}/include/cutlass/cutlass.h)
+    message(STATUS "Using CUTLASS (header-only) from: ${CUTLASS_DIR}")
+    add_compile_definitions(OASR_USE_CUTLASS)
+else()
+    message(STATUS "CUTLASS not found at ${CUTLASS_DIR}. Fetching headers from GitHub...")
+    include(FetchContent)
+    FetchContent_Declare(
+        cutlass
+        GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
+        GIT_TAG v3.4.0
+    )
+    # Populate only: do not call FetchContent_MakeAvailable so we do not build CUTLASS library
+    FetchContent_Populate(cutlass)
+    set(CUTLASS_DIR ${cutlass_SOURCE_DIR} CACHE PATH "CUTLASS directory (header-only)" FORCE)
+    add_compile_definitions(OASR_USE_CUTLASS)
 endif()
 
 # pybind11 for Python bindings
@@ -126,12 +129,15 @@ set(OASR_SOURCES
     csrc/kernels/normalization/norm_kernels.cu
     csrc/kernels/convolution/conv_kernels.cu
     
+    # GEMM Kernels (CUTLASS-based)
+    csrc/kernels/gemm/gemm_kernels.cu
+    csrc/kernels/gemm/bmm_kernels.cu
+    csrc/kernels/gemm/group_gemm_kernels.cu
+    
     # TODO: Add these when ready
     # csrc/common/tensor.cpp
     # csrc/common/allocator.cpp
     # csrc/kernels/attention/attention_kernels.cu
-    # csrc/kernels/feedforward/ffn_kernels.cu
-    # csrc/ops/cutlass/gemm_ops.cu
     # csrc/layers/base_layer.cpp
     # csrc/layers/attention_layer.cpp
     # csrc/layers/conv_layer.cpp
@@ -146,14 +152,21 @@ set(OASR_HEADERS
     csrc/kernels/convolution/conv_params.h
     csrc/kernels/convolution/conv_kernels.h
     
+    # GEMM Headers
+    csrc/kernels/gemm/gemm_configs.h
+    csrc/kernels/gemm/gemm_utils.h
+    csrc/kernels/gemm/gemm_params.h
+    csrc/kernels/gemm/gemm_kernels.h
+    csrc/kernels/gemm/bmm_params.h
+    csrc/kernels/gemm/bmm_kernels.h
+    csrc/kernels/gemm/group_gemm_params.h
+    csrc/kernels/gemm/group_gemm_kernels.h
+    
     # TODO: Add these when ready
     # csrc/common/tensor.h
     # csrc/common/allocator.h
     # csrc/kernels/attention/attention_params.h
     # csrc/kernels/attention/attention_kernels.h
-    # csrc/kernels/feedforward/ffn_params.h
-    # csrc/kernels/feedforward/ffn_kernels.h
-    # csrc/ops/cutlass/gemm_ops.h
     # csrc/layers/base_layer.h
     # csrc/layers/attention_layer.h
     # csrc/layers/conv_layer.h
@@ -171,12 +184,11 @@ target_include_directories(oasr_core PUBLIC
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-if(USE_CUTLASS)
-    target_include_directories(oasr_core PUBLIC
-        ${CUTLASS_DIR}/include
-        ${CUTLASS_DIR}/tools/util/include
+# CUTLASS
+target_include_directories(oasr_core PUBLIC
+    ${CUTLASS_DIR}/include
+    ${CUTLASS_DIR}/tools/util/include
     )
-endif()
 
 target_link_libraries(oasr_core PUBLIC
     CUDA::cudart

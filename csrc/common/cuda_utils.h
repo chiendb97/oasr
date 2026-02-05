@@ -18,7 +18,7 @@ namespace oasr {
         cudaError_t err = call;                                                   \
         if (err != cudaSuccess) {                                                 \
             throw std::runtime_error(                                             \
-                std::string("CUDA error at ") + __FILE__ + ":" +                  \
+                std::string("CUDA error at ") + std::string(__FILE__) + ":" +     \
                 std::to_string(__LINE__) + ": " + cudaGetErrorString(err));       \
         }                                                                          \
     } while (0)
@@ -29,7 +29,7 @@ namespace oasr {
         cublasStatus_t status = call;                                             \
         if (status != CUBLAS_STATUS_SUCCESS) {                                    \
             throw std::runtime_error(                                             \
-                std::string("cuBLAS error at ") + __FILE__ + ":" +                \
+                std::string("cuBLAS error at ") + std::string(__FILE__) + ":" +   \
                 std::to_string(__LINE__) + ": " + std::to_string(status));        \
         }                                                                          \
     } while (0)
@@ -40,7 +40,7 @@ namespace oasr {
         cudnnStatus_t status = call;                                              \
         if (status != CUDNN_STATUS_SUCCESS) {                                     \
             throw std::runtime_error(                                             \
-                std::string("cuDNN error at ") + __FILE__ + ":" +                 \
+                std::string("cuDNN error at ") + std::string(__FILE__) + ":" +    \
                 std::to_string(__LINE__) + ": " + cudnnGetErrorString(status));   \
         }                                                                          \
     } while (0)

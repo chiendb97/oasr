@@ -11,6 +11,7 @@
 #include "kernels/normalization/norm_kernels.h"
 #include "kernels/convolution/conv_kernels.h"
 #include "kernels/convolution/conv_params.h"
+#include "pybind_kernels.h"
 
 namespace py = pybind11;
 
@@ -330,4 +331,7 @@ PYBIND11_MODULE(_C, m) {
              py::arg("activation") = oasr::ActivationType::SWISH,
              py::arg("fuse_activation") = false,
              "General 1D convolution kernel");
+
+    // GEMM/BMM/GroupGEMM kernels (CUTLASS)
+    oasr::pybind::registerGemmBindings(kernels);
 }

@@ -2,55 +2,35 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "kernels/normalization/norm_kernels.h"
-#include "common/cuda_utils.h"
+#include "kernels/reduction/allreduce.h"
+#include "common/vec_dtypes.h"
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <algorithm>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cudnn.h>
+#include <stdexcept>
 
 namespace oasr {
 namespace kernels {
 
+// Import vector types from oasr namespace
+using oasr::Vec;
+using oasr::VecTypeTrait;
+using oasr::vecSum;
+using oasr::vecSumSquares;
+using oasr::vecSumSquaredDiff;
+using oasr::floatToVec;
+using oasr::loadVec;
+using oasr::storeVec;
+
 // =============================================================================
-// Constants and helpers
+// Constants
 // =============================================================================
 
-constexpr int WARP_SIZE = 32;
 constexpr int MAX_THREADS_PER_BLOCK = 1024;
-
-// Warp-level reduction for sum
-template <typename T>
-__device__ __forceinline__ T warpReduceSum(T val) {
-    #pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        val += __shfl_xor_sync(0xffffffff, val, offset);
-    }
-    return val;
-}
-
-// Block-level reduction for sum
-template <typename T>
-__device__ __forceinline__ T blockReduceSum(T val) {
-    __shared__ T shared[32];  // One slot per warp
-    
-    int lane = threadIdx.x % WARP_SIZE;
-    int wid = threadIdx.x / WARP_SIZE;
-    
-    val = warpReduceSum(val);
-    
-    if (lane == 0) {
-        shared[wid] = val;
-    }
-    __syncthreads();
-    
-    // Only first warp does the final reduction
-    val = (threadIdx.x < blockDim.x / WARP_SIZE) ? shared[lane] : T(0);
-    if (wid == 0) {
-        val = warpReduceSum(val);
-    }
-    
-    return val;
-}
 
 // =============================================================================
 // LayerNorm Kernels
@@ -406,8 +386,523 @@ __global__ void addLayerNormKernel(
 }
 
 // =============================================================================
+// Vectorized LayerNorm Kernel
+// =============================================================================
+
+template <typename T, int VecSize>
+__global__ void layerNormKernelVec(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const T* __restrict__ gamma,
+    const T* __restrict__ beta,
+    int hidden_size,
+    float eps
+) {
+    using VecT = Vec<T, VecSize>;
+    
+    const int row_idx = blockIdx.x;
+    const T* row_input = input + row_idx * hidden_size;
+    T* row_output = output + row_idx * hidden_size;
+    
+    const int vec_hidden_size = hidden_size / VecSize;
+    const int remainder = hidden_size % VecSize;
+    
+    // Phase 1: Compute mean using vectorized loads
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v;
+        v.load(row_input + i * VecSize);
+        local_sum += vecSum(v);
+    }
+    
+    // Handle remainder elements
+    if (remainder > 0 && threadIdx.x == 0) {
+        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
+            local_sum += static_cast<float>(row_input[i]);
+        }
+    }
+    
+    float mean = blockReduceSum(local_sum) / static_cast<float>(hidden_size);
+    __syncthreads();
+    
+    __shared__ float shared_mean;
+    if (threadIdx.x == 0) shared_mean = mean;
+    __syncthreads();
+    mean = shared_mean;
+    
+    // Phase 2: Compute variance using vectorized loads
+    float local_var = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v;
+        v.load(row_input + i * VecSize);
+        local_var += vecSumSquaredDiff(v, mean);
+    }
+    
+    // Handle remainder elements
+    if (remainder > 0 && threadIdx.x == 0) {
+        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
+            float diff = static_cast<float>(row_input[i]) - mean;
+            local_var += diff * diff;
+        }
+    }
+    
+    float variance = blockReduceSum(local_var) / static_cast<float>(hidden_size);
+    __syncthreads();
+    
+    __shared__ float shared_var;
+    if (threadIdx.x == 0) shared_var = variance;
+    __syncthreads();
+    variance = shared_var;
+    
+    float inv_std = rsqrtf(variance + eps);
+    
+    // Phase 3: Normalize and scale using vectorized load/store
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_gamma, v_out;
+        v_in.load(row_input + i * VecSize);
+        v_gamma.load(gamma + i * VecSize);
+        
+        float vals[VecSize];
+        #pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            float normalized = (static_cast<float>(v_in[j]) - mean) * inv_std;
+            vals[j] = normalized * static_cast<float>(v_gamma[j]);
+        }
+        
+        if (beta != nullptr) {
+            VecT v_beta;
+            v_beta.load(beta + i * VecSize);
+            #pragma unroll
+            for (int j = 0; j < VecSize; j++) {
+                vals[j] += static_cast<float>(v_beta[j]);
+            }
+        }
+        
+        floatToVec<T, VecSize>(vals, v_out);
+        v_out.store(row_output + i * VecSize);
+    }
+    
+    // Handle remainder elements
+    if (remainder > 0 && threadIdx.x == 0) {
+        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
+            float normalized = (static_cast<float>(row_input[i]) - mean) * inv_std;
+            float scaled = normalized * static_cast<float>(gamma[i]);
+            if (beta != nullptr) {
+                scaled += static_cast<float>(beta[i]);
+            }
+            row_output[i] = static_cast<T>(scaled);
+        }
+    }
+}
+
+// =============================================================================
+// Vectorized RMSNorm Kernel
+// =============================================================================
+
+template <typename T, int VecSize>
+__global__ void rmsNormKernelVec(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const T* __restrict__ gamma,
+    int hidden_size,
+    float eps
+) {
+    using VecT = Vec<T, VecSize>;
+    
+    const int row_idx = blockIdx.x;
+    const T* row_input = input + row_idx * hidden_size;
+    T* row_output = output + row_idx * hidden_size;
+    
+    const int vec_hidden_size = hidden_size / VecSize;
+    const int remainder = hidden_size % VecSize;
+    
+    // Phase 1: Compute mean of squares using vectorized loads
+    float local_sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v;
+        v.load(row_input + i * VecSize);
+        local_sum_sq += vecSumSquares(v);
+    }
+    
+    // Handle remainder elements
+    if (remainder > 0 && threadIdx.x == 0) {
+        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
+            float val = static_cast<float>(row_input[i]);
+            local_sum_sq += val * val;
+        }
+    }
+    
+    float mean_sq = blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size);
+    __syncthreads();
+    
+    __shared__ float shared_mean_sq;
+    if (threadIdx.x == 0) shared_mean_sq = mean_sq;
+    __syncthreads();
+    mean_sq = shared_mean_sq;
+    
+    float inv_rms = rsqrtf(mean_sq + eps);
+    
+    // Phase 2: Normalize and scale using vectorized load/store
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_gamma, v_out;
+        v_in.load(row_input + i * VecSize);
+        v_gamma.load(gamma + i * VecSize);
+        
+        float vals[VecSize];
+        #pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            vals[j] = static_cast<float>(v_in[j]) * inv_rms * static_cast<float>(v_gamma[j]);
+        }
+        
+        floatToVec<T, VecSize>(vals, v_out);
+        v_out.store(row_output + i * VecSize);
+    }
+    
+    // Handle remainder elements
+    if (remainder > 0 && threadIdx.x == 0) {
+        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
+            float normalized = static_cast<float>(row_input[i]) * inv_rms;
+            row_output[i] = static_cast<T>(normalized * static_cast<float>(gamma[i]));
+        }
+    }
+}
+
+// =============================================================================
+// Vectorized BatchNorm1D Kernel
+// =============================================================================
+
+template <typename T, int VecSize>
+__global__ void batchNorm1DKernelVec(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const T* __restrict__ gamma,
+    const T* __restrict__ beta,
+    const T* __restrict__ running_mean,
+    const T* __restrict__ running_var,
+    int batch_size,
+    int seq_len,
+    int channels,
+    float eps
+) {
+    using VecT = Vec<T, VecSize>;
+    
+    const int total_elements = batch_size * seq_len * channels;
+    const int vec_channels = channels / VecSize;
+    
+    // Each thread processes VecSize elements at a time
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+         idx < total_elements / VecSize; 
+         idx += blockDim.x * gridDim.x) {
+        
+        // Calculate position
+        int flat_idx = idx * VecSize;
+        int c_start = flat_idx % channels;
+        
+        // Check if this is an aligned vector access within channels
+        if (c_start + VecSize <= channels && c_start % VecSize == 0) {
+            VecT v_in, v_gamma, v_beta, v_mean, v_var, v_out;
+            v_in.load(input + flat_idx);
+            v_gamma.load(gamma + c_start);
+            v_beta.load(beta + c_start);
+            v_mean.load(running_mean + c_start);
+            v_var.load(running_var + c_start);
+            
+            float vals[VecSize];
+            #pragma unroll
+            for (int j = 0; j < VecSize; j++) {
+                float inv_std = rsqrtf(static_cast<float>(v_var[j]) + eps);
+                float x = static_cast<float>(v_in[j]);
+                float normalized = (x - static_cast<float>(v_mean[j])) * inv_std;
+                vals[j] = normalized * static_cast<float>(v_gamma[j]) + static_cast<float>(v_beta[j]);
+            }
+            
+            floatToVec<T, VecSize>(vals, v_out);
+            v_out.store(output + flat_idx);
+        } else {
+            // Fall back to scalar for unaligned accesses
+            for (int j = 0; j < VecSize && flat_idx + j < total_elements; j++) {
+                int c = (flat_idx + j) % channels;
+                float mean = static_cast<float>(running_mean[c]);
+                float var = static_cast<float>(running_var[c]);
+                float g = static_cast<float>(gamma[c]);
+                float b = static_cast<float>(beta[c]);
+                float inv_std = rsqrtf(var + eps);
+                float x = static_cast<float>(input[flat_idx + j]);
+                float normalized = (x - mean) * inv_std;
+                output[flat_idx + j] = static_cast<T>(normalized * g + b);
+            }
+        }
+    }
+    
+    // Handle remainder elements
+    int remainder_start = (total_elements / VecSize) * VecSize;
+    for (int idx = remainder_start + blockIdx.x * blockDim.x + threadIdx.x; 
+         idx < total_elements; 
+         idx += blockDim.x * gridDim.x) {
+        int c = idx % channels;
+        float mean = static_cast<float>(running_mean[c]);
+        float var = static_cast<float>(running_var[c]);
+        float g = static_cast<float>(gamma[c]);
+        float b = static_cast<float>(beta[c]);
+        float inv_std = rsqrtf(var + eps);
+        float x = static_cast<float>(input[idx]);
+        float normalized = (x - mean) * inv_std;
+        output[idx] = static_cast<T>(normalized * g + b);
+    }
+}
+
+// =============================================================================
+// Vectorized GroupNorm Kernel
+// =============================================================================
+
+template <typename T, int VecSize>
+__global__ void groupNormKernelVec(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const T* __restrict__ gamma,
+    const T* __restrict__ beta,
+    int batch_size,
+    int seq_len,
+    int channels,
+    int num_groups,
+    float eps
+) {
+    using VecT = Vec<T, VecSize>;
+    
+    int channels_per_group = channels / num_groups;
+    int vec_channels_per_group = channels_per_group / VecSize;
+    int remainder = channels_per_group % VecSize;
+    
+    int idx = blockIdx.x;
+    int group_idx = idx % num_groups;
+    int seq_idx = (idx / num_groups) % seq_len;
+    int batch_idx = idx / (num_groups * seq_len);
+    
+    const T* group_input = input + batch_idx * seq_len * channels + 
+                           seq_idx * channels + 
+                           group_idx * channels_per_group;
+    T* group_output = output + batch_idx * seq_len * channels + 
+                      seq_idx * channels + 
+                      group_idx * channels_per_group;
+    
+    // Phase 1: Compute mean using vectorized loads
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < vec_channels_per_group; i += blockDim.x) {
+        VecT v;
+        v.load(group_input + i * VecSize);
+        local_sum += vecSum(v);
+    }
+    
+    // Handle remainder
+    if (remainder > 0 && threadIdx.x == 0) {
+        for (int i = vec_channels_per_group * VecSize; i < channels_per_group; i++) {
+            local_sum += static_cast<float>(group_input[i]);
+        }
+    }
+    
+    float mean = blockReduceSum(local_sum) / static_cast<float>(channels_per_group);
+    __syncthreads();
+    
+    __shared__ float shared_mean;
+    if (threadIdx.x == 0) shared_mean = mean;
+    __syncthreads();
+    mean = shared_mean;
+    
+    // Phase 2: Compute variance using vectorized loads
+    float local_var = 0.0f;
+    for (int i = threadIdx.x; i < vec_channels_per_group; i += blockDim.x) {
+        VecT v;
+        v.load(group_input + i * VecSize);
+        local_var += vecSumSquaredDiff(v, mean);
+    }
+    
+    // Handle remainder
+    if (remainder > 0 && threadIdx.x == 0) {
+        for (int i = vec_channels_per_group * VecSize; i < channels_per_group; i++) {
+            float diff = static_cast<float>(group_input[i]) - mean;
+            local_var += diff * diff;
+        }
+    }
+    
+    float variance = blockReduceSum(local_var) / static_cast<float>(channels_per_group);
+    __syncthreads();
+    
+    __shared__ float shared_var;
+    if (threadIdx.x == 0) shared_var = variance;
+    __syncthreads();
+    variance = shared_var;
+    
+    float inv_std = rsqrtf(variance + eps);
+    
+    // Phase 3: Normalize and scale using vectorized load/store
+    for (int i = threadIdx.x; i < vec_channels_per_group; i += blockDim.x) {
+        int channel_idx = group_idx * channels_per_group + i * VecSize;
+        
+        VecT v_in, v_gamma, v_beta, v_out;
+        v_in.load(group_input + i * VecSize);
+        v_gamma.load(gamma + channel_idx);
+        v_beta.load(beta + channel_idx);
+        
+        float vals[VecSize];
+        #pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            float normalized = (static_cast<float>(v_in[j]) - mean) * inv_std;
+            vals[j] = normalized * static_cast<float>(v_gamma[j]) + static_cast<float>(v_beta[j]);
+        }
+        
+        floatToVec<T, VecSize>(vals, v_out);
+        v_out.store(group_output + i * VecSize);
+    }
+    
+    // Handle remainder
+    if (remainder > 0 && threadIdx.x == 0) {
+        for (int i = vec_channels_per_group * VecSize; i < channels_per_group; i++) {
+            int channel_idx = group_idx * channels_per_group + i;
+            float normalized = (static_cast<float>(group_input[i]) - mean) * inv_std;
+            float g = static_cast<float>(gamma[channel_idx]);
+            float b = static_cast<float>(beta[channel_idx]);
+            group_output[i] = static_cast<T>(normalized * g + b);
+        }
+    }
+}
+
+// =============================================================================
+// Vectorized Add + LayerNorm Fused Kernel
+// =============================================================================
+
+template <typename T, int VecSize>
+__global__ void addLayerNormKernelVec(
+    const T* __restrict__ input,
+    const T* __restrict__ residual,
+    T* __restrict__ output,
+    const T* __restrict__ gamma,
+    const T* __restrict__ beta,
+    int hidden_size,
+    float eps
+) {
+    using VecT = Vec<T, VecSize>;
+    
+    const int row_idx = blockIdx.x;
+    const T* row_input = input + row_idx * hidden_size;
+    const T* row_residual = residual + row_idx * hidden_size;
+    T* row_output = output + row_idx * hidden_size;
+    
+    const int vec_hidden_size = hidden_size / VecSize;
+    const int remainder = hidden_size % VecSize;
+    
+    // Phase 1: Compute mean using vectorized loads
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_res;
+        v_in.load(row_input + i * VecSize);
+        v_res.load(row_residual + i * VecSize);
+        
+        #pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            local_sum += static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]);
+        }
+    }
+    
+    // Handle remainder
+    if (remainder > 0 && threadIdx.x == 0) {
+        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
+            local_sum += static_cast<float>(row_input[i]) + static_cast<float>(row_residual[i]);
+        }
+    }
+    
+    float mean = blockReduceSum(local_sum) / static_cast<float>(hidden_size);
+    __syncthreads();
+    
+    __shared__ float shared_mean;
+    if (threadIdx.x == 0) shared_mean = mean;
+    __syncthreads();
+    mean = shared_mean;
+    
+    // Phase 2: Compute variance using vectorized loads
+    float local_var = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_res;
+        v_in.load(row_input + i * VecSize);
+        v_res.load(row_residual + i * VecSize);
+        
+        #pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            float val = static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]);
+            float diff = val - mean;
+            local_var += diff * diff;
+        }
+    }
+    
+    // Handle remainder
+    if (remainder > 0 && threadIdx.x == 0) {
+        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
+            float val = static_cast<float>(row_input[i]) + static_cast<float>(row_residual[i]);
+            float diff = val - mean;
+            local_var += diff * diff;
+        }
+    }
+    
+    float variance = blockReduceSum(local_var) / static_cast<float>(hidden_size);
+    __syncthreads();
+    
+    __shared__ float shared_var;
+    if (threadIdx.x == 0) shared_var = variance;
+    __syncthreads();
+    variance = shared_var;
+    
+    float inv_std = rsqrtf(variance + eps);
+    
+    // Phase 3: Normalize and scale using vectorized load/store
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_res, v_gamma, v_out;
+        v_in.load(row_input + i * VecSize);
+        v_res.load(row_residual + i * VecSize);
+        v_gamma.load(gamma + i * VecSize);
+        
+        float vals[VecSize];
+        #pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            float val = static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]);
+            float normalized = (val - mean) * inv_std;
+            vals[j] = normalized * static_cast<float>(v_gamma[j]);
+        }
+        
+        if (beta != nullptr) {
+            VecT v_beta;
+            v_beta.load(beta + i * VecSize);
+            #pragma unroll
+            for (int j = 0; j < VecSize; j++) {
+                vals[j] += static_cast<float>(v_beta[j]);
+            }
+        }
+        
+        floatToVec<T, VecSize>(vals, v_out);
+        v_out.store(row_output + i * VecSize);
+    }
+    
+    // Handle remainder
+    if (remainder > 0 && threadIdx.x == 0) {
+        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
+            float val = static_cast<float>(row_input[i]) + static_cast<float>(row_residual[i]);
+            float normalized = (val - mean) * inv_std;
+            float scaled = normalized * static_cast<float>(gamma[i]);
+            if (beta != nullptr) {
+                scaled += static_cast<float>(beta[i]);
+            }
+            row_output[i] = static_cast<T>(scaled);
+        }
+    }
+}
+
+// =============================================================================
 // Dispatcher functions
 // =============================================================================
+
+// Helper to check if we can use vectorized kernels
+template <typename T>
+__host__ constexpr int getVecSize() {
+    return VecTypeTrait<T>::VecSize;
+}
 
 template <typename T>
 void invokeLayerNormTyped(const void* input, void* output,
@@ -416,18 +911,42 @@ void invokeLayerNormTyped(const void* input, void* output,
                           float eps, cudaStream_t stream) {
     int num_rows = batch_size * seq_len;
     
+    constexpr int VecSize = VecTypeTrait<T>::VecSize;
+    
     // Choose block size based on hidden_size
     int block_size = std::min(hidden_size, MAX_THREADS_PER_BLOCK);
     block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
     
-    layerNormKernel<T><<<num_rows, block_size, 0, stream>>>(
-        static_cast<const T*>(input),
-        static_cast<T*>(output),
-        static_cast<const T*>(gamma),
-        static_cast<const T*>(beta),
-        hidden_size,
-        eps
-    );
+    // Use vectorized kernel if hidden_size is large enough and alignment is good
+    // Vectorization requires hidden_size >= VecSize and pointer alignment
+    bool use_vec = (hidden_size >= VecSize) && 
+                   (reinterpret_cast<uintptr_t>(input) % (sizeof(T) * VecSize) == 0) &&
+                   (reinterpret_cast<uintptr_t>(output) % (sizeof(T) * VecSize) == 0);
+    
+    if (use_vec) {
+        // Adjust block size for vectorized kernel (fewer iterations needed)
+        int vec_hidden = hidden_size / VecSize;
+        block_size = std::min(vec_hidden, MAX_THREADS_PER_BLOCK);
+        block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
+        
+        layerNormKernelVec<T, VecSize><<<num_rows, block_size, 0, stream>>>(
+            static_cast<const T*>(input),
+            static_cast<T*>(output),
+            static_cast<const T*>(gamma),
+            static_cast<const T*>(beta),
+            hidden_size,
+            eps
+        );
+    } else {
+        layerNormKernel<T><<<num_rows, block_size, 0, stream>>>(
+            static_cast<const T*>(input),
+            static_cast<T*>(output),
+            static_cast<const T*>(gamma),
+            static_cast<const T*>(beta),
+            hidden_size,
+            eps
+        );
+    }
 }
 
 template <typename T>
@@ -437,16 +956,36 @@ void invokeRMSNormTyped(const void* input, void* output,
                         float eps, cudaStream_t stream) {
     int num_rows = batch_size * seq_len;
     
+    constexpr int VecSize = VecTypeTrait<T>::VecSize;
+    
     int block_size = std::min(hidden_size, MAX_THREADS_PER_BLOCK);
     block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
     
-    rmsNormKernel<T><<<num_rows, block_size, 0, stream>>>(
-        static_cast<const T*>(input),
-        static_cast<T*>(output),
-        static_cast<const T*>(gamma),
-        hidden_size,
-        eps
-    );
+    bool use_vec = (hidden_size >= VecSize) && 
+                   (reinterpret_cast<uintptr_t>(input) % (sizeof(T) * VecSize) == 0) &&
+                   (reinterpret_cast<uintptr_t>(output) % (sizeof(T) * VecSize) == 0);
+    
+    if (use_vec) {
+        int vec_hidden = hidden_size / VecSize;
+        block_size = std::min(vec_hidden, MAX_THREADS_PER_BLOCK);
+        block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
+        
+        rmsNormKernelVec<T, VecSize><<<num_rows, block_size, 0, stream>>>(
+            static_cast<const T*>(input),
+            static_cast<T*>(output),
+            static_cast<const T*>(gamma),
+            hidden_size,
+            eps
+        );
+    } else {
+        rmsNormKernel<T><<<num_rows, block_size, 0, stream>>>(
+            static_cast<const T*>(input),
+            static_cast<T*>(output),
+            static_cast<const T*>(gamma),
+            hidden_size,
+            eps
+        );
+    }
 }
 
 // =============================================================================
@@ -503,51 +1042,114 @@ void invokeRMSNorm(const void* input, void* output,
     }
 }
 
+template <typename T>
+void invokeBatchNorm1DTyped(const void* input, void* output,
+                            const void* gamma, const void* beta,
+                            const void* running_mean, const void* running_var,
+                            int batch_size, int seq_len, int channels,
+                            float eps, cudaStream_t stream) {
+    int total_elements = batch_size * seq_len * channels;
+    int block_size = 256;
+    
+    constexpr int VecSize = VecTypeTrait<T>::VecSize;
+    
+    // Check if we can use vectorized kernel
+    bool use_vec = (channels >= VecSize) && (channels % VecSize == 0) &&
+                   (reinterpret_cast<uintptr_t>(input) % (sizeof(T) * VecSize) == 0) &&
+                   (reinterpret_cast<uintptr_t>(output) % (sizeof(T) * VecSize) == 0);
+    
+    if (use_vec) {
+        int vec_total = total_elements / VecSize;
+        int grid_size = (vec_total + block_size - 1) / block_size;
+        
+        batchNorm1DKernelVec<T, VecSize><<<grid_size, block_size, 0, stream>>>(
+            static_cast<const T*>(input),
+            static_cast<T*>(output),
+            static_cast<const T*>(gamma),
+            static_cast<const T*>(beta),
+            static_cast<const T*>(running_mean),
+            static_cast<const T*>(running_var),
+            batch_size, seq_len, channels, eps
+        );
+    } else {
+        int grid_size = (total_elements + block_size - 1) / block_size;
+        
+        batchNorm1DKernel<T><<<grid_size, block_size, 0, stream>>>(
+            static_cast<const T*>(input),
+            static_cast<T*>(output),
+            static_cast<const T*>(gamma),
+            static_cast<const T*>(beta),
+            static_cast<const T*>(running_mean),
+            static_cast<const T*>(running_var),
+            batch_size, seq_len, channels, eps
+        );
+    }
+}
+
 void invokeBatchNorm1D(const void* input, void* output,
                        const void* gamma, const void* beta,
                        const void* running_mean, const void* running_var,
                        int batch_size, int seq_len, int channels,
                        float eps, DataType dtype, cudaStream_t stream) {
-    int total_elements = batch_size * seq_len * channels;
-    int block_size = 256;
-    int grid_size = (total_elements + block_size - 1) / block_size;
-    
     switch (dtype) {
         case DataType::FP32:
-            batchNorm1DKernel<float><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const float*>(input),
-                static_cast<float*>(output),
-                static_cast<const float*>(gamma),
-                static_cast<const float*>(beta),
-                static_cast<const float*>(running_mean),
-                static_cast<const float*>(running_var),
-                batch_size, seq_len, channels, eps
-            );
+            invokeBatchNorm1DTyped<float>(input, output, gamma, beta,
+                                          running_mean, running_var,
+                                          batch_size, seq_len, channels, eps, stream);
             break;
         case DataType::FP16:
-            batchNorm1DKernel<half><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const half*>(input),
-                static_cast<half*>(output),
-                static_cast<const half*>(gamma),
-                static_cast<const half*>(beta),
-                static_cast<const half*>(running_mean),
-                static_cast<const half*>(running_var),
-                batch_size, seq_len, channels, eps
-            );
+            invokeBatchNorm1DTyped<half>(input, output, gamma, beta,
+                                         running_mean, running_var,
+                                         batch_size, seq_len, channels, eps, stream);
             break;
         case DataType::BF16:
-            batchNorm1DKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(input),
-                static_cast<__nv_bfloat16*>(output),
-                static_cast<const __nv_bfloat16*>(gamma),
-                static_cast<const __nv_bfloat16*>(beta),
-                static_cast<const __nv_bfloat16*>(running_mean),
-                static_cast<const __nv_bfloat16*>(running_var),
-                batch_size, seq_len, channels, eps
-            );
+            invokeBatchNorm1DTyped<__nv_bfloat16>(input, output, gamma, beta,
+                                                  running_mean, running_var,
+                                                  batch_size, seq_len, channels, eps, stream);
             break;
         default:
             throw std::runtime_error("Unsupported data type for BatchNorm1D");
+    }
+}
+
+template <typename T>
+void invokeGroupNormTyped(const void* input, void* output,
+                          const void* gamma, const void* beta,
+                          int batch_size, int seq_len, int channels, int num_groups,
+                          float eps, cudaStream_t stream) {
+    int num_blocks = batch_size * seq_len * num_groups;
+    int channels_per_group = channels / num_groups;
+    
+    constexpr int VecSize = VecTypeTrait<T>::VecSize;
+    
+    // Check if we can use vectorized kernel
+    bool use_vec = (channels_per_group >= VecSize) &&
+                   (reinterpret_cast<uintptr_t>(input) % (sizeof(T) * VecSize) == 0) &&
+                   (reinterpret_cast<uintptr_t>(output) % (sizeof(T) * VecSize) == 0);
+    
+    if (use_vec) {
+        int vec_channels_per_group = channels_per_group / VecSize;
+        int block_size = std::min(vec_channels_per_group, MAX_THREADS_PER_BLOCK);
+        block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
+        
+        groupNormKernelVec<T, VecSize><<<num_blocks, block_size, 0, stream>>>(
+            static_cast<const T*>(input),
+            static_cast<T*>(output),
+            static_cast<const T*>(gamma),
+            static_cast<const T*>(beta),
+            batch_size, seq_len, channels, num_groups, eps
+        );
+    } else {
+        int block_size = std::min(channels_per_group, MAX_THREADS_PER_BLOCK);
+        block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+        
+        groupNormKernel<T><<<num_blocks, block_size, 0, stream>>>(
+            static_cast<const T*>(input),
+            static_cast<T*>(output),
+            static_cast<const T*>(gamma),
+            static_cast<const T*>(beta),
+            batch_size, seq_len, channels, num_groups, eps
+        );
     }
 }
 
@@ -555,41 +1157,64 @@ void invokeGroupNorm(const void* input, void* output,
                      const void* gamma, const void* beta,
                      int batch_size, int seq_len, int channels, int num_groups,
                      float eps, DataType dtype, cudaStream_t stream) {
-    int num_blocks = batch_size * seq_len * num_groups;
-    int channels_per_group = channels / num_groups;
-    int block_size = std::min(channels_per_group, MAX_THREADS_PER_BLOCK);
-    block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-    
     switch (dtype) {
         case DataType::FP32:
-            groupNormKernel<float><<<num_blocks, block_size, 0, stream>>>(
-                static_cast<const float*>(input),
-                static_cast<float*>(output),
-                static_cast<const float*>(gamma),
-                static_cast<const float*>(beta),
-                batch_size, seq_len, channels, num_groups, eps
-            );
+            invokeGroupNormTyped<float>(input, output, gamma, beta,
+                                        batch_size, seq_len, channels, num_groups, eps, stream);
             break;
         case DataType::FP16:
-            groupNormKernel<half><<<num_blocks, block_size, 0, stream>>>(
-                static_cast<const half*>(input),
-                static_cast<half*>(output),
-                static_cast<const half*>(gamma),
-                static_cast<const half*>(beta),
-                batch_size, seq_len, channels, num_groups, eps
-            );
+            invokeGroupNormTyped<half>(input, output, gamma, beta,
+                                       batch_size, seq_len, channels, num_groups, eps, stream);
             break;
         case DataType::BF16:
-            groupNormKernel<__nv_bfloat16><<<num_blocks, block_size, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(input),
-                static_cast<__nv_bfloat16*>(output),
-                static_cast<const __nv_bfloat16*>(gamma),
-                static_cast<const __nv_bfloat16*>(beta),
-                batch_size, seq_len, channels, num_groups, eps
-            );
+            invokeGroupNormTyped<__nv_bfloat16>(input, output, gamma, beta,
+                                                batch_size, seq_len, channels, num_groups, eps, stream);
             break;
         default:
             throw std::runtime_error("Unsupported data type for GroupNorm");
+    }
+}
+
+template <typename T>
+void invokeAddLayerNormTyped(const void* input, const void* residual, void* output,
+                             const void* gamma, const void* beta,
+                             int batch_size, int seq_len, int hidden_size,
+                             float eps, cudaStream_t stream) {
+    int num_rows = batch_size * seq_len;
+    
+    constexpr int VecSize = VecTypeTrait<T>::VecSize;
+    
+    int block_size = std::min(hidden_size, MAX_THREADS_PER_BLOCK);
+    block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+    
+    // Check if we can use vectorized kernel
+    bool use_vec = (hidden_size >= VecSize) &&
+                   (reinterpret_cast<uintptr_t>(input) % (sizeof(T) * VecSize) == 0) &&
+                   (reinterpret_cast<uintptr_t>(residual) % (sizeof(T) * VecSize) == 0) &&
+                   (reinterpret_cast<uintptr_t>(output) % (sizeof(T) * VecSize) == 0);
+    
+    if (use_vec) {
+        int vec_hidden = hidden_size / VecSize;
+        block_size = std::min(vec_hidden, MAX_THREADS_PER_BLOCK);
+        block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
+        
+        addLayerNormKernelVec<T, VecSize><<<num_rows, block_size, 0, stream>>>(
+            static_cast<const T*>(input),
+            static_cast<const T*>(residual),
+            static_cast<T*>(output),
+            static_cast<const T*>(gamma),
+            static_cast<const T*>(beta),
+            hidden_size, eps
+        );
+    } else {
+        addLayerNormKernel<T><<<num_rows, block_size, 0, stream>>>(
+            static_cast<const T*>(input),
+            static_cast<const T*>(residual),
+            static_cast<T*>(output),
+            static_cast<const T*>(gamma),
+            static_cast<const T*>(beta),
+            hidden_size, eps
+        );
     }
 }
 
@@ -597,40 +1222,18 @@ void invokeAddLayerNorm(const void* input, const void* residual, void* output,
                         const void* gamma, const void* beta,
                         int batch_size, int seq_len, int hidden_size,
                         float eps, DataType dtype, cudaStream_t stream) {
-    int num_rows = batch_size * seq_len;
-    int block_size = std::min(hidden_size, MAX_THREADS_PER_BLOCK);
-    block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-    
     switch (dtype) {
         case DataType::FP32:
-            addLayerNormKernel<float><<<num_rows, block_size, 0, stream>>>(
-                static_cast<const float*>(input),
-                static_cast<const float*>(residual),
-                static_cast<float*>(output),
-                static_cast<const float*>(gamma),
-                static_cast<const float*>(beta),
-                hidden_size, eps
-            );
+            invokeAddLayerNormTyped<float>(input, residual, output, gamma, beta,
+                                           batch_size, seq_len, hidden_size, eps, stream);
             break;
         case DataType::FP16:
-            addLayerNormKernel<half><<<num_rows, block_size, 0, stream>>>(
-                static_cast<const half*>(input),
-                static_cast<const half*>(residual),
-                static_cast<half*>(output),
-                static_cast<const half*>(gamma),
-                static_cast<const half*>(beta),
-                hidden_size, eps
-            );
+            invokeAddLayerNormTyped<half>(input, residual, output, gamma, beta,
+                                          batch_size, seq_len, hidden_size, eps, stream);
             break;
         case DataType::BF16:
-            addLayerNormKernel<__nv_bfloat16><<<num_rows, block_size, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(input),
-                static_cast<const __nv_bfloat16*>(residual),
-                static_cast<__nv_bfloat16*>(output),
-                static_cast<const __nv_bfloat16*>(gamma),
-                static_cast<const __nv_bfloat16*>(beta),
-                hidden_size, eps
-            );
+            invokeAddLayerNormTyped<__nv_bfloat16>(input, residual, output, gamma, beta,
+                                                   batch_size, seq_len, hidden_size, eps, stream);
             break;
         default:
             throw std::runtime_error("Unsupported data type for AddLayerNorm");

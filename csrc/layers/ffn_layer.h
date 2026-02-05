@@ -4,7 +4,8 @@
 #pragma once
 
 #include "base_layer.h"
-#include "kernels/feedforward/ffn_params.h"
+#include "kernels/gemm/gemm_kernels.h"
+#include "kernels/gemm/gemm_params.h"
 
 namespace oasr {
 namespace layers {
