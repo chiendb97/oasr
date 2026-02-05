@@ -1,14 +1,11 @@
 # Tests CMake configuration
+# Structure aligned with tests/python/unit/ (test_gemm.py, test_conv_kernels.py, test_norm_kernels.py)
 
-# Test sources
+# Test sources (all .cu for consistent extension)
 set(TEST_SOURCES
     test_norm_kernels.cu
     test_gemm.cu
-    # TODO: Add these when ready
-    # test_tensor.cpp
-    # test_attention.cpp
-    # test_conv.cpp
-    # test_ffn.cpp
+    test_conv.cu
 )
 
 # Add test executable
