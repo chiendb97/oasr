@@ -38,19 +38,22 @@ void invokeDepthwiseConv1D(const void* input, const void* weight, const void* bi
 
 /**
  * @brief Pointwise (1x1) convolution
- * 
- * Essentially a linear projection, but kept as conv for consistency.
- * Can be fused with activation.
- * 
+ *
+ * Essentially a linear projection. Can be fused with activation.
+ * Backend selects implementation: NATIVE (CUDA kernel) or CUTLASS (GEMM).
+ * No automatic fallback; invalid backend or CUTLASS failure throws.
+ *
  * @param input Input [batch, seq_len, in_channels]
  * @param weight Weight [out_channels, in_channels]
  * @param bias Optional bias [out_channels]
  * @param output Output [batch, seq_len, out_channels]
+ * @param backend NATIVE or CUTLASS (explicit; no fallback)
  * @param activation Optional fused activation
  */
 void invokePointwiseConv1D(const void* input, const void* weight, const void* bias,
                            void* output, int batch_size, int seq_len,
                            int in_channels, int out_channels,
+                           PointwiseConvBackend backend,
                            ActivationType activation, bool fuse_activation,
                            DataType dtype, cudaStream_t stream);
 

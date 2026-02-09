@@ -179,6 +179,7 @@ TEST_F(TestPointwiseConv1D, PointwiseConv1D_2_128_256_512) {
 
     invokePointwiseConv1D(d_x, d_w, d_b, d_out,
                           batch_size, seq_len, in_ch, out_ch,
+                          PointwiseConvBackend::NATIVE,
                           ActivationType::SWISH, false, DataType::FP32, nullptr);
 
     OASR_CUDA_CHECK(cudaMemcpy(out_host.data(), d_out, n_out * sizeof(float), cudaMemcpyDeviceToHost));

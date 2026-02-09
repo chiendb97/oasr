@@ -3,6 +3,8 @@
 
 #include "kernels/convolution/conv_kernels.h"
 #include "common/cuda_utils.h"
+#include "kernels/gemm/gemm_kernels.h"
+#include "kernels/gemm/gemm_params.h"
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -101,18 +103,24 @@ __global__ void depthwiseConv1DKernelOptimized(
     bool is_causal
 ) {
     extern __shared__ char shared_mem[];
-    T* shared_input = reinterpret_cast<T*>(shared_mem);
-    
     const int TILE_SIZE = blockDim.x;
     const int half_kernel = KERNEL_SIZE / 2;
     const int halo = is_causal ? (KERNEL_SIZE - 1) : half_kernel;
-    
+    const int input_shared_size = TILE_SIZE + 2 * halo;
+    T* shared_input = reinterpret_cast<T*>(shared_mem);
+    float* shared_weight = reinterpret_cast<float*>(shared_mem + input_shared_size * sizeof(T));
+
     int b = blockIdx.z;
     int c = blockIdx.y;
     int tile_start = blockIdx.x * TILE_SIZE;
     int local_t = threadIdx.x;
     int global_t = tile_start + local_t;
-    
+
+    // Load weight once per block (all threads share channel c)
+    for (int k = local_t; k < KERNEL_SIZE; k += blockDim.x) {
+        shared_weight[k] = static_cast<float>(weight[c * KERNEL_SIZE + k]);
+    }
+
     // Load input tile with halo
     int shared_idx = local_t + halo;
     if (global_t < seq_len) {
@@ -121,7 +129,7 @@ __global__ void depthwiseConv1DKernelOptimized(
     } else {
         shared_input[shared_idx] = T(0);
     }
-    
+
     // Load halo regions
     if (local_t < halo) {
         int left_t = tile_start - halo + local_t;
@@ -131,7 +139,7 @@ __global__ void depthwiseConv1DKernelOptimized(
         } else {
             shared_input[local_t] = T(0);
         }
-        
+
         if (!is_causal) {
             int right_t = tile_start + TILE_SIZE + local_t;
             if (right_t < seq_len) {
@@ -142,29 +150,22 @@ __global__ void depthwiseConv1DKernelOptimized(
             }
         }
     }
-    
+
     __syncthreads();
-    
+
     if (global_t >= seq_len) return;
-    
-    // Load weight into registers
-    float w[KERNEL_SIZE];
-    #pragma unroll
-    for (int k = 0; k < KERNEL_SIZE; k++) {
-        w[k] = static_cast<float>(weight[c * KERNEL_SIZE + k]);
-    }
-    
-    // Compute convolution
+
+    // Compute convolution using shared weight
     float sum = 0.0f;
     if (is_causal) {
         #pragma unroll
         for (int k = 0; k < KERNEL_SIZE; k++) {
-            sum += static_cast<float>(shared_input[shared_idx - (KERNEL_SIZE - 1) + k]) * w[k];
+            sum += static_cast<float>(shared_input[shared_idx - (KERNEL_SIZE - 1) + k]) * shared_weight[k];
         }
     } else {
         #pragma unroll
         for (int k = 0; k < KERNEL_SIZE; k++) {
-            sum += static_cast<float>(shared_input[shared_idx - half_kernel + k]) * w[k];
+            sum += static_cast<float>(shared_input[shared_idx - half_kernel + k]) * shared_weight[k];
         }
     }
     
@@ -175,6 +176,53 @@ __global__ void depthwiseConv1DKernelOptimized(
     
     int output_idx = b * seq_len * channels + global_t * channels + c;
     output[output_idx] = static_cast<T>(sum);
+}
+
+// Block-per-(batch,seq) depthwise algorithm (one block per output position, threads over channels).
+// Same parallelization as FasterTransformer WenetKernels; keeps existing params and layout.
+template <typename T>
+__global__ void depthwiseConv1DBlockPerPositionKernel(
+    const T* __restrict__ input,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    T* __restrict__ output,
+    int batch_size,
+    int seq_len,
+    int channels,
+    int kernel_size,
+    int padding,
+    bool is_causal)
+{
+    int c_id = threadIdx.x;
+    if (c_id >= channels) return;
+    int s_id = blockIdx.x % seq_len;
+    int b_id = blockIdx.x / seq_len;
+
+    int s_start, s_end, k_start;
+    if (is_causal) {
+        s_start = max(0, s_id - (kernel_size - 1));
+        s_end   = s_id + 1;
+        k_start = (kernel_size - 1) - (s_id - s_start);
+    } else {
+        s_start = s_id - padding;
+        s_end   = min(s_start + kernel_size, seq_len);
+        s_start = max(s_start, 0);
+        k_start = max(padding - s_id, 0);
+    }
+
+    const T* in_ptr = input + b_id * seq_len * channels + c_id;
+    const T* w_ptr  = weight + c_id * kernel_size;
+
+    float val = 0.0f;
+    for (int i = s_start; i < s_end; ++i) {
+        int k = k_start + (i - s_start);
+        val += static_cast<float>(in_ptr[i * channels]) * static_cast<float>(w_ptr[k]);
+    }
+    if (bias != nullptr) {
+        val += static_cast<float>(bias[c_id]);
+    }
+
+    output[blockIdx.x * channels + c_id] = static_cast<T>(val);
 }
 
 // =============================================================================
@@ -232,6 +280,44 @@ __global__ void pointwiseConv1DKernel(
     }
     
     output[pos * out_channels + out_c] = static_cast<T>(sum);
+}
+
+// Bias + optional activation for pointwise GEMM output [batch*seq_len, out_channels].
+template <typename T>
+__global__ void pointwiseBiasActivationKernel(
+    T* __restrict__ output,       // [batch*seq_len, out_channels]
+    const T* __restrict__ bias,   // [out_channels] or nullptr
+    int batch_size,
+    int seq_len,
+    int out_channels,
+    ActivationType activation,
+    bool fuse_activation
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch_size * seq_len * out_channels;
+    if (idx >= total) return;
+
+    int out_c = idx % out_channels;
+    float val = static_cast<float>(output[idx]);
+    if (bias != nullptr) {
+        val += static_cast<float>(bias[out_c]);
+    }
+    if (fuse_activation) {
+        switch (activation) {
+            case ActivationType::RELU:
+                val = fmaxf(val, 0.0f);
+                break;
+            case ActivationType::GELU:
+                val = 0.5f * val * (1.0f + tanhf(0.7978845608f * (val + 0.044715f * val * val * val)));
+                break;
+            case ActivationType::SWISH:
+                val = val / (1.0f + expf(-val));
+                break;
+            default:
+                break;
+        }
+    }
+    output[idx] = static_cast<T>(val);
 }
 
 // =============================================================================
@@ -515,19 +601,24 @@ void invokeDepthwiseConv1DTyped(const void* input, const void* weight, const voi
                                 void* output, int batch_size, int seq_len, int channels,
                                 int kernel_size, int padding, bool is_causal,
                                 cudaStream_t stream) {
+    if (channels <= 1024) {
+        depthwiseConv1DBlockPerPositionKernel<T><<<batch_size * seq_len, channels, 0, stream>>>(
+            static_cast<const T*>(input), static_cast<const T*>(weight),
+            static_cast<const T*>(bias), static_cast<T*>(output),
+            batch_size, seq_len, channels, kernel_size, padding, is_causal);
+        return;
+    }
+
     int total_elements = batch_size * seq_len * channels;
-    int block_size = 256;
-    int grid_size = (total_elements + block_size - 1) / block_size;
-    
-    // Use optimized kernel for common kernel sizes
+    int block_size     = 256;
+    int grid_size      = (total_elements + block_size - 1) / block_size;
     constexpr int tile_size = 128;
-    
-    // Dispatch based on kernel size
+
     switch (kernel_size) {
         case 3: {
             dim3 grid((seq_len + tile_size - 1) / tile_size, channels, batch_size);
             int halo = is_causal ? 2 : 1;
-            int shared_size = (tile_size + 2 * halo) * sizeof(T);
+            int shared_size = (tile_size + 2 * halo) * sizeof(T) + 3 * sizeof(float);
             depthwiseConv1DKernelOptimized<T, 3><<<grid, tile_size, shared_size, stream>>>(
                 static_cast<const T*>(input), static_cast<const T*>(weight),
                 static_cast<const T*>(bias), static_cast<T*>(output),
@@ -537,7 +628,7 @@ void invokeDepthwiseConv1DTyped(const void* input, const void* weight, const voi
         case 7: {
             dim3 grid((seq_len + tile_size - 1) / tile_size, channels, batch_size);
             int halo = is_causal ? 6 : 3;
-            int shared_size = (tile_size + 2 * halo) * sizeof(T);
+            int shared_size = (tile_size + 2 * halo) * sizeof(T) + 7 * sizeof(float);
             depthwiseConv1DKernelOptimized<T, 7><<<grid, tile_size, shared_size, stream>>>(
                 static_cast<const T*>(input), static_cast<const T*>(weight),
                 static_cast<const T*>(bias), static_cast<T*>(output),
@@ -547,7 +638,7 @@ void invokeDepthwiseConv1DTyped(const void* input, const void* weight, const voi
         case 15: {
             dim3 grid((seq_len + tile_size - 1) / tile_size, channels, batch_size);
             int halo = is_causal ? 14 : 7;
-            int shared_size = (tile_size + 2 * halo) * sizeof(T);
+            int shared_size = (tile_size + 2 * halo) * sizeof(T) + 15 * sizeof(float);
             depthwiseConv1DKernelOptimized<T, 15><<<grid, tile_size, shared_size, stream>>>(
                 static_cast<const T*>(input), static_cast<const T*>(weight),
                 static_cast<const T*>(bias), static_cast<T*>(output),
@@ -557,7 +648,7 @@ void invokeDepthwiseConv1DTyped(const void* input, const void* weight, const voi
         case 31: {
             dim3 grid((seq_len + tile_size - 1) / tile_size, channels, batch_size);
             int halo = is_causal ? 30 : 15;
-            int shared_size = (tile_size + 2 * halo) * sizeof(T);
+            int shared_size = (tile_size + 2 * halo) * sizeof(T) + 31 * sizeof(float);
             depthwiseConv1DKernelOptimized<T, 31><<<grid, tile_size, shared_size, stream>>>(
                 static_cast<const T*>(input), static_cast<const T*>(weight),
                 static_cast<const T*>(bias), static_cast<T*>(output),
@@ -565,14 +656,10 @@ void invokeDepthwiseConv1DTyped(const void* input, const void* weight, const voi
             break;
         }
         default:
-            // Fall back to general kernel
             depthwiseConv1DKernel<T><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const T*>(input),
-                static_cast<const T*>(weight),
-                static_cast<const T*>(bias),
-                static_cast<T*>(output),
-                batch_size, seq_len, channels, kernel_size, padding, is_causal
-            );
+                static_cast<const T*>(input), static_cast<const T*>(weight),
+                static_cast<const T*>(bias), static_cast<T*>(output),
+                batch_size, seq_len, channels, kernel_size, padding, is_causal);
             break;
     }
 }
@@ -658,45 +745,87 @@ void invokeDepthwiseConv1D(const void* input, const void* weight, const void* bi
 void invokePointwiseConv1D(const void* input, const void* weight, const void* bias,
                            void* output, int batch_size, int seq_len,
                            int in_channels, int out_channels,
+                           PointwiseConvBackend backend,
                            ActivationType activation, bool fuse_activation,
                            DataType dtype, cudaStream_t stream) {
+    const int M = batch_size * seq_len;
+    const int N = out_channels;
+    const int K = in_channels;
     int num_positions = batch_size * seq_len;
-    int block_size = std::min(out_channels, MAX_THREADS_PER_BLOCK);
-    
-    switch (dtype) {
-        case DataType::FP32:
-            pointwiseConv1DKernel<float><<<num_positions, block_size, 0, stream>>>(
-                static_cast<const float*>(input),
-                static_cast<const float*>(weight),
-                static_cast<const float*>(bias),
-                static_cast<float*>(output),
-                batch_size, seq_len, in_channels, out_channels,
-                activation, fuse_activation
-            );
-            break;
-        case DataType::FP16:
-            pointwiseConv1DKernel<half><<<num_positions, block_size, 0, stream>>>(
-                static_cast<const half*>(input),
-                static_cast<const half*>(weight),
-                static_cast<const half*>(bias),
-                static_cast<half*>(output),
-                batch_size, seq_len, in_channels, out_channels,
-                activation, fuse_activation
-            );
-            break;
-        case DataType::BF16:
-            pointwiseConv1DKernel<__nv_bfloat16><<<num_positions, block_size, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(input),
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<const __nv_bfloat16*>(bias),
-                static_cast<__nv_bfloat16*>(output),
-                batch_size, seq_len, in_channels, out_channels,
-                activation, fuse_activation
-            );
-            break;
-        default:
-            throw std::runtime_error("Unsupported data type for PointwiseConv1D");
+    int block_size   = std::min(out_channels, MAX_THREADS_PER_BLOCK);
+    cudaStream_t s   = (stream != nullptr) ? stream : 0;
+
+    if (backend == PointwiseConvBackend::CUTLASS) {
+        if (dtype != DataType::FP16 && dtype != DataType::BF16) {
+            throw std::runtime_error("PointwiseConv1D CUTLASS backend requires FP16 or BF16");
+        }
+        namespace gm = oasr::kernels::gemm;
+        gm::GemmParams params;
+        params.A      = input;
+        params.B      = weight;
+        params.D     = output;
+        params.M     = M;
+        params.N     = N;
+        params.K     = K;
+        params.lda   = K;
+        params.ldb   = K;
+        params.ldd   = N;
+        params.trans_b = gm::TransposeOp::Transpose;
+        params.dtype_a = dtype;
+        params.dtype_b = dtype;
+        params.dtype_d = dtype;
+        params.stream = stream;
+        gm::GemmStatus status = gm::invokeGemm(params);
+        if (status != gm::GemmStatus::SUCCESS) {
+            throw std::runtime_error(std::string("PointwiseConv1D CUTLASS failed: ") +
+                                     gm::getGemmStatusString(status));
+        }
+        int total_elements = M * N;
+        int grid_size      = (total_elements + block_size - 1) / block_size;
+        if (dtype == DataType::FP16) {
+            pointwiseBiasActivationKernel<half><<<grid_size, block_size, 0, s>>>(
+                static_cast<half*>(output), static_cast<const half*>(bias),
+                batch_size, seq_len, out_channels, activation, fuse_activation);
+        } else {
+            pointwiseBiasActivationKernel<__nv_bfloat16><<<grid_size, block_size, 0, s>>>(
+                static_cast<__nv_bfloat16*>(output), static_cast<const __nv_bfloat16*>(bias),
+                batch_size, seq_len, out_channels, activation, fuse_activation);
+        }
+        return;
     }
+
+    if (backend == PointwiseConvBackend::NATIVE) {
+        switch (dtype) {
+            case DataType::FP32:
+                pointwiseConv1DKernel<float><<<num_positions, block_size, 0, stream>>>(
+                    static_cast<const float*>(input), static_cast<const float*>(weight),
+                    static_cast<const float*>(bias), static_cast<float*>(output),
+                    batch_size, seq_len, in_channels, out_channels,
+                    activation, fuse_activation);
+                break;
+            case DataType::FP16:
+                pointwiseConv1DKernel<half><<<num_positions, block_size, 0, stream>>>(
+                    static_cast<const half*>(input), static_cast<const half*>(weight),
+                    static_cast<const half*>(bias), static_cast<half*>(output),
+                    batch_size, seq_len, in_channels, out_channels,
+                    activation, fuse_activation);
+                break;
+            case DataType::BF16:
+                pointwiseConv1DKernel<__nv_bfloat16><<<num_positions, block_size, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(input),
+                    static_cast<const __nv_bfloat16*>(weight),
+                    static_cast<const __nv_bfloat16*>(bias),
+                    static_cast<__nv_bfloat16*>(output),
+                    batch_size, seq_len, in_channels, out_channels,
+                    activation, fuse_activation);
+                break;
+            default:
+                throw std::runtime_error("Unsupported data type for PointwiseConv1D");
+        }
+        return;
+    }
+
+    throw std::runtime_error("PointwiseConv1D: invalid backend");
 }
 
 void invokeGLU(const void* input, void* output,

@@ -9,6 +9,12 @@
 namespace oasr {
 namespace kernels {
 
+/** Backend for pointwise (1x1) convolution: native CUDA kernel or CUTLASS GEMM. */
+enum class PointwiseConvBackend {
+    NATIVE = 0,
+    CUTLASS = 1,
+};
+
 /**
  * @brief Parameters for 1D convolution kernels
  * 

@@ -109,40 +109,59 @@ GemmStatus invokeGemm(const GemmParams& params) {
     if (params.M <= 0 || params.N <= 0 || params.K <= 0) {
         return GemmStatus::INVALID_ARGUMENT;
     }
-    
+    const bool trans_b = (params.trans_b == TransposeOp::Transpose);
+    const int64_t ldb = trans_b ? params.K : params.ldb;
+
     if (params.dtype_a == DataType::FP16 && params.dtype_b == DataType::FP16) {
         using DType = cutlass::half_t;
         using LayoutA = cutlass::layout::RowMajor;
-        using LayoutB = cutlass::layout::RowMajor;
+        using LayoutBTrans = cutlass::layout::ColumnMajor;
+        using LayoutBNoTrans = cutlass::layout::RowMajor;
         using LayoutC = cutlass::layout::RowMajor;
-        
-        return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutB, LayoutC>::run(
+        if (trans_b) {
+            return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutBTrans, LayoutC>::run(
+                reinterpret_cast<const DType*>(params.A),
+                reinterpret_cast<const DType*>(params.B),
+                reinterpret_cast<DType*>(params.D),
+                params.M, params.N, params.K,
+                params.lda, ldb, params.ldd,
+                params.alpha, params.beta,
+                params.stream);
+        }
+        return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutBNoTrans, LayoutC>::run(
             reinterpret_cast<const DType*>(params.A),
             reinterpret_cast<const DType*>(params.B),
             reinterpret_cast<DType*>(params.D),
             params.M, params.N, params.K,
             params.lda, params.ldb, params.ldd,
             params.alpha, params.beta,
-            params.stream
-        );
+            params.stream);
     }
-    else if (params.dtype_a == DataType::BF16 && params.dtype_b == DataType::BF16) {
+    if (params.dtype_a == DataType::BF16 && params.dtype_b == DataType::BF16) {
         using DType = cutlass::bfloat16_t;
         using LayoutA = cutlass::layout::RowMajor;
-        using LayoutB = cutlass::layout::RowMajor;
+        using LayoutBTrans = cutlass::layout::ColumnMajor;
+        using LayoutBNoTrans = cutlass::layout::RowMajor;
         using LayoutC = cutlass::layout::RowMajor;
-        
-        return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutB, LayoutC>::run(
+        if (trans_b) {
+            return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutBTrans, LayoutC>::run(
+                reinterpret_cast<const DType*>(params.A),
+                reinterpret_cast<const DType*>(params.B),
+                reinterpret_cast<DType*>(params.D),
+                params.M, params.N, params.K,
+                params.lda, ldb, params.ldd,
+                params.alpha, params.beta,
+                params.stream);
+        }
+        return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutBNoTrans, LayoutC>::run(
             reinterpret_cast<const DType*>(params.A),
             reinterpret_cast<const DType*>(params.B),
             reinterpret_cast<DType*>(params.D),
             params.M, params.N, params.K,
             params.lda, params.ldb, params.ldd,
             params.alpha, params.beta,
-            params.stream
-        );
+            params.stream);
     }
-    
     return GemmStatus::NOT_SUPPORTED;
 }
 
