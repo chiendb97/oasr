@@ -224,20 +224,29 @@ if(BUILD_PYTHON)
     )
     
     pybind11_add_module(_C ${PYBIND_SOURCES})
-    
+
     target_include_directories(_C PRIVATE
         ${CMAKE_SOURCE_DIR}/csrc
         ${CUDAToolkit_INCLUDE_DIRS}
     )
     
     target_link_libraries(_C PRIVATE oasr_core)
-    
-    # Set output directory
+
+    # Set output directory for the Python module (never write into source tree).
+    # - When built via setuptools (setup.py), CMAKE_LIBRARY_OUTPUT_DIRECTORY is
+    #   set and the .so is placed under build/.
+    # - For standalone CMake builds, use the build tree so python/oasr stays clean.
+    if(CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+        set(PYTHON_MODULE_OUTPUT_DIR ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
+    else()
+        set(PYTHON_MODULE_OUTPUT_DIR ${CMAKE_BINARY_DIR}/oasr)
+    endif()
+
     set_target_properties(_C PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/python/oasr
+        LIBRARY_OUTPUT_DIRECTORY ${PYTHON_MODULE_OUTPUT_DIR}
     )
     
-    message(STATUS "Python module will be built to: ${CMAKE_SOURCE_DIR}/python/oasr/_C${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    message(STATUS "Python module will be built to: ${PYTHON_MODULE_OUTPUT_DIR}/_C${CMAKE_SHARED_LIBRARY_SUFFIX}")
 endif()
 
 # =============================================================================

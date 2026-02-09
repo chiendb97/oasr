@@ -220,8 +220,7 @@ PYBIND11_MODULE(_C, m) {
              py::arg("padding") = 0, py::arg("is_causal") = false,
              py::arg("dtype") = oasr::DataType::FP16,
              "Depthwise 1D convolution kernel");
-    
-    // Pointwise Conv1D
+
     conv.def("pointwise_conv1d",
              [](intptr_t input, intptr_t weight, intptr_t bias,
                 intptr_t output, int batch_size, int seq_len,

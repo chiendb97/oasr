@@ -38,10 +38,9 @@ void invokeDepthwiseConv1D(const void* input, const void* weight, const void* bi
 
 /**
  * @brief Pointwise (1x1) convolution
- * 
- * Essentially a linear projection, but kept as conv for consistency.
- * Can be fused with activation.
- * 
+ *
+ * Essentially a linear projection. Can be fused with activation.
+ *
  * @param input Input [batch, seq_len, in_channels]
  * @param weight Weight [out_channels, in_channels]
  * @param bias Optional bias [out_channels]

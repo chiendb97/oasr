@@ -3,6 +3,9 @@
 Performance benchmarks for convolution kernels.
 Uses triton.testing.do_bench for accurate GPU timing.
 
+Problem sizes align with WeNet Conformer-base (cnn_module_kernel=15) /
+Conformer-large (cnn_module_kernel=31); 10 sec audio, batch up to 64.
+
 Profiling mode for NVIDIA Nsight Compute:
     ncu --set full -o profile_report python bench_conv_kernels.py \
     --profile --kernel swish --target oasr \
@@ -198,8 +201,8 @@ def setup_batch_norm_swish(batch_size, seq_len, channels, dtype=torch.float16):
     return oasr_fn, pytorch_fn
 
 
-def setup_conformer_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.float16):
-    """Setup tensors for Conformer conv block."""
+def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.float16):
+    """Setup tensors for conv block (depthwise + pointwise + GLU + swish)."""
     x = torch.randn(batch_size, seq_len, d_model, device='cuda', dtype=dtype)
     
     pw1_weight = torch.randn(2 * d_model, d_model, device='cuda', dtype=dtype)
@@ -259,23 +262,24 @@ def setup_conformer_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=
 # Benchmark functions
 # =============================================================================
 
+
 def benchmark_depthwise_conv1d():
-    """Benchmark DepthwiseConv1D: OASR vs PyTorch."""
+    """Benchmark DepthwiseConv1D: OASR vs PyTorch. Conformer CNN module (B, T_enc, d_model, kernel)."""
     import triton
-    
-    print("\n" + "=" * 70)
-    print("DepthwiseConv1D Benchmark")
-    print("=" * 70)
-    
+
     configs = [
-        (16, 256, 256, 7),
-        (16, 256, 256, 31),
-        (32, 512, 512, 31),
-        (32, 512, 512, 63),
-        (64, 512, 256, 31),
-        (64, 1024, 512, 31),
+        (32, 250, 256, 15),
+        (64, 250, 256, 15),
+        (64, 250, 512, 31),
+        (64, 500, 256, 15),
+        (64, 500, 512, 31),
+        (32, 125, 256, 15),
+        (64, 125, 512, 31),
     ]
-    
+
+    print("\n" + "=" * 70)
+    print("DepthwiseConv1D Benchmark (Conformer CNN module)")
+    print("=" * 70)
     print(f"\n{'Shape':<35} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 75)
     
@@ -291,19 +295,19 @@ def benchmark_depthwise_conv1d():
 
 
 def benchmark_depthwise_conv1d_causal():
-    """Benchmark causal DepthwiseConv1D."""
+    """Benchmark causal DepthwiseConv1D. Conformer (B, T_enc, d_model, kernel)."""
     import triton
-    
-    print("\n" + "=" * 70)
-    print("DepthwiseConv1D (Causal) Benchmark")
-    print("=" * 70)
-    
+
     configs = [
-        (16, 256, 256, 31),
-        (32, 512, 512, 31),
-        (64, 1024, 512, 31),
+        (32, 250, 256, 15),
+        (64, 250, 256, 15),
+        (64, 250, 512, 31),
+        (64, 500, 512, 31),
     ]
-    
+
+    print("\n" + "=" * 70)
+    print("DepthwiseConv1D (Causal) Benchmark (Conformer workload)")
+    print("=" * 70)
     print(f"\n{'Shape':<35} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 75)
     
@@ -319,20 +323,22 @@ def benchmark_depthwise_conv1d_causal():
 
 
 def benchmark_pointwise_conv1d():
-    """Benchmark PointwiseConv1D (linear projection)."""
+    """Benchmark PointwiseConv1D (linear projection). Conformer (B, T_enc, in_ch, out_ch)."""
     import triton
-    
-    print("\n" + "=" * 70)
-    print("PointwiseConv1D (Linear) Benchmark")
-    print("=" * 70)
-    
+
     configs = [
-        (16, 256, 256, 512),
-        (32, 512, 512, 1024),
-        (32, 512, 512, 2048),
-        (64, 512, 768, 768),
+        (32, 250, 256, 512),
+        (64, 250, 256, 512),
+        (64, 250, 512, 1024),
+        (64, 250, 256, 2048),
+        (64, 250, 512, 2048),
+        (64, 500, 256, 512),
+        (64, 500, 512, 1024),
     ]
-    
+
+    print("\n" + "=" * 70)
+    print("PointwiseConv1D (Linear) Benchmark (Conformer conv/FFN)")
+    print("=" * 70)
     print(f"\n{'Shape':<40} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 80)
     
@@ -348,20 +354,20 @@ def benchmark_pointwise_conv1d():
 
 
 def benchmark_glu():
-    """Benchmark GLU activation."""
+    """Benchmark GLU activation. Conformer conv block (B, T_enc, d_model) after expand."""
     import triton
-    
-    print("\n" + "=" * 70)
-    print("GLU Activation Benchmark")
-    print("=" * 70)
-    
+
     configs = [
-        (16, 256, 256),
-        (32, 512, 512),
-        (64, 512, 1024),
-        (64, 1024, 512),
+        (32, 250, 256),
+        (64, 250, 256),
+        (64, 250, 512),
+        (64, 500, 256),
+        (64, 500, 512),
     ]
-    
+
+    print("\n" + "=" * 70)
+    print("GLU Activation Benchmark (Conformer conv block)")
+    print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
     
@@ -377,19 +383,19 @@ def benchmark_glu():
 
 
 def benchmark_swish():
-    """Benchmark Swish (SiLU) activation."""
+    """Benchmark Swish (SiLU) activation. Conformer (B, T_enc, d_model)."""
     import triton
-    
-    print("\n" + "=" * 70)
-    print("Swish Activation Benchmark")
-    print("=" * 70)
-    
+
     configs = [
-        (32, 512, 512),
-        (64, 512, 1024),
-        (64, 1024, 512),
+        (32, 250, 256),
+        (64, 250, 256),
+        (64, 250, 512),
+        (64, 500, 512),
     ]
-    
+
+    print("\n" + "=" * 70)
+    print("Swish Activation Benchmark (Conformer workload)")
+    print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
     
@@ -405,19 +411,19 @@ def benchmark_swish():
 
 
 def benchmark_batch_norm_swish():
-    """Benchmark fused BatchNorm + Swish."""
+    """Benchmark fused BatchNorm + Swish. Conformer (B, T_enc, channels)."""
     import triton
-    
-    print("\n" + "=" * 70)
-    print("BatchNorm + Swish (Fused) Benchmark")
-    print("=" * 70)
-    
+
     configs = [
-        (16, 512, 256),
-        (32, 512, 512),
-        (64, 512, 512),
+        (32, 250, 256),
+        (64, 250, 256),
+        (64, 250, 512),
+        (64, 500, 512),
     ]
-    
+
+    print("\n" + "=" * 70)
+    print("BatchNorm + Swish (Fused) Benchmark (Conformer workload)")
+    print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
     
@@ -432,25 +438,26 @@ def benchmark_batch_norm_swish():
         print(f"{shape_str:<30} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
 
 
-def benchmark_conformer_conv_block():
-    """Benchmark full Conformer conv block."""
+def benchmark_conv_block():
+    """Benchmark full conv block (depthwise + pointwise + GLU + swish)."""
     import triton
-    
-    print("\n" + "=" * 70)
-    print("Conformer Conv Block (End-to-End) Benchmark")
-    print("=" * 70)
-    
+
     configs = [
-        (16, 256, 256, 31),
-        (32, 512, 512, 31),
-        (32, 512, 256, 31),
+        (32, 250, 256, 15),
+        (64, 250, 256, 15),
+        (64, 250, 512, 31),
+        (64, 500, 256, 15),
+        (64, 500, 512, 31),
     ]
-    
+
+    print("\n" + "=" * 70)
+    print("Conv Block (End-to-End) Benchmark")
+    print("=" * 70)
     print(f"\n{'Config':<35} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 75)
     
     for batch_size, seq_len, d_model, kernel_size in configs:
-        oasr_fn, pytorch_fn = setup_conformer_conv_block(batch_size, seq_len, d_model, kernel_size)
+        oasr_fn, pytorch_fn = setup_conv_block(batch_size, seq_len, d_model, kernel_size)
         
         oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
         pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
@@ -464,15 +471,15 @@ def benchmark_conformer_conv_block():
 # Profiling functions
 # =============================================================================
 
-# Default profiling configs (representative sizes)
+# Default profiling configs (B=64, T=250)
 PROFILE_CONFIGS = {
-    'depthwise_conv1d': (32, 512, 512, 31),
-    'depthwise_conv1d_causal': (32, 512, 512, 31),
-    'pointwise_conv1d': (32, 512, 512, 1024),
-    'glu': (32, 512, 512),
-    'swish': (32, 512, 512),
-    'batch_norm_swish': (32, 512, 512),
-    'conformer_conv_block': (32, 512, 512, 31),
+    'depthwise_conv1d': (64, 250, 512, 31),
+    'depthwise_conv1d_causal': (64, 250, 512, 31),
+    'pointwise_conv1d': (64, 250, 512, 1024),
+    'glu': (64, 250, 512),
+    'swish': (64, 250, 512),
+    'batch_norm_swish': (64, 250, 512),
+    'conv_block': (64, 250, 512, 31),
 }
 
 
@@ -499,7 +506,7 @@ def profile_kernels(kernels: list, target: str = 'both', warmup: int = 3, iters:
         'glu': lambda: setup_glu(*PROFILE_CONFIGS['glu']),
         'swish': lambda: setup_swish(*PROFILE_CONFIGS['swish']),
         'batch_norm_swish': lambda: setup_batch_norm_swish(*PROFILE_CONFIGS['batch_norm_swish']),
-        'conformer_conv_block': lambda: setup_conformer_conv_block(*PROFILE_CONFIGS['conformer_conv_block']),
+        'conv_block': lambda: setup_conv_block(*PROFILE_CONFIGS['conv_block']),
     }
     
     for kernel_name in kernels:
@@ -560,7 +567,7 @@ Examples:
 
 Available kernels:
   depthwise_conv1d, depthwise_conv1d_causal, pointwise_conv1d,
-  glu, swish, batch_norm_swish, conformer_conv_block
+  glu, swish, batch_norm_swish, conv_block
         """
     )
     
@@ -607,7 +614,7 @@ Available kernels:
         benchmark_glu()
         benchmark_swish()
         benchmark_batch_norm_swish()
-        benchmark_conformer_conv_block()
+        benchmark_conv_block()
         
         print("\n" + "=" * 70)
         print("Benchmarks complete!")

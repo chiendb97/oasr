@@ -3,6 +3,9 @@
 Performance benchmarks for normalization kernels.
 Uses triton.testing.do_bench for accurate GPU timing.
 
+Problem sizes align with WeNet (10 sec audio, batch up to 64):
+  train_conformer.yaml, train_conformer_bidecoder_large.yaml
+
 Profiling mode for NVIDIA Nsight Compute:
     ncu --set full -o profile_report python bench_norm_kernels.py \
     --profile --kernel layer_norm --target oasr \
@@ -191,23 +194,23 @@ def setup_batch_norm(batch_size, seq_len, channels, dtype=torch.float32):
 # Benchmark functions
 # =============================================================================
 
+
 def benchmark_layer_norm():
-    """Benchmark LayerNorm: OASR vs PyTorch."""
+    """Benchmark LayerNorm: OASR vs PyTorch. Sizes from WeNet Conformer-base/large (B,T,d_model)."""
     import triton
-    
-    print("\n" + "=" * 70)
-    print("LayerNorm Benchmark")
-    print("=" * 70)
-    
+
     configs = [
-        (8, 256, 256),
-        (16, 512, 512),
-        (32, 512, 512),
-        (32, 512, 768),
-        (32, 512, 1024),
-        (64, 1024, 512),
+        (32, 250, 256),
+        (64, 250, 256),
+        (64, 250, 512),
+        (64, 500, 256),
+        (64, 500, 512),
+        (32, 500, 512),
     ]
-    
+
+    print("\n" + "=" * 70)
+    print("LayerNorm Benchmark (Conformer encoder workload)")
+    print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
     
@@ -223,20 +226,19 @@ def benchmark_layer_norm():
 
 
 def benchmark_rms_norm():
-    """Benchmark RMSNorm: OASR vs manual PyTorch."""
+    """Benchmark RMSNorm: OASR vs manual PyTorch. Conformer (B, T_enc, d_model)."""
     import triton
-    
-    print("\n" + "=" * 70)
-    print("RMSNorm Benchmark")
-    print("=" * 70)
-    
+
     configs = [
-        (16, 512, 512),
-        (32, 512, 768),
-        (32, 512, 1024),
-        (64, 1024, 512),
+        (32, 250, 256),
+        (64, 250, 256),
+        (64, 250, 512),
+        (64, 500, 512),
     ]
-    
+
+    print("\n" + "=" * 70)
+    print("RMSNorm Benchmark (Conformer workload)")
+    print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
     
@@ -252,19 +254,19 @@ def benchmark_rms_norm():
 
 
 def benchmark_add_layer_norm():
-    """Benchmark fused Add + LayerNorm."""
+    """Benchmark fused Add + LayerNorm. Conformer (B, T_enc, d_model)."""
     import triton
-    
-    print("\n" + "=" * 70)
-    print("Add + LayerNorm (Fused) Benchmark")
-    print("=" * 70)
-    
+
     configs = [
-        (16, 512, 512),
-        (32, 512, 768),
-        (32, 512, 1024),
+        (32, 250, 256),
+        (64, 250, 256),
+        (64, 250, 512),
+        (64, 500, 512),
     ]
-    
+
+    print("\n" + "=" * 70)
+    print("Add + LayerNorm (Fused) Benchmark (Conformer workload)")
+    print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
     
@@ -280,19 +282,19 @@ def benchmark_add_layer_norm():
 
 
 def benchmark_group_norm():
-    """Benchmark GroupNorm."""
+    """Benchmark GroupNorm. Conformer (B, T_enc, channels, num_groups)."""
     import triton
-    
-    print("\n" + "=" * 70)
-    print("GroupNorm Benchmark")
-    print("=" * 70)
-    
+
     configs = [
-        (8, 256, 256, 32),
-        (16, 512, 512, 32),
-        (32, 256, 512, 64),
+        (32, 250, 256, 32),
+        (64, 250, 256, 32),
+        (64, 250, 512, 64),
+        (64, 500, 512, 64),
     ]
-    
+
+    print("\n" + "=" * 70)
+    print("GroupNorm Benchmark (Conformer workload)")
+    print("=" * 70)
     print(f"\n{'Shape':<35} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 75)
     
@@ -308,19 +310,19 @@ def benchmark_group_norm():
 
 
 def benchmark_batch_norm():
-    """Benchmark BatchNorm1D (inference)."""
+    """Benchmark BatchNorm1D (inference). Conformer (B, T_enc, channels)."""
     import triton
-    
-    print("\n" + "=" * 70)
-    print("BatchNorm1D (Inference) Benchmark")
-    print("=" * 70)
-    
+
     configs = [
-        (16, 512, 256),
-        (32, 512, 512),
-        (64, 1024, 256),
+        (32, 250, 256),
+        (64, 250, 256),
+        (64, 250, 512),
+        (64, 500, 512),
     ]
-    
+
+    print("\n" + "=" * 70)
+    print("BatchNorm1D (Inference) Benchmark (Conformer workload)")
+    print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
     
@@ -339,13 +341,13 @@ def benchmark_batch_norm():
 # Profiling functions
 # =============================================================================
 
-# Default profiling configs (representative sizes)
+# Default profiling configs (B=64, T=250)
 PROFILE_CONFIGS = {
-    'layer_norm': (32, 512, 512),
-    'rms_norm': (32, 512, 512),
-    'add_layer_norm': (32, 512, 512),
-    'group_norm': (16, 512, 512, 32),
-    'batch_norm': (32, 512, 512),
+    'layer_norm': (64, 250, 256),
+    'rms_norm': (64, 250, 256),
+    'add_layer_norm': (64, 250, 512),
+    'group_norm': (64, 250, 512, 64),
+    'batch_norm': (64, 250, 512),
 }
 
 

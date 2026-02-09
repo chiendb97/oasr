@@ -3,6 +3,9 @@
 Performance benchmarks for GEMM, Batched GEMM, and Grouped GEMM kernels.
 Uses triton.testing.do_bench for accurate GPU timing.
 
+Problem sizes align with WeNet Conformer-base (d_model=256, linear_units=2048) /
+Conformer-large (d_model=512); 10 sec audio, batch up to 64.
+
 Profiling mode for NVIDIA Nsight Compute:
     ncu --set full -o profile_report python bench_gemm_kernels.py \
     --profile --kernel gemm --target oasr \
@@ -210,22 +213,26 @@ def setup_group_gemm(problem_sizes, dtype=torch.float16):
 # Benchmark functions
 # =============================================================================
 
+
 def benchmark_gemm():
-    """Benchmark GEMM: OASR vs PyTorch."""
+    """Benchmark GEMM: OASR vs PyTorch. Sizes from WeNet (10 sec audio, batch up to 64)."""
     import triton
 
-    print("\n" + "=" * 70)
-    print("GEMM Benchmark")
-    print("=" * 70)
-
     configs = [
-        (256, 256, 256),
-        (512, 512, 512),
-        (1024, 1024, 1024),
-        (128, 4096, 768),
-        (512, 768, 768),
+        (8000, 256, 256),
+        (16000, 256, 256),
+        (16000, 2048, 256),
+        (16000, 256, 2048),
+        (16000, 512, 512),
+        (16000, 2048, 512),
+        (16000, 512, 2048),
+        (32000, 256, 256),
+        (32000, 512, 512),
     ]
 
+    print("\n" + "=" * 70)
+    print("GEMM Benchmark (Conformer-base / Conformer-large workload)")
+    print("=" * 70)
     print(f"\n{'Shape (M, N, K)':<25} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 65)
 
@@ -241,20 +248,20 @@ def benchmark_gemm():
 
 
 def benchmark_bmm():
-    """Benchmark Batched GEMM: OASR vs PyTorch."""
+    """Benchmark Batched GEMM: OASR vs PyTorch. Sizes from WeNet Conformer attention (B*heads, T, head_dim)."""
     import triton
 
-    print("\n" + "=" * 70)
-    print("Batched GEMM (BMM) Benchmark")
-    print("=" * 70)
-
     configs = [
-        (16, 128, 128, 256),
-        (32, 256, 256, 256),
-        (64, 128, 512, 256),
-        (32, 512, 768, 768),
+        (256, 250, 250, 64),
+        (512, 250, 250, 64),
+        (256, 125, 125, 64),
+        (512, 500, 500, 64),
+        (64, 250, 64, 64),
     ]
 
+    print("\n" + "=" * 70)
+    print("Batched GEMM (BMM) Benchmark (Conformer attention workload)")
+    print("=" * 70)
     print(f"\n{'Shape (B, M, N, K)':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
 
@@ -270,20 +277,19 @@ def benchmark_bmm():
 
 
 def benchmark_group_gemm():
-    """Benchmark Grouped GEMM: OASR vs PyTorch loop."""
+    """Benchmark Grouped GEMM: OASR vs PyTorch loop. Sizes from Conformer multi-block/head."""
     import triton
 
-    print("\n" + "=" * 70)
-    print("Grouped GEMM Benchmark")
-    print("=" * 70)
-
-    # Same (M, N, K) for all problems
     configs = [
-        (16, (128, 256, 128)),  # 16 problems, each 128x256 @ 128x256
-        (32, (64, 512, 256)),
-        (64, (32, 256, 128)),
+        (64, (250, 64, 64)),
+        (256, (250, 64, 64)),
+        (12, (16000, 256, 2048)),
+        (12, (16000, 512, 2048)),
     ]
 
+    print("\n" + "=" * 70)
+    print("Grouped GEMM Benchmark (Conformer multi-block/head workload)")
+    print("=" * 70)
     print(f"\n{'Config':<40} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 80)
 
@@ -303,11 +309,11 @@ def benchmark_group_gemm():
 # Profiling functions
 # =============================================================================
 
-# Default profiling configs (representative sizes)
+# Default profiling configs (Conformer representative sizes)
 PROFILE_CONFIGS = {
-    'gemm': (512, 512, 512),
-    'bmm': (32, 256, 256, 256),
-    'group_gemm': (16, (128, 256, 128)),  # num_problems, (M, N, K)
+    'gemm': (16000, 256, 2048),   # FFN reduce, B=64 T=250
+    'bmm': (256, 250, 250, 64),   # attention Q@K^T
+    'group_gemm': (64, (250, 64, 64)),  # num_problems, (M, N, K)
 }
 
 
