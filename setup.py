@@ -8,7 +8,6 @@ Setup script for building and installing the OASR package.
 import os
 import sys
 import subprocess
-import shutil
 import sysconfig
 from pathlib import Path
 
@@ -78,22 +77,12 @@ class CMakeBuild(build_ext):
             cwd=build_dir
         )
         
-        # Run CMake build
+        # Run CMake build (extension is built directly into ext_dir)
         print(f"CMake build: {' '.join(build_args)}")
         subprocess.check_call(
             ["cmake", "--build", "."] + build_args,
             cwd=build_dir
         )
-        
-        # Copy the built library to the package directory if needed
-        # CMake outputs to source_dir/python/oasr, but setuptools expects it in ext_dir
-        ext_suffix = get_ext_suffix()
-        source_lib = Path(ext.sourcedir) / "python" / "oasr" / f"_C{ext_suffix}"
-        target = ext_dir / f"_C{ext_suffix}"
-        
-        if source_lib.exists() and source_lib.resolve() != target.resolve():
-            print(f"Copying {source_lib} -> {target}")
-            shutil.copy2(source_lib, target)
 
 
 def get_version() -> str:
@@ -174,6 +163,8 @@ setup(
     python_requires=">=3.8",
     install_requires=install_requires,
     extras_require=extras_require,
+    # Keep egg-info metadata under build/ instead of polluting the source tree
+    options={"egg_info": {"egg_base": "build"}},
     
     # Classifiers
     classifiers=[
