@@ -127,7 +127,6 @@ def setup_pointwise_conv1d(batch_size, seq_len, in_ch, out_ch, dtype=torch.float
         oasr.kernels.convolution.pointwise_conv1d(
             x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
             batch_size, seq_len, in_ch, out_ch,
-            oasr.kernels.convolution.PointwiseConvBackend.CUTLASS,
             oasr.ActivationType.SWISH, False, dtype_map[dtype]
         )
     
@@ -222,12 +221,11 @@ def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.floa
     dw_weight_pt = dw_weight.view(d_model, 1, kernel_size)
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
-    backend = oasr.kernels.convolution.PointwiseConvBackend.CUTLASS
     def oasr_fn():
         oasr.kernels.convolution.pointwise_conv1d(
             x.data_ptr(), pw1_weight.data_ptr(), pw1_bias.data_ptr(), pw1_out.data_ptr(),
             batch_size, seq_len, d_model, 2 * d_model,
-            backend, oasr.ActivationType.SWISH, False, dtype_map[dtype]
+            oasr.ActivationType.SWISH, False, dtype_map[dtype]
         )
         oasr.kernels.convolution.glu(
             pw1_out.data_ptr(), glu_out.data_ptr(),
@@ -245,7 +243,7 @@ def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.floa
         oasr.kernels.convolution.pointwise_conv1d(
             swish_out.data_ptr(), pw2_weight.data_ptr(), pw2_bias.data_ptr(), output.data_ptr(),
             batch_size, seq_len, d_model, d_model,
-            backend, oasr.ActivationType.SWISH, False, dtype_map[dtype]
+            oasr.ActivationType.SWISH, False, dtype_map[dtype]
         )
     
     def pytorch_fn():

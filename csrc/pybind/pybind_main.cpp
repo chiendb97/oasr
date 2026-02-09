@@ -220,17 +220,11 @@ PYBIND11_MODULE(_C, m) {
              py::arg("padding") = 0, py::arg("is_causal") = false,
              py::arg("dtype") = oasr::DataType::FP16,
              "Depthwise 1D convolution kernel");
-    
-    // Pointwise Conv1D backend: NATIVE or CUTLASS (explicit; no fallback)
-    py::enum_<oasr::kernels::PointwiseConvBackend>(conv, "PointwiseConvBackend")
-        .value("NATIVE", oasr::kernels::PointwiseConvBackend::NATIVE)
-        .value("CUTLASS", oasr::kernels::PointwiseConvBackend::CUTLASS);
 
     conv.def("pointwise_conv1d",
              [](intptr_t input, intptr_t weight, intptr_t bias,
                 intptr_t output, int batch_size, int seq_len,
                 int in_channels, int out_channels,
-                oasr::kernels::PointwiseConvBackend backend,
                 oasr::ActivationType activation, bool fuse_activation,
                 oasr::DataType dtype) {
                  oasr::kernels::invokePointwiseConv1D(
@@ -238,12 +232,11 @@ PYBIND11_MODULE(_C, m) {
                      bias != 0 ? to_const_ptr(bias) : nullptr,
                      to_ptr(output), batch_size, seq_len,
                      in_channels, out_channels,
-                     backend, activation, fuse_activation, dtype, nullptr);
+                     activation, fuse_activation, dtype, nullptr);
              },
              py::arg("input"), py::arg("weight"), py::arg("bias"),
              py::arg("output"), py::arg("batch_size"), py::arg("seq_len"),
              py::arg("in_channels"), py::arg("out_channels"),
-             py::arg("backend") = oasr::kernels::PointwiseConvBackend::NATIVE,
              py::arg("activation") = oasr::ActivationType::SWISH,
              py::arg("fuse_activation") = false,
              py::arg("dtype") = oasr::DataType::FP16,

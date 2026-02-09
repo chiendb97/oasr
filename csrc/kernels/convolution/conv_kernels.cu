@@ -601,13 +601,13 @@ void invokeDepthwiseConv1DTyped(const void* input, const void* weight, const voi
                                 void* output, int batch_size, int seq_len, int channels,
                                 int kernel_size, int padding, bool is_causal,
                                 cudaStream_t stream) {
-    if (channels <= 1024) {
-        depthwiseConv1DBlockPerPositionKernel<T><<<batch_size * seq_len, channels, 0, stream>>>(
-            static_cast<const T*>(input), static_cast<const T*>(weight),
-            static_cast<const T*>(bias), static_cast<T*>(output),
-            batch_size, seq_len, channels, kernel_size, padding, is_causal);
-        return;
-    }
+    // if (channels <= 1024) {
+    //     depthwiseConv1DBlockPerPositionKernel<T><<<batch_size * seq_len, channels, 0, stream>>>(
+    //         static_cast<const T*>(input), static_cast<const T*>(weight),
+    //         static_cast<const T*>(bias), static_cast<T*>(output),
+    //         batch_size, seq_len, channels, kernel_size, padding, is_causal);
+    //     return;
+    // }
 
     int total_elements = batch_size * seq_len * channels;
     int block_size     = 256;
@@ -745,7 +745,6 @@ void invokeDepthwiseConv1D(const void* input, const void* weight, const void* bi
 void invokePointwiseConv1D(const void* input, const void* weight, const void* bias,
                            void* output, int batch_size, int seq_len,
                            int in_channels, int out_channels,
-                           PointwiseConvBackend backend,
                            ActivationType activation, bool fuse_activation,
                            DataType dtype, cudaStream_t stream) {
     const int M = batch_size * seq_len;
@@ -755,77 +754,72 @@ void invokePointwiseConv1D(const void* input, const void* weight, const void* bi
     int block_size   = std::min(out_channels, MAX_THREADS_PER_BLOCK);
     cudaStream_t s   = (stream != nullptr) ? stream : 0;
 
-    if (backend == PointwiseConvBackend::CUTLASS) {
-        if (dtype != DataType::FP16 && dtype != DataType::BF16) {
-            throw std::runtime_error("PointwiseConv1D CUTLASS backend requires FP16 or BF16");
-        }
-        namespace gm = oasr::kernels::gemm;
-        gm::GemmParams params;
-        params.A      = input;
-        params.B      = weight;
-        params.D     = output;
-        params.M     = M;
-        params.N     = N;
-        params.K     = K;
-        params.lda   = K;
-        params.ldb   = K;
-        params.ldd   = N;
-        params.trans_b = gm::TransposeOp::Transpose;
-        params.dtype_a = dtype;
-        params.dtype_b = dtype;
-        params.dtype_d = dtype;
-        params.stream = stream;
-        gm::GemmStatus status = gm::invokeGemm(params);
-        if (status != gm::GemmStatus::SUCCESS) {
-            throw std::runtime_error(std::string("PointwiseConv1D CUTLASS failed: ") +
-                                     gm::getGemmStatusString(status));
-        }
-        int total_elements = M * N;
-        int grid_size      = (total_elements + block_size - 1) / block_size;
-        if (dtype == DataType::FP16) {
-            pointwiseBiasActivationKernel<half><<<grid_size, block_size, 0, s>>>(
-                static_cast<half*>(output), static_cast<const half*>(bias),
-                batch_size, seq_len, out_channels, activation, fuse_activation);
-        } else {
-            pointwiseBiasActivationKernel<__nv_bfloat16><<<grid_size, block_size, 0, s>>>(
-                static_cast<__nv_bfloat16*>(output), static_cast<const __nv_bfloat16*>(bias),
-                batch_size, seq_len, out_channels, activation, fuse_activation);
-        }
-        return;
-    }
+    // if (backend == PointwiseConvBackend::CUTLASS) {
+    //     if (dtype != DataType::FP16 && dtype != DataType::BF16) {
+    //         throw std::runtime_error("PointwiseConv1D CUTLASS backend requires FP16 or BF16");
+    //     }
+    //     namespace gm = oasr::kernels::gemm;
+    //     gm::GemmParams params;
+    //     params.A      = input;
+    //     params.B      = weight;
+    //     params.D     = output;
+    //     params.M     = M;
+    //     params.N     = N;
+    //     params.K     = K;
+    //     params.lda   = K;
+    //     params.ldb   = K;
+    //     params.ldd   = N;
+    //     params.trans_b = gm::TransposeOp::Transpose;
+    //     params.dtype_a = dtype;
+    //     params.dtype_b = dtype;
+    //     params.dtype_d = dtype;
+    //     params.stream = stream;
+    //     gm::GemmStatus status = gm::invokeGemm(params);
+    //     if (status != gm::GemmStatus::SUCCESS) {
+    //         throw std::runtime_error(std::string("PointwiseConv1D CUTLASS failed: ") +
+    //                                  gm::getGemmStatusString(status));
+    //     }
+    //     int total_elements = M * N;
+    //     int grid_size      = (total_elements + block_size - 1) / block_size;
+    //     if (dtype == DataType::FP16) {
+    //         pointwiseBiasActivationKernel<half><<<grid_size, block_size, 0, s>>>(
+    //             static_cast<half*>(output), static_cast<const half*>(bias),
+    //             batch_size, seq_len, out_channels, activation, fuse_activation);
+    //     } else {
+    //         pointwiseBiasActivationKernel<__nv_bfloat16><<<grid_size, block_size, 0, s>>>(
+    //             static_cast<__nv_bfloat16*>(output), static_cast<const __nv_bfloat16*>(bias),
+    //             batch_size, seq_len, out_channels, activation, fuse_activation);
+    //     }
+    //     return;
+    // }
 
-    if (backend == PointwiseConvBackend::NATIVE) {
-        switch (dtype) {
-            case DataType::FP32:
-                pointwiseConv1DKernel<float><<<num_positions, block_size, 0, stream>>>(
-                    static_cast<const float*>(input), static_cast<const float*>(weight),
-                    static_cast<const float*>(bias), static_cast<float*>(output),
-                    batch_size, seq_len, in_channels, out_channels,
-                    activation, fuse_activation);
-                break;
-            case DataType::FP16:
-                pointwiseConv1DKernel<half><<<num_positions, block_size, 0, stream>>>(
-                    static_cast<const half*>(input), static_cast<const half*>(weight),
-                    static_cast<const half*>(bias), static_cast<half*>(output),
-                    batch_size, seq_len, in_channels, out_channels,
-                    activation, fuse_activation);
-                break;
-            case DataType::BF16:
-                pointwiseConv1DKernel<__nv_bfloat16><<<num_positions, block_size, 0, stream>>>(
-                    static_cast<const __nv_bfloat16*>(input),
-                    static_cast<const __nv_bfloat16*>(weight),
-                    static_cast<const __nv_bfloat16*>(bias),
-                    static_cast<__nv_bfloat16*>(output),
-                    batch_size, seq_len, in_channels, out_channels,
-                    activation, fuse_activation);
-                break;
-            default:
-                throw std::runtime_error("Unsupported data type for PointwiseConv1D");
-        }
-        return;
+    switch (dtype) {
+        case DataType::FP32:
+            pointwiseConv1DKernel<float><<<num_positions, block_size, 0, stream>>>(
+                static_cast<const float*>(input), static_cast<const float*>(weight),
+                static_cast<const float*>(bias), static_cast<float*>(output),
+                batch_size, seq_len, in_channels, out_channels,
+                activation, fuse_activation);
+            break;
+        case DataType::FP16:
+            pointwiseConv1DKernel<half><<<num_positions, block_size, 0, stream>>>(
+                static_cast<const half*>(input), static_cast<const half*>(weight),
+                static_cast<const half*>(bias), static_cast<half*>(output),
+                batch_size, seq_len, in_channels, out_channels,
+                activation, fuse_activation);
+            break;
+        case DataType::BF16:
+            pointwiseConv1DKernel<__nv_bfloat16><<<num_positions, block_size, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(input),
+                static_cast<const __nv_bfloat16*>(weight),
+                static_cast<const __nv_bfloat16*>(bias),
+                static_cast<__nv_bfloat16*>(output),
+                batch_size, seq_len, in_channels, out_channels,
+                activation, fuse_activation);
+            break;
+        default:
+            throw std::runtime_error("Unsupported data type for PointwiseConv1D");
     }
-
-    throw std::runtime_error("PointwiseConv1D: invalid backend");
 }
 
 void invokeGLU(const void* input, void* output,
