@@ -2,7 +2,6 @@
 build/
 cmake-build-*/
 .cache/
-python/
 *.o
 *.so
 *.a
