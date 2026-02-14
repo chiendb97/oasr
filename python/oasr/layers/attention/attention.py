@@ -31,61 +31,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-###############################################################################
-# Rotary embedding utilities (ported from WeNet `rope_utils.py`)
-###############################################################################
-
-
-def _precompute_freqs_cis(
-    dim: int,
-    end: int,
-    theta: float = 10000.0,
-) -> torch.Tensor:
-    """Precompute complex exponentials used for rotary embeddings.
-
-    Copied (with minimal adaptation) from:
-    https://github.com/wenet-e2e/wenet/blob/main/wenet/utils/rope_utils.py
-    """
-
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-
-def _google_apply_rotary_emb(
-    x: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> torch.Tensor:
-    """Apply rotary embedding (Google/Gemma style) to query/key tensors."""
-
-    # x: [batch, time, heads, dim]
-    x_ = torch.view_as_complex(
-        torch.stack(torch.chunk(x.float(), 2, dim=-1), dim=-1)
-    )
-    x_out = torch.view_as_real(x_ * freqs_cis).type_as(x)
-    x_out = torch.cat(torch.chunk(x_out, 2, dim=-1), dim=-2)
-    x_out = x_out.reshape(x_out.shape[0], x_out.shape[1], x_out.shape[2], -1)
-    return x_out
-
-
-def _llama_apply_rotary_emb(
-    x: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> torch.Tensor:
-    """Apply rotary embedding (LLaMA style) to query/key tensors."""
-
-    x_ = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    x_out = torch.view_as_real(x_ * freqs_cis).flatten(3)
-    return x_out.type_as(x)
-
-
-_APPLY_ROTARY_EMB = {
-    "google": _google_apply_rotary_emb,
-    "llama": _llama_apply_rotary_emb,
-}
-
+from oasr.layers.rotary_embedding import get_apply_rotary_emb
 
 T_CACHE = Tuple[torch.Tensor, torch.Tensor]
 
@@ -755,11 +701,8 @@ class RopeMultiHeadedAttention(MultiHeadedAttention):
             n_kv_head,
             head_dim,
         )
-        if style not in _APPLY_ROTARY_EMB:
-            raise ValueError(
-                f"Unknown RoPE style '{style}', supported: {list(_APPLY_ROTARY_EMB)}"
-            )
         self.style = style
+        self._apply_rotary_emb = get_apply_rotary_emb(style)
 
     def forward(
         self,
@@ -791,10 +734,9 @@ class RopeMultiHeadedAttention(MultiHeadedAttention):
         k = self._forward_linearx("key", key, head_first=False)
         v = self._forward_linearx("value", value, head_first=False)
 
-        # Apply rotary embeddings (ported behavior from WeNet)
-        apply_fn = _APPLY_ROTARY_EMB[self.style]
-        q = apply_fn(q, pos_emb)
-        k = apply_fn(k, pos_emb)
+        # Apply rotary embeddings via dedicated rotary_embedding module
+        q = self._apply_rotary_emb(q, pos_emb)
+        k = self._apply_rotary_emb(k, pos_emb)
 
         k, v, new_cache = self._update_kv_and_cache(
             k,

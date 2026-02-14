@@ -1,6 +1,6 @@
 """High-level Python layer wrappers (Conv, Linear, Norm, ...)."""
 
-from .convolution import Conv1d, DepthwiseConv1d, PointwiseConv1d
+from .conv import Conv1d, DepthwiseConv1d, PointwiseConv1d
 from .linear import Linear
 from .normalization import LayerNorm, RMSNorm, GroupNorm, BatchNorm1d, AddLayerNorm
 
