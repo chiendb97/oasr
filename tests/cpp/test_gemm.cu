@@ -1,8 +1,7 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Unit tests for GEMM, Batched GEMM (BMM), and Grouped GEMM kernels.
-// Structure and behavior aligned with tests/python/unit/test_gemm.py
+// Unit tests for GEMM, Batched GEMM (BMM), and Grouped GEMM layers.
 
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
@@ -13,12 +12,9 @@
 #include <random>
 #include <string>
 
-#include "kernels/gemm/gemm_params.h"
 #include "kernels/gemm/gemm_kernels.h"
 #include "kernels/gemm/gemm_utils.h"
-#include "kernels/gemm/bmm_params.h"
 #include "kernels/gemm/bmm_kernels.h"
-#include "kernels/gemm/group_gemm_params.h"
 #include "kernels/gemm/group_gemm_kernels.h"
 #include "common/cuda_utils.h"
 
@@ -137,25 +133,11 @@ void TestGemm::RunGemmFp16(int M, int N, int K, int lda, int ldb, int ldd,
     OASR_CUDA_CHECK(cudaMemcpy(d_B, B_half.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
     OASR_CUDA_CHECK(cudaMemset(d_D, 0, M * N * sizeof(half)));
 
-    GemmParams params;
-    params.A = d_A;
-    params.B = d_B;
-    params.C = nullptr;
-    params.D = d_D;
-    params.M = M;
-    params.N = N;
-    params.K = K;
-    params.lda = lda;
-    params.ldb = ldb;
-    params.ldd = ldd;
-    params.alpha = alpha;
-    params.beta = beta;
-    params.dtype_a = DataType::FP16;
-    params.dtype_b = DataType::FP16;
-    params.dtype_d = DataType::FP16;
-    params.stream = nullptr;
-
-    GemmStatus status = invokeGemm(params);
+    GemmStatus status = invokeGemm(
+        d_A, d_B, d_D, M, N, K, lda, ldb, ldd,
+        alpha, beta,
+        TransposeOp::NoTranspose, TransposeOp::NoTranspose,
+        DataType::FP16, nullptr);
     ASSERT_EQ(status, GemmStatus::SUCCESS)
         << "invokeGemm failed: " << getGemmStatusString(status);
 
@@ -229,9 +211,16 @@ void TestBmm::RunBmmFp16(int batch_size, int M, int N, int K) {
     OASR_CUDA_CHECK(cudaMemcpy(d_B, B_half.data(), B_half.size() * sizeof(half), cudaMemcpyHostToDevice));
     OASR_CUDA_CHECK(cudaMemset(d_D, 0, D_half.size() * sizeof(half)));
 
-    BmmParams params = BmmParams::Strided(d_A, d_B, d_D, batch_size, M, N, K, DataType::FP16, nullptr);
+    int64_t stride_a = static_cast<int64_t>(M) * K;
+    int64_t stride_b = static_cast<int64_t>(K) * N;
+    int64_t stride_d = static_cast<int64_t>(M) * N;
 
-    GemmStatus status = invokeBmm(params);
+    GemmStatus status = invokeBmm(
+        d_A, d_B, d_D, batch_size, M, N, K,
+        K, N, N, stride_a, stride_b, stride_d,
+        1.0f, 0.0f,
+        TransposeOp::NoTranspose, TransposeOp::NoTranspose,
+        DataType::FP16, nullptr);
     ASSERT_EQ(status, GemmStatus::SUCCESS)
         << "invokeBmm failed: " << getGemmStatusString(status);
 
@@ -355,25 +344,15 @@ void TestGroupGemm::RunGroupGemmFp16(const std::vector<std::tuple<int, int, int>
     if (float_ws > 0) OASR_CUDA_CHECK(cudaMalloc(&workspace_float, float_ws));
     if (int_ws > 0) OASR_CUDA_CHECK(cudaMalloc(&workspace_int, int_ws));
 
-    GroupGemmParams params;
-    params.problems = d_problems;
-    params.num_problems = num_problems;
-    params.A_array = reinterpret_cast<const void* const*>(d_A_array);
-    params.B_array = reinterpret_cast<const void* const*>(d_B_array);
-    params.D_array = reinterpret_cast<void* const*>(d_D_array);
-    params.lda_array = d_lda;
-    params.ldb_array = d_ldb;
-    params.ldd_array = d_ldd;
-    params.alpha = 1.0f;
-    params.beta = 0.0f;
-    params.dtype_a = params.dtype_b = params.dtype_d = DataType::FP16;
-    params.workspace_float = workspace_float;
-    params.workspace_float_size = float_ws;
-    params.workspace_int = workspace_int;
-    params.workspace_int_size = int_ws;
-    params.stream = nullptr;
-
-    GemmStatus status = invokeGroupGemm(params);
+    GemmStatus status = invokeGroupGemm(
+        d_problems, num_problems,
+        reinterpret_cast<const void* const*>(d_A_array),
+        reinterpret_cast<const void* const*>(d_B_array),
+        reinterpret_cast<void* const*>(d_D_array),
+        d_lda, d_ldb, d_ldd,
+        DataType::FP16,
+        workspace_float, float_ws,
+        nullptr);
     ASSERT_EQ(status, GemmStatus::SUCCESS)
         << "invokeGroupGemm failed: " << getGemmStatusString(status);
 
@@ -457,10 +436,10 @@ TEST_F(TestGemmHelpers, GetSmVersion) {
 }
 
 //==============================================================================
-// Parameter default tests (kept for API stability)
+// API consistency: invoke functions accept direct parameters
 //==============================================================================
 
-class GemmParamsTest : public ::testing::Test {
+class GemmApiTest : public ::testing::Test {
 protected:
     void SetUp() override {
         int device_count = 0;
@@ -469,22 +448,24 @@ protected:
     }
 };
 
-TEST_F(GemmParamsTest, GemmParamsDefaults) {
-    GemmParams params{};
-    EXPECT_EQ(params.A, nullptr);
-    EXPECT_EQ(params.B, nullptr);
-    EXPECT_EQ(params.D, nullptr);
-    EXPECT_FLOAT_EQ(params.alpha, 1.0f);
-    EXPECT_FLOAT_EQ(params.beta, 0.0f);
-    EXPECT_EQ(params.dtype_a, DataType::FP16);
+TEST_F(GemmApiTest, InvokeGemmAcceptsDirectParams) {
+    // Smoke test: invoke_gemm accepts all parameters directly
+    void* dummy = nullptr;
+    GemmStatus s = invokeGemm(
+        dummy, dummy, dummy, 1, 1, 1,
+        1, 1, 1, 1.0f, 0.0f,
+        TransposeOp::NoTranspose, TransposeOp::NoTranspose,
+        DataType::FP16, nullptr);
+    EXPECT_TRUE(s == GemmStatus::INVALID_ARGUMENT || s == GemmStatus::SUCCESS);
 }
 
-TEST_F(GemmParamsTest, BmmParamsStridedFactory) {
+TEST_F(GemmApiTest, InvokeBmmAcceptsDirectParams) {
     void* dummy = nullptr;
-    auto params = BmmParams::Strided(dummy, dummy, dummy, 8, 64, 128, 256, DataType::FP16, nullptr);
-    EXPECT_EQ(params.batch_size, 8);
-    EXPECT_EQ(params.M, 64);
-    EXPECT_EQ(params.N, 128);
-    EXPECT_EQ(params.K, 256);
-    EXPECT_FALSE(params.use_pointer_array);
+    GemmStatus s = invokeBmm(
+        dummy, dummy, dummy, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1,
+        1.0f, 0.0f,
+        TransposeOp::NoTranspose, TransposeOp::NoTranspose,
+        DataType::FP16, nullptr);
+    EXPECT_TRUE(s == GemmStatus::INVALID_ARGUMENT || s == GemmStatus::SUCCESS);
 }

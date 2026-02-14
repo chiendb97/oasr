@@ -123,32 +123,33 @@ struct CutlassGroupGemmSM80 {
 // Public API Implementations
 //==============================================================================
 
-GemmStatus invokeGroupGemm(const GroupGemmParams& params) {
-    if (params.problems == nullptr || params.num_problems <= 0) {
+GemmStatus invokeGroupGemm(const GemmProblemDesc* problems, int num_problems,
+                           const void* const* A_array, const void* const* B_array,
+                           void* const* D_array,
+                           const int64_t* lda_array, const int64_t* ldb_array,
+                           const int64_t* ldd_array,
+                           DataType dtype,
+                           void* workspace_float, size_t workspace_float_size,
+                           cudaStream_t stream) {
+    if (problems == nullptr || num_problems <= 0) return GemmStatus::INVALID_ARGUMENT;
+    if (A_array == nullptr || B_array == nullptr || D_array == nullptr)
         return GemmStatus::INVALID_ARGUMENT;
-    }
-    if (params.A_array == nullptr || params.B_array == nullptr ||
-        params.D_array == nullptr) {
-        return GemmStatus::INVALID_ARGUMENT;
-    }
 
-    // Allocate device memory for problem descriptors (CUTLASS GemmCoord)
-    cutlass::DeviceAllocation<cutlass::gemm::GemmCoord> problems_device(params.num_problems);
+    cutlass::DeviceAllocation<cutlass::gemm::GemmCoord> problems_device(num_problems);
 
-    // params.problems may be on device (e.g. from Python tensor.data_ptr()); copy to host first
-    std::vector<GemmProblemDesc> problems_desc_host(params.num_problems);
+    // problems may be on device; copy to host first
+    std::vector<GemmProblemDesc> problems_desc_host(num_problems);
     OASR_CUDA_CHECK(cudaMemcpyAsync(
         problems_desc_host.data(),
-        params.problems,
-        params.num_problems * sizeof(GemmProblemDesc),
+        problems,
+        num_problems * sizeof(GemmProblemDesc),
         cudaMemcpyDeviceToHost,
-        params.stream
+        stream
     ));
-    OASR_CUDA_CHECK(cudaStreamSynchronize(params.stream));
+    OASR_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Convert GemmProblemDesc to cutlass::gemm::GemmCoord
-    std::vector<cutlass::gemm::GemmCoord> problems_host(params.num_problems);
-    for (int i = 0; i < params.num_problems; ++i) {
+    std::vector<cutlass::gemm::GemmCoord> problems_host(num_problems);
+    for (int i = 0; i < num_problems; ++i) {
         problems_host[i] = cutlass::gemm::GemmCoord(
             problems_desc_host[i].M,
             problems_desc_host[i].N,
@@ -159,42 +160,35 @@ GemmStatus invokeGroupGemm(const GroupGemmParams& params) {
     OASR_CUDA_CHECK(cudaMemcpyAsync(
         problems_device.get(),
         problems_host.data(),
-        params.num_problems * sizeof(cutlass::gemm::GemmCoord),
+        num_problems * sizeof(cutlass::gemm::GemmCoord),
         cudaMemcpyHostToDevice,
-        params.stream
+        stream
     ));
-    
-    if (params.dtype_a == DataType::FP16) {
+
+    if (dtype == DataType::FP16) {
         using DType = cutlass::half_t;
         return CutlassGroupGemmSM80<DType>::run(
-            params.workspace_float, params.workspace_float_size,
-            problems_device.get(),
-            params.num_problems,
-            reinterpret_cast<const DType* const*>(params.A_array),
-            reinterpret_cast<const DType* const*>(params.B_array),
-            reinterpret_cast<DType* const*>(params.D_array),
-            params.lda_array,
-            params.ldb_array,
-            params.ldd_array,
-            params.stream
+            workspace_float, workspace_float_size,
+            problems_device.get(), num_problems,
+            reinterpret_cast<const DType* const*>(A_array),
+            reinterpret_cast<const DType* const*>(B_array),
+            reinterpret_cast<DType* const*>(D_array),
+            lda_array, ldb_array, ldd_array,
+            stream
         );
     }
-    else if (params.dtype_a == DataType::BF16) {
+    if (dtype == DataType::BF16) {
         using DType = cutlass::bfloat16_t;
         return CutlassGroupGemmSM80<DType>::run(
-            params.workspace_float, params.workspace_float_size,
-            problems_device.get(),
-            params.num_problems,
-            reinterpret_cast<const DType* const*>(params.A_array),
-            reinterpret_cast<const DType* const*>(params.B_array),
-            reinterpret_cast<DType* const*>(params.D_array),
-            params.lda_array,
-            params.ldb_array,
-            params.ldd_array,
-            params.stream
+            workspace_float, workspace_float_size,
+            problems_device.get(), num_problems,
+            reinterpret_cast<const DType* const*>(A_array),
+            reinterpret_cast<const DType* const*>(B_array),
+            reinterpret_cast<DType* const*>(D_array),
+            lda_array, ldb_array, ldd_array,
+            stream
         );
     }
-    
     return GemmStatus::NOT_SUPPORTED;
 }
 
@@ -330,40 +324,22 @@ void GroupGemmRunner::getWorkspaceSize(int num_problems,
                                 float_workspace_size, int_workspace_size);
 }
 
-GemmStatus GroupGemmRunner::run(const GroupGemmParams& params) {
-    return invokeGroupGemm(params);
-}
-
-GemmStatus GroupGemmRunner::run(
-    const GemmProblemDesc* problems, int num_problems,
-    const void* const* A_array, const void* const* B_array,
-    void* const* D_array,
-    const int64_t* lda_array, const int64_t* ldb_array, const int64_t* ldd_array,
-    void* workspace_float, size_t workspace_float_size,
-    void* workspace_int, size_t workspace_int_size,
-    bool weight_column_major,
-    cudaStream_t stream)
+GemmStatus GroupGemmRunner::run(const GemmProblemDesc* problems, int num_problems,
+                                const void* const* A_array, const void* const* B_array,
+                                void* const* D_array,
+                                const int64_t* lda_array, const int64_t* ldb_array,
+                                const int64_t* ldd_array,
+                                void* workspace_float, size_t workspace_float_size,
+                                void* workspace_int, size_t workspace_int_size,
+                                bool weight_column_major,
+                                cudaStream_t stream)
 {
-    GroupGemmParams params;
-    params.problems = problems;
-    params.num_problems = num_problems;
-    params.A_array = A_array;
-    params.B_array = B_array;
-    params.D_array = D_array;
-    params.lda_array = lda_array;
-    params.ldb_array = ldb_array;
-    params.ldd_array = ldd_array;
-    params.weight_column_major = weight_column_major;
-    params.dtype_a = impl_->dtype;
-    params.dtype_b = impl_->dtype;
-    params.dtype_d = impl_->dtype;
-    params.workspace_float = workspace_float;
-    params.workspace_float_size = workspace_float_size;
-    params.workspace_int = workspace_int;
-    params.workspace_int_size = workspace_int_size;
-    params.stream = stream;
-    
-    return invokeGroupGemm(params);
+    (void)workspace_int;
+    (void)workspace_int_size;
+    (void)weight_column_major;
+    return invokeGroupGemm(problems, num_problems, A_array, B_array, D_array,
+                          lda_array, ldb_array, ldd_array, impl_->dtype,
+                          workspace_float, workspace_float_size, stream);
 }
 
 std::vector<GemmConfig> GroupGemmRunner::getConfigs() const {
@@ -377,10 +353,16 @@ std::vector<GemmConfig> GroupGemmRunner::getConfigs() const {
 // Segment GEMM Implementation
 //==============================================================================
 
-GemmStatus invokeSegmentGemm(const SegmentGemmParams& params) {
-    (void)params;
-    // TODO: Implement segment GEMM using grouped GEMM internally
-    return GemmStatus::NOT_SUPPORTED;
+GemmStatus invokeSegmentGemm(const void* A, const void* B, void* D,
+                             const int* segment_offsets, int num_segments,
+                             int K, int N, DataType dtype,
+                             bool weight_column_major,
+                             void* workspace, size_t workspace_size,
+                             cudaStream_t stream) {
+    (void)A; (void)B; (void)D; (void)segment_offsets; (void)num_segments;
+    (void)K; (void)N; (void)dtype; (void)weight_column_major;
+    (void)workspace; (void)workspace_size; (void)stream;
+    return GemmStatus::NOT_SUPPORTED;  // TODO: Implement using grouped GEMM
 }
 
 } // namespace gemm

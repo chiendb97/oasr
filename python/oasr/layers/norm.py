@@ -23,7 +23,7 @@ class LayerNorm:
     ) -> "torch.Tensor":
         batch_size, seq_len, hidden_size = x.shape
         output = x.new_empty(x.shape)
-        kernels.normalization.layer_norm(
+        kernels.norm.layer_norm(
             x.data_ptr(),
             output.data_ptr(),
             gamma.data_ptr(),
@@ -54,7 +54,7 @@ class RMSNorm:
     ) -> "torch.Tensor":
         batch_size, seq_len, hidden_size = x.shape
         output = x.new_empty(x.shape)
-        kernels.normalization.rms_norm(
+        kernels.norm.rms_norm(
             x.data_ptr(),
             output.data_ptr(),
             gamma.data_ptr(),
@@ -86,7 +86,7 @@ class GroupNorm:
     ) -> "torch.Tensor":
         batch_size, seq_len, channels = x.shape
         output = x.new_empty(x.shape)
-        kernels.normalization.group_norm(
+        kernels.norm.group_norm(
             x.data_ptr(),
             output.data_ptr(),
             gamma.data_ptr(),
@@ -121,7 +121,7 @@ class BatchNorm1d:
     ) -> "torch.Tensor":
         batch_size, seq_len, channels = x.shape
         output = x.new_empty(x.shape)
-        kernels.normalization.batch_norm_1d(
+        kernels.norm.batch_norm_1d(
             x.data_ptr(),
             output.data_ptr(),
             gamma.data_ptr(),
@@ -156,7 +156,7 @@ class AddLayerNorm:
     ) -> "torch.Tensor":
         batch_size, seq_len, hidden_size = x.shape
         output = x.new_empty(x.shape)
-        kernels.normalization.add_layer_norm(
+        kernels.norm.add_layer_norm(
             x.data_ptr(),
             residual.data_ptr(),
             output.data_ptr(),

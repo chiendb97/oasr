@@ -64,17 +64,13 @@ class TestGemm:
         B = torch.randn(K, N, device='cuda', dtype=dtype)
         D = torch.empty(M, N, device='cuda', dtype=dtype)
 
-        params = oasr.kernels.gemm.GemmParams()
-        params.A = A.data_ptr()
-        params.B = B.data_ptr()
-        params.D = D.data_ptr()
-        params.M, params.N, params.K = M, N, K
-        params.lda, params.ldb, params.ldd = K, N, N
-        params.alpha = 1.0
-        params.beta = 0.0
-        params.dtype_a = params.dtype_b = params.dtype_d = oasr.DataType.FP16
-
-        status = oasr.kernels.gemm.invoke_gemm(params)
+        status = oasr.kernels.gemm.invoke_gemm(
+            A.data_ptr(), B.data_ptr(), D.data_ptr(),
+            M, N, K, K, N, N, 1.0, 0.0,
+            oasr.kernels.gemm.TransposeOp.NoTranspose,
+            oasr.kernels.gemm.TransposeOp.NoTranspose,
+            oasr.DataType.FP16,
+        )
         assert status == oasr.kernels.gemm.GemmStatus.SUCCESS, (
             f'invoke_gemm failed: {oasr.kernels.gemm.get_gemm_status_string(status)}'
         )
@@ -91,17 +87,13 @@ class TestGemm:
         B = torch.randn(K, N, device='cuda', dtype=dtype)
         D = torch.empty(M, N, device='cuda', dtype=dtype)
 
-        params = oasr.kernels.gemm.GemmParams()
-        params.A = A.data_ptr()
-        params.B = B.data_ptr()
-        params.D = D.data_ptr()
-        params.M, params.N, params.K = M, N, K
-        params.lda, params.ldb, params.ldd = K, N, N
-        params.alpha = 2.0
-        params.beta = 0.0
-        params.dtype_a = params.dtype_b = params.dtype_d = oasr.DataType.FP16
-
-        status = oasr.kernels.gemm.invoke_gemm(params)
+        status = oasr.kernels.gemm.invoke_gemm(
+            A.data_ptr(), B.data_ptr(), D.data_ptr(),
+            M, N, K, K, N, N, 2.0, 0.0,
+            oasr.kernels.gemm.TransposeOp.NoTranspose,
+            oasr.kernels.gemm.TransposeOp.NoTranspose,
+            oasr.DataType.FP16,
+        )
         assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
         oasr.synchronize()
 
@@ -118,17 +110,13 @@ class TestGemm:
         B = torch.randn(K, N, device='cuda', dtype=dtype)
         D = torch.empty(M, N, device='cuda', dtype=dtype)
 
-        params = oasr.kernels.gemm.GemmParams()
-        params.A = A.data_ptr()
-        params.B = B.data_ptr()
-        params.D = D.data_ptr()
-        params.M, params.N, params.K = M, N, K
-        params.lda, params.ldb, params.ldd = K, N, N
-        params.alpha = 1.0
-        params.beta = 0.0
-        params.dtype_a = params.dtype_b = params.dtype_d = oasr.DataType.BF16
-
-        status = oasr.kernels.gemm.invoke_gemm(params)
+        status = oasr.kernels.gemm.invoke_gemm(
+            A.data_ptr(), B.data_ptr(), D.data_ptr(),
+            M, N, K, K, N, N, 1.0, 0.0,
+            oasr.kernels.gemm.TransposeOp.NoTranspose,
+            oasr.kernels.gemm.TransposeOp.NoTranspose,
+            oasr.DataType.BF16,
+        )
         assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
         oasr.synchronize()
 
@@ -154,11 +142,15 @@ class TestBmm:
         B = torch.randn(batch_size, K, N, device='cuda', dtype=dtype)
         D = torch.empty(batch_size, M, N, device='cuda', dtype=dtype)
 
-        params = oasr.kernels.gemm.BmmParams.Strided(
+        stride_a, stride_b, stride_d = M * K, K * N, M * N
+        status = oasr.kernels.gemm.invoke_bmm(
             A.data_ptr(), B.data_ptr(), D.data_ptr(),
-            batch_size, M, N, K, oasr.DataType.FP16,
+            batch_size, M, N, K, K, N, N,
+            stride_a, stride_b, stride_d, 1.0, 0.0,
+            oasr.kernels.gemm.TransposeOp.NoTranspose,
+            oasr.kernels.gemm.TransposeOp.NoTranspose,
+            oasr.DataType.FP16,
         )
-        status = oasr.kernels.gemm.invoke_bmm(params)
         assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
         oasr.synchronize()
 
@@ -175,11 +167,15 @@ class TestBmm:
         B = torch.randn(batch_size, K, N, device='cuda', dtype=dtype)
         D = torch.empty(batch_size, M, N, device='cuda', dtype=dtype)
 
-        params = oasr.kernels.gemm.BmmParams.Strided(
+        stride_a, stride_b, stride_d = M * K, K * N, M * N
+        status = oasr.kernels.gemm.invoke_bmm(
             A.data_ptr(), B.data_ptr(), D.data_ptr(),
-            batch_size, M, N, K, oasr.DataType.BF16,
+            batch_size, M, N, K, K, N, N,
+            stride_a, stride_b, stride_d, 1.0, 0.0,
+            oasr.kernels.gemm.TransposeOp.NoTranspose,
+            oasr.kernels.gemm.TransposeOp.NoTranspose,
+            oasr.DataType.BF16,
         )
-        status = oasr.kernels.gemm.invoke_bmm(params)
         assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
         oasr.synchronize()
 
@@ -191,8 +187,8 @@ class TestBmm:
 # Grouped GEMM (variable-sized problems)
 # -----------------------------------------------------------------------------
 
-def _build_group_gemm_params(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype):
-    """Build GroupGemmParams and workspace for a list of (M, N, K) problems."""
+def _invoke_group_gemm(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype):
+    """Build workspace and call invoke_group_gemm with direct parameters."""
     oasr_dtype = oasr.DataType.FP16 if dtype == torch.float16 else oasr.DataType.BF16
     num_problems = len(problem_sizes)
 
@@ -214,25 +210,15 @@ def _build_group_gemm_params(oasr, problem_sizes, A_tensors, B_tensors, D_tensor
 
     float_ws, int_ws = oasr.kernels.gemm.query_group_gemm_workspace_size(num_problems, oasr_dtype)
     workspace_float = torch.empty(float_ws, dtype=torch.uint8, device='cuda')
-    workspace_int = torch.empty(int_ws, dtype=torch.uint8, device='cuda')
 
-    params = oasr.kernels.gemm.GroupGemmParams()
-    params.problems = problems_tensor.data_ptr()
-    params.num_problems = num_problems
-    params.A_array = a_ptrs.data_ptr()
-    params.B_array = b_ptrs.data_ptr()
-    params.D_array = d_ptrs.data_ptr()
-    params.lda_array = lda_tensor.data_ptr()
-    params.ldb_array = ldb_tensor.data_ptr()
-    params.ldd_array = ldd_tensor.data_ptr()
-    params.alpha = 1.0
-    params.beta = 0.0
-    params.dtype_a = params.dtype_b = params.dtype_d = oasr_dtype
-    params.workspace_float = workspace_float.data_ptr()
-    params.workspace_float_size = float_ws
-    params.workspace_int = workspace_int.data_ptr()
-    params.workspace_int_size = int_ws
-    return params
+    return oasr.kernels.gemm.invoke_group_gemm(
+        problems_tensor.data_ptr(),
+        num_problems,
+        a_ptrs.data_ptr(), b_ptrs.data_ptr(), d_ptrs.data_ptr(),
+        lda_tensor.data_ptr(), ldb_tensor.data_ptr(), ldd_tensor.data_ptr(),
+        oasr_dtype,
+        workspace_float.data_ptr(), float_ws,
+    )
 
 
 class TestGroupGemm:
@@ -246,8 +232,7 @@ class TestGroupGemm:
         B_tensors = [torch.randn(K, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
         D_tensors = [torch.empty(M, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
 
-        params = _build_group_gemm_params(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype)
-        status = oasr.kernels.gemm.invoke_group_gemm(params)
+        status = _invoke_group_gemm(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype)
         assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
         oasr.synchronize()
 
@@ -263,8 +248,7 @@ class TestGroupGemm:
         B_tensors = [torch.randn(K, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
         D_tensors = [torch.empty(M, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
 
-        params = _build_group_gemm_params(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype)
-        status = oasr.kernels.gemm.invoke_group_gemm(params)
+        status = _invoke_group_gemm(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype)
         assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
         oasr.synchronize()
 
@@ -280,8 +264,7 @@ class TestGroupGemm:
         B_tensors = [torch.randn(K, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
         D_tensors = [torch.empty(M, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
 
-        params = _build_group_gemm_params(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype)
-        status = oasr.kernels.gemm.invoke_group_gemm(params)
+        status = _invoke_group_gemm(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype)
         assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
         oasr.synchronize()
 

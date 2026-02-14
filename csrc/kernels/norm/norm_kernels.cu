@@ -1,7 +1,7 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "kernels/normalization/norm_kernels.h"
+#include "kernels/norm/norm_kernels.h"
 #include "kernels/reduction/allreduce.h"
 #include "common/vec_dtypes.h"
 

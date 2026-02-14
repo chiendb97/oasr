@@ -30,7 +30,6 @@ oasr/
 │   │   ├── gemm/            # GEMM, BMM, Grouped GEMM (CUTLASS)
 │   │   ├── normalization/  # LayerNorm, RMSNorm, BatchNorm, GroupNorm
 │   │   └── reduction/       # Reduction helpers
-│   ├── layers/              # Layer abstractions (attention, conv, FFN, encoder)
 │   ├── ops/                 # CUTLASS ops and configs
 │   └── pybind/              # Python bindings
 ├── python/oasr/             # Python package

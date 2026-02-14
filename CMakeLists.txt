@@ -126,8 +126,8 @@ set(OASR_SOURCES
     csrc/common/cuda_utils.cpp
     
     # Kernels
-    csrc/kernels/normalization/norm_kernels.cu
-    csrc/kernels/convolution/conv_kernels.cu
+    csrc/kernels/norm/norm_kernels.cu
+    csrc/kernels/conv/conv_kernels.cu
     
     # GEMM Kernels (CUTLASS-based)
     csrc/kernels/gemm/gemm_kernels.cu
@@ -138,28 +138,19 @@ set(OASR_SOURCES
     # csrc/common/tensor.cpp
     # csrc/common/allocator.cpp
     # csrc/kernels/attention/attention_kernels.cu
-    # csrc/layers/base_layer.cpp
-    # csrc/layers/attention_layer.cpp
-    # csrc/layers/conv_layer.cpp
-    # csrc/layers/ffn_layer.cpp
-    # csrc/layers/encoder_layer.cpp
 )
 
 set(OASR_HEADERS
     csrc/common/types.h
     csrc/common/cuda_utils.h
-    csrc/kernels/normalization/norm_kernels.h
-    csrc/kernels/convolution/conv_params.h
-    csrc/kernels/convolution/conv_kernels.h
+    csrc/kernels/norm/norm_kernels.h
+    csrc/kernels/conv/conv_kernels.h
     
     # GEMM Headers
     csrc/kernels/gemm/gemm_configs.h
     csrc/kernels/gemm/gemm_utils.h
-    csrc/kernels/gemm/gemm_params.h
     csrc/kernels/gemm/gemm_kernels.h
-    csrc/kernels/gemm/bmm_params.h
     csrc/kernels/gemm/bmm_kernels.h
-    csrc/kernels/gemm/group_gemm_params.h
     csrc/kernels/gemm/group_gemm_kernels.h
     
     # TODO: Add these when ready
@@ -167,11 +158,6 @@ set(OASR_HEADERS
     # csrc/common/allocator.h
     # csrc/kernels/attention/attention_params.h
     # csrc/kernels/attention/attention_kernels.h
-    # csrc/layers/base_layer.h
-    # csrc/layers/attention_layer.h
-    # csrc/layers/conv_layer.h
-    # csrc/layers/ffn_layer.h
-    # csrc/layers/encoder_layer.h
 )
 
 # =============================================================================

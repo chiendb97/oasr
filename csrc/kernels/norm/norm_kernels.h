@@ -10,38 +10,6 @@ namespace oasr {
 namespace kernels {
 
 /**
- * @brief Parameters for normalization kernels
- */
-struct NormParams {
-    const void* input;
-    void* output;
-    const void* weight;         // gamma / scale
-    const void* bias;           // beta / offset
-    
-    // For batch norm: running statistics
-    const void* running_mean;
-    const void* running_var;
-    
-    int batch_size;
-    int seq_len;
-    int hidden_size;
-    
-    float eps;
-    NormType norm_type;
-    DataType dtype;
-    
-    cudaStream_t stream;
-    
-    NormParams()
-        : input(nullptr), output(nullptr), weight(nullptr), bias(nullptr)
-        , running_mean(nullptr), running_var(nullptr)
-        , batch_size(0), seq_len(0), hidden_size(0)
-        , eps(1e-5f), norm_type(NormType::LAYER_NORM), dtype(DataType::FP16)
-        , stream(nullptr)
-    {}
-};
-
-/**
  * @brief Layer normalization kernel
  * 
  * Computes: output = (input - mean) / sqrt(var + eps) * gamma + beta

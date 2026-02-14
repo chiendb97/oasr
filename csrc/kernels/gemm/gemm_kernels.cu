@@ -102,103 +102,107 @@ struct CutlassGemmSM80 {
 // Public API Implementations
 //==============================================================================
 
-GemmStatus invokeGemm(const GemmParams& params) {
-    if (params.A == nullptr || params.B == nullptr || params.D == nullptr) {
+GemmStatus invokeGemm(const void* A, const void* B, void* D,
+                      int M, int N, int K,
+                      int64_t lda, int64_t ldb, int64_t ldd,
+                      float alpha, float beta,
+                      TransposeOp trans_a, TransposeOp trans_b,
+                      DataType dtype,
+                      cudaStream_t stream) {
+    if (A == nullptr || B == nullptr || D == nullptr) {
         return GemmStatus::INVALID_ARGUMENT;
     }
-    if (params.M <= 0 || params.N <= 0 || params.K <= 0) {
+    if (M <= 0 || N <= 0 || K <= 0) {
         return GemmStatus::INVALID_ARGUMENT;
     }
-    const bool trans_b = (params.trans_b == TransposeOp::Transpose);
-    const int64_t ldb = trans_b ? params.K : params.ldb;
+    const bool trans_b_flag = (trans_b == TransposeOp::Transpose);
+    const int64_t ldb_eff = trans_b_flag ? static_cast<int64_t>(K) : ldb;
 
-    if (params.dtype_a == DataType::FP16 && params.dtype_b == DataType::FP16) {
+    if (dtype == DataType::FP16) {
         using DType = cutlass::half_t;
         using LayoutA = cutlass::layout::RowMajor;
         using LayoutBTrans = cutlass::layout::ColumnMajor;
         using LayoutBNoTrans = cutlass::layout::RowMajor;
         using LayoutC = cutlass::layout::RowMajor;
-        if (trans_b) {
+        if (trans_b_flag) {
             return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutBTrans, LayoutC>::run(
-                reinterpret_cast<const DType*>(params.A),
-                reinterpret_cast<const DType*>(params.B),
-                reinterpret_cast<DType*>(params.D),
-                params.M, params.N, params.K,
-                params.lda, ldb, params.ldd,
-                params.alpha, params.beta,
-                params.stream);
+                reinterpret_cast<const DType*>(A),
+                reinterpret_cast<const DType*>(B),
+                reinterpret_cast<DType*>(D),
+                M, N, K,
+                lda, ldb_eff, ldd,
+                alpha, beta,
+                stream);
         }
         return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutBNoTrans, LayoutC>::run(
-            reinterpret_cast<const DType*>(params.A),
-            reinterpret_cast<const DType*>(params.B),
-            reinterpret_cast<DType*>(params.D),
-            params.M, params.N, params.K,
-            params.lda, params.ldb, params.ldd,
-            params.alpha, params.beta,
-            params.stream);
+            reinterpret_cast<const DType*>(A),
+            reinterpret_cast<const DType*>(B),
+            reinterpret_cast<DType*>(D),
+            M, N, K,
+            lda, ldb, ldd,
+            alpha, beta,
+            stream);
     }
-    if (params.dtype_a == DataType::BF16 && params.dtype_b == DataType::BF16) {
+    if (dtype == DataType::BF16) {
         using DType = cutlass::bfloat16_t;
         using LayoutA = cutlass::layout::RowMajor;
         using LayoutBTrans = cutlass::layout::ColumnMajor;
         using LayoutBNoTrans = cutlass::layout::RowMajor;
         using LayoutC = cutlass::layout::RowMajor;
-        if (trans_b) {
+        if (trans_b_flag) {
             return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutBTrans, LayoutC>::run(
-                reinterpret_cast<const DType*>(params.A),
-                reinterpret_cast<const DType*>(params.B),
-                reinterpret_cast<DType*>(params.D),
-                params.M, params.N, params.K,
-                params.lda, ldb, params.ldd,
-                params.alpha, params.beta,
-                params.stream);
+                reinterpret_cast<const DType*>(A),
+                reinterpret_cast<const DType*>(B),
+                reinterpret_cast<DType*>(D),
+                M, N, K,
+                lda, ldb_eff, ldd,
+                alpha, beta,
+                stream);
         }
         return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutBNoTrans, LayoutC>::run(
-            reinterpret_cast<const DType*>(params.A),
-            reinterpret_cast<const DType*>(params.B),
-            reinterpret_cast<DType*>(params.D),
-            params.M, params.N, params.K,
-            params.lda, params.ldb, params.ldd,
-            params.alpha, params.beta,
-            params.stream);
+            reinterpret_cast<const DType*>(A),
+            reinterpret_cast<const DType*>(B),
+            reinterpret_cast<DType*>(D),
+            M, N, K,
+            lda, ldb, ldd,
+            alpha, beta,
+            stream);
     }
     return GemmStatus::NOT_SUPPORTED;
 }
 
 template <>
-GemmStatus invokeGemmTyped<half>(const GemmParams& params) {
+GemmStatus invokeGemmTyped<half>(const void* A, const void* B, void* D,
+                                 int M, int N, int K,
+                                 int64_t lda, int64_t ldb, int64_t ldd,
+                                 float alpha, float beta,
+                                 cudaStream_t stream) {
     using DType = cutlass::half_t;
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::RowMajor;
     using LayoutC = cutlass::layout::RowMajor;
-    
     return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutB, LayoutC>::run(
-        reinterpret_cast<const DType*>(params.A),
-        reinterpret_cast<const DType*>(params.B),
-        reinterpret_cast<DType*>(params.D),
-        params.M, params.N, params.K,
-        params.lda, params.ldb, params.ldd,
-        params.alpha, params.beta,
-        params.stream
-    );
+        reinterpret_cast<const DType*>(A),
+        reinterpret_cast<const DType*>(B),
+        reinterpret_cast<DType*>(D),
+        M, N, K, lda, ldb, ldd, alpha, beta, stream);
 }
 
 template <>
-GemmStatus invokeGemmTyped<__nv_bfloat16>(const GemmParams& params) {
+GemmStatus invokeGemmTyped<__nv_bfloat16>(const void* A, const void* B, void* D,
+                                          int M, int N, int K,
+                                          int64_t lda, int64_t ldb, int64_t ldd,
+                                          float alpha, float beta,
+                                          cudaStream_t stream) {
     using DType = cutlass::bfloat16_t;
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::RowMajor;
     using LayoutC = cutlass::layout::RowMajor;
-    
     return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutB, LayoutC>::run(
-        reinterpret_cast<const DType*>(params.A),
-        reinterpret_cast<const DType*>(params.B),
-        reinterpret_cast<DType*>(params.D),
-        params.M, params.N, params.K,
-        params.lda, params.ldb, params.ldd,
-        params.alpha, params.beta,
-        params.stream
-    );
+        reinterpret_cast<const DType*>(A),
+        reinterpret_cast<const DType*>(B),
+        reinterpret_cast<DType*>(D),
+        M, N, K, lda, ldb, ldd, alpha, beta, stream);
 }
 
 //==============================================================================
@@ -214,24 +218,10 @@ GemmStatus invokeGemmBiasActivation(
 {
     (void)bias;
     (void)activation;
-    
-    GemmParams params;
-    params.A = A;
-    params.B = B;
-    params.D = D;
-    params.M = M;
-    params.N = N;
-    params.K = K;
-    params.lda = K;
-    params.ldb = N;
-    params.ldd = N;
-    params.dtype_a = dtype;
-    params.dtype_b = dtype;
-    params.dtype_d = dtype;
-    params.stream = stream;
-    
     // TODO: Add epilogue fusion for activation
-    return invokeGemm(params);
+    return invokeGemm(A, B, D, M, N, K, K, N, N, 1.0f, 0.0f,
+                     TransposeOp::NoTranspose, TransposeOp::NoTranspose,
+                     dtype, stream);
 }
 
 //==============================================================================
@@ -264,23 +254,7 @@ void Fp16GemmRunner::gemm(const void* A, const void* B, void* D,
                           void* workspace, size_t workspace_size,
                           cudaStream_t stream) {
     (void)config; (void)workspace; (void)workspace_size;
-    
-    GemmParams params;
-    params.A = A;
-    params.B = B;
-    params.D = D;
-    params.M = M;
-    params.N = N;
-    params.K = K;
-    params.lda = K;
-    params.ldb = N;
-    params.ldd = N;
-    params.dtype_a = DataType::FP16;
-    params.dtype_b = DataType::FP16;
-    params.dtype_d = DataType::FP16;
-    params.stream = stream;
-    
-    GemmStatus status = invokeGemmTyped<half>(params);
+    GemmStatus status = invokeGemmTyped<half>(A, B, D, M, N, K, K, N, N, 1.0f, 0.0f, stream);
     if (status != GemmStatus::SUCCESS) {
         throw std::runtime_error(std::string("GEMM failed: ") + getGemmStatusString(status));
     }
@@ -313,23 +287,7 @@ void Bf16GemmRunner::gemm(const void* A, const void* B, void* D,
                           void* workspace, size_t workspace_size,
                           cudaStream_t stream) {
     (void)config; (void)workspace; (void)workspace_size;
-    
-    GemmParams params;
-    params.A = A;
-    params.B = B;
-    params.D = D;
-    params.M = M;
-    params.N = N;
-    params.K = K;
-    params.lda = K;
-    params.ldb = N;
-    params.ldd = N;
-    params.dtype_a = DataType::BF16;
-    params.dtype_b = DataType::BF16;
-    params.dtype_d = DataType::BF16;
-    params.stream = stream;
-    
-    GemmStatus status = invokeGemmTyped<__nv_bfloat16>(params);
+    GemmStatus status = invokeGemmTyped<__nv_bfloat16>(A, B, D, M, N, K, K, N, N, 1.0f, 0.0f, stream);
     if (status != GemmStatus::SUCCESS) {
         throw std::runtime_error(std::string("GEMM failed: ") + getGemmStatusString(status));
     }
@@ -380,25 +338,12 @@ GemmConfig autoTuneGemm(int M, int N, int K, DataType dtype,
     
     for (const auto& config : configs) {
         try {
-            GemmParams params;
-            params.A = A;
-            params.B = B;
-            params.D = D;
-            params.M = M;
-            params.N = N;
-            params.K = K;
-            params.lda = K;
-            params.ldb = N;
-            params.ldd = N;
-            params.dtype_a = dtype;
-            params.dtype_b = dtype;
-            params.dtype_d = dtype;
-            params.config = config;
-            params.stream = stream;
-            
+            (void)config;
             // Warmup
             for (int i = 0; i < num_warmup; ++i) {
-                invokeGemm(params);
+                invokeGemm(A, B, D, M, N, K, K, N, N, 1.0f, 0.0f,
+                          TransposeOp::NoTranspose, TransposeOp::NoTranspose,
+                          dtype, stream);
             }
             OASR_CUDA_CHECK(cudaStreamSynchronize(stream));
             
@@ -409,7 +354,9 @@ GemmConfig autoTuneGemm(int M, int N, int K, DataType dtype,
             
             OASR_CUDA_CHECK(cudaEventRecord(start, stream));
             for (int i = 0; i < num_iter; ++i) {
-                invokeGemm(params);
+                invokeGemm(A, B, D, M, N, K, K, N, N, 1.0f, 0.0f,
+                          TransposeOp::NoTranspose, TransposeOp::NoTranspose,
+                          dtype, stream);
             }
             OASR_CUDA_CHECK(cudaEventRecord(stop, stream));
             OASR_CUDA_CHECK(cudaEventSynchronize(stop));

@@ -3,7 +3,7 @@
 
 # Test sources (all .cu for consistent extension)
 set(TEST_SOURCES
-    test_norm_kernels.cu
+    test_norm.cu
     test_gemm.cu
     test_conv.cu
 )

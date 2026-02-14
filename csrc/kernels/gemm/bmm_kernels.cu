@@ -68,35 +68,42 @@ struct CutlassBmmSM80 {
     }
 };
 
-GemmStatus invokeBmm(const BmmParams& params) {
-    if (params.use_pointer_array) return GemmStatus::NOT_SUPPORTED;
-    if (!params.A || !params.B || !params.D) return GemmStatus::INVALID_ARGUMENT;
-    if (params.batch_size <= 0 || params.M <= 0 || params.N <= 0 || params.K <= 0)
-        return GemmStatus::INVALID_ARGUMENT;
-    
-    if (params.dtype_a == DataType::FP16) {
+GemmStatus invokeBmm(const void* A, const void* B, void* D,
+                     int batch_size, int M, int N, int K,
+                     int64_t lda, int64_t ldb, int64_t ldd,
+                     int64_t stride_a, int64_t stride_b, int64_t stride_d,
+                     float alpha, float beta,
+                     TransposeOp trans_a, TransposeOp trans_b,
+                     DataType dtype,
+                     cudaStream_t stream) {
+    if (A == nullptr || B == nullptr || D == nullptr) return GemmStatus::INVALID_ARGUMENT;
+    if (batch_size <= 0 || M <= 0 || N <= 0 || K <= 0) return GemmStatus::INVALID_ARGUMENT;
+    if (trans_a != TransposeOp::NoTranspose || trans_b != TransposeOp::NoTranspose)
+        return GemmStatus::NOT_SUPPORTED;
+
+    if (dtype == DataType::FP16) {
         using DType = cutlass::half_t;
         using Layout = cutlass::layout::RowMajor;
         return CutlassBmmSM80<DType, DType, DType, Layout, Layout, Layout>::run(
-            reinterpret_cast<const DType*>(params.A),
-            reinterpret_cast<const DType*>(params.B),
-            reinterpret_cast<DType*>(params.D),
-            params.batch_size, params.M, params.N, params.K,
-            params.lda, params.ldb, params.ldd,
-            params.stride_a, params.stride_b, params.stride_d,
-            params.alpha, params.beta, params.stream);
+            reinterpret_cast<const DType*>(A),
+            reinterpret_cast<const DType*>(B),
+            reinterpret_cast<DType*>(D),
+            batch_size, M, N, K,
+            lda, ldb, ldd,
+            stride_a, stride_b, stride_d,
+            alpha, beta, stream);
     }
-    else if (params.dtype_a == DataType::BF16) {
+    if (dtype == DataType::BF16) {
         using DType = cutlass::bfloat16_t;
         using Layout = cutlass::layout::RowMajor;
         return CutlassBmmSM80<DType, DType, DType, Layout, Layout, Layout>::run(
-            reinterpret_cast<const DType*>(params.A),
-            reinterpret_cast<const DType*>(params.B),
-            reinterpret_cast<DType*>(params.D),
-            params.batch_size, params.M, params.N, params.K,
-            params.lda, params.ldb, params.ldd,
-            params.stride_a, params.stride_b, params.stride_d,
-            params.alpha, params.beta, params.stream);
+            reinterpret_cast<const DType*>(A),
+            reinterpret_cast<const DType*>(B),
+            reinterpret_cast<DType*>(D),
+            batch_size, M, N, K,
+            lda, ldb, ldd,
+            stride_a, stride_b, stride_d,
+            alpha, beta, stream);
     }
     return GemmStatus::NOT_SUPPORTED;
 }
@@ -164,16 +171,18 @@ GemmStatus BmmRunner::runStrided(const void* A, const void* B, void* D,
     int batch, int M, int N, int K,
     int64_t stride_a, int64_t stride_b, int64_t stride_d,
     float alpha, float beta, void*, size_t, cudaStream_t stream) {
-    auto params = BmmParams::StridedCustom(A, B, D, batch, M, N, K, stride_a, stride_b, stride_d, impl_->dtype, stream);
-    params.alpha = alpha; params.beta = beta;
-    return invokeBmm(params);
+    return invokeBmm(A, B, D, batch, M, N, K, K, N, N,
+                    stride_a, stride_b, stride_d,
+                    alpha, beta, TransposeOp::NoTranspose, TransposeOp::NoTranspose,
+                    impl_->dtype, stream);
 }
 
 GemmStatus BmmRunner::runArray(const void* const* A_array, const void* const* B_array,
     void* const* D_array, int batch, int M, int N, int K,
     float, float, void*, size_t, cudaStream_t stream) {
-    auto params = BmmParams::PointerArray(A_array, B_array, D_array, batch, M, N, K, impl_->dtype, stream);
-    return invokeBmm(params);
+    (void)A_array; (void)B_array; (void)D_array; (void)batch; (void)M; (void)N; (void)K;
+    (void)stream;
+    return GemmStatus::NOT_SUPPORTED;  // Pointer array mode not implemented
 }
 
 std::vector<GemmConfig> BmmRunner::getConfigs() const {
@@ -194,18 +203,31 @@ GemmConfig autoTuneBmm(int batch, int M, int N, int K, DataType dtype,
     GemmConfig best = configs[0];
     float best_time = std::numeric_limits<float>::max();
     
+    int64_t stride_a = static_cast<int64_t>(M) * K;
+    int64_t stride_b = static_cast<int64_t>(K) * N;
+    int64_t stride_d = static_cast<int64_t>(M) * N;
+
     for (const auto& cfg : configs) {
         try {
-            auto params = BmmParams::Strided(A, B, D, batch, M, N, K, dtype, stream);
-            params.config = cfg;
-            for (int i = 0; i < num_warmup; ++i) invokeBmm(params);
+            (void)cfg;
+            for (int i = 0; i < num_warmup; ++i) {
+                invokeBmm(A, B, D, batch, M, N, K, K, N, N,
+                         stride_a, stride_b, stride_d,
+                         1.0f, 0.0f, TransposeOp::NoTranspose, TransposeOp::NoTranspose,
+                         dtype, stream);
+            }
             OASR_CUDA_CHECK(cudaStreamSynchronize(stream));
             
             cudaEvent_t start, stop;
             OASR_CUDA_CHECK(cudaEventCreate(&start));
             OASR_CUDA_CHECK(cudaEventCreate(&stop));
             OASR_CUDA_CHECK(cudaEventRecord(start, stream));
-            for (int i = 0; i < num_iter; ++i) invokeBmm(params);
+            for (int i = 0; i < num_iter; ++i) {
+                invokeBmm(A, B, D, batch, M, N, K, K, N, N,
+                         stride_a, stride_b, stride_d,
+                         1.0f, 0.0f, TransposeOp::NoTranspose, TransposeOp::NoTranspose,
+                         dtype, stream);
+            }
             OASR_CUDA_CHECK(cudaEventRecord(stop, stream));
             OASR_CUDA_CHECK(cudaEventSynchronize(stop));
             

@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include "group_gemm_params.h"
 #include "gemm_configs.h"
 #include "gemm_utils.h"
 #include "common/types.h"
@@ -21,24 +20,52 @@ namespace kernels {
 namespace gemm {
 
 //==============================================================================
+// Grouped GEMM: Problem descriptor
+//==============================================================================
+
+/**
+ * @brief Problem specification for a single GEMM in a group (M, N, K)
+ */
+struct GemmProblemDesc {
+    int M;
+    int N;
+    int K;
+
+    GemmProblemDesc() : M(0), N(0), K(0) {}
+    GemmProblemDesc(int m, int n, int k) : M(m), N(n), K(k) {}
+};
+
+//==============================================================================
 // Grouped GEMM Interface
 //==============================================================================
 
 /**
  * @brief Execute grouped GEMM operation
- * 
- * Computes GEMM for multiple problems with potentially different sizes:
- * D[i] = alpha * A[i] @ B[i] + beta * C[i]
- * 
- * This is particularly useful for:
- * - Variable-length sequence processing (e.g., in ASR)
- * - LoRA fine-tuning with different ranks
- * - Mixture of Experts (MoE) models
- * 
- * @param params Grouped GEMM parameters
+ *
+ * Computes: D[i] = alpha * A[i] @ B[i] + beta * D[i] for variable-sized problems
+ *
+ * @param problems [num_problems] problem dimensions on device (GemmProblemDesc*)
+ * @param num_problems Number of problems
+ * @param A_array [num_problems] array of A pointers
+ * @param B_array [num_problems] array of B pointers
+ * @param D_array [num_problems] array of D pointers
+ * @param lda_array [num_problems] leading dimensions for A
+ * @param ldb_array [num_problems] leading dimensions for B
+ * @param ldd_array [num_problems] leading dimensions for D
+ * @param dtype Data type (FP16 or BF16)
+ * @param workspace_float Workspace buffer
+ * @param workspace_float_size Size of float workspace
+ * @param stream CUDA stream
  * @return Status code
  */
-GemmStatus invokeGroupGemm(const GroupGemmParams& params);
+GemmStatus invokeGroupGemm(const GemmProblemDesc* problems, int num_problems,
+                           const void* const* A_array, const void* const* B_array,
+                           void* const* D_array,
+                           const int64_t* lda_array, const int64_t* ldb_array,
+                           const int64_t* ldd_array,
+                           DataType dtype,
+                           void* workspace_float, size_t workspace_float_size,
+                           cudaStream_t stream = nullptr);
 
 /**
  * @brief Grouped GEMM with typed interface
@@ -95,20 +122,15 @@ public:
     /**
      * @brief Run grouped GEMM
      */
-    GemmStatus run(const GroupGemmParams& params);
-    
-    /**
-     * @brief Run grouped GEMM with explicit arrays
-     */
-    GemmStatus run(
-        const GemmProblemDesc* problems, int num_problems,
-        const void* const* A_array, const void* const* B_array,
-        void* const* D_array,
-        const int64_t* lda_array, const int64_t* ldb_array, const int64_t* ldd_array,
-        void* workspace_float, size_t workspace_float_size,
-        void* workspace_int, size_t workspace_int_size,
-        bool weight_column_major,
-        cudaStream_t stream);
+    GemmStatus run(const GemmProblemDesc* problems, int num_problems,
+                   const void* const* A_array, const void* const* B_array,
+                   void* const* D_array,
+                   const int64_t* lda_array, const int64_t* ldb_array,
+                   const int64_t* ldd_array,
+                   void* workspace_float, size_t workspace_float_size,
+                   void* workspace_int, size_t workspace_int_size,
+                   bool weight_column_major,
+                   cudaStream_t stream);
     
     /**
      * @brief Get available configurations
@@ -125,36 +147,16 @@ private:
 //==============================================================================
 
 /**
- * @brief Parameters for segment GEMM
- * 
+ * @brief Execute segment GEMM (stub: not implemented)
+ *
  * For processing contiguous segments in a single buffer.
- * Useful when data is packed into a single tensor with segment offsets.
  */
-struct SegmentGemmParams {
-    const void* A;              // [total_tokens, K] packed input
-    const void* B;              // [K, N] shared weights (or per-segment)
-    void* D;                    // [total_tokens, N] packed output
-    
-    const int* segment_offsets; // [num_segments + 1] cumsum of segment lengths
-    int num_segments;
-    int K;                      // Input dimension
-    int N;                      // Output dimension
-    
-    DataType dtype = DataType::FP16;
-    bool weight_column_major = false;
-    
-    void* workspace = nullptr;
-    size_t workspace_size = 0;
-    
-    cudaStream_t stream = nullptr;
-};
-
-/**
- * @brief Execute segment GEMM
- * 
- * Efficiently handles variable-length segments packed into contiguous memory.
- */
-GemmStatus invokeSegmentGemm(const SegmentGemmParams& params);
+GemmStatus invokeSegmentGemm(const void* A, const void* B, void* D,
+                             const int* segment_offsets, int num_segments,
+                             int K, int N, DataType dtype,
+                             bool weight_column_major,
+                             void* workspace, size_t workspace_size,
+                             cudaStream_t stream = nullptr);
 
 } // namespace gemm
 } // namespace kernels

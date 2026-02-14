@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit tests for convolution kernels.
+Unit tests for convolution.
 Uses torch.testing.assert_close for correctness verification.
 """
 
@@ -49,7 +49,7 @@ class TestDepthwiseConv1D:
             torch.float16: oasr.DataType.FP16,
         }
         
-        oasr.kernels.convolution.depthwise_conv1d(
+        oasr.kernels.conv.depthwise_conv1d(
             x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
             batch_size, seq_len, channels, kernel_size, padding,
             False,  # is_causal
@@ -79,7 +79,7 @@ class TestDepthwiseConv1D:
         bias = torch.randn(channels, device='cuda', dtype=dtype)
         output = torch.empty_like(x)
         
-        oasr.kernels.convolution.depthwise_conv1d(
+        oasr.kernels.conv.depthwise_conv1d(
             x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
             batch_size, seq_len, channels, kernel_size, 0,
             True,  # is_causal
@@ -114,7 +114,7 @@ class TestPointwiseConv1D:
         bias = torch.randn(out_ch, device='cuda', dtype=dtype)
         output = torch.empty(batch_size, seq_len, out_ch, device='cuda', dtype=dtype)
         
-        oasr.kernels.convolution.pointwise_conv1d(
+        oasr.kernels.conv.pointwise_conv1d(
             x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
             batch_size, seq_len, in_ch, out_ch,
             oasr.ActivationType.SWISH, False,
@@ -145,7 +145,7 @@ class TestGLU:
             torch.float16: oasr.DataType.FP16,
         }
         
-        oasr.kernels.convolution.glu(
+        oasr.kernels.conv.glu(
             x.data_ptr(), output.data_ptr(),
             batch_size, seq_len, channels,
             dtype_map[dtype]
@@ -172,7 +172,7 @@ class TestSwish:
         x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
         output = torch.empty_like(x)
         
-        oasr.kernels.convolution.swish(
+        oasr.kernels.conv.swish(
             x.data_ptr(), output.data_ptr(),
             batch_size, seq_len, channels,
             oasr.DataType.FP32
@@ -203,7 +203,7 @@ class TestBatchNormSwish:
         running_var = torch.abs(torch.randn(channels, device='cuda', dtype=dtype)) + 0.1
         output = torch.empty_like(x)
         
-        oasr.kernels.convolution.batch_norm_swish(
+        oasr.kernels.conv.batch_norm_swish(
             x.data_ptr(), output.data_ptr(),
             gamma.data_ptr(), beta.data_ptr(),
             running_mean.data_ptr(), running_var.data_ptr(),
@@ -239,7 +239,7 @@ class TestConv1D:
         out_len = (seq_len + 2 * padding - kernel_size) // stride + 1
         output = torch.empty(batch_size, out_len, out_ch, device='cuda', dtype=dtype)
         
-        oasr.kernels.convolution.conv1d(
+        oasr.kernels.conv.conv1d(
             x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
             batch_size, seq_len, in_ch, out_ch,
             kernel_size, stride, padding, 1, 1,  # dilation=1, groups=1
@@ -280,33 +280,33 @@ class TestConformerConvPattern:
         
         # OASR pipeline
         pw1_out = torch.empty(batch_size, seq_len, 2 * d_model, device='cuda', dtype=dtype)
-        oasr.kernels.convolution.pointwise_conv1d(
+        oasr.kernels.conv.pointwise_conv1d(
             x.data_ptr(), pw1_weight.data_ptr(), pw1_bias.data_ptr(), pw1_out.data_ptr(),
             batch_size, seq_len, d_model, 2 * d_model,
             oasr.ActivationType.SWISH, False, oasr.DataType.FP32
         )
         
         glu_out = torch.empty(batch_size, seq_len, d_model, device='cuda', dtype=dtype)
-        oasr.kernels.convolution.glu(
+        oasr.kernels.conv.glu(
             pw1_out.data_ptr(), glu_out.data_ptr(),
             batch_size, seq_len, d_model, oasr.DataType.FP32
         )
         
         dw_out = torch.empty(batch_size, seq_len, d_model, device='cuda', dtype=dtype)
-        oasr.kernels.convolution.depthwise_conv1d(
+        oasr.kernels.conv.depthwise_conv1d(
             glu_out.data_ptr(), dw_weight.data_ptr(), dw_bias.data_ptr(), dw_out.data_ptr(),
             batch_size, seq_len, d_model, kernel_size, kernel_size // 2,
             False, oasr.DataType.FP32
         )
         
         swish_out = torch.empty_like(dw_out)
-        oasr.kernels.convolution.swish(
+        oasr.kernels.conv.swish(
             dw_out.data_ptr(), swish_out.data_ptr(),
             batch_size, seq_len, d_model, oasr.DataType.FP32
         )
         
         output = torch.empty(batch_size, seq_len, d_model, device='cuda', dtype=dtype)
-        oasr.kernels.convolution.pointwise_conv1d(
+        oasr.kernels.conv.pointwise_conv1d(
             swish_out.data_ptr(), pw2_weight.data_ptr(), pw2_bias.data_ptr(), output.data_ptr(),
             batch_size, seq_len, d_model, d_model,
             oasr.ActivationType.SWISH, False, oasr.DataType.FP32

@@ -4,8 +4,6 @@ Unit tests for OASR attention layers, using WeNet as ground truth.
 These tests compare the outputs of the OASR attention implementations under
 `oasr.layers.attention.attention` against the original WeNet reference
 implementations in `wenet.models.transformer.attention`.
-
-Tests are skipped automatically if WeNet is not available.
 """
 
 from __future__ import annotations
@@ -13,8 +11,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-
-wenet = pytest.importorskip("wenet")
 
 from wenet.models.transformer import attention as wenet_attn  # type: ignore  # noqa: E402
 from wenet.utils import rope_utils as wenet_rope_utils  # type: ignore  # noqa: E402

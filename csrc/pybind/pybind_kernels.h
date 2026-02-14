@@ -8,17 +8,13 @@
 
 #include "kernels/attention/attention_kernels.h"
 #include "kernels/attention/attention_params.h"
-#include "kernels/convolution/conv_kernels.h"
-#include "kernels/convolution/conv_params.h"
-#include "kernels/normalization/norm_kernels.h"
+#include "kernels/conv/conv_kernels.h"
+#include "kernels/norm/norm_kernels.h"
 
 // GEMM kernels
 #include "kernels/gemm/gemm_configs.h"
-#include "kernels/gemm/gemm_params.h"
 #include "kernels/gemm/gemm_kernels.h"
-#include "kernels/gemm/bmm_params.h"
 #include "kernels/gemm/bmm_kernels.h"
-#include "kernels/gemm/group_gemm_params.h"
 #include "kernels/gemm/group_gemm_kernels.h"
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -96,98 +92,6 @@ inline void registerGemmBindings(py::module_& kernels) {
       .def("to_string", &GemmConfig::toString)
       .def("__repr__", &GemmConfig::toString);
 
-  py::class_<GemmParams>(gemm_mod, "GemmParams")
-      .def(py::init<>())
-      .def_property("A",
-          [](const GemmParams& p) { return reinterpret_cast<intptr_t>(p.A); },
-          [](GemmParams& p, intptr_t v) { p.A = reinterpret_cast<const void*>(v); })
-      .def_property("B",
-          [](const GemmParams& p) { return reinterpret_cast<intptr_t>(p.B); },
-          [](GemmParams& p, intptr_t v) { p.B = reinterpret_cast<const void*>(v); })
-      .def_property("C",
-          [](const GemmParams& p) { return reinterpret_cast<intptr_t>(p.C); },
-          [](GemmParams& p, intptr_t v) { p.C = reinterpret_cast<const void*>(v); })
-      .def_property("D",
-          [](const GemmParams& p) { return reinterpret_cast<intptr_t>(p.D); },
-          [](GemmParams& p, intptr_t v) { p.D = reinterpret_cast<void*>(v); })
-      .def_readwrite("M", &GemmParams::M)
-      .def_readwrite("N", &GemmParams::N)
-      .def_readwrite("K", &GemmParams::K)
-      .def_readwrite("lda", &GemmParams::lda)
-      .def_readwrite("ldb", &GemmParams::ldb)
-      .def_readwrite("ldc", &GemmParams::ldc)
-      .def_readwrite("ldd", &GemmParams::ldd)
-      .def_readwrite("alpha", &GemmParams::alpha)
-      .def_readwrite("beta", &GemmParams::beta)
-      .def_readwrite("trans_a", &GemmParams::trans_a)
-      .def_readwrite("trans_b", &GemmParams::trans_b)
-      .def_readwrite("dtype_a", &GemmParams::dtype_a)
-      .def_readwrite("dtype_b", &GemmParams::dtype_b)
-      .def_readwrite("dtype_c", &GemmParams::dtype_c)
-      .def_readwrite("dtype_d", &GemmParams::dtype_d)
-      .def_readwrite("config", &GemmParams::config)
-      .def_readwrite("epilogue_fusion", &GemmParams::epilogue_fusion)
-      .def_property("workspace",
-          [](const GemmParams& p) { return reinterpret_cast<intptr_t>(p.workspace); },
-          [](GemmParams& p, intptr_t v) { p.workspace = reinterpret_cast<void*>(v); })
-      .def_readwrite("workspace_size", &GemmParams::workspace_size);
-
-  py::class_<BmmParams>(gemm_mod, "BmmParams")
-      .def(py::init<>())
-      .def_readwrite("batch_size", &BmmParams::batch_size)
-      .def_readwrite("M", &BmmParams::M)
-      .def_readwrite("N", &BmmParams::N)
-      .def_readwrite("K", &BmmParams::K)
-      .def_readwrite("lda", &BmmParams::lda)
-      .def_readwrite("ldb", &BmmParams::ldb)
-      .def_readwrite("ldc", &BmmParams::ldc)
-      .def_readwrite("ldd", &BmmParams::ldd)
-      .def_readwrite("stride_a", &BmmParams::stride_a)
-      .def_readwrite("stride_b", &BmmParams::stride_b)
-      .def_readwrite("stride_c", &BmmParams::stride_c)
-      .def_readwrite("stride_d", &BmmParams::stride_d)
-      .def_readwrite("alpha", &BmmParams::alpha)
-      .def_readwrite("beta", &BmmParams::beta)
-      .def_readwrite("trans_a", &BmmParams::trans_a)
-      .def_readwrite("trans_b", &BmmParams::trans_b)
-      .def_readwrite("dtype_a", &BmmParams::dtype_a)
-      .def_readwrite("dtype_b", &BmmParams::dtype_b)
-      .def_readwrite("dtype_d", &BmmParams::dtype_d)
-      .def_readwrite("use_pointer_array", &BmmParams::use_pointer_array)
-      .def_readwrite("config", &BmmParams::config)
-      .def_static("Strided",
-          [](intptr_t a, intptr_t b, intptr_t d, int batch, int m, int n, int k,
-             DataType dtype, py::object stream) {
-            cudaStream_t s = stream.is_none() ? nullptr
-                                              : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
-            return BmmParams::Strided(
-                reinterpret_cast<const void*>(a),
-                reinterpret_cast<const void*>(b),
-                reinterpret_cast<void*>(d),
-                batch, m, n, k, dtype, s);
-          },
-          py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("batch"), py::arg("m"), py::arg("n"), py::arg("k"),
-          py::arg("dtype"), py::arg("stream") = py::none(),
-          "Create strided batched GEMM params")
-      .def_static("StridedCustom",
-          [](intptr_t a, intptr_t b, intptr_t d, int batch, int m, int n, int k,
-             int64_t stride_a, int64_t stride_b, int64_t stride_d,
-             DataType dtype, py::object stream) {
-            cudaStream_t s = stream.is_none() ? nullptr
-                                              : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
-            return BmmParams::StridedCustom(
-                reinterpret_cast<const void*>(a),
-                reinterpret_cast<const void*>(b),
-                reinterpret_cast<void*>(d),
-                batch, m, n, k, stride_a, stride_b, stride_d, dtype, s);
-          },
-          py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("batch"), py::arg("m"), py::arg("n"), py::arg("k"),
-          py::arg("stride_a"), py::arg("stride_b"), py::arg("stride_d"),
-          py::arg("dtype"), py::arg("stream") = py::none(),
-          "Create strided batched GEMM params with custom strides");
-
   py::class_<GemmProblemDesc>(gemm_mod, "GemmProblemDesc")
       .def(py::init<>())
       .def(py::init<int, int, int>(), py::arg("m"), py::arg("n"), py::arg("k"))
@@ -195,94 +99,80 @@ inline void registerGemmBindings(py::module_& kernels) {
       .def_readwrite("N", &GemmProblemDesc::N)
       .def_readwrite("K", &GemmProblemDesc::K);
 
-  py::class_<GroupGemmParams>(gemm_mod, "GroupGemmParams")
-      .def(py::init<>())
-      .def_property("problems",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.problems);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.problems = reinterpret_cast<const GemmProblemDesc*>(v);
-          })
-      .def_readwrite("num_problems", &GroupGemmParams::num_problems)
-      .def_property("A_array",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.A_array);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.A_array = reinterpret_cast<const void* const*>(v);
-          })
-      .def_property("B_array",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.B_array);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.B_array = reinterpret_cast<const void* const*>(v);
-          })
-      .def_property("D_array",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.D_array);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.D_array = reinterpret_cast<void* const*>(v);
-          })
-      .def_property("lda_array",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.lda_array);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.lda_array = reinterpret_cast<const int64_t*>(v);
-          })
-      .def_property("ldb_array",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.ldb_array);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.ldb_array = reinterpret_cast<const int64_t*>(v);
-          })
-      .def_property("ldd_array",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.ldd_array);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.ldd_array = reinterpret_cast<const int64_t*>(v);
-          })
-      .def_readwrite("alpha", &GroupGemmParams::alpha)
-      .def_readwrite("beta", &GroupGemmParams::beta)
-      .def_readwrite("weight_column_major", &GroupGemmParams::weight_column_major)
-      .def_readwrite("dtype_a", &GroupGemmParams::dtype_a)
-      .def_readwrite("dtype_b", &GroupGemmParams::dtype_b)
-      .def_readwrite("dtype_d", &GroupGemmParams::dtype_d)
-      .def_readwrite("config", &GroupGemmParams::config)
-      .def_property("workspace_float",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.workspace_float);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.workspace_float = reinterpret_cast<void*>(v);
-          })
-      .def_readwrite("workspace_float_size", &GroupGemmParams::workspace_float_size)
-      .def_property("workspace_int",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.workspace_int);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.workspace_int = reinterpret_cast<void*>(v);
-          })
-      .def_readwrite("workspace_int_size", &GroupGemmParams::workspace_int_size)
-      .def_property("stream",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.stream);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.stream = reinterpret_cast<cudaStream_t>(v);
-          });
+  gemm_mod.def("invoke_gemm",
+      [](intptr_t a, intptr_t b, intptr_t d, int M, int N, int K,
+         int64_t lda, int64_t ldb, int64_t ldd, float alpha, float beta,
+         TransposeOp trans_a, TransposeOp trans_b, DataType dtype, py::object stream) {
+        cudaStream_t s = stream.is_none() ? nullptr
+            : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
+        return invokeGemm(
+            reinterpret_cast<const void*>(a),
+            reinterpret_cast<const void*>(b),
+            reinterpret_cast<void*>(d),
+            M, N, K, lda, ldb, ldd, alpha, beta,
+            trans_a, trans_b, dtype, s);
+      },
+      py::arg("a"), py::arg("b"), py::arg("d"),
+      py::arg("M"), py::arg("N"), py::arg("K"),
+      py::arg("lda"), py::arg("ldb"), py::arg("ldd"),
+      py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
+      py::arg("trans_a") = TransposeOp::NoTranspose,
+      py::arg("trans_b") = TransposeOp::NoTranspose,
+      py::arg("dtype"), py::arg("stream") = py::none(),
+      "Execute GEMM: D = alpha * A @ B + beta * D");
 
-  gemm_mod.def("invoke_gemm", &invokeGemm, py::arg("params"),
-      "Execute GEMM: D = alpha * A @ B + beta * C");
-  gemm_mod.def("invoke_bmm", &invokeBmm, py::arg("params"),
-      "Execute batched GEMM");
-  gemm_mod.def("invoke_group_gemm", &invokeGroupGemm, py::arg("params"),
+  gemm_mod.def("invoke_bmm",
+      [](intptr_t a, intptr_t b, intptr_t d, int batch_size, int M, int N, int K,
+         int64_t lda, int64_t ldb, int64_t ldd,
+         int64_t stride_a, int64_t stride_b, int64_t stride_d,
+         float alpha, float beta,
+         TransposeOp trans_a, TransposeOp trans_b, DataType dtype, py::object stream) {
+        cudaStream_t s = stream.is_none() ? nullptr
+            : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
+        return invokeBmm(
+            reinterpret_cast<const void*>(a),
+            reinterpret_cast<const void*>(b),
+            reinterpret_cast<void*>(d),
+            batch_size, M, N, K, lda, ldb, ldd,
+            stride_a, stride_b, stride_d, alpha, beta,
+            trans_a, trans_b, dtype, s);
+      },
+      py::arg("a"), py::arg("b"), py::arg("d"),
+      py::arg("batch_size"), py::arg("M"), py::arg("N"), py::arg("K"),
+      py::arg("lda"), py::arg("ldb"), py::arg("ldd"),
+      py::arg("stride_a"), py::arg("stride_b"), py::arg("stride_d"),
+      py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
+      py::arg("trans_a") = TransposeOp::NoTranspose,
+      py::arg("trans_b") = TransposeOp::NoTranspose,
+      py::arg("dtype"), py::arg("stream") = py::none(),
+      "Execute strided batched GEMM");
+
+  gemm_mod.def("invoke_group_gemm",
+      [](intptr_t problems, int num_problems,
+         intptr_t a_array, intptr_t b_array, intptr_t d_array,
+         intptr_t lda_array, intptr_t ldb_array, intptr_t ldd_array,
+         DataType dtype, intptr_t workspace_float, size_t workspace_float_size,
+         py::object stream) {
+        cudaStream_t s = stream.is_none() ? nullptr
+            : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
+        return invokeGroupGemm(
+            reinterpret_cast<const GemmProblemDesc*>(problems),
+            num_problems,
+            reinterpret_cast<const void* const*>(a_array),
+            reinterpret_cast<const void* const*>(b_array),
+            reinterpret_cast<void* const*>(d_array),
+            reinterpret_cast<const int64_t*>(lda_array),
+            reinterpret_cast<const int64_t*>(ldb_array),
+            reinterpret_cast<const int64_t*>(ldd_array),
+            dtype,
+            reinterpret_cast<void*>(workspace_float),
+            workspace_float_size, s);
+      },
+      py::arg("problems"), py::arg("num_problems"),
+      py::arg("a_array"), py::arg("b_array"), py::arg("d_array"),
+      py::arg("lda_array"), py::arg("ldb_array"), py::arg("ldd_array"),
+      py::arg("dtype"), py::arg("workspace_float"), py::arg("workspace_float_size"),
+      py::arg("stream") = py::none(),
       "Execute grouped GEMM (variable-sized problems)");
 
   gemm_mod.def("query_group_gemm_workspace_size",
@@ -396,64 +286,7 @@ inline void registerKernelBindings(py::module_ &m) {
 
   // ============== Convolution Kernels ==============
   py::module_ conv =
-      kernels.def_submodule("convolution", "Convolution kernels");
-
-  // Conv1DParams (stream as intptr_t to avoid cudaStream_t in pybind)
-  py::class_<kernels::Conv1DParams>(conv, "Conv1DParams")
-      .def(py::init<>())
-      .def_readwrite("batch_size", &kernels::Conv1DParams::batch_size)
-      .def_readwrite("seq_len", &kernels::Conv1DParams::seq_len)
-      .def_readwrite("in_channels", &kernels::Conv1DParams::in_channels)
-      .def_readwrite("out_channels", &kernels::Conv1DParams::out_channels)
-      .def_readwrite("kernel_size", &kernels::Conv1DParams::kernel_size)
-      .def_readwrite("stride", &kernels::Conv1DParams::stride)
-      .def_readwrite("padding", &kernels::Conv1DParams::padding)
-      .def_readwrite("dilation", &kernels::Conv1DParams::dilation)
-      .def_readwrite("groups", &kernels::Conv1DParams::groups)
-      .def_readwrite("conv_type", &kernels::Conv1DParams::conv_type)
-      .def_readwrite("dtype", &kernels::Conv1DParams::dtype)
-      .def_readwrite("channels_last", &kernels::Conv1DParams::channels_last)
-      .def_readwrite("is_causal", &kernels::Conv1DParams::is_causal)
-      .def_property("stream",
-          [](const kernels::Conv1DParams& p) {
-            return reinterpret_cast<intptr_t>(p.stream);
-          },
-          [](kernels::Conv1DParams& p, intptr_t v) {
-            p.stream = reinterpret_cast<cudaStream_t>(v);
-          });
-
-  // ConformerConvParams (stream as intptr_t to avoid cudaStream_t in pybind)
-  py::class_<kernels::ConformerConvParams>(conv, "ConformerConvParams")
-      .def(py::init<>())
-      .def_readwrite("batch_size", &kernels::ConformerConvParams::batch_size)
-      .def_readwrite("seq_len", &kernels::ConformerConvParams::seq_len)
-      .def_readwrite("d_model", &kernels::ConformerConvParams::d_model)
-      .def_readwrite("kernel_size", &kernels::ConformerConvParams::kernel_size)
-      .def_readwrite("dtype", &kernels::ConformerConvParams::dtype)
-      .def_readwrite("batch_norm_eps",
-                     &kernels::ConformerConvParams::batch_norm_eps)
-      .def_readwrite("is_causal", &kernels::ConformerConvParams::is_causal)
-      .def_property("stream",
-          [](const kernels::ConformerConvParams& p) {
-            return reinterpret_cast<intptr_t>(p.stream);
-          },
-          [](kernels::ConformerConvParams& p, intptr_t v) {
-            p.stream = reinterpret_cast<cudaStream_t>(v);
-          });
-
-  // ConvState
-  py::class_<kernels::ConvState>(conv, "ConvState")
-      .def(py::init<>())
-      .def_readwrite("buffer_size", &kernels::ConvState::buffer_size)
-      .def_readwrite("channels", &kernels::ConvState::channels)
-      .def_readwrite("dtype", &kernels::ConvState::dtype);
-
-  // Convolution kernel functions
-  conv.def("conv1d", &kernels::invokeConv1D, py::arg("params"),
-           "1D convolution kernel");
-
-  conv.def("conformer_conv_module", &kernels::invokeConformerConvModule,
-           py::arg("params"), "Conformer convolution module");
+      kernels.def_submodule("conv", "Convolution kernels");
 
   conv.def("glu",
            [](const void* input, void* output, int batch_size, int seq_len,
@@ -542,100 +375,6 @@ inline void registerKernelBindings(py::module_ &m) {
       .def("to_string", &GemmConfig::toString)
       .def("__repr__", &GemmConfig::toString);
 
-  // --- GemmParams ---
-  py::class_<GemmParams>(gemm_mod, "GemmParams")
-      .def(py::init<>())
-      .def_property("A",
-          [](const GemmParams& p) { return reinterpret_cast<intptr_t>(p.A); },
-          [](GemmParams& p, intptr_t v) { p.A = reinterpret_cast<const void*>(v); })
-      .def_property("B",
-          [](const GemmParams& p) { return reinterpret_cast<intptr_t>(p.B); },
-          [](GemmParams& p, intptr_t v) { p.B = reinterpret_cast<const void*>(v); })
-      .def_property("C",
-          [](const GemmParams& p) { return reinterpret_cast<intptr_t>(p.C); },
-          [](GemmParams& p, intptr_t v) { p.C = reinterpret_cast<const void*>(v); })
-      .def_property("D",
-          [](const GemmParams& p) { return reinterpret_cast<intptr_t>(p.D); },
-          [](GemmParams& p, intptr_t v) { p.D = reinterpret_cast<void*>(v); })
-      .def_readwrite("M", &GemmParams::M)
-      .def_readwrite("N", &GemmParams::N)
-      .def_readwrite("K", &GemmParams::K)
-      .def_readwrite("lda", &GemmParams::lda)
-      .def_readwrite("ldb", &GemmParams::ldb)
-      .def_readwrite("ldc", &GemmParams::ldc)
-      .def_readwrite("ldd", &GemmParams::ldd)
-      .def_readwrite("alpha", &GemmParams::alpha)
-      .def_readwrite("beta", &GemmParams::beta)
-      .def_readwrite("trans_a", &GemmParams::trans_a)
-      .def_readwrite("trans_b", &GemmParams::trans_b)
-      .def_readwrite("dtype_a", &GemmParams::dtype_a)
-      .def_readwrite("dtype_b", &GemmParams::dtype_b)
-      .def_readwrite("dtype_c", &GemmParams::dtype_c)
-      .def_readwrite("dtype_d", &GemmParams::dtype_d)
-      .def_readwrite("config", &GemmParams::config)
-      .def_readwrite("epilogue_fusion", &GemmParams::epilogue_fusion)
-      .def_property("workspace",
-          [](const GemmParams& p) { return reinterpret_cast<intptr_t>(p.workspace); },
-          [](GemmParams& p, intptr_t v) { p.workspace = reinterpret_cast<void*>(v); })
-      .def_readwrite("workspace_size", &GemmParams::workspace_size);
-
-  // --- BmmParams ---
-  py::class_<BmmParams>(gemm_mod, "BmmParams")
-      .def(py::init<>())
-      .def_readwrite("batch_size", &BmmParams::batch_size)
-      .def_readwrite("M", &BmmParams::M)
-      .def_readwrite("N", &BmmParams::N)
-      .def_readwrite("K", &BmmParams::K)
-      .def_readwrite("lda", &BmmParams::lda)
-      .def_readwrite("ldb", &BmmParams::ldb)
-      .def_readwrite("ldc", &BmmParams::ldc)
-      .def_readwrite("ldd", &BmmParams::ldd)
-      .def_readwrite("stride_a", &BmmParams::stride_a)
-      .def_readwrite("stride_b", &BmmParams::stride_b)
-      .def_readwrite("stride_c", &BmmParams::stride_c)
-      .def_readwrite("stride_d", &BmmParams::stride_d)
-      .def_readwrite("alpha", &BmmParams::alpha)
-      .def_readwrite("beta", &BmmParams::beta)
-      .def_readwrite("trans_a", &BmmParams::trans_a)
-      .def_readwrite("trans_b", &BmmParams::trans_b)
-      .def_readwrite("dtype_a", &BmmParams::dtype_a)
-      .def_readwrite("dtype_b", &BmmParams::dtype_b)
-      .def_readwrite("dtype_d", &BmmParams::dtype_d)
-      .def_readwrite("use_pointer_array", &BmmParams::use_pointer_array)
-      .def_readwrite("config", &BmmParams::config)
-      .def_static("Strided",
-          [](intptr_t a, intptr_t b, intptr_t d, int batch, int m, int n, int k,
-             DataType dtype, py::object stream) {
-            cudaStream_t s = stream.is_none() ? nullptr
-                                              : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
-            return BmmParams::Strided(
-                reinterpret_cast<const void*>(a),
-                reinterpret_cast<const void*>(b),
-                reinterpret_cast<void*>(d),
-                batch, m, n, k, dtype, s);
-          },
-          py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("batch"), py::arg("m"), py::arg("n"), py::arg("k"),
-          py::arg("dtype"), py::arg("stream") = py::none(),
-          "Create strided batched GEMM params")
-      .def_static("StridedCustom",
-          [](intptr_t a, intptr_t b, intptr_t d, int batch, int m, int n, int k,
-             int64_t stride_a, int64_t stride_b, int64_t stride_d,
-             DataType dtype, py::object stream) {
-            cudaStream_t s = stream.is_none() ? nullptr
-                                              : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
-            return BmmParams::StridedCustom(
-                reinterpret_cast<const void*>(a),
-                reinterpret_cast<const void*>(b),
-                reinterpret_cast<void*>(d),
-                batch, m, n, k, stride_a, stride_b, stride_d, dtype, s);
-          },
-          py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("batch"), py::arg("m"), py::arg("n"), py::arg("k"),
-          py::arg("stride_a"), py::arg("stride_b"), py::arg("stride_d"),
-          py::arg("dtype"), py::arg("stream") = py::none(),
-          "Create strided batched GEMM params with custom strides");
-
   // --- GemmProblemDesc ---
   py::class_<GemmProblemDesc>(gemm_mod, "GemmProblemDesc")
       .def(py::init<>())
@@ -644,96 +383,81 @@ inline void registerKernelBindings(py::module_ &m) {
       .def_readwrite("N", &GemmProblemDesc::N)
       .def_readwrite("K", &GemmProblemDesc::K);
 
-  // --- GroupGemmParams ---
-  py::class_<GroupGemmParams>(gemm_mod, "GroupGemmParams")
-      .def(py::init<>())
-      .def_property("problems",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.problems);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.problems = reinterpret_cast<const GemmProblemDesc*>(v);
-          })
-      .def_readwrite("num_problems", &GroupGemmParams::num_problems)
-      .def_property("A_array",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.A_array);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.A_array = reinterpret_cast<const void* const*>(v);
-          })
-      .def_property("B_array",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.B_array);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.B_array = reinterpret_cast<const void* const*>(v);
-          })
-      .def_property("D_array",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.D_array);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.D_array = reinterpret_cast<void* const*>(v);
-          })
-      .def_property("lda_array",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.lda_array);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.lda_array = reinterpret_cast<const int64_t*>(v);
-          })
-      .def_property("ldb_array",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.ldb_array);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.ldb_array = reinterpret_cast<const int64_t*>(v);
-          })
-      .def_property("ldd_array",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.ldd_array);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.ldd_array = reinterpret_cast<const int64_t*>(v);
-          })
-      .def_readwrite("alpha", &GroupGemmParams::alpha)
-      .def_readwrite("beta", &GroupGemmParams::beta)
-      .def_readwrite("weight_column_major", &GroupGemmParams::weight_column_major)
-      .def_readwrite("dtype_a", &GroupGemmParams::dtype_a)
-      .def_readwrite("dtype_b", &GroupGemmParams::dtype_b)
-      .def_readwrite("dtype_d", &GroupGemmParams::dtype_d)
-      .def_readwrite("config", &GroupGemmParams::config)
-      .def_property("workspace_float",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.workspace_float);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.workspace_float = reinterpret_cast<void*>(v);
-          })
-      .def_readwrite("workspace_float_size", &GroupGemmParams::workspace_float_size)
-      .def_property("workspace_int",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.workspace_int);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.workspace_int = reinterpret_cast<void*>(v);
-          })
-      .def_readwrite("workspace_int_size", &GroupGemmParams::workspace_int_size)
-      .def_property("stream",
-          [](const GroupGemmParams& p) {
-            return reinterpret_cast<intptr_t>(p.stream);
-          },
-          [](GroupGemmParams& p, intptr_t v) {
-            p.stream = reinterpret_cast<cudaStream_t>(v);
-          });
+  // --- Invoke kernels (direct parameters) ---
+  gemm_mod.def("invoke_gemm",
+      [](intptr_t a, intptr_t b, intptr_t d, int M, int N, int K,
+         int64_t lda, int64_t ldb, int64_t ldd, float alpha, float beta,
+         TransposeOp trans_a, TransposeOp trans_b, DataType dtype, py::object stream) {
+        cudaStream_t s = stream.is_none() ? nullptr
+            : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
+        return invokeGemm(
+            reinterpret_cast<const void*>(a),
+            reinterpret_cast<const void*>(b),
+            reinterpret_cast<void*>(d),
+            M, N, K, lda, ldb, ldd, alpha, beta,
+            trans_a, trans_b, dtype, s);
+      },
+      py::arg("a"), py::arg("b"), py::arg("d"),
+      py::arg("M"), py::arg("N"), py::arg("K"),
+      py::arg("lda"), py::arg("ldb"), py::arg("ldd"),
+      py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
+      py::arg("trans_a") = TransposeOp::NoTranspose,
+      py::arg("trans_b") = TransposeOp::NoTranspose,
+      py::arg("dtype"), py::arg("stream") = py::none(),
+      "Execute GEMM: D = alpha * A @ B + beta * D");
 
-  // --- Invoke kernels ---
-  gemm_mod.def("invoke_gemm", &invokeGemm, py::arg("params"),
-      "Execute GEMM: D = alpha * A @ B + beta * C");
-  gemm_mod.def("invoke_bmm", &invokeBmm, py::arg("params"),
-      "Execute batched GEMM");
-  gemm_mod.def("invoke_group_gemm", &invokeGroupGemm, py::arg("params"),
+  gemm_mod.def("invoke_bmm",
+      [](intptr_t a, intptr_t b, intptr_t d, int batch_size, int M, int N, int K,
+         int64_t lda, int64_t ldb, int64_t ldd,
+         int64_t stride_a, int64_t stride_b, int64_t stride_d,
+         float alpha, float beta,
+         TransposeOp trans_a, TransposeOp trans_b, DataType dtype, py::object stream) {
+        cudaStream_t s = stream.is_none() ? nullptr
+            : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
+        return invokeBmm(
+            reinterpret_cast<const void*>(a),
+            reinterpret_cast<const void*>(b),
+            reinterpret_cast<void*>(d),
+            batch_size, M, N, K, lda, ldb, ldd,
+            stride_a, stride_b, stride_d, alpha, beta,
+            trans_a, trans_b, dtype, s);
+      },
+      py::arg("a"), py::arg("b"), py::arg("d"),
+      py::arg("batch_size"), py::arg("M"), py::arg("N"), py::arg("K"),
+      py::arg("lda"), py::arg("ldb"), py::arg("ldd"),
+      py::arg("stride_a"), py::arg("stride_b"), py::arg("stride_d"),
+      py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
+      py::arg("trans_a") = TransposeOp::NoTranspose,
+      py::arg("trans_b") = TransposeOp::NoTranspose,
+      py::arg("dtype"), py::arg("stream") = py::none(),
+      "Execute strided batched GEMM");
+
+  gemm_mod.def("invoke_group_gemm",
+      [](intptr_t problems, int num_problems,
+         intptr_t a_array, intptr_t b_array, intptr_t d_array,
+         intptr_t lda_array, intptr_t ldb_array, intptr_t ldd_array,
+         DataType dtype, intptr_t workspace_float, size_t workspace_float_size,
+         py::object stream) {
+        cudaStream_t s = stream.is_none() ? nullptr
+            : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
+        return invokeGroupGemm(
+            reinterpret_cast<const GemmProblemDesc*>(problems),
+            num_problems,
+            reinterpret_cast<const void* const*>(a_array),
+            reinterpret_cast<const void* const*>(b_array),
+            reinterpret_cast<void* const*>(d_array),
+            reinterpret_cast<const int64_t*>(lda_array),
+            reinterpret_cast<const int64_t*>(ldb_array),
+            reinterpret_cast<const int64_t*>(ldd_array),
+            dtype,
+            reinterpret_cast<void*>(workspace_float),
+            workspace_float_size, s);
+      },
+      py::arg("problems"), py::arg("num_problems"),
+      py::arg("a_array"), py::arg("b_array"), py::arg("d_array"),
+      py::arg("lda_array"), py::arg("ldb_array"), py::arg("ldd_array"),
+      py::arg("dtype"), py::arg("workspace_float"), py::arg("workspace_float_size"),
+      py::arg("stream") = py::none(),
       "Execute grouped GEMM (variable-sized problems)");
 
   // --- Group GEMM workspace query ---
@@ -800,17 +524,7 @@ inline void registerKernelBindings(py::module_ &m) {
 
   // ============== Normalization Kernels ==============
   py::module_ norm =
-      kernels.def_submodule("normalization", "Normalization kernels");
-
-  // NormParams
-  py::class_<kernels::NormParams>(norm, "NormParams")
-      .def(py::init<>())
-      .def_readwrite("batch_size", &kernels::NormParams::batch_size)
-      .def_readwrite("seq_len", &kernels::NormParams::seq_len)
-      .def_readwrite("hidden_size", &kernels::NormParams::hidden_size)
-      .def_readwrite("eps", &kernels::NormParams::eps)
-      .def_readwrite("norm_type", &kernels::NormParams::norm_type)
-      .def_readwrite("dtype", &kernels::NormParams::dtype);
+      kernels.def_submodule("norm", "Normalization kernels");
 
   // Normalization kernel functions (stream as intptr_t to avoid cudaStream_t in pybind)
   norm.def("layer_norm",

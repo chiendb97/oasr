@@ -81,7 +81,7 @@ class Conv1d:
                 batch_size, self.out_channels, out_seq, device=x.device, dtype=x.dtype
             )
 
-        kernels.convolution.conv1d(
+        kernels.conv.conv1d(
             x.data_ptr(),
             weight.data_ptr(),
             bias_ptr,
@@ -136,7 +136,7 @@ class DepthwiseConv1d:
         batch_size, seq_len, _ = x.shape
         output = torch.empty_like(x)
         bias_ptr = bias.data_ptr() if bias is not None else 0
-        kernels.convolution.depthwise_conv1d(
+        kernels.conv.depthwise_conv1d(
             x.data_ptr(),
             weight.data_ptr(),
             bias_ptr,
@@ -185,7 +185,7 @@ class PointwiseConv1d:
             batch_size, seq_len, self.out_channels, device=x.device, dtype=x.dtype
         )
         bias_ptr = bias.data_ptr() if bias is not None else 0
-        kernels.convolution.pointwise_conv1d(
+        kernels.conv.pointwise_conv1d(
             x.data_ptr(),
             weight.data_ptr(),
             bias_ptr,
@@ -205,4 +205,3 @@ class PointwiseConv1d:
 
 
 __all__ = ["Conv1d", "DepthwiseConv1d", "PointwiseConv1d"]
-

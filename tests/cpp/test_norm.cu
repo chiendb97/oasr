@@ -1,8 +1,7 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Unit tests for normalization kernels.
-// Structure and behavior aligned with tests/python/unit/test_norm_kernels.py
+// Unit tests for normalization layers.
 
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
@@ -11,7 +10,7 @@
 #include <vector>
 #include <random>
 
-#include "kernels/normalization/norm_kernels.h"
+#include "kernels/norm/norm_kernels.h"
 #include "common/cuda_utils.h"
 
 using namespace oasr;

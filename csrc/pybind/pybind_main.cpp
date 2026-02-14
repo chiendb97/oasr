@@ -8,9 +8,8 @@
 
 #include <cuda_runtime.h>
 #include "common/types.h"
-#include "kernels/normalization/norm_kernels.h"
-#include "kernels/convolution/conv_kernels.h"
-#include "kernels/convolution/conv_params.h"
+#include "kernels/norm/norm_kernels.h"
+#include "kernels/conv/conv_kernels.h"
 #include "pybind_kernels.h"
 
 namespace py = pybind11;
@@ -98,18 +97,8 @@ PYBIND11_MODULE(_C, m) {
     // Normalization Kernels
     // =========================================================================
     py::module_ kernels = m.def_submodule("kernels", "Low-level CUDA kernels");
-    py::module_ norm = kernels.def_submodule("normalization", "Normalization kernels");
-    
-    // NormParams
-    py::class_<oasr::kernels::NormParams>(norm, "NormParams")
-        .def(py::init<>())
-        .def_readwrite("batch_size", &oasr::kernels::NormParams::batch_size)
-        .def_readwrite("seq_len", &oasr::kernels::NormParams::seq_len)
-        .def_readwrite("hidden_size", &oasr::kernels::NormParams::hidden_size)
-        .def_readwrite("eps", &oasr::kernels::NormParams::eps)
-        .def_readwrite("norm_type", &oasr::kernels::NormParams::norm_type)
-        .def_readwrite("dtype", &oasr::kernels::NormParams::dtype);
-    
+    py::module_ norm = kernels.def_submodule("norm", "Normalization kernels");
+
     // Normalization kernel functions with Python-friendly interface
     // Use intptr_t for pointers (compatible with tensor.data_ptr())
     norm.def("layer_norm", 
@@ -201,7 +190,7 @@ PYBIND11_MODULE(_C, m) {
     // =========================================================================
     // Convolution Kernels
     // =========================================================================
-    py::module_ conv = kernels.def_submodule("convolution", "Convolution kernels");
+    py::module_ conv = kernels.def_submodule("conv", "Convolution kernels");
     
     // Depthwise Conv1D
     conv.def("depthwise_conv1d",
@@ -288,36 +277,20 @@ PYBIND11_MODULE(_C, m) {
              py::arg("eps") = 1e-5f, py::arg("dtype") = oasr::DataType::FP16,
              "Fused BatchNorm + Swish kernel");
     
-    // General Conv1D (with params)
+    // General Conv1D
     conv.def("conv1d",
              [](intptr_t input, intptr_t weight, intptr_t bias, intptr_t output,
                 int batch_size, int seq_len, int in_channels, int out_channels,
                 int kernel_size, int stride, int padding, int dilation, int groups,
                 oasr::ConvType conv_type, oasr::DataType dtype, bool channels_last,
                 bool is_causal, oasr::ActivationType activation, bool fuse_activation) {
-                 oasr::kernels::Conv1DParams params;
-                 params.input = to_const_ptr(input);
-                 params.output = to_ptr(output);
-                 params.weight = to_const_ptr(weight);
-                 params.bias = bias != 0 ? to_const_ptr(bias) : nullptr;
-                 params.batch_size = batch_size;
-                 params.seq_len = seq_len;
-                 params.in_channels = in_channels;
-                 params.out_channels = out_channels;
-                 params.kernel_size = kernel_size;
-                 params.stride = stride;
-                 params.padding = padding;
-                 params.dilation = dilation;
-                 params.groups = groups;
-                 params.conv_type = conv_type;
-                 params.dtype = dtype;
-                 params.channels_last = channels_last;
-                 params.is_causal = is_causal;
-                 params.activation = activation;
-                 params.fuse_activation = fuse_activation;
-                 params.stream = nullptr;
-                 
-                 oasr::kernels::invokeConv1D(params);
+                 oasr::kernels::invokeConv1D(
+                     to_const_ptr(input), to_ptr(output), to_const_ptr(weight),
+                     bias != 0 ? to_const_ptr(bias) : nullptr,
+                     batch_size, seq_len, in_channels, out_channels,
+                     kernel_size, stride, padding, dilation, groups,
+                     conv_type, dtype, channels_last, is_causal,
+                     activation, fuse_activation, nullptr);
              },
              py::arg("input"), py::arg("weight"), py::arg("bias"), py::arg("output"),
              py::arg("batch_size"), py::arg("seq_len"),

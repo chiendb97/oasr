@@ -3,9 +3,6 @@
 Performance benchmarks for convolution kernels.
 Uses triton.testing.do_bench for accurate GPU timing.
 
-Problem sizes align with WeNet Conformer-base (cnn_module_kernel=15) /
-Conformer-large (cnn_module_kernel=31); 10 sec audio, batch up to 64.
-
 Profiling mode for NVIDIA Nsight Compute:
     ncu --set full -o profile_report python bench_conv_kernels.py \
     --profile --kernel swish --target oasr \
@@ -72,7 +69,7 @@ def setup_depthwise_conv1d(batch_size, seq_len, channels, kernel_size, dtype=tor
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.convolution.depthwise_conv1d(
+        oasr.kernels.conv.depthwise_conv1d(
             x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
             batch_size, seq_len, channels, kernel_size, padding,
             False, dtype_map[dtype]
@@ -98,7 +95,7 @@ def setup_depthwise_conv1d_causal(batch_size, seq_len, channels, kernel_size, dt
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.convolution.depthwise_conv1d(
+        oasr.kernels.conv.depthwise_conv1d(
             x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
             batch_size, seq_len, channels, kernel_size, 0,
             True, dtype_map[dtype]
@@ -124,7 +121,7 @@ def setup_pointwise_conv1d(batch_size, seq_len, in_ch, out_ch, dtype=torch.float
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.convolution.pointwise_conv1d(
+        oasr.kernels.conv.pointwise_conv1d(
             x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
             batch_size, seq_len, in_ch, out_ch,
             oasr.ActivationType.SWISH, False, dtype_map[dtype]
@@ -144,7 +141,7 @@ def setup_glu(batch_size, seq_len, channels, dtype=torch.float16):
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.convolution.glu(
+        oasr.kernels.conv.glu(
             x.data_ptr(), output.data_ptr(),
             batch_size, seq_len, channels, dtype_map[dtype]
         )
@@ -163,7 +160,7 @@ def setup_swish(batch_size, seq_len, channels, dtype=torch.float16):
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.convolution.swish(
+        oasr.kernels.conv.swish(
             x.data_ptr(), output.data_ptr(),
             batch_size, seq_len, channels, dtype_map[dtype]
         )
@@ -187,7 +184,7 @@ def setup_batch_norm_swish(batch_size, seq_len, channels, dtype=torch.float16):
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.convolution.batch_norm_swish(
+        oasr.kernels.conv.batch_norm_swish(
             x.data_ptr(), output.data_ptr(),
             gamma.data_ptr(), beta.data_ptr(),
             running_mean.data_ptr(), running_var.data_ptr(),
@@ -222,25 +219,25 @@ def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.floa
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.convolution.pointwise_conv1d(
+        oasr.kernels.conv.pointwise_conv1d(
             x.data_ptr(), pw1_weight.data_ptr(), pw1_bias.data_ptr(), pw1_out.data_ptr(),
             batch_size, seq_len, d_model, 2 * d_model,
             oasr.ActivationType.SWISH, False, dtype_map[dtype]
         )
-        oasr.kernels.convolution.glu(
+        oasr.kernels.conv.glu(
             pw1_out.data_ptr(), glu_out.data_ptr(),
             batch_size, seq_len, d_model, dtype_map[dtype]
         )
-        oasr.kernels.convolution.depthwise_conv1d(
+        oasr.kernels.conv.depthwise_conv1d(
             glu_out.data_ptr(), dw_weight.data_ptr(), dw_bias.data_ptr(), dw_out.data_ptr(),
             batch_size, seq_len, d_model, kernel_size, kernel_size // 2,
             False, dtype_map[dtype]
         )
-        oasr.kernels.convolution.swish(
+        oasr.kernels.conv.swish(
             dw_out.data_ptr(), swish_out.data_ptr(),
             batch_size, seq_len, d_model, dtype_map[dtype]
         )
-        oasr.kernels.convolution.pointwise_conv1d(
+        oasr.kernels.conv.pointwise_conv1d(
             swish_out.data_ptr(), pw2_weight.data_ptr(), pw2_bias.data_ptr(), output.data_ptr(),
             batch_size, seq_len, d_model, d_model,
             oasr.ActivationType.SWISH, False, dtype_map[dtype]

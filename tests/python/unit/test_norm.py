@@ -46,7 +46,7 @@ class TestLayerNorm:
             torch.bfloat16: oasr.DataType.BF16,
         }
         
-        oasr.kernels.normalization.layer_norm(
+        oasr.kernels.norm.layer_norm(
             x.data_ptr(), output.data_ptr(),
             gamma.data_ptr(), beta.data_ptr(),
             batch_size, seq_len, hidden_size,
@@ -74,7 +74,7 @@ class TestLayerNorm:
         gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
         output = torch.empty_like(x)
         
-        oasr.kernels.normalization.layer_norm(
+        oasr.kernels.norm.layer_norm(
             x.data_ptr(), output.data_ptr(),
             gamma.data_ptr(), 0,  # nullptr for beta
             batch_size, seq_len, hidden_size,
@@ -112,7 +112,7 @@ class TestRMSNorm:
             torch.float16: oasr.DataType.FP16,
         }
         
-        oasr.kernels.normalization.rms_norm(
+        oasr.kernels.norm.rms_norm(
             x.data_ptr(), output.data_ptr(),
             gamma.data_ptr(),
             batch_size, seq_len, hidden_size,
@@ -146,7 +146,7 @@ class TestAddLayerNorm:
         beta = torch.randn(hidden_size, device='cuda', dtype=dtype)
         output = torch.empty_like(x)
         
-        oasr.kernels.normalization.add_layer_norm(
+        oasr.kernels.norm.add_layer_norm(
             x.data_ptr(), residual.data_ptr(), output.data_ptr(),
             gamma.data_ptr(), beta.data_ptr(),
             batch_size, seq_len, hidden_size,
@@ -182,7 +182,7 @@ class TestBatchNorm1D:
         running_var = torch.abs(torch.randn(channels, device='cuda', dtype=dtype)) + 0.1
         output = torch.empty_like(x)
         
-        oasr.kernels.normalization.batch_norm_1d(
+        oasr.kernels.norm.batch_norm_1d(
             x.data_ptr(), output.data_ptr(),
             gamma.data_ptr(), beta.data_ptr(),
             running_mean.data_ptr(), running_var.data_ptr(),
@@ -215,7 +215,7 @@ class TestGroupNorm:
         beta = torch.randn(channels, device='cuda', dtype=dtype)
         output = torch.empty_like(x)
         
-        oasr.kernels.normalization.group_norm(
+        oasr.kernels.norm.group_norm(
             x.data_ptr(), output.data_ptr(),
             gamma.data_ptr(), beta.data_ptr(),
             batch_size, seq_len, channels, num_groups,
