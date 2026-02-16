@@ -3,9 +3,6 @@
 Performance benchmarks for GEMM, Batched GEMM, and Grouped GEMM kernels.
 Uses triton.testing.do_bench for accurate GPU timing.
 
-Problem sizes align with WeNet Conformer-base (d_model=256, linear_units=2048) /
-Conformer-large (d_model=512); 10 sec audio, batch up to 64.
-
 Profiling mode for NVIDIA Nsight Compute:
     ncu --set full -o profile_report python bench_gemm_kernels.py \
     --profile --kernel gemm --target oasr \
@@ -79,24 +76,17 @@ def setup_gemm(M, N, K, dtype=torch.float16):
     B = torch.randn(K, N, device='cuda', dtype=dtype)
     D = torch.empty(M, N, device='cuda', dtype=dtype)
 
-    params = gemm_mod.GemmParams()
-    params.A = A.data_ptr()
-    params.B = B.data_ptr()
-    params.D = D.data_ptr()
-    params.M = M
-    params.N = N
-    params.K = K
-    params.lda = K
-    params.ldb = N
-    params.ldd = N
-    params.alpha = 1.0
-    params.beta = 0.0
-    params.dtype_a = oasr_dtype
-    params.dtype_b = oasr_dtype
-    params.dtype_d = oasr_dtype
+    trans = gemm_mod.TransposeOp.NoTranspose
+    lda, ldb, ldd = K, N, N
 
     def oasr_fn():
-        gemm_mod.invoke_gemm(params)
+        gemm_mod.invoke_gemm(
+            A.data_ptr(), B.data_ptr(), D.data_ptr(),
+            M, N, K, lda, ldb, ldd,
+            alpha=1.0, beta=0.0,
+            trans_a=trans, trans_b=trans,
+            dtype=oasr_dtype, stream=None,
+        )
 
     def pytorch_fn():
         torch.matmul(A, B, out=D)
@@ -119,13 +109,20 @@ def setup_bmm(batch_size, M, N, K, dtype=torch.float16):
     B = torch.randn(batch_size, K, N, device='cuda', dtype=dtype)
     D = torch.empty(batch_size, M, N, device='cuda', dtype=dtype)
 
-    params = gemm_mod.BmmParams.Strided(
-        A.data_ptr(), B.data_ptr(), D.data_ptr(),
-        batch_size, M, N, K, oasr_dtype, None
-    )
+    lda, ldb, ldd = K, N, N
+    stride_a, stride_b, stride_d = M * K, K * N, M * N
+    trans = gemm_mod.TransposeOp.NoTranspose
 
     def oasr_fn():
-        gemm_mod.invoke_bmm(params)
+        gemm_mod.invoke_bmm(
+            A.data_ptr(), B.data_ptr(), D.data_ptr(),
+            batch_size, M, N, K,
+            lda, ldb, ldd,
+            stride_a, stride_b, stride_d,
+            alpha=1.0, beta=0.0,
+            trans_a=trans, trans_b=trans,
+            dtype=oasr_dtype, stream=None,
+        )
 
     def pytorch_fn():
         torch.bmm(A, B, out=D)
@@ -176,31 +173,18 @@ def setup_group_gemm(problem_sizes, dtype=torch.float16):
     # problems: device buffer of GemmProblemDesc (M,N,K per problem -> 3 ints each)
     problems_tensor = torch.tensor(problems_MNK, dtype=torch.int32, device='cuda')
 
-    float_ws_size, int_ws_size = gemm_mod.query_group_gemm_workspace_size(num_problems, oasr_dtype)
+    float_ws_size, _ = gemm_mod.query_group_gemm_workspace_size(num_problems, oasr_dtype)
     workspace_float = torch.empty(float_ws_size, dtype=torch.uint8, device='cuda')
-    workspace_int = torch.empty(int_ws_size, dtype=torch.uint8, device='cuda')
-
-    params = gemm_mod.GroupGemmParams()
-    params.problems = problems_tensor.data_ptr()
-    params.num_problems = num_problems
-    params.A_array = a_ptrs.data_ptr()
-    params.B_array = b_ptrs.data_ptr()
-    params.D_array = d_ptrs.data_ptr()
-    params.lda_array = lda_tensor.data_ptr()
-    params.ldb_array = ldb_tensor.data_ptr()
-    params.ldd_array = ldd_tensor.data_ptr()
-    params.alpha = 1.0
-    params.beta = 0.0
-    params.dtype_a = oasr_dtype
-    params.dtype_b = oasr_dtype
-    params.dtype_d = oasr_dtype
-    params.workspace_float = workspace_float.data_ptr()
-    params.workspace_float_size = float_ws_size
-    params.workspace_int = workspace_int.data_ptr()
-    params.workspace_int_size = int_ws_size
 
     def oasr_fn():
-        gemm_mod.invoke_group_gemm(params)
+        gemm_mod.invoke_group_gemm(
+            problems_tensor.data_ptr(), num_problems,
+            a_ptrs.data_ptr(), b_ptrs.data_ptr(), d_ptrs.data_ptr(),
+            lda_tensor.data_ptr(), ldb_tensor.data_ptr(), ldd_tensor.data_ptr(),
+            oasr_dtype,
+            workspace_float.data_ptr(), float_ws_size,
+            stream=None,
+        )
 
     def pytorch_fn():
         for i in range(num_problems):

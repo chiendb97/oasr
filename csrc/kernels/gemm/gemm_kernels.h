@@ -7,13 +7,13 @@
 
 #pragma once
 
-#include "gemm_params.h"
 #include "gemm_configs.h"
 #include "gemm_utils.h"
 #include "common/types.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cstdint>
 #include <vector>
 #include <memory>
 
@@ -27,21 +27,43 @@ namespace gemm {
 
 /**
  * @brief Execute GEMM operation
- * 
- * Computes: D = alpha * op(A) @ op(B) + beta * C
- * 
- * @param params GEMM parameters
+ *
+ * Computes: D = alpha * op(A) @ op(B) + beta * D
+ *
+ * @param A Input matrix [M, K] (or [K, M] if trans_a)
+ * @param B Input matrix [K, N] (or [N, K] if trans_b)
+ * @param D Output matrix [M, N] (also used as C for beta scaling)
+ * @param M Number of rows of output
+ * @param N Number of columns of output
+ * @param K Contraction dimension
+ * @param lda Leading dimension of A
+ * @param ldb Leading dimension of B
+ * @param ldd Leading dimension of D
+ * @param alpha Scale factor for A @ B
+ * @param beta Scale factor for D (D = alpha*A*B + beta*D)
+ * @param trans_a Transpose operation for A
+ * @param trans_b Transpose operation for B
+ * @param dtype Data type (FP16 or BF16)
+ * @param stream CUDA stream
  * @return Status code
  */
-GemmStatus invokeGemm(const GemmParams& params);
+GemmStatus invokeGemm(const void* A, const void* B, void* D,
+                      int M, int N, int K,
+                      int64_t lda, int64_t ldb, int64_t ldd,
+                      float alpha, float beta,
+                      TransposeOp trans_a, TransposeOp trans_b,
+                      DataType dtype,
+                      cudaStream_t stream = nullptr);
 
 /**
- * @brief Execute GEMM with specific data type
- * 
- * Template specializations for FP16 and BF16
+ * @brief Execute GEMM with specific data type (internal use)
  */
 template <typename T>
-GemmStatus invokeGemmTyped(const GemmParams& params);
+GemmStatus invokeGemmTyped(const void* A, const void* B, void* D,
+                           int M, int N, int K,
+                           int64_t lda, int64_t ldb, int64_t ldd,
+                           float alpha, float beta,
+                           cudaStream_t stream);
 
 /**
  * @brief Query required workspace size for GEMM

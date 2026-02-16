@@ -6,13 +6,13 @@
 
 #pragma once
 
-#include "bmm_params.h"
 #include "gemm_configs.h"
 #include "gemm_utils.h"
 #include "common/types.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cstdint>
 #include <vector>
 #include <memory>
 
@@ -25,14 +25,39 @@ namespace gemm {
 //==============================================================================
 
 /**
- * @brief Execute batched GEMM operation
- * 
- * Computes: D[b] = alpha * A[b] @ B[b] + beta * C[b]
- * 
- * @param params Batched GEMM parameters
+ * @brief Execute strided batched GEMM operation
+ *
+ * Computes: D[b] = alpha * A[b] @ B[b] + beta * D[b] for b in [0, batch_size)
+ *
+ * @param A Input [batch_size, M, K] (strided)
+ * @param B Input [batch_size, K, N] (strided)
+ * @param D Output [batch_size, M, N] (strided)
+ * @param batch_size Number of batches
+ * @param M Rows of output per batch
+ * @param N Columns of output per batch
+ * @param K Contraction dimension
+ * @param lda Leading dimension of A (within batch)
+ * @param ldb Leading dimension of B (within batch)
+ * @param ldd Leading dimension of D (within batch)
+ * @param stride_a Stride between batches in A
+ * @param stride_b Stride between batches in B
+ * @param stride_d Stride between batches in D
+ * @param alpha Scale factor
+ * @param beta Scale factor for D
+ * @param trans_a Transpose for A
+ * @param trans_b Transpose for B
+ * @param dtype Data type (FP16 or BF16)
+ * @param stream CUDA stream
  * @return Status code
  */
-GemmStatus invokeBmm(const BmmParams& params);
+GemmStatus invokeBmm(const void* A, const void* B, void* D,
+                     int batch_size, int M, int N, int K,
+                     int64_t lda, int64_t ldb, int64_t ldd,
+                     int64_t stride_a, int64_t stride_b, int64_t stride_d,
+                     float alpha, float beta,
+                     TransposeOp trans_a, TransposeOp trans_b,
+                     DataType dtype,
+                     cudaStream_t stream = nullptr);
 
 /**
  * @brief Strided batched GEMM with typed interface

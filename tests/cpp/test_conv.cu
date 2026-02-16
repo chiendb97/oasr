@@ -1,8 +1,7 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Unit tests for convolution kernels.
-// Structure and behavior aligned with tests/python/unit/test_conv_kernels.py
+// Unit tests for convolution layers.
 
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
@@ -10,8 +9,7 @@
 #include <vector>
 #include <random>
 
-#include "kernels/convolution/conv_kernels.h"
-#include "kernels/convolution/conv_params.h"
+#include "kernels/conv/conv_kernels.h"
 #include "common/cuda_utils.h"
 
 using namespace oasr;
@@ -130,22 +128,6 @@ TEST_F(TestDepthwiseConv1D, DepthwiseConv1D_1_64_128_3) {
     cudaFree(d_x); cudaFree(d_w); cudaFree(d_b); cudaFree(d_out);
 }
 
-TEST_F(TestDepthwiseConv1D, Conv1DParamsDefaults) {
-    Conv1DParams params{};
-    EXPECT_EQ(params.batch_size, 0);
-    EXPECT_EQ(params.seq_len, 0);
-    EXPECT_EQ(params.in_channels, 0);
-    EXPECT_EQ(params.out_channels, 0);
-    EXPECT_EQ(params.kernel_size, 0);
-    EXPECT_EQ(params.stride, 1);
-    EXPECT_EQ(params.padding, 0);
-    EXPECT_EQ(params.dilation, 1);
-    EXPECT_EQ(params.groups, 1);
-    EXPECT_EQ(params.conv_type, ConvType::STANDARD);
-    EXPECT_TRUE(params.channels_last);
-    EXPECT_FALSE(params.is_causal);
-}
-
 //-----------------------------------------------------------------------------
 // TestPointwiseConv1D
 //-----------------------------------------------------------------------------
@@ -179,7 +161,6 @@ TEST_F(TestPointwiseConv1D, PointwiseConv1D_2_128_256_512) {
 
     invokePointwiseConv1D(d_x, d_w, d_b, d_out,
                           batch_size, seq_len, in_ch, out_ch,
-                          PointwiseConvBackend::NATIVE,
                           ActivationType::SWISH, false, DataType::FP32, nullptr);
 
     OASR_CUDA_CHECK(cudaMemcpy(out_host.data(), d_out, n_out * sizeof(float), cudaMemcpyDeviceToHost));
@@ -302,36 +283,16 @@ TEST_F(TestBatchNormSwish, BatchNormSwish_2_128_256) {
 
 class TestConv1D : public ConvTestFixture {};
 
-TEST_F(TestConv1D, Conv1DParamsDefaults) {
-    Conv1DParams params{};
-    EXPECT_EQ(params.batch_size, 0);
-    EXPECT_EQ(params.kernel_size, 0);
-    EXPECT_EQ(params.stride, 1);
-    EXPECT_EQ(params.padding, 0);
-    EXPECT_EQ(params.conv_type, ConvType::STANDARD);
-}
-
 //-----------------------------------------------------------------------------
-// TestConformerConvPattern
+// TestConvState
 //-----------------------------------------------------------------------------
 
-class TestConformerConvPattern : public ConvTestFixture {};
+class TestConvState : public ConvTestFixture {};
 
-TEST_F(TestConformerConvPattern, ConformerConvParamsDefaults) {
-    ConformerConvParams params{};
-    EXPECT_EQ(params.batch_size, 0);
-    EXPECT_EQ(params.seq_len, 0);
-    EXPECT_EQ(params.d_model, 0);
-    EXPECT_EQ(params.kernel_size, 31);
-    EXPECT_EQ(params.dtype, DataType::FP16);
-    EXPECT_FLOAT_EQ(params.batch_norm_eps, 1e-5f);
-    EXPECT_FALSE(params.is_causal);
-}
-
-TEST_F(TestConformerConvPattern, ConvStateDefaults) {
-    ConvState state{};
-    EXPECT_EQ(state.buffer, nullptr);
-    EXPECT_EQ(state.buffer_size, 0);
-    EXPECT_EQ(state.channels, 0);
-    EXPECT_EQ(state.dtype, DataType::FP16);
+TEST_F(TestConvState, InitResetFreeConvState) {
+    int batch_size = 2, kernel_size = 31, channels = 128;
+    void* state = initConvState(batch_size, kernel_size, channels, DataType::FP32);
+    ASSERT_NE(state, nullptr);
+    resetConvState(state, batch_size, kernel_size, channels, DataType::FP32, nullptr);
+    freeConvState(state);
 }

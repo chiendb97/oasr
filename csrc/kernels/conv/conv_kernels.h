@@ -3,21 +3,23 @@
 
 #pragma once
 
-#include "conv_params.h"
-#include "common/tensor.h"
+#include "common/types.h"
+#include <cuda_runtime.h>
 
 namespace oasr {
 namespace kernels {
 
 /**
  * @brief 1D convolution kernel
- * 
+ *
  * Supports standard, depthwise, and pointwise convolutions.
  * Optimized implementations selected based on parameters.
- * 
- * @param params Convolution parameters
  */
-void invokeConv1D(const Conv1DParams& params);
+void invokeConv1D(const void* input, void* output, const void* weight, const void* bias,
+                  int batch_size, int seq_len, int in_channels, int out_channels,
+                  int kernel_size, int stride, int padding, int dilation, int groups,
+                  ConvType conv_type, DataType dtype, bool channels_last, bool is_causal,
+                  ActivationType activation, bool fuse_activation, cudaStream_t stream);
 
 /**
  * @brief Depthwise separable 1D convolution
@@ -54,56 +56,35 @@ void invokePointwiseConv1D(const void* input, const void* weight, const void* bi
                            DataType dtype, cudaStream_t stream);
 
 /**
- * @brief Complete Conformer convolution module
- * 
- * Fused implementation of the full Conformer conv module:
- * - Pointwise conv (1 -> 2 channels with GLU)
- * - Depthwise conv
- * - BatchNorm + Swish
- * - Pointwise conv (back to original channels)
- * 
- * @param params Conformer conv parameters
- */
-void invokeConformerConvModule(const ConformerConvParams& params);
-
-/**
- * @brief Causal convolution with state management
- * 
- * For streaming inference, maintains state from previous chunks.
- * 
+ * @brief Causal convolution with state management (streaming)
+ *
  * @param input Current input chunk [batch, chunk_len, channels]
- * @param state Previous state (updated in-place)
+ * @param state_buffer State buffer (updated in-place) [batch, kernel_size-1, channels]
  * @param weight Convolution weight
  * @param bias Optional bias
  * @param output Output [batch, chunk_len, channels]
- * @param kernel_size Convolution kernel size
- * @param dtype Data type
- * @param stream CUDA stream
  */
-void invokeCausalConv1D(const void* input, ConvState& state,
+void invokeCausalConv1D(const void* input, void* state_buffer,
                         const void* weight, const void* bias,
                         void* output, int batch_size, int chunk_len, int channels,
                         int kernel_size, DataType dtype, cudaStream_t stream);
 
 /**
- * @brief Initialize convolution state for streaming
- * 
- * @param state State to initialize
- * @param batch_size Batch size
- * @param kernel_size Kernel size
- * @param channels Number of channels
- * @param dtype Data type
+ * @brief Allocate and initialize convolution state buffer for streaming.
+ * Caller must cudaFree the returned buffer when done.
  */
-void initConvState(ConvState& state, int batch_size, int kernel_size, int channels,
-                   DataType dtype);
+void* initConvState(int batch_size, int kernel_size, int channels, DataType dtype);
 
 /**
  * @brief Reset convolution state (zero out buffer)
- * 
- * @param state State to reset
- * @param stream CUDA stream
  */
-void resetConvState(ConvState& state, cudaStream_t stream);
+void resetConvState(void* state_buffer, int batch_size, int kernel_size, int channels,
+                    DataType dtype, cudaStream_t stream);
+
+/**
+ * @brief Free convolution state buffer allocated by initConvState
+ */
+void freeConvState(void* state_buffer);
 
 // GLU (Gated Linear Unit) activation
 // output = input[:, :half] * sigmoid(input[:, half:])
@@ -124,9 +105,6 @@ void invokeBatchNormSwish(const void* input, void* output,
                           float eps, DataType dtype, cudaStream_t stream);
 
 // Template specializations
-template <typename T>
-void invokeConv1DTyped(const Conv1DParams& params);
-
 template <typename T>
 void invokeDepthwiseConv1DTyped(const void* input, const void* weight, const void* bias,
                                 void* output, int batch_size, int seq_len, int channels,

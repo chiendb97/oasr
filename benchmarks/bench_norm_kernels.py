@@ -3,9 +3,6 @@
 Performance benchmarks for normalization kernels.
 Uses triton.testing.do_bench for accurate GPU timing.
 
-Problem sizes align with WeNet (10 sec audio, batch up to 64):
-  train_conformer.yaml, train_conformer_bidecoder_large.yaml
-
 Profiling mode for NVIDIA Nsight Compute:
     ncu --set full -o profile_report python bench_norm_kernels.py \
     --profile --kernel layer_norm --target oasr \
@@ -63,7 +60,7 @@ def setup_layer_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.normalization.layer_norm(
+        oasr.kernels.norm.layer_norm(
             x.data_ptr(), output.data_ptr(),
             gamma.data_ptr(), beta.data_ptr(),
             batch_size, seq_len, hidden_size,
@@ -90,7 +87,7 @@ def setup_rms_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.normalization.rms_norm(
+        oasr.kernels.norm.rms_norm(
             x.data_ptr(), output.data_ptr(),
             gamma.data_ptr(),
             batch_size, seq_len, hidden_size,
@@ -116,7 +113,7 @@ def setup_add_layer_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.normalization.add_layer_norm(
+        oasr.kernels.norm.add_layer_norm(
             x.data_ptr(), residual.data_ptr(), output.data_ptr(),
             gamma.data_ptr(), beta.data_ptr(),
             batch_size, seq_len, hidden_size,
@@ -145,7 +142,7 @@ def setup_group_norm(batch_size, seq_len, channels, num_groups, dtype=torch.floa
     channels_per_group = channels // num_groups
     
     def oasr_fn():
-        oasr.kernels.normalization.group_norm(
+        oasr.kernels.norm.group_norm(
             x.data_ptr(), output.data_ptr(),
             gamma.data_ptr(), beta.data_ptr(),
             batch_size, seq_len, channels, num_groups,
@@ -176,7 +173,7 @@ def setup_batch_norm(batch_size, seq_len, channels, dtype=torch.float32):
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.normalization.batch_norm_1d(
+        oasr.kernels.norm.batch_norm_1d(
             x.data_ptr(), output.data_ptr(),
             gamma.data_ptr(), beta.data_ptr(),
             running_mean.data_ptr(), running_var.data_ptr(),

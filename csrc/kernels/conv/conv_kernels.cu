@@ -1,10 +1,8 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "kernels/convolution/conv_kernels.h"
+#include "kernels/conv/conv_kernels.h"
 #include "common/cuda_utils.h"
-#include "kernels/gemm/gemm_kernels.h"
-#include "kernels/gemm/gemm_params.h"
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -668,48 +666,51 @@ void invokeDepthwiseConv1DTyped(const void* input, const void* weight, const voi
 // Public API implementations
 // =============================================================================
 
-void invokeConv1D(const Conv1DParams& params) {
-    int out_len = (params.seq_len + 2 * params.padding - 
-                   params.dilation * (params.kernel_size - 1) - 1) / params.stride + 1;
-    int total_elements = params.batch_size * out_len * params.out_channels;
+void invokeConv1D(const void* input, void* output, const void* weight, const void* bias,
+                  int batch_size, int seq_len, int in_channels, int out_channels,
+                  int kernel_size, int stride, int padding, int dilation, int groups,
+                  ConvType conv_type, DataType dtype, bool channels_last, bool is_causal,
+                  ActivationType activation, bool fuse_activation, cudaStream_t stream) {
+    (void)conv_type;
+    (void)channels_last;
+    (void)is_causal;
+    int out_len = (seq_len + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    int total_elements = batch_size * out_len * out_channels;
     int block_size = 256;
     int grid_size = (total_elements + block_size - 1) / block_size;
-    
-    switch (params.dtype) {
+
+    switch (dtype) {
         case DataType::FP32:
-            conv1DKernel<float><<<grid_size, block_size, 0, params.stream>>>(
-                static_cast<const float*>(params.input),
-                static_cast<const float*>(params.weight),
-                static_cast<const float*>(params.bias),
-                static_cast<float*>(params.output),
-                params.batch_size, params.seq_len, params.in_channels,
-                params.out_channels, params.kernel_size, params.stride,
-                params.padding, params.dilation, params.groups,
-                params.activation, params.fuse_activation
+            conv1DKernel<float><<<grid_size, block_size, 0, stream>>>(
+                static_cast<const float*>(input),
+                static_cast<const float*>(weight),
+                static_cast<const float*>(bias),
+                static_cast<float*>(output),
+                batch_size, seq_len, in_channels, out_channels,
+                kernel_size, stride, padding, dilation, groups,
+                activation, fuse_activation
             );
             break;
         case DataType::FP16:
-            conv1DKernel<half><<<grid_size, block_size, 0, params.stream>>>(
-                static_cast<const half*>(params.input),
-                static_cast<const half*>(params.weight),
-                static_cast<const half*>(params.bias),
-                static_cast<half*>(params.output),
-                params.batch_size, params.seq_len, params.in_channels,
-                params.out_channels, params.kernel_size, params.stride,
-                params.padding, params.dilation, params.groups,
-                params.activation, params.fuse_activation
+            conv1DKernel<half><<<grid_size, block_size, 0, stream>>>(
+                static_cast<const half*>(input),
+                static_cast<const half*>(weight),
+                static_cast<const half*>(bias),
+                static_cast<half*>(output),
+                batch_size, seq_len, in_channels, out_channels,
+                kernel_size, stride, padding, dilation, groups,
+                activation, fuse_activation
             );
             break;
         case DataType::BF16:
-            conv1DKernel<__nv_bfloat16><<<grid_size, block_size, 0, params.stream>>>(
-                static_cast<const __nv_bfloat16*>(params.input),
-                static_cast<const __nv_bfloat16*>(params.weight),
-                static_cast<const __nv_bfloat16*>(params.bias),
-                static_cast<__nv_bfloat16*>(params.output),
-                params.batch_size, params.seq_len, params.in_channels,
-                params.out_channels, params.kernel_size, params.stride,
-                params.padding, params.dilation, params.groups,
-                params.activation, params.fuse_activation
+            conv1DKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(input),
+                static_cast<const __nv_bfloat16*>(weight),
+                static_cast<const __nv_bfloat16*>(bias),
+                static_cast<__nv_bfloat16*>(output),
+                batch_size, seq_len, in_channels, out_channels,
+                kernel_size, stride, padding, dilation, groups,
+                activation, fuse_activation
             );
             break;
         default:
@@ -938,7 +939,7 @@ void invokeBatchNormSwish(const void* input, void* output,
     }
 }
 
-void invokeCausalConv1D(const void* input, ConvState& state,
+void invokeCausalConv1D(const void* input, void* state_buffer,
                         const void* weight, const void* bias,
                         void* output, int batch_size, int chunk_len, int channels,
                         int kernel_size, DataType dtype, cudaStream_t stream) {
@@ -951,7 +952,7 @@ void invokeCausalConv1D(const void* input, ConvState& state,
         case DataType::FP32:
             causalConv1DKernel<float><<<grid_size, block_size, 0, stream>>>(
                 static_cast<const float*>(input),
-                static_cast<float*>(state.buffer),
+                static_cast<float*>(state_buffer),
                 static_cast<const float*>(weight),
                 static_cast<const float*>(bias),
                 static_cast<float*>(output),
@@ -963,7 +964,7 @@ void invokeCausalConv1D(const void* input, ConvState& state,
                 int state_grid = (state_elements + block_size - 1) / block_size;
                 updateConvStateKernel<float><<<state_grid, block_size, 0, stream>>>(
                     static_cast<const float*>(input),
-                    static_cast<float*>(state.buffer),
+                    static_cast<float*>(state_buffer),
                     batch_size, chunk_len, channels, state_len
                 );
             }
@@ -971,7 +972,7 @@ void invokeCausalConv1D(const void* input, ConvState& state,
         case DataType::FP16:
             causalConv1DKernel<half><<<grid_size, block_size, 0, stream>>>(
                 static_cast<const half*>(input),
-                static_cast<half*>(state.buffer),
+                static_cast<half*>(state_buffer),
                 static_cast<const half*>(weight),
                 static_cast<const half*>(bias),
                 static_cast<half*>(output),
@@ -982,7 +983,7 @@ void invokeCausalConv1D(const void* input, ConvState& state,
                 int state_grid = (state_elements + block_size - 1) / block_size;
                 updateConvStateKernel<half><<<state_grid, block_size, 0, stream>>>(
                     static_cast<const half*>(input),
-                    static_cast<half*>(state.buffer),
+                    static_cast<half*>(state_buffer),
                     batch_size, chunk_len, channels, state_len
                 );
             }
@@ -990,7 +991,7 @@ void invokeCausalConv1D(const void* input, ConvState& state,
         case DataType::BF16:
             causalConv1DKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(input),
-                static_cast<__nv_bfloat16*>(state.buffer),
+                static_cast<__nv_bfloat16*>(state_buffer),
                 static_cast<const __nv_bfloat16*>(weight),
                 static_cast<const __nv_bfloat16*>(bias),
                 static_cast<__nv_bfloat16*>(output),
@@ -1001,7 +1002,7 @@ void invokeCausalConv1D(const void* input, ConvState& state,
                 int state_grid = (state_elements + block_size - 1) / block_size;
                 updateConvStateKernel<__nv_bfloat16><<<state_grid, block_size, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(input),
-                    static_cast<__nv_bfloat16*>(state.buffer),
+                    static_cast<__nv_bfloat16*>(state_buffer),
                     batch_size, chunk_len, channels, state_len
                 );
             }
@@ -1011,30 +1012,29 @@ void invokeCausalConv1D(const void* input, ConvState& state,
     }
 }
 
-void initConvState(ConvState& state, int batch_size, int kernel_size, int channels,
-                   DataType dtype) {
+void* initConvState(int batch_size, int kernel_size, int channels, DataType dtype) {
     int state_len = kernel_size - 1;
     size_t buffer_size = batch_size * state_len * channels * getDataTypeSize(dtype);
     
-    OASR_CUDA_CHECK(cudaMalloc(&state.buffer, buffer_size));
-    OASR_CUDA_CHECK(cudaMemset(state.buffer, 0, buffer_size));
-    
-    state.buffer_size = state_len;
-    state.channels = channels;
-    state.dtype = dtype;
+    void* buffer = nullptr;
+    OASR_CUDA_CHECK(cudaMalloc(&buffer, buffer_size));
+    OASR_CUDA_CHECK(cudaMemset(buffer, 0, buffer_size));
+    return buffer;
 }
 
-void resetConvState(ConvState& state, cudaStream_t stream) {
-    if (state.buffer != nullptr && state.buffer_size > 0) {
-        size_t bytes = state.buffer_size * state.channels * getDataTypeSize(state.dtype);
-        OASR_CUDA_CHECK(cudaMemsetAsync(state.buffer, 0, bytes, stream));
+void resetConvState(void* state_buffer, int batch_size, int kernel_size, int channels,
+                    DataType dtype, cudaStream_t stream) {
+    if (state_buffer != nullptr) {
+        int state_len = kernel_size - 1;
+        size_t bytes = batch_size * state_len * channels * getDataTypeSize(dtype);
+        OASR_CUDA_CHECK(cudaMemsetAsync(state_buffer, 0, bytes, stream));
     }
 }
 
-void invokeConformerConvModule(const ConformerConvParams& params) {
-    // TODO: Implement fused Conformer conv module
-    // For now, users should call individual kernels in sequence
-    throw std::runtime_error("invokeConformerConvModule not yet implemented - use individual kernels");
+void freeConvState(void* state_buffer) {
+    if (state_buffer != nullptr) {
+        OASR_CUDA_CHECK(cudaFree(state_buffer));
+    }
 }
 
 // Explicit template instantiations

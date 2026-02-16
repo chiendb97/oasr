@@ -2,7 +2,6 @@
 build/
 cmake-build-*/
 .cache/
-python/
 *.o
 *.so
 *.a
@@ -90,7 +89,7 @@ third_party/pybind11/
 *.safetensors
 *.ckpt
 data/
-models/
+./models/
 checkpoints/
 
 # Logs
