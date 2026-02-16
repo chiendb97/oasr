@@ -3,7 +3,6 @@
 
 #include "kernels/conv/conv_kernels.h"
 #include "common/cuda_utils.h"
-#include "kernels/gemm/gemm_kernels.h"
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
