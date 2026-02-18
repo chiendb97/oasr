@@ -1,6 +1,6 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Conformer model (WeNet algorithm, vLLM-style layout)."""
+"""Conformer model (encoder only)."""
 
 from .config import ConformerEncoderConfig, ConformerModelConfig
 from .model import (

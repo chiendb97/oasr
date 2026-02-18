@@ -8,25 +8,14 @@ High-performance ASR inference with CUDA kernels (conv, gemm, norm, attention).
 __version__ = "0.1.0"
 
 # C extension: kernels and enums
-try:
-    from oasr import _C  # type: ignore[attr-defined]
-except ImportError:  # pragma: no cover - optional extension
-    _C = None
+from oasr import _C  # type: ignore[attr-defined]
 
-if _C is not None:
-    kernels = _C.kernels
-    DataType = _C.DataType
-    ConvType = _C.ConvType
-    ActivationType = _C.ActivationType
-    NormType = getattr(_C, "NormType", None)
-    synchronize = _C.synchronize
-else:
-    kernels = None
-    DataType = None
-    ConvType = None
-    ActivationType = None
-    NormType = None
-    synchronize = None
+kernels = _C.kernels
+DataType = _C.DataType
+ConvType = _C.ConvType
+ActivationType = _C.ActivationType
+NormType = _C.NormType
+synchronize = _C.synchronize
 
 # Layers package (primary home of Python kernel wrappers)
 from . import layers
