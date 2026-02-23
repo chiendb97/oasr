@@ -442,7 +442,6 @@ __global__ void layerNormKernelVectorized(
     T* row_output = output + row_idx * hidden_size;
     
     const int vec_hidden_size = hidden_size / VecSize;
-    const int remainder = hidden_size % VecSize;
     
     // Phase 1: Compute mean using vectorized loads
     float local_sum = 0.0f;
@@ -450,13 +449,6 @@ __global__ void layerNormKernelVectorized(
         VecT v;
         v.load(row_input + i * VecSize);
         local_sum += vecSum(v);
-    }
-    
-    // Handle remainder elements
-    if (remainder > 0 && threadIdx.x == 0) {
-        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
-            local_sum += static_cast<float>(row_input[i]);
-        }
     }
     
     float mean = blockReduceSum(local_sum) / static_cast<float>(hidden_size);
@@ -473,14 +465,6 @@ __global__ void layerNormKernelVectorized(
         VecT v;
         v.load(row_input + i * VecSize);
         local_var += vecSumSquaredDiff(v, mean);
-    }
-    
-    // Handle remainder elements
-    if (remainder > 0 && threadIdx.x == 0) {
-        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
-            float diff = static_cast<float>(row_input[i]) - mean;
-            local_var += diff * diff;
-        }
     }
     
     float variance = blockReduceSum(local_var) / static_cast<float>(hidden_size);
@@ -518,18 +502,6 @@ __global__ void layerNormKernelVectorized(
         floatToVec<T, VecSize>(vals, v_out);
         v_out.store(row_output + i * VecSize);
     }
-    
-    // Handle remainder elements
-    if (remainder > 0 && threadIdx.x == 0) {
-        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
-            float normalized = (static_cast<float>(row_input[i]) - mean) * inv_std;
-            float scaled = normalized * static_cast<float>(gamma[i]);
-            if (beta != nullptr) {
-                scaled += static_cast<float>(beta[i]);
-            }
-            row_output[i] = static_cast<T>(scaled);
-        }
-    }
 }
 
 // =============================================================================
@@ -551,7 +523,6 @@ __global__ void rmsNormKernelVectorized(
     T* row_output = output + row_idx * hidden_size;
     
     const int vec_hidden_size = hidden_size / VecSize;
-    const int remainder = hidden_size % VecSize;
     
     // Phase 1: Compute mean of squares using vectorized loads
     float local_sum_sq = 0.0f;
@@ -559,14 +530,6 @@ __global__ void rmsNormKernelVectorized(
         VecT v;
         v.load(row_input + i * VecSize);
         local_sum_sq += vecSumSquares(v);
-    }
-    
-    // Handle remainder elements
-    if (remainder > 0 && threadIdx.x == 0) {
-        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
-            float val = static_cast<float>(row_input[i]);
-            local_sum_sq += val * val;
-        }
     }
     
     float mean_sq = blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size);
@@ -593,14 +556,6 @@ __global__ void rmsNormKernelVectorized(
         
         floatToVec<T, VecSize>(vals, v_out);
         v_out.store(row_output + i * VecSize);
-    }
-    
-    // Handle remainder elements
-    if (remainder > 0 && threadIdx.x == 0) {
-        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
-            float normalized = static_cast<float>(row_input[i]) * inv_rms;
-            row_output[i] = static_cast<T>(normalized * static_cast<float>(gamma[i]));
-        }
     }
 }
 
@@ -669,22 +624,6 @@ __global__ void batchNorm1DKernelVectorized(
                 output[flat_idx + j] = static_cast<T>(normalized * g + b);
             }
         }
-    }
-    
-    // Handle remainder elements
-    int remainder_start = (total_elements / VecSize) * VecSize;
-    for (int idx = remainder_start + blockIdx.x * blockDim.x + threadIdx.x; 
-         idx < total_elements; 
-         idx += blockDim.x * gridDim.x) {
-        int c = idx % channels;
-        float mean = static_cast<float>(running_mean[c]);
-        float var = static_cast<float>(running_var[c]);
-        float g = static_cast<float>(gamma[c]);
-        float b = static_cast<float>(beta[c]);
-        float inv_std = rsqrtf(var + eps);
-        float x = static_cast<float>(input[idx]);
-        float normalized = (x - mean) * inv_std;
-        output[idx] = static_cast<T>(normalized * g + b);
     }
 }
 
@@ -792,7 +731,6 @@ __global__ void groupNormKernelVectorized(
 
     // ---- Phase 3: normalize and apply per-channel affine (vectorized where possible) ----
     int vec_channels = channels / VecSize;
-    int remainder = channels % VecSize;
 
     for (int vec_c = threadIdx.x; vec_c < vec_channels; vec_c += blockDim.x) {
         int c = vec_c * VecSize;
@@ -811,17 +749,6 @@ __global__ void groupNormKernelVectorized(
         }
         floatToVec<T, VecSize>(vals, v_out);
         v_out.store(out_row + c);
-    }
-
-    if (remainder > 0) {
-        for (int c = vec_channels * VecSize + threadIdx.x; c < channels; c += blockDim.x) {
-            int g = c / channels_per_group;
-            float v = static_cast<float>(row[c]);
-            float n = (v - group_mean[g]) * group_inv_std[g];
-            out_row[c] = static_cast<T>(
-                n * static_cast<float>(gamma[c]) + static_cast<float>(beta[c])
-            );
-        }
     }
 }
 
@@ -847,7 +774,6 @@ __global__ void addLayerNormKernelVectorized(
     T* row_output = output + row_idx * hidden_size;
     
     const int vec_hidden_size = hidden_size / VecSize;
-    const int remainder = hidden_size % VecSize;
     
     // Phase 1: Compute mean using vectorized loads
     float local_sum = 0.0f;
@@ -859,13 +785,6 @@ __global__ void addLayerNormKernelVectorized(
         #pragma unroll
         for (int j = 0; j < VecSize; j++) {
             local_sum += static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]);
-        }
-    }
-    
-    // Handle remainder
-    if (remainder > 0 && threadIdx.x == 0) {
-        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
-            local_sum += static_cast<float>(row_input[i]) + static_cast<float>(row_residual[i]);
         }
     }
     
@@ -887,15 +806,6 @@ __global__ void addLayerNormKernelVectorized(
         #pragma unroll
         for (int j = 0; j < VecSize; j++) {
             float val = static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]);
-            float diff = val - mean;
-            local_var += diff * diff;
-        }
-    }
-    
-    // Handle remainder
-    if (remainder > 0 && threadIdx.x == 0) {
-        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
-            float val = static_cast<float>(row_input[i]) + static_cast<float>(row_residual[i]);
             float diff = val - mean;
             local_var += diff * diff;
         }
@@ -937,19 +847,6 @@ __global__ void addLayerNormKernelVectorized(
         
         floatToVec<T, VecSize>(vals, v_out);
         v_out.store(row_output + i * VecSize);
-    }
-    
-    // Handle remainder
-    if (remainder > 0 && threadIdx.x == 0) {
-        for (int i = vec_hidden_size * VecSize; i < hidden_size; i++) {
-            float val = static_cast<float>(row_input[i]) + static_cast<float>(row_residual[i]);
-            float normalized = (val - mean) * inv_std;
-            float scaled = normalized * static_cast<float>(gamma[i]);
-            if (beta != nullptr) {
-                scaled += static_cast<float>(beta[i]);
-            }
-            row_output[i] = static_cast<T>(scaled);
-        }
     }
 }
 
