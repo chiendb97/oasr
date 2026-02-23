@@ -390,7 +390,7 @@ __global__ void addLayerNormKernel(
 // =============================================================================
 
 template <typename T, int VecSize>
-__global__ void layerNormKernelVec(
+__global__ void layerNormKernelVectorized(
     const T* __restrict__ input,
     T* __restrict__ output,
     const T* __restrict__ gamma,
@@ -500,7 +500,7 @@ __global__ void layerNormKernelVec(
 // =============================================================================
 
 template <typename T, int VecSize>
-__global__ void rmsNormKernelVec(
+__global__ void rmsNormKernelVectorized(
     const T* __restrict__ input,
     T* __restrict__ output,
     const T* __restrict__ gamma,
@@ -572,7 +572,7 @@ __global__ void rmsNormKernelVec(
 // =============================================================================
 
 template <typename T, int VecSize>
-__global__ void batchNorm1DKernelVec(
+__global__ void batchNorm1DKernelVectorized(
     const T* __restrict__ input,
     T* __restrict__ output,
     const T* __restrict__ gamma,
@@ -656,7 +656,7 @@ __global__ void batchNorm1DKernelVec(
 // =============================================================================
 
 template <typename T, int VecSize>
-__global__ void groupNormKernelVec(
+__global__ void groupNormKernelVectorized(
     const T* __restrict__ input,
     T* __restrict__ output,
     const T* __restrict__ gamma,
@@ -771,7 +771,7 @@ __global__ void groupNormKernelVec(
 // =============================================================================
 
 template <typename T, int VecSize>
-__global__ void addLayerNormKernelVec(
+__global__ void addLayerNormKernelVectorized(
     const T* __restrict__ input,
     const T* __restrict__ residual,
     T* __restrict__ output,
@@ -929,7 +929,7 @@ void invokeLayerNormTyped(const void* input, void* output,
         block_size = std::min(vec_hidden, MAX_THREADS_PER_BLOCK);
         block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
         
-        layerNormKernelVec<T, VecSize><<<num_rows, block_size, 0, stream>>>(
+        layerNormKernelVectorized<T, VecSize><<<num_rows, block_size, 0, stream>>>(
             static_cast<const T*>(input),
             static_cast<T*>(output),
             static_cast<const T*>(gamma),
@@ -970,7 +970,7 @@ void invokeRMSNormTyped(const void* input, void* output,
         block_size = std::min(vec_hidden, MAX_THREADS_PER_BLOCK);
         block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
         
-        rmsNormKernelVec<T, VecSize><<<num_rows, block_size, 0, stream>>>(
+        rmsNormKernelVectorized<T, VecSize><<<num_rows, block_size, 0, stream>>>(
             static_cast<const T*>(input),
             static_cast<T*>(output),
             static_cast<const T*>(gamma),
@@ -1062,7 +1062,7 @@ void invokeBatchNorm1DTyped(const void* input, void* output,
         int vec_total = total_elements / VecSize;
         int grid_size = (vec_total + block_size - 1) / block_size;
         
-        batchNorm1DKernelVec<T, VecSize><<<grid_size, block_size, 0, stream>>>(
+        batchNorm1DKernelVectorized<T, VecSize><<<grid_size, block_size, 0, stream>>>(
             static_cast<const T*>(input),
             static_cast<T*>(output),
             static_cast<const T*>(gamma),
@@ -1132,7 +1132,7 @@ void invokeGroupNormTyped(const void* input, void* output,
         int block_size = std::min(vec_channels_per_group, MAX_THREADS_PER_BLOCK);
         block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
         
-        groupNormKernelVec<T, VecSize><<<num_blocks, block_size, 0, stream>>>(
+        groupNormKernelVectorized<T, VecSize><<<num_blocks, block_size, 0, stream>>>(
             static_cast<const T*>(input),
             static_cast<T*>(output),
             static_cast<const T*>(gamma),
@@ -1198,7 +1198,7 @@ void invokeAddLayerNormTyped(const void* input, const void* residual, void* outp
         block_size = std::min(vec_hidden, MAX_THREADS_PER_BLOCK);
         block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
         
-        addLayerNormKernelVec<T, VecSize><<<num_rows, block_size, 0, stream>>>(
+        addLayerNormKernelVectorized<T, VecSize><<<num_rows, block_size, 0, stream>>>(
             static_cast<const T*>(input),
             static_cast<const T*>(residual),
             static_cast<T*>(output),
