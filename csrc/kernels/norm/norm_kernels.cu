@@ -269,57 +269,94 @@ __global__ void groupNormKernel(
     int num_groups,
     float eps
 ) {
-    // Each block processes one (batch, seq, group) combination
     int channels_per_group = channels / num_groups;
-    
+    float inv_channels_per_group = 1.0f / static_cast<float>(channels_per_group);
+
     int idx = blockIdx.x;
-    int group_idx = idx % num_groups;
-    int seq_idx = (idx / num_groups) % seq_len;
-    int batch_idx = idx / (num_groups * seq_len);
-    
-    const T* group_input = input + batch_idx * seq_len * channels + 
-                           seq_idx * channels + 
-                           group_idx * channels_per_group;
-    T* group_output = output + batch_idx * seq_len * channels + 
-                      seq_idx * channels + 
-                      group_idx * channels_per_group;
-    
-    // Compute mean
-    float local_sum = 0.0f;
-    for (int i = threadIdx.x; i < channels_per_group; i += blockDim.x) {
-        local_sum += static_cast<float>(group_input[i]);
+    int seq_idx = idx % seq_len;
+    int batch_idx = idx / seq_len;
+
+    const T* row     = input  + (batch_idx * seq_len + seq_idx) * channels;
+    T*       out_row = output + (batch_idx * seq_len + seq_idx) * channels;
+
+    // threads_per_group: largest power-of-2 <= blockDim.x / num_groups
+    // int raw_tpg = blockDim.x / num_groups;
+    // int tpg = 1;
+    // while ((tpg << 1) <= raw_tpg) tpg <<= 1;
+
+    // thread_per_group should be a power-of-2
+    int threads_per_group = blockDim.x / num_groups;
+
+    int my_group  = threadIdx.x / threads_per_group;
+    int local_tid = threadIdx.x % threads_per_group;
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+
+    // Shared memory: [group_mean | group_inv_std | warp_buf (inter-warp case)]
+    extern __shared__ float smem[];
+    float* group_mean    = smem;
+    float* group_inv_std = smem + num_groups;
+
+    // ---- Phase 1: thread-local accumulation for assigned group ----
+    float psum = 0.0f, psq = 0.0f;
+    const T* gptr = row + my_group * channels_per_group;
+    for (int i = local_tid; i < channels_per_group; i += threads_per_group) {
+        float v = static_cast<float>(gptr[i]);
+        psum += v;
+        psq  += v * v;
     }
-    float mean = blockReduceSum(local_sum) / static_cast<float>(channels_per_group);
-    __syncthreads();
-    
-    __shared__ float shared_mean;
-    if (threadIdx.x == 0) shared_mean = mean;
-    __syncthreads();
-    mean = shared_mean;
-    
-    // Compute variance
-    float local_var = 0.0f;
-    for (int i = threadIdx.x; i < channels_per_group; i += blockDim.x) {
-        float diff = static_cast<float>(group_input[i]) - mean;
-        local_var += diff * diff;
+
+    // ---- Phase 2: CUB-style tree reduction ----
+    // Warp-level segmented reduction: XOR with offset < seg stays in the
+    // same power-of-2 aligned segment, so each group reduces independently.
+    int seg = (threads_per_group < WARP_SIZE) ? threads_per_group : WARP_SIZE;
+    for (int off = seg >> 1; off > 0; off >>= 1) {
+        psum += __shfl_xor_sync(0xffffffff, psum, off);
+        psq  += __shfl_xor_sync(0xffffffff, psq,  off);
     }
-    float variance = blockReduceSum(local_var) / static_cast<float>(channels_per_group);
+
+    if (threads_per_group <= WARP_SIZE) {
+        // Each group's segment fits in one warp -- leader already has the total.
+        if (local_tid == 0) {
+            float mean = psum * inv_channels_per_group;
+            group_mean[my_group]    = mean;
+            group_inv_std[my_group] = rsqrtf(psq * inv_channels_per_group - mean * mean + eps);
+        }
+    } else {
+        // Multiple warps per group: write warp partials, then reduce across warps.
+        int warps_per_group = threads_per_group / WARP_SIZE;
+        int warp_idx = local_tid / WARP_SIZE;
+        float* wbuf = smem + 2 * num_groups;
+
+        if (lane == 0) {
+            int bi = my_group * warps_per_group + warp_idx;
+            wbuf[bi]                    = psum;
+            wbuf[num_groups * warps_per_group + bi] = psq;
+        }
+        __syncthreads();
+
+        if (local_tid == 0) {
+            float s = 0.0f, sq = 0.0f;
+            int base    = my_group * warps_per_group;
+            int sq_base = num_groups * warps_per_group + base;
+            for (int w = 0; w < warps_per_group; ++w) {
+                s  += wbuf[base + w];
+                sq += wbuf[sq_base + w];
+            }
+            float mean = s * inv_channels_per_group;
+            group_mean[my_group]    = mean;
+            group_inv_std[my_group] = rsqrtf(sq * inv_channels_per_group - mean * mean + eps);
+        }
+    }
     __syncthreads();
-    
-    __shared__ float shared_var;
-    if (threadIdx.x == 0) shared_var = variance;
-    __syncthreads();
-    variance = shared_var;
-    
-    float inv_std = rsqrtf(variance + eps);
-    
-    // Normalize and scale
-    for (int i = threadIdx.x; i < channels_per_group; i += blockDim.x) {
-        int channel_idx = group_idx * channels_per_group + i;
-        float normalized = (static_cast<float>(group_input[i]) - mean) * inv_std;
-        float g = static_cast<float>(gamma[channel_idx]);
-        float b = static_cast<float>(beta[channel_idx]);
-        group_output[i] = static_cast<T>(normalized * g + b);
+
+    // ---- Phase 3: normalize and apply per-channel affine transform ----
+    for (int c = threadIdx.x; c < channels; c += blockDim.x) {
+        int   g = c / channels_per_group;
+        float v = static_cast<float>(row[c]);
+        float n = (v - group_mean[g]) * group_inv_std[g];
+        out_row[c] = static_cast<T>(
+            n * static_cast<float>(gamma[c]) + static_cast<float>(beta[c])
+        );
     }
 }
 
@@ -668,100 +705,122 @@ __global__ void groupNormKernelVectorized(
     float eps
 ) {
     using VecT = Vec<T, VecSize>;
-    
+
     int channels_per_group = channels / num_groups;
-    int vec_channels_per_group = channels_per_group / VecSize;
-    int remainder = channels_per_group % VecSize;
-    
+    float inv_channels_per_group = 1.0f / static_cast<float>(channels_per_group);
+
     int idx = blockIdx.x;
-    int group_idx = idx % num_groups;
-    int seq_idx = (idx / num_groups) % seq_len;
-    int batch_idx = idx / (num_groups * seq_len);
-    
-    const T* group_input = input + batch_idx * seq_len * channels + 
-                           seq_idx * channels + 
-                           group_idx * channels_per_group;
-    T* group_output = output + batch_idx * seq_len * channels + 
-                      seq_idx * channels + 
-                      group_idx * channels_per_group;
-    
-    // Phase 1: Compute mean using vectorized loads
-    float local_sum = 0.0f;
-    for (int i = threadIdx.x; i < vec_channels_per_group; i += blockDim.x) {
+    int seq_idx = idx % seq_len;
+    int batch_idx = idx / seq_len;
+
+    const T* row     = input  + (batch_idx * seq_len + seq_idx) * channels;
+    T*       out_row = output + (batch_idx * seq_len + seq_idx) * channels;
+
+    // threads_per_group: largest power-of-2 <= blockDim.x / num_groups
+    // int raw_tpg = blockDim.x / num_groups;
+    // int tpg = 1;
+    // while ((tpg << 1) <= raw_tpg) tpg <<= 1;
+
+    // thread_per_group should be a power-of-2
+    int threads_per_group = blockDim.x / num_groups;
+
+    int my_group  = threadIdx.x / threads_per_group;
+    int local_tid = threadIdx.x % threads_per_group;
+
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+
+    // Shared memory: [group_mean | group_inv_std | warp_buf (inter-warp case)]
+    extern __shared__ float smem[];
+    float* group_mean    = smem;
+    float* group_inv_std = smem + num_groups;
+
+    // ---- Phase 1: thread-local accumulation for assigned group (vectorized) ----
+    float psum = 0.0f, psq = 0.0f;
+    const T* gptr = row + my_group * channels_per_group;
+    int vec_channels_per_group = channels_per_group / VecSize;
+    for (int vec_i = local_tid; vec_i < vec_channels_per_group; vec_i += threads_per_group) {
         VecT v;
-        v.load(group_input + i * VecSize);
-        local_sum += vecSum(v);
+        v.load(gptr + vec_i * VecSize);
+        psum += vecSum(v);
+        psq  += vecSumSquares(v);
     }
-    
-    // Handle remainder
-    if (remainder > 0 && threadIdx.x == 0) {
-        for (int i = vec_channels_per_group * VecSize; i < channels_per_group; i++) {
-            local_sum += static_cast<float>(group_input[i]);
+    for (int i = vec_channels_per_group * VecSize + local_tid; i < channels_per_group; i += threads_per_group) {
+        float v = static_cast<float>(gptr[i]);
+        psum += v;
+        psq  += v * v;
+    }
+
+    // ---- Phase 2: CUB-style tree reduction ----
+    int seg = (threads_per_group < WARP_SIZE) ? threads_per_group : WARP_SIZE;
+    for (int off = seg >> 1; off > 0; off >>= 1) {
+        psum += __shfl_xor_sync(0xffffffff, psum, off);
+        psq  += __shfl_xor_sync(0xffffffff, psq,  off);
+    }
+
+    if (threads_per_group <= WARP_SIZE) {
+        if (local_tid == 0) {
+            float mean = psum * inv_channels_per_group;
+            group_mean[my_group]    = mean;
+            group_inv_std[my_group] = rsqrtf(psq * inv_channels_per_group - mean * mean + eps);
+        }
+    } else {
+        int warps_per_group = threads_per_group / WARP_SIZE;
+        int warp_idx = local_tid / WARP_SIZE;
+        float* wbuf = smem + 2 * num_groups;
+
+        if (lane == 0) {
+            int bi = my_group * warps_per_group + warp_idx;
+            wbuf[bi]                    = psum;
+            wbuf[num_groups * warps_per_group + bi] = psq;
+        }
+        __syncthreads();
+
+        if (local_tid == 0) {
+            float s = 0.0f, sq = 0.0f;
+            int base    = my_group * warps_per_group;
+            int sq_base = num_groups * warps_per_group + base;
+            for (int w = 0; w < warps_per_group; ++w) {
+                s  += wbuf[base + w];
+                sq += wbuf[sq_base + w];
+            }
+            float mean = s * inv_channels_per_group;
+            group_mean[my_group]    = mean;
+            group_inv_std[my_group] = rsqrtf(sq * inv_channels_per_group - mean * mean + eps);
         }
     }
-    
-    float mean = blockReduceSum(local_sum) / static_cast<float>(channels_per_group);
     __syncthreads();
-    
-    __shared__ float shared_mean;
-    if (threadIdx.x == 0) shared_mean = mean;
-    __syncthreads();
-    mean = shared_mean;
-    
-    // Phase 2: Compute variance using vectorized loads
-    float local_var = 0.0f;
-    for (int i = threadIdx.x; i < vec_channels_per_group; i += blockDim.x) {
-        VecT v;
-        v.load(group_input + i * VecSize);
-        local_var += vecSumSquaredDiff(v, mean);
-    }
-    
-    // Handle remainder
-    if (remainder > 0 && threadIdx.x == 0) {
-        for (int i = vec_channels_per_group * VecSize; i < channels_per_group; i++) {
-            float diff = static_cast<float>(group_input[i]) - mean;
-            local_var += diff * diff;
-        }
-    }
-    
-    float variance = blockReduceSum(local_var) / static_cast<float>(channels_per_group);
-    __syncthreads();
-    
-    __shared__ float shared_var;
-    if (threadIdx.x == 0) shared_var = variance;
-    __syncthreads();
-    variance = shared_var;
-    
-    float inv_std = rsqrtf(variance + eps);
-    
-    // Phase 3: Normalize and scale using vectorized load/store
-    for (int i = threadIdx.x; i < vec_channels_per_group; i += blockDim.x) {
-        int channel_idx = group_idx * channels_per_group + i * VecSize;
-        
+
+    // ---- Phase 3: normalize and apply per-channel affine (vectorized where possible) ----
+    int vec_channels = channels / VecSize;
+    int remainder = channels % VecSize;
+
+    for (int vec_c = threadIdx.x; vec_c < vec_channels; vec_c += blockDim.x) {
+        int c = vec_c * VecSize;
+        int g = c / channels_per_group;
         VecT v_in, v_gamma, v_beta, v_out;
-        v_in.load(group_input + i * VecSize);
-        v_gamma.load(gamma + channel_idx);
-        v_beta.load(beta + channel_idx);
-        
+        v_in.load(row + c);
+        v_gamma.load(gamma + c);
+        v_beta.load(beta + c);
+        float mean_g = group_mean[g];
+        float inv_std_g = group_inv_std[g];
         float vals[VecSize];
         #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            float normalized = (static_cast<float>(v_in[j]) - mean) * inv_std;
-            vals[j] = normalized * static_cast<float>(v_gamma[j]) + static_cast<float>(v_beta[j]);
+            float n = (static_cast<float>(v_in[j]) - mean_g) * inv_std_g;
+            vals[j] = n * static_cast<float>(v_gamma[j]) + static_cast<float>(v_beta[j]);
         }
-        
         floatToVec<T, VecSize>(vals, v_out);
-        v_out.store(group_output + i * VecSize);
+        v_out.store(out_row + c);
     }
-    
-    // Handle remainder
-    if (remainder > 0 && threadIdx.x == 0) {
-        for (int i = vec_channels_per_group * VecSize; i < channels_per_group; i++) {
-            int channel_idx = group_idx * channels_per_group + i;
-            float normalized = (static_cast<float>(group_input[i]) - mean) * inv_std;
-            float g = static_cast<float>(gamma[channel_idx]);
-            float b = static_cast<float>(beta[channel_idx]);
-            group_output[i] = static_cast<T>(normalized * g + b);
+
+    if (remainder > 0) {
+        for (int c = vec_channels * VecSize + threadIdx.x; c < channels; c += blockDim.x) {
+            int g = c / channels_per_group;
+            float v = static_cast<float>(row[c]);
+            float n = (v - group_mean[g]) * group_inv_std[g];
+            out_row[c] = static_cast<T>(
+                n * static_cast<float>(gamma[c]) + static_cast<float>(beta[c])
+            );
         }
     }
 }
@@ -1117,22 +1176,25 @@ void invokeGroupNormTyped(const void* input, void* output,
                           const void* gamma, const void* beta,
                           int batch_size, int seq_len, int channels, int num_groups,
                           float eps, cudaStream_t stream) {
-    int num_blocks = batch_size * seq_len * num_groups;
     int channels_per_group = channels / num_groups;
-    
+
     constexpr int VecSize = VecTypeTrait<T>::VecSize;
-    
-    // Check if we can use vectorized kernel
+
+    int num_blocks = batch_size * seq_len;
+    int block_size = std::min(channels, MAX_THREADS_PER_BLOCK);
+    block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE,
+                          WARP_SIZE);
+    int num_warps = block_size / WARP_SIZE;
+    size_t smem_bytes = sizeof(float) * (2 * num_groups + 2 * num_warps);
+
     bool use_vec = (channels_per_group >= VecSize) &&
                    (reinterpret_cast<uintptr_t>(input) % (sizeof(T) * VecSize) == 0) &&
-                   (reinterpret_cast<uintptr_t>(output) % (sizeof(T) * VecSize) == 0);
-    
+                   (reinterpret_cast<uintptr_t>(output) % (sizeof(T) * VecSize) == 0) &&
+                   (reinterpret_cast<uintptr_t>(gamma) % (sizeof(T) * VecSize) == 0) &&
+                   (reinterpret_cast<uintptr_t>(beta) % (sizeof(T) * VecSize) == 0);
+
     if (use_vec) {
-        int vec_channels_per_group = channels_per_group / VecSize;
-        int block_size = std::min(vec_channels_per_group, MAX_THREADS_PER_BLOCK);
-        block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
-        
-        groupNormKernelVectorized<T, VecSize><<<num_blocks, block_size, 0, stream>>>(
+        groupNormKernelVectorized<T, VecSize><<<num_blocks, block_size, smem_bytes, stream>>>(
             static_cast<const T*>(input),
             static_cast<T*>(output),
             static_cast<const T*>(gamma),
@@ -1140,10 +1202,7 @@ void invokeGroupNormTyped(const void* input, void* output,
             batch_size, seq_len, channels, num_groups, eps
         );
     } else {
-        int block_size = std::min(channels_per_group, MAX_THREADS_PER_BLOCK);
-        block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-        
-        groupNormKernel<T><<<num_blocks, block_size, 0, stream>>>(
+        groupNormKernel<T><<<num_blocks, block_size, smem_bytes, stream>>>(
             static_cast<const T*>(input),
             static_cast<T*>(output),
             static_cast<const T*>(gamma),

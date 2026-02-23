@@ -204,6 +204,7 @@ class TestGroupNorm:
         (2, 64, 256, 32),
         (4, 128, 512, 64),
         (2, 64, 128, 8),
+        (2, 64, 4096, 2),
     ])
     def test_group_norm(self, oasr, batch_size, seq_len, channels, num_groups):
         """Test GroupNorm kernel."""
