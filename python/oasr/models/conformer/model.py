@@ -10,6 +10,7 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import nn
 
+from oasr.layers.norm import LayerNorm, RMSNorm
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention, T_CACHE
 
 from .config import ConformerEncoderConfig, ConformerModelConfig
@@ -34,24 +35,6 @@ def _get_activation(activation_type: str) -> nn.Module:
     if activation_type == "gelu":
         return nn.GELU()
     return nn.SiLU()
-
-
-def _rms_norm_class() -> type:
-    """Return an RMSNorm class (LayerNorm-like interface)."""
-    try:
-        from torch.nn import RMSNorm
-        return RMSNorm
-    except ImportError:
-        class RMSNorm(nn.Module):
-            def __init__(self, normalized_shape: int, eps: float = 1e-5):
-                super().__init__()
-                self.eps = eps
-                self.weight = nn.Parameter(torch.ones(normalized_shape))
-
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-                return (x * rms).to(x.dtype) * self.weight
-        return RMSNorm
 
 
 # -----------------------------------------------------------------------------
@@ -127,9 +110,9 @@ class ConvolutionModule(nn.Module):
         else:
             self.use_layer_norm = True
             self.norm = (
-                nn.LayerNorm(inner_channels, eps=norm_eps)
+                LayerNorm(inner_channels, eps=norm_eps)
                 if norm == "layer_norm"
-                else _rms_norm_class()(inner_channels, eps=norm_eps)
+                else RMSNorm(inner_channels, eps=norm_eps)
             )
 
         self.pointwise_conv2 = nn.Conv1d(inner_channels, channels, kernel_size=1, stride=1, padding=0, bias=bias)
