@@ -541,14 +541,14 @@ inline void registerKernelBindings(py::module_ &m) {
            "Layer normalization kernel");
 
   norm.def("rms_norm",
-           [](const void* input, void* output, const void* gamma,
+           [](const void* input, void* output, const void* gamma, const void* beta,
               int batch_size, int seq_len, int hidden_size, float eps,
               DataType dtype, intptr_t stream) {
-             kernels::invokeRMSNorm(input, output, gamma,
+             kernels::invokeRMSNorm(input, output, gamma, beta,
                  batch_size, seq_len, hidden_size, eps, dtype,
                  reinterpret_cast<cudaStream_t>(stream));
            },
-           py::arg("input"), py::arg("output"), py::arg("gamma"),
+           py::arg("input"), py::arg("output"), py::arg("gamma"), py::arg("beta"),
            py::arg("batch_size"), py::arg("seq_len"), py::arg("hidden_size"),
            py::arg("eps"), py::arg("dtype"), py::arg("stream") = 0,
            "RMS normalization kernel");

@@ -59,7 +59,7 @@ void cpuLayerNorm(const T* input, T* output,
 }
 
 template <typename T>
-void cpuRMSNorm(const T* input, T* output, const T* gamma,
+void cpuRMSNorm(const T* input, T* output, const T* gamma, const T* beta,
                 int batch_size, int seq_len, int hidden_size, float eps) {
     for (int b = 0; b < batch_size * seq_len; ++b) {
         const T* row = input + b * hidden_size;
@@ -71,8 +71,12 @@ void cpuRMSNorm(const T* input, T* output, const T* gamma,
         }
         mean_sq /= static_cast<float>(hidden_size);
         float inv_rms = 1.0f / std::sqrt(mean_sq + eps);
-        for (int i = 0; i < hidden_size; ++i)
+        for (int i = 0; i < hidden_size; ++i) {
             out_row[i] = static_cast<T>(static_cast<float>(row[i]) * inv_rms * static_cast<float>(gamma[i]));
+            if (beta != nullptr) {
+                out_row[i] += static_cast<T>(static_cast<float>(beta[i]));
+            }
+        }
     }
 }
 
@@ -246,20 +250,23 @@ void TestRMSNorm::RunRMSNorm(int batch_size, int seq_len, int hidden_size, DataT
     size_t p = static_cast<size_t>(hidden_size);
     auto input_f = oasr::kernels::test::generateRandomData<float>(n);
     auto gamma_f = oasr::kernels::test::generateRandomData<float>(p, 0.5f, 1.5f);
+    auto beta_f = oasr::kernels::test::generateRandomData<float>(p, -0.5f, 0.5f);
 
     if (dtype == DataType::FP32) {
-        float *d_in = nullptr, *d_out = nullptr, *d_gamma = nullptr;
+        float *d_in = nullptr, *d_out = nullptr, *d_gamma = nullptr, *d_beta = nullptr;
         OASR_CUDA_CHECK(cudaMalloc(&d_in, n * sizeof(float)));
         OASR_CUDA_CHECK(cudaMalloc(&d_out, n * sizeof(float)));
         OASR_CUDA_CHECK(cudaMalloc(&d_gamma, p * sizeof(float)));
+        OASR_CUDA_CHECK(cudaMalloc(&d_beta, p * sizeof(float)));
         OASR_CUDA_CHECK(cudaMemcpy(d_in, input_f.data(), n * sizeof(float), cudaMemcpyHostToDevice));
         OASR_CUDA_CHECK(cudaMemcpy(d_gamma, gamma_f.data(), p * sizeof(float), cudaMemcpyHostToDevice));
+        OASR_CUDA_CHECK(cudaMemcpy(d_beta, beta_f.data(), p * sizeof(float), cudaMemcpyHostToDevice));
 
-        invokeRMSNorm(d_in, d_out, d_gamma, batch_size, seq_len, hidden_size, eps, DataType::FP32, nullptr);
+        invokeRMSNorm(d_in, d_out, d_gamma, d_beta, batch_size, seq_len, hidden_size, eps, DataType::FP32, nullptr);
 
         std::vector<float> out_gpu(n), out_cpu(n);
         OASR_CUDA_CHECK(cudaMemcpy(out_gpu.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost));
-        oasr::kernels::test::cpuRMSNorm(input_f.data(), out_cpu.data(), gamma_f.data(),
+        oasr::kernels::test::cpuRMSNorm(input_f.data(), out_cpu.data(), gamma_f.data(), beta_f.data(),
                                         batch_size, seq_len, hidden_size, eps);
         for (size_t i = 0; i < n; ++i)
             EXPECT_LE(std::abs(out_gpu[i] - out_cpu[i]), atol + rtol * std::abs(out_cpu[i])) << "i=" << i;
@@ -267,28 +274,32 @@ void TestRMSNorm::RunRMSNorm(int batch_size, int seq_len, int hidden_size, DataT
         return;
     }
 
-    std::vector<half> input_h(n), gamma_h(p);
+    std::vector<half> input_h(n), gamma_h(p), beta_h(p);
     for (size_t i = 0; i < n; ++i) input_h[i] = __float2half(input_f[i]);
     for (size_t i = 0; i < p; ++i) gamma_h[i] = __float2half(gamma_f[i]);
-    half *d_in = nullptr, *d_out = nullptr, *d_gamma = nullptr;
+    for (size_t i = 0; i < p; ++i) beta_h[i] = __float2half(beta_f[i]);
+
+    half *d_in = nullptr, *d_out = nullptr, *d_gamma = nullptr, *d_beta = nullptr;
     OASR_CUDA_CHECK(cudaMalloc(&d_in, n * sizeof(half)));
     OASR_CUDA_CHECK(cudaMalloc(&d_out, n * sizeof(half)));
     OASR_CUDA_CHECK(cudaMalloc(&d_gamma, p * sizeof(half)));
+    OASR_CUDA_CHECK(cudaMalloc(&d_beta, p * sizeof(half)));
     OASR_CUDA_CHECK(cudaMemcpy(d_in, input_h.data(), n * sizeof(half), cudaMemcpyHostToDevice));
     OASR_CUDA_CHECK(cudaMemcpy(d_gamma, gamma_h.data(), p * sizeof(half), cudaMemcpyHostToDevice));
+    OASR_CUDA_CHECK(cudaMemcpy(d_beta, beta_h.data(), p * sizeof(half), cudaMemcpyHostToDevice));
 
-    invokeRMSNorm(d_in, d_out, d_gamma, batch_size, seq_len, hidden_size, eps, DataType::FP16, nullptr);
+    invokeRMSNorm(d_in, d_out, d_gamma, d_beta, batch_size, seq_len, hidden_size, eps, DataType::FP16, nullptr);
 
     std::vector<half> out_h(n);
     std::vector<float> out_cpu(n);
     OASR_CUDA_CHECK(cudaMemcpy(out_h.data(), d_out, n * sizeof(half), cudaMemcpyDeviceToHost));
-    oasr::kernels::test::cpuRMSNorm(input_f.data(), out_cpu.data(), gamma_f.data(),
+    oasr::kernels::test::cpuRMSNorm(input_f.data(), out_cpu.data(), gamma_f.data(), beta_f.data(),
                                     batch_size, seq_len, hidden_size, eps);
     for (size_t i = 0; i < n; ++i) {
         float gpu_val = __half2float(out_h[i]);
         EXPECT_LE(std::abs(gpu_val - out_cpu[i]), atol + rtol * std::abs(out_cpu[i])) << "i=" << i;
     }
-    cudaFree(d_in); cudaFree(d_out); cudaFree(d_gamma);
+    cudaFree(d_in); cudaFree(d_out); cudaFree(d_gamma); cudaFree(d_beta);
 }
 
 TEST_F(TestRMSNorm, RMSNorm_1_64_128_FP32) { RunRMSNorm(1, 64, 128, DataType::FP32, 1e-4f, 1e-4f); }

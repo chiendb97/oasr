@@ -105,6 +105,7 @@ class TestRMSNorm:
         
         x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
         gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
+        beta = torch.randn(hidden_size, device='cuda', dtype=dtype)
         output = torch.empty_like(x)
         
         dtype_map = {
@@ -114,7 +115,7 @@ class TestRMSNorm:
         
         oasr.kernels.norm.rms_norm(
             x.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(),
+            gamma.data_ptr(), beta.data_ptr(),
             batch_size, seq_len, hidden_size,
             eps, dtype_map[dtype]
         )
@@ -122,7 +123,7 @@ class TestRMSNorm:
         
         # Reference: RMS = sqrt(mean(x^2) + eps)
         rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-        expected = x / rms * gamma
+        expected = x / rms * gamma + beta
         
         rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)

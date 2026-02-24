@@ -48,7 +48,7 @@ void invokeLayerNorm(const void* input, void* output,
  * @param stream CUDA stream
  */
 void invokeRMSNorm(const void* input, void* output,
-                   const void* gamma,
+                   const void* gamma, const void* beta,
                    int batch_size, int seq_len, int hidden_size,
                    float eps, DataType dtype, cudaStream_t stream);
 
@@ -131,7 +131,7 @@ void invokeLayerNormTyped(const void* input, void* output,
 
 template <typename T>
 void invokeRMSNormTyped(const void* input, void* output,
-                        const void* gamma,
+                        const void* gamma, const void* beta,
                         int batch_size, int seq_len, int hidden_size,
                         float eps, cudaStream_t stream);
 

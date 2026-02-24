@@ -119,15 +119,17 @@ PYBIND11_MODULE(_C, m) {
              "Layer normalization kernel");
     
     norm.def("rms_norm",
-             [](intptr_t input, intptr_t output, intptr_t gamma,
+             [](intptr_t input, intptr_t output, intptr_t gamma, intptr_t beta,
                 int batch_size, int seq_len, int hidden_size,
                 float eps, oasr::DataType dtype) {
                  oasr::kernels::invokeRMSNorm(
-                     to_const_ptr(input), to_ptr(output), to_const_ptr(gamma),
+                     to_const_ptr(input), to_ptr(output), 
+                     to_const_ptr(gamma), to_const_ptr(beta),
                      batch_size, seq_len, hidden_size,
                      eps, dtype, nullptr);
              },
-             py::arg("input"), py::arg("output"), py::arg("gamma"),
+             py::arg("input"), py::arg("output"), 
+             py::arg("gamma"), py::arg("beta"),
              py::arg("batch_size"), py::arg("seq_len"), py::arg("hidden_size"),
              py::arg("eps") = 1e-5f, py::arg("dtype") = oasr::DataType::FP16,
              "RMS normalization kernel");

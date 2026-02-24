@@ -180,6 +180,7 @@ __global__ void rmsNormKernel(
     const T* __restrict__ input,
     T* __restrict__ output,
     const T* __restrict__ gamma,
+    const T* __restrict__ beta,
     int hidden_size,
     float eps
 ) {
@@ -209,7 +210,11 @@ __global__ void rmsNormKernel(
     // Normalize and scale
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         float normalized = static_cast<float>(row_input[i]) * inv_rms;
-        row_output[i] = static_cast<T>(normalized * static_cast<float>(gamma[i]));
+        float scaled = normalized * static_cast<float>(gamma[i]);
+        if (beta != nullptr) {
+            scaled += static_cast<float>(beta[i]);
+        }
+        row_output[i] = static_cast<T>(scaled);
     }
 }
 
@@ -513,6 +518,7 @@ __global__ void rmsNormKernelVectorized(
     const T* __restrict__ input,
     T* __restrict__ output,
     const T* __restrict__ gamma,
+    const T* __restrict__ beta,
     int hidden_size,
     float eps
 ) {
@@ -554,6 +560,14 @@ __global__ void rmsNormKernelVectorized(
             vals[j] = static_cast<float>(v_in[j]) * inv_rms * static_cast<float>(v_gamma[j]);
         }
         
+        if (beta != nullptr) {
+            VecT v_beta;
+            v_beta.load(beta + i * VecSize);
+            #pragma unroll
+            for (int j = 0; j < VecSize; j++) {
+                vals[j] += static_cast<float>(v_beta[j]);
+            }
+        }
         floatToVec<T, VecSize>(vals, v_out);
         v_out.store(row_output + i * VecSize);
     }
@@ -908,6 +922,7 @@ void invokeLayerNormTyped(const void* input, void* output,
 template <typename T>
 void invokeRMSNormTyped(const void* input, void* output,
                         const void* gamma,
+                        const void* beta,
                         int batch_size, int seq_len, int hidden_size,
                         float eps, cudaStream_t stream) {
     int num_rows = batch_size * seq_len;
@@ -930,6 +945,7 @@ void invokeRMSNormTyped(const void* input, void* output,
             static_cast<const T*>(input),
             static_cast<T*>(output),
             static_cast<const T*>(gamma),
+            static_cast<const T*>(beta),
             hidden_size,
             eps
         );
@@ -938,6 +954,7 @@ void invokeRMSNormTyped(const void* input, void* output,
             static_cast<const T*>(input),
             static_cast<T*>(output),
             static_cast<const T*>(gamma),
+            static_cast<const T*>(beta),
             hidden_size,
             eps
         );
@@ -975,21 +992,22 @@ void invokeLayerNorm(const void* input, void* output,
 
 void invokeRMSNorm(const void* input, void* output,
                    const void* gamma,
+                   const void* beta,
                    int batch_size, int seq_len, int hidden_size,
                    float eps, DataType dtype, cudaStream_t stream) {
     switch (dtype) {
         case DataType::FP32:
-            invokeRMSNormTyped<float>(input, output, gamma,
+            invokeRMSNormTyped<float>(input, output, gamma, beta,
                                       batch_size, seq_len, hidden_size,
                                       eps, stream);
             break;
         case DataType::FP16:
-            invokeRMSNormTyped<half>(input, output, gamma,
+            invokeRMSNormTyped<half>(input, output, gamma, beta,
                                      batch_size, seq_len, hidden_size,
                                      eps, stream);
             break;
         case DataType::BF16:
-            invokeRMSNormTyped<__nv_bfloat16>(input, output, gamma,
+            invokeRMSNormTyped<__nv_bfloat16>(input, output, gamma, beta,
                                               batch_size, seq_len, hidden_size,
                                               eps, stream);
             break;
@@ -1225,11 +1243,11 @@ template void invokeLayerNormTyped<half>(const void*, void*, const void*, const 
 template void invokeLayerNormTyped<__nv_bfloat16>(const void*, void*, const void*, const void*,
                                                   int, int, int, float, cudaStream_t);
 
-template void invokeRMSNormTyped<float>(const void*, void*, const void*,
+template void invokeRMSNormTyped<float>(const void*, void*, const void*, const void*,
                                         int, int, int, float, cudaStream_t);
-template void invokeRMSNormTyped<half>(const void*, void*, const void*,
+template void invokeRMSNormTyped<half>(const void*, void*, const void*, const void*,
                                        int, int, int, float, cudaStream_t);
-template void invokeRMSNormTyped<__nv_bfloat16>(const void*, void*, const void*,
+template void invokeRMSNormTyped<__nv_bfloat16>(const void*, void*, const void*, const void*,
                                                 int, int, int, float, cudaStream_t);
 
 } // namespace kernels
