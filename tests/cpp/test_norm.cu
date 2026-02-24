@@ -80,6 +80,31 @@ void cpuRMSNorm(const T* input, T* output, const T* gamma, const T* beta,
     }
 }
 
+template <typename T>
+void cpuGroupNorm(const T* input, T* output, const T* gamma, const T* beta,
+                  int batch_size, int seq_len, int channels, int num_groups, float eps) {
+    int cpq = channels / num_groups;
+    for (size_t idx = 0; idx < batch_size * seq_len * channels; ++idx) {
+        int b = idx / (seq_len * channels);
+        int rest = idx % (seq_len * channels);
+        int t = rest / channels;
+        int c = rest % channels;
+        int g = c / cpq;
+        size_t base = static_cast<size_t>(b) * seq_len * channels + t * channels + g * cpq;
+        float mean = 0.0f, var = 0.0f;
+        for (int i = 0; i < cpq; ++i) {
+            mean += static_cast<float>(input[base + i]);
+        }
+        mean /= cpq;
+        for (int i = 0; i < cpq; ++i) {
+            float v = static_cast<float>(input[base + i]); var += (v - mean) * (v - mean); 
+        }
+        var /= cpq;
+        float expected = (static_cast<float>(input[idx]) - mean) / std::sqrt(var + eps) * static_cast<float>(gamma[c]) + static_cast<float>(beta[c]);
+        output[idx] = static_cast<T>(expected);
+    }
+}
+
 }  // namespace test
 }  // namespace kernels
 }  // namespace oasr
@@ -503,8 +528,7 @@ protected:
     void TearDown() override { cudaDeviceSynchronize(); }
 };
 
-// TODO: Re-enable when GroupNorm kernel numerics match CPU ref (vectorized path?)
-TEST_F(TestGroupNorm, DISABLED_GroupNorm_2_64_256_32) {
+TEST_F(TestGroupNorm, GroupNorm_2_64_256_32) {
     const int batch_size = 2, seq_len = 64, channels = 256, num_groups = 32;
     const float eps = 1e-5f;
     size_t n = static_cast<size_t>(batch_size) * seq_len * channels;
@@ -528,29 +552,11 @@ TEST_F(TestGroupNorm, DISABLED_GroupNorm_2_64_256_32) {
     std::vector<float> out_gpu(n);
     OASR_CUDA_CHECK(cudaMemcpy(out_gpu.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost));
 
-    int cpq = channels / num_groups;
-    for (int b = 0; b < batch_size; ++b) {
-        for (int t = 0; t < seq_len; ++t) {
-            for (int g = 0; g < num_groups; ++g) {
-                float mean = 0.0f, var = 0.0f;
-                for (int c = 0; c < cpq; ++c) {
-                    float v = x_f[b * seq_len * channels + t * channels + g * cpq + c];
-                    mean += v;
-                }
-                mean /= cpq;
-                for (int c = 0; c < cpq; ++c) {
-                    float v = x_f[b * seq_len * channels + t * channels + g * cpq + c];
-                    var += (v - mean) * (v - mean);
-                }
-                var /= cpq;
-                float inv_std = 1.0f / std::sqrt(var + eps);
-                for (int c = 0; c < cpq; ++c) {
-                    int idx = b * seq_len * channels + t * channels + g * cpq + c;
-                    float expected = (x_f[idx] - mean) * inv_std * gamma_f[idx] + beta_f[idx];
-                    EXPECT_LE(std::abs(out_gpu[idx] - expected), 1e-3f) << "idx=" << idx;
-                }
-            }
-        }
+    std::vector<float> out_cpu(n);
+    oasr::kernels::test::cpuGroupNorm(x_f.data(), out_cpu.data(), gamma_f.data(), beta_f.data(),
+                                      batch_size, seq_len, channels, num_groups, eps);
+    for (size_t i = 0; i < n; ++i) {
+        EXPECT_LE(std::abs(out_gpu[i] - out_cpu[i]), 1e-4f) << "i=" << i;
     }
     cudaFree(d_x); cudaFree(d_out); cudaFree(d_gamma); cudaFree(d_beta);
 }
@@ -578,27 +584,17 @@ TEST_F(TestGroupNorm, GroupNorm_4_128_512_64) {
 
     std::vector<float> out_gpu(n);
     OASR_CUDA_CHECK(cudaMemcpy(out_gpu.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost));
-    int cpq = channels / num_groups;
-    for (size_t idx = 0; idx < n; ++idx) {
-        int b = idx / (seq_len * channels);
-        int rest = idx % (seq_len * channels);
-        int t = rest / channels;
-        int c = rest % channels;
-        int g = c / cpq;
-        size_t base = static_cast<size_t>(b) * seq_len * channels + t * channels + g * cpq;
-        float mean = 0.0f, var = 0.0f;
-        for (int i = 0; i < cpq; ++i) mean += x_f[base + i];
-        mean /= cpq;
-        for (int i = 0; i < cpq; ++i) { float v = x_f[base + i]; var += (v - mean) * (v - mean); }
-        var /= cpq;
-        float expected = (x_f[idx] - mean) / std::sqrt(var + eps) * gamma_f[c] + beta_f[c];
-        EXPECT_LE(std::abs(out_gpu[idx] - expected), 1e-3f) << "idx=" << idx;
+
+    std::vector<float> out_cpu(n);
+    oasr::kernels::test::cpuGroupNorm(x_f.data(), out_cpu.data(), gamma_f.data(), beta_f.data(),
+                                      batch_size, seq_len, channels, num_groups, eps);
+    for (size_t i = 0; i < n; ++i) {
+        EXPECT_LE(std::abs(out_gpu[i] - out_cpu[i]), 1e-4f) << "i=" << i;
     }
     cudaFree(d_x); cudaFree(d_out); cudaFree(d_gamma); cudaFree(d_beta);
 }
 
-// TODO: Re-enable when GroupNorm kernel numerics match CPU ref
-TEST_F(TestGroupNorm, DISABLED_GroupNorm_2_64_128_8) {
+TEST_F(TestGroupNorm, GroupNorm_2_64_128_8) {
     const int batch_size = 2, seq_len = 64, channels = 128, num_groups = 8;
     const float eps = 1e-5f;
     size_t n = static_cast<size_t>(batch_size) * seq_len * channels;
@@ -621,29 +617,12 @@ TEST_F(TestGroupNorm, DISABLED_GroupNorm_2_64_128_8) {
 
     std::vector<float> out_gpu(n);
     OASR_CUDA_CHECK(cudaMemcpy(out_gpu.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost));
-    int cpq = channels / num_groups;
-    for (int b = 0; b < batch_size; ++b) {
-        for (int t = 0; t < seq_len; ++t) {
-            for (int g = 0; g < num_groups; ++g) {
-                float mean = 0.0f, var = 0.0f;
-                for (int c = 0; c < cpq; ++c) {
-                    float v = x_f[b * seq_len * channels + t * channels + g * cpq + c];
-                    mean += v;
-                }
-                mean /= cpq;
-                for (int c = 0; c < cpq; ++c) {
-                    float v = x_f[b * seq_len * channels + t * channels + g * cpq + c];
-                    var += (v - mean) * (v - mean);
-                }
-                var /= cpq;
-                float inv_std = 1.0f / std::sqrt(var + eps);
-                for (int c = 0; c < cpq; ++c) {
-                    int idx = b * seq_len * channels + t * channels + g * cpq + c;
-                    float expected = (x_f[idx] - mean) * inv_std * gamma_f[idx] + beta_f[idx];
-                    EXPECT_LE(std::abs(out_gpu[idx] - expected), 1e-3f) << "idx=" << idx;
-                }
-            }
-        }
+
+    std::vector<float> out_cpu(n);
+    oasr::kernels::test::cpuGroupNorm(x_f.data(), out_cpu.data(), gamma_f.data(), beta_f.data(),
+                                      batch_size, seq_len, channels, num_groups, eps);
+    for (size_t i = 0; i < n; ++i) {
+        EXPECT_LE(std::abs(out_gpu[i] - out_cpu[i]), 1e-4f) << "i=" << i;
     }
     cudaFree(d_x); cudaFree(d_out); cudaFree(d_gamma); cudaFree(d_beta);
 }
