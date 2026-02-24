@@ -60,24 +60,22 @@ def _rms_norm_class() -> type:
 
 
 class PositionwiseFeedForward(nn.Module):
-    """Position-wise feed-forward: Linear -> activation -> dropout -> Linear (WeNet)."""
+    """Position-wise feed-forward: Linear -> activation -> Linear (WeNet)."""
 
     def __init__(
         self,
         idim: int,
         hidden_units: int,
-        dropout_rate: float,
         activation: nn.Module | None = None,
         bias: bool = True,
     ):
         super().__init__()
         self.w_1 = nn.Linear(idim, hidden_units, bias=bias)
         self.activation = activation if activation is not None else nn.SiLU()
-        self.dropout = nn.Dropout(dropout_rate)
         self.w_2 = nn.Linear(hidden_units, idim, bias=bias)
 
     def forward(self, xs: torch.Tensor) -> torch.Tensor:
-        return self.w_2(self.dropout(self.activation(self.w_1(xs))))
+        return self.w_2(self.activation(self.w_1(xs)))
 
 
 # -----------------------------------------------------------------------------
@@ -178,11 +176,10 @@ class ConvolutionModule(nn.Module):
 class RelPositionalEncoding(nn.Module):
     """Relative positional encoding for Conformer (WeNet). Returns (x * xscale, pos_emb)."""
 
-    def __init__(self, d_model: int, dropout_rate: float, max_len: int = 5000):
+    def __init__(self, d_model: int, max_len: int = 5000):
         super().__init__()
         self.d_model = d_model
         self.xscale = math.sqrt(d_model)
-        self.dropout = nn.Dropout(p=dropout_rate)
         self.max_len = max_len
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
@@ -204,7 +201,7 @@ class RelPositionalEncoding(nn.Module):
             index = offset.unsqueeze(1) + torch.arange(0, size, device=offset.device)
             index = index.clamp(min=0)
             pos_emb = torch.nn.functional.embedding(index, self.pe[0])
-        return self.dropout(x), self.dropout(pos_emb)
+        return x, pos_emb
 
     def position_encoding(self, offset: Union[int, torch.Tensor], size: int) -> torch.Tensor:
         if isinstance(offset, int):
@@ -221,7 +218,6 @@ class Conv2dSubsampling(nn.Module):
         self,
         idim: int,
         odim: int,
-        dropout_rate: float,
         pos_enc: nn.Module,
         subsampling_rate: int = 4,
     ):
@@ -244,7 +240,6 @@ class Conv2dSubsampling(nn.Module):
         self.out = nn.Sequential(
             nn.Linear(self.linear_dim, odim),
             nn.LayerNorm(odim, eps=1e-5),
-            nn.Dropout(dropout_rate),
         )
         self.right_context = 6 if subsampling_rate == 4 else 0
 
@@ -283,7 +278,6 @@ class ConformerEncoderLayer(nn.Module):
         feed_forward: nn.Module,
         feed_forward_macaron: Optional[nn.Module] = None,
         conv_module: Optional[ConvolutionModule] = None,
-        dropout_rate: float = 0.1,
         normalize_before: bool = True,
         layer_norm_type: str = "layer_norm",
         norm_eps: float = 1e-5,
@@ -293,7 +287,6 @@ class ConformerEncoderLayer(nn.Module):
         self.feed_forward = feed_forward
         self.feed_forward_macaron = feed_forward_macaron
         self.conv_module = conv_module
-        self.dropout = nn.Dropout(dropout_rate)
         self.size = size
         self.normalize_before = normalize_before
         norm_class = nn.LayerNorm if layer_norm_type == "layer_norm" else _rms_norm_class()
@@ -321,14 +314,14 @@ class ConformerEncoderLayer(nn.Module):
             residual = x
             if self.normalize_before:
                 x = self.norm_ff_macaron(x)
-            x = residual + self.ff_scale * self.dropout(self.feed_forward_macaron(x))
+            x = residual + self.ff_scale * self.feed_forward_macaron(x)
             if not self.normalize_before:
                 x = self.norm_ff_macaron(x)
         residual = x
         if self.normalize_before:
             x = self.norm_mha(x)
         x_att, new_att_cache = self.self_attn(x, x, x, mask, pos_emb, att_cache)
-        x = residual + self.dropout(x_att)
+        x = residual + x_att
         if not self.normalize_before:
             x = self.norm_mha(x)
         new_cnn_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
@@ -337,13 +330,13 @@ class ConformerEncoderLayer(nn.Module):
             if self.normalize_before:
                 x = self.norm_conv(x)
             x, new_cnn_cache = self.conv_module(x, mask_pad, cnn_cache)
-            x = residual + self.dropout(x)
+            x = residual + x
             if not self.normalize_before:
                 x = self.norm_conv(x)
         residual = x
         if self.normalize_before:
             x = self.norm_ff(x)
-        x = residual + self.ff_scale * self.dropout(self.feed_forward(x))
+        x = residual + self.ff_scale * self.feed_forward(x)
         if not self.normalize_before:
             x = self.norm_ff(x)
         if self.conv_module is not None:
@@ -365,14 +358,12 @@ class ConformerEncoder(nn.Module):
         self._output_size = config.output_size
         pos_enc = RelPositionalEncoding(
             config.output_size,
-            config.positional_dropout_rate,
             max_len=5000,
         )
         if config.input_layer == "conv2d":
             self.embed = Conv2dSubsampling(
                 config.input_size,
                 config.output_size,
-                config.dropout_rate,
                 pos_enc,
                 subsampling_rate=4,
             )
@@ -388,7 +379,6 @@ class ConformerEncoder(nn.Module):
             return PositionwiseFeedForward(
                 config.output_size,
                 config.linear_units,
-                config.dropout_rate,
                 activation=activation,
                 bias=True,
             )
@@ -398,7 +388,6 @@ class ConformerEncoder(nn.Module):
             self_attn = RelPositionMultiHeadedAttention(
                 config.attention_heads,
                 config.output_size,
-                config.attention_dropout_rate,
                 query_bias=True,
                 key_bias=True,
                 value_bias=True,
@@ -427,7 +416,6 @@ class ConformerEncoder(nn.Module):
                     feed_forward=ff,
                     feed_forward_macaron=ff_macaron,
                     conv_module=conv,
-                    dropout_rate=config.dropout_rate,
                     normalize_before=config.normalize_before,
                     layer_norm_type=config.layer_norm_type,
                     norm_eps=config.norm_eps,

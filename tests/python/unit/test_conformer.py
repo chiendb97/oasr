@@ -52,7 +52,6 @@ def test_positionwise_feed_forward_matches_wenet(idim: int, hidden_units: int):
     impl = PositionwiseFeedForward(
         idim=idim,
         hidden_units=hidden_units,
-        dropout_rate=dropout,
         activation=activation,
     )
     impl.load_state_dict(ref.state_dict())
@@ -186,7 +185,6 @@ def test_conformer_encoder_layer_matches_wenet(
             num_blocks=num_blocks,
             attention_heads=2,
             linear_units=128,
-            dropout_rate=0.0,
             positional_dropout_rate=0.0,
             attention_dropout_rate=0.0,
             use_cnn_module=True,
@@ -315,7 +313,7 @@ def test_rel_positional_encoding_shape():
     """RelPositionalEncoding returns scaled x and pos_emb with correct shapes."""
     torch.manual_seed(5)
     d_model = 64
-    pos_enc = RelPositionalEncoding(d_model, dropout_rate=0.0, max_len=5000)
+    pos_enc = RelPositionalEncoding(d_model, max_len=5000)
 
     batch, time = 2, 20
     x = _randn(batch, time, d_model)
