@@ -44,184 +44,34 @@ __global__ void depthwiseConv1DKernel(
     int seq_len,
     int channels,
     int kernel_size,
-    int padding,
-    bool is_causal
+    int padding
 ) {
-    // Each thread handles one output element
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = batch_size * seq_len * channels;
-    
-    if (idx >= total_elements) return;
-    
-    // Compute indices
-    int c = idx % channels;
-    int t = (idx / channels) % seq_len;
-    int b = idx / (channels * seq_len);
-    
-    // Compute convolution
-    float sum = 0.0f;
-    int half_kernel = kernel_size / 2;
-    
-    for (int k = 0; k < kernel_size; k++) {
-        int input_t;
-        if (is_causal) {
-            // Causal: only look at past and current
-            input_t = t - (kernel_size - 1) + k;
-        } else {
-            // Standard: symmetric padding
-            input_t = t - half_kernel + k;
-        }
-        
-        if (input_t >= 0 && input_t < seq_len) {
-            int input_idx = b * seq_len * channels + input_t * channels + c;
-            int weight_idx = c * kernel_size + k;
-            sum += static_cast<float>(input[input_idx]) * static_cast<float>(weight[weight_idx]);
-        }
-    }
-    
-    // Add bias
-    if (bias != nullptr) {
-        sum += static_cast<float>(bias[c]);
-    }
-    
-    output[idx] = static_cast<T>(sum);
-}
-
-// Optimized depthwise conv with shared memory
-template <typename T, int KERNEL_SIZE>
-__global__ void depthwiseConv1DKernelOptimized(
-    const T* __restrict__ input,
-    const T* __restrict__ weight,
-    const T* __restrict__ bias,
-    T* __restrict__ output,
-    int batch_size,
-    int seq_len,
-    int channels,
-    int padding,
-    bool is_causal
-) {
-    extern __shared__ char shared_mem[];
-    const int TILE_SIZE = blockDim.x;
-    const int half_kernel = KERNEL_SIZE / 2;
-    const int halo = is_causal ? (KERNEL_SIZE - 1) : half_kernel;
-    const int input_shared_size = TILE_SIZE + 2 * halo;
-    T* shared_input = reinterpret_cast<T*>(shared_mem);
-    float* shared_weight = reinterpret_cast<float*>(shared_mem + input_shared_size * sizeof(T));
-
-    int b = blockIdx.z;
-    int c = blockIdx.y;
-    int tile_start = blockIdx.x * TILE_SIZE;
-    int local_t = threadIdx.x;
-    int global_t = tile_start + local_t;
-
-    // Load weight once per block (all threads share channel c)
-    for (int k = local_t; k < KERNEL_SIZE; k += blockDim.x) {
-        shared_weight[k] = static_cast<float>(weight[c * KERNEL_SIZE + k]);
-    }
-
-    // Load input tile with halo
-    int shared_idx = local_t + halo;
-    if (global_t < seq_len) {
-        int input_idx = b * seq_len * channels + global_t * channels + c;
-        shared_input[shared_idx] = input[input_idx];
-    } else {
-        shared_input[shared_idx] = T(0);
-    }
-
-    // Load halo regions
-    if (local_t < halo) {
-        int left_t = tile_start - halo + local_t;
-        if (left_t >= 0 && left_t < seq_len) {
-            int input_idx = b * seq_len * channels + left_t * channels + c;
-            shared_input[local_t] = input[input_idx];
-        } else {
-            shared_input[local_t] = T(0);
-        }
-
-        if (!is_causal) {
-            int right_t = tile_start + TILE_SIZE + local_t;
-            if (right_t < seq_len) {
-                int input_idx = b * seq_len * channels + right_t * channels + c;
-                shared_input[TILE_SIZE + halo + local_t] = input[input_idx];
-            } else {
-                shared_input[TILE_SIZE + halo + local_t] = T(0);
-            }
-        }
-    }
-
-    __syncthreads();
-
-    if (global_t >= seq_len) return;
-
-    // Compute convolution using shared weight
-    float sum = 0.0f;
-    if (is_causal) {
-        #pragma unroll
-        for (int k = 0; k < KERNEL_SIZE; k++) {
-            sum += static_cast<float>(shared_input[shared_idx - (KERNEL_SIZE - 1) + k]) * shared_weight[k];
-        }
-    } else {
-        #pragma unroll
-        for (int k = 0; k < KERNEL_SIZE; k++) {
-            sum += static_cast<float>(shared_input[shared_idx - half_kernel + k]) * shared_weight[k];
-        }
-    }
-    
-    // Add bias
-    if (bias != nullptr) {
-        sum += static_cast<float>(bias[c]);
-    }
-    
-    int output_idx = b * seq_len * channels + global_t * channels + c;
-    output[output_idx] = static_cast<T>(sum);
-}
-
-// Block-per-(batch,seq) depthwise algorithm (one block per output position, threads over channels).
-// Same parallelization as FasterTransformer WenetKernels; keeps existing params and layout.
-template <typename T>
-__global__ void depthwiseConv1DBlockPerPositionKernel(
-    const T* __restrict__ input,
-    const T* __restrict__ weight,
-    const T* __restrict__ bias,
-    T* __restrict__ output,
-    int batch_size,
-    int seq_len,
-    int channels,
-    int kernel_size,
-    int padding,
-    bool is_causal)
-{
     int c_id = threadIdx.x;
-    if (c_id >= channels) return;
-    int s_id = blockIdx.x % seq_len;
-    int b_id = blockIdx.x / seq_len;
+    int s_id = blockIdx.x;
+    int b_id = blockIdx.y;
+    int o_id = (blockIdx.y * gridDim.x + blockIdx.x) * channels + c_id;
+    
+    int s_start = s_id - padding;
+    int s_end = min(s_start + kernel_size, seq_len);
+    s_start = max(s_start, 0);
 
-    int s_start, s_end, k_start;
-    if (is_causal) {
-        s_start = max(0, s_id - (kernel_size - 1));
-        s_end   = s_id + 1;
-        k_start = (kernel_size - 1) - (s_id - s_start);
-    } else {
-        s_start = s_id - padding;
-        s_end   = min(s_start + kernel_size, seq_len);
-        s_start = max(s_start, 0);
-        k_start = max(padding - s_id, 0);
-    }
+    int k_start = max(padding - s_id, 0);
 
-    const T* in_ptr = input + b_id * seq_len * channels + c_id;
-    const T* w_ptr  = weight + c_id * kernel_size;
+    input += b_id * seq_len * channels + c_id;
+    weight += c_id;
 
     float val = 0.0f;
-    for (int i = s_start; i < s_end; ++i) {
-        int k = k_start + (i - s_start);
-        val += static_cast<float>(in_ptr[i * channels]) * static_cast<float>(w_ptr[k]);
-    }
-    if (bias != nullptr) {
-        val += static_cast<float>(bias[c_id]);
+    for (int i = s_start; i < s_end; i++) {
+        val += (float)input[i * channels] * (float)weight[(k_start + i - s_start) * channels];
     }
 
-    output[blockIdx.x * channels + c_id] = static_cast<T>(val);
+    if (bias != nullptr) {
+        val += (float)bias[c_id];
+    }
+    
+    output[o_id] = (T)val;
 }
+
 
 // =============================================================================
 // Pointwise (1x1) Convolution Kernel
@@ -597,69 +447,13 @@ __global__ void conv1DKernel(
 template <typename T>
 void invokeDepthwiseConv1DTyped(const void* input, const void* weight, const void* bias,
                                 void* output, int batch_size, int seq_len, int channels,
-                                int kernel_size, int padding, bool is_causal,
-                                cudaStream_t stream) {
-    // if (channels <= 1024) {
-    //     depthwiseConv1DBlockPerPositionKernel<T><<<batch_size * seq_len, channels, 0, stream>>>(
-    //         static_cast<const T*>(input), static_cast<const T*>(weight),
-    //         static_cast<const T*>(bias), static_cast<T*>(output),
-    //         batch_size, seq_len, channels, kernel_size, padding, is_causal);
-    //     return;
-    // }
-
-    int total_elements = batch_size * seq_len * channels;
-    int block_size     = 256;
-    int grid_size      = (total_elements + block_size - 1) / block_size;
-    constexpr int tile_size = 128;
-
-    switch (kernel_size) {
-        case 3: {
-            dim3 grid((seq_len + tile_size - 1) / tile_size, channels, batch_size);
-            int halo = is_causal ? 2 : 1;
-            int shared_size = (tile_size + 2 * halo) * sizeof(T) + 3 * sizeof(float);
-            depthwiseConv1DKernelOptimized<T, 3><<<grid, tile_size, shared_size, stream>>>(
-                static_cast<const T*>(input), static_cast<const T*>(weight),
-                static_cast<const T*>(bias), static_cast<T*>(output),
-                batch_size, seq_len, channels, padding, is_causal);
-            break;
-        }
-        case 7: {
-            dim3 grid((seq_len + tile_size - 1) / tile_size, channels, batch_size);
-            int halo = is_causal ? 6 : 3;
-            int shared_size = (tile_size + 2 * halo) * sizeof(T) + 7 * sizeof(float);
-            depthwiseConv1DKernelOptimized<T, 7><<<grid, tile_size, shared_size, stream>>>(
-                static_cast<const T*>(input), static_cast<const T*>(weight),
-                static_cast<const T*>(bias), static_cast<T*>(output),
-                batch_size, seq_len, channels, padding, is_causal);
-            break;
-        }
-        case 15: {
-            dim3 grid((seq_len + tile_size - 1) / tile_size, channels, batch_size);
-            int halo = is_causal ? 14 : 7;
-            int shared_size = (tile_size + 2 * halo) * sizeof(T) + 15 * sizeof(float);
-            depthwiseConv1DKernelOptimized<T, 15><<<grid, tile_size, shared_size, stream>>>(
-                static_cast<const T*>(input), static_cast<const T*>(weight),
-                static_cast<const T*>(bias), static_cast<T*>(output),
-                batch_size, seq_len, channels, padding, is_causal);
-            break;
-        }
-        case 31: {
-            dim3 grid((seq_len + tile_size - 1) / tile_size, channels, batch_size);
-            int halo = is_causal ? 30 : 15;
-            int shared_size = (tile_size + 2 * halo) * sizeof(T) + 31 * sizeof(float);
-            depthwiseConv1DKernelOptimized<T, 31><<<grid, tile_size, shared_size, stream>>>(
-                static_cast<const T*>(input), static_cast<const T*>(weight),
-                static_cast<const T*>(bias), static_cast<T*>(output),
-                batch_size, seq_len, channels, padding, is_causal);
-            break;
-        }
-        default:
-            depthwiseConv1DKernel<T><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const T*>(input), static_cast<const T*>(weight),
-                static_cast<const T*>(bias), static_cast<T*>(output),
-                batch_size, seq_len, channels, kernel_size, padding, is_causal);
-            break;
-    }
+                                int kernel_size, int padding, cudaStream_t stream) {
+    dim3 block_size(channels);
+    dim3 grid_size(seq_len + 2 * padding - kernel_size + 1, batch_size);
+    depthwiseConv1DKernel<T><<<grid_size, block_size, 0, stream>>>(
+        static_cast<const T*>(input), static_cast<const T*>(weight),
+        static_cast<const T*>(bias), static_cast<T*>(output),
+        batch_size, seq_len, channels, kernel_size, padding);
 }
 
 // =============================================================================
@@ -720,23 +514,22 @@ void invokeConv1D(const void* input, void* output, const void* weight, const voi
 
 void invokeDepthwiseConv1D(const void* input, const void* weight, const void* bias,
                            void* output, int batch_size, int seq_len, int channels,
-                           int kernel_size, int padding, bool is_causal,
-                           DataType dtype, cudaStream_t stream) {
+                           int kernel_size, int padding, DataType dtype, cudaStream_t stream) {
     switch (dtype) {
         case DataType::FP32:
             invokeDepthwiseConv1DTyped<float>(input, weight, bias, output,
                                               batch_size, seq_len, channels,
-                                              kernel_size, padding, is_causal, stream);
+                                              kernel_size, padding, stream);
             break;
         case DataType::FP16:
             invokeDepthwiseConv1DTyped<half>(input, weight, bias, output,
                                              batch_size, seq_len, channels,
-                                             kernel_size, padding, is_causal, stream);
+                                             kernel_size, padding, stream);
             break;
         case DataType::BF16:
             invokeDepthwiseConv1DTyped<__nv_bfloat16>(input, weight, bias, output,
                                                       batch_size, seq_len, channels,
-                                                      kernel_size, padding, is_causal, stream);
+                                                      kernel_size, padding, stream);
             break;
         default:
             throw std::runtime_error("Unsupported data type for DepthwiseConv1D");
@@ -1039,11 +832,11 @@ void freeConvState(void* state_buffer) {
 
 // Explicit template instantiations
 template void invokeDepthwiseConv1DTyped<float>(const void*, const void*, const void*,
-                                                 void*, int, int, int, int, int, bool, cudaStream_t);
+                                                 void*, int, int, int, int, int, cudaStream_t);
 template void invokeDepthwiseConv1DTyped<half>(const void*, const void*, const void*,
-                                                void*, int, int, int, int, int, bool, cudaStream_t);
+                                                void*, int, int, int, int, int, cudaStream_t);
 template void invokeDepthwiseConv1DTyped<__nv_bfloat16>(const void*, const void*, const void*,
-                                                         void*, int, int, int, int, int, bool, cudaStream_t);
+                                                         void*, int, int, int, int, int, cudaStream_t);
 
 } // namespace kernels
 } // namespace oasr

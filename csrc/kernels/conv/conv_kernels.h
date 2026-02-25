@@ -35,8 +35,7 @@ void invokeConv1D(const void* input, void* output, const void* weight, const voi
  */
 void invokeDepthwiseConv1D(const void* input, const void* weight, const void* bias,
                            void* output, int batch_size, int seq_len, int channels,
-                           int kernel_size, int padding, bool is_causal,
-                           DataType dtype, cudaStream_t stream);
+                           int kernel_size, int padding, DataType dtype, cudaStream_t stream);
 
 /**
  * @brief Pointwise (1x1) convolution
@@ -108,8 +107,7 @@ void invokeBatchNormSwish(const void* input, void* output,
 template <typename T>
 void invokeDepthwiseConv1DTyped(const void* input, const void* weight, const void* bias,
                                 void* output, int batch_size, int seq_len, int channels,
-                                int kernel_size, int padding, bool is_causal,
-                                cudaStream_t stream);
+                                int kernel_size, int padding, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace oasr
