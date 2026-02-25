@@ -116,6 +116,27 @@ if(BUILD_PYTHON)
         )
         FetchContent_MakeAvailable(pybind11)
     endif()
+
+    # PyTorch (libtorch) — required for torch::Tensor in pybind bindings.
+    # First try to discover the prefix via Python import (works for direct
+    # cmake builds).  When building inside pip's isolated build env the
+    # import will fail; in that case we rely on CMAKE_PREFIX_PATH being
+    # set by setup.py.
+    execute_process(
+        COMMAND ${Python_EXECUTABLE} -c "import torch; print(torch.utils.cmake_prefix_path)"
+        OUTPUT_VARIABLE TORCH_CMAKE_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE TORCH_FIND_RESULT
+    )
+    if(TORCH_FIND_RESULT EQUAL 0)
+        list(APPEND CMAKE_PREFIX_PATH "${TORCH_CMAKE_PREFIX}")
+    endif()
+    find_package(Torch REQUIRED)
+    find_library(TORCH_PYTHON_LIB torch_python
+        PATHS "${TORCH_INSTALL_PREFIX}/lib"
+        REQUIRED)
+    message(STATUS "Found PyTorch: ${Torch_DIR}")
+    message(STATUS "Found torch_python: ${TORCH_PYTHON_LIB}")
 endif()
 
 # =============================================================================
@@ -214,9 +235,11 @@ if(BUILD_PYTHON)
     target_include_directories(_C PRIVATE
         ${CMAKE_SOURCE_DIR}/csrc
         ${CUDAToolkit_INCLUDE_DIRS}
+        ${TORCH_INCLUDE_DIRS}
     )
     
-    target_link_libraries(_C PRIVATE oasr_core)
+    target_link_libraries(_C PRIVATE oasr_core ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIB})
+    target_compile_options(_C PRIVATE ${TORCH_CXX_FLAGS})
 
     # Set output directory for the Python module (never write into source tree).
     # - When built via setuptools (setup.py), CMAKE_LIBRARY_OUTPUT_DIRECTORY is

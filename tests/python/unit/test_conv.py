@@ -16,7 +16,6 @@ sys.path.insert(0, 'python')
 def oasr():
     """Import oasr module."""
     import oasr
-    # Import types from _C module if needed
     try:
         from oasr import ConvType, ActivationType
     except ImportError:
@@ -37,64 +36,71 @@ class TestDepthwiseConv1D:
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
     def test_depthwise_conv1d(self, oasr, batch_size, seq_len, channels, kernel_size, dtype):
         """Test DepthwiseConv1D against PyTorch reference."""
-        padding = kernel_size // 2
+        padding = (kernel_size - 1) // 2
         
         x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
-        weight = torch.randn(channels, kernel_size, device='cuda', dtype=dtype)
+        weight = torch.randn(kernel_size, channels, device='cuda', dtype=dtype)
         bias = torch.randn(channels, device='cuda', dtype=dtype)
-        output = torch.empty_like(x)
         
         dtype_map = {
             torch.float32: oasr.DataType.FP32,
             torch.float16: oasr.DataType.FP16,
         }
         
-        oasr.kernels.conv.depthwise_conv1d(
-            x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
+        output = oasr.kernels.conv.depthwise_conv1d(
+            x, weight, bias,
             batch_size, seq_len, channels, kernel_size, padding,
-            False,  # is_causal
             dtype_map[dtype]
         )
         oasr.synchronize()
         
         # PyTorch reference
         x_nchw = x.permute(0, 2, 1)  # [batch, channels, seq_len]
-        weight_pt = weight.view(channels, 1, kernel_size)
-        ref_nchw = F.conv1d(x_nchw, weight_pt, bias, padding=padding, groups=channels)
+        weight_pt = weight.permute(1, 0).view(channels, 1, kernel_size) # [channels, 1, kernel_size]
+        ref_nchw = F.conv1d(x_nchw, weight_pt, bias=bias, stride=1, padding=padding, groups=channels)
+
         expected = ref_nchw.permute(0, 2, 1)  # [batch, seq_len, channels]
         
-        # FP16 with large kernels accumulates more error
         rtol = 1e-4 if dtype == torch.float32 else 5e-2
         atol = 1e-4 if dtype == torch.float32 else 5e-2
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
-    @pytest.mark.parametrize("kernel_size", [3, 7, 15])
-    def test_depthwise_conv1d_causal(self, oasr, kernel_size):
+    @pytest.mark.parametrize("batch_size,seq_len,channels,kernel_size", [
+        (1, 64, 128, 3),
+        (2, 128, 256, 7),
+        (4, 256, 512, 31),
+    ])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_depthwise_conv1d_causal(self, oasr, batch_size, seq_len, channels, kernel_size, dtype):
         """Test causal DepthwiseConv1D."""
-        batch_size, seq_len, channels = 2, 64, 128
-        dtype = torch.float32
-        
-        x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
-        weight = torch.randn(channels, kernel_size, device='cuda', dtype=dtype)
+        padding = 0
+        lorder = kernel_size - 1
+
+        x = torch.randn(batch_size, seq_len + lorder, channels, device='cuda', dtype=dtype)
+        weight = torch.randn(kernel_size, channels, device='cuda', dtype=dtype)
         bias = torch.randn(channels, device='cuda', dtype=dtype)
-        output = torch.empty_like(x)
+
+        dtype_map = {
+            torch.float32: oasr.DataType.FP32,
+            torch.float16: oasr.DataType.FP16,
+        }
         
-        oasr.kernels.conv.depthwise_conv1d(
-            x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
-            batch_size, seq_len, channels, kernel_size, 0,
-            True,  # is_causal
-            oasr.DataType.FP32
+        output = oasr.kernels.conv.depthwise_conv1d(
+            x, weight, bias,
+            batch_size, seq_len + lorder, channels, kernel_size, padding,
+            dtype_map[dtype]
         )
         oasr.synchronize()
         
         # Causal = left padding only
         x_nchw = x.permute(0, 2, 1)
-        weight_pt = weight.view(channels, 1, kernel_size)
-        x_padded = F.pad(x_nchw, (kernel_size - 1, 0))
-        ref_nchw = F.conv1d(x_padded, weight_pt, bias, groups=channels)
+        weight_pt = weight.permute(1, 0).view(channels, 1, kernel_size)
+        ref_nchw = F.conv1d(x_nchw, weight_pt, bias=bias, stride=1, padding=padding, groups=channels)
         expected = ref_nchw.permute(0, 2, 1)
-        
-        torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
+
+        rtol = 1e-4 if dtype == torch.float32 else 5e-2
+        atol = 1e-4 if dtype == torch.float32 else 5e-2
+        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
 
 class TestPointwiseConv1D:
@@ -112,10 +118,9 @@ class TestPointwiseConv1D:
         x = torch.randn(batch_size, seq_len, in_ch, device='cuda', dtype=dtype)
         weight = torch.randn(out_ch, in_ch, device='cuda', dtype=dtype)
         bias = torch.randn(out_ch, device='cuda', dtype=dtype)
-        output = torch.empty(batch_size, seq_len, out_ch, device='cuda', dtype=dtype)
         
-        oasr.kernels.conv.pointwise_conv1d(
-            x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
+        output = oasr.kernels.conv.pointwise_conv1d(
+            x, weight, bias,
             batch_size, seq_len, in_ch, out_ch,
             oasr.ActivationType.SWISH, False,
             oasr.DataType.FP32
@@ -138,15 +143,14 @@ class TestGLU:
     def test_glu(self, oasr, batch_size, seq_len, channels, dtype):
         """Test GLU against F.glu."""
         x = torch.randn(batch_size, seq_len, 2 * channels, device='cuda', dtype=dtype)
-        output = torch.empty(batch_size, seq_len, channels, device='cuda', dtype=dtype)
         
         dtype_map = {
             torch.float32: oasr.DataType.FP32,
             torch.float16: oasr.DataType.FP16,
         }
         
-        oasr.kernels.conv.glu(
-            x.data_ptr(), output.data_ptr(),
+        output = oasr.kernels.conv.glu(
+            x,
             batch_size, seq_len, channels,
             dtype_map[dtype]
         )
@@ -170,10 +174,9 @@ class TestSwish:
         dtype = torch.float32
         
         x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
-        output = torch.empty_like(x)
         
-        oasr.kernels.conv.swish(
-            x.data_ptr(), output.data_ptr(),
+        output = oasr.kernels.conv.swish(
+            x,
             batch_size, seq_len, channels,
             oasr.DataType.FP32
         )
@@ -201,12 +204,11 @@ class TestBatchNormSwish:
         beta = torch.randn(channels, device='cuda', dtype=dtype)
         running_mean = torch.randn(channels, device='cuda', dtype=dtype)
         running_var = torch.abs(torch.randn(channels, device='cuda', dtype=dtype)) + 0.1
-        output = torch.empty_like(x)
         
-        oasr.kernels.conv.batch_norm_swish(
-            x.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(), beta.data_ptr(),
-            running_mean.data_ptr(), running_var.data_ptr(),
+        output = oasr.kernels.conv.batch_norm_swish(
+            x,
+            gamma, beta,
+            running_mean, running_var,
             batch_size, seq_len, channels,
             eps, oasr.DataType.FP32
         )
@@ -236,11 +238,8 @@ class TestConv1D:
         weight = torch.randn(out_ch, in_ch, kernel_size, device='cuda', dtype=dtype)
         bias = torch.randn(out_ch, device='cuda', dtype=dtype)
         
-        out_len = (seq_len + 2 * padding - kernel_size) // stride + 1
-        output = torch.empty(batch_size, out_len, out_ch, device='cuda', dtype=dtype)
-        
-        oasr.kernels.conv.conv1d(
-            x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
+        output = oasr.kernels.conv.conv1d(
+            x, weight, bias,
             batch_size, seq_len, in_ch, out_ch,
             kernel_size, stride, padding, 1, 1,  # dilation=1, groups=1
             oasr.ConvType.STANDARD, oasr.DataType.FP32,
@@ -254,7 +253,6 @@ class TestConv1D:
         ref_nchw = F.conv1d(x_nchw, weight, bias, stride=stride, padding=padding)
         expected = ref_nchw.permute(0, 2, 1)
         
-        # Larger tolerance due to different accumulation order
         torch.testing.assert_close(output, expected, rtol=5e-2, atol=5e-2)
 
 
@@ -279,35 +277,30 @@ class TestConformerConvPattern:
         pw2_bias = torch.randn(d_model, device='cuda', dtype=dtype)
         
         # OASR pipeline
-        pw1_out = torch.empty(batch_size, seq_len, 2 * d_model, device='cuda', dtype=dtype)
-        oasr.kernels.conv.pointwise_conv1d(
-            x.data_ptr(), pw1_weight.data_ptr(), pw1_bias.data_ptr(), pw1_out.data_ptr(),
+        pw1_out = oasr.kernels.conv.pointwise_conv1d(
+            x, pw1_weight, pw1_bias,
             batch_size, seq_len, d_model, 2 * d_model,
             oasr.ActivationType.SWISH, False, oasr.DataType.FP32
         )
         
-        glu_out = torch.empty(batch_size, seq_len, d_model, device='cuda', dtype=dtype)
-        oasr.kernels.conv.glu(
-            pw1_out.data_ptr(), glu_out.data_ptr(),
+        glu_out = oasr.kernels.conv.glu(
+            pw1_out,
             batch_size, seq_len, d_model, oasr.DataType.FP32
         )
         
-        dw_out = torch.empty(batch_size, seq_len, d_model, device='cuda', dtype=dtype)
-        oasr.kernels.conv.depthwise_conv1d(
-            glu_out.data_ptr(), dw_weight.data_ptr(), dw_bias.data_ptr(), dw_out.data_ptr(),
+        dw_out = oasr.kernels.conv.depthwise_conv1d(
+            glu_out, dw_weight, dw_bias,
             batch_size, seq_len, d_model, kernel_size, kernel_size // 2,
-            False, oasr.DataType.FP32
+            oasr.DataType.FP32
         )
         
-        swish_out = torch.empty_like(dw_out)
-        oasr.kernels.conv.swish(
-            dw_out.data_ptr(), swish_out.data_ptr(),
+        swish_out = oasr.kernels.conv.swish(
+            dw_out,
             batch_size, seq_len, d_model, oasr.DataType.FP32
         )
         
-        output = torch.empty(batch_size, seq_len, d_model, device='cuda', dtype=dtype)
-        oasr.kernels.conv.pointwise_conv1d(
-            swish_out.data_ptr(), pw2_weight.data_ptr(), pw2_bias.data_ptr(), output.data_ptr(),
+        output = oasr.kernels.conv.pointwise_conv1d(
+            swish_out, pw2_weight, pw2_bias,
             batch_size, seq_len, d_model, d_model,
             oasr.ActivationType.SWISH, False, oasr.DataType.FP32
         )
@@ -323,7 +316,6 @@ class TestConformerConvPattern:
         ref_swish = F.silu(ref_dw)
         expected = F.linear(ref_swish, pw2_weight, pw2_bias)
         
-        # Multiple chained ops accumulate error
         torch.testing.assert_close(output, expected, rtol=5e-3, atol=5e-3)
 
 

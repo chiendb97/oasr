@@ -37,18 +37,15 @@ class TestLayerNorm:
         x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
         gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
         beta = torch.randn(hidden_size, device='cuda', dtype=dtype)
-        output = torch.empty_like(x)
         
-        # Get DataType enum
         dtype_map = {
             torch.float32: oasr.DataType.FP32,
             torch.float16: oasr.DataType.FP16,
             torch.bfloat16: oasr.DataType.BF16,
         }
         
-        oasr.kernels.norm.layer_norm(
-            x.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(), beta.data_ptr(),
+        output = oasr.kernels.norm.layer_norm(
+            x, gamma, beta,
             batch_size, seq_len, hidden_size,
             eps, dtype_map[dtype]
         )
@@ -60,7 +57,6 @@ class TestLayerNorm:
         layer_norm.bias.data = beta.clone()
         expected = layer_norm(x)
         
-        # Use torch.testing.assert_close for verification
         rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
@@ -72,11 +68,9 @@ class TestLayerNorm:
         
         x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
         gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
-        output = torch.empty_like(x)
         
-        oasr.kernels.norm.layer_norm(
-            x.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(), 0,  # nullptr for beta
+        output = oasr.kernels.norm.layer_norm(
+            x, gamma, None,
             batch_size, seq_len, hidden_size,
             eps, oasr.DataType.FP32
         )
@@ -106,16 +100,14 @@ class TestRMSNorm:
         x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
         gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
         beta = torch.randn(hidden_size, device='cuda', dtype=dtype)
-        output = torch.empty_like(x)
         
         dtype_map = {
             torch.float32: oasr.DataType.FP32,
             torch.float16: oasr.DataType.FP16,
         }
         
-        oasr.kernels.norm.rms_norm(
-            x.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(), beta.data_ptr(),
+        output = oasr.kernels.norm.rms_norm(
+            x, gamma, beta,
             batch_size, seq_len, hidden_size,
             eps, dtype_map[dtype]
         )
@@ -145,11 +137,10 @@ class TestAddLayerNorm:
         residual = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
         gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
         beta = torch.randn(hidden_size, device='cuda', dtype=dtype)
-        output = torch.empty_like(x)
         
-        oasr.kernels.norm.add_layer_norm(
-            x.data_ptr(), residual.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(), beta.data_ptr(),
+        output = oasr.kernels.norm.add_layer_norm(
+            x, residual,
+            gamma, beta,
             batch_size, seq_len, hidden_size,
             eps, oasr.DataType.FP32
         )
@@ -181,12 +172,10 @@ class TestBatchNorm1D:
         beta = torch.randn(channels, device='cuda', dtype=dtype)
         running_mean = torch.randn(channels, device='cuda', dtype=dtype)
         running_var = torch.abs(torch.randn(channels, device='cuda', dtype=dtype)) + 0.1
-        output = torch.empty_like(x)
         
-        oasr.kernels.norm.batch_norm_1d(
-            x.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(), beta.data_ptr(),
-            running_mean.data_ptr(), running_var.data_ptr(),
+        output = oasr.kernels.norm.batch_norm_1d(
+            x, gamma, beta,
+            running_mean, running_var,
             batch_size, seq_len, channels,
             eps, oasr.DataType.FP32
         )
@@ -215,11 +204,9 @@ class TestGroupNorm:
         x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
         gamma = torch.randn(channels, device='cuda', dtype=dtype)
         beta = torch.randn(channels, device='cuda', dtype=dtype)
-        output = torch.empty_like(x)
         
-        oasr.kernels.norm.group_norm(
-            x.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(), beta.data_ptr(),
+        output = oasr.kernels.norm.group_norm(
+            x, gamma, beta,
             batch_size, seq_len, channels, num_groups,
             eps, oasr.DataType.FP32
         )

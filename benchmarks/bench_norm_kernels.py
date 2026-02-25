@@ -23,21 +23,11 @@ import oasr
 # =============================================================================
 
 def profile_kernel(name: str, fn, warmup: int = 3, profile_iters: int = 1):
-    """
-    Run kernel for profiling with Nsight Compute.
-    
-    Args:
-        name: Kernel name for NVTX range
-        fn: Kernel function to profile
-        warmup: Number of warmup iterations
-        profile_iters: Number of iterations to profile
-    """
-    # Warmup
+    """Run kernel for profiling with Nsight Compute."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     
-    # Profile iterations with NVTX markers
     torch.cuda.nvtx.range_push(name)
     for _ in range(profile_iters):
         fn()
@@ -55,14 +45,12 @@ def setup_layer_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
     gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
     beta = torch.randn(hidden_size, device='cuda', dtype=dtype)
-    output = torch.empty_like(x)
     
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.norm.layer_norm(
-            x.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(), beta.data_ptr(),
+        return oasr.kernels.norm.layer_norm(
+            x, gamma, beta,
             batch_size, seq_len, hidden_size,
             eps, dtype_map[dtype]
         )
@@ -82,14 +70,12 @@ def setup_rms_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     eps = 1e-5
     x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
     gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
-    output = torch.empty_like(x)
     
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.norm.rms_norm(
-            x.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(),
+        return oasr.kernels.norm.rms_norm(
+            x, gamma, None,
             batch_size, seq_len, hidden_size,
             eps, dtype_map[dtype]
         )
@@ -108,14 +94,13 @@ def setup_add_layer_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     residual = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
     gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
     beta = torch.randn(hidden_size, device='cuda', dtype=dtype)
-    output = torch.empty_like(x)
     
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.norm.add_layer_norm(
-            x.data_ptr(), residual.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(), beta.data_ptr(),
+        return oasr.kernels.norm.add_layer_norm(
+            x, residual,
+            gamma, beta,
             batch_size, seq_len, hidden_size,
             eps, dtype_map[dtype]
         )
@@ -136,15 +121,13 @@ def setup_group_norm(batch_size, seq_len, channels, num_groups, dtype=torch.floa
     x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
     gamma = torch.randn(channels, device='cuda', dtype=dtype)
     beta = torch.randn(channels, device='cuda', dtype=dtype)
-    output = torch.empty_like(x)
     
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     channels_per_group = channels // num_groups
     
     def oasr_fn():
-        oasr.kernels.norm.group_norm(
-            x.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(), beta.data_ptr(),
+        return oasr.kernels.norm.group_norm(
+            x, gamma, beta,
             batch_size, seq_len, channels, num_groups,
             eps, dtype_map[dtype]
         )
@@ -168,15 +151,13 @@ def setup_batch_norm(batch_size, seq_len, channels, dtype=torch.float32):
     beta = torch.randn(channels, device='cuda', dtype=dtype)
     running_mean = torch.randn(channels, device='cuda', dtype=dtype)
     running_var = torch.abs(torch.randn(channels, device='cuda', dtype=dtype)) + 0.1
-    output = torch.empty_like(x)
     
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.norm.batch_norm_1d(
-            x.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(), beta.data_ptr(),
-            running_mean.data_ptr(), running_var.data_ptr(),
+        return oasr.kernels.norm.batch_norm_1d(
+            x, gamma, beta,
+            running_mean, running_var,
             batch_size, seq_len, channels,
             eps, dtype_map[dtype]
         )
@@ -338,7 +319,6 @@ def benchmark_batch_norm():
 # Profiling functions
 # =============================================================================
 
-# Default profiling configs (B=64, T=250)
 PROFILE_CONFIGS = {
     'layer_norm': (64, 250, 256),
     'rms_norm': (64, 250, 256),
@@ -349,15 +329,7 @@ PROFILE_CONFIGS = {
 
 
 def profile_kernels(kernels: list, target: str = 'both', warmup: int = 3, iters: int = 1):
-    """
-    Profile specified kernels for Nsight Compute.
-    
-    Args:
-        kernels: List of kernel names to profile
-        target: Which implementation to profile ('oasr', 'pytorch', or 'both')
-        warmup: Warmup iterations
-        iters: Profile iterations
-    """
+    """Profile specified kernels for Nsight Compute."""
     print("=" * 70)
     print("OASR Normalization Kernels - Profiling Mode")
     print("=" * 70)
@@ -383,12 +355,10 @@ def profile_kernels(kernels: list, target: str = 'both', warmup: int = 3, iters:
         
         oasr_fn, pytorch_fn = setup_funcs[kernel_name]()
         
-        # Profile OASR kernel
         if target in ('oasr', 'both'):
             print(f"  Running OASR kernel...")
             profile_kernel(f"oasr_{kernel_name}", oasr_fn, warmup=warmup, profile_iters=iters)
         
-        # Profile PyTorch reference
         if target in ('pytorch', 'both'):
             print(f"  Running PyTorch kernel...")
             profile_kernel(f"pytorch_{kernel_name}", pytorch_fn, warmup=warmup, profile_iters=iters)
@@ -416,15 +386,6 @@ Examples:
   # Profile specific kernel with Nsight Compute (OASR only)
   ncu --set full -o layernorm_profile python bench_norm_kernels.py --profile --kernel layer_norm --target oasr
 
-  # Profile PyTorch implementation only
-  python bench_norm_kernels.py --profile --kernel layer_norm --target pytorch
-
-  # Profile both implementations (default)
-  python bench_norm_kernels.py --profile --kernel layer_norm --target both
-
-  # Profile multiple kernels
-  python bench_norm_kernels.py --profile --kernel layer_norm rms_norm
-
   # Profile all kernels
   python bench_norm_kernels.py --profile --kernel all
 
@@ -433,39 +394,26 @@ Available kernels:
         """
     )
     
-    parser.add_argument(
-        '--profile', action='store_true',
-        help='Run in profiling mode (single iterations for ncu)'
-    )
-    parser.add_argument(
-        '--kernel', nargs='+', default=['all'],
-        help='Kernel(s) to profile (use "all" for all kernels)'
-    )
-    parser.add_argument(
-        '--target', choices=['oasr', 'pytorch', 'both'], default='oasr',
-        help='Which implementation to profile: oasr, pytorch, or both (default: oasr)'
-    )
-    parser.add_argument(
-        '--warmup', type=int, default=3,
-        help='Number of warmup iterations for profiling (default: 3)'
-    )
-    parser.add_argument(
-        '--iters', type=int, default=1,
-        help='Number of profile iterations (default: 1)'
-    )
+    parser.add_argument('--profile', action='store_true',
+        help='Run in profiling mode (single iterations for ncu)')
+    parser.add_argument('--kernel', nargs='+', default=['all'],
+        help='Kernel(s) to profile (use "all" for all kernels)')
+    parser.add_argument('--target', choices=['oasr', 'pytorch', 'both'], default='oasr',
+        help='Which implementation to profile (default: oasr)')
+    parser.add_argument('--warmup', type=int, default=3,
+        help='Number of warmup iterations for profiling (default: 3)')
+    parser.add_argument('--iters', type=int, default=1,
+        help='Number of profile iterations (default: 1)')
     
     args = parser.parse_args()
     
     if args.profile:
-        # Profiling mode
         if 'all' in args.kernel:
             kernels = list(PROFILE_CONFIGS.keys())
         else:
             kernels = args.kernel
-        
         profile_kernels(kernels, target=args.target, warmup=args.warmup, iters=args.iters)
     else:
-        # Benchmark mode
         print("=" * 70)
         print("OASR Normalization Kernels - Performance Benchmarks")
         print("=" * 70)

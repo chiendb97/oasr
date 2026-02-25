@@ -120,7 +120,7 @@ TEST_F(TestDepthwiseConv1D, DepthwiseConv1D_1_64_128_3) {
 
     invokeDepthwiseConv1D(d_x, d_w, d_b, d_out,
                           batch_size, seq_len, channels, kernel_size, padding,
-                          false, DataType::FP32, nullptr);
+                          DataType::FP32, nullptr);
 
     OASR_CUDA_CHECK(cudaMemcpy(out_host.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < n; ++i)

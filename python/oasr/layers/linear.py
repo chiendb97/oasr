@@ -4,57 +4,63 @@
 
 from __future__ import annotations
 
-from typing import Optional
+import math
+
+import torch
 
 from oasr import kernels
 from oasr.utils import _torch_dtype_to_oasr
 
 
 class Linear:
-    """Wrapper for GEMM kernel: D = alpha * A @ B + beta * C."""
+    """Linear layer: y = x @ weight + bias, backed by a GEMM kernel."""
 
-    def __init__(self, alpha: float = 1.0, beta: float = 0.0):
-        self.alpha = alpha
-        self.beta = beta
-
-    def forward(
+    def __init__(
         self,
-        A: "torch.Tensor",
-        B: "torch.Tensor",
-        C: Optional["torch.Tensor"] = None,
-    ) -> "torch.Tensor":
-        """D = alpha * A @ B + beta * C. A: (M, K), B: (K, N), C optional (M, N)."""
-        import torch
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ):
+        self.in_features = in_features
+        self.out_features = out_features
 
-        M, K = A.shape
-        _, N = B.shape
-        D = torch.empty(M, N, device=A.device, dtype=A.dtype)
-        oasr_dtype = _torch_dtype_to_oasr(A.dtype)
-
-        params = kernels.gemm.GemmParams()
-        params.A = A.data_ptr()
-        params.B = B.data_ptr()
-        params.D = D.data_ptr()
-        params.M, params.N, params.K = M, N, K
-        params.lda, params.ldb, params.ldd = K, N, N
-        params.alpha = self.alpha
-        params.beta = self.beta
-        params.dtype_a = params.dtype_b = params.dtype_d = oasr_dtype
-        if C is not None:
-            params.C = C.data_ptr()
-            params.ldc = N
-            params.dtype_c = oasr_dtype
+        self.weight = torch.empty(in_features, out_features, device=device, dtype=dtype)
+        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if bias:
+            bound = 1 / math.sqrt(in_features) if in_features > 0 else 0
+            self.bias = torch.empty(out_features, device=device, dtype=dtype)
+            torch.nn.init.uniform_(self.bias, -bound, bound)
         else:
-            params.C = 0
-            params.ldc = N
+            self.bias = None
 
-        status = kernels.gemm.invoke_gemm(params)
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        """x: (*, in_features) -> (*, out_features)."""
+        input_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features)
+        M, K = x_2d.shape
+        N = self.out_features
+        oasr_dtype = _torch_dtype_to_oasr(x.dtype)
+
+        D, status = kernels.gemm.invoke_gemm(
+            x_2d, self.weight,
+            M, N, K, K, N, N,
+            1.0, 0.0,
+            kernels.gemm.TransposeOp.NoTranspose,
+            kernels.gemm.TransposeOp.NoTranspose,
+            oasr_dtype,
+        )
         if status != kernels.gemm.GemmStatus.SUCCESS:
             raise RuntimeError(f"GEMM failed: {kernels.gemm.get_gemm_status_string(status)}")
-        return D
 
-    def __call__(self, A, B, C=None):
-        return self.forward(A, B, C)
+        if self.bias is not None:
+            D += self.bias
+
+        return D.reshape(*input_shape[:-1], N)
+
+    def __call__(self, x):
+        return self.forward(x)
 
 
 __all__ = ["Linear"]

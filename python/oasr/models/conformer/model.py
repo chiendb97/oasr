@@ -10,6 +10,7 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import nn
 
+from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d
 from oasr.layers.norm import LayerNorm, RMSNorm
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention, T_CACHE
 
@@ -73,7 +74,7 @@ class ConvolutionModule(nn.Module):
         self,
         channels: int,
         kernel_size: int = 15,
-        activation: nn.Module | None = None,
+        activation_type: str = "swish",
         norm: str = "batch_norm",
         causal: bool = False,
         bias: bool = True,
@@ -81,8 +82,8 @@ class ConvolutionModule(nn.Module):
         conv_inner_factor: int = 2,
     ):
         super().__init__()
-        self.pointwise_conv1 = nn.Conv1d(
-            channels, conv_inner_factor * channels, kernel_size=1, stride=1, padding=0, bias=bias
+        self.pointwise_conv1 = PointwiseConv1d(
+            channels, conv_inner_factor * channels, activation=activation_type, fuse_activation=True
         )
         if causal:
             padding = 0
@@ -93,13 +94,10 @@ class ConvolutionModule(nn.Module):
             self.lorder = 0
 
         inner_channels = conv_inner_factor * channels // 2
-        self.depthwise_conv = nn.Conv1d(
-            inner_channels,
-            inner_channels,
+        self.depthwise_conv = DepthwiseConv1d(
+            channels,
             kernel_size,
-            stride=1,
             padding=padding,
-            groups=inner_channels,
             bias=bias,
         )
 
@@ -115,8 +113,8 @@ class ConvolutionModule(nn.Module):
                 else RMSNorm(inner_channels, eps=norm_eps)
             )
 
-        self.pointwise_conv2 = nn.Conv1d(inner_channels, channels, kernel_size=1, stride=1, padding=0, bias=bias)
-        self.activation = activation if activation is not None else nn.SiLU()
+        self.pointwise_conv2 = PointwiseConv1d(inner_channels, channels, fuse_activation=False, bias=bias)
+        self.activation = _get_activation(activation_type)
 
     def forward(
         self,
@@ -137,7 +135,6 @@ class ConvolutionModule(nn.Module):
         else:
             new_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
         x = self.pointwise_conv1(x)
-        x = nn.functional.glu(x, dim=1)
         x = self.depthwise_conv(x)
         if self.use_layer_norm:
             x = x.transpose(1, 2)
@@ -273,6 +270,7 @@ class ConformerEncoderLayer(nn.Module):
         self.size = size
         self.normalize_before = normalize_before
         norm_class = nn.LayerNorm if layer_norm_type == "layer_norm" else _rms_norm_class()
+        norm_class = LayerNorm if layer_norm_type == "layer_norm" else RMSNorm
         self.norm_ff = norm_class(size, eps=norm_eps)
         self.norm_mha = norm_class(size, eps=norm_eps)
         if feed_forward_macaron is not None:
@@ -354,7 +352,7 @@ class ConformerEncoder(nn.Module):
             raise NotImplementedError(f"input_layer={config.input_layer}")
         self.normalize_before = config.normalize_before
         self.final_norm = config.final_norm
-        norm_class = nn.LayerNorm if config.layer_norm_type == "layer_norm" else _rms_norm_class()
+        norm_class = LayerNorm if config.layer_norm_type == "layer_norm" else RMSNorm
         self.after_norm = norm_class(config.output_size, eps=config.norm_eps)
         activation = _get_activation(config.activation_type)
 
@@ -385,7 +383,7 @@ class ConformerEncoder(nn.Module):
                 conv = ConvolutionModule(
                     config.output_size,
                     config.cnn_module_kernel,
-                    activation=activation,
+                    activation_type=config.activation_type,
                     norm=config.cnn_module_norm,
                     causal=config.causal,
                     bias=config.conv_bias,

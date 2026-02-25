@@ -84,6 +84,7 @@ def test_convolution_module_matches_wenet(
     torch.manual_seed(1)
     # Use SiLU to match Conformer's swish
     activation = torch.nn.SiLU()
+    activation_type = "silu"
 
     ref = wenet_conv.ConvolutionModule(
         channels=channels,
@@ -98,7 +99,7 @@ def test_convolution_module_matches_wenet(
     impl = ConvolutionModule(
         channels=channels,
         kernel_size=kernel_size,
-        activation=activation,
+        activation_type=activation_type,
         norm="batch_norm",
         causal=causal,
         bias=True,

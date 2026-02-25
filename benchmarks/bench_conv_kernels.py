@@ -18,7 +18,6 @@ import torch.nn.functional as F
 
 import oasr
 
-# Import types
 try:
     from oasr import ConvType, ActivationType
 except ImportError:
@@ -32,21 +31,11 @@ except ImportError:
 # =============================================================================
 
 def profile_kernel(name: str, fn, warmup: int = 3, profile_iters: int = 1):
-    """
-    Run kernel for profiling with Nsight Compute.
-    
-    Args:
-        name: Kernel name for NVTX range
-        fn: Kernel function to profile
-        warmup: Number of warmup iterations
-        profile_iters: Number of iterations to profile
-    """
-    # Warmup
+    """Run kernel for profiling with Nsight Compute."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     
-    # Profile iterations with NVTX markers
     torch.cuda.nvtx.range_push(name)
     for _ in range(profile_iters):
         fn()
@@ -64,18 +53,16 @@ def setup_depthwise_conv1d(batch_size, seq_len, channels, kernel_size, dtype=tor
     x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
     weight = torch.randn(channels, kernel_size, device='cuda', dtype=dtype)
     bias = torch.randn(channels, device='cuda', dtype=dtype)
-    output = torch.empty_like(x)
     
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.conv.depthwise_conv1d(
-            x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
+        return oasr.kernels.conv.depthwise_conv1d(
+            x, weight, bias,
             batch_size, seq_len, channels, kernel_size, padding,
-            False, dtype_map[dtype]
+            dtype_map[dtype]
         )
     
-    # PyTorch reference
     x_nchw = x.permute(0, 2, 1).contiguous()
     weight_pt = weight.view(channels, 1, kernel_size)
     
@@ -90,15 +77,14 @@ def setup_depthwise_conv1d_causal(batch_size, seq_len, channels, kernel_size, dt
     x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
     weight = torch.randn(channels, kernel_size, device='cuda', dtype=dtype)
     bias = torch.randn(channels, device='cuda', dtype=dtype)
-    output = torch.empty_like(x)
     
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.conv.depthwise_conv1d(
-            x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
+        return oasr.kernels.conv.depthwise_conv1d(
+            x, weight, bias,
             batch_size, seq_len, channels, kernel_size, 0,
-            True, dtype_map[dtype]
+            dtype_map[dtype]
         )
     
     x_nchw = x.permute(0, 2, 1).contiguous()
@@ -116,13 +102,12 @@ def setup_pointwise_conv1d(batch_size, seq_len, in_ch, out_ch, dtype=torch.float
     x = torch.randn(batch_size, seq_len, in_ch, device='cuda', dtype=dtype)
     weight = torch.randn(out_ch, in_ch, device='cuda', dtype=dtype)
     bias = torch.randn(out_ch, device='cuda', dtype=dtype)
-    output = torch.empty(batch_size, seq_len, out_ch, device='cuda', dtype=dtype)
     
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.conv.pointwise_conv1d(
-            x.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
+        return oasr.kernels.conv.pointwise_conv1d(
+            x, weight, bias,
             batch_size, seq_len, in_ch, out_ch,
             oasr.ActivationType.SWISH, False, dtype_map[dtype]
         )
@@ -136,13 +121,12 @@ def setup_pointwise_conv1d(batch_size, seq_len, in_ch, out_ch, dtype=torch.float
 def setup_glu(batch_size, seq_len, channels, dtype=torch.float16):
     """Setup tensors for GLU."""
     x = torch.randn(batch_size, seq_len, 2 * channels, device='cuda', dtype=dtype)
-    output = torch.empty(batch_size, seq_len, channels, device='cuda', dtype=dtype)
     
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.conv.glu(
-            x.data_ptr(), output.data_ptr(),
+        return oasr.kernels.conv.glu(
+            x,
             batch_size, seq_len, channels, dtype_map[dtype]
         )
     
@@ -155,13 +139,12 @@ def setup_glu(batch_size, seq_len, channels, dtype=torch.float16):
 def setup_swish(batch_size, seq_len, channels, dtype=torch.float16):
     """Setup tensors for Swish."""
     x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
-    output = torch.empty_like(x)
     
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.conv.swish(
-            x.data_ptr(), output.data_ptr(),
+        return oasr.kernels.conv.swish(
+            x,
             batch_size, seq_len, channels, dtype_map[dtype]
         )
     
@@ -179,15 +162,14 @@ def setup_batch_norm_swish(batch_size, seq_len, channels, dtype=torch.float16):
     beta = torch.randn(channels, device='cuda', dtype=dtype)
     running_mean = torch.randn(channels, device='cuda', dtype=dtype)
     running_var = torch.abs(torch.randn(channels, device='cuda', dtype=dtype)) + 0.1
-    output = torch.empty_like(x)
     
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.conv.batch_norm_swish(
-            x.data_ptr(), output.data_ptr(),
-            gamma.data_ptr(), beta.data_ptr(),
-            running_mean.data_ptr(), running_var.data_ptr(),
+        return oasr.kernels.conv.batch_norm_swish(
+            x,
+            gamma, beta,
+            running_mean, running_var,
             batch_size, seq_len, channels, eps, dtype_map[dtype]
         )
     
@@ -209,36 +191,30 @@ def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.floa
     pw2_weight = torch.randn(d_model, d_model, device='cuda', dtype=dtype)
     pw2_bias = torch.randn(d_model, device='cuda', dtype=dtype)
     
-    pw1_out = torch.empty(batch_size, seq_len, 2 * d_model, device='cuda', dtype=dtype)
-    glu_out = torch.empty(batch_size, seq_len, d_model, device='cuda', dtype=dtype)
-    dw_out = torch.empty(batch_size, seq_len, d_model, device='cuda', dtype=dtype)
-    swish_out = torch.empty_like(dw_out)
-    output = torch.empty(batch_size, seq_len, d_model, device='cuda', dtype=dtype)
-    
     dw_weight_pt = dw_weight.view(d_model, 1, kernel_size)
     dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
-        oasr.kernels.conv.pointwise_conv1d(
-            x.data_ptr(), pw1_weight.data_ptr(), pw1_bias.data_ptr(), pw1_out.data_ptr(),
+        pw1_out = oasr.kernels.conv.pointwise_conv1d(
+            x, pw1_weight, pw1_bias,
             batch_size, seq_len, d_model, 2 * d_model,
             oasr.ActivationType.SWISH, False, dtype_map[dtype]
         )
-        oasr.kernels.conv.glu(
-            pw1_out.data_ptr(), glu_out.data_ptr(),
+        glu_out = oasr.kernels.conv.glu(
+            pw1_out,
             batch_size, seq_len, d_model, dtype_map[dtype]
         )
-        oasr.kernels.conv.depthwise_conv1d(
-            glu_out.data_ptr(), dw_weight.data_ptr(), dw_bias.data_ptr(), dw_out.data_ptr(),
+        dw_out = oasr.kernels.conv.depthwise_conv1d(
+            glu_out, dw_weight, dw_bias,
             batch_size, seq_len, d_model, kernel_size, kernel_size // 2,
-            False, dtype_map[dtype]
+            dtype_map[dtype]
         )
-        oasr.kernels.conv.swish(
-            dw_out.data_ptr(), swish_out.data_ptr(),
+        swish_out = oasr.kernels.conv.swish(
+            dw_out,
             batch_size, seq_len, d_model, dtype_map[dtype]
         )
-        oasr.kernels.conv.pointwise_conv1d(
-            swish_out.data_ptr(), pw2_weight.data_ptr(), pw2_bias.data_ptr(), output.data_ptr(),
+        return oasr.kernels.conv.pointwise_conv1d(
+            swish_out, pw2_weight, pw2_bias,
             batch_size, seq_len, d_model, d_model,
             oasr.ActivationType.SWISH, False, dtype_map[dtype]
         )
@@ -261,7 +237,7 @@ def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.floa
 
 
 def benchmark_depthwise_conv1d():
-    """Benchmark DepthwiseConv1D: OASR vs PyTorch. Conformer CNN module (B, T_enc, d_model, kernel)."""
+    """Benchmark DepthwiseConv1D: OASR vs PyTorch."""
     import triton
 
     configs = [
@@ -292,7 +268,7 @@ def benchmark_depthwise_conv1d():
 
 
 def benchmark_depthwise_conv1d_causal():
-    """Benchmark causal DepthwiseConv1D. Conformer (B, T_enc, d_model, kernel)."""
+    """Benchmark causal DepthwiseConv1D."""
     import triton
 
     configs = [
@@ -320,7 +296,7 @@ def benchmark_depthwise_conv1d_causal():
 
 
 def benchmark_pointwise_conv1d():
-    """Benchmark PointwiseConv1D (linear projection). Conformer (B, T_enc, in_ch, out_ch)."""
+    """Benchmark PointwiseConv1D (linear projection)."""
     import triton
 
     configs = [
@@ -351,7 +327,7 @@ def benchmark_pointwise_conv1d():
 
 
 def benchmark_glu():
-    """Benchmark GLU activation. Conformer conv block (B, T_enc, d_model) after expand."""
+    """Benchmark GLU activation."""
     import triton
 
     configs = [
@@ -380,7 +356,7 @@ def benchmark_glu():
 
 
 def benchmark_swish():
-    """Benchmark Swish (SiLU) activation. Conformer (B, T_enc, d_model)."""
+    """Benchmark Swish (SiLU) activation."""
     import triton
 
     configs = [
@@ -408,7 +384,7 @@ def benchmark_swish():
 
 
 def benchmark_batch_norm_swish():
-    """Benchmark fused BatchNorm + Swish. Conformer (B, T_enc, channels)."""
+    """Benchmark fused BatchNorm + Swish."""
     import triton
 
     configs = [
@@ -468,7 +444,6 @@ def benchmark_conv_block():
 # Profiling functions
 # =============================================================================
 
-# Default profiling configs (B=64, T=250)
 PROFILE_CONFIGS = {
     'depthwise_conv1d': (64, 250, 512, 31),
     'depthwise_conv1d_causal': (64, 250, 512, 31),
@@ -481,15 +456,7 @@ PROFILE_CONFIGS = {
 
 
 def profile_kernels(kernels: list, target: str = 'both', warmup: int = 3, iters: int = 1):
-    """
-    Profile specified kernels for Nsight Compute.
-    
-    Args:
-        kernels: List of kernel names to profile
-        target: Which implementation to profile ('oasr', 'pytorch', or 'both')
-        warmup: Warmup iterations
-        iters: Profile iterations
-    """
+    """Profile specified kernels for Nsight Compute."""
     print("=" * 70)
     print("OASR Convolution Kernels - Profiling Mode")
     print("=" * 70)
@@ -517,12 +484,10 @@ def profile_kernels(kernels: list, target: str = 'both', warmup: int = 3, iters:
         
         oasr_fn, pytorch_fn = setup_funcs[kernel_name]()
         
-        # Profile OASR kernel
         if target in ('oasr', 'both'):
             print(f"  Running OASR kernel...")
             profile_kernel(f"oasr_{kernel_name}", oasr_fn, warmup=warmup, profile_iters=iters)
         
-        # Profile PyTorch reference
         if target in ('pytorch', 'both'):
             print(f"  Running PyTorch kernel...")
             profile_kernel(f"pytorch_{kernel_name}", pytorch_fn, warmup=warmup, profile_iters=iters)
@@ -550,15 +515,6 @@ Examples:
   # Profile specific kernel with Nsight Compute (OASR only)
   ncu --set full -o depthwise_profile python bench_conv_kernels.py --profile --kernel depthwise_conv1d --target oasr
 
-  # Profile PyTorch implementation only
-  python bench_conv_kernels.py --profile --kernel depthwise_conv1d --target pytorch
-
-  # Profile both implementations (default)
-  python bench_conv_kernels.py --profile --kernel depthwise_conv1d --target both
-
-  # Profile multiple kernels
-  python bench_conv_kernels.py --profile --kernel depthwise_conv1d glu swish
-
   # Profile all kernels
   python bench_conv_kernels.py --profile --kernel all
 
@@ -568,39 +524,26 @@ Available kernels:
         """
     )
     
-    parser.add_argument(
-        '--profile', action='store_true',
-        help='Run in profiling mode (single iterations for ncu)'
-    )
-    parser.add_argument(
-        '--kernel', nargs='+', default=['all'],
-        help='Kernel(s) to profile (use "all" for all kernels)'
-    )
-    parser.add_argument(
-        '--target', choices=['oasr', 'pytorch', 'both'], default='oasr',
-        help='Which implementation to profile: oasr, pytorch, or both (default: oasr)'
-    )
-    parser.add_argument(
-        '--warmup', type=int, default=3,
-        help='Number of warmup iterations for profiling (default: 3)'
-    )
-    parser.add_argument(
-        '--iters', type=int, default=1,
-        help='Number of profile iterations (default: 1)'
-    )
+    parser.add_argument('--profile', action='store_true',
+        help='Run in profiling mode (single iterations for ncu)')
+    parser.add_argument('--kernel', nargs='+', default=['all'],
+        help='Kernel(s) to profile (use "all" for all kernels)')
+    parser.add_argument('--target', choices=['oasr', 'pytorch', 'both'], default='oasr',
+        help='Which implementation to profile (default: oasr)')
+    parser.add_argument('--warmup', type=int, default=3,
+        help='Number of warmup iterations for profiling (default: 3)')
+    parser.add_argument('--iters', type=int, default=1,
+        help='Number of profile iterations (default: 1)')
     
     args = parser.parse_args()
     
     if args.profile:
-        # Profiling mode
         if 'all' in args.kernel:
             kernels = list(PROFILE_CONFIGS.keys())
         else:
             kernels = args.kernel
-        
         profile_kernels(kernels, target=args.target, warmup=args.warmup, iters=args.iters)
     else:
-        # Benchmark mode
         print("=" * 70)
         print("OASR Convolution Kernels - Performance Benchmarks")
         print("=" * 70)

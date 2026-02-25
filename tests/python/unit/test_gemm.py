@@ -62,10 +62,9 @@ class TestGemm:
         dtype = torch.float16
         A = torch.randn(M, K, device='cuda', dtype=dtype)
         B = torch.randn(K, N, device='cuda', dtype=dtype)
-        D = torch.empty(M, N, device='cuda', dtype=dtype)
 
-        status = oasr.kernels.gemm.invoke_gemm(
-            A.data_ptr(), B.data_ptr(), D.data_ptr(),
+        D, status = oasr.kernels.gemm.invoke_gemm(
+            A, B,
             M, N, K, K, N, N, 1.0, 0.0,
             oasr.kernels.gemm.TransposeOp.NoTranspose,
             oasr.kernels.gemm.TransposeOp.NoTranspose,
@@ -85,10 +84,9 @@ class TestGemm:
         dtype = torch.float16
         A = torch.randn(M, K, device='cuda', dtype=dtype)
         B = torch.randn(K, N, device='cuda', dtype=dtype)
-        D = torch.empty(M, N, device='cuda', dtype=dtype)
 
-        status = oasr.kernels.gemm.invoke_gemm(
-            A.data_ptr(), B.data_ptr(), D.data_ptr(),
+        D, status = oasr.kernels.gemm.invoke_gemm(
+            A, B,
             M, N, K, K, N, N, 2.0, 0.0,
             oasr.kernels.gemm.TransposeOp.NoTranspose,
             oasr.kernels.gemm.TransposeOp.NoTranspose,
@@ -108,10 +106,9 @@ class TestGemm:
         dtype = torch.bfloat16
         A = torch.randn(M, K, device='cuda', dtype=dtype)
         B = torch.randn(K, N, device='cuda', dtype=dtype)
-        D = torch.empty(M, N, device='cuda', dtype=dtype)
 
-        status = oasr.kernels.gemm.invoke_gemm(
-            A.data_ptr(), B.data_ptr(), D.data_ptr(),
+        D, status = oasr.kernels.gemm.invoke_gemm(
+            A, B,
             M, N, K, K, N, N, 1.0, 0.0,
             oasr.kernels.gemm.TransposeOp.NoTranspose,
             oasr.kernels.gemm.TransposeOp.NoTranspose,
@@ -140,11 +137,10 @@ class TestBmm:
         dtype = torch.float16
         A = torch.randn(batch_size, M, K, device='cuda', dtype=dtype)
         B = torch.randn(batch_size, K, N, device='cuda', dtype=dtype)
-        D = torch.empty(batch_size, M, N, device='cuda', dtype=dtype)
 
         stride_a, stride_b, stride_d = M * K, K * N, M * N
-        status = oasr.kernels.gemm.invoke_bmm(
-            A.data_ptr(), B.data_ptr(), D.data_ptr(),
+        D, status = oasr.kernels.gemm.invoke_bmm(
+            A, B,
             batch_size, M, N, K, K, N, N,
             stride_a, stride_b, stride_d, 1.0, 0.0,
             oasr.kernels.gemm.TransposeOp.NoTranspose,
@@ -165,11 +161,10 @@ class TestBmm:
         dtype = torch.bfloat16
         A = torch.randn(batch_size, M, K, device='cuda', dtype=dtype)
         B = torch.randn(batch_size, K, N, device='cuda', dtype=dtype)
-        D = torch.empty(batch_size, M, N, device='cuda', dtype=dtype)
 
         stride_a, stride_b, stride_d = M * K, K * N, M * N
-        status = oasr.kernels.gemm.invoke_bmm(
-            A.data_ptr(), B.data_ptr(), D.data_ptr(),
+        D, status = oasr.kernels.gemm.invoke_bmm(
+            A, B,
             batch_size, M, N, K, K, N, N,
             stride_a, stride_b, stride_d, 1.0, 0.0,
             oasr.kernels.gemm.TransposeOp.NoTranspose,

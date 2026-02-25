@@ -17,7 +17,6 @@ import torch
 
 import oasr
 
-# Resolve gemm submodule and types
 try:
     gemm_mod = oasr.kernels.gemm
     DataType = oasr.DataType
@@ -35,21 +34,11 @@ if DataType is None:
 # =============================================================================
 
 def profile_kernel(name: str, fn, warmup: int = 3, profile_iters: int = 1):
-    """
-    Run kernel for profiling with Nsight Compute.
-
-    Args:
-        name: Kernel name for NVTX range
-        fn: Kernel function to profile
-        warmup: Number of warmup iterations
-        profile_iters: Number of iterations to profile
-    """
-    # Warmup
+    """Run kernel for profiling with Nsight Compute."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
 
-    # Profile iterations with NVTX markers
     torch.cuda.nvtx.range_push(name)
     for _ in range(profile_iters):
         fn()
@@ -74,22 +63,26 @@ def setup_gemm(M, N, K, dtype=torch.float16):
 
     A = torch.randn(M, K, device='cuda', dtype=dtype)
     B = torch.randn(K, N, device='cuda', dtype=dtype)
-    D = torch.empty(M, N, device='cuda', dtype=dtype)
 
     trans = gemm_mod.TransposeOp.NoTranspose
     lda, ldb, ldd = K, N, N
 
+    # Pre-allocate D for benchmarking (avoid alloc overhead in hot loop)
+    D_holder = [None]
+
     def oasr_fn():
-        gemm_mod.invoke_gemm(
-            A.data_ptr(), B.data_ptr(), D.data_ptr(),
+        D_holder[0], _ = gemm_mod.invoke_gemm(
+            A, B,
             M, N, K, lda, ldb, ldd,
             alpha=1.0, beta=0.0,
             trans_a=trans, trans_b=trans,
             dtype=oasr_dtype, stream=None,
         )
 
+    D_pt = torch.empty(M, N, device='cuda', dtype=dtype)
+
     def pytorch_fn():
-        torch.matmul(A, B, out=D)
+        torch.matmul(A, B, out=D_pt)
 
     return oasr_fn, pytorch_fn
 
@@ -107,15 +100,16 @@ def setup_bmm(batch_size, M, N, K, dtype=torch.float16):
 
     A = torch.randn(batch_size, M, K, device='cuda', dtype=dtype)
     B = torch.randn(batch_size, K, N, device='cuda', dtype=dtype)
-    D = torch.empty(batch_size, M, N, device='cuda', dtype=dtype)
 
     lda, ldb, ldd = K, N, N
     stride_a, stride_b, stride_d = M * K, K * N, M * N
     trans = gemm_mod.TransposeOp.NoTranspose
 
+    D_holder = [None]
+
     def oasr_fn():
-        gemm_mod.invoke_bmm(
-            A.data_ptr(), B.data_ptr(), D.data_ptr(),
+        D_holder[0], _ = gemm_mod.invoke_bmm(
+            A, B,
             batch_size, M, N, K,
             lda, ldb, ldd,
             stride_a, stride_b, stride_d,
@@ -124,17 +118,16 @@ def setup_bmm(batch_size, M, N, K, dtype=torch.float16):
             dtype=oasr_dtype, stream=None,
         )
 
+    D_pt = torch.empty(batch_size, M, N, device='cuda', dtype=dtype)
+
     def pytorch_fn():
-        torch.bmm(A, B, out=D)
+        torch.bmm(A, B, out=D_pt)
 
     return oasr_fn, pytorch_fn
 
 
 def setup_group_gemm(problem_sizes, dtype=torch.float16):
-    """
-    problem_sizes: list of (M, N, K) for each problem.
-    Setup device arrays and GroupGemmParams for invoke_group_gemm.
-    """
+    """Setup device arrays for invoke_group_gemm."""
     dtype_map = {
         torch.float32: DataType.FP32,
         torch.float16: DataType.FP16,
@@ -162,15 +155,12 @@ def setup_group_gemm(problem_sizes, dtype=torch.float16):
         ldd_list.append(N)
         problems_MNK.extend([M, N, K])
 
-    # Device array of pointers (as int64 on GPU)
     a_ptrs = torch.tensor([t.data_ptr() for t in A_tensors], dtype=torch.int64, device='cuda')
     b_ptrs = torch.tensor([t.data_ptr() for t in B_tensors], dtype=torch.int64, device='cuda')
     d_ptrs = torch.tensor([t.data_ptr() for t in D_tensors], dtype=torch.int64, device='cuda')
     lda_tensor = torch.tensor(lda_list, dtype=torch.int64, device='cuda')
     ldb_tensor = torch.tensor(ldb_list, dtype=torch.int64, device='cuda')
     ldd_tensor = torch.tensor(ldd_list, dtype=torch.int64, device='cuda')
-
-    # problems: device buffer of GemmProblemDesc (M,N,K per problem -> 3 ints each)
     problems_tensor = torch.tensor(problems_MNK, dtype=torch.int32, device='cuda')
 
     float_ws_size, _ = gemm_mod.query_group_gemm_workspace_size(num_problems, oasr_dtype)
@@ -199,7 +189,7 @@ def setup_group_gemm(problem_sizes, dtype=torch.float16):
 
 
 def benchmark_gemm():
-    """Benchmark GEMM: OASR vs PyTorch. Sizes from WeNet (10 sec audio, batch up to 64)."""
+    """Benchmark GEMM: OASR vs PyTorch."""
     import triton
 
     configs = [
@@ -232,7 +222,7 @@ def benchmark_gemm():
 
 
 def benchmark_bmm():
-    """Benchmark Batched GEMM: OASR vs PyTorch. Sizes from WeNet Conformer attention (B*heads, T, head_dim)."""
+    """Benchmark Batched GEMM: OASR vs PyTorch."""
     import triton
 
     configs = [
@@ -261,7 +251,7 @@ def benchmark_bmm():
 
 
 def benchmark_group_gemm():
-    """Benchmark Grouped GEMM: OASR vs PyTorch loop. Sizes from Conformer multi-block/head."""
+    """Benchmark Grouped GEMM: OASR vs PyTorch loop."""
     import triton
 
     configs = [
@@ -293,24 +283,15 @@ def benchmark_group_gemm():
 # Profiling functions
 # =============================================================================
 
-# Default profiling configs (Conformer representative sizes)
 PROFILE_CONFIGS = {
-    'gemm': (16000, 256, 2048),   # FFN reduce, B=64 T=250
-    'bmm': (256, 250, 250, 64),   # attention Q@K^T
-    'group_gemm': (64, (250, 64, 64)),  # num_problems, (M, N, K)
+    'gemm': (16000, 256, 2048),
+    'bmm': (256, 250, 250, 64),
+    'group_gemm': (64, (250, 64, 64)),
 }
 
 
 def profile_kernels(kernels: list, target: str = 'oasr', warmup: int = 3, iters: int = 1):
-    """
-    Profile specified kernels for Nsight Compute.
-
-    Args:
-        kernels: List of kernel names to profile
-        target: Which implementation to profile ('oasr', 'pytorch', or 'both')
-        warmup: Warmup iterations
-        iters: Profile iterations
-    """
+    """Profile specified kernels for Nsight Compute."""
     print("=" * 70)
     print("OASR GEMM Kernels - Profiling Mode")
     print("=" * 70)
@@ -336,12 +317,10 @@ def profile_kernels(kernels: list, target: str = 'oasr', warmup: int = 3, iters:
 
         oasr_fn, pytorch_fn = setup_funcs[kernel_name]()
 
-        # Profile OASR kernel
         if target in ('oasr', 'both'):
             print(f"  Running OASR kernel...")
             profile_kernel(f"oasr_{kernel_name}", oasr_fn, warmup=warmup, profile_iters=iters)
 
-        # Profile PyTorch reference
         if target in ('pytorch', 'both'):
             print(f"  Running PyTorch kernel...")
             profile_kernel(f"pytorch_{kernel_name}", pytorch_fn, warmup=warmup, profile_iters=iters)
@@ -369,15 +348,6 @@ Examples:
   # Profile specific kernel with Nsight Compute (OASR only)
   ncu --set full -o gemm_profile python bench_gemm_kernels.py --profile --kernel gemm --target oasr
 
-  # Profile PyTorch implementation only
-  python bench_gemm_kernels.py --profile --kernel gemm --target pytorch
-
-  # Profile both implementations
-  python bench_gemm_kernels.py --profile --kernel gemm --target both
-
-  # Profile multiple kernels
-  python bench_gemm_kernels.py --profile --kernel gemm bmm --target both
-
   # Profile all kernels
   python bench_gemm_kernels.py --profile --kernel all
 
@@ -386,39 +356,26 @@ Available kernels:
         """
     )
 
-    parser.add_argument(
-        '--profile', action='store_true',
-        help='Run in profiling mode (single iterations for ncu)'
-    )
-    parser.add_argument(
-        '--kernel', nargs='+', default=['all'],
-        help='Kernel(s) to profile (use "all" for all kernels)'
-    )
-    parser.add_argument(
-        '--target', choices=['oasr', 'pytorch', 'both'], default='oasr',
-        help='Which implementation to profile: oasr, pytorch, or both (default: oasr)'
-    )
-    parser.add_argument(
-        '--warmup', type=int, default=3,
-        help='Number of warmup iterations for profiling (default: 3)'
-    )
-    parser.add_argument(
-        '--iters', type=int, default=1,
-        help='Number of profile iterations (default: 1)'
-    )
+    parser.add_argument('--profile', action='store_true',
+        help='Run in profiling mode (single iterations for ncu)')
+    parser.add_argument('--kernel', nargs='+', default=['all'],
+        help='Kernel(s) to profile (use "all" for all kernels)')
+    parser.add_argument('--target', choices=['oasr', 'pytorch', 'both'], default='oasr',
+        help='Which implementation to profile (default: oasr)')
+    parser.add_argument('--warmup', type=int, default=3,
+        help='Number of warmup iterations for profiling (default: 3)')
+    parser.add_argument('--iters', type=int, default=1,
+        help='Number of profile iterations (default: 1)')
 
     args = parser.parse_args()
 
     if args.profile:
-        # Profiling mode
         if 'all' in args.kernel:
             kernels = list(PROFILE_CONFIGS.keys())
         else:
             kernels = args.kernel
-
         profile_kernels(kernels, target=args.target, warmup=args.warmup, iters=args.iters)
     else:
-        # Benchmark mode
         print("=" * 70)
         print("OASR GEMM Kernels - Performance Benchmarks")
         print("=" * 70)
