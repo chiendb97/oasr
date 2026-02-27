@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <torch/extension.h>
 #include <cstdint>
 #include <vector>
 #include <memory>
@@ -28,48 +29,23 @@ namespace gemm {
 /**
  * @brief Execute GEMM operation
  *
- * Computes: D = alpha * op(A) @ op(B) + beta * D
+ * Computes: D = alpha * op(A) @ op(B) + beta * C
+ * When C is undefined, computes: D = alpha * op(A) @ op(B)
  *
- * @param A Input matrix [M, K] (or [K, M] if trans_a)
- * @param B Input matrix [K, N] (or [N, K] if trans_b)
- * @param D Output matrix [M, N] (also used as C for beta scaling)
- * @param M Number of rows of output
- * @param N Number of columns of output
- * @param K Contraction dimension
- * @param lda Leading dimension of A
- * @param ldb Leading dimension of B
- * @param ldd Leading dimension of D
- * @param alpha Scale factor for A @ B
- * @param beta Scale factor for D (D = alpha*A*B + beta*D)
- * @param trans_a Transpose operation for A
- * @param trans_b Transpose operation for B
+ * Dimensions are derived from tensor shapes:
+ *   K = A.size(-1), M = A.numel() / K, N = B.size(0)
+ *
+ * @param A Input tensor [M, K] or [batch, M', K]
+ * @param B Input tensor [N, K]
+ * @param C Optional bias tensor [M, N] (undefined tensor to skip)
+ * @param D Output tensor [M, N]
  * @param dtype Data type (FP16 or BF16)
  * @param stream CUDA stream
  * @return Status code
  */
-GemmStatus invokeGemm(const void* A, const void* B, void* D,
-                      int M, int N, int K,
-                      int64_t lda, int64_t ldb, int64_t ldd,
-                      float alpha, float beta,
-                      TransposeOp trans_a, TransposeOp trans_b,
-                      DataType dtype,
+GemmStatus invokeGemm(const torch::Tensor& A, const torch::Tensor& B,
+                      const torch::Tensor& C, torch::Tensor& D,
                       cudaStream_t stream = nullptr);
-
-/**
- * @brief Execute GEMM with specific data type (internal use)
- */
-template <typename T>
-GemmStatus invokeGemmTyped(const void* A, const void* B, void* D,
-                           int M, int N, int K,
-                           int64_t lda, int64_t ldb, int64_t ldd,
-                           float alpha, float beta,
-                           cudaStream_t stream);
-
-/**
- * @brief Query required workspace size for GEMM
- */
-size_t queryGemmWorkspaceSize(int M, int N, int K, DataType dtype,
-                              const GemmConfig& config = GemmConfig());
 
 //==============================================================================
 // GEMM with Fused Operations
@@ -80,87 +56,12 @@ size_t queryGemmWorkspaceSize(int M, int N, int K, DataType dtype,
  * 
  * Computes: D = activation(A @ B + bias)
  */
+template <typename ElementA, typename ElementB, typename ElementC>
 GemmStatus invokeGemmBiasActivation(
-    const void* A, const void* B, const void* bias, void* D,
-    int M, int N, int K,
+    const torch::Tensor& A, const torch::Tensor& B,
+    const torch::Tensor& C, torch::Tensor& D,
     ActivationType activation,
-    DataType dtype,
     cudaStream_t stream);
-
-//==============================================================================
-// GEMM Runner Class
-//==============================================================================
-
-/**
- * @brief Abstract interface for GEMM runners
- */
-class GemmRunnerInterface {
-public:
-    virtual ~GemmRunnerInterface() = default;
-    
-    /**
-     * @brief Execute GEMM operation
-     */
-    virtual void gemm(const void* A, const void* B, void* D,
-                      int M, int N, int K,
-                      const GemmConfig& config,
-                      void* workspace, size_t workspace_size,
-                      cudaStream_t stream) = 0;
-    
-    /**
-     * @brief Get required workspace size
-     */
-    virtual size_t getWorkspaceSize(int M, int N, int K) = 0;
-    
-    /**
-     * @brief Get available configurations for auto-tuning
-     */
-    virtual std::vector<GemmConfig> getConfigs() const = 0;
-};
-
-/**
- * @brief FP16 GEMM runner using CUTLASS
- */
-class Fp16GemmRunner : public GemmRunnerInterface {
-public:
-    explicit Fp16GemmRunner(int sm_version = 80);
-    ~Fp16GemmRunner() override;
-    
-    void gemm(const void* A, const void* B, void* D,
-              int M, int N, int K,
-              const GemmConfig& config,
-              void* workspace, size_t workspace_size,
-              cudaStream_t stream) override;
-    
-    size_t getWorkspaceSize(int M, int N, int K) override;
-    std::vector<GemmConfig> getConfigs() const override;
-    
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-};
-
-/**
- * @brief BF16 GEMM runner using CUTLASS
- */
-class Bf16GemmRunner : public GemmRunnerInterface {
-public:
-    explicit Bf16GemmRunner(int sm_version = 80);
-    ~Bf16GemmRunner() override;
-    
-    void gemm(const void* A, const void* B, void* D,
-              int M, int N, int K,
-              const GemmConfig& config,
-              void* workspace, size_t workspace_size,
-              cudaStream_t stream) override;
-    
-    size_t getWorkspaceSize(int M, int N, int K) override;
-    std::vector<GemmConfig> getConfigs() const override;
-    
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-};
 
 //==============================================================================
 // Auto-Tuning

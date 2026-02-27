@@ -4,6 +4,8 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <cutlass/half.h>
+#include <cutlass/bfloat16.h>
 #include "kernels/gemm/gemm_configs.h"
 #include "kernels/gemm/gemm_kernels.h"
 #include "kernels/gemm/bmm_kernels.h"
@@ -21,11 +23,6 @@ inline void registerGemmBindings(py::module_& kernels) {
         kernels.def_submodule("gemm", "GEMM/BMM/GroupGEMM kernels (CUTLASS)");
 
     // --- Enums ---
-    py::enum_<TransposeOp>(gemm_mod, "TransposeOp")
-        .value("NoTranspose", TransposeOp::NoTranspose)
-        .value("Transpose", TransposeOp::Transpose)
-        .value("ConjugateTranspose", TransposeOp::ConjugateTranspose);
-
     py::enum_<MatrixLayout>(gemm_mod, "MatrixLayout")
         .value("RowMajor", MatrixLayout::RowMajor)
         .value("ColumnMajor", MatrixLayout::ColumnMajor);
@@ -66,6 +63,11 @@ inline void registerGemmBindings(py::module_& kernels) {
         .value("ClusterShape_1x4x1", ClusterShape::ClusterShape_1x4x1)
         .value("ClusterShape_4x1x1", ClusterShape::ClusterShape_4x1x1);
 
+    py::enum_<TransposeOp>(gemm_mod, "TransposeOp")
+        .value("NoTranspose", TransposeOp::NoTranspose)
+        .value("Transpose", TransposeOp::Transpose)
+        .value("ConjugateTranspose", TransposeOp::ConjugateTranspose);
+
     // --- Config types ---
     py::class_<GemmConfig>(gemm_mod, "GemmConfig")
         .def(py::init<>())
@@ -86,32 +88,26 @@ inline void registerGemmBindings(py::module_& kernels) {
         .def_readwrite("N", &GemmProblemDesc::N)
         .def_readwrite("K", &GemmProblemDesc::K);
 
-    // --- GEMM: D = alpha * A @ B + beta * D ---
+    // --- GEMM: D = alpha * A @ B + beta * C ---
     gemm_mod.def("invoke_gemm",
         [](const torch::Tensor& a, const torch::Tensor& b,
-           int M, int N, int K,
-           int64_t lda, int64_t ldb, int64_t ldd,
-           float alpha, float beta,
-           TransposeOp trans_a, TransposeOp trans_b,
-           DataType dtype, py::object stream) -> py::tuple {
+           std::optional<const torch::Tensor>& c,
+           py::object stream) -> py::tuple {
+            const int K = a.size(-1);
+            const int M = a.numel() / K;
+            const int N = b.size(0);
             auto d = torch::empty({M, N}, a.options());
             cudaStream_t s = stream.is_none()
                 ? nullptr
                 : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
-            auto status = invokeGemm(
-                a.data_ptr(), b.data_ptr(), d.data_ptr(),
-                M, N, K, lda, ldb, ldd, alpha, beta,
-                trans_a, trans_b, dtype, s);
+
+            torch::Tensor c_tensor = c.has_value() ? c.value() : torch::Tensor();
+            auto status = invokeGemm(a, b, c_tensor, d, s);
             return py::make_tuple(d, status);
         },
-        py::arg("a"), py::arg("b"),
-        py::arg("M"), py::arg("N"), py::arg("K"),
-        py::arg("lda"), py::arg("ldb"), py::arg("ldd"),
-        py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
-        py::arg("trans_a") = TransposeOp::NoTranspose,
-        py::arg("trans_b") = TransposeOp::NoTranspose,
-        py::arg("dtype"), py::arg("stream") = py::none(),
-        "Execute GEMM: D = alpha * A @ B + beta * D. Returns (output, status).");
+        py::arg("a"), py::arg("b"), py::arg("c") = py::none(),
+        py::arg("stream") = py::none(),
+        "Execute GEMM: D = A @ B + C (C is optional). Returns (output, status).");
 
     // --- Batched GEMM (strided) ---
     gemm_mod.def("invoke_bmm",
@@ -184,11 +180,6 @@ inline void registerGemmBindings(py::module_& kernels) {
         py::arg("num_problems"), py::arg("dtype"),
         py::arg("config") = GemmConfig(),
         "Query workspace sizes for grouped GEMM (returns float_ws, int_ws)");
-
-    gemm_mod.def("query_gemm_workspace_size", &queryGemmWorkspaceSize,
-        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("dtype"),
-        py::arg("config") = GemmConfig(),
-        "Query workspace size for GEMM");
 
     gemm_mod.def("query_bmm_workspace_size", &queryBmmWorkspaceSize,
         py::arg("batch_size"), py::arg("M"), py::arg("N"), py::arg("K"),

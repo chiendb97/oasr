@@ -191,6 +191,15 @@ target_include_directories(oasr_core PUBLIC
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
+if(BUILD_PYTHON)
+    # Torch headers are needed when kernels use torch::Tensor.
+    # Python headers are required because torch/extension.h includes Python.h.
+    target_include_directories(oasr_core PUBLIC
+        ${TORCH_INCLUDE_DIRS}
+        ${Python_INCLUDE_DIRS}
+    )
+endif()
+
 # CUTLASS
 target_include_directories(oasr_core PUBLIC
     ${CUTLASS_DIR}/include
@@ -202,6 +211,10 @@ target_link_libraries(oasr_core PUBLIC
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
 )
+
+if(BUILD_PYTHON)
+    target_link_libraries(oasr_core PUBLIC ${TORCH_LIBRARIES})
+endif()
 
 if(CUDNN_LIB)
     target_link_libraries(oasr_core PUBLIC ${CUDNN_LIB})

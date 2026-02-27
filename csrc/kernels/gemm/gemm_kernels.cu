@@ -4,9 +4,11 @@
 // Standard GEMM kernel implementations using CUTLASS
 // Supports BF16 and FP16 precision
 
+#include <cstdint>
 #include "gemm_kernels.h"
 #include "gemm_utils.h"
 #include "common/cuda_utils.h"
+#include <torch/extension.h>
 
 // Suppress warnings from CUTLASS headers
 #ifdef __GNUC__
@@ -27,9 +29,10 @@
 #pragma GCC diagnostic pop
 #endif
 
-#include <stdexcept>
+#include <stdexcept>    
 #include <sstream>
 #include <limits>
+#include <type_traits>
 
 namespace oasr {
 namespace kernels {
@@ -60,9 +63,9 @@ struct CutlassGemmSM80 {
     >;
     
     static GemmStatus run(
-        const ElementA* A, const ElementB* B, ElementC* D,
+        const ElementA* A, const ElementB* B, const ElementC* C, ElementC* D,
         int M, int N, int K,
-        int64_t lda, int64_t ldb, int64_t ldd,
+        int64_t lda, int64_t ldb, int64_t ldc,
         float alpha, float beta,
         cudaStream_t stream)
     {
@@ -70,8 +73,8 @@ struct CutlassGemmSM80 {
             {M, N, K},
             {A, lda},
             {B, ldb},
-            {D, ldd},
-            {D, ldd},
+            {C ? C : D, ldc},
+            {D, ldc},
             {alpha, beta}
         );
         
@@ -102,207 +105,70 @@ struct CutlassGemmSM80 {
 // Public API Implementations
 //==============================================================================
 
-GemmStatus invokeGemm(const void* A, const void* B, void* D,
-                      int M, int N, int K,
-                      int64_t lda, int64_t ldb, int64_t ldd,
-                      float alpha, float beta,
-                      TransposeOp trans_a, TransposeOp trans_b,
-                      DataType dtype,
+
+GemmStatus invokeGemm(const torch::Tensor& A, const torch::Tensor& B,
+                      const torch::Tensor& C, torch::Tensor& D,
                       cudaStream_t stream) {
-    if (A == nullptr || B == nullptr || D == nullptr) {
+
+    const int K = A.size(-1);
+    const int M = A.numel() / K;
+    const int N = B.size(0);
+
+    const void* A_ptr = A.data_ptr();
+    const void* B_ptr = B.data_ptr();
+    const void* C_ptr = C.defined() ? C.data_ptr() : nullptr;
+    void* D_ptr = D.data_ptr();
+
+    if (A_ptr == nullptr || B_ptr == nullptr || D_ptr == nullptr) {
         return GemmStatus::INVALID_ARGUMENT;
     }
     if (M <= 0 || N <= 0 || K <= 0) {
         return GemmStatus::INVALID_ARGUMENT;
     }
-    const bool trans_b_flag = (trans_b == TransposeOp::Transpose);
-    const int64_t ldb_eff = trans_b_flag ? static_cast<int64_t>(K) : ldb;
 
-    if (dtype == DataType::FP16) {
-        using DType = cutlass::half_t;
-        using LayoutA = cutlass::layout::RowMajor;
-        using LayoutBTrans = cutlass::layout::ColumnMajor;
-        using LayoutBNoTrans = cutlass::layout::RowMajor;
-        using LayoutC = cutlass::layout::RowMajor;
-        if (trans_b_flag) {
-            return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutBTrans, LayoutC>::run(
-                reinterpret_cast<const DType*>(A),
-                reinterpret_cast<const DType*>(B),
-                reinterpret_cast<DType*>(D),
-                M, N, K,
-                lda, ldb_eff, ldd,
-                alpha, beta,
-                stream);
-        }
-        return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutBNoTrans, LayoutC>::run(
-            reinterpret_cast<const DType*>(A),
-            reinterpret_cast<const DType*>(B),
-            reinterpret_cast<DType*>(D),
-            M, N, K,
-            lda, ldb, ldd,
-            alpha, beta,
-            stream);
-    }
-    if (dtype == DataType::BF16) {
-        using DType = cutlass::bfloat16_t;
-        using LayoutA = cutlass::layout::RowMajor;
-        using LayoutBTrans = cutlass::layout::ColumnMajor;
-        using LayoutBNoTrans = cutlass::layout::RowMajor;
-        using LayoutC = cutlass::layout::RowMajor;
-        if (trans_b_flag) {
-            return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutBTrans, LayoutC>::run(
-                reinterpret_cast<const DType*>(A),
-                reinterpret_cast<const DType*>(B),
-                reinterpret_cast<DType*>(D),
-                M, N, K,
-                lda, ldb_eff, ldd,
-                alpha, beta,
-                stream);
-        }
-        return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutBNoTrans, LayoutC>::run(
-            reinterpret_cast<const DType*>(A),
-            reinterpret_cast<const DType*>(B),
-            reinterpret_cast<DType*>(D),
-            M, N, K,
-            lda, ldb, ldd,
-            alpha, beta,
-            stream);
-    }
-    return GemmStatus::NOT_SUPPORTED;
-}
+    float alpha = 1.0f;
+    float beta = (C_ptr == nullptr) ? 0.0f : 1.0f;
 
-template <>
-GemmStatus invokeGemmTyped<half>(const void* A, const void* B, void* D,
-                                 int M, int N, int K,
-                                 int64_t lda, int64_t ldb, int64_t ldd,
-                                 float alpha, float beta,
-                                 cudaStream_t stream) {
-    using DType = cutlass::half_t;
+    uint64_t lda = K;
+    uint64_t ldb = K;
+    uint64_t ldc = N;
+
     using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutC = cutlass::layout::RowMajor;
-    return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutB, LayoutC>::run(
-        reinterpret_cast<const DType*>(A),
-        reinterpret_cast<const DType*>(B),
-        reinterpret_cast<DType*>(D),
-        M, N, K, lda, ldb, ldd, alpha, beta, stream);
-}
 
-template <>
-GemmStatus invokeGemmTyped<__nv_bfloat16>(const void* A, const void* B, void* D,
-                                          int M, int N, int K,
-                                          int64_t lda, int64_t ldb, int64_t ldd,
-                                          float alpha, float beta,
-                                          cudaStream_t stream) {
-    using DType = cutlass::bfloat16_t;
-    using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::RowMajor;
-    using LayoutC = cutlass::layout::RowMajor;
-    return CutlassGemmSM80<DType, DType, DType, LayoutA, LayoutB, LayoutC>::run(
-        reinterpret_cast<const DType*>(A),
-        reinterpret_cast<const DType*>(B),
-        reinterpret_cast<DType*>(D),
-        M, N, K, lda, ldb, ldd, alpha, beta, stream);
+    if (A.scalar_type() == torch::kHalf) {
+        return CutlassGemmSM80<cutlass::half_t, cutlass::half_t, cutlass::half_t, LayoutA, LayoutB, LayoutC>::run(
+            reinterpret_cast<const cutlass::half_t*>(A_ptr),
+            reinterpret_cast<const cutlass::half_t*>(B_ptr),
+            reinterpret_cast<const cutlass::half_t*>(C_ptr),
+            reinterpret_cast<cutlass::half_t*>(D_ptr), M, N, K, lda, ldb, ldc, alpha, beta, stream);
+    } else if (A.scalar_type() == torch::kBFloat16) {
+        return CutlassGemmSM80<cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t, LayoutA, LayoutB, LayoutC>::run(
+            reinterpret_cast<const cutlass::bfloat16_t*>(A_ptr),
+            reinterpret_cast<const cutlass::bfloat16_t*>(B_ptr),
+            reinterpret_cast<const cutlass::bfloat16_t*>(C_ptr),
+            reinterpret_cast<cutlass::bfloat16_t*>(D_ptr), M, N, K, lda, ldb, ldc, alpha, beta, stream);
+    } else {
+        return GemmStatus::INVALID_ARGUMENT;
+    }
 }
 
 //==============================================================================
 // Fused GEMM + Activation (placeholder)
 //==============================================================================
 
+template <typename ElementA, typename ElementB, typename ElementC>
 GemmStatus invokeGemmBiasActivation(
-    const void* A, const void* B, const void* bias, void* D,
-    int M, int N, int K,
+    const torch::Tensor& A, const torch::Tensor& B,
+    const torch::Tensor& C, torch::Tensor& D,
     ActivationType activation,
-    DataType dtype,
     cudaStream_t stream)
 {
-    (void)bias;
     (void)activation;
-    // TODO: Add epilogue fusion for activation
-    return invokeGemm(A, B, D, M, N, K, K, N, N, 1.0f, 0.0f,
-                     TransposeOp::NoTranspose, TransposeOp::NoTranspose,
-                     dtype, stream);
+    return invokeGemm(A, B, C, D, stream);
 }
 
-//==============================================================================
-// Workspace Size Query
-//==============================================================================
-
-size_t queryGemmWorkspaceSize(int M, int N, int K, DataType dtype,
-                              const GemmConfig& config) {
-    (void)M; (void)N; (void)K; (void)dtype; (void)config;
-    return 4 * 1024 * 1024;  // 4MB
-}
-
-//==============================================================================
-// GEMM Runner Implementations
-//==============================================================================
-
-struct Fp16GemmRunner::Impl {
-    int sm_version;
-    Impl(int sm) : sm_version(sm) {}
-};
-
-Fp16GemmRunner::Fp16GemmRunner(int sm_version)
-    : impl_(std::make_unique<Impl>(sm_version)) {}
-
-Fp16GemmRunner::~Fp16GemmRunner() = default;
-
-void Fp16GemmRunner::gemm(const void* A, const void* B, void* D,
-                          int M, int N, int K,
-                          const GemmConfig& config,
-                          void* workspace, size_t workspace_size,
-                          cudaStream_t stream) {
-    (void)config; (void)workspace; (void)workspace_size;
-    GemmStatus status = invokeGemmTyped<half>(A, B, D, M, N, K, K, N, N, 1.0f, 0.0f, stream);
-    if (status != GemmStatus::SUCCESS) {
-        throw std::runtime_error(std::string("GEMM failed: ") + getGemmStatusString(status));
-    }
-}
-
-size_t Fp16GemmRunner::getWorkspaceSize(int M, int N, int K) {
-    return queryGemmWorkspaceSize(M, N, K, DataType::FP16);
-}
-
-std::vector<GemmConfig> Fp16GemmRunner::getConfigs() const {
-    if (impl_->sm_version >= 90) {
-        return getDefaultSM90Configs();
-    }
-    return getDefaultSM80Configs();
-}
-
-struct Bf16GemmRunner::Impl {
-    int sm_version;
-    Impl(int sm) : sm_version(sm) {}
-};
-
-Bf16GemmRunner::Bf16GemmRunner(int sm_version)
-    : impl_(std::make_unique<Impl>(sm_version)) {}
-
-Bf16GemmRunner::~Bf16GemmRunner() = default;
-
-void Bf16GemmRunner::gemm(const void* A, const void* B, void* D,
-                          int M, int N, int K,
-                          const GemmConfig& config,
-                          void* workspace, size_t workspace_size,
-                          cudaStream_t stream) {
-    (void)config; (void)workspace; (void)workspace_size;
-    GemmStatus status = invokeGemmTyped<__nv_bfloat16>(A, B, D, M, N, K, K, N, N, 1.0f, 0.0f, stream);
-    if (status != GemmStatus::SUCCESS) {
-        throw std::runtime_error(std::string("GEMM failed: ") + getGemmStatusString(status));
-    }
-}
-
-size_t Bf16GemmRunner::getWorkspaceSize(int M, int N, int K) {
-    return queryGemmWorkspaceSize(M, N, K, DataType::BF16);
-}
-
-std::vector<GemmConfig> Bf16GemmRunner::getConfigs() const {
-    if (impl_->sm_version >= 90) {
-        return getDefaultSM90Configs();
-    }
-    return getDefaultSM80Configs();
-}
 
 //==============================================================================
 // Auto-Tuning
@@ -324,59 +190,57 @@ GemmConfig autoTuneGemm(int M, int N, int K, DataType dtype,
         return GemmConfig();
     }
     
-    size_t size_a = static_cast<size_t>(M) * K * getDataTypeSize(dtype);
-    size_t size_b = static_cast<size_t>(K) * N * getDataTypeSize(dtype);
-    size_t size_d = static_cast<size_t>(M) * N * getDataTypeSize(dtype);
+    size_t size_a = M * K * getDataTypeSize(dtype);
+    size_t size_b = N * K * getDataTypeSize(dtype);
+    size_t size_d = M * N * getDataTypeSize(dtype);
     
-    void *A, *B, *D;
+    void *A = nullptr, *B = nullptr, *D = nullptr;
     OASR_CUDA_CHECK(cudaMalloc(&A, size_a));
     OASR_CUDA_CHECK(cudaMalloc(&B, size_b));
     OASR_CUDA_CHECK(cudaMalloc(&D, size_d));
-    
+
     GemmConfig best_config = configs[0];
-    float best_time = std::numeric_limits<float>::max();
+    (void)num_warmup;
+    (void)num_iter;
+    (void)stream;
     
-    for (const auto& config : configs) {
-        try {
-            (void)config;
-            // Warmup
-            for (int i = 0; i < num_warmup; ++i) {
-                invokeGemm(A, B, D, M, N, K, K, N, N, 1.0f, 0.0f,
-                          TransposeOp::NoTranspose, TransposeOp::NoTranspose,
-                          dtype, stream);
-            }
-            OASR_CUDA_CHECK(cudaStreamSynchronize(stream));
+    // for (const auto& config : configs) {
+    //     try {
+    //         (void)config;
+    //         // Warmup
+    //         for (int i = 0; i < num_warmup; ++i) {
+    //             invokeGemm(A, B, nullptr, D, M, N, K, dtype, stream);
+    //         }
+    //         OASR_CUDA_CHECK(cudaStreamSynchronize(stream));
             
-            // Timing
-            cudaEvent_t start, stop;
-            OASR_CUDA_CHECK(cudaEventCreate(&start));
-            OASR_CUDA_CHECK(cudaEventCreate(&stop));
+    //         // Timing
+    //         cudaEvent_t start, stop;
+    //         OASR_CUDA_CHECK(cudaEventCreate(&start));
+    //         OASR_CUDA_CHECK(cudaEventCreate(&stop));
             
-            OASR_CUDA_CHECK(cudaEventRecord(start, stream));
-            for (int i = 0; i < num_iter; ++i) {
-                invokeGemm(A, B, D, M, N, K, K, N, N, 1.0f, 0.0f,
-                          TransposeOp::NoTranspose, TransposeOp::NoTranspose,
-                          dtype, stream);
-            }
-            OASR_CUDA_CHECK(cudaEventRecord(stop, stream));
-            OASR_CUDA_CHECK(cudaEventSynchronize(stop));
+    //         OASR_CUDA_CHECK(cudaEventRecord(start, stream));
+    //         for (int i = 0; i < num_iter; ++i) {
+    //             invokeGemm(A, B, nullptr, D, M, N, K, dtype, stream);
+    //         }
+    //         OASR_CUDA_CHECK(cudaEventRecord(stop, stream));
+    //         OASR_CUDA_CHECK(cudaEventSynchronize(stop));
             
-            float elapsed_ms;
-            OASR_CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-            elapsed_ms /= num_iter;
+    //         float elapsed_ms;
+    //         OASR_CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    //         elapsed_ms /= num_iter;
             
-            if (elapsed_ms < best_time) {
-                best_time = elapsed_ms;
-                best_config = config;
-            }
+    //         if (elapsed_ms < best_time) {
+    //             best_time = elapsed_ms;
+    //             best_config = config;
+    //         }
             
-            OASR_CUDA_CHECK(cudaEventDestroy(start));
-            OASR_CUDA_CHECK(cudaEventDestroy(stop));
-        }
-        catch (...) {
-            continue;
-        }
-    }
+    //         OASR_CUDA_CHECK(cudaEventDestroy(start));
+    //         OASR_CUDA_CHECK(cudaEventDestroy(stop));
+    //     }
+    //     catch (...) {
+    //         continue;
+    //     }
+    // }
     
     OASR_CUDA_CHECK(cudaFree(A));
     OASR_CUDA_CHECK(cudaFree(B));

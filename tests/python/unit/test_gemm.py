@@ -61,41 +61,15 @@ class TestGemm:
         """Test GEMM FP16 against torch.matmul."""
         dtype = torch.float16
         A = torch.randn(M, K, device='cuda', dtype=dtype)
-        B = torch.randn(K, N, device='cuda', dtype=dtype)
+        B = torch.randn(N, K, device='cuda', dtype=dtype)
 
-        D, status = oasr.kernels.gemm.invoke_gemm(
-            A, B,
-            M, N, K, K, N, N, 1.0, 0.0,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.DataType.FP16,
-        )
+        D, status = oasr.kernels.gemm.invoke_gemm(A, B)
         assert status == oasr.kernels.gemm.GemmStatus.SUCCESS, (
             f'invoke_gemm failed: {oasr.kernels.gemm.get_gemm_status_string(status)}'
         )
         oasr.synchronize()
 
-        expected = torch.matmul(A, B)
-        torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
-
-    def test_gemm_alpha_beta(self, oasr):
-        """Test GEMM with alpha=2.0, beta=0 -> D = 2 * A @ B."""
-        M, N, K = 32, 64, 48
-        dtype = torch.float16
-        A = torch.randn(M, K, device='cuda', dtype=dtype)
-        B = torch.randn(K, N, device='cuda', dtype=dtype)
-
-        D, status = oasr.kernels.gemm.invoke_gemm(
-            A, B,
-            M, N, K, K, N, N, 2.0, 0.0,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.DataType.FP16,
-        )
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
-        oasr.synchronize()
-
-        expected = 2.0 * torch.matmul(A, B)
+        expected = torch.matmul(A, B.T)
         torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.parametrize('M,N,K', [(64, 128, 256)])
@@ -105,19 +79,13 @@ class TestGemm:
             pytest.skip('BF16 not supported on this device')
         dtype = torch.bfloat16
         A = torch.randn(M, K, device='cuda', dtype=dtype)
-        B = torch.randn(K, N, device='cuda', dtype=dtype)
+        B = torch.randn(N, K, device='cuda', dtype=dtype)
 
-        D, status = oasr.kernels.gemm.invoke_gemm(
-            A, B,
-            M, N, K, K, N, N, 1.0, 0.0,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.DataType.BF16,
-        )
+        D, status = oasr.kernels.gemm.invoke_gemm(A, B)
         assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
         oasr.synchronize()
 
-        expected = torch.matmul(A, B)
+        expected = torch.matmul(A, B.T)
         torch.testing.assert_close(D.float(), expected.float(), rtol=1e-2, atol=1e-2)
 
 
@@ -274,22 +242,6 @@ class TestGroupGemm:
 
 class TestGemmHelpers:
     """Tests for GEMM helper APIs."""
-
-    def test_query_gemm_workspace_size(self, oasr):
-        """query_gemm_workspace_size returns non-negative int."""
-        size = oasr.kernels.gemm.query_gemm_workspace_size(128, 256, 512, oasr.DataType.FP16)
-        assert isinstance(size, int) and size >= 0
-
-    def test_query_bmm_workspace_size(self, oasr):
-        """query_bmm_workspace_size returns non-negative int."""
-        size = oasr.kernels.gemm.query_bmm_workspace_size(8, 64, 64, 128, oasr.DataType.FP16)
-        assert isinstance(size, int) and size >= 0
-
-    def test_query_group_gemm_workspace_size(self, oasr):
-        """query_group_gemm_workspace_size returns (float_ws, int_ws) >= 0."""
-        float_ws, int_ws = oasr.kernels.gemm.query_group_gemm_workspace_size(4, oasr.DataType.FP16)
-        assert isinstance(float_ws, int) and float_ws >= 0
-        assert isinstance(int_ws, int) and int_ws >= 0
 
     def test_get_gemm_status_string(self, oasr):
         """get_gemm_status_string returns string containing status name."""

@@ -58,8 +58,7 @@ def setup_depthwise_conv1d(batch_size, seq_len, channels, kernel_size, dtype=tor
     
     def oasr_fn():
         return oasr.kernels.conv.depthwise_conv1d(
-            x, weight, bias,
-            batch_size, seq_len, channels, kernel_size, padding,
+            x, weight, bias, padding,
             dtype_map[dtype]
         )
     
@@ -82,8 +81,7 @@ def setup_depthwise_conv1d_causal(batch_size, seq_len, channels, kernel_size, dt
     
     def oasr_fn():
         return oasr.kernels.conv.depthwise_conv1d(
-            x, weight, bias,
-            batch_size, seq_len, channels, kernel_size, 0,
+            x, weight, bias, 0,
             dtype_map[dtype]
         )
     
@@ -108,7 +106,6 @@ def setup_pointwise_conv1d(batch_size, seq_len, in_ch, out_ch, dtype=torch.float
     def oasr_fn():
         return oasr.kernels.conv.pointwise_conv1d(
             x, weight, bias,
-            batch_size, seq_len, in_ch, out_ch,
             oasr.ActivationType.SWISH, False, dtype_map[dtype]
         )
     
@@ -127,7 +124,7 @@ def setup_glu(batch_size, seq_len, channels, dtype=torch.float16):
     def oasr_fn():
         return oasr.kernels.conv.glu(
             x,
-            batch_size, seq_len, channels, dtype_map[dtype]
+            dtype_map[dtype]
         )
     
     def pytorch_fn():
@@ -145,7 +142,7 @@ def setup_swish(batch_size, seq_len, channels, dtype=torch.float16):
     def oasr_fn():
         return oasr.kernels.conv.swish(
             x,
-            batch_size, seq_len, channels, dtype_map[dtype]
+            dtype_map[dtype]
         )
     
     def pytorch_fn():
@@ -170,7 +167,7 @@ def setup_batch_norm_swish(batch_size, seq_len, channels, dtype=torch.float16):
             x,
             gamma, beta,
             running_mean, running_var,
-            batch_size, seq_len, channels, eps, dtype_map[dtype]
+            eps, dtype_map[dtype]
         )
     
     def pytorch_fn():
@@ -197,25 +194,22 @@ def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.floa
     def oasr_fn():
         pw1_out = oasr.kernels.conv.pointwise_conv1d(
             x, pw1_weight, pw1_bias,
-            batch_size, seq_len, d_model, 2 * d_model,
             oasr.ActivationType.SWISH, False, dtype_map[dtype]
         )
         glu_out = oasr.kernels.conv.glu(
             pw1_out,
-            batch_size, seq_len, d_model, dtype_map[dtype]
+            dtype_map[dtype]
         )
         dw_out = oasr.kernels.conv.depthwise_conv1d(
-            glu_out, dw_weight, dw_bias,
-            batch_size, seq_len, d_model, kernel_size, kernel_size // 2,
+            glu_out, dw_weight, dw_bias, kernel_size // 2,
             dtype_map[dtype]
         )
         swish_out = oasr.kernels.conv.swish(
             dw_out,
-            batch_size, seq_len, d_model, dtype_map[dtype]
+            dtype_map[dtype]
         )
         return oasr.kernels.conv.pointwise_conv1d(
             swish_out, pw2_weight, pw2_bias,
-            batch_size, seq_len, d_model, d_model,
             oasr.ActivationType.SWISH, False, dtype_map[dtype]
         )
     
@@ -251,7 +245,7 @@ def benchmark_depthwise_conv1d():
     ]
 
     print("\n" + "=" * 70)
-    print("DepthwiseConv1D Benchmark (Conformer CNN module)")
+    print("DepthwiseConv1D Benchmark")
     print("=" * 70)
     print(f"\n{'Shape':<35} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 75)
@@ -279,7 +273,7 @@ def benchmark_depthwise_conv1d_causal():
     ]
 
     print("\n" + "=" * 70)
-    print("DepthwiseConv1D (Causal) Benchmark (Conformer workload)")
+    print("DepthwiseConv1D (Causal) Benchmark")
     print("=" * 70)
     print(f"\n{'Shape':<35} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 75)
@@ -296,7 +290,7 @@ def benchmark_depthwise_conv1d_causal():
 
 
 def benchmark_pointwise_conv1d():
-    """Benchmark PointwiseConv1D (linear projection)."""
+    """Benchmark PointwiseConv1D."""
     import triton
 
     configs = [
@@ -310,7 +304,7 @@ def benchmark_pointwise_conv1d():
     ]
 
     print("\n" + "=" * 70)
-    print("PointwiseConv1D (Linear) Benchmark (Conformer conv/FFN)")
+    print("PointwiseConv1D Benchmark")
     print("=" * 70)
     print(f"\n{'Shape':<40} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 80)
@@ -339,7 +333,7 @@ def benchmark_glu():
     ]
 
     print("\n" + "=" * 70)
-    print("GLU Activation Benchmark (Conformer conv block)")
+    print("GLU Activation Benchmark")
     print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
@@ -395,7 +389,7 @@ def benchmark_batch_norm_swish():
     ]
 
     print("\n" + "=" * 70)
-    print("BatchNorm + Swish (Fused) Benchmark (Conformer workload)")
+    print("BatchNorm + Swish (Fused) Benchmark")
     print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)

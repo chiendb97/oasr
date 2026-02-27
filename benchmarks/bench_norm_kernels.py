@@ -51,7 +51,6 @@ def setup_layer_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     def oasr_fn():
         return oasr.kernels.norm.layer_norm(
             x, gamma, beta,
-            batch_size, seq_len, hidden_size,
             eps, dtype_map[dtype]
         )
     
@@ -76,7 +75,6 @@ def setup_rms_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     def oasr_fn():
         return oasr.kernels.norm.rms_norm(
             x, gamma, None,
-            batch_size, seq_len, hidden_size,
             eps, dtype_map[dtype]
         )
     
@@ -101,7 +99,6 @@ def setup_add_layer_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
         return oasr.kernels.norm.add_layer_norm(
             x, residual,
             gamma, beta,
-            batch_size, seq_len, hidden_size,
             eps, dtype_map[dtype]
         )
     
@@ -128,7 +125,7 @@ def setup_group_norm(batch_size, seq_len, channels, num_groups, dtype=torch.floa
     def oasr_fn():
         return oasr.kernels.norm.group_norm(
             x, gamma, beta,
-            batch_size, seq_len, channels, num_groups,
+            num_groups,
             eps, dtype_map[dtype]
         )
     
@@ -158,7 +155,6 @@ def setup_batch_norm(batch_size, seq_len, channels, dtype=torch.float32):
         return oasr.kernels.norm.batch_norm_1d(
             x, gamma, beta,
             running_mean, running_var,
-            batch_size, seq_len, channels,
             eps, dtype_map[dtype]
         )
     

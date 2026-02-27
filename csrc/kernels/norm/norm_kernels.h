@@ -5,6 +5,7 @@
 
 #include "common/types.h"
 #include <cuda_runtime.h>
+#include <torch/extension.h>
 
 namespace oasr {
 namespace kernels {
@@ -17,19 +18,14 @@ namespace kernels {
  * 
  * @param input Input tensor [batch, seq_len, hidden_size]
  * @param output Output tensor [batch, seq_len, hidden_size]
- * @param gamma Scale parameter [hidden_size]
- * @param beta Offset parameter [hidden_size]
- * @param batch_size Batch size
- * @param seq_len Sequence length
- * @param hidden_size Hidden dimension
+ * @param weight Scale parameter [hidden_size]
+ * @param bias Offset parameter [hidden_size]
  * @param eps Epsilon for numerical stability
- * @param dtype Data type
  * @param stream CUDA stream
  */
-void invokeLayerNorm(const void* input, void* output,
-                     const void* gamma, const void* beta,
-                     int batch_size, int seq_len, int hidden_size,
-                     float eps, DataType dtype, cudaStream_t stream);
+void invokeLayerNorm(const torch::Tensor& input, torch::Tensor& output,
+                     const torch::Tensor& weight, const torch::Tensor& bias,
+                     float eps, cudaStream_t stream);
 
 /**
  * @brief RMS normalization kernel
@@ -39,18 +35,14 @@ void invokeLayerNorm(const void* input, void* output,
  * 
  * @param input Input tensor
  * @param output Output tensor
- * @param gamma Scale parameter
- * @param batch_size Batch size
- * @param seq_len Sequence length
- * @param hidden_size Hidden dimension
+ * @param weight Scale parameter
+ * @param bias Offset parameter
  * @param eps Epsilon for numerical stability
- * @param dtype Data type
  * @param stream CUDA stream
  */
-void invokeRMSNorm(const void* input, void* output,
-                   const void* gamma, const void* beta,
-                   int batch_size, int seq_len, int hidden_size,
-                   float eps, DataType dtype, cudaStream_t stream);
+void invokeRMSNorm(const torch::Tensor& input, torch::Tensor& output,
+                   const torch::Tensor& weight, const torch::Tensor& bias,
+                   float eps, cudaStream_t stream);
 
 /**
  * @brief Batch normalization kernel (inference mode)
@@ -61,30 +53,33 @@ void invokeRMSNorm(const void* input, void* output,
  * 
  * @param input Input tensor [batch, seq_len, channels]
  * @param output Output tensor
- * @param gamma Scale parameter [channels]
- * @param beta Offset parameter [channels]
+ * @param weight Scale parameter [channels]
+ * @param bias Offset parameter [channels]
  * @param running_mean Running mean [channels]
  * @param running_var Running variance [channels]
+ * @param eps Epsilon for numerical stability
+ * @param stream CUDA stream
  */
-void invokeBatchNorm1D(const void* input, void* output,
-                       const void* gamma, const void* beta,
-                       const void* running_mean, const void* running_var,
-                       int batch_size, int seq_len, int channels,
-                       float eps, DataType dtype, cudaStream_t stream);
+void invokeBatchNorm1D(const torch::Tensor& input, torch::Tensor& output,
+                       const torch::Tensor& weight, const torch::Tensor& bias,
+                       const torch::Tensor& running_mean, const torch::Tensor& running_var,
+                       float eps, cudaStream_t stream);
 
 /**
  * @brief Group normalization kernel
  * 
  * @param input Input tensor [batch, seq_len, channels]
  * @param output Output tensor
- * @param gamma Scale [channels]
- * @param beta Offset [channels]
+ * @param weight Scale [channels]
+ * @param bias Offset [channels]
  * @param num_groups Number of groups
+ * @param eps Epsilon for numerical stability
+ * @param stream CUDA stream
  */
-void invokeGroupNorm(const void* input, void* output,
-                     const void* gamma, const void* beta,
-                     int batch_size, int seq_len, int channels, int num_groups,
-                     float eps, DataType dtype, cudaStream_t stream);
+void invokeGroupNorm(const torch::Tensor& input, torch::Tensor& output,
+                     const torch::Tensor& weight, const torch::Tensor& bias,
+                     int num_groups,
+                     float eps, cudaStream_t stream);
 
 /**
  * @brief Fused LayerNorm + Linear kernel
@@ -92,12 +87,10 @@ void invokeGroupNorm(const void* input, void* output,
  * Computes: output = LayerNorm(input) @ weight.T + bias
  * Common pattern in transformer blocks.
  */
-void invokeLayerNormLinear(const void* input, void* output,
-                           const void* ln_gamma, const void* ln_beta,
-                           const void* weight, const void* bias,
-                           int batch_size, int seq_len,
-                           int in_features, int out_features,
-                           float eps, DataType dtype, cudaStream_t stream);
+void invokeLayerNormLinear(const torch::Tensor& input, torch::Tensor& output,
+                           const torch::Tensor& ln_weight, const torch::Tensor& ln_bias,
+                           const torch::Tensor& weight, const torch::Tensor& bias,
+                           float eps, cudaStream_t stream);
 
 /**
  * @brief Fused Add + LayerNorm kernel
@@ -105,34 +98,31 @@ void invokeLayerNormLinear(const void* input, void* output,
  * Computes: output = LayerNorm(input + residual)
  * Common pattern after attention and FFN.
  */
-void invokeAddLayerNorm(const void* input, const void* residual, void* output,
-                        const void* gamma, const void* beta,
-                        int batch_size, int seq_len, int hidden_size,
-                        float eps, DataType dtype, cudaStream_t stream);
+void invokeAddLayerNorm(const torch::Tensor& input, const torch::Tensor& residual,
+                        torch::Tensor& output,
+                        const torch::Tensor& weight, const torch::Tensor& bias,
+                        float eps, cudaStream_t stream);
 
 /**
  * @brief Fused Add + LayerNorm + Linear kernel
  * 
  * Computes: output = Linear(LayerNorm(input + residual))
  */
-void invokeAddLayerNormLinear(const void* input, const void* residual, void* output,
-                              const void* ln_gamma, const void* ln_beta,
-                              const void* weight, const void* bias,
-                              int batch_size, int seq_len,
-                              int in_features, int out_features,
-                              float eps, DataType dtype, cudaStream_t stream);
+void invokeAddLayerNormLinear(const torch::Tensor& input, const torch::Tensor& residual,
+                              torch::Tensor& output,
+                              const torch::Tensor& ln_weight, const torch::Tensor& ln_bias,
+                              const torch::Tensor& weight, const torch::Tensor& bias,
+                              float eps, cudaStream_t stream);
 
 // Template specializations
 template <typename T>
-void invokeLayerNormTyped(const void* input, void* output,
-                          const void* gamma, const void* beta,
-                          int batch_size, int seq_len, int hidden_size,
+void invokeLayerNormTyped(const torch::Tensor& input, torch::Tensor& output,
+                          const torch::Tensor& weight, const torch::Tensor& bias,
                           float eps, cudaStream_t stream);
 
 template <typename T>
-void invokeRMSNormTyped(const void* input, void* output,
-                        const void* gamma, const void* beta,
-                        int batch_size, int seq_len, int hidden_size,
+void invokeRMSNormTyped(const torch::Tensor& input, torch::Tensor& output,
+                        const torch::Tensor& weight, const torch::Tensor& bias,
                         float eps, cudaStream_t stream);
 
 } // namespace kernels

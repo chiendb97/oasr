@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "kernels/conv/conv_kernels.h"
+#include "kernels/gemm/gemm_kernels.h"
 #include "common/cuda_utils.h"
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <torch/extension.h>
 #include <algorithm>
 #include <cmath>
 
@@ -37,7 +39,7 @@ __device__ __forceinline__ T swish(T x) {
 template <typename T>
 __global__ void depthwiseConv1DKernel(
     const T* __restrict__ input,     // [batch, seq_len, channels]
-    const T* __restrict__ weight,    // [channels, 1, kernel_size]
+    const T* __restrict__ weight,    // [kernel_size, channels]
     const T* __restrict__ bias,      // [channels] or nullptr
     T* __restrict__ output,          // [batch, seq_len, channels]
     int batch_size,
@@ -72,6 +74,49 @@ __global__ void depthwiseConv1DKernel(
     output[o_id] = (T)val;
 }
 
+// =============================================================================
+// Fused Depthwise 1D Convolution + SiLU Kernel
+// =============================================================================
+
+template <typename T>
+__global__ void depthwiseConv1DSiluKernel(
+    const T* __restrict__ input,     // [batch, seq_len, channels]
+    const T* __restrict__ weight,    // [kernel_size, channels]
+    const T* __restrict__ bias,      // [channels] or nullptr
+    T* __restrict__ output,          // [batch, seq_len, channels]
+    int batch_size,
+    int seq_len,
+    int channels,
+    int kernel_size,
+    int padding
+) {
+    int c_id = threadIdx.x;
+    int s_id = blockIdx.x;
+    int b_id = blockIdx.y;
+    int o_id = (blockIdx.y * gridDim.x + blockIdx.x) * channels + c_id;
+    
+    int s_start = s_id - padding;
+    int s_end = min(s_start + kernel_size, seq_len);
+    s_start = max(s_start, 0);
+
+    int k_start = max(padding - s_id, 0);
+
+    input += b_id * seq_len * channels + c_id;
+    weight += c_id;
+
+    float val = 0.0f;
+    for (int i = s_start; i < s_end; i++) {
+        val += (float)input[i * channels] * (float)weight[(k_start + i - s_start) * channels];
+    }
+
+    if (bias != nullptr) {
+        val += (float)bias[c_id];
+    }
+
+    val *= sigmoid(val);
+    
+    output[o_id] = (T)val;
+}
 
 // =============================================================================
 // Pointwise (1x1) Convolution Kernel
@@ -229,8 +274,8 @@ template <typename T>
 __global__ void batchNormSwishKernel(
     const T* __restrict__ input,
     T* __restrict__ output,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
     const T* __restrict__ running_mean,
     const T* __restrict__ running_var,
     int batch_size,
@@ -248,8 +293,8 @@ __global__ void batchNormSwishKernel(
     float x = static_cast<float>(input[idx]);
     float mean = static_cast<float>(running_mean[c]);
     float var = static_cast<float>(running_var[c]);
-    float g = static_cast<float>(gamma[c]);
-    float b = static_cast<float>(beta[c]);
+    float g = static_cast<float>(weight[c]);
+    float b = static_cast<float>(bias[c]);
     
     // BatchNorm
     float inv_std = rsqrtf(var + eps);
@@ -445,14 +490,44 @@ __global__ void conv1DKernel(
 // =============================================================================
 
 template <typename T>
-void invokeDepthwiseConv1DTyped(const void* input, const void* weight, const void* bias,
-                                void* output, int batch_size, int seq_len, int channels,
-                                int kernel_size, int padding, cudaStream_t stream) {
+void invokeDepthwiseConv1DTyped(const torch::Tensor& input, const torch::Tensor& weight,
+                                const torch::Tensor& bias, torch::Tensor& output,
+                                int padding, cudaStream_t stream) {
+    const int batch_size = input.size(0);
+    const int seq_len = input.size(1);
+    const int channels = input.size(2);
+    const int kernel_size = weight.size(0);
+
+    const T* input_ptr = static_cast<const T*>(input.data_ptr());
+    const T* weight_ptr = static_cast<const T*>(weight.data_ptr());
+    const T* bias_ptr = bias.defined() ? static_cast<const T*>(bias.data_ptr()) : nullptr;
+    T* output_ptr = static_cast<T*>(output.data_ptr());
+
     dim3 block_size(channels);
     dim3 grid_size(seq_len + 2 * padding - kernel_size + 1, batch_size);
     depthwiseConv1DKernel<T><<<grid_size, block_size, 0, stream>>>(
-        static_cast<const T*>(input), static_cast<const T*>(weight),
-        static_cast<const T*>(bias), static_cast<T*>(output),
+        input_ptr, weight_ptr, bias_ptr, output_ptr,
+        batch_size, seq_len, channels, kernel_size, padding);
+}
+
+template <typename T>
+void invokeDepthwiseConv1DSiluTyped(const torch::Tensor& input, const torch::Tensor& weight,
+                                    const torch::Tensor& bias, torch::Tensor& output,
+                                    int padding, cudaStream_t stream) {
+    const int batch_size = input.size(0);
+    const int seq_len = input.size(1);
+    const int channels = input.size(2);
+    const int kernel_size = weight.size(0);
+
+    const T* input_ptr = static_cast<const T*>(input.data_ptr());
+    const T* weight_ptr = static_cast<const T*>(weight.data_ptr());
+    const T* bias_ptr = bias.defined() ? static_cast<const T*>(bias.data_ptr()) : nullptr;
+    T* output_ptr = static_cast<T*>(output.data_ptr());
+
+    dim3 block_size(channels);
+    dim3 grid_size(seq_len + 2 * padding - kernel_size + 1, batch_size);
+    depthwiseConv1DSiluKernel<T><<<grid_size, block_size, 0, stream>>>(
+        input_ptr, weight_ptr, bias_ptr, output_ptr,
         batch_size, seq_len, channels, kernel_size, padding);
 }
 
@@ -460,14 +535,26 @@ void invokeDepthwiseConv1DTyped(const void* input, const void* weight, const voi
 // Public API implementations
 // =============================================================================
 
-void invokeConv1D(const void* input, void* output, const void* weight, const void* bias,
-                  int batch_size, int seq_len, int in_channels, int out_channels,
-                  int kernel_size, int stride, int padding, int dilation, int groups,
+void invokeConv1D(const torch::Tensor& input, torch::Tensor& output,
+                  const torch::Tensor& weight, const torch::Tensor& bias,
+                  int stride, int padding, int dilation, int groups,
                   ConvType conv_type, DataType dtype, bool channels_last, bool is_causal,
                   ActivationType activation, bool fuse_activation, cudaStream_t stream) {
     (void)conv_type;
     (void)channels_last;
     (void)is_causal;
+
+    const int batch_size = input.size(0);
+    const int seq_len = input.size(1);
+    const int in_channels = input.size(2);
+    const int out_channels = weight.size(0);
+    const int kernel_size = weight.size(-1);
+
+    const void* input_ptr = input.data_ptr();
+    const void* weight_ptr = weight.data_ptr();
+    const void* bias_ptr = bias.defined() ? bias.data_ptr() : nullptr;
+    void* output_ptr = output.data_ptr();
+
     int out_len = (seq_len + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
     int total_elements = batch_size * out_len * out_channels;
     int block_size = 256;
@@ -476,10 +563,10 @@ void invokeConv1D(const void* input, void* output, const void* weight, const voi
     switch (dtype) {
         case DataType::FP32:
             conv1DKernel<float><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const float*>(input),
-                static_cast<const float*>(weight),
-                static_cast<const float*>(bias),
-                static_cast<float*>(output),
+                static_cast<const float*>(input_ptr),
+                static_cast<const float*>(weight_ptr),
+                static_cast<const float*>(bias_ptr),
+                static_cast<float*>(output_ptr),
                 batch_size, seq_len, in_channels, out_channels,
                 kernel_size, stride, padding, dilation, groups,
                 activation, fuse_activation
@@ -487,10 +574,10 @@ void invokeConv1D(const void* input, void* output, const void* weight, const voi
             break;
         case DataType::FP16:
             conv1DKernel<half><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const half*>(input),
-                static_cast<const half*>(weight),
-                static_cast<const half*>(bias),
-                static_cast<half*>(output),
+                static_cast<const half*>(input_ptr),
+                static_cast<const half*>(weight_ptr),
+                static_cast<const half*>(bias_ptr),
+                static_cast<half*>(output_ptr),
                 batch_size, seq_len, in_channels, out_channels,
                 kernel_size, stride, padding, dilation, groups,
                 activation, fuse_activation
@@ -498,10 +585,10 @@ void invokeConv1D(const void* input, void* output, const void* weight, const voi
             break;
         case DataType::BF16:
             conv1DKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(input),
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<const __nv_bfloat16*>(bias),
-                static_cast<__nv_bfloat16*>(output),
+                static_cast<const __nv_bfloat16*>(input_ptr),
+                static_cast<const __nv_bfloat16*>(weight_ptr),
+                static_cast<const __nv_bfloat16*>(bias_ptr),
+                static_cast<__nv_bfloat16*>(output_ptr),
                 batch_size, seq_len, in_channels, out_channels,
                 kernel_size, stride, padding, dilation, groups,
                 activation, fuse_activation
@@ -512,113 +599,96 @@ void invokeConv1D(const void* input, void* output, const void* weight, const voi
     }
 }
 
-void invokeDepthwiseConv1D(const void* input, const void* weight, const void* bias,
-                           void* output, int batch_size, int seq_len, int channels,
-                           int kernel_size, int padding, DataType dtype, cudaStream_t stream) {
+void invokeDepthwiseConv1D(const torch::Tensor& input, const torch::Tensor& weight,
+                           const torch::Tensor& bias, torch::Tensor& output,
+                           int padding, DataType dtype, cudaStream_t stream) {
     switch (dtype) {
         case DataType::FP32:
             invokeDepthwiseConv1DTyped<float>(input, weight, bias, output,
-                                              batch_size, seq_len, channels,
-                                              kernel_size, padding, stream);
+                                              padding, stream);
             break;
         case DataType::FP16:
             invokeDepthwiseConv1DTyped<half>(input, weight, bias, output,
-                                             batch_size, seq_len, channels,
-                                             kernel_size, padding, stream);
+                                             padding, stream);
             break;
         case DataType::BF16:
             invokeDepthwiseConv1DTyped<__nv_bfloat16>(input, weight, bias, output,
-                                                      batch_size, seq_len, channels,
-                                                      kernel_size, padding, stream);
+                                                      padding, stream);
             break;
         default:
             throw std::runtime_error("Unsupported data type for DepthwiseConv1D");
     }
 }
 
-void invokePointwiseConv1D(const void* input, const void* weight, const void* bias,
-                           void* output, int batch_size, int seq_len,
-                           int in_channels, int out_channels,
-                           ActivationType activation, bool fuse_activation,
-                           DataType dtype, cudaStream_t stream) {
-    const int M = batch_size * seq_len;
-    const int N = out_channels;
-    const int K = in_channels;
-    int num_positions = batch_size * seq_len;
-    int block_size   = std::min(out_channels, MAX_THREADS_PER_BLOCK);
-    cudaStream_t s   = (stream != nullptr) ? stream : 0;
-
-    // if (backend == PointwiseConvBackend::CUTLASS) {
-    //     if (dtype != DataType::FP16 && dtype != DataType::BF16) {
-    //         throw std::runtime_error("PointwiseConv1D CUTLASS backend requires FP16 or BF16");
-    //     }
-    //     namespace gm = oasr::kernels::gemm;
-    //     gm::GemmParams params;
-    //     params.A      = input;
-    //     params.B      = weight;
-    //     params.D     = output;
-    //     params.M     = M;
-    //     params.N     = N;
-    //     params.K     = K;
-    //     params.lda   = K;
-    //     params.ldb   = K;
-    //     params.ldd   = N;
-    //     params.trans_b = gm::TransposeOp::Transpose;
-    //     params.dtype_a = dtype;
-    //     params.dtype_b = dtype;
-    //     params.dtype_d = dtype;
-    //     params.stream = stream;
-    //     gm::GemmStatus status = gm::invokeGemm(params);
-    //     if (status != gm::GemmStatus::SUCCESS) {
-    //         throw std::runtime_error(std::string("PointwiseConv1D CUTLASS failed: ") +
-    //                                  gm::getGemmStatusString(status));
-    //     }
-    //     int total_elements = M * N;
-    //     int grid_size      = (total_elements + block_size - 1) / block_size;
-    //     if (dtype == DataType::FP16) {
-    //         pointwiseBiasActivationKernel<half><<<grid_size, block_size, 0, s>>>(
-    //             static_cast<half*>(output), static_cast<const half*>(bias),
-    //             batch_size, seq_len, out_channels, activation, fuse_activation);
-    //     } else {
-    //         pointwiseBiasActivationKernel<__nv_bfloat16><<<grid_size, block_size, 0, s>>>(
-    //             static_cast<__nv_bfloat16*>(output), static_cast<const __nv_bfloat16*>(bias),
-    //             batch_size, seq_len, out_channels, activation, fuse_activation);
-    //     }
-    //     return;
-    // }
-
+void invokeDepthwiseConv1DSilu(const torch::Tensor& input, const torch::Tensor& weight,
+                               const torch::Tensor& bias, torch::Tensor& output,
+                               int padding, DataType dtype, cudaStream_t stream) {
     switch (dtype) {
         case DataType::FP32:
-            pointwiseConv1DKernel<float><<<num_positions, block_size, 0, stream>>>(
-                static_cast<const float*>(input), static_cast<const float*>(weight),
-                static_cast<const float*>(bias), static_cast<float*>(output),
-                batch_size, seq_len, in_channels, out_channels,
-                activation, fuse_activation);
+            invokeDepthwiseConv1DSiluTyped<float>(input, weight, bias, output,
+                                                  padding, stream);
             break;
         case DataType::FP16:
-            pointwiseConv1DKernel<half><<<num_positions, block_size, 0, stream>>>(
-                static_cast<const half*>(input), static_cast<const half*>(weight),
-                static_cast<const half*>(bias), static_cast<half*>(output),
-                batch_size, seq_len, in_channels, out_channels,
-                activation, fuse_activation);
+            invokeDepthwiseConv1DSiluTyped<half>(input, weight, bias, output,
+                                                 padding, stream);
             break;
         case DataType::BF16:
-            pointwiseConv1DKernel<__nv_bfloat16><<<num_positions, block_size, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(input),
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<const __nv_bfloat16*>(bias),
-                static_cast<__nv_bfloat16*>(output),
-                batch_size, seq_len, in_channels, out_channels,
-                activation, fuse_activation);
+            invokeDepthwiseConv1DSiluTyped<__nv_bfloat16>(input, weight, bias, output,
+                                                          padding, stream);
             break;
         default:
-            throw std::runtime_error("Unsupported data type for PointwiseConv1D");
+            throw std::runtime_error("Unsupported data type for DepthwiseConv1DSilu");
     }
 }
 
-void invokeGLU(const void* input, void* output,
-               int batch_size, int seq_len, int channels,
+void invokePointwiseConv1D(const torch::Tensor& input, const torch::Tensor& weight,
+                           const torch::Tensor& bias, torch::Tensor& output,
+                           ActivationType activation, bool fuse_activation,
+                           DataType dtype, cudaStream_t stream) {
+    const int batch_size = input.size(0);
+    const int seq_len = input.size(1);
+    const int in_channels = input.size(2);
+    const int out_channels = weight.size(0);
+
+    const int M = batch_size * seq_len;
+    const int N = out_channels;
+    const int K = in_channels;
+    int block_size   = std::min(out_channels, MAX_THREADS_PER_BLOCK);
+    cudaStream_t s   = (stream != nullptr) ? stream : 0;
+
+    if (dtype != DataType::FP16 && dtype != DataType::BF16) {
+        throw std::runtime_error("PointwiseConv1D CUTLASS backend requires FP16 or BF16");
+    }
+    using namespace oasr::kernels::gemm;
+
+    torch::Tensor empty_c;
+    gemm::invokeGemm(input, weight, empty_c, output, stream);
+
+    const void* bias_ptr = bias.defined() ? bias.data_ptr() : nullptr;
+    void* output_ptr = output.data_ptr();
+
+    int total_elements = M * N;
+    int grid_size      = (total_elements + block_size - 1) / block_size;
+    if (dtype == DataType::FP16) {
+        pointwiseBiasActivationKernel<half><<<grid_size, block_size, 0, s>>>(
+            static_cast<half*>(output_ptr), static_cast<const half*>(bias_ptr),
+            batch_size, seq_len, out_channels, activation, fuse_activation);
+    } else {
+        pointwiseBiasActivationKernel<__nv_bfloat16><<<grid_size, block_size, 0, s>>>(
+            static_cast<__nv_bfloat16*>(output_ptr), static_cast<const __nv_bfloat16*>(bias_ptr),
+            batch_size, seq_len, out_channels, activation, fuse_activation);
+    }
+}
+
+void invokeGLU(const torch::Tensor& input, torch::Tensor& output,
                DataType dtype, cudaStream_t stream) {
+    const int batch_size = input.size(0);
+    const int seq_len = input.size(1);
+    const int channels = input.size(2) / 2;
+
+    const void* input_ptr = input.data_ptr();
+    void* output_ptr = output.data_ptr();
+
     int total_elements = batch_size * seq_len * channels;
     int block_size = 256;
     int grid_size = (total_elements + block_size - 1) / block_size;
@@ -626,22 +696,22 @@ void invokeGLU(const void* input, void* output,
     switch (dtype) {
         case DataType::FP32:
             gluKernel<float><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const float*>(input),
-                static_cast<float*>(output),
+                static_cast<const float*>(input_ptr),
+                static_cast<float*>(output_ptr),
                 batch_size, seq_len, channels
             );
             break;
         case DataType::FP16:
             gluKernel<half><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const half*>(input),
-                static_cast<half*>(output),
+                static_cast<const half*>(input_ptr),
+                static_cast<half*>(output_ptr),
                 batch_size, seq_len, channels
             );
             break;
         case DataType::BF16:
             gluKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(input),
-                static_cast<__nv_bfloat16*>(output),
+                static_cast<const __nv_bfloat16*>(input_ptr),
+                static_cast<__nv_bfloat16*>(output_ptr),
                 batch_size, seq_len, channels
             );
             break;
@@ -650,9 +720,15 @@ void invokeGLU(const void* input, void* output,
     }
 }
 
-void invokeSwish(const void* input, void* output,
-                 int batch_size, int seq_len, int channels,
+void invokeSwish(const torch::Tensor& input, torch::Tensor& output,
                  DataType dtype, cudaStream_t stream) {
+    const int batch_size = input.size(0);
+    const int seq_len = input.size(1);
+    const int channels = input.size(2);
+
+    const void* input_ptr = input.data_ptr();
+    void* output_ptr = output.data_ptr();
+
     int total_elements = batch_size * seq_len * channels;
     int block_size = 256;
     int grid_size = (total_elements + block_size - 1) / block_size;
@@ -660,22 +736,22 @@ void invokeSwish(const void* input, void* output,
     switch (dtype) {
         case DataType::FP32:
             swishKernel<float><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const float*>(input),
-                static_cast<float*>(output),
+                static_cast<const float*>(input_ptr),
+                static_cast<float*>(output_ptr),
                 batch_size, seq_len, channels
             );
             break;
         case DataType::FP16:
             swishKernel<half><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const half*>(input),
-                static_cast<half*>(output),
+                static_cast<const half*>(input_ptr),
+                static_cast<half*>(output_ptr),
                 batch_size, seq_len, channels
             );
             break;
         case DataType::BF16:
             swishKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(input),
-                static_cast<__nv_bfloat16*>(output),
+                static_cast<const __nv_bfloat16*>(input_ptr),
+                static_cast<__nv_bfloat16*>(output_ptr),
                 batch_size, seq_len, channels
             );
             break;
@@ -684,11 +760,20 @@ void invokeSwish(const void* input, void* output,
     }
 }
 
-void invokeBatchNormSwish(const void* input, void* output,
-                          const void* gamma, const void* beta,
-                          const void* running_mean, const void* running_var,
-                          int batch_size, int seq_len, int channels,
+void invokeBatchNormSwish(const torch::Tensor& input, torch::Tensor& output,
+                          const torch::Tensor& weight, const torch::Tensor& bias,
+                          const torch::Tensor& running_mean, const torch::Tensor& running_var,
                           float eps, DataType dtype, cudaStream_t stream) {
+    const int batch_size = input.size(0);
+    const int seq_len = input.size(1);
+    const int channels = input.size(2);
+    const void* input_ptr = input.data_ptr();
+    void* output_ptr = output.data_ptr();
+    const void* weight_ptr = weight.data_ptr();
+    const void* bias_ptr = bias.data_ptr();
+    const void* running_mean_ptr = running_mean.data_ptr();
+    const void* running_var_ptr = running_var.data_ptr();
+
     int total_elements = batch_size * seq_len * channels;
     int block_size = 256;
     int grid_size = (total_elements + block_size - 1) / block_size;
@@ -696,34 +781,34 @@ void invokeBatchNormSwish(const void* input, void* output,
     switch (dtype) {
         case DataType::FP32:
             batchNormSwishKernel<float><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const float*>(input),
-                static_cast<float*>(output),
-                static_cast<const float*>(gamma),
-                static_cast<const float*>(beta),
-                static_cast<const float*>(running_mean),
-                static_cast<const float*>(running_var),
+                static_cast<const float*>(input_ptr),
+                static_cast<float*>(output_ptr),
+                static_cast<const float*>(weight_ptr),
+                static_cast<const float*>(bias_ptr),
+                static_cast<const float*>(running_mean_ptr),
+                static_cast<const float*>(running_var_ptr),
                 batch_size, seq_len, channels, eps
             );
             break;
         case DataType::FP16:
             batchNormSwishKernel<half><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const half*>(input),
-                static_cast<half*>(output),
-                static_cast<const half*>(gamma),
-                static_cast<const half*>(beta),
-                static_cast<const half*>(running_mean),
-                static_cast<const half*>(running_var),
+                static_cast<const half*>(input_ptr),
+                static_cast<half*>(output_ptr),
+                static_cast<const half*>(weight_ptr),
+                static_cast<const half*>(bias_ptr),
+                static_cast<const half*>(running_mean_ptr),
+                static_cast<const half*>(running_var_ptr),
                 batch_size, seq_len, channels, eps
             );
             break;
         case DataType::BF16:
             batchNormSwishKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(input),
-                static_cast<__nv_bfloat16*>(output),
-                static_cast<const __nv_bfloat16*>(gamma),
-                static_cast<const __nv_bfloat16*>(beta),
-                static_cast<const __nv_bfloat16*>(running_mean),
-                static_cast<const __nv_bfloat16*>(running_var),
+                static_cast<const __nv_bfloat16*>(input_ptr),
+                static_cast<__nv_bfloat16*>(output_ptr),
+                static_cast<const __nv_bfloat16*>(weight_ptr),
+                static_cast<const __nv_bfloat16*>(bias_ptr),
+                static_cast<const __nv_bfloat16*>(running_mean_ptr),
+                static_cast<const __nv_bfloat16*>(running_var_ptr),
                 batch_size, seq_len, channels, eps
             );
             break;
@@ -732,10 +817,18 @@ void invokeBatchNormSwish(const void* input, void* output,
     }
 }
 
-void invokeCausalConv1D(const void* input, void* state_buffer,
-                        const void* weight, const void* bias,
-                        void* output, int batch_size, int chunk_len, int channels,
-                        int kernel_size, DataType dtype, cudaStream_t stream) {
+void invokeCausalConv1D(const torch::Tensor& input, void* state_buffer,
+                        const torch::Tensor& weight, const torch::Tensor& bias,
+                        torch::Tensor& output, DataType dtype, cudaStream_t stream) {
+    const int batch_size = input.size(0);
+    const int chunk_len = input.size(1);
+    const int channels = input.size(2);
+    const int kernel_size = weight.size(-1);
+    const void* input_ptr = input.data_ptr();
+    const void* weight_ptr = weight.data_ptr();
+    const void* bias_ptr = bias.defined() ? bias.data_ptr() : nullptr;
+    void* output_ptr = output.data_ptr();
+
     int total_elements = batch_size * chunk_len * channels;
     int block_size = 256;
     int grid_size = (total_elements + block_size - 1) / block_size;
@@ -744,19 +837,18 @@ void invokeCausalConv1D(const void* input, void* state_buffer,
     switch (dtype) {
         case DataType::FP32:
             causalConv1DKernel<float><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const float*>(input),
+                static_cast<const float*>(input_ptr),
                 static_cast<float*>(state_buffer),
-                static_cast<const float*>(weight),
-                static_cast<const float*>(bias),
-                static_cast<float*>(output),
+                static_cast<const float*>(weight_ptr),
+                static_cast<const float*>(bias_ptr),
+                static_cast<float*>(output_ptr),
                 batch_size, chunk_len, channels, kernel_size
             );
-            // Update state
             {
                 int state_elements = batch_size * state_len * channels;
                 int state_grid = (state_elements + block_size - 1) / block_size;
                 updateConvStateKernel<float><<<state_grid, block_size, 0, stream>>>(
-                    static_cast<const float*>(input),
+                    static_cast<const float*>(input_ptr),
                     static_cast<float*>(state_buffer),
                     batch_size, chunk_len, channels, state_len
                 );
@@ -764,18 +856,18 @@ void invokeCausalConv1D(const void* input, void* state_buffer,
             break;
         case DataType::FP16:
             causalConv1DKernel<half><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const half*>(input),
+                static_cast<const half*>(input_ptr),
                 static_cast<half*>(state_buffer),
-                static_cast<const half*>(weight),
-                static_cast<const half*>(bias),
-                static_cast<half*>(output),
+                static_cast<const half*>(weight_ptr),
+                static_cast<const half*>(bias_ptr),
+                static_cast<half*>(output_ptr),
                 batch_size, chunk_len, channels, kernel_size
             );
             {
                 int state_elements = batch_size * state_len * channels;
                 int state_grid = (state_elements + block_size - 1) / block_size;
                 updateConvStateKernel<half><<<state_grid, block_size, 0, stream>>>(
-                    static_cast<const half*>(input),
+                    static_cast<const half*>(input_ptr),
                     static_cast<half*>(state_buffer),
                     batch_size, chunk_len, channels, state_len
                 );
@@ -783,18 +875,18 @@ void invokeCausalConv1D(const void* input, void* state_buffer,
             break;
         case DataType::BF16:
             causalConv1DKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(input),
+                static_cast<const __nv_bfloat16*>(input_ptr),
                 static_cast<__nv_bfloat16*>(state_buffer),
-                static_cast<const __nv_bfloat16*>(weight),
-                static_cast<const __nv_bfloat16*>(bias),
-                static_cast<__nv_bfloat16*>(output),
+                static_cast<const __nv_bfloat16*>(weight_ptr),
+                static_cast<const __nv_bfloat16*>(bias_ptr),
+                static_cast<__nv_bfloat16*>(output_ptr),
                 batch_size, chunk_len, channels, kernel_size
             );
             {
                 int state_elements = batch_size * state_len * channels;
                 int state_grid = (state_elements + block_size - 1) / block_size;
                 updateConvStateKernel<__nv_bfloat16><<<state_grid, block_size, 0, stream>>>(
-                    static_cast<const __nv_bfloat16*>(input),
+                    static_cast<const __nv_bfloat16*>(input_ptr),
                     static_cast<__nv_bfloat16*>(state_buffer),
                     batch_size, chunk_len, channels, state_len
                 );
@@ -831,12 +923,15 @@ void freeConvState(void* state_buffer) {
 }
 
 // Explicit template instantiations
-template void invokeDepthwiseConv1DTyped<float>(const void*, const void*, const void*,
-                                                 void*, int, int, int, int, int, cudaStream_t);
-template void invokeDepthwiseConv1DTyped<half>(const void*, const void*, const void*,
-                                                void*, int, int, int, int, int, cudaStream_t);
-template void invokeDepthwiseConv1DTyped<__nv_bfloat16>(const void*, const void*, const void*,
-                                                         void*, int, int, int, int, int, cudaStream_t);
+template void invokeDepthwiseConv1DTyped<float>(const torch::Tensor&, const torch::Tensor&,
+                                                 const torch::Tensor&, torch::Tensor&,
+                                                 int, cudaStream_t);
+template void invokeDepthwiseConv1DTyped<half>(const torch::Tensor&, const torch::Tensor&,
+                                                const torch::Tensor&, torch::Tensor&,
+                                                int, cudaStream_t);
+template void invokeDepthwiseConv1DTyped<__nv_bfloat16>(const torch::Tensor&, const torch::Tensor&,
+                                                         const torch::Tensor&, torch::Tensor&,
+                                                         int, cudaStream_t);
 
 } // namespace kernels
 } // namespace oasr
