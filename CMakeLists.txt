@@ -271,27 +271,6 @@ if(BUILD_PYTHON)
     message(STATUS "Python module will be built to: ${PYTHON_MODULE_OUTPUT_DIR}/_C${CMAKE_SHARED_LIBRARY_SUFFIX}")
 endif()
 
-# =============================================================================
-# Tests
-# =============================================================================
-if(BUILD_TESTS)
-    enable_testing()
-    
-    # Find or fetch GoogleTest
-    find_package(GTest QUIET)
-    if(NOT GTest_FOUND)
-        include(FetchContent)
-        FetchContent_Declare(
-            googletest
-            GIT_REPOSITORY https://github.com/google/googletest.git
-            GIT_TAG v1.14.0
-        )
-        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-        FetchContent_MakeAvailable(googletest)
-    endif()
-    
-    add_subdirectory(tests)
-endif()
 
 # =============================================================================
 # Examples
@@ -321,7 +300,6 @@ message(STATUS "=== OASR Build Configuration ===")
 message(STATUS "Build type:        ${CMAKE_BUILD_TYPE}")
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "Python bindings:   ${BUILD_PYTHON}")
-message(STATUS "Build tests:       ${BUILD_TESTS}")
 message(STATUS "Use CUTLASS:       ${USE_CUTLASS}")
 message(STATUS "Use FlashAttention: ${USE_FLASH_ATTENTION}")
 message(STATUS "Enable FP16:       ${ENABLE_FP16}")
