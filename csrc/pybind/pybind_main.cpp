@@ -76,8 +76,6 @@ PYBIND11_MODULE(_C, m) {
         .value("RELU", oasr::ActivationType::RELU)
         .value("GELU", oasr::ActivationType::GELU)
         .value("SWISH", oasr::ActivationType::SWISH)
-        .value("GATED_GELU", oasr::ActivationType::GATED_GELU)
-        .value("GATED_SWISH", oasr::ActivationType::GATED_SWISH)
         .export_values();
 
     // =========================================================================

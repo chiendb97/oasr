@@ -18,15 +18,13 @@ inline void registerNormBindings(py::module_& kernels) {
         [](const torch::Tensor& input,
            const torch::Tensor& weight, py::object bias_obj,
            float eps) -> torch::Tensor {
-            auto output = torch::empty_like(input);
             torch::Tensor bias;
             if (!bias_obj.is_none()) {
                 bias = bias_obj.cast<torch::Tensor>();
             }
-            oasr::kernels::invokeLayerNorm(
-                input, output, weight, bias,
+            return oasr::kernels::invokeLayerNorm(
+                input, weight, bias,
                 eps, nullptr);
-            return output;
         },
         py::arg("input"), py::arg("weight"),
         py::arg("bias") = py::none(),
@@ -37,15 +35,13 @@ inline void registerNormBindings(py::module_& kernels) {
         [](const torch::Tensor& input,
            const torch::Tensor& weight, py::object bias_obj,
            float eps) -> torch::Tensor {
-            auto output = torch::empty_like(input);
             torch::Tensor bias;
             if (!bias_obj.is_none()) {
                 bias = bias_obj.cast<torch::Tensor>();
             }
-            oasr::kernels::invokeRMSNorm(
-                input, output, weight, bias,
+            return oasr::kernels::invokeRMSNorm(
+                input, weight, bias,
                 eps, nullptr);
-            return output;
         },
         py::arg("input"), py::arg("weight"),
         py::arg("bias") = py::none(),
@@ -57,16 +53,14 @@ inline void registerNormBindings(py::module_& kernels) {
            const torch::Tensor& weight, py::object bias_obj,
            const torch::Tensor& running_mean, const torch::Tensor& running_var,
            float eps) -> torch::Tensor {
-            auto output = torch::empty_like(input);
             torch::Tensor bias;
             if (!bias_obj.is_none()) {
                 bias = bias_obj.cast<torch::Tensor>();
             }
-            oasr::kernels::invokeBatchNorm1D(
-                input, output, weight, bias,
+            return oasr::kernels::invokeBatchNorm1D(
+                input, weight, bias,
                 running_mean, running_var,
                 eps, nullptr);
-            return output;
         },
         py::arg("input"),
         py::arg("weight"), py::arg("bias"),
@@ -79,16 +73,14 @@ inline void registerNormBindings(py::module_& kernels) {
            const torch::Tensor& weight, py::object bias_obj,
            int num_groups,
            float eps) -> torch::Tensor {
-            auto output = torch::empty_like(input);
             torch::Tensor bias;
             if (!bias_obj.is_none()) {
                 bias = bias_obj.cast<torch::Tensor>();
             }
-            oasr::kernels::invokeGroupNorm(
-                input, output, weight, bias,
+            return oasr::kernels::invokeGroupNorm(
+                input, weight, bias,
                 num_groups,
                 eps, nullptr);
-            return output;
         },
         py::arg("input"),
         py::arg("weight"), py::arg("bias"),
@@ -100,16 +92,14 @@ inline void registerNormBindings(py::module_& kernels) {
         [](const torch::Tensor& input, const torch::Tensor& residual,
            const torch::Tensor& weight, py::object bias_obj,
            float eps) -> torch::Tensor {
-            auto output = torch::empty_like(input);
             torch::Tensor bias;
             if (!bias_obj.is_none()) {
                 bias = bias_obj.cast<torch::Tensor>();
             }
-            oasr::kernels::invokeAddLayerNorm(
-                input, residual, output,
+            return oasr::kernels::invokeAddLayerNorm(
+                input, residual,
                 weight, bias,
                 eps, nullptr);
-            return output;
         },
         py::arg("input"), py::arg("residual"),
         py::arg("weight"), py::arg("bias") = py::none(),

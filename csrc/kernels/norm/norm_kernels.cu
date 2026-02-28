@@ -979,9 +979,10 @@ void invokeRMSNormTyped(const torch::Tensor& input, torch::Tensor& output,
 // Public API implementations
 // =============================================================================
 
-void invokeLayerNorm(const torch::Tensor& input, torch::Tensor& output,
+torch::Tensor invokeLayerNorm(const torch::Tensor& input,
                      const torch::Tensor& weight, const torch::Tensor& bias,
                      float eps, cudaStream_t stream) {
+    auto output = torch::empty_like(input);
     switch (input.scalar_type()) {
         case torch::kFloat32:
             invokeLayerNormTyped<float>(input, output, weight, bias, eps, stream);
@@ -995,11 +996,13 @@ void invokeLayerNorm(const torch::Tensor& input, torch::Tensor& output,
         default:
             throw std::runtime_error("Unsupported data type for LayerNorm");
     }
+    return output;
 }
 
-void invokeRMSNorm(const torch::Tensor& input, torch::Tensor& output,
+torch::Tensor invokeRMSNorm(const torch::Tensor& input,
                    const torch::Tensor& weight, const torch::Tensor& bias,
                    float eps, cudaStream_t stream) {
+    auto output = torch::empty_like(input);
     switch (input.scalar_type()) {
         case torch::kFloat32:
             invokeRMSNormTyped<float>(input, output, weight, bias, eps, stream);
@@ -1013,6 +1016,7 @@ void invokeRMSNorm(const torch::Tensor& input, torch::Tensor& output,
         default:
             throw std::runtime_error("Unsupported data type for RMSNorm");
     }
+    return output;
 }
 
 template <typename T>
@@ -1068,10 +1072,11 @@ void invokeBatchNorm1DTyped(const torch::Tensor& input, torch::Tensor& output,
     }
 }
 
-void invokeBatchNorm1D(const torch::Tensor& input, torch::Tensor& output,
+torch::Tensor invokeBatchNorm1D(const torch::Tensor& input,
                        const torch::Tensor& weight, const torch::Tensor& bias,
                        const torch::Tensor& running_mean, const torch::Tensor& running_var,
                        float eps, cudaStream_t stream) {
+    auto output = torch::empty_like(input);
     switch (input.scalar_type()) {
         case torch::kFloat32:
             invokeBatchNorm1DTyped<float>(input, output, weight, bias,
@@ -1088,6 +1093,7 @@ void invokeBatchNorm1D(const torch::Tensor& input, torch::Tensor& output,
         default:
             throw std::runtime_error("Unsupported data type for BatchNorm1D");
     }
+    return output;
 }
 
 template <typename T>
@@ -1139,10 +1145,11 @@ void invokeGroupNormTyped(const torch::Tensor& input, torch::Tensor& output,
     }
 }
 
-void invokeGroupNorm(const torch::Tensor& input, torch::Tensor& output,
+torch::Tensor invokeGroupNorm(const torch::Tensor& input,
                      const torch::Tensor& weight, const torch::Tensor& bias,
                      int num_groups,
                      float eps, cudaStream_t stream) {
+    auto output = torch::empty_like(input);
     switch (input.scalar_type()) {
         case torch::kFloat32:
             invokeGroupNormTyped<float>(input, output, weight, bias,
@@ -1159,6 +1166,7 @@ void invokeGroupNorm(const torch::Tensor& input, torch::Tensor& output,
         default:
             throw std::runtime_error("Unsupported data type for GroupNorm");
     }
+    return output;
 }
 
 template <typename T>
@@ -1213,10 +1221,10 @@ void invokeAddLayerNormTyped(const torch::Tensor& input, const torch::Tensor& re
     }
 }
 
-void invokeAddLayerNorm(const torch::Tensor& input, const torch::Tensor& residual,
-                        torch::Tensor& output,
+torch::Tensor invokeAddLayerNorm(const torch::Tensor& input, const torch::Tensor& residual,
                         const torch::Tensor& weight, const torch::Tensor& bias,
                         float eps, cudaStream_t stream) {
+    auto output = torch::empty_like(input);
     switch (input.scalar_type()) {
         case torch::kFloat32:
             invokeAddLayerNormTyped<float>(input, residual, output, weight, bias, eps, stream);
@@ -1230,24 +1238,7 @@ void invokeAddLayerNorm(const torch::Tensor& input, const torch::Tensor& residua
         default:
             throw std::runtime_error("Unsupported data type for AddLayerNorm");
     }
-}
-
-// Stub implementations for fused kernels (TODO: implement with CUTLASS)
-void invokeLayerNormLinear(const torch::Tensor& input, torch::Tensor& output,
-                           const torch::Tensor& ln_weight, const torch::Tensor& ln_bias,
-                           const torch::Tensor& weight, const torch::Tensor& bias,
-                           float eps, cudaStream_t stream) {
-    // TODO: Implement fused LayerNorm + Linear kernel
-    throw std::runtime_error("invokeLayerNormLinear not yet implemented");
-}
-
-void invokeAddLayerNormLinear(const torch::Tensor& input, const torch::Tensor& residual,
-                              torch::Tensor& output,
-                              const torch::Tensor& ln_weight, const torch::Tensor& ln_bias,
-                              const torch::Tensor& weight, const torch::Tensor& bias,
-                              float eps, cudaStream_t stream) {
-    // TODO: Implement fused Add + LayerNorm + Linear kernel
-    throw std::runtime_error("invokeAddLayerNormLinear not yet implemented");
+    return output;
 }
 
 // Explicit template instantiations

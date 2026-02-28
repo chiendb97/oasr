@@ -51,15 +51,12 @@ def setup_depthwise_conv1d(batch_size, seq_len, channels, kernel_size, dtype=tor
     """Setup tensors for depthwise conv1d."""
     padding = kernel_size // 2
     x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
-    weight = torch.randn(channels, kernel_size, device='cuda', dtype=dtype)
+    weight = torch.randn(kernel_size, channels, device='cuda', dtype=dtype)
     bias = torch.randn(channels, device='cuda', dtype=dtype)
-    
-    dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
         return oasr.kernels.conv.depthwise_conv1d(
             x, weight, bias, padding,
-            dtype_map[dtype]
         )
     
     x_nchw = x.permute(0, 2, 1).contiguous()
@@ -73,44 +70,61 @@ def setup_depthwise_conv1d(batch_size, seq_len, channels, kernel_size, dtype=tor
 
 def setup_depthwise_conv1d_causal(batch_size, seq_len, channels, kernel_size, dtype=torch.float16):
     """Setup tensors for causal depthwise conv1d."""
-    x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
-    weight = torch.randn(channels, kernel_size, device='cuda', dtype=dtype)
+    x = torch.randn(batch_size, seq_len + kernel_size - 1, channels, device='cuda', dtype=dtype)
+    weight = torch.randn(kernel_size, channels, device='cuda', dtype=dtype)
     bias = torch.randn(channels, device='cuda', dtype=dtype)
-    
-    dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
         return oasr.kernels.conv.depthwise_conv1d(
             x, weight, bias, 0,
-            dtype_map[dtype]
         )
     
     x_nchw = x.permute(0, 2, 1).contiguous()
     weight_pt = weight.view(channels, 1, kernel_size)
     
     def pytorch_fn():
-        x_padded = F.pad(x_nchw, (kernel_size - 1, 0))
-        return F.conv1d(x_padded, weight_pt, bias, groups=channels)
+        return F.conv1d(x_nchw, weight_pt, bias, padding=0, groups=channels)
     
     return oasr_fn, pytorch_fn
-
 
 def setup_pointwise_conv1d(batch_size, seq_len, in_ch, out_ch, dtype=torch.float16):
     """Setup tensors for pointwise conv1d."""
     x = torch.randn(batch_size, seq_len, in_ch, device='cuda', dtype=dtype)
     weight = torch.randn(out_ch, in_ch, device='cuda', dtype=dtype)
     bias = torch.randn(out_ch, device='cuda', dtype=dtype)
-    
-    dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
-    
+        
     def oasr_fn():
         return oasr.kernels.conv.pointwise_conv1d(
             x, weight, bias,
-            oasr.ActivationType.SWISH, False, dtype_map[dtype]
         )
     
     def pytorch_fn():
         return F.linear(x, weight, bias)
+    
+    return oasr_fn, pytorch_fn
+
+
+def setup_pointwise_conv1d_activation(batch_size, seq_len, in_ch, out_ch, activation, dtype=torch.float16):
+    """Setup tensors for pointwise conv1d with activation."""
+    x = torch.randn(batch_size, seq_len, in_ch, device='cuda', dtype=dtype)
+    weight = torch.randn(out_ch, in_ch, device='cuda', dtype=dtype)
+    bias = torch.randn(out_ch, device='cuda', dtype=dtype)
+        
+    def oasr_fn():
+        return oasr.kernels.conv.pointwise_conv1d_activation(
+            x, weight, bias,
+            activation
+        )
+    
+    def pytorch_fn():
+        if activation == oasr.ActivationType.SWISH:
+            return F.silu(F.linear(x, weight, bias))
+        elif activation == oasr.ActivationType.RELU:
+            return F.relu(F.linear(x, weight, bias))
+        elif activation == oasr.ActivationType.GELU:
+            return F.gelu(F.linear(x, weight, bias))
+        else:
+            raise ValueError(f"Unsupported activation type: {activation}")
     
     return oasr_fn, pytorch_fn
 
@@ -183,7 +197,7 @@ def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.floa
     
     pw1_weight = torch.randn(2 * d_model, d_model, device='cuda', dtype=dtype)
     pw1_bias = torch.randn(2 * d_model, device='cuda', dtype=dtype)
-    dw_weight = torch.randn(d_model, kernel_size, device='cuda', dtype=dtype)
+    dw_weight = torch.randn(kernel_size, d_model, device='cuda', dtype=dtype)
     dw_bias = torch.randn(d_model, device='cuda', dtype=dtype)
     pw2_weight = torch.randn(d_model, d_model, device='cuda', dtype=dtype)
     pw2_bias = torch.randn(d_model, device='cuda', dtype=dtype)
@@ -311,6 +325,36 @@ def benchmark_pointwise_conv1d():
     
     for batch_size, seq_len, in_ch, out_ch in configs:
         oasr_fn, pytorch_fn = setup_pointwise_conv1d(batch_size, seq_len, in_ch, out_ch)
+
+        oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
+        pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
+        
+        speedup = pytorch_ms / oasr_ms
+        shape_str = f"[{batch_size}, {seq_len}, {in_ch}] -> {out_ch}"
+        print(f"{shape_str:<40} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
+
+def benchmark_pointwise_conv1d_activation():
+    """Benchmark PointwiseConv1D."""
+    import triton
+
+    configs = [
+        (32, 250, 256, 512),
+        (64, 250, 256, 512),
+        (64, 250, 512, 1024),
+        (64, 250, 256, 2048),
+        (64, 250, 512, 2048),
+        (64, 500, 256, 512),
+        (64, 500, 512, 1024),
+    ]
+
+    print("\n" + "=" * 70)
+    print("PointwiseConv1D Benchmark")
+    print("=" * 70)
+    print(f"\n{'Shape':<40} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
+    print("-" * 80)
+    
+    for batch_size, seq_len, in_ch, out_ch in configs:
+        oasr_fn, pytorch_fn = setup_pointwise_conv1d_activation(batch_size, seq_len, in_ch, out_ch, oasr.ActivationType.SWISH)
         
         oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
         pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
@@ -361,7 +405,7 @@ def benchmark_swish():
     ]
 
     print("\n" + "=" * 70)
-    print("Swish Activation Benchmark (Conformer workload)")
+    print("Swish Activation Benchmark")
     print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)

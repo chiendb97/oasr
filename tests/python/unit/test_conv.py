@@ -42,14 +42,8 @@ class TestDepthwiseConv1D:
         weight = torch.randn(kernel_size, channels, device='cuda', dtype=dtype)
         bias = torch.randn(channels, device='cuda', dtype=dtype)
         
-        dtype_map = {
-            torch.bfloat16: oasr.DataType.BF16,
-            torch.float16: oasr.DataType.FP16,
-        }
-        
         output = oasr.kernels.conv.depthwise_conv1d(
-            x, weight, bias, padding,
-            dtype_map[dtype]
+            x, weight, bias, padding
         )
         oasr.synchronize()
         
@@ -79,14 +73,8 @@ class TestDepthwiseConv1D:
         weight = torch.randn(kernel_size, channels, device='cuda', dtype=dtype)
         bias = torch.randn(channels, device='cuda', dtype=dtype)
 
-        dtype_map = {
-            torch.bfloat16: oasr.DataType.BF16,
-            torch.float16: oasr.DataType.FP16,
-        }
-        
         output = oasr.kernels.conv.depthwise_conv1d(
-            x, weight, bias, padding,
-            dtype_map[dtype]
+            x, weight, bias, padding
         )
         oasr.synchronize()
         
@@ -118,14 +106,8 @@ class TestDepthwiseConv1DSilu:
         weight = torch.randn(kernel_size, channels, device='cuda', dtype=dtype)
         bias = torch.randn(channels, device='cuda', dtype=dtype)
         
-        dtype_map = {
-            torch.bfloat16: oasr.DataType.BF16,
-            torch.float16: oasr.DataType.FP16,
-        }
-        
         output = oasr.kernels.conv.depthwise_conv1d_silu(
-            x, weight, bias, padding,
-            dtype_map[dtype]
+            x, weight, bias, padding
         )
         oasr.synchronize()
         
@@ -155,14 +137,8 @@ class TestDepthwiseConv1DSilu:
         weight = torch.randn(kernel_size, channels, device='cuda', dtype=dtype)
         bias = torch.randn(channels, device='cuda', dtype=dtype)
 
-        dtype_map = {
-            torch.bfloat16: oasr.DataType.BF16,
-            torch.float16: oasr.DataType.FP16,
-        }
-        
         output = oasr.kernels.conv.depthwise_conv1d_silu(
-            x, weight, bias, padding,
-            dtype_map[dtype]
+            x, weight, bias, padding
         )
         oasr.synchronize()
         
@@ -188,24 +164,42 @@ class TestPointwiseConv1D:
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_pointwise_conv1d(self, oasr, batch_size, seq_len, in_ch, out_ch, dtype):
         """Test PointwiseConv1D against F.linear."""
-        dtype_map = {
-            torch.bfloat16: oasr.DataType.BF16,
-            torch.float16: oasr.DataType.FP16,
-        }
-        
         x = torch.randn(batch_size, seq_len, in_ch, device='cuda', dtype=dtype)
         weight = torch.randn(out_ch, in_ch, device='cuda', dtype=dtype)
         bias = torch.randn(out_ch, device='cuda', dtype=dtype)
         
         output = oasr.kernels.conv.pointwise_conv1d(
-            x, weight, bias,
-            oasr.ActivationType.SWISH, False,
-            dtype_map[dtype]
+            x, weight, bias
         )
         oasr.synchronize()
         
         expected = F.linear(x, weight, bias).to(dtype)
         
+        rtol = 1e-2 if dtype == torch.float16 else 1e-2
+        atol = 1e-2 if dtype == torch.float16 else 1e-2
+        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
+
+
+    @pytest.mark.parametrize("batch_size,seq_len,in_ch,out_ch", [
+        (2, 128, 256, 512),
+        (4, 256, 512, 256),
+        (2, 64, 768, 768),
+    ])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_pointwise_conv1d_activation(self, oasr, batch_size, seq_len, in_ch, out_ch, dtype):
+        """Test PointwiseConv1DActivation against F.linear."""
+        x = torch.randn(batch_size, seq_len, in_ch, device='cuda', dtype=dtype)
+        weight = torch.randn(out_ch, in_ch, device='cuda', dtype=dtype)
+        bias = torch.randn(out_ch, device='cuda', dtype=dtype)
+        
+        output = oasr.kernels.conv.pointwise_conv1d_activation(
+            x, weight, bias,
+            oasr.ActivationType.SWISH,
+        )
+        oasr.synchronize()
+        
+        expected = F.silu(F.linear(x, weight, bias)).to(dtype)
+
         rtol = 1e-2 if dtype == torch.float16 else 1e-2
         atol = 1e-2 if dtype == torch.float16 else 1e-2
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)

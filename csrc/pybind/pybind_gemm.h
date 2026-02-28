@@ -92,22 +92,32 @@ inline void registerGemmBindings(py::module_& kernels) {
     gemm_mod.def("invoke_gemm",
         [](const torch::Tensor& a, const torch::Tensor& b,
            std::optional<const torch::Tensor>& c,
-           py::object stream) -> py::tuple {
-            const int K = a.size(-1);
-            const int M = a.numel() / K;
-            const int N = b.size(0);
-            auto d = torch::empty({M, N}, a.options());
+           py::object stream) -> torch::Tensor {
             cudaStream_t s = stream.is_none()
                 ? nullptr
                 : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
 
             torch::Tensor c_tensor = c.has_value() ? c.value() : torch::Tensor();
-            auto status = invokeGemm(a, b, c_tensor, d, s);
-            return py::make_tuple(d, status);
+            auto d = invokeGemm(a, b, c_tensor, s);
+            return d;
         },
         py::arg("a"), py::arg("b"), py::arg("c") = py::none(),
         py::arg("stream") = py::none(),
         "Execute GEMM: D = A @ B + C (C is optional). Returns (output, status).");
+
+    gemm_mod.def("invoke_gemm_activation",
+        [](const torch::Tensor& a, const torch::Tensor& b,
+           std::optional<const torch::Tensor>& c,
+           ActivationType activation, py::object stream) -> torch::Tensor {
+            cudaStream_t s = stream.is_none()
+                ? nullptr
+                : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
+            torch::Tensor c_tensor = c.has_value() ? c.value() : torch::Tensor();
+            auto d = invokeGemmActivation(a, b, c_tensor, activation, s);
+            return d;
+        },
+        py::arg("a"), py::arg("b"), py::arg("c") = py::none(), py::arg("activation"), py::arg("stream") = py::none(),
+        "Execute GEMM with activation: D = activation(A @ B + C). Returns output tensor.");
 
     // --- Batched GEMM (strided) ---
     gemm_mod.def("invoke_bmm",

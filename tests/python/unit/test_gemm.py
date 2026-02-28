@@ -63,10 +63,7 @@ class TestGemm:
         A = torch.randn(M, K, device='cuda', dtype=dtype)
         B = torch.randn(N, K, device='cuda', dtype=dtype)
 
-        D, status = oasr.kernels.gemm.invoke_gemm(A, B)
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS, (
-            f'invoke_gemm failed: {oasr.kernels.gemm.get_gemm_status_string(status)}'
-        )
+        D = oasr.kernels.gemm.invoke_gemm(A, B)
         oasr.synchronize()
 
         expected = torch.matmul(A, B.T)
@@ -81,8 +78,7 @@ class TestGemm:
         A = torch.randn(M, K, device='cuda', dtype=dtype)
         B = torch.randn(N, K, device='cuda', dtype=dtype)
 
-        D, status = oasr.kernels.gemm.invoke_gemm(A, B)
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
+        D = oasr.kernels.gemm.invoke_gemm(A, B)
         oasr.synchronize()
 
         expected = torch.matmul(A, B.T)

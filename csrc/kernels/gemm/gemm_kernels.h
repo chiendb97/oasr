@@ -29,8 +29,8 @@ namespace gemm {
 /**
  * @brief Execute GEMM operation
  *
- * Computes: D = alpha * op(A) @ op(B) + beta * C
- * When C is undefined, computes: D = alpha * op(A) @ op(B)
+ * Computes: D = A @ B + C
+ * When C is undefined, computes: D = A @ B
  *
  * Dimensions are derived from tensor shapes:
  *   K = A.size(-1), M = A.numel() / K, N = B.size(0)
@@ -43,8 +43,7 @@ namespace gemm {
  * @param stream CUDA stream
  * @return Status code
  */
-GemmStatus invokeGemm(const torch::Tensor& A, const torch::Tensor& B,
-                      const torch::Tensor& C, torch::Tensor& D,
+torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& C,
                       cudaStream_t stream = nullptr);
 
 //==============================================================================
@@ -52,16 +51,14 @@ GemmStatus invokeGemm(const torch::Tensor& A, const torch::Tensor& B,
 //==============================================================================
 
 /**
- * @brief GEMM with fused bias and activation
+ * @brief GEMM with fused activation
  * 
- * Computes: D = activation(A @ B + bias)
+ * Computes: D = activation(A @ B + C)
  */
-template <typename ElementA, typename ElementB, typename ElementC>
-GemmStatus invokeGemmBiasActivation(
-    const torch::Tensor& A, const torch::Tensor& B,
-    const torch::Tensor& C, torch::Tensor& D,
+torch::Tensor invokeGemmActivation(
+    const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& C,
     ActivationType activation,
-    cudaStream_t stream);
+    cudaStream_t stream = nullptr);
 
 //==============================================================================
 // Auto-Tuning

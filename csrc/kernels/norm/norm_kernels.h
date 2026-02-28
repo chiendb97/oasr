@@ -23,7 +23,7 @@ namespace kernels {
  * @param eps Epsilon for numerical stability
  * @param stream CUDA stream
  */
-void invokeLayerNorm(const torch::Tensor& input, torch::Tensor& output,
+torch::Tensor invokeLayerNorm(const torch::Tensor& input,
                      const torch::Tensor& weight, const torch::Tensor& bias,
                      float eps, cudaStream_t stream);
 
@@ -40,7 +40,7 @@ void invokeLayerNorm(const torch::Tensor& input, torch::Tensor& output,
  * @param eps Epsilon for numerical stability
  * @param stream CUDA stream
  */
-void invokeRMSNorm(const torch::Tensor& input, torch::Tensor& output,
+torch::Tensor invokeRMSNorm(const torch::Tensor& input,
                    const torch::Tensor& weight, const torch::Tensor& bias,
                    float eps, cudaStream_t stream);
 
@@ -60,7 +60,7 @@ void invokeRMSNorm(const torch::Tensor& input, torch::Tensor& output,
  * @param eps Epsilon for numerical stability
  * @param stream CUDA stream
  */
-void invokeBatchNorm1D(const torch::Tensor& input, torch::Tensor& output,
+torch::Tensor invokeBatchNorm1D(const torch::Tensor& input,
                        const torch::Tensor& weight, const torch::Tensor& bias,
                        const torch::Tensor& running_mean, const torch::Tensor& running_var,
                        float eps, cudaStream_t stream);
@@ -76,21 +76,11 @@ void invokeBatchNorm1D(const torch::Tensor& input, torch::Tensor& output,
  * @param eps Epsilon for numerical stability
  * @param stream CUDA stream
  */
-void invokeGroupNorm(const torch::Tensor& input, torch::Tensor& output,
+torch::Tensor invokeGroupNorm(const torch::Tensor& input,
                      const torch::Tensor& weight, const torch::Tensor& bias,
                      int num_groups,
                      float eps, cudaStream_t stream);
 
-/**
- * @brief Fused LayerNorm + Linear kernel
- * 
- * Computes: output = LayerNorm(input) @ weight.T + bias
- * Common pattern in transformer blocks.
- */
-void invokeLayerNormLinear(const torch::Tensor& input, torch::Tensor& output,
-                           const torch::Tensor& ln_weight, const torch::Tensor& ln_bias,
-                           const torch::Tensor& weight, const torch::Tensor& bias,
-                           float eps, cudaStream_t stream);
 
 /**
  * @brief Fused Add + LayerNorm kernel
@@ -98,21 +88,9 @@ void invokeLayerNormLinear(const torch::Tensor& input, torch::Tensor& output,
  * Computes: output = LayerNorm(input + residual)
  * Common pattern after attention and FFN.
  */
-void invokeAddLayerNorm(const torch::Tensor& input, const torch::Tensor& residual,
-                        torch::Tensor& output,
+torch::Tensor invokeAddLayerNorm(const torch::Tensor& input, const torch::Tensor& residual,
                         const torch::Tensor& weight, const torch::Tensor& bias,
                         float eps, cudaStream_t stream);
-
-/**
- * @brief Fused Add + LayerNorm + Linear kernel
- * 
- * Computes: output = Linear(LayerNorm(input + residual))
- */
-void invokeAddLayerNormLinear(const torch::Tensor& input, const torch::Tensor& residual,
-                              torch::Tensor& output,
-                              const torch::Tensor& ln_weight, const torch::Tensor& ln_bias,
-                              const torch::Tensor& weight, const torch::Tensor& bias,
-                              float eps, cudaStream_t stream);
 
 // Template specializations
 template <typename T>
