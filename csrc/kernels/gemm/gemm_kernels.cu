@@ -76,10 +76,11 @@ struct CutlassGemmSM80 {
 
     static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
                           int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldc,
-                          ElementComputeEpilogue alpha, ElementComputeEpilogue beta,
+                          ElementComputeEpilogue alpha,
                           cudaStream_t stream) {
         int split_k_slices = 1;
-        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C ? C : D, C ? 0 : ldc},
+        float beta = (C == nullptr) ? 0.0f : 1.0f;
+        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0},
                                       {D, ldc}, {alpha, beta}, split_k_slices);
 
         Gemm gemm_op;
@@ -132,10 +133,11 @@ struct CutlassGemmReluSM80 {
 
     static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
                           int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldc,
-                          ElementComputeEpilogue alpha, ElementComputeEpilogue beta,
+                          ElementComputeEpilogue alpha,
                           cudaStream_t stream) {
         int split_k_slices = 1;
-        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C ? C : D, C ? 0 : ldc},
+        float beta = (C == nullptr) ? 0.0f : 1.0f;
+        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0},
                                       {D, ldc}, {alpha, beta}, split_k_slices);
 
         Gemm gemm_op;
@@ -188,10 +190,11 @@ struct CutlassGemmGeluSM80 {
 
     static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
                           int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldc,
-                          ElementComputeEpilogue alpha, ElementComputeEpilogue beta,
+                          ElementComputeEpilogue alpha,
                           cudaStream_t stream) {
         int split_k_slices = 1;
-        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C ? C : D, C ? 0 : ldc},
+        float beta = (C == nullptr) ? 0.0f : 1.0f;
+        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0},
                                       {D, ldc}, {alpha, beta}, split_k_slices);
 
         Gemm gemm_op;
@@ -244,10 +247,11 @@ struct CutlassGemmSwishSM80 {
 
     static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
                           int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldc,
-                          ElementComputeEpilogue alpha, ElementComputeEpilogue beta,
+                          ElementComputeEpilogue alpha,
                           cudaStream_t stream) {
         int split_k_slices = 1;
-        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C ? C : D, C ? 0 : ldc},
+        float beta = (C == nullptr) ? 0.0f : 1.0f;
+        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0},
                                       {D, ldc}, {alpha, beta}, split_k_slices);
 
         Gemm gemm_op;
@@ -298,7 +302,6 @@ torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const t
     }
 
     float alpha = 1.0f;
-    float beta = (C_ptr == nullptr) ? 0.0f : 1.0f;
 
     uint64_t lda = K;
     uint64_t ldb = K;
@@ -317,7 +320,7 @@ torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const t
                                           reinterpret_cast<const cutlass::half_t*>(B_ptr),
                                           reinterpret_cast<const cutlass::half_t*>(C_ptr),
                                           reinterpret_cast<cutlass::half_t*>(D_ptr), M, N, K, lda,
-                                          ldb, ldc, alpha, beta, stream);
+                                          ldb, ldc, alpha, stream);
     } else if (A.scalar_type() == torch::kBFloat16) {
         status = CutlassGemmSM80<cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t,
                                  LayoutA, LayoutB,
@@ -325,7 +328,7 @@ torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const t
                                                reinterpret_cast<const cutlass::bfloat16_t*>(B_ptr),
                                                reinterpret_cast<const cutlass::bfloat16_t*>(C_ptr),
                                                reinterpret_cast<cutlass::bfloat16_t*>(D_ptr), M, N,
-                                               K, lda, ldb, ldc, alpha, beta, stream);
+                                               K, lda, ldb, ldc, alpha, stream);
     } else {
         status = GemmStatus::INVALID_ARGUMENT;
     }
@@ -365,7 +368,6 @@ torch::Tensor invokeGemmActivation(const torch::Tensor& A, const torch::Tensor& 
     }
 
     float alpha = 1.0f;
-    float beta = (C_ptr == nullptr) ? 0.0f : 1.0f;
 
     uint64_t lda = K;
     uint64_t ldb = K;
@@ -386,7 +388,7 @@ torch::Tensor invokeGemmActivation(const torch::Tensor& A, const torch::Tensor& 
                                                   reinterpret_cast<const cutlass::half_t*>(B_ptr),
                                                   reinterpret_cast<const cutlass::half_t*>(C_ptr),
                                                   reinterpret_cast<cutlass::half_t*>(D_ptr), M, N,
-                                                  K, lda, ldb, ldc, alpha, beta, stream);
+                                                  K, lda, ldb, ldc, alpha, stream);
         } else if (activation == ActivationType::GELU) {
             status =
                 CutlassGemmGeluSM80<cutlass::half_t, cutlass::half_t, cutlass::half_t, LayoutA,
@@ -395,7 +397,7 @@ torch::Tensor invokeGemmActivation(const torch::Tensor& A, const torch::Tensor& 
                                                   reinterpret_cast<const cutlass::half_t*>(B_ptr),
                                                   reinterpret_cast<const cutlass::half_t*>(C_ptr),
                                                   reinterpret_cast<cutlass::half_t*>(D_ptr), M, N,
-                                                  K, lda, ldb, ldc, alpha, beta, stream);
+                                                  K, lda, ldb, ldc, alpha, stream);
         } else if (activation == ActivationType::SWISH) {
             status =
                 CutlassGemmSwishSM80<cutlass::half_t, cutlass::half_t, cutlass::half_t, LayoutA,
@@ -404,7 +406,7 @@ torch::Tensor invokeGemmActivation(const torch::Tensor& A, const torch::Tensor& 
                                                    reinterpret_cast<const cutlass::half_t*>(B_ptr),
                                                    reinterpret_cast<const cutlass::half_t*>(C_ptr),
                                                    reinterpret_cast<cutlass::half_t*>(D_ptr), M, N,
-                                                   K, lda, ldb, ldc, alpha, beta, stream);
+                                                   K, lda, ldb, ldc, alpha, stream);
         } else {
             status = GemmStatus::INVALID_ARGUMENT;
         }
@@ -416,7 +418,7 @@ torch::Tensor invokeGemmActivation(const torch::Tensor& A, const torch::Tensor& 
                               reinterpret_cast<const cutlass::bfloat16_t*>(B_ptr),
                               reinterpret_cast<const cutlass::bfloat16_t*>(C_ptr),
                               reinterpret_cast<cutlass::bfloat16_t*>(D_ptr), M, N, K, lda, ldb, ldc,
-                              alpha, beta, stream);
+                              alpha, stream);
         } else if (activation == ActivationType::GELU) {
             status = CutlassGemmGeluSM80<
                 cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t, LayoutA, LayoutB,
@@ -424,7 +426,7 @@ torch::Tensor invokeGemmActivation(const torch::Tensor& A, const torch::Tensor& 
                               reinterpret_cast<const cutlass::bfloat16_t*>(B_ptr),
                               reinterpret_cast<const cutlass::bfloat16_t*>(C_ptr),
                               reinterpret_cast<cutlass::bfloat16_t*>(D_ptr), M, N, K, lda, ldb, ldc,
-                              alpha, beta, stream);
+                              alpha, stream);
         } else if (activation == ActivationType::SWISH) {
             status = CutlassGemmSwishSM80<
                 cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t, LayoutA, LayoutB,
@@ -432,7 +434,7 @@ torch::Tensor invokeGemmActivation(const torch::Tensor& A, const torch::Tensor& 
                               reinterpret_cast<const cutlass::bfloat16_t*>(B_ptr),
                               reinterpret_cast<const cutlass::bfloat16_t*>(C_ptr),
                               reinterpret_cast<cutlass::bfloat16_t*>(D_ptr), M, N, K, lda, ldb, ldc,
-                              alpha, beta, stream);
+                              alpha, stream);
         } else {
             status = GemmStatus::INVALID_ARGUMENT;
         }
