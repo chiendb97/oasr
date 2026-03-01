@@ -735,31 +735,6 @@ torch::Tensor invokeCausalConv1D(const torch::Tensor& input, void* state_buffer,
     return output;
 }
 
-void* initConvState(int batch_size, int kernel_size, int channels, DataType dtype) {
-    int state_len = kernel_size - 1;
-    size_t buffer_size = batch_size * state_len * channels * getDataTypeSize(dtype);
-
-    void* buffer = nullptr;
-    OASR_CUDA_CHECK(cudaMalloc(&buffer, buffer_size));
-    OASR_CUDA_CHECK(cudaMemset(buffer, 0, buffer_size));
-    return buffer;
-}
-
-void resetConvState(void* state_buffer, int batch_size, int kernel_size, int channels,
-                    DataType dtype, cudaStream_t stream) {
-    if (state_buffer != nullptr) {
-        int state_len = kernel_size - 1;
-        size_t bytes = batch_size * state_len * channels * getDataTypeSize(dtype);
-        OASR_CUDA_CHECK(cudaMemsetAsync(state_buffer, 0, bytes, stream));
-    }
-}
-
-void freeConvState(void* state_buffer) {
-    if (state_buffer != nullptr) {
-        OASR_CUDA_CHECK(cudaFree(state_buffer));
-    }
-}
-
 // Explicit template instantiations
 template void invokeDepthwiseConv1DTyped<float>(const torch::Tensor&, const torch::Tensor&,
                                                 const torch::Tensor&, torch::Tensor&, int,

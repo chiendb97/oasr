@@ -35,7 +35,6 @@ torch::Tensor invokeConv1D(const torch::Tensor& input,
  * @param input Input [batch, seq_len, channels]
  * @param weight Weight [kernel_size, channels]
  * @param bias Optional bias [channels]
- * @param output Output [batch, out_seq_len, channels]
  * @param padding Padding size
  * @param stream CUDA stream
  */
@@ -52,7 +51,6 @@ torch::Tensor invokeDepthwiseConv1D(const torch::Tensor& input, const torch::Ten
  * @param input Input [batch, seq_len, channels]
  * @param weight Weight [kernel_size, channels]
  * @param bias Optional bias [channels]
- * @param output Output [batch, out_seq_len, channels]
  * @param padding Padding size
  * @param stream CUDA stream
  */
@@ -70,7 +68,6 @@ torch::Tensor invokeDepthwiseConv1DSilu(const torch::Tensor& input, const torch:
  * @param input Input [batch, seq_len, in_channels]
  * @param weight Weight [out_channels, in_channels]
  * @param bias Optional bias [out_channels]
- * @param output Output [batch, seq_len, out_channels]
  * @param stream CUDA stream
  */
 torch::Tensor invokePointwiseConv1D(const torch::Tensor& input, const torch::Tensor& weight,
@@ -103,30 +100,11 @@ torch::Tensor invokePointwiseConv1DActivation(const torch::Tensor& input, const 
  * @param state_buffer State buffer (updated in-place) [batch, kernel_size-1, channels]
  * @param weight Convolution weight
  * @param bias Optional bias
- * @param output Output [batch, chunk_len, channels]
- * @param dtype Data type
  * @param stream CUDA stream
  */
 torch::Tensor invokeCausalConv1D(const torch::Tensor& input, void* state_buffer,
                         const torch::Tensor& weight, const torch::Tensor& bias,
                         DataType dtype, cudaStream_t stream);
-
-/**
- * @brief Allocate and initialize convolution state buffer for streaming.
- * Caller must cudaFree the returned buffer when done.
- */
-void* initConvState(int batch_size, int kernel_size, int channels, DataType dtype);
-
-/**
- * @brief Reset convolution state (zero out buffer)
- */
-void resetConvState(void* state_buffer, int batch_size, int kernel_size, int channels,
-                    DataType dtype, cudaStream_t stream);
-
-/**
- * @brief Free convolution state buffer allocated by initConvState
- */
-void freeConvState(void* state_buffer);
 
 // GLU (Gated Linear Unit) activation
 // output = input[:, :half] * sigmoid(input[:, half:])
