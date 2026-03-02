@@ -38,10 +38,8 @@ namespace gemm {
  * @param A Input tensor [M, K] or [batch, M', K]
  * @param B Input tensor [N, K]
  * @param C Optional bias tensor [M, N] (undefined tensor to skip)
- * @param D Output tensor [M, N]
- * @param dtype Data type (FP16 or BF16)
  * @param stream CUDA stream
- * @return Status code
+ * @return Output tensor [M, N]
  */
 torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& C,
                       cudaStream_t stream = nullptr);
@@ -54,6 +52,13 @@ torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const t
  * @brief GEMM with fused activation
  * 
  * Computes: D = activation(A @ B + C)
+ *
+ * @param A Input tensor [M, K] or [batch, M', K]
+ * @param B Input tensor [N, K]
+ * @param C Optional bias tensor [M, N] (undefined tensor to skip)
+ * @param activation Activation type
+ * @param stream CUDA stream
+ * @return Output tensor [M, N]
  */
 torch::Tensor invokeGemmActivation(
     const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& C,
