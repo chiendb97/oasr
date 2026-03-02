@@ -14,6 +14,7 @@ sys.path.insert(0, 'python')
 
 import argparse
 import torch
+import torch.nn.functional as F
 
 import oasr
 
@@ -52,76 +53,32 @@ def profile_kernel(name: str, fn, warmup: int = 3, profile_iters: int = 1):
 
 def setup_gemm(M, N, K, dtype=torch.float16):
     """Setup tensors for single GEMM: D = A @ B."""
-    dtype_map = {
-        torch.float32: DataType.FP32,
-        torch.float16: DataType.FP16,
-        torch.bfloat16: DataType.BF16,
-    }
-    if dtype not in dtype_map:
-        dtype = torch.float16
-    oasr_dtype = dtype_map[dtype]
 
     A = torch.randn(M, K, device='cuda', dtype=dtype)
-    B = torch.randn(K, N, device='cuda', dtype=dtype)
-
-    trans = gemm_mod.TransposeOp.NoTranspose
-    lda, ldb, ldd = K, N, N
-
-    # Pre-allocate D for benchmarking (avoid alloc overhead in hot loop)
-    D_holder = [None]
+    B = torch.randn(N, K, device='cuda', dtype=dtype)
 
     def oasr_fn():
-        D_holder[0], _ = gemm_mod.invoke_gemm(
-            A, B,
-            M, N, K, lda, ldb, ldd,
-            alpha=1.0, beta=0.0,
-            trans_a=trans, trans_b=trans,
-            dtype=oasr_dtype, stream=None,
+        return gemm_mod.invoke_gemm(
+            A, B, stream=None,
         )
 
-    D_pt = torch.empty(M, N, device='cuda', dtype=dtype)
-
     def pytorch_fn():
-        torch.matmul(A, B, out=D_pt)
+        return F.linear(A, B)
 
     return oasr_fn, pytorch_fn
 
 
 def setup_bmm(batch_size, M, N, K, dtype=torch.float16):
     """Setup tensors for strided batched GEMM: D[b] = A[b] @ B[b]."""
-    dtype_map = {
-        torch.float32: DataType.FP32,
-        torch.float16: DataType.FP16,
-        torch.bfloat16: DataType.BF16,
-    }
-    if dtype not in dtype_map:
-        dtype = torch.float16
-    oasr_dtype = dtype_map[dtype]
-
     A = torch.randn(batch_size, M, K, device='cuda', dtype=dtype)
-    B = torch.randn(batch_size, K, N, device='cuda', dtype=dtype)
-
-    lda, ldb, ldd = K, N, N
-    stride_a, stride_b, stride_d = M * K, K * N, M * N
-    trans = gemm_mod.TransposeOp.NoTranspose
-
-    D_holder = [None]
+    B = torch.randn(batch_size, N, K, device='cuda', dtype=dtype)
+    B_transposed = B.transpose(1, 2).contiguous()
 
     def oasr_fn():
-        D_holder[0], _ = gemm_mod.invoke_bmm(
-            A, B,
-            batch_size, M, N, K,
-            lda, ldb, ldd,
-            stride_a, stride_b, stride_d,
-            alpha=1.0, beta=0.0,
-            trans_a=trans, trans_b=trans,
-            dtype=oasr_dtype, stream=None,
-        )
-
-    D_pt = torch.empty(batch_size, M, N, device='cuda', dtype=dtype)
+        return gemm_mod.invoke_bmm(A, B_transposed, stream=None)
 
     def pytorch_fn():
-        torch.bmm(A, B, out=D_pt)
+        return torch.bmm(A, B_transposed)
 
     return oasr_fn, pytorch_fn
 
@@ -205,7 +162,7 @@ def benchmark_gemm():
     ]
 
     print("\n" + "=" * 70)
-    print("GEMM Benchmark (Conformer-base / Conformer-large workload)")
+    print("GEMM Benchmark")
     print("=" * 70)
     print(f"\n{'Shape (M, N, K)':<25} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 65)
@@ -226,15 +183,15 @@ def benchmark_bmm():
     import triton
 
     configs = [
-        (256, 250, 250, 64),
+        (256, 200, 200, 64),
         (512, 250, 250, 64),
-        (256, 125, 125, 64),
-        (512, 500, 500, 64),
-        (64, 250, 64, 64),
+        (256, 100, 100, 64),
+        (512, 200, 200, 64),
+        (64, 200, 64, 64),
     ]
 
     print("\n" + "=" * 70)
-    print("Batched GEMM (BMM) Benchmark (Conformer attention workload)")
+    print("Batched GEMM (BMM) Benchmark")
     print("=" * 70)
     print(f"\n{'Shape (B, M, N, K)':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
@@ -262,7 +219,7 @@ def benchmark_group_gemm():
     ]
 
     print("\n" + "=" * 70)
-    print("Grouped GEMM Benchmark (Conformer multi-block/head workload)")
+    print("Grouped GEMM Benchmark")
     print("=" * 70)
     print(f"\n{'Config':<40} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 80)
@@ -285,8 +242,8 @@ def benchmark_group_gemm():
 
 PROFILE_CONFIGS = {
     'gemm': (16000, 256, 2048),
-    'bmm': (256, 250, 250, 64),
-    'group_gemm': (64, (250, 64, 64)),
+    'bmm': (256, 200, 200, 64),
+    'group_gemm': (64, (200, 64, 64)),
 }
 
 

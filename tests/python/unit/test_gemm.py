@@ -57,9 +57,9 @@ class TestGemm:
         (32, 32, 32),
         (256, 32, 128),
     ])
-    def test_gemm_fp16(self, oasr, M, N, K):
-        """Test GEMM FP16 against torch.matmul."""
-        dtype = torch.float16
+    @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+    def test_gemm(self, oasr, M, N, K, dtype):
+        """Test GEMM against torch.matmul."""
         A = torch.randn(M, K, device='cuda', dtype=dtype)
         B = torch.randn(N, K, device='cuda', dtype=dtype)
 
@@ -68,21 +68,6 @@ class TestGemm:
 
         expected = torch.matmul(A, B.T)
         torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
-
-    @pytest.mark.parametrize('M,N,K', [(64, 128, 256)])
-    def test_gemm_bf16(self, oasr, M, N, K):
-        """Test GEMM BF16 against torch.matmul (skipped if BF16 not supported)."""
-        if not torch.cuda.is_bf16_supported():
-            pytest.skip('BF16 not supported on this device')
-        dtype = torch.bfloat16
-        A = torch.randn(M, K, device='cuda', dtype=dtype)
-        B = torch.randn(N, K, device='cuda', dtype=dtype)
-
-        D = oasr.kernels.gemm.invoke_gemm(A, B)
-        oasr.synchronize()
-
-        expected = torch.matmul(A, B.T)
-        torch.testing.assert_close(D.float(), expected.float(), rtol=1e-2, atol=1e-2)
 
 
 # -----------------------------------------------------------------------------
@@ -93,53 +78,21 @@ class TestBmm:
     """Tests for batched GEMM (strided) kernel."""
 
     @pytest.mark.parametrize('batch_size,M,N,K', [
-        (4, 64, 64, 128),
-        (2, 32, 32, 32),
+        (4, 64, 128, 256),
+        (3, 32, 32, 32),
+        (3, 200, 200, 32),
     ])
-    def test_bmm_fp16(self, oasr, batch_size, M, N, K):
-        """Test BMM FP16 against torch.bmm."""
-        dtype = torch.float16
+    @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+    def test_bmm(self, oasr, batch_size, M, N, K, dtype):
+        """Test BMM against torch.bmm."""
         A = torch.randn(batch_size, M, K, device='cuda', dtype=dtype)
-        B = torch.randn(batch_size, K, N, device='cuda', dtype=dtype)
+        B = torch.randn(batch_size, N, K, device='cuda', dtype=dtype)
 
-        stride_a, stride_b, stride_d = M * K, K * N, M * N
-        D, status = oasr.kernels.gemm.invoke_bmm(
-            A, B,
-            batch_size, M, N, K, K, N, N,
-            stride_a, stride_b, stride_d, 1.0, 0.0,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.DataType.FP16,
-        )
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
+        D = oasr.kernels.gemm.invoke_bmm(A, B)
         oasr.synchronize()
 
-        expected = torch.bmm(A, B)
+        expected = torch.bmm(A, B.permute(0, 2, 1))
         torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
-
-    def test_bmm_bf16(self, oasr):
-        """Test BMM BF16 against torch.bmm (skipped if BF16 not supported)."""
-        if not torch.cuda.is_bf16_supported():
-            pytest.skip('BF16 not supported on this device')
-        batch_size, M, N, K = 4, 64, 64, 128
-        dtype = torch.bfloat16
-        A = torch.randn(batch_size, M, K, device='cuda', dtype=dtype)
-        B = torch.randn(batch_size, K, N, device='cuda', dtype=dtype)
-
-        stride_a, stride_b, stride_d = M * K, K * N, M * N
-        D, status = oasr.kernels.gemm.invoke_bmm(
-            A, B,
-            batch_size, M, N, K, K, N, N,
-            stride_a, stride_b, stride_d, 1.0, 0.0,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.DataType.BF16,
-        )
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
-        oasr.synchronize()
-
-        expected = torch.bmm(A, B)
-        torch.testing.assert_close(D.float(), expected.float(), rtol=1e-2, atol=1e-2)
 
 
 # -----------------------------------------------------------------------------

@@ -122,32 +122,16 @@ inline void registerGemmBindings(py::module_& kernels) {
     // --- Batched GEMM (strided) ---
     gemm_mod.def("invoke_bmm",
         [](const torch::Tensor& a, const torch::Tensor& b,
-           int batch_size, int M, int N, int K,
-           int64_t lda, int64_t ldb, int64_t ldd,
-           int64_t stride_a, int64_t stride_b, int64_t stride_d,
-           float alpha, float beta,
-           TransposeOp trans_a, TransposeOp trans_b,
-           DataType dtype, py::object stream) -> py::tuple {
-            auto d = torch::empty({batch_size, M, N}, a.options());
+           py::object stream) -> torch::Tensor {
             cudaStream_t s = stream.is_none()
                 ? nullptr
                 : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
-            auto status = invokeBmm(
-                a.data_ptr(), b.data_ptr(), d.data_ptr(),
-                batch_size, M, N, K, lda, ldb, ldd,
-                stride_a, stride_b, stride_d, alpha, beta,
-                trans_a, trans_b, dtype, s);
-            return py::make_tuple(d, status);
+            auto d = invokeBmm(a, b, s);
+            return d;
         },
         py::arg("a"), py::arg("b"),
-        py::arg("batch_size"), py::arg("M"), py::arg("N"), py::arg("K"),
-        py::arg("lda"), py::arg("ldb"), py::arg("ldd"),
-        py::arg("stride_a"), py::arg("stride_b"), py::arg("stride_d"),
-        py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
-        py::arg("trans_a") = TransposeOp::NoTranspose,
-        py::arg("trans_b") = TransposeOp::NoTranspose,
-        py::arg("dtype"), py::arg("stream") = py::none(),
-        "Execute strided batched GEMM. Returns (output, status).");
+        py::arg("stream") = py::none(),
+        "Execute batched GEMM. Returns output tensor.");
 
     // --- Grouped GEMM (pointer arrays, kept low-level) ---
     gemm_mod.def("invoke_group_gemm",
@@ -190,11 +174,6 @@ inline void registerGemmBindings(py::module_& kernels) {
         py::arg("num_problems"), py::arg("dtype"),
         py::arg("config") = GemmConfig(),
         "Query workspace sizes for grouped GEMM (returns float_ws, int_ws)");
-
-    gemm_mod.def("query_bmm_workspace_size", &queryBmmWorkspaceSize,
-        py::arg("batch_size"), py::arg("M"), py::arg("N"), py::arg("K"),
-        py::arg("dtype"), py::arg("config") = GemmConfig(),
-        "Query workspace size for batched GEMM");
 
     // --- Utility functions ---
     gemm_mod.def("get_sm_version", &getSMVersion, py::arg("device_id") = -1,
