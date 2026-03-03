@@ -19,8 +19,6 @@ namespace kernels {
 // Constants and helpers
 // =============================================================================
 
-constexpr int MAX_THREADS_PER_BLOCK = 1024;
-
 // Sigmoid function
 template <typename T>
 __device__ __forceinline__ T sigmoid(T x) {
