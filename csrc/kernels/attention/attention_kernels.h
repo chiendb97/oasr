@@ -4,7 +4,6 @@
 #pragma once
 
 #include "attention_params.h"
-#include "common/tensor.h"
 #include <cuda_runtime.h>
 
 namespace oasr {

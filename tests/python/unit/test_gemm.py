@@ -57,71 +57,17 @@ class TestGemm:
         (32, 32, 32),
         (256, 32, 128),
     ])
-    def test_gemm_fp16(self, oasr, M, N, K):
-        """Test GEMM FP16 against torch.matmul."""
-        dtype = torch.float16
+    @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+    def test_gemm(self, oasr, M, N, K, dtype):
+        """Test GEMM against torch.matmul."""
         A = torch.randn(M, K, device='cuda', dtype=dtype)
-        B = torch.randn(K, N, device='cuda', dtype=dtype)
-        D = torch.empty(M, N, device='cuda', dtype=dtype)
+        B = torch.randn(N, K, device='cuda', dtype=dtype)
 
-        status = oasr.kernels.gemm.invoke_gemm(
-            A.data_ptr(), B.data_ptr(), D.data_ptr(),
-            M, N, K, K, N, N, 1.0, 0.0,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.DataType.FP16,
-        )
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS, (
-            f'invoke_gemm failed: {oasr.kernels.gemm.get_gemm_status_string(status)}'
-        )
+        D = oasr.kernels.gemm.invoke_gemm(A, B)
         oasr.synchronize()
 
-        expected = torch.matmul(A, B)
+        expected = torch.matmul(A, B.T)
         torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
-
-    def test_gemm_alpha_beta(self, oasr):
-        """Test GEMM with alpha=2.0, beta=0 -> D = 2 * A @ B."""
-        M, N, K = 32, 64, 48
-        dtype = torch.float16
-        A = torch.randn(M, K, device='cuda', dtype=dtype)
-        B = torch.randn(K, N, device='cuda', dtype=dtype)
-        D = torch.empty(M, N, device='cuda', dtype=dtype)
-
-        status = oasr.kernels.gemm.invoke_gemm(
-            A.data_ptr(), B.data_ptr(), D.data_ptr(),
-            M, N, K, K, N, N, 2.0, 0.0,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.DataType.FP16,
-        )
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
-        oasr.synchronize()
-
-        expected = 2.0 * torch.matmul(A, B)
-        torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
-
-    @pytest.mark.parametrize('M,N,K', [(64, 128, 256)])
-    def test_gemm_bf16(self, oasr, M, N, K):
-        """Test GEMM BF16 against torch.matmul (skipped if BF16 not supported)."""
-        if not torch.cuda.is_bf16_supported():
-            pytest.skip('BF16 not supported on this device')
-        dtype = torch.bfloat16
-        A = torch.randn(M, K, device='cuda', dtype=dtype)
-        B = torch.randn(K, N, device='cuda', dtype=dtype)
-        D = torch.empty(M, N, device='cuda', dtype=dtype)
-
-        status = oasr.kernels.gemm.invoke_gemm(
-            A.data_ptr(), B.data_ptr(), D.data_ptr(),
-            M, N, K, K, N, N, 1.0, 0.0,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.DataType.BF16,
-        )
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
-        oasr.synchronize()
-
-        expected = torch.matmul(A, B)
-        torch.testing.assert_close(D.float(), expected.float(), rtol=1e-2, atol=1e-2)
 
 
 # -----------------------------------------------------------------------------
@@ -132,145 +78,65 @@ class TestBmm:
     """Tests for batched GEMM (strided) kernel."""
 
     @pytest.mark.parametrize('batch_size,M,N,K', [
-        (4, 64, 64, 128),
-        (2, 32, 32, 32),
+        (4, 64, 128, 256),
+        (3, 32, 32, 32),
+        (3, 200, 200, 32),
     ])
-    def test_bmm_fp16(self, oasr, batch_size, M, N, K):
-        """Test BMM FP16 against torch.bmm."""
-        dtype = torch.float16
+    @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+    def test_bmm(self, oasr, batch_size, M, N, K, dtype):
+        """Test BMM against torch.bmm."""
         A = torch.randn(batch_size, M, K, device='cuda', dtype=dtype)
-        B = torch.randn(batch_size, K, N, device='cuda', dtype=dtype)
-        D = torch.empty(batch_size, M, N, device='cuda', dtype=dtype)
+        B = torch.randn(batch_size, N, K, device='cuda', dtype=dtype)
 
-        stride_a, stride_b, stride_d = M * K, K * N, M * N
-        status = oasr.kernels.gemm.invoke_bmm(
-            A.data_ptr(), B.data_ptr(), D.data_ptr(),
-            batch_size, M, N, K, K, N, N,
-            stride_a, stride_b, stride_d, 1.0, 0.0,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.DataType.FP16,
-        )
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
+        D = oasr.kernels.gemm.invoke_bmm(A, B)
         oasr.synchronize()
 
-        expected = torch.bmm(A, B)
+        expected = torch.bmm(A, B.permute(0, 2, 1))
         torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
-
-    def test_bmm_bf16(self, oasr):
-        """Test BMM BF16 against torch.bmm (skipped if BF16 not supported)."""
-        if not torch.cuda.is_bf16_supported():
-            pytest.skip('BF16 not supported on this device')
-        batch_size, M, N, K = 4, 64, 64, 128
-        dtype = torch.bfloat16
-        A = torch.randn(batch_size, M, K, device='cuda', dtype=dtype)
-        B = torch.randn(batch_size, K, N, device='cuda', dtype=dtype)
-        D = torch.empty(batch_size, M, N, device='cuda', dtype=dtype)
-
-        stride_a, stride_b, stride_d = M * K, K * N, M * N
-        status = oasr.kernels.gemm.invoke_bmm(
-            A.data_ptr(), B.data_ptr(), D.data_ptr(),
-            batch_size, M, N, K, K, N, N,
-            stride_a, stride_b, stride_d, 1.0, 0.0,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.kernels.gemm.TransposeOp.NoTranspose,
-            oasr.DataType.BF16,
-        )
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
-        oasr.synchronize()
-
-        expected = torch.bmm(A, B)
-        torch.testing.assert_close(D.float(), expected.float(), rtol=1e-2, atol=1e-2)
-
-
-# -----------------------------------------------------------------------------
-# Grouped GEMM (variable-sized problems)
-# -----------------------------------------------------------------------------
-
-def _invoke_group_gemm(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype):
-    """Build workspace and call invoke_group_gemm with direct parameters."""
-    oasr_dtype = oasr.DataType.FP16 if dtype == torch.float16 else oasr.DataType.BF16
-    num_problems = len(problem_sizes)
-
-    problems_MNK = []
-    lda_list, ldb_list, ldd_list = [], [], []
-    for M, N, K in problem_sizes:
-        problems_MNK.extend([M, N, K])
-        lda_list.append(K)
-        ldb_list.append(N)
-        ldd_list.append(N)
-
-    a_ptrs = torch.tensor([t.data_ptr() for t in A_tensors], dtype=torch.int64, device='cuda')
-    b_ptrs = torch.tensor([t.data_ptr() for t in B_tensors], dtype=torch.int64, device='cuda')
-    d_ptrs = torch.tensor([t.data_ptr() for t in D_tensors], dtype=torch.int64, device='cuda')
-    problems_tensor = torch.tensor(problems_MNK, dtype=torch.int32, device='cuda')
-    lda_tensor = torch.tensor(lda_list, dtype=torch.int64, device='cuda')
-    ldb_tensor = torch.tensor(ldb_list, dtype=torch.int64, device='cuda')
-    ldd_tensor = torch.tensor(ldd_list, dtype=torch.int64, device='cuda')
-
-    float_ws, int_ws = oasr.kernels.gemm.query_group_gemm_workspace_size(num_problems, oasr_dtype)
-    workspace_float = torch.empty(float_ws, dtype=torch.uint8, device='cuda')
-
-    return oasr.kernels.gemm.invoke_group_gemm(
-        problems_tensor.data_ptr(),
-        num_problems,
-        a_ptrs.data_ptr(), b_ptrs.data_ptr(), d_ptrs.data_ptr(),
-        lda_tensor.data_ptr(), ldb_tensor.data_ptr(), ldd_tensor.data_ptr(),
-        oasr_dtype,
-        workspace_float.data_ptr(), float_ws,
-    )
 
 
 class TestGroupGemm:
-    """Tests for grouped GEMM kernel (variable-sized problems)."""
+    """Tests for grouped GEMM kernel (variable M per group, fixed N, K)."""
 
-    def test_group_gemm_single_problem(self, oasr):
+    @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+    def test_group_gemm_single_problem(self, oasr, dtype):
         """Test grouped GEMM with one problem."""
-        problem_sizes = [(64, 128, 256)]
-        dtype = torch.float16
-        A_tensors = [torch.randn(M, K, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
-        B_tensors = [torch.randn(K, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
-        D_tensors = [torch.empty(M, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
+        # Fixed N, K; single group with variable M
+        M, N, K = 32, 64, 64
+        A = torch.randn(M, K, device='cuda', dtype=dtype)
+        B = torch.randn(1, K, N, device='cuda', dtype=dtype)
+        offset = torch.tensor([M], dtype=torch.int64, device='cuda')
 
-        status = _invoke_group_gemm(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype)
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
+        D = oasr.kernels.gemm.invoke_group_gemm(A, B, offset)
         oasr.synchronize()
 
-        for i, (M, N, K) in enumerate(problem_sizes):
-            expected = torch.matmul(A_tensors[i], B_tensors[i])
-            torch.testing.assert_close(D_tensors[i], expected, rtol=1e-2, atol=1e-2)
+        assert D.shape == (M, N)
+        expected = torch.matmul(A, B[0].T)
+        torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
 
-    def test_group_gemm_multiple_same_size(self, oasr):
-        """Test grouped GEMM with multiple identical problem sizes."""
-        problem_sizes = [(32, 64, 64)] * 4
-        dtype = torch.float16
-        A_tensors = [torch.randn(M, K, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
-        B_tensors = [torch.randn(K, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
-        D_tensors = [torch.empty(M, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
+    @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+    def test_group_gemm_variable_sizes(self, oasr, dtype):
+        """Test grouped GEMM with different M per group (same N, K)."""
+        # M per group: 32, 64, 16; shared N=64, K=64
+        M_list = [32, 64, 16]
+        N, K = 128, 64
+        L = sum(M_list)
+        num_groups = len(M_list)
 
-        status = _invoke_group_gemm(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype)
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
+        A = torch.randn(L, K, device='cuda', dtype=dtype)
+        B = torch.randn(num_groups, N, K, device='cuda', dtype=dtype)
+        offset = torch.cumsum(torch.tensor(M_list, dtype=torch.int32, device='cuda'), dim=0, dtype=torch.int32)
+
+        D = oasr.kernels.gemm.invoke_group_gemm(A, B, offset)
         oasr.synchronize()
 
-        for i in range(len(problem_sizes)):
-            expected = torch.matmul(A_tensors[i], B_tensors[i])
-            torch.testing.assert_close(D_tensors[i], expected, rtol=1e-2, atol=1e-2)
+        assert D.shape == (L, N)
 
-    def test_group_gemm_variable_sizes(self, oasr):
-        """Test grouped GEMM with different M, N, K per problem."""
-        problem_sizes = [(32, 64, 48), (64, 32, 96), (16, 128, 64)]
-        dtype = torch.float16
-        A_tensors = [torch.randn(M, K, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
-        B_tensors = [torch.randn(K, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
-        D_tensors = [torch.empty(M, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
+        # Use grouped_mm for the expected result
+        B_transposed = B.transpose(1, 2).contiguous()
+        expected = torch.nn.functional.grouped_mm(A, B_transposed, offs=offset)
 
-        status = _invoke_group_gemm(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype)
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
-        oasr.synchronize()
-
-        for i, (M, N, K) in enumerate(problem_sizes):
-            expected = torch.matmul(A_tensors[i], B_tensors[i])
-            torch.testing.assert_close(D_tensors[i], expected, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
 
 
 # -----------------------------------------------------------------------------
@@ -279,22 +145,6 @@ class TestGroupGemm:
 
 class TestGemmHelpers:
     """Tests for GEMM helper APIs."""
-
-    def test_query_gemm_workspace_size(self, oasr):
-        """query_gemm_workspace_size returns non-negative int."""
-        size = oasr.kernels.gemm.query_gemm_workspace_size(128, 256, 512, oasr.DataType.FP16)
-        assert isinstance(size, int) and size >= 0
-
-    def test_query_bmm_workspace_size(self, oasr):
-        """query_bmm_workspace_size returns non-negative int."""
-        size = oasr.kernels.gemm.query_bmm_workspace_size(8, 64, 64, 128, oasr.DataType.FP16)
-        assert isinstance(size, int) and size >= 0
-
-    def test_query_group_gemm_workspace_size(self, oasr):
-        """query_group_gemm_workspace_size returns (float_ws, int_ws) >= 0."""
-        float_ws, int_ws = oasr.kernels.gemm.query_group_gemm_workspace_size(4, oasr.DataType.FP16)
-        assert isinstance(float_ws, int) and float_ws >= 0
-        assert isinstance(int_ws, int) and int_ws >= 0
 
     def test_get_gemm_status_string(self, oasr):
         """get_gemm_status_string returns string containing status name."""

@@ -31,20 +31,33 @@ namespace oasr {
 namespace kernels {
 namespace gemm {
 
-template <typename ElementA, typename ElementB, typename ElementC,
-          typename LayoutA, typename LayoutB, typename LayoutC>
+template <typename ElementA, typename ElementB, typename ElementCD,
+          typename LayoutA, typename LayoutB, typename LayoutCD>
 struct CutlassBmmSM80 {
+    using ElementAccumulator = float;
+    using ElementComputeEpilogue = ElementAccumulator;
+
+    using MMAOp = cutlass::arch::OpClassTensorOp;
+
+    using SmArch = cutlass::arch::Sm80;
+
+    using ShapeMMAThreadBlock = cutlass::gemm::GemmShape<128, 128, 32>;
+    using ShapeMMAWarps = cutlass::gemm::GemmShape<64, 64, 32>;
+    using ShapeMMAOp = cutlass::gemm::GemmShape<16, 8, 16>;
+
+    using SwizzleThreadblock = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
+
+    using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
+        ElementCD, 128 / cutlass::sizeof_bits<ElementCD>::value, ElementComputeEpilogue,
+        ElementComputeEpilogue, cutlass::epilogue::thread::ScaleType::Default>;
+
+    static constexpr int NumStages = 2;
     using Gemm = cutlass::gemm::device::GemmBatched<
-        ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,
-        float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-        cutlass::gemm::GemmShape<128, 128, 32>,
-        cutlass::gemm::GemmShape<64, 64, 32>,
-        cutlass::gemm::GemmShape<16, 8, 16>,
-        cutlass::epilogue::thread::LinearCombination<
-            ElementC, 128 / cutlass::sizeof_bits<ElementC>::value, float, float>,
-        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, 3>;
+        ElementA, LayoutA, ElementB, LayoutB, ElementCD, LayoutCD,
+        ElementAccumulator, MMAOp, SmArch, ShapeMMAThreadBlock, ShapeMMAWarps, ShapeMMAOp,
+        EpilogueOp, SwizzleThreadblock, NumStages>;
     
-    static GemmStatus run(const ElementA* A, const ElementB* B, ElementC* D,
+    static GemmStatus run(const ElementA* A, const ElementB* B, ElementCD* D,
         int batch_size, int M, int N, int K,
         int64_t lda, int64_t ldb, int64_t ldd,
         int64_t stride_a, int64_t stride_b, int64_t stride_d,
@@ -68,125 +81,69 @@ struct CutlassBmmSM80 {
     }
 };
 
-GemmStatus invokeBmm(const void* A, const void* B, void* D,
-                     int batch_size, int M, int N, int K,
-                     int64_t lda, int64_t ldb, int64_t ldd,
-                     int64_t stride_a, int64_t stride_b, int64_t stride_d,
-                     float alpha, float beta,
-                     TransposeOp trans_a, TransposeOp trans_b,
-                     DataType dtype,
-                     cudaStream_t stream) {
-    if (A == nullptr || B == nullptr || D == nullptr) return GemmStatus::INVALID_ARGUMENT;
-    if (batch_size <= 0 || M <= 0 || N <= 0 || K <= 0) return GemmStatus::INVALID_ARGUMENT;
-    if (trans_a != TransposeOp::NoTranspose || trans_b != TransposeOp::NoTranspose)
-        return GemmStatus::NOT_SUPPORTED;
+torch::Tensor invokeBmm(const torch::Tensor& A, const torch::Tensor& B,
+                        cudaStream_t stream) {
+    const int batch_size = A.size(0);
+    const int M = A.size(1);
+    const int N = B.size(1);
+    const int K = A.size(2);
 
-    if (dtype == DataType::FP16) {
-        using DType = cutlass::half_t;
-        using Layout = cutlass::layout::RowMajor;
-        return CutlassBmmSM80<DType, DType, DType, Layout, Layout, Layout>::run(
-            reinterpret_cast<const DType*>(A),
-            reinterpret_cast<const DType*>(B),
-            reinterpret_cast<DType*>(D),
-            batch_size, M, N, K,
-            lda, ldb, ldd,
-            stride_a, stride_b, stride_d,
-            alpha, beta, stream);
+    auto D = torch::empty({batch_size, M, N}, A.options());
+
+    const void* A_ptr = A.data_ptr();
+    const void* B_ptr = B.data_ptr();
+    void* D_ptr = D.data_ptr();
+
+    if (A_ptr == nullptr || B_ptr == nullptr || D_ptr == nullptr) {
+        throw std::invalid_argument("Invalid input tensor");
     }
-    if (dtype == DataType::BF16) {
-        using DType = cutlass::bfloat16_t;
-        using Layout = cutlass::layout::RowMajor;
-        return CutlassBmmSM80<DType, DType, DType, Layout, Layout, Layout>::run(
-            reinterpret_cast<const DType*>(A),
-            reinterpret_cast<const DType*>(B),
-            reinterpret_cast<DType*>(D),
-            batch_size, M, N, K,
-            lda, ldb, ldd,
-            stride_a, stride_b, stride_d,
-            alpha, beta, stream);
+    if (M <= 0 || N <= 0 || K <= 0) {
+        throw std::invalid_argument("Invalid input tensor dimensions");
     }
-    return GemmStatus::NOT_SUPPORTED;
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+
+    uint64_t lda = K;
+    uint64_t ldb = K;
+    uint64_t ldd = N;
+
+    int64_t stride_a = M * K;
+    int64_t stride_b = N * K;
+    int64_t stride_d = M * N;
+
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutCD = cutlass::layout::RowMajor;
+
+    GemmStatus status = GemmStatus::SUCCESS;
+
+    if (A.scalar_type() == torch::kHalf) {
+        status = CutlassBmmSM80<cutlass::half_t, cutlass::half_t, cutlass::half_t, LayoutA,
+                                LayoutB, LayoutCD>::run(
+            reinterpret_cast<const cutlass::half_t*>(A_ptr), reinterpret_cast<const cutlass::half_t*>(B_ptr),
+            reinterpret_cast<cutlass::half_t*>(D_ptr), batch_size, M, N, K, lda, ldb, ldd,
+            stride_a, stride_b, stride_d, alpha, beta, stream);
+    } else if (A.scalar_type() == torch::kBFloat16) {
+        status = CutlassBmmSM80<cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t, LayoutA,
+                                LayoutB, LayoutCD>::run(
+            reinterpret_cast<const cutlass::bfloat16_t*>(A_ptr), reinterpret_cast<const cutlass::bfloat16_t*>(B_ptr),
+            reinterpret_cast<cutlass::bfloat16_t*>(D_ptr), batch_size, M, N, K, lda, ldb, ldd,
+            stride_a, stride_b, stride_d, alpha, beta, stream);
+    } else {
+        throw std::invalid_argument("Unsupported data type");
+    }
+
+    if (status != GemmStatus::SUCCESS) {
+        throw std::runtime_error("BMM execution failed: " + std::to_string(static_cast<int>(status)));
+    }
+
+    return D;
 }
 
-template <>
-GemmStatus invokeBmmStrided<half>(const half* A, const half* B, half* D,
-    int batch_size, int M, int N, int K,
-    int64_t stride_a, int64_t stride_b, int64_t stride_d,
-    float alpha, float beta, TransposeOp trans_a, TransposeOp trans_b,
-    cudaStream_t stream) {
-    if (trans_a != TransposeOp::NoTranspose || trans_b != TransposeOp::NoTranspose)
-        return GemmStatus::NOT_SUPPORTED;
-    using DType = cutlass::half_t;
-    using Layout = cutlass::layout::RowMajor;
-    return CutlassBmmSM80<DType, DType, DType, Layout, Layout, Layout>::run(
-        reinterpret_cast<const DType*>(A), reinterpret_cast<const DType*>(B),
-        reinterpret_cast<DType*>(D), batch_size, M, N, K, K, N, N,
-        stride_a, stride_b, stride_d, alpha, beta, stream);
-}
-
-template <>
-GemmStatus invokeBmmStrided<__nv_bfloat16>(const __nv_bfloat16* A, const __nv_bfloat16* B, 
-    __nv_bfloat16* D, int batch_size, int M, int N, int K,
-    int64_t stride_a, int64_t stride_b, int64_t stride_d,
-    float alpha, float beta, TransposeOp trans_a, TransposeOp trans_b,
-    cudaStream_t stream) {
-    if (trans_a != TransposeOp::NoTranspose || trans_b != TransposeOp::NoTranspose)
-        return GemmStatus::NOT_SUPPORTED;
-    using DType = cutlass::bfloat16_t;
-    using Layout = cutlass::layout::RowMajor;
-    return CutlassBmmSM80<DType, DType, DType, Layout, Layout, Layout>::run(
-        reinterpret_cast<const DType*>(A), reinterpret_cast<const DType*>(B),
-        reinterpret_cast<DType*>(D), batch_size, M, N, K, K, N, N,
-        stride_a, stride_b, stride_d, alpha, beta, stream);
-}
-
-template <>
-GemmStatus invokeBmmArray<half>(const half* const*, const half* const*, half* const*,
-    int, int, int, int, int64_t, int64_t, int64_t, float, float,
-    TransposeOp, TransposeOp, cudaStream_t) { return GemmStatus::NOT_SUPPORTED; }
-
-template <>
-GemmStatus invokeBmmArray<__nv_bfloat16>(const __nv_bfloat16* const*, const __nv_bfloat16* const*,
-    __nv_bfloat16* const*, int, int, int, int, int64_t, int64_t, int64_t,
-    float, float, TransposeOp, TransposeOp, cudaStream_t) { return GemmStatus::NOT_SUPPORTED; }
-
-size_t queryBmmWorkspaceSize(int, int, int, int, DataType, const GemmConfig&) {
-    return 8 * 1024 * 1024;
-}
-
-struct BmmRunner::Impl {
-    DataType dtype;
-    int sm_version;
-    Impl(DataType dt, int sm) : dtype(dt), sm_version(sm < 0 ? getSMVersion() : sm) {}
-};
-
-BmmRunner::BmmRunner(DataType dtype, int sm_version) : impl_(std::make_unique<Impl>(dtype, sm_version)) {}
-BmmRunner::~BmmRunner() = default;
-
-size_t BmmRunner::getWorkspaceSize(int batch, int M, int N, int K) const {
-    return queryBmmWorkspaceSize(batch, M, N, K, impl_->dtype);
-}
-
-GemmStatus BmmRunner::runStrided(const void* A, const void* B, void* D,
-    int batch, int M, int N, int K,
-    int64_t stride_a, int64_t stride_b, int64_t stride_d,
-    float alpha, float beta, void*, size_t, cudaStream_t stream) {
-    return invokeBmm(A, B, D, batch, M, N, K, K, N, N,
-                    stride_a, stride_b, stride_d,
-                    alpha, beta, TransposeOp::NoTranspose, TransposeOp::NoTranspose,
-                    impl_->dtype, stream);
-}
-
-GemmStatus BmmRunner::runArray(const void* const* A_array, const void* const* B_array,
-    void* const* D_array, int batch, int M, int N, int K,
-    float, float, void*, size_t, cudaStream_t stream) {
-    (void)A_array; (void)B_array; (void)D_array; (void)batch; (void)M; (void)N; (void)K;
-    (void)stream;
-    return GemmStatus::NOT_SUPPORTED;  // Pointer array mode not implemented
-}
-
-std::vector<GemmConfig> BmmRunner::getConfigs() const {
-    return impl_->sm_version >= 90 ? getDefaultSM90Configs() : getDefaultSM80Configs();
+torch::Tensor invokeBmmArray(const torch::Tensor& A, const torch::Tensor& B,
+                             cudaStream_t stream = nullptr) {
+    return invokeBmm(A, B, stream);
 }
 
 GemmConfig autoTuneBmm(int batch, int M, int N, int K, DataType dtype,
@@ -195,26 +152,18 @@ GemmConfig autoTuneBmm(int batch, int M, int N, int K, DataType dtype,
     if (configs.empty()) return GemmConfig();
     
     size_t elem_size = getDataTypeSize(dtype);
-    void *A, *B, *D;
-    OASR_CUDA_CHECK(cudaMalloc(&A, static_cast<size_t>(batch) * M * K * elem_size));
-    OASR_CUDA_CHECK(cudaMalloc(&B, static_cast<size_t>(batch) * K * N * elem_size));
-    OASR_CUDA_CHECK(cudaMalloc(&D, static_cast<size_t>(batch) * M * N * elem_size));
+    torch::Tensor A, B;
+    A = torch::empty({batch, M, K}, A.options());
+    B = torch::empty({batch, K, N}, B.options());
     
     GemmConfig best = configs[0];
     float best_time = std::numeric_limits<float>::max();
-    
-    int64_t stride_a = static_cast<int64_t>(M) * K;
-    int64_t stride_b = static_cast<int64_t>(K) * N;
-    int64_t stride_d = static_cast<int64_t>(M) * N;
 
     for (const auto& cfg : configs) {
         try {
             (void)cfg;
             for (int i = 0; i < num_warmup; ++i) {
-                invokeBmm(A, B, D, batch, M, N, K, K, N, N,
-                         stride_a, stride_b, stride_d,
-                         1.0f, 0.0f, TransposeOp::NoTranspose, TransposeOp::NoTranspose,
-                         dtype, stream);
+                auto D = invokeBmm(A, B, stream);
             }
             OASR_CUDA_CHECK(cudaStreamSynchronize(stream));
             
@@ -223,10 +172,7 @@ GemmConfig autoTuneBmm(int batch, int M, int N, int K, DataType dtype,
             OASR_CUDA_CHECK(cudaEventCreate(&stop));
             OASR_CUDA_CHECK(cudaEventRecord(start, stream));
             for (int i = 0; i < num_iter; ++i) {
-                invokeBmm(A, B, D, batch, M, N, K, K, N, N,
-                         stride_a, stride_b, stride_d,
-                         1.0f, 0.0f, TransposeOp::NoTranspose, TransposeOp::NoTranspose,
-                         dtype, stream);
+                auto D = invokeBmm(A, B, stream);
             }
             OASR_CUDA_CHECK(cudaEventRecord(stop, stream));
             OASR_CUDA_CHECK(cudaEventSynchronize(stop));
@@ -239,9 +185,6 @@ GemmConfig autoTuneBmm(int batch, int M, int N, int K, DataType dtype,
         } catch (...) { continue; }
     }
     
-    OASR_CUDA_CHECK(cudaFree(A));
-    OASR_CUDA_CHECK(cudaFree(B));
-    OASR_CUDA_CHECK(cudaFree(D));
     return best;
 }
 

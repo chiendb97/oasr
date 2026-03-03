@@ -6,158 +6,103 @@
 
 #pragma once
 
-#include "gemm_configs.h"
-#include "gemm_utils.h"
-#include "common/types.h"
-#include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <cutlass/gemm_coord.h>
+#include <cutlass/util/device_memory.h>
+
+#include <ATen/core/TensorBody.h>
+#include <cstdint>
+#include <torch/torch.h>
 #include <vector>
-#include <memory>
 
 namespace oasr {
 namespace kernels {
 namespace gemm {
 
 //==============================================================================
-// Grouped GEMM: Problem descriptor
-//==============================================================================
-
-/**
- * @brief Problem specification for a single GEMM in a group (M, N, K)
- */
-struct GemmProblemDesc {
-    int M;
-    int N;
-    int K;
-
-    GemmProblemDesc() : M(0), N(0), K(0) {}
-    GemmProblemDesc(int m, int n, int k) : M(m), N(n), K(k) {}
-};
-
-//==============================================================================
 // Grouped GEMM Interface
 //==============================================================================
+
+// Grouped GEMM Problem Descriptor
+template <typename ElementA, typename ElementB, typename ElementCD>
+struct GroupedGemmProblemDesc {
+    std::vector<cutlass::gemm::GemmCoord> problem_sizes;
+    cutlass::DeviceAllocation<cutlass::gemm::GemmCoord> problems_sizes_device;
+
+    cutlass::DeviceAllocation<ElementA*> ptr_A_device;
+    cutlass::DeviceAllocation<ElementB*> ptr_B_device;
+    cutlass::DeviceAllocation<ElementCD*> ptr_D_device;
+
+    cutlass::DeviceAllocation<int64_t> lda_device;
+    cutlass::DeviceAllocation<int64_t> ldb_device;
+    cutlass::DeviceAllocation<int64_t> ldd_device;
+
+    GroupedGemmProblemDesc(int problem_count, int L, int K, int N, const torch::Tensor& A,
+                           const torch::Tensor& B, const torch::Tensor& offset,
+                           const torch::Tensor& D)
+        : problem_sizes(problem_count),
+          problems_sizes_device(problem_count),
+          ptr_A_device(problem_count),
+          ptr_B_device(problem_count),
+          ptr_D_device(problem_count),
+          lda_device(problem_count),
+          ldb_device(problem_count),
+          ldd_device(problem_count) {
+        std::vector<ElementA*> ptr_A(problem_count);
+        std::vector<ElementB*> ptr_B(problem_count);
+        std::vector<ElementCD*> ptr_D(problem_count);
+        std::vector<int64_t> lda(problem_count);
+        std::vector<int64_t> ldb(problem_count);
+        std::vector<int64_t> ldd(problem_count);
+
+        auto offset_host = offset.cpu();
+
+        int offset_M = 0;
+        for (int i = 0; i < problem_count; ++i) {
+            int next_offset_M = offset_host[i].item<int>();
+            int M = next_offset_M - offset_M;
+            problem_sizes[i] = cutlass::gemm::GemmCoord(M, N, K);
+            lda[i] = K;
+            ldb[i] = K;
+            ldd[i] = N;
+
+            // A and D are laid out as concatenated [M_i, K] and [M_i, N] tiles.
+            // Use data_ptr() (void*) and cast to avoid undefined symbol for data_ptr<cutlass::*>
+            ptr_A[i] =
+                reinterpret_cast<ElementA*>(A.data_ptr()) + static_cast<int64_t>(offset_M) * K;
+            ptr_B[i] = reinterpret_cast<ElementB*>(B[i].data_ptr());
+            ptr_D[i] =
+                reinterpret_cast<ElementCD*>(D.data_ptr()) + static_cast<int64_t>(offset_M) * N;
+
+            offset_M = next_offset_M;
+        }
+
+        problems_sizes_device.copy_from_host(problem_sizes.data());
+        ptr_A_device.copy_from_host(ptr_A.data());
+        ptr_B_device.copy_from_host(ptr_B.data());
+        ptr_D_device.copy_from_host(ptr_D.data());
+        lda_device.copy_from_host(lda.data());
+        ldb_device.copy_from_host(ldb.data());
+        ldd_device.copy_from_host(ldd.data());
+    }
+};
 
 /**
  * @brief Execute grouped GEMM operation
  *
  * Computes: D[i] = alpha * A[i] @ B[i] + beta * D[i] for variable-sized problems
  *
- * @param problems [num_problems] problem dimensions on device (GemmProblemDesc*)
- * @param num_problems Number of problems
- * @param A_array [num_problems] array of A pointers
- * @param B_array [num_problems] array of B pointers
- * @param D_array [num_problems] array of D pointers
- * @param lda_array [num_problems] leading dimensions for A
- * @param ldb_array [num_problems] leading dimensions for B
- * @param ldd_array [num_problems] leading dimensions for D
- * @param dtype Data type (FP16 or BF16)
- * @param workspace_float Workspace buffer
- * @param workspace_float_size Size of float workspace
+ * @param A Input tensor [L, K]
+ * @param B Input tensor [B, N, K]
+ * @param offset Offset tensor [B]
  * @param stream CUDA stream
- * @return Status code
+ * @return Output tensor [L, N]
+ * @note L = sum(M_i for i in [0, B-1]), B is the batch size
  */
-GemmStatus invokeGroupGemm(const GemmProblemDesc* problems, int num_problems,
-                           const void* const* A_array, const void* const* B_array,
-                           void* const* D_array,
-                           const int64_t* lda_array, const int64_t* ldb_array,
-                           const int64_t* ldd_array,
-                           DataType dtype,
-                           void* workspace_float, size_t workspace_float_size,
-                           cudaStream_t stream = nullptr);
+torch::Tensor invokeGroupGemm(const torch::Tensor& A, const torch::Tensor& B,
+                              const torch::Tensor& offset, cudaStream_t stream = nullptr);
 
-/**
- * @brief Grouped GEMM with typed interface
- */
-template <typename DTypeIn, typename DTypeOut = DTypeIn>
-GemmStatus invokeGroupGemmTyped(
-    void* workspace_float, size_t workspace_float_size,
-    void* workspace_int, size_t workspace_int_size,
-    const GemmProblemDesc* problems, int num_problems,
-    const DTypeIn* const* A_array, const DTypeIn* const* B_array,
-    DTypeOut* const* D_array,
-    const int64_t* lda_array, const int64_t* ldb_array, const int64_t* ldd_array,
-    bool weight_column_major,
-    cudaStream_t stream);
-
-/**
- * @brief Query required workspace sizes for grouped GEMM
- */
-void queryGroupGemmWorkspaceSize(
-    int num_problems,
-    const GemmProblemDesc* problems,  // Can be null for conservative estimate
-    DataType dtype,
-    size_t& float_workspace_size,
-    size_t& int_workspace_size,
-    const GemmConfig& config = GemmConfig());
-
-//==============================================================================
-// Grouped GEMM Runner Class
-//==============================================================================
-
-/**
- * @brief Grouped GEMM runner class
- */
-class GroupGemmRunner {
-public:
-    /**
-     * @brief Construct grouped GEMM runner
-     * @param dtype Data type (FP16 or BF16)
-     * @param sm_version SM version (default: auto-detect)
-     */
-    explicit GroupGemmRunner(DataType dtype, int sm_version = -1);
-    ~GroupGemmRunner();
-    
-    GroupGemmRunner(const GroupGemmRunner&) = delete;
-    GroupGemmRunner& operator=(const GroupGemmRunner&) = delete;
-    
-    /**
-     * @brief Get required workspace sizes
-     */
-    void getWorkspaceSize(int num_problems,
-                          size_t& float_workspace_size,
-                          size_t& int_workspace_size) const;
-    
-    /**
-     * @brief Run grouped GEMM
-     */
-    GemmStatus run(const GemmProblemDesc* problems, int num_problems,
-                   const void* const* A_array, const void* const* B_array,
-                   void* const* D_array,
-                   const int64_t* lda_array, const int64_t* ldb_array,
-                   const int64_t* ldd_array,
-                   void* workspace_float, size_t workspace_float_size,
-                   void* workspace_int, size_t workspace_int_size,
-                   bool weight_column_major,
-                   cudaStream_t stream);
-    
-    /**
-     * @brief Get available configurations
-     */
-    std::vector<GemmConfig> getConfigs() const;
-    
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-};
-
-//==============================================================================
-// Segment GEMM (for contiguous segments)
-//==============================================================================
-
-/**
- * @brief Execute segment GEMM (stub: not implemented)
- *
- * For processing contiguous segments in a single buffer.
- */
-GemmStatus invokeSegmentGemm(const void* A, const void* B, void* D,
-                             const int* segment_offsets, int num_segments,
-                             int K, int N, DataType dtype,
-                             bool weight_column_major,
-                             void* workspace, size_t workspace_size,
-                             cudaStream_t stream = nullptr);
-
-} // namespace gemm
-} // namespace kernels
-} // namespace oasr
+}  // namespace gemm
+}  // namespace kernels
+}  // namespace oasr

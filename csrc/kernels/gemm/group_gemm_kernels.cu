@@ -4,31 +4,28 @@
 // Grouped GEMM kernel implementations using CUTLASS
 // Supports variable-sized problems with BF16 and FP16 precision
 
-#include "group_gemm_kernels.h"
 #include "gemm_utils.h"
-#include "common/cuda_utils.h"
+#include "group_gemm_kernels.h"
 
 #ifdef __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wstrict-aliasing"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wstrict-aliasing"
+    #pragma GCC diagnostic ignored "-Wunused-parameter"
 #endif
 
 #include <cutlass/cutlass.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/gemm/device/gemm_grouped.h>
 #include <cutlass/gemm/kernel/default_gemm_grouped.h>
-#include <cutlass/epilogue/thread/linear_combination.h>
-#include <cutlass/util/device_memory.h>
 #include <cutlass/layout/matrix.h>
 #include <cutlass/numeric_types.h>
+#include <cutlass/util/device_memory.h>
 
 #ifdef __GNUC__
-#pragma GCC diagnostic pop
+    #pragma GCC diagnostic pop
 #endif
 
 #include <stdexcept>
-#include <sstream>
-#include <vector>
 
 namespace oasr {
 namespace kernels {
@@ -38,83 +35,70 @@ namespace gemm {
 // Grouped GEMM Implementation (SM80)
 //==============================================================================
 
-template <typename DType>
+template <typename ElementA, typename ElementB, typename ElementCD, typename LayoutA,
+          typename LayoutB, typename LayoutCD>
 struct CutlassGroupGemmSM80 {
-    using ElementA = DType;
-    using ElementB = DType;
-    using ElementC = DType;
     using ElementAccumulator = float;
-    
-    using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::RowMajor;
-    using LayoutC = cutlass::layout::RowMajor;
-    
-    static constexpr int kAlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-    static constexpr int kAlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-    
+    using ElementComputeEpilogue = ElementAccumulator;
+
+    constexpr static int kAlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    constexpr static int kAlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    constexpr static int kAlignmentCD = 128 / cutlass::sizeof_bits<ElementCD>::value;
+
+    using MMAOp = cutlass::arch::OpClassTensorOp;
+
+    using SmArch = cutlass::arch::Sm80;
+
+    using ShapeMMAThreadBlock = cutlass::gemm::GemmShape<128, 128, 32>;
+    using ShapeMMAWarps = cutlass::gemm::GemmShape<64, 64, 32>;
+    using ShapeMMAOp = cutlass::gemm::GemmShape<16, 8, 16>;
+
+    using SwizzleThreadblock = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
+
+    using EpilogueOp =
+        cutlass::epilogue::thread::LinearCombination<ElementCD, kAlignmentCD, ElementAccumulator,
+                                                     ElementAccumulator>;
+
     using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-        ElementA, LayoutA, cutlass::ComplexTransform::kNone, kAlignmentA,
-        ElementB, LayoutB, cutlass::ComplexTransform::kNone, kAlignmentB,
-        ElementC, LayoutC,
-        ElementAccumulator,
-        cutlass::arch::OpClassTensorOp,
-        cutlass::arch::Sm80,
-        cutlass::gemm::GemmShape<128, 128, 32>,
-        cutlass::gemm::GemmShape<64, 64, 32>,
-        cutlass::gemm::GemmShape<16, 8, 16>,
-        cutlass::epilogue::thread::LinearCombination<
-            ElementC, 128 / cutlass::sizeof_bits<ElementC>::value,
-            ElementAccumulator, ElementAccumulator>,
-        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
-        4  // Stages
-    >::GemmKernel;
-    
-    using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
-    using EpilogueOutputOp = typename GemmKernel::Epilogue::OutputOp;
-    
-    static GemmStatus run(
-        void* workspace, size_t workspace_size,
-        cutlass::gemm::GemmCoord* problems,
-        int num_problems,
-        const DType* const* A_array,
-        const DType* const* B_array,
-        DType* const* D_array,
-        const int64_t* lda_array,
-        const int64_t* ldb_array,
-        const int64_t* ldd_array,
-        cudaStream_t stream)
-    {
-        typename EpilogueOutputOp::Params epilogue_params(1.0f, 0.0f);
-        
-        // CUTLASS Arguments expects non-const pointer types (Element* **); kernel only reads A/B/ld*
-        typename GemmGrouped::Arguments args(
-            problems,
-            num_problems,
-            4,  // threadblock count
-            epilogue_params,
-            const_cast<DType**>(A_array),
-            const_cast<DType**>(B_array),
-            const_cast<DType**>(D_array),
-            const_cast<DType**>(D_array),
-            const_cast<int64_t*>(lda_array),
-            const_cast<int64_t*>(ldb_array),
-            const_cast<int64_t*>(ldd_array),
-            const_cast<int64_t*>(ldd_array),
-            nullptr  // host_problem_sizes (optional)
+        ElementA, LayoutA, cutlass::ComplexTransform::kNone, kAlignmentA, ElementB, LayoutB,
+        cutlass::ComplexTransform::kNone, kAlignmentB, ElementCD, LayoutCD, ElementAccumulator,
+        MMAOp, SmArch, ShapeMMAThreadBlock, ShapeMMAWarps, ShapeMMAOp, EpilogueOp,
+        SwizzleThreadblock, 4>::GemmKernel;
+
+    using Gemm = cutlass::gemm::device::GemmGrouped<GemmKernel>;
+
+    static GemmStatus run(GroupedGemmProblemDesc<ElementA, ElementB, ElementCD>& problem_desc,
+                          int problem_count, cudaStream_t stream) {
+        typename EpilogueOp::Params epilogue_params(1.0f, 0.0f);
+
+        int threadblock_count = Gemm::sufficient(problem_desc.problem_sizes.data(), problem_count);
+        typename Gemm::Arguments args(
+            problem_desc.problems_sizes_device.get(), problem_count, threadblock_count,
+            epilogue_params, problem_desc.ptr_A_device.get(), problem_desc.ptr_B_device.get(),
+            problem_desc.ptr_D_device.get(), problem_desc.ptr_D_device.get(),
+            problem_desc.lda_device.get(), problem_desc.ldb_device.get(),
+            problem_desc.ldd_device.get(), problem_desc.ldd_device.get()
         );
-        
-        GemmGrouped gemm;
-        
-        cutlass::Status status = gemm.initialize(args, workspace, stream);
+
+        Gemm gemm_op;
+        cutlass::Status status = gemm_op.can_implement(args);
+        if (status != cutlass::Status::kSuccess) {
+            return GemmStatus::NOT_SUPPORTED;
+        }
+
+        size_t workspace_size = gemm_op.get_workspace_size(args);
+        cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+
+        status = gemm_op.initialize(args, workspace.get(), stream);
         if (status != cutlass::Status::kSuccess) {
             return GemmStatus::INTERNAL_ERROR;
         }
-        
-        status = gemm.run(stream);
+
+        status = gemm_op(stream);
         if (status != cutlass::Status::kSuccess) {
             return GemmStatus::CUTLASS_ERROR;
         }
-        
+
         return GemmStatus::SUCCESS;
     }
 };
@@ -123,248 +107,42 @@ struct CutlassGroupGemmSM80 {
 // Public API Implementations
 //==============================================================================
 
-GemmStatus invokeGroupGemm(const GemmProblemDesc* problems, int num_problems,
-                           const void* const* A_array, const void* const* B_array,
-                           void* const* D_array,
-                           const int64_t* lda_array, const int64_t* ldb_array,
-                           const int64_t* ldd_array,
-                           DataType dtype,
-                           void* workspace_float, size_t workspace_float_size,
-                           cudaStream_t stream) {
-    if (problems == nullptr || num_problems <= 0) return GemmStatus::INVALID_ARGUMENT;
-    if (A_array == nullptr || B_array == nullptr || D_array == nullptr)
-        return GemmStatus::INVALID_ARGUMENT;
+torch::Tensor invokeGroupGemm(const torch::Tensor& A, const torch::Tensor& B,
+                              const torch::Tensor& offset, cudaStream_t stream) {
+    int problem_count = offset.size(0);
+    auto L = A.size(0);
+    auto N = B.size(1);
+    auto K = A.size(1);
 
-    cutlass::DeviceAllocation<cutlass::gemm::GemmCoord> problems_device(num_problems);
+    auto D = torch::empty({L, N}, A.options());
 
-    // problems may be on device; copy to host first
-    std::vector<GemmProblemDesc> problems_desc_host(num_problems);
-    OASR_CUDA_CHECK(cudaMemcpyAsync(
-        problems_desc_host.data(),
-        problems,
-        num_problems * sizeof(GemmProblemDesc),
-        cudaMemcpyDeviceToHost,
-        stream
-    ));
-    OASR_CUDA_CHECK(cudaStreamSynchronize(stream));
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutCD = cutlass::layout::RowMajor;
 
-    std::vector<cutlass::gemm::GemmCoord> problems_host(num_problems);
-    for (int i = 0; i < num_problems; ++i) {
-        problems_host[i] = cutlass::gemm::GemmCoord(
-            problems_desc_host[i].M,
-            problems_desc_host[i].N,
-            problems_desc_host[i].K
-        );
+    GemmStatus status = GemmStatus::SUCCESS;
+
+    if (A.dtype() == torch::kFloat16) {
+        GroupedGemmProblemDesc<cutlass::half_t, cutlass::half_t, cutlass::half_t> problem_desc(
+            problem_count, L, K, N, A, B, offset, D);
+        status = CutlassGroupGemmSM80<cutlass::half_t, cutlass::half_t, cutlass::half_t, LayoutA,
+                                      LayoutB, LayoutCD>::run(problem_desc, problem_count, stream);
+    } else if (A.dtype() == torch::kBFloat16) {
+        GroupedGemmProblemDesc<cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t>
+            problem_desc(problem_count, L, K, N, A, B, offset, D);
+        status = CutlassGroupGemmSM80<cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t,
+                                      LayoutA, LayoutB, LayoutCD>::run(problem_desc, problem_count,
+                                                                       stream);
+    } else {
+        throw std::invalid_argument("Invalid input tensor type");
+    }
+    if (status != GemmStatus::SUCCESS) {
+        throw std::runtime_error("Grouped GEMM failed");
     }
 
-    OASR_CUDA_CHECK(cudaMemcpyAsync(
-        problems_device.get(),
-        problems_host.data(),
-        num_problems * sizeof(cutlass::gemm::GemmCoord),
-        cudaMemcpyHostToDevice,
-        stream
-    ));
-
-    if (dtype == DataType::FP16) {
-        using DType = cutlass::half_t;
-        return CutlassGroupGemmSM80<DType>::run(
-            workspace_float, workspace_float_size,
-            problems_device.get(), num_problems,
-            reinterpret_cast<const DType* const*>(A_array),
-            reinterpret_cast<const DType* const*>(B_array),
-            reinterpret_cast<DType* const*>(D_array),
-            lda_array, ldb_array, ldd_array,
-            stream
-        );
-    }
-    if (dtype == DataType::BF16) {
-        using DType = cutlass::bfloat16_t;
-        return CutlassGroupGemmSM80<DType>::run(
-            workspace_float, workspace_float_size,
-            problems_device.get(), num_problems,
-            reinterpret_cast<const DType* const*>(A_array),
-            reinterpret_cast<const DType* const*>(B_array),
-            reinterpret_cast<DType* const*>(D_array),
-            lda_array, ldb_array, ldd_array,
-            stream
-        );
-    }
-    return GemmStatus::NOT_SUPPORTED;
+    return D;
 }
 
-template <>
-GemmStatus invokeGroupGemmTyped<half, half>(
-    void* workspace_float, size_t workspace_float_size,
-    void* workspace_int, size_t workspace_int_size,
-    const GemmProblemDesc* problems, int num_problems,
-    const half* const* A_array, const half* const* B_array,
-    half* const* D_array,
-    const int64_t* lda_array, const int64_t* ldb_array, const int64_t* ldd_array,
-    bool weight_column_major,
-    cudaStream_t stream)
-{
-    (void)workspace_int;
-    (void)workspace_int_size;
-    (void)weight_column_major;
-    
-    cutlass::DeviceAllocation<cutlass::gemm::GemmCoord> problems_device(num_problems);
-    std::vector<cutlass::gemm::GemmCoord> problems_host(num_problems);
-    for (int i = 0; i < num_problems; ++i) {
-        problems_host[i] = cutlass::gemm::GemmCoord(
-            problems[i].M, problems[i].N, problems[i].K
-        );
-    }
-    
-    OASR_CUDA_CHECK(cudaMemcpyAsync(
-        problems_device.get(),
-        problems_host.data(),
-        num_problems * sizeof(cutlass::gemm::GemmCoord),
-        cudaMemcpyHostToDevice,
-        stream
-    ));
-    
-    using DType = cutlass::half_t;
-    return CutlassGroupGemmSM80<DType>::run(
-        workspace_float, workspace_float_size,
-        problems_device.get(),
-        num_problems,
-        reinterpret_cast<const DType* const*>(A_array),
-        reinterpret_cast<const DType* const*>(B_array),
-        reinterpret_cast<DType* const*>(D_array),
-        lda_array, ldb_array, ldd_array,
-        stream
-    );
-}
-
-template <>
-GemmStatus invokeGroupGemmTyped<__nv_bfloat16, __nv_bfloat16>(
-    void* workspace_float, size_t workspace_float_size,
-    void* workspace_int, size_t workspace_int_size,
-    const GemmProblemDesc* problems, int num_problems,
-    const __nv_bfloat16* const* A_array, const __nv_bfloat16* const* B_array,
-    __nv_bfloat16* const* D_array,
-    const int64_t* lda_array, const int64_t* ldb_array, const int64_t* ldd_array,
-    bool weight_column_major,
-    cudaStream_t stream)
-{
-    (void)workspace_int;
-    (void)workspace_int_size;
-    (void)weight_column_major;
-    
-    cutlass::DeviceAllocation<cutlass::gemm::GemmCoord> problems_device(num_problems);
-    std::vector<cutlass::gemm::GemmCoord> problems_host(num_problems);
-    for (int i = 0; i < num_problems; ++i) {
-        problems_host[i] = cutlass::gemm::GemmCoord(
-            problems[i].M, problems[i].N, problems[i].K
-        );
-    }
-    
-    OASR_CUDA_CHECK(cudaMemcpyAsync(
-        problems_device.get(),
-        problems_host.data(),
-        num_problems * sizeof(cutlass::gemm::GemmCoord),
-        cudaMemcpyHostToDevice,
-        stream
-    ));
-    
-    using DType = cutlass::bfloat16_t;
-    return CutlassGroupGemmSM80<DType>::run(
-        workspace_float, workspace_float_size,
-        problems_device.get(),
-        num_problems,
-        reinterpret_cast<const DType* const*>(A_array),
-        reinterpret_cast<const DType* const*>(B_array),
-        reinterpret_cast<DType* const*>(D_array),
-        lda_array, ldb_array, ldd_array,
-        stream
-    );
-}
-
-//==============================================================================
-// Workspace Size Query
-//==============================================================================
-
-void queryGroupGemmWorkspaceSize(
-    int num_problems,
-    const GemmProblemDesc* problems,
-    DataType dtype,
-    size_t& float_workspace_size,
-    size_t& int_workspace_size,
-    const GemmConfig& config)
-{
-    (void)num_problems; (void)problems; (void)dtype; (void)config;
-    float_workspace_size = 16 * 1024 * 1024;  // 16MB
-    int_workspace_size = 1 * 1024 * 1024;     // 1MB
-}
-
-//==============================================================================
-// Grouped GEMM Runner Implementation
-//==============================================================================
-
-struct GroupGemmRunner::Impl {
-    DataType dtype;
-    int sm_version;
-    
-    Impl(DataType dt, int sm) : dtype(dt), sm_version(sm) {
-        if (sm_version < 0) {
-            sm_version = getSMVersion();
-        }
-    }
-};
-
-GroupGemmRunner::GroupGemmRunner(DataType dtype, int sm_version)
-    : impl_(std::make_unique<Impl>(dtype, sm_version)) {}
-
-GroupGemmRunner::~GroupGemmRunner() = default;
-
-void GroupGemmRunner::getWorkspaceSize(int num_problems,
-                                       size_t& float_workspace_size,
-                                       size_t& int_workspace_size) const {
-    queryGroupGemmWorkspaceSize(num_problems, nullptr, impl_->dtype,
-                                float_workspace_size, int_workspace_size);
-}
-
-GemmStatus GroupGemmRunner::run(const GemmProblemDesc* problems, int num_problems,
-                                const void* const* A_array, const void* const* B_array,
-                                void* const* D_array,
-                                const int64_t* lda_array, const int64_t* ldb_array,
-                                const int64_t* ldd_array,
-                                void* workspace_float, size_t workspace_float_size,
-                                void* workspace_int, size_t workspace_int_size,
-                                bool weight_column_major,
-                                cudaStream_t stream)
-{
-    (void)workspace_int;
-    (void)workspace_int_size;
-    (void)weight_column_major;
-    return invokeGroupGemm(problems, num_problems, A_array, B_array, D_array,
-                          lda_array, ldb_array, ldd_array, impl_->dtype,
-                          workspace_float, workspace_float_size, stream);
-}
-
-std::vector<GemmConfig> GroupGemmRunner::getConfigs() const {
-    if (impl_->sm_version >= 90) {
-        return getDefaultSM90Configs();
-    }
-    return getDefaultSM80Configs();
-}
-
-//==============================================================================
-// Segment GEMM Implementation
-//==============================================================================
-
-GemmStatus invokeSegmentGemm(const void* A, const void* B, void* D,
-                             const int* segment_offsets, int num_segments,
-                             int K, int N, DataType dtype,
-                             bool weight_column_major,
-                             void* workspace, size_t workspace_size,
-                             cudaStream_t stream) {
-    (void)A; (void)B; (void)D; (void)segment_offsets; (void)num_segments;
-    (void)K; (void)N; (void)dtype; (void)weight_column_major;
-    (void)workspace; (void)workspace_size; (void)stream;
-    return GemmStatus::NOT_SUPPORTED;  // TODO: Implement using grouped GEMM
-}
-
-} // namespace gemm
-} // namespace kernels
-} // namespace oasr
+}  // namespace gemm
+}  // namespace kernels
+}  // namespace oasr

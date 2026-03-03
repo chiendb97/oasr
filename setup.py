@@ -28,6 +28,35 @@ class CMakeExtension(Extension):
         self.sourcedir = os.path.abspath(sourcedir)
 
 
+def _find_torch_cmake_prefix():
+    """Find torch cmake prefix, even inside pip's isolated build env."""
+    try:
+        import torch
+        return torch.utils.cmake_prefix_path
+    except ImportError:
+        pass
+
+    # In pip's isolated build env, torch isn't importable directly.
+    # Probe the system site-packages for the torch cmake config.
+    import sysconfig as _sc
+    for scheme in ("purelib", "platlib"):
+        site_dir = _sc.get_path(scheme)
+        candidate = os.path.join(site_dir, "torch", "share", "cmake")
+        if os.path.isdir(candidate):
+            return candidate
+
+    try:
+        import site
+        for site_dir in site.getsitepackages():
+            candidate = os.path.join(site_dir, "torch", "share", "cmake")
+            if os.path.isdir(candidate):
+                return candidate
+    except AttributeError:
+        pass
+
+    return None
+
+
 class CMakeBuild(build_ext):
     """Build extension using CMake."""
     
@@ -48,6 +77,11 @@ class CMakeBuild(build_ext):
             "-DBUILD_TESTS=OFF",
             "-DBUILD_EXAMPLES=OFF",
         ]
+        
+        # Torch cmake prefix (for find_package(Torch))
+        torch_prefix = _find_torch_cmake_prefix()
+        if torch_prefix:
+            cmake_args.append(f"-DCMAKE_PREFIX_PATH={torch_prefix}")
         
         # Build type
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")

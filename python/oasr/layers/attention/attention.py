@@ -52,7 +52,6 @@ class MultiHeadedAttention(nn.Module):
     Args:
         n_head: Number of attention heads.
         n_feat: Model dimension (input and output size).
-        dropout_rate: Dropout rate applied to attention weights.
         query_bias: Whether to include bias in the query projection.
         key_bias: Whether to include bias in the key projection.
         value_bias: Whether to include bias in the value projection.
@@ -68,7 +67,6 @@ class MultiHeadedAttention(nn.Module):
         self,
         n_head: int,
         n_feat: int,
-        dropout_rate: float,
         query_bias: bool = True,
         key_bias: bool = True,
         value_bias: bool = True,
@@ -100,10 +98,8 @@ class MultiHeadedAttention(nn.Module):
         self.linear_k = nn.Linear(n_feat, self.inner_kv_dim, bias=key_bias)
         self.linear_v = nn.Linear(n_feat, self.inner_kv_dim, bias=value_bias)
         self.linear_out = nn.Linear(self.inner_dim, n_feat, bias=query_bias)
-        self.dropout = nn.Dropout(p=dropout_rate)
 
         self.use_sdpa = use_sdpa
-        self.dropout_rate = dropout_rate
 
     def _forward_linearx(
         self,
@@ -203,8 +199,7 @@ class MultiHeadedAttention(nn.Module):
                 value
             )  # (batch, ..., head, time1, time2)
 
-        p_attn = self.dropout(attn)
-        x = torch.matmul(p_attn, value)  # (batch, ..., head, time1, d_k)
+        x = torch.matmul(attn, value)  # (batch, ..., head, time1, d_k)
         # [batch, ..., time1, head, d_k]
         x = x.transpose(-3, -2).contiguous()
         x_shape = x.size()[:-2] + torch.Size([self.h * self.d_k])
@@ -319,7 +314,6 @@ class MultiHeadedAttention(nn.Module):
             k,
             v,
             attn_mask=mask.unsqueeze(1),
-            dropout_p=self.dropout_rate if self.training else 0.0,
             scale=1 / math.sqrt(self.d_k),
         )
         output = (
@@ -340,7 +334,6 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         self,
         n_head: int,
         n_feat: int,
-        dropout_rate: float,
         query_bias: bool = True,
         key_bias: bool = True,
         value_bias: bool = True,
@@ -352,7 +345,6 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         super().__init__(
             n_head,
             n_feat,
-            dropout_rate,
             query_bias,
             key_bias,
             value_bias,
@@ -448,7 +440,6 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
             k,
             v,
             attn_mask=mask,
-            dropout_p=self.dropout_rate if self.training else 0.0,
             scale=1 / math.sqrt(self.d_k),
         )
         output = (
@@ -466,7 +457,6 @@ class MultiHeadedCrossAttention(MultiHeadedAttention):
         self,
         n_head: int,
         n_feat: int,
-        dropout_rate: float,
         query_bias: bool = True,
         key_bias: bool = True,
         value_bias: bool = True,
@@ -477,7 +467,6 @@ class MultiHeadedCrossAttention(MultiHeadedAttention):
         super().__init__(
             n_head,
             n_feat,
-            dropout_rate,
             query_bias,
             key_bias,
             value_bias,
@@ -549,7 +538,6 @@ class MultiHeadedCrossAttention(MultiHeadedAttention):
                 k,
                 v,
                 attn_mask=mask.unsqueeze(1),
-                dropout_p=self.dropout_rate if self.training else 0.0,
                 scale=1 / math.sqrt(self.d_k),
             )
             output = output.transpose(-2, -3).contiguous()
@@ -576,7 +564,6 @@ class ShawRelPositionMultiHeadedAttention(MultiHeadedAttention):
         self,
         n_head: int,
         n_feat: int,
-        dropout_rate: float,
         query_bias: bool = True,
         key_bias: bool = True,
         value_bias: bool = True,
@@ -589,7 +576,6 @@ class ShawRelPositionMultiHeadedAttention(MultiHeadedAttention):
         super().__init__(
             n_head,
             n_feat,
-            dropout_rate,
             query_bias,
             key_bias,
             value_bias,
@@ -663,7 +649,6 @@ class ShawRelPositionMultiHeadedAttention(MultiHeadedAttention):
             k,
             v,
             attn_mask=mask,
-            dropout_p=self.dropout_rate if self.training else 0.0,
             scale=1 / math.sqrt(self.d_k),
         )
         output = (
@@ -681,7 +666,6 @@ class RopeMultiHeadedAttention(MultiHeadedAttention):
         self,
         n_head: int,
         n_feat: int,
-        dropout_rate: float,
         query_bias: bool = True,
         key_bias: bool = True,
         value_bias: bool = True,
@@ -693,7 +677,6 @@ class RopeMultiHeadedAttention(MultiHeadedAttention):
         super().__init__(
             n_head,
             n_feat,
-            dropout_rate,
             query_bias,
             key_bias,
             value_bias,
@@ -759,7 +742,6 @@ class RopeMultiHeadedAttention(MultiHeadedAttention):
             k,
             v,
             attn_mask=mask.unsqueeze(1),
-            dropout_p=self.dropout_rate if self.training else 0.0,
             scale=1 / math.sqrt(self.d_k),
         )
         output = (

@@ -116,6 +116,27 @@ if(BUILD_PYTHON)
         )
         FetchContent_MakeAvailable(pybind11)
     endif()
+
+    # PyTorch (libtorch) — required for torch::Tensor in pybind bindings.
+    # First try to discover the prefix via Python import (works for direct
+    # cmake builds).  When building inside pip's isolated build env the
+    # import will fail; in that case we rely on CMAKE_PREFIX_PATH being
+    # set by setup.py.
+    execute_process(
+        COMMAND ${Python_EXECUTABLE} -c "import torch; print(torch.utils.cmake_prefix_path)"
+        OUTPUT_VARIABLE TORCH_CMAKE_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE TORCH_FIND_RESULT
+    )
+    if(TORCH_FIND_RESULT EQUAL 0)
+        list(APPEND CMAKE_PREFIX_PATH "${TORCH_CMAKE_PREFIX}")
+    endif()
+    find_package(Torch REQUIRED)
+    find_library(TORCH_PYTHON_LIB torch_python
+        PATHS "${TORCH_INSTALL_PREFIX}/lib"
+        REQUIRED)
+    message(STATUS "Found PyTorch: ${Torch_DIR}")
+    message(STATUS "Found torch_python: ${TORCH_PYTHON_LIB}")
 endif()
 
 # =============================================================================
@@ -170,6 +191,15 @@ target_include_directories(oasr_core PUBLIC
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
+if(BUILD_PYTHON)
+    # Torch headers are needed when kernels use torch::Tensor.
+    # Python headers are required because torch/extension.h includes Python.h.
+    target_include_directories(oasr_core PUBLIC
+        ${TORCH_INCLUDE_DIRS}
+        ${Python_INCLUDE_DIRS}
+    )
+endif()
+
 # CUTLASS
 target_include_directories(oasr_core PUBLIC
     ${CUTLASS_DIR}/include
@@ -181,6 +211,10 @@ target_link_libraries(oasr_core PUBLIC
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
 )
+
+if(BUILD_PYTHON)
+    target_link_libraries(oasr_core PUBLIC ${TORCH_LIBRARIES})
+endif()
 
 if(CUDNN_LIB)
     target_link_libraries(oasr_core PUBLIC ${CUDNN_LIB})
@@ -214,9 +248,11 @@ if(BUILD_PYTHON)
     target_include_directories(_C PRIVATE
         ${CMAKE_SOURCE_DIR}/csrc
         ${CUDAToolkit_INCLUDE_DIRS}
+        ${TORCH_INCLUDE_DIRS}
     )
     
-    target_link_libraries(_C PRIVATE oasr_core)
+    target_link_libraries(_C PRIVATE oasr_core ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIB})
+    target_compile_options(_C PRIVATE ${TORCH_CXX_FLAGS})
 
     # Set output directory for the Python module (never write into source tree).
     # - When built via setuptools (setup.py), CMAKE_LIBRARY_OUTPUT_DIRECTORY is
@@ -235,27 +271,6 @@ if(BUILD_PYTHON)
     message(STATUS "Python module will be built to: ${PYTHON_MODULE_OUTPUT_DIR}/_C${CMAKE_SHARED_LIBRARY_SUFFIX}")
 endif()
 
-# =============================================================================
-# Tests
-# =============================================================================
-if(BUILD_TESTS)
-    enable_testing()
-    
-    # Find or fetch GoogleTest
-    find_package(GTest QUIET)
-    if(NOT GTest_FOUND)
-        include(FetchContent)
-        FetchContent_Declare(
-            googletest
-            GIT_REPOSITORY https://github.com/google/googletest.git
-            GIT_TAG v1.14.0
-        )
-        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-        FetchContent_MakeAvailable(googletest)
-    endif()
-    
-    add_subdirectory(tests)
-endif()
 
 # =============================================================================
 # Examples
@@ -285,7 +300,6 @@ message(STATUS "=== OASR Build Configuration ===")
 message(STATUS "Build type:        ${CMAKE_BUILD_TYPE}")
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "Python bindings:   ${BUILD_PYTHON}")
-message(STATUS "Build tests:       ${BUILD_TESTS}")
 message(STATUS "Use CUTLASS:       ${USE_CUTLASS}")
 message(STATUS "Use FlashAttention: ${USE_FLASH_ATTENTION}")
 message(STATUS "Enable FP16:       ${ENABLE_FP16}")

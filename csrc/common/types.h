@@ -49,8 +49,6 @@ enum class ActivationType {
     RELU = 0,
     GELU = 1,
     SWISH = 2,                  // SiLU
-    GATED_GELU = 3,
-    GATED_SWISH = 4,
 };
 
 // Normalization types
