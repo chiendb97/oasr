@@ -3,12 +3,12 @@
 
 #pragma once
 
+#include <cutlass/cutlass.h>
 #include <torch/extension.h>
-#include <cutlass/half.h>
-#include <cutlass/bfloat16.h>
+
+#include "kernels/gemm/bmm_kernels.h"
 #include "kernels/gemm/gemm_configs.h"
 #include "kernels/gemm/gemm_kernels.h"
-#include "kernels/gemm/bmm_kernels.h"
 #include "kernels/gemm/group_gemm_kernels.h"
 
 namespace py = pybind11;
@@ -19,8 +19,7 @@ namespace pybind {
 inline void registerGemmBindings(py::module_& kernels) {
     using namespace kernels::gemm;
 
-    py::module_ gemm_mod =
-        kernels.def_submodule("gemm", "GEMM/BMM/GroupGEMM kernels (CUTLASS)");
+    py::module_ gemm_mod = kernels.def_submodule("gemm", "GEMM/BMM/GroupGEMM kernels (CUTLASS)");
 
     // --- Enums ---
     py::enum_<MatrixLayout>(gemm_mod, "MatrixLayout")
@@ -81,135 +80,97 @@ inline void registerGemmBindings(py::module_& kernels) {
         .def("to_string", &GemmConfig::toString)
         .def("__repr__", &GemmConfig::toString);
 
-    py::class_<GemmProblemDesc>(gemm_mod, "GemmProblemDesc")
-        .def(py::init<>())
-        .def(py::init<int, int, int>(), py::arg("m"), py::arg("n"), py::arg("k"))
-        .def_readwrite("M", &GemmProblemDesc::M)
-        .def_readwrite("N", &GemmProblemDesc::N)
-        .def_readwrite("K", &GemmProblemDesc::K);
-
     // --- GEMM: D = alpha * A @ B + beta * C ---
-    gemm_mod.def("invoke_gemm",
-        [](const torch::Tensor& a, const torch::Tensor& b,
-           std::optional<const torch::Tensor>& c,
+    gemm_mod.def(
+        "invoke_gemm",
+        [](const torch::Tensor& a, const torch::Tensor& b, std::optional<const torch::Tensor>& c,
            py::object stream) -> torch::Tensor {
             cudaStream_t s = stream.is_none()
-                ? nullptr
-                : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
+                                 ? nullptr
+                                 : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
 
             torch::Tensor c_tensor = c.has_value() ? c.value() : torch::Tensor();
             auto d = invokeGemm(a, b, c_tensor, s);
             return d;
         },
-        py::arg("a"), py::arg("b"), py::arg("c") = py::none(),
-        py::arg("stream") = py::none(),
+        py::arg("a"), py::arg("b"), py::arg("c") = py::none(), py::arg("stream") = py::none(),
         "Execute GEMM: D = A @ B + C (C is optional). Returns (output, status).");
 
-    gemm_mod.def("invoke_gemm_activation",
-        [](const torch::Tensor& a, const torch::Tensor& b,
-           std::optional<const torch::Tensor>& c,
+    gemm_mod.def(
+        "invoke_gemm_activation",
+        [](const torch::Tensor& a, const torch::Tensor& b, std::optional<const torch::Tensor>& c,
            ActivationType activation, py::object stream) -> torch::Tensor {
             cudaStream_t s = stream.is_none()
-                ? nullptr
-                : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
+                                 ? nullptr
+                                 : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
             torch::Tensor c_tensor = c.has_value() ? c.value() : torch::Tensor();
             auto d = invokeGemmActivation(a, b, c_tensor, activation, s);
             return d;
         },
-        py::arg("a"), py::arg("b"), py::arg("c") = py::none(), py::arg("activation"), py::arg("stream") = py::none(),
+        py::arg("a"), py::arg("b"), py::arg("c") = py::none(), py::arg("activation"),
+        py::arg("stream") = py::none(),
         "Execute GEMM with activation: D = activation(A @ B + C). Returns output tensor.");
 
     // --- Batched GEMM (strided) ---
-    gemm_mod.def("invoke_bmm",
-        [](const torch::Tensor& a, const torch::Tensor& b,
-           py::object stream) -> torch::Tensor {
+    gemm_mod.def(
+        "invoke_bmm",
+        [](const torch::Tensor& a, const torch::Tensor& b, py::object stream) -> torch::Tensor {
             cudaStream_t s = stream.is_none()
-                ? nullptr
-                : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
+                                 ? nullptr
+                                 : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
             auto d = invokeBmm(a, b, s);
             return d;
         },
-        py::arg("a"), py::arg("b"),
-        py::arg("stream") = py::none(),
+        py::arg("a"), py::arg("b"), py::arg("stream") = py::none(),
         "Execute batched GEMM. Returns output tensor.");
 
     // --- Grouped GEMM (pointer arrays, kept low-level) ---
-    gemm_mod.def("invoke_group_gemm",
-        [](intptr_t problems, int num_problems,
-           intptr_t a_array, intptr_t b_array, intptr_t d_array,
-           intptr_t lda_array, intptr_t ldb_array, intptr_t ldd_array,
-           DataType dtype, intptr_t workspace_float, size_t workspace_float_size,
-           py::object stream) {
+    gemm_mod.def(
+        "invoke_group_gemm",
+        [](const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& offset,
+           py::object stream) -> torch::Tensor {
             cudaStream_t s = stream.is_none()
-                ? nullptr
-                : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
-            return invokeGroupGemm(
-                reinterpret_cast<const GemmProblemDesc*>(problems),
-                num_problems,
-                reinterpret_cast<const void* const*>(a_array),
-                reinterpret_cast<const void* const*>(b_array),
-                reinterpret_cast<void* const*>(d_array),
-                reinterpret_cast<const int64_t*>(lda_array),
-                reinterpret_cast<const int64_t*>(ldb_array),
-                reinterpret_cast<const int64_t*>(ldd_array),
-                dtype,
-                reinterpret_cast<void*>(workspace_float),
-                workspace_float_size, s);
+                                 ? nullptr
+                                 : reinterpret_cast<cudaStream_t>(stream.cast<intptr_t>());
+            return invokeGroupGemm(a, b, offset, s);
         },
-        py::arg("problems"), py::arg("num_problems"),
-        py::arg("a_array"), py::arg("b_array"), py::arg("d_array"),
-        py::arg("lda_array"), py::arg("ldb_array"), py::arg("ldd_array"),
-        py::arg("dtype"), py::arg("workspace_float"), py::arg("workspace_float_size"),
-        py::arg("stream") = py::none(),
-        "Execute grouped GEMM (variable-sized problems)");
-
-    // --- Workspace queries ---
-    gemm_mod.def("query_group_gemm_workspace_size",
-        [](int num_problems, DataType dtype, const GemmConfig& config) {
-            size_t float_ws = 0, int_ws = 0;
-            queryGroupGemmWorkspaceSize(num_problems, nullptr, dtype,
-                                        float_ws, int_ws, config);
-            return py::make_tuple(float_ws, int_ws);
-        },
-        py::arg("num_problems"), py::arg("dtype"),
-        py::arg("config") = GemmConfig(),
-        "Query workspace sizes for grouped GEMM (returns float_ws, int_ws)");
+        py::arg("a"), py::arg("b"), py::arg("offset"), py::arg("stream") = py::none(),
+        "Execute grouped GEMM. Returns output tensor.");
 
     // --- Utility functions ---
     gemm_mod.def("get_sm_version", &getSMVersion, py::arg("device_id") = -1,
-        "Get SM version of the current or specified device");
+                 "Get SM version of the current or specified device");
     gemm_mod.def("supports_tma", &supportsTMA, py::arg("sm_version"),
-        "Check if SM version supports TMA");
-    gemm_mod.def("supports_warp_specialization", &supportsWarpSpecialization,
-        py::arg("sm_version"),
-        "Check if SM version supports warp specialization");
+                 "Check if SM version supports TMA");
+    gemm_mod.def("supports_warp_specialization", &supportsWarpSpecialization, py::arg("sm_version"),
+                 "Check if SM version supports warp specialization");
     gemm_mod.def("get_gemm_status_string", &getGemmStatusString, py::arg("status"),
-        "Convert GemmStatus to string");
+                 "Convert GemmStatus to string");
 
     // --- Auto-tuning ---
-    gemm_mod.def("auto_tune_gemm",
+    gemm_mod.def(
+        "auto_tune_gemm",
         [](int M, int N, int K, DataType dtype, int num_warmup, int num_iter) {
             return autoTuneGemm(M, N, K, dtype, num_warmup, num_iter, nullptr);
         },
-        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("dtype"),
-        py::arg("num_warmup") = 5, py::arg("num_iter") = 10,
-        "Auto-tune and return best GEMM configuration");
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("dtype"), py::arg("num_warmup") = 5,
+        py::arg("num_iter") = 10, "Auto-tune and return best GEMM configuration");
 
-    gemm_mod.def("auto_tune_bmm",
-        [](int batch, int M, int N, int K, DataType dtype,
-           int num_warmup, int num_iter) {
+    gemm_mod.def(
+        "auto_tune_bmm",
+        [](int batch, int M, int N, int K, DataType dtype, int num_warmup, int num_iter) {
             return autoTuneBmm(batch, M, N, K, dtype, num_warmup, num_iter, nullptr);
         },
-        py::arg("batch"), py::arg("M"), py::arg("N"), py::arg("K"),
-        py::arg("dtype"), py::arg("num_warmup") = 5, py::arg("num_iter") = 10,
+        py::arg("batch"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("dtype"),
+        py::arg("num_warmup") = 5, py::arg("num_iter") = 10,
         "Auto-tune and return best batched GEMM configuration");
 
     // --- Default configs ---
     gemm_mod.def("get_default_sm80_configs", &getDefaultSM80Configs,
-        "Get default GEMM configurations for SM80");
+                 "Get default GEMM configurations for SM80");
     gemm_mod.def("get_default_sm90_configs", &getDefaultSM90Configs,
-        "Get default GEMM configurations for SM90");
+                 "Get default GEMM configurations for SM90");
 }
 
-} // namespace pybind
-} // namespace oasr
+}  // namespace pybind
+}  // namespace oasr

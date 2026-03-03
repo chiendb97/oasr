@@ -95,94 +95,48 @@ class TestBmm:
         torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
 
 
-# -----------------------------------------------------------------------------
-# Grouped GEMM (variable-sized problems)
-# -----------------------------------------------------------------------------
-
-def _invoke_group_gemm(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype):
-    """Build workspace and call invoke_group_gemm with direct parameters."""
-    oasr_dtype = oasr.DataType.FP16 if dtype == torch.float16 else oasr.DataType.BF16
-    num_problems = len(problem_sizes)
-
-    problems_MNK = []
-    lda_list, ldb_list, ldd_list = [], [], []
-    for M, N, K in problem_sizes:
-        problems_MNK.extend([M, N, K])
-        lda_list.append(K)
-        ldb_list.append(N)
-        ldd_list.append(N)
-
-    a_ptrs = torch.tensor([t.data_ptr() for t in A_tensors], dtype=torch.int64, device='cuda')
-    b_ptrs = torch.tensor([t.data_ptr() for t in B_tensors], dtype=torch.int64, device='cuda')
-    d_ptrs = torch.tensor([t.data_ptr() for t in D_tensors], dtype=torch.int64, device='cuda')
-    problems_tensor = torch.tensor(problems_MNK, dtype=torch.int32, device='cuda')
-    lda_tensor = torch.tensor(lda_list, dtype=torch.int64, device='cuda')
-    ldb_tensor = torch.tensor(ldb_list, dtype=torch.int64, device='cuda')
-    ldd_tensor = torch.tensor(ldd_list, dtype=torch.int64, device='cuda')
-
-    float_ws, int_ws = oasr.kernels.gemm.query_group_gemm_workspace_size(num_problems, oasr_dtype)
-    workspace_float = torch.empty(float_ws, dtype=torch.uint8, device='cuda')
-
-    return oasr.kernels.gemm.invoke_group_gemm(
-        problems_tensor.data_ptr(),
-        num_problems,
-        a_ptrs.data_ptr(), b_ptrs.data_ptr(), d_ptrs.data_ptr(),
-        lda_tensor.data_ptr(), ldb_tensor.data_ptr(), ldd_tensor.data_ptr(),
-        oasr_dtype,
-        workspace_float.data_ptr(), float_ws,
-    )
-
-
 class TestGroupGemm:
-    """Tests for grouped GEMM kernel (variable-sized problems)."""
+    """Tests for grouped GEMM kernel (variable M per group, fixed N, K)."""
 
-    def test_group_gemm_single_problem(self, oasr):
+    @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+    def test_group_gemm_single_problem(self, oasr, dtype):
         """Test grouped GEMM with one problem."""
-        problem_sizes = [(64, 128, 256)]
-        dtype = torch.float16
-        A_tensors = [torch.randn(M, K, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
-        B_tensors = [torch.randn(K, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
-        D_tensors = [torch.empty(M, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
+        # Fixed N, K; single group with variable M
+        M, N, K = 32, 64, 64
+        A = torch.randn(M, K, device='cuda', dtype=dtype)
+        B = torch.randn(1, K, N, device='cuda', dtype=dtype)
+        offset = torch.tensor([M], dtype=torch.int64, device='cuda')
 
-        status = _invoke_group_gemm(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype)
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
+        D = oasr.kernels.gemm.invoke_group_gemm(A, B, offset)
         oasr.synchronize()
 
-        for i, (M, N, K) in enumerate(problem_sizes):
-            expected = torch.matmul(A_tensors[i], B_tensors[i])
-            torch.testing.assert_close(D_tensors[i], expected, rtol=1e-2, atol=1e-2)
+        assert D.shape == (M, N)
+        expected = torch.matmul(A, B[0].T)
+        torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
 
-    def test_group_gemm_multiple_same_size(self, oasr):
-        """Test grouped GEMM with multiple identical problem sizes."""
-        problem_sizes = [(32, 64, 64)] * 4
-        dtype = torch.float16
-        A_tensors = [torch.randn(M, K, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
-        B_tensors = [torch.randn(K, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
-        D_tensors = [torch.empty(M, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
+    @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+    def test_group_gemm_variable_sizes(self, oasr, dtype):
+        """Test grouped GEMM with different M per group (same N, K)."""
+        # M per group: 32, 64, 16; shared N=64, K=64
+        M_list = [32, 64, 16]
+        N, K = 128, 64
+        L = sum(M_list)
+        num_groups = len(M_list)
 
-        status = _invoke_group_gemm(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype)
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
+        A = torch.randn(L, K, device='cuda', dtype=dtype)
+        B = torch.randn(num_groups, N, K, device='cuda', dtype=dtype)
+        offset = torch.cumsum(torch.tensor(M_list, dtype=torch.int32, device='cuda'), dim=0, dtype=torch.int32)
+
+        D = oasr.kernels.gemm.invoke_group_gemm(A, B, offset)
         oasr.synchronize()
 
-        for i in range(len(problem_sizes)):
-            expected = torch.matmul(A_tensors[i], B_tensors[i])
-            torch.testing.assert_close(D_tensors[i], expected, rtol=1e-2, atol=1e-2)
+        assert D.shape == (L, N)
 
-    def test_group_gemm_variable_sizes(self, oasr):
-        """Test grouped GEMM with different M, N, K per problem."""
-        problem_sizes = [(32, 64, 48), (64, 32, 96), (16, 128, 64)]
-        dtype = torch.float16
-        A_tensors = [torch.randn(M, K, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
-        B_tensors = [torch.randn(K, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
-        D_tensors = [torch.empty(M, N, device='cuda', dtype=dtype) for M, N, K in problem_sizes]
+        # Use grouped_mm for the expected result
+        B_transposed = B.transpose(1, 2).contiguous()
+        expected = torch.nn.functional.grouped_mm(A, B_transposed, offs=offset)
 
-        status = _invoke_group_gemm(oasr, problem_sizes, A_tensors, B_tensors, D_tensors, dtype)
-        assert status == oasr.kernels.gemm.GemmStatus.SUCCESS
-        oasr.synchronize()
-
-        for i, (M, N, K) in enumerate(problem_sizes):
-            expected = torch.matmul(A_tensors[i], B_tensors[i])
-            torch.testing.assert_close(D_tensors[i], expected, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
 
 
 # -----------------------------------------------------------------------------

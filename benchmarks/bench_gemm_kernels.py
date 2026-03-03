@@ -83,59 +83,35 @@ def setup_bmm(batch_size, M, N, K, dtype=torch.float16):
     return oasr_fn, pytorch_fn
 
 
-def setup_group_gemm(problem_sizes, dtype=torch.float16):
-    """Setup device arrays for invoke_group_gemm."""
-    dtype_map = {
-        torch.float32: DataType.FP32,
-        torch.float16: DataType.FP16,
-        torch.bfloat16: DataType.BF16,
-    }
-    if dtype not in dtype_map:
-        dtype = torch.float16
-    oasr_dtype = dtype_map[dtype]
+def setup_group_gemm(problem_sizes, dtype=torch.bfloat16):
+    """Setup tensors for grouped GEMM using high-level invoke_group_gemm.
+
+    problem_sizes: list of (M, N, K) for each group. N and K are assumed equal
+    across all groups (matches the grouped GEMM tests); M may vary.
+    """
+    if len(problem_sizes) == 0:
+        raise ValueError("problem_sizes must be non-empty")
+
+    # Assume common N, K across groups
+    _, N, K = problem_sizes[0]
+    Ms = [M for M, _, _ in problem_sizes]
+    assert all(N_i == N and K_i == K for M, N_i, K_i in problem_sizes), \
+        "All grouped GEMM problems must share the same N and K"
+
     num_problems = len(problem_sizes)
+    L = sum(Ms)
 
-    A_tensors = []
-    B_tensors = []
-    D_tensors = []
-    lda_list = []
-    ldb_list = []
-    ldd_list = []
-    problems_MNK = []
-
-    for M, N, K in problem_sizes:
-        A_tensors.append(torch.randn(M, K, device='cuda', dtype=dtype))
-        B_tensors.append(torch.randn(K, N, device='cuda', dtype=dtype))
-        D_tensors.append(torch.empty(M, N, device='cuda', dtype=dtype))
-        lda_list.append(K)
-        ldb_list.append(N)
-        ldd_list.append(N)
-        problems_MNK.extend([M, N, K])
-
-    a_ptrs = torch.tensor([t.data_ptr() for t in A_tensors], dtype=torch.int64, device='cuda')
-    b_ptrs = torch.tensor([t.data_ptr() for t in B_tensors], dtype=torch.int64, device='cuda')
-    d_ptrs = torch.tensor([t.data_ptr() for t in D_tensors], dtype=torch.int64, device='cuda')
-    lda_tensor = torch.tensor(lda_list, dtype=torch.int64, device='cuda')
-    ldb_tensor = torch.tensor(ldb_list, dtype=torch.int64, device='cuda')
-    ldd_tensor = torch.tensor(ldd_list, dtype=torch.int64, device='cuda')
-    problems_tensor = torch.tensor(problems_MNK, dtype=torch.int32, device='cuda')
-
-    float_ws_size, _ = gemm_mod.query_group_gemm_workspace_size(num_problems, oasr_dtype)
-    workspace_float = torch.empty(float_ws_size, dtype=torch.uint8, device='cuda')
+    # Build concatenated A [L, K] and per-group B [num_problems, K, N]
+    A = torch.randn(L, K, device='cuda', dtype=dtype)
+    B = torch.randn(num_problems, N, K, device='cuda', dtype=dtype)
+    B_transposed = B.transpose(1, 2).contiguous()
+    offset = torch.cumsum(torch.tensor(Ms, dtype=torch.int32, device='cuda'), dim=0, dtype=torch.int32)
 
     def oasr_fn():
-        gemm_mod.invoke_group_gemm(
-            problems_tensor.data_ptr(), num_problems,
-            a_ptrs.data_ptr(), b_ptrs.data_ptr(), d_ptrs.data_ptr(),
-            lda_tensor.data_ptr(), ldb_tensor.data_ptr(), ldd_tensor.data_ptr(),
-            oasr_dtype,
-            workspace_float.data_ptr(), float_ws_size,
-            stream=None,
-        )
+        return gemm_mod.invoke_group_gemm(A, B, offset, stream=None)
 
     def pytorch_fn():
-        for i in range(num_problems):
-            torch.matmul(A_tensors[i], B_tensors[i], out=D_tensors[i])
+        return F.grouped_mm(A, B_transposed, offs=offset)
 
     return oasr_fn, pytorch_fn
 
@@ -211,11 +187,13 @@ def benchmark_group_gemm():
     """Benchmark Grouped GEMM: OASR vs PyTorch loop."""
     import triton
 
+    # Each config: (num_groups, (base_M, N, K)).
+    # For benchmarking we keep N, K fixed per config and vary M across groups.
     configs = [
-        (64, (250, 64, 64)),
-        (256, (250, 64, 64)),
-        (12, (16000, 256, 2048)),
-        (12, (16000, 512, 2048)),
+        (8, (256, 64, 64)),
+        (8, (256, 128, 64)),
+        (16, (16000, 256, 2048)),
+        (16, (16000, 512, 2048)),
     ]
 
     print("\n" + "=" * 70)
@@ -224,15 +202,22 @@ def benchmark_group_gemm():
     print(f"\n{'Config':<40} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 80)
 
-    for num_problems, (M, N, K) in configs:
-        problem_sizes = [(M, N, K)] * num_problems
+    for problem_count, (base_M, N, K) in configs:
+        # Use a fixed small number of problems with random M while keeping N, K fixed.
+        torch.manual_seed(0)
+        # Sample M in a reasonable range around base_M
+        low = max(16, base_M // 2)
+        high = max(low + 1, base_M * 2)
+        Ms = torch.randint(low=low, high=high, size=(problem_count,), device='cuda').tolist()
+
+        problem_sizes = [(M_i, N, K) for M_i in Ms]
         oasr_fn, pytorch_fn = setup_group_gemm(problem_sizes)
 
         oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
         pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
 
         speedup = pytorch_ms / oasr_ms
-        config_str = f"{num_problems} x ({M}, {N}, {K})"
+        config_str = f"{problem_count} x (M∈[{min(Ms)},{max(Ms)}], N={N}, K={K})"
         print(f"{config_str:<40} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
 
 
