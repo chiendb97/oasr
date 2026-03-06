@@ -9,21 +9,11 @@ Profiling mode for NVIDIA Nsight Compute:
     --warmup 0 --iters 1
 """
 
-import sys
-sys.path.insert(0, 'python')
-
 import argparse
 import torch
 import torch.nn.functional as F
 
 import oasr
-
-try:
-    from oasr import ConvType, ActivationType
-except ImportError:
-    from oasr._C import ConvType, ActivationType
-    oasr.ConvType = ConvType
-    oasr.ActivationType = ActivationType
 
 
 # =============================================================================
@@ -133,12 +123,9 @@ def setup_glu(batch_size, seq_len, channels, dtype=torch.float16):
     """Setup tensors for GLU."""
     x = torch.randn(batch_size, seq_len, 2 * channels, device='cuda', dtype=dtype)
     
-    dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
-    
     def oasr_fn():
         return oasr.kernels.conv.glu(
-            x,
-            dtype_map[dtype]
+            x
         )
     
     def pytorch_fn():
@@ -150,13 +137,10 @@ def setup_glu(batch_size, seq_len, channels, dtype=torch.float16):
 def setup_swish(batch_size, seq_len, channels, dtype=torch.float16):
     """Setup tensors for Swish."""
     x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
-    
-    dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
-    
+        
     def oasr_fn():
         return oasr.kernels.conv.swish(
-            x,
-            dtype_map[dtype]
+            x
         )
     
     def pytorch_fn():
@@ -174,14 +158,9 @@ def setup_batch_norm_swish(batch_size, seq_len, channels, dtype=torch.float16):
     running_mean = torch.randn(channels, device='cuda', dtype=dtype)
     running_var = torch.abs(torch.randn(channels, device='cuda', dtype=dtype)) + 0.1
     
-    dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
-    
     def oasr_fn():
         return oasr.kernels.conv.batch_norm_swish(
-            x,
-            gamma, beta,
-            running_mean, running_var,
-            eps, dtype_map[dtype]
+            x, gamma, beta, running_mean, running_var, eps
         )
     
     def pytorch_fn():
@@ -203,28 +182,22 @@ def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.floa
     pw2_bias = torch.randn(d_model, device='cuda', dtype=dtype)
     
     dw_weight_pt = dw_weight.view(d_model, 1, kernel_size)
-    dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
         pw1_out = oasr.kernels.conv.pointwise_conv1d(
-            x, pw1_weight, pw1_bias,
-            oasr.ActivationType.SWISH, False, dtype_map[dtype]
+            x, pw1_weight, pw1_bias
         )
         glu_out = oasr.kernels.conv.glu(
-            pw1_out,
-            dtype_map[dtype]
+            pw1_out
         )
         dw_out = oasr.kernels.conv.depthwise_conv1d(
-            glu_out, dw_weight, dw_bias, kernel_size // 2,
-            dtype_map[dtype]
+            glu_out, dw_weight, dw_bias, kernel_size // 2
         )
         swish_out = oasr.kernels.conv.swish(
-            dw_out,
-            dtype_map[dtype]
+            dw_out
         )
         return oasr.kernels.conv.pointwise_conv1d(
-            swish_out, pw2_weight, pw2_bias,
-            oasr.ActivationType.SWISH, False, dtype_map[dtype]
+            swish_out, pw2_weight, pw2_bias
         )
     
     def pytorch_fn():

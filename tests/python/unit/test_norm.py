@@ -4,20 +4,13 @@ Unit tests for normalization kernels.
 Uses torch.testing.assert_close for correctness verification.
 """
 
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-import sys
-sys.path.insert(0, 'python')
-
-
-@pytest.fixture
-def oasr():
-    """Import oasr module."""
-    import oasr
-    return oasr
-
+import oasr
 
 class TestLayerNorm:
     """Tests for LayerNorm kernel."""
@@ -30,7 +23,7 @@ class TestLayerNorm:
         (2, 128, 1024),
     ])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-    def test_layer_norm(self, oasr, batch_size, seq_len, hidden_size, dtype):
+    def test_layer_norm(self, batch_size, seq_len, hidden_size, dtype):
         """Test LayerNorm against PyTorch reference."""
         eps = 1e-5
         
@@ -53,7 +46,7 @@ class TestLayerNorm:
         rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
-    def test_layer_norm_no_beta(self, oasr):
+    def test_layer_norm_no_beta(self):
         """Test LayerNorm without beta (bias)."""
         batch_size, seq_len, hidden_size = 2, 128, 256
         eps = 1e-5
@@ -85,7 +78,7 @@ class TestRMSNorm:
         (4, 256, 512),
     ])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-    def test_rms_norm(self, oasr, batch_size, seq_len, hidden_size, dtype):
+    def test_rms_norm(self, batch_size, seq_len, hidden_size, dtype):
         """Test RMSNorm against reference implementation."""
         eps = 1e-5
         
@@ -114,7 +107,7 @@ class TestAddLayerNorm:
         (2, 128, 256),
         (4, 256, 512),
     ])
-    def test_add_layer_norm(self, oasr, batch_size, seq_len, hidden_size):
+    def test_add_layer_norm(self, batch_size, seq_len, hidden_size):
         """Test fused Add + LayerNorm."""
         eps = 1e-5
         dtype = torch.float32
@@ -147,7 +140,7 @@ class TestBatchNorm1D:
         (2, 128, 256),
         (4, 64, 512),
     ])
-    def test_batch_norm_1d(self, oasr, batch_size, seq_len, channels):
+    def test_batch_norm_1d(self, batch_size, seq_len, channels):
         """Test BatchNorm1D in inference mode."""
         eps = 1e-5
         dtype = torch.float32
@@ -180,7 +173,7 @@ class TestGroupNorm:
         (2, 64, 128, 8),
         (2, 64, 4096, 2),
     ])
-    def test_group_norm(self, oasr, batch_size, seq_len, channels, num_groups):
+    def test_group_norm(self, batch_size, seq_len, channels, num_groups):
         """Test GroupNorm kernel."""
         eps = 1e-5
         dtype = torch.float32

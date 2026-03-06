@@ -12,17 +12,7 @@ import sys
 sys.path.insert(0, 'python')
 
 
-@pytest.fixture
-def oasr():
-    """Import oasr module."""
-    import oasr
-    try:
-        from oasr import ConvType, ActivationType
-    except ImportError:
-        from oasr._C import ConvType, ActivationType
-        oasr.ConvType = ConvType
-        oasr.ActivationType = ActivationType
-    return oasr
+import oasr
 
 
 class TestDepthwiseConv1D:
@@ -34,7 +24,7 @@ class TestDepthwiseConv1D:
         (4, 256, 512, 31),
     ])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_depthwise_conv1d(self, oasr, batch_size, seq_len, channels, kernel_size, dtype):
+    def test_depthwise_conv1d(self, batch_size, seq_len, channels, kernel_size, dtype):
         """Test DepthwiseConv1D against PyTorch reference."""
         padding = (kernel_size - 1) // 2
         
@@ -64,7 +54,7 @@ class TestDepthwiseConv1D:
         (4, 256, 512, 31),
     ])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_depthwise_conv1d_causal(self, oasr, batch_size, seq_len, channels, kernel_size, dtype):
+    def test_depthwise_conv1d_causal(self, batch_size, seq_len, channels, kernel_size, dtype):
         """Test causal DepthwiseConv1D."""
         padding = 0
         lorder = kernel_size - 1
@@ -98,7 +88,7 @@ class TestDepthwiseConv1DSilu:
         (4, 256, 512, 31),
     ])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_depthwise_conv1d_silu(self, oasr, batch_size, seq_len, channels, kernel_size, dtype):
+    def test_depthwise_conv1d_silu(self, batch_size, seq_len, channels, kernel_size, dtype):
         """Test DepthwiseConv1D against PyTorch reference."""
         padding = (kernel_size - 1) // 2
         
@@ -128,7 +118,7 @@ class TestDepthwiseConv1DSilu:
         (4, 256, 512, 31),
     ])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_depthwise_conv1d_causal_silu(self, oasr, batch_size, seq_len, channels, kernel_size, dtype):
+    def test_depthwise_conv1d_causal_silu(self, batch_size, seq_len, channels, kernel_size, dtype):
         """Test causal DepthwiseConv1D."""
         padding = 0
         lorder = kernel_size - 1
@@ -162,7 +152,7 @@ class TestPointwiseConv1D:
         (2, 64, 768, 768),
     ])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_pointwise_conv1d(self, oasr, batch_size, seq_len, in_ch, out_ch, dtype):
+    def test_pointwise_conv1d(self, batch_size, seq_len, in_ch, out_ch, dtype):
         """Test PointwiseConv1D against F.linear."""
         x = torch.randn(batch_size, seq_len, in_ch, device='cuda', dtype=dtype)
         weight = torch.randn(out_ch, in_ch, device='cuda', dtype=dtype)
@@ -186,7 +176,7 @@ class TestPointwiseConv1D:
         (2, 64, 768, 768),
     ])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_pointwise_conv1d_activation(self, oasr, batch_size, seq_len, in_ch, out_ch, dtype):
+    def test_pointwise_conv1d_activation(self, batch_size, seq_len, in_ch, out_ch, dtype):
         """Test PointwiseConv1DActivation against F.linear."""
         x = torch.randn(batch_size, seq_len, in_ch, device='cuda', dtype=dtype)
         weight = torch.randn(out_ch, in_ch, device='cuda', dtype=dtype)
@@ -213,7 +203,7 @@ class TestGLU:
         (4, 256, 512),
     ])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_glu(self, oasr, batch_size, seq_len, channels, dtype):
+    def test_glu(self, batch_size, seq_len, channels, dtype):
         """Test GLU against F.glu."""
         x = torch.randn(batch_size, seq_len, 2 * channels, device='cuda', dtype=dtype)
         
@@ -242,7 +232,7 @@ class TestSwish:
         (2, 128, 256),
         (4, 256, 512),
     ])
-    def test_swish(self, oasr, batch_size, seq_len, channels):
+    def test_swish(self, batch_size, seq_len, channels):
         """Test Swish against F.silu."""
         dtype = torch.float32
         
@@ -266,7 +256,7 @@ class TestBatchNormSwish:
         (2, 128, 256),
         (4, 64, 512),
     ])
-    def test_batch_norm_swish(self, oasr, batch_size, seq_len, channels):
+    def test_batch_norm_swish(self, batch_size, seq_len, channels):
         """Test fused BatchNorm + Swish."""
         eps = 1e-5
         dtype = torch.float32
@@ -300,7 +290,7 @@ class TestConv1D:
         (256, 256, 5, 1, 2),
         (512, 256, 3, 2, 1),
     ])
-    def test_conv1d_standard(self, oasr, in_ch, out_ch, kernel_size, stride, padding):
+    def test_conv1d_standard(self, in_ch, out_ch, kernel_size, stride, padding):
         """Test standard Conv1D."""
         batch_size, seq_len = 2, 64
         dtype = torch.float32
@@ -329,7 +319,7 @@ class TestConv1D:
 class TestConformerConvPattern:
     """Integration test for Conformer-style convolution pattern."""
 
-    def test_conformer_conv_pattern(self, oasr):
+    def test_conformer_conv_pattern(self):
         """Test full Conformer conv block pattern."""
         batch_size, seq_len, d_model = 2, 128, 256
         kernel_size = 31
