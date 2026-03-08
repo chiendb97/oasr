@@ -5,16 +5,25 @@
 
 import torch
 
-import oasr._C as _C
+import oasr
 
 
-_DTYPE_TO_OASR = {
-    torch.float32: _C.DataType.FP32,
-    torch.float16: _C.DataType.FP16,
-    torch.bfloat16: _C.DataType.BF16
+TORCH_DTYPE_TO_OASR_DTYPE = {
+    torch.float32: oasr.DataType.FP32,
+    torch.float16: oasr.DataType.FP16,
+    torch.bfloat16: oasr.DataType.BF16
 }
 
-def _torch_dtype_to_oasr(dtype):
-    """Map torch dtype to oasr DataType."""
+STR_ACTIVATION_TO_OASR_ACTIVATION = {
+    "swish": oasr.ActivationType.SWISH,
+    "silu": oasr.ActivationType.SWISH,
+    "relu": oasr.ActivationType.RELU,
+    "gelu": oasr.ActivationType.GELU
+}
 
-    return _DTYPE_TO_OASR.get(dtype, _C.DataType.FP16)
+
+def torch_dtype_to_oasr_dtype(dtype):
+    return TORCH_DTYPE_TO_OASR_DTYPE.get(dtype, oasr.DataType.FP16)
+
+def str_activation_to_oasr_activation(activation):
+    return STR_ACTIVATION_TO_OASR_ACTIVATION.get(activation.lower(), oasr.ActivationType.SWISH)
