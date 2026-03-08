@@ -26,8 +26,12 @@ from oasr.models.conformer import (  # noqa: E402
 from oasr.models.conformer.model import RelPositionalEncoding  # noqa: E402
 
 
+DEVICE = torch.device("cuda")
+DTYPE = torch.bfloat16
+
+
 def _randn(*shape: int, device: torch.device | None = None) -> torch.Tensor:
-    return torch.randn(*shape, device=device, dtype=torch.float32)
+    return torch.randn(*shape, device=device or DEVICE, dtype=DTYPE)
 
 
 # -----------------------------------------------------------------------------
@@ -56,8 +60,8 @@ def test_positionwise_feed_forward_matches_wenet(idim: int, hidden_units: int):
     )
     impl.load_state_dict(ref.state_dict())
 
-    ref.eval()
-    impl.eval()
+    ref = ref.to(DTYPE).eval().to(DEVICE)
+    impl = impl.to(DTYPE).eval().to(DEVICE)
 
     batch, time = 2, 10
     xs = _randn(batch, time, idim)
@@ -67,7 +71,7 @@ def test_positionwise_feed_forward_matches_wenet(idim: int, hidden_units: int):
         out_impl = impl(xs)
 
     assert out_ref.shape == out_impl.shape
-    torch.testing.assert_close(out_impl, out_ref, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(out_impl, out_ref, rtol=5e-3, atol=5e-3)
 
 
 # -----------------------------------------------------------------------------
@@ -108,27 +112,25 @@ def test_convolution_module_matches_wenet(
     )
     impl.load_state_dict(ref.state_dict())
 
-    ref.eval()
-    impl.eval()
+    ref = ref.to(DTYPE).eval().to(DEVICE)
+    impl = impl.to(DTYPE).eval().to(DEVICE)
 
     batch, time = 2, 20
     x = _randn(batch, time, channels)
-    mask_pad = torch.ones(batch, 1, time, dtype=torch.bool)
+    mask_pad = torch.ones(batch, 1, time, dtype=torch.bool, device=DEVICE)
     if time > 1:
         mask_pad[:, :, -1] = 0
-    # ConvolutionModule expects mask_pad (B, 1, T) for masking; WeNet uses (B, 1, T) in conv
-    # OASR model uses mask_pad (B, 1, T) in conv_module forward
-    cache = torch.zeros(0, 0, 0)
+    cache = torch.zeros(0, 0, 0, device=DEVICE)
 
     with torch.no_grad():
         out_ref, cache_ref = ref(x, mask_pad, cache)
         out_impl, cache_impl = impl(x, mask_pad, cache)
 
     assert out_ref.shape == out_impl.shape
-    torch.testing.assert_close(out_impl, out_ref, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(out_impl, out_ref, rtol=1e-2, atol=5e-3)
     assert cache_ref.shape == cache_impl.shape
     if cache_ref.numel() > 0:
-        torch.testing.assert_close(cache_impl, cache_ref, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(cache_impl, cache_ref, rtol=1e-2, atol=5e-3)
 
 
 # -----------------------------------------------------------------------------
@@ -196,33 +198,33 @@ def test_conformer_encoder_layer_matches_wenet(
     load_sd = {k: ref_sd[k] for k in impl_encoder.state_dict() if k in ref_sd}
     impl_encoder.load_state_dict(load_sd, strict=False)
 
-    ref_encoder.eval()
-    impl_encoder.eval()
+    ref_encoder = ref_encoder.to(DTYPE).eval().to(DEVICE)
+    impl_encoder = impl_encoder.to(DTYPE).eval().to(DEVICE)
 
     batch, time_in = 2, 40
     xs = _randn(batch, time_in, 80)
-    # Build mask for subsampling: (B, 1, T) valid positions
     T = xs.size(1)
-    xs_lens = torch.full((batch,), T, dtype=torch.long)
+    xs_lens = torch.full((batch,), T, dtype=torch.long, device=DEVICE)
     mask = wenet_encoder.make_pad_mask(xs_lens, T).unsqueeze(1)
 
     with torch.no_grad():
-        # Single embedded input from WeNet embed; feed through ref layers and impl layers
         x_embed, pos_emb, mask_embed = ref_encoder.embed(xs, mask)
         mask_pad = mask_embed
         x_embed_impl = x_embed.clone()
         mask_embed_impl = mask_embed.clone()
 
-        att_cache = (torch.zeros(0, 0, 0, 0), torch.zeros(0, 0, 0, 0))
-        cnn_cache = torch.zeros(0, 0, 0)
+        att_cache = (torch.zeros(0, 0, 0, 0, device=DEVICE),
+                     torch.zeros(0, 0, 0, 0, device=DEVICE))
+        cnn_cache = torch.zeros(0, 0, 0, device=DEVICE)
         for i in range(num_blocks):
             x_embed, mask_embed, att_cache, cnn_cache = ref_encoder.encoders[i](
                 x_embed, mask_embed, pos_emb, mask_pad, att_cache, cnn_cache
             )
         ref_out = x_embed
 
-        att_cache2 = (torch.zeros(0, 0, 0, 0), torch.zeros(0, 0, 0, 0))
-        cnn_cache2 = torch.zeros(0, 0, 0)
+        att_cache2 = (torch.zeros(0, 0, 0, 0, device=DEVICE),
+                      torch.zeros(0, 0, 0, 0, device=DEVICE))
+        cnn_cache2 = torch.zeros(0, 0, 0, device=DEVICE)
         for i in range(num_blocks):
             x_embed_impl, mask_embed_impl, att_cache2, cnn_cache2 = impl_encoder.encoders[i](
                 x_embed_impl, mask_embed_impl, pos_emb, mask_pad, att_cache2, cnn_cache2
@@ -230,7 +232,7 @@ def test_conformer_encoder_layer_matches_wenet(
         impl_out = x_embed_impl
 
     assert ref_out.shape == impl_out.shape
-    torch.testing.assert_close(impl_out, ref_out, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(impl_out, ref_out, rtol=5e-2, atol=5e-2)
 
 
 # -----------------------------------------------------------------------------
@@ -256,16 +258,15 @@ def test_conformer_encoder_forward_shape(
         cnn_module_kernel=15,
     )
     encoder = ConformerEncoder(config)
-    encoder.eval()
+    encoder = encoder.to(DTYPE).eval().to(DEVICE)
 
     batch, time_in = 2, 80
     xs = _randn(batch, time_in, input_size)
-    xs_lens = torch.full((batch,), time_in, dtype=torch.long)
+    xs_lens = torch.full((batch,), time_in, dtype=torch.long, device=DEVICE)
 
     with torch.no_grad():
         out, masks = encoder(xs, xs_lens)
 
-    # After conv2d 4x subsampling: time roughly (time_in - 6) / 4
     expected_time = (time_in - 1) // 2
     expected_time = (expected_time - 1) // 2
     assert out.shape == (batch, expected_time, output_size)
@@ -287,12 +288,11 @@ def test_conformer_encoder_variable_length(batch: int):
         use_cnn_module=True,
     )
     encoder = ConformerEncoder(config)
-    encoder.eval()
+    encoder = encoder.to(DTYPE).eval().to(DEVICE)
 
     max_len = 40
     xs = _randn(batch, max_len, 80)
-    # Different lengths per batch
-    xs_lens = torch.tensor([max_len, max_len - 10][:batch], dtype=torch.long)
+    xs_lens = torch.tensor([max_len, max_len - 10][:batch], dtype=torch.long, device=DEVICE)
 
     with torch.no_grad():
         out, masks = encoder(xs, xs_lens)
@@ -315,6 +315,7 @@ def test_rel_positional_encoding_shape():
     torch.manual_seed(5)
     d_model = 64
     pos_enc = RelPositionalEncoding(d_model, max_len=5000)
+    pos_enc = pos_enc.to(DTYPE).to(DEVICE)
 
     batch, time = 2, 20
     x = _randn(batch, time, d_model)
@@ -323,7 +324,6 @@ def test_rel_positional_encoding_shape():
         x_out, pos_emb = pos_enc(x, offset=0)
 
     assert x_out.shape == (batch, time, d_model)
-    # pos_emb is (1, time, d_model) from buffer slice, broadcasts over batch
     assert pos_emb.shape[0] in (1, batch)
     assert pos_emb.shape[1] == time
     assert pos_emb.shape[2] == d_model

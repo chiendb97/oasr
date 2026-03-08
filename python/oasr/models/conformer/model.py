@@ -13,6 +13,7 @@ from torch import nn
 from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d
 from oasr.layers.norm import LayerNorm, RMSNorm
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention, T_CACHE
+from oasr.utils import torch_dtype_to_oasr_dtype, str_activation_to_oasr_activation
 
 from .config import ConformerEncoderConfig, ConformerModelConfig
 
@@ -79,17 +80,18 @@ class ConvolutionModule(nn.Module):
         causal: bool = False,
         bias: bool = True,
         norm_eps: float = 1e-5,
-        conv_inner_factor: int = 2,
+        conv_inner_factor: int = 2
     ):
         super().__init__()
         self.pointwise_conv1 = PointwiseConv1d(
-            channels, conv_inner_factor * channels, activation=activation_type, fuse_activation=True
+            channels, conv_inner_factor * channels,
         )
         if causal:
             padding = 0
             self.lorder = kernel_size - 1
         else:
-            assert (kernel_size - 1) % 2 == 0, "kernel_size should be odd for non-causal"
+            assert (kernel_size -
+                    1) % 2 == 0, "kernel_size should be odd for non-causal"
             padding = (kernel_size - 1) // 2
             self.lorder = 0
 
@@ -113,7 +115,8 @@ class ConvolutionModule(nn.Module):
                 else RMSNorm(inner_channels, eps=norm_eps)
             )
 
-        self.pointwise_conv2 = PointwiseConv1d(inner_channels, channels, fuse_activation=False, bias=bias)
+        self.pointwise_conv2 = PointwiseConv1d(
+            inner_channels, channels, bias=bias)
         self.activation = _get_activation(activation_type)
 
     def forward(
@@ -122,27 +125,36 @@ class ConvolutionModule(nn.Module):
         mask_pad: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
         cache: torch.Tensor = torch.zeros((0, 0, 0)),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x: [B, T, C], mask_pad: [B, 1, T]
+        # Transpose to [B, C, T] for masking and causal padding
         x = x.transpose(1, 2)
         if mask_pad.size(2) > 0:
             x = x.masked_fill(~mask_pad, 0.0)
         if self.lorder > 0:
             if cache.size(2) == 0:
-                x = nn.functional.pad(x, (self.lorder, 0), mode="constant", value=0.0)
+                x = nn.functional.pad(
+                    x, (self.lorder, 0), mode="constant", value=0.0)
             else:
-                assert cache.size(0) == x.size(0) and cache.size(1) == x.size(1)
+                assert cache.size(0) == x.size(
+                    0) and cache.size(1) == x.size(1)
                 x = torch.cat((cache, x), dim=2)
-            new_cache = x[:, :, -self.lorder :].contiguous()
+            new_cache = x[:, :, -self.lorder:].contiguous()
         else:
             new_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
+        # Transpose to [B, T, C] contiguous for OASR custom kernels
+        x = x.transpose(1, 2).contiguous()
         x = self.pointwise_conv1(x)
+        x = nn.functional.glu(x, dim=-1)
         x = self.depthwise_conv(x)
         if self.use_layer_norm:
-            x = x.transpose(1, 2)
             x = self.activation(self.norm(x))
-            x = x.transpose(1, 2)
         else:
+            x = x.transpose(1, 2)
             x = self.activation(self.norm(x))
+            x = x.transpose(1, 2)
         x = self.pointwise_conv2(x)
+        # Transpose to [B, C, T] for masking
+        x = x.transpose(1, 2)
         if mask_pad.size(2) > 0:
             x = x.masked_fill(~mask_pad, 0.0)
         return x.transpose(1, 2), new_cache
@@ -164,7 +176,8 @@ class RelPositionalEncoding(nn.Module):
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float32) * -(math.log(10000.0) / d_model)
+            torch.arange(0, d_model, 2, dtype=torch.float32) * -
+            (math.log(10000.0) / d_model)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
@@ -176,17 +189,19 @@ class RelPositionalEncoding(nn.Module):
         x = x * self.xscale
         size = x.size(1)
         if isinstance(offset, int):
-            pos_emb = self.pe[:, offset : offset + size]
+            pos_emb = self.pe[:, offset: offset + size]
         else:
-            index = offset.unsqueeze(1) + torch.arange(0, size, device=offset.device)
+            index = offset.unsqueeze(
+                1) + torch.arange(0, size, device=offset.device)
             index = index.clamp(min=0)
             pos_emb = torch.nn.functional.embedding(index, self.pe[0])
         return x, pos_emb
 
     def position_encoding(self, offset: Union[int, torch.Tensor], size: int) -> torch.Tensor:
         if isinstance(offset, int):
-            return self.pe[:, offset : offset + size]
-        index = offset.unsqueeze(1) + torch.arange(0, size, device=offset.device)
+            return self.pe[:, offset: offset + size]
+        index = offset.unsqueeze(
+            1) + torch.arange(0, size, device=offset.device)
         index = index.clamp(min=0)
         return torch.nn.functional.embedding(index, self.pe[0])
 
@@ -288,7 +303,8 @@ class ConformerEncoderLayer(nn.Module):
         mask: torch.Tensor,
         pos_emb: torch.Tensor,
         mask_pad: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
-        att_cache: T_CACHE = (torch.zeros(0, 0, 0, 0), torch.zeros(0, 0, 0, 0)),
+        att_cache: T_CACHE = (torch.zeros(0, 0, 0, 0),
+                              torch.zeros(0, 0, 0, 0)),
         cnn_cache: torch.Tensor = torch.zeros(0, 0, 0),
     ) -> Tuple[torch.Tensor, torch.Tensor, T_CACHE, torch.Tensor]:
         if self.feed_forward_macaron is not None:
@@ -301,7 +317,8 @@ class ConformerEncoderLayer(nn.Module):
         residual = x
         if self.normalize_before:
             x = self.norm_mha(x)
-        x_att, new_att_cache = self.self_attn(x, x, x, mask, pos_emb, att_cache)
+        x_att, new_att_cache = self.self_attn(
+            x, x, x, mask, pos_emb, att_cache)
         x = residual + x_att
         if not self.normalize_before:
             x = self.norm_mha(x)
