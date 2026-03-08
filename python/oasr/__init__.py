@@ -20,7 +20,6 @@ synchronize = _C.synchronize
 # Layers package (primary home of Python kernel wrappers)
 from . import layers
 from .layers import (
-    Conv1d,
     DepthwiseConv1d,
     PointwiseConv1d,
     Linear,
@@ -41,7 +40,6 @@ __all__ = [
     "synchronize",
     "layers",
     # Conv
-    "Conv1d",
     "DepthwiseConv1d",
     "PointwiseConv1d",
     # Linear

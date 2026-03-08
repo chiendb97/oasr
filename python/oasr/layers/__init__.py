@@ -1,12 +1,11 @@
 """High-level Python layer wrappers (Conv, Linear, Norm, ...)."""
 
-from .conv import Conv1d, DepthwiseConv1d, PointwiseConv1d
+from .conv import DepthwiseConv1d, PointwiseConv1d
 from .linear import Linear
 from .norm import LayerNorm, RMSNorm, GroupNorm, BatchNorm1d, AddLayerNorm
 
 __all__ = [
     # Convolution
-    "Conv1d",
     "DepthwiseConv1d",
     "PointwiseConv1d",
     # Linear
@@ -18,4 +17,3 @@ __all__ = [
     "BatchNorm1d",
     "AddLayerNorm",
 ]
-

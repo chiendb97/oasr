@@ -13,82 +13,8 @@ import math
 import torch
 import torch.nn as nn
 
-from oasr import ActivationType, ConvType, kernels
-from oasr.utils import _torch_dtype_to_oasr
-
-_BACKEND_ERROR = (
-    "oasr._C extension not found. Build the project with pip install -e . or set PYTHONPATH."
-)
-
-
-class Conv1d(nn.Module):
-    """Wrapper for 1D convolution kernel."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 1,
-        stride: int = 1,
-        padding: int = 0,
-        dilation: int = 1,
-        groups: int = 1,
-        conv_type: str = "standard",
-        is_causal: bool = False,
-        channels_last: bool = True,
-        activation: str = "SWISH",
-        fuse_activation: bool = False,
-        bias: bool = True,
-        device=None,
-        dtype=None,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
-        self.conv_type = conv_type
-        self.is_causal = is_causal
-        self.channels_last = channels_last
-        self.activation = activation
-        self.fuse_activation = fuse_activation
-
-        self.weight = nn.Parameter(torch.empty(
-            out_channels, in_channels // groups, kernel_size, device=device, dtype=dtype
-        ))
-        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if bias:
-            fan_in = (in_channels // groups) * kernel_size
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            self.bias = nn.Parameter(torch.empty(out_channels, device=device, dtype=dtype))
-            torch.nn.init.uniform_(self.bias, -bound, bound)
-        else:
-            self.bias = None
-
-    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
-        if kernels is None:
-            raise ImportError(_BACKEND_ERROR)
-        batch_size, seq_len = x.shape[0], x.shape[1]
-        oasr_dtype = _torch_dtype_to_oasr(x.dtype)
-
-        return kernels.conv.conv1d(
-            x, self.weight, self.bias,
-            batch_size, seq_len,
-            self.in_channels, self.out_channels,
-            self.kernel_size, self.stride, self.padding,
-            self.dilation, self.groups,
-            getattr(ConvType, self.conv_type.upper(), ConvType.STANDARD),
-            oasr_dtype,
-            self.channels_last, self.is_causal,
-            getattr(ActivationType, self.activation.upper(), ActivationType.SWISH),
-            self.fuse_activation,
-        )
-
-    def __call__(self, x):
-        return self.forward(x)
+import oasr
+from oasr.utils import str_activation_to_oasr_activation
 
 
 class DepthwiseConv1d(nn.Module):
@@ -99,7 +25,6 @@ class DepthwiseConv1d(nn.Module):
         channels: int,
         kernel_size: int,
         padding: int = 0,
-        is_causal: bool = False,
         bias: bool = True,
         device=None,
         dtype=None,
@@ -108,31 +33,60 @@ class DepthwiseConv1d(nn.Module):
         self.channels = channels
         self.kernel_size = kernel_size
         self.padding = padding
-        self.is_causal = is_causal
 
-        self.weight = nn.Parameter(torch.empty(channels, 1, kernel_size, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.empty(
+            kernel_size, 1, channels, device=device, dtype=dtype))
         torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         if bias:
             fan_in = kernel_size
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            self.bias = nn.Parameter(torch.empty(channels, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.empty(
+                channels, device=device, dtype=dtype))
             torch.nn.init.uniform_(self.bias, -bound, bound)
         else:
             self.bias = None
 
-    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
-        if kernels is None:
-            raise ImportError(_BACKEND_ERROR)
-        batch_size, seq_len, _ = x.shape
-        return kernels.conv.depthwise_conv1d(
-            x, self.weight, self.bias,
-            batch_size, seq_len, self.channels,
-            self.kernel_size, self.padding,
-            _torch_dtype_to_oasr(x.dtype),
-        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return oasr.kernels.conv.depthwise_conv1d(x, self.weight, self.bias, self.padding)
 
-    def __call__(self, x):
-        return self.forward(x)
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Support loading WeNet Conv1d depthwise weights.
+
+        WeNet depthwise conv uses PyTorch Conv1d layout [C, 1, K].
+        OASR depthwise kernel expects [K, 1, C], so transpose on load.
+        """
+        weight_key = prefix + "weight"
+        if weight_key in state_dict:
+            w = state_dict[weight_key]
+            # Detect WeNet-style layout and convert to OASR layout.
+            if (
+                isinstance(w, torch.Tensor)
+                and w.ndim == 3
+                and w.shape[1] == 1
+                and w.shape[0] == self.channels
+                and w.shape[2] == self.kernel_size
+                and w.shape != self.weight.shape
+            ):
+                state_dict[weight_key] = w.permute(2, 1, 0).contiguous()
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
 
 class PointwiseConv1d(nn.Module):
@@ -142,8 +96,7 @@ class PointwiseConv1d(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        activation: str = "swish",
-        fuse_activation: bool = False,
+        activation_type: str | None = None,
         bias: bool = True,
         device=None,
         dtype=None,
@@ -151,34 +104,28 @@ class PointwiseConv1d(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.activation = activation
-        self.fuse_activation = fuse_activation
+        self.activation = (
+            None if activation_type is None
+            else str_activation_to_oasr_activation(activation_type)
+        )
 
-        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, 1, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.empty(
+            out_channels, in_channels, 1, device=device, dtype=dtype))
         torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         if bias:
             fan_in = in_channels
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            self.bias = nn.Parameter(torch.empty(out_channels, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.empty(
+                out_channels, device=device, dtype=dtype))
             torch.nn.init.uniform_(self.bias, -bound, bound)
         else:
             self.bias = None
 
-    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
-        if kernels is None:
-            raise ImportError(_BACKEND_ERROR)
-        batch_size, seq_len, _ = x.shape
-        return kernels.conv.pointwise_conv1d(
-            x, self.weight, self.bias,
-            batch_size, seq_len,
-            self.in_channels, self.out_channels,
-            getattr(ActivationType, self.activation.upper(), ActivationType.SWISH),
-            self.fuse_activation,
-            _torch_dtype_to_oasr(x.dtype),
-        )
-
-    def __call__(self, x):
-        return self.forward(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.activation is not None:
+            return oasr.kernels.conv.pointwise_conv1d_activation(x, self.weight, self.bias, self.activation)
+        else:
+            return oasr.kernels.conv.pointwise_conv1d(x, self.weight, self.bias)
 
 
-__all__ = ["Conv1d", "DepthwiseConv1d", "PointwiseConv1d"]
+__all__ = ["DepthwiseConv1d", "PointwiseConv1d"]
