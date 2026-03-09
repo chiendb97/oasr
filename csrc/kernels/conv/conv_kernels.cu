@@ -9,6 +9,7 @@
 #include <torch/extension.h>
 
 #include "common/cuda_utils.h"
+#include "common/vec_dtypes.h"
 #include "kernels/conv/conv_kernels.h"
 #include "kernels/gemm/gemm_kernels.h"
 
@@ -66,6 +67,81 @@ __global__ void depthwiseConv1DKernel(const T* __restrict__ input,   // [batch, 
     }
 
     output[o_id] = (T)val;
+}
+
+// =============================================================================
+// Depthwise 1D Convolution Kernel (vectorized)
+// =============================================================================
+// Each thread processes VecSize channels using 128-bit vector loads/stores.
+// Requires channels % VecSize == 0.
+//
+// Grid:  (out_len, batch_size)
+// Block: (channels / VecSize)
+
+template <typename T, int VecSize>
+__global__ void depthwiseConv1DVecKernel(const T* __restrict__ input,  // [batch, seq_len, channels]
+                                         const T* __restrict__ weight,  // [kernel_size, channels]
+                                         const T* __restrict__ bias,    // [channels] or nullptr
+                                         T* __restrict__ output,  // [batch, out_len, channels]
+                                         int batch_size, int seq_len, int channels, int kernel_size,
+                                         int padding) {
+    // Thread ID in the vectorized channel dimension
+    const int vec_id = threadIdx.x;  // which vector chunk [0, channels/VecSize)
+    const int s_id = blockIdx.x;     // output sequence position
+    const int b_id = blockIdx.y;     // batch index
+
+    const int c_offset = vec_id * VecSize;  // starting channel for this thread
+
+    // Compute the valid input range for this output position
+    int s_start = s_id - padding;
+    int s_end = min(s_start + kernel_size, seq_len);
+    s_start = max(s_start, 0);
+
+    int k_start = max(padding - s_id, 0);
+
+    // Pointers for this batch element, offset to the vector chunk
+    const T* input_base = input + b_id * seq_len * channels + c_offset;
+    const T* weight_base = weight + c_offset;
+
+    // Accumulate in float for numerical stability
+    float acc[VecSize];
+#pragma unroll
+    for (int v = 0; v < VecSize; v++) {
+        acc[v] = 0.0f;
+    }
+
+    // Main convolution loop
+    for (int i = s_start; i < s_end; i++) {
+        Vec<T, VecSize> in_vec;
+        in_vec.load(input_base + i * channels);
+
+        Vec<T, VecSize> w_vec;
+        w_vec.load(weight_base + (k_start + i - s_start) * channels);
+
+#pragma unroll
+        for (int v = 0; v < VecSize; v++) {
+            acc[v] += static_cast<float>(in_vec[v]) * static_cast<float>(w_vec[v]);
+        }
+    }
+
+    // Add bias
+    if (bias != nullptr) {
+        Vec<T, VecSize> bias_vec;
+        bias_vec.load(bias + c_offset);
+#pragma unroll
+        for (int v = 0; v < VecSize; v++) {
+            acc[v] += static_cast<float>(bias_vec[v]);
+        }
+    }
+
+    // Store result
+    const int out_offset = (b_id * gridDim.x + s_id) * channels + c_offset;
+    Vec<T, VecSize> out_vec;
+#pragma unroll
+    for (int v = 0; v < VecSize; v++) {
+        out_vec[v] = static_cast<T>(acc[v]);
+    }
+    out_vec.store(output + out_offset);
 }
 
 // =============================================================================
@@ -297,11 +373,24 @@ void invokeDepthwiseConv1DTyped(const torch::Tensor& input, const torch::Tensor&
     const T* bias_ptr = bias.defined() ? static_cast<const T*>(bias.data_ptr()) : nullptr;
     T* output_ptr = static_cast<T*>(output.data_ptr());
 
-    dim3 block_size(channels);
-    dim3 grid_size(seq_len + 2 * padding - kernel_size + 1, batch_size);
-    depthwiseConv1DKernel<T><<<grid_size, block_size, 0, stream>>>(input_ptr, weight_ptr, bias_ptr,
-                                                                   output_ptr, batch_size, seq_len,
-                                                                   channels, kernel_size, padding);
+    const int out_len = seq_len + 2 * padding - kernel_size + 1;
+    dim3 grid_size(out_len, batch_size);
+
+    constexpr int kVecSize = VecTypeTrait<T>::VecSize;
+
+    // Use vectorized kernel when channels are aligned to VecSize
+    // and the thread count fits within hardware limits
+    if (channels % kVecSize == 0 && (channels / kVecSize) <= 1024) {
+        dim3 block_size(channels / kVecSize);
+        depthwiseConv1DVecKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
+            input_ptr, weight_ptr, bias_ptr, output_ptr, batch_size, seq_len, channels, kernel_size,
+            padding);
+    } else {
+        dim3 block_size(channels);
+        depthwiseConv1DKernel<T><<<grid_size, block_size, 0, stream>>>(
+            input_ptr, weight_ptr, bias_ptr, output_ptr, batch_size, seq_len, channels, kernel_size,
+            padding);
+    }
 }
 
 template <typename T>
