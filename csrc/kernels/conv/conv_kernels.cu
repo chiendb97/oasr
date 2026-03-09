@@ -671,31 +671,32 @@ void invokeGLUTyped(const torch::Tensor& input, torch::Tensor& output, cudaStrea
     }
 }
 
-torch::Tensor invokeGLU(const torch::Tensor& input, DataType dtype, cudaStream_t stream) {
+torch::Tensor invokeGLU(const torch::Tensor& input, cudaStream_t stream) {
     const int batch_size = input.size(0);
     const int seq_len = input.size(1);
     const int channels = input.size(2) / 2;
 
     auto output = torch::empty({batch_size, seq_len, channels}, input.options());
 
-    switch (dtype) {
-        case DataType::FP32:
+    switch (input.scalar_type()) {
+        case torch::ScalarType::Float:
             invokeGLUTyped<float>(input, output, stream);
             break;
-        case DataType::FP16:
+        case torch::ScalarType::Half:
             invokeGLUTyped<half>(input, output, stream);
             break;
-        case DataType::BF16:
+        case torch::ScalarType::BFloat16:
             invokeGLUTyped<__nv_bfloat16>(input, output, stream);
             break;
         default:
             throw std::runtime_error("Unsupported data type for GLU");
+            break;
     }
 
     return output;
 }
 
-torch::Tensor invokeSwish(const torch::Tensor& input, DataType dtype, cudaStream_t stream) {
+torch::Tensor invokeSwish(const torch::Tensor& input, cudaStream_t stream) {
     const int batch_size = input.size(0);
     const int seq_len = input.size(1);
     const int channels = input.size(2);
@@ -709,24 +710,25 @@ torch::Tensor invokeSwish(const torch::Tensor& input, DataType dtype, cudaStream
     int block_size = 256;
     int grid_size = (total_elements + block_size - 1) / block_size;
 
-    switch (dtype) {
-        case DataType::FP32:
+    switch (input.scalar_type()) {
+        case torch::ScalarType::Float:
             swishKernel<float><<<grid_size, block_size, 0, stream>>>(
                 static_cast<const float*>(input_ptr), static_cast<float*>(output_ptr), batch_size,
                 seq_len, channels);
             break;
-        case DataType::FP16:
+        case torch::ScalarType::Half:
             swishKernel<half><<<grid_size, block_size, 0, stream>>>(
                 static_cast<const half*>(input_ptr), static_cast<half*>(output_ptr), batch_size,
                 seq_len, channels);
             break;
-        case DataType::BF16:
+        case torch::ScalarType::BFloat16:
             swishKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(input_ptr),
                 static_cast<__nv_bfloat16*>(output_ptr), batch_size, seq_len, channels);
             break;
         default:
             throw std::runtime_error("Unsupported data type for Swish");
+            break;
     }
 
     return output;
@@ -734,7 +736,7 @@ torch::Tensor invokeSwish(const torch::Tensor& input, DataType dtype, cudaStream
 
 torch::Tensor invokeBatchNormSwish(const torch::Tensor& input, const torch::Tensor& weight,
                                    const torch::Tensor& bias, const torch::Tensor& running_mean,
-                                   const torch::Tensor& running_var, float eps, DataType dtype,
+                                   const torch::Tensor& running_var, float eps,
                                    cudaStream_t stream) {
     const int batch_size = input.size(0);
     const int seq_len = input.size(1);
@@ -753,22 +755,22 @@ torch::Tensor invokeBatchNormSwish(const torch::Tensor& input, const torch::Tens
     int block_size = 256;
     int grid_size = (total_elements + block_size - 1) / block_size;
 
-    switch (dtype) {
-        case DataType::FP32:
+    switch (input.scalar_type()) {
+        case torch::ScalarType::Float:
             batchNormSwishKernel<float><<<grid_size, block_size, 0, stream>>>(
                 static_cast<const float*>(input_ptr), static_cast<float*>(output_ptr),
                 static_cast<const float*>(weight_ptr), static_cast<const float*>(bias_ptr),
                 static_cast<const float*>(running_mean_ptr),
                 static_cast<const float*>(running_var_ptr), batch_size, seq_len, channels, eps);
             break;
-        case DataType::FP16:
+        case torch::ScalarType::Half:
             batchNormSwishKernel<half><<<grid_size, block_size, 0, stream>>>(
                 static_cast<const half*>(input_ptr), static_cast<half*>(output_ptr),
                 static_cast<const half*>(weight_ptr), static_cast<const half*>(bias_ptr),
                 static_cast<const half*>(running_mean_ptr),
                 static_cast<const half*>(running_var_ptr), batch_size, seq_len, channels, eps);
             break;
-        case DataType::BF16:
+        case torch::ScalarType::BFloat16:
             batchNormSwishKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(input_ptr),
                 static_cast<__nv_bfloat16*>(output_ptr),
@@ -780,6 +782,7 @@ torch::Tensor invokeBatchNormSwish(const torch::Tensor& input, const torch::Tens
             break;
         default:
             throw std::runtime_error("Unsupported data type for BatchNormSwish");
+            break;
     }
 
     return output;
@@ -787,7 +790,7 @@ torch::Tensor invokeBatchNormSwish(const torch::Tensor& input, const torch::Tens
 
 torch::Tensor invokeCausalConv1D(const torch::Tensor& input, void* state_buffer,
                                  const torch::Tensor& weight, const torch::Tensor& bias,
-                                 DataType dtype, cudaStream_t stream) {
+                                 cudaStream_t stream) {
     const int batch_size = input.size(0);
     const int chunk_len = input.size(1);
     const int channels = input.size(2);
@@ -805,8 +808,8 @@ torch::Tensor invokeCausalConv1D(const torch::Tensor& input, void* state_buffer,
     int grid_size = (total_elements + block_size - 1) / block_size;
     int state_len = kernel_size - 1;
 
-    switch (dtype) {
-        case DataType::FP32:
+    switch (input.scalar_type()) {
+        case torch::ScalarType::Float:
             causalConv1DKernel<float><<<grid_size, block_size, 0, stream>>>(
                 static_cast<const float*>(input_ptr), static_cast<float*>(state_buffer),
                 static_cast<const float*>(weight_ptr), static_cast<const float*>(bias_ptr),
@@ -819,7 +822,7 @@ torch::Tensor invokeCausalConv1D(const torch::Tensor& input, void* state_buffer,
                     batch_size, chunk_len, channels, state_len);
             }
             break;
-        case DataType::FP16:
+        case torch::ScalarType::Half:
             causalConv1DKernel<half><<<grid_size, block_size, 0, stream>>>(
                 static_cast<const half*>(input_ptr), static_cast<half*>(state_buffer),
                 static_cast<const half*>(weight_ptr), static_cast<const half*>(bias_ptr),
@@ -832,7 +835,7 @@ torch::Tensor invokeCausalConv1D(const torch::Tensor& input, void* state_buffer,
                     batch_size, chunk_len, channels, state_len);
             }
             break;
-        case DataType::BF16:
+        case torch::ScalarType::BFloat16:
             causalConv1DKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(input_ptr),
                 static_cast<__nv_bfloat16*>(state_buffer),
@@ -851,6 +854,7 @@ torch::Tensor invokeCausalConv1D(const torch::Tensor& input, void* state_buffer,
             break;
         default:
             throw std::runtime_error("Unsupported data type for CausalConv1D");
+            break;
     }
 
     return output;

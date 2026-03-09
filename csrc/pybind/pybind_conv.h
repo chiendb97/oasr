@@ -71,32 +71,31 @@ inline void registerConvBindings(py::module_& kernels) {
 
     conv.def(
         "glu",
-        [](const torch::Tensor& input, DataType dtype) -> torch::Tensor {
+        [](const torch::Tensor& input) -> torch::Tensor {
             int batch_size = input.size(0);
             int seq_len = input.size(1);
             int channels = input.size(2) / 2;
-            return oasr::kernels::invokeGLU(input, dtype, nullptr);
+            return oasr::kernels::invokeGLU(input, nullptr);
         },
-        py::arg("input"), py::arg("dtype") = DataType::FP16,
+        py::arg("input"),
         "GLU (Gated Linear Unit) activation kernel");
 
     conv.def(
         "swish",
-        [](const torch::Tensor& input, DataType dtype) -> torch::Tensor {
-            return oasr::kernels::invokeSwish(input, dtype, nullptr);
+        [](const torch::Tensor& input) -> torch::Tensor {
+            return oasr::kernels::invokeSwish(input, nullptr);
         },
-        py::arg("input"), py::arg("dtype") = DataType::FP16, "Swish activation kernel");
+        py::arg("input"), "Swish activation kernel");
 
     conv.def(
         "batch_norm_swish",
         [](const torch::Tensor& input, const torch::Tensor& gamma, const torch::Tensor& beta,
-           const torch::Tensor& running_mean, const torch::Tensor& running_var, float eps,
-           DataType dtype) -> torch::Tensor {
+           const torch::Tensor& running_mean, const torch::Tensor& running_var, float eps) -> torch::Tensor {
             return oasr::kernels::invokeBatchNormSwish(input, gamma, beta, running_mean,
-                                                       running_var, eps, dtype, nullptr);
+                                                       running_var, eps, nullptr);
         },
         py::arg("input"), py::arg("gamma"), py::arg("beta"), py::arg("running_mean"),
-        py::arg("running_var"), py::arg("eps") = 1e-5f, py::arg("dtype") = DataType::FP16,
+        py::arg("running_var"), py::arg("eps") = 1e-5f,
         "Fused BatchNorm + Swish kernel");
 }
 
