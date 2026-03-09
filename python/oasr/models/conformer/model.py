@@ -126,38 +126,38 @@ class ConvolutionModule(nn.Module):
         cache: torch.Tensor = torch.zeros((0, 0, 0)),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # x: [B, T, C], mask_pad: [B, 1, T]
-        # Transpose to [B, C, T] for masking and causal padding
-        x = x.transpose(1, 2)
+        # Stay in [B, T, C] throughout; reshape mask for broadcasting
         if mask_pad.size(2) > 0:
-            x = x.masked_fill(~mask_pad, 0.0)
+            # [B, 1, T] -> [B, T, 1] to broadcast over C dimension
+            mask_btc = mask_pad.transpose(1, 2)
+            x = x.masked_fill(~mask_btc, 0.0)
         if self.lorder > 0:
             if cache.size(2) == 0:
+                # Pad along T dimension: (0, 0) for C, (lorder, 0) for T
                 x = nn.functional.pad(
-                    x, (self.lorder, 0), mode="constant", value=0.0)
+                    x, (0, 0, self.lorder, 0), mode="constant", value=0.0)
             else:
+                # cache is [B, T, C], same layout as x
                 assert cache.size(0) == x.size(
-                    0) and cache.size(1) == x.size(1)
-                x = torch.cat((cache, x), dim=2)
-            new_cache = x[:, :, -self.lorder:].contiguous()
+                    0) and cache.size(2) == x.size(2)
+                x = torch.cat((cache, x), dim=1)
+            new_cache = x[:, -self.lorder:, :].contiguous()
         else:
             new_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
-        # Transpose to [B, T, C] contiguous for OASR custom kernels
-        x = x.transpose(1, 2).contiguous()
         x = self.pointwise_conv1(x)
         x = nn.functional.glu(x, dim=-1)
         x = self.depthwise_conv(x)
         if self.use_layer_norm:
             x = self.activation(self.norm(x))
         else:
+            # BatchNorm1d requires [B, C, T]
             x = x.transpose(1, 2)
             x = self.activation(self.norm(x))
             x = x.transpose(1, 2)
         x = self.pointwise_conv2(x)
-        # Transpose to [B, C, T] for masking
-        x = x.transpose(1, 2)
         if mask_pad.size(2) > 0:
-            x = x.masked_fill(~mask_pad, 0.0)
-        return x.transpose(1, 2), new_cache
+            x = x.masked_fill(~mask_btc, 0.0)
+        return x, new_cache
 
 
 # -----------------------------------------------------------------------------

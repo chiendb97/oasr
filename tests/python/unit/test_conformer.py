@@ -128,9 +128,11 @@ def test_convolution_module_matches_wenet(
 
     assert out_ref.shape == out_impl.shape
     torch.testing.assert_close(out_impl, out_ref, rtol=1e-2, atol=5e-3)
-    assert cache_ref.shape == cache_impl.shape
+    # OASR cache is [B, T, C]; WeNet cache is [B, C, T] — transpose for comparison
     if cache_ref.numel() > 0:
-        torch.testing.assert_close(cache_impl, cache_ref, rtol=1e-2, atol=5e-3)
+        cache_ref_btc = cache_ref.transpose(1, 2)
+        assert cache_ref_btc.shape == cache_impl.shape
+        torch.testing.assert_close(cache_impl, cache_ref_btc, rtol=1e-2, atol=5e-3)
 
 
 # -----------------------------------------------------------------------------
