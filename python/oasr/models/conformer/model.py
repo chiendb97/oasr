@@ -13,7 +13,7 @@ from torch import nn
 from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d
 from oasr.layers.norm import LayerNorm, RMSNorm
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention, T_CACHE
-from oasr.utils import torch_dtype_to_oasr_dtype, str_activation_to_oasr_activation
+from wenet.utils.common import mask_to_bias
 
 from .config import ConformerEncoderConfig, ConformerModelConfig
 
@@ -284,7 +284,6 @@ class ConformerEncoderLayer(nn.Module):
         self.conv_module = conv_module
         self.size = size
         self.normalize_before = normalize_before
-        norm_class = nn.LayerNorm if layer_norm_type == "layer_norm" else _rms_norm_class()
         norm_class = LayerNorm if layer_norm_type == "layer_norm" else RMSNorm
         self.norm_ff = norm_class(size, eps=norm_eps)
         self.norm_mha = norm_class(size, eps=norm_eps)
@@ -307,6 +306,11 @@ class ConformerEncoderLayer(nn.Module):
                               torch.zeros(0, 0, 0, 0)),
         cnn_cache: torch.Tensor = torch.zeros(0, 0, 0),
     ) -> Tuple[torch.Tensor, torch.Tensor, T_CACHE, torch.Tensor]:
+        # Attention always uses SDPA-based kernels. WeNet expects the
+        # attention mask to be an additive bias (float/bfloat16/half), not a
+        # bool tensor, so convert boolean masks to a large negative bias via
+        # `mask_to_bias` before calling into `RelPositionMultiHeadedAttention`.
+
         if self.feed_forward_macaron is not None:
             residual = x
             if self.normalize_before:
@@ -339,7 +343,7 @@ class ConformerEncoderLayer(nn.Module):
             x = self.norm_ff(x)
         if self.conv_module is not None:
             x = self.norm_final(x)
-        return x, mask, new_att_cache, new_cnn_cache
+        return x, new_att_cache, new_cnn_cache
 
 
 # -----------------------------------------------------------------------------
@@ -389,7 +393,6 @@ class ConformerEncoder(nn.Module):
                 query_bias=True,
                 key_bias=True,
                 value_bias=True,
-                use_sdpa=False,
                 n_kv_head=config.n_kv_head,
                 head_dim=config.head_dim,
             )
@@ -433,9 +436,9 @@ class ConformerEncoder(nn.Module):
         T = xs.size(1)
         masks = _make_pad_mask(xs_lens, T).unsqueeze(1)
         xs, pos_emb, masks = self.embed(xs, masks)
-        mask_pad = masks
+        attn_masks = mask_to_bias(masks, xs.dtype)
         for layer in self.encoders:
-            xs, masks, _, _ = layer(xs, masks, pos_emb, mask_pad)
+            xs, _, _ = layer(xs, attn_masks, pos_emb, masks)
         if self.normalize_before and self.final_norm:
             xs = self.after_norm(xs)
         return xs, masks
