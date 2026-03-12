@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cutlass/cutlass.h>
+
 #include <torch/extension.h>
 
 #include "kernels/gemm/bmm_kernels.h"
@@ -82,7 +83,7 @@ inline void registerGemmBindings(py::module_& kernels) {
 
     // --- GEMM: D = alpha * A @ B + beta * C ---
     gemm_mod.def(
-        "invoke_gemm",
+        "gemm",
         [](const torch::Tensor& a, const torch::Tensor& b, std::optional<const torch::Tensor>& c,
            py::object stream) -> torch::Tensor {
             cudaStream_t s = stream.is_none()
@@ -97,7 +98,7 @@ inline void registerGemmBindings(py::module_& kernels) {
         "Execute GEMM: D = A @ B + C (C is optional). Returns (output, status).");
 
     gemm_mod.def(
-        "invoke_gemm_activation",
+        "gemm_activation",
         [](const torch::Tensor& a, const torch::Tensor& b, std::optional<const torch::Tensor>& c,
            ActivationType activation, py::object stream) -> torch::Tensor {
             cudaStream_t s = stream.is_none()
@@ -113,7 +114,7 @@ inline void registerGemmBindings(py::module_& kernels) {
 
     // --- Batched GEMM (strided) ---
     gemm_mod.def(
-        "invoke_bmm",
+        "bmm",
         [](const torch::Tensor& a, const torch::Tensor& b, py::object stream) -> torch::Tensor {
             cudaStream_t s = stream.is_none()
                                  ? nullptr
@@ -126,7 +127,7 @@ inline void registerGemmBindings(py::module_& kernels) {
 
     // --- Grouped GEMM (pointer arrays, kept low-level) ---
     gemm_mod.def(
-        "invoke_group_gemm",
+        "group_gemm",
         [](const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& offset,
            py::object stream) -> torch::Tensor {
             cudaStream_t s = stream.is_none()

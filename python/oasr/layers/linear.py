@@ -41,7 +41,7 @@ class Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (*, in_features) -> (*, out_features)."""
 
-        return oasr.kernels.gemm.invoke_gemm(x, self.weight, self.bias)
+        return oasr.kernels.gemm.gemm(x, self.weight, self.bias)
 
 
 __all__ = ["Linear"]

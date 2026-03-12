@@ -45,7 +45,7 @@ def setup_gemm(M, N, K, dtype=torch.float16):
     B = torch.randn(N, K, device='cuda', dtype=dtype)
 
     def oasr_fn():
-        return oasr.kernels.gemm.invoke_gemm(
+        return oasr.kernels.gemm.gemm(
             A, B, stream=None,
         )
 
@@ -62,7 +62,7 @@ def setup_bmm(batch_size, M, N, K, dtype=torch.float16):
     B_transposed = B.transpose(1, 2).contiguous()
 
     def oasr_fn():
-        return oasr.kernels.gemm.invoke_bmm(A, B_transposed, stream=None)
+        return oasr.kernels.gemm.bmm(A, B_transposed, stream=None)
 
     def pytorch_fn():
         return torch.bmm(A, B_transposed)
@@ -95,7 +95,7 @@ def setup_group_gemm(problem_sizes, dtype=torch.bfloat16):
     offset = torch.cumsum(torch.tensor(Ms, dtype=torch.int32, device='cuda'), dim=0, dtype=torch.int32)
 
     def oasr_fn():
-        return oasr.kernels.gemm.invoke_group_gemm(A, B, offset, stream=None)
+        return oasr.kernels.gemm.group_gemm(A, B, offset, stream=None)
 
     def pytorch_fn():
         return F.grouped_mm(A, B_transposed, offs=offset)
