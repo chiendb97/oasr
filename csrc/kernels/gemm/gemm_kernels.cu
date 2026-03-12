@@ -9,7 +9,7 @@
 
 #include "common/cuda_utils.h"
 #include "cutlass/epilogue/thread/linear_combination_gelu.h"
-#include "cutlass/epilogue/thread/linear_combination_hardswish.h"
+#include "cutlass/epilogue/thread/linear_combination_silu.h"
 #include "cutlass/epilogue/thread/scale_type.h"
 #include "gemm_kernels.h"
 #include "gemm_utils.h"
@@ -235,7 +235,7 @@ struct CutlassGemmSwishSM80 {
 
     using SwizzleThreadblock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
 
-    using EpilogueOp = cutlass::epilogue::thread::LinearCombinationHardSwish<
+    using EpilogueOp = cutlass::epilogue::thread::LinearCombinationSilu<
         ElementCD, 128 / cutlass::sizeof_bits<ElementCD>::value, ElementComputeEpilogue,
         ElementComputeEpilogue, cutlass::epilogue::thread::ScaleType::Default>;
 
@@ -287,7 +287,10 @@ torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const t
     const int M = A.numel() / K;
     const int N = B.numel() / K;
 
-    auto D = torch::empty({M, N}, A.options());
+    auto out_sizes = A.sizes().vec();
+    out_sizes.back() = N;
+
+    auto D = torch::empty(out_sizes, A.options());
 
     const void* A_ptr = A.data_ptr();
     const void* B_ptr = B.data_ptr();
@@ -353,7 +356,9 @@ torch::Tensor invokeGemmActivation(const torch::Tensor& A, const torch::Tensor& 
     const int M = A.numel() / K;
     const int N = B.numel() / K;
 
-    auto D = torch::empty({M, N}, A.options());
+    auto out_sizes = A.sizes().vec();
+    out_sizes.back() = N;
+    auto D = torch::empty(out_sizes, A.options());
 
     const void* A_ptr = A.data_ptr();
     const void* B_ptr = B.data_ptr();
