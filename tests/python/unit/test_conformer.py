@@ -22,7 +22,7 @@ from oasr.models.conformer import (  # noqa: E402
 )
 
 
-def make_wenet_encoder_config(
+def make_encoder_config(
     output_size: int = 64,
     num_blocks: int = 1,
     attention_heads: int = 2,
@@ -31,7 +31,7 @@ def make_wenet_encoder_config(
     cnn_module_kernel: int = 15,
     use_sdpa: bool = True,
 ):
-    """Build WeNet ConformerEncoder kwargs matching OASR ConformerEncoderConfig."""
+    """Build ConformerEncoder kwargs matching OASR ConformerEncoderConfig."""
     return dict(
         input_size=80,
         output_size=output_size,
@@ -61,13 +61,14 @@ def test_conformer_encoder_matches_wenet_sdpa(
     """Conformer encoder output matches the WeNet SDPA implementation."""
     torch.manual_seed(2)
 
-    wenet_encoder_config = make_wenet_encoder_config(
+    wenet_encoder_config = make_encoder_config(
         output_size=output_size,
         num_blocks=num_blocks,
         attention_heads=2,
         linear_units=128,
         use_cnn_module=True,
         cnn_module_kernel=15,
+        use_sdpa=True,
     )
 
     ref_encoder = wenet_encoder.ConformerEncoder(
