@@ -14,7 +14,7 @@ from oasr.layers.linear import Linear, LinearActivation
 from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d
 from oasr.layers.norm import LayerNorm, RMSNorm
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention, T_CACHE
-from oasr.utils.backend import get_activation, get_norm
+from oasr.utils import get_activation, get_norm
 from .config import ConformerEncoderConfig, ConformerModelConfig
 
 
