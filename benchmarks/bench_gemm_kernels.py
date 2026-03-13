@@ -9,25 +9,12 @@ Profiling mode for NVIDIA Nsight Compute:
     --warmup 0 --iters 1
 """
 
-import sys
-sys.path.insert(0, 'python')
-
 import argparse
 import torch
 import torch.nn.functional as F
 
 import oasr
 
-try:
-    gemm_mod = oasr.kernels.gemm
-    DataType = oasr.DataType
-except AttributeError:
-    from oasr._C import kernels
-    gemm_mod = kernels.gemm
-    DataType = oasr.DataType if hasattr(oasr, 'DataType') else getattr(kernels, 'DataType', None)
-if DataType is None:
-    import oasr._C
-    DataType = oasr._C.DataType
 
 
 # =============================================================================
@@ -58,7 +45,7 @@ def setup_gemm(M, N, K, dtype=torch.float16):
     B = torch.randn(N, K, device='cuda', dtype=dtype)
 
     def oasr_fn():
-        return gemm_mod.invoke_gemm(
+        return oasr.kernels.gemm.gemm(
             A, B, stream=None,
         )
 
@@ -75,7 +62,7 @@ def setup_bmm(batch_size, M, N, K, dtype=torch.float16):
     B_transposed = B.transpose(1, 2).contiguous()
 
     def oasr_fn():
-        return gemm_mod.invoke_bmm(A, B_transposed, stream=None)
+        return oasr.kernels.gemm.bmm(A, B_transposed, stream=None)
 
     def pytorch_fn():
         return torch.bmm(A, B_transposed)
@@ -108,7 +95,7 @@ def setup_group_gemm(problem_sizes, dtype=torch.bfloat16):
     offset = torch.cumsum(torch.tensor(Ms, dtype=torch.int32, device='cuda'), dim=0, dtype=torch.int32)
 
     def oasr_fn():
-        return gemm_mod.invoke_group_gemm(A, B, offset, stream=None)
+        return oasr.kernels.gemm.group_gemm(A, B, offset, stream=None)
 
     def pytorch_fn():
         return F.grouped_mm(A, B_transposed, offs=offset)

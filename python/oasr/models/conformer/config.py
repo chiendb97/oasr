@@ -23,12 +23,9 @@ class ConformerEncoderConfig:
 
     # Attention
     attention_heads: int = 4
-    attention_dropout_rate: float = 0.0
 
     # Feed-forward
     linear_units: int = 2048
-    dropout_rate: float = 0.1
-    positional_dropout_rate: float = 0.1
 
     # Conformer-specific
     positionwise_conv_kernel_size: int = 1
@@ -64,7 +61,8 @@ class ConformerEncoderConfig:
 class ConformerModelConfig:
     """Top-level Conformer model config (encoder-only or encoder + head)."""
 
-    encoder: ConformerEncoderConfig = field(default_factory=ConformerEncoderConfig)
+    encoder: ConformerEncoderConfig = field(
+        default_factory=ConformerEncoderConfig)
     # For ASR: vocab_size if adding a CTC/decoder head later
     vocab_size: Optional[int] = None
 
@@ -72,5 +70,6 @@ class ConformerModelConfig:
     def from_dict(cls, d: dict) -> ConformerModelConfig:
         """Build from a dict (e.g. HuggingFace config)."""
         encoder_dict = d.get("encoder", d)
-        encoder = ConformerEncoderConfig(**{k: v for k, v in encoder_dict.items() if hasattr(ConformerEncoderConfig, k)})
+        encoder = ConformerEncoderConfig(
+            **{k: v for k, v in encoder_dict.items() if hasattr(ConformerEncoderConfig, k)})
         return cls(encoder=encoder, vocab_size=d.get("vocab_size"))

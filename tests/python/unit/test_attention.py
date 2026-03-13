@@ -14,19 +14,17 @@ import torch
 
 from wenet.models.transformer import attention as wenet_attn  # type: ignore  # noqa: E402
 from wenet.utils import rope_utils as wenet_rope_utils  # type: ignore  # noqa: E402
+from wenet.utils.common import mask_to_bias  # type: ignore  # noqa: E402
 
 from oasr.layers.attention import attention as oasr_attn  # noqa: E402
 
 
-def _randn(*shape: int, device: torch.device | None = None) -> torch.Tensor:
-    return torch.randn(*shape, device=device, dtype=torch.float32)
-
-
 @pytest.mark.parametrize("n_head,n_feat,time1,time2", [(4, 16, 5, 7), (2, 8, 3, 3)])
-@pytest.mark.parametrize("use_sdpa", [False])
-def test_multi_headed_attention_matches_wenet(n_head, n_feat, time1, time2, use_sdpa):
+def test_multi_headed_attention_matches_wenet(n_head, n_feat, time1, time2):
     """MultiHeadedAttention outputs should match WeNet implementation."""
     torch.manual_seed(0)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dropout = 0.0  # keep deterministic
 
@@ -34,14 +32,13 @@ def test_multi_headed_attention_matches_wenet(n_head, n_feat, time1, time2, use_
         n_head=n_head,
         n_feat=n_feat,
         dropout_rate=dropout,
-        use_sdpa=use_sdpa,
+        use_sdpa=True,
     )
     impl = oasr_attn.MultiHeadedAttention(
         n_head=n_head,
         n_feat=n_feat,
-        dropout_rate=dropout,
-        use_sdpa=use_sdpa,
-    )
+    ).to(device)
+    ref.to(device)
     # Ensure identical weights
     impl.load_state_dict(ref.state_dict())
 
@@ -49,25 +46,29 @@ def test_multi_headed_attention_matches_wenet(n_head, n_feat, time1, time2, use_
     impl.eval()
 
     batch = 2
-    query = _randn(batch, time1, n_feat)
-    key = _randn(batch, time2, n_feat)
-    value = _randn(batch, time2, n_feat)
+    query = torch.randn(batch, time1, n_feat, dtype=torch.float32, device=device)
+    key = torch.randn(batch, time2, n_feat, dtype=torch.float32, device=device)
+    value = torch.randn(batch, time2, n_feat, dtype=torch.float32, device=device)
 
-    # Padding mask: shape (batch, 1, time2), 1 = keep, 0 = mask
-    mask = torch.ones(batch, 1, time2, dtype=torch.bool)
+    # Padding mask (bool): shape (batch, 1, time2), 1 = keep, 0 = mask
+    mask_bool = torch.ones(batch, 1, time2, dtype=torch.bool, device=device)
     # Set some positions to 0 to test masking
     if time2 > 1:
-        mask[:, :, -1] = 0
+        mask_bool[:, :, -1] = 0
+    # For SDPA, WeNet expects an additive bias mask instead of bool.
+    mask = mask_to_bias(mask_bool, query.dtype)
 
     # Default cache (no past)
     cache = (
-        torch.zeros(0, 0, 0, 0),
-        torch.zeros(0, 0, 0, 0),
+        torch.zeros(0, 0, 0, 0, device=device),
+        torch.zeros(0, 0, 0, 0, device=device),
     )
 
     with torch.no_grad():
-        out_ref, cache_ref = ref(query, key, value, mask, torch.empty(0), cache)
-        out_impl, cache_impl = impl(query, key, value, mask, torch.empty(0), cache)
+        out_ref, cache_ref = ref(
+            query, key, value, mask, torch.empty(0), cache)
+        out_impl, cache_impl = impl(
+            query, key, value, mask, torch.empty(0), cache)
 
     assert out_ref.shape == out_impl.shape
     torch.testing.assert_close(out_impl, out_ref, rtol=1e-5, atol=1e-6)
@@ -80,12 +81,13 @@ def test_multi_headed_attention_matches_wenet(n_head, n_feat, time1, time2, use_
 
 
 @pytest.mark.parametrize("n_head,n_feat,time", [(4, 16, 6)])
-@pytest.mark.parametrize("use_sdpa", [False])
 def test_rel_position_multi_headed_attention_matches_wenet(
-    n_head, n_feat, time, use_sdpa
+    n_head, n_feat, time
 ):
     """RelPositionMultiHeadedAttention should match WeNet implementation."""
     torch.manual_seed(1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dropout = 0.0
 
@@ -93,33 +95,33 @@ def test_rel_position_multi_headed_attention_matches_wenet(
         n_head=n_head,
         n_feat=n_feat,
         dropout_rate=dropout,
-        use_sdpa=use_sdpa,
-    )
+        use_sdpa=True,
+    ).to(device)
     impl = oasr_attn.RelPositionMultiHeadedAttention(
         n_head=n_head,
-        n_feat=n_feat,
-        dropout_rate=dropout,
-        use_sdpa=use_sdpa,
-    )
+        n_feat=n_feat
+    ).to(device)
     impl.load_state_dict(ref.state_dict())
 
     ref.eval()
     impl.eval()
 
     batch = 2
-    query = _randn(batch, time, n_feat)
-    key = _randn(batch, time, n_feat)
-    value = _randn(batch, time, n_feat)
+    query = torch.randn(batch, time, n_feat, dtype=torch.float32, device=device)
+    key = torch.randn(batch, time, n_feat, dtype=torch.float32, device=device)
+    value = torch.randn(batch, time, n_feat, dtype=torch.float32, device=device)
 
     # Positional embedding (WeNet expects [batch, time, size])
-    pos_emb = _randn(batch, time, n_feat)
+    pos_emb = torch.randn(batch, time, n_feat, dtype=torch.float32, device=device)
 
-    # Full attention mask (no padding masked)
-    mask = torch.ones(batch, time, time, dtype=torch.bool)
+    # Full attention mask (no padding masked) as bool
+    mask_bool = torch.ones(batch, time, time, dtype=torch.bool, device=device)
+    # Convert to additive bias for SDPA
+    mask = mask_to_bias(mask_bool, query.dtype)
 
     cache = (
-        torch.zeros(0, 0, 0, 0),
-        torch.zeros(0, 0, 0, 0),
+        torch.zeros(0, 0, 0, 0, device=device),
+        torch.zeros(0, 0, 0, 0, device=device),
     )
 
     with torch.no_grad():
@@ -136,12 +138,13 @@ def test_rel_position_multi_headed_attention_matches_wenet(
 
 
 @pytest.mark.parametrize("n_head,n_feat,time_q,time_kv", [(4, 16, 3, 5)])
-@pytest.mark.parametrize("use_sdpa", [False])
 def test_multi_headed_cross_attention_matches_wenet(
-    n_head, n_feat, time_q, time_kv, use_sdpa
+    n_head, n_feat, time_q, time_kv
 ):
     """MultiHeadedCrossAttention should match WeNet implementation."""
     torch.manual_seed(2)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dropout = 0.0
 
@@ -149,37 +152,39 @@ def test_multi_headed_cross_attention_matches_wenet(
         n_head=n_head,
         n_feat=n_feat,
         dropout_rate=dropout,
-        use_sdpa=use_sdpa,
-    )
+        use_sdpa=True,
+    ).to(device)
     impl = oasr_attn.MultiHeadedCrossAttention(
         n_head=n_head,
-        n_feat=n_feat,
-        dropout_rate=dropout,
-        use_sdpa=use_sdpa,
-    )
+        n_feat=n_feat
+    ).to(device)
     impl.load_state_dict(ref.state_dict())
 
     ref.eval()
     impl.eval()
 
     batch = 2
-    query = _randn(batch, time_q, n_feat)
-    key = _randn(batch, time_kv, n_feat)
-    value = _randn(batch, time_kv, n_feat)
+    query = torch.randn(batch, time_q, n_feat, dtype=torch.float32, device=device)
+    key = torch.randn(batch, time_kv, n_feat, dtype=torch.float32, device=device)
+    value = torch.randn(batch, time_kv, n_feat, dtype=torch.float32, device=device)
 
-    # Mask shape (batch, time_q, time_kv)
-    mask = torch.ones(batch, time_q, time_kv, dtype=torch.bool)
+    # Mask shape (batch, time_q, time_kv) as bool
+    mask_bool = torch.ones(batch, time_q, time_kv, dtype=torch.bool, device=device)
     if time_kv > 1:
-        mask[:, :, -1] = 0
+        mask_bool[:, :, -1] = 0
+    # Convert to additive bias for SDPA
+    mask = mask_to_bias(mask_bool, query.dtype)
 
     cache = (
-        torch.zeros(0, 0, 0, 0),
-        torch.zeros(0, 0, 0, 0),
+        torch.zeros(0, 0, 0, 0, device=device),
+        torch.zeros(0, 0, 0, 0, device=device),
     )
 
     with torch.no_grad():
-        out_ref, cache_ref = ref(query, key, value, mask, torch.empty(0), cache)
-        out_impl, cache_impl = impl(query, key, value, mask, torch.empty(0), cache)
+        out_ref, cache_ref = ref(
+            query, key, value, mask, torch.empty(0), cache)
+        out_impl, cache_impl = impl(
+            query, key, value, mask, torch.empty(0), cache)
 
     assert out_ref.shape == out_impl.shape
     torch.testing.assert_close(out_impl, out_ref, rtol=1e-5, atol=1e-6)
@@ -192,9 +197,8 @@ def test_multi_headed_cross_attention_matches_wenet(
 
 @pytest.mark.parametrize("n_head,n_feat,time", [(4, 16, 5)])
 @pytest.mark.parametrize("style", ["google", "llama"])
-@pytest.mark.parametrize("use_sdpa", [False])
 def test_rope_multi_headed_attention_matches_wenet(
-    n_head, n_feat, time, style, use_sdpa
+    n_head, n_feat, time, style
 ):
     """RopeMultiHeadedAttention should match WeNet implementation."""
     torch.manual_seed(3)
@@ -205,14 +209,12 @@ def test_rope_multi_headed_attention_matches_wenet(
         n_head=n_head,
         n_feat=n_feat,
         dropout_rate=dropout,
-        use_sdpa=use_sdpa,
+        use_sdpa=True,
         style=style,
     )
     impl = oasr_attn.RopeMultiHeadedAttention(
         n_head=n_head,
         n_feat=n_feat,
-        dropout_rate=dropout,
-        use_sdpa=use_sdpa,
         style=style,
     )
     impl.load_state_dict(ref.state_dict())
@@ -221,9 +223,9 @@ def test_rope_multi_headed_attention_matches_wenet(
     impl.eval()
 
     batch = 2
-    query = _randn(batch, time, n_feat)
-    key = _randn(batch, time, n_feat)
-    value = _randn(batch, time, n_feat)
+    query = torch.randn(batch, time, n_feat)
+    key = torch.randn(batch, time, n_feat)
+    value = torch.randn(batch, time, n_feat)
 
     # Use WeNet's RoPE utility as the ground truth for pos_emb.
     # We need to reshape the frequencies so they broadcast correctly with
@@ -234,8 +236,10 @@ def test_rope_multi_headed_attention_matches_wenet(
     # so that it broadcasts over batch and head dimensions.
     freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2)
 
-    # Mask (no positions masked)
-    mask = torch.ones(batch, 1, time, dtype=torch.bool)
+    # Mask (no positions masked) as bool
+    mask_bool = torch.ones(batch, 1, time, dtype=torch.bool)
+    # Convert to additive bias for SDPA
+    mask = mask_to_bias(mask_bool, query.dtype)
 
     cache = (
         torch.zeros(0, 0, 0, 0),
@@ -253,5 +257,3 @@ def test_rope_multi_headed_attention_matches_wenet(
     for c_ref, c_impl in zip(cache_ref, cache_impl):
         assert c_ref.shape == c_impl.shape
         torch.testing.assert_close(c_impl, c_ref, rtol=1e-5, atol=1e-6)
-
-

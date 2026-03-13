@@ -9,9 +9,6 @@ Profiling mode for NVIDIA Nsight Compute:
     --warmup 0 --iters 1
 """
 
-import sys
-sys.path.insert(0, 'python')
-
 import argparse
 import torch
 
@@ -46,12 +43,10 @@ def setup_layer_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
     beta = torch.randn(hidden_size, device='cuda', dtype=dtype)
     
-    dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
         return oasr.kernels.norm.layer_norm(
-            x, gamma, beta,
-            eps, dtype_map[dtype]
+            x, gamma, beta, eps
         )
     
     layer_norm = torch.nn.LayerNorm(hidden_size, eps=eps, device='cuda', dtype=dtype)
@@ -70,12 +65,10 @@ def setup_rms_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
     gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
     
-    dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
         return oasr.kernels.norm.rms_norm(
-            x, gamma, None,
-            eps, dtype_map[dtype]
+            x, gamma, None, eps
         )
     
     def pytorch_fn():
@@ -93,13 +86,10 @@ def setup_add_layer_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
     beta = torch.randn(hidden_size, device='cuda', dtype=dtype)
     
-    dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
         return oasr.kernels.norm.add_layer_norm(
-            x, residual,
-            gamma, beta,
-            eps, dtype_map[dtype]
+            x, residual, gamma, beta, eps
         )
     
     layer_norm = torch.nn.LayerNorm(hidden_size, eps=eps, device='cuda', dtype=dtype)
@@ -119,14 +109,11 @@ def setup_group_norm(batch_size, seq_len, channels, num_groups, dtype=torch.floa
     gamma = torch.randn(channels, device='cuda', dtype=dtype)
     beta = torch.randn(channels, device='cuda', dtype=dtype)
     
-    dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     channels_per_group = channels // num_groups
     
     def oasr_fn():
         return oasr.kernels.norm.group_norm(
-            x, gamma, beta,
-            num_groups,
-            eps, dtype_map[dtype]
+            x, gamma, beta, num_groups, eps
         )
     
     def pytorch_fn():
@@ -149,13 +136,10 @@ def setup_batch_norm(batch_size, seq_len, channels, dtype=torch.float32):
     running_mean = torch.randn(channels, device='cuda', dtype=dtype)
     running_var = torch.abs(torch.randn(channels, device='cuda', dtype=dtype)) + 0.1
     
-    dtype_map = {torch.float32: oasr.DataType.FP32, torch.float16: oasr.DataType.FP16}
     
     def oasr_fn():
         return oasr.kernels.norm.batch_norm_1d(
-            x, gamma, beta,
-            running_mean, running_var,
-            eps, dtype_map[dtype]
+            x, gamma, beta, running_mean, running_var, eps
         )
     
     def pytorch_fn():

@@ -869,12 +869,6 @@ __global__ void addLayerNormKernelVectorized(
 // Dispatcher functions
 // =============================================================================
 
-// Helper to check if we can use vectorized kernels
-template <typename T>
-__host__ constexpr int getVecSize() {
-    return VecTypeTrait<T>::VecSize;
-}
-
 template <typename T>
 void invokeLayerNormTyped(const torch::Tensor& input, torch::Tensor& output,
                           const torch::Tensor& weight, const torch::Tensor& bias,

@@ -7,20 +7,11 @@ High-performance ASR inference with CUDA kernels (conv, gemm, norm, attention).
 
 __version__ = "0.1.0"
 
-# C extension: kernels and enums
-from oasr import _C  # type: ignore[attr-defined]
-
-kernels = _C.kernels
-DataType = _C.DataType
-ConvType = _C.ConvType
-ActivationType = _C.ActivationType
-NormType = _C.NormType
-synchronize = _C.synchronize
+import importlib as _importlib
 
 # Layers package (primary home of Python kernel wrappers)
 from . import layers
 from .layers import (
-    Conv1d,
     DepthwiseConv1d,
     PointwiseConv1d,
     Linear,
@@ -31,8 +22,31 @@ from .layers import (
     AddLayerNorm,
 )
 
+
+def __getattr__(name: str):
+    """Lazily expose C extension symbols (kernels, enums, synchronize, …).
+
+    On first access the compiled ``oasr._C`` module is imported and the
+    requested attribute is cached in the package globals so that subsequent
+    look-ups are instant and skip this function entirely.
+    """
+    _C = _importlib.import_module("oasr._C")
+    globals()["_C"] = _C
+    if name == "_C":
+        return _C
+    try:
+        attr = getattr(_C, name)
+    except AttributeError:
+        raise AttributeError(
+            f"module 'oasr' has no attribute {name!r}"
+        ) from None
+    globals()[name] = attr
+    return attr
+
+
 __all__ = [
     "__version__",
+    # C extension (loaded lazily via __getattr__)
     "kernels",
     "DataType",
     "ConvType",
@@ -41,7 +55,6 @@ __all__ = [
     "synchronize",
     "layers",
     # Conv
-    "Conv1d",
     "DepthwiseConv1d",
     "PointwiseConv1d",
     # Linear

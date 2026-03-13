@@ -39,6 +39,8 @@ T_CACHE = Tuple[torch.Tensor, torch.Tensor]
 class MultiHeadedAttention(nn.Module):
     """Multi-Head Attention layer.
 
+    Always uses PyTorch SDPA kernels.
+
     If ``n_kv_head`` is not ``None`` and ``n_kv_head != n_head``, this
     implements Multi-Query or Grouped-Query attention:
 
@@ -55,8 +57,6 @@ class MultiHeadedAttention(nn.Module):
         query_bias: Whether to include bias in the query projection.
         key_bias: Whether to include bias in the key projection.
         value_bias: Whether to include bias in the value projection.
-        use_sdpa: If True, use ``torch.nn.functional.scaled_dot_product_attention``
-            when available (PyTorch 2.0+).
         n_kv_head: Number of key/value heads (for MQA/GQA). If ``None``,
             defaults to ``n_head`` (standard multi-head).
         head_dim: Per-head dimension. If ``None``, inferred as
@@ -70,7 +70,6 @@ class MultiHeadedAttention(nn.Module):
         query_bias: bool = True,
         key_bias: bool = True,
         value_bias: bool = True,
-        use_sdpa: bool = False,
         n_kv_head: Optional[int] = None,
         head_dim: Optional[int] = None,
     ):
@@ -98,8 +97,6 @@ class MultiHeadedAttention(nn.Module):
         self.linear_k = nn.Linear(n_feat, self.inner_kv_dim, bias=key_bias)
         self.linear_v = nn.Linear(n_feat, self.inner_kv_dim, bias=value_bias)
         self.linear_out = nn.Linear(self.inner_dim, n_feat, bias=query_bias)
-
-        self.use_sdpa = use_sdpa
 
     def _forward_linearx(
         self,
@@ -304,11 +301,9 @@ class MultiHeadedAttention(nn.Module):
         q, k, v = self.forward_qkv(query, key, value)
         k, v, new_cache = self._update_kv_and_cache(k, v, cache)
 
-        if not self.use_sdpa:
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
-            return self.forward_attention(v, scores, mask), new_cache
-
-        # SDPA path
+        # SDPA-only path. The `mask` tensor is expected to be an additive
+        # bias (float/bfloat16/half), not a boolean padding mask.
+        assert mask.dtype != torch.bool
         output = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
@@ -337,7 +332,6 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         query_bias: bool = True,
         key_bias: bool = True,
         value_bias: bool = True,
-        use_sdpa: bool = False,
         n_kv_head: Optional[int] = None,
         head_dim: Optional[int] = None,
     ):
@@ -348,9 +342,8 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
             query_bias,
             key_bias,
             value_bias,
-            use_sdpa,
-            n_kv_head,
-            head_dim,
+            n_kv_head=n_kv_head,
+            head_dim=head_dim,
         )
 
         # Linear transformation for positional encoding
@@ -387,7 +380,8 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         x = x_padded[:, :, 1:].view_as(x)
 
         if zero_triu:
-            ones = torch.ones((x.size(2), x.size(3)), device=x.device, dtype=x.dtype)
+            ones = torch.ones((x.size(2), x.size(3)),
+                              device=x.device, dtype=x.dtype)
             x = x * torch.tril(ones, x.size(3) - x.size(2))[None, None, :, :]
 
         return x
@@ -397,7 +391,7 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+        mask: torch.Tensor,
         pos_emb: torch.Tensor = torch.empty(0),
         cache: T_CACHE = (
             torch.zeros((0, 0, 0, 0)),
@@ -424,14 +418,9 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         # (batch, head, time1, time2)
         matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
 
-        if not self.use_sdpa:
-            # Compute matrix a and c as in the paper
-            # (batch, head, time1, time2)
-            matrix_ac = torch.matmul(q_with_bias_u, k.transpose(-2, -1))
-            scores = (matrix_ac + matrix_bd) / math.sqrt(self.d_k)
-            return self.forward_attention(v, scores, mask), new_cache
-
-        # SDPA path: matrix_bd becomes part of the mask bias
+        # SDPA-only path: matrix_bd becomes part of the mask bias. The
+        # incoming `mask` must already be an additive bias tensor
+        # (float/bfloat16/half), not a boolean padding mask.
         assert mask.dtype != torch.bool
         mask = mask.unsqueeze(1)
         mask = (matrix_bd + mask) / math.sqrt(self.d_k)
@@ -460,7 +449,6 @@ class MultiHeadedCrossAttention(MultiHeadedAttention):
         query_bias: bool = True,
         key_bias: bool = True,
         value_bias: bool = True,
-        use_sdpa: bool = False,
         n_kv_head: Optional[int] = None,
         head_dim: Optional[int] = None,
     ):
@@ -470,9 +458,8 @@ class MultiHeadedCrossAttention(MultiHeadedAttention):
             query_bias,
             key_bias,
             value_bias,
-            use_sdpa,
-            n_kv_head,
-            head_dim,
+            n_kv_head=n_kv_head,
+            head_dim=head_dim,
         )
 
     def forward(
@@ -480,7 +467,7 @@ class MultiHeadedCrossAttention(MultiHeadedAttention):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+        mask: torch.Tensor,
         pos_emb: torch.Tensor = torch.empty(0),
         cache: T_CACHE = (
             torch.zeros((0, 0, 0, 0)),
@@ -529,21 +516,20 @@ class MultiHeadedCrossAttention(MultiHeadedAttention):
             v = v.unsqueeze(1)
             mask = mask.unsqueeze(1)
 
-        if not self.use_sdpa:
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
-            output = self.forward_attention(v, scores, mask)
-        else:
-            output = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=mask.unsqueeze(1),
-                scale=1 / math.sqrt(self.d_k),
-            )
-            output = output.transpose(-2, -3).contiguous()
-            output_shape = output.size()[:-2] + torch.Size([self.h * self.d_k])
-            output = output.view(output_shape)  # (batch, ..., time1, d_model)
-            output = self.linear_out(output)
+        # SDPA-only path. The `mask` tensor is expected to be an additive
+        # bias (float/bfloat16/half), not a boolean padding mask.
+        assert mask.dtype != torch.bool
+        output = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask.unsqueeze(1),
+            scale=1 / math.sqrt(self.d_k),
+        )
+        output = output.transpose(-2, -3).contiguous()
+        output_shape = output.size()[:-2] + torch.Size([self.h * self.d_k])
+        output = output.view(output_shape)  # (batch, ..., time1, d_model)
+        output = self.linear_out(output)
 
         if query.size(0) != B:
             # Fold beams back into batch.
@@ -567,7 +553,6 @@ class ShawRelPositionMultiHeadedAttention(MultiHeadedAttention):
         query_bias: bool = True,
         key_bias: bool = True,
         value_bias: bool = True,
-        use_sdpa: bool = False,
         n_kv_head: Optional[int] = None,
         head_dim: Optional[int] = None,
     ):
@@ -579,7 +564,6 @@ class ShawRelPositionMultiHeadedAttention(MultiHeadedAttention):
             query_bias,
             key_bias,
             value_bias,
-            use_sdpa,
             None,
             None,
         )
@@ -614,7 +598,7 @@ class ShawRelPositionMultiHeadedAttention(MultiHeadedAttention):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+        mask: torch.Tensor,
         pos_emb: torch.Tensor = torch.empty(0),
         cache: T_CACHE = (
             torch.zeros((0, 0, 0, 0)),
@@ -630,17 +614,13 @@ class ShawRelPositionMultiHeadedAttention(MultiHeadedAttention):
 
         # rel_k: (t2, t2, d_k)
         rel_k = self.rel_k_embed(self._relative_indices(k))
-        rel_k = rel_k[-q.size(2) :]
+        rel_k = rel_k[-q.size(2):]
         # rel_att_weights: (batch, head, time1, time2)
         rel_att_weights = torch.einsum("bhld,lrd->bhlr", q, rel_k)
 
-        if not self.use_sdpa:
-            scores = (torch.matmul(q, k.transpose(-2, -1)) + rel_att_weights) / math.sqrt(
-                self.d_k
-            )
-            return self.forward_attention(v, scores, mask), new_cache
-
-        # SDPA path: rel_att_weights is used as bias in the mask.
+        # SDPA-only path: rel_att_weights is used as bias in the mask. The
+        # incoming `mask` must already be an additive bias tensor
+        # (float/bfloat16/half), not a boolean padding mask.
         assert mask.dtype != torch.bool
         mask = mask.unsqueeze(1)
         mask = (rel_att_weights + mask) / math.sqrt(self.d_k)
@@ -669,7 +649,6 @@ class RopeMultiHeadedAttention(MultiHeadedAttention):
         query_bias: bool = True,
         key_bias: bool = True,
         value_bias: bool = True,
-        use_sdpa: bool = False,
         n_kv_head: Optional[int] = None,
         head_dim: Optional[int] = None,
         style: str = "google",
@@ -680,9 +659,8 @@ class RopeMultiHeadedAttention(MultiHeadedAttention):
             query_bias,
             key_bias,
             value_bias,
-            use_sdpa,
-            n_kv_head,
-            head_dim,
+            n_kv_head=n_kv_head,
+            head_dim=head_dim,
         )
         self.style = style
         self._apply_rotary_emb = get_apply_rotary_emb(style)
@@ -692,7 +670,7 @@ class RopeMultiHeadedAttention(MultiHeadedAttention):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+        mask: torch.Tensor,
         pos_emb: torch.Tensor = torch.empty(0),
         cache: T_CACHE = (
             torch.zeros((0, 0, 0, 0)),
@@ -733,10 +711,9 @@ class RopeMultiHeadedAttention(MultiHeadedAttention):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        if not self.use_sdpa:
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
-            return self.forward_attention(v, scores, mask), new_cache
-
+        # SDPA-only path. The `mask` tensor is expected to be an additive
+        # bias (float/bfloat16/half), not a boolean padding mask.
+        assert mask.dtype != torch.bool
         output = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
@@ -759,4 +736,3 @@ __all__ = [
     "ShawRelPositionMultiHeadedAttention",
     "RopeMultiHeadedAttention",
 ]
-

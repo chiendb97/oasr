@@ -1,13 +1,23 @@
-"""
-OASR Utilities Module
+"""OASR Utilities Module
 
-Helper functions for profiling, C extension backend, and dtype mapping.
+Profiling helpers and mappings between Python/PyTorch types and
+OASR C extension enums.
 """
 
-from .backend import _torch_dtype_to_oasr
+from .mappings import (
+    get_activation,
+    get_activation_type,
+    get_dtype,
+    get_norm,
+    get_norm_type,
+)
 from .timer import Timer
 
 __all__ = [
     "Timer",
-    "_torch_dtype_to_oasr",
+    "get_activation",
+    "get_activation_type",
+    "get_dtype",
+    "get_norm",
+    "get_norm_type",
 ]
