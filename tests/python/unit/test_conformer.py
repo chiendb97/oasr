@@ -19,6 +19,7 @@ from wenet.utils.common import mask_to_bias  # type: ignore
 from oasr.models.conformer import (  # noqa: E402
     ConformerEncoder,
     ConformerEncoderConfig,
+    ConformerModelConfig,
 )
 
 
@@ -53,7 +54,7 @@ def make_encoder_config(
     )
 
 
-@pytest.mark.parametrize("output_size,num_blocks", [(64, 1), (128, 1), (64, 2), (128, 2)])
+@pytest.mark.parametrize("output_size,num_blocks", [(64, 1), (128, 1), (64, 4), (128, 4)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_conformer_encoder_matches_wenet_sdpa(
     output_size: int, num_blocks: int, dtype: torch.dtype
@@ -75,17 +76,16 @@ def test_conformer_encoder_matches_wenet_sdpa(
         **wenet_encoder_config
     )
 
-    impl_encoder = ConformerEncoder(
-        ConformerEncoderConfig(
-            input_size=wenet_encoder_config["input_size"],
-            output_size=wenet_encoder_config["output_size"],
-            num_blocks=wenet_encoder_config["num_blocks"],
-            attention_heads=wenet_encoder_config["attention_heads"],
-            linear_units=wenet_encoder_config["linear_units"],
-            use_cnn_module=wenet_encoder_config["use_cnn_module"],
-            cnn_module_kernel=wenet_encoder_config["cnn_module_kernel"],
-        )
-    )
+    impl_encoder = ConformerEncoder(ConformerEncoderConfig(
+        input_size=wenet_encoder_config["input_size"],
+        output_size=wenet_encoder_config["output_size"],
+        num_blocks=wenet_encoder_config["num_blocks"],
+        attention_heads=wenet_encoder_config["attention_heads"],
+        linear_units=wenet_encoder_config["linear_units"],
+        use_cnn_module=wenet_encoder_config["use_cnn_module"],
+        cnn_module_kernel=wenet_encoder_config["cnn_module_kernel"],
+    ))
+
     ref_sd = ref_encoder.state_dict()
     load_sd = {k: ref_sd[k] for k in impl_encoder.state_dict() if k in ref_sd}
     impl_encoder.load_state_dict(load_sd, strict=False)

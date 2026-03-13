@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 import oasr
-from oasr.utils import str_activation_to_oasr_activation
+from oasr.utils import get_activation_type
 
 
 class DepthwiseConv1d(nn.Module):
@@ -106,7 +106,7 @@ class PointwiseConv1d(nn.Module):
         self.out_channels = out_channels
         self.activation = (
             None if activation_type is None
-            else str_activation_to_oasr_activation(activation_type)
+            else get_activation_type(activation_type)
         )
 
         self.weight = nn.Parameter(torch.empty(
