@@ -3,12 +3,23 @@
 Pytest configuration and shared fixtures for OASR tests.
 """
 
+import os
 import sys
 import pytest
 import torch
 
 # Add python module to path
 sys.path.insert(0, 'python')
+
+
+def pytest_addoption(parser):
+    """Register custom command-line options."""
+    parser.addoption(
+        "--ckpt-dir",
+        action="store",
+        default=os.environ.get("WENET_CKPT_DIR", ""),
+        help="Path to WeNet checkpoint dir for load_wenet_checkpoint tests",
+    )
 
 
 def pytest_configure(config):
@@ -19,6 +30,12 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: mark test as slow-running"
     )
+
+
+@pytest.fixture(scope="session")
+def ckpt_dir(request):
+    """Path to WeNet checkpoint dir (from --ckpt-dir or CKPT_DIR env)."""
+    return request.config.getoption("--ckpt-dir", default="")
 
 
 @pytest.fixture(scope="session")

@@ -39,6 +39,22 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
     return row.unsqueeze(0) < lengths.unsqueeze(1)
 
 
+class GlobalCMVN(nn.Module):
+    """Global cepstral mean and variance normalization.
+
+    Stores pre-computed mean and inverse std-dev as buffers
+    and applies ``(x - mean) * istd`` to input features.
+    """
+
+    def __init__(self, mean: torch.Tensor, istd: torch.Tensor):
+        super().__init__()
+        self.register_buffer("mean", mean)
+        self.register_buffer("istd", istd)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) * self.istd
+
+
 # -----------------------------------------------------------------------------
 # Position-wise feed-forward
 # -----------------------------------------------------------------------------
@@ -209,6 +225,7 @@ class Conv2dSubsampling(nn.Module):
         idim: int,
         odim: int,
         subsampling_rate: int = 4,
+        embed_layer_norm: bool = True,
     ):
         super().__init__()
         self.pos_enc = RelPositionalEncoding(
@@ -230,10 +247,10 @@ class Conv2dSubsampling(nn.Module):
             self.linear_dim = idim
         else:
             raise NotImplementedError(f"subsampling_rate={subsampling_rate}")
-        self.out = nn.Sequential(
-            Linear(self.linear_dim, odim),
-            LayerNorm(odim, eps=1e-5),
-        )
+        layers = [Linear(self.linear_dim, odim)]
+        if embed_layer_norm:
+            layers.append(LayerNorm(odim, eps=1e-5))
+        self.out = nn.Sequential(*layers)
         self.right_context = 6 if subsampling_rate == 4 else 0
 
     def forward(
@@ -402,13 +419,19 @@ class ConformerEncoderLayer(nn.Module):
 class ConformerEncoder(nn.Module):
     """Conformer encoder: subsampling + pos enc + N x ConformerEncoderLayer + final norm."""
 
-    def __init__(self, config: ConformerEncoderConfig):
+    def __init__(
+        self,
+        config: ConformerEncoderConfig,
+        global_cmvn: Optional[GlobalCMVN] = None,
+    ):
         super().__init__()
+        self.global_cmvn = global_cmvn
         if config.input_layer == "conv2d":
             self.embed = Conv2dSubsampling(
                 config.input_size,
                 config.output_size,
                 subsampling_rate=4,
+                embed_layer_norm=config.embed_layer_norm,
             )
         else:
             raise NotImplementedError(f"input_layer={config.input_layer}")
@@ -445,6 +468,8 @@ class ConformerEncoder(nn.Module):
         xs: torch.Tensor,
         xs_lens: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.global_cmvn is not None:
+            xs = self.global_cmvn(xs)
         T = xs.size(1)
         masks = make_pad_mask(xs_lens, T).unsqueeze(1)
         xs, pos_emb, masks = self.embed(xs, masks)
@@ -466,10 +491,11 @@ class ConformerModel(nn.Module):
     def __init__(
         self,
         config: Optional[ConformerModelConfig] = None,
+        global_cmvn: Optional[GlobalCMVN] = None,
     ):
         super().__init__()
         self.config = config
-        self.encoder = ConformerEncoder(config.encoder)
+        self.encoder = ConformerEncoder(config.encoder, global_cmvn=global_cmvn)
 
     def forward(
         self,
