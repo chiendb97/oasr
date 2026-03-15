@@ -3,11 +3,13 @@
 """Conformer model (encoder only)."""
 
 from .config import ConformerEncoderConfig, ConformerModelConfig
+from .convert import load_wenet_checkpoint
 from .model import (
     ConformerEncoder,
     ConformerEncoderLayer,
     ConformerModel,
     ConvolutionModule,
+    GlobalCMVN,
     PositionwiseFeedForward,
 )
 
@@ -18,5 +20,7 @@ __all__ = [
     "ConformerEncoderConfig",
     "ConformerModelConfig",
     "ConvolutionModule",
+    "GlobalCMVN",
     "PositionwiseFeedForward",
+    "load_wenet_checkpoint",
 ]

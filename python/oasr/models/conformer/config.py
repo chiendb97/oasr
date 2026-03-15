@@ -49,6 +49,8 @@ class ConformerEncoderConfig:
 
     # Input layer: "conv2d", "linear", "conv2d6", "conv2d8"
     input_layer: str = "conv2d"
+    # Whether to apply LayerNorm after the embed linear projection
+    embed_layer_norm: bool = True
     # Positional encoding: "rel_pos" for Conformer
     pos_enc_layer_type: str = "rel_pos"
 
