@@ -7,7 +7,7 @@
 
 #include <torch/extension.h>
 
-#include "common/types.h"
+#include "kernels/common/types.h"
 
 namespace oasr {
 namespace kernels {

@@ -7,12 +7,12 @@
 #include <cstdint>
 #include <torch/extension.h>
 
-#include "common/cuda_utils.h"
 #include "cutlass/epilogue/thread/linear_combination_gelu.h"
 #include "cutlass/epilogue/thread/linear_combination_silu.h"
 #include "cutlass/epilogue/thread/scale_type.h"
 #include "gemm_kernels.h"
 #include "gemm_utils.h"
+#include "kernels/common/cuda_utils.h"
 
 // Suppress warnings from CUTLASS headers
 #ifdef __GNUC__
@@ -76,12 +76,11 @@ struct CutlassGemmSM80 {
 
     static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
                           int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldc,
-                          ElementComputeEpilogue alpha,
-                          cudaStream_t stream) {
+                          ElementComputeEpilogue alpha, cudaStream_t stream) {
         int split_k_slices = 1;
         float beta = (C == nullptr) ? 0.0f : 1.0f;
-        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0},
-                                      {D, ldc}, {alpha, beta}, split_k_slices);
+        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0}, {D, ldc},
+                                      {alpha, beta}, split_k_slices);
 
         Gemm gemm_op;
         cutlass::Status status = gemm_op.can_implement(args);
@@ -133,12 +132,11 @@ struct CutlassGemmReluSM80 {
 
     static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
                           int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldc,
-                          ElementComputeEpilogue alpha,
-                          cudaStream_t stream) {
+                          ElementComputeEpilogue alpha, cudaStream_t stream) {
         int split_k_slices = 1;
         float beta = (C == nullptr) ? 0.0f : 1.0f;
-        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0},
-                                      {D, ldc}, {alpha, beta}, split_k_slices);
+        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0}, {D, ldc},
+                                      {alpha, beta}, split_k_slices);
 
         Gemm gemm_op;
         cutlass::Status status = gemm_op.can_implement(args);
@@ -190,12 +188,11 @@ struct CutlassGemmGeluSM80 {
 
     static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
                           int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldc,
-                          ElementComputeEpilogue alpha,
-                          cudaStream_t stream) {
+                          ElementComputeEpilogue alpha, cudaStream_t stream) {
         int split_k_slices = 1;
         float beta = (C == nullptr) ? 0.0f : 1.0f;
-        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0},
-                                      {D, ldc}, {alpha, beta}, split_k_slices);
+        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0}, {D, ldc},
+                                      {alpha, beta}, split_k_slices);
 
         Gemm gemm_op;
         cutlass::Status status = gemm_op.can_implement(args);
@@ -247,12 +244,11 @@ struct CutlassGemmSwishSM80 {
 
     static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
                           int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldc,
-                          ElementComputeEpilogue alpha,
-                          cudaStream_t stream) {
+                          ElementComputeEpilogue alpha, cudaStream_t stream) {
         int split_k_slices = 1;
         float beta = (C == nullptr) ? 0.0f : 1.0f;
-        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0},
-                                      {D, ldc}, {alpha, beta}, split_k_slices);
+        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0}, {D, ldc},
+                                      {alpha, beta}, split_k_slices);
 
         Gemm gemm_op;
         cutlass::Status status = gemm_op.can_implement(args);

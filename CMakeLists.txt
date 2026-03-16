@@ -144,7 +144,7 @@ endif()
 # =============================================================================
 set(OASR_SOURCES
     # Common (minimal for now)
-    csrc/common/cuda_utils.cpp
+    csrc/kernels/common/cuda_utils.cpp
     
     # Kernels
     csrc/kernels/norm/norm_kernels.cu
@@ -156,14 +156,14 @@ set(OASR_SOURCES
     csrc/kernels/gemm/group_gemm_kernels.cu
     
     # TODO: Add these when ready
-    # csrc/common/tensor.cpp
-    # csrc/common/allocator.cpp
+    # csrc/kernels/common/tensor.cpp
+    # csrc/kernels/common/allocator.cpp
     # csrc/kernels/attention/attention_kernels.cu
 )
 
 set(OASR_HEADERS
-    csrc/common/types.h
-    csrc/common/cuda_utils.h
+    csrc/kernels/common/types.h
+    csrc/kernels/common/cuda_utils.h
     csrc/kernels/norm/norm_kernels.h
     csrc/kernels/conv/conv_kernels.h
     
@@ -175,8 +175,8 @@ set(OASR_HEADERS
     csrc/kernels/gemm/group_gemm_kernels.h
     
     # TODO: Add these when ready
-    # csrc/common/tensor.h
-    # csrc/common/allocator.h
+    # csrc/kernels/common/tensor.h
+    # csrc/kernels/common/allocator.h
     # csrc/kernels/attention/attention_params.h
     # csrc/kernels/attention/attention_kernels.h
 )

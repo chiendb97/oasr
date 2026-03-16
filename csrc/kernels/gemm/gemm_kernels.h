@@ -7,16 +7,18 @@
 
 #pragma once
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <cstdint>
+#include <memory>
+#include <torch/extension.h>
+#include <vector>
+
 #include "gemm_configs.h"
 #include "gemm_utils.h"
-#include "common/types.h"
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <torch/extension.h>
-#include <cstdint>
-#include <vector>
-#include <memory>
+#include "kernels/common/types.h"
 
 namespace oasr {
 namespace kernels {
@@ -42,7 +44,7 @@ namespace gemm {
  * @return Output tensor [M, N]
  */
 torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& C,
-                      cudaStream_t stream = nullptr);
+                         cudaStream_t stream = nullptr);
 
 //==============================================================================
 // GEMM with Fused Operations
@@ -50,7 +52,7 @@ torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const t
 
 /**
  * @brief GEMM with fused activation
- * 
+ *
  * Computes: D = activation(A @ B + C)
  *
  * @param A Input tensor [M, K] or [batch, M', K]
@@ -60,10 +62,9 @@ torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const t
  * @param stream CUDA stream
  * @return Output tensor [M, N]
  */
-torch::Tensor invokeGemmActivation(
-    const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& C,
-    ActivationType activation,
-    cudaStream_t stream = nullptr);
+torch::Tensor invokeGemmActivation(const torch::Tensor& A, const torch::Tensor& B,
+                                   const torch::Tensor& C, ActivationType activation,
+                                   cudaStream_t stream = nullptr);
 
 //==============================================================================
 // Auto-Tuning
@@ -71,17 +72,16 @@ torch::Tensor invokeGemmActivation(
 
 /**
  * @brief Profile and select best GEMM configuration
- * 
+ *
  * @param M, N, K Problem dimensions
  * @param dtype Data type
  * @param num_warmup Number of warmup iterations
  * @param num_iter Number of timing iterations
  * @return Best configuration
  */
-GemmConfig autoTuneGemm(int M, int N, int K, DataType dtype,
-                        int num_warmup = 5, int num_iter = 10,
+GemmConfig autoTuneGemm(int M, int N, int K, DataType dtype, int num_warmup = 5, int num_iter = 10,
                         cudaStream_t stream = nullptr);
 
-} // namespace gemm
-} // namespace kernels
-} // namespace oasr
+}  // namespace gemm
+}  // namespace kernels
+}  // namespace oasr

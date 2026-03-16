@@ -8,8 +8,8 @@
 #include <cmath>
 #include <torch/extension.h>
 
-#include "common/cuda_utils.h"
-#include "common/vec_dtypes.h"
+#include "kernels/common/cuda_utils.h"
+#include "kernels/common/vec_dtypes.h"
 #include "kernels/conv/conv_kernels.h"
 #include "kernels/gemm/gemm_kernels.h"
 
