@@ -20,6 +20,12 @@ def pytest_addoption(parser):
         default=os.environ.get("WENET_CKPT_DIR", ""),
         help="Path to WeNet checkpoint dir for load_wenet_checkpoint tests",
     )
+    parser.addoption(
+        "--audio-path",
+        action="store",
+        default=os.environ.get("WENET_AUDIO_PATH", ""),
+        help="Path to a test audio file for decoder integration tests",
+    )
 
 
 def pytest_configure(config):
@@ -36,6 +42,12 @@ def pytest_configure(config):
 def ckpt_dir(request):
     """Path to WeNet checkpoint dir (from --ckpt-dir or CKPT_DIR env)."""
     return request.config.getoption("--ckpt-dir", default="")
+
+
+@pytest.fixture(scope="session")
+def audio_path(request):
+    """Path to a test audio file (from --audio-path or WENET_AUDIO_PATH env)."""
+    return request.config.getoption("--audio-path", default="")
 
 
 @pytest.fixture(scope="session")

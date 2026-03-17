@@ -7,6 +7,7 @@
 
 #include "kernels/common/types.h"
 #include "pybind_conv.h"
+#include "pybind_decoder.h"
 #include "pybind_gemm.h"
 #include "pybind_norm.h"
 
@@ -94,4 +95,9 @@ PYBIND11_MODULE(_C, m) {
     oasr::pybind::registerNormBindings(kernels);
     oasr::pybind::registerConvBindings(kernels);
     oasr::pybind::registerGemmBindings(kernels);
+
+    // =========================================================================
+    // Decoder bindings
+    // =========================================================================
+    oasr::pybind::registerDecoderBindings(m);
 }

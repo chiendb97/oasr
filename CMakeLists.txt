@@ -154,6 +154,10 @@ set(OASR_SOURCES
     csrc/kernels/gemm/gemm_kernels.cu
     csrc/kernels/gemm/bmm_kernels.cu
     csrc/kernels/gemm/group_gemm_kernels.cu
+
+    # Decoder
+    csrc/decoder/common/utils.cc
+    csrc/decoder/ctc_prefix_beam_search.cc
     
     # TODO: Add these when ready
     # csrc/kernels/common/tensor.cpp
@@ -173,6 +177,12 @@ set(OASR_HEADERS
     csrc/kernels/gemm/gemm_kernels.h
     csrc/kernels/gemm/bmm_kernels.h
     csrc/kernels/gemm/group_gemm_kernels.h
+
+    # Decoder Headers
+    csrc/decoder/common/utils.h
+    csrc/decoder/search_interface.h
+    csrc/decoder/ctc_prefix_beam_search.h
+
     
     # TODO: Add these when ready
     # csrc/kernels/common/tensor.h
