@@ -3,15 +3,14 @@
 Unit tests for decoder wrappers (CTC prefix beam search).
 """
 
-import math
 from pathlib import Path
 
 import pytest
 import torch
 import torchaudio
 
-from oasr.decoder import CtcPrefixBeamSearch
 from oasr.models.conformer import load_wenet_checkpoint
+from oasr.decoder import CtcPrefixBeamSearch
 
 
 class TestCtcPrefixBeamSearch:
@@ -33,7 +32,7 @@ class TestCtcPrefixBeamSearch:
         def read_audio(path: str):
             """Read audio file."""
             audio, sr = torchaudio.load(path)
-            audio =  audio * (1 << 15)
+            audio = audio * (1 << 15)
             return audio, sr
 
         def extract_features(audio: torch.Tensor, sr: int):
@@ -87,12 +86,14 @@ class TestCtcPrefixBeamSearch:
                 word, idx = line.strip().split()
                 id2word[int(idx)] = word
 
-        text = " ".join([id2word[idx] for idx in outputs[0]])
+        text = "".join([id2word[idx]
+                       for idx in outputs[0]]).replace("▁", " ").strip()
         print(f"text: {text}, likelihood: {likelihood[0]}")
 
         assert len(outputs) >= 1
         assert isinstance(outputs[0], list)
         assert isinstance(likelihood[0], float)
+        assert len(text.split()) > 0
 
 
 if __name__ == "__main__":
