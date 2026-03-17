@@ -1,31 +1,32 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "kernels/norm/norm_kernels.h"
-#include "kernels/reduction/allreduce.h"
-#include "common/vec_dtypes.h"
-
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <algorithm>
-#include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #include <cudnn.h>
+
+#include <algorithm>
 #include <stdexcept>
 #include <torch/extension.h>
+
+#include "kernels/common/vec_dtypes.h"
+#include "kernels/norm/norm_kernels.h"
+#include "kernels/reduction/allreduce.h"
 
 namespace oasr {
 namespace kernels {
 
 // Import vector types from oasr namespace
-using oasr::Vec;
-using oasr::VecTypeTrait;
-using oasr::vecSum;
-using oasr::vecSumSquares;
-using oasr::vecSumSquaredDiff;
 using oasr::floatToVec;
 using oasr::loadVec;
 using oasr::storeVec;
+using oasr::Vec;
+using oasr::vecSum;
+using oasr::vecSumSquaredDiff;
+using oasr::vecSumSquares;
+using oasr::VecTypeTrait;
 
 // =============================================================================
 // Constants
@@ -38,19 +39,14 @@ constexpr int MAX_THREADS_PER_BLOCK = 1024;
 // =============================================================================
 
 template <typename T>
-__global__ void layerNormKernel(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
-    int hidden_size,
-    float eps
-) {
+__global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ output,
+                                const T* __restrict__ gamma, const T* __restrict__ beta,
+                                int hidden_size, float eps) {
     // Each block processes one row (one token)
     const int row_idx = blockIdx.x;
     const T* row_input = input + row_idx * hidden_size;
     T* row_output = output + row_idx * hidden_size;
-    
+
     // Compute mean
     float local_sum = 0.0f;
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
@@ -58,7 +54,7 @@ __global__ void layerNormKernel(
     }
     float mean = blockReduceSum(local_sum) / static_cast<float>(hidden_size);
     __syncthreads();
-    
+
     // Broadcast mean to all threads
     __shared__ float shared_mean;
     if (threadIdx.x == 0) {
@@ -66,7 +62,7 @@ __global__ void layerNormKernel(
     }
     __syncthreads();
     mean = shared_mean;
-    
+
     // Compute variance
     float local_var_sum = 0.0f;
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
@@ -75,7 +71,7 @@ __global__ void layerNormKernel(
     }
     float variance = blockReduceSum(local_var_sum) / static_cast<float>(hidden_size);
     __syncthreads();
-    
+
     // Broadcast variance
     __shared__ float shared_var;
     if (threadIdx.x == 0) {
@@ -83,10 +79,10 @@ __global__ void layerNormKernel(
     }
     __syncthreads();
     variance = shared_var;
-    
+
     // Compute rsqrt(variance + eps)
     float inv_std = rsqrtf(variance + eps);
-    
+
     // Normalize and scale
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         float normalized = (static_cast<float>(row_input[i]) - mean) * inv_std;
@@ -100,24 +96,20 @@ __global__ void layerNormKernel(
 
 // Optimized kernel for hidden_size <= 1024 (fits in one block)
 template <typename T, int HIDDEN_SIZE>
-__global__ void layerNormKernelSmall(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
-    float eps
-) {
+__global__ void layerNormKernelSmall(const T* __restrict__ input, T* __restrict__ output,
+                                     const T* __restrict__ gamma, const T* __restrict__ beta,
+                                     float eps) {
     const int row_idx = blockIdx.x;
     const T* row_input = input + row_idx * HIDDEN_SIZE;
     T* row_output = output + row_idx * HIDDEN_SIZE;
-    
+
     // Each thread handles multiple elements
     constexpr int ELEMENTS_PER_THREAD = (HIDDEN_SIZE + 255) / 256;
-    
+
     float vals[ELEMENTS_PER_THREAD];
     float local_sum = 0.0f;
-    
-    #pragma unroll
+
+#pragma unroll
     for (int i = 0; i < ELEMENTS_PER_THREAD; i++) {
         int idx = threadIdx.x + i * blockDim.x;
         if (idx < HIDDEN_SIZE) {
@@ -125,19 +117,20 @@ __global__ void layerNormKernelSmall(
             local_sum += vals[i];
         }
     }
-    
+
     // Reduce to get mean
     float mean = blockReduceSum(local_sum) / static_cast<float>(HIDDEN_SIZE);
     __syncthreads();
-    
+
     __shared__ float shared_mean;
-    if (threadIdx.x == 0) shared_mean = mean;
+    if (threadIdx.x == 0)
+        shared_mean = mean;
     __syncthreads();
     mean = shared_mean;
-    
+
     // Compute variance
     float local_var = 0.0f;
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < ELEMENTS_PER_THREAD; i++) {
         int idx = threadIdx.x + i * blockDim.x;
         if (idx < HIDDEN_SIZE) {
@@ -145,19 +138,20 @@ __global__ void layerNormKernelSmall(
             local_var += diff * diff;
         }
     }
-    
+
     float variance = blockReduceSum(local_var) / static_cast<float>(HIDDEN_SIZE);
     __syncthreads();
-    
+
     __shared__ float shared_var;
-    if (threadIdx.x == 0) shared_var = variance;
+    if (threadIdx.x == 0)
+        shared_var = variance;
     __syncthreads();
     variance = shared_var;
-    
+
     float inv_std = rsqrtf(variance + eps);
-    
-    // Write output
-    #pragma unroll
+
+// Write output
+#pragma unroll
     for (int i = 0; i < ELEMENTS_PER_THREAD; i++) {
         int idx = threadIdx.x + i * blockDim.x;
         if (idx < HIDDEN_SIZE) {
@@ -177,37 +171,32 @@ __global__ void layerNormKernelSmall(
 // =============================================================================
 
 template <typename T>
-__global__ void rmsNormKernel(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
-    int hidden_size,
-    float eps
-) {
+__global__ void rmsNormKernel(const T* __restrict__ input, T* __restrict__ output,
+                              const T* __restrict__ gamma, const T* __restrict__ beta,
+                              int hidden_size, float eps) {
     const int row_idx = blockIdx.x;
     const T* row_input = input + row_idx * hidden_size;
     T* row_output = output + row_idx * hidden_size;
-    
+
     // Compute mean of squares
     float local_sum_sq = 0.0f;
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         float val = static_cast<float>(row_input[i]);
         local_sum_sq += val * val;
     }
-    
+
     float mean_sq = blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size);
     __syncthreads();
-    
+
     __shared__ float shared_mean_sq;
     if (threadIdx.x == 0) {
         shared_mean_sq = mean_sq;
     }
     __syncthreads();
     mean_sq = shared_mean_sq;
-    
+
     float inv_rms = rsqrtf(mean_sq + eps);
-    
+
     // Normalize and scale
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         float normalized = static_cast<float>(row_input[i]) * inv_rms;
@@ -224,37 +213,28 @@ __global__ void rmsNormKernel(
 // =============================================================================
 
 template <typename T>
-__global__ void batchNorm1DKernel(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
-    const T* __restrict__ running_mean,
-    const T* __restrict__ running_var,
-    int batch_size,
-    int seq_len,
-    int channels,
-    float eps
-) {
+__global__ void batchNorm1DKernel(const T* __restrict__ input, T* __restrict__ output,
+                                  const T* __restrict__ gamma, const T* __restrict__ beta,
+                                  const T* __restrict__ running_mean,
+                                  const T* __restrict__ running_var, int batch_size, int seq_len,
+                                  int channels, float eps) {
     // Each thread handles one element
     // Input shape: [batch, seq_len, channels]
     const int total_elements = batch_size * seq_len * channels;
-    
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; 
-         idx < total_elements; 
+
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements;
          idx += blockDim.x * gridDim.x) {
-        
         int c = idx % channels;
-        
+
         float mean = static_cast<float>(running_mean[c]);
         float var = static_cast<float>(running_var[c]);
         float g = static_cast<float>(gamma[c]);
         float b = static_cast<float>(beta[c]);
-        
+
         float inv_std = rsqrtf(var + eps);
         float x = static_cast<float>(input[idx]);
         float normalized = (x - mean) * inv_std;
-        
+
         output[idx] = static_cast<T>(normalized * g + b);
     }
 }
@@ -264,17 +244,10 @@ __global__ void batchNorm1DKernel(
 // =============================================================================
 
 template <typename T>
-__global__ void groupNormKernel(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
-    int batch_size,
-    int seq_len,
-    int channels,
-    int num_groups,
-    float eps
-) {
+__global__ void groupNormKernel(const T* __restrict__ input, T* __restrict__ output,
+                                const T* __restrict__ gamma, const T* __restrict__ beta,
+                                int batch_size, int seq_len, int channels, int num_groups,
+                                float eps) {
     int channels_per_group = channels / num_groups;
     float inv_channels_per_group = 1.0f / static_cast<float>(channels_per_group);
 
@@ -282,8 +255,8 @@ __global__ void groupNormKernel(
     int seq_idx = idx % seq_len;
     int batch_idx = idx / seq_len;
 
-    const T* row     = input  + (batch_idx * seq_len + seq_idx) * channels;
-    T*       out_row = output + (batch_idx * seq_len + seq_idx) * channels;
+    const T* row = input + (batch_idx * seq_len + seq_idx) * channels;
+    T* out_row = output + (batch_idx * seq_len + seq_idx) * channels;
 
     // threads_per_group: largest power-of-2 <= blockDim.x / num_groups
     // int raw_tpg = blockDim.x / num_groups;
@@ -293,13 +266,13 @@ __global__ void groupNormKernel(
     // thread_per_group should be a power-of-2
     int threads_per_group = blockDim.x / num_groups;
 
-    int my_group  = threadIdx.x / threads_per_group;
+    int my_group = threadIdx.x / threads_per_group;
     int local_tid = threadIdx.x % threads_per_group;
     int lane = threadIdx.x & (WARP_SIZE - 1);
 
     // Shared memory: [group_mean | group_inv_std | warp_buf (inter-warp case)]
     extern __shared__ float smem[];
-    float* group_mean    = smem;
+    float* group_mean = smem;
     float* group_inv_std = smem + num_groups;
 
     // ---- Phase 1: thread-local accumulation for assigned group ----
@@ -308,7 +281,7 @@ __global__ void groupNormKernel(
     for (int i = local_tid; i < channels_per_group; i += threads_per_group) {
         float v = static_cast<float>(gptr[i]);
         psum += v;
-        psq  += v * v;
+        psq += v * v;
     }
 
     // ---- Phase 2: CUB-style tree reduction ----
@@ -317,14 +290,14 @@ __global__ void groupNormKernel(
     int seg = (threads_per_group < WARP_SIZE) ? threads_per_group : WARP_SIZE;
     for (int off = seg >> 1; off > 0; off >>= 1) {
         psum += __shfl_xor_sync(0xffffffff, psum, off);
-        psq  += __shfl_xor_sync(0xffffffff, psq,  off);
+        psq += __shfl_xor_sync(0xffffffff, psq, off);
     }
 
     if (threads_per_group <= WARP_SIZE) {
         // Each group's segment fits in one warp -- leader already has the total.
         if (local_tid == 0) {
             float mean = psum * inv_channels_per_group;
-            group_mean[my_group]    = mean;
+            group_mean[my_group] = mean;
             group_inv_std[my_group] = rsqrtf(psq * inv_channels_per_group - mean * mean + eps);
         }
     } else {
@@ -335,21 +308,21 @@ __global__ void groupNormKernel(
 
         if (lane == 0) {
             int bi = my_group * warps_per_group + warp_idx;
-            wbuf[bi]                    = psum;
+            wbuf[bi] = psum;
             wbuf[num_groups * warps_per_group + bi] = psq;
         }
         __syncthreads();
 
         if (local_tid == 0) {
             float s = 0.0f, sq = 0.0f;
-            int base    = my_group * warps_per_group;
+            int base = my_group * warps_per_group;
             int sq_base = num_groups * warps_per_group + base;
             for (int w = 0; w < warps_per_group; ++w) {
-                s  += wbuf[base + w];
+                s += wbuf[base + w];
                 sq += wbuf[sq_base + w];
             }
             float mean = s * inv_channels_per_group;
-            group_mean[my_group]    = mean;
+            group_mean[my_group] = mean;
             group_inv_std[my_group] = rsqrtf(sq * inv_channels_per_group - mean * mean + eps);
         }
     }
@@ -357,12 +330,10 @@ __global__ void groupNormKernel(
 
     // ---- Phase 3: normalize and apply per-channel affine transform ----
     for (int c = threadIdx.x; c < channels; c += blockDim.x) {
-        int   g = c / channels_per_group;
+        int g = c / channels_per_group;
         float v = static_cast<float>(row[c]);
         float n = (v - group_mean[g]) * group_inv_std[g];
-        out_row[c] = static_cast<T>(
-            n * static_cast<float>(gamma[c]) + static_cast<float>(beta[c])
-        );
+        out_row[c] = static_cast<T>(n * static_cast<float>(gamma[c]) + static_cast<float>(beta[c]));
     }
 }
 
@@ -371,20 +342,14 @@ __global__ void groupNormKernel(
 // =============================================================================
 
 template <typename T>
-__global__ void addLayerNormKernel(
-    const T* __restrict__ input,
-    const T* __restrict__ residual,
-    T* __restrict__ output,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
-    int hidden_size,
-    float eps
-) {
+__global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restrict__ residual,
+                                   T* __restrict__ output, const T* __restrict__ gamma,
+                                   const T* __restrict__ beta, int hidden_size, float eps) {
     const int row_idx = blockIdx.x;
     const T* row_input = input + row_idx * hidden_size;
     const T* row_residual = residual + row_idx * hidden_size;
     T* row_output = output + row_idx * hidden_size;
-    
+
     // Compute mean of (input + residual)
     float local_sum = 0.0f;
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
@@ -393,12 +358,13 @@ __global__ void addLayerNormKernel(
     }
     float mean = blockReduceSum(local_sum) / static_cast<float>(hidden_size);
     __syncthreads();
-    
+
     __shared__ float shared_mean;
-    if (threadIdx.x == 0) shared_mean = mean;
+    if (threadIdx.x == 0)
+        shared_mean = mean;
     __syncthreads();
     mean = shared_mean;
-    
+
     // Compute variance
     float local_var = 0.0f;
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
@@ -408,14 +374,15 @@ __global__ void addLayerNormKernel(
     }
     float variance = blockReduceSum(local_var) / static_cast<float>(hidden_size);
     __syncthreads();
-    
+
     __shared__ float shared_var;
-    if (threadIdx.x == 0) shared_var = variance;
+    if (threadIdx.x == 0)
+        shared_var = variance;
     __syncthreads();
     variance = shared_var;
-    
+
     float inv_std = rsqrtf(variance + eps);
-    
+
     // Normalize and scale
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         float val = static_cast<float>(row_input[i]) + static_cast<float>(row_residual[i]);
@@ -433,22 +400,17 @@ __global__ void addLayerNormKernel(
 // =============================================================================
 
 template <typename T, int VecSize>
-__global__ void layerNormKernelVectorized(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
-    int hidden_size,
-    float eps
-) {
+__global__ void layerNormKernelVectorized(const T* __restrict__ input, T* __restrict__ output,
+                                          const T* __restrict__ gamma, const T* __restrict__ beta,
+                                          int hidden_size, float eps) {
     using VecT = Vec<T, VecSize>;
-    
+
     const int row_idx = blockIdx.x;
     const T* row_input = input + row_idx * hidden_size;
     T* row_output = output + row_idx * hidden_size;
-    
+
     const int vec_hidden_size = hidden_size / VecSize;
-    
+
     // Phase 1: Compute mean using vectorized loads
     float local_sum = 0.0f;
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -456,15 +418,16 @@ __global__ void layerNormKernelVectorized(
         v.load(row_input + i * VecSize);
         local_sum += vecSum(v);
     }
-    
+
     float mean = blockReduceSum(local_sum) / static_cast<float>(hidden_size);
     __syncthreads();
-    
+
     __shared__ float shared_mean;
-    if (threadIdx.x == 0) shared_mean = mean;
+    if (threadIdx.x == 0)
+        shared_mean = mean;
     __syncthreads();
     mean = shared_mean;
-    
+
     // Phase 2: Compute variance using vectorized loads
     float local_var = 0.0f;
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -472,39 +435,40 @@ __global__ void layerNormKernelVectorized(
         v.load(row_input + i * VecSize);
         local_var += vecSumSquaredDiff(v, mean);
     }
-    
+
     float variance = blockReduceSum(local_var) / static_cast<float>(hidden_size);
     __syncthreads();
-    
+
     __shared__ float shared_var;
-    if (threadIdx.x == 0) shared_var = variance;
+    if (threadIdx.x == 0)
+        shared_var = variance;
     __syncthreads();
     variance = shared_var;
-    
+
     float inv_std = rsqrtf(variance + eps);
-    
+
     // Phase 3: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
         VecT v_in, v_gamma, v_out;
         v_in.load(row_input + i * VecSize);
         v_gamma.load(gamma + i * VecSize);
-        
+
         float vals[VecSize];
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < VecSize; j++) {
             float normalized = (static_cast<float>(v_in[j]) - mean) * inv_std;
             vals[j] = normalized * static_cast<float>(v_gamma[j]);
         }
-        
+
         if (beta != nullptr) {
             VecT v_beta;
             v_beta.load(beta + i * VecSize);
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < VecSize; j++) {
                 vals[j] += static_cast<float>(v_beta[j]);
             }
         }
-        
+
         floatToVec<T, VecSize>(vals, v_out);
         v_out.store(row_output + i * VecSize);
     }
@@ -515,22 +479,17 @@ __global__ void layerNormKernelVectorized(
 // =============================================================================
 
 template <typename T, int VecSize>
-__global__ void rmsNormKernelVectorized(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
-    int hidden_size,
-    float eps
-) {
+__global__ void rmsNormKernelVectorized(const T* __restrict__ input, T* __restrict__ output,
+                                        const T* __restrict__ gamma, const T* __restrict__ beta,
+                                        int hidden_size, float eps) {
     using VecT = Vec<T, VecSize>;
-    
+
     const int row_idx = blockIdx.x;
     const T* row_input = input + row_idx * hidden_size;
     T* row_output = output + row_idx * hidden_size;
-    
+
     const int vec_hidden_size = hidden_size / VecSize;
-    
+
     // Phase 1: Compute mean of squares using vectorized loads
     float local_sum_sq = 0.0f;
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -538,33 +497,34 @@ __global__ void rmsNormKernelVectorized(
         v.load(row_input + i * VecSize);
         local_sum_sq += vecSumSquares(v);
     }
-    
+
     float mean_sq = blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size);
     __syncthreads();
-    
+
     __shared__ float shared_mean_sq;
-    if (threadIdx.x == 0) shared_mean_sq = mean_sq;
+    if (threadIdx.x == 0)
+        shared_mean_sq = mean_sq;
     __syncthreads();
     mean_sq = shared_mean_sq;
-    
+
     float inv_rms = rsqrtf(mean_sq + eps);
-    
+
     // Phase 2: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
         VecT v_in, v_gamma, v_out;
         v_in.load(row_input + i * VecSize);
         v_gamma.load(gamma + i * VecSize);
-        
+
         float vals[VecSize];
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < VecSize; j++) {
             vals[j] = static_cast<float>(v_in[j]) * inv_rms * static_cast<float>(v_gamma[j]);
         }
-        
+
         if (beta != nullptr) {
             VecT v_beta;
             v_beta.load(beta + i * VecSize);
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < VecSize; j++) {
                 vals[j] += static_cast<float>(v_beta[j]);
             }
@@ -579,32 +539,23 @@ __global__ void rmsNormKernelVectorized(
 // =============================================================================
 
 template <typename T, int VecSize>
-__global__ void batchNorm1DKernelVectorized(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
-    const T* __restrict__ running_mean,
-    const T* __restrict__ running_var,
-    int batch_size,
-    int seq_len,
-    int channels,
-    float eps
-) {
+__global__ void batchNorm1DKernelVectorized(const T* __restrict__ input, T* __restrict__ output,
+                                            const T* __restrict__ gamma, const T* __restrict__ beta,
+                                            const T* __restrict__ running_mean,
+                                            const T* __restrict__ running_var, int batch_size,
+                                            int seq_len, int channels, float eps) {
     using VecT = Vec<T, VecSize>;
-    
+
     const int total_elements = batch_size * seq_len * channels;
     const int vec_channels = channels / VecSize;
-    
+
     // Each thread processes VecSize elements at a time
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; 
-         idx < total_elements / VecSize; 
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements / VecSize;
          idx += blockDim.x * gridDim.x) {
-        
         // Calculate position
         int flat_idx = idx * VecSize;
         int c_start = flat_idx % channels;
-        
+
         // Check if this is an aligned vector access within channels
         if (c_start + VecSize <= channels && c_start % VecSize == 0) {
             VecT v_in, v_gamma, v_beta, v_mean, v_var, v_out;
@@ -613,16 +564,17 @@ __global__ void batchNorm1DKernelVectorized(
             v_beta.load(beta + c_start);
             v_mean.load(running_mean + c_start);
             v_var.load(running_var + c_start);
-            
+
             float vals[VecSize];
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < VecSize; j++) {
                 float inv_std = rsqrtf(static_cast<float>(v_var[j]) + eps);
                 float x = static_cast<float>(v_in[j]);
                 float normalized = (x - static_cast<float>(v_mean[j])) * inv_std;
-                vals[j] = normalized * static_cast<float>(v_gamma[j]) + static_cast<float>(v_beta[j]);
+                vals[j] =
+                    normalized * static_cast<float>(v_gamma[j]) + static_cast<float>(v_beta[j]);
             }
-            
+
             floatToVec<T, VecSize>(vals, v_out);
             v_out.store(output + flat_idx);
         } else {
@@ -647,17 +599,10 @@ __global__ void batchNorm1DKernelVectorized(
 // =============================================================================
 
 template <typename T, int VecSize>
-__global__ void groupNormKernelVectorized(
-    const T* __restrict__ input,
-    T* __restrict__ output,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
-    int batch_size,
-    int seq_len,
-    int channels,
-    int num_groups,
-    float eps
-) {
+__global__ void groupNormKernelVectorized(const T* __restrict__ input, T* __restrict__ output,
+                                          const T* __restrict__ gamma, const T* __restrict__ beta,
+                                          int batch_size, int seq_len, int channels, int num_groups,
+                                          float eps) {
     using VecT = Vec<T, VecSize>;
 
     int channels_per_group = channels / num_groups;
@@ -667,8 +612,8 @@ __global__ void groupNormKernelVectorized(
     int seq_idx = idx % seq_len;
     int batch_idx = idx / seq_len;
 
-    const T* row     = input  + (batch_idx * seq_len + seq_idx) * channels;
-    T*       out_row = output + (batch_idx * seq_len + seq_idx) * channels;
+    const T* row = input + (batch_idx * seq_len + seq_idx) * channels;
+    T* out_row = output + (batch_idx * seq_len + seq_idx) * channels;
 
     // threads_per_group: largest power-of-2 <= blockDim.x / num_groups
     // int raw_tpg = blockDim.x / num_groups;
@@ -678,14 +623,14 @@ __global__ void groupNormKernelVectorized(
     // thread_per_group should be a power-of-2
     int threads_per_group = blockDim.x / num_groups;
 
-    int my_group  = threadIdx.x / threads_per_group;
+    int my_group = threadIdx.x / threads_per_group;
     int local_tid = threadIdx.x % threads_per_group;
 
     int lane = threadIdx.x & (WARP_SIZE - 1);
 
     // Shared memory: [group_mean | group_inv_std | warp_buf (inter-warp case)]
     extern __shared__ float smem[];
-    float* group_mean    = smem;
+    float* group_mean = smem;
     float* group_inv_std = smem + num_groups;
 
     // ---- Phase 1: thread-local accumulation for assigned group (vectorized) ----
@@ -696,25 +641,26 @@ __global__ void groupNormKernelVectorized(
         VecT v;
         v.load(gptr + vec_i * VecSize);
         psum += vecSum(v);
-        psq  += vecSumSquares(v);
+        psq += vecSumSquares(v);
     }
-    for (int i = vec_channels_per_group * VecSize + local_tid; i < channels_per_group; i += threads_per_group) {
+    for (int i = vec_channels_per_group * VecSize + local_tid; i < channels_per_group;
+         i += threads_per_group) {
         float v = static_cast<float>(gptr[i]);
         psum += v;
-        psq  += v * v;
+        psq += v * v;
     }
 
     // ---- Phase 2: CUB-style tree reduction ----
     int seg = (threads_per_group < WARP_SIZE) ? threads_per_group : WARP_SIZE;
     for (int off = seg >> 1; off > 0; off >>= 1) {
         psum += __shfl_xor_sync(0xffffffff, psum, off);
-        psq  += __shfl_xor_sync(0xffffffff, psq,  off);
+        psq += __shfl_xor_sync(0xffffffff, psq, off);
     }
 
     if (threads_per_group <= WARP_SIZE) {
         if (local_tid == 0) {
             float mean = psum * inv_channels_per_group;
-            group_mean[my_group]    = mean;
+            group_mean[my_group] = mean;
             group_inv_std[my_group] = rsqrtf(psq * inv_channels_per_group - mean * mean + eps);
         }
     } else {
@@ -724,21 +670,21 @@ __global__ void groupNormKernelVectorized(
 
         if (lane == 0) {
             int bi = my_group * warps_per_group + warp_idx;
-            wbuf[bi]                    = psum;
+            wbuf[bi] = psum;
             wbuf[num_groups * warps_per_group + bi] = psq;
         }
         __syncthreads();
 
         if (local_tid == 0) {
             float s = 0.0f, sq = 0.0f;
-            int base    = my_group * warps_per_group;
+            int base = my_group * warps_per_group;
             int sq_base = num_groups * warps_per_group + base;
             for (int w = 0; w < warps_per_group; ++w) {
-                s  += wbuf[base + w];
+                s += wbuf[base + w];
                 sq += wbuf[sq_base + w];
             }
             float mean = s * inv_channels_per_group;
-            group_mean[my_group]    = mean;
+            group_mean[my_group] = mean;
             group_inv_std[my_group] = rsqrtf(sq * inv_channels_per_group - mean * mean + eps);
         }
     }
@@ -757,7 +703,7 @@ __global__ void groupNormKernelVectorized(
         float mean_g = group_mean[g];
         float inv_std_g = group_inv_std[g];
         float vals[VecSize];
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < VecSize; j++) {
             float n = (static_cast<float>(v_in[j]) - mean_g) * inv_std_g;
             vals[j] = n * static_cast<float>(v_gamma[j]) + static_cast<float>(v_beta[j]);
@@ -772,94 +718,92 @@ __global__ void groupNormKernelVectorized(
 // =============================================================================
 
 template <typename T, int VecSize>
-__global__ void addLayerNormKernelVectorized(
-    const T* __restrict__ input,
-    const T* __restrict__ residual,
-    T* __restrict__ output,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
-    int hidden_size,
-    float eps
-) {
+__global__ void addLayerNormKernelVectorized(const T* __restrict__ input,
+                                             const T* __restrict__ residual, T* __restrict__ output,
+                                             const T* __restrict__ gamma,
+                                             const T* __restrict__ beta, int hidden_size,
+                                             float eps) {
     using VecT = Vec<T, VecSize>;
-    
+
     const int row_idx = blockIdx.x;
     const T* row_input = input + row_idx * hidden_size;
     const T* row_residual = residual + row_idx * hidden_size;
     T* row_output = output + row_idx * hidden_size;
-    
+
     const int vec_hidden_size = hidden_size / VecSize;
-    
+
     // Phase 1: Compute mean using vectorized loads
     float local_sum = 0.0f;
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
         VecT v_in, v_res;
         v_in.load(row_input + i * VecSize);
         v_res.load(row_residual + i * VecSize);
-        
-        #pragma unroll
+
+#pragma unroll
         for (int j = 0; j < VecSize; j++) {
             local_sum += static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]);
         }
     }
-    
+
     float mean = blockReduceSum(local_sum) / static_cast<float>(hidden_size);
     __syncthreads();
-    
+
     __shared__ float shared_mean;
-    if (threadIdx.x == 0) shared_mean = mean;
+    if (threadIdx.x == 0)
+        shared_mean = mean;
     __syncthreads();
     mean = shared_mean;
-    
+
     // Phase 2: Compute variance using vectorized loads
     float local_var = 0.0f;
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
         VecT v_in, v_res;
         v_in.load(row_input + i * VecSize);
         v_res.load(row_residual + i * VecSize);
-        
-        #pragma unroll
+
+#pragma unroll
         for (int j = 0; j < VecSize; j++) {
             float val = static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]);
             float diff = val - mean;
             local_var += diff * diff;
         }
     }
-    
+
     float variance = blockReduceSum(local_var) / static_cast<float>(hidden_size);
     __syncthreads();
-    
+
     __shared__ float shared_var;
-    if (threadIdx.x == 0) shared_var = variance;
+    if (threadIdx.x == 0)
+        shared_var = variance;
     __syncthreads();
     variance = shared_var;
-    
+
     float inv_std = rsqrtf(variance + eps);
-    
+
     // Phase 3: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
         VecT v_in, v_res, v_gamma, v_out;
         v_in.load(row_input + i * VecSize);
         v_res.load(row_residual + i * VecSize);
         v_gamma.load(gamma + i * VecSize);
-        
+
         float vals[VecSize];
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < VecSize; j++) {
             float val = static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]);
             float normalized = (val - mean) * inv_std;
             vals[j] = normalized * static_cast<float>(v_gamma[j]);
         }
-        
+
         if (beta != nullptr) {
             VecT v_beta;
             v_beta.load(beta + i * VecSize);
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < VecSize; j++) {
                 vals[j] += static_cast<float>(v_beta[j]);
             }
         }
-        
+
         floatToVec<T, VecSize>(vals, v_out);
         v_out.store(row_output + i * VecSize);
     }
@@ -871,101 +815,77 @@ __global__ void addLayerNormKernelVectorized(
 
 template <typename T>
 void invokeLayerNormTyped(const torch::Tensor& input, torch::Tensor& output,
-                          const torch::Tensor& weight, const torch::Tensor& bias,
-                          float eps, cudaStream_t stream) {
+                          const torch::Tensor& weight, const torch::Tensor& bias, float eps,
+                          cudaStream_t stream) {
     int batch_size = input.size(0);
     int seq_len = input.size(1);
     int hidden_size = input.size(2);
     int num_rows = batch_size * seq_len;
-    
+
     constexpr int VecSize = VecTypeTrait<T>::VecSize;
 
     const T* input_ptr = static_cast<const T*>(input.data_ptr());
     T* output_ptr = static_cast<T*>(output.data_ptr());
     const T* weight_ptr = static_cast<const T*>(weight.data_ptr());
     const T* bias_ptr = bias.defined() ? static_cast<const T*>(bias.data_ptr()) : nullptr;
-    
+
     // Choose block size based on hidden_size
     int block_size = std::min(hidden_size, MAX_THREADS_PER_BLOCK);
     block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-    
+
     // Use vectorized kernel if hidden_size is large enough and alignment is good
     // Vectorization requires hidden_size >= VecSize and pointer alignment
-    bool use_vec = (hidden_size >= VecSize) && 
+    bool use_vec = (hidden_size >= VecSize) &&
                    (reinterpret_cast<uintptr_t>(input_ptr) % (sizeof(T) * VecSize) == 0) &&
                    (reinterpret_cast<uintptr_t>(output_ptr) % (sizeof(T) * VecSize) == 0);
-    
+
     if (use_vec) {
         // Adjust block size for vectorized kernel (fewer iterations needed)
         int vec_hidden = hidden_size / VecSize;
         block_size = std::min(vec_hidden, MAX_THREADS_PER_BLOCK);
         block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
-        
+
         layerNormKernelVectorized<T, VecSize><<<num_rows, block_size, 0, stream>>>(
-            input_ptr,
-            output_ptr,
-            weight_ptr,
-            bias_ptr,
-            hidden_size,
-            eps
-        );
+            input_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
     } else {
-        layerNormKernel<T><<<num_rows, block_size, 0, stream>>>(
-            input_ptr,
-            output_ptr,
-            weight_ptr,
-            bias_ptr,
-            hidden_size,
-            eps
-        );
+        layerNormKernel<T><<<num_rows, block_size, 0, stream>>>(input_ptr, output_ptr, weight_ptr,
+                                                                bias_ptr, hidden_size, eps);
     }
 }
 
 template <typename T>
 void invokeRMSNormTyped(const torch::Tensor& input, torch::Tensor& output,
-                        const torch::Tensor& weight, const torch::Tensor& bias,
-                        float eps, cudaStream_t stream) {
+                        const torch::Tensor& weight, const torch::Tensor& bias, float eps,
+                        cudaStream_t stream) {
     int batch_size = input.size(0);
     int seq_len = input.size(1);
     int hidden_size = input.size(2);
     int num_rows = batch_size * seq_len;
-    
+
     constexpr int VecSize = VecTypeTrait<T>::VecSize;
 
     const T* input_ptr = static_cast<const T*>(input.data_ptr());
     T* output_ptr = static_cast<T*>(output.data_ptr());
     const T* weight_ptr = static_cast<const T*>(weight.data_ptr());
     const T* bias_ptr = bias.defined() ? static_cast<const T*>(bias.data_ptr()) : nullptr;
-    
+
     int block_size = std::min(hidden_size, MAX_THREADS_PER_BLOCK);
     block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-    
-    bool use_vec = (hidden_size >= VecSize) && 
+
+    bool use_vec = (hidden_size >= VecSize) &&
                    (reinterpret_cast<uintptr_t>(input_ptr) % (sizeof(T) * VecSize) == 0) &&
                    (reinterpret_cast<uintptr_t>(output_ptr) % (sizeof(T) * VecSize) == 0);
-    
+
     if (use_vec) {
         int vec_hidden = hidden_size / VecSize;
         block_size = std::min(vec_hidden, MAX_THREADS_PER_BLOCK);
         block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
-        
+
         rmsNormKernelVectorized<T, VecSize><<<num_rows, block_size, 0, stream>>>(
-            input_ptr,
-            output_ptr,
-            weight_ptr,
-            bias_ptr,
-            hidden_size,
-            eps
-        );
+            input_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
     } else {
-        rmsNormKernel<T><<<num_rows, block_size, 0, stream>>>(
-            input_ptr,
-            output_ptr,
-            weight_ptr,
-            bias_ptr,
-            hidden_size,
-            eps
-        );
+        rmsNormKernel<T><<<num_rows, block_size, 0, stream>>>(input_ptr, output_ptr, weight_ptr,
+                                                              bias_ptr, hidden_size, eps);
     }
 }
 
@@ -973,9 +893,8 @@ void invokeRMSNormTyped(const torch::Tensor& input, torch::Tensor& output,
 // Public API implementations
 // =============================================================================
 
-torch::Tensor invokeLayerNorm(const torch::Tensor& input,
-                     const torch::Tensor& weight, const torch::Tensor& bias,
-                     float eps, cudaStream_t stream) {
+torch::Tensor invokeLayerNorm(const torch::Tensor& input, const torch::Tensor& weight,
+                              const torch::Tensor& bias, float eps, cudaStream_t stream) {
     auto output = torch::empty_like(input);
     switch (input.scalar_type()) {
         case torch::kFloat32:
@@ -993,9 +912,8 @@ torch::Tensor invokeLayerNorm(const torch::Tensor& input,
     return output;
 }
 
-torch::Tensor invokeRMSNorm(const torch::Tensor& input,
-                   const torch::Tensor& weight, const torch::Tensor& bias,
-                   float eps, cudaStream_t stream) {
+torch::Tensor invokeRMSNorm(const torch::Tensor& input, const torch::Tensor& weight,
+                            const torch::Tensor& bias, float eps, cudaStream_t stream) {
     auto output = torch::empty_like(input);
     switch (input.scalar_type()) {
         case torch::kFloat32:
@@ -1023,7 +941,7 @@ void invokeBatchNorm1DTyped(const torch::Tensor& input, torch::Tensor& output,
     int channels = input.size(2);
     int total_elements = batch_size * seq_len * channels;
     int block_size = 256;
-    
+
     constexpr int VecSize = VecTypeTrait<T>::VecSize;
 
     const T* input_ptr = static_cast<const T*>(input.data_ptr());
@@ -1032,57 +950,44 @@ void invokeBatchNorm1DTyped(const torch::Tensor& input, torch::Tensor& output,
     const T* bias_ptr = bias.defined() ? static_cast<const T*>(bias.data_ptr()) : nullptr;
     const T* running_mean_ptr = static_cast<const T*>(running_mean.data_ptr());
     const T* running_var_ptr = static_cast<const T*>(running_var.data_ptr());
-    
+
     // Check if we can use vectorized kernel
     bool use_vec = (channels >= VecSize) && (channels % VecSize == 0) &&
                    (reinterpret_cast<uintptr_t>(input_ptr) % (sizeof(T) * VecSize) == 0) &&
                    (reinterpret_cast<uintptr_t>(output_ptr) % (sizeof(T) * VecSize) == 0);
-    
+
     if (use_vec) {
         int vec_total = total_elements / VecSize;
         int grid_size = (vec_total + block_size - 1) / block_size;
-        
+
         batchNorm1DKernelVectorized<T, VecSize><<<grid_size, block_size, 0, stream>>>(
-            input_ptr,
-            output_ptr,
-            weight_ptr,
-            bias_ptr,
-            running_mean_ptr,
-            running_var_ptr,
-            batch_size, seq_len, channels, eps
-        );
+            input_ptr, output_ptr, weight_ptr, bias_ptr, running_mean_ptr, running_var_ptr,
+            batch_size, seq_len, channels, eps);
     } else {
         int grid_size = (total_elements + block_size - 1) / block_size;
-        
+
         batchNorm1DKernel<T><<<grid_size, block_size, 0, stream>>>(
-            input_ptr,
-            output_ptr,
-            weight_ptr,
-            bias_ptr,
-            running_mean_ptr,
-            running_var_ptr,
-            batch_size, seq_len, channels, eps
-        );
+            input_ptr, output_ptr, weight_ptr, bias_ptr, running_mean_ptr, running_var_ptr,
+            batch_size, seq_len, channels, eps);
     }
 }
 
-torch::Tensor invokeBatchNorm1D(const torch::Tensor& input,
-                       const torch::Tensor& weight, const torch::Tensor& bias,
-                       const torch::Tensor& running_mean, const torch::Tensor& running_var,
-                       float eps, cudaStream_t stream) {
+torch::Tensor invokeBatchNorm1D(const torch::Tensor& input, const torch::Tensor& weight,
+                                const torch::Tensor& bias, const torch::Tensor& running_mean,
+                                const torch::Tensor& running_var, float eps, cudaStream_t stream) {
     auto output = torch::empty_like(input);
     switch (input.scalar_type()) {
         case torch::kFloat32:
-            invokeBatchNorm1DTyped<float>(input, output, weight, bias,
-                                          running_mean, running_var, eps, stream);
+            invokeBatchNorm1DTyped<float>(input, output, weight, bias, running_mean, running_var,
+                                          eps, stream);
             break;
         case torch::kHalf:
-            invokeBatchNorm1DTyped<half>(input, output, weight, bias,
-                                         running_mean, running_var, eps, stream);
+            invokeBatchNorm1DTyped<half>(input, output, weight, bias, running_mean, running_var,
+                                         eps, stream);
             break;
         case torch::kBFloat16:
-            invokeBatchNorm1DTyped<__nv_bfloat16>(input, output, weight, bias,
-                                                  running_mean, running_var, eps, stream);
+            invokeBatchNorm1DTyped<__nv_bfloat16>(input, output, weight, bias, running_mean,
+                                                  running_var, eps, stream);
             break;
         default:
             throw std::runtime_error("Unsupported data type for BatchNorm1D");
@@ -1092,8 +997,7 @@ torch::Tensor invokeBatchNorm1D(const torch::Tensor& input,
 
 template <typename T>
 void invokeGroupNormTyped(const torch::Tensor& input, torch::Tensor& output,
-                          const torch::Tensor& weight, const torch::Tensor& bias,
-                          int num_groups,
+                          const torch::Tensor& weight, const torch::Tensor& bias, int num_groups,
                           float eps, cudaStream_t stream) {
     int batch_size = input.size(0);
     int seq_len = input.size(1);
@@ -1109,8 +1013,7 @@ void invokeGroupNormTyped(const torch::Tensor& input, torch::Tensor& output,
 
     int num_blocks = batch_size * seq_len;
     int block_size = std::min(channels, MAX_THREADS_PER_BLOCK);
-    block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE,
-                          WARP_SIZE);
+    block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
     int num_warps = block_size / WARP_SIZE;
     size_t smem_bytes = sizeof(float) * (2 * num_groups + 2 * num_warps);
 
@@ -1122,40 +1025,29 @@ void invokeGroupNormTyped(const torch::Tensor& input, torch::Tensor& output,
 
     if (use_vec) {
         groupNormKernelVectorized<T, VecSize><<<num_blocks, block_size, smem_bytes, stream>>>(
-            input_ptr,
-            output_ptr,
-            weight_ptr,
-            bias_ptr,
-            batch_size, seq_len, channels, num_groups, eps
-        );
+            input_ptr, output_ptr, weight_ptr, bias_ptr, batch_size, seq_len, channels, num_groups,
+            eps);
     } else {
         groupNormKernel<T><<<num_blocks, block_size, smem_bytes, stream>>>(
-            input_ptr,
-            output_ptr,
-            weight_ptr,
-            bias_ptr,
-            batch_size, seq_len, channels, num_groups, eps
-        );
+            input_ptr, output_ptr, weight_ptr, bias_ptr, batch_size, seq_len, channels, num_groups,
+            eps);
     }
 }
 
-torch::Tensor invokeGroupNorm(const torch::Tensor& input,
-                     const torch::Tensor& weight, const torch::Tensor& bias,
-                     int num_groups,
-                     float eps, cudaStream_t stream) {
+torch::Tensor invokeGroupNorm(const torch::Tensor& input, const torch::Tensor& weight,
+                              const torch::Tensor& bias, int num_groups, float eps,
+                              cudaStream_t stream) {
     auto output = torch::empty_like(input);
     switch (input.scalar_type()) {
         case torch::kFloat32:
-            invokeGroupNormTyped<float>(input, output, weight, bias,
-                                        num_groups, eps, stream);
+            invokeGroupNormTyped<float>(input, output, weight, bias, num_groups, eps, stream);
             break;
         case torch::kHalf:
-            invokeGroupNormTyped<half>(input, output, weight, bias,
-                                       num_groups, eps, stream);
+            invokeGroupNormTyped<half>(input, output, weight, bias, num_groups, eps, stream);
             break;
         case torch::kBFloat16:
-            invokeGroupNormTyped<__nv_bfloat16>(input, output, weight, bias,
-                                                num_groups, eps, stream);
+            invokeGroupNormTyped<__nv_bfloat16>(input, output, weight, bias, num_groups, eps,
+                                                stream);
             break;
         default:
             throw std::runtime_error("Unsupported data type for GroupNorm");
@@ -1165,14 +1057,13 @@ torch::Tensor invokeGroupNorm(const torch::Tensor& input,
 
 template <typename T>
 void invokeAddLayerNormTyped(const torch::Tensor& input, const torch::Tensor& residual,
-                             torch::Tensor& output,
-                             const torch::Tensor& weight, const torch::Tensor& bias,
-                             float eps, cudaStream_t stream) {
+                             torch::Tensor& output, const torch::Tensor& weight,
+                             const torch::Tensor& bias, float eps, cudaStream_t stream) {
     int batch_size = input.size(0);
     int seq_len = input.size(1);
     int hidden_size = input.size(2);
     int num_rows = batch_size * seq_len;
-    
+
     constexpr int VecSize = VecTypeTrait<T>::VecSize;
 
     const T* input_ptr = static_cast<const T*>(input.data_ptr());
@@ -1180,44 +1071,32 @@ void invokeAddLayerNormTyped(const torch::Tensor& input, const torch::Tensor& re
     T* output_ptr = static_cast<T*>(output.data_ptr());
     const T* weight_ptr = static_cast<const T*>(weight.data_ptr());
     const T* bias_ptr = bias.defined() ? static_cast<const T*>(bias.data_ptr()) : nullptr;
-    
+
     int block_size = std::min(hidden_size, MAX_THREADS_PER_BLOCK);
     block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-    
+
     // Check if we can use vectorized kernel
     bool use_vec = (hidden_size >= VecSize) &&
                    (reinterpret_cast<uintptr_t>(input_ptr) % (sizeof(T) * VecSize) == 0) &&
                    (reinterpret_cast<uintptr_t>(residual_ptr) % (sizeof(T) * VecSize) == 0) &&
                    (reinterpret_cast<uintptr_t>(output_ptr) % (sizeof(T) * VecSize) == 0);
-    
+
     if (use_vec) {
         int vec_hidden = hidden_size / VecSize;
         block_size = std::min(vec_hidden, MAX_THREADS_PER_BLOCK);
         block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
-        
+
         addLayerNormKernelVectorized<T, VecSize><<<num_rows, block_size, 0, stream>>>(
-            input_ptr,
-            residual_ptr,
-            output_ptr,
-            weight_ptr,
-            bias_ptr,
-            hidden_size, eps
-        );
+            input_ptr, residual_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
     } else {
         addLayerNormKernel<T><<<num_rows, block_size, 0, stream>>>(
-            input_ptr,
-            residual_ptr,
-            output_ptr,
-            weight_ptr,
-            bias_ptr,
-            hidden_size, eps
-        );
+            input_ptr, residual_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
     }
 }
 
 torch::Tensor invokeAddLayerNorm(const torch::Tensor& input, const torch::Tensor& residual,
-                        const torch::Tensor& weight, const torch::Tensor& bias,
-                        float eps, cudaStream_t stream) {
+                                 const torch::Tensor& weight, const torch::Tensor& bias, float eps,
+                                 cudaStream_t stream) {
     auto output = torch::empty_like(input);
     switch (input.scalar_type()) {
         case torch::kFloat32:
@@ -1227,7 +1106,8 @@ torch::Tensor invokeAddLayerNorm(const torch::Tensor& input, const torch::Tensor
             invokeAddLayerNormTyped<half>(input, residual, output, weight, bias, eps, stream);
             break;
         case torch::kBFloat16:
-            invokeAddLayerNormTyped<__nv_bfloat16>(input, residual, output, weight, bias, eps, stream);
+            invokeAddLayerNormTyped<__nv_bfloat16>(input, residual, output, weight, bias, eps,
+                                                   stream);
             break;
         default:
             throw std::runtime_error("Unsupported data type for AddLayerNorm");
@@ -1237,24 +1117,21 @@ torch::Tensor invokeAddLayerNorm(const torch::Tensor& input, const torch::Tensor
 
 // Explicit template instantiations
 template void invokeLayerNormTyped<float>(const torch::Tensor&, torch::Tensor&,
-                                          const torch::Tensor&, const torch::Tensor&,
-                                          float, cudaStream_t);
-template void invokeLayerNormTyped<half>(const torch::Tensor&, torch::Tensor&,
-                                         const torch::Tensor&, const torch::Tensor&,
-                                         float, cudaStream_t);
+                                          const torch::Tensor&, const torch::Tensor&, float,
+                                          cudaStream_t);
+template void invokeLayerNormTyped<half>(const torch::Tensor&, torch::Tensor&, const torch::Tensor&,
+                                         const torch::Tensor&, float, cudaStream_t);
 template void invokeLayerNormTyped<__nv_bfloat16>(const torch::Tensor&, torch::Tensor&,
-                                                  const torch::Tensor&, const torch::Tensor&,
-                                                  float, cudaStream_t);
+                                                  const torch::Tensor&, const torch::Tensor&, float,
+                                                  cudaStream_t);
 
-template void invokeRMSNormTyped<float>(const torch::Tensor&, torch::Tensor&,
-                                        const torch::Tensor&, const torch::Tensor&,
-                                        float, cudaStream_t);
-template void invokeRMSNormTyped<half>(const torch::Tensor&, torch::Tensor&,
-                                       const torch::Tensor&, const torch::Tensor&,
-                                       float, cudaStream_t);
+template void invokeRMSNormTyped<float>(const torch::Tensor&, torch::Tensor&, const torch::Tensor&,
+                                        const torch::Tensor&, float, cudaStream_t);
+template void invokeRMSNormTyped<half>(const torch::Tensor&, torch::Tensor&, const torch::Tensor&,
+                                       const torch::Tensor&, float, cudaStream_t);
 template void invokeRMSNormTyped<__nv_bfloat16>(const torch::Tensor&, torch::Tensor&,
-                                                const torch::Tensor&, const torch::Tensor&,
-                                                float, cudaStream_t);
+                                                const torch::Tensor&, const torch::Tensor&, float,
+                                                cudaStream_t);
 
-} // namespace kernels
-} // namespace oasr
+}  // namespace kernels
+}  // namespace oasr

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import yaml
 
 from .config import ConformerEncoderConfig, ConformerModelConfig
@@ -33,12 +34,12 @@ from .model import ConformerModel, GlobalCMVN
 logger = logging.getLogger(__name__)
 
 
-def _parse_wenet_yaml(yaml_path: str) -> Dict[str, Any]:
+def parse_wenet_yaml(yaml_path: str) -> Dict[str, Any]:
     with open(yaml_path, "r") as f:
         return yaml.safe_load(f)
 
 
-def _build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
+def build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
     """Translate a WeNet ``train.yaml`` into a :class:`ConformerModelConfig`."""
     enc = raw.get("encoder_conf", {})
     encoder_cfg = ConformerEncoderConfig(
@@ -57,13 +58,17 @@ def _build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
         input_layer=enc.get("input_layer", "conv2d"),
         embed_layer_norm=False,
     )
+
+    vocab_size = raw.get("output_dim")
+    if vocab_size % 8 != 0:
+        vocab_size = (vocab_size // 8 + 1) * 8
     return ConformerModelConfig(
         encoder=encoder_cfg,
-        vocab_size=raw.get("output_dim"),
+        vocab_size=vocab_size,
     )
 
 
-def _load_global_cmvn(cmvn_path: str) -> GlobalCMVN:
+def load_global_cmvn(cmvn_path: str) -> GlobalCMVN:
     """Load a WeNet JSON-format ``global_cmvn`` file into a :class:`GlobalCMVN` module."""
     with open(cmvn_path, "r") as f:
         raw = json.load(f)
@@ -77,7 +82,7 @@ def _load_global_cmvn(cmvn_path: str) -> GlobalCMVN:
     return GlobalCMVN(mean, istd)
 
 
-def _filter_encoder_state_dict(
+def filter_encoder_state_dict(
     state_dict: Dict[str, torch.Tensor],
 ) -> Dict[str, torch.Tensor]:
     """Keep only ``encoder.*`` keys from a full WeNet checkpoint.
@@ -85,7 +90,20 @@ def _filter_encoder_state_dict(
     The prefix is kept as-is since ``ConformerModel.state_dict()`` also
     nests everything under ``encoder.``.
     """
-    return {k: v for k, v in state_dict.items() if k.startswith("encoder.")}
+    encoder_state_dict = {k: v for k,
+                          v in state_dict.items() if k.startswith("encoder.")}
+
+    vocab_size = state_dict["ctc.ctc_lo.weight"].shape[0]
+    if vocab_size % 8 != 0:
+        padding = 8 - vocab_size % 8
+        encoder_state_dict["ctc.ctc_lo.weight"] = F.pad(
+            state_dict["ctc.ctc_lo.weight"], (0, 0, 0, padding))
+        encoder_state_dict["ctc.ctc_lo.bias"] = F.pad(
+            state_dict["ctc.ctc_lo.bias"], (0, padding))
+    else:
+        encoder_state_dict["ctc.ctc_lo.weight"] = state_dict["ctc.ctc_lo.weight"]
+        encoder_state_dict["ctc.ctc_lo.bias"] = state_dict["ctc.ctc_lo.bias"]
+    return encoder_state_dict
 
 
 def load_wenet_checkpoint(
@@ -118,14 +136,14 @@ def load_wenet_checkpoint(
             raise FileNotFoundError(f"Required file not found: {p}")
 
     # --- 1. Parse config ---
-    raw_config = _parse_wenet_yaml(str(yaml_path))
-    config = _build_config_from_wenet(raw_config)
+    raw_config = parse_wenet_yaml(str(yaml_path))
+    config = build_config_from_wenet(raw_config)
     logger.info("Encoder config: %s", config.encoder)
 
     # --- 2. Build GlobalCMVN (optional) ---
     global_cmvn: Optional[GlobalCMVN] = None
     if cmvn_path.exists():
-        global_cmvn = _load_global_cmvn(str(cmvn_path))
+        global_cmvn = load_global_cmvn(str(cmvn_path))
         logger.info("Loaded global CMVN from %s", cmvn_path)
 
     # --- 3. Construct model ---
@@ -133,18 +151,19 @@ def load_wenet_checkpoint(
 
     # --- 4. Load checkpoint ---
     state_dict = torch.load(str(ckpt_path), map_location=device)
-    encoder_sd = _filter_encoder_state_dict(state_dict)
+    encoder_state_dict = filter_encoder_state_dict(state_dict)
     logger.info(
         "Checkpoint has %d encoder keys (out of %d total)",
-        len(encoder_sd),
+        len(encoder_state_dict),
         len(state_dict),
     )
 
-    missing, unexpected = model.load_state_dict(encoder_sd, strict=False)
+    missing, unexpected = model.load_state_dict(
+        encoder_state_dict, strict=False)
 
     # pos_enc.pe is a computed buffer, expected to be absent from the checkpoint
-    _expected_missing = {"encoder.embed.pos_enc.pe"}
-    real_missing = [k for k in missing if k not in _expected_missing]
+    expected_missing = {"encoder.embed.pos_enc.pe"}
+    real_missing = [k for k in missing if k not in expected_missing]
     if real_missing:
         logger.warning("Unexpected missing keys: %s", real_missing)
     if unexpected:

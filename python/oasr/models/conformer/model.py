@@ -3,6 +3,8 @@
 """Conformer model: encoder, layers, and submodules (WeNet algorithm, vLLM-style layout)."""
 
 from __future__ import annotations
+from typing import Tuple
+import torch.nn.functional as F
 
 import math
 from typing import Optional, Tuple, Union
@@ -53,6 +55,31 @@ class GlobalCMVN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean) * self.istd
+
+
+class CTC(torch.nn.Module):
+    """CTC module"""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        encoder_output_size: int,
+    ):
+        """ Construct CTC module
+        Args:
+            vocab_size: number of output classes
+            encoder_output_size: number of encoder projection units
+        """
+        super().__init__()
+        self.ctc_lo = Linear(encoder_output_size, vocab_size)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Calculate CTC loss.
+
+        Args:
+            hidden_states: batch of hidden state sequences (B, T, D)
+        """
+        return F.log_softmax(self.ctc_lo(hidden_states), dim=2)
 
 
 # -----------------------------------------------------------------------------
@@ -495,11 +522,18 @@ class ConformerModel(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.encoder = ConformerEncoder(config.encoder, global_cmvn=global_cmvn)
+        self.encoder = ConformerEncoder(
+            config.encoder, global_cmvn=global_cmvn)
+        self.ctc = CTC(
+            config.vocab_size,
+            config.encoder.output_size,
+        )
 
     def forward(
         self,
         input_features: torch.Tensor,
         lengths: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.encoder(input_features, lengths)
+        hidden_states, masks = self.encoder(input_features, lengths)
+        logits = self.ctc(hidden_states)
+        return logits

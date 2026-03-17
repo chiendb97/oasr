@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import oasr
 import pytest
 import torch
 import yaml
@@ -164,9 +165,21 @@ def load_wenet_model_from_ckpt_dir(ckpt_dir: Path, device: str):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_load_checkpoint_matches_wenet(ckpt_dir: str, batch: int, time_in: int, feat_dim: int, dtype: torch.dtype):
     """Encoder inference outputs match between OASR and WeNet for the same checkpoint."""
-    if not Path(ckpt_dir).exists():
+    # Skip this test when no valid WeNet checkpoint directory is provided.
+    # The ``ckpt_dir`` fixture returns an empty string when the option/env var
+    # is not set, and ``Path('')`` resolves to the current working directory,
+    # which incorrectly makes this test run and then fail with a missing
+    # ``train.yaml`` error.  Instead, require that the directory exists and
+    # contains the expected WeNet files.
+    if not ckpt_dir:
         pytest.skip(
-            "WeNet checkpoint dir not set or not found; set WENET_CKPT_DIR env var or --wenet-ckpt-dir"
+            "WeNet checkpoint dir not set; set WENET_CKPT_DIR env var or --ckpt-dir/--wenet-ckpt-dir"
+        )
+    ckpt_path = Path(ckpt_dir)
+    if not ckpt_path.exists() or not (ckpt_path / "train.yaml").exists() or not (ckpt_path / "final.pt").exists():
+        pytest.skip(
+            "WeNet checkpoint dir not found or incomplete; set WENET_CKPT_DIR env var or --ckpt-dir/--wenet-ckpt-dir "
+            "to a directory containing train.yaml and final.pt"
         )
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -183,16 +196,18 @@ def test_load_checkpoint_matches_wenet(ckpt_dir: str, batch: int, time_in: int, 
         wenet_encoder_out, wenet_masks = wenet_model.encoder(
             feats, lengths, decoding_chunk_size=-1, num_decoding_left_chunks=-1
         )
+        wenet_probs = wenet_model.ctc.log_softmax(wenet_encoder_out)
 
-        oasr_encoder_out, oasr_masks = oasr_model(feats, lengths)
+        oasr_probs = oasr_model(feats, lengths)
+        oasr_probs = oasr_probs[:, :, :wenet_probs.shape[2]]
 
-    assert oasr_encoder_out.shape == wenet_encoder_out.shape, (
-        f"Shape mismatch: OASR {oasr_encoder_out.shape} vs WeNet {wenet_encoder_out.shape}"
+    assert oasr_probs.shape == wenet_probs.shape, (
+        f"Shape mismatch: OASR {oasr_probs.shape} vs WeNet {wenet_probs.shape}"
     )
     torch.testing.assert_close(
-        oasr_encoder_out,
-        wenet_encoder_out,
+        oasr_probs,
+        wenet_probs,
         rtol=5e-2,
         atol=5e-2,
-        msg="OASR and WeNet encoder outputs should match for the same checkpoint and input.",
+        msg="OASR and WeNet probs should match for the same checkpoint and input.",
     )

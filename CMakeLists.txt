@@ -144,7 +144,7 @@ endif()
 # =============================================================================
 set(OASR_SOURCES
     # Common (minimal for now)
-    csrc/common/cuda_utils.cpp
+    csrc/kernels/common/cuda_utils.cpp
     
     # Kernels
     csrc/kernels/norm/norm_kernels.cu
@@ -154,16 +154,20 @@ set(OASR_SOURCES
     csrc/kernels/gemm/gemm_kernels.cu
     csrc/kernels/gemm/bmm_kernels.cu
     csrc/kernels/gemm/group_gemm_kernels.cu
+
+    # Decoder
+    csrc/decoder/common/utils.cc
+    csrc/decoder/ctc_prefix_beam_search.cc
     
     # TODO: Add these when ready
-    # csrc/common/tensor.cpp
-    # csrc/common/allocator.cpp
+    # csrc/kernels/common/tensor.cpp
+    # csrc/kernels/common/allocator.cpp
     # csrc/kernels/attention/attention_kernels.cu
 )
 
 set(OASR_HEADERS
-    csrc/common/types.h
-    csrc/common/cuda_utils.h
+    csrc/kernels/common/types.h
+    csrc/kernels/common/cuda_utils.h
     csrc/kernels/norm/norm_kernels.h
     csrc/kernels/conv/conv_kernels.h
     
@@ -173,10 +177,16 @@ set(OASR_HEADERS
     csrc/kernels/gemm/gemm_kernels.h
     csrc/kernels/gemm/bmm_kernels.h
     csrc/kernels/gemm/group_gemm_kernels.h
+
+    # Decoder Headers
+    csrc/decoder/common/utils.h
+    csrc/decoder/search_interface.h
+    csrc/decoder/ctc_prefix_beam_search.h
+
     
     # TODO: Add these when ready
-    # csrc/common/tensor.h
-    # csrc/common/allocator.h
+    # csrc/kernels/common/tensor.h
+    # csrc/kernels/common/allocator.h
     # csrc/kernels/attention/attention_params.h
     # csrc/kernels/attention/attention_kernels.h
 )

@@ -1,7 +1,7 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "common/cuda_utils.h"
+#include "kernels/common/cuda_utils.h"
 
 namespace oasr {
 

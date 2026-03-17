@@ -1,13 +1,15 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 
-#include <torch/extension.h>
 #include <cuda_runtime.h>
 
-#include "common/types.h"
-#include "pybind_norm.h"
+#include <torch/extension.h>
+
+#include "kernels/common/types.h"
 #include "pybind_conv.h"
+#include "pybind_decoder.h"
 #include "pybind_gemm.h"
+#include "pybind_norm.h"
 
 namespace py = pybind11;
 
@@ -18,34 +20,41 @@ PYBIND11_MODULE(_C, m) {
     // =========================================================================
     // CUDA utilities
     // =========================================================================
-    m.def("init_cuda", []() {
-        int device_count;
-        cudaGetDeviceCount(&device_count);
-        if (device_count == 0) {
-            throw std::runtime_error("No CUDA devices found");
-        }
-        return device_count;
-    }, "Initialize CUDA and return device count");
+    m.def(
+        "init_cuda",
+        []() {
+            int device_count;
+            cudaGetDeviceCount(&device_count);
+            if (device_count == 0) {
+                throw std::runtime_error("No CUDA devices found");
+            }
+            return device_count;
+        },
+        "Initialize CUDA and return device count");
 
-    m.def("get_device_count", []() {
-        int count;
-        cudaGetDeviceCount(&count);
-        return count;
-    }, "Get number of CUDA devices");
+    m.def(
+        "get_device_count",
+        []() {
+            int count;
+            cudaGetDeviceCount(&count);
+            return count;
+        },
+        "Get number of CUDA devices");
 
-    m.def("set_device", [](int device_id) {
-        cudaSetDevice(device_id);
-    }, py::arg("device_id"), "Set current CUDA device");
+    m.def(
+        "set_device", [](int device_id) { cudaSetDevice(device_id); }, py::arg("device_id"),
+        "Set current CUDA device");
 
-    m.def("get_device", []() {
-        int device;
-        cudaGetDevice(&device);
-        return device;
-    }, "Get current CUDA device");
+    m.def(
+        "get_device",
+        []() {
+            int device;
+            cudaGetDevice(&device);
+            return device;
+        },
+        "Get current CUDA device");
 
-    m.def("synchronize", []() {
-        cudaDeviceSynchronize();
-    }, "Synchronize current CUDA device");
+    m.def("synchronize", []() { cudaDeviceSynchronize(); }, "Synchronize current CUDA device");
 
     // =========================================================================
     // Enums
@@ -86,4 +95,9 @@ PYBIND11_MODULE(_C, m) {
     oasr::pybind::registerNormBindings(kernels);
     oasr::pybind::registerConvBindings(kernels);
     oasr::pybind::registerGemmBindings(kernels);
+
+    // =========================================================================
+    // Decoder bindings
+    // =========================================================================
+    oasr::pybind::registerDecoderBindings(m);
 }
