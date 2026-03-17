@@ -47,6 +47,33 @@ class TestCtcPrefixBeamSearch:
             )
             return feats
 
+        def build_dictionary(ckpt_dir: str):
+            """Build dictionary from words.txt."""
+            id2word = {}
+            with open(Path(ckpt_dir) / "words.txt", "r") as f:
+                for line in f.readlines():
+                    word, idx = line.strip().split()
+                    id2word[int(idx)] = word
+            return id2word
+
+        def decode(probs: torch.Tensor, id2word: dict[int, str]):
+            """Detokenize outputs."""
+            decoder = CtcPrefixBeamSearch(
+                blank=0, first_beam_size=10, second_beam_size=10)
+
+            probs = probs.squeeze(0).to(device="cpu", dtype=torch.float32)
+
+            decoder.reset()
+            decoder.search(probs)
+            decoder.finalize_search()
+
+            outputs = decoder.outputs
+            likelihood = decoder.likelihood
+
+            text = "".join([id2word[idx]
+                           for idx in outputs[0]]).replace("▁", " ").strip()
+            return text, likelihood
+
         # Run the encoder on CUDA using the requested half/bfloat16 dtype.
         device = "cuda"
         oasr_model, _ = load_wenet_checkpoint(
@@ -68,32 +95,24 @@ class TestCtcPrefixBeamSearch:
 
         with torch.no_grad():
             probs = oasr_model(feats, lengths)
+            chunk_by_chunk_probs = oasr_model.forward_chunk_by_chunk(
+                feats, decoding_chunk_size=4, num_decoding_left_chunks=2)
 
         # CtcPrefixBeamSearch expects log-probs of shape [T, V] on CPU in
         # float32; collapse the batch dimension and move to CPU.
         probs = probs.squeeze(0).to(device="cpu", dtype=dtype)
+        chunk_by_chunk_probs = chunk_by_chunk_probs.squeeze(
+            0).to(device="cpu", dtype=dtype)
 
-        decoder.reset()
-        decoder.search(probs)
-        decoder.finalize_search()
+        id2word = build_dictionary(ckpt_dir)
 
-        outputs = decoder.outputs
-        likelihood = decoder.likelihood
+        text, _ = decode(probs, id2word)
+        chunk_by_chunk_text, _ = decode(chunk_by_chunk_probs, id2word)
+        print(f"text: {text}")
+        print(f"chunk_by_chunk_text: {chunk_by_chunk_text}")
 
-        id2word = {}
-        with open(Path(ckpt_dir) / "words.txt", "r") as f:
-            for line in f.readlines():
-                word, idx = line.strip().split()
-                id2word[int(idx)] = word
-
-        text = "".join([id2word[idx]
-                       for idx in outputs[0]]).replace("▁", " ").strip()
-        print(f"text: {text}, likelihood: {likelihood[0]}")
-
-        assert len(outputs) >= 1
-        assert isinstance(outputs[0], list)
-        assert isinstance(likelihood[0], float)
         assert len(text.split()) > 0
+        assert len(chunk_by_chunk_text.split()) > 0
 
 
 if __name__ == "__main__":

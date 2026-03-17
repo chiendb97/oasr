@@ -142,6 +142,94 @@ def test_conformer_encoder_matches_wenet(
     torch.testing.assert_close(impl_out, ref_out, rtol=5e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize("chunk_size", [2, 4])
+@pytest.mark.parametrize("num_blocks", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_forward_chunk_encoder_matches_wenet(
+    chunk_size: int,
+    num_blocks: int,
+    dtype: torch.dtype,
+):
+    """Encoder forward_chunk output matches the WeNet ConformerEncoder.forward_chunk."""
+    if dtype == torch.bfloat16 and not torch.cuda.is_available():
+        pytest.skip("bfloat16 requires CUDA")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(7)
+
+    wenet_encoder_config = make_encoder_config(
+        output_size=64,
+        num_blocks=num_blocks,
+        attention_heads=2,
+        linear_units=128,
+        use_cnn_module=True,
+        cnn_module_kernel=15,
+        use_sdpa=True,
+    )
+
+    ref_encoder = wenet_encoder.ConformerEncoder(**wenet_encoder_config)
+    impl_encoder = ConformerEncoder(ConformerEncoderConfig(
+        input_size=wenet_encoder_config["input_size"],
+        output_size=wenet_encoder_config["output_size"],
+        num_blocks=wenet_encoder_config["num_blocks"],
+        attention_heads=wenet_encoder_config["attention_heads"],
+        linear_units=wenet_encoder_config["linear_units"],
+        use_cnn_module=wenet_encoder_config["use_cnn_module"],
+        cnn_module_kernel=wenet_encoder_config["cnn_module_kernel"],
+        embed_layer_norm=False,  # match WeNet default (no LayerNorm in embed)
+    ))
+
+    ref_sd = ref_encoder.state_dict()
+    load_sd = {k: ref_sd[k] for k in impl_encoder.state_dict() if k in ref_sd}
+    impl_encoder.load_state_dict(load_sd, strict=False)
+
+    ref_encoder = ref_encoder.eval().to(dtype=dtype, device=device)
+    impl_encoder = impl_encoder.eval().to(dtype=dtype, device=device)
+
+    time_in = chunk_input_time(chunk_size)
+    xs = torch.randn(1, time_in, 80, dtype=dtype, device=device)
+    offset = 0
+    required_cache_size = -1
+    att_cache = torch.zeros(0, 0, 0, 0, dtype=dtype, device=device)
+    cnn_cache = torch.zeros(0, 0, 0, 0, dtype=dtype, device=device)
+    # Both WeNet and OASR attention expect additive bias (float), not bool. First chunk: key_size = chunk_size.
+    att_mask_bias = torch.zeros(
+        1, chunk_size, chunk_size, dtype=dtype, device=device)
+
+    with torch.no_grad():
+        ref_out, ref_att_cache, ref_cnn_cache = ref_encoder.forward_chunk(
+            xs,
+            offset,
+            required_cache_size,
+            att_cache=att_cache,
+            cnn_cache=cnn_cache,
+            att_mask=att_mask_bias,
+        )
+        impl_out, impl_att_cache, impl_cnn_cache = impl_encoder.forward_chunk(
+            xs,
+            offset,
+            required_cache_size,
+            att_cache=att_cache,
+            cnn_cache=cnn_cache,
+            att_mask=att_mask_bias,
+        )
+
+    assert ref_out.shape == impl_out.shape, (
+        f"output shape: WeNet {ref_out.shape} vs OASR {impl_out.shape}"
+    )
+    torch.testing.assert_close(impl_out, ref_out, rtol=5e-2, atol=5e-2)
+    assert ref_att_cache.shape == impl_att_cache.shape, (
+        f"att_cache shape: WeNet {ref_att_cache.shape} vs OASR {impl_att_cache.shape}"
+    )
+    torch.testing.assert_close(
+        impl_att_cache, ref_att_cache, rtol=5e-2, atol=5e-2)
+    assert ref_cnn_cache.shape == impl_cnn_cache.shape, (
+        f"cnn_cache shape: WeNet {ref_cnn_cache.shape} vs OASR {impl_cnn_cache.shape}"
+    )
+    if ref_cnn_cache.numel() > 0:
+        torch.testing.assert_close(
+            impl_cnn_cache, ref_cnn_cache, rtol=5e-2, atol=5e-2)
+
+
 def load_wenet_model_from_ckpt_dir(ckpt_dir: Path, device: str):
     """Load full WeNet ASR model from checkpoint dir (train.yaml + final.pt)."""
     yaml_path = ckpt_dir / "train.yaml"
@@ -159,6 +247,195 @@ def load_wenet_model_from_ckpt_dir(ckpt_dir: Path, device: str):
     model, _ = init_model(args, configs)
     model = model.to(device).eval()
     return model
+
+
+def chunk_input_time(chunk_size: int, subsample_rate: int = 4, right_context: int = 6) -> int:
+    """Input time length for one chunk so that after subsampling we get chunk_size frames."""
+    return (chunk_size - 1) * subsample_rate + right_context + 1
+
+
+@pytest.mark.parametrize("chunk_size", [2, 4, 8])
+@pytest.mark.parametrize("num_blocks", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_forward_chunk_encoder_shapes(
+    chunk_size: int,
+    num_blocks: int,
+    dtype: torch.dtype,
+):
+    """Encoder forward_chunk returns correct output and cache shapes (b=1, empty caches)."""
+    if dtype == torch.bfloat16 and not torch.cuda.is_available():
+        pytest.skip("bfloat16 requires CUDA")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(3)
+
+    config = ConformerEncoderConfig(
+        input_size=80,
+        output_size=64,
+        num_blocks=num_blocks,
+        attention_heads=2,
+        linear_units=128,
+        use_cnn_module=True,
+        cnn_module_kernel=15,
+        causal=False,
+    )
+    encoder = ConformerEncoder(config).eval().to(device=device, dtype=dtype)
+
+    time_in = chunk_input_time(chunk_size)
+    xs = torch.randn(1, time_in, 80, dtype=dtype, device=device)
+    offset = 0
+    required_cache_size = -1  # keep full history
+    att_cache = torch.zeros(0, 0, 0, 0, dtype=dtype, device=device)
+    cnn_cache = torch.zeros(0, 0, 0, 0, dtype=dtype, device=device)
+
+    with torch.no_grad():
+        out, r_att_cache, r_cnn_cache = encoder.forward_chunk(
+            xs, offset, required_cache_size, att_cache, cnn_cache
+        )
+
+    assert out.shape == (1, chunk_size, 64), f"out shape {out.shape}"
+    assert r_att_cache.dim() == 4
+    assert r_att_cache.size(0) == num_blocks
+    assert r_att_cache.size(1) == 2  # attention_heads
+    # required_cache_size < 0 -> keep all
+    assert r_att_cache.size(2) == chunk_size
+    assert r_att_cache.size(3) == 64  # d_k * 2 for key+value
+    assert r_cnn_cache.dim() == 4
+    assert r_cnn_cache.size(0) == num_blocks
+    # causal=False -> lorder=0; cnn_cache can be (elayers, 0, 0, 0) when no conv cache
+    assert r_cnn_cache.size(2) == 0
+    assert r_cnn_cache.size(3) == 0 or r_cnn_cache.size(3) == 64
+
+
+@pytest.mark.parametrize("chunk_size", [4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_forward_chunk_encoder_first_chunk_matches_full(chunk_size: int, dtype: torch.dtype):
+    """First chunk with empty cache should match full encoder on the same input (single chunk)."""
+    if dtype == torch.bfloat16 and not torch.cuda.is_available():
+        pytest.skip("bfloat16 requires CUDA")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(4)
+
+    config = ConformerModelConfig(
+        encoder=ConformerEncoderConfig(
+            input_size=80,
+            output_size=64,
+            num_blocks=1,
+            attention_heads=2,
+            linear_units=128,
+            use_cnn_module=True,
+            cnn_module_kernel=15,
+            causal=False,
+        ),
+        vocab_size=128,
+    )
+    model = ConformerModel(config).eval().to(device=device, dtype=dtype)
+
+    time_in = chunk_input_time(chunk_size)
+    xs = torch.randn(1, time_in, 80, dtype=dtype, device=device)
+    xs_lens = torch.full((1,), time_in, dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        full_out = model(xs, xs_lens)
+        chunk_out, _, _ = model.forward_chunk(
+            xs,
+            offset=0,
+            required_cache_size=-1,
+            att_cache=torch.zeros(0, 0, 0, 0, dtype=dtype, device=device),
+            cnn_cache=torch.zeros(0, 0, 0, 0, dtype=dtype, device=device),
+        )
+
+    assert full_out.shape == chunk_out.shape
+    torch.testing.assert_close(chunk_out, full_out, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("chunk_size", [64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_forward_chunk_encoder_two_chunks(chunk_size: int, dtype: torch.dtype):
+    """Two consecutive chunks with cache: shapes and no crash."""
+    if dtype == torch.bfloat16 and not torch.cuda.is_available():
+        pytest.skip("bfloat16 requires CUDA")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(5)
+
+    config = ConformerEncoderConfig(
+        input_size=80,
+        output_size=64,
+        num_blocks=1,
+        attention_heads=2,
+        linear_units=128,
+        use_cnn_module=True,
+        cnn_module_kernel=15,
+        causal=False,
+    )
+    encoder = ConformerEncoder(config).eval().to(device=device, dtype=dtype)
+
+    time_in = chunk_input_time(chunk_size)
+    xs1 = torch.randn(1, time_in, 80, dtype=dtype, device=device)
+    xs2 = torch.randn(1, time_in, 80, dtype=dtype, device=device)
+
+    with torch.no_grad():
+        out1, att_cache, cnn_cache = encoder.forward_chunk(
+            xs1, offset=0, required_cache_size=chunk_size,
+            att_cache=torch.zeros(0, 0, 0, 0, dtype=dtype, device=device),
+            cnn_cache=torch.zeros(0, 0, 0, 0, dtype=dtype, device=device),
+        )
+    assert out1.shape == (1, chunk_size, 64)
+    assert att_cache.shape[0] == 1 and att_cache.shape[1] == 2
+    assert cnn_cache.dim() == 4 and cnn_cache.size(0) == 1
+
+    with torch.no_grad():
+        out2, att_cache2, cnn_cache2 = encoder.forward_chunk(
+            xs2, offset=chunk_size, required_cache_size=chunk_size,
+            att_cache=att_cache, cnn_cache=cnn_cache,
+        )
+    assert out2.shape == (1, chunk_size, 64)
+    assert att_cache2.shape[0] == 1
+    assert cnn_cache2.shape[0] == 1
+
+
+@pytest.mark.parametrize("chunk_size", [4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_forward_chunk_model_shapes(chunk_size: int, dtype: torch.dtype):
+    """Conformer encoder forward_chunk + CTC produce expected shapes (logits, att_cache, cnn_cache).
+    Logits are computed via F.linear to avoid custom GEMM NOT_SUPPORTED for small chunk sizes.
+    """
+    if dtype == torch.bfloat16 and not torch.cuda.is_available():
+        pytest.skip("bfloat16 requires CUDA")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(6)
+
+    config = ConformerModelConfig(
+        encoder=ConformerEncoderConfig(
+            input_size=80,
+            output_size=64,
+            num_blocks=1,
+            attention_heads=2,
+            linear_units=128,
+            use_cnn_module=True,
+            cnn_module_kernel=15,
+            causal=False,
+        ),
+        vocab_size=128,
+    )
+    model = ConformerModel(config).eval().to(device=device, dtype=dtype)
+
+    time_in = chunk_input_time(chunk_size)
+    xs = torch.randn(1, time_in, 80, dtype=dtype, device=device)
+    att_cache = torch.zeros(0, 0, 0, 0, dtype=dtype, device=device)
+    cnn_cache = torch.zeros(0, 0, 0, 0, dtype=dtype, device=device)
+
+    with torch.no_grad():
+        probs, att_cache, cnn_cache = model.forward_chunk(
+            xs,
+            offset=0,
+            required_cache_size=-1,
+            att_cache=att_cache,
+            cnn_cache=cnn_cache,
+        )
+
+    assert probs.shape == (1, chunk_size, 128)
+    assert att_cache.dim() == 4 and att_cache.size(0) == 1
+    assert cnn_cache.dim() == 4 and cnn_cache.size(0) == 1
 
 
 @pytest.mark.parametrize("batch,time_in,feat_dim", [(2, 80, 80), (1, 60, 80)])
