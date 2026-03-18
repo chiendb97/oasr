@@ -13,7 +13,7 @@ import torch
 from torch import nn
 
 from oasr.layers.linear import Linear, LinearActivation
-from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d
+from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d, Conv2dActivation
 from oasr.layers.norm import LayerNorm, RMSNorm
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention, T_CACHE
 from oasr.utils import get_activation, get_norm
@@ -262,15 +262,14 @@ class Conv2dSubsampling(nn.Module):
 
         self.subsampling_rate = subsampling_rate
         if subsampling_rate == 4:
-            self.conv = nn.Sequential(
-                nn.Conv2d(1, odim, 3, 2),
-                nn.ReLU(),
-                nn.Conv2d(odim, odim, 3, 2),
-                nn.ReLU(),
-            )
+            # Both convs use fused conv + ReLU via CUTLASS Ampere Tensor Core
+            # Implicit GEMM (NHWC layout). IC=1 uses kAnalytic iterator.
+            self.conv1 = Conv2dActivation(1, odim, 3, stride=2, activation_type="relu")
+            self.conv2 = Conv2dActivation(odim, odim, 3, stride=2, activation_type="relu")
             self.linear_dim = odim * (((idim - 1) // 2 - 1) // 2)
         elif subsampling_rate == 1:
-            self.conv = None
+            self.conv1 = None
+            self.conv2 = None
             self.linear_dim = idim
         else:
             raise NotImplementedError(f"subsampling_rate={subsampling_rate}")
@@ -280,17 +279,53 @@ class Conv2dSubsampling(nn.Module):
         self.out = nn.Sequential(*layers)
         self.right_context = 6 if subsampling_rate == 4 else 0
 
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Remap old nn.Sequential checkpoint keys to the new attribute names.
+
+        Old layout (nn.Sequential):
+          conv.0.weight / conv.0.bias  →  conv1.weight / conv1.bias
+          conv.2.weight / conv.2.bias  →  conv2.weight / conv2.bias
+
+        Conv2dActivation's own _load_from_state_dict handles the
+        [K, IC, R, S] → [K, R, S, IC] weight permutation for both convs.
+        """
+        remap = {
+            prefix + "conv.0.weight": prefix + "conv1.weight",
+            prefix + "conv.0.bias":   prefix + "conv1.bias",
+            prefix + "conv.2.weight": prefix + "conv2.weight",
+            prefix + "conv.2.bias":   prefix + "conv2.bias",
+        }
+        for old_key, new_key in remap.items():
+            if old_key in state_dict:
+                state_dict[new_key] = state_dict.pop(old_key)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
         x_mask: torch.Tensor,
         offset: Union[int, torch.Tensor] = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.conv is not None:
-            x = x.unsqueeze(1)
-            x = self.conv(x)
-            b, c, t, f = x.size()
-            x = x.transpose(1, 2).contiguous().view(b, t, c * f)
+        if self.conv1 is not None:
+            x = x.unsqueeze(-1)       # [N, T,   F,  1   ] NHWC
+            x = self.conv1(x)         # [N, T',  F', odim] NHWC (fused ReLU)
+            x = self.conv2(x)         # [N, T'', F'', odim] NHWC (fused ReLU)
+            b, t, f, c = x.size()
+            # Flatten in c-major order to match WeNet's NCHW-based convention
+            # (transpose(1,2).view on [b,c,t,f] == permute(0,1,3,2).view on [b,t,f,c])
+            x = x.permute(0, 1, 3, 2).contiguous().view(b, t, c * f)  # [N, T'', odim*F'']
             x_mask = x_mask[:, :, 2::2][:, :, 2::2]
         x = self.out(x)
         x, pos_emb = self.pos_enc(x, offset)

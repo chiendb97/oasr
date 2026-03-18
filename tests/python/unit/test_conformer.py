@@ -94,9 +94,10 @@ def test_conformer_encoder_matches_wenet(
         cnn_module_kernel=wenet_encoder_config["cnn_module_kernel"],
     ))
 
+    # Pass full WeNet state dict; _load_from_state_dict hooks in OASR modules
+    # handle key remapping (conv.0 → conv1) and weight layout conversion.
     ref_sd = ref_encoder.state_dict()
-    load_sd = {k: ref_sd[k] for k in impl_encoder.state_dict() if k in ref_sd}
-    impl_encoder.load_state_dict(load_sd, strict=False)
+    impl_encoder.load_state_dict(ref_sd, strict=False)
 
     ref_encoder = ref_encoder.eval().to(dtype=dtype, device=torch.device("cuda"))
     impl_encoder = impl_encoder.eval().to(dtype=dtype, device=torch.device("cuda"))
@@ -178,9 +179,10 @@ def test_forward_chunk_encoder_matches_wenet(
         embed_layer_norm=False,  # match WeNet default (no LayerNorm in embed)
     ))
 
+    # Pass full WeNet state dict; _load_from_state_dict hooks in OASR modules
+    # handle key remapping (conv.0 → conv1) and weight layout conversion.
     ref_sd = ref_encoder.state_dict()
-    load_sd = {k: ref_sd[k] for k in impl_encoder.state_dict() if k in ref_sd}
-    impl_encoder.load_state_dict(load_sd, strict=False)
+    impl_encoder.load_state_dict(ref_sd, strict=False)
 
     ref_encoder = ref_encoder.eval().to(dtype=dtype, device=device)
     impl_encoder = impl_encoder.eval().to(dtype=dtype, device=device)
