@@ -288,69 +288,186 @@ class TestBatchNormSwish:
         torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
 
 
-class TestConformerConvPattern:
-    """Integration test for Conformer-style convolution pattern."""
+class TestConv2d:
+    """Tests for the conv2d kernel (oasr.kernels.conv.conv2d).
 
-    def test_conformer_conv_pattern(self):
-        """Test full Conformer conv block pattern."""
-        batch_size, seq_len, d_model = 2, 128, 256
-        kernel_size = 31
-        dtype = torch.float16
-        scale = 1.0 / (d_model ** 0.5)
+    The CUTLASS backend operates on NHWC tensors and requires
+    ``in_channels % 8 == 0`` and ``out_channels % 8 == 0``.
 
-        # Inputs (scaled to avoid FP16 overflow in multi-stage pipeline)
-        x = torch.randn(batch_size, seq_len, d_model,
-                        device='cuda', dtype=dtype) * scale
+    The PyTorch reference uses F.conv2d on NCHW input/filter and then
+    transposes the result back to NHWC for comparison.
+    """
 
-        # Weights
-        pw1_weight = torch.randn(2 * d_model, d_model,
-                                 device='cuda', dtype=dtype) * scale
-        pw1_bias = torch.randn(2 * d_model, device='cuda', dtype=dtype) * scale
-        dw_weight = torch.randn(kernel_size, d_model,
-                                device='cuda', dtype=dtype) * scale
-        dw_bias = torch.randn(d_model, device='cuda', dtype=dtype) * scale
-        pw2_weight = torch.randn(
-            d_model, d_model, device='cuda', dtype=dtype) * scale
-        pw2_bias = torch.randn(d_model, device='cuda', dtype=dtype) * scale
+    @pytest.mark.parametrize("N,H,W,IC,K,R,S,pad,stride,dilation", [
+        (2, 16, 16, 32,  64, 3, 3, 1, 1, 1),  # 3x3, same padding
+        (1, 28, 28, 64, 128, 1, 1, 0, 1, 1),  # 1x1 pointwise
+        (2, 14, 14, 128, 64, 3, 3, 1, 2, 1),  # stride-2 downsampling
+        (1,  8,  8,  32, 32, 3, 3, 2, 1, 2),  # dilation-2
+        (2, 200, 80,  1, 64, 3, 3, 1, 2, 1),  # IC=1 direct kernel, stride-2
+        (4, 100, 40,  1, 32, 3, 3, 1, 1, 1),  # IC=1 direct kernel, same padding
+    ])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_conv2d(self, N, H, W, IC, K, R, S, pad, stride, dilation, dtype):
+        """Test conv2d against F.conv2d reference."""
+        # NHWC input and KRSC filter
+        x = torch.randn(N, H, W, IC, device="cuda", dtype=dtype) * 0.1
+        w = torch.randn(K, R, S, IC, device="cuda", dtype=dtype) * 0.1
+        bias = torch.randn(K, device="cuda", dtype=dtype) * 0.1
 
-        # OASR pipeline
-        pw1_out = oasr.kernels.conv.pointwise_conv1d_activation(
-            x, pw1_weight, pw1_bias,
-            oasr.ActivationType.SWISH
-        )
+        output = oasr.kernels.conv.conv2d(
+            x, w, bias, pad, pad, stride, stride, dilation, dilation)
+        oasr.synchronize()
 
-        glu_out = oasr.kernels.conv.glu(
-            pw1_out
-        )
+        # Reference: F.conv2d expects NCHW input and KCRS filter
+        x_nchw = x.float().permute(0, 3, 1, 2).contiguous()
+        # [K, R, S, IC] -> [K, IC, R, S]
+        w_kcrs = w.float().permute(0, 3, 1, 2).contiguous()
+        ref_nchw = F.conv2d(x_nchw, w_kcrs, bias.float(),
+                            padding=pad, stride=stride, dilation=dilation)
+        # [N, K, P, Q] -> [N, P, Q, K]
+        expected = ref_nchw.permute(0, 2, 3, 1).to(dtype)
 
-        dw_out = oasr.kernels.conv.depthwise_conv1d(
-            glu_out, dw_weight, dw_bias, kernel_size // 2
-        )
+        assert output.shape == expected.shape
+        rtol, atol = (1e-2, 1e-2) if dtype == torch.float16 else (1e-2, 1e-2)
+        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
-        swish_out = oasr.kernels.conv.swish(
-            dw_out
-        )
+    @pytest.mark.parametrize("N,H,W,IC,K,R,S,pad,stride,dilation", [
+        (2, 16, 16, 32, 64, 3, 3, 1, 1, 1),
+        (1, 28, 28, 64, 128, 1, 1, 0, 1, 1),
+    ])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_conv2d_no_bias(self, N, H, W, IC, K, R, S, pad, stride, dilation, dtype):
+        """Test conv2d without bias."""
+        x = torch.randn(N, H, W, IC, device="cuda", dtype=dtype) * 0.1
+        w = torch.randn(K, R, S, IC, device="cuda", dtype=dtype) * 0.1
 
-        output = oasr.kernels.conv.pointwise_conv1d_activation(
-            swish_out, pw2_weight, pw2_bias,
-            oasr.ActivationType.SWISH
+        output = oasr.kernels.conv.conv2d(
+            x, w, None, pad, pad, stride, stride, dilation, dilation)
+        oasr.synchronize()
+
+        x_nchw = x.float().permute(0, 3, 1, 2).contiguous()
+        w_kcrs = w.float().permute(0, 3, 1, 2).contiguous()
+        ref_nchw = F.conv2d(x_nchw, w_kcrs, bias=None,
+                            padding=pad, stride=stride, dilation=dilation)
+        expected = ref_nchw.permute(0, 2, 3, 1).to(dtype)
+
+        assert output.shape == expected.shape
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+
+class TestConv2dActivation:
+    """Tests for the conv2d_activation kernel (fused epilogue)."""
+
+    @pytest.mark.parametrize("N,H,W,IC,K,R,S,pad", [
+        (2, 16, 16, 32,  64, 3, 3, 1),
+        (1, 28, 28, 64, 128, 1, 1, 0),
+        (2, 200, 80,  1, 64, 3, 3, 1),  # IC=1 direct kernel with fused activation
+    ])
+    @pytest.mark.parametrize("activation,ref_fn", [
+        (lambda: oasr.ActivationType.RELU, F.relu),
+        (lambda: oasr.ActivationType.GELU, F.gelu),
+        (lambda: oasr.ActivationType.SWISH, F.silu),
+    ])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_conv2d_activation(self, N, H, W, IC, K, R, S, pad, activation, ref_fn, dtype):
+        """Test conv2d_activation against F.conv2d + activation reference."""
+        x = torch.randn(N, H, W, IC, device="cuda", dtype=dtype) * 0.1
+        w = torch.randn(K, R, S, IC, device="cuda", dtype=dtype) * 0.1
+        bias = torch.randn(K, device="cuda", dtype=dtype) * 0.1
+
+        output = oasr.kernels.conv.conv2d_activation(
+            x, w, bias, activation(), pad, pad, 1, 1, 1, 1
         )
         oasr.synchronize()
 
-        # PyTorch reference (compute in fp32 for accuracy, then convert)
-        x_f32 = x.float()
-        ref_pw1 = F.linear(x_f32, pw1_weight.float(), pw1_bias.float())
-        ref_glu = F.glu(ref_pw1, dim=-1)
-        ref_glu_nchw = ref_glu.permute(0, 2, 1)
-        dw_weight_pt = dw_weight.float().permute(1, 0).view(d_model, 1, kernel_size)
-        ref_dw_nchw = F.conv1d(ref_glu_nchw, dw_weight_pt, dw_bias.float(
-        ), padding=kernel_size // 2, groups=d_model)
-        ref_dw = ref_dw_nchw.permute(0, 2, 1)
-        ref_swish = F.silu(ref_dw)
-        expected = F.linear(ref_swish, pw2_weight.float(),
-                            pw2_bias.float()).half()
+        x_nchw = x.float().permute(0, 3, 1, 2).contiguous()
+        w_kcrs = w.float().permute(0, 3, 1, 2).contiguous()
+        ref_nchw = F.conv2d(x_nchw, w_kcrs, bias.float(), padding=pad)
+        expected = ref_fn(ref_nchw.permute(0, 2, 3, 1)).to(dtype)
 
-        torch.testing.assert_close(output, expected, rtol=5e-2, atol=5e-2)
+        assert output.shape == expected.shape
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+
+class TestConv2dLayer:
+    """Tests for the Conv2d and Conv2dActivation nn.Module wrappers."""
+
+    @pytest.mark.parametrize("N,H,W,IC,K,kernel_size,padding,stride", [
+        (2, 16, 16, 32,  64, 3, 1, 1),
+        (1, 28, 28, 64, 128, 1, 0, 1),
+        (2, 14, 14, 64,  32, 3, 1, 2),
+    ])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_conv2d_layer(self, N, H, W, IC, K, kernel_size, padding, stride, dtype):
+        """Test Conv2d layer forward pass against F.conv2d reference."""
+        layer = oasr.Conv2d(
+            in_channels=IC, out_channels=K,
+            kernel_size=kernel_size, padding=padding, stride=stride,
+            bias=True, dtype=dtype, device="cuda",
+        )
+
+        x = torch.randn(N, H, W, IC, device="cuda", dtype=dtype) * 0.1
+        output = layer(x)
+        oasr.synchronize()
+
+        # Reference: convert weights back to KCRS for F.conv2d
+        w_kcrs = layer.weight.float().permute(
+            0, 3, 1, 2).contiguous()  # [K,R,S,IC] -> [K,IC,R,S]
+        ref_nchw = F.conv2d(
+            x.float().permute(0, 3, 1, 2).contiguous(),
+            w_kcrs, layer.bias.float(),
+            padding=padding, stride=stride,
+        )
+        expected = ref_nchw.permute(0, 2, 3, 1).to(dtype)
+
+        assert output.shape == expected.shape
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("activation_type,ref_fn", [
+        ("relu",  F.relu),
+        ("gelu",  F.gelu),
+        ("swish", F.silu),
+    ])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_conv2d_activation_layer(self, activation_type, ref_fn, dtype):
+        """Test Conv2dActivation layer forward pass against F.conv2d + activation."""
+        N, H, W, IC, K = 2, 16, 16, 32, 64
+        layer = oasr.Conv2dActivation(
+            in_channels=IC, out_channels=K,
+            kernel_size=3, padding=1,
+            activation_type=activation_type,
+            bias=True, dtype=dtype, device="cuda",
+        )
+
+        x = torch.randn(N, H, W, IC, device="cuda", dtype=dtype) * 0.1
+        output = layer(x)
+        oasr.synchronize()
+
+        w_kcrs = layer.weight.float().permute(0, 3, 1, 2).contiguous()
+        ref_nchw = F.conv2d(
+            x.float().permute(0, 3, 1, 2).contiguous(),
+            w_kcrs, layer.bias.float(), padding=1,
+        )
+        expected = ref_fn(ref_nchw.permute(0, 2, 3, 1)).to(dtype)
+
+        assert output.shape == expected.shape
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    def test_load_from_pytorch_conv2d(self):
+        """Test loading weights from a standard PyTorch nn.Conv2d state dict."""
+        dtype = torch.float16
+        IC, K, R = 32, 64, 3
+        pt_conv = torch.nn.Conv2d(
+            IC, K, R, padding=1, bias=True).cuda().to(dtype)
+        oasr_conv = oasr.Conv2d(IC, K, R, padding=1,
+                                bias=True, dtype=dtype, device="cuda")
+
+        oasr_conv.load_state_dict(pt_conv.state_dict())
+
+        # Verify the weight was transposed correctly: [K, IC, R, S] -> [K, R, S, IC]
+        assert oasr_conv.weight.shape == (K, R, R, IC)
+        expected_w = pt_conv.weight.permute(0, 2, 3, 1).contiguous()
+        torch.testing.assert_close(oasr_conv.weight.data, expected_w)
 
 
 if __name__ == "__main__":

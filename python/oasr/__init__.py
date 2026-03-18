@@ -16,6 +16,8 @@ from . import layers
 from .layers import (
     DepthwiseConv1d,
     PointwiseConv1d,
+    Conv2d,
+    Conv2dActivation,
     Linear,
     LayerNorm,
     RMSNorm,
@@ -78,6 +80,8 @@ __all__ = [
     # Conv
     "DepthwiseConv1d",
     "PointwiseConv1d",
+    "Conv2d",
+    "Conv2dActivation",
     # Linear
     "Linear",
     # Norm
