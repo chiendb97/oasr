@@ -5,14 +5,8 @@
 // Supports BF16 and FP16 precision
 
 #include <cstdint>
+#include <stdexcept>
 #include <torch/extension.h>
-
-#include "cutlass/epilogue/thread/linear_combination_gelu.h"
-#include "cutlass/epilogue/thread/linear_combination_silu.h"
-#include "cutlass/epilogue/thread/scale_type.h"
-#include "gemm_kernels.h"
-#include "gemm_utils.h"
-#include "kernels/common/cuda_utils.h"
 
 // Suppress warnings from CUTLASS headers
 #ifdef __GNUC__
@@ -25,6 +19,9 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/epilogue/thread/linear_combination_bias_relu.h>
+#include <cutlass/epilogue/thread/linear_combination_gelu.h>
+#include <cutlass/epilogue/thread/linear_combination_silu.h>
+#include <cutlass/epilogue/thread/scale_type.h>
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/layout/matrix.h>
 #include <cutlass/numeric_types.h>
@@ -34,10 +31,9 @@
     #pragma GCC diagnostic pop
 #endif
 
-#include <limits>
-#include <sstream>
-#include <stdexcept>
-#include <type_traits>
+#include "gemm_kernels.h"
+#include "gemm_utils.h"
+#include "kernels/common/cuda_utils.h"
 
 namespace oasr {
 namespace kernels {
