@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <torch/extension.h>
 
+#include "kernels/common/math.h"
 #include "kernels/common/vec_dtypes.h"
 #include "kernels/norm/norm_kernels.h"
 #include "kernels/reduction/allreduce.h"
@@ -20,15 +22,61 @@ namespace kernels {
 
 // Import vector types from oasr namespace
 using oasr::Vec;
+using oasr::vecCast;
 using oasr::vecSum;
 using oasr::vecSumSquares;
 using oasr::VecTypeTrait;
 
 // =============================================================================
-// Constants
+// Architecture Configuration & Helpers
 // =============================================================================
 
 constexpr int MAX_THREADS_PER_BLOCK = 1024;
+
+// Broadcast a scalar from thread 0 to all threads via shared memory.
+// Includes barriers before (flush prior shared-mem ops) and after (publish).
+__device__ __forceinline__ float broadcastFromThread0(float value, float* smem) {
+    __syncthreads();
+    if (threadIdx.x == 0)
+        *smem = value;
+    __syncthreads();
+    return *smem;
+}
+
+// Compute warp-aligned block size clamped to [WARP_SIZE, max_threads].
+inline int alignedBlockSize(int num_elements, int max_threads = MAX_THREADS_PER_BLOCK) {
+    int bs = std::min(num_elements, max_threads);
+    return std::max(((bs + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
+}
+
+// Check pointer alignment for vectorized access of VecSize elements.
+template <typename T, int VecSize>
+inline bool isAligned(const void* ptr) {
+    return reinterpret_cast<uintptr_t>(ptr) % (sizeof(T) * VecSize) == 0;
+}
+
+// Dispatch over float / half / bfloat16 scalar types.
+template <typename T>
+struct TypeTag {
+    using type = T;
+};
+
+template <typename Fn>
+void dispatchFloatTypes(torch::ScalarType dtype, const char* op_name, Fn&& fn) {
+    switch (dtype) {
+        case torch::kFloat32:
+            fn(TypeTag<float>{});
+            break;
+        case torch::kHalf:
+            fn(TypeTag<half>{});
+            break;
+        case torch::kBFloat16:
+            fn(TypeTag<__nv_bfloat16>{});
+            break;
+        default:
+            throw std::runtime_error(std::string("Unsupported data type for ") + op_name);
+    }
+}
 
 // =============================================================================
 // LayerNorm Kernel
@@ -46,6 +94,8 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
 
     const int vec_hidden_size = hidden_size / VecSize;
 
+    __shared__ float smem[2];
+
     // Phase 1: Compute mean using vectorized loads
     float local_sum = 0.0f;
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -54,14 +104,8 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
         local_sum += vecSum(v);
     }
 
-    float mean = blockReduceSum(local_sum) / static_cast<float>(hidden_size);
-    __syncthreads();
-
-    __shared__ float shared_mean;
-    if (threadIdx.x == 0)
-        shared_mean = mean;
-    __syncthreads();
-    mean = shared_mean;
+    float mean = broadcastFromThread0(
+        blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
 
     // Phase 2: Compute variance using vectorized loads
     float local_var = 0.0f;
@@ -75,16 +119,10 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
         }
     }
 
-    float variance = blockReduceSum(local_var) / static_cast<float>(hidden_size);
-    __syncthreads();
-
-    __shared__ float shared_var;
-    if (threadIdx.x == 0)
-        shared_var = variance;
-    __syncthreads();
-    variance = shared_var;
-
-    float inv_std = rsqrtf(variance + eps);
+    float inv_std = rsqrtf(
+        broadcastFromThread0(
+            blockReduceSum(local_var) / static_cast<float>(hidden_size), &smem[1])
+        + eps);
 
     // Phase 3: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -108,7 +146,7 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
             }
         }
 
-        vecCast<T, float, VecSize>(vals).store(row_output + i * VecSize);
+        vecCast<T>(vals).store(row_output + i * VecSize);
     }
 }
 
@@ -136,15 +174,11 @@ __global__ void layerNormKernelSmall(const T* __restrict__ input, T* __restrict_
         }
     }
 
-    // Reduce to get mean
-    float mean = blockReduceSum(local_sum) / static_cast<float>(HIDDEN_SIZE);
-    __syncthreads();
+    __shared__ float smem[2];
 
-    __shared__ float shared_mean;
-    if (threadIdx.x == 0)
-        shared_mean = mean;
-    __syncthreads();
-    mean = shared_mean;
+    // Reduce to get mean
+    float mean = broadcastFromThread0(
+        blockReduceSum(local_sum) / static_cast<float>(HIDDEN_SIZE), &smem[0]);
 
     // Compute variance
     float local_var = 0.0f;
@@ -157,16 +191,10 @@ __global__ void layerNormKernelSmall(const T* __restrict__ input, T* __restrict_
         }
     }
 
-    float variance = blockReduceSum(local_var) / static_cast<float>(HIDDEN_SIZE);
-    __syncthreads();
-
-    __shared__ float shared_var;
-    if (threadIdx.x == 0)
-        shared_var = variance;
-    __syncthreads();
-    variance = shared_var;
-
-    float inv_std = rsqrtf(variance + eps);
+    float inv_std = rsqrtf(
+        broadcastFromThread0(
+            blockReduceSum(local_var) / static_cast<float>(HIDDEN_SIZE), &smem[1])
+        + eps);
 
 // Write output
 #pragma unroll
@@ -200,6 +228,8 @@ __global__ void rmsNormKernel(const T* __restrict__ input, T* __restrict__ outpu
 
     const int vec_hidden_size = hidden_size / VecSize;
 
+    __shared__ float smem;
+
     // Phase 1: Compute mean of squares using vectorized loads
     float local_sum_sq = 0.0f;
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -208,16 +238,10 @@ __global__ void rmsNormKernel(const T* __restrict__ input, T* __restrict__ outpu
         local_sum_sq += vecSumSquares(v);
     }
 
-    float mean_sq = blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size);
-    __syncthreads();
-
-    __shared__ float shared_mean_sq;
-    if (threadIdx.x == 0)
-        shared_mean_sq = mean_sq;
-    __syncthreads();
-    mean_sq = shared_mean_sq;
-
-    float inv_rms = rsqrtf(mean_sq + eps);
+    float inv_rms = rsqrtf(
+        broadcastFromThread0(
+            blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size), &smem)
+        + eps);
 
     // Phase 2: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -239,7 +263,7 @@ __global__ void rmsNormKernel(const T* __restrict__ input, T* __restrict__ outpu
                 vals[j] += static_cast<float>(v_bias[j]);
             }
         }
-        vecCast<T, float, VecSize>(vals).store(row_output + i * VecSize);
+        vecCast<T>(vals).store(row_output + i * VecSize);
     }
 }
 
@@ -256,7 +280,6 @@ __global__ void batchNorm1DKernel(const T* __restrict__ input, T* __restrict__ o
     using VecT = Vec<T, VecSize>;
 
     const int total_elements = batch_size * seq_len * channels;
-    const int vec_channels = channels / VecSize;
 
     // Each thread processes VecSize elements at a time
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements / VecSize;
@@ -267,7 +290,7 @@ __global__ void batchNorm1DKernel(const T* __restrict__ input, T* __restrict__ o
 
         // Check if this is an aligned vector access within channels
         if (c_start + VecSize <= channels && c_start % VecSize == 0) {
-            VecT v_in, v_weight, v_bias, v_mean, v_var, v_out;
+            VecT v_in, v_weight, v_bias, v_mean, v_var;
             v_in.load(input + flat_idx);
             v_weight.load(weight + c_start);
             v_bias.load(bias + c_start);
@@ -284,7 +307,7 @@ __global__ void batchNorm1DKernel(const T* __restrict__ input, T* __restrict__ o
                     normalized * static_cast<float>(v_weight[j]) + static_cast<float>(v_bias[j]);
             }
 
-            vecCast<T, float, VecSize>(vals).store(output + flat_idx);
+            vecCast<T>(vals).store(output + flat_idx);
         } else {
             // Fall back to scalar for unaligned accesses
             for (int j = 0; j < VecSize && flat_idx + j < total_elements; j++) {
@@ -353,7 +376,7 @@ __global__ void groupNormKernel(const T* __restrict__ input, T* __restrict__ out
         psq += v * v;
     }
 
-    // ---- Phase 2: CUB-style tree reduction ----
+    // ---- Phase 2: Tree reduction ----
     int seg = (threads_per_group < WARP_SIZE) ? threads_per_group : WARP_SIZE;
     for (int off = seg >> 1; off > 0; off >>= 1) {
         psum += __shfl_xor_sync(0xffffffff, psum, off);
@@ -411,7 +434,7 @@ __global__ void groupNormKernel(const T* __restrict__ input, T* __restrict__ out
             float n = (static_cast<float>(v_in[j]) - mean_g) * inv_std_g;
             vals[j] = n * static_cast<float>(v_weight[j]) + static_cast<float>(v_bias[j]);
         }
-        vecCast<T, float, VecSize>(vals).store(out_row + c);
+        vecCast<T>(vals).store(out_row + c);
     }
 }
 
@@ -432,6 +455,8 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
 
     const int vec_hidden_size = hidden_size / VecSize;
 
+    __shared__ float smem[2];
+
     // Phase 1: Compute mean using vectorized loads
     float local_sum = 0.0f;
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -445,14 +470,8 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
         }
     }
 
-    float mean = blockReduceSum(local_sum) / static_cast<float>(hidden_size);
-    __syncthreads();
-
-    __shared__ float shared_mean;
-    if (threadIdx.x == 0)
-        shared_mean = mean;
-    __syncthreads();
-    mean = shared_mean;
+    float mean = broadcastFromThread0(
+        blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
 
     // Phase 2: Compute variance using vectorized loads
     float local_var = 0.0f;
@@ -469,16 +488,10 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
         }
     }
 
-    float variance = blockReduceSum(local_var) / static_cast<float>(hidden_size);
-    __syncthreads();
-
-    __shared__ float shared_var;
-    if (threadIdx.x == 0)
-        shared_var = variance;
-    __syncthreads();
-    variance = shared_var;
-
-    float inv_std = rsqrtf(variance + eps);
+    float inv_std = rsqrtf(
+        broadcastFromThread0(
+            blockReduceSum(local_var) / static_cast<float>(hidden_size), &smem[1])
+        + eps);
 
     // Phase 3: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -504,46 +517,223 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
             }
         }
 
-        vecCast<T, float, VecSize>(vals).store(row_output + i * VecSize);
+        vecCast<T>(vals).store(row_output + i * VecSize);
+    }
+}
+
+// Dispatch ActivationType enum to compile-time activation functor.
+template <typename Fn>
+void dispatchActivation(ActivationType act, Fn&& fn) {
+    switch (act) {
+        case ActivationType::RELU:
+            fn(ReluActivation{});
+            break;
+        case ActivationType::GELU:
+            fn(GeluActivation{});
+            break;
+        case ActivationType::SWISH:
+            fn(SwishActivation{});
+            break;
+        default:
+            throw std::runtime_error("Unsupported activation type");
     }
 }
 
 // =============================================================================
-// Fused BatchNorm + Swish Kernel
+// Fused LayerNorm + Activation Kernel
 // =============================================================================
 
-template <typename T>
-__global__ void batchNormSwishKernel(const T* __restrict__ input, T* __restrict__ output,
-                                     const T* __restrict__ weight, const T* __restrict__ bias,
-                                     const T* __restrict__ running_mean,
-                                     const T* __restrict__ running_var, int batch_size, int seq_len,
-                                     int channels, float eps) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = batch_size * seq_len * channels;
+template <typename T, int VecSize, typename ActFn>
+__global__ void layerNormActKernel(const T* __restrict__ input, T* __restrict__ output,
+                                   const T* __restrict__ weight, const T* __restrict__ bias,
+                                   int hidden_size, float eps) {
+    using VecT = Vec<T, VecSize>;
+    ActFn act;
 
-    if (idx >= total_elements)
-        return;
+    const int row_idx = blockIdx.x;
+    const T* row_input = input + row_idx * hidden_size;
+    T* row_output = output + row_idx * hidden_size;
 
-    int c = idx % channels;
+    const int vec_hidden_size = hidden_size / VecSize;
 
-    float x = static_cast<float>(input[idx]);
-    float mean = static_cast<float>(running_mean[c]);
-    float var = static_cast<float>(running_var[c]);
-    float w = static_cast<float>(weight[c]);
-    float b = static_cast<float>(bias[c]);
+    __shared__ float smem[2];
 
-    // BatchNorm
-    float inv_std = rsqrtf(var + eps);
-    float normalized = (x - mean) * inv_std * w + b;
+    // Phase 1: Compute mean
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v;
+        v.load(row_input + i * VecSize);
+        local_sum += vecSum(v);
+    }
 
-    // Swish
-    float result = normalized / (1.0f + expf(-normalized));
+    float mean = broadcastFromThread0(
+        blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
 
-    output[idx] = static_cast<T>(result);
+    // Phase 2: Compute variance
+    float local_var = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v;
+        v.load(row_input + i * VecSize);
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            float diff = static_cast<float>(v[j]) - mean;
+            local_var += diff * diff;
+        }
+    }
+
+    float inv_std = rsqrtf(
+        broadcastFromThread0(
+            blockReduceSum(local_var) / static_cast<float>(hidden_size), &smem[1])
+        + eps);
+
+    // Phase 3: Normalize, scale, and apply activation
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_weight;
+        v_in.load(row_input + i * VecSize);
+        v_weight.load(weight + i * VecSize);
+
+        Vec<float, VecSize> vals;
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            float normalized = (static_cast<float>(v_in[j]) - mean) * inv_std;
+            vals[j] = normalized * static_cast<float>(v_weight[j]);
+        }
+
+        if (bias != nullptr) {
+            VecT v_bias;
+            v_bias.load(bias + i * VecSize);
+#pragma unroll
+            for (int j = 0; j < VecSize; j++) {
+                vals[j] += static_cast<float>(v_bias[j]);
+            }
+        }
+
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            vals[j] = act(vals[j]);
+        }
+
+        vecCast<T>(vals).store(row_output + i * VecSize);
+    }
 }
 
 // =============================================================================
-// Dispatcher functions
+// Fused RMSNorm + Activation Kernel
+// =============================================================================
+
+template <typename T, int VecSize, typename ActFn>
+__global__ void rmsNormActKernel(const T* __restrict__ input, T* __restrict__ output,
+                                 const T* __restrict__ weight, const T* __restrict__ bias,
+                                 int hidden_size, float eps) {
+    using VecT = Vec<T, VecSize>;
+    ActFn act;
+
+    const int row_idx = blockIdx.x;
+    const T* row_input = input + row_idx * hidden_size;
+    T* row_output = output + row_idx * hidden_size;
+
+    const int vec_hidden_size = hidden_size / VecSize;
+
+    __shared__ float smem;
+
+    // Phase 1: Compute mean of squares
+    float local_sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v;
+        v.load(row_input + i * VecSize);
+        local_sum_sq += vecSumSquares(v);
+    }
+
+    float inv_rms = rsqrtf(
+        broadcastFromThread0(
+            blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size), &smem)
+        + eps);
+
+    // Phase 2: Normalize, scale, and apply activation
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_weight;
+        v_in.load(row_input + i * VecSize);
+        v_weight.load(weight + i * VecSize);
+
+        Vec<float, VecSize> vals;
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            vals[j] = static_cast<float>(v_in[j]) * inv_rms * static_cast<float>(v_weight[j]);
+        }
+
+        if (bias != nullptr) {
+            VecT v_bias;
+            v_bias.load(bias + i * VecSize);
+#pragma unroll
+            for (int j = 0; j < VecSize; j++) {
+                vals[j] += static_cast<float>(v_bias[j]);
+            }
+        }
+
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            vals[j] = act(vals[j]);
+        }
+
+        vecCast<T>(vals).store(row_output + i * VecSize);
+    }
+}
+
+// =============================================================================
+// Fused BatchNorm + Activation Kernel (vectorized)
+// =============================================================================
+
+template <typename T, int VecSize, typename ActFn>
+__global__ void batchNormActKernel(const T* __restrict__ input, T* __restrict__ output,
+                                   const T* __restrict__ weight, const T* __restrict__ bias,
+                                   const T* __restrict__ running_mean,
+                                   const T* __restrict__ running_var, int batch_size, int seq_len,
+                                   int channels, float eps) {
+    using VecT = Vec<T, VecSize>;
+    ActFn act;
+
+    int total_elements = batch_size * seq_len * channels;
+
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements / VecSize;
+         idx += blockDim.x * gridDim.x) {
+        int flat_idx = idx * VecSize;
+        int c_start = flat_idx % channels;
+
+        if (c_start + VecSize <= channels && c_start % VecSize == 0) {
+            VecT v_in, v_weight, v_bias, v_mean, v_var;
+            v_in.load(input + flat_idx);
+            v_weight.load(weight + c_start);
+            v_bias.load(bias + c_start);
+            v_mean.load(running_mean + c_start);
+            v_var.load(running_var + c_start);
+
+            Vec<float, VecSize> vals;
+#pragma unroll
+            for (int j = 0; j < VecSize; j++) {
+                float inv_std = rsqrtf(static_cast<float>(v_var[j]) + eps);
+                float x = static_cast<float>(v_in[j]);
+                float bn_out = (x - static_cast<float>(v_mean[j])) * inv_std
+                               * static_cast<float>(v_weight[j]) + static_cast<float>(v_bias[j]);
+                vals[j] = act(bn_out);
+            }
+
+            vecCast<T>(vals).store(output + flat_idx);
+        } else {
+            // Fall back to scalar for unaligned accesses
+            for (int j = 0; j < VecSize && flat_idx + j < total_elements; j++) {
+                int c = (flat_idx + j) % channels;
+                float inv_std = rsqrtf(static_cast<float>(running_var[c]) + eps);
+                float x = static_cast<float>(input[flat_idx + j]);
+                float bn_out = (x - static_cast<float>(running_mean[c])) * inv_std
+                               * static_cast<float>(weight[c]) + static_cast<float>(bias[c]);
+                output[flat_idx + j] = static_cast<T>(act(bn_out));
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Typed Dispatcher Functions
 // =============================================================================
 
 template <typename T>
@@ -562,25 +752,15 @@ void invokeLayerNormTyped(const torch::Tensor& input, torch::Tensor& output,
     const T* weight_ptr = static_cast<const T*>(weight.data_ptr());
     const T* bias_ptr = bias.defined() ? static_cast<const T*>(bias.data_ptr()) : nullptr;
 
-    // Choose block size based on hidden_size
-    int block_size = std::min(hidden_size, MAX_THREADS_PER_BLOCK);
-    block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-
-    // Use vectorized kernel if hidden_size is large enough and alignment is good
-    // Vectorization requires hidden_size >= VecSize and pointer alignment
-    bool use_vec = (hidden_size >= VecSize) &&
-                   (reinterpret_cast<uintptr_t>(input_ptr) % (sizeof(T) * VecSize) == 0) &&
-                   (reinterpret_cast<uintptr_t>(output_ptr) % (sizeof(T) * VecSize) == 0);
+    bool use_vec = (hidden_size >= VecSize) && isAligned<T, VecSize>(input_ptr)
+                   && isAligned<T, VecSize>(output_ptr);
 
     if (use_vec) {
-        // Adjust block size for vectorized kernel (fewer iterations needed)
-        int vec_hidden = hidden_size / VecSize;
-        block_size = std::min(vec_hidden, MAX_THREADS_PER_BLOCK);
-        block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
-
+        int block_size = alignedBlockSize(hidden_size / VecSize);
         layerNormKernel<T, VecSize><<<num_rows, block_size, 0, stream>>>(
             input_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
     } else {
+        int block_size = alignedBlockSize(hidden_size);
         layerNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
             input_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
     }
@@ -602,66 +782,18 @@ void invokeRMSNormTyped(const torch::Tensor& input, torch::Tensor& output,
     const T* weight_ptr = static_cast<const T*>(weight.data_ptr());
     const T* bias_ptr = bias.defined() ? static_cast<const T*>(bias.data_ptr()) : nullptr;
 
-    int block_size = std::min(hidden_size, MAX_THREADS_PER_BLOCK);
-    block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-
-    bool use_vec = (hidden_size >= VecSize) &&
-                   (reinterpret_cast<uintptr_t>(input_ptr) % (sizeof(T) * VecSize) == 0) &&
-                   (reinterpret_cast<uintptr_t>(output_ptr) % (sizeof(T) * VecSize) == 0);
+    bool use_vec = (hidden_size >= VecSize) && isAligned<T, VecSize>(input_ptr)
+                   && isAligned<T, VecSize>(output_ptr);
 
     if (use_vec) {
-        int vec_hidden = hidden_size / VecSize;
-        block_size = std::min(vec_hidden, MAX_THREADS_PER_BLOCK);
-        block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
-
+        int block_size = alignedBlockSize(hidden_size / VecSize);
         rmsNormKernel<T, VecSize><<<num_rows, block_size, 0, stream>>>(
             input_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
     } else {
+        int block_size = alignedBlockSize(hidden_size);
         rmsNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(input_ptr, output_ptr, weight_ptr,
-                                                                 bias_ptr, hidden_size, eps);
+                                                                   bias_ptr, hidden_size, eps);
     }
-}
-
-// =============================================================================
-// Public API implementations
-// =============================================================================
-
-torch::Tensor invokeLayerNorm(const torch::Tensor& input, const torch::Tensor& weight,
-                              const torch::Tensor& bias, float eps, cudaStream_t stream) {
-    auto output = torch::empty_like(input);
-    switch (input.scalar_type()) {
-        case torch::kFloat32:
-            invokeLayerNormTyped<float>(input, output, weight, bias, eps, stream);
-            break;
-        case torch::kHalf:
-            invokeLayerNormTyped<half>(input, output, weight, bias, eps, stream);
-            break;
-        case torch::kBFloat16:
-            invokeLayerNormTyped<__nv_bfloat16>(input, output, weight, bias, eps, stream);
-            break;
-        default:
-            throw std::runtime_error("Unsupported data type for LayerNorm");
-    }
-    return output;
-}
-
-torch::Tensor invokeRMSNorm(const torch::Tensor& input, const torch::Tensor& weight,
-                            const torch::Tensor& bias, float eps, cudaStream_t stream) {
-    auto output = torch::empty_like(input);
-    switch (input.scalar_type()) {
-        case torch::kFloat32:
-            invokeRMSNormTyped<float>(input, output, weight, bias, eps, stream);
-            break;
-        case torch::kHalf:
-            invokeRMSNormTyped<half>(input, output, weight, bias, eps, stream);
-            break;
-        case torch::kBFloat16:
-            invokeRMSNormTyped<__nv_bfloat16>(input, output, weight, bias, eps, stream);
-            break;
-        default:
-            throw std::runtime_error("Unsupported data type for RMSNorm");
-    }
-    return output;
 }
 
 template <typename T>
@@ -684,49 +816,20 @@ void invokeBatchNorm1DTyped(const torch::Tensor& input, torch::Tensor& output,
     const T* running_mean_ptr = static_cast<const T*>(running_mean.data_ptr());
     const T* running_var_ptr = static_cast<const T*>(running_var.data_ptr());
 
-    // Check if we can use vectorized kernel
-    bool use_vec = (channels >= VecSize) && (channels % VecSize == 0) &&
-                   (reinterpret_cast<uintptr_t>(input_ptr) % (sizeof(T) * VecSize) == 0) &&
-                   (reinterpret_cast<uintptr_t>(output_ptr) % (sizeof(T) * VecSize) == 0);
+    bool use_vec = (channels >= VecSize) && (channels % VecSize == 0)
+                   && isAligned<T, VecSize>(input_ptr) && isAligned<T, VecSize>(output_ptr);
 
     if (use_vec) {
-        int vec_total = total_elements / VecSize;
-        int grid_size = (vec_total + block_size - 1) / block_size;
-
+        int grid_size = (total_elements / VecSize + block_size - 1) / block_size;
         batchNorm1DKernel<T, VecSize><<<grid_size, block_size, 0, stream>>>(
             input_ptr, output_ptr, weight_ptr, bias_ptr, running_mean_ptr, running_var_ptr,
             batch_size, seq_len, channels, eps);
     } else {
-        int vec_total = total_elements;
-        int grid_size = (vec_total + block_size - 1) / block_size;
-
+        int grid_size = (total_elements + block_size - 1) / block_size;
         batchNorm1DKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
             input_ptr, output_ptr, weight_ptr, bias_ptr, running_mean_ptr, running_var_ptr,
             batch_size, seq_len, channels, eps);
     }
-}
-
-torch::Tensor invokeBatchNorm1D(const torch::Tensor& input, const torch::Tensor& weight,
-                                const torch::Tensor& bias, const torch::Tensor& running_mean,
-                                const torch::Tensor& running_var, float eps, cudaStream_t stream) {
-    auto output = torch::empty_like(input);
-    switch (input.scalar_type()) {
-        case torch::kFloat32:
-            invokeBatchNorm1DTyped<float>(input, output, weight, bias, running_mean, running_var,
-                                          eps, stream);
-            break;
-        case torch::kHalf:
-            invokeBatchNorm1DTyped<half>(input, output, weight, bias, running_mean, running_var,
-                                         eps, stream);
-            break;
-        case torch::kBFloat16:
-            invokeBatchNorm1DTyped<__nv_bfloat16>(input, output, weight, bias, running_mean,
-                                                  running_var, eps, stream);
-            break;
-        default:
-            throw std::runtime_error("Unsupported data type for BatchNorm1D");
-    }
-    return output;
 }
 
 template <typename T>
@@ -746,16 +849,13 @@ void invokeGroupNormTyped(const torch::Tensor& input, torch::Tensor& output,
     const T* bias_ptr = static_cast<const T*>(bias.data_ptr());
 
     int num_blocks = batch_size * seq_len;
-    int block_size = std::min(channels, MAX_THREADS_PER_BLOCK);
-    block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
+    int block_size = alignedBlockSize(channels);
     int num_warps = block_size / WARP_SIZE;
     size_t smem_bytes = sizeof(float) * (2 * num_groups + 2 * num_warps);
 
-    bool use_vec = (channels_per_group >= VecSize) &&
-                   (reinterpret_cast<uintptr_t>(input_ptr) % (sizeof(T) * VecSize) == 0) &&
-                   (reinterpret_cast<uintptr_t>(output_ptr) % (sizeof(T) * VecSize) == 0) &&
-                   (reinterpret_cast<uintptr_t>(weight_ptr) % (sizeof(T) * VecSize) == 0) &&
-                   (reinterpret_cast<uintptr_t>(bias_ptr) % (sizeof(T) * VecSize) == 0);
+    bool use_vec = (channels_per_group >= VecSize) && isAligned<T, VecSize>(input_ptr)
+                   && isAligned<T, VecSize>(output_ptr) && isAligned<T, VecSize>(weight_ptr)
+                   && isAligned<T, VecSize>(bias_ptr);
 
     if (use_vec) {
         groupNormKernel<T, VecSize><<<num_blocks, block_size, smem_bytes, stream>>>(
@@ -766,27 +866,6 @@ void invokeGroupNormTyped(const torch::Tensor& input, torch::Tensor& output,
             input_ptr, output_ptr, weight_ptr, bias_ptr, batch_size, seq_len, channels, num_groups,
             eps);
     }
-}
-
-torch::Tensor invokeGroupNorm(const torch::Tensor& input, const torch::Tensor& weight,
-                              const torch::Tensor& bias, int num_groups, float eps,
-                              cudaStream_t stream) {
-    auto output = torch::empty_like(input);
-    switch (input.scalar_type()) {
-        case torch::kFloat32:
-            invokeGroupNormTyped<float>(input, output, weight, bias, num_groups, eps, stream);
-            break;
-        case torch::kHalf:
-            invokeGroupNormTyped<half>(input, output, weight, bias, num_groups, eps, stream);
-            break;
-        case torch::kBFloat16:
-            invokeGroupNormTyped<__nv_bfloat16>(input, output, weight, bias, num_groups, eps,
-                                                stream);
-            break;
-        default:
-            throw std::runtime_error("Unsupported data type for GroupNorm");
-    }
-    return output;
 }
 
 template <typename T>
@@ -806,46 +885,212 @@ void invokeAddLayerNormTyped(const torch::Tensor& input, const torch::Tensor& re
     const T* weight_ptr = static_cast<const T*>(weight.data_ptr());
     const T* bias_ptr = bias.defined() ? static_cast<const T*>(bias.data_ptr()) : nullptr;
 
-    int block_size = std::min(hidden_size, MAX_THREADS_PER_BLOCK);
-    block_size = ((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-
-    // Check if we can use vectorized kernel
-    bool use_vec = (hidden_size >= VecSize) &&
-                   (reinterpret_cast<uintptr_t>(input_ptr) % (sizeof(T) * VecSize) == 0) &&
-                   (reinterpret_cast<uintptr_t>(residual_ptr) % (sizeof(T) * VecSize) == 0) &&
-                   (reinterpret_cast<uintptr_t>(output_ptr) % (sizeof(T) * VecSize) == 0);
+    bool use_vec = (hidden_size >= VecSize) && isAligned<T, VecSize>(input_ptr)
+                   && isAligned<T, VecSize>(residual_ptr) && isAligned<T, VecSize>(output_ptr);
 
     if (use_vec) {
-        int vec_hidden = hidden_size / VecSize;
-        block_size = std::min(vec_hidden, MAX_THREADS_PER_BLOCK);
-        block_size = std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
-
+        int block_size = alignedBlockSize(hidden_size / VecSize);
         addLayerNormKernel<T, VecSize><<<num_rows, block_size, 0, stream>>>(
             input_ptr, residual_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
     } else {
+        int block_size = alignedBlockSize(hidden_size);
         addLayerNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
             input_ptr, residual_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
     }
+}
+
+template <typename T, typename ActFn>
+void invokeLayerNormActTyped(const torch::Tensor& input, torch::Tensor& output,
+                             const torch::Tensor& weight, const torch::Tensor& bias, float eps,
+                             ActFn, cudaStream_t stream) {
+    int batch_size = input.size(0);
+    int seq_len = input.size(1);
+    int hidden_size = input.size(2);
+    int num_rows = batch_size * seq_len;
+
+    constexpr int VecSize = VecTypeTrait<T>::VecSize;
+
+    const T* input_ptr = static_cast<const T*>(input.data_ptr());
+    T* output_ptr = static_cast<T*>(output.data_ptr());
+    const T* weight_ptr = static_cast<const T*>(weight.data_ptr());
+    const T* bias_ptr = bias.defined() ? static_cast<const T*>(bias.data_ptr()) : nullptr;
+
+    bool use_vec = (hidden_size >= VecSize) && isAligned<T, VecSize>(input_ptr)
+                   && isAligned<T, VecSize>(output_ptr);
+
+    if (use_vec) {
+        int block_size = alignedBlockSize(hidden_size / VecSize);
+        layerNormActKernel<T, VecSize, ActFn><<<num_rows, block_size, 0, stream>>>(
+            input_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
+    } else {
+        int block_size = alignedBlockSize(hidden_size);
+        layerNormActKernel<T, 1, ActFn><<<num_rows, block_size, 0, stream>>>(
+            input_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
+    }
+}
+
+template <typename T, typename ActFn>
+void invokeRMSNormActTyped(const torch::Tensor& input, torch::Tensor& output,
+                           const torch::Tensor& weight, const torch::Tensor& bias, float eps,
+                           ActFn, cudaStream_t stream) {
+    int batch_size = input.size(0);
+    int seq_len = input.size(1);
+    int hidden_size = input.size(2);
+    int num_rows = batch_size * seq_len;
+
+    constexpr int VecSize = VecTypeTrait<T>::VecSize;
+
+    const T* input_ptr = static_cast<const T*>(input.data_ptr());
+    T* output_ptr = static_cast<T*>(output.data_ptr());
+    const T* weight_ptr = static_cast<const T*>(weight.data_ptr());
+    const T* bias_ptr = bias.defined() ? static_cast<const T*>(bias.data_ptr()) : nullptr;
+
+    bool use_vec = (hidden_size >= VecSize) && isAligned<T, VecSize>(input_ptr)
+                   && isAligned<T, VecSize>(output_ptr);
+
+    if (use_vec) {
+        int block_size = alignedBlockSize(hidden_size / VecSize);
+        rmsNormActKernel<T, VecSize, ActFn><<<num_rows, block_size, 0, stream>>>(
+            input_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
+    } else {
+        int block_size = alignedBlockSize(hidden_size);
+        rmsNormActKernel<T, 1, ActFn><<<num_rows, block_size, 0, stream>>>(
+            input_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
+    }
+}
+
+template <typename T, typename ActFn>
+void invokeBatchNormActTyped(const torch::Tensor& input, torch::Tensor& output,
+                             const torch::Tensor& weight, const torch::Tensor& bias,
+                             const torch::Tensor& running_mean, const torch::Tensor& running_var,
+                             float eps, ActFn, cudaStream_t stream) {
+    int batch_size = input.size(0);
+    int seq_len = input.size(1);
+    int channels = input.size(2);
+    int total_elements = batch_size * seq_len * channels;
+    int block_size = 256;
+
+    constexpr int VecSize = VecTypeTrait<T>::VecSize;
+
+    const T* input_ptr = static_cast<const T*>(input.data_ptr());
+    T* output_ptr = static_cast<T*>(output.data_ptr());
+    const T* weight_ptr = static_cast<const T*>(weight.data_ptr());
+    const T* bias_ptr = static_cast<const T*>(bias.data_ptr());
+    const T* running_mean_ptr = static_cast<const T*>(running_mean.data_ptr());
+    const T* running_var_ptr = static_cast<const T*>(running_var.data_ptr());
+
+    bool use_vec = (channels >= VecSize) && (channels % VecSize == 0)
+                   && isAligned<T, VecSize>(input_ptr) && isAligned<T, VecSize>(output_ptr);
+
+    if (use_vec) {
+        int grid_size = (total_elements / VecSize + block_size - 1) / block_size;
+        batchNormActKernel<T, VecSize, ActFn><<<grid_size, block_size, 0, stream>>>(
+            input_ptr, output_ptr, weight_ptr, bias_ptr, running_mean_ptr, running_var_ptr,
+            batch_size, seq_len, channels, eps);
+    } else {
+        int grid_size = (total_elements + block_size - 1) / block_size;
+        batchNormActKernel<T, 1, ActFn><<<grid_size, block_size, 0, stream>>>(
+            input_ptr, output_ptr, weight_ptr, bias_ptr, running_mean_ptr, running_var_ptr,
+            batch_size, seq_len, channels, eps);
+    }
+}
+
+// =============================================================================
+// Public API implementations
+// =============================================================================
+
+torch::Tensor invokeLayerNorm(const torch::Tensor& input, const torch::Tensor& weight,
+                              const torch::Tensor& bias, float eps, cudaStream_t stream) {
+    auto output = torch::empty_like(input);
+    dispatchFloatTypes(input.scalar_type(), "LayerNorm", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        invokeLayerNormTyped<T>(input, output, weight, bias, eps, stream);
+    });
+    return output;
+}
+
+torch::Tensor invokeRMSNorm(const torch::Tensor& input, const torch::Tensor& weight,
+                            const torch::Tensor& bias, float eps, cudaStream_t stream) {
+    auto output = torch::empty_like(input);
+    dispatchFloatTypes(input.scalar_type(), "RMSNorm", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        invokeRMSNormTyped<T>(input, output, weight, bias, eps, stream);
+    });
+    return output;
+}
+
+torch::Tensor invokeBatchNorm1D(const torch::Tensor& input, const torch::Tensor& weight,
+                                const torch::Tensor& bias, const torch::Tensor& running_mean,
+                                const torch::Tensor& running_var, float eps, cudaStream_t stream) {
+    auto output = torch::empty_like(input);
+    dispatchFloatTypes(input.scalar_type(), "BatchNorm1D", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        invokeBatchNorm1DTyped<T>(input, output, weight, bias, running_mean, running_var, eps,
+                                  stream);
+    });
+    return output;
+}
+
+torch::Tensor invokeGroupNorm(const torch::Tensor& input, const torch::Tensor& weight,
+                              const torch::Tensor& bias, int num_groups, float eps,
+                              cudaStream_t stream) {
+    auto output = torch::empty_like(input);
+    dispatchFloatTypes(input.scalar_type(), "GroupNorm", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        invokeGroupNormTyped<T>(input, output, weight, bias, num_groups, eps, stream);
+    });
+    return output;
 }
 
 torch::Tensor invokeAddLayerNorm(const torch::Tensor& input, const torch::Tensor& residual,
                                  const torch::Tensor& weight, const torch::Tensor& bias, float eps,
                                  cudaStream_t stream) {
     auto output = torch::empty_like(input);
-    switch (input.scalar_type()) {
-        case torch::kFloat32:
-            invokeAddLayerNormTyped<float>(input, residual, output, weight, bias, eps, stream);
-            break;
-        case torch::kHalf:
-            invokeAddLayerNormTyped<half>(input, residual, output, weight, bias, eps, stream);
-            break;
-        case torch::kBFloat16:
-            invokeAddLayerNormTyped<__nv_bfloat16>(input, residual, output, weight, bias, eps,
-                                                   stream);
-            break;
-        default:
-            throw std::runtime_error("Unsupported data type for AddLayerNorm");
-    }
+    dispatchFloatTypes(input.scalar_type(), "AddLayerNorm", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        invokeAddLayerNormTyped<T>(input, residual, output, weight, bias, eps, stream);
+    });
+    return output;
+}
+
+torch::Tensor invokeLayerNormActivation(const torch::Tensor& input, const torch::Tensor& weight,
+                                        const torch::Tensor& bias, float eps,
+                                        ActivationType activation, cudaStream_t stream) {
+    auto output = torch::empty_like(input);
+    dispatchFloatTypes(input.scalar_type(), "LayerNormActivation", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        dispatchActivation(activation, [&](auto act) {
+            invokeLayerNormActTyped<T>(input, output, weight, bias, eps, act, stream);
+        });
+    });
+    return output;
+}
+
+torch::Tensor invokeRMSNormActivation(const torch::Tensor& input, const torch::Tensor& weight,
+                                       const torch::Tensor& bias, float eps,
+                                       ActivationType activation, cudaStream_t stream) {
+    auto output = torch::empty_like(input);
+    dispatchFloatTypes(input.scalar_type(), "RMSNormActivation", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        dispatchActivation(activation, [&](auto act) {
+            invokeRMSNormActTyped<T>(input, output, weight, bias, eps, act, stream);
+        });
+    });
+    return output;
+}
+
+torch::Tensor invokeBatchNormActivation(const torch::Tensor& input, const torch::Tensor& weight,
+                                         const torch::Tensor& bias, const torch::Tensor& running_mean,
+                                         const torch::Tensor& running_var, float eps,
+                                         ActivationType activation, cudaStream_t stream) {
+    auto output = torch::empty_like(input);
+    dispatchFloatTypes(input.scalar_type(), "BatchNormActivation", [&](auto tag) {
+        using T = typename decltype(tag)::type;
+        dispatchActivation(activation, [&](auto act) {
+            invokeBatchNormActTyped<T>(input, output, weight, bias, running_mean, running_var, eps,
+                                       act, stream);
+        });
+    });
     return output;
 }
 
@@ -853,54 +1098,8 @@ torch::Tensor invokeBatchNormSwish(const torch::Tensor& input, const torch::Tens
                                    const torch::Tensor& bias, const torch::Tensor& running_mean,
                                    const torch::Tensor& running_var, float eps,
                                    cudaStream_t stream) {
-    const int batch_size = input.size(0);
-    const int seq_len = input.size(1);
-    const int channels = input.size(2);
-
-    auto output = torch::empty_like(input);
-
-    const void* input_ptr = input.data_ptr();
-    void* output_ptr = output.data_ptr();
-    const void* weight_ptr = weight.data_ptr();
-    const void* bias_ptr = bias.data_ptr();
-    const void* running_mean_ptr = running_mean.data_ptr();
-    const void* running_var_ptr = running_var.data_ptr();
-
-    int total_elements = batch_size * seq_len * channels;
-    int block_size = 256;
-    int grid_size = (total_elements + block_size - 1) / block_size;
-
-    switch (input.scalar_type()) {
-        case torch::ScalarType::Float:
-            batchNormSwishKernel<float><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const float*>(input_ptr), static_cast<float*>(output_ptr),
-                static_cast<const float*>(weight_ptr), static_cast<const float*>(bias_ptr),
-                static_cast<const float*>(running_mean_ptr),
-                static_cast<const float*>(running_var_ptr), batch_size, seq_len, channels, eps);
-            break;
-        case torch::ScalarType::Half:
-            batchNormSwishKernel<half><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const half*>(input_ptr), static_cast<half*>(output_ptr),
-                static_cast<const half*>(weight_ptr), static_cast<const half*>(bias_ptr),
-                static_cast<const half*>(running_mean_ptr),
-                static_cast<const half*>(running_var_ptr), batch_size, seq_len, channels, eps);
-            break;
-        case torch::ScalarType::BFloat16:
-            batchNormSwishKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(input_ptr),
-                static_cast<__nv_bfloat16*>(output_ptr),
-                static_cast<const __nv_bfloat16*>(weight_ptr),
-                static_cast<const __nv_bfloat16*>(bias_ptr),
-                static_cast<const __nv_bfloat16*>(running_mean_ptr),
-                static_cast<const __nv_bfloat16*>(running_var_ptr), batch_size, seq_len, channels,
-                eps);
-            break;
-        default:
-            throw std::runtime_error("Unsupported data type for BatchNormSwish");
-            break;
-    }
-
-    return output;
+    return invokeBatchNormActivation(input, weight, bias, running_mean, running_var, eps,
+                                     ActivationType::SWISH, stream);
 }
 
 // Explicit template instantiations

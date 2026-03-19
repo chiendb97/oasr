@@ -14,9 +14,9 @@ from torch import nn
 
 from oasr.layers.linear import Linear, LinearActivation
 from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d, Conv2dActivation
-from oasr.layers.norm import LayerNorm, RMSNorm
+from oasr.layers.norm import LayerNorm
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention, T_CACHE
-from oasr.utils import get_activation, get_norm
+from oasr.utils import get_norm, get_norm_activation
 from .config import ConformerEncoderConfig, ConformerModelConfig
 
 
@@ -149,13 +149,30 @@ class ConvolutionModule(nn.Module):
 
         assert norm in ("batch_norm", "layer_norm", "rms_norm")
 
-        self.norm = get_norm(norm)(inner_channels, eps=norm_eps)
-
-        self.use_layer_norm = norm != "batch_norm"
+        self.norm_activation = get_norm_activation(norm)(
+            inner_channels, eps=norm_eps, activation=activation_type)
 
         self.pointwise_conv2 = PointwiseConv1d(
             inner_channels, channels, bias=bias)
-        self.activation = get_activation(activation_type)
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        # Remap old "norm.*" keys to "norm_activation.*"
+        old_prefix = prefix + "norm."
+        new_prefix = prefix + "norm_activation."
+        keys_to_remap = [k for k in state_dict if k.startswith(old_prefix)]
+        for old_key in keys_to_remap:
+            state_dict[new_prefix + old_key[len(old_prefix):]] = state_dict.pop(old_key)
+        # Drop parameterless activation module keys (e.g. from nn.SiLU)
+        act_prefix = prefix + "activation."
+        for k in [k for k in state_dict if k.startswith(act_prefix)]:
+            state_dict.pop(k)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
 
     def forward(
         self,
@@ -185,13 +202,7 @@ class ConvolutionModule(nn.Module):
         x = self.pointwise_conv1(x)
         x = nn.functional.glu(x, dim=-1)
         x = self.depthwise_conv(x)
-        if self.use_layer_norm:
-            x = self.activation(self.norm(x))
-        else:
-            # BatchNorm1d requires [B, C, T]
-            x = x.transpose(1, 2)
-            x = self.activation(self.norm(x))
-            x = x.transpose(1, 2)
+        x = self.norm_activation(x)
         x = self.pointwise_conv2(x)
         if mask_pad.size(2) > 0:
             x = x.masked_fill(~mask_btc, 0.0)

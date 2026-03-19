@@ -152,6 +152,61 @@ def setup_batch_norm(batch_size, seq_len, channels, dtype=torch.float32):
     return oasr_fn, pytorch_fn
 
 
+def setup_layer_norm_activation(batch_size, seq_len, hidden_size, activation_name="swish", dtype=torch.float16):
+    """Setup tensors for fused LayerNorm + Activation."""
+    eps = 1e-5
+    x = torch.randn(batch_size, seq_len, hidden_size,
+                    device='cuda', dtype=dtype)
+    gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
+    beta = torch.randn(hidden_size, device='cuda', dtype=dtype)
+
+    from oasr.utils.mappings import get_activation_type, get_activation
+    act_type = get_activation_type(activation_name)
+    torch_act = get_activation(activation_name).cuda()
+
+    def oasr_fn():
+        return oasr.kernels.norm.layer_norm_activation(
+            x, gamma, beta, eps, act_type
+        )
+
+    layer_norm = torch.nn.LayerNorm(
+        hidden_size, eps=eps, device='cuda', dtype=dtype)
+    layer_norm.weight.data = gamma.clone()
+    layer_norm.bias.data = beta.clone()
+
+    def pytorch_fn():
+        return torch_act(layer_norm(x))
+
+    return oasr_fn, pytorch_fn
+
+
+def setup_batch_norm_activation(batch_size, seq_len, channels, activation_name="swish", dtype=torch.float16):
+    """Setup tensors for fused BatchNorm + Activation."""
+    eps = 1e-5
+    x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
+    gamma = torch.randn(channels, device='cuda', dtype=dtype)
+    beta = torch.randn(channels, device='cuda', dtype=dtype)
+    running_mean = torch.randn(channels, device='cuda', dtype=dtype)
+    running_var = torch.abs(torch.randn(
+        channels, device='cuda', dtype=dtype)) + 0.1
+
+    from oasr.utils.mappings import get_activation_type, get_activation
+    act_type = get_activation_type(activation_name)
+    torch_act = get_activation(activation_name).cuda()
+
+    def oasr_fn():
+        return oasr.kernels.norm.batch_norm_activation(
+            x, gamma, beta, running_mean, running_var, eps, act_type
+        )
+
+    def pytorch_fn():
+        bn_out = (x - running_mean) / \
+            torch.sqrt(running_var + eps) * gamma + beta
+        return torch_act(bn_out)
+
+    return oasr_fn, pytorch_fn
+
+
 def setup_batch_norm_swish(batch_size, seq_len, channels, dtype=torch.float16):
     """Setup tensors for fused BatchNorm + Swish."""
     eps = 1e-5
@@ -194,7 +249,7 @@ def benchmark_layer_norm():
     ]
 
     print("\n" + "=" * 70)
-    print("LayerNorm Benchmark (Conformer encoder workload)")
+    print("LayerNorm Benchmark")
     print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
@@ -280,7 +335,7 @@ def benchmark_group_norm():
     ]
 
     print("\n" + "=" * 70)
-    print("GroupNorm Benchmark (Conformer workload)")
+    print("GroupNorm Benchmark")
     print("=" * 70)
     print(f"\n{'Shape':<35} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 75)
@@ -309,7 +364,7 @@ def benchmark_batch_norm():
     ]
 
     print("\n" + "=" * 70)
-    print("BatchNorm1D (Inference) Benchmark (Conformer workload)")
+    print("BatchNorm1D (Inference) Benchmark")
     print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
@@ -323,6 +378,72 @@ def benchmark_batch_norm():
         speedup = pytorch_ms / oasr_ms
         shape_str = f"[{batch_size}, {seq_len}, {channels}]"
         print(f"{shape_str:<30} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
+
+
+def benchmark_layer_norm_activation():
+    """Benchmark fused LayerNorm + Activation: OASR fused vs PyTorch separate."""
+    import triton
+
+    configs = [
+        (64, 250, 256),
+        (64, 250, 512),
+        (64, 500, 512),
+    ]
+    activations = ["relu", "gelu", "swish"]
+
+    print("\n" + "=" * 80)
+    print("LayerNorm + Activation (Fused) Benchmark")
+    print("=" * 80)
+    print(
+        f"\n{'Shape':<25} {'Act':<8} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
+    print("-" * 80)
+
+    for batch_size, seq_len, hidden_size in configs:
+        for act_name in activations:
+            oasr_fn, pytorch_fn = setup_layer_norm_activation(
+                batch_size, seq_len, hidden_size, act_name)
+
+            oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
+            pytorch_ms = triton.testing.do_bench(
+                pytorch_fn, warmup=100, rep=500)
+
+            speedup = pytorch_ms / oasr_ms
+            shape_str = f"[{batch_size}, {seq_len}, {hidden_size}]"
+            print(
+                f"{shape_str:<25} {act_name:<8} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
+
+
+def benchmark_batch_norm_activation():
+    """Benchmark fused BatchNorm + Activation: OASR fused vs PyTorch separate."""
+    import triton
+
+    configs = [
+        (64, 250, 256),
+        (64, 250, 512),
+        (64, 500, 512),
+    ]
+    activations = ["relu", "gelu", "swish"]
+
+    print("\n" + "=" * 80)
+    print("BatchNorm + Activation (Fused) Benchmark")
+    print("=" * 80)
+    print(
+        f"\n{'Shape':<25} {'Act':<8} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
+    print("-" * 80)
+
+    for batch_size, seq_len, channels in configs:
+        for act_name in activations:
+            oasr_fn, pytorch_fn = setup_batch_norm_activation(
+                batch_size, seq_len, channels, act_name)
+
+            oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
+            pytorch_ms = triton.testing.do_bench(
+                pytorch_fn, warmup=100, rep=500)
+
+            speedup = pytorch_ms / oasr_ms
+            shape_str = f"[{batch_size}, {seq_len}, {channels}]"
+            print(
+                f"{shape_str:<25} {act_name:<8} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
 
 
 def benchmark_batch_norm_swish():
@@ -366,6 +487,8 @@ PROFILE_CONFIGS = {
     'group_norm': (64, 250, 512, 64),
     'batch_norm': (64, 250, 512),
     'batch_norm_swish': (64, 250, 512),
+    'layer_norm_activation': (64, 250, 512),
+    'batch_norm_activation': (64, 250, 512),
 }
 
 
@@ -384,6 +507,8 @@ def profile_kernels(kernels: list, target: str = 'both', warmup: int = 3, iters:
         'group_norm': lambda: setup_group_norm(*PROFILE_CONFIGS['group_norm']),
         'batch_norm': lambda: setup_batch_norm(*PROFILE_CONFIGS['batch_norm']),
         'batch_norm_swish': lambda: setup_batch_norm_swish(*PROFILE_CONFIGS['batch_norm_swish']),
+        'layer_norm_activation': lambda: setup_layer_norm_activation(*PROFILE_CONFIGS['layer_norm_activation']),
+        'batch_norm_activation': lambda: setup_batch_norm_activation(*PROFILE_CONFIGS['batch_norm_activation']),
     }
 
     for kernel_name in kernels:
@@ -434,7 +559,8 @@ Examples:
   python bench_norm_kernels.py --profile --kernel all
 
 Available kernels:
-  layer_norm, rms_norm, add_layer_norm, group_norm, batch_norm, batch_norm_swish
+  layer_norm, rms_norm, add_layer_norm, group_norm, batch_norm, batch_norm_swish,
+  layer_norm_activation, batch_norm_activation
         """
     )
 
@@ -469,6 +595,8 @@ Available kernels:
         benchmark_group_norm()
         benchmark_batch_norm()
         benchmark_batch_norm_swish()
+        benchmark_layer_norm_activation()
+        benchmark_batch_norm_activation()
         print("\n" + "=" * 70)
         print("Benchmarks complete!")
         print("=" * 70)

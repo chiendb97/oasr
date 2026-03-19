@@ -250,5 +250,137 @@ class TestBatchNormSwish:
         torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
 
 
+class TestLayerNormActivation:
+    """Tests for fused LayerNorm + Activation kernel."""
+
+    @pytest.mark.parametrize("batch_size,seq_len,hidden_size", [
+        (2, 128, 256),
+        (4, 256, 512),
+    ])
+    @pytest.mark.parametrize("activation,torch_act", [
+        (oasr.ActivationType.RELU, torch.nn.ReLU()),
+        (oasr.ActivationType.GELU, torch.nn.GELU(approximate="tanh")),
+        (oasr.ActivationType.SWISH, torch.nn.SiLU()),
+    ])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_layer_norm_activation(self, batch_size, seq_len, hidden_size, activation, torch_act, dtype):
+        """Test fused LayerNorm + Activation against separate PyTorch ops."""
+        eps = 1e-5
+
+        x = torch.randn(batch_size, seq_len, hidden_size,
+                        device='cuda', dtype=dtype)
+        weight = torch.randn(hidden_size, device='cuda', dtype=dtype)
+        bias = torch.randn(hidden_size, device='cuda', dtype=dtype)
+
+        output = oasr.kernels.norm.layer_norm_activation(
+            x, weight, bias, eps, activation
+        )
+        oasr.synchronize()
+
+        # Reference: LayerNorm then activation
+        layer_norm = torch.nn.LayerNorm(
+            hidden_size, eps=eps, device='cuda', dtype=dtype)
+        layer_norm.weight.data = weight.clone()
+        layer_norm.bias.data = bias.clone()
+        expected = torch_act(layer_norm(x))
+
+        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
+        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
+
+
+class TestRMSNormActivation:
+    """Tests for fused RMSNorm + Activation kernel."""
+
+    @pytest.mark.parametrize("batch_size,seq_len,hidden_size", [
+        (2, 128, 256),
+        (4, 256, 512),
+    ])
+    @pytest.mark.parametrize("activation,torch_act", [
+        (oasr.ActivationType.RELU, torch.nn.ReLU()),
+        (oasr.ActivationType.GELU, torch.nn.GELU(approximate="tanh")),
+        (oasr.ActivationType.SWISH, torch.nn.SiLU()),
+    ])
+    def test_rms_norm_activation(self, batch_size, seq_len, hidden_size, activation, torch_act):
+        """Test fused RMSNorm + Activation against separate PyTorch ops."""
+        eps = 1e-5
+        dtype = torch.float32
+
+        x = torch.randn(batch_size, seq_len, hidden_size,
+                        device='cuda', dtype=dtype)
+        weight = torch.randn(hidden_size, device='cuda', dtype=dtype)
+        bias = torch.randn(hidden_size, device='cuda', dtype=dtype)
+
+        output = oasr.kernels.norm.rms_norm_activation(
+            x, weight, bias, eps, activation
+        )
+        oasr.synchronize()
+
+        # Reference: RMSNorm then activation
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+        expected = torch_act(x / rms * weight + bias)
+
+        torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
+
+
+class TestBatchNormActivation:
+    """Tests for fused BatchNorm + Activation kernel."""
+
+    @pytest.mark.parametrize("batch_size,seq_len,channels", [
+        (2, 128, 256),
+        (4, 64, 512),
+    ])
+    @pytest.mark.parametrize("activation,torch_act", [
+        (oasr.ActivationType.RELU, torch.nn.ReLU()),
+        (oasr.ActivationType.GELU, torch.nn.GELU(approximate="tanh")),
+        (oasr.ActivationType.SWISH, torch.nn.SiLU()),
+    ])
+    def test_batch_norm_activation(self, batch_size, seq_len, channels, activation, torch_act):
+        """Test fused BatchNorm + Activation against separate PyTorch ops."""
+        eps = 1e-5
+        dtype = torch.float32
+
+        x = torch.randn(batch_size, seq_len, channels,
+                        device='cuda', dtype=dtype)
+        gamma = torch.randn(channels, device='cuda', dtype=dtype)
+        beta = torch.randn(channels, device='cuda', dtype=dtype)
+        running_mean = torch.randn(channels, device='cuda', dtype=dtype)
+        running_var = torch.abs(torch.randn(
+            channels, device='cuda', dtype=dtype)) + 0.1
+
+        output = oasr.kernels.norm.batch_norm_activation(
+            x, gamma, beta,
+            running_mean, running_var,
+            eps, activation
+        )
+        oasr.synchronize()
+
+        # Reference: BatchNorm then activation
+        bn_out = (x - running_mean) / \
+            torch.sqrt(running_var + eps) * gamma + beta
+        expected = torch_act(bn_out)
+
+        torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
+
+    def test_batch_norm_activation_matches_batch_norm_swish(self):
+        """Verify batch_norm_activation with SWISH matches legacy batch_norm_swish."""
+        batch_size, seq_len, channels = 2, 128, 256
+        eps = 1e-5
+        dtype = torch.float32
+
+        x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
+        gamma = torch.randn(channels, device='cuda', dtype=dtype)
+        beta = torch.randn(channels, device='cuda', dtype=dtype)
+        running_mean = torch.randn(channels, device='cuda', dtype=dtype)
+        running_var = torch.abs(torch.randn(channels, device='cuda', dtype=dtype)) + 0.1
+
+        out_legacy = oasr.kernels.norm.batch_norm_swish(
+            x, gamma, beta, running_mean, running_var, eps)
+        out_generic = oasr.kernels.norm.batch_norm_activation(
+            x, gamma, beta, running_mean, running_var, eps, oasr.ActivationType.SWISH)
+        oasr.synchronize()
+
+        torch.testing.assert_close(out_legacy, out_generic, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

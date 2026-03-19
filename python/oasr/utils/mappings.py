@@ -69,3 +69,14 @@ def get_norm(norm_type: str):
         "batch_norm": _norm.BatchNorm1d,
         "group_norm": _norm.GroupNorm,
     }.get(norm_type.lower(), _norm.BatchNorm1d)
+
+
+def get_norm_activation(norm_type: str):
+    """Map a norm name to the corresponding fused norm+activation layer *class*."""
+    from oasr.layers import norm as _norm
+
+    return {
+        "layer_norm": _norm.LayerNormActivation,
+        "rms_norm": _norm.RMSNormActivation,
+        "batch_norm": _norm.BatchNormActivation,
+    }.get(norm_type.lower(), _norm.BatchNormActivation)
