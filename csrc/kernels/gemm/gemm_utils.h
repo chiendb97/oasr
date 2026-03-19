@@ -9,12 +9,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <stdexcept>
 #include <utility>
 
-#include "gemm_configs.h"
 #include "kernels/common/cuda_utils.h"
-#include "kernels/common/types.h"
 
 namespace oasr {
 namespace kernels {

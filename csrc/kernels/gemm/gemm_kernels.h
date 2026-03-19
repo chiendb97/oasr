@@ -11,13 +11,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <cstdint>
-#include <memory>
 #include <torch/extension.h>
-#include <vector>
 
-#include "gemm_configs.h"
-#include "gemm_utils.h"
 #include "kernels/common/types.h"
 
 namespace oasr {
@@ -65,22 +60,6 @@ torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const t
 torch::Tensor invokeGemmActivation(const torch::Tensor& A, const torch::Tensor& B,
                                    const torch::Tensor& C, ActivationType activation,
                                    cudaStream_t stream = nullptr);
-
-//==============================================================================
-// Auto-Tuning
-//==============================================================================
-
-/**
- * @brief Profile and select best GEMM configuration
- *
- * @param M, N, K Problem dimensions
- * @param dtype Data type
- * @param num_warmup Number of warmup iterations
- * @param num_iter Number of timing iterations
- * @return Best configuration
- */
-GemmConfig autoTuneGemm(int M, int N, int K, DataType dtype, int num_warmup = 5, int num_iter = 10,
-                        cudaStream_t stream = nullptr);
 
 }  // namespace gemm
 }  // namespace kernels

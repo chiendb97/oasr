@@ -33,12 +33,6 @@ namespace gemm {
 torch::Tensor invokeBmm(const torch::Tensor& A, const torch::Tensor& B,
                         cudaStream_t stream = nullptr);
 
-/**
- * @brief Auto-tune BMM configuration
- */
-GemmConfig autoTuneBmm(int batch, int M, int N, int K, DataType dtype, int num_warmup = 5,
-                       int num_iter = 10, cudaStream_t stream = nullptr);
-
 }  // namespace gemm
 }  // namespace kernels
 }  // namespace oasr
