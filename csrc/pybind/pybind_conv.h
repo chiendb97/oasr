@@ -71,34 +71,6 @@ inline void registerConvBindings(py::module_& kernels) {
         "Pointwise (1x1) convolution with activation kernel");
 
     conv.def(
-        "glu",
-        [](const torch::Tensor& input) -> torch::Tensor {
-            int batch_size = input.size(0);
-            int seq_len = input.size(1);
-            int channels = input.size(2) / 2;
-            return oasr::kernels::invokeGLU(input, nullptr);
-        },
-        py::arg("input"), "GLU (Gated Linear Unit) activation kernel");
-
-    conv.def(
-        "swish",
-        [](const torch::Tensor& input) -> torch::Tensor {
-            return oasr::kernels::invokeSwish(input, nullptr);
-        },
-        py::arg("input"), "Swish activation kernel");
-
-    conv.def(
-        "batch_norm_swish",
-        [](const torch::Tensor& input, const torch::Tensor& gamma, const torch::Tensor& beta,
-           const torch::Tensor& running_mean, const torch::Tensor& running_var,
-           float eps) -> torch::Tensor {
-            return oasr::kernels::invokeBatchNormSwish(input, gamma, beta, running_mean,
-                                                       running_var, eps, nullptr);
-        },
-        py::arg("input"), py::arg("gamma"), py::arg("beta"), py::arg("running_mean"),
-        py::arg("running_var"), py::arg("eps") = 1e-5f, "Fused BatchNorm + Swish kernel");
-
-    conv.def(
         "conv2d",
         [](const torch::Tensor& input, const torch::Tensor& filter, py::object bias_obj, int pad_h,
            int pad_w, int stride_h, int stride_w, int dilation_h, int dilation_w,

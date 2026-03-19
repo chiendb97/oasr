@@ -203,91 +203,6 @@ class TestPointwiseConv1D:
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
 
-class TestGLU:
-    """Tests for GLU activation kernel."""
-
-    @pytest.mark.parametrize("batch_size,seq_len,channels", [
-        (2, 128, 256),
-        (4, 256, 512),
-    ])
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_glu(self, batch_size, seq_len, channels, dtype):
-        """Test GLU against F.glu."""
-        x = torch.randn(batch_size, seq_len, 2 * channels,
-                        device='cuda', dtype=dtype)
-
-        output = oasr.kernels.conv.glu(
-            x
-        )
-        oasr.synchronize()
-
-        expected = F.glu(x, dim=-1).to(dtype)
-
-        rtol = 1e-2 if dtype == torch.float16 else 1e-2
-        atol = 1e-2 if dtype == torch.float16 else 1e-2
-        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
-
-
-class TestSwish:
-    """Tests for Swish (SiLU) activation kernel."""
-
-    @pytest.mark.parametrize("batch_size,seq_len,channels", [
-        (2, 128, 256),
-        (4, 256, 512),
-    ])
-    def test_swish(self, batch_size, seq_len, channels):
-        """Test Swish against F.silu."""
-        dtype = torch.float32
-
-        x = torch.randn(batch_size, seq_len, channels,
-                        device='cuda', dtype=dtype)
-
-        output = oasr.kernels.conv.swish(
-            x
-        )
-        oasr.synchronize()
-
-        expected = F.silu(x)
-
-        torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
-
-
-class TestBatchNormSwish:
-    """Tests for fused BatchNorm + Swish kernel."""
-
-    @pytest.mark.parametrize("batch_size,seq_len,channels", [
-        (2, 128, 256),
-        (4, 64, 512),
-    ])
-    def test_batch_norm_swish(self, batch_size, seq_len, channels):
-        """Test fused BatchNorm + Swish."""
-        eps = 1e-5
-        dtype = torch.float32
-
-        x = torch.randn(batch_size, seq_len, channels,
-                        device='cuda', dtype=dtype)
-        gamma = torch.randn(channels, device='cuda', dtype=dtype)
-        beta = torch.randn(channels, device='cuda', dtype=dtype)
-        running_mean = torch.randn(channels, device='cuda', dtype=dtype)
-        running_var = torch.abs(torch.randn(
-            channels, device='cuda', dtype=dtype)) + 0.1
-
-        output = oasr.kernels.conv.batch_norm_swish(
-            x,
-            gamma, beta,
-            running_mean, running_var,
-            eps
-        )
-        oasr.synchronize()
-
-        # Reference: BatchNorm then Swish
-        bn_out = (x - running_mean) / \
-            torch.sqrt(running_var + eps) * gamma + beta
-        expected = F.silu(bn_out)
-
-        torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
-
-
 class TestConv2d:
     """Tests for the conv2d kernel (oasr.kernels.conv.conv2d).
 
@@ -304,7 +219,8 @@ class TestConv2d:
         (2, 14, 14, 128, 64, 3, 3, 1, 2, 1),  # stride-2 downsampling
         (1,  8,  8,  32, 32, 3, 3, 2, 1, 2),  # dilation-2
         (2, 200, 80,  1, 64, 3, 3, 1, 2, 1),  # IC=1 direct kernel, stride-2
-        (4, 100, 40,  1, 32, 3, 3, 1, 1, 1),  # IC=1 direct kernel, same padding
+        # IC=1 direct kernel, same padding
+        (4, 100, 40,  1, 32, 3, 3, 1, 1, 1),
     ])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_conv2d(self, N, H, W, IC, K, R, S, pad, stride, dilation, dtype):
@@ -361,7 +277,8 @@ class TestConv2dActivation:
     @pytest.mark.parametrize("N,H,W,IC,K,R,S,pad", [
         (2, 16, 16, 32,  64, 3, 3, 1),
         (1, 28, 28, 64, 128, 1, 1, 0),
-        (2, 200, 80,  1, 64, 3, 3, 1),  # IC=1 direct kernel with fused activation
+        # IC=1 direct kernel with fused activation
+        (2, 200, 80,  1, 64, 3, 3, 1),
     ])
     @pytest.mark.parametrize("activation,ref_fn", [
         (lambda: oasr.ActivationType.RELU, F.relu),

@@ -97,36 +97,7 @@ torch::Tensor invokeCausalConv1D(const torch::Tensor& input, void* state_buffer,
                                  const torch::Tensor& weight, const torch::Tensor& bias,
                                  cudaStream_t stream);
 
-// GLU (Gated Linear Unit) activation
-// output = input[:, :half] * sigmoid(input[:, half:])
-// Dimensions derived: batch_size=input.size(0), seq_len=input.size(1), channels=input.size(2)/2
-//
-// @param input Input [batch, seq_len, channels]
-// @param stream CUDA stream
-// @return Output [batch, seq_len, channels]
-torch::Tensor invokeGLU(const torch::Tensor& input, cudaStream_t stream);
 
-// Swish activation: x * sigmoid(x)
-// Dimensions derived: batch_size=input.size(0), seq_len=input.size(1), channels=input.size(2)
-// @param input Input [batch, seq_len, channels]
-// @param stream CUDA stream
-// @return Output [batch, seq_len, channels]
-torch::Tensor invokeSwish(const torch::Tensor& input, cudaStream_t stream);
-
-// Fused BatchNorm + Swish (inference mode)
-// Dimensions derived: batch_size=input.size(0), seq_len=input.size(1), channels=input.size(2)
-// @param input Input [batch, seq_len, channels]
-// @param gamma Scale tensor [channels]
-// @param beta Bias tensor [channels]
-// @param running_mean Running mean tensor [channels]
-// @param running_var Running variance tensor [channels]
-// @param eps Epsilon for numerical stability
-// @param stream CUDA stream
-// @return Output [batch, seq_len, channels]
-torch::Tensor invokeBatchNormSwish(const torch::Tensor& input, const torch::Tensor& gamma,
-                                   const torch::Tensor& beta, const torch::Tensor& running_mean,
-                                   const torch::Tensor& running_var, float eps,
-                                   cudaStream_t stream);
 
 }  // namespace kernels
 }  // namespace oasr

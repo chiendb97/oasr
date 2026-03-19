@@ -810,6 +810,40 @@ __global__ void addLayerNormKernelVectorized(const T* __restrict__ input,
 }
 
 // =============================================================================
+// Fused BatchNorm + Swish Kernel
+// =============================================================================
+
+template <typename T>
+__global__ void batchNormSwishKernel(const T* __restrict__ input, T* __restrict__ output,
+                                     const T* __restrict__ weight, const T* __restrict__ bias,
+                                     const T* __restrict__ running_mean,
+                                     const T* __restrict__ running_var, int batch_size, int seq_len,
+                                     int channels, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * seq_len * channels;
+
+    if (idx >= total_elements)
+        return;
+
+    int c = idx % channels;
+
+    float x = static_cast<float>(input[idx]);
+    float mean = static_cast<float>(running_mean[c]);
+    float var = static_cast<float>(running_var[c]);
+    float g = static_cast<float>(weight[c]);
+    float b = static_cast<float>(bias[c]);
+
+    // BatchNorm
+    float inv_std = rsqrtf(var + eps);
+    float normalized = (x - mean) * inv_std * g + b;
+
+    // Swish
+    float result = normalized / (1.0f + expf(-normalized));
+
+    output[idx] = static_cast<T>(result);
+}
+
+// =============================================================================
 // Dispatcher functions
 // =============================================================================
 
@@ -1112,6 +1146,60 @@ torch::Tensor invokeAddLayerNorm(const torch::Tensor& input, const torch::Tensor
         default:
             throw std::runtime_error("Unsupported data type for AddLayerNorm");
     }
+    return output;
+}
+
+torch::Tensor invokeBatchNormSwish(const torch::Tensor& input, const torch::Tensor& weight,
+                                   const torch::Tensor& bias, const torch::Tensor& running_mean,
+                                   const torch::Tensor& running_var, float eps,
+                                   cudaStream_t stream) {
+    const int batch_size = input.size(0);
+    const int seq_len = input.size(1);
+    const int channels = input.size(2);
+
+    auto output = torch::empty_like(input);
+
+    const void* input_ptr = input.data_ptr();
+    void* output_ptr = output.data_ptr();
+    const void* weight_ptr = weight.data_ptr();
+    const void* bias_ptr = bias.data_ptr();
+    const void* running_mean_ptr = running_mean.data_ptr();
+    const void* running_var_ptr = running_var.data_ptr();
+
+    int total_elements = batch_size * seq_len * channels;
+    int block_size = 256;
+    int grid_size = (total_elements + block_size - 1) / block_size;
+
+    switch (input.scalar_type()) {
+        case torch::ScalarType::Float:
+            batchNormSwishKernel<float><<<grid_size, block_size, 0, stream>>>(
+                static_cast<const float*>(input_ptr), static_cast<float*>(output_ptr),
+                static_cast<const float*>(weight_ptr), static_cast<const float*>(bias_ptr),
+                static_cast<const float*>(running_mean_ptr),
+                static_cast<const float*>(running_var_ptr), batch_size, seq_len, channels, eps);
+            break;
+        case torch::ScalarType::Half:
+            batchNormSwishKernel<half><<<grid_size, block_size, 0, stream>>>(
+                static_cast<const half*>(input_ptr), static_cast<half*>(output_ptr),
+                static_cast<const half*>(weight_ptr), static_cast<const half*>(bias_ptr),
+                static_cast<const half*>(running_mean_ptr),
+                static_cast<const half*>(running_var_ptr), batch_size, seq_len, channels, eps);
+            break;
+        case torch::ScalarType::BFloat16:
+            batchNormSwishKernel<__nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(input_ptr),
+                static_cast<__nv_bfloat16*>(output_ptr),
+                static_cast<const __nv_bfloat16*>(weight_ptr),
+                static_cast<const __nv_bfloat16*>(bias_ptr),
+                static_cast<const __nv_bfloat16*>(running_mean_ptr),
+                static_cast<const __nv_bfloat16*>(running_var_ptr), batch_size, seq_len, channels,
+                eps);
+            break;
+        default:
+            throw std::runtime_error("Unsupported data type for BatchNormSwish");
+            break;
+    }
+
     return output;
 }
 
