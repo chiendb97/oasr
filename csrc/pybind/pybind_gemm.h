@@ -8,8 +8,8 @@
 #include <torch/extension.h>
 
 #include "kernels/gemm/bmm_kernels.h"
-#include "kernels/gemm/gemm_configs.h"
 #include "kernels/gemm/gemm_kernels.h"
+#include "kernels/gemm/gemm_utils.h"
 #include "kernels/gemm/group_gemm_kernels.h"
 
 namespace py = pybind11;
@@ -147,24 +147,6 @@ inline void registerGemmBindings(py::module_& kernels) {
                  "Check if SM version supports warp specialization");
     gemm_mod.def("get_gemm_status_string", &getGemmStatusString, py::arg("status"),
                  "Convert GemmStatus to string");
-
-    // --- Auto-tuning ---
-    gemm_mod.def(
-        "auto_tune_gemm",
-        [](int M, int N, int K, DataType dtype, int num_warmup, int num_iter) {
-            return autoTuneGemm(M, N, K, dtype, num_warmup, num_iter, nullptr);
-        },
-        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("dtype"), py::arg("num_warmup") = 5,
-        py::arg("num_iter") = 10, "Auto-tune and return best GEMM configuration");
-
-    gemm_mod.def(
-        "auto_tune_bmm",
-        [](int batch, int M, int N, int K, DataType dtype, int num_warmup, int num_iter) {
-            return autoTuneBmm(batch, M, N, K, dtype, num_warmup, num_iter, nullptr);
-        },
-        py::arg("batch"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("dtype"),
-        py::arg("num_warmup") = 5, py::arg("num_iter") = 10,
-        "Auto-tune and return best batched GEMM configuration");
 
     // --- Default configs ---
     gemm_mod.def("get_default_sm80_configs", &getDefaultSM80Configs,

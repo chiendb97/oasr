@@ -142,59 +142,6 @@ torch::Tensor invokeBmm(const torch::Tensor& A, const torch::Tensor& B, cudaStre
     return D;
 }
 
-torch::Tensor invokeBmmArray(const torch::Tensor& A, const torch::Tensor& B,
-                             cudaStream_t stream = nullptr) {
-    return invokeBmm(A, B, stream);
-}
-
-GemmConfig autoTuneBmm(int batch, int M, int N, int K, DataType dtype, int num_warmup, int num_iter,
-                       cudaStream_t stream) {
-    auto configs = getSMVersion() >= 90 ? getDefaultSM90Configs() : getDefaultSM80Configs();
-    if (configs.empty())
-        return GemmConfig();
-
-    size_t elem_size = getDataTypeSize(dtype);
-    torch::Tensor A, B;
-    A = torch::empty({batch, M, K}, A.options());
-    B = torch::empty({batch, K, N}, B.options());
-
-    GemmConfig best = configs[0];
-    float best_time = std::numeric_limits<float>::max();
-
-    for (const auto& cfg : configs) {
-        try {
-            (void)cfg;
-            for (int i = 0; i < num_warmup; ++i) {
-                auto D = invokeBmm(A, B, stream);
-            }
-            OASR_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-            cudaEvent_t start, stop;
-            OASR_CUDA_CHECK(cudaEventCreate(&start));
-            OASR_CUDA_CHECK(cudaEventCreate(&stop));
-            OASR_CUDA_CHECK(cudaEventRecord(start, stream));
-            for (int i = 0; i < num_iter; ++i) {
-                auto D = invokeBmm(A, B, stream);
-            }
-            OASR_CUDA_CHECK(cudaEventRecord(stop, stream));
-            OASR_CUDA_CHECK(cudaEventSynchronize(stop));
-
-            float ms;
-            OASR_CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-            if (ms / num_iter < best_time) {
-                best_time = ms / num_iter;
-                best = cfg;
-            }
-            OASR_CUDA_CHECK(cudaEventDestroy(start));
-            OASR_CUDA_CHECK(cudaEventDestroy(stop));
-        } catch (...) {
-            continue;
-        }
-    }
-
-    return best;
-}
-
 }  // namespace gemm
 }  // namespace kernels
 }  // namespace oasr
