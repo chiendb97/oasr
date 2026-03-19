@@ -147,8 +147,10 @@ set(OASR_SOURCES
     csrc/kernels/common/cuda_utils.cpp
     
     # Kernels
+    csrc/kernels/activation/activation_kernels.cu
     csrc/kernels/norm/norm_kernels.cu
-    csrc/kernels/conv/conv_kernels.cu
+    csrc/kernels/conv/conv1d_kernels.cu
+    csrc/kernels/conv/conv2d_kernels.cu
     
     # GEMM Kernels (CUTLASS-based)
     csrc/kernels/gemm/gemm_kernels.cu
@@ -168,8 +170,10 @@ set(OASR_SOURCES
 set(OASR_HEADERS
     csrc/kernels/common/types.h
     csrc/kernels/common/cuda_utils.h
+    csrc/kernels/activation/activation_kernels.h
     csrc/kernels/norm/norm_kernels.h
-    csrc/kernels/conv/conv_kernels.h
+    csrc/kernels/conv/conv1d_kernels.h
+    csrc/kernels/conv/conv2d_kernels.h
     
     # GEMM Headers
     csrc/kernels/gemm/gemm_configs.h

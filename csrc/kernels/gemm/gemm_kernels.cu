@@ -17,11 +17,6 @@
 
 // CUTLASS includes
 #include <cutlass/cutlass.h>
-#include <cutlass/epilogue/thread/linear_combination.h>
-#include <cutlass/epilogue/thread/linear_combination_bias_relu.h>
-#include <cutlass/epilogue/thread/linear_combination_gelu.h>
-#include <cutlass/epilogue/thread/linear_combination_silu.h>
-#include <cutlass/epilogue/thread/scale_type.h>
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/layout/matrix.h>
 #include <cutlass/numeric_types.h>
@@ -33,52 +28,24 @@
 
 #include "gemm_kernels.h"
 #include "gemm_utils.h"
+#include "kernels/common/epilogue_functors.h"
 
 namespace oasr {
 namespace kernels {
 namespace gemm {
 
 //==============================================================================
-// Epilogue Op Aliases
-//==============================================================================
-
-template <typename ElementCD, typename ElementCompute>
-struct EpilogueIdentity {
-    using Op = cutlass::epilogue::thread::LinearCombination<
-        ElementCD, 128 / cutlass::sizeof_bits<ElementCD>::value, ElementCompute, ElementCompute,
-        cutlass::epilogue::thread::ScaleType::Default>;
-};
-
-template <typename ElementCD, typename ElementCompute>
-struct EpilogueRelu {
-    using Op = cutlass::epilogue::thread::LinearCombinationRelu<
-        ElementCD, 128 / cutlass::sizeof_bits<ElementCD>::value, ElementCompute, ElementCompute,
-        cutlass::epilogue::thread::ScaleType::Default>;
-};
-
-template <typename ElementCD, typename ElementCompute>
-struct EpilogueGelu {
-    using Op = cutlass::epilogue::thread::LinearCombinationGELU<
-        ElementCD, 128 / cutlass::sizeof_bits<ElementCD>::value, ElementCompute, ElementCompute,
-        cutlass::epilogue::thread::ScaleType::Default>;
-};
-
-template <typename ElementCD, typename ElementCompute>
-struct EpilogueSwish {
-    using Op = cutlass::epilogue::thread::LinearCombinationSilu<
-        ElementCD, 128 / cutlass::sizeof_bits<ElementCD>::value, ElementCompute, ElementCompute,
-        cutlass::epilogue::thread::ScaleType::Default>;
-};
-
-//==============================================================================
 // Unified GEMM Implementation (SM80)
 //==============================================================================
 
 template <typename ElementA, typename ElementB, typename ElementCD, typename LayoutA,
-          typename LayoutB, typename LayoutCD, template <typename, typename> class EpilogueFunctor>
+          typename LayoutB, typename LayoutCD,
+          template <int, typename, typename> class EpilogueFunctor>
 struct CutlassGemmSM80 {
     using ElementAccumulator = float;
     using ElementComputeEpilogue = ElementAccumulator;
+
+    static constexpr int EpilogueAlignment = 128 / cutlass::sizeof_bits<ElementCD>::value;
 
     using MMAOp = cutlass::arch::OpClassTensorOp;
     using SmArch = cutlass::arch::Sm80;
@@ -89,7 +56,8 @@ struct CutlassGemmSM80 {
 
     using SwizzleThreadblock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
 
-    using EpilogueOp = typename EpilogueFunctor<ElementCD, ElementComputeEpilogue>::Op;
+    using EpilogueOp =
+        typename EpilogueFunctor<EpilogueAlignment, ElementCD, ElementComputeEpilogue>::Op;
 
     static constexpr int NumStages = 2;
 

@@ -11,6 +11,7 @@ Profiling mode for NVIDIA Nsight Compute:
 
 import argparse
 import torch
+import torch.nn.functional as F
 
 import oasr
 
@@ -24,7 +25,7 @@ def profile_kernel(name: str, fn, warmup: int = 3, profile_iters: int = 1):
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
-    
+
     torch.cuda.nvtx.range_push(name)
     for _ in range(profile_iters):
         fn()
@@ -39,66 +40,69 @@ def profile_kernel(name: str, fn, warmup: int = 3, profile_iters: int = 1):
 def setup_layer_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     """Setup tensors for LayerNorm."""
     eps = 1e-5
-    x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
+    x = torch.randn(batch_size, seq_len, hidden_size,
+                    device='cuda', dtype=dtype)
     gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
     beta = torch.randn(hidden_size, device='cuda', dtype=dtype)
-    
-    
+
     def oasr_fn():
         return oasr.kernels.norm.layer_norm(
             x, gamma, beta, eps
         )
-    
-    layer_norm = torch.nn.LayerNorm(hidden_size, eps=eps, device='cuda', dtype=dtype)
+
+    layer_norm = torch.nn.LayerNorm(
+        hidden_size, eps=eps, device='cuda', dtype=dtype)
     layer_norm.weight.data = gamma.clone()
     layer_norm.bias.data = beta.clone()
-    
+
     def pytorch_fn():
         return layer_norm(x)
-    
+
     return oasr_fn, pytorch_fn
 
 
 def setup_rms_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     """Setup tensors for RMSNorm."""
     eps = 1e-5
-    x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
+    x = torch.randn(batch_size, seq_len, hidden_size,
+                    device='cuda', dtype=dtype)
     gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
-    
-    
+
     def oasr_fn():
         return oasr.kernels.norm.rms_norm(
             x, gamma, None, eps
         )
-    
+
     def pytorch_fn():
         rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
         return x / rms * gamma
-    
+
     return oasr_fn, pytorch_fn
 
 
 def setup_add_layer_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     """Setup tensors for fused Add + LayerNorm."""
     eps = 1e-5
-    x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
-    residual = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
+    x = torch.randn(batch_size, seq_len, hidden_size,
+                    device='cuda', dtype=dtype)
+    residual = torch.randn(batch_size, seq_len,
+                           hidden_size, device='cuda', dtype=dtype)
     gamma = torch.randn(hidden_size, device='cuda', dtype=dtype)
     beta = torch.randn(hidden_size, device='cuda', dtype=dtype)
-    
-    
+
     def oasr_fn():
         return oasr.kernels.norm.add_layer_norm(
             x, residual, gamma, beta, eps
         )
-    
-    layer_norm = torch.nn.LayerNorm(hidden_size, eps=eps, device='cuda', dtype=dtype)
+
+    layer_norm = torch.nn.LayerNorm(
+        hidden_size, eps=eps, device='cuda', dtype=dtype)
     layer_norm.weight.data = gamma.clone()
     layer_norm.bias.data = beta.clone()
-    
+
     def pytorch_fn():
         return layer_norm(x + residual)
-    
+
     return oasr_fn, pytorch_fn
 
 
@@ -108,14 +112,14 @@ def setup_group_norm(batch_size, seq_len, channels, num_groups, dtype=torch.floa
     x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
     gamma = torch.randn(channels, device='cuda', dtype=dtype)
     beta = torch.randn(channels, device='cuda', dtype=dtype)
-    
+
     channels_per_group = channels // num_groups
-    
+
     def oasr_fn():
         return oasr.kernels.norm.group_norm(
             x, gamma, beta, num_groups, eps
         )
-    
+
     def pytorch_fn():
         x_r = x.view(batch_size, seq_len, num_groups, channels_per_group)
         mean = x_r.mean(dim=-1, keepdim=True)
@@ -123,7 +127,7 @@ def setup_group_norm(batch_size, seq_len, channels, num_groups, dtype=torch.floa
         x_norm = (x_r - mean) / torch.sqrt(var + eps)
         x_norm = x_norm.view(batch_size, seq_len, channels)
         return x_norm * gamma + beta
-    
+
     return oasr_fn, pytorch_fn
 
 
@@ -134,17 +138,40 @@ def setup_batch_norm(batch_size, seq_len, channels, dtype=torch.float32):
     gamma = torch.randn(channels, device='cuda', dtype=dtype)
     beta = torch.randn(channels, device='cuda', dtype=dtype)
     running_mean = torch.randn(channels, device='cuda', dtype=dtype)
-    running_var = torch.abs(torch.randn(channels, device='cuda', dtype=dtype)) + 0.1
-    
-    
+    running_var = torch.abs(torch.randn(
+        channels, device='cuda', dtype=dtype)) + 0.1
+
     def oasr_fn():
         return oasr.kernels.norm.batch_norm_1d(
             x, gamma, beta, running_mean, running_var, eps
         )
-    
+
     def pytorch_fn():
         return (x - running_mean) / torch.sqrt(running_var + eps) * gamma + beta
-    
+
+    return oasr_fn, pytorch_fn
+
+
+def setup_batch_norm_swish(batch_size, seq_len, channels, dtype=torch.float16):
+    """Setup tensors for fused BatchNorm + Swish."""
+    eps = 1e-5
+    x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
+    gamma = torch.randn(channels, device='cuda', dtype=dtype)
+    beta = torch.randn(channels, device='cuda', dtype=dtype)
+    running_mean = torch.randn(channels, device='cuda', dtype=dtype)
+    running_var = torch.abs(torch.randn(
+        channels, device='cuda', dtype=dtype)) + 0.1
+
+    def oasr_fn():
+        return oasr.kernels.norm.batch_norm_swish(
+            x, gamma, beta, running_mean, running_var, eps
+        )
+
+    def pytorch_fn():
+        bn_out = (x - running_mean) / \
+            torch.sqrt(running_var + eps) * gamma + beta
+        return F.silu(bn_out)
+
     return oasr_fn, pytorch_fn
 
 
@@ -171,13 +198,14 @@ def benchmark_layer_norm():
     print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
-    
+
     for batch_size, seq_len, hidden_size in configs:
-        oasr_fn, pytorch_fn = setup_layer_norm(batch_size, seq_len, hidden_size)
-        
+        oasr_fn, pytorch_fn = setup_layer_norm(
+            batch_size, seq_len, hidden_size)
+
         oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
         pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
-        
+
         speedup = pytorch_ms / oasr_ms
         shape_str = f"[{batch_size}, {seq_len}, {hidden_size}]"
         print(f"{shape_str:<30} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
@@ -199,13 +227,13 @@ def benchmark_rms_norm():
     print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
-    
+
     for batch_size, seq_len, hidden_size in configs:
         oasr_fn, pytorch_fn = setup_rms_norm(batch_size, seq_len, hidden_size)
-        
+
         oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
         pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
-        
+
         speedup = pytorch_ms / oasr_ms
         shape_str = f"[{batch_size}, {seq_len}, {hidden_size}]"
         print(f"{shape_str:<30} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
@@ -227,13 +255,14 @@ def benchmark_add_layer_norm():
     print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
-    
+
     for batch_size, seq_len, hidden_size in configs:
-        oasr_fn, pytorch_fn = setup_add_layer_norm(batch_size, seq_len, hidden_size)
-        
+        oasr_fn, pytorch_fn = setup_add_layer_norm(
+            batch_size, seq_len, hidden_size)
+
         oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
         pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
-        
+
         speedup = pytorch_ms / oasr_ms
         shape_str = f"[{batch_size}, {seq_len}, {hidden_size}]"
         print(f"{shape_str:<30} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
@@ -255,13 +284,14 @@ def benchmark_group_norm():
     print("=" * 70)
     print(f"\n{'Shape':<35} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 75)
-    
+
     for batch_size, seq_len, channels, num_groups in configs:
-        oasr_fn, pytorch_fn = setup_group_norm(batch_size, seq_len, channels, num_groups)
-        
+        oasr_fn, pytorch_fn = setup_group_norm(
+            batch_size, seq_len, channels, num_groups)
+
         oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
         pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
-        
+
         speedup = pytorch_ms / oasr_ms
         shape_str = f"[{batch_size}, {seq_len}, {channels}] g={num_groups}"
         print(f"{shape_str:<35} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
@@ -283,13 +313,42 @@ def benchmark_batch_norm():
     print("=" * 70)
     print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 70)
-    
+
     for batch_size, seq_len, channels in configs:
         oasr_fn, pytorch_fn = setup_batch_norm(batch_size, seq_len, channels)
-        
+
         oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
         pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
-        
+
+        speedup = pytorch_ms / oasr_ms
+        shape_str = f"[{batch_size}, {seq_len}, {channels}]"
+        print(f"{shape_str:<30} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
+
+
+def benchmark_batch_norm_swish():
+    """Benchmark fused BatchNorm + Swish."""
+    import triton
+
+    configs = [
+        (32, 250, 256),
+        (64, 250, 256),
+        (64, 250, 512),
+        (64, 500, 512),
+    ]
+
+    print("\n" + "=" * 70)
+    print("BatchNorm + Swish (Fused) Benchmark")
+    print("=" * 70)
+    print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
+    print("-" * 70)
+
+    for batch_size, seq_len, channels in configs:
+        oasr_fn, pytorch_fn = setup_batch_norm_swish(
+            batch_size, seq_len, channels)
+
+        oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
+        pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
+
         speedup = pytorch_ms / oasr_ms
         shape_str = f"[{batch_size}, {seq_len}, {channels}]"
         print(f"{shape_str:<30} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
@@ -299,12 +358,14 @@ def benchmark_batch_norm():
 # Profiling functions
 # =============================================================================
 
+
 PROFILE_CONFIGS = {
     'layer_norm': (64, 250, 256),
     'rms_norm': (64, 250, 256),
     'add_layer_norm': (64, 250, 512),
     'group_norm': (64, 250, 512, 64),
     'batch_norm': (64, 250, 512),
+    'batch_norm_swish': (64, 250, 512),
 }
 
 
@@ -315,36 +376,39 @@ def profile_kernels(kernels: list, target: str = 'both', warmup: int = 3, iters:
     print("=" * 70)
     print(f"Target: {target}, Warmup: {warmup}, Profile iterations: {iters}")
     print("=" * 70)
-    
+
     setup_funcs = {
         'layer_norm': lambda: setup_layer_norm(*PROFILE_CONFIGS['layer_norm']),
         'rms_norm': lambda: setup_rms_norm(*PROFILE_CONFIGS['rms_norm']),
         'add_layer_norm': lambda: setup_add_layer_norm(*PROFILE_CONFIGS['add_layer_norm']),
         'group_norm': lambda: setup_group_norm(*PROFILE_CONFIGS['group_norm']),
         'batch_norm': lambda: setup_batch_norm(*PROFILE_CONFIGS['batch_norm']),
+        'batch_norm_swish': lambda: setup_batch_norm_swish(*PROFILE_CONFIGS['batch_norm_swish']),
     }
-    
+
     for kernel_name in kernels:
         if kernel_name not in setup_funcs:
             print(f"Unknown kernel: {kernel_name}")
             continue
-        
+
         config = PROFILE_CONFIGS[kernel_name]
         print(f"\nProfiling: {kernel_name}")
         print(f"  Config: {config}")
-        
+
         oasr_fn, pytorch_fn = setup_funcs[kernel_name]()
-        
+
         if target in ('oasr', 'both'):
             print(f"  Running OASR kernel...")
-            profile_kernel(f"oasr_{kernel_name}", oasr_fn, warmup=warmup, profile_iters=iters)
-        
+            profile_kernel(f"oasr_{kernel_name}", oasr_fn,
+                           warmup=warmup, profile_iters=iters)
+
         if target in ('pytorch', 'both'):
             print(f"  Running PyTorch kernel...")
-            profile_kernel(f"pytorch_{kernel_name}", pytorch_fn, warmup=warmup, profile_iters=iters)
-        
+            profile_kernel(
+                f"pytorch_{kernel_name}", pytorch_fn, warmup=warmup, profile_iters=iters)
+
         print(f"  Done.")
-    
+
     print("\n" + "=" * 70)
     print("Profiling complete!")
     print("=" * 70)
@@ -356,7 +420,7 @@ def profile_kernels(kernels: list, target: str = 'both', warmup: int = 3, iters:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="OASR Normalization Kernels - Benchmark & Profile",
+        description="OASR Norm Kernels - Benchmark & Profile",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -370,40 +434,41 @@ Examples:
   python bench_norm_kernels.py --profile --kernel all
 
 Available kernels:
-  layer_norm, rms_norm, add_layer_norm, group_norm, batch_norm
+  layer_norm, rms_norm, add_layer_norm, group_norm, batch_norm, batch_norm_swish
         """
     )
-    
+
     parser.add_argument('--profile', action='store_true',
-        help='Run in profiling mode (single iterations for ncu)')
+                        help='Run in profiling mode (single iterations for ncu)')
     parser.add_argument('--kernel', nargs='+', default=['all'],
-        help='Kernel(s) to profile (use "all" for all kernels)')
+                        help='Kernel(s) to profile (use "all" for all kernels)')
     parser.add_argument('--target', choices=['oasr', 'pytorch', 'both'], default='oasr',
-        help='Which implementation to profile (default: oasr)')
+                        help='Which implementation to profile (default: oasr)')
     parser.add_argument('--warmup', type=int, default=3,
-        help='Number of warmup iterations for profiling (default: 3)')
+                        help='Number of warmup iterations for profiling (default: 3)')
     parser.add_argument('--iters', type=int, default=1,
-        help='Number of profile iterations (default: 1)')
-    
+                        help='Number of profile iterations (default: 1)')
+
     args = parser.parse_args()
-    
+
     if args.profile:
         if 'all' in args.kernel:
             kernels = list(PROFILE_CONFIGS.keys())
         else:
             kernels = args.kernel
-        profile_kernels(kernels, target=args.target, warmup=args.warmup, iters=args.iters)
+        profile_kernels(kernels, target=args.target,
+                        warmup=args.warmup, iters=args.iters)
     else:
         print("=" * 70)
-        print("OASR Normalization Kernels - Performance Benchmarks")
+        print("OASR Norm Kernels - Performance Benchmarks")
         print("=" * 70)
-        
+
         benchmark_layer_norm()
         benchmark_rms_norm()
         benchmark_add_layer_norm()
         benchmark_group_norm()
         benchmark_batch_norm()
-        
+        benchmark_batch_norm_swish()
         print("\n" + "=" * 70)
         print("Benchmarks complete!")
         print("=" * 70)

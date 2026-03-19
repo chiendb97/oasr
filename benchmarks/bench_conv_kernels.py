@@ -121,60 +121,6 @@ def setup_pointwise_conv1d_activation(batch_size, seq_len, in_ch, out_ch, activa
     return oasr_fn, pytorch_fn
 
 
-def setup_glu(batch_size, seq_len, channels, dtype=torch.float16):
-    """Setup tensors for GLU."""
-    x = torch.randn(batch_size, seq_len, 2 * channels,
-                    device='cuda', dtype=dtype)
-
-    def oasr_fn():
-        return oasr.kernels.conv.glu(
-            x
-        )
-
-    def pytorch_fn():
-        return F.glu(x, dim=-1)
-
-    return oasr_fn, pytorch_fn
-
-
-def setup_swish(batch_size, seq_len, channels, dtype=torch.float16):
-    """Setup tensors for Swish."""
-    x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
-
-    def oasr_fn():
-        return oasr.kernels.conv.swish(
-            x
-        )
-
-    def pytorch_fn():
-        return F.silu(x)
-
-    return oasr_fn, pytorch_fn
-
-
-def setup_batch_norm_swish(batch_size, seq_len, channels, dtype=torch.float16):
-    """Setup tensors for fused BatchNorm + Swish."""
-    eps = 1e-5
-    x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
-    gamma = torch.randn(channels, device='cuda', dtype=dtype)
-    beta = torch.randn(channels, device='cuda', dtype=dtype)
-    running_mean = torch.randn(channels, device='cuda', dtype=dtype)
-    running_var = torch.abs(torch.randn(
-        channels, device='cuda', dtype=dtype)) + 0.1
-
-    def oasr_fn():
-        return oasr.kernels.conv.batch_norm_swish(
-            x, gamma, beta, running_mean, running_var, eps
-        )
-
-    def pytorch_fn():
-        bn_out = (x - running_mean) / \
-            torch.sqrt(running_var + eps) * gamma + beta
-        return F.silu(bn_out)
-
-    return oasr_fn, pytorch_fn
-
-
 def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.float16):
     """Setup tensors for conv block (depthwise + pointwise + GLU + swish)."""
     x = torch.randn(batch_size, seq_len, d_model, device='cuda', dtype=dtype)
@@ -192,13 +138,13 @@ def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.floa
         pw1_out = oasr.kernels.conv.pointwise_conv1d(
             x, pw1_weight, pw1_bias
         )
-        glu_out = oasr.kernels.conv.glu(
+        glu_out = oasr.kernels.activation.glu(
             pw1_out
         )
         dw_out = oasr.kernels.conv.depthwise_conv1d(
             glu_out, dw_weight, dw_bias, kernel_size // 2
         )
-        swish_out = oasr.kernels.conv.swish(
+        swish_out = oasr.kernels.activation.swish(
             dw_out
         )
         return oasr.kernels.conv.pointwise_conv1d(
@@ -413,92 +359,6 @@ def benchmark_pointwise_conv1d_activation():
         print(f"{shape_str:<40} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
 
 
-def benchmark_glu():
-    """Benchmark GLU activation."""
-    import triton
-
-    configs = [
-        (32, 250, 256),
-        (64, 250, 256),
-        (64, 250, 512),
-        (64, 500, 256),
-        (64, 500, 512),
-    ]
-
-    print("\n" + "=" * 70)
-    print("GLU Activation Benchmark")
-    print("=" * 70)
-    print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
-    print("-" * 70)
-
-    for batch_size, seq_len, channels in configs:
-        oasr_fn, pytorch_fn = setup_glu(batch_size, seq_len, channels)
-
-        oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
-        pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
-
-        speedup = pytorch_ms / oasr_ms
-        shape_str = f"[{batch_size}, {seq_len}, {2*channels}]"
-        print(f"{shape_str:<30} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
-
-
-def benchmark_swish():
-    """Benchmark Swish (SiLU) activation."""
-    import triton
-
-    configs = [
-        (32, 250, 256),
-        (64, 250, 256),
-        (64, 250, 512),
-        (64, 500, 512),
-    ]
-
-    print("\n" + "=" * 70)
-    print("Swish Activation Benchmark")
-    print("=" * 70)
-    print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
-    print("-" * 70)
-
-    for batch_size, seq_len, channels in configs:
-        oasr_fn, pytorch_fn = setup_swish(batch_size, seq_len, channels)
-
-        oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
-        pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
-
-        speedup = pytorch_ms / oasr_ms
-        shape_str = f"[{batch_size}, {seq_len}, {channels}]"
-        print(f"{shape_str:<30} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
-
-
-def benchmark_batch_norm_swish():
-    """Benchmark fused BatchNorm + Swish."""
-    import triton
-
-    configs = [
-        (32, 250, 256),
-        (64, 250, 256),
-        (64, 250, 512),
-        (64, 500, 512),
-    ]
-
-    print("\n" + "=" * 70)
-    print("BatchNorm + Swish (Fused) Benchmark")
-    print("=" * 70)
-    print(f"\n{'Shape':<30} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
-    print("-" * 70)
-
-    for batch_size, seq_len, channels in configs:
-        oasr_fn, pytorch_fn = setup_batch_norm_swish(
-            batch_size, seq_len, channels)
-
-        oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
-        pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
-
-        speedup = pytorch_ms / oasr_ms
-        shape_str = f"[{batch_size}, {seq_len}, {channels}]"
-        print(f"{shape_str:<30} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
-
-
 def benchmark_conv_block():
     """Benchmark full conv block (depthwise + pointwise + GLU + swish)."""
     import triton
@@ -542,7 +402,8 @@ def benchmark_conv2d():
     # First two rows mirror Conv2dSubsampling (IC=1 then IC=odim);
     # remaining rows cover larger aligned shapes.
     configs = [
-        (16, 200, 80,   1,  64, 3, 3, 0, 2),  # subsampling conv1 (IC=1, kAnalytic)
+        # subsampling conv1 (IC=1, kAnalytic)
+        (16, 200, 80,   1,  64, 3, 3, 0, 2),
         (16, 100, 40,  64,  64, 3, 3, 0, 2),  # subsampling conv2
         (32, 200, 80,   1,  64, 3, 3, 0, 2),
         (32, 100, 40,  64,  64, 3, 3, 0, 2),
@@ -555,7 +416,8 @@ def benchmark_conv2d():
     print("\n" + "=" * 75)
     print("Conv2d NHWC Benchmark (CUTLASS Ampere Tensor Core vs PyTorch NCHW)")
     print("=" * 75)
-    print(f"\n{'Shape [N,H,W,IC->K]':<38} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
+    print(
+        f"\n{'Shape [N,H,W,IC->K]':<38} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 78)
 
     for N, H, W, IC, K, R, S, pad, stride in configs:
@@ -588,28 +450,29 @@ def benchmark_conv2d_activation():
 
     for act_type, act_name in activations:
         print("\n" + "=" * 78)
-        print(f"Conv2d + {act_name.upper()} (fused, CUTLASS) vs PyTorch unfused")
+        print(
+            f"Conv2d + {act_name.upper()} (fused, CUTLASS) vs PyTorch unfused")
         print("=" * 78)
-        print(f"\n{'Shape [N,H,W,IC->K]':<38} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
+        print(
+            f"\n{'Shape [N,H,W,IC->K]':<38} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
         print("-" * 78)
 
         for N, H, W, IC, K, R, S, pad, stride in configs:
             oasr_fn, pytorch_fn = setup_conv2d_activation(
                 N, H, W, IC, K, R, S, pad, stride, activation=act_type)
             oasr_ms = triton.testing.do_bench(oasr_fn, warmup=100, rep=500)
-            pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=100, rep=500)
+            pytorch_ms = triton.testing.do_bench(
+                pytorch_fn, warmup=100, rep=500)
             speedup = pytorch_ms / oasr_ms
             shape_str = f"[{N},{H},{W},{IC}->{K}] {R}x{S} p={pad} s={stride}"
-            print(f"{shape_str:<38} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
+            print(
+                f"{shape_str:<38} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
 
 
 PROFILE_CONFIGS = {
     'depthwise_conv1d': (64, 250, 512, 31),
     'depthwise_conv1d_causal': (64, 250, 512, 31),
     'pointwise_conv1d': (64, 250, 512, 1024),
-    'glu': (64, 250, 512),
-    'swish': (64, 250, 512),
-    'batch_norm_swish': (64, 250, 512),
     'conv_block': (64, 250, 512, 31),
     # (batch, H, W, IC, K, R, S, pad, stride)
     'conv2d': (16, 100, 40, 256, 256, 3, 3, 1, 1),
@@ -629,9 +492,6 @@ def profile_kernels(kernels: list, target: str = 'both', warmup: int = 3, iters:
         'depthwise_conv1d': lambda: setup_depthwise_conv1d(*PROFILE_CONFIGS['depthwise_conv1d']),
         'depthwise_conv1d_causal': lambda: setup_depthwise_conv1d_causal(*PROFILE_CONFIGS['depthwise_conv1d_causal']),
         'pointwise_conv1d': lambda: setup_pointwise_conv1d(*PROFILE_CONFIGS['pointwise_conv1d']),
-        'glu': lambda: setup_glu(*PROFILE_CONFIGS['glu']),
-        'swish': lambda: setup_swish(*PROFILE_CONFIGS['swish']),
-        'batch_norm_swish': lambda: setup_batch_norm_swish(*PROFILE_CONFIGS['batch_norm_swish']),
         'conv_block': lambda: setup_conv_block(*PROFILE_CONFIGS['conv_block']),
         'conv2d': lambda: setup_conv2d(*PROFILE_CONFIGS['conv2d']),
         'conv2d_activation': lambda: setup_conv2d_activation(*PROFILE_CONFIGS['conv2d_activation']),
@@ -686,8 +546,7 @@ Examples:
 
 Available kernels:
   depthwise_conv1d, depthwise_conv1d_causal, pointwise_conv1d,
-  glu, swish, batch_norm_swish, conv_block,
-  conv2d, conv2d_activation
+  conv_block, conv2d, conv2d_activation
         """
     )
 
@@ -719,9 +578,6 @@ Available kernels:
         benchmark_depthwise_conv1d()
         benchmark_depthwise_conv1d_causal()
         benchmark_pointwise_conv1d()
-        benchmark_glu()
-        benchmark_swish()
-        benchmark_batch_norm_swish()
         benchmark_conv2d()
         benchmark_conv2d_activation()
         benchmark_conv_block()

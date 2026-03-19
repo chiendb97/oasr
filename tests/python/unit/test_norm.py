@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 import oasr
 
+
 class TestLayerNorm:
     """Tests for LayerNorm kernel."""
 
@@ -26,23 +27,25 @@ class TestLayerNorm:
     def test_layer_norm(self, batch_size, seq_len, hidden_size, dtype):
         """Test LayerNorm against PyTorch reference."""
         eps = 1e-5
-        
-        x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
+
+        x = torch.randn(batch_size, seq_len, hidden_size,
+                        device='cuda', dtype=dtype)
         weight = torch.randn(hidden_size, device='cuda', dtype=dtype)
         bias = torch.randn(hidden_size, device='cuda', dtype=dtype)
-        
+
         output = oasr.kernels.norm.layer_norm(
             x, weight, bias,
             eps
         )
         oasr.synchronize()
-        
+
         # PyTorch reference
-        layer_norm = torch.nn.LayerNorm(hidden_size, eps=eps, device='cuda', dtype=dtype)
+        layer_norm = torch.nn.LayerNorm(
+            hidden_size, eps=eps, device='cuda', dtype=dtype)
         layer_norm.weight.data = weight.clone()
         layer_norm.bias.data = bias.clone()
         expected = layer_norm(x)
-        
+
         rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
@@ -51,21 +54,22 @@ class TestLayerNorm:
         batch_size, seq_len, hidden_size = 2, 128, 256
         eps = 1e-5
         dtype = torch.float32
-        
-        x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
+
+        x = torch.randn(batch_size, seq_len, hidden_size,
+                        device='cuda', dtype=dtype)
         weight = torch.randn(hidden_size, device='cuda', dtype=dtype)
-        
+
         output = oasr.kernels.norm.layer_norm(
             x, weight, None,
             eps
         )
         oasr.synchronize()
-        
+
         # Manual reference without beta
         mean = x.mean(dim=-1, keepdim=True)
         var = x.var(dim=-1, keepdim=True, unbiased=False)
         expected = (x - mean) / torch.sqrt(var + eps) * weight
-        
+
         torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
 
 
@@ -81,21 +85,22 @@ class TestRMSNorm:
     def test_rms_norm(self, batch_size, seq_len, hidden_size, dtype):
         """Test RMSNorm against reference implementation."""
         eps = 1e-5
-        
-        x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
+
+        x = torch.randn(batch_size, seq_len, hidden_size,
+                        device='cuda', dtype=dtype)
         weight = torch.randn(hidden_size, device='cuda', dtype=dtype)
         bias = torch.randn(hidden_size, device='cuda', dtype=dtype)
-        
+
         output = oasr.kernels.norm.rms_norm(
             x, weight, bias,
             eps
         )
         oasr.synchronize()
-        
+
         # Reference: RMS = sqrt(mean(x^2) + eps)
         rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
         expected = x / rms * weight + bias
-        
+
         rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
@@ -111,25 +116,28 @@ class TestAddLayerNorm:
         """Test fused Add + LayerNorm."""
         eps = 1e-5
         dtype = torch.float32
-        
-        x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
-        residual = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=dtype)
+
+        x = torch.randn(batch_size, seq_len, hidden_size,
+                        device='cuda', dtype=dtype)
+        residual = torch.randn(batch_size, seq_len,
+                               hidden_size, device='cuda', dtype=dtype)
         weight = torch.randn(hidden_size, device='cuda', dtype=dtype)
         bias = torch.randn(hidden_size, device='cuda', dtype=dtype)
-        
+
         output = oasr.kernels.norm.add_layer_norm(
             x, residual,
             weight, bias,
             eps
         )
         oasr.synchronize()
-        
+
         # Reference
-        layer_norm = torch.nn.LayerNorm(hidden_size, eps=eps, device='cuda', dtype=dtype)
+        layer_norm = torch.nn.LayerNorm(
+            hidden_size, eps=eps, device='cuda', dtype=dtype)
         layer_norm.weight.data = weight.clone()
         layer_norm.bias.data = bias.clone()
         expected = layer_norm(x + residual)
-        
+
         torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
 
 
@@ -144,23 +152,26 @@ class TestBatchNorm1D:
         """Test BatchNorm1D in inference mode."""
         eps = 1e-5
         dtype = torch.float32
-        
-        x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
+
+        x = torch.randn(batch_size, seq_len, channels,
+                        device='cuda', dtype=dtype)
         weight = torch.randn(channels, device='cuda', dtype=dtype)
         bias = torch.randn(channels, device='cuda', dtype=dtype)
         running_mean = torch.randn(channels, device='cuda', dtype=dtype)
-        running_var = torch.abs(torch.randn(channels, device='cuda', dtype=dtype)) + 0.1
-        
+        running_var = torch.abs(torch.randn(
+            channels, device='cuda', dtype=dtype)) + 0.1
+
         output = oasr.kernels.norm.batch_norm_1d(
             x, weight, bias,
             running_mean, running_var,
             eps
         )
         oasr.synchronize()
-        
+
         # Reference: (x - mean) / sqrt(var + eps) * gamma + beta
-        expected = (x - running_mean) / torch.sqrt(running_var + eps) * weight + bias
-        
+        expected = (x - running_mean) / \
+            torch.sqrt(running_var + eps) * weight + bias
+
         torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
 
 
@@ -177,27 +188,65 @@ class TestGroupNorm:
         """Test GroupNorm kernel."""
         eps = 1e-5
         dtype = torch.float32
-        
-        x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
+
+        x = torch.randn(batch_size, seq_len, channels,
+                        device='cuda', dtype=dtype)
         weight = torch.randn(channels, device='cuda', dtype=dtype)
         bias = torch.randn(channels, device='cuda', dtype=dtype)
-        
+
         output = oasr.kernels.norm.group_norm(
             x, weight, bias,
             num_groups,
             eps
         )
         oasr.synchronize()
-        
+
         # Reference (manual GroupNorm for [N, T, C] format)
         channels_per_group = channels // num_groups
-        x_reshaped = x.view(batch_size, seq_len, num_groups, channels_per_group)
+        x_reshaped = x.view(batch_size, seq_len,
+                            num_groups, channels_per_group)
         mean = x_reshaped.mean(dim=-1, keepdim=True)
         var = x_reshaped.var(dim=-1, keepdim=True, unbiased=False)
         x_norm = (x_reshaped - mean) / torch.sqrt(var + eps)
         x_norm = x_norm.view(batch_size, seq_len, channels)
         expected = x_norm * weight + bias
-        
+
+        torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
+
+
+class TestBatchNormSwish:
+    """Tests for fused BatchNorm + Swish kernel."""
+
+    @pytest.mark.parametrize("batch_size,seq_len,channels", [
+        (2, 128, 256),
+        (4, 64, 512),
+    ])
+    def test_batch_norm_swish(self, batch_size, seq_len, channels):
+        """Test fused BatchNorm + Swish."""
+        eps = 1e-5
+        dtype = torch.float32
+
+        x = torch.randn(batch_size, seq_len, channels,
+                        device='cuda', dtype=dtype)
+        gamma = torch.randn(channels, device='cuda', dtype=dtype)
+        beta = torch.randn(channels, device='cuda', dtype=dtype)
+        running_mean = torch.randn(channels, device='cuda', dtype=dtype)
+        running_var = torch.abs(torch.randn(
+            channels, device='cuda', dtype=dtype)) + 0.1
+
+        output = oasr.kernels.norm.batch_norm_swish(
+            x,
+            gamma, beta,
+            running_mean, running_var,
+            eps
+        )
+        oasr.synchronize()
+
+        # Reference: BatchNorm then Swish
+        bn_out = (x - running_mean) / \
+            torch.sqrt(running_var + eps) * gamma + beta
+        expected = F.silu(bn_out)
+
         torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
 
 

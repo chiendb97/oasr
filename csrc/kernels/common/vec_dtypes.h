@@ -3,8 +3,8 @@
 
 #pragma once
 
-#include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace oasr {
@@ -17,7 +17,7 @@ namespace oasr {
 template <typename T, int VecSize>
 struct Vec {
     T data[VecSize];
-    
+
     __device__ __forceinline__ T& operator[](int i) { return data[i]; }
     __device__ __forceinline__ const T& operator[](int i) const { return data[i]; }
 };
@@ -29,34 +29,30 @@ struct Vec {
 template <>
 struct Vec<float, 1> {
     float data;
-    
+
     __device__ __forceinline__ float& operator[](int i) { return data; }
     __device__ __forceinline__ const float& operator[](int i) const { return data; }
-    
-    __device__ __forceinline__ void load(const float* ptr) {
-        data = *ptr;
-    }
-    
-    __device__ __forceinline__ void store(float* ptr) const {
-        *ptr = data;
-    }
+
+    __device__ __forceinline__ void load(const float* ptr) { data = *ptr; }
+
+    __device__ __forceinline__ void store(float* ptr) const { *ptr = data; }
 };
 
 template <>
 struct Vec<float, 2> {
     float2 data;
-    
-    __device__ __forceinline__ float& operator[](int i) { 
-        return reinterpret_cast<float*>(&data)[i]; 
+
+    __device__ __forceinline__ float& operator[](int i) {
+        return reinterpret_cast<float*>(&data)[i];
     }
-    __device__ __forceinline__ const float& operator[](int i) const { 
-        return reinterpret_cast<const float*>(&data)[i]; 
+    __device__ __forceinline__ const float& operator[](int i) const {
+        return reinterpret_cast<const float*>(&data)[i];
     }
-    
+
     __device__ __forceinline__ void load(const float* ptr) {
         data = *reinterpret_cast<const float2*>(ptr);
     }
-    
+
     __device__ __forceinline__ void store(float* ptr) const {
         *reinterpret_cast<float2*>(ptr) = data;
     }
@@ -65,18 +61,18 @@ struct Vec<float, 2> {
 template <>
 struct Vec<float, 4> {
     float4 data;
-    
-    __device__ __forceinline__ float& operator[](int i) { 
-        return reinterpret_cast<float*>(&data)[i]; 
+
+    __device__ __forceinline__ float& operator[](int i) {
+        return reinterpret_cast<float*>(&data)[i];
     }
-    __device__ __forceinline__ const float& operator[](int i) const { 
-        return reinterpret_cast<const float*>(&data)[i]; 
+    __device__ __forceinline__ const float& operator[](int i) const {
+        return reinterpret_cast<const float*>(&data)[i];
     }
-    
+
     __device__ __forceinline__ void load(const float* ptr) {
         data = *reinterpret_cast<const float4*>(ptr);
     }
-    
+
     __device__ __forceinline__ void store(float* ptr) const {
         *reinterpret_cast<float4*>(ptr) = data;
     }
@@ -89,34 +85,28 @@ struct Vec<float, 4> {
 template <>
 struct Vec<half, 1> {
     half data;
-    
+
     __device__ __forceinline__ half& operator[](int i) { return data; }
     __device__ __forceinline__ const half& operator[](int i) const { return data; }
-    
-    __device__ __forceinline__ void load(const half* ptr) {
-        data = *ptr;
-    }
-    
-    __device__ __forceinline__ void store(half* ptr) const {
-        *ptr = data;
-    }
+
+    __device__ __forceinline__ void load(const half* ptr) { data = *ptr; }
+
+    __device__ __forceinline__ void store(half* ptr) const { *ptr = data; }
 };
 
 template <>
 struct Vec<half, 2> {
     half2 data;
-    
-    __device__ __forceinline__ half& operator[](int i) { 
-        return reinterpret_cast<half*>(&data)[i]; 
+
+    __device__ __forceinline__ half& operator[](int i) { return reinterpret_cast<half*>(&data)[i]; }
+    __device__ __forceinline__ const half& operator[](int i) const {
+        return reinterpret_cast<const half*>(&data)[i];
     }
-    __device__ __forceinline__ const half& operator[](int i) const { 
-        return reinterpret_cast<const half*>(&data)[i]; 
-    }
-    
+
     __device__ __forceinline__ void load(const half* ptr) {
         data = *reinterpret_cast<const half2*>(ptr);
     }
-    
+
     __device__ __forceinline__ void store(half* ptr) const {
         *reinterpret_cast<half2*>(ptr) = data;
     }
@@ -125,20 +115,18 @@ struct Vec<half, 2> {
 template <>
 struct Vec<half, 4> {
     half2 data[2];
-    
-    __device__ __forceinline__ half& operator[](int i) { 
-        return reinterpret_cast<half*>(data)[i]; 
+
+    __device__ __forceinline__ half& operator[](int i) { return reinterpret_cast<half*>(data)[i]; }
+    __device__ __forceinline__ const half& operator[](int i) const {
+        return reinterpret_cast<const half*>(data)[i];
     }
-    __device__ __forceinline__ const half& operator[](int i) const { 
-        return reinterpret_cast<const half*>(data)[i]; 
-    }
-    
+
     __device__ __forceinline__ void load(const half* ptr) {
         float2 tmp = *reinterpret_cast<const float2*>(ptr);
         data[0] = reinterpret_cast<half2*>(&tmp)[0];
         data[1] = reinterpret_cast<half2*>(&tmp)[1];
     }
-    
+
     __device__ __forceinline__ void store(half* ptr) const {
         *reinterpret_cast<float2*>(ptr) = *reinterpret_cast<const float2*>(data);
     }
@@ -147,14 +135,12 @@ struct Vec<half, 4> {
 template <>
 struct Vec<half, 8> {
     half2 data[4];
-    
-    __device__ __forceinline__ half& operator[](int i) { 
-        return reinterpret_cast<half*>(data)[i]; 
+
+    __device__ __forceinline__ half& operator[](int i) { return reinterpret_cast<half*>(data)[i]; }
+    __device__ __forceinline__ const half& operator[](int i) const {
+        return reinterpret_cast<const half*>(data)[i];
     }
-    __device__ __forceinline__ const half& operator[](int i) const { 
-        return reinterpret_cast<const half*>(data)[i]; 
-    }
-    
+
     __device__ __forceinline__ void load(const half* ptr) {
         float4 tmp = *reinterpret_cast<const float4*>(ptr);
         data[0] = reinterpret_cast<half2*>(&tmp)[0];
@@ -162,7 +148,7 @@ struct Vec<half, 8> {
         data[2] = reinterpret_cast<half2*>(&tmp)[2];
         data[3] = reinterpret_cast<half2*>(&tmp)[3];
     }
-    
+
     __device__ __forceinline__ void store(half* ptr) const {
         *reinterpret_cast<float4*>(ptr) = *reinterpret_cast<const float4*>(data);
     }
@@ -175,34 +161,30 @@ struct Vec<half, 8> {
 template <>
 struct Vec<__nv_bfloat16, 1> {
     __nv_bfloat16 data;
-    
+
     __device__ __forceinline__ __nv_bfloat16& operator[](int i) { return data; }
     __device__ __forceinline__ const __nv_bfloat16& operator[](int i) const { return data; }
-    
-    __device__ __forceinline__ void load(const __nv_bfloat16* ptr) {
-        data = *ptr;
-    }
-    
-    __device__ __forceinline__ void store(__nv_bfloat16* ptr) const {
-        *ptr = data;
-    }
+
+    __device__ __forceinline__ void load(const __nv_bfloat16* ptr) { data = *ptr; }
+
+    __device__ __forceinline__ void store(__nv_bfloat16* ptr) const { *ptr = data; }
 };
 
 template <>
 struct Vec<__nv_bfloat16, 2> {
     __nv_bfloat162 data;
-    
-    __device__ __forceinline__ __nv_bfloat16& operator[](int i) { 
-        return reinterpret_cast<__nv_bfloat16*>(&data)[i]; 
+
+    __device__ __forceinline__ __nv_bfloat16& operator[](int i) {
+        return reinterpret_cast<__nv_bfloat16*>(&data)[i];
     }
-    __device__ __forceinline__ const __nv_bfloat16& operator[](int i) const { 
-        return reinterpret_cast<const __nv_bfloat16*>(&data)[i]; 
+    __device__ __forceinline__ const __nv_bfloat16& operator[](int i) const {
+        return reinterpret_cast<const __nv_bfloat16*>(&data)[i];
     }
-    
+
     __device__ __forceinline__ void load(const __nv_bfloat16* ptr) {
         data = *reinterpret_cast<const __nv_bfloat162*>(ptr);
     }
-    
+
     __device__ __forceinline__ void store(__nv_bfloat16* ptr) const {
         *reinterpret_cast<__nv_bfloat162*>(ptr) = data;
     }
@@ -211,20 +193,20 @@ struct Vec<__nv_bfloat16, 2> {
 template <>
 struct Vec<__nv_bfloat16, 4> {
     __nv_bfloat162 data[2];
-    
-    __device__ __forceinline__ __nv_bfloat16& operator[](int i) { 
-        return reinterpret_cast<__nv_bfloat16*>(data)[i]; 
+
+    __device__ __forceinline__ __nv_bfloat16& operator[](int i) {
+        return reinterpret_cast<__nv_bfloat16*>(data)[i];
     }
-    __device__ __forceinline__ const __nv_bfloat16& operator[](int i) const { 
-        return reinterpret_cast<const __nv_bfloat16*>(data)[i]; 
+    __device__ __forceinline__ const __nv_bfloat16& operator[](int i) const {
+        return reinterpret_cast<const __nv_bfloat16*>(data)[i];
     }
-    
+
     __device__ __forceinline__ void load(const __nv_bfloat16* ptr) {
         float2 tmp = *reinterpret_cast<const float2*>(ptr);
         data[0] = reinterpret_cast<__nv_bfloat162*>(&tmp)[0];
         data[1] = reinterpret_cast<__nv_bfloat162*>(&tmp)[1];
     }
-    
+
     __device__ __forceinline__ void store(__nv_bfloat16* ptr) const {
         *reinterpret_cast<float2*>(ptr) = *reinterpret_cast<const float2*>(data);
     }
@@ -233,14 +215,14 @@ struct Vec<__nv_bfloat16, 4> {
 template <>
 struct Vec<__nv_bfloat16, 8> {
     __nv_bfloat162 data[4];
-    
-    __device__ __forceinline__ __nv_bfloat16& operator[](int i) { 
-        return reinterpret_cast<__nv_bfloat16*>(data)[i]; 
+
+    __device__ __forceinline__ __nv_bfloat16& operator[](int i) {
+        return reinterpret_cast<__nv_bfloat16*>(data)[i];
     }
-    __device__ __forceinline__ const __nv_bfloat16& operator[](int i) const { 
-        return reinterpret_cast<const __nv_bfloat16*>(data)[i]; 
+    __device__ __forceinline__ const __nv_bfloat16& operator[](int i) const {
+        return reinterpret_cast<const __nv_bfloat16*>(data)[i];
     }
-    
+
     __device__ __forceinline__ void load(const __nv_bfloat16* ptr) {
         float4 tmp = *reinterpret_cast<const float4*>(ptr);
         data[0] = reinterpret_cast<__nv_bfloat162*>(&tmp)[0];
@@ -248,7 +230,7 @@ struct Vec<__nv_bfloat16, 8> {
         data[2] = reinterpret_cast<__nv_bfloat162*>(&tmp)[2];
         data[3] = reinterpret_cast<__nv_bfloat162*>(&tmp)[3];
     }
-    
+
     __device__ __forceinline__ void store(__nv_bfloat16* ptr) const {
         *reinterpret_cast<float4*>(ptr) = *reinterpret_cast<const float4*>(data);
     }
@@ -299,7 +281,7 @@ __device__ __forceinline__ void storeVec(T* ptr, const Vec<T, VecSize>& v) {
 // Convert vector elements to float for accumulation
 template <typename T, int VecSize>
 __device__ __forceinline__ void vecToFloat(const Vec<T, VecSize>& v, float* out) {
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < VecSize; i++) {
         out[i] = static_cast<float>(v[i]);
     }
@@ -308,7 +290,7 @@ __device__ __forceinline__ void vecToFloat(const Vec<T, VecSize>& v, float* out)
 // Convert float array back to vector type
 template <typename T, int VecSize>
 __device__ __forceinline__ void floatToVec(const float* in, Vec<T, VecSize>& v) {
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < VecSize; i++) {
         v[i] = static_cast<T>(in[i]);
     }
@@ -318,7 +300,7 @@ __device__ __forceinline__ void floatToVec(const float* in, Vec<T, VecSize>& v) 
 template <typename T, int VecSize>
 __device__ __forceinline__ float vecSum(const Vec<T, VecSize>& v) {
     float sum = 0.0f;
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < VecSize; i++) {
         sum += static_cast<float>(v[i]);
     }
@@ -329,7 +311,7 @@ __device__ __forceinline__ float vecSum(const Vec<T, VecSize>& v) {
 template <typename T, int VecSize>
 __device__ __forceinline__ float vecSumSquares(const Vec<T, VecSize>& v) {
     float sum = 0.0f;
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < VecSize; i++) {
         float val = static_cast<float>(v[i]);
         sum += val * val;
@@ -341,7 +323,7 @@ __device__ __forceinline__ float vecSumSquares(const Vec<T, VecSize>& v) {
 template <typename T, int VecSize>
 __device__ __forceinline__ float vecSumSquaredDiff(const Vec<T, VecSize>& v, float mean) {
     float sum = 0.0f;
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < VecSize; i++) {
         float diff = static_cast<float>(v[i]) - mean;
         sum += diff * diff;
@@ -369,4 +351,4 @@ using Vec8 = Vec<T, 8>;
 template <typename T>
 using OptVec = Vec<T, VecTypeTrait<T>::VecSize>;
 
-} // namespace oasr
+}  // namespace oasr

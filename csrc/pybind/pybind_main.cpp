@@ -6,6 +6,7 @@
 #include <torch/extension.h>
 
 #include "kernels/common/types.h"
+#include "pybind_activation.h"
 #include "pybind_conv.h"
 #include "pybind_decoder.h"
 #include "pybind_gemm.h"
@@ -95,6 +96,7 @@ PYBIND11_MODULE(_C, m) {
     oasr::pybind::registerNormBindings(kernels);
     oasr::pybind::registerConvBindings(kernels);
     oasr::pybind::registerGemmBindings(kernels);
+    oasr::pybind::registerActivationBindings(kernels);
 
     // =========================================================================
     // Decoder bindings

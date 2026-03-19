@@ -5,7 +5,8 @@
 
 #include <torch/extension.h>
 
-#include "kernels/conv/conv_kernels.h"
+#include "kernels/conv/conv1d_kernels.h"
+#include "kernels/conv/conv2d_kernels.h"
 
 namespace py = pybind11;
 
@@ -70,55 +71,23 @@ inline void registerConvBindings(py::module_& kernels) {
         "Pointwise (1x1) convolution with activation kernel");
 
     conv.def(
-        "glu",
-        [](const torch::Tensor& input) -> torch::Tensor {
-            int batch_size = input.size(0);
-            int seq_len = input.size(1);
-            int channels = input.size(2) / 2;
-            return oasr::kernels::invokeGLU(input, nullptr);
-        },
-        py::arg("input"),
-        "GLU (Gated Linear Unit) activation kernel");
-
-    conv.def(
-        "swish",
-        [](const torch::Tensor& input) -> torch::Tensor {
-            return oasr::kernels::invokeSwish(input, nullptr);
-        },
-        py::arg("input"), "Swish activation kernel");
-
-    conv.def(
-        "batch_norm_swish",
-        [](const torch::Tensor& input, const torch::Tensor& gamma, const torch::Tensor& beta,
-           const torch::Tensor& running_mean, const torch::Tensor& running_var, float eps) -> torch::Tensor {
-            return oasr::kernels::invokeBatchNormSwish(input, gamma, beta, running_mean,
-                                                       running_var, eps, nullptr);
-        },
-        py::arg("input"), py::arg("gamma"), py::arg("beta"), py::arg("running_mean"),
-        py::arg("running_var"), py::arg("eps") = 1e-5f,
-        "Fused BatchNorm + Swish kernel");
-
-    conv.def(
         "conv2d",
-        [](const torch::Tensor& input, const torch::Tensor& filter, py::object bias_obj,
-           int pad_h, int pad_w, int stride_h, int stride_w, int dilation_h, int dilation_w,
+        [](const torch::Tensor& input, const torch::Tensor& filter, py::object bias_obj, int pad_h,
+           int pad_w, int stride_h, int stride_w, int dilation_h, int dilation_w,
            py::object stream_obj) -> torch::Tensor {
             torch::Tensor bias;
             if (!bias_obj.is_none()) {
                 bias = bias_obj.cast<torch::Tensor>();
             }
-            cudaStream_t stream =
-                stream_obj.is_none()
-                    ? nullptr
-                    : reinterpret_cast<cudaStream_t>(stream_obj.cast<intptr_t>());
+            cudaStream_t stream = stream_obj.is_none()
+                                      ? nullptr
+                                      : reinterpret_cast<cudaStream_t>(stream_obj.cast<intptr_t>());
             return oasr::kernels::invokeConv2d(input, filter, bias, pad_h, pad_w, stride_h,
                                                stride_w, dilation_h, dilation_w, stream);
         },
-        py::arg("input"), py::arg("filter"), py::arg("bias") = py::none(),
-        py::arg("pad_h") = 0, py::arg("pad_w") = 0,
-        py::arg("stride_h") = 1, py::arg("stride_w") = 1,
-        py::arg("dilation_h") = 1, py::arg("dilation_w") = 1,
-        py::arg("stream") = py::none(),
+        py::arg("input"), py::arg("filter"), py::arg("bias") = py::none(), py::arg("pad_h") = 0,
+        py::arg("pad_w") = 0, py::arg("stride_h") = 1, py::arg("stride_w") = 1,
+        py::arg("dilation_h") = 1, py::arg("dilation_w") = 1, py::arg("stream") = py::none(),
         "2D convolution (NHWC layout, FP16/BF16) using CUTLASS Ampere Tensor Core Implicit GEMM. "
         "input [N,H,W,IC], filter [K,R,S,IC], bias [K] (optional), output [N,P,Q,K]. "
         "Requires IC % 8 == 0 and K % 8 == 0.");
@@ -132,20 +101,17 @@ inline void registerConvBindings(py::module_& kernels) {
             if (!bias_obj.is_none()) {
                 bias = bias_obj.cast<torch::Tensor>();
             }
-            cudaStream_t stream =
-                stream_obj.is_none()
-                    ? nullptr
-                    : reinterpret_cast<cudaStream_t>(stream_obj.cast<intptr_t>());
+            cudaStream_t stream = stream_obj.is_none()
+                                      ? nullptr
+                                      : reinterpret_cast<cudaStream_t>(stream_obj.cast<intptr_t>());
             return oasr::kernels::invokeConv2dActivation(input, filter, bias, activation, pad_h,
-                                                          pad_w, stride_h, stride_w, dilation_h,
-                                                          dilation_w, stream);
+                                                         pad_w, stride_h, stride_w, dilation_h,
+                                                         dilation_w, stream);
         },
         py::arg("input"), py::arg("filter"), py::arg("bias") = py::none(),
-        py::arg("activation") = ActivationType::SWISH,
-        py::arg("pad_h") = 0, py::arg("pad_w") = 0,
-        py::arg("stride_h") = 1, py::arg("stride_w") = 1,
-        py::arg("dilation_h") = 1, py::arg("dilation_w") = 1,
-        py::arg("stream") = py::none(),
+        py::arg("activation") = ActivationType::SWISH, py::arg("pad_h") = 0, py::arg("pad_w") = 0,
+        py::arg("stride_h") = 1, py::arg("stride_w") = 1, py::arg("dilation_h") = 1,
+        py::arg("dilation_w") = 1, py::arg("stream") = py::none(),
         "2D convolution with fused activation (NHWC layout, FP16/BF16) using CUTLASS Ampere "
         "Tensor Core Implicit GEMM. "
         "input [N,H,W,IC], filter [K,R,S,IC], bias [K] (optional), output [N,P,Q,K]. "
