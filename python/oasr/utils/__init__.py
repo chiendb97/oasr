@@ -9,6 +9,7 @@ from .mappings import (
     get_activation_type,
     get_dtype,
     get_norm,
+    get_norm_activation,
     get_norm_type,
 )
 from .timer import Timer
@@ -19,5 +20,6 @@ __all__ = [
     "get_activation_type",
     "get_dtype",
     "get_norm",
+    "get_norm_activation",
     "get_norm_type",
 ]

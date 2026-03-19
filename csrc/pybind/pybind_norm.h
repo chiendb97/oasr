@@ -93,6 +93,49 @@ inline void registerNormBindings(py::module_& kernels) {
         },
         py::arg("input"), py::arg("gamma"), py::arg("beta"), py::arg("running_mean"),
         py::arg("running_var"), py::arg("eps") = 1e-5f, "Fused BatchNorm + Swish kernel");
+
+    norm.def(
+        "layer_norm_activation",
+        [](const torch::Tensor& input, const torch::Tensor& weight, py::object bias_obj,
+           float eps, oasr::ActivationType activation) -> torch::Tensor {
+            torch::Tensor bias;
+            if (!bias_obj.is_none()) {
+                bias = bias_obj.cast<torch::Tensor>();
+            }
+            return oasr::kernels::invokeLayerNormActivation(input, weight, bias, eps, activation,
+                                                             nullptr);
+        },
+        py::arg("input"), py::arg("weight"), py::arg("bias") = py::none(),
+        py::arg("eps") = 1e-5f, py::arg("activation") = oasr::ActivationType::SWISH,
+        "Fused LayerNorm + Activation kernel");
+
+    norm.def(
+        "rms_norm_activation",
+        [](const torch::Tensor& input, const torch::Tensor& weight, py::object bias_obj,
+           float eps, oasr::ActivationType activation) -> torch::Tensor {
+            torch::Tensor bias;
+            if (!bias_obj.is_none()) {
+                bias = bias_obj.cast<torch::Tensor>();
+            }
+            return oasr::kernels::invokeRMSNormActivation(input, weight, bias, eps, activation,
+                                                           nullptr);
+        },
+        py::arg("input"), py::arg("weight"), py::arg("bias") = py::none(),
+        py::arg("eps") = 1e-5f, py::arg("activation") = oasr::ActivationType::SWISH,
+        "Fused RMSNorm + Activation kernel");
+
+    norm.def(
+        "batch_norm_activation",
+        [](const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& bias,
+           const torch::Tensor& running_mean, const torch::Tensor& running_var, float eps,
+           oasr::ActivationType activation) -> torch::Tensor {
+            return oasr::kernels::invokeBatchNormActivation(input, weight, bias, running_mean,
+                                                             running_var, eps, activation, nullptr);
+        },
+        py::arg("input"), py::arg("weight"), py::arg("bias"), py::arg("running_mean"),
+        py::arg("running_var"), py::arg("eps") = 1e-5f,
+        py::arg("activation") = oasr::ActivationType::SWISH,
+        "Fused BatchNorm + Activation kernel");
 }
 
 }  // namespace pybind

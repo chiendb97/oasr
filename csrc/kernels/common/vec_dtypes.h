@@ -287,15 +287,6 @@ __device__ __forceinline__ void vecToFloat(const Vec<T, VecSize>& v, float* out)
     }
 }
 
-// Convert float array back to vector type
-template <typename T, int VecSize>
-__device__ __forceinline__ void floatToVec(const float* in, Vec<T, VecSize>& v) {
-#pragma unroll
-    for (int i = 0; i < VecSize; i++) {
-        v[i] = static_cast<T>(in[i]);
-    }
-}
-
 // Sum all elements in a vector
 template <typename T, int VecSize>
 __device__ __forceinline__ float vecSum(const Vec<T, VecSize>& v) {
@@ -319,16 +310,147 @@ __device__ __forceinline__ float vecSumSquares(const Vec<T, VecSize>& v) {
     return sum;
 }
 
-// Sum of squared differences from mean
-template <typename T, int VecSize>
-__device__ __forceinline__ float vecSumSquaredDiff(const Vec<T, VecSize>& v, float mean) {
-    float sum = 0.0f;
+// =============================================================================
+// Arithmetic Operator Overloads (element-wise, computed in float)
+// Supports mixed types: Vec<T1, N> op Vec<T2, N> -> Vec<T1, N>
+// =============================================================================
+
+// Vec + Vec (mixed-type)
+template <typename T1, typename T2, int VecSize>
+__device__ __forceinline__ Vec<T1, VecSize> operator+(const Vec<T1, VecSize>& a,
+                                                      const Vec<T2, VecSize>& b) {
+    Vec<T1, VecSize> result;
 #pragma unroll
     for (int i = 0; i < VecSize; i++) {
-        float diff = static_cast<float>(v[i]) - mean;
-        sum += diff * diff;
+        result[i] = static_cast<T1>(static_cast<float>(a[i]) + static_cast<float>(b[i]));
     }
-    return sum;
+    return result;
+}
+
+// Vec - Vec (mixed-type)
+template <typename T1, typename T2, int VecSize>
+__device__ __forceinline__ Vec<T1, VecSize> operator-(const Vec<T1, VecSize>& a,
+                                                      const Vec<T2, VecSize>& b) {
+    Vec<T1, VecSize> result;
+#pragma unroll
+    for (int i = 0; i < VecSize; i++) {
+        result[i] = static_cast<T1>(static_cast<float>(a[i]) - static_cast<float>(b[i]));
+    }
+    return result;
+}
+
+// Vec * Vec (mixed-type)
+template <typename T1, typename T2, int VecSize>
+__device__ __forceinline__ Vec<T1, VecSize> operator*(const Vec<T1, VecSize>& a,
+                                                      const Vec<T2, VecSize>& b) {
+    Vec<T1, VecSize> result;
+#pragma unroll
+    for (int i = 0; i < VecSize; i++) {
+        result[i] = static_cast<T1>(static_cast<float>(a[i]) * static_cast<float>(b[i]));
+    }
+    return result;
+}
+
+// Vec / Vec (mixed-type)
+template <typename T1, typename T2, int VecSize>
+__device__ __forceinline__ Vec<T1, VecSize> operator/(const Vec<T1, VecSize>& a,
+                                                      const Vec<T2, VecSize>& b) {
+    Vec<T1, VecSize> result;
+#pragma unroll
+    for (int i = 0; i < VecSize; i++) {
+        result[i] = static_cast<T1>(static_cast<float>(a[i]) / static_cast<float>(b[i]));
+    }
+    return result;
+}
+
+// Vec + scalar
+template <typename T, int VecSize>
+__device__ __forceinline__ Vec<T, VecSize> operator+(const Vec<T, VecSize>& a, float scalar) {
+    Vec<T, VecSize> result;
+#pragma unroll
+    for (int i = 0; i < VecSize; i++) {
+        result[i] = static_cast<T>(static_cast<float>(a[i]) + scalar);
+    }
+    return result;
+}
+
+// scalar + Vec
+template <typename T, int VecSize>
+__device__ __forceinline__ Vec<T, VecSize> operator+(float scalar, const Vec<T, VecSize>& a) {
+    return a + scalar;
+}
+
+// Vec - scalar
+template <typename T, int VecSize>
+__device__ __forceinline__ Vec<T, VecSize> operator-(const Vec<T, VecSize>& a, float scalar) {
+    Vec<T, VecSize> result;
+#pragma unroll
+    for (int i = 0; i < VecSize; i++) {
+        result[i] = static_cast<T>(static_cast<float>(a[i]) - scalar);
+    }
+    return result;
+}
+
+// scalar - Vec
+template <typename T, int VecSize>
+__device__ __forceinline__ Vec<T, VecSize> operator-(float scalar, const Vec<T, VecSize>& a) {
+    Vec<T, VecSize> result;
+#pragma unroll
+    for (int i = 0; i < VecSize; i++) {
+        result[i] = static_cast<T>(scalar - static_cast<float>(a[i]));
+    }
+    return result;
+}
+
+// Vec * scalar
+template <typename T, int VecSize>
+__device__ __forceinline__ Vec<T, VecSize> operator*(const Vec<T, VecSize>& a, float scalar) {
+    Vec<T, VecSize> result;
+#pragma unroll
+    for (int i = 0; i < VecSize; i++) {
+        result[i] = static_cast<T>(static_cast<float>(a[i]) * scalar);
+    }
+    return result;
+}
+
+// scalar * Vec
+template <typename T, int VecSize>
+__device__ __forceinline__ Vec<T, VecSize> operator*(float scalar, const Vec<T, VecSize>& a) {
+    return a * scalar;
+}
+
+// Vec / scalar
+template <typename T, int VecSize>
+__device__ __forceinline__ Vec<T, VecSize> operator/(const Vec<T, VecSize>& a, float scalar) {
+    Vec<T, VecSize> result;
+    float inv = 1.0f / scalar;
+#pragma unroll
+    for (int i = 0; i < VecSize; i++) {
+        result[i] = static_cast<T>(static_cast<float>(a[i]) * inv);
+    }
+    return result;
+}
+
+// scalar / Vec
+template <typename T, int VecSize>
+__device__ __forceinline__ Vec<T, VecSize> operator/(float scalar, const Vec<T, VecSize>& a) {
+    Vec<T, VecSize> result;
+#pragma unroll
+    for (int i = 0; i < VecSize; i++) {
+        result[i] = static_cast<T>(scalar / static_cast<float>(a[i]));
+    }
+    return result;
+}
+
+// Cast vector from one data type to another
+template <typename TDst, typename TSrc, int VecSize>
+__device__ __forceinline__ Vec<TDst, VecSize> vecCast(const Vec<TSrc, VecSize>& v) {
+    Vec<TDst, VecSize> result;
+#pragma unroll
+    for (int i = 0; i < VecSize; i++) {
+        result[i] = static_cast<TDst>(v[i]);
+    }
+    return result;
 }
 
 // =============================================================================
