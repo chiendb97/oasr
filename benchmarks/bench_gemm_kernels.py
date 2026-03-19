@@ -16,7 +16,6 @@ import torch.nn.functional as F
 import oasr
 
 
-
 # =============================================================================
 # Profiling utilities
 # =============================================================================
@@ -92,13 +91,29 @@ def setup_group_gemm(problem_sizes, dtype=torch.bfloat16):
     A = torch.randn(L, K, device='cuda', dtype=dtype)
     B = torch.randn(num_problems, N, K, device='cuda', dtype=dtype)
     B_transposed = B.transpose(1, 2).contiguous()
-    offset = torch.cumsum(torch.tensor(Ms, dtype=torch.int32, device='cuda'), dim=0, dtype=torch.int32)
+    offset = torch.cumsum(torch.tensor(
+        Ms, dtype=torch.int32, device='cuda'), dim=0, dtype=torch.int32)
 
     def oasr_fn():
         return oasr.kernels.gemm.group_gemm(A, B, offset, stream=None)
 
     def pytorch_fn():
-        return F.grouped_mm(A, B_transposed, offs=offset)
+        try:
+            D = torch.nn.functional.grouped_mm(
+                A, B_transposed, offs=offset)
+            return D
+        except:
+            D = torch.zeros(L, N, device='cuda', dtype=dtype)
+            num_groups = len(Ms)
+            s_idx = 0
+            for i in range(num_groups):
+                m_i = Ms[i]
+                D[s_idx: s_idx + m_i] = torch.matmul(
+                    A[s_idx: s_idx + m_i], B_transposed[i]
+                )
+                s_idx += m_i
+
+            return D
 
     return oasr_fn, pytorch_fn
 
@@ -127,7 +142,8 @@ def benchmark_gemm():
     print("\n" + "=" * 70)
     print("GEMM Benchmark")
     print("=" * 70)
-    print(f"\n{'Shape (M, N, K)':<25} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
+    print(
+        f"\n{'Shape (M, N, K)':<25} {'OASR (ms)':<12} {'PyTorch (ms)':<14} {'Speedup':<10}")
     print("-" * 65)
 
     for M, N, K in configs:
@@ -177,10 +193,10 @@ def benchmark_group_gemm():
     # Each config: (num_groups, (base_M, N, K)).
     # For benchmarking we keep N, K fixed per config and vary M across groups.
     configs = [
-        (8, (256, 64, 64)),
-        (8, (256, 128, 64)),
-        (16, (16000, 256, 2048)),
-        (16, (16000, 512, 2048)),
+        (32, (256, 64, 64)),
+        (32, (256, 128, 64)),
+        (64, (16000, 256, 2048)),
+        (64, (16000, 512, 2048)),
     ]
 
     print("\n" + "=" * 70)
@@ -195,7 +211,8 @@ def benchmark_group_gemm():
         # Sample M in a reasonable range around base_M
         low = max(16, base_M // 2)
         high = max(low + 1, base_M * 2)
-        Ms = torch.randint(low=low, high=high, size=(problem_count,), device='cuda').tolist()
+        Ms = torch.randint(low=low, high=high, size=(
+            problem_count,), device='cuda').tolist()
 
         problem_sizes = [(M_i, N, K) for M_i in Ms]
         oasr_fn, pytorch_fn = setup_group_gemm(problem_sizes)
@@ -205,7 +222,8 @@ def benchmark_group_gemm():
 
         speedup = pytorch_ms / oasr_ms
         config_str = f"{problem_count} x (M∈[{min(Ms)},{max(Ms)}], N={N}, K={K})"
-        print(f"{config_str:<40} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
+        print(
+            f"{config_str:<40} {oasr_ms:<12.4f} {pytorch_ms:<14.4f} {speedup:<10.2f}x")
 
 
 # =============================================================================
@@ -231,7 +249,8 @@ def profile_kernels(kernels: list, target: str = 'oasr', warmup: int = 3, iters:
         'gemm': lambda: setup_gemm(*PROFILE_CONFIGS['gemm']),
         'bmm': lambda: setup_bmm(*PROFILE_CONFIGS['bmm']),
         'group_gemm': lambda: setup_group_gemm(
-            [PROFILE_CONFIGS['group_gemm'][1]] * PROFILE_CONFIGS['group_gemm'][0]
+            [PROFILE_CONFIGS['group_gemm'][1]] *
+            PROFILE_CONFIGS['group_gemm'][0]
         ),
     }
 
@@ -248,11 +267,13 @@ def profile_kernels(kernels: list, target: str = 'oasr', warmup: int = 3, iters:
 
         if target in ('oasr', 'both'):
             print(f"  Running OASR kernel...")
-            profile_kernel(f"oasr_{kernel_name}", oasr_fn, warmup=warmup, profile_iters=iters)
+            profile_kernel(f"oasr_{kernel_name}", oasr_fn,
+                           warmup=warmup, profile_iters=iters)
 
         if target in ('pytorch', 'both'):
             print(f"  Running PyTorch kernel...")
-            profile_kernel(f"pytorch_{kernel_name}", pytorch_fn, warmup=warmup, profile_iters=iters)
+            profile_kernel(
+                f"pytorch_{kernel_name}", pytorch_fn, warmup=warmup, profile_iters=iters)
 
         print(f"  Done.")
 
@@ -286,15 +307,15 @@ Available kernels:
     )
 
     parser.add_argument('--profile', action='store_true',
-        help='Run in profiling mode (single iterations for ncu)')
+                        help='Run in profiling mode (single iterations for ncu)')
     parser.add_argument('--kernel', nargs='+', default=['all'],
-        help='Kernel(s) to profile (use "all" for all kernels)')
+                        help='Kernel(s) to profile (use "all" for all kernels)')
     parser.add_argument('--target', choices=['oasr', 'pytorch', 'both'], default='oasr',
-        help='Which implementation to profile (default: oasr)')
+                        help='Which implementation to profile (default: oasr)')
     parser.add_argument('--warmup', type=int, default=3,
-        help='Number of warmup iterations for profiling (default: 3)')
+                        help='Number of warmup iterations for profiling (default: 3)')
     parser.add_argument('--iters', type=int, default=1,
-        help='Number of profile iterations (default: 1)')
+                        help='Number of profile iterations (default: 1)')
 
     args = parser.parse_args()
 
@@ -303,7 +324,8 @@ Available kernels:
             kernels = list(PROFILE_CONFIGS.keys())
         else:
             kernels = args.kernel
-        profile_kernels(kernels, target=args.target, warmup=args.warmup, iters=args.iters)
+        profile_kernels(kernels, target=args.target,
+                        warmup=args.warmup, iters=args.iters)
     else:
         print("=" * 70)
         print("OASR GEMM Kernels - Performance Benchmarks")
