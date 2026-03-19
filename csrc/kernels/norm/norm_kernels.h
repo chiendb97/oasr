@@ -129,15 +129,15 @@ void invokeRMSNormTyped(const torch::Tensor& input, torch::Tensor& output,
 // Fused BatchNorm + Swish (inference mode)
 // Dimensions derived: batch_size=input.size(0), seq_len=input.size(1), channels=input.size(2)
 // @param input Input [batch, seq_len, channels]
-// @param gamma Scale tensor [channels]
-// @param beta Bias tensor [channels]
+// @param weight Scale tensor [channels]
+// @param bias Bias tensor [channels]
 // @param running_mean Running mean tensor [channels]
 // @param running_var Running variance tensor [channels]
 // @param eps Epsilon for numerical stability
 // @param stream CUDA stream
 // @return Output [batch, seq_len, channels]
-torch::Tensor invokeBatchNormSwish(const torch::Tensor& input, const torch::Tensor& gamma,
-                                   const torch::Tensor& beta, const torch::Tensor& running_mean,
+torch::Tensor invokeBatchNormSwish(const torch::Tensor& input, const torch::Tensor& weight,
+                                   const torch::Tensor& bias, const torch::Tensor& running_mean,
                                    const torch::Tensor& running_var, float eps,
                                    cudaStream_t stream);
 
