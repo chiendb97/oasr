@@ -44,7 +44,7 @@ def setup_glu(batch_size, seq_len, channels, dtype=torch.float16):
                     device='cuda', dtype=dtype)
 
     def oasr_fn():
-        return oasr.kernels.conv.glu(
+        return oasr.kernels.activation.glu(
             x
         )
 
@@ -59,7 +59,7 @@ def setup_swish(batch_size, seq_len, channels, dtype=torch.float16):
     x = torch.randn(batch_size, seq_len, channels, device='cuda', dtype=dtype)
 
     def oasr_fn():
-        return oasr.kernels.conv.swish(
+        return oasr.kernels.activation.swish(
             x
         )
 

@@ -138,13 +138,13 @@ def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.floa
         pw1_out = oasr.kernels.conv.pointwise_conv1d(
             x, pw1_weight, pw1_bias
         )
-        glu_out = oasr.kernels.conv.glu(
+        glu_out = oasr.kernels.activation.glu(
             pw1_out
         )
         dw_out = oasr.kernels.conv.depthwise_conv1d(
             glu_out, dw_weight, dw_bias, kernel_size // 2
         )
-        swish_out = oasr.kernels.conv.swish(
+        swish_out = oasr.kernels.activation.swish(
             dw_out
         )
         return oasr.kernels.conv.pointwise_conv1d(
