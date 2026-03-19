@@ -442,25 +442,15 @@ __device__ __forceinline__ Vec<T, VecSize> operator/(float scalar, const Vec<T, 
     return result;
 }
 
-// Convert float array back to vector type
-template <typename T, int VecSize>
-__device__ __forceinline__ void floatToVec(const float* in, Vec<T, VecSize>& v) {
+// Cast vector from one data type to another
+template <typename TDst, typename TSrc, int VecSize>
+__device__ __forceinline__ Vec<TDst, VecSize> vecCast(const Vec<TSrc, VecSize>& v) {
+    Vec<TDst, VecSize> result;
 #pragma unroll
     for (int i = 0; i < VecSize; i++) {
-        v[i] = static_cast<T>(in[i]);
+        result[i] = static_cast<TDst>(v[i]);
     }
-}
-
-// Sum of squared differences from mean
-template <typename T, int VecSize>
-__device__ __forceinline__ float vecSumSquaredDiff(const Vec<T, VecSize>& v, float mean) {
-    float sum = 0.0f;
-#pragma unroll
-    for (int i = 0; i < VecSize; i++) {
-        float diff = static_cast<float>(v[i]) - mean;
-        sum += diff * diff;
-    }
-    return sum;
+    return result;
 }
 
 // =============================================================================

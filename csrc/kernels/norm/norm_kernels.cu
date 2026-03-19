@@ -19,12 +19,8 @@ namespace oasr {
 namespace kernels {
 
 // Import vector types from oasr namespace
-using oasr::floatToVec;
-using oasr::loadVec;
-using oasr::storeVec;
 using oasr::Vec;
 using oasr::vecSum;
-using oasr::vecSumSquaredDiff;
 using oasr::vecSumSquares;
 using oasr::VecTypeTrait;
 
@@ -72,7 +68,11 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
         VecT v;
         v.load(row_input + i * VecSize);
-        local_var += vecSumSquaredDiff(v, mean);
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            float diff = static_cast<float>(v[j]) - mean;
+            local_var += diff * diff;
+        }
     }
 
     float variance = blockReduceSum(local_var) / static_cast<float>(hidden_size);
@@ -88,11 +88,11 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
 
     // Phase 3: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
-        VecT v_in, v_weight, v_out;
+        VecT v_in, v_weight;
         v_in.load(row_input + i * VecSize);
         v_weight.load(weight + i * VecSize);
 
-        float vals[VecSize];
+        Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
             float normalized = (static_cast<float>(v_in[j]) - mean) * inv_std;
@@ -108,8 +108,7 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
             }
         }
 
-        floatToVec<T, VecSize>(vals, v_out);
-        v_out.store(row_output + i * VecSize);
+        vecCast<T, float, VecSize>(vals).store(row_output + i * VecSize);
     }
 }
 
@@ -222,11 +221,11 @@ __global__ void rmsNormKernel(const T* __restrict__ input, T* __restrict__ outpu
 
     // Phase 2: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
-        VecT v_in, v_weight, v_out;
+        VecT v_in, v_weight;
         v_in.load(row_input + i * VecSize);
         v_weight.load(weight + i * VecSize);
 
-        float vals[VecSize];
+        Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
             vals[j] = static_cast<float>(v_in[j]) * inv_rms * static_cast<float>(v_weight[j]);
@@ -240,8 +239,7 @@ __global__ void rmsNormKernel(const T* __restrict__ input, T* __restrict__ outpu
                 vals[j] += static_cast<float>(v_bias[j]);
             }
         }
-        floatToVec<T, VecSize>(vals, v_out);
-        v_out.store(row_output + i * VecSize);
+        vecCast<T, float, VecSize>(vals).store(row_output + i * VecSize);
     }
 }
 
@@ -276,7 +274,7 @@ __global__ void batchNorm1DKernel(const T* __restrict__ input, T* __restrict__ o
             v_mean.load(running_mean + c_start);
             v_var.load(running_var + c_start);
 
-            float vals[VecSize];
+            Vec<float, VecSize> vals;
 #pragma unroll
             for (int j = 0; j < VecSize; j++) {
                 float inv_std = rsqrtf(static_cast<float>(v_var[j]) + eps);
@@ -286,8 +284,7 @@ __global__ void batchNorm1DKernel(const T* __restrict__ input, T* __restrict__ o
                     normalized * static_cast<float>(v_weight[j]) + static_cast<float>(v_bias[j]);
             }
 
-            floatToVec<T, VecSize>(vals, v_out);
-            v_out.store(output + flat_idx);
+            vecCast<T, float, VecSize>(vals).store(output + flat_idx);
         } else {
             // Fall back to scalar for unaligned accesses
             for (int j = 0; j < VecSize && flat_idx + j < total_elements; j++) {
@@ -402,20 +399,19 @@ __global__ void groupNormKernel(const T* __restrict__ input, T* __restrict__ out
     for (int vec_c = threadIdx.x; vec_c < vec_channels; vec_c += blockDim.x) {
         int c = vec_c * VecSize;
         int g = c / channels_per_group;
-        VecT v_in, v_weight, v_bias, v_out;
+        VecT v_in, v_weight, v_bias;
         v_in.load(row + c);
         v_weight.load(weight + c);
         v_bias.load(bias + c);
         float mean_g = group_mean[g];
         float inv_std_g = group_inv_std[g];
-        float vals[VecSize];
+        Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
             float n = (static_cast<float>(v_in[j]) - mean_g) * inv_std_g;
             vals[j] = n * static_cast<float>(v_weight[j]) + static_cast<float>(v_bias[j]);
         }
-        floatToVec<T, VecSize>(vals, v_out);
-        v_out.store(out_row + c);
+        vecCast<T, float, VecSize>(vals).store(out_row + c);
     }
 }
 
@@ -486,12 +482,12 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
 
     // Phase 3: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
-        VecT v_in, v_res, v_weight, v_out;
+        VecT v_in, v_res, v_weight;
         v_in.load(row_input + i * VecSize);
         v_res.load(row_residual + i * VecSize);
         v_weight.load(weight + i * VecSize);
 
-        float vals[VecSize];
+        Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
             float val = static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]);
@@ -508,8 +504,7 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
             }
         }
 
-        floatToVec<T, VecSize>(vals, v_out);
-        v_out.store(row_output + i * VecSize);
+        vecCast<T, float, VecSize>(vals).store(row_output + i * VecSize);
     }
 }
 
@@ -622,8 +617,8 @@ void invokeRMSNormTyped(const torch::Tensor& input, torch::Tensor& output,
         rmsNormKernel<T, VecSize><<<num_rows, block_size, 0, stream>>>(
             input_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
     } else {
-        rmsNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
-            input_ptr, output_ptr, weight_ptr, bias_ptr, hidden_size, eps);
+        rmsNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(input_ptr, output_ptr, weight_ptr,
+                                                                 bias_ptr, hidden_size, eps);
     }
 }
 
