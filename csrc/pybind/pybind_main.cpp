@@ -1,9 +1,11 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 
-#include <cuda_runtime.h>
+#include <pybind11/pybind11.h>
 
 #include <torch/extension.h>
+
+#include <c10/cuda/CUDAFunctions.h>
 
 #include "kernels/common/types.h"
 #include "pybind_activation.h"
@@ -24,8 +26,7 @@ PYBIND11_MODULE(_C, m) {
     m.def(
         "init_cuda",
         []() {
-            int device_count;
-            cudaGetDeviceCount(&device_count);
+            int device_count = static_cast<int>(c10::cuda::device_count());
             if (device_count == 0) {
                 throw std::runtime_error("No CUDA devices found");
             }
@@ -36,26 +37,22 @@ PYBIND11_MODULE(_C, m) {
     m.def(
         "get_device_count",
         []() {
-            int count;
-            cudaGetDeviceCount(&count);
-            return count;
+            return static_cast<int>(c10::cuda::device_count());
         },
         "Get number of CUDA devices");
 
-    m.def(
-        "set_device", [](int device_id) { cudaSetDevice(device_id); }, py::arg("device_id"),
-        "Set current CUDA device");
+    m.def("set_device",
+          [](int device_id) { c10::cuda::set_device(device_id); },
+          py::arg("device_id"), "Set current CUDA device");
 
     m.def(
         "get_device",
         []() {
-            int device;
-            cudaGetDevice(&device);
-            return device;
+            return static_cast<int>(c10::cuda::current_device());
         },
         "Get current CUDA device");
 
-    m.def("synchronize", []() { cudaDeviceSynchronize(); }, "Synchronize current CUDA device");
+    m.def("synchronize", []() { c10::cuda::device_synchronize(); }, "Synchronize current CUDA device");
 
     // =========================================================================
     // Enums
