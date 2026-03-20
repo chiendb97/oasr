@@ -10,8 +10,6 @@
 
 #include <torch/torch.h>
 
-#include "gemm_configs.h"
-#include "kernels/common/types.h"
 namespace oasr {
 namespace kernels {
 namespace gemm {

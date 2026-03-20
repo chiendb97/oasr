@@ -2,32 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Standard GEMM kernel implementations using CUTLASS
-// Supports BF16 and FP16 precision
+// Supports BF16 and FP16 precision with architecture-aware dispatch
 
 #include <cstdint>
 #include <stdexcept>
 #include <torch/extension.h>
 
-// Suppress warnings from CUTLASS headers
-#ifdef __GNUC__
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wstrict-aliasing"
-    #pragma GCC diagnostic ignored "-Wunused-parameter"
-#endif
-
-// CUTLASS includes
-#include <cutlass/cutlass.h>
-#include <cutlass/gemm/device/gemm.h>
-#include <cutlass/layout/matrix.h>
-#include <cutlass/numeric_types.h>
-#include <cutlass/util/device_memory.h>
-
-#ifdef __GNUC__
-    #pragma GCC diagnostic pop
-#endif
-
+#include "gemm_impl.h"
 #include "gemm_kernels.h"
 #include "gemm_utils.h"
+#include "kernels/common/arch_dispatch.h"
+#include "kernels/common/arch_traits.h"
 #include "kernels/common/epilogue_functors.h"
 
 namespace oasr {
@@ -35,67 +20,42 @@ namespace kernels {
 namespace gemm {
 
 //==============================================================================
-// Unified GEMM Implementation (SM80)
+// Arch-dispatched helpers (template context enables if constexpr)
 //==============================================================================
 
-template <typename ElementA, typename ElementB, typename ElementCD, typename LayoutA,
-          typename LayoutB, typename LayoutCD,
-          template <int, typename, typename> class EpilogueFunctor>
-struct CutlassGemmSM80 {
-    using ElementAccumulator = float;
-    using ElementComputeEpilogue = ElementAccumulator;
+template <int SmVersion, template <int, typename, typename> class EpilogueFn>
+static GemmStatus dispatchGemmDtype(const torch::Tensor& A, const void* A_ptr, const void* B_ptr,
+                                    const void* C_ptr, void* D_ptr, int M, int N, int K,
+                                    uint64_t lda, uint64_t ldb, uint64_t ldc, float alpha,
+                                    cudaStream_t stream) {
+    using Traits = ArchTraits<SmVersion>;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
 
-    static constexpr int EpilogueAlignment = 128 / cutlass::sizeof_bits<ElementCD>::value;
-
-    using MMAOp = cutlass::arch::OpClassTensorOp;
-    using SmArch = cutlass::arch::Sm80;
-
-    using ShapeMMAThreadBlock = cutlass::gemm::GemmShape<128, 128, 32>;
-    using ShapeMMAWarps = cutlass::gemm::GemmShape<64, 64, 32>;
-    using ShapeMMAOp = cutlass::gemm::GemmShape<16, 8, 16>;
-
-    using SwizzleThreadblock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
-
-    using EpilogueOp =
-        typename EpilogueFunctor<EpilogueAlignment, ElementCD, ElementComputeEpilogue>::Op;
-
-    static constexpr int NumStages = 2;
-
-    using Gemm = cutlass::gemm::device::Gemm<ElementA, LayoutA, ElementB, LayoutB, ElementCD,
-                                             LayoutCD, ElementAccumulator, MMAOp, SmArch,
-                                             ShapeMMAThreadBlock, ShapeMMAWarps, ShapeMMAOp,
-                                             EpilogueOp, SwizzleThreadblock, NumStages>;
-
-    static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
-                          int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldc,
-                          ElementComputeEpilogue alpha, cudaStream_t stream) {
-        int split_k_slices = 1;
-        float beta = (C == nullptr) ? 0.0f : 1.0f;
-        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0}, {D, ldc},
-                                      {alpha, beta}, split_k_slices);
-
-        Gemm gemm_op;
-        cutlass::Status status = gemm_op.can_implement(args);
-        if (status != cutlass::Status::kSuccess) {
-            return GemmStatus::NOT_SUPPORTED;
+    if (A.scalar_type() == torch::kHalf) {
+        return CutlassGemm<Traits, cutlass::half_t, cutlass::half_t, cutlass::half_t, LayoutA,
+                           LayoutB, LayoutC,
+                           EpilogueFn>::run(reinterpret_cast<const cutlass::half_t*>(A_ptr),
+                                            reinterpret_cast<const cutlass::half_t*>(B_ptr),
+                                            reinterpret_cast<const cutlass::half_t*>(C_ptr),
+                                            reinterpret_cast<cutlass::half_t*>(D_ptr), M, N, K, lda,
+                                            ldb, ldc, alpha, stream);
+    } else if (A.scalar_type() == torch::kBFloat16) {
+        if constexpr (Traits::kSupportsBF16) {
+            return CutlassGemm<Traits, cutlass::bfloat16_t, cutlass::bfloat16_t,
+                               cutlass::bfloat16_t, LayoutA, LayoutB, LayoutC, EpilogueFn>::run(
+                reinterpret_cast<const cutlass::bfloat16_t*>(A_ptr),
+                reinterpret_cast<const cutlass::bfloat16_t*>(B_ptr),
+                reinterpret_cast<const cutlass::bfloat16_t*>(C_ptr),
+                reinterpret_cast<cutlass::bfloat16_t*>(D_ptr), M, N, K, lda, ldb, ldc, alpha,
+                stream);
+        } else {
+            throw std::runtime_error("BF16 not supported on SM" + std::to_string(SmVersion));
         }
-
-        size_t workspace_size = Gemm::get_workspace_size(args);
-        cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-
-        status = gemm_op.initialize(args, workspace.get(), stream);
-        if (status != cutlass::Status::kSuccess) {
-            return GemmStatus::INTERNAL_ERROR;
-        }
-
-        status = gemm_op(stream);
-        if (status != cutlass::Status::kSuccess) {
-            return GemmStatus::CUTLASS_ERROR;
-        }
-
-        return GemmStatus::SUCCESS;
     }
-};
+    return GemmStatus::INVALID_ARGUMENT;
+}
 
 //==============================================================================
 // Public API Implementations
@@ -130,35 +90,15 @@ torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const t
     uint64_t ldb = K;
     uint64_t ldc = N;
 
-    using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::ColumnMajor;
-    using LayoutC = cutlass::layout::RowMajor;
-
     GemmStatus status = GemmStatus::SUCCESS;
 
-    if (A.scalar_type() == torch::kHalf) {
-        status =
-            CutlassGemmSM80<cutlass::half_t, cutlass::half_t, cutlass::half_t, LayoutA, LayoutB,
-                            LayoutC,
-                            EpilogueIdentity>::run(reinterpret_cast<const cutlass::half_t*>(A_ptr),
-                                                   reinterpret_cast<const cutlass::half_t*>(B_ptr),
-                                                   reinterpret_cast<const cutlass::half_t*>(C_ptr),
-                                                   reinterpret_cast<cutlass::half_t*>(D_ptr), M, N,
-                                                   K, lda, ldb, ldc, alpha, stream);
-    } else if (A.scalar_type() == torch::kBFloat16) {
-        status = CutlassGemmSM80<
-            cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t, LayoutA, LayoutB,
-            LayoutC, EpilogueIdentity>::run(reinterpret_cast<const cutlass::bfloat16_t*>(A_ptr),
-                                            reinterpret_cast<const cutlass::bfloat16_t*>(B_ptr),
-                                            reinterpret_cast<const cutlass::bfloat16_t*>(C_ptr),
-                                            reinterpret_cast<cutlass::bfloat16_t*>(D_ptr), M, N, K,
-                                            lda, ldb, ldc, alpha, stream);
-    } else {
-        status = GemmStatus::INVALID_ARGUMENT;
-    }
+    int sm = getDeviceSmVersion();
+    OASR_DISPATCH_ARCH(sm, SM_VERSION, {
+        status = dispatchGemmDtype<SM_VERSION, EpilogueIdentity>(A, A_ptr, B_ptr, C_ptr, D_ptr, M,
+                                                                 N, K, lda, ldb, ldc, alpha, stream);
+    });
 
     if (status != GemmStatus::SUCCESS) {
-        // throw exception with status code
         throw std::runtime_error("GEMM execution failed: " +
                                  std::to_string(static_cast<int>(status)));
     }
@@ -167,7 +107,7 @@ torch::Tensor invokeGemm(const torch::Tensor& A, const torch::Tensor& B, const t
 };
 
 //==============================================================================
-// Fused GEMM + Activation (placeholder)
+// Fused GEMM + Activation
 //==============================================================================
 
 torch::Tensor invokeGemmActivation(const torch::Tensor& A, const torch::Tensor& B,
@@ -199,49 +139,25 @@ torch::Tensor invokeGemmActivation(const torch::Tensor& A, const torch::Tensor& 
     uint64_t ldb = K;
     uint64_t ldc = N;
 
-    using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::ColumnMajor;
-    using LayoutC = cutlass::layout::RowMajor;
-
     GemmStatus status = GemmStatus::SUCCESS;
 
-    // Dispatch activation type, then dtype
-#define DISPATCH_GEMM_ACTIVATION(EpilogueFn)                                                       \
-    if (A.scalar_type() == torch::kHalf) {                                                         \
-        status = CutlassGemmSM80<cutlass::half_t, cutlass::half_t, cutlass::half_t, LayoutA,       \
-                                 LayoutB, LayoutC,                                                 \
-                                 EpilogueFn>::run(reinterpret_cast<const cutlass::half_t*>(A_ptr), \
-                                                  reinterpret_cast<const cutlass::half_t*>(B_ptr), \
-                                                  reinterpret_cast<const cutlass::half_t*>(C_ptr), \
-                                                  reinterpret_cast<cutlass::half_t*>(D_ptr), M, N, \
-                                                  K, lda, ldb, ldc, alpha, stream);                \
-    } else if (A.scalar_type() == torch::kBFloat16) {                                              \
-        status =                                                                                   \
-            CutlassGemmSM80<cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t,         \
-                            LayoutA, LayoutB, LayoutC,                                             \
-                            EpilogueFn>::run(reinterpret_cast<const cutlass::bfloat16_t*>(A_ptr),  \
-                                             reinterpret_cast<const cutlass::bfloat16_t*>(B_ptr),  \
-                                             reinterpret_cast<const cutlass::bfloat16_t*>(C_ptr),  \
-                                             reinterpret_cast<cutlass::bfloat16_t*>(D_ptr), M, N,  \
-                                             K, lda, ldb, ldc, alpha, stream);                     \
-    } else {                                                                                       \
-        throw std::invalid_argument("Invalid input tensor type");                                  \
-    }
-
-    if (activation == ActivationType::RELU) {
-        DISPATCH_GEMM_ACTIVATION(EpilogueRelu)
-    } else if (activation == ActivationType::GELU) {
-        DISPATCH_GEMM_ACTIVATION(EpilogueGelu)
-    } else if (activation == ActivationType::SWISH) {
-        DISPATCH_GEMM_ACTIVATION(EpilogueSwish)
-    } else {
-        status = GemmStatus::INVALID_ARGUMENT;
-    }
-
-#undef DISPATCH_GEMM_ACTIVATION
+    int sm = getDeviceSmVersion();
+    OASR_DISPATCH_ARCH(sm, SM_VERSION, {
+        if (activation == ActivationType::RELU) {
+            status = dispatchGemmDtype<SM_VERSION, EpilogueRelu>(A, A_ptr, B_ptr, C_ptr, D_ptr, M,
+                                                                 N, K, lda, ldb, ldc, alpha, stream);
+        } else if (activation == ActivationType::GELU) {
+            status = dispatchGemmDtype<SM_VERSION, EpilogueGelu>(A, A_ptr, B_ptr, C_ptr, D_ptr, M,
+                                                                 N, K, lda, ldb, ldc, alpha, stream);
+        } else if (activation == ActivationType::SWISH) {
+            status = dispatchGemmDtype<SM_VERSION, EpilogueSwish>(A, A_ptr, B_ptr, C_ptr, D_ptr, M,
+                                                                  N, K, lda, ldb, ldc, alpha, stream);
+        } else {
+            status = GemmStatus::INVALID_ARGUMENT;
+        }
+    });
 
     if (status != GemmStatus::SUCCESS) {
-        // throw exception with status code
         throw std::runtime_error("GEMM activation execution failed: " +
                                  std::to_string(static_cast<int>(status)));
     }

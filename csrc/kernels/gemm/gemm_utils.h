@@ -55,24 +55,6 @@ inline const char* getGemmStatusString(GemmStatus status) {
 }
 
 //==============================================================================
-// Device Query Functions
-//==============================================================================
-
-/**
- * @brief Check if SM version supports TMA
- */
-inline bool supportsTMA(int sm_version) {
-    return sm_version >= 90;
-}
-
-/**
- * @brief Check if SM version supports warp specialization
- */
-inline bool supportsWarpSpecialization(int sm_version) {
-    return sm_version >= 90;
-}
-
-//==============================================================================
 // Dispatch Macros
 //==============================================================================
 
@@ -128,20 +110,6 @@ inline bool supportsWarpSpecialization(int sm_version) {
             constexpr bool WEIGHT_LAYOUT = false;                        \
             __VA_ARGS__                                                  \
         }                                                                \
-    } while (0)
-
-/**
- * @brief Dispatch based on SM version
- */
-#define OASR_DISPATCH_SM_VERSION(sm_version, SM_VERSION, ...) \
-    do {                                                      \
-        if ((sm_version) >= 90) {                             \
-            constexpr int SM_VERSION = 90;                    \
-            __VA_ARGS__                                       \
-        } else {                                              \
-            constexpr int SM_VERSION = 80;                    \
-            __VA_ARGS__                                       \
-        }                                                     \
     } while (0)
 
 //==============================================================================
