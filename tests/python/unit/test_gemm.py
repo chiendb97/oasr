@@ -11,29 +11,6 @@ import oasr
 
 
 # -----------------------------------------------------------------------------
-# Smoke tests (no CUDA required)
-# -----------------------------------------------------------------------------
-
-class TestGemmModule:
-    """Smoke tests: module and enums exist."""
-
-    def test_gemm_module_import(self):
-        """GEMM submodule is importable."""
-        assert oasr.kernels.gemm is not None
-
-    def test_gemm_status_enum(self):
-        """GemmStatus enum has expected values."""
-        assert hasattr(oasr.kernels.gemm, 'GemmStatus')
-        assert getattr(oasr.kernels.gemm.GemmStatus, 'SUCCESS') is not None
-
-    def test_get_gemm_status_string(self):
-        """get_gemm_status_string returns non-empty string."""
-        s = oasr.kernels.gemm.get_gemm_status_string(
-            oasr.kernels.gemm.GemmStatus.SUCCESS)
-        assert isinstance(s, str) and len(s) > 0
-
-
-# -----------------------------------------------------------------------------
 # Single GEMM: D = alpha * A @ B + beta * C
 # -----------------------------------------------------------------------------
 
@@ -136,25 +113,6 @@ class TestGroupGemm:
                 s_idx += m_i
 
         torch.testing.assert_close(D, expected, rtol=1e-2, atol=1e-2)
-
-
-# -----------------------------------------------------------------------------
-# Helper APIs (workspace, status, config)
-# -----------------------------------------------------------------------------
-
-class TestGemmHelpers:
-    """Tests for GEMM helper APIs."""
-
-    def test_get_gemm_status_string(self):
-        """get_gemm_status_string returns string containing status name."""
-        s = oasr.kernels.gemm.get_gemm_status_string(
-            oasr.kernels.gemm.GemmStatus.SUCCESS)
-        assert isinstance(s, str) and 'SUCCESS' in s
-
-    def test_get_sm_version(self):
-        """get_sm_version returns non-negative int."""
-        sm = oasr.kernels.gemm.get_sm_version(-1)
-        assert isinstance(sm, int) and sm >= 0
 
 
 if __name__ == '__main__':

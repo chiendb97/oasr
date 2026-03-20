@@ -173,7 +173,6 @@ set(OASR_HEADERS
     csrc/kernels/conv/conv2d_kernels.h
     
     # GEMM Headers
-    csrc/kernels/gemm/gemm_configs.h
     csrc/kernels/gemm/gemm_utils.h
     csrc/kernels/gemm/gemm_kernels.h
     csrc/kernels/gemm/bmm_kernels.h

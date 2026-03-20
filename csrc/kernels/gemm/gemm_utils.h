@@ -55,24 +55,6 @@ inline const char* getGemmStatusString(GemmStatus status) {
 }
 
 //==============================================================================
-// Device Query Functions
-//==============================================================================
-
-/**
- * @brief Check if SM version supports TMA
- */
-inline bool supportsTMA(int sm_version) {
-    return sm_version >= 90;
-}
-
-/**
- * @brief Check if SM version supports warp specialization
- */
-inline bool supportsWarpSpecialization(int sm_version) {
-    return sm_version >= 90;
-}
-
-//==============================================================================
 // Dispatch Macros
 //==============================================================================
 
