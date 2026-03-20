@@ -40,12 +40,24 @@ inline int getDeviceSmVersion() {
 /**
  * @brief Map a runtime SM version to the nearest compiled architecture family.
  *
- * SM86 (GA102), SM87, SM89 (Ada) → 80  (same MMA ISA as Ampere)
- * SM100, SM120 → 90  (map forward to Hopper for now)
+ * Each GPU maps to the highest ArchTraits specialization that does not exceed it:
+ *   SM120+       → 120 (next-gen)
+ *   SM103-SM119  → 103 (Blackwell consumer, e.g. RTX 5090)
+ *   SM100-SM102  → 100 (Blackwell datacenter, e.g. B200)
+ *   SM90-SM99    → 90  (Hopper, e.g. H100)
+ *   SM89         → 89  (Ada Lovelace, e.g. RTX 4090)
+ *   SM86-SM88    → 86  (Ampere GA102, e.g. RTX 3090, A40)
+ *   SM80-SM85    → 80  (Ampere GA100, e.g. A100)
+ *   SM75-SM79    → 75  (Turing)
+ *   SM70-SM74    → 70  (Volta)
  */
 inline int resolveSmVersion(int sm) {
-    if (sm >= 100) return 90;
+    if (sm >= 120) return 120;
+    if (sm >= 103) return 103;
+    if (sm >= 100) return 100;
     if (sm >= 90) return 90;
+    if (sm >= 89) return 89;
+    if (sm >= 86) return 86;
     if (sm >= 80) return 80;
     if (sm >= 75) return 75;
     if (sm >= 70) return 70;
@@ -69,8 +81,28 @@ inline int resolveSmVersion(int sm) {
     do {                                                                                  \
         const int _resolved = oasr::kernels::resolveSmVersion(sm_version);               \
         switch (_resolved) {                                                              \
+            case 120: {                                                                   \
+                constexpr int ARCH_VAR = 120;                                             \
+                __VA_ARGS__                                                               \
+            } break;                                                                      \
+            case 103: {                                                                   \
+                constexpr int ARCH_VAR = 103;                                             \
+                __VA_ARGS__                                                               \
+            } break;                                                                      \
+            case 100: {                                                                   \
+                constexpr int ARCH_VAR = 100;                                             \
+                __VA_ARGS__                                                               \
+            } break;                                                                      \
             case 90: {                                                                    \
                 constexpr int ARCH_VAR = 90;                                              \
+                __VA_ARGS__                                                               \
+            } break;                                                                      \
+            case 89: {                                                                    \
+                constexpr int ARCH_VAR = 89;                                              \
+                __VA_ARGS__                                                               \
+            } break;                                                                      \
+            case 86: {                                                                    \
+                constexpr int ARCH_VAR = 86;                                              \
                 __VA_ARGS__                                                               \
             } break;                                                                      \
             case 80: {                                                                    \
