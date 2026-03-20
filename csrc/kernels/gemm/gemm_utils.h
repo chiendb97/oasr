@@ -112,20 +112,6 @@ inline const char* getGemmStatusString(GemmStatus status) {
         }                                                                \
     } while (0)
 
-/**
- * @brief Dispatch based on SM version
- */
-#define OASR_DISPATCH_SM_VERSION(sm_version, SM_VERSION, ...) \
-    do {                                                      \
-        if ((sm_version) >= 90) {                             \
-            constexpr int SM_VERSION = 90;                    \
-            __VA_ARGS__                                       \
-        } else {                                              \
-            constexpr int SM_VERSION = 80;                    \
-            __VA_ARGS__                                       \
-        }                                                     \
-    } while (0)
-
 //==============================================================================
 // CUTLASS Helper Macros
 //==============================================================================
