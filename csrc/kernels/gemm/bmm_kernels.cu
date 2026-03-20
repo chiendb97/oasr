@@ -5,7 +5,6 @@
 
 #include "bmm_kernels.h"
 #include "gemm_utils.h"
-#include "kernels/common/cuda_utils.h"
 
 #ifdef __GNUC__
     #pragma GCC diagnostic push
@@ -24,7 +23,6 @@
     #pragma GCC diagnostic pop
 #endif
 
-#include <limits>
 #include <stdexcept>
 
 namespace oasr {

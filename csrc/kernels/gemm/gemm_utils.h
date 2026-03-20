@@ -9,10 +9,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <utility>
-
-#include "kernels/common/cuda_utils.h"
-
 namespace oasr {
 namespace kernels {
 namespace gemm {
@@ -63,26 +59,6 @@ inline const char* getGemmStatusString(GemmStatus status) {
 //==============================================================================
 
 /**
- * @brief Get compute capability of current device
- */
-inline std::pair<int, int> getComputeCapability(int device_id = -1) {
-    if (device_id < 0) {
-        OASR_CUDA_CHECK(cudaGetDevice(&device_id));
-    }
-    cudaDeviceProp props;
-    OASR_CUDA_CHECK(cudaGetDeviceProperties(&props, device_id));
-    return {props.major, props.minor};
-}
-
-/**
- * @brief Get SM version as integer (e.g., 80, 86, 89, 90)
- */
-inline int getSMVersion(int device_id = -1) {
-    auto [major, minor] = getComputeCapability(device_id);
-    return major * 10 + minor;
-}
-
-/**
  * @brief Check if SM version supports TMA
  */
 inline bool supportsTMA(int sm_version) {
@@ -94,19 +70,6 @@ inline bool supportsTMA(int sm_version) {
  */
 inline bool supportsWarpSpecialization(int sm_version) {
     return sm_version >= 90;
-}
-
-/**
- * @brief Get shared memory limit per SM
- */
-inline int getSharedMemoryPerSM(int device_id = -1) {
-    if (device_id < 0) {
-        OASR_CUDA_CHECK(cudaGetDevice(&device_id));
-    }
-    int smem_limit;
-    OASR_CUDA_CHECK(cudaDeviceGetAttribute(&smem_limit, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
-                                           device_id));
-    return smem_limit;
 }
 
 //==============================================================================

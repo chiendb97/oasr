@@ -139,8 +139,6 @@ inline void registerGemmBindings(py::module_& kernels) {
         "Execute grouped GEMM. Returns output tensor.");
 
     // --- Utility functions ---
-    gemm_mod.def("get_sm_version", &getSMVersion, py::arg("device_id") = -1,
-                 "Get SM version of the current or specified device");
     gemm_mod.def("supports_tma", &supportsTMA, py::arg("sm_version"),
                  "Check if SM version supports TMA");
     gemm_mod.def("supports_warp_specialization", &supportsWarpSpecialization, py::arg("sm_version"),

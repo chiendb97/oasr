@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "common/types.h"
+#include "kernels/common/types.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 
