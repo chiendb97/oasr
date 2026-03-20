@@ -40,8 +40,8 @@ set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES OFF)
 
 # Set CUDA architectures if not specified
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    # Support common architectures: Volta, Turing, Ampere, Ada, Hopper
-    set(CMAKE_CUDA_ARCHITECTURES 70 75 80 86 89 90)
+    # Support common architectures: Volta, Turing, Ampere, Ada, Hopper, Blackwell
+    set(CMAKE_CUDA_ARCHITECTURES 70 75 80 86 89 90 100 120)
 endif()
 
 # CUDA compiler flags
@@ -82,7 +82,7 @@ else()
     FetchContent_Declare(
         cutlass
         GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-        GIT_TAG v3.4.0
+        GIT_TAG v4.4.2
     )
     # Populate only: do not call FetchContent_MakeAvailable so we do not build CUTLASS library
     FetchContent_Populate(cutlass)
@@ -158,11 +158,6 @@ set(OASR_SOURCES
     # Decoder
     csrc/decoder/common/utils.cc
     csrc/decoder/ctc_prefix_beam_search.cc
-    
-    # TODO: Add these when ready
-    # csrc/kernels/common/tensor.cpp
-    # csrc/kernels/common/allocator.cpp
-    # csrc/kernels/attention/attention_kernels.cu
 )
 
 set(OASR_HEADERS
@@ -182,13 +177,6 @@ set(OASR_HEADERS
     csrc/decoder/common/utils.h
     csrc/decoder/search_interface.h
     csrc/decoder/ctc_prefix_beam_search.h
-
-    
-    # TODO: Add these when ready
-    # csrc/kernels/common/tensor.h
-    # csrc/kernels/common/allocator.h
-    # csrc/kernels/attention/attention_params.h
-    # csrc/kernels/attention/attention_kernels.h
 )
 
 # =============================================================================
