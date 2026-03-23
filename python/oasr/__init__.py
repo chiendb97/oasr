@@ -11,12 +11,38 @@ import importlib as _importlib
 import sys as _sys
 import types as _types
 
-# Layers package (primary home of Python kernel wrappers)
+# =============================================================================
+# Functional API (FlashInfer style)
+# =============================================================================
+from .activation import (
+    glu, swish,
+    ACTIVATION_RELU, ACTIVATION_GELU, ACTIVATION_SWISH,
+    get_activation_type_id,
+)
+from .norm import (
+    layer_norm, rms_norm, batch_norm_1d, group_norm, add_layer_norm,
+    layer_norm_activation, rms_norm_activation, batch_norm_activation, batch_norm_swish,
+)
+from .conv import (
+    depthwise_conv1d, pointwise_conv1d, conv2d,
+    depthwise_conv1d_silu, pointwise_conv1d_activation, causal_conv1d, conv2d_activation,
+)
+from .gemm import gemm, bmm, group_gemm, gemm_activation
+
+# =============================================================================
+# Autotuning
+# =============================================================================
+from . import tune
+from .tune import autotune, enable_autotune, disable_autotune
+
+# =============================================================================
+# nn.Module wrappers
+# =============================================================================
 from . import layers
 from .layers import (
     DepthwiseConv1d,
     PointwiseConv1d,
-    Conv2d,
+    Conv2d as Conv2dModule,
     Conv2dActivation,
     Linear,
     LayerNorm,
@@ -26,6 +52,10 @@ from .layers import (
     AddLayerNorm,
 )
 
+
+# =============================================================================
+# Legacy C extension support (backward compatibility)
+# =============================================================================
 
 def _register_c_extension():
     """Load the C extension and register its submodules (e.g. ``decoder``)
@@ -46,16 +76,16 @@ _register_c_extension()
 
 
 def __getattr__(name: str):
-    """Lazily expose C extension symbols (kernels, enums, synchronize, …).
-
-    On first access the compiled ``oasr._C`` module is imported and the
-    requested attribute is cached in the package globals so that subsequent
-    look-ups are instant and skip this function entirely.
-    """
+    """Lazily expose C extension symbols (kernels, enums, synchronize, ...)."""
     _C = globals().get("_C")
     if _C is None:
-        _C = _importlib.import_module("oasr._C")
-        globals()["_C"] = _C
+        try:
+            _C = _importlib.import_module("oasr._C")
+            globals()["_C"] = _C
+        except ImportError:
+            raise AttributeError(
+                f"module 'oasr' has no attribute {name!r}"
+            ) from None
     if name == "_C":
         return _C
     try:
@@ -70,24 +100,54 @@ def __getattr__(name: str):
 
 __all__ = [
     "__version__",
-    # C extension (loaded lazily via __getattr__)
-    "kernels",
-    "DataType",
-    "ConvType",
-    "ActivationType",
-    "NormType",
+    # Activation constants
+    "ACTIVATION_RELU",
+    "ACTIVATION_GELU",
+    "ACTIVATION_SWISH",
+    "get_activation_type_id",
+    # Functional API
+    "glu",
+    "swish",
+    "layer_norm",
+    "rms_norm",
+    "batch_norm_1d",
+    "group_norm",
+    "add_layer_norm",
+    "layer_norm_activation",
+    "rms_norm_activation",
+    "batch_norm_activation",
+    "batch_norm_swish",
+    "depthwise_conv1d",
+    "pointwise_conv1d",
+    "conv2d",
+    "depthwise_conv1d_silu",
+    "pointwise_conv1d_activation",
+    "causal_conv1d",
+    "conv2d_activation",
+    "gemm",
+    "bmm",
+    "group_gemm",
+    "gemm_activation",
+    # nn.Module wrappers
     "layers",
-    # Conv
     "DepthwiseConv1d",
     "PointwiseConv1d",
-    "Conv2d",
+    "Conv2dModule",
     "Conv2dActivation",
-    # Linear
     "Linear",
-    # Norm
     "LayerNorm",
     "RMSNorm",
     "GroupNorm",
     "BatchNorm1d",
     "AddLayerNorm",
+    # Autotuning
+    "tune",
+    "autotune",
+    "enable_autotune",
+    "disable_autotune",
+    # Legacy C extension (loaded lazily via __getattr__)
+    "DataType",
+    "ConvType",
+    "ActivationType",
+    "NormType",
 ]

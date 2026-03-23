@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 
 import oasr
-from oasr.utils import get_activation_type
 
 
 class Linear(nn.Module):
@@ -42,7 +41,7 @@ class Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (*, in_features) -> (*, out_features)."""
 
-        return oasr.kernels.gemm.gemm(x, self.weight, self.bias)
+        return oasr.gemm(x, self.weight, self.bias)
 
 
 class LinearActivation(nn.Module):
@@ -60,7 +59,7 @@ class LinearActivation(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.activation_type = get_activation_type(activation_type)
+        self.activation_type = oasr.get_activation_type_id(activation_type)
         self.weight = nn.Parameter(torch.empty(
             out_features, in_features, device=device, dtype=dtype))
         torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
@@ -75,7 +74,7 @@ class LinearActivation(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (*, in_features) -> (*, out_features)."""
 
-        return oasr.kernels.gemm.gemm_activation(x, self.weight, self.bias, self.activation_type)
+        return oasr.gemm_activation(x, self.weight, self.bias, self.activation_type)
 
 
 __all__ = ["Linear", "LinearActivation"]
