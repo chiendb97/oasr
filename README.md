@@ -1,6 +1,6 @@
 # OASR - Open Automatic Speech Recognition
 
-A high-performance open-source inference framework for ASR models built with C++, CUDA, and CUTLASS. Kernels are JIT-compiled at runtime via TVM-FFI (FlashInfer-style) and cached for subsequent use.
+A high-performance open-source inference framework for ASR models built with C++, CUDA, and CUTLASS. Kernels are JIT-compiled at runtime via TVM-FFI and cached for subsequent use.
 
 ## Supported Models
 
@@ -71,7 +71,7 @@ oasr/
 - **CMake** >= 3.18
 - **Python** >= 3.8
 - **apache-tvm-ffi** -- TVM FFI runtime for JIT compilation
-- **CUTLASS** -- Fetched automatically by CMake (v4.4.2) if not present under `third_party/cutlass`
+- **CUTLASS** -- NVIDIA CUDA Templates for Linear Algebra Subroutines and Solvers; required for CUTLASS-based kernel generation and execution
 - **cuDNN** -- Optional; Conv2D cuDNN backend disabled if not found
 
 ## Installation

@@ -72,23 +72,8 @@ endif()
 # =============================================================================
 # CUTLASS
 # =============================================================================
-set(CUTLASS_DIR "${CMAKE_SOURCE_DIR}/third_party/cutlass" CACHE PATH "CUTLASS directory (header-only)")
-if(EXISTS ${CUTLASS_DIR}/include/cutlass/cutlass.h)
-    message(STATUS "Using CUTLASS (header-only) from: ${CUTLASS_DIR}")
-    add_compile_definitions(OASR_USE_CUTLASS)
-else()
-    message(STATUS "CUTLASS not found at ${CUTLASS_DIR}. Fetching headers from GitHub...")
-    include(FetchContent)
-    FetchContent_Declare(
-        cutlass
-        GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-        GIT_TAG v4.4.2
-    )
-    # Populate only: do not call FetchContent_MakeAvailable so we do not build CUTLASS library
-    FetchContent_Populate(cutlass)
-    set(CUTLASS_DIR ${cutlass_SOURCE_DIR} CACHE PATH "CUTLASS directory (header-only)" FORCE)
-    add_compile_definitions(OASR_USE_CUTLASS)
-endif()
+set(CUTLASS_DIR "${CMAKE_SOURCE_DIR}/3rdparty/cutlass" CACHE PATH "CUTLASS directory (header-only)")
+
 
 # Python and dependencies for bindings
 if(BUILD_PYTHON)
