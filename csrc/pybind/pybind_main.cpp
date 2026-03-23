@@ -7,12 +7,8 @@
 
 #include <c10/cuda/CUDAFunctions.h>
 
-#include "kernels/common/types.h"
-#include "pybind_activation.h"
-#include "pybind_conv.h"
+#include <oasr/common/types.h>
 #include "pybind_decoder.h"
-#include "pybind_gemm.h"
-#include "pybind_norm.h"
 
 namespace py = pybind11;
 
@@ -84,16 +80,6 @@ PYBIND11_MODULE(_C, m) {
         .value("GELU", oasr::ActivationType::GELU)
         .value("SWISH", oasr::ActivationType::SWISH)
         .export_values();
-
-    // =========================================================================
-    // Kernel submodule registrations
-    // =========================================================================
-    py::module_ kernels = m.def_submodule("kernels", "Low-level CUDA kernels");
-
-    oasr::pybind::registerNormBindings(kernels);
-    oasr::pybind::registerConvBindings(kernels);
-    oasr::pybind::registerGemmBindings(kernels);
-    oasr::pybind::registerActivationBindings(kernels);
 
     // =========================================================================
     // Decoder bindings

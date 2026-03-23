@@ -14,7 +14,6 @@ import torch
 import torch.nn as nn
 
 import oasr
-from oasr.utils import get_activation_type
 
 
 class DepthwiseConv1d(nn.Module):
@@ -47,7 +46,7 @@ class DepthwiseConv1d(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.kernels.conv.depthwise_conv1d(x, self.weight, self.bias, self.padding)
+        return oasr.depthwise_conv1d(x, self.weight, self.bias, self.padding)
 
     def _load_from_state_dict(
         self,
@@ -106,7 +105,7 @@ class PointwiseConv1d(nn.Module):
         self.out_channels = out_channels
         self.activation = (
             None if activation_type is None
-            else get_activation_type(activation_type)
+            else oasr.get_activation_type_id(activation_type)
         )
 
         self.weight = nn.Parameter(torch.empty(
@@ -123,9 +122,9 @@ class PointwiseConv1d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.activation is not None:
-            return oasr.kernels.conv.pointwise_conv1d_activation(x, self.weight, self.bias, self.activation)
+            return oasr.pointwise_conv1d_activation(x, self.weight, self.bias, self.activation)
         else:
-            return oasr.kernels.conv.pointwise_conv1d(x, self.weight, self.bias)
+            return oasr.pointwise_conv1d(x, self.weight, self.bias)
 
 
 class Conv2d(nn.Module):
@@ -185,7 +184,7 @@ class Conv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [N, H, W, in_channels] -> [N, P, Q, out_channels]."""
-        return oasr.kernels.conv.conv2d(
+        return oasr.conv2d(
             x, self.weight, self.bias,
             self.padding[0], self.padding[1],
             self.stride[0], self.stride[1],
@@ -264,7 +263,7 @@ class Conv2dActivation(nn.Module):
         self.padding = (pad_h, pad_w)
         self.stride = (stride_h, stride_w)
         self.dilation = (dilation_h, dilation_w)
-        self.activation = get_activation_type(activation_type)
+        self.activation = oasr.get_activation_type_id(activation_type)
 
         self.weight = nn.Parameter(
             torch.empty(out_channels, kernel_h, kernel_w, in_channels, device=device, dtype=dtype)
@@ -281,7 +280,7 @@ class Conv2dActivation(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [N, H, W, in_channels] -> [N, P, Q, out_channels]."""
-        return oasr.kernels.conv.conv2d_activation(
+        return oasr.conv2d_activation(
             x, self.weight, self.bias,
             self.activation,
             self.padding[0], self.padding[1],

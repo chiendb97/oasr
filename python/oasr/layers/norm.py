@@ -27,7 +27,7 @@ class LayerNorm(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.kernels.norm.layer_norm(x, self.weight, self.bias, self.eps)
+        return oasr.layer_norm(x, self.weight, self.bias, self.eps)
 
 
 class RMSNorm(nn.Module):
@@ -46,7 +46,7 @@ class RMSNorm(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.kernels.norm.rms_norm(x, self.weight, self.bias, self.eps)
+        return oasr.rms_norm(x, self.weight, self.bias, self.eps)
 
 
 class GroupNorm(nn.Module):
@@ -66,7 +66,7 @@ class GroupNorm(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.kernels.norm.group_norm(x, self.weight, self.bias, self.num_groups, self.eps)
+        return oasr.group_norm(x, self.weight, self.bias, self.num_groups, self.eps)
 
 
 class BatchNorm1d(nn.Module):
@@ -92,7 +92,7 @@ class BatchNorm1d(nn.Module):
             num_channels, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.kernels.norm.batch_norm_1d(x, self.weight, self.bias, self.running_mean, self.running_var, self.eps)
+        return oasr.batch_norm_1d(x, self.weight, self.bias, self.running_mean, self.running_var, self.eps)
 
 
 class BatchNormSwish(nn.Module):
@@ -113,7 +113,7 @@ class BatchNormSwish(nn.Module):
             num_channels, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.kernels.norm.batch_norm_swish(x, self.weight, self.bias, self.running_mean, self.running_var, self.eps)
+        return oasr.batch_norm_swish(x, self.weight, self.bias, self.running_mean, self.running_var, self.eps)
 
 
 class AddLayerNorm(nn.Module):
@@ -136,7 +136,7 @@ class AddLayerNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor,
     ) -> torch.Tensor:
-        return oasr.kernels.norm.add_layer_norm(x, residual, self.weight, self.bias, self.eps)
+        return oasr.add_layer_norm(x, residual, self.weight, self.bias, self.eps)
 
 
 class LayerNormActivation(nn.Module):
@@ -152,11 +152,9 @@ class LayerNormActivation(nn.Module):
         dtype=None,
     ):
         super().__init__()
-        from oasr.utils.mappings import get_activation_type
-
         self.normalized_shape = normalized_shape
         self.eps = eps
-        self.activation_type = get_activation_type(activation)
+        self.activation_type = oasr.get_activation_type_id(activation)
         self.weight = nn.Parameter(torch.ones(
             normalized_shape, device=device, dtype=dtype))
         if bias:
@@ -166,7 +164,7 @@ class LayerNormActivation(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.kernels.norm.layer_norm_activation(
+        return oasr.layer_norm_activation(
             x, self.weight, self.bias, self.eps, self.activation_type)
 
 
@@ -183,11 +181,9 @@ class RMSNormActivation(nn.Module):
         dtype=None,
     ):
         super().__init__()
-        from oasr.utils.mappings import get_activation_type
-
         self.normalized_shape = normalized_shape
         self.eps = eps
-        self.activation_type = get_activation_type(activation)
+        self.activation_type = oasr.get_activation_type_id(activation)
         self.weight = nn.Parameter(torch.ones(
             normalized_shape, device=device, dtype=dtype))
         if bias:
@@ -197,7 +193,7 @@ class RMSNormActivation(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.kernels.norm.rms_norm_activation(
+        return oasr.rms_norm_activation(
             x, self.weight, self.bias, self.eps, self.activation_type)
 
 
@@ -213,11 +209,9 @@ class BatchNormActivation(nn.Module):
         dtype=None,
     ):
         super().__init__()
-        from oasr.utils.mappings import get_activation_type
-
         self.num_channels = num_channels
         self.eps = eps
-        self.activation_type = get_activation_type(activation)
+        self.activation_type = oasr.get_activation_type_id(activation)
         self.weight = nn.Parameter(torch.ones(
             num_channels, device=device, dtype=dtype))
         self.bias = nn.Parameter(torch.zeros(
@@ -228,7 +222,7 @@ class BatchNormActivation(nn.Module):
             num_channels, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.kernels.norm.batch_norm_activation(
+        return oasr.batch_norm_activation(
             x, self.weight, self.bias, self.running_mean, self.running_var,
             self.eps, self.activation_type)
 

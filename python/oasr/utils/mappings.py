@@ -9,12 +9,22 @@ circular imports.
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 import torch.nn as nn
 
 
 def get_dtype(dtype: torch.dtype):
-    """Map a ``torch.dtype`` to the corresponding ``oasr.DataType`` enum."""
+    """Map a ``torch.dtype`` to the corresponding ``oasr.DataType`` enum.
+
+    .. deprecated:: Use integer dtype constants instead.
+    """
+    warnings.warn(
+        "get_dtype() is deprecated. Use integer dtype constants instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     from oasr import _C  # type: ignore[attr-defined]
 
     return {
@@ -25,7 +35,15 @@ def get_dtype(dtype: torch.dtype):
 
 
 def get_activation_type(activation_type: str):
-    """Map an activation name to the corresponding ``oasr.ActivationType`` enum."""
+    """Map an activation name to the corresponding ``oasr.ActivationType`` enum.
+
+    .. deprecated:: Use ``oasr.get_activation_type_id()`` instead.
+    """
+    warnings.warn(
+        "get_activation_type() is deprecated. Use oasr.get_activation_type_id() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     from oasr import _C  # type: ignore[attr-defined]
 
     return {
@@ -48,7 +66,15 @@ def get_activation(activation_type: str) -> nn.Module:
 
 
 def get_norm_type(norm_type: str):
-    """Map a norm name to the corresponding ``oasr.NormType`` enum."""
+    """Map a norm name to the corresponding ``oasr.NormType`` enum.
+
+    .. deprecated:: Use norm layer classes directly instead.
+    """
+    warnings.warn(
+        "get_norm_type() is deprecated. Use norm layer classes directly.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     from oasr import _C  # type: ignore[attr-defined]
 
     return {
