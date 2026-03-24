@@ -1,7 +1,7 @@
 """OASR Utilities Module
 
-Profiling helpers and mappings between Python/PyTorch types and
-OASR C extension enums.
+Profiling helpers, mappings between Python/PyTorch types and
+OASR C extension enums, and validation decorators.
 """
 
 from .mappings import (
@@ -13,6 +13,11 @@ from .mappings import (
     get_norm_type,
 )
 from .timer import Timer
+from .validation import (
+    backend_requirement,
+    is_sm90a_supported,
+    supported_compute_capability,
+)
 
 __all__ = [
     "Timer",
@@ -22,4 +27,7 @@ __all__ = [
     "get_norm",
     "get_norm_activation",
     "get_norm_type",
+    "backend_requirement",
+    "is_sm90a_supported",
+    "supported_compute_capability",
 ]

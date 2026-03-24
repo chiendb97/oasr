@@ -70,6 +70,9 @@ static constexpr DLDataType dl_int32 = {kDLInt, 32, 1};
         }                                                                                 \
     }()
 
+// Alias: same as DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16 (dispatches FP32/FP16/BF16)
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16 DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16
+
 // Dispatch for FP16/BF16 only (half-precision input types for GEMM/conv)
 #define DISPATCH_DLPACK_HALF_DTYPE(dl_dtype, c_type, ...)                                 \
     [&]() -> bool {                                                                       \

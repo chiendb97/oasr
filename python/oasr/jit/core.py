@@ -182,6 +182,23 @@ def gen_jit_spec(
     )
 
 
+def write_if_different(path: Path, content: str) -> bool:
+    """Write *content* to *path* only if it differs from the current contents.
+
+    Returns True if the file was (re-)written, False if it was already
+    up-to-date.  This avoids unnecessary recompilation when the generated
+    source has not changed.
+    """
+    path = Path(path)
+    if path.exists():
+        existing = path.read_text()
+        if existing == content:
+            return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    return True
+
+
 def clear_cache() -> None:
     """Remove all JIT-compiled artifacts."""
     if env.OASR_JIT_CACHE_DIR.exists():
