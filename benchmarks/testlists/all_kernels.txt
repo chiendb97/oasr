@@ -1,0 +1,32 @@
+# Comprehensive benchmark: one representative config per subroutine
+
+# GEMM family
+--routine gemm --subroutine gemm --M 16000 --N 256 --K 2048
+--routine gemm --subroutine bmm --batch-count 256 --M 200 --N 200 --K 64
+--routine gemm --subroutine group_gemm --batch-count 64 --M 16000 --N 256 --K 2048 --dtype bfloat16
+--routine gemm --subroutine gemm_activation --M 16000 --N 512 --K 512
+
+# Norm family
+--routine norm --subroutine layer_norm --batch 64 --seq 250 --hidden 512
+--routine norm --subroutine add_layer_norm --batch 64 --seq 250 --hidden 512
+--routine norm --subroutine layer_norm_activation --batch 64 --seq 250 --hidden 512
+--routine norm --subroutine rms_norm --batch 64 --seq 250 --hidden 512
+--routine norm --subroutine batch_norm --batch 64 --seq 250 --hidden 512 --dtype float32
+--routine norm --subroutine batch_norm_swish --batch 64 --seq 250 --hidden 512
+--routine norm --subroutine batch_norm_activation --batch 64 --seq 250 --hidden 512
+--routine norm --subroutine group_norm --batch 64 --seq 250 --hidden 512 --num-groups 64 --dtype float32
+
+# Conv family
+--routine conv --subroutine depthwise_conv1d --batch 64 --seq 250 --channels 512 --kernel-size 31
+--routine conv --subroutine depthwise_conv1d_causal --batch 64 --seq 250 --channels 512 --kernel-size 31
+--routine conv --subroutine pointwise_conv1d --batch 64 --seq 250 --channels 512 --out-channels 1024
+--routine conv --subroutine pointwise_conv1d_activation --batch 64 --seq 250 --channels 512 --out-channels 1024
+--routine conv --subroutine conv2d --batch 16 --height 100 --width 40 --channels 256 --out-filters 256 --pad 1 --stride 1
+--routine conv --subroutine conv2d_activation --batch 16 --height 100 --width 40 --channels 256 --out-filters 256 --pad 1 --stride 1
+
+# Activation family
+--routine activation --subroutine glu --batch 64 --seq 250 --channels 512
+--routine activation --subroutine swish --batch 64 --seq 250 --channels 512
+
+# Composite
+--routine composite --subroutine conv_block --batch 64 --seq 250 --d-model 512 --kernel-size 31

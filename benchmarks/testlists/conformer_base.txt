@@ -1,0 +1,21 @@
+# Conformer-base workload (d_model=256, kernel_size=15)
+# Typical shapes from WeNet Conformer-base ASR model
+
+# Normalization
+--routine norm --subroutine layer_norm --batch 64 --seq 250 --hidden 256
+--routine norm --subroutine add_layer_norm --batch 64 --seq 250 --hidden 256
+--routine norm --subroutine batch_norm --batch 64 --seq 250 --hidden 256
+
+# Convolution
+--routine conv --subroutine depthwise_conv1d --batch 64 --seq 250 --channels 256 --kernel-size 15
+--routine conv --subroutine pointwise_conv1d --batch 64 --seq 250 --channels 256 --out-channels 512
+
+# Activation
+--routine activation --subroutine glu --batch 64 --seq 250 --channels 256
+--routine activation --subroutine swish --batch 64 --seq 250 --channels 256
+
+# GEMM (linear projections)
+--routine gemm --subroutine gemm --M 16000 --N 256 --K 256
+
+# Composite
+--routine composite --subroutine conv_block --batch 64 --seq 250 --d-model 256 --kernel-size 15
