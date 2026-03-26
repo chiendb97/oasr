@@ -4,6 +4,9 @@
 
 Provides gen_all_modules() and register_default_modules() for pre-compiling
 all OASR kernels, analogous to FlashInfer's aot.py.
+
+Since tile variants are now compiled into the same module as the default
+(FlashInfer-style), gen_all_modules() already includes all variants.
 """
 
 from typing import List
@@ -11,6 +14,9 @@ from typing import List
 
 def gen_all_modules() -> List:
     """Generate JIT specs for all OASR kernel families.
+
+    Each GEMM/Conv2D module already contains ALL tile variants compiled into
+    a single ``.so``, so no separate ``gen_all_gemm_variants()`` is needed.
 
     Returns:
         List of JitSpec objects for all kernel modules.

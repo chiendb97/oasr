@@ -7,6 +7,8 @@ from typing import Optional
 
 import torch
 
+from oasr.api_logging import oasr_api
+
 
 @functools.cache
 def _get_gemm_module():
@@ -29,6 +31,31 @@ def _get_group_gemm_module():
     return gen_group_gemm_module().build_and_load()
 
 
+def _default_gemm_fn():
+    from oasr.jit.gemm import GEMM_DEFAULT, gemm_func_name
+
+    return getattr(_get_gemm_module(), gemm_func_name(GEMM_DEFAULT))
+
+
+def _default_gemm_activation_fn():
+    from oasr.jit.gemm import GEMM_DEFAULT, gemm_activation_func_name
+
+    return getattr(_get_gemm_module(), gemm_activation_func_name(GEMM_DEFAULT))
+
+
+def _default_bmm_fn():
+    from oasr.jit.gemm import GEMM_DEFAULT, bmm_func_name
+
+    return getattr(_get_bmm_module(), bmm_func_name(GEMM_DEFAULT))
+
+
+def _default_group_gemm_fn():
+    from oasr.jit.gemm import GEMM_DEFAULT, group_gemm_func_name
+
+    return getattr(_get_group_gemm_module(), group_gemm_func_name(GEMM_DEFAULT))
+
+
+@oasr_api
 def gemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -56,7 +83,7 @@ def gemm(
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner
-        from oasr.tune._types import OpKey
+        from oasr.tune.autotuner import OpKey
 
         M = out.reshape(-1, N).shape[0]
         get_tuner().dispatch(
@@ -68,10 +95,11 @@ def gemm(
         )
         return out
 
-    _get_gemm_module().gemm(out.reshape(-1, N), A.reshape(-1, K), B, C, 1)
+    _default_gemm_fn()(out.reshape(-1, N), A.reshape(-1, K), B, C, 1)
     return out
 
 
+@oasr_api
 def bmm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -96,7 +124,7 @@ def bmm(
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner
-        from oasr.tune._types import OpKey
+        from oasr.tune.autotuner import OpKey
 
         get_tuner().dispatch(
             op_key=OpKey("gemm", "bmm"),
@@ -107,10 +135,11 @@ def bmm(
         )
         return out
 
-    _get_bmm_module().bmm(out, A, B)
+    _default_bmm_fn()(out, A, B)
     return out
 
 
+@oasr_api
 def group_gemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -138,7 +167,7 @@ def group_gemm(
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner
-        from oasr.tune._types import OpKey
+        from oasr.tune.autotuner import OpKey
 
         get_tuner().dispatch(
             op_key=OpKey("gemm", "group_gemm"),
@@ -149,10 +178,11 @@ def group_gemm(
         )
         return out
 
-    _get_group_gemm_module().group_gemm(out, A, B, offset)
+    _default_group_gemm_fn()(out, A, B, offset)
     return out
 
 
+@oasr_api
 def gemm_activation(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -182,7 +212,7 @@ def gemm_activation(
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner
-        from oasr.tune._types import OpKey
+        from oasr.tune.autotuner import OpKey
 
         M = out.reshape(-1, N).shape[0]
         get_tuner().dispatch(
@@ -195,6 +225,6 @@ def gemm_activation(
         )
         return out
 
-    _get_gemm_module().gemm_activation(out.reshape(-1, N),
-                                       A.reshape(-1, K), B, C, activation_type, 1)
+    _default_gemm_activation_fn()(out.reshape(-1, N),
+                                   A.reshape(-1, K), B, C, activation_type, 1)
     return out

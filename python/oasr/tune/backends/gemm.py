@@ -1,82 +1,51 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""GEMM backend registrations with tile-variant autotuning.
+"""GEMM backend registrations for autotuning (FlashInfer-style).
 
-Registers the default CUTLASS GEMM configuration as the fallback, plus
-additional tile variants that the autotuner can profile and select from.
-Each tile variant is JIT-compiled into a separate shared library.
-
-For split-K, the same compiled module is reused with different runtime
-``split_k_slices`` values — no recompilation needed.
+All tile variants are pre-compiled into a single shared library by the JIT
+layer (``oasr.jit.gemm``).  The autotuner selects which pre-compiled variant
+to call — no JIT compilation is triggered during tuning.
 """
 
 import functools
 import logging
 
-from oasr.tune._registry import BackendEntry, _global_registry
-from oasr.tune._types import OpKey, Tactic
-from oasr.tune.kernel_configs import (
+from oasr.tune.autotuner import BackendEntry, _global_registry, OpKey, Tactic
+from oasr.jit.gemm import (
+    TileConfig,
     GEMM_DEFAULT,
     GEMM_TILE_CONFIGS,
     BMM_TILE_CONFIGS,
     GROUP_GEMM_TILE_CONFIGS,
-    TileConfig,
-    get_unique_compile_configs,
+    gemm_func_name,
+    gemm_activation_func_name,
+    bmm_func_name,
+    group_gemm_func_name,
 )
 
 logger = logging.getLogger("oasr.tune")
 
 
 # ---------------------------------------------------------------------------
-# Module cache — each (family, tile_config) maps to a lazily-compiled module
+# Pre-compiled module loaders (one module per family, contains ALL variants)
 # ---------------------------------------------------------------------------
 
-_gemm_modules = {}
-_bmm_modules = {}
-_group_gemm_modules = {}
+@functools.cache
+def _get_gemm_module():
+    from oasr.jit.gemm import gen_gemm_module
+    return gen_gemm_module().build_and_load()
 
 
-def _get_gemm_variant_module(cfg: TileConfig):
-    """Get or compile a GEMM module for a specific tile config."""
-    key = cfg.name
-    if key not in _gemm_modules:
-        from oasr.jit.gemm import gen_gemm_module_variant
-
-        spec = gen_gemm_module_variant(
-            tile_m=cfg.tile_m, tile_n=cfg.tile_n, tile_k=cfg.tile_k,
-            warp_m=cfg.warp_m, warp_n=cfg.warp_n, warp_k=cfg.warp_k,
-            stages=cfg.stages,
-        )
-        _gemm_modules[key] = spec.build_and_load()
-    return _gemm_modules[key]
+@functools.cache
+def _get_bmm_module():
+    from oasr.jit.gemm import gen_bmm_module
+    return gen_bmm_module().build_and_load()
 
 
-def _get_bmm_variant_module(cfg: TileConfig):
-    key = cfg.name
-    if key not in _bmm_modules:
-        from oasr.jit.gemm import gen_bmm_module_variant
-
-        spec = gen_bmm_module_variant(
-            tile_m=cfg.tile_m, tile_n=cfg.tile_n, tile_k=cfg.tile_k,
-            warp_m=cfg.warp_m, warp_n=cfg.warp_n, warp_k=cfg.warp_k,
-            stages=cfg.stages,
-        )
-        _bmm_modules[key] = spec.build_and_load()
-    return _bmm_modules[key]
-
-
-def _get_group_gemm_variant_module(cfg: TileConfig):
-    key = cfg.name
-    if key not in _group_gemm_modules:
-        from oasr.jit.gemm import gen_group_gemm_module_variant
-
-        spec = gen_group_gemm_module_variant(
-            tile_m=cfg.tile_m, tile_n=cfg.tile_n, tile_k=cfg.tile_k,
-            warp_m=cfg.warp_m, warp_n=cfg.warp_n, warp_k=cfg.warp_k,
-            stages=cfg.stages,
-        )
-        _group_gemm_modules[key] = spec.build_and_load()
-    return _group_gemm_modules[key]
+@functools.cache
+def _get_group_gemm_module():
+    from oasr.jit.gemm import gen_group_gemm_module
+    return gen_group_gemm_module().build_and_load()
 
 
 # ---------------------------------------------------------------------------
@@ -84,20 +53,16 @@ def _get_group_gemm_variant_module(cfg: TileConfig):
 # ---------------------------------------------------------------------------
 
 def _make_gemm_runner(cfg: TileConfig):
-    """Create a GEMM runner that calls the variant module with split_k."""
+    """Create a GEMM runner that calls a specific variant from the module."""
     split_k = cfg.split_k
-    # The compile config is the same cfg but with split_k=1
-    compile_cfg = TileConfig(
-        tile_m=cfg.tile_m, tile_n=cfg.tile_n, tile_k=cfg.tile_k,
-        warp_m=cfg.warp_m, warp_n=cfg.warp_n, warp_k=cfg.warp_k,
-        stages=cfg.stages, split_k=1,
-    )
+    fn_name = gemm_func_name(cfg)
 
     def runner():
-        mod = _get_gemm_variant_module(compile_cfg)
+        mod = _get_gemm_module()
+        fn = getattr(mod, fn_name)
 
         def call(out, A, B, C, split_k_slices=split_k):
-            mod.gemm(out, A, B, C, split_k_slices)
+            fn(out, A, B, C, split_k_slices)
 
         return call
 
@@ -106,17 +71,14 @@ def _make_gemm_runner(cfg: TileConfig):
 
 def _make_gemm_activation_runner(cfg: TileConfig):
     split_k = cfg.split_k
-    compile_cfg = TileConfig(
-        tile_m=cfg.tile_m, tile_n=cfg.tile_n, tile_k=cfg.tile_k,
-        warp_m=cfg.warp_m, warp_n=cfg.warp_n, warp_k=cfg.warp_k,
-        stages=cfg.stages, split_k=1,
-    )
+    fn_name = gemm_activation_func_name(cfg)
 
     def runner():
-        mod = _get_gemm_variant_module(compile_cfg)
+        mod = _get_gemm_module()
+        fn = getattr(mod, fn_name)
 
         def call(out, A, B, C, activation_type, split_k_slices=split_k):
-            mod.gemm_activation(out, A, B, C, activation_type, split_k_slices)
+            fn(out, A, B, C, activation_type, split_k_slices)
 
         return call
 
@@ -157,9 +119,11 @@ for _cfg in GEMM_TILE_CONFIGS:
 # ---------------------------------------------------------------------------
 
 def _make_bmm_runner(cfg: TileConfig):
+    fn_name = bmm_func_name(cfg)
+
     def runner():
-        mod = _get_bmm_variant_module(cfg)
-        return mod.bmm
+        mod = _get_bmm_module()
+        return getattr(mod, fn_name)
 
     return runner
 
@@ -187,9 +151,11 @@ for _cfg in BMM_TILE_CONFIGS:
 # ---------------------------------------------------------------------------
 
 def _make_group_gemm_runner(cfg: TileConfig):
+    fn_name = group_gemm_func_name(cfg)
+
     def runner():
-        mod = _get_group_gemm_variant_module(cfg)
-        return mod.group_gemm
+        mod = _get_group_gemm_module()
+        return getattr(mod, fn_name)
 
     return runner
 

@@ -7,6 +7,8 @@ from typing import Optional
 
 import torch
 
+from oasr.api_logging import oasr_api
+
 # Activation type integer constants matching ActivationType enum in include/oasr/common/types.h
 ACTIVATION_RELU = 0
 ACTIVATION_GELU = 1
@@ -32,6 +34,7 @@ def _get_activation_module():
     return gen_activation_module().build_and_load()
 
 
+@oasr_api
 def glu(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Gated Linear Unit activation.
 
@@ -54,6 +57,7 @@ def glu(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor
     return out
 
 
+@oasr_api
 def swish(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Swish (SiLU) activation: x * sigmoid(x).
 

@@ -13,6 +13,7 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent.parent
 
 OASR_CSRC_DIR = _PROJECT_ROOT / "csrc"
 OASR_INCLUDE_DIR = _PROJECT_ROOT / "include"
+OASR_TEMPLATE_DIR = _PROJECT_ROOT / "csrc" / "templates"
 
 # Generated source directory for Jinja2 templates
 OASR_GEN_SRC_DIR = pathlib.Path(
@@ -20,11 +21,15 @@ OASR_GEN_SRC_DIR = pathlib.Path(
                    ".cache" / "oasr" / "generated")
 )
 
-# JIT cache directory
-OASR_JIT_CACHE_DIR = pathlib.Path(
-    os.environ.get("OASR_JIT_CACHE_DIR", pathlib.Path.home() /
-                   ".cache" / "oasr" / "jit")
+# JIT build directory (Ninja builds, compiled .so artifacts)
+OASR_JIT_DIR = pathlib.Path(
+    os.environ.get("OASR_JIT_DIR", os.environ.get(
+        "OASR_JIT_CACHE_DIR", pathlib.Path.home() / ".cache" / "oasr" / "jit"
+    ))
 )
+
+# Backward-compatible alias
+OASR_JIT_CACHE_DIR = OASR_JIT_DIR
 
 
 def _find_cutlass_include_dirs():

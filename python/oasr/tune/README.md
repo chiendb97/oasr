@@ -1,6 +1,6 @@
 # OASR Autotuning
 
-Runtime kernel selection that benchmarks candidate backends and caches the fastest `(backend, tactic)` per operation and input signature.
+Runtime kernel selection that benchmarks candidate backends and caches the fastest `(backend, tactic)` per operation and input signature. Follows the FlashInfer autotuner.py single-file pattern.
 
 ## Quick Start
 
@@ -43,12 +43,12 @@ Configs that differ only in `split_k` share the same compiled module, reducing J
 
 | Operation | Config list | Default | Count |
 |-----------|------------|---------|-------|
-| GEMM | `GEMM_TILE_CONFIGS` | 128×128×32, stages=2 | 11 (incl. split-K) |
+| GEMM | `GEMM_TILE_CONFIGS` | 128x128x32, stages=2 | 11 (incl. split-K) |
 | BMM | `BMM_TILE_CONFIGS` | Same as GEMM (no split-K) | 9 |
 | Group GEMM | `GROUP_GEMM_TILE_CONFIGS` | Same as GEMM (no split-K) | 9 |
-| Conv2D | `CONV2D_TILE_CONFIGS` | 128×128×64, stages=3 | 6 |
+| Conv2D | `CONV2D_TILE_CONFIGS` | 128x128x64, stages=3 | 6 |
 
-The C++ kernel headers use `TuneableTraits<SmVersion>` (in `include/oasr/common/tuneable_traits.h`) which wraps `ArchTraits` with preprocessor-conditional overrides. When `-DOASR_GEMM_TILE_M=X` flags are passed during JIT compilation, they override the default tile sizes. When no flags are set, `TuneableTraits` is identical to `ArchTraits`.
+The C++ kernel headers use per-family config structs (e.g., `GemmConfig` in `include/oasr/gemm/cutlass_gemm_configs.h`, `Conv2dConfig` in `include/oasr/conv/cutlass_conv2d_configs.h`). When `-DOASR_GEMM_TILE_M=X` flags are passed during JIT compilation, the `JitGemmConfig` typedef overrides the default tile sizes. When no flags are set, `DefaultGemmConfig<SM>` provides per-SM defaults. For Jinja-based variants, tile configs are baked directly into generated source files.
 
 ## Cache Files
 
@@ -56,13 +56,13 @@ Cache files are JSON with environment metadata:
 
 ```json
 {
-  "version": 1,
-  "env": {
-    "gpu_name": "NVIDIA A100-SXM4-80GB",
-    "sm": 80,
+  "_metadata": {
+    "oasr_version": "0.1.0",
     "cuda_version": "12.4",
-    "oasr_version": "0.1.0"
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "sm": "80"
   },
+  "version": 1,
   "entries": {
     "conv|conv2d||(1,64,64,3,32,3,3,1,1,1,1,1,1)|float16|sm80": {
       "backend": "cudnn",
@@ -80,15 +80,24 @@ Cache files are JSON with environment metadata:
 ## API Reference
 
 ```python
-# Context manager
-with autotune(tune_mode=True, cache="path.json", warmup=25, rep=100, log_level="INFO"):
+# Context manager (FlashInfer-style)
+with autotune(tune_mode=True, cache="path.json", warmup=25, rep=100):
     ...
+
+# Global toggle
+enable_autotune(cache="path.json")
+disable_autotune()
 
 # Direct helpers
 load_configs("path.json")    # Load cached configs
 save_configs("path.json")    # Save current cache
 clear_cache()                # Clear in-memory cache
 get_selected_config(...)     # Query cached tactic for a profile
+
+# Singleton access
+tuner = AutoTuner.get()
+tuner.stats                  # AutoTunerStatistics
+tuner.reset_statistics()     # Reset stats counters
 ```
 
 ## Adding a New Backend
@@ -97,8 +106,7 @@ get_selected_config(...)     # Query cached tactic for a profile
 2. Register entries using the global registry:
 
 ```python
-from oasr.tune._registry import BackendEntry, _global_registry
-from oasr.tune._types import OpKey, Tactic
+from oasr.tune.autotuner import BackendEntry, _global_registry, OpKey, Tactic
 
 def _trtllm_runner():
     # Return a callable with the same signature as the TVM-FFI module call
@@ -131,26 +139,27 @@ GEMM_TILE_CONFIGS.append(
 
 Each `TileConfig` is automatically registered as a `BackendEntry` with a `Tactic("cutlass", config=...)` in the backend modules. The autotuner profiles them all and picks the fastest.
 
-**Constraints** (CUTLASS 2.x TensorOp, SM80+, MMA 16×8×16):
+**Constraints** (CUTLASS 2.x TensorOp, SM80+, MMA 16x8x16):
 - `tile_m % warp_m == 0` and `tile_n % warp_n == 0`
 - `warp_m % 16 == 0` and `warp_n % 8 == 0`
 - `tile_k % warp_k == 0` and `tile_k % 16 == 0`
-- Total warps = `(tile_m/warp_m) × (tile_n/warp_n)`, typically 4 or 8
+- Total warps = `(tile_m/warp_m) x (tile_n/warp_n)`, typically 4 or 8
 
 ## Architecture
 
 ```
 tune/
-    __init__.py      # Public API: autotune(), load_configs(), etc.
-    _types.py        # OpKey, ProfileKey, Tactic, TuneResult
-    _registry.py     # BackendRegistry + BackendEntry
-    _cache.py        # TuneCache (in-memory + JSON persistence)
-    _profiler.py     # Profiler (triton.testing.do_bench / CUDA events)
-    _tuner.py        # AutoTuner orchestrator
+    __init__.py        # Re-exports from autotuner.py
+    autotuner.py       # Single-file autotuner (FlashInfer-style)
+                       #   Types: OpKey, ProfileKey, Tactic, TuneResult
+                       #   Registry: BackendEntry, BackendRegistry
+                       #   AutoTuner: singleton with cache, profiling, dispatch
+                       #   Context manager: autotune()
+                       #   Convenience API: enable/disable, load/save, etc.
     kernel_configs.py  # TileConfig dataclass + config lists
     backends/
-        conv2d.py    # CUTLASS tile variants + cuDNN backends
-        gemm.py      # CUTLASS tile variants (GEMM, BMM, Group GEMM)
+        gemm.py        # CUTLASS tile variants (GEMM, BMM, Group GEMM)
+        conv2d.py      # CUTLASS tile variants + cuDNN backends
 ```
 
-Lookup priority: **in-memory cache → persisted JSON → bundled defaults → fallback tactic**.
+Lookup priority: **in-memory cache -> user-loaded file configs -> bundled defaults -> fallback tactic**.

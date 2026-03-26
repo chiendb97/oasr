@@ -7,6 +7,8 @@ from typing import Optional
 
 import torch
 
+from oasr.api_logging import oasr_api
+
 
 @functools.cache
 def _get_conv_module():
@@ -29,6 +31,18 @@ def _get_cudnn_conv2d_module():
     return gen_cudnn_conv2d_module().build_and_load()
 
 
+def _default_conv2d_fn():
+    from oasr.jit.conv import CONV2D_DEFAULT, conv2d_func_name
+
+    return getattr(_get_conv2d_module(), conv2d_func_name(CONV2D_DEFAULT))
+
+
+def _default_conv2d_activation_fn():
+    from oasr.jit.conv import CONV2D_DEFAULT, conv2d_activation_func_name
+
+    return getattr(_get_conv2d_module(), conv2d_activation_func_name(CONV2D_DEFAULT))
+
+
 # IC threshold below which cuDNN is used instead of CUTLASS.
 # CUTLASS implicit GEMM uses scalar alignment (=1) for all IC values, but
 # cuDNN can pick better algorithms when IC is small (e.g. IC=1 in conformer
@@ -36,6 +50,7 @@ def _get_cudnn_conv2d_module():
 _CUDNN_IC_THRESHOLD = 8
 
 
+@oasr_api
 def depthwise_conv1d(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -66,6 +81,7 @@ def depthwise_conv1d(
     return out
 
 
+@oasr_api
 def pointwise_conv1d(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -91,6 +107,7 @@ def pointwise_conv1d(
     return out
 
 
+@oasr_api
 def conv2d(
     input: torch.Tensor,
     filter: torch.Tensor,
@@ -136,7 +153,7 @@ def conv2d(
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner
-        from oasr.tune._types import OpKey
+        from oasr.tune.autotuner import OpKey
 
         N, H, W, _IC = input.shape
         K, R, S, _ = filter.shape
@@ -156,12 +173,13 @@ def conv2d(
             out, input, filter, bias, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w
         )
     else:
-        _get_conv2d_module().conv2d(
+        _default_conv2d_fn()(
             out, input, filter, bias, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w
         )
     return out
 
 
+@oasr_api
 def depthwise_conv1d_silu(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -181,6 +199,7 @@ def depthwise_conv1d_silu(
     return out
 
 
+@oasr_api
 def pointwise_conv1d_activation(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -197,6 +216,7 @@ def pointwise_conv1d_activation(
     return out
 
 
+@oasr_api
 def causal_conv1d(
     input: torch.Tensor,
     state: torch.Tensor,
@@ -211,6 +231,7 @@ def causal_conv1d(
     return out
 
 
+@oasr_api
 def conv2d_activation(
     input: torch.Tensor,
     filter: torch.Tensor,
@@ -242,7 +263,7 @@ def conv2d_activation(
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner
-        from oasr.tune._types import OpKey
+        from oasr.tune.autotuner import OpKey
 
         N, H, W, _IC = input.shape
         K, R, S, _ = filter.shape
@@ -263,7 +284,7 @@ def conv2d_activation(
             dilation_h, dilation_w,
         )
     else:
-        _get_conv2d_module().conv2d_activation(
+        _default_conv2d_activation_fn()(
             out, input, filter, bias, activation_type, pad_h, pad_w, stride_h, stride_w,
             dilation_h, dilation_w,
         )

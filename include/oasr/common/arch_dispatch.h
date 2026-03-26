@@ -39,16 +39,16 @@ inline int getDeviceSmVersion() {
 /**
  * @brief Map a runtime SM version to the nearest compiled architecture family.
  *
- * Each GPU maps to the highest ArchTraits specialization that does not exceed it:
- *   SM120+       → 120 (next-gen)
- *   SM103-SM119  → 103 (Blackwell consumer, e.g. RTX 5090)
- *   SM100-SM102  → 100 (Blackwell datacenter, e.g. B200)
- *   SM90-SM99    → 90  (Hopper, e.g. H100)
- *   SM89         → 89  (Ada Lovelace, e.g. RTX 4090)
- *   SM86-SM88    → 86  (Ampere GA102, e.g. RTX 3090, A40)
- *   SM80-SM85    → 80  (Ampere GA100, e.g. A100)
- *   SM75-SM79    → 75  (Turing)
- *   SM70-SM74    → 70  (Volta)
+ * Each GPU maps to the highest specialization that does not exceed it:
+ *   SM120+       -> 120 (next-gen)
+ *   SM103-SM119  -> 103 (Blackwell consumer, e.g. RTX 5090)
+ *   SM100-SM102  -> 100 (Blackwell datacenter, e.g. B200)
+ *   SM90-SM99    -> 90  (Hopper, e.g. H100)
+ *   SM89         -> 89  (Ada Lovelace, e.g. RTX 4090)
+ *   SM86-SM88    -> 86  (Ampere GA102, e.g. RTX 3090, A40)
+ *   SM80-SM85    -> 80  (Ampere GA100, e.g. A100)
+ *   SM75-SM79    -> 75  (Turing)
+ *   SM70-SM74    -> 70  (Volta)
  */
 inline int resolveSmVersion(int sm) {
     if (sm >= 120) return 120;
@@ -66,73 +66,75 @@ inline int resolveSmVersion(int sm) {
 }  // namespace oasr
 
 /**
- * @brief Runtime dispatch macro — converts runtime SM version to a compile-time constant.
+ * @brief Runtime dispatch macro -- converts runtime SM version to a compile-time constant.
  *
  * When OASR_TARGET_SM is defined (e.g. via JIT -DOASR_TARGET_SM=80), only the
- * target architecture is instantiated, avoiding invalid template combinations
- * for other architectures and reducing compilation time.
+ * target architecture is instantiated, reducing compilation time.
  *
  * Usage:
  *   int sm = oasr::getDeviceSmVersion();
- *   OASR_DISPATCH_ARCH(sm, SM_VERSION, {
- *       using Traits = oasr::ArchTraits<SM_VERSION>;
- *       // ... use Traits ...
+ *   OASR_DISPATCH_SM(sm, SM_VERSION, {
+ *       using MMA = oasr::gemm::SmMMATraits<SM_VERSION>;
+ *       // ... use SM_VERSION ...
  *   });
  */
 #ifdef OASR_TARGET_SM
 
-#define OASR_DISPATCH_ARCH(sm_version, ARCH_VAR, ...)                                    \
-    do {                                                                                  \
-        constexpr int ARCH_VAR = OASR_TARGET_SM;                                         \
-        __VA_ARGS__                                                                       \
+#define OASR_DISPATCH_SM(sm_version, ARCH_VAR, ...)                                        \
+    do {                                                                                    \
+        constexpr int ARCH_VAR = OASR_TARGET_SM;                                           \
+        __VA_ARGS__                                                                         \
     } while (0)
 
 #else  // Full runtime dispatch (AOT builds)
 
-#define OASR_DISPATCH_ARCH(sm_version, ARCH_VAR, ...)                                    \
-    do {                                                                                  \
-        const int _resolved = oasr::resolveSmVersion(sm_version);                        \
-        switch (_resolved) {                                                              \
-            case 120: {                                                                   \
-                constexpr int ARCH_VAR = 120;                                             \
-                __VA_ARGS__                                                               \
-            } break;                                                                      \
-            case 103: {                                                                   \
-                constexpr int ARCH_VAR = 103;                                             \
-                __VA_ARGS__                                                               \
-            } break;                                                                      \
-            case 100: {                                                                   \
-                constexpr int ARCH_VAR = 100;                                             \
-                __VA_ARGS__                                                               \
-            } break;                                                                      \
-            case 90: {                                                                    \
-                constexpr int ARCH_VAR = 90;                                              \
-                __VA_ARGS__                                                               \
-            } break;                                                                      \
-            case 89: {                                                                    \
-                constexpr int ARCH_VAR = 89;                                              \
-                __VA_ARGS__                                                               \
-            } break;                                                                      \
-            case 86: {                                                                    \
-                constexpr int ARCH_VAR = 86;                                              \
-                __VA_ARGS__                                                               \
-            } break;                                                                      \
-            case 80: {                                                                    \
-                constexpr int ARCH_VAR = 80;                                              \
-                __VA_ARGS__                                                               \
-            } break;                                                                      \
-            case 75: {                                                                    \
-                constexpr int ARCH_VAR = 75;                                              \
-                __VA_ARGS__                                                               \
-            } break;                                                                      \
-            case 70: {                                                                    \
-                constexpr int ARCH_VAR = 70;                                              \
-                __VA_ARGS__                                                               \
-            } break;                                                                      \
-            default:                                                                      \
-                throw std::runtime_error("Unsupported SM version: " +                     \
-                                         std::to_string(_resolved));                      \
-        }                                                                                 \
+#define OASR_DISPATCH_SM(sm_version, ARCH_VAR, ...)                                        \
+    do {                                                                                    \
+        const int _resolved = oasr::resolveSmVersion(sm_version);                          \
+        switch (_resolved) {                                                                \
+            case 120: {                                                                     \
+                constexpr int ARCH_VAR = 120;                                               \
+                __VA_ARGS__                                                                 \
+            } break;                                                                        \
+            case 103: {                                                                     \
+                constexpr int ARCH_VAR = 103;                                               \
+                __VA_ARGS__                                                                 \
+            } break;                                                                        \
+            case 100: {                                                                     \
+                constexpr int ARCH_VAR = 100;                                               \
+                __VA_ARGS__                                                                 \
+            } break;                                                                        \
+            case 90: {                                                                      \
+                constexpr int ARCH_VAR = 90;                                                \
+                __VA_ARGS__                                                                 \
+            } break;                                                                        \
+            case 89: {                                                                      \
+                constexpr int ARCH_VAR = 89;                                                \
+                __VA_ARGS__                                                                 \
+            } break;                                                                        \
+            case 86: {                                                                      \
+                constexpr int ARCH_VAR = 86;                                                \
+                __VA_ARGS__                                                                 \
+            } break;                                                                        \
+            case 80: {                                                                      \
+                constexpr int ARCH_VAR = 80;                                                \
+                __VA_ARGS__                                                                 \
+            } break;                                                                        \
+            case 75: {                                                                      \
+                constexpr int ARCH_VAR = 75;                                                \
+                __VA_ARGS__                                                                 \
+            } break;                                                                        \
+            case 70: {                                                                      \
+                constexpr int ARCH_VAR = 70;                                                \
+                __VA_ARGS__                                                                 \
+            } break;                                                                        \
+            default:                                                                        \
+                throw std::runtime_error("Unsupported SM version: " +                       \
+                                         std::to_string(_resolved));                        \
+        }                                                                                   \
     } while (0)
 
 #endif  // OASR_TARGET_SM
+
+// Backward compatibility alias
+#define OASR_DISPATCH_ARCH OASR_DISPATCH_SM

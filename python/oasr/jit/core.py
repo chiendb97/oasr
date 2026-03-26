@@ -2,20 +2,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """Core JIT compilation infrastructure.
 
-Mirrors FlashInfer's JitSpec + gen_jit_spec() pattern.
-Uses NVCC for compilation and ctypes for loading.
+Mirrors FlashInfer's JIT architecture:
+- ``cpp_ext`` for Ninja-based compilation with proper flag construction
+- ``cubin_loader`` for concurrent-safe caching with file locking
+- ``JitSpec`` / ``JinjaJitSpec`` for specifying compilation units
 """
 
-import ctypes
 import hashlib
-import os
+import logging
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from . import env
+from .cpp_ext import (
+    generate_ninja_build_for_op,
+    run_ninja,
+)
+from .cubin_loader import locked_compile, write_if_different
+
+logger = logging.getLogger("oasr.jit")
+
+
+# ---------------------------------------------------------------------------
+# Device / SM detection
+# ---------------------------------------------------------------------------
 
 
 def _get_cuda_arch() -> Tuple[int, int]:
@@ -25,6 +37,7 @@ def _get_cuda_arch() -> Tuple[int, int]:
     """
     try:
         import torch
+
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
             return (props.major, props.minor)
@@ -42,11 +55,33 @@ def _get_cuda_arch() -> Tuple[int, int]:
         return (8, 0)  # Safe default: SM80 (Ampere)
 
 
+def _get_target_sm() -> int:
+    """Get the resolved target SM version for JIT compilation."""
+    major, minor = _get_cuda_arch()
+    sm = major * 10 + minor
+    sm_to_arch = {
+        70: 70, 75: 75, 80: 80, 86: 86, 89: 89,
+        90: 90, 100: 100, 103: 103, 120: 120,
+    }
+    target_sm = 80
+    for threshold in sorted(sm_to_arch.keys()):
+        if sm >= threshold:
+            target_sm = sm_to_arch[threshold]
+    return target_sm
+
+
+# ---------------------------------------------------------------------------
+# JitSpec
+# ---------------------------------------------------------------------------
+
+
 class JitSpec:
     """Specification for a JIT-compiled CUDA module.
 
     Encapsulates source files, compiler flags, and include directories.
-    Supports both AOT and JIT compilation paths.
+    Compilation uses Ninja (via ``cpp_ext``) for parallel builds with
+    dependency tracking.  Concurrent builds of the same library are
+    serialised via file locks (``cubin_loader``).
     """
 
     def __init__(
@@ -54,17 +89,17 @@ class JitSpec:
         name: str,
         sources: List[Path],
         extra_cuda_cflags: Optional[List[str]] = None,
-        extra_include_dirs: Optional[List[str]] = None,
+        extra_include_dirs: Optional[List[Path]] = None,
         extra_ldflags: Optional[List[str]] = None,
     ):
         self.name = name
         self.sources = [Path(s) for s in sources]
         self.extra_cuda_cflags = extra_cuda_cflags or []
-        self.extra_include_dirs = extra_include_dirs or []
+        self.extra_include_dirs = [Path(d) for d in (extra_include_dirs or [])]
         self.extra_ldflags = extra_ldflags or []
 
     def _content_hash(self) -> str:
-        """Compute hash of all source files for cache invalidation."""
+        """Compute hash of all source files + flags for cache invalidation."""
         h = hashlib.sha256()
         h.update(self.name.encode())
         for flag in sorted(self.extra_cuda_cflags):
@@ -78,72 +113,116 @@ class JitSpec:
                 h.update(str(src).encode())
         return h.hexdigest()[:16]
 
+    def _get_lib_dir(self) -> Path:
+        """Get the build directory for this module."""
+        content_hash = self._content_hash()
+        return env.OASR_JIT_DIR / self.name / content_hash
+
     def _get_lib_path(self) -> Path:
         """Get the path to the compiled shared library."""
-        content_hash = self._content_hash()
-        cache_dir = env.OASR_JIT_CACHE_DIR / self.name / content_hash
-        return cache_dir / f"lib{self.name}.so"
+        return self._get_lib_dir() / f"{self.name}.so"
 
-    def _compile(self, lib_path: Path) -> None:
-        """Compile sources into a shared library using NVCC."""
-        lib_path.parent.mkdir(parents=True, exist_ok=True)
+    def _compile(self, lib_path: str) -> None:
+        """Compile sources into a shared library using Ninja."""
+        lib_path = Path(lib_path)
+        build_dir = lib_path.parent
+        build_dir.mkdir(parents=True, exist_ok=True)
 
-        # Find NVCC
-        nvcc = shutil.which("nvcc")
-        if nvcc is None:
-            raise RuntimeError("nvcc not found. Please install CUDA toolkit.")
+        # Generate build.ninja
+        ninja_content = generate_ninja_build_for_op(
+            name=self.name,
+            sources=self.sources,
+            extra_cuda_cflags=self.extra_cuda_cflags,
+            extra_include_dirs=self.extra_include_dirs,
+            extra_ldflags=self.extra_ldflags,
+            build_dir=build_dir,
+        )
+        ninja_file = build_dir / "build.ninja"
+        write_if_different(ninja_file, ninja_content)
 
-        # Find TVM-FFI include dir
-        tvm_ffi_include = _get_tvm_ffi_include_dir()
-
-        # Build include flags
-        include_dirs = [
-            str(env.OASR_INCLUDE_DIR),
-            str(env.OASR_CSRC_DIR),
-        ] + self.extra_include_dirs
-        if tvm_ffi_include:
-            include_dirs.append(tvm_ffi_include)
-
-        include_flags = [f"-I{d}" for d in include_dirs]
-
-        # Compile each source to object files, then link
-        obj_files = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for src in self.sources:
-                obj_path = Path(tmpdir) / (src.stem + ".o")
-                cmd = [
-                    nvcc,
-                    "-c",
-                    str(src),
-                    "-o",
-                    str(obj_path),
-                    "--compiler-options",
-                    "-fPIC",
-                ] + self.extra_cuda_cflags + include_flags
-                subprocess.check_call(cmd)
-                obj_files.append(str(obj_path))
-
-            # Link into shared library
-            link_cmd = [
-                nvcc,
-                "-shared",
-                "-o",
-                str(lib_path),
-            ] + obj_files + ["--compiler-options", "-fPIC"] + self.extra_ldflags
-            subprocess.check_call(link_cmd)
+        # Run ninja
+        verbose = logger.isEnabledFor(logging.DEBUG)
+        run_ninja(workdir=build_dir, ninja_file=ninja_file, verbose=verbose)
 
     def build_and_load(self):
-        """Build if needed, then load the shared library.
+        """Build if needed (with file-lock protection), then load the module.
 
-        Returns a tvm_ffi.Module handle. Functions exported via
-        TVM_FFI_DLL_EXPORT_TYPED_FUNC are accessible as attributes
+        Returns a ``tvm_ffi.Module`` handle.  Functions exported via
+        ``TVM_FFI_DLL_EXPORT_TYPED_FUNC`` are accessible as attributes
         or via indexing (e.g., ``module["layernorm"]``).
         """
         lib_path = self._get_lib_path()
         if not lib_path.exists():
-            self._compile(lib_path)
+            locked_compile(str(lib_path), self._compile)
         import tvm_ffi
+
         return tvm_ffi.load_module(str(lib_path))
+
+
+# ---------------------------------------------------------------------------
+# JinjaJitSpec
+# ---------------------------------------------------------------------------
+
+
+class JinjaJitSpec(JitSpec):
+    """JitSpec that generates source files from Jinja2 templates.
+
+    Instead of compiling static source files, this renders a Jinja2 template
+    with baked-in configuration (tile sizes, SM version, etc.) to produce
+    a self-contained ``.cu`` file that instantiates exactly one kernel config.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        template_name: str,
+        template_vars: dict,
+        extra_cuda_cflags: Optional[List[str]] = None,
+        extra_include_dirs: Optional[List[Path]] = None,
+        extra_ldflags: Optional[List[str]] = None,
+    ):
+        self.template_name = template_name
+        self.template_vars = template_vars
+
+        # Render template to generated source file
+        gen_src = self._render_source(name)
+
+        super().__init__(
+            name=name,
+            sources=[gen_src],
+            extra_cuda_cflags=extra_cuda_cflags,
+            extra_include_dirs=extra_include_dirs,
+            extra_ldflags=extra_ldflags,
+        )
+
+    def _render_source(self, name: str) -> Path:
+        """Render the Jinja template to a generated .cu file."""
+        from .templates import render_template
+
+        rendered = render_template(self.template_name, **self.template_vars)
+        gen_path = env.OASR_GEN_SRC_DIR / name / f"{name}.cu"
+        write_if_different(gen_path, rendered)
+        return gen_path
+
+
+# ---------------------------------------------------------------------------
+# Factory functions
+# ---------------------------------------------------------------------------
+
+
+def _default_cuda_cflags() -> List[str]:
+    """Standard OASR NVCC flags used by all kernel modules."""
+    target_sm = _get_target_sm()
+    major, minor = _get_cuda_arch()
+    sm = major * 10 + minor
+    return [
+        "-std=c++17",
+        "-O3",
+        "--use_fast_math",
+        "-DENABLE_BF16",
+        f"-DOASR_TARGET_SM={target_sm}",
+        f"-gencode=arch=compute_{sm},code=sm_{sm}",
+    ]
 
 
 def gen_jit_spec(
@@ -153,62 +232,41 @@ def gen_jit_spec(
     extra_ldflags: Optional[List[str]] = None,
 ) -> JitSpec:
     """Create a JitSpec with standard OASR compilation flags."""
-    major, minor = _get_cuda_arch()
-    sm = major * 10 + minor
-    # Map SM to the nearest ArchTraits specialization
-    sm_to_arch = {70: 70, 75: 75, 80: 80, 86: 86, 89: 89, 90: 90, 100: 100, 103: 103, 120: 120}
-    target_sm = 80  # default
-    for threshold in sorted(sm_to_arch.keys()):
-        if sm >= threshold:
-            target_sm = sm_to_arch[threshold]
-    default_flags = [
-        "-std=c++17",
-        "-O3",
-        "--use_fast_math",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "-DENABLE_BF16",
-        f"-DOASR_TARGET_SM={target_sm}",
-        f"-gencode=arch=compute_{sm},code=sm_{sm}",
-    ]
-    include_dirs = [str(env.OASR_INCLUDE_DIR), str(env.OASR_CSRC_DIR)]
-    include_dirs.extend(env.OASR_CUTLASS_INCLUDE_DIRS)
     return JitSpec(
         name=name,
         sources=sources,
-        extra_cuda_cflags=default_flags + (extra_cuda_cflags or []),
-        extra_include_dirs=include_dirs,
+        extra_cuda_cflags=_default_cuda_cflags() + (extra_cuda_cflags or []),
         extra_ldflags=extra_ldflags,
     )
 
 
-def write_if_different(path: Path, content: str) -> bool:
-    """Write *content* to *path* only if it differs from the current contents.
+def gen_jinja_jit_spec(
+    name: str,
+    template_name: str,
+    template_vars: dict,
+    extra_cuda_cflags: Optional[List[str]] = None,
+    extra_ldflags: Optional[List[str]] = None,
+) -> JinjaJitSpec:
+    """Create a JinjaJitSpec with standard OASR compilation flags.
 
-    Returns True if the file was (re-)written, False if it was already
-    up-to-date.  This avoids unnecessary recompilation when the generated
-    source has not changed.
+    Like ``gen_jit_spec()`` but renders a Jinja template instead of using
+    static source files.
     """
-    path = Path(path)
-    if path.exists():
-        existing = path.read_text()
-        if existing == content:
-            return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
-    return True
+    return JinjaJitSpec(
+        name=name,
+        template_name=template_name,
+        template_vars=template_vars,
+        extra_cuda_cflags=_default_cuda_cflags() + (extra_cuda_cflags or []),
+        extra_ldflags=extra_ldflags,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cache management
+# ---------------------------------------------------------------------------
 
 
 def clear_cache() -> None:
     """Remove all JIT-compiled artifacts."""
-    if env.OASR_JIT_CACHE_DIR.exists():
-        shutil.rmtree(env.OASR_JIT_CACHE_DIR)
-
-
-def _get_tvm_ffi_include_dir() -> Optional[str]:
-    """Get TVM-FFI include directory if available."""
-    try:
-        import tvm_ffi.libinfo
-        return str(tvm_ffi.libinfo.find_include_path())
-    except (ImportError, AttributeError):
-        return None
+    if env.OASR_JIT_DIR.exists():
+        shutil.rmtree(env.OASR_JIT_DIR)

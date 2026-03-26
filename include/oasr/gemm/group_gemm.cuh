@@ -1,10 +1,9 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Grouped GEMM kernel — pure CUDA + CUTLASS, no framework dependencies.
-// Supports variable-sized problems with BF16 and FP16 precision.
-//
-// Merges group_gemm_impl.h (CUTLASS template) and group_gemm_kernels.cu (dispatch logic).
+// Grouped GEMM kernel -- pure CUDA + CUTLASS.
+// Uses GemmConfig + SmMMATraits dispatch (FlashInfer-style).
+// Requires SM >= 80 (Ampere or newer).
 
 #pragma once
 
@@ -33,30 +32,15 @@
 #endif
 
 #include <oasr/common/arch_dispatch.h>
-#include <oasr/common/arch_traits.h>
-#include <oasr/common/tuneable_traits.h>
-#include <oasr/gemm/gemm_utils.h>
+#include <oasr/gemm/cutlass_gemm_configs.h>
 
 namespace oasr {
 namespace gemm {
 
 //==============================================================================
-// Grouped GEMM Problem Descriptor (raw-pointer interface, no torch dependency)
+// Grouped GEMM Problem Descriptor
 //==============================================================================
 
-/**
- * @brief Describes a set of grouped GEMM problems using raw pointers.
- *
- * Each problem i computes: D_i = A_i @ B_i
- * where A_i is [M_i, K] and B_i is [N, K] (column-major) and D_i is [M_i, N].
- *
- * A is a concatenated buffer [L, K] where L = sum(M_i).  D is [L, N].
- * B is a per-problem array of pointers, each pointing to [N, K].
- *
- * @tparam ElementA  Element type of matrix A
- * @tparam ElementB  Element type of matrix B
- * @tparam ElementCD Element type of output matrix D
- */
 template <typename ElementA, typename ElementB, typename ElementCD>
 struct GroupedGemmProblemDesc {
     std::vector<cutlass::gemm::GemmCoord> problem_sizes;
@@ -70,22 +54,8 @@ struct GroupedGemmProblemDesc {
     cutlass::DeviceAllocation<int64_t> ldb_device;
     cutlass::DeviceAllocation<int64_t> ldd_device;
 
-    /**
-     * @brief Construct a grouped GEMM problem descriptor from raw pointers.
-     *
-     * @param problem_count Number of problems (batch size)
-     * @param K             Inner dimension (columns of A, rows of B in logical view)
-     * @param N             Output columns
-     * @param A_ptr         Pointer to concatenated A matrices [L, K] on device
-     * @param B_ptrs        Host array of problem_count device pointers, each to [N, K]
-     * @param D_ptr         Pointer to concatenated D matrices [L, N] on device
-     * @param offsets_host  Host array of problem_count cumulative row offsets.
-     *                      offsets_host[i] = sum(M_0..M_i), so M_i = offsets_host[i] -
-     *                      offsets_host[i-1] (offsets_host[-1] is implicitly 0).
-     */
     GroupedGemmProblemDesc(int problem_count, int K, int N, const ElementA* A_ptr,
-                           const ElementB* B_ptr, ElementCD* D_ptr,
-                           const int* offsets_host)
+                           const ElementB* B_ptr, ElementCD* D_ptr, const int* offsets_host)
         : problem_sizes(problem_count),
           problems_sizes_device(problem_count),
           ptr_A_device(problem_count),
@@ -110,7 +80,6 @@ struct GroupedGemmProblemDesc {
             ldb[i] = K;
             ldd[i] = N;
 
-            // A and D are laid out as concatenated [M_i, K] and [M_i, N] tiles.
             ptr_A[i] = const_cast<ElementA*>(A_ptr) + static_cast<int64_t>(offset_M) * K;
             ptr_B[i] = const_cast<ElementB*>(B_ptr) + static_cast<int64_t>(i) * N * K;
             ptr_D[i] = D_ptr + static_cast<int64_t>(offset_M) * N;
@@ -129,12 +98,12 @@ struct GroupedGemmProblemDesc {
 };
 
 //==============================================================================
-// CUTLASS Grouped GEMM Template (from group_gemm_impl.h)
+// CUTLASS Grouped GEMM Template
 //==============================================================================
 
-template <typename Traits, typename ElementA, typename ElementB, typename ElementCD, typename LayoutA,
-          typename LayoutB, typename LayoutCD>
-struct CutlassGroupGemm {
+template <typename Config, typename MMATraits, typename ElementA, typename ElementB,
+          typename ElementCD, typename LayoutA, typename LayoutB, typename LayoutCD>
+struct CutlassGroupGemmKernel {
     using ElementAccumulator = float;
     using ElementComputeEpilogue = ElementAccumulator;
 
@@ -142,12 +111,12 @@ struct CutlassGroupGemm {
     static constexpr int kAlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
     static constexpr int kAlignmentCD = 128 / cutlass::sizeof_bits<ElementCD>::value;
 
-    using MMAOp = typename Traits::MMAOp;
-    using SmArch = typename Traits::SmArch;
+    using MMAOp = typename MMATraits::MMAOp;
+    using SmArch = typename MMATraits::SmArch;
 
-    using ShapeMMAThreadBlock = typename Traits::Gemm::ThreadBlock;
-    using ShapeMMAWarps = typename Traits::Gemm::Warps;
-    using ShapeMMAOp = typename Traits::Gemm::MMAShape;
+    using ShapeMMAThreadBlock = typename Config::ThreadBlock;
+    using ShapeMMAWarps = typename Config::Warps;
+    using ShapeMMAOp = typename MMATraits::MMAShape;
 
     using SwizzleThreadblock = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
 
@@ -155,7 +124,7 @@ struct CutlassGroupGemm {
         cutlass::epilogue::thread::LinearCombination<ElementCD, kAlignmentCD, ElementAccumulator,
                                                      ElementAccumulator>;
 
-    static constexpr int NumStages = Traits::Gemm::NumStages;
+    static constexpr int NumStages = Config::NumStages;
 
     using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
         ElementA, LayoutA, cutlass::ComplexTransform::kNone, kAlignmentA, ElementB, LayoutB,
@@ -201,30 +170,25 @@ struct CutlassGroupGemm {
 };
 
 //==============================================================================
-// Architecture + dtype dispatch helper
+// Dispatch helpers
 //==============================================================================
 
 namespace detail {
 
-template <int SmVersion, typename ElementA, typename ElementB, typename ElementCD>
-static GemmStatus dispatchGroupGemmImpl(int problem_count, int K, int N, const ElementA* A_ptr,
-                                        const ElementB* B_ptr, ElementCD* D_ptr,
-                                        const int* offsets_host, cudaStream_t stream) {
-    if constexpr (SmVersion < 80) {
-        throw std::runtime_error("Grouped GEMM requires SM80 or newer (current: SM" +
-                                 std::to_string(SmVersion) + ")");
-    } else {
-        using Traits = oasr::TuneableTraits<SmVersion>;
-        using LayoutA = cutlass::layout::RowMajor;
-        using LayoutB = cutlass::layout::ColumnMajor;
-        using LayoutCD = cutlass::layout::RowMajor;
+template <typename Config, typename MMATraits, typename ElementA, typename ElementB,
+          typename ElementCD>
+static GemmStatus dispatchGroupGemmWithConfig(int problem_count, int K, int N,
+                                               const ElementA* A_ptr, const ElementB* B_ptr,
+                                               ElementCD* D_ptr, const int* offsets_host,
+                                               cudaStream_t stream) {
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutCD = cutlass::layout::RowMajor;
 
-        GroupedGemmProblemDesc<ElementA, ElementB, ElementCD> problem_desc(problem_count, K, N,
-                                                                           A_ptr, B_ptr, D_ptr,
-                                                                           offsets_host);
-        return CutlassGroupGemm<Traits, ElementA, ElementB, ElementCD, LayoutA, LayoutB,
-                                LayoutCD>::run(problem_desc, problem_count, stream);
-    }
+    GroupedGemmProblemDesc<ElementA, ElementB, ElementCD> problem_desc(problem_count, K, N, A_ptr,
+                                                                       B_ptr, D_ptr, offsets_host);
+    return CutlassGroupGemmKernel<Config, MMATraits, ElementA, ElementB, ElementCD, LayoutA,
+                                   LayoutB, LayoutCD>::run(problem_desc, problem_count, stream);
 }
 
 }  // namespace detail
@@ -234,27 +198,14 @@ static GemmStatus dispatchGroupGemmImpl(int problem_count, int K, int N, const E
 //==============================================================================
 
 /**
- * @brief Execute grouped GEMM operation with variable problem sizes.
+ * @brief Execute grouped GEMM with variable problem sizes.
  *
  * Computes: D_i = A_i @ B_i for each problem i in [0, problem_count).
- *
- * A is a concatenated [L, K] buffer on device (L = sum of all M_i).
- * B_ptrs is a host array of problem_count device pointers, each to [N, K] col-major.
- * D is a concatenated [L, N] buffer on device.
- * offsets_host is a host array where offsets_host[i] is the cumulative row count
- * through problem i (i.e., offsets_host[i] = M_0 + M_1 + ... + M_i).
- *
  * Requires SM >= 80 (Ampere or newer).
- *
- * @tparam ElementA  Element type of matrix A (cutlass::half_t or cutlass::bfloat16_t)
- * @tparam ElementB  Element type of matrix B
- * @tparam ElementCD Element type of output matrix D
- * @return cudaError_t  cudaSuccess on success
  */
 template <typename ElementA, typename ElementB, typename ElementCD>
-cudaError_t GroupGemm(const ElementA* A, const ElementB* B, ElementCD* D,
-                      int problem_count, int K, int N, const int* offsets_host,
-                      cudaStream_t stream) {
+cudaError_t GroupGemm(const ElementA* A, const ElementB* B, ElementCD* D, int problem_count, int K,
+                      int N, const int* offsets_host, cudaStream_t stream) {
     if (A == nullptr || B == nullptr || D == nullptr || offsets_host == nullptr) {
         return cudaErrorInvalidValue;
     }
@@ -264,11 +215,33 @@ cudaError_t GroupGemm(const ElementA* A, const ElementB* B, ElementCD* D,
 
     GemmStatus status = GemmStatus::SUCCESS;
 
+#ifdef OASR_TARGET_SM
+    {
+        constexpr int SM_VERSION = OASR_TARGET_SM;
+        static_assert(SM_VERSION >= 80, "Grouped GEMM requires SM80 or newer");
+#ifdef OASR_GEMM_TILE_M
+        using Config = JitGemmConfig;
+#else
+        using Config = typename DefaultGemmConfig<SM_VERSION>::type;
+#endif
+        using MMA = SmMMATraits<SM_VERSION>;
+        status = detail::dispatchGroupGemmWithConfig<Config, MMA>(problem_count, K, N, A, B, D,
+                                                                   offsets_host, stream);
+    }
+#else
     int sm = oasr::getDeviceSmVersion();
-    OASR_DISPATCH_ARCH(sm, SM_VERSION, {
-        status = detail::dispatchGroupGemmImpl<SM_VERSION>(problem_count, K, N, A, B, D,
-                                                           offsets_host, stream);
+    OASR_DISPATCH_SM(sm, SM_VERSION, {
+        if constexpr (SM_VERSION < 80) {
+            throw std::runtime_error("Grouped GEMM requires SM80 or newer (current: SM" +
+                                     std::to_string(SM_VERSION) + ")");
+        } else {
+            using Config = typename DefaultGemmConfig<SM_VERSION>::type;
+            using MMA = SmMMATraits<SM_VERSION>;
+            status = detail::dispatchGroupGemmWithConfig<Config, MMA>(problem_count, K, N, A, B, D,
+                                                                       offsets_host, stream);
+        }
     });
+#endif
 
     if (status != GemmStatus::SUCCESS) {
         return cudaErrorUnknown;
