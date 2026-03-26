@@ -1,0 +1,55 @@
+# Merged into compile_commands from build/ — needed because clangd often picks a
+# csrc/*.cc TU for tvm_ffi_utils.h (no TVM-FFI -I there). Harmless if a path is absent.
+#
+# compile_commands.json uses "directory": "<repo>/build", so relative -I paths here are
+# resolved from build/: use ../ for repo-root dirs and _deps/ for FetchContent CUTLASS.
+CompileFlags:
+  Compiler: clang++
+  Add:
+    - "-I/usr/local/lib/python3.13/dist-packages/tvm_ffi/include"
+    - "-I/usr/local/lib/python3.12/dist-packages/tvm_ffi/include"
+    - "-I/usr/local/lib/python3.11/dist-packages/tvm_ffi/include"
+    - "-I/usr/local/lib/python3.10/dist-packages/tvm_ffi/include"
+    - "-I/usr/lib/python3.13/dist-packages/tvm_ffi/include"
+    - "-I/usr/lib/python3.12/dist-packages/tvm_ffi/include"
+    - "-I/usr/lib/python3.11/dist-packages/tvm_ffi/include"
+    - "-I/usr/lib/python3.10/dist-packages/tvm_ffi/include"
+    - "-I../csrc"
+    - "-I../include"
+    - "-I../3rdparty/cutlass/include"
+    - "-I../3rdparty/cutlass/tools/util/include"
+    - "-I/usr/local/cuda/include"
+    - "-I/usr/local/cuda/targets/x86_64-linux/include"
+    - "-I/usr/local/lib/python3.13/dist-packages/torch/include"
+    - "-I/usr/local/lib/python3.12/dist-packages/torch/include"
+    - "-I/usr/local/lib/python3.11/dist-packages/torch/include"
+    - "-I/usr/local/lib/python3.10/dist-packages/torch/include"
+    - "-I/usr/local/lib/python3.13/dist-packages/torch/include/torch/csrc/api/include" 
+    - "-I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include"
+    - "-I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include"
+    - "-I/usr/local/lib/python3.10/dist-packages/torch/include/torch/csrc/api/include"
+    - "-I/usr/include/python3.13"
+    - "-I/usr/include/python3.12"
+    - "-I/usr/include/python3.11"
+    - "-I/usr/include/python3.10"
+    - "-D__CUDACC__"
+    - "-DOASR_ENABLE_FP16"
+    - "-DOASR_ENABLE_BF16"
+    - "--no-cuda-version-check"
+  Remove:
+    - "-forward-unknown-to-host-compiler"
+    - "--expt-relaxed-constexpr"
+    - "--expt-extended-lambda"
+    - "-Xcompiler=*"
+    - "--use_fast_math"
+    - "-Xptxas=*"
+    - "-gencode"
+    - "arch=*"
+    - "-Xcudafe"
+    - "--diag_suppress=*"
+    - "-rdc=true"
+    - "--expt-*"
+  CompilationDatabase: build/
+
+Index:
+  Background: Build
