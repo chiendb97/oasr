@@ -165,7 +165,6 @@ set(OASR_HEADERS
     include/oasr/common/vec_dtypes.h
     include/oasr/common/math.h
     include/oasr/common/arch_dispatch.h
-    include/oasr/common/arch_traits.h
     include/oasr/common/epilogue_functors.h
 
     # Decoder headers

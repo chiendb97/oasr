@@ -29,7 +29,6 @@
 
 #include <oasr/common/arch_dispatch.h>
 #include <oasr/gemm/cutlass_gemm_configs.h>
-#include <oasr/gemm/gemm_utils.h>
 
 namespace oasr {
 namespace gemm {

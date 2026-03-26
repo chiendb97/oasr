@@ -17,7 +17,6 @@
 #include <oasr/common/types.h>
 #include <oasr/gemm/cutlass_gemm_configs.h>
 #include <oasr/gemm/gemm_cutlass_template.h>
-#include <oasr/gemm/gemm_utils.h>
 
 namespace oasr {
 namespace gemm {
