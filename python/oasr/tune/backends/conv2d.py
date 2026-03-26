@@ -1,21 +1,24 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Conv2D backend registrations with tile-variant autotuning.
+"""Conv2D backend registrations for autotuning (FlashInfer-style).
 
-Registers CUTLASS Conv2D tile variants from ``CONV2D_TILE_CONFIGS`` plus
-cuDNN backends.  Each CUTLASS tile variant is JIT-compiled into a separate
-shared library; the autotuner profiles and selects the best one at runtime.
+All CUTLASS tile variants are pre-compiled into a single shared library by
+the JIT layer (``oasr.jit.conv``).  The autotuner selects which pre-compiled
+variant to call — no JIT compilation is triggered during tuning.
+
+cuDNN backends are also registered as additional candidates.
 """
 
 import functools
 import logging
 
-from oasr.tune._registry import BackendEntry, _global_registry
-from oasr.tune._types import OpKey, Tactic
-from oasr.tune.kernel_configs import (
+from oasr.tune.autotuner import BackendEntry, _global_registry, OpKey, Tactic
+from oasr.jit.gemm import TileConfig
+from oasr.jit.conv import (
     CONV2D_DEFAULT,
     CONV2D_TILE_CONFIGS,
-    TileConfig,
+    conv2d_func_name,
+    conv2d_activation_func_name,
 )
 
 logger = logging.getLogger("oasr.tune")
@@ -42,25 +45,13 @@ def _has_cudnn() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# CUTLASS tile-variant module cache
+# Pre-compiled CUTLASS module (contains ALL variants)
 # ---------------------------------------------------------------------------
 
-_conv2d_modules = {}
-
-
-def _get_conv2d_variant_module(cfg: TileConfig):
-    """Get or compile a Conv2D module for a specific tile config."""
-    key = cfg.name
-    if key not in _conv2d_modules:
-        from oasr.jit.conv import gen_conv2d_module_variant
-
-        spec = gen_conv2d_module_variant(
-            tile_m=cfg.tile_m, tile_n=cfg.tile_n, tile_k=cfg.tile_k,
-            warp_m=cfg.warp_m, warp_n=cfg.warp_n, warp_k=cfg.warp_k,
-            stages=cfg.stages,
-        )
-        _conv2d_modules[key] = spec.build_and_load()
-    return _conv2d_modules[key]
+@functools.cache
+def _get_conv2d_module():
+    from oasr.jit.conv import gen_conv2d_module
+    return gen_conv2d_module().build_and_load()
 
 
 # ---------------------------------------------------------------------------
@@ -68,19 +59,23 @@ def _get_conv2d_variant_module(cfg: TileConfig):
 # ---------------------------------------------------------------------------
 
 def _make_conv2d_runner(cfg: TileConfig):
-    """Create a CUTLASS Conv2D runner for a specific tile config."""
+    """Create a CUTLASS Conv2D runner for a specific variant."""
+    fn_name = conv2d_func_name(cfg)
+
     def runner():
-        mod = _get_conv2d_variant_module(cfg)
-        return mod.conv2d
+        mod = _get_conv2d_module()
+        return getattr(mod, fn_name)
 
     return runner
 
 
 def _make_conv2d_activation_runner(cfg: TileConfig):
-    """Create a CUTLASS Conv2D+activation runner for a specific tile config."""
+    """Create a CUTLASS Conv2D+activation runner for a specific variant."""
+    fn_name = conv2d_activation_func_name(cfg)
+
     def runner():
-        mod = _get_conv2d_variant_module(cfg)
-        return mod.conv2d_activation
+        mod = _get_conv2d_module()
+        return getattr(mod, fn_name)
 
     return runner
 

@@ -41,7 +41,7 @@ struct ToCutlassType<__nv_bfloat16> {
 // GroupGemm launcher
 // =============================================================================
 
-void group_gemm(TensorView output, TensorView A, TensorView B, TensorView offsets) {
+void {{ func_name }}(TensorView output, TensorView A, TensorView B, TensorView offsets) {
     CHECK_INPUT(A);
     CHECK_INPUT(output);
 
@@ -79,4 +79,4 @@ void group_gemm(TensorView output, TensorView A, TensorView B, TensorView offset
     });
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm, group_gemm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});

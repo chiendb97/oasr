@@ -43,7 +43,7 @@ struct ToCutlassType<__nv_bfloat16> {
 // GEMM launcher: D = A @ B [+ C]
 // =============================================================================
 
-void gemm(TensorView output, TensorView A, TensorView B, Optional C_opt,
+void {{ func_name }}(TensorView output, TensorView A, TensorView B, Optional C_opt,
           int64_t split_k_slices) {
     CHECK_INPUT(A);
     CHECK_INPUT(B);
@@ -88,14 +88,14 @@ void gemm(TensorView output, TensorView A, TensorView B, Optional C_opt,
     });
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm, gemm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});
 
 {% if with_activation %}
 // =============================================================================
 // GEMM + Activation launcher: D = activation(A @ B [+ C])
 // =============================================================================
 
-void gemm_activation(TensorView output, TensorView A, TensorView B, Optional C_opt,
+void {{ func_name }}_activation(TensorView output, TensorView A, TensorView B, Optional C_opt,
                      int64_t activation_type, int64_t split_k_slices) {
     CHECK_INPUT(A);
     CHECK_INPUT(B);
@@ -166,5 +166,5 @@ void gemm_activation(TensorView output, TensorView A, TensorView B, Optional C_o
     });
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_activation, gemm_activation);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}_activation, {{ func_name }}_activation);
 {% endif %}

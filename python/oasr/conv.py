@@ -31,6 +31,18 @@ def _get_cudnn_conv2d_module():
     return gen_cudnn_conv2d_module().build_and_load()
 
 
+def _default_conv2d_fn():
+    from oasr.jit.conv import CONV2D_DEFAULT, conv2d_func_name
+
+    return getattr(_get_conv2d_module(), conv2d_func_name(CONV2D_DEFAULT))
+
+
+def _default_conv2d_activation_fn():
+    from oasr.jit.conv import CONV2D_DEFAULT, conv2d_activation_func_name
+
+    return getattr(_get_conv2d_module(), conv2d_activation_func_name(CONV2D_DEFAULT))
+
+
 # IC threshold below which cuDNN is used instead of CUTLASS.
 # CUTLASS implicit GEMM uses scalar alignment (=1) for all IC values, but
 # cuDNN can pick better algorithms when IC is small (e.g. IC=1 in conformer
@@ -141,7 +153,7 @@ def conv2d(
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner
-        from oasr.tune._types import OpKey
+        from oasr.tune.autotuner import OpKey
 
         N, H, W, _IC = input.shape
         K, R, S, _ = filter.shape
@@ -161,7 +173,7 @@ def conv2d(
             out, input, filter, bias, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w
         )
     else:
-        _get_conv2d_module().conv2d(
+        _default_conv2d_fn()(
             out, input, filter, bias, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w
         )
     return out
@@ -251,7 +263,7 @@ def conv2d_activation(
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner
-        from oasr.tune._types import OpKey
+        from oasr.tune.autotuner import OpKey
 
         N, H, W, _IC = input.shape
         K, R, S, _ = filter.shape
@@ -272,7 +284,7 @@ def conv2d_activation(
             dilation_h, dilation_w,
         )
     else:
-        _get_conv2d_module().conv2d_activation(
+        _default_conv2d_activation_fn()(
             out, input, filter, bias, activation_type, pad_h, pad_w, stride_h, stride_w,
             dilation_h, dilation_w,
         )

@@ -41,7 +41,7 @@ struct ToCutlassType<__nv_bfloat16> {
 // BMM launcher: D[b] = A[b] @ B[b]
 // =============================================================================
 
-void bmm(TensorView output, TensorView A, TensorView B) {
+void {{ func_name }}(TensorView output, TensorView A, TensorView B) {
     CHECK_INPUT(A);
     CHECK_INPUT(B);
     CHECK_INPUT(output);
@@ -82,4 +82,4 @@ void bmm(TensorView output, TensorView A, TensorView B) {
     });
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm, bmm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});
