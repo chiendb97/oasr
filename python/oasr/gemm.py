@@ -7,6 +7,8 @@ from typing import Optional
 
 import torch
 
+from oasr.api_logging import oasr_api
+
 
 @functools.cache
 def _get_gemm_module():
@@ -29,6 +31,7 @@ def _get_group_gemm_module():
     return gen_group_gemm_module().build_and_load()
 
 
+@oasr_api
 def gemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -72,6 +75,7 @@ def gemm(
     return out
 
 
+@oasr_api
 def bmm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -111,6 +115,7 @@ def bmm(
     return out
 
 
+@oasr_api
 def group_gemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -153,6 +158,7 @@ def group_gemm(
     return out
 
 
+@oasr_api
 def gemm_activation(
     A: torch.Tensor,
     B: torch.Tensor,

@@ -147,6 +147,8 @@ install_requires = [
     "numpy>=1.20.0",
     "apache-tvm-ffi>=0.1.0",
     "jinja2>=3.0",
+    "filelock>=3.0",
+    "packaging>=21.0",
 ]
 
 extras_require = {

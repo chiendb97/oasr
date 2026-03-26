@@ -1,15 +1,22 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""JIT generator for GEMM kernels."""
+"""JIT generator for GEMM kernels.
 
-from typing import List, Optional
+Default modules use static source files (csrc/gemm.cu + csrc/gemm_jit_binding.cu).
+Variant modules (for autotuning) use Jinja templates to generate source files
+with baked-in tile configurations.
+"""
 
-from .core import gen_jit_spec, JitSpec
+from .core import gen_jit_spec, gen_jinja_jit_spec, _get_target_sm, JitSpec
 from . import env
 
 
+# =============================================================================
+# Default modules (static sources, use DefaultGemmConfig for the detected SM)
+# =============================================================================
+
 def gen_gemm_module() -> JitSpec:
-    """Generate JIT spec for GEMM kernels."""
+    """Generate JIT spec for GEMM kernels with default config."""
     return gen_jit_spec(
         "gemm",
         [
@@ -18,6 +25,32 @@ def gen_gemm_module() -> JitSpec:
         ],
     )
 
+
+def gen_bmm_module() -> JitSpec:
+    """Generate JIT spec for batched GEMM kernels with default config."""
+    return gen_jit_spec(
+        "bmm",
+        [
+            env.OASR_CSRC_DIR / "bmm.cu",
+            env.OASR_CSRC_DIR / "bmm_jit_binding.cu",
+        ],
+    )
+
+
+def gen_group_gemm_module() -> JitSpec:
+    """Generate JIT spec for grouped GEMM kernels with default config."""
+    return gen_jit_spec(
+        "group_gemm",
+        [
+            env.OASR_CSRC_DIR / "group_gemm.cu",
+            env.OASR_CSRC_DIR / "group_gemm_jit_binding.cu",
+        ],
+    )
+
+
+# =============================================================================
+# Variant modules (Jinja-generated, for autotuning)
+# =============================================================================
 
 def gen_gemm_module_variant(
     tile_m: int,
@@ -30,37 +63,28 @@ def gen_gemm_module_variant(
 ) -> JitSpec:
     """Generate JIT spec for GEMM with a custom tile configuration.
 
-    Each unique set of tile parameters produces a separate compiled module,
-    allowing the autotuner to profile different configurations.
+    Uses Jinja template to generate a .cu file with the config baked in,
+    producing a single-config instantiation for fast compilation.
     """
-    variant_name = f"gemm_t{tile_m}x{tile_n}x{tile_k}_w{warp_m}x{warp_n}x{warp_k}_s{stages}"
-    tile_flags = [
-        f"-DOASR_GEMM_TILE_M={tile_m}",
-        f"-DOASR_GEMM_TILE_N={tile_n}",
-        f"-DOASR_GEMM_TILE_K={tile_k}",
-        f"-DOASR_GEMM_WARP_M={warp_m}",
-        f"-DOASR_GEMM_WARP_N={warp_n}",
-        f"-DOASR_GEMM_WARP_K={warp_k}",
-        f"-DOASR_GEMM_STAGES={stages}",
-    ]
-    return gen_jit_spec(
-        variant_name,
-        [
-            env.OASR_CSRC_DIR / "gemm.cu",
-            env.OASR_CSRC_DIR / "gemm_jit_binding.cu",
-        ],
-        extra_cuda_cflags=tile_flags,
+    sm = _get_target_sm()
+    variant_name = (
+        f"gemm_sm{sm}_t{tile_m}x{tile_n}x{tile_k}_w{warp_m}x{warp_n}x{warp_k}_s{stages}"
     )
-
-
-def gen_bmm_module() -> JitSpec:
-    """Generate JIT spec for batched GEMM kernels."""
-    return gen_jit_spec(
-        "bmm",
-        [
-            env.OASR_CSRC_DIR / "bmm.cu",
-            env.OASR_CSRC_DIR / "bmm_jit_binding.cu",
-        ],
+    return gen_jinja_jit_spec(
+        name=variant_name,
+        template_name="gemm_cutlass_template.cu.jinja",
+        template_vars={
+            "op_name": variant_name,
+            "tile_m": tile_m,
+            "tile_n": tile_n,
+            "tile_k": tile_k,
+            "warp_m": warp_m,
+            "warp_n": warp_n,
+            "warp_k": warp_k,
+            "stages": stages,
+            "sm_version": sm,
+            "with_activation": True,
+        },
     )
 
 
@@ -74,34 +98,24 @@ def gen_bmm_module_variant(
     stages: int,
 ) -> JitSpec:
     """Generate JIT spec for BMM with a custom tile configuration."""
-    variant_name = f"bmm_t{tile_m}x{tile_n}x{tile_k}_w{warp_m}x{warp_n}x{warp_k}_s{stages}"
-    tile_flags = [
-        f"-DOASR_GEMM_TILE_M={tile_m}",
-        f"-DOASR_GEMM_TILE_N={tile_n}",
-        f"-DOASR_GEMM_TILE_K={tile_k}",
-        f"-DOASR_GEMM_WARP_M={warp_m}",
-        f"-DOASR_GEMM_WARP_N={warp_n}",
-        f"-DOASR_GEMM_WARP_K={warp_k}",
-        f"-DOASR_GEMM_STAGES={stages}",
-    ]
-    return gen_jit_spec(
-        variant_name,
-        [
-            env.OASR_CSRC_DIR / "bmm.cu",
-            env.OASR_CSRC_DIR / "bmm_jit_binding.cu",
-        ],
-        extra_cuda_cflags=tile_flags,
+    sm = _get_target_sm()
+    variant_name = (
+        f"bmm_sm{sm}_t{tile_m}x{tile_n}x{tile_k}_w{warp_m}x{warp_n}x{warp_k}_s{stages}"
     )
-
-
-def gen_group_gemm_module() -> JitSpec:
-    """Generate JIT spec for grouped GEMM kernels."""
-    return gen_jit_spec(
-        "group_gemm",
-        [
-            env.OASR_CSRC_DIR / "group_gemm.cu",
-            env.OASR_CSRC_DIR / "group_gemm_jit_binding.cu",
-        ],
+    return gen_jinja_jit_spec(
+        name=variant_name,
+        template_name="bmm_cutlass_template.cu.jinja",
+        template_vars={
+            "op_name": variant_name,
+            "tile_m": tile_m,
+            "tile_n": tile_n,
+            "tile_k": tile_k,
+            "warp_m": warp_m,
+            "warp_n": warp_n,
+            "warp_k": warp_k,
+            "stages": stages,
+            "sm_version": sm,
+        },
     )
 
 
@@ -115,23 +129,22 @@ def gen_group_gemm_module_variant(
     stages: int,
 ) -> JitSpec:
     """Generate JIT spec for grouped GEMM with a custom tile configuration."""
+    sm = _get_target_sm()
     variant_name = (
-        f"group_gemm_t{tile_m}x{tile_n}x{tile_k}_w{warp_m}x{warp_n}x{warp_k}_s{stages}"
+        f"group_gemm_sm{sm}_t{tile_m}x{tile_n}x{tile_k}_w{warp_m}x{warp_n}x{warp_k}_s{stages}"
     )
-    tile_flags = [
-        f"-DOASR_GEMM_TILE_M={tile_m}",
-        f"-DOASR_GEMM_TILE_N={tile_n}",
-        f"-DOASR_GEMM_TILE_K={tile_k}",
-        f"-DOASR_GEMM_WARP_M={warp_m}",
-        f"-DOASR_GEMM_WARP_N={warp_n}",
-        f"-DOASR_GEMM_WARP_K={warp_k}",
-        f"-DOASR_GEMM_STAGES={stages}",
-    ]
-    return gen_jit_spec(
-        variant_name,
-        [
-            env.OASR_CSRC_DIR / "group_gemm.cu",
-            env.OASR_CSRC_DIR / "group_gemm_jit_binding.cu",
-        ],
-        extra_cuda_cflags=tile_flags,
+    return gen_jinja_jit_spec(
+        name=variant_name,
+        template_name="group_gemm_cutlass_template.cu.jinja",
+        template_vars={
+            "op_name": variant_name,
+            "tile_m": tile_m,
+            "tile_n": tile_n,
+            "tile_k": tile_k,
+            "warp_m": warp_m,
+            "warp_n": warp_n,
+            "warp_k": warp_k,
+            "stages": stages,
+            "sm_version": sm,
+        },
     )

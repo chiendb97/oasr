@@ -7,6 +7,8 @@ from typing import Optional
 
 import torch
 
+from oasr.api_logging import oasr_api
+
 
 @functools.cache
 def _get_conv_module():
@@ -36,6 +38,7 @@ def _get_cudnn_conv2d_module():
 _CUDNN_IC_THRESHOLD = 8
 
 
+@oasr_api
 def depthwise_conv1d(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -66,6 +69,7 @@ def depthwise_conv1d(
     return out
 
 
+@oasr_api
 def pointwise_conv1d(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -91,6 +95,7 @@ def pointwise_conv1d(
     return out
 
 
+@oasr_api
 def conv2d(
     input: torch.Tensor,
     filter: torch.Tensor,
@@ -162,6 +167,7 @@ def conv2d(
     return out
 
 
+@oasr_api
 def depthwise_conv1d_silu(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -181,6 +187,7 @@ def depthwise_conv1d_silu(
     return out
 
 
+@oasr_api
 def pointwise_conv1d_activation(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -197,6 +204,7 @@ def pointwise_conv1d_activation(
     return out
 
 
+@oasr_api
 def causal_conv1d(
     input: torch.Tensor,
     state: torch.Tensor,
@@ -211,6 +219,7 @@ def causal_conv1d(
     return out
 
 
+@oasr_api
 def conv2d_activation(
     input: torch.Tensor,
     filter: torch.Tensor,

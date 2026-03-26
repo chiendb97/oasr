@@ -7,6 +7,8 @@ from typing import Optional
 
 import torch
 
+from oasr.api_logging import oasr_api
+
 
 @functools.cache
 def _get_norm_module():
@@ -15,6 +17,7 @@ def _get_norm_module():
     return gen_norm_module().build_and_load()
 
 
+@oasr_api
 def layer_norm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -40,6 +43,7 @@ def layer_norm(
     return out
 
 
+@oasr_api
 def rms_norm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -65,6 +69,7 @@ def rms_norm(
     return out
 
 
+@oasr_api
 def batch_norm_1d(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -94,6 +99,7 @@ def batch_norm_1d(
     return out
 
 
+@oasr_api
 def group_norm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -121,6 +127,7 @@ def group_norm(
     return out
 
 
+@oasr_api
 def add_layer_norm(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -148,6 +155,7 @@ def add_layer_norm(
     return out
 
 
+@oasr_api
 def layer_norm_activation(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -163,6 +171,7 @@ def layer_norm_activation(
     return out
 
 
+@oasr_api
 def rms_norm_activation(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -178,6 +187,7 @@ def rms_norm_activation(
     return out
 
 
+@oasr_api
 def batch_norm_activation(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -197,6 +207,7 @@ def batch_norm_activation(
     return out
 
 
+@oasr_api
 def batch_norm_swish(
     input: torch.Tensor,
     weight: torch.Tensor,

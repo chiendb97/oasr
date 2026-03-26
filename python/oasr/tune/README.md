@@ -48,7 +48,7 @@ Configs that differ only in `split_k` share the same compiled module, reducing J
 | Group GEMM | `GROUP_GEMM_TILE_CONFIGS` | Same as GEMM (no split-K) | 9 |
 | Conv2D | `CONV2D_TILE_CONFIGS` | 128×128×64, stages=3 | 6 |
 
-The C++ kernel headers use `TuneableTraits<SmVersion>` (in `include/oasr/common/tuneable_traits.h`) which wraps `ArchTraits` with preprocessor-conditional overrides. When `-DOASR_GEMM_TILE_M=X` flags are passed during JIT compilation, they override the default tile sizes. When no flags are set, `TuneableTraits` is identical to `ArchTraits`.
+The C++ kernel headers use per-family config structs (e.g., `GemmConfig` in `include/oasr/gemm/cutlass_gemm_configs.h`, `Conv2dConfig` in `include/oasr/conv/cutlass_conv2d_configs.h`). When `-DOASR_GEMM_TILE_M=X` flags are passed during JIT compilation, the `JitGemmConfig` typedef overrides the default tile sizes. When no flags are set, `DefaultGemmConfig<SM>` provides per-SM defaults. For Jinja-based variants, tile configs are baked directly into generated source files.
 
 ## Cache Files
 

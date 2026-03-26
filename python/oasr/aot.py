@@ -10,7 +10,7 @@ from typing import List
 
 
 def gen_all_modules() -> List:
-    """Generate JIT specs for all OASR kernel families.
+    """Generate JIT specs for all OASR kernel families (default configs).
 
     Returns:
         List of JitSpec objects for all kernel modules.
@@ -30,6 +30,50 @@ def gen_all_modules() -> List:
         gen_bmm_module(),
         gen_group_gemm_module(),
     ]
+
+
+def gen_all_gemm_variants() -> List:
+    """Generate JIT specs for all GEMM tile configuration variants.
+
+    Used by the autotuner to pre-compile all candidate tile configs.
+    Each unique compile config produces a separate Jinja-generated module.
+    """
+    from oasr.jit.gemm import (
+        gen_gemm_module_variant,
+        gen_bmm_module_variant,
+        gen_group_gemm_module_variant,
+    )
+    from oasr.tune.kernel_configs import (
+        GEMM_TILE_CONFIGS,
+        BMM_TILE_CONFIGS,
+        GROUP_GEMM_TILE_CONFIGS,
+        get_unique_compile_configs,
+    )
+
+    specs = []
+
+    for cfg in get_unique_compile_configs(GEMM_TILE_CONFIGS).values():
+        specs.append(gen_gemm_module_variant(
+            tile_m=cfg.tile_m, tile_n=cfg.tile_n, tile_k=cfg.tile_k,
+            warp_m=cfg.warp_m, warp_n=cfg.warp_n, warp_k=cfg.warp_k,
+            stages=cfg.stages,
+        ))
+
+    for cfg in get_unique_compile_configs(BMM_TILE_CONFIGS).values():
+        specs.append(gen_bmm_module_variant(
+            tile_m=cfg.tile_m, tile_n=cfg.tile_n, tile_k=cfg.tile_k,
+            warp_m=cfg.warp_m, warp_n=cfg.warp_n, warp_k=cfg.warp_k,
+            stages=cfg.stages,
+        ))
+
+    for cfg in get_unique_compile_configs(GROUP_GEMM_TILE_CONFIGS).values():
+        specs.append(gen_group_gemm_module_variant(
+            tile_m=cfg.tile_m, tile_n=cfg.tile_n, tile_k=cfg.tile_k,
+            warp_m=cfg.warp_m, warp_n=cfg.warp_n, warp_k=cfg.warp_k,
+            stages=cfg.stages,
+        ))
+
+    return specs
 
 
 def register_default_modules() -> int:
