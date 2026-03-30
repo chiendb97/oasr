@@ -57,19 +57,16 @@ struct CutlassArch<89> {
 template <>
 struct CutlassArch<90> {
     using Type = cutlass::arch::Sm90;
-    using InstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
 };
 
 template <>
 struct CutlassArch<100> {
     using Type = cutlass::arch::Sm100;
-    using InstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
 };
 
 template <>
 struct CutlassArch<120> {
     using Type = cutlass::arch::Sm120;
-    using InstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
 };
 
 template <int BM, int BN, int BK, int WM, int WN, int WK, int kStages, int kSmVersion>

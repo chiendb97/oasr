@@ -38,12 +38,12 @@
     #pragma GCC diagnostic pop
 #endif
 
+#include <cutlass/gemm/group_array_problem_shape.hpp>
+
 #include <oasr/common/epilogue_functors.h>
 #include <oasr/common/utils.h>
 #include <oasr/gemm/cutlass_gemm_configs.h>
 #include <oasr/gemm/gemm_cutlass_template.h>
-
-#include <cutlass/gemm/group_array_problem_shape.hpp>
 
 namespace oasr {
 namespace gemm {
@@ -182,7 +182,7 @@ struct CutlassBmmKernelSm90 {
 
     // Linear combination epilogue (no activation for BMM)
     using FusionOp = cutlass::epilogue::fusion::LinearCombination<ElementCD, ElementCompute,
-                                                                   ElementCD, ElementCompute>;
+                                                                  ElementCD, ElementCompute>;
 
     // Build epilogue collective via CUTLASS 3.x builder
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -210,10 +210,10 @@ struct CutlassBmmKernelSm90 {
     using StrideC = typename Gemm::GemmKernel::StrideC;
     using StrideD = typename Gemm::GemmKernel::StrideD;
 
-    static GemmStatus run(const ElementA* A, const ElementB* B, ElementCD* D, int batch_size,
-                          int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldd,
-                          int64_t stride_a, int64_t stride_b, int64_t stride_d, float alpha,
-                          float beta, cudaStream_t stream) {
+    static GemmStatus run(const ElementA* A, const ElementB* B, ElementCD* D, int batch_size, int M,
+                          int N, int K, int64_t lda, int64_t ldb, int64_t ldd, int64_t stride_a,
+                          int64_t stride_b, int64_t stride_d, float alpha, float beta,
+                          cudaStream_t stream) {
         // Compute strides with batch dimension
         auto cute_stride_A =
             cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, batch_size));
@@ -222,11 +222,10 @@ struct CutlassBmmKernelSm90 {
         auto cute_stride_D =
             cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, batch_size));
 
-        typename Gemm::Arguments arguments{
-            cutlass::gemm::GemmUniversalMode::kGemm,
-            {M, N, K, batch_size},
-            {A, cute_stride_A, B, cute_stride_B},
-            {{}, D, cute_stride_D, D, cute_stride_D}};
+        typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGemm,
+                                           {M, N, K, batch_size},
+                                           {A, cute_stride_A, B, cute_stride_B},
+                                           {{}, D, cute_stride_D, D, cute_stride_D}};
 
         // Set epilogue scaling factors
         arguments.epilogue.thread.alpha = alpha;
@@ -291,7 +290,7 @@ struct CutlassGroupGemmKernelSm90 {
 
     // Linear combination epilogue (no activation for group GEMM)
     using FusionOp = cutlass::epilogue::fusion::LinearCombination<ElementCD, ElementCompute,
-                                                                   ElementCD, ElementCompute>;
+                                                                  ElementCD, ElementCompute>;
 
     // Group problem shape for variable-size grouped GEMM
     using ProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
@@ -325,7 +324,8 @@ struct CutlassGroupGemmKernelSm90 {
     static GemmStatus run(GroupedGemmProblemDesc<ElementA, ElementB, ElementCD>& problem_desc,
                           int problem_count, cudaStream_t stream) {
         // Build host-side arrays of problem shapes and strides
-        std::vector<typename ProblemShape::UnderlyingProblemShape> problem_shapes_host(problem_count);
+        std::vector<typename ProblemShape::UnderlyingProblemShape> problem_shapes_host(
+            problem_count);
         std::vector<StrideA> strides_A_host(problem_count);
         std::vector<StrideB> strides_B_host(problem_count);
         std::vector<StrideD> strides_D_host(problem_count);
@@ -363,7 +363,8 @@ struct CutlassGroupGemmKernelSm90 {
              reinterpret_cast<const ElementB**>(problem_desc.ptr_B_device.get()),
              strides_B_device.get()},
             {{1.0f, 0.0f},
-             nullptr, strides_D_device.get(),
+             nullptr,
+             strides_D_device.get(),
              reinterpret_cast<ElementCD**>(problem_desc.ptr_D_device.get()),
              strides_D_device.get()}};
 

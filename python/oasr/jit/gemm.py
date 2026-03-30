@@ -12,8 +12,7 @@ a single ``gen_jit_spec()`` call.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
-
+from typing import Dict, List, Tuple, Union
 from .core import gen_jit_spec, _get_target_sm, JitSpec
 from . import env
 
@@ -24,7 +23,7 @@ from . import env
 
 
 @dataclass(frozen=True)
-class CutlassGemmConfig:
+class TileShape:
     """A CUTLASS tile configuration for GEMM or Conv2D."""
     BK: int
     BN: int
@@ -32,12 +31,38 @@ class CutlassGemmConfig:
     WK: int
     WN: int
     WM: int
+
+
+class TileShapeSm90:
+    """A CUTLASS tile configuration for GEMM or Conv2D."""
+    BM: int
+    BN: int
+    BK: int
+
+
+class ClusterShape:
+    """A CUTLASS cluster configuration for GEMM or Conv2D."""
+    CM: int
+    CN: int
+    CK: int
+
+
+class CutlassGemmConfig:
+    """A CUTLASS GEMM configuration."""
+    BM: int
+    BN: int
+    BK: int
+    WM: int
+    WN: int
+    WK: int
     kStages: int
+    kSmVersion: int
 
     @property
     def name(self) -> str:
         """Unique identifier for this config."""
-        parts = [f"t{self.BM}x{self.BN}x{self.BK}"]
+        parts = [f"sm{self.kSmVersion}"]
+        parts.append(f"b{self.BM}x{self.BN}x{self.BK}")
         parts.append(f"w{self.WM}x{self.WN}x{self.WK}")
         parts.append(f"s{self.kStages}")
         return "_".join(parts)
@@ -45,7 +70,8 @@ class CutlassGemmConfig:
     @property
     def compile_name(self) -> str:
         """Config name excluding runtime params (split_k)."""
-        parts = [f"t{self.BM}x{self.BN}x{self.BK}"]
+        parts = [f"sm{self.kSmVersion}"]
+        parts.append(f"b{self.BM}x{self.BN}x{self.BK}")
         parts.append(f"w{self.WM}x{self.WN}x{self.WK}")
         parts.append(f"s{self.kStages}")
         return "_".join(parts)
@@ -69,7 +95,7 @@ class CutlassGemmConfig:
 
 
 class CutlassGemmConfigSm90:
-    """A CUTLASS tile configuration for GEMM or Conv2D."""
+    """A CUTLASS GEMM configuration for SM90+."""
     BM: int
     BN: int
     BK: int
@@ -78,28 +104,31 @@ class CutlassGemmConfigSm90:
     CK: int
     kSMs: int
     kStages: int
+    kSmVersion: int
 
     @property
     def name(self) -> str:
         """Unique identifier for this config."""
-        parts = [f"t{self.BM}x{self.BN}x{self.BK}"]
+        parts = [f"sm{self.kSmVersion}"]
+        parts.append(f"b{self.BM}x{self.BN}x{self.BK}")
         parts.append(f"c{self.CM}x{self.CN}x{self.CK}")
-        parts.append(f"s{self.kSMs}")
+        parts.append(f"k{self.kSMs}")
         parts.append(f"s{self.kStages}")
         return "_".join(parts)
 
     @property
     def compile_name(self) -> str:
         """Config name excluding runtime params (split_k)."""
-        parts = [f"t{self.BM}x{self.BN}x{self.BK}"]
+        parts = [f"sm{self.kSmVersion}"]
+        parts.append(f"b{self.BM}x{self.BN}x{self.BK}")
         parts.append(f"c{self.CM}x{self.CN}x{self.CK}")
-        parts.append(f"s{self.kSMs}")
+        parts.append(f"k{self.kSMs}")
         parts.append(f"s{self.kStages}")
         return "_".join(parts)
 
     @property
     def num_warps(self) -> int:
-        return (self.BM // self.WM) * (self.BN // self.WN)
+        return self.kSMs * (self.CM // self.CK) * (self.CN // self.CK)
 
     def to_tactic_config(self) -> Tuple[Tuple[str, int], ...]:
         """Convert to a ``Tactic.config`` tuple."""
@@ -116,23 +145,42 @@ class CutlassGemmConfigSm90:
         return tuple(items)
 
 
-def get_unique_compile_configs(configs: List[CutlassGemmConfig]) -> Dict[str, CutlassGemmConfig]:
+def get_unique_compile_configs(sm: int,
+                               tile_shape_configs: List[TileShape],
+                               tile_shape_configs_sm90: List[TileShapeSm90],
+                               cluster_shape_configs_sm90: List[ClusterShape]) -> Dict[str, Union[CutlassGemmConfig, CutlassGemmConfigSm90]]:
     """Deduplicate configs that compile to the same variant.
 
     Split-K is a runtime parameter, so configs that differ only in split_k
     share the same compiled variant.  Returns a dict of unique compile keys
     to representative configs (with split_k=1).
     """
-    seen: Dict[str, CutlassGemmConfig] = {}
-    for cfg in configs:
-        compile_cfg = CutlassGemmConfig(
-            BM=cfg.BM, BN=cfg.BN, BK=cfg.BK,
-            WM=cfg.WM, WN=cfg.WN, WK=cfg.WK,
-            kStages=cfg.kStages,
-        )
-        key = compile_cfg.compile_name
-        if key not in seen:
-            seen[key] = compile_cfg
+    seen: Dict[str, Union[CutlassGemmConfig, CutlassGemmConfigSm90]] = {}
+
+    if sm in [75, 80, 86, 89]:
+        for cfg in tile_shape_configs:
+            compile_cfg = CutlassGemmConfig(
+                BM=cfg.BM, BN=cfg.BN, BK=cfg.BK, WM=cfg.WM, WN=cfg.WN, WK=cfg.WK, kStages=3, kSmVersion=sm)
+            key = compile_cfg.compile_name
+            if key not in seen:
+                seen[key] = compile_cfg
+    else:
+        for tile_shape_cfg in tile_shape_configs_sm90:
+            for cluster_shape_cfg in cluster_shape_configs_sm90:
+                compile_cfg = CutlassGemmConfigSm90(
+                    BM=tile_shape_cfg.BM,
+                    BN=tile_shape_cfg.BN,
+                    BK=tile_shape_cfg.BK,
+                    CM=cluster_shape_cfg.CM,
+                    CN=cluster_shape_cfg.CN,
+                    CK=cluster_shape_cfg.CK,
+                    kSMs=1,
+                    kStages=3,
+                    kSmVersion=sm
+                )
+            key = compile_cfg.compile_name
+            if key not in seen:
+                seen[key] = compile_cfg
     return seen
 
 
@@ -141,67 +189,53 @@ def get_unique_compile_configs(configs: List[CutlassGemmConfig]) -> Dict[str, Cu
 # =============================================================================
 
 
-CUTLASS_GEMM_CONFIGS: List[CutlassGemmConfig] = [
-    # Default (matches ArchTraits<80>)
-    CutlassGemmConfig(BM=16, BN=128, BK=64, WM=16, WN=32,
-                      WK=64, kStages=3),
-    CutlassGemmConfig(BM=32, BN=128, BK=64, WM=32, WN=32,
-                      WK=64, kStages=3),
-    CutlassGemmConfig(BM=64, BN=128, BK=64, WM=32, WN=64,
-                      WK=64, kStages=3),
-    CutlassGemmConfig(BM=64, BN=64, BK=128, WM=32, WN=64,
-                      WK=64, kStages=3),
-    CutlassGemmConfig(BM=64, BN=128, BK=64, WM=64, WN=32,
-                      WK=64, kStages=3),
-    CutlassGemmConfig(BM=128, BN=64, BK=64, WM=64, WN=32,
-                      WK=64, kStages=3),
-    CutlassGemmConfig(BM=128, BN=128, BK=64, WM=64, WN=32,
-                      WK=64, kStages=3),
-    CutlassGemmConfig(BM=128, BN=128, BK=64, WM=64, WN=64,
-                      WK=64, kStages=3),
-    CutlassGemmConfig(BM=128, BN=128, BK=64, WM=128, WN=32,
-                      WK=64, kStages=3),
-    CutlassGemmConfig(BM=128, BN=256, BK=64, WM=64, WN=64,
-                      WK=64, kStages=3),
-    CutlassGemmConfig(BM=256, BN=128, BK=64, WM=64, WN=64,
-                      WK=64, kStages=3),
-    CutlassGemmConfig(BM=128, BN=64, BK=128, WM=64, WN=32,
-                      WK=128, kStages=3),
-    CutlassGemmConfig(BM=16, BN=256, BK=64, WM=16, WN=64,
-                      WK=64, kStages=3),
-    CutlassGemmConfig(BM=16, BN=256, BK=128, WM=16, WN=64,
-                      WK=128, kStages=3),
+TileShapeConfigs: List[TileShape] = [
+    TileShape(BM=16, BN=128, BK=64, WM=16, WN=32, WK=64),
+    TileShape(BM=32, BN=128, BK=64, WM=32, WN=32, WK=64),
+    TileShape(BM=64, BN=128, BK=64, WM=32, WN=64, WK=64),
+    TileShape(BM=64, BN=64, BK=128, WM=32, WN=64, WK=64),
+    TileShape(BM=64, BN=128, BK=64, WM=64, WN=32, WK=64),
+    TileShape(BM=128, BN=64, BK=64, WM=64, WN=32, WK=64),
+    TileShape(BM=128, BN=128, BK=64, WM=64, WN=32, WK=64),
+    TileShape(BM=128, BN=128, BK=64, WM=64, WN=64, WK=64),
+    TileShape(BM=128, BN=128, BK=64, WM=128, WN=32, WK=64),
+    TileShape(BM=128, BN=256, BK=64, WM=64, WN=64, WK=64),
+    TileShape(BM=256, BN=128, BK=64, WM=64, WN=64, WK=64),
+    TileShape(BM=128, BN=64, BK=128, WM=64, WN=32, WK=128),
+    TileShape(BM=16, BN=256, BK=64, WM=16, WN=64, WK=64),
+    TileShape(BM=16, BN=256, BK=128, WM=16, WN=64, WK=128),
 ]
 
-CUTLASS_GEMM_CONFIGS_SM90: List[CutlassGemmConfigSm90] = [
-     TileShape_64x16x128,
-    TileShape_64x32x128,
-    TileShape_64x64x128,
-    TileShape_64x128x128,
-    TileShape_64x256x128,
-    TileShape_64x512x128,
-    TileShape_128x16x128,
-    TileShape_128x32x128,
-    TileShape_128x64x128,
-    TileShape_128x128x128,
-    TileShape_128x256x128,
-    // SM103
-    TileShape_128x128x768,
-    TileShape_128x192x768,
-    TileShape_128x256x768
-    
-    CutlassGemmConfigSm90(BM=64, BN=16, BK=128, CM=1, CN=1, CK=1, kSMs=1, kStages=3),
-
+TileShapeConfigsSm90: List[TileShapeSm90] = [
+    TileShapeSm90(BM=64, BN=16, BK=128),
+    TileShapeSm90(BM=64, BN=32, BK=128),
+    TileShapeSm90(BM=64, BN=64, BK=128),
+    TileShapeSm90(BM=64, BN=128, BK=128),
+    TileShapeSm90(BM=64, BN=256, BK=128),
+    TileShapeSm90(BM=64, BN=512, BK=128),
+    TileShapeSm90(BM=128, BN=16, BK=128),
+    TileShapeSm90(BM=128, BN=32, BK=128),
+    TileShapeSm90(BM=128, BN=64, BK=128),
+    TileShapeSm90(BM=128, BN=128, BK=128),
+    TileShapeSm90(BM=128, BN=256, BK=128),
+    # SM103
+    TileShapeSm90(BM=128, BN=128, BK=768),
+    TileShapeSm90(BM=128, BN=192, BK=768),
+    TileShapeSm90(BM=128, BN=256, BK=768),
 ]
 
-# BMM tile configurations (shares GEMM configs, no split-K)
-BMM_TILE_CONFIGS: List[CutlassGemmConfig] = [
-    cfg for cfg in CUTLASS_GEMM_CONFIGS if cfg.split_k == 1
-]
-
-# Grouped GEMM tile configurations (SM80+ only, no split-K)
-GROUP_GEMM_TILE_CONFIGS: List[CutlassGemmConfig] = [
-    cfg for cfg in CUTLASS_GEMM_CONFIGS if cfg.split_k == 1
+ClusterShapeConfigsSm90: List[ClusterShape] = [
+    ClusterShape(CM=1, CN=1, CK=1),
+    ClusterShape(CM=2, CN=1, CK=1),
+    ClusterShape(CM=1, CN=2, CK=1),
+    ClusterShape(CM=2, CN=2, CK=1),
+    ClusterShape(CM=1, CN=4, CK=1),
+    ClusterShape(CM=4, CN=2, CK=1),
+    ClusterShape(CM=2, CN=4, CK=1),
+    ClusterShape(CM=4, CN=4, CK=1),
+    ClusterShape(CM=1, CN=8, CK=1),
+    ClusterShape(CM=8, CN=1, CK=1),
+    ClusterShape(CM=4, CN=1, CK=1),
 ]
 
 
@@ -212,8 +246,11 @@ GROUP_GEMM_TILE_CONFIGS: List[CutlassGemmConfig] = [
 
 def _render_all_variants(
     template_name: str,
+    template_sm90_name: str,
     family: str,
-    configs: List[CutlassGemmConfig],
+    tile_shape_configs: List[TileShape],
+    tile_shape_configs_sm90: List[TileShapeSm90],
+    cluster_shape_configs_sm90: List[ClusterShape],
     *,
     with_activation: bool = False,
 ) -> List:
@@ -235,7 +272,8 @@ def _render_all_variants(
     from .cubin_loader import write_if_different
 
     sm = _get_target_sm()
-    unique_configs = get_unique_compile_configs(configs)
+    unique_configs = get_unique_compile_configs(
+        sm, tile_shape_configs, tile_shape_configs_sm90, cluster_shape_configs_sm90)
     source_paths = []
 
     for config_name, cfg in unique_configs.items():
@@ -243,7 +281,7 @@ def _render_all_variants(
         variant_file_name = f"{family}_sm{sm}_{config_name}"
 
         rendered = render_template(
-            template_name,
+            template_name if sm in [75, 80, 86, 89] else template_sm90_name,
             op_name=variant_file_name,
             func_name=func_name,
             tile_m=cfg.tile_m,
@@ -277,8 +315,11 @@ def gen_gemm_module() -> JitSpec:
     """
     source_paths = _render_all_variants(
         "gemm_cutlass_template.cu.jinja",
+        "gemm_cutlass_template_sm90.cu.jinja",
         "gemm",
-        CUTLASS_GEMM_CONFIGS,
+        TileShapeConfigs,
+        TileShapeConfigsSm90,
+        ClusterShapeConfigsSm90,
         with_activation=True,
     )
     return gen_jit_spec("gemm", source_paths)
@@ -291,8 +332,11 @@ def gen_bmm_module() -> JitSpec:
     """
     source_paths = _render_all_variants(
         "bmm_cutlass_template.cu.jinja",
+        "bmm_cutlass_template_sm90.cu.jinja",
         "bmm",
-        BMM_TILE_CONFIGS,
+        TileShapeConfigs,
+        TileShapeConfigsSm90,
+        ClusterShapeConfigsSm90,
     )
     return gen_jit_spec("bmm", source_paths)
 
@@ -304,8 +348,11 @@ def gen_group_gemm_module() -> JitSpec:
     """
     source_paths = _render_all_variants(
         "group_gemm_cutlass_template.cu.jinja",
+        "group_gemm_cutlass_template_sm90.cu.jinja",
         "group_gemm",
-        GROUP_GEMM_TILE_CONFIGS,
+        TileShapeConfigs,
+        TileShapeConfigsSm90,
+        ClusterShapeConfigsSm90,
     )
     return gen_jit_spec("group_gemm", source_paths)
 
