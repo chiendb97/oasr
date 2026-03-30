@@ -25,28 +25,31 @@ from . import env
 @dataclass(frozen=True)
 class TileShape:
     """A CUTLASS tile configuration for GEMM or Conv2D."""
-    BK: int
-    BN: int
     BM: int
-    WK: int
-    WN: int
+    BN: int
+    BK: int
     WM: int
+    WN: int
+    WK: int
 
 
+@dataclass(frozen=True)
 class TileShapeSm90:
-    """A CUTLASS tile configuration for GEMM or Conv2D."""
+    """A CUTLASS tile configuration for SM90+ GEMM."""
     BM: int
     BN: int
     BK: int
 
 
+@dataclass(frozen=True)
 class ClusterShape:
-    """A CUTLASS cluster configuration for GEMM or Conv2D."""
+    """A CUTLASS cluster configuration for SM90+ GEMM."""
     CM: int
     CN: int
     CK: int
 
 
+@dataclass(frozen=True)
 class CutlassGemmConfig:
     """A CUTLASS GEMM configuration."""
     BM: int
@@ -94,6 +97,7 @@ class CutlassGemmConfig:
         return tuple(items)
 
 
+@dataclass(frozen=True)
 class CutlassGemmConfigSm90:
     """A CUTLASS GEMM configuration for SM90+."""
     BM: int
@@ -160,7 +164,8 @@ def get_unique_compile_configs(sm: int,
     if sm in [75, 80, 86, 89]:
         for cfg in tile_shape_configs:
             compile_cfg = CutlassGemmConfig(
-                BM=cfg.BM, BN=cfg.BN, BK=cfg.BK, WM=cfg.WM, WN=cfg.WN, WK=cfg.WK, kStages=3, kSmVersion=sm)
+                BM=cfg.BM, BN=cfg.BN, BK=cfg.BK, WM=cfg.WM, WN=cfg.WN, WK=cfg.WK,
+                kStages=3, kSmVersion=sm)
             key = compile_cfg.compile_name
             if key not in seen:
                 seen[key] = compile_cfg
@@ -178,9 +183,9 @@ def get_unique_compile_configs(sm: int,
                     kStages=3,
                     kSmVersion=sm
                 )
-            key = compile_cfg.compile_name
-            if key not in seen:
-                seen[key] = compile_cfg
+                key = compile_cfg.compile_name
+                if key not in seen:
+                    seen[key] = compile_cfg
     return seen
 
 
@@ -260,9 +265,12 @@ def _render_all_variants(
     exported functions (e.g., ``gemm_t128x128x32_w64x64x32_s2``).
 
     Args:
-        template_name: Jinja template file name.
+        template_name: Jinja template file name for SM<=89.
+        template_sm90_name: Jinja template file name for SM90+.
         family: Kernel family name (``"gemm"``, ``"bmm"``, ``"group_gemm"``).
-        configs: List of tile configurations.
+        tile_shape_configs: List of SM<=89 tile configurations.
+        tile_shape_configs_sm90: List of SM90+ tile configurations.
+        cluster_shape_configs_sm90: List of SM90+ cluster configurations.
         with_activation: Whether to include fused activation variants (GEMM only).
 
     Returns:
@@ -280,20 +288,37 @@ def _render_all_variants(
         func_name = f"{family}_{config_name}"
         variant_file_name = f"{family}_sm{sm}_{config_name}"
 
-        rendered = render_template(
-            template_name if sm in [75, 80, 86, 89] else template_sm90_name,
-            op_name=variant_file_name,
-            func_name=func_name,
-            tile_m=cfg.tile_m,
-            tile_n=cfg.tile_n,
-            tile_k=cfg.tile_k,
-            warp_m=cfg.warp_m,
-            warp_n=cfg.warp_n,
-            warp_k=cfg.warp_k,
-            stages=cfg.stages,
-            sm_version=sm,
-            with_activation=with_activation,
-        )
+        if sm in [75, 80, 86, 89]:
+            rendered = render_template(
+                template_name,
+                op_name=variant_file_name,
+                func_name=func_name,
+                tile_m=cfg.BM,
+                tile_n=cfg.BN,
+                tile_k=cfg.BK,
+                warp_m=cfg.WM,
+                warp_n=cfg.WN,
+                warp_k=cfg.WK,
+                stages=cfg.kStages,
+                sm_version=sm,
+                with_activation=with_activation,
+            )
+        else:
+            rendered = render_template(
+                template_sm90_name,
+                op_name=variant_file_name,
+                func_name=func_name,
+                tile_m=cfg.BM,
+                tile_n=cfg.BN,
+                tile_k=cfg.BK,
+                cluster_m=cfg.CM,
+                cluster_n=cfg.CN,
+                cluster_k=cfg.CK,
+                k_sms=cfg.kSMs,
+                stages=cfg.kStages,
+                sm_version=sm,
+                with_activation=with_activation,
+            )
         gen_path = env.OASR_GEN_SRC_DIR / family / f"{variant_file_name}.cu"
         write_if_different(gen_path, rendered)
         source_paths.append(gen_path)
