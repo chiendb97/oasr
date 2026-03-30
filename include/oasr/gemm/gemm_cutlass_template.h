@@ -50,7 +50,9 @@ struct CutlassGemmKernel {
     using ElementAccumulator = float;
     using ElementComputeEpilogue = ElementAccumulator;
 
-    static constexpr int EpilogueAlignment = 128 / cutlass::sizeof_bits<ElementCD>::value;
+    static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    static constexpr int AlignmentEpilogue = 128 / cutlass::sizeof_bits<ElementCD>::value;
 
     using MMAOp = cutlass::arch::OpClassTensorOp;
     using SmArch = typename CutlassGemmConfig::SmArch;
@@ -61,7 +63,7 @@ struct CutlassGemmKernel {
 
     using SwizzleThreadblock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
 
-    using EpilogueOp = typename FusionEpilogueOp<activation_type, EpilogueAlignment, ElementCD,
+    using EpilogueOp = typename FusionEpilogueOp<activation_type, AlignmentEpilogue, ElementCD,
                                                  ElementComputeEpilogue, ElementCD>::type;
 
     static constexpr int Stages = CutlassGemmConfig::Stages;
@@ -69,7 +71,8 @@ struct CutlassGemmKernel {
     using Gemm =
         cutlass::gemm::device::Gemm<ElementA, LayoutA, ElementB, LayoutB, ElementCD, LayoutCD,
                                     ElementAccumulator, MMAOp, SmArch, ThreadblockShape, WarpShape,
-                                    InstructionShape, EpilogueOp, SwizzleThreadblock, Stages>;
+                                    InstructionShape, EpilogueOp, SwizzleThreadblock, Stages,
+                                    AlignmentA, AlignmentB>;
 
     static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
                           int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldc,
@@ -119,20 +122,21 @@ struct CutlassBmmKernel {
 
     using SwizzleThreadblock = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
 
-    // SIMT epilogue requires scalar access (alignment=1)
-    static constexpr int EpilogueAlignment = 128 / cutlass::sizeof_bits<ElementCD>::value;
+    static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    static constexpr int AlignmentEpilogue = 128 / cutlass::sizeof_bits<ElementCD>::value;
 
     using EpilogueOp =
-        cutlass::epilogue::thread::LinearCombination<ElementCD, EpilogueAlignment,
+        cutlass::epilogue::thread::LinearCombination<ElementCD, AlignmentEpilogue,
                                                      ElementComputeEpilogue, ElementComputeEpilogue,
                                                      cutlass::epilogue::thread::ScaleType::Default>;
 
     static constexpr int NumStages = CutlassGemmConfig::NumStages;
 
-    using Gemm = cutlass::gemm::device::GemmBatched<ElementA, LayoutA, ElementB, LayoutB, ElementCD,
-                                                    LayoutCD, ElementAccumulator, MMAOp, SmArch,
-                                                    ThreadblockShape, WarpShape, InstructionShape,
-                                                    EpilogueOp, SwizzleThreadblock, NumStages>;
+    using Gemm = cutlass::gemm::device::GemmBatched<
+        ElementA, LayoutA, ElementB, LayoutB, ElementCD, LayoutCD, ElementAccumulator, MMAOp,
+        SmArch, ThreadblockShape, WarpShape, InstructionShape, EpilogueOp, SwizzleThreadblock,
+        NumStages, AlignmentA, AlignmentB>;
 
     static GemmStatus run(const ElementA* A, const ElementB* B, ElementCD* D, int batch_size, int M,
                           int N, int K, int64_t lda, int64_t ldb, int64_t ldd, int64_t stride_a,
@@ -224,9 +228,9 @@ struct CutlassGroupGemmKernel {
     using ElementAccumulator = float;
     using ElementComputeEpilogue = ElementAccumulator;
 
-    static constexpr int kAlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-    static constexpr int kAlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-    static constexpr int kAlignmentCD = 128 / cutlass::sizeof_bits<ElementCD>::value;
+    static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    static constexpr int AlignmentEpilogue = 128 / cutlass::sizeof_bits<ElementCD>::value;
 
     using MMAOp = cutlass::arch::OpClassTensorOp;
     using SmArch = typename CutlassGemmConfig::SmArch;
@@ -238,14 +242,14 @@ struct CutlassGroupGemmKernel {
     using SwizzleThreadblock = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
 
     using EpilogueOp =
-        cutlass::epilogue::thread::LinearCombination<ElementCD, kAlignmentCD, ElementAccumulator,
-                                                     ElementAccumulator>;
+        cutlass::epilogue::thread::LinearCombination<ElementCD, AlignmentEpilogue,
+                                                     ElementAccumulator, ElementAccumulator>;
 
     static constexpr int NumStages = CutlassGemmConfig::NumStages;
 
     using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-        ElementA, LayoutA, cutlass::ComplexTransform::kNone, kAlignmentA, ElementB, LayoutB,
-        cutlass::ComplexTransform::kNone, kAlignmentB, ElementCD, LayoutCD, ElementAccumulator,
+        ElementA, LayoutA, cutlass::ComplexTransform::kNone, AlignmentA, ElementB, LayoutB,
+        cutlass::ComplexTransform::kNone, AlignmentB, ElementCD, LayoutCD, ElementAccumulator,
         MMAOp, SmArch, ThreadblockShape, WarpShape, InstructionShape, EpilogueOp,
         SwizzleThreadblock, NumStages>::GemmKernel;
 

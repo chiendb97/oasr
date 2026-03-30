@@ -90,7 +90,7 @@ cudaError_t Gemm(const ElementA* A, const ElementB* B, const ElementCD* C, Eleme
 
 #ifdef OASR_TARGET_SM
     {
-
+        constexpr int SM_VERSION = OASR_TARGET_SM;
         status = detail::dispatchGemmWithSmVersion<SM_VERSION, ElementA, ElementB, ElementCD,
                                                     ActivationType::IDENTITY>(
             A, B, C, D, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
@@ -137,6 +137,7 @@ cudaError_t GemmActivation(const ElementA* A, const ElementB* B, const ElementCD
 
 #ifdef OASR_TARGET_SM
     {
+        constexpr int SM_VERSION = OASR_TARGET_SM;
         status = detail::dispatchGemmWithSmVersion<SM_VERSION, ElementA, ElementB, ElementCD,
                                                     activation>(
                 A, B, C, D, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);

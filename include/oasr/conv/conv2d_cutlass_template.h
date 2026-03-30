@@ -27,87 +27,60 @@
     #pragma GCC diagnostic pop
 #endif
 
-#include <oasr/conv/cutlass_conv2d_configs.h>
+#include <oasr/common/epilogue_functors.h>
+#include <oasr/common/utils.h>
 
 namespace oasr {
 namespace conv {
 
 //==============================================================================
-// Status Codes
-//==============================================================================
-
-enum class Conv2dStatus {
-    SUCCESS = 0,
-    INVALID_ARGUMENT,
-    NOT_SUPPORTED,
-    INTERNAL_ERROR,
-    CUTLASS_ERROR,
-};
-
-inline const char* getConv2dStatusString(Conv2dStatus status) {
-    switch (status) {
-        case Conv2dStatus::SUCCESS:       return "SUCCESS";
-        case Conv2dStatus::INVALID_ARGUMENT: return "INVALID_ARGUMENT";
-        case Conv2dStatus::NOT_SUPPORTED: return "NOT_SUPPORTED";
-        case Conv2dStatus::INTERNAL_ERROR: return "INTERNAL_ERROR";
-        case Conv2dStatus::CUTLASS_ERROR: return "CUTLASS_ERROR";
-        default:                          return "UNKNOWN";
-    }
-}
-
-//==============================================================================
 // CutlassConv2dFpropKernel -- parameterized by Config + MMATraits
 //==============================================================================
 
-template <typename Config, typename MMATraits, typename ElementA, typename ElementB,
-          typename ElementCD, template <int, typename, typename> class EpilogueFunctor>
+template <typename CutlassConv2dConfig, typename ElementA, typename ElementB, typename ElementCD,
+          oasr::ActivationType activation_type>
 struct CutlassConv2dFpropKernel {
     using ElementAccumulator = float;
     using ElementComputeEpilogue = float;
 
     // Scalar alignment for maximum IC compatibility (conformer subsampling has IC=1)
-    static constexpr int kAlignmentA = 1;
-    static constexpr int kAlignmentB = 1;
-
-    // cp_async fallback: scalar alignment with fp16/bf16 (2 bytes) < 4 bytes minimum
-    static constexpr int kElementBytes = cutlass::sizeof_bits<ElementA>::value / 8;
-    static constexpr bool kNeedsCpAsyncFallback =
-        (kAlignmentA * kElementBytes < 4) && (Config::NumStages > 2);
-
-    static constexpr int EpilogueAlignment = Config::EpilogueAlignment;
+    static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    static constexpr int AlignmentEpilogue = 128 / cutlass::sizeof_bits<ElementCD>::value;
 
     using LayoutInput = cutlass::layout::TensorNHWC;
     using LayoutFilter = cutlass::layout::TensorNHWC;
     using LayoutOutput = cutlass::layout::TensorNHWC;
 
-    using MMAOp = typename MMATraits::MMAOp;
-    using SmArch = typename MMATraits::SmArch;
-    using ShapeMMAThreadBlock = typename Config::ThreadBlock;
-    using ShapeMMAWarps = typename Config::Warps;
-    using ShapeMMAOp = typename MMATraits::MMAShape;
+    using MMAOp = cutlass::arch::OpClassTensorOp;
+    using SmArch = typename CutlassConv2dConfig::SmArch;
+    using ShapeMMAThreadBlock = typename CutlassConv2dConfig::ThreadBlock;
+    using ShapeMMAWarps = typename CutlassConv2dConfig::Warps;
+    using ShapeMMAOp = typename CutlassConv2dConfig::MMAShape;
     using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
 
-    static constexpr int NumStages = kNeedsCpAsyncFallback ? 2 : Config::NumStages;
-    static constexpr cutlass::conv::IteratorAlgorithm IterAlgo = kNeedsCpAsyncFallback
-        ? cutlass::conv::IteratorAlgorithm::kAnalytic : Config::IterAlgo;
-    static constexpr cutlass::conv::StrideSupport OutStride = kNeedsCpAsyncFallback
-        ? cutlass::conv::StrideSupport::kStrided : Config::OutStride;
+    static constexpr int NumStages = CutlassConv2dConfig::NumStages;
+    static constexpr cutlass::conv::IteratorAlgorithm IterAlgo =
+        cutlass::conv::IteratorAlgorithm::kOptimized;
+    static constexpr cutlass::conv::StrideSupport OutStride =
+        cutlass::conv::StrideSupport::kStrided;
 
-    using EpilogueOp =
-        typename EpilogueFunctor<EpilogueAlignment, ElementCD, ElementComputeEpilogue>::Op;
+    using EpilogueOp = typename FusionEpilogueOp<activation_type, AlignmentEpilogue, ElementCD,
+                                                 ElementComputeEpilogue, ElementCD>::type;
 
     using Conv2dKernel = typename cutlass::conv::kernel::DefaultConv2dFprop<
         ElementA, LayoutInput, ElementB, LayoutFilter, ElementCD, LayoutOutput, ElementAccumulator,
         MMAOp, SmArch, ShapeMMAThreadBlock, ShapeMMAWarps, ShapeMMAOp, EpilogueOp,
         SwizzleThreadBlock, NumStages, cutlass::arch::OpMultiplyAdd, IterAlgo, OutStride,
-        kAlignmentA, kAlignmentB>::Kernel;
+        AlignmentA, AlignmentB>::Kernel;
 
     using ImplicitGemm = cutlass::conv::device::ImplicitGemmConvolution<Conv2dKernel>;
 
-    static Conv2dStatus run(const ElementA* input, const ElementB* filter, const ElementCD* bias,
-                            ElementCD* output, int N, int H, int W, int IC, int K, int R, int S,
-                            int pad_h, int pad_w, int stride_h, int stride_w, int dilation_h,
-                            int dilation_w, ElementComputeEpilogue alpha, cudaStream_t stream) {
+    static gemm::GemmStatus run(const ElementA* input, const ElementB* filter,
+                                const ElementCD* bias, ElementCD* output, int N, int H, int W,
+                                int IC, int K, int R, int S, int pad_h, int pad_w, int stride_h,
+                                int stride_w, int dilation_h, int dilation_w,
+                                ElementComputeEpilogue alpha, cudaStream_t stream) {
         int P = (H + 2 * pad_h - dilation_h * (R - 1) - 1) / stride_h + 1;
         int Q = (W + 2 * pad_w - dilation_w * (S - 1) - 1) / stride_w + 1;
 
@@ -134,7 +107,7 @@ struct CutlassConv2dFpropKernel {
         ImplicitGemm conv_op;
         cutlass::Status status = conv_op.can_implement(args);
         if (status != cutlass::Status::kSuccess) {
-            return Conv2dStatus::NOT_SUPPORTED;
+            return gemm::GemmStatus::NOT_SUPPORTED;
         }
 
         size_t workspace_size = ImplicitGemm::get_workspace_size(args);
@@ -142,15 +115,15 @@ struct CutlassConv2dFpropKernel {
 
         status = conv_op.initialize(args, workspace.get(), stream);
         if (status != cutlass::Status::kSuccess) {
-            return Conv2dStatus::INTERNAL_ERROR;
+            return gemm::GemmStatus::INTERNAL_ERROR;
         }
 
         status = conv_op(stream);
         if (status != cutlass::Status::kSuccess) {
-            return Conv2dStatus::CUTLASS_ERROR;
+            return gemm::GemmStatus::CUTLASS_ERROR;
         }
 
-        return Conv2dStatus::SUCCESS;
+        return gemm::GemmStatus::SUCCESS;
     }
 };
 

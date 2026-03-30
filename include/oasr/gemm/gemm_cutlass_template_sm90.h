@@ -71,7 +71,7 @@ struct CutlassGemmKernelSm90 {
     // Alignment (128-bit = 16 bytes)
     static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
     static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-    static constexpr int AlignmentCD = 128 / cutlass::sizeof_bits<ElementCD>::value;
+    static constexpr int AlignmentEpilogue = 128 / cutlass::sizeof_bits<ElementCD>::value;
 
     // Schedule types from SMTypeAdapter
     using EpilogueSchedule = typename CutlassGemmConfig::EpilogueSchedule;
@@ -85,8 +85,8 @@ struct CutlassGemmKernelSm90 {
     // Build epilogue collective via CUTLASS 3.x builder
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         ArchTag, OperatorClass, TileShape, ClusterShape, EpilogueTileType, ElementAccumulator,
-        ElementCompute, ElementCD, LayoutCD, AlignmentCD, ElementCD, LayoutCD, AlignmentCD,
-        EpilogueSchedule, FusionOp>::CollectiveOp;
+        ElementCompute, ElementCD, LayoutCD, AlignmentEpilogue, ElementCD, LayoutCD,
+        AlignmentEpilogue, EpilogueSchedule, FusionOp>::CollectiveOp;
 
     // Build mainloop collective via CUTLASS 3.x builder
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -173,7 +173,7 @@ struct CutlassBmmKernelSm90 {
     // Alignment (128-bit = 16 bytes)
     static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
     static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-    static constexpr int AlignmentCD = 128 / cutlass::sizeof_bits<ElementCD>::value;
+    static constexpr int AlignmentEpilogue = 128 / cutlass::sizeof_bits<ElementCD>::value;
 
     // Schedule types from SMTypeAdapter
     using EpilogueSchedule = typename CutlassGemmConfig::EpilogueSchedule;
@@ -187,8 +187,8 @@ struct CutlassBmmKernelSm90 {
     // Build epilogue collective via CUTLASS 3.x builder
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         ArchTag, OperatorClass, TileShape, ClusterShape, EpilogueTileType, ElementAccumulator,
-        ElementCompute, ElementCD, LayoutCD, AlignmentCD, ElementCD, LayoutCD, AlignmentCD,
-        EpilogueSchedule, FusionOp>::CollectiveOp;
+        ElementCompute, ElementCD, LayoutCD, AlignmentEpilogue, ElementCD, LayoutCD,
+        AlignmentEpilogue, EpilogueSchedule, FusionOp>::CollectiveOp;
 
     // Build mainloop collective via CUTLASS 3.x builder
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -281,7 +281,7 @@ struct CutlassGroupGemmKernelSm90 {
     // Alignment (128-bit = 16 bytes)
     static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
     static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-    static constexpr int AlignmentCD = 128 / cutlass::sizeof_bits<ElementCD>::value;
+    static constexpr int AlignmentEpilogue = 128 / cutlass::sizeof_bits<ElementCD>::value;
 
     // Ptr-array schedule types for grouped GEMM (different from regular GEMM schedules)
     using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
@@ -298,8 +298,8 @@ struct CutlassGroupGemmKernelSm90 {
     // Build epilogue collective via CUTLASS 3.x builder (ptr-array: LayoutCD *)
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         ArchTag, OperatorClass, TileShape, ClusterShape, EpilogueTileType, ElementAccumulator,
-        ElementCompute, ElementCD, LayoutCD*, AlignmentCD, ElementCD, LayoutCD*, AlignmentCD,
-        EpilogueSchedule, FusionOp>::CollectiveOp;
+        ElementCompute, ElementCD, LayoutCD*, AlignmentEpilogue, ElementCD, LayoutCD*,
+        AlignmentEpilogue, EpilogueSchedule, FusionOp>::CollectiveOp;
 
     // Build mainloop collective via CUTLASS 3.x builder (ptr-array: LayoutA *, LayoutB *)
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
