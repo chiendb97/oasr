@@ -41,6 +41,9 @@
 #include <oasr/common/epilogue_functors.h>
 #include <oasr/common/utils.h>
 #include <oasr/gemm/cutlass_gemm_configs.h>
+#include <oasr/gemm/gemm_cutlass_template.h>
+
+#include <cutlass/gemm/group_array_problem_shape.hpp>
 
 namespace oasr {
 namespace gemm {
@@ -152,8 +155,7 @@ struct CutlassGemmKernelSm90 {
 // CutlassBmmKernelSm90 -- CUTLASS 3.x BMM template for SM90+
 //==============================================================================
 
-template <typename CutlassGemmConfig, typename ElementA, typename ElementB, typename ElementCD,
-          ActivationType activation_type>
+template <typename CutlassGemmConfig, typename ElementA, typename ElementB, typename ElementCD>
 struct CutlassBmmKernelSm90 {
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::ColumnMajor;
@@ -178,9 +180,9 @@ struct CutlassBmmKernelSm90 {
     using MainloopSchedule = typename CutlassGemmConfig::MainloopSchedule;
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
-    // CUTLASS 3.x fusion operation for epilogue (identity, relu, gelu, swish)
-    using FusionOp =
-        typename FusionEpilogueOpSm90<activation_type, ElementCD, ElementCompute, ElementCD>::type;
+    // Linear combination epilogue (no activation for BMM)
+    using FusionOp = cutlass::epilogue::fusion::LinearCombination<ElementCD, ElementCompute,
+                                                                   ElementCD, ElementCompute>;
 
     // Build epilogue collective via CUTLASS 3.x builder
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -208,19 +210,23 @@ struct CutlassBmmKernelSm90 {
     using StrideC = typename Gemm::GemmKernel::StrideC;
     using StrideD = typename Gemm::GemmKernel::StrideD;
 
-    static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
-                          int M, int N, int K, ElementCompute alpha, ElementCompute beta,
-                          cudaStream_t stream) {
-        // Compute strides (batch dimension = 1 for standard GEMM)
-        auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
-        auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
-        auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
-        auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+    static GemmStatus run(const ElementA* A, const ElementB* B, ElementCD* D, int batch_size,
+                          int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldd,
+                          int64_t stride_a, int64_t stride_b, int64_t stride_d, float alpha,
+                          float beta, cudaStream_t stream) {
+        // Compute strides with batch dimension
+        auto cute_stride_A =
+            cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, batch_size));
+        auto cute_stride_B =
+            cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, batch_size));
+        auto cute_stride_D =
+            cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, batch_size));
 
-        typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGemm,
-                                           {M, N, K, 1},  // problem shape (M, N, K, batch=1)
-                                           {A, stride_A, B, stride_B},
-                                           {{}, C, stride_C, D, stride_D}};
+        typename Gemm::Arguments arguments{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, batch_size},
+            {A, cute_stride_A, B, cute_stride_B},
+            {{}, D, cute_stride_D, D, cute_stride_D}};
 
         // Set epilogue scaling factors
         arguments.epilogue.thread.alpha = alpha;
@@ -253,10 +259,12 @@ struct CutlassBmmKernelSm90 {
 
 //==============================================================================
 // CutlassGroupGemmKernelSm90 -- CUTLASS 3.x Group GEMM template for SM90+
+//
+// Uses ptr-array TMA warp-specialized cooperative scheduling with
+// GroupProblemShape for variable-size grouped GEMM.
 //==============================================================================
 
-template <typename CutlassGemmConfig, typename ElementA, typename ElementB, typename ElementCD,
-          ActivationType activation_type>
+template <typename CutlassGemmConfig, typename ElementA, typename ElementB, typename ElementCD>
 struct CutlassGroupGemmKernelSm90 {
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::ColumnMajor;
@@ -276,58 +284,88 @@ struct CutlassGroupGemmKernelSm90 {
     static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
     static constexpr int AlignmentCD = 128 / cutlass::sizeof_bits<ElementCD>::value;
 
-    // Schedule types from SMTypeAdapter
-    using EpilogueSchedule = typename CutlassGemmConfig::EpilogueSchedule;
-    using MainloopSchedule = typename CutlassGemmConfig::MainloopSchedule;
+    // Ptr-array schedule types for grouped GEMM (different from regular GEMM schedules)
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+    using MainloopSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
-    // CUTLASS 3.x fusion operation for epilogue (identity, relu, gelu, swish)
-    using FusionOp =
-        typename FusionEpilogueOpSm90<activation_type, ElementCD, ElementCompute, ElementCD>::type;
+    // Linear combination epilogue (no activation for group GEMM)
+    using FusionOp = cutlass::epilogue::fusion::LinearCombination<ElementCD, ElementCompute,
+                                                                   ElementCD, ElementCompute>;
 
-    // Build epilogue collective via CUTLASS 3.x builder
+    // Group problem shape for variable-size grouped GEMM
+    using ProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
+
+    // Build epilogue collective via CUTLASS 3.x builder (ptr-array: LayoutCD *)
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         ArchTag, OperatorClass, TileShape, ClusterShape, EpilogueTileType, ElementAccumulator,
-        ElementCompute, ElementCD, LayoutCD, AlignmentCD, ElementCD, LayoutCD, AlignmentCD,
+        ElementCompute, ElementCD, LayoutCD*, AlignmentCD, ElementCD, LayoutCD*, AlignmentCD,
         EpilogueSchedule, FusionOp>::CollectiveOp;
 
-    // Build mainloop collective via CUTLASS 3.x builder
+    // Build mainloop collective via CUTLASS 3.x builder (ptr-array: LayoutA *, LayoutB *)
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-        ArchTag, OperatorClass, ElementA, LayoutA, AlignmentA, ElementB, LayoutB, AlignmentB,
+        ArchTag, OperatorClass, ElementA, LayoutA*, AlignmentA, ElementB, LayoutB*, AlignmentB,
         ElementAccumulator, TileShape, ClusterShape,
         cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
             sizeof(typename CollectiveEpilogue::SharedStorage))>,
         MainloopSchedule>::CollectiveOp;
 
-    // Assemble kernel and device adapter
-    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>,
-                                                            CollectiveMainloop, CollectiveEpilogue>;
+    // Assemble kernel and device adapter with GroupProblemShape
+    using GemmKernel =
+        cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
 
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-    // Stride types from kernel
+    // Stride types from kernel (these are per-group stride types)
     using StrideA = typename Gemm::GemmKernel::StrideA;
     using StrideB = typename Gemm::GemmKernel::StrideB;
     using StrideC = typename Gemm::GemmKernel::StrideC;
     using StrideD = typename Gemm::GemmKernel::StrideD;
 
-    static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
-                          int M, int N, int K, ElementCompute alpha, ElementCompute beta,
-                          cudaStream_t stream) {
-        // Compute strides (batch dimension = 1 for standard GEMM)
-        auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
-        auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
-        auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
-        auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+    static GemmStatus run(GroupedGemmProblemDesc<ElementA, ElementB, ElementCD>& problem_desc,
+                          int problem_count, cudaStream_t stream) {
+        // Build host-side arrays of problem shapes and strides
+        std::vector<typename ProblemShape::UnderlyingProblemShape> problem_shapes_host(problem_count);
+        std::vector<StrideA> strides_A_host(problem_count);
+        std::vector<StrideB> strides_B_host(problem_count);
+        std::vector<StrideD> strides_D_host(problem_count);
 
-        typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGemm,
-                                           {M, N, K, 1},  // problem shape (M, N, K, batch=1)
-                                           {A, stride_A, B, stride_B},
-                                           {{}, C, stride_C, D, stride_D}};
+        for (int i = 0; i < problem_count; ++i) {
+            auto& ps = problem_desc.problem_sizes[i];
+            int M = ps.m(), N = ps.n(), K = ps.k();
+            problem_shapes_host[i] = cute::make_shape(M, N, K);
+            strides_A_host[i] =
+                cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+            strides_B_host[i] =
+                cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+            strides_D_host[i] =
+                cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+        }
 
-        // Set epilogue scaling factors
-        arguments.epilogue.thread.alpha = alpha;
-        arguments.epilogue.thread.beta = beta;
+        // Allocate and copy to device
+        cutlass::DeviceAllocation<typename ProblemShape::UnderlyingProblemShape>
+            problem_shapes_device(problem_count);
+        cutlass::DeviceAllocation<StrideA> strides_A_device(problem_count);
+        cutlass::DeviceAllocation<StrideB> strides_B_device(problem_count);
+        cutlass::DeviceAllocation<StrideD> strides_D_device(problem_count);
+
+        problem_shapes_device.copy_from_host(problem_shapes_host.data());
+        strides_A_device.copy_from_host(strides_A_host.data());
+        strides_B_device.copy_from_host(strides_B_host.data());
+        strides_D_device.copy_from_host(strides_D_host.data());
+
+        // Build arguments for grouped GEMM
+        typename Gemm::Arguments arguments{
+            cutlass::gemm::GemmUniversalMode::kGrouped,
+            {problem_count, problem_shapes_device.get(), problem_shapes_host.data()},
+            {reinterpret_cast<const ElementA**>(problem_desc.ptr_A_device.get()),
+             strides_A_device.get(),
+             reinterpret_cast<const ElementB**>(problem_desc.ptr_B_device.get()),
+             strides_B_device.get()},
+            {{1.0f, 0.0f},
+             nullptr, strides_D_device.get(),
+             reinterpret_cast<ElementCD**>(problem_desc.ptr_D_device.get()),
+             strides_D_device.get()}};
 
         Gemm gemm;
 
