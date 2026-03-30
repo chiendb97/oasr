@@ -9,21 +9,38 @@ to call — no JIT compilation is triggered during tuning.
 
 import functools
 import logging
+from typing import Union
 
 from oasr.tune.autotuner import BackendEntry, _global_registry, OpKey, Tactic
 from oasr.jit.gemm import (
-    TileConfig,
-    GEMM_DEFAULT,
-    GEMM_TILE_CONFIGS,
-    BMM_TILE_CONFIGS,
-    GROUP_GEMM_TILE_CONFIGS,
+    CutlassGemmConfig,
+    CutlassGemmConfigSm90,
+    TileShapeConfigs,
+    TileShapeConfigsSm90,
+    ClusterShapeConfigsSm90,
+    get_unique_compile_configs,
     gemm_func_name,
     gemm_activation_func_name,
     bmm_func_name,
     group_gemm_func_name,
 )
+from oasr.jit.core import _get_target_sm
 
 logger = logging.getLogger("oasr.tune")
+
+_sm = _get_target_sm()
+_all_gemm_configs = get_unique_compile_configs(
+    _sm, TileShapeConfigs, TileShapeConfigsSm90, ClusterShapeConfigsSm90
+)
+
+# Default configs (mid-range tile picked heuristically)
+_GEMM_DEFAULT_SM_LT90 = CutlassGemmConfig(
+    BM=128, BN=128, BK=64, WM=64, WN=64, WK=64, kStages=3, kSmVersion=_sm
+)
+_GEMM_DEFAULT_SM90 = CutlassGemmConfigSm90(
+    BM=128, BN=128, BK=128, CM=1, CN=1, CK=1, kSMs=1, kStages=3, kSmVersion=_sm
+)
+_GEMM_DEFAULT = _GEMM_DEFAULT_SM_LT90 if _sm < 90 else _GEMM_DEFAULT_SM90
 
 
 # ---------------------------------------------------------------------------
@@ -52,16 +69,15 @@ def _get_group_gemm_module():
 # GEMM registration
 # ---------------------------------------------------------------------------
 
-def _make_gemm_runner(cfg: TileConfig):
+def _make_gemm_runner(cfg: Union[CutlassGemmConfig, CutlassGemmConfigSm90]):
     """Create a GEMM runner that calls a specific variant from the module."""
-    split_k = cfg.split_k
     fn_name = gemm_func_name(cfg)
 
     def runner():
         mod = _get_gemm_module()
         fn = getattr(mod, fn_name)
 
-        def call(out, A, B, C, split_k_slices=split_k):
+        def call(out, A, B, C, split_k_slices=1):
             fn(out, A, B, C, split_k_slices)
 
         return call
@@ -69,15 +85,14 @@ def _make_gemm_runner(cfg: TileConfig):
     return runner
 
 
-def _make_gemm_activation_runner(cfg: TileConfig):
-    split_k = cfg.split_k
+def _make_gemm_activation_runner(cfg: Union[CutlassGemmConfig, CutlassGemmConfigSm90]):
     fn_name = gemm_activation_func_name(cfg)
 
     def runner():
         mod = _get_gemm_module()
         fn = getattr(mod, fn_name)
 
-        def call(out, A, B, C, activation_type, split_k_slices=split_k):
+        def call(out, A, B, C, activation_type, split_k_slices=1):
             fn(out, A, B, C, activation_type, split_k_slices)
 
         return call
@@ -85,13 +100,9 @@ def _make_gemm_activation_runner(cfg: TileConfig):
     return runner
 
 
-for _cfg in GEMM_TILE_CONFIGS:
+for _cfg in _all_gemm_configs.values():
     _tactic = Tactic("cutlass", config=_cfg.to_tactic_config())
-    _is_default = (_cfg.tile_m == GEMM_DEFAULT.tile_m
-                   and _cfg.tile_n == GEMM_DEFAULT.tile_n
-                   and _cfg.tile_k == GEMM_DEFAULT.tile_k
-                   and _cfg.stages == GEMM_DEFAULT.stages
-                   and _cfg.split_k == 1)
+    _is_default = (_cfg.compile_name == _GEMM_DEFAULT.compile_name)
 
     _global_registry.register(
         OpKey("gemm", "gemm"),
@@ -118,7 +129,7 @@ for _cfg in GEMM_TILE_CONFIGS:
 # BMM registration
 # ---------------------------------------------------------------------------
 
-def _make_bmm_runner(cfg: TileConfig):
+def _make_bmm_runner(cfg: Union[CutlassGemmConfig, CutlassGemmConfigSm90]):
     fn_name = bmm_func_name(cfg)
 
     def runner():
@@ -128,12 +139,9 @@ def _make_bmm_runner(cfg: TileConfig):
     return runner
 
 
-for _cfg in BMM_TILE_CONFIGS:
+for _cfg in _all_gemm_configs.values():
     _tactic = Tactic("cutlass", config=_cfg.to_tactic_config())
-    _is_default = (_cfg.tile_m == GEMM_DEFAULT.tile_m
-                   and _cfg.tile_n == GEMM_DEFAULT.tile_n
-                   and _cfg.tile_k == GEMM_DEFAULT.tile_k
-                   and _cfg.stages == GEMM_DEFAULT.stages)
+    _is_default = (_cfg.compile_name == _GEMM_DEFAULT.compile_name)
 
     _global_registry.register(
         OpKey("gemm", "bmm"),
@@ -150,7 +158,7 @@ for _cfg in BMM_TILE_CONFIGS:
 # Group GEMM registration
 # ---------------------------------------------------------------------------
 
-def _make_group_gemm_runner(cfg: TileConfig):
+def _make_group_gemm_runner(cfg: Union[CutlassGemmConfig, CutlassGemmConfigSm90]):
     fn_name = group_gemm_func_name(cfg)
 
     def runner():
@@ -160,12 +168,9 @@ def _make_group_gemm_runner(cfg: TileConfig):
     return runner
 
 
-for _cfg in GROUP_GEMM_TILE_CONFIGS:
+for _cfg in _all_gemm_configs.values():
     _tactic = Tactic("cutlass", config=_cfg.to_tactic_config())
-    _is_default = (_cfg.tile_m == GEMM_DEFAULT.tile_m
-                   and _cfg.tile_n == GEMM_DEFAULT.tile_n
-                   and _cfg.tile_k == GEMM_DEFAULT.tile_k
-                   and _cfg.stages == GEMM_DEFAULT.stages)
+    _is_default = (_cfg.compile_name == _GEMM_DEFAULT.compile_name)
 
     _global_registry.register(
         OpKey("gemm", "group_gemm"),

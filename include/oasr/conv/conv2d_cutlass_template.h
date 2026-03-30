@@ -29,6 +29,7 @@
 
 #include <oasr/common/epilogue_functors.h>
 #include <oasr/common/utils.h>
+#include <oasr/conv/cutlass_conv2d_configs.h>
 
 namespace oasr {
 namespace conv {

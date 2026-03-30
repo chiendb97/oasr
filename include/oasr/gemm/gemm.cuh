@@ -35,25 +35,25 @@ static GemmStatus dispatchGemmWithSmVersion(const ElementA* A_ptr, const Element
                                           float alpha, cudaStream_t stream, int split_k_slices = 1) {
     if constexpr (SM_VERSION == 75) {
         using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 75>;
-        return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+        return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
     } else if constexpr (SM_VERSION == 80) {
         using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 80>;
-        return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+        return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
     } else if constexpr (SM_VERSION == 86) {
         using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 86>;
-        return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+        return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
     } else if constexpr (SM_VERSION == 89) {
         using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 89>;
-        return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+        return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
     } else if constexpr (SM_VERSION == 90) {
         using Config = CutlassGemmConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 90>;
-        return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+        return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
     } else if constexpr (SM_VERSION == 100) {
         using Config = CutlassGemmConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 100>;
-        return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+        return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
     } else if constexpr (SM_VERSION == 120) {
         using Config = CutlassGemmConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 120>;
-        return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+        return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
     } else {
         return GemmStatus::INVALID_ARGUMENT;
     }

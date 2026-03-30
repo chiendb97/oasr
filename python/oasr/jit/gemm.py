@@ -405,3 +405,19 @@ def bmm_func_name(cfg: CutlassGemmConfig) -> str:
 def group_gemm_func_name(cfg: CutlassGemmConfig) -> str:
     """Return the TVM-FFI export name for a grouped GEMM variant."""
     return f"group_gemm_{cfg.compile_name}"
+
+
+# =============================================================================
+# Default configs (used by non-autotuned paths in python/oasr/gemm.py)
+# =============================================================================
+
+_sm = _get_target_sm()
+
+if _sm < 90:
+    GEMM_DEFAULT: Union[CutlassGemmConfig, CutlassGemmConfigSm90] = CutlassGemmConfig(
+        BM=128, BN=128, BK=64, WM=64, WN=64, WK=64, kStages=3, kSmVersion=_sm
+    )
+else:
+    GEMM_DEFAULT = CutlassGemmConfigSm90(
+        BM=128, BN=128, BK=128, CM=1, CN=1, CK=1, kSMs=1, kStages=3, kSmVersion=_sm
+    )

@@ -10,6 +10,7 @@
 #include <oasr/common/types.h>
 #include <oasr/gemm/cutlass_gemm_configs.h>
 #include <oasr/conv/conv2d_cutlass_template.h>
+#include <oasr/conv/conv2d_cutlass_template_sm90.h>
 
 namespace oasr {
 namespace conv {
@@ -30,26 +31,26 @@ static gemm::GemmStatus dispatchConv2dWithSmVersion(const void* input_ptr, const
                                               int dilation_h, int dilation_w,
                                               cudaStream_t stream) {
                                                 if constexpr (SM_VERSION == 75) {
-                                                    using Config = gemm::CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 75>;
-                                                    return conv::CutlassConv2dFpropKernel<Config, ElementA, ElementB, ElementCD, activation_type>(input_ptr, filter_ptr, bias_ptr, output_ptr, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, stream);
+                                                    using Config = conv::CutlassConv2dConfig<16, 128, 64, 16, 32, 64, 3, 75>;
+                                                    return conv::CutlassConv2dFpropKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(input_ptr, filter_ptr, bias_ptr, output_ptr, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w,  1.0f, stream);
                                                 } else if constexpr (SM_VERSION == 80) {
-                                                    using Config = gemm::CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 80>;
-                                                    return conv::CutlassConv2dFpropKernel<Config, ElementA, ElementB, ElementCD, activation_type>(input_ptr, filter_ptr, bias_ptr, output_ptr, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, stream);
+                                                    using Config = conv::CutlassConv2dConfig<16, 128, 64, 16, 32, 64, 3, 80>;
+                                                    return conv::CutlassConv2dFpropKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(input_ptr, filter_ptr, bias_ptr, output_ptr, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, 1.0f, stream);
                                                 } else if constexpr (SM_VERSION == 86) {
-                                                    using Config = gemm::CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 86>;
-                                                    return conv::CutlassConv2dFpropKernel<Config, ElementA, ElementB, ElementCD, activation_type>(input_ptr, filter_ptr, bias_ptr, output_ptr, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, stream);
+                                                    using Config = conv::CutlassConv2dConfig<16, 128, 64, 16, 32, 64, 3, 86>;
+                                                    return conv::CutlassConv2dFpropKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(input_ptr, filter_ptr, bias_ptr, output_ptr, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, 1.0f, stream);
                                                 } else if constexpr (SM_VERSION == 89) {
-                                                    using Config = gemm::CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 89>;
-                                                    return conv::CutlassConv2dFpropKernel<Config, ElementA, ElementB, ElementCD, activation_type>(input_ptr, filter_ptr, bias_ptr, output_ptr, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, stream);
+                                                    using Config = conv::CutlassConv2dConfig<16, 128, 64, 16, 32, 64, 3, 89>;
+                                                    return conv::CutlassConv2dFpropKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(input_ptr, filter_ptr, bias_ptr, output_ptr, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, 1.0f, stream);
                                                 } else if constexpr (SM_VERSION == 90) {
-                                                    using Config = gemm::CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 90>;
-                                                    return conv::CutlassConv2dFpropKernel<Config, ElementA, ElementB, ElementCD, activation_type>(input_ptr, filter_ptr, bias_ptr, output_ptr, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, stream);
+                                                    using Config = conv::CutlassConv2dConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 90>;
+                                                    return conv::CutlassConv2dFpropKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(input_ptr, filter_ptr, bias_ptr, output_ptr, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, 1.0f, stream);
                                                 } else if constexpr (SM_VERSION == 100) {
-                                                    using Config = gemm::CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 100>;
-                                                } else if constexpr (SM_VERSION == 103) {
-                                                    using Config = gemm::CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 103>;
+                                                    using Config = conv::CutlassConv2dConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 100>;
+                                                    return conv::CutlassConv2dFpropKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(input_ptr, filter_ptr, bias_ptr, output_ptr, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, 1.0f, stream);
                                                 } else if constexpr (SM_VERSION == 120) {
-                                                    using Config = gemm::CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 120>;
+                                                    using Config = conv::CutlassConv2dConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 120>;
+                                                    return conv::CutlassConv2dFpropKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(input_ptr, filter_ptr, bias_ptr, output_ptr, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, 1.0f, stream);
                                                 } else {
                                                     return gemm::GemmStatus::NOT_SUPPORTED;
                                                 }
