@@ -3,10 +3,11 @@
 
 #pragma once
 
-#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+#include <cstdint>
 
 namespace oasr {
 
@@ -40,7 +41,7 @@ enum class AttentionType {
 enum class ConvType {
     DEPTHWISE = 0,  // Depthwise separable
     POINTWISE = 1,
-    CAUSAL = 2,   // Causal convolution for streaming
+    CAUSAL = 2,  // Causal convolution for streaming
     STANDARD = 3,
 };
 
@@ -49,6 +50,7 @@ enum class ActivationType {
     RELU = 0,
     GELU = 1,
     SWISH = 2,  // SiLU
+    IDENTITY = 3,
 };
 
 // Normalization types
@@ -71,12 +73,18 @@ enum class ModelType {
 // Helper to get size of data type
 inline size_t getDataTypeSize(DataType dtype) {
     switch (dtype) {
-        case DataType::FP32: return 4;
-        case DataType::FP16: return 2;
-        case DataType::BF16: return 2;
-        case DataType::INT8: return 1;
-        case DataType::INT32: return 4;
-        default: return 0;
+        case DataType::FP32:
+            return 4;
+        case DataType::FP16:
+            return 2;
+        case DataType::BF16:
+            return 2;
+        case DataType::INT8:
+            return 1;
+        case DataType::INT32:
+            return 4;
+        default:
+            return 0;
     }
 }
 

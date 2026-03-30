@@ -24,69 +24,111 @@ from . import env
 
 
 @dataclass(frozen=True)
-class TileConfig:
+class CutlassGemmConfig:
     """A CUTLASS tile configuration for GEMM or Conv2D."""
-
-    tile_m: int
-    tile_n: int
-    tile_k: int
-    warp_m: int
-    warp_n: int
-    warp_k: int
-    stages: int
-    split_k: int = 1  # Only meaningful for GEMM (runtime param, not compiled)
+    BK: int
+    BN: int
+    BM: int
+    WK: int
+    WN: int
+    WM: int
+    kStages: int
 
     @property
     def name(self) -> str:
         """Unique identifier for this config."""
-        parts = [f"t{self.tile_m}x{self.tile_n}x{self.tile_k}"]
-        parts.append(f"w{self.warp_m}x{self.warp_n}x{self.warp_k}")
-        parts.append(f"s{self.stages}")
-        if self.split_k > 1:
-            parts.append(f"sk{self.split_k}")
+        parts = [f"t{self.BM}x{self.BN}x{self.BK}"]
+        parts.append(f"w{self.WM}x{self.WN}x{self.WK}")
+        parts.append(f"s{self.kStages}")
         return "_".join(parts)
 
     @property
     def compile_name(self) -> str:
         """Config name excluding runtime params (split_k)."""
-        parts = [f"t{self.tile_m}x{self.tile_n}x{self.tile_k}"]
-        parts.append(f"w{self.warp_m}x{self.warp_n}x{self.warp_k}")
-        parts.append(f"s{self.stages}")
+        parts = [f"t{self.BM}x{self.BN}x{self.BK}"]
+        parts.append(f"w{self.WM}x{self.WN}x{self.WK}")
+        parts.append(f"s{self.kStages}")
         return "_".join(parts)
 
     @property
     def num_warps(self) -> int:
-        return (self.tile_m // self.warp_m) * (self.tile_n // self.warp_n)
+        return (self.BM // self.WM) * (self.BN // self.WN)
 
     def to_tactic_config(self) -> Tuple[Tuple[str, int], ...]:
         """Convert to a ``Tactic.config`` tuple."""
         items = [
-            ("tile_m", self.tile_m),
-            ("tile_n", self.tile_n),
-            ("tile_k", self.tile_k),
-            ("warp_m", self.warp_m),
-            ("warp_n", self.warp_n),
-            ("warp_k", self.warp_k),
-            ("stages", self.stages),
+            ("BM", self.BM),
+            ("BN", self.BN),
+            ("BK", self.BK),
+            ("WM", self.WM),
+            ("WN", self.WN),
+            ("WK", self.WK),
+            ("kStages", self.kStages),
         ]
-        if self.split_k > 1:
-            items.append(("split_k", self.split_k))
         return tuple(items)
 
 
-def get_unique_compile_configs(configs: List[TileConfig]) -> Dict[str, TileConfig]:
+class CutlassGemmConfigSm90:
+    """A CUTLASS tile configuration for GEMM or Conv2D."""
+    BM: int
+    BN: int
+    BK: int
+    CM: int
+    CN: int
+    CK: int
+    kSMs: int
+    kStages: int
+
+    @property
+    def name(self) -> str:
+        """Unique identifier for this config."""
+        parts = [f"t{self.BM}x{self.BN}x{self.BK}"]
+        parts.append(f"c{self.CM}x{self.CN}x{self.CK}")
+        parts.append(f"s{self.kSMs}")
+        parts.append(f"s{self.kStages}")
+        return "_".join(parts)
+
+    @property
+    def compile_name(self) -> str:
+        """Config name excluding runtime params (split_k)."""
+        parts = [f"t{self.BM}x{self.BN}x{self.BK}"]
+        parts.append(f"c{self.CM}x{self.CN}x{self.CK}")
+        parts.append(f"s{self.kSMs}")
+        parts.append(f"s{self.kStages}")
+        return "_".join(parts)
+
+    @property
+    def num_warps(self) -> int:
+        return (self.BM // self.WM) * (self.BN // self.WN)
+
+    def to_tactic_config(self) -> Tuple[Tuple[str, int], ...]:
+        """Convert to a ``Tactic.config`` tuple."""
+        items = [
+            ("BM", self.BM),
+            ("BN", self.BN),
+            ("BK", self.BK),
+            ("CM", self.CM),
+            ("CN", self.CN),
+            ("CK", self.CK),
+            ("kSMs", self.kSMs),
+            ("kStages", self.kStages),
+        ]
+        return tuple(items)
+
+
+def get_unique_compile_configs(configs: List[CutlassGemmConfig]) -> Dict[str, CutlassGemmConfig]:
     """Deduplicate configs that compile to the same variant.
 
     Split-K is a runtime parameter, so configs that differ only in split_k
     share the same compiled variant.  Returns a dict of unique compile keys
     to representative configs (with split_k=1).
     """
-    seen: Dict[str, TileConfig] = {}
+    seen: Dict[str, CutlassGemmConfig] = {}
     for cfg in configs:
-        compile_cfg = TileConfig(
-            tile_m=cfg.tile_m, tile_n=cfg.tile_n, tile_k=cfg.tile_k,
-            warp_m=cfg.warp_m, warp_n=cfg.warp_n, warp_k=cfg.warp_k,
-            stages=cfg.stages, split_k=1,
+        compile_cfg = CutlassGemmConfig(
+            BM=cfg.BM, BN=cfg.BN, BK=cfg.BK,
+            WM=cfg.WM, WN=cfg.WN, WK=cfg.WK,
+            kStages=cfg.kStages,
         )
         key = compile_cfg.compile_name
         if key not in seen:
@@ -98,40 +140,68 @@ def get_unique_compile_configs(configs: List[TileConfig]) -> Dict[str, TileConfi
 # GEMM tile configurations (SM80+ TensorOp 16x8x16)
 # =============================================================================
 
-GEMM_DEFAULT = TileConfig(
-    tile_m=128, tile_n=128, tile_k=32, warp_m=64, warp_n=64, warp_k=32, stages=2
-)
 
-GEMM_TILE_CONFIGS: List[TileConfig] = [
+CUTLASS_GEMM_CONFIGS: List[CutlassGemmConfig] = [
     # Default (matches ArchTraits<80>)
-    GEMM_DEFAULT,
-    # More pipeline stages
-    TileConfig(tile_m=128, tile_n=128, tile_k=32, warp_m=64, warp_n=64, warp_k=32, stages=3),
-    TileConfig(tile_m=128, tile_n=128, tile_k=32, warp_m=64, warp_n=64, warp_k=32, stages=4),
-    # Larger tiles — good for large M, N
-    TileConfig(tile_m=256, tile_n=128, tile_k=32, warp_m=64, warp_n=64, warp_k=32, stages=3),
-    TileConfig(tile_m=128, tile_n=256, tile_k=32, warp_m=64, warp_n=64, warp_k=32, stages=3),
-    # Smaller tiles — good for small M or N
-    TileConfig(tile_m=64, tile_n=64, tile_k=32, warp_m=32, warp_n=32, warp_k=32, stages=4),
-    TileConfig(tile_m=128, tile_n=64, tile_k=32, warp_m=64, warp_n=32, warp_k=32, stages=3),
-    TileConfig(tile_m=64, tile_n=128, tile_k=32, warp_m=32, warp_n=64, warp_k=32, stages=3),
-    # Larger K tile — good for K-bound problems
-    TileConfig(tile_m=128, tile_n=128, tile_k=64, warp_m=64, warp_n=64, warp_k=64, stages=3),
-    # Split-K variants (runtime param, same compiled variant as default)
-    TileConfig(tile_m=128, tile_n=128, tile_k=32, warp_m=64, warp_n=64, warp_k=32, stages=2,
-               split_k=2),
-    TileConfig(tile_m=128, tile_n=128, tile_k=32, warp_m=64, warp_n=64, warp_k=32, stages=2,
-               split_k=4),
+    CutlassGemmConfig(BM=16, BN=128, BK=64, WM=16, WN=32,
+                      WK=64, kStages=3),
+    CutlassGemmConfig(BM=32, BN=128, BK=64, WM=32, WN=32,
+                      WK=64, kStages=3),
+    CutlassGemmConfig(BM=64, BN=128, BK=64, WM=32, WN=64,
+                      WK=64, kStages=3),
+    CutlassGemmConfig(BM=64, BN=64, BK=128, WM=32, WN=64,
+                      WK=64, kStages=3),
+    CutlassGemmConfig(BM=64, BN=128, BK=64, WM=64, WN=32,
+                      WK=64, kStages=3),
+    CutlassGemmConfig(BM=128, BN=64, BK=64, WM=64, WN=32,
+                      WK=64, kStages=3),
+    CutlassGemmConfig(BM=128, BN=128, BK=64, WM=64, WN=32,
+                      WK=64, kStages=3),
+    CutlassGemmConfig(BM=128, BN=128, BK=64, WM=64, WN=64,
+                      WK=64, kStages=3),
+    CutlassGemmConfig(BM=128, BN=128, BK=64, WM=128, WN=32,
+                      WK=64, kStages=3),
+    CutlassGemmConfig(BM=128, BN=256, BK=64, WM=64, WN=64,
+                      WK=64, kStages=3),
+    CutlassGemmConfig(BM=256, BN=128, BK=64, WM=64, WN=64,
+                      WK=64, kStages=3),
+    CutlassGemmConfig(BM=128, BN=64, BK=128, WM=64, WN=32,
+                      WK=128, kStages=3),
+    CutlassGemmConfig(BM=16, BN=256, BK=64, WM=16, WN=64,
+                      WK=64, kStages=3),
+    CutlassGemmConfig(BM=16, BN=256, BK=128, WM=16, WN=64,
+                      WK=128, kStages=3),
+]
+
+CUTLASS_GEMM_CONFIGS_SM90: List[CutlassGemmConfigSm90] = [
+     TileShape_64x16x128,
+    TileShape_64x32x128,
+    TileShape_64x64x128,
+    TileShape_64x128x128,
+    TileShape_64x256x128,
+    TileShape_64x512x128,
+    TileShape_128x16x128,
+    TileShape_128x32x128,
+    TileShape_128x64x128,
+    TileShape_128x128x128,
+    TileShape_128x256x128,
+    // SM103
+    TileShape_128x128x768,
+    TileShape_128x192x768,
+    TileShape_128x256x768
+    
+    CutlassGemmConfigSm90(BM=64, BN=16, BK=128, CM=1, CN=1, CK=1, kSMs=1, kStages=3),
+
 ]
 
 # BMM tile configurations (shares GEMM configs, no split-K)
-BMM_TILE_CONFIGS: List[TileConfig] = [
-    cfg for cfg in GEMM_TILE_CONFIGS if cfg.split_k == 1
+BMM_TILE_CONFIGS: List[CutlassGemmConfig] = [
+    cfg for cfg in CUTLASS_GEMM_CONFIGS if cfg.split_k == 1
 ]
 
 # Grouped GEMM tile configurations (SM80+ only, no split-K)
-GROUP_GEMM_TILE_CONFIGS: List[TileConfig] = [
-    cfg for cfg in GEMM_TILE_CONFIGS if cfg.split_k == 1
+GROUP_GEMM_TILE_CONFIGS: List[CutlassGemmConfig] = [
+    cfg for cfg in CUTLASS_GEMM_CONFIGS if cfg.split_k == 1
 ]
 
 
@@ -143,7 +213,7 @@ GROUP_GEMM_TILE_CONFIGS: List[TileConfig] = [
 def _render_all_variants(
     template_name: str,
     family: str,
-    configs: List[TileConfig],
+    configs: List[CutlassGemmConfig],
     *,
     with_activation: bool = False,
 ) -> List:
@@ -208,7 +278,7 @@ def gen_gemm_module() -> JitSpec:
     source_paths = _render_all_variants(
         "gemm_cutlass_template.cu.jinja",
         "gemm",
-        GEMM_TILE_CONFIGS,
+        CUTLASS_GEMM_CONFIGS,
         with_activation=True,
     )
     return gen_jit_spec("gemm", source_paths)
@@ -245,21 +315,21 @@ def gen_group_gemm_module() -> JitSpec:
 # =============================================================================
 
 
-def gemm_func_name(cfg: TileConfig) -> str:
+def gemm_func_name(cfg: CutlassGemmConfig) -> str:
     """Return the TVM-FFI export name for a GEMM variant."""
     return f"gemm_{cfg.compile_name}"
 
 
-def gemm_activation_func_name(cfg: TileConfig) -> str:
+def gemm_activation_func_name(cfg: CutlassGemmConfig) -> str:
     """Return the TVM-FFI export name for a GEMM+activation variant."""
     return f"gemm_{cfg.compile_name}_activation"
 
 
-def bmm_func_name(cfg: TileConfig) -> str:
+def bmm_func_name(cfg: CutlassGemmConfig) -> str:
     """Return the TVM-FFI export name for a BMM variant."""
     return f"bmm_{cfg.compile_name}"
 
 
-def group_gemm_func_name(cfg: TileConfig) -> str:
+def group_gemm_func_name(cfg: CutlassGemmConfig) -> str:
     """Return the TVM-FFI export name for a grouped GEMM variant."""
     return f"group_gemm_{cfg.compile_name}"
