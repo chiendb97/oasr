@@ -11,10 +11,10 @@ Usage:
 
   # Select backends to compare
   python benchmarks/oasr_benchmark.py --routine norm --subroutine layer_norm \\
-      --backends oasr pytorch --batch 64 --seq 250 --hidden 512
+      --backends cuda torch --batch 64 --seq 250 --hidden 512
 
   # Correctness check
-  python benchmarks/oasr_benchmark.py --routine gemm --backends oasr pytorch --refcheck
+  python benchmarks/oasr_benchmark.py --routine gemm --backends cutlass torch --refcheck
 
   # Export to CSV
   python benchmarks/oasr_benchmark.py --routine norm --output_path results.csv
@@ -22,8 +22,9 @@ Usage:
   # Batch test from testlist
   python benchmarks/oasr_benchmark.py --testlist benchmarks/testlists/conformer_base.txt
 
-  # Profiling mode (for Nsight Compute)
-  python benchmarks/oasr_benchmark.py --routine gemm --profile --dry_run_iters 0
+  # Profiling mode (NVTX markers, run under ncu manually)
+  python benchmarks/oasr_benchmark.py --routine gemm --subroutine gemm \\
+      --M 200 --N 200 --K 64 --backends cutlass --profile --dry_run_iters 0
 
   # Verbose output
   python benchmarks/oasr_benchmark.py --routine gemm -vv
@@ -77,8 +78,9 @@ def _build_global_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backends",
         nargs="+",
-        default=["oasr", "pytorch"],
-        help="Backend(s) to benchmark (default: oasr pytorch)",
+        default=None,
+        help="Backend(s) to benchmark. Per-family defaults: gemm/conv2d → cutlass torch; "
+             "norm/conv1d/activation/composite → cuda torch",
     )
     parser.add_argument(
         "--dtype",
@@ -267,28 +269,21 @@ def _run_profile_mode(routine_mod, args: argparse.Namespace) -> None:
 
     subroutine = args.subroutine
     warmup = args.dry_run_iters
-    backends = args.backends
+    dtype = parse_dtype(args.dtype)
 
-    if hasattr(routine_mod, "PROFILE_CONFIGS") and subroutine in routine_mod.PROFILE_CONFIGS:
-        cfg_tuple = routine_mod.PROFILE_CONFIGS[subroutine]
-        setup_fn_name = f"setup_{subroutine}"
-        if hasattr(routine_mod, setup_fn_name):
-            setup_fn = getattr(routine_mod, setup_fn_name)
-            oasr_fn, pytorch_fn = setup_fn(*cfg_tuple)
+    configs = routine_mod._resolve_configs(args, subroutine)
+    cfg = configs[0]
+    oasr_fn, pytorch_fn = routine_mod._setup_for_config(subroutine, cfg, dtype)
+    fn_map = routine_mod.get_fn_map(subroutine, oasr_fn, pytorch_fn)
+    backends = args.backends or list(fn_map.keys())
 
-            print(f"[INFO] Profiling: {args.routine}/{subroutine}")
-            print(f"[INFO] Config: {cfg_tuple}")
-
-            if "oasr" in backends:
-                print("[INFO] Running OASR kernel...")
-                profile_kernel(f"oasr_{subroutine}", oasr_fn, warmup=warmup)
-            if "pytorch" in backends:
-                print("[INFO] Running PyTorch kernel...")
-                profile_kernel(f"pytorch_{subroutine}", pytorch_fn, warmup=warmup)
-            print("[INFO] Profiling done.")
-            return
-
-    print(f"[WARNING] No profile config found for {args.routine}/{subroutine}")
+    print(f"[INFO] Profiling: {args.routine}/{subroutine}  config={cfg}")
+    for name, fn in fn_map.items():
+        if name not in backends:
+            continue
+        print(f"[INFO] Running {name}...")
+        profile_kernel(f"{name}_{subroutine}", fn, warmup=warmup)
+    print("[INFO] Profiling done.")
 
 
 # ---------------------------------------------------------------------------

@@ -47,40 +47,40 @@ A test case is generally invoked as `python benchmarks/oasr_benchmark.py --routi
 ```bash
 # GEMM
 $ python benchmarks/oasr_benchmark.py --routine gemm --subroutine bmm \
-    --backends oasr pytorch --batch-count 256 --M 200 --N 200 --K 64 \
+    --backends cutlass torch --batch-count 256 --M 200 --N 200 --K 64 \
     --dtype float16 --refcheck -vv --generate_repro_command
 
 [INFO] gemm/bmm
 [VVERBOSE] gpu_name = 'NVIDIA_A100_80GB_PCIe'
-[REPRO] python benchmarks/oasr_benchmark.py --routine gemm --subroutine bmm --backends oasr pytorch --dtype float16 --num_iters 30 --dry_run_iters 5 --refcheck --batch-count 256 --M 200 --N 200 --K 64
-[PERF] oasr         :: median time 0.145 ms; std 0.002 ms; achieved tflops 125.3 TFLOPs/sec
-[PERF] pytorch      :: median time 0.168 ms; std 0.003 ms; achieved tflops 108.1 TFLOPs/sec
+[REPRO] python benchmarks/oasr_benchmark.py --routine gemm --subroutine bmm --backends cutlass torch --dtype float16 --num_iters 30 --dry_run_iters 5 --refcheck --batch-count 256 --M 200 --N 200 --K 64
+[PERF] cutlass      :: median time 0.145 ms; std 0.002 ms; achieved tflops 125.3 TFLOPs/sec
+[PERF] torch        :: median time 0.168 ms; std 0.003 ms; achieved tflops 108.1 TFLOPs/sec
 
 # LayerNorm
 $ python benchmarks/oasr_benchmark.py --routine norm --subroutine layer_norm \
-    --backends oasr pytorch --batch 64 --seq 250 --hidden 512 --refcheck -vv
+    --backends cuda torch --batch 64 --seq 250 --hidden 512 --refcheck -vv
 
 [INFO] norm/layer_norm
-[PERF] oasr         :: median time 0.023 ms; std 0.001 ms; achieved tb_per_sec 2.87 TB/sec
-[PERF] pytorch      :: median time 0.031 ms; std 0.001 ms; achieved tb_per_sec 2.13 TB/sec
+[PERF] cuda         :: median time 0.023 ms; std 0.001 ms; achieved tb_per_sec 2.87 TB/sec
+[PERF] torch        :: median time 0.031 ms; std 0.001 ms; achieved tb_per_sec 2.13 TB/sec
 
 # Depthwise Conv1D
 $ python benchmarks/oasr_benchmark.py --routine conv --subroutine depthwise_conv1d \
-    --backends oasr pytorch --batch 64 --seq 250 --channels 256 --kernel-size 15 \
+    --backends cuda torch --batch 64 --seq 250 --channels 256 --kernel-size 15 \
     --refcheck -vv
 
 [INFO] conv/depthwise_conv1d
-[PERF] oasr         :: median time 0.018 ms; std 0.001 ms
-[PERF] pytorch      :: median time 0.025 ms; std 0.001 ms
+[PERF] cuda         :: median time 0.018 ms; std 0.001 ms
+[PERF] torch        :: median time 0.025 ms; std 0.001 ms
 
 # End-to-end Conformer conv block
 $ python benchmarks/oasr_benchmark.py --routine composite --subroutine conv_block \
-    --backends oasr pytorch --batch 64 --seq 250 --d-model 256 --kernel-size 15 \
+    --backends cuda torch --batch 64 --seq 250 --d-model 256 --kernel-size 15 \
     --refcheck -vv
 
 [INFO] composite/conv_block
-[PERF] oasr         :: median time 0.089 ms; std 0.002 ms
-[PERF] pytorch      :: median time 0.142 ms; std 0.003 ms
+[PERF] cuda         :: median time 0.089 ms; std 0.002 ms
+[PERF] torch        :: median time 0.142 ms; std 0.003 ms
 ```
 
 ### List Available Routines
@@ -146,7 +146,7 @@ The output CSV contains:
 |------|-------------|---------|
 | `--routine` | Kernel routine family (gemm, norm, conv, activation, composite) | required |
 | `--subroutine` | Specific kernel within the routine (e.g. bmm, layer_norm) | first available |
-| `--backends` | Backend(s) to benchmark (space-separated) | oasr pytorch |
+| `--backends` | Backend(s) to benchmark (space-separated). Per-family defaults: gemm/conv2d → `cutlass torch`; norm/conv1d/activation/composite → `cuda torch` | (auto) |
 | `--dtype` | Data type (float16, bfloat16, float32) | float16 |
 | `--num_iters` | Number of iterations for performance measurement | 30 |
 | `--dry_run_iters` | Number of warmup iterations | 5 |
@@ -155,7 +155,7 @@ The output CSV contains:
 | `--use_cuda_events` | Force CUDA events timing (skip Triton do_bench) | False |
 | `--output_path` | Path to save CSV results | None |
 | `--testlist` | Path to a file containing a list of test cases | None |
-| `--profile` | Run in profiling mode (Nsight Compute / NVTX) | False |
+| `--profile` | Run in profiling mode (NVTX markers for Nsight Compute) | False |
 | `-v`, `-vv` | Increase verbosity (can be used multiple times) | 0 |
 | `--case_tag` | Optional tag for annotating results in the output CSV | None |
 | `--generate_repro_command` | Print a reproducer command for each test case | False |
@@ -229,21 +229,20 @@ The framework automatically selects the best available method.
 
 ## Routine & Backend Support Matrix
 
-All OASR kernels support two backends: `oasr` (CUDA/CUTLASS kernels via TVM-FFI JIT) and `pytorch` (standard PyTorch operations).
-
-| Routine | Subroutines | Backend | Metric | SM 7.0+ | SM 8.0+ |
-|---------|-------------|---------|--------|---------|---------|
-| **gemm** | gemm, bmm, group_gemm, gemm_activation | oasr, pytorch | TFLOPS | yes | yes |
-| **norm** | layer_norm, add_layer_norm, layer_norm_activation, rms_norm, batch_norm, batch_norm_swish, batch_norm_activation, group_norm | oasr, pytorch | TB/sec | yes | yes |
-| **conv** | depthwise_conv1d, depthwise_conv1d_causal | oasr, pytorch | time | yes | yes |
-| **conv** | pointwise_conv1d, pointwise_conv1d_activation | oasr, pytorch | TFLOPS | yes | yes |
-| **conv** | conv2d, conv2d_activation | oasr, pytorch | TFLOPS | yes | yes |
-| **activation** | glu, swish | oasr, pytorch | TB/sec | yes | yes |
-| **composite** | conv_block | oasr, pytorch | time | yes | yes |
+| Routine | Subroutines | Backends | Metric | SM 7.0+ | SM 8.0+ |
+|---------|-------------|----------|--------|---------|---------|
+| **gemm** | gemm, bmm, group_gemm, gemm_activation | `cutlass`, `torch` | TFLOPS | yes | yes |
+| **norm** | layer_norm, add_layer_norm, layer_norm_activation, rms_norm, batch_norm, batch_norm_swish, batch_norm_activation, group_norm | `cuda`, `torch` | TB/sec | yes | yes |
+| **conv** | depthwise_conv1d, depthwise_conv1d_causal | `cuda`, `torch` | time | yes | yes |
+| **conv** | pointwise_conv1d, pointwise_conv1d_activation | `cuda`, `torch` | TFLOPS | yes | yes |
+| **conv** | conv2d, conv2d_activation | `cutlass`, `torch` | TFLOPS | yes | yes |
+| **activation** | glu, swish | `cuda`, `torch` | TB/sec | yes | yes |
+| **composite** | conv_block | `cuda`, `torch` | time | yes | yes |
 
 Backend legend:
-- **oasr**: OASR CUDA/CUTLASS kernels, JIT-compiled via TVM-FFI. Operates on NLC (1D) or NHWC (2D) layouts.
-- **pytorch**: Standard PyTorch operations (F.linear, F.conv1d, F.conv2d, LayerNorm, etc.). Used as the reference baseline.
+- **cutlass**: CUTLASS-based OASR kernels (GEMM, Conv2D), JIT-compiled via TVM-FFI.
+- **cuda**: Handwritten CUDA OASR kernels (Norm, Conv1D, Activation), JIT-compiled via TVM-FFI.
+- **torch**: Standard PyTorch operations used as the reference baseline.
 
 ## Testlist Files
 
@@ -280,19 +279,38 @@ One representative configuration per subroutine across all kernel families.
 
 ## Profiling
 
-Use `--profile` mode for integration with Nsight Compute:
+Use `--profile` with `--dry_run_iters 0` to run a single kernel iteration wrapped in NVTX markers, then invoke `ncu` or `nsys` around the script:
+
+### Nsight Compute (ncu)
 
 ```bash
-# Profile with NVTX markers
-ncu --set full -o gemm_profile python benchmarks/oasr_benchmark.py \
-    --routine gemm --subroutine gemm --profile --dry_run_iters 0
+# GEMM — generates gemm_profile.ncu-rep
+ncu --set full -o gemm_profile \
+    python benchmarks/oasr_benchmark.py \
+    --routine gemm --subroutine gemm \
+    --M 200 --N 200 --K 64 --backends cutlass \
+    --profile --dry_run_iters 0
 
-# Profile with nsys
-nsys profile python benchmarks/oasr_benchmark.py \
-    --routine conv --subroutine depthwise_conv1d --profile --dry_run_iters 0
+# LayerNorm
+ncu --set full -o layer_norm_profile \
+    python benchmarks/oasr_benchmark.py \
+    --routine norm --subroutine layer_norm \
+    --batch 64 --seq 250 --hidden 512 --backends cuda \
+    --profile --dry_run_iters 0
 ```
 
-Profiling mode runs a single iteration with NVTX range markers, making it easy to isolate the kernel of interest in the profiler output.
+Open the generated `.ncu-rep` file in the Nsight Compute UI to inspect kernel metrics.
+
+### Nsight Systems (nsys)
+
+```bash
+nsys profile python benchmarks/oasr_benchmark.py \
+    --routine conv --subroutine depthwise_conv1d \
+    --batch 64 --seq 250 --channels 256 --kernel-size 15 \
+    --profile --dry_run_iters 0
+```
+
+Profiling mode runs a single iteration with NVTX range markers (named `<backend>_<subroutine>`), making it easy to isolate the kernel of interest in the profiler output. Problem size is controlled by the same flags used for regular benchmarking (`--batch`, `--seq`, `--hidden`, `--M`, `--N`, `--K`, etc.).
 
 ## Legacy Standalone Scripts
 
@@ -353,7 +371,7 @@ When `--output_path` is specified, results are written as CSV with the following
 |--------|-------------|
 | `routine` | Kernel routine family (e.g. `gemm`, `norm`, `conv`) |
 | `subroutine` | Specific kernel (e.g. `bmm`, `layer_norm`, `depthwise_conv1d`) |
-| `backend` | Backend used (`oasr` or `pytorch`) |
+| `backend` | Backend used (e.g. `cutlass`, `cuda`, `torch`) |
 | `shape` | Shape string describing the test configuration (e.g. `B=256_M=200_N=200_K=64`) |
 | `dtype` | Data type used (e.g. `float16`, `bfloat16`, `float32`) |
 | `median_ms` | Median kernel execution time in milliseconds |
@@ -377,7 +395,7 @@ pivot = df.pivot_table(
     columns="backend",
     values="median_ms",
 )
-pivot["speedup"] = pivot["pytorch"] / pivot["oasr"]
+pivot["speedup"] = pivot["torch"] / pivot["cutlass"]  # or "cuda" for norm/conv1d
 print(pivot.sort_values("speedup", ascending=False))
 ```
 
@@ -436,9 +454,11 @@ from benchmarks.routines.bench_utils import (
 def run_test(args, output: OutputWriter):
     dtype = parse_dtype(args.dtype)
     # ... set up tensors and kernels ...
+    fn_map = get_fn_map(args.subroutine, oasr_fn, pytorch_fn)
+    backends = args.backends or list(fn_map.keys())
 
-    for backend in args.backends:
-        fn = oasr_fn if backend == "oasr" else pytorch_fn
+    for backend in backends:
+        fn = fn_map[backend]
         median_ms, std_ms = bench_fn(
             fn,
             dry_run_iters=args.dry_run_iters,

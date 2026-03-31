@@ -104,7 +104,6 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     from benchmarks.routines.bench_utils import parse_dtype
 
     dtype = parse_dtype(dtype_str)
-    backends = getattr(args, "backends", ["oasr", "pytorch"])
     do_check = getattr(args, "refcheck", False)
     allow_mismatch = getattr(args, "allow_output_mismatch", False)
     dry_run_iters = getattr(args, "dry_run_iters", 5)
@@ -117,11 +116,12 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
         oasr_fn, pytorch_fn = setup_conv_block(
             cfg["batch"], cfg["seq"], cfg["d_model"], cfg["kernel_size"], dtype
         )
-        fn_map = {"oasr": oasr_fn, "pytorch": pytorch_fn}
+        fn_map = {"cuda": oasr_fn, "torch": pytorch_fn}
+        backends = getattr(args, "backends", None) or list(fn_map.keys())
 
         shape_str = f"[{cfg['batch']}, {cfg['seq']}, {cfg['d_model']}] k={cfg['kernel_size']}"
 
-        if do_check and "oasr" in backends and "pytorch" in backends:
+        if do_check and "torch" in backends and any(b in fn_map and b != "torch" for b in backends):
             oasr_out = oasr_fn()
             pytorch_out = pytorch_fn()
             passed, max_diff = check_close(oasr_out, pytorch_out)
@@ -182,7 +182,7 @@ def run_standalone() -> None:
                 cfg["batch"], cfg["seq"], cfg["d_model"], cfg["kernel_size"]
             )
             shape_str = f"[{cfg['batch']}, {cfg['seq']}, {cfg['d_model']}] k={cfg['kernel_size']}"
-            for backend, fn in [("oasr", oasr_fn), ("pytorch", pytorch_fn)]:
+            for backend, fn in [("cuda", oasr_fn), ("torch", pytorch_fn)]:
                 median_ms, std_ms = bench_fn(fn)
                 output.write_result(BenchResult(
                     routine="composite", subroutine="conv_block", backend=backend,

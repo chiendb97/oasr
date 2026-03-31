@@ -177,7 +177,7 @@ def get_device_info() -> dict[str, Any]:
     return {
         "name": props.name,
         "sm": f"{props.major}.{props.minor}",
-        "memory_gb": round(props.total_mem / 1e9, 1),
+        "memory_gb": round(props.total_memory / 1e9, 1),
     }
 
 
@@ -192,7 +192,7 @@ class BenchResult:
 
     routine: str
     subroutine: str
-    backend: str  # "oasr" or "pytorch"
+    backend: str  # e.g. "cutlass", "cuda", "torch"
     shape: str
     dtype: str
     median_ms: float
