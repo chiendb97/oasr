@@ -11,15 +11,22 @@ cuDNN backends are also registered as additional candidates.
 
 import functools
 import logging
+from typing import Union
 
 from oasr.tune.autotuner import BackendEntry, _global_registry, OpKey, Tactic
-from oasr.jit.gemm import TileConfig
 from oasr.jit.conv import (
+    CutlassConv2dConfig,
+    CutlassConv2dConfigSm90,
     CONV2D_DEFAULT,
+    CONV2D_DEFAULT_SM90,
     CONV2D_TILE_CONFIGS,
+    CONV2D_TILE_CONFIGS_SM90,
+    CONV2D_CLUSTER_CONFIGS_SM90,
     conv2d_func_name,
     conv2d_activation_func_name,
+    _get_unique_conv2d_compile_configs,
 )
+from oasr.jit.core import _get_target_sm
 
 logger = logging.getLogger("oasr.tune")
 
@@ -58,7 +65,7 @@ def _get_conv2d_module():
 # CUTLASS tile-variant runner factories
 # ---------------------------------------------------------------------------
 
-def _make_conv2d_runner(cfg: TileConfig):
+def _make_conv2d_runner(cfg: Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]):
     """Create a CUTLASS Conv2D runner for a specific variant."""
     fn_name = conv2d_func_name(cfg)
 
@@ -69,7 +76,7 @@ def _make_conv2d_runner(cfg: TileConfig):
     return runner
 
 
-def _make_conv2d_activation_runner(cfg: TileConfig):
+def _make_conv2d_activation_runner(cfg: Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]):
     """Create a CUTLASS Conv2D+activation runner for a specific variant."""
     fn_name = conv2d_activation_func_name(cfg)
 
@@ -84,12 +91,13 @@ def _make_conv2d_activation_runner(cfg: TileConfig):
 # Registration: CUTLASS tile variants for conv2d and conv2d_activation
 # ---------------------------------------------------------------------------
 
-for _cfg in CONV2D_TILE_CONFIGS:
+_sm = _get_target_sm()
+_all_configs = _get_unique_conv2d_compile_configs(_sm)
+_default_cfg = CONV2D_DEFAULT_SM90 if _sm >= 90 else CONV2D_DEFAULT
+
+for _cfg in _all_configs.values():
     _tactic = Tactic("cutlass", config=_cfg.to_tactic_config())
-    _is_default = (_cfg.tile_m == CONV2D_DEFAULT.tile_m
-                   and _cfg.tile_n == CONV2D_DEFAULT.tile_n
-                   and _cfg.tile_k == CONV2D_DEFAULT.tile_k
-                   and _cfg.stages == CONV2D_DEFAULT.stages)
+    _is_default = (_cfg.compile_name == _default_cfg.compile_name)
 
     _global_registry.register(
         OpKey("conv", "conv2d"),

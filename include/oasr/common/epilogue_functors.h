@@ -20,38 +20,92 @@
 #include <cutlass/epilogue/thread/scale_type.h>
 #include <cutlass/numeric_types.h>
 
+// CUTLASS 3.x fusion operations
+#include <cutlass/epilogue/fusion/operations.hpp>
+
 #ifdef __GNUC__
     #pragma GCC diagnostic pop
 #endif
 
+#include <oasr/common/types.h>
+
 namespace oasr {
 
-template <int Alignment, typename ElementCD, typename ElementCompute>
-struct EpilogueIdentity {
-    using Op = cutlass::epilogue::thread::LinearCombination<
-        ElementCD, Alignment, ElementCompute, ElementCompute,
+//==============================================================================
+// FusionEpilogueOp -- maps OASR EpilogueFunctor to CUTLASS 2.x fusion operation
+//==============================================================================
+template <ActivationType fusion_op, int Alignment, typename ElementD, typename ElementCompute,
+          typename ElementC = ElementD>
+struct FusionEpilogueOp {
+    using type =
+        cutlass::epilogue::thread::LinearCombination<ElementD, Alignment, ElementCompute,
+                                                     ElementCompute,
+                                                     cutlass::epilogue::thread::ScaleType::Default>;
+};
+
+template <int Alignment, typename ElementD, typename ElementCompute, typename ElementC>
+struct FusionEpilogueOp<ActivationType::IDENTITY, Alignment, ElementD, ElementCompute, ElementC> {
+    using type =
+        cutlass::epilogue::thread::LinearCombination<ElementD, Alignment, ElementCompute,
+                                                     ElementCompute,
+                                                     cutlass::epilogue::thread::ScaleType::Default>;
+};
+
+template <int Alignment, typename ElementD, typename ElementCompute, typename ElementC>
+struct FusionEpilogueOp<ActivationType::RELU, Alignment, ElementD, ElementCompute, ElementC> {
+    using type = cutlass::epilogue::thread::LinearCombinationRelu<
+        ElementD, Alignment, ElementCompute, ElementCompute,
         cutlass::epilogue::thread::ScaleType::Default>;
 };
 
-template <int Alignment, typename ElementCD, typename ElementCompute>
-struct EpilogueRelu {
-    using Op = cutlass::epilogue::thread::LinearCombinationRelu<
-        ElementCD, Alignment, ElementCompute, ElementCompute,
+template <int Alignment, typename ElementD, typename ElementCompute, typename ElementC>
+struct FusionEpilogueOp<ActivationType::GELU, Alignment, ElementD, ElementCompute, ElementC> {
+    using type = cutlass::epilogue::thread::LinearCombinationGELU<
+        ElementD, Alignment, ElementCompute, ElementCompute,
         cutlass::epilogue::thread::ScaleType::Default>;
 };
 
-template <int Alignment, typename ElementCD, typename ElementCompute>
-struct EpilogueGelu {
-    using Op = cutlass::epilogue::thread::LinearCombinationGELU<
-        ElementCD, Alignment, ElementCompute, ElementCompute,
+template <int Alignment, typename ElementD, typename ElementCompute, typename ElementC>
+struct FusionEpilogueOp<ActivationType::SWISH, Alignment, ElementD, ElementCompute, ElementC> {
+    using type = cutlass::epilogue::thread::LinearCombinationSilu<
+        ElementD, Alignment, ElementCompute, ElementCompute,
         cutlass::epilogue::thread::ScaleType::Default>;
 };
 
-template <int Alignment, typename ElementCD, typename ElementCompute>
-struct EpilogueSwish {
-    using Op = cutlass::epilogue::thread::LinearCombinationSilu<
-        ElementCD, Alignment, ElementCompute, ElementCompute,
-        cutlass::epilogue::thread::ScaleType::Default>;
+//==============================================================================
+// FusionEpilogueOpSm90 -- maps OASR EpilogueFunctor to CUTLASS 3.x fusion operation
+//==============================================================================
+
+template <ActivationType fusion_op, typename ElementD, typename ElementCompute,
+          typename ElementC = ElementD>
+struct FusionEpilogueOpSm90 {
+    // Default: identity (linear combination)
+    using type = cutlass::epilogue::fusion::LinearCombination<ElementD, ElementCompute, ElementC,
+                                                              ElementCompute>;
+};
+
+template <typename ElementD, typename ElementCompute, typename ElementC>
+struct FusionEpilogueOpSm90<oasr::ActivationType::IDENTITY, ElementD, ElementCompute, ElementC> {
+    using type = cutlass::epilogue::fusion::LinearCombination<ElementD, ElementCompute, ElementC,
+                                                              ElementCompute>;
+};
+
+template <typename ElementD, typename ElementCompute, typename ElementC>
+struct FusionEpilogueOpSm90<oasr::ActivationType::RELU, ElementD, ElementCompute, ElementC> {
+    using type = cutlass::epilogue::fusion::LinCombEltAct<cutlass::epilogue::thread::ReLu, ElementD,
+                                                          ElementCompute, ElementC, ElementCompute>;
+};
+
+template <typename ElementD, typename ElementCompute, typename ElementC>
+struct FusionEpilogueOpSm90<oasr::ActivationType::GELU, ElementD, ElementCompute, ElementC> {
+    using type = cutlass::epilogue::fusion::LinCombEltAct<cutlass::epilogue::thread::GELU, ElementD,
+                                                          ElementCompute, ElementC, ElementCompute>;
+};
+
+template <typename ElementD, typename ElementCompute, typename ElementC>
+struct FusionEpilogueOpSm90<oasr::ActivationType::SWISH, ElementD, ElementCompute, ElementC> {
+    using type = cutlass::epilogue::fusion::LinCombEltAct<cutlass::epilogue::thread::SiLu, ElementD,
+                                                          ElementCompute, ElementC, ElementCompute>;
 };
 
 }  // namespace oasr
