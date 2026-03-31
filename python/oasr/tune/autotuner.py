@@ -1021,8 +1021,18 @@ def _ensure_backends_registered() -> None:
 
 
 def is_tuning_enabled() -> bool:
-    """Return ``True`` if autotuning dispatch is active."""
-    return _enabled
+    """Return ``True`` if autotuning dispatch is active.
+
+    Returns True when either:
+    - ``enable_autotune()`` has been called (``_enabled`` flag), or
+    - An ``autotune()`` context manager is active (``tuner.is_tuning_mode``).
+    """
+    if _enabled:
+        return True
+    # Check the singleton directly without creating it (avoid side effects
+    # on hot-path calls).
+    instance = AutoTuner._instance
+    return instance is not None and instance.is_tuning_mode
 
 
 def get_tuner() -> AutoTuner:
