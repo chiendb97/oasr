@@ -198,7 +198,6 @@ TileShapeConfigs: List[TileShape] = [
     TileShape(BM=16, BN=128, BK=64, WM=16, WN=32, WK=64),
     TileShape(BM=32, BN=128, BK=64, WM=32, WN=32, WK=64),
     TileShape(BM=64, BN=128, BK=64, WM=32, WN=64, WK=64),
-    TileShape(BM=64, BN=64, BK=128, WM=32, WN=64, WK=64),
     TileShape(BM=64, BN=128, BK=64, WM=64, WN=32, WK=64),
     TileShape(BM=128, BN=64, BK=64, WM=64, WN=32, WK=64),
     TileShape(BM=128, BN=128, BK=64, WM=64, WN=32, WK=64),
@@ -206,9 +205,7 @@ TileShapeConfigs: List[TileShape] = [
     TileShape(BM=128, BN=128, BK=64, WM=128, WN=32, WK=64),
     TileShape(BM=128, BN=256, BK=64, WM=64, WN=64, WK=64),
     TileShape(BM=256, BN=128, BK=64, WM=64, WN=64, WK=64),
-    TileShape(BM=128, BN=64, BK=128, WM=64, WN=32, WK=128),
     TileShape(BM=16, BN=256, BK=64, WM=16, WN=64, WK=64),
-    TileShape(BM=16, BN=256, BK=128, WM=16, WN=64, WK=128),
 ]
 
 TileShapeConfigsSm90: List[TileShapeSm90] = [

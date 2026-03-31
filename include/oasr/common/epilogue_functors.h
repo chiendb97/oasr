@@ -38,35 +38,37 @@ template <ActivationType fusion_op, int Alignment, typename ElementD, typename E
           typename ElementC = ElementD>
 struct FusionEpilogueOp {
     using type =
-        cutlass::epilogue::thread::LinearCombination<ElementD, Alignment, ElementC, ElementCompute,
+        cutlass::epilogue::thread::LinearCombination<ElementD, Alignment, ElementCompute,
+                                                     ElementCompute,
                                                      cutlass::epilogue::thread::ScaleType::Default>;
 };
 
 template <int Alignment, typename ElementD, typename ElementCompute, typename ElementC>
 struct FusionEpilogueOp<ActivationType::IDENTITY, Alignment, ElementD, ElementCompute, ElementC> {
     using type =
-        cutlass::epilogue::thread::LinearCombination<ElementD, Alignment, ElementC, ElementCompute,
+        cutlass::epilogue::thread::LinearCombination<ElementD, Alignment, ElementCompute,
+                                                     ElementCompute,
                                                      cutlass::epilogue::thread::ScaleType::Default>;
 };
 
 template <int Alignment, typename ElementD, typename ElementCompute, typename ElementC>
 struct FusionEpilogueOp<ActivationType::RELU, Alignment, ElementD, ElementCompute, ElementC> {
     using type = cutlass::epilogue::thread::LinearCombinationRelu<
-        ElementD, Alignment, ElementC, ElementCompute,
+        ElementD, Alignment, ElementCompute, ElementCompute,
         cutlass::epilogue::thread::ScaleType::Default>;
 };
 
 template <int Alignment, typename ElementD, typename ElementCompute, typename ElementC>
 struct FusionEpilogueOp<ActivationType::GELU, Alignment, ElementD, ElementCompute, ElementC> {
     using type = cutlass::epilogue::thread::LinearCombinationGELU<
-        ElementD, Alignment, ElementC, ElementCompute,
+        ElementD, Alignment, ElementCompute, ElementCompute,
         cutlass::epilogue::thread::ScaleType::Default>;
 };
 
 template <int Alignment, typename ElementD, typename ElementCompute, typename ElementC>
 struct FusionEpilogueOp<ActivationType::SWISH, Alignment, ElementD, ElementCompute, ElementC> {
     using type = cutlass::epilogue::thread::LinearCombinationSilu<
-        ElementD, Alignment, ElementC, ElementCompute,
+        ElementD, Alignment, ElementCompute, ElementCompute,
         cutlass::epilogue::thread::ScaleType::Default>;
 };
 
