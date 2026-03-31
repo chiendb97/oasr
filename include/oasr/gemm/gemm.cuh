@@ -16,7 +16,9 @@
 #include "oasr/common/types.h"
 #include "oasr/gemm/cutlass_gemm_configs.h"
 #include "oasr/gemm/gemm_cutlass_template.h"
+#if !defined(OASR_TARGET_SM) || OASR_TARGET_SM >= 90
 #include "oasr/gemm/gemm_cutlass_template_sm90.h"
+#endif
 
 namespace oasr {
 namespace gemm {
@@ -45,6 +47,7 @@ static GemmStatus dispatchGemmWithSmVersion(const ElementA* A_ptr, const Element
     } else if constexpr (SM_VERSION == 89) {
         using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 89>;
         return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+#if !defined(OASR_TARGET_SM) || OASR_TARGET_SM >= 90
     } else if constexpr (SM_VERSION == 90) {
         using Config = CutlassGemmConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 90>;
         return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
@@ -54,8 +57,35 @@ static GemmStatus dispatchGemmWithSmVersion(const ElementA* A_ptr, const Element
     } else if constexpr (SM_VERSION == 120) {
         using Config = CutlassGemmConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 120>;
         return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+#endif
     } else {
         return GemmStatus::INVALID_ARGUMENT;
+    }
+}
+
+template <int SM_VERSION, typename ElementA, typename ElementB, typename ElementCD>
+static GemmStatus dispatchGemmActivation(const ElementA* A_ptr, const ElementB* B_ptr,
+                                         const ElementCD* C_ptr, ElementCD* D_ptr, int M, int N,
+                                         int K, uint64_t lda, uint64_t ldb, uint64_t ldc,
+                                         float alpha, ActivationType activation,
+                                         cudaStream_t stream, int split_k_slices) {
+    switch (activation) {
+        case ActivationType::RELU:
+            return dispatchGemmWithSmVersion<SM_VERSION, ElementA, ElementB, ElementCD,
+                                             ActivationType::RELU>(
+                A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+        case ActivationType::GELU:
+            return dispatchGemmWithSmVersion<SM_VERSION, ElementA, ElementB, ElementCD,
+                                             ActivationType::GELU>(
+                A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+        case ActivationType::SWISH:
+            return dispatchGemmWithSmVersion<SM_VERSION, ElementA, ElementB, ElementCD,
+                                             ActivationType::SWISH>(
+                A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+        default:
+            return dispatchGemmWithSmVersion<SM_VERSION, ElementA, ElementB, ElementCD,
+                                             ActivationType::IDENTITY>(
+                A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
     }
 }
 
@@ -138,17 +168,14 @@ cudaError_t GemmActivation(const ElementA* A, const ElementB* B, const ElementCD
 #ifdef OASR_TARGET_SM
     {
         constexpr int SM_VERSION = OASR_TARGET_SM;
-        status = detail::dispatchGemmWithSmVersion<SM_VERSION, ElementA, ElementB, ElementCD,
-                                                    activation>(
-                A, B, C, D, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
-        }
+        status = detail::dispatchGemmActivation<SM_VERSION, ElementA, ElementB, ElementCD>(
+            A, B, C, D, M, N, K, lda, ldb, ldc, alpha, activation, stream, split_k_slices);
     }
 #else
     int sm = oasr::getDeviceSmVersion();
     OASR_DISPATCH_SM(sm, SM_VERSION, {
-        status = detail::dispatchGemmWithSmVersion<SM_VERSION, ElementA, ElementB, ElementCD,
-                                                    activation>(
-                A, B, C, D, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+        status = detail::dispatchGemmActivation<SM_VERSION, ElementA, ElementB, ElementCD>(
+            A, B, C, D, M, N, K, lda, ldb, ldc, alpha, activation, stream, split_k_slices);
     });
 #endif
 
