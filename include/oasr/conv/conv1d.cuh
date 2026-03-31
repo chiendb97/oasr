@@ -9,8 +9,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
-
 #include <oasr/common/math.h>
 #include <oasr/common/types.h>
 #include <oasr/common/vec_dtypes.h>
@@ -22,50 +20,8 @@ namespace conv {
 // Depthwise 1D Convolution Kernel
 // =============================================================================
 
-template <typename T>
-__global__ void depthwiseConv1DKernel(const T* __restrict__ input,   // [batch, seq_len, channels]
-                                      const T* __restrict__ weight,  // [kernel_size, channels]
-                                      const T* __restrict__ bias,    // [channels] or nullptr
-                                      T* __restrict__ output,        // [batch, seq_len, channels]
-                                      int batch_size, int seq_len, int channels, int kernel_size,
-                                      int padding) {
-    int c_id = threadIdx.x;
-    int s_id = blockIdx.x;
-    int b_id = blockIdx.y;
-    int o_id = (blockIdx.y * gridDim.x + blockIdx.x) * channels + c_id;
-
-    int s_start = s_id - padding;
-    int s_end = min(s_start + kernel_size, seq_len);
-    s_start = max(s_start, 0);
-
-    int k_start = max(padding - s_id, 0);
-
-    input += b_id * seq_len * channels + c_id;
-    weight += c_id;
-
-    float val = 0.0f;
-    for (int i = s_start; i < s_end; i++) {
-        val += (float)input[i * channels] * (float)weight[(k_start + i - s_start) * channels];
-    }
-
-    if (bias != nullptr) {
-        val += (float)bias[c_id];
-    }
-
-    output[o_id] = (T)val;
-}
-
-// =============================================================================
-// Depthwise 1D Convolution Kernel (vectorized)
-// =============================================================================
-// Each thread processes VecSize channels using 128-bit vector loads/stores.
-// Requires channels % VecSize == 0.
-//
-// Grid:  (out_len, batch_size)
-// Block: (channels / VecSize)
-
 template <typename T, int VecSize>
-__global__ void depthwiseConv1DVecKernel(const T* __restrict__ input,  // [batch, seq_len, channels]
+__global__ void depthwiseConv1DKernel(const T* __restrict__ input,  // [batch, seq_len, channels]
                                          const T* __restrict__ weight,  // [kernel_size, channels]
                                          const T* __restrict__ bias,    // [channels] or nullptr
                                          T* __restrict__ output,  // [batch, out_len, channels]
@@ -134,52 +90,8 @@ __global__ void depthwiseConv1DVecKernel(const T* __restrict__ input,  // [batch
 // Fused Depthwise 1D Convolution + SiLU Kernel
 // =============================================================================
 
-template <typename T>
-__global__ void depthwiseConv1DSiluKernel(
-    const T* __restrict__ input,   // [batch, seq_len, channels]
-    const T* __restrict__ weight,  // [kernel_size, channels]
-    const T* __restrict__ bias,    // [channels] or nullptr
-    T* __restrict__ output,        // [batch, seq_len, channels]
-    int batch_size, int seq_len, int channels, int kernel_size, int padding) {
-    int c_id = threadIdx.x;
-    int s_id = blockIdx.x;
-    int b_id = blockIdx.y;
-    int o_id = (blockIdx.y * gridDim.x + blockIdx.x) * channels + c_id;
-
-    int s_start = s_id - padding;
-    int s_end = min(s_start + kernel_size, seq_len);
-    s_start = max(s_start, 0);
-
-    int k_start = max(padding - s_id, 0);
-
-    input += b_id * seq_len * channels + c_id;
-    weight += c_id;
-
-    float val = 0.0f;
-    for (int i = s_start; i < s_end; i++) {
-        val += (float)input[i * channels] * (float)weight[(k_start + i - s_start) * channels];
-    }
-
-    if (bias != nullptr) {
-        val += (float)bias[c_id];
-    }
-
-    val = oasr::swish(val);
-
-    output[o_id] = (T)val;
-}
-
-// =============================================================================
-// Depthwise 1D Convolution + SiLU Kernel (vectorized)
-// =============================================================================
-// Each thread processes VecSize channels using 128-bit vector loads/stores.
-// Requires channels % VecSize == 0.
-//
-// Grid:  (out_len, batch_size)
-// Block: (channels / VecSize)
-
 template <typename T, int VecSize>
-__global__ void depthwiseConv1DVecSiluKernel(
+__global__ void depthwiseConv1DSiluKernel(
     const T* __restrict__ input,   // [batch, seq_len, channels]
     const T* __restrict__ weight,  // [kernel_size, channels]
     const T* __restrict__ bias,    // [channels] or nullptr
@@ -376,11 +288,11 @@ cudaError_t DepthwiseConv1D(const T* input, const T* weight, const T* bias, T* o
     // and the thread count fits within hardware limits
     if (channels % kVecSize == 0 && (channels / kVecSize) <= 1024) {
         dim3 block_size(channels / kVecSize);
-        depthwiseConv1DVecKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
+        depthwiseConv1DKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
             input, weight, bias, output, batch_size, seq_len, channels, kernel_size, padding);
     } else {
         dim3 block_size(channels);
-        depthwiseConv1DKernel<T><<<grid_size, block_size, 0, stream>>>(
+        depthwiseConv1DKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
             input, weight, bias, output, batch_size, seq_len, channels, kernel_size, padding);
     }
 
@@ -416,11 +328,11 @@ cudaError_t DepthwiseConv1DSilu(const T* input, const T* weight, const T* bias, 
     // and the thread count fits within hardware limits
     if (channels % kVecSize == 0 && (channels / kVecSize) <= 1024) {
         dim3 block_size(channels / kVecSize);
-        depthwiseConv1DVecSiluKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
+        depthwiseConv1DSiluKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
             input, weight, bias, output, batch_size, seq_len, channels, kernel_size, padding);
     } else {
         dim3 block_size(channels);
-        depthwiseConv1DSiluKernel<T><<<grid_size, block_size, 0, stream>>>(
+        depthwiseConv1DSiluKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
             input, weight, bias, output, batch_size, seq_len, channels, kernel_size, padding);
     }
 
