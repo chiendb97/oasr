@@ -269,7 +269,6 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     from benchmarks.routines.bench_utils import parse_dtype
 
     dtype = parse_dtype(dtype_str)
-    backends = getattr(args, "backends", ["oasr", "pytorch"])
     do_check = getattr(args, "refcheck", False)
     allow_mismatch = getattr(args, "allow_output_mismatch", False)
     dry_run_iters = getattr(args, "dry_run_iters", 5)
@@ -280,11 +279,12 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
 
     for cfg in configs:
         oasr_fn, pytorch_fn = _setup_for_config(subroutine, cfg, dtype)
-        fn_map = {"oasr": oasr_fn, "pytorch": pytorch_fn}
+        fn_map = get_fn_map(subroutine, oasr_fn, pytorch_fn)
+        backends = getattr(args, "backends", None) or list(fn_map.keys())
 
         shape_str = _shape_str(subroutine, cfg)
 
-        if do_check and "oasr" in backends and "pytorch" in backends:
+        if do_check and "torch" in backends and any(b in fn_map and b != "torch" for b in backends):
             oasr_out = oasr_fn()
             pytorch_out = pytorch_fn()
             passed, max_diff = check_close(oasr_out, pytorch_out)
@@ -415,6 +415,13 @@ def _shape_str(subroutine, cfg):
         return f"[{cfg['batch']}, {cfg['seq']}, {cfg['channels']}] k={cfg['kernel_size']}"
 
 
+def get_fn_map(subroutine, oasr_fn, pytorch_fn):
+    """Return {backend_name: fn} for conv subroutines."""
+    if subroutine in ("conv2d", "conv2d_activation"):
+        return {"cutlass": oasr_fn, "torch": pytorch_fn}
+    return {"cuda": oasr_fn, "torch": pytorch_fn}
+
+
 # ---------------------------------------------------------------------------
 # Standalone entry
 # ---------------------------------------------------------------------------
@@ -455,7 +462,7 @@ def run_standalone(variant: str = "depthwise_conv1d") -> None:
             for cfg in configs:
                 oasr_fn, pytorch_fn = _setup_for_config(sub, cfg, torch.float16)
                 shape_str = _shape_str(sub, cfg)
-                for backend, fn in [("oasr", oasr_fn), ("pytorch", pytorch_fn)]:
+                for backend, fn in get_fn_map(sub, oasr_fn, pytorch_fn).items():
                     median_ms, std_ms = bench_fn(fn)
                     tflops = _compute_tflops(sub, cfg, median_ms)
                     output.write_result(BenchResult(

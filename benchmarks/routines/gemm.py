@@ -182,7 +182,6 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
         from benchmarks.routines.bench_utils import parse_dtype
         dtype = parse_dtype(dtype_str)
 
-    backends = getattr(args, "backends", ["oasr", "pytorch"])
     do_check = getattr(args, "refcheck", False)
     allow_mismatch = getattr(args, "allow_output_mismatch", False)
     dry_run_iters = getattr(args, "dry_run_iters", 5)
@@ -190,16 +189,16 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     use_cuda_events = getattr(args, "use_cuda_events", False)
 
     configs = _resolve_configs(args, subroutine)
-    backend_fns = {"oasr": 0, "pytorch": 1}
 
     for cfg in configs:
         oasr_fn, pytorch_fn = _setup_for_config(subroutine, cfg, dtype)
-        fn_map = {"oasr": oasr_fn, "pytorch": pytorch_fn}
+        fn_map = get_fn_map(subroutine, oasr_fn, pytorch_fn)
+        backends = getattr(args, "backends", None) or list(fn_map.keys())
         shape_str = _shape_str(subroutine, cfg)
 
         output.write_verbose(f"shape = {shape_str}, dtype = {dtype_str}", level=2)
 
-        if do_check and "oasr" in backends and "pytorch" in backends:
+        if do_check and "torch" in backends and any(b in fn_map and b != "torch" for b in backends):
             oasr_out = oasr_fn()
             pytorch_out = pytorch_fn()
             passed, max_diff = check_close(oasr_out, pytorch_out)
@@ -291,6 +290,11 @@ def _shape_str(subroutine: str, cfg: dict) -> str:
         return f"({cfg['M']}, {cfg['N']}, {cfg['K']})"
 
 
+def get_fn_map(subroutine, cutlass_fn, torch_fn):
+    """Return {backend_name: fn} for gemm subroutines."""
+    return {"cutlass": cutlass_fn, "torch": torch_fn}
+
+
 # ---------------------------------------------------------------------------
 # Standalone entry (backwards compat)
 # ---------------------------------------------------------------------------
@@ -321,7 +325,7 @@ def _run_standalone_gemm() -> None:
     parser.add_argument("--no-tune", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--kernel", nargs="+", default=["all"])
-    parser.add_argument("--target", choices=["oasr", "pytorch", "both"], default="oasr")
+    parser.add_argument("--target", choices=["cutlass", "torch", "both"], default="cutlass")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=1)
     args = parser.parse_args()
@@ -341,7 +345,7 @@ def _run_standalone_gemm() -> None:
         for cfg in DEFAULT_CONFIGS["gemm"]:
             oasr_fn, pytorch_fn = setup_gemm(cfg["M"], cfg["N"], cfg["K"])
             shape = f"({cfg['M']}, {cfg['N']}, {cfg['K']})"
-            for backend, fn in [("oasr", oasr_fn), ("pytorch", pytorch_fn)]:
+            for backend, fn in [("cutlass", oasr_fn), ("torch", pytorch_fn)]:
                 median_ms, std_ms = bench_fn(fn)
                 tflops = compute_gemm_tflops(cfg["M"], cfg["N"], cfg["K"], median_ms)
                 output.write_result(BenchResult(
@@ -362,7 +366,7 @@ def _run_standalone_bmm() -> None:
         for cfg in DEFAULT_CONFIGS["bmm"]:
             oasr_fn, pytorch_fn = setup_bmm(cfg["B"], cfg["M"], cfg["N"], cfg["K"])
             shape = f"({cfg['B']}, {cfg['M']}, {cfg['N']}, {cfg['K']})"
-            for backend, fn in [("oasr", oasr_fn), ("pytorch", pytorch_fn)]:
+            for backend, fn in [("cutlass", oasr_fn), ("torch", pytorch_fn)]:
                 median_ms, std_ms = bench_fn(fn)
                 tflops = compute_bmm_tflops(cfg["B"], cfg["M"], cfg["N"], cfg["K"], median_ms)
                 output.write_result(BenchResult(
@@ -400,7 +404,7 @@ def _run_standalone_group_gemm() -> None:
             problem_sizes = [(m_i, N, K) for m_i in Ms]
             oasr_fn, pytorch_fn = setup_group_gemm(problem_sizes)
             config_str = f"{num_groups}x(M~{M}, N={N}, K={K})"
-            for backend, fn in [("oasr", oasr_fn), ("pytorch", pytorch_fn)]:
+            for backend, fn in [("cutlass", oasr_fn), ("torch", pytorch_fn)]:
                 median_ms, std_ms = bench_fn(fn)
                 tflops = compute_gemm_tflops(num_groups * M, N, K, median_ms)
                 output.write_result(BenchResult(

@@ -116,7 +116,6 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     from benchmarks.routines.bench_utils import parse_dtype
 
     dtype = parse_dtype(dtype_str)
-    backends = getattr(args, "backends", ["oasr", "pytorch"])
     do_check = getattr(args, "refcheck", False)
     allow_mismatch = getattr(args, "allow_output_mismatch", False)
     dry_run_iters = getattr(args, "dry_run_iters", 5)
@@ -127,13 +126,14 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
 
     for cfg in configs:
         oasr_fn, pytorch_fn = _setup_for_config(subroutine, cfg, dtype)
-        fn_map = {"oasr": oasr_fn, "pytorch": pytorch_fn}
+        fn_map = get_fn_map(subroutine, oasr_fn, pytorch_fn)
+        backends = getattr(args, "backends", None) or list(fn_map.keys())
 
         b, s, c = cfg["batch"], cfg["seq"], cfg["channels"]
         bytes_accessed = _activation_bytes(b, s, c, dtype, subroutine)
         shape_str = _shape_str(subroutine, cfg)
 
-        if do_check and "oasr" in backends and "pytorch" in backends:
+        if do_check and "torch" in backends and any(b in fn_map and b != "torch" for b in backends):
             oasr_out = oasr_fn()
             pytorch_out = pytorch_fn()
             passed, max_diff = check_close(oasr_out, pytorch_out)
@@ -193,6 +193,11 @@ def _shape_str(subroutine, cfg):
     return f"[{b}, {s}, {c}]"
 
 
+def get_fn_map(subroutine, cuda_fn, torch_fn):
+    """Return {backend_name: fn} for activation subroutines."""
+    return {"cuda": cuda_fn, "torch": torch_fn}
+
+
 # ---------------------------------------------------------------------------
 # Standalone entry
 # ---------------------------------------------------------------------------
@@ -218,7 +223,7 @@ def run_standalone(variant: str = "glu") -> None:
                 b, s, c = cfg["batch"], cfg["seq"], cfg["channels"]
                 bytes_accessed = _activation_bytes(b, s, c, torch.float16, sub)
                 shape_str = _shape_str(sub, cfg)
-                for backend, fn in [("oasr", oasr_fn), ("pytorch", pytorch_fn)]:
+                for backend, fn in get_fn_map(sub, oasr_fn, pytorch_fn).items():
                     median_ms, std_ms = bench_fn(fn)
                     bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
                     output.write_result(BenchResult(
