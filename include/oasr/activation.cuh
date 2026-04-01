@@ -21,36 +21,9 @@ namespace activation {
 // GLU (Gated Linear Unit) Kernel
 // =============================================================================
 
-template <typename T>
-__global__ void gluKernel(const T* __restrict__ input,   // [batch, seq_len, 2 * channels]
-                          T* __restrict__ output,         // [batch, seq_len, channels]
-                          int batch_size, int seq_len, int channels) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = batch_size * seq_len * channels;
-
-    if (idx >= total_elements)
-        return;
-
-    int c = idx % channels;
-    int pos = idx / channels;
-
-    // input[:, :, :channels] * sigmoid(input[:, :, channels:])
-    int input_idx1 = pos * (2 * channels) + c;
-    int input_idx2 = pos * (2 * channels) + channels + c;
-
-    float x = static_cast<float>(input[input_idx1]);
-    float gate = static_cast<float>(input[input_idx2]);
-    float sigmoid_gate = oasr::sigmoid(gate);
-
-    output[idx] = static_cast<T>(x * sigmoid_gate);
-}
-
-// =============================================================================
-// GLU (Gated Linear Unit) Kernel (vectorized)
-// =============================================================================
 
 template <typename T, int VecSize>
-__global__ void gluVecKernel(const T* __restrict__ input,   // [batch, seq_len, 2 * channels]
+__global__ void gluKernel(const T* __restrict__ input,   // [batch, seq_len, 2 * channels]
                              T* __restrict__ output,         // [batch, seq_len, channels]
                              int batch_size, int seq_len, int channels) {
     const int total_elements = batch_size * seq_len * channels;
@@ -91,21 +64,29 @@ __global__ void gluVecKernel(const T* __restrict__ input,   // [batch, seq_len, 
 }
 
 // =============================================================================
-// Swish Kernel
+// Swish Kernel (vectorized)
 // =============================================================================
 
-template <typename T>
+template <typename T, int VecSize>
 __global__ void swishKernel(const T* __restrict__ input, T* __restrict__ output, int batch_size,
                             int seq_len, int channels) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = batch_size * seq_len * channels;
+    const int total_elements = batch_size * seq_len * channels;
+    const int total_vec_elements = total_elements / VecSize;
 
-    if (idx >= total_elements)
-        return;
+    for (int vid = blockIdx.x * blockDim.x + threadIdx.x; vid < total_vec_elements;
+         vid += gridDim.x * blockDim.x) {
+        Vec<T, VecSize> v_in;
+        v_in.load(input + vid * VecSize);
 
-    float x = static_cast<float>(input[idx]);
-    float result = oasr::swish(x);
-    output[idx] = static_cast<T>(result);
+        Vec<T, VecSize> v_out;
+#pragma unroll
+        for (int v = 0; v < VecSize; v++) {
+            float x = static_cast<float>(v_in[v]);
+            v_out[v] = static_cast<T>(oasr::swish(x));
+        }
+
+        v_out.store(output + vid * VecSize);
+    }
 }
 
 // =============================================================================
@@ -124,13 +105,13 @@ cudaError_t GLU(const T* input, T* output, int batch_size, int seq_len, int chan
         const int block_size = 256;
         int grid_size = (total_vec_elements + block_size - 1) / block_size;
         grid_size = std::min(grid_size, 65535);
-        gluVecKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
+        gluKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
             input, output, batch_size, seq_len, channels);
     } else {
         const int block_size = 256;
         const int grid_size = (total_elements + block_size - 1) / block_size;
-        gluKernel<T><<<grid_size, block_size, 0, stream>>>(input, output, batch_size, seq_len,
-                                                            channels);
+        gluKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
+            input, output, batch_size, seq_len, channels);
     }
 
     return cudaGetLastError();
@@ -139,12 +120,23 @@ cudaError_t GLU(const T* input, T* output, int batch_size, int seq_len, int chan
 template <typename T>
 cudaError_t Swish(const T* input, T* output, int batch_size, int seq_len, int channels,
                   cudaStream_t stream) {
-    int total_elements = batch_size * seq_len * channels;
-    int block_size = 256;
-    int grid_size = (total_elements + block_size - 1) / block_size;
+    const int total_elements = batch_size * seq_len * channels;
 
-    swishKernel<T><<<grid_size, block_size, 0, stream>>>(input, output, batch_size, seq_len,
-                                                          channels);
+    constexpr int kVecSize = VecTypeTrait<T>::VecSize;
+
+    if (channels % kVecSize == 0) {
+        const int total_vec_elements = total_elements / kVecSize;
+        const int block_size = 256;
+        int grid_size = (total_vec_elements + block_size - 1) / block_size;
+        grid_size = std::min(grid_size, 65535);
+        swishKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
+            input, output, batch_size, seq_len, channels);
+    } else {
+        const int block_size = 256;
+        const int grid_size = (total_elements + block_size - 1) / block_size;
+        swishKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
+            input, output, batch_size, seq_len, channels);
+    }
 
     return cudaGetLastError();
 }
