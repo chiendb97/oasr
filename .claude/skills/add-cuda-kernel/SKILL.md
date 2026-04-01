@@ -264,9 +264,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm, rmsnorm);
 
 Note: Multiple launcher functions can be exported from a single binding file, as the norm and activation families do.
 
-## Step 4: Create JIT Generator in `python/oasr/jit/`
+## Step 4: Create JIT Generator in `oasr/jit/`
 
-Create `python/oasr/jit/scale.py`:
+Create `oasr/jit/scale.py`:
 
 ```python
 from .core import gen_jit_spec, JitSpec
@@ -294,7 +294,7 @@ def gen_scale_module() -> JitSpec:
 **Real examples:**
 
 ```python
-# python/oasr/jit/activation.py
+# oasr/jit/activation.py
 def gen_activation_module() -> JitSpec:
     return gen_jit_spec(
         "activation",
@@ -302,7 +302,7 @@ def gen_activation_module() -> JitSpec:
          env.OASR_CSRC_DIR / "activation_jit_binding.cu"],
     )
 
-# python/oasr/jit/norm.py
+# oasr/jit/norm.py
 def gen_norm_module() -> JitSpec:
     return gen_jit_spec(
         "norm",
@@ -389,9 +389,9 @@ def gen_my_universal_module():
 | `[12]` | SM120 | Specific architecture only |
 | `[8, 9, 10, 11, 12]` | SM80, SM90, SM100, SM110, SM120 | Ampere, Hopper, Blackwell |
 
-## Step 5: Create Python API in `python/oasr/`
+## Step 5: Create Python API in `oasr/`
 
-Create `python/oasr/scale.py`:
+Create `oasr/scale.py`:
 
 ```python
 import functools
@@ -454,7 +454,7 @@ def scale(input: torch.Tensor, factor: float,
 - **Destination-passing style**: Output tensor is an optional Python parameter (`out=None`) but **passed first** to the C++ TVM-FFI function
 - Import the JIT module lazily inside the cached function to avoid import-time compilation
 
-**Real example** (from `python/oasr/activation.py`):
+**Real example** (from `oasr/activation.py`):
 
 ```python
 @functools.cache
@@ -732,9 +732,9 @@ def test_hopper_kernel():
 
 ## Step 7: Register in AOT
 
-Register your kernel in `python/oasr/aot.py` so users with `oasr-jit-cache` can skip JIT compilation.
+Register your kernel in `oasr/aot.py` so users with `oasr-jit-cache` can skip JIT compilation.
 
-Edit `python/oasr/aot.py`:
+Edit `oasr/aot.py`:
 
 ```python
 def gen_all_modules() -> List:
@@ -759,7 +759,7 @@ def gen_all_modules() -> List:
 
 ## Step 8: Export API
 
-Edit `python/oasr/__init__.py`:
+Edit `oasr/__init__.py`:
 
 ```python
 from .scale import scale as scale
@@ -902,10 +902,10 @@ When adding a new kernel, look at these existing families as references:
 include/oasr/scale.cuh                # NEW: CUDA kernel definition
 csrc/scale.cu                         # NEW: TVM-FFI launcher
 csrc/scale_jit_binding.cu             # NEW: TVM-FFI binding
-python/oasr/jit/scale.py              # NEW: JIT generator
-python/oasr/scale.py                  # NEW: Python API
-python/oasr/__init__.py               # MODIFIED: Export API
-python/oasr/aot.py                    # MODIFIED: Register AOT
-tests/test_scale.py                   # NEW: Unit tests
+oasr/jit/scale.py              # NEW: JIT generator
+oasr/scale.py                  # NEW: Python API
+oasr/__init__.py               # MODIFIED: Export API
+oasr/aot.py                    # MODIFIED: Register AOT
+test_scale.py                   # NEW: Unit tests
 benchmarks/bench_scale.py             # NEW: Benchmark script
 ```

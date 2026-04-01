@@ -405,7 +405,7 @@ def group_gemm_func_name(cfg: CutlassGemmConfig) -> str:
 
 
 # =============================================================================
-# Default configs (used by non-autotuned paths in python/oasr/gemm.py)
+# Default configs (used by non-autotuned paths in oasr/gemm.py)
 # =============================================================================
 
 _sm = _get_target_sm()

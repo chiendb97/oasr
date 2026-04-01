@@ -102,7 +102,7 @@ tuner.reset_statistics()     # Reset stats counters
 
 ## Adding a New Backend
 
-1. Create a file in `python/oasr/tune/backends/`, e.g. `tensorrtllm.py`.
+1. Create a file in `oasr/tune/backends/`, e.g. `tensorrtllm.py`.
 2. Register entries using the global registry:
 
 ```python

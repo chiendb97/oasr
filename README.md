@@ -26,8 +26,8 @@ A high-performance open-source inference framework for ASR models built with C++
 ## Architecture
 
 ```
-Python functional API (python/oasr/<family>.py)
-    +-- JIT generator (python/oasr/jit/<family>.py) -> JitSpec
+Python functional API (oasr/<family>.py)
+    +-- JIT generator (oasr/jit/<family>.py) -> JitSpec
             +-- TVM-FFI JIT binding (csrc/<family>_jit_binding.cu)
                     +-- TVM-FFI launcher (csrc/<family>.cu)
                             +-- Pure CUDA kernels (include/oasr/<family>.cuh)
@@ -47,7 +47,7 @@ oasr/
 │   ├── tvm_ffi_utils.h        # DLPack dtype dispatch and validation macros
 │   ├── decoder/               # CTC prefix beam search (CPU, C++)
 │   └── pybind/                # pybind11 module (decoder + legacy enums)
-├── python/oasr/               # Python package
+├── oasr/                      # Python package
 │   ├── activation.py          # Functional API: GLU, Swish
 │   ├── norm.py                # Functional API: LayerNorm, RMSNorm, etc.
 │   ├── conv.py                # Functional API: Conv1D, Conv2D
@@ -202,7 +202,7 @@ linear = Linear(in_features, out_features)
 
 ## Kernel Auto-Tuning
 
-OASR includes a built-in auto-tuning framework for GEMM and Conv2D kernels. See `python/oasr/tune/` for details.
+OASR includes a built-in auto-tuning framework for GEMM and Conv2D kernels. See `oasr/tune/` for details.
 
 ## License
 

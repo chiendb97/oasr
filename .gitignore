@@ -67,8 +67,8 @@ Thumbs.db
 *.ptx
 
 # Compiled extensions
-python/oasr/_C*.so
-python/oasr/*.so
+oasr/_C*.so
+oasr/*.so
 
 # CMake
 CMakeFiles/

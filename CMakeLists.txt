@@ -206,7 +206,7 @@ if(BUILD_PYTHON)
     # Set output directory for the Python module (never write into source tree).
     # - When built via setuptools (setup.py), CMAKE_LIBRARY_OUTPUT_DIRECTORY is
     #   set and the .so is placed under build/.
-    # - For standalone CMake builds, use the build tree so python/oasr stays clean.
+    # - For standalone CMake builds, use the build tree so oasr stays clean.
     if(CMAKE_LIBRARY_OUTPUT_DIRECTORY)
         set(PYTHON_MODULE_OUTPUT_DIR ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
     else()
