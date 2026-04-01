@@ -159,7 +159,7 @@ def setup_pointwise_conv1d(batch_size, seq_len, in_ch, out_ch, dtype=torch.float
     bias = torch.randn(out_ch, device="cuda", dtype=dtype)
 
     def oasr_fn():
-        return oasr.pointwise_conv1d(x, weight, bias)
+        return oasr.gemm(x, weight, bias)
 
     def pytorch_fn():
         return F.linear(x, weight, bias)
@@ -177,7 +177,7 @@ def setup_pointwise_conv1d_activation(
     bias = torch.randn(out_ch, device="cuda", dtype=dtype)
 
     def oasr_fn():
-        return oasr.pointwise_conv1d_activation(x, weight, bias, activation)
+        return oasr.gemm_activation(x, weight, bias, activation)
 
     def pytorch_fn():
         out = F.linear(x, weight, bias)
@@ -256,6 +256,11 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pad", type=int, default=0, help="Padding")
     parser.add_argument("--stride", type=int, default=1, help="Stride")
     parser.add_argument("--activation", type=str, default=None, help="Activation (swish, relu, gelu)")
+    parser.add_argument("--autotune", action="store_true",
+                        help="Enable autotuning for pointwise_conv1d subroutines")
+    parser.add_argument("--cache", type=str, default=None, help="Autotune cache file path")
+    parser.add_argument("--no-tune", action="store_true",
+                        help="Use cached configs only (no profiling)")
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +270,15 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
 
 def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     subroutine = getattr(args, "subroutine", "depthwise_conv1d")
+    if (
+        getattr(args, "autotune", False)
+        and subroutine in ("pointwise_conv1d", "pointwise_conv1d_activation")
+    ):
+        tune_mode = not getattr(args, "no_tune", False)
+        cache = getattr(args, "cache", None)
+        _benchmark_pointwise_conv1d_autotune(args, subroutine, tune_mode=tune_mode, cache_path=cache)
+        return
+
     dtype_str = getattr(args, "dtype", "float16")
     from benchmarks.routines.bench_utils import parse_dtype
 
@@ -417,9 +431,94 @@ def _shape_str(subroutine, cfg):
 
 def get_fn_map(subroutine, oasr_fn, pytorch_fn):
     """Return {backend_name: fn} for conv subroutines."""
-    if subroutine in ("conv2d", "conv2d_activation"):
+    if subroutine in ("conv2d", "conv2d_activation", "pointwise_conv1d", "pointwise_conv1d_activation"):
         return {"cutlass": oasr_fn, "torch": pytorch_fn}
     return {"cuda": oasr_fn, "torch": pytorch_fn}
+
+
+# ---------------------------------------------------------------------------
+# Pointwise Conv1D autotuning benchmark
+# ---------------------------------------------------------------------------
+
+
+def _benchmark_pointwise_conv1d_autotune(args, subroutine, *, tune_mode=True, cache_path=None):
+    """Profile all GEMM tile variants for pointwise_conv1d / pointwise_conv1d_activation.
+
+    Pointwise Conv1D is backed by oasr.gemm, so the autotuner selects the best
+    CUTLASS tile config for each (M=batch*seq, N=out_ch, K=in_ch) problem shape.
+    """
+    from oasr.tune import get_selected_config
+    from oasr.tune.autotuner import OpKey
+
+    op_key = OpKey("gemm", "gemm" if subroutine == "pointwise_conv1d" else "gemm_activation")
+    mode_str = "PROFILING" if tune_mode else "CACHED"
+
+    print("\n" + "=" * 110)
+    print(f"Pointwise Conv1D Autotuning ({subroutine}, {mode_str})")
+    print("=" * 110)
+    if cache_path:
+        print(f"Cache: {cache_path}")
+    print()
+
+    from benchmarks.routines.bench_utils import parse_dtype
+    dtype_str = getattr(args, "dtype", "float16")
+    dtype = parse_dtype(dtype_str)
+
+    sm = torch.cuda.get_device_capability()
+    sm_version = sm[0] * 10 + sm[1]
+
+    configs = _resolve_configs(args, subroutine)
+
+    with oasr.autotune(tune_mode, cache=cache_path):
+        print(
+            f"{'Shape (B,T,IC->OC)':<32} {'Tuned (ms)':<12} {'Config':<35} "
+            f"{'Default (ms)':<14} {'PyTorch (ms)':<14} {'vs Def':<9} {'vs PT':<9}"
+        )
+        print("-" * 130)
+
+        for cfg in configs:
+            batch, seq = cfg["batch"], cfg["seq"]
+            in_ch, out_ch = cfg["channels"], cfg["out_channels"]
+            M = batch * seq
+
+            oasr_fn, pytorch_fn = _setup_for_config(subroutine, cfg, dtype)
+            tuned_ms, _ = bench_fn(oasr_fn)
+
+            tactic = get_selected_config(
+                op_key=op_key,
+                shape_sig=(M, out_ch, in_ch),
+                dtype=dtype_str,
+                device_sm=sm_version,
+            )
+            if tactic is not None:
+                c = dict(tactic.config)
+                config_str = (
+                    f"{c.get('tile_m', '?')}x{c.get('tile_n', '?')}x{c.get('tile_k', '?')}"
+                    f"_w{c.get('warp_m', '?')}x{c.get('warp_n', '?')}x{c.get('warp_k', '?')}"
+                    f"_s{c.get('stages', '?')}"
+                )
+            else:
+                config_str = "default"
+
+            import oasr.tune as _tune_mod
+            prev = _tune_mod._enabled
+            _tune_mod._enabled = False
+            default_fn, _ = _setup_for_config(subroutine, cfg, dtype)
+            default_ms, _ = bench_fn(default_fn)
+            _tune_mod._enabled = prev
+
+            pytorch_ms, _ = bench_fn(pytorch_fn)
+            vs_default = default_ms / tuned_ms if tuned_ms > 0 else 0.0
+            vs_pytorch = pytorch_ms / tuned_ms if tuned_ms > 0 else 0.0
+            shape_str = f"[{batch},{seq},{in_ch}->{out_ch}]"
+            print(
+                f"{shape_str:<32} {tuned_ms:<12.4f} {config_str:<35} "
+                f"{default_ms:<14.4f} {pytorch_ms:<14.4f} {vs_default:<9.2f}x {vs_pytorch:<9.2f}x"
+            )
+
+    print("\n" + "=" * 110)
+    print("Autotuning benchmark complete!")
+    print("=" * 110)
 
 
 # ---------------------------------------------------------------------------

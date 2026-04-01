@@ -25,8 +25,8 @@ from .norm import (
     cmvn,
 )
 from .conv import (
-    depthwise_conv1d, pointwise_conv1d, conv2d,
-    depthwise_conv1d_silu, pointwise_conv1d_activation, causal_conv1d, conv2d_activation,
+    depthwise_conv1d, conv2d,
+    depthwise_conv1d_silu, causal_conv1d, conv2d_activation,
 )
 from .gemm import gemm, bmm, group_gemm, gemm_activation
 
@@ -121,10 +121,8 @@ __all__ = [
     "batch_norm_swish",
     "cmvn",
     "depthwise_conv1d",
-    "pointwise_conv1d",
     "conv2d",
     "depthwise_conv1d_silu",
-    "pointwise_conv1d_activation",
     "causal_conv1d",
     "conv2d_activation",
     "gemm",

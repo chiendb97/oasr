@@ -121,10 +121,14 @@ class PointwiseConv1d(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # weight: [out_channels, in_channels, 1] -> [out_channels, in_channels]
+        # oasr.gemm accepts batched A (e.g. [batch, seq_len, in_channels]) and
+        # preserves the leading dimensions in the output, so no manual reshape
+        # is needed here.  This also picks up GEMM autotuning automatically.
+        weight = self.weight.squeeze(-1)
         if self.activation is not None:
-            return oasr.pointwise_conv1d_activation(x, self.weight, self.bias, self.activation)
-        else:
-            return oasr.pointwise_conv1d(x, self.weight, self.bias)
+            return oasr.gemm_activation(x, weight, self.bias, self.activation)
+        return oasr.gemm(x, weight, self.bias)
 
 
 class Conv2d(nn.Module):

@@ -55,8 +55,8 @@ class TestDepthwiseConv1D:
         assert result.data_ptr() == out.data_ptr()
 
 
-class TestPointwiseConv1D:
-    """Tests for oasr.pointwise_conv1d() functional API."""
+class TestPointwiseConv1dLayer:
+    """Tests for oasr.layers.PointwiseConv1d (delegates to oasr.gemm)."""
 
     @pytest.mark.parametrize(
         "batch_size,seq_len,in_channels,out_channels",
@@ -66,16 +66,20 @@ class TestPointwiseConv1D:
         ],
     )
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_pointwise_conv1d(self, batch_size, seq_len, in_channels, out_channels, dtype):
+    def test_pointwise_conv1d_layer(self, batch_size, seq_len, in_channels, out_channels, dtype):
+        layer = oasr.PointwiseConv1d(in_channels, out_channels, bias=True).cuda().to(dtype)
         x = torch.randn(batch_size, seq_len, in_channels, device="cuda", dtype=dtype)
-        weight = torch.randn(out_channels, in_channels, device="cuda", dtype=dtype)
 
-        output = oasr.pointwise_conv1d(x, weight)
+        output = layer(x)
 
-        # Reference: reshape to [B*T, C_in] @ [C_out, C_in]^T = [B*T, C_out]
+        assert output.shape == (batch_size, seq_len, out_channels)
+        # Reference via plain matmul with the same weights
+        weight = layer.weight.squeeze(-1)  # [out_channels, in_channels]
         x_flat = x.reshape(-1, in_channels)
-        expected = torch.matmul(x_flat, weight.T).reshape(batch_size, seq_len, out_channels)
-
+        expected = torch.matmul(x_flat, weight.T)
+        if layer.bias is not None:
+            expected = expected + layer.bias
+        expected = expected.reshape(batch_size, seq_len, out_channels)
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
 
