@@ -180,6 +180,36 @@ void addlayernorm(TensorView output, TensorView input, TensorView residual, Tens
 }
 
 // =============================================================================
+// CMVN launcher
+// =============================================================================
+
+void cmvn(TensorView output, TensorView input, TensorView mean, TensorView istd) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output);
+    CHECK_INPUT(mean);
+    CHECK_INPUT(istd);
+
+    unsigned int num_rows = 1;
+    for (int i = 0; i < input.ndim() - 1; ++i) {
+        num_rows *= input.size(i);
+    }
+    unsigned int num_cols = input.size(input.ndim() - 1);
+
+    cudaStream_t stream = get_stream(input.device());
+
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+        cudaError_t status = norm::CMVN<c_type>(
+            static_cast<const c_type*>(input.data_ptr()),
+            static_cast<const c_type*>(mean.data_ptr()),
+            static_cast<const c_type*>(istd.data_ptr()),
+            static_cast<c_type*>(output.data_ptr()), num_rows, num_cols, stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "CMVN kernel failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
+// =============================================================================
 // Fused norm+activation launchers
 // =============================================================================
 

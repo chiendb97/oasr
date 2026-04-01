@@ -754,6 +754,49 @@ __global__ void batchNormActKernel(const T* __restrict__ input, T* __restrict__ 
 }
 
 // =============================================================================
+// CMVN (Cepstral Mean and Variance Normalization) Kernel
+// =============================================================================
+
+template <typename T, int VecSize>
+__global__ void cmvnKernel(const T* __restrict__ input, T* __restrict__ output,
+                           const T* __restrict__ mean, const T* __restrict__ istd,
+                           int num_rows, int num_cols) {
+    using VecT = oasr::Vec<T, VecSize>;
+
+    const int total_elements = num_rows * num_cols;
+
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements / VecSize;
+         idx += blockDim.x * gridDim.x) {
+        int flat_idx = idx * VecSize;
+        int c_start = flat_idx % num_cols;
+
+        if (c_start + VecSize <= num_cols && c_start % VecSize == 0) {
+            VecT v_in, v_mean, v_istd;
+            v_in.load(input + flat_idx);
+            v_mean.load(mean + c_start);
+            v_istd.load(istd + c_start);
+
+            oasr::Vec<float, VecSize> vals;
+#pragma unroll
+            for (int j = 0; j < VecSize; j++) {
+                vals[j] = (static_cast<float>(v_in[j]) - static_cast<float>(v_mean[j]))
+                           * static_cast<float>(v_istd[j]);
+            }
+
+            oasr::vecCast<T>(vals).store(output + flat_idx);
+        } else {
+            for (int j = 0; j < VecSize && flat_idx + j < total_elements; j++) {
+                int c = (flat_idx + j) % num_cols;
+                float x = static_cast<float>(input[flat_idx + j]);
+                float m = static_cast<float>(mean[c]);
+                float s = static_cast<float>(istd[c]);
+                output[flat_idx + j] = static_cast<T>((x - m) * s);
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Typed Launcher Functions (raw pointer interface, returning cudaError_t)
 // =============================================================================
 
@@ -945,6 +988,35 @@ cudaError_t RMSNormActivation(const T* input, const T* weight, const T* bias, T*
         err = cudaGetLastError();
     });
     return err;
+}
+
+// ---- CMVN ----
+
+template <typename T>
+cudaError_t CMVN(const T* input, const T* mean, const T* istd, T* output,
+                 unsigned int num_rows, unsigned int num_cols, cudaStream_t stream) {
+    constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
+
+    int total_elements = static_cast<int>(num_rows * num_cols);
+    int block_size = 256;
+
+    bool use_vec = (num_cols >= static_cast<unsigned int>(VecSize))
+                   && (num_cols % VecSize == 0)
+                   && isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output)
+                   && isAligned<T, VecSize>(mean) && isAligned<T, VecSize>(istd);
+
+    if (use_vec) {
+        int grid_size = (total_elements / VecSize + block_size - 1) / block_size;
+        cmvnKernel<T, VecSize><<<grid_size, block_size, 0, stream>>>(
+            input, output, mean, istd, static_cast<int>(num_rows),
+            static_cast<int>(num_cols));
+    } else {
+        int grid_size = (total_elements + block_size - 1) / block_size;
+        cmvnKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
+            input, output, mean, istd, static_cast<int>(num_rows),
+            static_cast<int>(num_cols));
+    }
+    return cudaGetLastError();
 }
 
 // ---- BatchNormActivation ----

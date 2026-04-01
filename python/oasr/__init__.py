@@ -22,6 +22,7 @@ from .activation import (
 from .norm import (
     layer_norm, rms_norm, batch_norm_1d, group_norm, add_layer_norm,
     layer_norm_activation, rms_norm_activation, batch_norm_activation, batch_norm_swish,
+    cmvn,
 )
 from .conv import (
     depthwise_conv1d, pointwise_conv1d, conv2d,
@@ -117,6 +118,7 @@ __all__ = [
     "rms_norm_activation",
     "batch_norm_activation",
     "batch_norm_swish",
+    "cmvn",
     "depthwise_conv1d",
     "pointwise_conv1d",
     "conv2d",
