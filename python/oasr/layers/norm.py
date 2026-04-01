@@ -227,8 +227,25 @@ class BatchNormActivation(nn.Module):
             self.eps, self.activation_type)
 
 
+class GlobalCMVN(nn.Module):
+    """Global cepstral mean and variance normalization.
+
+    Stores pre-computed mean and inverse std-dev as buffers
+    and applies ``oasr.cmvn(x, mean, istd)`` to input features.
+    """
+
+    def __init__(self, mean: torch.Tensor, istd: torch.Tensor):
+        super().__init__()
+        self.register_buffer("mean", mean)
+        self.register_buffer("istd", istd)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return oasr.cmvn(x, self.mean, self.istd)
+
+
 __all__ = [
     "LayerNorm", "RMSNorm", "GroupNorm",
     "BatchNorm1d", "BatchNormSwish", "AddLayerNorm",
     "LayerNormActivation", "RMSNormActivation", "BatchNormActivation",
+    "GlobalCMVN",
 ]

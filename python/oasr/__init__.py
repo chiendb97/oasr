@@ -51,6 +51,7 @@ from .layers import (
     GroupNorm,
     BatchNorm1d,
     AddLayerNorm,
+    GlobalCMVN,
 )
 
 
@@ -142,6 +143,7 @@ __all__ = [
     "GroupNorm",
     "BatchNorm1d",
     "AddLayerNorm",
+    "GlobalCMVN",
     # Autotuning
     "tune",
     "autotune",
