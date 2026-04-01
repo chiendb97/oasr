@@ -25,6 +25,7 @@ void batchnorm_activation(TensorView output, TensorView input, TensorView weight
                           int64_t activation_type);
 void batchnorm_swish(TensorView output, TensorView input, TensorView weight, TensorView bias,
                      TensorView running_mean, TensorView running_var, double eps);
+void cmvn(TensorView output, TensorView input, TensorView mean, TensorView istd);
 
 // TVM-FFI symbol exports
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(layernorm, layernorm);
@@ -36,3 +37,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(layernorm_activation, layernorm_activation);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm_activation, rmsnorm_activation);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(batchnorm_activation, batchnorm_activation);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(batchnorm_swish, batchnorm_swish);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cmvn, cmvn);

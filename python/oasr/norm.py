@@ -208,6 +208,33 @@ def batch_norm_activation(
 
 
 @oasr_api
+def cmvn(
+    input: torch.Tensor,
+    mean: torch.Tensor,
+    istd: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Apply Cepstral Mean and Variance Normalization (CMVN).
+
+    Computes: output = (input - mean) * istd, where mean and istd are
+    broadcast along the feature dimension.
+
+    Args:
+        input: Input tensor [..., num_cols].
+        mean: Mean vector [num_cols].
+        istd: Inverse standard deviation vector [num_cols].
+        out: Optional pre-allocated output tensor.
+
+    Returns:
+        Normalized tensor with same shape as input.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    _get_norm_module().cmvn(out, input, mean, istd)
+    return out
+
+
+@oasr_api
 def batch_norm_swish(
     input: torch.Tensor,
     weight: torch.Tensor,

@@ -22,10 +22,11 @@ from .activation import (
 from .norm import (
     layer_norm, rms_norm, batch_norm_1d, group_norm, add_layer_norm,
     layer_norm_activation, rms_norm_activation, batch_norm_activation, batch_norm_swish,
+    cmvn,
 )
 from .conv import (
-    depthwise_conv1d, pointwise_conv1d, conv2d,
-    depthwise_conv1d_silu, pointwise_conv1d_activation, causal_conv1d, conv2d_activation,
+    depthwise_conv1d, conv2d,
+    depthwise_conv1d_silu, causal_conv1d, conv2d_activation,
 )
 from .gemm import gemm, bmm, group_gemm, gemm_activation
 
@@ -50,6 +51,7 @@ from .layers import (
     GroupNorm,
     BatchNorm1d,
     AddLayerNorm,
+    GlobalCMVN,
 )
 
 
@@ -117,11 +119,10 @@ __all__ = [
     "rms_norm_activation",
     "batch_norm_activation",
     "batch_norm_swish",
+    "cmvn",
     "depthwise_conv1d",
-    "pointwise_conv1d",
     "conv2d",
     "depthwise_conv1d_silu",
-    "pointwise_conv1d_activation",
     "causal_conv1d",
     "conv2d_activation",
     "gemm",
@@ -140,6 +141,7 @@ __all__ = [
     "GroupNorm",
     "BatchNorm1d",
     "AddLayerNorm",
+    "GlobalCMVN",
     # Autotuning
     "tune",
     "autotune",

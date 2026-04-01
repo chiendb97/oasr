@@ -61,11 +61,11 @@ def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.floa
     dw_weight_pt = dw_weight.view(d_model, 1, kernel_size)
 
     def oasr_fn():
-        pw1_out = oasr.pointwise_conv1d(x, pw1_weight, pw1_bias)
+        pw1_out = oasr.gemm(x, pw1_weight, pw1_bias)
         glu_out = oasr.glu(pw1_out)
         dw_out = oasr.depthwise_conv1d(glu_out, dw_weight, dw_bias, kernel_size // 2)
         swish_out = oasr.swish(dw_out)
-        return oasr.pointwise_conv1d(swish_out, pw2_weight, pw2_bias)
+        return oasr.gemm(swish_out, pw2_weight, pw2_bias)
 
     def pytorch_fn():
         pw1 = F.linear(x, pw1_weight, pw1_bias)

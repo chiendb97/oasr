@@ -14,7 +14,7 @@ from torch import nn
 
 from oasr.layers.linear import Linear, LinearActivation
 from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d, Conv2dActivation
-from oasr.layers.norm import LayerNorm
+from oasr.layers.norm import LayerNorm, GlobalCMVN
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention, T_CACHE
 from oasr.utils import get_norm, get_norm_activation
 from .config import ConformerEncoderConfig, ConformerModelConfig
@@ -39,22 +39,6 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
     """(B,) lengths -> (B, max_len) bool, True where valid (not padded)."""
     row = torch.arange(max_len, device=lengths.device, dtype=lengths.dtype)
     return row.unsqueeze(0) < lengths.unsqueeze(1)
-
-
-class GlobalCMVN(nn.Module):
-    """Global cepstral mean and variance normalization.
-
-    Stores pre-computed mean and inverse std-dev as buffers
-    and applies ``(x - mean) * istd`` to input features.
-    """
-
-    def __init__(self, mean: torch.Tensor, istd: torch.Tensor):
-        super().__init__()
-        self.register_buffer("mean", mean)
-        self.register_buffer("istd", istd)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.mean) * self.istd
 
 
 class CTC(torch.nn.Module):
@@ -164,7 +148,8 @@ class ConvolutionModule(nn.Module):
         new_prefix = prefix + "norm_activation."
         keys_to_remap = [k for k in state_dict if k.startswith(old_prefix)]
         for old_key in keys_to_remap:
-            state_dict[new_prefix + old_key[len(old_prefix):]] = state_dict.pop(old_key)
+            state_dict[new_prefix +
+                       old_key[len(old_prefix):]] = state_dict.pop(old_key)
         # Drop parameterless activation module keys (e.g. from nn.SiLU)
         act_prefix = prefix + "activation."
         for k in [k for k in state_dict if k.startswith(act_prefix)]:
@@ -275,8 +260,10 @@ class Conv2dSubsampling(nn.Module):
         if subsampling_rate == 4:
             # Both convs use fused conv + ReLU via CUTLASS Ampere Tensor Core
             # Implicit GEMM (NHWC layout). IC=1 uses kAnalytic iterator.
-            self.conv1 = Conv2dActivation(1, odim, 3, stride=2, activation_type="relu")
-            self.conv2 = Conv2dActivation(odim, odim, 3, stride=2, activation_type="relu")
+            self.conv1 = Conv2dActivation(
+                1, odim, 3, stride=2, activation_type="relu")
+            self.conv2 = Conv2dActivation(
+                odim, odim, 3, stride=2, activation_type="relu")
             self.linear_dim = odim * (((idim - 1) // 2 - 1) // 2)
         elif subsampling_rate == 1:
             self.conv1 = None
@@ -336,7 +323,8 @@ class Conv2dSubsampling(nn.Module):
             b, t, f, c = x.size()
             # Flatten in c-major order to match WeNet's NCHW-based convention
             # (transpose(1,2).view on [b,c,t,f] == permute(0,1,3,2).view on [b,t,f,c])
-            x = x.permute(0, 1, 3, 2).contiguous().view(b, t, c * f)  # [N, T'', odim*F'']
+            x = x.permute(0, 1, 3, 2).contiguous().view(
+                b, t, c * f)  # [N, T'', odim*F'']
             x_mask = x_mask[:, :, 2::2][:, :, 2::2]
         x = self.out(x)
         x, pos_emb = self.pos_enc(x, offset)

@@ -76,10 +76,10 @@ cudaError_t ScaleLauncher(const T* input, T* output, T factor, int n,
 
 **Real examples:**
 
-- `include/oasr/activation.cuh` — `oasr::activation::GLU<T>()`, `oasr::activation::Swish<T>()`
-- `include/oasr/norm.cuh` — `oasr::norm::LayerNorm<T>()`, `oasr::norm::RMSNorm<T>()`
-- `include/oasr/conv/conv1d.cuh` — Depthwise/pointwise conv1d kernels
-- `include/oasr/gemm/gemm.cuh` — CUTLASS GEMM kernels
+- `include/oasr/activation.cuh` -- `oasr::activation::GLU<T>()`, `oasr::activation::Swish<T>()`
+- `include/oasr/norm.cuh` -- `oasr::norm::LayerNorm<T>()`, `oasr::norm::RMSNorm<T>()`
+- `include/oasr/conv/conv1d.cuh` -- Depthwise/pointwise conv1d kernels
+- `include/oasr/gemm/gemm.cuh` -- CUTLASS GEMM kernels
 
 ## Step 2: Create Launcher in `csrc/`
 
@@ -129,6 +129,7 @@ void scale_run(TensorView output, TensorView input, double factor) {
 - Dispatches on dtype with `DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16` (handles FP32/FP16/BF16)
 - Converts TensorView to raw pointers with `static_cast<T*>(x.data_ptr())`
 - Checks kernel result with `TVM_FFI_ICHECK`
+- Add descriptive error messages with `<<` operator
 
 **Available validation macros** (from `csrc/tvm_ffi_utils.h`):
 
@@ -149,9 +150,40 @@ void scale_run(TensorView output, TensorView input, double factor) {
 
 **TVM-FFI Error Handling:**
 
-- `TVM_FFI_ICHECK(condition) << "message"` — Assert with error message
-- `TVM_FFI_THROW(ValueError) << "message"` — Throw ValueError (normal runtime errors)
-- `TVM_FFI_LOG_AND_THROW(InternalError) << "message"` — Log + throw (for constructor/init errors that may not propagate)
+- `TVM_FFI_ICHECK(condition) << "message"` -- Assert with error message (used inside dispatch macros or when you need a simple assertion)
+- `TVM_FFI_THROW(ValueError) << "message"` -- Throw ValueError with custom message (standard runtime error handling)
+- `TVM_FFI_THROW(TypeError) << "message"` -- Throw TypeError
+- Use `<<` to chain multiple values in the error message
+- Errors are properly propagated back to Python
+
+**When to use `TVM_FFI_THROW` vs `TVM_FFI_LOG_AND_THROW`:**
+
+- **`TVM_FFI_THROW`**: Use for normal runtime error handling. This is the standard way to report errors that will be caught and propagated to Python.
+
+  ```cpp
+  void scale_run(TensorView output, TensorView input, double factor) {
+    if (!input.device().device_type == kDLCUDA) {
+      TVM_FFI_THROW(ValueError) << "Input must be a CUDA tensor";
+    }
+  }
+  ```
+
+- **`TVM_FFI_LOG_AND_THROW`**: Use only in cases where:
+  1. The function may be called during object construction time (e.g., validation in constructors or setup methods)
+  2. The exception may not be caught properly (e.g., during module initialization)
+  3. The error condition almost never fails in practice (e.g., internal errors, unsupported dtype combinations in dispatch macros)
+
+  This variant logs the error message before throwing, ensuring visibility even if the exception doesn't propagate correctly.
+
+  ```cpp
+  void check_weights_shape(std::string which_weights) const {
+    if (which_weights != "gemm1" && which_weights != "gemm2") {
+      // Internal error that should never happen - use LOG_AND_THROW
+      TVM_FFI_LOG_AND_THROW(InternalError)
+          << "Internal error: which_weights = " << which_weights;
+    }
+  }
+  ```
 
 **Real example** (from `csrc/activation.cu`):
 
@@ -198,7 +230,21 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, scale_run);
 
 - Include `"tvm_ffi_utils.h"` for TVM-FFI macros and type aliases
 - Forward declare the launcher function(s)
-- Export with `TVM_FFI_DLL_EXPORT_TYPED_FUNC(exported_name, function)` — the exported name is how Python accesses it
+- Export with `TVM_FFI_DLL_EXPORT_TYPED_FUNC(exported_name, function)` -- the exported name is how Python accesses it
+
+**Real example** (from `csrc/activation_jit_binding.cu`):
+
+```cpp
+#include "tvm_ffi_utils.h"
+
+// Forward declarations of launcher functions
+void glu(TensorView output, TensorView input);
+void swish(TensorView output, TensorView input);
+
+// TVM-FFI symbol exports
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(glu, glu);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(swish, swish);
+```
 
 **Real example** (from `csrc/norm_jit_binding.cu`):
 
@@ -216,7 +262,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm, rmsnorm);
 // ... more exports ...
 ```
 
-Note: Multiple launcher functions can be exported from a single binding file, as the norm family does.
+Note: Multiple launcher functions can be exported from a single binding file, as the norm and activation families do.
 
 ## Step 4: Create JIT Generator in `python/oasr/jit/`
 
@@ -243,25 +289,25 @@ def gen_scale_module() -> JitSpec:
 - Import `gen_jit_spec` and `JitSpec` from `.core`, paths from `.env`
 - `gen_jit_spec()` auto-detects GPU architecture and sets default NVCC flags
 - Source files are the launcher `.cu` + binding `.cu` from `csrc/`
-- **NEVER write to package directories** — JIT cache goes to `~/.cache/oasr/jit/`
+- **NEVER write to package directories** -- JIT cache goes to `~/.cache/oasr/jit/`
 
 **Real examples:**
 
 ```python
-# python/oasr/jit/norm.py
-def gen_norm_module() -> JitSpec:
-    return gen_jit_spec(
-        "norm",
-        [env.OASR_CSRC_DIR / "norm.cu",
-         env.OASR_CSRC_DIR / "norm_jit_binding.cu"],
-    )
-
 # python/oasr/jit/activation.py
 def gen_activation_module() -> JitSpec:
     return gen_jit_spec(
         "activation",
         [env.OASR_CSRC_DIR / "activation.cu",
          env.OASR_CSRC_DIR / "activation_jit_binding.cu"],
+    )
+
+# python/oasr/jit/norm.py
+def gen_norm_module() -> JitSpec:
+    return gen_jit_spec(
+        "norm",
+        [env.OASR_CSRC_DIR / "norm.cu",
+         env.OASR_CSRC_DIR / "norm_jit_binding.cu"],
     )
 ```
 
@@ -298,7 +344,7 @@ from oasr.jit import current_compilation_context
 def gen_my_hopper_only_module():
     """Example: Kernel works on SM90 and later supported architectures."""
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        # Explicitly list supported SM versions
+        # Explicitly list supported SM versions -- no automatic future compatibility
         supported_major_versions=[9, 10, 11, 12]  # SM90, SM100, SM110, SM120
     )
 
@@ -308,9 +354,21 @@ def gen_my_hopper_only_module():
         extra_cuda_cflags=nvcc_flags,
     )
 
+def gen_my_blackwell_only_module():
+    """Example: Kernel only works on SM100 (Blackwell)."""
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10]  # SM100 only
+    )
+
+    return gen_jit_spec(
+        name="my_blackwell_kernel",
+        sources=sources,
+        extra_cuda_cflags=nvcc_flags,
+    )
+
 def gen_my_universal_module():
     """Example: Kernel works on all architectures (default)."""
-    # No need to call get_nvcc_flags_list — gen_jit_spec auto-detects
+    # No need to call get_nvcc_flags_list -- gen_jit_spec auto-detects
     return gen_jit_spec(
         name="my_universal_kernel",
         sources=sources,
@@ -318,8 +376,8 @@ def gen_my_universal_module():
 ```
 
 **What Happens:**
-- If user's GPU is SM90 and they call a Hopper-only module → Compiles and runs
-- If user's GPU is SM80 and they call a Hopper-only module → `RuntimeError: No supported CUDA architectures found for major versions [9, 10, 11, 12]`
+- If user's GPU is SM90 and they call a Hopper-only module -> Compiles and runs
+- If user's GPU is SM80 and they call a Hopper-only module -> `RuntimeError: No supported CUDA architectures found for major versions [9, 10, 11, 12]`
 
 #### Common Architecture Specifications
 
@@ -328,6 +386,7 @@ def gen_my_universal_module():
 | `None` | All available GPUs | Universal kernels (default) |
 | `[9, 10, 11, 12]` | SM90, SM100, SM110, SM120 | Hopper, Blackwell |
 | `[10, 11, 12]` | SM100, SM110, SM120 | Blackwell only |
+| `[12]` | SM120 | Specific architecture only |
 | `[8, 9, 10, 11, 12]` | SM80, SM90, SM100, SM110, SM120 | Ampere, Hopper, Blackwell |
 
 ## Step 5: Create Python API in `python/oasr/`
@@ -341,7 +400,6 @@ from typing import Optional
 import torch
 
 from .api_logging import oasr_api
-from .utils import backend_requirement, supported_compute_capability
 
 
 @functools.cache
@@ -352,29 +410,7 @@ def _get_scale_module():
     return gen_scale_module().build_and_load()
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120])
-def _check_scale_problem_size(input: torch.Tensor, factor: float,
-                               out: Optional[torch.Tensor] = None) -> bool:
-    """Validate inputs for scale operation."""
-    if not input.is_cuda:
-        raise ValueError("Input must be a CUDA tensor")
-
-    if out is not None:
-        if out.shape != input.shape:
-            raise ValueError("Output shape mismatch")
-        if out.dtype != input.dtype:
-            raise ValueError("Output dtype mismatch")
-        if not out.is_cuda:
-            raise ValueError("Output must be a CUDA tensor")
-
-    return True
-
-
 @oasr_api
-@backend_requirement(
-    backend_checks={},  # No backend choices for this simple kernel
-    common_check=_check_scale_problem_size,
-)
 def scale(input: torch.Tensor, factor: float,
           out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Element-wise scale operation.
@@ -415,7 +451,6 @@ def scale(input: torch.Tensor, factor: float,
 
 - Uses `@functools.cache` to cache the compiled module (compile once per process)
 - `@oasr_api` decorator (from `oasr.api_logging`) enables debug logging
-- `@backend_requirement` (from `oasr.utils`) validates inputs and compute capability
 - **Destination-passing style**: Output tensor is an optional Python parameter (`out=None`) but **passed first** to the C++ TVM-FFI function
 - Import the JIT module lazily inside the cached function to avoid import-time compilation
 
@@ -428,17 +463,30 @@ def _get_activation_module():
     return gen_activation_module().build_and_load()
 
 
+@oasr_api
+def glu(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Gated Linear Unit activation."""
+    if out is None:
+        out = torch.empty(
+            input.shape[:-1] + (input.shape[-1] // 2,),
+            device=input.device, dtype=input.dtype,
+        )
+    _get_activation_module().glu(out, input)  # output first!
+    return out
+
+
+@oasr_api
 def swish(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Swish (SiLU) activation: x * sigmoid(x)."""
     if out is None:
         out = torch.empty_like(input)
-    _get_activation_module().swish(out, input)  # output first!
+    _get_activation_module().swish(out, input)
     return out
 ```
 
-### Using `@backend_requirement` and `@supported_compute_capability` Decorators
+### (Advanced) Using `@backend_requirement` and `@supported_compute_capability` Decorators
 
-Oasr provides two decorators (in `oasr.utils`) for enforcing compute capability and backend requirements:
+For kernels with compute capability requirements or multiple backend choices, Oasr provides two decorators (in `oasr.utils`):
 
 #### `@supported_compute_capability` Decorator
 
@@ -460,7 +508,7 @@ Enforces backend and problem size requirements at runtime. There are three usage
 
 **Pattern 1: Single Backend (No Backend Choices)**
 
-For kernels with only one implementation (like our scale example):
+For kernels with only one implementation:
 
 ```python
 from oasr.utils import backend_requirement, supported_compute_capability
@@ -627,6 +675,13 @@ class TestScale:
 
         expected = x * factor
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+    def test_scale_cpu_error(self):
+        """Test that CPU tensors raise an error."""
+        x = torch.randn(128, dtype=torch.float32)
+
+        with pytest.raises(Exception):
+            oasr.scale(x, 2.0)
 ```
 
 **Key points:**
@@ -724,9 +779,11 @@ pytest tests/test_scale.py::TestScale::test_scale_correctness -v
 
 ## Step 10: Add Benchmark
 
+**All new kernels should have benchmarks.** This helps track performance regressions and allows users to compare against other implementations.
+
 Benchmarks live in `benchmarks/` and use the unified routines framework in `benchmarks/routines/`. Each benchmark script delegates to a `run_standalone()` function.
 
-**Simple standalone benchmark** — create `benchmarks/bench_scale.py`:
+**Simple standalone benchmark** -- create `benchmarks/bench_scale.py`:
 
 ```python
 #!/usr/bin/env python3
@@ -807,6 +864,12 @@ median_s, std_s = bench_gpu_time(
 print(f"Median: {median_s*1e6:.2f} us, Std: {std_s*1e6:.2f} us")
 ```
 
+**For more complex kernels**, consider:
+
+- Adding comparisons against reference implementations (e.g., PyTorch native, cuBLAS, cuDNN)
+- Using the unified benchmarking framework in `benchmarks/oasr_benchmark.py` if applicable
+- Testing across different problem sizes and configurations
+
 **Benchmark utilities** (from `benchmarks/routines/bench_utils.py`):
 
 | Function | Purpose |
@@ -817,7 +880,7 @@ print(f"Median: {median_s*1e6:.2f} us, Std: {std_s*1e6:.2f} us")
 | `BenchResult(...)` | Structured result dataclass |
 | `OutputWriter()` | Manages terminal + CSV output |
 
-→ **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/SKILL.md`](../benchmark-kernel/SKILL.md)**
+-> **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/SKILL.md`](../benchmark-kernel/SKILL.md)**
 
 ## Existing OASR Kernel Families
 

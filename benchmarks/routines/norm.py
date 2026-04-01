@@ -35,6 +35,7 @@ SUBROUTINES = [
     "batch_norm_swish",
     "batch_norm_activation",
     "group_norm",
+    "cmvn",
 ]
 
 # ---------------------------------------------------------------------------
@@ -90,6 +91,13 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
         {"batch": 64, "seq": 250, "hidden": 512, "num_groups": 64},
         {"batch": 64, "seq": 500, "hidden": 512, "num_groups": 64},
     ],
+    "cmvn": [
+        {"batch": 32, "seq": 250, "hidden": 80},
+        {"batch": 64, "seq": 250, "hidden": 80},
+        {"batch": 64, "seq": 500, "hidden": 80},
+        {"batch": 64, "seq": 250, "hidden": 256},
+        {"batch": 64, "seq": 500, "hidden": 512},
+    ],
 }
 
 PROFILE_CONFIGS: dict[str, tuple] = {
@@ -101,6 +109,7 @@ PROFILE_CONFIGS: dict[str, tuple] = {
     "batch_norm_swish": (64, 250, 512),
     "batch_norm_activation": (64, 250, 512),
     "group_norm": (64, 250, 512, 64),
+    "cmvn": (64, 250, 80),
 }
 
 
@@ -274,6 +283,20 @@ def setup_group_norm(batch_size, seq_len, channels, num_groups, dtype=torch.floa
     return oasr_fn, pytorch_fn
 
 
+def setup_cmvn(batch_size, seq_len, num_cols, dtype=torch.float16):
+    x = torch.randn(batch_size, seq_len, num_cols, device="cuda", dtype=dtype)
+    mean = torch.randn(num_cols, device="cuda", dtype=dtype)
+    istd = torch.randn(num_cols, device="cuda", dtype=dtype).abs() + 0.1
+
+    def oasr_fn():
+        return oasr.cmvn(x, mean, istd)
+
+    def pytorch_fn():
+        return (x - mean) * istd
+
+    return oasr_fn, pytorch_fn
+
+
 # ---------------------------------------------------------------------------
 # CLI args
 # ---------------------------------------------------------------------------
@@ -395,6 +418,8 @@ def _setup_for_config(subroutine, cfg, dtype, activation_name="swish"):
     elif subroutine == "group_norm":
         num_groups = cfg.get("num_groups", 32)
         return setup_group_norm(b, s, h, num_groups, dtype)
+    elif subroutine == "cmvn":
+        return setup_cmvn(b, s, h, dtype)
     else:
         raise ValueError(f"Unknown norm subroutine: {subroutine}")
 
@@ -431,6 +456,10 @@ _STANDALONE_MAP = {
     "group_norm": {
         "title": "GroupNorm Kernel",
         "subroutines": ["group_norm"],
+    },
+    "cmvn": {
+        "title": "CMVN Kernel",
+        "subroutines": ["cmvn"],
     },
 }
 
@@ -492,6 +521,8 @@ def _make_profile_setup(subroutine):
             return setup_layer_norm_activation(*cfg_tuple)
         elif subroutine == "rms_norm":
             return setup_rms_norm(*cfg_tuple)
+        elif subroutine == "cmvn":
+            return setup_cmvn(*cfg_tuple)
         else:
             return setup_layer_norm(*cfg_tuple)
 

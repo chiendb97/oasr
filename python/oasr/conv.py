@@ -82,32 +82,6 @@ def depthwise_conv1d(
 
 
 @oasr_api
-def pointwise_conv1d(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Pointwise (1x1) convolution.
-
-    Args:
-        input: Input [batch, seq_len, in_channels].
-        weight: Weight [out_channels, in_channels].
-        bias: Optional bias [out_channels].
-        out: Optional pre-allocated output tensor.
-
-    Returns:
-        Output [batch, seq_len, out_channels].
-    """
-    if out is None:
-        batch, seq_len = input.shape[0], input.shape[1]
-        out_channels = weight.shape[0]
-        out = torch.empty(batch, seq_len, out_channels, device=input.device, dtype=input.dtype)
-    _get_conv_module().pointwise_conv1d(out, input, weight, bias)
-    return out
-
-
-@oasr_api
 def conv2d(
     input: torch.Tensor,
     filter: torch.Tensor,
@@ -196,23 +170,6 @@ def depthwise_conv1d_silu(
             device=input.device, dtype=input.dtype,
         )
     _get_conv_module().depthwise_conv1d_silu(out, input, weight, bias, padding)
-    return out
-
-
-@oasr_api
-def pointwise_conv1d_activation(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    activation_type: int = 2,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Pointwise (1x1) convolution with fused activation."""
-    if out is None:
-        batch, seq_len = input.shape[0], input.shape[1]
-        out_channels = weight.shape[0]
-        out = torch.empty(batch, seq_len, out_channels, device=input.device, dtype=input.dtype)
-    _get_conv_module().pointwise_conv1d_activation(out, input, weight, bias, activation_type)
     return out
 
 

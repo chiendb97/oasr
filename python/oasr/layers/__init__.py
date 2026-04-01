@@ -2,7 +2,7 @@
 
 from .conv import DepthwiseConv1d, PointwiseConv1d, Conv2d, Conv2dActivation
 from .linear import Linear
-from .norm import LayerNorm, RMSNorm, GroupNorm, BatchNorm1d, AddLayerNorm
+from .norm import LayerNorm, RMSNorm, GroupNorm, BatchNorm1d, AddLayerNorm, GlobalCMVN
 
 __all__ = [
     # Convolution
@@ -18,4 +18,5 @@ __all__ = [
     "GroupNorm",
     "BatchNorm1d",
     "AddLayerNorm",
+    "GlobalCMVN",
 ]
