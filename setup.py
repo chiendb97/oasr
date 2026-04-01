@@ -121,7 +121,7 @@ class CMakeBuild(build_ext):
 
 def get_version() -> str:
     """Get version from package __init__.py."""
-    version_file = Path(__file__).parent / "python" / "oasr" / "__init__.py"
+    version_file = Path(__file__).parent / "oasr" / "__init__.py"
     version = "0.1.0"
     
     if version_file.exists():
@@ -190,8 +190,7 @@ setup(
     license="Apache-2.0",
     
     # Package configuration
-    package_dir={"": "python"},
-    packages=find_packages(where="python"),
+    packages=find_packages(include=["oasr", "oasr.*"]),
     
     # C++ extension
     ext_modules=[CMakeExtension("oasr._C", sourcedir=".")],

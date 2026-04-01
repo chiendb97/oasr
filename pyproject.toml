@@ -81,7 +81,7 @@ Repository = "https://github.com/your-org/oasr"
 Issues = "https://github.com/your-org/oasr/issues"
 
 [tool.setuptools.packages.find]
-where = ["python"]
+include = ["oasr*"]
 
 [tool.black]
 line-length = 100
