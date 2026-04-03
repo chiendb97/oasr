@@ -5,11 +5,11 @@
 import os
 import pathlib
 
-# Root of the OASR package (python/oasr/)
+# Root of the OASR package (oasr/)
 _PACKAGE_DIR = pathlib.Path(__file__).resolve().parent.parent
 
 # Source directories (relative to project root)
-_PROJECT_ROOT = _PACKAGE_DIR.parent.parent
+_PROJECT_ROOT = _PACKAGE_DIR.parent
 
 OASR_CSRC_DIR = _PROJECT_ROOT / "csrc"
 OASR_INCLUDE_DIR = _PROJECT_ROOT / "include"
@@ -39,7 +39,7 @@ def _find_cutlass_include_dirs():
 
     Search order:
     1. CUTLASS_DIR environment variable
-    2. third_party/cutlass/ in the project tree
+    2. 3rdparty/cutlass/ in the project tree
     3. FlashInfer's bundled CUTLASS copy
     """
     def _collect_dirs(cutlass_root):
@@ -54,30 +54,10 @@ def _find_cutlass_include_dirs():
             dirs.append(str(util_inc))
         return dirs
 
-    # 1. Environment variable
-    env_dir = os.environ.get("CUTLASS_DIR")
-    if env_dir:
-        dirs = _collect_dirs(pathlib.Path(env_dir))
-        if dirs:
-            return dirs
-
-    # 2. Project third_party/
-    project_cutlass = _PROJECT_ROOT / "third_party" / "cutlass"
+    project_cutlass = _PROJECT_ROOT / "3rdparty" / "cutlass"
     dirs = _collect_dirs(project_cutlass)
-    if dirs:
-        return dirs
 
-    # 3. FlashInfer's bundled copy
-    try:
-        import flashinfer
-        fi_dir = pathlib.Path(flashinfer.__file__).parent / "data" / "cutlass"
-        dirs = _collect_dirs(fi_dir)
-        if dirs:
-            return dirs
-    except ImportError:
-        pass
-
-    return []
+    return dirs
 
 
 OASR_CUTLASS_INCLUDE_DIRS = _find_cutlass_include_dirs()

@@ -196,8 +196,11 @@ def get_unique_compile_configs(sm: int,
 
 TileShapeConfigs: List[TileShape] = [
     TileShape(BM=16, BN=128, BK=64, WM=16, WN=32, WK=64),
+    TileShape(BM=128, BN=16, BK=64, WM=32, WN=16, WK=64),
     TileShape(BM=32, BN=128, BK=64, WM=32, WN=32, WK=64),
+    TileShape(BM=128, BN=32, BK=64, WM=32, WN=32, WK=64),
     TileShape(BM=64, BN=128, BK=64, WM=32, WN=64, WK=64),
+    TileShape(BM=128, BN=64, BK=64, WM=64, WN=32, WK=64),
     TileShape(BM=64, BN=128, BK=64, WM=64, WN=32, WK=64),
     TileShape(BM=128, BN=64, BK=64, WM=64, WN=32, WK=64),
     TileShape(BM=128, BN=128, BK=64, WM=64, WN=32, WK=64),
@@ -206,6 +209,7 @@ TileShapeConfigs: List[TileShape] = [
     TileShape(BM=128, BN=256, BK=64, WM=64, WN=64, WK=64),
     TileShape(BM=256, BN=128, BK=64, WM=64, WN=64, WK=64),
     TileShape(BM=16, BN=256, BK=64, WM=16, WN=64, WK=64),
+    TileShape(BM=256, BN=16, BK=64, WM=64, WN=16, WK=64),
 ]
 
 TileShapeConfigsSm90: List[TileShapeSm90] = [
@@ -405,7 +409,7 @@ def group_gemm_func_name(cfg: CutlassGemmConfig) -> str:
 
 
 # =============================================================================
-# Default configs (used by non-autotuned paths in python/oasr/gemm.py)
+# Default configs (used by non-autotuned paths in oasr/gemm.py)
 # =============================================================================
 
 _sm = _get_target_sm()

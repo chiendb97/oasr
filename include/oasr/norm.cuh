@@ -13,7 +13,6 @@
 
 #include <algorithm>
 #include <cstdint>
-
 #include <oasr/common/math.h>
 #include <oasr/common/types.h>
 #include <oasr/common/vec_dtypes.h>
@@ -119,8 +118,8 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
         local_sum += oasr::vecSum(v);
     }
 
-    float mean = broadcastFromThread0(
-        blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
+    float mean =
+        broadcastFromThread0(blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
 
     // Phase 2: Compute variance using vectorized loads
     float local_var = 0.0f;
@@ -130,14 +129,14 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
             float diff = static_cast<float>(v[j]) - mean;
-            local_var += diff * diff;
+            local_var = std::fmaf(diff, diff, local_var);
         }
     }
 
-    float inv_std = rsqrtf(
-        broadcastFromThread0(
-            blockReduceSum(local_var) / static_cast<float>(hidden_size), &smem[1])
-        + eps);
+    float inv_std =
+        rsqrtf(broadcastFromThread0(blockReduceSum(local_var) / static_cast<float>(hidden_size),
+                                    &smem[1]) +
+               eps);
 
     // Phase 3: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -148,8 +147,8 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
         oasr::Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            float normalized = (static_cast<float>(v_in[j]) - mean) * inv_std;
-            vals[j] = normalized * static_cast<float>(v_weight[j]);
+            vals[j] =
+                (static_cast<float>(v_in[j]) - mean) * inv_std * static_cast<float>(v_weight[j]);
         }
 
         if (bias != nullptr) {
@@ -162,71 +161,6 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
         }
 
         oasr::vecCast<T>(vals).store(row_output + i * VecSize);
-    }
-}
-
-// =============================================================================
-// LayerNorm Kernel (small hidden size, fits in one block)
-// =============================================================================
-
-template <typename T, int HIDDEN_SIZE>
-__global__ void layerNormKernelSmall(const T* __restrict__ input, T* __restrict__ output,
-                                     const T* __restrict__ weight, const T* __restrict__ bias,
-                                     float eps) {
-    const int row_idx = blockIdx.x;
-    const T* row_input = input + row_idx * HIDDEN_SIZE;
-    T* row_output = output + row_idx * HIDDEN_SIZE;
-
-    // Each thread handles multiple elements
-    constexpr int ELEMENTS_PER_THREAD = (HIDDEN_SIZE + 255) / 256;
-
-    float vals[ELEMENTS_PER_THREAD];
-    float local_sum = 0.0f;
-
-#pragma unroll
-    for (int i = 0; i < ELEMENTS_PER_THREAD; i++) {
-        int idx = threadIdx.x + i * blockDim.x;
-        if (idx < HIDDEN_SIZE) {
-            vals[i] = static_cast<float>(row_input[idx]);
-            local_sum += vals[i];
-        }
-    }
-
-    __shared__ float smem[2];
-
-    // Reduce to get mean
-    float mean = broadcastFromThread0(
-        blockReduceSum(local_sum) / static_cast<float>(HIDDEN_SIZE), &smem[0]);
-
-    // Compute variance
-    float local_var = 0.0f;
-#pragma unroll
-    for (int i = 0; i < ELEMENTS_PER_THREAD; i++) {
-        int idx = threadIdx.x + i * blockDim.x;
-        if (idx < HIDDEN_SIZE) {
-            float diff = vals[i] - mean;
-            local_var += diff * diff;
-        }
-    }
-
-    float inv_std = rsqrtf(
-        broadcastFromThread0(
-            blockReduceSum(local_var) / static_cast<float>(HIDDEN_SIZE), &smem[1])
-        + eps);
-
-// Write output
-#pragma unroll
-    for (int i = 0; i < ELEMENTS_PER_THREAD; i++) {
-        int idx = threadIdx.x + i * blockDim.x;
-        if (idx < HIDDEN_SIZE) {
-            float normalized = (vals[i] - mean) * inv_std;
-            float w = static_cast<float>(weight[idx]);
-            float scaled = normalized * w;
-            if (bias != nullptr) {
-                scaled += static_cast<float>(bias[idx]);
-            }
-            row_output[idx] = static_cast<T>(scaled);
-        }
     }
 }
 
@@ -256,10 +190,10 @@ __global__ void rmsNormKernel(const T* __restrict__ input, T* __restrict__ outpu
         local_sum_sq += oasr::vecSumSquares(v);
     }
 
-    float inv_rms = rsqrtf(
-        broadcastFromThread0(
-            blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size), &smem)
-        + eps);
+    float inv_rms =
+        rsqrtf(broadcastFromThread0(blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size),
+                                    &smem) +
+               eps);
 
     // Phase 2: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -306,40 +240,23 @@ __global__ void batchNorm1DKernel(const T* __restrict__ input, T* __restrict__ o
         int flat_idx = idx * VecSize;
         int c_start = flat_idx % channels;
 
-        // Check if this is an aligned vector access within channels
-        if (c_start + VecSize <= channels && c_start % VecSize == 0) {
-            VecT v_in, v_weight, v_bias, v_mean, v_var;
-            v_in.load(input + flat_idx);
-            v_weight.load(weight + c_start);
-            v_bias.load(bias + c_start);
-            v_mean.load(running_mean + c_start);
-            v_var.load(running_var + c_start);
+        VecT v_in, v_weight, v_bias, v_mean, v_var;
+        v_in.load(input + flat_idx);
+        v_weight.load(weight + c_start);
+        v_bias.load(bias + c_start);
+        v_mean.load(running_mean + c_start);
+        v_var.load(running_var + c_start);
 
-            oasr::Vec<float, VecSize> vals;
+        oasr::Vec<float, VecSize> vals;
 #pragma unroll
-            for (int j = 0; j < VecSize; j++) {
-                float inv_std = rsqrtf(static_cast<float>(v_var[j]) + eps);
-                float x = static_cast<float>(v_in[j]);
-                float normalized = (x - static_cast<float>(v_mean[j])) * inv_std;
-                vals[j] =
-                    normalized * static_cast<float>(v_weight[j]) + static_cast<float>(v_bias[j]);
-            }
-
-            oasr::vecCast<T>(vals).store(output + flat_idx);
-        } else {
-            // Fall back to scalar for unaligned accesses
-            for (int j = 0; j < VecSize && flat_idx + j < total_elements; j++) {
-                int c = (flat_idx + j) % channels;
-                float mean = static_cast<float>(running_mean[c]);
-                float var = static_cast<float>(running_var[c]);
-                float g = static_cast<float>(weight[c]);
-                float b = static_cast<float>(bias[c]);
-                float inv_std = rsqrtf(var + eps);
-                float x = static_cast<float>(input[flat_idx + j]);
-                float normalized = (x - mean) * inv_std;
-                output[flat_idx + j] = static_cast<T>(normalized * g + b);
-            }
+        for (int j = 0; j < VecSize; j++) {
+            vals[j] = (static_cast<float>(v_in[j]) - static_cast<float>(v_mean[j])) *
+                          rsqrtf(static_cast<float>(v_var[j]) + eps) *
+                          static_cast<float>(v_weight[j]) +
+                      static_cast<float>(v_bias[j]);
         }
+
+        oasr::vecCast<T>(vals).store(output + flat_idx);
     }
 }
 
@@ -449,8 +366,9 @@ __global__ void groupNormKernel(const T* __restrict__ input, T* __restrict__ out
         oasr::Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            float n = (static_cast<float>(v_in[j]) - mean_g) * inv_std_g;
-            vals[j] = n * static_cast<float>(v_weight[j]) + static_cast<float>(v_bias[j]);
+            vals[j] = (static_cast<float>(v_in[j]) - mean_g) * inv_std_g *
+                          static_cast<float>(v_weight[j]) +
+                      static_cast<float>(v_bias[j]);
         }
         oasr::vecCast<T>(vals).store(out_row + c);
     }
@@ -488,8 +406,8 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
         }
     }
 
-    float mean = broadcastFromThread0(
-        blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
+    float mean =
+        broadcastFromThread0(blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
 
     // Phase 2: Compute variance using vectorized loads
     float local_var = 0.0f;
@@ -500,16 +418,15 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
 
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            float val = static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]);
-            float diff = val - mean;
-            local_var += diff * diff;
+            float diff = static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]) - mean;
+            local_var = std::fmaf(diff, diff, local_var);
         }
     }
 
-    float inv_std = rsqrtf(
-        broadcastFromThread0(
-            blockReduceSum(local_var) / static_cast<float>(hidden_size), &smem[1])
-        + eps);
+    float inv_std =
+        rsqrtf(broadcastFromThread0(blockReduceSum(local_var) / static_cast<float>(hidden_size),
+                                    &smem[1]) +
+               eps);
 
     // Phase 3: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -521,9 +438,8 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
         oasr::Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            float val = static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]);
-            float normalized = (val - mean) * inv_std;
-            vals[j] = normalized * static_cast<float>(v_weight[j]);
+            vals[j] = (static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]) - mean) *
+                      inv_std * static_cast<float>(v_weight[j]);
         }
 
         if (bias != nullptr) {
@@ -587,8 +503,8 @@ __global__ void layerNormActKernel(const T* __restrict__ input, T* __restrict__ 
         local_sum += oasr::vecSum(v);
     }
 
-    float mean = broadcastFromThread0(
-        blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
+    float mean =
+        broadcastFromThread0(blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
 
     // Phase 2: Compute variance
     float local_var = 0.0f;
@@ -598,14 +514,14 @@ __global__ void layerNormActKernel(const T* __restrict__ input, T* __restrict__ 
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
             float diff = static_cast<float>(v[j]) - mean;
-            local_var += diff * diff;
+            local_var = std::fmaf(diff, diff, local_var);
         }
     }
 
-    float inv_std = rsqrtf(
-        broadcastFromThread0(
-            blockReduceSum(local_var) / static_cast<float>(hidden_size), &smem[1])
-        + eps);
+    float inv_std =
+        rsqrtf(broadcastFromThread0(blockReduceSum(local_var) / static_cast<float>(hidden_size),
+                                    &smem[1]) +
+               eps);
 
     // Phase 3: Normalize, scale, and apply activation
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -616,8 +532,8 @@ __global__ void layerNormActKernel(const T* __restrict__ input, T* __restrict__ 
         oasr::Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            float normalized = (static_cast<float>(v_in[j]) - mean) * inv_std;
-            vals[j] = normalized * static_cast<float>(v_weight[j]);
+            vals[j] =
+                (static_cast<float>(v_in[j]) - mean) * inv_std * static_cast<float>(v_weight[j]);
         }
 
         if (bias != nullptr) {
@@ -665,10 +581,10 @@ __global__ void rmsNormActKernel(const T* __restrict__ input, T* __restrict__ ou
         local_sum_sq += oasr::vecSumSquares(v);
     }
 
-    float inv_rms = rsqrtf(
-        broadcastFromThread0(
-            blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size), &smem)
-        + eps);
+    float inv_rms =
+        rsqrtf(broadcastFromThread0(blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size),
+                                    &smem) +
+               eps);
 
     // Phase 2: Normalize, scale, and apply activation
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -720,36 +636,23 @@ __global__ void batchNormActKernel(const T* __restrict__ input, T* __restrict__ 
         int flat_idx = idx * VecSize;
         int c_start = flat_idx % channels;
 
-        if (c_start + VecSize <= channels && c_start % VecSize == 0) {
-            VecT v_in, v_weight, v_bias, v_mean, v_var;
-            v_in.load(input + flat_idx);
-            v_weight.load(weight + c_start);
-            v_bias.load(bias + c_start);
-            v_mean.load(running_mean + c_start);
-            v_var.load(running_var + c_start);
+        VecT v_in, v_weight, v_bias, v_mean, v_var;
+        v_in.load(input + flat_idx);
+        v_weight.load(weight + c_start);
+        v_bias.load(bias + c_start);
+        v_mean.load(running_mean + c_start);
+        v_var.load(running_var + c_start);
 
-            oasr::Vec<float, VecSize> vals;
+        oasr::Vec<float, VecSize> vals;
 #pragma unroll
-            for (int j = 0; j < VecSize; j++) {
-                float inv_std = rsqrtf(static_cast<float>(v_var[j]) + eps);
-                float x = static_cast<float>(v_in[j]);
-                float bn_out = (x - static_cast<float>(v_mean[j])) * inv_std
-                               * static_cast<float>(v_weight[j]) + static_cast<float>(v_bias[j]);
-                vals[j] = act(bn_out);
-            }
-
-            oasr::vecCast<T>(vals).store(output + flat_idx);
-        } else {
-            // Fall back to scalar for unaligned accesses
-            for (int j = 0; j < VecSize && flat_idx + j < total_elements; j++) {
-                int c = (flat_idx + j) % channels;
-                float inv_std = rsqrtf(static_cast<float>(running_var[c]) + eps);
-                float x = static_cast<float>(input[flat_idx + j]);
-                float bn_out = (x - static_cast<float>(running_mean[c])) * inv_std
-                               * static_cast<float>(weight[c]) + static_cast<float>(bias[c]);
-                output[flat_idx + j] = static_cast<T>(act(bn_out));
-            }
+        for (int j = 0; j < VecSize; j++) {
+            vals[j] = act((static_cast<float>(v_in[j]) - static_cast<float>(v_mean[j])) *
+                              rsqrtf(static_cast<float>(v_var[j]) + eps) *
+                              static_cast<float>(v_weight[j]) +
+                          static_cast<float>(v_bias[j]));
         }
+
+        oasr::vecCast<T>(vals).store(output + flat_idx);
     }
 }
 
@@ -759,8 +662,8 @@ __global__ void batchNormActKernel(const T* __restrict__ input, T* __restrict__ 
 
 template <typename T, int VecSize>
 __global__ void cmvnKernel(const T* __restrict__ input, T* __restrict__ output,
-                           const T* __restrict__ mean, const T* __restrict__ istd,
-                           int num_rows, int num_cols) {
+                           const T* __restrict__ mean, const T* __restrict__ istd, int num_rows,
+                           int num_cols) {
     using VecT = oasr::Vec<T, VecSize>;
 
     const int total_elements = num_rows * num_cols;
@@ -770,29 +673,19 @@ __global__ void cmvnKernel(const T* __restrict__ input, T* __restrict__ output,
         int flat_idx = idx * VecSize;
         int c_start = flat_idx % num_cols;
 
-        if (c_start + VecSize <= num_cols && c_start % VecSize == 0) {
-            VecT v_in, v_mean, v_istd;
-            v_in.load(input + flat_idx);
-            v_mean.load(mean + c_start);
-            v_istd.load(istd + c_start);
+        VecT v_in, v_mean, v_istd;
+        v_in.load(input + flat_idx);
+        v_mean.load(mean + c_start);
+        v_istd.load(istd + c_start);
 
-            oasr::Vec<float, VecSize> vals;
+        oasr::Vec<float, VecSize> vals;
 #pragma unroll
-            for (int j = 0; j < VecSize; j++) {
-                vals[j] = (static_cast<float>(v_in[j]) - static_cast<float>(v_mean[j]))
-                           * static_cast<float>(v_istd[j]);
-            }
-
-            oasr::vecCast<T>(vals).store(output + flat_idx);
-        } else {
-            for (int j = 0; j < VecSize && flat_idx + j < total_elements; j++) {
-                int c = (flat_idx + j) % num_cols;
-                float x = static_cast<float>(input[flat_idx + j]);
-                float m = static_cast<float>(mean[c]);
-                float s = static_cast<float>(istd[c]);
-                output[flat_idx + j] = static_cast<T>((x - m) * s);
-            }
+        for (int j = 0; j < VecSize; j++) {
+            vals[j] = (static_cast<float>(v_in[j]) - static_cast<float>(v_mean[j])) *
+                      static_cast<float>(v_istd[j]);
         }
+
+        oasr::vecCast<T>(vals).store(output + flat_idx);
     }
 }
 
@@ -808,8 +701,8 @@ cudaError_t LayerNorm(const T* input, const T* weight, const T* bias, T* output,
                       cudaStream_t stream) {
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
-    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize))
-                   && isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
+                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
@@ -831,8 +724,8 @@ cudaError_t RMSNorm(const T* input, const T* weight, const T* bias, T* output,
                     cudaStream_t stream) {
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
-    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize))
-                   && isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
+                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
@@ -849,31 +742,28 @@ cudaError_t RMSNorm(const T* input, const T* weight, const T* bias, T* output,
 // ---- BatchNorm1D ----
 
 template <typename T>
-cudaError_t BatchNorm1D(const T* input, const T* weight, const T* bias,
-                        const T* running_mean, const T* running_var, T* output,
-                        unsigned int batch_size, unsigned int seq_len, unsigned int channels,
-                        float eps, cudaStream_t stream) {
+cudaError_t BatchNorm1D(const T* input, const T* weight, const T* bias, const T* running_mean,
+                        const T* running_var, T* output, unsigned int batch_size,
+                        unsigned int seq_len, unsigned int channels, float eps,
+                        cudaStream_t stream) {
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     int total_elements = static_cast<int>(batch_size * seq_len * channels);
     int block_size = 256;
 
-    bool use_vec = (channels >= static_cast<unsigned int>(VecSize))
-                   && (channels % VecSize == 0)
-                   && isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+    bool use_vec = (channels >= static_cast<unsigned int>(VecSize)) && (channels % VecSize == 0) &&
+                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
 
     if (use_vec) {
         int grid_size = (total_elements / VecSize + block_size - 1) / block_size;
         batchNorm1DKernel<T, VecSize><<<grid_size, block_size, 0, stream>>>(
-            input, output, weight, bias, running_mean, running_var,
-            static_cast<int>(batch_size), static_cast<int>(seq_len),
-            static_cast<int>(channels), eps);
+            input, output, weight, bias, running_mean, running_var, static_cast<int>(batch_size),
+            static_cast<int>(seq_len), static_cast<int>(channels), eps);
     } else {
         int grid_size = (total_elements + block_size - 1) / block_size;
         batchNorm1DKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
-            input, output, weight, bias, running_mean, running_var,
-            static_cast<int>(batch_size), static_cast<int>(seq_len),
-            static_cast<int>(channels), eps);
+            input, output, weight, bias, running_mean, running_var, static_cast<int>(batch_size),
+            static_cast<int>(seq_len), static_cast<int>(channels), eps);
     }
     return cudaGetLastError();
 }
@@ -892,20 +782,18 @@ cudaError_t GroupNorm(const T* input, const T* weight, const T* bias, T* output,
     int num_warps = block_size / WARP_SIZE;
     size_t smem_bytes = sizeof(float) * (2 * num_groups + 2 * static_cast<unsigned int>(num_warps));
 
-    bool use_vec = (static_cast<int>(channels_per_group) >= VecSize)
-                   && isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output)
-                   && isAligned<T, VecSize>(weight) && isAligned<T, VecSize>(bias);
+    bool use_vec = (static_cast<int>(channels_per_group) >= VecSize) &&
+                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output) &&
+                   isAligned<T, VecSize>(weight) && isAligned<T, VecSize>(bias);
 
     if (use_vec) {
         groupNormKernel<T, VecSize><<<num_blocks, block_size, smem_bytes, stream>>>(
-            input, output, weight, bias, static_cast<int>(batch_size),
-            static_cast<int>(seq_len), static_cast<int>(channels),
-            static_cast<int>(num_groups), eps);
+            input, output, weight, bias, static_cast<int>(batch_size), static_cast<int>(seq_len),
+            static_cast<int>(channels), static_cast<int>(num_groups), eps);
     } else {
         groupNormKernel<T, 1><<<num_blocks, block_size, smem_bytes, stream>>>(
-            input, output, weight, bias, static_cast<int>(batch_size),
-            static_cast<int>(seq_len), static_cast<int>(channels),
-            static_cast<int>(num_groups), eps);
+            input, output, weight, bias, static_cast<int>(batch_size), static_cast<int>(seq_len),
+            static_cast<int>(channels), static_cast<int>(num_groups), eps);
     }
     return cudaGetLastError();
 }
@@ -918,9 +806,9 @@ cudaError_t AddLayerNorm(const T* input, const T* residual, const T* weight, con
                          cudaStream_t stream) {
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
-    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize))
-                   && isAligned<T, VecSize>(input) && isAligned<T, VecSize>(residual)
-                   && isAligned<T, VecSize>(output);
+    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
+                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(residual) &&
+                   isAligned<T, VecSize>(output);
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
@@ -942,8 +830,8 @@ cudaError_t LayerNormActivation(const T* input, const T* weight, const T* bias, 
                                 ActivationType activation, cudaStream_t stream) {
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
-    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize))
-                   && isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
+                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
 
     cudaError_t err = cudaSuccess;
     dispatchActivation(activation, [&](auto act) {
@@ -970,8 +858,8 @@ cudaError_t RMSNormActivation(const T* input, const T* weight, const T* bias, T*
                               ActivationType activation, cudaStream_t stream) {
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
-    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize))
-                   && isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
+                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
 
     cudaError_t err = cudaSuccess;
     dispatchActivation(activation, [&](auto act) {
@@ -993,28 +881,25 @@ cudaError_t RMSNormActivation(const T* input, const T* weight, const T* bias, T*
 // ---- CMVN ----
 
 template <typename T>
-cudaError_t CMVN(const T* input, const T* mean, const T* istd, T* output,
-                 unsigned int num_rows, unsigned int num_cols, cudaStream_t stream) {
+cudaError_t CMVN(const T* input, const T* mean, const T* istd, T* output, unsigned int num_rows,
+                 unsigned int num_cols, cudaStream_t stream) {
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     int total_elements = static_cast<int>(num_rows * num_cols);
     int block_size = 256;
 
-    bool use_vec = (num_cols >= static_cast<unsigned int>(VecSize))
-                   && (num_cols % VecSize == 0)
-                   && isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output)
-                   && isAligned<T, VecSize>(mean) && isAligned<T, VecSize>(istd);
+    bool use_vec = (num_cols >= static_cast<unsigned int>(VecSize)) && (num_cols % VecSize == 0) &&
+                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output) &&
+                   isAligned<T, VecSize>(mean) && isAligned<T, VecSize>(istd);
 
     if (use_vec) {
         int grid_size = (total_elements / VecSize + block_size - 1) / block_size;
         cmvnKernel<T, VecSize><<<grid_size, block_size, 0, stream>>>(
-            input, output, mean, istd, static_cast<int>(num_rows),
-            static_cast<int>(num_cols));
+            input, output, mean, istd, static_cast<int>(num_rows), static_cast<int>(num_cols));
     } else {
         int grid_size = (total_elements + block_size - 1) / block_size;
         cmvnKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
-            input, output, mean, istd, static_cast<int>(num_rows),
-            static_cast<int>(num_cols));
+            input, output, mean, istd, static_cast<int>(num_rows), static_cast<int>(num_cols));
     }
     return cudaGetLastError();
 }
@@ -1032,9 +917,8 @@ cudaError_t BatchNormActivation(const T* input, const T* weight, const T* bias,
     int total_elements = static_cast<int>(batch_size * seq_len * channels);
     int block_size = 256;
 
-    bool use_vec = (channels >= static_cast<unsigned int>(VecSize))
-                   && (channels % VecSize == 0)
-                   && isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+    bool use_vec = (channels >= static_cast<unsigned int>(VecSize)) && (channels % VecSize == 0) &&
+                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
 
     cudaError_t err = cudaSuccess;
     dispatchActivation(activation, [&](auto act) {
@@ -1043,14 +927,14 @@ cudaError_t BatchNormActivation(const T* input, const T* weight, const T* bias,
             int grid_size = (total_elements / VecSize + block_size - 1) / block_size;
             batchNormActKernel<T, VecSize, ActFn><<<grid_size, block_size, 0, stream>>>(
                 input, output, weight, bias, running_mean, running_var,
-                static_cast<int>(batch_size), static_cast<int>(seq_len),
-                static_cast<int>(channels), eps);
+                static_cast<int>(batch_size), static_cast<int>(seq_len), static_cast<int>(channels),
+                eps);
         } else {
             int grid_size = (total_elements + block_size - 1) / block_size;
             batchNormActKernel<T, 1, ActFn><<<grid_size, block_size, 0, stream>>>(
                 input, output, weight, bias, running_mean, running_var,
-                static_cast<int>(batch_size), static_cast<int>(seq_len),
-                static_cast<int>(channels), eps);
+                static_cast<int>(batch_size), static_cast<int>(seq_len), static_cast<int>(channels),
+                eps);
         }
         err = cudaGetLastError();
     });
@@ -1060,10 +944,10 @@ cudaError_t BatchNormActivation(const T* input, const T* weight, const T* bias,
 // ---- BatchNormSwish (convenience wrapper) ----
 
 template <typename T>
-cudaError_t BatchNormSwish(const T* input, const T* weight, const T* bias,
-                           const T* running_mean, const T* running_var, T* output,
-                           unsigned int batch_size, unsigned int seq_len, unsigned int channels,
-                           float eps, cudaStream_t stream) {
+cudaError_t BatchNormSwish(const T* input, const T* weight, const T* bias, const T* running_mean,
+                           const T* running_var, T* output, unsigned int batch_size,
+                           unsigned int seq_len, unsigned int channels, float eps,
+                           cudaStream_t stream) {
     return BatchNormActivation<T>(input, weight, bias, running_mean, running_var, output,
                                   batch_size, seq_len, channels, eps, ActivationType::SWISH,
                                   stream);
