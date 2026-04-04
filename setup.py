@@ -28,6 +28,53 @@ class CMakeExtension(Extension):
         self.sourcedir = os.path.abspath(sourcedir)
 
 
+def _find_k2_cmake_dir():
+    """Return the directory containing k2Config.cmake, or None if k2 is not installed.
+
+    Works without importing k2 (safe inside pip's isolated build env) by
+    probing known site-packages paths directly.
+    """
+    import glob
+    import sysconfig as _sc
+    import site
+
+    # Collect candidate site-packages directories (system + user + venv).
+    site_dirs = []
+    for scheme in ("purelib", "platlib"):
+        try:
+            site_dirs.append(_sc.get_path(scheme))
+        except Exception:
+            pass
+    try:
+        site_dirs.extend(site.getsitepackages())
+    except AttributeError:
+        pass
+    try:
+        site_dirs.append(site.getusersitepackages())
+    except AttributeError:
+        pass
+
+    for site_dir in dict.fromkeys(d for d in site_dirs if d):  # dedup, preserve order
+        k2_pkg_dir = os.path.join(site_dir, "k2")
+        if not os.path.isdir(k2_pkg_dir):
+            continue
+        # Standard k2 pip layout: k2/share/cmake/k2/k2Config.cmake
+        for candidate in (
+            os.path.join(k2_pkg_dir, "share", "cmake", "k2"),
+            os.path.join(k2_pkg_dir, "cmake"),
+            k2_pkg_dir,
+        ):
+            if os.path.isfile(os.path.join(candidate, "k2Config.cmake")):
+                return candidate
+        # Fallback: glob anywhere under the package dir
+        hits = glob.glob(
+            os.path.join(k2_pkg_dir, "**", "k2Config.cmake"), recursive=True
+        )
+        if hits:
+            return os.path.dirname(hits[0])
+    return None
+
+
 def _find_torch_cmake_prefix():
     """Find torch cmake prefix, even inside pip's isolated build env."""
     try:
@@ -55,6 +102,28 @@ def _find_torch_cmake_prefix():
         pass
 
     return None
+
+
+def _detect_cuda_architectures() -> str:
+    """Return a semicolon-separated list of CUDA SM versions for the host GPUs.
+
+    Queries torch.cuda to find the actual device capabilities so we never pass
+    an architecture that the installed CUDA toolkit does not support (e.g.
+    compute_70 was dropped in CUDA 12.x).  Falls back to 80;86;89;90 if CUDA
+    is unavailable or the query fails.
+    """
+    _FALLBACK = "80;86;89;90"
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return _FALLBACK
+        archs: set[str] = set()
+        for i in range(torch.cuda.device_count()):
+            major, minor = torch.cuda.get_device_capability(i)
+            archs.add(f"{major}{minor}")
+        return ";".join(sorted(archs)) if archs else _FALLBACK
+    except Exception:
+        return _FALLBACK
 
 
 class CMakeBuild(build_ext):
@@ -87,14 +156,32 @@ class CMakeBuild(build_ext):
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         cmake_args.append(f"-DCMAKE_BUILD_TYPE={build_type}")
         
-        # CUDA architectures
-        cuda_arch = os.environ.get("CUDA_ARCHITECTURES", "70;75;80;86;89;90")
+        # CUDA architectures: honour explicit override, otherwise auto-detect
+        # from available GPUs via PyTorch.  Fall back to a conservative modern
+        # set (80+) that works on CUDA 11.8+ without requiring Volta support.
+        cuda_arch = os.environ.get("CUDA_ARCHITECTURES") or _detect_cuda_architectures()
         cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}")
         
         if os.environ.get("OASR_USE_FLASH_ATTENTION", "0") == "1":
             cmake_args.append("-DUSE_FLASH_ATTENTION=ON")
         else:
             cmake_args.append("-DUSE_FLASH_ATTENTION=OFF")
+
+        if os.environ.get("OASR_USE_K2", "0") == "1":
+            cmake_args.append("-DOASR_USE_K2=ON")
+            # Resolve k2's CMake config dir here (real Python env, k2 importable)
+            # and pass it explicitly so the pip isolated-env CMake step doesn't
+            # need to import k2 itself.
+            k2_cmake_dir = _find_k2_cmake_dir()
+            if k2_cmake_dir:
+                cmake_args.append(f"-Dk2_DIR={k2_cmake_dir}")
+            else:
+                raise RuntimeError(
+                    "OASR_USE_K2=1 requires k2 to be installed. "
+                    "Run: pip install k2"
+                )
+        else:
+            cmake_args.append("-DOASR_USE_K2=OFF")
         
         # Build arguments
         build_args = ["--config", build_type]

@@ -11,6 +11,7 @@ option(BUILD_EXAMPLES "Build examples" OFF)
 option(USE_FLASH_ATTENTION "Use FlashAttention kernels" OFF)
 option(ENABLE_FP16 "Enable FP16 support" ON)
 option(ENABLE_BF16 "Enable BF16 support" ON)
+option(OASR_USE_K2 "Enable K2 WFST beam search decoder (requires K2)" OFF)
 
 # =============================================================================
 # Global settings
@@ -156,7 +157,9 @@ endif()
 # ---------------------------------------------------------------------------
 set(OASR_SOURCES
     csrc/decoder/common/utils.cc
+    csrc/decoder/context_graph.cc
     csrc/decoder/ctc_prefix_beam_search.cc
+    csrc/decoder/ctc_greedy_search.cc
 )
 
 set(OASR_HEADERS
@@ -170,8 +173,24 @@ set(OASR_HEADERS
     # Decoder headers
     csrc/decoder/common/utils.h
     csrc/decoder/search_interface.h
+    csrc/decoder/context_graph.h
     csrc/decoder/ctc_prefix_beam_search.h
+    csrc/decoder/ctc_greedy_search.h
+    csrc/decoder/ctc_wfst_beam_search.h
 )
+
+# =============================================================================
+# Optional: K2 WFST decoder
+# =============================================================================
+if(OASR_USE_K2)
+    # k2_DIR must be set by the caller (setup.py resolves it from the installed
+    # k2 Python package and passes -Dk2_DIR=... on the cmake command line).
+    # Manual builds: cmake -DOASR_USE_K2=ON -Dk2_DIR=$(python -c
+    #   "import k2,os; print(os.path.join(os.path.dirname(k2.__file__),'share','cmake','k2'))")
+    find_package(k2 REQUIRED)
+    list(APPEND OASR_SOURCES csrc/decoder/ctc_wfst_beam_search.cc)
+    message(STATUS "K2 WFST decoder enabled (k2 version: ${k2_VERSION})")
+endif()
 
 # =============================================================================
 # Library target (decoder only — kernel launchers are JIT-compiled at runtime)
@@ -182,6 +201,14 @@ target_include_directories(oasr_core PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/csrc
 )
+
+if(OASR_USE_K2)
+    target_compile_definitions(oasr_core PUBLIC OASR_USE_K2)
+    # k2/torch_api.h includes torch/script.h, so oasr_core needs Torch headers.
+    target_include_directories(oasr_core PUBLIC ${TORCH_INCLUDE_DIRS})
+    target_link_libraries(oasr_core PUBLIC k2_torch_api ${TORCH_LIBRARIES})
+    message(STATUS "Linking oasr_core with K2")
+endif()
 
 # =============================================================================
 # Python module

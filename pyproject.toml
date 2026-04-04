@@ -67,6 +67,10 @@ dev = [
     "mypy>=1.0.0",
     "ruff>=0.1.0",
 ]
+wfst = [
+    "k2>=1.24",
+    "kaldilm",
+]
 all = [
     "oasr[audio,serving]",
 ]

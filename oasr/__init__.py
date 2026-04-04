@@ -76,6 +76,11 @@ def _register_c_extension():
 
 _register_c_extension()
 
+# =============================================================================
+# High-level decoder API
+# =============================================================================
+from .decode import Decoder, DecoderConfig, DecoderResult
+
 
 def __getattr__(name: str):
     """Lazily expose C extension symbols (kernels, enums, synchronize, ...)."""
@@ -147,6 +152,10 @@ __all__ = [
     "autotune",
     "enable_autotune",
     "disable_autotune",
+    # High-level decoder API
+    "Decoder",
+    "DecoderConfig",
+    "DecoderResult",
     # Legacy C extension (loaded lazily via __getattr__)
     "DataType",
     "ConvType",

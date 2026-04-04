@@ -15,11 +15,13 @@
 #ifndef DECODER_CTC_PREFIX_BEAM_SEARCH_H_
 #define DECODER_CTC_PREFIX_BEAM_SEARCH_H_
 
+#include <memory>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "decoder/common/utils.h"
+#include "decoder/context_graph.h"
 #include "decoder/search_interface.h"
 
 namespace oasr {
@@ -40,9 +42,15 @@ struct PrefixScore {
     std::vector<int> times_s;           // times of viterbi blank path
     std::vector<int> times_ns;          // times of viterbi none blank path
 
+    // Context biasing state (zero-overhead when no ContextGraph is set)
+    int context_state = 0;
+    float context_score = 0.0f;
+
     float score() const { return LogAdd(s, ns); }
     float viterbi_score() const { return v_s > v_ns ? v_s : v_ns; }
     const std::vector<int>& times() const { return v_s > v_ns ? times_s : times_ns; }
+    // Total score including phrase-boosting bonus; used for beam pruning.
+    float total_score() const { return score() + context_score; }
 };
 
 struct PrefixHash {
@@ -66,6 +74,11 @@ public:
     SearchType Type() const override { return SearchType::kPrefixBeamSearch; }
     void UpdateHypotheses(const std::vector<std::pair<std::vector<int>, PrefixScore>>& hpys);
 
+    // Set an optional ContextGraph for phrase boosting. Pass nullptr to disable.
+    void SetContextGraph(std::shared_ptr<ContextGraph> context_graph) {
+        context_graph_ = std::move(context_graph);
+    }
+
     const std::vector<float>& viterbi_likelihood() const { return viterbi_likelihood_; }
     const std::vector<std::vector<int>>& Inputs() const override { return hypotheses_; }
     const std::vector<std::vector<int>>& Outputs() const override { return outputs_; }
@@ -84,6 +97,7 @@ private:
     std::unordered_map<std::vector<int>, PrefixScore, PrefixHash> cur_hyps_;
     std::vector<std::vector<int>> outputs_;
     CtcPrefixBeamSearchOptions opts_;
+    std::shared_ptr<ContextGraph> context_graph_;
 
 public:
     OASR_DISALLOW_COPY_AND_ASSIGN(CtcPrefixBeamSearch);

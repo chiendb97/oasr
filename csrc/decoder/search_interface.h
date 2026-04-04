@@ -23,6 +23,7 @@ namespace decoder {
 enum SearchType {
     kPrefixBeamSearch = 0x00,
     kWfstBeamSearch = 0x01,
+    kGreedySearch = 0x02,
 };
 
 class SearchInterface {

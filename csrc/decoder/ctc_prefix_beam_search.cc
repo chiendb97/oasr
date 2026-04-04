@@ -51,9 +51,10 @@ void CtcPrefixBeamSearch::Reset() {
     times_.emplace_back(empty);
 }
 
+// Beam pruning uses total_score() (= acoustic score + context bonus).
 static bool PrefixScoreCompare(const std::pair<std::vector<int>, PrefixScore>& a,
                                const std::pair<std::vector<int>, PrefixScore>& b) {
-    return a.second.score() > b.second.score();
+    return a.second.total_score() > b.second.total_score();
 }
 
 void CtcPrefixBeamSearch::UpdateHypotheses(
@@ -68,7 +69,7 @@ void CtcPrefixBeamSearch::UpdateHypotheses(
         cur_hyps_[item.first] = item.second;
         hypotheses_.emplace_back(item.first);
         outputs_.emplace_back(std::move(item.first));
-        likelihood_.emplace_back(item.second.score());
+        likelihood_.emplace_back(item.second.total_score());
         viterbi_likelihood_.emplace_back(item.second.viterbi_score());
         times_.emplace_back(item.second.times());
     }
@@ -81,7 +82,7 @@ void CtcPrefixBeamSearch::Search(const std::vector<std::vector<float>>& logp) {
     if (logp.size() == 0)
         return;
     int first_beam_size = std::min(static_cast<int>(logp[0].size()), opts_.first_beam_size);
-    for (int t = 0; t < logp.size(); ++t, ++abs_time_step_) {
+    for (int t = 0; t < static_cast<int>(logp.size()); ++t, ++abs_time_step_) {
         const std::vector<float>& logp_t = logp[t];
         std::unordered_map<std::vector<int>, PrefixScore, PrefixHash> next_hyps;
         // 1. First beam prune, only select topk candidates
@@ -90,7 +91,7 @@ void CtcPrefixBeamSearch::Search(const std::vector<std::vector<float>>& logp) {
         TopK(logp_t, first_beam_size, &topk_score, &topk_index);
 
         // 2. Token passing
-        for (int i = 0; i < topk_index.size(); ++i) {
+        for (int i = 0; i < static_cast<int>(topk_index.size()); ++i) {
             int id = topk_index[i];
             auto prob = topk_score[i];
             for (const auto& it : cur_hyps_) {
@@ -106,6 +107,9 @@ void CtcPrefixBeamSearch::Search(const std::vector<std::vector<float>>& logp) {
                     next_score.s = LogAdd(next_score.s, prefix_score.score() + prob);
                     next_score.v_s = prefix_score.viterbi_score() + prob;
                     next_score.times_s = prefix_score.times();
+                    // Context state is unchanged when a blank is emitted
+                    next_score.context_state = prefix_score.context_state;
+                    next_score.context_score = prefix_score.context_score;
                 } else if (!prefix.empty() && id == prefix.back()) {
                     // Case 1: *a + a => *a
                     PrefixScore& next_score1 = next_hyps[prefix];
@@ -119,6 +123,9 @@ void CtcPrefixBeamSearch::Search(const std::vector<std::vector<float>>& logp) {
                             next_score1.times_ns.back() = abs_time_step_;
                         }
                     }
+                    // Context state stays the same (no new token emitted)
+                    next_score1.context_state = prefix_score.context_state;
+                    next_score1.context_score = prefix_score.context_score;
 
                     // Case 2: *aε + a => *aa
                     std::vector<int> new_prefix(prefix);
@@ -131,6 +138,13 @@ void CtcPrefixBeamSearch::Search(const std::vector<std::vector<float>>& logp) {
                         next_score2.times_ns = prefix_score.times_s;
                         next_score2.times_ns.emplace_back(abs_time_step_);
                     }
+                    // New token emitted: advance context state
+                    if (context_graph_) {
+                        auto [new_ctx_state, delta] =
+                            context_graph_->GetNextState(prefix_score.context_state, id);
+                        next_score2.context_state = new_ctx_state;
+                        next_score2.context_score = prefix_score.context_score + delta;
+                    }
                 } else {
                     // Case 3: *a + b => *ab, *aε + b => *ab
                     std::vector<int> new_prefix(prefix);
@@ -142,6 +156,13 @@ void CtcPrefixBeamSearch::Search(const std::vector<std::vector<float>>& logp) {
                         next_score.cur_token_prob = prob;
                         next_score.times_ns = prefix_score.times();
                         next_score.times_ns.emplace_back(abs_time_step_);
+                    }
+                    // New token emitted: advance context state
+                    if (context_graph_) {
+                        auto [new_ctx_state, delta] =
+                            context_graph_->GetNextState(prefix_score.context_state, id);
+                        next_score.context_state = new_ctx_state;
+                        next_score.context_score = prefix_score.context_score + delta;
                     }
                 }
             }
@@ -165,9 +186,16 @@ void CtcPrefixBeamSearch::FinalizeSearch() {
     assert(hypotheses_.size() == cur_hyps_.size());
     assert(hypotheses_.size() == likelihood_.size());
     std::vector<std::pair<std::vector<int>, PrefixScore>> arr(cur_hyps_.begin(), cur_hyps_.end());
-    std::sort(arr.begin(), arr.end(), PrefixScoreCompare);
 
-    // Update cur_hyps_ and get new result
+    // Subtract any partial-match context bonus at finalization to avoid
+    // rewarding an incomplete phrase match.
+    if (context_graph_) {
+        for (auto& item : arr) {
+            item.second.context_score -= context_graph_->GetBackoffScore(item.second.context_state);
+        }
+    }
+
+    std::sort(arr.begin(), arr.end(), PrefixScoreCompare);
     UpdateHypotheses(arr);
 }
 
