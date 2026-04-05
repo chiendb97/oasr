@@ -40,6 +40,8 @@ CompileFlags:
     - "-D__CUDACC__"
     - "-DOASR_ENABLE_FP16"
     - "-DOASR_ENABLE_BF16"
+    - "-DOASR_USE_K2"
+    - "-DOASR_K2_STREAMING"
   Remove:
     - "-forward-unknown-to-host-compiler"
     - "--expt-relaxed-constexpr"

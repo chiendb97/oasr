@@ -182,12 +182,26 @@ set(OASR_HEADERS
 # Optional: K2 WFST decoder
 # =============================================================================
 if(OASR_USE_K2)
-    # k2_DIR must be set by the caller (setup.py resolves it from the installed
-    # k2 Python package and passes -Dk2_DIR=... on the cmake command line).
-    # Manual builds: cmake -DOASR_USE_K2=ON -Dk2_DIR=$(python -c
-    #   "import k2,os; print(os.path.join(os.path.dirname(k2.__file__),'share','cmake','k2'))")
+    # k2 must be installed externally (e.g. built in the Docker image from
+    # https://github.com/chiendb97/k2 branch feat/cuda13).
+    # Pass -Dk2_DIR=<prefix>/share/cmake/k2 if find_package cannot locate it
+    # automatically (e.g. for a non-standard install prefix).
     find_package(k2 REQUIRED)
+
+    # K2_SOURCE_DIR must point to the k2 source tree so the streaming decoder
+    # can include internal headers (k2/csrc/, k2/torch/csrc/) that are not
+    # part of the installed package.  In Docker this is /opt/k2-src.
+    # Pass -DK2_SOURCE_DIR=<path> on the cmake command line, or set the
+    # K2_SOURCE_DIR environment variable (picked up by setup.py).
+    if(NOT DEFINED K2_SOURCE_DIR)
+        message(FATAL_ERROR
+            "K2_SOURCE_DIR is not set.\n"
+            "Point it to the k2 source tree, e.g.:\n"
+            "  cmake -DK2_SOURCE_DIR=/opt/k2-src ...")
+    endif()
+
     list(APPEND OASR_SOURCES csrc/decoder/ctc_wfst_beam_search.cc)
+    list(APPEND OASR_SOURCES csrc/decoder/ctc_wfst_streaming_decoder.cc)
     message(STATUS "K2 WFST decoder enabled (k2 version: ${k2_VERSION})")
 endif()
 
@@ -202,11 +216,19 @@ target_include_directories(oasr_core PUBLIC
 )
 
 if(OASR_USE_K2)
-    target_compile_definitions(oasr_core PUBLIC OASR_USE_K2)
+    target_compile_definitions(oasr_core PUBLIC OASR_USE_K2 OASR_K2_STREAMING)
     # k2/torch_api.h includes torch/script.h, so oasr_core needs Torch headers.
     target_include_directories(oasr_core PUBLIC ${TORCH_INCLUDE_DIRS})
+    # Public k2 API (torch_api.h) from the installed prefix.
     target_link_libraries(oasr_core PUBLIC k2_torch_api ${TORCH_LIBRARIES})
-    message(STATUS "Linking oasr_core with K2")
+    # Internal k2 headers from the submodule source tree (not installed).
+    # These are required by the streaming decoder (k2/csrc/intersect_dense_pruned.h, etc.)
+    target_include_directories(oasr_core PUBLIC ${K2_SOURCE_DIR})
+    # k2context: OnlineDenseIntersecter
+    # k2_torch:  CreateDenseFsaVec, ShortestPath, GetTexts
+    target_link_libraries(oasr_core PUBLIC k2context k2_torch)
+    message(STATUS "K2 source dir (internal headers): ${K2_SOURCE_DIR}")
+    message(STATUS "Linking oasr_core with K2 (offline + streaming decoders)")
 endif()
 
 # =============================================================================

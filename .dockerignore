@@ -1,0 +1,24 @@
+# Docker build context exclusions
+# Build with: docker build -f docker/Dockerfile -t oasr .
+
+# Build artifacts
+build/
+*.egg-info/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Large third-party sources (k2 is cloned fresh inside the image)
+3rdparty/k2/
+3rdparty/k2_install/
+3rdparty/cutlass/
+
+# Editor / IDE tooling
+.clangd
+compile_commands.json
+.vscode/
+.idea/
+
+# Git history (not needed in image)
+.git/

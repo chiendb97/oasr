@@ -29,16 +29,30 @@ class CMakeExtension(Extension):
 
 
 def _find_k2_cmake_dir():
-    """Return the directory containing k2Config.cmake, or None if k2 is not installed.
+    """Return the directory containing k2Config.cmake.
 
-    Works without importing k2 (safe inside pip's isolated build env) by
-    probing known site-packages paths directly.
+    Search order:
+    1. Submodule install at 3rdparty/k2_install (built from the bundled submodule).
+    2. System-wide install at /usr/local/share/cmake/k2.
+    3. pip package in site-packages (fallback for environments without submodule build).
     """
     import glob
     import sysconfig as _sc
     import site
 
-    # Collect candidate site-packages directories (system + user + venv).
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    # 1. Prefer the submodule-built install (3rdparty/k2_install).
+    submodule_cmake = os.path.join(here, "3rdparty", "k2_install", "share", "cmake", "k2")
+    if os.path.isfile(os.path.join(submodule_cmake, "k2Config.cmake")):
+        return submodule_cmake
+
+    # 2. System-wide install (e.g. /usr/local/share/cmake/k2).
+    system_cmake = "/usr/local/share/cmake/k2"
+    if os.path.isfile(os.path.join(system_cmake, "k2Config.cmake")):
+        return system_cmake
+
+    # 3. pip package layout in site-packages.
     site_dirs = []
     for scheme in ("purelib", "platlib"):
         try:
@@ -66,7 +80,6 @@ def _find_k2_cmake_dir():
         ):
             if os.path.isfile(os.path.join(candidate, "k2Config.cmake")):
                 return candidate
-        # Fallback: glob anywhere under the package dir
         hits = glob.glob(
             os.path.join(k2_pkg_dir, "**", "k2Config.cmake"), recursive=True
         )
@@ -169,9 +182,8 @@ class CMakeBuild(build_ext):
 
         if os.environ.get("OASR_USE_K2", "0") == "1":
             cmake_args.append("-DOASR_USE_K2=ON")
-            # Resolve k2's CMake config dir here (real Python env, k2 importable)
-            # and pass it explicitly so the pip isolated-env CMake step doesn't
-            # need to import k2 itself.
+            # Resolve k2's CMake config dir and pass it explicitly so the
+            # pip isolated-env CMake step doesn't need to import k2 itself.
             k2_cmake_dir = _find_k2_cmake_dir()
             if k2_cmake_dir:
                 cmake_args.append(f"-Dk2_DIR={k2_cmake_dir}")
@@ -180,6 +192,12 @@ class CMakeBuild(build_ext):
                     "OASR_USE_K2=1 requires k2 to be installed. "
                     "Run: pip install k2"
                 )
+            # Optional: point to k2 source tree for internal headers
+            # (k2/csrc/, k2/torch/csrc/).  Required by the streaming decoder.
+            # Falls back to the bundled submodule (3rdparty/k2) when not set.
+            k2_src = os.environ.get("K2_SOURCE_DIR")
+            if k2_src:
+                cmake_args.append(f"-DK2_SOURCE_DIR={k2_src}")
         else:
             cmake_args.append("-DOASR_USE_K2=OFF")
         
