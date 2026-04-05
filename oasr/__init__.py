@@ -29,6 +29,12 @@ from .conv import (
     depthwise_conv1d_silu, causal_conv1d, conv2d_activation,
 )
 from .gemm import gemm, bmm, group_gemm, gemm_activation
+from .ctc_decode import (
+    ctc_beam_search_decode,
+    GpuStreamingDecoder,
+    GpuDecoderConfig,
+    GpuDecoderResult,
+)
 
 # =============================================================================
 # Autotuning
@@ -156,6 +162,11 @@ __all__ = [
     "Decoder",
     "DecoderConfig",
     "DecoderResult",
+    # GPU CTC decoder
+    "ctc_beam_search_decode",
+    "GpuStreamingDecoder",
+    "GpuDecoderConfig",
+    "GpuDecoderResult",
     # Legacy C extension (loaded lazily via __getattr__)
     "DataType",
     "ConvType",

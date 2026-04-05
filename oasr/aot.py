@@ -25,6 +25,7 @@ def gen_all_modules() -> List:
     from oasr.jit.norm import gen_norm_module
     from oasr.jit.conv import gen_conv_module, gen_conv2d_module, gen_cudnn_conv2d_module
     from oasr.jit.gemm import gen_gemm_module, gen_bmm_module, gen_group_gemm_module
+    from oasr.jit.ctc_decoder import gen_ctc_decoder_module
 
     return [
         gen_activation_module(),
@@ -35,6 +36,7 @@ def gen_all_modules() -> List:
         gen_gemm_module(),
         gen_bmm_module(),
         gen_group_gemm_module(),
+        gen_ctc_decoder_module(),
     ]
 
 
