@@ -14,7 +14,6 @@
 #include "k2/torch_api.h"
 
 #include "decoder/common/utils.h"
-#include "decoder/search_interface.h"
 
 namespace oasr {
 namespace decoder {
@@ -44,7 +43,7 @@ struct CtcWfstBeamSearchOptions {
 // Build requirements:
 //   cmake -DOASR_USE_K2=ON -Dk2_DIR=<k2Config.cmake dir> ...
 //   or:  OASR_USE_K2=1 pip install -e .
-class CtcWfstBeamSearch : public SearchInterface {
+class CtcWfstBeamSearch {
 public:
     CtcWfstBeamSearch(const CtcWfstBeamSearchOptions& opts,
                       k2::FsaClassPtr decoding_graph);
@@ -56,16 +55,14 @@ public:
         const std::string& fst_path,
         torch::Device device = torch::kCPU);
 
-    void Search(const std::vector<std::vector<float>>& logp) override;
-    void Reset() override;
-    void FinalizeSearch() override;
+    void Search(const std::vector<std::vector<float>>& logp);
+    void Reset();
+    void FinalizeSearch();
 
-    SearchType Type() const override { return SearchType::kWfstBeamSearch; }
-
-    const std::vector<std::vector<int>>& Inputs() const override { return hypotheses_; }
-    const std::vector<std::vector<int>>& Outputs() const override { return outputs_; }
-    const std::vector<float>& Likelihood() const override { return likelihood_; }
-    const std::vector<std::vector<int>>& Times() const override { return times_; }
+    const std::vector<std::vector<int>>& Inputs() const { return hypotheses_; }
+    const std::vector<std::vector<int>>& Outputs() const { return outputs_; }
+    const std::vector<float>& Likelihood() const { return likelihood_; }
+    const std::vector<std::vector<int>>& Times() const { return times_; }
 
 private:
     CtcWfstBeamSearchOptions opts_;

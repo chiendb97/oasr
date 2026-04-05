@@ -172,7 +172,6 @@ set(OASR_HEADERS
 
     # Decoder headers
     csrc/decoder/common/utils.h
-    csrc/decoder/search_interface.h
     csrc/decoder/context_graph.h
     csrc/decoder/ctc_prefix_beam_search.h
     csrc/decoder/ctc_greedy_search.h

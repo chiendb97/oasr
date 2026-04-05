@@ -9,7 +9,6 @@
 
 #include "decoder/common/utils.h"
 #include "decoder/context_graph.h"
-#include "decoder/search_interface.h"
 
 namespace oasr {
 namespace decoder {
@@ -25,27 +24,25 @@ struct CtcGreedySearchOptions {
 // Supports both offline (one call to Search) and chunk-based streaming
 // (multiple Search calls; prev_token_ preserves CTC collapse state across
 // chunks). Returns a single hypothesis in the N-best interface.
-class CtcGreedySearch : public SearchInterface {
+class CtcGreedySearch {
 public:
     explicit CtcGreedySearch(const CtcGreedySearchOptions& opts);
 
-    void Search(const std::vector<std::vector<float>>& logp) override;
-    void Reset() override;
+    void Search(const std::vector<std::vector<float>>& logp);
+    void Reset();
     // No-op for greedy; results are already final after each Search call.
-    void FinalizeSearch() override;
-
-    SearchType Type() const override { return SearchType::kGreedySearch; }
+    void FinalizeSearch();
 
     // Set an optional ContextGraph for phrase boosting. Pass nullptr to disable.
     void SetContextGraph(std::shared_ptr<ContextGraph> context_graph) {
         context_graph_ = std::move(context_graph);
     }
 
-    // Returns a size-1 N-best list to match SearchInterface.
-    const std::vector<std::vector<int>>& Inputs() const override { return hypotheses_; }
-    const std::vector<std::vector<int>>& Outputs() const override { return hypotheses_; }
-    const std::vector<float>& Likelihood() const override { return likelihood_vec_; }
-    const std::vector<std::vector<int>>& Times() const override { return times_; }
+    // Returns a size-1 N-best list.
+    const std::vector<std::vector<int>>& Inputs() const { return hypotheses_; }
+    const std::vector<std::vector<int>>& Outputs() const { return hypotheses_; }
+    const std::vector<float>& Likelihood() const { return likelihood_vec_; }
+    const std::vector<std::vector<int>>& Times() const { return times_; }
 
 private:
     CtcGreedySearchOptions opts_;
