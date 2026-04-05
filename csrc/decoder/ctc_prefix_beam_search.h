@@ -22,7 +22,6 @@
 
 #include "decoder/common/utils.h"
 #include "decoder/context_graph.h"
-#include "decoder/search_interface.h"
 
 namespace oasr {
 namespace decoder {
@@ -64,14 +63,13 @@ struct PrefixHash {
     }
 };
 
-class CtcPrefixBeamSearch : public SearchInterface {
+class CtcPrefixBeamSearch {
 public:
     explicit CtcPrefixBeamSearch(const CtcPrefixBeamSearchOptions& opts);
 
-    void Search(const std::vector<std::vector<float>>& logp) override;
-    void Reset() override;
-    void FinalizeSearch() override;
-    SearchType Type() const override { return SearchType::kPrefixBeamSearch; }
+    void Search(const std::vector<std::vector<float>>& logp);
+    void Reset();
+    void FinalizeSearch();
     void UpdateHypotheses(const std::vector<std::pair<std::vector<int>, PrefixScore>>& hpys);
 
     // Set an optional ContextGraph for phrase boosting. Pass nullptr to disable.
@@ -80,10 +78,10 @@ public:
     }
 
     const std::vector<float>& viterbi_likelihood() const { return viterbi_likelihood_; }
-    const std::vector<std::vector<int>>& Inputs() const override { return hypotheses_; }
-    const std::vector<std::vector<int>>& Outputs() const override { return outputs_; }
-    const std::vector<float>& Likelihood() const override { return likelihood_; }
-    const std::vector<std::vector<int>>& Times() const override { return times_; }
+    const std::vector<std::vector<int>>& Inputs() const { return hypotheses_; }
+    const std::vector<std::vector<int>>& Outputs() const { return outputs_; }
+    const std::vector<float>& Likelihood() const { return likelihood_; }
+    const std::vector<std::vector<int>>& Times() const { return times_; }
 
 private:
     int abs_time_step_ = 0;

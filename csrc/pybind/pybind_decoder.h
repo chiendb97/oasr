@@ -45,7 +45,7 @@ inline void registerDecoderBindings(py::module_& m) {
     py::module_ decoder_mod = m.def_submodule("decoder", "Decoder search algorithms");
 
     // -----------------------------------------------------------------
-    // ContextGraph (phrase boosting)
+    // ContextGraph (phrase boosting) — public C++ class, used from Python
     // -----------------------------------------------------------------
     py::class_<ContextGraph, std::shared_ptr<ContextGraph>>(decoder_mod, "ContextGraph")
         .def(py::init([](const std::vector<std::vector<int>>& phrases, float context_score) {
@@ -66,21 +66,11 @@ inline void registerDecoderBindings(py::module_& m) {
         .def("get_backoff_score", &ContextGraph::GetBackoffScore, py::arg("state"),
              "Penalty for an uncommitted partial match at finalization.");
 
-    py::enum_<SearchType>(decoder_mod, "SearchType")
-        .value("kPrefixBeamSearch", SearchType::kPrefixBeamSearch)
-        .value("kWfstBeamSearch", SearchType::kWfstBeamSearch)
-        .value("kGreedySearch", SearchType::kGreedySearch)
-        .export_values();
-
     // -----------------------------------------------------------------
-    // CTC Greedy Search
+    // _GreedySearchCore — internal C++ compute core for greedy decoding.
+    // Use oasr.decoder.CtcGreedySearch (the Python wrapper) instead.
     // -----------------------------------------------------------------
-    py::class_<CtcGreedySearchOptions>(decoder_mod, "CtcGreedySearchOptions")
-        .def(py::init<>())
-        .def_readwrite("blank", &CtcGreedySearchOptions::blank);
-
-    py::class_<CtcGreedySearch>(decoder_mod, "CtcGreedySearch")
-        .def(py::init<const CtcGreedySearchOptions&>(), py::arg("options"))
+    py::class_<CtcGreedySearch>(decoder_mod, "_GreedySearchCore")
         .def(py::init([](int blank) {
                  CtcGreedySearchOptions opts;
                  opts.blank = blank;
@@ -99,45 +89,33 @@ inline void registerDecoderBindings(py::module_& m) {
                 auto logp_vec = tensorToLogProbs(logp_f32);
                 self.Search(logp_vec);
             },
-            py::arg("logp"),
-            "Run CTC greedy search on a 2D log-probability tensor [T, V].")
-        .def("reset", &CtcGreedySearch::Reset, "Reset internal decoder state.")
-        .def("finalize_search", &CtcGreedySearch::FinalizeSearch,
-             "Finalize search (no-op for greedy).")
+            py::arg("logp"))
+        .def("reset", &CtcGreedySearch::Reset)
+        .def("finalize_search", &CtcGreedySearch::FinalizeSearch)
         .def(
             "set_context_graph",
             [](CtcGreedySearch& self, std::shared_ptr<ContextGraph> ctx) {
                 self.SetContextGraph(std::move(ctx));
             },
-            py::arg("context_graph"),
-            "Attach a ContextGraph for phrase boosting (pass None to disable).")
+            py::arg("context_graph"))
         .def_property_readonly(
             "outputs",
             &CtcGreedySearch::Outputs,
-            py::return_value_policy::reference_internal,
-            "Best output token ID sequence (wrapped in a size-1 list).")
+            py::return_value_policy::reference_internal)
         .def_property_readonly(
             "likelihood",
             &CtcGreedySearch::Likelihood,
-            py::return_value_policy::reference_internal,
-            "Cumulative log-likelihood of the best path (including context bonus).")
+            py::return_value_policy::reference_internal)
         .def_property_readonly(
             "times",
             &CtcGreedySearch::Times,
-            py::return_value_policy::reference_internal,
-            "Per-token frame timestamps.");
+            py::return_value_policy::reference_internal);
 
     // -----------------------------------------------------------------
-    // CTC Prefix Beam Search
+    // _PrefixBeamSearchCore — internal C++ compute core for prefix beam search.
+    // Use oasr.decoder.CtcPrefixBeamSearch (the Python wrapper) instead.
     // -----------------------------------------------------------------
-    py::class_<CtcPrefixBeamSearchOptions>(decoder_mod, "CtcPrefixBeamSearchOptions")
-        .def(py::init<>())
-        .def_readwrite("blank", &CtcPrefixBeamSearchOptions::blank)
-        .def_readwrite("first_beam_size", &CtcPrefixBeamSearchOptions::first_beam_size)
-        .def_readwrite("second_beam_size", &CtcPrefixBeamSearchOptions::second_beam_size);
-
-    py::class_<CtcPrefixBeamSearch>(decoder_mod, "CtcPrefixBeamSearch")
-        .def(py::init<const CtcPrefixBeamSearchOptions&>(), py::arg("options"))
+    py::class_<CtcPrefixBeamSearch>(decoder_mod, "_PrefixBeamSearchCore")
         .def(py::init([](int blank, int first_beam_size, int second_beam_size) {
                  CtcPrefixBeamSearchOptions opts;
                  opts.blank = blank;
@@ -159,69 +137,69 @@ inline void registerDecoderBindings(py::module_& m) {
                 auto logp_vec = tensorToLogProbs(logp_f32);
                 self.Search(logp_vec);
             },
-            py::arg("logp"),
-            "Run CTC prefix beam search on a 2D log-probability tensor [T, V].")
-        .def("reset", &CtcPrefixBeamSearch::Reset, "Reset internal decoder state.")
-        .def("finalize_search", &CtcPrefixBeamSearch::FinalizeSearch,
-             "Finalize search and update hypotheses.")
-        .def_property_readonly(
-            "inputs",
-            &CtcPrefixBeamSearch::Inputs,
-            py::return_value_policy::reference_internal,
-            "N-best input ID sequences.")
-        .def_property_readonly(
-            "outputs",
-            &CtcPrefixBeamSearch::Outputs,
-            py::return_value_policy::reference_internal,
-            "N-best output ID sequences.")
-        .def_property_readonly(
-            "likelihood",
-            &CtcPrefixBeamSearch::Likelihood,
-            py::return_value_policy::reference_internal,
-            "Likelihood scores for each hypothesis.")
-        .def_property_readonly(
-            "times",
-            &CtcPrefixBeamSearch::Times,
-            py::return_value_policy::reference_internal,
-            "Per-token timestamps for each hypothesis.")
-        .def_property_readonly(
-            "viterbi_likelihood",
-            &CtcPrefixBeamSearch::viterbi_likelihood,
-            py::return_value_policy::reference_internal,
-            "Viterbi path likelihoods for each hypothesis.")
+            py::arg("logp"))
+        .def("reset", &CtcPrefixBeamSearch::Reset)
+        .def("finalize_search", &CtcPrefixBeamSearch::FinalizeSearch)
         .def(
             "set_context_graph",
             [](CtcPrefixBeamSearch& self, std::shared_ptr<ContextGraph> ctx) {
                 self.SetContextGraph(std::move(ctx));
             },
-            py::arg("context_graph"),
-            "Attach a ContextGraph for phrase boosting (pass None to disable).");
+            py::arg("context_graph"))
+        .def_property_readonly(
+            "inputs",
+            &CtcPrefixBeamSearch::Inputs,
+            py::return_value_policy::reference_internal)
+        .def_property_readonly(
+            "outputs",
+            &CtcPrefixBeamSearch::Outputs,
+            py::return_value_policy::reference_internal)
+        .def_property_readonly(
+            "likelihood",
+            &CtcPrefixBeamSearch::Likelihood,
+            py::return_value_policy::reference_internal)
+        .def_property_readonly(
+            "times",
+            &CtcPrefixBeamSearch::Times,
+            py::return_value_policy::reference_internal)
+        .def_property_readonly(
+            "viterbi_likelihood",
+            &CtcPrefixBeamSearch::viterbi_likelihood,
+            py::return_value_policy::reference_internal);
 
 #ifdef OASR_USE_K2
     // -----------------------------------------------------------------
-    // CTC WFST Beam Search (K2)
+    // _WfstBeamSearchCore — internal C++ compute core for K2 WFST decoding.
+    // Use oasr.decoder.CtcWfstBeamSearch (the Python wrapper) instead.
     // -----------------------------------------------------------------
-    py::class_<CtcWfstBeamSearchOptions>(decoder_mod, "CtcWfstBeamSearchOptions")
-        .def(py::init<>())
-        .def_readwrite("blank", &CtcWfstBeamSearchOptions::blank)
-        .def_readwrite("search_beam", &CtcWfstBeamSearchOptions::search_beam)
-        .def_readwrite("output_beam", &CtcWfstBeamSearchOptions::output_beam)
-        .def_readwrite("min_active_states", &CtcWfstBeamSearchOptions::min_active_states)
-        .def_readwrite("max_active_states", &CtcWfstBeamSearchOptions::max_active_states)
-        .def_readwrite("subsampling_factor", &CtcWfstBeamSearchOptions::subsampling_factor)
-        .def_readwrite("nbest", &CtcWfstBeamSearchOptions::nbest)
-        .def_readwrite("blank_skip_thresh", &CtcWfstBeamSearchOptions::blank_skip_thresh);
-
-    py::class_<CtcWfstBeamSearch>(decoder_mod, "CtcWfstBeamSearch")
-        // Primary constructor: load graph from a file saved with torch.save(fsa.as_dict(), path)
+    py::class_<CtcWfstBeamSearch>(decoder_mod, "_WfstBeamSearchCore")
         .def_static(
             "from_file",
-            [](const std::string& fst_path, const CtcWfstBeamSearchOptions& opts) {
+            [](const std::string& fst_path,
+               int blank, float search_beam, float output_beam,
+               int min_active_states, int max_active_states,
+               int subsampling_factor, int nbest, float blank_skip_thresh) {
+                CtcWfstBeamSearchOptions opts;
+                opts.blank = blank;
+                opts.search_beam = search_beam;
+                opts.output_beam = output_beam;
+                opts.min_active_states = min_active_states;
+                opts.max_active_states = max_active_states;
+                opts.subsampling_factor = subsampling_factor;
+                opts.nbest = nbest;
+                opts.blank_skip_thresh = blank_skip_thresh;
                 return CtcWfstBeamSearch::FromFile(opts, fst_path, torch::kCPU);
             },
-            py::arg("fst_path"), py::arg("options") = CtcWfstBeamSearchOptions{},
-            "Load a decoding graph from *fst_path* (saved with torch.save(fsa.as_dict(), ...)) "
-            "and create a WFST beam-search decoder.")
+            py::arg("fst_path"),
+            py::arg("blank") = 0,
+            py::arg("search_beam") = 20.0f,
+            py::arg("output_beam") = 8.0f,
+            py::arg("min_active_states") = 30,
+            py::arg("max_active_states") = 10000,
+            py::arg("subsampling_factor") = 1,
+            py::arg("nbest") = 10,
+            py::arg("blank_skip_thresh") = 0.98f,
+            "Load a decoding graph from *fst_path* and create a WFST beam-search core.")
         .def(
             "search",
             [](CtcWfstBeamSearch& self, const torch::Tensor& logp) {
@@ -234,20 +212,18 @@ inline void registerDecoderBindings(py::module_& m) {
                 auto logp_vec = tensorToLogProbs(logp_f32);
                 self.Search(logp_vec);
             },
-            py::arg("logp"),
-            "Feed a chunk of log-probability frames [T, V] to the WFST decoder.")
-        .def("reset", &CtcWfstBeamSearch::Reset, "Reset internal decoder state.")
-        .def("finalize_search", &CtcWfstBeamSearch::FinalizeSearch,
-             "Finalize WFST decoding and extract N-best paths.")
+            py::arg("logp"))
+        .def("reset", &CtcWfstBeamSearch::Reset)
+        .def("finalize_search", &CtcWfstBeamSearch::FinalizeSearch)
         .def_property_readonly(
             "outputs", &CtcWfstBeamSearch::Outputs,
-            py::return_value_policy::reference_internal, "N-best decoded token sequences.")
+            py::return_value_policy::reference_internal)
         .def_property_readonly(
             "likelihood", &CtcWfstBeamSearch::Likelihood,
-            py::return_value_policy::reference_internal, "N-best path scores.")
+            py::return_value_policy::reference_internal)
         .def_property_readonly(
             "times", &CtcWfstBeamSearch::Times,
-            py::return_value_policy::reference_internal, "Per-token timestamps (if available).");
+            py::return_value_policy::reference_internal);
 
     decoder_mod.attr("k2_available") = true;
 #else
@@ -257,4 +233,3 @@ inline void registerDecoderBindings(py::module_& m) {
 
 }  // namespace pybind
 }  // namespace oasr
-

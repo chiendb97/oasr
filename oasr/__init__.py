@@ -29,6 +29,12 @@ from .conv import (
     depthwise_conv1d_silu, causal_conv1d, conv2d_activation,
 )
 from .gemm import gemm, bmm, group_gemm, gemm_activation
+from .ctc_decode import (
+    ctc_beam_search_decode,
+    GpuStreamingDecoder,
+    GpuDecoderConfig,
+    GpuDecoderResult,
+)
 
 # =============================================================================
 # Autotuning
@@ -60,14 +66,21 @@ from .layers import (
 # =============================================================================
 
 def _register_c_extension():
-    """Load the C extension and register its submodules (e.g. ``decoder``)
-    in ``sys.modules`` so that ``from oasr.decoder import ...`` works."""
+    """Load the C extension and register its submodules in ``sys.modules``.
+
+    The ``decoder`` submodule is intentionally skipped here because
+    ``oasr/decoder/`` is a real Python package that handles its own imports
+    from the C extension.
+    """
     try:
         _C = _importlib.import_module("oasr._C")
     except ImportError:
         return
     globals()["_C"] = _C
     for _attr_name in dir(_C):
+        if _attr_name == "decoder":
+            # oasr.decoder is a Python package; do not overwrite it.
+            continue
         _attr = getattr(_C, _attr_name)
         if isinstance(_attr, _types.ModuleType):
             _sys.modules[f"{__name__}.{_attr_name}"] = _attr
@@ -156,6 +169,11 @@ __all__ = [
     "Decoder",
     "DecoderConfig",
     "DecoderResult",
+    # GPU CTC decoder
+    "ctc_beam_search_decode",
+    "GpuStreamingDecoder",
+    "GpuDecoderConfig",
+    "GpuDecoderResult",
     # Legacy C extension (loaded lazily via __getattr__)
     "DataType",
     "ConvType",
