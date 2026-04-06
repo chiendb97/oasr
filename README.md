@@ -80,8 +80,6 @@ oasr/
 # Editable install (builds pybind11 extension via CMake; kernels are JIT-compiled on first use)
 pip install -e .
 
-# Target a specific GPU architecture (e.g. SM 80)
-CUDA_ARCHITECTURES=80 pip install -e .
 
 # Multiple architectures (semicolon-separated)
 CUDA_ARCHITECTURES="80;86;90" pip install -e .

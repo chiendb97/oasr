@@ -17,14 +17,20 @@ def pytest_addoption(parser):
     parser.addoption(
         "--ckpt-dir",
         action="store",
-        default=os.environ.get("WENET_CKPT_DIR", ""),
+        default=os.environ.get("CKPT_DIR", ""),
         help="Path to WeNet checkpoint dir for load_wenet_checkpoint tests",
     )
     parser.addoption(
         "--audio-path",
         action="store",
-        default=os.environ.get("WENET_AUDIO_PATH", ""),
+        default=os.environ.get("AUDIO_PATH", ""),
         help="Path to a test audio file for decoder integration tests",
+    )
+    parser.addoption(
+        "--lang-dir",
+        action="store",
+        default=os.environ.get("LANG_DIR", ""),
+        help="Path to a pre-built language directory for WFST beam search tests",
     )
 
 
@@ -46,8 +52,14 @@ def ckpt_dir(request):
 
 @pytest.fixture(scope="session")
 def audio_path(request):
-    """Path to a test audio file (from --audio-path or WENET_AUDIO_PATH env)."""
+    """Path to a test audio file (from --audio-path or AUDIO_PATH env)."""
     return request.config.getoption("--audio-path", default="")
+
+
+@pytest.fixture(scope="session")
+def lang_dir(request):
+    """Path to a pre-built language directory (from --lang-dir or LANG_DIR env)."""
+    return request.config.getoption("--lang-dir", default="")
 
 
 @pytest.fixture(scope="session")

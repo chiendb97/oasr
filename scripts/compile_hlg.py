@@ -113,7 +113,16 @@ def compile_HLG(lang_dir: Path, lm_dir: Path, lm: str) -> k2.Fsa:
     g_pt = lm_dir / f"{lm}.pt"
     g_fst_txt = lm_dir / f"{lm}.fst.txt"
 
-    if g_pt.is_file():
+    # Use the cached .pt only when it is *newer* than the .fst.txt source to
+    # avoid stale caches after words.txt or ARPA changes.
+    g_pt_fresh = (
+        g_pt.is_file()
+        and (
+            not g_fst_txt.is_file()
+            or g_pt.stat().st_mtime >= g_fst_txt.stat().st_mtime
+        )
+    )
+    if g_pt_fresh:
         logging.info(f"Loading pre-compiled G from {g_pt}")
         G = k2.Fsa.from_dict(torch.load(g_pt, weights_only=False))
     elif g_fst_txt.is_file():
