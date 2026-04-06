@@ -1,5 +1,5 @@
 # Build artifacts
-build/
+build*/
 cmake-build-*/
 .cache/
 *.o
@@ -76,10 +76,6 @@ CMakeCache.txt
 cmake_install.cmake
 Makefile
 compile_commands.json
-
-# Third party (if not committed)
-third_party/cutlass/
-third_party/pybind11/
 
 # Model weights and data
 *.bin

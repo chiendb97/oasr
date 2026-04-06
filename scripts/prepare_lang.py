@@ -75,13 +75,21 @@ def main():
         print(f"ERROR: {lexicon_file} not found", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Reading lexicon from {lexicon_file}")
+    print(f"Reading lexicon from {lexicon_file}", file=sys.stderr)
     lexicon = read_lexicon(lexicon_file)
 
     tokens = get_tokens(lexicon)
     words = get_words(lexicon)
 
-    print("Adding disambiguation symbols")
+    if args.sil_token not in tokens:
+        print(
+            f"ERROR: silence token '{args.sil_token}' not found in any lexicon entry. "
+            "Add a silence entry (e.g. 'SIL SIL') to lexicon.txt or use --sil-token.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print("Adding disambiguation symbols", file=sys.stderr)
     lexicon_disambig, max_disambig = add_disambig_symbols(lexicon)
 
     # Append disambiguation tokens (#0, #1, ...) to the token list.
@@ -99,12 +107,12 @@ def main():
     token2id = generate_id_map(tokens)
     word2id = generate_id_map(words)
 
-    print(f"Writing outputs to {lang_dir}/")
+    print(f"Writing outputs to {lang_dir}/", file=sys.stderr)
     write_mapping(lang_dir / "tokens.txt", token2id)
     write_mapping(lang_dir / "words.txt", word2id)
     write_lexicon(lang_dir / "lexicon_disambig.txt", lexicon_disambig)
 
-    print(f"Building L (with silence, sil_prob={args.sil_prob})")
+    print(f"Building L (with silence, sil_prob={args.sil_prob})", file=sys.stderr)
     L = lexicon_to_fst(
         lexicon,
         token2id=token2id,
@@ -113,7 +121,7 @@ def main():
         sil_prob=args.sil_prob,
     )
 
-    print("Building L_disambig (with #0 self-loops)")
+    print("Building L_disambig (with #0 self-loops)", file=sys.stderr)
     L_disambig = lexicon_to_fst(
         lexicon_disambig,
         token2id=token2id,
@@ -125,12 +133,12 @@ def main():
 
     torch.save(L.as_dict(), lang_dir / "L.pt")
     torch.save(L_disambig.as_dict(), lang_dir / "L_disambig.pt")
-    print("Done.")
-    print(f"  tokens.txt           : {lang_dir / 'tokens.txt'}")
-    print(f"  words.txt            : {lang_dir / 'words.txt'}")
-    print(f"  lexicon_disambig.txt : {lang_dir / 'lexicon_disambig.txt'}")
-    print(f"  L.pt                 : {lang_dir / 'L.pt'}")
-    print(f"  L_disambig.pt        : {lang_dir / 'L_disambig.pt'}")
+    print("Done.", file=sys.stderr)
+    print(f"  tokens.txt           : {lang_dir / 'tokens.txt'}", file=sys.stderr)
+    print(f"  words.txt            : {lang_dir / 'words.txt'}", file=sys.stderr)
+    print(f"  lexicon_disambig.txt : {lang_dir / 'lexicon_disambig.txt'}", file=sys.stderr)
+    print(f"  L.pt                 : {lang_dir / 'L.pt'}", file=sys.stderr)
+    print(f"  L_disambig.pt        : {lang_dir / 'L_disambig.pt'}", file=sys.stderr)
 
 
 if __name__ == "__main__":

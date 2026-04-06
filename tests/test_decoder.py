@@ -3,10 +3,13 @@
 Unit tests for decoder wrappers: CTC greedy search and CTC prefix beam search.
 """
 
+import os
 from pathlib import Path
-
 import pytest
 import torch
+import torchaudio
+
+import oasr.decoder as _decoder_mod
 
 from oasr.decoder import (
     ContextGraph,
@@ -30,6 +33,42 @@ def _make_logp(T: int, V: int, best_path: list[int]) -> torch.Tensor:
     for t, tok in enumerate(best_path):
         logp[t, tok] = 0.0
     return logp
+
+
+def read_audio(path: str):
+    """Read audio file."""
+    audio, sr = torchaudio.load(path)
+    audio = audio * (1 << 15)
+    return audio, sr
+
+
+def extract_features(audio: torch.Tensor, sr: int):
+    # extract feature using torchaudio.compliance.kaldi as kaldi
+    feats = torchaudio.compliance.kaldi.fbank(
+        audio,
+        sr,
+        num_mel_bins=80,
+        frame_shift=10,
+        frame_length=25,
+        dither=1.0,
+    )
+    return feats
+
+
+def read_audio_and_extract_features(path: str, device: str, dtype: torch.dtype):
+    audio, sr = read_audio(path)
+    feats = extract_features(audio, sr)
+    return feats.unsqueeze(0).to(device=device, dtype=dtype)
+
+
+def build_dictionary(words_path: str):
+    """Build dictionary from words.txt."""
+    id2word = {}
+    with open(words_path, "r") as f:
+        for line in f.readlines():
+            word, idx = line.strip().split()
+            id2word[int(idx)] = word
+    return id2word
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +172,8 @@ class TestCtcGreedySearch:
         decoder = CtcGreedySearch(opts)
         # Token id=2 is now blank; ids 0, 1, 3 are non-blank
         V = 4
-        logp = _make_logp(3, V, [0, 2, 1])  # blank=2, so only t=0->0 and t=2->1 are kept
+        # blank=2, so only t=0->0 and t=2->1 are kept
+        logp = _make_logp(3, V, [0, 2, 1])
         decoder.search(logp)
         assert decoder.outputs[0] == [0, 1]
 
@@ -143,7 +183,8 @@ class TestCtcGreedySearch:
         # Set specific log-probs: t=0 best=-0.5, t=1 best=-0.3
         logp = torch.full((2, V), -1e9)
         logp[0, 1] = -0.5
-        logp[1, 0] = -0.3  # blank -> not emitted as token, but still contributes to likelihood
+        # blank -> not emitted as token, but still contributes to likelihood
+        logp[1, 0] = -0.3
         decoder = CtcGreedySearch(blank=0)
         decoder.search(logp)
         assert abs(decoder.likelihood[0] - (-0.5 + -0.3)) < 1e-5
@@ -175,7 +216,8 @@ class TestContextGraph:
         for tok in [1, 2, 3]:
             state, delta = ctx.get_next_state(state, tok)
             total_delta += delta
-        assert abs(total_delta - 3.0) < 1e-5, f"Expected 3.0, got {total_delta}"
+        assert abs(total_delta -
+                   3.0) < 1e-5, f"Expected 3.0, got {total_delta}"
 
     def test_no_match_returns_to_root(self):
         """An unrelated token stays at / returns to start state with zero score."""
@@ -239,27 +281,31 @@ class TestBeamSearchWithContext:
         logp[1, blank] = -0.01  # blank at t=1 (paths don't change)
 
         # Without context: top path should be [1]
-        decoder_no_ctx = CtcPrefixBeamSearch(blank=blank, first_beam_size=5, second_beam_size=5)
+        decoder_no_ctx = CtcPrefixBeamSearch(
+            blank=blank, first_beam_size=5, second_beam_size=5)
         decoder_no_ctx.search(logp)
         decoder_no_ctx.finalize_search()
         top_no_ctx = decoder_no_ctx.outputs[0]
 
         # With context [2]: +5.0 bonus lifts [2] above [1]
         ctx = ContextGraph(phrases=[[2]], context_score=5.0)
-        decoder_ctx = CtcPrefixBeamSearch(blank=blank, first_beam_size=5, second_beam_size=5)
+        decoder_ctx = CtcPrefixBeamSearch(
+            blank=blank, first_beam_size=5, second_beam_size=5)
         decoder_ctx.set_context_graph(ctx)
         decoder_ctx.search(logp)
         decoder_ctx.finalize_search()
         top_ctx = decoder_ctx.outputs[0]
 
-        assert top_no_ctx == [1], f"Expected [1] without context, got {top_no_ctx}"
+        assert top_no_ctx == [
+            1], f"Expected [1] without context, got {top_no_ctx}"
         assert top_ctx == [2], f"Expected [2] with context, got {top_ctx}"
 
     def test_no_context_regression(self):
         """Without a context graph, beam search behavior is unchanged."""
         V = 4
         logp = _make_logp(4, V, [1, 0, 2, 0])
-        decoder = CtcPrefixBeamSearch(blank=0, first_beam_size=4, second_beam_size=4)
+        decoder = CtcPrefixBeamSearch(
+            blank=0, first_beam_size=4, second_beam_size=4)
         decoder.search(logp)
         decoder.finalize_search()
         assert decoder.outputs[0] == [1, 2]
@@ -272,13 +318,15 @@ class TestBeamSearchWithContext:
 
         # Offline: single call
         logp = _make_logp(5, V, [1, 0, 2, 0, 3])
-        d_offline = CtcPrefixBeamSearch(blank=blank, first_beam_size=5, second_beam_size=5)
+        d_offline = CtcPrefixBeamSearch(
+            blank=blank, first_beam_size=5, second_beam_size=5)
         d_offline.set_context_graph(ctx)
         d_offline.search(logp)
         d_offline.finalize_search()
 
         # Streaming: two chunks
-        d_stream = CtcPrefixBeamSearch(blank=blank, first_beam_size=5, second_beam_size=5)
+        d_stream = CtcPrefixBeamSearch(
+            blank=blank, first_beam_size=5, second_beam_size=5)
         d_stream.set_context_graph(ctx)
         d_stream.search(logp[:3])
         d_stream.search(logp[3:])
@@ -336,77 +384,112 @@ class TestGreedySearchWithContext:
 # K2 WFST Beam Search tests (skipped when K2 is not available)
 # ---------------------------------------------------------------------------
 
-import oasr.decoder as _decoder_mod
 
 _K2_AVAILABLE = getattr(_decoder_mod, "k2_available", False)
 
 
 @pytest.mark.skipif(not _K2_AVAILABLE, reason="K2 not available (build with OASR_USE_K2=1)")
 class TestCtcWfstBeamSearch:
-    """Tests for CtcWfstBeamSearch (K2 backend). Only run when K2 is compiled in."""
+    """Integration tests for CtcWfstBeamSearch using a real AM checkpoint,
+    a pre-built language directory, and a real audio file.
+    Only runs when K2 is compiled in.
 
-    @staticmethod
-    def _save_fsa(fsa, tmp_path, name: str) -> str:
-        """Save a k2 Fsa as a dict to a temp file and return the path."""
-        import torch
+    Pass paths via CLI or environment variables:
+        --ckpt-dir  / CKPT_DIR    AM checkpoint directory
+        --lang-dir  / LANG_DIR    Language directory
+        --audio-path / AUDIO_PATH  input WAV file
+    """
 
-        path = str(tmp_path / name)
-        torch.save(fsa.as_dict(), path, _use_new_zipfile_serialization=True)
-        return path
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_decode(self, ckpt_dir: str, lang_dir: str, audio_path: str, dtype: torch.dtype):
+        """WFST decoder produces a non-empty transcription for a real utterance."""
+        if not ckpt_dir or not Path(ckpt_dir).exists():
+            pytest.skip(
+                "AM checkpoint dir not set or not found; use --ckpt-dir or CKPT_DIR")
+        if not lang_dir or not Path(lang_dir).exists():
+            pytest.skip(
+                "Language directory not set or not found; use --lang-dir or LANG_DIR")
+        if not audio_path or not Path(audio_path).exists():
+            pytest.skip(
+                "Audio path not set or not found; use --audio-path or AUDIO_PATH")
 
-    def test_wfst_basic(self, tmp_path):
-        """Decode a single token through a CTC topo decoding graph."""
-        import k2
-
-        # k2.ctc_topo creates a proper CTC topology graph with aux_labels,
-        # which is required by k2.GetLattice + k2.BestPath.
-        # max_token=1: blank=0, token=1
-        graph = k2.ctc_topo(max_token=1)
-        graph_path = self._save_fsa(graph, tmp_path, "graph_basic.pt")
-
+        import torchaudio  # noqa: F401
         from oasr.decoder import CtcWfstBeamSearch, CtcWfstBeamSearchOptions
+        from oasr.models.conformer import load_wenet_checkpoint
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        model, _ = load_wenet_checkpoint(ckpt_dir, device=device, dtype=dtype)
+
+        feats = read_audio_and_extract_features(
+            audio_path, device=device, dtype=dtype)
+        lengths = torch.full((1,), feats.size(
+            1), dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            logp = model(feats, lengths)  # [1, T, V]
+        logp = logp.squeeze(0).to(device="cpu", dtype=torch.float32)  # [T, V]
 
         opts = CtcWfstBeamSearchOptions()
-        opts.blank_skip_thresh = 0.0  # disable blank-skipping for deterministic test
-        decoder = CtcWfstBeamSearch.from_file(graph_path, opts)
-
-        # Two frames: token 1 then blank (0). CTC should decode to [1].
-        V = 2  # vocab: blank=0, token=1
-        logp = _make_logp(2, V, [1, 0])
+        opts.nbest = 5
+        decoder = CtcWfstBeamSearch.from_file(os.path.join(lang_dir, "HLG.pt"), opts)
         decoder.search(logp)
         decoder.finalize_search()
+        id2word = build_dictionary(os.path.join(lang_dir, "words.txt"))
+        print(f"text: {" ".join([id2word[i] for i in decoder.outputs[0]])}")
+        assert len(decoder.outputs) >= 1, "Expected at least one hypothesis"
+        assert len(decoder.outputs[0]) > 0, "Top hypothesis must be non-empty"
 
-        assert len(decoder.outputs) >= 1
-        assert decoder.outputs[0] == [1]
-
-    def test_wfst_streaming(self, tmp_path):
-        """Chunked WFST decoding matches offline decoding."""
-        import k2
-
-        # max_token=2: blank=0, tokens 1 and 2
-        graph = k2.ctc_topo(max_token=2)
-        graph_path = self._save_fsa(graph, tmp_path, "graph_stream.pt")
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_wfst_streaming_matches_offline(self, ckpt_dir: str, lang_dir: str, audio_path: str, dtype: torch.dtype):
+        """Chunked WFST decoding over a real utterance matches single-pass offline result."""
+        if not ckpt_dir or not Path(ckpt_dir).exists():
+            pytest.skip(
+                "AM checkpoint dir not set or not found; use --ckpt-dir or CKPT_DIR")
+        if not lang_dir or not Path(lang_dir).exists():
+            pytest.skip(
+                "Language directory not set or not found; use --lang-dir or LANG_DIR")
+        if not audio_path or not Path(audio_path).exists():
+            pytest.skip(
+                "Audio path not set or not found; use --audio-path or AUDIO_PATH")
 
         from oasr.decoder import CtcWfstBeamSearch, CtcWfstBeamSearchOptions
+        from oasr.models.conformer import load_wenet_checkpoint
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        model, _ = load_wenet_checkpoint(ckpt_dir, device=device, dtype=dtype)
+
+        feats = read_audio_and_extract_features(
+            audio_path, device=device, dtype=dtype)
+        lengths = torch.full((1,), feats.size(
+            1), dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            logp = model(feats, lengths)  # [1, T, V]
+        logp = logp.squeeze(0).to(device="cpu", dtype=torch.float32)  # [T, V]
 
         opts = CtcWfstBeamSearchOptions()
-        opts.blank_skip_thresh = 0.0  # disable blank skipping for this test
-        V = 3  # vocab: blank=0, token 1, token 2
-        full_path = [1, 0, 2, 0]  # token1, blank, token2, blank → expected [1, 2]
-        logp = _make_logp(len(full_path), V, full_path)
+        # disable blank-skipping (skip if P(blank) > thresh; 1.0 = never)
+        opts.blank_skip_thresh = 1.0
 
-        # Offline
-        d_offline = CtcWfstBeamSearch.from_file(graph_path, opts)
+        # Offline: single search call
+        d_offline = CtcWfstBeamSearch.from_file(os.path.join(lang_dir, "HLG.pt"), opts)
         d_offline.search(logp)
         d_offline.finalize_search()
 
-        # Streaming (same frames split in two chunks)
-        d_stream = CtcWfstBeamSearch.from_file(graph_path, opts)
-        d_stream.search(logp[:2])
-        d_stream.search(logp[2:])
+        # Streaming: split into three equal chunks
+        T = logp.size(0)
+        chunk = T // 3
+        d_stream = CtcWfstBeamSearch.from_file(os.path.join(lang_dir, "HLG.pt"), opts)
+        d_stream.search(logp[:chunk])
+        d_stream.search(logp[chunk: 2 * chunk])
+        d_stream.search(logp[2 * chunk:])
         d_stream.finalize_search()
 
-        assert d_stream.outputs[0] == d_offline.outputs[0]
+        assert d_stream.outputs[0] == d_offline.outputs[0], (
+            f"Streaming output {d_stream.outputs[0]} != offline {d_offline.outputs[0]}"
+        )
 
 
 class TestCtcPrefixBeamSearch:
@@ -420,39 +503,12 @@ class TestCtcPrefixBeamSearch:
 
         if not ckpt_dir or not Path(ckpt_dir).exists():
             pytest.skip(
-                "WeNet checkpoint dir not set or not found; set WENET_CKPT_DIR env var or --ckpt-dir"
+                "WeNet checkpoint dir not set or not found; set CKPT_DIR env var or --ckpt-dir"
             )
         if not audio_path or not Path(audio_path).exists():
             pytest.skip(
-                "Audio path not set or not found; set WENET_AUDIO_PATH env var or --audio-path"
+                "Audio path not set or not found; set AUDIO_PATH env var or --audio-path"
             )
-
-        def read_audio(path: str):
-            """Read audio file."""
-            audio, sr = torchaudio.load(path)
-            audio = audio * (1 << 15)
-            return audio, sr
-
-        def extract_features(audio: torch.Tensor, sr: int):
-            # extract feature using torchaudio.compliance.kaldi as kaldi
-            feats = torchaudio.compliance.kaldi.fbank(
-                audio,
-                sr,
-                num_mel_bins=80,
-                frame_shift=10,
-                frame_length=25,
-                dither=1.0,
-            )
-            return feats
-
-        def build_dictionary(ckpt_dir: str):
-            """Build dictionary from words.txt."""
-            id2word = {}
-            with open(Path(ckpt_dir) / "words.txt", "r") as f:
-                for line in f.readlines():
-                    word, idx = line.strip().split()
-                    id2word[int(idx)] = word
-            return id2word
 
         def decode(probs: torch.Tensor, id2word: dict[int, str]):
             """Detokenize outputs."""
@@ -482,10 +538,8 @@ class TestCtcPrefixBeamSearch:
 
         torch.manual_seed(42)
 
-        audio, sr = read_audio(audio_path)
-        feats = extract_features(audio, sr)  # [T, F]
-        feats = feats.unsqueeze(0)  # [1, T, F]
-        feats = feats.to(device=device, dtype=dtype)
+        feats = read_audio_and_extract_features(
+            audio_path, device=device, dtype=dtype)
 
         lengths = torch.full(
             (1,), feats.size(1), dtype=torch.long, device=device
@@ -502,7 +556,7 @@ class TestCtcPrefixBeamSearch:
         chunk_by_chunk_probs = chunk_by_chunk_probs.squeeze(
             0).to(device="cpu", dtype=dtype)
 
-        id2word = build_dictionary(ckpt_dir)
+        id2word = build_dictionary(os.path.join(ckpt_dir, "words.txt"))
 
         text, _ = decode(probs, id2word)
         chunk_by_chunk_text, _ = decode(chunk_by_chunk_probs, id2word)
@@ -602,7 +656,8 @@ class TestDecoderAPI:
         logp[1, blank] = -0.01
 
         # Without context
-        d1 = Decoder(DecoderConfig(search_type="prefix_beam", blank=blank, beam_size=5))
+        d1 = Decoder(DecoderConfig(
+            search_type="prefix_beam", blank=blank, beam_size=5))
         r1 = d1.decode(logp)
         assert r1.tokens[0] == [1]
 
@@ -631,7 +686,8 @@ class TestDecoderAPI:
             decoder = Decoder(config)
             result = decoder.decode(logp)
             assert len(result.tokens) >= 1
-            assert len(result.tokens[0]) > 0, f"Empty decode for search_type={stype!r}"
+            assert len(
+                result.tokens[0]) > 0, f"Empty decode for search_type={stype!r}"
 
     def test_unknown_search_type_raises(self):
         """DecoderConfig with unknown search_type raises ValueError."""

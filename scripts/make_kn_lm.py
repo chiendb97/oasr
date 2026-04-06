@@ -18,10 +18,20 @@ dependencies beyond the Python standard library).
 
 Usage::
 
+    # Single file
     python scripts/make_kn_lm.py \\
         -ngram-order 3 \\
-        -text data/lang_char/transcript_words.txt \\
+        -text data/lang/text \\
         -lm data/lm/G_3_gram.arpa
+
+    # Multiple files (e.g. LibriSpeech train splits)
+    python scripts/make_kn_lm.py \\
+        -ngram-order 3 \\
+        -text train-clean-100/text train-clean-360/text train-other-500/text \\
+        -lm data/lm/G_3_gram.arpa
+
+Input text files must contain plain text with one sentence per line
+(space-separated words).  Utterance IDs must be stripped beforehand.
 """
 
 import argparse
@@ -46,8 +56,10 @@ parser.add_argument(
 parser.add_argument(
     "-text",
     type=str,
+    nargs="*",
     default=None,
-    help="Path to the corpus file (one sentence per line). "
+    metavar="FILE",
+    help="One or more corpus files (one sentence per line, plain text). "
     "Reads from stdin if not specified.",
 )
 parser.add_argument(
@@ -250,13 +262,14 @@ class NgramCounts:
 if __name__ == "__main__":
     ngram_counts = NgramCounts(args.ngram_order)
 
-    if args.text is None:
+    if not args.text:
         ngram_counts.add_raw_counts_from_standard_input()
     else:
-        if not os.path.isfile(args.text):
-            print(f"ERROR: text file not found: {args.text}", file=sys.stderr)
-            sys.exit(1)
-        ngram_counts.add_raw_counts_from_file(args.text)
+        for text_file in args.text:
+            if not os.path.isfile(text_file):
+                print(f"ERROR: text file not found: {text_file}", file=sys.stderr)
+                sys.exit(1)
+            ngram_counts.add_raw_counts_from_file(text_file)
 
     ngram_counts.cal_discounting_constants()
     ngram_counts.cal_f()

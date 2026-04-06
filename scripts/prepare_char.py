@@ -126,20 +126,20 @@ def main():
         print(f"ERROR: {words_file} not found", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loading word symbol table from {words_file}")
+    print(f"Loading word symbol table from {words_file}", file=sys.stderr)
     word_sym_table = k2.SymbolTable.from_file(words_file)
 
     # Filter out special/reserved symbols.
     excluded = {"<eps>", "!SIL", "<SPOKEN_NOISE>", "<UNK>", "#0", "<s>", "</s>"}
     words = [w for w in word_sym_table.symbols if w not in excluded]
 
-    print(f"Generating character token table from {text_file}")
+    print(f"Generating character token table from {text_file}", file=sys.stderr)
     token_sym_table = generate_tokens(text_file)
 
-    print(f"Building lexicon ({len(words)} words)")
+    print(f"Building lexicon ({len(words)} words)", file=sys.stderr)
     lexicon = generate_lexicon(token_sym_table, words)
 
-    print("Adding disambiguation symbols")
+    print("Adding disambiguation symbols", file=sys.stderr)
     lexicon_disambig, max_disambig = add_disambig_symbols(lexicon)
 
     # Append disambiguation tokens (#0, #1, ..., #max_disambig) to the token table.
@@ -158,15 +158,15 @@ def main():
     # Build word2id dict from symbol table (k2.SymbolTable supports [] lookup).
     word2id = {w: word_sym_table[w] for w in word_sym_table.symbols}
 
-    print(f"Writing outputs to {lang_dir}/")
+    print(f"Writing outputs to {lang_dir}/", file=sys.stderr)
     write_mapping(lang_dir / "tokens.txt", token_sym_table)
     write_lexicon(lang_dir / "lexicon.txt", lexicon)
     write_lexicon(lang_dir / "lexicon_disambig.txt", lexicon_disambig)
 
-    print("Building L (lexicon FST without silence)")
+    print("Building L (lexicon FST without silence)", file=sys.stderr)
     L = lexicon_to_fst_no_sil(lexicon, token2id=token_sym_table, word2id=word2id)
 
-    print("Building L_disambig (lexicon FST with #0 self-loops)")
+    print("Building L_disambig (lexicon FST with #0 self-loops)", file=sys.stderr)
     L_disambig = lexicon_to_fst_no_sil(
         lexicon_disambig,
         token2id=token_sym_table,
@@ -176,12 +176,12 @@ def main():
 
     torch.save(L.as_dict(), lang_dir / "L.pt")
     torch.save(L_disambig.as_dict(), lang_dir / "L_disambig.pt")
-    print("Done.")
-    print(f"  tokens.txt           : {lang_dir / 'tokens.txt'}")
-    print(f"  lexicon.txt          : {lang_dir / 'lexicon.txt'}")
-    print(f"  lexicon_disambig.txt : {lang_dir / 'lexicon_disambig.txt'}")
-    print(f"  L.pt                 : {lang_dir / 'L.pt'}")
-    print(f"  L_disambig.pt        : {lang_dir / 'L_disambig.pt'}")
+    print("Done.", file=sys.stderr)
+    print(f"  tokens.txt           : {lang_dir / 'tokens.txt'}", file=sys.stderr)
+    print(f"  lexicon.txt          : {lang_dir / 'lexicon.txt'}", file=sys.stderr)
+    print(f"  lexicon_disambig.txt : {lang_dir / 'lexicon_disambig.txt'}", file=sys.stderr)
+    print(f"  L.pt                 : {lang_dir / 'L.pt'}", file=sys.stderr)
+    print(f"  L_disambig.pt        : {lang_dir / 'L_disambig.pt'}", file=sys.stderr)
 
 
 if __name__ == "__main__":
