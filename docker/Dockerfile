@@ -40,8 +40,6 @@ RUN rm -rf /opt/k2-src/build
 # ---------------------------------------------------------------------------
 FROM nvcr.io/nvidia/pytorch:26.03-py3 AS runtime
 
-ARG CUDA_ARCHS=80
-
 # Copy k2 install tree into /usr/local so CMake's default search path finds it:
 #   /usr/local/include/k2/torch_api.h
 #   /usr/local/lib/libk2_*.so
@@ -75,7 +73,6 @@ COPY . .
 # enabling the streaming decoder's internal-header includes.
 RUN OASR_USE_K2=1 \
     K2_SOURCE_DIR=/opt/k2-src \
-    CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
     pip install --no-build-isolation -e .
 
 # ---------------------------------------------------------------------------

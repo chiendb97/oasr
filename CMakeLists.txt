@@ -193,6 +193,9 @@ if(OASR_USE_K2)
     # part of the installed package.  In Docker this is /opt/k2-src.
     # Pass -DK2_SOURCE_DIR=<path> on the cmake command line, or set the
     # K2_SOURCE_DIR environment variable (picked up by setup.py).
+    if(NOT DEFINED K2_SOURCE_DIR AND DEFINED ENV{K2_SOURCE_DIR})
+        set(K2_SOURCE_DIR "$ENV{K2_SOURCE_DIR}")
+    endif()
     if(NOT DEFINED K2_SOURCE_DIR)
         message(FATAL_ERROR
             "K2_SOURCE_DIR is not set.\n"

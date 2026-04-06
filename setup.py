@@ -42,17 +42,12 @@ def _find_k2_cmake_dir():
 
     here = os.path.dirname(os.path.abspath(__file__))
 
-    # 1. Prefer the submodule-built install (3rdparty/k2_install).
-    submodule_cmake = os.path.join(here, "3rdparty", "k2_install", "share", "cmake", "k2")
-    if os.path.isfile(os.path.join(submodule_cmake, "k2Config.cmake")):
-        return submodule_cmake
-
-    # 2. System-wide install (e.g. /usr/local/share/cmake/k2).
+    # 1. System-wide install (e.g. /usr/local/share/cmake/k2).
     system_cmake = "/usr/local/share/cmake/k2"
     if os.path.isfile(os.path.join(system_cmake, "k2Config.cmake")):
         return system_cmake
 
-    # 3. pip package layout in site-packages.
+    # 2. pip package layout in site-packages.
     site_dirs = []
     for scheme in ("purelib", "platlib"):
         try:
@@ -192,10 +187,9 @@ class CMakeBuild(build_ext):
                     "OASR_USE_K2=1 requires k2 to be installed. "
                     "Run: pip install k2"
                 )
-            # Optional: point to k2 source tree for internal headers
-            # (k2/csrc/, k2/torch/csrc/).  Required by the streaming decoder.
-            # Falls back to the bundled submodule (3rdparty/k2) when not set.
-            k2_src = os.environ.get("K2_SOURCE_DIR")
+            # K2 source tree for internal headers (k2/csrc/, k2/torch/csrc/).
+            # Required by the streaming decoder.
+            k2_src = os.environ.get("K2_SOURCE_DIR", "/opt/k2-src")
             if k2_src:
                 cmake_args.append(f"-DK2_SOURCE_DIR={k2_src}")
         else:
