@@ -67,7 +67,7 @@ def _build_global_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         choices=list_routines(),
-        help="Kernel routine family (gemm, norm, conv, activation, composite)",
+        help="Kernel routine family (gemm, norm, conv, activation, composite, ctc_decoder)",
     )
     parser.add_argument(
         "--subroutine",
@@ -80,7 +80,7 @@ def _build_global_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         help="Backend(s) to benchmark. Per-family defaults: gemm/conv2d → cutlass torch; "
-             "norm/conv1d/activation/composite → cuda torch",
+             "norm/conv1d/activation/composite → cuda torch; ctc_decoder → oasr torchaudio",
     )
     parser.add_argument(
         "--dtype",

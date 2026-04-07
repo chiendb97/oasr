@@ -22,6 +22,7 @@ ROUTINE_REGISTRY: dict[str, str] = {
     "conv": "benchmarks.routines.conv",
     "activation": "benchmarks.routines.activation",
     "composite": "benchmarks.routines.composite",
+    "ctc_decoder": "benchmarks.routines.ctc_decoder",
 }
 
 
