@@ -307,3 +307,141 @@ class TestCtcDecoderApiExport:
         assert hasattr(oasr, "GpuStreamingDecoder")
         assert hasattr(oasr, "GpuDecoderConfig")
         assert hasattr(oasr, "GpuDecoderResult")
+
+
+# ---------------------------------------------------------------------------
+# Paged memory tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.cuda
+class TestCtcDecoderPagedOffline:
+    """Tests for paged-memory GPU CTC prefix beam search (offline)."""
+
+    def test_paged_matches_flat_basic(self, device):
+        """Paged mode produces token-exact output matching flat mode."""
+        V = 5
+        logp = _make_logp_gpu(5, V, [1, 0, 2, 0, 3], device)
+        seq_lengths = torch.tensor([5], dtype=torch.int32, device=device)
+
+        result_flat = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=3, blank_id=0, blank_threshold=1.0, max_seq_len=10)
+        result_paged = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=3, blank_id=0, blank_threshold=1.0, max_seq_len=10,
+            use_paged_memory=True, page_size=4)
+
+        assert result_paged.tokens[0][0] == [1, 2, 3]
+        assert result_paged.tokens == result_flat.tokens
+
+    def test_paged_matches_flat_batched(self, device):
+        """Paged mode handles batched inputs identically to flat mode."""
+        V = 6
+        paths = [
+            [1, 0, 2, 0, 3],
+            [4, 0, 5],
+            [1, 0, 1, 0, 1, 0, 2],
+        ]
+        logp, seq_lengths = _make_batched_logp_gpu(paths, V, device)
+
+        result_flat = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=5, blank_id=0, blank_threshold=1.0, max_seq_len=20)
+        result_paged = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=5, blank_id=0, blank_threshold=1.0, max_seq_len=20,
+            use_paged_memory=True, page_size=4)
+
+        assert result_paged.tokens == result_flat.tokens
+
+    def test_paged_workspace_smaller_than_flat(self, device):
+        """Paged workspace is smaller than flat for large max_seq_len."""
+        mod = oasr.ctc_decode._get_ctc_decoder_module()
+        batch, beam, vocab, max_seq = 4, 16, 5000, 1024
+        flat_size = mod.ctc_decoder_workspace_size(batch, beam, vocab, max_seq)
+        paged_size = mod.ctc_decoder_paged_workspace_size(batch, beam, vocab, max_seq, 16)
+        assert paged_size < flat_size
+
+    def test_paged_workspace_size_positive(self, device):
+        """Paged workspace size is positive."""
+        mod = oasr.ctc_decode._get_ctc_decoder_module()
+        size = mod.ctc_decoder_paged_workspace_size(1, 10, 5000, 200, 16)
+        assert size > 0
+
+    def test_paged_page_size_16(self, device):
+        """Default page_size=16 produces correct output."""
+        V = 8
+        logp = _make_logp_gpu(7, V, [1, 0, 2, 0, 3, 0, 4], device)
+        seq_lengths = torch.tensor([7], dtype=torch.int32, device=device)
+
+        result = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=5, blank_id=0, blank_threshold=1.0, max_seq_len=10,
+            use_paged_memory=True, page_size=16)
+
+        assert result.tokens[0][0] == [1, 2, 3, 4]
+
+    def test_paged_long_sequence_multiple_pages(self, device):
+        """Sequence longer than one page exercises multi-page access."""
+        V = 6
+        # 20 non-blank tokens separated by blanks → each token on a new page
+        # (page_size=4 means page boundary every 4 tokens)
+        tokens = [t for tok in range(1, 21) for t in [tok % V or 1, 0]]
+        T = len(tokens)
+        path_tokens = [t for t in tokens]
+        logp = _make_logp_gpu(T, V, path_tokens, device)
+        seq_lengths = torch.tensor([T], dtype=torch.int32, device=device)
+
+        result = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=1, blank_id=0, blank_threshold=1.0, max_seq_len=40,
+            use_paged_memory=True, page_size=4)
+
+        # Result should be non-empty and have a positive score
+        assert len(result.tokens[0][0]) > 0
+        assert result.scores[0, 0].item() > -1e8
+
+
+@pytest.mark.cuda
+class TestCtcDecoderPagedStreaming:
+    """Tests for paged-memory GPU CTC prefix beam search (streaming)."""
+
+    def test_paged_streaming_matches_flat(self, device):
+        """Paged streaming produces the same output as flat streaming."""
+        V = 5
+        path = [1, 0, 2, 0, 3]
+
+        def _run(use_paged):
+            config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10,
+                                      use_paged_memory=use_paged, page_size=4)
+            decoder = GpuStreamingDecoder(config)
+            decoder.init_stream(batch=1, vocab_size=V, device=device)
+            for tok in path:
+                frame = torch.full((1, 1, V), -1e9, dtype=torch.float32, device=device)
+                frame[0, 0, tok] = 0.0
+                decoder.decode_chunk(frame)
+            return decoder.finalize_stream()
+
+        result_flat = _run(use_paged=False)
+        result_paged = _run(use_paged=True)
+
+        assert result_paged.tokens[0][0] == [1, 2, 3]
+        assert result_paged.tokens == result_flat.tokens
+
+    def test_paged_streaming_state_size_positive(self, device):
+        """Paged state buffer size is positive."""
+        mod = oasr.ctc_decode._get_ctc_decoder_module()
+        size = mod.ctc_decoder_paged_state_size(1, 10, 5000, 200, 16)
+        assert size > 0
+
+    def test_paged_streaming_reinit(self, device):
+        """Re-calling init_stream in paged mode resets state."""
+        V = 5
+        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10,
+                                  use_paged_memory=True, page_size=4)
+        decoder = GpuStreamingDecoder(config)
+
+        decoder.init_stream(batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk(_make_logp_gpu(3, V, [1, 0, 2], device))
+        result1 = decoder.finalize_stream()
+
+        decoder.init_stream(batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk(_make_logp_gpu(3, V, [3, 0, 4], device))
+        result2 = decoder.finalize_stream()
+
+        assert result1.tokens[0][0] == [1, 2]
+        assert result2.tokens[0][0] == [3, 4]

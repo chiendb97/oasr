@@ -47,12 +47,19 @@ class GpuDecoderConfig:
             (offline mode only). Reduces computation on blank-heavy frames.
         max_seq_len: Maximum decoded sequence length per utterance. Beams
             longer than this are truncated.
+        use_paged_memory: Use paged-attention-style memory for decoded
+            sequences. Reduces GPU memory usage when max_seq_len is large
+            by storing sequences in fixed-size pages with prefix sharing.
+        page_size: Number of tokens per page (must be a positive integer).
+            16 (the default) aligns with a single cache line (64 bytes).
     """
 
     beam_size: int = 10
     blank_id: int = 0
     blank_threshold: float = 0.98
     max_seq_len: int = 200
+    use_paged_memory: bool = False
+    page_size: int = 16
 
 
 @dataclass
@@ -100,6 +107,8 @@ def ctc_beam_search_decode(
     blank_id: int = 0,
     blank_threshold: float = 0.98,
     max_seq_len: int = 200,
+    use_paged_memory: bool = False,
+    page_size: int = 16,
 ) -> GpuDecoderResult:
     """GPU-accelerated CTC prefix beam search decode (offline, full sequence).
 
@@ -117,6 +126,10 @@ def ctc_beam_search_decode(
         Skip threshold for blank probability.
     max_seq_len : int
         Maximum decoded output sequence length.
+    use_paged_memory : bool
+        Use paged-attention-style memory for decoded sequences.
+    page_size : int
+        Tokens per page when ``use_paged_memory=True`` (default 16).
 
     Returns
     -------
@@ -134,7 +147,13 @@ def ctc_beam_search_decode(
     # Allocate workspace (needs max of input seq len and output seq len)
     input_seq_len = log_prob.size(1)
     ws_seq_len = max(input_seq_len, max_seq_len)
-    ws_bytes = mod.ctc_decoder_workspace_size(batch, beam_size, log_prob.size(2), ws_seq_len)
+    vocab_size = log_prob.size(2)
+
+    if use_paged_memory:
+        ws_bytes = mod.ctc_decoder_paged_workspace_size(
+            batch, beam_size, vocab_size, ws_seq_len, page_size)
+    else:
+        ws_bytes = mod.ctc_decoder_workspace_size(batch, beam_size, vocab_size, ws_seq_len)
     workspace = torch.empty(int(ws_bytes), dtype=torch.uint8, device=device)
 
     # Allocate outputs
@@ -142,11 +161,18 @@ def ctc_beam_search_decode(
     out_lengths = torch.empty(batch, beam_size, dtype=torch.int32, device=device)
     out_scores = torch.empty(batch, beam_size, dtype=torch.float32, device=device)
 
-    mod.ctc_beam_search_decode(
-        out_tokens, out_lengths, out_scores,
-        log_prob, seq_lengths, workspace,
-        beam_size, blank_id, blank_threshold,
-    )
+    if use_paged_memory:
+        mod.ctc_beam_search_decode_paged(
+            out_tokens, out_lengths, out_scores,
+            log_prob, seq_lengths, workspace,
+            beam_size, blank_id, blank_threshold, page_size,
+        )
+    else:
+        mod.ctc_beam_search_decode(
+            out_tokens, out_lengths, out_scores,
+            log_prob, seq_lengths, workspace,
+            beam_size, blank_id, blank_threshold,
+        )
 
     tokens = _extract_tokens(out_tokens, out_lengths, batch, beam_size)
     return GpuDecoderResult(tokens=tokens, lengths=out_lengths, scores=out_scores)
@@ -197,16 +223,25 @@ class GpuStreamingDecoder:
         if device is None:
             device = torch.device("cuda")
 
-        state_bytes = self._mod.ctc_decoder_state_size(
-            batch, cfg.beam_size, vocab_size, cfg.max_seq_len)
+        if cfg.use_paged_memory:
+            state_bytes = self._mod.ctc_decoder_paged_state_size(
+                batch, cfg.beam_size, vocab_size, cfg.max_seq_len, cfg.page_size)
+        else:
+            state_bytes = self._mod.ctc_decoder_state_size(
+                batch, cfg.beam_size, vocab_size, cfg.max_seq_len)
         self._state_buffer = torch.empty(int(state_bytes), dtype=torch.uint8, device=device)
         self._batch = batch
         self._vocab_size = vocab_size
         self._step = 0
 
-        self._mod.ctc_beam_search_init_state(
-            self._state_buffer, batch, cfg.beam_size,
-            vocab_size, cfg.max_seq_len, cfg.blank_id)
+        if cfg.use_paged_memory:
+            self._mod.ctc_beam_search_init_state_paged(
+                self._state_buffer, batch, cfg.beam_size,
+                vocab_size, cfg.max_seq_len, cfg.blank_id, cfg.page_size)
+        else:
+            self._mod.ctc_beam_search_init_state(
+                self._state_buffer, batch, cfg.beam_size,
+                vocab_size, cfg.max_seq_len, cfg.blank_id)
 
     def decode_chunk(self, log_prob: torch.Tensor) -> None:
         """Process one chunk of log-probability frames.
