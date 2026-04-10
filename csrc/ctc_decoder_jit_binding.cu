@@ -21,7 +21,8 @@ void ctc_beam_search_init_state(TensorView state_buffer,
                                 int64_t blank_id);
 void ctc_beam_search_step(TensorView state_buffer, TensorView log_prob_frame,
                           int64_t beam, int64_t blank_id,
-                          int64_t step, double blank_threshold);
+                          int64_t step, double blank_threshold,
+                          int64_t actual_frame_index);
 void ctc_beam_search_read_state(TensorView out_tokens, TensorView out_lengths,
                                 TensorView out_scores, TensorView state_buffer,
                                 int64_t step);

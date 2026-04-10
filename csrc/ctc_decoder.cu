@@ -109,7 +109,8 @@ void ctc_beam_search_init_state(TensorView state_buffer,
 
 void ctc_beam_search_step(TensorView state_buffer, TensorView log_prob_frame,
                           int64_t beam, int64_t blank_id,
-                          int64_t step, double blank_threshold) {
+                          int64_t step, double blank_threshold,
+                          int64_t actual_frame_index) {
   CHECK_INPUT(state_buffer);
   CHECK_INPUT(log_prob_frame);
   CHECK_DIM(2, log_prob_frame);
@@ -129,6 +130,7 @@ void ctc_beam_search_step(TensorView state_buffer, TensorView log_prob_frame,
       batch_stride, vocab_stride,
       static_cast<int>(step),
       static_cast<int>(blank_id), -1, // space_id = -1
+      static_cast<int>(actual_frame_index),
       stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)

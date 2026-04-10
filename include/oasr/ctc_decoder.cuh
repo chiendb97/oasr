@@ -270,8 +270,9 @@ struct FastDivmod {
             return;
         }
         unsigned int p = 31;
-        while ((1u << p) < (unsigned int)d)
+        while ((1u << p) < (unsigned int)d) {
             ++p;
+        }
         uint64_t m = ((1ULL << (32 + p)) + d - 1) / d;
         multiplier = (unsigned int)(m - (1ULL << 32));
         shift_right = p;
@@ -515,10 +516,15 @@ __global__ void first_step_kernel(const float* __restrict__ log_prob, int batch_
     // single best. For top-1 this is exact; for top-beam we do a full second
     // pass below to ensure correctness when beam candidates span the same thread.
     if (threadIdx.x == 0) {
-        // Full serial top-beam scan over all non-blank vocab items.
+        // Reserve one beam slot for the empty prefix (blank-only path) when
+        // beam > 1.  This prevents spurious initial tokens in streaming mode
+        // where early frames may have moderate blank probability (< threshold)
+        // but no confident non-blank tokens.
+        int nb_beams = (beam > 1) ? beam - 1 : beam;
+
         float topk_keys[128];
         int topk_vals[128];
-        for (int k = 0; k < beam; ++k) {
+        for (int k = 0; k < nb_beams; ++k) {
             topk_keys[k] = NEG_INF;
             topk_vals[k] = -1;
         }
@@ -527,9 +533,8 @@ __global__ void first_step_kernel(const float* __restrict__ log_prob, int batch_
             if (c == blank_id)
                 continue;
             float p = log_prob[bid * batch_stride + first_t * seq_stride + c * vocab_stride];
-            // Replace the minimum in the top-beam heap.
             int min_idx = 0;
-            for (int k = 1; k < beam; ++k)
+            for (int k = 1; k < nb_beams; ++k)
                 if (topk_keys[k] < topk_keys[min_idx])
                     min_idx = k;
             if (p > topk_keys[min_idx]) {
@@ -538,8 +543,8 @@ __global__ void first_step_kernel(const float* __restrict__ log_prob, int batch_
             }
         }
 
-        // Sort top-beam descending (insertion sort).
-        for (int i = 1; i < beam; ++i) {
+        // Sort top non-blank beams descending (insertion sort).
+        for (int i = 1; i < nb_beams; ++i) {
             float ki = topk_keys[i];
             int vi = topk_vals[i];
             int j = i - 1;
@@ -552,16 +557,13 @@ __global__ void first_step_kernel(const float* __restrict__ log_prob, int batch_
             topk_vals[j + 1] = vi;
         }
 
-        // Write results (matching reference first_matrix__bitonic_topk_kernel).
-        for (int k = 0; k < beam; ++k) {
+        // Write non-blank beams to slots 0..nb_beams-1.
+        for (int k = 0; k < nb_beams; ++k) {
             int base = bid * ldbeam + k;
             int token = topk_vals[k];
             float key = topk_keys[k];
 
             if (token >= 0 && token != blank_id) {
-                // Non-blank top-K token: initialise pprev per need_add_blank flag.
-                // If need_add_blank=true: blank path already accumulated → (key, NEG_INF)
-                // If need_add_blank=false: fresh start, nonblank path → (NEG_INF, key)
                 float2 xy = need_add_blank ? make_float2(key, NEG_INF) : make_float2(NEG_INF, key);
                 pprev[base] = xy;
                 int shift = clen[base];  // should be 0 on first step
@@ -570,12 +572,22 @@ __global__ void first_step_kernel(const float* __restrict__ log_prob, int batch_
                 clast[base] = token;
                 score[base] = key;
             } else {
-                // No valid token (e.g., beam > vocab_size - 1 non-blank tokens)
                 pprev[base] = make_float2(NEG_INF, NEG_INF);
                 clast[base] = blank_id;
                 clen[base] = 0;
                 score[base] = NEG_INF;
             }
+        }
+
+        // Write the blank/empty-prefix beam to the last slot.
+        if (beam > 1) {
+            int base = bid * ldbeam + (beam - 1);
+            float blank_prob = log_prob[bid * batch_stride + first_t * seq_stride +
+                                        blank_id * vocab_stride];
+            pprev[base] = make_float2(blank_prob, NEG_INF);
+            clast[base] = blank_id;
+            clen[base] = 0;
+            score[base] = blank_prob;
         }
     }
 }
@@ -1534,10 +1546,27 @@ inline void init_streaming_state(void* state_buffer, int batch, int beam, int vo
 
 inline cudaError_t streaming_step(void* state_buffer, const float* log_prob_frame, int batch_stride,
                                   int vocab_stride, int step, int blank_id, int space_id,
+                                  int actual_frame_index,
                                   cudaStream_t stream) {
     StreamingState state;
     cudaMemcpyAsync(&state, state_buffer, sizeof(StreamingState), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
+
+    // Update select_seqs[b * max_seq_len + step] = actual_frame_index for every batch
+    // element.  This mirrors what init_select_kernel does in offline mode: storing the
+    // true (post-filter) frame index so that need_add_blank detection in
+    // first_step_kernel / prob_matrix_kernel / prob_space_blank_kernel / topk_phase2_kernel
+    // fires correctly when blank-dominant frames have been skipped by the caller.
+    if (actual_frame_index != step) {
+        for (int b = 0; b < state.data.batch; ++b) {
+            int val = actual_frame_index;
+            cudaMemcpyAsync(
+                state.data.select_seqs + b * state.data.max_seq_len + step,
+                &val, sizeof(int),
+                cudaMemcpyHostToDevice, stream);
+        }
+        cudaStreamSynchronize(stream);
+    }
 
     // log_prob_frame is [batch, vocab_size] (single frame).
     // With seq_stride=0, the kernel always accesses index 0 along the seq dim.
@@ -1635,9 +1664,11 @@ __global__ void first_step_paged_kernel(
     __syncthreads();
 
     if (threadIdx.x == 0) {
+        int nb_beams = (beam > 1) ? beam - 1 : beam;
+
         float topk_keys[128];
         int topk_vals[128];
-        for (int k = 0; k < beam; ++k) {
+        for (int k = 0; k < nb_beams; ++k) {
             topk_keys[k] = NEG_INF;
             topk_vals[k] = -1;
         }
@@ -1646,7 +1677,7 @@ __global__ void first_step_paged_kernel(
                 continue;
             float p = log_prob[bid * batch_stride + first_t * seq_stride + c * vocab_stride];
             int min_idx = 0;
-            for (int k = 1; k < beam; ++k)
+            for (int k = 1; k < nb_beams; ++k)
                 if (topk_keys[k] < topk_keys[min_idx])
                     min_idx = k;
             if (p > topk_keys[min_idx]) {
@@ -1654,7 +1685,7 @@ __global__ void first_step_paged_kernel(
                 topk_vals[min_idx] = c;
             }
         }
-        for (int i = 1; i < beam; ++i) {
+        for (int i = 1; i < nb_beams; ++i) {
             float ki = topk_keys[i];
             int vi = topk_vals[i];
             int j = i - 1;
@@ -1667,7 +1698,7 @@ __global__ void first_step_paged_kernel(
             topk_vals[j + 1] = vi;
         }
 
-        for (int k = 0; k < beam; ++k) {
+        for (int k = 0; k < nb_beams; ++k) {
             int base = bid * ldbeam + k;
             int token = topk_vals[k];
             float key = topk_keys[k];
@@ -1675,8 +1706,6 @@ __global__ void first_step_paged_kernel(
             if (token >= 0 && token != blank_id) {
                 float2 xy = need_add_blank ? make_float2(key, NEG_INF) : make_float2(NEG_INF, key);
                 pprev[base] = xy;
-                // Physical page for (bid, k) is pre-allocated as bid * beam + k.
-                // Token goes to offset 0 (clen starts at 0).
                 int phys = bid * beam + k;
                 page_storage[phys * page_size + 0] = token;
                 clen[base] = 1;
@@ -1688,6 +1717,16 @@ __global__ void first_step_paged_kernel(
                 clen[base] = 0;
                 score[base] = NEG_INF;
             }
+        }
+
+        if (beam > 1) {
+            int base = bid * ldbeam + (beam - 1);
+            float blank_prob = log_prob[bid * batch_stride + first_t * seq_stride +
+                                        blank_id * vocab_stride];
+            pprev[base] = make_float2(blank_prob, NEG_INF);
+            clast[base] = blank_id;
+            clen[base] = 0;
+            score[base] = blank_prob;
         }
     }
 }

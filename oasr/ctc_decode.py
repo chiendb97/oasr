@@ -28,6 +28,7 @@ Example -- streaming decode::
 from __future__ import annotations
 
 import functools
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -203,6 +204,7 @@ class GpuStreamingDecoder:
         self._mod = _get_ctc_decoder_module()
         self._state_buffer: Optional[torch.Tensor] = None
         self._step = 0
+        self._actual_frame_idx = 0
         self._batch = 0
         self._vocab_size = 0
 
@@ -233,6 +235,7 @@ class GpuStreamingDecoder:
         self._batch = batch
         self._vocab_size = vocab_size
         self._step = 0
+        self._actual_frame_idx = 0  # total frames seen including skipped blank frames
 
         if cfg.use_paged_memory:
             self._mod.ctc_beam_search_init_state_paged(
@@ -258,16 +261,37 @@ class GpuStreamingDecoder:
         log_prob = log_prob.contiguous().float()
         chunk_t = log_prob.size(1)
 
+        # Pre-compute log threshold; None means disabled (mirrors offline path).
+        blank_log_thresh = (
+            math.log(cfg.blank_threshold)
+            if 0.0 < cfg.blank_threshold < 1.0
+            else None
+        )
+
         for t in range(chunk_t):
             if self._step >= cfg.max_seq_len:
                 break  # Reached maximum decoded sequence length
             frame = log_prob[:, t, :].contiguous()  # [batch, vocab_size]
+
+            # Skip blank-dominant frames (mirrors the init_select_kernel filter
+            # in the offline ctc_beam_search_decode_batch path).  A frame is
+            # skipped when every batch element's blank log-prob ≥ threshold.
+            if blank_log_thresh is not None:
+                if frame[:, cfg.blank_id].min().item() >= blank_log_thresh:
+                    self._actual_frame_idx += 1
+                    continue
+
+            # Pass actual_frame_index so select_seqs[step] is updated to reflect
+            # any skipped blank frames.  This enables need_add_blank detection in
+            # first_step_kernel / prob_matrix_kernel (same as offline mode).
             self._mod.ctc_beam_search_step(
                 self._state_buffer, frame,
                 cfg.beam_size, cfg.blank_id,
                 self._step, cfg.blank_threshold,
+                self._actual_frame_idx,
             )
             self._step += 1
+            self._actual_frame_idx += 1
 
     def finalize_stream(self) -> GpuDecoderResult:
         """Finalize streaming decoding and return results.

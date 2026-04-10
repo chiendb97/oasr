@@ -229,7 +229,7 @@ class TestCtcDecoderGpuStreaming:
         assert result2.tokens[0][0] == [3, 4]
 
     def test_streaming_step_counter(self, device):
-        """Step counter increments correctly."""
+        """Step counter increments correctly (blank-dominant frames are skipped)."""
         V = 5
         config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10)
         decoder = GpuStreamingDecoder(config)
@@ -237,7 +237,7 @@ class TestCtcDecoderGpuStreaming:
 
         assert decoder.step == 0
 
-        logp = _make_logp_gpu(3, V, [1, 0, 2], device)
+        logp = _make_logp_gpu(3, V, [1, 2, 3], device)
         decoder.decode_chunk(logp)
         assert decoder.step == 3
 
