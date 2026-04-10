@@ -16,7 +16,9 @@ A high-performance open-source inference framework for ASR models built with C++
 - **Convolution** -- Depthwise/pointwise Conv1D (including causal), Conv2D via CUTLASS Implicit GEMM, cuDNN Conv2D
 - **Activation** -- GLU, Swish
 - **Attention** -- Multi-head and relative-position attention with optional rotary embeddings
-- **CTC decoder** -- CTC prefix beam search (CPU-side C++)
+- **CTC decoder** -- CTC greedy search, prefix beam search, and WFST beam search (CPU-side C++ with Python wrappers)
+- **Streaming inference** -- Chunk-by-chunk Conformer inference with paged GPU memory for attention and CNN caches
+- **Paged memory cache** -- `BlockPool`-backed paged KV cache and `StreamContext` for multi-request streaming
 - **Kernel auto-tuning** -- Built-in profiling and caching framework for GEMM and Conv2D kernels
 - **Flash Attention** -- Optional support (enable at build time)
 - **Architecture support** -- Volta through Blackwell (SM70--SM120)
@@ -45,17 +47,20 @@ oasr/
 ├── csrc/                      # TVM-FFI launchers + JIT bindings
 │   ├── *.cu                   # Per-kernel launchers and _jit_binding files
 │   ├── tvm_ffi_utils.h        # DLPack dtype dispatch and validation macros
-│   ├── decoder/               # CTC prefix beam search (CPU, C++)
+│   ├── decoder/               # CTC greedy/prefix-beam/WFST decoders + context graph (CPU, C++)
 │   └── pybind/                # pybind11 module (decoder + legacy enums)
 ├── oasr/                      # Python package
 │   ├── activation.py          # Functional API: GLU, Swish
 │   ├── norm.py                # Functional API: LayerNorm, RMSNorm, etc.
 │   ├── conv.py                # Functional API: Conv1D, Conv2D
 │   ├── gemm.py                # Functional API: GEMM, BMM, Grouped GEMM
+│   ├── ctc_decode.py          # High-level CTC decode helpers
 │   ├── aot.py                 # Ahead-of-time compilation registration
 │   ├── jit/                   # JIT spec generators (core.py + per-family)
 │   ├── tune/                  # Auto-tuning framework (profiler, cache, backends)
 │   ├── layers/                # nn.Module wrappers (norm, conv, linear, attention, rotary)
+│   ├── decoder/               # Python wrappers: CtcGreedySearch, CtcPrefixBeamSearch, CtcWfstBeamSearch
+│   ├── cache/                 # Streaming cache manager (BlockPool, AttentionCacheManager, StreamContext)
 │   ├── models/conformer/      # Conformer model, config, weight conversion
 │   └── utils/                 # Dtype mappings, timer
 ├── benchmarks/                # Performance benchmarks
@@ -196,6 +201,47 @@ from oasr.layers import LayerNorm, Linear, Conv1D
 
 norm = LayerNorm(hidden_size)
 linear = Linear(in_features, out_features)
+```
+
+## Streaming Inference
+
+The `oasr.cache` subpackage provides a paged-memory streaming cache for chunk-by-chunk Conformer inference:
+
+```python
+from oasr.cache import (
+    CacheConfig, BlockPool,
+    AttentionCacheManager, CnnCacheManager, CtcStateCacheManager,
+    StreamContext,
+)
+from oasr import GpuDecoderConfig
+
+config = CacheConfig(
+    num_layers=12, n_kv_head=4, head_dim=64, hidden_dim=256,
+    kernel_size=15, chunk_size=16, num_left_chunks=4,
+    block_size_frames=16, max_num_blocks=2048,
+)
+pool    = BlockPool(config)
+att_mgr = AttentionCacheManager(pool, config)
+cnn_mgr = CnnCacheManager(config)
+ctc_mgr = CtcStateCacheManager(GpuDecoderConfig(beam_size=10))
+
+# Per-request streaming
+sid = 42
+att_mgr.allocate_stream(sid)
+cnn_mgr.allocate_stream(sid)
+ctc_mgr.allocate_stream(sid, batch=1, vocab_size=5000)
+ctx = StreamContext(sid, att_mgr, cnn_mgr, ctc_mgr)
+
+for chunk_audio in audio_chunks:
+    att_cache  = ctx.get_att_cache()
+    cnn_cache  = ctx.get_cnn_cache()
+    logits, new_att, new_cnn = model.forward_chunk(
+        chunk_audio, offset, required_cache_size, att_cache, cnn_cache)
+    ctx.commit_chunk(new_att[:, :, -chunk_size:, :], new_cnn)
+    ctx.get_decoder().decode_chunk(logits)
+
+result = ctx.get_decoder().finalize_stream()
+ctx.free()
 ```
 
 ## Kernel Auto-Tuning
