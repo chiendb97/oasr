@@ -5,16 +5,25 @@
 Inspired by the vLLM v1 ``BlockPool`` design:
 https://github.com/vllm-project/vllm/tree/main/vllm/v1/core
 
-A single large GPU tensor is pre-allocated and divided into fixed-size
-physical blocks (pages). A CPU-side free list tracks available block IDs.
-All ``AttentionCacheManager`` instances share one ``BlockPool``.
+Two large GPU tensors (one for K, one for V) are pre-allocated and divided
+into fixed-size physical blocks (pages).  A CPU-side free list tracks
+available block IDs.  All ``AttentionCacheManager`` instances share one
+``BlockPool``.
+
+The backing tensors have shape::
+
+    (num_layers, max_num_blocks, block_size_frames, n_kv_head, head_dim)
+
+Keeping K and V in separate contiguous tensors is required by
+``flash_attn_with_kvcache``, which expects
+``k_cache: (max_num_blocks, block_size, n_kv_head, head_dim)`` per layer.
 """
 
 from __future__ import annotations
 
 import collections
 import threading
-from typing import List
+from typing import List, Tuple
 
 import torch
 
@@ -24,16 +33,16 @@ from oasr.cache.types import CacheConfig
 class BlockPool:
     """Shared pool of physical GPU memory blocks for paged KV cache.
 
-    Pre-allocates one contiguous GPU tensor and manages allocation via a
-    thread-safe free list. Multiple ``AttentionCacheManager`` instances
-    share a single pool.
+    Pre-allocates two contiguous GPU tensors (K pool and V pool) and
+    manages allocation via a thread-safe free list.  Multiple
+    ``AttentionCacheManager`` instances share a single pool.
 
-    The backing tensor has shape::
+    Each pool has shape::
 
-        (num_layers, max_num_blocks, block_size_frames, n_kv_head, kv_last_dim)
+        (num_layers, max_num_blocks, block_size_frames, n_kv_head, head_dim)
 
     Indexing ``pool[layer, block_id]`` yields a
-    ``(block_size_frames, n_kv_head, kv_last_dim)`` slab for one physical block
+    ``(block_size_frames, n_kv_head, head_dim)`` slab for one physical block
     in one encoder layer.
 
     Parameters
@@ -45,7 +54,7 @@ class BlockPool:
     --------
     >>> pool = BlockPool(config)
     >>> ids = pool.allocate(2)
-    >>> pool.get_block_view(layer=0, block_id=ids[0])  # write KV into slab
+    >>> k_view, v_view = pool.get_kv_block_view(layer=0, block_id=ids[0])
     >>> pool.free(ids)
     """
 
@@ -53,18 +62,16 @@ class BlockPool:
         self._config = config
         self._lock = threading.Lock()
 
-        # Pre-allocate the full pool tensor on the target device.
-        # Shape: (num_layers, max_num_blocks, block_size_frames, n_kv_head, kv_last_dim)
         cfg = config
-        self._pool = torch.zeros(
+        pool_shape = (
             cfg.num_layers,
             cfg.max_num_blocks,
             cfg.block_size_frames,
             cfg.n_kv_head,
-            cfg.kv_last_dim,
-            dtype=cfg.dtype,
-            device=cfg.device,
+            cfg.head_dim,
         )
+        self._k_pool = torch.zeros(*pool_shape, dtype=cfg.dtype, device=cfg.device)
+        self._v_pool = torch.zeros(*pool_shape, dtype=cfg.dtype, device=cfg.device)
 
         # Free list: all block IDs are initially free.
         self._free_list: collections.deque[int] = collections.deque(
@@ -122,7 +129,7 @@ class BlockPool:
         Parameters
         ----------
         block_ids : list[int]
-            Physical block IDs to release. Passing an empty list is a no-op.
+            Physical block IDs to release.  Passing an empty list is a no-op.
         """
         with self._lock:
             self._free_list.extend(block_ids)
@@ -131,10 +138,31 @@ class BlockPool:
     # Tensor access
     # ------------------------------------------------------------------
 
-    def get_block_view(self, layer: int, block_id: int) -> torch.Tensor:
-        """Return a direct view into the pool for one layer and block.
+    def get_kv_view(self, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return zero-copy views of the full K and V pools for one layer.
 
-        The returned tensor is a *view* — writes are reflected in the pool.
+        The returned tensors have shape
+        ``(max_num_blocks, block_size_frames, n_kv_head, head_dim)`` and are
+        passed directly into ``PagedKVCache`` / ``flash_attn_with_kvcache``.
+
+        Parameters
+        ----------
+        layer : int
+            Encoder layer index ``[0, num_layers)``.
+
+        Returns
+        -------
+        k_view, v_view : Tensor
+            Views into ``_k_pool[layer]`` and ``_v_pool[layer]``.
+        """
+        return self._k_pool[layer], self._v_pool[layer]
+
+    def get_kv_block_view(
+        self, layer: int, block_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return direct views into K and V slabs for one layer and block.
+
+        The returned tensors are *views* — writes are reflected in the pool.
 
         Parameters
         ----------
@@ -145,17 +173,17 @@ class BlockPool:
 
         Returns
         -------
-        torch.Tensor
-            Shape ``(block_size_frames, n_kv_head, kv_last_dim)``, same
-            dtype and device as the pool.
+        k_view, v_view : Tensor
+            Both shaped ``(block_size_frames, n_kv_head, head_dim)``.
         """
-        return self._pool[layer, block_id]  # view, no copy
+        return self._k_pool[layer, block_id], self._v_pool[layer, block_id]
 
-    def gather_blocks(self, layer: int, block_ids: List[int]) -> torch.Tensor:
-        """Gather multiple blocks for one layer into a contiguous tensor.
+    def gather_kv_blocks(
+        self, layer: int, block_ids: List[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather multiple blocks for one layer into contiguous K and V tensors.
 
-        Uses ``torch.index_select`` to collect the requested blocks from the
-        pool, then reshapes to merge the block and frame dimensions.
+        Uses ``torch.index_select`` on each pool separately.
 
         Parameters
         ----------
@@ -166,20 +194,20 @@ class BlockPool:
 
         Returns
         -------
-        torch.Tensor
-            Shape ``(len(block_ids) * block_size_frames, n_kv_head, kv_last_dim)``.
+        k_flat, v_flat : Tensor
+            Both shaped ``(len(block_ids) * block_size_frames, n_kv_head, head_dim)``.
             Data is contiguous and freshly allocated.
         """
+        cfg = self._config
         if not block_ids:
-            cfg = self._config
-            return torch.empty(
-                0, cfg.n_kv_head, cfg.kv_last_dim,
+            empty = torch.empty(
+                0, cfg.n_kv_head, cfg.head_dim,
                 dtype=cfg.dtype, device=cfg.device,
             )
-        idx = torch.tensor(block_ids, dtype=torch.long, device=self._pool.device)
-        # pool[layer] shape: (max_num_blocks, block_size_frames, n_kv_head, kv_last_dim)
-        selected = torch.index_select(self._pool[layer], dim=0, index=idx)
-        # selected shape: (num_blocks, block_size_frames, n_kv_head, kv_last_dim)
-        n = selected.size(0)
-        bsf = self._config.block_size_frames
-        return selected.reshape(n * bsf, self._config.n_kv_head, self._config.kv_last_dim)
+            return empty, empty.clone()
+
+        idx = torch.tensor(block_ids, dtype=torch.long, device=self._k_pool.device)
+        n, bsf = len(block_ids), cfg.block_size_frames
+        k = torch.index_select(self._k_pool[layer], 0, idx).reshape(n * bsf, cfg.n_kv_head, cfg.head_dim)
+        v = torch.index_select(self._v_pool[layer], 0, idx).reshape(n * bsf, cfg.n_kv_head, cfg.head_dim)
+        return k, v

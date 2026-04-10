@@ -79,6 +79,14 @@ class CacheConfig:
             return -1
         return self.chunk_size * self.num_left_chunks
 
+    max_blocks_per_seq: int = 512
+    """Maximum number of logical blocks per stream for the block_table tensor.
+
+    Must satisfy ``max_blocks_per_seq >= max_logical_blocks`` (when
+    ``num_left_chunks >= 0``).  Used to size the ``block_table`` tensor
+    allocated for each stream in :class:`AttentionCacheManager`.
+    """
+
     @property
     def max_logical_blocks(self) -> Optional[int]:
         """Maximum logical blocks per stream for the attention KV cache.

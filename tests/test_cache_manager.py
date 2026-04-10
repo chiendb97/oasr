@@ -123,45 +123,60 @@ class TestBlockPool:
         cfg = make_config(max_num_blocks=4, block_size_frames=4, n_kv_head=2, head_dim=8)
         pool = BlockPool(cfg)
         (bid,) = pool.allocate(1)
-        view = pool.get_block_view(layer=0, block_id=bid)
-        assert view.shape == (4, 2, 16)  # (block_size_frames, n_kv_head, kv_last_dim=16)
-        # Write sentinel value and read it back via another view call.
-        view[:] = 7.0
-        view2 = pool.get_block_view(layer=0, block_id=bid)
-        assert view2.allclose(torch.full_like(view2, 7.0))
+        k_view, v_view = pool.get_kv_block_view(layer=0, block_id=bid)
+        # Each view: (block_size_frames, n_kv_head, head_dim)
+        assert k_view.shape == (4, 2, 8)
+        assert v_view.shape == (4, 2, 8)
+        # Write sentinel values and read back via another view call.
+        k_view[:] = 3.0
+        v_view[:] = 7.0
+        k2, v2 = pool.get_kv_block_view(layer=0, block_id=bid)
+        assert k2.allclose(torch.full_like(k2, 3.0))
+        assert v2.allclose(torch.full_like(v2, 7.0))
 
     def test_gather_blocks_shape(self):
         cfg = make_config(max_num_blocks=8, block_size_frames=4, n_kv_head=2, head_dim=8)
         pool = BlockPool(cfg)
         ids = pool.allocate(3)
-        gathered = pool.gather_blocks(layer=0, block_ids=ids)
-        assert gathered.shape == (3 * 4, 2, 16)  # (N*bsf, n_kv_head, kv_last_dim)
+        k_flat, v_flat = pool.gather_kv_blocks(layer=0, block_ids=ids)
+        # Each: (N*block_size_frames, n_kv_head, head_dim)
+        assert k_flat.shape == (3 * 4, 2, 8)
+        assert v_flat.shape == (3 * 4, 2, 8)
 
     def test_gather_empty_returns_zero_frames(self):
         cfg = make_config(max_num_blocks=4, n_kv_head=2, head_dim=8)
         pool = BlockPool(cfg)
-        out = pool.gather_blocks(layer=0, block_ids=[])
-        assert out.shape[0] == 0
+        k_out, v_out = pool.gather_kv_blocks(layer=0, block_ids=[])
+        assert k_out.shape[0] == 0
+        assert v_out.shape[0] == 0
 
     def test_gather_preserves_values(self):
         cfg = make_config(max_num_blocks=4, block_size_frames=2, n_kv_head=1, head_dim=4)
         pool = BlockPool(cfg)
         ids = pool.allocate(2)
-        pool.get_block_view(0, ids[0])[:] = 1.0
-        pool.get_block_view(0, ids[1])[:] = 2.0
-        out = pool.gather_blocks(layer=0, block_ids=ids)
-        # First 2 frames should be 1.0, next 2 should be 2.0
-        assert out[:2].allclose(torch.ones_like(out[:2]))
-        assert out[2:].allclose(torch.full_like(out[2:], 2.0))
+        k0, v0 = pool.get_kv_block_view(0, ids[0])
+        k1, v1 = pool.get_kv_block_view(0, ids[1])
+        k0[:] = 1.0; v0[:] = 10.0
+        k1[:] = 2.0; v1[:] = 20.0
+        k_out, v_out = pool.gather_kv_blocks(layer=0, block_ids=ids)
+        # First 2 frames block 0, next 2 frames block 1.
+        assert k_out[:2].allclose(torch.ones_like(k_out[:2]))
+        assert k_out[2:].allclose(torch.full_like(k_out[2:], 2.0))
+        assert v_out[:2].allclose(torch.full_like(v_out[:2], 10.0))
+        assert v_out[2:].allclose(torch.full_like(v_out[2:], 20.0))
 
     def test_layer_independence(self):
         cfg = make_config(num_layers=2, max_num_blocks=4, block_size_frames=2, n_kv_head=1, head_dim=4)
         pool = BlockPool(cfg)
         (bid,) = pool.allocate(1)
-        pool.get_block_view(0, bid)[:] = 1.0
-        pool.get_block_view(1, bid)[:] = 2.0
-        assert pool.get_block_view(0, bid).allclose(torch.ones(2, 1, 8))
-        assert pool.get_block_view(1, bid).allclose(torch.full((2, 1, 8), 2.0))
+        k0, v0 = pool.get_kv_block_view(0, bid)
+        k1, v1 = pool.get_kv_block_view(1, bid)
+        k0[:] = 1.0; v0[:] = 1.0
+        k1[:] = 2.0; v1[:] = 2.0
+        k0r, v0r = pool.get_kv_block_view(0, bid)
+        k1r, v1r = pool.get_kv_block_view(1, bid)
+        assert k0r.allclose(torch.ones(2, 1, 4))
+        assert k1r.allclose(torch.full((2, 1, 4), 2.0))
 
 
 # ---------------------------------------------------------------------------

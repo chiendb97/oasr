@@ -27,12 +27,15 @@ Typical usage::
 
 from __future__ import annotations
 
+from typing import List
+
 import torch
 
 from oasr.cache.attention_cache import AttentionCacheManager
 from oasr.cache.cnn_cache import CnnCacheManager
 from oasr.cache.ctc_state import CtcStateCacheManager
 from oasr.ctc_decode import GpuStreamingDecoder
+from oasr.layers.attention.attention import PagedKVCache
 
 
 class StreamContext:
@@ -123,6 +126,27 @@ class StreamContext:
         """
         return self._ctc_state.get_decoder(self._stream_id)
 
+    def get_att_caches(self) -> List[PagedKVCache]:
+        """Return one :class:`~oasr.layers.attention.PagedKVCache` per layer.
+
+        Used with :meth:`~oasr.models.conformer.ConformerModel.forward_chunk_paged`.
+        :meth:`prepare_chunk` must be called first to allocate the write block.
+
+        Returns
+        -------
+        list[PagedKVCache]
+            One entry per encoder layer.
+        """
+        return self._attention_cache.get_paged_caches(self._stream_id)
+
+    def prepare_chunk(self) -> None:
+        """Allocate the next physical block before a paged forward pass.
+
+        Must be called **once per chunk** before :meth:`get_att_caches` /
+        :meth:`~oasr.models.conformer.ConformerModel.forward_chunk_paged`.
+        """
+        self._attention_cache.prepare_chunk(self._stream_id)
+
     # ------------------------------------------------------------------
     # Mutation
     # ------------------------------------------------------------------
@@ -134,24 +158,42 @@ class StreamContext:
     ) -> None:
         """Commit encoder cache outputs from the latest ``forward_chunk`` call.
 
-        Call this after each ``forward_chunk`` to persist the updated caches.
+        Dense-mode (``forward_chunk``) path.  For paged-mode use
+        :meth:`commit_chunk_paged` instead.
 
         Parameters
         ----------
         new_kv_chunk : torch.Tensor
-            New KV data for the attention cache.  Pass only the **new**
-            frames produced by the current chunk — the last ``chunk_size``
-            frames of the full trimmed ``new_att_cache`` returned by
-            ``forward_chunk``::
-
-                new_kv_chunk = new_att_cache[:, :, -chunk_size:, :]
-
+            New packed K+V data.  Pass only the **new** frames:
+            ``new_att_cache[:, :, -chunk_size:, :]``.
             Shape: ``(num_layers, n_kv_head, chunk_frames, kv_last_dim)``.
         new_cnn_cache : torch.Tensor
-            CNN cache as returned by ``forward_chunk``.
+            CNN cache returned by ``forward_chunk``.
             Shape: ``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
         """
         self._attention_cache.commit(self._stream_id, new_kv_chunk)
+        self._cnn_cache.update(self._stream_id, new_cnn_cache)
+
+    def commit_chunk_paged(
+        self,
+        chunk_frames: int,
+        new_cnn_cache: torch.Tensor,
+    ) -> None:
+        """Commit cache state after a :meth:`forward_chunk_paged` call.
+
+        K/V were already written into the pool by the attention layer.  This
+        method advances ``cache_seqlens``, evicts if needed, and stores the
+        updated CNN cache.
+
+        Parameters
+        ----------
+        chunk_frames : int
+            Number of encoder-output frames written (usually ``chunk_size``).
+        new_cnn_cache : torch.Tensor
+            CNN cache returned by ``forward_chunk_paged``.
+            Shape: ``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
+        """
+        self._attention_cache.commit_chunk_paged(self._stream_id, chunk_frames)
         self._cnn_cache.update(self._stream_id, new_cnn_cache)
 
     # ------------------------------------------------------------------
