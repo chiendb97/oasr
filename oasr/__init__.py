@@ -34,6 +34,8 @@ from .ctc_decode import (
     GpuStreamingDecoder,
     GpuDecoderConfig,
     GpuDecoderResult,
+    StreamState,
+    StreamHandle,
 )
 
 # =============================================================================
@@ -88,6 +90,19 @@ def _register_c_extension():
 
 
 _register_c_extension()
+
+# =============================================================================
+# Streaming cache manager
+# =============================================================================
+from . import cache
+from .cache import (
+    CacheConfig,
+    BlockPool,
+    AttentionCacheManager,
+    CnnCacheManager,
+    CtcStateCacheManager,
+    StreamContext,
+)
 
 # =============================================================================
 # High-level decoder API
@@ -174,6 +189,16 @@ __all__ = [
     "GpuStreamingDecoder",
     "GpuDecoderConfig",
     "GpuDecoderResult",
+    "StreamState",
+    "StreamHandle",
+    # Streaming cache manager
+    "cache",
+    "CacheConfig",
+    "BlockPool",
+    "AttentionCacheManager",
+    "CnnCacheManager",
+    "CtcStateCacheManager",
+    "StreamContext",
     # Legacy C extension (loaded lazily via __getattr__)
     "DataType",
     "ConvType",

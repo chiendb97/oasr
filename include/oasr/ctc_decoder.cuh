@@ -17,6 +17,228 @@
 #include <cstdint>
 #include <cub/cub.cuh>
 
+// ---------------------------------------------------------------------------
+// Paged memory primitives (folded in from paged_memory.cuh)
+//
+// Implements a paged-attention style memory system for storing variable-length
+// decoded token sequences. Instead of pre-allocating batch * beam * max_seq_len
+// tokens, sequences are stored in fixed-size pages with a block table for
+// indirection, enabling prefix sharing across beams via reference counting.
+// ---------------------------------------------------------------------------
+
+namespace oasr {
+namespace paged_memory {
+
+static constexpr int DEFAULT_PAGE_SIZE = 16;  // tokens per page (64 bytes, 1 cache line)
+static constexpr int INVALID_PAGE = -1;
+static constexpr int PAGED_ALIGN_BYTES = 128;
+
+struct PagedSequenceState {
+    // GPU: [num_pages * page_size] — contiguous token storage pool
+    int* page_storage;
+
+    // GPU: [batch * beam * max_logical_pages] * 2 — double-buffered block tables.
+    // block_table[p][(bid * beam + k) * max_logical_pages + lp] = physical page index
+    int* block_table[2];
+
+    // GPU: [num_pages] — per-page reference count (CPU-driven during init/step)
+    int* ref_counts;
+
+    // GPU: [1] — atomic counter for page allocation (next available physical page)
+    int* next_free_page;
+
+    // GPU: [num_pages] — stack of recycled physical page indices (ref_count dropped to 0)
+    int* free_pool;
+
+    // GPU: [1] — number of valid entries in free_pool (top of stack)
+    int* free_pool_size;
+
+    // Scalars (host-accessible after copying StreamingState from GPU)
+    int page_size;
+    int max_logical_pages;  // = ceil(max_seq_len / page_size)
+    int num_pages;
+    int batch;
+    int beam;
+
+    // Zero-initialize: indicates flat mode when page_storage == nullptr
+    PagedSequenceState()
+        : page_storage(nullptr),
+          ref_counts(nullptr),
+          next_free_page(nullptr),
+          free_pool(nullptr),
+          free_pool_size(nullptr),
+          page_size(0),
+          max_logical_pages(0),
+          num_pages(0),
+          batch(0),
+          beam(0) {
+        block_table[0] = nullptr;
+        block_table[1] = nullptr;
+    }
+
+    __host__ __device__ bool is_enabled() const { return page_storage != nullptr; }
+};
+
+inline constexpr size_t paged_align_size(size_t n) {
+    return (n + PAGED_ALIGN_BYTES - 1) / PAGED_ALIGN_BYTES * PAGED_ALIGN_BYTES;
+}
+
+inline int default_num_pages(int batch, int beam, int max_seq_len, int page_size) {
+    // Allocate (max_lp + 1) pages per beam: max_lp for the steady-state double-buffered
+    // block tables (completed pages are shared across both slots) plus 1 extra batch*beam
+    // slab to cover the step-1 CoW burst before any recycling has happened.
+    int max_lp = (max_seq_len + page_size - 1) / page_size;
+    return batch * beam * (max_lp + 1);
+}
+
+inline size_t calculate_paged_region_size(int batch, int beam, int max_seq_len,
+                                          int page_size = DEFAULT_PAGE_SIZE,
+                                          int num_pages = 0) {
+    if (num_pages <= 0)
+        num_pages = default_num_pages(batch, beam, max_seq_len, page_size);
+    int max_lp = (max_seq_len + page_size - 1) / page_size;
+
+    size_t total = 0;
+    total += paged_align_size(sizeof(int) * num_pages * page_size);
+    total += paged_align_size(sizeof(int) * batch * beam * max_lp) * 2;
+    total += paged_align_size(sizeof(int) * num_pages);  // ref_counts
+    total += paged_align_size(sizeof(int));              // next_free_page
+    total += paged_align_size(sizeof(int) * num_pages);  // free_pool
+    total += paged_align_size(sizeof(int));              // free_pool_size
+    return total;
+}
+
+inline void init_paged_state(PagedSequenceState* ps, void* workspace,
+                             int batch, int beam, int max_seq_len,
+                             int page_size, int num_pages,
+                             cudaStream_t stream) {
+    if (num_pages <= 0)
+        num_pages = default_num_pages(batch, beam, max_seq_len, page_size);
+
+    ps->page_size = page_size;
+    ps->max_logical_pages = (max_seq_len + page_size - 1) / page_size;
+    ps->num_pages = num_pages;
+    ps->batch = batch;
+    ps->beam = beam;
+
+    int max_lp = ps->max_logical_pages;
+
+    char* ptr = reinterpret_cast<char*>(workspace);
+
+#define PAGED_ALLOC(field, type, count)               \
+    ps->field = reinterpret_cast<type*>(ptr);         \
+    ptr += paged_align_size(sizeof(type) * (count));
+
+    PAGED_ALLOC(page_storage, int, num_pages * page_size)
+    PAGED_ALLOC(block_table[0], int, batch * beam * max_lp)
+    PAGED_ALLOC(block_table[1], int, batch * beam * max_lp)
+    PAGED_ALLOC(ref_counts, int, num_pages)
+    PAGED_ALLOC(next_free_page, int, 1)
+    PAGED_ALLOC(free_pool, int, num_pages)
+    PAGED_ALLOC(free_pool_size, int, 1)
+
+#undef PAGED_ALLOC
+
+    cudaMemsetAsync(ps->page_storage, 0, sizeof(int) * num_pages * page_size, stream);
+
+    {
+        int total_bt = batch * beam * max_lp;
+        int* h_bt = new int[total_bt];
+        for (int b = 0; b < batch; ++b) {
+            for (int k = 0; k < beam; ++k) {
+                int bk = b * beam + k;
+                for (int lp = 0; lp < max_lp; ++lp) {
+                    h_bt[bk * max_lp + lp] = (lp == 0) ? bk : INVALID_PAGE;
+                }
+            }
+        }
+        cudaMemcpyAsync(ps->block_table[0], h_bt, sizeof(int) * total_bt,
+                        cudaMemcpyHostToDevice, stream);
+        delete[] h_bt;
+    }
+
+    {
+        int total_bt = batch * beam * max_lp;
+        int* h_bt = new int[total_bt];
+        for (int i = 0; i < total_bt; ++i)
+            h_bt[i] = INVALID_PAGE;
+        cudaMemcpyAsync(ps->block_table[1], h_bt, sizeof(int) * total_bt,
+                        cudaMemcpyHostToDevice, stream);
+        delete[] h_bt;
+    }
+
+    {
+        int* h_refs = new int[num_pages];
+        for (int i = 0; i < batch * beam; ++i)
+            h_refs[i] = 1;
+        for (int i = batch * beam; i < num_pages; ++i)
+            h_refs[i] = 0;
+        cudaMemcpyAsync(ps->ref_counts, h_refs, sizeof(int) * num_pages,
+                        cudaMemcpyHostToDevice, stream);
+        delete[] h_refs;
+    }
+
+    {
+        int nfp = batch * beam;
+        cudaMemcpyAsync(ps->next_free_page, &nfp, sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+    }
+
+    {
+        int zero = 0;
+        cudaMemcpyAsync(ps->free_pool_size, &zero, sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+    }
+    // free_pool contents are uninitialised (only valid indices are used via free_pool_size)
+}
+
+__device__ __forceinline__ int paged_read(const int* __restrict__ page_storage,
+                                          const int* __restrict__ bt,
+                                          int bk_idx, int pos,
+                                          int page_size, int max_lp) {
+    int lp = pos / page_size;
+    int off = pos - lp * page_size;
+    int phys = bt[bk_idx * max_lp + lp];
+    return page_storage[phys * page_size + off];
+}
+
+__device__ __forceinline__ bool paged_seq_compare(const int* __restrict__ page_storage,
+                                                   const int* __restrict__ bt,
+                                                   int bid, int beam_a, int beam_b,
+                                                   int len, int beam,
+                                                   int page_size, int max_lp) {
+    int full_pages = len / page_size;
+    int bk_a = bid * beam + beam_a;
+    int bk_b = bid * beam + beam_b;
+
+    for (int p = 0; p < full_pages; ++p) {
+        int phys_a = bt[bk_a * max_lp + p];
+        int phys_b = bt[bk_b * max_lp + p];
+        if (phys_a == phys_b)
+            continue;
+        for (int i = 0; i < page_size; ++i) {
+            if (page_storage[phys_a * page_size + i] != page_storage[phys_b * page_size + i])
+                return false;
+        }
+    }
+
+    int rem = len - full_pages * page_size;
+    if (rem > 0) {
+        int phys_a = bt[bk_a * max_lp + full_pages];
+        int phys_b = bt[bk_b * max_lp + full_pages];
+        if (phys_a != phys_b) {
+            for (int i = 0; i < rem; ++i) {
+                if (page_storage[phys_a * page_size + i] != page_storage[phys_b * page_size + i])
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
+}  // namespace paged_memory
+}  // namespace oasr
+
 namespace oasr {
 namespace ctc_decoder {
 
@@ -48,8 +270,9 @@ struct FastDivmod {
             return;
         }
         unsigned int p = 31;
-        while ((1u << p) < (unsigned int)d)
+        while ((1u << p) < (unsigned int)d) {
             ++p;
+        }
         uint64_t m = ((1ULL << (32 + p)) + d - 1) / d;
         multiplier = (unsigned int)(m - (1ULL << 32));
         shift_right = p;
@@ -119,6 +342,9 @@ struct InternalData {
 
     FastDivmod ldc_divmod;
     int max_select_seq_len;
+
+    // Paged memory state (all null pointers = flat mode; page_storage != nullptr = paged mode)
+    paged_memory::PagedSequenceState paged;
 };
 
 // =============================================================================
@@ -127,6 +353,43 @@ struct InternalData {
 
 __inline__ __device__ float logprob_add(float a, float b) {
     return a + b;
+}
+
+// =============================================================================
+// Paged memory helpers — allocate/free a physical page atomically.
+//
+// alloc_page: prefer recycled pages from free_pool over fresh allocation.
+//   Call only AFTER __syncthreads() that follows the fork phase so that all
+//   free_page pushes are visible before any pop.
+//
+// free_page: decrement ref_count; if it reaches zero, push the page index onto
+//   the free_pool stack.  The push is safe to call from multiple concurrent
+//   threads as long as each physical page is freed by exactly one logical
+//   "owner" (ensured by the fork loop which handles each bk_dst slot once).
+// =============================================================================
+
+__device__ __forceinline__ int alloc_page(int* __restrict__ free_pool,
+                                          int* __restrict__ free_pool_size,
+                                          int* __restrict__ next_free_page) {
+    // Atomically pop one index from the free_pool stack.
+    int idx = atomicAdd(free_pool_size, -1) - 1;
+    if (idx >= 0) {
+        return free_pool[idx];
+    }
+    // Pool was empty (or raced to empty); undo the decrement and allocate fresh.
+    atomicAdd(free_pool_size, 1);
+    return atomicAdd(next_free_page, 1);
+}
+
+__device__ __forceinline__ void free_page(int phys,
+                                          int* __restrict__ free_pool,
+                                          int* __restrict__ free_pool_size,
+                                          int* __restrict__ ref_counts) {
+    // Decrement ref_count; when it hits 0 the page becomes available.
+    if (atomicSub(&ref_counts[phys], 1) == 1) {
+        int slot = atomicAdd(free_pool_size, 1);
+        free_pool[slot] = phys;
+    }
 }
 
 // logsumexp matching torchaudio reference:
@@ -253,10 +516,15 @@ __global__ void first_step_kernel(const float* __restrict__ log_prob, int batch_
     // single best. For top-1 this is exact; for top-beam we do a full second
     // pass below to ensure correctness when beam candidates span the same thread.
     if (threadIdx.x == 0) {
-        // Full serial top-beam scan over all non-blank vocab items.
+        // Reserve one beam slot for the empty prefix (blank-only path) when
+        // beam > 1.  This prevents spurious initial tokens in streaming mode
+        // where early frames may have moderate blank probability (< threshold)
+        // but no confident non-blank tokens.
+        int nb_beams = (beam > 1) ? beam - 1 : beam;
+
         float topk_keys[128];
         int topk_vals[128];
-        for (int k = 0; k < beam; ++k) {
+        for (int k = 0; k < nb_beams; ++k) {
             topk_keys[k] = NEG_INF;
             topk_vals[k] = -1;
         }
@@ -265,9 +533,8 @@ __global__ void first_step_kernel(const float* __restrict__ log_prob, int batch_
             if (c == blank_id)
                 continue;
             float p = log_prob[bid * batch_stride + first_t * seq_stride + c * vocab_stride];
-            // Replace the minimum in the top-beam heap.
             int min_idx = 0;
-            for (int k = 1; k < beam; ++k)
+            for (int k = 1; k < nb_beams; ++k)
                 if (topk_keys[k] < topk_keys[min_idx])
                     min_idx = k;
             if (p > topk_keys[min_idx]) {
@@ -276,8 +543,8 @@ __global__ void first_step_kernel(const float* __restrict__ log_prob, int batch_
             }
         }
 
-        // Sort top-beam descending (insertion sort).
-        for (int i = 1; i < beam; ++i) {
+        // Sort top non-blank beams descending (insertion sort).
+        for (int i = 1; i < nb_beams; ++i) {
             float ki = topk_keys[i];
             int vi = topk_vals[i];
             int j = i - 1;
@@ -290,16 +557,13 @@ __global__ void first_step_kernel(const float* __restrict__ log_prob, int batch_
             topk_vals[j + 1] = vi;
         }
 
-        // Write results (matching reference first_matrix__bitonic_topk_kernel).
-        for (int k = 0; k < beam; ++k) {
+        // Write non-blank beams to slots 0..nb_beams-1.
+        for (int k = 0; k < nb_beams; ++k) {
             int base = bid * ldbeam + k;
             int token = topk_vals[k];
             float key = topk_keys[k];
 
             if (token >= 0 && token != blank_id) {
-                // Non-blank top-K token: initialise pprev per need_add_blank flag.
-                // If need_add_blank=true: blank path already accumulated → (key, NEG_INF)
-                // If need_add_blank=false: fresh start, nonblank path → (NEG_INF, key)
                 float2 xy = need_add_blank ? make_float2(key, NEG_INF) : make_float2(NEG_INF, key);
                 pprev[base] = xy;
                 int shift = clen[base];  // should be 0 on first step
@@ -308,12 +572,22 @@ __global__ void first_step_kernel(const float* __restrict__ log_prob, int batch_
                 clast[base] = token;
                 score[base] = key;
             } else {
-                // No valid token (e.g., beam > vocab_size - 1 non-blank tokens)
                 pprev[base] = make_float2(NEG_INF, NEG_INF);
                 clast[base] = blank_id;
                 clen[base] = 0;
                 score[base] = NEG_INF;
             }
+        }
+
+        // Write the blank/empty-prefix beam to the last slot.
+        if (beam > 1) {
+            int base = bid * ldbeam + (beam - 1);
+            float blank_prob = log_prob[bid * batch_stride + first_t * seq_stride +
+                                        blank_id * vocab_stride];
+            pprev[base] = make_float2(blank_prob, NEG_INF);
+            clast[base] = blank_id;
+            clen[base] = 0;
+            score[base] = blank_prob;
         }
     }
 }
@@ -892,6 +1166,7 @@ inline void init_internal_data(InternalData* data, void* workspace, int batch, i
     data->ldseq_len = align16(max_seq_len);
     data->max_seq_len = max_seq_len;
     data->ldc_divmod = FastDivmod(vocab_size);
+    data->paged = paged_memory::PagedSequenceState();  // all null (flat mode)
 
     int ldbeam = data->ldbeam;
     int ldseq_len = data->ldseq_len;
@@ -920,6 +1195,88 @@ inline void init_internal_data(InternalData* data, void* workspace, int batch, i
     ALLOC_BUF(select_seq_lens, int, batch)
 
 #undef ALLOC_BUF
+}
+
+// =============================================================================
+// Paged workspace size (replaces the two flat clist arrays with a paged region)
+// =============================================================================
+
+inline size_t calculate_paged_workspace_size(int batch, int beam, int vocab_size, int max_seq_len,
+                                             int page_size = paged_memory::DEFAULT_PAGE_SIZE,
+                                             int num_pages = 0) {
+    int ldbeam = align16(beam);
+    int ldc = vocab_size;
+
+    size_t total = 0;
+    total += align_size(sizeof(float2) * batch * ldbeam);
+    total += align_size(sizeof(float) * batch * beam * ldc);
+    total += align_size(sizeof(float) * batch * beam * ldc);
+    total += align_size(sizeof(int) * batch * ldbeam);
+    total += align_size(sizeof(int) * batch * ldbeam) * 2;  // clen[0..1]
+    // clist[0..1] are OMITTED — replaced by paged region
+    total += align_size(sizeof(int) * batch * ldbeam);      // ptid
+    total += align_size(sizeof(float) * batch * ldbeam);
+    total += align_size(sizeof(float) * batch * MAX_BLOCKS_PER_BATCH * beam);
+    total += align_size(sizeof(int) * batch * MAX_BLOCKS_PER_BATCH * beam);
+    total += align_size(sizeof(int) * batch * max_seq_len);
+    total += align_size(sizeof(int) * batch);
+    total += ALIGN_BYTES;
+    // Paged region
+    total += paged_memory::calculate_paged_region_size(batch, beam, max_seq_len, page_size,
+                                                        num_pages);
+    return total;
+}
+
+// =============================================================================
+// Paged init_internal_data — bump-allocates base fields then initialises
+// PagedSequenceState from the remaining workspace. `clist[0/1]` are left null.
+// =============================================================================
+
+inline void init_internal_data_paged(InternalData* data, void* workspace,
+                                     int batch, int beam, int vocab_size, int max_seq_len,
+                                     int page_size, int num_pages,
+                                     cudaStream_t stream) {
+    data->batch = batch;
+    data->beam = beam;
+    data->vocab_size = vocab_size;
+    data->ldc = vocab_size;
+    data->ldbeam = align16(beam);
+    data->ldseq_len = align16(max_seq_len);
+    data->max_seq_len = max_seq_len;
+    data->ldc_divmod = FastDivmod(vocab_size);
+    // clist stays null in paged mode
+    data->clist[0] = nullptr;
+    data->clist[1] = nullptr;
+
+    int ldbeam = data->ldbeam;
+    int ldc = data->ldc;
+
+    char* ptr = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(workspace) + ALIGN_BYTES - 1) /
+                                        ALIGN_BYTES * ALIGN_BYTES);
+
+#define ALLOC_BUF_P(name, type, count)         \
+    data->name = reinterpret_cast<type*>(ptr); \
+    ptr += align_size(sizeof(type) * (count));
+
+    ALLOC_BUF_P(pprev, float2, batch * ldbeam)
+    ALLOC_BUF_P(ptable, float, batch * beam * ldc)
+    ALLOC_BUF_P(ptablen, float, batch * beam * ldc)
+    ALLOC_BUF_P(clast, int, batch * ldbeam)
+    ALLOC_BUF_P(clen[0], int, batch * ldbeam)
+    ALLOC_BUF_P(clen[1], int, batch * ldbeam)
+    // clist[0] and clist[1] are NOT allocated; paged region follows instead
+    ALLOC_BUF_P(ptid, int, batch * ldbeam)
+    ALLOC_BUF_P(score, float, batch * ldbeam)
+    ALLOC_BUF_P(topk_key_buffer, float, batch * MAX_BLOCKS_PER_BATCH * beam)
+    ALLOC_BUF_P(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
+    ALLOC_BUF_P(select_seqs, int, batch * max_seq_len)
+    ALLOC_BUF_P(select_seq_lens, int, batch)
+
+#undef ALLOC_BUF_P
+
+    // Initialise paged state from remaining workspace
+    paged_memory::init_paged_state(&data->paged, ptr, batch, beam, max_seq_len,
+                                   page_size, num_pages, stream);
 }
 
 // =============================================================================
@@ -1097,6 +1454,25 @@ inline cudaError_t ctc_beam_search_decode_batch(
 }
 
 // =============================================================================
+// Forward declarations for paged variants (defined after streaming functions)
+// =============================================================================
+
+__global__ void gather_paged_results_kernel(
+    const int* page_storage,
+    const int* block_table0, const int* block_table1,
+    const int* select_seq_lens, int max_select_seq_len,
+    const int* clen0, const int* clen1,
+    const float* score, int ldbeam,
+    int* out_tokens, int* out_lengths, float* out_scores,
+    int batch, int beam, int max_out_len,
+    int page_size, int max_lp);
+
+inline cudaError_t ctc_prefix_beam_search_step_paged(
+    InternalData* data, const float* log_prob,
+    int batch_stride, int seq_stride, int vocab_stride,
+    int step, int blank_id, int space_id, cudaStream_t stream);
+
+// =============================================================================
 // Streaming state
 // =============================================================================
 
@@ -1106,12 +1482,20 @@ inline size_t calculate_state_buffer_size(int batch, int beam, int vocab_size, i
     return STATE_HEADER_SIZE + calculate_workspace_size(batch, beam, vocab_size, max_seq_len);
 }
 
+// Paged streaming state buffer: same header layout, smaller workspace (no clist), plus paged region.
+inline size_t calculate_paged_state_buffer_size(int batch, int beam, int vocab_size, int max_seq_len,
+                                                int page_size = paged_memory::DEFAULT_PAGE_SIZE,
+                                                int num_pages = 0) {
+    return STATE_HEADER_SIZE +
+           calculate_paged_workspace_size(batch, beam, vocab_size, max_seq_len, page_size, num_pages);
+}
+
 struct StreamingState {
     InternalData data;
     int current_step;
     int space_id;
     int blank_id;
-    int _pad;
+    int use_paged_memory;  // 0 = flat (replaces _pad), 1 = paged
 };
 
 inline void init_streaming_state(void* state_buffer, int batch, int beam, int vocab_size,
@@ -1120,7 +1504,7 @@ inline void init_streaming_state(void* state_buffer, int batch, int beam, int vo
     state.current_step = 0;
     state.space_id = -1;
     state.blank_id = blank_id;
-    state._pad = 0;
+    state.use_paged_memory = 0;
 
     void* workspace = reinterpret_cast<char*>(state_buffer) + STATE_HEADER_SIZE;
     init_internal_data(&state.data, workspace, batch, beam, vocab_size, max_seq_len);
@@ -1162,17 +1546,39 @@ inline void init_streaming_state(void* state_buffer, int batch, int beam, int vo
 
 inline cudaError_t streaming_step(void* state_buffer, const float* log_prob_frame, int batch_stride,
                                   int vocab_stride, int step, int blank_id, int space_id,
+                                  int actual_frame_index,
                                   cudaStream_t stream) {
     StreamingState state;
     cudaMemcpyAsync(&state, state_buffer, sizeof(StreamingState), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 
+    // Update select_seqs[b * max_seq_len + step] = actual_frame_index for every batch
+    // element.  This mirrors what init_select_kernel does in offline mode: storing the
+    // true (post-filter) frame index so that need_add_blank detection in
+    // first_step_kernel / prob_matrix_kernel / prob_space_blank_kernel / topk_phase2_kernel
+    // fires correctly when blank-dominant frames have been skipped by the caller.
+    if (actual_frame_index != step) {
+        for (int b = 0; b < state.data.batch; ++b) {
+            int val = actual_frame_index;
+            cudaMemcpyAsync(
+                state.data.select_seqs + b * state.data.max_seq_len + step,
+                &val, sizeof(int),
+                cudaMemcpyHostToDevice, stream);
+        }
+        cudaStreamSynchronize(stream);
+    }
+
     // log_prob_frame is [batch, vocab_size] (single frame).
-    // With seq_stride=0, the kernel always accesses index 0 along the seq dim
-    // regardless of the selected timestep value.
-    bool is_last = false;
-    return ctc_prefix_beam_search_step(&state.data, log_prob_frame, batch_stride, 0, vocab_stride,
-                                       step, is_last, blank_id, space_id, stream);
+    // With seq_stride=0, the kernel always accesses index 0 along the seq dim.
+    if (state.use_paged_memory) {
+        return ctc_prefix_beam_search_step_paged(&state.data, log_prob_frame,
+                                                 batch_stride, 0, vocab_stride,
+                                                 step, blank_id, space_id, stream);
+    } else {
+        bool is_last = false;
+        return ctc_prefix_beam_search_step(&state.data, log_prob_frame, batch_stride, 0, vocab_stride,
+                                           step, is_last, blank_id, space_id, stream);
+    }
 }
 
 inline cudaError_t read_streaming_results(void* state_buffer, int* out_tokens, int* out_lengths,
@@ -1187,6 +1593,21 @@ inline cudaError_t read_streaming_results(void* state_buffer, int* out_tokens, i
     int step = state.current_step;
     int final_parity = (step <= 1) ? 0 : ((step - 1) % 2);
 
+    if (state.use_paged_memory) {
+        auto& ps = data->paged;
+        // Use gather kernel; treat step as max_select for parity computation
+        dim3 gather_grid(batch, beam);
+        gather_paged_results_kernel<<<gather_grid, 256, 0, stream>>>(
+            ps.page_storage, ps.block_table[0], ps.block_table[1],
+            data->select_seq_lens, step,
+            data->clen[0], data->clen[1],
+            data->score, data->ldbeam,
+            out_tokens, out_lengths, out_scores,
+            batch, beam, max_out_len,
+            ps.page_size, ps.max_logical_pages);
+        return cudaGetLastError();
+    }
+
     cudaMemcpy2DAsync(out_lengths, sizeof(int) * beam, data->clen[final_parity],
                       sizeof(int) * data->ldbeam, sizeof(int) * beam, batch,
                       cudaMemcpyDeviceToDevice, stream);
@@ -1197,6 +1618,704 @@ inline cudaError_t read_streaming_results(void* state_buffer, int* out_tokens, i
                       sizeof(float) * beam, batch, cudaMemcpyDeviceToDevice, stream);
 
     return cudaGetLastError();
+}
+
+// =============================================================================
+// Paged kernel: first step — write initial tokens into pre-allocated page 0
+//
+// Each (batch, beam) pair has physical page = bid * beam + k pre-allocated in
+// block_table[0]. The initial token is written directly to page_storage.
+// =============================================================================
+
+template <int BLOCK_SIZE>
+__global__ void first_step_paged_kernel(
+    const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
+    const int* __restrict__ select_seqs, const int* __restrict__ select_seq_lens,
+    float2* __restrict__ pprev, int* __restrict__ clast, int* __restrict__ clen,
+    float* __restrict__ score,
+    int* __restrict__ page_storage, int page_size,
+    int beam, int ldbeam, int vocab_size, int blank_id, int batch, int max_seq_len) {
+    int bid = blockIdx.x;
+    if (bid >= batch)
+        return;
+    if (select_seq_lens[bid] == 0)
+        return;
+
+    int first_t = select_seqs[bid * max_seq_len];
+    bool need_add_blank = (first_t > 0);
+
+    extern __shared__ char smem[];
+    float* s_keys = reinterpret_cast<float*>(smem);
+    int* s_vals = reinterpret_cast<int*>(s_keys + BLOCK_SIZE);
+
+    float local_best = NEG_INF;
+    int local_best_id = -1;
+    for (int c = threadIdx.x; c < vocab_size; c += BLOCK_SIZE) {
+        if (c == blank_id)
+            continue;
+        float p = log_prob[bid * batch_stride + first_t * seq_stride + c * vocab_stride];
+        if (p > local_best) {
+            local_best = p;
+            local_best_id = c;
+        }
+    }
+    s_keys[threadIdx.x] = local_best;
+    s_vals[threadIdx.x] = local_best_id;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int nb_beams = (beam > 1) ? beam - 1 : beam;
+
+        float topk_keys[128];
+        int topk_vals[128];
+        for (int k = 0; k < nb_beams; ++k) {
+            topk_keys[k] = NEG_INF;
+            topk_vals[k] = -1;
+        }
+        for (int c = 0; c < vocab_size; ++c) {
+            if (c == blank_id)
+                continue;
+            float p = log_prob[bid * batch_stride + first_t * seq_stride + c * vocab_stride];
+            int min_idx = 0;
+            for (int k = 1; k < nb_beams; ++k)
+                if (topk_keys[k] < topk_keys[min_idx])
+                    min_idx = k;
+            if (p > topk_keys[min_idx]) {
+                topk_keys[min_idx] = p;
+                topk_vals[min_idx] = c;
+            }
+        }
+        for (int i = 1; i < nb_beams; ++i) {
+            float ki = topk_keys[i];
+            int vi = topk_vals[i];
+            int j = i - 1;
+            while (j >= 0 && topk_keys[j] < ki) {
+                topk_keys[j + 1] = topk_keys[j];
+                topk_vals[j + 1] = topk_vals[j];
+                --j;
+            }
+            topk_keys[j + 1] = ki;
+            topk_vals[j + 1] = vi;
+        }
+
+        for (int k = 0; k < nb_beams; ++k) {
+            int base = bid * ldbeam + k;
+            int token = topk_vals[k];
+            float key = topk_keys[k];
+
+            if (token >= 0 && token != blank_id) {
+                float2 xy = need_add_blank ? make_float2(key, NEG_INF) : make_float2(NEG_INF, key);
+                pprev[base] = xy;
+                int phys = bid * beam + k;
+                page_storage[phys * page_size + 0] = token;
+                clen[base] = 1;
+                clast[base] = token;
+                score[base] = key;
+            } else {
+                pprev[base] = make_float2(NEG_INF, NEG_INF);
+                clast[base] = blank_id;
+                clen[base] = 0;
+                score[base] = NEG_INF;
+            }
+        }
+
+        if (beam > 1) {
+            int base = bid * ldbeam + (beam - 1);
+            float blank_prob = log_prob[bid * batch_stride + first_t * seq_stride +
+                                        blank_id * vocab_stride];
+            pprev[base] = make_float2(blank_prob, NEG_INF);
+            clast[base] = blank_id;
+            clen[base] = 0;
+            score[base] = blank_prob;
+        }
+    }
+}
+
+// =============================================================================
+// Paged kernel: merge duplicate prefixes
+//
+// Same logic as merge_kernel but reads sequences via paged_seq_compare.
+// =============================================================================
+
+__global__ void merge_paged_kernel(
+    const int* __restrict__ select_seq_lens, int step,
+    float* __restrict__ ptable, float* __restrict__ ptablen,
+    const int* __restrict__ clast, const int* __restrict__ clen,
+    int ldc, int beam, int ldbeam, int batch, int blank_id,
+    const int* __restrict__ page_storage, const int* __restrict__ block_table,
+    int page_size, int max_lp) {
+    const int bid = blockIdx.y;
+    if (bid >= batch)
+        return;
+    if (step >= select_seq_lens[bid])
+        return;
+
+    __shared__ int smem_clen[128];
+    if (threadIdx.x < beam)
+        smem_clen[threadIdx.x] = clen[threadIdx.x + bid * ldbeam];
+    __syncthreads();
+
+    int shorter_beam = blockIdx.x;
+    int longer_beam = threadIdx.x;
+
+    if (longer_beam < beam && (smem_clen[longer_beam] - 1) == smem_clen[shorter_beam]) {
+        if (paged_memory::paged_seq_compare(page_storage, block_table,
+                                            bid, longer_beam, shorter_beam,
+                                            smem_clen[shorter_beam],
+                                            beam, page_size, max_lp)) {
+            int tidin = clast[longer_beam + bid * ldbeam] + (shorter_beam + bid * beam) * ldc;
+            int tidout = blank_id + (longer_beam + bid * beam) * ldc;
+            ptable[tidout] = logsumexp(ptable[tidout], ptable[tidin]);
+            ptablen[tidout] = logsumexp(ptablen[tidout], ptablen[tidin]);
+            ptable[tidin] = NEG_INF;
+            ptablen[tidin] = NEG_INF;
+        }
+    }
+}
+
+// =============================================================================
+// Paged kernel: Top-K Phase 2 with block table fork and copy-on-write
+//
+// Execution is split into two passes separated by __syncthreads():
+//
+//   Pass 1 – Fork (parallelised over WRITE_THREADS per output beam):
+//     For each logical page p of the source beam, copy the physical page index
+//     from block_table_src to block_table_dst, releasing (via free_page) any
+//     entry that block_table_dst previously held, and acquiring (via
+//     atomicAdd on ref_counts) the new entry.
+//
+//   __syncthreads()  — ensures all free_page pushes are visible before any pop.
+//
+//   Pass 2 – Append / CoW (tid_in_sub == 0 only):
+//     Non-blank token: allocate or copy-on-write the last logical page with
+//     alloc_page (which prefers recycled pages from free_pool).
+//
+// =============================================================================
+
+template <int BLOCK_SIZE, int ITEMS_PER_THREAD, int WRITE_THREADS = 8>
+__global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_paged_kernel(
+    const int* __restrict__ select_seq_lens, int step,
+    int items_per_batch, int beam, int batch,
+    float* __restrict__ topk_key_buffer, int* __restrict__ topk_value_buffer,
+    int ldc, int ldbeam,
+    float2* __restrict__ pprev,
+    const float* __restrict__ ptable, const float* __restrict__ ptablen,
+    int* __restrict__ clast,
+    int* __restrict__ clen_src, int* __restrict__ clen_dst,
+    float* __restrict__ score,
+    int blank_id, const int* __restrict__ select_seqs, int max_seq_len,
+    int* __restrict__ page_storage,
+    int* __restrict__ block_table_src, int* __restrict__ block_table_dst,
+    int* __restrict__ ref_counts, int* __restrict__ next_free_page,
+    int* __restrict__ free_pool, int* __restrict__ free_pool_size,
+    int page_size, int max_lp) {
+    const int bid = blockIdx.x;
+    if (bid >= batch)
+        return;
+    if (step >= select_seq_lens[bid])
+        return;
+
+    bool need_add_blank = false;
+    if (step == 0) {
+        need_add_blank = (select_seqs[bid * max_seq_len] > 0);
+    } else {
+        int cur_t = select_seqs[bid * max_seq_len + step];
+        int prev_t = select_seqs[bid * max_seq_len + step - 1];
+        need_add_blank = (cur_t > prev_t + 1);
+    }
+
+    const int tx = threadIdx.x;
+    const int rw_offset = bid * items_per_batch;
+
+    typedef cub::BlockRadixSort<float, BLOCK_SIZE, ITEMS_PER_THREAD, int> BlockSortT;
+    __shared__ union {
+        typename BlockSortT::TempStorage temp_storage;
+        struct {
+            float keys[128];
+            int vals[128];
+            int src_clast[128];
+            int src_clen[128];
+        } topk;
+    } smem;
+
+    float keys[ITEMS_PER_THREAD];
+    int values[ITEMS_PER_THREAD];
+
+    const int items_per_iter = BLOCK_SIZE * ITEMS_PER_THREAD;
+
+#pragma unroll
+    for (int ITEM = 0; ITEM < ITEMS_PER_THREAD; ++ITEM) {
+        int pos = BLOCK_SIZE * ITEM + tx;
+        if (pos < items_per_batch) {
+            keys[ITEM] = topk_key_buffer[rw_offset + pos];
+            values[ITEM] = topk_value_buffer[rw_offset + pos];
+        } else {
+            keys[ITEM] = NEG_INF;
+            values[ITEM] = pos;
+        }
+    }
+    BlockSortT{smem.temp_storage}.SortDescendingBlockedToStriped(keys, values);
+    __syncthreads();
+
+    const int stride = items_per_iter - beam;
+    for (int offset = items_per_iter; offset < items_per_batch; offset += stride) {
+#pragma unroll
+        for (int ITEM = 0; ITEM < ITEMS_PER_THREAD; ++ITEM) {
+            int striped_pos = BLOCK_SIZE * ITEM + tx;
+            int new_local = striped_pos - beam;
+            int new_idx = rw_offset + offset + new_local;
+            if (new_local >= 0) {
+                if ((offset + new_local) < items_per_batch) {
+                    keys[ITEM] = topk_key_buffer[new_idx];
+                    values[ITEM] = topk_value_buffer[new_idx];
+                } else {
+                    keys[ITEM] = NEG_INF;
+                }
+            }
+        }
+        BlockSortT{smem.temp_storage}.SortDescendingBlockedToStriped(keys, values);
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int ITEM = 0; ITEM < ITEMS_PER_THREAD; ++ITEM) {
+        int striped_pos = BLOCK_SIZE * ITEM + tx;
+        if (striped_pos < beam) {
+            smem.topk.keys[striped_pos] = keys[ITEM];
+            smem.topk.vals[striped_pos] = values[ITEM];
+        }
+    }
+    __syncthreads();
+
+    for (int k = tx; k < beam; k += BLOCK_SIZE) {
+        smem.topk.src_clast[k] = clast[bid * ldbeam + k];
+        smem.topk.src_clen[k] = clen_src[bid * ldbeam + k];
+    }
+    __syncthreads();
+
+    const int sub_warp_id = tx / WRITE_THREADS;
+    const int tid_in_sub = tx % WRITE_THREADS;
+    const int sub_warps = BLOCK_SIZE / WRITE_THREADS;
+
+    // =========================================================================
+    // Pass 1: Fork — copy block table entries from src to dst.
+    //   For each slot that block_table_dst previously held a valid page,
+    //   release that reference via free_page (which may push the page onto
+    //   free_pool if ref_count drops to zero).
+    //   Then acquire the new reference from block_table_src via atomicAdd.
+    // =========================================================================
+    for (int out_beam = sub_warp_id; out_beam < beam; out_beam += sub_warps) {
+        int id = smem.topk.vals[out_beam];
+        int src_beam = id / ldc;
+        int prevlen = smem.topk.src_clen[src_beam];
+        int num_pages_used = (prevlen > 0) ? (prevlen + page_size - 1) / page_size : 0;
+
+        int bk_src = bid * beam + src_beam;
+        int bk_dst = bid * beam + out_beam;
+
+        for (int p = tid_in_sub; p < num_pages_used; p += WRITE_THREADS) {
+            int old_phys = block_table_dst[bk_dst * max_lp + p];
+            if (old_phys != paged_memory::INVALID_PAGE)
+                free_page(old_phys, free_pool, free_pool_size, ref_counts);
+            int phys = block_table_src[bk_src * max_lp + p];
+            block_table_dst[bk_dst * max_lp + p] = phys;
+            atomicAdd(&ref_counts[phys], 1);
+        }
+    }
+
+    // Barrier: all free_page pushes must be complete before alloc_page pops.
+    __syncthreads();
+
+    // =========================================================================
+    // Pass 2: Append / CoW — scalar per output beam (tid_in_sub == 0 only).
+    //   Allocate or copy-on-write the last logical page, then write the token.
+    // =========================================================================
+    for (int out_beam = sub_warp_id; out_beam < beam; out_beam += sub_warps) {
+        if (tid_in_sub != 0) continue;
+
+        int id = smem.topk.vals[out_beam];
+        int src_beam = id / ldc;
+        int char_id = id - src_beam * ldc;
+        float new_score = smem.topk.keys[out_beam];
+        int prevlen = smem.topk.src_clen[src_beam];
+
+        int bk_dst = bid * beam + out_beam;
+        int dst_base = bid * ldbeam + out_beam;
+
+        if (char_id == blank_id) {
+            clast[dst_base] = smem.topk.src_clast[src_beam];
+            clen_dst[dst_base] = prevlen;
+        } else {
+            // Non-blank: append char_id at position prevlen
+            clast[dst_base] = char_id;
+            clen_dst[dst_base] = prevlen + 1;
+
+            int write_pos = prevlen;
+            int last_lp = write_pos / page_size;
+            int off = write_pos - last_lp * page_size;
+
+            if (off == 0) {
+                // Starting a new logical page: allocate a fresh or recycled page.
+                int new_phys = alloc_page(free_pool, free_pool_size, next_free_page);
+                block_table_dst[bk_dst * max_lp + last_lp] = new_phys;
+                ref_counts[new_phys] = 1;
+                page_storage[new_phys * page_size + 0] = char_id;
+            } else {
+                // Writing within an existing page: CoW if shared.
+                int bt_idx = bk_dst * max_lp + last_lp;
+                int phys = block_table_dst[bt_idx];
+                if (ref_counts[phys] > 1) {
+                    // Copy-on-write: allocate a fresh/recycled page and copy.
+                    int new_phys = alloc_page(free_pool, free_pool_size, next_free_page);
+                    for (int i = 0; i < page_size; ++i)
+                        page_storage[new_phys * page_size + i] = page_storage[phys * page_size + i];
+                    block_table_dst[bt_idx] = new_phys;
+                    // Release one reference from the old page (the bt_dst slot).
+                    free_page(phys, free_pool, free_pool_size, ref_counts);
+                    ref_counts[new_phys] = 1;
+                    phys = new_phys;
+                }
+                page_storage[phys * page_size + off] = char_id;
+            }
+        }
+
+        score[dst_base] = new_score;
+
+        float p = ptable[bid * ldc * beam + id];
+        float pn = ptablen[bid * ldc * beam + id];
+        float2 pprev_next;
+        if (need_add_blank) {
+            pprev_next = make_float2(new_score, NEG_INF);
+        } else {
+            pprev_next = make_float2(p, pn);
+        }
+        pprev[dst_base] = pprev_next;
+    }
+}
+
+// =============================================================================
+// Paged kernel: fixup parity — copy block table entries for batches whose
+// last-step parity differs from the global final parity.
+//
+// Unlike the flat fixup which copies token data, this copies block table
+// entries and increments ref counts on the referenced physical pages.
+// =============================================================================
+
+__global__ void fixup_parity_paged_kernel(
+    const int* __restrict__ select_seq_lens, int max_select_seq_len,
+    int* __restrict__ clen0, int* __restrict__ clen1,
+    int* __restrict__ block_table0, int* __restrict__ block_table1,
+    int* __restrict__ ref_counts,
+    int ldbeam, int beam, int batch, int final_parity, int max_lp) {
+    const int bid = blockIdx.x;
+    if (bid >= batch)
+        return;
+
+    int nsteps = select_seq_lens[bid];
+    int batch_parity;
+    if (nsteps <= 1) {
+        batch_parity = 0;
+    } else {
+        batch_parity = (nsteps - 1) % 2;
+    }
+    if (batch_parity == final_parity)
+        return;
+
+    int* src_clen = (batch_parity == 0) ? clen0 : clen1;
+    int* dst_clen = (final_parity == 0) ? clen0 : clen1;
+    int* src_bt = (batch_parity == 0) ? block_table0 : block_table1;
+    int* dst_bt = (final_parity == 0) ? block_table0 : block_table1;
+
+    for (int k = threadIdx.x; k < beam; k += blockDim.x) {
+        int base = bid * ldbeam + k;
+        int len = src_clen[base];
+        dst_clen[base] = len;
+
+        int num_pages_used = (len > 0) ? (len + 31) / 32 : 0;  // safe upper bound
+        // Use actual page_size via max_lp and len
+        // Recompute: num_pages = ceil(len / page_size), but we don't have page_size here.
+        // Instead, iterate over all max_lp entries and check for INVALID_PAGE.
+        int bk = bid * beam + k;
+        for (int lp = 0; lp < max_lp; ++lp) {
+            int phys = src_bt[bk * max_lp + lp];
+            dst_bt[bk * max_lp + lp] = phys;
+            if (phys != paged_memory::INVALID_PAGE)
+                atomicAdd(&ref_counts[phys], 1);
+        }
+    }
+}
+
+// =============================================================================
+// Paged kernel: gather results — read token sequences via block table and
+// write to flat output tensor [batch, beam, max_out_len].
+// =============================================================================
+
+__global__ void gather_paged_results_kernel(
+    const int* __restrict__ page_storage,
+    const int* __restrict__ block_table0, const int* __restrict__ block_table1,
+    const int* __restrict__ select_seq_lens, int max_select_seq_len,
+    const int* __restrict__ clen0, const int* __restrict__ clen1,
+    const float* __restrict__ score, int ldbeam,
+    int* __restrict__ out_tokens, int* __restrict__ out_lengths,
+    float* __restrict__ out_scores,
+    int batch, int beam, int max_out_len,
+    int page_size, int max_lp) {
+    // One block per (batch, beam); threads iterate over token positions.
+    const int bid = blockIdx.x;
+    const int k = blockIdx.y;
+    if (bid >= batch || k >= beam)
+        return;
+
+    // Determine which parity holds this batch's results.
+    // In streaming mode select_seq_lens[bid] = max_seq_len (identity mapping),
+    // so clamp to max_select_seq_len (= actual step count) for correct parity.
+    int nsteps = select_seq_lens[bid];
+    if (nsteps > max_select_seq_len)
+        nsteps = max_select_seq_len;
+    int batch_parity = (nsteps <= 1) ? 0 : (nsteps - 1) % 2;
+    int final_parity = (max_select_seq_len <= 1) ? 0 : (max_select_seq_len - 1) % 2;
+    int use_parity = (batch_parity == final_parity) ? final_parity : batch_parity;
+
+    const int* clen = (use_parity == 0) ? clen0 : clen1;
+    const int* bt = (use_parity == 0) ? block_table0 : block_table1;
+
+    int base = bid * ldbeam + k;
+    int len = clen[base];
+    int copy_len = (len < max_out_len) ? len : max_out_len;
+
+    // Write tokens
+    int bk = bid * beam + k;
+    for (int pos = threadIdx.x; pos < copy_len; pos += blockDim.x) {
+        int lp = pos / page_size;
+        int off = pos - lp * page_size;
+        int phys = bt[bk * max_lp + lp];
+        out_tokens[bid * beam * max_out_len + k * max_out_len + pos] =
+            page_storage[phys * page_size + off];
+    }
+
+    if (threadIdx.x == 0) {
+        out_lengths[bid * beam + k] = copy_len;
+        out_scores[bid * beam + k] = score[base];
+    }
+}
+
+// =============================================================================
+// Paged step launcher — dispatches paged kernels for one beam search step
+// =============================================================================
+
+inline cudaError_t ctc_prefix_beam_search_step_paged(
+    InternalData* data, const float* log_prob,
+    int batch_stride, int seq_stride, int vocab_stride,
+    int step, int blank_id, int space_id, cudaStream_t stream) {
+    auto& ps = data->paged;
+    int batch = data->batch;
+    int beam = data->beam;
+    int ldc = data->ldc;
+    int ldbeam = data->ldbeam;
+    int max_seq_len = data->max_seq_len;
+
+    int src_parity = (step == 0) ? 0 : ((step - 1) % 2);
+    int dst_parity = (step == 0) ? 0 : (step % 2);
+
+    if (step == 0) {
+        int smem_size = (sizeof(float) + sizeof(int)) * 256;
+        first_step_paged_kernel<256><<<batch, 256, smem_size, stream>>>(
+            log_prob, batch_stride, seq_stride, vocab_stride,
+            data->select_seqs, data->select_seq_lens,
+            data->pprev, data->clast, data->clen[0], data->score,
+            ps.page_storage, ps.page_size,
+            beam, ldbeam, data->vocab_size, blank_id, batch, max_seq_len);
+    } else {
+        // --- Probability matrix (same as flat) ---
+        {
+            int total = ldc * beam;
+            int threads = 256;
+            int batch_nz = (batch > 0) ? batch : 1;
+            int bx = min((total + threads - 1) / threads, MAX_BLOCKS / batch_nz);
+            dim3 grid(bx, batch);
+            prob_matrix_kernel<<<grid, threads, 0, stream>>>(
+                log_prob, batch_stride, seq_stride, vocab_stride,
+                data->select_seqs, data->select_seq_lens, step,
+                data->pprev, data->ptable, data->ptablen, data->clast,
+                ldc, beam, ldbeam, batch, blank_id, space_id, max_seq_len);
+        }
+
+        // --- Blank / space (same as flat) ---
+        prob_space_blank_kernel<<<batch, ldbeam, 0, stream>>>(
+            log_prob, batch_stride, seq_stride, vocab_stride,
+            data->select_seqs, data->select_seq_lens, step,
+            data->pprev, data->ptable, data->ptablen, data->clast,
+            ldc, beam, ldbeam, batch, blank_id, space_id, max_seq_len);
+
+        // --- Merge duplicates (paged) ---
+        {
+            dim3 merge_grid(beam, batch);
+            merge_paged_kernel<<<merge_grid, ldbeam, 0, stream>>>(
+                data->select_seq_lens, step,
+                data->ptable, data->ptablen, data->clast, data->clen[src_parity],
+                ldc, beam, ldbeam, batch, blank_id,
+                ps.page_storage, ps.block_table[src_parity],
+                ps.page_size, ps.max_logical_pages);
+        }
+
+        // --- Top-K Phase 1 (same as flat) ---
+        int bxs;
+        {
+            constexpr int P1_BLOCK = 128;
+            constexpr int P1_IPT = 4;
+            int all_items = ldc * beam;
+            bxs = min(MAX_BLOCKS_PER_BATCH,
+                      max(1, (all_items + P1_BLOCK * P1_IPT - 1) / (P1_BLOCK * P1_IPT)));
+            bxs = min(bxs, MAX_BLOCKS / max(batch, 1));
+            dim3 p1_grid(bxs, batch);
+            topk_phase1_kernel<P1_BLOCK, P1_IPT><<<p1_grid, P1_BLOCK, 0, stream>>>(
+                data->select_seq_lens, step, data->ptable, data->ptablen,
+                ldc, beam, batch, data->topk_key_buffer, data->topk_value_buffer);
+        }
+
+        // --- Top-K Phase 2 (paged) ---
+        {
+            constexpr int P2_BLOCK = 128;
+            constexpr int P2_IPT = 2;
+            int items_per_batch = bxs * beam;
+            topk_phase2_paged_kernel<P2_BLOCK, P2_IPT><<<batch, P2_BLOCK, 0, stream>>>(
+                data->select_seq_lens, step, items_per_batch, beam, batch,
+                data->topk_key_buffer, data->topk_value_buffer,
+                ldc, ldbeam,
+                data->pprev, data->ptable, data->ptablen, data->clast,
+                data->clen[src_parity], data->clen[dst_parity],
+                data->score,
+                blank_id, data->select_seqs, max_seq_len,
+                ps.page_storage,
+                ps.block_table[src_parity], ps.block_table[dst_parity],
+                ps.ref_counts, ps.next_free_page,
+                ps.free_pool, ps.free_pool_size,
+                ps.page_size, ps.max_logical_pages);
+        }
+    }
+
+    return cudaGetLastError();
+}
+
+// =============================================================================
+// Paged offline decode (analogous to ctc_beam_search_decode_batch)
+// =============================================================================
+
+inline cudaError_t ctc_beam_search_decode_batch_paged(
+    const float* log_prob, int batch_stride, int seq_stride, int vocab_stride,
+    const int* seq_lengths,
+    int* out_tokens, int* out_lengths, float* out_scores,
+    void* workspace, int batch, int beam, int vocab_size,
+    int max_seq_len, int max_out_len,
+    int blank_id, int space_id, float blank_threshold,
+    int page_size, int num_pages,
+    cudaStream_t stream) {
+    int ws_seq_len = (max_seq_len > max_out_len) ? max_seq_len : max_out_len;
+
+    InternalData data;
+    init_internal_data_paged(&data, workspace, batch, beam, vocab_size, ws_seq_len,
+                             page_size, num_pages, stream);
+
+    // Initialise beam-state buffers (same as flat, minus clist)
+    cudaMemsetAsync(data.clast, 0, sizeof(int) * batch * data.ldbeam, stream);
+    cudaMemsetAsync(data.clen[0], 0, sizeof(int) * batch * data.ldbeam, stream);
+    cudaMemsetAsync(data.clen[1], 0, sizeof(int) * batch * data.ldbeam, stream);
+    cudaMemsetAsync(data.ptable, 0xcc, sizeof(float) * batch * beam * data.ldc, stream);
+    cudaMemsetAsync(data.ptablen, 0xcc, sizeof(float) * batch * beam * data.ldc, stream);
+    cudaMemsetAsync(data.select_seq_lens, 0, sizeof(int) * batch, stream);
+
+    float log_threshold = (blank_threshold <= 0.0f)   ? NEG_INF
+                          : (blank_threshold >= 1.0f) ? 0.0f
+                                                      : logf(blank_threshold);
+
+    constexpr int SEL_BLOCK = 128;
+    constexpr int SEL_IPT = 4;
+    init_select_kernel<SEL_BLOCK, SEL_IPT><<<batch, SEL_BLOCK, 0, stream>>>(
+        log_prob, batch_stride, seq_stride, vocab_stride, seq_lengths,
+        batch, data.max_seq_len, blank_id, log_threshold,
+        data.select_seqs, data.select_seq_lens);
+
+    int* h_select_lens = new int[batch];
+    cudaMemcpyAsync(h_select_lens, data.select_seq_lens, sizeof(int) * batch,
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    int max_select = 0;
+    for (int b = 0; b < batch; ++b)
+        if (h_select_lens[b] > max_select)
+            max_select = h_select_lens[b];
+    delete[] h_select_lens;
+    data.max_select_seq_len = max_select;
+
+    for (int step = 0; step < max_select; ++step) {
+        cudaError_t err = ctc_prefix_beam_search_step_paged(
+            &data, log_prob, batch_stride, seq_stride, vocab_stride,
+            step, blank_id, space_id, stream);
+        if (err != cudaSuccess)
+            return err;
+    }
+
+    auto& ps = data.paged;
+
+    // Launch gather kernel to read paged sequences into flat output
+    dim3 gather_grid(batch, beam);
+    gather_paged_results_kernel<<<gather_grid, 256, 0, stream>>>(
+        ps.page_storage, ps.block_table[0], ps.block_table[1],
+        data.select_seq_lens, max_select,
+        data.clen[0], data.clen[1],
+        data.score, data.ldbeam,
+        out_tokens, out_lengths, out_scores,
+        batch, beam, max_out_len,
+        ps.page_size, ps.max_logical_pages);
+
+    return cudaGetLastError();
+}
+
+// =============================================================================
+// Paged streaming state init
+// =============================================================================
+
+inline void init_streaming_state_paged(void* state_buffer, int batch, int beam,
+                                       int vocab_size, int max_seq_len,
+                                       int blank_id, int page_size, int num_pages,
+                                       cudaStream_t stream) {
+    StreamingState state;
+    state.current_step = 0;
+    state.space_id = -1;
+    state.blank_id = blank_id;
+    state.use_paged_memory = 1;
+
+    void* workspace = reinterpret_cast<char*>(state_buffer) + STATE_HEADER_SIZE;
+    init_internal_data_paged(&state.data, workspace, batch, beam, vocab_size, max_seq_len,
+                             page_size, num_pages, stream);
+    state.data.max_select_seq_len = max_seq_len;
+
+    cudaMemcpyAsync(state_buffer, &state, sizeof(StreamingState), cudaMemcpyHostToDevice, stream);
+
+    // Initialise beam-state buffers
+    cudaMemsetAsync(state.data.clast, 0, sizeof(int) * batch * state.data.ldbeam, stream);
+    cudaMemsetAsync(state.data.clen[0], 0, sizeof(int) * batch * state.data.ldbeam, stream);
+    cudaMemsetAsync(state.data.clen[1], 0, sizeof(int) * batch * state.data.ldbeam, stream);
+    cudaMemsetAsync(state.data.ptable, 0xcc, sizeof(float) * batch * beam * state.data.ldc, stream);
+    cudaMemsetAsync(state.data.ptablen, 0xcc, sizeof(float) * batch * beam * state.data.ldc, stream);
+
+    // Identity frame mapping (all frames selected in streaming mode)
+    int* h_sel_lens = new int[batch];
+    for (int b = 0; b < batch; ++b)
+        h_sel_lens[b] = max_seq_len;
+    cudaMemcpyAsync(state.data.select_seq_lens, h_sel_lens, sizeof(int) * batch,
+                    cudaMemcpyHostToDevice, stream);
+    delete[] h_sel_lens;
+
+    int* h_sel_seqs = new int[batch * max_seq_len];
+    for (int b = 0; b < batch; ++b)
+        for (int t = 0; t < max_seq_len; ++t)
+            h_sel_seqs[b * max_seq_len + t] = t;
+    cudaMemcpyAsync(state.data.select_seqs, h_sel_seqs, sizeof(int) * batch * max_seq_len,
+                    cudaMemcpyHostToDevice, stream);
+    delete[] h_sel_seqs;
+
+    cudaStreamSynchronize(stream);
 }
 
 }  // namespace ctc_decoder

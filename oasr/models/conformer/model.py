@@ -3,19 +3,22 @@
 """Conformer model: encoder, layers, and submodules (WeNet algorithm, vLLM-style layout)."""
 
 from __future__ import annotations
-from typing import Tuple
-import torch.nn.functional as F
 
 import math
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from oasr.layers.linear import Linear, LinearActivation
 from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d, Conv2dActivation
 from oasr.layers.norm import LayerNorm, GlobalCMVN
-from oasr.layers.attention.attention import RelPositionMultiHeadedAttention, T_CACHE
+from oasr.layers.attention.attention import (
+    PagedKVCache,
+    RelPositionMultiHeadedAttention,
+    T_CACHE,
+)
 from oasr.utils import get_norm, get_norm_activation
 from .config import ConformerEncoderConfig, ConformerModelConfig
 
@@ -429,10 +432,12 @@ class ConformerEncoderLayer(nn.Module):
         mask: torch.Tensor,
         pos_emb: torch.Tensor,
         mask_pad: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
-        att_cache: T_CACHE = (torch.zeros(0, 0, 0, 0),
-                              torch.zeros(0, 0, 0, 0)),
+        att_cache: Union[T_CACHE, PagedKVCache] = (
+            torch.zeros(0, 0, 0, 0),
+            torch.zeros(0, 0, 0, 0),
+        ),
         cnn_cache: torch.Tensor = torch.zeros(0, 0, 0),
-    ) -> Tuple[torch.Tensor, torch.Tensor, T_CACHE, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Union[T_CACHE, PagedKVCache], torch.Tensor]:
         if self.feed_forward_macaron is not None:
             residual = x
             if self.normalize_before:
@@ -636,6 +641,110 @@ class ConformerEncoder(nn.Module):
 
         return (xs, r_att_cache, r_cnn_cache)
 
+    # ------------------------------------------------------------------
+    # Properties (introspect model dims without importing config)
+    # ------------------------------------------------------------------
+
+    @property
+    def num_encoder_layers(self) -> int:
+        """Number of conformer encoder layers."""
+        return len(self.encoders)
+
+    @property
+    def n_kv_head(self) -> int:
+        """Number of KV attention heads per layer."""
+        return self.encoders[0].self_attn.h_kv  # type: ignore[attr-defined]
+
+    @property
+    def head_dim(self) -> int:
+        """Per-head key/value dimension."""
+        return self.encoders[0].self_attn.d_k  # type: ignore[attr-defined]
+
+    # ------------------------------------------------------------------
+    # Paged-cache forward
+    # ------------------------------------------------------------------
+
+    def forward_chunk_paged(
+        self,
+        xs: torch.Tensor,
+        offset: int,
+        att_caches: List[PagedKVCache],
+        cnn_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
+        att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward one chunk using paged KV cache.
+
+        K/V for the current chunk are written directly into the shared block
+        pool by :class:`~oasr.layers.attention.RelPositionMultiHeadedAttention`
+        (via :func:`~oasr.layers.attention.attention._paged_write_kv`).  The
+        caller is responsible for allocating the necessary physical blocks
+        **before** this call and for updating ``cache_seqlens`` **after**.
+
+        Parameters
+        ----------
+        xs : Tensor
+            Chunk input ``(1, chunk_input_frames, mel_dim)``.
+        offset : int
+            Current encoder-output frame offset (used for positional encoding).
+        att_caches : list[PagedKVCache]
+            One :class:`~oasr.layers.attention.PagedKVCache` per encoder layer.
+            All items share the **same** ``block_table`` and ``cache_seqlens``
+            tensors; only ``k_cache`` / ``v_cache`` differ per layer.
+        cnn_cache : Tensor
+            CNN cache ``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
+            Pass a ``(0,0,0,0)`` tensor on the first chunk.
+        att_mask : Tensor
+            Additive attention bias ``(1, chunk_size, attention_key_size)``.
+            A ``(0,0,0)`` placeholder is replaced internally by a zero mask.
+
+        Returns
+        -------
+        xs : Tensor
+            Encoder output ``(1, chunk_size, hidden_dim)``.
+        r_cnn_cache : Tensor
+            Updated CNN cache ``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
+        """
+        assert xs.size(0) == 1
+        tmp_masks = torch.ones(
+            1, xs.size(1), device=xs.device, dtype=torch.bool
+        ).unsqueeze(1)
+        if self.global_cmvn is not None:
+            xs = self.global_cmvn(xs)
+        xs, pos_emb, _ = self.embed(xs, tmp_masks, offset)
+
+        chunk_size = xs.size(1)
+        cache_t1 = int(att_caches[0].cache_seqlens[0].item())
+        attention_key_size = cache_t1 + chunk_size
+
+        if att_mask.size(-1) == 0 and attention_key_size > 0:
+            att_mask = torch.zeros(
+                (1, chunk_size, attention_key_size),
+                dtype=xs.dtype,
+                device=xs.device,
+            )
+        elif att_mask.dtype == torch.bool:
+            att_mask = mask_to_bias(att_mask, xs.dtype)
+
+        pos_emb = self.embed.pos_enc.position_encoding(
+            offset=offset - cache_t1, size=attention_key_size
+        )
+
+        r_cnn_cache = []
+        for i, layer in enumerate(self.encoders):
+            xs, _, new_cnn_cache = layer(
+                xs,
+                att_mask,
+                pos_emb,
+                att_cache=att_caches[i],
+                cnn_cache=cnn_cache[i] if cnn_cache.size(0) > 0 else cnn_cache,
+            )
+            r_cnn_cache.append(new_cnn_cache.unsqueeze(0))
+
+        if self.normalize_before and self.final_norm:
+            xs = self.after_norm(xs)
+
+        return xs, torch.cat(r_cnn_cache, dim=0)
+
     def forward_chunk_by_chunk(
         self,
         xs: torch.Tensor,
@@ -733,6 +842,25 @@ class ConformerModel(nn.Module):
 
         probs = self.ctc(hidden_states)
         return probs, att_cache, cnn_cache
+
+    def forward_chunk_paged(
+        self,
+        input_features: torch.Tensor,
+        offset: int,
+        att_caches: List[PagedKVCache],
+        cnn_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
+        att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward one chunk with paged KV cache; returns ``(probs, r_cnn_cache)``.
+
+        See :meth:`ConformerEncoder.forward_chunk_paged` for parameter and
+        return-value documentation.
+        """
+        hidden_states, r_cnn_cache = self.encoder.forward_chunk_paged(
+            input_features, offset, att_caches, cnn_cache, att_mask
+        )
+        probs = self.ctc(hidden_states)
+        return probs, r_cnn_cache
 
     def forward_chunk_by_chunk(
         self,
