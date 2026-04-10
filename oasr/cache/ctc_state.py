@@ -2,27 +2,42 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-stream CTC decoder GPU state manager.
 
-Wraps ``GpuStreamingDecoder`` instances, providing the same allocate /
-get / free lifecycle as the attention and CNN cache managers. Each stream
-gets its own ``GpuStreamingDecoder`` whose internal GPU state buffer is
-allocated on ``init_stream()`` and released when the stream is freed.
+Uses a **single shared** :class:`~oasr.ctc_decode.GpuStreamingDecoder`
+engine with per-stream :class:`~oasr.ctc_decode.StreamState` objects,
+enabling interleaved chunk processing across many concurrent requests
+while sharing the JIT module, config, and blank-threshold computation.
+
+Freed states are returned to an internal **pool** so that subsequent
+``allocate_stream`` calls can reuse their GPU buffers without triggering
+``cudaMalloc``.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 
-from oasr.ctc_decode import GpuDecoderConfig, GpuStreamingDecoder
+from oasr.ctc_decode import (
+    GpuDecoderConfig,
+    GpuStreamingDecoder,
+    StreamHandle,
+    StreamState,
+)
 
 
 class CtcStateCacheManager:
-    """Manages per-stream CTC decoder GPU state.
+    """Manages per-stream CTC decoder GPU state with state pooling.
 
-    One ``GpuStreamingDecoder`` instance is maintained per active stream.
-    The decoder state (beam scores, hypothesis sequences, paged memory tables)
-    lives in a CUDA ``uint8`` buffer owned by the decoder.
+    A **single** :class:`GpuStreamingDecoder` engine is shared across all
+    streams.  Each stream gets its own lightweight :class:`StreamState`;
+    when a stream is freed the state is pooled (not destroyed) so the
+    next ``allocate_stream`` reuses the GPU buffer.
+
+    The :meth:`get_decoder` method returns a :class:`StreamHandle` that
+    presents the same ``decode_chunk`` / ``finalize_stream`` / ``step`` /
+    ``config`` interface as a standalone decoder, so callers do not need
+    to know about the underlying state separation.
 
     Parameters
     ----------
@@ -34,15 +49,21 @@ class CtcStateCacheManager:
     --------
     >>> mgr = CtcStateCacheManager(GpuDecoderConfig(beam_size=5))
     >>> mgr.allocate_stream(0, batch=1, vocab_size=5000)
-    >>> decoder = mgr.get_decoder(0)
-    >>> decoder.decode_chunk(log_probs)
-    >>> result = decoder.finalize_stream()
-    >>> mgr.free_stream(0)
+    >>> mgr.allocate_stream(1, batch=1, vocab_size=5000)
+    >>> # Interleaved chunk processing — both streams share one engine:
+    >>> mgr.get_decoder(0).decode_chunk(chunk_a)
+    >>> mgr.get_decoder(1).decode_chunk(chunk_b)
+    >>> mgr.get_decoder(0).decode_chunk(chunk_c)
+    >>> result_0 = mgr.get_decoder(0).finalize_stream()
+    >>> mgr.free_stream(0)            # state returned to pool
+    >>> mgr.allocate_stream(2, batch=1, vocab_size=5000)  # reuses pooled state
     """
 
     def __init__(self, decoder_config: Optional[GpuDecoderConfig] = None) -> None:
         self._decoder_config = decoder_config or GpuDecoderConfig()
-        self._decoders: Dict[int, GpuStreamingDecoder] = {}
+        self._decoder = GpuStreamingDecoder(self._decoder_config)
+        self._states: Dict[int, StreamState] = {}
+        self._pool: List[StreamState] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -55,7 +76,11 @@ class CtcStateCacheManager:
         vocab_size: int,
         device: Optional[torch.device] = None,
     ) -> None:
-        """Create and initialize a streaming CTC decoder for a new stream.
+        """Create and initialize a per-stream CTC decoder state.
+
+        If a previously freed :class:`StreamState` is available in the
+        pool it is reused (via :meth:`GpuStreamingDecoder.reset_state`),
+        avoiding a fresh GPU buffer allocation.
 
         Parameters
         ----------
@@ -74,17 +99,20 @@ class CtcStateCacheManager:
         ValueError
             If ``stream_id`` is already allocated.
         """
-        if stream_id in self._decoders:
+        if stream_id in self._states:
             raise ValueError(f"CTC state for stream {stream_id} already allocated.")
-        decoder = GpuStreamingDecoder(self._decoder_config)
-        decoder.init_stream(batch=batch, vocab_size=vocab_size, device=device)
-        self._decoders[stream_id] = decoder
+        if self._pool:
+            state = self._pool.pop()
+            self._decoder.reset_state(state, batch, vocab_size, device)
+        else:
+            state = self._decoder.create_state(batch, vocab_size, device)
+        self._states[stream_id] = state
 
     def free_stream(self, stream_id: int) -> None:
-        """Release the CTC decoder and its GPU state for a stream.
+        """Return the CTC state for a stream to the internal pool.
 
-        The decoder's internal state buffer tensor is deleted, returning GPU
-        memory to PyTorch's allocator.
+        The state's GPU buffer is **not** freed — it is kept alive inside
+        the pool so that subsequent ``allocate_stream`` calls can reuse it.
 
         Parameters
         ----------
@@ -96,18 +124,23 @@ class CtcStateCacheManager:
         KeyError
             If ``stream_id`` is not allocated.
         """
-        if stream_id not in self._decoders:
+        if stream_id not in self._states:
             raise KeyError(f"CTC state for stream {stream_id} not found.")
-        del self._decoders[stream_id]
+        self._pool.append(self._states.pop(stream_id))
 
     # ------------------------------------------------------------------
     # Access
     # ------------------------------------------------------------------
 
-    def get_decoder(self, stream_id: int) -> GpuStreamingDecoder:
-        """Return the streaming CTC decoder for a stream.
+    def get_decoder(
+        self, stream_id: int,
+    ) -> StreamHandle:
+        """Return a handle that binds the shared decoder to this stream's state.
 
-        The returned decoder is ready for ``decode_chunk()`` calls.
+        The returned :class:`StreamHandle` exposes ``decode_chunk()``,
+        ``finalize_stream()``, ``step``, and ``config`` — the same
+        interface as :class:`GpuStreamingDecoder` — so it can be used
+        as a drop-in replacement.
 
         Parameters
         ----------
@@ -116,14 +149,14 @@ class CtcStateCacheManager:
 
         Returns
         -------
-        GpuStreamingDecoder
-            The live decoder instance.
+        StreamHandle
+            A lightweight proxy ready for ``decode_chunk()`` calls.
 
         Raises
         ------
         KeyError
             If ``stream_id`` is not allocated.
         """
-        if stream_id not in self._decoders:
+        if stream_id not in self._states:
             raise KeyError(f"CTC state for stream {stream_id} not found.")
-        return self._decoders[stream_id]
+        return StreamHandle(self._decoder, self._states[stream_id])

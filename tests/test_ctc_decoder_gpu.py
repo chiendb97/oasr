@@ -11,6 +11,8 @@ from oasr.ctc_decode import (
     GpuDecoderConfig,
     GpuDecoderResult,
     GpuStreamingDecoder,
+    StreamHandle,
+    StreamState,
     ctc_beam_search_decode,
 )
 
@@ -241,6 +243,76 @@ class TestCtcDecoderGpuStreaming:
         decoder.decode_chunk(logp)
         assert decoder.step == 3
 
+    def test_reuse_with_varying_batch(self, device):
+        """Single decoder reused across requests with different batch sizes."""
+        V = 6
+        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10)
+        decoder = GpuStreamingDecoder(config)
+
+        # Request 1: batch=1
+        decoder.init_stream(batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk(_make_logp_gpu(3, V, [1, 0, 2], device))
+        r1 = decoder.finalize_stream()
+        assert r1.tokens[0][0] == [1, 2]
+
+        # Request 2: batch=2 (larger — triggers buffer growth)
+        paths = [[3, 0, 4], [1, 0, 1]]
+        logp, _ = _make_batched_logp_gpu(paths, V, device)
+        decoder.init_stream(batch=2, vocab_size=V, device=device)
+        decoder.decode_chunk(logp)
+        r2 = decoder.finalize_stream()
+        assert r2.tokens[0][0] == [3, 4]
+        assert r2.tokens[1][0] == [1, 1]
+
+        # Request 3: batch=1 again (reuses the larger buffer)
+        decoder.init_stream(batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk(_make_logp_gpu(3, V, [4, 0, 3], device))
+        r3 = decoder.finalize_stream()
+        assert r3.tokens[0][0] == [4, 3]
+
+    def test_reuse_with_varying_chunk_count(self, device):
+        """Single decoder reused with different numbers of chunks."""
+        V = 5
+        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=20)
+        decoder = GpuStreamingDecoder(config)
+
+        # Short request: 1 chunk
+        decoder.init_stream(batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk(_make_logp_gpu(3, V, [1, 0, 2], device))
+        assert decoder.finalize_stream().tokens[0][0] == [1, 2]
+
+        # Long request: 3 chunks
+        decoder.init_stream(batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk(_make_logp_gpu(2, V, [1, 0], device))
+        decoder.decode_chunk(_make_logp_gpu(2, V, [2, 0], device))
+        decoder.decode_chunk(_make_logp_gpu(1, V, [3], device))
+        assert decoder.finalize_stream().tokens[0][0] == [1, 2, 3]
+
+    def test_buffer_reuse_no_realloc(self, device):
+        """Verifies that init_stream reuses the same buffer when size matches."""
+        V = 5
+        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10)
+        decoder = GpuStreamingDecoder(config)
+
+        decoder.init_stream(batch=1, vocab_size=V, device=device)
+        buf_ptr_1 = decoder._state.buffer.data_ptr()
+
+        decoder.init_stream(batch=1, vocab_size=V, device=device)
+        buf_ptr_2 = decoder._state.buffer.data_ptr()
+
+        assert buf_ptr_1 == buf_ptr_2, "Buffer should be reused for identical params"
+
+    def test_empty_chunk(self, device):
+        """Zero-length chunk is a no-op."""
+        V = 5
+        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10)
+        decoder = GpuStreamingDecoder(config)
+        decoder.init_stream(batch=1, vocab_size=V, device=device)
+
+        empty = torch.empty(1, 0, V, dtype=torch.float32, device=device)
+        decoder.decode_chunk(empty)
+        assert decoder.step == 0
+
     def test_finalize_without_init_raises(self, device):
         """Calling finalize without init raises RuntimeError."""
         decoder = GpuStreamingDecoder()
@@ -254,6 +326,138 @@ class TestCtcDecoderGpuStreaming:
         logp = _make_logp_gpu(3, V, [1, 0, 2], device)
         with pytest.raises(RuntimeError, match="init_stream"):
             decoder.decode_chunk(logp)
+
+
+# ---------------------------------------------------------------------------
+# Interleaved / explicit StreamState tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.cuda
+class TestCtcDecoderInterleaved:
+    """Tests for interleaved multi-request decoding via explicit StreamState."""
+
+    def test_create_state(self, device):
+        """create_state returns a StreamState with correct attributes."""
+        V = 5
+        decoder = GpuStreamingDecoder(GpuDecoderConfig(beam_size=3, max_seq_len=10))
+        state = decoder.create_state(batch=1, vocab_size=V, device=device)
+
+        assert isinstance(state, StreamState)
+        assert state.step == 0
+        assert state.batch == 1
+        assert state.vocab_size == V
+        assert state.buffer.device.type == "cuda"
+
+    def test_interleaved_two_requests(self, device):
+        """Two requests interleaved on the same decoder produce correct output."""
+        V = 5
+        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10)
+        decoder = GpuStreamingDecoder(config)
+
+        s1 = decoder.create_state(batch=1, vocab_size=V, device=device)
+        s2 = decoder.create_state(batch=1, vocab_size=V, device=device)
+
+        # Interleave: s1 gets [1, 0, 2], s2 gets [3, 0, 4]
+        decoder.decode_chunk(_make_logp_gpu(1, V, [1], device), state=s1)
+        decoder.decode_chunk(_make_logp_gpu(1, V, [3], device), state=s2)
+        decoder.decode_chunk(_make_logp_gpu(1, V, [0], device), state=s1)
+        decoder.decode_chunk(_make_logp_gpu(1, V, [0], device), state=s2)
+        decoder.decode_chunk(_make_logp_gpu(1, V, [2], device), state=s1)
+        decoder.decode_chunk(_make_logp_gpu(1, V, [4], device), state=s2)
+
+        r1 = decoder.finalize_stream(state=s1)
+        r2 = decoder.finalize_stream(state=s2)
+
+        assert r1.tokens[0][0] == [1, 2]
+        assert r2.tokens[0][0] == [3, 4]
+
+    def test_interleaved_different_lengths(self, device):
+        """Interleaved requests with different frame counts."""
+        V = 5
+        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=20)
+        decoder = GpuStreamingDecoder(config)
+
+        s_short = decoder.create_state(batch=1, vocab_size=V, device=device)
+        s_long = decoder.create_state(batch=1, vocab_size=V, device=device)
+
+        decoder.decode_chunk(_make_logp_gpu(3, V, [1, 0, 2], device), state=s_short)
+        decoder.decode_chunk(_make_logp_gpu(2, V, [3, 0], device), state=s_long)
+
+        r_short = decoder.finalize_stream(state=s_short)
+        assert r_short.tokens[0][0] == [1, 2]
+
+        decoder.decode_chunk(_make_logp_gpu(3, V, [4, 0, 1], device), state=s_long)
+        r_long = decoder.finalize_stream(state=s_long)
+        assert r_long.tokens[0][0] == [3, 4, 1]
+
+    def test_reset_state_reuses_buffer(self, device):
+        """reset_state reinitializes without reallocating if size fits."""
+        V = 5
+        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10)
+        decoder = GpuStreamingDecoder(config)
+
+        state = decoder.create_state(batch=1, vocab_size=V, device=device)
+        buf_ptr = state.buffer.data_ptr()
+
+        decoder.decode_chunk(_make_logp_gpu(3, V, [1, 0, 2], device), state=state)
+        assert state.step == 3
+
+        decoder.reset_state(state, batch=1, vocab_size=V)
+        assert state.step == 0
+        assert state.buffer.data_ptr() == buf_ptr, "Buffer should be reused"
+
+        decoder.decode_chunk(_make_logp_gpu(3, V, [3, 0, 4], device), state=state)
+        r = decoder.finalize_stream(state=state)
+        assert r.tokens[0][0] == [3, 4]
+
+    def test_reset_state_grows_for_larger_batch(self, device):
+        """reset_state allocates a larger buffer when batch grows."""
+        V = 5
+        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10)
+        decoder = GpuStreamingDecoder(config)
+
+        state = decoder.create_state(batch=1, vocab_size=V, device=device)
+        small_bytes = state._buffer_bytes
+
+        decoder.reset_state(state, batch=4, vocab_size=V)
+        assert state._buffer_bytes >= small_bytes
+        assert state.batch == 4
+
+    def test_stream_handle(self, device):
+        """StreamHandle wraps decoder + state with the standard interface."""
+        V = 5
+        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10)
+        decoder = GpuStreamingDecoder(config)
+        state = decoder.create_state(batch=1, vocab_size=V, device=device)
+
+        handle = StreamHandle(decoder, state)
+        assert handle.step == 0
+        assert handle.config is config
+
+        handle.decode_chunk(_make_logp_gpu(3, V, [1, 0, 2], device))
+        assert handle.step == 3
+        r = handle.finalize_stream()
+        assert r.tokens[0][0] == [1, 2]
+
+    def test_explicit_state_does_not_affect_internal(self, device):
+        """Using explicit state does not touch the internal default state."""
+        V = 5
+        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10)
+        decoder = GpuStreamingDecoder(config)
+
+        decoder.init_stream(batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk(_make_logp_gpu(3, V, [1, 0, 2], device))
+
+        state = decoder.create_state(batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk(_make_logp_gpu(3, V, [3, 0, 4], device), state=state)
+
+        assert decoder.step == 3
+        assert state.step == 3
+
+        r_internal = decoder.finalize_stream()
+        r_explicit = decoder.finalize_stream(state=state)
+        assert r_internal.tokens[0][0] == [1, 2]
+        assert r_explicit.tokens[0][0] == [3, 4]
 
 
 # ---------------------------------------------------------------------------

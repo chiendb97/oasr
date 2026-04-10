@@ -410,12 +410,12 @@ class TestAttentionCacheManager:
 @pytest.mark.cuda
 class TestCtcStateCacheManager:
     def test_allocate_and_get_decoder(self, device):
-        from oasr import GpuDecoderConfig, GpuStreamingDecoder
+        from oasr import GpuDecoderConfig, StreamHandle
 
         mgr = CtcStateCacheManager(GpuDecoderConfig(beam_size=4))
         mgr.allocate_stream(0, batch=1, vocab_size=100, device=device)
         dec = mgr.get_decoder(0)
-        assert isinstance(dec, GpuStreamingDecoder)
+        assert isinstance(dec, StreamHandle)
         assert dec.step == 0
 
     def test_double_allocate_raises(self, device):
@@ -435,6 +435,48 @@ class TestCtcStateCacheManager:
         mgr = CtcStateCacheManager()
         with pytest.raises(KeyError):
             mgr.get_decoder(99)
+
+    def test_pool_reuses_state_after_free(self, device):
+        """Freed StreamState is pooled and its buffer reused on next allocate."""
+        from oasr import GpuDecoderConfig
+
+        mgr = CtcStateCacheManager(GpuDecoderConfig(beam_size=4))
+        mgr.allocate_stream(0, batch=1, vocab_size=100, device=device)
+        state_0 = mgr._states[0]
+        buf_ptr = state_0.buffer.data_ptr()
+
+        mgr.free_stream(0)
+        assert len(mgr._pool) == 1
+
+        mgr.allocate_stream(1, batch=1, vocab_size=100, device=device)
+        state_1 = mgr._states[1]
+        assert state_1 is state_0, "StreamState should be reused from pool"
+        assert state_1.buffer.data_ptr() == buf_ptr, "Buffer should be reused"
+        assert state_1.step == 0, "State should be reset"
+
+    def test_pool_grows_with_concurrent_streams(self, device):
+        """Multiple concurrent streams each get their own state."""
+        mgr = CtcStateCacheManager()
+        mgr.allocate_stream(0, batch=1, vocab_size=50, device=device)
+        mgr.allocate_stream(1, batch=1, vocab_size=50, device=device)
+        assert mgr._states[0] is not mgr._states[1]
+
+        mgr.free_stream(0)
+        mgr.free_stream(1)
+        assert len(mgr._pool) == 2
+
+        mgr.allocate_stream(2, batch=1, vocab_size=50, device=device)
+        mgr.allocate_stream(3, batch=1, vocab_size=50, device=device)
+        assert mgr._states[2] is not mgr._states[3]
+
+    def test_shared_decoder_engine(self, device):
+        """All streams share the same underlying decoder engine."""
+        mgr = CtcStateCacheManager()
+        mgr.allocate_stream(0, batch=1, vocab_size=50, device=device)
+        mgr.allocate_stream(1, batch=1, vocab_size=50, device=device)
+        h0 = mgr.get_decoder(0)
+        h1 = mgr.get_decoder(1)
+        assert h0._decoder is h1._decoder, "Handles should share the same engine"
 
 
 # ---------------------------------------------------------------------------

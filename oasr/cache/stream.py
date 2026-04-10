@@ -27,14 +27,14 @@ Typical usage::
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Union
 
 import torch
 
 from oasr.cache.attention_cache import AttentionCacheManager
 from oasr.cache.cnn_cache import CnnCacheManager
 from oasr.cache.ctc_state import CtcStateCacheManager
-from oasr.ctc_decode import GpuStreamingDecoder
+from oasr.ctc_decode import GpuStreamingDecoder, StreamHandle
 from oasr.layers.attention.attention import PagedKVCache
 
 
@@ -116,12 +116,12 @@ class StreamContext:
         """
         return self._cnn_cache.get_cache(self._stream_id)
 
-    def get_decoder(self) -> GpuStreamingDecoder:
+    def get_decoder(self) -> Union[GpuStreamingDecoder, StreamHandle]:
         """Return the CTC streaming decoder for this stream.
 
         Returns
         -------
-        GpuStreamingDecoder
+        GpuStreamingDecoder or StreamHandle
             Ready for ``decode_chunk()`` and ``finalize_stream()`` calls.
         """
         return self._ctc_state.get_decoder(self._stream_id)

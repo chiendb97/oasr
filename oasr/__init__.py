@@ -34,6 +34,8 @@ from .ctc_decode import (
     GpuStreamingDecoder,
     GpuDecoderConfig,
     GpuDecoderResult,
+    StreamState,
+    StreamHandle,
 )
 
 # =============================================================================
@@ -187,6 +189,8 @@ __all__ = [
     "GpuStreamingDecoder",
     "GpuDecoderConfig",
     "GpuDecoderResult",
+    "StreamState",
+    "StreamHandle",
     # Streaming cache manager
     "cache",
     "CacheConfig",
