@@ -27,6 +27,8 @@ from typing import List, Tuple
 import pytest
 import torch
 
+from oasr.features import FeatureConfig, extract_features_batch
+
 # ---------------------------------------------------------------------------
 # Model-architecture constants (specific to the U2++ LibriSpeech checkpoint)
 # ---------------------------------------------------------------------------
@@ -80,6 +82,9 @@ def _read_audio_and_extract_features(
 ) -> torch.Tensor:
     """Load a WAV file and compute 80-dim log-mel filterbank features.
 
+    Uses :mod:`oasr.features` (same Kaldi FBANK settings as the legacy tests:
+    25 ms frame, 10 ms shift, dither 1.0).
+
     Returns
     -------
     torch.Tensor
@@ -89,15 +94,15 @@ def _read_audio_and_extract_features(
 
     audio, sr = torchaudio.load(path)
     audio = audio * (1 << 15)
-    feats = torchaudio.compliance.kaldi.fbank(
-        audio,
-        sr,
+    cfg = FeatureConfig(
+        sample_rate=int(sr),
         num_mel_bins=80,
-        frame_shift=10,
-        frame_length=25,
+        frame_length_ms=25.0,
+        frame_shift_ms=10.0,
         dither=1.0,
     )
-    return feats.unsqueeze(0).to(device=device, dtype=dtype)
+    feats, _ = extract_features_batch([audio], cfg)
+    return feats.to(device=device, dtype=dtype)
 
 
 def _chunk_features(feats: torch.Tensor) -> List[torch.Tensor]:

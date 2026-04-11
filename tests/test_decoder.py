@@ -10,6 +10,7 @@ import torch
 import torchaudio
 
 import oasr.decoder as _decoder_mod
+from oasr.features import FeatureConfig, extract_features_batch
 
 from oasr.decoder import (
     ContextGraph,
@@ -42,23 +43,19 @@ def read_audio(path: str):
     return audio, sr
 
 
-def extract_features(audio: torch.Tensor, sr: int):
-    # extract feature using torchaudio.compliance.kaldi as kaldi
-    feats = torchaudio.compliance.kaldi.fbank(
-        audio,
-        sr,
+def read_audio_and_extract_features(path: str, device: str, dtype: torch.dtype):
+    """Load WAV and compute 80-dim FBANK via :mod:`oasr.features` (Kaldi-compatible)."""
+    audio, sr = read_audio(path)
+    cfg = FeatureConfig(
+        sample_rate=int(sr),
         num_mel_bins=80,
-        frame_shift=10,
-        frame_length=25,
+        frame_length_ms=25.0,
+        frame_shift_ms=10.0,
         dither=1.0,
     )
-    return feats
-
-
-def read_audio_and_extract_features(path: str, device: str, dtype: torch.dtype):
-    audio, sr = read_audio(path)
-    feats = extract_features(audio, sr)
-    return feats.unsqueeze(0).to(device=device, dtype=dtype)
+    # Wrap in a list so (C, T) is one utterance, not a batch of C mono channels.
+    feats, _ = extract_features_batch([audio], cfg)
+    return feats.to(device=device, dtype=dtype)
 
 
 def build_dictionary(words_path: str):

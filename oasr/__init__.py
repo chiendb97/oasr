@@ -29,6 +29,13 @@ from .conv import (
     depthwise_conv1d_silu, causal_conv1d, conv2d_activation,
 )
 from .gemm import gemm, bmm, group_gemm, gemm_activation
+from .features import (
+    fbank_batch,
+    mfcc_batch,
+    extract_features_batch,
+    FeatureConfig,
+    BatchedStreamingFeatureExtractor,
+)
 from .ctc_decode import (
     ctc_beam_search_decode,
     GpuStreamingDecoder,
@@ -162,6 +169,12 @@ __all__ = [
     "bmm",
     "group_gemm",
     "gemm_activation",
+    # Feature extraction (batched)
+    "fbank_batch",
+    "mfcc_batch",
+    "extract_features_batch",
+    "FeatureConfig",
+    "BatchedStreamingFeatureExtractor",
     # nn.Module wrappers
     "layers",
     "DepthwiseConv1d",
