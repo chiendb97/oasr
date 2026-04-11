@@ -32,6 +32,12 @@ def pytest_addoption(parser):
         default=os.environ.get("LANG_DIR", ""),
         help="Path to a pre-built language directory for WFST beam search tests",
     )
+    parser.addoption(
+        "--wav-dir",
+        action="store",
+        default=os.environ.get("WAV_DIR", ""),
+        help="Directory of test WAV files for engine integration tests",
+    )
 
 
 def pytest_configure(config):
@@ -60,6 +66,12 @@ def audio_path(request):
 def lang_dir(request):
     """Path to a pre-built language directory (from --lang-dir or LANG_DIR env)."""
     return request.config.getoption("--lang-dir", default="")
+
+
+@pytest.fixture(scope="session")
+def wav_dir(request):
+    """Directory of test WAV files (from --wav-dir or WAV_DIR env)."""
+    return request.config.getoption("--wav-dir", default="")
 
 
 @pytest.fixture(scope="session")
