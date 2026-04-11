@@ -67,7 +67,7 @@ def _build_global_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         choices=list_routines(),
-        help="Kernel routine family (gemm, norm, conv, activation, composite, ctc_decoder)",
+        help="Kernel routine family (gemm, norm, conv, activation, composite, ctc_decoder, engine)",
     )
     parser.add_argument(
         "--subroutine",
