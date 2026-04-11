@@ -30,7 +30,6 @@ ENV/
 env.bak/
 venv.bak/
 .python-version
-CLAUDE.md
 
 # IDE
 .vscode/
