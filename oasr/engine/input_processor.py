@@ -113,8 +113,8 @@ class InputProcessor:
 
         # Cache on each request
         for i, req in enumerate(requests):
-            req.features = features[i : i + 1]
-            req.feature_lengths = feat_lengths[i : i + 1]
+            req.features = features[i: i + 1]
+            req.feature_lengths = feat_lengths[i: i + 1]
 
         return features, feat_lengths
 
