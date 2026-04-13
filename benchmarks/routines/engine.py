@@ -18,17 +18,18 @@ Subroutines
 """
 
 from __future__ import annotations
+from benchmarks.routines.bench_utils import BenchResult, OutputWriter
+from oasr.engine import ASREngine, EngineConfig, OfflineEngine
 
 import argparse
 import glob
 import os
 import statistics
 import time
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import torch
 
-from benchmarks.routines.bench_utils import BenchResult, OutputWriter
 
 SUBROUTINES = ["offline", "streaming", "offline_wfst", "streaming_wfst"]
 
@@ -92,6 +93,43 @@ def _get_audio_durations(wav_paths: List[str]) -> List[float]:
     return durations
 
 
+def _load_waveforms(
+    wav_paths: List[str], sample_rate: int = 16000
+) -> Tuple[List[torch.Tensor], List[float]]:
+    """Load audio files into CPU float32 waveform tensors (unscaled).
+
+    Parameters
+    ----------
+    wav_paths : list of str
+        Paths to ``.wav`` files.
+    sample_rate : int
+        Target sample rate; files at a different rate are resampled.
+
+    Returns
+    -------
+    waveforms : List[Tensor]
+        1-D float32 CPU tensors of shape ``(T,)``.
+    durations : List[float]
+        Audio durations in seconds derived from the loaded waveforms.
+    """
+    import torchaudio
+
+    waveforms: List[torch.Tensor] = []
+    durations: List[float] = []
+    for p in wav_paths:
+        waveform, sr = torchaudio.load(p)  # (C, T)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != sample_rate:
+            waveform = torchaudio.functional.resample(
+                waveform, orig_freq=sr, new_freq=sample_rate
+            )
+        wav = waveform.squeeze(0).float()
+        waveforms.append(wav)
+        durations.append(wav.shape[-1] / sample_rate)
+    return waveforms, durations
+
+
 def _resolve_fst_file(wfst_path: Optional[str]) -> Optional[str]:
     """Resolve WFST directory or file to the HLG.pt path."""
     if wfst_path is None:
@@ -108,20 +146,24 @@ def _resolve_fst_file(wfst_path: Optional[str]) -> Optional[str]:
 
 
 def _time_offline(
-    engine: Any,
-    wav_paths: List[str],
+    engine: OfflineEngine,
+    waveforms: List[torch.Tensor],
+    durations: List[float],
     batch_size: int,
     num_iters: int,
 ) -> tuple[float, float, float]:
-    """Time OfflineEngine over *wav_paths* in batches.
+    """Time OfflineEngine over pre-loaded *waveforms* in batches.
+
+    Audio must be loaded before calling this function so that file I/O is
+    excluded from the timed region.
 
     Returns
     -------
     (median_ms, std_ms, rtf)
     """
-    durations = _get_audio_durations(wav_paths)
     total_duration = sum(durations)
-    batches = [wav_paths[i : i + batch_size] for i in range(0, len(wav_paths), batch_size)]
+    batches = [waveforms[i: i + batch_size]
+               for i in range(0, len(waveforms), batch_size)]
 
     def _run_all():
         for batch in batches:
@@ -148,21 +190,24 @@ def _time_offline(
 
 
 def _time_streaming(
-    engine: Any,
-    wav_paths: List[str],
+    engine: ASREngine,
+    waveforms: List[torch.Tensor],
+    durations: List[float],
     num_iters: int,
 ) -> tuple[float, float, float]:
-    """Time ASREngine over *wav_paths* (one request per file).
+    """Time ASREngine over pre-loaded *waveforms* (one request per file).
+
+    Audio must be loaded before calling this function so that file I/O is
+    excluded from the timed region.
 
     Returns
     -------
     (median_ms, std_ms, rtf)
     """
-    durations = _get_audio_durations(wav_paths)
     total_duration = sum(durations)
 
     def _run_all():
-        for wav in wav_paths:
+        for wav in waveforms:
             engine.add_request(wav)
         engine.run()
 
@@ -207,7 +252,6 @@ def _run_config(
     output: OutputWriter,
 ) -> None:
     """Run one benchmark configuration and write results to *output*."""
-    from oasr.engine import ASREngine, EngineConfig, OfflineEngine
 
     if dtype is None:
         dtype = torch.float16
@@ -219,18 +263,24 @@ def _run_config(
         print(f"  [SKIP] {subroutine}: --wfst-path required but not provided")
         return
 
-    # Collect audio and compute statistics
+    # Collect audio paths, then pre-load waveforms before starting the engine.
+    # This ensures file I/O is excluded from the timed benchmark region.
     try:
         wav_paths = _collect_wav_paths(audio_dir, num_utterances)
     except RuntimeError as exc:
         print(f"  [ERROR] {subroutine}: {exc}")
         return
 
-    durations = _get_audio_durations(wav_paths)
-    n = len(wav_paths)
+    try:
+        waveforms, durations = _load_waveforms(wav_paths)
+    except Exception as exc:
+        print(f"  [ERROR] {subroutine}: failed to load audio — {exc}")
+        return
+
+    n = len(waveforms)
     avg_dur = sum(durations) / n
 
-    decoder_type = "ctc_wfst" if is_wfst else "ctc_prefix_beam"
+    decoder_type = "ctc_wfst" if is_wfst else "ctc_gpu"
     dtype_str = {torch.float16: "float16", torch.bfloat16: "bfloat16",
                  torch.float32: "float32"}.get(dtype, "float16")
 
@@ -252,7 +302,8 @@ def _run_config(
                 f"N={n}, chunk={chunk_size}, max_bs={max_batch_size}, "
                 f"avg_dur={avg_dur:.1f}s"
             )
-            median_ms, std_ms, rtf = _time_streaming(engine, wav_paths, num_iters)
+            median_ms, std_ms, rtf = _time_streaming(
+                engine, waveforms, durations, num_iters)
         else:
             cfg = EngineConfig(
                 ckpt_dir=ckpt_dir,
@@ -263,7 +314,8 @@ def _run_config(
             )
             engine = OfflineEngine(cfg)
             shape_str = f"N={n}, batch={batch_size}, avg_dur={avg_dur:.1f}s"
-            median_ms, std_ms, rtf = _time_offline(engine, wav_paths, batch_size, num_iters)
+            median_ms, std_ms, rtf = _time_offline(
+                engine, waveforms, durations, batch_size, num_iters)
     except Exception as exc:
         print(f"  [ERROR] {subroutine}: {exc}")
         import traceback
@@ -444,8 +496,10 @@ Examples:
       --subroutines offline streaming offline_wfst streaming_wfst
 """,
     )
-    parser.add_argument("--ckpt-dir", required=True, help="WeNet checkpoint directory")
-    parser.add_argument("--audio-dir", required=True, help="Directory with .wav files")
+    parser.add_argument("--ckpt-dir", required=True,
+                        help="WeNet checkpoint directory")
+    parser.add_argument("--audio-dir", required=True,
+                        help="Directory with .wav files")
     parser.add_argument(
         "--wfst-path", default=None,
         help="WFST directory (HLG.pt) or path to HLG.pt",
