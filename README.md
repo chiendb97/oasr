@@ -4,9 +4,21 @@ A high-performance open-source inference framework for ASR models built with C++
 
 ## Supported Models
 
-- **Conformer** - Convolution-augmented Transformer
-- **Paraformer** - Parallel Transformer for ASR
-- **Branchformer** - Branch-based Transformer
+| Model | Description | Status |
+|-------|-------------|--------|
+| **Conformer** | Convolution-augmented Transformer | ✅ |
+| **Paraformer** | Parallel Transformer for ASR | 🔲 Planned |
+| **Branchformer** | Branch-based Transformer | 🔲 Planned |
+| **Zipformer** | Zipformer encoder | 🔲 Planned |
+| **Transducer** | Transducer | 🔲 Planned |
+
+## Supported Decoders
+
+| Decoder | Description | Status |
+|---------|-------------|--------|
+| **CTC Prefix Beam Search (GPU)** | GPU-accelerated beam search | ✅ |
+| **CTC Prefix Beam Search (CPU)** | CPU prefix beam search | ✅ |
+| **CTC WFST Beam Search** | Weighted FST beam search (requires k2) | ✅ |
 
 ## Features
 
@@ -62,6 +74,7 @@ oasr/
 │   ├── decoder/               # Python wrappers: CtcGreedySearch, CtcPrefixBeamSearch, CtcWfstBeamSearch
 │   ├── cache/                 # Streaming cache manager (BlockPool, AttentionCacheManager, StreamContext)
 │   ├── models/conformer/      # Conformer model, config, weight conversion
+│   ├── engine/                # Inference engine (ASREngine, OfflineEngine, EngineConfig, Scheduler)
 │   └── utils/                 # Dtype mappings, timer
 ├── benchmarks/                # Performance benchmarks
 ├── tests/                     # Pytest test suite
@@ -202,6 +215,60 @@ from oasr.layers import LayerNorm, Linear, Conv1D
 norm = LayerNorm(hidden_size)
 linear = Linear(in_features, out_features)
 ```
+
+## Engine
+
+The `oasr.engine` subpackage provides a vLLM-inspired inference engine for Conformer-CTC models. It handles feature extraction, streaming chunk-by-chunk encoding with paged KV cache, CTC decoding, and detokenization in one unified interface.
+
+### Offline transcription
+
+```python
+from oasr.engine import OfflineEngine, EngineConfig
+
+engine = OfflineEngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))
+
+# Single file
+text = engine.transcribe("audio.wav")
+
+# Batch
+texts = engine.transcribe(["a.wav", "b.wav", "c.wav"])
+
+# Simulate streaming (chunk-by-chunk, no real-time constraint)
+text = engine.transcribe_streaming("audio.wav", chunk_size=16)
+```
+
+### Streaming transcription (multi-request)
+
+```python
+from oasr.engine import ASREngine, EngineConfig
+
+engine = ASREngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))
+
+# Convenience: add requests and run to completion
+texts = engine.transcribe(["a.wav", "b.wav", "c.wav"])
+
+# Explicit step loop for online serving
+rid = engine.add_request("audio.wav")
+results = engine.run()
+text = {r.request_id: r.text for r in results}[rid]
+```
+
+### EngineConfig
+
+Key parameters for `EngineConfig`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ckpt_dir` | `""` | WeNet-format checkpoint directory |
+| `device` | `"cuda"` | CUDA device string |
+| `dtype` | `torch.float16` | Model and cache precision |
+| `chunk_size` | `16` | Encoder output frames per streaming chunk |
+| `num_left_chunks` | `-1` | Past chunks to keep in attention cache (`-1` = unlimited) |
+| `max_batch_size` | `32` | Max concurrent streaming requests per step |
+| `decoder_type` | `"ctc_prefix_beam"` | One of `ctc_greedy`, `ctc_prefix_beam`, `ctc_gpu`, `ctc_wfst` |
+| `audio_scale` | `32768.0` | Scale factor applied before feature extraction (restores int16 range) |
+
+The checkpoint directory is expected to contain `final.pt`, `train.yaml`, `global_cmvn`, and optionally a SentencePiece `.model` file and `units.txt` vocabulary. These are auto-detected when `ckpt_dir` is set.
 
 ## Streaming Inference
 
