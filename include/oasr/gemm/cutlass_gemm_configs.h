@@ -5,6 +5,14 @@
 // Cutlass 2.x SM75/SM80/SM86/SM89 dispatch.
 // Cutlass 3.x SM90+/SM100+/SM120+ dispatch.
 //
+// SM90/SM120 scheduling follows Quack's GemmConfig convention:
+//   kPingpong=true  → KernelTmaWarpSpecializedPingpong
+//   kPingpong=false → KernelTmaWarpSpecializedCooperative
+//
+// SM100 scheduling uses kSMs (1 or 2) via SMTypeAdapter:
+//   kSMs=1 → KernelTmaWarpSpecialized1SmSm100
+//   kSMs=2 → KernelTmaWarpSpecialized2SmSm100
+//
 #pragma once
 
 #include <cassert>
@@ -81,10 +89,39 @@ struct CutlassGemmConfig {
 };
 
 //==============================================================================
-// CutlassGemmConfigSm90 -- CUTLASS 3.x GEMM configuration for SM90+
+// SM90 / SM120 schedule adapter — Quack-style pingpong / cooperative
 //==============================================================================
 
-template <int>
+/// Select SM90/SM120 epilogue and mainloop schedules based on kPingpong.
+///
+/// kPingpong=false → Cooperative warp-specialised WGMMA
+///   - Mainloop: KernelTmaWarpSpecializedCooperative
+///   - Epilogue: TmaWarpSpecializedCooperative
+///
+/// kPingpong=true → Pingpong warp-specialised WGMMA
+///   - Mainloop: KernelTmaWarpSpecializedPingpong
+///   - Epilogue: TmaWarpSpecialized  (pingpong uses the base TMA epilogue)
+template <bool kPingpong>
+struct Sm90ScheduleAdapter {
+    // kPingpong=false: cooperative schedule
+    using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
+    using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
+};
+
+template <>
+struct Sm90ScheduleAdapter<true> {
+    // kPingpong=true: pingpong schedule
+    // Note: pingpong uses TmaWarpSpecialized (base) for the epilogue, not a
+    // dedicated pingpong epilogue type — this matches CUTLASS 3.x examples.
+    using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized;
+    using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
+};
+
+//==============================================================================
+// SM100 schedule adapter — 1-SM / 2-SM co-operative
+//==============================================================================
+
+template <int kSMs>
 struct SMTypeAdapter;
 
 template <>
@@ -101,13 +138,52 @@ struct SMTypeAdapter<2> {
     using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmSm100;
 };
 
-template <int BM, int BN, int BK, int CM, int CN, int CK, int kSMs, int kStages, int kSmVersion>
-struct CutlassGemmConfigSm90 {
-    using TileShape = cute::Shape<cute::Int<BM * kSMs>, cute::Int<BN>, cute::Int<BK>>;
-    using ClusterShape = cute::Shape<cute::Int<CM>, cute::Int<CN>, cute::Int<CK>>;
-    using SmArch = typename CutlassArch<kSmVersion>::Type;
+//==============================================================================
+// GemmScheduleSelector — routes to the correct adapter per SM architecture
+//
+//   SM90  / SM120 → Sm90ScheduleAdapter<kPingpong>
+//   SM100         → SMTypeAdapter<kSMs>
+//==============================================================================
+
+template <int kSmVersion, int kSMs, bool kPingpong>
+struct GemmScheduleSelector {
+    // Default: SM90 and SM120 — pingpong or cooperative
+    using EpilogueSchedule = typename Sm90ScheduleAdapter<kPingpong>::EpilogueSchedule;
+    using MainloopSchedule = typename Sm90ScheduleAdapter<kPingpong>::MainloopSchedule;
+};
+
+template <int kSMs, bool kPingpong>
+struct GemmScheduleSelector<100, kSMs, kPingpong> {
+    // SM100: 1-SM or 2-SM co-operative scheduling
     using EpilogueSchedule = typename SMTypeAdapter<kSMs>::EpilogueSchedule;
     using MainloopSchedule = typename SMTypeAdapter<kSMs>::MainloopSchedule;
+};
+
+//==============================================================================
+// CutlassGemmConfigSm90 — CUTLASS 3.x GEMM configuration for SM90+
+//
+// Template parameters (Quack-aligned):
+//   BM, BN, BK         — tile dimensions
+//   CM, CN             — cluster dimensions (CK is always 1)
+//   kSMs               — number of co-operative SMs (1 or 2, SM100 only)
+//   kStages            — pipeline stages
+//   kSmVersion         — SM version: 90, 100, or 120
+//   kPingpong          — True → Pingpong schedule (SM90/SM120 only)
+//==============================================================================
+
+template <int BM, int BN, int BK, int CM, int CN, int kSMs, int kStages, int kSmVersion,
+          bool kPingpong = false>
+struct CutlassGemmConfigSm90 {
+    // TileShape: for SM100 with kSMs=2 the tile M dimension is doubled so that
+    // both SMs together cover BM*2 rows.  For SM90/SM120 kSMs=1 so no scaling.
+    using TileShape = cute::Shape<cute::Int<BM * kSMs>, cute::Int<BN>, cute::Int<BK>>;
+    using ClusterShape = cute::Shape<cute::Int<CM>, cute::Int<CN>, cute::Int<1>>;
+    using SmArch = typename CutlassArch<kSmVersion>::Type;
+
+    using _ScheduleSelector = GemmScheduleSelector<kSmVersion, kSMs, kPingpong>;
+    using EpilogueSchedule = typename _ScheduleSelector::EpilogueSchedule;
+    using MainloopSchedule = typename _ScheduleSelector::MainloopSchedule;
+
     static constexpr int Stages = kStages;
 };
 

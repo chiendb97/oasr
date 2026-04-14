@@ -47,13 +47,20 @@ struct CutlassConv2dConfig {
     static constexpr int NumStages = kStages;
 };
 
-template <int BM, int BN, int BK, int CM, int CN, int CK, int kSMs, int kStages, int kSmVersion>
+template <int BM, int BN, int BK, int CM, int CN, int kSMs, int kStages, int kSmVersion,
+          bool kPingpong = false>
 struct CutlassConv2dConfigSm90 {
+    // TileShape: for SM100 with kSMs=2 the tile M dimension is doubled so that
+    // both SMs together cover BM*2 rows.  For SM90/SM120 kSMs=1 so no scaling.
     using TileShape = cute::Shape<cute::Int<BM * kSMs>, cute::Int<BN>, cute::Int<BK>>;
-    using ClusterShape = cute::Shape<cute::Int<CM>, cute::Int<CN>, cute::Int<CK>>;
+    // CK is always 1 for implicit-GEMM convolution.
+    using ClusterShape = cute::Shape<cute::Int<CM>, cute::Int<CN>, cute::Int<1>>;
     using SmArch = typename gemm::CutlassArch<kSmVersion>::Type;
-    using EpilogueSchedule = typename gemm::SMTypeAdapter<kSMs>::EpilogueSchedule;
-    using MainloopSchedule = typename gemm::SMTypeAdapter<kSMs>::MainloopSchedule;
+
+    using _ScheduleSelector = gemm::GemmScheduleSelector<kSmVersion, kSMs, kPingpong>;
+    using EpilogueSchedule = typename _ScheduleSelector::EpilogueSchedule;
+    using MainloopSchedule = typename _ScheduleSelector::MainloopSchedule;
+
     static constexpr int Stages = kStages;
 };
 

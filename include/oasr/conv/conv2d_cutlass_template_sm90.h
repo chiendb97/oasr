@@ -74,8 +74,8 @@ struct CutlassConv2dFpropKernelSm90 {
     using TileShape = typename CutlassConv2dConfig::TileShape;
     using ClusterShape = typename CutlassConv2dConfig::ClusterShape;
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
-    using KernelSchedule = cutlass::conv::collective::KernelScheduleAuto;
-    using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+    using KernelSchedule = typename CutlassConv2dConfig::MainloopSchedule;
+    using EpilogueSchedule = typename CutlassConv2dConfig::EpilogueSchedule;
 
     // 2D conv fprop problem shape
     using ProblemShape = cutlass::conv::ConvProblemShape<cutlass::conv::Operator::kFprop, 2>;

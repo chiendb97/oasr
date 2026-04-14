@@ -131,7 +131,7 @@ struct CutlassBmmKernel {
                                                      ElementComputeEpilogue, ElementComputeEpilogue,
                                                      cutlass::epilogue::thread::ScaleType::Default>;
 
-    static constexpr int NumStages = CutlassGemmConfig::NumStages;
+    static constexpr int NumStages = CutlassGemmConfig::Stages;
 
     using Gemm = cutlass::gemm::device::GemmBatched<
         ElementA, LayoutA, ElementB, LayoutB, ElementCD, LayoutCD, ElementAccumulator, MMAOp,
@@ -245,7 +245,7 @@ struct CutlassGroupGemmKernel {
         cutlass::epilogue::thread::LinearCombination<ElementCD, AlignmentEpilogue,
                                                      ElementAccumulator, ElementAccumulator>;
 
-    static constexpr int NumStages = CutlassGemmConfig::NumStages;
+    static constexpr int NumStages = CutlassGemmConfig::Stages;
 
     using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
         ElementA, LayoutA, cutlass::ComplexTransform::kNone, AlignmentA, ElementB, LayoutB,
