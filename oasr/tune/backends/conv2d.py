@@ -6,6 +6,9 @@ All CUTLASS tile variants are pre-compiled into a single shared library by
 the JIT layer (``oasr.jit.conv``).  The autotuner selects which pre-compiled
 variant to call — no JIT compilation is triggered during tuning.
 
+Conv2D has no runtime-only parameters (no split-K), so the full autotune set
+and the compile set are identical (``name == compile_name``).
+
 cuDNN backends are also registered as additional candidates.
 """
 
@@ -18,17 +21,18 @@ from oasr.jit.conv import (
     CutlassConv2dConfig,
     CutlassConv2dConfigSm90,
     CONV2D_DEFAULT,
-    CONV2D_DEFAULT_SM90,
-    CONV2D_TILE_CONFIGS,
-    CONV2D_TILE_CONFIGS_SM90,
-    CONV2D_CLUSTER_CONFIGS_SM90,
+    get_all_conv2d_autotune_configs,
     conv2d_func_name,
     conv2d_activation_func_name,
-    _get_unique_conv2d_compile_configs,
 )
 from oasr.jit.core import _get_target_sm
 
 logger = logging.getLogger("oasr.tune")
+
+_sm = _get_target_sm()
+
+# Full set — keyed by name (== compile_name for conv2d); used for tactic registration.
+_all_autotune_configs = get_all_conv2d_autotune_configs(_sm)
 
 
 # ---------------------------------------------------------------------------
@@ -91,13 +95,9 @@ def _make_conv2d_activation_runner(cfg: Union[CutlassConv2dConfig, CutlassConv2d
 # Registration: CUTLASS tile variants for conv2d and conv2d_activation
 # ---------------------------------------------------------------------------
 
-_sm = _get_target_sm()
-_all_configs = _get_unique_conv2d_compile_configs(_sm)
-_default_cfg = CONV2D_DEFAULT_SM90 if _sm >= 90 else CONV2D_DEFAULT
-
-for _cfg in _all_configs.values():
+for _cfg in _all_autotune_configs.values():
     _tactic = Tactic("cutlass", config=_cfg.to_tactic_config())
-    _is_default = (_cfg.compile_name == _default_cfg.compile_name)
+    _is_default = (_cfg.compile_name == CONV2D_DEFAULT.compile_name)
 
     _global_registry.register(
         OpKey("conv", "conv2d"),
