@@ -52,7 +52,7 @@ pip install "oasr[wfst]"   # installs k2 and kaldilm
 
 ```bash
 # BPE (e.g. LibriSpeech WeNet/ESPnet model)
-bash scripts/run_hlg.sh \
+bash scripts/lang/run_hlg.sh \
     --token-type bpe \
     --am-dir /path/to/am \
     --text   train-clean-100/text train-clean-360/text train-other-500/text \
@@ -60,13 +60,13 @@ bash scripts/run_hlg.sh \
     --lm-dir   data/lm
 
 # Character-based
-bash scripts/run_hlg.sh \
+bash scripts/lang/run_hlg.sh \
     --token-type char \
     --lang-dir data/lang_char \
     --lm-dir   data/lm
 
 # Phone-based
-bash scripts/run_hlg.sh \
+bash scripts/lang/run_hlg.sh \
     --token-type phone \
     --lang-dir data/lang_phone \
     --lm-dir   data/lm \
@@ -76,19 +76,19 @@ bash scripts/run_hlg.sh \
 **Resume from a stage** (outputs of earlier stages are reused):
 
 ```bash
-bash scripts/run_hlg.sh ... --stage 3
+bash scripts/lang/run_hlg.sh ... --stage 3
 ```
 
 **Run only one stage**:
 
 ```bash
-bash scripts/run_hlg.sh ... --stage 4 --stop-stage 4
+bash scripts/lang/run_hlg.sh ... --stage 4 --stop-stage 4
 ```
 
 **Force recomputation** even if outputs already exist:
 
 ```bash
-bash scripts/run_hlg.sh ... --overwrite
+bash scripts/lang/run_hlg.sh ... --overwrite
 ```
 
 | Option | Default | Description |
@@ -122,7 +122,7 @@ The lang directory must contain:
 - `words.txt` — word symbol table (`word id` per line)
 
 ```bash
-python scripts/prepare_char.py --lang-dir data/lang_char
+python scripts/lang/prepare_char.py --lang-dir data/lang_char
 ```
 
 Outputs written to `data/lang_char/`:
@@ -135,7 +135,7 @@ Outputs written to `data/lang_char/`:
 #### Step 2 — Train an n-gram language model
 
 ```bash
-python scripts/make_kn_lm.py \
+python scripts/lang/make_kn_lm.py \
     -ngram-order 3 \
     -text data/lang_char/text \
     -lm data/lm/G_3_gram.arpa
@@ -158,7 +158,7 @@ python -m kaldilm \
 #### Step 4 — Compile HLG
 
 ```bash
-python scripts/compile_hlg.py \
+python scripts/lang/compile_hlg.py \
     --lang-dir data/lang_char \
     --lm G_3_gram \
     --lm-dir data/lm
@@ -179,7 +179,7 @@ unigram vocabulary (e.g. `train_960_unigram5000.model`).
 #### Step 1 — Build the word symbol table
 
 ```bash
-python scripts/prepare_words.py \
+python scripts/lang/prepare_words.py \
     --text train-clean-100/text train-clean-360/text train-other-500/text \
     --lang-dir data/lang_bpe
 ```
@@ -192,7 +192,7 @@ Input text files must contain one sentence per line with space-separated words
 ```bash
 AM=/path/to/20210610_u2pp_conformer_exp_librispeech
 
-python scripts/prepare_bpe.py \
+python scripts/lang/prepare_bpe.py \
     --lang-dir data/lang_bpe \
     --bpe-model $AM/train_960_unigram5000.model \
     --units-file $AM/units.txt
@@ -208,7 +208,7 @@ Outputs written to `data/lang_bpe/`:
 #### Step 3 — Train an n-gram language model
 
 ```bash
-python scripts/make_kn_lm.py \
+python scripts/lang/make_kn_lm.py \
     -ngram-order 3 \
     -text train-clean-100/text train-clean-360/text train-other-500/text \
     -lm data/lm/G_3_gram.arpa
@@ -227,7 +227,7 @@ python -m kaldilm \
 #### Step 5 — Compile HLG
 
 ```bash
-python scripts/compile_hlg.py \
+python scripts/lang/compile_hlg.py \
     --lang-dir data/lang_bpe \
     --lm G_3_gram \
     --lm-dir data/lm
@@ -256,7 +256,7 @@ Replace step 1 with `prepare_lang.py`, which reads a `lexicon.txt` with phone pr
 (e.g., `hello HH AH L OW`) and models inter-word silence:
 
 ```bash
-python scripts/prepare_lang.py \
+python scripts/lang/prepare_lang.py \
     --lang-dir data/lang_phone \
     --sil-token SIL \
     --sil-prob 0.5
