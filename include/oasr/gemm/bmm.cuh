@@ -65,7 +65,9 @@ static GemmStatus dispatchBmmWithSmVersion(const ElementA* A_ptr, const ElementB
         using Config = CutlassGemmConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 100>;
         return CutlassBmmKernel<Config, ElementA, ElementB, ElementCD>::run(A_ptr, B_ptr, D_ptr, batch_size, M, N, K, lda, ldb, ldd, stride_a, stride_b, stride_d, alpha, beta, stream);
     } else if constexpr (SM_VERSION == 120) {
-        using Config = CutlassGemmConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 120>;
+        // SM120 TMA warp-specialised builder supports only F8/F6/F4 MMA; fall
+        // back to the CUTLASS 2.x path (Sm80 tensor op is forward-compatible).
+        using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 120>;
         return CutlassBmmKernel<Config, ElementA, ElementB, ElementCD>::run(A_ptr, B_ptr, D_ptr, batch_size, M, N, K, lda, ldb, ldd, stride_a, stride_b, stride_d, alpha, beta, stream);
     } else {
         return GemmStatus::INVALID_ARGUMENT;

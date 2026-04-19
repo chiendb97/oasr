@@ -16,7 +16,10 @@
 #include "oasr/common/types.h"
 #include "oasr/gemm/cutlass_gemm_configs.h"
 #include "oasr/gemm/gemm_cutlass_template.h"
-#if !defined(OASR_TARGET_SM) || OASR_TARGET_SM >= 90
+// SM120 (GeForce Blackwell / RTX 50) falls back to the CUTLASS 2.x path for
+// FP16/BF16, so it does NOT need the SM90+ template.  Only pull it in when
+// we're either in AOT mode (no OASR_TARGET_SM) or JIT-targeting SM90 / SM100.
+#if !defined(OASR_TARGET_SM) || OASR_TARGET_SM == 90 || OASR_TARGET_SM == 100
 #include "oasr/gemm/gemm_cutlass_template_sm90.h"
 #endif
 
@@ -47,17 +50,19 @@ static GemmStatus dispatchGemmWithSmVersion(const ElementA* A_ptr, const Element
     } else if constexpr (SM_VERSION == 89) {
         using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 89>;
         return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
-#if !defined(OASR_TARGET_SM) || OASR_TARGET_SM >= 90
+#if !defined(OASR_TARGET_SM) || OASR_TARGET_SM == 90 || OASR_TARGET_SM == 100
     } else if constexpr (SM_VERSION == 90) {
         using Config = CutlassGemmConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 90>;
         return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
     } else if constexpr (SM_VERSION == 100) {
         using Config = CutlassGemmConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 100>;
         return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
-    } else if constexpr (SM_VERSION == 120) {
-        using Config = CutlassGemmConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 120>;
-        return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
 #endif
+    } else if constexpr (SM_VERSION == 120) {
+        // SM120 TMA warp-specialised builder supports only F8/F6/F4 MMA; fall
+        // back to the CUTLASS 2.x path (Sm80 tensor op is forward-compatible).
+        using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 120>;
+        return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
     } else {
         return GemmStatus::INVALID_ARGUMENT;
     }

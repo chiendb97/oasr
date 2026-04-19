@@ -72,9 +72,16 @@ struct CutlassArch<100> {
     using Type = cutlass::arch::Sm100;
 };
 
+// SM120 (GeForce Blackwell / RTX 50 series) note:
+//   The CUTLASS 3.x SM120 CollectiveBuilder for OpClassTensorOp is restricted to
+//   F8/F6/F4 MMA only — it does NOT support FP16/BF16 GEMM.  For FP16/BF16 we
+//   instead drive SM120 through the CUTLASS 2.x path, whose SM80 tensor-op
+//   specialisations (mma.sync.aligned.m16n8k16) are forward-compatible with
+//   SM120 hardware.  So CutlassArch<120> intentionally aliases to Sm80.
 template <>
 struct CutlassArch<120> {
-    using Type = cutlass::arch::Sm120;
+    using Type = cutlass::arch::Sm80;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
 };
 
 template <int BM, int BN, int BK, int WM, int WN, int WK, int kStages, int kSmVersion>

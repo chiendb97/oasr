@@ -110,7 +110,10 @@ void ctc_beam_search_init_state(TensorView state_buffer,
 void ctc_beam_search_step(TensorView state_buffer, TensorView log_prob_frame,
                           int64_t beam, int64_t blank_id,
                           int64_t step, double blank_threshold,
-                          int64_t actual_frame_index) {
+                          int64_t actual_frame_index,
+                          int64_t batch, int64_t vocab_size,
+                          int64_t max_seq_len, int64_t use_paged_memory,
+                          int64_t page_size) {
   CHECK_INPUT(state_buffer);
   CHECK_INPUT(log_prob_frame);
   CHECK_DIM(2, log_prob_frame);
@@ -131,6 +134,10 @@ void ctc_beam_search_step(TensorView state_buffer, TensorView log_prob_frame,
       static_cast<int>(step),
       static_cast<int>(blank_id), -1, // space_id = -1
       static_cast<int>(actual_frame_index),
+      static_cast<int>(batch), static_cast<int>(beam),
+      static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
+      static_cast<int>(use_paged_memory), static_cast<int>(page_size),
+      0,  // num_pages=0 → auto
       stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
@@ -243,7 +250,9 @@ void ctc_beam_search_init_state_paged(TensorView state_buffer,
 
 void ctc_beam_search_read_state(TensorView out_tokens, TensorView out_lengths,
                                 TensorView out_scores, TensorView state_buffer,
-                                int64_t step) {
+                                int64_t step, int64_t batch, int64_t beam,
+                                int64_t vocab_size, int64_t max_seq_len,
+                                int64_t use_paged_memory, int64_t page_size) {
   CHECK_INPUT(out_tokens);
   CHECK_INPUT(out_lengths);
   CHECK_INPUT(out_scores);
@@ -255,23 +264,17 @@ void ctc_beam_search_read_state(TensorView out_tokens, TensorView out_lengths,
   int max_out_len = out_tokens.size(2);
   cudaStream_t stream = get_stream(state_buffer.device());
 
-  // Read state header, update current_step (used for parity), write back to GPU.
-  ctc_decoder::StreamingState state;
-  cudaMemcpyAsync(&state, state_buffer.data_ptr(), sizeof(ctc_decoder::StreamingState),
-                  cudaMemcpyDeviceToHost, stream);
-  cudaStreamSynchronize(stream);
-  state.current_step = static_cast<int>(step);
-  // Write the updated header back so read_streaming_results sees the correct step.
-  cudaMemcpyAsync(state_buffer.data_ptr(), &state, sizeof(ctc_decoder::StreamingState),
-                  cudaMemcpyHostToDevice, stream);
-  cudaStreamSynchronize(stream);
-
   cudaError_t status = ctc_decoder::read_streaming_results(
       state_buffer.data_ptr(),
       static_cast<int*>(out_tokens.data_ptr()),
       static_cast<int*>(out_lengths.data_ptr()),
       static_cast<float*>(out_scores.data_ptr()),
-      max_out_len, stream);
+      max_out_len, static_cast<int>(step),
+      static_cast<int>(batch), static_cast<int>(beam),
+      static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
+      static_cast<int>(use_paged_memory), static_cast<int>(page_size),
+      0,  // num_pages=0 → auto
+      stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "CTC beam search read state failed: " << cudaGetErrorString(status);
