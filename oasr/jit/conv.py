@@ -226,29 +226,15 @@ def _get_sm100_conv2d_configs(sm: int) -> Dict[str, CutlassConv2dConfigSm90]:
     return seen
 
 
-def _get_sm120_conv2d_configs(sm: int) -> Dict[str, CutlassConv2dConfigSm90]:
-    """SM120 configs following GEMM's ``_get_sm120_configs()`` pattern."""
-    tile_k = 128
-    kStages = 3
+def _get_sm120_conv2d_configs(sm: int) -> Dict[str, CutlassConv2dConfig]:
+    """SM120 (GeForce Blackwell / RTX 50 series) Conv2D configs.
 
-    tile_mn_coop = [(128, 128), (128, 64), (64, 128), (128, 160), (128, 192)]
-    tile_mn_pingpong = [(128, 128), (128, 64), (64, 128), (128, 160)]
-    tile_mn_vals = (
-        [(m, n, False) for m, n in tile_mn_coop] +
-        [(m, n, True) for m, n in tile_mn_pingpong]
-    )
-
-    seen: Dict[str, CutlassConv2dConfigSm90] = {}
-    for tile_m, tile_n, pingpong in tile_mn_vals:
-        cfg = CutlassConv2dConfigSm90(
-            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            cluster_m=1, cluster_n=1,
-            pingpong=pingpong, kSMs=1, kStages=kStages, kSmVersion=sm,
-        )
-        key = cfg.compile_name
-        if key not in seen:
-            seen[key] = cfg
-    return seen
+    The CUTLASS 3.x SM120 CollectiveBuilder supports only F8/F6/F4 MMA, so
+    FP16/BF16 Conv2D on SM120 is routed through the CUTLASS 2.x tensor-op path
+    using the Sm80 forward-compatible instructions (mma.sync.aligned.m16n8k16).
+    Mirrors GEMM's ``_get_sm120_configs()``.
+    """
+    return _build_sm_lt90_conv2d_configs(sm, TileShapeConfigs, [3], _SM_MAX_SMEM_BYTES[120])
 
 
 def get_all_conv2d_autotune_configs(
@@ -293,7 +279,9 @@ def get_unique_conv2d_compile_configs(
 
 _sm = _get_target_sm()
 
-if _sm < 90:
+if _sm < 90 or _sm == 120:
+    # SM120 uses the CUTLASS 2.x (SM<90) path for FP16/BF16 — see
+    # ``_get_sm120_conv2d_configs`` above.
     CONV2D_DEFAULT: Union[CutlassConv2dConfig, CutlassConv2dConfigSm90] = CutlassConv2dConfig(
         block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=64, warp_k=64,
         kStages=3, kSmVersion=_sm,
@@ -339,7 +327,7 @@ def _render_all_conv2d_variants() -> List:
         func_name = f"conv2d_{config_name}"
         variant_file_name = f"conv2d_sm{sm}_{config_name}"
 
-        if sm in [75, 80, 86, 89]:
+        if sm in [75, 80, 86, 89, 120]:
             rendered = render_template(
                 "conv2d_cutlass_template.cu.jinja",
                 op_name=variant_file_name,

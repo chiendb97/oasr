@@ -245,6 +245,11 @@ _SM_MAX_SMEM_BYTES: Dict[int, int] = {
     80: 164 * 1024,   # Ampere A100
     86: 100 * 1024,   # Ampere RTX 30-series
     89: 100 * 1024,   # Ada Lovelace
+    # SM120 (GeForce Blackwell / RTX 50 series) — CUTLASS 3.x SM120 TMA builder
+    # is F8F6F4-only, so FP16/BF16 GEMM on SM120 falls back to the CUTLASS 2.x
+    # path using the Sm80 tensor-op specialisations (see CutlassArch<120>).
+    # Use the Sm80 shared-memory budget for stage calculations.
+    120: 100 * 1024,
 }
 
 
@@ -416,43 +421,14 @@ def _get_sm100_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
     return seen
 
 
-def _get_sm120_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
-    """SM120 (GeForce Blackwell) configs following Quack's ``_get_sm120_configs()`` pattern.
+def _get_sm120_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
+    """SM120 (GeForce Blackwell / RTX 50 series) configs.
 
-    Uses warp-level MMA (similar to SM90 but with warp-level MMA instead of
-    WGMMA). Cluster is always 1×1. Both Cooperative and Pingpong variants.
+    The CUTLASS 3.x SM120 CollectiveBuilder supports only F8/F6/F4 MMA, so
+    FP16/BF16 GEMM on SM120 is routed through the CUTLASS 2.x tensor-op path
+    using the Sm80 forward-compatible instructions (mma.sync.aligned.m16n8k16).
     """
-    tile_k = 128
-    kStages = 3
-
-    tile_mn_coop = [(128, 128), (128, 64), (64, 128), (128, 160), (128, 192)]
-    tile_mn_pingpong = [(128, 128), (128, 64), (64, 128), (128, 160)]
-    tile_mn_vals = (
-        [(m, n, False) for m, n in tile_mn_coop] +
-        [(m, n, True) for m, n in tile_mn_pingpong]
-    )
-
-    seen: Dict[str, CutlassGemmConfigSm90] = {}
-    for tile_m, tile_n, pingpong in tile_mn_vals:
-        cfg = CutlassGemmConfigSm90(
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            cluster_m=1,
-            cluster_n=1,
-            pingpong=pingpong,
-            is_dynamic_persistent=True,
-            swap_ab=False,
-            max_swizzle_size=8,
-            use_tma_gather=False,
-            kSMs=1,
-            kStages=kStages,
-            kSmVersion=sm,
-        )
-        key = cfg.compile_name
-        if key not in seen:
-            seen[key] = cfg
-    return seen
+    return _build_sm_lt90_configs(sm, TileShapeConfigs, [3], [1, 2, 4], _SM_MAX_SMEM_BYTES[120])
 
 
 def get_all_autotune_configs(
@@ -534,7 +510,7 @@ def _render_all_variants(
         func_name = f"{family}_{config_name}"
         variant_file_name = f"{family}_sm{sm}_{config_name}"
 
-        if sm in [75, 80, 86, 89]:
+        if sm in [75, 80, 86, 89, 120]:
             rendered = render_template(
                 template_name,
                 op_name=variant_file_name,
@@ -650,7 +626,9 @@ def group_gemm_func_name(cfg: Union[CutlassGemmConfig, CutlassGemmConfigSm90]) -
 
 _sm = _get_target_sm()
 
-if _sm < 90:
+if _sm < 90 or _sm == 120:
+    # SM120 uses the CUTLASS 2.x (SM<90) path for FP16/BF16 — see
+    # ``_get_sm120_configs`` above.
     GEMM_DEFAULT: Union[CutlassGemmConfig, CutlassGemmConfigSm90] = CutlassGemmConfig(
         block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=64, warp_k=64, kStages=3, kSmVersion=_sm
     )
