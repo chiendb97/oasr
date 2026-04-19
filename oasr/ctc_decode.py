@@ -505,6 +505,10 @@ class GpuStreamingDecoder:
         mod_step = self._mod.ctc_beam_search_step
         step = s.step
         frame_idx = s.actual_frame_idx
+        batch = s.batch
+        vocab_size = s.vocab_size
+        use_paged = 1 if cfg.use_paged_memory else 0
+        page_size = cfg.page_size
 
         for t in range(chunk_t):
             if step >= max_step:
@@ -516,11 +520,14 @@ class GpuStreamingDecoder:
             # The C++ launcher reads batch_stride / vocab_stride from the
             # DLPack strides, so a non-contiguous view is perfectly fine
             # and avoids a per-frame cudaMemcpy that .contiguous() incurs.
+            # Passing the known dimensions lets the launcher skip a blocking
+            # GPU→CPU read of the state header on every step.
             mod_step(
                 state_buf, log_prob[:, t, :],
                 beam, blank_id,
                 step, blank_threshold,
                 frame_idx,
+                batch, vocab_size, max_step, use_paged, page_size,
             )
             step += 1
             frame_idx += 1
@@ -557,9 +564,12 @@ class GpuStreamingDecoder:
         out_scores = torch.empty(
             batch, cfg.beam_size, dtype=torch.float32, device=device)
 
+        use_paged = 1 if cfg.use_paged_memory else 0
         self._mod.ctc_beam_search_read_state(
             out_tokens, out_lengths, out_scores,
-            s.buffer, s.step)
+            s.buffer, s.step,
+            batch, cfg.beam_size, s.vocab_size, cfg.max_seq_len,
+            use_paged, cfg.page_size)
 
         tokens = _extract_tokens(out_tokens, out_lengths, batch, cfg.beam_size)
         return GpuDecoderResult(tokens=tokens, lengths=out_lengths, scores=out_scores)

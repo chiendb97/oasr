@@ -22,10 +22,15 @@ void ctc_beam_search_init_state(TensorView state_buffer,
 void ctc_beam_search_step(TensorView state_buffer, TensorView log_prob_frame,
                           int64_t beam, int64_t blank_id,
                           int64_t step, double blank_threshold,
-                          int64_t actual_frame_index);
+                          int64_t actual_frame_index,
+                          int64_t batch, int64_t vocab_size,
+                          int64_t max_seq_len, int64_t use_paged_memory,
+                          int64_t page_size);
 void ctc_beam_search_read_state(TensorView out_tokens, TensorView out_lengths,
                                 TensorView out_scores, TensorView state_buffer,
-                                int64_t step);
+                                int64_t step, int64_t batch, int64_t beam,
+                                int64_t vocab_size, int64_t max_seq_len,
+                                int64_t use_paged_memory, int64_t page_size);
 
 // Paged variants
 int64_t ctc_decoder_paged_workspace_size(int64_t batch, int64_t beam,
