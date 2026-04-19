@@ -428,7 +428,7 @@ def _get_sm120_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
     FP16/BF16 GEMM on SM120 is routed through the CUTLASS 2.x tensor-op path
     using the Sm80 forward-compatible instructions (mma.sync.aligned.m16n8k16).
     """
-    return _build_sm_lt90_configs(sm, TileShapeConfigs, [3], [1, 2, 4], _SM_MAX_SMEM_BYTES[120])
+    return _build_sm_lt90_configs(sm, TileShapeConfigs, [3, 4], [1, 2, 4], _SM_MAX_SMEM_BYTES[120])
 
 
 def get_all_autotune_configs(
