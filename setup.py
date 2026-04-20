@@ -32,9 +32,8 @@ def _find_k2_cmake_dir():
     """Return the directory containing k2Config.cmake.
 
     Search order:
-    1. Submodule install at 3rdparty/k2_install (built from the bundled submodule).
-    2. System-wide install at /usr/local/share/cmake/k2.
-    3. pip package in site-packages (fallback for environments without submodule build).
+    1. System-wide install at /usr/local/share/cmake/k2.
+    2. pip package in site-packages (fallback for environments without submodule build).
     """
     import glob
     import sysconfig as _sc
@@ -43,9 +42,10 @@ def _find_k2_cmake_dir():
     here = os.path.dirname(os.path.abspath(__file__))
 
     # 1. System-wide install (e.g. /usr/local/share/cmake/k2).
-    system_cmake = "/usr/local/share/cmake/k2"
-    if os.path.isfile(os.path.join(system_cmake, "k2Config.cmake")):
-        return system_cmake
+    system_cmakes = ["/usr/local/share/cmake/k2", "/opt/k2-install/share/cmake/k2"]
+    for system_cmake in system_cmakes:
+        if os.path.isfile(os.path.join(system_cmake, "k2Config.cmake")):
+            return system_cmake
 
     # 2. pip package layout in site-packages.
     site_dirs = []

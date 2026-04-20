@@ -1,44 +1,47 @@
+# syntax=docker/dockerfile:1
 # ---------------------------------------------------------------------------
-# Stage 1 – build k2
+# Multi-stage Dockerfile for OASR
+# Build with: docker build -f docker/Dockerfile -t oasr .
 # ---------------------------------------------------------------------------
-FROM nvcr.io/nvidia/pytorch:26.03-py3 AS k2-builder
+
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.03-py3
+
+# ---------------------------------------------------------------------------
+# Stage 1 – torch base (shared by builder and runtime to ensure ABI parity)
+# ---------------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS torch-base
+
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/nightly/cu132
+
+RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    TORCH_INDEX_URL=${TORCH_INDEX_URL} \
+    bash /opt/docker/common/install.sh --pytorch
+
+# ---------------------------------------------------------------------------
+# Stage 2 – build base (torch-base + build tools + build-time Python deps)
+# ---------------------------------------------------------------------------
+FROM torch-base AS build-base
+
+RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    bash /opt/docker/common/install.sh --build_deps
+
+# ---------------------------------------------------------------------------
+# Stage 3 – build k2
+# ---------------------------------------------------------------------------
+FROM build-base AS k2-builder
 
 ARG K2_REPO=https://github.com/chiendb97/k2.git
 ARG K2_BRANCH=feat/cuda13
 
-# Build tools (only needed in this stage)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git \
-        cmake \
-        ninja-build \
-    && rm -rf /var/lib/apt/lists/*
-
-# Clone k2 source
-RUN git clone --branch "${K2_BRANCH}" --depth 1 "${K2_REPO}" /opt/k2-src
-
-# Configure k2
-# Install to /opt/k2-install (a dedicated prefix kept isolated from /usr/local).
-# C++17 is required for kaldifeat compatibility with recent PyTorch.
-# Tests and benchmarks are disabled to keep the layer small.
-RUN cmake -S /opt/k2-src -B /opt/k2-src/build \
-        -GNinja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX=/opt/k2-install \
-        -DCMAKE_CXX_STANDARD=17 \
-        -DK2_ENABLE_TESTS=OFF \
-        -DK2_ENABLE_BENCHMARK=OFF \
-        -DPYTHON_EXECUTABLE="$(which python3)"
-
-# Build and install
-RUN cmake --build /opt/k2-src/build --target install
-
-# Drop the build directory; keep the source for internal headers.
-RUN rm -rf /opt/k2-src/build
+RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    K2_REPO=${K2_REPO} \
+    K2_BRANCH=${K2_BRANCH} \
+    bash /opt/docker/common/install.sh --k2
 
 # ---------------------------------------------------------------------------
-# Stage 2 – runtime image
+# Stage 4 – runtime image
 # ---------------------------------------------------------------------------
-FROM nvcr.io/nvidia/pytorch:26.03-py3 AS runtime
+FROM torch-base AS runtime
 
 # Copy k2 install tree into /usr/local so CMake's default search path finds it:
 #   /usr/local/include/k2/torch_api.h
@@ -50,15 +53,10 @@ COPY --from=k2-builder /opt/k2-install/ /usr/local/
 #   k2/csrc/intersect_dense_pruned.h, k2/torch/csrc/{fsa_class,decode,...}.h
 COPY --from=k2-builder /opt/k2-src /opt/k2-src
 
+ENV K2_SOURCE_DIR=/opt/k2-src
+
 # Refresh the linker cache so libk2_*.so are found at runtime
 RUN ldconfig
-
-# OASR Python runtime / build deps
-RUN pip install --no-cache-dir \
-        apache-tvm-ffi \
-        pybind11 \
-        jinja2 \
-        numpy
 
 # Copy OASR source (see .dockerignore for exclusions)
 WORKDIR /workspace/oasr
@@ -74,11 +72,5 @@ COPY . .
 RUN OASR_USE_K2=1 \
     K2_SOURCE_DIR=/opt/k2-src \
     pip install --no-build-isolation -e .
-
-# ---------------------------------------------------------------------------
-# Runtime environment
-# ---------------------------------------------------------------------------
-# Expose K2_SOURCE_DIR so downstream processes can reference the source tree
-ENV K2_SOURCE_DIR=/opt/k2-src
 
 CMD ["/bin/bash"]
