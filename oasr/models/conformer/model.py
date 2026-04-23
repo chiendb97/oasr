@@ -671,6 +671,7 @@ class ConformerEncoder(nn.Module):
         att_caches: List[PagedKVCache],
         cnn_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
         att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
+        cache_t1: int = -1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward one chunk using paged KV cache.
 
@@ -696,6 +697,13 @@ class ConformerEncoder(nn.Module):
         att_mask : Tensor
             Additive attention bias ``(1, chunk_size, attention_key_size)``.
             A ``(0,0,0)`` placeholder is replaced internally by a zero mask.
+        cache_t1 : int
+            Number of frames already in the KV cache, as a host-side int.
+            When non-negative, skips the ``cache_seqlens[0].item()`` D2H
+            sync — the scheduler already tracks this via
+            ``AttentionCacheState.num_committed_frames``.  Passing ``-1``
+            (the legacy default) falls back to reading from the GPU tensor
+            for callers that don't track cache length on the host.
 
         Returns
         -------
@@ -713,7 +721,8 @@ class ConformerEncoder(nn.Module):
         xs, pos_emb, _ = self.embed(xs, tmp_masks, offset)
 
         chunk_size = xs.size(1)
-        cache_t1 = int(att_caches[0].cache_seqlens[0].item())
+        if cache_t1 < 0:
+            cache_t1 = int(att_caches[0].cache_seqlens[0].item())
         attention_key_size = cache_t1 + chunk_size
 
         if att_mask.size(-1) == 0 and attention_key_size > 0:
@@ -850,6 +859,7 @@ class ConformerModel(nn.Module):
         att_caches: List[PagedKVCache],
         cnn_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
         att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
+        cache_t1: int = -1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward one chunk with paged KV cache; returns ``(probs, r_cnn_cache)``.
 
@@ -857,7 +867,7 @@ class ConformerModel(nn.Module):
         return-value documentation.
         """
         hidden_states, r_cnn_cache = self.encoder.forward_chunk_paged(
-            input_features, offset, att_caches, cnn_cache, att_mask
+            input_features, offset, att_caches, cnn_cache, att_mask, cache_t1,
         )
         probs = self.ctc(hidden_states)
         return probs, r_cnn_cache

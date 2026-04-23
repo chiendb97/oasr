@@ -152,7 +152,15 @@ def _time_offline(
     batch_size: int,
     num_iters: int,
 ) -> tuple[float, float, float]:
-    """Time OfflineEngine over pre-loaded *waveforms* in batches.
+    """Time OfflineEngine over pre-loaded *waveforms*.
+
+    The full waveform list is handed to ``engine.transcribe`` in one call so
+    the engine's offline pipeline can overlap CPU feature prep for later
+    micro-batches with GPU forward+decode for earlier ones.  ``batch_size`` is
+    interpreted as the GPU forward micro-batch size and is forwarded to the
+    engine via ``offline_micro_batch_size``; processing the full list in one
+    call instead of chunking at the benchmark layer is what lets the
+    producer thread keep the GPU continuously fed.
 
     Audio must be loaded before calling this function so that file I/O is
     excluded from the timed region.
@@ -162,12 +170,9 @@ def _time_offline(
     (median_ms, std_ms, rtf)
     """
     total_duration = sum(durations)
-    batches = [waveforms[i: i + batch_size]
-               for i in range(0, len(waveforms), batch_size)]
 
     def _run_all():
-        for batch in batches:
-            engine.transcribe(batch)
+        engine.transcribe(waveforms)
 
     # Warmup
     _run_all()
@@ -311,6 +316,7 @@ def _run_config(
                 dtype=dtype,
                 decoder_type=decoder_type,
                 fst_path=fst_file,
+                offline_micro_batch_size=batch_size,
             )
             engine = OfflineEngine(cfg)
             shape_str = f"N={n}, batch={batch_size}, avg_dur={avg_dur:.1f}s"

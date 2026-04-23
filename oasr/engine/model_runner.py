@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -79,7 +79,7 @@ class ModelRunner:
         self,
         features: torch.Tensor,
         lengths: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run a batched offline forward pass.
 
         Parameters
@@ -91,10 +91,17 @@ class ModelRunner:
 
         Returns
         -------
-        Tensor
+        log_probs : Tensor
             ``(B, T_out, vocab_size)`` log-softmax probabilities.
+        output_lengths : Tensor
+            ``(B,)`` int32 valid encoder output frame counts, computed from
+            the encoder's padding mask so downstream decoders ignore padding.
         """
-        return self._model(features, lengths)
+        hidden, masks = self._model.encoder(features, lengths)
+        log_probs = self._model.ctc(hidden)  # (B, T_out, V)
+        # masks: (B, 1, T_out) with True = valid
+        output_lengths = masks.squeeze(1).sum(dim=-1).to(torch.int32)
+        return log_probs, output_lengths
 
     # ------------------------------------------------------------------
     # Streaming cache lifecycle
@@ -189,11 +196,18 @@ class ModelRunner:
                 ctx.prepare_chunk()
                 att_caches = ctx.get_att_caches()
                 cnn_cache = ctx.get_cnn_cache()
+                # ``req.offset`` already tracks the host-side cache length
+                # (each commit advances it by the chunk's frames); pass it
+                # through so the encoder skips the per-chunk
+                # ``cache_seqlens[0].item()`` D2H sync — that single call
+                # dominates the conformer-forward wall time at
+                # ``chunk_size=16``.
                 log_probs, new_cnn = self._model.forward_chunk_paged(
                     chunk,
                     req.offset,
                     att_caches,
                     cnn_cache,
+                    cache_t1=req.offset,
                 )
                 actual_frames = log_probs.size(1)
                 ctx.commit_chunk_paged(actual_frames, new_cnn)

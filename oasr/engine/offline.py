@@ -1,6 +1,11 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Simple offline (non-streaming) ASR transcription engine."""
+"""Offline (non-streaming) ASR transcription engine.
+
+Thin wrapper over :class:`~oasr.engine.ASREngine` that defaults ``add_request``
+to ``streaming=False`` so inputs flow through the dynamic-batching offline
+path.  Kept as a separate class so existing call-sites continue to work.
+"""
 
 from __future__ import annotations
 
@@ -10,28 +15,20 @@ from typing import List, Union
 import numpy as np
 import torch
 
-from oasr.models.conformer.convert import load_wenet_checkpoint
-
-from .config import EngineConfig
-from .input_processor import InputProcessor
-from .output_processor import OutputProcessor
-from .request import Request, RequestOutput
+from .engine import ASREngine
+from .request import Request
 
 logger = logging.getLogger(__name__)
 
 
-class OfflineEngine:
+class OfflineEngine(ASREngine):
     """Offline batch transcription engine.
 
-    Loads a Conformer-CTC model and provides a simple
-    :meth:`transcribe` method for single files or batches. No scheduler or
-    paged cache is needed for offline decoding — the model processes all
-    frames in a single forward pass.
-
-    Parameters
-    ----------
-    config : EngineConfig
-        Engine configuration.  ``ckpt_dir`` must be set.
+    Inherits the full step loop, scheduler, and model runner from
+    :class:`ASREngine`.  The only behavioural difference is that
+    :meth:`transcribe` defaults to ``streaming=False`` so requests are
+    length-bucketed and forwarded in a single padded pass rather than
+    streaming chunk-by-chunk.
 
     Examples
     --------
@@ -40,77 +37,43 @@ class OfflineEngine:
         engine = OfflineEngine(EngineConfig(ckpt_dir="/path/to/ckpt"))
         text = engine.transcribe("audio.wav")
 
-    Batch::
+    Batch with length-aware bucketing (see ``length_bucket_ratio``)::
 
         texts = engine.transcribe(["a.wav", "b.wav", "c.wav"])
 
-    Streaming simulation (chunk-by-chunk with no real-time constraints)::
+    Streaming simulation (chunk-by-chunk, no real-time constraint)::
 
         texts = engine.transcribe_streaming("long_audio.wav", chunk_size=16)
     """
 
-    def __init__(self, config: EngineConfig) -> None:
-        self._config = config
-        device_str = config.device
-        dtype = config.dtype
-
-        logger.info("Loading model from %s ...", config.ckpt_dir)
-        model, model_config = load_wenet_checkpoint(
-            config.ckpt_dir,
-            config.checkpoint_name,
-            device=device_str,
-            dtype=dtype,
-        )
-        self._model = model
-        self._model_config = model_config
-        config._model_config = model_config
-
-        self._device = torch.device(device_str)
-        self._input_processor = InputProcessor(config, self._device)
-        self._output_processor = OutputProcessor(config)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def transcribe(
+    def transcribe(  # type: ignore[override]
         self,
         audio: Union[str, List[str], torch.Tensor, "np.ndarray", List[torch.Tensor]],
+        sample_rate: int = 16000,
+        streaming: bool = False,
     ) -> Union[str, List[str]]:
-        """Transcribe one or more audio inputs.
+        """Transcribe one or more audio inputs (offline by default).
 
-        Parameters
-        ----------
-        audio : str, list, Tensor, or ndarray
-            * A single file path (``str``) — returns a single ``str``.
-            * A list of file paths or waveform tensors — returns a list.
-            * A single waveform tensor ``(T,)`` or ``(1, T)`` — returns ``str``.
-            * A NumPy array — returns ``str``.
-
-        Returns
-        -------
-        str or List[str]
-            Transcribed text.  Returns a list when the input is a list,
-            a plain string otherwise.
+        See :meth:`ASREngine.transcribe` for parameter semantics; the only
+        difference here is the default ``streaming=False``.
         """
-        is_single = not isinstance(audio, list)
-        audio_list: List = [audio] if is_single else audio  # type: ignore[list-item]
+        return super().transcribe(audio, sample_rate=sample_rate, streaming=streaming)
 
-        requests = [Request(a) for a in audio_list]
-        outputs = self._run_batch(requests)
-        texts = [o.text for o in outputs]
-        return texts[0] if is_single else texts
+    # ------------------------------------------------------------------
+    # Legacy streaming-simulation helper
+    # ------------------------------------------------------------------
 
     def transcribe_streaming(
         self,
         audio: Union[str, torch.Tensor, "np.ndarray"],
         chunk_size: int = None,  # type: ignore[assignment]
     ) -> str:
-        """Simulate streaming by processing audio chunk-by-chunk.
+        """Simulate streaming via ``model.forward_chunk_by_chunk`` (no cache).
 
-        Uses :meth:`~oasr.models.conformer.ConformerModel.forward_chunk_by_chunk`
-        internally — no paged cache.  Useful for measuring streaming accuracy
-        without real-time latency constraints.
+        Kept for backward compatibility and accuracy-benchmarking use cases
+        that need deterministic chunk-by-chunk decoding without paged KV
+        cache.  For real concurrent streaming use
+        :meth:`ASREngine.add_request(..., streaming=True)` instead.
 
         Parameters
         ----------
@@ -119,11 +82,6 @@ class OfflineEngine:
         chunk_size : int, optional
             Encoder output frames per chunk.  Defaults to
             ``config.chunk_size``.
-
-        Returns
-        -------
-        str
-            Transcribed text.
         """
         chunk_size = chunk_size or self._config.chunk_size
 
@@ -137,35 +95,7 @@ class OfflineEngine:
                 num_decoding_left_chunks=self._config.num_left_chunks,
             )  # (1, T_out, V)
 
-        # Compute output length (encoder output T) for the decoder
         T_out = log_probs.size(1)
         lengths = torch.tensor([T_out], dtype=torch.int32, device=self._device)
-
         outputs = self._output_processor.decode_offline(log_probs, lengths)
         return outputs[0].text if outputs else ""
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _run_batch(self, requests: List[Request]) -> List[RequestOutput]:
-        """Load features and run a full forward pass for a batch of requests."""
-        features, feat_lengths = self._input_processor.process_offline(requests)
-
-        with torch.no_grad():
-            # Get encoder hidden states and masks (True=valid)
-            hidden, masks = self._model.encoder(features, feat_lengths)
-            log_probs = self._model.ctc(hidden)  # (B, T_out, V)
-
-        # Extract valid output lengths from masks: (B, 1, T_out) True=valid
-        output_lengths = masks.squeeze(1).sum(dim=-1).to(torch.int32)
-
-        outputs = self._output_processor.decode_offline(log_probs, output_lengths)
-
-        # Stamp request IDs onto outputs
-        for req, out in zip(requests, outputs):
-            out.request_id = req.request_id
-            req.output = out
-
-        return outputs
-
