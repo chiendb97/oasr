@@ -322,6 +322,7 @@ class AttentionCacheManager:
                 f"Stream {stream_id}: call prepare_chunk() before get_paged_caches()."
             )
         cfg = self._config
+        host_seqlen = state.num_committed_frames
         caches = []
         for layer in range(cfg.num_layers):
             k_view, v_view = self._pool.get_kv_view(layer)
@@ -332,6 +333,7 @@ class AttentionCacheManager:
                     block_table=state.block_table,
                     cache_seqlens=state.cache_seqlens,
                     block_size=cfg.block_size_frames,
+                    host_seqlen=host_seqlen,
                 )
             )
         return caches

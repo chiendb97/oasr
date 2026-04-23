@@ -87,6 +87,14 @@ class PagedKVCache:
     block_table: torch.Tensor
     cache_seqlens: torch.Tensor
     block_size: int
+    # Host-side mirror of ``cache_seqlens[0]`` — the cache manager updates
+    # this Python int at commit time, so the attention forward path can
+    # skip the per-layer ``cache_seqlens[0].item()`` D2H sync (which was
+    # running once per encoder layer and dominating streaming wall time:
+    # 12 layers × ~0.3 ms sync ≈ 4 ms wasted per chunk).  ``-1`` means
+    # "not tracked" and forces a fallback sync so this remains
+    # backward-compatible with callers that don't set it.
+    host_seqlen: int = -1
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +462,10 @@ class MultiHeadedAttention(nn.Module):
         if isinstance(cache, PagedKVCache):
             q, k, v = self.forward_qkv(query, key, value)
             # q: (1, n_head, chunk_size, d_k)
-            seqlen_offset = int(cache.cache_seqlens[0].item())
+            if cache.host_seqlen >= 0:
+                seqlen_offset = cache.host_seqlen
+            else:
+                seqlen_offset = int(cache.cache_seqlens[0].item())
             total_frames = seqlen_offset + q.size(2)
 
             if (
@@ -622,7 +633,10 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         q = q.transpose(1, 2)  # (batch, time1, n_head, d_k)
 
         if isinstance(cache, PagedKVCache):
-            seqlen_offset = int(cache.cache_seqlens[0].item())
+            if cache.host_seqlen >= 0:
+                seqlen_offset = cache.host_seqlen
+            else:
+                seqlen_offset = int(cache.cache_seqlens[0].item())
             total_frames = seqlen_offset + q.size(1)
             # Write new K/V into the paged pool.
             _paged_write_kv(

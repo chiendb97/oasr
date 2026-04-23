@@ -16,24 +16,33 @@ from .config import EngineConfig
 from .input_processor import InputProcessor
 from .model_runner import ModelRunner
 from .output_processor import OutputProcessor
-from .request import Request, RequestOutput, RequestState
+from .pipeline import OfflinePipeline
+from .request import Request, RequestOutput
 from .scheduler import Scheduler, SchedulerOutput
 
 logger = logging.getLogger(__name__)
 
 
 class ASREngine:
-    """ASR inference engine with streaming chunk-by-chunk processing.
+    """Unified ASR inference engine with dynamic batching.
 
-    Follows a vLLM-inspired three-stage step loop:
+    Handles both streaming (chunk-by-chunk with paged KV cache) and offline
+    (single-pass batched) requests in one step loop.  Each step:
 
-    1. **Schedule** — admit waiting requests, collect running ones.
-    2. **Forward** — run encoder chunks for all scheduled requests.
-    3. **Postprocess** — decode log-probs, finalize completed requests.
+    1. **Schedule** — admit up to ``max_offline_batch_size`` waiting offline
+       requests, admit waiting streaming requests up to
+       ``max_batch_size``, and classify running streams.
+    2. **Forward** — route the admitted offline batch through the
+       pipelined :class:`OfflinePipeline` (length-bucketed micro-batches
+       of size ``offline_micro_batch_size`` overlap GPU feature extraction
+       with encoder forward + CTC decode) and run one encoder chunk per
+       active streaming request.
+    3. **Postprocess** — decode log-probs and finalise completed requests.
 
-    Supports both streaming (chunk-by-chunk with paged KV cache) and
-    offline (single-pass) operation through a unified :meth:`transcribe`
-    convenience method.
+    Dynamic batching is length-aware: within the offline pipeline,
+    requests are sorted by estimated feature length and split into
+    similarly-sized micro-batches to minimise padded-compute waste.
+    Starvation of bursty offline requests is bounded by ``max_wait_time``.
 
     Parameters
     ----------
@@ -42,17 +51,15 @@ class ASREngine:
 
     Examples
     --------
-    Offline convenience (internally uses streaming path)::
+    Streaming transcription::
 
         engine = ASREngine(EngineConfig(ckpt_dir="/path/to/ckpt"))
         text = engine.transcribe("audio.wav")
 
-    Explicit streaming loop::
+    Explicit offline batch::
 
-        engine = ASREngine(config)
-        rid = engine.add_request("audio.wav")
+        ids = [engine.add_request(p, streaming=False) for p in paths]
         results = engine.run()
-        text = {r.request_id: r.text for r in results}[rid]
     """
 
     def __init__(self, config: EngineConfig) -> None:
@@ -78,6 +85,21 @@ class ASREngine:
         self._model_runner = ModelRunner(model, config, cache_config)
         self._output_processor = OutputProcessor(config)
 
+        # Offline execution pipeline — handles CPU/GPU overlap and
+        # length-bucketed micro-batching internally.
+        micro = int(config.offline_micro_batch_size or 0)
+        if micro <= 0:
+            micro = min(config.max_offline_batch_size, 32)
+        self._offline_pipeline = OfflinePipeline(
+            input_processor=self._input_processor,
+            model_runner=self._model_runner,
+            output_processor=self._output_processor,
+            micro_batch_size=micro,
+            depth=max(1, int(config.offline_pipeline_depth)),
+            device=self._device,
+            gpu_feature_extraction=bool(config.offline_gpu_feature_extraction),
+        )
+
     # ------------------------------------------------------------------
     # Request management
     # ------------------------------------------------------------------
@@ -87,11 +109,18 @@ class ASREngine:
         audio: Union[str, torch.Tensor, "np.ndarray"],
         request_id: Optional[str] = None,
         sample_rate: int = 16000,
+        streaming: bool = True,
+        priority: int = 0,
     ) -> str:
         """Add a new request to the engine.
 
-        Audio features are extracted and pre-chunked immediately so the step
-        loop sees only already-computed tensors.
+        Both paths defer actual feature extraction until the engine step
+        loop can batch it: streaming admission batches fbank across all
+        freshly-admitted streams in one GPU call, and the offline pipeline
+        batches fbank within each GPU micro-batch.  What :meth:`add_request`
+        does synchronously is load the waveform, stamp a cheap but exact
+        (Kaldi ``snip_edges`` formula) frame count so the scheduler can
+        bucket by length, and enqueue.
 
         Parameters
         ----------
@@ -101,26 +130,40 @@ class ASREngine:
             Unique identifier.  Auto-generated if omitted.
         sample_rate : int
             Audio sample rate in Hz.
+        streaming : bool, default ``True``
+            ``True`` routes the request through the paged-cache streaming
+            path; ``False`` routes it through the batched offline path.
+        priority : int, default ``0``
+            Lower values are scheduled first within each waiting queue.
 
         Returns
         -------
         str
             The assigned ``request_id``.
         """
-        req = Request(audio, request_id=request_id, streaming=True, sample_rate=sample_rate)
-        # Pre-process: load audio, extract features, chunk for streaming
-        self._input_processor.process_for_streaming(req)
+        req = Request(
+            audio,
+            request_id=request_id,
+            streaming=streaming,
+            sample_rate=sample_rate,
+            priority=priority,
+        )
+        if streaming:
+            # Streaming needs ``chunks_remaining`` populated before the
+            # scheduler classifies has_chunks, so we extract features
+            # eagerly here.  ``process_for_streaming`` routes through the
+            # batched GPU fbank fast path (single-item batch) when the
+            # config matches, which is ~2–3× faster than the old
+            # per-utterance ``torchaudio.compliance.kaldi.fbank`` even for
+            # one waveform.
+            self._input_processor.process_for_streaming(req)
+        else:
+            self._input_processor.prepare_offline(req)
         self._scheduler.add_request(req)
         return req.request_id
 
     def abort_request(self, request_id: str) -> None:
-        """Remove a request from the engine (clean up cache if running).
-
-        Parameters
-        ----------
-        request_id : str
-            The request to abort.
-        """
+        """Remove a request from the engine, freeing cache if allocated."""
         req = self._scheduler.abort_request(request_id)
         if req is not None and req.stream_context is not None:
             self._model_runner.free_stream(req)
@@ -130,42 +173,35 @@ class ASREngine:
     # ------------------------------------------------------------------
 
     def step(self) -> List[RequestOutput]:
-        """Execute one engine step.
-
-        Each call performs three stages:
-
-        1. **Schedule** — admit new requests, find runnable ones, identify
-           completed ones.
-        2. **Forward** — run one encoder chunk per scheduled request.
-        3. **Postprocess** — feed log-probs to the CTC decoder; finalize and
-           clean up requests that have no remaining chunks.
-
-        Returns
-        -------
-        List[RequestOutput]
-            Partial and final outputs produced this step.
-        """
+        """Execute one engine step covering streaming + offline work."""
         sched: SchedulerOutput = self._scheduler.schedule()
         outputs: List[RequestOutput] = []
 
-        # Admit: allocate cache for newly admitted requests
+        # Streaming admission: allocate cache for freshly admitted streams.
+        # Features + chunks are already populated by ``add_request``'s call
+        # to ``process_for_streaming``; the scheduler relies on
+        # ``has_chunks`` to classify admitted streams as runnable, so
+        # extraction has to happen before scheduling, not here.
         for req in sched.newly_admitted:
-            self._model_runner.allocate_stream(req)
+            if req.streaming:
+                self._model_runner.allocate_stream(req)
 
-        # Forward: run encoder chunk for requests that have work to do
+        # Offline batch — run the padded forward and finalise immediately.
+        if sched.offline_batch:
+            outputs.extend(self._run_offline_batch(sched.offline_batch))
+
+        # Streaming forward — one encoder chunk per active request.
         if sched.scheduled_requests:
             log_probs_map: Dict[str, torch.Tensor] = (
                 self._model_runner.forward_streaming_step(sched.scheduled_requests)
             )
-
-            # Decode each chunk's log-probs
             for req in sched.scheduled_requests:
                 lp = log_probs_map.get(req.request_id)
                 if lp is not None:
                     partial = self._output_processor.decode_streaming_chunk(req, lp)
                     outputs.append(partial)
 
-        # Finalize: requests whose chunk queue is now empty
+        # Streaming finalisation — requests whose chunk queue is now empty.
         for req in sched.to_finalize:
             final = self._output_processor.finalize_streaming(req)
             req.output = final
@@ -176,18 +212,20 @@ class ASREngine:
         return outputs
 
     def run(self) -> List[RequestOutput]:
-        """Run the engine until all pending requests are complete.
-
-        Returns
-        -------
-        List[RequestOutput]
-            All **final** outputs (``finished=True``) in completion order.
-        """
+        """Run the engine until all pending requests are complete."""
         final_outputs: List[RequestOutput] = []
         while self._scheduler.has_pending():
             step_outputs = self.step()
             final_outputs.extend(o for o in step_outputs if o.finished)
         return final_outputs
+
+    # ------------------------------------------------------------------
+    # Offline batch handling
+    # ------------------------------------------------------------------
+
+    def _run_offline_batch(self, batch: List[Request]) -> List[RequestOutput]:
+        """Forward one offline batch through the pipelined executor."""
+        return self._offline_pipeline.run(batch)
 
     # ------------------------------------------------------------------
     # Convenience API
@@ -197,8 +235,9 @@ class ASREngine:
         self,
         audio: Union[str, List[str], torch.Tensor, "np.ndarray"],
         sample_rate: int = 16000,
+        streaming: bool = True,
     ) -> Union[str, List[str]]:
-        """Transcribe one or more audio inputs using the streaming engine.
+        """Transcribe one or more audio inputs.
 
         Parameters
         ----------
@@ -206,17 +245,17 @@ class ASREngine:
             Single or multiple audio inputs.
         sample_rate : int
             Sample rate of the audio (Hz).
-
-        Returns
-        -------
-        str or List[str]
-            Transcribed text(s).
+        streaming : bool, default ``True``
+            ``True`` uses the chunk-by-chunk streaming path; ``False`` uses
+            the batched offline path.  Offline is strictly faster when
+            real-time output isn't needed.
         """
         is_single = not isinstance(audio, list)
         audio_list: List = [audio] if is_single else audio  # type: ignore[list-item]
 
         request_ids = [
-            self.add_request(a, sample_rate=sample_rate) for a in audio_list
+            self.add_request(a, sample_rate=sample_rate, streaming=streaming)
+            for a in audio_list
         ]
         final = self.run()
 
@@ -235,5 +274,5 @@ class ASREngine:
 
     @property
     def num_waiting(self) -> int:
-        """Number of requests waiting to be admitted."""
+        """Total number of requests across both waiting queues."""
         return self._scheduler.num_waiting

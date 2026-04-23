@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import enum
+import time
 import uuid
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -21,6 +22,11 @@ class RequestState(enum.Enum):
     WAITING = "waiting"
     RUNNING = "running"
     FINISHED = "finished"
+
+
+# Default priority level (lower value = higher priority).
+# Streaming requests default to this; offline can be bumped lower-priority.
+DEFAULT_PRIORITY = 0
 
 
 @dataclass
@@ -72,11 +78,14 @@ class Request:
         request_id: Optional[str] = None,
         streaming: bool = False,
         sample_rate: int = 16000,
+        priority: int = DEFAULT_PRIORITY,
     ) -> None:
         self.request_id: str = request_id or uuid.uuid4().hex
         self.audio: Union[str, torch.Tensor, "np.ndarray"] = audio
         self.streaming: bool = streaming
         self.sample_rate: int = sample_rate
+        self.priority: int = priority
+        self.arrival_time: float = time.monotonic()
 
         # Lifecycle state
         self.state: RequestState = RequestState.WAITING
@@ -85,6 +94,14 @@ class Request:
         self.features: Optional[torch.Tensor] = None          # (1, T, F)
         self.feature_lengths: Optional[torch.Tensor] = None   # (1,)
         self.chunks_remaining: Optional[List[torch.Tensor]] = None  # (1, W, F) each
+        # Offline-path raw waveform (CPU, scaled) held between ``add_request`` and
+        # the batched ``collate_offline`` call.  Released once features are built.
+        self.waveform: Optional[torch.Tensor] = None  # (T_samples,) CPU float32
+        # Number of feature frames.  For offline this starts as a cheap
+        # sample-count-derived estimate so the scheduler can bucket before
+        # features are extracted, and is overwritten with the exact value
+        # after the batched extraction runs.
+        self.num_frames: int = 0
 
         # Assigned by Scheduler
         self.stream_id: Optional[int] = None
@@ -104,6 +121,11 @@ class Request:
     def has_chunks(self) -> bool:
         """True if there are pre-chunked feature windows still to process."""
         return bool(self.chunks_remaining)
+
+    @property
+    def waited_for(self) -> float:
+        """Seconds spent in the waiting queue (monotonic clock)."""
+        return time.monotonic() - self.arrival_time
 
     def __repr__(self) -> str:
         audio_repr = self.audio if isinstance(self.audio, str) else type(self.audio).__name__
