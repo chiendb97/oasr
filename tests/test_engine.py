@@ -112,18 +112,22 @@ class TestRequest:
         assert req.streaming is False
         assert req.request_id  # non-empty
 
-    def test_has_chunks_false_initially(self):
+    def test_has_pending_audio_false_initially(self):
         from oasr.engine.request import Request
 
         req = Request("audio.wav")
-        assert not req.has_chunks
+        assert not req.has_pending_audio
 
-    def test_has_chunks_true_after_assignment(self):
+    def test_has_pending_audio_true_after_enqueue(self):
+        from collections import deque
+
         from oasr.engine.request import Request
 
-        req = Request("audio.wav")
-        req.chunks_remaining = [torch.zeros(1, 67, 80)]
-        assert req.has_chunks
+        req = Request("audio.wav", streaming=True)
+        req.audio_chunks = deque([torch.zeros(16000)])
+        req.audio_tail = torch.zeros(0)
+        req.audio_final = True
+        assert req.has_pending_audio
 
     def test_custom_request_id(self):
         from oasr.engine.request import Request
@@ -145,10 +149,16 @@ class TestScheduler:
         return cfg
 
     def _make_request(self, n_chunks=3):
+        from collections import deque
+
         from oasr.engine.request import Request
 
         req = Request("audio.wav", streaming=True)
-        req.chunks_remaining = [torch.zeros(1, 67, 80) for _ in range(n_chunks)]
+        # Enqueue ``n_chunks`` fake audio-sample tensors so the request is
+        # "still streaming" under the new audio-chunk admission model.
+        req.audio_chunks = deque([torch.zeros(16000) for _ in range(n_chunks)])
+        req.audio_tail = torch.zeros(0)
+        req.audio_final = True
         return req
 
     def test_add_and_schedule(self):
@@ -160,7 +170,7 @@ class TestScheduler:
 
         output = sched.schedule()
         assert len(output.newly_admitted) == 1
-        assert req in output.scheduled_requests
+        assert req in output.running_streams
         assert sched.num_running == 1
         assert sched.num_waiting == 0
 
@@ -188,15 +198,17 @@ class TestScheduler:
         assert finished is req
         assert sched.num_running == 0
 
-    def test_to_finalize_when_no_chunks(self):
+    def test_running_streams_surfaces_all_admitted(self):
         from oasr.engine.scheduler import Scheduler
 
         sched = Scheduler(self._make_config())
-        req = self._make_request(n_chunks=0)
-        sched.add_request(req)
+        r1 = self._make_request()
+        r2 = self._make_request(n_chunks=0)  # no audio — still admitted
+        sched.add_request(r1)
+        sched.add_request(r2)
         output = sched.schedule()
-        assert req in output.to_finalize
-        assert req not in output.scheduled_requests
+        assert r1 in output.running_streams
+        assert r2 in output.running_streams
 
     def test_has_pending(self):
         from oasr.engine.scheduler import Scheduler
@@ -302,6 +314,148 @@ class TestInputProcessor:
         features = torch.randn(1, n_frames, 80)
         chunks = proc.chunk_features(features)
         assert len(chunks) == 2
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — streaming audio-chunk feature extraction
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingAudioChunks:
+    """Verify streaming reads audio incrementally and never looks at future audio."""
+
+    def _make(self, dtype: torch.dtype = torch.float32):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.input_processor import InputProcessor
+        from oasr.engine.request import Request
+
+        cfg = EngineConfig(ckpt_dir="/tmp/fake", chunk_size=16, dtype=dtype)
+        proc = InputProcessor(cfg, torch.device("cpu"))
+        return cfg, proc, Request
+
+    def test_prepare_streaming_does_not_extract_features(self):
+        cfg, proc, Request = self._make()
+        wav = torch.randn(16000 * 2)  # 2 s
+        req = Request(wav, streaming=True)
+        req.waveform = wav
+        proc.prepare_streaming(req)
+
+        # Audio has been split into chunks but no fbank has run yet.
+        assert req.audio_chunks is not None and len(req.audio_chunks) > 0
+        assert req.feature_buffer is None
+        assert req.feature_frames == 0
+        assert req.audio_final is True
+
+    def test_prepare_streaming_chunk_size_matches_stride(self):
+        cfg, proc, Request = self._make()
+        # exactly 4 chunks' worth of audio
+        n = proc.streaming_audio_chunk_samples * 4
+        wav = torch.randn(n)
+        req = Request(wav, streaming=True)
+        req.waveform = wav
+        proc.prepare_streaming(req)
+        assert len(req.audio_chunks) == 4
+
+    def test_extract_streaming_pops_exactly_one_chunk(self):
+        """The engine must never consume future audio when extracting features
+        for the current step — :meth:`extract_streaming_batch` may pop at most
+        one chunk from each stream's queue.
+        """
+        cfg, proc, Request = self._make()
+        wav = torch.randn(16000 * 3)  # 3 s
+        req = Request(wav, streaming=True)
+        req.waveform = wav
+        proc.prepare_streaming(req)
+
+        before = len(req.audio_chunks)
+        assert before >= 2  # need enough audio for the test to mean anything
+
+        proc.extract_streaming_batch([req])
+        after = len(req.audio_chunks)
+        assert after == before - 1, \
+            f"extract_streaming_batch popped {before - after} chunks, expected 1"
+
+    def test_streaming_features_match_full_audio_fbank(self):
+        """Incremental fbank (tail + chunk) must reproduce full-audio fbank."""
+        from oasr.features.backends import _extract
+
+        cfg, proc, Request = self._make()
+        # Pick a length that's not a clean multiple of chunk_samples so the
+        # last chunk exercises the flush path.
+        n = proc.streaming_audio_chunk_samples * 5 + 317
+        torch.manual_seed(0)
+        wav = torch.randn(n) * 32.0
+        req = Request(wav, streaming=True)
+        req.waveform = wav
+        proc.prepare_streaming(req)
+
+        # Drive the streaming extractor to completion.
+        while req.has_pending_audio:
+            proc.extract_streaming_batch([req])
+
+        # Compare against the one-shot offline fbank.
+        full = _extract(wav, proc._feature_config)
+        got = req.feature_buffer[: req.feature_frames]
+        # Incremental path uses the padded-final-frame trick for the tail,
+        # so the last few frames can differ in the very last partial frame.
+        # Compare the full prefix that the offline path also produces.
+        n_common = min(full.size(0), got.size(0))
+        assert n_common > 0
+        torch.testing.assert_close(
+            got[:n_common].to(torch.float32),
+            full[:n_common].to(torch.float32),
+            rtol=1e-4, atol=1e-3,
+            msg=(
+                f"incremental fbank diverged from one-shot fbank "
+                f"(n_common={n_common}, full={full.size(0)}, got={got.size(0)})"
+            ),
+        )
+
+    def test_streaming_extraction_sees_only_tail_plus_current(self):
+        """Spy on `_extract_single` to confirm it only ever sees tail + one
+        chunk, never any enqueued-but-future chunk samples.
+        """
+        cfg, proc, Request = self._make()
+        chunk_samples = proc.streaming_audio_chunk_samples
+
+        # 4 distinct, non-overlapping "fingerprint" chunks so we can tell if
+        # any leak forward into earlier fbank calls.  Each chunk is filled
+        # with a unique constant.
+        parts = [torch.full((chunk_samples,), float(i + 1)) for i in range(4)]
+        wav = torch.cat(parts)
+        req = Request(wav, streaming=True)
+        req.waveform = wav
+        proc.prepare_streaming(req)
+
+        observed_maxes: list[float] = []
+        from oasr.engine import input_processor as _ip
+        orig = _ip._extract_single
+
+        def spy(waveform, cfg):
+            # What does the extractor see this call?  Record the max-abs
+            # value so we can tell which fingerprint chunks are present.
+            observed_maxes.append(float(waveform.abs().max().item()))
+            return orig(waveform, cfg)
+
+        _ip._extract_single = spy  # type: ignore[assignment]
+        try:
+            # Step 1: should see only chunk 0 (max = 1.0).
+            proc.extract_streaming_batch([req])
+            assert observed_maxes, "extractor was not invoked"
+            assert observed_maxes[-1] <= 1.0 + 1e-6, \
+                f"step 1 fbank saw future audio, max={observed_maxes[-1]}"
+
+            # Step 2: tail from chunk 0 + chunk 1 (max = 2.0).
+            proc.extract_streaming_batch([req])
+            assert observed_maxes[-1] <= 2.0 + 1e-6, \
+                f"step 2 fbank saw future audio, max={observed_maxes[-1]}"
+
+            # Step 3: chunk 2 arrives.
+            proc.extract_streaming_batch([req])
+            assert observed_maxes[-1] <= 3.0 + 1e-6, \
+                f"step 3 fbank saw future audio, max={observed_maxes[-1]}"
+        finally:
+            _ip._extract_single = orig  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +592,108 @@ class TestASREngine:
         results = engine.run()
         assert all(r.finished for r in results)
         assert any(r.request_id == rid for r in results)
+
+    def test_streaming_matches_offline_single_stream(
+        self, device, ckpt_dir: str, wav_dir: str,
+    ):
+        """With ``max_batch_size=1`` streaming must reproduce offline exactly.
+
+        Running streams one at a time through the paged forward bypasses the
+        batched path, so we get a strict bitwise check on the core audio-chunk
+        refactor: per-step fbank + forward_chunk_paged at B=1 has to agree
+        frame-for-frame with the offline batched forward.
+        """
+        from oasr.engine import ASREngine, EngineConfig, OfflineEngine
+
+        _require_ckpt(ckpt_dir)
+        _require_wav_dir(wav_dir)
+        wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
+        if len(wavs) < 3:
+            pytest.skip("Need at least 3 .wav files in WAV directory")
+
+        paths = [_wav_path(wav_dir, i) for i in range(3)]
+
+        off_cfg = EngineConfig(
+            ckpt_dir=ckpt_dir,
+            device=str(device),
+            dtype=torch.float16,
+            decoder_type="ctc_prefix_beam",
+        )
+        off = OfflineEngine(off_cfg)
+        off_texts = off.transcribe(paths)
+
+        cfg = EngineConfig(
+            ckpt_dir=ckpt_dir,
+            device=str(device),
+            dtype=torch.float16,
+            decoder_type="ctc_prefix_beam",
+            chunk_size=16,
+            num_left_chunks=-1,
+            use_paged_cache=True,
+            max_batch_size=1,
+        )
+        on = ASREngine(cfg)
+        on_texts = on.transcribe(paths)
+        for off_t, on_t in zip(off_texts, on_texts):
+            assert on_t == off_t, \
+                f"streaming(B=1) != offline\n  offline: {off_t!r}\n  stream : {on_t!r}"
+
+    def test_streaming_batched_matches_offline_wer(
+        self, device, ckpt_dir: str, wav_dir: str,
+    ):
+        """Batched streaming is numerically close to offline (fp16 ULP-level).
+
+        Batched paged forward reorders fp16 reductions across B streams, so
+        one-char differences at CTC decision boundaries are expected.  We
+        check WER stays below a loose threshold rather than demanding a
+        bit-exact match.
+        """
+        from oasr.engine import EngineConfig, OfflineEngine
+
+        _require_ckpt(ckpt_dir)
+        _require_wav_dir(wav_dir)
+        wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
+        if len(wavs) < 4:
+            pytest.skip("Need at least 4 .wav files in WAV directory")
+
+        paths = [_wav_path(wav_dir, i) for i in range(4)]
+
+        off_cfg = EngineConfig(
+            ckpt_dir=ckpt_dir,
+            device=str(device),
+            dtype=torch.float16,
+            decoder_type="ctc_prefix_beam",
+        )
+        off = OfflineEngine(off_cfg)
+        off_texts = off.transcribe(paths)
+
+        on = self._make_engine(ckpt_dir, device)  # max_batch_size=32 by default
+        on_texts = on.transcribe(paths)
+
+        def _wer(ref: str, hyp: str) -> float:
+            r, h = ref.split(), hyp.split()
+            # Levenshtein at word level
+            dp = [[0] * (len(h) + 1) for _ in range(len(r) + 1)]
+            for i in range(len(r) + 1):
+                dp[i][0] = i
+            for j in range(len(h) + 1):
+                dp[0][j] = j
+            for i in range(1, len(r) + 1):
+                for j in range(1, len(h) + 1):
+                    if r[i - 1] == h[j - 1]:
+                        dp[i][j] = dp[i - 1][j - 1]
+                    else:
+                        dp[i][j] = 1 + min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1])
+            return dp[len(r)][len(h)] / max(1, len(r))
+
+        total = sum(_wer(ref, hyp) for ref, hyp in zip(off_texts, on_texts))
+        avg_wer = total / len(paths)
+        # Loose threshold: batched-fp16 vs offline-batched-fp16 typically
+        # diverge by <5% WER on a handful of utterances; the drift comes
+        # from reordered fp16 reductions in the per-layer matmuls and
+        # paged attention, *not* from wrong streaming logic.
+        assert avg_wer < 0.05, \
+            f"Batched streaming diverged too far from offline: WER={avg_wer:.3f}"
 
     def test_engine_idle_after_run(self, device, ckpt_dir: str, wav_dir: str):
         _require_ckpt(ckpt_dir)

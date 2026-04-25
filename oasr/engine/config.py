@@ -120,6 +120,17 @@ class EngineConfig:
     #   "sjf"     — shortest-job-first (best throughput, can starve long reqs;
     #               starvation is still bounded by ``max_wait_time``)
     schedule_policy: str = "bucket"
+    # Streaming cohort admission: when ``streaming_cohort_admit`` is True the
+    # scheduler only admits new streaming requests when **either** the running
+    # pool is empty **or** every running stream is still at ``offset == 0``
+    # (i.e. has not yet run an encoder chunk).  This keeps every active
+    # cohort in lockstep so that ``_forward_batched_paged`` can dispatch a
+    # single ``B = max_batch_size`` encoder call instead of fragmenting into
+    # many small offset groups.  The biggest streaming throughput win on
+    # backlog-style workloads — at the cost of brief GPU idle time during
+    # cohort transitions.  Set to ``False`` for maximally responsive
+    # admission (one new request per freed slot).
+    streaming_cohort_admit: bool = True
     # GPU forward batch size for the offline pipeline.  Each admitted offline
     # request is routed through a length-bucketed micro-batch of at most this
     # many requests, which determines the B dimension of the padded encoder

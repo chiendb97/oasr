@@ -60,6 +60,7 @@ site/
 # OS
 .DS_Store
 Thumbs.db
+.nfs*
 
 # CUDA
 *.cubin
@@ -87,6 +88,9 @@ compile_commands.json
 data/
 ./models/
 checkpoints/
+
+# Claude
+.claude/
 
 # Logs
 *.log

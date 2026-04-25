@@ -12,6 +12,8 @@ import torch
 
 from oasr.models.conformer.convert import load_wenet_checkpoint
 
+from oasr.utils.nvtx import nvtx_pop, nvtx_push
+
 from .config import EngineConfig
 from .input_processor import InputProcessor
 from .model_runner import ModelRunner
@@ -30,14 +32,17 @@ class ASREngine:
     (single-pass batched) requests in one step loop.  Each step:
 
     1. **Schedule** — admit up to ``max_offline_batch_size`` waiting offline
-       requests, admit waiting streaming requests up to
-       ``max_batch_size``, and classify running streams.
-    2. **Forward** — route the admitted offline batch through the
+       requests and admit waiting streaming requests up to
+       ``max_batch_size``.
+    2. **Ingest** — batched GPU fbank across every active stream's next
+       pending audio chunk (one kernel call for the whole running pool,
+       no stream ever sees audio beyond its own enqueued chunks).
+    3. **Forward** — route the admitted offline batch through the
        pipelined :class:`OfflinePipeline` (length-bucketed micro-batches
        of size ``offline_micro_batch_size`` overlap GPU feature extraction
        with encoder forward + CTC decode) and run one encoder chunk per
-       active streaming request.
-    3. **Postprocess** — decode log-probs and finalise completed requests.
+       streaming request whose buffer now holds a full window.
+    4. **Postprocess** — decode log-probs and finalise completed requests.
 
     Dynamic batching is length-aware: within the offline pipeline,
     requests are sorted by estimated feature length and split into
@@ -100,6 +105,16 @@ class ASREngine:
             gpu_feature_extraction=bool(config.offline_gpu_feature_extraction),
         )
 
+        # Dedicated CUDA stream for the streaming fbank kernel.  Lets the
+        # H2D waveform copy + batched fbank for the current step overlap
+        # with the encoder forward of the previous step's tail (the
+        # encoder forward is async, so once dispatched the GPU can run
+        # both kernels concurrently when they live on different streams).
+        self._feat_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream(device=self._device)
+            if self._device.type == "cuda" else None
+        )
+
     # ------------------------------------------------------------------
     # Request management
     # ------------------------------------------------------------------
@@ -115,12 +130,14 @@ class ASREngine:
         """Add a new request to the engine.
 
         Both paths defer actual feature extraction until the engine step
-        loop can batch it: streaming admission batches fbank across all
-        freshly-admitted streams in one GPU call, and the offline pipeline
-        batches fbank within each GPU micro-batch.  What :meth:`add_request`
-        does synchronously is load the waveform, stamp a cheap but exact
-        (Kaldi ``snip_edges`` formula) frame count so the scheduler can
-        bucket by length, and enqueue.
+        loop can batch it: streaming ingests audio **chunk by chunk** inside
+        ``step()`` (batched across all active streams in one GPU fbank
+        call), and the offline pipeline batches fbank within each GPU
+        micro-batch.  What :meth:`add_request` does synchronously is load
+        the waveform, stamp a cheap but exact (Kaldi ``snip_edges``
+        formula) frame count so the scheduler can bucket by length, and
+        split the waveform into streaming audio chunks on the CPU.  No
+        fbank runs until the request is admitted and stepped.
 
         Parameters
         ----------
@@ -149,18 +166,90 @@ class ASREngine:
             priority=priority,
         )
         if streaming:
-            # Streaming needs ``chunks_remaining`` populated before the
-            # scheduler classifies has_chunks, so we extract features
-            # eagerly here.  ``process_for_streaming`` routes through the
-            # batched GPU fbank fast path (single-item batch) when the
-            # config matches, which is ~2–3× faster than the old
-            # per-utterance ``torchaudio.compliance.kaldi.fbank`` even for
-            # one waveform.
-            self._input_processor.process_for_streaming(req)
+            # Split the waveform into audio-sample chunks *without* running
+            # fbank.  Feature extraction runs inside ``step()`` batched
+            # across all active streams — realistic streaming behaviour
+            # (one chunk's worth of audio produces one chunk's worth of
+            # features) and a much better match for the model's forward
+            # throughput than the old pre-extract-everything admission.
+            self._input_processor.prepare_streaming(req)
         else:
             self._input_processor.prepare_offline(req)
         self._scheduler.add_request(req)
         return req.request_id
+
+    def add_streaming_request(
+        self,
+        request_id: Optional[str] = None,
+        sample_rate: int = 16000,
+        priority: int = 0,
+    ) -> str:
+        """Open a chunk-by-chunk streaming request.
+
+        Registers an empty streaming request with no audio attached.  Push
+        audio into the engine via :meth:`feed_chunk` (one chunk per call).
+        The engine starts processing chunks in the next :meth:`step` after
+        the request is admitted by the scheduler — feeding chunks before
+        admission just queues them on the request's audio deque.
+
+        Parameters
+        ----------
+        request_id : str, optional
+            Unique identifier.  Auto-generated (UUID4 hex) if omitted.
+        sample_rate : int
+            Sample rate of the audio that will be fed via :meth:`feed_chunk`.
+        priority : int, default ``0``
+            Lower values are scheduled first within the streaming queue.
+
+        Returns
+        -------
+        str
+            The assigned ``request_id`` — pass it to :meth:`feed_chunk`.
+        """
+        req = Request(
+            audio=None,
+            request_id=request_id,
+            streaming=True,
+            sample_rate=sample_rate,
+            priority=priority,
+        )
+        self._input_processor.prepare_streaming_open(req)
+        self._scheduler.add_request(req)
+        return req.request_id
+
+    def feed_chunk(
+        self,
+        request_id: str,
+        chunk: Union[torch.Tensor, "np.ndarray"],
+        is_last: bool = False,
+    ) -> None:
+        """Push one audio chunk into a streaming request.
+
+        Parameters
+        ----------
+        request_id : str
+            Id returned from :meth:`add_streaming_request`.
+        chunk : Tensor or ndarray
+            1-D audio samples for this chunk.  Convert to CPU float32 happens
+            automatically; passing CPU tensors that are already in the right
+            shape is fastest.
+        is_last : bool, default ``False``
+            Set ``True`` on the last chunk to flush the trailing partial
+            frame and trigger finalisation as soon as the encoder drains.
+
+        Notes
+        -----
+        Tolerates feeding chunks before admission (they queue on the
+        request's audio deque) and after admission (they're consumed by the
+        next :meth:`step`).  Raises if the request id is unknown or has
+        already been finalised.
+        """
+        req = self._scheduler.find_request(request_id)
+        if req is None:
+            raise KeyError(
+                f"feed_chunk: unknown or finished request_id {request_id!r}"
+            )
+        self._input_processor.append_streaming_chunk(req, chunk, is_last=is_last)
 
     def abort_request(self, request_id: str) -> None:
         """Remove a request from the engine, freeing cache if allocated."""
@@ -174,41 +263,83 @@ class ASREngine:
 
     def step(self) -> List[RequestOutput]:
         """Execute one engine step covering streaming + offline work."""
+        nvtx_push("engine.step")
+        nvtx_push("schedule")
         sched: SchedulerOutput = self._scheduler.schedule()
+        nvtx_pop()
         outputs: List[RequestOutput] = []
 
         # Streaming admission: allocate cache for freshly admitted streams.
-        # Features + chunks are already populated by ``add_request``'s call
-        # to ``process_for_streaming``; the scheduler relies on
-        # ``has_chunks`` to classify admitted streams as runnable, so
-        # extraction has to happen before scheduling, not here.
-        for req in sched.newly_admitted:
-            if req.streaming:
-                self._model_runner.allocate_stream(req)
+        if sched.newly_admitted:
+            nvtx_push("allocate_stream")
+            for req in sched.newly_admitted:
+                if req.streaming:
+                    self._model_runner.allocate_stream(req)
+            nvtx_pop()
 
         # Offline batch — run the padded forward and finalise immediately.
         if sched.offline_batch:
+            nvtx_push("offline_batch")
             outputs.extend(self._run_offline_batch(sched.offline_batch))
+            nvtx_pop()
 
-        # Streaming forward — one encoder chunk per active request.
-        if sched.scheduled_requests:
-            log_probs_map: Dict[str, torch.Tensor] = (
-                self._model_runner.forward_streaming_step(sched.scheduled_requests)
-            )
-            for req in sched.scheduled_requests:
-                lp = log_probs_map.get(req.request_id)
-                if lp is not None:
-                    partial = self._output_processor.decode_streaming_chunk(req, lp)
-                    outputs.append(partial)
+        running = sched.running_streams
+        if running:
+            # 1. Batched GPU fbank across every stream with pending audio —
+            #    one kernel call for the whole active pool rather than N
+            #    sequential fbank calls.  Issued on the dedicated feat
+            #    stream when running on CUDA so it can overlap with the
+            #    previous step's encoder forward; the default stream waits
+            #    on the recorded event before reading feature_buffer.
+            needs_feat = [r for r in running if r.has_pending_audio]
+            if needs_feat:
+                nvtx_push("extract_fbank")
+                self._input_processor.extract_streaming_batch(
+                    needs_feat, cuda_stream=self._feat_stream,
+                )
+                if self._feat_stream is not None:
+                    # Synchronise default stream with feat stream so the
+                    # downstream forward sees the freshly-written
+                    # feature_buffer slices.
+                    torch.cuda.current_stream(self._device).wait_stream(
+                        self._feat_stream
+                    )
+                nvtx_pop()
 
-        # Streaming finalisation — requests whose chunk queue is now empty.
-        for req in sched.to_finalize:
-            final = self._output_processor.finalize_streaming(req)
-            req.output = final
-            outputs.append(final)
-            self._model_runner.free_stream(req)
-            self._scheduler.finish_request(req.request_id)
+            # 2. For each stream whose feature buffer now holds at least
+            #    one encoder window, run forward_chunk_paged.
+            window = self._config.decoding_window
+            ready = [r for r in running if r.has_ready_encoder_chunk(window)]
+            if ready:
+                nvtx_push("forward_streaming")
+                log_probs_map: Dict[str, torch.Tensor] = (
+                    self._model_runner.forward_streaming_step(ready)
+                )
+                nvtx_pop()
+                nvtx_push("decode_streaming")
+                for req in ready:
+                    lp = log_probs_map.get(req.request_id)
+                    if lp is not None:
+                        partial = self._output_processor.decode_streaming_chunk(req, lp)
+                        outputs.append(partial)
+                nvtx_pop()
 
+            # 3. Finalise streams whose audio is exhausted and whose
+            #    feature buffer has been fully consumed.  A stream can
+            #    reach this state in the same step it ran its last
+            #    encoder chunk, so we check *after* the forward pass.
+            nvtx_push("finalize_streams")
+            for req in list(running):
+                if (not req.has_pending_audio) \
+                        and (not req.has_ready_encoder_chunk(window)):
+                    final = self._output_processor.finalize_streaming(req)
+                    req.output = final
+                    outputs.append(final)
+                    self._model_runner.free_stream(req)
+                    self._scheduler.finish_request(req.request_id)
+            nvtx_pop()
+
+        nvtx_pop()  # engine.step
         return outputs
 
     def run(self) -> List[RequestOutput]:

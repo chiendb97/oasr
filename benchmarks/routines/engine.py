@@ -194,16 +194,51 @@ def _time_offline(
     return median_ms, std_ms, rtf
 
 
+def _split_waveform_into_chunks(
+    wav: torch.Tensor, chunk_samples: int
+) -> List[torch.Tensor]:
+    """Split a 1-D waveform into per-call chunks of ``chunk_samples`` samples.
+
+    The final chunk may be shorter.  Chunks are contiguous CPU float32 views
+    that the engine can hand directly to ``feed_chunk`` without further copies.
+    """
+    n = wav.numel()
+    chunks: List[torch.Tensor] = []
+    for start in range(0, n, chunk_samples):
+        chunks.append(wav[start: start + chunk_samples].contiguous())
+    return chunks
+
+
 def _time_streaming(
     engine: ASREngine,
     waveforms: List[torch.Tensor],
     durations: List[float],
     num_iters: int,
 ) -> tuple[float, float, float]:
-    """Time ASREngine over pre-loaded *waveforms* (one request per file).
+    """Time ASREngine over pre-loaded *waveforms* fed chunk-by-chunk.
 
-    Audio must be loaded before calling this function so that file I/O is
-    excluded from the timed region.
+    What this measures
+    ------------------
+    *Backlog-throughput streaming.*  Each waveform is pre-split (outside the
+    timed region) into per-call audio chunks of size ``stride * frame_shift``
+    samples.  Inside the timed region we register a streaming request and
+    push chunks via :meth:`engine.feed_chunk`, exactly mirroring how a
+    real-time client would deliver audio.  ``engine.run()`` then drains the
+    backlog by looping ``step()``; each step processes one chunk per active
+    stream:
+
+    1. Batched GPU FBANK across all streams' next-pending chunks (one
+       kernel call for the whole pool, never sees audio beyond what's
+       already enqueued for each stream).
+    2. Per-stream ``forward_chunk_paged`` on the freshly-produced features.
+    3. Per-stream streaming CTC decode + cache commit.
+
+    Audio is pre-loaded into memory so the number reflects compute only,
+    not disk I/O.  RTF = wall_clock / total_audio_seconds — lower is better;
+    RTF < 1 means the system keeps up with real time.
+
+    For an RTF number that reflects *single-stream* interactive latency
+    (one client sending one chunk every 640 ms), set ``max_batch_size=1``.
 
     Returns
     -------
@@ -211,9 +246,22 @@ def _time_streaming(
     """
     total_duration = sum(durations)
 
+    # Pre-split waveforms once so chunking cost is excluded from the timed
+    # region.  Chunk size matches the engine's ``stride * frame_shift``
+    # (one encoder chunk worth of new audio).
+    chunk_samples = engine._input_processor.streaming_audio_chunk_samples  # type: ignore[attr-defined]
+    chunks_per_utt: List[List[torch.Tensor]] = [
+        _split_waveform_into_chunks(wav, chunk_samples) for wav in waveforms
+    ]
+
     def _run_all():
-        for wav in waveforms:
-            engine.add_request(wav)
+        for chunks in chunks_per_utt:
+            if not chunks:
+                continue
+            rid = engine.add_streaming_request(sample_rate=16000)
+            last = len(chunks) - 1
+            for j, c in enumerate(chunks):
+                engine.feed_chunk(rid, c, is_last=(j == last))
         engine.run()
 
     # Warmup

@@ -245,6 +245,90 @@ void ctc_beam_search_init_state_paged(TensorView state_buffer,
 }
 
 // =============================================================================
+// Streaming: process a whole chunk of frames in one call
+// =============================================================================
+//
+// Replaces the per-frame Python loop in ``GpuStreamingDecoder.decode_chunk``
+// with a single C++ launcher that iterates ``chunk_T`` frames and calls
+// ``streaming_step`` once per active frame.  Eliminates ~10 μs of Python
+// overhead per frame (Python→C++ trip + tensor-slice bookkeeping) which was
+// dominating wall time for batched streaming workloads.
+//
+// ``is_speech_mask`` is an optional CPU uint8 / bool tensor of length
+// ``chunk_T``: when present, frames where the mask is 0 are skipped (the
+// caller pre-computed the blank-threshold mask on GPU and copied it once).
+// When empty, every frame is decoded.
+//
+// Returns the new ``step`` (= start_step + #active frames decoded, capped at
+// ``max_seq_len``).  ``frame_idx`` after the chunk is always
+// ``start_frame_idx + chunk_T`` (or earlier if ``max_seq_len`` was reached);
+// the caller can compute it without a return value.
+int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk,
+                              TensorView is_speech_mask,
+                              int64_t beam, int64_t blank_id,
+                              int64_t start_step, double blank_threshold,
+                              int64_t start_frame_idx,
+                              int64_t batch, int64_t vocab_size,
+                              int64_t max_seq_len, int64_t use_paged_memory,
+                              int64_t page_size) {
+  CHECK_INPUT(state_buffer);
+  CHECK_INPUT(log_prob_chunk);
+  CHECK_DIM(3, log_prob_chunk);
+
+  TVM_FFI_ICHECK(log_prob_chunk.dtype().code == kDLFloat &&
+                  log_prob_chunk.dtype().bits == 32)
+      << "log_prob_chunk must be float32";
+
+  int chunk_t = log_prob_chunk.size(1);
+  int batch_stride = log_prob_chunk.stride(0);
+  int seq_stride = log_prob_chunk.stride(1);
+  int vocab_stride = log_prob_chunk.stride(2);
+  const float* lp_data = static_cast<const float*>(log_prob_chunk.data_ptr());
+
+  const uint8_t* mask_data = nullptr;
+  if (is_speech_mask.numel() > 0) {
+    TVM_FFI_ICHECK(is_speech_mask.dtype().code == kDLUInt &&
+                    is_speech_mask.dtype().bits == 8)
+        << "is_speech_mask must be uint8";
+    TVM_FFI_ICHECK(is_speech_mask.size(0) == chunk_t)
+        << "is_speech_mask length (" << is_speech_mask.size(0)
+        << ") must equal chunk_T (" << chunk_t << ")";
+    mask_data = static_cast<const uint8_t*>(is_speech_mask.data_ptr());
+  }
+
+  cudaStream_t stream = get_stream(state_buffer.device());
+
+  int step = static_cast<int>(start_step);
+  int frame_idx = static_cast<int>(start_frame_idx);
+  for (int t = 0; t < chunk_t; ++t) {
+    if (step >= max_seq_len) {
+      break;
+    }
+    if (mask_data && !mask_data[t]) {
+      ++frame_idx;
+      continue;
+    }
+    const float* lp_frame = lp_data + static_cast<size_t>(t) * seq_stride;
+    cudaError_t status = ctc_decoder::streaming_step(
+        state_buffer.data_ptr(), lp_frame,
+        batch_stride, vocab_stride,
+        step,
+        static_cast<int>(blank_id), -1,
+        frame_idx,
+        static_cast<int>(batch), static_cast<int>(beam),
+        static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
+        static_cast<int>(use_paged_memory), static_cast<int>(page_size),
+        0,  // num_pages=0 → auto
+        stream);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "CTC chunk step failed: " << cudaGetErrorString(status);
+    ++step;
+    ++frame_idx;
+  }
+  return static_cast<int64_t>(step);
+}
+
+// =============================================================================
 // Streaming: read results
 // =============================================================================
 

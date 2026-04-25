@@ -112,39 +112,51 @@ def _paged_write_kv(
 ) -> None:
     """Write new K/V frames into the paged block pool.
 
+    Supports both single-stream (``B=1``) and batched (``B>=2``) inputs —
+    for the batched paged forward each row of ``block_table`` belongs to
+    one stream and writes its own physical block.  Uses vectorised GPU
+    advanced indexing rather than a per-stream ``.item()`` round-trip, so
+    no D2H sync is required.
+
     Parameters
     ----------
     k_cache, v_cache : Tensor
         Pool tensors ``(max_blocks, block_size, n_kv_head, head_dim)``.
     block_table : Tensor
-        ``(1, max_blocks_per_seq)`` int32.
+        ``(B, max_blocks_per_seq)`` int32 — one row per stream in the
+        batch.  All streams share ``seqlen_offset`` (the batched paged
+        forward only batches streams whose offsets match).
     seqlen_offset : int
-        Absolute frame index at which to start writing (= ``cache_seqlens[0]``
-        before any increment).
+        Absolute frame index at which to start writing.  Host-side int —
+        no GPU sync.
     new_k, new_v : Tensor
-        ``(1, n_kv_head, chunk_size, head_dim)`` — **head-first** layout as
-        returned by :meth:`MultiHeadedAttention.forward_qkv`.
+        ``(B, n_kv_head, chunk_size, head_dim)`` — **head-first** layout
+        as returned by :meth:`MultiHeadedAttention.forward_qkv`.
     """
     block_size = k_cache.size(1)
     chunk_size = new_k.size(2)
-    # Pool layout: (block_size, n_kv_head, head_dim) → transpose to time-first.
-    k_data = new_k[0].permute(1, 0, 2).contiguous()  # (chunk_size, n_kv_head, d_k)
-    v_data = new_v[0].permute(1, 0, 2).contiguous()
+    blk_logical = seqlen_offset // block_size
+    blk_offset = seqlen_offset % block_size
 
-    written, pos = 0, seqlen_offset
-    while written < chunk_size:
-        blk_logical = pos // block_size
-        blk_offset = pos % block_size
-        phys_blk = block_table[0, blk_logical].item()
-        frames = min(block_size - blk_offset, chunk_size - written)
-        k_cache[phys_blk, blk_offset: blk_offset + frames].copy_(
-            k_data[written: written + frames]
-        )
-        v_cache[phys_blk, blk_offset: blk_offset + frames].copy_(
-            v_data[written: written + frames]
-        )
-        written += frames
-        pos += frames
+    # Time-first per-stream layout: (B, chunk_size, n_kv_head, d_k).
+    k_data = new_k.permute(0, 2, 1, 3).contiguous()
+    v_data = new_v.permute(0, 2, 1, 3).contiguous()
+
+    # Per-stream physical block IDs — vectorised GPU index, no .item().
+    phys_blks = block_table[:, blk_logical].long()  # (B,)
+
+    if blk_offset + chunk_size <= block_size:
+        # Common case: all chunk frames land in one block per stream.
+        k_cache[phys_blks, blk_offset: blk_offset + chunk_size] = k_data
+        v_cache[phys_blks, blk_offset: blk_offset + chunk_size] = v_data
+    else:
+        # Span two blocks (chunk straddles a block boundary).
+        first_n = block_size - blk_offset
+        phys_blks_next = block_table[:, blk_logical + 1].long()  # (B,)
+        k_cache[phys_blks, blk_offset:block_size] = k_data[:, :first_n]
+        v_cache[phys_blks, blk_offset:block_size] = v_data[:, :first_n]
+        k_cache[phys_blks_next, 0: chunk_size - first_n] = k_data[:, first_n:]
+        v_cache[phys_blks_next, 0: chunk_size - first_n] = v_data[:, first_n:]
 
 
 def _paged_gather_kv(
@@ -155,45 +167,50 @@ def _paged_gather_kv(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Gather K and V from the paged pool for all ``total_frames`` tokens.
 
-    The frames returned include any frames just written by :func:`_paged_write_kv`
-    in the same forward pass (because those writes happened in-place to the
-    pool tensors before this gather).
+    Supports both single-stream (``B=1``) and batched (``B>=2``) inputs —
+    one block-table row per stream.  The frames returned include any
+    frames just written by :func:`_paged_write_kv` in the same forward
+    pass (those writes happened in-place to the pool tensors before
+    this gather).
 
     Parameters
     ----------
     k_cache, v_cache : Tensor
         Pool tensors ``(max_blocks, block_size, n_kv_head, head_dim)``.
     block_table : Tensor
-        ``(1, max_blocks_per_seq)`` int32.
+        ``(B, max_blocks_per_seq)`` int32.
     total_frames : int
-        Total number of frames to retrieve.  Pass
+        Total number of frames to retrieve per stream.  Pass
         ``cache_seqlens[0] + chunk_size`` to include the current chunk.
 
     Returns
     -------
     k, v : Tensor
-        Both shaped ``(1, n_kv_head, total_frames, head_dim)`` — head-first,
-        matching SDPA's expected layout.
+        Both shaped ``(B, n_kv_head, total_frames, head_dim)`` —
+        head-first, matching SDPA's expected layout.
     """
+    B = block_table.size(0)
     if total_frames == 0:
         n_kv_head, head_dim = k_cache.size(2), k_cache.size(3)
         empty = torch.zeros(
-            1, n_kv_head, 0, head_dim, dtype=k_cache.dtype, device=k_cache.device
+            B, n_kv_head, 0, head_dim, dtype=k_cache.dtype, device=k_cache.device
         )
         return empty, empty.clone()
 
     block_size = k_cache.size(1)
     num_blocks = (total_frames + block_size - 1) // block_size
-    block_ids = block_table[0, :num_blocks].long()  # int32 → int64 for indexing
+    block_ids = block_table[:, :num_blocks].long()  # (B, num_blocks)
 
-    # (num_blocks, block_size, n_kv_head, head_dim) → (total_frames, ...)
-    k_flat = k_cache[block_ids].reshape(-1, k_cache.size(2), k_cache.size(3))[:total_frames]
-    v_flat = v_cache[block_ids].reshape(-1, v_cache.size(2), v_cache.size(3))[:total_frames]
+    # (B, num_blocks, block_size, n_kv_head, d_k) → flatten the block axis.
+    k_gathered = k_cache[block_ids].reshape(
+        B, num_blocks * block_size, k_cache.size(2), k_cache.size(3)
+    )[:, :total_frames]
+    v_gathered = v_cache[block_ids].reshape(
+        B, num_blocks * block_size, v_cache.size(2), v_cache.size(3)
+    )[:, :total_frames]
 
-    # → (1, n_kv_head, total_frames, head_dim)  head-first
-    k = k_flat.permute(1, 0, 2).unsqueeze(0)
-    v = v_flat.permute(1, 0, 2).unsqueeze(0)
-    return k, v
+    # → (B, n_kv_head, total_frames, d_k)  head-first
+    return k_gathered.permute(0, 2, 1, 3), v_gathered.permute(0, 2, 1, 3)
 
 
 class MultiHeadedAttention(nn.Module):

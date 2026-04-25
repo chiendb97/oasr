@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from typing import Deque, List, Optional
+from typing import Deque, Dict, List, Optional
 
 from .config import EngineConfig
 from .request import Request, RequestState
@@ -38,25 +38,24 @@ class SchedulerOutput:
 
     Attributes
     ----------
-    scheduled_requests : List[Request]
-        Running streaming requests that have at least one chunk ready to
-        process this step.
+    running_streams : List[Request]
+        All admitted streaming requests currently in the running pool.  The
+        engine step-loop decides per-request whether to run feature
+        extraction, an encoder chunk, or finalisation; the scheduler no
+        longer distinguishes those states because a single request may need
+        several of them within one step.
     newly_admitted : List[Request]
         Requests that were just promoted from WAITING to RUNNING this step.
         For streaming requests, this is where the engine allocates their KV
         cache; offline batches are admitted-then-finalised in the same step
         and never enter ``_running``.
-    to_finalize : List[Request]
-        Running streaming requests that have exhausted their chunks and
-        should be finalised (decode + cleanup) this step.
     offline_batch : List[Request]
         Length-bucketed batch of offline requests to forward in a single
         padded batch.  Empty when no offline work is scheduled this step.
     """
 
-    scheduled_requests: List[Request] = field(default_factory=list)
+    running_streams: List[Request] = field(default_factory=list)
     newly_admitted: List[Request] = field(default_factory=list)
-    to_finalize: List[Request] = field(default_factory=list)
     offline_batch: List[Request] = field(default_factory=list)
 
 
@@ -87,6 +86,10 @@ class Scheduler:
         self._streaming_waiting: Deque[Request] = deque()
         self._offline_waiting: Deque[Request] = deque()
         self._running: "OrderedDict[str, Request]" = OrderedDict()
+        # O(1) lookup index — kept in sync with the three queues above so
+        # ``feed_chunk`` doesn't pay an O(N_pending) scan per chunk on
+        # backlog-style workloads.
+        self._index: Dict[str, Request] = {}
         self._next_stream_id: int = 0
 
     # ------------------------------------------------------------------
@@ -106,6 +109,7 @@ class Scheduler:
             self._insert_ordered(self._streaming_waiting, request)
         else:
             self._insert_ordered(self._offline_waiting, request)
+        self._index[request.request_id] = request
 
     def schedule(self) -> SchedulerOutput:
         """Compute the next scheduling step."""
@@ -126,12 +130,10 @@ class Scheduler:
             self._running[req.request_id] = req
             output.newly_admitted.append(req)
 
-        # 3. Classify running streaming requests.
-        for req in list(self._running.values()):
-            if req.has_chunks:
-                output.scheduled_requests.append(req)
-            else:
-                output.to_finalize.append(req)
+        # 3. Hand the engine all active streams; it dispatches per-stream
+        #    work (feature extraction, encoder chunk, finalisation) itself
+        #    because one step may need to do several of those in sequence.
+        output.running_streams = list(self._running.values())
 
         return output
 
@@ -139,6 +141,7 @@ class Scheduler:
         """Move a running streaming request to the FINISHED state."""
         req = self._running.pop(request_id)
         req.state = RequestState.FINISHED
+        self._index.pop(request_id, None)
         return req
 
     def abort_request(self, request_id: str) -> Optional[Request]:
@@ -146,18 +149,31 @@ class Scheduler:
         if request_id in self._running:
             req = self._running.pop(request_id)
             req.state = RequestState.FINISHED
+            self._index.pop(request_id, None)
             return req
         for queue in (self._streaming_waiting, self._offline_waiting):
             for i, req in enumerate(queue):
                 if req.request_id == request_id:
                     del queue[i]
                     req.state = RequestState.FINISHED
+                    self._index.pop(request_id, None)
                     return req
         return None
 
     def has_pending(self) -> bool:
         """Return ``True`` if there are waiting or running requests."""
         return bool(self._streaming_waiting or self._offline_waiting or self._running)
+
+    def find_request(self, request_id: str) -> Optional[Request]:
+        """Look up a request by id across the running pool and waiting queues.
+
+        Used by :meth:`ASREngine.feed_chunk` to push an audio chunk onto a
+        streaming request that may be running, waiting, or already gone
+        (in which case ``None`` is returned and the caller must decide
+        whether to raise or silently drop the chunk).  O(1) via the
+        scheduler's id index.
+        """
+        return self._index.get(request_id)
 
     # ------------------------------------------------------------------
     # Internal — streaming admission
@@ -166,18 +182,38 @@ class Scheduler:
     def _admit_streaming(self, budget: int) -> List[Request]:
         """Pick up to ``budget`` streaming requests to promote to RUNNING.
 
-        Streaming admission uses priority + arrival order; bucketing is less
-        useful here because the model's streaming forward is per-request
-        sequential (each request owns its own KV cache).  Prioritising
-        shorter requests would still help tail-latency but could starve
-        long-form streams, so we keep it arrival-ordered unless ``sjf``
-        policy is active.
+        With ``streaming_cohort_admit=True`` the scheduler gates admission
+        on the running pool's offset state so all active streams stay in
+        lockstep, **and** sorts the waiting queue by length so each cohort
+        contains length-similar utterances.  Together this minimises tail
+        waste at cohort drain time (no single long stream stalling 31
+        finished slots) and amortises encoder kernel launches across the
+        widest possible ``B = max_batch_size`` batched paged forward —
+        the single biggest streaming throughput lever on backlog
+        workloads.
+
+        Without cohort admission, admission falls back to the
+        ``schedule_policy`` ordering (FCFS / bucket / SJF).
         """
         if budget <= 0 or not self._streaming_waiting:
             return []
 
-        policy = self._config.schedule_policy
-        if policy == "sjf":
+        cfg = self._config
+
+        # Cohort gate: only admit when the running pool is empty or every
+        # running stream is still at offset 0.  Streams admitted in the same
+        # step share offset 0 and tick in lockstep until the cohort drains.
+        if cfg.streaming_cohort_admit and self._running:
+            for req in self._running.values():
+                if req.offset != 0:
+                    return []
+
+        policy = cfg.schedule_policy
+        # When cohort admission is on, length-bucket the waiting queue so
+        # the next cohort consists of similar-length utterances — keeps
+        # the cohort drain tail short.  Otherwise honour the configured
+        # policy (bucket / sjf / fcfs).
+        if cfg.streaming_cohort_admit or policy == "sjf":
             self._sort_by_length(self._streaming_waiting)
 
         admitted: List[Request] = []
