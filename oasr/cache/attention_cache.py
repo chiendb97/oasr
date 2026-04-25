@@ -22,7 +22,7 @@ a shared ``BlockPool``.  Two usage modes are supported:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -337,6 +337,57 @@ class AttentionCacheManager:
                 )
             )
         return caches
+
+    def prepare_chunks_batched(self, stream_ids: List[int]) -> None:
+        """Allocate one new physical block for each of ``stream_ids``.
+
+        Cheaper than calling :meth:`prepare_chunk` once per stream when
+        the engine is dispatching a batched paged forward — does ONE
+        :meth:`BlockPool.allocate` call for ``B`` blocks and writes the
+        resulting IDs into each stream's GPU block_table via a single
+        scatter-style update.
+        """
+        if not stream_ids:
+            return
+        cfg = self._config
+        # Lazily allocate block_table / cache_seqlens for any new streams.
+        for sid in stream_ids:
+            state = self._get_state(sid)
+            if state.block_table is None:
+                state.block_table = torch.zeros(
+                    1, cfg.max_blocks_per_seq, dtype=torch.int32,
+                    device=cfg.device,
+                )
+                state.cache_seqlens = torch.zeros(
+                    1, dtype=torch.int32, device=cfg.device,
+                )
+
+        block_ids = self._pool.allocate(len(stream_ids))
+        # Update host + GPU state per stream.  GPU writes are one-element
+        # scalar stores into each stream's own block_table tensor — small
+        # but unavoidable with per-stream block tables.
+        for sid, block_id in zip(stream_ids, block_ids):
+            state = self._streams[sid]
+            state.logical_blocks.append(block_id)
+            logical_idx = len(state.logical_blocks) - 1
+            state.block_table[0, logical_idx] = block_id  # type: ignore[index]
+
+    def get_paged_state_views(
+        self, stream_id: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(block_table, cache_seqlens)`` shared across all layers.
+
+        Cheaper than :meth:`get_paged_caches` for callers that only need
+        the per-stream paging tensors (the batched paged forward stacks
+        these across streams to build a single ``B``-row block-table).
+        """
+        state = self._get_state(stream_id)
+        if state.block_table is None or state.cache_seqlens is None:
+            raise RuntimeError(
+                f"Stream {stream_id}: call prepare_chunk() before "
+                f"get_paged_state_views()."
+            )
+        return state.block_table, state.cache_seqlens
 
     def commit_chunk_paged(self, stream_id: int, chunk_frames: int) -> None:
         """Advance ``cache_seqlens`` after a paged forward pass and evict if needed.

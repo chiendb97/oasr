@@ -75,14 +75,17 @@ class Request:
 
     def __init__(
         self,
-        audio: Union[str, torch.Tensor, "np.ndarray"],
+        audio: Optional[Union[str, torch.Tensor, "np.ndarray"]] = None,
         request_id: Optional[str] = None,
         streaming: bool = False,
         sample_rate: int = 16000,
         priority: int = DEFAULT_PRIORITY,
     ) -> None:
         self.request_id: str = request_id or uuid.uuid4().hex
-        self.audio: Union[str, torch.Tensor, "np.ndarray"] = audio
+        # ``audio`` is optional for the chunk-by-chunk streaming API
+        # (``ASREngine.add_streaming_request`` registers a stream then
+        # ``ASREngine.feed_chunk`` pushes individual chunks afterwards).
+        self.audio: Optional[Union[str, torch.Tensor, "np.ndarray"]] = audio
         self.streaming: bool = streaming
         self.sample_rate: int = sample_rate
         self.priority: int = priority
@@ -125,6 +128,11 @@ class Request:
         # more audio will arrive).  Triggers fbank flush + last-window forward.
         self.audio_final: bool = False
 
+        # Running total of audio samples enqueued via ``feed_chunk`` /
+        # ``prepare_streaming``.  Used by :meth:`append_streaming_chunk` to
+        # update ``num_frames`` in O(1) instead of summing the whole deque.
+        self.samples_enqueued: int = 0
+
         # Assigned by Scheduler
         self.stream_id: Optional[int] = None
 
@@ -166,7 +174,12 @@ class Request:
         return time.monotonic() - self.arrival_time
 
     def __repr__(self) -> str:
-        audio_repr = self.audio if isinstance(self.audio, str) else type(self.audio).__name__
+        if self.audio is None:
+            audio_repr = "None"
+        elif isinstance(self.audio, str):
+            audio_repr = self.audio
+        else:
+            audio_repr = type(self.audio).__name__
         return (
             f"Request(id={self.request_id[:8]}, state={self.state.value}, "
             f"streaming={self.streaming}, audio={audio_repr})"

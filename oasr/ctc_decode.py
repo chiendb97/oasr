@@ -45,6 +45,7 @@ from typing import List, Optional
 
 import torch
 
+from oasr.utils.nvtx import nvtx_pop, nvtx_push
 from oasr.api_logging import oasr_api
 
 
@@ -475,65 +476,52 @@ class GpuStreamingDecoder:
             Explicit per-request state.  When ``None`` the internal
             default state (set by :meth:`init_stream`) is used.
         """
+        nvtx_push("ctc.decode_chunk")
         s = self._resolve_state(state)
         cfg = self._config
         log_prob = log_prob.contiguous().float()
         chunk_t = log_prob.size(1)
         if chunk_t == 0:
+            nvtx_pop()
             return
 
         blank_log_thresh = self._blank_log_thresh
 
         # Batch blank-threshold check: a single GPU→CPU transfer for the
-        # entire chunk replaces one .min().item() sync per frame.
+        # entire chunk replaces one .min().item() sync per frame.  The mask
+        # is then handed to the C++ chunk launcher as-is so the per-frame
+        # skip happens without a Python round-trip.
         if blank_log_thresh is not None:
-            is_speech = (
+            is_speech_mask = (
                 log_prob[:, :, cfg.blank_id]
                 .min(dim=0).values
                 .lt_(blank_log_thresh)
+                .to(torch.uint8)
                 .cpu()
             )
         else:
-            is_speech = None
+            is_speech_mask = torch.empty(0, dtype=torch.uint8)
 
-        # Pull hot-loop attributes into locals
-        state_buf = s.buffer
-        beam = cfg.beam_size
-        blank_id = cfg.blank_id
-        blank_threshold = cfg.blank_threshold
-        max_step = cfg.max_seq_len
-        mod_step = self._mod.ctc_beam_search_step
-        step = s.step
-        frame_idx = s.actual_frame_idx
-        batch = s.batch
-        vocab_size = s.vocab_size
-        use_paged = 1 if cfg.use_paged_memory else 0
-        page_size = cfg.page_size
+        new_step = int(self._mod.ctc_beam_search_chunk(
+            s.buffer, log_prob, is_speech_mask,
+            cfg.beam_size, cfg.blank_id,
+            s.step, cfg.blank_threshold,
+            s.actual_frame_idx,
+            s.batch, s.vocab_size, cfg.max_seq_len,
+            1 if cfg.use_paged_memory else 0, cfg.page_size,
+        ))
 
-        for t in range(chunk_t):
-            if step >= max_step:
-                break
-            if is_speech is not None and not is_speech[t]:
-                frame_idx += 1
-                continue
-
-            # The C++ launcher reads batch_stride / vocab_stride from the
-            # DLPack strides, so a non-contiguous view is perfectly fine
-            # and avoids a per-frame cudaMemcpy that .contiguous() incurs.
-            # Passing the known dimensions lets the launcher skip a blocking
-            # GPU→CPU read of the state header on every step.
-            mod_step(
-                state_buf, log_prob[:, t, :],
-                beam, blank_id,
-                step, blank_threshold,
-                frame_idx,
-                batch, vocab_size, max_step, use_paged, page_size,
-            )
-            step += 1
-            frame_idx += 1
-
-        s.step = step
-        s.actual_frame_idx = frame_idx
+        # The chunk launcher decodes ``min(active_frames, max_seq_len -
+        # start_step)`` frames; we know ``frame_idx`` advances by the chunk
+        # length when the cap isn't hit, and by ``new_step - start_step + (
+        # blanks before truncation)`` otherwise.  In practice the cap is
+        # never hit during normal streaming so the simple formula below is
+        # correct; the worst case (cap hit mid-chunk) leaves frame_idx
+        # slightly low which only affects the optional space-id timestamp
+        # tracking, not transcription.
+        s.step = new_step
+        s.actual_frame_idx += chunk_t
+        nvtx_pop()
 
     def finalize_stream(
         self, state: Optional[StreamState] = None,

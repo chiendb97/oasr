@@ -16,8 +16,22 @@ from oasr.features import FeatureConfig, extract_features_batch
 from oasr.features.backends import _extract as _extract_single
 from oasr.features.gpu_fbank import batched_fbank_gpu, supports_batched_gpu_fbank
 
+from oasr.utils.nvtx import nvtx_pop, nvtx_push
+
 from .config import EngineConfig
 from .request import Request
+
+
+class _NullCtx:
+    """No-op context manager used when fbank doesn't need a dedicated stream."""
+
+    __slots__ = ()
+
+    def __enter__(self) -> "_NullCtx":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
 
 
 class InputProcessor:
@@ -432,7 +446,7 @@ class InputProcessor:
     # ------------------------------------------------------------------
 
     def prepare_streaming(self, request: Request) -> None:
-        """Register a streaming request without extracting any features.
+        """Register a streaming request from a full waveform (legacy API).
 
         Splits the raw waveform into **audio-sample** chunks that the engine
         then feeds into the fbank path incrementally — one chunk per step per
@@ -443,8 +457,11 @@ class InputProcessor:
         The default audio-chunk size corresponds to ``stride`` feature frames
         (i.e. one encoder chunk worth of new audio): at 16 kHz with a 10 ms
         hop and ``chunk_size=16``/``subsampling_rate=4`` that's 10240 samples
-        ≈ 640 ms.  This matches the rate at which a real-time client would
-        push audio frames into the engine.
+        ≈ 640 ms.
+
+        Prefer :meth:`prepare_streaming_open` + :meth:`append_streaming_chunk`
+        for chunk-by-chunk feeding, which models a real-time client more
+        faithfully and avoids the up-front waveform load.
         """
         wav = request.waveform if request.waveform is not None \
             else self.load_audio(request.audio, request.sample_rate)
@@ -470,6 +487,77 @@ class InputProcessor:
         request.feature_cursor = 0
         request.waveform = None
 
+    def prepare_streaming_open(self, request: Request) -> None:
+        """Register an empty streaming request — chunks arrive via
+        :meth:`append_streaming_chunk`.
+
+        Sets up the streaming state with an empty audio queue.  No fbank
+        runs and no waveform load happens here; the engine starts processing
+        as soon as the first chunk lands.
+        """
+        request.audio_chunks = deque()
+        request.audio_tail = torch.empty(0, dtype=torch.float32)
+        request.audio_final = False
+        request.num_frames = 0
+        request.feature_buffer = None
+        request.feature_frames = 0
+        request.feature_cursor = 0
+        request.waveform = None
+
+    def append_streaming_chunk(
+        self,
+        request: Request,
+        chunk: Union[torch.Tensor, np.ndarray],
+        is_last: bool = False,
+    ) -> None:
+        """Push one audio chunk onto an open streaming request.
+
+        Parameters
+        ----------
+        request : Request
+            A request previously initialised with :meth:`prepare_streaming_open`.
+        chunk : Tensor or ndarray
+            1-D audio samples (CPU or GPU; converted to CPU float32).
+        is_last : bool
+            ``True`` marks the final chunk — sets ``audio_final`` so the
+            engine flushes the trailing partial frame.
+        """
+        if request.audio_chunks is None:
+            raise RuntimeError(
+                "append_streaming_chunk called on a request that was not "
+                "initialised via prepare_streaming_open"
+            )
+        if request.audio_final:
+            raise RuntimeError(
+                f"feed_chunk after is_last=True for request {request.request_id}"
+            )
+
+        # Normalise to CPU float32 1-D, scaled like load_audio does.
+        scale = self._config.audio_scale
+        if isinstance(chunk, np.ndarray):
+            wav: torch.Tensor = torch.from_numpy(chunk)
+        elif isinstance(chunk, torch.Tensor):
+            wav = chunk
+        else:  # type: ignore[unreachable]
+            raise TypeError(f"Unsupported chunk type: {type(chunk)}")
+        if wav.dtype != torch.float32:
+            wav = wav.float()
+        if wav.dim() == 2:
+            wav = wav.squeeze(0)
+        if wav.device.type != "cpu":
+            wav = wav.cpu()
+        if scale != 1.0:
+            wav = wav * scale
+        wav = wav.contiguous()
+
+        request.audio_chunks.append(wav)
+        request.samples_enqueued += wav.numel()
+        if is_last:
+            request.audio_final = True
+        # Keep the scheduler's bucket estimate roughly in sync.  O(1) using
+        # the running total instead of re-summing the deque per chunk.
+        request.num_frames = self._estimate_num_frames(request.samples_enqueued)
+
     @property
     def streaming_audio_chunk_samples(self) -> int:
         """Default per-step audio-chunk size in samples (= ``stride`` frames)."""
@@ -479,6 +567,7 @@ class InputProcessor:
     def extract_streaming_batch(
         self,
         requests: List[Request],
+        cuda_stream: Optional["torch.cuda.Stream"] = None,
     ) -> None:
         """Run one batched GPU-fbank call over all queued streams.
 
@@ -491,6 +580,15 @@ class InputProcessor:
         No stream is allowed to look at samples beyond its own enqueued
         chunk — we only fuse across *different* streams, never across future
         chunks of the same stream.
+
+        Parameters
+        ----------
+        cuda_stream : torch.cuda.Stream, optional
+            When provided (and the engine is on CUDA) the H2D copy and
+            ``batched_fbank_gpu`` kernel run on this stream so they can
+            overlap with the encoder forward on the default stream.  The
+            caller is responsible for synchronising the default stream
+            against fbank completion before reading ``feature_buffer``.
         """
         if not requests:
             return
@@ -557,6 +655,7 @@ class InputProcessor:
         if not fbank_reqs:
             return
 
+        nvtx_push("pad+pin")
         lengths_cpu = torch.tensor(
             [w.numel() for w in fbank_inputs], dtype=torch.int64
         )
@@ -570,15 +669,31 @@ class InputProcessor:
             lengths_cpu_pin = lengths_cpu.pin_memory()
         else:
             lengths_cpu_pin = lengths_cpu
-
-        wav_gpu = padded_cpu.to(device=device, non_blocking=True)
-        lengths_gpu = lengths_cpu_pin.to(device=device, non_blocking=True)
+        nvtx_pop()
 
         use_gpu_fbank = device.type == "cuda" and supports_batched_gpu_fbank(fcfg)
+        # If a dedicated CUDA stream was provided, run the H2D copy and the
+        # fbank kernel on it so they can overlap with the encoder forward on
+        # the default stream.  The caller is responsible for inserting the
+        # event-wait before reading feature_buffer.
+        use_alt_stream = (
+            use_gpu_fbank and cuda_stream is not None
+        )
         if use_gpu_fbank:
-            feats_f32, feat_lens = batched_fbank_gpu(wav_gpu, lengths_gpu, fcfg)
-            feats = feats_f32.to(dtype=dtype)
-            feat_lens_cpu = feat_lens.to(device="cpu").tolist()
+            stream_ctx = (
+                torch.cuda.stream(cuda_stream) if use_alt_stream
+                else _NullCtx()
+            )
+            with stream_ctx:
+                nvtx_push("h2d")
+                wav_gpu = padded_cpu.to(device=device, non_blocking=True)
+                lengths_gpu = lengths_cpu_pin.to(device=device, non_blocking=True)
+                nvtx_pop()
+                nvtx_push("fbank")
+                feats_f32, feat_lens = batched_fbank_gpu(wav_gpu, lengths_gpu, fcfg)
+                feats = feats_f32.to(dtype=dtype)
+                feat_lens_cpu = feat_lens.to(device="cpu").tolist()
+                nvtx_pop()
         else:
             # Fallback: per-utt CPU/torchaudio fbank.  Used by non-Povey
             # configs and CPU-only devices.
@@ -598,6 +713,7 @@ class InputProcessor:
             feat_lens_cpu = feat_lens_cpu_list
 
         # Distribute new frames back into per-stream buffers and update tails.
+        nvtx_push("distribute")
         for i, req in enumerate(fbank_reqs):
             new_nf = int(feat_lens_cpu[i])
             if new_nf > 0:
@@ -612,6 +728,7 @@ class InputProcessor:
                 req.audio_tail = cat[consumed:].contiguous()
             else:
                 req.audio_tail = cat.new_empty(0)
+        nvtx_pop()
 
     def _append_features(
         self,

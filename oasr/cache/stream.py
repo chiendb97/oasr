@@ -27,7 +27,7 @@ Typical usage::
 
 from __future__ import annotations
 
-from typing import List, Union
+from typing import List, Tuple, Union
 
 import torch
 
@@ -138,6 +138,15 @@ class StreamContext:
             One entry per encoder layer.
         """
         return self._attention_cache.get_paged_caches(self._stream_id)
+
+    def get_paged_state_views(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the per-stream ``(block_table, cache_seqlens)`` views.
+
+        Cheap accessor for the batched paged forward — avoids building 12
+        :class:`PagedKVCache` dataclass instances per stream just to read
+        the shared paging tensors.
+        """
+        return self._attention_cache.get_paged_state_views(self._stream_id)
 
     def prepare_chunk(self) -> None:
         """Allocate the next physical block before a paged forward pass.

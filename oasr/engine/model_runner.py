@@ -19,6 +19,8 @@ from oasr.cache import (
 from oasr.layers.attention.attention import PagedKVCache
 from oasr.models.conformer.model import ConformerModel
 
+from oasr.utils.nvtx import nvtx_pop, nvtx_push
+
 from .config import EngineConfig
 from .request import Request
 
@@ -261,37 +263,45 @@ class ModelRunner:
             self._forward_single(group[0], window, stride, context, results)
             return
 
+        nvtx_push(f"batched_paged[B={len(group)}]")
         # 1. Prepare per-stream write blocks (allocates a new physical
-        #    block and updates each stream's block_table in place).
-        for req in group:
-            ctx = req.stream_context
-            assert ctx is not None
-            ctx.prepare_chunk()
+        #    block and updates each stream's block_table in place).  One
+        #    batched allocator call instead of B per-stream calls.
+        nvtx_push("prepare_chunk")
+        stream_ids = [req.stream_id for req in group]
+        # All streams in a group are paged; assert non-None to satisfy mypy.
+        assert all(req.stream_context is not None for req in group)
+        self._att_mgr.prepare_chunks_batched(stream_ids)  # type: ignore[arg-type]
+        nvtx_pop()
 
         # 2. Stack per-stream paged descriptors into a (B, ...) view.
         #    All layers share the same block_table / cache_seqlens (one
-        #    pair per stream), so we stack once and reuse across layers.
-        block_tables = [req.stream_context.get_att_caches()[0].block_table
-                        for req in group]
-        cache_seqlens = [req.stream_context.get_att_caches()[0].cache_seqlens
-                         for req in group]
+        #    pair per stream), so we read those shared tensors via a
+        #    cheap accessor (no per-layer dataclass construction) and
+        #    stack once for the whole batched forward.
+        block_tables: List[torch.Tensor] = []
+        cache_seqlens: List[torch.Tensor] = []
+        for req in group:
+            bt, cs = req.stream_context.get_paged_state_views()
+            block_tables.append(bt)
+            cache_seqlens.append(cs)
         batched_bt = torch.cat(block_tables, dim=0)       # (B, blocks_per_seq)
         batched_cs = torch.cat(cache_seqlens, dim=0)      # (B,)
 
         # 3. Build batched PagedKVCache descriptors, one per layer, that
         #    share k_cache / v_cache with each stream (the block pool is
         #    global) and share the newly-stacked block_table / cache_seqlens.
-        sample_caches = group[0].stream_context.get_att_caches()
-        num_layers = len(sample_caches)
+        block_size = self._cache_config.block_size_frames
+        num_layers = self._cache_config.num_layers
         batched_att_caches: List[PagedKVCache] = []
         for i in range(num_layers):
-            base = sample_caches[i]
+            k_view, v_view = self._block_pool.get_kv_view(i)
             batched_att_caches.append(PagedKVCache(
-                k_cache=base.k_cache,
-                v_cache=base.v_cache,
+                k_cache=k_view,
+                v_cache=v_view,
                 block_table=batched_bt,
                 cache_seqlens=batched_cs,
-                block_size=base.block_size,
+                block_size=block_size,
                 host_seqlen=offset,
             ))
 
@@ -314,6 +324,7 @@ class ModelRunner:
             cnn_cache = per_stream_cnn[0]  # placeholder (0,0,0,0)
 
         # 5. One batched encoder call.
+        nvtx_push("encoder_call")
         log_probs, new_cnn = self._model.forward_chunk_paged(
             xs,
             offset,
@@ -322,15 +333,19 @@ class ModelRunner:
             cache_t1=offset,
         )
         actual_frames = log_probs.size(1)
+        nvtx_pop()
 
         # 6. Split the new cnn_cache back into per-stream slices and
         #    commit per-stream attention-cache advancement.
+        nvtx_push("commit")
         for b, req in enumerate(group):
             per_stream_new_cnn = new_cnn[:, b: b + 1]  # (L, 1, T, H)
             req.stream_context.commit_chunk_paged(actual_frames, per_stream_new_cnn)
             req.offset += actual_frames
             req.feature_cursor += stride
             results[req.request_id] = log_probs[b: b + 1]
+        nvtx_pop()
+        nvtx_pop()  # batched_paged
 
     # ------------------------------------------------------------------
     # Per-stream fallback forward
