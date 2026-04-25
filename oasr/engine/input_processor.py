@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -407,17 +408,12 @@ class InputProcessor:
     def chunk_features(self, features: torch.Tensor) -> List[torch.Tensor]:
         """Split a ``(1, T, F)`` feature tensor into overlapping chunk windows.
 
-        The windowing replicates the logic in
-        ``ConformerEncoder.forward_chunk_by_chunk``:
+        Kept for tests and legacy use.  The live streaming path now slices
+        encoder chunks directly out of ``Request.feature_buffer`` in the
+        engine step loop; this helper is no longer called for admission.
 
         * stride = ``subsampling_rate * chunk_size``
         * window = ``(chunk_size - 1) * subsampling_rate + right_context + 1``
-
-        Returns
-        -------
-        List[Tensor]
-            List of ``(1, window, F)`` feature windows ready for
-            ``model.forward_chunk`` / ``model.forward_chunk_paged``.
         """
         cfg = self._config
         stride = cfg.stride
@@ -431,50 +427,228 @@ class InputProcessor:
             chunks.append(features[:, cur:end, :])
         return chunks
 
-    def process_for_streaming(self, request: Request) -> None:
-        """Load audio, extract features, and pre-chunk for streaming.
+    # ------------------------------------------------------------------
+    # Streaming audio ingest + per-step batched fbank
+    # ------------------------------------------------------------------
 
-        Uses the batched GPU fbank fast path (:func:`batched_fbank_gpu`)
-        on a single-item batch when the config permits — even for one
-        utterance it's ~2–3× faster than the per-call
-        ``torchaudio.compliance.kaldi.fbank`` path because it skips the
-        per-call mel-bank construction and Python-level option building
-        that dominates single-utt runtime.  Populates
-        ``request.features``, ``request.feature_lengths``,
-        ``request.num_frames``, and ``request.chunks_remaining``.
+    def prepare_streaming(self, request: Request) -> None:
+        """Register a streaming request without extracting any features.
+
+        Splits the raw waveform into **audio-sample** chunks that the engine
+        then feeds into the fbank path incrementally — one chunk per step per
+        stream.  Only the tail of the previous chunk is re-used when
+        extracting features, so the engine never looks at future audio when
+        processing the current chunk.
+
+        The default audio-chunk size corresponds to ``stride`` feature frames
+        (i.e. one encoder chunk worth of new audio): at 16 kHz with a 10 ms
+        hop and ``chunk_size=16``/``subsampling_rate=4`` that's 10240 samples
+        ≈ 640 ms.  This matches the rate at which a real-time client would
+        push audio frames into the engine.
         """
         wav = request.waveform if request.waveform is not None \
             else self.load_audio(request.audio, request.sample_rate)
 
-        if self._device.type == "cuda" \
-                and supports_batched_gpu_fbank(self._feature_config):
-            wav_cpu = wav
-            if not wav_cpu.is_pinned():
-                wav_cpu = wav_cpu.pin_memory()
-            wav_gpu = wav_cpu.to(self._device, non_blocking=True).unsqueeze(0)
-            lengths_gpu = torch.tensor(
-                [wav.size(0)], dtype=torch.int64, device=self._device,
-            )
-            features_f32, feat_lengths = batched_fbank_gpu(
-                wav_gpu, lengths_gpu, self._feature_config,
-            )
-            features = features_f32.to(dtype=self._config.dtype)
-            # Trim to the one valid length before chunking so the
-            # downstream windowing sees only the utterance's real frames.
-            T = int(feat_lengths[0].item())
-            features = features[:, :T, :]
-        else:
-            features, feat_lengths = extract_features_batch(
-                [wav], self._feature_config,
-            )
-            features = features.to(
-                device=self._device, dtype=self._config.dtype,
-            )
-            feat_lengths = feat_lengths.to(device=self._device)
+        # Keep the waveform on CPU float32 for fbank; GPU promotion is batched
+        # in ``extract_streaming_batch``.
+        wav_cpu = wav.detach()
+        if wav_cpu.device.type != "cpu":
+            wav_cpu = wav_cpu.cpu()
 
-        request.features = features  # (1, T, F)
-        request.feature_lengths = feat_lengths
-        request.num_frames = int(feat_lengths.item() if feat_lengths.numel() == 1
-                                  else feat_lengths[0].item())
-        request.chunks_remaining = self.chunk_features(features)
+        chunk_samples = self.streaming_audio_chunk_samples
+        chunks: "deque[torch.Tensor]" = deque()
+        n = wav_cpu.numel()
+        for start in range(0, n, chunk_samples):
+            chunks.append(wav_cpu[start: start + chunk_samples].contiguous())
+
+        request.audio_chunks = chunks
+        request.audio_tail = wav_cpu.new_empty(0)
+        request.audio_final = True  # whole-waveform API — no more audio will arrive
+        request.num_frames = self._estimate_num_frames(n)
+        request.feature_buffer = None
+        request.feature_frames = 0
+        request.feature_cursor = 0
         request.waveform = None
+
+    @property
+    def streaming_audio_chunk_samples(self) -> int:
+        """Default per-step audio-chunk size in samples (= ``stride`` frames)."""
+        fcfg = self._feature_config
+        return self._config.stride * fcfg.frame_shift_samples
+
+    def extract_streaming_batch(
+        self,
+        requests: List[Request],
+    ) -> None:
+        """Run one batched GPU-fbank call over all queued streams.
+
+        For each request with a pending audio chunk, this pops the next
+        chunk, prepends the previous ``audio_tail``, pads all streams to the
+        max combined length, ships one ``(B, T)`` waveform to the device,
+        and runs :func:`batched_fbank_gpu` once for the whole batch.  The
+        per-stream new frames are concatenated onto ``feature_buffer``.
+
+        No stream is allowed to look at samples beyond its own enqueued
+        chunk — we only fuse across *different* streams, never across future
+        chunks of the same stream.
+        """
+        if not requests:
+            return
+
+        fcfg = self._feature_config
+        frame_shift = fcfg.frame_shift_samples
+        frame_len = fcfg.frame_length_samples
+        feat_dim = fcfg.output_dim
+        dtype = self._config.dtype
+        device = self._device
+
+        # Collect per-stream (combined waveform, is_final_flush) pairs.
+        combined: List[torch.Tensor] = []
+        targets: List[Request] = []
+        is_flush: List[bool] = []
+        for req in requests:
+            if req.audio_chunks is None or req.audio_tail is None:
+                continue
+            if req.audio_chunks:
+                chunk = req.audio_chunks.popleft()
+                cat = chunk if req.audio_tail.numel() == 0 \
+                    else torch.cat([req.audio_tail, chunk])
+                flush = req.audio_final and not req.audio_chunks \
+                    and cat.numel() >= frame_len
+                # On the very last chunk pad the tail so the final partial
+                # frame still gets emitted (mirrors
+                # ``_StreamingFeatureExtractor._flush_torchaudio``).
+                if req.audio_final and not req.audio_chunks:
+                    if cat.numel() < frame_len:
+                        pad = cat.new_zeros(frame_len - cat.numel())
+                        cat = torch.cat([cat, pad])
+                        flush = True
+                combined.append(cat)
+                targets.append(req)
+                is_flush.append(flush)
+            elif req.audio_final and req.audio_tail.numel() > 0:
+                # No chunks left but tail still carries unconsumed samples
+                # (can happen when the whole waveform was < chunk_samples).
+                cat = req.audio_tail
+                if cat.numel() < frame_len:
+                    pad = cat.new_zeros(frame_len - cat.numel())
+                    cat = torch.cat([cat, pad])
+                combined.append(cat)
+                targets.append(req)
+                is_flush.append(True)
+
+        if not targets:
+            return
+
+        # Drop streams whose combined buffer is still shorter than one
+        # frame — they need more audio before fbank can produce anything.
+        # Keep their tail updated and retry next step.
+        fbank_inputs: List[torch.Tensor] = []
+        fbank_reqs: List[Request] = []
+        fbank_flush: List[bool] = []
+        for req, cat, flush in zip(targets, combined, is_flush):
+            if cat.numel() < frame_len and not flush:
+                req.audio_tail = cat
+                continue
+            fbank_inputs.append(cat)
+            fbank_reqs.append(req)
+            fbank_flush.append(flush)
+
+        if not fbank_reqs:
+            return
+
+        lengths_cpu = torch.tensor(
+            [w.numel() for w in fbank_inputs], dtype=torch.int64
+        )
+        T_max = int(lengths_cpu.max().item())
+
+        padded_cpu = torch.zeros(len(fbank_inputs), T_max, dtype=torch.float32)
+        for i, w in enumerate(fbank_inputs):
+            padded_cpu[i, : w.numel()] = w
+        if device.type == "cuda":
+            padded_cpu = padded_cpu.pin_memory()
+            lengths_cpu_pin = lengths_cpu.pin_memory()
+        else:
+            lengths_cpu_pin = lengths_cpu
+
+        wav_gpu = padded_cpu.to(device=device, non_blocking=True)
+        lengths_gpu = lengths_cpu_pin.to(device=device, non_blocking=True)
+
+        use_gpu_fbank = device.type == "cuda" and supports_batched_gpu_fbank(fcfg)
+        if use_gpu_fbank:
+            feats_f32, feat_lens = batched_fbank_gpu(wav_gpu, lengths_gpu, fcfg)
+            feats = feats_f32.to(dtype=dtype)
+            feat_lens_cpu = feat_lens.to(device="cpu").tolist()
+        else:
+            # Fallback: per-utt CPU/torchaudio fbank.  Used by non-Povey
+            # configs and CPU-only devices.
+            feat_list: List[torch.Tensor] = []
+            feat_lens_cpu_list: List[int] = []
+            for i, w in enumerate(fbank_inputs):
+                f = _extract_single(w, fcfg)
+                feat_list.append(f)
+                feat_lens_cpu_list.append(f.size(0))
+            max_nf = max(feat_lens_cpu_list) if feat_lens_cpu_list else 0
+            feats_cpu = torch.zeros(
+                len(feat_list), max_nf, feat_dim, dtype=torch.float32
+            )
+            for i, f in enumerate(feat_list):
+                feats_cpu[i, : f.size(0)] = f
+            feats = feats_cpu.to(device=device, dtype=dtype, non_blocking=True)
+            feat_lens_cpu = feat_lens_cpu_list
+
+        # Distribute new frames back into per-stream buffers and update tails.
+        for i, req in enumerate(fbank_reqs):
+            new_nf = int(feat_lens_cpu[i])
+            if new_nf > 0:
+                new_feats = feats[i, :new_nf, :]  # (new_nf, F) view on device
+                self._append_features(req, new_feats, feat_dim)
+            # New tail = samples beyond the last consumed frame
+            consumed = new_nf * frame_shift
+            cat = fbank_inputs[i]
+            if fbank_flush[i]:
+                req.audio_tail = cat.new_empty(0)
+            elif consumed < cat.numel():
+                req.audio_tail = cat[consumed:].contiguous()
+            else:
+                req.audio_tail = cat.new_empty(0)
+
+    def _append_features(
+        self,
+        request: Request,
+        new_frames: torch.Tensor,
+        feat_dim: int,
+    ) -> None:
+        """Append ``new_frames`` to ``request.feature_buffer``.
+
+        The buffer grows amortised-doubled so we never pay an O(T) copy per
+        chunk at steady state.  Consumed prefix (before ``feature_cursor``)
+        is compacted opportunistically so long utterances don't keep
+        re-allocating.
+        """
+        n_new = new_frames.size(0)
+        buf = request.feature_buffer
+        have = request.feature_frames
+
+        # Compact the buffer if the consumed prefix is a large share of it
+        # (cheap amortised, avoids unbounded growth on long streams).
+        if buf is not None and request.feature_cursor > 0 \
+                and request.feature_cursor >= have // 2:
+            keep = buf[request.feature_cursor: have].contiguous()
+            request.feature_buffer = keep
+            buf = request.feature_buffer
+            request.feature_frames = keep.size(0)
+            have = request.feature_frames
+            request.feature_cursor = 0
+
+        needed = have + n_new
+        if buf is None or needed > buf.size(0):
+            cap = max(needed, (buf.size(0) * 2) if buf is not None else max(needed, 128))
+            new_buf = new_frames.new_zeros(cap, feat_dim)
+            if buf is not None and have > 0:
+                new_buf[:have] = buf[:have]
+            request.feature_buffer = new_buf
+            buf = new_buf
+
+        buf[have: have + n_new] = new_frames
+        request.feature_frames = have + n_new

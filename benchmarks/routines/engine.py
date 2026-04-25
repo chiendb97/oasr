@@ -202,8 +202,27 @@ def _time_streaming(
 ) -> tuple[float, float, float]:
     """Time ASREngine over pre-loaded *waveforms* (one request per file).
 
-    Audio must be loaded before calling this function so that file I/O is
-    excluded from the timed region.
+    What this measures
+    ------------------
+    *Backlog-throughput streaming.*  ``add_request(full_waveform)`` does
+    **not** run feature extraction — it just splits the waveform into
+    per-step audio-sample chunks.  ``engine.run()`` then loops ``step()``
+    and each step processes one chunk per active stream:
+
+    1. Batched GPU FBANK across all streams' next-pending chunks (one
+       kernel call for the whole pool, never sees audio beyond what's
+       already enqueued for each stream).
+    2. Per-stream ``forward_chunk_paged`` on the freshly-produced features.
+    3. Per-stream streaming CTC decode + cache commit.
+
+    So the timed compute is identical to what a server would do when it
+    receives chunks from ``max_batch_size`` concurrent real-time clients
+    back-to-back.  Audio is pre-loaded into memory so the number reflects
+    compute only, not disk I/O.  RTF = wall_clock / total_audio_seconds —
+    lower is better; RTF < 1 means the system keeps up with real time.
+
+    For an RTF number that reflects *single-stream* interactive latency
+    (one client sending one chunk every 640 ms), set ``max_batch_size=1``.
 
     Returns
     -------

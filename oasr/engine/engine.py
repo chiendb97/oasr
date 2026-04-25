@@ -30,14 +30,17 @@ class ASREngine:
     (single-pass batched) requests in one step loop.  Each step:
 
     1. **Schedule** — admit up to ``max_offline_batch_size`` waiting offline
-       requests, admit waiting streaming requests up to
-       ``max_batch_size``, and classify running streams.
-    2. **Forward** — route the admitted offline batch through the
+       requests and admit waiting streaming requests up to
+       ``max_batch_size``.
+    2. **Ingest** — batched GPU fbank across every active stream's next
+       pending audio chunk (one kernel call for the whole running pool,
+       no stream ever sees audio beyond its own enqueued chunks).
+    3. **Forward** — route the admitted offline batch through the
        pipelined :class:`OfflinePipeline` (length-bucketed micro-batches
        of size ``offline_micro_batch_size`` overlap GPU feature extraction
        with encoder forward + CTC decode) and run one encoder chunk per
-       active streaming request.
-    3. **Postprocess** — decode log-probs and finalise completed requests.
+       streaming request whose buffer now holds a full window.
+    4. **Postprocess** — decode log-probs and finalise completed requests.
 
     Dynamic batching is length-aware: within the offline pipeline,
     requests are sorted by estimated feature length and split into
@@ -115,12 +118,14 @@ class ASREngine:
         """Add a new request to the engine.
 
         Both paths defer actual feature extraction until the engine step
-        loop can batch it: streaming admission batches fbank across all
-        freshly-admitted streams in one GPU call, and the offline pipeline
-        batches fbank within each GPU micro-batch.  What :meth:`add_request`
-        does synchronously is load the waveform, stamp a cheap but exact
-        (Kaldi ``snip_edges`` formula) frame count so the scheduler can
-        bucket by length, and enqueue.
+        loop can batch it: streaming ingests audio **chunk by chunk** inside
+        ``step()`` (batched across all active streams in one GPU fbank
+        call), and the offline pipeline batches fbank within each GPU
+        micro-batch.  What :meth:`add_request` does synchronously is load
+        the waveform, stamp a cheap but exact (Kaldi ``snip_edges``
+        formula) frame count so the scheduler can bucket by length, and
+        split the waveform into streaming audio chunks on the CPU.  No
+        fbank runs until the request is admitted and stepped.
 
         Parameters
         ----------
@@ -149,14 +154,13 @@ class ASREngine:
             priority=priority,
         )
         if streaming:
-            # Streaming needs ``chunks_remaining`` populated before the
-            # scheduler classifies has_chunks, so we extract features
-            # eagerly here.  ``process_for_streaming`` routes through the
-            # batched GPU fbank fast path (single-item batch) when the
-            # config matches, which is ~2–3× faster than the old
-            # per-utterance ``torchaudio.compliance.kaldi.fbank`` even for
-            # one waveform.
-            self._input_processor.process_for_streaming(req)
+            # Split the waveform into audio-sample chunks *without* running
+            # fbank.  Feature extraction runs inside ``step()`` batched
+            # across all active streams — realistic streaming behaviour
+            # (one chunk's worth of audio produces one chunk's worth of
+            # features) and a much better match for the model's forward
+            # throughput than the old pre-extract-everything admission.
+            self._input_processor.prepare_streaming(req)
         else:
             self._input_processor.prepare_offline(req)
         self._scheduler.add_request(req)
@@ -178,10 +182,6 @@ class ASREngine:
         outputs: List[RequestOutput] = []
 
         # Streaming admission: allocate cache for freshly admitted streams.
-        # Features + chunks are already populated by ``add_request``'s call
-        # to ``process_for_streaming``; the scheduler relies on
-        # ``has_chunks`` to classify admitted streams as runnable, so
-        # extraction has to happen before scheduling, not here.
         for req in sched.newly_admitted:
             if req.streaming:
                 self._model_runner.allocate_stream(req)
@@ -190,24 +190,41 @@ class ASREngine:
         if sched.offline_batch:
             outputs.extend(self._run_offline_batch(sched.offline_batch))
 
-        # Streaming forward — one encoder chunk per active request.
-        if sched.scheduled_requests:
-            log_probs_map: Dict[str, torch.Tensor] = (
-                self._model_runner.forward_streaming_step(sched.scheduled_requests)
-            )
-            for req in sched.scheduled_requests:
-                lp = log_probs_map.get(req.request_id)
-                if lp is not None:
-                    partial = self._output_processor.decode_streaming_chunk(req, lp)
-                    outputs.append(partial)
+        running = sched.running_streams
+        if running:
+            # 1. Batched GPU fbank across every stream with pending audio —
+            #    one kernel call for the whole active pool rather than N
+            #    sequential fbank calls.
+            needs_feat = [r for r in running if r.has_pending_audio]
+            if needs_feat:
+                self._input_processor.extract_streaming_batch(needs_feat)
 
-        # Streaming finalisation — requests whose chunk queue is now empty.
-        for req in sched.to_finalize:
-            final = self._output_processor.finalize_streaming(req)
-            req.output = final
-            outputs.append(final)
-            self._model_runner.free_stream(req)
-            self._scheduler.finish_request(req.request_id)
+            # 2. For each stream whose feature buffer now holds at least
+            #    one encoder window, run forward_chunk_paged.
+            window = self._config.decoding_window
+            ready = [r for r in running if r.has_ready_encoder_chunk(window)]
+            if ready:
+                log_probs_map: Dict[str, torch.Tensor] = (
+                    self._model_runner.forward_streaming_step(ready)
+                )
+                for req in ready:
+                    lp = log_probs_map.get(req.request_id)
+                    if lp is not None:
+                        partial = self._output_processor.decode_streaming_chunk(req, lp)
+                        outputs.append(partial)
+
+            # 3. Finalise streams whose audio is exhausted and whose
+            #    feature buffer has been fully consumed.  A stream can
+            #    reach this state in the same step it ran its last
+            #    encoder chunk, so we check *after* the forward pass.
+            for req in list(running):
+                if (not req.has_pending_audio) \
+                        and (not req.has_ready_encoder_chunk(window)):
+                    final = self._output_processor.finalize_streaming(req)
+                    req.output = final
+                    outputs.append(final)
+                    self._model_runner.free_stream(req)
+                    self._scheduler.finish_request(req.request_id)
 
         return outputs
 

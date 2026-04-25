@@ -712,9 +712,9 @@ class ConformerEncoder(nn.Module):
         r_cnn_cache : Tensor
             Updated CNN cache ``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
         """
-        assert xs.size(0) == 1
+        B = xs.size(0)
         tmp_masks = torch.ones(
-            1, xs.size(1), device=xs.device, dtype=torch.bool
+            B, xs.size(1), device=xs.device, dtype=torch.bool
         ).unsqueeze(1)
         if self.global_cmvn is not None:
             xs = self.global_cmvn(xs)

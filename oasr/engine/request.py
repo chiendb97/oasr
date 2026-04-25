@@ -7,8 +7,9 @@ from __future__ import annotations
 import enum
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Deque, List, Optional, Union
 
 import numpy as np
 import torch
@@ -93,7 +94,6 @@ class Request:
         # Populated by InputProcessor
         self.features: Optional[torch.Tensor] = None          # (1, T, F)
         self.feature_lengths: Optional[torch.Tensor] = None   # (1,)
-        self.chunks_remaining: Optional[List[torch.Tensor]] = None  # (1, W, F) each
         # Offline-path raw waveform (CPU, scaled) held between ``add_request`` and
         # the batched ``collate_offline`` call.  Released once features are built.
         self.waveform: Optional[torch.Tensor] = None  # (T_samples,) CPU float32
@@ -102,6 +102,28 @@ class Request:
         # features are extracted, and is overwritten with the exact value
         # after the batched extraction runs.
         self.num_frames: int = 0
+
+        # --- Streaming audio-chunk state (all populated by InputProcessor) ---
+        # Queue of audio-sample chunks awaiting feature extraction.  Each
+        # element is a CPU float32 1-D tensor of raw samples.  Streaming
+        # ingests strictly left-to-right from this queue; the scheduler never
+        # reaches ahead of the currently-enqueued chunks (no future audio).
+        self.audio_chunks: Optional[Deque[torch.Tensor]] = None
+        # Residual samples from the last fbank call — the suffix of the
+        # combined (tail + new) waveform that didn't fit in a whole frame.
+        # They get prepended to the next audio chunk so frame boundaries
+        # stay aligned across streaming invocations.
+        self.audio_tail: Optional[torch.Tensor] = None
+        # Device-side feature ring.  Grown by extraction; encoder chunks are
+        # sliced from ``features[feature_cursor : feature_cursor + window]``.
+        self.feature_buffer: Optional[torch.Tensor] = None
+        # Number of valid feature frames currently in ``feature_buffer``.
+        self.feature_frames: int = 0
+        # Feature-frame index of the next encoder chunk's start.
+        self.feature_cursor: int = 0
+        # Flips to True when the final audio chunk has been enqueued (no
+        # more audio will arrive).  Triggers fbank flush + last-window forward.
+        self.audio_final: bool = False
 
         # Assigned by Scheduler
         self.stream_id: Optional[int] = None
@@ -118,9 +140,25 @@ class Request:
         return self.state == RequestState.FINISHED
 
     @property
-    def has_chunks(self) -> bool:
-        """True if there are pre-chunked feature windows still to process."""
-        return bool(self.chunks_remaining)
+    def has_pending_audio(self) -> bool:
+        """True if audio samples still need to be turned into features."""
+        return bool(self.audio_chunks) or (
+            self.audio_final and self.audio_tail is not None
+            and self.audio_tail.numel() > 0
+        )
+
+    def has_ready_encoder_chunk(self, window: int) -> bool:
+        """True if ``feature_buffer`` holds enough frames for a full window.
+
+        At final-flush time (no more audio coming) we emit whatever remains,
+        even if it's shorter than ``window``.
+        """
+        available = self.feature_frames - self.feature_cursor
+        if available >= window:
+            return True
+        if self.audio_final and not self.audio_chunks and available > 0:
+            return True
+        return False
 
     @property
     def waited_for(self) -> float:

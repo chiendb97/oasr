@@ -38,25 +38,24 @@ class SchedulerOutput:
 
     Attributes
     ----------
-    scheduled_requests : List[Request]
-        Running streaming requests that have at least one chunk ready to
-        process this step.
+    running_streams : List[Request]
+        All admitted streaming requests currently in the running pool.  The
+        engine step-loop decides per-request whether to run feature
+        extraction, an encoder chunk, or finalisation; the scheduler no
+        longer distinguishes those states because a single request may need
+        several of them within one step.
     newly_admitted : List[Request]
         Requests that were just promoted from WAITING to RUNNING this step.
         For streaming requests, this is where the engine allocates their KV
         cache; offline batches are admitted-then-finalised in the same step
         and never enter ``_running``.
-    to_finalize : List[Request]
-        Running streaming requests that have exhausted their chunks and
-        should be finalised (decode + cleanup) this step.
     offline_batch : List[Request]
         Length-bucketed batch of offline requests to forward in a single
         padded batch.  Empty when no offline work is scheduled this step.
     """
 
-    scheduled_requests: List[Request] = field(default_factory=list)
+    running_streams: List[Request] = field(default_factory=list)
     newly_admitted: List[Request] = field(default_factory=list)
-    to_finalize: List[Request] = field(default_factory=list)
     offline_batch: List[Request] = field(default_factory=list)
 
 
@@ -126,12 +125,10 @@ class Scheduler:
             self._running[req.request_id] = req
             output.newly_admitted.append(req)
 
-        # 3. Classify running streaming requests.
-        for req in list(self._running.values()):
-            if req.has_chunks:
-                output.scheduled_requests.append(req)
-            else:
-                output.to_finalize.append(req)
+        # 3. Hand the engine all active streams; it dispatches per-stream
+        #    work (feature extraction, encoder chunk, finalisation) itself
+        #    because one step may need to do several of those in sequence.
+        output.running_streams = list(self._running.values())
 
         return output
 
