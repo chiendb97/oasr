@@ -2,13 +2,10 @@
 
 The cache subsystem (`oasr/cache/`) manages all per-stream GPU state required
 for chunk-by-chunk Conformer inference: paged attention KV cache, fixed-size
-CNN left-context cache, and per-stream CTC decoder state.  It is the
+CNN left-context cache, and per-stream CTC decoder state. It is the
 foundation that lets the engine run many concurrent streaming requests on a
 single shared GPU memory pool without tearing down or re-allocating buffers
 between chunks.
-
-This document is a developer reference. It assumes familiarity with the
-top-level project layout described in `CLAUDE.md`.
 
 ## 1. Purpose and Responsibilities
 

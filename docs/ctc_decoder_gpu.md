@@ -1005,11 +1005,3 @@ read_streaming_results         (out, state, step, ...)
 oasr.ctc_beam_search_decode(...) -> GpuDecoderResult
 GpuStreamingDecoder + StreamState + StreamHandle
 ```
-
-## 17. Related Documents
-
-- `cache_manager.md` — `CtcStateCacheManager` and the per-stream
-  `StreamState` pool used by the engine.
-- `engine.md` — how `OutputProcessor` selects this decoder via
-  `decoder_type="ctc_gpu"`.
-- `CLAUDE.md` — top-level project layout and build instructions.

@@ -520,10 +520,3 @@ engine.abort_request(rid)
 engine.num_running    # int
 engine.num_waiting    # int
 ```
-
-## 12. Related Documents
-
-- `cache_manager.md` — paged KV cache, CNN cache, CTC state pool.
-- `scheduler.md` — admission policies, length bucketing, cohort gate.
-- `autotuning.md` — kernel-level tuning framework (orthogonal to engine).
-- `CLAUDE.md` — top-level architecture and build/test commands.
