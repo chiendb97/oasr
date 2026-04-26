@@ -170,7 +170,7 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
   - `env.py` — Path constants including `OASR_TEMPLATE_DIR`, `OASR_GEN_SRC_DIR`.
   - Per-family modules: `gemm.py`, `conv.py`, `norm.py`, `activation.py`, `ctc_decoder.py`.
 - **`decoder/`** — Python wrappers for the C++ decoders: `CtcGreedySearch`, `CtcPrefixBeamSearch`, `CtcWfstBeamSearch` (requires k2), `ContextGraph` (phrase boosting trie). Also exposes `k2_available` flag. Each wrapper lazily imports the compiled `_C` extension and delegates to a `_*Core` C++ object.
-- **`engine/`** — vLLM-style inference engine for offline + streaming Conformer-CTC on a single GPU:
+- **`engine/`** — Inference engine for offline + streaming Conformer-CTC on a single GPU:
   - `EngineConfig` — unified config aggregating model, cache, feature, decoding, detokenization settings.
   - `ASREngine` — streaming engine with a step loop: schedule → batched GPU fbank ingest → encoder forward (length-bucketed offline micro-batches via `OfflinePipeline` overlap with one chunk per active streaming request) → CTC postprocess. Handles offline + streaming requests in one pool; starvation bounded by `max_wait_time`.
   - `OfflineEngine` — simple batch transcription, no scheduler/cache.
