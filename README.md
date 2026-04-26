@@ -16,9 +16,10 @@ A high-performance open-source inference framework for ASR models built with C++
 
 | Decoder | Description | Status |
 |---------|-------------|--------|
-| **CTC Prefix Beam Search (GPU)** | GPU-accelerated beam search | ✅ |
+| **CTC Greedy Search** | CPU greedy argmax decode | ✅ |
 | **CTC Prefix Beam Search (CPU)** | CPU prefix beam search | ✅ |
-| **CTC WFST Beam Search** | Weighted FST beam search (requires k2) | ✅ |
+| **CTC Prefix Beam Search (GPU)** | GPU beam search (offline + multi-request streaming) | ✅ |
+| **CTC WFST Beam Search** | Weighted FST beam search (requires k2; offline + streaming) | ✅ |
 
 ## Features
 
@@ -28,7 +29,9 @@ A high-performance open-source inference framework for ASR models built with C++
 - **Convolution** -- Depthwise/pointwise Conv1D (including causal), Conv2D via CUTLASS Implicit GEMM, cuDNN Conv2D
 - **Activation** -- GLU, Swish
 - **Attention** -- Multi-head and relative-position attention with optional rotary embeddings
-- **CTC decoder** -- CTC greedy search, prefix beam search, and WFST beam search (CPU-side C++ with Python wrappers)
+- **CTC decoder** -- CTC greedy, prefix beam, and WFST beam search (CPU-side C++ with Python wrappers); GPU prefix beam search with offline + multi-request streaming APIs
+- **Feature extraction** -- Batched FBANK / MFCC via `torchaudio` (default) or `kaldifeat` (optional GPU path), plus `BatchedStreamingFeatureExtractor` for `B` parallel chunked streams
+- **Inference engine** -- vLLM-style `ASREngine` (streaming + offline) and `OfflineEngine` for Conformer-CTC, with dynamic length-bucketed batching and paged KV cache
 - **Streaming inference** -- Chunk-by-chunk Conformer inference with paged GPU memory for attention and CNN caches
 - **Paged memory cache** -- `BlockPool`-backed paged KV cache and `StreamContext` for multi-request streaming
 - **Kernel auto-tuning** -- Built-in profiling and caching framework for GEMM and Conv2D kernels
@@ -73,9 +76,10 @@ oasr/
 │   ├── layers/                # nn.Module wrappers (norm, conv, linear, attention, rotary)
 │   ├── decoder/               # Python wrappers: CtcGreedySearch, CtcPrefixBeamSearch, CtcWfstBeamSearch
 │   ├── cache/                 # Streaming cache manager (BlockPool, AttentionCacheManager, StreamContext)
+│   ├── features/              # Batched FBANK/MFCC + BatchedStreamingFeatureExtractor (torchaudio / kaldifeat)
 │   ├── models/conformer/      # Conformer model, config, weight conversion
-│   ├── engine/                # Inference engine (ASREngine, OfflineEngine, EngineConfig, Scheduler)
-│   └── utils/                 # Dtype mappings, timer
+│   ├── engine/                # Inference engine (ASREngine, OfflineEngine, EngineConfig, Scheduler, Pipeline)
+│   └── utils/                 # Dtype mappings, validation decorators, NVTX, timer
 ├── benchmarks/                # Performance benchmarks
 ├── tests/                     # Pytest test suite
 ├── CMakeLists.txt
@@ -143,46 +147,38 @@ ctest --output-on-failure
 
 ## Benchmarks and Profiling
 
-Benchmark scripts in `benchmarks/` use `triton.testing.do_bench` when Triton is available.
+OASR provides a unified benchmark framework (`benchmarks/oasr_benchmark.py`) with a per-family routine registry under `benchmarks/routines/`. Backend names depend on the kernel family: `cutlass` / `torch` for GEMM and Conv2D; `cuda` / `torch` for Norm, Conv1D, Activation, and composite kernels. Legacy standalone `bench_*.py` scripts remain as thin wrappers.
 
-### Available benchmarks
+### Unified CLI
 
 ```bash
-# Normalization
-python benchmarks/bench_layer_norm.py
-python benchmarks/bench_rms_norm.py
-python benchmarks/bench_batch_norm.py
-python benchmarks/bench_group_norm.py
+# GEMM family (cutlass vs. torch reference)
+python benchmarks/oasr_benchmark.py --routine gemm --subroutine bmm \
+    --backends cutlass torch --batch-count 256 --M 200 --N 200 --K 64 \
+    --dtype float16 --refcheck -vv
 
-# Convolution
-python benchmarks/bench_depthwise_conv1d.py
-python benchmarks/bench_pointwise_conv1d.py
-python benchmarks/bench_conv2d.py
-python benchmarks/bench_conv_block.py
+# Norm / Conv1D / Activation family (cuda vs. torch reference)
+python benchmarks/oasr_benchmark.py --routine norm --subroutine layer_norm \
+    --backends cuda torch --batch 64 --seq 250 --hidden 512 --refcheck -vv
 
-# GEMM
-python benchmarks/bench_gemm.py
-python benchmarks/bench_bmm.py
-python benchmarks/bench_group_gemm.py
+# List all available routines/subroutines
+python benchmarks/oasr_benchmark.py --list
 
-# Activation
-python benchmarks/bench_glu.py
-python benchmarks/bench_swish.py
+# Batch testing from a testlist file
+python benchmarks/oasr_benchmark.py --testlist benchmarks/testlists/conformer_base.txt \
+    --output_path results.csv --refcheck
 ```
 
 ### Profiling with Nsight Compute
 
-Use `--profile` for single-iteration runs suitable for `ncu`:
+`--profile` emits NVTX markers and runs in single-iteration mode suitable for `ncu`:
 
 ```bash
-ncu --set full -o gemm_profile python benchmarks/bench_gemm.py \
-  --profile --kernel gemm --target oasr --warmup 0 --iters 1
-
-ncu --set full -o norm_profile python benchmarks/bench_layer_norm.py \
-  --profile --kernel layer_norm --target oasr --warmup 0 --iters 1
+ncu --set full -o gemm_profile python benchmarks/oasr_benchmark.py \
+    --routine gemm --subroutine gemm --backends cutlass --profile --dry_run_iters 0
 ```
 
-Each script supports `--kernel`, `--target` (oasr/pytorch/both), `--warmup`, and `--iters`; see `--help`.
+See `benchmarks/README.md` for the full CLI reference.
 
 ## Quick Start (Python)
 
