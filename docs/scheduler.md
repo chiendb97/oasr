@@ -145,13 +145,7 @@ Two independent guards bound padded-compute waste:
 budget = max_batch_size - len(_running)
 if budget <= 0: return []
 
-if streaming_cohort_admit and _running:
-    # Only admit when all running streams are still at offset 0;
-    # otherwise the new stream would lag behind the cohort and break
-    # the lockstep that makes _forward_batched_paged efficient.
-    if any(r.offset != 0 for r in _running.values()):
-        return []
-
+# Length bucketing only — no offset gate (heterogeneous-offset batching).
 if streaming_cohort_admit or policy == "sjf":
     sort _streaming_waiting by (priority, num_frames)
 
@@ -164,28 +158,30 @@ while _streaming_waiting and len(admitted) < budget:
 return admitted
 ```
 
-### 4.3 Cohort admission rationale
+### 4.3 Heterogeneous-offset batching
 
-Streaming throughput is dominated by `_forward_batched_paged`, which
-fuses up to `B = max_batch_size` per-stream encoder calls into one
-batched forward. That fusion is only possible when all `B` streams
-share `(offset, window_size)`. Cohort admission enforces this:
+`_forward_batched_paged` (in `oasr/engine/model_runner.py`) uses PyTorch
+**FlexAttention** over the paged KV pool. FlexAttention accepts a
+`block_mask` built from each stream's `cache_seqlens` and a `score_mod`
+that adds the Conformer rel-pos bias `matrix_bd / sqrt(d_k)`. Because
+both per-stream lengths and per-stream pos_emb are expressed inside the
+fused kernel, streams with **different** `(offset, cache_seqlens)`
+batch into a single forward — there is no cohort-admit gate.
 
-- If the running pool is empty, anything goes — the next admitted
-  cohort defines the offset.
-- Otherwise the gate stays closed until every running stream has
-  reached the end of its audio (after which it is finalised and
-  removed). When the pool empties, the next batch admits in lockstep
-  again.
+Practical consequences:
 
-The cost is brief GPU idle time during cohort transitions; the win is
-per-step launch-amortised forwards across `B` streams. On backlog
-workloads this is the single largest streaming throughput knob.
-
-When `streaming_cohort_admit=False`, admission falls back to the
-configured `schedule_policy` ordering (FCFS / bucket / SJF) and each
-freed slot is filled immediately — better tail latency for the *next*
-request, worse aggregate throughput.
+- New requests join an in-flight pool at any time. The "freed slot is
+  filled immediately" behaviour — previously available only with
+  `streaming_cohort_admit=False` — is now the default for *all*
+  policies.
+- `streaming_cohort_admit=True` no longer gates admission on
+  `offset == 0`; it only sorts the waiting queue by length so each
+  batched forward sees length-similar utterances (less padded-compute
+  waste from a single very-long stream stretching the chunk-attention
+  context for the rest of the cohort).
+- The encoder's positional embedding is built per-stream when offsets
+  differ (`RelPositionalEncoding.position_encoding(offsets_tensor, …)`),
+  collapsing to broadcast when they happen to match.
 
 ### 4.4 Priority handling
 
@@ -258,7 +254,7 @@ All scheduler-relevant knobs live on `EngineConfig`:
 | `max_offline_pad_ratio` | 4.0 | Hard cap on `(max_len × B) / sum_len`. `0` disables. |
 | `max_wait_time` | 0.2 s | Starvation bound: oldest offline request triggers forced flush. |
 | `schedule_policy` | `"bucket"` | One of `"fcfs"`, `"bucket"`, `"sjf"`. |
-| `streaming_cohort_admit` | `True` | Gate streaming admission on cohort offset alignment. |
+| `streaming_cohort_admit` | `True` | Length-bucket the waiting queue before admission so each batched paged forward sees length-similar utterances. **No longer gates on offset alignment** (FlexAttention handles per-stream `cache_seqlens` natively). |
 
 ### Choosing a policy
 

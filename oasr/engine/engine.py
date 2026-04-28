@@ -115,6 +115,30 @@ class ASREngine:
             if self._device.type == "cuda" else None
         )
 
+        # Warm up the FlexAttention kernel + BlockMask compile cache so
+        # the first request doesn't pay torch.compile latency. Walks both
+        # branches (homogeneous-offset → block_mask=None, heterogeneous →
+        # real BlockMask). Skipped on CPU since the engine doesn't run
+        # FlexAttention there.
+        if self._device.type == "cuda":
+            from oasr.layers.attention.attention import warmup_flex_attention
+            try:
+                warmup_flex_attention(
+                    n_head=model.encoder.encoders[0].self_attn.h,
+                    n_kv_head=model.encoder.encoders[0].self_attn.h_kv,
+                    head_dim=model.encoder.encoders[0].self_attn.d_k,
+                    max_batch_size=config.max_batch_size,
+                    chunk_size=config.chunk_size,
+                    max_attention_key_size=config.chunk_size * 16,
+                    device=self._device,
+                    dtype=dtype,
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "FlexAttention warmup failed (will compile on first call): %s",
+                    exc,
+                )
+
     # ------------------------------------------------------------------
     # Request management
     # ------------------------------------------------------------------

@@ -228,11 +228,13 @@ class ModelRunner:
                 fallback.append(req)
 
         if batchable:
-            by_offset: Dict[int, List[Request]] = {}
-            for req in batchable:
-                by_offset.setdefault(req.offset, []).append(req)
-            for off, group in by_offset.items():
-                self._forward_batched_paged(group, off, window, stride, context, results)
+            # Heterogeneous-offset batching: all batchable streams go into
+            # one paged forward regardless of offset. FlexAttention's
+            # block-mask is built from per-stream cache_seqlens, and the
+            # encoder builds per-stream pos_emb when offsets differ.
+            self._forward_batched_paged(
+                batchable, window, stride, context, results,
+            )
 
         for req in fallback:
             self._forward_single(req, window, stride, context, results)
@@ -246,7 +248,6 @@ class ModelRunner:
     def _forward_batched_paged(
         self,
         group: List[Request],
-        offset: int,
         window: int,
         stride: int,
         context: int,
@@ -254,9 +255,13 @@ class ModelRunner:
     ) -> None:
         """Run one paged forward on ``B = len(group)`` stacked streams.
 
-        Pre-condition: every request in ``group`` shares ``offset``, has a
-        full ``window`` frames ready in its feature buffer, and is using
-        paged attention.
+        Streams may have **different** offsets (cohort-relaxed admission).
+        FlexAttention enforces per-stream cache lengths via a block-mask
+        derived from ``cache.cache_seqlens``; the encoder builds per-stream
+        position embeddings when offsets differ.
+
+        Pre-condition: every request in ``group`` has a full ``window``
+        frames ready in its feature buffer and is using paged attention.
         """
         if len(group) == 1:
             # Skip the stack/unstack bookkeeping for a single stream.
@@ -269,16 +274,11 @@ class ModelRunner:
         #    batched allocator call instead of B per-stream calls.
         nvtx_push("prepare_chunk")
         stream_ids = [req.stream_id for req in group]
-        # All streams in a group are paged; assert non-None to satisfy mypy.
         assert all(req.stream_context is not None for req in group)
         self._att_mgr.prepare_chunks_batched(stream_ids)  # type: ignore[arg-type]
         nvtx_pop()
 
         # 2. Stack per-stream paged descriptors into a (B, ...) view.
-        #    All layers share the same block_table / cache_seqlens (one
-        #    pair per stream), so we read those shared tensors via a
-        #    cheap accessor (no per-layer dataclass construction) and
-        #    stack once for the whole batched forward.
         block_tables: List[torch.Tensor] = []
         cache_seqlens: List[torch.Tensor] = []
         for req in group:
@@ -288,11 +288,19 @@ class ModelRunner:
         batched_bt = torch.cat(block_tables, dim=0)       # (B, blocks_per_seq)
         batched_cs = torch.cat(cache_seqlens, dim=0)      # (B,)
 
-        # 3. Build batched PagedKVCache descriptors, one per layer, that
-        #    share k_cache / v_cache with each stream (the block pool is
-        #    global) and share the newly-stacked block_table / cache_seqlens.
+        # 3. Build batched PagedKVCache descriptors. The engine tracks
+        #    each request's ``offset`` on the host, so we can compute
+        #    both the max (for sizing pos_emb / gather) and detect
+        #    homogeneity (for the scalar-offset fast paths) without a
+        #    D2H sync from cache_seqlens.
         block_size = self._cache_config.block_size_frames
         num_layers = self._cache_config.num_layers
+        max_offset = max(req.offset for req in group)
+        homogeneous_offset = (
+            max_offset
+            if all(req.offset == max_offset for req in group)
+            else -1
+        )
         batched_att_caches: List[PagedKVCache] = []
         for i in range(num_layers):
             k_view, v_view = self._block_pool.get_kv_view(i)
@@ -302,7 +310,8 @@ class ModelRunner:
                 block_table=batched_bt,
                 cache_seqlens=batched_cs,
                 block_size=block_size,
-                host_seqlen=offset,
+                host_seqlen_max=max_offset,
+                host_seqlen_homogeneous=homogeneous_offset,
             ))
 
         # 4. Stack feature-chunk slices and cnn_cache across streams.
@@ -313,29 +322,38 @@ class ModelRunner:
         xs = torch.stack(feature_chunks, dim=0)  # (B, window, F)
 
         per_stream_cnn = [req.stream_context.get_cnn_cache() for req in group]
-        # Each per-stream cnn_cache has shape
-        # ``(num_layers, 1, cnn_cache_frames, hidden_dim)`` when populated
-        # or a (0,0,0,0) placeholder on the first chunk.  Only stack when
-        # every stream is past its first chunk; otherwise pass the
-        # placeholder (the model handles it layer-wise).
         if all(c.size(0) > 0 for c in per_stream_cnn):
             cnn_cache = torch.cat(per_stream_cnn, dim=1)  # (L, B, T, H)
         else:
-            cnn_cache = per_stream_cnn[0]  # placeholder (0,0,0,0)
+            cnn_cache = per_stream_cnn[0]  # (0,0,0,0) placeholder
 
-        # 5. One batched encoder call.
+        # 5. Pass either a scalar offset (when all streams share one,
+        #    enabling broadcast pos_emb and the int-offset _paged_write
+        #    fast path) or a (B,) tensor (heterogeneous case) — built
+        #    only when needed to avoid unnecessary CPU/GPU round-trips.
+        homogeneous = all(req.offset == max_offset for req in group)
+        if homogeneous:
+            offset_arg: object = max_offset
+        else:
+            offset_arg = torch.tensor(
+                [req.offset for req in group],
+                dtype=batched_cs.dtype,
+                device=batched_cs.device,
+            )
+
+        # 6. One batched encoder call.
         nvtx_push("encoder_call")
         log_probs, new_cnn = self._model.forward_chunk_paged(
             xs,
-            offset,
+            offset_arg,
             batched_att_caches,
             cnn_cache,
-            cache_t1=offset,
+            cache_t1=max_offset,
         )
         actual_frames = log_probs.size(1)
         nvtx_pop()
 
-        # 6. Split the new cnn_cache back into per-stream slices and
+        # 7. Split the new cnn_cache back into per-stream slices and
         #    commit per-stream attention-cache advancement.
         nvtx_push("commit")
         for b, req in enumerate(group):

@@ -182,37 +182,24 @@ class Scheduler:
     def _admit_streaming(self, budget: int) -> List[Request]:
         """Pick up to ``budget`` streaming requests to promote to RUNNING.
 
-        With ``streaming_cohort_admit=True`` the scheduler gates admission
-        on the running pool's offset state so all active streams stay in
-        lockstep, **and** sorts the waiting queue by length so each cohort
-        contains length-similar utterances.  Together this minimises tail
-        waste at cohort drain time (no single long stream stalling 31
-        finished slots) and amortises encoder kernel launches across the
-        widest possible ``B = max_batch_size`` batched paged forward —
-        the single biggest streaming throughput lever on backlog
-        workloads.
+        Heterogeneous-offset batching (FlexAttention-paged) batches all
+        running streams in one encoder forward regardless of each stream's
+        ``offset``, so admission carries **no** cohort-alignment gate —
+        new requests can join an in-flight pool at any time, and the
+        per-stream ``cache_seqlens`` + pos_emb handle the variable
+        lengths inside the kernel.
 
-        Without cohort admission, admission falls back to the
-        ``schedule_policy`` ordering (FCFS / bucket / SJF).
+        ``streaming_cohort_admit=True`` now only controls **length
+        bucketing**: the waiting queue is sorted by length before
+        admission so each batched paged forward sees length-similar
+        utterances (lower padded-compute waste). With ``False``, admission
+        follows ``schedule_policy`` ordering (FCFS / bucket / SJF).
         """
         if budget <= 0 or not self._streaming_waiting:
             return []
 
         cfg = self._config
-
-        # Cohort gate: only admit when the running pool is empty or every
-        # running stream is still at offset 0.  Streams admitted in the same
-        # step share offset 0 and tick in lockstep until the cohort drains.
-        if cfg.streaming_cohort_admit and self._running:
-            for req in self._running.values():
-                if req.offset != 0:
-                    return []
-
         policy = cfg.schedule_policy
-        # When cohort admission is on, length-bucket the waiting queue so
-        # the next cohort consists of similar-length utterances — keeps
-        # the cohort drain tail short.  Otherwise honour the configured
-        # policy (bucket / sjf / fcfs).
         if cfg.streaming_cohort_admit or policy == "sjf":
             self._sort_by_length(self._streaming_waiting)
 

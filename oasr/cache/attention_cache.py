@@ -333,7 +333,10 @@ class AttentionCacheManager:
                     block_table=state.block_table,
                     cache_seqlens=state.cache_seqlens,
                     block_size=cfg.block_size_frames,
-                    host_seqlen=host_seqlen,
+                    host_seqlen_max=host_seqlen,
+                    # Single-stream is trivially homogeneous; enables the
+                    # scalar-offset write and zero-pad-bias fast paths.
+                    host_seqlen_homogeneous=host_seqlen,
                 )
             )
         return caches
