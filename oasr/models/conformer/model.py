@@ -432,12 +432,9 @@ class ConformerEncoderLayer(nn.Module):
         mask: torch.Tensor,
         pos_emb: torch.Tensor,
         mask_pad: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
-        att_cache: Union[T_CACHE, PagedKVCache] = (
-            torch.zeros(0, 0, 0, 0),
-            torch.zeros(0, 0, 0, 0),
-        ),
+        att_cache: Union[T_CACHE, PagedKVCache, None] = None,
         cnn_cache: torch.Tensor = torch.zeros(0, 0, 0),
-    ) -> Tuple[torch.Tensor, Union[T_CACHE, PagedKVCache], torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Union[T_CACHE, PagedKVCache, None], torch.Tensor]:
         if self.feed_forward_macaron is not None:
             residual = x
             if self.normalize_before:
@@ -667,7 +664,7 @@ class ConformerEncoder(nn.Module):
     def forward_chunk_paged(
         self,
         xs: torch.Tensor,
-        offset: int,
+        offset: Union[int, torch.Tensor],
         att_caches: List[PagedKVCache],
         cnn_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
         att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
@@ -684,65 +681,73 @@ class ConformerEncoder(nn.Module):
         Parameters
         ----------
         xs : Tensor
-            Chunk input ``(1, chunk_input_frames, mel_dim)``.
-        offset : int
-            Current encoder-output frame offset (used for positional encoding).
+            Chunk input ``(B, chunk_input_frames, mel_dim)``.  ``B`` is the
+            number of streams batched in this call.
+        offset : int or Tensor
+            Encoder-output frame offset(s).  ``int`` is the legacy
+            homogeneous case (every stream at the same offset); a 1-D
+            ``int Tensor`` of shape ``(B,)`` enables the heterogeneous
+            cohort-relaxed batched forward (each stream has its own
+            offset and pos_emb).
         att_caches : list[PagedKVCache]
-            One :class:`~oasr.layers.attention.PagedKVCache` per encoder layer.
-            All items share the **same** ``block_table`` and ``cache_seqlens``
-            tensors; only ``k_cache`` / ``v_cache`` differ per layer.
+            One :class:`~oasr.layers.attention.PagedKVCache` per encoder
+            layer. All items share the **same** ``block_table`` and
+            ``cache_seqlens`` tensors; only ``k_cache`` / ``v_cache``
+            differ per layer.
         cnn_cache : Tensor
-            CNN cache ``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
-            Pass a ``(0,0,0,0)`` tensor on the first chunk.
+            CNN cache ``(num_layers, B, cnn_cache_frames, hidden_dim)``.
+            Pass a ``(0,0,0,0)`` placeholder on the first chunk.
         att_mask : Tensor
-            Additive attention bias ``(1, chunk_size, attention_key_size)``.
-            A ``(0,0,0)`` placeholder is replaced internally by a zero mask.
+            Unused with paged attention (per-stream length is enforced by
+            the FlexAttention block-mask built from ``cache.cache_seqlens``).
+            Kept for signature compatibility.
         cache_t1 : int
-            Number of frames already in the KV cache, as a host-side int.
-            When non-negative, skips the ``cache_seqlens[0].item()`` D2H
-            sync — the scheduler already tracks this via
-            ``AttentionCacheState.num_committed_frames``.  Passing ``-1``
-            (the legacy default) falls back to reading from the GPU tensor
-            for callers that don't track cache length on the host.
+            Maximum cached frames across the batch as a host-side int.
+            When non-negative, sizes the rel-pos embedding without a D2H
+            sync.  ``-1`` falls back to ``cache_seqlens.max().item()``.
 
         Returns
         -------
         xs : Tensor
-            Encoder output ``(1, chunk_size, hidden_dim)``.
+            Encoder output ``(B, chunk_size, hidden_dim)``.
         r_cnn_cache : Tensor
-            Updated CNN cache ``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
+            Updated CNN cache ``(num_layers, B, cnn_cache_frames, hidden_dim)``.
         """
+        del att_mask  # paged path uses cache.cache_seqlens for masking
+
         B = xs.size(0)
         tmp_masks = torch.ones(
             B, xs.size(1), device=xs.device, dtype=torch.bool
         ).unsqueeze(1)
         if self.global_cmvn is not None:
             xs = self.global_cmvn(xs)
-        xs, pos_emb, _ = self.embed(xs, tmp_masks, offset)
+        xs, _, _ = self.embed(xs, tmp_masks, offset)
 
         chunk_size = xs.size(1)
         if cache_t1 < 0:
-            cache_t1 = int(att_caches[0].cache_seqlens[0].item())
+            cache_t1 = int(att_caches[0].cache_seqlens.max().item())
         attention_key_size = cache_t1 + chunk_size
 
-        if att_mask.size(-1) == 0 and attention_key_size > 0:
-            att_mask = torch.zeros(
-                (1, chunk_size, attention_key_size),
-                dtype=xs.dtype,
-                device=xs.device,
-            )
-        elif att_mask.dtype == torch.bool:
-            att_mask = mask_to_bias(att_mask, xs.dtype)
-
+        # Per-stream pos_emb: positions begin at ``offset - cache_seqlens``
+        # for each stream, which is non-zero only when the cache has been
+        # evicted.  When ``offset`` is an int we know all streams share
+        # the same offset → the broadcast (1, T_pos, D) form is used.
+        if isinstance(offset, int):
+            pos_start = offset - cache_t1
+        else:
+            # offset: Tensor (B,) on GPU. cache_seqlens: Tensor (B,).
+            pos_start = offset - att_caches[0].cache_seqlens.to(offset.dtype)
         pos_emb = self.embed.pos_enc.position_encoding(
-            offset=offset - cache_t1, size=attention_key_size
+            offset=pos_start, size=attention_key_size,
         )
 
         r_cnn_cache = []
         for i, layer in enumerate(self.encoders):
             xs, _, new_cnn_cache = layer(
                 xs,
-                att_mask,
+                # Padding mask is unused inside the paged self-attn path; pass
+                # a zero-dim placeholder.
+                torch.zeros((0, 0, 0), dtype=xs.dtype, device=xs.device),
                 pos_emb,
                 att_cache=att_caches[i],
                 cnn_cache=cnn_cache[i] if cnn_cache.size(0) > 0 else cnn_cache,

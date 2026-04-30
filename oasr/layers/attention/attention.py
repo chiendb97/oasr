@@ -1,53 +1,99 @@
-#!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""
-Multi-head attention layers.
+"""Conformer-style attention layer for OASR streaming inference.
 
-This module ports the attention implementations from
-`wenet/models/transformer/attention.py` into OASR, keeping the
-algorithms unchanged while adapting them to live inside the OASR
-package.
+A single inference-only attention class is provided:
+:class:`RelPositionMultiHeadedAttention`. The actual attention compute
+goes through PyTorch SDPA
+(``torch.nn.functional.scaled_dot_product_attention``) for all three
+cache modes:
 
-The core classes mirror WeNet:
+* offline (``cache=None``)
+* dense streaming (``cache=(K_cached, V_cached)``)
+* paged streaming (``cache=PagedKVCache``)
 
-- MultiHeadedAttention
-- RelPositionMultiHeadedAttention
-- MultiHeadedCrossAttention
-- ShawRelPositionMultiHeadedAttention
-- RopeMultiHeadedAttention
+The Transformer-XL rel-pos bias ``matrix_bd`` is combined with the
+padding / per-stream length mask and passed in via ``attn_mask``.
 
-These are standard PyTorch ``nn.Module`` implementations. They do
-not yet call into OASR CUDA attention kernels; see the project
-documentation for what kernel bindings would be needed to make
-that possible.
+A FlexAttention path was prototyped (the helpers ``build_paged_block_mask``,
+``_flex_attention_paged_with_bias``, and ``warmup_flex_attention`` below
+remain for future re-enablement). It produced numerical parity with SDPA
+but was significantly slower on Conformer streaming shapes — the chunk
+``T_q`` (8 frames after subsampling) is much smaller than FlexAttention's
+``BLOCK_M=128`` Q-tile, so most of every tile was wasted. SDPA's
+cuBLAS-sized tiles match our shapes directly. Re-enabling FlexAttention
+will likely require packing queries across requests (variable-length
+attention) so the packed Q length exceeds ``BLOCK_M``.
+
+Removed in this revision (relative to the WeNet-port era):
+    * ``MultiHeadedAttention`` / ``MultiHeadedCrossAttention`` /
+      ``ShawRelPositionMultiHeadedAttention`` / ``RopeMultiHeadedAttention`` —
+      none of them were used by the active Conformer encoder.
+    * The ``if not self.training`` cache-update branch — inference-only.
+    * The ``flash_attn_with_kvcache`` path — flash_attn 2.7 cannot express
+      ``matrix_bd`` (no ``attn_bias`` argument).
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    create_block_mask as _create_block_mask,
+    flex_attention as _flex_attention,
+)
 
-from oasr.layers.rotary_embedding import get_apply_rotary_emb
 
+# Compile the BlockMask constructor with ``dynamic=True`` so a single
+# compiled callable adapts to varying ``(B, T_q, T_kv)`` across calls.
+_create_block_mask_compiled = torch.compile(_create_block_mask, dynamic=True)
+
+
+# FlexAttention itself is compiled via the wrapper in
+# :func:`_flex_attention_paged_with_bias` rather than ``torch.compile``-ing
+# ``flex_attention`` directly. The wrapper closure-captures the additive
+# ``bias`` for ``score_mod``; placing the closure construction *inside*
+# the compiled function keeps everything in a single Dynamo trace, which
+# is the pattern PyTorch's FlexAttention API expects (otherwise
+# ``flex_attention`` falls back to the unfused eager implementation).
+@torch.compile(dynamic=True)
+def _flex_attention_paged_with_bias(
+    q: torch.Tensor,
+    k_full: torch.Tensor,
+    v_full: torch.Tensor,
+    bias: torch.Tensor,
+    block_mask: Optional[BlockMask],
+    softmax_scale: float,
+    enable_gqa: bool,
+) -> torch.Tensor:
+    """FlexAttention with a precomputed additive bias added via score_mod.
+
+    Wrapped in ``torch.compile`` so ``flex_attention`` runs through the
+    fused Triton kernel rather than the unfused fallback.
+    """
+    def score_mod(score, b, h, q_idx, kv_idx):  # type: ignore[no-untyped-def]
+        return score + bias[b, h, q_idx, kv_idx]
+
+    return _flex_attention(
+        q, k_full, v_full,
+        score_mod=score_mod,
+        block_mask=block_mask,
+        scale=softmax_scale,
+        enable_gqa=enable_gqa,
+    )
+
+
+# Dense KV cache pair ``(K_cached, V_cached)`` used by the legacy
+# ``forward_chunk`` path. Both tensors are head-first
+# ``(B, n_kv_head, T_cached, head_dim)``. New chunks concatenate along the
+# time axis to produce the next cache.
 T_CACHE = Tuple[torch.Tensor, torch.Tensor]
-
-# ---------------------------------------------------------------------------
-# Optional flash-attention import
-# ---------------------------------------------------------------------------
-
-try:
-    from flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache
-
-    _HAS_FLASH_ATTN = True
-except ImportError:  # pragma: no cover
-    _flash_attn_with_kvcache = None  # type: ignore[assignment]
-    _HAS_FLASH_ATTN = False
 
 
 # ---------------------------------------------------------------------------
@@ -57,29 +103,30 @@ except ImportError:  # pragma: no cover
 
 @dataclass
 class PagedKVCache:
-    """Per-layer paged KV cache descriptor for inference-only decoding.
+    """Per-layer paged KV cache descriptor.
 
-    ``k_cache`` and ``v_cache`` are views into the shared
-    :class:`~oasr.cache.block_pool.BlockPool` for a single encoder layer.
-    All layers belonging to the same stream share the **same Python tensor
-    objects** for ``block_table`` and ``cache_seqlens``, so that a single
-    in-place update to ``cache_seqlens`` propagates to every layer.
+    All tensors except ``k_cache`` / ``v_cache`` are shared across encoder
+    layers within the same forward call (one ``block_table`` and one
+    ``cache_seqlens`` per stream batch).
 
     Attributes
     ----------
-    k_cache : Tensor
-        ``(max_num_blocks, block_size, n_kv_head, head_dim)`` — physical K pool.
-    v_cache : Tensor
-        ``(max_num_blocks, block_size, n_kv_head, head_dim)`` — physical V pool.
+    k_cache, v_cache : Tensor
+        ``(max_num_blocks, block_size, n_kv_head, head_dim)`` views into the
+        block pool for one encoder layer.
     block_table : Tensor
-        ``(1, max_blocks_per_seq)`` int32 — logical → physical block mapping.
+        ``(B, max_blocks_per_seq)`` int32 — per-stream logical → physical
+        block mapping.
     cache_seqlens : Tensor
-        ``(1,)`` int32 — number of K/V tokens committed to the cache **before**
-        the current chunk.  Updated by the cache manager's ``commit_chunk``
-        *after* ``forward_chunk`` returns.
+        ``(B,)`` int32 — committed K/V frames in the pool **before** the
+        current chunk's K/V write. Lives on the same device as ``k_cache``.
     block_size : int
         Frames per physical block (= ``block_size_frames`` in
         :class:`~oasr.cache.types.CacheConfig`).
+    host_seqlen_max : int
+        Host-side mirror of ``cache_seqlens.max().item()`` so the encoder
+        can compute the kernel's max key-sequence length without a per-step
+        D2H sync (the engine already tracks ``Request.offset`` on the host).
     """
 
     k_cache: torch.Tensor
@@ -87,18 +134,24 @@ class PagedKVCache:
     block_table: torch.Tensor
     cache_seqlens: torch.Tensor
     block_size: int
-    # Host-side mirror of ``cache_seqlens[0]`` — the cache manager updates
-    # this Python int at commit time, so the attention forward path can
-    # skip the per-layer ``cache_seqlens[0].item()`` D2H sync (which was
-    # running once per encoder layer and dominating streaming wall time:
-    # 12 layers × ~0.3 ms sync ≈ 4 ms wasted per chunk).  ``-1`` means
-    # "not tracked" and forces a fallback sync so this remains
-    # backward-compatible with callers that don't set it.
-    host_seqlen: int = -1
+    host_seqlen_max: int = 0
+    # When set (>=0), every stream in this batch shares this offset, so
+    # the paged write can take the cheap scalar-offset fast path and the
+    # per-stream length mask collapses to "no mask" (all streams have
+    # ``T_kv_max`` valid frames). ``-1`` falls back to the per-stream
+    # ``cache_seqlens`` tensor and a real ``BlockMask``.
+    host_seqlen_homogeneous: int = -1
+    # FlexAttention BlockMask, shared across encoder layers within one
+    # ``forward_chunk_paged`` call. Built once by the encoder before the
+    # layer loop (depends only on ``cache_seqlens``, ``T_q``, ``T_kv_max``)
+    # and attached to every per-layer ``PagedKVCache`` so the attention
+    # layer doesn't pay 12× the construction cost. ``None`` means full
+    # attention with no masking (homogeneous-offset case).
+    block_mask: Optional[Any] = None
 
 
 # ---------------------------------------------------------------------------
-# Paged-cache low-level helpers
+# Paged-cache write / gather helpers
 # ---------------------------------------------------------------------------
 
 
@@ -106,138 +159,187 @@ def _paged_write_kv(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
-    seqlen_offset: int,
+    offsets: Union[int, torch.Tensor],
     new_k: torch.Tensor,
     new_v: torch.Tensor,
 ) -> None:
-    """Write new K/V frames into the paged block pool.
-
-    Supports both single-stream (``B=1``) and batched (``B>=2``) inputs —
-    for the batched paged forward each row of ``block_table`` belongs to
-    one stream and writes its own physical block.  Uses vectorised GPU
-    advanced indexing rather than a per-stream ``.item()`` round-trip, so
-    no D2H sync is required.
+    """Write new K/V frames into the paged pool.
 
     Parameters
     ----------
     k_cache, v_cache : Tensor
-        Pool tensors ``(max_blocks, block_size, n_kv_head, head_dim)``.
+        Per-layer pool views ``(max_blocks, block_size, n_kv_head, head_dim)``.
     block_table : Tensor
-        ``(B, max_blocks_per_seq)`` int32 — one row per stream in the
-        batch.  All streams share ``seqlen_offset`` (the batched paged
-        forward only batches streams whose offsets match).
-    seqlen_offset : int
-        Absolute frame index at which to start writing.  Host-side int —
-        no GPU sync.
+        ``(B, max_blocks_per_seq)`` int32 — one row per stream.
+    offsets : int or Tensor
+        Logical write offset. ``int`` (homogeneous case): every stream
+        writes at the same offset; uses a cheap row-slice fast path with
+        no D2H sync. ``(B,)`` int Tensor (heterogeneous case): per-stream
+        offsets dispatched via a vectorised scatter.
     new_k, new_v : Tensor
-        ``(B, n_kv_head, chunk_size, head_dim)`` — **head-first** layout
-        as returned by :meth:`MultiHeadedAttention.forward_qkv`.
+        ``(B, n_kv_head, T, head_dim)`` head-first new K/V to write.
     """
+    B, _, T, _ = new_k.shape
+    H_kv = new_k.size(1)
+    D = new_k.size(3)
     block_size = k_cache.size(1)
-    chunk_size = new_k.size(2)
-    blk_logical = seqlen_offset // block_size
-    blk_offset = seqlen_offset % block_size
 
-    # Time-first per-stream layout: (B, chunk_size, n_kv_head, d_k).
-    k_data = new_k.permute(0, 2, 1, 3).contiguous()
+    # Frame-major layout matching the pool's per-block tile.
+    k_data = new_k.permute(0, 2, 1, 3).contiguous()  # (B, T, H_kv, D)
     v_data = new_v.permute(0, 2, 1, 3).contiguous()
 
-    # Per-stream physical block IDs — vectorised GPU index, no .item().
-    phys_blks = block_table[:, blk_logical].long()  # (B,)
+    if isinstance(offsets, int):
+        # Homogeneous fast path — same as the pre-cohort-relax code.
+        blk_logical = offsets // block_size
+        blk_offset = offsets % block_size
+        if blk_offset + T <= block_size:
+            phys_blks = block_table[:, blk_logical].long()  # (B,)
+            k_cache[phys_blks, blk_offset: blk_offset + T] = k_data
+            v_cache[phys_blks, blk_offset: blk_offset + T] = v_data
+        else:
+            first_n = block_size - blk_offset
+            phys_blks = block_table[:, blk_logical].long()
+            phys_blks_next = block_table[:, blk_logical + 1].long()
+            k_cache[phys_blks, blk_offset:block_size] = k_data[:, :first_n]
+            v_cache[phys_blks, blk_offset:block_size] = v_data[:, :first_n]
+            k_cache[phys_blks_next, 0: T - first_n] = k_data[:, first_n:]
+            v_cache[phys_blks_next, 0: T - first_n] = v_data[:, first_n:]
+        return
 
-    if blk_offset + chunk_size <= block_size:
-        # Common case: all chunk frames land in one block per stream.
-        k_cache[phys_blks, blk_offset: blk_offset + chunk_size] = k_data
-        v_cache[phys_blks, blk_offset: blk_offset + chunk_size] = v_data
-    else:
-        # Span two blocks (chunk straddles a block boundary).
-        first_n = block_size - blk_offset
-        phys_blks_next = block_table[:, blk_logical + 1].long()  # (B,)
-        k_cache[phys_blks, blk_offset:block_size] = k_data[:, :first_n]
-        v_cache[phys_blks, blk_offset:block_size] = v_data[:, :first_n]
-        k_cache[phys_blks_next, 0: chunk_size - first_n] = k_data[:, first_n:]
-        v_cache[phys_blks_next, 0: chunk_size - first_n] = v_data[:, first_n:]
+    # Heterogeneous-offset scatter.
+    arange_T = torch.arange(T, device=offsets.device, dtype=offsets.dtype)
+    time_pos = offsets.unsqueeze(1) + arange_T.unsqueeze(0)  # (B, T)
+    blk_logical_t = (time_pos // block_size).long()
+    blk_offset_t = (time_pos % block_size).long()
+
+    phys_blk = torch.gather(block_table.long(), dim=1, index=blk_logical_t)
+    flat_idx = (phys_blk * block_size + blk_offset_t).view(-1)
+
+    k_flat = k_cache.view(-1, H_kv, D)
+    v_flat = v_cache.view(-1, H_kv, D)
+    k_flat[flat_idx] = k_data.view(B * T, H_kv, D)
+    v_flat[flat_idx] = v_data.view(B * T, H_kv, D)
 
 
 def _paged_gather_kv(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
-    total_frames: int,
+    max_total_kv: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Gather K and V from the paged pool for all ``total_frames`` tokens.
+    """Gather the first ``max_total_kv`` K/V frames for every stream.
 
-    Supports both single-stream (``B=1``) and batched (``B>=2``) inputs —
-    one block-table row per stream.  The frames returned include any
-    frames just written by :func:`_paged_write_kv` in the same forward
-    pass (those writes happened in-place to the pool tensors before
-    this gather).
+    Streams whose actual valid length is < ``max_total_kv`` end up with
+    stale tail data in the gathered tensor; the FlexAttention block-mask
+    enforces per-stream length and discards it.
 
-    Parameters
-    ----------
-    k_cache, v_cache : Tensor
-        Pool tensors ``(max_blocks, block_size, n_kv_head, head_dim)``.
-    block_table : Tensor
-        ``(B, max_blocks_per_seq)`` int32.
-    total_frames : int
-        Total number of frames to retrieve per stream.  Pass
-        ``cache_seqlens[0] + chunk_size`` to include the current chunk.
-
-    Returns
-    -------
-    k, v : Tensor
-        Both shaped ``(B, n_kv_head, total_frames, head_dim)`` —
-        head-first, matching SDPA's expected layout.
+    Returns ``(k, v)`` both shaped ``(B, n_kv_head, max_total_kv, head_dim)``.
     """
     B = block_table.size(0)
-    if total_frames == 0:
-        n_kv_head, head_dim = k_cache.size(2), k_cache.size(3)
+    H_kv, D = k_cache.size(2), k_cache.size(3)
+    if max_total_kv == 0:
         empty = torch.zeros(
-            B, n_kv_head, 0, head_dim, dtype=k_cache.dtype, device=k_cache.device
+            B, H_kv, 0, D, dtype=k_cache.dtype, device=k_cache.device
         )
         return empty, empty.clone()
 
     block_size = k_cache.size(1)
-    num_blocks = (total_frames + block_size - 1) // block_size
+    num_blocks = (max_total_kv + block_size - 1) // block_size
     block_ids = block_table[:, :num_blocks].long()  # (B, num_blocks)
 
-    # (B, num_blocks, block_size, n_kv_head, d_k) → flatten the block axis.
     k_gathered = k_cache[block_ids].reshape(
-        B, num_blocks * block_size, k_cache.size(2), k_cache.size(3)
-    )[:, :total_frames]
+        B, num_blocks * block_size, H_kv, D
+    )[:, :max_total_kv]
     v_gathered = v_cache[block_ids].reshape(
-        B, num_blocks * block_size, v_cache.size(2), v_cache.size(3)
-    )[:, :total_frames]
-
-    # → (B, n_kv_head, total_frames, d_k)  head-first
+        B, num_blocks * block_size, H_kv, D
+    )[:, :max_total_kv]
     return k_gathered.permute(0, 2, 1, 3), v_gathered.permute(0, 2, 1, 3)
 
 
-class MultiHeadedAttention(nn.Module):
-    """Multi-Head Attention layer.
+# ---------------------------------------------------------------------------
+# Per-stream length → additive padding bias (SDPA paged / dense / offline)
+# ---------------------------------------------------------------------------
 
-    Always uses PyTorch SDPA kernels.
 
-    If ``n_kv_head`` is not ``None`` and ``n_kv_head != n_head``, this
-    implements Multi-Query or Grouped-Query attention:
+def _length_to_pad_bias(
+    total_kv_lens: torch.Tensor,
+    T_kv_max: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build a ``(B, 1, 1, T_kv_max)`` additive bias that masks each
+    stream's attention to ``[0, total_kv_lens[b])`` (``-inf`` outside).
+    """
+    arange = torch.arange(T_kv_max, device=total_kv_lens.device)
+    keep = arange.unsqueeze(0) < total_kv_lens.unsqueeze(1)  # (B, T_kv_max)
+    bias = torch.where(keep, 0.0, float("-inf")).to(dtype)
+    return bias.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, T_kv_max)
 
-    - case 1: ``n_kv_head is None`` and ``head_dim is None``:
-      standard multi-head self-attention (MHSA)
-    - case 2: ``n_kv_head == 1`` and ``n_head > 1``:
-      multi-query attention (MQA)
-    - case 3: ``1 < n_kv_head < n_head``:
-      grouped-query attention (GQA)
 
-    Args:
-        n_head: Number of attention heads.
-        n_feat: Model dimension (input and output size).
-        query_bias: Whether to include bias in the query projection.
-        key_bias: Whether to include bias in the key projection.
-        value_bias: Whether to include bias in the value projection.
-        n_kv_head: Number of key/value heads (for MQA/GQA). If ``None``,
-            defaults to ``n_head`` (standard multi-head).
-        head_dim: Per-head dimension. If ``None``, inferred as
-            ``n_feat // n_head``.
+# ---------------------------------------------------------------------------
+# Paged FlexAttention BlockMask (kept for future re-enablement; not used
+# by the active SDPA path).
+# ---------------------------------------------------------------------------
+
+
+def build_paged_block_mask(
+    total_kv_lens: torch.Tensor,
+    B: int,
+    T_q: int,
+    T_kv_max: int,
+    device: torch.device,
+) -> BlockMask:
+    """Build a per-stream length BlockMask for FlexAttention paged forward.
+
+    Stream ``b`` attends to ``kv_idx ∈ [0, total_kv_lens[b])`` only.
+    Built once per encoder ``forward_chunk_paged`` call and shared
+    across all encoder layers via ``PagedKVCache.block_mask``.
+
+    Goes through the compiled ``create_block_mask`` so per-call Python
+    overhead is amortised across all subsequent calls.
+    """
+    def mask_mod(b, h, q_idx, kv_idx):  # type: ignore[no-untyped-def]
+        del h, q_idx
+        return kv_idx < total_kv_lens[b]
+
+    return _create_block_mask_compiled(
+        mask_mod, B=B, H=None, Q_LEN=T_q, KV_LEN=T_kv_max,
+        device=device,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Conformer rel-pos multi-head attention
+# ---------------------------------------------------------------------------
+
+
+class RelPositionMultiHeadedAttention(nn.Module):
+    """Multi-Head Attention with Transformer-XL relative-position bias.
+
+    Reference: https://arxiv.org/abs/1901.02860.
+
+    Inference-only. The actual attention compute uses SDPA; the
+    Transformer-XL ``matrix_bd`` rel-pos bias is combined with the
+    padding / per-stream length mask and passed in as ``attn_mask``.
+
+    Supports MHA / MQA / GQA layouts:
+
+    * ``n_kv_head=None``: standard multi-head (``n_kv_head = n_head``).
+    * ``n_kv_head=1``: multi-query attention.
+    * ``1 < n_kv_head < n_head``: grouped-query attention.
+
+    Parameters
+    ----------
+    n_head : int
+        Number of query/output attention heads.
+    n_feat : int
+        Model dimension (input / output size).
+    query_bias, key_bias, value_bias : bool
+        Whether the corresponding linear projection uses a bias term.
+    n_kv_head : int, optional
+        Number of K/V heads; defaults to ``n_head``. Requires ``head_dim``
+        when set explicitly.
+    head_dim : int, optional
+        Per-head dimension; defaults to ``n_feat // n_head``.
     """
 
     def __init__(
@@ -250,20 +352,19 @@ class MultiHeadedAttention(nn.Module):
         n_kv_head: Optional[int] = None,
         head_dim: Optional[int] = None,
     ):
-        """Construct a MultiHeadedAttention object (ported from WeNet)."""
         super().__init__()
 
-        # Inner dimensions for Q/K/V projections
+        # Inner dimensions for Q/K/V projections.
         self.inner_dim = n_feat if head_dim is None else head_dim * n_head
         if n_kv_head is not None:
-            assert head_dim is not None, "head_dim must be set when n_kv_head is not None"
+            assert head_dim is not None, (
+                "head_dim must be set when n_kv_head is not None"
+            )
             self.inner_kv_dim = head_dim * n_kv_head
-            n_kv_head = n_kv_head
         else:
             self.inner_kv_dim = self.inner_dim
             n_kv_head = n_head
 
-        # We assume d_v always equals d_k
         self.d_k = self.inner_dim // n_head
         assert self.d_k == self.inner_kv_dim // n_kv_head
 
@@ -275,733 +376,302 @@ class MultiHeadedAttention(nn.Module):
         self.linear_v = nn.Linear(n_feat, self.inner_kv_dim, bias=value_bias)
         self.linear_out = nn.Linear(self.inner_dim, n_feat, bias=query_bias)
 
-    def _forward_linearx(
-        self,
-        name: str,
-        x: torch.Tensor,
-        head_first: bool = True,
-    ) -> torch.Tensor:
-        """Apply the Q/K/V projection and reshape into head dimensions."""
+        self.linear_pos = nn.Linear(n_feat, n_feat, bias=False)
+        self.pos_bias_u = nn.Parameter(torch.empty(self.h, self.d_k))
+        self.pos_bias_v = nn.Parameter(torch.empty(self.h, self.d_k))
+        nn.init.xavier_uniform_(self.pos_bias_u)
+        nn.init.xavier_uniform_(self.pos_bias_v)
 
-        assert x.ndim >= 3
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _project(self, name: str, x: torch.Tensor) -> torch.Tensor:
         if name == "query":
             x = self.linear_q(x)
-            x_shape = x.size()
-            x_shape = x_shape[:-1] + torch.Size([self.h, self.d_k])
+            heads = self.h
         elif name == "key":
             x = self.linear_k(x)
-            x_shape = x.size()
-            x_shape = x_shape[:-1] + torch.Size([self.h_kv, self.d_k])
+            heads = self.h_kv
         else:
             assert name == "value"
             x = self.linear_v(x)
-            x_shape = x.size()
-            x_shape = x_shape[:-1] + torch.Size([self.h_kv, self.d_k])
+            heads = self.h_kv
+        x = x.view(*x.shape[:-1], heads, self.d_k)
+        return x.transpose(-3, -2)  # (..., heads, T, d_k)
 
-        # split last dim
-        x = x.view(x_shape)
-        if head_first:
-            # (batch, ..., head or head_kv, time, d_k)
-            x = x.transpose(-3, -2)
-        return x
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
-    def forward_qkv(
+    def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Transform query, key, and value.
+        mask: torch.Tensor = torch.zeros((0, 0, 0)),
+        pos_emb: torch.Tensor = torch.empty(0),
+        cache: Union[T_CACHE, PagedKVCache, None] = None,
+    ) -> Tuple[torch.Tensor, Union[T_CACHE, PagedKVCache, None]]:
+        """Compute Conformer rel-pos attention.
 
-        Args:
-            query: Query tensor of shape ``(batch, ..., time1, size)``.
-            key: Key tensor of shape ``(batch, ..., time2, size)``.
-            value: Value tensor of shape ``(batch, ..., time2, size)``.
+        Three cache modes are supported:
 
-        Returns:
-            Transformed Q/K/V tensors:
+        * **Offline** (``cache is None`` or empty tuple). Standard
+          attention over ``(query, key, value)``; ``mask`` is the additive
+          padding bias of shape ``(B, 1, T)``.
+        * **Paged streaming** (:class:`PagedKVCache`). K/V are written
+          into the shared block pool and attended over the full per-stream
+          context ``[0, cache_seqlens[b] + T_q)``.
+        * **Dense streaming** (tuple of ``(K_cached, V_cached)`` head-first
+          tensors). New K/V are concatenated with the cached pair and
+          returned as the next cache. ``mask`` is an additive bias over the
+          full attended range; same algebra as the legacy SDPA path.
 
-            - ``q``: ``(batch, ..., n_head, time1, d_k)``
-            - ``k``: ``(batch, ..., n_head_kv, time2, d_k)``
-            - ``v``: ``(batch, ..., n_head_kv, time2, d_k)``
+        Returns
+        -------
+        out : Tensor
+            ``(B, T_q, n_feat)``.
+        cache : same type as input
+            Updated cache; ``None`` for the offline path, the same descriptor
+            (pool was updated in place) for paged, or a fresh
+            ``(K_full, V_full)`` pair for dense.
         """
+        B, T_q, _ = query.shape
 
-        q = self._forward_linearx("query", query)
-        k = self._forward_linearx("key", key)
-        v = self._forward_linearx("value", value)
-        return q, k, v
+        # 1. Q/K/V projections.
+        q = self._project("query", query)  # (B, H,    T_q, d_k)
+        k = self._project("key",   key)    # (B, H_kv, T_q, d_k)
+        v = self._project("value", value)  # (B, H_kv, T_q, d_k)
 
-    def forward_attention(
+        if isinstance(cache, PagedKVCache):
+            return self._forward_paged(q, k, v, pos_emb, cache, B, T_q)
+
+        # Tuple form: dense streaming when the cache tensors are populated,
+        # otherwise (placeholder zeros) it's the offline / first-chunk path.
+        if isinstance(cache, tuple) and cache[0].numel() > 0:
+            return self._forward_dense(q, k, v, mask, pos_emb, cache, B, T_q)
+
+        return self._forward_offline(q, k, v, mask, pos_emb, B, T_q)
+
+    # ------------------------------------------------------------------
+    # Mode-specific implementations
+    # ------------------------------------------------------------------
+
+    def _forward_paged(
         self,
-        value: torch.Tensor,
-        scores: torch.Tensor,
-        mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
-    ) -> torch.Tensor:
-        """Compute attention context vector.
-
-        Args:
-            value: Transformed value, shape
-                ``(batch, ..., n_head, time2, d_k)``.
-            scores: Attention scores, shape
-                ``(batch, ..., n_head, time1, time2)``.
-            mask: Attention mask, either of shape
-
-                - ``(batch, 1, time2)`` or
-                - ``(batch, ..., time1, time2)``
-
-                A value of 0 means the position is masked.
-
-        Returns:
-            Output tensor of shape ``(batch, ..., time1, d_model)``.
-        """
-
-        # NOTE: When will `if mask.size(-1) > 0` be True?
-        # 1. ONNX export for first chunk
-        # 2. PyTorch training
-        if mask.size(-1) > 0:  # time2 > 0
-            # (batch, ..., 1, *, time2)
-            mask = mask.unsqueeze(-3).eq(0)
-            # For last chunk, time2 might be larger than scores.size(-1)
-            mask = mask[..., : scores.size(-1)]  # (batch, 1, *, time2)
-            scores = scores.masked_fill(mask, -float("inf"))
-            attn = torch.softmax(scores.float(), dim=-1).type_as(value).masked_fill(
-                mask, 0.0
-            )  # (batch, head, time1, time2)
-        else:
-            # NOTE: This path is used for some ONNX/JIT export modes.
-            attn = torch.softmax(scores.float(), dim=-1).type_as(
-                value
-            )  # (batch, ..., head, time1, time2)
-
-        x = torch.matmul(attn, value)  # (batch, ..., head, time1, d_k)
-        # [batch, ..., time1, head, d_k]
-        x = x.transpose(-3, -2).contiguous()
-        x_shape = x.size()[:-2] + torch.Size([self.h * self.d_k])
-        x = x.view(x_shape)  # (batch, ..., time1, d_model)
-        return self.linear_out(x)  # (batch, ..., time1, d_model)
-
-    def _update_kv_and_cache(
-        self,
+        q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        pos_emb: torch.Tensor,
+        cache: PagedKVCache,
+        B: int,
+        T_q: int,
+    ) -> Tuple[torch.Tensor, PagedKVCache]:
+        homogeneous = cache.host_seqlen_homogeneous >= 0
+
+        # 1. Write the new K/V into the paged pool. Scalar-offset fast
+        #    path when every stream in the batch shares an offset.
+        if homogeneous:
+            _paged_write_kv(
+                cache.k_cache, cache.v_cache, cache.block_table,
+                cache.host_seqlen_homogeneous, k, v,
+            )
+        else:
+            _paged_write_kv(
+                cache.k_cache, cache.v_cache, cache.block_table,
+                cache.cache_seqlens, k, v,
+            )
+
+        # 2. Relative-position bias.  pos_emb: (B_pos, T_kv_max, n_feat)
+        #    with T_kv_max == host_seqlen_max + T_q.
+        n_batch_pos = pos_emb.size(0)
+        T_kv_max = pos_emb.size(1)
+        p = self.linear_pos(pos_emb).view(n_batch_pos, T_kv_max, self.h, self.d_k)
+        p = p.transpose(1, 2)  # (B_pos, H, T_kv_max, d_k)
+
+        q_t = q.transpose(1, 2)  # (B, T_q, H, d_k)
+        q_with_bias_u = (q_t + self.pos_bias_u).transpose(1, 2)
+        q_with_bias_v = (q_t + self.pos_bias_v).transpose(1, 2)
+
+        matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))  # (B, H, T_q, T_kv_max)
+
+        # 3. Gather K/V from the paged pool (includes the just-written chunk).
+        k_full, v_full = _paged_gather_kv(
+            cache.k_cache, cache.v_cache, cache.block_table, T_kv_max,
+        )
+        if self.h_kv != self.h and self.h_kv != 1:
+            # Expand KV heads for grouped-query attention; SDPA broadcasts
+            # H_kv=1 (MQA) automatically, but not generic H_kv groups.
+            n_repeat = self.h // self.h_kv
+            k_full = k_full.repeat_interleave(n_repeat, dim=1)
+            v_full = v_full.repeat_interleave(n_repeat, dim=1)
+
+        # 4. SDPA with combined attn_mask = (matrix_bd + pad_bias) / sqrt(d_k).
+        #    Skip the pad_bias build entirely when offsets are homogeneous —
+        #    every stream's valid kv length is exactly T_kv_max so the bias
+        #    would be all zeros.
+        if homogeneous:
+            attn_mask = matrix_bd * (1.0 / math.sqrt(self.d_k))
+        else:
+            total_kv_lens = cache.cache_seqlens + T_q  # (B,) on GPU
+            pad_bias = _length_to_pad_bias(total_kv_lens, T_kv_max, q.dtype)
+            attn_mask = (matrix_bd + pad_bias) * (1.0 / math.sqrt(self.d_k))
+        out = F.scaled_dot_product_attention(
+            q_with_bias_u, k_full, v_full,
+            attn_mask=attn_mask,
+            scale=1.0 / math.sqrt(self.d_k),
+        )  # (B, H, T_q, d_k)
+
+        # 5. Output projection.
+        out = out.transpose(1, 2).contiguous().view(B, T_q, self.h * self.d_k)
+        return self.linear_out(out), cache
+
+    def _forward_dense(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+        pos_emb: torch.Tensor,
         cache: T_CACHE,
-        head_first: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, T_CACHE]:
-        """Update KV cache for streaming / incremental decoding."""
+        B: int,
+        T_q: int,
+    ) -> Tuple[torch.Tensor, T_CACHE]:
+        """Dense streaming — concatenate with cached K/V, then attend."""
+        k_old, v_old = cache
+        k_full = torch.cat([k_old, k], dim=-2)  # (B, H_kv, T_old + T_q, d_k)
+        v_full = torch.cat([v_old, v], dim=-2)
+        out = self._attend_with_relpos_bias(q, k_full, v_full, mask, pos_emb, B, T_q)
+        return out, (k_full, v_full)
 
-        new_cache = cache
-        seq_axis = -2 if head_first else -3
-        head_axis = -3 if head_first else -2
+    def _forward_offline(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+        pos_emb: torch.Tensor,
+        B: int,
+        T_q: int,
+    ) -> Tuple[torch.Tensor, None]:
+        """Full-sequence attention with padding bias and rel-pos bias."""
+        out = self._attend_with_relpos_bias(q, k, v, mask, pos_emb, B, T_q)
+        return out, None
 
-        if not self.training:
-            # When exporting ONNX or running inference, we append new K/V
-            # to the cache. Zero-shaped tensors are handled gracefully.
-            key_cache, value_cache = cache
-            if key_cache.size(0) > 0:
-                k = torch.cat([key_cache, k], dim=seq_axis)
-            if value_cache.size(0) > 0:
-                v = torch.cat([value_cache, v], dim=seq_axis)
+    def _attend_with_relpos_bias(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+        pos_emb: torch.Tensor,
+        B: int,
+        T_q: int,
+    ) -> torch.Tensor:
+        """Rel-pos attention over already-prepared Q/K/V via SDPA.
 
-            # Cache slicing for chunked inference is handled at the
-            # encoder layer level; here we simply concatenate.
-            new_cache = (k, v)
+        ``mask`` is the additive padding bias (``0`` valid, ``-inf``
+        padding). Combined with ``matrix_bd`` and scaled by
+        ``1/sqrt(d_k)``, then passed to SDPA as ``attn_mask`` — same
+        algebra as the original WeNet RelPos path.
+        """
+        n_batch_pos = pos_emb.size(0)
+        T_pos = pos_emb.size(1)
+        p = self.linear_pos(pos_emb).view(n_batch_pos, T_pos, self.h, self.d_k)
+        p = p.transpose(1, 2)  # (B_pos, H, T_pos, d_k)
 
-        # For multi-query or grouped-query attention, expand KV heads.
+        q_t = q.transpose(1, 2)
+        q_with_bias_u = (q_t + self.pos_bias_u).transpose(1, 2)
+        q_with_bias_v = (q_t + self.pos_bias_v).transpose(1, 2)
+
+        matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))  # (B, H, T_q, T_pos)
+        if mask.numel() > 0:
+            attn_mask = (matrix_bd + mask.unsqueeze(1)) * (1.0 / math.sqrt(self.d_k))
+        else:
+            attn_mask = matrix_bd * (1.0 / math.sqrt(self.d_k))
+
         if self.h_kv != self.h and self.h_kv != 1:
             n_repeat = self.h // self.h_kv
+            k = k.repeat_interleave(n_repeat, dim=1)
+            v = v.repeat_interleave(n_repeat, dim=1)
 
-            k_shape = k.size()
-            repeat_axis = head_axis + 1
-            k = (
-                k.unsqueeze(head_axis)
-                .expand(
-                    k_shape[:repeat_axis]
-                    + torch.Size([n_repeat])
-                    + k_shape[repeat_axis:]
-                )
-                .reshape(
-                    k_shape[:head_axis]
-                    + torch.Size([self.h_kv * n_repeat])
-                    + k_shape[repeat_axis:]
-                )
-            )
+        out = F.scaled_dot_product_attention(
+            q_with_bias_u, k, v,
+            attn_mask=attn_mask,
+            scale=1.0 / math.sqrt(self.d_k),
+        )  # (B, H, T_q, d_k)
 
-            v_shape = v.size()
-            v = (
-                v.unsqueeze(head_axis)
-                .expand(
-                    v_shape[:repeat_axis]
-                    + torch.Size([n_repeat])
-                    + v_shape[repeat_axis:]
-                )
-                .reshape(
-                    v_shape[:head_axis]
-                    + torch.Size([self.h_kv * n_repeat])
-                    + v_shape[repeat_axis:]
-                )
-            )
-
-        return k, v, new_cache
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
-        pos_emb: torch.Tensor = torch.empty(0),
-        cache: Union[T_CACHE, PagedKVCache] = (
-            torch.zeros(0, 0, 0, 0),
-            torch.zeros(0, 0, 0, 0),
-        ),
-    ) -> Tuple[torch.Tensor, Union[T_CACHE, PagedKVCache]]:
-        """Compute scaled dot-product attention.
-
-        Args:
-            query: Query tensor of shape ``(batch, time1, size)``.
-            key: Key tensor of shape ``(batch, time2, size)``.
-            value: Value tensor of shape ``(batch, time2, size)``.
-            mask: Mask tensor of shape ``(batch, 1, time2)`` or
-                ``(batch, time1, time2)``.
-            pos_emb: Positional embedding (unused in base class).
-            cache: Dense KV cache pair (training / non-paged inference) or
-                a :class:`PagedKVCache` descriptor for paged inference.
-
-        Returns:
-            A tuple of:
-
-            - Output tensor ``(batch, time1, d_model)``.
-            - Updated cache (same type as input).
-        """
-
-        del pos_emb  # Not used in standard attention
-
-        if isinstance(cache, PagedKVCache):
-            q, k, v = self.forward_qkv(query, key, value)
-            # q: (1, n_head, chunk_size, d_k)
-            if cache.host_seqlen >= 0:
-                seqlen_offset = cache.host_seqlen
-            else:
-                seqlen_offset = int(cache.cache_seqlens[0].item())
-            total_frames = seqlen_offset + q.size(2)
-
-            if (
-                _HAS_FLASH_ATTN
-                and query.is_cuda
-                and query.dtype in (torch.float16, torch.bfloat16)
-            ):
-                # flash_attn_with_kvcache expects (batch, seqlen, nheads, head_dim).
-                # It writes k/v into the paged pool and computes attention atomically.
-                q_fa = q.permute(0, 2, 1, 3)   # (1, chunk_size, n_head, d_k)
-                k_fa = k.permute(0, 2, 1, 3)   # (1, chunk_size, n_kv_head, d_k)
-                v_fa = v.permute(0, 2, 1, 3)
-                output = _flash_attn_with_kvcache(
-                    q_fa,
-                    cache.k_cache,
-                    cache.v_cache,
-                    k_fa,
-                    v_fa,
-                    block_table=cache.block_table,
-                    cache_seqlens=cache.cache_seqlens,
-                    softmax_scale=1.0 / math.sqrt(self.d_k),
-                    causal=False,
-                )  # (1, chunk_size, n_head, d_k)
-                output = output.reshape(query.size(0), -1, self.h * self.d_k)
-            else:
-                # Fallback: write K/V into pool, gather all frames, run SDPA.
-                _paged_write_kv(
-                    cache.k_cache, cache.v_cache,
-                    cache.block_table, seqlen_offset, k, v,
-                )
-                k_full, v_full = _paged_gather_kv(
-                    cache.k_cache, cache.v_cache, cache.block_table, total_frames,
-                )
-                # Expand KV heads for GQA (not needed for MQA: SDPA broadcasts).
-                if self.h_kv != self.h and self.h_kv != 1:
-                    n_repeat = self.h // self.h_kv
-                    k_full = k_full.repeat_interleave(n_repeat, dim=1)
-                    v_full = v_full.repeat_interleave(n_repeat, dim=1)
-                assert mask.dtype != torch.bool
-                output = F.scaled_dot_product_attention(
-                    q, k_full, v_full,
-                    attn_mask=mask.unsqueeze(1),
-                    scale=1 / math.sqrt(self.d_k),
-                )
-                output = (
-                    output.transpose(1, 2)
-                    .contiguous()
-                    .view(query.size(0), -1, self.h * self.d_k)
-                )
-            return self.linear_out(output), cache
-
-        # ----------------------------------------------------------------
-        # Dense T_CACHE path (training / non-paged inference)
-        # ----------------------------------------------------------------
-        q, k, v = self.forward_qkv(query, key, value)
-        k, v, new_cache = self._update_kv_and_cache(k, v, cache)
-
-        # SDPA-only path. The `mask` tensor is expected to be an additive
-        # bias (float/bfloat16/half), not a boolean padding mask.
-        assert mask.dtype != torch.bool
-        output = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=mask.unsqueeze(1),
-            scale=1 / math.sqrt(self.d_k),
-        )
-        output = (
-            output.transpose(1, 2)
-            .contiguous()
-            .view(query.size(0), -1, self.h * self.d_k)
-        )  # (batch, time1, d_model)
-        return self.linear_out(output), new_cache
+        out = out.transpose(1, 2).contiguous().view(B, T_q, self.h * self.d_k)
+        return self.linear_out(out)
 
 
-class RelPositionMultiHeadedAttention(MultiHeadedAttention):
-    """Multi-Head Attention layer with relative position encoding.
+def warmup_flex_attention(
+    *,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int,
+    max_batch_size: int,
+    chunk_size: int,
+    max_attention_key_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Trigger ``torch.compile`` for the FlexAttention kernel and the
+    BlockMask constructor on representative shapes.
 
-    Paper: https://arxiv.org/abs/1901.02860
+    Run once at engine init so the first benchmark / request doesn't
+    pay the compilation tax. With ``dynamic=True`` on both compiled
+    callables, a single warmup amortises across all subsequent shape
+    combinations the engine produces.
+
+    Walks through both branches:
+    * **homogeneous** — ``block_mask=None`` (the common case where every
+      streaming request in a step shares an offset).
+    * **heterogeneous** — a real BlockMask built from per-stream
+      ``cache_seqlens`` (cohort-relaxed admission, varying offsets).
     """
+    B = max_batch_size
+    T_q = chunk_size
+    T_kv = max_attention_key_size
 
-    def __init__(
-        self,
-        n_head: int,
-        n_feat: int,
-        query_bias: bool = True,
-        key_bias: bool = True,
-        value_bias: bool = True,
-        n_kv_head: Optional[int] = None,
-        head_dim: Optional[int] = None,
-    ):
-        """Construct a RelPositionMultiHeadedAttention object."""
-        super().__init__(
-            n_head,
-            n_feat,
-            query_bias,
-            key_bias,
-            value_bias,
-            n_kv_head=n_kv_head,
-            head_dim=head_dim,
-        )
+    q = torch.randn(B, n_head, T_q, head_dim, device=device, dtype=dtype)
+    k = torch.randn(B, n_kv_head, T_kv, head_dim, device=device, dtype=dtype)
+    v = torch.randn(B, n_kv_head, T_kv, head_dim, device=device, dtype=dtype)
+    bias = torch.zeros(B, n_head, T_q, T_kv, device=device, dtype=dtype)
 
-        # Linear transformation for positional encoding
-        self.linear_pos = nn.Linear(n_feat, n_feat, bias=False)
+    enable_gqa = n_kv_head != n_head
 
-        # Learnable biases used in matrix c and matrix d
-        # as described in https://arxiv.org/abs/1901.02860 Section 3.3
-        self.pos_bias_u = nn.Parameter(torch.Tensor(self.h, self.d_k))
-        self.pos_bias_v = nn.Parameter(torch.Tensor(self.h, self.d_k))
-        torch.nn.init.xavier_uniform_(self.pos_bias_u)
-        torch.nn.init.xavier_uniform_(self.pos_bias_v)
+    # Homogeneous branch — no BlockMask, full attention.
+    _flex_attention_paged_with_bias(
+        q, k, v, bias, block_mask=None,
+        softmax_scale=1.0 / math.sqrt(head_dim),
+        enable_gqa=enable_gqa,
+    )
 
-    def rel_shift(self, x: torch.Tensor, zero_triu: bool = False) -> torch.Tensor:
-        """Compute relative positional encoding shift.
+    # Heterogeneous branch — real BlockMask with varying lengths so the
+    # mask_mod path actually traces (cache_seqlens=0 here means stream b
+    # attends only to its own freshly-written T_q frames; trivial but
+    # non-uniform across the batch).
+    base_lens = torch.full((B,), 0, device=device, dtype=torch.int32)
+    base_lens[: B // 2] = max(0, T_kv - T_q)  # half full, half empty
+    block_mask = build_paged_block_mask(
+        base_lens + T_q, B=B, T_q=T_q, T_kv_max=T_kv, device=device,
+    )
+    _flex_attention_paged_with_bias(
+        q, k, v, bias, block_mask=block_mask,
+        softmax_scale=1.0 / math.sqrt(head_dim),
+        enable_gqa=enable_gqa,
+    )
 
-        Args:
-            x: Input tensor ``(batch, head, time1, time2)``.
-            zero_triu: If True, zero out the upper triangular part.
-        """
-
-        zero_pad = torch.zeros(
-            (x.size()[0], x.size()[1], x.size()[2], 1),
-            device=x.device,
-            dtype=x.dtype,
-        )
-        x_padded = torch.cat([zero_pad, x], dim=-1)
-
-        x_padded = x_padded.view(
-            x.size()[0],
-            x.size()[1],
-            x.size(3) + 1,
-            x.size(2),
-        )
-        x = x_padded[:, :, 1:].view_as(x)
-
-        if zero_triu:
-            ones = torch.ones((x.size(2), x.size(3)),
-                              device=x.device, dtype=x.dtype)
-            x = x * torch.tril(ones, x.size(3) - x.size(2))[None, None, :, :]
-
-        return x
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        mask: torch.Tensor,
-        pos_emb: torch.Tensor = torch.empty(0),
-        cache: Union[T_CACHE, PagedKVCache] = (
-            torch.zeros((0, 0, 0, 0)),
-            torch.zeros((0, 0, 0, 0)),
-        ),
-    ) -> Tuple[torch.Tensor, Union[T_CACHE, PagedKVCache]]:
-        """Compute scaled dot-product attention with relative positional encoding.
-
-        When ``cache`` is a :class:`PagedKVCache` the method writes new K/V
-        frames into the shared block pool *before* gathering the full context,
-        so that the rel-pos bias can be applied over the complete
-        ``(cache_seqlens + chunk_size)``-frame key sequence.
-        """
-
-        q, k, v = self.forward_qkv(query, key, value)
-        # q: (batch, n_head, time1, d_k)
-        q = q.transpose(1, 2)  # (batch, time1, n_head, d_k)
-
-        if isinstance(cache, PagedKVCache):
-            if cache.host_seqlen >= 0:
-                seqlen_offset = cache.host_seqlen
-            else:
-                seqlen_offset = int(cache.cache_seqlens[0].item())
-            total_frames = seqlen_offset + q.size(1)
-            # Write new K/V into the paged pool.
-            _paged_write_kv(
-                cache.k_cache, cache.v_cache,
-                cache.block_table, seqlen_offset, k, v,
-            )
-            # Gather the full key/value context (past + current chunk).
-            k_full, v_full = _paged_gather_kv(
-                cache.k_cache, cache.v_cache, cache.block_table, total_frames,
-            )
-            # k_full: (1, n_kv_head, total_frames, d_k)
-            # Expand KV heads for GQA (not needed for MQA: SDPA broadcasts).
-            if self.h_kv != self.h and self.h_kv != 1:
-                n_repeat = self.h // self.h_kv
-                k_full = k_full.repeat_interleave(n_repeat, dim=1)
-                v_full = v_full.repeat_interleave(n_repeat, dim=1)
-            new_cache: Union[T_CACHE, PagedKVCache] = cache
-        else:
-            k, v, new_cache = self._update_kv_and_cache(k, v, cache)
-            k_full, v_full = k, v
-
-        n_batch_pos = pos_emb.size(0)
-        p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
-        p = p.transpose(1, 2)  # (batch, n_head, time_pos, d_k)
-
-        # (batch, n_head, time1, d_k)
-        q_with_bias_u = (q + self.pos_bias_u).transpose(1, 2)
-        q_with_bias_v = (q + self.pos_bias_v).transpose(1, 2)
-
-        # (batch, n_head, time1, time_pos)
-        matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
-
-        # SDPA-only path: matrix_bd becomes part of the mask bias. The
-        # incoming `mask` must already be an additive bias tensor
-        # (float/bfloat16/half), not a boolean padding mask.
-        assert mask.dtype != torch.bool
-        mask = mask.unsqueeze(1)
-        mask = (matrix_bd + mask) / math.sqrt(self.d_k)
-        output = F.scaled_dot_product_attention(
-            q_with_bias_u,
-            k_full,
-            v_full,
-            attn_mask=mask,
-            scale=1 / math.sqrt(self.d_k),
-        )
-        output = (
-            output.transpose(1, 2)
-            .contiguous()
-            .view(query.size(0), -1, self.h * self.d_k)
-        )  # (batch, time1, d_model)
-        return self.linear_out(output), new_cache
-
-
-class MultiHeadedCrossAttention(MultiHeadedAttention):
-    """Cross-attention variant of MultiHeadedAttention."""
-
-    def __init__(
-        self,
-        n_head: int,
-        n_feat: int,
-        query_bias: bool = True,
-        key_bias: bool = True,
-        value_bias: bool = True,
-        n_kv_head: Optional[int] = None,
-        head_dim: Optional[int] = None,
-    ):
-        super().__init__(
-            n_head,
-            n_feat,
-            query_bias,
-            key_bias,
-            value_bias,
-            n_kv_head=n_kv_head,
-            head_dim=head_dim,
-        )
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        mask: torch.Tensor,
-        pos_emb: torch.Tensor = torch.empty(0),
-        cache: T_CACHE = (
-            torch.zeros((0, 0, 0, 0)),
-            torch.zeros((0, 0, 0, 0)),
-        ),
-    ) -> Tuple[torch.Tensor, T_CACHE]:
-        """Compute cross-attention between decoder query and encoder memory."""
-
-        del pos_emb
-
-        key_cache, value_cache = cache
-        assert key_cache.size(0) == value_cache.size(0)
-
-        if key_cache.size(0) > 0:
-            # During inference with cache, we reuse pre-computed keys/values.
-            assert not self.training
-            q = self._forward_linearx("query", query)
-            k, v = key_cache, value_cache
-            new_cache = cache
-        else:
-            q, k, v = self.forward_qkv(query, key, value)
-            new_cache = (k, v) if not self.training else cache
-
-        # For multi-query or multi-group attention, repeat KV heads.
-        if self.h_kv != self.h and self.h_kv != 1:
-            k = torch.repeat_interleave(
-                k,
-                self.h // self.h_kv,
-                dim=-3,
-            )
-            v = torch.repeat_interleave(
-                v,
-                self.h // self.h_kv,
-                dim=-3,
-            )
-
-        B = query.size(0)
-        beams = 1
-        if B != k.size(0):
-            # Beam search case: batch is expanded.
-            assert not self.training
-            beams = B // k.size(0)
-            B = k.size(0)
-            q = q.view(B, beams, q.size(-3), q.size(-2), q.size(-1))
-            k = k.unsqueeze(1)
-            v = v.unsqueeze(1)
-            mask = mask.unsqueeze(1)
-
-        # SDPA-only path. The `mask` tensor is expected to be an additive
-        # bias (float/bfloat16/half), not a boolean padding mask.
-        assert mask.dtype != torch.bool
-        output = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=mask.unsqueeze(1),
-            scale=1 / math.sqrt(self.d_k),
-        )
-        output = output.transpose(-2, -3).contiguous()
-        output_shape = output.size()[:-2] + torch.Size([self.h * self.d_k])
-        output = output.view(output_shape)  # (batch, ..., time1, d_model)
-        output = self.linear_out(output)
-
-        if query.size(0) != B:
-            # Fold beams back into batch.
-            assert not self.training
-            output_shape = torch.Size([B * beams]) + output.size()[2:]
-            output = output.view(output_shape)
-
-        return output, new_cache
-
-
-class ShawRelPositionMultiHeadedAttention(MultiHeadedAttention):
-    """Multi-head attention with Shaw-style relative position embeddings.
-
-    Reference: https://arxiv.org/pdf/1803.02155.pdf
-    """
-
-    def __init__(
-        self,
-        n_head: int,
-        n_feat: int,
-        query_bias: bool = True,
-        key_bias: bool = True,
-        value_bias: bool = True,
-        n_kv_head: Optional[int] = None,
-        head_dim: Optional[int] = None,
-    ):
-        # n_kv_head / head_dim not used here; use standard multi-head config.
-        del n_kv_head, head_dim
-        super().__init__(
-            n_head,
-            n_feat,
-            query_bias,
-            key_bias,
-            value_bias,
-            None,
-            None,
-        )
-
-        # TODO: make these configurable if needed
-        self.max_right_rel_pos = 8
-        self.max_left_rel_pos = 64
-        self.rel_k_embed = torch.nn.Embedding(
-            self.max_left_rel_pos + self.max_right_rel_pos + 1,
-            self.d_k,
-        )
-
-    def _relative_indices(self, keys: torch.Tensor) -> torch.Tensor:
-        """Compute relative position indices."""
-
-        # (S, 1)
-        indices = torch.arange(keys.size(2), device=keys.device).unsqueeze(0)
-
-        # (S, S)
-        rel_indices = indices - indices.transpose(0, 1)
-
-        rel_indices = torch.clamp(
-            rel_indices,
-            -self.max_left_rel_pos,
-            self.max_right_rel_pos,
-        )
-
-        return rel_indices + self.max_left_rel_pos
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        mask: torch.Tensor,
-        pos_emb: torch.Tensor = torch.empty(0),
-        cache: T_CACHE = (
-            torch.zeros((0, 0, 0, 0)),
-            torch.zeros(0, 0, 0, 0),
-        ),
-    ) -> Tuple[torch.Tensor, T_CACHE]:
-        """Compute Shaw-style relative position attention."""
-
-        del pos_emb
-
-        q, k, v = self.forward_qkv(query, key, value)
-        k, v, new_cache = self._update_kv_and_cache(k, v, cache)
-
-        # rel_k: (t2, t2, d_k)
-        rel_k = self.rel_k_embed(self._relative_indices(k))
-        rel_k = rel_k[-q.size(2):]
-        # rel_att_weights: (batch, head, time1, time2)
-        rel_att_weights = torch.einsum("bhld,lrd->bhlr", q, rel_k)
-
-        # SDPA-only path: rel_att_weights is used as bias in the mask. The
-        # incoming `mask` must already be an additive bias tensor
-        # (float/bfloat16/half), not a boolean padding mask.
-        assert mask.dtype != torch.bool
-        mask = mask.unsqueeze(1)
-        mask = (rel_att_weights + mask) / math.sqrt(self.d_k)
-        output = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=mask,
-            scale=1 / math.sqrt(self.d_k),
-        )
-        output = (
-            output.transpose(1, 2)
-            .contiguous()
-            .view(query.size(0), -1, self.h * self.d_k)
-        )  # (batch, time1, d_model)
-        return self.linear_out(output), new_cache
-
-
-class RopeMultiHeadedAttention(MultiHeadedAttention):
-    """Multi-head attention with rotary position embeddings (RoPE)."""
-
-    def __init__(
-        self,
-        n_head: int,
-        n_feat: int,
-        query_bias: bool = True,
-        key_bias: bool = True,
-        value_bias: bool = True,
-        n_kv_head: Optional[int] = None,
-        head_dim: Optional[int] = None,
-        style: str = "google",
-    ):
-        super().__init__(
-            n_head,
-            n_feat,
-            query_bias,
-            key_bias,
-            value_bias,
-            n_kv_head=n_kv_head,
-            head_dim=head_dim,
-        )
-        self.style = style
-        self._apply_rotary_emb = get_apply_rotary_emb(style)
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        mask: torch.Tensor,
-        pos_emb: torch.Tensor = torch.empty(0),
-        cache: T_CACHE = (
-            torch.zeros((0, 0, 0, 0)),
-            torch.zeros(0, 0, 0, 0),
-        ),
-    ) -> Tuple[torch.Tensor, T_CACHE]:
-        """Compute RoPE-scaled dot-product attention.
-
-        Args:
-            query: Query tensor of shape ``(batch, time1, size)``.
-            key: Key tensor of shape ``(batch, time2, size)``.
-            value: Value tensor of shape ``(batch, time2, size)``.
-            mask: Attention mask, same semantics as in ``MultiHeadedAttention``.
-            pos_emb: Rotary embedding tensor (precomputed frequencies) of
-                shape matching the style.
-            cache: KV cache for streaming decoding.
-        """
-
-        # Explicitly construct Q/K/V with `head_first=False` so that RoPE
-        # can operate on (batch, time, heads, dim).
-        q = self._forward_linearx("query", query, head_first=False)
-        k = self._forward_linearx("key", key, head_first=False)
-        v = self._forward_linearx("value", value, head_first=False)
-
-        # Apply rotary embeddings via dedicated rotary_embedding module
-        q = self._apply_rotary_emb(q, pos_emb)
-        k = self._apply_rotary_emb(k, pos_emb)
-
-        k, v, new_cache = self._update_kv_and_cache(
-            k,
-            v,
-            cache,
-            head_first=False,
-        )
-
-        # Convert to (batch, heads, time, dim) for attention computation
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # SDPA-only path. The `mask` tensor is expected to be an additive
-        # bias (float/bfloat16/half), not a boolean padding mask.
-        assert mask.dtype != torch.bool
-        output = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=mask.unsqueeze(1),
-            scale=1 / math.sqrt(self.d_k),
-        )
-        output = (
-            output.transpose(1, 2)
-            .contiguous()
-            .view(query.size(0), -1, self.h * self.d_k)
-        )  # (batch, time1, d_model)
-        return self.linear_out(output), new_cache
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 __all__ = [
-    "MultiHeadedAttention",
-    "RelPositionMultiHeadedAttention",
-    "MultiHeadedCrossAttention",
-    "ShawRelPositionMultiHeadedAttention",
-    "RopeMultiHeadedAttention",
     "PagedKVCache",
+    "RelPositionMultiHeadedAttention",
+    "T_CACHE",
+    "build_paged_block_mask",
+    "warmup_flex_attention",
 ]

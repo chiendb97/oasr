@@ -194,6 +194,61 @@ def _time_offline(
     return median_ms, std_ms, rtf
 
 
+def _warmup_engine(
+    engine: Any,
+    waveforms: List[torch.Tensor],
+    *,
+    is_streaming: bool,
+) -> None:
+    """Warm up FlexAttention's ``torch.compile`` cache.
+
+    The first encoder forward through FlexAttention triggers a Triton
+    kernel compile (and a separate compile for the BlockMask
+    constructor). Both are wrapped with ``dynamic=True`` so a single
+    compile covers a wide range of subsequent shapes, but the first
+    invocation still pays the compile cost — billing it to the timed
+    region distorts measurements badly.
+
+    This helper runs the engine on a small, **representative** subset
+    of the workload — short and long waveforms, single and batched —
+    so the steady-state shapes have been compiled before timing starts.
+    The engine is reset between phases so internal state doesn't carry
+    over.
+    """
+    if not waveforms:
+        return
+
+    # Pick a short and a long sample so both small-T_kv and large-T_kv
+    # FlexAttention shapes get traced.
+    sorted_by_len = sorted(waveforms, key=lambda w: w.numel())
+    short = sorted_by_len[0]
+    long = sorted_by_len[-1]
+    samples = [short, long]
+
+    if is_streaming:
+        chunk_samples = engine._input_processor.streaming_audio_chunk_samples  # type: ignore[attr-defined]
+        # Single-stream phase: B=1 path.
+        rid = engine.add_streaming_request(sample_rate=16000)
+        chunks = _split_waveform_into_chunks(short, chunk_samples)
+        for j, c in enumerate(chunks):
+            engine.feed_chunk(rid, c, is_last=(j == len(chunks) - 1))
+        engine.run()
+
+        # Multi-stream phase: hits the batched paged path.
+        rids = [engine.add_streaming_request(sample_rate=16000) for _ in samples]
+        for rid_, wav in zip(rids, samples):
+            chs = _split_waveform_into_chunks(wav, chunk_samples)
+            for j, c in enumerate(chs):
+                engine.feed_chunk(rid_, c, is_last=(j == len(chs) - 1))
+        engine.run()
+    else:
+        # Offline path: run a tiny batch through transcribe(...).
+        engine.transcribe(samples)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def _split_waveform_into_chunks(
     wav: torch.Tensor, chunk_samples: int
 ) -> List[torch.Tensor]:
@@ -355,6 +410,7 @@ def _run_config(
                 f"N={n}, chunk={chunk_size}, max_bs={max_batch_size}, "
                 f"avg_dur={avg_dur:.1f}s"
             )
+            _warmup_engine(engine, waveforms, is_streaming=True)
             median_ms, std_ms, rtf = _time_streaming(
                 engine, waveforms, durations, num_iters)
         else:
@@ -368,6 +424,7 @@ def _run_config(
             )
             engine = OfflineEngine(cfg)
             shape_str = f"N={n}, batch={batch_size}, avg_dur={avg_dur:.1f}s"
+            _warmup_engine(engine, waveforms, is_streaming=False)
             median_ms, std_ms, rtf = _time_offline(
                 engine, waveforms, durations, batch_size, num_iters)
     except Exception as exc:
