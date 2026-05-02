@@ -1,6 +1,24 @@
 #pragma once
 
+#include <algorithm>
+
 namespace oasr {
+
+constexpr int WARP_SIZE = 32;
+constexpr int MAX_THREADS_PER_BLOCK = 1024;
+
+// Compute warp-aligned block size clamped to [WARP_SIZE, max_threads].
+inline int alignedBlockSize(int num_elements, int max_threads = MAX_THREADS_PER_BLOCK) {
+    int block_size = std::min(num_elements, max_threads);
+    return std::max(((block_size + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
+}
+
+// Check pointer alignment for vectorized access of VecSize elements.
+template <typename T, int VecSize>
+inline bool isAligned(const void* ptr) {
+    return reinterpret_cast<uintptr_t>(ptr) % (sizeof(T) * VecSize) == 0;
+}
+
 namespace gemm {
 
 //==============================================================================

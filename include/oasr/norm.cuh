@@ -11,86 +11,15 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
-#include <cstdint>
 #include <oasr/common/math.h>
 #include <oasr/common/types.h>
+#include <oasr/common/utils.h>
 #include <oasr/common/vec_dtypes.h>
+#include <oasr/reduction.cuh>
 
 namespace oasr {
 namespace norm {
-
-// =============================================================================
-// Reduction Utilities (inlined from allreduce.h)
-// =============================================================================
-
-constexpr int WARP_SIZE = 32;
-
-template <typename T>
-__device__ __forceinline__ T warpReduceSum(T val) {
-#pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        val += __shfl_xor_sync(0xffffffff, val, offset);
-    }
-    return val;
-}
-
-template <typename T>
-__device__ __forceinline__ T blockReduceSum(T val) {
-    __shared__ T shared[32];  // One slot per warp
-
-    int lane = threadIdx.x % WARP_SIZE;
-    int wid = threadIdx.x / WARP_SIZE;
-
-    val = warpReduceSum(val);
-
-    if (lane == 0) {
-        shared[wid] = val;
-    }
-    __syncthreads();
-
-    // Only first warp does the final reduction
-    val = (threadIdx.x < blockDim.x / WARP_SIZE) ? shared[lane] : T(0);
-    if (wid == 0) {
-        val = warpReduceSum(val);
-    }
-
-    return val;
-}
-
-// =============================================================================
-// Architecture Configuration & Helpers
-// =============================================================================
-
-constexpr int MAX_THREADS_PER_BLOCK = 1024;
-
-// Broadcast a scalar from thread 0 to all threads via shared memory.
-// Includes barriers before (flush prior shared-mem ops) and after (publish).
-__device__ __forceinline__ float broadcastFromThread0(float value, float* smem) {
-    __syncthreads();
-    if (threadIdx.x == 0)
-        *smem = value;
-    __syncthreads();
-    return *smem;
-}
-
-// Compute warp-aligned block size clamped to [WARP_SIZE, max_threads].
-inline int alignedBlockSize(int num_elements, int max_threads = MAX_THREADS_PER_BLOCK) {
-    int bs = std::min(num_elements, max_threads);
-    return std::max(((bs + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE, WARP_SIZE);
-}
-
-// Check pointer alignment for vectorized access of VecSize elements.
-template <typename T, int VecSize>
-inline bool isAligned(const void* ptr) {
-    return reinterpret_cast<uintptr_t>(ptr) % (sizeof(T) * VecSize) == 0;
-}
-
-// Type tag for dispatch helpers.
-template <typename T>
-struct TypeTag {
-    using type = T;
-};
+using namespace oasr::reduction;
 
 // =============================================================================
 // LayerNorm Kernel
@@ -119,7 +48,7 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
     }
 
     float mean =
-        broadcastFromThread0(blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
+        blockBroadcast(blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
 
     // Phase 2: Compute variance using vectorized loads
     float local_var = 0.0f;
@@ -133,10 +62,9 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
         }
     }
 
-    float inv_std =
-        rsqrtf(broadcastFromThread0(blockReduceSum(local_var) / static_cast<float>(hidden_size),
-                                    &smem[1]) +
-               eps);
+    float inv_std = rsqrtf(
+        blockBroadcast(blockReduceSum(local_var) / static_cast<float>(hidden_size), &smem[1]) +
+        eps);
 
     // Phase 3: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -190,10 +118,9 @@ __global__ void rmsNormKernel(const T* __restrict__ input, T* __restrict__ outpu
         local_sum_sq += oasr::vecSumSquares(v);
     }
 
-    float inv_rms =
-        rsqrtf(broadcastFromThread0(blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size),
-                                    &smem) +
-               eps);
+    float inv_rms = rsqrtf(
+        blockBroadcast(blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size), &smem) +
+        eps);
 
     // Phase 2: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -287,7 +214,7 @@ __global__ void groupNormKernel(const T* __restrict__ input, T* __restrict__ out
     int my_group = threadIdx.x / threads_per_group;
     int local_tid = threadIdx.x % threads_per_group;
 
-    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int lane = threadIdx.x & (oasr::WARP_SIZE - 1);
 
     // Shared memory: [group_mean | group_inv_std | warp_buf (inter-warp case)]
     extern __shared__ float smem[];
@@ -312,21 +239,21 @@ __global__ void groupNormKernel(const T* __restrict__ input, T* __restrict__ out
     }
 
     // ---- Phase 2: Tree reduction ----
-    int seg = (threads_per_group < WARP_SIZE) ? threads_per_group : WARP_SIZE;
+    int seg = (threads_per_group < oasr::WARP_SIZE) ? threads_per_group : oasr::WARP_SIZE;
     for (int off = seg >> 1; off > 0; off >>= 1) {
         psum += __shfl_xor_sync(0xffffffff, psum, off);
         psq += __shfl_xor_sync(0xffffffff, psq, off);
     }
 
-    if (threads_per_group <= WARP_SIZE) {
+    if (threads_per_group <= oasr::WARP_SIZE) {
         if (local_tid == 0) {
             float mean = psum * inv_channels_per_group;
             group_mean[my_group] = mean;
             group_inv_std[my_group] = rsqrtf(psq * inv_channels_per_group - mean * mean + eps);
         }
     } else {
-        int warps_per_group = threads_per_group / WARP_SIZE;
-        int warp_idx = local_tid / WARP_SIZE;
+        int warps_per_group = threads_per_group / oasr::WARP_SIZE;
+        int warp_idx = local_tid / oasr::WARP_SIZE;
         float* wbuf = smem + 2 * num_groups;
 
         if (lane == 0) {
@@ -407,7 +334,7 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
     }
 
     float mean =
-        broadcastFromThread0(blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
+        blockBroadcast(blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
 
     // Phase 2: Compute variance using vectorized loads
     float local_var = 0.0f;
@@ -423,10 +350,9 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
         }
     }
 
-    float inv_std =
-        rsqrtf(broadcastFromThread0(blockReduceSum(local_var) / static_cast<float>(hidden_size),
-                                    &smem[1]) +
-               eps);
+    float inv_std = rsqrtf(
+        blockBroadcast(blockReduceSum(local_var) / static_cast<float>(hidden_size), &smem[1]) +
+        eps);
 
     // Phase 3: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -504,7 +430,7 @@ __global__ void layerNormActKernel(const T* __restrict__ input, T* __restrict__ 
     }
 
     float mean =
-        broadcastFromThread0(blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
+        blockBroadcast(blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
 
     // Phase 2: Compute variance
     float local_var = 0.0f;
@@ -518,10 +444,9 @@ __global__ void layerNormActKernel(const T* __restrict__ input, T* __restrict__ 
         }
     }
 
-    float inv_std =
-        rsqrtf(broadcastFromThread0(blockReduceSum(local_var) / static_cast<float>(hidden_size),
-                                    &smem[1]) +
-               eps);
+    float inv_std = rsqrtf(
+        blockBroadcast(blockReduceSum(local_var) / static_cast<float>(hidden_size), &smem[1]) +
+        eps);
 
     // Phase 3: Normalize, scale, and apply activation
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -581,10 +506,9 @@ __global__ void rmsNormActKernel(const T* __restrict__ input, T* __restrict__ ou
         local_sum_sq += oasr::vecSumSquares(v);
     }
 
-    float inv_rms =
-        rsqrtf(broadcastFromThread0(blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size),
-                                    &smem) +
-               eps);
+    float inv_rms = rsqrtf(
+        blockBroadcast(blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size), &smem) +
+        eps);
 
     // Phase 2: Normalize, scale, and apply activation
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
@@ -779,7 +703,7 @@ cudaError_t GroupNorm(const T* input, const T* weight, const T* bias, T* output,
     int channels_per_group = static_cast<int>(channels / num_groups);
     int num_blocks = static_cast<int>(batch_size * seq_len);
     int block_size = alignedBlockSize(static_cast<int>(channels));
-    int num_warps = block_size / WARP_SIZE;
+    int num_warps = block_size / oasr::WARP_SIZE;
     size_t smem_bytes = sizeof(float) * (2 * num_groups + 2 * static_cast<unsigned int>(num_warps));
 
     bool use_vec = (static_cast<int>(channels_per_group) >= VecSize) &&
