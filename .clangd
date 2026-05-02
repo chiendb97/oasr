@@ -24,6 +24,7 @@ CompileFlags:
     - "-I../3rdparty/cutlass/include"
     - "-I../3rdparty/cutlass/tools/util/include"
     - "-I/usr/local/cuda/include"
+    - "-I/usr/local/cuda/include/cccl"
     - "-I/usr/local/cuda/targets/x86_64-linux/include"
     - "-I/usr/local/lib/python3.13/dist-packages/torch/include"
     - "-I/usr/local/lib/python3.12/dist-packages/torch/include"
