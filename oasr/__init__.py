@@ -29,6 +29,7 @@ from .conv import (
     depthwise_conv1d_silu, causal_conv1d, conv2d_activation,
 )
 from .gemm import gemm, bmm, group_gemm, gemm_activation
+from .softmax import softmax
 from .features import (
     fbank_batch,
     mfcc_batch,
@@ -67,6 +68,7 @@ from .layers import (
     BatchNorm1d,
     AddLayerNorm,
     GlobalCMVN,
+    Softmax as SoftmaxModule,
 )
 
 
@@ -169,6 +171,7 @@ __all__ = [
     "bmm",
     "group_gemm",
     "gemm_activation",
+    "softmax",
     # Feature extraction (batched)
     "fbank_batch",
     "mfcc_batch",
@@ -188,6 +191,7 @@ __all__ = [
     "BatchNorm1d",
     "AddLayerNorm",
     "GlobalCMVN",
+    "SoftmaxModule",
     # Autotuning
     "tune",
     "autotune",
