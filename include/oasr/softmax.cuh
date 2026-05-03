@@ -10,7 +10,6 @@
 #include <cuda_runtime.h>
 
 #include <cuda/std/limits>
-
 #include <oasr/common/math.h>
 #include <oasr/common/types.h>
 #include <oasr/common/utils.h>
@@ -62,19 +61,18 @@ __global__ void softmaxKernel(const T* __restrict__ input, T* __restrict__ outpu
             vals[j] = expf(static_cast<float>(v[j]) - row_max);
             local_sum += vals[j];
         }
-        oasr::vecCast<T>(vals).store(row_output + i * VecSize);
     }
     float inv_sum = 1.0f / blockBroadcast(blockReduceSum(local_sum), &smem[1]);
 
     // Phase 3: normalize; each thread reads back its own phase-2 output
     for (int i = threadIdx.x; i < vec_num_cols; i += blockDim.x) {
         VecT v;
-        v.load(row_output + i * VecSize);
+        v.load(row_input + i * VecSize);
 
         oasr::Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            vals[j] = static_cast<float>(v[j]) * inv_sum;
+            vals[j] = expf(static_cast<float>(v[j]) - row_max) * inv_sum;
         }
         oasr::vecCast<T>(vals).store(row_output + i * VecSize);
     }
@@ -89,18 +87,17 @@ cudaError_t Softmax(const T* input, T* output, unsigned int num_rows, unsigned i
                     cudaStream_t stream) {
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
-    bool use_vec = (num_cols >= static_cast<unsigned int>(VecSize)) &&
-                   (num_cols % VecSize == 0) && isAligned<T, VecSize>(input) &&
-                   isAligned<T, VecSize>(output);
+    bool use_vec = (num_cols >= static_cast<unsigned int>(VecSize)) && (num_cols % VecSize == 0) &&
+                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(num_cols) / VecSize);
-        softmaxKernel<T, VecSize><<<num_rows, block_size, 0, stream>>>(
-            input, output, static_cast<int>(num_cols));
+        softmaxKernel<T, VecSize>
+            <<<num_rows, block_size, 0, stream>>>(input, output, static_cast<int>(num_cols));
     } else {
         int block_size = alignedBlockSize(static_cast<int>(num_cols));
-        softmaxKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
-            input, output, static_cast<int>(num_cols));
+        softmaxKernel<T, 1>
+            <<<num_rows, block_size, 0, stream>>>(input, output, static_cast<int>(num_cols));
     }
     return cudaGetLastError();
 }
