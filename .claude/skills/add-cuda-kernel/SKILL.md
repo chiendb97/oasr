@@ -781,15 +781,19 @@ pytest tests/test_scale.py::TestScale::test_scale_correctness -v
 
 **All new kernels should have benchmarks.** This helps track performance regressions and allows users to compare against other implementations.
 
-Benchmarks live in `benchmarks/` and use the unified routines framework in `benchmarks/routines/`. Each benchmark script delegates to a `run_standalone()` function.
+Benchmarks follow the **routines + thin-wrapper** pattern: a single routine module in `benchmarks/routines/<family>.py` exposes the kernel(s) to both the unified CLI (`oasr_benchmark.py`) and to per-kernel `bench_*.py` scripts that act as thin wrappers around `run_standalone()`. Reference: `benchmarks/routines/activation.py` + `benchmarks/bench_glu.py`.
 
-**Simple standalone benchmark** -- create `benchmarks/bench_scale.py`:
+### Step 10a: Create the routine module
+
+Create `benchmarks/routines/scale.py`:
 
 ```python
-#!/usr/bin/env python3
-"""Performance benchmarks for Scale kernel."""
+"""Scale family benchmark routines."""
+
+from __future__ import annotations
 
 import argparse
+from typing import Any
 
 import torch
 
@@ -799,76 +803,234 @@ from benchmarks.routines.bench_utils import (
     OutputWriter,
     bench_fn,
     check_close,
+    compute_bandwidth_tb_s,
+    dtype_size,
+    parse_dtype,
+    run_main,
 )
 
+SUBROUTINES = ["scale"]
 
-def run_standalone():
-    parser = argparse.ArgumentParser(description="OASR Scale Benchmark")
-    parser.add_argument("--target", choices=["oasr", "pytorch", "both"], default="oasr")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iters", type=int, default=30)
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# Default configs
+# ---------------------------------------------------------------------------
 
-    writer = OutputWriter()
-    sizes = [1024, 4096, 16384, 65536, 262144]
-    dtypes = [torch.float16, torch.bfloat16]
+DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
+    "scale": [
+        {"size": 1024},
+        {"size": 4096},
+        {"size": 16384},
+        {"size": 65536},
+        {"size": 262144},
+    ],
+}
 
-    writer.write_header("Scale Kernel Benchmark")
+PROFILE_CONFIGS: dict[str, tuple] = {
+    "scale": (65536,),
+}
 
-    for size in sizes:
-        for dtype in dtypes:
-            x = torch.randn(size, dtype=dtype, device="cuda")
-            factor = 2.0
 
-            if args.target in ("oasr", "both"):
-                median_ms, std_ms = bench_fn(
-                    lambda: oasr.scale(x, factor),
-                    dry_run_iters=args.warmup,
-                    num_iters=args.iters,
-                )
-                writer.write_result(BenchResult(
-                    routine="scale", subroutine="scale",
-                    backend="oasr", shape=f"{size}",
-                    dtype=str(dtype), median_ms=median_ms, std_ms=std_ms,
-                ))
+def get_default_configs() -> dict[str, list[dict[str, Any]]]:
+    return DEFAULT_CONFIGS
 
-            if args.target in ("pytorch", "both"):
-                median_ms, std_ms = bench_fn(
-                    lambda: x * factor,
-                    dry_run_iters=args.warmup,
-                    num_iters=args.iters,
-                )
-                writer.write_result(BenchResult(
-                    routine="scale", subroutine="scale",
-                    backend="pytorch", shape=f"{size}",
-                    dtype=str(dtype), median_ms=median_ms, std_ms=std_ms,
-                ))
 
-    writer.finalize()
+# ---------------------------------------------------------------------------
+# Setup functions  -- return (oasr_fn, pytorch_fn) closures
+# ---------------------------------------------------------------------------
+
+
+def setup_scale(size, dtype=torch.float16):
+    x = torch.randn(size, device="cuda", dtype=dtype)
+    factor = 2.0
+
+    def oasr_fn():
+        return oasr.scale(x, factor)
+
+    def pytorch_fn():
+        return x * factor
+
+    return oasr_fn, pytorch_fn
+
+
+# ---------------------------------------------------------------------------
+# CLI args (used by oasr_benchmark.py)
+# ---------------------------------------------------------------------------
+
+
+def parse_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--size", type=int, default=None, help="Number of elements")
+
+
+# ---------------------------------------------------------------------------
+# run_test  -- entry point invoked by oasr_benchmark.py
+# ---------------------------------------------------------------------------
+
+
+def _scale_bytes(size, dtype):
+    """Bytes accessed: read input + write output."""
+    return 2 * size * dtype_size(dtype)
+
+
+def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
+    subroutine = getattr(args, "subroutine", "scale")
+    dtype_str = getattr(args, "dtype", "float16")
+    dtype = parse_dtype(dtype_str)
+    do_check = getattr(args, "refcheck", False)
+    allow_mismatch = getattr(args, "allow_output_mismatch", False)
+    dry_run_iters = getattr(args, "dry_run_iters", 5)
+    num_iters = getattr(args, "num_iters", 30)
+    use_cuda_events = getattr(args, "use_cuda_events", False)
+
+    configs = _resolve_configs(args, subroutine)
+
+    for cfg in configs:
+        oasr_fn, pytorch_fn = setup_scale(cfg["size"], dtype)
+        fn_map = get_fn_map(subroutine, oasr_fn, pytorch_fn)
+        backends = getattr(args, "backends", None) or list(fn_map.keys())
+
+        bytes_accessed = _scale_bytes(cfg["size"], dtype)
+        shape_str = f"[{cfg['size']}]"
+
+        if do_check and "torch" in backends and any(b in fn_map and b != "torch" for b in backends):
+            passed, max_diff = check_close(oasr_fn(), pytorch_fn())
+            if not passed:
+                print(f"  [ERROR] Output mismatch for {shape_str} (max_diff={max_diff:.6f})")
+                if not allow_mismatch:
+                    continue
+
+        for backend in backends:
+            if backend not in fn_map:
+                print(f"  [WARNING] Unknown backend '{backend}', skipping")
+                continue
+            median_ms, std_ms = bench_fn(
+                fn_map[backend],
+                dry_run_iters=dry_run_iters,
+                num_iters=num_iters,
+                use_cuda_events=use_cuda_events,
+            )
+            bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
+            output.write_result(BenchResult(
+                routine="scale",
+                subroutine=subroutine,
+                backend=backend,
+                shape=shape_str,
+                dtype=dtype_str,
+                median_ms=median_ms,
+                std_ms=std_ms,
+                bandwidth_tb_s=bw,
+            ))
+
+
+def _resolve_configs(args, subroutine):
+    size = getattr(args, "size", None)
+    if size is not None:
+        return [{"size": size}]
+    return DEFAULT_CONFIGS.get(subroutine, DEFAULT_CONFIGS["scale"])
+
+
+def get_fn_map(subroutine, cuda_fn, torch_fn):
+    """Return {backend_name: fn} -- backend names match what users pass to --backends."""
+    return {"cuda": cuda_fn, "torch": torch_fn}
+
+
+# ---------------------------------------------------------------------------
+# Standalone entry  -- used by bench_scale.py thin wrapper
+# ---------------------------------------------------------------------------
+
+
+def run_standalone(variant: str = "scale") -> None:
+    subs = [variant]
+    pcfg = {k: PROFILE_CONFIGS[k] for k in subs if k in PROFILE_CONFIGS}
+    setup_funcs = {sub: _make_profile_setup(sub) for sub in subs if sub in PROFILE_CONFIGS}
+
+    def benchmark():
+        output = OutputWriter()
+        for sub in subs:
+            output.write_header(f"{sub.upper()} Kernel Benchmark")
+            for cfg in DEFAULT_CONFIGS.get(sub, []):
+                oasr_fn, pytorch_fn = setup_scale(cfg["size"], torch.float16)
+                bytes_accessed = _scale_bytes(cfg["size"], torch.float16)
+                shape_str = f"[{cfg['size']}]"
+                for backend, fn in get_fn_map(sub, oasr_fn, pytorch_fn).items():
+                    median_ms, std_ms = bench_fn(fn)
+                    bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
+                    output.write_result(BenchResult(
+                        routine="scale", subroutine=sub, backend=backend,
+                        shape=shape_str, dtype="float16",
+                        median_ms=median_ms, std_ms=std_ms,
+                        bandwidth_tb_s=bw,
+                    ))
+        output.finalize()
+
+    run_main(f"{variant.upper()} Kernel", pcfg, setup_funcs, benchmark)
+
+
+def _make_profile_setup(subroutine):
+    cfg_tuple = PROFILE_CONFIGS[subroutine]
+
+    def _setup():
+        return setup_scale(*cfg_tuple)
+
+    return _setup
+```
+
+**Key points:**
+
+- `SUBROUTINES`, `parse_args`, `run_test`, `get_default_configs`, `run_standalone` are the contract the routine registry expects (see `benchmarks/routines/__init__.py`).
+- `setup_*()` functions return **two closures** `(oasr_fn, pytorch_fn)` that take no arguments -- this is what `bench_fn` consumes and what the profile path replays.
+- Backend names (`"cuda"` / `"torch"`) are family-conventional. Norm/Conv1D/Activation use `cuda`/`torch`; GEMM/Conv2D use `cutlass`/`torch`. Match the family your kernel belongs to.
+- Use `compute_bandwidth_tb_s` for memory-bound kernels and `compute_gemm_tflops` / `compute_bmm_tflops` for compute-bound ones.
+
+### Step 10b: Register the routine
+
+Edit `benchmarks/routines/__init__.py` and add the routine to `ROUTINE_REGISTRY`:
+
+```python
+ROUTINE_REGISTRY: dict[str, str] = {
+    "gemm": "benchmarks.routines.gemm",
+    "norm": "benchmarks.routines.norm",
+    # ...
+    "scale": "benchmarks.routines.scale",  # NEW
+}
+```
+
+This makes `python benchmarks/oasr_benchmark.py --routine scale --subroutine scale ...` work.
+
+### Step 10c: Create the thin wrapper
+
+Create `benchmarks/bench_scale.py`:
+
+```python
+#!/usr/bin/env python3
+"""OASR Scale Benchmark -- CUDA vs PyTorch."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from benchmarks.routines.scale import run_standalone
 
 
 if __name__ == "__main__":
-    run_standalone()
+    run_standalone("scale")
 ```
 
-**Alternative: Using `oasr.testing.bench_gpu_time`** for quick benchmarks:
+For families with multiple subroutines (e.g. activation), create one thin wrapper per subroutine (`bench_glu.py`, `bench_swish.py`) -- each calls `run_standalone("<subroutine>")`. See `benchmarks/bench_glu.py` and `benchmarks/bench_swish.py`.
 
-```python
-from oasr.testing import bench_gpu_time
+### Step 10d: Run it
 
-x = torch.randn(4096, dtype=torch.float16, device="cuda")
-median_s, std_s = bench_gpu_time(
-    oasr.scale, args=(x, 2.0),
-    enable_cupti=True, dry_run_iters=10, repeat_iters=100,
-)
-print(f"Median: {median_s*1e6:.2f} us, Std: {std_s*1e6:.2f} us")
+```bash
+# Standalone (thin wrapper)
+python benchmarks/bench_scale.py
+
+# Unified CLI
+python benchmarks/oasr_benchmark.py --routine scale --subroutine scale \
+    --backends cuda torch --size 4096 --dtype float16 --refcheck -vv
+
+# Profiling mode (NVTX markers for Nsight Compute)
+ncu --set full -o scale_profile python benchmarks/bench_scale.py --profile --target oasr
 ```
-
-**For more complex kernels**, consider:
-
-- Adding comparisons against reference implementations (e.g., PyTorch native, cuBLAS, cuDNN)
-- Using the unified benchmarking framework in `benchmarks/oasr_benchmark.py` if applicable
-- Testing across different problem sizes and configurations
 
 **Benchmark utilities** (from `benchmarks/routines/bench_utils.py`):
 
@@ -877,8 +1039,11 @@ print(f"Median: {median_s*1e6:.2f} us, Std: {std_s*1e6:.2f} us")
 | `bench_fn(fn, ...)` | Time a function, returns `(median_ms, std_ms)` |
 | `profile_kernel(name, fn, ...)` | Run with NVTX markers for Nsight Compute |
 | `check_close(actual, expected, ...)` | Compare tensors, returns `(passed, max_diff)` |
+| `compute_bandwidth_tb_s(bytes, ms)` | Memory bandwidth for memory-bound kernels |
+| `compute_gemm_tflops(M, N, K, ms)` | TFLOPS for compute-bound GEMM-like kernels |
 | `BenchResult(...)` | Structured result dataclass |
-| `OutputWriter()` | Manages terminal + CSV output |
+| `OutputWriter()` | Manages terminal `[PERF]` lines + CSV output |
+| `run_main(title, pcfg, setup, fn)` | Standard standalone main with `--profile` support |
 
 -> **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/SKILL.md`](../benchmark-kernel/SKILL.md)**
 
@@ -899,13 +1064,15 @@ When adding a new kernel, look at these existing families as references:
 ## Summary of Files Created/Modified
 
 ```
-include/oasr/scale.cuh                # NEW: CUDA kernel definition
-csrc/scale.cu                         # NEW: TVM-FFI launcher
-csrc/scale_jit_binding.cu             # NEW: TVM-FFI binding
-oasr/jit/scale.py              # NEW: JIT generator
-oasr/scale.py                  # NEW: Python API
-oasr/__init__.py               # MODIFIED: Export API
-oasr/aot.py                    # MODIFIED: Register AOT
-test_scale.py                   # NEW: Unit tests
-benchmarks/bench_scale.py             # NEW: Benchmark script
+include/oasr/scale.cuh                  # NEW: CUDA kernel definition
+csrc/scale.cu                           # NEW: TVM-FFI launcher
+csrc/scale_jit_binding.cu               # NEW: TVM-FFI binding
+oasr/jit/scale.py                       # NEW: JIT generator
+oasr/scale.py                           # NEW: Python API
+oasr/__init__.py                        # MODIFIED: Export API
+oasr/aot.py                             # MODIFIED: Register AOT
+tests/test_scale.py                     # NEW: Unit tests
+benchmarks/routines/scale.py            # NEW: Benchmark routine module
+benchmarks/routines/__init__.py         # MODIFIED: Register routine
+benchmarks/bench_scale.py               # NEW: Standalone benchmark wrapper
 ```
