@@ -27,6 +27,7 @@ def gen_all_modules() -> List:
     from oasr.jit.gemm import gen_gemm_module, gen_bmm_module, gen_group_gemm_module
     from oasr.jit.ctc_decoder import gen_ctc_decoder_module
     from oasr.jit.softmax import gen_softmax_module
+    from oasr.jit.topk import gen_topk_module
 
     return [
         gen_activation_module(),
@@ -39,6 +40,7 @@ def gen_all_modules() -> List:
         gen_group_gemm_module(),
         gen_ctc_decoder_module(),
         gen_softmax_module(),
+        gen_topk_module(),
     ]
 
 

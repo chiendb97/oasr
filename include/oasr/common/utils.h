@@ -19,6 +19,9 @@ inline bool isAligned(const void* ptr) {
     return reinterpret_cast<uintptr_t>(ptr) % (sizeof(T) * VecSize) == 0;
 }
 
+}  // namespace oasr
+
+namespace oasr {
 namespace gemm {
 
 //==============================================================================

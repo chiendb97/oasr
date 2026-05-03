@@ -30,6 +30,7 @@ from .conv import (
 )
 from .gemm import gemm, bmm, group_gemm, gemm_activation
 from .softmax import softmax
+from .topk import topk
 from .features import (
     fbank_batch,
     mfcc_batch,
@@ -69,6 +70,7 @@ from .layers import (
     AddLayerNorm,
     GlobalCMVN,
     Softmax as SoftmaxModule,
+    TopK as TopKModule,
 )
 
 
@@ -172,6 +174,7 @@ __all__ = [
     "group_gemm",
     "gemm_activation",
     "softmax",
+    "topk",
     # Feature extraction (batched)
     "fbank_batch",
     "mfcc_batch",
@@ -192,6 +195,7 @@ __all__ = [
     "AddLayerNorm",
     "GlobalCMVN",
     "SoftmaxModule",
+    "TopKModule",
     # Autotuning
     "tune",
     "autotune",

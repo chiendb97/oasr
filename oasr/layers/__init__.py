@@ -4,6 +4,7 @@ from .conv import DepthwiseConv1d, PointwiseConv1d, Conv2d, Conv2dActivation
 from .linear import Linear
 from .norm import LayerNorm, RMSNorm, GroupNorm, BatchNorm1d, AddLayerNorm, GlobalCMVN
 from .softmax import Softmax
+from .topk import TopK
 
 __all__ = [
     # Convolution
@@ -22,4 +23,6 @@ __all__ = [
     "GlobalCMVN",
     # Softmax
     "Softmax",
+    # TopK
+    "TopK",
 ]

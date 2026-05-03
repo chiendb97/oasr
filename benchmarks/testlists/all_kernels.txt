@@ -31,5 +31,8 @@
 # Softmax family
 --routine softmax --subroutine softmax --batch 64 --seq 250 --channels 512
 
+# TopK family
+--routine topk --subroutine topk --batch 64 --seq 250 --channels 4096 --k 5
+
 # Composite
 --routine composite --subroutine conv_block --batch 64 --seq 250 --d-model 512 --kernel-size 31
