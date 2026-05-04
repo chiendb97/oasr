@@ -28,6 +28,8 @@ def gen_all_modules() -> List:
     from oasr.jit.ctc_decoder import gen_ctc_decoder_module
     from oasr.jit.softmax import gen_softmax_module
     from oasr.jit.topk import gen_topk_module
+    from oasr.jit.fft import gen_fft_module
+    from oasr.jit.features import gen_features_module
 
     return [
         gen_activation_module(),
@@ -41,6 +43,8 @@ def gen_all_modules() -> List:
         gen_ctc_decoder_module(),
         gen_softmax_module(),
         gen_topk_module(),
+        gen_fft_module(),
+        gen_features_module(),
     ]
 
 

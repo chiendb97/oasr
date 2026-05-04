@@ -1,6 +1,7 @@
 """High-level Python layer wrappers (Conv, Linear, Norm, ...)."""
 
 from .conv import DepthwiseConv1d, PointwiseConv1d, Conv2d, Conv2dActivation
+from .feature import Fbank, Mfcc
 from .linear import Linear
 from .norm import LayerNorm, RMSNorm, GroupNorm, BatchNorm1d, AddLayerNorm, GlobalCMVN
 from .softmax import Softmax
@@ -12,6 +13,9 @@ __all__ = [
     "PointwiseConv1d",
     "Conv2d",
     "Conv2dActivation",
+    # Feature extraction
+    "Fbank",
+    "Mfcc",
     # Linear
     "Linear",
     # Normalization
