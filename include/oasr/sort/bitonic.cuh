@@ -20,6 +20,8 @@
 
 #include <cuda_runtime.h>
 
+#include <oasr/common/math.h>
+
 namespace oasr {
 namespace sort {
 
@@ -34,21 +36,28 @@ template <bool Ascending>
 __device__ __forceinline__ void compare_and_swap(float& a, float& b) {
     float lo = fminf(a, b);
     float hi = fmaxf(a, b);
-    a = Ascending ? lo : hi;
-    b = Ascending ? hi : lo;
+    if constexpr (Ascending) {
+        a = lo;
+        b = hi;
+    } else {
+        a = hi;
+        b = lo;
+    }
 }
 
 template <bool Ascending, typename Aux>
 __device__ __forceinline__ void compare_and_swap(float& a, float& b, Aux& xa, Aux& xb) {
-    bool a_first = Ascending ? (a <= b) : (a >= b);
-    float ka = a_first ? a : b;
-    float kb = a_first ? b : a;
-    Aux va = a_first ? xa : xb;
-    Aux vb = a_first ? xb : xa;
-    a = ka;
-    b = kb;
-    xa = va;
-    xb = vb;
+    if constexpr (Ascending) {
+        if (a > b) {
+            swap(a, b);
+            swap(xa, xb);
+        }
+    } else {
+        if (a < b) {
+            swap(a, b);
+            swap(xa, xb);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
