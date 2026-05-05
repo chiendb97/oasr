@@ -20,7 +20,7 @@
 
 #include <cuda_runtime.h>
 
-#include <oasr/reduction.cuh>
+#include <oasr/reduction.cuh>  // brings in oasr/common/utils.h (WARP_SIZE)
 
 namespace oasr {
 namespace features {
@@ -62,33 +62,51 @@ __global__ inline void FbankPreprocessKernel(const float* __restrict__ frames,
         smem[i] = v;
         local_sum += v;
     }
-    __syncthreads();
 
-    float mean = 0.0f;
+    __shared__ float s_mean;
     if (remove_dc_offset) {
+        __syncthreads();
         const float total = oasr::reduction::blockReduceSum<float>(local_sum);
-        __shared__ float s_mean;
         if (tid == 0) {
             s_mean = total / static_cast<float>(frame_length);
         }
-        __syncthreads();
-        mean = s_mean;
+    } else if (tid == 0) {
+        s_mean = 0.0f;
+    }
+    __syncthreads();
+    const float mean = s_mean;
+
+    // Phase 2: emit pre-emphasized + windowed samples.
+    for (int i = tid; i < frame_length; i += bs) {
+        const float xi = smem[i] - mean;
+        float yi;
+        if (apply_preemph) {
+            const float xim1 = (i > 0) ? (smem[i - 1] - mean) : xi;
+            yi = xi - preemph_coef * xim1;
+        } else {
+            yi = xi;
+        }
+        out_ptr[i] = yi * window[i];
     }
 
-    // Phase 2: emit pre-emphasized + windowed samples; zero-pad to n_fft.
-    for (int i = tid; i < n_fft; i += bs) {
-        if (i < frame_length) {
-            const float xi = smem[i] - mean;
-            float yi;
-            if (apply_preemph) {
-                const float xim1 = (i > 0) ? (smem[i - 1] - mean) : xi;
-                yi = xi - preemph_coef * xim1;
-            } else {
-                yi = xi;
+    // Phase 3: zero-pad the tail [frame_length, n_fft).
+    // Use float4 stores when the start offset and remaining length are aligned.
+    const int pad_start = frame_length;
+    const int pad_end = n_fft;
+    const int pad_len = pad_end - pad_start;
+    if (pad_len > 0) {
+        const bool aligned = ((pad_start & 3) == 0) && ((pad_len & 3) == 0);
+        if (aligned) {
+            float4* out4 = reinterpret_cast<float4*>(out_ptr + pad_start);
+            const float4 zero4 = make_float4(0.f, 0.f, 0.f, 0.f);
+            const int n4 = pad_len >> 2;
+            for (int j = tid; j < n4; j += bs) {
+                out4[j] = zero4;
             }
-            out_ptr[i] = yi * window[i];
         } else {
-            out_ptr[i] = 0.0f;
+            for (int i = pad_start + tid; i < pad_end; i += bs) {
+                out_ptr[i] = 0.0f;
+            }
         }
     }
 }
@@ -114,7 +132,9 @@ inline cudaError_t FbankPreprocess(const float* frames, const float* window, flo
 //
 // Layout:
 //   gridDim.x  = total_frames
-//   blockDim.x = chosen at launch (>= 64); each thread strides over mel bins.
+//   blockDim.x = 128 (4 warps); each warp computes one mel bin per pass via a
+//                warp-strided dot product, giving fully-coalesced reads of
+//                `mel_mat`.
 //   shared     = F floats (cached power spectrum).
 __global__ inline void MelLogKernel(const float* __restrict__ power,
                                     const float* __restrict__ mel_mat,
@@ -125,6 +145,9 @@ __global__ inline void MelLogKernel(const float* __restrict__ power,
     const int frame_idx = blockIdx.x;
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int wid = tid >> 5;
+    const int n_warps = bs >> 5;
 
     const float* in_ptr = power + frame_idx * num_freq;
     for (int i = tid; i < num_freq; i += bs) {
@@ -133,23 +156,26 @@ __global__ inline void MelLogKernel(const float* __restrict__ power,
     __syncthreads();
 
     float* out_ptr = output + frame_idx * num_mel;
-    for (int b = tid; b < num_mel; b += bs) {
+    for (int b = wid; b < num_mel; b += n_warps) {
         const float* fb = mel_mat + b * num_freq;
         float acc = 0.0f;
-        for (int i = 0; i < num_freq; ++i) {
+        for (int i = lane; i < num_freq; i += WARP_SIZE) {
             acc += fb[i] * spec[i];
         }
-        if (acc < log_floor) {
-            acc = log_floor;
+        acc = oasr::reduction::warpReduceSum(acc);
+        if (lane == 0) {
+            if (acc < log_floor) {
+                acc = log_floor;
+            }
+            out_ptr[b] = logf(acc);
         }
-        out_ptr[b] = logf(acc);
     }
 }
 
 inline cudaError_t MelLog(const float* power, const float* mel_mat, float* output,
                           int total_frames, int num_freq, int num_mel, float log_floor,
                           cudaStream_t stream) {
-    const int threads = 128;
+    const int threads = 128;  // 4 warps
     const size_t smem_bytes = static_cast<size_t>(num_freq) * sizeof(float);
     MelLogKernel<<<total_frames, threads, smem_bytes, stream>>>(power, mel_mat, output,
                                                                 num_freq, num_mel, log_floor);
@@ -169,7 +195,8 @@ inline cudaError_t MelLog(const float* power, const float* mel_mat, float* outpu
 //
 // Layout:
 //   gridDim.x  = total_frames
-//   blockDim.x = 128 (each thread strides over output ceps).
+//   blockDim.x = 128 (4 warps); each warp emits one cepstral coefficient via a
+//                warp-strided dot product (coalesced reads of `dct_mat`).
 //   shared     = num_mel floats.
 __global__ inline void DctLifterKernel(const float* __restrict__ log_mel,
                                        const float* __restrict__ dct_mat,
@@ -182,6 +209,9 @@ __global__ inline void DctLifterKernel(const float* __restrict__ log_mel,
     const int frame_idx = blockIdx.x;
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int wid = tid >> 5;
+    const int n_warps = bs >> 5;
 
     const float* in_ptr = log_mel + frame_idx * num_mel;
     for (int i = tid; i < num_mel; i += bs) {
@@ -190,19 +220,22 @@ __global__ inline void DctLifterKernel(const float* __restrict__ log_mel,
     __syncthreads();
 
     float* out_ptr = output + frame_idx * num_ceps;
-    for (int k = tid; k < num_ceps; k += bs) {
+    for (int k = wid; k < num_ceps; k += n_warps) {
         const float* row = dct_mat + k * num_mel;
         float acc = 0.0f;
-        for (int i = 0; i < num_mel; ++i) {
+        for (int i = lane; i < num_mel; i += WARP_SIZE) {
             acc += row[i] * smel[i];
         }
-        if (lifter_weights != nullptr) {
-            acc *= lifter_weights[k];
+        acc = oasr::reduction::warpReduceSum(acc);
+        if (lane == 0) {
+            if (lifter_weights != nullptr) {
+                acc *= lifter_weights[k];
+            }
+            if (replace_c0_with_energy && k == 0 && energy != nullptr) {
+                acc = energy[frame_idx];
+            }
+            out_ptr[k] = acc;
         }
-        if (replace_c0_with_energy && k == 0 && energy != nullptr) {
-            acc = energy[frame_idx];
-        }
-        out_ptr[k] = acc;
     }
 }
 
@@ -210,7 +243,7 @@ inline cudaError_t DctLifter(const float* log_mel, const float* dct_mat,
                              const float* lifter_weights, const float* energy, float* output,
                              int total_frames, int num_mel, int num_ceps,
                              bool replace_c0_with_energy, cudaStream_t stream) {
-    const int threads = 128;
+    const int threads = 128;  // 4 warps
     const size_t smem_bytes = static_cast<size_t>(num_mel) * sizeof(float);
     DctLifterKernel<<<total_frames, threads, smem_bytes, stream>>>(
         log_mel, dct_mat, lifter_weights, energy, output, num_mel, num_ceps,
