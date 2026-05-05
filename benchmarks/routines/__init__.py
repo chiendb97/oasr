@@ -23,6 +23,8 @@ ROUTINE_REGISTRY: dict[str, str] = {
     "activation": "benchmarks.routines.activation",
     "softmax": "benchmarks.routines.softmax",
     "topk": "benchmarks.routines.topk",
+    "fft": "benchmarks.routines.fft",
+    "feature": "benchmarks.routines.feature",
     "composite": "benchmarks.routines.composite",
     "ctc_decoder": "benchmarks.routines.ctc_decoder",
     "engine": "benchmarks.routines.engine",

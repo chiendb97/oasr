@@ -6,6 +6,13 @@
 
 namespace oasr {
 
+template <typename T>
+__device__ __forceinline__ void swap(T& a, T& b) {
+    T tmp = a;
+    a = b;
+    b = tmp;
+}
+
 // =============================================================================
 // Scalar Activation Functions
 // =============================================================================

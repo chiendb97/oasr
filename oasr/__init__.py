@@ -31,6 +31,7 @@ from .conv import (
 from .gemm import gemm, bmm, group_gemm, gemm_activation
 from .softmax import softmax
 from .topk import topk
+from .fft import rfft, rfft_power
 from .features import (
     fbank_batch,
     mfcc_batch,
@@ -38,6 +39,7 @@ from .features import (
     FeatureConfig,
     BatchedStreamingFeatureExtractor,
 )
+from .feature import dct_lifter, fbank_preprocess, mel_log
 from .ctc_decode import (
     ctc_beam_search_decode,
     GpuStreamingDecoder,
@@ -62,6 +64,8 @@ from .layers import (
     PointwiseConv1d,
     Conv2d as Conv2dModule,
     Conv2dActivation,
+    Fbank,
+    Mfcc,
     Linear,
     LayerNorm,
     RMSNorm,
@@ -175,18 +179,26 @@ __all__ = [
     "gemm_activation",
     "softmax",
     "topk",
+    "rfft",
+    "rfft_power",
     # Feature extraction (batched)
     "fbank_batch",
     "mfcc_batch",
     "extract_features_batch",
     "FeatureConfig",
     "BatchedStreamingFeatureExtractor",
+    # Low-level CUDA feature ops
+    "fbank_preprocess",
+    "mel_log",
+    "dct_lifter",
     # nn.Module wrappers
     "layers",
     "DepthwiseConv1d",
     "PointwiseConv1d",
     "Conv2dModule",
     "Conv2dActivation",
+    "Fbank",
+    "Mfcc",
     "Linear",
     "LayerNorm",
     "RMSNorm",

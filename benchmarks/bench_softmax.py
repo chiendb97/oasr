@@ -20,6 +20,7 @@ CONFIGS = [
     {"batch": 64, "seq": 250,  "channels": 1024},
     {"batch": 64, "seq": 1000, "channels": 512},
     {"batch": 64, "seq": 1000, "channels": 1024},
+    {"batch": 1, "seq": 1, "channels": 131072},
 ]
 
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
