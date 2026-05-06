@@ -19,22 +19,30 @@ SUBROUTINES = {
         {"batch": 64, "seq": 500, "hidden": 256},
         {"batch": 64, "seq": 500, "hidden": 512},
         {"batch": 32, "seq": 500, "hidden": 512},
+        {"batch": 1, "seq": 16384, "hidden": 8192},
     ],
     "add_layer_norm": [
         {"batch": 32, "seq": 250, "hidden": 256},
         {"batch": 64, "seq": 250, "hidden": 256},
         {"batch": 64, "seq": 250, "hidden": 512},
+        {"batch": 64, "seq": 500, "hidden": 256},
         {"batch": 64, "seq": 500, "hidden": 512},
+        {"batch": 32, "seq": 500, "hidden": 512},
+        {"batch": 1, "seq": 16384, "hidden": 8192},
     ],
     "layer_norm_activation": [
+        {"batch": 32, "seq": 250, "hidden": 256},
         {"batch": 64, "seq": 250, "hidden": 256},
         {"batch": 64, "seq": 250, "hidden": 512},
+        {"batch": 64, "seq": 500, "hidden": 256},
         {"batch": 64, "seq": 500, "hidden": 512},
+        {"batch": 32, "seq": 500, "hidden": 512},
+        {"batch": 1, "seq": 16384, "hidden": 8192},
     ],
 }
 
-DTYPES = [torch.float16]
-DTYPE_NAMES = {torch.float16: "float16"}
+DTYPES = [torch.float16, torch.bfloat16]
+DTYPE_NAMES = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
 
 _COL_SHAPE  = 20
 _COL_TIME   = 12
