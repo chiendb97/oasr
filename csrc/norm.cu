@@ -1,4 +1,4 @@
-r// Copyright 2024 OASR Authors
+// Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 //
 // TVM-FFI launcher layer for normalization kernels.
