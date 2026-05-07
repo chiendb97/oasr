@@ -155,6 +155,8 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
 
 - **`__init__.py`** — Exposes all functional API functions (e.g., `oasr.gemm`, `oasr.layer_norm`) and nn.Module wrappers. Lazy-loads `_C` extension for decoder access.
 - **`activation.py`**, **`norm.py`**, **`conv.py`**, **`gemm.py`** — Functional API: `@oasr_api` decorated, JIT-compile kernels on first call via `@functools.cache`, allocate output tensors, call into compiled modules.
+- **`attention.py`** — `fmha(q, k, v, *, softmax_scale, attn_bias, cache_seqlens, block_table, out)` fused multi-head attention. Three cache modes share one signature: offline (no `cache_seqlens`), dense streaming (`cache_seqlens` only), paged streaming (`block_table` + `cache_seqlens` — currently raises; wrapper falls back to SDPA). Dispatches via `oasr.jit.attention.select_backend()` to either `_sdpa_reference` (PyTorch SDPA fallback, fp32-friendly) or `_call_cute_dsl` (CuteDSL kernel, fp16/bf16 only).
+- **`kernels/`** — Low-level kernel implementations that **do not** use the TVM-FFI / Ninja JIT pipeline. Currently houses `kernels/cute/attention/` (CuteDSL FMHA): `base.py` (arch-agnostic base + `pick_arch_cls`) and `fmha_sm120.py` (`FmhaSm120`). Compiled via `cutlass.cute.compile()` returning a Python callable; cached per-config in `oasr/jit/attention.py::_compiled_fmha`.
 - **`ctc_decode.py`** — GPU CTC prefix beam search, exposing two orthogonal APIs:
   - `ctc_beam_search_decode(log_prob, seq_lengths, ...)` — offline batched decode (allocates workspace + output, calls C++ in one shot).
   - `GpuStreamingDecoder` — streaming decoder with two usage modes:
@@ -169,6 +171,7 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
   - `templates.py` — Jinja2 rendering utilities (`get_template_env()`, `render_template()`).
   - `env.py` — Path constants including `OASR_TEMPLATE_DIR`, `OASR_GEN_SRC_DIR`.
   - Per-family modules: `gemm.py`, `conv.py`, `norm.py`, `activation.py`, `ctc_decoder.py`.
+  - `attention.py` — **Different model**: not a Ninja JIT spec but a `functools.cache`-keyed wrapper around `cutlass.cute.compile()`. Exposes `select_backend()`, `get_compiled_fmha(...)`, `warmup_fmha(...)`, and `set_backend_mode()` (mostly for tests; clears the compile cache). SM120 is the only arch with a cute dsl backend in this revision; everything else routes through SDPA.
 - **`decoder/`** — Python wrappers for the C++ decoders: `CtcGreedySearch`, `CtcPrefixBeamSearch`, `CtcWfstBeamSearch` (requires k2), `ContextGraph` (phrase boosting trie). Also exposes `k2_available` flag. Each wrapper lazily imports the compiled `_C` extension and delegates to a `_*Core` C++ object.
 - **`engine/`** — Inference engine for offline + streaming Conformer-CTC on a single GPU:
   - `EngineConfig` — unified config aggregating model, cache, feature, decoding, detokenization settings.
@@ -235,3 +238,4 @@ Two skill files provide step-by-step workflows for common tasks:
 | `CUDA_ARCHITECTURES` | Override SM targets for build (e.g., `80` or `80;86`) |
 | `OASR_USE_FLASH_ATTENTION` | Set to `1` to enable Flash Attention support |
 | `OASR_CUDA_ARCH_LIST` | Manual override for JIT CUDA architecture detection |
+| `OASR_ATTN_BACKEND` | `sdpa` (force SDPA), `cute` (require CuteDSL FMHA, error otherwise), `auto` (default — try cute on SM120, warn + fall back) |

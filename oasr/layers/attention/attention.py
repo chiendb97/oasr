@@ -507,20 +507,23 @@ class RelPositionMultiHeadedAttention(nn.Module):
             k_full = k_full.repeat_interleave(n_repeat, dim=1)
             v_full = v_full.repeat_interleave(n_repeat, dim=1)
 
-        # 4. SDPA with combined attn_mask = (matrix_bd + pad_bias) / sqrt(d_k).
-        #    Skip the pad_bias build entirely when offsets are homogeneous —
-        #    every stream's valid kv length is exactly T_kv_max so the bias
-        #    would be all zeros.
+        # 4. Combined attn_bias = (matrix_bd + pad_bias) / sqrt(d_k); when
+        #    offsets are homogeneous every stream's valid kv length is exactly
+        #    T_kv_max so the pad bias would be all zeros and we skip its build.
+        scale = 1.0 / math.sqrt(self.d_k)
         if homogeneous:
-            attn_mask = matrix_bd * (1.0 / math.sqrt(self.d_k))
+            combined_bias = matrix_bd * scale
         else:
             total_kv_lens = cache.cache_seqlens + T_q  # (B,) on GPU
             pad_bias = _length_to_pad_bias(total_kv_lens, T_kv_max, q.dtype)
-            attn_mask = (matrix_bd + pad_bias) * (1.0 / math.sqrt(self.d_k))
-        out = F.scaled_dot_product_attention(
+            # pad_bias is (B,1,1,T_kv_max); broadcasts against matrix_bd (B,H,T_q,T_kv_max).
+            combined_bias = (matrix_bd + pad_bias) * scale  # (B, H, T_q, T_kv_max)
+        # Local import to avoid a circular import oasr->layers->attention.
+        from oasr.attention import fmha
+        out = fmha(
             q_with_bias_u, k_full, v_full,
-            attn_mask=attn_mask,
-            scale=1.0 / math.sqrt(self.d_k),
+            softmax_scale=scale,
+            attn_bias=combined_bias,
         )  # (B, H, T_q, d_k)
 
         # 5. Output projection.
@@ -569,12 +572,14 @@ class RelPositionMultiHeadedAttention(nn.Module):
         B: int,
         T_q: int,
     ) -> torch.Tensor:
-        """Rel-pos attention over already-prepared Q/K/V via SDPA.
+        """Rel-pos attention over already-prepared Q/K/V.
 
         ``mask`` is the additive padding bias (``0`` valid, ``-inf``
         padding). Combined with ``matrix_bd`` and scaled by
-        ``1/sqrt(d_k)``, then passed to SDPA as ``attn_mask`` — same
-        algebra as the original WeNet RelPos path.
+        ``1/sqrt(d_k)``, then routed through :func:`oasr.fmha`
+        which selects the SDPA fallback or the SM120 fused kernel based
+        on ``OASR_ATTN_BACKEND`` and the active GPU. Algebra is identical
+        to the legacy SDPA path: ``S = (Q @ K^T) * scale + (matrix_bd + mask) * scale``.
         """
         n_batch_pos = pos_emb.size(0)
         T_pos = pos_emb.size(1)
@@ -585,21 +590,21 @@ class RelPositionMultiHeadedAttention(nn.Module):
         q_with_bias_u = (q_t + self.pos_bias_u).transpose(1, 2)
         q_with_bias_v = (q_t + self.pos_bias_v).transpose(1, 2)
 
+        scale = 1.0 / math.sqrt(self.d_k)
         matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))  # (B, H, T_q, T_pos)
         if mask.numel() > 0:
-            attn_mask = (matrix_bd + mask.unsqueeze(1)) * (1.0 / math.sqrt(self.d_k))
+            combined_bias = (matrix_bd + mask.unsqueeze(1)) * scale
         else:
-            attn_mask = matrix_bd * (1.0 / math.sqrt(self.d_k))
+            combined_bias = matrix_bd * scale
 
-        if self.h_kv != self.h and self.h_kv != 1:
-            n_repeat = self.h // self.h_kv
-            k = k.repeat_interleave(n_repeat, dim=1)
-            v = v.repeat_interleave(n_repeat, dim=1)
-
-        out = F.scaled_dot_product_attention(
+        # GQA broadcast happens inside fmha (kernel handles head fan-out),
+        # so we pass k/v unexpanded.
+        # Local import to avoid a circular import via oasr -> layers -> attention.
+        from oasr.attention import fmha
+        out = fmha(
             q_with_bias_u, k, v,
-            attn_mask=attn_mask,
-            scale=1.0 / math.sqrt(self.d_k),
+            softmax_scale=scale,
+            attn_bias=combined_bias,
         )  # (B, H, T_q, d_k)
 
         out = out.transpose(1, 2).contiguous().view(B, T_q, self.h * self.d_k)
