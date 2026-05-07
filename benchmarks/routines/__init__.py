@@ -21,6 +21,7 @@ ROUTINE_REGISTRY: dict[str, str] = {
     "norm": "benchmarks.routines.norm",
     "conv": "benchmarks.routines.conv",
     "activation": "benchmarks.routines.activation",
+    "attention": "benchmarks.routines.attention",
     "softmax": "benchmarks.routines.softmax",
     "topk": "benchmarks.routines.topk",
     "fft": "benchmarks.routines.fft",

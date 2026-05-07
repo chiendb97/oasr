@@ -30,6 +30,7 @@ from .conv import (
 )
 from .gemm import gemm, bmm, group_gemm, gemm_activation
 from .softmax import softmax
+from .attention import fmha
 from .topk import topk
 from .fft import rfft, rfft_power
 from .features import (

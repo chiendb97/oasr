@@ -28,7 +28,7 @@ A high-performance open-source inference framework for ASR models built with C++
 - **Normalization** -- LayerNorm, RMSNorm, BatchNorm1d, GroupNorm (fused add+norm, fused norm+activation)
 - **Convolution** -- Depthwise/pointwise Conv1D (including causal), Conv2D via CUTLASS Implicit GEMM, cuDNN Conv2D
 - **Activation** -- GLU, Swish
-- **Attention** -- Multi-head and relative-position attention with optional rotary embeddings
+- **Attention** -- Multi-head and relative-position attention with optional rotary embeddings; fused FMHA (`oasr.fmha`) with offline / dense-streaming / paged-streaming cache modes (CuteDSL kernel on SM120, PyTorch SDPA fallback elsewhere)
 - **CTC decoder** -- CTC greedy, prefix beam, and WFST beam search (CPU-side C++ with Python wrappers); GPU prefix beam search with offline + multi-request streaming APIs
 - **Feature extraction** -- Batched FBANK / MFCC via `torchaudio` (default) or `kaldifeat` (optional GPU path), plus `BatchedStreamingFeatureExtractor` for `B` parallel chunked streams
 - **Inference engine** -- vLLM-style `ASREngine` (streaming + offline) and `OfflineEngine` for Conformer-CTC, with dynamic length-bucketed batching and paged KV cache
@@ -69,9 +69,11 @@ oasr/
 │   ├── norm.py                # Functional API: LayerNorm, RMSNorm, etc.
 │   ├── conv.py                # Functional API: Conv1D, Conv2D
 │   ├── gemm.py                # Functional API: GEMM, BMM, Grouped GEMM
+│   ├── attention.py           # Functional API: fmha (CuteDSL / SDPA fallback)
 │   ├── ctc_decode.py          # High-level CTC decode helpers
 │   ├── aot.py                 # Ahead-of-time compilation registration
-│   ├── jit/                   # JIT spec generators (core.py + per-family)
+│   ├── jit/                   # JIT spec generators (core.py + per-family; jit/attention.py wraps cutlass.cute.compile)
+│   ├── kernels/               # Low-level CuteDSL/Triton/hand-CUDA kernels (kernels/cute/attention/ for FMHA)
 │   ├── tune/                  # Auto-tuning framework (profiler, cache, backends)
 │   ├── layers/                # nn.Module wrappers (norm, conv, linear, attention, rotary)
 │   ├── decoder/               # Python wrappers: CtcGreedySearch, CtcPrefixBeamSearch, CtcWfstBeamSearch
@@ -202,7 +204,17 @@ output = oasr.group_gemm(A_list, B_list)
 # Activation
 output = oasr.glu(input)
 output = oasr.swish(input)
+
+# Fused multi-head attention (CuteDSL on SM120; SDPA fallback elsewhere)
+# q, k, v: (B, H, T, D); attn_bias: (B, H, T_q, T_k); cache_seqlens: (B,) int32
+output = oasr.fmha(q, k, v, softmax_scale=1.0 / D**0.5)
+output = oasr.fmha(
+    q, k, v, softmax_scale=1.0 / D**0.5,
+    attn_bias=bias, cache_seqlens=lens,  # dense-streaming mode
+)
 ```
+
+Set `OASR_ATTN_BACKEND=sdpa` to force the SDPA path, or `=cute` to require the CuteDSL kernel (errors on unsupported archs). Default is `auto`.
 
 ```python
 # nn.Module wrappers
