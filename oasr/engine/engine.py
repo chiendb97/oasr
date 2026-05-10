@@ -115,15 +115,14 @@ class ASREngine:
             if self._device.type == "cuda" else None
         )
 
-        # Warm up the FlexAttention kernel + BlockMask compile cache so
-        # the first request doesn't pay torch.compile latency. Walks both
-        # branches (homogeneous-offset → block_mask=None, heterogeneous →
-        # real BlockMask). Skipped on CPU since the engine doesn't run
-        # FlexAttention there.
+        # Warm up the cute FMHA compile cache so the first request
+        # doesn't pay JIT-compile latency. Skipped on CPU and on archs
+        # where the cute backend isn't available (warmup_fmha is a no-op
+        # in those cases).
         if self._device.type == "cuda":
-            from oasr.layers.attention.attention import warmup_flex_attention
+            from oasr.jit.attention import warmup_fmha
             try:
-                warmup_flex_attention(
+                warmup_fmha(
                     n_head=model.encoder.encoders[0].self_attn.h,
                     n_kv_head=model.encoder.encoders[0].self_attn.h_kv,
                     head_dim=model.encoder.encoders[0].self_attn.d_k,
@@ -135,7 +134,7 @@ class ASREngine:
                 )
             except Exception as exc:  # pragma: no cover
                 logger.warning(
-                    "FlexAttention warmup failed (will compile on first call): %s",
+                    "FMHA warmup failed (will compile on first call): %s",
                     exc,
                 )
 

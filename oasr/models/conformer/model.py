@@ -14,8 +14,8 @@ from torch import nn
 from oasr.layers.linear import Linear, LinearActivation
 from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d, Conv2dActivation
 from oasr.layers.norm import LayerNorm, GlobalCMVN
+from oasr.cache.paged_kv import PagedKVCache
 from oasr.layers.attention.attention import (
-    PagedKVCache,
     RelPositionMultiHeadedAttention,
     T_CACHE,
 )
@@ -674,9 +674,9 @@ class ConformerEncoder(nn.Module):
 
         K/V for the current chunk are written directly into the shared block
         pool by :class:`~oasr.layers.attention.RelPositionMultiHeadedAttention`
-        (via :func:`~oasr.layers.attention.attention._paged_write_kv`).  The
-        caller is responsible for allocating the necessary physical blocks
-        **before** this call and for updating ``cache_seqlens`` **after**.
+        (via :meth:`~oasr.cache.PagedKVCache.write_kv_chunk`). The caller is
+        responsible for allocating the necessary physical blocks **before**
+        this call and for updating ``cache_seqlens`` **after**.
 
         Parameters
         ----------

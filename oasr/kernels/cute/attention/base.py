@@ -42,10 +42,15 @@ class FmhaBase:
     * ``mV``  : same shape as ``mK``.
     * ``mO``  : ``(B, H,    T_q, D)`` output (pre-allocated by caller).
     * ``mBias`` : optional ``(B, H, T_q, T_k_max)`` additive bias, dtype = mQ.dtype.
-                  ``None`` if ``has_bias`` is False.
+                  ``None`` if ``has_bias`` is False. In paged mode
+                  ``T_k_max`` is the logical kv extent (typically
+                  ``cache_seqlens.max() + T_q``) -- bias is a dense
+                  matrix over the gathered/contiguous-T_k axis even when
+                  K/V live in the paged pool.
     * ``mCacheSeqlens`` : optional ``(B,)`` int32, per-stream valid kv length.
                           ``None`` => attend over the full ``T_k``.
-    * ``mBlockTable`` : ``(B, max_blocks_per_seq)`` int32; required iff ``paged``.
+    * ``mBlockTable`` : ``(B, max_blocks_per_seq)`` int32 in paged mode;
+                       zero-rank dummy tensor when ``paged`` is False.
     * ``softmax_scale`` : f32 scalar = 1/sqrt(D) (or whatever the caller chose).
 
     Math performed:

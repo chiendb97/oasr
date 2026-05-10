@@ -28,7 +28,14 @@ from benchmarks.routines.bench_utils import (
     run_main,
 )
 
-SUBROUTINES = ["fmha_offline", "fmha_bias", "fmha_seqlens", "fmha_bias_seqlens"]
+SUBROUTINES = [
+    "fmha_offline",
+    "fmha_bias",
+    "fmha_seqlens",
+    "fmha_bias_seqlens",
+    "fmha_paged",
+    "fmha_paged_bias",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -52,8 +59,22 @@ _BASE_CONFIGS: list[dict[str, Any]] = [
     {"B": 4,  "H": 8,  "H_kv": 8,  "T_q": 256,  "T_k":  256,  "D": 64},
 ]
 
+_PAGED_CONFIGS: list[dict[str, Any]] = [
+    # (B, H, H_kv, T_q, T_k, D, block_size) -- T_k is padded to a multiple
+    # of block_size at setup time. head_dim must be a multiple of 32 for
+    # the paged kernel.
+    {"B": 1,  "H": 4,  "H_kv": 4,  "T_q":   8,  "T_k":   64,  "D": 64, "block_size": 16},
+    {"B": 4,  "H": 4,  "H_kv": 4,  "T_q":   8,  "T_k":   64,  "D": 64, "block_size": 16},
+    {"B": 2,  "H": 8,  "H_kv": 2,  "T_q":  16,  "T_k":  256,  "D": 64, "block_size": 16},  # GQA streaming
+    {"B": 1,  "H": 8,  "H_kv": 8,  "T_q":  64,  "T_k":  512,  "D": 64, "block_size": 16},
+    {"B": 1,  "H": 8,  "H_kv": 8,  "T_q": 128,  "T_k": 1024,  "D": 64, "block_size": 32},
+    {"B": 4,  "H": 8,  "H_kv": 2,  "T_q":  32,  "T_k":  512,  "D": 64, "block_size": 16},
+]
+
+
 DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
-    sub: list(_BASE_CONFIGS) for sub in SUBROUTINES
+    sub: (list(_PAGED_CONFIGS) if sub.startswith("fmha_paged") else list(_BASE_CONFIGS))
+    for sub in SUBROUTINES
 }
 
 PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
@@ -61,6 +82,8 @@ PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
     "fmha_bias": _BASE_CONFIGS[8],
     "fmha_seqlens": _BASE_CONFIGS[8],
     "fmha_bias_seqlens": _BASE_CONFIGS[8],
+    "fmha_paged": _PAGED_CONFIGS[3],            # (1, 8, 8, 64, 512, 64)
+    "fmha_paged_bias": _PAGED_CONFIGS[3],
 }
 
 
@@ -175,11 +198,109 @@ def setup_fmha_bias_seqlens(cfg: dict, dtype: torch.dtype = torch.float16):
     return _setup_common(cfg, dtype, with_bias=True, with_seqlens=True)
 
 
+# ---------------------------------------------------------------------------
+# Paged subroutines: K/V live in a (num_blocks, block_size, H_kv, D) pool
+# accessed via per-stream block tables. Compares the cute paged kernel
+# against gather-then-SDPA.
+# ---------------------------------------------------------------------------
+
+
+def _make_paged_inputs(
+    cfg: dict, dtype: torch.dtype, *, with_bias: bool, seed: int = 0,
+):
+    B, H, H_kv = cfg["B"], cfg["H"], cfg["H_kv"]
+    T_q, T_k, D = cfg["T_q"], cfg["T_k"], cfg["D"]
+    block_size = int(cfg.get("block_size", 16))
+    if T_k % block_size != 0:
+        # Round up so T_k is a multiple of block_size for clean block tables.
+        T_k = ((T_k + block_size - 1) // block_size) * block_size
+    max_blocks_per_seq = T_k // block_size
+
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn(B, H, T_q, D, dtype=dtype, device="cuda", generator=g)
+    num_pool_blocks = max(B * max_blocks_per_seq + 4, 32)
+    k_pool = torch.randn(
+        num_pool_blocks, block_size, H_kv, D, dtype=dtype, device="cuda", generator=g,
+    )
+    v_pool = torch.randn(
+        num_pool_blocks, block_size, H_kv, D, dtype=dtype, device="cuda", generator=g,
+    )
+    block_ids = torch.randperm(num_pool_blocks)[: B * max_blocks_per_seq]
+    block_table = block_ids.reshape(B, max_blocks_per_seq).to(
+        dtype=torch.int32, device="cuda",
+    )
+    # Vary cache_seqlens across streams to exercise per-stream length mask.
+    seqlens = torch.tensor(
+        [max(1, T_k - 8 - 2 * b) for b in range(B)],
+        dtype=torch.int32, device="cuda",
+    )
+    bias = None
+    if with_bias:
+        bias = torch.randn(B, H, T_q, T_k, dtype=dtype, device="cuda", generator=g) * 0.1
+    return q, k_pool, v_pool, block_table, seqlens, bias, T_k
+
+
+def _setup_paged(cfg: dict, dtype: torch.dtype, *, with_bias: bool):
+    q, k_pool, v_pool, block_table, seqlens, bias, T_k = _make_paged_inputs(
+        cfg, dtype, with_bias=with_bias,
+    )
+    H, D = q.size(1), q.size(-1)
+    H_kv = k_pool.size(2)
+    block_size = k_pool.size(1)
+    scale = 1.0 / (D ** 0.5)
+    out = torch.empty_like(q)
+
+    def oasr_fn():
+        return oasr.fmha(
+            q, k_pool, v_pool,
+            softmax_scale=scale,
+            attn_bias=bias,
+            cache_seqlens=seqlens,
+            block_table=block_table,
+            out=out,
+        )
+
+    # Reference: gather + SDPA (mirrors the SDPA fallback path).
+    block_ids_long = block_table.long()
+    k_full = k_pool[block_ids_long].reshape(
+        q.size(0), -1, H_kv, D
+    ).permute(0, 2, 1, 3)
+    v_full = v_pool[block_ids_long].reshape(
+        q.size(0), -1, H_kv, D
+    ).permute(0, 2, 1, 3)
+    if H_kv != H:
+        n_repeat = H // H_kv
+        k_full = k_full.repeat_interleave(n_repeat, dim=1)
+        v_full = v_full.repeat_interleave(n_repeat, dim=1)
+    full_mask = _build_sdpa_mask(q, k_full, bias, seqlens)
+
+    def pytorch_fn():
+        return F.scaled_dot_product_attention(
+            q, k_full, v_full, attn_mask=full_mask, scale=scale,
+        )
+
+    # Stash the resolved T_k so the bench TFLOPS calculation uses the
+    # padded value (matches what the kernel actually walks).
+    cfg["T_k"] = T_k
+    cfg["block_size"] = block_size
+    return oasr_fn, pytorch_fn
+
+
+def setup_fmha_paged(cfg: dict, dtype: torch.dtype = torch.float16):
+    return _setup_paged(cfg, dtype, with_bias=False)
+
+
+def setup_fmha_paged_bias(cfg: dict, dtype: torch.dtype = torch.float16):
+    return _setup_paged(cfg, dtype, with_bias=True)
+
+
 _SETUP_FNS = {
     "fmha_offline": setup_fmha_offline,
     "fmha_bias": setup_fmha_bias,
     "fmha_seqlens": setup_fmha_seqlens,
     "fmha_bias_seqlens": setup_fmha_bias_seqlens,
+    "fmha_paged": setup_fmha_paged,
+    "fmha_paged_bias": setup_fmha_paged_bias,
 }
 
 
