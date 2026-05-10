@@ -15,16 +15,6 @@ cache modes:
 The Transformer-XL rel-pos bias ``matrix_bd`` is combined with the
 padding / per-stream length mask and passed in via ``attn_mask``.
 
-A FlexAttention path was prototyped (the helpers ``build_paged_block_mask``,
-``_flex_attention_paged_with_bias``, and ``warmup_flex_attention`` below
-remain for future re-enablement). It produced numerical parity with SDPA
-but was significantly slower on Conformer streaming shapes — the chunk
-``T_q`` (8 frames after subsampling) is much smaller than FlexAttention's
-``BLOCK_M=128`` Q-tile, so most of every tile was wasted. SDPA's
-cuBLAS-sized tiles match our shapes directly. Re-enabling FlexAttention
-will likely require packing queries across requests (variable-length
-attention) so the packed Q length exceeds ``BLOCK_M``.
-
 Removed in this revision (relative to the WeNet-port era):
     * ``MultiHeadedAttention`` / ``MultiHeadedCrossAttention`` /
       ``ShawRelPositionMultiHeadedAttention`` / ``RopeMultiHeadedAttention`` —
@@ -43,50 +33,7 @@ from typing import Any, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn.attention.flex_attention import (
-    BlockMask,
-    create_block_mask as _create_block_mask,
-    flex_attention as _flex_attention,
-)
 
-
-# Compile the BlockMask constructor with ``dynamic=True`` so a single
-# compiled callable adapts to varying ``(B, T_q, T_kv)`` across calls.
-_create_block_mask_compiled = torch.compile(_create_block_mask, dynamic=True)
-
-
-# FlexAttention itself is compiled via the wrapper in
-# :func:`_flex_attention_paged_with_bias` rather than ``torch.compile``-ing
-# ``flex_attention`` directly. The wrapper closure-captures the additive
-# ``bias`` for ``score_mod``; placing the closure construction *inside*
-# the compiled function keeps everything in a single Dynamo trace, which
-# is the pattern PyTorch's FlexAttention API expects (otherwise
-# ``flex_attention`` falls back to the unfused eager implementation).
-@torch.compile(dynamic=True)
-def _flex_attention_paged_with_bias(
-    q: torch.Tensor,
-    k_full: torch.Tensor,
-    v_full: torch.Tensor,
-    bias: torch.Tensor,
-    block_mask: Optional[BlockMask],
-    softmax_scale: float,
-    enable_gqa: bool,
-) -> torch.Tensor:
-    """FlexAttention with a precomputed additive bias added via score_mod.
-
-    Wrapped in ``torch.compile`` so ``flex_attention`` runs through the
-    fused Triton kernel rather than the unfused fallback.
-    """
-    def score_mod(score, b, h, q_idx, kv_idx):  # type: ignore[no-untyped-def]
-        return score + bias[b, h, q_idx, kv_idx]
-
-    return _flex_attention(
-        q, k_full, v_full,
-        score_mod=score_mod,
-        block_mask=block_mask,
-        scale=softmax_scale,
-        enable_gqa=enable_gqa,
-    )
 
 
 # Dense KV cache pair ``(K_cached, V_cached)`` used by the legacy
@@ -273,38 +220,6 @@ def _length_to_pad_bias(
     keep = arange.unsqueeze(0) < total_kv_lens.unsqueeze(1)  # (B, T_kv_max)
     bias = torch.where(keep, 0.0, float("-inf")).to(dtype)
     return bias.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, T_kv_max)
-
-
-# ---------------------------------------------------------------------------
-# Paged FlexAttention BlockMask (kept for future re-enablement; not used
-# by the active SDPA path).
-# ---------------------------------------------------------------------------
-
-
-def build_paged_block_mask(
-    total_kv_lens: torch.Tensor,
-    B: int,
-    T_q: int,
-    T_kv_max: int,
-    device: torch.device,
-) -> BlockMask:
-    """Build a per-stream length BlockMask for FlexAttention paged forward.
-
-    Stream ``b`` attends to ``kv_idx ∈ [0, total_kv_lens[b])`` only.
-    Built once per encoder ``forward_chunk_paged`` call and shared
-    across all encoder layers via ``PagedKVCache.block_mask``.
-
-    Goes through the compiled ``create_block_mask`` so per-call Python
-    overhead is amortised across all subsequent calls.
-    """
-    def mask_mod(b, h, q_idx, kv_idx):  # type: ignore[no-untyped-def]
-        del h, q_idx
-        return kv_idx < total_kv_lens[b]
-
-    return _create_block_mask_compiled(
-        mask_mod, B=B, H=None, Q_LEN=T_q, KV_LEN=T_kv_max,
-        device=device,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -611,72 +526,8 @@ class RelPositionMultiHeadedAttention(nn.Module):
         return self.linear_out(out)
 
 
-def warmup_flex_attention(
-    *,
-    n_head: int,
-    n_kv_head: int,
-    head_dim: int,
-    max_batch_size: int,
-    chunk_size: int,
-    max_attention_key_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> None:
-    """Trigger ``torch.compile`` for the FlexAttention kernel and the
-    BlockMask constructor on representative shapes.
-
-    Run once at engine init so the first benchmark / request doesn't
-    pay the compilation tax. With ``dynamic=True`` on both compiled
-    callables, a single warmup amortises across all subsequent shape
-    combinations the engine produces.
-
-    Walks through both branches:
-    * **homogeneous** — ``block_mask=None`` (the common case where every
-      streaming request in a step shares an offset).
-    * **heterogeneous** — a real BlockMask built from per-stream
-      ``cache_seqlens`` (cohort-relaxed admission, varying offsets).
-    """
-    B = max_batch_size
-    T_q = chunk_size
-    T_kv = max_attention_key_size
-
-    q = torch.randn(B, n_head, T_q, head_dim, device=device, dtype=dtype)
-    k = torch.randn(B, n_kv_head, T_kv, head_dim, device=device, dtype=dtype)
-    v = torch.randn(B, n_kv_head, T_kv, head_dim, device=device, dtype=dtype)
-    bias = torch.zeros(B, n_head, T_q, T_kv, device=device, dtype=dtype)
-
-    enable_gqa = n_kv_head != n_head
-
-    # Homogeneous branch — no BlockMask, full attention.
-    _flex_attention_paged_with_bias(
-        q, k, v, bias, block_mask=None,
-        softmax_scale=1.0 / math.sqrt(head_dim),
-        enable_gqa=enable_gqa,
-    )
-
-    # Heterogeneous branch — real BlockMask with varying lengths so the
-    # mask_mod path actually traces (cache_seqlens=0 here means stream b
-    # attends only to its own freshly-written T_q frames; trivial but
-    # non-uniform across the batch).
-    base_lens = torch.full((B,), 0, device=device, dtype=torch.int32)
-    base_lens[: B // 2] = max(0, T_kv - T_q)  # half full, half empty
-    block_mask = build_paged_block_mask(
-        base_lens + T_q, B=B, T_q=T_q, T_kv_max=T_kv, device=device,
-    )
-    _flex_attention_paged_with_bias(
-        q, k, v, bias, block_mask=block_mask,
-        softmax_scale=1.0 / math.sqrt(head_dim),
-        enable_gqa=enable_gqa,
-    )
-
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
 __all__ = [
     "PagedKVCache",
     "RelPositionMultiHeadedAttention",
     "T_CACHE",
-    "build_paged_block_mask",
-    "warmup_flex_attention",
 ]
