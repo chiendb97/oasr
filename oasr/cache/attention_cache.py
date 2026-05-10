@@ -27,8 +27,8 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from oasr.cache.block_pool import BlockPool
+from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.types import CacheConfig
-from oasr.layers.attention.attention import PagedKVCache
 
 
 @dataclass
@@ -334,9 +334,6 @@ class AttentionCacheManager:
                     cache_seqlens=state.cache_seqlens,
                     block_size=cfg.block_size_frames,
                     host_seqlen_max=host_seqlen,
-                    # Single-stream is trivially homogeneous; enables the
-                    # scalar-offset write and zero-pad-bias fast paths.
-                    host_seqlen_homogeneous=host_seqlen,
                 )
             )
         return caches
@@ -395,9 +392,9 @@ class AttentionCacheManager:
     def commit_chunk_paged(self, stream_id: int, chunk_frames: int) -> None:
         """Advance ``cache_seqlens`` after a paged forward pass and evict if needed.
 
-        The model has already written K/V directly into the pool via
-        :func:`~oasr.layers.attention.attention._paged_write_kv`.  This method
-        only updates the frame counter and handles eviction.
+        The attention layer has already written K/V directly into the
+        pool via :meth:`PagedKVCache.write_kv_chunk`. This method only
+        updates the frame counter and handles eviction.
 
         Parameters
         ----------

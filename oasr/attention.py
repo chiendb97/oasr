@@ -46,6 +46,34 @@ def _length_to_pad_bias(
     return torch.where(keep, 0.0, float("-inf")).to(dtype).unsqueeze(1).unsqueeze(1)
 
 
+def _gather_paged_kv(
+    k_pool: torch.Tensor,
+    v_pool: torch.Tensor,
+    block_table: torch.Tensor,
+) -> tuple:
+    """Gather paged K/V into dense ``(B, H_kv, T_kv_logical, D)`` for SDPA.
+
+    ``k_pool``/``v_pool`` have shape ``(num_blocks, block_size, H_kv, D)``.
+    Trailing logical positions past each stream's ``cache_seqlens[b]`` get
+    stale data; the caller masks them via ``cache_seqlens`` (passed to
+    ``_sdpa_reference``).
+    """
+    B = block_table.size(0)
+    block_size = k_pool.size(1)
+    H_kv = k_pool.size(2)
+    D = k_pool.size(3)
+    num_blocks_per_seq = block_table.size(1)
+
+    block_ids = block_table.long()
+    k_full = k_pool[block_ids].reshape(
+        B, num_blocks_per_seq * block_size, H_kv, D
+    ).permute(0, 2, 1, 3)
+    v_full = v_pool[block_ids].reshape(
+        B, num_blocks_per_seq * block_size, H_kv, D
+    ).permute(0, 2, 1, 3)
+    return k_full, v_full
+
+
 def _sdpa_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -135,27 +163,53 @@ def fmha(
         raise ValueError(f"q must be (B, H, T_q, D), got shape {tuple(q.shape)}")
     B, H, T_q, D = q.shape
 
-    if block_table is not None:
-        # Paged mode: not yet routed to the cute kernel (Stage 2). Caller
-        # should hold a contiguous gathered view and use the dense path; the
-        # nn.Module wrapper handles this transparently.
-        raise NotImplementedError(
-            "fmha: paged-KV path is not implemented in this revision; "
-            "the wrapper falls back to SDPA for paged streaming."
-        )
+    paged = block_table is not None
+    if paged:
+        # Paged mode: K/V are per-layer pool views with shape
+        # (num_blocks, block_size, H_kv, D). cache_seqlens is required
+        # so the kernel can mask each stream to its valid kv length.
+        if k.dim() != 4 or v.dim() != 4:
+            raise ValueError(
+                f"paged k/v must be (num_blocks, block_size, H_kv, D); "
+                f"got {tuple(k.shape)} / {tuple(v.shape)}"
+            )
+        if k.shape != v.shape:
+            raise ValueError(
+                f"k and v must have identical shape: {k.shape} vs {v.shape}"
+            )
+        if k.size(3) != D:
+            raise ValueError(
+                f"paged k head_dim mismatch with q: q={tuple(q.shape)}, "
+                f"k={tuple(k.shape)}"
+            )
+        H_kv = k.size(2)
+        block_size = k.size(1)
+        if block_size <= 0:
+            raise ValueError(f"paged block_size must be > 0; got {block_size}")
+        if cache_seqlens is None:
+            raise ValueError("paged mode requires cache_seqlens")
+        if block_table.dim() != 2 or block_table.size(0) != B:
+            raise ValueError(
+                f"block_table must be (B, max_blocks_per_seq) = ({B}, ...); "
+                f"got {tuple(block_table.shape)}"
+            )
+        if block_table.dtype != torch.int32:
+            block_table = block_table.to(torch.int32)
+        T_k = block_table.size(1) * block_size  # logical kv extent
+    else:
+        if k.dim() != 4 or v.dim() != 4:
+            raise ValueError(
+                f"k/v must be (B, H_kv, T_k, D); got {tuple(k.shape)} / {tuple(v.shape)}"
+            )
+        if k.shape != v.shape:
+            raise ValueError(f"k and v must have identical shape: {k.shape} vs {v.shape}")
+        if k.size(0) != B or k.size(3) != D:
+            raise ValueError(
+                f"k batch/D mismatch with q: q={tuple(q.shape)}, k={tuple(k.shape)}"
+            )
+        H_kv = k.size(1)
+        T_k = k.size(2)
 
-    if k.dim() != 4 or v.dim() != 4:
-        raise ValueError(
-            f"k/v must be (B, H_kv, T_k, D); got {tuple(k.shape)} / {tuple(v.shape)}"
-        )
-    if k.shape != v.shape:
-        raise ValueError(f"k and v must have identical shape: {k.shape} vs {v.shape}")
-    if k.size(0) != B or k.size(3) != D:
-        raise ValueError(
-            f"k batch/D mismatch with q: q={tuple(q.shape)}, k={tuple(k.shape)}"
-        )
-    H_kv = k.size(1)
-    T_k = k.size(2)
     if H % H_kv != 0:
         raise ValueError(f"H ({H}) must be divisible by H_kv ({H_kv})")
 
@@ -193,18 +247,28 @@ def fmha(
 
     # ---- Backend dispatch ----------------------------------------------------
     # Fall back to SDPA for any dtype the cute kernel can't handle (fp32 etc.),
-    # even when the backend is "cute".
+    # even when the backend is "cute". For the SDPA fallback in paged mode we
+    # gather the per-stream K/V into dense form first.
     backend = select_backend()
     if backend == "sdpa" or q.dtype not in (torch.float16, torch.bfloat16):
-        out.copy_(_sdpa_reference(q, k, v, softmax_scale, attn_bias, cache_seqlens))
+        if paged:
+            k_dense, v_dense = _gather_paged_kv(k, v, block_table)
+        else:
+            k_dense, v_dense = k, v
+        out.copy_(
+            _sdpa_reference(
+                q, k_dense, v_dense, softmax_scale, attn_bias, cache_seqlens,
+            )
+        )
         return out
 
-    # backend == "cute"  (SM120 only in this revision)
+    # backend == "cute"
     return _call_cute_dsl(
         q, k, v, out,
         softmax_scale=softmax_scale,
         attn_bias=attn_bias,
         cache_seqlens=cache_seqlens,
+        block_table=block_table,
     )
 
 
@@ -221,6 +285,7 @@ def _call_cute_dsl(
     softmax_scale: float,
     attn_bias: Optional[torch.Tensor],
     cache_seqlens: Optional[torch.Tensor],
+    block_table: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Wrap torch tensors as CuteDSL descriptors and invoke the compiled kernel."""
     import cuda.bindings.driver as cuda_driver
@@ -228,13 +293,21 @@ def _call_cute_dsl(
     from cutlass.cute.runtime import from_dlpack
 
     B, H, T_q, D = q.shape
-    H_kv = k.size(1)
+    paged = block_table is not None
+    if paged:
+        # Paged K/V layout: (num_blocks, block_size, H_kv, D).
+        H_kv = k.size(2)
+        block_size = k.size(1)
+    else:
+        H_kv = k.size(1)
+        block_size = 0
     dtype_str = "float16" if q.dtype == torch.float16 else "bfloat16"
 
     fn = get_compiled_fmha(
         head_dim=D, dtype_str=dtype_str,
         num_heads=H, num_kv_heads=H_kv,
-        has_bias=(attn_bias is not None), paged=False,
+        has_bias=(attn_bias is not None),
+        paged=paged, block_size=block_size,
     )
 
     # cp.async needs the head-dim ptr 16B-aligned; mark_compact_shape_dynamic
@@ -274,6 +347,9 @@ def _call_cute_dsl(
     if cache_seqlens is not None:
         seqlens = cache_seqlens.contiguous()
     else:
+        # In offline mode the per-column mask doubles as the T_k tail-
+        # residue mask -- synthesize a (B,)-of-T_k tensor so the kernel
+        # masks columns >= T_k to -inf via the same compare.
         T_k = k.size(2)
         seqlens = torch.full((q.size(0),), T_k, dtype=torch.int32, device=q.device)
     mCacheSeqlens = (
@@ -281,7 +357,19 @@ def _call_cute_dsl(
         .mark_layout_dynamic(leading_dim=0)
     )
 
+    if paged:
+        bt = block_table.contiguous()
+        mBlockTable = (
+            from_dlpack(bt, assumed_align=4)
+            .mark_layout_dynamic(leading_dim=bt.dim() - 1)
+        )
+    else:
+        # Dense path: zero-rank dummy block table; the kernel only reads
+        # it when self._paged is True.
+        dummy_bt = torch.empty((), dtype=torch.int32, device=q.device)
+        mBlockTable = from_dlpack(dummy_bt, assumed_align=4)
+
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(mQ, mK, mV, mO, mBias, mCacheSeqlens,
+    fn(mQ, mK, mV, mO, mBias, mCacheSeqlens, mBlockTable,
        cutlass.Float32(float(softmax_scale)), stream)
     return out

@@ -185,16 +185,69 @@ def test_fmha_bias_and_mask(fmha, cuda, dtype, shape):
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
-def test_fmha_paged_not_implemented(fmha, cuda):
-    """Paged mode (block_table) is intentionally NotImplementedError in this revision."""
-    q = torch.randn(1, 4, 8, 64, device=cuda, dtype=torch.float16)
-    pool_k = torch.randn(16, 16, 4, 64, device=cuda, dtype=torch.float16)  # paged layout
-    pool_v = torch.randn(16, 16, 4, 64, device=cuda, dtype=torch.float16)
-    bt = torch.zeros(1, 4, dtype=torch.int32, device=cuda)
-    seqlens = torch.tensor([8], dtype=torch.int32, device=cuda)
-    with pytest.raises(NotImplementedError, match="paged"):
-        fmha(q, pool_k, pool_v,
-             softmax_scale=0.125, cache_seqlens=seqlens, block_table=bt)
+_PAGED_SHAPES = [
+    # (B, H, H_kv, T_q, max_blocks_per_seq, D, block_size)
+    (1, 4, 4, 8, 4, 64, 16),     # MHA, single stream
+    (2, 4, 4, 8, 4, 64, 16),     # MHA, two streams
+    (3, 8, 2, 16, 8, 64, 16),    # GQA, multi-stream, longer kv
+    (1, 4, 4, 8, 8, 64, 32),     # different block_size
+    (2, 8, 1, 8, 4, 64, 16),     # MQA
+]
+
+
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("shape", _PAGED_SHAPES)
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_fmha_paged_matches_sdpa(fmha, cuda, dtype, shape, with_bias):
+    """Paged mode produces the same result as SDPA on gathered K/V."""
+    B, H, H_kv, T_q, max_blocks_per_seq, D, block_size = shape
+    T_kv_max = max_blocks_per_seq * block_size
+
+    torch.manual_seed(11)
+    num_pool_blocks = max(B * max_blocks_per_seq + 4, 16)
+    k_pool = torch.randn(
+        num_pool_blocks, block_size, H_kv, D, device=cuda, dtype=dtype,
+    )
+    v_pool = torch.randn(
+        num_pool_blocks, block_size, H_kv, D, device=cuda, dtype=dtype,
+    )
+
+    # Per-stream block table picks distinct blocks.
+    block_ids = torch.randperm(num_pool_blocks)[: B * max_blocks_per_seq]
+    block_table = block_ids.reshape(B, max_blocks_per_seq).to(
+        dtype=torch.int32, device=cuda,
+    )
+    # Per-stream cache_seqlens: vary across streams.
+    cache_seqlens = torch.tensor(
+        [min(T_kv_max - 4 - 2 * b, T_kv_max - 1) for b in range(B)],
+        dtype=torch.int32, device=cuda,
+    )
+
+    q = torch.randn(B, H, T_q, D, device=cuda, dtype=dtype)
+    bias = (
+        torch.randn(B, H, T_q, T_kv_max, device=cuda, dtype=dtype) * 0.1
+        if with_bias else None
+    )
+    scale = 1.0 / math.sqrt(D)
+
+    out = fmha(
+        q, k_pool, v_pool,
+        softmax_scale=scale, attn_bias=bias,
+        cache_seqlens=cache_seqlens, block_table=block_table,
+    )
+
+    # Reference: gather and call SDPA.
+    block_ids_long = block_table.long()
+    k_full = k_pool[block_ids_long].reshape(
+        B, T_kv_max, H_kv, D
+    ).permute(0, 2, 1, 3)
+    v_full = v_pool[block_ids_long].reshape(
+        B, T_kv_max, H_kv, D
+    ).permute(0, 2, 1, 3)
+    ref = _ref_fmha(
+        q, k_full, v_full, scale, attn_bias=bias, cache_seqlens=cache_seqlens,
+    )
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
 def test_fmha_fp32_falls_back_to_sdpa(fmha, cuda):

@@ -24,17 +24,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from oasr.layers.attention.attention import (
-    PagedKVCache,
-    RelPositionMultiHeadedAttention,
-    _paged_gather_kv,
-    _paged_write_kv,
-    build_paged_block_mask,
-)
+from oasr.cache import PagedKVCache
+from oasr.layers.attention.attention import RelPositionMultiHeadedAttention
 
 
-# FlexAttention's compiled fused kernel requires head_dim >= 16 (Triton
-# block-tile constraint). Tests use n_feat=64, n_head=4 → d_k = 16.
+# Tests use n_feat=64, n_head=4 → d_k = 16.
 N_HEAD = 4
 N_FEAT = 64
 D_K = N_FEAT // N_HEAD
@@ -92,16 +86,17 @@ def _ref_paged(attn, x, pos_emb, cache: PagedKVCache):
     k_new = attn._project("key", x)
     v_new = attn._project("value", x)
 
-    k_pool_local = cache.k_cache.clone()
-    v_pool_local = cache.v_cache.clone()
-    _paged_write_kv(
-        k_pool_local, v_pool_local, cache.block_table,
-        cache.cache_seqlens, k_new, v_new,
+    cache_local = PagedKVCache(
+        k_cache=cache.k_cache.clone(),
+        v_cache=cache.v_cache.clone(),
+        block_table=cache.block_table,
+        cache_seqlens=cache.cache_seqlens,
+        block_size=cache.block_size,
+        host_seqlen_max=cache.host_seqlen_max,
     )
+    cache_local.write_kv_chunk(k_new, v_new, offset=cache_local.cache_seqlens)
     T_kv_max = cache.host_seqlen_max + x.size(1)
-    k_full, v_full = _paged_gather_kv(
-        k_pool_local, v_pool_local, cache.block_table, T_kv_max,
-    )
+    k_full, v_full = cache_local.gather_full_kv(T_kv_max)
 
     total_kv_lens = cache.cache_seqlens + x.size(1)
     arange = torch.arange(T_kv_max, device=cache.cache_seqlens.device)
@@ -202,18 +197,10 @@ def test_paged_path_matches_sdpa(attn, device):
     T_kv_max = 10 + T_q
     pos_emb = torch.randn(1, T_kv_max, N_FEAT, device=device)
 
-    # The encoder normally builds the FlexAttention BlockMask once per
-    # forward and shares it across layers. Mirror that here.
-    total_kv_lens = cache_seqlens + T_q
-    block_mask = build_paged_block_mask(
-        total_kv_lens, B=B, T_q=T_q, T_kv_max=T_kv_max, device=device,
-    )
-
     cache = PagedKVCache(
         k_cache=k_pool, v_cache=v_pool,
         block_table=block_table, cache_seqlens=cache_seqlens,
         block_size=block_size, host_seqlen_max=10,
-        block_mask=block_mask,
     )
 
     k_pool_save = k_pool.clone()

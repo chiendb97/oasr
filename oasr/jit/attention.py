@@ -167,11 +167,13 @@ def _compiled_fmha(
         dtype=cute_dtype, head_dim=head_dim,
         m_block_size=m_block, n_block_size=n_block,
         num_threads=num_threads, has_bias=has_bias,
+        paged=paged, block_size=block_size,
     ):
         raise RuntimeError(
             f"{cls.__name__}.can_implement returned False for "
             f"head_dim={head_dim}, m_block={m_block}, n_block={n_block}, "
-            f"num_threads={num_threads}, has_bias={has_bias}"
+            f"num_threads={num_threads}, has_bias={has_bias}, "
+            f"paged={paged}, block_size={block_size}"
         )
     inst = cls(
         head_dim=head_dim, dtype=cute_dtype,
@@ -182,13 +184,29 @@ def _compiled_fmha(
 
     # Build dummy descriptor tensors for cute.compile — shapes only matter for
     # rank/dtype/dynamic-leading-dim signalling; values are unused.
-    B, H, T_q, T_k = 1, num_heads, max(m_block, 8), max(n_block, 16)
+    B, H, T_q, T_k_dense = 1, num_heads, max(m_block, 8), max(n_block, 16)
     H_kv = num_kv_heads
     device = "cuda"
     q = torch.empty(B, H, T_q, head_dim, dtype=torch_dtype, device=device)
-    k = torch.empty(B, H_kv, T_k, head_dim, dtype=torch_dtype, device=device)
-    v = torch.empty(B, H_kv, T_k, head_dim, dtype=torch_dtype, device=device)
     o = torch.empty(B, H, T_q, head_dim, dtype=torch_dtype, device=device)
+
+    if paged:
+        # Paged K/V is a per-layer pool view: (num_blocks, block_size, H_kv, D).
+        # T_k_max is the logical kv extent; for the bias/length-mask shape we
+        # use ``max_blocks_per_seq * block_size``.
+        max_blocks_per_seq = max(n_block // block_size, 1)
+        num_blocks = max(max_blocks_per_seq, 2)
+        k = torch.empty(num_blocks, block_size, H_kv, head_dim,
+                        dtype=torch_dtype, device=device)
+        v = torch.empty(num_blocks, block_size, H_kv, head_dim,
+                        dtype=torch_dtype, device=device)
+        T_k_logical = max_blocks_per_seq * block_size
+    else:
+        k = torch.empty(B, H_kv, T_k_dense, head_dim,
+                        dtype=torch_dtype, device=device)
+        v = torch.empty(B, H_kv, T_k_dense, head_dim,
+                        dtype=torch_dtype, device=device)
+        T_k_logical = T_k_dense
 
     # cp.async with 128-bit copies requires the head-dim ptr to be
     # 16B-aligned at IR-verify time. ``mark_compact_shape_dynamic`` with
@@ -210,7 +228,8 @@ def _compiled_fmha(
 
     mQ = _wrap(q); mK = _wrap(k); mV = _wrap(v); mO = _wrap(o)
     if has_bias:
-        bias = torch.empty(B, H, T_q, T_k, dtype=torch_dtype, device=device)
+        bias = torch.empty(B, H, T_q, T_k_logical,
+                           dtype=torch_dtype, device=device)
         mBias = _wrap(bias)
     else:
         # Zero-rank dummy: cute.rank(mBias) > 0 in the kernel == False.
@@ -223,12 +242,28 @@ def _compiled_fmha(
         from_dlpack(seqlens, assumed_align=4).mark_layout_dynamic(leading_dim=0)
     )
 
+    if paged:
+        block_table = torch.zeros(
+            B, max(n_block // block_size, 1),
+            dtype=torch.int32, device=device,
+        )
+        mBlockTable = (
+            from_dlpack(block_table, assumed_align=4)
+            .mark_layout_dynamic(leading_dim=block_table.dim() - 1)
+        )
+    else:
+        # Zero-rank dummy when paged=False; kernel never reads it.
+        mBlockTable = from_dlpack(
+            torch.empty((), dtype=torch.int32, device=device), assumed_align=4,
+        )
+
     import cuda.bindings.driver as cuda_driver
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
 
     softmax_scale = cutlass.Float32(1.0 / (head_dim ** 0.5))
     return cute.compile(
-        inst, mQ, mK, mV, mO, mBias, mCacheSeqlens, softmax_scale, stream,
+        inst, mQ, mK, mV, mO, mBias, mCacheSeqlens, mBlockTable,
+        softmax_scale, stream,
     )
 
 
@@ -251,7 +286,8 @@ def get_compiled_fmha(
         raise RuntimeError("no CUDA device available")
     return _compiled_fmha(
         cap, head_dim, dtype_str, num_heads, num_kv_heads,
-        has_bias, paged, block_size, m_block, n_block, num_threads,
+        has_bias, paged, block_size,
+        m_block, n_block, num_threads,
     )
 
 
@@ -272,8 +308,8 @@ def warmup_fmha(
 ) -> None:
     """Eagerly populate the compile cache for a given Conformer config.
 
-    Mirrors :func:`oasr.layers.attention.attention.warmup_flex_attention`. Skips
-    silently on archs other than SM120 or when the active backend is ``sdpa``.
+    Skips silently on archs other than SM120 or when the active backend is
+    ``sdpa``.
     """
     if select_backend() != "cute":
         return

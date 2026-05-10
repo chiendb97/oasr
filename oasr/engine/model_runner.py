@@ -16,7 +16,7 @@ from oasr.cache import (
     CtcStateCacheManager,
     StreamContext,
 )
-from oasr.layers.attention.attention import PagedKVCache
+from oasr.cache.paged_kv import PagedKVCache
 from oasr.models.conformer.model import ConformerModel
 
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
@@ -289,18 +289,11 @@ class ModelRunner:
         batched_cs = torch.cat(cache_seqlens, dim=0)      # (B,)
 
         # 3. Build batched PagedKVCache descriptors. The engine tracks
-        #    each request's ``offset`` on the host, so we can compute
-        #    both the max (for sizing pos_emb / gather) and detect
-        #    homogeneity (for the scalar-offset fast paths) without a
-        #    D2H sync from cache_seqlens.
+        #    each request's ``offset`` on the host, so we can size
+        #    pos_emb / gather without a D2H sync from cache_seqlens.
         block_size = self._cache_config.block_size_frames
         num_layers = self._cache_config.num_layers
         max_offset = max(req.offset for req in group)
-        homogeneous_offset = (
-            max_offset
-            if all(req.offset == max_offset for req in group)
-            else -1
-        )
         batched_att_caches: List[PagedKVCache] = []
         for i in range(num_layers):
             k_view, v_view = self._block_pool.get_kv_view(i)
@@ -311,7 +304,6 @@ class ModelRunner:
                 cache_seqlens=batched_cs,
                 block_size=block_size,
                 host_seqlen_max=max_offset,
-                host_seqlen_homogeneous=homogeneous_offset,
             ))
 
         # 4. Stack feature-chunk slices and cnn_cache across streams.

@@ -13,6 +13,6 @@ class FmhaSm120(FmhaSm80):
     """SM120 FMHA kernel -- SM80 kernel body, SM120-sized smem budget.
     """
 
-    arch = 80
+    arch = 120
 
     _smem_arch_str = "sm_120"

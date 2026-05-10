@@ -34,8 +34,8 @@ import torch
 from oasr.cache.attention_cache import AttentionCacheManager
 from oasr.cache.cnn_cache import CnnCacheManager
 from oasr.cache.ctc_state import CtcStateCacheManager
+from oasr.cache.paged_kv import PagedKVCache
 from oasr.ctc_decode import GpuStreamingDecoder, StreamHandle
-from oasr.layers.attention.attention import PagedKVCache
 
 
 class StreamContext:

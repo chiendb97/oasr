@@ -72,17 +72,27 @@ class FmhaSm80(FmhaBase):
             paged=paged,
             block_size=block_size,
         )
-        if paged:
-            raise NotImplementedError(
-                f"{type(self).__name__}: paged-KV path is not implemented in "
-                f"this revision; use the SDPA fallback for paged streaming "
-                f"until the paged-attention follow-up lands."
-            )
         self._m_block_size = m_block_size
         self._n_block_size = n_block_size
         # Pad head_dim up to a multiple of 32 (so the m16n8k16 MMA k-stride works).
         self._head_dim_padded = (head_dim + 31) // 32 * 32
         self._num_threads = num_threads
+        if paged:
+            # Each n-tile of N_BLOCK rows reads ``blocks_per_n_tile`` consecutive
+            # logical block-IDs from the block table. Validated as a constexpr
+            # below; the load loop in kernel() walks 0..blocks_per_n_tile.
+            if block_size <= 0:
+                raise ValueError(
+                    f"{type(self).__name__}: paged=True requires block_size > 0"
+                )
+            if n_block_size % block_size != 0:
+                raise ValueError(
+                    f"{type(self).__name__}: paged kernel requires "
+                    f"n_block_size ({n_block_size}) % block_size ({block_size}) == 0"
+                )
+            self._blocks_per_n_tile = n_block_size // block_size
+        else:
+            self._blocks_per_n_tile = 1
 
         import cutlass.pipeline as pipeline
         self.cta_sync_barrier = pipeline.NamedBarrier(
@@ -110,6 +120,8 @@ class FmhaSm80(FmhaBase):
         n_block_size: int = 64,
         num_threads: int = 128,
         has_bias: bool = False,
+        paged: bool = False,
+        block_size: int = 0,
         **_kwargs,
     ) -> bool:
         if dtype != cutlass.Float16 and dtype != cutlass.BFloat16:
@@ -120,12 +132,23 @@ class FmhaSm80(FmhaBase):
             return False
         if (m_block_size * 2) % num_threads != 0:
             return False
-        # Smem budget: sQ + sK + sV. Bias (when has_bias) is gmem-direct, not
-        # staged through smem.
+        if paged:
+            if block_size <= 0:
+                return False
+            if n_block_size % block_size != 0:
+                return False
+            # Paged mode skips per-element head_dim predication for sub-tile
+            # cp.async loads -- require head_dim to fall on the MMA k-stride
+            # boundary so head_dim == head_dim_padded.
+            if head_dim % 32 != 0:
+                return False
+        # Smem budget: sQ + 2 * sK + sV. Bias (when has_bias) is gmem-direct,
+        # not staged through smem. The 2x sK is for the K cp.async ping-pong
+        # buffer.
         del has_bias  # not part of the smem budget
         smem_bytes = (
             m_block_size * head_dim
-            + n_block_size * head_dim * 2
+            + n_block_size * head_dim * 3
         ) * 2  # fp16/bf16 = 2B
         if smem_bytes > cls._smem_capacity_in_bytes():
             return False
@@ -138,11 +161,12 @@ class FmhaSm80(FmhaBase):
     def __call__(
         self,
         mQ: cute.Tensor,                              # (B, H,    T_q, D)
-        mK: cute.Tensor,                              # (B, H_kv, T_k, D)
-        mV: cute.Tensor,                              # (B, H_kv, T_k, D)
+        mK: cute.Tensor,                              # (B, H_kv, T_k, D) or paged
+        mV: cute.Tensor,                              # (B, H_kv, T_k, D) or paged
         mO: cute.Tensor,                              # (B, H,    T_q, D)
         mBias: cute.Tensor,                           # (B, H, T_q, T_k) or zero-rank dummy
         mCacheSeqlens: cute.Tensor,                   # (B,) int32 or zero-rank dummy
+        mBlockTable: cute.Tensor,                     # (B, max_blocks_per_seq) int32 (paged) or 0-rank dummy
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
@@ -183,12 +207,20 @@ class FmhaSm80(FmhaBase):
         # ``if has_bias`` branch that the @cute.kernel preprocessor used to
         # garble into a misleading "argument #18 (SharedStorage)" error.
 
+        # 2-stage K pipelining: dual sK0/sK1 buffers so the next-K cp.async
+        # can start *before* the current QK gemm finishes (writes to the
+        # opposite stage's buffer, no race with the in-flight smem read).
+        # Smem grows from 24 KB to 32 KB for D=64 (still fits SM80 163 KB
+        # and SM120 99 KB caps).
         @cute.struct
         class SharedStorage:
             sQ: cute.struct.Align[
                 cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024
             ]
-            sK: cute.struct.Align[
+            sK0: cute.struct.Align[
+                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
+            ]
+            sK1: cute.struct.Align[
                 cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
             ]
             sV: cute.struct.Align[
@@ -242,7 +274,7 @@ class FmhaSm80(FmhaBase):
         softmax_scale_log2 = softmax_scale * LOG2_E
 
         self.kernel(
-            mQ, mK, mV, mO, mBias, mCacheSeqlens,
+            mQ, mK, mV, mO, mBias, mCacheSeqlens, mBlockTable,
             softmax_scale, softmax_scale_log2,
             sQ_layout, sKV_layout, sO_layout,
             gmem_tiled_copy_QKV, gmem_tiled_copy_O,
@@ -265,6 +297,7 @@ class FmhaSm80(FmhaBase):
         mO: cute.Tensor,
         mBias: cute.Tensor,
         mCacheSeqlens: cute.Tensor,
+        mBlockTable: cute.Tensor,
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
@@ -281,9 +314,21 @@ class FmhaSm80(FmhaBase):
         # GQA: head index in K/V tensors.
         kv_head = num_head // self._gqa_ratio
 
+        # ---- Logical KV extent ----------------------------------------------
+        # Dense: T_kv_logical == mK.shape[2] (the contiguous T_k axis).
+        # Paged: mK is (num_blocks, block_size, H_kv, D), so the logical kv
+        # extent is determined by how many logical blocks are addressable per
+        # stream (``mBlockTable.shape[1] * block_size``). The per-stream length
+        # mask in softmax_rescale_O still narrows this to each stream's actual
+        # ``cache_seqlens[b]``.
+        if cutlass.const_expr(self._paged):
+            t_kv_logical = mBlockTable.shape[1] * self._block_size
+        else:
+            t_kv_logical = mK.shape[2]
+
         # Number of K-tiles to process for this stream. With per-stream length
         # mask, every block walks the full K-range and masks dynamically.
-        n_block_max = cute.ceil_div(mK.shape[2], self._n_block_size)
+        n_block_max = cute.ceil_div(t_kv_logical, self._n_block_size)
         n_block = n_block_max - 1
 
         # ---- Slice gmem tiles for this (b, h) --------------------------------
@@ -293,17 +338,25 @@ class FmhaSm80(FmhaBase):
             (self._m_block_size, self._head_dim_padded),
             (m_block, 0),
         )
-        # mK/mV: (B, H_kv, T_k, D). Slice on (b, kv_head) -> (T_k, D).
-        gK = cute.local_tile(
-            mK[batch_size, kv_head, None, None],
-            (self._n_block_size, self._head_dim_padded),
-            (None, 0),
-        )
-        gV = cute.local_tile(
-            mV[batch_size, kv_head, None, None],
-            (self._n_block_size, self._head_dim_padded),
-            (None, 0),
-        )
+        # K/V slicing.
+        # Dense: mK/mV is (B, H_kv, T_k, D). gK/gV is the per-CTA tile chain.
+        # Paged: mK/mV is (num_blocks, block_size, H_kv, D). We do NOT build a
+        # contiguous gK/gV view -- per n_block loads happen via
+        # _load_kv_tile_paged which gathers from mBlockTable.
+        if cutlass.const_expr(not self._paged):
+            gK = cute.local_tile(
+                mK[batch_size, kv_head, None, None],
+                (self._n_block_size, self._head_dim_padded),
+                (None, 0),
+            )
+            gV = cute.local_tile(
+                mV[batch_size, kv_head, None, None],
+                (self._n_block_size, self._head_dim_padded),
+                (None, 0),
+            )
+        else:
+            gK = None
+            gV = None
 
         # NB: bias is read directly from gmem inside ``_add_bias_tile`` -- no
         # gBias slice or sBias allocation is needed at the kernel scope.
@@ -312,7 +365,8 @@ class FmhaSm80(FmhaBase):
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQ = storage.sQ.get_tensor(sQ_layout)
-        sK = storage.sK.get_tensor(sKV_layout)
+        sK0 = storage.sK0.get_tensor(sKV_layout)
+        sK1 = storage.sK1.get_tensor(sKV_layout)
         sV = storage.sV.get_tensor(sKV_layout)
 
         # Transpose view of sV for tiled MMA (K-major).
@@ -328,16 +382,26 @@ class FmhaSm80(FmhaBase):
         gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_slice(tidx)
         tQgQ = gmem_thr_copy_QKV.partition_S(gQ)
         tQsQ = gmem_thr_copy_QKV.partition_D(sQ)
-        tKgK = gmem_thr_copy_QKV.partition_S(gK)
-        tKsK = gmem_thr_copy_QKV.partition_D(sK)
-        tVgV = gmem_thr_copy_QKV.partition_S(gV)
+        # Per-stage K smem destination partitions for cp.async.
+        tKsK0 = gmem_thr_copy_QKV.partition_D(sK0)
+        tKsK1 = gmem_thr_copy_QKV.partition_D(sK1)
         tVsV = gmem_thr_copy_QKV.partition_D(sV)
+        # gmem-side partitions only exist in dense mode -- paged mode loads
+        # K/V via per-sub-tile cp.async issued from the block_table lookup.
+        if cutlass.const_expr(not self._paged):
+            tKgK = gmem_thr_copy_QKV.partition_S(gK)
+            tVgV = gmem_thr_copy_QKV.partition_S(gV)
+        else:
+            tKgK = None
+            tVgV = None
 
 
         # ---- MMA partitions and accumulators ---------------------------------
         thr_mma = tiled_mma.get_slice(tidx)
         tSrQ = thr_mma.make_fragment_A(thr_mma.partition_A(sQ))
-        tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK))
+        # Two MMA fragments for K, one per stage.
+        tSrK0 = thr_mma.make_fragment_B(thr_mma.partition_B(sK0))
+        tSrK1 = thr_mma.make_fragment_B(thr_mma.partition_B(sK1))
         tOrVt = thr_mma.make_fragment_B(thr_mma.partition_B(sVt))
         acc_shape_O = thr_mma.partition_shape_C(
             (self._m_block_size, self._head_dim_padded)
@@ -365,27 +429,21 @@ class FmhaSm80(FmhaBase):
 
         tSsQ = smem_thr_copy_Q.partition_S(sQ)
         tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
-        tSsK = smem_thr_copy_K.partition_S(sK)
-        tSrK_copy_view = smem_thr_copy_K.retile(tSrK)
+        tSsK0 = smem_thr_copy_K.partition_S(sK0)
+        tSsK1 = smem_thr_copy_K.partition_S(sK1)
+        tSrK0_copy_view = smem_thr_copy_K.retile(tSrK0)
+        tSrK1_copy_view = smem_thr_copy_K.retile(tSrK1)
         tOsVt = smem_thr_copy_V.partition_S(sVt)
         tOrVt_copy_view = smem_thr_copy_V.retile(tOrVt)
 
         # ---- Predicates for head_dim & seqlen --------------------------------
         mcQ = cute.make_identity_tensor(mQ.layout.shape)
-        mcKV = cute.make_identity_tensor(mK.layout.shape)
         cQ = cute.local_tile(
             mcQ[batch_size, num_head, None, None],
             (self._m_block_size, self._head_dim_padded),
             (m_block, 0),
         )
-        cKV = cute.local_tile(
-            mcKV[batch_size, kv_head, None, None],
-            (self._n_block_size, self._head_dim_padded),
-            (n_block, 0),
-        )
-
         tQcQ = gmem_thr_copy_QKV.partition_S(cQ)
-        tKVcKV = gmem_thr_copy_QKV.partition_S(cKV)
         tQpQ = cute.make_rmem_tensor(
             cute.make_layout(
                 (tQsQ.shape[0][1], cute.size(tQsQ, mode=[1]), cute.size(tQsQ, mode=[2])),
@@ -393,24 +451,41 @@ class FmhaSm80(FmhaBase):
             ),
             cutlass.Boolean,
         )
-        tKVpKV = cute.make_rmem_tensor(
-            cute.make_layout(
-                (tKsK.shape[0][1], cute.size(tKsK, mode=[1]), cute.size(tKsK, mode=[2])),
-                stride=(cute.size(tKsK, mode=[2]), 0, 1),
-            ),
-            cutlass.Boolean,
-        )
-        # head_dim predicates (Q rows: idx[3] -> head_dim axis in (B,H,T,D))
+        # Q head_dim predicates (idx[3] -> head_dim axis in (B,H,T,D)).
         for rest_v in cutlass.range_constexpr(tQpQ.shape[0]):
             for rest_k in cutlass.range_constexpr(tQpQ.shape[2]):
                 tQpQ[rest_v, 0, rest_k] = cute.elem_less(
                     tQcQ[(0, rest_v), 0, rest_k][3], mQ.layout.shape[3]
                 )
-        for rest_v in cutlass.range_constexpr(tKVpKV.shape[0]):
-            for rest_k in cutlass.range_constexpr(tKVpKV.shape[2]):
-                tKVpKV[rest_v, 0, rest_k] = cute.elem_less(
-                    tKVcKV[(0, rest_v), 0, rest_k][3], mK.layout.shape[3]
-                )
+
+        # K/V predicates only exist in dense mode. Paged mode constrains
+        # head_dim % 32 == 0 (so head_dim == head_dim_padded -- no
+        # head-axis predicate needed) and reads block_table-resolved
+        # physical blocks unconditionally; stale tail data is masked out
+        # by softmax_rescale_O via cache_seqlens.
+        if cutlass.const_expr(not self._paged):
+            mcKV = cute.make_identity_tensor(mK.layout.shape)
+            cKV = cute.local_tile(
+                mcKV[batch_size, kv_head, None, None],
+                (self._n_block_size, self._head_dim_padded),
+                (n_block, 0),
+            )
+            tKVcKV = gmem_thr_copy_QKV.partition_S(cKV)
+            tKVpKV = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (tKsK0.shape[0][1], cute.size(tKsK0, mode=[1]), cute.size(tKsK0, mode=[2])),
+                    stride=(cute.size(tKsK0, mode=[2]), 0, 1),
+                ),
+                cutlass.Boolean,
+            )
+            for rest_v in cutlass.range_constexpr(tKVpKV.shape[0]):
+                for rest_k in cutlass.range_constexpr(tKVpKV.shape[2]):
+                    tKVpKV[rest_v, 0, rest_k] = cute.elem_less(
+                        tKVcKV[(0, rest_v), 0, rest_k][3], mK.layout.shape[3]
+                    )
+        else:
+            tKVcKV = None
+            tKVpKV = None
 
         # NB: per-stream length mask is applied inside softmax_rescale_O using
         # ``mCacheSeqlens`` directly (when rank > 0) or ``mK.shape[2]`` for the
@@ -430,16 +505,25 @@ class FmhaSm80(FmhaBase):
                 )
             else:
                 tQsQ[None, m, None].fill(0)
-        for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-            if cute.elem_less(tKVcKV[0, n, 0][2], mK.layout.shape[2]):
-                cute.copy(
-                    gmem_tiled_copy_QKV,
-                    tKgK[None, n, None, n_block],
-                    tKsK[None, n, None],
-                    pred=tKVpKV[None, n, None],
-                )
-            else:
-                tKsK[None, n, None].fill(0)
+        # Initial K prefetch goes into stage 0 (sK0). Subsequent prefetches
+        # alternate stages, with each compute_one_n_block_pipelined call
+        # issuing the *next* iteration's K into the opposite stage.
+        if cutlass.const_expr(not self._paged):
+            for n in cutlass.range_constexpr(cute.size(tKsK0.shape[1])):
+                if cute.elem_less(tKVcKV[0, n, 0][2], mK.layout.shape[2]):
+                    cute.copy(
+                        gmem_tiled_copy_QKV,
+                        tKgK[None, n, None, n_block],
+                        tKsK0[None, n, None],
+                        pred=tKVpKV[None, n, None],
+                    )
+                else:
+                    tKsK0[None, n, None].fill(0)
+        else:
+            self._paged_load_kv_tile(
+                mK, sK0, mBlockTable, batch_size, kv_head, n_block,
+                gmem_thr_copy_QKV, gmem_tiled_copy_QKV,
+            )
         cute.arch.cp_async_commit_group()
 
         # ---- Online softmax state --------------------------------------------
@@ -454,19 +538,23 @@ class FmhaSm80(FmhaBase):
 
         basic_params = SimpleNamespace(
             m_block=m_block, n_block=n_block,
-            mQ=mQ, mK=mK, mO=mO, mBias=mBias,
-            mCacheSeqlens=mCacheSeqlens,
-            batch_size=batch_size, num_head=num_head,
+            mQ=mQ, mK=mK, mV=mV, mO=mO, mBias=mBias,
+            mCacheSeqlens=mCacheSeqlens, mBlockTable=mBlockTable,
+            t_kv_logical=t_kv_logical,
+            batch_size=batch_size, num_head=num_head, kv_head=kv_head,
         )
         mma_params = SimpleNamespace(
             thr_mma=thr_mma, tiled_mma=tiled_mma,
-            tSrQ=tSrQ, tSrK=tSrK, tOrVt=tOrVt, acc_O=acc_O,
+            tSrQ=tSrQ, tSrK0=tSrK0, tSrK1=tSrK1,
+            tOrVt=tOrVt, acc_O=acc_O,
         )
         gmem_copy_params = SimpleNamespace(
             gmem_tiled_copy_QKV=gmem_tiled_copy_QKV,
+            gmem_thr_copy_QKV=gmem_thr_copy_QKV,
             tKVcKV=tKVcKV,
-            tKgK=tKgK, tKsK=tKsK,
-            tVgV=tVgV, tVsV=tVsV,
+            tKgK=tKgK, tKsK0=tKsK0, tKsK1=tKsK1,
+            sK0=sK0, sK1=sK1,
+            tVgV=tVgV, tVsV=tVsV, sV=sV,
             tKVpKV=tKVpKV,
         )
         smem_copy_params = SimpleNamespace(
@@ -474,7 +562,9 @@ class FmhaSm80(FmhaBase):
             smem_tiled_copy_K=smem_tiled_copy_K,
             smem_tiled_copy_V=smem_tiled_copy_V,
             tSsQ=tSsQ, tSrQ_copy_view=tSrQ_copy_view,
-            tSsK=tSsK, tSrK_copy_view=tSrK_copy_view,
+            tSsK0=tSsK0, tSsK1=tSsK1,
+            tSrK0_copy_view=tSrK0_copy_view,
+            tSrK1_copy_view=tSrK1_copy_view,
             tOsVt=tOsVt, tOrVt_copy_view=tOrVt_copy_view,
         )
         softmax_params = SimpleNamespace(
@@ -486,23 +576,37 @@ class FmhaSm80(FmhaBase):
         # The first iteration is peeled out so ``is_first_n_block`` is a
         # compile-time constant -- ``softmax_rescale_O`` uses ``const_expr`` on
         # it to skip the previous-row state copy on the first tile, and the JIT
-        # path can only emit that branch if the value is constexpr. (Passing
-        # ``(n_tile == 0)`` from a runtime ``range(n_block_max)`` loop gives
-        # the const_expr a dynamic value and the kernel fails to JIT.)
+        # path can only emit that branch if the value is constexpr.
+        #
+        # 2-stage K pipelining: the initial K prefetch (above) lands in stage 0
+        # (sK0), so iter 0 reads stage 0 while issuing the next-K prefetch into
+        # stage 1. Subsequent iterations alternate. We dispatch ``curr_stage``
+        # as a constexpr by branching on the runtime ``n_tile`` parity inside
+        # the loop -- both paths get JIT-compiled.
         basic_params.n_block = n_block_max - 1
         self.compute_one_n_block(
             basic_params, mma_params, gmem_copy_params, smem_copy_params,
             softmax_params,
             is_first_n_block=True,
+            curr_stage=0,
         )
         for n_tile in range(1, n_block_max, 1):
             n_block = n_block_max - n_tile - 1
             basic_params.n_block = n_block
-            self.compute_one_n_block(
-                basic_params, mma_params, gmem_copy_params, smem_copy_params,
-                softmax_params,
-                is_first_n_block=False,
-            )
+            if (n_tile % 2) == 1:
+                self.compute_one_n_block(
+                    basic_params, mma_params, gmem_copy_params,
+                    smem_copy_params, softmax_params,
+                    is_first_n_block=False,
+                    curr_stage=1,
+                )
+            else:
+                self.compute_one_n_block(
+                    basic_params, mma_params, gmem_copy_params,
+                    smem_copy_params, softmax_params,
+                    is_first_n_block=False,
+                    curr_stage=0,
+                )
 
         # ---- Epilogue: normalize, write back ---------------------------------
         self.normalize_softmax(acc_O, row_sum)
@@ -563,6 +667,11 @@ class FmhaSm80(FmhaBase):
     # ------------------------------------------------------------------------
     # Inner per-N-tile compute (QK MMA + bias add + softmax + V MMA)
     # ------------------------------------------------------------------------
+    # 2-stage K cp.async pipelining: ``curr_stage`` (constexpr 0/1) selects
+    # which sK buffer holds the current K data; the next-K prefetch is issued
+    # *before* the QK gemm into the opposite stage's buffer so cp.async
+    # overlaps with the MMA. The host launcher alternates stages per
+    # iteration (peeled iter 0 = stage 0, then 1, 0, 1, 0, ...).
     @cute.jit
     def compute_one_n_block(
         self,
@@ -572,6 +681,7 @@ class FmhaSm80(FmhaBase):
         smem_copy_params: SimpleNamespace,
         softmax_params: SimpleNamespace,
         is_first_n_block: cutlass.Constexpr,
+        curr_stage: cutlass.Constexpr,
     ):
         acc_shape_S = mma_params.thr_mma.partition_shape_C(
             (self._m_block_size, self._n_block_size)
@@ -579,39 +689,84 @@ class FmhaSm80(FmhaBase):
         acc_S = cute.make_rmem_tensor(acc_shape_S, cutlass.Float32)
         acc_S.fill(0.0)
 
-        # Wait for K (and Bias if applicable) prefetch.
+        # Pick per-stage K partitions.
+        if cutlass.const_expr(curr_stage == 0):
+            tSsK_curr = smem_copy_params.tSsK0
+            tSrK_curr = mma_params.tSrK0
+            tSrK_curr_copy_view = smem_copy_params.tSrK0_copy_view
+            tKsK_next = gmem_copy_params.tKsK1
+            sK_next = gmem_copy_params.sK1
+        else:
+            tSsK_curr = smem_copy_params.tSsK1
+            tSrK_curr = mma_params.tSrK1
+            tSrK_curr_copy_view = smem_copy_params.tSrK1_copy_view
+            tKsK_next = gmem_copy_params.tKsK0
+            sK_next = gmem_copy_params.sK0
+
+        # Wait for K(curr) -- the cp.async issued in the previous iteration
+        # (or the initial prefetch for iter 0). At this point only the K
+        # group is pending so wait_group(0) drains everything.
         cute.arch.cp_async_wait_group(0)
         self.cta_sync_barrier.arrive_and_wait()
 
         # Stage V for this n_block; on the first iteration we predicate K-residue.
-        if is_first_n_block:
-            for n in cutlass.range_constexpr(cute.size(gmem_copy_params.tVsV.shape[1])):
-                if cute.elem_less(
-                    gmem_copy_params.tKVcKV[0, n, 0][2],
-                    basic_params.mK.layout.shape[2],
-                ):
-                    cute.copy(
-                        gmem_copy_params.gmem_tiled_copy_QKV,
-                        gmem_copy_params.tVgV[None, n, None, basic_params.n_block],
-                        gmem_copy_params.tVsV[None, n, None],
-                        pred=gmem_copy_params.tKVpKV[None, n, None],
-                    )
-                else:
-                    gmem_copy_params.tVsV[None, n, None].fill(0.0)
+        if cutlass.const_expr(not self._paged):
+            if is_first_n_block:
+                for n in cutlass.range_constexpr(cute.size(gmem_copy_params.tVsV.shape[1])):
+                    if cute.elem_less(
+                        gmem_copy_params.tKVcKV[0, n, 0][2],
+                        basic_params.mK.layout.shape[2],
+                    ):
+                        cute.copy(
+                            gmem_copy_params.gmem_tiled_copy_QKV,
+                            gmem_copy_params.tVgV[None, n, None, basic_params.n_block],
+                            gmem_copy_params.tVsV[None, n, None],
+                            pred=gmem_copy_params.tKVpKV[None, n, None],
+                        )
+                    else:
+                        gmem_copy_params.tVsV[None, n, None].fill(0.0)
+            else:
+                cute.copy(
+                    gmem_copy_params.gmem_tiled_copy_QKV,
+                    gmem_copy_params.tVgV[None, None, None, basic_params.n_block],
+                    gmem_copy_params.tVsV,
+                    pred=gmem_copy_params.tKVpKV,
+                )
         else:
-            cute.copy(
+            self._paged_load_kv_tile(
+                basic_params.mV, gmem_copy_params.sV,
+                basic_params.mBlockTable,
+                basic_params.batch_size, basic_params.kv_head,
+                basic_params.n_block,
+                gmem_copy_params.gmem_thr_copy_QKV,
                 gmem_copy_params.gmem_tiled_copy_QKV,
-                gmem_copy_params.tVgV[None, None, None, basic_params.n_block],
-                gmem_copy_params.tVsV,
-                pred=gmem_copy_params.tKVpKV,
             )
         cute.arch.cp_async_commit_group()
 
-        # ---- QK GEMM ---------------------------------------------------------
-        # NB: the K prefetch for the next n_block must NOT be issued before the
-        # QK gemm finishes -- the cp.async writes the same sK that the gemm
-        # reads from, racing with ldmatrix on the existing K. The reference
-        # FA2 issues the prefetch after the gemm, so we do the same.
+        # Issue NEXT K prefetch BEFORE the QK gemm. Writes go to the opposite
+        # stage's sK buffer (sK_next), so there's no race with the QK gemm
+        # reading sK_curr. This is the FA2 2-stage pipelining trick: the
+        # cp.async runs concurrently with the MMA below.
+        if basic_params.n_block > 0:
+            if cutlass.const_expr(not self._paged):
+                cute.copy(
+                    gmem_copy_params.gmem_tiled_copy_QKV,
+                    gmem_copy_params.tKgK[None, None, None, basic_params.n_block - 1],
+                    tKsK_next,
+                    pred=gmem_copy_params.tKVpKV,
+                )
+            else:
+                self._paged_load_kv_tile(
+                    basic_params.mK, sK_next,
+                    basic_params.mBlockTable,
+                    basic_params.batch_size, basic_params.kv_head,
+                    basic_params.n_block - 1,
+                    gmem_copy_params.gmem_thr_copy_QKV,
+                    gmem_copy_params.gmem_tiled_copy_QKV,
+                )
+            cute.arch.cp_async_commit_group()
+
+        # ---- QK GEMM (reads sK_curr, runs concurrently with cp.asyncs) ------
         cute.copy(
             smem_copy_params.smem_tiled_copy_Q,
             smem_copy_params.tSsQ[None, None, 0],
@@ -619,8 +774,8 @@ class FmhaSm80(FmhaBase):
         )
         cute.copy(
             smem_copy_params.smem_tiled_copy_K,
-            smem_copy_params.tSsK[None, None, 0],
-            smem_copy_params.tSrK_copy_view[None, None, 0],
+            tSsK_curr[None, None, 0],
+            tSrK_curr_copy_view[None, None, 0],
         )
         for k in cutlass.range_constexpr(cute.size(smem_copy_params.tSsQ.shape[2])):
             k_next = (k + 1) % cute.size(smem_copy_params.tSsQ.shape[2])
@@ -631,28 +786,23 @@ class FmhaSm80(FmhaBase):
             )
             cute.copy(
                 smem_copy_params.smem_tiled_copy_K,
-                smem_copy_params.tSsK[None, None, k_next],
-                smem_copy_params.tSrK_copy_view[None, None, k_next],
+                tSsK_curr[None, None, k_next],
+                tSrK_curr_copy_view[None, None, k_next],
             )
             cute.gemm(
                 mma_params.tiled_mma, acc_S,
                 mma_params.tSrQ[None, None, k],
-                mma_params.tSrK[None, None, k], acc_S,
+                tSrK_curr[None, None, k], acc_S,
             )
 
-        cute.arch.cp_async_wait_group(0)
-        self.cta_sync_barrier.arrive_and_wait()
-
-        # Prefetch the next n_block of K (in reverse order). Issued after the
-        # QK gemm so the cp.async writes don't race with smem K reads above.
+        # Wait for V. If next-K was also issued, leave it in flight
+        # (wait_group(1) keeps the K group pending for the next iter).
+        # If not (last iter, n_block == 0), drain everything.
         if basic_params.n_block > 0:
-            cute.copy(
-                gmem_copy_params.gmem_tiled_copy_QKV,
-                gmem_copy_params.tKgK[None, None, None, basic_params.n_block - 1],
-                gmem_copy_params.tKsK,
-                pred=gmem_copy_params.tKVpKV,
-            )
-            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(1)
+        else:
+            cute.arch.cp_async_wait_group(0)
+        self.cta_sync_barrier.arrive_and_wait()
 
         # ---- Bias add (per-tile, after QK MMA, before softmax) --------------
         # Kernel matches SDPA semantics: ``attn_bias`` is treated as a
@@ -706,6 +856,47 @@ class FmhaSm80(FmhaBase):
             )
 
     # ------------------------------------------------------------------------
+    # Paged K/V load: gather ``blocks_per_n_tile`` consecutive logical
+    # block-IDs from the block table and issue per-sub-block cp.async copies
+    # into ``sKV``. ``head_dim % 32 == 0`` is enforced by ``can_implement``
+    # so head_dim == head_dim_padded and no per-element head-axis predicate
+    # is required.
+    # ------------------------------------------------------------------------
+    @cute.jit
+    def _paged_load_kv_tile(
+        self,
+        mKV: cute.Tensor,             # (num_blocks, block_size, H_kv, D)
+        sKV: cute.Tensor,             # (N_BLOCK, head_dim_padded) smem
+        mBlockTable: cute.Tensor,     # (B, max_blocks_per_seq) int32
+        batch_size: cutlass.Int32,
+        kv_head: cutlass.Int32,
+        n_block: cutlass.Int32,
+        gmem_thr_copy_QKV: cute.TiledCopy,
+        gmem_tiled_copy_QKV: cute.TiledCopy,
+    ):
+        block_size = self._block_size
+        head_dim_padded = self._head_dim_padded
+        n_logical_base = n_block * self._blocks_per_n_tile
+        for i in cutlass.range_constexpr(self._blocks_per_n_tile):
+            phys = mBlockTable[batch_size, n_logical_base + i]
+            # Slice (block_size, head_dim) view of one physical block for this
+            # KV head. With head_dim % 32 == 0 the gmem tile shape exactly
+            # matches the smem sub-tile so no head_dim predicate is needed.
+            gKV_block = cute.local_tile(
+                mKV[phys, None, kv_head, None],
+                (block_size, head_dim_padded),
+                (0, 0),
+            )
+            sKV_sub = cute.local_tile(
+                sKV,
+                (block_size, head_dim_padded),
+                (i, 0),
+            )
+            tKVgKV = gmem_thr_copy_QKV.partition_S(gKV_block)
+            tKVsKV = gmem_thr_copy_QKV.partition_D(sKV_sub)
+            cute.copy(gmem_tiled_copy_QKV, tKVgKV, tKVsKV)
+
+    # ------------------------------------------------------------------------
     # Bias tile: read gmem bias[b, h, q_row, k_col] and add into acc_S.
     # ------------------------------------------------------------------------
     # We do a direct gmem read per accumulator element instead of staging
@@ -736,13 +927,16 @@ class FmhaSm80(FmhaBase):
         acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
 
         # Per-tile (q_row, k_col) coords for bounds checking. Out-of-bounds
-        # entries (q_row >= T_q or k_col >= T_k) are skipped -- the softmax
-        # masking path will set these acc_S slots to -inf anyway.
+        # entries (q_row >= T_q or k_col >= T_kv_logical) are skipped -- the
+        # softmax masking path will set these acc_S slots to -inf anyway.
+        # mBias.shape[3] is the logical kv extent in both modes (caller
+        # always sizes it that way), so it is the correct bound regardless
+        # of whether mK is dense or paged.
         mcS = cute.make_identity_tensor(
             (basic_params.mQ.shape[0],
              basic_params.mQ.shape[1],
              basic_params.mQ.shape[2],
-             basic_params.mK.shape[2])
+             basic_params.mBias.shape[3])
         )
         cS = cute.local_tile(
             mcS[basic_params.batch_size, basic_params.num_head, None, None],
@@ -766,7 +960,7 @@ class FmhaSm80(FmhaBase):
             if row_in_bounds:
                 for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
                     if cute.elem_less(
-                        tScS_mn[r, c][3], basic_params.mK.shape[2]
+                        tScS_mn[r, c][3], basic_params.mBias.shape[3]
                     ):
                         acc_S_mn[r, c] = (
                             acc_S_mn[r, c]
@@ -794,12 +988,15 @@ class FmhaSm80(FmhaBase):
             )
             cute.basic_copy(softmax_params.row_max, row_max_prev)
 
-        # Per-tile (q_row, k_col) coords for length masking.
+        # Per-tile (q_row, k_col) coords for length masking. The kv axis
+        # uses the *logical* kv extent (``t_kv_logical``) so that
+        # ``tScS_mn[..., 3]`` is the logical k position regardless of
+        # whether K/V live in a dense tensor or a paged pool.
         mcS = cute.make_identity_tensor(
             (basic_params.mQ.shape[0],   # B
              basic_params.mQ.shape[1],   # H
              basic_params.mQ.shape[2],   # T_q
-             basic_params.mK.shape[2])   # T_k
+             basic_params.t_kv_logical)  # logical T_kv
         )
         cS = cute.local_tile(
             mcS[basic_params.batch_size, basic_params.num_head, None, None],
@@ -809,10 +1006,9 @@ class FmhaSm80(FmhaBase):
         tScS = mma_params.thr_mma.partition_C(cS)
         tScS_mn = self._make_acc_tensor_mn_view(tScS)
 
-        # Per-stream length mask. The host wrapper *always* passes a (B,)
-        # int32 ``mCacheSeqlens`` -- in offline mode it's filled with T_k so
-        # the per-tile mask collapses to the tail-residue mask without
-        # needing a runtime rank check inside the kernel.
+        # Per-stream length mask. Always-on: the column compare also serves
+        # as the T_k tail-residue mask (in offline mode, ``mCacheSeqlens``
+        # is filled with T_k so columns >= T_k get masked to -inf).
         # NB: ``cute.elem_less`` rejects register values like
         # ``cutlass.Int32(...)`` -- pass coord-type values directly.
         cache_len = basic_params.mCacheSeqlens[basic_params.batch_size]

@@ -27,13 +27,12 @@ Removed in this revision (relative to the WeNet-port era):
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
+from oasr.cache.paged_kv import PagedKVCache
 
 
 # Dense KV cache pair ``(K_cached, V_cached)`` used by the legacy
@@ -41,185 +40,6 @@ from torch import nn
 # ``(B, n_kv_head, T_cached, head_dim)``. New chunks concatenate along the
 # time axis to produce the next cache.
 T_CACHE = Tuple[torch.Tensor, torch.Tensor]
-
-
-# ---------------------------------------------------------------------------
-# Paged KV cache descriptor
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class PagedKVCache:
-    """Per-layer paged KV cache descriptor.
-
-    All tensors except ``k_cache`` / ``v_cache`` are shared across encoder
-    layers within the same forward call (one ``block_table`` and one
-    ``cache_seqlens`` per stream batch).
-
-    Attributes
-    ----------
-    k_cache, v_cache : Tensor
-        ``(max_num_blocks, block_size, n_kv_head, head_dim)`` views into the
-        block pool for one encoder layer.
-    block_table : Tensor
-        ``(B, max_blocks_per_seq)`` int32 — per-stream logical → physical
-        block mapping.
-    cache_seqlens : Tensor
-        ``(B,)`` int32 — committed K/V frames in the pool **before** the
-        current chunk's K/V write. Lives on the same device as ``k_cache``.
-    block_size : int
-        Frames per physical block (= ``block_size_frames`` in
-        :class:`~oasr.cache.types.CacheConfig`).
-    host_seqlen_max : int
-        Host-side mirror of ``cache_seqlens.max().item()`` so the encoder
-        can compute the kernel's max key-sequence length without a per-step
-        D2H sync (the engine already tracks ``Request.offset`` on the host).
-    """
-
-    k_cache: torch.Tensor
-    v_cache: torch.Tensor
-    block_table: torch.Tensor
-    cache_seqlens: torch.Tensor
-    block_size: int
-    host_seqlen_max: int = 0
-    # When set (>=0), every stream in this batch shares this offset, so
-    # the paged write can take the cheap scalar-offset fast path and the
-    # per-stream length mask collapses to "no mask" (all streams have
-    # ``T_kv_max`` valid frames). ``-1`` falls back to the per-stream
-    # ``cache_seqlens`` tensor and a real ``BlockMask``.
-    host_seqlen_homogeneous: int = -1
-    # FlexAttention BlockMask, shared across encoder layers within one
-    # ``forward_chunk_paged`` call. Built once by the encoder before the
-    # layer loop (depends only on ``cache_seqlens``, ``T_q``, ``T_kv_max``)
-    # and attached to every per-layer ``PagedKVCache`` so the attention
-    # layer doesn't pay 12× the construction cost. ``None`` means full
-    # attention with no masking (homogeneous-offset case).
-    block_mask: Optional[Any] = None
-
-
-# ---------------------------------------------------------------------------
-# Paged-cache write / gather helpers
-# ---------------------------------------------------------------------------
-
-
-def _paged_write_kv(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    offsets: Union[int, torch.Tensor],
-    new_k: torch.Tensor,
-    new_v: torch.Tensor,
-) -> None:
-    """Write new K/V frames into the paged pool.
-
-    Parameters
-    ----------
-    k_cache, v_cache : Tensor
-        Per-layer pool views ``(max_blocks, block_size, n_kv_head, head_dim)``.
-    block_table : Tensor
-        ``(B, max_blocks_per_seq)`` int32 — one row per stream.
-    offsets : int or Tensor
-        Logical write offset. ``int`` (homogeneous case): every stream
-        writes at the same offset; uses a cheap row-slice fast path with
-        no D2H sync. ``(B,)`` int Tensor (heterogeneous case): per-stream
-        offsets dispatched via a vectorised scatter.
-    new_k, new_v : Tensor
-        ``(B, n_kv_head, T, head_dim)`` head-first new K/V to write.
-    """
-    B, _, T, _ = new_k.shape
-    H_kv = new_k.size(1)
-    D = new_k.size(3)
-    block_size = k_cache.size(1)
-
-    # Frame-major layout matching the pool's per-block tile.
-    k_data = new_k.permute(0, 2, 1, 3).contiguous()  # (B, T, H_kv, D)
-    v_data = new_v.permute(0, 2, 1, 3).contiguous()
-
-    if isinstance(offsets, int):
-        # Homogeneous fast path — same as the pre-cohort-relax code.
-        blk_logical = offsets // block_size
-        blk_offset = offsets % block_size
-        if blk_offset + T <= block_size:
-            phys_blks = block_table[:, blk_logical].long()  # (B,)
-            k_cache[phys_blks, blk_offset: blk_offset + T] = k_data
-            v_cache[phys_blks, blk_offset: blk_offset + T] = v_data
-        else:
-            first_n = block_size - blk_offset
-            phys_blks = block_table[:, blk_logical].long()
-            phys_blks_next = block_table[:, blk_logical + 1].long()
-            k_cache[phys_blks, blk_offset:block_size] = k_data[:, :first_n]
-            v_cache[phys_blks, blk_offset:block_size] = v_data[:, :first_n]
-            k_cache[phys_blks_next, 0: T - first_n] = k_data[:, first_n:]
-            v_cache[phys_blks_next, 0: T - first_n] = v_data[:, first_n:]
-        return
-
-    # Heterogeneous-offset scatter.
-    arange_T = torch.arange(T, device=offsets.device, dtype=offsets.dtype)
-    time_pos = offsets.unsqueeze(1) + arange_T.unsqueeze(0)  # (B, T)
-    blk_logical_t = (time_pos // block_size).long()
-    blk_offset_t = (time_pos % block_size).long()
-
-    phys_blk = torch.gather(block_table.long(), dim=1, index=blk_logical_t)
-    flat_idx = (phys_blk * block_size + blk_offset_t).view(-1)
-
-    k_flat = k_cache.view(-1, H_kv, D)
-    v_flat = v_cache.view(-1, H_kv, D)
-    k_flat[flat_idx] = k_data.view(B * T, H_kv, D)
-    v_flat[flat_idx] = v_data.view(B * T, H_kv, D)
-
-
-def _paged_gather_kv(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    max_total_kv: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Gather the first ``max_total_kv`` K/V frames for every stream.
-
-    Streams whose actual valid length is < ``max_total_kv`` end up with
-    stale tail data in the gathered tensor; the FlexAttention block-mask
-    enforces per-stream length and discards it.
-
-    Returns ``(k, v)`` both shaped ``(B, n_kv_head, max_total_kv, head_dim)``.
-    """
-    B = block_table.size(0)
-    H_kv, D = k_cache.size(2), k_cache.size(3)
-    if max_total_kv == 0:
-        empty = torch.zeros(
-            B, H_kv, 0, D, dtype=k_cache.dtype, device=k_cache.device
-        )
-        return empty, empty.clone()
-
-    block_size = k_cache.size(1)
-    num_blocks = (max_total_kv + block_size - 1) // block_size
-    block_ids = block_table[:, :num_blocks].long()  # (B, num_blocks)
-
-    k_gathered = k_cache[block_ids].reshape(
-        B, num_blocks * block_size, H_kv, D
-    )[:, :max_total_kv]
-    v_gathered = v_cache[block_ids].reshape(
-        B, num_blocks * block_size, H_kv, D
-    )[:, :max_total_kv]
-    return k_gathered.permute(0, 2, 1, 3), v_gathered.permute(0, 2, 1, 3)
-
-
-# ---------------------------------------------------------------------------
-# Per-stream length → additive padding bias (SDPA paged / dense / offline)
-# ---------------------------------------------------------------------------
-
-
-def _length_to_pad_bias(
-    total_kv_lens: torch.Tensor,
-    T_kv_max: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Build a ``(B, 1, 1, T_kv_max)`` additive bias that masks each
-    stream's attention to ``[0, total_kv_lens[b])`` (``-inf`` outside).
-    """
-    arange = torch.arange(T_kv_max, device=total_kv_lens.device)
-    keep = arange.unsqueeze(0) < total_kv_lens.unsqueeze(1)  # (B, T_kv_max)
-    bias = torch.where(keep, 0.0, float("-inf")).to(dtype)
-    return bias.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, T_kv_max)
 
 
 # ---------------------------------------------------------------------------
@@ -383,20 +203,9 @@ class RelPositionMultiHeadedAttention(nn.Module):
         B: int,
         T_q: int,
     ) -> Tuple[torch.Tensor, PagedKVCache]:
-        homogeneous = cache.host_seqlen_homogeneous >= 0
-
-        # 1. Write the new K/V into the paged pool. Scalar-offset fast
-        #    path when every stream in the batch shares an offset.
-        if homogeneous:
-            _paged_write_kv(
-                cache.k_cache, cache.v_cache, cache.block_table,
-                cache.host_seqlen_homogeneous, k, v,
-            )
-        else:
-            _paged_write_kv(
-                cache.k_cache, cache.v_cache, cache.block_table,
-                cache.cache_seqlens, k, v,
-            )
+        # 1. Write the new K/V into the paged pool. The cache descriptor
+        #    owns the scatter logic.
+        cache.write_kv_chunk(k, v, offset=cache.cache_seqlens)
 
         # 2. Relative-position bias.  pos_emb: (B_pos, T_kv_max, n_feat)
         #    with T_kv_max == host_seqlen_max + T_q.
@@ -411,37 +220,49 @@ class RelPositionMultiHeadedAttention(nn.Module):
 
         matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))  # (B, H, T_q, T_kv_max)
 
-        # 3. Gather K/V from the paged pool (includes the just-written chunk).
-        k_full, v_full = _paged_gather_kv(
-            cache.k_cache, cache.v_cache, cache.block_table, T_kv_max,
-        )
-        if self.h_kv != self.h and self.h_kv != 1:
-            # Expand KV heads for grouped-query attention; SDPA broadcasts
-            # H_kv=1 (MQA) automatically, but not generic H_kv groups.
-            n_repeat = self.h // self.h_kv
-            k_full = k_full.repeat_interleave(n_repeat, dim=1)
-            v_full = v_full.repeat_interleave(n_repeat, dim=1)
-
-        # 4. Combined attn_bias = (matrix_bd + pad_bias) / sqrt(d_k); when
-        #    offsets are homogeneous every stream's valid kv length is exactly
-        #    T_kv_max so the pad bias would be all zeros and we skip its build.
+        # 3. The fmha kernel reads paged K/V directly via the block table.
+        #    Pass pool views unexpanded -- the kernel handles GQA head fan-out.
+        #    The per-stream length mask is enforced inside the kernel via
+        #    ``cache_seqlens``; no host-side pad_bias add is needed.
         scale = 1.0 / math.sqrt(self.d_k)
-        if homogeneous:
-            combined_bias = matrix_bd * scale
-        else:
-            total_kv_lens = cache.cache_seqlens + T_q  # (B,) on GPU
-            pad_bias = _length_to_pad_bias(total_kv_lens, T_kv_max, q.dtype)
-            # pad_bias is (B,1,1,T_kv_max); broadcasts against matrix_bd (B,H,T_q,T_kv_max).
-            combined_bias = (matrix_bd + pad_bias) * scale  # (B, H, T_q, T_kv_max)
+        total_kv_lens = cache.cache_seqlens + T_q  # (B,) on GPU
+        # The bias passed to fmha must already be scaled to match the
+        # post-softmax_scale logit semantics; the kernel adds bias *after*
+        # the QK*scale.
+        combined_bias = matrix_bd * scale  # (B, H, T_q, T_kv_max)
+        # Pad T_kv_max up to a multiple of block_size so block_table covers
+        # all addressable logical positions cleanly. The kernel computes its
+        # logical kv extent as ``block_table.shape[1] * block_size``; the
+        # bias must match that shape, padded with values that will be masked
+        # out by ``cache_seqlens`` anyway.
+        bs = cache.block_size
+        T_kv_padded = ((T_kv_max + bs - 1) // bs) * bs
+        if T_kv_padded > T_kv_max:
+            pad_cols = T_kv_padded - T_kv_max
+            tail = torch.zeros(
+                B, self.h, T_q, pad_cols,
+                dtype=combined_bias.dtype, device=combined_bias.device,
+            )
+            combined_bias = torch.cat([combined_bias, tail], dim=-1)
+
+        block_table_view = cache.block_table
+        # Caller may have allocated a wider block_table than needed; the
+        # kernel walks the full T_kv_padded extent.
+        max_blocks_needed = T_kv_padded // bs
+        if block_table_view.size(1) > max_blocks_needed:
+            block_table_view = block_table_view[:, :max_blocks_needed]
+
         # Local import to avoid a circular import oasr->layers->attention.
         from oasr.attention import fmha
         out = fmha(
-            q_with_bias_u, k_full, v_full,
+            q_with_bias_u, cache.k_cache, cache.v_cache,
             softmax_scale=scale,
             attn_bias=combined_bias,
+            cache_seqlens=total_kv_lens,
+            block_table=block_table_view,
         )  # (B, H, T_q, d_k)
 
-        # 5. Output projection.
+        # 4. Output projection.
         out = out.transpose(1, 2).contiguous().view(B, T_q, self.h * self.d_k)
         return self.linear_out(out), cache
 
@@ -527,7 +348,6 @@ class RelPositionMultiHeadedAttention(nn.Module):
 
 
 __all__ = [
-    "PagedKVCache",
     "RelPositionMultiHeadedAttention",
     "T_CACHE",
 ]
