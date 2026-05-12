@@ -2,17 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """SM120 fused multi-head attention (CuteDSL).
 
-Backend for consumer Blackwell (RTX 50xx, sm_120). SM120 reuses the SM80
-m16n8k16 / cp.async path.
+Backend for consumer Blackwell (RTX 50xx, sm_120). Reuses the SM80 mainloop
+verbatim; the only difference is the 99 KB smem cap.
 """
 
-from .fmha_sm80 import FmhaSm80
+from .fmha_fwd_sm80 import FmhaForwardSm80
 
 
-class FmhaSm120(FmhaSm80):
-    """SM120 FMHA kernel -- SM80 kernel body, SM120-sized smem budget.
-    """
+class FmhaSm120(FmhaForwardSm80):
+    """SM120 FMHA forward -- SM80 kernel body, SM120-sized smem budget."""
 
     arch = 120
-
     _smem_arch_str = "sm_120"

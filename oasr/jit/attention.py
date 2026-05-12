@@ -51,6 +51,11 @@ def _read_backend_mode() -> str:
 
 _BACKEND_MODE = _read_backend_mode()
 
+# Resolved at module load (or first call from a test that flipped the env)
+# so the steady-state ``select_backend()`` call is a bare attribute read,
+# not a functools.cache dict lookup.
+_RESOLVED_BACKEND: Optional[str] = None
+
 
 def get_backend_mode() -> str:
     """Return the currently selected backend mode (``sdpa`` / ``cute`` / ``auto``)."""
@@ -59,10 +64,11 @@ def get_backend_mode() -> str:
 
 def set_backend_mode(mode: str) -> None:
     """Override the backend mode for the rest of the process. Mostly useful in tests."""
-    global _BACKEND_MODE
+    global _BACKEND_MODE, _RESOLVED_BACKEND
     if mode not in _VALID_BACKENDS:
         raise ValueError(f"invalid backend mode {mode!r}; valid: {_VALID_BACKENDS}")
     _BACKEND_MODE = mode
+    _RESOLVED_BACKEND = None  # force re-probe on next select_backend()
     # Clear the per-config compile cache when switching modes so re-tests see the change.
     _compiled_fmha.cache_clear()
     _capability_probe.cache_clear()
@@ -120,8 +126,29 @@ def _capability_probe() -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
 
 
 def select_backend() -> str:
-    """Return ``"cute"`` or ``"sdpa"`` based on the active mode + GPU."""
-    return _capability_probe()[1]
+    """Return ``"cute"`` or ``"sdpa"`` based on the active mode + GPU.
+
+    Cached at module scope after the first call so the hot path is a bare
+    global read instead of a ``functools.cache`` dict lookup. Cleared by
+    :func:`set_backend_mode`.
+    """
+    global _RESOLVED_BACKEND
+    if _RESOLVED_BACKEND is None:
+        _RESOLVED_BACKEND = _capability_probe()[1]
+    return _RESOLVED_BACKEND
+
+
+# Resolve eagerly at module load if CUDA is sitting there ready to go --
+# this moves the one-time probe cost out of the first ``fmha()`` call.
+try:
+    import torch as _torch_probe
+    if _torch_probe.cuda.is_available():
+        _RESOLVED_BACKEND = _capability_probe()[1]
+    del _torch_probe
+except Exception:
+    # torch not importable on this host; leave _RESOLVED_BACKEND=None so
+    # the first call lazily probes.
+    pass
 
 
 # ---------------------------------------------------------------------------

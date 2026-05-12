@@ -78,6 +78,10 @@ class FmhaBase:
         has_bias: bool = False,
         paged: bool = False,
         block_size: int = 0,
+        causal: bool = False,
+        window_size_left: int = -1,
+        window_size_right: int = -1,
+        varlen: bool = False,
     ):
         if num_heads % num_kv_heads != 0:
             raise ValueError(
@@ -85,6 +89,11 @@ class FmhaBase:
             )
         if paged and block_size <= 0:
             raise ValueError(f"paged=True requires block_size > 0, got {block_size}")
+        if paged and varlen:
+            # Varlen + paged is FA's append-KV path. We do not support that
+            # combination yet -- paged streaming already encodes per-stream
+            # length via cache_seqlens.
+            raise ValueError("paged=True is mutually exclusive with varlen=True")
         self._head_dim = head_dim
         self._dtype = dtype
         self._num_heads = num_heads
@@ -93,6 +102,10 @@ class FmhaBase:
         self._has_bias = has_bias
         self._paged = paged
         self._block_size = block_size
+        self._causal = causal
+        self._window_size_left = window_size_left
+        self._window_size_right = window_size_right
+        self._varlen = varlen
 
     # --- Public introspection ------------------------------------------------
 
@@ -115,6 +128,14 @@ class FmhaBase:
     @property
     def paged(self) -> bool:
         return self._paged
+
+    @property
+    def causal(self) -> bool:
+        return self._causal
+
+    @property
+    def varlen(self) -> bool:
+        return self._varlen
 
     # --- Subclass contract ---------------------------------------------------
 

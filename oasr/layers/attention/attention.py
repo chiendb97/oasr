@@ -230,13 +230,19 @@ class RelPositionMultiHeadedAttention(nn.Module):
         # post-softmax_scale logit semantics; the kernel adds bias *after*
         # the QK*scale.
         combined_bias = matrix_bd * scale  # (B, H, T_q, T_kv_max)
-        # Pad T_kv_max up to a multiple of block_size so block_table covers
-        # all addressable logical positions cleanly. The kernel computes its
-        # logical kv extent as ``block_table.shape[1] * block_size``; the
-        # bias must match that shape, padded with values that will be masked
-        # out by ``cache_seqlens`` anyway.
+        # Pad T_kv_max up to a multiple of the kernel's N_BLOCK tile so that
+        # the kernel's per-n-tile block_table reads stay in-bounds. The
+        # kernel reads ``mBlockTable[b, n_block * (N_BLOCK/bs) + i]`` for
+        # ``i in [0, N_BLOCK/bs)`` and ``n_block in [0, ceil(seqlen_k/N_BLOCK))``,
+        # so block_table must have at least
+        # ``ceil(seqlen_k/N_BLOCK) * (N_BLOCK/bs)`` columns. Rounding
+        # T_kv_max up to a multiple of N_BLOCK satisfies that and keeps the
+        # bias / block_table shapes consistent (kernel sees
+        # ``t_kv_logical = block_table.shape[1] * bs``; bounds-checked bias
+        # tolerates the padding).
         bs = cache.block_size
-        T_kv_padded = ((T_kv_max + bs - 1) // bs) * bs
+        N_BLOCK = 64  # matches FmhaForwardSm80._n_block_size default
+        T_kv_padded = ((T_kv_max + N_BLOCK - 1) // N_BLOCK) * N_BLOCK
         if T_kv_padded > T_kv_max:
             pad_cols = T_kv_padded - T_kv_max
             tail = torch.zeros(
