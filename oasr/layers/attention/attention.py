@@ -241,7 +241,7 @@ class RelPositionMultiHeadedAttention(nn.Module):
         # ``t_kv_logical = block_table.shape[1] * bs``; bounds-checked bias
         # tolerates the padding).
         bs = cache.block_size
-        N_BLOCK = 64  # matches FmhaForwardSm80._n_block_size default
+        N_BLOCK = 64  # matches FmhaSm80._n_block_size default
         T_kv_padded = ((T_kv_max + N_BLOCK - 1) // N_BLOCK) * N_BLOCK
         if T_kv_padded > T_kv_max:
             pad_cols = T_kv_padded - T_kv_max
