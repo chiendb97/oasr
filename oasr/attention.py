@@ -579,11 +579,19 @@ def _call_cute_dsl(
     dtype_str = "float16" if q.dtype is torch.float16 else "bfloat16"
     device = q.device
 
+    # When bias is present, prefer the vectorized rmem-load path. The
+    # ``bias_aligned`` flag tells the kernel that the bias trailing-axis
+    # stride (= T_k * 2 B for fp16/bf16) is divisible by 4 B so a b32
+    # col-pair load is always safe. Falls back to a slower predicated path
+    # for odd T_k (e.g. real-world ASR T_k = 33/249 audio frames).
+    bias_aligned = attn_bias is not None and (attn_bias.size(-1) % 2 == 0)
+
     fn = get_compiled_fmha(
         head_dim=D, dtype_str=dtype_str,
         num_heads=H, num_kv_heads=H_kv,
         has_bias=(attn_bias is not None),
         paged=paged, block_size=block_size,
+        bias_aligned=bias_aligned,
     )
 
     # Q/K/V/O must have strictly canonical row-major strides; see

@@ -168,6 +168,7 @@ def _compiled_fmha(
     m_block: int,
     n_block: int,
     num_threads: int,
+    bias_aligned: bool = False,
 ):
     """Return a compiled CuteDSL callable for the given configuration.
 
@@ -195,18 +196,21 @@ def _compiled_fmha(
         m_block_size=m_block, n_block_size=n_block,
         num_threads=num_threads, has_bias=has_bias,
         paged=paged, block_size=block_size,
+        bias_aligned=bias_aligned,
     ):
         raise RuntimeError(
             f"{cls.__name__}.can_implement returned False for "
             f"head_dim={head_dim}, m_block={m_block}, n_block={n_block}, "
             f"num_threads={num_threads}, has_bias={has_bias}, "
-            f"paged={paged}, block_size={block_size}"
+            f"paged={paged}, block_size={block_size}, "
+            f"bias_aligned={bias_aligned}"
         )
     inst = cls(
         head_dim=head_dim, dtype=cute_dtype,
         num_heads=num_heads, num_kv_heads=num_kv_heads,
         has_bias=has_bias, paged=paged, block_size=block_size,
         m_block_size=m_block, n_block_size=n_block, num_threads=num_threads,
+        bias_aligned=bias_aligned,
     )
 
     # Build dummy descriptor tensors for cute.compile — shapes only matter for
@@ -306,6 +310,7 @@ def get_compiled_fmha(
     m_block: int = 64,
     n_block: int = 64,
     num_threads: int = 128,
+    bias_aligned: bool = False,
 ):
     """Public accessor — returns a compiled CuteDSL callable, compiling on first call."""
     cap = _capability_probe()[0]
@@ -315,6 +320,7 @@ def get_compiled_fmha(
         cap, head_dim, dtype_str, num_heads, num_kv_heads,
         has_bias, paged, block_size,
         m_block, n_block, num_threads,
+        bias_aligned,
     )
 
 

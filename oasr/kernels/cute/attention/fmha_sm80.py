@@ -100,6 +100,7 @@ class FmhaSm80(FmhaBase):
         n_block_size: int = 64,
         num_threads: int = 128,
         q_in_regs: bool = False,
+        bias_aligned: bool = False,
     ):
         super().__init__(
             head_dim=head_dim,
@@ -124,6 +125,15 @@ class FmhaSm80(FmhaBase):
         # ldmatrix instructions per n-block iter, which adds up across many
         # iters at large T_q / T_k.
         self._q_in_regs = q_in_regs
+        # Bias path optimization knob (only checked when has_bias=True).
+        # When True, the kernel assumes the bias trailing dim T_k is even
+        # (= row stride divisible by 4 B for fp16) and can issue unpredicated
+        # vectorized ``autovec_copy`` (b32 col-pair loads) into rmem.
+        # When False, falls back to a predicated element-wise ``basic_copy_if``
+        # that's slower but safe on odd T_k (e.g. real audio frame counts
+        # like 33 / 249). The wrapper computes this from
+        # ``attn_bias.size(-1) % 2 == 0``.
+        self._bias_aligned = bias_aligned
 
         if paged:
             if n_block_size % block_size != 0:
@@ -161,6 +171,7 @@ class FmhaSm80(FmhaBase):
         window_size_left: int = -1,
         window_size_right: int = -1,
         varlen: bool = False,
+        bias_aligned: bool = False,
         **_kwargs,
     ) -> bool:
         if dtype != cutlass.Float16 and dtype != cutlass.BFloat16:
@@ -936,6 +947,32 @@ class FmhaSm80(FmhaBase):
         SDPA semantics: bias is treated as a post-scale logit. The softmax
         baked into ``exp2((acc_S + bias_scaled) * scale_log2)`` collapses to
         ``exp(scale * acc_S + bias)`` once we pre-divide bias by scale.
+
+        Implementation note: bulk-loads the per-thread bias fragment from
+        gmem into rmem in one pass, then runs the add as a pure-compute
+        pass. Concentrating the gmem reads in one copy lets the JIT emit
+        ILP-friendly loads where the per-thread MMA C-partition lets it
+        (col-pair adjacent elements fold into b32 reads).
+
+        Why this matters: Triton's ``do_bench`` (used by our bench harness)
+        clears L2 between iters, so cold gmem latency on the 4 MB bias
+        tile dominates if reads are serialized inside the read-modify-write
+        of the add. The old per-element form burned ~60 us per call on
+        the (1,8,8,256,1024,64) shape.
+
+        Two paths, dispatched at compile time on the constexpr
+        ``self._bias_aligned``:
+
+        * **aligned** (``T_k`` is even — every real-world bias tensor we
+          ship): unpredicated ``cute.autovec_copy`` emits b32 col-pair loads.
+          OOB rows/cols (when ``T_q`` / ``T_k`` don't divide the tile) read
+          stale gmem; the values are harmless because ``AttentionMask.apply``
+          overwrites those acc_S slots with -inf afterwards.
+        * **unaligned** (``T_k`` is odd, e.g. 33-frame audio batches in the
+          test suite): falls back to predicated ``cute.basic_copy_if`` —
+          slower because the per-element predicate breaks vectorization,
+          but safe against the b32-vs-2-byte-aligned-row-stride fault that
+          unpredicated autovec hits.
         """
         gBias = cute.local_tile(
             mBias[batch_size, num_head, None, None],
@@ -943,26 +980,45 @@ class FmhaSm80(FmhaBase):
             (m_block, n_block),
         )
         tBias = thr_mma.partition_C(gBias)
-        tBias_mn = make_acc_mn_view(tBias)
+
+        rBias = cute.make_fragment_like(tBias, self._dtype)
+        if cutlass.const_expr(self._bias_aligned):
+            # Fast path: T_k % 2 == 0 guarantees the col-pair (2 fp16) is
+            # 4-byte aligned at every (q_row, k_col) start, so a b32 load
+            # never faults. OOB read residues are masked to -inf later.
+            cute.autovec_copy(tBias, rBias)
+        else:
+            # Safe path: build a per-element bounds predicate and use
+            # predicated copy so we never read OOB / misaligned addresses.
+            mcS = cute.make_identity_tensor(mBias.layout.shape)
+            cS = cute.local_tile(
+                mcS[batch_size, num_head, None, None],
+                (self._m_block_size, self._n_block_size),
+                (m_block, n_block),
+            )
+            tScS = thr_mma.partition_C(cS)
+            tScS_mn = make_acc_mn_view(tScS)
+
+            rBiasPred = cute.make_fragment_like(tBias, cutlass.Boolean)
+            rBiasPred_mn = make_acc_mn_view(rBiasPred)
+            for r in cutlass.range_constexpr(cute.size(rBiasPred_mn.shape[0])):
+                row_ok = cute.elem_less(tScS_mn[r, 0][2], mBias.shape[2])
+                for c in cutlass.range_constexpr(cute.size(rBiasPred_mn.shape[1])):
+                    rBiasPred_mn[r, c] = row_ok and cute.elem_less(
+                        tScS_mn[r, c][3], mBias.shape[3]
+                    )
+            rBias.fill(0)
+            cute.basic_copy_if(rBiasPred, tBias, rBias)
+
+        # Pure-compute add. On the aligned path, OOB rBias entries hold
+        # stale gmem (will be -inf masked later). On the unaligned path,
+        # OOB entries are 0 and the add is a no-op.
+        rBias_mn = make_acc_mn_view(rBias)
         acc_S_mn = make_acc_mn_view(acc_S)
-
-        # Bounds tensor for q_row / k_col so we don't read past mBias.
-        mcS = cute.make_identity_tensor(mBias.layout.shape)
-        cS = cute.local_tile(
-            mcS[batch_size, num_head, None, None],
-            (self._m_block_size, self._n_block_size),
-            (m_block, n_block),
-        )
-        tScS = thr_mma.partition_C(cS)
-        tScS_mn = make_acc_mn_view(tScS)
-
         for r in cutlass.range_constexpr(cute.size(acc_S_mn.shape[0])):
-            row_ok = cute.elem_less(tScS_mn[r, 0][2], mBias.shape[2])
-            if row_ok:
-                for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
-                    if cute.elem_less(tScS_mn[r, c][3], mBias.shape[3]):
-                        acc_S_mn[r, c] = (
-                            acc_S_mn[r, c]
-                            + cutlass.Float32(tBias_mn[r, c]) * inv_scale
-                        )
+            for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
+                acc_S_mn[r, c] = (
+                    acc_S_mn[r, c]
+                    + cutlass.Float32(rBias_mn[r, c]) * inv_scale
+                )
 
