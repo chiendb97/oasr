@@ -13,25 +13,32 @@ them. Paged-KV gather lives on the kernel class itself as
 ``self._block_size`` / ``self._head_dim_padded`` as class-level constexprs
 across runtime if-regions, which a free-standing helper struct cannot do.
 
-Key differences from the previous OASR SM80 kernel:
+Key features (Tier 2 cp.async ring matching FA's flash_fwd SM80 path):
 
-* ``num_stages = 2`` for **both** K and V cp.async (dual ``sK0/sK1`` *and*
-  dual ``sV0/sV1``). The previous kernel pipelined K only and reloaded V
-  into a single buffer each iter, which serialized V loads with the QK
-  gemm. Smem grows from 32 KB to 40 KB at ``M=N=64, D=64`` -- still well
-  under SM80's 163 KB and SM120's 99 KB caps.
+* ``num_stages`` cp.async ring for **both** K and V, default 3. Single 3D
+  ``sK`` and ``sV`` smem tensors of shape ``(N_BLOCK, head_dim, num_stages)``;
+  the iter loop indexes the active stage at runtime via ``smem_pipe_read``
+  / ``smem_pipe_write`` ``Int32`` counters that cycle mod num_stages via
+  :meth:`FmhaSm80._advance_pipeline`. Smem grows to 56 KB at
+  ``M=N=64, D=64, num_stages=3`` — still well under SM120's 99 KB cap.
+* Optional ``q_in_regs`` mode: ldmatrix Q once in the prologue, then
+  reuse sQ's smem region as ``sV`` via ``cute.recast_ptr``. Saves
+  ``num_stages * N * D * dtype_bytes`` of smem.
+* FIFO drain magic: prologue commits each stage's K then V so V's commit
+  lands between successive K commits. The iter loop's
+  ``wait_group(num_stages * 2 - 2)`` drains the oldest K right before its
+  QK gemm consumes it; later in the iter another wait drains the V right
+  before its PV gemm.
 * :class:`AttentionMask` carries the per-stream length, causal, and
-  sliding-window mask in one constexpr-flagged loop instead of an inline
-  branch tree. Causal / window-size knobs are wired through ``FmhaBase``
-  and default off, preserving current behavior.
-* Online softmax now lives in :class:`Softmax` (state + helpers). The
-  empty-row clamp (``row_max == -inf`` => 0) carries over.
+  sliding-window mask in one constexpr-flagged loop. Causal / window-size
+  knobs are wired through ``FmhaBase`` and default off.
+* Online softmax lives in :class:`Softmax`. Empty-row clamp
+  (``row_max == -inf`` => 0) carries over.
 * Paged KV uses ``_paged_load_kv_tile`` on this class. Same
   block-aligned-``n_block`` constraint as before
   (``N_BLOCK % block_size == 0``).
-* Varlen is scaffolded (constexpr ``self._varlen`` in feasibility), but the
-  kernel-side packed-tensor indexing lands in a follow-up phase along with
-  the Python wrapper rework.
+* Varlen is scaffolded (constexpr ``self._varlen`` in feasibility), but
+  the kernel-side packed-tensor indexing lands in a follow-up phase.
 """
 
 # PEP 563 (deferred annotations) breaks CuteDSL Constexpr detection;
@@ -99,6 +106,7 @@ class FmhaSm80(FmhaBase):
         m_block_size: int = 64,
         n_block_size: int = 64,
         num_threads: int = 128,
+        num_stages: int = 3,
         q_in_regs: bool = False,
         bias_aligned: bool = False,
     ):
@@ -120,10 +128,29 @@ class FmhaSm80(FmhaBase):
         # Pad head_dim up to a multiple of 32 so m16n8k16 MMA k-stride works.
         self._head_dim_padded = (head_dim + 31) // 32 * 32
         self._num_threads = num_threads
-        # Tier 2: if True, ldmatrix Q to rmem once in the prologue and skip
-        # the per-iter Q ldmatrix in ``_compute_one_n_block``. Saves K_tiles
-        # ldmatrix instructions per n-block iter, which adds up across many
-        # iters at large T_q / T_k.
+        # Tier 2: cp.async ring depth for both K and V. Structurally tracks
+        # FlashAttention's ``num_stages`` knob: sK / sV are a single 3D
+        # smem tensor of shape ``(N, D, num_stages)``, indexed cyclically
+        # via Int32 ``smem_pipe_read`` / ``smem_pipe_write`` counters that
+        # the iter loop advances mod ``num_stages``. ``num_stages = 2``
+        # matches the prior 2-stage behavior; bumping to ``3`` keeps three
+        # K + (num_stages - 1) V loads inflight at steady state for deeper
+        # cp.async latency hiding (FA's expected 2-5% on compute-bound
+        # shapes). Default stays at 2 so the OASR perf envelope doesn't
+        # shift under the user.
+        if num_stages < 1:
+            raise ValueError(f"num_stages must be >= 1, got {num_stages}")
+        self._num_stages = num_stages
+        # Tier 2 (paired with the num_stages cp.async ring): when True,
+        # ldmatrix Q to rmem once in the prologue and skip the per-iter
+        # Q ldmatrix. Also opts into the sQ/sV0 smem alias path — sQ's
+        # MemRange is sized to hold the multi-stage V ring and sV is a
+        # ``cute.recast_ptr`` view of the same memory. Saves
+        # ``num_stages * N * D * dtype_bytes`` of smem (= 24 KB at
+        # num_stages=3, M=N=64, D=64, fp16). Default off because the added
+        # rmem-Q register pressure regresses small-shape latency; turn on
+        # via the constructor when smem capacity matters (e.g. D >= 128 or
+        # SM80 with num_stages >= 4).
         self._q_in_regs = q_in_regs
         # Bias path optimization knob (only checked when has_bias=True).
         # When True, the kernel assumes the bias trailing dim T_k is even
@@ -164,6 +191,7 @@ class FmhaSm80(FmhaBase):
         m_block_size: int = 64,
         n_block_size: int = 64,
         num_threads: int = 128,
+        num_stages: int = 3,
         has_bias: bool = False,
         paged: bool = False,
         block_size: int = 0,
@@ -182,6 +210,8 @@ class FmhaSm80(FmhaBase):
             return False
         if (m_block_size * 2) % num_threads != 0:
             return False
+        if num_stages < 1:
+            return False
         if paged:
             if block_size <= 0:
                 return False
@@ -195,8 +225,8 @@ class FmhaSm80(FmhaBase):
                 return False
         if causal and window_size_right == -1:
             window_size_right = 0  # causal implies right-window 0
-        # Smem budget: sQ + 2*sK + 2*sV. Bias (when has_bias) is gmem-direct,
-        # not staged through smem.
+        # Smem budget: sQ + num_stages * (sK + sV). Bias (when has_bias) is
+        # gmem-direct, not staged through smem.
         del has_bias  # not part of the smem budget
         del causal
         del window_size_left
@@ -204,8 +234,8 @@ class FmhaSm80(FmhaBase):
         del varlen
         smem_bytes = (
             m_block_size * head_dim
-            + n_block_size * head_dim * 4   # 2*sK + 2*sV
-        ) * 2                                # fp16/bf16 = 2B
+            + n_block_size * head_dim * num_stages * 2  # num_stages * (sK + sV)
+        ) * 2                                            # fp16/bf16 = 2B
         if smem_bytes > cls._smem_capacity_in_bytes():
             return False
         return True
@@ -239,37 +269,52 @@ class FmhaSm80(FmhaBase):
         self._dtype = mQ.element_type
 
         # ---- Smem layouts ----------------------------------------------------
+        # sQ stays 2D ``(M_BLOCK, head_dim)``. sK and sV are 3D
+        # ``(N_BLOCK, head_dim, num_stages)`` so the iter loop can index
+        # the ring stage at runtime via ``smem_pipe_read`` / ``write``.
+        # Structurally tracks ``FlashAttentionForwardSm80._get_shared_storage_cls``.
         sQ_atom, _smem_k_block_size = make_smem_swizzle_atom(
             self._dtype, self._head_dim_padded,
         )
         sQ_layout = make_smem_layout(
             sQ_atom, self._m_block_size, self._head_dim_padded,
         )
-        sKV_layout = make_smem_layout(
-            sQ_atom, self._n_block_size, self._head_dim_padded,
+        sK_layout = cute.tile_to_shape(
+            sQ_atom,
+            (self._n_block_size, self._head_dim_padded, self._num_stages),
+            (0, 1, 2),
         )
+        sV_layout = sK_layout
         sO_layout = sQ_layout
 
-        # 2-stage K + 2-stage V smem ring (dual ping-pong on both axes).
-        # No double-buffer alias between sQ and sV in this revision; that's
-        # a follow-on Q_in_regs optimization.
-        @cute.struct
-        class SharedStorage:
-            sQ: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024
-            ]
-            sK0: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
-            ]
-            sK1: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
-            ]
-            sV0: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
-            ]
-            sV1: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
-            ]
+        # When ``q_in_regs`` is on, sQ and sV share one ``MemRange`` sized to
+        # max(cosize(sQ), cosize(sV)). Q is written/read first (cp.async +
+        # ldmatrix), then a barrier flips ownership and the same smem holds
+        # sV's multi-stage ring. Matches FA's ``SharedStorageSharedQV``;
+        # saves ``num_stages * N * D * dtype_bytes`` of smem.
+        if cutlass.const_expr(self._q_in_regs):
+            cosize_sQV = max(cute.cosize(sQ_layout), cute.cosize(sV_layout))
+
+            @cute.struct
+            class SharedStorage:
+                sQ: cute.struct.Align[
+                    cute.struct.MemRange[self._dtype, cosize_sQV], 1024
+                ]
+                sK: cute.struct.Align[
+                    cute.struct.MemRange[self._dtype, cute.cosize(sK_layout)], 1024
+                ]
+        else:
+            @cute.struct
+            class SharedStorage:
+                sQ: cute.struct.Align[
+                    cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024
+                ]
+                sK: cute.struct.Align[
+                    cute.struct.MemRange[self._dtype, cute.cosize(sK_layout)], 1024
+                ]
+                sV: cute.struct.Align[
+                    cute.struct.MemRange[self._dtype, cute.cosize(sV_layout)], 1024
+                ]
 
         # ---- Copy atoms ------------------------------------------------------
         async_elems = async_copy_elements(self._dtype)
@@ -302,7 +347,7 @@ class FmhaSm80(FmhaBase):
         self.kernel(
             mQ, mK, mV, mO, mBias, mCacheSeqlens, mBlockTable,
             softmax_scale, softmax_scale_log2,
-            sQ_layout, sKV_layout, sO_layout,
+            sQ_layout, sK_layout, sV_layout, sO_layout,
             gmem_tiled_copy_QKV, gmem_tiled_copy_O,
             tiled_mma, SharedStorage,
         ).launch(
@@ -327,7 +372,8 @@ class FmhaSm80(FmhaBase):
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
-        sKV_layout: cute.ComposedLayout,
+        sK_layout: cute.ComposedLayout,
+        sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
         gmem_tiled_copy_QKV: cute.TiledCopy,
         gmem_tiled_copy_O: cute.TiledCopy,
@@ -386,24 +432,36 @@ class FmhaSm80(FmhaBase):
             gV = None
 
         # ---- Smem ------------------------------------------------------------
+        # Single sK / sV smem tensor with a trailing ``num_stages`` dim;
+        # the iter loop indexes the stage at runtime via the
+        # smem_pipe_read / smem_pipe_write Int32 counters. When q_in_regs is
+        # on, sV reuses sQ's smem region via ``cute.recast_ptr`` — sized to
+        # hold the multi-stage V ring (max of sQ-cosize, sV-cosize).
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQ = storage.sQ.get_tensor(sQ_layout)
-        sK0 = storage.sK0.get_tensor(sKV_layout)
-        sK1 = storage.sK1.get_tensor(sKV_layout)
-        sV0 = storage.sV0.get_tensor(sKV_layout)
-        sV1 = storage.sV1.get_tensor(sKV_layout)
-        sVt0 = make_v_transpose_view(sV0, self._head_dim_padded, self._n_block_size)
-        sVt1 = make_v_transpose_view(sV1, self._head_dim_padded, self._n_block_size)
+        sK = storage.sK.get_tensor(sK_layout)
+        if cutlass.const_expr(self._q_in_regs):
+            sV = cute.make_tensor(
+                cute.recast_ptr(sQ.iterator, dtype=self._dtype),
+                sV_layout,
+            )
+        else:
+            sV = storage.sV.get_tensor(sV_layout)
+        sVt = make_v_transpose_view(
+            sV, self._head_dim_padded, self._n_block_size,
+            num_stages=self._num_stages,
+        )
 
         # ---- Partitions ------------------------------------------------------
         gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_slice(tidx)
         tQgQ = gmem_thr_copy_QKV.partition_S(gQ)
         tQsQ = gmem_thr_copy_QKV.partition_D(sQ)
-        tKsK0 = gmem_thr_copy_QKV.partition_D(sK0)
-        tKsK1 = gmem_thr_copy_QKV.partition_D(sK1)
-        tVsV0 = gmem_thr_copy_QKV.partition_D(sV0)
-        tVsV1 = gmem_thr_copy_QKV.partition_D(sV1)
+        # tKsK / tVsV are 4D: (CPY_Atom, CPY_N, CPY_K, num_stages). Slicing
+        # the last dim with the pipe counter at issue / load time picks the
+        # active stage's smem region.
+        tKsK = gmem_thr_copy_QKV.partition_D(sK)
+        tVsV = gmem_thr_copy_QKV.partition_D(sV)
         if cutlass.const_expr(not self._paged):
             tKgK = gmem_thr_copy_QKV.partition_S(gK)
             tVgV = gmem_thr_copy_QKV.partition_S(gV)
@@ -413,11 +471,14 @@ class FmhaSm80(FmhaBase):
 
         # ---- MMA partitions / accumulators -----------------------------------
         thr_mma = tiled_mma.get_slice(tidx)
+        # Use stage 0 slice to size the rmem fragments (same shape per stage).
         tSrQ = thr_mma.make_fragment_A(thr_mma.partition_A(sQ))
-        tSrK0 = thr_mma.make_fragment_B(thr_mma.partition_B(sK0))
-        tSrK1 = thr_mma.make_fragment_B(thr_mma.partition_B(sK1))
-        tOrVt0 = thr_mma.make_fragment_B(thr_mma.partition_B(sVt0))
-        tOrVt1 = thr_mma.make_fragment_B(thr_mma.partition_B(sVt1))
+        tSrK = thr_mma.make_fragment_B(
+            thr_mma.partition_B(sK[None, None, 0])
+        )
+        tOrVt = thr_mma.make_fragment_B(
+            thr_mma.partition_B(sVt[None, None, 0])
+        )
         acc_shape_O = thr_mma.partition_shape_C(
             (self._m_block_size, self._head_dim_padded)
         )
@@ -436,14 +497,12 @@ class FmhaSm80(FmhaBase):
         smem_thr_copy_V = smem_tiled_copy_V.get_slice(tidx)
         tSsQ = smem_thr_copy_Q.partition_S(sQ)
         tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
-        tSsK0 = smem_thr_copy_K.partition_S(sK0)
-        tSsK1 = smem_thr_copy_K.partition_S(sK1)
-        tSrK0_copy_view = smem_thr_copy_K.retile(tSrK0)
-        tSrK1_copy_view = smem_thr_copy_K.retile(tSrK1)
-        tOsVt0 = smem_thr_copy_V.partition_S(sVt0)
-        tOsVt1 = smem_thr_copy_V.partition_S(sVt1)
-        tOrVt0_copy_view = smem_thr_copy_V.retile(tOrVt0)
-        tOrVt1_copy_view = smem_thr_copy_V.retile(tOrVt1)
+        # 4D ldmatrix partitions; slice the trailing dim by the pipe
+        # counter inside the gemm.
+        tSsK = smem_thr_copy_K.partition_S(sK)
+        tSrK_copy_view = smem_thr_copy_K.retile(tSrK)
+        tOsVt = smem_thr_copy_V.partition_S(sVt)
+        tOrVt_copy_view = smem_thr_copy_V.retile(tOrVt)
 
         # ---- Predicates ------------------------------------------------------
         mcQ = cute.make_identity_tensor(mQ.layout.shape)
@@ -475,8 +534,8 @@ class FmhaSm80(FmhaBase):
             tKVcKV = gmem_thr_copy_QKV.partition_S(cKV)
             tKVpKV = cute.make_rmem_tensor(
                 cute.make_layout(
-                    (tKsK0.shape[0][1], cute.size(tKsK0, mode=[1]), cute.size(tKsK0, mode=[2])),
-                    stride=(cute.size(tKsK0, mode=[2]), 0, 1),
+                    (tKsK.shape[0][1], cute.size(tKsK, mode=[1]), cute.size(tKsK, mode=[2])),
+                    stride=(cute.size(tKsK, mode=[2]), 0, 1),
                 ),
                 cutlass.Boolean,
             )
@@ -489,7 +548,27 @@ class FmhaSm80(FmhaBase):
             tKVcKV = None
             tKVpKV = None
 
-        # ---- Prefetch Q + first K -------------------------------------------
+        # ---- Prologue (FA-style cp.async ring fill) -------------------------
+        # Pattern mirrors ``FlashAttentionForwardSm80.__call__``'s prologue.
+        # FIFO drain trick: each stage commits K **before** V so V's commit
+        # lands between K's; the iter loop's
+        # ``wait_group(num_stages * 2 - 2)`` then drains exactly the oldest
+        # K (which we're about to consume), leaving the more recent K/V
+        # loads inflight.
+        #
+        # Q_in_regs ordering: when sQ/sV alias, V's cp.async writes the same
+        # smem region as Q's. So Q must be (a) drained, (b) ldmatrix'd to
+        # rmem, and (c) cross-warp synced before any V issue. We split the
+        # prologue accordingly:
+        #
+        #   1. Q -> sQ; commit
+        #   2. K[N-1] -> sK[0]; commit
+        #   3. (q_in_regs only) wait_group(num_stages * 2 - 1) drains Q;
+        #      barrier; ldmatrix Q; barrier  — sQ is now safe to alias.
+        #   4. For stage in [0, num_stages):
+        #        - if (q_in_regs and stage>0) or not q_in_regs: load_K + commit
+        #        - if stage < num_stages-1: load_V + commit
+        #   5. (no-q_in_regs) wait_group(num_stages * 2 - 1) drains Q.
         # Q (with predicates) -> sQ
         for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
             if cute.elem_less(tQcQ[0, m, 0][2], mQ.layout.shape[2]):
@@ -501,24 +580,25 @@ class FmhaSm80(FmhaBase):
                 )
             else:
                 tQsQ[None, m, None].fill(0)
-
-        # First K -> sK0 (rightmost N-tile)
-        n_block = n_block_max - 1
-        self._load_k_tile(
-            mK, sK0, tKsK0, tKgK, tKVpKV, tKVcKV,
-            mBlockTable, batch_size, kv_head, n_block,
-            gmem_thr_copy_QKV, gmem_tiled_copy_QKV,
-        )
         cute.arch.cp_async_commit_group()
 
-        # Tier 2: when ``q_in_regs`` is enabled, drain the prologue cp.async
-        # group and ldmatrix Q into the rmem fragment once. Subsequent
-        # n-block iters then skip the per-iter Q ldmatrix entirely (the
-        # gemm helper switches to ``gemm_rs`` which only loads B = K).
-        # Draining here is harmless -- iter 0's ``wait_group(0)`` becomes a
-        # no-op since K0 is also drained, and the sync barrier ordering
-        # holds. K is reloaded in the mainloop as usual.
+        n_block_init = n_block_max - 1
+
+        # Q_in_regs: load K[N-1] into sK[0] before the wait/ldmatrix Q step,
+        # then ldmatrix Q to rmem, barrier, and **only then** issue V loads
+        # (which will write to the sQ-aliased smem region).
         if cutlass.const_expr(self._q_in_regs):
+            self._load_kv_tile(
+                mK, sK, tKsK, tKgK, tKVpKV, tKVcKV,
+                mBlockTable, batch_size, kv_head,
+                n_block_init, 0,
+                gmem_thr_copy_QKV, gmem_tiled_copy_QKV,
+                need_predicates=True,
+            )
+            cute.arch.cp_async_commit_group()
+            # Drain Q + K[N-1]. With 2 commits inflight, wait_group(0) is
+            # the only safe choice (we need Q drained; K[N-1] will also
+            # drain, which is fine — its data is in sK[0] in smem).
             cute.arch.cp_async_wait_group(0)
             self.cta_sync_barrier.arrive_and_wait()
             K_tiles_q = cute.size(tSsQ.shape[2])
@@ -528,6 +608,42 @@ class FmhaSm80(FmhaBase):
                     tSsQ[None, None, k],
                     tSrQ_copy_view[None, None, k],
                 )
+            # Ensure all warps finished reading sQ before any V cp.async writes.
+            self.cta_sync_barrier.arrive_and_wait()
+
+        # Stage-loop: load K[N-1-stage] and V[N-1-stage] for each ring stage.
+        for stage in cutlass.range_constexpr(self._num_stages):
+            # K: stage 0 already loaded above in the q_in_regs path.
+            if cutlass.const_expr(not self._q_in_regs) or stage > 0:
+                if stage == 0 or n_block_init - stage >= 0:
+                    self._load_kv_tile(
+                        mK, sK, tKsK, tKgK, tKVpKV, tKVcKV,
+                        mBlockTable, batch_size, kv_head,
+                        n_block_init - stage, stage,
+                        gmem_thr_copy_QKV, gmem_tiled_copy_QKV,
+                        need_predicates=(stage == 0),
+                    )
+                cute.arch.cp_async_commit_group()
+            # V: load num_stages - 1 V stages here; the last V stage is
+            # loaded by iter 0's body.
+            if cutlass.const_expr(stage < self._num_stages - 1):
+                if stage == 0 or n_block_init - stage >= 0:
+                    self._load_kv_tile(
+                        mV, sV, tVsV, tVgV, tKVpKV, tKVcKV,
+                        mBlockTable, batch_size, kv_head,
+                        n_block_init - stage, stage,
+                        gmem_thr_copy_QKV, gmem_tiled_copy_QKV,
+                        need_predicates=(stage == 0),
+                    )
+                cute.arch.cp_async_commit_group()
+
+        # No-Q_in_regs: drain Q after all K/V issues. Total commits =
+        # 1 (Q) + num_stages (K) + (num_stages - 1) (V) = 2 * num_stages.
+        # wait_group(2 * num_stages - 1) drains 1 (= Q) and leaves the
+        # K/V's inflight for the iter loop to consume.
+        if cutlass.const_expr(not self._q_in_regs):
+            cute.arch.cp_async_wait_group(2 * self._num_stages - 1)
+            self.cta_sync_barrier.arrive_and_wait()
 
         # ---- Softmax + mask --------------------------------------------------
         softmax = Softmax.make_from_acc_O(acc_O, softmax_scale_log2)
@@ -539,29 +655,24 @@ class FmhaSm80(FmhaBase):
             has_seqlen_k=True,
             has_seqlen_q=True,
         )
-
-        # Per-batch length (``seqlen_k`` already loaded above for the
-        # tight-n_block_max calc).
         seqlen_q = mQ.shape[2]
-
-        # ---- 3-phase mainloop ------------------------------------------------
-        # Iter 0 (rightmost N-tile) is peeled out so the JIT can drop the
-        # "is_first" branches in softmax. When causal / window are off the
-        # masked-tail / unmasked-inner distinction collapses; for now every
-        # iter applies the per-stream length mask (cheap when seqlen_k is
-        # block-aligned -- the AttentionMask is constexpr-flagged and the
-        # length compare is a single Int32 elem_less per element).
         inv_scale = 1.0 / softmax_scale
+
+        # ---- Mainloop (pipe-counter cycling per FA) --------------------------
+        # ``smem_pipe_read`` selects which sK / sV stage iter n consumes;
+        # ``smem_pipe_write`` selects the slot for the next-stage's-worth
+        # of load issues. Both cycle mod num_stages via ``_advance_pipeline``.
+        smem_pipe_read = cutlass.Int32(0)
+        smem_pipe_write = cutlass.Int32(self._num_stages - 1)
 
         self._compute_one_n_block(
             mQ, mK, mV, mBias, mBlockTable,
-            tKgK, tVgV,
-            sK0, sK1, sV0, sV1,
-            tKsK0, tKsK1, tVsV0, tVsV1,
-            tSsQ, tSsK0, tSsK1, tSrQ, tSrQ_copy_view,
-            tSrK0, tSrK1, tSrK0_copy_view, tSrK1_copy_view,
-            tOrVt0, tOrVt1, tOrVt0_copy_view, tOrVt1_copy_view,
-            tOsVt0, tOsVt1,
+            tKgK, tVgV, sK, sV,
+            tKsK, tVsV,
+            tSsQ, tSsK, tSrQ, tSrQ_copy_view,
+            tSrK, tSrK_copy_view,
+            tOrVt, tOrVt_copy_view,
+            tOsVt,
             smem_tiled_copy_Q, smem_tiled_copy_K, smem_tiled_copy_V,
             gmem_tiled_copy_QKV, gmem_thr_copy_QKV,
             tKVcKV, tKVpKV,
@@ -571,61 +682,40 @@ class FmhaSm80(FmhaBase):
             t_kv_logical=t_kv_logical,
             seqlen_q=seqlen_q, seqlen_k=seqlen_k,
             inv_scale=inv_scale, m_block=m_block,
-            n_block=n_block_max - 1,
+            n_block=n_block_init,
+            smem_pipe_read=smem_pipe_read,
+            smem_pipe_write=smem_pipe_write,
             is_first=True,
-            curr_stage=0,
         )
-        # ``curr_stage`` is a constexpr (0 or 1); dispatch via if/else so the
-        # JIT specializes both branches at the call site. ``n_tile`` is a
-        # runtime value, so we cannot pass ``n_tile % 2`` as a constexpr.
+        smem_pipe_read = self._advance_pipeline(smem_pipe_read)
+        smem_pipe_write = self._advance_pipeline(smem_pipe_write)
+
         for n_tile in range(1, n_block_max, 1):
             n_block_cur = n_block_max - n_tile - 1
-            if (n_tile % 2) == 1:
-                self._compute_one_n_block(
-                    mQ, mK, mV, mBias, mBlockTable,
-                    tKgK, tVgV,
-                    sK0, sK1, sV0, sV1,
-                    tKsK0, tKsK1, tVsV0, tVsV1,
-                    tSsQ, tSsK0, tSsK1, tSrQ, tSrQ_copy_view,
-                    tSrK0, tSrK1, tSrK0_copy_view, tSrK1_copy_view,
-                    tOrVt0, tOrVt1, tOrVt0_copy_view, tOrVt1_copy_view,
-                    tOsVt0, tOsVt1,
-                    smem_tiled_copy_Q, smem_tiled_copy_K, smem_tiled_copy_V,
-                    gmem_tiled_copy_QKV, gmem_thr_copy_QKV,
-                    tKVcKV, tKVpKV,
-                    tiled_mma, thr_mma, acc_O,
-                    softmax, mask,
-                    batch_size, kv_head, num_head,
-                    t_kv_logical=t_kv_logical,
-                    seqlen_q=seqlen_q, seqlen_k=seqlen_k,
-                    inv_scale=inv_scale, m_block=m_block,
-                    n_block=n_block_cur,
-                    is_first=False,
-                    curr_stage=1,
-                )
-            else:
-                self._compute_one_n_block(
-                    mQ, mK, mV, mBias, mBlockTable,
-                    tKgK, tVgV,
-                    sK0, sK1, sV0, sV1,
-                    tKsK0, tKsK1, tVsV0, tVsV1,
-                    tSsQ, tSsK0, tSsK1, tSrQ, tSrQ_copy_view,
-                    tSrK0, tSrK1, tSrK0_copy_view, tSrK1_copy_view,
-                    tOrVt0, tOrVt1, tOrVt0_copy_view, tOrVt1_copy_view,
-                    tOsVt0, tOsVt1,
-                    smem_tiled_copy_Q, smem_tiled_copy_K, smem_tiled_copy_V,
-                    gmem_tiled_copy_QKV, gmem_thr_copy_QKV,
-                    tKVcKV, tKVpKV,
-                    tiled_mma, thr_mma, acc_O,
-                    softmax, mask,
-                    batch_size, kv_head, num_head,
-                    t_kv_logical=t_kv_logical,
-                    seqlen_q=seqlen_q, seqlen_k=seqlen_k,
-                    inv_scale=inv_scale, m_block=m_block,
-                    n_block=n_block_cur,
-                    is_first=False,
-                    curr_stage=0,
-                )
+            self._compute_one_n_block(
+                mQ, mK, mV, mBias, mBlockTable,
+                tKgK, tVgV, sK, sV,
+                tKsK, tVsV,
+                tSsQ, tSsK, tSrQ, tSrQ_copy_view,
+                tSrK, tSrK_copy_view,
+                tOrVt, tOrVt_copy_view,
+                tOsVt,
+                smem_tiled_copy_Q, smem_tiled_copy_K, smem_tiled_copy_V,
+                gmem_tiled_copy_QKV, gmem_thr_copy_QKV,
+                tKVcKV, tKVpKV,
+                tiled_mma, thr_mma, acc_O,
+                softmax, mask,
+                batch_size, kv_head, num_head,
+                t_kv_logical=t_kv_logical,
+                seqlen_q=seqlen_q, seqlen_k=seqlen_k,
+                inv_scale=inv_scale, m_block=m_block,
+                n_block=n_block_cur,
+                smem_pipe_read=smem_pipe_read,
+                smem_pipe_write=smem_pipe_write,
+                is_first=False,
+            )
+            smem_pipe_read = self._advance_pipeline(smem_pipe_read)
+            smem_pipe_write = self._advance_pipeline(smem_pipe_write)
 
         # ---- Epilogue --------------------------------------------------------
         softmax.finalize(acc_O)
@@ -683,6 +773,15 @@ class FmhaSm80(FmhaBase):
                     pred=tOpO[None, rest_m, None],
                 )
 
+    @cute.jit
+    def _advance_pipeline(self, pipeline_index):
+        """``(pipeline_index + 1) % num_stages`` for the cp.async ring."""
+        return (
+            pipeline_index + 1
+            if pipeline_index < self._num_stages - 1
+            else cutlass.Int32(0)
+        )
+
     # ------------------------------------------------------------------------
     # Per-N-tile compute
     # ------------------------------------------------------------------------
@@ -690,13 +789,12 @@ class FmhaSm80(FmhaBase):
     def _compute_one_n_block(
         self,
         mQ, mK, mV, mBias, mBlockTable,
-        tKgK, tVgV,
-        sK0, sK1, sV0, sV1,
-        tKsK0, tKsK1, tVsV0, tVsV1,
-        tSsQ, tSsK0, tSsK1, tSrQ, tSrQ_copy_view,
-        tSrK0, tSrK1, tSrK0_copy_view, tSrK1_copy_view,
-        tOrVt0, tOrVt1, tOrVt0_copy_view, tOrVt1_copy_view,
-        tOsVt0, tOsVt1,
+        tKgK, tVgV, sK, sV,
+        tKsK, tVsV,
+        tSsQ, tSsK, tSrQ, tSrQ_copy_view,
+        tSrK, tSrK_copy_view,
+        tOrVt, tOrVt_copy_view,
+        tOsVt,
         smem_tiled_copy_Q, smem_tiled_copy_K, smem_tiled_copy_V,
         gmem_tiled_copy_QKV, gmem_thr_copy_QKV,
         tKVcKV, tKVpKV,
@@ -709,128 +807,109 @@ class FmhaSm80(FmhaBase):
         inv_scale: cutlass.Float32,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
+        smem_pipe_read: cutlass.Int32,
+        smem_pipe_write: cutlass.Int32,
         is_first: cutlass.Constexpr,
-        curr_stage: cutlass.Constexpr,
     ):
-        # Select per-stage K / V partition views.
-        if cutlass.const_expr(curr_stage == 0):
-            tSsK_curr = tSsK0
-            tSrK_curr = tSrK0
-            tSrK_curr_copy_view = tSrK0_copy_view
-            tKsK_next = tKsK1
-            sK_next = sK1
-            tVsV_curr = tVsV0
-            tOsVt_curr = tOsVt0
-            tOrVt_curr = tOrVt0
-            tOrVt_curr_copy_view = tOrVt0_copy_view
-            sV_curr = sV0
-        else:
-            tSsK_curr = tSsK1
-            tSrK_curr = tSrK1
-            tSrK_curr_copy_view = tSrK1_copy_view
-            tKsK_next = tKsK0
-            sK_next = sK0
-            tVsV_curr = tVsV1
-            tOsVt_curr = tOsVt1
-            tOrVt_curr = tOrVt1
-            tOrVt_curr_copy_view = tOrVt1_copy_view
-            sV_curr = sV1
+        """One N-tile of S/O processing.
 
-        # ---- Wait for K(curr); stage V(curr) + K(next) cp.async --------
-        cute.arch.cp_async_wait_group(0)
-        self.cta_sync_barrier.arrive_and_wait()
+        Structurally tracks ``FlashAttentionForwardSm80.compute_one_n_block``:
+        the iter has two ``wait_group(num_stages*2 - 2)`` syncs — one
+        before the QK gemm to drain the K we're about to consume, one
+        before the PV gemm to drain the V we're about to consume. Between
+        the QK gemm and the PV gemm the iter issues the V_next (look-ahead
+        ``num_stages - 1`` blocks ahead) and the K_next (look-ahead
+        ``num_stages`` blocks ahead) cp.asyncs into the slots picked by
+        ``smem_pipe_write``.
+        """
+        # Sync helper — leaves (num_stages*2 - 2) groups inflight, drains 1.
+        # For num_stages=2: wait_group(2) keeps 2 groups inflight. For
+        # num_stages=3: wait_group(4) keeps 4. The FIFO order guarantees
+        # the drained group is the one whose data we're about to read.
+        wait_count = self._num_stages * 2 - 2
 
-        # V(curr) load (first-tile predicate on K-residue).
-        if cutlass.const_expr(not self._paged):
-            if is_first:
-                for n in cutlass.range_constexpr(cute.size(tVsV_curr.shape[1])):
-                    if cute.elem_less(tKVcKV[0, n, 0][2], mK.layout.shape[2]):
-                        cute.copy(
-                            gmem_tiled_copy_QKV,
-                            tVgV[None, n, None, n_block],
-                            tVsV_curr[None, n, None],
-                            pred=tKVpKV[None, n, None],
-                        )
-                    else:
-                        tVsV_curr[None, n, None].fill(0.0)
-            else:
-                cute.copy(
-                    gmem_tiled_copy_QKV,
-                    tVgV[None, None, None, n_block],
-                    tVsV_curr,
-                    pred=tKVpKV,
-                )
-        else:
-            self._paged_load_kv_tile(
-                mV, sV_curr, mBlockTable,
-                batch_size, kv_head, n_block,
-                gmem_thr_copy_QKV, gmem_tiled_copy_QKV,
-            )
-        cute.arch.cp_async_commit_group()
-
-        # K(next) prefetch — runs concurrently with the QK gemm below.
-        if n_block > 0:
-            if cutlass.const_expr(not self._paged):
-                cute.copy(
-                    gmem_tiled_copy_QKV,
-                    tKgK[None, None, None, n_block - 1],
-                    tKsK_next,
-                    pred=tKVpKV,
-                )
-            else:
-                self._paged_load_kv_tile(
-                    mK, sK_next, mBlockTable,
-                    batch_size, kv_head, n_block - 1,
-                    gmem_thr_copy_QKV, gmem_tiled_copy_QKV,
-                )
-            cute.arch.cp_async_commit_group()
-
-        # ---- QK gemm (reads sK_curr; overlaps with V + K(next) cp.async) ----
         acc_shape_S = thr_mma.partition_shape_C(
             (self._m_block_size, self._n_block_size)
         )
         acc_S = cute.make_rmem_tensor(acc_shape_S, cutlass.Float32)
         acc_S.fill(0.0)
+
+        # Drain the K[n_block] cp.async (oldest in flight).
+        cute.arch.cp_async_wait_group(wait_count)
+        self.cta_sync_barrier.arrive_and_wait()
+
+        # Issue V_next = V[n_block - (num_stages - 1)] into sV[smem_pipe_write].
+        # This V is consumed `num_stages - 1` iters from now; the lead lets
+        # the cp.async overlap with the QK gemm below + the subsequent
+        # softmax. Skipped when the look-ahead would go past block 0.
+        if cutlass.const_expr(self._num_stages == 1) or (
+            n_block - self._num_stages + 1 >= 0
+        ):
+            n_block_v_next = (
+                n_block
+                if cutlass.const_expr(self._num_stages == 1)
+                else n_block - self._num_stages + 1
+            )
+            self._load_kv_tile(
+                mV, sV, tVsV, tVgV, tKVpKV, tKVcKV,
+                mBlockTable, batch_size, kv_head,
+                n_block_v_next, smem_pipe_write,
+                gmem_thr_copy_QKV, gmem_tiled_copy_QKV,
+                need_predicates=(is_first and self._num_stages == 1),
+            )
+        cute.arch.cp_async_commit_group()
+
+        # ---- QK gemm: reads sK at the smem_pipe_read stage. ---------------
         if cutlass.const_expr(self._q_in_regs):
-            # Q is pre-populated in rmem (kernel prologue ldmatrix). Only
-            # need to load K from smem.
             gemm_rs(
                 tiled_mma, acc_S,
-                rA_view=tSrQ, rB_for_mma=tSrK_curr,
+                rA_view=tSrQ, rB_for_mma=tSrK,
                 smem_tiled_copy_B=smem_tiled_copy_K,
-                sB_partitioned=tSsK_curr,
-                rB_copy_view=tSrK_curr_copy_view,
+                sB_partitioned=tSsK[None, None, None, smem_pipe_read],
+                rB_copy_view=tSrK_copy_view,
             )
         else:
             gemm_with_smem_prefetch(
                 tiled_mma, acc_S,
-                rA_for_mma=tSrQ, rB_for_mma=tSrK_curr,
+                rA_for_mma=tSrQ, rB_for_mma=tSrK,
                 smem_tiled_copy_A=smem_tiled_copy_Q,
                 smem_tiled_copy_B=smem_tiled_copy_K,
-                sA_partitioned=tSsQ, sB_partitioned=tSsK_curr,
+                sA_partitioned=tSsQ,
+                sB_partitioned=tSsK[None, None, None, smem_pipe_read],
                 rA_copy_view=tSrQ_copy_view,
-                rB_copy_view=tSrK_curr_copy_view,
+                rB_copy_view=tSrK_copy_view,
             )
 
-        # ---- Wait for V(curr) [+ K(next) still in flight] -------------------
-        if n_block > 0:
-            cute.arch.cp_async_wait_group(1)
-        else:
-            cute.arch.cp_async_wait_group(0)
-        self.cta_sync_barrier.arrive_and_wait()
+        # Advance smem_pipe_write for the K_next issue (K writes to the
+        # slot one ahead of where V went, mirroring the prologue's K-then-V
+        # ordering inside each stage).
+        smem_pipe_write = self._advance_pipeline(smem_pipe_write)
 
-        # ---- Bias add (gmem-direct, with bounds check) ----------------------
+        # Drain V[n_block] for the PV gemm. (Same wait count — by now
+        # V[n_block]'s commit is the oldest remaining.) Also issues
+        # K_next = K[n_block - num_stages] for the iter that's num_stages
+        # ahead, keeping the ring full.
+        if cutlass.const_expr(self._num_stages == 1):
+            cute.arch.cp_async_wait_group(wait_count)
+            self.cta_sync_barrier.arrive_and_wait()
+            if n_block - 1 >= 0:
+                self._load_kv_tile(
+                    mK, sK, tKsK, tKgK, tKVpKV, tKVcKV,
+                    mBlockTable, batch_size, kv_head,
+                    n_block - 1, smem_pipe_write,
+                    gmem_thr_copy_QKV, gmem_tiled_copy_QKV,
+                    need_predicates=False,
+                )
+            cute.arch.cp_async_commit_group()
+
+        # ---- Bias add (in-rmem) -------------------------------------------
         if cutlass.const_expr(self._has_bias):
             self._add_bias_tile(
                 mBias, batch_size, num_head,
                 m_block, n_block, thr_mma, acc_S, inv_scale,
             )
 
-        # ---- Mask + online softmax ------------------------------------------
-        # Identity tile for (q_row, k_col) bounds. We synthesize a (B, H,
-        # T_q, T_kv_logical) shape so ``tScS_mn[r, c][2]`` is the absolute
-        # q_row and ``[3]`` is the absolute k_col regardless of whether
-        # KV lives in a dense tensor or a paged pool.
+        # ---- Mask + online softmax ----------------------------------------
         mcS = cute.make_identity_tensor(
             (mQ.shape[0], mQ.shape[1], mQ.shape[2], t_kv_logical)
         )
@@ -843,10 +922,8 @@ class FmhaSm80(FmhaBase):
         mask.apply(acc_S, tScS, seqlen_q=seqlen_q, seqlen_k=seqlen_k)
         softmax.online_softmax(acc_S, acc_O, is_first=is_first)
 
-        # ---- PV gemm --------------------------------------------------------
         rP = cute.make_fragment_like(acc_S, self._dtype)
         rP.store(acc_S.load().to(self._dtype))
-        # Layout transform (4, MMA_M, MMA_N) -> ((4,2), MMA_M, MMA_N/2).
         rP_layout_divided = cute.logical_divide(rP.layout, (None, None, 2))
         rP_mma_view = cute.make_layout(
             (
@@ -861,39 +938,75 @@ class FmhaSm80(FmhaBase):
             ),
         )
         tOrS = cute.make_tensor(rP.iterator, rP_mma_view)
+
+        # Drain V[n_block] before PV. Same wait pattern — by now V's commit
+        # is the oldest. Also issue K_next here for num_stages > 1 (so it
+        # overlaps with PV gemm instead of with QK).
+        if cutlass.const_expr(self._num_stages > 1):
+            cute.arch.cp_async_wait_group(wait_count)
+            self.cta_sync_barrier.arrive_and_wait()
+            if n_block - self._num_stages >= 0:
+                self._load_kv_tile(
+                    mK, sK, tKsK, tKgK, tKVpKV, tKVcKV,
+                    mBlockTable, batch_size, kv_head,
+                    n_block - self._num_stages, smem_pipe_write,
+                    gmem_thr_copy_QKV, gmem_tiled_copy_QKV,
+                    need_predicates=False,
+                )
+            cute.arch.cp_async_commit_group()
+
+        # ---- PV gemm: reads sV at the smem_pipe_read stage. ---------------
         gemm_rs(
             tiled_mma, acc_O,
-            rA_view=tOrS, rB_for_mma=tOrVt_curr,
+            rA_view=tOrS, rB_for_mma=tOrVt,
             smem_tiled_copy_B=smem_tiled_copy_V,
-            sB_partitioned=tOsVt_curr,
-            rB_copy_view=tOrVt_curr_copy_view,
+            sB_partitioned=tOsVt[None, None, None, smem_pipe_read],
+            rB_copy_view=tOrVt_copy_view,
         )
 
     # ------------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------------
     @cute.jit
-    def _load_k_tile(
+    def _load_kv_tile(
         self,
-        mK, sK_dst, tKsK_dst, tKgK, tKVpKV, tKVcKV,
-        mBlockTable, batch_size, kv_head, n_block,
+        mKV, sKV, tKVsKV_3D, tKVgKV, tKVpKV, tKVcKV,
+        mBlockTable, batch_size, kv_head, n_block, stage,
         gmem_thr_copy_QKV, gmem_tiled_copy_QKV,
+        need_predicates: cutlass.Constexpr,
     ):
-        """Load one K N-tile into ``sK_dst``. Dispatches dense vs paged."""
+        """Load one K (or V) N-tile into the ring's ``stage`` slot.
+
+        ``tKVsKV_3D`` is the 4D partitioned smem destination
+        ``(Atom, n, K_tile, num_stages)``; the inner stage slice
+        ``[..., stage]`` selects the active ring slot. ``need_predicates``
+        is True only for the rightmost (residue-prone) tile — inner tiles
+        can issue an unpredicated bulk cp.async.
+        """
         if cutlass.const_expr(not self._paged):
-            for n in cutlass.range_constexpr(cute.size(tKsK_dst.shape[1])):
-                if cute.elem_less(tKVcKV[0, n, 0][2], mK.layout.shape[2]):
-                    cute.copy(
-                        gmem_tiled_copy_QKV,
-                        tKgK[None, n, None, n_block],
-                        tKsK_dst[None, n, None],
-                        pred=tKVpKV[None, n, None],
-                    )
-                else:
-                    tKsK_dst[None, n, None].fill(0)
+            tKVsKV = tKVsKV_3D[None, None, None, stage]
+            if cutlass.const_expr(need_predicates):
+                for n in cutlass.range_constexpr(cute.size(tKVsKV.shape[1])):
+                    if cute.elem_less(tKVcKV[0, n, 0][2], mKV.layout.shape[2]):
+                        cute.copy(
+                            gmem_tiled_copy_QKV,
+                            tKVgKV[None, n, None, n_block],
+                            tKVsKV[None, n, None],
+                            pred=tKVpKV[None, n, None],
+                        )
+                    else:
+                        tKVsKV[None, n, None].fill(0)
+            else:
+                cute.copy(
+                    gmem_tiled_copy_QKV,
+                    tKVgKV[None, None, None, n_block],
+                    tKVsKV,
+                    pred=tKVpKV,
+                )
         else:
             self._paged_load_kv_tile(
-                mK, sK_dst, mBlockTable, batch_size, kv_head, n_block,
+                mKV, sKV[None, None, stage], mBlockTable,
+                batch_size, kv_head, n_block,
                 gmem_thr_copy_QKV, gmem_tiled_copy_QKV,
             )
 

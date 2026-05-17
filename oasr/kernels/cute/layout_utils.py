@@ -51,6 +51,7 @@ def make_smem_layout(
 
 def make_v_transpose_view(
     sV: cute.Tensor, head_dim_padded: int, n_block_size: int,
+    num_stages: int = 1,
 ) -> cute.Tensor:
     """Return a logical k-major view of the V smem tile for the PV gemm.
 
@@ -58,12 +59,27 @@ def make_v_transpose_view(
     gemm wants it in ``(head_dim, N_BLOCK)`` form so the m16n8k16 atom can
     treat V's column axis (n_block) as the gemm-K. We don't materialize a
     transpose -- we compose a layout view over the same smem pointer.
+
+    With ``num_stages > 1``, sV is 3D ``(N_BLOCK, head_dim, num_stages)``
+    and the returned view is ``(head_dim, N_BLOCK, num_stages)`` — the
+    iter loop slices the trailing stage dim with the pipe counter.
     """
+    if num_stages == 1:
+        return cute.composition(
+            sV,
+            cute.make_layout(
+                (head_dim_padded, n_block_size),
+                stride=(n_block_size, 1),
+            ),
+        )
+    # 3D: stage stride is num_stages * (N_BLOCK * head_dim) = N_BLOCK * D
+    # (since sV's stage dim is the outermost). The transpose only swaps
+    # the inner two dims; the stage dim is unchanged.
     return cute.composition(
         sV,
         cute.make_layout(
-            (head_dim_padded, n_block_size),
-            stride=(n_block_size, 1),
+            (head_dim_padded, n_block_size, num_stages),
+            stride=(n_block_size, 1, n_block_size * head_dim_padded),
         ),
     )
 
