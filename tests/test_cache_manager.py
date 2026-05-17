@@ -5,9 +5,9 @@
 Tests are grouped into:
   - BlockPool: allocation, free, exhaustion, tensor views
   - CnnCacheManager: lifecycle, update, shape validation
-  - AttentionCacheManager: single/multi-chunk commit, eviction, free
+  - AttentionCacheManager: paged prepare/commit, eviction, free
   - CtcStateCacheManager: requires CUDA
-  - StreamContext: full end-to-end lifecycle
+  - StreamContext: paged-mode lifecycle
   - Multi-stream isolation
 """
 
@@ -265,100 +265,6 @@ class TestCnnCacheManager:
 
 
 class TestAttentionCacheManager:
-    def _make_kv_chunk(self, cfg: CacheConfig, chunk_frames: int) -> torch.Tensor:
-        """Random KV chunk with shape (L, H, chunk_frames, kv_last_dim)."""
-        return torch.randn(
-            cfg.num_layers, cfg.n_kv_head, chunk_frames, cfg.kv_last_dim,
-            dtype=cfg.dtype, device=cfg.device,
-        )
-
-    def test_initial_cache_is_empty(self):
-        cfg = make_config()
-        pool = BlockPool(cfg)
-        mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
-        cache = mgr.get_stacked_cache(0)
-        # Before any commit the cache should be (0,0,0,0) — matching forward_chunk default.
-        assert cache.shape == (0, 0, 0, 0)
-
-    def test_single_chunk_commit_shape(self):
-        cfg = make_config(num_layers=2, n_kv_head=2, head_dim=4, chunk_size=4, block_size_frames=4)
-        pool = BlockPool(cfg)
-        mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
-        kv = self._make_kv_chunk(cfg, 4)
-        mgr.commit(0, kv)
-        out = mgr.get_stacked_cache(0)
-        assert out.shape == (2, 2, 4, 8)  # (L, H, 4 frames, d_k*2)
-
-    def test_single_chunk_commit_values(self):
-        cfg = make_config(num_layers=1, n_kv_head=1, head_dim=4, chunk_size=2, block_size_frames=2)
-        pool = BlockPool(cfg)
-        mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
-        kv = torch.ones(1, 1, 2, 8)
-        mgr.commit(0, kv)
-        out = mgr.get_stacked_cache(0)
-        assert out.allclose(torch.ones_like(out))
-
-    def test_multi_chunk_grows_cache(self):
-        cfg = make_config(num_layers=2, n_kv_head=2, head_dim=4, chunk_size=4,
-                          block_size_frames=4, num_left_chunks=-1, max_num_blocks=32)
-        pool = BlockPool(cfg)
-        mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
-        for _ in range(3):
-            kv = self._make_kv_chunk(cfg, 4)
-            mgr.commit(0, kv)
-        out = mgr.get_stacked_cache(0)
-        assert out.shape[2] == 12  # 3 chunks * 4 frames each
-
-    def test_eviction_with_num_left_chunks(self):
-        # num_left_chunks=2, chunk_size=4, block_size_frames=4 => max_logical_blocks=2
-        cfg = make_config(
-            num_layers=1, n_kv_head=1, head_dim=4, chunk_size=4,
-            block_size_frames=4, num_left_chunks=2, max_num_blocks=32,
-        )
-        pool = BlockPool(cfg)
-        mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
-        initial_free = pool.num_free_blocks
-
-        # Commit 4 chunks: only last 2 should survive.
-        for i in range(4):
-            kv = torch.full((1, 1, 4, 8), float(i + 1))
-            mgr.commit(0, kv)
-
-        out = mgr.get_stacked_cache(0)
-        assert out.shape[2] == 8  # 2 chunks * 4 frames
-
-        # The oldest 2 blocks were evicted and returned to pool.
-        # Now we should have: initial - 2 blocks used (one per surviving chunk).
-        assert pool.num_free_blocks == initial_free - 2
-
-        # Verify that the retained data is from the last 2 chunks.
-        # chunk 3 => value 3.0, chunk 4 => value 4.0
-        expected = torch.cat([
-            torch.full((1, 1, 4, 8), 3.0),
-            torch.full((1, 1, 4, 8), 4.0),
-        ], dim=2)
-        assert out.allclose(expected), f"out={out}\nexpected={expected}"
-
-    def test_free_stream_returns_blocks(self):
-        cfg = make_config(
-            num_layers=1, n_kv_head=1, head_dim=4, chunk_size=4,
-            block_size_frames=4, num_left_chunks=-1, max_num_blocks=16,
-        )
-        pool = BlockPool(cfg)
-        mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
-        initial = pool.num_free_blocks
-        for _ in range(3):
-            mgr.commit(0, self._make_kv_chunk(cfg, 4))
-        assert pool.num_free_blocks == initial - 3
-        mgr.free_stream(0)
-        assert pool.num_free_blocks == initial
-
     def test_double_allocate_raises(self):
         cfg = make_config()
         pool = BlockPool(cfg)
@@ -367,39 +273,101 @@ class TestAttentionCacheManager:
         with pytest.raises(ValueError, match="already allocated"):
             mgr.allocate_stream(0)
 
-    def test_commit_wrong_num_layers_raises(self):
-        cfg = make_config(num_layers=4)
+    def test_get_paged_caches_before_prepare_raises(self):
+        cfg = make_config()
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
         mgr.allocate_stream(0)
-        wrong_kv = torch.ones(2, 2, 4, cfg.kv_last_dim)  # wrong num_layers
-        with pytest.raises(ValueError, match="num_layers"):
-            mgr.commit(0, wrong_kv)
+        with pytest.raises(RuntimeError, match="prepare_chunk"):
+            mgr.get_paged_caches(0)
 
-    def test_commit_chunk_too_large_raises(self):
-        cfg = make_config(block_size_frames=4)
+    def test_prepare_chunk_allocates_block_and_updates_table(self):
+        cfg = make_config(num_layers=2, max_num_blocks=8)
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
         mgr.allocate_stream(0)
-        big_kv = torch.ones(cfg.num_layers, cfg.n_kv_head, 8, cfg.kv_last_dim)
-        with pytest.raises(ValueError, match="block_size_frames"):
-            mgr.commit(0, big_kv)
+        initial_free = pool.num_free_blocks
+        mgr.prepare_chunk(0)
+        assert pool.num_free_blocks == initial_free - 1
+        bt, cs = mgr.get_paged_state_views(0)
+        assert bt.shape == (1, cfg.max_blocks_per_seq)
+        assert cs.shape == (1,)
+        # Block id stored at logical index 0.
+        assert int(bt[0, 0].item()) >= 0
+        assert int(cs[0].item()) == 0
 
-    def test_get_cache_view_per_layer(self):
-        cfg = make_config(num_layers=3, n_kv_head=2, head_dim=4, chunk_size=4, block_size_frames=4)
+    def test_commit_chunk_paged_advances_seqlens(self):
+        cfg = make_config(num_layers=1, chunk_size=4, block_size_frames=4, max_num_blocks=16)
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
         mgr.allocate_stream(0)
-        # Commit with distinct per-layer values for verification.
-        kv = torch.stack([
-            torch.full((cfg.n_kv_head, cfg.chunk_size, cfg.kv_last_dim), float(l))
-            for l in range(cfg.num_layers)
-        ])
-        mgr.commit(0, kv)
-        for l in range(cfg.num_layers):
-            view = mgr.get_cache_view(0, l)
-            assert view.shape == (1, 2, 4, 8)
-            assert view.allclose(torch.full_like(view, float(l)))
+        mgr.prepare_chunk(0)
+        mgr.commit_chunk_paged(0, chunk_frames=4)
+        _, cs = mgr.get_paged_state_views(0)
+        assert int(cs[0].item()) == 4
+        mgr.prepare_chunk(0)
+        mgr.commit_chunk_paged(0, chunk_frames=4)
+        assert int(cs[0].item()) == 8
+
+    def test_eviction_with_num_left_chunks(self):
+        # max_logical_blocks=2 from num_left_chunks=2 (chunk_size=block_size_frames=4)
+        cfg = make_config(
+            num_layers=1, chunk_size=4, block_size_frames=4,
+            num_left_chunks=2, max_num_blocks=16,
+        )
+        pool = BlockPool(cfg)
+        mgr = AttentionCacheManager(pool, cfg)
+        mgr.allocate_stream(0)
+        initial_free = pool.num_free_blocks
+
+        # Commit 4 chunks: only the last 2 blocks should survive after eviction.
+        for _ in range(4):
+            mgr.prepare_chunk(0)
+            mgr.commit_chunk_paged(0, chunk_frames=4)
+
+        # 2 blocks held, 2 evicted back to pool.
+        assert pool.num_free_blocks == initial_free - 2
+        _, cs = mgr.get_paged_state_views(0)
+        assert int(cs[0].item()) == 8  # 2 blocks * 4 frames
+
+    def test_free_stream_returns_blocks(self):
+        cfg = make_config(num_layers=1, max_num_blocks=16)
+        pool = BlockPool(cfg)
+        mgr = AttentionCacheManager(pool, cfg)
+        mgr.allocate_stream(0)
+        initial = pool.num_free_blocks
+        for _ in range(3):
+            mgr.prepare_chunk(0)
+            mgr.commit_chunk_paged(0, chunk_frames=cfg.block_size_frames)
+        assert pool.num_free_blocks == initial - 3
+        mgr.free_stream(0)
+        assert pool.num_free_blocks == initial
+
+    def test_prepare_chunks_batched_allocates_one_block_per_stream(self):
+        cfg = make_config(num_layers=1, max_num_blocks=32)
+        pool = BlockPool(cfg)
+        mgr = AttentionCacheManager(pool, cfg)
+        for sid in range(4):
+            mgr.allocate_stream(sid)
+        initial = pool.num_free_blocks
+        mgr.prepare_chunks_batched([0, 1, 2, 3])
+        assert pool.num_free_blocks == initial - 4
+        for sid in range(4):
+            bt, _ = mgr.get_paged_state_views(sid)
+            assert int(bt[0, 0].item()) >= 0
+
+    def test_get_paged_caches_returns_one_per_layer(self):
+        cfg = make_config(num_layers=3, max_num_blocks=8)
+        pool = BlockPool(cfg)
+        mgr = AttentionCacheManager(pool, cfg)
+        mgr.allocate_stream(0)
+        mgr.prepare_chunk(0)
+        caches = mgr.get_paged_caches(0)
+        assert len(caches) == cfg.num_layers
+        # All caches share the same block_table / cache_seqlens.
+        for c in caches[1:]:
+            assert c.block_table.data_ptr() == caches[0].block_table.data_ptr()
+            assert c.cache_seqlens.data_ptr() == caches[0].cache_seqlens.data_ptr()
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +453,7 @@ class TestCtcStateCacheManager:
 
 
 class TestStreamContext:
-    """Full lifecycle tests using CPU tensors (no CUDA required)."""
+    """Paged-mode lifecycle tests using CPU tensors (no CUDA required)."""
 
     def _setup(self, num_left_chunks: int = -1) -> tuple:
         cfg = make_config(
@@ -507,12 +475,6 @@ class TestStreamContext:
         cnn_mgr.allocate_stream(sid)
         return StreamContext(sid, att_mgr, cnn_mgr, ctc_mgr)
 
-    def test_initial_att_cache_is_empty_tensor(self):
-        cfg, pool, att_mgr, cnn_mgr = self._setup()
-        ctx = self._make_stream(0, att_mgr, cnn_mgr)
-        att = ctx.get_att_cache()
-        assert att.shape == (0, 0, 0, 0)
-
     def test_initial_cnn_cache_is_zero(self):
         cfg, pool, att_mgr, cnn_mgr = self._setup()
         ctx = self._make_stream(0, att_mgr, cnn_mgr)
@@ -520,30 +482,30 @@ class TestStreamContext:
         assert cnn.shape == (2, 1, 2, 8)  # (L, 1, K-1, D)
         assert cnn.allclose(torch.zeros_like(cnn))
 
-    def test_commit_and_read_att(self):
+    def test_prepare_chunk_then_get_paged_caches(self):
         cfg, pool, att_mgr, cnn_mgr = self._setup()
         ctx = self._make_stream(0, att_mgr, cnn_mgr)
-        kv = torch.full((2, 2, 4, 8), 5.0)
-        cnn = torch.zeros(2, 1, 2, 8)
-        ctx.commit_chunk(kv, cnn)
-        att = ctx.get_att_cache()
-        assert att.shape == (2, 2, 4, 8)
-        assert att.allclose(torch.full_like(att, 5.0))
+        ctx.prepare_chunk()
+        caches = ctx.get_att_caches()
+        assert len(caches) == cfg.num_layers
 
-    def test_commit_and_read_cnn(self):
+    def test_commit_chunk_paged_updates_cnn_and_seqlens(self):
         cfg, pool, att_mgr, cnn_mgr = self._setup()
         ctx = self._make_stream(0, att_mgr, cnn_mgr)
-        kv = torch.zeros(2, 2, 4, 8)
+        ctx.prepare_chunk()
         new_cnn = torch.full((2, 1, 2, 8), 3.0)
-        ctx.commit_chunk(kv, new_cnn)
+        ctx.commit_chunk_paged(chunk_frames=4, new_cnn_cache=new_cnn)
         assert ctx.get_cnn_cache().allclose(torch.full_like(new_cnn, 3.0))
+        _, cs = ctx.get_paged_state_views()
+        assert int(cs[0].item()) == 4
 
     def test_free_returns_pool_blocks(self):
         cfg, pool, att_mgr, cnn_mgr = self._setup()
         initial = pool.num_free_blocks
         ctx = self._make_stream(0, att_mgr, cnn_mgr)
         for _ in range(3):
-            ctx.commit_chunk(torch.ones(2, 2, 4, 8), torch.zeros(2, 1, 2, 8))
+            ctx.prepare_chunk()
+            ctx.commit_chunk_paged(chunk_frames=4, new_cnn_cache=torch.zeros(2, 1, 2, 8))
         ctx.free()
         assert pool.num_free_blocks == initial
 
@@ -559,7 +521,7 @@ class TestStreamContext:
 
 
 class TestMultiStreamIsolation:
-    def test_streams_are_independent(self):
+    def test_streams_have_independent_state(self):
         cfg = make_config(
             num_layers=1, n_kv_head=1, head_dim=4, hidden_dim=8,
             kernel_size=3, chunk_size=4, block_size_frames=4,
@@ -573,19 +535,18 @@ class TestMultiStreamIsolation:
             att_mgr.allocate_stream(sid)
             cnn_mgr.allocate_stream(sid)
 
-        # Each stream commits a distinct constant value.
+        # Advance each stream a different number of chunks.
         for sid in range(4):
-            kv = torch.full((1, 1, 4, 8), float(sid + 1))
-            cnn = torch.full((1, 1, 2, 8), float(sid + 1))
-            att_mgr.commit(sid, kv)
-            cnn_mgr.update(sid, cnn)
+            for _ in range(sid + 1):
+                att_mgr.prepare_chunk(sid)
+                att_mgr.commit_chunk_paged(sid, chunk_frames=4)
+            cnn_mgr.update(sid, torch.full((1, 1, 2, 8), float(sid + 1)))
 
         for sid in range(4):
-            att = att_mgr.get_stacked_cache(sid)
+            _, cs = att_mgr.get_paged_state_views(sid)
+            assert int(cs[0].item()) == 4 * (sid + 1), f"sid={sid}"
             cnn = cnn_mgr.get_cache(sid)
-            expected_val = float(sid + 1)
-            assert att.allclose(torch.full_like(att, expected_val)), f"sid={sid}"
-            assert cnn.allclose(torch.full_like(cnn, expected_val)), f"sid={sid}"
+            assert cnn.allclose(torch.full_like(cnn, float(sid + 1))), f"sid={sid}"
 
     def test_partial_free_leaves_others_intact(self):
         cfg = make_config(
@@ -597,27 +558,23 @@ class TestMultiStreamIsolation:
         att_mgr = AttentionCacheManager(pool, cfg)
         cnn_mgr = CnnCacheManager(cfg)
 
-        for sid in [0, 1, 2, 3]:
+        for sid in range(4):
             att_mgr.allocate_stream(sid)
             cnn_mgr.allocate_stream(sid)
-            kv = torch.full((1, 1, 4, 8), float(sid))
-            cnn = torch.full((1, 1, 2, 8), float(sid))
-            att_mgr.commit(sid, kv)
-            cnn_mgr.update(sid, cnn)
+            att_mgr.prepare_chunk(sid)
+            att_mgr.commit_chunk_paged(sid, chunk_frames=4)
+            cnn_mgr.update(sid, torch.full((1, 1, 2, 8), float(sid)))
 
-        # Free streams 1 and 3.
         att_mgr.free_stream(1)
         cnn_mgr.free_stream(1)
         att_mgr.free_stream(3)
         cnn_mgr.free_stream(3)
 
-        # Streams 0 and 2 should be unaffected.
         for sid in [0, 2]:
-            att = att_mgr.get_stacked_cache(sid)
+            _, cs = att_mgr.get_paged_state_views(sid)
+            assert int(cs[0].item()) == 4, f"sid={sid}"
             cnn = cnn_mgr.get_cache(sid)
-            expected = float(sid)
-            assert att.allclose(torch.full_like(att, expected)), f"sid={sid}"
-            assert cnn.allclose(torch.full_like(cnn, expected)), f"sid={sid}"
+            assert cnn.allclose(torch.full_like(cnn, float(sid))), f"sid={sid}"
 
     def test_pool_accounting_after_partial_free(self):
         cfg = make_config(
@@ -633,7 +590,8 @@ class TestMultiStreamIsolation:
         for sid in range(4):
             att_mgr.allocate_stream(sid)
             cnn_mgr.allocate_stream(sid)
-            att_mgr.commit(sid, torch.zeros(1, 1, 4, 8))  # uses 1 block each
+            att_mgr.prepare_chunk(sid)
+            att_mgr.commit_chunk_paged(sid, chunk_frames=4)
 
         assert pool.num_free_blocks == initial - 4
 

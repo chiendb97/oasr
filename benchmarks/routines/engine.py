@@ -402,8 +402,7 @@ def _run_config(
                 chunk_size=chunk_size,
                 num_left_chunks=num_left_chunks,
                 max_batch_size=max_batch_size,
-                use_paged_cache=True,
-                fst_path=fst_file,
+                    fst_path=fst_file,
             )
             engine: Any = ASREngine(cfg)
             shape_str = (

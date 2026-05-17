@@ -43,12 +43,11 @@ class ModelRunner:
 
     Notes
     -----
-    **Streaming batching constraint**: :meth:`ConformerEncoder.forward_chunk`
-    and :meth:`ConformerEncoder.forward_chunk_paged` require ``batch_size=1``.
-    The engine therefore iterates over concurrent streaming requests
-    sequentially within a single ``step()`` rather than running a true
-    batched forward.  The cache managers still track all streams concurrently
-    and the scheduler amortises overhead across requests.
+    Streaming runs the paged ``forward_chunk_paged`` path. Streams with full
+    ready windows are batched together by :meth:`_forward_batched_paged`;
+    partial/final windows fall back to :meth:`_forward_single`. The cache
+    managers track all streams concurrently and the scheduler amortises
+    overhead across requests.
     """
 
     def __init__(
@@ -174,9 +173,9 @@ class ModelRunner:
         """Process at most one encoder chunk per request.
 
         Slices ``window`` frames out of ``request.feature_buffer`` starting
-        at ``request.feature_cursor``, runs ``forward_chunk_paged`` (or
-        ``forward_chunk`` in dense mode), commits the updated caches, and
-        advances ``feature_cursor`` by ``stride`` frames.  Requests whose
+        at ``request.feature_cursor``, runs ``forward_chunk_paged``, commits
+        the updated caches, and advances ``feature_cursor`` by ``stride``
+        frames.  Requests whose
         buffer doesn't yet hold a full window are skipped (they'll be
         revisited on the next step once more audio has been extracted).
 
@@ -204,16 +203,15 @@ class ModelRunner:
             chunks are omitted.
         """
         cfg = self._config
-        use_paged = cfg.use_paged_cache
         window = cfg.decoding_window
         stride = cfg.stride
         context = cfg.right_context + 1
 
         results: Dict[str, torch.Tensor] = {}
 
-        # Partition into (full-window + paged) and the catch-all fallback.
-        # Full-window-paged streams with identical offsets are candidates
-        # for batched forward.
+        # Partition into batchable (full-window paged) and the partial/final
+        # fallback. Full-window streams go through the batched paged forward;
+        # partial/final windows run one-at-a-time through ``_forward_single``.
         batchable: List[Request] = []
         fallback: List[Request] = []
 
@@ -230,8 +228,7 @@ class ModelRunner:
                 and (req.audio_tail is None or req.audio_tail.numel() == 0)
                 and available <= window
             )
-            # Only full-window paged forwards go through the batched path.
-            if use_paged and not is_final_window and available >= window:
+            if not is_final_window and available >= window:
                 batchable.append(req)
             else:
                 fallback.append(req)
@@ -393,13 +390,11 @@ class ModelRunner:
         context: int,
         results: Dict[str, torch.Tensor],
     ) -> None:
-        """Run one paged-or-dense forward for a single request.
+        """Run one paged forward for a single request.
 
-        Used for partial/final windows, for streams whose offsets differ
-        from the batched group, and for the dense (non-paged) cache mode.
+        Used for partial/final windows that the batched paged forward
+        cannot accommodate.
         """
-        cfg = self._config
-        use_paged = cfg.use_paged_cache
         if req.feature_buffer is None:
             return
 
@@ -420,33 +415,18 @@ class ModelRunner:
         ctx = req.stream_context
         assert ctx is not None
 
-        if use_paged:
-            ctx.prepare_chunk()
-            att_caches = ctx.get_att_caches()
-            cnn_cache = ctx.get_cnn_cache()
-            log_probs, new_cnn = self._model.forward_chunk_paged(
-                chunk,
-                req.offset,
-                att_caches,
-                cnn_cache,
-                cache_t1=req.offset,
-            )
-            actual_frames = log_probs.size(1)
-            ctx.commit_chunk_paged(actual_frames, new_cnn)
-        else:
-            att_cache = ctx.get_att_cache()
-            cnn_cache = ctx.get_cnn_cache()
-            required = cfg.required_cache_size
-            log_probs, new_att, new_cnn = self._model.forward_chunk(
-                chunk,
-                req.offset,
-                required,
-                att_cache,
-                cnn_cache,
-            )
-            actual_frames = log_probs.size(1)
-            new_kv_chunk = new_att[:, :, -actual_frames:, :]
-            ctx.commit_chunk(new_kv_chunk, new_cnn)
+        ctx.prepare_chunk()
+        att_caches = ctx.get_att_caches()
+        cnn_cache = ctx.get_cnn_cache()
+        log_probs, new_cnn = self._model.forward_chunk_paged(
+            chunk,
+            req.offset,
+            att_caches,
+            cnn_cache,
+            cache_t1=req.offset,
+        )
+        actual_frames = log_probs.size(1)
+        ctx.commit_chunk_paged(actual_frames, new_cnn)
 
         req.offset += actual_frames
         if is_final_window:

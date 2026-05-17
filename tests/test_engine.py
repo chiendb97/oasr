@@ -533,16 +533,6 @@ class TestOfflineEngine:
         # LJSpeech is English — result should contain only ASCII
         assert text.isascii(), f"Expected ASCII text, got: {text!r}"
 
-    @pytest.mark.slow
-    def test_transcribe_streaming_simulation(self, device, ckpt_dir: str, wav_dir: str):
-        _require_ckpt(ckpt_dir)
-        _require_wav_dir(wav_dir)
-        engine = self._make_engine(ckpt_dir, device)
-        text = engine.transcribe_streaming(_wav_path(wav_dir, 0))
-        assert isinstance(text, str)
-        assert len(text) > 0
-
-
 # ---------------------------------------------------------------------------
 # Integration tests — ASREngine (streaming)
 # ---------------------------------------------------------------------------
@@ -559,7 +549,6 @@ class TestASREngine:
             decoder_type="ctc_prefix_beam",
             chunk_size=16,
             num_left_chunks=-1,
-            use_paged_cache=True,
         )
         return ASREngine(cfg)
 
@@ -629,7 +618,6 @@ class TestASREngine:
             decoder_type="ctc_prefix_beam",
             chunk_size=16,
             num_left_chunks=-1,
-            use_paged_cache=True,
             max_batch_size=1,
         )
         on = ASREngine(cfg)
@@ -720,7 +708,6 @@ class TestASREngine:
             dtype=torch.float16,
             decoder_type="ctc_prefix_beam",
             chunk_size=16,
-            use_paged_cache=True,
             max_num_blocks=512,
         )
         engine = ASREngine(cfg)

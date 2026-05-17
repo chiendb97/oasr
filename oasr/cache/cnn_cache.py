@@ -8,7 +8,7 @@ fixed-size per stream (no paging required), so a simple per-stream tensor
 allocation is used.
 
 The cache tensor shape matches the ``cnn_cache`` argument accepted and
-returned by ``ConformerEncoder.forward_chunk``:
+returned by ``ConformerEncoder.forward_chunk_paged``:
 ``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
 """
 
@@ -39,7 +39,7 @@ class CnnCacheManager:
     >>> mgr = CnnCacheManager(config)
     >>> mgr.allocate_stream(stream_id=0)
     >>> cache = mgr.get_cache(0)            # shape (L, 1, K-1, D)
-    >>> mgr.update(0, new_cache)            # overwrite after forward_chunk
+    >>> mgr.update(0, new_cache)            # overwrite after forward_chunk_paged
     >>> mgr.free_stream(0)
     """
 
@@ -112,7 +112,7 @@ class CnnCacheManager:
         -------
         torch.Tensor
             Shape ``(num_layers, 1, cnn_cache_frames, hidden_dim)`` matching
-            the ``cnn_cache`` input expected by ``forward_chunk``.
+            the ``cnn_cache`` input expected by ``forward_chunk_paged``.
 
         Raises
         ------
@@ -132,7 +132,7 @@ class CnnCacheManager:
             Stream identifier.
         new_cnn_cache : torch.Tensor
             New cache tensor, shape ``(num_layers, 1, cnn_cache_frames, hidden_dim)``
-            as returned by ``ConformerEncoder.forward_chunk``.
+            as returned by ``ConformerEncoder.forward_chunk_paged``.
 
         Raises
         ------

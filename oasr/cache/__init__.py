@@ -26,7 +26,7 @@ Typical server setup::
     cnn_mgr  = CnnCacheManager(config)
     ctc_mgr  = CtcStateCacheManager(GpuDecoderConfig(beam_size=10))
 
-Per-request usage::
+Per-request usage (paged-only)::
 
     sid = 42
     att_mgr.allocate_stream(sid)
@@ -35,11 +35,12 @@ Per-request usage::
     ctx = StreamContext(sid, att_mgr, cnn_mgr, ctc_mgr)
 
     for chunk_audio in audio_chunks:
-        att_cache  = ctx.get_att_cache()
+        ctx.prepare_chunk()
+        att_caches = ctx.get_att_caches()
         cnn_cache  = ctx.get_cnn_cache()
-        logits, new_att, new_cnn = model.forward_chunk(
-            chunk_audio, offset, required_cache_size, att_cache, cnn_cache)
-        ctx.commit_chunk(new_att[:, :, -chunk_size:, :], new_cnn)
+        logits, new_cnn = model.forward_chunk_paged(
+            chunk_audio, offset, att_caches, cnn_cache, cache_t1=offset)
+        ctx.commit_chunk_paged(logits.size(1), new_cnn)
         ctx.get_decoder().decode_chunk(logits)
 
     result = ctx.get_decoder().finalize_stream()

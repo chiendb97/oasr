@@ -49,9 +49,6 @@ class EngineConfig:
         means each chunk maps to exactly one block.
     max_blocks_per_seq : int
         Maximum logical blocks per stream in the block table tensor.
-    use_paged_cache : bool
-        If True (default), use ``forward_chunk_paged`` + ``BlockPool``.
-        If False, use ``forward_chunk`` with dense cache tensors.
     feature_config : FeatureConfig, optional
         Feature extraction config.  Defaults to 80-dim log-mel FBANK at 16 kHz
         with dither disabled (``dither=0.0``) for deterministic inference.
@@ -159,7 +156,6 @@ class EngineConfig:
     max_num_blocks: int = 2048
     block_size_frames: int = 16
     max_blocks_per_seq: int = 512
-    use_paged_cache: bool = True
 
     # Feature extraction
     feature_config: Optional[FeatureConfig] = None
@@ -242,11 +238,6 @@ class EngineConfig:
     def stride(self) -> int:
         """Feature frame stride between consecutive chunk windows."""
         return self.subsampling_rate * self.chunk_size
-
-    @property
-    def required_cache_size(self) -> int:
-        """Attention cache size in encoder frames for dense streaming mode."""
-        return self.chunk_size * self.num_left_chunks
 
     # ------------------------------------------------------------------
     # CacheConfig builder

@@ -196,7 +196,7 @@ class BatchedStreamingFeatureExtractor:
 
         for chunk_batch in audio_chunk_batches:
             feats, feat_lens = ext.process_chunk(chunk_batch)
-            model.forward_chunk(feats, feat_lens, ...)
+            model.forward_chunk_paged(feats, ...)
 
         final_feats, final_lens = ext.flush()
         ext.reset()

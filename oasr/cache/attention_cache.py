@@ -3,20 +3,19 @@
 """Paged attention KV cache manager for streaming conformer inference.
 
 Each active stream maintains a logical-to-physical block mapping backed by
-a shared ``BlockPool``.  Two usage modes are supported:
+a shared :class:`BlockPool`. Per-stream usage:
 
-**Dense mode** (backward-compatible with ``forward_chunk``)
-    ``commit(stream_id, new_kv_chunk)`` allocates a block, copies packed K+V
-    data into it, and ``get_stacked_cache`` gathers them back into the dense
-    ``(elayers, head, cache_t1, d_k * 2)`` tensor expected by
-    ``ConformerEncoder.forward_chunk``.
+* :meth:`AttentionCacheManager.prepare_chunk` allocates the next physical
+  block in advance (or :meth:`prepare_chunks_batched` for B streams).
+* :meth:`AttentionCacheManager.get_paged_caches` returns one
+  :class:`PagedKVCache` per encoder layer; ``forward_chunk_paged`` writes
+  K/V directly into the pool via :meth:`PagedKVCache.write_kv_chunk`.
+* :meth:`AttentionCacheManager.commit_chunk_paged` increments
+  ``cache_seqlens`` and evicts the oldest block when the left-context limit
+  is reached.
 
-**Paged mode** (used with ``forward_chunk_paged``)
-    ``prepare_chunk(stream_id)`` allocates the next physical block in advance.
-    ``get_paged_caches(stream_id)`` returns one :class:`PagedKVCache` per
-    encoder layer.  ``forward_chunk_paged`` writes K/V directly into the pool.
-    ``commit_chunk_paged(stream_id, chunk_frames)`` increments ``cache_seqlens``
-    and evicts the oldest block when the left-context limit is reached.
+The dense-cache path (``forward_chunk`` / ``commit`` / ``get_stacked_cache``)
+was removed: streaming is paged-only.
 """
 
 from __future__ import annotations
@@ -42,8 +41,8 @@ class _StreamKVState:
     num_committed_frames : int
         Total encoder-output frames written into this stream's K/V pool.
     block_table : Tensor or None
-        ``(1, max_blocks_per_seq)`` int32 on the cache device.  Allocated on
-        first use in paged mode; ``None`` until then.
+        ``(1, max_blocks_per_seq)`` int32 on the cache device. Allocated on
+        first use; ``None`` until then.
     cache_seqlens : Tensor or None
         ``(1,)`` int32 scalar tracking committed frames for paged attention.
         Shared across all layers of the same stream.
@@ -67,23 +66,13 @@ class AttentionCacheManager:
 
     Examples
     --------
-    Dense mode::
-
-        mgr = AttentionCacheManager(pool, config)
-        mgr.allocate_stream(42)
-        cache = mgr.get_stacked_cache(42)      # (L, H, 0, d_k*2) initially
-        mgr.commit(42, new_kv_chunk)
-        cache = mgr.get_stacked_cache(42)      # (L, H, chunk_sz, d_k*2)
-        mgr.free_stream(42)
-
-    Paged mode::
-
-        mgr.allocate_stream(42)
-        mgr.prepare_chunk(42)                  # allocate block for next write
-        att_caches = mgr.get_paged_caches(42)  # List[PagedKVCache]
-        xs, cnn = model.forward_chunk_paged(xs, offset, att_caches, cnn)
-        mgr.commit_chunk_paged(42, chunk_size)
-        mgr.free_stream(42)
+    >>> mgr = AttentionCacheManager(pool, config)
+    >>> mgr.allocate_stream(42)
+    >>> mgr.prepare_chunk(42)                  # allocate block for next write
+    >>> att_caches = mgr.get_paged_caches(42)  # List[PagedKVCache]
+    >>> xs, cnn = model.forward_chunk_paged(xs, offset, att_caches, cnn)
+    >>> mgr.commit_chunk_paged(42, chunk_size)
+    >>> mgr.free_stream(42)
     """
 
     def __init__(self, block_pool: BlockPool, config: CacheConfig) -> None:
@@ -129,134 +118,6 @@ class AttentionCacheManager:
         if state.logical_blocks:
             self._pool.free(state.logical_blocks)
         del self._streams[stream_id]
-
-    # ------------------------------------------------------------------
-    # Dense-mode access
-    # ------------------------------------------------------------------
-
-    def get_cache_view(self, stream_id: int, layer: int) -> torch.Tensor:
-        """Return the gathered KV cache for one layer as a packed tensor.
-
-        Parameters
-        ----------
-        stream_id : int
-            Stream identifier.
-        layer : int
-            Encoder layer index ``[0, num_layers)``.
-
-        Returns
-        -------
-        torch.Tensor
-            Shape ``(1, n_kv_head, committed_frames, head_dim * 2)``.
-        """
-        state = self._get_state(stream_id)
-        cfg = self._config
-        if not state.logical_blocks:
-            return torch.empty(
-                1, cfg.n_kv_head, 0, cfg.kv_last_dim,
-                dtype=cfg.dtype, device=cfg.device,
-            )
-        # Gather K and V separately, each (n*block_size, n_kv_head, head_dim).
-        k_flat, v_flat = self._pool.gather_kv_blocks(layer, state.logical_blocks)
-        k_flat = k_flat[: state.num_committed_frames]
-        v_flat = v_flat[: state.num_committed_frames]
-        # Pack into (committed_frames, n_kv_head, head_dim * 2).
-        kv_flat = torch.cat([k_flat, v_flat], dim=-1)
-        # → (1, n_kv_head, committed_frames, head_dim * 2)
-        return kv_flat.permute(1, 0, 2).unsqueeze(0)
-
-    def get_stacked_cache(self, stream_id: int) -> torch.Tensor:
-        """Return the full packed KV cache stacked across all layers.
-
-        Shape matches the ``att_cache`` parameter of
-        ``ConformerEncoder.forward_chunk``:
-        ``(num_layers, n_kv_head, cache_t1, d_k * 2)``.
-
-        Parameters
-        ----------
-        stream_id : int
-            Stream identifier.
-
-        Returns
-        -------
-        torch.Tensor
-            ``(num_layers, n_kv_head, committed_frames, kv_last_dim)`` or
-            ``(0, 0, 0, 0)`` when no frames have been committed.
-        """
-        state = self._get_state(stream_id)
-        cfg = self._config
-        if not state.logical_blocks:
-            return torch.zeros(0, 0, 0, 0, dtype=cfg.dtype, device=cfg.device)
-        views = [self.get_cache_view(stream_id, l) for l in range(cfg.num_layers)]
-        return torch.cat(views, dim=0)
-
-    # ------------------------------------------------------------------
-    # Dense-mode mutation
-    # ------------------------------------------------------------------
-
-    def commit(self, stream_id: int, new_kv_chunk: torch.Tensor) -> None:
-        """Write new packed K+V frames from the latest ``forward_chunk`` call.
-
-        Parameters
-        ----------
-        stream_id : int
-            Stream identifier.
-        new_kv_chunk : torch.Tensor
-            Shape ``(num_layers, n_kv_head, chunk_frames, kv_last_dim)``
-            where ``kv_last_dim = head_dim * 2``.
-
-        Raises
-        ------
-        ValueError
-            If shape is inconsistent with the config.
-        RuntimeError
-            If the pool has no free blocks.
-        """
-        state = self._get_state(stream_id)
-        cfg = self._config
-        chunk_frames = new_kv_chunk.size(2)
-
-        if new_kv_chunk.size(0) != cfg.num_layers:
-            raise ValueError(
-                f"new_kv_chunk.shape[0]={new_kv_chunk.size(0)} != "
-                f"num_layers={cfg.num_layers}."
-            )
-        if new_kv_chunk.size(3) != cfg.kv_last_dim:
-            raise ValueError(
-                f"new_kv_chunk.shape[3]={new_kv_chunk.size(3)} != "
-                f"kv_last_dim={cfg.kv_last_dim}."
-            )
-        if chunk_frames > cfg.block_size_frames:
-            raise ValueError(
-                f"chunk_frames={chunk_frames} exceeds "
-                f"block_size_frames={cfg.block_size_frames}."
-            )
-
-        # Allocate one new physical block.
-        (block_id,) = self._pool.allocate(1)
-        state.logical_blocks.append(block_id)
-
-        # Write split K and V into the block for each layer.
-        # Pool block view shape: (block_size, n_kv_head, head_dim).
-        # new_kv_chunk[l] shape: (n_kv_head, chunk_frames, kv_last_dim).
-        head_dim = cfg.head_dim
-        for l in range(cfg.num_layers):
-            k_view, v_view = self._pool.get_kv_block_view(l, block_id)
-            layer_kv = new_kv_chunk[l]  # (n_kv_head, chunk_frames, kv_last_dim)
-            # Permute to (chunk_frames, n_kv_head, kv_last_dim) and split.
-            layer_kv_t = layer_kv.permute(1, 0, 2)  # (chunk_frames, n_kv_head, kv_last_dim)
-            k_view[:chunk_frames].copy_(layer_kv_t[..., :head_dim])
-            v_view[:chunk_frames].copy_(layer_kv_t[..., head_dim:])
-
-        state.num_committed_frames += chunk_frames
-
-        # Also keep block_table / cache_seqlens in sync for paged mode.
-        if state.block_table is not None:
-            logical_idx = len(state.logical_blocks) - 1
-            state.block_table[0, logical_idx] = block_id
-            state.cache_seqlens[0] = state.num_committed_frames
-
-        self._evict_oldest(stream_id)
 
     # ------------------------------------------------------------------
     # Paged-mode access and mutation
@@ -433,11 +294,6 @@ class AttentionCacheManager:
                 n = len(state.logical_blocks)
                 state.block_table[0, :n] = state.block_table[0, 1: n + 1].clone()
                 state.block_table[0, n] = 0
-
-    # Keep old name for backward compatibility.
-    def evict_oldest(self, stream_id: int) -> None:
-        """Alias for :meth:`_evict_oldest` (backward-compatible name)."""
-        self._evict_oldest(stream_id)
 
     def _get_state(self, stream_id: int) -> _StreamKVState:
         try:
