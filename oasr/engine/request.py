@@ -135,6 +135,11 @@ class Request:
 
         # Assigned by Scheduler
         self.stream_id: Optional[int] = None
+        # Assigned by ModelRunner when admitting the stream — a fixed slot
+        # id in ``[0, max_batch_size)`` indexing into the engine's
+        # persistent batched block_table, cache_seqlens, CNN cache and
+        # feature buffer. Released back to the slot pool on free_stream.
+        self.slot_id: Optional[int] = None
 
         # Populated by ModelRunner (streaming only)
         self.stream_context: Optional[StreamContext] = None

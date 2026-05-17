@@ -56,6 +56,10 @@ class CacheConfig:
     num_left_chunks: int = -1
     block_size_frames: int = 16
     max_num_blocks: int = 1024
+    max_batch_size: int = 32
+    """Maximum concurrent streams. Sizes the persistent batched block_table,
+    cache_seqlens, CNN cache, and feature buffer tensors. Each admitted stream
+    gets a slot id in ``[0, max_batch_size)`` via ``StreamSlotPool``."""
     device: torch.device = field(default_factory=lambda: torch.device("cuda"))
     dtype: torch.dtype = torch.float16
 

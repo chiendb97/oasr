@@ -265,6 +265,7 @@ class EngineConfig:
             block_size_frames=self.block_size_frames,
             max_num_blocks=self.max_num_blocks,
             max_blocks_per_seq=self.max_blocks_per_seq,
+            max_batch_size=self.max_batch_size,
             device=torch.device(self.device),
             dtype=self.dtype,
         )

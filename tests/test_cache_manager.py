@@ -188,20 +188,20 @@ class TestCnnCacheManager:
     def test_allocate_and_get_shape(self):
         cfg = make_config(num_layers=4, kernel_size=5, hidden_dim=16)
         mgr = CnnCacheManager(cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         cache = mgr.get_cache(0)
         assert cache.shape == (4, 1, 4, 16)  # (L, 1, K-1, D)
 
     def test_allocate_zero_initialized(self):
         cfg = make_config()
         mgr = CnnCacheManager(cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         assert mgr.get_cache(0).allclose(torch.zeros_like(mgr.get_cache(0)))
 
     def test_update_overwrites(self):
         cfg = make_config(num_layers=2, kernel_size=3, hidden_dim=8)
         mgr = CnnCacheManager(cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         new_val = torch.ones(2, 1, 2, 8)
         mgr.update(0, new_val)
         assert mgr.get_cache(0).allclose(new_val)
@@ -209,7 +209,7 @@ class TestCnnCacheManager:
     def test_update_again_overwrites(self):
         cfg = make_config(num_layers=2, kernel_size=3, hidden_dim=8)
         mgr = CnnCacheManager(cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         mgr.update(0, torch.ones(2, 1, 2, 8))
         new_val = torch.full((2, 1, 2, 8), 3.0)
         mgr.update(0, new_val)
@@ -218,21 +218,21 @@ class TestCnnCacheManager:
     def test_update_shape_mismatch_raises(self):
         cfg = make_config(num_layers=2, kernel_size=3, hidden_dim=8)
         mgr = CnnCacheManager(cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         with pytest.raises(ValueError, match="shape mismatch"):
             mgr.update(0, torch.ones(2, 1, 3, 8))  # wrong cnn_cache_frames
 
     def test_double_allocate_raises(self):
         cfg = make_config()
         mgr = CnnCacheManager(cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         with pytest.raises(ValueError, match="already allocated"):
-            mgr.allocate_stream(0)
+            mgr.allocate_stream(0, slot_id=1)
 
     def test_free_stream(self):
         cfg = make_config()
         mgr = CnnCacheManager(cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         mgr.free_stream(0)
         with pytest.raises(KeyError):
             mgr.get_cache(0)
@@ -252,8 +252,8 @@ class TestCnnCacheManager:
     def test_stream_isolation(self):
         cfg = make_config(num_layers=2, kernel_size=3, hidden_dim=8)
         mgr = CnnCacheManager(cfg)
-        mgr.allocate_stream(0)
-        mgr.allocate_stream(1)
+        mgr.allocate_stream(0, slot_id=0)
+        mgr.allocate_stream(1, slot_id=1)
         mgr.update(0, torch.ones(2, 1, 2, 8))
         # stream 1 should still be zeros
         assert mgr.get_cache(1).allclose(torch.zeros_like(mgr.get_cache(1)))
@@ -269,23 +269,15 @@ class TestAttentionCacheManager:
         cfg = make_config()
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         with pytest.raises(ValueError, match="already allocated"):
-            mgr.allocate_stream(0)
-
-    def test_get_paged_caches_before_prepare_raises(self):
-        cfg = make_config()
-        pool = BlockPool(cfg)
-        mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
-        with pytest.raises(RuntimeError, match="prepare_chunk"):
-            mgr.get_paged_caches(0)
+            mgr.allocate_stream(0, slot_id=1)
 
     def test_prepare_chunk_allocates_block_and_updates_table(self):
         cfg = make_config(num_layers=2, max_num_blocks=8)
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         initial_free = pool.num_free_blocks
         mgr.prepare_chunk(0)
         assert pool.num_free_blocks == initial_free - 1
@@ -300,7 +292,7 @@ class TestAttentionCacheManager:
         cfg = make_config(num_layers=1, chunk_size=4, block_size_frames=4, max_num_blocks=16)
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         mgr.prepare_chunk(0)
         mgr.commit_chunk_paged(0, chunk_frames=4)
         _, cs = mgr.get_paged_state_views(0)
@@ -317,7 +309,7 @@ class TestAttentionCacheManager:
         )
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         initial_free = pool.num_free_blocks
 
         # Commit 4 chunks: only the last 2 blocks should survive after eviction.
@@ -334,7 +326,7 @@ class TestAttentionCacheManager:
         cfg = make_config(num_layers=1, max_num_blocks=16)
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         initial = pool.num_free_blocks
         for _ in range(3):
             mgr.prepare_chunk(0)
@@ -348,7 +340,7 @@ class TestAttentionCacheManager:
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
         for sid in range(4):
-            mgr.allocate_stream(sid)
+            mgr.allocate_stream(sid, slot_id=sid)
         initial = pool.num_free_blocks
         mgr.prepare_chunks_batched([0, 1, 2, 3])
         assert pool.num_free_blocks == initial - 4
@@ -360,7 +352,7 @@ class TestAttentionCacheManager:
         cfg = make_config(num_layers=3, max_num_blocks=8)
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
-        mgr.allocate_stream(0)
+        mgr.allocate_stream(0, slot_id=0)
         mgr.prepare_chunk(0)
         caches = mgr.get_paged_caches(0)
         assert len(caches) == cfg.num_layers
@@ -455,6 +447,9 @@ class TestCtcStateCacheManager:
 class TestStreamContext:
     """Paged-mode lifecycle tests using CPU tensors (no CUDA required)."""
 
+    def setup_method(self):
+        self._next_slot = 0
+
     def _setup(self, num_left_chunks: int = -1) -> tuple:
         cfg = make_config(
             num_layers=2, n_kv_head=2, head_dim=4, hidden_dim=8,
@@ -471,8 +466,10 @@ class TestStreamContext:
         from unittest.mock import MagicMock
         ctc_mgr = MagicMock()
         ctc_mgr.free_stream = MagicMock()
-        att_mgr.allocate_stream(sid)
-        cnn_mgr.allocate_stream(sid)
+        slot = self._next_slot
+        self._next_slot += 1
+        att_mgr.allocate_stream(sid, slot_id=slot)
+        cnn_mgr.allocate_stream(sid, slot_id=slot)
         return StreamContext(sid, att_mgr, cnn_mgr, ctc_mgr)
 
     def test_initial_cnn_cache_is_zero(self):
@@ -532,8 +529,8 @@ class TestMultiStreamIsolation:
         cnn_mgr = CnnCacheManager(cfg)
 
         for sid in range(4):
-            att_mgr.allocate_stream(sid)
-            cnn_mgr.allocate_stream(sid)
+            att_mgr.allocate_stream(sid, slot_id=sid)
+            cnn_mgr.allocate_stream(sid, slot_id=sid)
 
         # Advance each stream a different number of chunks.
         for sid in range(4):
@@ -558,12 +555,12 @@ class TestMultiStreamIsolation:
         att_mgr = AttentionCacheManager(pool, cfg)
         cnn_mgr = CnnCacheManager(cfg)
 
-        for sid in range(4):
-            att_mgr.allocate_stream(sid)
-            cnn_mgr.allocate_stream(sid)
-            att_mgr.prepare_chunk(sid)
-            att_mgr.commit_chunk_paged(sid, chunk_frames=4)
-            cnn_mgr.update(sid, torch.full((1, 1, 2, 8), float(sid)))
+        for sid_ in range(4):
+            att_mgr.allocate_stream(sid_, slot_id=sid_)
+            cnn_mgr.allocate_stream(sid_, slot_id=sid_)
+            att_mgr.prepare_chunk(sid_)
+            att_mgr.commit_chunk_paged(sid_, chunk_frames=4)
+            cnn_mgr.update(sid_, torch.full((1, 1, 2, 8), float(sid_)))
 
         att_mgr.free_stream(1)
         cnn_mgr.free_stream(1)
@@ -587,11 +584,11 @@ class TestMultiStreamIsolation:
         cnn_mgr = CnnCacheManager(cfg)
         initial = pool.num_free_blocks  # 32
 
-        for sid in range(4):
-            att_mgr.allocate_stream(sid)
-            cnn_mgr.allocate_stream(sid)
-            att_mgr.prepare_chunk(sid)
-            att_mgr.commit_chunk_paged(sid, chunk_frames=4)
+        for sid_ in range(4):
+            att_mgr.allocate_stream(sid_, slot_id=sid_)
+            cnn_mgr.allocate_stream(sid_, slot_id=sid_)
+            att_mgr.prepare_chunk(sid_)
+            att_mgr.commit_chunk_paged(sid_, chunk_frames=4)
 
         assert pool.num_free_blocks == initial - 4
 

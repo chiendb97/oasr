@@ -2,14 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-stream CNN cache manager for conformer convolution modules.
 
-The CNN module in a causal conformer stores the last ``kernel_size - 1``
-input frames as left-context padding for the next chunk. This cache is
-fixed-size per stream (no paging required), so a simple per-stream tensor
-allocation is used.
+The causal Conformer CNN module stores the last ``kernel_size - 1`` input
+frames per layer as left-context padding for the next chunk. The cache is
+fixed-size per stream (no paging required), so we keep one **persistent
+batched tensor** of shape
+``(num_layers, max_batch_size, cnn_cache_frames, hidden_dim)`` and assign
+each admitted stream a slot id. Per-stream views are zero-copy slices.
 
-The cache tensor shape matches the ``cnn_cache`` argument accepted and
-returned by ``ConformerEncoder.forward_chunk_paged``:
-``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
+This replaces the old dict-of-tensors layout (one alloc per stream) plus
+the ``torch.cat`` of B per-stream caches that the batched paged forward
+used to do every chunk.
 """
 
 from __future__ import annotations
@@ -22,22 +24,19 @@ from oasr.cache.types import CacheConfig
 
 
 class CnnCacheManager:
-    """Manages fixed-size CNN cache tensors for all active streams.
-
-    Each stream holds one tensor of shape
-    ``(num_layers, 1, cnn_cache_frames, hidden_dim)`` that is overwritten
-    in place after every chunk.
+    """Slot-indexed CNN cache for all active streams.
 
     Parameters
     ----------
     config : CacheConfig
-        Cache configuration. The CNN cache only uses ``num_layers``,
-        ``cnn_cache_frames``, ``hidden_dim``, ``device``, and ``dtype``.
+        Cache configuration. The CNN cache uses ``num_layers``,
+        ``cnn_cache_frames``, ``hidden_dim``, ``max_batch_size``,
+        ``device``, and ``dtype``.
 
     Examples
     --------
     >>> mgr = CnnCacheManager(config)
-    >>> mgr.allocate_stream(stream_id=0)
+    >>> mgr.allocate_stream(stream_id=0, slot_id=0)
     >>> cache = mgr.get_cache(0)            # shape (L, 1, K-1, D)
     >>> mgr.update(0, new_cache)            # overwrite after forward_chunk_paged
     >>> mgr.free_stream(0)
@@ -45,108 +44,133 @@ class CnnCacheManager:
 
     def __init__(self, config: CacheConfig) -> None:
         self._config = config
-        self._caches: Dict[int, torch.Tensor] = {}
+        self._slots: Dict[int, int] = {}
+        # Persistent batched cache: (L, max_batch_size, K-1, D).
+        self._buffer = torch.zeros(
+            config.num_layers,
+            config.max_batch_size,
+            config.cnn_cache_frames,
+            config.hidden_dim,
+            dtype=config.dtype,
+            device=config.device,
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def allocate_stream(self, stream_id: int) -> None:
-        """Allocate a zero-initialized CNN cache tensor for a new stream.
-
-        Parameters
-        ----------
-        stream_id : int
-            Unique stream identifier.
+    def allocate_stream(self, stream_id: int, slot_id: int) -> None:
+        """Register a stream at the given slot id with a zeroed cache row.
 
         Raises
         ------
         ValueError
-            If ``stream_id`` is already allocated.
+            If ``stream_id`` is already allocated, or ``slot_id`` is out of
+            range / in use.
         """
-        if stream_id in self._caches:
+        if stream_id in self._slots:
             raise ValueError(f"CNN cache for stream {stream_id} already allocated.")
-        cfg = self._config
-        self._caches[stream_id] = torch.zeros(
-            cfg.num_layers,
-            1,
-            cfg.cnn_cache_frames,
-            cfg.hidden_dim,
-            dtype=cfg.dtype,
-            device=cfg.device,
-        )
+        if not (0 <= slot_id < self._config.max_batch_size):
+            raise ValueError(
+                f"slot_id {slot_id} out of range [0, {self._config.max_batch_size})"
+            )
+        if slot_id in self._slots.values():
+            raise ValueError(f"slot_id {slot_id} already in use")
+        self._slots[stream_id] = slot_id
+        # Zero this slot's column across all layers.
+        self._buffer[:, slot_id].zero_()
 
     def free_stream(self, stream_id: int) -> None:
-        """Release the CNN cache tensor for a stream.
-
-        Parameters
-        ----------
-        stream_id : int
-            Stream to release.
-
-        Raises
-        ------
-        KeyError
-            If ``stream_id`` is not allocated.
-        """
-        if stream_id not in self._caches:
+        """Release the slot mapping for a stream."""
+        if stream_id not in self._slots:
             raise KeyError(f"CNN cache for stream {stream_id} not found.")
-        del self._caches[stream_id]
+        del self._slots[stream_id]
 
     # ------------------------------------------------------------------
     # Access / update
     # ------------------------------------------------------------------
 
+    @property
+    def buffer(self) -> torch.Tensor:
+        """The persistent ``(L, max_batch_size, K-1, D)`` buffer."""
+        return self._buffer
+
+    def slot_of(self, stream_id: int) -> int:
+        if stream_id not in self._slots:
+            raise KeyError(f"CNN cache for stream {stream_id} not found.")
+        return self._slots[stream_id]
+
     def get_cache(self, stream_id: int) -> torch.Tensor:
-        """Return the CNN cache tensor for a stream.
-
-        The returned tensor is the live storage — callers should not modify
-        it directly; use ``update()`` instead.
-
-        Parameters
-        ----------
-        stream_id : int
-            Stream identifier.
+        """Return the CNN cache view for a single stream.
 
         Returns
         -------
         torch.Tensor
-            Shape ``(num_layers, 1, cnn_cache_frames, hidden_dim)`` matching
-            the ``cnn_cache`` input expected by ``forward_chunk_paged``.
+            Shape ``(num_layers, 1, cnn_cache_frames, hidden_dim)`` — a
+            zero-copy slice of the persistent buffer matching the
+            ``cnn_cache`` input expected by ``forward_chunk_paged``.
 
         Raises
         ------
         KeyError
             If ``stream_id`` is not allocated.
         """
-        if stream_id not in self._caches:
-            raise KeyError(f"CNN cache for stream {stream_id} not found.")
-        return self._caches[stream_id]
+        slot = self.slot_of(stream_id)
+        return self._buffer[:, slot: slot + 1]
+
+    def get_batched_cache(
+        self, slot_ids_gpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return ``(L, B_active, K-1, D)`` gather for a batched paged forward.
+
+        Replaces the old per-stream ``torch.cat(per_stream_cnn, dim=1)`` build
+        in the engine's batched paged path.
+        """
+        # index_select along the second (slot) axis.
+        return self._buffer.index_select(1, slot_ids_gpu)
 
     def update(self, stream_id: int, new_cnn_cache: torch.Tensor) -> None:
-        """Overwrite the CNN cache with the output from the latest chunk.
+        """Overwrite the CNN cache for a stream with the new chunk output.
 
         Parameters
         ----------
         stream_id : int
             Stream identifier.
         new_cnn_cache : torch.Tensor
-            New cache tensor, shape ``(num_layers, 1, cnn_cache_frames, hidden_dim)``
-            as returned by ``ConformerEncoder.forward_chunk_paged``.
-
-        Raises
-        ------
-        KeyError
-            If ``stream_id`` is not allocated.
-        ValueError
-            If ``new_cnn_cache`` shape is incompatible with the stored cache.
+            Shape ``(num_layers, 1, cnn_cache_frames, hidden_dim)`` as
+            returned by ``ConformerEncoder.forward_chunk_paged``.
         """
-        if stream_id not in self._caches:
-            raise KeyError(f"CNN cache for stream {stream_id} not found.")
-        stored = self._caches[stream_id]
-        if new_cnn_cache.shape != stored.shape:
+        slot = self.slot_of(stream_id)
+        expected = (
+            self._config.num_layers, 1,
+            self._config.cnn_cache_frames, self._config.hidden_dim,
+        )
+        if tuple(new_cnn_cache.shape) != expected:
             raise ValueError(
                 f"CNN cache shape mismatch for stream {stream_id}: "
-                f"expected {tuple(stored.shape)}, got {tuple(new_cnn_cache.shape)}."
+                f"expected {expected}, got {tuple(new_cnn_cache.shape)}."
             )
-        stored.copy_(new_cnn_cache)
+        self._buffer[:, slot: slot + 1].copy_(new_cnn_cache)
+
+    def update_batched(
+        self,
+        slot_ids_gpu: torch.Tensor,
+        new_cnn_cache: torch.Tensor,
+    ) -> None:
+        """Scatter-update the CNN cache for ``B`` streams in one call.
+
+        Parameters
+        ----------
+        slot_ids_gpu : Tensor
+            ``(B,)`` int64 slot ids on the cache device.
+        new_cnn_cache : Tensor
+            ``(num_layers, B, cnn_cache_frames, hidden_dim)`` — already in
+            batched layout produced by the encoder forward.
+        """
+        if new_cnn_cache.size(1) != slot_ids_gpu.size(0):
+            raise ValueError(
+                f"slot count {slot_ids_gpu.size(0)} does not match "
+                f"new_cnn_cache batch dim {new_cnn_cache.size(1)}"
+            )
+        # Vectorised scatter along the slot axis.
+        self._buffer.index_copy_(1, slot_ids_gpu, new_cnn_cache)

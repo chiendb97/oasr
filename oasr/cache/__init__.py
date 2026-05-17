@@ -50,6 +50,7 @@ Per-request usage (paged-only)::
 from oasr.cache.types import CacheConfig
 from oasr.cache.block_pool import BlockPool
 from oasr.cache.paged_kv import PagedKVCache
+from oasr.cache.slot_pool import StreamSlotPool
 from oasr.cache.attention_cache import AttentionCacheManager
 from oasr.cache.cnn_cache import CnnCacheManager
 from oasr.cache.ctc_state import CtcStateCacheManager
@@ -59,6 +60,7 @@ __all__ = [
     "CacheConfig",
     "BlockPool",
     "PagedKVCache",
+    "StreamSlotPool",
     "AttentionCacheManager",
     "CnnCacheManager",
     "CtcStateCacheManager",

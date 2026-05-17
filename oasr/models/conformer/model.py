@@ -601,8 +601,8 @@ class ConformerEncoder(nn.Module):
             Kept for signature compatibility.
         cache_t1 : int
             Maximum cached frames across the batch as a host-side int.
-            When non-negative, sizes the rel-pos embedding without a D2H
-            sync.  ``-1`` falls back to ``cache_seqlens.max().item()``.
+            Required (must be ``>= 0``): sizes the rel-pos embedding
+            without a D2H sync on ``cache_seqlens``.
 
         Returns
         -------
@@ -622,8 +622,11 @@ class ConformerEncoder(nn.Module):
         xs, _, _ = self.embed(xs, tmp_masks, offset)
 
         chunk_size = xs.size(1)
-        if cache_t1 < 0:
-            cache_t1 = int(att_caches[0].cache_seqlens.max().item())
+        assert cache_t1 >= 0, (
+            "forward_chunk_paged requires cache_t1 (max cached frames across "
+            "the batch) to be provided host-side; the engine tracks each "
+            "stream's offset already, so passing -1 would force a D2H sync."
+        )
         attention_key_size = cache_t1 + chunk_size
 
         # Per-stream pos_emb: positions begin at ``offset - cache_seqlens``

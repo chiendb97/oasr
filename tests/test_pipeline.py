@@ -201,8 +201,8 @@ def _cache_manager_streaming_paged(
     ctc_mgr = CtcStateCacheManager(GpuDecoderConfig(beam_size=beam_size))
 
     sid = 0
-    att_mgr.allocate_stream(sid)
-    cnn_mgr.allocate_stream(sid)
+    att_mgr.allocate_stream(sid, slot_id=0)
+    cnn_mgr.allocate_stream(sid, slot_id=0)
     ctc_mgr.allocate_stream(sid, batch=1, vocab_size=vocab_size, device=device)
     ctx = StreamContext(sid, att_mgr, cnn_mgr, ctc_mgr)
 
@@ -378,9 +378,9 @@ class TestMultiStreamIsolation:
         ctc_mgr = CtcStateCacheManager(GpuDecoderConfig(beam_size=5))
 
         sid_a, sid_b = 10, 20
-        for sid in (sid_a, sid_b):
-            att_mgr.allocate_stream(sid)
-            cnn_mgr.allocate_stream(sid)
+        for slot, sid in enumerate((sid_a, sid_b)):
+            att_mgr.allocate_stream(sid, slot_id=slot)
+            cnn_mgr.allocate_stream(sid, slot_id=slot)
             ctc_mgr.allocate_stream(sid, batch=1, vocab_size=VOCAB_SIZE, device=device)
 
         ctx_a = StreamContext(sid_a, att_mgr, cnn_mgr, ctc_mgr)
@@ -553,9 +553,9 @@ class TestStreamingWithRealAudio:
         initial_free = pool.num_free_blocks
 
         sid_a, sid_b = 1, 2
-        for sid in (sid_a, sid_b):
-            att_mgr.allocate_stream(sid)
-            cnn_mgr.allocate_stream(sid)
+        for slot, sid in enumerate((sid_a, sid_b)):
+            att_mgr.allocate_stream(sid, slot_id=slot)
+            cnn_mgr.allocate_stream(sid, slot_id=slot)
             ctc_mgr.allocate_stream(sid, batch=1, vocab_size=VOCAB_SIZE, device=device)
 
         ctx_a = StreamContext(sid_a, att_mgr, cnn_mgr, ctc_mgr)

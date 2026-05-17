@@ -656,10 +656,16 @@ class InputProcessor:
             return
 
         nvtx_push("pad+pin")
-        lengths_cpu = torch.tensor(
-            [w.numel() for w in fbank_inputs], dtype=torch.int64
-        )
-        T_max = int(lengths_cpu.max().item())
+        # Host-side waveform sample counts and the deterministic Kaldi
+        # snip_edges frame count formula give us ``feat_lens`` without a
+        # GPU→CPU sync on the fbank-output length tensor.
+        sample_counts = [w.numel() for w in fbank_inputs]
+        T_max = max(sample_counts)
+        feat_lens_cpu: List[int] = [
+            ((n - frame_len) // frame_shift + 1) if n >= frame_len else 0
+            for n in sample_counts
+        ]
+        lengths_cpu = torch.tensor(sample_counts, dtype=torch.int64)
 
         padded_cpu = torch.zeros(len(fbank_inputs), T_max, dtype=torch.float32)
         for i, w in enumerate(fbank_inputs):
@@ -690,9 +696,10 @@ class InputProcessor:
                 lengths_gpu = lengths_cpu_pin.to(device=device, non_blocking=True)
                 nvtx_pop()
                 nvtx_push("fbank")
-                feats_f32, feat_lens = batched_fbank_gpu(wav_gpu, lengths_gpu, fcfg)
+                feats_f32, _feat_lens_gpu = batched_fbank_gpu(wav_gpu, lengths_gpu, fcfg)
                 feats = feats_f32.to(dtype=dtype)
-                feat_lens_cpu = feat_lens.to(device="cpu").tolist()
+                # feat_lens_cpu was computed host-side above; the GPU
+                # ``feat_lens`` tensor is left unused to avoid the D2H sync.
                 nvtx_pop()
         else:
             # Fallback: per-utt CPU/torchaudio fbank.  Used by non-Povey
