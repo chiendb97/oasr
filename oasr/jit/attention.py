@@ -244,11 +244,22 @@ def _compiled_fmha(
     # divisibility=128/dtype.width tells the compiler that the leading dim
     # has guaranteed alignment so the verifier accepts the copy. Without it,
     # the upstream FA2 example also fails on this same alignment check.
+    #
+    # NB: ``enable_tvm_ffi=True`` on ``from_dlpack`` plus
+    # ``options="--enable-tvm-ffi"`` on ``cute.compile`` together emit a
+    # compiled callable that accepts raw torch tensors at call time
+    # (rather than per-call ``from_dlpack`` wrappers) and is safe to
+    # capture into a ``torch.cuda.CUDAGraph``. The legacy per-call
+    # ``from_dlpack`` path produces fresh Python descriptor objects whose
+    # backing dlpack capsules get GC'd between graph replays, which is
+    # what causes the streaming engine's ``CUDA_ERROR_ILLEGAL_ADDRESS``.
+    # This is the same pattern Flash Attention's ``flash_attn/cute``
+    # uses (cute_dsl_utils.py::to_cute_tensor with enable_tvm_ffi=True).
     elem_bits = 16 if dtype_str == "float16" else 16  # bf16 is also 16b
     align_div = 128 // elem_bits
     def _wrap(t: torch.Tensor) -> "cute.Tensor":
         return (
-            from_dlpack(t, assumed_align=16)
+            from_dlpack(t, assumed_align=16, enable_tvm_ffi=True)
             .mark_layout_dynamic(leading_dim=t.dim() - 1)
             .mark_compact_shape_dynamic(
                 mode=t.dim() - 1,
@@ -265,12 +276,14 @@ def _compiled_fmha(
     else:
         # Zero-rank dummy: cute.rank(mBias) > 0 in the kernel == False.
         mBias = from_dlpack(
-            torch.empty((), dtype=torch_dtype, device=device), assumed_align=16,
+            torch.empty((), dtype=torch_dtype, device=device),
+            assumed_align=16, enable_tvm_ffi=True,
         )
 
     seqlens = torch.zeros(B, dtype=torch.int32, device=device)
     mCacheSeqlens = (
-        from_dlpack(seqlens, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        from_dlpack(seqlens, assumed_align=4, enable_tvm_ffi=True)
+        .mark_layout_dynamic(leading_dim=0)
     )
 
     if paged:
@@ -279,13 +292,14 @@ def _compiled_fmha(
             dtype=torch.int32, device=device,
         )
         mBlockTable = (
-            from_dlpack(block_table, assumed_align=4)
+            from_dlpack(block_table, assumed_align=4, enable_tvm_ffi=True)
             .mark_layout_dynamic(leading_dim=block_table.dim() - 1)
         )
     else:
         # Zero-rank dummy when paged=False; kernel never reads it.
         mBlockTable = from_dlpack(
-            torch.empty((), dtype=torch.int32, device=device), assumed_align=4,
+            torch.empty((), dtype=torch.int32, device=device),
+            assumed_align=4, enable_tvm_ffi=True,
         )
 
     import cuda.bindings.driver as cuda_driver
@@ -295,6 +309,7 @@ def _compiled_fmha(
     return cute.compile(
         inst, mQ, mK, mV, mO, mBias, mCacheSeqlens, mBlockTable,
         softmax_scale, stream,
+        options="--enable-tvm-ffi",
     )
 
 

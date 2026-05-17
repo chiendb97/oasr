@@ -145,32 +145,30 @@ def persistent_inputs():
             _descriptor_cache.clear()
 
 
-def _get_dummy_bias(dtype: torch.dtype, device: torch.device):
-    """Return the cached ``(tensor, wrapped_descriptor)`` for a 0-rank dummy bias.
+def _get_dummy_bias(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Return a process-cached zero-rank torch tensor for the no-bias path.
 
+    The TVM-FFI compiled callable accepts torch tensors directly, so we
+    keep the dummy as a torch tensor (no per-call ``from_dlpack`` wrap).
     ``has_bias=False`` kernels read ``mBias`` as a zero-rank tensor and
-    the kernel never dereferences it. Cache by ``(dtype, device_index)``.
+    the kernel never dereferences it.
     """
     key = (dtype, device.index if device.index is not None else 0)
-    entry = _dummy_bias_cache.get(key)
-    if entry is None:
+    t = _dummy_bias_cache.get(key)
+    if t is None:
         t = torch.empty((), dtype=dtype, device=device)
-        wrapped = _from_dlpack(t, assumed_align=16)
-        entry = (t, wrapped)
-        _dummy_bias_cache[key] = entry
-    return entry[1]
+        _dummy_bias_cache[key] = t
+    return t
 
 
-def _get_dummy_block_table(device: torch.device):
-    """Return the cached wrapped descriptor for a 0-rank int32 block_table."""
+def _get_dummy_block_table(device: torch.device) -> torch.Tensor:
+    """Return the cached zero-rank int32 dummy block_table torch tensor."""
     idx = device.index if device.index is not None else 0
-    entry = _dummy_block_table_cache.get(idx)
-    if entry is None:
+    t = _dummy_block_table_cache.get(idx)
+    if t is None:
         t = torch.empty((), dtype=torch.int32, device=device)
-        wrapped = _from_dlpack(t, assumed_align=4)
-        entry = (t, wrapped)
-        _dummy_block_table_cache[idx] = entry
-    return entry[1]
+        _dummy_block_table_cache[idx] = t
+    return t
 
 
 def _get_offline_seqlens(B: int, T_k: int, device: torch.device) -> torch.Tensor:
@@ -569,12 +567,17 @@ def _call_cute_dsl(
     cache_seqlens: Optional[torch.Tensor],
     block_table: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Wrap torch tensors as CuteDSL descriptors and invoke the compiled kernel.
+    """Invoke the TVM-FFI compiled CuteDSL kernel with raw torch tensors.
 
-    Hot path: 4 ``from_dlpack`` calls (Q/K/V/O), optionally one for bias and
-    one for block_table when those features are active; module-cached
-    descriptors otherwise. Plus one in-place fill on the cached seqlens
-    buffer in offline mode.
+    With ``options="--enable-tvm-ffi"`` baked into ``cute.compile`` and
+    ``enable_tvm_ffi=True`` passed at descriptor build time, the compiled
+    callable accepts torch tensors directly — no per-call ``from_dlpack``
+    wrappers needed. This is the same path Flash Attention's
+    ``flash_attn/cute`` uses; it is the only kernel-side call pattern
+    that is safe to capture into a ``torch.cuda.CUDAGraph`` and replay
+    across mutating chunks (the legacy per-call wrapper produces fresh
+    Python capsule objects whose ownership is freed between replays,
+    which causes the in-graph ``CUDA_ERROR_ILLEGAL_ADDRESS``).
     """
     dtype_str = "float16" if q.dtype is torch.float16 else "bfloat16"
     device = q.device
@@ -596,33 +599,30 @@ def _call_cute_dsl(
 
     # Q/K/V/O must have strictly canonical row-major strides; see
     # ``_ensure_canonical`` for why ``.is_contiguous()`` alone is unsafe.
-    mQ = _wrap16_cached(_ensure_canonical(q))
-    mK = _wrap16_cached(_ensure_canonical(k))
-    mV = _wrap16_cached(_ensure_canonical(v))
-    mO = _wrap16_cached(_ensure_canonical(out))
+    q_t = _ensure_canonical(q)
+    k_t = _ensure_canonical(k)
+    v_t = _ensure_canonical(v)
+    o_t = _ensure_canonical(out)
 
     if attn_bias is not None:
-        # NB: bias uses ``_wrap_bias_cached`` (no divisibility hint on the
-        # leading T_k axis) -- bias is read scalar-style by the kernel,
-        # so a T_k of e.g. 249 (real audio frame counts) is legal.
-        mBias = _wrap_bias_cached(_ensure_canonical(attn_bias))
+        bias_t = _ensure_canonical(attn_bias)
     else:
-        mBias = _get_dummy_bias(q.dtype, device)
+        bias_t = _get_dummy_bias(q.dtype, device)
 
     # cache_seqlens: synthesize a (B,) buffer of T_k in offline mode using
-    # the cached process buffer; otherwise wrap the caller's tensor.
+    # the cached process buffer; otherwise use the caller's tensor.
     if cache_seqlens is not None:
-        sl = _ensure_canonical(cache_seqlens)
+        seqlens_t = _ensure_canonical(cache_seqlens)
     else:
-        sl = _get_offline_seqlens(B, T_k, device)
-    mCacheSeqlens = _wrap_seqlens_cached(sl)
+        seqlens_t = _get_offline_seqlens(B, T_k, device)
 
     if paged:
-        mBlockTable = _wrap_block_table_cached(_ensure_canonical(block_table))
+        block_table_t = _ensure_canonical(block_table)
     else:
-        mBlockTable = _get_dummy_block_table(device)
+        block_table_t = _get_dummy_block_table(device)
 
     stream = _CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(mQ, mK, mV, mO, mBias, mCacheSeqlens, mBlockTable,
+    # TVM-FFI compiled callable accepts torch tensors directly.
+    fn(q_t, k_t, v_t, o_t, bias_t, seqlens_t, block_table_t,
        _Float32(float(softmax_scale)), stream)
     return out

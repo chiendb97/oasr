@@ -23,6 +23,7 @@ from oasr.models.conformer.model import ConformerModel
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from .config import EngineConfig
+from .graph_cache import GraphedEncoderForward, round_up_bucket
 from .request import Request
 
 
@@ -73,6 +74,30 @@ class ModelRunner:
             )
         else:
             self._ctc_mgr = CtcStateCacheManager(config.gpu_decoder_config)
+
+        # CUDA Graph cache for the steady-state batched paged forward.
+        # Captures lazily on first encounter of each (B_active, cache_t1
+        # bucket) shape. Eager fallback is used for non-CUDA devices, when
+        # graphs are disabled, or for partial/final windows.
+        self._use_cuda_graphs = (
+            config.use_cuda_graphs
+            and torch.device(config.device).type == "cuda"
+        )
+        if self._use_cuda_graphs:
+            self._graph_cache = GraphedEncoderForward(
+                model,
+                self._att_mgr,
+                self._cnn_mgr,
+                cache_dtype=cache_config.dtype,
+                device=torch.device(config.device),
+                window=config.decoding_window,
+                feat_dim=config.feature_config.output_dim,
+                cnn_cache_frames=cache_config.cnn_cache_frames,
+                num_layers=cache_config.num_layers,
+                hidden_dim=cache_config.hidden_dim,
+            )
+        else:
+            self._graph_cache = None
 
     # ------------------------------------------------------------------
     # Offline forward
@@ -298,6 +323,7 @@ class ModelRunner:
             return
 
         nvtx_push(f"batched_paged[B={len(group)}]")
+        B_active = len(group)
         stream_ids = [req.stream_id for req in group]
         slot_ids_host = [req.slot_id for req in group]
         assert all(s is not None for s in slot_ids_host), (
@@ -312,16 +338,8 @@ class ModelRunner:
         self._att_mgr.prepare_chunks_batched(stream_ids)  # type: ignore[arg-type]
         nvtx_pop()
 
-        # 2. Gather B_active-row views of the persistent block_table /
-        #    cache_seqlens (two index_select kernels — no per-stream
-        #    torch.cat / dataclass rebuild loop). The persistent paged
-        #    K/V pool views are shared across layers.
+        # 2. Gather feature-chunk slices and CNN cache rows in one shot.
         max_offset = max(req.offset for req in group)
-        batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_gpu)
-        for c in batched_att_caches:
-            c.host_seqlen_max = max_offset
-
-        # 3. Gather feature-chunk slices and CNN cache rows in one shot.
         feature_chunks = [
             req.feature_buffer[req.feature_cursor: req.feature_cursor + window]
             for req in group
@@ -329,31 +347,43 @@ class ModelRunner:
         xs = torch.stack(feature_chunks, dim=0)  # (B, window, F)
         cnn_cache = self._cnn_mgr.get_batched_cache(slot_ids_gpu)  # (L, B, T, H)
 
-        # 4. Homogeneous-offset fast path: pass a scalar so the encoder can
-        #    broadcast pos_emb and the kernel can use the int-offset write
-        #    path. Heterogeneous case allocates a small (B,) tensor.
-        homogeneous = all(req.offset == max_offset for req in group)
-        if homogeneous:
-            offset_arg: object = max_offset
-        else:
-            offset_arg = torch.tensor(
-                [req.offset for req in group],
-                dtype=torch.int32, device=device,
-            )
-
-        # 5. One batched encoder call.
-        nvtx_push("encoder_call")
-        log_probs, new_cnn = self._model.forward_chunk_paged(
-            xs,
-            offset_arg,
-            batched_att_caches,
-            cnn_cache,
-            cache_t1=max_offset,
+        # 3. Per-stream encoder-frame offsets (always a tensor for the
+        #    graphed path; the eager fallback accepts the same tensor).
+        offsets_gpu = torch.tensor(
+            [req.offset for req in group],
+            dtype=torch.int32, device=device,
         )
+
+        # 4. Encoder forward — graph replay when shape matches steady
+        #    state (B == max_batch_size); eager otherwise. Restricting
+        #    capture to steady-state shapes bounds the number of captured
+        #    graphs and avoids the cross-capture aliasing hazards of
+        #    sharing a CUDA graph memory pool.
+        nvtx_push("encoder_call")
+        cache_t1_bucket = round_up_bucket(max_offset)
+        use_graph = (
+            self._use_cuda_graphs
+            and self._graph_cache is not None
+            and B_active == self._cache_config.max_batch_size
+        )
+        if use_graph:
+            log_probs, new_cnn = self._graph_cache.replay(
+                B_active, cache_t1_bucket,
+                xs=xs, cnn_in=cnn_cache,
+                slot_ids=slot_ids_gpu, offsets=offsets_gpu,
+            )
+        else:
+            batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_gpu)
+            for c in batched_att_caches:
+                c.host_seqlen_max = max_offset
+            log_probs, new_cnn = self._model.forward_chunk_paged(
+                xs, offsets_gpu, batched_att_caches, cnn_cache,
+                cache_t1=max_offset,
+            )
         actual_frames = log_probs.size(1)
         nvtx_pop()
 
-        # 6. Commit: one scatter onto the persistent cache_seqlens via the
+        # 5. Commit: one scatter onto the persistent cache_seqlens via the
         #    batched API, one index_copy_ to scatter the new CNN cache back
         #    into the persistent buffer, then host-side cursor / result
         #    updates.
