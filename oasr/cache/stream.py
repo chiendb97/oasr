@@ -14,11 +14,11 @@ Typical usage (paged-only)::
     for chunk_audio in audio_chunks:
         ctx.prepare_chunk()                       # allocate block for next write
         att_caches = ctx.get_att_caches()         # List[PagedKVCache], one per layer
-        cnn_cache  = ctx.get_cnn_cache()          # (L, 1, K-1, D)
-        logits, new_cnn = model.forward_chunk_paged(
+        cnn_cache  = ctx.get_cnn_cache()          # SlotCnnCache descriptor
+        logits = model.forward_chunk_paged(
             chunk_audio, offset, att_caches, cnn_cache, cache_t1=offset,
         )
-        ctx.commit_chunk_paged(logits.size(1), new_cnn)
+        ctx.commit_chunk_paged(logits.size(1))    # advance cache_seqlens
         ctx.get_decoder().decode_chunk(logits)
 
     result = ctx.get_decoder().finalize_stream()
@@ -35,6 +35,7 @@ from oasr.cache.attention_cache import AttentionCacheManager
 from oasr.cache.cnn_cache import CnnCacheManager
 from oasr.cache.ctc_state import CtcStateCacheManager
 from oasr.cache.paged_kv import PagedKVCache
+from oasr.cache.slot_cnn import SlotCnnCache
 from oasr.ctc_decode import GpuStreamingDecoder, StreamHandle
 
 
@@ -65,7 +66,7 @@ class StreamContext:
     >>> ctx = StreamContext(sid, att_mgr, cnn_mgr, ctc_mgr)
     >>> ctx.prepare_chunk()
     >>> ctx.get_att_caches()              # pass to forward_chunk_paged
-    >>> ctx.commit_chunk_paged(n, cnn)    # update after forward_chunk_paged
+    >>> ctx.commit_chunk_paged(n)         # advance KV cache_seqlens
     >>> ctx.free()                        # release all resources
     """
 
@@ -94,17 +95,20 @@ class StreamContext:
     # Cache access
     # ------------------------------------------------------------------
 
-    def get_cnn_cache(self) -> torch.Tensor:
-        """Return the CNN cache tensor for ``forward_chunk_paged``.
+    def get_cnn_cache(self) -> SlotCnnCache:
+        """Return the slot-indexed CNN cache descriptor for this stream.
 
         Returns
         -------
-        torch.Tensor
-            Shape ``(num_layers, 1, cnn_cache_frames, hidden_dim)`` matching
-            the ``cnn_cache`` parameter of
-            ``ConformerEncoder.forward_chunk_paged``.
+        SlotCnnCache
+            Wraps the persistent CNN buffer plus a ``(1,)`` int64 slot-id
+            tensor for this stream, matching the ``cnn_cache`` parameter of
+            :meth:`~oasr.models.conformer.ConformerModel.forward_chunk_paged`.
         """
-        return self._cnn_cache.get_cache(self._stream_id)
+        slot = self._cnn_cache.slot_of(self._stream_id)
+        buffer = self._cnn_cache.buffer
+        slot_ids = torch.tensor([slot], dtype=torch.long, device=buffer.device)
+        return SlotCnnCache(buffer=buffer, slot_ids=slot_ids)
 
     def get_decoder(self) -> Union[GpuStreamingDecoder, StreamHandle]:
         """Return the CTC streaming decoder for this stream.
@@ -150,27 +154,20 @@ class StreamContext:
     # Mutation
     # ------------------------------------------------------------------
 
-    def commit_chunk_paged(
-        self,
-        chunk_frames: int,
-        new_cnn_cache: torch.Tensor,
-    ) -> None:
-        """Commit cache state after a :meth:`forward_chunk_paged` call.
+    def commit_chunk_paged(self, chunk_frames: int) -> None:
+        """Advance KV ``cache_seqlens`` after a :meth:`forward_chunk_paged` call.
 
-        K/V were already written into the pool by the attention layer.  This
-        method advances ``cache_seqlens``, evicts if needed, and stores the
-        updated CNN cache.
+        K/V are already in the pool (written by the attention layer) and the
+        CNN cache is already committed in place (scattered by the encoder
+        through the :class:`SlotCnnCache` descriptor). This method just
+        advances the per-stream ``cache_seqlens`` and evicts if needed.
 
         Parameters
         ----------
         chunk_frames : int
             Number of encoder-output frames written (usually ``chunk_size``).
-        new_cnn_cache : torch.Tensor
-            CNN cache returned by ``forward_chunk_paged``.
-            Shape: ``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
         """
         self._attention_cache.commit_chunk_paged(self._stream_id, chunk_frames)
-        self._cnn_cache.update(self._stream_id, new_cnn_cache)
 
     # ------------------------------------------------------------------
     # Cleanup

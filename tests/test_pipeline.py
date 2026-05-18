@@ -208,16 +208,15 @@ def _cache_manager_streaming_paged(
 
     offset = 0
     logits_list = []
-    cnn_cache = torch.zeros(0, 0, 0, 0, dtype=dtype, device=device)
     with torch.no_grad():
         for xs in chunks:
             ctx.prepare_chunk()
             att_caches = ctx.get_att_caches()
-            probs, new_cnn = model.forward_chunk_paged(
+            cnn_cache = ctx.get_cnn_cache()
+            probs = model.forward_chunk_paged(
                 xs, offset, att_caches, cnn_cache, cache_t1=offset,
             )
-            ctx.commit_chunk_paged(probs.size(1), new_cnn)
-            cnn_cache = new_cnn
+            ctx.commit_chunk_paged(probs.size(1))
             ctx.get_decoder().decode_chunk(probs)
             logits_list.append(probs)
             offset += probs.size(1)
@@ -389,27 +388,22 @@ class TestMultiStreamIsolation:
         chunks_a = _make_chunks(n_chunks, seed=100, device=device, dtype=dtype)
         chunks_b = _make_chunks(n_chunks, seed=200, device=device, dtype=dtype)
 
-        cnn_cache_a = torch.zeros(0, 0, 0, 0, dtype=dtype, device=device)
-        cnn_cache_b = torch.zeros(0, 0, 0, 0, dtype=dtype, device=device)
         offset_a = offset_b = 0
 
         with torch.no_grad():
             for xs_a, xs_b in zip(chunks_a, chunks_b):
-                for ctx, xs, off, cnn_state in (
-                    (ctx_a, xs_a, offset_a, cnn_cache_a),
-                    (ctx_b, xs_b, offset_b, cnn_cache_b),
+                for ctx, xs, off in (
+                    (ctx_a, xs_a, offset_a),
+                    (ctx_b, xs_b, offset_b),
                 ):
                     ctx.prepare_chunk()
                     att_caches = ctx.get_att_caches()
-                    probs, new_cnn = model.forward_chunk_paged(
-                        xs, off, att_caches, cnn_state, cache_t1=off,
+                    cnn_cache = ctx.get_cnn_cache()
+                    probs = model.forward_chunk_paged(
+                        xs, off, att_caches, cnn_cache, cache_t1=off,
                     )
-                    ctx.commit_chunk_paged(probs.size(1), new_cnn)
+                    ctx.commit_chunk_paged(probs.size(1))
                     ctx.get_decoder().decode_chunk(probs)
-                    if ctx is ctx_a:
-                        cnn_cache_a = new_cnn
-                    else:
-                        cnn_cache_b = new_cnn
                 offset_a += CHUNK_SIZE
                 offset_b += CHUNK_SIZE
 
@@ -561,27 +555,22 @@ class TestStreamingWithRealAudio:
         ctx_a = StreamContext(sid_a, att_mgr, cnn_mgr, ctc_mgr)
         ctx_b = StreamContext(sid_b, att_mgr, cnn_mgr, ctc_mgr)
 
-        cnn_cache_a = torch.zeros(0, 0, 0, 0, dtype=dtype, device=device)
-        cnn_cache_b = torch.zeros(0, 0, 0, 0, dtype=dtype, device=device)
         offset_a = offset_b = 0
 
         with torch.no_grad():
             for xs_a, xs_b in zip(chunks_a, chunks_b):
-                for ctx, xs, off, cnn_state, sid_local in (
-                    (ctx_a, xs_a, offset_a, cnn_cache_a, "a"),
-                    (ctx_b, xs_b, offset_b, cnn_cache_b, "b"),
+                for ctx, xs, off in (
+                    (ctx_a, xs_a, offset_a),
+                    (ctx_b, xs_b, offset_b),
                 ):
                     ctx.prepare_chunk()
                     att_caches = ctx.get_att_caches()
-                    probs, new_cnn = model.forward_chunk_paged(
-                        xs, off, att_caches, cnn_state, cache_t1=off,
+                    cnn_cache = ctx.get_cnn_cache()
+                    probs = model.forward_chunk_paged(
+                        xs, off, att_caches, cnn_cache, cache_t1=off,
                     )
-                    ctx.commit_chunk_paged(probs.size(1), new_cnn)
+                    ctx.commit_chunk_paged(probs.size(1))
                     ctx.get_decoder().decode_chunk(probs)
-                    if sid_local == "a":
-                        cnn_cache_a = new_cnn
-                    else:
-                        cnn_cache_b = new_cnn
                 offset_a += CHUNK_SIZE
                 offset_b += CHUNK_SIZE
 

@@ -37,10 +37,10 @@ Per-request usage (paged-only)::
     for chunk_audio in audio_chunks:
         ctx.prepare_chunk()
         att_caches = ctx.get_att_caches()
-        cnn_cache  = ctx.get_cnn_cache()
-        logits, new_cnn = model.forward_chunk_paged(
+        cnn_cache  = ctx.get_cnn_cache()        # SlotCnnCache descriptor
+        logits = model.forward_chunk_paged(
             chunk_audio, offset, att_caches, cnn_cache, cache_t1=offset)
-        ctx.commit_chunk_paged(logits.size(1), new_cnn)
+        ctx.commit_chunk_paged(logits.size(1))
         ctx.get_decoder().decode_chunk(logits)
 
     result = ctx.get_decoder().finalize_stream()
@@ -50,6 +50,7 @@ Per-request usage (paged-only)::
 from oasr.cache.types import CacheConfig
 from oasr.cache.block_pool import BlockPool
 from oasr.cache.paged_kv import PagedKVCache
+from oasr.cache.slot_cnn import SlotCnnCache
 from oasr.cache.slot_pool import StreamSlotPool
 from oasr.cache.attention_cache import AttentionCacheManager
 from oasr.cache.cnn_cache import CnnCacheManager
@@ -60,6 +61,7 @@ __all__ = [
     "CacheConfig",
     "BlockPool",
     "PagedKVCache",
+    "SlotCnnCache",
     "StreamSlotPool",
     "AttentionCacheManager",
     "CnnCacheManager",

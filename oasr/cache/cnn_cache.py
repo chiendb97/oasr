@@ -9,9 +9,10 @@ batched tensor** of shape
 ``(num_layers, max_batch_size, cnn_cache_frames, hidden_dim)`` and assign
 each admitted stream a slot id. Per-stream views are zero-copy slices.
 
-This replaces the old dict-of-tensors layout (one alloc per stream) plus
-the ``torch.cat`` of B per-stream caches that the batched paged forward
-used to do every chunk.
+The batched paged forward reads / writes this buffer in place via a
+:class:`~oasr.cache.SlotCnnCache` descriptor (gather at the top of the
+encoder, scatter at the bottom), mirroring how K/V are written through
+:class:`~oasr.cache.PagedKVCache`.
 """
 
 from __future__ import annotations
@@ -37,8 +38,11 @@ class CnnCacheManager:
     --------
     >>> mgr = CnnCacheManager(config)
     >>> mgr.allocate_stream(stream_id=0, slot_id=0)
+    >>> # The encoder usually wraps this with a SlotCnnCache descriptor and
+    >>> # scatters new tails back in place via ``forward_chunk_paged``; the
+    >>> # accessors below remain for direct per-stream inspection / tests.
     >>> cache = mgr.get_cache(0)            # shape (L, 1, K-1, D)
-    >>> mgr.update(0, new_cache)            # overwrite after forward_chunk_paged
+    >>> mgr.update(0, new_cache)
     >>> mgr.free_stream(0)
     """
 
@@ -118,27 +122,20 @@ class CnnCacheManager:
         slot = self.slot_of(stream_id)
         return self._buffer[:, slot: slot + 1]
 
-    def get_batched_cache(
-        self, slot_ids_gpu: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return ``(L, B_active, K-1, D)`` gather for a batched paged forward.
-
-        Replaces the old per-stream ``torch.cat(per_stream_cnn, dim=1)`` build
-        in the engine's batched paged path.
-        """
-        # index_select along the second (slot) axis.
-        return self._buffer.index_select(1, slot_ids_gpu)
-
     def update(self, stream_id: int, new_cnn_cache: torch.Tensor) -> None:
         """Overwrite the CNN cache for a stream with the new chunk output.
+
+        Streaming forwards normally update the buffer in place via a
+        :class:`~oasr.cache.SlotCnnCache` descriptor passed into
+        ``forward_chunk_paged``; this accessor remains for direct
+        per-stream inspection and tests.
 
         Parameters
         ----------
         stream_id : int
             Stream identifier.
         new_cnn_cache : torch.Tensor
-            Shape ``(num_layers, 1, cnn_cache_frames, hidden_dim)`` as
-            returned by ``ConformerEncoder.forward_chunk_paged``.
+            Shape ``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
         """
         slot = self.slot_of(stream_id)
         expected = (
@@ -151,26 +148,3 @@ class CnnCacheManager:
                 f"expected {expected}, got {tuple(new_cnn_cache.shape)}."
             )
         self._buffer[:, slot: slot + 1].copy_(new_cnn_cache)
-
-    def update_batched(
-        self,
-        slot_ids_gpu: torch.Tensor,
-        new_cnn_cache: torch.Tensor,
-    ) -> None:
-        """Scatter-update the CNN cache for ``B`` streams in one call.
-
-        Parameters
-        ----------
-        slot_ids_gpu : Tensor
-            ``(B,)`` int64 slot ids on the cache device.
-        new_cnn_cache : Tensor
-            ``(num_layers, B, cnn_cache_frames, hidden_dim)`` — already in
-            batched layout produced by the encoder forward.
-        """
-        if new_cnn_cache.size(1) != slot_ids_gpu.size(0):
-            raise ValueError(
-                f"slot count {slot_ids_gpu.size(0)} does not match "
-                f"new_cnn_cache batch dim {new_cnn_cache.size(1)}"
-            )
-        # Vectorised scatter along the slot axis.
-        self._buffer.index_copy_(1, slot_ids_gpu, new_cnn_cache)

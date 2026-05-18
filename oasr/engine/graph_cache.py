@@ -4,9 +4,12 @@
 
 A standalone PyTorch :class:`torch.cuda.CUDAGraph` is captured per
 ``(B_active, cache_t1_bucket)`` shape. Captures are lazy on first
-encounter; replays reuse pre-allocated input buffers (``xs``, ``cnn``,
-``slot_ids``, ``offset``) plus the captured output buffers
-(``log_probs``, ``new_cnn``).
+encounter; replays reuse pre-allocated input buffers (``xs``,
+``slot_ids``, ``offset``) and the captured output buffer ``log_probs``.
+The CNN cache is read/written in place inside the captured forward via
+a :class:`~oasr.cache.SlotCnnCache` descriptor, so the persistent
+``CnnCacheManager`` buffer is updated directly without a separate
+post-replay scatter.
 
 Steady-state streaming is launch-bound — the model's 12-layer conformer
 encoder issues ~200 small kernels per chunk, and at 32 streams ×
@@ -24,6 +27,10 @@ Capture constraints
 * The encoder is invoked with ``offset`` as a per-stream int32 tensor
   (heterogeneous-offset code path) regardless of whether the actual batch
   is homogeneous — the captured code path must be stable.
+* The CNN buffer rows referenced by ``slot_ids`` are snapshotted before
+  capture and restored after; the warmup and captured ``_run`` both
+  mutate those rows, but the first real replay must read the engine's
+  pre-chunk state.
 """
 
 from __future__ import annotations
@@ -37,6 +44,7 @@ import tvm_ffi
 from oasr.cache.attention_cache import AttentionCacheManager
 from oasr.cache.cnn_cache import CnnCacheManager
 from oasr.cache.paged_kv import PagedKVCache
+from oasr.cache.slot_cnn import SlotCnnCache
 
 
 # N_BLOCK tile size of the FMHA kernel; T_kv must be a multiple of this.
@@ -54,7 +62,6 @@ class _CapturedShape:
 
     graph: "torch.cuda.CUDAGraph"
     xs_buf: torch.Tensor
-    cnn_in_buf: torch.Tensor
     slot_ids_buf: torch.Tensor
     offset_buf: torch.Tensor
     # Persistent gather buffers that mirror the persistent state for the
@@ -63,7 +70,6 @@ class _CapturedShape:
     batched_block_table: torch.Tensor
     batched_cache_seqlens: torch.Tensor
     log_probs_out: torch.Tensor
-    new_cnn_out: torch.Tensor
 
 
 class GraphedEncoderForward:
@@ -117,10 +123,10 @@ class GraphedEncoderForward:
         # All captures share one CUDA Graph memory pool so that the
         # intermediate-tensor allocations from earlier captures don't
         # cumulatively fragment the regular caching allocator. The
-        # caller must consume any captured output (log_probs / new_cnn)
-        # before the next replay — that's already the case in the engine
-        # step loop (CTC decode + commit happen synchronously after
-        # ``replay()`` returns).
+        # caller must consume any captured output (log_probs) before the
+        # next replay — that's already the case in the engine step loop
+        # (CTC decode + commit happen synchronously after ``replay()``
+        # returns).
         self._pool = torch.cuda.graph_pool_handle()
         # Keyed by ``(B, T_input, cache_t1_bucket)``. ``T_input`` is the
         # encoder input frame count for the chunk — the batched path uses
@@ -151,17 +157,19 @@ class GraphedEncoderForward:
         cache_t1_bucket: int,
         *,
         xs: torch.Tensor,
-        cnn_in: torch.Tensor,
         slot_ids: torch.Tensor,
         offsets: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Optional[torch.Tensor]:
         """Replay (or first-capture) the encoder forward at the given shape.
 
         On the first call for a new ``(B, cache_t1_bucket)`` shape the graph
         is captured using the caller-provided ``slot_ids`` / ``offsets`` (so
         the capture-time warmup runs on the **actual** persistent paging
         state rather than dummy state). Subsequent replays just refresh the
-        pre-allocated input buffers and trigger ``cudaGraphLaunch``.
+        pre-allocated input buffers and trigger ``cudaGraphLaunch``. The
+        captured forward reads CNN left-context from the persistent
+        ``cnn_mgr.buffer`` (at rows ``slot_ids``) and scatters new tails
+        back into it in place.
 
         Parameters
         ----------
@@ -171,22 +179,20 @@ class GraphedEncoderForward:
             Bucket-aligned host-side cache_t1 (multiple of ``_KERNEL_N_BLOCK``).
         xs : Tensor
             ``(B, window, feat_dim)`` encoder input.
-        cnn_in : Tensor
-            ``(num_layers, B, cnn_cache_frames, hidden_dim)`` CNN cache.
         slot_ids : Tensor
-            ``(B,)`` int64 slot ids (host-side gather into persistent tables).
+            ``(B,)`` int64 slot ids (gather into persistent tables; also
+            selects the CNN buffer rows read/written by the captured
+            forward).
         offsets : Tensor
             ``(B,)`` int32 per-stream encoder-frame offsets.
 
         Returns
         -------
-        log_probs : Tensor
+        log_probs : Tensor or None
             ``(B, chunk_size, vocab_size)`` log-softmax output. **Aliases
             the captured buffer**; callers must consume it before the next
-            replay or clone.
-        new_cnn : Tensor
-            ``(num_layers, B, cnn_cache_frames, hidden_dim)`` new CNN cache.
-            Same aliasing caveat as ``log_probs``.
+            replay or clone. Returns ``None`` when the per-shape capture
+            cache is saturated (caller falls back to eager mode).
         """
         key = (B, T_input, cache_t1_bucket)
         state = self._captured.get(key)
@@ -194,23 +200,16 @@ class GraphedEncoderForward:
             if len(self._captured) >= self._max_captures:
                 # Refuse to capture once the cache is saturated; the caller
                 # will fall back to eager mode for this chunk.
-                return None  # type: ignore[return-value]
+                return None
             state = self._capture(
-                B, T_input, cache_t1_bucket, xs, cnn_in, slot_ids, offsets,
+                B, T_input, cache_t1_bucket, xs, slot_ids, offsets,
             )
             self._captured[key] = state
 
         # Refresh captured input buffers with current per-chunk state.
-        # ``slot_ids`` / ``offsets`` are kept for downstream code that may
-        # read them but the kernel doesn't see them at replay — it reads
-        # the gather buffers below. The graph captured ``index_select``
-        # writes into ``batched_block_table`` / ``batched_cache_seqlens``
-        # whose addresses we keep stable across replays; refreshing those
-        # gather buffers from the persistent state is the only way the
-        # captured kernel sees post-``prepare_chunks_batched`` /
-        # ``commit_chunks_paged_batched`` updates.
+        # The captured forward reads ``slot_ids_buf`` to gather/scatter
+        # CNN cache rows and to drive the gather buffers below.
         state.xs_buf.copy_(xs)
-        state.cnn_in_buf.copy_(cnn_in)
         state.slot_ids_buf.copy_(slot_ids)
         state.offset_buf.copy_(offsets)
         # Refresh the gather buffers from the current persistent state
@@ -224,7 +223,7 @@ class GraphedEncoderForward:
                            out=state.batched_cache_seqlens)
 
         state.graph.replay()
-        return state.log_probs_out, state.new_cnn_out
+        return state.log_probs_out
 
     # ------------------------------------------------------------------
     # Capture
@@ -237,7 +236,6 @@ class GraphedEncoderForward:
         T_input: int,
         cache_t1_bucket: int,
         xs: torch.Tensor,
-        cnn_in: torch.Tensor,
         slot_ids: torch.Tensor,
         offsets: torch.Tensor,
     ) -> _CapturedShape:
@@ -248,11 +246,17 @@ class GraphedEncoderForward:
         an in-graph ``index_select`` result (whose destination address
         could move across captures). Before each replay the caller
         refreshes these gather buffers from the persistent state.
+
+        The CNN cache is read **in place** from ``cnn_mgr.buffer`` (whose
+        address is stable) at rows ``slot_ids_buf``. Both the warmup
+        ``_run`` and the captured ``_run`` mutate those rows, so we
+        snapshot them before warmup and restore them after capture so the
+        first real ``state.graph.replay()`` reads the engine's pre-chunk
+        state.
         """
         # Pre-allocate input buffers, primed with the caller's tensors so
         # the warmup run operates on the real persistent paging state.
         xs_buf = xs.clone()
-        cnn_in_buf = cnn_in.clone()
         slot_ids_buf = slot_ids.clone()
         offset_buf = offsets.clone()
 
@@ -277,11 +281,20 @@ class GraphedEncoderForward:
                 )
             )
 
-        def _run() -> Tuple[torch.Tensor, torch.Tensor]:
+        cnn_cache = SlotCnnCache(buffer=self._cnn_mgr.buffer, slot_ids=slot_ids_buf)
+
+        def _run() -> torch.Tensor:
             return self._model.forward_chunk_paged(
-                xs_buf, offset_buf, caches, cnn_in_buf,
+                xs_buf, offset_buf, caches, cnn_cache,
                 cache_t1=cache_t1_bucket,
             )
+
+        # Snapshot the CNN buffer rows for the active slots so we can
+        # restore them after capture. The warmup ``_run`` and the captured
+        # ``_run`` both write to these rows; without restore, the first
+        # real ``state.graph.replay()`` would read the post-capture state
+        # instead of the engine's pre-chunk state.
+        saved_cnn = self._cnn_mgr.buffer.index_select(1, slot_ids_buf).clone()
 
         # Warmup once on the default stream so cuBLAS / cuDNN finalise any
         # one-time workspace allocations before we open capture. Real
@@ -290,6 +303,9 @@ class GraphedEncoderForward:
         # caller's actual ``xs``.
         _run()
         torch.cuda.synchronize(self._device)
+        # Restore so the captured ``_run`` reads the same pre-chunk CNN
+        # state that the first real replay will see.
+        self._cnn_mgr.buffer.index_copy_(1, slot_ids_buf, saved_cnn)
 
         graph = torch.cuda.CUDAGraph()
         # ``tvm_ffi.use_torch_stream(torch.cuda.graph(g))`` is the documented
@@ -299,16 +315,18 @@ class GraphedEncoderForward:
         # captured into ``graph`` (rather than escaping to the default
         # stream and tripping ``cudaErrorIllegalAddress`` on replay).
         with tvm_ffi.use_torch_stream(torch.cuda.graph(graph, pool=self._pool)):
-            log_probs_out, new_cnn_out = _run()
+            log_probs_out = _run()
+
+        # Restore again so the first real replay (line below in caller)
+        # reads the engine's pre-chunk CNN state.
+        self._cnn_mgr.buffer.index_copy_(1, slot_ids_buf, saved_cnn)
 
         return _CapturedShape(
             graph=graph,
             xs_buf=xs_buf,
-            cnn_in_buf=cnn_in_buf,
             slot_ids_buf=slot_ids_buf,
             offset_buf=offset_buf,
             batched_block_table=batched_bt,
             batched_cache_seqlens=batched_cs,
             log_probs_out=log_probs_out,
-            new_cnn_out=new_cnn_out,
         )

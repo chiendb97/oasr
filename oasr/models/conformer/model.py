@@ -15,6 +15,7 @@ from oasr.layers.linear import Linear, LinearActivation
 from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d, Conv2dActivation
 from oasr.layers.norm import LayerNorm, GlobalCMVN
 from oasr.cache.paged_kv import PagedKVCache
+from oasr.cache.slot_cnn import SlotCnnCache
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention
 from oasr.utils import get_norm, get_norm_activation
 from .config import ConformerEncoderConfig, ConformerModelConfig
@@ -564,17 +565,24 @@ class ConformerEncoder(nn.Module):
         xs: torch.Tensor,
         offset: Union[int, torch.Tensor],
         att_caches: List[PagedKVCache],
-        cnn_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
+        cnn_cache: SlotCnnCache,
         att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
         cache_t1: int = -1,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward one chunk using paged KV cache.
+    ) -> torch.Tensor:
+        """Forward one chunk using paged KV and slot-indexed CNN caches.
 
-        K/V for the current chunk are written directly into the shared block
-        pool by :class:`~oasr.layers.attention.RelPositionMultiHeadedAttention`
-        (via :meth:`~oasr.cache.PagedKVCache.write_kv_chunk`). The caller is
-        responsible for allocating the necessary physical blocks **before**
-        this call and for updating ``cache_seqlens`` **after**.
+        Both cache families are written **in-place** during this call:
+
+        * K/V for the current chunk are written into the shared block pool by
+          :class:`~oasr.layers.attention.RelPositionMultiHeadedAttention` (via
+          :meth:`~oasr.cache.PagedKVCache.write_kv_chunk`).
+        * CNN left-context is gathered from ``cnn_cache.buffer[slot_ids]`` at
+          the top of the encoder and scattered back at the end, so the
+          persistent ``CnnCacheManager`` buffer is updated in place.
+
+        The caller is responsible for allocating the next physical KV block
+        **before** this call (via ``AttentionCacheManager.prepare_chunk*``)
+        and for updating ``cache_seqlens`` **after**.
 
         Parameters
         ----------
@@ -592,9 +600,11 @@ class ConformerEncoder(nn.Module):
             layer. All items share the **same** ``block_table`` and
             ``cache_seqlens`` tensors; only ``k_cache`` / ``v_cache``
             differ per layer.
-        cnn_cache : Tensor
-            CNN cache ``(num_layers, B, cnn_cache_frames, hidden_dim)``.
-            Pass a ``(0,0,0,0)`` placeholder on the first chunk.
+        cnn_cache : SlotCnnCache
+            Descriptor over the persistent CNN buffer plus the ``(B,)`` int64
+            ``slot_ids`` for this batch. The encoder gathers the per-stream
+            left-context at the top and scatters the new tails back into the
+            buffer at the bottom.
         att_mask : Tensor
             Unused with paged attention (per-stream length is enforced by
             the FlexAttention block-mask built from ``cache.cache_seqlens``).
@@ -608,8 +618,6 @@ class ConformerEncoder(nn.Module):
         -------
         xs : Tensor
             Encoder output ``(B, chunk_size, hidden_dim)``.
-        r_cnn_cache : Tensor
-            Updated CNN cache ``(num_layers, B, cnn_cache_frames, hidden_dim)``.
         """
         del att_mask  # paged path uses cache.cache_seqlens for masking
 
@@ -642,23 +650,28 @@ class ConformerEncoder(nn.Module):
             offset=pos_start, size=attention_key_size,
         )
 
-        r_cnn_cache = []
+        # Gather the per-stream left-context once at the top, then scatter
+        # the per-layer tails back at the end. One batched index_select +
+        # one batched index_copy_ per chunk, regardless of layer count.
+        cnn_in = cnn_cache.gather()  # (L, B, K-1, H)
+        new_cnn_layers: List[torch.Tensor] = []
         for i, layer in enumerate(self.encoders):
-            xs, _, new_cnn_cache = layer(
+            xs, _, new_cnn = layer(
                 xs,
                 # Padding mask is unused inside the paged self-attn path; pass
                 # a zero-dim placeholder.
                 torch.zeros((0, 0, 0), dtype=xs.dtype, device=xs.device),
                 pos_emb,
                 att_cache=att_caches[i],
-                cnn_cache=cnn_cache[i] if cnn_cache.size(0) > 0 else cnn_cache,
+                cnn_cache=cnn_in[i],
             )
-            r_cnn_cache.append(new_cnn_cache.unsqueeze(0))
+            new_cnn_layers.append(new_cnn)
+        cnn_cache.scatter(torch.stack(new_cnn_layers, dim=0))
 
         if self.normalize_before and self.final_norm:
             xs = self.after_norm(xs)
 
-        return xs, torch.cat(r_cnn_cache, dim=0)
+        return xs
 
 class ConformerModel(nn.Module):
     """Conformer model: encoder + CTC."""
@@ -689,19 +702,19 @@ class ConformerModel(nn.Module):
     def forward_chunk_paged(
         self,
         input_features: torch.Tensor,
-        offset: int,
+        offset: Union[int, torch.Tensor],
         att_caches: List[PagedKVCache],
-        cnn_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
+        cnn_cache: SlotCnnCache,
         att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
         cache_t1: int = -1,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward one chunk with paged KV cache; returns ``(probs, r_cnn_cache)``.
+    ) -> torch.Tensor:
+        """Forward one chunk with paged KV + slot-indexed CNN cache; returns ``probs``.
 
-        See :meth:`ConformerEncoder.forward_chunk_paged` for parameter and
-        return-value documentation.
+        See :meth:`ConformerEncoder.forward_chunk_paged` for parameter
+        documentation. The CNN cache is committed in place into
+        ``cnn_cache.buffer`` at rows ``cnn_cache.slot_ids``.
         """
-        hidden_states, r_cnn_cache = self.encoder.forward_chunk_paged(
+        hidden_states = self.encoder.forward_chunk_paged(
             input_features, offset, att_caches, cnn_cache, att_mask, cache_t1,
         )
-        probs = self.ctc(hidden_states)
-        return probs, r_cnn_cache
+        return self.ctc(hidden_states)
