@@ -122,20 +122,32 @@ class GraphedEncoderForward:
         # step loop (CTC decode + commit happen synchronously after
         # ``replay()`` returns).
         self._pool = torch.cuda.graph_pool_handle()
-        self._captured: Dict[Tuple[int, int], _CapturedShape] = {}
-        self._max_captures = 32
+        # Keyed by ``(B, T_input, cache_t1_bucket)``. ``T_input`` is the
+        # encoder input frame count for the chunk — the batched path uses
+        # ``T_input == window`` for every cohort, and the B=1 fallback
+        # ``_forward_single`` path lands here too with smaller ``T_input``
+        # for partial / final windows.
+        self._captured: Dict[Tuple[int, int, int], _CapturedShape] = {}
+        # Steady-state streaming hits at most ``max_batch_size`` distinct B
+        # values × ``ceil(max_offset / N_BLOCK)`` cache_t1 buckets. The B=1
+        # single fallback adds a handful of ``T_input`` variants on top.
+        # Cap generously so the typical workload is fully captured without
+        # ever falling back to eager mode; ``_capture`` short-circuits
+        # cleanly when the cap is hit.
+        self._max_captures = 512
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def have(self, B: int, cache_t1_bucket: int) -> bool:
-        return (B, cache_t1_bucket) in self._captured
+    def have(self, B: int, T_input: int, cache_t1_bucket: int) -> bool:
+        return (B, T_input, cache_t1_bucket) in self._captured
 
     @torch.no_grad()
     def replay(
         self,
         B: int,
+        T_input: int,
         cache_t1_bucket: int,
         *,
         xs: torch.Tensor,
@@ -176,14 +188,16 @@ class GraphedEncoderForward:
             ``(num_layers, B, cnn_cache_frames, hidden_dim)`` new CNN cache.
             Same aliasing caveat as ``log_probs``.
         """
-        key = (B, cache_t1_bucket)
+        key = (B, T_input, cache_t1_bucket)
         state = self._captured.get(key)
         if state is None:
             if len(self._captured) >= self._max_captures:
                 # Refuse to capture once the cache is saturated; the caller
                 # will fall back to eager mode for this chunk.
                 return None  # type: ignore[return-value]
-            state = self._capture(B, cache_t1_bucket, xs, cnn_in, slot_ids, offsets)
+            state = self._capture(
+                B, T_input, cache_t1_bucket, xs, cnn_in, slot_ids, offsets,
+            )
             self._captured[key] = state
 
         # Refresh captured input buffers with current per-chunk state.
@@ -220,6 +234,7 @@ class GraphedEncoderForward:
     def _capture(
         self,
         B: int,
+        T_input: int,
         cache_t1_bucket: int,
         xs: torch.Tensor,
         cnn_in: torch.Tensor,

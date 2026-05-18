@@ -157,22 +157,23 @@ class EngineConfig:
     block_size_frames: int = 16
     max_blocks_per_seq: int = 512
 
-    # CUDA Graph capture for the streaming encoder forward (experimental,
-    # disabled by default). The cute DSL fmha is now compiled with TVM-FFI
-    # (``options="--enable-tvm-ffi"``) and invoked with raw torch tensors,
-    # matching Flash Attention's ``flash_attn/cute`` pattern. Capture +
-    # replay works at a fixed ``(B_active, cache_t1_bucket)`` shape (the
-    # ``GraphedEncoderForward`` probe shows ~20× speedup at fixed shape).
-    # The remaining open issue is that **eager fmha calls** at smaller B
-    # after the engine has captured a few B==max_batch_size graphs trip
-    # ``cudaErrorIllegalAddress`` mid-decode (reliably reproduces with the
-    # default benchmark at B=18 max_offset=128 after 2 successful B=32
-    # graph captures and a sequence of B<32 eager calls). Disabled by
-    # default so streaming stays correct; flip to ``True`` only when
-    # iterating on this issue. The standalone TVM-FFI win (~25% RTF
-    # reduction vs the pre-TVM-FFI path) is independent of this flag —
-    # it comes for free in the eager path.
-    use_cuda_graphs: bool = False
+    # CUDA Graph capture for the steady-state streaming encoder forward.
+    # The cute DSL fmha is compiled with TVM-FFI (``--enable-tvm-ffi``)
+    # and invoked with raw torch tensors, matching Flash Attention's
+    # ``flash_attn/cute`` pattern. Capture + replay collapses the 12-layer
+    # ~200-kernel encoder forward into a single CUDA Graph launch per
+    # ``(B_active, cache_t1_bucket)`` shape; at steady state (B ==
+    # max_batch_size) this is a clean win over the eager dispatch.
+    #
+    # The bias tile in the cute kernel is read unpredicated along T_q —
+    # safe only when adjacent gmem is mapped. Eager calls always landed
+    # adjacent allocations on the default pool so the over-read was
+    # invisible; once graph capture started carving the address space into
+    # private pools the over-read could fall into unmapped pages and trip
+    # ``cudaErrorIllegalAddress``. ``RelPositionMultiHeadedAttention.
+    # _forward_paged`` now pads ``combined_bias`` to the kernel's
+    # ``(M_BLOCK, N_BLOCK)`` tile so every bias read stays in-bounds.
+    use_cuda_graphs: bool = True
 
     # Feature extraction
     feature_config: Optional[FeatureConfig] = None

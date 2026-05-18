@@ -207,26 +207,30 @@ class RelPositionMultiHeadedAttention(nn.Module):
         # post-softmax_scale logit semantics; the kernel adds bias *after*
         # the QK*scale.
         combined_bias = matrix_bd * scale  # (B, H, T_q, T_kv_max)
-        # Pad T_kv_max up to a multiple of the kernel's N_BLOCK tile so that
-        # the kernel's per-n-tile block_table reads stay in-bounds. The
-        # kernel reads ``mBlockTable[b, n_block * (N_BLOCK/bs) + i]`` for
-        # ``i in [0, N_BLOCK/bs)`` and ``n_block in [0, ceil(seqlen_k/N_BLOCK))``,
-        # so block_table must have at least
-        # ``ceil(seqlen_k/N_BLOCK) * (N_BLOCK/bs)`` columns. Rounding
-        # T_kv_max up to a multiple of N_BLOCK satisfies that and keeps the
-        # bias / block_table shapes consistent (kernel sees
-        # ``t_kv_logical = block_table.shape[1] * bs``; bounds-checked bias
-        # tolerates the padding).
+        # Pad ``T_q`` up to ``M_BLOCK`` and ``T_kv_max`` up to ``N_BLOCK``.
+        # The cute fmha kernel reads the full ``(M_BLOCK, N_BLOCK)`` bias
+        # tile without per-row predication along the ``T_q`` axis -- the
+        # comment in ``_add_bias_tile`` notes that OOB rows read stale gmem,
+        # which is harmless **when adjacent memory is mapped**. Under CUDA
+        # Graph captures the allocator fragments the address space and the
+        # over-read can fall into an unmapped segment, raising
+        # ``cudaErrorIllegalAddress``. Padding to ``(M_BLOCK, N_BLOCK)``
+        # multiples keeps every kernel-side bias tile read in-bounds.
+        # Block-table needs the same N_BLOCK / block_size multiple because
+        # the kernel reads ``mBlockTable[b, n_block * (N_BLOCK/bs) + i]``
+        # for the full ``ceil(seqlen_k/N_BLOCK)`` × ``N_BLOCK/bs`` extent.
         bs = cache.block_size
         N_BLOCK = 64  # matches FmhaSm80._n_block_size default
+        M_BLOCK = 64  # matches FmhaSm80._m_block_size default
         T_kv_padded = ((T_kv_max + N_BLOCK - 1) // N_BLOCK) * N_BLOCK
-        if T_kv_padded > T_kv_max:
-            pad_cols = T_kv_padded - T_kv_max
-            tail = torch.zeros(
-                B, self.h, T_q, pad_cols,
+        T_q_padded = ((T_q + M_BLOCK - 1) // M_BLOCK) * M_BLOCK
+        if T_kv_padded > T_kv_max or T_q_padded > T_q:
+            padded = torch.zeros(
+                B, self.h, T_q_padded, T_kv_padded,
                 dtype=combined_bias.dtype, device=combined_bias.device,
             )
-            combined_bias = torch.cat([combined_bias, tail], dim=-1)
+            padded[:, :, :T_q, :T_kv_max] = combined_bias
+            combined_bias = padded
 
         block_table_view = cache.block_table
         # Caller may have allocated a wider block_table than needed; the

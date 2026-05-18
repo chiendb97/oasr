@@ -355,6 +355,13 @@ def _sdpa_reference(
         k = k.repeat_interleave(n_repeat, dim=1)
         v = v.repeat_interleave(n_repeat, dim=1)
 
+    # ``attn_bias`` may be padded along the T_q / T_k axes (callers pad up
+    # to the cute kernel's (M_BLOCK, N_BLOCK) tile size so the kernel's
+    # unpredicated bias-tile reads stay in-bounds under CUDA Graph capture).
+    # SDPA wants ``(B, H, T_q, T_kv)`` exactly, so trim back here.
+    if attn_bias is not None and (attn_bias.size(-2) != T_q or attn_bias.size(-1) != T_kv):
+        attn_bias = attn_bias[..., :T_q, :T_kv]
+
     if attn_bias is not None and cache_seqlens is not None:
         pad = _length_to_pad_bias(cache_seqlens, T_kv, q.dtype)
         full_mask = attn_bias + pad
@@ -425,11 +432,17 @@ def _validate_inputs(
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError("q, k, v must share dtype")
 
-    if attn_bias is not None and attn_bias.shape != (B, H, T_q, T_k):
-        raise ValueError(
-            f"attn_bias must be (B, H, T_q, T_k) = ({B}, {H}, {T_q}, {T_k}); "
-            f"got {tuple(attn_bias.shape)}"
-        )
+    if attn_bias is not None:
+        bs = attn_bias.shape
+        # ``attn_bias`` may be padded up to the kernel's (M_BLOCK, N_BLOCK)
+        # tile size along the T_q and T_k axes so the cute kernel's
+        # unpredicated bias-tile reads stay in-bounds even when the active
+        # ``T_q`` / ``T_k`` are smaller. We accept any padded extent.
+        if len(bs) != 4 or bs[0] != B or bs[1] != H or bs[2] < T_q or bs[3] < T_k:
+            raise ValueError(
+                f"attn_bias must be (B, H, ≥T_q, ≥T_k) = ({B}, {H}, ≥{T_q}, ≥{T_k}); "
+                f"got {tuple(attn_bias.shape)}"
+            )
 
     if cache_seqlens is not None and (
         cache_seqlens.dim() != 1 or cache_seqlens.size(0) != B

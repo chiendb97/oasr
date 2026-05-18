@@ -175,6 +175,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="CSV file path for results (optional)",
     )
 
+    parser.add_argument(
+        "--cuda-graphs",
+        choices=["on", "off"],
+        default=None,
+        help="Enable / disable CUDA Graph capture for the streaming encoder "
+             "forward. Defaults to the engine config setting "
+             "(``EngineConfig.use_cuda_graphs``).",
+    )
+
     return parser
 
 
@@ -209,6 +218,7 @@ def main() -> None:
             num_iters=args.num_iters,
             dtype=dtype,
             output=output,
+            use_cuda_graphs=(args.cuda_graphs == "on" if args.cuda_graphs else None),
         )
 
     output.finalize()

@@ -316,12 +316,10 @@ class ModelRunner:
 
         Pre-condition: every request in ``group`` has a full ``window``
         frames ready in its feature buffer and is using paged attention.
+        Single-stream cohorts (B=1) also flow through this path so they
+        can hit the CUDA graph cache instead of paying ~17 ms of eager
+        launch overhead in :meth:`_forward_single`.
         """
-        if len(group) == 1:
-            # Skip the stack/unstack bookkeeping for a single stream.
-            self._forward_single(group[0], window, stride, context, results)
-            return
-
         nvtx_push(f"batched_paged[B={len(group)}]")
         B_active = len(group)
         stream_ids = [req.stream_id for req in group]
@@ -354,24 +352,23 @@ class ModelRunner:
             dtype=torch.int32, device=device,
         )
 
-        # 4. Encoder forward — graph replay when shape matches steady
-        #    state (B == max_batch_size); eager otherwise. Restricting
-        #    capture to steady-state shapes bounds the number of captured
-        #    graphs and avoids the cross-capture aliasing hazards of
-        #    sharing a CUDA graph memory pool.
+        # 4. Encoder forward — graph replay for any captured (B, bucket)
+        #    shape; eager fallback when the graph cache is saturated or
+        #    disabled. Captures are lazy and per-(B, cache_t1_bucket); a
+        #    typical workload sees a small set of (B, bucket) combos
+        #    because the scheduler keeps streams in lockstep cohorts and
+        #    cache_t1 grows in N_BLOCK-sized steps.
         nvtx_push("encoder_call")
         cache_t1_bucket = round_up_bucket(max_offset)
-        use_graph = (
-            self._use_cuda_graphs
-            and self._graph_cache is not None
-            and B_active == self._cache_config.max_batch_size
-        )
-        if use_graph:
-            log_probs, new_cnn = self._graph_cache.replay(
-                B_active, cache_t1_bucket,
+        graph_out = None
+        if self._use_cuda_graphs and self._graph_cache is not None:
+            graph_out = self._graph_cache.replay(
+                B_active, xs.size(1), cache_t1_bucket,
                 xs=xs, cnn_in=cnn_cache,
                 slot_ids=slot_ids_gpu, offsets=offsets_gpu,
             )
+        if graph_out is not None:
+            log_probs, new_cnn = graph_out
         else:
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_gpu)
             for c in batched_att_caches:
@@ -433,19 +430,45 @@ class ModelRunner:
 
         ctx = req.stream_context
         assert ctx is not None
+        assert req.slot_id is not None
 
-        ctx.prepare_chunk()
-        att_caches = ctx.get_att_caches()
-        cnn_cache = ctx.get_cnn_cache()
-        log_probs, new_cnn = self._model.forward_chunk_paged(
-            chunk,
-            req.offset,
-            att_caches,
-            cnn_cache,
-            cache_t1=req.offset,
-        )
+        nvtx_push(f"single[off={req.offset},T_q={chunk.size(1)}]")
+        # Allocate the next physical block for this stream and refresh the
+        # persistent block_table row before we hand the slot into either
+        # the graph-cached or eager forward.
+        self._att_mgr.prepare_chunks_batched([req.stream_id])  # type: ignore[arg-type]
+
+        device = self._att_mgr.block_table.device
+        slot_ids_gpu = torch.tensor([req.slot_id], dtype=torch.long, device=device)
+        offsets_gpu = torch.tensor([req.offset], dtype=torch.int32, device=device)
+        cnn_cache = self._cnn_mgr.get_batched_cache(slot_ids_gpu)  # (L, 1, K-1, H)
+
+        cache_t1_bucket = round_up_bucket(req.offset)
+        nvtx_push("single.encoder_call")
+        graph_out = None
+        if self._use_cuda_graphs and self._graph_cache is not None:
+            graph_out = self._graph_cache.replay(
+                1, chunk.size(1), cache_t1_bucket,
+                xs=chunk, cnn_in=cnn_cache,
+                slot_ids=slot_ids_gpu, offsets=offsets_gpu,
+            )
+        if graph_out is not None:
+            log_probs, new_cnn = graph_out
+        else:
+            batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_gpu)
+            for c in batched_att_caches:
+                c.host_seqlen_max = req.offset
+            log_probs, new_cnn = self._model.forward_chunk_paged(
+                chunk, offsets_gpu, batched_att_caches, cnn_cache,
+                cache_t1=req.offset,
+            )
+        nvtx_pop()
         actual_frames = log_probs.size(1)
-        ctx.commit_chunk_paged(actual_frames, new_cnn)
+
+        # Commit cache state — single-stream batched commit + CNN scatter.
+        self._cnn_mgr.update_batched(slot_ids_gpu, new_cnn)
+        self._att_mgr.commit_chunks_paged_batched([req.stream_id], actual_frames)  # type: ignore[arg-type]
+        nvtx_pop()  # single
 
         req.offset += actual_frames
         if is_final_window:
