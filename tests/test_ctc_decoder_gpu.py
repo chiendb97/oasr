@@ -400,7 +400,8 @@ class TestCtcDecoderInterleaved:
         buf_ptr = state.buffer.data_ptr()
 
         decoder.decode_chunk(_make_logp_gpu(3, V, [1, 0, 2], device), state=state)
-        assert state.step == 3
+        # step counts non-blank frames emitted; [1, 0, 2] yields 2 emit steps.
+        assert state.step == 2
 
         decoder.reset_state(state, batch=1, vocab_size=V)
         assert state.step == 0
@@ -435,7 +436,8 @@ class TestCtcDecoderInterleaved:
         assert handle.config is config
 
         handle.decode_chunk(_make_logp_gpu(3, V, [1, 0, 2], device))
-        assert handle.step == 3
+        # [1, 0, 2] emits two non-blank steps.
+        assert handle.step == 2
         r = handle.finalize_stream()
         assert r.tokens[0][0] == [1, 2]
 
@@ -451,8 +453,9 @@ class TestCtcDecoderInterleaved:
         state = decoder.create_state(batch=1, vocab_size=V, device=device)
         decoder.decode_chunk(_make_logp_gpu(3, V, [3, 0, 4], device), state=state)
 
-        assert decoder.step == 3
-        assert state.step == 3
+        # Each sequence has one blank in the middle, so 2 emit steps.
+        assert decoder.step == 2
+        assert state.step == 2
 
         r_internal = decoder.finalize_stream()
         r_explicit = decoder.finalize_stream(state=state)

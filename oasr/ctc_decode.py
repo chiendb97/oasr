@@ -418,6 +418,14 @@ class GpuStreamingDecoder:
         vocab_size = vocab_size if vocab_size is not None else state.vocab_size
         if device is None:
             device = state.buffer.device
+        else:
+            device = torch.device(device)
+            # torch.empty(..., device=torch.device("cuda")) materialises on the
+            # current CUDA device, so the buffer ends up with index 0 (or whatever
+            # the active device is). Resolve the index here so the equality check
+            # below doesn't reallocate when the caller passes an indexless "cuda".
+            if device.type == "cuda" and device.index is None:
+                device = torch.device("cuda", torch.cuda.current_device())
 
         required = self._state_bytes_for(batch, vocab_size)
         if state._buffer_bytes >= required and state.buffer.device == device:
