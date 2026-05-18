@@ -91,6 +91,11 @@ python benchmarks/oasr_benchmark.py --list
 python benchmarks/oasr_benchmark.py --testlist benchmarks/testlists/conformer_base.txt \
     --output_path results.csv --refcheck
 
+# Engine-level benchmark with CUDA Graph capture of the streaming encoder
+# (toggles EngineConfig.use_cuda_graphs; default is "on")
+python benchmarks/bench_engine.py --cuda-graphs on        # captured (default)
+python benchmarks/bench_engine.py --cuda-graphs off       # eager (apples-to-apples profiling)
+
 # Profiling with Nsight Compute (NVTX markers via --profile)
 ncu --set full -o gemm_profile python benchmarks/oasr_benchmark.py \
     --routine gemm --subroutine gemm --backends cutlass --profile --dry_run_iters 0
@@ -155,7 +160,7 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
 
 - **`__init__.py`** — Exposes all functional API functions (e.g., `oasr.gemm`, `oasr.layer_norm`) and nn.Module wrappers. Lazy-loads `_C` extension for decoder access.
 - **`activation.py`**, **`norm.py`**, **`conv.py`**, **`gemm.py`** — Functional API: `@oasr_api` decorated, JIT-compile kernels on first call via `@functools.cache`, allocate output tensors, call into compiled modules.
-- **`attention.py`** — `fmha(q, k, v, *, softmax_scale, attn_bias, cache_seqlens, block_table, out)` fused multi-head attention. Three cache modes share one signature: offline (no `cache_seqlens`), dense streaming (`cache_seqlens` only), paged streaming (`block_table` + `cache_seqlens` — currently raises; wrapper falls back to SDPA). Dispatches via `oasr.jit.attention.select_backend()` to either `_sdpa_reference` (PyTorch SDPA fallback, fp32-friendly) or `_call_cute_dsl` (CuteDSL kernel, fp16/bf16 only).
+- **`attention.py`** — `fmha(q, k, v, *, softmax_scale, attn_bias, cache_seqlens, block_table, out)` fused multi-head attention. Three cache modes share one signature: **offline** (`block_table is None`, `cache_seqlens is None`), **dense streaming** (`block_table is None`, `cache_seqlens is not None` — caller concatenated old + new K/V), **paged streaming** (`block_table is not None`, `cache_seqlens` required — K/V are pool views). Dispatches via `oasr.jit.attention.select_backend()` to either `_sdpa_reference` (PyTorch SDPA fallback, fp32-friendly) or the CuteDSL kernel (fp16/bf16 only). Also exposes `oasr.fmha.persistent_inputs(...)` — a context manager that caches CuteDSL DLPack descriptors for the hot loop when the engine reuses the same Q/K/V/out/bias/block_table/cache_seqlens tensors every call. A `validate=False` fast path skips checks for proven inputs.
 - **`softmax.py`**, **`topk.py`**, **`fft.py`**, **`feature.py`** — Additional `@oasr_api` functional entry points: `softmax`, `topk`, `rfft`/`rfft_power`, and feature-extraction primitives (`dct_lifter`, `fbank_preprocess`, `mel_log`). Same JIT-on-first-call pattern as the other top-level modules.
 - **`kernels/`** — Low-level kernel implementations that **do not** use the TVM-FFI / Ninja JIT pipeline. `kernels/cute/attention/` holds the CuteDSL FMHA: `base.py` (abstract `FmhaBase` + `pick_arch_cls(major, minor)` dispatcher), `fmha_sm80.py` (`FmhaSm80` — covers sm_80 / sm_86 / sm_89), and `fmha_sm120.py` (`FmhaSm120`, a thin subclass over `FmhaSm80` for consumer Blackwell). `kernels/cute/` also contains FlashAttention-style helper modules used by these backends: `block_info.py`, `seqlen_info.py`, `mask.py`, `softmax.py`, `tile_scheduler.py`, `pack_gqa.py`, `paged_kv.py`, `named_barrier.py`, `copy_utils.py`, `layout_utils.py`, `ampere_helpers.py`, `utils.py`. Compiled via `cutlass.cute.compile()` returning a Python callable; cached per-config in `oasr/jit/attention.py::_compiled_fmha`.
 - **`ctc_decode.py`** — GPU CTC prefix beam search, exposing two orthogonal APIs:
@@ -175,9 +180,10 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
   - `attention.py` — **Different model**: not a Ninja JIT spec but a `functools.cache`-keyed wrapper around `cutlass.cute.compile()`. Exposes `select_backend()`, `get_compiled_fmha(...)`, `warmup_fmha(...)`, and `set_backend_mode()` (mostly for tests; clears the compile cache). `select_backend()` probes the device capability eagerly at module load and resolves to `"cute"` on sm_80 / sm_86 / sm_89 / sm_120 (when CuteDSL imports cleanly), otherwise `"sdpa"`.
 - **`decoder/`** — Python wrappers for the C++ decoders: `CtcGreedySearch`, `CtcPrefixBeamSearch`, `CtcWfstBeamSearch` (requires k2), `ContextGraph` (phrase boosting trie). Also exposes `k2_available` flag. Each wrapper lazily imports the compiled `_C` extension and delegates to a `_*Core` C++ object.
 - **`engine/`** — Inference engine for offline + streaming Conformer-CTC on a single GPU:
-  - `EngineConfig` — unified config aggregating model, cache, feature, decoding, detokenization settings.
+  - `EngineConfig` — unified config aggregating model, cache, feature, decoding, detokenization settings. `use_cuda_graphs: bool = True` toggles CUDA Graph capture of the steady-state streaming encoder forward.
   - `ASREngine` — streaming engine with a step loop: schedule → batched GPU fbank ingest → encoder forward (length-bucketed offline micro-batches via `OfflinePipeline` overlap with one chunk per active streaming request) → CTC postprocess. Handles offline + streaming requests in one pool; starvation bounded by `max_wait_time`.
   - `OfflineEngine` — simple batch transcription, no scheduler/cache.
+  - `graph_cache.py` — `EncoderGraphCache` lazily captures one `torch.cuda.CUDAGraph` per `(B, T_input, cache_t1_bucket)` shape, replays via pre-allocated input/output buffers. Persistent paging slots and `cnn_cache` are captured by **address**, so they must be allocated before the first capture and never reallocated. All captures share one CUDA Graph memory pool. Engine paths are slot-based (`forward_chunk_paged`) so the captured code path is stable across calls.
   - `Request` / `RequestOutput` / `RequestState` (`WAITING → RUNNING → FINISHED`).
   - Internal modules: `scheduler.py`, `model_runner.py`, `pipeline.py`, `input_processor.py`, `output_processor.py`.
 - **`features/`** — Batched audio feature extraction (FBANK / MFCC):
@@ -195,6 +201,16 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
 - **`testing/`** — `bench_gpu_time(fn, args, ...)` utility: CUDA-event timing with optional CUPTI fallback via `triton.testing.do_bench`; returns `(median_s, std_s)`.
 - **`aot.py`** — Ahead-of-time compilation registration for all kernel families. Includes `gen_all_gemm_variants()` for systematic AOT variant enumeration.
 - **`tune/`** — Autotuning framework: backend registry, profiler, cache, kernel configs (`TileConfig`). See `docs/autotuning.md` for design and API (`oasr.autotune()` context manager, `enable_autotune()`/`disable_autotune()` global toggles, persistent JSON cache).
+
+### Companion docs (under `docs/`)
+
+| File | Covers |
+|------|--------|
+| `docs/autotuning.md` | `oasr.tune` design, `oasr.autotune()` API, JSON cache format |
+| `docs/cache_manager.md` | `BlockPool` / `AttentionCacheManager` / `CnnCacheManager` / `StreamContext` semantics |
+| `docs/ctc_decoder_gpu.md` | `GpuStreamingDecoder` single- vs. multi-request flows, paged-memory options |
+| `docs/engine.md` | `ASREngine` / `OfflineEngine` step loop, batching, CUDA Graph capture |
+| `docs/scheduler.md` | Streaming + offline request scheduling, starvation bounds, micro-batching |
 - **`layers/`** — Thin `nn.Module`-style wrappers around functional API: `conv.py`, `linear.py`, `norm.py`, `attention/`, `rotary_embedding/`.
 - **`models/conformer/`** — Conformer model (`model.py`), config dataclass (`config.py`), weight conversion utility (`convert.py`).
 - **`utils/`** — `validation.py` (`@supported_compute_capability`, `@backend_requirement` decorators), `mappings.py` (dtype/enum helpers), `timer.py`.
