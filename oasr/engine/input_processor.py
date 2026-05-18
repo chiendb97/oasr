@@ -14,7 +14,12 @@ import torch
 
 from oasr.features import FeatureConfig, extract_features_batch
 from oasr.features.backends import _extract as _extract_single
-from oasr.features.gpu_fbank import batched_fbank_gpu, supports_batched_gpu_fbank
+from oasr.features.batched import (
+    batched_fbank,
+    batched_mfcc,
+    supports_batched_fbank,
+    supports_batched_mfcc,
+)
 
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
@@ -263,16 +268,18 @@ class InputProcessor:
         device with one pinned non-blocking H2D, and runs fbank over the
         whole batch in one call.
 
-        When the feature config matches the standard Kaldi-compliant fbank
-        settings (see :func:`supports_batched_gpu_fbank`), uses the truly
-        batched :func:`batched_fbank_gpu` implementation that issues a
-        handful of fused kernels over the entire micro-batch — ~10× faster
-        than looping :func:`torchaudio.compliance.kaldi.fbank` per
-        utterance because it eliminates the per-call Python overhead.
+        When the feature config matches the standard Kaldi-compliant
+        settings (see :func:`supports_batched_fbank` /
+        :func:`supports_batched_mfcc`), uses the truly batched
+        :func:`batched_fbank` / :func:`batched_mfcc` implementation that
+        issues a handful of fused kernels over the entire micro-batch —
+        ~10× faster than looping
+        :func:`torchaudio.compliance.kaldi.fbank` / ``mfcc`` per utterance
+        because it eliminates the per-call Python overhead.
 
         Falls back to the per-utterance loop for unusual configs
-        (non-Povey windows, MFCC, dithered, etc.) so output quality is
-        preserved even when the fast path is unavailable.
+        (non-Povey windows, dithered, use_energy=True, etc.) so output
+        quality is preserved even when the fast path is unavailable.
 
         Returns
         -------
@@ -306,13 +313,13 @@ class InputProcessor:
             padded_wav_cpu = padded_wav_cpu.pin_memory()
         wav_gpu = padded_wav_cpu.to(device=self._device, non_blocking=True)
 
-        if supports_batched_gpu_fbank(self._feature_config):
+        fcfg = self._feature_config
+        if supports_batched_fbank(fcfg) or supports_batched_mfcc(fcfg):
             lengths_gpu = wav_lengths.to(
                 device=self._device, non_blocking=True
             )
-            features_f32, feat_lengths = batched_fbank_gpu(
-                wav_gpu, lengths_gpu, self._feature_config
-            )
+            batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
+            features_f32, feat_lengths = batched_fn(wav_gpu, lengths_gpu, fcfg)
             features = features_f32.to(dtype=self._config.dtype)
         else:
             # Fall back to per-utterance fbank on GPU (still much faster
@@ -569,13 +576,14 @@ class InputProcessor:
         requests: List[Request],
         cuda_stream: Optional["torch.cuda.Stream"] = None,
     ) -> None:
-        """Run one batched GPU-fbank call over all queued streams.
+        """Run one batched feature-extraction call over all queued streams.
 
         For each request with a pending audio chunk, this pops the next
         chunk, prepends the previous ``audio_tail``, pads all streams to the
         max combined length, ships one ``(B, T)`` waveform to the device,
-        and runs :func:`batched_fbank_gpu` once for the whole batch.  The
-        per-stream new frames are concatenated onto ``feature_buffer``.
+        and runs :func:`batched_fbank` / :func:`batched_mfcc` once for the
+        whole batch.  The per-stream new frames are concatenated onto
+        ``feature_buffer``.
 
         No stream is allowed to look at samples beyond its own enqueued
         chunk — we only fuse across *different* streams, never across future
@@ -585,10 +593,10 @@ class InputProcessor:
         ----------
         cuda_stream : torch.cuda.Stream, optional
             When provided (and the engine is on CUDA) the H2D copy and
-            ``batched_fbank_gpu`` kernel run on this stream so they can
+            the batched feature kernel run on this stream so they can
             overlap with the encoder forward on the default stream.  The
             caller is responsible for synchronising the default stream
-            against fbank completion before reading ``feature_buffer``.
+            against feature completion before reading ``feature_buffer``.
         """
         if not requests:
             return
@@ -677,26 +685,27 @@ class InputProcessor:
             lengths_cpu_pin = lengths_cpu
         nvtx_pop()
 
-        use_gpu_fbank = device.type == "cuda" and supports_batched_gpu_fbank(fcfg)
-        # If a dedicated CUDA stream was provided, run the H2D copy and the
-        # fbank kernel on it so they can overlap with the encoder forward on
-        # the default stream.  The caller is responsible for inserting the
-        # event-wait before reading feature_buffer.
-        use_alt_stream = (
-            use_gpu_fbank and cuda_stream is not None
+        use_batched = device.type == "cuda" and (
+            supports_batched_fbank(fcfg) or supports_batched_mfcc(fcfg)
         )
-        if use_gpu_fbank:
+        # If a dedicated CUDA stream was provided, run the H2D copy and the
+        # feature kernel on it so they can overlap with the encoder forward
+        # on the default stream.  The caller is responsible for inserting
+        # the event-wait before reading feature_buffer.
+        use_alt_stream = use_batched and cuda_stream is not None
+        if use_batched:
             stream_ctx = (
                 torch.cuda.stream(cuda_stream) if use_alt_stream
                 else _NullCtx()
             )
+            batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
             with stream_ctx:
                 nvtx_push("h2d")
                 wav_gpu = padded_cpu.to(device=device, non_blocking=True)
                 lengths_gpu = lengths_cpu_pin.to(device=device, non_blocking=True)
                 nvtx_pop()
-                nvtx_push("fbank")
-                feats_f32, _feat_lens_gpu = batched_fbank_gpu(wav_gpu, lengths_gpu, fcfg)
+                nvtx_push("feature")
+                feats_f32, _feat_lens_gpu = batched_fn(wav_gpu, lengths_gpu, fcfg)
                 feats = feats_f32.to(dtype=dtype)
                 # feat_lens_cpu was computed host-side above; the GPU
                 # ``feat_lens`` tensor is left unused to avoid the D2H sync.

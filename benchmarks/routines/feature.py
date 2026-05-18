@@ -265,7 +265,7 @@ def _torch_fbank_pipeline(
     preemph: float,
     eps: float,
 ) -> torch.Tensor:
-    """Pure torch batched pipeline (matches gpu_fbank.batched_fbank_gpu)."""
+    """Pure torch batched pipeline (matches batched.batched_fbank)."""
     frames = waveforms.unfold(-1, frame_length, frame_shift)
     f = frames - frames.mean(dim=-1, keepdim=True)
     preem = torch.empty_like(f)
