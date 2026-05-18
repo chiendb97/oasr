@@ -80,6 +80,8 @@ _SHAPES = [
     (2, 8, 1, 8, 64, 64),     # MQA
     (2, 8, 2, 8, 64, 64),     # GQA
     (1, 4, 4, 64, 256, 64),   # offline-ish shape
+    (1, 4, 4, 16, 249, 64),   # T_k not divisible by 8 (real audio frame counts)
+    (2, 4, 4, 16, 33, 64),    # tiny odd T_k
 ]
 
 _DTYPES = [torch.float16]

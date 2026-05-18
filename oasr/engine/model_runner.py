@@ -15,6 +15,7 @@ from oasr.cache import (
     CnnCacheManager,
     CtcStateCacheManager,
     StreamContext,
+    StreamSlotPool,
 )
 from oasr.cache.paged_kv import PagedKVCache
 from oasr.models.conformer.model import ConformerModel
@@ -22,6 +23,7 @@ from oasr.models.conformer.model import ConformerModel
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from .config import EngineConfig
+from .graph_cache import GraphedEncoderForward, round_up_bucket
 from .request import Request
 
 
@@ -43,12 +45,11 @@ class ModelRunner:
 
     Notes
     -----
-    **Streaming batching constraint**: :meth:`ConformerEncoder.forward_chunk`
-    and :meth:`ConformerEncoder.forward_chunk_paged` require ``batch_size=1``.
-    The engine therefore iterates over concurrent streaming requests
-    sequentially within a single ``step()`` rather than running a true
-    batched forward.  The cache managers still track all streams concurrently
-    and the scheduler amortises overhead across requests.
+    Streaming runs the paged ``forward_chunk_paged`` path. Streams with full
+    ready windows are batched together by :meth:`_forward_batched_paged`;
+    partial/final windows fall back to :meth:`_forward_single`. The cache
+    managers track all streams concurrently and the scheduler amortises
+    overhead across requests.
     """
 
     def __init__(
@@ -65,6 +66,7 @@ class ModelRunner:
         self._block_pool = BlockPool(cache_config)
         self._att_mgr = AttentionCacheManager(self._block_pool, cache_config)
         self._cnn_mgr = CnnCacheManager(cache_config)
+        self._slot_pool = StreamSlotPool(cache_config.max_batch_size)
         # Only create the CTC state manager when using the GPU decoder
         if config.decoder_type == "ctc_gpu":
             self._ctc_mgr: CtcStateCacheManager = CtcStateCacheManager(
@@ -72,6 +74,30 @@ class ModelRunner:
             )
         else:
             self._ctc_mgr = CtcStateCacheManager(config.gpu_decoder_config)
+
+        # CUDA Graph cache for the steady-state batched paged forward.
+        # Captures lazily on first encounter of each (B_active, cache_t1
+        # bucket) shape. Eager fallback is used for non-CUDA devices, when
+        # graphs are disabled, or for partial/final windows.
+        self._use_cuda_graphs = (
+            config.use_cuda_graphs
+            and torch.device(config.device).type == "cuda"
+        )
+        if self._use_cuda_graphs:
+            self._graph_cache = GraphedEncoderForward(
+                model,
+                self._att_mgr,
+                self._cnn_mgr,
+                cache_dtype=cache_config.dtype,
+                device=torch.device(config.device),
+                window=config.decoding_window,
+                feat_dim=config.feature_config.output_dim,
+                cnn_cache_frames=cache_config.cnn_cache_frames,
+                num_layers=cache_config.num_layers,
+                hidden_dim=cache_config.hidden_dim,
+            )
+        else:
+            self._graph_cache = None
 
     # ------------------------------------------------------------------
     # Offline forward
@@ -100,6 +126,15 @@ class ModelRunner:
             ``(B,)`` int32 valid encoder output frame counts, computed from
             the encoder's padding mask so downstream decoders ignore padding.
         """
+        # NB: do NOT wrap with ``oasr.fmha.persistent_inputs()`` here.
+        # Within one encoder forward each layer produces fresh Q/K/V/bias,
+        # there are no shared tensors to cache, so the context provides
+        # no win. And the engine runs kernels async without synchronizing
+        # between encoder layers or between consecutive forward_offline
+        # calls -- if the cache held a tensor that's then released at
+        # context exit (storage returned to the torch CUDA allocator),
+        # an in-flight kernel reading from that storage would race with
+        # the allocator handing it to a new allocation.
         hidden, masks = self._model.encoder(features, lengths)
         log_probs = self._model.ctc(hidden)  # (B, T_out, V)
         # masks: (B, 1, T_out) with True = valid
@@ -132,8 +167,11 @@ class ModelRunner:
         vocab_size = self._config._model_config.vocab_size or 5002  # type: ignore[union-attr]
         device = torch.device(self._config.device)
 
-        self._att_mgr.allocate_stream(sid)
-        self._cnn_mgr.allocate_stream(sid)
+        slot_id = self._slot_pool.allocate()
+        request.slot_id = slot_id
+
+        self._att_mgr.allocate_stream(sid, slot_id=slot_id)
+        self._cnn_mgr.allocate_stream(sid, slot_id=slot_id)
         self._ctc_mgr.allocate_stream(sid, batch=1, vocab_size=vocab_size, device=device)
 
         ctx = StreamContext(sid, self._att_mgr, self._cnn_mgr, self._ctc_mgr)
@@ -147,11 +185,14 @@ class ModelRunner:
         ----------
         request : Request
             The request to clean up.  Its ``stream_context`` is freed and
-            set to ``None``.
+            set to ``None``; its slot is returned to the slot pool.
         """
         if request.stream_context is not None:
             request.stream_context.free()
             request.stream_context = None
+        if request.slot_id is not None:
+            self._slot_pool.free(request.slot_id)
+            request.slot_id = None
 
     # ------------------------------------------------------------------
     # Streaming forward step
@@ -165,9 +206,9 @@ class ModelRunner:
         """Process at most one encoder chunk per request.
 
         Slices ``window`` frames out of ``request.feature_buffer`` starting
-        at ``request.feature_cursor``, runs ``forward_chunk_paged`` (or
-        ``forward_chunk`` in dense mode), commits the updated caches, and
-        advances ``feature_cursor`` by ``stride`` frames.  Requests whose
+        at ``request.feature_cursor``, runs ``forward_chunk_paged``, commits
+        the updated caches, and advances ``feature_cursor`` by ``stride``
+        frames.  Requests whose
         buffer doesn't yet hold a full window are skipped (they'll be
         revisited on the next step once more audio has been extracted).
 
@@ -195,16 +236,15 @@ class ModelRunner:
             chunks are omitted.
         """
         cfg = self._config
-        use_paged = cfg.use_paged_cache
         window = cfg.decoding_window
         stride = cfg.stride
         context = cfg.right_context + 1
 
         results: Dict[str, torch.Tensor] = {}
 
-        # Partition into (full-window + paged) and the catch-all fallback.
-        # Full-window-paged streams with identical offsets are candidates
-        # for batched forward.
+        # Partition into batchable (full-window paged) and the partial/final
+        # fallback. Full-window streams go through the batched paged forward;
+        # partial/final windows run one-at-a-time through ``_forward_single``.
         batchable: List[Request] = []
         fallback: List[Request] = []
 
@@ -221,12 +261,26 @@ class ModelRunner:
                 and (req.audio_tail is None or req.audio_tail.numel() == 0)
                 and available <= window
             )
-            # Only full-window paged forwards go through the batched path.
-            if use_paged and not is_final_window and available >= window:
+            if not is_final_window and available >= window:
                 batchable.append(req)
             else:
                 fallback.append(req)
 
+        # NB: do NOT wrap with ``oasr.fmha.persistent_inputs()`` here.
+        # The engine's hot path doesn't actually reuse tensors across
+        # layers (``_attend_paged`` builds a fresh ``block_table_view``
+        # slice per layer; ``total_kv_lens`` is a new tensor per layer;
+        # Q/K/V projections are fresh per layer), so the descriptor cache
+        # has nothing to hit. Worse, the engine runs encoder kernels
+        # asynchronously without between-layer / between-step syncs --
+        # if the cache held a tensor that then gets released at context
+        # exit (storage returned to the torch CUDA caching allocator), an
+        # in-flight kernel reading from that storage races with the
+        # allocator handing the storage to the next step's allocation.
+        # That's the ``cudaErrorIllegalAddress`` we hit at B=32 streaming.
+        # ``persistent_inputs`` remains useful for callers that DO reuse
+        # tensors and synchronize between calls (benchmarks, ad-hoc loops);
+        # it's not appropriate for the async engine pipeline.
         if batchable:
             # Heterogeneous-offset batching: all batchable streams go into
             # one paged forward regardless of offset. FlexAttention's
@@ -262,95 +316,78 @@ class ModelRunner:
 
         Pre-condition: every request in ``group`` has a full ``window``
         frames ready in its feature buffer and is using paged attention.
+        Single-stream cohorts (B=1) also flow through this path so they
+        can hit the CUDA graph cache instead of paying ~17 ms of eager
+        launch overhead in :meth:`_forward_single`.
         """
-        if len(group) == 1:
-            # Skip the stack/unstack bookkeeping for a single stream.
-            self._forward_single(group[0], window, stride, context, results)
-            return
-
         nvtx_push(f"batched_paged[B={len(group)}]")
-        # 1. Prepare per-stream write blocks (allocates a new physical
-        #    block and updates each stream's block_table in place).  One
-        #    batched allocator call instead of B per-stream calls.
-        nvtx_push("prepare_chunk")
+        B_active = len(group)
         stream_ids = [req.stream_id for req in group]
-        assert all(req.stream_context is not None for req in group)
+        slot_ids_host = [req.slot_id for req in group]
+        assert all(s is not None for s in slot_ids_host), (
+            "all batched streams must have an allocated slot_id"
+        )
+        device = self._att_mgr.block_table.device
+        slot_ids_gpu = torch.tensor(slot_ids_host, dtype=torch.long, device=device)
+
+        # 1. Prepare per-stream write blocks — one allocator call + one
+        #    scatter onto the persistent block_table.
+        nvtx_push("prepare_chunk")
         self._att_mgr.prepare_chunks_batched(stream_ids)  # type: ignore[arg-type]
         nvtx_pop()
 
-        # 2. Stack per-stream paged descriptors into a (B, ...) view.
-        block_tables: List[torch.Tensor] = []
-        cache_seqlens: List[torch.Tensor] = []
-        for req in group:
-            bt, cs = req.stream_context.get_paged_state_views()
-            block_tables.append(bt)
-            cache_seqlens.append(cs)
-        batched_bt = torch.cat(block_tables, dim=0)       # (B, blocks_per_seq)
-        batched_cs = torch.cat(cache_seqlens, dim=0)      # (B,)
-
-        # 3. Build batched PagedKVCache descriptors. The engine tracks
-        #    each request's ``offset`` on the host, so we can size
-        #    pos_emb / gather without a D2H sync from cache_seqlens.
-        block_size = self._cache_config.block_size_frames
-        num_layers = self._cache_config.num_layers
+        # 2. Gather feature-chunk slices and CNN cache rows in one shot.
         max_offset = max(req.offset for req in group)
-        batched_att_caches: List[PagedKVCache] = []
-        for i in range(num_layers):
-            k_view, v_view = self._block_pool.get_kv_view(i)
-            batched_att_caches.append(PagedKVCache(
-                k_cache=k_view,
-                v_cache=v_view,
-                block_table=batched_bt,
-                cache_seqlens=batched_cs,
-                block_size=block_size,
-                host_seqlen_max=max_offset,
-            ))
-
-        # 4. Stack feature-chunk slices and cnn_cache across streams.
         feature_chunks = [
             req.feature_buffer[req.feature_cursor: req.feature_cursor + window]
             for req in group
         ]
         xs = torch.stack(feature_chunks, dim=0)  # (B, window, F)
+        cnn_cache = self._cnn_mgr.get_batched_cache(slot_ids_gpu)  # (L, B, T, H)
 
-        per_stream_cnn = [req.stream_context.get_cnn_cache() for req in group]
-        if all(c.size(0) > 0 for c in per_stream_cnn):
-            cnn_cache = torch.cat(per_stream_cnn, dim=1)  # (L, B, T, H)
-        else:
-            cnn_cache = per_stream_cnn[0]  # (0,0,0,0) placeholder
-
-        # 5. Pass either a scalar offset (when all streams share one,
-        #    enabling broadcast pos_emb and the int-offset _paged_write
-        #    fast path) or a (B,) tensor (heterogeneous case) — built
-        #    only when needed to avoid unnecessary CPU/GPU round-trips.
-        homogeneous = all(req.offset == max_offset for req in group)
-        if homogeneous:
-            offset_arg: object = max_offset
-        else:
-            offset_arg = torch.tensor(
-                [req.offset for req in group],
-                dtype=batched_cs.dtype,
-                device=batched_cs.device,
-            )
-
-        # 6. One batched encoder call.
-        nvtx_push("encoder_call")
-        log_probs, new_cnn = self._model.forward_chunk_paged(
-            xs,
-            offset_arg,
-            batched_att_caches,
-            cnn_cache,
-            cache_t1=max_offset,
+        # 3. Per-stream encoder-frame offsets (always a tensor for the
+        #    graphed path; the eager fallback accepts the same tensor).
+        offsets_gpu = torch.tensor(
+            [req.offset for req in group],
+            dtype=torch.int32, device=device,
         )
+
+        # 4. Encoder forward — graph replay for any captured (B, bucket)
+        #    shape; eager fallback when the graph cache is saturated or
+        #    disabled. Captures are lazy and per-(B, cache_t1_bucket); a
+        #    typical workload sees a small set of (B, bucket) combos
+        #    because the scheduler keeps streams in lockstep cohorts and
+        #    cache_t1 grows in N_BLOCK-sized steps.
+        nvtx_push("encoder_call")
+        cache_t1_bucket = round_up_bucket(max_offset)
+        graph_out = None
+        if self._use_cuda_graphs and self._graph_cache is not None:
+            graph_out = self._graph_cache.replay(
+                B_active, xs.size(1), cache_t1_bucket,
+                xs=xs, cnn_in=cnn_cache,
+                slot_ids=slot_ids_gpu, offsets=offsets_gpu,
+            )
+        if graph_out is not None:
+            log_probs, new_cnn = graph_out
+        else:
+            batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_gpu)
+            for c in batched_att_caches:
+                c.host_seqlen_max = max_offset
+            log_probs, new_cnn = self._model.forward_chunk_paged(
+                xs, offsets_gpu, batched_att_caches, cnn_cache,
+                cache_t1=max_offset,
+            )
         actual_frames = log_probs.size(1)
         nvtx_pop()
 
-        # 7. Split the new cnn_cache back into per-stream slices and
-        #    commit per-stream attention-cache advancement.
+        # 5. Commit: one scatter onto the persistent cache_seqlens via the
+        #    batched API, one index_copy_ to scatter the new CNN cache back
+        #    into the persistent buffer, then host-side cursor / result
+        #    updates.
         nvtx_push("commit")
+        self._cnn_mgr.update_batched(slot_ids_gpu, new_cnn)
+        self._att_mgr.commit_chunks_paged_batched(stream_ids, actual_frames)  # type: ignore[arg-type]
         for b, req in enumerate(group):
-            per_stream_new_cnn = new_cnn[:, b: b + 1]  # (L, 1, T, H)
-            req.stream_context.commit_chunk_paged(actual_frames, per_stream_new_cnn)
             req.offset += actual_frames
             req.feature_cursor += stride
             results[req.request_id] = log_probs[b: b + 1]
@@ -369,13 +406,11 @@ class ModelRunner:
         context: int,
         results: Dict[str, torch.Tensor],
     ) -> None:
-        """Run one paged-or-dense forward for a single request.
+        """Run one paged forward for a single request.
 
-        Used for partial/final windows, for streams whose offsets differ
-        from the batched group, and for the dense (non-paged) cache mode.
+        Used for partial/final windows that the batched paged forward
+        cannot accommodate.
         """
-        cfg = self._config
-        use_paged = cfg.use_paged_cache
         if req.feature_buffer is None:
             return
 
@@ -395,34 +430,45 @@ class ModelRunner:
 
         ctx = req.stream_context
         assert ctx is not None
+        assert req.slot_id is not None
 
-        if use_paged:
-            ctx.prepare_chunk()
-            att_caches = ctx.get_att_caches()
-            cnn_cache = ctx.get_cnn_cache()
+        nvtx_push(f"single[off={req.offset},T_q={chunk.size(1)}]")
+        # Allocate the next physical block for this stream and refresh the
+        # persistent block_table row before we hand the slot into either
+        # the graph-cached or eager forward.
+        self._att_mgr.prepare_chunks_batched([req.stream_id])  # type: ignore[arg-type]
+
+        device = self._att_mgr.block_table.device
+        slot_ids_gpu = torch.tensor([req.slot_id], dtype=torch.long, device=device)
+        offsets_gpu = torch.tensor([req.offset], dtype=torch.int32, device=device)
+        cnn_cache = self._cnn_mgr.get_batched_cache(slot_ids_gpu)  # (L, 1, K-1, H)
+
+        cache_t1_bucket = round_up_bucket(req.offset)
+        nvtx_push("single.encoder_call")
+        graph_out = None
+        if self._use_cuda_graphs and self._graph_cache is not None:
+            graph_out = self._graph_cache.replay(
+                1, chunk.size(1), cache_t1_bucket,
+                xs=chunk, cnn_in=cnn_cache,
+                slot_ids=slot_ids_gpu, offsets=offsets_gpu,
+            )
+        if graph_out is not None:
+            log_probs, new_cnn = graph_out
+        else:
+            batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_gpu)
+            for c in batched_att_caches:
+                c.host_seqlen_max = req.offset
             log_probs, new_cnn = self._model.forward_chunk_paged(
-                chunk,
-                req.offset,
-                att_caches,
-                cnn_cache,
+                chunk, offsets_gpu, batched_att_caches, cnn_cache,
                 cache_t1=req.offset,
             )
-            actual_frames = log_probs.size(1)
-            ctx.commit_chunk_paged(actual_frames, new_cnn)
-        else:
-            att_cache = ctx.get_att_cache()
-            cnn_cache = ctx.get_cnn_cache()
-            required = cfg.required_cache_size
-            log_probs, new_att, new_cnn = self._model.forward_chunk(
-                chunk,
-                req.offset,
-                required,
-                att_cache,
-                cnn_cache,
-            )
-            actual_frames = log_probs.size(1)
-            new_kv_chunk = new_att[:, :, -actual_frames:, :]
-            ctx.commit_chunk(new_kv_chunk, new_cnn)
+        nvtx_pop()
+        actual_frames = log_probs.size(1)
+
+        # Commit cache state — single-stream batched commit + CNN scatter.
+        self._cnn_mgr.update_batched(slot_ids_gpu, new_cnn)
+        self._att_mgr.commit_chunks_paged_batched([req.stream_id], actual_frames)  # type: ignore[arg-type]
+        nvtx_pop()  # single
 
         req.offset += actual_frames
         if is_final_window:

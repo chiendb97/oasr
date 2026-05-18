@@ -7,18 +7,18 @@ request. Callers interact with a single object rather than three separate
 managers, reducing the risk of mismatched stream IDs and making the
 streaming loop concise.
 
-Typical usage::
+Typical usage (paged-only)::
 
     ctx = StreamContext(stream_id, att_mgr, cnn_mgr, ctc_mgr)
 
     for chunk_audio in audio_chunks:
-        att_cache = ctx.get_att_cache()        # (L, H, cache_t, d_k*2)
-        cnn_cache = ctx.get_cnn_cache()        # (L, 1, K-1, D)
-        logits, new_att, new_cnn = model.forward_chunk(
-            chunk_audio, offset, required_cache_size, att_cache, cnn_cache)
-        # Extract only the new chunk's KV (last chunk_size frames)
-        new_kv_chunk = new_att[:, :, -chunk_size:, :]
-        ctx.commit_chunk(new_kv_chunk, new_cnn)
+        ctx.prepare_chunk()                       # allocate block for next write
+        att_caches = ctx.get_att_caches()         # List[PagedKVCache], one per layer
+        cnn_cache  = ctx.get_cnn_cache()          # (L, 1, K-1, D)
+        logits, new_cnn = model.forward_chunk_paged(
+            chunk_audio, offset, att_caches, cnn_cache, cache_t1=offset,
+        )
+        ctx.commit_chunk_paged(logits.size(1), new_cnn)
         ctx.get_decoder().decode_chunk(logits)
 
     result = ctx.get_decoder().finalize_stream()
@@ -63,9 +63,10 @@ class StreamContext:
     >>> cnn_mgr.allocate_stream(sid)
     >>> ctc_mgr.allocate_stream(sid, batch=1, vocab_size=5000)
     >>> ctx = StreamContext(sid, att_mgr, cnn_mgr, ctc_mgr)
-    >>> ctx.get_att_cache()        # pass to forward_chunk
-    >>> ctx.commit_chunk(...)      # update after forward_chunk
-    >>> ctx.free()                 # release all resources
+    >>> ctx.prepare_chunk()
+    >>> ctx.get_att_caches()              # pass to forward_chunk_paged
+    >>> ctx.commit_chunk_paged(n, cnn)    # update after forward_chunk_paged
+    >>> ctx.free()                        # release all resources
     """
 
     def __init__(
@@ -93,26 +94,15 @@ class StreamContext:
     # Cache access
     # ------------------------------------------------------------------
 
-    def get_att_cache(self) -> torch.Tensor:
-        """Return the stacked attention KV cache for ``forward_chunk``.
-
-        Returns
-        -------
-        torch.Tensor
-            Shape ``(num_layers, n_kv_head, cache_t1, d_k * 2)`` matching
-            the ``att_cache`` parameter of ``ConformerEncoder.forward_chunk``.
-            Returns a ``(0, 0, 0, 0)`` empty tensor on the first chunk.
-        """
-        return self._attention_cache.get_stacked_cache(self._stream_id)
-
     def get_cnn_cache(self) -> torch.Tensor:
-        """Return the CNN cache tensor for ``forward_chunk``.
+        """Return the CNN cache tensor for ``forward_chunk_paged``.
 
         Returns
         -------
         torch.Tensor
             Shape ``(num_layers, 1, cnn_cache_frames, hidden_dim)`` matching
-            the ``cnn_cache`` parameter of ``ConformerEncoder.forward_chunk``.
+            the ``cnn_cache`` parameter of
+            ``ConformerEncoder.forward_chunk_paged``.
         """
         return self._cnn_cache.get_cache(self._stream_id)
 
@@ -159,29 +149,6 @@ class StreamContext:
     # ------------------------------------------------------------------
     # Mutation
     # ------------------------------------------------------------------
-
-    def commit_chunk(
-        self,
-        new_kv_chunk: torch.Tensor,
-        new_cnn_cache: torch.Tensor,
-    ) -> None:
-        """Commit encoder cache outputs from the latest ``forward_chunk`` call.
-
-        Dense-mode (``forward_chunk``) path.  For paged-mode use
-        :meth:`commit_chunk_paged` instead.
-
-        Parameters
-        ----------
-        new_kv_chunk : torch.Tensor
-            New packed K+V data.  Pass only the **new** frames:
-            ``new_att_cache[:, :, -chunk_size:, :]``.
-            Shape: ``(num_layers, n_kv_head, chunk_frames, kv_last_dim)``.
-        new_cnn_cache : torch.Tensor
-            CNN cache returned by ``forward_chunk``.
-            Shape: ``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
-        """
-        self._attention_cache.commit(self._stream_id, new_kv_chunk)
-        self._cnn_cache.update(self._stream_id, new_cnn_cache)
 
     def commit_chunk_paged(
         self,

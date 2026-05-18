@@ -358,6 +358,7 @@ def _run_config(
     dtype: "torch.dtype" = None,
     num_iters: int,
     output: OutputWriter,
+    use_cuda_graphs: Optional[bool] = None,
 ) -> None:
     """Run one benchmark configuration and write results to *output*."""
 
@@ -394,7 +395,7 @@ def _run_config(
 
     try:
         if is_streaming:
-            cfg = EngineConfig(
+            cfg_kwargs = dict(
                 ckpt_dir=ckpt_dir,
                 device="cuda",
                 dtype=dtype,
@@ -402,9 +403,11 @@ def _run_config(
                 chunk_size=chunk_size,
                 num_left_chunks=num_left_chunks,
                 max_batch_size=max_batch_size,
-                use_paged_cache=True,
                 fst_path=fst_file,
             )
+            if use_cuda_graphs is not None:
+                cfg_kwargs["use_cuda_graphs"] = use_cuda_graphs
+            cfg = EngineConfig(**cfg_kwargs)
             engine: Any = ASREngine(cfg)
             shape_str = (
                 f"N={n}, chunk={chunk_size}, max_bs={max_batch_size}, "

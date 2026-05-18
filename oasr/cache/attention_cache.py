@@ -2,21 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Paged attention KV cache manager for streaming conformer inference.
 
-Each active stream maintains a logical-to-physical block mapping backed by
-a shared ``BlockPool``.  Two usage modes are supported:
+Each active stream owns a **slot id** in ``[0, max_batch_size)``; the manager
+holds two persistent batched tensors indexed by slot:
 
-**Dense mode** (backward-compatible with ``forward_chunk``)
-    ``commit(stream_id, new_kv_chunk)`` allocates a block, copies packed K+V
-    data into it, and ``get_stacked_cache`` gathers them back into the dense
-    ``(elayers, head, cache_t1, d_k * 2)`` tensor expected by
-    ``ConformerEncoder.forward_chunk``.
+* ``block_table`` — ``(max_batch_size, max_blocks_per_seq)`` int32, logical
+  block ids per stream.
+* ``cache_seqlens`` — ``(max_batch_size,)`` int32, committed encoder frames
+  per stream.
 
-**Paged mode** (used with ``forward_chunk_paged``)
-    ``prepare_chunk(stream_id)`` allocates the next physical block in advance.
-    ``get_paged_caches(stream_id)`` returns one :class:`PagedKVCache` per
-    encoder layer.  ``forward_chunk_paged`` writes K/V directly into the pool.
-    ``commit_chunk_paged(stream_id, chunk_frames)`` increments ``cache_seqlens``
-    and evicts the oldest block when the left-context limit is reached.
+The persistent layout lets the batched paged forward fetch all B_active
+streams' paging metadata via two ``index_select`` calls — no per-stream
+Python loop, no per-chunk ``torch.cat``. Per-stream descriptors are still
+exposed (``get_paged_caches``, ``get_paged_state_views``) as zero-copy
+views into the persistent tensors.
+
+Streaming is paged-only; dense ``forward_chunk`` and its accompanying
+``commit`` / ``get_stacked_cache`` API were removed.
 """
 
 from __future__ import annotations
@@ -33,57 +34,39 @@ from oasr.cache.types import CacheConfig
 
 @dataclass
 class _StreamKVState:
-    """Internal per-stream logical-to-physical block mapping.
+    """Internal per-stream paging state.
 
     Attributes
     ----------
+    slot_id : int
+        Row index in the persistent batched block_table / cache_seqlens.
     logical_blocks : list[int]
         Ordered list of physical block IDs (oldest → newest).
     num_committed_frames : int
         Total encoder-output frames written into this stream's K/V pool.
-    block_table : Tensor or None
-        ``(1, max_blocks_per_seq)`` int32 on the cache device.  Allocated on
-        first use in paged mode; ``None`` until then.
-    cache_seqlens : Tensor or None
-        ``(1,)`` int32 scalar tracking committed frames for paged attention.
-        Shared across all layers of the same stream.
     """
 
+    slot_id: int
     logical_blocks: List[int] = field(default_factory=list)
     num_committed_frames: int = 0
-    block_table: Optional[torch.Tensor] = None
-    cache_seqlens: Optional[torch.Tensor] = None
 
 
 class AttentionCacheManager:
     """Manages paged attention KV cache for all active streams.
+
+    Holds one persistent ``(max_batch_size, max_blocks_per_seq)`` int32
+    ``block_table`` and ``(max_batch_size,)`` int32 ``cache_seqlens``
+    on the cache device. Each admitted stream is bound to a slot id; the
+    persistent rows for that slot store its paging metadata. Per-stream
+    views are zero-copy slices of the global tensors.
 
     Parameters
     ----------
     block_pool : BlockPool
         Shared physical block pool.
     config : CacheConfig
-        Cache configuration.
-
-    Examples
-    --------
-    Dense mode::
-
-        mgr = AttentionCacheManager(pool, config)
-        mgr.allocate_stream(42)
-        cache = mgr.get_stacked_cache(42)      # (L, H, 0, d_k*2) initially
-        mgr.commit(42, new_kv_chunk)
-        cache = mgr.get_stacked_cache(42)      # (L, H, chunk_sz, d_k*2)
-        mgr.free_stream(42)
-
-    Paged mode::
-
-        mgr.allocate_stream(42)
-        mgr.prepare_chunk(42)                  # allocate block for next write
-        att_caches = mgr.get_paged_caches(42)  # List[PagedKVCache]
-        xs, cnn = model.forward_chunk_paged(xs, offset, att_caches, cnn)
-        mgr.commit_chunk_paged(42, chunk_size)
-        mgr.free_stream(42)
+        Cache configuration (must define ``max_batch_size``,
+        ``max_blocks_per_seq``).
     """
 
     def __init__(self, block_pool: BlockPool, config: CacheConfig) -> None:
@@ -91,172 +74,99 @@ class AttentionCacheManager:
         self._config = config
         self._streams: Dict[int, _StreamKVState] = {}
 
+        # Persistent batched paging tensors. Allocated once at construction
+        # so the batched paged forward only needs two ``index_select`` calls
+        # to pull active-batch metadata, not a Python loop over B streams.
+        self._block_table = torch.zeros(
+            config.max_batch_size, config.max_blocks_per_seq,
+            dtype=torch.int32, device=config.device,
+        )
+        self._cache_seqlens = torch.zeros(
+            config.max_batch_size, dtype=torch.int32, device=config.device,
+        )
+
+        # Pre-built per-layer PagedKVCache descriptors pointing at the FULL
+        # persistent block_table / cache_seqlens. The batched paged forward
+        # builds B_active-row views from these on each chunk.
+        self._persistent_caches: List[PagedKVCache] = [
+            PagedKVCache(
+                k_cache=self._pool.get_kv_view(layer)[0],
+                v_cache=self._pool.get_kv_view(layer)[1],
+                block_table=self._block_table,
+                cache_seqlens=self._cache_seqlens,
+                block_size=config.block_size_frames,
+                host_seqlen_max=0,
+            )
+            for layer in range(config.num_layers)
+        ]
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def block_table(self) -> torch.Tensor:
+        """The persistent ``(max_batch_size, max_blocks_per_seq)`` block_table."""
+        return self._block_table
+
+    @property
+    def cache_seqlens(self) -> torch.Tensor:
+        """The persistent ``(max_batch_size,)`` cache_seqlens."""
+        return self._cache_seqlens
+
+    @property
+    def num_layers(self) -> int:
+        return self._config.num_layers
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def allocate_stream(self, stream_id: int) -> None:
-        """Register a new stream with an empty KV cache.
+    def allocate_stream(self, stream_id: int, slot_id: int) -> None:
+        """Register a new stream at a given slot id.
 
         Parameters
         ----------
         stream_id : int
             Unique stream identifier.
+        slot_id : int
+            Row index in the persistent batched block_table / cache_seqlens.
+            Must be in ``[0, max_batch_size)`` and not already in use.
 
         Raises
         ------
         ValueError
-            If ``stream_id`` is already allocated.
+            If ``stream_id`` is already allocated or ``slot_id`` is out of
+            range / in use.
         """
         if stream_id in self._streams:
             raise ValueError(f"Attention cache for stream {stream_id} already allocated.")
-        self._streams[stream_id] = _StreamKVState()
+        if not (0 <= slot_id < self._config.max_batch_size):
+            raise ValueError(
+                f"slot_id {slot_id} out of range [0, {self._config.max_batch_size})"
+            )
+        for s in self._streams.values():
+            if s.slot_id == slot_id:
+                raise ValueError(f"slot_id {slot_id} already in use")
+        self._streams[stream_id] = _StreamKVState(slot_id=slot_id)
+        # Reset persistent rows for the new stream.
+        self._block_table[slot_id].zero_()
+        self._cache_seqlens[slot_id] = 0
 
     def free_stream(self, stream_id: int) -> None:
         """Release all physical blocks for a stream and remove it.
 
-        Parameters
-        ----------
-        stream_id : int
-            Stream to release.
-
-        Raises
-        ------
-        KeyError
-            If ``stream_id`` is not allocated.
+        The slot is left tied to the freed state until the caller (engine)
+        releases it back to the StreamSlotPool.
         """
         state = self._get_state(stream_id)
         if state.logical_blocks:
             self._pool.free(state.logical_blocks)
         del self._streams[stream_id]
 
-    # ------------------------------------------------------------------
-    # Dense-mode access
-    # ------------------------------------------------------------------
-
-    def get_cache_view(self, stream_id: int, layer: int) -> torch.Tensor:
-        """Return the gathered KV cache for one layer as a packed tensor.
-
-        Parameters
-        ----------
-        stream_id : int
-            Stream identifier.
-        layer : int
-            Encoder layer index ``[0, num_layers)``.
-
-        Returns
-        -------
-        torch.Tensor
-            Shape ``(1, n_kv_head, committed_frames, head_dim * 2)``.
-        """
-        state = self._get_state(stream_id)
-        cfg = self._config
-        if not state.logical_blocks:
-            return torch.empty(
-                1, cfg.n_kv_head, 0, cfg.kv_last_dim,
-                dtype=cfg.dtype, device=cfg.device,
-            )
-        # Gather K and V separately, each (n*block_size, n_kv_head, head_dim).
-        k_flat, v_flat = self._pool.gather_kv_blocks(layer, state.logical_blocks)
-        k_flat = k_flat[: state.num_committed_frames]
-        v_flat = v_flat[: state.num_committed_frames]
-        # Pack into (committed_frames, n_kv_head, head_dim * 2).
-        kv_flat = torch.cat([k_flat, v_flat], dim=-1)
-        # → (1, n_kv_head, committed_frames, head_dim * 2)
-        return kv_flat.permute(1, 0, 2).unsqueeze(0)
-
-    def get_stacked_cache(self, stream_id: int) -> torch.Tensor:
-        """Return the full packed KV cache stacked across all layers.
-
-        Shape matches the ``att_cache`` parameter of
-        ``ConformerEncoder.forward_chunk``:
-        ``(num_layers, n_kv_head, cache_t1, d_k * 2)``.
-
-        Parameters
-        ----------
-        stream_id : int
-            Stream identifier.
-
-        Returns
-        -------
-        torch.Tensor
-            ``(num_layers, n_kv_head, committed_frames, kv_last_dim)`` or
-            ``(0, 0, 0, 0)`` when no frames have been committed.
-        """
-        state = self._get_state(stream_id)
-        cfg = self._config
-        if not state.logical_blocks:
-            return torch.zeros(0, 0, 0, 0, dtype=cfg.dtype, device=cfg.device)
-        views = [self.get_cache_view(stream_id, l) for l in range(cfg.num_layers)]
-        return torch.cat(views, dim=0)
-
-    # ------------------------------------------------------------------
-    # Dense-mode mutation
-    # ------------------------------------------------------------------
-
-    def commit(self, stream_id: int, new_kv_chunk: torch.Tensor) -> None:
-        """Write new packed K+V frames from the latest ``forward_chunk`` call.
-
-        Parameters
-        ----------
-        stream_id : int
-            Stream identifier.
-        new_kv_chunk : torch.Tensor
-            Shape ``(num_layers, n_kv_head, chunk_frames, kv_last_dim)``
-            where ``kv_last_dim = head_dim * 2``.
-
-        Raises
-        ------
-        ValueError
-            If shape is inconsistent with the config.
-        RuntimeError
-            If the pool has no free blocks.
-        """
-        state = self._get_state(stream_id)
-        cfg = self._config
-        chunk_frames = new_kv_chunk.size(2)
-
-        if new_kv_chunk.size(0) != cfg.num_layers:
-            raise ValueError(
-                f"new_kv_chunk.shape[0]={new_kv_chunk.size(0)} != "
-                f"num_layers={cfg.num_layers}."
-            )
-        if new_kv_chunk.size(3) != cfg.kv_last_dim:
-            raise ValueError(
-                f"new_kv_chunk.shape[3]={new_kv_chunk.size(3)} != "
-                f"kv_last_dim={cfg.kv_last_dim}."
-            )
-        if chunk_frames > cfg.block_size_frames:
-            raise ValueError(
-                f"chunk_frames={chunk_frames} exceeds "
-                f"block_size_frames={cfg.block_size_frames}."
-            )
-
-        # Allocate one new physical block.
-        (block_id,) = self._pool.allocate(1)
-        state.logical_blocks.append(block_id)
-
-        # Write split K and V into the block for each layer.
-        # Pool block view shape: (block_size, n_kv_head, head_dim).
-        # new_kv_chunk[l] shape: (n_kv_head, chunk_frames, kv_last_dim).
-        head_dim = cfg.head_dim
-        for l in range(cfg.num_layers):
-            k_view, v_view = self._pool.get_kv_block_view(l, block_id)
-            layer_kv = new_kv_chunk[l]  # (n_kv_head, chunk_frames, kv_last_dim)
-            # Permute to (chunk_frames, n_kv_head, kv_last_dim) and split.
-            layer_kv_t = layer_kv.permute(1, 0, 2)  # (chunk_frames, n_kv_head, kv_last_dim)
-            k_view[:chunk_frames].copy_(layer_kv_t[..., :head_dim])
-            v_view[:chunk_frames].copy_(layer_kv_t[..., head_dim:])
-
-        state.num_committed_frames += chunk_frames
-
-        # Also keep block_table / cache_seqlens in sync for paged mode.
-        if state.block_table is not None:
-            logical_idx = len(state.logical_blocks) - 1
-            state.block_table[0, logical_idx] = block_id
-            state.cache_seqlens[0] = state.num_committed_frames
-
-        self._evict_oldest(stream_id)
+    def slot_of(self, stream_id: int) -> int:
+        """Return the slot id bound to ``stream_id``."""
+        return self._get_state(stream_id).slot_id
 
     # ------------------------------------------------------------------
     # Paged-mode access and mutation
@@ -266,148 +176,171 @@ class AttentionCacheManager:
         """Allocate the next physical block and update the block table.
 
         Must be called **before** ``get_paged_caches`` and
-        ``forward_chunk_paged`` so that the block table contains a valid entry
+        ``forward_chunk_paged`` so the block table contains a valid entry
         for the frames about to be written.
-
-        Parameters
-        ----------
-        stream_id : int
-            Stream identifier.
-
-        Raises
-        ------
-        RuntimeError
-            If the pool has no free blocks.
         """
         state = self._get_state(stream_id)
-        cfg = self._config
-
-        # Lazily allocate block_table and cache_seqlens on first use.
-        if state.block_table is None:
-            state.block_table = torch.zeros(
-                1, cfg.max_blocks_per_seq, dtype=torch.int32, device=cfg.device
-            )
-            state.cache_seqlens = torch.zeros(1, dtype=torch.int32, device=cfg.device)
-
         (block_id,) = self._pool.allocate(1)
         state.logical_blocks.append(block_id)
         logical_idx = len(state.logical_blocks) - 1
-        state.block_table[0, logical_idx] = block_id
+        self._block_table[state.slot_id, logical_idx] = block_id
+
+    def prepare_chunks_batched(self, stream_ids: List[int]) -> None:
+        """Allocate one new physical block for each of ``stream_ids``.
+
+        Issues a single ``BlockPool.allocate(B)`` plus a batched scatter
+        into the persistent block_table — replacing the per-stream scalar
+        stores that the old per-stream-tensor layout required.
+        """
+        if not stream_ids:
+            return
+
+        # One allocator call for all B blocks.
+        block_ids = self._pool.allocate(len(stream_ids))
+
+        # Gather the per-stream (slot, logical_idx) targets host-side; one
+        # batched scatter onto the persistent block_table replaces B scalar
+        # writes.
+        slots: List[int] = []
+        logical_indices: List[int] = []
+        for sid, block_id in zip(stream_ids, block_ids):
+            state = self._streams[sid]
+            state.logical_blocks.append(block_id)
+            logical_indices.append(len(state.logical_blocks) - 1)
+            slots.append(state.slot_id)
+
+        device = self._block_table.device
+        slots_t = torch.tensor(slots, dtype=torch.long, device=device)
+        logical_t = torch.tensor(logical_indices, dtype=torch.long, device=device)
+        block_ids_t = torch.tensor(block_ids, dtype=torch.int32, device=device)
+        self._block_table[slots_t, logical_t] = block_ids_t
 
     def get_paged_caches(self, stream_id: int) -> List[PagedKVCache]:
         """Return one :class:`PagedKVCache` per encoder layer for the stream.
 
-        All returned objects share the same ``block_table`` and
-        ``cache_seqlens`` tensors.  Only ``k_cache`` / ``v_cache`` differ.
-
-        Parameters
-        ----------
-        stream_id : int
-            Stream identifier.  Must have been prepared with
-            :meth:`prepare_chunk` at least once.
-
-        Returns
-        -------
-        list[PagedKVCache]
-            One entry per encoder layer (length ``config.num_layers``).
+        Used by per-stream fallback paths (e.g. partial/final windows). The
+        returned descriptors are ``(1, max_blocks_per_seq)`` / ``(1,)``
+        zero-copy slices of the persistent batched tensors.
 
         Raises
         ------
         RuntimeError
-            If :meth:`prepare_chunk` was never called for this stream.
+            If ``stream_id`` has not been admitted.
         """
         state = self._get_state(stream_id)
-        if state.block_table is None:
-            raise RuntimeError(
-                f"Stream {stream_id}: call prepare_chunk() before get_paged_caches()."
-            )
         cfg = self._config
+        slot = state.slot_id
+        block_table_view = self._block_table[slot: slot + 1]
+        cache_seqlens_view = self._cache_seqlens[slot: slot + 1]
         host_seqlen = state.num_committed_frames
-        caches = []
+        caches: List[PagedKVCache] = []
         for layer in range(cfg.num_layers):
             k_view, v_view = self._pool.get_kv_view(layer)
             caches.append(
                 PagedKVCache(
                     k_cache=k_view,
                     v_cache=v_view,
-                    block_table=state.block_table,
-                    cache_seqlens=state.cache_seqlens,
+                    block_table=block_table_view,
+                    cache_seqlens=cache_seqlens_view,
                     block_size=cfg.block_size_frames,
                     host_seqlen_max=host_seqlen,
                 )
             )
         return caches
 
-    def prepare_chunks_batched(self, stream_ids: List[int]) -> None:
-        """Allocate one new physical block for each of ``stream_ids``.
-
-        Cheaper than calling :meth:`prepare_chunk` once per stream when
-        the engine is dispatching a batched paged forward — does ONE
-        :meth:`BlockPool.allocate` call for ``B`` blocks and writes the
-        resulting IDs into each stream's GPU block_table via a single
-        scatter-style update.
-        """
-        if not stream_ids:
-            return
-        cfg = self._config
-        # Lazily allocate block_table / cache_seqlens for any new streams.
-        for sid in stream_ids:
-            state = self._get_state(sid)
-            if state.block_table is None:
-                state.block_table = torch.zeros(
-                    1, cfg.max_blocks_per_seq, dtype=torch.int32,
-                    device=cfg.device,
-                )
-                state.cache_seqlens = torch.zeros(
-                    1, dtype=torch.int32, device=cfg.device,
-                )
-
-        block_ids = self._pool.allocate(len(stream_ids))
-        # Update host + GPU state per stream.  GPU writes are one-element
-        # scalar stores into each stream's own block_table tensor — small
-        # but unavoidable with per-stream block tables.
-        for sid, block_id in zip(stream_ids, block_ids):
-            state = self._streams[sid]
-            state.logical_blocks.append(block_id)
-            logical_idx = len(state.logical_blocks) - 1
-            state.block_table[0, logical_idx] = block_id  # type: ignore[index]
-
     def get_paged_state_views(
         self, stream_id: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(block_table, cache_seqlens)`` shared across all layers.
+        """Return ``(block_table_row, cache_seqlens_row)`` views for the stream.
 
-        Cheaper than :meth:`get_paged_caches` for callers that only need
-        the per-stream paging tensors (the batched paged forward stacks
-        these across streams to build a single ``B``-row block-table).
+        Both views are zero-copy slices of the persistent batched tensors.
         """
         state = self._get_state(stream_id)
-        if state.block_table is None or state.cache_seqlens is None:
-            raise RuntimeError(
-                f"Stream {stream_id}: call prepare_chunk() before "
-                f"get_paged_state_views()."
+        slot = state.slot_id
+        return (
+            self._block_table[slot: slot + 1],
+            self._cache_seqlens[slot: slot + 1],
+        )
+
+    def get_batched_paged_caches(
+        self, slot_ids_gpu: torch.Tensor,
+    ) -> Tuple[List[PagedKVCache], torch.Tensor, torch.Tensor]:
+        """Return per-layer paged caches indexed by an active-batch slot tensor.
+
+        Parameters
+        ----------
+        slot_ids_gpu : Tensor
+            ``(B_active,)`` int64 / int32 tensor on the cache device. Picks
+            the rows of the persistent batched ``block_table`` /
+            ``cache_seqlens`` to expose to the kernel.
+
+        Returns
+        -------
+        caches : list[PagedKVCache]
+            One :class:`PagedKVCache` per encoder layer. ``block_table`` and
+            ``cache_seqlens`` are shared across layers; only ``k_cache`` /
+            ``v_cache`` differ.
+        batched_block_table : Tensor
+            The ``(B_active, max_blocks_per_seq)`` gather; returned so the
+            caller can reuse it for kernel-size trimming / debugging.
+        batched_cache_seqlens : Tensor
+            The ``(B_active,)`` gather.
+        """
+        cfg = self._config
+        # Single index_select call replaces the old per-stream ``torch.cat``
+        # of B ``(1, max_blocks_per_seq)`` rows.
+        batched_bt = self._block_table.index_select(0, slot_ids_gpu)
+        batched_cs = self._cache_seqlens.index_select(0, slot_ids_gpu)
+        caches: List[PagedKVCache] = []
+        for layer in range(cfg.num_layers):
+            base = self._persistent_caches[layer]
+            caches.append(
+                PagedKVCache(
+                    k_cache=base.k_cache,
+                    v_cache=base.v_cache,
+                    block_table=batched_bt,
+                    cache_seqlens=batched_cs,
+                    block_size=cfg.block_size_frames,
+                    host_seqlen_max=0,  # the caller passes cache_t1 host-side
+                )
             )
-        return state.block_table, state.cache_seqlens
+        return caches, batched_bt, batched_cs
 
     def commit_chunk_paged(self, stream_id: int, chunk_frames: int) -> None:
         """Advance ``cache_seqlens`` after a paged forward pass and evict if needed.
 
-        The attention layer has already written K/V directly into the
-        pool via :meth:`PagedKVCache.write_kv_chunk`. This method only
-        updates the frame counter and handles eviction.
-
-        Parameters
-        ----------
-        stream_id : int
-            Stream identifier.
-        chunk_frames : int
-            Number of encoder-output frames written in the latest chunk.
+        The attention layer wrote K/V directly into the pool via
+        :meth:`PagedKVCache.write_kv_chunk`; this method only updates the
+        host-side counter, the persistent ``cache_seqlens`` row, and runs
+        per-stream eviction.
         """
         state = self._get_state(stream_id)
         state.num_committed_frames += chunk_frames
-        if state.cache_seqlens is not None:
-            state.cache_seqlens[0] = state.num_committed_frames
+        self._cache_seqlens[state.slot_id] = state.num_committed_frames
         self._evict_oldest(stream_id)
+
+    def commit_chunks_paged_batched(
+        self,
+        stream_ids: List[int],
+        chunk_frames: int,
+    ) -> None:
+        """Batched ``commit_chunk_paged`` for a group of streams.
+
+        Advances ``cache_seqlens`` for ``B`` streams via a single scatter,
+        then runs per-stream eviction host-side.
+        """
+        if not stream_ids:
+            return
+        slots: List[int] = []
+        for sid in stream_ids:
+            state = self._streams[sid]
+            state.num_committed_frames += chunk_frames
+            slots.append(state.slot_id)
+        slots_t = torch.tensor(slots, dtype=torch.long, device=self._block_table.device)
+        # In-place batched advance — one kernel for all B updates.
+        self._cache_seqlens[slots_t] += chunk_frames
+        for sid in stream_ids:
+            self._evict_oldest(sid)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -421,23 +354,16 @@ class AttentionCacheManager:
         if max_blocks is None:
             return  # unlimited history
 
+        slot = state.slot_id
         while len(state.logical_blocks) > max_blocks:
             evicted = state.logical_blocks.pop(0)
             self._pool.free([evicted])
-            # Adjust committed frame counter.
             state.num_committed_frames = len(state.logical_blocks) * cfg.block_size_frames
-            if state.cache_seqlens is not None:
-                state.cache_seqlens[0] = state.num_committed_frames
-            # Shift the block table left by one entry.
-            if state.block_table is not None:
-                n = len(state.logical_blocks)
-                state.block_table[0, :n] = state.block_table[0, 1: n + 1].clone()
-                state.block_table[0, n] = 0
-
-    # Keep old name for backward compatibility.
-    def evict_oldest(self, stream_id: int) -> None:
-        """Alias for :meth:`_evict_oldest` (backward-compatible name)."""
-        self._evict_oldest(stream_id)
+            self._cache_seqlens[slot] = state.num_committed_frames
+            # Shift this stream's block_table row left by one entry.
+            n = len(state.logical_blocks)
+            self._block_table[slot, :n] = self._block_table[slot, 1: n + 1].clone()
+            self._block_table[slot, n] = 0
 
     def _get_state(self, stream_id: int) -> _StreamKVState:
         try:

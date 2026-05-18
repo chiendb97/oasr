@@ -544,24 +544,16 @@ class TestCtcPrefixBeamSearch:
 
         with torch.no_grad():
             probs = oasr_model(feats, lengths)
-            chunk_by_chunk_probs = oasr_model.forward_chunk_by_chunk(
-                feats, decoding_chunk_size=4, num_decoding_left_chunks=2)
 
-        # CtcPrefixBeamSearch expects log-probs of shape [T, V] on CPU in
-        # float32; collapse the batch dimension and move to CPU.
+        # CtcPrefixBeamSearch expects log-probs of shape [T, V] on CPU.
         probs = probs.squeeze(0).to(device="cpu", dtype=dtype)
-        chunk_by_chunk_probs = chunk_by_chunk_probs.squeeze(
-            0).to(device="cpu", dtype=dtype)
 
         id2word = build_dictionary(os.path.join(ckpt_dir, "words.txt"))
 
         text, _ = decode(probs, id2word)
-        chunk_by_chunk_text, _ = decode(chunk_by_chunk_probs, id2word)
         print(f"text: {text}")
-        print(f"chunk_by_chunk_text: {chunk_by_chunk_text}")
 
         assert len(text.split()) > 0
-        assert len(chunk_by_chunk_text.split()) > 0
 
 
 # ---------------------------------------------------------------------------

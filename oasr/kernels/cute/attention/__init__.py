@@ -3,11 +3,10 @@
 """CuteDSL-based fused attention kernels.
 
 Per-arch forward-pass classes:
-    FmhaBase   -- abstract spec.
-    FmhaSm80   -- Ampere kernel (sm_80 / sm_86 / sm_89). Carries the
-                  full m16n8k16 + cp.async kernel body.
-    FmhaSm120  -- consumer Blackwell (RTX 50xx). Thin subclass over
-                  ``FmhaSm80`` that swaps in SM120's 99 KB smem cap.
+    FmhaBase          -- abstract spec.
+    FmhaSm80          -- Ampere kernel (sm_80 / sm_86 / sm_89). Thin shim.
+    FmhaSm120         -- consumer Blackwell (RTX 50xx). Thin shim with
+                         the 99 KB smem cap.
 """
 
 from .base import FmhaBase

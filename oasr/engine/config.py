@@ -49,9 +49,6 @@ class EngineConfig:
         means each chunk maps to exactly one block.
     max_blocks_per_seq : int
         Maximum logical blocks per stream in the block table tensor.
-    use_paged_cache : bool
-        If True (default), use ``forward_chunk_paged`` + ``BlockPool``.
-        If False, use ``forward_chunk`` with dense cache tensors.
     feature_config : FeatureConfig, optional
         Feature extraction config.  Defaults to 80-dim log-mel FBANK at 16 kHz
         with dither disabled (``dither=0.0``) for deterministic inference.
@@ -159,7 +156,24 @@ class EngineConfig:
     max_num_blocks: int = 2048
     block_size_frames: int = 16
     max_blocks_per_seq: int = 512
-    use_paged_cache: bool = True
+
+    # CUDA Graph capture for the steady-state streaming encoder forward.
+    # The cute DSL fmha is compiled with TVM-FFI (``--enable-tvm-ffi``)
+    # and invoked with raw torch tensors, matching Flash Attention's
+    # ``flash_attn/cute`` pattern. Capture + replay collapses the 12-layer
+    # ~200-kernel encoder forward into a single CUDA Graph launch per
+    # ``(B_active, cache_t1_bucket)`` shape; at steady state (B ==
+    # max_batch_size) this is a clean win over the eager dispatch.
+    #
+    # The bias tile in the cute kernel is read unpredicated along T_q —
+    # safe only when adjacent gmem is mapped. Eager calls always landed
+    # adjacent allocations on the default pool so the over-read was
+    # invisible; once graph capture started carving the address space into
+    # private pools the over-read could fall into unmapped pages and trip
+    # ``cudaErrorIllegalAddress``. ``RelPositionMultiHeadedAttention.
+    # _forward_paged`` now pads ``combined_bias`` to the kernel's
+    # ``(M_BLOCK, N_BLOCK)`` tile so every bias read stays in-bounds.
+    use_cuda_graphs: bool = True
 
     # Feature extraction
     feature_config: Optional[FeatureConfig] = None
@@ -243,11 +257,6 @@ class EngineConfig:
         """Feature frame stride between consecutive chunk windows."""
         return self.subsampling_rate * self.chunk_size
 
-    @property
-    def required_cache_size(self) -> int:
-        """Attention cache size in encoder frames for dense streaming mode."""
-        return self.chunk_size * self.num_left_chunks
-
     # ------------------------------------------------------------------
     # CacheConfig builder
     # ------------------------------------------------------------------
@@ -274,6 +283,7 @@ class EngineConfig:
             block_size_frames=self.block_size_frames,
             max_num_blocks=self.max_num_blocks,
             max_blocks_per_seq=self.max_blocks_per_seq,
+            max_batch_size=self.max_batch_size,
             device=torch.device(self.device),
             dtype=self.dtype,
         )

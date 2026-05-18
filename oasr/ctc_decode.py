@@ -490,7 +490,10 @@ class GpuStreamingDecoder:
         # Batch blank-threshold check: a single GPU→CPU transfer for the
         # entire chunk replaces one .min().item() sync per frame.  The mask
         # is then handed to the C++ chunk launcher as-is so the per-frame
-        # skip happens without a Python round-trip.
+        # skip happens without a Python round-trip — and, critically, lets
+        # the host loop skip ``streaming_step`` launches for blank frames,
+        # which is a large net win on streaming workloads even though the
+        # mask materialisation itself is a small D2H sync.
         if blank_log_thresh is not None:
             is_speech_mask = (
                 log_prob[:, :, cfg.blank_id]

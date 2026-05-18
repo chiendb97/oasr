@@ -1,11 +1,10 @@
 """Unit tests for OASR's RelPos multi-head attention.
 
-After the refactor a single class is exposed —
+A single class is exposed —
 :class:`oasr.layers.attention.attention.RelPositionMultiHeadedAttention` —
-exercising three cache modes:
+exercising two cache modes:
 
 * offline (``cache=None``)
-* dense streaming (``cache=(K_old, V_old)``)
 * paged streaming (``cache=PagedKVCache``)
 
 Each mode is checked against a hand-rolled reference that re-implements
@@ -13,7 +12,8 @@ the WeNet rel-pos algebra exactly (``matrix_bd`` combined with the
 padding bias before SDPA). The reference and the implementation both
 funnel into ``F.scaled_dot_product_attention``, so this is a regression
 guard against accidental drift in the bias / mask plumbing rather than
-a kernel-vs-kernel comparison.
+a kernel-vs-kernel comparison. The dense streaming (``cache=tuple``)
+path has been removed; streaming is paged-only.
 """
 
 from __future__ import annotations
@@ -51,28 +51,6 @@ def _ref_offline(attn, x, mask, pos_emb):
     )
     out = out.transpose(1, 2).contiguous().view(x.size(0), -1, attn.h * attn.d_k)
     return attn.linear_out(out)
-
-
-def _ref_dense(attn, x, mask, pos_emb, cache):
-    """SDPA reference for the dense-streaming path."""
-    q = attn._project("query", x)
-    k_new = attn._project("key", x)
-    v_new = attn._project("value", x)
-    k_old, v_old = cache
-    k_full = torch.cat([k_old, k_new], dim=-2)
-    v_full = torch.cat([v_old, v_new], dim=-2)
-    n_batch_pos = pos_emb.size(0)
-    p = attn.linear_pos(pos_emb).view(n_batch_pos, -1, attn.h, attn.d_k).transpose(1, 2)
-    q_t = q.transpose(1, 2)
-    q_u = (q_t + attn.pos_bias_u).transpose(1, 2)
-    q_v = (q_t + attn.pos_bias_v).transpose(1, 2)
-    matrix_bd = torch.matmul(q_v, p.transpose(-2, -1))
-    attn_bias = (matrix_bd + mask.unsqueeze(1)) / math.sqrt(attn.d_k)
-    out = F.scaled_dot_product_attention(
-        q_u, k_full, v_full, attn_mask=attn_bias, scale=1 / math.sqrt(attn.d_k),
-    )
-    out = out.transpose(1, 2).contiguous().view(x.size(0), -1, attn.h * attn.d_k)
-    return attn.linear_out(out), (k_full, v_full)
 
 
 def _ref_paged(attn, x, pos_emb, cache: PagedKVCache):
@@ -137,25 +115,6 @@ def test_offline_path_matches_sdpa(attn, device, B, T):
 
     assert cache is None
     torch.testing.assert_close(out_new, out_ref, rtol=1e-4, atol=1e-4)
-
-
-@pytest.mark.parametrize("B,T_q,T_old", [(1, 4, 12), (2, 6, 16)])
-def test_dense_path_matches_sdpa(attn, device, B, T_q, T_old):
-    """Dense streaming (cache=tuple) FlexAttention path matches SDPA reference."""
-    x = torch.randn(B, T_q, N_FEAT, device=device)
-    T_kv = T_old + T_q
-    pos_emb = torch.randn(B, T_kv, N_FEAT, device=device)
-    mask = torch.zeros(B, 1, T_kv, device=device)
-    k_old = torch.randn(B, N_HEAD, T_old, D_K, device=device)
-    v_old = torch.randn(B, N_HEAD, T_old, D_K, device=device)
-
-    with torch.no_grad():
-        out_new, new_cache = attn(x, x, x, mask, pos_emb, cache=(k_old, v_old))
-        out_ref, ref_cache = _ref_dense(attn, x, mask, pos_emb, (k_old, v_old))
-
-    torch.testing.assert_close(out_new, out_ref, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(new_cache[0], ref_cache[0], rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(new_cache[1], ref_cache[1], rtol=1e-4, atol=1e-4)
 
 
 def test_paged_path_matches_sdpa(attn, device):

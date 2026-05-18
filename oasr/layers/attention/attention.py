@@ -4,24 +4,17 @@
 
 A single inference-only attention class is provided:
 :class:`RelPositionMultiHeadedAttention`. The actual attention compute
-goes through PyTorch SDPA
-(``torch.nn.functional.scaled_dot_product_attention``) for all three
-cache modes:
+goes through :func:`oasr.attention.fmha` (CuteDSL on supported GPUs,
+SDPA fallback otherwise) for two cache modes:
 
 * offline (``cache=None``)
-* dense streaming (``cache=(K_cached, V_cached)``)
 * paged streaming (``cache=PagedKVCache``)
 
 The Transformer-XL rel-pos bias ``matrix_bd`` is combined with the
-padding / per-stream length mask and passed in via ``attn_mask``.
+padding / per-stream length mask and passed in via ``attn_bias``.
 
-Removed in this revision (relative to the WeNet-port era):
-    * ``MultiHeadedAttention`` / ``MultiHeadedCrossAttention`` /
-      ``ShawRelPositionMultiHeadedAttention`` / ``RopeMultiHeadedAttention`` —
-      none of them were used by the active Conformer encoder.
-    * The ``if not self.training`` cache-update branch — inference-only.
-    * The ``flash_attn_with_kvcache`` path — flash_attn 2.7 cannot express
-      ``matrix_bd`` (no ``attn_bias`` argument).
+The dense streaming path (``cache=(K_cached, V_cached)``) has been removed;
+streaming is paged-only.
 """
 
 from __future__ import annotations
@@ -35,13 +28,6 @@ from torch import nn
 from oasr.cache.paged_kv import PagedKVCache
 
 
-# Dense KV cache pair ``(K_cached, V_cached)`` used by the legacy
-# ``forward_chunk`` path. Both tensors are head-first
-# ``(B, n_kv_head, T_cached, head_dim)``. New chunks concatenate along the
-# time axis to produce the next cache.
-T_CACHE = Tuple[torch.Tensor, torch.Tensor]
-
-
 # ---------------------------------------------------------------------------
 # Conformer rel-pos multi-head attention
 # ---------------------------------------------------------------------------
@@ -52,9 +38,10 @@ class RelPositionMultiHeadedAttention(nn.Module):
 
     Reference: https://arxiv.org/abs/1901.02860.
 
-    Inference-only. The actual attention compute uses SDPA; the
-    Transformer-XL ``matrix_bd`` rel-pos bias is combined with the
-    padding / per-stream length mask and passed in as ``attn_mask``.
+    Inference-only. The actual attention compute goes through
+    :func:`oasr.fmha`; the Transformer-XL ``matrix_bd`` rel-pos bias is
+    combined with the padding / per-stream length mask and passed in as
+    ``attn_bias``.
 
     Supports MHA / MQA / GQA layouts:
 
@@ -146,22 +133,18 @@ class RelPositionMultiHeadedAttention(nn.Module):
         value: torch.Tensor,
         mask: torch.Tensor = torch.zeros((0, 0, 0)),
         pos_emb: torch.Tensor = torch.empty(0),
-        cache: Union[T_CACHE, PagedKVCache, None] = None,
-    ) -> Tuple[torch.Tensor, Union[T_CACHE, PagedKVCache, None]]:
+        cache: Union[PagedKVCache, None] = None,
+    ) -> Tuple[torch.Tensor, Union[PagedKVCache, None]]:
         """Compute Conformer rel-pos attention.
 
-        Three cache modes are supported:
+        Two cache modes are supported:
 
-        * **Offline** (``cache is None`` or empty tuple). Standard
-          attention over ``(query, key, value)``; ``mask`` is the additive
-          padding bias of shape ``(B, 1, T)``.
+        * **Offline** (``cache is None``). Standard attention over
+          ``(query, key, value)``; ``mask`` is the additive padding bias of
+          shape ``(B, 1, T)``.
         * **Paged streaming** (:class:`PagedKVCache`). K/V are written
           into the shared block pool and attended over the full per-stream
           context ``[0, cache_seqlens[b] + T_q)``.
-        * **Dense streaming** (tuple of ``(K_cached, V_cached)`` head-first
-          tensors). New K/V are concatenated with the cached pair and
-          returned as the next cache. ``mask`` is an additive bias over the
-          full attended range; same algebra as the legacy SDPA path.
 
         Returns
         -------
@@ -169,8 +152,7 @@ class RelPositionMultiHeadedAttention(nn.Module):
             ``(B, T_q, n_feat)``.
         cache : same type as input
             Updated cache; ``None`` for the offline path, the same descriptor
-            (pool was updated in place) for paged, or a fresh
-            ``(K_full, V_full)`` pair for dense.
+            (pool was updated in place) for paged.
         """
         B, T_q, _ = query.shape
 
@@ -181,11 +163,6 @@ class RelPositionMultiHeadedAttention(nn.Module):
 
         if isinstance(cache, PagedKVCache):
             return self._forward_paged(q, k, v, pos_emb, cache, B, T_q)
-
-        # Tuple form: dense streaming when the cache tensors are populated,
-        # otherwise (placeholder zeros) it's the offline / first-chunk path.
-        if isinstance(cache, tuple) and cache[0].numel() > 0:
-            return self._forward_dense(q, k, v, mask, pos_emb, cache, B, T_q)
 
         return self._forward_offline(q, k, v, mask, pos_emb, B, T_q)
 
@@ -230,20 +207,30 @@ class RelPositionMultiHeadedAttention(nn.Module):
         # post-softmax_scale logit semantics; the kernel adds bias *after*
         # the QK*scale.
         combined_bias = matrix_bd * scale  # (B, H, T_q, T_kv_max)
-        # Pad T_kv_max up to a multiple of block_size so block_table covers
-        # all addressable logical positions cleanly. The kernel computes its
-        # logical kv extent as ``block_table.shape[1] * block_size``; the
-        # bias must match that shape, padded with values that will be masked
-        # out by ``cache_seqlens`` anyway.
+        # Pad ``T_q`` up to ``M_BLOCK`` and ``T_kv_max`` up to ``N_BLOCK``.
+        # The cute fmha kernel reads the full ``(M_BLOCK, N_BLOCK)`` bias
+        # tile without per-row predication along the ``T_q`` axis -- the
+        # comment in ``_add_bias_tile`` notes that OOB rows read stale gmem,
+        # which is harmless **when adjacent memory is mapped**. Under CUDA
+        # Graph captures the allocator fragments the address space and the
+        # over-read can fall into an unmapped segment, raising
+        # ``cudaErrorIllegalAddress``. Padding to ``(M_BLOCK, N_BLOCK)``
+        # multiples keeps every kernel-side bias tile read in-bounds.
+        # Block-table needs the same N_BLOCK / block_size multiple because
+        # the kernel reads ``mBlockTable[b, n_block * (N_BLOCK/bs) + i]``
+        # for the full ``ceil(seqlen_k/N_BLOCK)`` × ``N_BLOCK/bs`` extent.
         bs = cache.block_size
-        T_kv_padded = ((T_kv_max + bs - 1) // bs) * bs
-        if T_kv_padded > T_kv_max:
-            pad_cols = T_kv_padded - T_kv_max
-            tail = torch.zeros(
-                B, self.h, T_q, pad_cols,
+        N_BLOCK = 64  # matches FmhaSm80._n_block_size default
+        M_BLOCK = 64  # matches FmhaSm80._m_block_size default
+        T_kv_padded = ((T_kv_max + N_BLOCK - 1) // N_BLOCK) * N_BLOCK
+        T_q_padded = ((T_q + M_BLOCK - 1) // M_BLOCK) * M_BLOCK
+        if T_kv_padded > T_kv_max or T_q_padded > T_q:
+            padded = torch.zeros(
+                B, self.h, T_q_padded, T_kv_padded,
                 dtype=combined_bias.dtype, device=combined_bias.device,
             )
-            combined_bias = torch.cat([combined_bias, tail], dim=-1)
+            padded[:, :, :T_q, :T_kv_max] = combined_bias
+            combined_bias = padded
 
         block_table_view = cache.block_table
         # Caller may have allocated a wider block_table than needed; the
@@ -266,24 +253,6 @@ class RelPositionMultiHeadedAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T_q, self.h * self.d_k)
         return self.linear_out(out), cache
 
-    def _forward_dense(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        mask: torch.Tensor,
-        pos_emb: torch.Tensor,
-        cache: T_CACHE,
-        B: int,
-        T_q: int,
-    ) -> Tuple[torch.Tensor, T_CACHE]:
-        """Dense streaming — concatenate with cached K/V, then attend."""
-        k_old, v_old = cache
-        k_full = torch.cat([k_old, k], dim=-2)  # (B, H_kv, T_old + T_q, d_k)
-        v_full = torch.cat([v_old, v], dim=-2)
-        out = self._attend_with_relpos_bias(q, k_full, v_full, mask, pos_emb, B, T_q)
-        return out, (k_full, v_full)
-
     def _forward_offline(
         self,
         q: torch.Tensor,
@@ -295,28 +264,6 @@ class RelPositionMultiHeadedAttention(nn.Module):
         T_q: int,
     ) -> Tuple[torch.Tensor, None]:
         """Full-sequence attention with padding bias and rel-pos bias."""
-        out = self._attend_with_relpos_bias(q, k, v, mask, pos_emb, B, T_q)
-        return out, None
-
-    def _attend_with_relpos_bias(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        mask: torch.Tensor,
-        pos_emb: torch.Tensor,
-        B: int,
-        T_q: int,
-    ) -> torch.Tensor:
-        """Rel-pos attention over already-prepared Q/K/V.
-
-        ``mask`` is the additive padding bias (``0`` valid, ``-inf``
-        padding). Combined with ``matrix_bd`` and scaled by
-        ``1/sqrt(d_k)``, then routed through :func:`oasr.fmha`
-        which selects the SDPA fallback or the SM120 fused kernel based
-        on ``OASR_ATTN_BACKEND`` and the active GPU. Algebra is identical
-        to the legacy SDPA path: ``S = (Q @ K^T) * scale + (matrix_bd + mask) * scale``.
-        """
         n_batch_pos = pos_emb.size(0)
         T_pos = pos_emb.size(1)
         p = self.linear_pos(pos_emb).view(n_batch_pos, T_pos, self.h, self.d_k)
@@ -344,10 +291,9 @@ class RelPositionMultiHeadedAttention(nn.Module):
         )  # (B, H, T_q, d_k)
 
         out = out.transpose(1, 2).contiguous().view(B, T_q, self.h * self.d_k)
-        return self.linear_out(out)
+        return self.linear_out(out), None
 
 
 __all__ = [
     "RelPositionMultiHeadedAttention",
-    "T_CACHE",
 ]

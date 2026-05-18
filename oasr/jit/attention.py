@@ -51,6 +51,11 @@ def _read_backend_mode() -> str:
 
 _BACKEND_MODE = _read_backend_mode()
 
+# Resolved at module load (or first call from a test that flipped the env)
+# so the steady-state ``select_backend()`` call is a bare attribute read,
+# not a functools.cache dict lookup.
+_RESOLVED_BACKEND: Optional[str] = None
+
 
 def get_backend_mode() -> str:
     """Return the currently selected backend mode (``sdpa`` / ``cute`` / ``auto``)."""
@@ -59,10 +64,11 @@ def get_backend_mode() -> str:
 
 def set_backend_mode(mode: str) -> None:
     """Override the backend mode for the rest of the process. Mostly useful in tests."""
-    global _BACKEND_MODE
+    global _BACKEND_MODE, _RESOLVED_BACKEND
     if mode not in _VALID_BACKENDS:
         raise ValueError(f"invalid backend mode {mode!r}; valid: {_VALID_BACKENDS}")
     _BACKEND_MODE = mode
+    _RESOLVED_BACKEND = None  # force re-probe on next select_backend()
     # Clear the per-config compile cache when switching modes so re-tests see the change.
     _compiled_fmha.cache_clear()
     _capability_probe.cache_clear()
@@ -120,8 +126,29 @@ def _capability_probe() -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
 
 
 def select_backend() -> str:
-    """Return ``"cute"`` or ``"sdpa"`` based on the active mode + GPU."""
-    return _capability_probe()[1]
+    """Return ``"cute"`` or ``"sdpa"`` based on the active mode + GPU.
+
+    Cached at module scope after the first call so the hot path is a bare
+    global read instead of a ``functools.cache`` dict lookup. Cleared by
+    :func:`set_backend_mode`.
+    """
+    global _RESOLVED_BACKEND
+    if _RESOLVED_BACKEND is None:
+        _RESOLVED_BACKEND = _capability_probe()[1]
+    return _RESOLVED_BACKEND
+
+
+# Resolve eagerly at module load if CUDA is sitting there ready to go --
+# this moves the one-time probe cost out of the first ``fmha()`` call.
+try:
+    import torch as _torch_probe
+    if _torch_probe.cuda.is_available():
+        _RESOLVED_BACKEND = _capability_probe()[1]
+    del _torch_probe
+except Exception:
+    # torch not importable on this host; leave _RESOLVED_BACKEND=None so
+    # the first call lazily probes.
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +168,7 @@ def _compiled_fmha(
     m_block: int,
     n_block: int,
     num_threads: int,
+    bias_aligned: bool = False,
 ):
     """Return a compiled CuteDSL callable for the given configuration.
 
@@ -168,18 +196,21 @@ def _compiled_fmha(
         m_block_size=m_block, n_block_size=n_block,
         num_threads=num_threads, has_bias=has_bias,
         paged=paged, block_size=block_size,
+        bias_aligned=bias_aligned,
     ):
         raise RuntimeError(
             f"{cls.__name__}.can_implement returned False for "
             f"head_dim={head_dim}, m_block={m_block}, n_block={n_block}, "
             f"num_threads={num_threads}, has_bias={has_bias}, "
-            f"paged={paged}, block_size={block_size}"
+            f"paged={paged}, block_size={block_size}, "
+            f"bias_aligned={bias_aligned}"
         )
     inst = cls(
         head_dim=head_dim, dtype=cute_dtype,
         num_heads=num_heads, num_kv_heads=num_kv_heads,
         has_bias=has_bias, paged=paged, block_size=block_size,
         m_block_size=m_block, n_block_size=n_block, num_threads=num_threads,
+        bias_aligned=bias_aligned,
     )
 
     # Build dummy descriptor tensors for cute.compile — shapes only matter for
@@ -213,11 +244,22 @@ def _compiled_fmha(
     # divisibility=128/dtype.width tells the compiler that the leading dim
     # has guaranteed alignment so the verifier accepts the copy. Without it,
     # the upstream FA2 example also fails on this same alignment check.
+    #
+    # NB: ``enable_tvm_ffi=True`` on ``from_dlpack`` plus
+    # ``options="--enable-tvm-ffi"`` on ``cute.compile`` together emit a
+    # compiled callable that accepts raw torch tensors at call time
+    # (rather than per-call ``from_dlpack`` wrappers) and is safe to
+    # capture into a ``torch.cuda.CUDAGraph``. The legacy per-call
+    # ``from_dlpack`` path produces fresh Python descriptor objects whose
+    # backing dlpack capsules get GC'd between graph replays, which is
+    # what causes the streaming engine's ``CUDA_ERROR_ILLEGAL_ADDRESS``.
+    # This is the same pattern Flash Attention's ``flash_attn/cute``
+    # uses (cute_dsl_utils.py::to_cute_tensor with enable_tvm_ffi=True).
     elem_bits = 16 if dtype_str == "float16" else 16  # bf16 is also 16b
     align_div = 128 // elem_bits
     def _wrap(t: torch.Tensor) -> "cute.Tensor":
         return (
-            from_dlpack(t, assumed_align=16)
+            from_dlpack(t, assumed_align=16, enable_tvm_ffi=True)
             .mark_layout_dynamic(leading_dim=t.dim() - 1)
             .mark_compact_shape_dynamic(
                 mode=t.dim() - 1,
@@ -234,12 +276,14 @@ def _compiled_fmha(
     else:
         # Zero-rank dummy: cute.rank(mBias) > 0 in the kernel == False.
         mBias = from_dlpack(
-            torch.empty((), dtype=torch_dtype, device=device), assumed_align=16,
+            torch.empty((), dtype=torch_dtype, device=device),
+            assumed_align=16, enable_tvm_ffi=True,
         )
 
     seqlens = torch.zeros(B, dtype=torch.int32, device=device)
     mCacheSeqlens = (
-        from_dlpack(seqlens, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        from_dlpack(seqlens, assumed_align=4, enable_tvm_ffi=True)
+        .mark_layout_dynamic(leading_dim=0)
     )
 
     if paged:
@@ -248,13 +292,14 @@ def _compiled_fmha(
             dtype=torch.int32, device=device,
         )
         mBlockTable = (
-            from_dlpack(block_table, assumed_align=4)
+            from_dlpack(block_table, assumed_align=4, enable_tvm_ffi=True)
             .mark_layout_dynamic(leading_dim=block_table.dim() - 1)
         )
     else:
         # Zero-rank dummy when paged=False; kernel never reads it.
         mBlockTable = from_dlpack(
-            torch.empty((), dtype=torch.int32, device=device), assumed_align=4,
+            torch.empty((), dtype=torch.int32, device=device),
+            assumed_align=4, enable_tvm_ffi=True,
         )
 
     import cuda.bindings.driver as cuda_driver
@@ -264,6 +309,7 @@ def _compiled_fmha(
     return cute.compile(
         inst, mQ, mK, mV, mO, mBias, mCacheSeqlens, mBlockTable,
         softmax_scale, stream,
+        options="--enable-tvm-ffi",
     )
 
 
@@ -279,6 +325,7 @@ def get_compiled_fmha(
     m_block: int = 64,
     n_block: int = 64,
     num_threads: int = 128,
+    bias_aligned: bool = False,
 ):
     """Public accessor — returns a compiled CuteDSL callable, compiling on first call."""
     cap = _capability_probe()[0]
@@ -288,6 +335,7 @@ def get_compiled_fmha(
         cap, head_dim, dtype_str, num_heads, num_kv_heads,
         has_bias, paged, block_size,
         m_block, n_block, num_threads,
+        bias_aligned,
     )
 
 

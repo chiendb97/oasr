@@ -15,18 +15,26 @@ from benchmarks.routines.attention import (
     setup_fmha_bias,
     setup_fmha_bias_seqlens,
     setup_fmha_offline,
+    setup_fmha_paged,
+    setup_fmha_paged_bias,
     setup_fmha_seqlens,
 )
 from benchmarks.routines.bench_utils import bench_fn
 
+import oasr
+
 DTYPES = [torch.float16, torch.bfloat16]
 DTYPE_NAMES = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
 
+# Mirrors ``benchmarks/routines/attention.py::_SETUP_FNS``; kept local so
+# bench_fmha.py can stay a thin standalone wrapper.
 _SETUP = {
     "fmha_offline": setup_fmha_offline,
     "fmha_bias": setup_fmha_bias,
     "fmha_seqlens": setup_fmha_seqlens,
     "fmha_bias_seqlens": setup_fmha_bias_seqlens,
+    "fmha_paged": setup_fmha_paged,
+    "fmha_paged_bias": setup_fmha_paged_bias,
 }
 
 _COL_SHAPE = 36
@@ -81,7 +89,11 @@ def _run_shape(sub, cfg, dtype):
     # Warm caches + first-call CuteDSL compile.
     cute_fn(); pt_fn()
     torch.cuda.synchronize()
-    cute_ms, _ = bench_fn(cute_fn)
+    # The bench reuses the same Q/K/V/out tensors across iters; reflect the
+    # engine's reality where descriptors stay cached for the duration of a
+    # streaming session.
+    with oasr.fmha.persistent_inputs():
+        cute_ms, _ = bench_fn(cute_fn)
     pt_ms,   _ = bench_fn(pt_fn)
     return cute_ms, pt_ms
 
