@@ -584,3 +584,178 @@ class TestBatchedStreaming:
         assert l1[0] >= 1
         f2, l2 = ext.flush()
         assert l2[0] == 0
+
+
+# ===========================================================================
+# GraphedFeatureExtraction — CUDA Graph capture of batched fbank/mfcc
+# ===========================================================================
+
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for graph capture"
+)
+
+
+@requires_cuda
+class TestGraphedFeatureExtraction:
+    """Bit-exact parity between captured replay and the eager batched path."""
+
+    def _make_cfg(self, *, feature_type: str = "fbank"):
+        from oasr.features import FeatureConfig
+
+        return FeatureConfig(dither=0.0, feature_type=feature_type)
+
+    def _eager_feats(
+        self,
+        wave_cpu: torch.Tensor,
+        lengths_cpu: torch.Tensor,
+        bucket: int,
+        t_pad: int,
+        cfg,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Run the unbatched-graph eager path on a (bucket, t_pad) buffer."""
+        from oasr.features.batched import batched_fbank, batched_mfcc
+
+        device = torch.device("cuda")
+        B_active = wave_cpu.size(0)
+        T = wave_cpu.size(1)
+        wav_gpu = torch.zeros(bucket, t_pad, dtype=torch.float32, device=device)
+        wav_gpu[:B_active, :T] = wave_cpu.to(device)
+        len_gpu = torch.zeros(bucket, dtype=torch.int64, device=device)
+        len_gpu[:B_active] = lengths_cpu.to(device)
+        fn = batched_mfcc if cfg.feature_type == "mfcc" else batched_fbank
+        feats_f32, _ = fn(wav_gpu, len_gpu, cfg)
+        return feats_f32.to(dtype=out_dtype)
+
+    def test_batched_fbank_cuda_graph_matches_eager(self):
+        """Replay output matches an eager call on the same padded inputs."""
+        from oasr.engine.graph_cache import GraphedFeatureExtraction
+
+        cfg = self._make_cfg()
+        device = torch.device("cuda")
+        chunk_samples = 16 * 4 * cfg.frame_shift_samples  # ASR steady-state stride
+        gfe = GraphedFeatureExtraction(
+            pool=torch.cuda.graph_pool_handle(),
+            device=device,
+            feature_config=cfg,
+            output_dtype=torch.float16,
+            chunk_samples=chunk_samples,
+            max_batch_size=8,
+        )
+        assert gfe.buckets == [1, 2, 4, 8]
+
+        torch.manual_seed(0)
+        for B_active in [1, 2, 3, 5, 8]:
+            bucket = gfe.pick_bucket(B_active)
+            assert bucket is not None
+            # Vary T inside [frame_len, t_pad].
+            for T in [
+                cfg.frame_length_samples,
+                chunk_samples,
+                chunk_samples + 117,
+                gfe.t_pad,
+            ]:
+                wave = torch.randn(B_active, T, dtype=torch.float32) * 1000.0
+                lengths = torch.full((B_active,), T, dtype=torch.int64)
+
+                feats_graph_view = gfe.replay(B_active, wave, lengths)
+                assert feats_graph_view is not None
+                assert feats_graph_view.dtype == torch.float16
+                # Caller slices to the first B_active rows.
+                feats_graph = feats_graph_view[:B_active].clone()
+
+                feats_eager = self._eager_feats(
+                    wave, lengths, bucket, gfe.t_pad, cfg, torch.float16
+                )[:B_active]
+
+                torch.testing.assert_close(
+                    feats_graph, feats_eager, rtol=0, atol=0,
+                    msg=f"B_active={B_active} T={T}",
+                )
+
+    def test_batched_mfcc_cuda_graph_matches_eager(self):
+        """Same bit-exact check on the MFCC path."""
+        from oasr.engine.graph_cache import GraphedFeatureExtraction
+
+        cfg = self._make_cfg(feature_type="mfcc")
+        device = torch.device("cuda")
+        chunk_samples = 16 * 4 * cfg.frame_shift_samples
+        gfe = GraphedFeatureExtraction(
+            pool=torch.cuda.graph_pool_handle(),
+            device=device,
+            feature_config=cfg,
+            output_dtype=torch.float32,
+            chunk_samples=chunk_samples,
+            max_batch_size=4,
+        )
+
+        torch.manual_seed(1)
+        for B_active in [1, 4]:
+            bucket = gfe.pick_bucket(B_active)
+            T = chunk_samples + 17
+            wave = torch.randn(B_active, T, dtype=torch.float32) * 500.0
+            lengths = torch.full((B_active,), T, dtype=torch.int64)
+            feats_graph = gfe.replay(B_active, wave, lengths)[:B_active].clone()
+            feats_eager = self._eager_feats(
+                wave, lengths, bucket, gfe.t_pad, cfg, torch.float32
+            )[:B_active]
+            torch.testing.assert_close(feats_graph, feats_eager, rtol=0, atol=0)
+
+    def test_pick_bucket_returns_smallest_fit(self):
+        from oasr.engine.graph_cache import GraphedFeatureExtraction
+
+        cfg = self._make_cfg()
+        gfe = GraphedFeatureExtraction(
+            pool=torch.cuda.graph_pool_handle(),
+            device=torch.device("cuda"),
+            feature_config=cfg,
+            output_dtype=torch.float16,
+            chunk_samples=16 * 4 * cfg.frame_shift_samples,
+            max_batch_size=16,
+        )
+        assert gfe.buckets == [1, 2, 4, 8, 16]
+        assert gfe.pick_bucket(1) == 1
+        assert gfe.pick_bucket(3) == 4
+        assert gfe.pick_bucket(8) == 8
+        assert gfe.pick_bucket(9) == 16
+        assert gfe.pick_bucket(17) is None  # oversize → eager fallback
+
+    def test_custom_batch_buckets_override(self):
+        """Explicit ``batch_buckets`` overrides the default power-of-two ladder."""
+        from oasr.engine.graph_cache import GraphedFeatureExtraction
+
+        cfg = self._make_cfg()
+        gfe = GraphedFeatureExtraction(
+            pool=torch.cuda.graph_pool_handle(),
+            device=torch.device("cuda"),
+            feature_config=cfg,
+            output_dtype=torch.float16,
+            chunk_samples=16 * 4 * cfg.frame_shift_samples,
+            max_batch_size=64,
+            batch_buckets=[8, 32],
+        )
+        assert gfe.buckets == [8, 32]
+        assert gfe.pick_bucket(1) == 8
+        assert gfe.pick_bucket(8) == 8
+        assert gfe.pick_bucket(9) == 32
+        assert gfe.pick_bucket(33) is None
+
+    def test_oversize_returns_none(self):
+        """Combined waveform longer than ``t_pad`` triggers the eager fallback."""
+        from oasr.engine.graph_cache import GraphedFeatureExtraction
+
+        cfg = self._make_cfg()
+        chunk_samples = 16 * 4 * cfg.frame_shift_samples
+        gfe = GraphedFeatureExtraction(
+            pool=torch.cuda.graph_pool_handle(),
+            device=torch.device("cuda"),
+            feature_config=cfg,
+            output_dtype=torch.float16,
+            chunk_samples=chunk_samples,
+            max_batch_size=4,
+        )
+        oversize_T = gfe.t_pad + 1
+        wave = torch.zeros(2, oversize_T, dtype=torch.float32)
+        lengths = torch.tensor([oversize_T, oversize_T], dtype=torch.int64)
+        assert gfe.replay(2, wave, lengths) is None

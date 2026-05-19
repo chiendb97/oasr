@@ -33,7 +33,8 @@ int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk
                               int64_t start_frame_idx,
                               int64_t batch, int64_t vocab_size,
                               int64_t max_seq_len, int64_t use_paged_memory,
-                              int64_t page_size);
+                              int64_t page_size, int64_t use_cuda_graphs);
+void ctc_decoder_release_graphs(TensorView state_buffer);
 void ctc_beam_search_read_state(TensorView out_tokens, TensorView out_lengths,
                                 TensorView out_scores, TensorView state_buffer,
                                 int64_t step, int64_t batch, int64_t beam,
@@ -64,6 +65,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_beam_search_decode, ctc_beam_search_decode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_beam_search_init_state, ctc_beam_search_init_state);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_beam_search_step, ctc_beam_search_step);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_beam_search_chunk, ctc_beam_search_chunk);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_decoder_release_graphs, ctc_decoder_release_graphs);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_beam_search_read_state, ctc_beam_search_read_state);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_decoder_paged_workspace_size, ctc_decoder_paged_workspace_size);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_decoder_paged_state_size, ctc_decoder_paged_state_size);

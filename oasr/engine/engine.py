@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -85,9 +85,25 @@ class ASREngine:
         self._device = torch.device(device_str)
         cache_config = config.build_cache_config(model_config)
 
-        self._input_processor = InputProcessor(config, self._device)
+        # CUDA Graph capture: each cache type (encoder, feature extraction,
+        # CTC) owns its own ``torch.cuda.graph_pool_handle()``. Sharing one
+        # pool across *different* cache families turned out to cause silent
+        # output aliasing — the encoder graph's intermediate allocations and
+        # the feature graph's captured ``feats_out`` ended up at the same
+        # device address, so a feature replay clobbered the encoder's
+        # captured output buffer. Within one cache family the pool is still
+        # shared across shape buckets (that's where the fragmentation win
+        # lives). ``InputProcessor`` and ``ModelRunner`` each allocate their
+        # own pool internally when ``graph_pool=None``.
+        self._graph_pool: Optional[Tuple[int, int]] = None
+
+        self._input_processor = InputProcessor(
+            config, self._device, graph_pool=self._graph_pool
+        )
         self._scheduler = Scheduler(config)
-        self._model_runner = ModelRunner(model, config, cache_config)
+        self._model_runner = ModelRunner(
+            model, config, cache_config, graph_pool=self._graph_pool
+        )
         self._output_processor = OutputProcessor(config)
 
         # Offline execution pipeline — handles CPU/GPU overlap and

@@ -9,13 +9,13 @@ CPU prep (or GPU fbank) on the next.
 Two collate modes are supported:
 
 * **GPU fbank** (``gpu_feature_extraction=True``) — the batched Kaldi
-  fbank from :mod:`oasr.features.gpu_fbank` runs on a dedicated CUDA
-  stream.  It yields ~10× the fbank throughput of a per-utterance
-  ``torchaudio.compliance.kaldi.fbank`` loop because it fuses the whole
-  micro-batch into a single sequence of kernels with no Python per-utt
-  overhead.  The feat stream runs ahead of the default-stream
-  forward+decode, overlapping fbank of chunk ``k+1`` with encoder work
-  on chunk ``k``.
+  fbank / mfcc from :mod:`oasr.features.batched` runs on a dedicated
+  CUDA stream.  It yields ~10× the feature-extraction throughput of a
+  per-utterance ``torchaudio.compliance.kaldi.{fbank,mfcc}`` loop
+  because it fuses the whole micro-batch into a single sequence of
+  kernels with no Python per-utt overhead.  The feat stream runs ahead
+  of the default-stream forward+decode, overlapping feature extraction
+  of chunk ``k+1`` with encoder work on chunk ``k``.
 * **CPU pool** (``gpu_feature_extraction=False``) — pre-submits the
   whole batch's fbank to the shared :class:`ThreadPoolExecutor` in
   chunk order, then harvests each micro-batch's futures on the producer

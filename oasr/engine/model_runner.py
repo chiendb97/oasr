@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -18,6 +18,7 @@ from oasr.cache import (
     StreamSlotPool,
 )
 from oasr.cache.paged_kv import PagedKVCache
+from oasr.cache.slot_cnn import SlotCnnCache
 from oasr.models.conformer.model import ConformerModel
 
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
@@ -57,10 +58,13 @@ class ModelRunner:
         model: ConformerModel,
         config: EngineConfig,
         cache_config: CacheConfig,
+        *,
+        graph_pool: Optional[Tuple[int, int]] = None,
     ) -> None:
         self._model = model
         self._config = config
         self._cache_config = cache_config
+        self._graph_pool = graph_pool
 
         # Build shared cache infrastructure
         self._block_pool = BlockPool(cache_config)
@@ -68,12 +72,21 @@ class ModelRunner:
         self._cnn_mgr = CnnCacheManager(cache_config)
         self._slot_pool = StreamSlotPool(cache_config.max_batch_size)
         # Only create the CTC state manager when using the GPU decoder
+        ctc_graphs_enabled = (
+            bool(getattr(config, "use_cuda_graphs", True))
+            and bool(getattr(config, "use_ctc_cuda_graphs", True))
+            and torch.device(config.device).type == "cuda"
+        )
         if config.decoder_type == "ctc_gpu":
             self._ctc_mgr: CtcStateCacheManager = CtcStateCacheManager(
-                config.gpu_decoder_config
+                config.gpu_decoder_config,
+                use_cuda_graphs=ctc_graphs_enabled,
             )
         else:
-            self._ctc_mgr = CtcStateCacheManager(config.gpu_decoder_config)
+            self._ctc_mgr = CtcStateCacheManager(
+                config.gpu_decoder_config,
+                use_cuda_graphs=ctc_graphs_enabled,
+            )
 
         # CUDA Graph cache for the steady-state batched paged forward.
         # Captures lazily on first encounter of each (B_active, cache_t1
@@ -95,6 +108,7 @@ class ModelRunner:
                 cnn_cache_frames=cache_config.cnn_cache_frames,
                 num_layers=cache_config.num_layers,
                 hidden_dim=cache_config.hidden_dim,
+                pool=self._graph_pool,
             )
         else:
             self._graph_cache = None
@@ -336,14 +350,16 @@ class ModelRunner:
         self._att_mgr.prepare_chunks_batched(stream_ids)  # type: ignore[arg-type]
         nvtx_pop()
 
-        # 2. Gather feature-chunk slices and CNN cache rows in one shot.
+        # 2. Gather feature-chunk slices. CNN left-context is now read by
+        #    the encoder itself via the SlotCnnCache descriptor (mirroring
+        #    how K/V are written through PagedKVCache).
         max_offset = max(req.offset for req in group)
         feature_chunks = [
             req.feature_buffer[req.feature_cursor: req.feature_cursor + window]
             for req in group
         ]
         xs = torch.stack(feature_chunks, dim=0)  # (B, window, F)
-        cnn_cache = self._cnn_mgr.get_batched_cache(slot_ids_gpu)  # (L, B, T, H)
+        cnn_cache = SlotCnnCache(buffer=self._cnn_mgr.buffer, slot_ids=slot_ids_gpu)
 
         # 3. Per-stream encoder-frame offsets (always a tensor for the
         #    graphed path; the eager fallback accepts the same tensor).
@@ -360,32 +376,27 @@ class ModelRunner:
         #    cache_t1 grows in N_BLOCK-sized steps.
         nvtx_push("encoder_call")
         cache_t1_bucket = round_up_bucket(max_offset)
-        graph_out = None
+        log_probs = None
         if self._use_cuda_graphs and self._graph_cache is not None:
-            graph_out = self._graph_cache.replay(
+            log_probs = self._graph_cache.replay(
                 B_active, xs.size(1), cache_t1_bucket,
-                xs=xs, cnn_in=cnn_cache,
-                slot_ids=slot_ids_gpu, offsets=offsets_gpu,
+                xs=xs, slot_ids=slot_ids_gpu, offsets=offsets_gpu,
             )
-        if graph_out is not None:
-            log_probs, new_cnn = graph_out
-        else:
+        if log_probs is None:
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_gpu)
             for c in batched_att_caches:
                 c.host_seqlen_max = max_offset
-            log_probs, new_cnn = self._model.forward_chunk_paged(
+            log_probs = self._model.forward_chunk_paged(
                 xs, offsets_gpu, batched_att_caches, cnn_cache,
                 cache_t1=max_offset,
             )
         actual_frames = log_probs.size(1)
         nvtx_pop()
 
-        # 5. Commit: one scatter onto the persistent cache_seqlens via the
-        #    batched API, one index_copy_ to scatter the new CNN cache back
-        #    into the persistent buffer, then host-side cursor / result
-        #    updates.
+        # 5. Commit: KV cache_seqlens scatter + host-side cursor / result
+        #    updates. CNN cache was already scattered in place by the
+        #    encoder through ``cnn_cache.scatter()``.
         nvtx_push("commit")
-        self._cnn_mgr.update_batched(slot_ids_gpu, new_cnn)
         self._att_mgr.commit_chunks_paged_batched(stream_ids, actual_frames)  # type: ignore[arg-type]
         for b, req in enumerate(group):
             req.offset += actual_frames
@@ -441,32 +452,29 @@ class ModelRunner:
         device = self._att_mgr.block_table.device
         slot_ids_gpu = torch.tensor([req.slot_id], dtype=torch.long, device=device)
         offsets_gpu = torch.tensor([req.offset], dtype=torch.int32, device=device)
-        cnn_cache = self._cnn_mgr.get_batched_cache(slot_ids_gpu)  # (L, 1, K-1, H)
+        cnn_cache = SlotCnnCache(buffer=self._cnn_mgr.buffer, slot_ids=slot_ids_gpu)
 
         cache_t1_bucket = round_up_bucket(req.offset)
         nvtx_push("single.encoder_call")
-        graph_out = None
+        log_probs = None
         if self._use_cuda_graphs and self._graph_cache is not None:
-            graph_out = self._graph_cache.replay(
+            log_probs = self._graph_cache.replay(
                 1, chunk.size(1), cache_t1_bucket,
-                xs=chunk, cnn_in=cnn_cache,
-                slot_ids=slot_ids_gpu, offsets=offsets_gpu,
+                xs=chunk, slot_ids=slot_ids_gpu, offsets=offsets_gpu,
             )
-        if graph_out is not None:
-            log_probs, new_cnn = graph_out
-        else:
+        if log_probs is None:
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_gpu)
             for c in batched_att_caches:
                 c.host_seqlen_max = req.offset
-            log_probs, new_cnn = self._model.forward_chunk_paged(
+            log_probs = self._model.forward_chunk_paged(
                 chunk, offsets_gpu, batched_att_caches, cnn_cache,
                 cache_t1=req.offset,
             )
         nvtx_pop()
         actual_frames = log_probs.size(1)
 
-        # Commit cache state — single-stream batched commit + CNN scatter.
-        self._cnn_mgr.update_batched(slot_ids_gpu, new_cnn)
+        # Commit cache state — KV cache_seqlens scatter only; CNN cache
+        # was scattered in place by the encoder.
         self._att_mgr.commit_chunks_paged_batched([req.stream_id], actual_frames)  # type: ignore[arg-type]
         nvtx_pop()  # single
 

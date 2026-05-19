@@ -190,7 +190,7 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
   - `FeatureConfig` — shared config for sample rate, mel bins, frame length/shift, dither, etc.
   - `fbank_batch` / `mfcc_batch` / `extract_features_batch` — offline batch extraction over padded `(B, T)` or list of waveforms.
   - `BatchedStreamingFeatureExtractor` — `B` parallel chunked streams (`process_chunk` / `flush`).
-  - Backends: `torchaudio.compliance.kaldi` (default) and optional `kaldifeat` GPU path. GPU FBANK in `gpu_fbank.py`.
+  - Backends: `torchaudio.compliance.kaldi` (default) and optional `kaldifeat` GPU path. Batched FBANK/MFCC in `batched.py`.
 - **`cache/`** — Paged-memory streaming cache manager for chunk-by-chunk Conformer inference:
   - `CacheConfig` — master config (layers, heads, dims, chunk size, block size, pool capacity).
   - `BlockPool` — fixed-size paged KV pool; blocks are allocated/freed per stream.

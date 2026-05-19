@@ -336,6 +336,14 @@ struct InternalData {
     int* select_seqs;      // [batch * max_seq_len]
     int* select_seq_lens;  // [batch]
 
+    // Per-state log-prob frame buffer.  Captured streaming graphs (Step 4)
+    // read the current frame's log-probs from this stable address; the host
+    // loop refreshes it via a single ``cudaMemcpyAsync`` before each graph
+    // replay so the captured kernel arg never changes across frames.
+    // Size: ``batch * vocab_size`` floats — the captured graphs read all
+    // ``batch`` rows in one go.
+    float* d_lp_frame_buf;
+
     FastDivmod ldc_divmod;
     int max_select_seq_len;
 
@@ -425,15 +433,78 @@ __global__ void init_streaming_select_kernel(int* __restrict__ select_seqs,
 }
 
 // =============================================================================
-// Kernel: write actual_frame_index into select_seqs[b, step] for all batches.
-// Tiny kernel that replaces a host-loop of one-byte cudaMemcpyAsync per batch.
+// Streaming counters living at the front of the state buffer
+// -----------------------------------------------------------------------------
+// The streaming chunk launcher used to advance ``step`` and ``actual_frame_index``
+// on the host and pass them as kernel-launch scalars per frame.  That prevents
+// CUDA-Graph capture from replaying a single ``streaming_step`` graph across
+// multiple frames — the captured launch would bake in the capture-time value.
+// We move both counters into device-resident int32 scalars at offsets 0/4 of
+// the (otherwise unused) state-buffer header so kernels can read them via a
+// single ``__ldg`` at block entry and the host loop can advance them with a
+// trivial captureable kernel.
+//
+// STATE_HEADER_SIZE is large enough to hold these 8 bytes already — the
+// previous comment in ``init_streaming_state`` noted the header region was
+// reserved but unused.
 // =============================================================================
 
-__global__ void set_select_seq_step_kernel(int* __restrict__ select_seqs, int batch,
-                                           int max_seq_len, int step, int actual_frame_index) {
+__host__ __device__ inline int* device_step_ptr(void* state_buffer) {
+    return reinterpret_cast<int*>(state_buffer);
+}
+__host__ __device__ inline int* device_frame_idx_ptr(void* state_buffer) {
+    return reinterpret_cast<int*>(reinterpret_cast<char*>(state_buffer) + sizeof(int));
+}
+
+// Single-thread kernels: cheap and captureable. Launch <<<1, 1>>>.
+__global__ inline void set_counters_kernel(int* d_step, int* d_frame_idx, int step,
+                                           int frame_idx) {
+    *d_step = step;
+    *d_frame_idx = frame_idx;
+}
+__global__ inline void advance_counters_kernel(int* d_step, int* d_frame_idx) {
+    *d_step += 1;
+    *d_frame_idx += 1;
+}
+__global__ inline void advance_frame_idx_kernel(int* d_frame_idx) { *d_frame_idx += 1; }
+
+inline cudaError_t set_stream_counters(void* state_buffer, int step, int frame_idx,
+                                       cudaStream_t stream) {
+    set_counters_kernel<<<1, 1, 0, stream>>>(device_step_ptr(state_buffer),
+                                             device_frame_idx_ptr(state_buffer), step, frame_idx);
+    return cudaGetLastError();
+}
+inline cudaError_t advance_stream_counters(void* state_buffer, cudaStream_t stream) {
+    advance_counters_kernel<<<1, 1, 0, stream>>>(device_step_ptr(state_buffer),
+                                                 device_frame_idx_ptr(state_buffer));
+    return cudaGetLastError();
+}
+inline cudaError_t advance_stream_frame_idx(void* state_buffer, cudaStream_t stream) {
+    advance_frame_idx_kernel<<<1, 1, 0, stream>>>(device_frame_idx_ptr(state_buffer));
+    return cudaGetLastError();
+}
+
+// =============================================================================
+// Kernel: write actual_frame_index into select_seqs[b, step] for all batches.
+// Tiny kernel that replaces a host-loop of one-byte cudaMemcpyAsync per batch.
+//
+// Device-resident counter form: reads ``*d_step`` and ``*d_frame_idx`` so the
+// host loop / graph capture doesn't need to bake either into a launch arg.
+// When ``*d_step == *d_frame_idx`` the kernel is a no-op (the identity mapping
+// already placed in select_seqs by ``init_streaming_select_kernel`` is correct).
+// =============================================================================
+
+__global__ void set_select_seq_step_kernel(int* __restrict__ select_seqs,
+                                           const int* __restrict__ d_step,
+                                           const int* __restrict__ d_frame_idx, int batch,
+                                           int max_seq_len) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b < batch)
-        select_seqs[b * max_seq_len + step] = actual_frame_index;
+    if (b >= batch)
+        return;
+    int step = __ldg(d_step);
+    int frame_idx = __ldg(d_frame_idx);
+    if (step != frame_idx)
+        select_seqs[b * max_seq_len + step] = frame_idx;
 }
 
 // =============================================================================
@@ -637,7 +708,8 @@ __global__ __launch_bounds__(BLOCK_SIZE) void first_step_kernel(
 __global__ void prob_matrix_kernel(const float* __restrict__ log_prob, int batch_stride,
                                    int seq_stride, int vocab_stride,
                                    const int* __restrict__ select_seqs,
-                                   const int* __restrict__ select_seq_lens, int step,
+                                   const int* __restrict__ select_seq_lens,
+                                   const int* __restrict__ d_step,
                                    float2* __restrict__ pprev, float* __restrict__ ptable,
                                    float* __restrict__ ptablen, const int* __restrict__ clast,
                                    int ldc, int beam, int ldbeam, int batch, int blank_id,
@@ -645,6 +717,7 @@ __global__ void prob_matrix_kernel(const float* __restrict__ log_prob, int batch
     const int bid = blockIdx.y;
     if (bid >= batch)
         return;
+    int step = __ldg(d_step);
     if (step >= select_seq_lens[bid])
         return;
 
@@ -730,7 +803,8 @@ __global__ void prob_matrix_kernel(const float* __restrict__ log_prob, int batch
 __global__ void prob_space_blank_kernel(const float* __restrict__ log_prob, int batch_stride,
                                         int seq_stride, int vocab_stride,
                                         const int* __restrict__ select_seqs,
-                                        const int* __restrict__ select_seq_lens, int step,
+                                        const int* __restrict__ select_seq_lens,
+                                        const int* __restrict__ d_step,
                                         float2* __restrict__ pprev, float* __restrict__ ptable,
                                         float* __restrict__ ptablen, const int* __restrict__ clast,
                                         int ldc, int beam, int ldbeam, int batch, int blank_id,
@@ -738,6 +812,7 @@ __global__ void prob_space_blank_kernel(const float* __restrict__ log_prob, int 
     const int bid = blockIdx.x;
     if (bid >= batch)
         return;
+    int step = __ldg(d_step);
     if (step >= select_seq_lens[bid])
         return;
 
@@ -804,7 +879,8 @@ __global__ void prob_space_blank_kernel(const float* __restrict__ log_prob, int 
 // Grid: (beam, batch), Block: (ldbeam, 1)
 // =============================================================================
 
-__global__ void merge_kernel(const int* __restrict__ select_seq_lens, int step,
+__global__ void merge_kernel(const int* __restrict__ select_seq_lens,
+                             const int* __restrict__ d_step,
                              float* __restrict__ ptable, float* __restrict__ ptablen,
                              const int* __restrict__ clast, const int* __restrict__ clist,
                              const int* __restrict__ clen, int ldc, int beam, int ldbeam,
@@ -812,6 +888,7 @@ __global__ void merge_kernel(const int* __restrict__ select_seq_lens, int step,
     const int bid = blockIdx.y;
     if (bid >= batch)
         return;
+    int step = __ldg(d_step);
     if (step >= select_seq_lens[bid])
         return;
 
@@ -857,12 +934,13 @@ __global__ void merge_kernel(const int* __restrict__ select_seq_lens, int step,
 
 template <int BLOCK_SIZE, int ITEMS_PER_THREAD>
 __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase1_kernel(
-    const int* __restrict__ select_seq_lens, int step, const float* __restrict__ ptable,
-    const float* __restrict__ ptablen, int ldc, int beam, int batch, float* topk_key_buffer,
-    int* topk_value_buffer) {
+    const int* __restrict__ select_seq_lens, const int* __restrict__ d_step,
+    const float* __restrict__ ptable, const float* __restrict__ ptablen, int ldc, int beam,
+    int batch, float* topk_key_buffer, int* topk_value_buffer) {
     const int bid = blockIdx.y;
     if (bid >= batch)
         return;
+    int step = __ldg(d_step);
     if (step >= select_seq_lens[bid])
         return;
 
@@ -952,7 +1030,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase1_kernel(
 
 template <int BLOCK_SIZE, int ITEMS_PER_THREAD, int WRITE_THREADS = 8>
 __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_kernel(
-    const int* __restrict__ select_seq_lens, int step,
+    const int* __restrict__ select_seq_lens, const int* __restrict__ d_step,
     int items_per_batch,  // = bxs * beam
     int beam, int batch, float* __restrict__ topk_key_buffer, int* __restrict__ topk_value_buffer,
     int ldc, int ldbeam, int ldseq_len, float2* __restrict__ pprev,
@@ -963,6 +1041,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_kernel(
     const int bid = blockIdx.x;
     if (bid >= batch)
         return;
+    int step = __ldg(d_step);
     if (step >= select_seq_lens[bid])
         return;
 
@@ -1181,6 +1260,7 @@ inline size_t calculate_workspace_size(int batch, int beam, int vocab_size, int 
     total += align_size(sizeof(int) * batch * MAX_BLOCKS_PER_BATCH * beam);
     total += align_size(sizeof(int) * batch * max_seq_len);  // select_seqs
     total += align_size(sizeof(int) * batch);                // select_seq_lens
+    total += align_size(sizeof(float) * batch * ldc);        // d_lp_frame_buf (Step 4 capture)
     total += ALIGN_BYTES;
     return total;
 }
@@ -1222,6 +1302,7 @@ inline void init_internal_data(InternalData* data, void* workspace, int batch, i
     ALLOC_BUF(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
     ALLOC_BUF(select_seqs, int, batch* max_seq_len)
     ALLOC_BUF(select_seq_lens, int, batch)
+    ALLOC_BUF(d_lp_frame_buf, float, batch * ldc)
 
 #undef ALLOC_BUF
 }
@@ -1249,6 +1330,7 @@ inline size_t calculate_paged_workspace_size(int batch, int beam, int vocab_size
     total += align_size(sizeof(int) * batch * MAX_BLOCKS_PER_BATCH * beam);
     total += align_size(sizeof(int) * batch * max_seq_len);
     total += align_size(sizeof(int) * batch);
+    total += align_size(sizeof(float) * batch * ldc);  // d_lp_frame_buf (Step 4 capture)
     total += ALIGN_BYTES;
     // Paged region
     total += paged_memory::calculate_paged_region_size(batch, beam, max_seq_len, page_size,
@@ -1300,6 +1382,7 @@ inline void init_internal_data_paged(InternalData* data, void* workspace,
     ALLOC_BUF_P(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
     ALLOC_BUF_P(select_seqs, int, batch * max_seq_len)
     ALLOC_BUF_P(select_seq_lens, int, batch)
+    ALLOC_BUF_P(d_lp_frame_buf, float, batch * ldc)
 
 #undef ALLOC_BUF_P
 
@@ -1315,7 +1398,8 @@ inline void init_internal_data_paged(InternalData* data, void* workspace,
 inline cudaError_t ctc_prefix_beam_search_step(InternalData* data, const float* log_prob,
                                                int batch_stride, int seq_stride, int vocab_stride,
                                                int step, bool is_last_step, int blank_id,
-                                               int space_id, cudaStream_t stream) {
+                                               int space_id, cudaStream_t stream,
+                                               const int* d_step) {
     int batch = data->batch;
     int beam = data->beam;
     int ldc = data->ldc;
@@ -1325,6 +1409,11 @@ inline cudaError_t ctc_prefix_beam_search_step(InternalData* data, const float* 
 
     // Double-buffer parity: step=0 writes to clen[0]/clist[0] (via first_step_kernel).
     // Steps 1,2,... alternate src/dst: dst_parity = step % 2.
+    // Host-side parity is used to pick the parity-dependent kernel ptr args;
+    // when this launcher is called from a graph-capture host that wraps it,
+    // each capture is parity-specific.  Per-frame ``step`` indexing inside
+    // each kernel reads from ``*d_step`` so the captured graph stays valid
+    // across multiple frames at the same parity.
     int src_parity = (step == 0) ? 0 : ((step - 1) % 2);
     int dst_parity = (step == 0) ? 0 : (step % 2);
 
@@ -1344,21 +1433,21 @@ inline cudaError_t ctc_prefix_beam_search_step(InternalData* data, const float* 
             dim3 grid(bx, batch);
             prob_matrix_kernel<<<grid, threads, 0, stream>>>(
                 log_prob, batch_stride, seq_stride, vocab_stride, data->select_seqs,
-                data->select_seq_lens, step, data->pprev, data->ptable, data->ptablen, data->clast,
-                ldc, beam, ldbeam, batch, blank_id, space_id, max_seq_len);
+                data->select_seq_lens, d_step, data->pprev, data->ptable, data->ptablen,
+                data->clast, ldc, beam, ldbeam, batch, blank_id, space_id, max_seq_len);
         }
 
         // --- 2. Blank / space probability ---
         prob_space_blank_kernel<<<batch, ldbeam, 0, stream>>>(
             log_prob, batch_stride, seq_stride, vocab_stride, data->select_seqs,
-            data->select_seq_lens, step, data->pprev, data->ptable, data->ptablen, data->clast, ldc,
-            beam, ldbeam, batch, blank_id, space_id, max_seq_len);
+            data->select_seq_lens, d_step, data->pprev, data->ptable, data->ptablen, data->clast,
+            ldc, beam, ldbeam, batch, blank_id, space_id, max_seq_len);
 
         // --- 3. Merge duplicate prefixes ---
         {
             dim3 merge_grid(beam, batch);
             merge_kernel<<<merge_grid, ldbeam, 0, stream>>>(
-                data->select_seq_lens, step, data->ptable, data->ptablen, data->clast,
+                data->select_seq_lens, d_step, data->ptable, data->ptablen, data->clast,
                 data->clist[src_parity], data->clen[src_parity], ldc, beam, ldbeam, ldseq_len,
                 batch, blank_id);
         }
@@ -1373,7 +1462,7 @@ inline cudaError_t ctc_prefix_beam_search_step(InternalData* data, const float* 
             bxs = min(bxs, MAX_BLOCKS / max(batch, 1));
             dim3 p1_grid(bxs, batch);
             topk_phase1_kernel<P1_BLOCK, P1_IPT><<<p1_grid, P1_BLOCK, 0, stream>>>(
-                data->select_seq_lens, step, data->ptable, data->ptablen, ldc, beam, batch,
+                data->select_seq_lens, d_step, data->ptable, data->ptablen, ldc, beam, batch,
                 data->topk_key_buffer, data->topk_value_buffer);
 
             // --- 5. Top-K Phase 2: reduce + state update ---
@@ -1381,11 +1470,11 @@ inline cudaError_t ctc_prefix_beam_search_step(InternalData* data, const float* 
             constexpr int P2_IPT = 2;
             int items_per_batch = bxs * beam;
             topk_phase2_kernel<P2_BLOCK, P2_IPT><<<batch, P2_BLOCK, 0, stream>>>(
-                data->select_seq_lens, step, items_per_batch, beam, batch, data->topk_key_buffer,
-                data->topk_value_buffer, ldc, ldbeam, ldseq_len, data->pprev, data->ptable,
-                data->ptablen, data->clast, data->clen[src_parity], data->clen[dst_parity],
-                data->clist[src_parity], data->clist[dst_parity], data->score, blank_id,
-                data->select_seqs, max_seq_len);
+                data->select_seq_lens, d_step, items_per_batch, beam, batch,
+                data->topk_key_buffer, data->topk_value_buffer, ldc, ldbeam, ldseq_len,
+                data->pprev, data->ptable, data->ptablen, data->clast, data->clen[src_parity],
+                data->clen[dst_parity], data->clist[src_parity], data->clist[dst_parity],
+                data->score, blank_id, data->select_seqs, max_seq_len);
         }
     }
 
@@ -1450,15 +1539,29 @@ inline cudaError_t ctc_beam_search_decode_batch(
     delete[] h_select_lens;
     data.max_select_seq_len = max_select;
 
+    // Scratch device int holding the current step value; refreshed before each
+    // inner-launcher call.  Kernels read ``*d_step`` instead of taking a host
+    // scalar so the streaming path can capture a shape-stable CUDA Graph in
+    // Step 4.  Offline batch is one alloc + ``max_select`` host→device memcpy
+    // updates per call; cheap relative to the per-step kernel work.
+    int* d_step_scratch = nullptr;
+    cudaError_t alloc_err = cudaMalloc(&d_step_scratch, sizeof(int));
+    if (alloc_err != cudaSuccess)
+        return alloc_err;
+
     // Main decode loop.
     for (int step = 0; step < max_select; ++step) {
+        cudaMemcpyAsync(d_step_scratch, &step, sizeof(int), cudaMemcpyHostToDevice, stream);
         bool is_last = (step == max_select - 1);
-        cudaError_t err =
-            ctc_prefix_beam_search_step(&data, log_prob, batch_stride, seq_stride, vocab_stride,
-                                        step, is_last, blank_id, space_id, stream);
-        if (err != cudaSuccess)
+        cudaError_t err = ctc_prefix_beam_search_step(
+            &data, log_prob, batch_stride, seq_stride, vocab_stride, step, is_last, blank_id,
+            space_id, stream, d_step_scratch);
+        if (err != cudaSuccess) {
+            cudaFree(d_step_scratch);
             return err;
+        }
     }
+    cudaFree(d_step_scratch);
 
     // Determine which double-buffer holds final results.
     // step=0 → clen[0]/clist[0]; step=N-1 where N>1 → clen[(N-1)%2]/clist[(N-1)%2].
@@ -1499,7 +1602,8 @@ __global__ void gather_paged_results_kernel(
 inline cudaError_t ctc_prefix_beam_search_step_paged(
     InternalData* data, const float* log_prob,
     int batch_stride, int seq_stride, int vocab_stride,
-    int step, int blank_id, int space_id, cudaStream_t stream);
+    int step, int blank_id, int space_id, cudaStream_t stream,
+    const int* d_step);
 
 // =============================================================================
 // Streaming state
@@ -1532,8 +1636,9 @@ inline void init_streaming_state(void* state_buffer, int batch, int beam, int vo
     // The StreamingState header that used to live at the start of state_buffer
     // is no longer read by the hot-loop step or read-state functions (they
     // reconstruct InternalData pointers on the host from dimensions passed by
-    // the caller), so we skip writing it.  The STATE_HEADER_SIZE region is
-    // still reserved at the front of the buffer for layout compatibility.
+    // the caller).  The first 8 bytes are now repurposed for the streaming
+    // counters (``device_step_ptr`` / ``device_frame_idx_ptr``); the rest of
+    // the STATE_HEADER_SIZE region is still reserved padding.
     StreamingState state;
     state.current_step = 0;
     state.space_id = -1;
@@ -1543,6 +1648,11 @@ inline void init_streaming_state(void* state_buffer, int batch, int beam, int vo
     void* workspace = reinterpret_cast<char*>(state_buffer) + STATE_HEADER_SIZE;
     init_internal_data(&state.data, workspace, batch, beam, vocab_size, max_seq_len);
     state.data.max_select_seq_len = max_seq_len;
+
+    // Zero the device-resident streaming counters (step / actual_frame_index)
+    // so the first ``streaming_step`` call sees step==0 / frame_idx==0 unless
+    // the caller writes different start values via ``set_stream_counters``.
+    cudaMemsetAsync(state_buffer, 0, sizeof(int) * 2, stream);
 
     // Initialise GPU buffers.
     cudaMemsetAsync(state.data.clast, 0, sizeof(int) * batch * state.data.ldbeam, stream);
@@ -1611,6 +1721,7 @@ inline void setup_internal_data_pointers(InternalData* data, void* workspace, in
     ALLOC_BUF(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
     ALLOC_BUF(select_seqs, int, batch* max_seq_len)
     ALLOC_BUF(select_seq_lens, int, batch)
+    ALLOC_BUF(d_lp_frame_buf, float, batch * ldc)
 
 #undef ALLOC_BUF
 }
@@ -1654,6 +1765,7 @@ inline void setup_internal_data_paged_pointers(InternalData* data, void* workspa
     ALLOC_BUF_P(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
     ALLOC_BUF_P(select_seqs, int, batch * max_seq_len)
     ALLOC_BUF_P(select_seq_lens, int, batch)
+    ALLOC_BUF_P(d_lp_frame_buf, float, batch * ldc)
 
 #undef ALLOC_BUF_P
 
@@ -1703,23 +1815,88 @@ inline cudaError_t streaming_step(void* state_buffer, const float* log_prob_fram
         setup_internal_data_pointers(&data, workspace, batch, beam, vocab_size, max_seq_len);
     }
 
+    // Sync the device-resident counters with the host scalar args so kernels
+    // that read ``*d_step`` / ``*d_frame_idx`` (currently only the unconditional
+    // ``set_select_seq_step_kernel``; later steps will refactor more kernels)
+    // see the caller's values. This is the host-int shim path; future
+    // device-counter overload skips this and uses the state's current scalars.
+    cudaError_t ce = set_stream_counters(state_buffer, step, actual_frame_index, stream);
+    if (ce != cudaSuccess)
+        return ce;
+
     // Update select_seqs[b, step] to reflect the caller's actual frame index.
-    // Identity mapping already placed `step` there, so we only launch when the
-    // caller's index differs.
-    if (actual_frame_index != step) {
+    // Always launched; the kernel itself no-ops when step == frame_idx.
+    {
         int threads = 128;
         int blocks = (batch + threads - 1) / threads;
         set_select_seq_step_kernel<<<blocks, threads, 0, stream>>>(
-            data.select_seqs, batch, max_seq_len, step, actual_frame_index);
+            data.select_seqs, device_step_ptr(state_buffer),
+            device_frame_idx_ptr(state_buffer), batch, max_seq_len);
     }
 
+    const int* d_step = device_step_ptr(state_buffer);
     if (use_paged_memory) {
         return ctc_prefix_beam_search_step_paged(&data, log_prob_frame, batch_stride, 0,
-                                                 vocab_stride, step, blank_id, space_id, stream);
+                                                 vocab_stride, step, blank_id, space_id, stream,
+                                                 d_step);
     } else {
         bool is_last = false;
         return ctc_prefix_beam_search_step(&data, log_prob_frame, batch_stride, 0, vocab_stride,
-                                           step, is_last, blank_id, space_id, stream);
+                                           step, is_last, blank_id, space_id, stream, d_step);
+    }
+}
+
+// =============================================================================
+// Streaming-step launcher — device-counter / captureable variant
+// -----------------------------------------------------------------------------
+// Same kernel sequence as ``streaming_step`` but expects the device-resident
+// ``d_step`` / ``d_frame_idx`` counters to already hold the current step's
+// values. No internal ``set_stream_counters`` write — counter advancement is
+// the caller's responsibility (e.g. via ``advance_counters_kernel``).
+//
+// ``step_for_parity`` is a HOST int used only to pick the parity-dependent
+// kernel ptr args (``clen[src/dst]``, ``clist[src/dst]``) and to branch into
+// the ``step==0`` ``first_step_kernel`` path.  Each CUDA-Graph capture of
+// this function is therefore parity-specific (Step 4 captures three graphs:
+// ``step==0``, even-step, odd-step).  Per-frame indexing inside every kernel
+// reads from ``*d_step`` so the captured launch is valid across all frames
+// that share the same parity.
+// =============================================================================
+
+inline cudaError_t streaming_step_persistent(
+    void* state_buffer, const float* log_prob_frame, int batch_stride, int vocab_stride,
+    int blank_id, int space_id, int batch, int beam, int vocab_size, int max_seq_len,
+    int use_paged_memory, int page_size, int num_pages, int step_for_parity,
+    cudaStream_t stream) {
+    void* workspace = reinterpret_cast<char*>(state_buffer) + STATE_HEADER_SIZE;
+
+    InternalData data;
+    if (use_paged_memory) {
+        setup_internal_data_paged_pointers(&data, workspace, batch, beam, vocab_size, max_seq_len,
+                                           page_size, num_pages);
+    } else {
+        setup_internal_data_pointers(&data, workspace, batch, beam, vocab_size, max_seq_len);
+    }
+
+    // Always launch — the kernel itself is a no-op when *d_step == *d_frame_idx.
+    {
+        int threads = 128;
+        int blocks = (batch + threads - 1) / threads;
+        set_select_seq_step_kernel<<<blocks, threads, 0, stream>>>(
+            data.select_seqs, device_step_ptr(state_buffer),
+            device_frame_idx_ptr(state_buffer), batch, max_seq_len);
+    }
+
+    const int* d_step = device_step_ptr(state_buffer);
+    if (use_paged_memory) {
+        return ctc_prefix_beam_search_step_paged(&data, log_prob_frame, batch_stride, 0,
+                                                 vocab_stride, step_for_parity, blank_id,
+                                                 space_id, stream, d_step);
+    } else {
+        bool is_last = false;
+        return ctc_prefix_beam_search_step(&data, log_prob_frame, batch_stride, 0, vocab_stride,
+                                           step_for_parity, is_last, blank_id, space_id, stream,
+                                           d_step);
     }
 }
 
@@ -1888,7 +2065,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void first_step_paged_kernel(
 // =============================================================================
 
 __global__ void merge_paged_kernel(
-    const int* __restrict__ select_seq_lens, int step,
+    const int* __restrict__ select_seq_lens, const int* __restrict__ d_step,
     float* __restrict__ ptable, float* __restrict__ ptablen,
     const int* __restrict__ clast, const int* __restrict__ clen,
     int ldc, int beam, int ldbeam, int batch, int blank_id,
@@ -1897,6 +2074,7 @@ __global__ void merge_paged_kernel(
     const int bid = blockIdx.y;
     if (bid >= batch)
         return;
+    int step = __ldg(d_step);
     if (step >= select_seq_lens[bid])
         return;
 
@@ -1944,7 +2122,7 @@ __global__ void merge_paged_kernel(
 
 template <int BLOCK_SIZE, int ITEMS_PER_THREAD, int WRITE_THREADS = 8>
 __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_paged_kernel(
-    const int* __restrict__ select_seq_lens, int step,
+    const int* __restrict__ select_seq_lens, const int* __restrict__ d_step,
     int items_per_batch, int beam, int batch,
     float* __restrict__ topk_key_buffer, int* __restrict__ topk_value_buffer,
     int ldc, int ldbeam,
@@ -1962,6 +2140,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_paged_kernel(
     const int bid = blockIdx.x;
     if (bid >= batch)
         return;
+    int step = __ldg(d_step);
     if (step >= select_seq_lens[bid])
         return;
 
@@ -2256,7 +2435,8 @@ __global__ void gather_paged_results_kernel(
 inline cudaError_t ctc_prefix_beam_search_step_paged(
     InternalData* data, const float* log_prob,
     int batch_stride, int seq_stride, int vocab_stride,
-    int step, int blank_id, int space_id, cudaStream_t stream) {
+    int step, int blank_id, int space_id, cudaStream_t stream,
+    const int* d_step) {
     auto& ps = data->paged;
     int batch = data->batch;
     int beam = data->beam;
@@ -2284,7 +2464,7 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
             dim3 grid(bx, batch);
             prob_matrix_kernel<<<grid, threads, 0, stream>>>(
                 log_prob, batch_stride, seq_stride, vocab_stride,
-                data->select_seqs, data->select_seq_lens, step,
+                data->select_seqs, data->select_seq_lens, d_step,
                 data->pprev, data->ptable, data->ptablen, data->clast,
                 ldc, beam, ldbeam, batch, blank_id, space_id, max_seq_len);
         }
@@ -2292,7 +2472,7 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
         // --- Blank / space (same as flat) ---
         prob_space_blank_kernel<<<batch, ldbeam, 0, stream>>>(
             log_prob, batch_stride, seq_stride, vocab_stride,
-            data->select_seqs, data->select_seq_lens, step,
+            data->select_seqs, data->select_seq_lens, d_step,
             data->pprev, data->ptable, data->ptablen, data->clast,
             ldc, beam, ldbeam, batch, blank_id, space_id, max_seq_len);
 
@@ -2300,7 +2480,7 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
         {
             dim3 merge_grid(beam, batch);
             merge_paged_kernel<<<merge_grid, ldbeam, 0, stream>>>(
-                data->select_seq_lens, step,
+                data->select_seq_lens, d_step,
                 data->ptable, data->ptablen, data->clast, data->clen[src_parity],
                 ldc, beam, ldbeam, batch, blank_id,
                 ps.page_storage, ps.block_table[src_parity],
@@ -2318,7 +2498,7 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
             bxs = min(bxs, MAX_BLOCKS / max(batch, 1));
             dim3 p1_grid(bxs, batch);
             topk_phase1_kernel<P1_BLOCK, P1_IPT><<<p1_grid, P1_BLOCK, 0, stream>>>(
-                data->select_seq_lens, step, data->ptable, data->ptablen,
+                data->select_seq_lens, d_step, data->ptable, data->ptablen,
                 ldc, beam, batch, data->topk_key_buffer, data->topk_value_buffer);
         }
 
@@ -2328,7 +2508,7 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
             constexpr int P2_IPT = 2;
             int items_per_batch = bxs * beam;
             topk_phase2_paged_kernel<P2_BLOCK, P2_IPT><<<batch, P2_BLOCK, 0, stream>>>(
-                data->select_seq_lens, step, items_per_batch, beam, batch,
+                data->select_seq_lens, d_step, items_per_batch, beam, batch,
                 data->topk_key_buffer, data->topk_value_buffer,
                 ldc, ldbeam,
                 data->pprev, data->ptable, data->ptablen, data->clast,
@@ -2396,13 +2576,22 @@ inline cudaError_t ctc_beam_search_decode_batch_paged(
     delete[] h_select_lens;
     data.max_select_seq_len = max_select;
 
+    int* d_step_scratch = nullptr;
+    cudaError_t alloc_err = cudaMalloc(&d_step_scratch, sizeof(int));
+    if (alloc_err != cudaSuccess)
+        return alloc_err;
+
     for (int step = 0; step < max_select; ++step) {
+        cudaMemcpyAsync(d_step_scratch, &step, sizeof(int), cudaMemcpyHostToDevice, stream);
         cudaError_t err = ctc_prefix_beam_search_step_paged(
             &data, log_prob, batch_stride, seq_stride, vocab_stride,
-            step, blank_id, space_id, stream);
-        if (err != cudaSuccess)
+            step, blank_id, space_id, stream, d_step_scratch);
+        if (err != cudaSuccess) {
+            cudaFree(d_step_scratch);
             return err;
+        }
     }
+    cudaFree(d_step_scratch);
 
     auto& ps = data.paged;
 
@@ -2439,7 +2628,9 @@ inline void init_streaming_state_paged(void* state_buffer, int batch, int beam,
                              page_size, num_pages, stream);
     state.data.max_select_seq_len = max_seq_len;
 
-    // Header is no longer read; skip the memcpy.
+    // Header is no longer read; skip the StreamingState memcpy.  Zero the
+    // device-resident streaming counters (mirrors the flat init path).
+    cudaMemsetAsync(state_buffer, 0, sizeof(int) * 2, stream);
 
     // Initialise beam-state buffers
     cudaMemsetAsync(state.data.clast, 0, sizeof(int) * batch * state.data.ldbeam, stream);

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
@@ -174,6 +174,28 @@ class EngineConfig:
     # _forward_paged`` now pads ``combined_bias`` to the kernel's
     # ``(M_BLOCK, N_BLOCK)`` tile so every bias read stays in-bounds.
     use_cuda_graphs: bool = True
+
+    # Sub-toggles for the two opt-in graph caches (gated by ``use_cuda_graphs``).
+    # ``use_feature_cuda_graphs`` controls ``GraphedFeatureExtraction``
+    # (batched fbank/mfcc capture). ``use_ctc_cuda_graphs`` controls the
+    # per-state captured ``streaming_step`` graphs inside ``GpuStreamingDecoder``.
+    #
+    # Both default OFF. They were experimentally validated at small workloads
+    # (N≈256 utts at B=64) where they shave 5-10% of wall time, but at
+    # production-scale runs (N>=2000) the per-replay CPU work in the feature
+    # graph (zero + copy + pin into the stable bucket buffer) and the per-non-blank
+    # ``cudaMemcpy2DAsync`` of ``log_prob`` slices in the CTC graph outweigh
+    # the kernel-launch savings — the captured intermediates also keep more
+    # memory live in the graph pool. Eager mode is faster at scale; the
+    # captured paths remain available for deployments where the trade-off
+    # flips (small B / many short utterances / fixed preferred batch size).
+    use_feature_cuda_graphs: bool = False
+    use_ctc_cuda_graphs: bool = False
+    # Optional override for the feature-graph B_active buckets. ``None``
+    # selects power-of-two buckets up to ``max_batch_size``
+    # (``[1, 2, 4, 8, 16, 32, ...]``). Services with a fixed preferred batch
+    # size can pin a tighter list (e.g. ``[8, 32]``) to skip unused captures.
+    feature_graph_batch_buckets: Optional[List[int]] = None
 
     # Feature extraction
     feature_config: Optional[FeatureConfig] = None

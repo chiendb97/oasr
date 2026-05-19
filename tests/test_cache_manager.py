@@ -476,8 +476,9 @@ class TestStreamContext:
         cfg, pool, att_mgr, cnn_mgr = self._setup()
         ctx = self._make_stream(0, att_mgr, cnn_mgr)
         cnn = ctx.get_cnn_cache()
-        assert cnn.shape == (2, 1, 2, 8)  # (L, 1, K-1, D)
-        assert cnn.allclose(torch.zeros_like(cnn))
+        gathered = cnn.gather()
+        assert gathered.shape == (2, 1, 2, 8)  # (L, 1, K-1, D)
+        assert gathered.allclose(torch.zeros_like(gathered))
 
     def test_prepare_chunk_then_get_paged_caches(self):
         cfg, pool, att_mgr, cnn_mgr = self._setup()
@@ -486,15 +487,21 @@ class TestStreamContext:
         caches = ctx.get_att_caches()
         assert len(caches) == cfg.num_layers
 
-    def test_commit_chunk_paged_updates_cnn_and_seqlens(self):
+    def test_commit_chunk_paged_advances_seqlens(self):
         cfg, pool, att_mgr, cnn_mgr = self._setup()
         ctx = self._make_stream(0, att_mgr, cnn_mgr)
         ctx.prepare_chunk()
-        new_cnn = torch.full((2, 1, 2, 8), 3.0)
-        ctx.commit_chunk_paged(chunk_frames=4, new_cnn_cache=new_cnn)
-        assert ctx.get_cnn_cache().allclose(torch.full_like(new_cnn, 3.0))
+        ctx.commit_chunk_paged(chunk_frames=4)
         _, cs = ctx.get_paged_state_views()
         assert int(cs[0].item()) == 4
+
+    def test_cnn_cache_scatter_round_trips(self):
+        cfg, pool, att_mgr, cnn_mgr = self._setup()
+        ctx = self._make_stream(0, att_mgr, cnn_mgr)
+        cnn = ctx.get_cnn_cache()
+        new_cnn = torch.full((2, 1, 2, 8), 3.0)
+        cnn.scatter(new_cnn)
+        assert ctx.get_cnn_cache().gather().allclose(torch.full_like(new_cnn, 3.0))
 
     def test_free_returns_pool_blocks(self):
         cfg, pool, att_mgr, cnn_mgr = self._setup()
@@ -502,7 +509,7 @@ class TestStreamContext:
         ctx = self._make_stream(0, att_mgr, cnn_mgr)
         for _ in range(3):
             ctx.prepare_chunk()
-            ctx.commit_chunk_paged(chunk_frames=4, new_cnn_cache=torch.zeros(2, 1, 2, 8))
+            ctx.commit_chunk_paged(chunk_frames=4)
         ctx.free()
         assert pool.num_free_blocks == initial
 
