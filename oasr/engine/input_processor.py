@@ -24,6 +24,7 @@ from oasr.features.batched import (
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from .config import EngineConfig
+from .graph_cache import GraphedFeatureExtraction
 from .request import Request
 
 
@@ -57,10 +58,23 @@ class InputProcessor:
         Target device for output tensors.
     """
 
-    def __init__(self, config: EngineConfig, device: torch.device) -> None:
+    def __init__(
+        self,
+        config: EngineConfig,
+        device: torch.device,
+        *,
+        graph_pool: Optional[Tuple[int, int]] = None,
+    ) -> None:
         self._config = config
         self._device = device
         self._feature_config: FeatureConfig = config.feature_config  # type: ignore[assignment]
+
+        # Shared CUDA Graph memory-pool handle injected by ``ASREngine`` so the
+        # feature-extraction graph cache (added in Step 2 of the plan) shares
+        # one pool with the encoder/CTC captures. ``None`` when the engine has
+        # CUDA graphs disabled or is running on CPU; the eager feature path is
+        # used in that case.
+        self._graph_pool = graph_pool
 
         # Parallel feature-extraction worker pool.  Kaldi-style fbank/mfcc release
         # the GIL inside their C++ ops, so a small Python thread pool yields real
@@ -94,6 +108,34 @@ class InputProcessor:
                 # set_num_threads can fail if a parallel section is already open;
                 # harmless — we'll just use the existing value.
                 pass
+
+        # CUDA-Graph cache for the steady-state streaming feature path. Lazy
+        # captures keyed by ``B_active`` bucket. ``None`` disables capture
+        # (CPU device, master ``use_cuda_graphs`` off, sub-toggle off, or the
+        # feature config doesn't satisfy the batched fbank/mfcc backend).
+        # The pool is per-cache to avoid intermediate-allocation aliasing with
+        # the encoder graph cache; ``graph_pool`` from the caller is honoured
+        # when non-None but the engine deliberately passes ``None`` so the
+        # cache allocates its own private pool.
+        self._feature_graph: Optional[GraphedFeatureExtraction] = None
+        if (
+            device.type == "cuda"
+            and bool(getattr(config, "use_cuda_graphs", True))
+            and bool(getattr(config, "use_feature_cuda_graphs", True))
+            and (
+                supports_batched_fbank(self._feature_config)
+                or supports_batched_mfcc(self._feature_config)
+            )
+        ):
+            self._feature_graph = GraphedFeatureExtraction(
+                pool=graph_pool,
+                device=device,
+                feature_config=self._feature_config,
+                output_dtype=config.dtype,
+                chunk_samples=self.streaming_audio_chunk_samples,
+                max_batch_size=int(config.max_batch_size),
+                batch_buckets=getattr(config, "feature_graph_batch_buckets", None),
+            )
 
     def __del__(self) -> None:
         pool = getattr(self, "_pool", None)
@@ -699,17 +741,39 @@ class InputProcessor:
                 else _NullCtx()
             )
             batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
-            with stream_ctx:
-                nvtx_push("h2d")
-                wav_gpu = padded_cpu.to(device=device, non_blocking=True)
-                lengths_gpu = lengths_cpu_pin.to(device=device, non_blocking=True)
-                nvtx_pop()
-                nvtx_push("feature")
-                feats_f32, _feat_lens_gpu = batched_fn(wav_gpu, lengths_gpu, fcfg)
-                feats = feats_f32.to(dtype=dtype)
-                # feat_lens_cpu was computed host-side above; the GPU
-                # ``feat_lens`` tensor is left unused to avoid the D2H sync.
-                nvtx_pop()
+
+            # Captured-graph fast path: only used in steady state (no flush)
+            # and when the cohort fits the largest pre-built B bucket and the
+            # combined waveform fits ``t_pad``. Any miss falls through to the
+            # eager path with no warm-up cost beyond a host-side branch.
+            feats: Optional[torch.Tensor] = None
+            fg = self._feature_graph
+            if (
+                fg is not None
+                and not any(fbank_flush)
+                and padded_cpu.size(1) <= fg.t_pad
+            ):
+                with stream_ctx:
+                    nvtx_push("feature_graph_replay")
+                    feats_view = fg.replay(
+                        len(fbank_inputs), padded_cpu, lengths_cpu_pin
+                    )
+                    nvtx_pop()
+                if feats_view is not None:
+                    feats = feats_view[: len(fbank_inputs)]
+
+            if feats is None:
+                with stream_ctx:
+                    nvtx_push("h2d")
+                    wav_gpu = padded_cpu.to(device=device, non_blocking=True)
+                    lengths_gpu = lengths_cpu_pin.to(device=device, non_blocking=True)
+                    nvtx_pop()
+                    nvtx_push("feature")
+                    feats_f32, _feat_lens_gpu = batched_fn(wav_gpu, lengths_gpu, fcfg)
+                    feats = feats_f32.to(dtype=dtype)
+                    # feat_lens_cpu was computed host-side above; the GPU
+                    # ``feat_lens`` tensor is left unused to avoid the D2H sync.
+                    nvtx_pop()
         else:
             # Fallback: per-utt CPU/torchaudio fbank.  Used by non-Povey
             # configs and CPU-only devices.

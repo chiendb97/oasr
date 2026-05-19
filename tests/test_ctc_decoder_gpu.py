@@ -652,3 +652,120 @@ class TestCtcDecoderPagedStreaming:
 
         assert result1.tokens[0][0] == [1, 2]
         assert result2.tokens[0][0] == [3, 4]
+
+
+# ---------------------------------------------------------------------------
+# Step 4: per-state captured CUDA Graph parity tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.cuda
+class TestCtcStreamingCudaGraphParity:
+    """Bit-exact decode parity between the captured-graph and eager paths."""
+
+    def _decode_path(self, V: int, path: list, *, use_cuda_graphs: bool,
+                     beam: int = 3, max_seq_len: int = 32,
+                     blank_threshold: float = 0.0,
+                     device=torch.device("cuda")):
+        """Run a synthetic CTC decode over ``path`` with the given graph mode."""
+        cfg = GpuDecoderConfig(beam_size=beam, blank_id=0,
+                               max_seq_len=max_seq_len,
+                               blank_threshold=blank_threshold)
+        decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=use_cuda_graphs)
+        decoder.init_stream(batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk(_make_logp_gpu(len(path), V, path, device))
+        return decoder.finalize_stream()
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            [1, 0, 2, 0, 3],
+            [0, 0, 1, 0, 0, 2, 3, 0],
+            [1, 1, 0, 2, 2, 0, 3],
+            [0, 0, 0, 0, 0],   # all-blank chunk
+            [1, 2, 3, 4],      # no blanks at all
+            [1] * 20,          # repeated non-blank
+        ],
+    )
+    def test_streaming_decode_matches_eager_graph_capture(self, path, device):
+        """Decoded tokens / lengths / scores match eager path bit-exactly."""
+        V = 6
+        r_eager = self._decode_path(V, path, use_cuda_graphs=False,
+                                    blank_threshold=0.0, device=device)
+        r_graph = self._decode_path(V, path, use_cuda_graphs=True,
+                                    blank_threshold=0.0, device=device)
+        assert r_eager.tokens == r_graph.tokens, (
+            f"path={path}: eager={r_eager.tokens}, graph={r_graph.tokens}")
+        torch.testing.assert_close(r_eager.lengths, r_graph.lengths,
+                                   rtol=0, atol=0)
+        torch.testing.assert_close(r_eager.scores, r_graph.scores,
+                                   rtol=0, atol=0)
+
+    def test_streaming_decode_with_blank_threshold(self, device):
+        """Blank-threshold skipping is preserved on the graph path."""
+        V = 5
+        path = [0, 0, 1, 0, 0, 0, 2, 0, 3, 0, 0]
+        r_eager = self._decode_path(V, path, use_cuda_graphs=False,
+                                    blank_threshold=0.5, device=device)
+        r_graph = self._decode_path(V, path, use_cuda_graphs=True,
+                                    blank_threshold=0.5, device=device)
+        assert r_eager.tokens == r_graph.tokens
+
+    def test_streaming_decode_multi_chunk_matches_eager(self, device):
+        """Decode parity across multiple chunks in one stream."""
+        V = 6
+        chunks = [
+            [1, 0, 2],
+            [0, 0, 3, 0],
+            [4, 0, 0, 5],
+        ]
+
+        def run(use_cuda_graphs: bool):
+            cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=32,
+                                   blank_threshold=0.0)
+            decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=use_cuda_graphs)
+            decoder.init_stream(batch=1, vocab_size=V, device=device)
+            for c in chunks:
+                decoder.decode_chunk(_make_logp_gpu(len(c), V, c, device))
+            return decoder.finalize_stream()
+
+        r_eager = run(False)
+        r_graph = run(True)
+        assert r_eager.tokens == r_graph.tokens
+
+    def test_streaming_decode_state_pool_reuse_with_graphs(self, device):
+        """Pooled state reuse (same shape) keeps captured graphs valid."""
+        V = 5
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=32,
+                               blank_threshold=0.0)
+        decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=True)
+
+        state = decoder.create_state(batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk(_make_logp_gpu(4, V, [1, 0, 2, 3], device),
+                             state=state)
+        r1 = decoder.finalize_stream(state=state)
+        assert r1.tokens[0][0] == [1, 2, 3]
+
+        # Reuse the same state — graphs should still be valid.
+        decoder.reset_state(state, batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk(_make_logp_gpu(4, V, [4, 0, 1, 2], device),
+                             state=state)
+        r2 = decoder.finalize_stream(state=state)
+        assert r2.tokens[0][0] == [4, 1, 2]
+
+    def test_streaming_decode_state_realloc_releases_graphs(self, device):
+        """Resetting to a larger shape releases stale graphs and recaptures."""
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=32,
+                               blank_threshold=0.0)
+        decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=True)
+
+        state = decoder.create_state(batch=1, vocab_size=5, device=device)
+        decoder.decode_chunk(_make_logp_gpu(3, 5, [1, 0, 2], device),
+                             state=state)
+        decoder.finalize_stream(state=state)
+
+        # Bigger vocab forces a realloc → graphs released → recaptured.
+        decoder.reset_state(state, batch=1, vocab_size=8, device=device)
+        decoder.decode_chunk(_make_logp_gpu(4, 8, [3, 0, 5, 7], device),
+                             state=state)
+        r = decoder.finalize_stream(state=state)
+        assert r.tokens[0][0] == [3, 5, 7]

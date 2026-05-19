@@ -298,7 +298,8 @@ class GpuStreamingDecoder:
     >>> r2 = decoder.finalize_stream(state=s2)
     """
 
-    def __init__(self, config: Optional[GpuDecoderConfig] = None):
+    def __init__(self, config: Optional[GpuDecoderConfig] = None,
+                 *, use_cuda_graphs: bool = True):
         self._config = config or GpuDecoderConfig()
         self._mod = _get_ctc_decoder_module()
 
@@ -310,6 +311,14 @@ class GpuStreamingDecoder:
         # size query entirely.
         self._cached_size_key: Optional[tuple] = None
         self._cached_size_val: int = 0
+
+        # Step 4: opt-in per-state CUDA Graph capture of ``streaming_step``.
+        # When enabled, each ``StreamState``'s first ``decode_chunk`` call
+        # captures four graphs (first/even/odd/blank); subsequent calls
+        # replay the appropriate graph per frame, replacing ~6 kernel
+        # launches with one D2D memcpy + one graph launch.  Falls back to
+        # the eager path inside the C++ chunk launcher if capture fails.
+        self._use_cuda_graphs: bool = bool(use_cuda_graphs)
 
         self._blank_log_thresh: Optional[float] = (
             math.log(self._config.blank_threshold)
@@ -429,8 +438,16 @@ class GpuStreamingDecoder:
 
         required = self._state_bytes_for(batch, vocab_size)
         if state._buffer_bytes >= required and state.buffer.device == device:
-            pass  # fast path — reuse existing buffer
+            pass  # fast path — reuse existing buffer (graphs remain valid)
         else:
+            # Reallocating the buffer invalidates any captured CUDA Graphs
+            # bound to its old data_ptr. Release them before swapping so a
+            # future state that lands at the same address doesn't pick up
+            # stale graphs.
+            try:
+                self._mod.ctc_decoder_release_graphs(state.buffer)
+            except Exception:
+                pass
             state.buffer = torch.empty(required, dtype=torch.uint8, device=device)
             state._buffer_bytes = required
 
@@ -520,6 +537,7 @@ class GpuStreamingDecoder:
             s.actual_frame_idx,
             s.batch, s.vocab_size, cfg.max_seq_len,
             1 if cfg.use_paged_memory else 0, cfg.page_size,
+            1 if self._use_cuda_graphs else 0,
         ))
 
         # The chunk launcher decodes ``min(active_frames, max_seq_len -

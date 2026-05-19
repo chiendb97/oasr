@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -58,10 +58,13 @@ class ModelRunner:
         model: ConformerModel,
         config: EngineConfig,
         cache_config: CacheConfig,
+        *,
+        graph_pool: Optional[Tuple[int, int]] = None,
     ) -> None:
         self._model = model
         self._config = config
         self._cache_config = cache_config
+        self._graph_pool = graph_pool
 
         # Build shared cache infrastructure
         self._block_pool = BlockPool(cache_config)
@@ -69,12 +72,21 @@ class ModelRunner:
         self._cnn_mgr = CnnCacheManager(cache_config)
         self._slot_pool = StreamSlotPool(cache_config.max_batch_size)
         # Only create the CTC state manager when using the GPU decoder
+        ctc_graphs_enabled = (
+            bool(getattr(config, "use_cuda_graphs", True))
+            and bool(getattr(config, "use_ctc_cuda_graphs", True))
+            and torch.device(config.device).type == "cuda"
+        )
         if config.decoder_type == "ctc_gpu":
             self._ctc_mgr: CtcStateCacheManager = CtcStateCacheManager(
-                config.gpu_decoder_config
+                config.gpu_decoder_config,
+                use_cuda_graphs=ctc_graphs_enabled,
             )
         else:
-            self._ctc_mgr = CtcStateCacheManager(config.gpu_decoder_config)
+            self._ctc_mgr = CtcStateCacheManager(
+                config.gpu_decoder_config,
+                use_cuda_graphs=ctc_graphs_enabled,
+            )
 
         # CUDA Graph cache for the steady-state batched paged forward.
         # Captures lazily on first encounter of each (B_active, cache_t1
@@ -96,6 +108,7 @@ class ModelRunner:
                 cnn_cache_frames=cache_config.cnn_cache_frames,
                 num_layers=cache_config.num_layers,
                 hidden_dim=cache_config.hidden_dim,
+                pool=self._graph_pool,
             )
         else:
             self._graph_cache = None

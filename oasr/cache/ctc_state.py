@@ -59,9 +59,11 @@ class CtcStateCacheManager:
     >>> mgr.allocate_stream(2, batch=1, vocab_size=5000)  # reuses pooled state
     """
 
-    def __init__(self, decoder_config: Optional[GpuDecoderConfig] = None) -> None:
+    def __init__(self, decoder_config: Optional[GpuDecoderConfig] = None,
+                 *, use_cuda_graphs: bool = True) -> None:
         self._decoder_config = decoder_config or GpuDecoderConfig()
-        self._decoder = GpuStreamingDecoder(self._decoder_config)
+        self._decoder = GpuStreamingDecoder(self._decoder_config,
+                                            use_cuda_graphs=use_cuda_graphs)
         self._states: Dict[int, StreamState] = {}
         self._pool: List[StreamState] = []
 
