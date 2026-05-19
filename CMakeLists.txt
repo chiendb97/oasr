@@ -5,12 +5,11 @@ project(oasr LANGUAGES CXX CUDA)
 # =============================================================================
 # Options
 # =============================================================================
-option(BUILD_PYTHON "Build Python bindings" ON)
-option(BUILD_TESTS "Build unit tests" OFF)  # Disabled for now - enable when ready
-option(BUILD_EXAMPLES "Build examples" OFF)
-option(USE_FLASH_ATTENTION "Use FlashAttention kernels" OFF)
-option(ENABLE_FP16 "Enable FP16 support" ON)
-option(ENABLE_BF16 "Enable BF16 support" ON)
+# Note: most kernel-related toggles (FP16/BF16/CUTLASS/FlashAttention) are
+# resolved at runtime by the TVM-FFI JIT pipeline, not at CMake configure time.
+# This CMake graph only builds the CPU-side decoder (oasr_core) and the
+# pybind11 module (_C) that exposes it.
+option(BUILD_PYTHON "Build Python bindings (_C pybind11 module)" ON)
 option(OASR_USE_K2 "Enable K2 WFST beam search decoder (requires K2)" OFF)
 
 # =============================================================================
@@ -29,7 +28,6 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 # =============================================================================
 # CUDA configuration
@@ -60,21 +58,9 @@ endif()
 # =============================================================================
 # Dependencies
 # =============================================================================
-
-# cuBLAS and cuDNN
-find_library(CUBLAS_LIB cublas HINTS ${CUDAToolkit_LIBRARY_DIR})
-find_library(CUBLASLT_LIB cublasLt HINTS ${CUDAToolkit_LIBRARY_DIR})
-find_library(CUDNN_LIB cudnn HINTS ${CUDAToolkit_LIBRARY_DIR} /usr/lib/x86_64-linux-gnu)
-
-if(NOT CUDNN_LIB)
-    message(WARNING "cuDNN not found. Some features may be disabled.")
-endif()
-
-# =============================================================================
-# CUTLASS
-# =============================================================================
-set(CUTLASS_DIR "${CMAKE_SOURCE_DIR}/3rdparty/cutlass" CACHE PATH "CUTLASS directory (header-only)")
-
+# cuBLAS / cuBLAS-Lt / cuDNN / CUTLASS are consumed by JIT-compiled kernels at
+# runtime (resolved by TVM-FFI / nvcc), not linked into oasr_core. No
+# find_library() calls are needed here.
 
 # Python and dependencies for bindings
 if(BUILD_PYTHON)
@@ -273,13 +259,6 @@ endif()
 
 
 # =============================================================================
-# Examples
-# =============================================================================
-if(BUILD_EXAMPLES)
-    add_subdirectory(examples)
-endif()
-
-# =============================================================================
 # Install rules
 # =============================================================================
 install(TARGETS oasr_core
@@ -297,12 +276,9 @@ install(DIRECTORY include/oasr/
 # =============================================================================
 message(STATUS "")
 message(STATUS "=== OASR Build Configuration ===")
-message(STATUS "Build type:        ${CMAKE_BUILD_TYPE}")
+message(STATUS "Build type:         ${CMAKE_BUILD_TYPE}")
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
-message(STATUS "Python bindings:   ${BUILD_PYTHON}")
-message(STATUS "Use CUTLASS:       ${USE_CUTLASS}")
-message(STATUS "Use FlashAttention: ${USE_FLASH_ATTENTION}")
-message(STATUS "Enable FP16:       ${ENABLE_FP16}")
-message(STATUS "Enable BF16:       ${ENABLE_BF16}")
+message(STATUS "Python bindings:    ${BUILD_PYTHON}")
+message(STATUS "K2 WFST decoder:    ${OASR_USE_K2}")
 message(STATUS "================================")
 message(STATUS "")

@@ -151,8 +151,6 @@ class CMakeBuild(build_ext):
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={ext_dir}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
             "-DBUILD_PYTHON=ON",
-            "-DBUILD_TESTS=OFF",
-            "-DBUILD_EXAMPLES=OFF",
         ]
         
         # Torch cmake prefix (for find_package(Torch))
@@ -169,11 +167,6 @@ class CMakeBuild(build_ext):
         # set (80+) that works on CUDA 11.8+ without requiring Volta support.
         cuda_arch = os.environ.get("CUDA_ARCHITECTURES") or _detect_cuda_architectures()
         cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}")
-        
-        if os.environ.get("OASR_USE_FLASH_ATTENTION", "0") == "1":
-            cmake_args.append("-DUSE_FLASH_ATTENTION=ON")
-        else:
-            cmake_args.append("-DUSE_FLASH_ATTENTION=OFF")
 
         if os.environ.get("OASR_USE_K2", "0") == "1":
             cmake_args.append("-DOASR_USE_K2=ON")

@@ -14,21 +14,9 @@ pip install -e .
 
 # Target specific GPU architecture
 CUDA_ARCHITECTURES=80 pip install -e .
-
-# With Flash Attention support
-OASR_USE_FLASH_ATTENTION=1 pip install -e .
 ```
 
 The build compiles the `_C.so` pybind11 extension (for decoder + enums) via CMake. CUDA kernels are JIT-compiled on first use via TVM-FFI and cached in `~/.cache/oasr/jit/`.
-
-### C++ tests only
-
-```bash
-mkdir build && cd build
-cmake .. -DBUILD_PYTHON=ON -DBUILD_TESTS=ON -DCMAKE_CUDA_ARCHITECTURES=80
-make -j
-ctest --output-on-failure
-```
 
 ## Testing
 
@@ -253,6 +241,5 @@ Two skill files provide step-by-step workflows for common tasks:
 | Variable | Purpose |
 |----------|---------|
 | `CUDA_ARCHITECTURES` | Override SM targets for build (e.g., `80` or `80;86`) |
-| `OASR_USE_FLASH_ATTENTION` | Set to `1` to enable Flash Attention support |
 | `OASR_CUDA_ARCH_LIST` | Manual override for JIT CUDA architecture detection |
 | `OASR_ATTN_BACKEND` | `sdpa` (force SDPA), `cute` (require CuteDSL FMHA, raise on unsupported arch or import failure), `auto` (default — use cute on sm_80 / sm_86 / sm_89 / sm_120 when CuteDSL imports, else warn + fall back to SDPA) |

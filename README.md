@@ -107,9 +107,6 @@ pip install -e .
 
 # Multiple architectures (semicolon-separated)
 CUDA_ARCHITECTURES="80;86;90" pip install -e .
-
-# With Flash Attention support
-OASR_USE_FLASH_ATTENTION=1 pip install -e .
 ```
 
 Optional dependency groups:
