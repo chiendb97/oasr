@@ -28,7 +28,7 @@ from .conv import (
     depthwise_conv1d, conv2d,
     depthwise_conv1d_silu, causal_conv1d, conv2d_activation,
 )
-from .gemm import gemm, bmm, group_gemm, gemm_activation
+from .gemm import gemm, bmm, group_gemm, gemm_activation, gemm_log_softmax
 from .softmax import softmax
 from .attention import fmha, persistent_inputs as fmha_persistent_inputs
 from .topk import topk
@@ -178,6 +178,7 @@ __all__ = [
     "bmm",
     "group_gemm",
     "gemm_activation",
+    "gemm_log_softmax",
     "softmax",
     "topk",
     "rfft",

@@ -595,6 +595,22 @@ def gen_group_gemm_module() -> JitSpec:
     return gen_jit_spec("group_gemm", source_paths)
 
 
+def gen_gemm_log_softmax_module() -> JitSpec:
+    """Generate JIT spec for fused GEMM + log_softmax.
+
+    Replaces ``F.log_softmax(linear(x), dim=-1)`` (e.g. the CTC head) with a
+    single Python call; internally a CUTLASS GEMM and an online log_softmax
+    kernel chain on the same stream.
+    """
+    return gen_jit_spec(
+        "gemm_log_softmax",
+        [
+            env.OASR_CSRC_DIR / "gemm_log_softmax.cu",
+            env.OASR_CSRC_DIR / "gemm_log_softmax_jit_binding.cu",
+        ],
+    )
+
+
 # =============================================================================
 # Default function name helpers
 # =============================================================================
