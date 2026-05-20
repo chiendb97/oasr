@@ -188,7 +188,7 @@ class ConvolutionModule(nn.Module):
         else:
             new_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
         x = self.pointwise_conv1(x)
-        x = nn.functional.glu(x, dim=-1)
+        x = oasr.glu(x)
         x = self.depthwise_conv(x)
         x = self.norm_activation(x)
         x = self.pointwise_conv2(x)
