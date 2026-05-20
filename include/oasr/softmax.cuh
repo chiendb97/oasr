@@ -114,6 +114,59 @@ __device__ __forceinline__ float2 blockReduce(float2 val) {
 }
 
 
+// One block per row. Two passes: online (max, sum) accumulation, then emit
+// log_softmax(x) = x - row_max - log(sum_exp). The first phase mirrors
+// onlineSoftmaxKernel; the second writes the log form directly.
+template <typename T, int VecSize>
+__global__ void onlineLogSoftmaxKernel(const T* __restrict__ input, T* __restrict__ output,
+                                       int num_cols) {
+    using VecT = oasr::Vec<T, VecSize>;
+
+    const int row_idx = blockIdx.x;
+    const T* row_input = input + row_idx * num_cols;
+    T* row_output = output + row_idx * num_cols;
+
+    const int vec_num_cols = num_cols / VecSize;
+
+    __shared__ float2 smem;
+
+    float2 local_val = make_float2(cuda::std::numeric_limits<float>::lowest(), 0.0f);
+    for (int i = threadIdx.x; i < vec_num_cols; i += blockDim.x) {
+        VecT v;
+        v.load(row_input + i * VecSize);
+
+        float vec_max = static_cast<float>(v[0]);
+#pragma unroll
+        for (int j = 1; j < VecSize; j++) {
+            vec_max = max(vec_max, static_cast<float>(v[j]));
+        }
+        float new_max = max(local_val.x, vec_max);
+        float vec_sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            vec_sum += expf(static_cast<float>(v[j]) - new_max);
+        }
+        local_val.y = local_val.y * expf(local_val.x - new_max) + vec_sum;
+        local_val.x = new_max;
+    }
+    float2 row_val = blockBroadcast(blockReduce(local_val), &smem);
+    const float row_max = row_val.x;
+    const float log_norm = logf(row_val.y);  // log(sum_exp(x - row_max))
+
+    // Phase 2: emit log_softmax(x) = (x - row_max) - log_norm.
+    for (int i = threadIdx.x; i < vec_num_cols; i += blockDim.x) {
+        VecT v;
+        v.load(row_input + i * VecSize);
+
+        oasr::Vec<float, VecSize> vals;
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            vals[j] = static_cast<float>(v[j]) - row_max - log_norm;
+        }
+        oasr::vecCast<T>(vals).store(row_output + i * VecSize);
+    }
+}
+
 // One block per row. Two passes: online (max, sum) accumulation, then normalize.
 template <typename T, int VecSize>
 __global__ void onlineSoftmaxKernel(const T* __restrict__ input, T* __restrict__ output,
@@ -189,6 +242,26 @@ cudaError_t Softmax(const T* input, T* output, unsigned int num_rows, unsigned i
     } else {
         int block_size = alignedBlockSize(static_cast<int>(num_cols));
         onlineSoftmaxKernel<T, 1>
+            <<<num_rows, block_size, 0, stream>>>(input, output, static_cast<int>(num_cols));
+    }
+    return cudaGetLastError();
+}
+
+template <typename T>
+cudaError_t LogSoftmax(const T* input, T* output, unsigned int num_rows, unsigned int num_cols,
+                       cudaStream_t stream) {
+    constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
+
+    bool use_vec = (num_cols >= static_cast<unsigned int>(VecSize)) && (num_cols % VecSize == 0) &&
+                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+
+    if (use_vec) {
+        int block_size = alignedBlockSize(static_cast<int>(num_cols) / VecSize);
+        onlineLogSoftmaxKernel<T, VecSize>
+            <<<num_rows, block_size, 0, stream>>>(input, output, static_cast<int>(num_cols));
+    } else {
+        int block_size = alignedBlockSize(static_cast<int>(num_cols));
+        onlineLogSoftmaxKernel<T, 1>
             <<<num_rows, block_size, 0, stream>>>(input, output, static_cast<int>(num_cols));
     }
     return cudaGetLastError();

@@ -8,9 +8,9 @@ import math
 from typing import List, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
+import oasr
 from oasr.layers.linear import Linear, LinearActivation
 from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d, Conv2dActivation
 from oasr.layers.norm import LayerNorm, GlobalCMVN
@@ -43,7 +43,7 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
 
 
 class CTC(torch.nn.Module):
-    """CTC module: Linear -> log_softmax"""
+    """CTC module: fused (Linear -> log_softmax) via oasr.gemm_log_softmax."""
 
     def __init__(
         self,
@@ -64,7 +64,9 @@ class CTC(torch.nn.Module):
         Args:
             hidden_states: batch of hidden state sequences (B, T, D)
         """
-        return F.log_softmax(self.ctc_lo(hidden_states), dim=2)
+        return oasr.gemm_log_softmax(
+            hidden_states, self.ctc_lo.weight, self.ctc_lo.bias
+        )
 
 
 # -----------------------------------------------------------------------------

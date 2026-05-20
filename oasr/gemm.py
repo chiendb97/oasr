@@ -31,6 +31,13 @@ def _get_group_gemm_module():
     return gen_group_gemm_module().build_and_load()
 
 
+@functools.cache
+def _get_gemm_log_softmax_module():
+    from oasr.jit.gemm import gen_gemm_log_softmax_module
+
+    return gen_gemm_log_softmax_module().build_and_load()
+
+
 def _default_gemm_fn():
     from oasr.jit.gemm import GEMM_DEFAULT, gemm_func_name
 
@@ -227,4 +234,37 @@ def gemm_activation(
 
     _default_gemm_activation_fn()(out.reshape(-1, N),
                                    A.reshape(-1, K), B, C, activation_type, 1)
+    return out
+
+
+@oasr_api
+def gemm_log_softmax(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused GEMM + log_softmax: D = log_softmax(A @ B.T + C, dim=-1).
+
+    Drop-in replacement for ``F.log_softmax(F.linear(A, B, C), dim=-1)`` such
+    as the CTC head ``F.log_softmax(self.ctc_lo(hidden_states), dim=2)``.
+
+    Args:
+        A: Activations [*, K]. Leading dims are flattened to M = prod(A.shape[:-1]).
+        B: Weight matrix [N, K] (e.g. ``nn.Linear.weight``).
+        C: Optional bias [N], broadcast over rows.
+        out: Optional pre-allocated output [*, N] with A's dtype.
+
+    Returns:
+        Output tensor with the same leading shape as A and last dim N.
+    """
+    K = A.shape[-1]
+    N = B.shape[0]
+    if out is None:
+        out_shape = list(A.shape[:-1]) + [N]
+        out = torch.empty(out_shape, device=A.device, dtype=A.dtype)
+
+    _get_gemm_log_softmax_module().gemm_log_softmax(
+        out.reshape(-1, N), A.reshape(-1, K), B, C, 1
+    )
     return out
