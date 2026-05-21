@@ -531,7 +531,17 @@ def fmha(
             block_table = block_table.to(torch.int32)
 
     if out is None:
-        out = torch.empty_like(q)
+        # ``empty_like(q)`` preserves q's memory format: when q came from a
+        # transpose (non-canonical strides) the output buffer would inherit
+        # those strides, and ``_call_cute_dsl``'s ``_ensure_canonical`` would
+        # then copy into a fresh canonical buffer that the cute kernel writes
+        # to — leaving the caller's ``out`` reference uninitialised. Allocate
+        # the output directly in canonical contiguous_format so the kernel
+        # writes land in the tensor we hand back.
+        out = torch.empty(
+            q.shape, dtype=q.dtype, device=q.device,
+            memory_format=torch.contiguous_format,
+        )
 
     # ---- Backend dispatch ---------------------------------------------------
     backend = select_backend()
@@ -638,4 +648,12 @@ def _call_cute_dsl(
     # TVM-FFI compiled callable accepts torch tensors directly.
     fn(q_t, k_t, v_t, o_t, bias_t, seqlens_t, block_table_t,
        _Float32(float(softmax_scale)), stream)
+    # When ``out`` had non-canonical strides (e.g. caller passed a transpose
+    # view) ``_ensure_canonical`` allocated a fresh canonical buffer that the
+    # cute kernel writes to; copy the result back so the caller's reference
+    # observes the output. ``fmha``'s ``out is None`` path now allocates
+    # canonical-contiguous so this guard only fires when the caller hands in
+    # a non-canonical pre-allocated ``out``.
+    if o_t.data_ptr() != out.data_ptr():
+        out.copy_(o_t)
     return out

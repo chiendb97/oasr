@@ -10,6 +10,7 @@
 
 #include <tvm/ffi/c_api.h>
 #include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/extra/c_env_api.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/optional.h>
 
@@ -96,9 +97,17 @@ static constexpr DLDataType dl_int32 = {kDLInt, 32, 1};
 // =============================================================================
 
 inline cudaStream_t get_stream(DLDevice device) {
-    // Use the default stream for the device.
-    // In production, this should use the stream from the framework context.
-    return nullptr;
+    // Use the caller's current CUDA stream (set on the FFI env by the
+    // framework, e.g. ``tvm_ffi.use_torch_stream`` or torch's autograd
+    // dispatcher). Returning ``nullptr`` (the null/default stream) here
+    // breaks CUDA Graph capture: ``torch.cuda.graph`` records kernels
+    // launched on the *capture* stream and silently skips any launched on
+    // the null stream, so every JIT-compiled OASR op (conv2d, gemm, glu,
+    // norm, ...) is left out of the captured graph, the resulting graph is
+    // empty (PyTorch warns ``CUDA Graph is empty``), and replays produce
+    // wrong / NaN outputs because none of the encoder ops actually run.
+    TVMFFIStreamHandle s = TVMFFIEnvGetStream(device.device_type, device.device_id);
+    return static_cast<cudaStream_t>(s);
 }
 
 inline size_t get_element_size(DLDataType dtype) {

@@ -40,6 +40,7 @@
 #endif
 
 #include <oasr/common/epilogue_functors.h>
+#include <oasr/common/graph_safe_workspace.h>
 #include <oasr/common/utils.h>
 #include <oasr/conv/cutlass_conv2d_configs.h>
 
@@ -179,7 +180,7 @@ struct CutlassConv2dFpropKernelSm90 {
         }
 
         size_t workspace_size = conv_op.get_workspace_size(arguments);
-        cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+        oasr::GraphSafeWorkspace workspace(workspace_size, stream);
 
         status = conv_op.initialize(arguments, workspace.get(), stream);
         if (status != cutlass::Status::kSuccess) {

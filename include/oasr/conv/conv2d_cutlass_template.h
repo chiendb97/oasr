@@ -28,6 +28,7 @@
 #endif
 
 #include <oasr/common/epilogue_functors.h>
+#include <oasr/common/graph_safe_workspace.h>
 #include <oasr/common/utils.h>
 #include <oasr/conv/cutlass_conv2d_configs.h>
 
@@ -112,7 +113,7 @@ struct CutlassConv2dFpropKernel {
         }
 
         size_t workspace_size = ImplicitGemm::get_workspace_size(args);
-        cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+        oasr::GraphSafeWorkspace workspace(workspace_size, stream);
 
         status = conv_op.initialize(args, workspace.get(), stream);
         if (status != cutlass::Status::kSuccess) {

@@ -31,6 +31,7 @@
 #endif
 
 #include <oasr/common/epilogue_functors.h>
+#include <oasr/common/graph_safe_workspace.h>
 #include <oasr/common/utils.h>
 #include <oasr/gemm/cutlass_gemm_configs.h>
 
@@ -89,7 +90,7 @@ struct CutlassGemmKernel {
         }
 
         size_t workspace_size = Gemm::get_workspace_size(args);
-        cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+        oasr::GraphSafeWorkspace workspace(workspace_size, stream);
 
         status = gemm_op.initialize(args, workspace.get(), stream);
         if (status != cutlass::Status::kSuccess) {
@@ -150,7 +151,7 @@ struct CutlassBmmKernel {
             return GemmStatus::NOT_SUPPORTED;
 
         size_t ws_size = Gemm::get_workspace_size(args);
-        cutlass::device_memory::allocation<uint8_t> ws(ws_size);
+        oasr::GraphSafeWorkspace ws(ws_size, stream);
 
         if (gemm_op.initialize(args, ws.get(), stream) != cutlass::Status::kSuccess)
             return GemmStatus::INTERNAL_ERROR;
@@ -274,7 +275,7 @@ struct CutlassGroupGemmKernel {
         }
 
         size_t workspace_size = gemm_op.get_workspace_size(args);
-        cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+        oasr::GraphSafeWorkspace workspace(workspace_size, stream);
 
         status = gemm_op.initialize(args, workspace.get(), stream);
         if (status != cutlass::Status::kSuccess) {
