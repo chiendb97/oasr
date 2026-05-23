@@ -42,20 +42,31 @@ class TestJitInfrastructure:
         assert len(spec.sources) == 2
 
     def test_gen_conv2d_module(self):
-        """Verify conv2d JIT spec can be created."""
+        """Verify conv2d JIT spec can be created.
+
+        Each CUTLASS tile config is rendered as a self-contained ``.cu`` (with
+        its own ``TVM_FFI_DLL_EXPORT_TYPED_FUNC``), so the spec holds one source
+        per unique compile config — count varies by target SM.
+        """
         from oasr.jit.conv import gen_conv2d_module
 
         spec = gen_conv2d_module()
         assert spec.name == "conv2d"
-        assert len(spec.sources) == 2
+        assert len(spec.sources) >= 1
+        assert all(p.suffix == ".cu" for p in spec.sources)
 
     def test_gen_gemm_module(self):
-        """Verify gemm JIT spec can be created."""
+        """Verify gemm JIT spec can be created.
+
+        Like conv2d, each tile variant is a self-contained ``.cu``; the source
+        count equals the number of unique compile configs for the target SM.
+        """
         from oasr.jit.gemm import gen_gemm_module
 
         spec = gen_gemm_module()
         assert spec.name == "gemm"
-        assert len(spec.sources) == 2
+        assert len(spec.sources) >= 1
+        assert all(p.suffix == ".cu" for p in spec.sources)
 
     def test_gen_bmm_module(self):
         """Verify bmm JIT spec can be created."""
@@ -63,7 +74,8 @@ class TestJitInfrastructure:
 
         spec = gen_bmm_module()
         assert spec.name == "bmm"
-        assert len(spec.sources) == 2
+        assert len(spec.sources) >= 1
+        assert all(p.suffix == ".cu" for p in spec.sources)
 
     def test_gen_group_gemm_module(self):
         """Verify group_gemm JIT spec can be created."""
@@ -71,23 +83,33 @@ class TestJitInfrastructure:
 
         spec = gen_group_gemm_module()
         assert spec.name == "group_gemm"
-        assert len(spec.sources) == 2
+        assert len(spec.sources) >= 1
+        assert all(p.suffix == ".cu" for p in spec.sources)
 
     def test_gen_all_modules(self):
         """Verify AOT gen_all_modules returns all expected specs."""
         from oasr.aot import gen_all_modules
 
         specs = gen_all_modules()
-        assert len(specs) == 8
         names = [s.name for s in specs]
-        assert "activation" in names
-        assert "norm" in names
-        assert "conv" in names
-        assert "conv2d" in names
-        assert "cudnn_conv2d" in names
-        assert "gemm" in names
-        assert "bmm" in names
-        assert "group_gemm" in names
+        expected = {
+            "activation",
+            "norm",
+            "conv",
+            "conv2d",
+            "cudnn_conv2d",
+            "gemm",
+            "bmm",
+            "group_gemm",
+            "gemm_log_softmax",
+            "ctc_decoder",
+            "softmax",
+            "topk",
+            "fft",
+            "features",
+        }
+        assert expected.issubset(set(names)), f"missing modules: {expected - set(names)}"
+        assert len(specs) == len(expected)
 
 
 if __name__ == "__main__":
