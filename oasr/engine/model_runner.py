@@ -140,15 +140,6 @@ class ModelRunner:
             ``(B,)`` int32 valid encoder output frame counts, computed from
             the encoder's padding mask so downstream decoders ignore padding.
         """
-        # NB: do NOT wrap with ``oasr.fmha.persistent_inputs()`` here.
-        # Within one encoder forward each layer produces fresh Q/K/V/bias,
-        # there are no shared tensors to cache, so the context provides
-        # no win. And the engine runs kernels async without synchronizing
-        # between encoder layers or between consecutive forward_offline
-        # calls -- if the cache held a tensor that's then released at
-        # context exit (storage returned to the torch CUDA allocator),
-        # an in-flight kernel reading from that storage would race with
-        # the allocator handing it to a new allocation.
         hidden, masks = self._model.encoder(features, lengths)
         log_probs = self._model.ctc(hidden)  # (B, T_out, V)
         # masks: (B, 1, T_out) with True = valid
@@ -280,21 +271,6 @@ class ModelRunner:
             else:
                 fallback.append(req)
 
-        # NB: do NOT wrap with ``oasr.fmha.persistent_inputs()`` here.
-        # The engine's hot path doesn't actually reuse tensors across
-        # layers (``_attend_paged`` builds a fresh ``block_table_view``
-        # slice per layer; ``total_kv_lens`` is a new tensor per layer;
-        # Q/K/V projections are fresh per layer), so the descriptor cache
-        # has nothing to hit. Worse, the engine runs encoder kernels
-        # asynchronously without between-layer / between-step syncs --
-        # if the cache held a tensor that then gets released at context
-        # exit (storage returned to the torch CUDA caching allocator), an
-        # in-flight kernel reading from that storage races with the
-        # allocator handing the storage to the next step's allocation.
-        # That's the ``cudaErrorIllegalAddress`` we hit at B=32 streaming.
-        # ``persistent_inputs`` remains useful for callers that DO reuse
-        # tensors and synchronize between calls (benchmarks, ad-hoc loops);
-        # it's not appropriate for the async engine pipeline.
         if batchable:
             # Heterogeneous-offset batching: all batchable streams go into
             # one paged forward regardless of offset. FlexAttention's
