@@ -195,6 +195,14 @@ class Scheduler:
         admission so each batched paged forward sees length-similar
         utterances (lower padded-compute waste). With ``False``, admission
         follows ``schedule_policy`` ordering (FCFS / bucket / SJF).
+
+        When ``preferred_batch_size`` is set, the admit count is snapped
+        so that the resulting running pool size lands on a preferred
+        value (largest preferred ``<= len(_running) + n_avail``).  If no
+        preferred grouping is reachable, admit 0 and wait for more
+        arrivals — unless the oldest waiting stream has been queued
+        longer than ``max_wait_time``, in which case force-flush all
+        available so progress is bounded.
         """
         if budget <= 0 or not self._streaming_waiting:
             return []
@@ -204,8 +212,22 @@ class Scheduler:
         if cfg.streaming_cohort_admit or policy == "sjf":
             self._sort_by_length(self._streaming_waiting)
 
+        n_avail = min(budget, len(self._streaming_waiting))
+        if cfg.preferred_batch_size is not None:
+            candidate = len(self._running) + n_avail
+            target = self._snap_to_preferred(candidate)
+            n_admit = max(0, target - len(self._running))
+            if n_admit == 0:
+                oldest = self._streaming_waiting[0]
+                if oldest.waited_for >= cfg.max_wait_time:
+                    n_admit = n_avail
+                else:
+                    return []
+        else:
+            n_admit = n_avail
+
         admitted: List[Request] = []
-        while self._streaming_waiting and len(admitted) < budget:
+        while self._streaming_waiting and len(admitted) < n_admit:
             req = self._streaming_waiting.popleft()
             req.stream_id = self._next_stream_id
             self._next_stream_id += 1
@@ -228,6 +250,12 @@ class Scheduler:
         ``length_bucket_ratio``.  Requests whose ``waited_for`` exceeds
         ``max_wait_time`` become forced anchors — they ship next step
         regardless of whether length-similar peers are available.
+
+        When ``preferred_batch_size`` is set, the final batch size is
+        snapped down to a preferred value (unless force-flushed) so the
+        pipeline emits micro-batches at known graph-captured / autotuned
+        widths.  Trailing requests are returned to the head of the queue
+        for the next step — keeping length-similarity intact.
         """
         q = self._offline_waiting
         if not q:
@@ -240,11 +268,12 @@ class Scheduler:
         # Forced-flush anchor if the oldest request has waited too long.
         force_flush = q[0].waited_for >= cfg.max_wait_time
 
+        batch: List[Request]
         if policy == "fcfs":
-            batch: List[Request] = []
+            batch = []
             while q and len(batch) < cap:
                 batch.append(q.popleft())
-            return batch
+            return self._snap_offline_batch(batch, q, force_flush)
 
         if policy == "sjf" and not force_flush:
             self._sort_by_length(q)
@@ -259,7 +288,8 @@ class Scheduler:
         if force_flush:
             # Keep strict FIFO for this batch — don't reorder the queue just
             # because we've exceeded the wait deadline.
-            return self._fill_batch_fifo(batch, q, cap)
+            batch = self._fill_batch_fifo(batch, q, cap)
+            return self._snap_offline_batch(batch, q, force_flush=True)
 
         ratio = cfg.length_bucket_ratio
         pad_cap = cfg.max_offline_pad_ratio
@@ -288,7 +318,54 @@ class Scheduler:
             max_len = new_max
             del q[i]
 
+        return self._snap_offline_batch(batch, q, force_flush=False)
+
+    def _snap_offline_batch(
+        self,
+        batch: List[Request],
+        q: Deque[Request],
+        force_flush: bool,
+    ) -> List[Request]:
+        """Trim a built batch to a preferred batch size, when configured.
+
+        Returns the overflow back to the head of ``q`` preserving order so
+        the next step picks them up (length-similarity intact).  Skipped
+        entirely when ``preferred_batch_size`` is unset.  When ``force_flush``
+        is true the batch ships as-is — the wait-deadline overrides the
+        preferred-size constraint.
+        """
+        cfg = self._config
+        if cfg.preferred_batch_size is None or force_flush or not batch:
+            return batch
+        target = self._snap_to_preferred(len(batch))
+        if target == 0:
+            # Below the smallest preferred — hold everything and wait for
+            # more arrivals.  ``max_wait_time`` triggers force_flush above.
+            q.extendleft(reversed(batch))
+            return []
+        if target < len(batch):
+            overflow = batch[target:]
+            batch = batch[:target]
+            q.extendleft(reversed(overflow))
         return batch
+
+    def _snap_to_preferred(self, candidate: int) -> int:
+        """Largest configured preferred batch size ``<= candidate``.
+
+        Returns ``0`` when ``preferred_batch_size`` is unset/empty or when
+        ``candidate`` is below the smallest preferred value.  The config
+        normaliser guarantees ``preferred_batch_size`` is sorted ascending.
+        """
+        pbs = self._config.preferred_batch_size
+        if not pbs or candidate < pbs[0]:
+            return 0
+        snapped = 0
+        for v in pbs:
+            if v <= candidate:
+                snapped = v
+            else:
+                break
+        return snapped
 
     @staticmethod
     def _fill_batch_fifo(

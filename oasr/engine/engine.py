@@ -119,7 +119,29 @@ class ASREngine:
             depth=max(1, int(config.offline_pipeline_depth)),
             device=self._device,
             gpu_feature_extraction=bool(config.offline_gpu_feature_extraction),
+            preferred_sizes=config.preferred_batch_size,
         )
+
+        # Pre-warm the encoder CUDA-Graph cache at each preferred batch
+        # size so the first real chunk replays instead of capturing.  Skipped
+        # silently when graphs are off, the model_runner has no graph cache,
+        # or no preferred sizes are configured.  Best-effort: a failure here
+        # falls back to lazy capture on first traffic.
+        if (
+            config.preferred_batch_size
+            and self._device.type == "cuda"
+            and bool(config.use_cuda_graphs)
+        ):
+            try:
+                self._model_runner.prewarm_encoder_graphs(
+                    config.preferred_batch_size
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "Encoder graph pre-warm failed (will capture on first "
+                    "chunk instead): %s",
+                    exc,
+                )
 
         # Dedicated CUDA stream for the streaming fbank kernel.  Lets the
         # H2D waveform copy + batched fbank for the current step overlap

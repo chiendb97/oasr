@@ -302,6 +302,7 @@ prepare_offline                    prepare_streaming
 | Field | Default | Description |
 |-------|---------|-------------|
 | `max_batch_size` | 32 | Encoder forward `B`. In streaming mode caps the running pool; in offline mode is the GPU forward width of each pipeline micro-batch. Offline admission per `step()` is capped at `max_batch_size × offline_pipeline_depth`. |
+| `preferred_batch_size` | `None` | When set, scheduler snaps streaming admission and offline micro-batches to one of these sizes; engine pre-warms the encoder CUDA-Graph cache at each value; defaults `feature_graph_batch_buckets`. `max_wait_time` is the escape valve. See [scheduler.md §4.6](scheduler.md). |
 | `length_bucket_ratio` | 0.0 | Soft floor on `min_len/max_len` in offline batch. |
 | `max_offline_pad_ratio` | 4.0 | Hard cap on padded/useful compute. |
 | `max_wait_time` | 0.2 | Starvation bound (seconds). |
