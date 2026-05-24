@@ -41,6 +41,7 @@
 #include <cutlass/gemm/group_array_problem_shape.hpp>
 
 #include <oasr/common/epilogue_functors.h>
+#include <oasr/common/graph_safe_workspace.h>
 #include <oasr/common/utils.h>
 #include <oasr/gemm/cutlass_gemm_configs.h>
 #include <oasr/gemm/gemm_cutlass_template.h>
@@ -130,7 +131,7 @@ struct CutlassGemmKernelSm90 {
 
         // Query workspace size and allocate
         size_t workspace_size = gemm.get_workspace_size(arguments);
-        cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+        oasr::GraphSafeWorkspace workspace(workspace_size, stream);
 
         cutlass::Status status = gemm.can_implement(arguments);
         if (status != cutlass::Status::kSuccess) {
@@ -235,7 +236,7 @@ struct CutlassBmmKernelSm90 {
 
         // Query workspace size and allocate
         size_t workspace_size = gemm.get_workspace_size(arguments);
-        cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+        oasr::GraphSafeWorkspace workspace(workspace_size, stream);
 
         cutlass::Status status = gemm.can_implement(arguments);
         if (status != cutlass::Status::kSuccess) {
@@ -372,7 +373,7 @@ struct CutlassGroupGemmKernelSm90 {
 
         // Query workspace size and allocate
         size_t workspace_size = gemm.get_workspace_size(arguments);
-        cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+        oasr::GraphSafeWorkspace workspace(workspace_size, stream);
 
         cutlass::Status status = gemm.can_implement(arguments);
         if (status != cutlass::Status::kSuccess) {

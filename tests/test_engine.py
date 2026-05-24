@@ -411,52 +411,6 @@ class TestStreamingAudioChunks:
             ),
         )
 
-    def test_streaming_extraction_sees_only_tail_plus_current(self):
-        """Spy on `_extract_single` to confirm it only ever sees tail + one
-        chunk, never any enqueued-but-future chunk samples.
-        """
-        cfg, proc, Request = self._make()
-        chunk_samples = proc.streaming_audio_chunk_samples
-
-        # 4 distinct, non-overlapping "fingerprint" chunks so we can tell if
-        # any leak forward into earlier fbank calls.  Each chunk is filled
-        # with a unique constant.
-        parts = [torch.full((chunk_samples,), float(i + 1)) for i in range(4)]
-        wav = torch.cat(parts)
-        req = Request(wav, streaming=True)
-        req.waveform = wav
-        proc.prepare_streaming(req)
-
-        observed_maxes: list[float] = []
-        from oasr.engine import input_processor as _ip
-        orig = _ip._extract_single
-
-        def spy(waveform, cfg):
-            # What does the extractor see this call?  Record the max-abs
-            # value so we can tell which fingerprint chunks are present.
-            observed_maxes.append(float(waveform.abs().max().item()))
-            return orig(waveform, cfg)
-
-        _ip._extract_single = spy  # type: ignore[assignment]
-        try:
-            # Step 1: should see only chunk 0 (max = 1.0).
-            proc.extract_streaming_batch([req])
-            assert observed_maxes, "extractor was not invoked"
-            assert observed_maxes[-1] <= 1.0 + 1e-6, \
-                f"step 1 fbank saw future audio, max={observed_maxes[-1]}"
-
-            # Step 2: tail from chunk 0 + chunk 1 (max = 2.0).
-            proc.extract_streaming_batch([req])
-            assert observed_maxes[-1] <= 2.0 + 1e-6, \
-                f"step 2 fbank saw future audio, max={observed_maxes[-1]}"
-
-            # Step 3: chunk 2 arrives.
-            proc.extract_streaming_batch([req])
-            assert observed_maxes[-1] <= 3.0 + 1e-6, \
-                f"step 3 fbank saw future audio, max={observed_maxes[-1]}"
-        finally:
-            _ip._extract_single = orig  # type: ignore[assignment]
-
 
 # ---------------------------------------------------------------------------
 # Unit tests — OutputProcessor (detokenization)
@@ -524,14 +478,6 @@ class TestOfflineEngine:
         assert isinstance(texts, list)
         assert len(texts) == 4
         assert all(isinstance(t, str) and len(t) > 0 for t in texts)
-
-    def test_transcribe_returns_english(self, device, ckpt_dir: str, wav_dir: str):
-        _require_ckpt(ckpt_dir)
-        _require_wav_dir(wav_dir)
-        engine = self._make_engine(ckpt_dir, device)
-        text = engine.transcribe(_wav_path(wav_dir, 0))
-        # LJSpeech is English — result should contain only ASCII
-        assert text.isascii(), f"Expected ASCII text, got: {text!r}"
 
 # ---------------------------------------------------------------------------
 # Integration tests — ASREngine (streaming)

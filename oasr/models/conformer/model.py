@@ -246,6 +246,11 @@ class RelPositionalEncoding(nn.Module):
 class Conv2dSubsampling(nn.Module):
     """Conv2d subsampling module (e.g. 4x) + linear + positional encoding (WeNet Conv2dSubsampling4)."""
 
+    # v2 = ``self.out[0].weight`` columns reordered from WeNet's ``(C, F)``
+    # c-major flatten to NHWC's natural ``(F, C)`` f-major flatten so the
+    # forward path can skip ``permute(0, 1, 3, 2).contiguous()``.
+    _version = 2
+
     def __init__(
         self,
         idim: int,
@@ -290,14 +295,18 @@ class Conv2dSubsampling(nn.Module):
         unexpected_keys,
         error_msgs,
     ):
-        """Remap old nn.Sequential checkpoint keys to the new attribute names.
+        """Remap legacy keys and reorder the embed-linear weight.
 
-        Old layout (nn.Sequential):
-          conv.0.weight / conv.0.bias  →  conv1.weight / conv1.bias
-          conv.2.weight / conv.2.bias  →  conv2.weight / conv2.bias
-
-        Conv2dActivation's own _load_from_state_dict handles the
-        [K, IC, R, S] → [K, R, S, IC] weight permutation for both convs.
+        * Old ``nn.Sequential`` layout:
+          ``conv.0.{weight,bias}`` → ``conv1.{weight,bias}``;
+          ``conv.2.{weight,bias}`` → ``conv2.{weight,bias}``.
+          (Conv2dActivation's own ``_load_from_state_dict`` handles the
+          ``[K, IC, R, S] → [K, R, S, IC]`` weight permutation.)
+        * v1 → v2: the embed linear ``self.out[0].weight`` was trained
+          against a ``(C, F)`` c-major flatten of the NHWC conv output.
+          We now flatten in NHWC-natural ``(F, C)`` order at runtime, so
+          we permute the weight's input axis on load.  Driven by
+          ``local_metadata['version']`` (``< 2`` ⇒ legacy).
         """
         remap = {
             prefix + "conv.0.weight": prefix + "conv1.weight",
@@ -308,6 +317,25 @@ class Conv2dSubsampling(nn.Module):
         for old_key, new_key in remap.items():
             if old_key in state_dict:
                 state_dict[new_key] = state_dict.pop(old_key)
+
+        version = local_metadata.get("version", 1)
+        if version < 2 and self.conv1 is not None:
+            out_w_key = prefix + "out.0.weight"
+            if out_w_key in state_dict:
+                w = state_dict[out_w_key]                 # (odim, C*F)
+                odim, in_dim = w.shape
+                C = self.out[0].out_features              # conv output channels
+                assert in_dim % C == 0, (
+                    f"Conv2dSubsampling.out[0].weight in_dim={in_dim} not "
+                    f"divisible by C={C}"
+                )
+                F = in_dim // C
+                # Old col index: c*F + f  →  new col index: f*C + c.
+                state_dict[out_w_key] = (
+                    w.view(odim, C, F).transpose(1, 2).reshape(odim, F * C)
+                    .contiguous()
+                )
+
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict,
             missing_keys, unexpected_keys, error_msgs,
@@ -324,10 +352,9 @@ class Conv2dSubsampling(nn.Module):
             x = self.conv1(x)         # [N, T',  F', odim] NHWC (fused ReLU)
             x = self.conv2(x)         # [N, T'', F'', odim] NHWC (fused ReLU)
             b, t, f, c = x.size()
-            # Flatten in c-major order to match WeNet's NCHW-based convention
-            # (transpose(1,2).view on [b,c,t,f] == permute(0,1,3,2).view on [b,t,f,c])
-            x = x.permute(0, 1, 3, 2).contiguous().view(
-                b, t, c * f)  # [N, T'', odim*F'']
+            # NHWC-natural flatten: inner index is (f, c).  The embed
+            # linear's input axis is permuted at load time to match.
+            x = x.reshape(b, t, f * c)
             x_mask = x_mask[:, :, 2::2][:, :, 2::2]
         x = self.out(x)
         x, pos_emb = self.pos_enc(x, offset)
@@ -445,8 +472,7 @@ class ConformerEncoderLayer(nn.Module):
         residual = x
         if self.normalize_before:
             x = self.norm_mha(x)
-        x_att, new_att_cache = self.self_attn(
-            x, x, x, mask, pos_emb, att_cache)
+        x_att, new_att_cache = self.self_attn(x, mask, pos_emb, att_cache)
         x = residual + x_att
         if not self.normalize_before:
             x = self.norm_mha(x)

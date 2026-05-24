@@ -34,11 +34,21 @@ N_FEAT = 64
 D_K = N_FEAT // N_HEAD
 
 
+def _ref_qkv(attn, x):
+    """Replicate the module's fused-QKV projection (head-major (B, H, T, D))."""
+    B, T, _ = x.shape
+    qkv = attn.linear_qkv(x)
+    q, k, v = qkv.split(
+        (attn.inner_dim, attn.inner_kv_dim, attn.inner_kv_dim), dim=-1)
+    q = q.view(B, T, attn.h,    attn.d_k).transpose(1, 2)
+    k = k.view(B, T, attn.h_kv, attn.d_k).transpose(1, 2)
+    v = v.view(B, T, attn.h_kv, attn.d_k).transpose(1, 2)
+    return q, k, v
+
+
 def _ref_offline(attn, x, mask, pos_emb):
     """SDPA reference for the offline path."""
-    q = attn._project("query", x)
-    k = attn._project("key", x)
-    v = attn._project("value", x)
+    q, k, v = _ref_qkv(attn, x)
     n_batch_pos = pos_emb.size(0)
     p = attn.linear_pos(pos_emb).view(n_batch_pos, -1, attn.h, attn.d_k).transpose(1, 2)
     q_t = q.transpose(1, 2)
@@ -60,9 +70,7 @@ def _ref_paged(attn, x, pos_emb, cache: PagedKVCache):
     up to ``host_seqlen_max + T_q`` frames, then run SDPA with the
     ``(matrix_bd + padding_bias) / sqrt(d_k)`` mask.
     """
-    q = attn._project("query", x)
-    k_new = attn._project("key", x)
-    v_new = attn._project("value", x)
+    q, k_new, v_new = _ref_qkv(attn, x)
 
     cache_local = PagedKVCache(
         k_cache=cache.k_cache.clone(),
@@ -110,7 +118,7 @@ def test_offline_path_matches_sdpa(attn, device, B, T):
     mask = torch.zeros(B, 1, T, device=device)
 
     with torch.no_grad():
-        out_new, cache = attn(x, x, x, mask, pos_emb, cache=None)
+        out_new, cache = attn(x, mask, pos_emb, cache=None)
         out_ref = _ref_offline(attn, x, mask, pos_emb)
 
     assert cache is None
@@ -168,7 +176,7 @@ def test_paged_path_matches_sdpa(attn, device):
     with torch.no_grad():
         cache.k_cache.copy_(k_pool_save)
         cache.v_cache.copy_(v_pool_save)
-        out_new, _ = attn(x, x, x, torch.zeros((0, 0, 0), device=device), pos_emb, cache=cache)
+        out_new, _ = attn(x, torch.zeros((0, 0, 0), device=device), pos_emb, cache=cache)
         cache.k_cache.copy_(k_pool_save)
         cache.v_cache.copy_(v_pool_save)
         out_ref = _ref_paged(attn, x, pos_emb, cache)

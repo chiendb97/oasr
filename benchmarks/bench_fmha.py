@@ -21,8 +21,6 @@ from benchmarks.routines.attention import (
 )
 from benchmarks.routines.bench_utils import bench_fn
 
-import oasr
-
 DTYPES = [torch.float16, torch.bfloat16]
 DTYPE_NAMES = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
 
@@ -89,11 +87,7 @@ def _run_shape(sub, cfg, dtype):
     # Warm caches + first-call CuteDSL compile.
     cute_fn(); pt_fn()
     torch.cuda.synchronize()
-    # The bench reuses the same Q/K/V/out tensors across iters; reflect the
-    # engine's reality where descriptors stay cached for the duration of a
-    # streaming session.
-    with oasr.fmha.persistent_inputs():
-        cute_ms, _ = bench_fn(cute_fn)
+    cute_ms, _ = bench_fn(cute_fn)
     pt_ms,   _ = bench_fn(pt_fn)
     return cute_ms, pt_ms
 

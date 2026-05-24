@@ -17,23 +17,17 @@ Three cache modes are encoded in one signature:
 * **paged streaming** -- ``block_table is not None``  (k/v are pool views,
                          ``cache_seqlens`` required).
 
-Per-call wrapper overhead is kept low by:
-
-* Hoisting hot-path imports (``cuda.bindings.driver``, ``cutlass``,
-  ``from_dlpack``) to module scope so they cost nothing at call time.
-* Caching the CuteDSL descriptors for the "I'm not using this feature"
-  zero-rank dummy tensors per ``(dtype, device)``.
-* Reusing a process-cached ``cache_seqlens`` buffer in offline mode --
-  avoids a fresh ``torch.full((B,), T_k, ...)`` allocation per call.
-* Skipping ``.contiguous()`` when the tensor is already row-major.
-* A ``validate=False`` fast path for callers that have already proven
-  their inputs (the inference engine on the hot path, for example).
+The compiled CuteDSL callable is built with ``--enable-tvm-ffi`` (see
+``oasr/jit/attention.py``), so it accepts raw torch tensors at call time and
+is safe to capture into a ``torch.cuda.CUDAGraph``. This wrapper therefore
+only has to: pick the backend, normalise strides, pad bias for the kernel's
+CTA tile, and reuse a couple of small process-cached dummy tensors. A
+``validate=False`` fast path skips shape/dtype checks for callers that have
+already proven their inputs (the inference engine on the hot path).
 """
 
 from __future__ import annotations
 
-import contextlib
-import math
 from typing import Optional
 
 import torch
@@ -43,13 +37,7 @@ from .api_logging import oasr_api
 from .jit.attention import get_compiled_fmha, select_backend
 
 
-__all__ = ["fmha", "persistent_inputs"]
-
-
-# Expose persistent_inputs as an attribute of fmha for the
-# ``oasr.fmha.persistent_inputs()`` idiom (matches what's documented in the
-# `oasr/attention.py` docstring); the assignment lives after the function
-# definition below.
+__all__ = ["fmha"]
 
 
 # ---------------------------------------------------------------------------
@@ -58,21 +46,17 @@ __all__ = ["fmha", "persistent_inputs"]
 # The CuteDSL imports below pull in MLIR / compiler infra and are heavy
 # (~100-500 ms cold). We do them once at module-load so each fmha() call
 # pays nothing. On hosts without CuteDSL (CPU-only, doc builds), the
-# imports fail silently and ``_CUTE_AVAILABLE`` falls to False -- callers
-# transparently route through the SDPA fallback.
+# imports fail silently and callers transparently route through the SDPA
+# fallback via ``select_backend()``.
 
 try:
     import cuda.bindings.driver as _cuda_driver
     import cutlass as _cutlass
-    from cutlass.cute.runtime import from_dlpack as _from_dlpack
-    _CUTE_AVAILABLE = True
     _CUstream = _cuda_driver.CUstream
     _Float32 = _cutlass.Float32
 except Exception:
-    _CUTE_AVAILABLE = False
     _cuda_driver = None
     _cutlass = None
-    _from_dlpack = None
     _CUstream = None
     _Float32 = None
 
@@ -81,11 +65,9 @@ except Exception:
 # Module-scope caches for per-call constants
 # ---------------------------------------------------------------------------
 
-# Wrapped CuteDSL descriptors for the "no bias" / "no block_table"
-# zero-rank dummies. Built lazily per ``(dtype, device_index)`` -- a handful
-# of combos in practice. We keep both the underlying torch tensor and the
-# wrapped descriptor alive in module scope; the tensors are tiny and never
-# freed for the life of the process.
+# Process-cached zero-rank dummies for the "no bias" / "no block_table"
+# paths. The kernel never dereferences them, but cute still requires a
+# tensor of the right dtype/rank. Tiny and never freed.
 _dummy_bias_cache: dict = {}
 _dummy_block_table_cache: dict = {}
 
@@ -94,65 +76,19 @@ _dummy_block_table_cache: dict = {}
 # each fmha() call in offline mode.
 _seqlens_buffer_cache: dict = {}
 
-# ---------------------------------------------------------------------------
-# Persistent-inputs descriptor cache
-# ---------------------------------------------------------------------------
-# DLPack capsule extraction + ``.mark_layout_dynamic`` + ``.mark_compact_
-# shape_dynamic`` together cost ~5-10 us per tensor; on a 4-tensor (Q/K/V/O)
-# hot path with ~40 us kernel time, that's wrapper > kernel.
-#
-# When the caller is reusing the same tensors back-to-back (the inference
-# engine's chunked streaming loop, or a benchmark sweep), they can opt into
-# descriptor caching by entering :func:`persistent_inputs`. Inside that
-# context, ``_wrap`` looks up the (already-wrapped) descriptor by ``id(t)``
-# instead of redoing the DLPack chain. Outside the context the cache is
-# cleared and lookups fall back to the per-call wrap.
-#
-# We cache ``(tensor_ref, wrapped_descriptor)`` so the underlying tensor
-# can't be GC'd while the descriptor lives -- if id() were reused for a
-# different tensor we'd return a stale descriptor pointing at freed data.
-
-_descriptor_cache: dict = {}
-_persistent_depth: int = 0
-
-
-@contextlib.contextmanager
-def persistent_inputs():
-    """Cache wrapped CuteDSL descriptors keyed on ``id(tensor)``.
-
-    Enter this context when calling ``oasr.fmha(...)`` repeatedly with the
-    same Q/K/V/out/bias/block_table/cache_seqlens tensors (engine hot path,
-    benchmarks). The first call wraps as usual; subsequent calls hit the
-    cache and skip the DLPack + ``mark_*`` chain.
-
-    Nesting is supported; the cache is cleared only when the outermost
-    context exits. Holding the cache prevents GC of the cached tensors,
-    so don't enter the context around a tensor-allocation-heavy section.
-
-    Example::
-
-        with oasr.fmha.persistent_inputs():
-            for chunk in stream:
-                oasr.fmha(q, k_view, v_view, ..., out=out, validate=False)
-    """
-    global _persistent_depth
-    _persistent_depth += 1
-    try:
-        yield
-    finally:
-        _persistent_depth -= 1
-        if _persistent_depth == 0:
-            _descriptor_cache.clear()
+# Cute fmha CTA tile sizes (must match ``FmhaSm80._m_block_size`` /
+# ``_n_block_size`` defaults).  In the paged path the kernel reads the full
+# ``(M_BLOCK, N_BLOCK)`` bias tile without per-row T_q predication, so the
+# bias must be padded up to these multiples.  Under CUDA Graph capture the
+# allocator fragments the address space and an OOB read can land in an
+# unmapped segment, raising ``cudaErrorIllegalAddress``; padding keeps every
+# tile read in-bounds.
+_KERNEL_M_BLOCK = 64
+_KERNEL_N_BLOCK = 64
 
 
 def _get_dummy_bias(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    """Return a process-cached zero-rank torch tensor for the no-bias path.
-
-    The TVM-FFI compiled callable accepts torch tensors directly, so we
-    keep the dummy as a torch tensor (no per-call ``from_dlpack`` wrap).
-    ``has_bias=False`` kernels read ``mBias`` as a zero-rank tensor and
-    the kernel never dereferences it.
-    """
+    """Return a process-cached zero-rank torch tensor for the no-bias path."""
     key = (dtype, device.index if device.index is not None else 0)
     t = _dummy_bias_cache.get(key)
     if t is None:
@@ -218,87 +154,6 @@ def _ensure_canonical(t: torch.Tensor) -> torch.Tensor:
     if t.is_contiguous():
         return t.as_strided(t.shape, canonical)
     return t.contiguous()
-
-
-# cp.async with 128-bit copies requires the head-dim ptr 16B-aligned.
-# 128 / 16 = 8 for fp16 / bf16 (both 16-bit).
-_ALIGN_DIV_16B = 8
-
-
-def _wrap16(t: torch.Tensor):
-    """Wrap a 16-bit Q/K/V/O tensor with cp.async-friendly alignment.
-
-    Q/K/V are loaded via 128-bit ``cp.async`` G2S; O is stored via the
-    matching 128-bit universal copy. The leading head-dim axis is guaranteed
-    divisible by 8 (``can_implement`` enforces ``head_dim % 8 == 0``), so
-    we can tell the IR verifier so.
-    """
-    return (
-        _from_dlpack(t, assumed_align=16)
-        .mark_layout_dynamic(leading_dim=t.dim() - 1)
-        .mark_compact_shape_dynamic(
-            mode=t.dim() - 1,
-            stride_order=t.dim_order(),
-            divisibility=_ALIGN_DIV_16B,
-        )
-    )
-
-
-def _wrap_bias(t: torch.Tensor):
-    """Wrap a 16-bit attn_bias tensor.
-
-    Unlike Q/K/V/O, ``attn_bias`` is read scalar-style by
-    ``_add_bias_tile`` (one ``Float32(tBias_mn[r, c])`` per accumulator
-    element -- no cp.async, no ldmatrix, no 128-bit vector load). Its
-    trailing T_k axis is therefore allowed to be any positive integer
-    (e.g. 249 frames in a real audio batch), so we don't assert a
-    divisibility hint on the leading dim.
-    """
-    return _from_dlpack(t, assumed_align=16).mark_layout_dynamic(
-        leading_dim=t.dim() - 1
-    )
-
-
-def _wrap_seqlens(t: torch.Tensor):
-    return _from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-
-
-def _wrap_block_table(t: torch.Tensor):
-    return _from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=t.dim() - 1)
-
-
-def _cached(t: torch.Tensor, wrap_fn):
-    """Look up the wrapped descriptor by ``id(t)`` under
-    :func:`persistent_inputs`, otherwise wrap fresh.
-
-    The cache entry stores ``(tensor_ref, wrapped)`` so the tensor can't
-    be GC'd while we hold a stale descriptor for it.
-    """
-    if _persistent_depth == 0:
-        return wrap_fn(t)
-    tid = id(t)
-    entry = _descriptor_cache.get(tid)
-    if entry is not None and entry[0] is t:
-        return entry[1]
-    wrapped = wrap_fn(t)
-    _descriptor_cache[tid] = (t, wrapped)
-    return wrapped
-
-
-def _wrap16_cached(t):
-    return _cached(t, _wrap16)
-
-
-def _wrap_bias_cached(t):
-    return _cached(t, _wrap_bias)
-
-
-def _wrap_seqlens_cached(t):
-    return _cached(t, _wrap_seqlens)
-
-
-def _wrap_block_table_cached(t):
-    return _cached(t, _wrap_block_table)
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +366,14 @@ def fmha(
     if paged:
         H_kv = k.size(2)
         block_size = k.size(1)
+        # Pad the caller's bias up to the cute kernel's CTA tile and trim
+        # the block table to match.  The cute kernel reads the bias tile
+        # unpredicated; padding keeps every read in-bounds under CUDA Graph
+        # capture.  The SDPA fallback trims oversized bias, so this is
+        # backend-neutral.
+        attn_bias, block_table = _pad_paged_inputs(
+            attn_bias, block_table, block_size=block_size,
+        )
         T_k = block_table.size(1) * block_size
     else:
         H_kv = k.size(1)
@@ -531,7 +394,17 @@ def fmha(
             block_table = block_table.to(torch.int32)
 
     if out is None:
-        out = torch.empty_like(q)
+        # ``empty_like(q)`` preserves q's memory format: when q came from a
+        # transpose (non-canonical strides) the output buffer would inherit
+        # those strides, and ``_call_cute_dsl``'s ``_ensure_canonical`` would
+        # then copy into a fresh canonical buffer that the cute kernel writes
+        # to — leaving the caller's ``out`` reference uninitialised. Allocate
+        # the output directly in canonical contiguous_format so the kernel
+        # writes land in the tensor we hand back.
+        out = torch.empty(
+            q.shape, dtype=q.dtype, device=q.device,
+            memory_format=torch.contiguous_format,
+        )
 
     # ---- Backend dispatch ---------------------------------------------------
     backend = select_backend()
@@ -557,15 +430,51 @@ def fmha(
     )
 
 
-# Attach as ``oasr.fmha.persistent_inputs(...)`` so callers don't have to
-# remember the separate import path. ``oasr_api`` uses ``functools.wraps``,
-# so the wrapper object accepts attribute assignment.
-fmha.persistent_inputs = persistent_inputs
-
-
 # ---------------------------------------------------------------------------
 # CuteDSL kernel invocation
 # ---------------------------------------------------------------------------
+
+def _pad_paged_inputs(
+    attn_bias: Optional[torch.Tensor],
+    block_table: torch.Tensor,
+    *,
+    block_size: int,
+) -> tuple:
+    """Pad ``attn_bias`` and trim ``block_table`` to the kernel tile.
+
+    The cute fmha kernel reads the full ``(M_BLOCK, N_BLOCK)`` bias tile
+    without per-row predication, so the bias must be padded up to those
+    multiples or an OOB tile read can land in an unmapped segment under
+    CUDA Graph capture (``cudaErrorIllegalAddress``).  The block table is
+    trimmed to match so the kernel's ``ceil(T_kv / N_BLOCK)`` walk only
+    indexes the rows we actually populated.
+
+    No-op when ``attn_bias is None`` -- the kernel takes its own no-bias
+    path and uses ``cache_seqlens`` directly for the K-block bound.
+    """
+    if attn_bias is None:
+        return attn_bias, block_table
+
+    T_q = attn_bias.size(-2)
+    T_kv = attn_bias.size(-1)
+    T_q_padded = ((T_q + _KERNEL_M_BLOCK - 1) // _KERNEL_M_BLOCK) * _KERNEL_M_BLOCK
+    T_kv_padded = ((T_kv + _KERNEL_N_BLOCK - 1) // _KERNEL_N_BLOCK) * _KERNEL_N_BLOCK
+
+    if T_q_padded > T_q or T_kv_padded > T_kv:
+        B, H = attn_bias.shape[:2]
+        padded = torch.zeros(
+            B, H, T_q_padded, T_kv_padded,
+            dtype=attn_bias.dtype, device=attn_bias.device,
+        )
+        padded[:, :, :T_q, :T_kv] = attn_bias
+        attn_bias = padded
+
+    max_blocks_needed = T_kv_padded // block_size
+    if block_table.size(1) > max_blocks_needed:
+        block_table = block_table[:, :max_blocks_needed]
+
+    return attn_bias, block_table
+
 
 def _call_cute_dsl(
     q: torch.Tensor,
@@ -582,15 +491,16 @@ def _call_cute_dsl(
 ) -> torch.Tensor:
     """Invoke the TVM-FFI compiled CuteDSL kernel with raw torch tensors.
 
-    With ``options="--enable-tvm-ffi"`` baked into ``cute.compile`` and
-    ``enable_tvm_ffi=True`` passed at descriptor build time, the compiled
-    callable accepts torch tensors directly — no per-call ``from_dlpack``
-    wrappers needed. This is the same path Flash Attention's
-    ``flash_attn/cute`` uses; it is the only kernel-side call pattern
-    that is safe to capture into a ``torch.cuda.CUDAGraph`` and replay
-    across mutating chunks (the legacy per-call wrapper produces fresh
-    Python capsule objects whose ownership is freed between replays,
-    which causes the in-graph ``CUDA_ERROR_ILLEGAL_ADDRESS``).
+    ``oasr/jit/attention.py`` builds the callable with
+    ``cute.compile(..., options="--enable-tvm-ffi")`` and
+    ``from_dlpack(..., enable_tvm_ffi=True)``, so the compiled ``fn``
+    accepts torch tensors directly -- no per-call DLPack wrappers needed.
+    This is the same pattern Flash Attention's ``flash_attn/cute`` uses;
+    it is the only kernel-side call pattern that is safe to capture into
+    a ``torch.cuda.CUDAGraph`` and replay across mutating chunks (the
+    legacy per-call wrapper produced fresh Python capsule objects whose
+    ownership was freed between replays, causing in-graph
+    ``CUDA_ERROR_ILLEGAL_ADDRESS``).
     """
     dtype_str = "float16" if q.dtype is torch.float16 else "bfloat16"
     device = q.device
@@ -638,4 +548,12 @@ def _call_cute_dsl(
     # TVM-FFI compiled callable accepts torch tensors directly.
     fn(q_t, k_t, v_t, o_t, bias_t, seqlens_t, block_table_t,
        _Float32(float(softmax_scale)), stream)
+    # When ``out`` had non-canonical strides (e.g. caller passed a transpose
+    # view) ``_ensure_canonical`` allocated a fresh canonical buffer that the
+    # cute kernel writes to; copy the result back so the caller's reference
+    # observes the output. ``fmha``'s ``out is None`` path now allocates
+    # canonical-contiguous so this guard only fires when the caller hands in
+    # a non-canonical pre-allocated ``out``.
+    if o_t.data_ptr() != out.data_ptr():
+        out.copy_(o_t)
     return out
