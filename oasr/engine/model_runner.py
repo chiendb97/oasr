@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -112,6 +112,53 @@ class ModelRunner:
             )
         else:
             self._graph_cache = None
+
+    # ------------------------------------------------------------------
+    # Encoder graph pre-warm
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def prewarm_encoder_graphs(self, batch_sizes: Sequence[int]) -> None:
+        """Pre-capture ``GraphedEncoderForward`` at every B in ``batch_sizes``.
+
+        Triggers the lazy capture path with dummy zero-filled inputs so the
+        first real chunk at each preferred B replays instead of paying the
+        capture latency on the request path.  All captures use
+        ``cache_t1_bucket=0`` (empty cache) and ``T_input == window``; the
+        cache_t1 ladder is populated lazily on first traffic.
+
+        No-op when CUDA graphs are disabled, ``_graph_cache`` is ``None``,
+        or ``batch_sizes`` is empty.  Must be called **before** any stream
+        is allocated so the dummy ``slot_ids = arange(B)`` rows are
+        guaranteed unused — the persistent ``block_table`` and CNN buffer
+        rows default to zero, which is also what the warmup forward will
+        read.  ``GraphedEncoderForward._capture`` snapshots and restores the
+        CNN buffer rows it touches, so pre-warm is non-destructive.
+        """
+        if self._graph_cache is None or not batch_sizes:
+            return
+        seen: List[int] = sorted({int(b) for b in batch_sizes if int(b) >= 1})
+        if not seen:
+            return
+        cap = self._cache_config.max_batch_size
+        if seen[-1] > cap:
+            raise ValueError(
+                f"prewarm batch size {seen[-1]} exceeds max_batch_size {cap}"
+            )
+
+        device = self._att_mgr.block_table.device
+        window = self._config.decoding_window
+        feat_dim = self._config.feature_config.output_dim
+        dtype = self._cache_config.dtype
+
+        for B in seen:
+            slot_ids = torch.arange(B, dtype=torch.long, device=device)
+            offsets = torch.zeros(B, dtype=torch.int32, device=device)
+            xs = torch.zeros(B, window, feat_dim, dtype=dtype, device=device)
+            self._graph_cache.replay(
+                B, window, 0,
+                xs=xs, slot_ids=slot_ids, offsets=offsets,
+            )
 
     # ------------------------------------------------------------------
     # Offline forward

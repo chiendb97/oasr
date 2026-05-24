@@ -33,7 +33,7 @@ from __future__ import annotations
 import queue
 import threading
 from concurrent.futures import Future
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -54,6 +54,7 @@ class OfflinePipeline:
         device: torch.device,
         sort_by_length: bool = True,
         gpu_feature_extraction: bool = True,
+        preferred_sizes: Optional[Sequence[int]] = None,
     ) -> None:
         self._inp = input_processor
         self._mr = model_runner
@@ -64,6 +65,16 @@ class OfflinePipeline:
         self._sort_by_length = sort_by_length
         self._gpu_feat = bool(gpu_feature_extraction) and device.type == "cuda"
         self._dtype: torch.dtype = input_processor._config.dtype
+        # Sorted ascending list of preferred chunk widths.  When set,
+        # ``_split_chunks`` greedily peels off chunks of the largest
+        # preferred value ``<= remaining``; the tail (always smaller than
+        # ``min(preferred_sizes)``, rare when the scheduler also snaps)
+        # ships as one final odd chunk.  ``None`` keeps the legacy
+        # balanced even-split behaviour.
+        self._preferred_sizes: Optional[List[int]] = (
+            sorted({int(v) for v in preferred_sizes if int(v) >= 1})
+            if preferred_sizes else None
+        )
         # Dedicated stream so GPU-side fbank of chunk k+1 can overlap with
         # the encoder forward + CTC decode of chunk k on the default stream.
         # Only created in GPU-feature mode; in CPU-feature mode the H2D
@@ -123,7 +134,10 @@ class OfflinePipeline:
         n = len(batch)
         mb = self._micro_batch_size
 
-        if n <= mb:
+        # Skip the short-circuit when preferred sizes are configured —
+        # we still want the greedy snap (e.g. n=7, mb=8, PBS=[4] should
+        # yield [4, 3] not [7]) below.
+        if n <= mb and not self._preferred_sizes:
             return [list(batch)], None
 
         if self._sort_by_length:
@@ -134,16 +148,43 @@ class OfflinePipeline:
             ordered = list(batch)
             orig_indices = None
 
-        # Balance: avoid a tiny trailing micro-batch that wastes launch overhead.
-        nchunks = (n + mb - 1) // mb
-        base, rem = divmod(n, nchunks)
         chunks: List[List[Request]] = []
-        idx = 0
-        for i in range(nchunks):
-            size = base + (1 if i < rem else 0)
-            chunks.append(ordered[idx: idx + size])
-            idx += size
+        if self._preferred_sizes:
+            # Greedy snap: each chunk is the largest preferred value that
+            # fits the remaining count, capped by ``mb``.  Scheduler
+            # snapping makes the tail rare; when present it ships as one
+            # final odd chunk.
+            idx = 0
+            while idx < n:
+                remaining = n - idx
+                size = self._snap_to_preferred(min(remaining, mb))
+                if size == 0:
+                    size = remaining  # tail < min(preferred); one odd chunk.
+                chunks.append(ordered[idx: idx + size])
+                idx += size
+        else:
+            # Balance: avoid a tiny trailing micro-batch that wastes launch overhead.
+            nchunks = (n + mb - 1) // mb
+            base, rem = divmod(n, nchunks)
+            idx = 0
+            for i in range(nchunks):
+                size = base + (1 if i < rem else 0)
+                chunks.append(ordered[idx: idx + size])
+                idx += size
         return chunks, orig_indices
+
+    def _snap_to_preferred(self, candidate: int) -> int:
+        """Largest preferred chunk size ``<= candidate``; 0 if none fits."""
+        pbs = self._preferred_sizes
+        if not pbs or candidate < pbs[0]:
+            return 0
+        snapped = 0
+        for v in pbs:
+            if v <= candidate:
+                snapped = v
+            else:
+                break
+        return snapped
 
     # ------------------------------------------------------------------
     # Execution modes

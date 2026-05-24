@@ -31,16 +31,17 @@ class ASREngine:
     Handles both streaming (chunk-by-chunk with paged KV cache) and offline
     (single-pass batched) requests in one step loop.  Each step:
 
-    1. **Schedule** — admit up to ``max_offline_batch_size`` waiting offline
-       requests and admit waiting streaming requests up to
-       ``max_batch_size``.
+    1. **Schedule** — admit waiting streaming requests up to
+       ``max_batch_size``, or admit up to
+       ``max_batch_size * offline_pipeline_depth`` waiting offline
+       requests (the service runs in one mode at a time).
     2. **Ingest** — batched GPU fbank across every active stream's next
        pending audio chunk (one kernel call for the whole running pool,
        no stream ever sees audio beyond its own enqueued chunks).
     3. **Forward** — route the admitted offline batch through the
        pipelined :class:`OfflinePipeline` (length-bucketed micro-batches
-       of size ``offline_micro_batch_size`` overlap GPU feature extraction
-       with encoder forward + CTC decode) and run one encoder chunk per
+       of size ``max_batch_size`` overlap GPU feature extraction with
+       encoder forward + CTC decode) and run one encoder chunk per
        streaming request whose buffer now holds a full window.
     4. **Postprocess** — decode log-probs and finalise completed requests.
 
@@ -107,19 +108,40 @@ class ASREngine:
         self._output_processor = OutputProcessor(config)
 
         # Offline execution pipeline — handles CPU/GPU overlap and
-        # length-bucketed micro-batching internally.
-        micro = int(config.offline_micro_batch_size or 0)
-        if micro <= 0:
-            micro = min(config.max_offline_batch_size, 32)
+        # length-bucketed micro-batching internally.  Forward width is
+        # ``max_batch_size`` (the same knob streaming uses); the service
+        # never runs both modes simultaneously.
         self._offline_pipeline = OfflinePipeline(
             input_processor=self._input_processor,
             model_runner=self._model_runner,
             output_processor=self._output_processor,
-            micro_batch_size=micro,
+            micro_batch_size=int(config.max_batch_size),
             depth=max(1, int(config.offline_pipeline_depth)),
             device=self._device,
             gpu_feature_extraction=bool(config.offline_gpu_feature_extraction),
+            preferred_sizes=config.preferred_batch_size,
         )
+
+        # Pre-warm the encoder CUDA-Graph cache at each preferred batch
+        # size so the first real chunk replays instead of capturing.  Skipped
+        # silently when graphs are off, the model_runner has no graph cache,
+        # or no preferred sizes are configured.  Best-effort: a failure here
+        # falls back to lazy capture on first traffic.
+        if (
+            config.preferred_batch_size
+            and self._device.type == "cuda"
+            and bool(config.use_cuda_graphs)
+        ):
+            try:
+                self._model_runner.prewarm_encoder_graphs(
+                    config.preferred_batch_size
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "Encoder graph pre-warm failed (will capture on first "
+                    "chunk instead): %s",
+                    exc,
+                )
 
         # Dedicated CUDA stream for the streaming fbank kernel.  Lets the
         # H2D waveform copy + batched fbank for the current step overlap

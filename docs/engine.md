@@ -97,7 +97,7 @@ step():
 `OfflinePipeline.run` then:
 
 1. Length-bucket and split into micro-batches of size
-   `offline_micro_batch_size` each.
+   `max_batch_size` each.
 2. Pad and ship features to the device (or run batched GPU fbank on a
    dedicated CUDA stream).
 3. Pipeline depth `D` allows up to `D` micro-batches in flight: a
@@ -301,14 +301,13 @@ prepare_offline                    prepare_streaming
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_batch_size` | 32 | Concurrent streaming requests. |
-| `max_offline_batch_size` | 1024 | Offline requests admitted per step. |
+| `max_batch_size` | 32 | Encoder forward `B`. In streaming mode caps the running pool; in offline mode is the GPU forward width of each pipeline micro-batch. Offline admission per `step()` is capped at `max_batch_size × offline_pipeline_depth`. |
+| `preferred_batch_size` | `None` | When set, scheduler snaps streaming admission and offline micro-batches to one of these sizes; engine pre-warms the encoder CUDA-Graph cache at each value; defaults `feature_graph_batch_buckets`. `max_wait_time` is the escape valve. See [scheduler.md §4.6](scheduler.md). |
 | `length_bucket_ratio` | 0.0 | Soft floor on `min_len/max_len` in offline batch. |
 | `max_offline_pad_ratio` | 4.0 | Hard cap on padded/useful compute. |
 | `max_wait_time` | 0.2 | Starvation bound (seconds). |
 | `schedule_policy` | `"bucket"` | `fcfs` / `bucket` / `sjf`. |
 | `streaming_cohort_admit` | `True` | Admit only when running pool offsets align — enables full `B` batched paged forward. |
-| `offline_micro_batch_size` | 32 | GPU forward `B` for the offline pipeline. |
 | `offline_pipeline_depth` | 3 | In-flight micro-batches (1 = sequential). |
 | `offline_gpu_feature_extraction` | `True` | Batched GPU fbank vs CPU pool. |
 
@@ -395,8 +394,7 @@ final = engine.run()                  # drain until finalised
 ### 7.4 Mixed offline + streaming on one engine
 
 ```python
-engine = ASREngine(EngineConfig(ckpt_dir=..., max_batch_size=8,
-                                max_offline_batch_size=64))
+engine = ASREngine(EngineConfig(ckpt_dir=..., max_batch_size=8))
 for path in offline_paths:
     engine.add_request(path, streaming=False)
 for path in streaming_paths:

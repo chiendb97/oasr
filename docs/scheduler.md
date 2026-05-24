@@ -90,7 +90,7 @@ The engine's step loop reads:
 ```
 q = _offline_waiting
 if q empty: return []
-cap = max(1, max_offline_batch_size)
+cap = max(1, max_batch_size * offline_pipeline_depth)
 policy = config.schedule_policy
 
 force_flush = q[0].waited_for >= max_wait_time
@@ -213,6 +213,48 @@ than ~`max_wait_time + step_duration`. The default `max_wait_time=0.2s`
 keeps p99 latency bounded while still letting normal-load batches
 collect ideal length-similar peers.
 
+### 4.6 Preferred batch sizes (Triton-style)
+
+`preferred_batch_size: Optional[List[int]]` constrains both queues to
+admit batches only at the listed B values. The smallest preferred value
+is the *minimum* batch size the scheduler will emit; the largest is the
+effective ceiling (must be `<= max_batch_size`, which remains the hard
+cap on KV / slot-pool resources).
+
+```
+# Streaming admission:
+n_avail   = min(budget, len(_streaming_waiting))
+candidate = len(_running) + n_avail
+target    = largest preferred <= candidate          # 0 if candidate < min preferred
+n_admit   = max(0, target - len(_running))
+if n_admit == 0:
+    if oldest waiting >= max_wait_time: n_admit = n_avail   # force-flush
+    else: n_admit = 0
+
+# Offline batch (applied after _build_offline_batch finishes):
+target = largest preferred <= len(batch)
+if target == 0 and not force_flush: requeue everything, return []
+if target < len(batch):           requeue overflow to head of queue
+```
+
+`max_wait_time` is the escape valve: when no preferred grouping is
+reachable but the oldest request has waited too long, the scheduler
+ships whatever is available even if the resulting size is not preferred.
+Force-flushed batches bypass the preferred-size trim too — the wait
+deadline outranks the size constraint.
+
+When set, `preferred_batch_size` also:
+
+- Drives the encoder CUDA-Graph pre-warm in `ASREngine.__init__`
+  (`ModelRunner.prewarm_encoder_graphs(...)`) so the first real chunk at
+  each preferred B replays a captured graph instead of paying capture
+  latency on the request path.
+- Defaults `feature_graph_batch_buckets` to the same list, so the
+  encoder graph cache and the feature graph cache share one B ladder.
+- Snaps `OfflinePipeline._split_chunks` to the preferred sizes — each
+  micro-batch is the largest preferred value `<= remaining`, falling
+  back to the remainder for the (rare) trailing odd chunk.
+
 ## 5. Data Flow
 
 ```
@@ -248,8 +290,8 @@ All scheduler-relevant knobs live on `EngineConfig`:
 
 | Option | Default | Effect |
 |--------|---------|--------|
-| `max_batch_size` | 32 | Cap on concurrent running streaming requests. |
-| `max_offline_batch_size` | 1024 | Max offline requests admitted per step. The pipeline then splits this into `offline_micro_batch_size` micro-batches internally. |
+| `max_batch_size` | 32 | Encoder forward batch size — caps the running streaming pool **and** is the GPU forward width of each offline pipeline micro-batch. Offline admission per step is capped at `max_batch_size × offline_pipeline_depth`, enough to keep the pipeline producer one depth ahead of the consumer. Remains the hard cap on resources when `preferred_batch_size` is set. |
+| `preferred_batch_size` | `None` | Triton-style preferred B values. When set, streaming admission and offline batch construction snap to one of these sizes; `max_wait_time` is the escape valve. Also drives encoder CUDA-Graph pre-warm and defaults `feature_graph_batch_buckets`. All values must be `<= max_batch_size`. `None` keeps the legacy "admit greedily" behaviour. |
 | `length_bucket_ratio` | 0.0 | Soft floor on `min_len/max_len` inside a bucket. `0` disables. |
 | `max_offline_pad_ratio` | 4.0 | Hard cap on `(max_len × B) / sum_len`. `0` disables. |
 | `max_wait_time` | 0.2 s | Starvation bound: oldest offline request triggers forced flush. |
@@ -339,8 +381,9 @@ while sched.has_pending():
 1. **`add_request` is O(1)** when `priority == 0` (default), O(N) only
    for non-default priorities.
 2. **`schedule()` is O(N_offline)** per call where N_offline is the
-   waiting queue length, bounded by `max_offline_batch_size`. It does
-   one `_sort_by_length` (O(N log N)) for SJF or cohort admission with
+   waiting queue length, bounded by
+   `max_batch_size × offline_pipeline_depth`. It does one
+   `_sort_by_length` (O(N log N)) for SJF or cohort admission with
    length-similar streams.
 3. **`find_request` / `abort_request` are O(1)** thanks to `_index`.
 4. **No GPU work.** The scheduler is pure Python on dataclasses; it is
@@ -351,10 +394,12 @@ while sched.has_pending():
    `_forward_batched_paged` can take the full `B` path on every step.
    On low-concurrency or interactive workloads it adds idle time at
    cohort boundaries — measure both on your traffic before deciding.
-6. **Avoid huge `max_offline_batch_size`** if the GPU cannot keep up —
-   the scheduler will admit them, the pipeline will queue them, and
-   memory pressure rises. Pair admission size with
-   `offline_micro_batch_size × offline_pipeline_depth`.
+6. **Offline admission scales with `max_batch_size × offline_pipeline_depth`.**
+   That is the smallest number that keeps `offline_pipeline_depth`
+   micro-batches in flight without starving the GPU consumer. Increase
+   `offline_pipeline_depth` (default 3) before reaching for a larger
+   admission window — depths above 3 rarely help because CPU prep is
+   only ever 1–2 micro-batches ahead in steady state.
 
 ## 10. Extension Points
 
