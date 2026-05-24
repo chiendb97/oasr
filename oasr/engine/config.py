@@ -40,7 +40,10 @@ class EngineConfig:
         Number of past chunks to keep in the attention cache.
         ``-1`` means unlimited (keep all history).
     max_batch_size : int
-        Maximum number of concurrent streaming requests in a single step.
+        Encoder forward batch size.  In streaming mode it caps the running
+        pool and sizes the paged KV cache; in offline mode it is the GPU
+        forward width of each pipeline micro-batch.  The service runs in
+        one mode at a time, never both.
     max_num_blocks : int
         Total number of physical KV-cache blocks in the shared block pool.
         Should satisfy ``max_num_blocks >= max_batch_size * max_blocks_per_seq``.
@@ -83,15 +86,15 @@ class EngineConfig:
     num_left_chunks: int = -1
 
     # Batching
+    # Encoder forward batch size — used in both modes since the service runs
+    # streaming OR offline (never both at once).  In streaming mode it caps
+    # the running pool, sizes the paged KV cache, and is the captured
+    # CUDA-Graph B.  In offline mode it is the GPU forward width of each
+    # micro-batch in :class:`OfflinePipeline`; the scheduler admits up to
+    # ``max_batch_size * offline_pipeline_depth`` requests per ``step()`` so
+    # the pipeline producer always has enough work queued to keep
+    # ``offline_pipeline_depth`` micro-batches in flight.
     max_batch_size: int = 32
-    # Maximum number of offline requests the scheduler admits per ``step()``
-    # call.  With the pipelined offline executor, all admitted requests flow
-    # through a producer/consumer pipeline that internally splits them into
-    # GPU-forward micro-batches of ``offline_micro_batch_size``.  Admitting
-    # many requests per step (rather than per-forward-batch) lets CPU feature
-    # prep for later micro-batches overlap with earlier-micro-batch GPU work
-    # without being gated by the step-loop boundary.
-    max_offline_batch_size: int = 1024
     # Length-bucket tolerance for offline batching.  Requests are grouped so
     # that ``min_len / max_len >= length_bucket_ratio`` within a batch,
     # bounding padded-compute waste.  ``0`` disables this ratio entirely and
@@ -128,13 +131,6 @@ class EngineConfig:
     # cohort transitions.  Set to ``False`` for maximally responsive
     # admission (one new request per freed slot).
     streaming_cohort_admit: bool = True
-    # GPU forward batch size for the offline pipeline.  Each admitted offline
-    # request is routed through a length-bucketed micro-batch of at most this
-    # many requests, which determines the B dimension of the padded encoder
-    # forward pass.  Smaller values reduce padded-compute waste but under-use
-    # the GPU; larger values amortise launch overhead but pad more.  ``0``
-    # falls back to ``min(max_offline_batch_size, 32)`` at engine-init time.
-    offline_micro_batch_size: int = 32
     # How many offline micro-batches to keep in flight at once.  ``1`` runs
     # sequentially (no threading, no CPU/GPU overlap).  ``2+`` runs CPU
     # feature prep for micro-batch ``k+1`` on a background thread while GPU

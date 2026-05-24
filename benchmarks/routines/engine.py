@@ -39,9 +39,9 @@ SUBROUTINES = ["offline", "streaming", "offline_wfst", "streaming_wfst"]
 
 DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
     "offline": [
-        {"num_utterances": 10, "batch_size": 1},
-        {"num_utterances": 10, "batch_size": 4},
-        {"num_utterances": 10, "batch_size": 8},
+        {"num_utterances": 10, "max_batch_size": 1},
+        {"num_utterances": 10, "max_batch_size": 4},
+        {"num_utterances": 10, "max_batch_size": 8},
     ],
     "streaming": [
         {"num_utterances": 10, "chunk_size": 8},
@@ -49,7 +49,7 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
         {"num_utterances": 10, "chunk_size": 32},
     ],
     "offline_wfst": [
-        {"num_utterances": 10, "batch_size": 4},
+        {"num_utterances": 10, "max_batch_size": 4},
     ],
     "streaming_wfst": [
         {"num_utterances": 10, "chunk_size": 16},
@@ -149,16 +149,15 @@ def _time_offline(
     engine: OfflineEngine,
     waveforms: List[torch.Tensor],
     durations: List[float],
-    batch_size: int,
     num_iters: int,
 ) -> tuple[float, float, float]:
     """Time OfflineEngine over pre-loaded *waveforms*.
 
     The full waveform list is handed to ``engine.transcribe`` in one call so
     the engine's offline pipeline can overlap CPU feature prep for later
-    micro-batches with GPU forward+decode for earlier ones.  ``batch_size`` is
-    interpreted as the GPU forward micro-batch size and is forwarded to the
-    engine via ``offline_micro_batch_size``; processing the full list in one
+    micro-batches with GPU forward+decode for earlier ones.  The GPU forward
+    width comes from ``EngineConfig.max_batch_size`` (configured by the
+    caller before ``engine`` is built); processing the full list in one
     call instead of chunking at the benchmark layer is what lets the
     producer thread keep the GPU continuously fed.
 
@@ -351,7 +350,6 @@ def _run_config(
     audio_dir: str,
     fst_file: Optional[str],
     num_utterances: int,
-    batch_size: int,
     chunk_size: int,
     num_left_chunks: int,
     max_batch_size: int = 32,
@@ -423,13 +421,13 @@ def _run_config(
                 dtype=dtype,
                 decoder_type=decoder_type,
                 fst_path=fst_file,
-                offline_micro_batch_size=batch_size,
+                max_batch_size=max_batch_size,
             )
             engine = OfflineEngine(cfg)
-            shape_str = f"N={n}, batch={batch_size}, avg_dur={avg_dur:.1f}s"
+            shape_str = f"N={n}, batch={max_batch_size}, avg_dur={avg_dur:.1f}s"
             _warmup_engine(engine, waveforms, is_streaming=False)
             median_ms, std_ms, rtf = _time_offline(
-                engine, waveforms, durations, batch_size, num_iters)
+                engine, waveforms, durations, num_iters)
     except Exception as exc:
         print(f"  [ERROR] {subroutine}: {exc}")
         import traceback
@@ -490,16 +488,12 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
         help="Number of .wav files to include per benchmark run (default: 10)",
     )
     parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=None,
-        help="Utterances per OfflineEngine.transcribe() call (default: sweep 1/4/8)",
-    )
-    parser.add_argument(
         "--max-batch-size",
         type=int,
-        default=32,
-        help="Max concurrent streaming requests in the ASREngine scheduler (default: 32)",
+        default=None,
+        help="Encoder forward batch size — streaming concurrent pool cap "
+             "and offline pipeline micro-batch width. "
+             "Default: 32 for streaming; sweep 1/4/8 for offline.",
     )
     parser.add_argument(
         "--chunk-size",
@@ -522,8 +516,7 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     audio_dir = getattr(args, "audio_dir", None)
     wfst_path = getattr(args, "wfst_path", None)
     num_utterances = getattr(args, "num_utterances", 10) or 10
-    batch_size = getattr(args, "batch_size", None)
-    max_batch_size = getattr(args, "max_batch_size", 32) or 32
+    max_batch_size = getattr(args, "max_batch_size", None)
     chunk_size = getattr(args, "chunk_size", None)
     num_left_chunks = getattr(args, "num_left_chunks", -1)
     dtype_str = getattr(args, "dtype", "float16") or "float16"
@@ -540,6 +533,9 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     from benchmarks.routines.bench_utils import parse_dtype
     dtype = parse_dtype(dtype_str)
 
+    is_streaming = subroutine.startswith("streaming")
+    default_mbs = 32 if is_streaming else 4
+
     for cfg in _resolve_configs(args, subroutine):
         _run_config(
             subroutine=subroutine,
@@ -547,10 +543,11 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
             audio_dir=audio_dir,
             fst_file=fst_file,
             num_utterances=cfg.get("num_utterances", num_utterances),
-            batch_size=cfg.get("batch_size", batch_size or 4),
             chunk_size=cfg.get("chunk_size", chunk_size or 16),
             num_left_chunks=num_left_chunks,
-            max_batch_size=max_batch_size,
+            max_batch_size=cfg.get(
+                "max_batch_size", max_batch_size if max_batch_size else default_mbs
+            ),
             dtype=dtype,
             num_iters=num_iters,
             output=output,
@@ -566,11 +563,14 @@ def _resolve_configs(
     fall back to DEFAULT_CONFIGS.
     """
     num_utterances = getattr(args, "num_utterances", None)
-    batch_size = getattr(args, "batch_size", None)
+    max_batch_size = getattr(args, "max_batch_size", None)
     chunk_size = getattr(args, "chunk_size", None)
 
-    if subroutine in ("offline", "offline_wfst") and batch_size is not None:
-        return [{"num_utterances": num_utterances or 10, "batch_size": batch_size}]
+    if subroutine in ("offline", "offline_wfst") and max_batch_size is not None:
+        return [{
+            "num_utterances": num_utterances or 10,
+            "max_batch_size": max_batch_size,
+        }]
     if subroutine in ("streaming", "streaming_wfst") and chunk_size is not None:
         return [{"num_utterances": num_utterances or 10, "chunk_size": chunk_size}]
 
@@ -620,11 +620,10 @@ Examples:
     )
     parser.add_argument("--num-utterances", type=int, default=10,
                         help="Number of .wav files per run (default: 10)")
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="Utterances per OfflineEngine.transcribe() call (default: 4)")
-    parser.add_argument("--max-batch-size", type=int, default=32,
-                        help="Max concurrent streaming requests in the ASREngine scheduler "
-                             "(default: 32)")
+    parser.add_argument("--max-batch-size", type=int, default=None,
+                        help="Encoder forward batch size — streaming concurrent pool "
+                             "cap and offline pipeline micro-batch width. "
+                             "Default: 32 for streaming, 4 for offline.")
     parser.add_argument("--chunk-size", type=int, default=16,
                         help="Encoder chunk size for streaming (default: 16)")
     parser.add_argument("--num-left-chunks", type=int, default=-1,
@@ -650,16 +649,20 @@ Examples:
     output = OutputWriter(output_path=args.output_path)
     output.write_header("OASR ASR Engine Benchmark")
 
+    explicit_mbs = args.max_batch_size is not None
+
     for sub in args.subroutines:
         output.write_header(f"--- {sub} ---")
+        is_streaming = sub.startswith("streaming")
+        default_mbs = 32 if is_streaming else 4
+        max_batch_size = args.max_batch_size if explicit_mbs else default_mbs
         _run_config(
             subroutine=sub,
             ckpt_dir=args.ckpt_dir,
             audio_dir=args.audio_dir,
             fst_file=fst_file,
             num_utterances=args.num_utterances,
-            batch_size=args.batch_size,
-            max_batch_size=args.max_batch_size,
+            max_batch_size=max_batch_size,
             chunk_size=args.chunk_size,
             num_left_chunks=args.num_left_chunks,
             dtype=dtype,

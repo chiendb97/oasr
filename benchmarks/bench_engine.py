@@ -6,12 +6,12 @@
 Measures Real-Time Factor (RTF), latency, and throughput for the ASR
 inference engine across offline and streaming decoding modes.
 
-Batch-size arguments
---------------------
---batch-size       Utterances per ``OfflineEngine.transcribe()`` call.
-                   Affects GPU memory and batched-forward throughput.
---max-batch-size   Max concurrent streaming requests in the ASREngine scheduler.
-                   Affects streaming throughput when multiple utterances overlap.
+Batch-size argument
+-------------------
+--max-batch-size   Encoder forward batch size — in streaming mode caps the
+                   concurrent running pool in the ASREngine scheduler; in
+                   offline mode is the GPU forward width of each pipeline
+                   micro-batch.  The service runs one mode at a time.
 
 Examples
 --------
@@ -25,7 +25,7 @@ python benchmarks/bench_engine.py \\
     --ckpt-dir CKPT_DIR \\
     --audio-dir WAV_DIR \\
     --subroutines offline \\
-    --batch-size BATCH_SIZE \\
+    --max-batch-size MAX_BATCH_SIZE \\
     --num-utterances NUM_UTTERANCES
 
 # Streaming — custom chunk + concurrency
@@ -106,20 +106,13 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Control how many utterances are processed together.",
     )
     batch_group.add_argument(
-        "--batch-size",
+        "--max-batch-size",
         type=int,
         default=None,
         metavar="N",
-        help="Utterances per OfflineEngine.transcribe() call "
-             "(default: sweep 1 / 4 / 8 when unset)",
-    )
-    batch_group.add_argument(
-        "--max-batch-size",
-        type=int,
-        default=32,
-        metavar="N",
-        help="Max concurrent streaming requests in the ASREngine scheduler "
-             "(default: 32)",
+        help="Encoder forward batch size — streaming concurrent pool cap "
+             "and offline pipeline micro-batch width. "
+             "Default: 32 for streaming, 4 for offline.",
     )
 
     # --- Streaming / chunking ---
@@ -203,18 +196,24 @@ def main() -> None:
     }
     dtype = dtype_map[args.dtype]
 
+    # When the user does not override --max-batch-size, the sweep configs in
+    # routines/engine.py drive the value per-config (offline: 1/4/8, streaming: 32).
+    explicit_mbs = args.max_batch_size is not None
+
     for sub in args.subroutines:
         output.write_header(f"--- {sub} ---")
+        is_streaming = sub.startswith("streaming")
+        default_mbs = 32 if is_streaming else 4
+        max_batch_size = args.max_batch_size if explicit_mbs else default_mbs
         _run_config(
             subroutine=sub,
             ckpt_dir=args.ckpt_dir,
             audio_dir=args.audio_dir,
             fst_file=fst_file,
             num_utterances=args.num_utterances,
-            batch_size=args.batch_size or 4,
             chunk_size=args.chunk_size or 16,
             num_left_chunks=args.num_left_chunks,
-            max_batch_size=args.max_batch_size,
+            max_batch_size=max_batch_size,
             num_iters=args.num_iters,
             dtype=dtype,
             output=output,

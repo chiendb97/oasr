@@ -90,7 +90,7 @@ The engine's step loop reads:
 ```
 q = _offline_waiting
 if q empty: return []
-cap = max(1, max_offline_batch_size)
+cap = max(1, max_batch_size * offline_pipeline_depth)
 policy = config.schedule_policy
 
 force_flush = q[0].waited_for >= max_wait_time
@@ -248,8 +248,7 @@ All scheduler-relevant knobs live on `EngineConfig`:
 
 | Option | Default | Effect |
 |--------|---------|--------|
-| `max_batch_size` | 32 | Cap on concurrent running streaming requests. |
-| `max_offline_batch_size` | 1024 | Max offline requests admitted per step. The pipeline then splits this into `offline_micro_batch_size` micro-batches internally. |
+| `max_batch_size` | 32 | Encoder forward batch size — caps the running streaming pool **and** is the GPU forward width of each offline pipeline micro-batch. Offline admission per step is capped at `max_batch_size × offline_pipeline_depth`, enough to keep the pipeline producer one depth ahead of the consumer. |
 | `length_bucket_ratio` | 0.0 | Soft floor on `min_len/max_len` inside a bucket. `0` disables. |
 | `max_offline_pad_ratio` | 4.0 | Hard cap on `(max_len × B) / sum_len`. `0` disables. |
 | `max_wait_time` | 0.2 s | Starvation bound: oldest offline request triggers forced flush. |
@@ -339,8 +338,9 @@ while sched.has_pending():
 1. **`add_request` is O(1)** when `priority == 0` (default), O(N) only
    for non-default priorities.
 2. **`schedule()` is O(N_offline)** per call where N_offline is the
-   waiting queue length, bounded by `max_offline_batch_size`. It does
-   one `_sort_by_length` (O(N log N)) for SJF or cohort admission with
+   waiting queue length, bounded by
+   `max_batch_size × offline_pipeline_depth`. It does one
+   `_sort_by_length` (O(N log N)) for SJF or cohort admission with
    length-similar streams.
 3. **`find_request` / `abort_request` are O(1)** thanks to `_index`.
 4. **No GPU work.** The scheduler is pure Python on dataclasses; it is
@@ -351,10 +351,12 @@ while sched.has_pending():
    `_forward_batched_paged` can take the full `B` path on every step.
    On low-concurrency or interactive workloads it adds idle time at
    cohort boundaries — measure both on your traffic before deciding.
-6. **Avoid huge `max_offline_batch_size`** if the GPU cannot keep up —
-   the scheduler will admit them, the pipeline will queue them, and
-   memory pressure rises. Pair admission size with
-   `offline_micro_batch_size × offline_pipeline_depth`.
+6. **Offline admission scales with `max_batch_size × offline_pipeline_depth`.**
+   That is the smallest number that keeps `offline_pipeline_depth`
+   micro-batches in flight without starving the GPU consumer. Increase
+   `offline_pipeline_depth` (default 3) before reaching for a larger
+   admission window — depths above 3 rarely help because CPU prep is
+   only ever 1–2 micro-batches ahead in steady state.
 
 ## 10. Extension Points
 
