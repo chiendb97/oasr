@@ -1,0 +1,82 @@
+// Copyright 2024 OASR Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// gRPC schema for the OASR serving frontend.
+//
+// Names borrow from Google Cloud Speech-to-Text v1 to feel familiar; the
+// semantics map onto OASR's engine (Conformer-CTC, no language detection).
+
+syntax = "proto3";
+
+package oasr.asr.v1;
+
+service Speech {
+    // Offline transcription of a single full audio payload.
+    rpc Recognize(RecognizeRequest) returns (RecognizeResponse);
+
+    // Bidirectional streaming transcription.  First message MUST be a
+    // ``streaming_config``; subsequent messages carry ``audio_content``.
+    rpc StreamingRecognize(stream StreamingRecognizeRequest)
+        returns (stream StreamingRecognizeResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Shared types
+// ---------------------------------------------------------------------------
+
+message RecognitionConfig {
+    enum AudioEncoding {
+        ENCODING_UNSPECIFIED = 0;
+        LINEAR16_F32 = 1;  // raw little-endian f32 mono PCM
+        LINEAR16_I16 = 2;  // raw little-endian int16 mono PCM
+        WAV          = 3;  // RIFF/WAV container
+    }
+    AudioEncoding encoding         = 1;
+    uint32        sample_rate_hertz = 2;
+    string        language_code     = 3;  // accepted, ignored in v1
+    int32         priority          = 4;
+}
+
+message TokenList {
+    repeated uint32 ids = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Unary (offline) RPC
+// ---------------------------------------------------------------------------
+
+message RecognizeRequest {
+    RecognitionConfig config = 1;
+    bytes             audio  = 2;
+}
+
+message RecognizeResponse {
+    string             request_id = 1;
+    string             text       = 2;
+    repeated TokenList tokens     = 3;
+    repeated float     scores     = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Bidirectional streaming RPC
+// ---------------------------------------------------------------------------
+
+message StreamingRecognitionConfig {
+    RecognitionConfig config         = 1;
+    bool              interim_results = 2;  // default true; false suppresses partials
+}
+
+message StreamingRecognizeRequest {
+    oneof streaming_request {
+        StreamingRecognitionConfig streaming_config = 1;
+        bytes                      audio_content   = 2;
+    }
+}
+
+message StreamingRecognizeResponse {
+    string             request_id = 1;
+    bool               is_final   = 2;
+    string             text       = 3;
+    repeated TokenList tokens     = 4;
+    repeated float     scores     = 5;
+}

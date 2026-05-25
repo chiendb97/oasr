@@ -14,9 +14,15 @@ pip install -e .
 
 # Target specific GPU architecture
 CUDA_ARCHITECTURES=80 pip install -e .
+
+# Install with serving extras (msgpack + pyzmq + client libs)
+pip install -e .[serving]
+
+# Build the Rust serving frontend (binary used by the `oasr-server` console script)
+cd rust && cargo build --release
 ```
 
-The build compiles the `_C.so` pybind11 extension (for decoder + enums) via CMake. CUDA kernels are JIT-compiled on first use via TVM-FFI and cached in `~/.cache/oasr/jit/`.
+The build compiles the `_C.so` pybind11 extension (for decoder + enums) via CMake. CUDA kernels are JIT-compiled on first use via TVM-FFI and cached in `~/.cache/oasr/jit/`. The Rust workspace under `rust/` is built separately with `cargo` — the `oasr-server` Python console script execs the resulting binary (resolved via `$OASR_RS_BIN`, `$PATH`, or `rust/target/release/oasr-server`).
 
 ## Testing
 
@@ -32,9 +38,12 @@ pytest tests/test_conv.py::TestDepthwiseConv1D -v
 
 # Skip slow tests
 pytest tests/ -m "not slow"
+
+# Run multi-thread engine stress tests (opt-in marker)
+pytest tests/test_engine_concurrent.py -m concurrent -v
 ```
 
-Tests live under `tests/`. Functional API tests follow a flat `tests/test_<kernel>.py` layout (FlashInfer convention). The conftest at `tests/conftest.py` provides fixtures: `device` (CUDA, skips if unavailable), `dtype`/`dtype_all` (FP32/FP16/BF16), `batch_seq_hidden` (common shape tuples). Default pytest options (`-v --tb=short`) are set in `pyproject.toml`.
+Tests live under `tests/`. Functional API tests follow a flat `tests/test_<kernel>.py` layout (FlashInfer convention). The conftest at `tests/conftest.py` provides fixtures: `device` (CUDA, skips if unavailable), `dtype`/`dtype_all` (FP32/FP16/BF16), `batch_seq_hidden` (common shape tuples). Default pytest options (`-v --tb=short`) are set in `pyproject.toml`. Registered markers: `slow` (long-running, skip with `-m 'not slow'`) and `concurrent` (multi-thread engine stress, opt-in).
 
 ## Linting & Formatting
 
@@ -169,8 +178,7 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
 - **`decoder/`** — Python wrappers for the C++ decoders: `CtcGreedySearch`, `CtcPrefixBeamSearch`, `CtcWfstBeamSearch` (requires k2), `ContextGraph` (phrase boosting trie). Also exposes `k2_available` flag. Each wrapper lazily imports the compiled `_C` extension and delegates to a `_*Core` C++ object.
 - **`engine/`** — Inference engine for offline + streaming Conformer-CTC on a single GPU:
   - `EngineConfig` — unified config aggregating model, cache, feature, decoding, detokenization settings. `use_cuda_graphs: bool = True` toggles CUDA Graph capture of the steady-state streaming encoder forward.
-  - `ASREngine` — streaming engine with a step loop: schedule → batched GPU fbank ingest → encoder forward (length-bucketed offline micro-batches via `OfflinePipeline` overlap with one chunk per active streaming request) → CTC postprocess. Handles offline + streaming requests in one pool; starvation bounded by `max_wait_time`.
-  - `OfflineEngine` — simple batch transcription, no scheduler/cache.
+  - `ASREngine` — unified streaming + offline engine.  Step loop: schedule → batched GPU fbank ingest → encoder forward (length-bucketed offline micro-batches via `OfflinePipeline` overlap with one chunk per active streaming request) → CTC postprocess.  Handles offline + streaming requests in one pool; starvation bounded by `max_wait_time`.  Convenience helpers: `transcribe(...)` (streaming default) and `transcribe_offline(...)` (batched offline).
   - `graph_cache.py` — `EncoderGraphCache` lazily captures one `torch.cuda.CUDAGraph` per `(B, T_input, cache_t1_bucket)` shape, replays via pre-allocated input/output buffers. Persistent paging slots and `cnn_cache` are captured by **address**, so they must be allocated before the first capture and never reallocated. All captures share one CUDA Graph memory pool. Engine paths are slot-based (`forward_chunk_paged`) so the captured code path is stable across calls.
   - `Request` / `RequestOutput` / `RequestState` (`WAITING → RUNNING → FINISHED`).
   - Internal modules: `scheduler.py`, `model_runner.py`, `pipeline.py`, `input_processor.py`, `output_processor.py`.
@@ -197,11 +205,36 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
 | `docs/autotuning.md` | `oasr.tune` design, `oasr.autotune()` API, JSON cache format |
 | `docs/cache_manager.md` | `BlockPool` / `AttentionCacheManager` / `CnnCacheManager` / `StreamContext` semantics |
 | `docs/ctc_decoder_gpu.md` | `GpuStreamingDecoder` single- vs. multi-request flows, paged-memory options |
-| `docs/engine.md` | `ASREngine` / `OfflineEngine` step loop, batching, CUDA Graph capture |
+| `docs/engine.md` | `ASREngine` step loop, batching, CUDA Graph capture |
+| `docs/engine_concurrency.md` | Engine thread-safety (RLock), worker thread modes, multi-process scaling |
 | `docs/scheduler.md` | Streaming + offline request scheduling, starvation bounds, micro-batching |
+| `docs/serving.md` | Rust `oasr-server` frontend: HTTP/gRPC/WebSocket API, multi-worker fleet, wire format |
 - **`layers/`** — Thin `nn.Module`-style wrappers around functional API: `conv.py`, `linear.py`, `norm.py`, `attention/`, `rotary_embedding/`.
 - **`models/conformer/`** — Conformer model (`model.py`), config dataclass (`config.py`), weight conversion utility (`convert.py`).
 - **`utils/`** — `validation.py` (`@supported_compute_capability`, `@backend_requirement` decorators), `mappings.py` (dtype/enum helpers), `timer.py`.
+- **`serving/`** — Python engine-worker process driven by the Rust frontend:
+  - `engine_worker.py` — `EngineWorker` owns one `ASREngine` and a ZMQ ROUTER socket. Single-thread mode polls the socket and runs `engine.step()` inline; two-thread mode (`--worker-threads 2`) splits I/O and step across threads, safe under the engine's RLock. Entry point: `python -m oasr.serving` or its `main()`.
+  - `ipc.py` — MessagePack wire codec mirroring the Rust `oasr-wire` crate. Each message is `[header_msgpack, optional_audio_payload]`; audio is raw little-endian f32 mono PCM, decoded zero-copy with `np.frombuffer`. Command tags: `CreateOffline`, `CreateStreaming`, `FeedChunk`, `Cancel`, `Ping`. Event tags: `Accepted`, `Partial`, `Final`, `Error`, `Pong`, `Overloaded`.
+  - `server.py` — `oasr-server` console-script shim. Resolves the Rust binary (`$OASR_RS_BIN` → `PATH` → `rust/target/release/oasr-server`) and `os.execvp`s into it.
+
+### Rust serving frontend (`rust/`)
+
+Cargo workspace that builds `oasr-server`, the binary the Python `oasr-server` console script execs. It supervises a fleet of Python workers (one per GPU) over ZeroMQ + MessagePack and exposes the engine over HTTP and gRPC.
+
+| Crate | Role |
+|---|---|
+| `oasr-wire` | MessagePack wire schema shared verbatim with `oasr/serving/ipc.py` |
+| `oasr-engine-client` | Async ZMQ DEALER client, per-request demux, multi-worker pool (`EnginePool`) |
+| `oasr-asr` | Audio decode (WAV via `hound`, raw PCM) to f32 mono `bytes::Bytes` |
+| `oasr-server-http` | axum routes: `/v1/transcriptions`, `/v1/stream` (WS), Whisper-compat `/v1/audio/transcriptions`, `/healthz`, `/readyz`, `/metrics`, `/v1/models` |
+| `oasr-server-grpc` | tonic `oasr.asr.v1.Speech` service (`Recognize` unary + `StreamingRecognize` bidi). Proto in `rust/proto/oasr_asr.proto` |
+| `oasr-server` | Binary: CLI, worker supervisor, runtime wiring |
+
+Routing policy: **offline** → least-loaded worker (`num_running + num_waiting` min); **streaming** → least-loaded at admission, then **sticky** by `request_id` for subsequent chunks / Cancel. Streaming state cannot migrate between workers; worker death surfaces `Event::Error{code: WORKER_LOST}` for in-flight streams. `/readyz` returns 200 iff any worker has produced a `Pong` in the last 5 s. Build deps: `libzmq3-dev`, `protobuf-compiler`, a C/C++ toolchain. ZMQ transport defaults to `tcp://` — the pure-Rust `zeromq` crate handshake can hang over `ipc://` on some Linux setups.
+
+### Engine concurrency
+
+`ASREngine` is **thread-safe** as of v0.1: every public entry (`add_request`, `add_streaming_request`, `feed_chunk`, `abort_request`, `step`, `run`, `num_running`, `num_waiting`, `transcribe`) acquires a process-wide re-entrant `threading.RLock`. Protects the scheduler queues (`_streaming_waiting`, `_offline_waiting`, `_running`, `_index` in `oasr/engine/scheduler.py`) and per-request audio mutation (`request.audio_chunks`, `request.audio_final`). The lock is coarse — `step()` holds it for the full 10–100 ms GPU-bound step — but the GIL serializes Python anyway and CUDA releases the GIL during forward, so two-thread serving (`--worker-threads 2`) still overlaps ZMQ ingestion with `step()`. Horizontal scale is multi-process via the Rust frontend, not multi-thread inside one engine.
 
 ### Binding pattern (FlashInfer-style)
 
@@ -243,3 +276,5 @@ Two skill files provide step-by-step workflows for common tasks:
 | `CUDA_ARCHITECTURES` | Override SM targets for build (e.g., `80` or `80;86`) |
 | `OASR_CUDA_ARCH_LIST` | Manual override for JIT CUDA architecture detection |
 | `OASR_ATTN_BACKEND` | `sdpa` (force SDPA), `cute` (require CuteDSL FMHA, raise on unsupported arch or import failure), `auto` (default — use cute on sm_80 / sm_86 / sm_89 / sm_120 when CuteDSL imports, else warn + fall back to SDPA) |
+| `OASR_RS_BIN` | Absolute path to the Rust `oasr-server` binary; overrides `$PATH` / `rust/target/release/` lookup used by the `oasr-server` console script |
+| `OASR_USE_K2` | Set to `1` to build the WFST decoder (requires `pip install k2` and a k2 source tree at `K2_SOURCE_DIR` — default `/opt/k2-src`) |

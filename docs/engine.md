@@ -22,11 +22,13 @@ cache) work in one pool, with length-aware bucketing and CPU/GPU overlap.
 4. **Driving the step loop**: schedule → ingest fbank → forward → decode
    → finalise.
 5. **Exposing a high-level API**:
-   - `transcribe(audio | List[audio])` for one-shot use.
+   - `transcribe(audio | List[audio])` for one-shot streaming use.
+   - `transcribe_offline(audio | List[audio])` for batch-only offline use.
    - `add_request` / `feed_chunk` / `step` / `run` for explicit control.
 
-`OfflineEngine` is a thin subclass that defaults `transcribe` to
-`streaming=False` for batch-only workflows.
+The engine no longer has a separate `OfflineEngine` subclass — pass
+`streaming=False` to `add_request` / `transcribe`, or use the
+`transcribe_offline` convenience helper, to take the offline path.
 
 ## 2. High-Level Architecture
 
@@ -68,8 +70,7 @@ cache) work in one pool, with length-aware bucketing and CPU/GPU overlap.
 
 | File | Class | Role |
 |------|-------|------|
-| `engine.py` | `ASREngine` | Top-level façade. Owns one of each subsystem and the step loop. |
-| `offline.py` | `OfflineEngine` | `ASREngine` with `streaming=False` default; also exposes legacy `transcribe_streaming` (no paged cache). |
+| `engine.py` | `ASREngine` | Top-level façade.  Owns one of each subsystem and the step loop.  Use `transcribe(...)` for streaming and `transcribe_offline(...)` for batch. |
 | `config.py` | `EngineConfig` | Unified dataclass aggregating model / cache / feature / decoding / detokenization settings. Auto-detects SentencePiece model and `units.txt`. |
 | `request.py` | `Request`, `RequestOutput`, `RequestState` | Single-request representation, output container, lifecycle enum (`WAITING → RUNNING → FINISHED`). |
 | `scheduler.py` | `Scheduler`, `SchedulerOutput` | Dynamic-batching admission control and length bucketing. See `scheduler.md`. |
@@ -357,12 +358,12 @@ loaded encoder dimensions.
 ### 7.1 Offline batch transcription
 
 ```python
-from oasr.engine import OfflineEngine, EngineConfig
+from oasr.engine import ASREngine, EngineConfig
 
-engine = OfflineEngine(EngineConfig(ckpt_dir="/path/to/ckpt"))
+engine = ASREngine(EngineConfig(ckpt_dir="/path/to/ckpt"))
 
-text  = engine.transcribe("audio.wav")
-texts = engine.transcribe(["a.wav", "b.wav", "c.wav"])
+text  = engine.transcribe_offline("audio.wav")
+texts = engine.transcribe_offline(["a.wav", "b.wav", "c.wav"])
 ```
 
 ### 7.2 Streaming, attached audio
@@ -489,9 +490,10 @@ engine = ASREngine(EngineConfig(
   scheduler to evict a low-priority running stream, then have
   `ASREngine` call `ModelRunner.free_stream` and re-queue the request.
   No public API changes required.
-- **Engine subclasses.** `OfflineEngine` is a worked example: it
-  overrides `transcribe` to default `streaming=False` and adds a
-  legacy `transcribe_streaming` helper without touching the step loop.
+- **Streaming vs offline at the API.** Both paths share the same engine
+  instance; pass `streaming=False` (or call `transcribe_offline`) to take
+  the batched offline path.  No subclassing is needed — the historical
+  `OfflineEngine` class was removed in favour of this unified surface.
 
 ## 11. Quick Reference
 

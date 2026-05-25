@@ -442,13 +442,16 @@ class TestOutputProcessorDetokenize:
 
 
 # ---------------------------------------------------------------------------
-# Integration tests — OfflineEngine
+# Integration tests — ASREngine offline path (former OfflineEngine surface)
 # ---------------------------------------------------------------------------
 
 
-class TestOfflineEngine:
+class TestOfflineTranscribe:
+    """Cover the offline batched path via ``ASREngine.transcribe_offline`` /
+    ``transcribe(..., streaming=False)``."""
+
     def _make_engine(self, ckpt_dir: str, device: torch.device):
-        from oasr.engine import EngineConfig, OfflineEngine
+        from oasr.engine import ASREngine, EngineConfig
 
         cfg = EngineConfig(
             ckpt_dir=ckpt_dir,
@@ -456,13 +459,13 @@ class TestOfflineEngine:
             dtype=torch.float16,
             decoder_type="ctc_prefix_beam",
         )
-        return OfflineEngine(cfg)
+        return ASREngine(cfg)
 
     def test_transcribe_single(self, device, ckpt_dir: str, wav_dir: str):
         _require_ckpt(ckpt_dir)
         _require_wav_dir(wav_dir)
         engine = self._make_engine(ckpt_dir, device)
-        text = engine.transcribe(_wav_path(wav_dir, 0))
+        text = engine.transcribe_offline(_wav_path(wav_dir, 0))
         assert isinstance(text, str)
         assert len(text) > 0
 
@@ -474,7 +477,7 @@ class TestOfflineEngine:
             pytest.skip(f"Need at least 4 .wav files in WAV directory, found {len(wavs)}")
         engine = self._make_engine(ckpt_dir, device)
         paths = [_wav_path(wav_dir, i) for i in range(4)]
-        texts = engine.transcribe(paths)
+        texts = engine.transcribe_offline(paths)
         assert isinstance(texts, list)
         assert len(texts) == 4
         assert all(isinstance(t, str) and len(t) > 0 for t in texts)
@@ -538,7 +541,7 @@ class TestASREngine:
         refactor: per-step fbank + forward_chunk_paged at B=1 has to agree
         frame-for-frame with the offline batched forward.
         """
-        from oasr.engine import ASREngine, EngineConfig, OfflineEngine
+        from oasr.engine import ASREngine, EngineConfig
 
         _require_ckpt(ckpt_dir)
         _require_wav_dir(wav_dir)
@@ -554,8 +557,8 @@ class TestASREngine:
             dtype=torch.float16,
             decoder_type="ctc_prefix_beam",
         )
-        off = OfflineEngine(off_cfg)
-        off_texts = off.transcribe(paths)
+        off = ASREngine(off_cfg)
+        off_texts = off.transcribe_offline(paths)
 
         cfg = EngineConfig(
             ckpt_dir=ckpt_dir,
@@ -582,7 +585,7 @@ class TestASREngine:
         check WER stays below a loose threshold rather than demanding a
         bit-exact match.
         """
-        from oasr.engine import EngineConfig, OfflineEngine
+        from oasr.engine import ASREngine, EngineConfig
 
         _require_ckpt(ckpt_dir)
         _require_wav_dir(wav_dir)
@@ -598,8 +601,8 @@ class TestASREngine:
             dtype=torch.float16,
             decoder_type="ctc_prefix_beam",
         )
-        off = OfflineEngine(off_cfg)
-        off_texts = off.transcribe(paths)
+        off = ASREngine(off_cfg)
+        off_texts = off.transcribe_offline(paths)
 
         on = self._make_engine(ckpt_dir, device)  # max_batch_size=32 by default
         on_texts = on.transcribe(paths)

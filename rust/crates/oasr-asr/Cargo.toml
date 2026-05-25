@@ -1,0 +1,12 @@
+[package]
+name = "oasr-asr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Audio decoding helpers (WAV + raw PCM) used by the OASR Rust frontend."
+
+[dependencies]
+bytes = { workspace = true }
+hound = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

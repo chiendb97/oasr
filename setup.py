@@ -249,6 +249,8 @@ extras_require = {
         "librosa>=0.10.0",
     ],
     "serving": [
+        "msgpack>=1.0.0",
+        "pyzmq>=25.0.0",
         "fastapi>=0.100.0",
         "uvicorn>=0.23.0",
         "pydantic>=2.0.0",
@@ -263,6 +265,8 @@ extras_require = {
     "all": [
         "soundfile>=0.12.0",
         "librosa>=0.10.0",
+        "msgpack>=1.0.0",
+        "pyzmq>=25.0.0",
         "fastapi>=0.100.0",
         "uvicorn>=0.23.0",
         "pydantic>=2.0.0",

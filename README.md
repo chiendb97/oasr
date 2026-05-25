@@ -31,7 +31,7 @@ A high-performance open-source inference framework for ASR models built with C++
 - **Attention** -- Multi-head and relative-position attention with optional rotary embeddings; fused FMHA (`oasr.fmha`) with offline / dense-streaming / paged-streaming cache modes (CuteDSL kernel on SM120, PyTorch SDPA fallback elsewhere)
 - **CTC decoder** -- CTC greedy, prefix beam, and WFST beam search (CPU-side C++ with Python wrappers); GPU prefix beam search with offline + multi-request streaming APIs
 - **Feature extraction** -- Batched FBANK / MFCC via `torchaudio` (default) or `kaldifeat` (optional GPU path), plus `BatchedStreamingFeatureExtractor` for `B` parallel chunked streams
-- **Inference engine** -- vLLM-style `ASREngine` (streaming + offline) and `OfflineEngine` for Conformer-CTC, with dynamic length-bucketed batching and paged KV cache
+- **Inference engine** -- vLLM-style `ASREngine` for Conformer-CTC (unified streaming + offline), with dynamic length-bucketed batching and paged KV cache
 - **Streaming inference** -- Chunk-by-chunk Conformer inference with paged GPU memory for attention and CNN caches
 - **Paged memory cache** -- `BlockPool`-backed paged KV cache and `StreamContext` for multi-request streaming
 - **Kernel auto-tuning** -- Built-in profiling and caching framework for GEMM and Conv2D kernels
@@ -80,7 +80,7 @@ oasr/
 │   ├── cache/                 # Streaming cache manager (BlockPool, AttentionCacheManager, StreamContext)
 │   ├── features/              # Batched FBANK/MFCC + BatchedStreamingFeatureExtractor (torchaudio / kaldifeat)
 │   ├── models/conformer/      # Conformer model, config, weight conversion
-│   ├── engine/                # Inference engine (ASREngine, OfflineEngine, EngineConfig, Scheduler, Pipeline)
+│   ├── engine/                # Inference engine (ASREngine, EngineConfig, Scheduler, Pipeline)
 │   └── utils/                 # Dtype mappings, validation decorators, NVTX, timer
 ├── benchmarks/                # Performance benchmarks
 ├── tests/                     # Pytest test suite
@@ -228,15 +228,15 @@ The `oasr.engine` subpackage provides a vLLM-inspired inference engine for Confo
 ### Offline transcription
 
 ```python
-from oasr.engine import OfflineEngine, EngineConfig
+from oasr.engine import ASREngine, EngineConfig
 
-engine = OfflineEngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))
+engine = ASREngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))
 
-# Single file
-text = engine.transcribe("audio.wav")
+# Single file (offline path)
+text = engine.transcribe_offline("audio.wav")
 
-# Batch
-texts = engine.transcribe(["a.wav", "b.wav", "c.wav"])
+# Batch — dynamic length-bucketed offline batching
+texts = engine.transcribe_offline(["a.wav", "b.wav", "c.wav"])
 
 # Simulate streaming (chunk-by-chunk, no real-time constraint)
 text = engine.transcribe_streaming("audio.wav", chunk_size=16)
