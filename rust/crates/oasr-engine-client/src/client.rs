@@ -355,10 +355,15 @@ async fn io_task(
                         continue;
                     }
                 };
+                // Any event from the worker proves it is alive — the pool's
+                // liveness check (`pick_least_loaded`) treats workers with no
+                // pong in 10s as dead, but the supervisor only sends one ping
+                // at startup, so under sustained load we'd otherwise wrongly
+                // declare a busy worker dead.
+                *last_pong_at.lock() = Some(Instant::now());
                 match &event {
                     Event::Pong { num_running, num_waiting, model_info: mi, .. } => {
                         load.store(num_running.saturating_add(*num_waiting), Ordering::Relaxed);
-                        *last_pong_at.lock() = Some(Instant::now());
                         if let Some(m) = mi {
                             *model_info.lock() = Some(m.clone());
                         }

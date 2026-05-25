@@ -47,7 +47,12 @@ class WorkerOptions:
     max_concurrent_requests: int = 256
     overload_emit_interval_s: float = 1.0
     poll_block_ms: int = 5
-    max_inbound_per_tick: int = 64
+    # Drain a whole burst per tick so that ``engine.step()`` runs on a full
+    # batch.  With 128 concurrent streams sending ~10 chunks each, the worker
+    # sees ~1400 messages per "wave"; the old 64 cap caused the engine to
+    # process small slices (B=1 forward dominated) and dropped throughput
+    # ~3-4× vs the in-process engine baseline.
+    max_inbound_per_tick: int = 4096
     log_level: str = "info"
 
     @classmethod
@@ -384,13 +389,20 @@ class EngineWorker:
     def _run_single_thread(self) -> int:
         import zmq
         while not self._shutdown.is_set():
-            # Drain inbound until empty (or budget exhausted) — keeps step()
-            # responsive when traffic bursts.
-            for _ in range(self.opt.max_inbound_per_tick):
-                events = self._poller.poll(timeout=
-                    0 if self._engine_has_work() else self.opt.poll_block_ms)
+            # Drain inbound until the queue is empty or the per-tick budget
+            # is exhausted, then step.  Skipping ``poll`` between recvs (the
+            # NOBLOCK recv itself signals empty via ``zmq.Again``) and using
+            # a large per-tick budget is what keeps the forward batch size
+            # near ``max_batch_size`` under bursty arrival — otherwise the
+            # engine processes small slices (B=1 paths dominate) and
+            # throughput drops several-fold vs the in-process engine.
+            if not self._engine_has_work():
+                # Idle — block briefly waiting for the first command.
+                events = self._poller.poll(timeout=self.opt.poll_block_ms)
                 if not events:
-                    break
+                    self._maybe_emit_overloaded()
+                    continue
+            for _ in range(self.opt.max_inbound_per_tick):
                 try:
                     frames = self._sock.recv_multipart(flags=zmq.NOBLOCK)
                 except zmq.Again:

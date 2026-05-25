@@ -31,9 +31,11 @@ A high-performance open-source inference framework for ASR models built with C++
 - **Attention** -- Multi-head and relative-position attention with optional rotary embeddings; fused FMHA (`oasr.fmha`) with offline / dense-streaming / paged-streaming cache modes (CuteDSL kernel on SM120, PyTorch SDPA fallback elsewhere)
 - **CTC decoder** -- CTC greedy, prefix beam, and WFST beam search (CPU-side C++ with Python wrappers); GPU prefix beam search with offline + multi-request streaming APIs
 - **Feature extraction** -- Batched FBANK / MFCC via `torchaudio` (default) or `kaldifeat` (optional GPU path), plus `BatchedStreamingFeatureExtractor` for `B` parallel chunked streams
-- **Inference engine** -- vLLM-style `ASREngine` for Conformer-CTC (unified streaming + offline), with dynamic length-bucketed batching and paged KV cache
+- **Inference engine** -- vLLM-style `ASREngine` for Conformer-CTC (unified streaming + offline), with dynamic length-bucketed batching, paged KV cache, and CUDA Graph capture of the steady-state streaming encoder
 - **Streaming inference** -- Chunk-by-chunk Conformer inference with paged GPU memory for attention and CNN caches
 - **Paged memory cache** -- `BlockPool`-backed paged KV cache and `StreamContext` for multi-request streaming
+- **Thread-safe engine** -- Process-wide `RLock` over scheduler queues; two-thread serving overlaps ZMQ I/O with `step()`
+- **Serving frontend** -- Rust `oasr-server` binary exposing HTTP, gRPC, and WebSocket APIs over a fleet of Python engine workers (one per GPU), with sticky streaming routing
 - **Kernel auto-tuning** -- Built-in profiling and caching framework for GEMM and Conv2D kernels
 - **Flash Attention** -- Optional support (enable at build time)
 - **Architecture support** -- Volta through Blackwell (SM70--SM120)
@@ -80,9 +82,20 @@ oasr/
 │   ├── cache/                 # Streaming cache manager (BlockPool, AttentionCacheManager, StreamContext)
 │   ├── features/              # Batched FBANK/MFCC + BatchedStreamingFeatureExtractor (torchaudio / kaldifeat)
 │   ├── models/conformer/      # Conformer model, config, weight conversion
-│   ├── engine/                # Inference engine (ASREngine, EngineConfig, Scheduler, Pipeline)
+│   ├── engine/                # Inference engine (ASREngine, EngineConfig, Scheduler, Pipeline, graph_cache)
+│   ├── serving/               # Engine worker (ZMQ ROUTER) + MessagePack IPC for the Rust frontend
 │   └── utils/                 # Dtype mappings, validation decorators, NVTX, timer
+├── rust/                      # Rust serving frontend (oasr-server binary)
+│   ├── crates/
+│   │   ├── oasr-wire/         # MessagePack wire schema shared with oasr/serving/ipc.py
+│   │   ├── oasr-engine-client/# Async ZMQ DEALER client + multi-worker EnginePool
+│   │   ├── oasr-asr/          # WAV / raw-PCM decoding to f32 mono
+│   │   ├── oasr-server-http/  # axum: /v1/transcriptions, /v1/stream (WS), Whisper-compat
+│   │   ├── oasr-server-grpc/  # tonic: oasr.asr.v1.Speech (Recognize + StreamingRecognize)
+│   │   └── oasr-server/       # Binary: CLI + worker supervisor + runtime wiring
+│   └── proto/oasr_asr.proto
 ├── benchmarks/                # Performance benchmarks
+├── docs/                      # Companion design docs (engine, scheduler, serving, autotuning, ...)
 ├── tests/                     # Pytest test suite
 ├── CMakeLists.txt
 ├── setup.py
@@ -114,7 +127,15 @@ Optional dependency groups:
 ```bash
 pip install -e ".[dev]"      # pytest, black, mypy, ruff
 pip install -e ".[audio]"    # soundfile, librosa
-pip install -e ".[serving]"  # FastAPI, Uvicorn
+pip install -e ".[serving]"  # msgpack + pyzmq + httpx/websockets clients
+pip install -e ".[wfst]"     # k2, kaldilm (WFST decoder)
+```
+
+Build the Rust serving frontend (produces the `oasr-server` binary that the Python console script execs into):
+
+```bash
+cd rust && cargo build --release
+# requires: libzmq3-dev, protobuf-compiler, a C/C++ toolchain
 ```
 
 ## Testing
@@ -272,8 +293,11 @@ Key parameters for `EngineConfig`:
 | `max_batch_size` | `32` | Max concurrent streaming requests per step |
 | `decoder_type` | `"ctc_prefix_beam"` | One of `ctc_greedy`, `ctc_prefix_beam`, `ctc_gpu`, `ctc_wfst` |
 | `audio_scale` | `32768.0` | Scale factor applied before feature extraction (restores int16 range) |
+| `use_cuda_graphs` | `True` | Capture/replay one CUDA Graph per `(B, T_input, cache_t1_bucket)` for the steady-state streaming encoder |
 
 The checkpoint directory is expected to contain `final.pt`, `train.yaml`, `global_cmvn`, and optionally a SentencePiece `.model` file and `units.txt` vocabulary. These are auto-detected when `ckpt_dir` is set.
+
+`ASREngine` is thread-safe: every public entry acquires a process-wide re-entrant lock so a serving worker can run `step()` on one thread while another thread feeds chunks. Horizontal scaling is multi-process via the Rust frontend.
 
 ## Streaming Inference
 
@@ -319,6 +343,45 @@ ctx.free()
 ## Kernel Auto-Tuning
 
 OASR includes a built-in auto-tuning framework for GEMM and Conv2D kernels. See `oasr/tune/` for details.
+
+## Serving
+
+The Rust `oasr-server` binary is the canonical serving entry point. It supervises a fleet of Python engine workers (one per GPU), routes requests over ZeroMQ + MessagePack, and exposes the engine over HTTP, gRPC, and WebSocket.
+
+```bash
+# Launch a single-worker server on GPU 0 (after `cargo build --release` and `pip install -e .[serving]`)
+oasr-server --ckpt-dir /path/to/checkpoint --workers 1
+
+# Multi-GPU fleet
+oasr-server --ckpt-dir /path/to/checkpoint --workers 4 --gpus 0,1,2,3
+```
+
+Endpoints:
+
+| Endpoint | Protocol | Purpose |
+|----------|----------|---------|
+| `POST /v1/transcriptions` | HTTP | Offline transcription (multipart audio upload) |
+| `POST /v1/audio/transcriptions` | HTTP | Whisper-compatible alias |
+| `GET /v1/stream` | WebSocket | Streaming transcription (chunked audio frames) |
+| `oasr.asr.v1.Speech/Recognize` | gRPC | Offline unary |
+| `oasr.asr.v1.Speech/StreamingRecognize` | gRPC | Streaming bidi |
+| `GET /healthz`, `/readyz`, `/metrics`, `/v1/models` | HTTP | Health, readiness, Prometheus metrics, model list |
+
+Routing: offline requests go to the least-loaded worker; streaming requests are least-loaded at admission and then sticky by `request_id` so subsequent chunks land on the same worker (streaming cache cannot migrate). `/readyz` is green iff at least one worker has pinged within the last 5 s.
+
+See `docs/serving.md` for the full wire format and deployment notes.
+
+## Documentation
+
+| File | Covers |
+|------|--------|
+| `docs/engine.md` | `ASREngine` step loop, batching, CUDA Graph capture |
+| `docs/engine_concurrency.md` | Engine thread-safety, worker-thread modes, multi-process scaling |
+| `docs/scheduler.md` | Streaming + offline request scheduling, starvation bounds, micro-batching |
+| `docs/cache_manager.md` | `BlockPool` / `AttentionCacheManager` / `CnnCacheManager` / `StreamContext` |
+| `docs/ctc_decoder_gpu.md` | `GpuStreamingDecoder` single- vs. multi-request flows, paged-memory options |
+| `docs/serving.md` | Rust `oasr-server` frontend: HTTP/gRPC/WebSocket API, multi-worker fleet, wire format |
+| `docs/autotuning.md` | `oasr.tune` design, `oasr.autotune()` API, JSON cache format |
 
 ## License
 

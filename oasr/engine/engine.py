@@ -403,9 +403,18 @@ class ASREngine:
                 #    feature buffer has been fully consumed.  A stream can
                 #    reach this state in the same step it ran its last
                 #    encoder chunk, so we check *after* the forward pass.
+                #    Only streams the client has explicitly closed
+                #    (``audio_final``) are eligible — a freshly admitted
+                #    streaming request that hasn't yet received audio is
+                #    otherwise indistinguishable from a drained one and
+                #    would be finalised with an empty transcript on the
+                #    very first step (regression seen via the service path
+                #    where ``CreateStreaming`` arrives before any
+                #    ``FeedChunk``).
                 nvtx_push("finalize_streams")
                 for req in list(running):
-                    if (not req.has_pending_audio) \
+                    if req.audio_final \
+                            and (not req.has_pending_audio) \
                             and (not req.has_ready_encoder_chunk(window)):
                         final = self._output_processor.finalize_streaming(req)
                         req.output = final

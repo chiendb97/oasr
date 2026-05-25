@@ -216,6 +216,8 @@ class RunStats:
     latencies_ms: List[float] = field(default_factory=list)
     first_partial_ms: List[float] = field(default_factory=list)
     partial_counts: List[int] = field(default_factory=list)
+    # rejection-cause histogram (engine error code | "transport:<ExcType>")
+    error_codes: dict = field(default_factory=dict)
 
     def pretty(self) -> str:
         if not self.latencies_ms:
@@ -249,6 +251,11 @@ class RunStats:
             lines.append(
                 f"  partials/req    mean={statistics.fmean(self.partial_counts):.1f}"
             )
+        if self.error_codes:
+            lines.append("  rejection breakdown:")
+            for code, n in sorted(self.error_codes.items(),
+                                  key=lambda kv: -kv[1]):
+                lines.append(f"    {code}: {n}")
         return "\n".join(lines)
 
 
@@ -402,8 +409,10 @@ async def _bench_streaming(
                             # let the consumer collect the error event.
                             return
 
+                    error_payload: Optional[dict] = None
+
                     async def consumer():
-                        nonlocal first_partial_at, partials
+                        nonlocal first_partial_at, partials, error_payload
                         async for msg in ws:
                             if isinstance(msg, bytes):
                                 continue
@@ -416,7 +425,10 @@ async def _bench_streaming(
                                 partials += 1
                                 if first_partial_at is None:
                                     first_partial_at = time.perf_counter()
-                            elif t in ("final", "error"):
+                            elif t == "error":
+                                error_payload = ev
+                                return t
+                            elif t == "final":
                                 return t
 
                     prod_task = asyncio.create_task(producer())
@@ -441,13 +453,25 @@ async def _bench_streaming(
                     elif final_kind == "error":
                         # Worker emitted an Error event (typically BUSY).
                         stats.n_rejected += 1
+                        if error_payload is not None:
+                            code_key = str(error_payload.get("code"))
+                            stats.error_codes[code_key] = \
+                                stats.error_codes.get(code_key, 0) + 1
                     else:
                         stats.n_fail += 1
-            except Exception:
+            except Exception as exc:
                 # Transport-level failure (TCP reset on overload, etc.) — count
                 # alongside rejections, since under heavy backpressure the
                 # server may close the WebSocket before the Error frame lands.
                 stats.n_rejected += 1
+                detail = type(exc).__name__
+                code = getattr(getattr(exc, "rcvd", None), "code", None)
+                if code is None:
+                    code = getattr(getattr(exc, "sent", None), "code", None)
+                if code is not None:
+                    detail = f"{detail}({code})"
+                key = f"transport:{detail}"
+                stats.error_codes[key] = stats.error_codes.get(key, 0) + 1
 
     pace_realtime = False  # set by caller via closure (see entry point)
     # Bind via attribute capture: rewrap with the value
