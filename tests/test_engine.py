@@ -457,6 +457,7 @@ class TestOfflineTranscribe:
             ckpt_dir=ckpt_dir,
             device=str(device),
             dtype=torch.float16,
+            service_mode="offline",
             decoder_type="ctc_prefix_beam",
         )
         return ASREngine(cfg)
@@ -555,6 +556,7 @@ class TestASREngine:
             ckpt_dir=ckpt_dir,
             device=str(device),
             dtype=torch.float16,
+            service_mode="offline",
             decoder_type="ctc_prefix_beam",
         )
         off = ASREngine(off_cfg)
@@ -599,6 +601,7 @@ class TestASREngine:
             ckpt_dir=ckpt_dir,
             device=str(device),
             dtype=torch.float16,
+            service_mode="offline",
             decoder_type="ctc_prefix_beam",
         )
         off = ASREngine(off_cfg)

@@ -90,6 +90,17 @@ class EngineConfig:
     device: str = "cuda"
     dtype: torch.dtype = torch.float16
 
+    # Service mode — the engine runs in exactly one mode per lifecycle,
+    # never both.  ``"streaming"`` admits chunk-by-chunk requests (paged
+    # KV cache, partial outputs); ``"offline"`` admits full-audio
+    # requests (length-bucketed micro-batched forward, single final
+    # output).  ``ASREngine.add_request`` validates that the per-request
+    # ``streaming`` flag matches this mode and raises ``ValueError`` on
+    # drift — the Rust dispatcher relies on this to surface
+    # misconfiguration eagerly instead of silently routing into a
+    # quiescent pipeline.
+    service_mode: str = "streaming"
+
     # Streaming chunking
     chunk_size: int = 16
     num_left_chunks: int = -1
@@ -262,6 +273,11 @@ class EngineConfig:
     _model_config: Optional[ConformerModelConfig] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.service_mode not in ("streaming", "offline"):
+            raise ValueError(
+                f"service_mode must be 'streaming' or 'offline', got "
+                f"{self.service_mode!r}"
+            )
         if self.feature_config is None:
             self.feature_config = FeatureConfig(dither=0.0)
         if self.gpu_decoder_config is None:

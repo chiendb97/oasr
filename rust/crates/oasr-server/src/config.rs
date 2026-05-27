@@ -54,6 +54,13 @@ pub struct Cli {
     /// torch.dtype string ("float16" | "bfloat16" | "float32").
     #[arg(long, default_value = "float16")]
     pub dtype: String,
+    /// Service mode — the engine runs in exactly one mode per lifecycle.
+    /// "streaming" (default) accepts chunk-by-chunk requests via /v1/stream
+    /// and the gRPC `StreamingRecognize`; "offline" accepts full-audio
+    /// requests via /v1/transcriptions and `Recognize`.  Mismatched
+    /// requests are rejected at admission.
+    #[arg(long, default_value = "streaming")]
+    pub service_mode: String,
     /// Optional: max batch size override.
     #[arg(long)]
     pub max_batch_size: Option<u32>,
@@ -118,6 +125,12 @@ impl Cli {
         }
         if !obj.contains_key("dtype") {
             obj.insert("dtype".into(), Value::String(self.dtype.clone()));
+        }
+        if !obj.contains_key("service_mode") {
+            obj.insert(
+                "service_mode".into(),
+                Value::String(self.service_mode.clone()),
+            );
         }
         if let Some(v) = self.max_batch_size {
             obj.entry("max_batch_size")

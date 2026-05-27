@@ -19,54 +19,48 @@ from .config import EngineConfig
 from .input_processor import InputProcessor
 from .model_runner import ModelRunner
 from .output_processor import OutputProcessor
-from .pipeline import OfflinePipeline
+from .pipeline import OfflinePipeline, Pipeline, StreamingPipeline
 from .request import Request, RequestOutput
-from .scheduler import Scheduler, SchedulerOutput
+from .scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
 
 class ASREngine:
-    """Unified ASR inference engine with dynamic batching.
+    """Single-mode ASR inference engine.
 
-    Handles both streaming (chunk-by-chunk with paged KV cache) and offline
-    (single-pass batched) requests in one step loop.  Each step:
+    Configured at construction (``EngineConfig.service_mode``) to handle
+    either **streaming** (chunk-by-chunk with paged KV cache, partial
+    outputs per tick) **or** **offline** (length-bucketed batched
+    single-pass forward, one final output per request) — never both
+    within the same lifecycle.
 
-    1. **Schedule** — admit waiting streaming requests up to
-       ``max_batch_size``, or admit up to
-       ``max_batch_size * offline_pipeline_depth`` waiting offline
-       requests (the service runs in one mode at a time).
-    2. **Ingest** — batched GPU fbank across every active stream's next
-       pending audio chunk (one kernel call for the whole running pool,
-       no stream ever sees audio beyond its own enqueued chunks).
-    3. **Forward** — route the admitted offline batch through the
-       pipelined :class:`OfflinePipeline` (length-bucketed micro-batches
-       of size ``max_batch_size`` overlap GPU feature extraction with
-       encoder forward + CTC decode) and run one encoder chunk per
-       streaming request whose buffer now holds a full window.
-    4. **Postprocess** — decode log-probs and finalise completed requests.
-
-    Dynamic batching is length-aware: within the offline pipeline,
-    requests are sorted by estimated feature length and split into
-    similarly-sized micro-batches to minimise padded-compute waste.
-    Starvation of bursty offline requests is bounded by ``max_wait_time``.
+    The engine is a thin orchestrator over one :class:`Pipeline`
+    instance: every public entry (``add_*``, ``feed_chunk``, ``abort``,
+    ``step``, ``run``, status) routes through ``self._pipeline``.
+    Throughput features land either as shared changes to
+    :class:`InputProcessor` / :class:`ModelRunner` /
+    :class:`OutputProcessor` (picked up by either pipeline) or as
+    explicit, deliberate changes to a single pipeline implementation —
+    the two modes never share dead branches.
 
     Parameters
     ----------
     config : EngineConfig
-        Fully configured engine settings.  ``ckpt_dir`` must be set.
+        Fully configured engine settings.  ``ckpt_dir`` must be set;
+        ``service_mode`` defaults to ``"streaming"``.
 
     Examples
     --------
-    Streaming transcription (default)::
+    Streaming::
 
         engine = ASREngine(EngineConfig(ckpt_dir="/path/to/ckpt"))
         text = engine.transcribe("audio.wav")
 
-    Offline batch — use :meth:`transcribe_offline`, or pass
-    ``streaming=False``::
+    Offline batch::
 
-        text = engine.transcribe("audio.wav", streaming=False)
+        cfg = EngineConfig(ckpt_dir="/path/to/ckpt", service_mode="offline")
+        engine = ASREngine(cfg)
         texts = engine.transcribe_offline(["a.wav", "b.wav", "c.wav"])
     """
 
@@ -116,21 +110,14 @@ class ASREngine:
         )
         self._output_processor = OutputProcessor(config)
 
-        # Offline execution pipeline — handles CPU/GPU overlap and
-        # length-bucketed micro-batching internally.  Forward width is
-        # ``max_batch_size`` (the same knob streaming uses); the service
-        # never runs both modes simultaneously.
-        self._offline_pipeline = OfflinePipeline(
-            input_processor=self._input_processor,
-            model_runner=self._model_runner,
-            output_processor=self._output_processor,
-            micro_batch_size=int(config.max_batch_size),
-            depth=max(1, int(config.offline_pipeline_depth)),
-            device=self._device,
-            gpu_feature_extraction=bool(config.offline_gpu_feature_extraction),
-            preferred_sizes=config.preferred_batch_size,
-            persistent_producer=bool(config.offline_persistent_pipeline),
-        )
+        # Build exactly one pipeline matching ``config.service_mode``.
+        # The other mode's machinery (paged KV cache vs. persistent
+        # producer thread) never wakes up, so there's no point paying
+        # the construction cost or holding the dead references.  All
+        # three building-block singletons (``InputProcessor`` /
+        # ``ModelRunner`` / ``OutputProcessor``) are still shared so
+        # throughput features land in one place regardless of mode.
+        self._pipeline: Pipeline = self._build_pipeline(config)
 
         # Pre-warm the encoder CUDA-Graph cache at each preferred batch
         # size so the first real chunk replays instead of capturing.  Skipped
@@ -152,16 +139,6 @@ class ASREngine:
                     "chunk instead): %s",
                     exc,
                 )
-
-        # Dedicated CUDA stream for the streaming fbank kernel.  Lets the
-        # H2D waveform copy + batched fbank for the current step overlap
-        # with the encoder forward of the previous step's tail (the
-        # encoder forward is async, so once dispatched the GPU can run
-        # both kernels concurrently when they live on different streams).
-        self._feat_stream: Optional[torch.cuda.Stream] = (
-            torch.cuda.Stream(device=self._device)
-            if self._device.type == "cuda" else None
-        )
 
         # Warm up the cute FMHA compile cache so the first request
         # doesn't pay JIT-compile latency. Skipped on CPU and on archs
@@ -237,17 +214,8 @@ class ASREngine:
             priority=priority,
         )
         with self._lock:
-            if streaming:
-                # Split the waveform into audio-sample chunks *without* running
-                # fbank.  Feature extraction runs inside ``step()`` batched
-                # across all active streams — realistic streaming behaviour
-                # (one chunk's worth of audio produces one chunk's worth of
-                # features) and a much better match for the model's forward
-                # throughput than the old pre-extract-everything admission.
-                self._input_processor.prepare_streaming(req)
-            else:
-                self._input_processor.prepare_offline(req)
-            self._scheduler.add_request(req)
+            self._validate_mode(streaming)
+            self._pipeline.admit(req)
         return req.request_id
 
     def add_requests_batch(self, specs: List[Dict]) -> List[str]:
@@ -283,14 +251,8 @@ class ASREngine:
                     sample_rate=sample_rate,
                     priority=priority,
                 )
-                if streaming:
-                    if audio is None:
-                        self._input_processor.prepare_streaming_open(req)
-                    else:
-                        self._input_processor.prepare_streaming(req)
-                else:
-                    self._input_processor.prepare_offline(req)
-                self._scheduler.add_request(req)
+                self._validate_mode(streaming)
+                self._pipeline.admit(req)
                 request_ids.append(req.request_id)
         return request_ids
 
@@ -330,8 +292,8 @@ class ASREngine:
             priority=priority,
         )
         with self._lock:
-            self._input_processor.prepare_streaming_open(req)
-            self._scheduler.add_request(req)
+            self._validate_mode(True)
+            self._pipeline.admit(req)
         return req.request_id
 
     def feed_chunk(
@@ -362,119 +324,71 @@ class ASREngine:
         already been finalised.
         """
         with self._lock:
-            req = self._scheduler.find_request(request_id)
-            if req is None:
-                raise KeyError(
-                    f"feed_chunk: unknown or finished request_id {request_id!r}"
-                )
-            self._input_processor.append_streaming_chunk(req, chunk, is_last=is_last)
+            # ``OfflinePipeline.feed_chunk`` raises ``NotImplementedError``,
+            # so this also serves as the mode check on offline engines.
+            self._pipeline.feed_chunk(request_id, chunk, is_last=is_last)
 
     def abort_request(self, request_id: str) -> None:
         """Remove a request from the engine, freeing cache if allocated."""
         with self._lock:
-            req = self._scheduler.abort_request(request_id)
-            if req is not None and req.stream_context is not None:
-                self._model_runner.free_stream(req)
+            self._pipeline.abort(request_id)
+
+    # ------------------------------------------------------------------
+    # Internal — pipeline construction and mode validation
+    # ------------------------------------------------------------------
+
+    def _build_pipeline(self, config: EngineConfig) -> Pipeline:
+        """Construct the single pipeline matching ``config.service_mode``."""
+        if config.service_mode == "streaming":
+            return StreamingPipeline(
+                scheduler=self._scheduler,
+                input_processor=self._input_processor,
+                model_runner=self._model_runner,
+                output_processor=self._output_processor,
+                config=config,
+                device=self._device,
+            )
+        return OfflinePipeline(
+            scheduler=self._scheduler,
+            input_processor=self._input_processor,
+            model_runner=self._model_runner,
+            output_processor=self._output_processor,
+            micro_batch_size=int(config.max_batch_size),
+            depth=max(1, int(config.offline_pipeline_depth)),
+            device=self._device,
+            gpu_feature_extraction=bool(config.offline_gpu_feature_extraction),
+            preferred_sizes=config.preferred_batch_size,
+            persistent_producer=bool(config.offline_persistent_pipeline),
+        )
+
+    def _validate_mode(self, streaming: bool) -> None:
+        """Raise ``ValueError`` when the per-request ``streaming`` flag
+        doesn't match ``config.service_mode``.
+
+        Routing a mismatched request would silently land it in the wrong
+        pipeline (offline ``admit`` on a streaming engine would just
+        never run; streaming ``admit`` on an offline engine would
+        produce empty outputs).  Surface the error eagerly so the caller
+        can re-deploy with the right ``service_mode``.
+        """
+        if streaming != self._pipeline.streaming:
+            raise ValueError(
+                f"Request streaming={streaming} does not match configured "
+                f"service_mode={self._config.service_mode!r}.  The engine "
+                "accepts only one mode per lifecycle; restart with the "
+                "matching service_mode."
+            )
 
     # ------------------------------------------------------------------
     # Step loop
     # ------------------------------------------------------------------
 
     def step(self) -> List[RequestOutput]:
-        """Execute one engine step covering streaming + offline work."""
+        """Execute one engine step — one call into the configured pipeline."""
         with self._lock:
             nvtx_push("engine.step")
-            nvtx_push("schedule")
-            sched: SchedulerOutput = self._scheduler.schedule()
+            outputs = self._pipeline.step()
             nvtx_pop()
-            outputs: List[RequestOutput] = []
-
-            # Streaming admission: allocate cache for freshly admitted streams.
-            if sched.newly_admitted:
-                nvtx_push("allocate_stream")
-                for req in sched.newly_admitted:
-                    if req.streaming:
-                        self._model_runner.allocate_stream(req)
-                nvtx_pop()
-
-            # Offline batch — submit to the persistent producer for async
-            # collation, then drain whatever's ready (from this submission
-            # or prior ones).  When persistent mode is disabled the pipeline
-            # falls back to synchronous run inside submit + drain.
-            if sched.offline_batch:
-                nvtx_push("offline_submit")
-                self._offline_pipeline.submit(sched.offline_batch)
-                nvtx_pop()
-            nvtx_push("offline_drain")
-            outputs.extend(self._offline_pipeline.drain_ready())
-            nvtx_pop()
-
-            running = sched.running_streams
-            if running:
-                # 1. Batched GPU fbank across every stream with pending audio —
-                #    one kernel call for the whole active pool rather than N
-                #    sequential fbank calls.  Issued on the dedicated feat
-                #    stream when running on CUDA so it can overlap with the
-                #    previous step's encoder forward; the default stream waits
-                #    on the recorded event before reading feature_buffer.
-                needs_feat = [r for r in running if r.has_pending_audio]
-                if needs_feat:
-                    nvtx_push("extract_fbank")
-                    self._input_processor.extract_streaming_batch(
-                        needs_feat, cuda_stream=self._feat_stream,
-                    )
-                    if self._feat_stream is not None:
-                        # Synchronise default stream with feat stream so the
-                        # downstream forward sees the freshly-written
-                        # feature_buffer slices.
-                        torch.cuda.current_stream(self._device).wait_stream(
-                            self._feat_stream
-                        )
-                    nvtx_pop()
-
-                # 2. For each stream whose feature buffer now holds at least
-                #    one encoder window, run forward_chunk_paged.
-                window = self._config.decoding_window
-                ready = [r for r in running if r.has_ready_encoder_chunk(window)]
-                if ready:
-                    nvtx_push("forward_streaming")
-                    log_probs_map: Dict[str, torch.Tensor] = (
-                        self._model_runner.forward_streaming_step(ready)
-                    )
-                    nvtx_pop()
-                    nvtx_push("decode_streaming")
-                    for req in ready:
-                        lp = log_probs_map.get(req.request_id)
-                        if lp is not None:
-                            partial = self._output_processor.decode_streaming_chunk(req, lp)
-                            outputs.append(partial)
-                    nvtx_pop()
-
-                # 3. Finalise streams whose audio is exhausted and whose
-                #    feature buffer has been fully consumed.  A stream can
-                #    reach this state in the same step it ran its last
-                #    encoder chunk, so we check *after* the forward pass.
-                #    Only streams the client has explicitly closed
-                #    (``audio_final``) are eligible — a freshly admitted
-                #    streaming request that hasn't yet received audio is
-                #    otherwise indistinguishable from a drained one and
-                #    would be finalised with an empty transcript on the
-                #    very first step (regression seen via the service path
-                #    where ``CreateStreaming`` arrives before any
-                #    ``FeedChunk``).
-                nvtx_push("finalize_streams")
-                for req in list(running):
-                    if req.audio_final \
-                            and (not req.has_pending_audio) \
-                            and (not req.has_ready_encoder_chunk(window)):
-                        final = self._output_processor.finalize_streaming(req)
-                        req.output = final
-                        outputs.append(final)
-                        self._model_runner.free_stream(req)
-                        self._scheduler.finish_request(req.request_id)
-                nvtx_pop()
-
-            nvtx_pop()  # engine.step
             return outputs
 
     def run(self) -> List[RequestOutput]:
@@ -487,13 +401,7 @@ class ASREngine:
         """
         with self._lock:
             final_outputs: List[RequestOutput] = []
-            # Loop while the scheduler has work OR while reqs are still
-            # in flight inside the persistent offline pipeline (they were
-            # submitted on a prior step but haven't been drained yet).
-            while (
-                self._scheduler.has_pending()
-                or self._offline_pipeline.in_flight() > 0
-            ):
+            while self._pipeline.has_pending():
                 step_outputs = self.step()
                 final_outputs.extend(o for o in step_outputs if o.finished)
             return final_outputs
@@ -556,22 +464,20 @@ class ASREngine:
 
     @property
     def num_running(self) -> int:
-        """Active streaming requests + offline reqs in the persistent pipeline.
+        """Currently-active requests.
 
-        Offline requests that have been submitted to the pipeline but not yet
-        drained back as outputs count as "running" here so the Rust
-        dispatcher (which uses `num_running + num_waiting` to decide whether
-        to skip a step / enter an idle wait) keeps stepping until the
-        pipeline drains.
+        For streaming mode: streams admitted to the running pool.  For
+        offline mode: requests submitted to the persistent pipeline but
+        not yet drained back as outputs.  In both cases the Rust
+        dispatcher uses ``num_running + num_waiting`` to decide whether
+        to skip a step / enter an idle wait, so the count must include
+        any work still in flight.
         """
         with self._lock:
-            return (
-                self._scheduler.num_running
-                + self._offline_pipeline.in_flight()
-            )
+            return self._pipeline.num_running()
 
     @property
     def num_waiting(self) -> int:
-        """Total number of requests across both waiting queues."""
+        """Requests in the waiting queue (admission pending)."""
         with self._lock:
-            return self._scheduler.num_waiting
+            return self._pipeline.num_waiting()

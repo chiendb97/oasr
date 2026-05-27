@@ -126,6 +126,29 @@ def _resolve_server_bin() -> Path:
     )
 
 
+_OFFLINE_SUBROUTINES = frozenset({"offline", "whisper", "grpc_offline"})
+_STREAMING_SUBROUTINES = frozenset({"streaming", "grpc_streaming"})
+
+
+def _derive_service_mode(subroutines: List[str]) -> str:
+    """Pick the engine ``service_mode`` from the chosen subroutines.
+
+    The Rust frontend wraps a single-mode engine, so all chosen
+    subroutines must agree.  ``offline`` / ``whisper`` / ``grpc_offline``
+    require ``service_mode=offline``; ``streaming`` / ``grpc_streaming``
+    require ``service_mode=streaming``.  Mixed sets are rejected.
+    """
+    has_offline = any(s in _OFFLINE_SUBROUTINES for s in subroutines)
+    has_streaming = any(s in _STREAMING_SUBROUTINES for s in subroutines)
+    if has_offline and has_streaming:
+        raise SystemExit(
+            "cannot mix offline and streaming subroutines in one bench "
+            "run — the engine runs in one mode per lifecycle.  Run them "
+            "in separate invocations."
+        )
+    return "streaming" if has_streaming else "offline"
+
+
 @dataclass
 class ServerHandle:
     proc: Optional[subprocess.Popen]
@@ -163,6 +186,7 @@ def _spawn_server(args: argparse.Namespace) -> ServerHandle:
         "--max-concurrent-requests", str(max(args.concurrency * 8, 256)),
         "--log-level", args.server_log_level,
         "--dtype", args.dtype,
+        "--service-mode", args.service_mode,
     ]
     if args.max_batch_size is not None:
         cmd.extend(["--max-batch-size", str(args.max_batch_size)])
@@ -484,6 +508,197 @@ async def _bench_streaming(
 
 
 # ---------------------------------------------------------------------------
+# gRPC stub generation
+# ---------------------------------------------------------------------------
+
+
+def _load_grpc_stubs(proto_path: Path):
+    """Compile ``rust/proto/oasr_asr.proto`` to a temp dir and import it.
+
+    Mirrors :mod:`scripts.grpc_stream` — keeps the bench self-contained so
+    we don't ship pre-generated stubs in the repo.
+    """
+    import importlib
+    import shutil
+    import tempfile
+    try:
+        from grpc_tools import protoc
+    except ImportError as e:  # pragma: no cover
+        raise SystemExit(
+            "grpc subroutines require grpcio-tools "
+            "(install with `pip install grpcio grpcio-tools`)"
+        ) from e
+    _ = shutil  # silence linter — kept for parity with grpc_stream.py
+    out = Path(tempfile.mkdtemp(prefix="oasr-bench-grpc-"))
+    rc = protoc.main([
+        "protoc",
+        f"--proto_path={proto_path.parent}",
+        f"--python_out={out}",
+        f"--grpc_python_out={out}",
+        str(proto_path),
+    ])
+    if rc != 0:
+        raise SystemExit(f"protoc failed with rc={rc}")
+    sys.path.insert(0, str(out))
+    pb = importlib.import_module("oasr_asr_pb2")
+    pb_grpc = importlib.import_module("oasr_asr_pb2_grpc")
+    return pb, pb_grpc
+
+
+# ---------------------------------------------------------------------------
+# gRPC offline benchmark — unary Recognize
+# ---------------------------------------------------------------------------
+
+
+async def _bench_grpc_offline(
+    grpc_addr: str, samples: List[Sample], concurrency: int, proto_path: Path,
+) -> RunStats:
+    import grpc
+
+    pb, pb_grpc = _load_grpc_stubs(proto_path)
+    stats = RunStats(name="grpc-offline (Recognize unary, raw f32 PCM)")
+    sem = asyncio.Semaphore(concurrency)
+
+    # Disable gRPC's HTTP proxy honoring — the env may carry an
+    # ``http_proxy`` that's irrelevant for the localhost frontend.
+    channel_options = [("grpc.enable_http_proxy", 0)]
+    async with grpc.aio.insecure_channel(grpc_addr, options=channel_options) as channel:
+        stub = pb_grpc.SpeechStub(channel)
+
+        async def one(sample: Sample) -> None:
+            async with sem:
+                cfg = pb.RecognitionConfig(
+                    encoding=pb.RecognitionConfig.LINEAR16_F32,
+                    sample_rate_hertz=sample.sample_rate,
+                    priority=0,
+                )
+                req = pb.RecognizeRequest(
+                    config=cfg,
+                    audio=sample.samples.astype("<f4").tobytes(),
+                )
+                start = time.perf_counter()
+                try:
+                    await stub.Recognize(req, timeout=600.0)
+                    elapsed_ms = (time.perf_counter() - start) * 1000.0
+                    stats.n_ok += 1
+                    stats.latencies_ms.append(elapsed_ms)
+                    stats.total_audio_s += sample.duration_s
+                except grpc.aio.AioRpcError as exc:
+                    code = exc.code()
+                    if code == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                        stats.n_rejected += 1
+                    else:
+                        stats.n_fail += 1
+                    key = f"grpc:{code.name}"
+                    stats.error_codes[key] = stats.error_codes.get(key, 0) + 1
+                except Exception:
+                    stats.n_fail += 1
+
+        t0 = time.perf_counter()
+        await asyncio.gather(*(one(s) for s in samples))
+        stats.wall_s = time.perf_counter() - t0
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# gRPC streaming benchmark — bidi StreamingRecognize
+# ---------------------------------------------------------------------------
+
+
+async def _bench_grpc_streaming(
+    grpc_addr: str,
+    samples: List[Sample],
+    concurrency: int,
+    chunk_ms: int,
+    proto_path: Path,
+    pace_realtime: bool,
+) -> RunStats:
+    import grpc
+
+    pb, pb_grpc = _load_grpc_stubs(proto_path)
+    stats = RunStats(
+        name=f"grpc-streaming (StreamingRecognize, chunk={chunk_ms}ms)"
+    )
+    sem = asyncio.Semaphore(concurrency)
+
+    # Disable gRPC's HTTP proxy honoring — the env may carry an
+    # ``http_proxy`` that's irrelevant for the localhost frontend.
+    channel_options = [("grpc.enable_http_proxy", 0)]
+    async with grpc.aio.insecure_channel(grpc_addr, options=channel_options) as channel:
+        stub = pb_grpc.SpeechStub(channel)
+
+        async def one(sample: Sample) -> None:
+            async with sem:
+                chunk_samples = int(sample.sample_rate * chunk_ms / 1000)
+                per_chunk = chunk_ms / 1000.0 if pace_realtime else 0.0
+                first_partial_at: Optional[float] = None
+                partials = 0
+                start = time.perf_counter()
+
+                async def requests():
+                    cfg = pb.RecognitionConfig(
+                        encoding=pb.RecognitionConfig.LINEAR16_F32,
+                        sample_rate_hertz=sample.sample_rate,
+                        priority=0,
+                    )
+                    yield pb.StreamingRecognizeRequest(
+                        streaming_config=pb.StreamingRecognitionConfig(
+                            config=cfg, interim_results=True,
+                        )
+                    )
+                    last = time.perf_counter()
+                    for i in range(0, len(sample.samples), chunk_samples):
+                        chunk = sample.samples[i:i + chunk_samples]
+                        if chunk.size == 0:
+                            break
+                        yield pb.StreamingRecognizeRequest(
+                            audio_content=chunk.astype("<f4").tobytes()
+                        )
+                        if per_chunk > 0:
+                            elapsed = time.perf_counter() - last
+                            if elapsed < per_chunk:
+                                await asyncio.sleep(per_chunk - elapsed)
+                            last = time.perf_counter()
+
+                try:
+                    final_seen = False
+                    async for resp in stub.StreamingRecognize(requests()):
+                        if resp.is_final:
+                            final_seen = True
+                            break
+                        partials += 1
+                        if first_partial_at is None:
+                            first_partial_at = time.perf_counter()
+                    elapsed_ms = (time.perf_counter() - start) * 1000.0
+                    if final_seen:
+                        stats.n_ok += 1
+                        stats.latencies_ms.append(elapsed_ms)
+                        stats.total_audio_s += sample.duration_s
+                        stats.partial_counts.append(partials)
+                        if first_partial_at is not None:
+                            stats.first_partial_ms.append(
+                                (first_partial_at - start) * 1000.0
+                            )
+                    else:
+                        stats.n_fail += 1
+                except grpc.aio.AioRpcError as exc:
+                    code = exc.code()
+                    if code == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                        stats.n_rejected += 1
+                    else:
+                        stats.n_fail += 1
+                    key = f"grpc:{code.name}"
+                    stats.error_codes[key] = stats.error_codes.get(key, 0) + 1
+                except Exception:
+                    stats.n_fail += 1
+
+        t0 = time.perf_counter()
+        await asyncio.gather(*(one(s) for s in samples))
+        stats.wall_s = time.perf_counter() - t0
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -504,8 +719,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "--subroutines",
         nargs="+",
         default=["offline"],
-        choices=["offline", "whisper", "streaming"],
-        help="Which serving paths to benchmark (default: offline)",
+        choices=[
+            "offline", "whisper", "streaming",
+            "grpc_offline", "grpc_streaming",
+        ],
+        help=(
+            "Which serving paths to benchmark (default: offline).  All "
+            "chosen subroutines must agree on engine mode — "
+            "offline/whisper/grpc_offline → service_mode=offline; "
+            "streaming/grpc_streaming → service_mode=streaming."
+        ),
+    )
+    p.add_argument(
+        "--proto",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "rust" / "proto" / "oasr_asr.proto",
+        help="Path to the gRPC schema (only used by grpc_* subroutines).",
     )
     p.add_argument("--num-utterances", type=int, default=200)
     p.add_argument("--concurrency", "-c", type=int, default=16,
@@ -549,10 +778,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _build_parser().parse_args()
+    args.service_mode = _derive_service_mode(args.subroutines)
 
     samples = _load_dataset(args.audio_dir, args.num_utterances)
 
     handle: Optional[ServerHandle] = None
+    grpc_addr: str
     if args.server_url is None:
         if args.ckpt_dir is None and args.worker_script is None:
             raise SystemExit(
@@ -565,8 +796,10 @@ def main() -> int:
             args.ckpt_dir = Path("/tmp/fake-ckpt")
         handle = _spawn_server(args)
         http_url = handle.http_url
+        grpc_addr = handle.grpc_addr
     else:
         http_url = args.server_url.rstrip("/")
+        grpc_addr = args.grpc_bind
 
     # Bind the streaming pacing flag onto the function so the inner closure can
     # read it without changing the signature.
@@ -576,7 +809,7 @@ def main() -> int:
     try:
         for sub in args.subroutines:
             print(f"\n=== {sub} ===  (concurrency={args.concurrency}, "
-                  f"n={len(samples)})", flush=True)
+                  f"n={len(samples)}, mode={args.service_mode})", flush=True)
             if sub == "offline":
                 s = asyncio.run(_bench_offline(http_url, samples, args.concurrency))
             elif sub == "whisper":
@@ -585,6 +818,15 @@ def main() -> int:
                 s = asyncio.run(
                     _bench_streaming(http_url, samples, args.concurrency, args.chunk_ms)
                 )
+            elif sub == "grpc_offline":
+                s = asyncio.run(_bench_grpc_offline(
+                    grpc_addr, samples, args.concurrency, args.proto,
+                ))
+            elif sub == "grpc_streaming":
+                s = asyncio.run(_bench_grpc_streaming(
+                    grpc_addr, samples, args.concurrency, args.chunk_ms,
+                    args.proto, bool(args.realtime),
+                ))
             else:
                 raise SystemExit(f"unknown subroutine: {sub}")
             print(s.pretty(), flush=True)

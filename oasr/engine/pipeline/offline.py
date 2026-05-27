@@ -33,19 +33,32 @@ from __future__ import annotations
 import queue
 import threading
 from concurrent.futures import Future
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import ClassVar, Dict, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 
-from .request import Request, RequestOutput, RequestState
+from ..request import Request, RequestOutput, RequestState
+from ..scheduler import Scheduler
+from .base import Pipeline
 
 
-class OfflinePipeline:
-    """Execute a list of offline requests with CPU/GPU overlap."""
+class OfflinePipeline(Pipeline):
+    """Execute offline batches with length-bucketed CPU/GPU overlap.
+
+    See :class:`oasr.engine.pipeline.base.Pipeline` for the per-tick
+    protocol.  Offline pipelines admit-and-finalise within a single
+    ``step()`` cycle (no per-request running state); the persistent
+    producer thread keeps collation of micro-batch ``k+1`` running while
+    the GPU consumes ``k``.
+    """
+
+    streaming: ClassVar[bool] = False
 
     def __init__(
         self,
         *,
+        scheduler: Scheduler,
         input_processor,
         model_runner,
         output_processor,
@@ -57,6 +70,7 @@ class OfflinePipeline:
         preferred_sizes: Optional[Sequence[int]] = None,
         persistent_producer: bool = True,
     ) -> None:
+        self._scheduler = scheduler
         self._inp = input_processor
         self._mr = model_runner
         self._op = output_processor
@@ -108,6 +122,69 @@ class OfflinePipeline:
             self._in_flight = 0
             self._in_flight_lock = threading.Lock()
             self._producer_error: List[BaseException] = []
+
+    # ------------------------------------------------------------------
+    # Pipeline ABC
+    # ------------------------------------------------------------------
+
+    def admit(self, request: Request) -> None:
+        """Prepare an offline request and enqueue it for batching."""
+        self._inp.prepare_offline(request)
+        self._scheduler.add_request(request)
+
+    def feed_chunk(
+        self,
+        request_id: str,
+        chunk: Union[torch.Tensor, "np.ndarray"],
+        is_last: bool = False,
+    ) -> None:
+        raise NotImplementedError(
+            "OfflinePipeline does not accept streaming audio chunks. "
+            "Set service_mode='streaming' if you need feed_chunk."
+        )
+
+    def abort(self, request_id: str) -> None:
+        """Drop a request from the offline waiting queue.
+
+        Offline requests don't allocate a per-stream cache, so there is
+        nothing to free beyond the scheduler entry itself.  Requests
+        already submitted to the persistent producer are intentionally
+        not interrupted — they complete and drop on the next drain.
+        """
+        self._scheduler.abort_request(request_id)
+
+    def step(self) -> List[RequestOutput]:
+        """One engine tick: pull a batch from the scheduler, submit to
+        the persistent producer, and drain whatever's ready.
+
+        Returns outputs from this submission **or** earlier ones (the
+        persistent producer overlaps collation across step boundaries).
+        """
+        batch = self._scheduler.schedule_offline()
+        if batch:
+            self.submit(batch)
+        return self.drain_ready()
+
+    def has_pending(self) -> bool:
+        return (
+            self._scheduler.num_waiting_offline > 0
+            or self.in_flight() > 0
+        )
+
+    def num_running(self) -> int:
+        """Submitted-but-not-yet-drained requests.
+
+        Offline requests never park in the scheduler's ``_running`` map
+        (that's streaming-only), so the only meaningful "running" count
+        is the persistent pipeline's in-flight depth.
+        """
+        return self.in_flight()
+
+    def num_waiting(self) -> int:
+        return self._scheduler.num_waiting_offline
+
+    def find_request(self, request_id: str) -> Optional[Request]:
+        return self._scheduler.find_request(request_id)
 
     # ------------------------------------------------------------------
     # Public API
