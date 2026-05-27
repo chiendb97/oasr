@@ -158,6 +158,15 @@ class EngineConfig:
     # above 3 rarely help because CPU prep is usually only 1–2 micro-batches
     # ahead of the GPU in steady state.
     offline_pipeline_depth: int = 3
+    # Keep the offline producer thread alive across ``step()`` calls so the
+    # collate of batch ``k+1`` overlaps with the encoder-forward+decode of
+    # batch ``k``.  When ``False`` each step rebuilds a fresh producer (the
+    # legacy per-batch behavior), which is fine for ``transcribe(list)``
+    # but loses pipelining when reqs arrive one-at-a-time over HTTP/gRPC
+    # and the scheduler only hands out small per-step batches.  Defaults
+    # ``True`` because the HTTP-frontend workload is the throughput-critical
+    # case and the cross-batch behavior is a strict superset of legacy.
+    offline_persistent_pipeline: bool = True
     # Run fbank/mfcc feature extraction on the GPU for offline batches.
     # When ``True`` (default) the pipeline pads waveforms, ships them to
     # the device with one H2D copy, and runs torchaudio's kaldi-compliant
@@ -228,8 +237,13 @@ class EngineConfig:
     # per-utterance fbank and causes large slowdowns on many-core hosts.
     cpu_intra_op_threads: int = 0
 
-    # Decoding
-    decoder_type: str = "ctc_prefix_beam"
+    # Decoding.  Default is the GPU CTC prefix beam — same algorithm as
+    # ``ctc_prefix_beam`` but the inner loop is a single batched C++ kernel
+    # instead of an N-times Python loop.  Benchmarked ~50× faster per-utt
+    # at common batch sizes (~5 ms decode for 64 reqs vs ~250 ms on CPU).
+    # Set to ``"ctc_prefix_beam"`` for the CPU path (e.g. when running
+    # without a GPU build), or ``"ctc_wfst"`` when ``fst_path`` is set.
+    decoder_type: str = "ctc_gpu"
     gpu_decoder_config: Optional[GpuDecoderConfig] = None
     cpu_decoder_config: Optional[DecoderConfig] = None
     fst_path: Optional[str] = None

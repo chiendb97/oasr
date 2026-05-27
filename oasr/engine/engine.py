@@ -129,6 +129,7 @@ class ASREngine:
             device=self._device,
             gpu_feature_extraction=bool(config.offline_gpu_feature_extraction),
             preferred_sizes=config.preferred_batch_size,
+            persistent_producer=bool(config.offline_persistent_pipeline),
         )
 
         # Pre-warm the encoder CUDA-Graph cache at each preferred batch
@@ -249,6 +250,50 @@ class ASREngine:
             self._scheduler.add_request(req)
         return req.request_id
 
+    def add_requests_batch(self, specs: List[Dict]) -> List[str]:
+        """Bulk admission — single Python entry for many requests.
+
+        Each ``spec`` is a dict with keys:
+
+        - ``audio``: ``None`` for a streaming-open admission (no audio yet);
+          otherwise the raw waveform (``str`` / ``Tensor`` / ``ndarray``)
+          that ``add_request`` would accept.
+        - ``request_id``: optional pre-assigned id.
+        - ``sample_rate``: int, defaults to ``16000``.
+        - ``streaming``: bool, defaults to ``True``.
+        - ``priority``: int, defaults to ``0``.
+
+        Holds ``self._lock`` for the whole batch — one acquire/release pair
+        instead of N — and avoids N round-trips across the PyO3 boundary
+        when the Rust dispatcher coalesces a tick's worth of admits.
+        Returns the assigned request ids in the same order.
+        """
+        request_ids: List[str] = []
+        with self._lock:
+            for spec in specs:
+                audio = spec.get("audio")
+                rid = spec.get("request_id")
+                sample_rate = int(spec.get("sample_rate", 16000))
+                streaming = bool(spec.get("streaming", True))
+                priority = int(spec.get("priority", 0))
+                req = Request(
+                    audio=audio,
+                    request_id=rid,
+                    streaming=streaming,
+                    sample_rate=sample_rate,
+                    priority=priority,
+                )
+                if streaming:
+                    if audio is None:
+                        self._input_processor.prepare_streaming_open(req)
+                    else:
+                        self._input_processor.prepare_streaming(req)
+                else:
+                    self._input_processor.prepare_offline(req)
+                self._scheduler.add_request(req)
+                request_ids.append(req.request_id)
+        return request_ids
+
     def add_streaming_request(
         self,
         request_id: Optional[str] = None,
@@ -352,11 +397,17 @@ class ASREngine:
                         self._model_runner.allocate_stream(req)
                 nvtx_pop()
 
-            # Offline batch — run the padded forward and finalise immediately.
+            # Offline batch — submit to the persistent producer for async
+            # collation, then drain whatever's ready (from this submission
+            # or prior ones).  When persistent mode is disabled the pipeline
+            # falls back to synchronous run inside submit + drain.
             if sched.offline_batch:
-                nvtx_push("offline_batch")
-                outputs.extend(self._run_offline_batch(sched.offline_batch))
+                nvtx_push("offline_submit")
+                self._offline_pipeline.submit(sched.offline_batch)
                 nvtx_pop()
+            nvtx_push("offline_drain")
+            outputs.extend(self._offline_pipeline.drain_ready())
+            nvtx_pop()
 
             running = sched.running_streams
             if running:
@@ -436,18 +487,16 @@ class ASREngine:
         """
         with self._lock:
             final_outputs: List[RequestOutput] = []
-            while self._scheduler.has_pending():
+            # Loop while the scheduler has work OR while reqs are still
+            # in flight inside the persistent offline pipeline (they were
+            # submitted on a prior step but haven't been drained yet).
+            while (
+                self._scheduler.has_pending()
+                or self._offline_pipeline.in_flight() > 0
+            ):
                 step_outputs = self.step()
                 final_outputs.extend(o for o in step_outputs if o.finished)
             return final_outputs
-
-    # ------------------------------------------------------------------
-    # Offline batch handling
-    # ------------------------------------------------------------------
-
-    def _run_offline_batch(self, batch: List[Request]) -> List[RequestOutput]:
-        """Forward one offline batch through the pipelined executor."""
-        return self._offline_pipeline.run(batch)
 
     # ------------------------------------------------------------------
     # Convenience API
@@ -507,9 +556,19 @@ class ASREngine:
 
     @property
     def num_running(self) -> int:
-        """Number of currently active streaming requests."""
+        """Active streaming requests + offline reqs in the persistent pipeline.
+
+        Offline requests that have been submitted to the pipeline but not yet
+        drained back as outputs count as "running" here so the Rust
+        dispatcher (which uses `num_running + num_waiting` to decide whether
+        to skip a step / enter an idle wait) keeps stepping until the
+        pipeline drains.
+        """
         with self._lock:
-            return self._scheduler.num_running
+            return (
+                self._scheduler.num_running
+                + self._offline_pipeline.in_flight()
+            )
 
     @property
     def num_waiting(self) -> int:

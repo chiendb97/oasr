@@ -55,6 +55,7 @@ class OfflinePipeline:
         sort_by_length: bool = True,
         gpu_feature_extraction: bool = True,
         preferred_sizes: Optional[Sequence[int]] = None,
+        persistent_producer: bool = True,
     ) -> None:
         self._inp = input_processor
         self._mr = model_runner
@@ -83,6 +84,30 @@ class OfflinePipeline:
             torch.cuda.Stream(device=device)
             if self._gpu_feat else None
         )
+
+        # ---- Persistent cross-step pipeline ----
+        # When enabled, a long-lived producer thread pulls submitted batches
+        # from `_incoming`, splits them into micro-batches, runs fbank /
+        # collate, and parks the result on `_ready` for the engine's step
+        # loop to drain (via :meth:`drain_ready`) on a later tick.  This
+        # lets `_collate(batch[k+1])` overlap with `_gpu_stage(batch[k])`
+        # **across** step boundaries — the within-batch pipelining in
+        # :meth:`run` only overlaps when one batch is split into multiple
+        # chunks, which doesn't happen when the scheduler hands out 10-20
+        # req batches under HTTP-driven trickle admission.
+        # Cross-step async pipeline state — see :meth:`submit` /
+        # :meth:`drain_ready`.  Each ``submit`` spawns a short-lived
+        # collate worker; outputs land on ``_ready`` and are consumed by
+        # ``drain_ready`` on the engine's step loop.
+        self._persistent_enabled = bool(persistent_producer)
+        if self._persistent_enabled:
+            self._ready: "queue.Queue[Optional[Tuple]]" = queue.Queue(
+                maxsize=max(2, self._depth)
+            )
+            self._stop_event = threading.Event()
+            self._in_flight = 0
+            self._in_flight_lock = threading.Lock()
+            self._producer_error: List[BaseException] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -117,6 +142,137 @@ class OfflinePipeline:
         for pos, orig in enumerate(orig_indices):
             restored[orig] = outputs[pos]
         return [r for r in restored if r is not None]
+
+    # ------------------------------------------------------------------
+    # Persistent cross-step pipeline
+    # ------------------------------------------------------------------
+
+    def submit(self, batch: List[Request]) -> None:
+        """Hand ``batch`` off for async collation.
+
+        Spawns a short-lived worker thread that splits ``batch`` into
+        micro-batches, runs fbank / collate on the side stream, and parks
+        each result on the internal ready queue.  Call :meth:`drain_ready`
+        on this or a subsequent step to run ``_gpu_stage`` against whatever
+        the worker has prepared.
+
+        Spawning a fresh thread per submission matches the proven
+        per-batch :meth:`_run_pipelined` pattern (which got engine-bench
+        to 1830 utts/s) and avoids the GIL-starvation behavior of a single
+        long-lived producer thread that empirically pays 100× per-collate
+        overhead under sustained dispatcher ticking.
+
+        When the persistent producer is disabled (``persistent_producer=False``
+        in the constructor) this falls back to a synchronous :meth:`run`
+        and buffers the outputs for the next ``drain_ready``.
+        """
+        if not batch:
+            return
+        if not self._persistent_enabled:
+            outputs = self.run(batch)
+            if outputs:
+                if not hasattr(self, "_sync_buffered"):
+                    self._sync_buffered: List[RequestOutput] = []
+                self._sync_buffered.extend(outputs)
+            return
+        with self._in_flight_lock:
+            self._in_flight += len(batch)
+        batch_ref = batch  # capture by ref for the worker
+
+        def worker() -> None:
+            try:
+                if self._device.type == "cuda":
+                    idx = (
+                        self._device.index
+                        if self._device.index is not None
+                        else torch.cuda.current_device()
+                    )
+                    torch.cuda.set_device(int(idx))
+                chunks, _orig_indices = self._split_chunks(batch_ref)
+                if self._gpu_feat:
+                    futures: Dict[str, "Future[torch.Tensor]"] = {}
+                else:
+                    ordered: List[Request] = [r for c in chunks for r in c]
+                    futures = self._inp.prefetch_features(ordered)
+                for c in chunks:
+                    if self._stop_event.is_set():
+                        return
+                    features, lengths, event = self._collate(c, futures)
+                    # Blocking put — backpressures the worker when the
+                    # consumer (engine.step) hasn't drained recent items.
+                    self._ready.put((c, features, lengths, event))
+            except BaseException as e:  # noqa: BLE001 — surface via drain
+                self._producer_error.append(e)
+                with self._in_flight_lock:
+                    self._in_flight -= len(batch_ref)
+
+        t = threading.Thread(
+            target=worker,
+            daemon=True,
+            name="oasr-offline-collate",
+        )
+        t.start()
+
+    def drain_ready(self, wait_first: float = 0.005) -> List[RequestOutput]:
+        """Run ``_gpu_stage`` for every collated micro-batch currently in
+        the ready queue.
+
+        When ``wait_first > 0`` and there is in-flight pipeline work but
+        nothing immediately ready, blocks up to ``wait_first`` seconds
+        waiting for the first item.  Required for cross-step pipelining:
+        without it the dispatcher's busy-loop (step → empty drain → step)
+        starves the collate worker of GIL and per-collate latency balloons
+        from ~5 ms to ~500 ms.  The blocking sleep parks the engine thread,
+        letting the worker thread acquire the GIL and do its Python work.
+        After the first item arrives (or the timeout expires) the rest of
+        the queue is drained non-blocking.
+
+        Surfaces producer-thread errors as exceptions on the caller, one
+        at a time per call.
+        """
+        if not self._persistent_enabled:
+            buffered = getattr(self, "_sync_buffered", None)
+            if buffered:
+                outputs = list(buffered)
+                buffered.clear()
+                return outputs
+            return []
+        if self._producer_error:
+            raise self._producer_error.pop(0)
+        outputs: List[RequestOutput] = []
+        first = True
+        while True:
+            try:
+                if first and wait_first > 0 and self.in_flight() > 0:
+                    item = self._ready.get(timeout=wait_first)
+                else:
+                    item = self._ready.get_nowait()
+            except queue.Empty:
+                break
+            first = False
+            chunk, features, lengths, event = item
+            chunk_outs = self._gpu_stage(chunk, features, lengths, event)
+            outputs.extend(chunk_outs)
+            with self._in_flight_lock:
+                self._in_flight -= len(chunk_outs)
+        return outputs
+
+    def in_flight(self) -> int:
+        """Requests currently submitted but not yet returned by
+        :meth:`drain_ready`.  Used by the engine to know whether to keep
+        looping ``step()`` after the scheduler queues are empty."""
+        if not self._persistent_enabled:
+            return len(getattr(self, "_sync_buffered", []))
+        with self._in_flight_lock:
+            return self._in_flight
+
+    def shutdown(self) -> None:
+        """Signal in-flight collate workers to stop ASAP.  Best-effort;
+        already-collated items remain in :attr:`_ready` and are drained
+        by the next :meth:`drain_ready`."""
+        if not self._persistent_enabled:
+            return
+        self._stop_event.set()
 
     # ------------------------------------------------------------------
     # Micro-batching
