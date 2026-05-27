@@ -15,7 +15,7 @@ pip install -e .
 # Target specific GPU architecture
 CUDA_ARCHITECTURES=80 pip install -e .
 
-# Install with serving extras (msgpack + pyzmq + client libs)
+# Install with serving extras (HTTP/WebSocket client libs for benchmarks)
 pip install -e .[serving]
 
 # Build the Rust serving frontend (binary used by the `oasr-server` console script)
@@ -181,7 +181,7 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
   - `ASREngine` — unified streaming + offline engine.  Step loop: schedule → batched GPU fbank ingest → encoder forward (length-bucketed offline micro-batches via `OfflinePipeline` overlap with one chunk per active streaming request) → CTC postprocess.  Handles offline + streaming requests in one pool; starvation bounded by `max_wait_time`.  Convenience helpers: `transcribe(...)` (streaming default) and `transcribe_offline(...)` (batched offline).
   - `graph_cache.py` — `EncoderGraphCache` lazily captures one `torch.cuda.CUDAGraph` per `(B, T_input, cache_t1_bucket)` shape, replays via pre-allocated input/output buffers. Persistent paging slots and `cnn_cache` are captured by **address**, so they must be allocated before the first capture and never reallocated. All captures share one CUDA Graph memory pool. Engine paths are slot-based (`forward_chunk_paged`) so the captured code path is stable across calls.
   - `Request` / `RequestOutput` / `RequestState` (`WAITING → RUNNING → FINISHED`).
-  - Internal modules: `scheduler.py`, `model_runner.py`, `pipeline.py`, `input_processor.py`, `output_processor.py`.
+  - Internal modules: `scheduler.py`, `model_runner.py`, `input_processor.py`, `output_processor.py`, plus the `pipeline/` package — `base.py` (`Pipeline` ABC), `offline.py` (`OfflinePipeline`: length-bucketed micro-batches, persistent cross-step collate producer with `submit`/`drain_ready`/`in_flight`), `streaming.py` (`StreamingPipeline`: chunk-by-chunk paged-KV). Service mode pinning: `EngineConfig.service_mode ∈ {"streaming","offline"}` selects exactly one pipeline per engine lifecycle; mismatched requests are rejected at admission.
 - **`features/`** — Batched audio feature extraction (FBANK / MFCC):
   - `FeatureConfig` — shared config for sample rate, mel bins, frame length/shift, dither, etc.
   - `fbank_batch` / `mfcc_batch` / `extract_features_batch` — offline batch extraction over padded `(B, T)` or list of waveforms.
@@ -208,33 +208,45 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
 | `docs/engine.md` | `ASREngine` step loop, batching, CUDA Graph capture |
 | `docs/engine_concurrency.md` | Engine thread-safety (RLock), worker thread modes, multi-process scaling |
 | `docs/scheduler.md` | Streaming + offline request scheduling, starvation bounds, micro-batching |
-| `docs/serving.md` | Rust `oasr-server` frontend: HTTP/gRPC/WebSocket API, multi-worker fleet, wire format |
+| `docs/serving.md` | Rust `oasr-server` frontend: HTTP/gRPC/WebSocket API, in-process PyO3 engine, wire format |
 - **`layers/`** — Thin `nn.Module`-style wrappers around functional API: `conv.py`, `linear.py`, `norm.py`, `attention/`, `rotary_embedding/`.
 - **`models/conformer/`** — Conformer model (`model.py`), config dataclass (`config.py`), weight conversion utility (`convert.py`).
 - **`utils/`** — `validation.py` (`@supported_compute_capability`, `@backend_requirement` decorators), `mappings.py` (dtype/enum helpers), `timer.py`.
-- **`serving/`** — Python engine-worker process driven by the Rust frontend:
-  - `engine_worker.py` — `EngineWorker` owns one `ASREngine` and a ZMQ ROUTER socket. Single-thread mode polls the socket and runs `engine.step()` inline; two-thread mode (`--worker-threads 2`) splits I/O and step across threads, safe under the engine's RLock. Entry point: `python -m oasr.serving` or its `main()`.
-  - `ipc.py` — MessagePack wire codec mirroring the Rust `oasr-wire` crate. Each message is `[header_msgpack, optional_audio_payload]`; audio is raw little-endian f32 mono PCM, decoded zero-copy with `np.frombuffer`. Command tags: `CreateOffline`, `CreateStreaming`, `FeedChunk`, `Cancel`, `Ping`. Event tags: `Accepted`, `Partial`, `Final`, `Error`, `Pong`, `Overloaded`.
-  - `server.py` — `oasr-server` console-script shim. Resolves the Rust binary (`$OASR_RS_BIN` → `PATH` → `rust/target/release/oasr-server`) and `os.execvp`s into it.
+- **`serving/` (removed)** — The Python ZMQ worker (`engine_worker.py` / `ipc.py` / `server.py`) is gone. `oasr-server` now embeds the engine in-process via PyO3 (see the Rust serving section below). The `oasr` Python package is a runtime dependency of the Rust binary — it must be importable at the active Python interpreter the binary linked against.
 
 ### Rust serving frontend (`rust/`)
 
-Cargo workspace that builds `oasr-server`, the binary the Python `oasr-server` console script execs. It supervises a fleet of Python workers (one per GPU) over ZeroMQ + MessagePack and exposes the engine over HTTP and gRPC.
+Cargo workspace that builds `oasr-server`, the binary the Python `oasr-server` console script execs. The binary hosts **one in-process Python `ASREngine` per process** via PyO3 (linked against `libpython` through `auto-initialize`) and serves it over HTTP + gRPC. Multi-GPU = launch N `oasr-server` processes behind a process manager, each with `CUDA_VISIBLE_DEVICES` set.
 
 | Crate | Role |
 |---|---|
-| `oasr-wire` | MessagePack wire schema shared verbatim with `oasr/serving/ipc.py` |
-| `oasr-engine-client` | Async ZMQ DEALER client, per-request demux, multi-worker pool (`EnginePool`) |
+| `oasr-wire` | Shared event/command types (`Cmd`, `Event`, `ErrorCode`, `ModelInfo`). Pure Rust — no codec / no IPC. |
+| `oasr-engine-client` | PyO3-backed driver: `PyEngine` wrapper, `EngineDispatcher` thread that owns the GIL and drives `engine.step()`, `EngineClient`/`EnginePool` async facades. |
 | `oasr-asr` | Audio decode (WAV via `hound`, raw PCM) to f32 mono `bytes::Bytes` |
 | `oasr-server-http` | axum routes: `/v1/transcriptions`, `/v1/stream` (WS), Whisper-compat `/v1/audio/transcriptions`, `/healthz`, `/readyz`, `/metrics`, `/v1/models` |
 | `oasr-server-grpc` | tonic `oasr.asr.v1.Speech` service (`Recognize` unary + `StreamingRecognize` bidi). Proto in `rust/proto/oasr_asr.proto` |
-| `oasr-server` | Binary: CLI, worker supervisor, runtime wiring |
+| `oasr-server` | Binary: CLI, Python interpreter init, engine + HTTP + gRPC wiring. **One process per GPU**; spawn multiple `oasr-server` processes for multi-GPU. |
 
-Routing policy: **offline** → least-loaded worker (`num_running + num_waiting` min); **streaming** → least-loaded at admission, then **sticky** by `request_id` for subsequent chunks / Cancel. Streaming state cannot migrate between workers; worker death surfaces `Event::Error{code: WORKER_LOST}` for in-flight streams. `/readyz` returns 200 iff any worker has produced a `Pong` in the last 5 s. Build deps: `libzmq3-dev`, `protobuf-compiler`, a C/C++ toolchain. ZMQ transport defaults to `tcp://` — the pure-Rust `zeromq` crate handshake can hang over `ipc://` on some Linux setups.
+Routing policy: single in-process engine per `oasr-server` process — no sticky map needed at the pool level (the pool exists for symmetry with a future multi-engine-per-process layout). `/readyz` returns 200 once the dispatcher has taken its first tick. Build deps: a Python development install (PyO3 links against `libpython` via `auto-initialize`), `protobuf-compiler`, a C/C++ toolchain.
+
+**Dispatcher (`oasr-engine-client::dispatcher`)** is the GIL-owning thread that drains commands from the tokio mpsc channel, replays them into Python (`add_request`/`feed_chunk`/`cancel`), runs `engine.step()`, and pushes the resulting events back via per-request channels. Key knobs (CLI flags on `oasr-server`):
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--engine-label` | `engine` | tracing label |
+| `--service-mode` | `streaming` | `streaming` or `offline` — pins the engine for its lifetime |
+| `--max-concurrent-requests` | `256` | engine-side admission cap; over-cap admits emit `Event::Overloaded` |
+| `--admit-window-ms` | `3` | wait up to N ms after first envelope for siblings before stepping (HTTP burst coalescing); `0` disables |
+| `--admit-threshold` | `64` | stop coalescing early when this many envelopes drained |
+| `--preferred-batch-sizes` | none | comma list, pre-warms CUDA-Graph capture per B |
+| `--schedule-policy` | engine default (`bucket`) | `bucket` / `fcfs` / `sjf` |
+| `--max-offline-pad-ratio` | engine default (`4.0`) | padded-waste cap for `bucket` policy |
+
+Admission coalescing batches contiguous `CreateOffline`/`CreateStreaming` envelopes into one `add_requests_batch` Python call — turns 10–20-deep service batches into 32–64 under `asyncio.gather`-style bursts. `FeedChunk`/`Cancel`/`Ping` flush the admit batch first to preserve `CreateStreaming → FeedChunk` ordering. The Python-side `oasr/serving/` directory still exists but is dead code from the binary's perspective; `bench_service.py` rejects `--num-workers > 1` with a helpful error pointing at the new "one process per GPU" topology.
 
 ### Engine concurrency
 
-`ASREngine` is **thread-safe** as of v0.1: every public entry (`add_request`, `add_streaming_request`, `feed_chunk`, `abort_request`, `step`, `run`, `num_running`, `num_waiting`, `transcribe`) acquires a process-wide re-entrant `threading.RLock`. Protects the scheduler queues (`_streaming_waiting`, `_offline_waiting`, `_running`, `_index` in `oasr/engine/scheduler.py`) and per-request audio mutation (`request.audio_chunks`, `request.audio_final`). The lock is coarse — `step()` holds it for the full 10–100 ms GPU-bound step — but the GIL serializes Python anyway and CUDA releases the GIL during forward, so two-thread serving (`--worker-threads 2`) still overlaps ZMQ ingestion with `step()`. Horizontal scale is multi-process via the Rust frontend, not multi-thread inside one engine.
+`ASREngine` is **thread-safe** as of v0.1: every public entry (`add_request`, `add_streaming_request`, `feed_chunk`, `abort_request`, `step`, `run`, `num_running`, `num_waiting`, `transcribe`) acquires a process-wide re-entrant `threading.RLock`. Protects the scheduler queues (`_streaming_waiting`, `_offline_waiting`, `_running`, `_index` in `oasr/engine/scheduler.py`) and per-request audio mutation (`request.audio_chunks`, `request.audio_final`). The lock is coarse — `step()` holds it for the full 10–100 ms GPU-bound step — but the GIL serializes Python anyway and CUDA releases the GIL during forward. Under serving, the PyO3 dispatcher (`oasr-engine-client::dispatcher`) is the only Python caller and runs single-threaded; HTTP/gRPC handlers stay on tokio and never touch the GIL. Horizontal scale is **one process per GPU** — launch multiple `oasr-server` processes behind a process manager.
 
 ### Binding pattern (FlashInfer-style)
 
