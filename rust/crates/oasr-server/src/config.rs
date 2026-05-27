@@ -1,6 +1,11 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 //! CLI / runtime config.
+//!
+//! After the move to PyO3 in-process engines (one engine per process, one
+//! process per GPU), the supervisor + subprocess-spawning options went away
+//! and the binary now reads engine config like `engine_worker.py` did:
+//! optional JSON file + flag overrides.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -10,43 +15,8 @@ use clap::Parser;
 use serde_json::{Map, Value};
 
 #[derive(Debug, Parser)]
-#[command(name = "oasr-server", version, about = "OASR HTTP + gRPC frontend")]
+#[command(name = "oasr-server", version, about = "OASR HTTP + gRPC frontend with in-process Python engine")]
 pub struct Cli {
-    // ---- Worker fleet ----
-    /// Number of Python worker processes to spawn.  Defaults to 1.
-    #[arg(long, default_value_t = 1)]
-    pub num_workers: usize,
-    /// Comma-separated CUDA device list mapping worker `k` to GPU `cuda_devices[k]`.
-    /// Defaults to "0,1,...,num_workers-1".
-    #[arg(long)]
-    pub cuda_devices: Option<String>,
-    /// Python worker thread mode: 1 (default) or 2.
-    #[arg(long, default_value_t = 1)]
-    pub worker_threads: u32,
-    /// Path to the Python interpreter and module spec.
-    #[arg(long, default_value = "python")]
-    pub python: String,
-    /// Module spec passed after the python interpreter.
-    #[arg(long, default_value = "oasr.serving")]
-    pub worker_module: String,
-    /// If set, the supervisor spawns ``python <worker_script>`` instead of
-    /// ``python -m <worker_module>``.  Useful for tests and benchmarks that
-    /// drive a stub worker (e.g. ``scripts/fake_engine_worker.py``).
-    #[arg(long)]
-    pub worker_script: Option<PathBuf>,
-    /// Base ZMQ endpoint; `{k}` is replaced with worker index, `{pid}` with
-    /// the server pid.  Default uses TCP because the pure-Rust `zeromq` crate
-    /// interoperates reliably with pyzmq only over TCP at this version.
-    #[arg(long, default_value = "tcp://127.0.0.1:{port}")]
-    pub zmq_endpoint_base: String,
-    /// Base TCP port for worker endpoints; worker `k` binds `--worker-port-base + k`.
-    #[arg(long, default_value_t = 55580)]
-    pub worker_port_base: u16,
-    /// Spawn workers (default) or assume they're already listening on
-    /// `zmq_endpoint_base` (then `num_workers` endpoints must already exist).
-    #[arg(long, default_value_t = true)]
-    pub spawn_workers: bool,
-
     // ---- Engine config (mirror EngineConfig essentials) ----
     /// Required: WeNet checkpoint directory.
     #[arg(long)]
@@ -70,9 +40,33 @@ pub struct Cli {
     /// Decoder type.
     #[arg(long)]
     pub decoder_type: Option<String>,
+    /// Preferred batch sizes (comma-separated, e.g. `1,4,16,32,64`).  Drives
+    /// the encoder CUDA-Graph pre-warm so the first request at each B value
+    /// replays a captured graph instead of triggering capture mid-traffic.
+    /// Values must be <= max_batch_size; the engine dedupes/sorts internally.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub preferred_batch_sizes: Option<Vec<u32>>,
+    /// Offline scheduling policy.  ``"bucket"`` (engine default) groups by
+    /// audio length using ``max_offline_pad_ratio`` as the safety cap;
+    /// ``"fcfs"`` is strict FIFO with no bucketing (bigger batches under
+    /// HTTP-trickle admission but more padded compute waste); ``"sjf"`` is
+    /// shortest-job-first.
+    #[arg(long)]
+    pub schedule_policy: Option<String>,
+    /// Padded-waste ratio cap for the bucket policy: a candidate is rejected
+    /// if adding it would push ``(max_len * batch_size) / sum_len`` above
+    /// this value.  Engine default is 4.0; raise to 8-16 for service
+    /// workloads where the per-batch padding cost is much smaller than the
+    /// per-batch dispatch overhead — directly grows per-step batches from
+    /// 10-20 to 30-60 on mixed-length traffic.
+    #[arg(long)]
+    pub max_offline_pad_ratio: Option<f64>,
     /// Full EngineConfig JSON file; values override individual flags above.
     #[arg(long)]
     pub engine_config: Option<PathBuf>,
+    /// Display label for tracing / logs (defaults to "engine").
+    #[arg(long, default_value = "engine")]
+    pub engine_label: String,
 
     // ---- Server ----
     #[arg(long, default_value = "0.0.0.0:8080")]
@@ -81,26 +75,23 @@ pub struct Cli {
     pub grpc_bind: SocketAddr,
     #[arg(long, default_value_t = 256)]
     pub max_concurrent_requests: u32,
+    /// Dispatcher admission coalescing window in milliseconds.  After the
+    /// first envelope arrives in a tick, wait up to this long for siblings
+    /// to land before stepping.  ``0`` disables (step ASAP).  Default 3 ms
+    /// — empirically grows per-step batches from 10-20 to 32-64 under
+    /// `asyncio.gather` HTTP bursts without a measurable p50 hit.
+    #[arg(long, default_value_t = 3)]
+    pub admit_window_ms: u64,
+    /// Coalescing target — stop waiting early once this many envelopes
+    /// have been drained.  Default 64 (matches the typical max_batch_size).
+    #[arg(long, default_value_t = 64)]
+    pub admit_threshold: usize,
     #[arg(long, default_value = "info")]
     pub log_level: String,
-    /// Soft timeout (s) for the READY handshake when spawning workers.
-    #[arg(long, default_value_t = 120)]
-    pub ready_timeout_s: u64,
 }
 
 impl Cli {
-    pub fn resolved_cuda_devices(&self) -> Vec<i32> {
-        if let Some(s) = self.cuda_devices.as_deref() {
-            s.split(',')
-                .filter(|t| !t.is_empty())
-                .filter_map(|t| t.trim().parse::<i32>().ok())
-                .collect()
-        } else {
-            (0..self.num_workers as i32).collect()
-        }
-    }
-
-    /// Build the full EngineConfig JSON object that goes to each worker.
+    /// Build the full EngineConfig JSON object handed to `PyEngine::new`.
     pub fn build_engine_config_json(&self) -> Result<String> {
         let mut obj: Map<String, Value> = if let Some(p) = &self.engine_config {
             let bytes = std::fs::read(p).with_context(|| format!("read engine_config {p:?}"))?;
@@ -143,7 +134,25 @@ impl Cli {
             obj.entry("decoder_type")
                 .or_insert(Value::String(s.clone()));
         }
-        // device defaults to "cuda" — let EngineConfig fall back if absent.
+        if let Some(sizes) = &self.preferred_batch_sizes {
+            let arr: Vec<Value> = sizes
+                .iter()
+                .map(|&v| Value::Number(v.into()))
+                .collect();
+            obj.entry("preferred_batch_size")
+                .or_insert(Value::Array(arr));
+        }
+        if let Some(s) = &self.schedule_policy {
+            obj.entry("schedule_policy")
+                .or_insert(Value::String(s.clone()));
+        }
+        if let Some(r) = self.max_offline_pad_ratio {
+            if let Some(n) = serde_json::Number::from_f64(r) {
+                obj.entry("max_offline_pad_ratio")
+                    .or_insert(Value::Number(n));
+            }
+        }
+        // device defaults to "cuda" — EngineConfig falls back if absent.
 
         Ok(serde_json::to_string(&Value::Object(obj))?)
     }

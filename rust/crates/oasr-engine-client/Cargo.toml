@@ -3,7 +3,7 @@ name = "oasr-engine-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Async ZeroMQ client to the OASR Python engine worker, with a multi-worker pool."
+description = "In-process driver for the OASR Python ASREngine via PyO3; per-engine handles + multi-engine pool."
 
 [dependencies]
 oasr-wire = { path = "../oasr-wire" }
@@ -18,8 +18,10 @@ parking_lot = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-zeromq = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+pyo3 = { workspace = true }
+numpy = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

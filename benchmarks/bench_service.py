@@ -171,14 +171,24 @@ class ServerHandle:
 
 
 def _spawn_server(args: argparse.Namespace) -> ServerHandle:
+    if args.num_workers != 1:
+        raise SystemExit(
+            "--num-workers > 1 is no longer supported: oasr-server now runs one "
+            "in-process engine per process.  For multi-GPU, launch N oasr-server "
+            "processes manually with distinct --http-bind/--grpc-bind and "
+            "CUDA_VISIBLE_DEVICES set per process."
+        )
+    if args.worker_script is not None:
+        raise SystemExit(
+            "--worker-script is no longer supported: the Rust binary no longer "
+            "spawns a Python subprocess (engine is in-process via PyO3)."
+        )
     bin_path = _resolve_server_bin()
     http_bind = args.http_bind
     grpc_bind = args.grpc_bind
     cmd = [
         str(bin_path),
         "--ckpt-dir", str(args.ckpt_dir),
-        "--num-workers", str(args.num_workers),
-        "--worker-threads", str(args.worker_threads),
         "--http-bind", http_bind,
         "--grpc-bind", grpc_bind,
         # Engine in-flight cap should comfortably exceed the bench
@@ -192,13 +202,16 @@ def _spawn_server(args: argparse.Namespace) -> ServerHandle:
         cmd.extend(["--max-batch-size", str(args.max_batch_size)])
     if args.chunk_size is not None:
         cmd.extend(["--chunk-size", str(args.chunk_size)])
-    if args.cuda_devices:
-        cmd.extend(["--cuda-devices", args.cuda_devices])
-    if args.worker_script is not None:
-        cmd.extend(["--worker-script", str(args.worker_script)])
 
     print(f"[bench] spawning: {' '.join(cmd)}", flush=True)
     env = os.environ.copy()
+    # The binary picks the active GPU via CUDA_VISIBLE_DEVICES; map the
+    # legacy --cuda-devices flag onto it (first device only, since one
+    # process == one engine == one GPU).
+    if args.cuda_devices:
+        first = args.cuda_devices.split(",")[0].strip()
+        if first:
+            env["CUDA_VISIBLE_DEVICES"] = first
     proc = subprocess.Popen(cmd, env=env)
 
     # Wait for /readyz.

@@ -159,8 +159,7 @@ impl EnginePool {
 }
 
 // Re-export so the `oasr-server` binary doesn't need to depend on tokio.
-pub use crate::client::CmdEnvelope as _CmdEnvelopeAlias;
-pub use crate::client::CmdEnvelope as CmdEnvelopePub;
+pub use crate::dispatcher::CmdEnvelope as CmdEnvelopePub;
 
 // Allow tests to introspect.
 #[doc(hidden)]

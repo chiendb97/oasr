@@ -3,13 +3,10 @@ name = "oasr-wire"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "MessagePack wire schema shared between the Rust frontend and the Python engine worker."
+description = "Shared type definitions for the OASR engine boundary (Cmd/Event/ErrorCode/ModelInfo)."
 
 [dependencies]
 serde = { workspace = true }
-rmp-serde = { workspace = true }
-bytes = { workspace = true }
-thiserror = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

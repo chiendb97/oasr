@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Per-request handles returned by [`EngineClient`] / [`EnginePool`].
 //!
-//! [`StreamingHandle`] holds the audio sender + event receiver for a
-//! streaming session; dropping it sends a `Cmd::Cancel` to the worker.
+//! [`StreamingHandle`] holds a clone of the dispatcher command sender + the
+//! event receiver for one streaming session.  `push_chunk` / `flush_last`
+//! build `Cmd::FeedChunk` envelopes inline and send them directly to the
+//! dispatcher — there's no intermediate forwarder task.  Dropping the
+//! handle without an explicit `finish` emits a `Cmd::Cancel`.
 //!
 //! [`OfflineHandle`] is a oneshot future that resolves with the Final or
 //! Error event.
@@ -15,7 +18,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::trace;
 
-use crate::client::CmdEnvelope;
+use crate::dispatcher::CmdEnvelope;
 use crate::router::RouterActor;
 use crate::EventStream;
 
@@ -51,7 +54,7 @@ impl Drop for CancelOnDrop {
             request_id: self.request_id.clone(),
         };
         let envelope = CmdEnvelope::new(cancel, None);
-        // Best effort — if the worker has already died, the cmd_tx is closed.
+        // Best effort — if the dispatcher has gone away, cmd_tx is closed.
         if let Err(e) = self.cmd_tx.try_send(envelope) {
             trace!(rid = %self.request_id, "could not send cancel on drop: {e}");
         }
@@ -62,7 +65,7 @@ impl Drop for CancelOnDrop {
 /// Streaming request handle: push audio chunks, pull events.
 pub struct StreamingHandle {
     pub request_id: String,
-    audio_tx: mpsc::Sender<(Bytes, bool)>,
+    cmd_tx: mpsc::Sender<CmdEnvelope>,
     pub events: EventStream,
     _cancel: Arc<parking_lot::Mutex<CancelOnDrop>>,
 }
@@ -70,7 +73,6 @@ pub struct StreamingHandle {
 impl StreamingHandle {
     pub(crate) fn new(
         request_id: String,
-        audio_tx: mpsc::Sender<(Bytes, bool)>,
         events: EventStream,
         cmd_tx: mpsc::Sender<CmdEnvelope>,
         router: RouterActor,
@@ -78,26 +80,50 @@ impl StreamingHandle {
         Self {
             _cancel: Arc::new(parking_lot::Mutex::new(CancelOnDrop::arm(
                 request_id.clone(),
-                cmd_tx,
+                cmd_tx.clone(),
                 router,
             ))),
             request_id,
-            audio_tx,
+            cmd_tx,
             events,
         }
     }
 
     /// Push one audio chunk with `is_last=false`.
-    pub async fn push_chunk(&self, audio: Bytes) -> Result<(), bytes::Bytes> {
-        self.audio_tx.send((audio, false)).await.map_err(|e| e.0 .0)
+    ///
+    /// On send failure (dispatcher gone, channel closed), returns the chunk
+    /// bytes back to the caller so they can decide whether to retry or
+    /// surface an error to the API client.
+    pub async fn push_chunk(&self, audio: Bytes) -> Result<(), Bytes> {
+        let envelope = CmdEnvelope::new(
+            Cmd::FeedChunk {
+                request_id: self.request_id.clone(),
+                is_last: false,
+            },
+            Some(audio),
+        );
+        self.cmd_tx
+            .send(envelope)
+            .await
+            .map_err(|e| e.0.payload.unwrap_or_default())
     }
 
-    /// Push the final audio chunk with `is_last=true` and disarm cancel-on-drop.
-    /// Pass an empty `Bytes` if the caller already exhausted audio.  The
-    /// envelope is enqueued behind any in-flight `push_chunk` calls so
-    /// ordering is preserved.
-    pub async fn flush_last(&self, audio: Bytes) -> Result<(), bytes::Bytes> {
-        let result = self.audio_tx.send((audio, true)).await.map_err(|e| e.0 .0);
+    /// Push the final audio chunk with `is_last=true` and disarm
+    /// cancel-on-drop.  Pass an empty `Bytes` if the caller already
+    /// exhausted audio.
+    pub async fn flush_last(&self, audio: Bytes) -> Result<(), Bytes> {
+        let envelope = CmdEnvelope::new(
+            Cmd::FeedChunk {
+                request_id: self.request_id.clone(),
+                is_last: true,
+            },
+            Some(audio),
+        );
+        let result = self
+            .cmd_tx
+            .send(envelope)
+            .await
+            .map_err(|e| e.0.payload.unwrap_or_default());
         self.finish();
         result
     }
