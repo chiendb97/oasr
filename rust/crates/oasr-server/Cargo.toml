@@ -30,6 +30,7 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 axum = { workspace = true }
 tonic = { workspace = true }
+tonic-health = { workspace = true }
 hyper = { workspace = true }
 
 [dev-dependencies]

@@ -7,8 +7,8 @@ Requires ``grpcio`` and ``grpcio-tools``::
 
     pip install grpcio grpcio-tools
 
-Generates the stubs at runtime from ``rust/proto/oasr_asr.proto`` so the
-script stays self-contained.
+Generates the stubs at runtime from ``rust/proto/oasr_speech_v1.proto`` so
+the script stays self-contained.
 
 Usage::
 
@@ -67,8 +67,8 @@ def _gen_stubs(proto_path: Path):
         raise RuntimeError(f"protoc failed with rc={rc}")
 
     sys.path.insert(0, str(out))
-    pb = importlib.import_module("oasr_asr_pb2")
-    pb_grpc = importlib.import_module("oasr_asr_pb2_grpc")
+    pb = importlib.import_module("oasr_speech_v1_pb2")
+    pb_grpc = importlib.import_module("oasr_speech_v1_pb2_grpc")
     return pb, pb_grpc
 
 
@@ -85,8 +85,9 @@ async def run(addr: str, wav: Path, chunk_ms: int, proto: Path) -> int:
 
         async def requests():
             cfg = pb.RecognitionConfig(
-                encoding=pb.RecognitionConfig.LINEAR16_F32,
+                encoding=pb.RecognitionConfig.LINEAR32F,
                 sample_rate_hertz=sr,
+                language_code="en-US",
                 priority=0,
             )
             yield pb.StreamingRecognizeRequest(
@@ -104,10 +105,12 @@ async def run(addr: str, wav: Path, chunk_ms: int, proto: Path) -> int:
 
         responses = stub.StreamingRecognize(requests())
         async for resp in responses:
-            tag = "FINAL" if resp.is_final else "PARTIAL"
-            print(f"[{tag}] rid={resp.request_id} text={resp.text!r}")
-            if resp.is_final:
-                break
+            for r in resp.results:
+                tag = "FINAL" if r.is_final else "PARTIAL"
+                text = r.alternatives[0].transcript if r.alternatives else ""
+                print(f"[{tag}] rid={resp.request_id} text={text!r}")
+                if r.is_final:
+                    return 0
     return 0
 
 
@@ -119,7 +122,7 @@ def main(argv: list[str]) -> int:
     p.add_argument(
         "--proto",
         type=Path,
-        default=Path(__file__).resolve().parent.parent / "rust" / "proto" / "oasr_asr.proto",
+        default=Path(__file__).resolve().parent.parent / "rust" / "proto" / "oasr_speech_v1.proto",
     )
     args = p.parse_args(argv)
     return asyncio.run(run(args.addr, args.wav, args.chunk_ms, args.proto))

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""OASR Serving Benchmark — HTTP + WebSocket against the Rust frontend.
+"""OASR Serving Benchmark — HTTP + gRPC against the Rust frontend.
 
 Measures end-to-end serving throughput and latency for the OASR ``oasr-server``
 binary.  Mirrors the CLI shape of ``benchmarks/bench_engine.py`` so the same
@@ -9,13 +9,17 @@ binary.  Mirrors the CLI shape of ``benchmarks/bench_engine.py`` so the same
 
 Subroutines (one or more)
 -------------------------
-``offline``  ``POST /v1/transcriptions`` with raw f32 PCM bodies, N concurrent
-             clients.  Reports RTF, total throughput, p50 / p95 / p99 latency.
-``whisper``  ``POST /v1/audio/transcriptions`` (OpenAI Whisper-compat) with
-             multipart WAV uploads, N concurrent clients.
-``streaming`` ``GET /v1/stream`` (WebSocket).  Each client opens one stream
-             at a time and feeds the audio in fixed-duration chunks; reports
-             first-partial latency, total stream wall time, and RTF.
+``offline``         ``POST /v1/speech:recognize`` (Google STT v1-shaped JSON,
+                    audio as base64), N concurrent clients.  Reports RTF,
+                    total throughput, p50 / p95 / p99 latency.
+``grpc_offline``    Unary ``oasr.speech.v1.Speech/Recognize``.
+``grpc_streaming``  Bidi ``oasr.speech.v1.Speech/StreamingRecognize``.  Each
+                    client opens one stream, feeds fixed-duration chunks,
+                    and consumes interim + final results.
+
+The pre-refactor ``streaming`` (WebSocket) and ``whisper`` (multipart)
+subroutines are intentionally removed: ``oasr-server`` now exposes only the
+HTTP + gRPC surfaces shaped after Google Cloud Speech-to-Text v1.
 
 Examples
 --------
@@ -23,12 +27,12 @@ Examples
 python benchmarks/bench_service.py \\
     --ckpt-dir /data01/kilm/users/chiendb/models/asr/am/20210610_u2pp_conformer_exp_librispeech \\
     --audio-dir /data01/kilm/users/chiendb/data/asr/ljspeech-sr16k-dataset/wavs \\
-    --subroutines streaming \\
+    --subroutines grpc_streaming \\
     --max-batch-size 64 --num-utterances 2000
 
 # Use a running server (skip spawn)
 python benchmarks/bench_service.py \\
-    --audio-dir /path/to/wavs --subroutines offline streaming \\
+    --audio-dir /path/to/wavs --subroutines offline grpc_streaming \\
     --server-url http://127.0.0.1:8080 --num-utterances 500
 """
 
@@ -36,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import statistics
@@ -86,7 +91,7 @@ class Sample:
     samples: np.ndarray
     sample_rate: int
     duration_s: float
-    wav_bytes: bytes  # the original on-disk WAV (used by whisper-compat path)
+    wav_bytes: bytes  # on-disk WAV (used by the WAV-encoded HTTP path)
 
 
 def _load_dataset(audio_dir: Path, n: int) -> List[Sample]:
@@ -143,18 +148,34 @@ def _resolve_server_bin() -> Path:
     )
 
 
-_OFFLINE_SUBROUTINES = frozenset({"offline", "whisper", "grpc_offline"})
-_STREAMING_SUBROUTINES = frozenset({"streaming", "grpc_streaming"})
+_OFFLINE_SUBROUTINES = frozenset({"offline", "grpc_offline"})
+_STREAMING_SUBROUTINES = frozenset({"grpc_streaming"})
+_REMOVED_SUBROUTINES = {
+    "whisper": (
+        "the Whisper-compat endpoint /v1/audio/transcriptions is no longer "
+        "served — oasr-server now exposes only the Google STT v1-shaped "
+        "HTTP + gRPC surface.  Use the `offline` subroutine for /v1/speech:recognize."
+    ),
+    "streaming": (
+        "the WebSocket endpoint /v1/stream is no longer served — switch to "
+        "the gRPC bidi `grpc_streaming` subroutine."
+    ),
+}
 
 
 def _derive_service_mode(subroutines: List[str]) -> str:
     """Pick the engine ``service_mode`` from the chosen subroutines.
 
     The Rust frontend wraps a single-mode engine, so all chosen
-    subroutines must agree.  ``offline`` / ``whisper`` / ``grpc_offline``
-    require ``service_mode=offline``; ``streaming`` / ``grpc_streaming``
-    require ``service_mode=streaming``.  Mixed sets are rejected.
+    subroutines must agree.  ``offline`` / ``grpc_offline`` require
+    ``service_mode=offline``; ``grpc_streaming`` requires
+    ``service_mode=streaming``.  Mixed sets are rejected.
     """
+    for sub in subroutines:
+        if sub in _REMOVED_SUBROUTINES:
+            raise SystemExit(
+                f"subroutine {sub!r} has been removed: {_REMOVED_SUBROUTINES[sub]}"
+            )
     has_offline = any(s in _OFFLINE_SUBROUTINES for s in subroutines)
     has_streaming = any(s in _STREAMING_SUBROUTINES for s in subroutines)
     if has_offline and has_streaming:
@@ -263,7 +284,7 @@ def _spawn_server(args: argparse.Namespace) -> ServerHandle:
 class RunStats:
     name: str
     n_ok: int = 0
-    n_rejected: int = 0  # backpressure (503 / Error{BUSY}) — server says retry later
+    n_rejected: int = 0  # backpressure (503 / RESOURCE_EXHAUSTED) — server says retry later
     n_fail: int = 0  # hard transport failures (TCP reset, decode, etc.)
     wall_s: float = 0.0
     total_audio_s: float = 0.0
@@ -314,23 +335,34 @@ class RunStats:
 
 
 # ---------------------------------------------------------------------------
-# Offline benchmark — POST /v1/transcriptions (raw PCM)
+# Offline benchmark — POST /v1/speech:recognize (JSON + base64 audio)
 # ---------------------------------------------------------------------------
 
 
-def _to_wire_bytes(samples: np.ndarray, wire_encoding: str) -> bytes:
+_WIRE_TO_ENCODING = {
+    "f32_le": "LINEAR32F",
+    "i16_le": "LINEAR16",
+    "wav": "WAV",
+}
+
+
+def _to_wire_bytes(samples: np.ndarray, wire_encoding: str, wav_bytes: bytes) -> bytes:
     """Encode an f32 mono sample buffer to the chosen wire format.
 
     ``f32_le`` is a passthrough cast.  ``i16_le`` clips to [-1, 1] then
-    scales by 32767 — matches `oasr-asr::decode_raw_pcm`'s widening (i16
+    scales by 32767 — matches ``oasr-asr::decode_raw_pcm``'s widening (i16
     samples are divided by 32768 on the server side; we scale by 32767
-    so a sample of 1.0 lands one count short of saturation).
+    so a sample of 1.0 lands one count short of saturation).  ``wav``
+    forwards the on-disk WAV container so the server picks up the
+    embedded sample rate.
     """
     if wire_encoding == "f32_le":
         return samples.astype("<f4", copy=False).tobytes()
     if wire_encoding == "i16_le":
         clipped = np.clip(samples, -1.0, 1.0)
         return (clipped * 32767.0).astype("<i2").tobytes()
+    if wire_encoding == "wav":
+        return wav_bytes
     raise ValueError(f"unsupported wire encoding: {wire_encoding!r}")
 
 
@@ -342,8 +374,9 @@ async def _bench_offline(
 ) -> RunStats:
     import httpx
 
+    enc_name = _WIRE_TO_ENCODING[wire_encoding]
     stats = RunStats(
-        name=f"offline (POST /v1/transcriptions, raw {wire_encoding} PCM)"
+        name=f"offline (POST /v1/speech:recognize, encoding={enc_name})"
     )
     sem = asyncio.Semaphore(concurrency)
 
@@ -351,17 +384,22 @@ async def _bench_offline(
 
         async def one(sample: Sample) -> None:
             async with sem:
-                body = _to_wire_bytes(sample.samples, wire_encoding)
-                url = (
-                    f"{http_url}/v1/transcriptions"
-                    f"?sample_rate={sample.sample_rate}&encoding={wire_encoding}"
-                )
+                raw = _to_wire_bytes(sample.samples, wire_encoding, sample.wav_bytes)
+                body = {
+                    "config": {
+                        "encoding": enc_name,
+                        "sampleRateHertz": sample.sample_rate,
+                        "languageCode": "en-US",
+                    },
+                    "audio": {
+                        "content": base64.b64encode(raw).decode("ascii"),
+                    },
+                }
                 start = time.perf_counter()
                 try:
                     resp = await client.post(
-                        url,
-                        content=body,
-                        headers={"content-type": "application/octet-stream"},
+                        f"{http_url}/v1/speech:recognize",
+                        json=body,
                     )
                     elapsed_ms = (time.perf_counter() - start) * 1000.0
                     if resp.status_code == 503:
@@ -384,200 +422,15 @@ async def _bench_offline(
 
 
 # ---------------------------------------------------------------------------
-# Whisper-compat benchmark — POST /v1/audio/transcriptions (multipart WAV)
-# ---------------------------------------------------------------------------
-
-
-async def _bench_whisper(http_url: str, samples: List[Sample], concurrency: int) -> RunStats:
-    import httpx
-
-    stats = RunStats(name="whisper-compat (POST /v1/audio/transcriptions)")
-    sem = asyncio.Semaphore(concurrency)
-
-    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
-
-        async def one(sample: Sample) -> None:
-            async with sem:
-                start = time.perf_counter()
-                try:
-                    files = {
-                        "file": (sample.path.name, sample.wav_bytes, "audio/wav"),
-                    }
-                    resp = await client.post(
-                        f"{http_url}/v1/audio/transcriptions",
-                        files=files,
-                        data={"response_format": "json"},
-                    )
-                    elapsed_ms = (time.perf_counter() - start) * 1000.0
-                    if resp.status_code == 503:
-                        stats.n_rejected += 1
-                        return
-                    if resp.status_code != 200:
-                        stats.n_fail += 1
-                        return
-                    _ = resp.json()
-                    stats.n_ok += 1
-                    stats.latencies_ms.append(elapsed_ms)
-                    stats.total_audio_s += sample.duration_s
-                except Exception:
-                    stats.n_fail += 1
-
-        t0 = time.perf_counter()
-        await asyncio.gather(*(one(s) for s in samples))
-        stats.wall_s = time.perf_counter() - t0
-    return stats
-
-
-# ---------------------------------------------------------------------------
-# Streaming benchmark — WebSocket
-# ---------------------------------------------------------------------------
-
-
-async def _bench_streaming(
-    http_url: str,
-    samples: List[Sample],
-    concurrency: int,
-    chunk_ms: int,
-    wire_encoding: str,
-) -> RunStats:
-    import websockets
-
-    ws_url = http_url.replace("http://", "ws://").replace("https://", "wss://")
-    ws_url = f"{ws_url}/v1/stream"
-
-    ws_format = {"f32_le": "pcm_f32le", "i16_le": "pcm_i16le"}[wire_encoding]
-
-    stats = RunStats(
-        name=f"streaming (WS /v1/stream, chunk={chunk_ms}ms, {wire_encoding})"
-    )
-    sem = asyncio.Semaphore(concurrency)
-
-    async def one(sample: Sample) -> None:
-        async with sem:
-            chunk_samples = int(sample.sample_rate * chunk_ms / 1000)
-            start = time.perf_counter()
-            first_partial_at: Optional[float] = None
-            partials = 0
-            try:
-                async with websockets.connect(
-                    ws_url,
-                    max_size=None,
-                    ping_interval=None,
-                    open_timeout=30,
-                    close_timeout=10,
-                ) as ws:
-                    await ws.send(json.dumps({
-                        "type": "start",
-                        "sample_rate": sample.sample_rate,
-                        "format": ws_format,
-                    }))
-
-                    async def producer():
-                        # Pace chunks at real-time — matches a live mic.  Set
-                        # `--realtime 0` to disable pacing (max-rate test).
-                        per_chunk = chunk_ms / 1000.0 if pace_realtime else 0.0
-                        last = time.perf_counter()
-                        try:
-                            for i in range(0, len(sample.samples), chunk_samples):
-                                chunk = sample.samples[i:i + chunk_samples]
-                                if chunk.size == 0:
-                                    break
-                                await ws.send(_to_wire_bytes(chunk, wire_encoding))
-                                if per_chunk > 0:
-                                    elapsed = time.perf_counter() - last
-                                    if elapsed < per_chunk:
-                                        await asyncio.sleep(per_chunk - elapsed)
-                                    last = time.perf_counter()
-                            await ws.send(json.dumps({"type": "end"}))
-                        except websockets.exceptions.ConnectionClosed:
-                            # Server closed (e.g. BUSY rejection mid-stream);
-                            # let the consumer collect the error event.
-                            return
-
-                    error_payload: Optional[dict] = None
-
-                    async def consumer():
-                        nonlocal first_partial_at, partials, error_payload
-                        async for msg in ws:
-                            if isinstance(msg, bytes):
-                                continue
-                            try:
-                                ev = json.loads(msg)
-                            except json.JSONDecodeError:
-                                continue
-                            t = ev.get("type")
-                            if t == "partial":
-                                partials += 1
-                                if first_partial_at is None:
-                                    first_partial_at = time.perf_counter()
-                            elif t == "error":
-                                error_payload = ev
-                                return t
-                            elif t == "final":
-                                return t
-
-                    prod_task = asyncio.create_task(producer())
-                    final_kind = await consumer()
-                    # Drain the producer if it's still going (e.g. on error).
-                    if not prod_task.done():
-                        prod_task.cancel()
-                        try:
-                            await prod_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                    elapsed_ms = (time.perf_counter() - start) * 1000.0
-                    if final_kind == "final":
-                        stats.n_ok += 1
-                        stats.latencies_ms.append(elapsed_ms)
-                        stats.total_audio_s += sample.duration_s
-                        stats.partial_counts.append(partials)
-                        if first_partial_at is not None:
-                            stats.first_partial_ms.append(
-                                (first_partial_at - start) * 1000.0
-                            )
-                    elif final_kind == "error":
-                        # Worker emitted an Error event (typically BUSY).
-                        stats.n_rejected += 1
-                        if error_payload is not None:
-                            code_key = str(error_payload.get("code"))
-                            stats.error_codes[code_key] = \
-                                stats.error_codes.get(code_key, 0) + 1
-                    else:
-                        stats.n_fail += 1
-            except Exception as exc:
-                # Transport-level failure (TCP reset on overload, etc.) — count
-                # alongside rejections, since under heavy backpressure the
-                # server may close the WebSocket before the Error frame lands.
-                stats.n_rejected += 1
-                detail = type(exc).__name__
-                code = getattr(getattr(exc, "rcvd", None), "code", None)
-                if code is None:
-                    code = getattr(getattr(exc, "sent", None), "code", None)
-                if code is not None:
-                    detail = f"{detail}({code})"
-                key = f"transport:{detail}"
-                stats.error_codes[key] = stats.error_codes.get(key, 0) + 1
-
-    pace_realtime = False  # set by caller via closure (see entry point)
-    # Bind via attribute capture: rewrap with the value
-    pace_realtime = bool(getattr(_bench_streaming, "_pace", False))
-
-    t0 = time.perf_counter()
-    await asyncio.gather(*(one(s) for s in samples))
-    stats.wall_s = time.perf_counter() - t0
-    return stats
-
-
-# ---------------------------------------------------------------------------
 # gRPC stub generation
 # ---------------------------------------------------------------------------
 
 
 def _load_grpc_stubs(proto_path: Path):
-    """Compile ``rust/proto/oasr_asr.proto`` to a temp dir and import it.
+    """Compile ``rust/proto/oasr_speech_v1.proto`` to a temp dir and import it.
 
-    Mirrors :mod:`scripts.grpc_stream` — keeps the bench self-contained so
-    we don't ship pre-generated stubs in the repo.
+    Keeps the bench self-contained — we don't ship pre-generated stubs in
+    the repo.
     """
     import importlib
     import shutil
@@ -601,8 +454,8 @@ def _load_grpc_stubs(proto_path: Path):
     if rc != 0:
         raise SystemExit(f"protoc failed with rc={rc}")
     sys.path.insert(0, str(out))
-    pb = importlib.import_module("oasr_asr_pb2")
-    pb_grpc = importlib.import_module("oasr_asr_pb2_grpc")
+    pb = importlib.import_module("oasr_speech_v1_pb2")
+    pb_grpc = importlib.import_module("oasr_speech_v1_pb2_grpc")
     return pb, pb_grpc
 
 
@@ -617,7 +470,7 @@ async def _bench_grpc_offline(
     import grpc
 
     pb, pb_grpc = _load_grpc_stubs(proto_path)
-    stats = RunStats(name="grpc-offline (Recognize unary, raw f32 PCM)")
+    stats = RunStats(name="grpc-offline (Recognize unary, LINEAR32F PCM)")
     sem = asyncio.Semaphore(concurrency)
 
     # Disable gRPC's HTTP proxy honoring — the env may carry an
@@ -629,14 +482,15 @@ async def _bench_grpc_offline(
         async def one(sample: Sample) -> None:
             async with sem:
                 cfg = pb.RecognitionConfig(
-                    encoding=pb.RecognitionConfig.LINEAR16_F32,
+                    encoding=pb.RecognitionConfig.LINEAR32F,
                     sample_rate_hertz=sample.sample_rate,
+                    language_code="en-US",
                     priority=0,
                 )
-                req = pb.RecognizeRequest(
-                    config=cfg,
-                    audio=sample.samples.astype("<f4").tobytes(),
+                audio = pb.RecognitionAudio(
+                    content=sample.samples.astype("<f4").tobytes(),
                 )
+                req = pb.RecognizeRequest(config=cfg, audio=audio)
                 start = time.perf_counter()
                 try:
                     await stub.Recognize(req, timeout=600.0)
@@ -698,8 +552,9 @@ async def _bench_grpc_streaming(
 
                 async def requests():
                     cfg = pb.RecognitionConfig(
-                        encoding=pb.RecognitionConfig.LINEAR16_F32,
+                        encoding=pb.RecognitionConfig.LINEAR32F,
                         sample_rate_hertz=sample.sample_rate,
+                        language_code="en-US",
                         priority=0,
                     )
                     yield pb.StreamingRecognizeRequest(
@@ -724,12 +579,14 @@ async def _bench_grpc_streaming(
                 try:
                     final_seen = False
                     async for resp in stub.StreamingRecognize(requests()):
-                        if resp.is_final:
+                        is_final = any(r.is_final for r in resp.results)
+                        if is_final:
                             final_seen = True
                             break
-                        partials += 1
-                        if first_partial_at is None:
-                            first_partial_at = time.perf_counter()
+                        if resp.results:
+                            partials += 1
+                            if first_partial_at is None:
+                                first_partial_at = time.perf_counter()
                     elapsed_ms = (time.perf_counter() - start) * 1000.0
                     if final_seen:
                         stats.n_ok += 1
@@ -766,7 +623,7 @@ async def _bench_grpc_streaming(
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="OASR Serving Benchmark — HTTP + WebSocket",
+        description="OASR Serving Benchmark — HTTP + gRPC",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -781,20 +638,24 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=["offline"],
         choices=[
-            "offline", "whisper", "streaming",
+            "offline",
             "grpc_offline", "grpc_streaming",
+            # Removed surfaces — accepted at the parser level so the
+            # error message at runtime is targeted (rather than argparse's
+            # generic "invalid choice").
+            "whisper", "streaming",
         ],
         help=(
             "Which serving paths to benchmark (default: offline).  All "
             "chosen subroutines must agree on engine mode — "
-            "offline/whisper/grpc_offline → service_mode=offline; "
-            "streaming/grpc_streaming → service_mode=streaming."
+            "offline/grpc_offline → service_mode=offline; "
+            "grpc_streaming → service_mode=streaming."
         ),
     )
     p.add_argument(
         "--proto",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "rust" / "proto" / "oasr_asr.proto",
+        default=Path(__file__).resolve().parents[1] / "rust" / "proto" / "oasr_speech_v1.proto",
         help="Path to the gRPC schema (only used by grpc_* subroutines).",
     )
     p.add_argument("--num-utterances", type=int,
@@ -809,12 +670,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # Streaming-specific
     p.add_argument("--chunk-ms", type=int,
                    default=_envint("CHUNK_MS", 640),
-                   help="WebSocket chunk size in milliseconds "
+                   help="gRPC bidi chunk size in milliseconds "
                         "(reads $CHUNK_MS if set; default 640)")
     p.add_argument(
         "--realtime",
         type=int, default=0, choices=(0, 1),
-        help="If 1, pace WS chunks at real-time (sleep chunk_ms between sends). "
+        help="If 1, pace streaming chunks at real-time (sleep chunk_ms between sends). "
              "Default 0 = send as fast as the network allows.",
     )
 
@@ -843,10 +704,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--wire-encoding",
         default="i16_le",
-        choices=("f32_le", "i16_le"),
-        help="PCM wire format for offline + streaming uploads. "
+        choices=("f32_le", "i16_le", "wav"),
+        help="PCM/container wire format for the HTTP offline path. "
              "Default i16_le halves wire bytes vs f32_le; server-side widens "
-             "to f32 (see oasr-asr::decode_raw_pcm).",
+             "to f32 (see oasr-asr::decode_raw_pcm).  `wav` posts the original "
+             "WAV container.",
     )
 
     p.add_argument("--output-path", default=None, type=Path,
@@ -880,10 +742,6 @@ def main() -> int:
         http_url = args.server_url.rstrip("/")
         grpc_addr = args.grpc_bind
 
-    # Bind the streaming pacing flag onto the function so the inner closure can
-    # read it without changing the signature.
-    _bench_streaming._pace = bool(args.realtime)  # type: ignore[attr-defined]
-
     all_stats: List[RunStats] = []
     try:
         for sub in args.subroutines:
@@ -892,15 +750,6 @@ def main() -> int:
             if sub == "offline":
                 s = asyncio.run(
                     _bench_offline(http_url, samples, args.concurrency, args.wire_encoding)
-                )
-            elif sub == "whisper":
-                s = asyncio.run(_bench_whisper(http_url, samples, args.concurrency))
-            elif sub == "streaming":
-                s = asyncio.run(
-                    _bench_streaming(
-                        http_url, samples, args.concurrency, args.chunk_ms,
-                        args.wire_encoding,
-                    )
                 )
             elif sub == "grpc_offline":
                 s = asyncio.run(_bench_grpc_offline(

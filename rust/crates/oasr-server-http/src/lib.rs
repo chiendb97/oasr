@@ -1,13 +1,11 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
-//! axum routes for the OASR HTTP API.
+//! axum routes for the OASR HTTP API (Google STT v1-shaped surface).
 
-pub mod offline;
+pub mod recognize;
 pub mod router;
-pub mod whisper;
-pub mod ws;
 
-pub use router::{build_router, AppState};
+pub use router::{build_router, AppState, ServiceMode};
 
 use std::sync::Arc;
 
@@ -18,4 +16,5 @@ use oasr_engine_client::EnginePool;
 pub struct ServerState {
     pub pool: Arc<EnginePool>,
     pub prometheus: Option<PrometheusHandle>,
+    pub service_mode: ServiceMode,
 }

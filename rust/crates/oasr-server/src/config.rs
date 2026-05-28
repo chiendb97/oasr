@@ -25,10 +25,10 @@ pub struct Cli {
     #[arg(long, default_value = "float16")]
     pub dtype: String,
     /// Service mode — the engine runs in exactly one mode per lifecycle.
-    /// "streaming" (default) accepts chunk-by-chunk requests via /v1/stream
-    /// and the gRPC `StreamingRecognize`; "offline" accepts full-audio
-    /// requests via /v1/transcriptions and `Recognize`.  Mismatched
-    /// requests are rejected at admission.
+    /// "streaming" (default) accepts chunk-by-chunk requests via the gRPC
+    /// `StreamingRecognize` RPC; "offline" accepts full-audio requests via
+    /// `POST /v1/speech:recognize` and the gRPC `Recognize` RPC.  The
+    /// mismatched RPC returns `FAILED_PRECONDITION` at the service layer.
     #[arg(long, default_value = "streaming")]
     pub service_mode: String,
     /// Optional: max batch size override.

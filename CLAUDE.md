@@ -272,8 +272,8 @@ Cargo workspace that builds `oasr-server`, the binary the Python `oasr-server` c
 | `oasr-wire` | Shared event/command types (`Cmd`, `Event`, `ErrorCode`, `ModelInfo`). Pure Rust — no codec / no IPC. |
 | `oasr-engine-client` | PyO3-backed driver: `PyEngine` wrapper, `EngineDispatcher` thread that owns the GIL and drives `engine.step()`, `EngineClient`/`EnginePool` async facades. |
 | `oasr-asr` | Audio decode (WAV via `hound`, raw PCM) to f32 mono `bytes::Bytes` |
-| `oasr-server-http` | axum routes: `/v1/transcriptions`, `/v1/stream` (WS), Whisper-compat `/v1/audio/transcriptions`, `/healthz`, `/readyz`, `/metrics`, `/v1/models` |
-| `oasr-server-grpc` | tonic `oasr.asr.v1.Speech` service (`Recognize` unary + `StreamingRecognize` bidi). Proto in `rust/proto/oasr_asr.proto` |
+| `oasr-server-http` | axum routes (Google STT v1-shaped REST): `POST /v1/speech:recognize`, `/healthz`, `/readyz`, `/metrics`, `/v1/models` |
+| `oasr-server-grpc` | tonic `oasr.speech.v1.Speech` service (`Recognize` unary + `StreamingRecognize` bidi) plus the standard `grpc.health.v1.Health` service. Proto in `rust/proto/oasr_speech_v1.proto` |
 | `oasr-server` | Binary: CLI, Python interpreter init, engine + HTTP + gRPC wiring. **One process per GPU**; spawn multiple `oasr-server` processes for multi-GPU. |
 
 Routing policy: single in-process engine per `oasr-server` process — no sticky map needed at the pool level (the pool exists for symmetry with a future multi-engine-per-process layout). `/readyz` returns 200 once the dispatcher has taken its first tick. Build deps: a Python development install (PyO3 links against `libpython` via `auto-initialize`), `protobuf-compiler`, a C/C++ toolchain.

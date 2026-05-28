@@ -1,0 +1,146 @@
+// Copyright 2024 OASR Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// OASR Speech v1 — shaped after google.cloud.speech.v1 so existing developer
+// tooling (grpcurl, REST conventions) feels familiar.  This is *not* the
+// Google package: we use the `oasr.speech.v1` namespace, and Google's
+// official client SDKs cannot connect without re-generating from this file.
+//
+// Differences from Google STT v1:
+// - No `LongRunningRecognize` (we do not expose async operations).
+// - `AudioEncoding` only honors LINEAR16, LINEAR32F (custom), and WAV (custom).
+//   Other values are reserved for source-compatibility but return
+//   `UNIMPLEMENTED`.
+// - `RecognitionConfig.priority` is a non-Google extension preserved for
+//   parity with the previous OASR API.
+// - `SpeechRecognitionAlternative.tokens` is a non-Google extension that
+//   carries the raw CTC token IDs alongside the transcript.
+// - `RecognizeResponse.request_id` / `StreamingRecognizeResponse.request_id`
+//   are non-Google extensions carrying the server-assigned request UUID.
+// - `language_code`, `model`, `max_alternatives`, `audio_channel_count`,
+//   `single_utterance`, `speech_event_type` are accepted but not honored.
+
+syntax = "proto3";
+
+package oasr.speech.v1;
+
+import "google/protobuf/duration.proto";
+
+service Speech {
+    // Synchronous unary recognition of a single full audio payload.
+    rpc Recognize(RecognizeRequest) returns (RecognizeResponse);
+
+    // Bidirectional streaming recognition.  The first inbound message MUST
+    // carry `streaming_config`; subsequent messages carry `audio_content`.
+    rpc StreamingRecognize(stream StreamingRecognizeRequest)
+        returns (stream StreamingRecognizeResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Shared types
+// ---------------------------------------------------------------------------
+
+message RecognitionConfig {
+    // Audio encoding.  Only LINEAR16, LINEAR32F, and WAV are honored;
+    // other values are reserved for source-compatibility with Google STT v1
+    // and return `UNIMPLEMENTED` if used.
+    enum AudioEncoding {
+        ENCODING_UNSPECIFIED = 0;
+        LINEAR16             = 1;   // little-endian 16-bit signed PCM (mono)
+        FLAC                 = 2;   // reserved, not implemented
+        MULAW                = 3;   // reserved, not implemented
+        AMR                  = 4;   // reserved, not implemented
+        AMR_WB               = 5;   // reserved, not implemented
+        OGG_OPUS             = 6;   // reserved, not implemented
+        SPEEX_WITH_HEADER_BYTE = 7; // reserved, not implemented
+        WEBM_OPUS            = 9;   // reserved, not implemented
+        // OASR extensions in the reserved enum range:
+        LINEAR32F            = 100; // little-endian 32-bit float PCM (mono)
+        WAV                  = 101; // RIFF/WAV container
+    }
+    AudioEncoding encoding             = 1;
+    uint32        sample_rate_hertz    = 2;
+    string        language_code        = 3;  // accepted, ignored
+    uint32        max_alternatives     = 4;  // bounded at server side
+    string        model                = 5;  // accepted, ignored (single model per process)
+    uint32        audio_channel_count  = 6;  // accepted, ignored (mono only)
+    int32         priority             = 100; // OASR extension
+}
+
+// ---------------------------------------------------------------------------
+// Audio source
+// ---------------------------------------------------------------------------
+
+message RecognitionAudio {
+    oneof audio_source {
+        bytes  content = 1;
+        string uri     = 2;  // returns UNIMPLEMENTED
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Results
+// ---------------------------------------------------------------------------
+
+message SpeechRecognitionAlternative {
+    string          transcript = 1;
+    float           confidence = 2;
+    repeated uint32 tokens     = 100;  // OASR extension: raw CTC token IDs
+}
+
+message SpeechRecognitionResult {
+    repeated SpeechRecognitionAlternative alternatives    = 1;
+    int32                                 channel_tag     = 2;
+    google.protobuf.Duration              result_end_time = 4;
+    string                                language_code   = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Unary RPC
+// ---------------------------------------------------------------------------
+
+message RecognizeRequest {
+    RecognitionConfig config = 1;
+    RecognitionAudio  audio  = 2;
+}
+
+message RecognizeResponse {
+    repeated SpeechRecognitionResult results    = 1;
+    string                           request_id = 100;  // OASR extension
+}
+
+// ---------------------------------------------------------------------------
+// Streaming RPC
+// ---------------------------------------------------------------------------
+
+message StreamingRecognitionConfig {
+    RecognitionConfig config           = 1;
+    bool              single_utterance = 2;  // accepted, ignored
+    bool              interim_results  = 3;
+}
+
+message StreamingRecognizeRequest {
+    oneof streaming_request {
+        StreamingRecognitionConfig streaming_config = 1;
+        bytes                      audio_content    = 2;
+    }
+}
+
+message StreamingRecognitionResult {
+    repeated SpeechRecognitionAlternative alternatives    = 1;
+    bool                                  is_final        = 2;
+    float                                 stability       = 3;
+    google.protobuf.Duration              result_end_time = 4;
+    string                                language_code   = 6;
+}
+
+enum SpeechEventType {
+    SPEECH_EVENT_UNSPECIFIED = 0;
+    END_OF_SINGLE_UTTERANCE  = 1;
+}
+
+message StreamingRecognizeResponse {
+    repeated StreamingRecognitionResult results            = 1;
+    SpeechEventType                     speech_event_type  = 2;
+    string                              request_id         = 100;  // OASR extension
+}

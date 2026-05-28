@@ -1,25 +1,27 @@
 # `rust/` — OASR serving frontend
 
 Cargo workspace that builds `oasr-server`, the binary the Python `oasr-server`
-console script execs.  It exposes:
+console script execs.  It hosts **one in-process Python `ASREngine` per
+process** via PyO3 and exposes a Google Speech-to-Text v1-shaped API:
 
-- **HTTP** (`axum`): native `/v1/transcriptions`, `/v1/stream` (WebSocket),
-  OpenAI Whisper-compatible `/v1/audio/transcriptions`, `/healthz`, `/readyz`,
-  `/metrics`, `/v1/models`.
-- **gRPC** (`tonic`): `oasr.asr.v1.Speech/Recognize` (unary) and
-  `oasr.asr.v1.Speech/StreamingRecognize` (bidi).
+- **HTTP** (`axum`):
+  - `POST /v1/speech:recognize` — synchronous recognition (offline mode).
+  - `GET /v1/models` — loaded model metadata.
+  - `GET /healthz`, `GET /readyz`, `GET /metrics`.
+- **gRPC** (`tonic`): `oasr.speech.v1.Speech/Recognize` (unary, offline mode)
+  and `oasr.speech.v1.Speech/StreamingRecognize` (bidi, streaming mode), plus
+  the standard `grpc.health.v1.Health` service.
 
-The frontend drives a fleet of N Python worker processes (one per GPU) over
-ZeroMQ + MessagePack.  Streaming requests stick to the worker that admitted
-them; offline requests go to the least-loaded worker.
+Multi-GPU scale = launch N `oasr-server` processes behind a load balancer
+(each with `CUDA_VISIBLE_DEVICES` set), not multi-worker within one process.
 
 ## Build
 
 System dependencies:
 
-- `libzmq3-dev` (for the `zmq` crate)
-- `protobuf-compiler` (for `tonic-build` to compile `proto/oasr_asr.proto`)
-- A C/C++ toolchain (libzmq's build invokes it)
+- A Python development install (PyO3 links `libpython` via `auto-initialize`)
+- `protobuf-compiler` (for `tonic-build` to compile `proto/oasr_speech_v1.proto`)
+- A C/C++ toolchain
 
 ```bash
 cd rust
@@ -29,13 +31,13 @@ cargo build --release
 
 ## Run
 
-The binary spawns Python workers itself.  Make sure `oasr` is importable
-(e.g. `pip install -e .[serving]`):
+The binary embeds the engine in-process via PyO3.  Make sure `oasr` is
+importable (e.g. `pip install -e .`):
 
 ```bash
 ./target/release/oasr-server \
     --ckpt-dir /path/to/wenet/ckpt \
-    --num-workers 2 --cuda-devices 0,1 \
+    --service-mode offline \
     --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051
 ```
 
@@ -45,9 +47,9 @@ See `--help` for the full CLI surface.
 
 | Crate | Role |
 |---|---|
-| `oasr-wire` | MessagePack wire schema shared with `oasr/serving/ipc.py` |
-| `oasr-engine-client` | Async ZMQ DEALER client, per-request demux, multi-worker pool |
+| `oasr-wire` | Shared event/command types (`Cmd`, `Event`, `ErrorCode`, `ModelInfo`) |
+| `oasr-engine-client` | PyO3-backed driver: `PyEngine`, `EngineDispatcher`, async client/pool |
 | `oasr-asr` | Audio decode (WAV via `hound`, raw PCM) to f32 mono `bytes::Bytes` |
-| `oasr-server-http` | axum routes (native + Whisper-compat + WebSocket) |
-| `oasr-server-grpc` | tonic Speech service (unary + bidi streaming) |
-| `oasr-server` | Binary: CLI, worker supervisor, runtime wiring |
+| `oasr-server-http` | axum routes for the Google STT v1 REST surface |
+| `oasr-server-grpc` | tonic `oasr.speech.v1.Speech` service (unary + bidi) |
+| `oasr-server` | Binary: CLI, Python interpreter init, engine + HTTP + gRPC wiring |

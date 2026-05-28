@@ -20,9 +20,10 @@ use oasr_engine_client::{
     client::EngineClientConfig, dispatcher::DispatcherConfig, EngineClient, EnginePool, PyEngine,
 };
 use oasr_server_grpc::pb::speech_server::SpeechServer;
-use oasr_server_grpc::SpeechService;
-use oasr_server_http::{build_router, ServerState};
+use oasr_server_grpc::{ServiceMode as GrpcServiceMode, SpeechService, SPEECH_SERVICE_NAME};
+use oasr_server_http::{build_router, ServerState, ServiceMode as HttpServiceMode};
 use tokio::signal;
+use tonic_health::ServingStatus;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -44,6 +45,15 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    let grpc_mode: GrpcServiceMode = cli
+        .service_mode
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("invalid --service-mode: {e}"))?;
+    let http_mode: HttpServiceMode = cli
+        .service_mode
+        .parse()
+        .expect("validated by GrpcServiceMode parse above");
 
     // ---- Build the in-process engine ----
     let engine_cfg_json = cli.build_engine_config_json().context("build engine config")?;
@@ -69,6 +79,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(ServerState {
         pool: Arc::clone(&pool),
         prometheus,
+        service_mode: http_mode,
     });
 
     // ---- HTTP server ----
@@ -84,14 +95,28 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ---- gRPC server ----
+    // ---- gRPC server (Speech + standard Health) ----
     let grpc_bind = cli.grpc_bind;
     let grpc_pool = Arc::clone(&pool);
+
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    // Mark the Speech service as serving from the start: the engine
+    // dispatcher has already completed its first tick above and the pool is
+    // accepting work.  An empty service name flips the overall process
+    // health, which Kubernetes / gRPC LBs probe by default.
+    health_reporter
+        .set_service_status(SPEECH_SERVICE_NAME, ServingStatus::Serving)
+        .await;
+    health_reporter
+        .set_service_status("", ServingStatus::Serving)
+        .await;
+
     let grpc_handle = tokio::spawn(async move {
-        let svc = SpeechService::new(grpc_pool);
+        let svc = SpeechService::new(grpc_pool, grpc_mode);
         info!("gRPC listening on http://{grpc_bind}");
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(SpeechServer::new(svc))
+            .add_service(health_service)
             .serve(grpc_bind)
             .await
         {
@@ -102,6 +127,14 @@ async fn main() -> Result<()> {
     // ---- Wait for shutdown ----
     wait_for_signal().await;
     info!("shutdown signal received; draining");
+
+    // Flip health to NOT_SERVING so probes in-flight see the transition.
+    health_reporter
+        .set_service_status(SPEECH_SERVICE_NAME, ServingStatus::NotServing)
+        .await;
+    health_reporter
+        .set_service_status("", ServingStatus::NotServing)
+        .await;
 
     http_handle.abort();
     grpc_handle.abort();
