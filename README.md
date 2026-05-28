@@ -1,250 +1,69 @@
-# OASR - Open Automatic Speech Recognition
+# OASR
 
-A high-performance open-source inference framework for ASR models built with C++, CUDA, and CUTLASS. Kernels are JIT-compiled at runtime via TVM-FFI and cached for subsequent use.
+**Open Automatic Speech Recognition — a high-performance inference framework for ASR models.**
+
+OASR delivers fast, scalable ASR inference on NVIDIA GPUs. It pairs custom CUDA kernels with a dynamic-batching inference engine and a production-ready serving frontend, so you can transcribe audio offline or stream it in real time over HTTP or gRPC.
+
+---
+
+## Key Features
+
+- **High throughput** — paged KV cache, dynamic length-bucketed batching, and CUDA Graph capture of the streaming encoder.
+- **Streaming and offline** — one engine handles both, with mixed pools in a single step loop.
+- **Production serving** — Rust `oasr-server` binary exposing an HTTP API and a gRPC bidi streaming RPC.
+- **Multiple decoders** — CTC greedy, CTC prefix beam (CPU & GPU), and WFST beam search.
+- **Broad GPU support** — Volta through Blackwell (SM70–SM120), with FP16 / BF16 / FP32 paths.
+- **Drop-in Python API** — functional and `nn.Module` wrappers for normalization, convolution, GEMM, attention, and feature extraction.
 
 ## Supported Models
 
-| Model | Description | Status |
-|-------|-------------|--------|
-| **Conformer** | Convolution-augmented Transformer | ✅ |
-| **Paraformer** | Parallel Transformer for ASR | 🔲 Planned |
-| **Branchformer** | Branch-based Transformer | 🔲 Planned |
-| **Zipformer** | Zipformer encoder | 🔲 Planned |
-| **Transducer** | Transducer | 🔲 Planned |
+| Model        | Status      |
+|--------------|-------------|
+| Conformer    | ✅ Available |
+| Paraformer   | 🔲 Planned  |
+| Branchformer | 🔲 Planned  |
+| Zipformer    | 🔲 Planned  |
+| Transducer   | 🔲 Planned  |
 
-## Supported Decoders
+---
 
-| Decoder | Description | Status |
-|---------|-------------|--------|
-| **CTC Greedy Search** | CPU greedy argmax decode | ✅ |
-| **CTC Prefix Beam Search (CPU)** | CPU prefix beam search | ✅ |
-| **CTC Prefix Beam Search (GPU)** | GPU beam search (offline + multi-request streaming) | ✅ |
-| **CTC WFST Beam Search** | Weighted FST beam search (requires k2; offline + streaming) | ✅ |
+## Getting Started
 
-## Features
+### Requirements
 
-- **JIT-compiled CUDA kernels** via TVM-FFI with automatic caching (`~/.cache/oasr/jit/`)
-- **CUTLASS-based GEMM** -- GEMM, Batched GEMM (BMM), and Grouped GEMM (variable-sized problems)
-- **Normalization** -- LayerNorm, RMSNorm, BatchNorm1d, GroupNorm (fused add+norm, fused norm+activation)
-- **Convolution** -- Depthwise/pointwise Conv1D (including causal), Conv2D via CUTLASS Implicit GEMM, cuDNN Conv2D
-- **Activation** -- GLU, Swish
-- **Attention** -- Multi-head and relative-position attention with optional rotary embeddings; fused FMHA (`oasr.fmha`) with offline / dense-streaming / paged-streaming cache modes (CuteDSL kernel on SM120, PyTorch SDPA fallback elsewhere)
-- **CTC decoder** -- CTC greedy, prefix beam, and WFST beam search (CPU-side C++ with Python wrappers); GPU prefix beam search with offline + multi-request streaming APIs
-- **Feature extraction** -- Batched FBANK / MFCC via `torchaudio` (default) or `kaldifeat` (optional GPU path), plus `BatchedStreamingFeatureExtractor` for `B` parallel chunked streams
-- **Inference engine** -- vLLM-style `ASREngine` for Conformer-CTC (unified streaming + offline), with dynamic length-bucketed batching, paged KV cache, and CUDA Graph capture of the steady-state streaming encoder
-- **Streaming inference** -- Chunk-by-chunk Conformer inference with paged GPU memory for attention and CNN caches
-- **Paged memory cache** -- `BlockPool`-backed paged KV cache and `StreamContext` for multi-request streaming
-- **Thread-safe engine** -- Process-wide `RLock` over scheduler queues; two-thread serving overlaps ZMQ I/O with `step()`
-- **Serving frontend** -- Rust `oasr-server` binary exposing HTTP, gRPC, and WebSocket APIs over a fleet of Python engine workers (one per GPU), with sticky streaming routing
-- **Kernel auto-tuning** -- Built-in profiling and caching framework for GEMM and Conv2D kernels
-- **Flash Attention** -- Optional support (enable at build time)
-- **Architecture support** -- Volta through Blackwell (SM70--SM120)
-- **Python bindings** -- Functional API + nn.Module wrappers
-- **Benchmarks and profiling** -- Triton-style timing and NVTX/Nsight Compute support
+- CUDA ≥ 11.8
+- Python ≥ 3.8
+- CMake ≥ 3.18
+- NVIDIA GPU (SM70 or newer)
 
-## Architecture
-
-```
-Python functional API (oasr/<family>.py)
-    +-- JIT generator (oasr/jit/<family>.py) -> JitSpec
-            +-- TVM-FFI JIT binding (csrc/<family>_jit_binding.cu)
-                    +-- TVM-FFI launcher (csrc/<family>.cu)
-                            +-- Pure CUDA kernels (include/oasr/<family>.cuh)
-                                    +-- CUTLASS ops + include/oasr/common/ utilities
-```
-
-```
-oasr/
-├── include/oasr/              # Pure CUDA kernel headers (no framework deps)
-│   ├── common/                # Types, vec dtypes, arch dispatch/traits, math
-│   ├── conv/                  # conv1d.cuh, conv2d.cuh
-│   ├── gemm/                  # gemm.cuh, bmm.cuh, group_gemm.cuh
-│   ├── activation.cuh         # GLU, Swish
-│   └── norm.cuh               # LayerNorm, RMSNorm, BatchNorm1d, GroupNorm
-├── csrc/                      # TVM-FFI launchers + JIT bindings
-│   ├── *.cu                   # Per-kernel launchers and _jit_binding files
-│   ├── tvm_ffi_utils.h        # DLPack dtype dispatch and validation macros
-│   ├── decoder/               # CTC greedy/prefix-beam/WFST decoders + context graph (CPU, C++)
-│   └── pybind/                # pybind11 module (decoder + legacy enums)
-├── oasr/                      # Python package
-│   ├── activation.py          # Functional API: GLU, Swish
-│   ├── norm.py                # Functional API: LayerNorm, RMSNorm, etc.
-│   ├── conv.py                # Functional API: Conv1D, Conv2D
-│   ├── gemm.py                # Functional API: GEMM, BMM, Grouped GEMM
-│   ├── attention.py           # Functional API: fmha (CuteDSL / SDPA fallback)
-│   ├── ctc_decode.py          # High-level CTC decode helpers
-│   ├── aot.py                 # Ahead-of-time compilation registration
-│   ├── jit/                   # JIT spec generators (core.py + per-family; jit/attention.py wraps cutlass.cute.compile)
-│   ├── kernels/               # Low-level CuteDSL/Triton/hand-CUDA kernels (kernels/cute/attention/ for FMHA)
-│   ├── tune/                  # Auto-tuning framework (profiler, cache, backends)
-│   ├── layers/                # nn.Module wrappers (norm, conv, linear, attention, rotary)
-│   ├── decoder/               # Python wrappers: CtcGreedySearch, CtcPrefixBeamSearch, CtcWfstBeamSearch
-│   ├── cache/                 # Streaming cache manager (BlockPool, AttentionCacheManager, StreamContext)
-│   ├── features/              # Batched FBANK/MFCC + BatchedStreamingFeatureExtractor (torchaudio / kaldifeat)
-│   ├── models/conformer/      # Conformer model, config, weight conversion
-│   ├── engine/                # Inference engine (ASREngine, EngineConfig, Scheduler, Pipeline, graph_cache)
-│   ├── serving/               # Engine worker (ZMQ ROUTER) + MessagePack IPC for the Rust frontend
-│   └── utils/                 # Dtype mappings, validation decorators, NVTX, timer
-├── rust/                      # Rust serving frontend (oasr-server binary)
-│   ├── crates/
-│   │   ├── oasr-wire/         # MessagePack wire schema shared with oasr/serving/ipc.py
-│   │   ├── oasr-engine-client/# Async ZMQ DEALER client + multi-worker EnginePool
-│   │   ├── oasr-asr/          # WAV / raw-PCM decoding to f32 mono
-│   │   ├── oasr-server-http/  # axum: /v1/transcriptions, /v1/stream (WS), Whisper-compat
-│   │   ├── oasr-server-grpc/  # tonic: oasr.asr.v1.Speech (Recognize + StreamingRecognize)
-│   │   └── oasr-server/       # Binary: CLI + worker supervisor + runtime wiring
-│   └── proto/oasr_asr.proto
-├── benchmarks/                # Performance benchmarks
-├── docs/                      # Companion design docs (engine, scheduler, serving, autotuning, ...)
-├── tests/                     # Pytest test suite
-├── CMakeLists.txt
-├── setup.py
-└── pyproject.toml
-```
-
-## Requirements
-
-- **CUDA** >= 11.8
-- **CMake** >= 3.18
-- **Python** >= 3.8
-- **apache-tvm-ffi** -- TVM FFI runtime for JIT compilation
-- **CUTLASS** -- NVIDIA CUDA Templates for Linear Algebra Subroutines and Solvers; required for CUTLASS-based kernel generation and execution
-- **cuDNN** -- Optional; Conv2D cuDNN backend disabled if not found
-
-## Installation
+### Install
 
 ```bash
-# Editable install (builds pybind11 extension via CMake; kernels are JIT-compiled on first use)
+# Editable install — kernels are JIT-compiled on first use
 pip install -e .
 
-
-# Multiple architectures (semicolon-separated)
+# Target specific GPU architectures
 CUDA_ARCHITECTURES="80;86;90" pip install -e .
 ```
 
-Optional dependency groups:
+Optional extras:
 
 ```bash
-pip install -e ".[dev]"      # pytest, black, mypy, ruff
 pip install -e ".[audio]"    # soundfile, librosa
-pip install -e ".[serving]"  # msgpack + pyzmq + httpx/websockets clients
+pip install -e ".[serving]"  # serving client libs (used by bench_service.py)
 pip install -e ".[wfst]"     # k2, kaldilm (WFST decoder)
 ```
 
-Build the Rust serving frontend (produces the `oasr-server` binary that the Python console script execs into):
+Build the Rust serving binary (linked against the active Python interpreter):
 
 ```bash
 cd rust && cargo build --release
-# requires: libzmq3-dev, protobuf-compiler, a C/C++ toolchain
+# Requires: protobuf-compiler, a C/C++ toolchain
 ```
 
-## Testing
+---
 
-### Python tests
-
-```bash
-# Run all tests
-pytest tests/
-
-# Run a single test file
-pytest tests/test_conv.py
-
-# Run a single test class
-pytest tests/test_conv.py::TestDepthwiseConv1D -v
-
-# Skip slow tests
-pytest tests/ -m "not slow"
-```
-
-### C++ unit tests
-
-```bash
-mkdir build && cd build
-cmake .. -DBUILD_PYTHON=ON -DBUILD_TESTS=ON -DCMAKE_CUDA_ARCHITECTURES=80
-make -j
-ctest --output-on-failure
-```
-
-## Benchmarks and Profiling
-
-OASR provides a unified benchmark framework (`benchmarks/oasr_benchmark.py`) with a per-family routine registry under `benchmarks/routines/`. Backend names depend on the kernel family: `cutlass` / `torch` for GEMM and Conv2D; `cuda` / `torch` for Norm, Conv1D, Activation, and composite kernels. Legacy standalone `bench_*.py` scripts remain as thin wrappers.
-
-### Unified CLI
-
-```bash
-# GEMM family (cutlass vs. torch reference)
-python benchmarks/oasr_benchmark.py --routine gemm --subroutine bmm \
-    --backends cutlass torch --batch-count 256 --M 200 --N 200 --K 64 \
-    --dtype float16 --refcheck -vv
-
-# Norm / Conv1D / Activation family (cuda vs. torch reference)
-python benchmarks/oasr_benchmark.py --routine norm --subroutine layer_norm \
-    --backends cuda torch --batch 64 --seq 250 --hidden 512 --refcheck -vv
-
-# List all available routines/subroutines
-python benchmarks/oasr_benchmark.py --list
-
-# Batch testing from a testlist file
-python benchmarks/oasr_benchmark.py --testlist benchmarks/testlists/conformer_base.txt \
-    --output_path results.csv --refcheck
-```
-
-### Profiling with Nsight Compute
-
-`--profile` emits NVTX markers and runs in single-iteration mode suitable for `ncu`:
-
-```bash
-ncu --set full -o gemm_profile python benchmarks/oasr_benchmark.py \
-    --routine gemm --subroutine gemm --backends cutlass --profile --dry_run_iters 0
-```
-
-See `benchmarks/README.md` for the full CLI reference.
-
-## Quick Start (Python)
-
-```python
-import oasr
-
-# Functional API (kernels JIT-compile on first call)
-# Normalization
-output = oasr.layer_norm(input, weight, bias)
-output = oasr.rms_norm(input, weight)
-
-# Convolution
-output = oasr.depthwise_conv1d(input, weight, bias)
-output = oasr.pointwise_conv1d(input, weight, bias)
-
-# GEMM
-output = oasr.gemm(A, B)
-output = oasr.bmm(A, B)
-output = oasr.group_gemm(A_list, B_list)
-
-# Activation
-output = oasr.glu(input)
-output = oasr.swish(input)
-
-# Fused multi-head attention (CuteDSL on SM120; SDPA fallback elsewhere)
-# q, k, v: (B, H, T, D); attn_bias: (B, H, T_q, T_k); cache_seqlens: (B,) int32
-output = oasr.fmha(q, k, v, softmax_scale=1.0 / D**0.5)
-output = oasr.fmha(
-    q, k, v, softmax_scale=1.0 / D**0.5,
-    attn_bias=bias, cache_seqlens=lens,  # dense-streaming mode
-)
-```
-
-Set `OASR_ATTN_BACKEND=sdpa` to force the SDPA path, or `=cute` to require the CuteDSL kernel (errors on unsupported archs). Default is `auto`.
-
-```python
-# nn.Module wrappers
-from oasr.layers import LayerNorm, Linear, Conv1D
-
-norm = LayerNorm(hidden_size)
-linear = Linear(in_features, out_features)
-```
-
-## Engine
-
-The `oasr.engine` subpackage provides a vLLM-inspired inference engine for Conformer-CTC models. It handles feature extraction, streaming chunk-by-chunk encoding with paged KV cache, CTC decoding, and detokenization in one unified interface.
+## Quick Start
 
 ### Offline transcription
 
@@ -253,135 +72,127 @@ from oasr.engine import ASREngine, EngineConfig
 
 engine = ASREngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))
 
-# Single file (offline path)
+# Single file
 text = engine.transcribe_offline("audio.wav")
 
-# Batch — dynamic length-bucketed offline batching
+# Batch — dynamic length-bucketed micro-batches
 texts = engine.transcribe_offline(["a.wav", "b.wav", "c.wav"])
-
-# Simulate streaming (chunk-by-chunk, no real-time constraint)
-text = engine.transcribe_streaming("audio.wav", chunk_size=16)
 ```
 
-### Streaming transcription (multi-request)
+### Streaming transcription
 
 ```python
 from oasr.engine import ASREngine, EngineConfig
 
 engine = ASREngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))
 
-# Convenience: add requests and run to completion
-texts = engine.transcribe(["a.wav", "b.wav", "c.wav"])
+# Attached-audio streaming — chunk-by-chunk decode, paged KV cache
+texts = engine.transcribe(["a.wav", "b.wav", "c.wav"], streaming=True)
 
-# Explicit step loop for online serving
-rid = engine.add_request("audio.wav")
-results = engine.run()
-text = {r.request_id: r.text for r in results}[rid]
+# Real-time feed loop
+rid = engine.add_streaming_request()
+for chunk in mic_chunks():
+    engine.feed_chunk(rid, chunk, is_last=False)
+    for out in engine.step():
+        if not out.finished:
+            print("partial:", out.text)
+engine.feed_chunk(rid, last_chunk, is_last=True)
+final = engine.run()
 ```
 
-### EngineConfig
+The checkpoint directory should contain `final.pt`, `train.yaml`, `global_cmvn`, and optionally a tokenizer `.model` file plus `units.txt`.
 
-Key parameters for `EngineConfig`:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `ckpt_dir` | `""` | WeNet-format checkpoint directory |
-| `device` | `"cuda"` | CUDA device string |
-| `dtype` | `torch.float16` | Model and cache precision |
-| `chunk_size` | `16` | Encoder output frames per streaming chunk |
-| `num_left_chunks` | `-1` | Past chunks to keep in attention cache (`-1` = unlimited) |
-| `max_batch_size` | `32` | Max concurrent streaming requests per step |
-| `decoder_type` | `"ctc_prefix_beam"` | One of `ctc_greedy`, `ctc_prefix_beam`, `ctc_gpu`, `ctc_wfst` |
-| `audio_scale` | `32768.0` | Scale factor applied before feature extraction (restores int16 range) |
-| `use_cuda_graphs` | `True` | Capture/replay one CUDA Graph per `(B, T_input, cache_t1_bucket)` for the steady-state streaming encoder |
-
-The checkpoint directory is expected to contain `final.pt`, `train.yaml`, `global_cmvn`, and optionally a SentencePiece `.model` file and `units.txt` vocabulary. These are auto-detected when `ckpt_dir` is set.
-
-`ASREngine` is thread-safe: every public entry acquires a process-wide re-entrant lock so a serving worker can run `step()` on one thread while another thread feeds chunks. Horizontal scaling is multi-process via the Rust frontend.
-
-## Streaming Inference
-
-The `oasr.cache` subpackage provides a paged-memory streaming cache for chunk-by-chunk Conformer inference:
-
-```python
-from oasr.cache import (
-    CacheConfig, BlockPool,
-    AttentionCacheManager, CnnCacheManager, CtcStateCacheManager,
-    StreamContext,
-)
-from oasr import GpuDecoderConfig
-
-config = CacheConfig(
-    num_layers=12, n_kv_head=4, head_dim=64, hidden_dim=256,
-    kernel_size=15, chunk_size=16, num_left_chunks=4,
-    block_size_frames=16, max_num_blocks=2048,
-)
-pool    = BlockPool(config)
-att_mgr = AttentionCacheManager(pool, config)
-cnn_mgr = CnnCacheManager(config)
-ctc_mgr = CtcStateCacheManager(GpuDecoderConfig(beam_size=10))
-
-# Per-request streaming
-sid = 42
-att_mgr.allocate_stream(sid)
-cnn_mgr.allocate_stream(sid)
-ctc_mgr.allocate_stream(sid, batch=1, vocab_size=5000)
-ctx = StreamContext(sid, att_mgr, cnn_mgr, ctc_mgr)
-
-for chunk_audio in audio_chunks:
-    att_cache  = ctx.get_att_cache()
-    cnn_cache  = ctx.get_cnn_cache()
-    logits, new_att, new_cnn = model.forward_chunk(
-        chunk_audio, offset, required_cache_size, att_cache, cnn_cache)
-    ctx.commit_chunk(new_att[:, :, -chunk_size:, :], new_cnn)
-    ctx.get_decoder().decode_chunk(logits)
-
-result = ctx.get_decoder().finalize_stream()
-ctx.free()
-```
-
-## Kernel Auto-Tuning
-
-OASR includes a built-in auto-tuning framework for GEMM and Conv2D kernels. See `oasr/tune/` for details.
+---
 
 ## Serving
 
-The Rust `oasr-server` binary is the canonical serving entry point. It supervises a fleet of Python engine workers (one per GPU), routes requests over ZeroMQ + MessagePack, and exposes the engine over HTTP, gRPC, and WebSocket.
+`oasr-server` runs one in-process `ASREngine` per process. `--service-mode` pins the engine to either `offline` (sync `Recognize`) or `streaming` (bidi `StreamingRecognize`) for its entire lifetime; the mismatched RPC returns `FAILED_PRECONDITION`. Scale horizontally by launching one process per GPU.
 
 ```bash
-# Launch a single-worker server on GPU 0 (after `cargo build --release` and `pip install -e .[serving]`)
-oasr-server --ckpt-dir /path/to/checkpoint --workers 1
+# Offline server on GPU 0
+./rust/target/release/oasr-server \
+    --ckpt-dir /path/to/checkpoint \
+    --service-mode offline \
+    --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051
 
-# Multi-GPU fleet
-oasr-server --ckpt-dir /path/to/checkpoint --workers 4 --gpus 0,1,2,3
+# Multi-GPU fleet — one process per device, fronted by your load balancer
+CUDA_VISIBLE_DEVICES=0 ./rust/target/release/oasr-server \
+    --ckpt-dir /path/to/checkpoint \
+    --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051 &
+CUDA_VISIBLE_DEVICES=1 ./rust/target/release/oasr-server \
+    --ckpt-dir /path/to/checkpoint \
+    --http-bind 127.0.0.1:8081 --grpc-bind 127.0.0.1:50052 &
 ```
 
-Endpoints:
+### Endpoints
 
-| Endpoint | Protocol | Purpose |
-|----------|----------|---------|
-| `POST /v1/transcriptions` | HTTP | Offline transcription (multipart audio upload) |
-| `POST /v1/audio/transcriptions` | HTTP | Whisper-compatible alias |
-| `GET /v1/stream` | WebSocket | Streaming transcription (chunked audio frames) |
-| `oasr.asr.v1.Speech/Recognize` | gRPC | Offline unary |
-| `oasr.asr.v1.Speech/StreamingRecognize` | gRPC | Streaming bidi |
-| `GET /healthz`, `/readyz`, `/metrics`, `/v1/models` | HTTP | Health, readiness, Prometheus metrics, model list |
+| Surface | Endpoint                                       | Purpose                                  |
+|---------|------------------------------------------------|------------------------------------------|
+| HTTP    | `POST /v1/speech:recognize`                    | Synchronous unary recognition (offline). |
+| HTTP    | `GET /v1/models`                               | Loaded model metadata.                   |
+| HTTP    | `GET /healthz` / `/readyz` / `/metrics`        | Liveness, readiness, Prometheus metrics. |
+| gRPC    | `oasr.speech.v1.Speech/Recognize`              | Synchronous unary (offline mode).        |
+| gRPC    | `oasr.speech.v1.Speech/StreamingRecognize`     | Bidi streaming (streaming mode).         |
+| gRPC    | `grpc.health.v1.Health/Check` and `Watch`      | Standard gRPC health checking.           |
 
-Routing: offline requests go to the least-loaded worker; streaming requests are least-loaded at admission and then sticky by `request_id` so subsequent chunks land on the same worker (streaming cache cannot migrate). `/readyz` is green iff at least one worker has pinged within the last 5 s.
+REST is synchronous only — streaming clients must use the gRPC `StreamingRecognize` RPC.
 
-See `docs/serving.md` for the full wire format and deployment notes.
+### HTTP example
+
+Audio is carried inline as base64 in `audio.content`.
+
+```bash
+B64=$(base64 -w0 audio.wav)
+curl -sS -X POST http://127.0.0.1:8080/v1/speech:recognize \
+     -H 'Content-Type: application/json' \
+     -d "$(jq -n --arg b64 "$B64" \
+           '{config:{encoding:"WAV",sampleRateHertz:16000,languageCode:"en-US"},
+             audio:{content:$b64}}')"
+```
+
+Accepted `encoding` values: `LINEAR16` (16-bit PCM mono), `LINEAR32F` (32-bit float PCM mono), and `WAV`. Other codecs return `UNIMPLEMENTED`.
+
+### gRPC streaming
+
+The first inbound message on `StreamingRecognize` must carry `streaming_config.config`; subsequent messages carry `audio_content` (raw PCM bytes). Each response contains a `StreamingRecognitionResult` with `is_final=true` on the terminal frame.
+
+```bash
+grpcurl -plaintext -import-path rust/proto -proto oasr_speech_v1.proto \
+        127.0.0.1:50051 oasr.speech.v1.Speech/StreamingRecognize
+```
+
+---
 
 ## Documentation
 
-| File | Covers |
-|------|--------|
-| `docs/engine.md` | `ASREngine` step loop, batching, CUDA Graph capture |
-| `docs/engine_concurrency.md` | Engine thread-safety, worker-thread modes, multi-process scaling |
-| `docs/scheduler.md` | Streaming + offline request scheduling, starvation bounds, micro-batching |
-| `docs/cache_manager.md` | `BlockPool` / `AttentionCacheManager` / `CnnCacheManager` / `StreamContext` |
-| `docs/ctc_decoder_gpu.md` | `GpuStreamingDecoder` single- vs. multi-request flows, paged-memory options |
-| `docs/serving.md` | Rust `oasr-server` frontend: HTTP/gRPC/WebSocket API, multi-worker fleet, wire format |
-| `docs/autotuning.md` | `oasr.tune` design, `oasr.autotune()` API, JSON cache format |
+| Document                                             | Covers                                                |
+|------------------------------------------------------|-------------------------------------------------------|
+| [`docs/engine.md`](docs/engine.md)                   | Engine step loop, batching, CUDA Graph capture        |
+| [`docs/engine_concurrency.md`](docs/engine_concurrency.md) | Engine thread-safety and multi-process scaling   |
+| [`docs/scheduler.md`](docs/scheduler.md)             | Request scheduling, starvation bounds, micro-batching |
+| [`docs/cache_manager.md`](docs/cache_manager.md)     | Paged streaming cache (`BlockPool`, `StreamContext`)  |
+| [`docs/ctc_decoder_gpu.md`](docs/ctc_decoder_gpu.md) | GPU CTC decoder, single- and multi-request flows      |
+| [`docs/serving.md`](docs/serving.md)                 | Serving frontend, wire format, deployment             |
+| [`docs/benchmarks.md`](docs/benchmarks.md)           | Engine and service benchmark recipes                  |
+| [`docs/autotuning.md`](docs/autotuning.md)           | Kernel auto-tuning API and cache format               |
+
+---
+
+## Testing
+
+```bash
+# Run all Python tests
+pytest tests/
+
+# Skip slow tests
+pytest tests/ -m "not slow"
+```
+
+---
+
+## Contributing
+
+Contributions are welcome. Please open an issue to discuss substantial changes before submitting a pull request, and run `black`, `ruff`, and `pytest` against your changes.
 
 ## License
 
