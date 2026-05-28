@@ -162,3 +162,28 @@ class CtcStateCacheManager:
         if stream_id not in self._states:
             raise KeyError(f"CTC state for stream {stream_id} not found.")
         return StreamHandle(self._decoder, self._states[stream_id])
+
+    def get_states(self, stream_ids: List[int]) -> List[StreamState]:
+        """Return :class:`StreamState` objects for ``stream_ids`` in order.
+
+        Used by the engine to feed
+        :meth:`~oasr.ctc_decode.GpuStreamingDecoder.decode_chunk_batch`
+        with the active set of streams in one call.
+
+        Raises
+        ------
+        KeyError
+            If any of ``stream_ids`` is not allocated.
+        """
+        result: List[StreamState] = []
+        for sid in stream_ids:
+            s = self._states.get(sid)
+            if s is None:
+                raise KeyError(f"CTC state for stream {sid} not found.")
+            result.append(s)
+        return result
+
+    @property
+    def decoder(self) -> GpuStreamingDecoder:
+        """The shared :class:`GpuStreamingDecoder` engine."""
+        return self._decoder

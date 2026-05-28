@@ -1,0 +1,26 @@
+[package]
+name = "oasr-server-grpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "tonic gRPC service for the OASR serving frontend (offline + bidi streaming)."
+
+[dependencies]
+oasr-wire = { path = "../oasr-wire" }
+oasr-engine-client = { path = "../oasr-engine-client" }
+oasr-asr = { path = "../oasr-asr" }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

@@ -769,3 +769,125 @@ class TestCtcStreamingCudaGraphParity:
                              state=state)
         r = decoder.finalize_stream(state=state)
         assert r.tokens[0][0] == [3, 5, 7]
+
+# ---------------------------------------------------------------------------
+# Batched streaming decode (decode_chunk_batch) — parity vs per-stream path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cuda
+class TestCtcDecoderBatchedChunk:
+    """Parity tests for ``GpuStreamingDecoder.decode_chunk_batch``."""
+
+    def _run_per_stream(self, decoder, paths, V, device):
+        states = [decoder.create_state(batch=1, vocab_size=V, device=device)
+                  for _ in paths]
+        for s, path in zip(states, paths):
+            decoder.decode_chunk(_make_logp_gpu(len(path), V, path, device),
+                                 state=s)
+        return [decoder.finalize_stream(state=s) for s in states], states
+
+    def _run_batched(self, decoder, paths, V, device):
+        # All chunks must share the same T for the batched call; pad with
+        # blank where shorter.
+        max_T = max(len(p) for p in paths)
+        padded = [p + [0] * (max_T - len(p)) for p in paths]
+        logp = torch.stack(
+            [_make_logp_gpu(max_T, V, p, device).squeeze(0) for p in padded],
+            dim=0,
+        )  # (N, T, V)
+        states = [decoder.create_state(batch=1, vocab_size=V, device=device)
+                  for _ in paths]
+        decoder.decode_chunk_batch(logp, states)
+        return [decoder.finalize_stream(state=s) for s in states], states
+
+    def test_batched_matches_per_stream_no_graphs(self, device):
+        V = 6
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=20,
+                               blank_threshold=0.0)
+        paths = [[1, 0, 2, 0, 3], [4, 0, 5, 0, 1], [2, 0, 3, 0, 4]]
+
+        d_per = GpuStreamingDecoder(cfg, use_cuda_graphs=False)
+        d_bat = GpuStreamingDecoder(cfg, use_cuda_graphs=False)
+
+        r_per, _ = self._run_per_stream(d_per, paths, V, device)
+        r_bat, _ = self._run_batched(d_bat, paths, V, device)
+
+        assert len(r_per) == len(r_bat)
+        for a, b in zip(r_per, r_bat):
+            assert a.tokens[0][0] == b.tokens[0][0]
+
+    def test_batched_matches_per_stream_with_graphs(self, device):
+        V = 6
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=20,
+                               blank_threshold=0.0)
+        paths = [[1, 0, 2], [3, 0, 4], [5, 0, 1], [2, 0, 3]]
+
+        d_per = GpuStreamingDecoder(cfg, use_cuda_graphs=True)
+        d_bat = GpuStreamingDecoder(cfg, use_cuda_graphs=True)
+
+        r_per, _ = self._run_per_stream(d_per, paths, V, device)
+        r_bat, _ = self._run_batched(d_bat, paths, V, device)
+
+        for a, b in zip(r_per, r_bat):
+            assert a.tokens[0][0] == b.tokens[0][0]
+
+    def test_batched_step_counter_advances(self, device):
+        V = 5
+        # Use the default blank_threshold so the blank frame at t=1 is
+        # skipped by the mask path — same behaviour as decode_chunk's
+        # eager loop.
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10,
+                               blank_threshold=0.98)
+        decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=False)
+        paths = [[1, 0, 2], [3, 0, 4]]
+        _, states = self._run_batched(decoder, paths, V, device)
+        # Two non-blank frames per path → step == 2, frame_idx == 3.
+        for s in states:
+            assert s.step == 2
+            assert s.actual_frame_idx == 3
+
+    def test_batched_blank_mask_skips_frames(self, device):
+        V = 6
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10,
+                               blank_threshold=0.0)
+        decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=False)
+        paths = [[1, 0, 2, 0, 3], [4, 0, 5, 0, 1]]
+        N, T = 2, 5
+        # Mask the middle frame for both streams; the path still encodes
+        # blank at t=1 and t=3, so the masked-skip mirrors blank behaviour
+        # and the final transcript stays the same.
+        mask = torch.ones((N, T), dtype=torch.uint8, device="cpu")
+        mask[:, 1] = 0
+        mask[:, 3] = 0
+        logp = torch.stack(
+            [_make_logp_gpu(T, V, p, device).squeeze(0) for p in paths], dim=0,
+        )
+        states = [decoder.create_state(batch=1, vocab_size=V, device=device)
+                  for _ in paths]
+        decoder.decode_chunk_batch(logp, states, is_speech_mask=mask)
+        for i, (s, path) in enumerate(zip(states, paths)):
+            r = decoder.finalize_stream(state=s)
+            # Three non-blank frames produce three emit steps.
+            assert s.step == 3
+            assert r.tokens[0][0] == [path[0], path[2], path[4]]
+
+    def test_batched_single_stream_matches_decode_chunk(self, device):
+        V = 5
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10,
+                               blank_threshold=0.0)
+        decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=True)
+        path = [1, 0, 2, 0, 3]
+        # Single-stream batched call should match the well-tested
+        # single-state path.
+        s_bat = decoder.create_state(batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk_batch(_make_logp_gpu(5, V, path, device), [s_bat])
+        r_bat = decoder.finalize_stream(state=s_bat)
+
+        s_per = decoder.create_state(batch=1, vocab_size=V, device=device)
+        decoder.decode_chunk(_make_logp_gpu(5, V, path, device), state=s_per)
+        r_per = decoder.finalize_stream(state=s_per)
+
+        assert r_bat.tokens[0][0] == r_per.tokens[0][0]
+        assert s_bat.step == s_per.step
+

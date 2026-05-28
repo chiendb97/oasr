@@ -11,15 +11,15 @@ Metrics
 
 Subroutines
 -----------
-* ``offline``         — OfflineEngine (batch forward, ctc_prefix_beam).
-* ``streaming``       — ASREngine (chunk-by-chunk, ctc_prefix_beam).
-* ``offline_wfst``    — OfflineEngine with WFST decoder (requires --wfst-path).
-* ``streaming_wfst``  — ASREngine with WFST decoder (requires --wfst-path).
+* ``offline``         — ``ASREngine.transcribe_offline`` (batch forward, ctc_prefix_beam).
+* ``streaming``       — ``ASREngine.transcribe`` (chunk-by-chunk, ctc_prefix_beam).
+* ``offline_wfst``    — offline path with WFST decoder (requires --wfst-path).
+* ``streaming_wfst``  — streaming path with WFST decoder (requires --wfst-path).
 """
 
 from __future__ import annotations
 from benchmarks.routines.bench_utils import BenchResult, OutputWriter
-from oasr.engine import ASREngine, EngineConfig, OfflineEngine
+from oasr.engine import ASREngine, EngineConfig
 
 import argparse
 import glob
@@ -146,18 +146,18 @@ def _resolve_fst_file(wfst_path: Optional[str]) -> Optional[str]:
 
 
 def _time_offline(
-    engine: OfflineEngine,
+    engine: ASREngine,
     waveforms: List[torch.Tensor],
     durations: List[float],
     num_iters: int,
 ) -> tuple[float, float, float]:
-    """Time OfflineEngine over pre-loaded *waveforms*.
+    """Time the offline path on ``engine`` over pre-loaded *waveforms*.
 
-    The full waveform list is handed to ``engine.transcribe`` in one call so
-    the engine's offline pipeline can overlap CPU feature prep for later
-    micro-batches with GPU forward+decode for earlier ones.  The GPU forward
-    width comes from ``EngineConfig.max_batch_size`` (configured by the
-    caller before ``engine`` is built); processing the full list in one
+    The full waveform list is handed to ``engine.transcribe_offline`` in one
+    call so the engine's offline pipeline can overlap CPU feature prep for
+    later micro-batches with GPU forward+decode for earlier ones.  The GPU
+    forward width comes from ``EngineConfig.max_batch_size`` (configured by
+    the caller before ``engine`` is built); processing the full list in one
     call instead of chunking at the benchmark layer is what lets the
     producer thread keep the GPU continuously fed.
 
@@ -171,7 +171,7 @@ def _time_offline(
     total_duration = sum(durations)
 
     def _run_all():
-        engine.transcribe(waveforms)
+        engine.transcribe_offline(waveforms)
 
     # Warmup
     _run_all()
@@ -241,8 +241,8 @@ def _warmup_engine(
                 engine.feed_chunk(rid_, c, is_last=(j == len(chs) - 1))
         engine.run()
     else:
-        # Offline path: run a tiny batch through transcribe(...).
-        engine.transcribe(samples)
+        # Offline path: run a tiny batch through transcribe_offline(...).
+        engine.transcribe_offline(samples)
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -397,6 +397,7 @@ def _run_config(
                 ckpt_dir=ckpt_dir,
                 device="cuda",
                 dtype=dtype,
+                service_mode="streaming",
                 decoder_type=decoder_type,
                 chunk_size=chunk_size,
                 num_left_chunks=num_left_chunks,
@@ -419,11 +420,12 @@ def _run_config(
                 ckpt_dir=ckpt_dir,
                 device="cuda",
                 dtype=dtype,
+                service_mode="offline",
                 decoder_type=decoder_type,
                 fst_path=fst_file,
                 max_batch_size=max_batch_size,
             )
-            engine = OfflineEngine(cfg)
+            engine = ASREngine(cfg)
             shape_str = f"N={n}, batch={max_batch_size}, avg_dur={avg_dur:.1f}s"
             _warmup_engine(engine, waveforms, is_streaming=False)
             median_ms, std_ms, rtf = _time_offline(

@@ -11,10 +11,9 @@ Components
     Unified configuration aggregating model, cache, feature extraction, decoding,
     and detokenization settings.
 :class:`ASREngine`
-    Streaming engine with a three-stage step loop (schedule → forward →
-    postprocess).  Suitable for concurrent multi-request serving.
-:class:`OfflineEngine`
-    Simple batch transcription engine.  No scheduler or cache management needed.
+    Unified engine for both streaming and offline transcription.  Pass
+    ``streaming=False`` to :meth:`add_request` or :meth:`transcribe` for
+    batched offline behaviour.
 :class:`Request`
     A single ASR inference request.
 :class:`RequestOutput`
@@ -26,10 +25,10 @@ Quick start
 -----------
 Offline transcription::
 
-    from oasr.engine import OfflineEngine, EngineConfig
+    from oasr.engine import ASREngine, EngineConfig
 
-    engine = OfflineEngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))
-    text = engine.transcribe("audio.wav")
+    engine = ASREngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))
+    text = engine.transcribe("audio.wav", streaming=False)
 
 Streaming transcription (multiple concurrent requests)::
 
@@ -41,13 +40,11 @@ Streaming transcription (multiple concurrent requests)::
 
 from .config import EngineConfig
 from .engine import ASREngine
-from .offline import OfflineEngine
 from .request import Request, RequestOutput, RequestState
 
 __all__ = [
     "EngineConfig",
     "ASREngine",
-    "OfflineEngine",
     "Request",
     "RequestOutput",
     "RequestState",

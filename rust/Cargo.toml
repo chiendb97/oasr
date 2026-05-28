@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oasr-wire",
+    "crates/oasr-engine-client",
+    "crates/oasr-asr",
+    "crates/oasr-server-http",
+    "crates/oasr-server-grpc",
+    "crates/oasr-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/your-org/oasr"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+
+# Errors / logging
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+# Python embedding — drives the in-process ASREngine dispatcher.  Picks up
+# `libpython` automatically via `auto-initialize`; the `oasr-server` binary
+# is linked at build time against the active interpreter (matched at runtime
+# via PYTHONHOME / the active venv).
+pyo3 = { version = "0.22", features = ["auto-initialize"] }
+numpy = "0.22"
+
+# Concurrent containers / ids
+dashmap = "6"
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
+
+# HTTP / gRPC
+axum = { version = "0.7", features = ["macros"] }
+base64 = "0.22"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+tonic = "0.12"
+tonic-health = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tonic-build = "0.12"
+hyper = { version = "1", features = ["full"] }
+
+# Audio
+hound = "3.5"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Metrics
+metrics = "0.22"
+metrics-exporter-prometheus = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

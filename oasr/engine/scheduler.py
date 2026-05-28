@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 from .config import EngineConfig
 from .request import Request, RequestState
@@ -112,30 +112,49 @@ class Scheduler:
             self._insert_ordered(self._offline_waiting, request)
         self._index[request.request_id] = request
 
-    def schedule(self) -> SchedulerOutput:
-        """Compute the next scheduling step."""
-        output = SchedulerOutput()
+    def schedule_offline(self) -> List[Request]:
+        """Pick one length-bucketed offline batch from the offline queue.
 
-        # 1. Offline batching — length-bucketed, size-capped.
-        offline_batch = self._build_offline_batch()
+        Marks each picked request RUNNING and returns the batch.  Returns
+        an empty list when no batch is ready.  Each batch is admitted-then-
+        finalised in the same step; offline requests never enter
+        ``_running`` (that pool tracks streaming admissions only).
+        """
+        batch = self._build_offline_batch()
+        for req in batch:
+            req.state = RequestState.RUNNING
+        return batch
+
+    def schedule_streaming(self) -> Tuple[List[Request], List[Request]]:
+        """Admit waiting streaming requests up to ``max_batch_size``.
+
+        Returns ``(newly_admitted, running_streams)`` — freshly-promoted
+        streams (the engine/pipeline allocates their KV cache on the first
+        list) and the full running pool the caller should iterate this
+        step.
+        """
+        budget = self._config.max_batch_size - len(self._running)
+        admitted = self._admit_streaming(budget)
+        for req in admitted:
+            self._running[req.request_id] = req
+        return admitted, list(self._running.values())
+
+    def schedule(self) -> SchedulerOutput:
+        """Legacy compositional helper — combines :meth:`schedule_offline`
+        and :meth:`schedule_streaming` into one :class:`SchedulerOutput`.
+
+        Mode-specific pipelines call the finer-grained methods directly so
+        they don't pay for the other mode's queue scan.  Retained for
+        tests that exercise both queues in one shared scheduler instance.
+        """
+        output = SchedulerOutput()
+        offline_batch = self.schedule_offline()
         if offline_batch:
-            for req in offline_batch:
-                req.state = RequestState.RUNNING
             output.offline_batch = offline_batch
             output.newly_admitted.extend(offline_batch)
-
-        # 2. Streaming admission — capped by running pool size.
-        budget = self._config.max_batch_size - len(self._running)
-        admitted_streaming = self._admit_streaming(budget)
-        for req in admitted_streaming:
-            self._running[req.request_id] = req
-            output.newly_admitted.append(req)
-
-        # 3. Hand the engine all active streams; it dispatches per-stream
-        #    work (feature extraction, encoder chunk, finalisation) itself
-        #    because one step may need to do several of those in sequence.
-        output.running_streams = list(self._running.values())
-
+        admitted_streaming, running_streams = self.schedule_streaming()
+        output.newly_admitted.extend(admitted_streaming)
+        output.running_streams = running_streams
         return output
 
     def finish_request(self, request_id: str) -> Request:

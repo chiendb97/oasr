@@ -1,0 +1,152 @@
+// Copyright 2024 OASR Authors
+// SPDX-License-Identifier: Apache-2.0
+//! Per-request handles returned by [`EngineClient`] / [`EnginePool`].
+//!
+//! [`StreamingHandle`] holds a clone of the dispatcher command sender + the
+//! event receiver for one streaming session.  `push_chunk` / `flush_last`
+//! build `Cmd::FeedChunk` envelopes inline and send them directly to the
+//! dispatcher — there's no intermediate forwarder task.  Dropping the
+//! handle without an explicit `finish` emits a `Cmd::Cancel`.
+//!
+//! [`OfflineHandle`] is a oneshot future that resolves with the Final or
+//! Error event.
+
+use bytes::Bytes;
+use oasr_wire::{Cmd, Event};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tracing::trace;
+
+use crate::dispatcher::CmdEnvelope;
+use crate::router::RouterActor;
+use crate::EventStream;
+
+/// Carrier of a cancellation tail when the WS / gRPC stream drops early.
+struct CancelOnDrop {
+    request_id: String,
+    cmd_tx: mpsc::Sender<CmdEnvelope>,
+    router: RouterActor,
+    finished: bool,
+}
+
+impl CancelOnDrop {
+    fn arm(request_id: String, cmd_tx: mpsc::Sender<CmdEnvelope>, router: RouterActor) -> Self {
+        Self {
+            request_id,
+            cmd_tx,
+            router,
+            finished: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let cancel = Cmd::Cancel {
+            request_id: self.request_id.clone(),
+        };
+        let envelope = CmdEnvelope::new(cancel, None);
+        // Best effort — if the dispatcher has gone away, cmd_tx is closed.
+        if let Err(e) = self.cmd_tx.try_send(envelope) {
+            trace!(rid = %self.request_id, "could not send cancel on drop: {e}");
+        }
+        self.router.remove(&self.request_id);
+    }
+}
+
+/// Streaming request handle: push audio chunks, pull events.
+pub struct StreamingHandle {
+    pub request_id: String,
+    cmd_tx: mpsc::Sender<CmdEnvelope>,
+    pub events: EventStream,
+    _cancel: Arc<parking_lot::Mutex<CancelOnDrop>>,
+}
+
+impl StreamingHandle {
+    pub(crate) fn new(
+        request_id: String,
+        events: EventStream,
+        cmd_tx: mpsc::Sender<CmdEnvelope>,
+        router: RouterActor,
+    ) -> Self {
+        Self {
+            _cancel: Arc::new(parking_lot::Mutex::new(CancelOnDrop::arm(
+                request_id.clone(),
+                cmd_tx.clone(),
+                router,
+            ))),
+            request_id,
+            cmd_tx,
+            events,
+        }
+    }
+
+    /// Push one audio chunk with `is_last=false`.
+    ///
+    /// On send failure (dispatcher gone, channel closed), returns the chunk
+    /// bytes back to the caller so they can decide whether to retry or
+    /// surface an error to the API client.
+    pub async fn push_chunk(&self, audio: Bytes) -> Result<(), Bytes> {
+        let envelope = CmdEnvelope::new(
+            Cmd::FeedChunk {
+                request_id: self.request_id.clone(),
+                is_last: false,
+            },
+            Some(audio),
+        );
+        self.cmd_tx
+            .send(envelope)
+            .await
+            .map_err(|e| e.0.payload.unwrap_or_default())
+    }
+
+    /// Push the final audio chunk with `is_last=true` and disarm
+    /// cancel-on-drop.  Pass an empty `Bytes` if the caller already
+    /// exhausted audio.
+    pub async fn flush_last(&self, audio: Bytes) -> Result<(), Bytes> {
+        let envelope = CmdEnvelope::new(
+            Cmd::FeedChunk {
+                request_id: self.request_id.clone(),
+                is_last: true,
+            },
+            Some(audio),
+        );
+        let result = self
+            .cmd_tx
+            .send(envelope)
+            .await
+            .map_err(|e| e.0.payload.unwrap_or_default());
+        self.finish();
+        result
+    }
+
+    /// Mark the handle as completed so dropping it won't emit a Cancel.
+    pub fn finish(&self) {
+        self._cancel.lock().disarm();
+    }
+}
+
+/// Offline request handle: await a single final result.
+pub struct OfflineHandle {
+    pub request_id: String,
+    rx: oneshot::Receiver<Event>,
+}
+
+impl OfflineHandle {
+    pub(crate) fn new(request_id: String, rx: oneshot::Receiver<Event>) -> Self {
+        Self { request_id, rx }
+    }
+
+    /// Await the final result event.
+    pub async fn finish(self) -> Result<Event, oneshot::error::RecvError> {
+        self.rx.await
+    }
+}

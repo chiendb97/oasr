@@ -1,0 +1,12 @@
+[package]
+name = "oasr-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared type definitions for the OASR engine boundary (Cmd/Event/ErrorCode/ModelInfo)."
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

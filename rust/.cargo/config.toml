@@ -1,0 +1,7 @@
+[build]
+# The repo lives on an NFS mount whose I/O semantics break rustc's autocfg
+# probes (e.g. indexmap's `cfg(has_std)` flag).  Redirect the target dir to a
+# local filesystem so build scripts can write .ll files without error.
+#
+# Override by setting CARGO_TARGET_DIR before invoking cargo.
+target-dir = "/tmp/oasr-cargo-target"
