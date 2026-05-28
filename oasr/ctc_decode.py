@@ -152,6 +152,14 @@ class StreamHandle:
         """Finalize and return results from the bound state."""
         return self._decoder.finalize_stream(state=self._state)
 
+    def peek(self) -> GpuDecoderResult:
+        """Snapshot the current best hypothesis without finalising.
+
+        Safe to call after each :meth:`decode_chunk`; the underlying
+        ``read_streaming_results`` kernel is a pure device-to-device copy.
+        """
+        return self._decoder.peek_state(state=self._state)
+
     @property
     def step(self) -> int:
         """Current timestep index of the bound state."""
@@ -664,10 +672,17 @@ class GpuStreamingDecoder:
             s.actual_frame_idx += chunk_t
         nvtx_pop()
 
-    def finalize_stream(
+    def peek_state(
         self, state: Optional[StreamState] = None,
     ) -> GpuDecoderResult:
-        """Finalize streaming decoding and return results.
+        """Snapshot the current best-so-far hypothesis from ``state``.
+
+        Workhorse for both :meth:`finalize_stream` and mid-stream interim
+        results.  The underlying ``ctc_beam_search_read_state`` kernel is a
+        device-to-device copy of the beam-state buffer, so this call is
+        non-destructive — it can be issued after every
+        :meth:`decode_chunk` / :meth:`decode_chunk_batch` to surface live
+        partial transcripts without ending the stream.
 
         Parameters
         ----------
@@ -678,7 +693,8 @@ class GpuStreamingDecoder:
         Returns
         -------
         GpuDecoderResult
-            Decoded tokens, lengths, and scores for each batch and beam.
+            Decoded tokens, lengths, and scores for each batch and beam
+            at the current decoder step.
         """
         s = self._resolve_state(state)
         cfg = self._config
@@ -702,6 +718,17 @@ class GpuStreamingDecoder:
 
         tokens = _extract_tokens(out_tokens, out_lengths, batch, cfg.beam_size)
         return GpuDecoderResult(tokens=tokens, lengths=out_lengths, scores=out_scores)
+
+    def finalize_stream(
+        self, state: Optional[StreamState] = None,
+    ) -> GpuDecoderResult:
+        """Read the final hypothesis from ``state`` at end-of-stream.
+
+        Identical to :meth:`peek_state` — the C++ side does not perform any
+        terminal bookkeeping, it just copies the current beam state out.
+        Kept as a separate name so end-of-stream call sites read clearly.
+        """
+        return self.peek_state(state=state)
 
     # ------------------------------------------------------------------
     # Properties

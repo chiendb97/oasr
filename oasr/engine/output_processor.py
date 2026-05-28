@@ -217,11 +217,17 @@ class OutputProcessor:
             if decoder is None:
                 decoder = reqs[0].stream_context.ctc_state_manager.decoder
             decoder.decode_chunk_batch(log_probs_batch, states)
-            for req in reqs:
+            for req, state in zip(reqs, states):
+                # peek_state issues a non-destructive D2D copy of the beam
+                # buffer plus a D→H of the (small) token tensor — adds a
+                # sub-ms sync per stream per chunk in exchange for real
+                # interim transcripts.
+                snap = decoder.peek_state(state=state)
+                best = snap.tokens[0][0] if snap.tokens and snap.tokens[0] else []
                 partials.append(RequestOutput(
                     request_id=req.request_id,
-                    text="",
-                    tokens=[],
+                    text=self.detokenize(best),
+                    tokens=snap.tokens[0] if snap.tokens else [],
                     finished=False,
                 ))
         return partials
@@ -253,11 +259,15 @@ class OutputProcessor:
         if dtype == "ctc_gpu":
             handle = ctx.get_decoder()
             handle.decode_chunk(log_probs)
-            # Return placeholder partial result (best hypothesis not available mid-stream)
+            # ``peek`` is a non-destructive D2D snapshot of the beam buffer;
+            # surfaces the best-so-far hypothesis without finalising the
+            # stream.
+            snap = handle.peek()
+            best = snap.tokens[0][0] if snap.tokens and snap.tokens[0] else []
             return RequestOutput(
                 request_id=request.request_id,
-                text="",
-                tokens=[],
+                text=self.detokenize(best),
+                tokens=snap.tokens[0] if snap.tokens else [],
                 finished=False,
             )
         else:
