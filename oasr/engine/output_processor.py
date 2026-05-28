@@ -149,6 +149,83 @@ class OutputProcessor:
     # Streaming decoding
     # ------------------------------------------------------------------
 
+    def decode_streaming_batch(
+        self,
+        requests: List[Request],
+        log_probs_map: Dict[str, torch.Tensor],
+    ) -> List[RequestOutput]:
+        """Batched streaming decode for **N ready streams** in one call.
+
+        For the ``ctc_gpu`` decoder we issue a single C++ launcher
+        (:meth:`~oasr.ctc_decode.GpuStreamingDecoder.decode_chunk_batch`)
+        over all ready streams at once, replacing the per-stream Python
+        loop in :meth:`~oasr.engine.pipeline.streaming.StreamingPipeline.step`.
+        For the CPU decoders we fall back to a Python loop here — those
+        decoders are single-threaded per-request anyway.
+
+        Parameters
+        ----------
+        requests : list of Request
+            Streams whose features are ready this step, in the order
+            their log-prob slices appear in ``log_probs_map``.
+        log_probs_map : dict
+            ``{request_id: tensor(1, T_chunk, V)}`` from
+            ``ModelRunner.forward_streaming_step``.
+
+        Returns
+        -------
+        list of RequestOutput
+            One partial output per request that had log-probs this step.
+        """
+        if not requests:
+            return []
+        dtype = self._config.decoder_type
+        if dtype != "ctc_gpu":
+            outputs: List[RequestOutput] = []
+            for req in requests:
+                lp = log_probs_map.get(req.request_id)
+                if lp is not None:
+                    outputs.append(self.decode_streaming_chunk(req, lp))
+            return outputs
+
+        # GPU fast path — gather N streams that have log-probs this step
+        # and run one batched chunk launch.  Streams whose chunk T differs
+        # (e.g. a final-window stream with a short tail) are processed in
+        # a separate batched call per ``T`` group — torch.cat can't stack
+        # tensors with mismatched T.  Typical workloads see one big group
+        # (the lockstep batched cohort) plus zero or one small groups.
+        from collections import defaultdict
+        groups: Dict[int, List[Request]] = defaultdict(list)
+        group_logp: Dict[int, List[torch.Tensor]] = defaultdict(list)
+        for req in requests:
+            lp = log_probs_map.get(req.request_id)
+            if lp is None:
+                continue
+            assert req.stream_context is not None, \
+                "stream_context must be allocated before decoding"
+            t_chunk = lp.size(1)
+            groups[t_chunk].append(req)
+            group_logp[t_chunk].append(lp)
+        if not groups:
+            return []
+
+        partials: List[RequestOutput] = []
+        decoder = None
+        for t_chunk, reqs in groups.items():
+            log_probs_batch = torch.cat(group_logp[t_chunk], dim=0)
+            states = [r.stream_context.get_ctc_state() for r in reqs]
+            if decoder is None:
+                decoder = reqs[0].stream_context.ctc_state_manager.decoder
+            decoder.decode_chunk_batch(log_probs_batch, states)
+            for req in reqs:
+                partials.append(RequestOutput(
+                    request_id=req.request_id,
+                    text="",
+                    tokens=[],
+                    finished=False,
+                ))
+        return partials
+
     def decode_streaming_chunk(
         self,
         request: Request,

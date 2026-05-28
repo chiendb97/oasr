@@ -8,6 +8,7 @@
 #include <functional>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "tvm_ffi_utils.h"
 
@@ -615,6 +616,216 @@ int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk
     ++frame_idx;
   }
   return static_cast<int64_t>(step);
+}
+
+// =============================================================================
+// Streaming: batched process a whole chunk for many streams at once
+// =============================================================================
+//
+// Replaces the per-stream Python loop in ``OutputProcessor.decode_streaming_chunk``
+// with a single C++ entrypoint that takes N state buffer pointers + a stacked
+// ``(N, T, V)`` log-prob tensor and processes every stream's chunk in one
+// call.  The per-frame work is the same as ``ctc_beam_search_chunk`` (per-state
+// graph cache, blank-skip mask, parity-aware graph selection); the only
+// difference is that the outer Python loop is folded into C++, eliminating
+// ~10 μs of Python overhead per stream per step.
+//
+// Tensor layout:
+//   * ``state_ptrs``     : ``(N,)`` int64 on **CPU**, each element is a
+//                          state buffer device pointer cast to ``int64_t``.
+//   * ``log_prob_chunk`` : ``(N, T, V)`` float32 on **CUDA**.
+//   * ``is_speech_mask`` : ``(N, T)`` uint8 on **CPU**, or empty for "decode
+//                          every frame".
+//   * ``start_steps``    : ``(N,)`` int32 on **CPU**, read AND mutated —
+//                          the caller reads the new step values back after
+//                          the call returns.
+//   * ``start_frame_idxs``: ``(N,)`` int32 on **CPU**, same read/mutate
+//                          contract as ``start_steps``.
+//
+// All N streams share the same ``(batch, beam, vocab_size, max_seq_len,
+// use_paged_memory, page_size, blank_id)`` config — the engine constructs
+// every per-stream ``StreamState`` from one ``GpuDecoderConfig``.
+void ctc_beam_search_chunk_batched(TensorView state_ptrs,
+                                   TensorView log_prob_chunk,
+                                   TensorView is_speech_mask,
+                                   TensorView start_steps,
+                                   TensorView start_frame_idxs,
+                                   int64_t beam, int64_t blank_id,
+                                   double blank_threshold,
+                                   int64_t batch, int64_t vocab_size,
+                                   int64_t max_seq_len,
+                                   int64_t use_paged_memory,
+                                   int64_t page_size,
+                                   int64_t use_cuda_graphs) {
+  CHECK_INPUT(log_prob_chunk);
+  CHECK_DIM(3, log_prob_chunk);
+  TVM_FFI_ICHECK(log_prob_chunk.dtype().code == kDLFloat &&
+                 log_prob_chunk.dtype().bits == 32)
+      << "log_prob_chunk must be float32";
+
+  int n_streams = log_prob_chunk.size(0);
+  if (n_streams == 0) return;
+  int chunk_t = log_prob_chunk.size(1);
+
+  TVM_FFI_ICHECK(state_ptrs.dtype().code == kDLInt && state_ptrs.dtype().bits == 64)
+      << "state_ptrs must be int64";
+  TVM_FFI_ICHECK(state_ptrs.size(0) == n_streams)
+      << "state_ptrs length (" << state_ptrs.size(0)
+      << ") must equal log_prob batch (" << n_streams << ")";
+  TVM_FFI_ICHECK(start_steps.dtype().code == kDLInt && start_steps.dtype().bits == 32)
+      << "start_steps must be int32";
+  TVM_FFI_ICHECK(start_steps.size(0) == n_streams);
+  TVM_FFI_ICHECK(start_frame_idxs.dtype().code == kDLInt &&
+                 start_frame_idxs.dtype().bits == 32)
+      << "start_frame_idxs must be int32";
+  TVM_FFI_ICHECK(start_frame_idxs.size(0) == n_streams);
+
+  int batch_stride = log_prob_chunk.stride(0);
+  int seq_stride = log_prob_chunk.stride(1);
+  int vocab_stride = log_prob_chunk.stride(2);
+  const float* lp_data_all = static_cast<const float*>(log_prob_chunk.data_ptr());
+
+  const int64_t* state_ptr_array = static_cast<const int64_t*>(state_ptrs.data_ptr());
+  int* steps_host = static_cast<int*>(start_steps.data_ptr());
+  int* frame_idxs_host = static_cast<int*>(start_frame_idxs.data_ptr());
+
+  const uint8_t* mask_data_all = nullptr;
+  int mask_stride0 = 0;
+  if (is_speech_mask.numel() > 0) {
+    TVM_FFI_ICHECK(is_speech_mask.dtype().code == kDLUInt &&
+                   is_speech_mask.dtype().bits == 8)
+        << "is_speech_mask must be uint8";
+    TVM_FFI_ICHECK(is_speech_mask.size(0) == n_streams)
+        << "is_speech_mask.shape[0] (" << is_speech_mask.size(0)
+        << ") must equal n_streams (" << n_streams << ")";
+    TVM_FFI_ICHECK(is_speech_mask.size(1) == chunk_t)
+        << "is_speech_mask.shape[1] (" << is_speech_mask.size(1)
+        << ") must equal chunk_T (" << chunk_t << ")";
+    mask_data_all = static_cast<const uint8_t*>(is_speech_mask.data_ptr());
+    mask_stride0 = is_speech_mask.stride(0);
+  }
+
+  cudaStream_t stream = get_stream(log_prob_chunk.device());
+
+  // ----- Resolve graph caches up-front under one lock -----
+  // Holding the mutex across all N lookups beats N independent acquisitions
+  // and lets first-time captures on this engine step share the same critical
+  // section as later replays.  ``caches[i] == nullptr`` means "fall back to
+  // the eager path for this stream" (capture failed or graphs disabled).
+  std::vector<CtcStreamGraphCache*> caches(n_streams, nullptr);
+  if (use_cuda_graphs) {
+    std::lock_guard<std::mutex> lock(g_ctc_graph_mutex);
+    for (int i = 0; i < n_streams; ++i) {
+      void* sptr = reinterpret_cast<void*>(state_ptr_array[i]);
+      auto& entry = g_ctc_graph_cache[sptr];
+      if (entry.captured &&
+          (entry.batch != static_cast<int>(batch) ||
+           entry.beam != static_cast<int>(beam) ||
+           entry.vocab_size != static_cast<int>(vocab_size) ||
+           entry.max_seq_len != static_cast<int>(max_seq_len) ||
+           entry.use_paged_memory != static_cast<int>(use_paged_memory) ||
+           entry.page_size != static_cast<int>(page_size) ||
+           entry.blank_id != static_cast<int>(blank_id))) {
+        destroy_graph_cache_entry(&entry);
+      }
+      if (!entry.captured) {
+        entry.batch = static_cast<int>(batch);
+        entry.beam = static_cast<int>(beam);
+        entry.vocab_size = static_cast<int>(vocab_size);
+        entry.max_seq_len = static_cast<int>(max_seq_len);
+        entry.use_paged_memory = static_cast<int>(use_paged_memory);
+        entry.page_size = static_cast<int>(page_size);
+        entry.blank_id = static_cast<int>(blank_id);
+        cudaError_t cerr = ensure_graphs_captured(&entry, sptr);
+        if (cerr != cudaSuccess) {
+          destroy_graph_cache_entry(&entry);
+          g_ctc_graph_cache.erase(sptr);
+          caches[i] = nullptr;
+          continue;
+        }
+      }
+      caches[i] = &entry;
+    }
+  }
+
+  // ----- Per-stream chunk loop -----
+  // Inner per-frame logic mirrors ``ctc_beam_search_chunk`` exactly; the
+  // outer loop replaces the Python per-stream loop in the engine.  All
+  // launches use the same CUDA stream so per-stream graphs serialise on
+  // the GPU side, identical to the pre-change behaviour.
+  for (int i = 0; i < n_streams; ++i) {
+    void* sptr = reinterpret_cast<void*>(state_ptr_array[i]);
+    const float* lp_base = lp_data_all + static_cast<size_t>(i) * batch_stride;
+    const uint8_t* mask_data = mask_data_all
+        ? mask_data_all + static_cast<size_t>(i) * mask_stride0
+        : nullptr;
+
+    int step = steps_host[i];
+    int frame_idx = frame_idxs_host[i];
+    CtcStreamGraphCache* cache = caches[i];
+
+    if (cache != nullptr) {
+      const size_t lp_row_bytes = sizeof(float) * static_cast<size_t>(vocab_size);
+      for (int t = 0; t < chunk_t; ++t) {
+        if (step >= max_seq_len) break;
+        if (mask_data && !mask_data[t]) {
+          ++frame_idx;
+          continue;
+        }
+        cache->pinned_counters_host[0] = step;
+        cache->pinned_counters_host[1] = frame_idx;
+        const float* lp_frame = lp_base + static_cast<size_t>(t) * seq_stride;
+        cudaError_t cerr = cudaMemcpy2DAsync(
+            cache->d_lp_frame_buf, lp_row_bytes,
+            lp_frame, static_cast<size_t>(batch_stride) * sizeof(float),
+            lp_row_bytes, static_cast<size_t>(batch),
+            cudaMemcpyDeviceToDevice, stream);
+        TVM_FFI_ICHECK(cerr == cudaSuccess)
+            << "CTC chunk D2D copy failed: " << cudaGetErrorString(cerr);
+        cudaGraphExec_t g;
+        if (step == 0) {
+          g = cache->graph_first;
+        } else if (step & 1) {
+          g = cache->graph_odd;
+        } else {
+          g = cache->graph_even;
+        }
+        cudaError_t lerr = cudaGraphLaunch(g, stream);
+        TVM_FFI_ICHECK(lerr == cudaSuccess)
+            << "CTC chunk graph launch failed: " << cudaGetErrorString(lerr);
+        ++step;
+        ++frame_idx;
+      }
+    } else {
+      // Eager fallback — same as ``ctc_beam_search_chunk``.
+      for (int t = 0; t < chunk_t; ++t) {
+        if (step >= max_seq_len) break;
+        if (mask_data && !mask_data[t]) {
+          ++frame_idx;
+          continue;
+        }
+        ctc_decoder::set_stream_counters(sptr, step, frame_idx, stream);
+        const float* lp_frame = lp_base + static_cast<size_t>(t) * seq_stride;
+        cudaError_t status = ctc_decoder::streaming_step_persistent(
+            sptr, lp_frame,
+            batch_stride, vocab_stride,
+            static_cast<int>(blank_id), -1,
+            static_cast<int>(batch), static_cast<int>(beam),
+            static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
+            static_cast<int>(use_paged_memory), static_cast<int>(page_size),
+            0,  // num_pages=0 → auto
+            step,
+            stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "CTC chunk step failed: " << cudaGetErrorString(status);
+        ++step;
+        ++frame_idx;
+      }
+    }
+
+    steps_host[i] = step;
+    frame_idxs_host[i] = frame_idx;
+  }
 }
 
 // =============================================================================

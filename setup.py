@@ -249,11 +249,11 @@ extras_require = {
         "librosa>=0.10.0",
     ],
     "serving": [
-        "msgpack>=1.0.0",
-        "pyzmq>=25.0.0",
-        "fastapi>=0.100.0",
-        "uvicorn>=0.23.0",
-        "pydantic>=2.0.0",
+        # Client libs used by benchmarks/bench_service.py + scripts/ws_stream.py.
+        # The server itself is the Rust ``oasr-server`` binary (in-process PyO3
+        # engine) — no msgpack / pyzmq runtime dependency.
+        "httpx>=0.27.0",
+        "websockets>=12.0",
     ],
     "dev": [
         "pytest>=7.0.0",
@@ -265,11 +265,8 @@ extras_require = {
     "all": [
         "soundfile>=0.12.0",
         "librosa>=0.10.0",
-        "msgpack>=1.0.0",
-        "pyzmq>=25.0.0",
-        "fastapi>=0.100.0",
-        "uvicorn>=0.23.0",
-        "pydantic>=2.0.0",
+        "httpx>=0.27.0",
+        "websockets>=12.0",
     ],
 }
 
@@ -316,13 +313,6 @@ setup(
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
         "Topic :: Multimedia :: Sound/Audio :: Speech",
     ],
-    
-    # Entry points
-    entry_points={
-        "console_scripts": [
-            "oasr-server=oasr.serving.server:main",
-        ],
-    },
     
     # Include package data
     include_package_data=True,

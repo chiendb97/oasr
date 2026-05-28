@@ -53,8 +53,25 @@ python benchmarks/bench_engine.py \\
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+
+def _envint(name: str, default):
+    """Read an int from ``$name`` if set, else return ``default``.
+
+    Lets ``.env`` (``MAX_BATCH_SIZE``, ``NUM_UTTERANCES``, ...) set the
+    default for an argparse int flag — the CLI flag still wins because
+    argparse only consults the default when the flag is absent.
+    """
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        raise SystemExit(f"env var {name}={v!r} is not an int")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -108,11 +125,12 @@ def _build_parser() -> argparse.ArgumentParser:
     batch_group.add_argument(
         "--max-batch-size",
         type=int,
-        default=None,
+        default=_envint("MAX_BATCH_SIZE", None),
         metavar="N",
         help="Encoder forward batch size — streaming concurrent pool cap "
              "and offline pipeline micro-batch width. "
-             "Default: 32 for streaming, 4 for offline.",
+             "Reads $MAX_BATCH_SIZE if set; otherwise sweeps "
+             "32 (streaming) / 4 (offline).",
     )
 
     # --- Streaming / chunking ---
@@ -138,9 +156,10 @@ def _build_parser() -> argparse.ArgumentParser:
     data_group.add_argument(
         "--num-utterances",
         type=int,
-        default=10,
+        default=_envint("NUM_UTTERANCES", 10),
         metavar="N",
-        help="Number of .wav files per benchmark run (default: 10)",
+        help="Number of .wav files per benchmark run "
+             "(reads $NUM_UTTERANCES if set; otherwise default: 10)",
     )
 
     # --- Precision ---

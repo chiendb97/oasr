@@ -552,6 +552,118 @@ class GpuStreamingDecoder:
         s.actual_frame_idx += chunk_t
         nvtx_pop()
 
+    def decode_chunk_batch(
+        self,
+        log_probs: torch.Tensor,
+        states: List[StreamState],
+        is_speech_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Process one chunk of log-probabilities for **many streams at once**.
+
+        Replaces the per-stream Python loop in the engine — instead of N
+        ``decode_chunk`` calls (each crossing the Python→C++ boundary), the
+        whole ready set is handed to a single C++ launcher that iterates
+        streams + frames internally.
+
+        Parameters
+        ----------
+        log_probs : torch.Tensor
+            Log-probability tensor ``[N, chunk_T, vocab_size]`` on CUDA,
+            float32.  ``N`` must equal ``len(states)``.
+        states : list of StreamState
+            One :class:`StreamState` per row of ``log_probs``, in the same
+            order.  Each state's ``step`` and ``actual_frame_idx`` are
+            updated in place after the call.
+        is_speech_mask : torch.Tensor, optional
+            CPU uint8 tensor ``[N, chunk_T]``; rows of 0 mark blank frames
+            that should be skipped without launching a step.  Pass ``None``
+            to decode every frame.
+        """
+        nvtx_push("ctc.decode_chunk_batch")
+        n = len(states)
+        if n == 0:
+            nvtx_pop()
+            return
+        if log_probs.size(0) != n:
+            raise ValueError(
+                f"log_probs.shape[0] ({log_probs.size(0)}) must equal "
+                f"len(states) ({n})")
+
+        chunk_t = log_probs.size(1)
+        if chunk_t == 0:
+            nvtx_pop()
+            return
+
+        log_probs = log_probs.contiguous().float()
+
+        cfg = self._config
+        # Validate the homogeneous-config assumption: every state was created
+        # by this same decoder, so its (batch, vocab_size) is fixed.
+        batch = states[0].batch
+        vocab_size = states[0].vocab_size
+        for s in states[1:]:
+            if s.batch != batch or s.vocab_size != vocab_size:
+                raise ValueError(
+                    "decode_chunk_batch: all states must share (batch, "
+                    "vocab_size); got mixed values")
+
+        state_ptrs = torch.tensor(
+            [s.buffer.data_ptr() for s in states],
+            dtype=torch.int64, device="cpu")
+        start_steps = torch.tensor(
+            [s.step for s in states], dtype=torch.int32, device="cpu")
+        start_frame_idxs = torch.tensor(
+            [s.actual_frame_idx for s in states],
+            dtype=torch.int32, device="cpu")
+
+        if is_speech_mask is None:
+            # Mirror the single-state path: when blank_threshold is set,
+            # auto-compute a per-(stream, frame) mask so blank-dominant
+            # frames skip without launching a kernel.  ``min(dim=batch)``
+            # in the single-state path becomes a no-op for batch=1, so
+            # the streaming batched form just gates on the per-row blank
+            # log-prob directly.
+            blank_log_thresh = self._blank_log_thresh
+            if blank_log_thresh is not None:
+                mask_tensor = (
+                    log_probs[:, :, cfg.blank_id]
+                    .lt(blank_log_thresh)
+                    .to(torch.uint8)
+                    .cpu()
+                    .contiguous()
+                )  # (N, T)
+            else:
+                mask_tensor = torch.empty(0, dtype=torch.uint8, device="cpu")
+        else:
+            mask_tensor = is_speech_mask.to(
+                dtype=torch.uint8, device="cpu", copy=False).contiguous()
+            if mask_tensor.dim() != 2 or mask_tensor.size(0) != n or \
+                    mask_tensor.size(1) != chunk_t:
+                raise ValueError(
+                    f"is_speech_mask must be (N={n}, chunk_T={chunk_t}); "
+                    f"got {tuple(mask_tensor.shape)}")
+
+        self._mod.ctc_beam_search_chunk_batched(
+            state_ptrs, log_probs, mask_tensor,
+            start_steps, start_frame_idxs,
+            cfg.beam_size, cfg.blank_id, cfg.blank_threshold,
+            batch, vocab_size, cfg.max_seq_len,
+            1 if cfg.use_paged_memory else 0, cfg.page_size,
+            1 if self._use_cuda_graphs else 0,
+        )
+
+        # Mirror the per-frame counter advance the single-state path does:
+        # the C++ launcher decoded ``min(active_frames, max_seq_len - step)``
+        # non-blank frames; ``actual_frame_idx`` advances by the full chunk
+        # length when the step cap isn't hit (the common case during normal
+        # streaming).  Writing it as ``+= chunk_t`` matches the existing
+        # ``decode_chunk`` implementation above.
+        new_steps = start_steps.tolist()
+        for i, s in enumerate(states):
+            s.step = int(new_steps[i])
+            s.actual_frame_idx += chunk_t
+        nvtx_pop()
+
     def finalize_stream(
         self, state: Optional[StreamState] = None,
     ) -> GpuDecoderResult:

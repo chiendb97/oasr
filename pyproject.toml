@@ -57,16 +57,11 @@ audio = [
     "kaldifeat>=1.22; python_version>='3.8'",
 ]
 serving = [
-    "msgpack>=1.0.0",
-    "pyzmq>=25.0.0",
     # Client libs used by benchmarks/bench_service.py + scripts/ws_stream.py.
+    # The server itself is the Rust ``oasr-server`` binary (in-process PyO3
+    # engine — no msgpack / no pyzmq runtime dependency).
     "httpx>=0.27.0",
     "websockets>=12.0",
-    # Legacy FastAPI/uvicorn deps retained for users who want a pure-Python
-    # serving stack; the canonical entry point is the Rust frontend under rust/.
-    "fastapi>=0.100.0",
-    "uvicorn>=0.23.0",
-    "pydantic>=2.0.0",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -83,9 +78,6 @@ wfst = [
 all = [
     "oasr[audio,serving]",
 ]
-
-[project.scripts]
-oasr-server = "oasr.serving.server:main"
 
 [project.urls]
 Homepage = "https://github.com/your-org/oasr"

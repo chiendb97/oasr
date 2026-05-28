@@ -49,6 +49,23 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 
+def _envint(name: str, default):
+    """Read an int from ``$name`` if set, else return ``default``.
+
+    Lets ``.env`` (``MAX_BATCH_SIZE``, ``NUM_UTTERANCES``, ``CONCURRENCY``,
+    ``CHUNK_MS``) set the default for an argparse int flag — the CLI flag
+    still wins because argparse only consults the default when the flag is
+    absent.
+    """
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        raise SystemExit(f"env var {name}={v!r} is not an int")
+
+
 # ---------------------------------------------------------------------------
 # Audio loading
 # ---------------------------------------------------------------------------
@@ -301,18 +318,44 @@ class RunStats:
 # ---------------------------------------------------------------------------
 
 
-async def _bench_offline(http_url: str, samples: List[Sample], concurrency: int) -> RunStats:
+def _to_wire_bytes(samples: np.ndarray, wire_encoding: str) -> bytes:
+    """Encode an f32 mono sample buffer to the chosen wire format.
+
+    ``f32_le`` is a passthrough cast.  ``i16_le`` clips to [-1, 1] then
+    scales by 32767 — matches `oasr-asr::decode_raw_pcm`'s widening (i16
+    samples are divided by 32768 on the server side; we scale by 32767
+    so a sample of 1.0 lands one count short of saturation).
+    """
+    if wire_encoding == "f32_le":
+        return samples.astype("<f4", copy=False).tobytes()
+    if wire_encoding == "i16_le":
+        clipped = np.clip(samples, -1.0, 1.0)
+        return (clipped * 32767.0).astype("<i2").tobytes()
+    raise ValueError(f"unsupported wire encoding: {wire_encoding!r}")
+
+
+async def _bench_offline(
+    http_url: str,
+    samples: List[Sample],
+    concurrency: int,
+    wire_encoding: str,
+) -> RunStats:
     import httpx
 
-    stats = RunStats(name="offline (POST /v1/transcriptions, raw f32 PCM)")
+    stats = RunStats(
+        name=f"offline (POST /v1/transcriptions, raw {wire_encoding} PCM)"
+    )
     sem = asyncio.Semaphore(concurrency)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
 
         async def one(sample: Sample) -> None:
             async with sem:
-                body = sample.samples.astype("<f4").tobytes()
-                url = f"{http_url}/v1/transcriptions?sample_rate={sample.sample_rate}&encoding=f32_le"
+                body = _to_wire_bytes(sample.samples, wire_encoding)
+                url = (
+                    f"{http_url}/v1/transcriptions"
+                    f"?sample_rate={sample.sample_rate}&encoding={wire_encoding}"
+                )
                 start = time.perf_counter()
                 try:
                     resp = await client.post(
@@ -395,13 +438,18 @@ async def _bench_streaming(
     samples: List[Sample],
     concurrency: int,
     chunk_ms: int,
+    wire_encoding: str,
 ) -> RunStats:
     import websockets
 
     ws_url = http_url.replace("http://", "ws://").replace("https://", "wss://")
     ws_url = f"{ws_url}/v1/stream"
 
-    stats = RunStats(name=f"streaming (WS /v1/stream, chunk={chunk_ms}ms)")
+    ws_format = {"f32_le": "pcm_f32le", "i16_le": "pcm_i16le"}[wire_encoding]
+
+    stats = RunStats(
+        name=f"streaming (WS /v1/stream, chunk={chunk_ms}ms, {wire_encoding})"
+    )
     sem = asyncio.Semaphore(concurrency)
 
     async def one(sample: Sample) -> None:
@@ -421,7 +469,7 @@ async def _bench_streaming(
                     await ws.send(json.dumps({
                         "type": "start",
                         "sample_rate": sample.sample_rate,
-                        "format": "pcm_f32le",
+                        "format": ws_format,
                     }))
 
                     async def producer():
@@ -434,7 +482,7 @@ async def _bench_streaming(
                                 chunk = sample.samples[i:i + chunk_samples]
                                 if chunk.size == 0:
                                     break
-                                await ws.send(chunk.astype("<f4").tobytes())
+                                await ws.send(_to_wire_bytes(chunk, wire_encoding))
                                 if per_chunk > 0:
                                     elapsed = time.perf_counter() - last
                                     if elapsed < per_chunk:
@@ -749,13 +797,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path(__file__).resolve().parents[1] / "rust" / "proto" / "oasr_asr.proto",
         help="Path to the gRPC schema (only used by grpc_* subroutines).",
     )
-    p.add_argument("--num-utterances", type=int, default=200)
-    p.add_argument("--concurrency", "-c", type=int, default=16,
-                   help="Concurrent in-flight requests per subroutine (default 16)")
+    p.add_argument("--num-utterances", type=int,
+                   default=_envint("NUM_UTTERANCES", 200),
+                   help="Number of .wav files per subroutine "
+                        "(reads $NUM_UTTERANCES if set; default 200)")
+    p.add_argument("--concurrency", "-c", type=int,
+                   default=_envint("CONCURRENCY", 16),
+                   help="Concurrent in-flight requests per subroutine "
+                        "(reads $CONCURRENCY if set; default 16)")
 
     # Streaming-specific
-    p.add_argument("--chunk-ms", type=int, default=640,
-                   help="WebSocket chunk size in milliseconds (default 640)")
+    p.add_argument("--chunk-ms", type=int,
+                   default=_envint("CHUNK_MS", 640),
+                   help="WebSocket chunk size in milliseconds "
+                        "(reads $CHUNK_MS if set; default 640)")
     p.add_argument(
         "--realtime",
         type=int, default=0, choices=(0, 1),
@@ -773,15 +828,26 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cuda-devices", default=None)
     p.add_argument("--worker-threads", type=int, default=1, choices=(1, 2))
     p.add_argument("--worker-script", default=None, type=Path,
-                   help="Override what the Rust server spawns (e.g. "
-                        "scripts/fake_engine_worker.py for stub testing).")
-    p.add_argument("--max-batch-size", type=int, default=None)
+                   help="Removed after the PyO3 in-process migration — accepted "
+                        "for back-compat; the script now rejects non-None values.")
+    p.add_argument("--max-batch-size", type=int,
+                   default=_envint("MAX_BATCH_SIZE", None),
+                   help="Engine encoder forward batch size "
+                        "(reads $MAX_BATCH_SIZE if set; default: engine config)")
     p.add_argument("--chunk-size", type=int, default=None,
                    help="Encoder chunk size (frames) for the engine (default: engine config)")
     p.add_argument("--dtype", default="float16",
                    choices=("float16", "bfloat16", "float32"))
     p.add_argument("--ready-timeout-s", type=int, default=180)
     p.add_argument("--server-log-level", default="warn")
+    p.add_argument(
+        "--wire-encoding",
+        default="i16_le",
+        choices=("f32_le", "i16_le"),
+        help="PCM wire format for offline + streaming uploads. "
+             "Default i16_le halves wire bytes vs f32_le; server-side widens "
+             "to f32 (see oasr-asr::decode_raw_pcm).",
+    )
 
     p.add_argument("--output-path", default=None, type=Path,
                    help="Optional JSON file path for the result summary")
@@ -824,12 +890,17 @@ def main() -> int:
             print(f"\n=== {sub} ===  (concurrency={args.concurrency}, "
                   f"n={len(samples)}, mode={args.service_mode})", flush=True)
             if sub == "offline":
-                s = asyncio.run(_bench_offline(http_url, samples, args.concurrency))
+                s = asyncio.run(
+                    _bench_offline(http_url, samples, args.concurrency, args.wire_encoding)
+                )
             elif sub == "whisper":
                 s = asyncio.run(_bench_whisper(http_url, samples, args.concurrency))
             elif sub == "streaming":
                 s = asyncio.run(
-                    _bench_streaming(http_url, samples, args.concurrency, args.chunk_ms)
+                    _bench_streaming(
+                        http_url, samples, args.concurrency, args.chunk_ms,
+                        args.wire_encoding,
+                    )
                 )
             elif sub == "grpc_offline":
                 s = asyncio.run(_bench_grpc_offline(

@@ -36,7 +36,7 @@ from oasr.cache.cnn_cache import CnnCacheManager
 from oasr.cache.ctc_state import CtcStateCacheManager
 from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.slot_cnn import SlotCnnCache
-from oasr.ctc_decode import GpuStreamingDecoder, StreamHandle
+from oasr.ctc_decode import GpuStreamingDecoder, StreamHandle, StreamState
 
 
 class StreamContext:
@@ -119,6 +119,20 @@ class StreamContext:
             Ready for ``decode_chunk()`` and ``finalize_stream()`` calls.
         """
         return self._ctc_state.get_decoder(self._stream_id)
+
+    def get_ctc_state(self) -> StreamState:
+        """Return the raw per-stream :class:`StreamState`.
+
+        Used by the engine's batched streaming-decode path
+        (:meth:`~oasr.ctc_decode.GpuStreamingDecoder.decode_chunk_batch`)
+        which feeds an array of states into a single C++ launcher.
+        """
+        return self._ctc_state.get_states([self._stream_id])[0]
+
+    @property
+    def ctc_state_manager(self) -> CtcStateCacheManager:
+        """Underlying :class:`CtcStateCacheManager` (shared across streams)."""
+        return self._ctc_state
 
     def get_att_caches(self) -> List[PagedKVCache]:
         """Return one :class:`~oasr.layers.attention.PagedKVCache` per layer.

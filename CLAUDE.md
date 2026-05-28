@@ -100,6 +100,54 @@ ncu --set full -o gemm_profile python benchmarks/oasr_benchmark.py \
 
 Legacy `bench_*.py` scripts still work as thin wrappers. See `benchmarks/README.md` for full CLI reference.
 
+### Engine vs. service benchmarks
+
+Two top-level perf harnesses pair up to measure the GPU ceiling (`bench_engine.py`)
+and the end-to-end serving cost (`bench_service.py`). Both pick up defaults
+from `.env` — copy `.env.example` to `.env`, edit, then
+`set -a; source .env; set +a` to export.
+
+| Env var | Becomes the default for |
+|---|---|
+| `CKPT_DIR`, `AUDIO_DIR` | `--ckpt-dir`, `--audio-dir` (expanded in shell, both scripts) |
+| `OASR_RS_BIN` | Path to `oasr-server` (`bench_service.py` reads it directly to spawn the server) |
+| `NUM_UTTERANCES` | `--num-utterances` (both scripts) |
+| `MAX_BATCH_SIZE` | `--max-batch-size` (both scripts) |
+| `CONCURRENCY` | `--concurrency` (`bench_service.py`) |
+| `CHUNK_MS` | `--chunk-ms` (`bench_service.py`) |
+
+CLI flag still wins when both are given. Templates — substitute the bracketed
+placeholders, or drop the flag to pick up the matching `.env` default:
+
+```bash
+# Engine — pure GPU + Python, no IPC/HTTP
+python benchmarks/bench_engine.py \
+    --ckpt-dir [CKPT_DIR] \
+    --audio-dir [AUDIO_DIR] \
+    --subroutines [offline|streaming|offline_wfst|streaming_wfst] \
+    --max-batch-size [MAX_BATCH_SIZE] \
+    --num-utterances [NUM_UTTERANCES] \
+    --chunk-size [CHUNK_SIZE] \
+    --cuda-graphs [on|off]
+
+# Service — Rust + HTTP + PyO3 dispatcher (auto-spawns oasr-server)
+python benchmarks/bench_service.py \
+    --ckpt-dir [CKPT_DIR] \
+    --audio-dir [AUDIO_DIR] \
+    --subroutines [offline|streaming|grpc_offline|grpc_streaming|whisper] \
+    --num-utterances [NUM_UTTERANCES] \
+    --concurrency [CONCURRENCY] \
+    --max-batch-size [MAX_BATCH_SIZE] \
+    --chunk-ms [CHUNK_MS] \
+    --wire-encoding [f32_le|i16_le] \
+    --realtime [0|1]
+```
+
+`--wire-encoding` (default `i16_le`) chooses the PCM format the bench client
+sends; `oasr-asr::decode_raw_pcm` widens i16 back to f32 server-side.
+`--service-mode` is auto-derived from `--subroutines`. Full recipe in
+`docs/benchmarks.md`.
+
 ## Architecture
 
 ### Layered design
@@ -203,6 +251,7 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
 | File | Covers |
 |------|--------|
 | `docs/autotuning.md` | `oasr.tune` design, `oasr.autotune()` API, JSON cache format |
+| `docs/benchmarks.md` | Engine vs. service bench recipes, `.env` workflow, RTF / latency interpretation |
 | `docs/cache_manager.md` | `BlockPool` / `AttentionCacheManager` / `CnnCacheManager` / `StreamContext` semantics |
 | `docs/ctc_decoder_gpu.md` | `GpuStreamingDecoder` single- vs. multi-request flows, paged-memory options |
 | `docs/engine.md` | `ASREngine` step loop, batching, CUDA Graph capture |

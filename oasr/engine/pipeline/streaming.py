@@ -152,11 +152,8 @@ class StreamingPipeline(Pipeline):
             )
             nvtx_pop()
             nvtx_push("decode_streaming")
-            for req in ready:
-                lp = log_probs_map.get(req.request_id)
-                if lp is not None:
-                    partial = self._op.decode_streaming_chunk(req, lp)
-                    outputs.append(partial)
+            partials = self._op.decode_streaming_batch(ready, log_probs_map)
+            outputs.extend(partials)
             nvtx_pop()
 
         # 3. Finalise streams whose audio is exhausted and whose feature

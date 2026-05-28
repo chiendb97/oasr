@@ -23,7 +23,7 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Python environments
-.env
+.env*
 .venv
 env/
 venv/
