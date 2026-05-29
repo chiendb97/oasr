@@ -5,6 +5,7 @@ requires = [
     "cmake>=3.18",
     "pybind11>=2.10",
     "ninja",
+    "setuptools-rust>=1.10",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -51,7 +52,7 @@ dependencies = [
 
 [project.optional-dependencies]
 audio = [
-    "torchaudio>=0.12.0",
+    "torchaudio>=0.11.0",
     "soundfile>=0.12.0",
     "librosa>=0.10.0",
     "kaldifeat>=1.22; python_version>='3.8'",
@@ -85,8 +86,23 @@ Documentation = "https://oasr.readthedocs.io"
 Repository = "https://github.com/your-org/oasr"
 Issues = "https://github.com/your-org/oasr/issues"
 
+[project.scripts]
+# Rust serving front-end.  `pip install` builds it into `oasr._core` (below);
+# this wrapper forwards argv to it so `oasr-server` works like the old binary.
+oasr-server = "oasr._server_cli:main"
+
 [tool.setuptools.packages.find]
 include = ["oasr*"]
+
+# Build the Rust serving core as the `oasr._core` PyO3 extension module during
+# `pip install`, mirroring sglang's setuptools-rust integration.  The crate is
+# a cdylib that links libpython at import time (pyo3 `extension-module`); see
+# rust/crates/oasr-core.  Requires a Rust toolchain + protobuf-compiler at
+# build time (tonic build.rs in oasr-server-grpc).
+[[tool.setuptools-rust.ext-modules]]
+target = "oasr._core"
+path = "rust/crates/oasr-core/Cargo.toml"
+binding = "PyO3"
 
 [tool.black]
 line-length = 100

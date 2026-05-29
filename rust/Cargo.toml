@@ -6,6 +6,23 @@ members = [
     "crates/oasr-asr",
     "crates/oasr-server-http",
     "crates/oasr-server-grpc",
+    "crates/oasr-serve",
+    "crates/oasr-server",
+    "crates/oasr-core",
+]
+# `oasr-core` (the `oasr._core` PyO3 extension module) enables
+# `pyo3/extension-module`, while `oasr-server` (the standalone binary) enables
+# `pyo3/auto-initialize`.  Those two pyo3 features are mutually exclusive, and
+# Cargo unifies features across a single build, so `oasr-core` is excluded from
+# the default set: a plain `cargo build` produces the binary, while the
+# extension module is built on its own by setuptools-rust (see pyproject.toml).
+default-members = [
+    "crates/oasr-wire",
+    "crates/oasr-engine-client",
+    "crates/oasr-asr",
+    "crates/oasr-server-http",
+    "crates/oasr-server-grpc",
+    "crates/oasr-serve",
     "crates/oasr-server",
 ]
 
@@ -33,11 +50,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
 
-# Python embedding — drives the in-process ASREngine dispatcher.  Picks up
-# `libpython` automatically via `auto-initialize`; the `oasr-server` binary
-# is linked at build time against the active interpreter (matched at runtime
-# via PYTHONHOME / the active venv).
-pyo3 = { version = "0.22", features = ["auto-initialize"] }
+# Python embedding — drives the in-process ASREngine dispatcher.  The pyo3
+# linkage mode is chosen per consumer, not here: `oasr-server` (binary) turns
+# on `pyo3/auto-initialize` to embed + link libpython, while `oasr-core` (the
+# `oasr._core` extension module) turns on `pyo3/extension-module` so libpython
+# is resolved by the host interpreter at import time.  Those features are
+# mutually exclusive, so the workspace dep stays feature-less and the consumers
+# opt in via `oasr-engine-client`'s `auto-initialize` / `extension-module`
+# features.
+pyo3 = { version = "0.22", default-features = false }
 numpy = "0.22"
 
 # Concurrent containers / ids

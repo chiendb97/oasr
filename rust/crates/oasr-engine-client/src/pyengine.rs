@@ -368,11 +368,15 @@ impl PyEngine {
 /// fallback — the engine concatenates this with `audio_tail` and needs a
 /// writable buffer.
 fn audio_bytes_to_numpy<'py>(py: Python<'py>, audio: &[u8]) -> PyResult<Bound<'py, PyArray1<f32>>> {
-    let n = audio.len() / std::mem::size_of::<f32>();
-    let samples = unsafe {
-        std::slice::from_raw_parts(audio.as_ptr() as *const f32, n)
-    };
-    Ok(PyArray1::<f32>::from_slice_bound(py, samples))
+    // The byte slice carries no 4-byte alignment guarantee, so reinterpreting
+    // it as `*const f32` is UB (and aborts under the slice alignment check).
+    // Decode each f32 explicitly from little-endian bytes; ragged tail bytes
+    // (len not a multiple of 4) are dropped, mirroring `np.frombuffer`.
+    let samples: Vec<f32> = audio
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    Ok(PyArray1::<f32>::from_slice_bound(py, &samples))
 }
 
 fn collect_model_info(_py: Python<'_>, cfg: &Bound<'_, PyAny>) -> PyResult<ModelInfo> {

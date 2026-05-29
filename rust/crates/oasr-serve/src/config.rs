@@ -15,7 +15,11 @@ use clap::Parser;
 use serde_json::{Map, Value};
 
 #[derive(Debug, Parser)]
-#[command(name = "oasr-server", version, about = "OASR HTTP + gRPC frontend with in-process Python engine")]
+#[command(
+    name = "oasr-server",
+    version,
+    about = "OASR HTTP + gRPC frontend with in-process Python engine"
+)]
 pub struct Cli {
     // ---- Engine config (mirror EngineConfig essentials) ----
     /// Required: WeNet checkpoint directory.
@@ -135,10 +139,7 @@ impl Cli {
                 .or_insert(Value::String(s.clone()));
         }
         if let Some(sizes) = &self.preferred_batch_sizes {
-            let arr: Vec<Value> = sizes
-                .iter()
-                .map(|&v| Value::Number(v.into()))
-                .collect();
+            let arr: Vec<Value> = sizes.iter().map(|&v| Value::Number(v.into())).collect();
             obj.entry("preferred_batch_size")
                 .or_insert(Value::Array(arr));
         }

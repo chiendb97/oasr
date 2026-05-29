@@ -1,9 +1,15 @@
 # OASR Serving — Rust frontend
 
-The `rust/` Cargo workspace builds `oasr-server`, a Rust binary that exposes
-the OASR engine over both HTTP and gRPC.  The API surface is shaped after
-**Google Cloud Speech-to-Text v1** so existing tooling (REST conventions,
-`grpcurl`, OpenAPI-style clients) feels familiar.
+The `rust/` Cargo workspace builds the OASR serving core, which exposes the
+engine over both HTTP and gRPC.  The API surface is shaped after **Google Cloud
+Speech-to-Text v1** so existing tooling (REST conventions, `grpcurl`,
+OpenAPI-style clients) feels familiar.
+
+`pip install` compiles the core into the `oasr._core` PyO3 extension module (via
+setuptools-rust) and installs the `oasr-server` console script that runs it, so
+the front-end ships with the wheel — no separate build step.  The same code also
+builds as a standalone binary (`rust/crates/oasr-server`) for `cargo`-only
+workflows; both share the `oasr-serve` crate.
 
 The engine runs **in-process** via PyO3 — one Python `ASREngine` per
 `oasr-server` process.  Multi-GPU scale is achieved by launching N
@@ -13,23 +19,25 @@ multiplexing inside one process.
 ## Quick start
 
 ```bash
-# 1. Build the Rust binary
-cd rust && cargo build --release && cd ..
-
-# 2. Install the Python package (the binary links against the active interpreter)
+# Install the Python package — builds the _C decoder extension, the oasr._core
+# serving extension (Rust), and the `oasr-server` console script.  Needs a Rust
+# toolchain + protobuf-compiler on PATH at build time.
 pip install -e .
 
-# 3. Launch — one engine per process
-./rust/target/release/oasr-server \
+# Launch — one engine per process
+oasr-server \
     --ckpt-dir /path/to/wenet/ckpt \
     --service-mode offline \
     --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051
 ```
 
-`./rust/target/release/oasr-server --help` lists every flag.  `--service-mode`
-pins the engine to either `offline` (sync `Recognize`) or `streaming` (bidi
-`StreamingRecognize`) for its entire lifecycle; the mismatched RPC returns
-`FAILED_PRECONDITION`.
+`oasr-server --help` lists every flag.  `--service-mode` pins the engine to
+either `offline` (sync `Recognize`) or `streaming` (bidi `StreamingRecognize`)
+for its entire lifecycle; the mismatched RPC returns `FAILED_PRECONDITION`.
+
+> Building the workspace with `cargo build --release` instead produces the same
+> server as the `rust/target/release/oasr-server` binary; substitute that path
+> for `oasr-server` in the commands below if you go that route.
 
 ## API surface
 
@@ -194,11 +202,11 @@ gRPC status mapping mirrors HTTP: `RESOURCE_EXHAUSTED`, `NOT_FOUND`,
 
 ```bash
 # GPU 0
-CUDA_VISIBLE_DEVICES=0 ./rust/target/release/oasr-server \
+CUDA_VISIBLE_DEVICES=0 oasr-server \
     --ckpt-dir /path/to/ckpt --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051 &
 
 # GPU 1
-CUDA_VISIBLE_DEVICES=1 ./rust/target/release/oasr-server \
+CUDA_VISIBLE_DEVICES=1 oasr-server \
     --ckpt-dir /path/to/ckpt --http-bind 127.0.0.1:8081 --grpc-bind 127.0.0.1:50052 &
 ```
 
@@ -208,7 +216,9 @@ not required since one process serves a request end-to-end.
 ## Benchmarking
 
 `benchmarks/bench_service.py` is a load generator for `oasr-server`.  It
-auto-spawns the binary unless `--server-url` is given.
+auto-spawns the server unless `--server-url` is given, resolving it via
+`$OASR_RS_BIN`, then the `oasr-server` console script on `PATH`, then
+`rust/target/release/oasr-server`.
 
 ```bash
 # Offline (HTTP + gRPC unary) — must launch the server in offline mode

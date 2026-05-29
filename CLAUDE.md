@@ -18,11 +18,11 @@ CUDA_ARCHITECTURES=80 pip install -e .
 # Install with serving extras (HTTP/WebSocket client libs for benchmarks)
 pip install -e .[serving]
 
-# Build the Rust serving frontend (binary used by the `oasr-server` console script)
+# Optional: build the Rust serving frontend as a standalone binary
 cd rust && cargo build --release
 ```
 
-The build compiles the `_C.so` pybind11 extension (for decoder + enums) via CMake. CUDA kernels are JIT-compiled on first use via TVM-FFI and cached in `~/.cache/oasr/jit/`. The Rust workspace under `rust/` is built separately with `cargo` — the `oasr-server` Python console script execs the resulting binary (resolved via `$OASR_RS_BIN`, `$PATH`, or `rust/target/release/oasr-server`).
+The build compiles three artifacts into the package: the `_C.so` pybind11 extension (decoder + enums) via CMake, and — via setuptools-rust (`[[tool.setuptools-rust.ext-modules]]` in `pyproject.toml`) — the `oasr._core` PyO3 extension module (the Rust serving core) plus the `oasr-server` console script that loads it. CUDA kernels are JIT-compiled on first use via TVM-FFI and cached in `~/.cache/oasr/jit/`. A Rust toolchain + `protobuf-compiler` must be on `PATH` at build time; with `--no-build-isolation`, `pip install "setuptools-rust>=1.10"` first. `setuptools-rust` runs cargo from the repo root, so the root `.cargo/config.toml` mirrors `rust/.cargo/config.toml`'s target-dir redirect (the repo's NFS mount breaks rustc autocfg probes). The same workspace still builds a standalone `rust/target/release/oasr-server` binary via plain `cargo build`.
 
 ## Testing
 
@@ -63,6 +63,27 @@ clang-format -i csrc/**/*.cu csrc/**/*.h csrc/**/*.cpp
 ```
 
 Style: Python uses 100-char line length (black + isort/black profile). C++ uses Google style with 100-char limit and C++17.
+
+### Rust workspace (`rust/`)
+
+```bash
+cd rust
+cargo build --release      # builds default-members (incl. the oasr-server binary)
+cargo test                 # tests default-members
+cargo test -p oasr-asr     # tests a single crate
+cargo fmt                  # rustfmt (run before committing Rust changes)
+cargo clippy
+```
+
+**Do not run `cargo build/test --workspace`.** `oasr-core` (the `oasr._core`
+extension module) enables `pyo3/extension-module` while `oasr-server` (binary)
+enables `pyo3/auto-initialize` — those features are mutually exclusive and Cargo
+unifies them per build, so building both crates in one invocation fails to
+compile. `oasr-core` is therefore excluded from `default-members`; plain `cargo`
+commands build the binary, and setuptools-rust builds `oasr-core` on its own
+(`pip install` / `python setup.py build_rust --inplace`). Run cargo from `rust/`
+(not the repo root) so `rust/.cargo/config.toml`'s target-dir redirect applies
+— the repo's NFS mount otherwise breaks rustc autocfg probes.
 
 ## Benchmarks & Profiling
 
@@ -261,22 +282,26 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
 - **`layers/`** — Thin `nn.Module`-style wrappers around functional API: `conv.py`, `linear.py`, `norm.py`, `attention/`, `rotary_embedding/`.
 - **`models/conformer/`** — Conformer model (`model.py`), config dataclass (`config.py`), weight conversion utility (`convert.py`).
 - **`utils/`** — `validation.py` (`@supported_compute_capability`, `@backend_requirement` decorators), `mappings.py` (dtype/enum helpers), `timer.py`.
-- **`serving/` (removed)** — The Python ZMQ worker (`engine_worker.py` / `ipc.py` / `server.py`) is gone. `oasr-server` now embeds the engine in-process via PyO3 (see the Rust serving section below). The `oasr` Python package is a runtime dependency of the Rust binary — it must be importable at the active Python interpreter the binary linked against.
+- **`serving/` (removed)** — The Python ZMQ worker (`engine_worker.py` / `ipc.py` / `server.py`) is gone. The serving front-end now embeds the engine in-process via PyO3 (see the Rust serving section below). The `oasr` Python package is a runtime dependency of the front-end — it must be importable at the active Python interpreter. The thin `oasr/_server_cli.py` (the `oasr-server` console-script entry point) just forwards `sys.argv` into `oasr._core.serve`.
 
 ### Rust serving frontend (`rust/`)
 
-Cargo workspace that builds `oasr-server`, the binary the Python `oasr-server` console script execs. The binary hosts **one in-process Python `ASREngine` per process** via PyO3 (linked against `libpython` through `auto-initialize`) and serves it over HTTP + gRPC. Multi-GPU = launch N `oasr-server` processes behind a process manager, each with `CUDA_VISIBLE_DEVICES` set.
+Cargo workspace that builds the OASR serving core. It ships **two ways** from one shared code path: as `oasr._core`, a PyO3 extension module built by setuptools-rust during `pip install` and run via the `oasr-server` console script (`oasr._server_cli:main`); and as a standalone `oasr-server` binary via `cargo build`. Either hosts **one in-process Python `ASREngine` per process** via PyO3 and serves it over HTTP + gRPC. Multi-GPU = launch N processes behind a process manager, each with `CUDA_VISIBLE_DEVICES` set.
+
+The PyO3 linkage mode is the key split: the binary embeds + links libpython (`pyo3/auto-initialize`), while the extension module is loaded by the host interpreter (`pyo3/extension-module`). These features are mutually exclusive and Cargo unifies features per build, so the shared serving logic lives in `oasr-serve` (mode-agnostic) and the two front-end crates select the mode via `oasr-engine-client`'s `auto-initialize` / `extension-module` features. `oasr-core` is excluded from `default-members` so a plain `cargo build` produces the binary; setuptools-rust builds `oasr-core` on its own.
 
 | Crate | Role |
 |---|---|
 | `oasr-wire` | Shared event/command types (`Cmd`, `Event`, `ErrorCode`, `ModelInfo`). Pure Rust — no codec / no IPC. |
-| `oasr-engine-client` | PyO3-backed driver: `PyEngine` wrapper, `EngineDispatcher` thread that owns the GIL and drives `engine.step()`, `EngineClient`/`EnginePool` async facades. |
+| `oasr-engine-client` | PyO3-backed driver: `PyEngine` wrapper, `EngineDispatcher` thread that owns the GIL and drives `engine.step()`, `EngineClient`/`EnginePool` async facades. Exposes `auto-initialize` / `extension-module` features forwarding to pyo3. |
 | `oasr-asr` | Audio decode (WAV via `hound`, raw PCM) to f32 mono `bytes::Bytes` |
 | `oasr-server-http` | axum routes (Google STT v1-shaped REST): `POST /v1/speech:recognize`, `/healthz`, `/readyz`, `/metrics`, `/v1/models` |
 | `oasr-server-grpc` | tonic `oasr.speech.v1.Speech` service (`Recognize` unary + `StreamingRecognize` bidi) plus the standard `grpc.health.v1.Health` service. Proto in `rust/proto/oasr_speech_v1.proto` |
-| `oasr-server` | Binary: CLI, Python interpreter init, engine + HTTP + gRPC wiring. **One process per GPU**; spawn multiple `oasr-server` processes for multi-GPU. |
+| `oasr-serve` | Mode-agnostic serving core: `Cli` + `run(cli)` (builds the engine, tokio runtime, HTTP + gRPC listeners). Shared by the binary and the extension module. |
+| `oasr-server` | Standalone binary: thin `main.rs` → `oasr_serve::run`; pulls `oasr-engine-client` with `auto-initialize`. **One process per GPU.** |
+| `oasr-core` | cdylib `oasr._core` PyO3 module: `#[pymodule]` exposing `serve(argv)` → `oasr_serve::run` under `allow_threads`; pulls `oasr-engine-client` with `extension-module`. Built by setuptools-rust. |
 
-Routing policy: single in-process engine per `oasr-server` process — no sticky map needed at the pool level (the pool exists for symmetry with a future multi-engine-per-process layout). `/readyz` returns 200 once the dispatcher has taken its first tick. Build deps: a Python development install (PyO3 links against `libpython` via `auto-initialize`), `protobuf-compiler`, a C/C++ toolchain.
+Routing policy: single in-process engine per process — no sticky map needed at the pool level (the pool exists for symmetry with a future multi-engine-per-process layout). `/readyz` returns 200 once the dispatcher has taken its first tick. Build deps: a Python development install (PyO3 links libpython), `protobuf-compiler`, a C/C++ toolchain.
 
 **Dispatcher (`oasr-engine-client::dispatcher`)** is the GIL-owning thread that drains commands from the tokio mpsc channel, replays them into Python (`add_request`/`feed_chunk`/`cancel`), runs `engine.step()`, and pushes the resulting events back via per-request channels. Key knobs (CLI flags on `oasr-server`):
 
@@ -337,5 +362,5 @@ Two skill files provide step-by-step workflows for common tasks:
 | `CUDA_ARCHITECTURES` | Override SM targets for build (e.g., `80` or `80;86`) |
 | `OASR_CUDA_ARCH_LIST` | Manual override for JIT CUDA architecture detection |
 | `OASR_ATTN_BACKEND` | `sdpa` (force SDPA), `cute` (require CuteDSL FMHA, raise on unsupported arch or import failure), `auto` (default — use cute on sm_80 / sm_86 / sm_89 / sm_120 when CuteDSL imports, else warn + fall back to SDPA) |
-| `OASR_RS_BIN` | Absolute path to the Rust `oasr-server` binary; overrides `$PATH` / `rust/target/release/` lookup used by the `oasr-server` console script |
+| `OASR_RS_BIN` | Absolute path to an `oasr-server` executable; overrides the `oasr-server`-on-`$PATH` / `rust/target/release/` lookup used by `bench_service.py` |
 | `OASR_USE_K2` | Set to `1` to build the WFST decoder (requires `pip install k2` and a k2 source tree at `K2_SOURCE_DIR` — default `/opt/k2-src`) |

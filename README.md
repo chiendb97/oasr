@@ -18,7 +18,7 @@ OASR delivers fast, scalable ASR inference on NVIDIA GPUs. It pairs custom CUDA 
 
 - **High throughput** — paged KV cache, dynamic length-bucketed batching, and CUDA Graph capture of the streaming encoder.
 - **Streaming and offline** — one engine handles both, with mixed pools in a single step loop.
-- **Production serving** — Rust `oasr-server` binary exposing an HTTP API and a gRPC bidi streaming RPC.
+- **Production serving** — Rust `oasr-server` front-end (built into the wheel via PyO3) exposing an HTTP API and a gRPC bidi streaming RPC.
 - **Multiple decoders** — CTC greedy, CTC prefix beam (CPU & GPU), and WFST beam search.
 - **Broad GPU support** — Volta through Blackwell (SM70–SM120), with FP16 / BF16 / FP32 paths.
 - **Drop-in Python API** — functional and `nn.Module` wrappers for normalization, convolution, GEMM, attention, and feature extraction.
@@ -43,6 +43,7 @@ OASR delivers fast, scalable ASR inference on NVIDIA GPUs. It pairs custom CUDA 
 - Python ≥ 3.8
 - CMake ≥ 3.18
 - NVIDIA GPU (SM70 or newer)
+- Rust toolchain + `protobuf-compiler` (to build the serving frontend during `pip install`)
 
 ### Install
 
@@ -54,6 +55,12 @@ pip install -e .
 CUDA_ARCHITECTURES="80;86;90" pip install -e .
 ```
 
+`pip install` builds three things into the package: the `_C` decoder extension
+(CMake/pybind11), the `oasr._core` serving extension (Rust, via setuptools-rust),
+and the `oasr-server` console script that runs it. A Rust toolchain and
+`protobuf-compiler` must be on `PATH` at build time; with `--no-build-isolation`
+also `pip install "setuptools-rust>=1.10"` first.
+
 Optional extras:
 
 ```bash
@@ -62,7 +69,8 @@ pip install -e ".[serving]"  # serving client libs (used by bench_service.py)
 pip install -e ".[wfst]"     # k2, kaldilm (WFST decoder)
 ```
 
-Build the Rust serving binary (linked against the active Python interpreter):
+The Rust workspace can also be built standalone (produces the same server as a
+plain binary at `rust/target/release/oasr-server`):
 
 ```bash
 cd rust && cargo build --release
@@ -118,20 +126,22 @@ The checkpoint directory should contain `final.pt`, `train.yaml`, `global_cmvn`,
 
 `oasr-server` runs one in-process `ASREngine` per process. `--service-mode` pins the engine to either `offline` (sync `Recognize`) or `streaming` (bidi `StreamingRecognize`) for its entire lifetime; the mismatched RPC returns `FAILED_PRECONDITION`. Scale horizontally by launching one process per GPU.
 
+`pip install` puts the `oasr-server` console script on `PATH` (it loads the
+`oasr._core` extension). Use it directly — or the standalone
+`rust/target/release/oasr-server` binary if you built the workspace with cargo.
+
 ```bash
-# Offline server on GPU 0
-./rust/target/release/oasr-server \
+# Offline server
+oasr-server \
     --ckpt-dir /path/to/checkpoint \
     --service-mode offline \
     --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051
 
-# Multi-GPU fleet — one process per device, fronted by your load balancer
-CUDA_VISIBLE_DEVICES=0 ./rust/target/release/oasr-server \
-    --ckpt-dir /path/to/checkpoint --service-mode offline \
-    --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051 &
-CUDA_VISIBLE_DEVICES=1 ./rust/target/release/oasr-server \
-    --ckpt-dir /path/to/checkpoint --service-mode offline \
-    --http-bind 127.0.0.1:8081 --grpc-bind 127.0.0.1:50052 &
+# Streaming server — bidi gRPC StreamingRecognize
+oasr-server \
+    --ckpt-dir /path/to/checkpoint \
+    --service-mode streaming \
+    --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051
 ```
 
 ### Endpoints
