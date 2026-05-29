@@ -1,0 +1,23 @@
+[package]
+name = "oasr-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PyO3 extension module (`oasr._core`) exposing the OASR serving core to Python; built by setuptools-rust during `pip install`."
+
+[lib]
+# Imported from Python as `oasr._core`; the cdylib is what setuptools-rust
+# renames + drops into the `oasr` package.
+name = "_core"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+oasr-serve = { path = "../oasr-serve" }
+# Direct dep solely to enable `extension-module`: libpython is provided by the
+# host interpreter at import time rather than linked in.  Additive with
+# `oasr-serve`'s transitive pyo3.
+oasr-engine-client = { path = "../oasr-engine-client", features = ["extension-module"] }
+
+pyo3 = { workspace = true, features = ["extension-module"] }
+clap = { workspace = true }

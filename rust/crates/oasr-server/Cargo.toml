@@ -3,40 +3,18 @@ name = "oasr-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "OASR serving frontend — HTTP + gRPC binary."
+description = "OASR serving frontend — HTTP + gRPC binary (embeds Python via pyo3/auto-initialize)."
 
 [[bin]]
 name = "oasr-server"
 path = "src/main.rs"
 
 [dependencies]
-oasr-wire = { path = "../oasr-wire" }
-oasr-engine-client = { path = "../oasr-engine-client" }
-oasr-asr = { path = "../oasr-asr" }
-oasr-server-http = { path = "../oasr-server-http" }
-oasr-server-grpc = { path = "../oasr-server-grpc" }
+oasr-serve = { path = "../oasr-serve" }
+# Direct dep solely to enable `auto-initialize`: this binary embeds + links
+# libpython.  The feature is additive, so it flips `oasr-serve`'s transitive
+# pyo3 to the embedding linkage for this build.
+oasr-engine-client = { path = "../oasr-engine-client", features = ["auto-initialize"] }
 
-tokio = { workspace = true }
-tokio-util = { workspace = true }
-futures = { workspace = true }
-clap = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-metrics = { workspace = true }
-metrics-exporter-prometheus = { workspace = true }
-axum = { workspace = true }
-tonic = { workspace = true }
-tonic-health = { workspace = true }
-hyper = { workspace = true }
-
-[dev-dependencies]
-bytes = { workspace = true }
-tokio-stream = { workspace = true }
-futures = { workspace = true }
-hound = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
-serde_json = { workspace = true }
+clap = { workspace = true }

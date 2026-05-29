@@ -12,10 +12,11 @@ the engine number is the ceiling, the service number is what real clients see.
 
 ## Setup
 
-1. Build the Python package and the Rust binary:
+1. Install the Python package — this also builds the Rust serving core into
+   `oasr._core` and installs the `oasr-server` console script (needs a Rust
+   toolchain + `protobuf-compiler` on `PATH`):
    ```bash
    pip install -e .[serving]
-   cd rust && cargo build --release && cd ..
    ```
 
 2. Copy `.env.example` to `.env`, edit the paths, then source it:
@@ -31,7 +32,7 @@ the engine number is the ceiling, the service number is what real clients see.
    |---|---|
    | `CKPT_DIR` | WeNet checkpoint directory (expanded into `--ckpt-dir`) |
    | `AUDIO_DIR` | Directory of mono 16 kHz `.wav` files (expanded into `--audio-dir`) |
-   | `OASR_RS_BIN` | Absolute path to the built `oasr-server` binary (`bench_service.py` reads it directly) |
+   | `OASR_RS_BIN` | Optional override for the `oasr-server` path (`bench_service.py` reads it directly); defaults to the `oasr-server` console script on `PATH`, then `rust/target/release/oasr-server` |
    | `NUM_UTTERANCES` | Default for `--num-utterances` (both scripts) |
    | `MAX_BATCH_SIZE` | Default for `--max-batch-size` (both scripts) |
    | `CONCURRENCY` | Default for `--concurrency` (`bench_service.py`) |
@@ -101,7 +102,8 @@ chunk-size config.
 
 ## Service benchmark
 
-`bench_service.py` auto-spawns `oasr-server` (resolved via `$OASR_RS_BIN`),
+`bench_service.py` auto-spawns `oasr-server` (resolved via `$OASR_RS_BIN`, then
+the `oasr-server` console script on `PATH`, then `rust/target/release/oasr-server`),
 waits for `/readyz`, drives it with the chosen subroutines, then shuts it
 down on exit. Use it to measure the gap closed (or not) by Rust + HTTP/WS.
 

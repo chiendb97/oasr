@@ -23,5 +23,13 @@ serde_json = { workspace = true }
 pyo3 = { workspace = true }
 numpy = { workspace = true }
 
+[features]
+# pyo3 linkage mode, selected by the top-level artifact that pulls this crate
+# in.  These are mutually exclusive (see the workspace pyo3 dep comment):
+#   * `oasr-server` (binary)      → `auto-initialize`  (embed + link libpython)
+#   * `oasr-core`  (ext. module)  → `extension-module` (host provides libpython)
+auto-initialize = ["pyo3/auto-initialize"]
+extension-module = ["pyo3/extension-module"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

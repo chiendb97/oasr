@@ -132,19 +132,26 @@ def _load_dataset(audio_dir: Path, n: int) -> List[Sample]:
 
 
 def _resolve_server_bin() -> Path:
+    import shutil
+
     env = os.environ.get("OASR_RS_BIN")
     if env:
         p = Path(env)
         if p.is_file():
             return p
-    # Default location for an editable repo.
+    # `pip install` ships the front-end as the `oasr-server` console script
+    # (oasr._server_cli:main → oasr._core), which lands on PATH.
+    on_path = shutil.which("oasr-server")
+    if on_path:
+        return Path(on_path)
+    # Default location for an editable repo built with `cargo build --release`.
     here = Path(__file__).resolve().parents[1]
     candidate = here / "rust" / "target" / "release" / "oasr-server"
     if candidate.is_file():
         return candidate
     raise SystemExit(
-        "oasr-server binary not found; build via `cd rust && cargo build --release` "
-        "or set OASR_RS_BIN=/path/to/oasr-server"
+        "oasr-server not found; install via `pip install -e .` (builds oasr._core), "
+        "build via `cd rust && cargo build --release`, or set OASR_RS_BIN=/path/to/oasr-server"
     )
 
 

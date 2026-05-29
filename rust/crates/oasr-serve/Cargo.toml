@@ -1,0 +1,37 @@
+[package]
+name = "oasr-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OASR serving core — wires the in-process Python engine to HTTP + gRPC. Shared by the `oasr-server` binary and the `oasr._core` extension module."
+
+[lib]
+name = "oasr_serve"
+path = "src/lib.rs"
+
+[dependencies]
+oasr-wire = { path = "../oasr-wire" }
+# No pyo3 linkage feature here on purpose: the top-level artifact (binary or
+# extension module) selects `auto-initialize` / `extension-module` so this
+# crate stays mode-agnostic.
+oasr-engine-client = { path = "../oasr-engine-client" }
+oasr-asr = { path = "../oasr-asr" }
+oasr-server-http = { path = "../oasr-server-http" }
+oasr-server-grpc = { path = "../oasr-server-grpc" }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+axum = { workspace = true }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+hyper = { workspace = true }
