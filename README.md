@@ -1,6 +1,14 @@
-# OASR
+<p align="center">
+  <picture>
+    <img alt="OASR" src="https://raw.githubusercontent.com/chiendb97/oasr/main/docs/assets/logos/oasr-logo-text.png" width=55%>
+  </picture>
+</p>
 
-**Open Automatic Speech Recognition — a high-performance inference framework for ASR models.**
+<h3 align="center">
+Open Automatic Speech Recognition — a high-performance inference framework for ASR models.
+</h3>
+
+---
 
 OASR delivers fast, scalable ASR inference on NVIDIA GPUs. It pairs custom CUDA kernels with a dynamic-batching inference engine and a production-ready serving frontend, so you can transcribe audio offline or stream it in real time over HTTP or gRPC.
 
