@@ -8,6 +8,10 @@ cmake-build-*/
 *.dylib
 *.ipynb
 
+# Rust
+.cargo/config.toml
+rust/.cargo/config.toml
+
 # Python
 __pycache__/
 *.py[cod]
