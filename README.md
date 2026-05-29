@@ -5,7 +5,7 @@
 </p>
 
 <h3 align="center">
-Open Automatic Speech Recognition — a high-performance inference framework for ASR models.
+Easy, fast, and cheap ASR serving for everyone
 </h3>
 
 ---
@@ -57,7 +57,7 @@ CUDA_ARCHITECTURES="80;86;90" pip install -e .
 Optional extras:
 
 ```bash
-pip install -e ".[audio]"    # soundfile, librosa
+pip install -e ".[audio]"    # torchaudio, soundfile, librosa, kaldifeat
 pip install -e ".[serving]"  # serving client libs (used by bench_service.py)
 pip install -e ".[wfst]"     # k2, kaldilm (WFST decoder)
 ```
@@ -73,12 +73,14 @@ cd rust && cargo build --release
 
 ## Quick Start
 
+An engine instance is pinned to a single mode for its lifetime via `EngineConfig.service_mode` (`"streaming"` — the default — or `"offline"`); mismatched requests raise `ValueError`.
+
 ### Offline transcription
 
 ```python
 from oasr.engine import ASREngine, EngineConfig
 
-engine = ASREngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))
+engine = ASREngine(EngineConfig(ckpt_dir="/path/to/checkpoint", service_mode="offline"))
 
 # Single file
 text = engine.transcribe_offline("audio.wav")
@@ -92,10 +94,10 @@ texts = engine.transcribe_offline(["a.wav", "b.wav", "c.wav"])
 ```python
 from oasr.engine import ASREngine, EngineConfig
 
-engine = ASREngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))
+engine = ASREngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))  # service_mode="streaming" by default
 
 # Attached-audio streaming — chunk-by-chunk decode, paged KV cache
-texts = engine.transcribe(["a.wav", "b.wav", "c.wav"], streaming=True)
+texts = engine.transcribe(["a.wav", "b.wav", "c.wav"])
 
 # Real-time feed loop
 rid = engine.add_streaming_request()
@@ -125,10 +127,10 @@ The checkpoint directory should contain `final.pt`, `train.yaml`, `global_cmvn`,
 
 # Multi-GPU fleet — one process per device, fronted by your load balancer
 CUDA_VISIBLE_DEVICES=0 ./rust/target/release/oasr-server \
-    --ckpt-dir /path/to/checkpoint \
+    --ckpt-dir /path/to/checkpoint --service-mode offline \
     --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051 &
 CUDA_VISIBLE_DEVICES=1 ./rust/target/release/oasr-server \
-    --ckpt-dir /path/to/checkpoint \
+    --ckpt-dir /path/to/checkpoint --service-mode offline \
     --http-bind 127.0.0.1:8081 --grpc-bind 127.0.0.1:50052 &
 ```
 
