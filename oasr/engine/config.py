@@ -144,16 +144,14 @@ class EngineConfig:
     # Length-aware batching: hard cap on **padded** input frames per offline
     # micro-batch, i.e. ``max_len * batch_size`` in pre-subsampling feature
     # frames (the same unit as ``Request.num_frames``).  ``None`` (default)
-    # keeps the plain :class:`OfflinePipeline` (standard padded forward), where
-    # width is governed solely by ``max_batch_size``.  When set, the engine
-    # selects :class:`LengthBucketPipeline`: length-sorted requests are grouped
-    # into buckets bounded by this padded-frame budget and run through the
-    # **batched-per-segment dense** packed forward (gapless FFN + per-segment
-    # ``cache_seqlens`` masking) — bit-exact to ``B=1`` inference, unlike the
-    # plain padded forward whose non-causal conv leaks across batch-padding
-    # boundaries.  Sequence packing (``enable_sequence_packing``) is the gapless
-    # *varlen* sibling of this same per-segment forward; the two are mutually
-    # independent and packing takes precedence when both are set.
+    # bounds each :class:`OfflinePipeline` micro-batch solely by
+    # ``max_batch_size``.  When set, length-sorted requests are greedily grouped
+    # into micro-batches bounded by this padded-frame budget (via
+    # ``OfflinePipeline._split_by_frames``) so a mixed short/long pool never
+    # forms an over-padded forward — exact-equivalent to the standard padded
+    # forward, only the batch composition changes.  Independent of sequence
+    # packing (``enable_sequence_packing``), which packs to a gapless varlen
+    # forward instead; packing takes precedence when both are set.
     max_batch_frames: Optional[int] = None
     # Maximum time (seconds) a waiting request may sit in the queue before it
     # is flushed even if no ideal length-bucket peer has arrived.  Prevents
@@ -308,8 +306,7 @@ class EngineConfig:
     def __post_init__(self) -> None:
         if self.service_mode not in ("streaming", "offline"):
             raise ValueError(
-                f"service_mode must be 'streaming' or 'offline', got "
-                f"{self.service_mode!r}"
+                f"service_mode must be 'streaming' or 'offline', got " f"{self.service_mode!r}"
             )
         if self.max_batch_frames is not None and self.max_batch_frames < 1:
             raise ValueError(
@@ -318,13 +315,10 @@ class EngineConfig:
             )
         if self.enable_sequence_packing:
             if self.service_mode != "offline":
-                raise ValueError(
-                    "enable_sequence_packing requires service_mode='offline'"
-                )
+                raise ValueError("enable_sequence_packing requires service_mode='offline'")
             if self.max_packed_frames < 1:
                 raise ValueError(
-                    f"max_packed_frames must be a positive int, got "
-                    f"{self.max_packed_frames!r}"
+                    f"max_packed_frames must be a positive int, got " f"{self.max_packed_frames!r}"
                 )
         if self.feature_config is None:
             self.feature_config = FeatureConfig(dither=0.0)
@@ -337,13 +331,10 @@ class EngineConfig:
             cleaned = sorted({int(v) for v in self.preferred_batch_size})
             if not cleaned:
                 raise ValueError(
-                    "preferred_batch_size must contain at least one value, "
-                    "or be None to disable"
+                    "preferred_batch_size must contain at least one value, " "or be None to disable"
                 )
             if cleaned[0] < 1:
-                raise ValueError(
-                    f"preferred_batch_size values must be >= 1, got {cleaned}"
-                )
+                raise ValueError(f"preferred_batch_size values must be >= 1, got {cleaned}")
             if cleaned[-1] > self.max_batch_size:
                 raise ValueError(
                     f"preferred_batch_size values must be <= max_batch_size "
@@ -409,7 +400,9 @@ class EngineConfig:
         """
         enc = model_config.encoder
         n_kv_head = enc.n_kv_head if enc.n_kv_head is not None else enc.attention_heads
-        head_dim = enc.head_dim if enc.head_dim is not None else enc.output_size // enc.attention_heads
+        head_dim = (
+            enc.head_dim if enc.head_dim is not None else enc.output_size // enc.attention_heads
+        )
         return CacheConfig(
             num_layers=enc.num_blocks,
             n_kv_head=n_kv_head,

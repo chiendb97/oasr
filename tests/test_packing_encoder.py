@@ -66,8 +66,10 @@ def test_conv_packed_matches_per_segment(dtype, causal, device):
     torch.manual_seed(0)
     C = 32
     conv = ConvolutionModule(
-        C, kernel_size=15,
-        norm="layer_norm" if causal else "batch_norm", causal=causal,
+        C,
+        kernel_size=15,
+        norm="layer_norm" if causal else "batch_norm",
+        causal=causal,
     )
     conv = conv.eval().to(device=device, dtype=dtype)
 
@@ -87,7 +89,7 @@ def test_conv_packed_matches_per_segment(dtype, causal, device):
 
     off = 0
     for ref, t in zip(refs, seg_lens):
-        seg_out = out_packed[:, off:off + t, :]
+        seg_out = out_packed[:, off : off + t, :]
         torch.testing.assert_close(seg_out, ref, **_tol(dtype))
         off += t
 
@@ -98,14 +100,9 @@ def test_conv_packed_matches_per_segment(dtype, causal, device):
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("use_varlen", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_packed_equals_batched_equal_lengths(dtype, use_varlen, device):
-    """Equal-length utts: no embed/conv padding, so packed == batched forward.
-
-    Covers both attention backends: ``use_varlen=True`` (sequence packing) and
-    ``use_varlen=False`` (length-bucketing dense).
-    """
+def test_packed_equals_batched_equal_lengths(dtype, device):
+    """Equal-length utts: no embed/conv padding, so packed == batched forward."""
     if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
         pytest.skip("bf16 unsupported")
     torch.manual_seed(1)
@@ -117,7 +114,7 @@ def test_packed_equals_batched_equal_lengths(dtype, use_varlen, device):
 
     with torch.no_grad():
         ref, ref_mask = enc(xs, lens)
-        packed, packed_mask = enc.forward_packed(xs, lens, use_varlen=use_varlen)
+        packed, packed_mask = enc.forward_packed(xs, lens)
 
     assert packed.shape == ref.shape
     torch.testing.assert_close(packed_mask, ref_mask)
@@ -125,14 +122,10 @@ def test_packed_equals_batched_equal_lengths(dtype, use_varlen, device):
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("use_varlen", [True, False])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_packed_equals_single_utterance(dtype, causal, use_varlen, device):
-    """Variable-length utts: packed valid frames == per-utterance B=1 forward.
-
-    Both attention backends (varlen / dense) must stay bit-exact to B=1.
-    """
+def test_packed_equals_single_utterance(dtype, causal, device):
+    """Variable-length utts: packed valid frames == per-utterance B=1 forward."""
     if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
         pytest.skip("bf16 unsupported")
     torch.manual_seed(2)
@@ -146,21 +139,18 @@ def test_packed_equals_single_utterance(dtype, causal, use_varlen, device):
     lens = torch.tensor(lens_in, dtype=torch.long, device=device)
 
     with torch.no_grad():
-        packed, packed_mask = enc.forward_packed(xs, lens, use_varlen=use_varlen)
+        packed, packed_mask = enc.forward_packed(xs, lens)
         out_lens = packed_mask.squeeze(1).sum(-1).tolist()
         # B=1 baseline per utterance.
         for i, t in enumerate(lens_in):
             ref_i, mask_i = enc(xs[i : i + 1, :t], lens[i : i + 1])
             ti = int(mask_i.squeeze(1).sum(-1).item())
             assert ti == int(out_lens[i])
-            torch.testing.assert_close(
-                packed[i : i + 1, :ti], ref_i[:, :ti], **_tol(dtype)
-            )
+            torch.testing.assert_close(packed[i : i + 1, :ti], ref_i[:, :ti], **_tol(dtype))
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("use_varlen", [True, False])
-def test_packed_single_segment_equals_offline(use_varlen, device):
+def test_packed_single_segment_equals_offline(device):
     """A 1-utterance pack must equal the plain offline forward exactly."""
     dtype = torch.float16
     torch.manual_seed(3)
@@ -171,5 +161,5 @@ def test_packed_single_segment_equals_offline(use_varlen, device):
     lens = torch.tensor([T], dtype=torch.long, device=device)
     with torch.no_grad():
         ref, _ = enc(xs, lens)
-        packed, _ = enc.forward_packed(xs, lens, use_varlen=use_varlen)
+        packed, _ = enc.forward_packed(xs, lens)
     torch.testing.assert_close(packed, ref, **_tol(dtype))

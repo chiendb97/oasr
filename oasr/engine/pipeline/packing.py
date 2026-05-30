@@ -12,8 +12,10 @@ forward call differ.
 
 Each micro-batch produced by :meth:`_split_chunks` is exactly one packed row,
 so the encoder concatenates its whole ``(B, T, F)`` micro-batch into a single
-gapless sequence.  The ``(B, T_out, V)`` output shape is identical to the
-padded path, so CTC decode + finalisation are inherited verbatim.
+gapless sequence and runs the **varlen** attention (``cu_seqlens`` + packed
+block-diagonal rel-pos bias) — zero attention padding.  The ``(B, T_out, V)``
+output shape is identical to the padded path, so CTC decode + finalisation are
+inherited verbatim.
 """
 
 from __future__ import annotations
@@ -27,16 +29,11 @@ from .offline import OfflinePipeline
 
 
 class PackingPipeline(OfflinePipeline):
-    """Offline pipeline that packs utterances into one encoder forward.
+    """Offline pipeline that packs utterances into one varlen encoder forward.
 
-    Two flavours sharing the same packed forward + producer/drain machinery:
-
-    * ``use_varlen=True`` (this class, sequence-packing mode) groups by a
-      **summed** post-subsampling budget and runs the gapless **varlen**
-      attention — zero attention padding.
-    * ``use_varlen=False`` (:class:`LengthBucketPipeline`, length-bucketing
-      mode) groups by a **padded** frame cap and runs the batched-per-segment
-      dense attention.
+    Groups length-sorted utterances by a **summed** post-subsampling token
+    budget (``max_packed_frames``) and runs the gapless varlen attention — zero
+    attention padding.  Bit-exact to ``B=1`` inference.
     """
 
     streaming: ClassVar[bool] = False
@@ -46,13 +43,11 @@ class PackingPipeline(OfflinePipeline):
         *,
         max_packed_frames: int,
         subsampling_rate: int = 4,
-        use_varlen: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self._max_packed_frames = max(1, int(max_packed_frames))
         self._subsampling_rate = max(1, int(subsampling_rate))
-        self._use_varlen = bool(use_varlen)
 
     # ------------------------------------------------------------------
     # Micro-batching — one chunk == one packed row
@@ -111,7 +106,8 @@ class PackingPipeline(OfflinePipeline):
             event.wait(torch.cuda.current_stream(self._device))
 
         log_probs, output_lengths = self._mr.forward_offline_packed(
-            features, lengths, use_varlen=self._use_varlen,
+            features,
+            lengths,
         )
         outputs = self._op.decode_offline(log_probs, output_lengths)
 
@@ -121,42 +117,3 @@ class PackingPipeline(OfflinePipeline):
             req.output = out
             req.state = RequestState.FINISHED
         return outputs
-
-
-class LengthBucketPipeline(PackingPipeline):
-    """Length-bucketing offline pipeline (batched-per-segment dense backend).
-
-    Reuses :class:`PackingPipeline`'s packed encoder forward (gapless FFN +
-    per-segment isolation, bit-exact to ``B=1``) but with the **dense**
-    attention backend (``use_varlen=False``) and the **padded-frame** grouping
-    inherited from :class:`OfflinePipeline` (``max_batch_frames`` caps
-    ``max_len * count`` per bucket) instead of the summed packing budget.
-    """
-
-    def __init__(
-        self,
-        *,
-        max_batch_frames: Optional[int],
-        subsampling_rate: int = 4,
-        **kwargs,
-    ) -> None:
-        # ``max_packed_frames`` is unused in dense mode (grouping is padded-cap
-        # via ``max_batch_frames``); pass a dummy so the parent accepts it.
-        super().__init__(
-            max_packed_frames=1,
-            subsampling_rate=subsampling_rate,
-            use_varlen=False,
-            **kwargs,
-        )
-        self._max_batch_frames = max_batch_frames
-
-    def _split_chunks(
-        self, batch: List[Request]
-    ) -> Tuple[List[List[Request]], Optional[List[int]]]:
-        """Group by padded-frame cap, bypassing the summed packing budget.
-
-        Delegates to :meth:`OfflinePipeline._split_chunks` (grandparent), which
-        routes to ``_split_by_frames`` when ``max_batch_frames`` is set and
-        falls back to count-based micro-batching otherwise.
-        """
-        return super(PackingPipeline, self)._split_chunks(batch)

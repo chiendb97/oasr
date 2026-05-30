@@ -65,21 +65,15 @@ class PackedLayout:
     seg_valid_mask : Tensor
         ``(num_segs, max_seg_len)`` bool — valid (non-pad) frames of the
         batched-per-segment conv grid.
-    use_varlen : bool
-        Which attention backend the packed layers run.  ``True`` → the gapless
-        varlen kernel (sequence-packing mode, zero attention padding); ``False``
-        → the batched-per-segment dense fmha with ``cache_seqlens`` masking
-        (length-bucketing mode).  Only the varlen path consumes the two
-        ``bias_*`` tensors below, so they are built only when ``True``.
     bias_offsets : Tensor or None
         ``(num_segs+1,)`` int32 prefix sum of ``H * T_s * T_s`` — start of each
         segment's block in the packed block-diagonal varlen attention bias.
-        ``None`` unless ``use_varlen``.
+        ``None`` when ``num_heads`` was not provided (conv-only layouts).
     bias_gather_idx : Tensor or None
         ``(sum H*T_s*T_s,)`` int64.  Source index into a batched
         ``(num_segs, H, max_seg_len, max_seg_len)`` rel-pos matrix that gathers
         each segment's valid ``(H, T_s, T_s)`` block into the packed bias.
-        ``None`` unless ``use_varlen``.
+        ``None`` when ``num_heads`` was not provided (conv-only layouts).
     src_rows : int
         ``B * Tp`` — row count of the flattened embed output (unpack reshape).
     padded_t : int
@@ -96,7 +90,6 @@ class PackedLayout:
     gapped_len: int
     conv_batched_idx: torch.Tensor
     seg_valid_mask: torch.Tensor
-    use_varlen: bool
     bias_offsets: "torch.Tensor | None"
     bias_gather_idx: "torch.Tensor | None"
     src_rows: int
@@ -107,7 +100,6 @@ def build_packed_layout(
     valid_mask: torch.Tensor,
     conv_kernel: int,
     num_heads: "int | None" = None,
-    use_varlen: bool = False,
 ) -> PackedLayout:
     """Build a :class:`PackedLayout` from a padding mask.
 
@@ -120,69 +112,63 @@ def build_packed_layout(
         Depthwise-conv kernel size (non-causal); the per-segment gap is
         ``(conv_kernel - 1) // 2`` zero frames.
     num_heads : int, optional
-        Required when ``use_varlen`` — sizes the packed block-diagonal varlen
-        attention bias (``bias_offsets`` / ``bias_gather_idx``).
-    use_varlen : bool
-        ``True`` builds the varlen-bias index tensors (sequence-packing mode);
-        ``False`` skips them (length-bucketing mode runs batched-dense fmha).
+        Number of attention heads.  When given, the packed block-diagonal
+        varlen attention bias index tensors (``bias_offsets`` /
+        ``bias_gather_idx``) are built; pass ``None`` for conv-only layouts
+        (e.g. the conv-module unit test) that never run attention.
 
     Notes
     -----
-    Performs **one** D2H sync.  In the batched-dense path that sync pulls the
-    two host ints (``total_tokens``, ``max_seg_len``); in the varlen path it
-    pulls the per-segment lengths once (``total``/``max_seg`` derived from them)
-    so the block-diagonal bias index build needs no further host round-trip.
-    The layout is built once and reused across all encoder layers.
+    Performs **one** D2H sync: the per-segment lengths are pulled once
+    (``total``/``max_seg`` derived from them) so the block-diagonal bias index
+    build needs no further host round-trip.  The layout is built once and
+    reused across all encoder layers.
     """
     assert valid_mask.dtype == torch.bool and valid_mask.dim() == 2
-    if use_varlen and num_heads is None:
-        raise ValueError("use_varlen=True requires num_heads")
     device = valid_mask.device
     B, Tp = valid_mask.shape
     conv_half = (conv_kernel - 1) // 2
 
-    seg_lengths = valid_mask.sum(dim=1).to(torch.int32)          # (B,)
+    seg_lengths = valid_mask.sum(dim=1).to(torch.int32)  # (B,)
     seg_lengths_i64 = seg_lengths.to(torch.int64)
     cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=device)
     cu_seqlens[1:] = torch.cumsum(seg_lengths, dim=0).to(torch.int32)
 
-    # Single D2H sync.  Varlen needs the per-segment lengths host-side for the
-    # block-diagonal bias build, so pull the whole list once and derive
-    # total/max_seg from it; the dense path only needs the two scalars.
-    seg_list: "list[int] | None" = None
+    # Single D2H sync: pull the per-segment lengths once (the block-diagonal
+    # bias index build needs them host-side) and derive total / max_seg.
     if B == 0:
+        seg_list: "list[int]" = []
         total, max_seg = 0, 0
-    elif use_varlen:
+    else:
         seg_list = seg_lengths.tolist()
         total, max_seg = sum(seg_list), max(seg_list)
-    else:
-        meta = torch.stack([cu_seqlens[B], seg_lengths.max()]).tolist()
-        total, max_seg = int(meta[0]), int(meta[1])
 
     # Flat source index (b * Tp + t) of every valid frame, ordered (b, t).
-    flat_src = (
-        torch.arange(B, device=device, dtype=torch.int64).unsqueeze(1) * Tp
-        + torch.arange(Tp, device=device, dtype=torch.int64).unsqueeze(0)
-    )                                                            # (B, Tp)
-    pack_src_idx = flat_src[valid_mask]                          # (total,)
+    flat_src = torch.arange(B, device=device, dtype=torch.int64).unsqueeze(1) * Tp + torch.arange(
+        Tp, device=device, dtype=torch.int64
+    ).unsqueeze(
+        0
+    )  # (B, Tp)
+    pack_src_idx = flat_src[valid_mask]  # (total,)
 
     arange_total = torch.arange(total, device=device, dtype=torch.int64)
     seg_id = torch.repeat_interleave(
         torch.arange(B, device=device, dtype=torch.int64), seg_lengths_i64
-    )                                                            # (total,)
+    )  # (total,)
 
     # Non-causal: gapped position = token + conv_half * segment_id.
     conv_gather_idx = arange_total + conv_half * seg_id
     gapped_len = total + conv_half * (B - 1) if B > 1 else total
 
     # Causal: flat (segment, local_pos) position in a (B, max_seg) grid.
-    seg_start = cu_seqlens.to(torch.int64)[seg_id]               # (total,)
+    seg_start = cu_seqlens.to(torch.int64)[seg_id]  # (total,)
     local_pos = arange_total - seg_start
     conv_batched_idx = seg_id * max_seg + local_pos
-    seg_valid_mask = (
-        torch.arange(max_seg, device=device, dtype=torch.int64).unsqueeze(0)
-        < seg_lengths_i64.unsqueeze(1)
-    )                                                            # (B, max_seg)
+    seg_valid_mask = torch.arange(max_seg, device=device, dtype=torch.int64).unsqueeze(
+        0
+    ) < seg_lengths_i64.unsqueeze(
+        1
+    )  # (B, max_seg)
 
     # Varlen packed block-diagonal bias index tensors: gather each segment's
     # valid (H, T_s, T_s) block out of a batched (B, H, max_seg, max_seg)
@@ -190,10 +176,12 @@ def build_packed_layout(
     # Built from the host ``seg_list`` already synced above (no extra round-trip).
     bias_offsets = None
     bias_gather_idx = None
-    if use_varlen and B > 0:
+    if num_heads is not None and B > 0:
         H = int(num_heads)
         block_sizes = torch.tensor(
-            [H * t * t for t in seg_list], dtype=torch.int32, device=device,
+            [H * t * t for t in seg_list],
+            dtype=torch.int32,
+            device=device,
         )
         bias_offsets = torch.zeros(B + 1, dtype=torch.int32, device=device)
         bias_offsets[1:] = torch.cumsum(block_sizes, dim=0).to(torch.int32)
@@ -203,13 +191,13 @@ def build_packed_layout(
             if t == 0:
                 continue
             ar = torch.arange(t, device=device, dtype=torch.int64)
-            src = (
-                ((s * H + h_ar).view(H, 1, 1) * max_seg + ar.view(1, t, 1))
-                * max_seg + ar.view(1, 1, t)
-            )                                                    # (H, t, t)
+            src = ((s * H + h_ar).view(H, 1, 1) * max_seg + ar.view(1, t, 1)) * max_seg + ar.view(
+                1, 1, t
+            )  # (H, t, t)
             idx_chunks.append(src.reshape(-1))
         bias_gather_idx = (
-            torch.cat(idx_chunks) if idx_chunks
+            torch.cat(idx_chunks)
+            if idx_chunks
             else torch.zeros(0, dtype=torch.int64, device=device)
         )
 
@@ -224,7 +212,6 @@ def build_packed_layout(
         gapped_len=gapped_len,
         conv_batched_idx=conv_batched_idx,
         seg_valid_mask=seg_valid_mask,
-        use_varlen=use_varlen,
         bias_offsets=bias_offsets,
         bias_gather_idx=bias_gather_idx,
         src_rows=B * Tp,
@@ -235,11 +222,7 @@ def build_packed_layout(
 def pack_hidden(xs: torch.Tensor, layout: PackedLayout) -> torch.Tensor:
     """Gather valid frames of padded ``(B, Tp, D)`` into gapless ``(1, T_total, D)``."""
     B, Tp, D = xs.shape
-    return (
-        xs.reshape(B * Tp, D)
-        .index_select(0, layout.pack_src_idx)
-        .unsqueeze(0)
-    )
+    return xs.reshape(B * Tp, D).index_select(0, layout.pack_src_idx).unsqueeze(0)
 
 
 def unpack_hidden(packed: torch.Tensor, layout: PackedLayout, D: int) -> torch.Tensor:

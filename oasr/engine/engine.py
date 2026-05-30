@@ -20,7 +20,6 @@ from .input_processor import InputProcessor
 from .model_runner import ModelRunner
 from .output_processor import OutputProcessor
 from .pipeline import (
-    LengthBucketPipeline,
     OfflinePipeline,
     PackingPipeline,
     Pipeline,
@@ -107,13 +106,9 @@ class ASREngine:
         # own pool internally when ``graph_pool=None``.
         self._graph_pool: Optional[Tuple[int, int]] = None
 
-        self._input_processor = InputProcessor(
-            config, self._device, graph_pool=self._graph_pool
-        )
+        self._input_processor = InputProcessor(config, self._device, graph_pool=self._graph_pool)
         self._scheduler = Scheduler(config)
-        self._model_runner = ModelRunner(
-            model, config, cache_config, graph_pool=self._graph_pool
-        )
+        self._model_runner = ModelRunner(model, config, cache_config, graph_pool=self._graph_pool)
         self._output_processor = OutputProcessor(config)
 
         # Build exactly one pipeline matching ``config.service_mode``.
@@ -136,13 +131,10 @@ class ASREngine:
             and bool(config.use_cuda_graphs)
         ):
             try:
-                self._model_runner.prewarm_encoder_graphs(
-                    config.preferred_batch_size
-                )
+                self._model_runner.prewarm_encoder_graphs(config.preferred_batch_size)
             except Exception as exc:  # pragma: no cover
                 logger.warning(
-                    "Encoder graph pre-warm failed (will capture on first "
-                    "chunk instead): %s",
+                    "Encoder graph pre-warm failed (will capture on first " "chunk instead): %s",
                     exc,
                 )
 
@@ -152,6 +144,7 @@ class ASREngine:
         # in those cases).
         if self._device.type == "cuda":
             from oasr.jit.attention import warmup_fmha
+
             try:
                 warmup_fmha(
                     n_head=model.encoder.encoders[0].self_attn.h,
@@ -371,18 +364,15 @@ class ASREngine:
             return PackingPipeline(
                 max_packed_frames=int(config.max_packed_frames),
                 subsampling_rate=config.subsampling_rate,
-                use_varlen=True,
                 **common,
             )
-        if config.max_batch_frames is not None:
-            # Length-bucketing: batched-per-segment dense attention (bit-exact,
-            # gapless FFN), padded-frame cap drives bucket formation.
-            return LengthBucketPipeline(
-                max_batch_frames=config.max_batch_frames,
-                subsampling_rate=config.subsampling_rate,
-                **common,
-            )
-        return OfflinePipeline(**common)
+        # Length-aware batching: plain padded offline forward with a
+        # padded-frame cap (``max_len * count``) driving micro-batch formation.
+        # ``None`` falls back to count-based micro-batching.
+        return OfflinePipeline(
+            max_batch_frames=config.max_batch_frames,
+            **common,
+        )
 
     def _validate_mode(self, streaming: bool) -> None:
         """Raise ``ValueError`` when the per-request ``streaming`` flag
@@ -457,8 +447,7 @@ class ASREngine:
         audio_list: List = [audio] if is_single else audio  # type: ignore[list-item]
 
         request_ids = [
-            self.add_request(a, sample_rate=sample_rate, streaming=streaming)
-            for a in audio_list
+            self.add_request(a, sample_rate=sample_rate, streaming=streaming) for a in audio_list
         ]
         final = self.run()
 
