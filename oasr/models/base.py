@@ -97,6 +97,11 @@ class BaseEncoder(nn.Module, ABC):
 
     #: Whether :meth:`forward_packed` is implemented (sequence packing).
     supports_packing: bool = False
+    #: Whether :meth:`forward_chunk_paged` (paged-KV streaming) is implemented.
+    #: Conformer-style encoders set this True; encoders with a different
+    #: streaming-cache model (e.g. Zipformer) leave it False and expose their
+    #: own streaming API instead.
+    supports_paged_streaming: bool = False
 
     @abstractmethod
     def forward(
@@ -105,7 +110,6 @@ class BaseEncoder(nn.Module, ABC):
         """Offline forward → ``(hidden (B, T_out, D), masks (B, 1, T_out) bool)``."""
         raise NotImplementedError
 
-    @abstractmethod
     def forward_chunk_paged(
         self,
         xs: torch.Tensor,
@@ -115,8 +119,15 @@ class BaseEncoder(nn.Module, ABC):
         att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
         cache_t1: int = -1,
     ) -> torch.Tensor:
-        """Streaming chunk forward (paged KV + slot CNN cache) → ``(B, chunk, D)``."""
-        raise NotImplementedError
+        """Streaming chunk forward (paged KV + slot CNN cache) → ``(B, chunk, D)``.
+
+        Default: unsupported.  Only encoders whose streaming cache maps onto the
+        engine's paged-KV + slot-CNN model implement this (``supports_paged_streaming
+        = True``).  Other encoders expose their own streaming API.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support paged-KV streaming"
+        )
 
     def forward_packed(
         self, xs: torch.Tensor, xs_lens: torch.Tensor

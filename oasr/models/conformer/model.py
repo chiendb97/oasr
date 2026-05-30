@@ -583,6 +583,7 @@ class ConformerEncoder(BaseEncoder):
     """Conformer encoder module."""
 
     supports_packing = True
+    supports_paged_streaming = True
 
     def __init__(
         self,

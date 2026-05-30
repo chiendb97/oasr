@@ -86,10 +86,12 @@ def register_model(
 
 def _ensure_builtins() -> None:
     """Import built-in model packages so their ``register_model`` calls run."""
-    if not _REGISTRY:
-        # Importing the package triggers its __init__ registration. Kept lazy to
-        # avoid an import cycle (conformer imports this module to register).
+    # Importing each package triggers its __init__ registration. Kept lazy to
+    # avoid an import cycle (each arch imports this module to register).
+    if "conformer" not in _REGISTRY:
         import oasr.models.conformer  # noqa: F401
+    if "zipformer" not in _REGISTRY:
+        import oasr.models.zipformer  # noqa: F401
 
 
 def get_model_entry(name: str) -> ModelEntry:

@@ -36,6 +36,12 @@ from .conformer import (
     ConvolutionModule,
     PositionwiseFeedForward,
 )
+from .zipformer import (
+    ZipformerEncoder,
+    ZipformerEncoderConfig,
+    ZipformerModel,
+    ZipformerModelConfig,
+)
 
 __all__ = [
     # Base abstractions
@@ -62,4 +68,9 @@ __all__ = [
     "ConformerModelConfig",
     "ConvolutionModule",
     "PositionwiseFeedForward",
+    # Zipformer
+    "ZipformerModel",
+    "ZipformerEncoder",
+    "ZipformerEncoderConfig",
+    "ZipformerModelConfig",
 ]
