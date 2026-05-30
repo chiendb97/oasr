@@ -89,7 +89,7 @@ class TestEngineConfig:
             output_size=256, num_blocks=12, attention_heads=4, cnn_module_kernel=15
         )
         model_cfg = ConformerModelConfig(encoder=enc_cfg, vocab_size=5002)
-        cc = cfg.build_cache_config(model_cfg)
+        cc = cfg.build_cache_config(model_cfg.cache_spec)
         assert cc.num_layers == 12
         assert cc.hidden_dim == 256
         assert cc.kernel_size == 15

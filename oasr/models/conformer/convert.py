@@ -22,14 +22,15 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 import yaml
 
+from oasr.layers.norm import GlobalCMVN
+
 from .config import ConformerEncoderConfig, ConformerModelConfig
-from .model import ConformerModel, GlobalCMVN
+from .model import ConformerModel
 
 logger = logging.getLogger(__name__)
 
@@ -82,28 +83,45 @@ def load_global_cmvn(cmvn_path: str) -> GlobalCMVN:
     return GlobalCMVN(mean, istd)
 
 
-def filter_encoder_state_dict(
-    state_dict: Dict[str, torch.Tensor],
-) -> Dict[str, torch.Tensor]:
-    """Keep only ``encoder.*`` keys from a full WeNet checkpoint.
+class WenetConverter:
+    """Checkpoint converter for WeNet Conformer experiment directories.
 
-    The prefix is kept as-is since ``ConformerModel.state_dict()`` also
-    nests everything under ``encoder.``.
+    Implements the :class:`~oasr.models.registry.CheckpointConverter` protocol:
+    it owns the *format*-specific concerns (parse ``train.yaml`` → config, load
+    ``global_cmvn``, read ``final.pt`` → raw state-dict).  The architecture's
+    name-mapping / vocab-padding lives in
+    :meth:`ConformerModel.load_weights`.
     """
-    encoder_state_dict = {k: v for k,
-                          v in state_dict.items() if k.startswith("encoder.")}
 
-    vocab_size = state_dict["ctc.ctc_lo.weight"].shape[0]
-    if vocab_size % 8 != 0:
-        padding = 8 - vocab_size % 8
-        encoder_state_dict["ctc.ctc_lo.weight"] = F.pad(
-            state_dict["ctc.ctc_lo.weight"], (0, 0, 0, padding))
-        encoder_state_dict["ctc.ctc_lo.bias"] = F.pad(
-            state_dict["ctc.ctc_lo.bias"], (0, padding))
-    else:
-        encoder_state_dict["ctc.ctc_lo.weight"] = state_dict["ctc.ctc_lo.weight"]
-        encoder_state_dict["ctc.ctc_lo.bias"] = state_dict["ctc.ctc_lo.bias"]
-    return encoder_state_dict
+    def detect(self, ckpt_dir: Path) -> bool:
+        """A WeNet experiment dir is identified by its ``train.yaml``."""
+        return (Path(ckpt_dir) / "train.yaml").exists()
+
+    def build_config(self, ckpt_dir: Path) -> ConformerModelConfig:
+        ckpt_dir = Path(ckpt_dir)
+        yaml_path = ckpt_dir / "train.yaml"
+        if not yaml_path.exists():
+            raise FileNotFoundError(f"Required file not found: {yaml_path}")
+        config = build_config_from_wenet(parse_wenet_yaml(str(yaml_path)))
+        logger.info("Encoder config: %s", config.encoder)
+        return config
+
+    def build_aux(self, ckpt_dir: Path) -> Dict[str, Any]:
+        """Build the ``global_cmvn`` buffer (optional) passed to ``from_config``."""
+        cmvn_path = Path(ckpt_dir) / "global_cmvn"
+        global_cmvn: Optional[GlobalCMVN] = None
+        if cmvn_path.exists():
+            global_cmvn = load_global_cmvn(str(cmvn_path))
+            logger.info("Loaded global CMVN from %s", cmvn_path)
+        return {"global_cmvn": global_cmvn}
+
+    def load_state_dict(
+        self, ckpt_dir: Path, checkpoint_name: str, map_location: Any
+    ) -> Mapping[str, torch.Tensor]:
+        ckpt_path = Path(ckpt_dir) / checkpoint_name
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Required file not found: {ckpt_path}")
+        return torch.load(str(ckpt_path), map_location=map_location)
 
 
 def load_wenet_checkpoint(
@@ -113,6 +131,9 @@ def load_wenet_checkpoint(
     dtype: Optional[torch.dtype] = None,
 ) -> Tuple[ConformerModel, ConformerModelConfig]:
     """Load a WeNet pretrained Conformer checkpoint directory.
+
+    Thin back-compat wrapper around
+    :func:`oasr.models.registry.build_model_from_checkpoint`.
 
     Args:
         ckpt_dir: Path to the WeNet experiment directory (must contain
@@ -126,56 +147,14 @@ def load_wenet_checkpoint(
         A tuple of ``(model, config)`` where *model* has weights loaded
         and is set to eval mode.
     """
-    ckpt_dir = Path(ckpt_dir)
-    yaml_path = ckpt_dir / "train.yaml"
-    cmvn_path = ckpt_dir / "global_cmvn"
-    ckpt_path = ckpt_dir / checkpoint_name
+    from ..registry import build_model_from_checkpoint
 
-    for p in (yaml_path, ckpt_path):
-        if not p.exists():
-            raise FileNotFoundError(f"Required file not found: {p}")
-
-    # --- 1. Parse config ---
-    raw_config = parse_wenet_yaml(str(yaml_path))
-    config = build_config_from_wenet(raw_config)
-    logger.info("Encoder config: %s", config.encoder)
-
-    # --- 2. Build GlobalCMVN (optional) ---
-    global_cmvn: Optional[GlobalCMVN] = None
-    if cmvn_path.exists():
-        global_cmvn = load_global_cmvn(str(cmvn_path))
-        logger.info("Loaded global CMVN from %s", cmvn_path)
-
-    # --- 3. Construct model ---
-    model = ConformerModel(config, global_cmvn=global_cmvn)
-
-    # --- 4. Load checkpoint ---
-    state_dict = torch.load(str(ckpt_path), map_location=device)
-    encoder_state_dict = filter_encoder_state_dict(state_dict)
-    logger.info(
-        "Checkpoint has %d encoder keys (out of %d total)",
-        len(encoder_state_dict),
-        len(state_dict),
+    return build_model_from_checkpoint(
+        ckpt_dir,
+        checkpoint_name=checkpoint_name,
+        device=device,
+        dtype=dtype,
     )
-
-    missing, unexpected = model.load_state_dict(
-        encoder_state_dict, strict=False)
-
-    # pos_enc.pe is a computed buffer, expected to be absent from the checkpoint
-    expected_missing = {"encoder.embed.pos_enc.pe"}
-    real_missing = [k for k in missing if k not in expected_missing]
-    if real_missing:
-        logger.warning("Unexpected missing keys: %s", real_missing)
-    if unexpected:
-        logger.warning("Unexpected keys in checkpoint: %s", unexpected)
-
-    model = model.to(device=device)
-    if dtype is not None:
-        model = model.to(dtype=dtype)
-
-    model.eval()
-    logger.info("Model loaded and set to eval mode.")
-    return model, config
 
 
 if __name__ == "__main__":

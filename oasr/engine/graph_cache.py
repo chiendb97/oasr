@@ -84,8 +84,8 @@ class GraphedEncoderForward:
 
     Parameters
     ----------
-    model : ConformerModel
-        The Conformer model whose ``forward_chunk_paged`` is captured.
+    model : BaseAsrModel
+        The model whose ``forward_chunk_paged`` is captured.
     att_mgr, cnn_mgr : cache managers
         Provide the persistent batched paging / CNN-cache tensors that the
         graph reads from.

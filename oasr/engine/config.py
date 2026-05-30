@@ -14,7 +14,7 @@ from oasr.cache import CacheConfig
 from oasr.ctc_decode import GpuDecoderConfig
 from oasr.decode import DecoderConfig
 from oasr.features import FeatureConfig
-from oasr.models.conformer.config import ConformerModelConfig
+from oasr.models.base import BaseModelConfig, CacheSpec
 
 
 @dataclass
@@ -301,7 +301,7 @@ class EngineConfig:
     audio_scale: float = 32768.0
 
     # Set by the engine after model loading
-    _model_config: Optional[ConformerModelConfig] = field(default=None, repr=False)
+    _model_config: Optional[BaseModelConfig] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.service_mode not in ("streaming", "offline"):
@@ -390,25 +390,21 @@ class EngineConfig:
     # CacheConfig builder
     # ------------------------------------------------------------------
 
-    def build_cache_config(self, model_config: ConformerModelConfig) -> CacheConfig:
-        """Derive a :class:`CacheConfig` from the loaded model configuration.
+    def build_cache_config(self, cache_spec: CacheSpec) -> CacheConfig:
+        """Derive a :class:`CacheConfig` from a model's :class:`CacheSpec`.
 
         Parameters
         ----------
-        model_config : ConformerModelConfig
-            The model configuration returned by ``load_wenet_checkpoint``.
+        cache_spec : CacheSpec
+            Architecture-agnostic cache descriptor, e.g. ``model.cache_spec``
+            (live model) or ``model_config.cache_spec`` (config object).
         """
-        enc = model_config.encoder
-        n_kv_head = enc.n_kv_head if enc.n_kv_head is not None else enc.attention_heads
-        head_dim = (
-            enc.head_dim if enc.head_dim is not None else enc.output_size // enc.attention_heads
-        )
         return CacheConfig(
-            num_layers=enc.num_blocks,
-            n_kv_head=n_kv_head,
-            head_dim=head_dim,
-            hidden_dim=enc.output_size,
-            kernel_size=enc.cnn_module_kernel,
+            num_layers=cache_spec.num_layers,
+            n_kv_head=cache_spec.n_kv_head,
+            head_dim=cache_spec.head_dim,
+            hidden_dim=cache_spec.hidden_dim,
+            kernel_size=cache_spec.conv_kernel_size,
             chunk_size=self.chunk_size,
             num_left_chunks=self.num_left_chunks,
             block_size_frames=self.block_size_frames,

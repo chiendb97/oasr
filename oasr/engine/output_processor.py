@@ -40,9 +40,20 @@ class OutputProcessor:
     ----------
     config : EngineConfig
         Engine configuration.
+    decode_type : str
+        The model's decode family (``model.decode_type``).  Only ``"ctc"`` is
+        wired today; ``"transducer"`` / ``"aed"`` are reserved extension points
+        and raise until their decode paths are implemented.
     """
 
-    def __init__(self, config: EngineConfig) -> None:
+    def __init__(self, config: EngineConfig, decode_type: str = "ctc") -> None:
+        if decode_type != "ctc":
+            raise NotImplementedError(
+                f"OutputProcessor only supports CTC decoding; got "
+                f"decode_type={decode_type!r}. Transducer/AED decode paths are a "
+                "planned extension point (add a branch here keyed on decode_type)."
+            )
+        self._decode_type = decode_type
         self._config = config
         self._sp = self._load_sentencepiece(config.sentencepiece_model)
         self._vocab: Optional[Dict[int, str]] = None
