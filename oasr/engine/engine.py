@@ -19,7 +19,13 @@ from .config import EngineConfig
 from .input_processor import InputProcessor
 from .model_runner import ModelRunner
 from .output_processor import OutputProcessor
-from .pipeline import OfflinePipeline, Pipeline, StreamingPipeline
+from .pipeline import (
+    LengthBucketPipeline,
+    OfflinePipeline,
+    PackingPipeline,
+    Pipeline,
+    StreamingPipeline,
+)
 from .request import Request, RequestOutput
 from .scheduler import Scheduler
 
@@ -348,7 +354,7 @@ class ASREngine:
                 config=config,
                 device=self._device,
             )
-        return OfflinePipeline(
+        common = dict(
             scheduler=self._scheduler,
             input_processor=self._input_processor,
             model_runner=self._model_runner,
@@ -360,6 +366,23 @@ class ASREngine:
             preferred_sizes=config.preferred_batch_size,
             persistent_producer=bool(config.offline_persistent_pipeline),
         )
+        if config.enable_sequence_packing:
+            # Sequence packing: gapless varlen attention, summed-frame budget.
+            return PackingPipeline(
+                max_packed_frames=int(config.max_packed_frames),
+                subsampling_rate=config.subsampling_rate,
+                use_varlen=True,
+                **common,
+            )
+        if config.max_batch_frames is not None:
+            # Length-bucketing: batched-per-segment dense attention (bit-exact,
+            # gapless FFN), padded-frame cap drives bucket formation.
+            return LengthBucketPipeline(
+                max_batch_frames=config.max_batch_frames,
+                subsampling_rate=config.subsampling_rate,
+                **common,
+            )
+        return OfflinePipeline(**common)
 
     def _validate_mode(self, streaming: bool) -> None:
         """Raise ``ValueError`` when the per-request ``streaming`` flag

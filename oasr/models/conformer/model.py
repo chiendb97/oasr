@@ -19,6 +19,7 @@ from oasr.cache.slot_cnn import SlotCnnCache
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention
 from oasr.utils import get_norm, get_norm_activation
 from .config import ConformerEncoderConfig, ConformerModelConfig
+from .packing import PackedLayout, build_packed_layout, pack_hidden, unpack_hidden
 
 
 # -----------------------------------------------------------------------------
@@ -195,6 +196,55 @@ class ConvolutionModule(nn.Module):
         if mask_pad.size(2) > 0:
             x = x.masked_fill(~mask_btc, 0.0)
         return x, new_cache
+
+    def forward_packed(
+        self,
+        x: torch.Tensor,
+        layout: PackedLayout,
+    ) -> torch.Tensor:
+        """Packed (sequence-packing) convolution forward over ``(1, T_total, C)``.
+
+        Two segment-isolation strategies, picked by the conv's causality:
+
+        * **Non-causal** (``lorder == 0``): the symmetric depthwise conv mixes
+          both sides, so its post-GLU input is scattered into a *gapped* layout
+          (``(K-1)//2`` zero frames between segments), run through one conv, and
+          gathered back.  Zero gap frames give every segment clean
+          conv-internal-zero boundaries — bit-exact to B=1 inference.
+        * **Causal** (``lorder > 0``): the depthwise conv only reads left
+          context, so a batched-per-segment form (each segment an independent
+          ``(num_segs, max_seg_len)`` row) has no right-context contamination.
+          Reuses the standard :meth:`forward` (left-pad + mask) verbatim.
+        """
+        if self.lorder == 0:
+            return self._forward_packed_noncausal(x, layout)
+        return self._forward_packed_causal(x, layout)
+
+    def _forward_packed_noncausal(
+        self, x: torch.Tensor, layout: PackedLayout
+    ) -> torch.Tensor:
+        x = self.pointwise_conv1(x)
+        x = oasr.glu(x)                                  # (1, T_total, C_inner)
+        c_inner = x.size(2)
+        gapped = x.new_zeros(1, layout.gapped_len, c_inner)
+        gapped[0].index_copy_(0, layout.conv_gather_idx, x[0])
+        gapped = self.depthwise_conv(gapped)             # (1, gapped_len, C_inner)
+        x = gapped[0].index_select(0, layout.conv_gather_idx).unsqueeze(0)
+        x = self.norm_activation(x)
+        x = self.pointwise_conv2(x)
+        return x
+
+    def _forward_packed_causal(
+        self, x: torch.Tensor, layout: PackedLayout
+    ) -> torch.Tensor:
+        S, Tm, C = layout.num_segs, layout.max_seg_len, x.size(2)
+        xb = x.new_zeros(S * Tm, C)
+        xb.index_copy_(0, layout.conv_batched_idx, x[0])
+        xb = xb.reshape(S, Tm, C)
+        mask_pad = layout.seg_valid_mask.unsqueeze(1)    # (S, 1, Tm)
+        yb, _ = self.forward(xb, mask_pad)               # standard causal forward
+        out = yb.reshape(S * Tm, C).index_select(0, layout.conv_batched_idx)
+        return out.unsqueeze(0)
 
 
 # -----------------------------------------------------------------------------
@@ -495,6 +545,50 @@ class ConformerEncoderLayer(nn.Module):
             x = self.norm_final(x)
         return x, new_att_cache, new_cnn_cache
 
+    def forward_packed(
+        self,
+        x: torch.Tensor,
+        pos_emb: torch.Tensor,
+        layout: PackedLayout,
+    ) -> torch.Tensor:
+        """Sequence-packing layer forward over a gapless packed row.
+
+        ``x`` is ``(1, T_total, D)``.  Attention is restricted to each
+        ``cu_seqlens`` segment; the conv module uses the gapped depthwise
+        path.  Macaron FFN / FFN / norms are per-token and run unchanged.
+        """
+        if self.feed_forward_macaron is not None:
+            residual = x
+            if self.normalize_before:
+                x = self.norm_ff_macaron(x)
+            x = residual + self.ff_scale * self.feed_forward_macaron(x)
+            if not self.normalize_before:
+                x = self.norm_ff_macaron(x)
+        residual = x
+        if self.normalize_before:
+            x = self.norm_mha(x)
+        x_att, _ = self.self_attn(x, pos_emb=pos_emb, layout=layout)
+        x = residual + x_att
+        if not self.normalize_before:
+            x = self.norm_mha(x)
+        if self.conv_module is not None:
+            residual = x
+            if self.normalize_before:
+                x = self.norm_conv(x)
+            x = self.conv_module.forward_packed(x, layout)
+            x = residual + x
+            if not self.normalize_before:
+                x = self.norm_conv(x)
+        residual = x
+        if self.normalize_before:
+            x = self.norm_ff(x)
+        x = residual + self.ff_scale * self.feed_forward(x)
+        if not self.normalize_before:
+            x = self.norm_ff(x)
+        if self.conv_module is not None:
+            x = self.norm_final(x)
+        return x
+
 
 # -----------------------------------------------------------------------------
 # Encoder
@@ -563,6 +657,50 @@ class ConformerEncoder(nn.Module):
             xs, _, _ = layer(xs, attn_masks, pos_emb, masks)
         if self.normalize_before and self.final_norm:
             xs = self.after_norm(xs)
+        return xs, masks
+
+    def forward_packed(
+        self,
+        xs: torch.Tensor,
+        xs_lens: torch.Tensor,
+        use_varlen: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-segment-isolated encoder forward (packing / length-bucketing).
+
+        Subsampling (``embed``) runs in normal batched mode so the Conv2d
+        receptive field never crosses an utterance boundary; the post-
+        subsampling hidden states are then packed into one gapless row and the
+        expensive conformer layers run once with per-segment attention + conv
+        isolation.  Returns the same ``(B, T_out, D)`` hidden + ``(B, 1, T_out)``
+        mask as :meth:`forward` so the CTC head / decode path are unchanged.
+
+        ``use_varlen`` selects the attention backend (and hence the mode):
+        ``True`` = gapless varlen kernel (sequence packing), ``False`` =
+        batched-per-segment dense fmha (length-bucketing).  Both are bit-exact
+        to ``B=1``; only the attention padding and the layout's bias tensors
+        differ.
+        """
+        if self.global_cmvn is not None:
+            xs = self.global_cmvn(xs)
+        T = xs.size(1)
+        masks = make_pad_mask(xs_lens, T).unsqueeze(1)
+        xs, pos_emb, masks = self.embed(xs, masks)          # (B, Tp, D)
+        D = xs.size(2)
+
+        cnn_kernel = self.encoders[0].conv_module.depthwise_conv.kernel_size \
+            if self.encoders[0].conv_module is not None else 1
+        num_heads = self.encoders[0].self_attn.h if use_varlen else None
+        layout = build_packed_layout(
+            masks.squeeze(1), cnn_kernel, num_heads=num_heads, use_varlen=use_varlen,
+        )
+
+        packed = pack_hidden(xs, layout)                    # (1, T_total, D)
+        for layer in self.encoders:
+            packed = layer.forward_packed(packed, pos_emb, layout)
+        if self.normalize_before and self.final_norm:
+            packed = self.after_norm(packed)
+
+        xs = unpack_hidden(packed, layout, D)               # (B, Tp, D)
         return xs, masks
 
     # ------------------------------------------------------------------
@@ -726,6 +864,24 @@ class ConformerModel(nn.Module):
         hidden_states, _ = self.encoder(input_features, lengths)
         probs = self.ctc(hidden_states)
         return probs
+
+    def forward_packed(
+        self,
+        input_features: torch.Tensor,
+        lengths: torch.Tensor,
+        use_varlen: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-segment-isolated forward; returns ``(probs, masks)``.
+
+        ``probs`` is ``(B, T_out, vocab)`` and ``masks`` is ``(B, 1, T_out)``
+        — identical shapes to the padded path so the offline decode is
+        unchanged.  ``use_varlen`` picks the attention backend (sequence
+        packing vs. length-bucketing); see :meth:`ConformerEncoder.forward_packed`.
+        """
+        hidden_states, masks = self.encoder.forward_packed(
+            input_features, lengths, use_varlen=use_varlen,
+        )
+        return self.ctc(hidden_states), masks
 
     def forward_chunk_paged(
         self,

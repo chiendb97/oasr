@@ -10,10 +10,13 @@ protocol.
 
 from .base import Pipeline
 from .offline import OfflinePipeline
+from .packing import LengthBucketPipeline, PackingPipeline
 from .streaming import StreamingPipeline
 
 __all__ = [
     "Pipeline",
     "OfflinePipeline",
+    "PackingPipeline",
+    "LengthBucketPipeline",
     "StreamingPipeline",
 ]

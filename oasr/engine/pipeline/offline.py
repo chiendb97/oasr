@@ -69,6 +69,7 @@ class OfflinePipeline(Pipeline):
         gpu_feature_extraction: bool = True,
         preferred_sizes: Optional[Sequence[int]] = None,
         persistent_producer: bool = True,
+        max_batch_frames: Optional[int] = None,
     ) -> None:
         self._scheduler = scheduler
         self._inp = input_processor
@@ -78,6 +79,13 @@ class OfflinePipeline(Pipeline):
         self._depth = max(1, int(depth))
         self._device = device
         self._sort_by_length = sort_by_length
+        # Padded-frame budget per micro-batch (``max_len * count`` in
+        # pre-subsampling feature frames).  When set, ``_split_chunks`` packs
+        # length-sorted requests into chunks bounded by this budget instead of
+        # by a fixed count — the non-packing length-aware batching path.
+        self._max_batch_frames: Optional[int] = (
+            int(max_batch_frames) if max_batch_frames is not None else None
+        )
         self._gpu_feat = bool(gpu_feature_extraction) and device.type == "cuda"
         self._dtype: torch.dtype = input_processor._config.dtype
         # Sorted ascending list of preferred chunk widths.  When set,
@@ -367,6 +375,12 @@ class OfflinePipeline(Pipeline):
         n = len(batch)
         mb = self._micro_batch_size
 
+        # Frame-budget split takes precedence when configured: bound padded
+        # compute (``max_len * count``) per micro-batch regardless of count,
+        # so a mixed short/long pool never forms an over-padded forward.
+        if self._max_batch_frames is not None:
+            return self._split_by_frames(batch)
+
         # Skip the short-circuit when preferred sizes are configured —
         # we still want the greedy snap (e.g. n=7, mb=8, PBS=[4] should
         # yield [4, 3] not [7]) below.
@@ -404,6 +418,47 @@ class OfflinePipeline(Pipeline):
                 size = base + (1 if i < rem else 0)
                 chunks.append(ordered[idx: idx + size])
                 idx += size
+        return chunks, orig_indices
+
+    def _split_by_frames(
+        self, batch: List[Request]
+    ) -> Tuple[List[List[Request]], Optional[List[int]]]:
+        """Split ``batch`` into micro-batches bounded by a padded-frame budget.
+
+        Length-sorts (when enabled) then greedily accumulates requests into a
+        chunk until adding the next would push the padded width
+        ``max_len * (count + 1)`` over ``max_batch_frames`` — or the count over
+        ``micro_batch_size``.  A single request always ships even if it alone
+        exceeds the budget (it can't be split in non-packing mode).  Sorting
+        ascending keeps each chunk length-tight, minimising padding.
+        """
+        budget = self._max_batch_frames
+        assert budget is not None
+        mb = self._micro_batch_size
+
+        if self._sort_by_length:
+            enumerated = sorted(enumerate(batch), key=lambda p: p[1].num_frames)
+            ordered = [r for _, r in enumerated]
+            orig_indices: Optional[List[int]] = [i for i, _ in enumerated]
+        else:
+            ordered = list(batch)
+            orig_indices = None
+
+        chunks: List[List[Request]] = []
+        cur: List[Request] = []
+        cur_max = 0
+        for r in ordered:
+            rlen = max(1, r.num_frames)
+            new_max = max(cur_max, rlen)
+            if cur and (new_max * (len(cur) + 1) > budget or len(cur) >= mb):
+                chunks.append(cur)
+                cur = [r]
+                cur_max = rlen
+            else:
+                cur.append(r)
+                cur_max = new_max
+        if cur:
+            chunks.append(cur)
         return chunks, orig_indices
 
     def _snap_to_preferred(self, candidate: int) -> int:

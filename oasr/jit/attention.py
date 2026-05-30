@@ -340,6 +340,145 @@ def get_compiled_fmha(
 
 
 # ---------------------------------------------------------------------------
+# Variable-length (sequence-packed) compile cache
+# ---------------------------------------------------------------------------
+
+@functools.cache
+def _compiled_fmha_varlen(
+    arch: Tuple[int, int],
+    head_dim: int,
+    dtype_str: str,
+    num_heads: int,
+    num_kv_heads: int,
+    has_bias: bool,
+    m_block: int,
+    n_block: int,
+    num_threads: int,
+    bias_aligned: bool = False,
+):
+    """Compile ``FmhaSm80.forward_varlen`` for packed ``(total, H, D)`` inputs.
+
+    Dummy descriptors signal rank/dtype/dynamic-dim only.  The varlen kernel
+    consumes packed q/k/v + ``cu_seqlens_q/k`` (+ a packed block-diagonal bias
+    and its ``bias_offsets`` when ``has_bias``) and writes a packed output.
+    """
+    import cutlass
+    import cutlass.cute as cute
+    import torch
+    from cutlass.cute.runtime import from_dlpack
+
+    if dtype_str == "float16":
+        cute_dtype = cutlass.Float16
+        torch_dtype = torch.float16
+    elif dtype_str == "bfloat16":
+        cute_dtype = cutlass.BFloat16
+        torch_dtype = torch.bfloat16
+    else:
+        raise ValueError(f"unsupported dtype {dtype_str!r}")
+
+    from oasr.kernels.cute.attention.base import pick_arch_cls
+    cls = pick_arch_cls(*arch)
+    if not cls.can_implement(
+        dtype=cute_dtype, head_dim=head_dim,
+        m_block_size=m_block, n_block_size=n_block,
+        num_threads=num_threads, has_bias=has_bias,
+        paged=False, varlen=True, bias_aligned=bias_aligned,
+    ):
+        raise RuntimeError("FmhaSm80.can_implement(varlen=True) returned False")
+    inst = cls(
+        head_dim=head_dim, dtype=cute_dtype,
+        num_heads=num_heads, num_kv_heads=num_kv_heads,
+        has_bias=has_bias, paged=False, varlen=True,
+        m_block_size=m_block, n_block_size=n_block, num_threads=num_threads,
+        bias_aligned=bias_aligned,
+    )
+
+    device = "cuda"
+    H, H_kv = num_heads, num_kv_heads
+    S = 2
+    total_q = max(m_block, 8) * S
+    total_k = max(n_block, 16) * S
+    q = torch.empty(total_q, H, head_dim, dtype=torch_dtype, device=device)
+    o = torch.empty(total_q, H, head_dim, dtype=torch_dtype, device=device)
+    k = torch.empty(total_k, H_kv, head_dim, dtype=torch_dtype, device=device)
+    v = torch.empty(total_k, H_kv, head_dim, dtype=torch_dtype, device=device)
+
+    elem_bits = 16
+    align_div = 128 // elem_bits
+
+    def _wrap(t: torch.Tensor) -> "cute.Tensor":
+        return (
+            from_dlpack(t, assumed_align=16, enable_tvm_ffi=True)
+            .mark_layout_dynamic(leading_dim=t.dim() - 1)
+            .mark_compact_shape_dynamic(
+                mode=t.dim() - 1, stride_order=t.dim_order(), divisibility=align_div,
+            )
+        )
+
+    mQ, mK, mV, mO = _wrap(q), _wrap(k), _wrap(v), _wrap(o)
+
+    if has_bias:
+        bias = torch.empty(H * total_q * total_k, dtype=torch_dtype, device=device)
+        mBias = (
+            from_dlpack(bias, assumed_align=16, enable_tvm_ffi=True)
+            .mark_layout_dynamic(leading_dim=0)
+        )
+        bias_off = torch.zeros(S + 1, dtype=torch.int32, device=device)
+        mBiasOff = (
+            from_dlpack(bias_off, assumed_align=4, enable_tvm_ffi=True)
+            .mark_layout_dynamic(leading_dim=0)
+        )
+    else:
+        mBias = from_dlpack(
+            torch.empty((), dtype=torch_dtype, device=device),
+            assumed_align=16, enable_tvm_ffi=True,
+        )
+        mBiasOff = from_dlpack(
+            torch.empty((), dtype=torch.int32, device=device),
+            assumed_align=4, enable_tvm_ffi=True,
+        )
+
+    cu_q = torch.zeros(S + 1, dtype=torch.int32, device=device)
+    cu_k = torch.zeros(S + 1, dtype=torch.int32, device=device)
+    mCuQ = from_dlpack(cu_q, assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
+    mCuK = from_dlpack(cu_k, assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
+
+    import cuda.bindings.driver as cuda_driver
+    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    softmax_scale = cutlass.Float32(1.0 / (head_dim ** 0.5))
+    max_seqlen_q = cutlass.Int32(max(m_block, 8))
+
+    return cute.compile(
+        inst.forward_varlen,
+        mQ, mK, mV, mO, mBias, mBiasOff, mCuQ, mCuK,
+        max_seqlen_q, softmax_scale, stream,
+        options="--enable-tvm-ffi",
+    )
+
+
+def get_compiled_fmha_varlen(
+    *,
+    head_dim: int,
+    dtype_str: str,
+    num_heads: int,
+    num_kv_heads: int,
+    has_bias: bool,
+    m_block: int = 64,
+    n_block: int = 64,
+    num_threads: int = 128,
+    bias_aligned: bool = False,
+):
+    """Public accessor for the compiled varlen kernel."""
+    cap = _capability_probe()[0]
+    if cap is None:
+        raise RuntimeError("no CUDA device available")
+    return _compiled_fmha_varlen(
+        cap, head_dim, dtype_str, num_heads, num_kv_heads,
+        has_bias, m_block, n_block, num_threads, bias_aligned,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Warmup helper
 # ---------------------------------------------------------------------------
 

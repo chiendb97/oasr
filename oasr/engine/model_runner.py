@@ -193,6 +193,32 @@ class ModelRunner:
         output_lengths = masks.squeeze(1).sum(dim=-1).to(torch.int32)
         return log_probs, output_lengths
 
+    @torch.no_grad()
+    def forward_offline_packed(
+        self,
+        features: torch.Tensor,
+        lengths: torch.Tensor,
+        use_varlen: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-segment-isolated offline forward (packing / length-bucketing).
+
+        Same signature and return shapes as :meth:`forward_offline` — the
+        ``(B, T, F)`` micro-batch is treated as one pack: subsampling runs
+        normal-batched, the post-subsampling states are concatenated into one
+        gapless row, the conformer layers run once with per-segment attention
+        + conv isolation, and the result is unpacked back to ``(B, T_out, V)``
+        so the CTC decode path is unchanged.
+
+        ``use_varlen=True`` runs the gapless varlen attention (sequence
+        packing); ``False`` runs the batched-per-segment dense attention
+        (length-bucketing).
+        """
+        log_probs, masks = self._model.forward_packed(
+            features, lengths, use_varlen=use_varlen,
+        )
+        output_lengths = masks.squeeze(1).sum(dim=-1).to(torch.int32)
+        return log_probs, output_lengths
+
     # ------------------------------------------------------------------
     # Streaming cache lifecycle
     # ------------------------------------------------------------------
