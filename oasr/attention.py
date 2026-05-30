@@ -37,7 +37,7 @@ from .api_logging import oasr_api
 from .jit.attention import get_compiled_fmha, select_backend
 
 
-__all__ = ["fmha"]
+__all__ = ["fmha", "fmha_varlen"]
 
 
 # ---------------------------------------------------------------------------
@@ -54,11 +54,13 @@ try:
     import cutlass as _cutlass
     _CUstream = _cuda_driver.CUstream
     _Float32 = _cutlass.Float32
+    _Int32 = _cutlass.Int32
 except Exception:
     _cuda_driver = None
     _cutlass = None
     _CUstream = None
     _Float32 = None
+    _Int32 = None
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +191,48 @@ def _gather_paged_kv(
         B, num_blocks_per_seq * block_size, H_kv, D
     ).permute(0, 2, 1, 3)
     return k_full, v_full
+
+
+def _sdpa_varlen_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    attn_bias: Optional[torch.Tensor],
+    bias_offsets: Optional[torch.Tensor],
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Varlen (sequence-packed) attention reference via per-segment SDPA.
+
+    Packed layout: ``q`` is ``(total_q, H, D)``, ``k``/``v`` are
+    ``(total_k, H_kv, D)``; ``cu_seqlens_*`` are ``(S+1,)`` prefix sums.  Each
+    segment attends only to itself.  ``attn_bias`` (when present) is the packed
+    block-diagonal rel-pos bias: a flat buffer whose segment ``s`` block is
+    ``(H, T_q_s, T_k_s)`` row-major at ``bias_offsets[s]`` (already pre-scaled,
+    SDPA semantics).  Writes into ``out`` ``(total_q, H, D)`` and returns it.
+    """
+    H = q.size(1)
+    cu_q = cu_seqlens_q.tolist()
+    cu_k = cu_seqlens_k.tolist()
+    bo = bias_offsets.tolist() if bias_offsets is not None else None
+    for s in range(len(cu_q) - 1):
+        qa, qb = cu_q[s], cu_q[s + 1]
+        ka, kb = cu_k[s], cu_k[s + 1]
+        if qb == qa:
+            continue
+        # (T, heads, D) -> (1, heads, T, D)
+        qs = q[qa:qb].transpose(0, 1).unsqueeze(0)
+        ks = k[ka:kb].transpose(0, 1).unsqueeze(0)
+        vs = v[ka:kb].transpose(0, 1).unsqueeze(0)
+        if attn_bias is not None and bo is not None:
+            bias_s = attn_bias[bo[s]:bo[s + 1]].view(1, H, qb - qa, kb - ka)
+        else:
+            bias_s = None
+        out_s = _sdpa_reference(qs, ks, vs, softmax_scale, bias_s, None)
+        out[qa:qb] = out_s.squeeze(0).transpose(0, 1)
+    return out
 
 
 def _sdpa_reference(
@@ -428,6 +472,184 @@ def fmha(
         cache_seqlens=cache_seqlens,
         block_table=block_table,
     )
+
+
+# ---------------------------------------------------------------------------
+# Variable-length (sequence-packed) attention
+# ---------------------------------------------------------------------------
+
+
+def _validate_varlen_inputs(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, attn_bias, bias_offsets, out,
+) -> None:
+    if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+        raise ValueError(
+            "varlen q/k/v must be packed 3-D (total, H, D); got "
+            f"{tuple(q.shape)} / {tuple(k.shape)} / {tuple(v.shape)}"
+        )
+    if k.shape != v.shape:
+        raise ValueError(f"k and v must match: {tuple(k.shape)} vs {tuple(v.shape)}")
+    if q.size(2) != k.size(2):
+        raise ValueError("q and k head_dim must match")
+    H, H_kv = q.size(1), k.size(1)
+    if H % H_kv != 0:
+        raise ValueError(f"H ({H}) must be divisible by H_kv ({H_kv})")
+    for name, cu in (("cu_seqlens_q", cu_seqlens_q), ("cu_seqlens_k", cu_seqlens_k)):
+        if cu.dim() != 1 or cu.numel() < 2:
+            raise ValueError(f"{name} must be 1-D with >= 2 entries")
+    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
+        raise ValueError("cu_seqlens_q and cu_seqlens_k must have equal length")
+    if (attn_bias is None) != (bias_offsets is None):
+        raise ValueError("attn_bias and bias_offsets must be provided together")
+    if out is not None and (out.shape != q.shape or out.dtype != q.dtype):
+        raise ValueError("out must match q in shape/dtype")
+
+
+@oasr_api
+def fmha_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: float,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    attn_bias: Optional[torch.Tensor] = None,
+    bias_offsets: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    validate: bool = True,
+) -> torch.Tensor:
+    """Variable-length (sequence-packed) fused multi-head attention.
+
+    Parameters
+    ----------
+    q : Tensor
+        ``(total_q, H, D)`` packed query (segments concatenated, no batch dim).
+    k, v : Tensor
+        ``(total_k, H_kv, D)`` packed key/value.
+    softmax_scale : float
+        Softmax scale (typically ``1/sqrt(D)``).
+    cu_seqlens_q, cu_seqlens_k : Tensor
+        ``(S+1,)`` int32 prefix sums of per-segment lengths.  Segment ``s``
+        spans ``[cu[s], cu[s+1])`` and attends only to itself.
+    max_seqlen_q, max_seqlen_k : int
+        Host-side max segment lengths (size the kernel tile loop / pos-emb).
+    attn_bias : Tensor, optional
+        Packed block-diagonal additive bias (pre-scaled, SDPA semantics): a
+        flat buffer whose segment-``s`` block is ``(H, T_q_s, T_k_s)``
+        row-major at ``bias_offsets[s]``.
+    bias_offsets : Tensor, optional
+        ``(S+1,)`` int64 prefix sum of ``H * T_q_s * T_k_s`` block sizes.
+    out : Tensor, optional
+        Pre-allocated ``(total_q, H, D)`` output.
+
+    Returns
+    -------
+    out : Tensor
+        ``(total_q, H, D)``.
+    """
+    if validate:
+        _validate_varlen_inputs(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, attn_bias, bias_offsets, out,
+        )
+        if attn_bias is not None and attn_bias.dtype != q.dtype:
+            attn_bias = attn_bias.to(q.dtype)
+        if cu_seqlens_q.dtype != torch.int32:
+            cu_seqlens_q = cu_seqlens_q.to(torch.int32)
+        if cu_seqlens_k.dtype != torch.int32:
+            cu_seqlens_k = cu_seqlens_k.to(torch.int32)
+
+    if out is None:
+        out = torch.empty(
+            q.shape, dtype=q.dtype, device=q.device,
+            memory_format=torch.contiguous_format,
+        )
+
+    backend = select_backend()
+    if (
+        backend == "cute"
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and _varlen_cute_available()
+    ):
+        return _call_cute_dsl_varlen(
+            q, k, v, out,
+            softmax_scale=softmax_scale,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            attn_bias=attn_bias, bias_offsets=bias_offsets,
+        )
+
+    return _sdpa_varlen_reference(
+        q, k, v, softmax_scale, cu_seqlens_q, cu_seqlens_k,
+        attn_bias, bias_offsets, out,
+    )
+
+
+def _varlen_cute_available() -> bool:
+    """Whether the CuteDSL varlen kernel path is wired."""
+    return _Int32 is not None
+
+
+def _call_cute_dsl_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    softmax_scale: float,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    attn_bias: Optional[torch.Tensor],
+    bias_offsets: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Invoke the compiled CuteDSL varlen kernel on packed inputs.
+
+    Single launch over the whole pack: grid ``(ceil(max_seqlen_q/M), S, H)``;
+    each CTA builds per-segment ``(1, heads, seqlen, D)`` views via
+    ``domain_offset`` so the dense mainloop + helpers run unchanged with zero
+    attention padding and no host-side scatter.
+    """
+    from .jit.attention import get_compiled_fmha_varlen
+
+    H, D = q.size(1), q.size(2)
+    H_kv = k.size(1)
+    dtype_str = "float16" if q.dtype is torch.float16 else "bfloat16"
+    has_bias = attn_bias is not None
+
+    fn = get_compiled_fmha_varlen(
+        head_dim=D, dtype_str=dtype_str,
+        num_heads=H, num_kv_heads=H_kv,
+        has_bias=has_bias, bias_aligned=False,
+    )
+
+    q_t = _ensure_canonical(q)
+    k_t = _ensure_canonical(k)
+    v_t = _ensure_canonical(v)
+    o_t = _ensure_canonical(out)
+    cu_q = _ensure_canonical(cu_seqlens_q)
+    cu_k = _ensure_canonical(cu_seqlens_k)
+
+    if has_bias:
+        bias_t = _ensure_canonical(attn_bias)
+        if bias_offsets.dtype != torch.int32:
+            bias_offsets = bias_offsets.to(torch.int32)
+        bias_off_t = _ensure_canonical(bias_offsets)
+    else:
+        bias_t = _get_dummy_bias(q.dtype, q.device)
+        bias_off_t = _get_dummy_block_table(q.device)
+
+    stream = _CUstream(torch.cuda.current_stream().cuda_stream)
+    fn(
+        q_t, k_t, v_t, o_t, bias_t, bias_off_t, cu_q, cu_k,
+        _Int32(int(max_seqlen_q)), _Float32(float(softmax_scale)), stream,
+    )
+    if o_t.data_ptr() != out.data_ptr():
+        out.copy_(o_t)
+    return out
 
 
 # ---------------------------------------------------------------------------

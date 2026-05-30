@@ -31,7 +31,10 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 
-SUBROUTINES = ["offline", "streaming", "offline_wfst", "streaming_wfst"]
+SUBROUTINES = [
+    "offline", "streaming", "offline_wfst", "streaming_wfst",
+    "offline_packing", "offline_length_batch",
+]
 
 # ---------------------------------------------------------------------------
 # Default sweep configs
@@ -53,6 +56,12 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
     ],
     "streaming_wfst": [
         {"num_utterances": 10, "chunk_size": 16},
+    ],
+    "offline_packing": [
+        {"num_utterances": 10, "max_batch_size": 32},
+    ],
+    "offline_length_batch": [
+        {"num_utterances": 10, "max_batch_size": 32},
     ],
 }
 
@@ -357,6 +366,8 @@ def _run_config(
     num_iters: int,
     output: OutputWriter,
     use_cuda_graphs: Optional[bool] = None,
+    max_packed_frames: int = 6000,
+    max_batch_frames: Optional[int] = None,
 ) -> None:
     """Run one benchmark configuration and write results to *output*."""
 
@@ -365,6 +376,8 @@ def _run_config(
 
     is_streaming = subroutine.startswith("streaming")
     is_wfst = subroutine.endswith("wfst")
+    is_packing = subroutine == "offline_packing"
+    is_length_batch = subroutine == "offline_length_batch"
 
     if is_wfst and fst_file is None:
         print(f"  [SKIP] {subroutine}: --wfst-path required but not provided")
@@ -424,9 +437,23 @@ def _run_config(
                 decoder_type=decoder_type,
                 fst_path=fst_file,
                 max_batch_size=max_batch_size,
+                enable_sequence_packing=is_packing,
+                max_packed_frames=max_packed_frames,
+                max_batch_frames=max_batch_frames if is_length_batch else None,
             )
             engine = ASREngine(cfg)
-            shape_str = f"N={n}, batch={max_batch_size}, avg_dur={avg_dur:.1f}s"
+            if is_packing:
+                shape_str = (
+                    f"N={n}, pack_frames={max_packed_frames}, "
+                    f"avg_dur={avg_dur:.1f}s"
+                )
+            elif is_length_batch:
+                shape_str = (
+                    f"N={n}, batch_frames={max_batch_frames}, "
+                    f"max_bs={max_batch_size}, avg_dur={avg_dur:.1f}s"
+                )
+            else:
+                shape_str = f"N={n}, batch={max_batch_size}, avg_dur={avg_dur:.1f}s"
             _warmup_engine(engine, waveforms, is_streaming=False)
             median_ms, std_ms, rtf = _time_offline(
                 engine, waveforms, durations, num_iters)
@@ -509,6 +536,20 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
         default=-1,
         help="Left context chunks for streaming (-1 = unlimited; default: -1)",
     )
+    parser.add_argument(
+        "--max-packed-frames",
+        type=int,
+        default=6000,
+        help="Post-subsampling token budget per packed row for the "
+             "offline_packing subroutine (default: 6000).",
+    )
+    parser.add_argument(
+        "--max-batch-frames",
+        type=int,
+        default=None,
+        help="Padded-frame budget (max_len * batch) for the "
+             "offline_length_batch subroutine (input feature frames).",
+    )
 
 
 def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
@@ -521,6 +562,8 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     max_batch_size = getattr(args, "max_batch_size", None)
     chunk_size = getattr(args, "chunk_size", None)
     num_left_chunks = getattr(args, "num_left_chunks", -1)
+    max_packed_frames = getattr(args, "max_packed_frames", 6000) or 6000
+    max_batch_frames = getattr(args, "max_batch_frames", None)
     dtype_str = getattr(args, "dtype", "float16") or "float16"
     # E2E benchmarks are slower — default to fewer iterations
     num_iters = min(getattr(args, "num_iters", 5), 20)
@@ -553,6 +596,8 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
             dtype=dtype,
             num_iters=num_iters,
             output=output,
+            max_packed_frames=max_packed_frames,
+            max_batch_frames=max_batch_frames,
         )
 
 
@@ -568,7 +613,12 @@ def _resolve_configs(
     max_batch_size = getattr(args, "max_batch_size", None)
     chunk_size = getattr(args, "chunk_size", None)
 
-    if subroutine in ("offline", "offline_wfst") and max_batch_size is not None:
+    if (
+        subroutine in (
+            "offline", "offline_wfst", "offline_packing", "offline_length_batch",
+        )
+        and max_batch_size is not None
+    ):
         return [{
             "num_utterances": num_utterances or 10,
             "max_batch_size": max_batch_size,

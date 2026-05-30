@@ -21,6 +21,7 @@ def _make_pipeline(preferred_sizes: Optional[Sequence[int]], mb: int = 8) -> Off
     """Build a pipeline with stub IO — only ``_split_chunks`` is exercised."""
     inp = SimpleNamespace(_config=SimpleNamespace(dtype=torch.float32))
     return OfflinePipeline(
+        scheduler=SimpleNamespace(),
         input_processor=inp,
         model_runner=SimpleNamespace(),
         output_processor=SimpleNamespace(),

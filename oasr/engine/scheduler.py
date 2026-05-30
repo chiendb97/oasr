@@ -312,6 +312,7 @@ class Scheduler:
 
         ratio = cfg.length_bucket_ratio
         pad_cap = cfg.max_offline_pad_ratio
+        frame_cap = cfg.max_batch_frames
 
         i = 0
         while i < len(q) and len(batch) < cap:
@@ -321,6 +322,14 @@ class Scheduler:
             new_max = max(max_len, cand_len)
 
             if ratio > 0 and new_min / new_max < ratio:
+                i += 1
+                continue
+
+            # Padded-frame budget: would adding this request push the padded
+            # width ``new_max * (batch_size + 1)`` over ``max_batch_frames``?
+            # The anchor always ships even if it alone exceeds the budget — a
+            # single utterance can't be split in non-packing mode.
+            if frame_cap is not None and new_max * (len(batch) + 1) > frame_cap:
                 i += 1
                 continue
 

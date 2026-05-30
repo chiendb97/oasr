@@ -141,6 +141,18 @@ class EngineConfig:
     # default is permissive enough to admit e.g. LJSpeech (~1–10 s spread) in a
     # single batch but still guards against pathological mixes.
     max_offline_pad_ratio: float = 4.0
+    # Length-aware batching: hard cap on **padded** input frames per offline
+    # micro-batch, i.e. ``max_len * batch_size`` in pre-subsampling feature
+    # frames (the same unit as ``Request.num_frames``).  ``None`` (default)
+    # bounds each :class:`OfflinePipeline` micro-batch solely by
+    # ``max_batch_size``.  When set, length-sorted requests are greedily grouped
+    # into micro-batches bounded by this padded-frame budget (via
+    # ``OfflinePipeline._split_by_frames``) so a mixed short/long pool never
+    # forms an over-padded forward — exact-equivalent to the standard padded
+    # forward, only the batch composition changes.  Independent of sequence
+    # packing (``enable_sequence_packing``), which packs to a gapless varlen
+    # forward instead; packing takes precedence when both are set.
+    max_batch_frames: Optional[int] = None
     # Maximum time (seconds) a waiting request may sit in the queue before it
     # is flushed even if no ideal length-bucket peer has arrived.  Prevents
     # starvation of outlier-length requests under heavy load.
@@ -187,6 +199,25 @@ class EngineConfig:
     # falls back to the CPU pool path — useful on GPUs that are already
     # saturated by the model forward.
     offline_gpu_feature_extraction: bool = True
+
+    # Sequence packing (offline only).  When ``True`` the offline pipeline
+    # concatenates several utterances into one packed encoder forward instead
+    # of padding each micro-batch to its max length.  Attention is restricted
+    # to same-utterance tokens via ``cu_seqlens`` (varlen FMHA on the cute
+    # path, per-segment SDPA fallback otherwise); the depthwise conv is
+    # isolated per-segment with zero gap-frames; positional encoding + rel-pos
+    # bias are rebuilt per segment.  Subsampling (``embed``) still runs in
+    # normal batched mode so the Conv2d receptive field never crosses an
+    # utterance boundary.  Mutually independent of ``max_batch_frames`` (that
+    # governs the *non*-packing length-aware mode).
+    enable_sequence_packing: bool = False
+    # Token budget for one packed encoder row, in **post-subsampling** encoder
+    # frames (≈ input_frames / 4).  ``PackingPipeline`` greedily fills a packed
+    # row with whole utterances until the next one would push the summed
+    # post-subsampling length (plus per-segment conv gap-frames) over this
+    # budget, then spills into another row.  Sized to keep one packed forward
+    # near the kernel's efficient occupancy without exhausting smem/registers.
+    max_packed_frames: int = 8192
 
     # Paged KV cache
     max_num_blocks: int = 2048
@@ -275,9 +306,20 @@ class EngineConfig:
     def __post_init__(self) -> None:
         if self.service_mode not in ("streaming", "offline"):
             raise ValueError(
-                f"service_mode must be 'streaming' or 'offline', got "
-                f"{self.service_mode!r}"
+                f"service_mode must be 'streaming' or 'offline', got " f"{self.service_mode!r}"
             )
+        if self.max_batch_frames is not None and self.max_batch_frames < 1:
+            raise ValueError(
+                f"max_batch_frames must be a positive int or None, got "
+                f"{self.max_batch_frames!r}"
+            )
+        if self.enable_sequence_packing:
+            if self.service_mode != "offline":
+                raise ValueError("enable_sequence_packing requires service_mode='offline'")
+            if self.max_packed_frames < 1:
+                raise ValueError(
+                    f"max_packed_frames must be a positive int, got " f"{self.max_packed_frames!r}"
+                )
         if self.feature_config is None:
             self.feature_config = FeatureConfig(dither=0.0)
         if self.gpu_decoder_config is None:
@@ -289,13 +331,10 @@ class EngineConfig:
             cleaned = sorted({int(v) for v in self.preferred_batch_size})
             if not cleaned:
                 raise ValueError(
-                    "preferred_batch_size must contain at least one value, "
-                    "or be None to disable"
+                    "preferred_batch_size must contain at least one value, " "or be None to disable"
                 )
             if cleaned[0] < 1:
-                raise ValueError(
-                    f"preferred_batch_size values must be >= 1, got {cleaned}"
-                )
+                raise ValueError(f"preferred_batch_size values must be >= 1, got {cleaned}")
             if cleaned[-1] > self.max_batch_size:
                 raise ValueError(
                     f"preferred_batch_size values must be <= max_batch_size "
@@ -361,7 +400,9 @@ class EngineConfig:
         """
         enc = model_config.encoder
         n_kv_head = enc.n_kv_head if enc.n_kv_head is not None else enc.attention_heads
-        head_dim = enc.head_dim if enc.head_dim is not None else enc.output_size // enc.attention_heads
+        head_dim = (
+            enc.head_dim if enc.head_dim is not None else enc.output_size // enc.attention_heads
+        )
         return CacheConfig(
             num_layers=enc.num_blocks,
             n_kv_head=n_kv_head,

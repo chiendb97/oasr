@@ -93,8 +93,7 @@ class ModelRunner:
         # bucket) shape. Eager fallback is used for non-CUDA devices, when
         # graphs are disabled, or for partial/final windows.
         self._use_cuda_graphs = (
-            config.use_cuda_graphs
-            and torch.device(config.device).type == "cuda"
+            config.use_cuda_graphs and torch.device(config.device).type == "cuda"
         )
         if self._use_cuda_graphs:
             self._graph_cache = GraphedEncoderForward(
@@ -142,9 +141,7 @@ class ModelRunner:
             return
         cap = self._cache_config.max_batch_size
         if seen[-1] > cap:
-            raise ValueError(
-                f"prewarm batch size {seen[-1]} exceeds max_batch_size {cap}"
-            )
+            raise ValueError(f"prewarm batch size {seen[-1]} exceeds max_batch_size {cap}")
 
         device = self._att_mgr.block_table.device
         window = self._config.decoding_window
@@ -156,8 +153,12 @@ class ModelRunner:
             offsets = torch.zeros(B, dtype=torch.int32, device=device)
             xs = torch.zeros(B, window, feat_dim, dtype=dtype, device=device)
             self._graph_cache.replay(
-                B, window, 0,
-                xs=xs, slot_ids=slot_ids, offsets=offsets,
+                B,
+                window,
+                0,
+                xs=xs,
+                slot_ids=slot_ids,
+                offsets=offsets,
             )
 
     # ------------------------------------------------------------------
@@ -190,6 +191,26 @@ class ModelRunner:
         hidden, masks = self._model.encoder(features, lengths)
         log_probs = self._model.ctc(hidden)  # (B, T_out, V)
         # masks: (B, 1, T_out) with True = valid
+        output_lengths = masks.squeeze(1).sum(dim=-1).to(torch.int32)
+        return log_probs, output_lengths
+
+    @torch.no_grad()
+    def forward_offline_packed(
+        self,
+        features: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sequence-packing offline forward (gapless varlen attention).
+
+        Same signature and return shapes as :meth:`forward_offline` — the
+        ``(B, T, F)`` micro-batch is treated as one pack: subsampling runs
+        normal-batched, the post-subsampling states are concatenated into one
+        gapless row, the conformer layers run once with per-segment varlen
+        attention + conv isolation, and the result is unpacked back to
+        ``(B, T_out, V)`` so the CTC decode path is unchanged.  Bit-exact to
+        ``B=1`` inference.
+        """
+        log_probs, masks = self._model.forward_packed(features, lengths)
         output_lengths = masks.squeeze(1).sum(dim=-1).to(torch.int32)
         return log_probs, output_lengths
 
@@ -324,7 +345,11 @@ class ModelRunner:
             # block-mask is built from per-stream cache_seqlens, and the
             # encoder builds per-stream pos_emb when offsets differ.
             self._forward_batched_paged(
-                batchable, window, stride, context, results,
+                batchable,
+                window,
+                stride,
+                context,
+                results,
             )
 
         for req in fallback:
@@ -361,9 +386,9 @@ class ModelRunner:
         B_active = len(group)
         stream_ids = [req.stream_id for req in group]
         slot_ids_host = [req.slot_id for req in group]
-        assert all(s is not None for s in slot_ids_host), (
-            "all batched streams must have an allocated slot_id"
-        )
+        assert all(
+            s is not None for s in slot_ids_host
+        ), "all batched streams must have an allocated slot_id"
         device = self._att_mgr.block_table.device
         slot_ids_gpu = torch.tensor(slot_ids_host, dtype=torch.long, device=device)
 
@@ -378,8 +403,7 @@ class ModelRunner:
         #    how K/V are written through PagedKVCache).
         max_offset = max(req.offset for req in group)
         feature_chunks = [
-            req.feature_buffer[req.feature_cursor: req.feature_cursor + window]
-            for req in group
+            req.feature_buffer[req.feature_cursor : req.feature_cursor + window] for req in group
         ]
         xs = torch.stack(feature_chunks, dim=0)  # (B, window, F)
         cnn_cache = SlotCnnCache(buffer=self._cnn_mgr.buffer, slot_ids=slot_ids_gpu)
@@ -388,7 +412,8 @@ class ModelRunner:
         #    graphed path; the eager fallback accepts the same tensor).
         offsets_gpu = torch.tensor(
             [req.offset for req in group],
-            dtype=torch.int32, device=device,
+            dtype=torch.int32,
+            device=device,
         )
 
         # 4. Encoder forward — graph replay for any captured (B, bucket)
@@ -402,15 +427,22 @@ class ModelRunner:
         log_probs = None
         if self._use_cuda_graphs and self._graph_cache is not None:
             log_probs = self._graph_cache.replay(
-                B_active, xs.size(1), cache_t1_bucket,
-                xs=xs, slot_ids=slot_ids_gpu, offsets=offsets_gpu,
+                B_active,
+                xs.size(1),
+                cache_t1_bucket,
+                xs=xs,
+                slot_ids=slot_ids_gpu,
+                offsets=offsets_gpu,
             )
         if log_probs is None:
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_gpu)
             for c in batched_att_caches:
                 c.host_seqlen_max = max_offset
             log_probs = self._model.forward_chunk_paged(
-                xs, offsets_gpu, batched_att_caches, cnn_cache,
+                xs,
+                offsets_gpu,
+                batched_att_caches,
+                cnn_cache,
                 cache_t1=max_offset,
             )
         actual_frames = log_probs.size(1)
@@ -424,7 +456,7 @@ class ModelRunner:
         for b, req in enumerate(group):
             req.offset += actual_frames
             req.feature_cursor += stride
-            results[req.request_id] = log_probs[b: b + 1]
+            results[req.request_id] = log_probs[b : b + 1]
         nvtx_pop()
         nvtx_pop()  # batched_paged
 
@@ -450,7 +482,7 @@ class ModelRunner:
 
         available = req.feature_frames - req.feature_cursor
         end = req.feature_cursor + min(window, available)
-        chunk = req.feature_buffer[req.feature_cursor: end].unsqueeze(0)
+        chunk = req.feature_buffer[req.feature_cursor : end].unsqueeze(0)
         is_final_window = (
             req.audio_final
             and not req.audio_chunks
@@ -482,15 +514,22 @@ class ModelRunner:
         log_probs = None
         if self._use_cuda_graphs and self._graph_cache is not None:
             log_probs = self._graph_cache.replay(
-                1, chunk.size(1), cache_t1_bucket,
-                xs=chunk, slot_ids=slot_ids_gpu, offsets=offsets_gpu,
+                1,
+                chunk.size(1),
+                cache_t1_bucket,
+                xs=chunk,
+                slot_ids=slot_ids_gpu,
+                offsets=offsets_gpu,
             )
         if log_probs is None:
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_gpu)
             for c in batched_att_caches:
                 c.host_seqlen_max = req.offset
             log_probs = self._model.forward_chunk_paged(
-                chunk, offsets_gpu, batched_att_caches, cnn_cache,
+                chunk,
+                offsets_gpu,
+                batched_att_caches,
+                cnn_cache,
                 cache_t1=req.offset,
             )
         nvtx_pop()
