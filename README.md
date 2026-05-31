@@ -10,18 +10,26 @@ Easy, fast, and cheap ASR serving for everyone
 
 ---
 
-OASR delivers fast, scalable ASR inference on NVIDIA GPUs. It pairs custom CUDA kernels with a dynamic-batching inference engine and a production-ready serving frontend, so you can transcribe audio offline or stream it in real time over HTTP or gRPC.
+OASR is a fast and easy-to-use framework for the inference and serving of automatic speech recognition (ASR) models. It is designed to deliver low-latency, high-throughput inference.
 
 ---
 
 ## Key Features
 
-- **High throughput** — paged KV cache, dynamic length-bucketed batching, and CUDA Graph capture of the streaming encoder.
-- **Streaming and offline** — one engine handles both, with mixed pools in a single step loop.
-- **Production serving** — Rust `oasr-server` front-end (built into the wheel via PyO3) exposing an HTTP API and a gRPC bidi streaming RPC.
-- **Multiple decoders** — CTC greedy, CTC prefix beam (CPU & GPU), and WFST beam search.
-- **Broad GPU support** — Volta through Blackwell (SM70–SM120), with FP16 / BF16 / FP32 paths.
-- **Drop-in Python API** — functional and `nn.Module` wrappers for normalization, convolution, GEMM, attention, and feature extraction.
+OASR is fast with:
+
+- Custom CUDA / CUTLASS kernels for GEMM, attention, normalization, convolution, feature extraction, and decoding
+- Paged KV cache for streaming attention
+- Dynamic batching of offline and streaming requests, with length-bucketing and sequence packing for offline
+- CUDA Graph capture of the steady-state streaming encoder
+- FP16 / BF16 / FP32 paths across Volta through Blackwell (SM70–SM120)
+
+OASR is flexible and easy to use with:
+
+- A single engine for both offline and streaming inference
+- Seamless integration with popular Hugging Face, WeNet, and Icefall models
+- Multiple decoders: CTC greedy, CTC prefix beam (CPU & GPU), and WFST beam search
+- A production Rust frontend with HTTP and gRPC APIs
 
 ## Supported Models
 
@@ -43,7 +51,7 @@ OASR delivers fast, scalable ASR inference on NVIDIA GPUs. It pairs custom CUDA 
 - Python ≥ 3.8
 - CMake ≥ 3.18
 - NVIDIA GPU (SM70 or newer)
-- Rust toolchain + `protobuf-compiler` (to build the serving frontend during `pip install`)
+- Rust toolchain + `protobuf-compiler`
 
 ### Install
 
@@ -53,28 +61,14 @@ pip install -e .
 
 # Target specific GPU architectures
 CUDA_ARCHITECTURES="80;86;90" pip install -e .
-```
 
-`pip install` builds three things into the package: the `_C` decoder extension
-(CMake/pybind11), the `oasr._core` serving extension (Rust, via setuptools-rust),
-and the `oasr-server` console script that runs it. A Rust toolchain and
-`protobuf-compiler` must be on `PATH` at build time; with `--no-build-isolation`
-also `pip install "setuptools-rust>=1.10"` first.
-
-Optional extras:
-
-```bash
+# Optional extras
 pip install -e ".[audio]"    # torchaudio, soundfile, librosa, kaldifeat
 pip install -e ".[serving]"  # serving client libs (used by bench_service.py)
 pip install -e ".[wfst]"     # k2, kaldilm (WFST decoder)
-```
 
-The Rust workspace can also be built standalone (produces the same server as a
-plain binary at `rust/target/release/oasr-server`):
-
-```bash
+# Optional: standalone server binary at rust/target/release/oasr-server
 cd rust && cargo build --release
-# Requires: protobuf-compiler, a C/C++ toolchain
 ```
 
 ---
@@ -82,6 +76,8 @@ cd rust && cargo build --release
 ## Quick Start
 
 An engine instance is pinned to a single mode for its lifetime via `EngineConfig.service_mode` (`"streaming"` — the default — or `"offline"`); mismatched requests raise `ValueError`.
+
+The checkpoint directory should contain `final.pt`, `train.yaml`, `global_cmvn`, and optionally a tokenizer `.model` file plus `units.txt`.
 
 ### Offline transcription
 
@@ -118,30 +114,18 @@ engine.feed_chunk(rid, last_chunk, is_last=True)
 final = engine.run()
 ```
 
-The checkpoint directory should contain `final.pt`, `train.yaml`, `global_cmvn`, and optionally a tokenizer `.model` file plus `units.txt`.
-
 ---
 
 ## Serving
 
 `oasr-server` runs one in-process `ASREngine` per process. `--service-mode` pins the engine to either `offline` (sync `Recognize`) or `streaming` (bidi `StreamingRecognize`) for its entire lifetime; the mismatched RPC returns `FAILED_PRECONDITION`. Scale horizontally by launching one process per GPU.
 
-`pip install` puts the `oasr-server` console script on `PATH` (it loads the
-`oasr._core` extension). Use it directly — or the standalone
-`rust/target/release/oasr-server` binary if you built the workspace with cargo.
-
 ```bash
-# Offline server
 oasr-server \
     --ckpt-dir /path/to/checkpoint \
-    --service-mode offline \
-    --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051
-
-# Streaming server — bidi gRPC StreamingRecognize
-oasr-server \
-    --ckpt-dir /path/to/checkpoint \
-    --service-mode streaming \
-    --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051
+    --service-mode offline \              # or: streaming
+    --http-bind 127.0.0.1:8080 \
+    --grpc-bind 127.0.0.1:50051
 ```
 
 ### Endpoints
@@ -159,7 +143,7 @@ REST is synchronous only — streaming clients must use the gRPC `StreamingRecog
 
 ### HTTP example
 
-Audio is carried inline as base64 in `audio.content`.
+Audio is carried inline as base64 in `audio.content`. Accepted `encoding` values: `LINEAR16` (16-bit PCM mono), `LINEAR32F` (32-bit float PCM mono), and `WAV`; other codecs return `UNIMPLEMENTED`.
 
 ```bash
 B64=$(base64 -w0 audio.wav)
@@ -169,8 +153,6 @@ curl -sS -X POST http://127.0.0.1:8080/v1/speech:recognize \
            '{config:{encoding:"WAV",sampleRateHertz:16000,languageCode:"en-US"},
              audio:{content:$b64}}')"
 ```
-
-Accepted `encoding` values: `LINEAR16` (16-bit PCM mono), `LINEAR32F` (32-bit float PCM mono), and `WAV`. Other codecs return `UNIMPLEMENTED`.
 
 ### gRPC streaming
 
@@ -195,18 +177,6 @@ grpcurl -plaintext -import-path rust/proto -proto oasr_speech_v1.proto \
 | [`docs/serving.md`](docs/serving.md)                 | Serving frontend, wire format, deployment             |
 | [`docs/benchmarks.md`](docs/benchmarks.md)           | Engine and service benchmark recipes                  |
 | [`docs/autotuning.md`](docs/autotuning.md)           | Kernel auto-tuning API and cache format               |
-
----
-
-## Testing
-
-```bash
-# Run all Python tests
-pytest tests/
-
-# Skip slow tests
-pytest tests/ -m "not slow"
-```
 
 ---
 
