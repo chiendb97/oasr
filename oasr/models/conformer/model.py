@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import logging
 import math
-from typing import List, Optional, Tuple, Union
+from typing import List, Mapping, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 import oasr
@@ -18,8 +20,12 @@ from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.slot_cnn import SlotCnnCache
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention
 from oasr.utils import get_norm, get_norm_activation
+from ..base import BaseAsrModel, BaseEncoder
+from ..heads.ctc import CTCHead
 from .config import ConformerEncoderConfig, ConformerModelConfig
 from .packing import PackedLayout, build_packed_layout, pack_hidden, unpack_hidden
+
+logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -43,29 +49,8 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
     return row.unsqueeze(0) < lengths.unsqueeze(1)
 
 
-class CTC(torch.nn.Module):
-    """CTC module: fused (Linear -> log_softmax) via oasr.gemm_log_softmax."""
-
-    def __init__(
-        self,
-        vocab_size: int,
-        encoder_output_size: int,
-    ):
-        """Construct CTC module
-        Args:
-            vocab_size: number of output classes
-            encoder_output_size: number of encoder projection units
-        """
-        super().__init__()
-        self.ctc_lo = Linear(encoder_output_size, vocab_size)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Calculate CTC loss.
-
-        Args:
-            hidden_states: batch of hidden state sequences (B, T, D)
-        """
-        return oasr.gemm_log_softmax(hidden_states, self.ctc_lo.weight, self.ctc_lo.bias)
+# Backwards-compatible alias; the CTC head now lives in oasr.models.heads.ctc.
+CTC = CTCHead
 
 
 # -----------------------------------------------------------------------------
@@ -594,8 +579,11 @@ class ConformerEncoderLayer(nn.Module):
 # -----------------------------------------------------------------------------
 
 
-class ConformerEncoder(nn.Module):
+class ConformerEncoder(BaseEncoder):
     """Conformer encoder module."""
+
+    supports_packing = True
+    supports_paged_streaming = True
 
     def __init__(
         self,
@@ -604,6 +592,9 @@ class ConformerEncoder(nn.Module):
     ):
         super().__init__()
         self.global_cmvn = global_cmvn
+        self._output_size = config.output_size
+        # Depthwise-conv left-context kernel for streaming; 1 == no CNN cache.
+        self._conv_kernel_size = config.cnn_module_kernel if config.use_cnn_module else 1
         if config.input_layer == "conv2d":
             self.embed = Conv2dSubsampling(
                 config.input_size,
@@ -717,6 +708,16 @@ class ConformerEncoder(nn.Module):
     def head_dim(self) -> int:
         """Per-head key/value dimension."""
         return self.encoders[0].self_attn.d_k  # type: ignore[attr-defined]
+
+    @property
+    def output_size(self) -> int:
+        """Encoder hidden dimension."""
+        return self._output_size
+
+    @property
+    def conv_kernel_size(self) -> int:
+        """Depthwise-conv kernel for streaming left-context; 1 == no CNN cache."""
+        return self._conv_kernel_size
 
     # ------------------------------------------------------------------
     # Paged-cache forward
@@ -835,8 +836,15 @@ class ConformerEncoder(nn.Module):
         return xs
 
 
-class ConformerModel(nn.Module):
-    """Conformer model: encoder + CTC."""
+class ConformerModel(BaseAsrModel):
+    """Conformer model: encoder + CTC head.
+
+    The offline (:meth:`forward_offline`), sequence-packing
+    (:meth:`forward_offline_packed`) and streaming
+    (:meth:`forward_chunk_paged`) entry points the engine calls are inherited
+    from :class:`~oasr.models.base.BaseAsrModel`; this class only supplies the
+    Conformer-specific construction and weight loading.
+    """
 
     def __init__(
         self,
@@ -846,10 +854,27 @@ class ConformerModel(nn.Module):
         super().__init__()
         self.config = config
         self.encoder = ConformerEncoder(config.encoder, global_cmvn=global_cmvn)
-        self.ctc = CTC(
+        # Registered under ``ctc`` (not ``head``) so WeNet checkpoint keys
+        # ``ctc.ctc_lo.*`` map directly; ``head`` is exposed as a property.
+        self.ctc = CTCHead(
             config.vocab_size,
             config.encoder.output_size,
         )
+
+    @property
+    def head(self) -> CTCHead:
+        """The decode-side head (alias for ``self.ctc``)."""
+        return self.ctc
+
+    @classmethod
+    def from_config(
+        cls,
+        config: ConformerModelConfig,
+        *,
+        global_cmvn: Optional[GlobalCMVN] = None,
+    ) -> "ConformerModel":
+        """Build a (random-weight) ConformerModel from its config."""
+        return cls(config, global_cmvn=global_cmvn)
 
     def forward(
         self,
@@ -860,42 +885,37 @@ class ConformerModel(nn.Module):
         probs = self.ctc(hidden_states)
         return probs
 
-    def forward_packed(
+    def load_weights(
         self,
-        input_features: torch.Tensor,
-        lengths: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sequence-packing forward; returns ``(probs, masks)``.
+        state_dict: Mapping[str, torch.Tensor],
+        *,
+        strict: bool = False,
+    ) -> None:
+        """Load a WeNet-format state-dict into this model.
 
-        ``probs`` is ``(B, T_out, vocab)`` and ``masks`` is ``(B, 1, T_out)``
-        — identical shapes to the padded path so the offline decode is
-        unchanged.  Runs the gapless varlen attention; see
-        :meth:`ConformerEncoder.forward_packed`.
+        Keeps only the ``encoder.*`` parameters and the ``ctc.ctc_lo.*``
+        projection, zero-padding the CTC weight/bias up to this model's
+        (8-aligned) vocab when the checkpoint's vocab is smaller.  In-module
+        reshaping (fused QKV, Conv2d reorder) is handled by the layers'
+        ``_load_from_state_dict`` hooks.  ``encoder.embed.pos_enc.pe`` is a
+        computed buffer and is expected to be absent from the checkpoint.
         """
-        hidden_states, masks = self.encoder.forward_packed(input_features, lengths)
-        return self.ctc(hidden_states), masks
+        sd = {k: v for k, v in state_dict.items() if k.startswith("encoder.")}
 
-    def forward_chunk_paged(
-        self,
-        input_features: torch.Tensor,
-        offset: Union[int, torch.Tensor],
-        att_caches: List[PagedKVCache],
-        cnn_cache: SlotCnnCache,
-        att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
-        cache_t1: int = -1,
-    ) -> torch.Tensor:
-        """Forward one chunk with paged KV + slot-indexed CNN cache; returns ``probs``.
+        target_vocab = self.ctc.ctc_lo.weight.shape[0]
+        ctc_w = state_dict["ctc.ctc_lo.weight"]
+        ctc_b = state_dict["ctc.ctc_lo.bias"]
+        pad = target_vocab - ctc_w.shape[0]
+        if pad > 0:
+            ctc_w = F.pad(ctc_w, (0, 0, 0, pad))
+            ctc_b = F.pad(ctc_b, (0, pad))
+        sd["ctc.ctc_lo.weight"] = ctc_w
+        sd["ctc.ctc_lo.bias"] = ctc_b
 
-        See :meth:`ConformerEncoder.forward_chunk_paged` for parameter
-        documentation. The CNN cache is committed in place into
-        ``cnn_cache.buffer`` at rows ``cnn_cache.slot_ids``.
-        """
-        hidden_states = self.encoder.forward_chunk_paged(
-            input_features,
-            offset,
-            att_caches,
-            cnn_cache,
-            att_mask,
-            cache_t1,
-        )
-        return self.ctc(hidden_states)
+        missing, unexpected = self.load_state_dict(sd, strict=strict)
+        expected_missing = {"encoder.embed.pos_enc.pe"}
+        real_missing = [k for k in missing if k not in expected_missing]
+        if real_missing:
+            logger.warning("Unexpected missing keys: %s", real_missing)
+        if unexpected:
+            logger.warning("Unexpected keys in checkpoint: %s", unexpected)

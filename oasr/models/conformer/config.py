@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from ..base import BaseModelConfig, CacheSpec
+
 
 @dataclass
 class ConformerEncoderConfig:
@@ -60,13 +62,34 @@ class ConformerEncoderConfig:
 
 
 @dataclass
-class ConformerModelConfig:
-    """Top-level Conformer model config (encoder-only or encoder + head)."""
+class ConformerModelConfig(BaseModelConfig):
+    """Top-level Conformer model config (encoder + CTC head)."""
 
+    model_type: str = "conformer"
     encoder: ConformerEncoderConfig = field(
         default_factory=ConformerEncoderConfig)
-    # For ASR: vocab_size if adding a CTC/decoder head later
-    vocab_size: Optional[int] = None
+    # For ASR: vocab_size for the CTC head (inherited from BaseModelConfig).
+
+    @property
+    def cache_spec(self) -> CacheSpec:
+        """Streaming-cache descriptor derived from the encoder hyperparameters.
+
+        Mirrors :attr:`ConformerEncoder.cache_spec` (the live-module path the
+        engine uses) so a model built from this config sizes identical caches.
+        """
+        enc = self.encoder
+        n_kv_head = enc.n_kv_head if enc.n_kv_head is not None else enc.attention_heads
+        head_dim = (
+            enc.head_dim if enc.head_dim is not None else enc.output_size // enc.attention_heads
+        )
+        conv_kernel = enc.cnn_module_kernel if enc.use_cnn_module else 1
+        return CacheSpec(
+            num_layers=enc.num_blocks,
+            n_kv_head=n_kv_head,
+            head_dim=head_dim,
+            hidden_dim=enc.output_size,
+            conv_kernel_size=conv_kernel,
+        )
 
     @classmethod
     def from_dict(cls, d: dict) -> ConformerModelConfig:

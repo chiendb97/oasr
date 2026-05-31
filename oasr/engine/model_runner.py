@@ -19,7 +19,7 @@ from oasr.cache import (
 )
 from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.slot_cnn import SlotCnnCache
-from oasr.models.conformer.model import ConformerModel
+from oasr.models.base import BaseAsrModel
 
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
@@ -29,15 +29,17 @@ from .request import Request
 
 
 class ModelRunner:
-    """Wraps :class:`~oasr.models.conformer.ConformerModel` execution.
+    """Wraps a :class:`~oasr.models.base.BaseAsrModel` execution.
 
     Owns the shared paged KV-cache pool and all three stream cache managers.
     Provides a clean interface for both offline batch forwarding and the
-    per-request streaming step.
+    per-request streaming step.  The runner is architecture-agnostic: it only
+    calls the model's :meth:`~oasr.models.base.BaseAsrModel.forward_offline`,
+    :meth:`forward_offline_packed`, and :meth:`forward_chunk_paged` entry points.
 
     Parameters
     ----------
-    model : ConformerModel
+    model : BaseAsrModel
         Loaded model already moved to the target device in eval mode.
     config : EngineConfig
         Engine configuration.
@@ -55,7 +57,7 @@ class ModelRunner:
 
     def __init__(
         self,
-        model: ConformerModel,
+        model: BaseAsrModel,
         config: EngineConfig,
         cache_config: CacheConfig,
         *,
@@ -188,11 +190,7 @@ class ModelRunner:
             ``(B,)`` int32 valid encoder output frame counts, computed from
             the encoder's padding mask so downstream decoders ignore padding.
         """
-        hidden, masks = self._model.encoder(features, lengths)
-        log_probs = self._model.ctc(hidden)  # (B, T_out, V)
-        # masks: (B, 1, T_out) with True = valid
-        output_lengths = masks.squeeze(1).sum(dim=-1).to(torch.int32)
-        return log_probs, output_lengths
+        return self._model.forward_offline(features, lengths)
 
     @torch.no_grad()
     def forward_offline_packed(
@@ -210,9 +208,7 @@ class ModelRunner:
         ``(B, T_out, V)`` so the CTC decode path is unchanged.  Bit-exact to
         ``B=1`` inference.
         """
-        log_probs, masks = self._model.forward_packed(features, lengths)
-        output_lengths = masks.squeeze(1).sum(dim=-1).to(torch.int32)
-        return log_probs, output_lengths
+        return self._model.forward_offline_packed(features, lengths)
 
     # ------------------------------------------------------------------
     # Streaming cache lifecycle

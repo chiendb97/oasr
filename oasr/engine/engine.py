@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from oasr.models.conformer.convert import load_wenet_checkpoint
+from oasr.models import build_model_from_checkpoint
 
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
@@ -82,7 +82,7 @@ class ASREngine:
         dtype = config.dtype
 
         logger.info("Loading model from %s ...", config.ckpt_dir)
-        model, model_config = load_wenet_checkpoint(
+        model, model_config = build_model_from_checkpoint(
             config.ckpt_dir,
             config.checkpoint_name,
             device=device_str,
@@ -92,7 +92,7 @@ class ASREngine:
         config._model_config = model_config
 
         self._device = torch.device(device_str)
-        cache_config = config.build_cache_config(model_config)
+        cache_config = config.build_cache_config(model.cache_spec)
 
         # CUDA Graph capture: each cache type (encoder, feature extraction,
         # CTC) owns its own ``torch.cuda.graph_pool_handle()``. Sharing one
@@ -109,7 +109,7 @@ class ASREngine:
         self._input_processor = InputProcessor(config, self._device, graph_pool=self._graph_pool)
         self._scheduler = Scheduler(config)
         self._model_runner = ModelRunner(model, config, cache_config, graph_pool=self._graph_pool)
-        self._output_processor = OutputProcessor(config)
+        self._output_processor = OutputProcessor(config, decode_type=model.decode_type)
 
         # Build exactly one pipeline matching ``config.service_mode``.
         # The other mode's machinery (paged KV cache vs. persistent
