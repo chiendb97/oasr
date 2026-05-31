@@ -125,6 +125,7 @@ class BaseEncoder(nn.Module, ABC):
         engine's paged-KV + slot-CNN model implement this (``supports_paged_streaming
         = True``).  Other encoders expose their own streaming API.
         """
+        del xs, offset, att_caches, cnn_cache, att_mask, cache_t1
         raise NotImplementedError(
             f"{type(self).__name__} does not support paged-KV streaming"
         )
@@ -133,6 +134,7 @@ class BaseEncoder(nn.Module, ABC):
         self, xs: torch.Tensor, xs_lens: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sequence-packing offline forward (optional).  Default: unsupported."""
+        del xs, xs_lens
         raise NotImplementedError(
             f"{type(self).__name__} does not support sequence packing"
         )
