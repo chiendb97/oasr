@@ -114,6 +114,52 @@ class TestCtcDecoderGpuOffline:
         # tok1, blank, tok1 → [1, 1] (blank separates the two 1s)
         assert best == [1, 1]
 
+    def test_repeat_after_skipped_blank_collapses(self, device):
+        """Regression for GPU-DEC-1: a repeat *following* a skipped blank
+        must still collapse.
+
+        Path ``tok1, blank, tok1, tok1`` with ``blank_threshold < 1`` skips the
+        (P=1.0) blank frame, so the step that emits the second ``tok1`` carries
+        ``need_add_blank`` (a blank was skipped before it).  The previous kernel
+        relabelled that freshly emitted non-blank token as "ends in blank", so
+        the third (consecutive) ``tok1`` frame extended instead of collapsing,
+        yielding ``[1, 1, 1]``.  CTC ground truth is ``1,blank,1,1 → [1, 1]``
+        (the last two 1s collapse, the blank separates the first pair).
+        """
+        V = 4
+        logp = _make_logp_gpu(4, V, [1, 0, 1, 1], device)
+        seq_lengths = torch.tensor([4], dtype=torch.int32, device=device)
+
+        result = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
+                                        blank_id=0, blank_threshold=0.98,
+                                        max_seq_len=10)
+        assert result.tokens[0][0] == [1, 1]
+
+        # Paged path goes through the parallel topk_phase2_paged_kernel.
+        paged = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
+                                       blank_id=0, blank_threshold=0.98,
+                                       max_seq_len=10, use_paged_memory=True)
+        assert paged.tokens[0][0] == [1, 1]
+
+    def test_repeat_after_leading_skipped_blank_collapses(self, device):
+        """Regression for GPU-DEC-1 (first-step variant): a repeat right after
+        leading skipped blanks must collapse.
+
+        Path ``blank, tok1, tok1`` with ``blank_threshold < 1`` skips the
+        leading blank, so ``first_step`` initialises the beam at ``first_t=1``.
+        The previous kernel put that initial non-blank token in the *blank*
+        slot when ``first_t > 0``, so the next (consecutive) ``tok1`` extended
+        to ``[1, 1]``.  CTC ground truth is ``blank,1,1 → [1]``.
+        """
+        V = 4
+        logp = _make_logp_gpu(3, V, [0, 1, 1], device)
+        seq_lengths = torch.tensor([3], dtype=torch.int32, device=device)
+
+        result = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
+                                        blank_id=0, blank_threshold=0.98,
+                                        max_seq_len=10)
+        assert result.tokens[0][0] == [1]
+
     def test_batched_decode(self, device):
         """Multiple utterances decoded in parallel."""
         V = 6
@@ -192,6 +238,25 @@ class TestCtcDecoderGpuStreaming:
 
         result = decoder.finalize_stream()
         assert result.tokens[0][0] == [1, 2, 3]
+
+    def test_streaming_repeat_after_skipped_blank_collapses(self, device):
+        """Regression for GPU-DEC-1 on the streaming path.
+
+        Same scenario as the offline test: ``tok1, blank, tok1, tok1`` with
+        ``blank_threshold < 1`` skips the blank frame; the repeat following the
+        skip must collapse to ``[1, 1]`` rather than extend to ``[1, 1, 1]``.
+        Exercised via ``decode_chunk`` (shared topk_phase2/first_step kernels),
+        with CUDA graphs off and on to cover both chunk-launcher paths.
+        """
+        V = 4
+        for use_graphs in (False, True):
+            config = GpuDecoderConfig(beam_size=3, blank_id=0,
+                                      blank_threshold=0.98, max_seq_len=10)
+            decoder = GpuStreamingDecoder(config, use_cuda_graphs=use_graphs)
+            decoder.init_stream(batch=1, vocab_size=V, device=device)
+            decoder.decode_chunk(_make_logp_gpu(4, V, [1, 0, 1, 1], device))
+            assert decoder.finalize_stream().tokens[0][0] == [1, 1], \
+                f"use_cuda_graphs={use_graphs}"
 
     def test_streaming_multi_frame_chunks(self, device):
         """Streaming with multi-frame chunks."""

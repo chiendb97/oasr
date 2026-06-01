@@ -585,9 +585,6 @@ __global__ __launch_bounds__(BLOCK_SIZE) void first_step_kernel(
         return;
 
     const int first_t = select_seqs[bid * max_seq_len];
-    // need_add_blank: true when there are leading blank frames before the first
-    // selected frame (matching reference's need_add_blank(batch_id, 0) logic).
-    const bool need_add_blank = (first_t > 0);
 
     // Reserve one beam slot for the empty prefix (blank-only path) when
     // beam > 1.  This prevents spurious initial tokens in streaming mode
@@ -666,8 +663,12 @@ __global__ __launch_bounds__(BLOCK_SIZE) void first_step_kernel(
         int token = smem.topk.vals[k];
         float key = smem.topk.keys[k];
         if (token >= 0 && token != blank_id) {
-            float2 xy = need_add_blank ? make_float2(key, NEG_INF) : make_float2(NEG_INF, key);
-            pprev[base] = xy;
+            // The prefix [token] ends in a non-blank, so its probability mass
+            // belongs in the non-blank slot regardless of any leading blank
+            // frames skipped before first_t (those only affect the empty/blank
+            // beam below).  Putting it in the blank slot would let the next
+            // identical frame extend (CTC repeat) instead of collapsing.
+            pprev[base] = make_float2(NEG_INF, key);
             // clen is memset to 0 before first_step; write token at position 0 directly.
             clist[bid * beam * ldseq_len + k * ldseq_len + 0] = token;
             clen[base] = 1;
@@ -1045,17 +1046,6 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_kernel(
     if (step >= select_seq_lens[bid])
         return;
 
-    // need_add_blank: true when there are blank frames between the previous
-    // selected step and this one (or leading blanks for step==0).
-    bool need_add_blank = false;
-    if (step == 0) {
-        need_add_blank = (select_seqs[bid * max_seq_len] > 0);
-    } else {
-        int cur_t = select_seqs[bid * max_seq_len + step];
-        int prev_t = select_seqs[bid * max_seq_len + step - 1];
-        need_add_blank = (cur_t > prev_t + 1);
-    }
-
     const int tx = threadIdx.x;
     const int rw_offset = bid * items_per_batch;
 
@@ -1166,18 +1156,23 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_kernel(
 
             score[dst_base] = new_score;
 
-            // pprev for the next step (matching reference topk_reduce logic):
-            //   need_add_blank=true  → collapsed score in blank slot: {score, NEG_INF}
-            //   need_add_blank=false → preserve the (p_blank, p_nonblank) split
+            // pprev for the next step is just this state's (blank, nonblank)
+            // split from ptable/ptablen.  The blank-frame collapse for any
+            // skipped (blank-dominant) frames *before* this step is already
+            // baked into ptable/ptablen by prob_matrix_kernel /
+            // prob_space_blank_kernel (they collapse the *incoming* prev to
+            // {logsumexp(pb,pn), NEG_INF}).  Do NOT additionally force the
+            // *outgoing* state into the blank slot on need_add_blank steps: the
+            // frame just emitted ``char_id``, so when it is non-blank the prefix
+            // ends in non-blank (pn carries the mass, pb == NEG_INF).  Forcing
+            // {new_score, NEG_INF} mislabels a freshly emitted non-blank token
+            // as "ends in blank", which lets the next identical frame extend
+            // (CTC repeat) instead of collapsing — duplicating the token.  For
+            // a blank winner ptablen[blank_slot] is already NEG_INF and
+            // p == new_score, so (p, pn) matches the old collapsed value too.
             float p = ptable[bid * ldc * beam + id];
             float pn = ptablen[bid * ldc * beam + id];
-            float2 pprev_next;
-            if (need_add_blank) {
-                pprev_next = make_float2(new_score, NEG_INF);
-            } else {
-                pprev_next = make_float2(p, pn);
-            }
-            pprev[dst_base] = pprev_next;
+            pprev[dst_base] = make_float2(p, pn);
         }
     }
 }
@@ -1964,7 +1959,6 @@ __global__ __launch_bounds__(BLOCK_SIZE) void first_step_paged_kernel(
         return;
 
     const int first_t = select_seqs[bid * max_seq_len];
-    const bool need_add_blank = (first_t > 0);
     const int nb_beams = (beam > 1) ? beam - 1 : beam;
     const int tx = threadIdx.x;
 
@@ -2033,8 +2027,9 @@ __global__ __launch_bounds__(BLOCK_SIZE) void first_step_paged_kernel(
         int token = smem.topk.vals[k];
         float key = smem.topk.keys[k];
         if (token >= 0 && token != blank_id) {
-            float2 xy = need_add_blank ? make_float2(key, NEG_INF) : make_float2(NEG_INF, key);
-            pprev[base] = xy;
+            // Prefix [token] ends in a non-blank: mass goes in the non-blank
+            // slot (see flat first_step_kernel for the full rationale).
+            pprev[base] = make_float2(NEG_INF, key);
             int phys = bid * beam + k;
             page_storage[phys * page_size + 0] = token;
             clen[base] = 1;
@@ -2143,15 +2138,6 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_paged_kernel(
     int step = __ldg(d_step);
     if (step >= select_seq_lens[bid])
         return;
-
-    bool need_add_blank = false;
-    if (step == 0) {
-        need_add_blank = (select_seqs[bid * max_seq_len] > 0);
-    } else {
-        int cur_t = select_seqs[bid * max_seq_len + step];
-        int prev_t = select_seqs[bid * max_seq_len + step - 1];
-        need_add_blank = (cur_t > prev_t + 1);
-    }
 
     const int tx = threadIdx.x;
     const int rw_offset = bid * items_per_batch;
@@ -2310,15 +2296,13 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_paged_kernel(
 
         score[dst_base] = new_score;
 
+        // Outgoing (blank, nonblank) split straight from ptable/ptablen — the
+        // incoming blank-frame collapse is already baked in upstream.  See the
+        // flat topk_phase2_kernel for why we must NOT force {new_score,
+        // NEG_INF} on need_add_blank steps (it duplicates repeated tokens).
         float p = ptable[bid * ldc * beam + id];
         float pn = ptablen[bid * ldc * beam + id];
-        float2 pprev_next;
-        if (need_add_blank) {
-            pprev_next = make_float2(new_score, NEG_INF);
-        } else {
-            pprev_next = make_float2(p, pn);
-        }
-        pprev[dst_base] = pprev_next;
+        pprev[dst_base] = make_float2(p, pn);
     }
 }
 

@@ -532,14 +532,6 @@ class TestASREngine:
         assert all(r.finished for r in results)
         assert any(r.request_id == rid for r in results)
 
-    @pytest.mark.xfail(
-        reason="GPU-DEC-1/2 (see docs/known_issues.md): the ctc_gpu decoder's "
-        "blank_threshold frame-skip garbles transcripts and GpuStreamingDecoder "
-        "truncates the tail, so streaming(B=1) cannot be bit-exact with offline "
-        "until those CUDA-kernel bugs are fixed. The encoder parity this test "
-        "guards is sound; remove this marker once the decoder is fixed.",
-        strict=False,
-    )
     def test_streaming_matches_offline_single_stream(
         self, device, ckpt_dir: str, wav_dir: str,
     ):
@@ -550,11 +542,13 @@ class TestASREngine:
         refactor: per-step fbank + forward_chunk_paged at B=1 has to agree
         frame-for-frame with the offline batched forward.
 
-        Currently ``xfail``: the encoder paths agree to within fp16
-        emission-boundary jitter that CTC collapse absorbs, but the ``ctc_gpu``
-        decoder bugs GPU-DEC-1/2 (``docs/known_issues.md``) break the bit-exact
-        text match. The old test passed only because it compared two CPU
-        ``prefix_beam`` decodes, which have no blank-skip and don't hit the bug.
+        This was briefly ``xfail`` while GPU-DEC-1 (``docs/known_issues.md``)
+        was open: the ``ctc_gpu`` decoder's blank-frame-skip mislabelled a
+        freshly emitted non-blank token as "ends in blank", so the next
+        identical frame extended (CTC repeat) instead of collapsing and
+        duplicated the token (e.g. ``EXHIBITION`` → ``EXHIBIT EXHIBITIONION``).
+        With that kernel fix the skip path is bit-exact with the no-skip /
+        CPU ``prefix_beam`` decode again, so streaming(B=1) == offline holds.
         """
         from oasr.engine import ASREngine, EngineConfig
 
