@@ -65,16 +65,15 @@ class EngineConfig:
         Feature extraction config.  Defaults to 80-dim log-mel FBANK at 16 kHz
         with dither disabled (``dither=0.0``) for deterministic inference.
     decoder_type : str
-        Which CTC decoder to use:
-        ``"ctc_greedy"`` — fast CPU greedy,
-        ``"ctc_prefix_beam"`` — CPU prefix beam search (default),
-        ``"ctc_gpu"`` — GPU beam search via ``GpuStreamingDecoder``,
-        ``"ctc_wfst"`` — CPU WFST beam search (requires k2).
+        Which GPU CTC decoder to use:
+        ``"ctc_gpu"`` — GPU beam search via ``GpuStreamingDecoder`` (default),
+        ``"ctc_wfst"`` — k2 WFST beam search (GPU, requires a k2 build).
     gpu_decoder_config : GpuDecoderConfig, optional
         Config for ``decoder_type="ctc_gpu"``.  Defaults to
         ``GpuDecoderConfig()``.
-    cpu_decoder_config : DecoderConfig, optional
-        Config for CPU decoders.  Defaults to ``DecoderConfig()``.
+    wfst_decoder_config : DecoderConfig, optional
+        Config for ``decoder_type="ctc_wfst"``.  Defaults to
+        ``DecoderConfig(search_type="wfst")``.
     fst_path : str, optional
         Path to the WFST FST file (only needed for ``"ctc_wfst"``).
     sentencepiece_model : str, optional
@@ -109,11 +108,9 @@ class EngineConfig:
     # Encoder forward batch size — used in both modes since the service runs
     # streaming OR offline (never both at once).  In streaming mode it caps
     # the running pool, sizes the paged KV cache, and is the captured
-    # CUDA-Graph B.  In offline mode it is the GPU forward width of each
-    # micro-batch in :class:`OfflinePipeline`; the scheduler admits up to
-    # ``max_batch_size * offline_pipeline_depth`` requests per ``step()`` so
-    # the pipeline producer always has enough work queued to keep
-    # ``offline_pipeline_depth`` micro-batches in flight.
+    # CUDA-Graph B.  In offline mode it is the GPU forward width: the
+    # scheduler admits one ``max_batch_size`` length-bucketed batch per
+    # ``step()`` and :class:`OfflinePipeline` runs it as a single forward.
     max_batch_size: int = 32
     # Triton-style preferred batch sizes.  When set, the scheduler snaps
     # streaming admission and offline batch construction to one of these B
@@ -130,9 +127,8 @@ class EngineConfig:
     # that ``min_len / max_len >= length_bucket_ratio`` within a batch,
     # bounding padded-compute waste.  ``0`` disables this ratio entirely and
     # relies solely on ``max_offline_pad_ratio`` as the safety net.  Splitting
-    # a bursty ``transcribe(list_of_N)`` call into sub-batches multiplies CPU
-    # feature-extraction cost (sequential torchaudio passes) while saving only
-    # a few percent of padded GPU compute, so off-by-default is faster on real
+    # a bursty ``transcribe(list_of_N)`` call into sub-batches saves only a few
+    # percent of padded GPU compute, so off-by-default is faster on real
     # datasets where adjacent-utterance length spread is moderate.
     length_bucket_ratio: float = 0.0
     # Hard cap on padded waste: reject a candidate from an offline batch when
@@ -174,31 +170,6 @@ class EngineConfig:
     # cohort transitions.  Set to ``False`` for maximally responsive
     # admission (one new request per freed slot).
     streaming_cohort_admit: bool = True
-    # How many offline micro-batches to keep in flight at once.  ``1`` runs
-    # sequentially (no threading, no CPU/GPU overlap).  ``2+`` runs CPU
-    # feature prep for micro-batch ``k+1`` on a background thread while GPU
-    # forward+decode executes micro-batch ``k`` on the main thread.  Values
-    # above 3 rarely help because CPU prep is usually only 1–2 micro-batches
-    # ahead of the GPU in steady state.
-    offline_pipeline_depth: int = 3
-    # Keep the offline producer thread alive across ``step()`` calls so the
-    # collate of batch ``k+1`` overlaps with the encoder-forward+decode of
-    # batch ``k``.  When ``False`` each step rebuilds a fresh producer (the
-    # legacy per-batch behavior), which is fine for ``transcribe(list)``
-    # but loses pipelining when reqs arrive one-at-a-time over HTTP/gRPC
-    # and the scheduler only hands out small per-step batches.  Defaults
-    # ``True`` because the HTTP-frontend workload is the throughput-critical
-    # case and the cross-batch behavior is a strict superset of legacy.
-    offline_persistent_pipeline: bool = True
-    # Run fbank/mfcc feature extraction on the GPU for offline batches.
-    # When ``True`` (default) the pipeline pads waveforms, ships them to
-    # the device with one H2D copy, and runs torchaudio's kaldi-compliant
-    # fbank per-utterance on a dedicated CUDA stream.  This bypasses the
-    # CPU fbank pool, which was the throughput ceiling for offline
-    # batching (~550 fbanks/s with 4 workers).  When ``False`` the pipeline
-    # falls back to the CPU pool path — useful on GPUs that are already
-    # saturated by the model forward.
-    offline_gpu_feature_extraction: bool = True
 
     # Sequence packing (offline only).  When ``True`` the offline pipeline
     # concatenates several utterances into one packed encoder forward instead
@@ -266,28 +237,14 @@ class EngineConfig:
 
     # Feature extraction
     feature_config: Optional[FeatureConfig] = None
-    # Number of parallel CPU workers used to extract fbank/mfcc features for
-    # offline batches.  ``0`` = auto-detect a sensible default (``min(8,
-    # nproc // 2)``).  ``1`` disables the worker pool entirely.
-    # Kaldi-style fbank releases the GIL inside its C++ op, so a small thread
-    # pool yields real parallelism and is typically the largest CPU-side
-    # speedup for offline throughput.
-    num_feature_workers: int = 0
-    # Intra-op thread count for PyTorch CPU ops (``torch.set_num_threads``).
-    # ``0`` = auto: ``min(16, 4 * num_feature_workers)``.  The PyTorch default
-    # is ``nproc`` which heavily oversubscribes for short CPU ops like
-    # per-utterance fbank and causes large slowdowns on many-core hosts.
-    cpu_intra_op_threads: int = 0
 
-    # Decoding.  Default is the GPU CTC prefix beam — same algorithm as
-    # ``ctc_prefix_beam`` but the inner loop is a single batched C++ kernel
-    # instead of an N-times Python loop.  Benchmarked ~50× faster per-utt
-    # at common batch sizes (~5 ms decode for 64 reqs vs ~250 ms on CPU).
-    # Set to ``"ctc_prefix_beam"`` for the CPU path (e.g. when running
-    # without a GPU build), or ``"ctc_wfst"`` when ``fst_path`` is set.
+    # Decoding.  Default is the GPU CTC prefix beam — a single batched C++
+    # kernel rather than an N-times Python loop (~50× faster per-utt at common
+    # batch sizes, ~5 ms decode for 64 reqs).  Set to ``"ctc_wfst"`` for the
+    # k2 WFST beam search (also GPU) when ``fst_path`` is provided.
     decoder_type: str = "ctc_gpu"
     gpu_decoder_config: Optional[GpuDecoderConfig] = None
-    cpu_decoder_config: Optional[DecoderConfig] = None
+    wfst_decoder_config: Optional[DecoderConfig] = None
     fst_path: Optional[str] = None
 
     # Detokenization
@@ -308,6 +265,12 @@ class EngineConfig:
             raise ValueError(
                 f"service_mode must be 'streaming' or 'offline', got " f"{self.service_mode!r}"
             )
+        if self.decoder_type not in ("ctc_gpu", "ctc_wfst"):
+            raise ValueError(
+                f"decoder_type must be 'ctc_gpu' or 'ctc_wfst', got "
+                f"{self.decoder_type!r}. CPU decoders are no longer exposed "
+                "through the engine; use the standalone oasr.decode API for those."
+            )
         if self.max_batch_frames is not None and self.max_batch_frames < 1:
             raise ValueError(
                 f"max_batch_frames must be a positive int or None, got "
@@ -324,8 +287,8 @@ class EngineConfig:
             self.feature_config = FeatureConfig(dither=0.0)
         if self.gpu_decoder_config is None:
             self.gpu_decoder_config = GpuDecoderConfig()
-        if self.cpu_decoder_config is None:
-            self.cpu_decoder_config = DecoderConfig(search_type="prefix_beam")
+        if self.wfst_decoder_config is None:
+            self.wfst_decoder_config = DecoderConfig(search_type="wfst")
         # Normalise preferred_batch_size: dedupe, sort, validate each <= cap.
         if self.preferred_batch_size is not None:
             cleaned = sorted({int(v) for v in self.preferred_batch_size})

@@ -11,8 +11,8 @@ Metrics
 
 Subroutines
 -----------
-* ``offline``         — ``ASREngine.transcribe_offline`` (batch forward, ctc_prefix_beam).
-* ``streaming``       — ``ASREngine.transcribe`` (chunk-by-chunk, ctc_prefix_beam).
+* ``offline``         — ``ASREngine.transcribe_offline`` (batch forward, ctc_gpu).
+* ``streaming``       — ``ASREngine.transcribe`` (chunk-by-chunk, ctc_gpu).
 * ``offline_wfst``    — offline path with WFST decoder (requires --wfst-path).
 * ``streaming_wfst``  — streaming path with WFST decoder (requires --wfst-path).
 """

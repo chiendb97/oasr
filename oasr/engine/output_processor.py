@@ -24,14 +24,12 @@ _SPECIAL_IDS = frozenset([0, 1, 2])  # <blank>, <unk>, <sos/eos>
 class OutputProcessor:
     """Converts raw CTC log-probabilities into detokenized text.
 
-    Supports four decoder types controlled by ``config.decoder_type``:
+    Supports two GPU decoder types controlled by ``config.decoder_type``:
 
-    * ``"ctc_greedy"`` — fast CPU greedy collapse.
-    * ``"ctc_prefix_beam"`` — CPU prefix beam search.
     * ``"ctc_gpu"`` — GPU CTC prefix beam search via
       :func:`~oasr.ctc_decode.ctc_beam_search_decode` (offline) or
       :class:`~oasr.ctc_decode.GpuStreamingDecoder` (streaming).
-    * ``"ctc_wfst"`` — CPU WFST beam search (requires k2 build).
+    * ``"ctc_wfst"`` — k2 WFST beam search (GPU; requires a k2 build).
 
     Detokenization uses a SentencePiece model when available, falling back to
     a plain character join using ``units.txt``.
@@ -83,12 +81,9 @@ class OutputProcessor:
         List[RequestOutput]
             One output per batch element (best hypothesis, finished=True).
         """
-        dtype = self._config.decoder_type
-
-        if dtype == "ctc_gpu":
+        if self._config.decoder_type == "ctc_gpu":
             return self._decode_offline_gpu(log_probs, lengths)
-        else:
-            return self._decode_offline_cpu(log_probs, lengths)
+        return self._decode_offline_wfst(log_probs, lengths)
 
     def _decode_offline_gpu(
         self,
@@ -123,21 +118,13 @@ class OutputProcessor:
             ))
         return outputs
 
-    def _decode_offline_cpu(
+    def _decode_offline_wfst(
         self,
         log_probs: torch.Tensor,
         lengths: torch.Tensor,
     ) -> List[RequestOutput]:
-        cfg = self._config.cpu_decoder_config
-        search_type = {
-            "ctc_greedy": "greedy",
-            "ctc_prefix_beam": "prefix_beam",
-            "ctc_wfst": "wfst",
-        }.get(self._config.decoder_type, "prefix_beam")
-        from dataclasses import replace
-        # type: ignore[arg-type]
-        cfg_override = replace(cfg, search_type=search_type) if cfg else None
-        decoder = Decoder(cfg_override, fst=self._config.fst_path)
+        cfg = self._config.wfst_decoder_config
+        decoder = Decoder(cfg, fst=self._config.fst_path)
 
         lengths_list = lengths.cpu().tolist()
         outputs = []
@@ -171,8 +158,8 @@ class OutputProcessor:
         (:meth:`~oasr.ctc_decode.GpuStreamingDecoder.decode_chunk_batch`)
         over all ready streams at once, replacing the per-stream Python
         loop in :meth:`~oasr.engine.pipeline.streaming.StreamingPipeline.step`.
-        For the CPU decoders we fall back to a Python loop here — those
-        decoders are single-threaded per-request anyway.
+        For the ``ctc_wfst`` decoder we fall back to a per-stream Python
+        loop here — the k2 decoder is single-threaded per-request anyway.
 
         Parameters
         ----------
@@ -190,8 +177,7 @@ class OutputProcessor:
         """
         if not requests:
             return []
-        dtype = self._config.decoder_type
-        if dtype != "ctc_gpu":
+        if self._config.decoder_type != "ctc_gpu":
             outputs: List[RequestOutput] = []
             for req in requests:
                 lp = log_probs_map.get(req.request_id)
@@ -265,9 +251,7 @@ class OutputProcessor:
         ctx = request.stream_context
         assert ctx is not None, "stream_context must be allocated before decoding"
 
-        dtype = self._config.decoder_type
-
-        if dtype == "ctc_gpu":
+        if self._config.decoder_type == "ctc_gpu":
             handle = ctx.get_decoder()
             handle.decode_chunk(log_probs)
             # ``peek`` is a non-destructive D2D snapshot of the beam buffer;
@@ -282,24 +266,15 @@ class OutputProcessor:
                 finished=False,
             )
         else:
-            # CPU streaming decoder stored on the request
-            if not hasattr(request, "_cpu_decoder"):
-                search_type = {
-                    "ctc_greedy": "greedy",
-                    "ctc_prefix_beam": "prefix_beam",
-                    "ctc_wfst": "wfst",
-                }.get(dtype, "prefix_beam")
-                cfg = self._config.cpu_decoder_config
-                from dataclasses import replace
-                # type: ignore[arg-type]
-                cfg_override = replace(cfg, search_type=search_type)
-                request._cpu_decoder = Decoder(
-                    cfg_override, fst=self._config.fst_path)
-                request._cpu_decoder.init_stream()
+            # k2 WFST streaming decoder stored on the request
+            if not hasattr(request, "_wfst_decoder"):
+                request._wfst_decoder = Decoder(
+                    self._config.wfst_decoder_config, fst=self._config.fst_path)
+                request._wfst_decoder.init_stream()
 
             # log_probs is (1, T_chunk, V) -- remove batch dim
             chunk_logp = log_probs.squeeze(0)
-            result: DecoderResult = request._cpu_decoder.decode_chunk(
+            result: DecoderResult = request._wfst_decoder.decode_chunk(
                 chunk_logp)
             best = result.tokens[0] if result.tokens else []
             return RequestOutput(
@@ -323,9 +298,7 @@ class OutputProcessor:
         RequestOutput
             Final output with ``finished=True``.
         """
-        dtype = self._config.decoder_type
-
-        if dtype == "ctc_gpu":
+        if self._config.decoder_type == "ctc_gpu":
             ctx = request.stream_context
             assert ctx is not None
             handle = ctx.get_decoder()
@@ -343,8 +316,8 @@ class OutputProcessor:
                 finished=True,
             )
         else:
-            cpu_dec = getattr(request, "_cpu_decoder", None)
-            if cpu_dec is None:
+            wfst_dec = getattr(request, "_wfst_decoder", None)
+            if wfst_dec is None:
                 # No chunks were decoded (empty audio)
                 return RequestOutput(
                     request_id=request.request_id,
@@ -352,14 +325,14 @@ class OutputProcessor:
                     tokens=[],
                     finished=True,
                 )
-            result_cpu: DecoderResult = cpu_dec.finalize_stream()
-            best = result_cpu.tokens[0] if result_cpu.tokens else []
+            result_wfst: DecoderResult = wfst_dec.finalize_stream()
+            best = result_wfst.tokens[0] if result_wfst.tokens else []
             text = self.detokenize(best)
             return RequestOutput(
                 request_id=request.request_id,
                 text=text,
-                tokens=result_cpu.tokens,
-                scores=result_cpu.scores,
+                tokens=result_wfst.tokens,
+                scores=result_wfst.scores,
                 finished=True,
             )
 

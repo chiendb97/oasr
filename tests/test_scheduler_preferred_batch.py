@@ -30,7 +30,6 @@ def _make_config(
     max_batch_size: int = 16,
     preferred_batch_size=None,
     max_wait_time: float = 0.2,
-    offline_pipeline_depth: int = 3,
     schedule_policy: str = "bucket",
 ) -> EngineConfig:
     return EngineConfig(
@@ -38,7 +37,6 @@ def _make_config(
         max_batch_size=max_batch_size,
         preferred_batch_size=preferred_batch_size,
         max_wait_time=max_wait_time,
-        offline_pipeline_depth=offline_pipeline_depth,
         schedule_policy=schedule_policy,
     )
 
@@ -182,7 +180,7 @@ class TestStreamingAdmission:
 
 class TestOfflineBatch:
     def test_trims_built_batch_to_preferred(self):
-        # max_batch_size=16, depth=3 → cap=48. 10 requests, PBS=[4, 8] →
+        # max_batch_size=16 → cap=16. 10 requests, PBS=[4, 8] →
         # built batch sized 10, trimmed down to 8. Remaining 2 stay queued.
         sched = Scheduler(
             _make_config(
@@ -217,20 +215,19 @@ class TestOfflineBatch:
         out = sched.schedule()
         assert len(out.offline_batch) == 3
 
-    def test_pbs_none_keeps_legacy_cap(self):
-        # Legacy: cap = max_batch_size * depth = 4 * 2 = 8. 10 requests
-        # → batch of 8.
+    def test_pbs_none_caps_at_max_batch_size(self):
+        # With no preferred sizes the offline batch is capped at max_batch_size.
+        # 10 requests, max_batch_size=4 → batch of 4.
         sched = Scheduler(
             _make_config(
                 max_batch_size=4,
-                offline_pipeline_depth=2,
                 preferred_batch_size=None,
             )
         )
         for _ in range(10):
             sched.add_request(_make_offline())
         out = sched.schedule()
-        assert len(out.offline_batch) == 8
+        assert len(out.offline_batch) == 4
 
     def test_overflow_returned_to_head_in_order(self):
         # Tag requests with their arrival order; after trim, the overflow

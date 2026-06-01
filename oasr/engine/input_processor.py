@@ -4,15 +4,13 @@
 
 from __future__ import annotations
 
-import os
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
-from oasr.features import FeatureConfig, extract_features_batch
+from oasr.features import FeatureConfig
 from oasr.features.backends import _extract as _extract_single
 from oasr.features.batched import (
     batched_fbank,
@@ -76,39 +74,6 @@ class InputProcessor:
         # used in that case.
         self._graph_pool = graph_pool
 
-        # Parallel feature-extraction worker pool.  Kaldi-style fbank/mfcc release
-        # the GIL inside their C++ ops, so a small Python thread pool yields real
-        # parallelism on multi-core boxes.  We also cap torch's intra-op thread
-        # count because the default (``nproc``) oversubscribes for these
-        # short-running ops and actively hurts single-call latency.
-        nproc = os.cpu_count() or 2
-        nw = int(getattr(config, "num_feature_workers", 0) or 0)
-        if nw <= 0:
-            # Empirically, 4 concurrent fbank ops saturates the throughput of a
-            # single utterance-level extract; more workers trigger torch-pool
-            # oversubscription and actively hurt.  Keep it small even on
-            # many-core hosts.
-            nw = min(4, max(1, nproc // 4))
-        self._num_workers: int = nw
-        self._pool: Optional[ThreadPoolExecutor] = (
-            ThreadPoolExecutor(max_workers=nw, thread_name_prefix="oasr-feat")
-            if nw > 1 else None
-        )
-
-        intra = int(getattr(config, "cpu_intra_op_threads", 0) or 0)
-        if intra <= 0:
-            # Keep total thread count (workers × intra) near nproc without
-            # overshooting; for nw=4 this resolves to 2, which matches the
-            # empirical sweet spot for LJSpeech-scale workloads.
-            intra = max(1, min(8, nproc // max(nw, 1)))
-        if torch.get_num_threads() > intra:
-            try:
-                torch.set_num_threads(intra)
-            except RuntimeError:
-                # set_num_threads can fail if a parallel section is already open;
-                # harmless — we'll just use the existing value.
-                pass
-
         # CUDA-Graph cache for the steady-state streaming feature path. Lazy
         # captures keyed by ``B_active`` bucket. ``None`` disables capture
         # (CPU device, master ``use_cuda_graphs`` off, sub-toggle off, or the
@@ -136,14 +101,6 @@ class InputProcessor:
                 max_batch_size=int(config.max_batch_size),
                 batch_buckets=getattr(config, "feature_graph_batch_buckets", None),
             )
-
-    def __del__(self) -> None:
-        pool = getattr(self, "_pool", None)
-        if pool is not None:
-            try:
-                pool.shutdown(wait=False)
-            except Exception:
-                pass
 
     # ------------------------------------------------------------------
     # Audio loading
@@ -196,39 +153,6 @@ class InputProcessor:
     # Batched offline processing
     # ------------------------------------------------------------------
 
-    def process_offline(self, requests: List[Request]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Load audio and extract features for a batch of offline requests.
-
-        Populates ``request.features``, ``request.feature_lengths``, and
-        ``request.num_frames`` for each request, and also returns the
-        stacked batch tensors.
-
-        Returns
-        -------
-        features : Tensor
-            ``(B, max_T, F)`` padded feature tensor on the engine device.
-        feature_lengths : Tensor
-            ``(B,)`` valid frame counts on the engine device.
-        """
-        waveforms: List[torch.Tensor] = []
-
-        for req in requests:
-            wav = self.load_audio(req.audio, req.sample_rate)
-            waveforms.append(wav)
-
-        features, feat_lengths = extract_features_batch(waveforms, self._feature_config)
-        features = features.to(device=self._device, dtype=self._config.dtype)
-        feat_lengths = feat_lengths.to(device=self._device)
-
-        # Cache on each request
-        lengths_cpu = feat_lengths.detach().cpu().tolist()
-        for i, req in enumerate(requests):
-            req.features = features[i: i + 1]
-            req.feature_lengths = feat_lengths[i: i + 1]
-            req.num_frames = int(lengths_cpu[i])
-
-        return features, feat_lengths
-
     def _estimate_num_frames(self, num_samples: int) -> int:
         """Cheap bucketing estimate of feature-frame count from sample count.
 
@@ -249,10 +173,6 @@ class InputProcessor:
             return 0
         return (num_samples + frame_shift // 2) // frame_shift
 
-    def _extract_one(self, waveform: torch.Tensor) -> torch.Tensor:
-        """Per-waveform fbank/mfcc; runs on a pool worker when enabled."""
-        return _extract_single(waveform, self._feature_config)
-
     def prepare_offline(self, request: Request) -> None:
         """Register an offline request without running feature extraction.
 
@@ -260,10 +180,8 @@ class InputProcessor:
         already a tensor or numpy array) and stamps a cheap sample-count
         based ``num_frames`` estimate so the scheduler can bucket by length
         without a D2H sync.  Actual fbank/mfcc extraction is deferred to
-        :meth:`collate_offline`, where it runs as part of the pipelined
-        producer so that each micro-batch's per-utterance extractions
-        saturate the worker pool together (rather than being interleaved
-        FIFO with unrelated requests from later micro-batches).
+        :meth:`collate_gpu`, which runs the batched GPU fbank over the whole
+        micro-batch in one shot.
         """
 
         wav = self.load_audio(request.audio, request.sample_rate)
@@ -272,33 +190,6 @@ class InputProcessor:
         # Clear any stale feature cache from reused Request objects.
         request.features = None
         request.feature_lengths = None
-
-    def prefetch_features(
-        self, requests: List[Request]
-    ) -> Dict[str, "Future[torch.Tensor]"]:
-        """Submit fbank/mfcc futures for ``requests`` in the given order.
-
-        Returns a ``request_id -> Future`` dict.  Callers should iterate in
-        the *same* order they want features to be available; the pool
-        processes submissions FIFO, so the head of ``requests`` finishes
-        first.  This lets the offline pipeline sort by length and get
-        chunk-0's features in a bounded wall-clock window regardless of how
-        many later chunks are co-pending.
-
-        Falls back to an empty dict when the worker pool is disabled;
-        :meth:`collate_offline` will synthesise features on demand in that
-        case.
-        """
-        if self._pool is None:
-            return {}
-        futures: Dict[str, "Future[torch.Tensor]"] = {}
-        for r in requests:
-            wav = r.waveform
-            if wav is None:
-                wav = self.load_audio(r.audio, r.sample_rate)
-                r.waveform = wav
-            futures[r.request_id] = self._pool.submit(self._extract_one, wav)
-        return futures
 
     def collate_gpu(
         self,
@@ -384,84 +275,6 @@ class InputProcessor:
         for r in requests:
             r.waveform = None
 
-        return features, feat_lengths
-
-    def collate_cpu(
-        self,
-        requests: List[Request],
-        futures: Optional[Dict[str, "Future[torch.Tensor]"]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract + pad fbank/mfcc features into pinned CPU tensors.
-
-        Does *not* issue any H2D copy.  The caller is expected to push the
-        returned pinned tensors to the device on whatever CUDA stream it
-        wants the copy to land on.  Returned pad tensor is float32; the
-        caller chooses the target dtype when it converts on device.
-
-        If ``futures`` is provided, harvests the fbank results from it
-        (submitted eagerly by :meth:`prefetch_features`); otherwise runs
-        extraction inline, batching across the worker pool when available.
-        """
-        assert requests, "cannot collate empty batch"
-
-        # 1. Resolve per-utterance features on CPU.
-        if futures:
-            feat_list: List[torch.Tensor] = [
-                futures.pop(r.request_id).result() for r in requests
-            ]
-        elif self._pool is not None and len(requests) > 1:
-            waveforms = [
-                r.waveform if r.waveform is not None
-                else self.load_audio(r.audio, r.sample_rate)
-                for r in requests
-            ]
-            feat_list = list(self._pool.map(self._extract_one, waveforms))
-        else:
-            feat_list = []
-            for r in requests:
-                wav = r.waveform
-                if wav is None:
-                    wav = self.load_audio(r.audio, r.sample_rate)
-                feat_list.append(self._extract_one(wav))
-
-        # 2. Pad + pin in preparation for a non-blocking H2D copy.
-        feat_lengths_cpu = torch.tensor(
-            [f.size(0) for f in feat_list], dtype=torch.int32
-        )
-        padded = torch.nn.utils.rnn.pad_sequence(
-            feat_list, batch_first=True, padding_value=0.0
-        )
-        if self._device.type == "cuda" and not padded.is_pinned():
-            padded = padded.pin_memory()
-            feat_lengths_cpu = feat_lengths_cpu.pin_memory()
-
-        # Release waveforms; we no longer need them once features exist.
-        for r in requests:
-            r.waveform = None
-
-        return padded, feat_lengths_cpu
-
-    def collate_offline(
-        self,
-        requests: List[Request],
-        futures: Optional[Dict[str, "Future[torch.Tensor]"]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Gather per-waveform features into one padded batch on device.
-
-        Convenience wrapper around :meth:`collate_cpu` that immediately
-        issues the H2D copy on the current CUDA stream.  Prefer
-        :meth:`collate_cpu` + explicit stream-controlled H2D in the
-        pipelined path.
-        """
-        padded, feat_lengths_cpu = self.collate_cpu(requests, futures)
-        features = padded.to(
-            device=self._device,
-            dtype=self._config.dtype,
-            non_blocking=True,
-        )
-        feat_lengths = feat_lengths_cpu.to(
-            device=self._device, non_blocking=True
-        )
         return features, feat_lengths
 
     # ------------------------------------------------------------------

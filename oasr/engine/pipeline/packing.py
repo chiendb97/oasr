@@ -99,12 +99,8 @@ class PackingPipeline(OfflinePipeline):
         chunk: List[Request],
         features: torch.Tensor,
         lengths: torch.Tensor,
-        event: Optional[torch.cuda.Event],
     ) -> List[RequestOutput]:
         """Packed forward + CTC decode + finalise on the default stream."""
-        if event is not None:
-            event.wait(torch.cuda.current_stream(self._device))
-
         log_probs, output_lengths = self._mr.forward_offline_packed(
             features,
             lengths,

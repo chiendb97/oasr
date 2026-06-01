@@ -353,11 +353,8 @@ class ASREngine:
             model_runner=self._model_runner,
             output_processor=self._output_processor,
             micro_batch_size=int(config.max_batch_size),
-            depth=max(1, int(config.offline_pipeline_depth)),
             device=self._device,
-            gpu_feature_extraction=bool(config.offline_gpu_feature_extraction),
             preferred_sizes=config.preferred_batch_size,
-            persistent_producer=bool(config.offline_persistent_pipeline),
         )
         if config.enable_sequence_packing:
             # Sequence packing: gapless varlen attention, summed-frame budget.
