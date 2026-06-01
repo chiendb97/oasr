@@ -114,6 +114,52 @@ class TestCtcDecoderGpuOffline:
         # tok1, blank, tok1 → [1, 1] (blank separates the two 1s)
         assert best == [1, 1]
 
+    def test_repeat_after_skipped_blank_collapses(self, device):
+        """Regression for GPU-DEC-1: a repeat *following* a skipped blank
+        must still collapse.
+
+        Path ``tok1, blank, tok1, tok1`` with ``blank_threshold < 1`` skips the
+        (P=1.0) blank frame, so the step that emits the second ``tok1`` carries
+        ``need_add_blank`` (a blank was skipped before it).  The previous kernel
+        relabelled that freshly emitted non-blank token as "ends in blank", so
+        the third (consecutive) ``tok1`` frame extended instead of collapsing,
+        yielding ``[1, 1, 1]``.  CTC ground truth is ``1,blank,1,1 → [1, 1]``
+        (the last two 1s collapse, the blank separates the first pair).
+        """
+        V = 4
+        logp = _make_logp_gpu(4, V, [1, 0, 1, 1], device)
+        seq_lengths = torch.tensor([4], dtype=torch.int32, device=device)
+
+        result = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
+                                        blank_id=0, blank_threshold=0.98,
+                                        max_seq_len=10)
+        assert result.tokens[0][0] == [1, 1]
+
+        # Paged path goes through the parallel topk_phase2_paged_kernel.
+        paged = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
+                                       blank_id=0, blank_threshold=0.98,
+                                       max_seq_len=10, use_paged_memory=True)
+        assert paged.tokens[0][0] == [1, 1]
+
+    def test_repeat_after_leading_skipped_blank_collapses(self, device):
+        """Regression for GPU-DEC-1 (first-step variant): a repeat right after
+        leading skipped blanks must collapse.
+
+        Path ``blank, tok1, tok1`` with ``blank_threshold < 1`` skips the
+        leading blank, so ``first_step`` initialises the beam at ``first_t=1``.
+        The previous kernel put that initial non-blank token in the *blank*
+        slot when ``first_t > 0``, so the next (consecutive) ``tok1`` extended
+        to ``[1, 1]``.  CTC ground truth is ``blank,1,1 → [1]``.
+        """
+        V = 4
+        logp = _make_logp_gpu(3, V, [0, 1, 1], device)
+        seq_lengths = torch.tensor([3], dtype=torch.int32, device=device)
+
+        result = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
+                                        blank_id=0, blank_threshold=0.98,
+                                        max_seq_len=10)
+        assert result.tokens[0][0] == [1]
+
     def test_batched_decode(self, device):
         """Multiple utterances decoded in parallel."""
         V = 6
@@ -192,6 +238,91 @@ class TestCtcDecoderGpuStreaming:
 
         result = decoder.finalize_stream()
         assert result.tokens[0][0] == [1, 2, 3]
+
+    def test_streaming_repeat_after_skipped_blank_collapses(self, device):
+        """Regression for GPU-DEC-1 on the streaming path.
+
+        Same scenario as the offline test: ``tok1, blank, tok1, tok1`` with
+        ``blank_threshold < 1`` skips the blank frame; the repeat following the
+        skip must collapse to ``[1, 1]`` rather than extend to ``[1, 1, 1]``.
+        Exercised via ``decode_chunk`` (shared topk_phase2/first_step kernels),
+        with CUDA graphs off and on to cover both chunk-launcher paths.
+        """
+        V = 4
+        for use_graphs in (False, True):
+            config = GpuDecoderConfig(beam_size=3, blank_id=0,
+                                      blank_threshold=0.98, max_seq_len=10)
+            decoder = GpuStreamingDecoder(config, use_cuda_graphs=use_graphs)
+            decoder.init_stream(batch=1, vocab_size=V, device=device)
+            decoder.decode_chunk(_make_logp_gpu(4, V, [1, 0, 1, 1], device))
+            assert decoder.finalize_stream().tokens[0][0] == [1, 1], \
+                f"use_cuda_graphs={use_graphs}"
+
+    def test_streaming_decodes_more_frames_than_output_cap(self, device):
+        """Regression for GPU-DEC-2: streaming decodes more *frames* than the
+        output-token cap (``max_seq_len``) instead of truncating.
+
+        ``step`` counts decoded frames, not output tokens.  Here many
+        blank-dominant (but not skipped, at ``blank_threshold=1.0``) frames push
+        ``step`` past ``max_seq_len`` before the two real tokens at the end.  The
+        pre-fix chunk loop capped ``step`` at ``max_seq_len`` and dropped the
+        trailing tokens; ``select_seqs`` is now a ring of width ``max_seq_len``
+        and the frame cap is gone, so the tail is decoded.  Output length stays
+        bounded by ``max_seq_len`` via the in-kernel clen cap.
+        """
+        V, msl, n_pad = 4, 8, 12
+        T = n_pad + 2
+        logp = torch.full((1, T, V), -1.0, dtype=torch.float32, device=device)
+        logp[0, :n_pad, 0] = 5.0       # P(blank) ~ 0.99 < 1.0 → decoded, no token
+        logp[0, n_pad, 1] = 5.0        # token 1
+        logp[0, n_pad + 1, 2] = 5.0    # token 2
+        for use_graphs in (False, True):
+            dec = GpuStreamingDecoder(
+                GpuDecoderConfig(beam_size=4, blank_id=0, blank_threshold=1.0,
+                                 max_seq_len=msl),
+                use_cuda_graphs=use_graphs)
+            dec.init_stream(batch=1, vocab_size=V, device=device)
+            dec.decode_chunk(logp)
+            assert dec.step > msl, f"step={dec.step} should exceed cap {msl}"
+            assert dec.finalize_stream().tokens[0][0] == [1, 2], \
+                f"use_cuda_graphs={use_graphs}"
+
+    def test_streaming_graph_multiframe_chunk_with_skips(self, device):
+        """Regression for the captured-graph multi-frame chunk counter race.
+
+        A single multi-frame chunk containing many non-blank frames interleaved
+        with skipped (P=1) blanks must decode identically under CUDA graphs and
+        eager.  The captured graphs previously pushed ``(step, frame_idx)``
+        through one reused pinned host buffer that the launcher overwrote for
+        the next frame before the GPU consumed it, so multi-frame graph chunks
+        saw stale counters and duplicated tokens.  Counters are now set by a
+        by-value kernel on the stream before each launch.
+        """
+        V = 6
+        # 6 groups of ``tok, blank, tok, tok`` (blank separates, then a repeat
+        # collapses) → each group contributes ``tok, tok``.
+        toks = [1, 2, 3, 4, 5, 1]
+        path = []
+        for k in toks:
+            path += [k, 0, k, k]
+        expected = []
+        for k in toks:
+            expected += [k, k]
+        logp = _make_logp_gpu(len(path), V, path, device)
+
+        def run(graphs):
+            dec = GpuStreamingDecoder(
+                GpuDecoderConfig(beam_size=4, blank_id=0, blank_threshold=0.98,
+                                 max_seq_len=64),
+                use_cuda_graphs=graphs)
+            dec.init_stream(batch=1, vocab_size=V, device=device)
+            dec.decode_chunk(logp)   # whole sequence in ONE multi-frame chunk
+            return dec.finalize_stream().tokens[0][0]
+
+        eager = run(False)
+        graph = run(True)
+        assert eager == expected, f"eager={eager} expected={expected}"
+        assert graph == eager, f"graph={graph} eager={eager}"
 
     def test_streaming_multi_frame_chunks(self, device):
         """Streaming with multi-frame chunks."""

@@ -59,13 +59,6 @@ struct CtcStreamGraphCache {
     // setup_internal_data_pointers).  The same address is baked into the
     // captured kernel launches, so the per-frame memcpy must target it.
     void* d_lp_frame_buf = nullptr;
-    // Pinned host int2: ``[step, frame_idx]``.  Captured graphs start with
-    // an ``cudaMemcpyAsync(d_step_ptr, pinned_counters_host, 8 bytes, H2D)``
-    // node that reads from this stable address.  The chunk launcher writes
-    // the current host counters here before each non-blank replay; blank
-    // frames just bump a host-side counter without launching anything.
-    // Removes the per-blank-frame ``advance_frame_idx`` launch entirely.
-    int* pinned_counters_host = nullptr;
 };
 
 std::mutex g_ctc_graph_mutex;
@@ -93,15 +86,6 @@ cudaError_t capture_one_graph(cudaGraphExec_t* out, cudaStream_t capture_stream,
 cudaError_t ensure_graphs_captured(CtcStreamGraphCache* cache, void* state_ptr) {
     if (cache->captured) return cudaSuccess;
 
-    // Pinned host int2 holds the (step, frame_idx) values the captured H2D
-    // node reads at every replay.  Stable address for the cache's lifetime.
-    if (cache->pinned_counters_host == nullptr) {
-        cudaError_t herr = cudaMallocHost(
-            reinterpret_cast<void**>(&cache->pinned_counters_host),
-            sizeof(int) * 2);
-        if (herr != cudaSuccess) return herr;
-    }
-
     cudaStream_t capture_stream = nullptr;
     cudaError_t err = cudaStreamCreate(&capture_stream);
     if (err != cudaSuccess) return err;
@@ -126,20 +110,18 @@ cudaError_t ensure_graphs_captured(CtcStreamGraphCache* cache, void* state_ptr) 
     const int batch_stride = cache->vocab_size;  // d_lp_frame_buf is (batch, vocab_size)
     const int vocab_stride = 1;
 
-    // The captured graph's first op is a tiny H2D copy that refreshes the
-    // device-resident counters from the pinned host buffer.  At replay
-    // time it reads whatever the chunk-launcher wrote into
-    // ``pinned_counters_host`` just before ``cudaGraphLaunch``.  The
-    // streaming kernels then read those values via ``__ldg(d_step)``.
-    // Because the captured launch arguments (source pointer = pinned host
-    // address, destination pointer = state-relative device counter) are
-    // stable, this is replay-safe across all frames and parities.
+    // The captured graph is *pure decode*: it reads the device-resident
+    // counters (``d_step`` / ``d_frame_idx``) via ``__ldg`` but does NOT push
+    // them itself.  The chunk launcher sets them with a ``set_stream_counters``
+    // kernel (step/frame_idx passed by value as launch args) on the same
+    // stream *before* each ``cudaGraphLaunch``.  Passing by value is the key:
+    // an earlier design copied the counters from a single reused pinned host
+    // buffer inside the graph, but the host overwrote that buffer for the next
+    // frame before the GPU executed the copy, so multi-frame chunks decoded
+    // with stale counters (duplicated tokens).  A by-value kernel launch is
+    // captured/ordered on the stream with no host-memory aliasing, so it is
+    // race-free across all frames and parities.
     auto launch_step = [&](int step_for_parity) -> cudaError_t {
-        cudaError_t e = cudaMemcpyAsync(
-            ctc_decoder::device_step_ptr(state_ptr),
-            cache->pinned_counters_host, sizeof(int) * 2,
-            cudaMemcpyHostToDevice, capture_stream);
-        if (e != cudaSuccess) return e;
         return ctc_decoder::streaming_step_persistent(
             state_ptr, data.d_lp_frame_buf, batch_stride, vocab_stride,
             cache->blank_id, -1, cache->batch, cache->beam, cache->vocab_size,
@@ -171,10 +153,6 @@ void destroy_graph_cache_entry(CtcStreamGraphCache* cache) {
     if (cache->graph_even) cudaGraphExecDestroy(cache->graph_even);
     if (cache->graph_odd) cudaGraphExecDestroy(cache->graph_odd);
     cache->graph_first = cache->graph_even = cache->graph_odd = nullptr;
-    if (cache->pinned_counters_host) {
-        cudaFreeHost(cache->pinned_counters_host);
-        cache->pinned_counters_host = nullptr;
-    }
     cache->captured = false;
 }
 
@@ -544,17 +522,21 @@ int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk
   if (cache != nullptr) {
     const size_t lp_row_bytes = sizeof(float) * static_cast<size_t>(vocab_size);
     for (int t = 0; t < chunk_t; ++t) {
-      if (step >= max_seq_len) break;
+      // No ``step >= max_seq_len`` cap: ``step`` counts decoded frames, which
+      // can exceed the output-token cap (max_seq_len) for long streams.
+      // ``select_seqs`` is a ring of width max_seq_len (kernels index it
+      // ``% max_seq_len``) and clen is capped in topk_phase2, so an unbounded
+      // step is safe.
       if (mask_data && !mask_data[t]) {
         // Blank: host-only frame_idx increment.  The next non-blank's
         // captured H2D will push the updated value to the device.
         ++frame_idx;
         continue;
       }
-      // Update the pinned host counters that the captured graph's H2D
-      // reads at replay time.  This is a 2×int CPU write, no kernel launch.
-      cache->pinned_counters_host[0] = step;
-      cache->pinned_counters_host[1] = frame_idx;
+      // Set the device counters by value on the stream (race-free, ordered
+      // before the graph that reads them).  See ensure_graphs_captured.
+      ctc_decoder::set_stream_counters(state_buffer.data_ptr(), step, frame_idx,
+                                       stream);
       // Refresh ``d_lp_frame_buf`` from this frame's log-prob slice.
       const float* lp_frame = lp_data + static_cast<size_t>(t) * seq_stride;
       cudaError_t cerr = cudaMemcpy2DAsync(
@@ -590,9 +572,8 @@ int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk
   // non-blank, but recovers the per-blank no-op behaviour that Step 3
   // accidentally regressed.
   for (int t = 0; t < chunk_t; ++t) {
-    if (step >= max_seq_len) {
-      break;
-    }
+    // No step cap — see the graph-path loop above; select_seqs is a ring and
+    // clen is capped in-kernel, so step may exceed max_seq_len safely.
     if (mask_data && !mask_data[t]) {
       ++frame_idx;
       continue;
@@ -767,13 +748,15 @@ void ctc_beam_search_chunk_batched(TensorView state_ptrs,
     if (cache != nullptr) {
       const size_t lp_row_bytes = sizeof(float) * static_cast<size_t>(vocab_size);
       for (int t = 0; t < chunk_t; ++t) {
-        if (step >= max_seq_len) break;
+        // No step cap (ring select_seqs + in-kernel clen cap) — see
+        // ctc_beam_search_chunk.
         if (mask_data && !mask_data[t]) {
           ++frame_idx;
           continue;
         }
-        cache->pinned_counters_host[0] = step;
-        cache->pinned_counters_host[1] = frame_idx;
+        // Race-free by-value counter set on the stream (see
+        // ensure_graphs_captured / the single-state chunk launcher).
+        ctc_decoder::set_stream_counters(sptr, step, frame_idx, stream);
         const float* lp_frame = lp_base + static_cast<size_t>(t) * seq_stride;
         cudaError_t cerr = cudaMemcpy2DAsync(
             cache->d_lp_frame_buf, lp_row_bytes,
@@ -799,7 +782,7 @@ void ctc_beam_search_chunk_batched(TensorView state_ptrs,
     } else {
       // Eager fallback — same as ``ctc_beam_search_chunk``.
       for (int t = 0; t < chunk_t; ++t) {
-        if (step >= max_seq_len) break;
+        // No step cap (ring select_seqs + in-kernel clen cap).
         if (mask_data && !mask_data[t]) {
           ++frame_idx;
           continue;
