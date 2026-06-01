@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <cfloat>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cub/cub.cuh>
@@ -428,7 +429,13 @@ __global__ void init_streaming_select_kernel(int* __restrict__ select_seqs,
         select_seqs[i] = i % max_seq_len;
     }
     for (int b = tid; b < batch; b += stride) {
-        select_seq_lens[b] = max_seq_len;
+        // Streaming has no fixed select length — every fed frame is decoded and
+        // ``step`` may exceed ``max_seq_len`` (the output-token cap) on long
+        // streams.  The per-step kernels guard on ``step >= select_seq_lens``,
+        // so set it to INT_MAX to disable that bound; select_seqs itself is a
+        // ring of width max_seq_len.  (Paged read passes the real step count as
+        // max_select_seq_len, so gather still derives the right parity.)
+        select_seq_lens[b] = INT_MAX;
     }
 }
 
@@ -503,8 +510,16 @@ __global__ void set_select_seq_step_kernel(int* __restrict__ select_seqs,
         return;
     int step = __ldg(d_step);
     int frame_idx = __ldg(d_frame_idx);
+    // ``step`` is the running count of decoded frames and is *not* bounded by
+    // ``max_seq_len`` (the output-token cap) in streaming — a long stream
+    // decodes more frames than it emits tokens.  ``select_seqs`` is only read
+    // for the need_add_blank gap test, which compares consecutive steps, so a
+    // ring of width ``max_seq_len`` is sufficient: step and step-1 never alias
+    // (max_seq_len >= 2) and are written every step once any blank is skipped.
+    // Offline always has step < max_seq_len, so ``% max_seq_len`` is a no-op
+    // there.
     if (step != frame_idx)
-        select_seqs[b * max_seq_len + step] = frame_idx;
+        select_seqs[b * max_seq_len + step % max_seq_len] = frame_idx;
 }
 
 // =============================================================================
@@ -722,7 +737,10 @@ __global__ void prob_matrix_kernel(const float* __restrict__ log_prob, int batch
     if (step >= select_seq_lens[bid])
         return;
 
-    int t = select_seqs[bid * max_seq_len + step];
+    // ``select_seqs`` is a width-``max_seq_len`` ring indexed by step (offline
+    // step < max_seq_len so the modulo is a no-op; streaming may run more
+    // decoded frames than the output cap — see set_select_seq_step_kernel).
+    int t = select_seqs[bid * max_seq_len + step % max_seq_len];
 
     // When there are skipped (blank-dominant) frames between the previous
     // selected frame and this one, we must account for the blank path that
@@ -730,8 +748,7 @@ __global__ void prob_matrix_kernel(const float* __restrict__ log_prob, int batch
     // collapses both blank and non-blank paths into the blank slot:
     //   effective_blank    = logsumexp(prev_blank, prev_nonblank)
     //   effective_nonblank = NEG_INF
-    bool need_add_blank =
-        (select_seqs[bid * max_seq_len + step] > select_seqs[bid * max_seq_len + step - 1] + 1);
+    bool need_add_blank = (t > select_seqs[bid * max_seq_len + (step - 1) % max_seq_len] + 1);
 
     int total = ldc * beam;
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -817,14 +834,15 @@ __global__ void prob_space_blank_kernel(const float* __restrict__ log_prob, int 
     if (step >= select_seq_lens[bid])
         return;
 
-    int t = select_seqs[bid * max_seq_len + step];
+    // Width-``max_seq_len`` ring (no-op modulo for offline; see
+    // set_select_seq_step_kernel for the streaming rationale).
+    int t = select_seqs[bid * max_seq_len + step % max_seq_len];
     int beam_idx = threadIdx.x;
     if (beam_idx >= beam)
         return;
 
     // Apply the same blank-frame adjustment as prob_matrix_kernel.
-    bool need_add_blank =
-        (select_seqs[bid * max_seq_len + step] > select_seqs[bid * max_seq_len + step - 1] + 1);
+    bool need_add_blank = (t > select_seqs[bid * max_seq_len + (step - 1) % max_seq_len] + 1);
 
     int pprev_idx = bid * ldbeam + beam_idx;
     float2 raw_prev = pprev[pprev_idx];
@@ -1146,11 +1164,17 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_kernel(
                 clast[dst_base] = smem.topk.src_clast[src_beam];
                 clen_dst[dst_base] = prevlen;
             } else {
-                // Non-blank extension: append new character.
+                // Non-blank extension: append new character.  Cap the length at
+                // the clist capacity (ldseq_len = output-token cap) so a stream
+                // that decodes more frames than it can emit tokens never lets
+                // clen run past this beam's clist region — merge_kernel's
+                // seq_compare and the result copy both bound their reads by clen.
                 clast[dst_base] = char_id;
-                clen_dst[dst_base] = prevlen + 1;
                 if (prevlen < ldseq_len) {
+                    clen_dst[dst_base] = prevlen + 1;
                     clist_dst[bid * beam * ldseq_len + out_beam * ldseq_len + prevlen] = char_id;
+                } else {
+                    clen_dst[dst_base] = ldseq_len;
                 }
             }
 
@@ -2257,9 +2281,18 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_paged_kernel(
         int bk_dst = bid * beam + out_beam;
         int dst_base = bid * ldbeam + out_beam;
 
+        // Output-token capacity = max_lp logical pages.  A stream may decode
+        // more frames than it can emit tokens; cap clen at the capacity so the
+        // last logical page index never exceeds max_lp (block_table OOB) and
+        // gather/seq_compare stay in range.
+        const int out_cap = max_lp * page_size;
         if (char_id == blank_id) {
             clast[dst_base] = smem.topk.src_clast[src_beam];
             clen_dst[dst_base] = prevlen;
+        } else if (prevlen >= out_cap) {
+            // Output cap reached: keep the prefix but stop appending tokens.
+            clast[dst_base] = char_id;
+            clen_dst[dst_base] = out_cap;
         } else {
             // Non-blank: append char_id at position prevlen
             clast[dst_base] = char_id;
