@@ -26,9 +26,7 @@ def _make_pipeline(preferred_sizes: Optional[Sequence[int]], mb: int = 8) -> Off
         model_runner=SimpleNamespace(),
         output_processor=SimpleNamespace(),
         micro_batch_size=mb,
-        depth=1,
         device=torch.device("cpu"),
-        gpu_feature_extraction=False,
         preferred_sizes=preferred_sizes,
     )
 

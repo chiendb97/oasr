@@ -31,7 +31,6 @@ from oasr.engine.scheduler import Scheduler
 def _make_config(
     *,
     max_batch_size: int = 16,
-    offline_pipeline_depth: int = 3,
     schedule_policy: str = "bucket",
     max_batch_frames: Optional[int] = None,
     max_offline_pad_ratio: float = 0.0,
@@ -40,7 +39,6 @@ def _make_config(
     return EngineConfig(
         ckpt_dir="/tmp/fake",
         max_batch_size=max_batch_size,
-        offline_pipeline_depth=offline_pipeline_depth,
         schedule_policy=schedule_policy,
         max_batch_frames=max_batch_frames,
         # Disable the pad-ratio / bucket-ratio guards so the frame cap is the
@@ -67,9 +65,7 @@ def _make_pipeline(
         model_runner=SimpleNamespace(),
         output_processor=SimpleNamespace(),
         micro_batch_size=mb,
-        depth=1,
         device=torch.device("cpu"),
-        gpu_feature_extraction=False,
         max_batch_frames=max_batch_frames,
     )
 
@@ -131,12 +127,12 @@ class TestSchedulerFrameCap:
         assert sched.num_waiting_offline == 2
 
     def test_none_keeps_count_behaviour(self):
-        # Without a frame cap, batch fills to the count cap (16 * 3 = 48).
+        # Without a frame cap, batch fills to the count cap (max_batch_size = 16).
         sched = Scheduler(_make_config(max_batch_frames=None))
         for _ in range(60):
             sched.add_request(_make_offline(num_frames=200))
         batch = sched.schedule_offline()
-        assert len(batch) == 48
+        assert len(batch) == 16
 
     def test_short_utts_pack_more_than_long(self):
         sched = Scheduler(_make_config(max_batch_frames=1000))

@@ -136,7 +136,7 @@ Error responses use the canonical Google error envelope:
         "dtype": "torch.float16",
         "chunk_size": 16,
         "max_batch_size": 64,
-        "decoder_type": "ctc_greedy_search",
+        "decoder_type": "ctc_gpu",
         "vocab_size": 5000
       }
     }
@@ -251,8 +251,8 @@ partials-per-request.
 
 ## Operational tips
 
-- Tune `--max-concurrent-requests` to the engine's
-  `max_batch_size * offline_pipeline_depth`.  Excess load returns HTTP 503 /
+- Tune `--max-concurrent-requests` to a small multiple of the engine's
+  `max_batch_size`.  Excess load returns HTTP 503 /
   gRPC `RESOURCE_EXHAUSTED` — clients should back off and retry.
 - For local development, a single process pinned to one GPU keeps things
   simple; multi-GPU scale comes from running additional `oasr-server`

@@ -74,10 +74,10 @@ The engine no longer has a separate `OfflineEngine` subclass — pass
 | `config.py` | `EngineConfig` | Unified dataclass aggregating model / cache / feature / decoding / detokenization settings. Auto-detects SentencePiece model and `units.txt`. |
 | `request.py` | `Request`, `RequestOutput`, `RequestState` | Single-request representation, output container, lifecycle enum (`WAITING → RUNNING → FINISHED`). |
 | `scheduler.py` | `Scheduler`, `SchedulerOutput` | Dynamic-batching admission control and length bucketing. See `scheduler.md`. |
-| `input_processor.py` | `InputProcessor` | Audio loading, batched fbank/MFCC (CPU pool or GPU stream), streaming chunk-split, CMVN-free (CMVN is in the model). |
+| `input_processor.py` | `InputProcessor` | Audio loading, batched GPU fbank/MFCC, streaming chunk-split, CMVN-free (CMVN is in the model). |
 | `model_runner.py` | `ModelRunner` | Wraps `ConformerModel`. Owns the cache managers; runs `forward_offline`, `forward_streaming_step`, and the batched paged path. |
 | `pipeline.py` | `OfflinePipeline` | Producer/consumer pipeline that splits an offline batch into length-bucketed micro-batches and overlaps fbank with forward+decode. |
-| `output_processor.py` | `OutputProcessor` | CTC decode (greedy / prefix beam / GPU / WFST) and SentencePiece-or-units detokenization. |
+| `output_processor.py` | `OutputProcessor` | CTC decode (GPU beam / k2 WFST) and SentencePiece-or-units detokenization. |
 
 ## 4. Core Algorithms and Workflows
 
@@ -302,15 +302,13 @@ prepare_offline                    prepare_streaming
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_batch_size` | 32 | Encoder forward `B`. In streaming mode caps the running pool; in offline mode is the GPU forward width of each pipeline micro-batch. Offline admission per `step()` is capped at `max_batch_size × offline_pipeline_depth`. |
+| `max_batch_size` | 32 | Encoder forward `B`. In streaming mode caps the running pool; in offline mode is the GPU forward width. Offline admission per `step()` is one length-bucketed batch of up to `max_batch_size`, run as a single forward. |
 | `preferred_batch_size` | `None` | When set, scheduler snaps streaming admission and offline micro-batches to one of these sizes; engine pre-warms the encoder CUDA-Graph cache at each value; defaults `feature_graph_batch_buckets`. `max_wait_time` is the escape valve. See [scheduler.md §4.6](scheduler.md). |
 | `length_bucket_ratio` | 0.0 | Soft floor on `min_len/max_len` in offline batch. |
 | `max_offline_pad_ratio` | 4.0 | Hard cap on padded/useful compute. |
 | `max_wait_time` | 0.2 | Starvation bound (seconds). |
 | `schedule_policy` | `"bucket"` | `fcfs` / `bucket` / `sjf`. |
 | `streaming_cohort_admit` | `True` | Admit only when running pool offsets align — enables full `B` batched paged forward. |
-| `offline_pipeline_depth` | 3 | In-flight micro-batches (1 = sequential). |
-| `offline_gpu_feature_extraction` | `True` | Batched GPU fbank vs CPU pool. |
 
 ### Paged KV cache
 
@@ -325,17 +323,15 @@ prepare_offline                    prepare_streaming
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `feature_config` | `FeatureConfig(dither=0.0)` | 80-dim log-mel FBANK at 16 kHz; deterministic. |
-| `num_feature_workers` | 0 (auto) | CPU thread pool size for offline fbank. `0` → `min(4, nproc//4)`. |
-| `cpu_intra_op_threads` | 0 (auto) | `torch.set_num_threads`; oversubscription protection. |
+| `feature_config` | `FeatureConfig(dither=0.0)` | 80-dim log-mel FBANK at 16 kHz; deterministic. Extracted on the GPU via the batched fbank/mfcc kernels. |
 
 ### Decoding and detokenization
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `decoder_type` | `"ctc_prefix_beam"` | `ctc_greedy` / `ctc_prefix_beam` / `ctc_gpu` / `ctc_wfst`. |
+| `decoder_type` | `"ctc_gpu"` | `ctc_gpu` (GPU CTC beam) / `ctc_wfst` (k2 WFST, GPU). |
 | `gpu_decoder_config` | `GpuDecoderConfig()` | GPU CTC config (beam, blank ID, thresholds). |
-| `cpu_decoder_config` | `DecoderConfig(search_type="prefix_beam")` | CPU decoder config. |
+| `wfst_decoder_config` | `DecoderConfig(search_type="wfst")` | k2 WFST decoder config. |
 | `fst_path` | `None` | Required for `ctc_wfst`. |
 | `sentencepiece_model` | auto-detected | `.model` in `ckpt_dir`. |
 | `unit_table` | auto-detected | `units.txt` / `words.txt` fallback. |
@@ -437,32 +433,21 @@ engine = ASREngine(EngineConfig(
    Keep `streaming_cohort_admit=True` and pick `max_batch_size` to fit
    the GPU. Larger batches amortise launch overhead but spread per-step
    latency.
-2. **Two CUDA streams overlap fbank and forward.** `_feat_stream` runs
-   the streaming fbank kernel; the default stream waits on a recorded
-   event before reading `feature_buffer`. The offline pipeline does the
-   same with its own feat stream.
-3. **`offline_pipeline_depth=3` is a good default.** Depth 1 disables
-   threading and overlap; depth 2 runs CPU prep one step ahead;
-   depth 3 covers any bursty scheduling. Above 3 rarely helps because
-   fbank is faster than encoder forward in steady state.
-4. **GPU fbank vs CPU pool.** `offline_gpu_feature_extraction=True`
-   bypasses the CPU pool's ~550 fbanks/s ceiling by running the whole
-   micro-batch as one fused kernel sequence on the feat stream. Set
-   `False` only when GPU is already saturated by the model forward.
-5. **Length bucketing trade-off.** `length_bucket_ratio=0` (default)
-   ships one big batch; `0.5` insists on ≥50 % length similarity. The
-   default is faster on real datasets because splitting a batch
-   multiplies CPU fbank cost; `max_offline_pad_ratio=4.0` is the safety
-   net against pathological mixes.
-6. **Avoid oversubscribing the host CPU.** The InputProcessor caps
-   PyTorch intra-op threads (default `min(8, nproc / num_workers)`)
-   because the PyTorch default oversubscribes for short fbank ops.
-7. **NVTX profiling.** The step loop is annotated with
+2. **A CUDA stream overlaps streaming fbank and forward.** `_feat_stream`
+   runs the streaming fbank kernel; the default stream waits on a recorded
+   event before reading `feature_buffer`. The offline pipeline runs its
+   micro-batches sequentially (GPU fbank → forward → decode), so it needs
+   no extra stream.
+3. **Length bucketing trade-off.** `length_bucket_ratio=0` (default)
+   ships one big batch; `0.5` insists on ≥50 % length similarity;
+   `max_offline_pad_ratio=4.0` is the safety net against pathological
+   mixes.
+4. **NVTX profiling.** The step loop is annotated with
    `nvtx_push("engine.step")` → `schedule` / `allocate_stream` /
    `offline_batch` / `extract_fbank` / `forward_streaming` /
    `decode_streaming` / `finalize_streams`. Capture with
    `nsys profile`/`ncu` to get per-stage timing without touching code.
-8. **Pool sizing.** The engine's most common production failure is
+5. **Pool sizing.** The engine's most common production failure is
    `BlockPool` exhaustion. Size `max_num_blocks` for
    `max_batch_size × max_logical_blocks` plus headroom; trade off
    against GPU memory.

@@ -98,7 +98,7 @@ class Request:
         self.features: Optional[torch.Tensor] = None          # (1, T, F)
         self.feature_lengths: Optional[torch.Tensor] = None   # (1,)
         # Offline-path raw waveform (CPU, scaled) held between ``add_request`` and
-        # the batched ``collate_offline`` call.  Released once features are built.
+        # the batched ``collate_gpu`` call.  Released once features are built.
         self.waveform: Optional[torch.Tensor] = None  # (T_samples,) CPU float32
         # Number of feature frames.  For offline this starts as a cheap
         # sample-count-derived estimate so the scheduler can bucket before

@@ -71,10 +71,9 @@ class Scheduler:
     * ``_running`` — admitted streaming requests with allocated KV cache.
 
     Each :meth:`schedule` call emits at most one offline batch (sized by
-    ``max_batch_size * offline_pipeline_depth`` and bucketed by feature
-    length), admits as many streaming requests as ``max_batch_size``
-    allows, and tags running requests for processing or finalisation
-    based on remaining chunk state.
+    ``max_batch_size`` and bucketed by feature length), admits as many
+    streaming requests as ``max_batch_size`` allows, and tags running
+    requests for processing or finalisation based on remaining chunk state.
 
     Parameters
     ----------
@@ -261,14 +260,13 @@ class Scheduler:
     def _build_offline_batch(self) -> List[Request]:
         """Construct one length-bucketed offline batch.
 
-        Policy dispatch lives here.  The batch cap is
-        ``max_batch_size * offline_pipeline_depth`` — enough to keep the
-        pipeline producer one depth ahead of the GPU consumer while
-        ``OfflinePipeline`` re-splits the admitted pool into
-        ``max_batch_size`` micro-batches internally.  Bucket tolerance is
-        ``length_bucket_ratio``.  Requests whose ``waited_for`` exceeds
-        ``max_wait_time`` become forced anchors — they ship next step
-        regardless of whether length-similar peers are available.
+        Policy dispatch lives here.  The batch cap is ``max_batch_size`` —
+        one micro-batch per ``step()``, which :class:`OfflinePipeline` runs
+        as a single offline forward (length-bucketed by feature length).
+        Bucket tolerance is ``length_bucket_ratio``.  Requests whose
+        ``waited_for`` exceeds ``max_wait_time`` become forced anchors —
+        they ship next step regardless of whether length-similar peers are
+        available.
 
         When ``preferred_batch_size`` is set, the final batch size is
         snapped down to a preferred value (unless force-flushed) so the
@@ -281,7 +279,7 @@ class Scheduler:
             return []
 
         cfg = self._config
-        cap = max(1, cfg.max_batch_size * max(1, cfg.offline_pipeline_depth))
+        cap = max(1, cfg.max_batch_size)
         policy = cfg.schedule_policy
 
         # Forced-flush anchor if the oldest request has waited too long.
