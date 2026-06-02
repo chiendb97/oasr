@@ -310,79 +310,8 @@ class InputProcessor:
 
         return features, feat_lengths
 
-    # ------------------------------------------------------------------
-    # Streaming chunking
-    # ------------------------------------------------------------------
-
-    def chunk_features(self, features: torch.Tensor) -> List[torch.Tensor]:
-        """Split a ``(1, T, F)`` feature tensor into overlapping chunk windows.
-
-        Kept for tests and legacy use.  The live streaming path now slices
-        encoder chunks directly out of ``Request.feature_buffer`` in the
-        engine step loop; this helper is no longer called for admission.
-
-        * stride = ``subsampling_rate * chunk_size``
-        * window = ``(chunk_size - 1) * subsampling_rate + right_context + 1``
-        """
-        cfg = self._config
-        stride = cfg.stride
-        window = cfg.decoding_window
-        num_frames = features.size(1)
-        context = cfg.right_context + 1
-
-        chunks: List[torch.Tensor] = []
-        for cur in range(0, num_frames - context + 1, stride):
-            end = min(cur + window, num_frames)
-            chunks.append(features[:, cur:end, :])
-        return chunks
-
-    # ------------------------------------------------------------------
-    # Streaming audio ingest + per-step batched fbank
-    # ------------------------------------------------------------------
 
     def prepare_streaming(self, request: Request) -> None:
-        """Register a streaming request from a full waveform (legacy API).
-
-        Splits the raw waveform into **audio-sample** chunks that the engine
-        then feeds into the fbank path incrementally — one chunk per step per
-        stream.  Only the tail of the previous chunk is re-used when
-        extracting features, so the engine never looks at future audio when
-        processing the current chunk.
-
-        The default audio-chunk size corresponds to ``stride`` feature frames
-        (i.e. one encoder chunk worth of new audio): at 16 kHz with a 10 ms
-        hop and ``chunk_size=16``/``subsampling_rate=4`` that's 10240 samples
-        ≈ 640 ms.
-
-        Prefer :meth:`prepare_streaming_open` + :meth:`append_streaming_chunk`
-        for chunk-by-chunk feeding, which models a real-time client more
-        faithfully and avoids the up-front waveform load.
-        """
-        wav = request.waveform if request.waveform is not None \
-            else self.load_audio(request.audio, request.sample_rate)
-
-        # Keep the waveform on CPU float32 for fbank; GPU promotion is batched
-        # in ``extract_streaming_batch``.
-        wav_cpu = wav.detach()
-        if wav_cpu.device.type != "cpu":
-            wav_cpu = wav_cpu.cpu()
-
-        chunk_samples = self.streaming_audio_chunk_samples
-        chunks: "deque[torch.Tensor]" = deque()
-        n = wav_cpu.numel()
-        for start in range(0, n, chunk_samples):
-            chunks.append(wav_cpu[start: start + chunk_samples].contiguous())
-
-        request.audio_chunks = chunks
-        request.audio_tail = wav_cpu.new_empty(0)
-        request.audio_final = True  # whole-waveform API — no more audio will arrive
-        request.num_frames = self._estimate_num_frames(n)
-        request.feature_buffer = None
-        request.feature_frames = 0
-        request.feature_cursor = 0
-        request.waveform = None
-
-    def prepare_streaming_open(self, request: Request) -> None:
         """Register an empty streaming request — chunks arrive via
         :meth:`append_streaming_chunk`.
 
@@ -410,7 +339,7 @@ class InputProcessor:
         Parameters
         ----------
         request : Request
-            A request previously initialised with :meth:`prepare_streaming_open`.
+            A request previously initialised with :meth:`prepare_streaming`.
         chunk : Tensor or ndarray
             1-D audio samples (CPU or GPU; converted to CPU float32).
         is_last : bool
@@ -420,7 +349,7 @@ class InputProcessor:
         if request.audio_chunks is None:
             raise RuntimeError(
                 "append_streaming_chunk called on a request that was not "
-                "initialised via prepare_streaming_open"
+                "initialised via prepare_streaming"
             )
         if request.audio_final:
             raise RuntimeError(

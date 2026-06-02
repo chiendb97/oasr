@@ -82,10 +82,10 @@ class StreamingPipeline(Pipeline):
         split into audio-chunk deque entries via
         :meth:`InputProcessor.prepare_streaming`.
         """
-        if request.audio is None:
-            self._inp.prepare_streaming_open(request)
-        else:
+        if request.waveform is not None:
             self._inp.prepare_streaming(request)
+        else:
+            raise ValueError("StreamingPipeline.admit: request.waveform must be not None")
         self._scheduler.add_request(request)
 
     def feed_chunk(
