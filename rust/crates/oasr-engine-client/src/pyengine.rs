@@ -8,7 +8,7 @@
 //! of being a single thread.
 
 use bytes::Bytes;
-use numpy::PyArray1;
+use numpy::{PyArray1, PyArrayMethods};
 use oasr_wire::{ErrorCode, Event, ModelInfo};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
@@ -323,8 +323,26 @@ impl PyEngine {
         _py: Python<'py>,
         bound: &Bound<'py, PyAny>,
     ) -> Result<Vec<Event>, PyEngineError> {
+        let list = Self::step_raw(bound)?;
+        Self::extract_events(&list)
+    }
+
+    /// Call `ASREngine.step()` and return the raw `RequestOutput` list without
+    /// marshaling its fields.  Split out from [`step_locked`] so callers (the
+    /// dispatcher) can time the GPU-bound step separately from the per-output
+    /// PyO3 extraction in [`extract_events`].
+    pub fn step_raw<'py>(
+        bound: &Bound<'py, PyAny>,
+    ) -> Result<Bound<'py, PyList>, PyEngineError> {
         let outputs = bound.call_method0("step")?;
-        let list: Bound<'_, PyList> = outputs.downcast_into()?;
+        let list: Bound<'py, PyList> = outputs.downcast_into()?;
+        Ok(list)
+    }
+
+    /// Marshal a `RequestOutput` list (from [`step_raw`]) into native events.
+    /// This is the GIL-held per-output `getattr` + `Vec` materialization that
+    /// runs on the dispatcher thread after each step.
+    pub fn extract_events(list: &Bound<'_, PyList>) -> Result<Vec<Event>, PyEngineError> {
         let mut events = Vec::with_capacity(list.len());
         for item in list.iter() {
             let rid: String = item.getattr("request_id")?.extract()?;
@@ -368,15 +386,26 @@ impl PyEngine {
 /// fallback — the engine concatenates this with `audio_tail` and needs a
 /// writable buffer.
 fn audio_bytes_to_numpy<'py>(py: Python<'py>, audio: &[u8]) -> PyResult<Bound<'py, PyArray1<f32>>> {
-    // The byte slice carries no 4-byte alignment guarantee, so reinterpreting
-    // it as `*const f32` is UB (and aborts under the slice alignment check).
-    // Decode each f32 explicitly from little-endian bytes; ragged tail bytes
-    // (len not a multiple of 4) are dropped, mirroring `np.frombuffer`.
-    let samples: Vec<f32> = audio
-        .chunks_exact(std::mem::size_of::<f32>())
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-    Ok(PyArray1::<f32>::from_slice_bound(py, &samples))
+    // The payload is contiguous little-endian f32 (already produced by the
+    // front-end / `oasr-asr`).  Fill a freshly-allocated numpy array with a
+    // single bulk memcpy into its (f32-aligned) backing store, instead of the
+    // old per-element `from_le_bytes` decode + second copy through a Vec —
+    // that loop dominated the dispatcher's per-tick admit cost on offline
+    // batches.  x86 is little-endian, so the source byte layout matches the
+    // destination; ragged tail bytes (len % 4 != 0) are dropped, mirroring
+    // `np.frombuffer`.
+    let elem = std::mem::size_of::<f32>();
+    let n = audio.len() / elem;
+    // SAFETY: `new_bound` returns an uninitialized, contiguous 1-D array of
+    // `n` f32; we immediately initialize every one of its `n * elem` bytes via
+    // a single non-overlapping copy from `audio` (a distinct allocation).
+    let arr = unsafe {
+        let arr = PyArray1::<f32>::new_bound(py, n, false);
+        let dst = arr.as_slice_mut().expect("fresh 1-D array is contiguous");
+        std::ptr::copy_nonoverlapping(audio.as_ptr(), dst.as_mut_ptr().cast::<u8>(), n * elem);
+        arr
+    };
+    Ok(arr)
 }
 
 fn collect_model_info(_py: Python<'_>, cfg: &Bound<'_, PyAny>) -> PyResult<ModelInfo> {

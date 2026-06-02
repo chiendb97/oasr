@@ -90,6 +90,7 @@ async fn serve(cli: Cli) -> Result<()> {
         max_concurrent_requests: cli.max_concurrent_requests,
         admit_window: Duration::from_millis(cli.admit_window_ms),
         admit_threshold: cli.admit_threshold,
+        trace_dispatch: cli.trace_dispatch,
         ..DispatcherConfig::default()
     };
     let client = Arc::new(EngineClient::start(engine, client_cfg));

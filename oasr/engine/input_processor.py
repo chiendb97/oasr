@@ -67,6 +67,13 @@ class InputProcessor:
         self._device = device
         self._feature_config: FeatureConfig = config.feature_config  # type: ignore[assignment]
 
+        # Persistent **pinned** 1-D staging buffer for the offline collate H2D.
+        # Reused across micro-batches so we pay ``cudaHostAlloc`` (slow) once and
+        # grow geometrically, instead of allocating + pinning a fresh
+        # ``(B, T_max)`` tensor every batch.  Viewed contiguously as
+        # ``(B, T_max)`` per call so the H2D stays a single async transfer.
+        self._wav_stage: Optional[torch.Tensor] = None
+
         # Shared CUDA Graph memory-pool handle injected by ``ASREngine`` so the
         # feature-extraction graph cache (added in Step 2 of the plan) shares
         # one pool with the encoder/CTC captures. ``None`` when the engine has
@@ -191,6 +198,23 @@ class InputProcessor:
         request.features = None
         request.feature_lengths = None
 
+    def _wav_stage_view(self, batch: int, t_max: int) -> torch.Tensor:
+        """Contiguous ``(batch, t_max)`` view of the reused pinned staging
+        buffer, growing the backing allocation geometrically on demand.
+
+        Pinned host memory so the subsequent ``.to(cuda, non_blocking=True)``
+        is a true async H2D.  Reuse is safe on the synchronous offline path:
+        ``wav_gpu`` is fully consumed (and D→H-synced at decode) before the
+        next collate overwrites the buffer.  The overlap pipeline double-buffers
+        explicitly rather than sharing this single buffer.
+        """
+        need = batch * t_max
+        cur = 0 if self._wav_stage is None else self._wav_stage.numel()
+        if cur < need:
+            new_cap = max(need, cur * 2)
+            self._wav_stage = torch.zeros(new_cap, dtype=torch.float32, pin_memory=True)
+        return self._wav_stage[:need].view(batch, t_max)
+
     def collate_gpu(
         self,
         requests: List[Request],
@@ -231,20 +255,29 @@ class InputProcessor:
                 wav = self.load_audio(r.audio, r.sample_rate)
             waveforms.append(wav)
 
-        wav_lengths = torch.tensor(
-            [w.size(0) for w in waveforms], dtype=torch.int64
-        )
-        T_max = int(wav_lengths.max().item())
+        wav_sizes = [w.size(0) for w in waveforms]
+        wav_lengths = torch.tensor(wav_sizes, dtype=torch.int64)
+        B = len(waveforms)
+        T_max = max(wav_sizes)
 
-        # One pinned H2D for the whole micro-batch of waveforms.
-        padded_wav_cpu = torch.zeros(
-            len(waveforms), T_max, dtype=torch.float32
-        )
-        for i, w in enumerate(waveforms):
-            padded_wav_cpu[i, : w.size(0)] = w
+        # One async H2D for the whole micro-batch, staged through a persistent
+        # pinned buffer.  ``stage`` is a contiguous ``(B, T_max)`` view of the
+        # reused pinned allocation; zero it (padding must be 0 for fbank), copy
+        # each waveform into its row, then issue a single non-blocking transfer.
+        # This replaces the old ``torch.zeros(...).pin_memory()`` which paid a
+        # fresh ``cudaHostAlloc`` + a second full copy every batch (~20 ms for a
+        # 64-utterance offline batch).
         if self._device.type == "cuda":
-            padded_wav_cpu = padded_wav_cpu.pin_memory()
-        wav_gpu = padded_wav_cpu.to(device=self._device, non_blocking=True)
+            stage = self._wav_stage_view(B, T_max)
+            stage.zero_()
+            for i, w in enumerate(waveforms):
+                stage[i, : wav_sizes[i]] = w
+            wav_gpu = stage.to(device=self._device, non_blocking=True)
+        else:
+            padded_wav_cpu = torch.zeros(B, T_max, dtype=torch.float32)
+            for i, w in enumerate(waveforms):
+                padded_wav_cpu[i, : wav_sizes[i]] = w
+            wav_gpu = padded_wav_cpu
 
         fcfg = self._feature_config
         if supports_batched_fbank(fcfg) or supports_batched_mfcc(fcfg):

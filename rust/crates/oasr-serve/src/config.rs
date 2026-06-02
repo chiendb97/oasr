@@ -44,6 +44,13 @@ pub struct Cli {
     /// Decoder type.
     #[arg(long)]
     pub decoder_type: Option<String>,
+    /// Offline only: overlap per-request admission prep (waveform load + scale
+    /// + frame stamp) with the GPU ``step()`` on a daemon prep thread.  Helps
+    /// at high concurrency (a deep backlog to pipeline); can slightly regress
+    /// at low concurrency due to GIL contention, so it is opt-in.  No effect in
+    /// streaming mode.
+    #[arg(long, default_value_t = false)]
+    pub overlap_admit: bool,
     /// Preferred batch sizes (comma-separated, e.g. `1,4,16,32,64`).  Drives
     /// the encoder CUDA-Graph pre-warm so the first request at each B value
     /// replays a captured graph instead of triggering capture mid-traffic.
@@ -90,6 +97,12 @@ pub struct Cli {
     /// have been drained.  Default 64 (matches the typical max_batch_size).
     #[arg(long, default_value_t = 64)]
     pub admit_threshold: usize,
+    /// Diagnostics: log a rolling per-tick dispatcher sub-stage timing
+    /// breakdown (intake / admit / step / extract / route) + effective batch
+    /// every ~2 s at INFO.  Off by default.  Used to decompose the
+    /// service↔engine gap; needs `--log-level info`.
+    #[arg(long, default_value_t = false)]
+    pub trace_dispatch: bool,
     #[arg(long, default_value = "info")]
     pub log_level: String,
 }
@@ -137,6 +150,9 @@ impl Cli {
         if let Some(s) = &self.decoder_type {
             obj.entry("decoder_type")
                 .or_insert(Value::String(s.clone()));
+        }
+        if self.overlap_admit {
+            obj.entry("overlap_admit").or_insert(Value::Bool(true));
         }
         if let Some(sizes) = &self.preferred_batch_sizes {
             let arr: Vec<Value> = sizes.iter().map(|&v| Value::Number(v.into())).collect();

@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
+import time
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -162,6 +164,40 @@ class ASREngine:
                     exc,
                 )
 
+        # Pre-warm the offline GPU path (fbank → encoder → CTC decode) so the
+        # first real request doesn't pay one-time cuBLAS/cuDNN/CTC-workspace
+        # initialisation — measured at ~3 s on the cold first ``step()``, which
+        # otherwise dominates short runs and produces a bimodal latency tail.
+        if self._device.type == "cuda" and config.service_mode == "offline":
+            try:
+                self._prewarm_offline()
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "Offline prewarm failed (first request will be slow): %s", exc
+                )
+
+        # Admission-prep overlap (offline only): a daemon thread runs the
+        # per-request ``prepare_offline`` (waveform load + scale + frame-count
+        # stamp) off the caller/step thread so it overlaps the GPU ``step()``.
+        # The thread is lock-free — it only prepares and hands finished
+        # requests to ``step()`` via ``_prep_out``; ``step`` drains that queue
+        # under the engine lock it already holds.  ``_admit_inflight`` counts
+        # requests accepted but not yet in the scheduler so ``num_waiting``
+        # (and the dispatcher's idle check) account for in-flight prep.
+        self._overlap_admit: bool = bool(
+            getattr(config, "overlap_admit", False) and config.service_mode == "offline"
+        )
+        self._prep_in: "queue.Queue[Optional[Request]]" = queue.Queue()
+        self._prep_out: "queue.Queue[Request]" = queue.Queue()
+        self._admit_inflight: int = 0
+        self._admit_inflight_lock = threading.Lock()
+        self._prep_thread: Optional[threading.Thread] = None
+        if self._overlap_admit:
+            self._prep_thread = threading.Thread(
+                target=self._prep_loop, name="oasr-admit-prep", daemon=True
+            )
+            self._prep_thread.start()
+
     # ------------------------------------------------------------------
     # Request management
     # ------------------------------------------------------------------
@@ -212,6 +248,12 @@ class ASREngine:
             sample_rate=sample_rate,
             priority=priority,
         )
+        if self._overlap_admit:
+            self._validate_mode(streaming)
+            with self._admit_inflight_lock:
+                self._admit_inflight += 1
+            self._prep_in.put(req)
+            return req.request_id
         with self._lock:
             self._validate_mode(streaming)
             self._pipeline.admit(req)
@@ -234,7 +276,13 @@ class ASREngine:
         instead of N — and avoids N round-trips across the PyO3 boundary
         when the Rust dispatcher coalesces a tick's worth of admits.
         Returns the assigned request ids in the same order.
+
+        When ``overlap_admit`` is enabled (offline), the heavy per-request
+        ``prepare_offline`` is deferred to the prep thread and this returns as
+        soon as the (cheap) ``Request`` objects are built and queued.
         """
+        if self._overlap_admit:
+            return self._admit_batch_overlapped(specs)
         request_ids: List[str] = []
         with self._lock:
             for spec in specs:
@@ -254,6 +302,108 @@ class ASREngine:
                 self._pipeline.admit(req)
                 request_ids.append(req.request_id)
         return request_ids
+
+    # ------------------------------------------------------------------
+    # Admission-prep overlap (offline)
+    # ------------------------------------------------------------------
+
+    def _admit_batch_overlapped(self, specs: List[Dict]) -> List[str]:
+        """Overlap fast-path for :meth:`add_requests_batch` (offline only).
+
+        Builds the (cheap) :class:`Request` objects on the caller's thread,
+        returns their ids immediately, and hands the requests to the prep
+        thread.  The heavy ``prepare_offline`` (waveform load + scale + frame
+        stamp) then runs off the step thread; ``step()`` admits prepared
+        requests to the scheduler.  ``_admit_inflight`` is bumped before
+        queueing so :attr:`num_waiting` reflects work the scheduler can't see
+        yet (otherwise the dispatcher could idle-wait past pending admits).
+        """
+        reqs: List[Request] = []
+        request_ids: List[str] = []
+        for spec in specs:
+            req = Request(
+                audio=spec.get("audio"),
+                request_id=spec.get("request_id"),
+                streaming=bool(spec.get("streaming", True)),
+                sample_rate=int(spec.get("sample_rate", 16000)),
+                priority=int(spec.get("priority", 0)),
+            )
+            self._validate_mode(req.streaming)  # reads immutable pipeline.streaming
+            reqs.append(req)
+            request_ids.append(req.request_id)
+        with self._admit_inflight_lock:
+            self._admit_inflight += len(reqs)
+        for req in reqs:
+            self._prep_in.put(req)
+        return request_ids
+
+    def _prep_loop(self) -> None:
+        """Daemon: prepare queued offline requests off the step thread.
+
+        Runs ``prepare_offline`` (lock-free — touches only the request) then
+        hands the request to ``_prep_out`` for ``step()`` to admit.  Never
+        acquires the engine lock, so it makes progress even while ``run()``
+        holds it across a drain loop.  A ``None`` sentinel stops the thread.
+        """
+        while True:
+            req = self._prep_in.get()
+            if req is None:
+                return
+            try:
+                self._input_processor.prepare_offline(req)
+                self._prep_out.put(req)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "admit-prep failed for request %s", getattr(req, "request_id", "?")
+                )
+                with self._admit_inflight_lock:
+                    self._admit_inflight -= 1
+
+    def _drain_prepared(self) -> None:
+        """Admit all prepared requests to the scheduler.  Caller holds the
+        engine lock (invoked at the head of :meth:`step`)."""
+        n = 0
+        while True:
+            try:
+                req = self._prep_out.get_nowait()
+            except queue.Empty:
+                break
+            self._scheduler.add_request(req)
+            n += 1
+        if n:
+            with self._admit_inflight_lock:
+                self._admit_inflight -= n
+
+    def _num_admit_inflight(self) -> int:
+        with self._admit_inflight_lock:
+            return self._admit_inflight
+
+    def shutdown(self) -> None:
+        """Stop the admission-prep thread (best-effort).  Safe to call twice;
+        a no-op when overlap admission is disabled."""
+        t = self._prep_thread
+        if t is not None and t.is_alive():
+            self._prep_in.put(None)
+            t.join(timeout=2.0)
+        self._prep_thread = None
+
+    def _prewarm_offline(self) -> None:
+        """Run one dummy offline batch per preferred size to absorb one-time
+        cuBLAS/cuDNN/CTC initialisation at startup rather than on the first
+        request.  Uses silent waveforms so it exercises the real
+        fbank → encoder → CTC-decode path at representative shapes."""
+        sizes = self._config.preferred_batch_size or [int(self._config.max_batch_size)]
+        n = 16000 * 6  # ~6 s of audio — representative frame count
+        for b in sorted({int(s) for s in sizes if int(s) >= 1}):
+            reqs: List[Request] = []
+            for _ in range(b):
+                r = Request(audio=None, streaming=False, sample_rate=16000)
+                r.waveform = torch.zeros(n, dtype=torch.float32)
+                reqs.append(r)
+            feats, lengths = self._input_processor.collate_gpu(reqs)
+            log_probs, out_len = self._model_runner.forward_offline(feats, lengths)
+            self._output_processor.decode_offline(log_probs, out_len)
+        torch.cuda.synchronize()
 
     def add_streaming_request(
         self,
@@ -396,6 +546,10 @@ class ASREngine:
     def step(self) -> List[RequestOutput]:
         """Execute one engine step — one call into the configured pipeline."""
         with self._lock:
+            if self._overlap_admit:
+                # Admit requests the prep thread finished preparing since the
+                # last step (cheap scheduler enqueue under the lock we hold).
+                self._drain_prepared()
             nvtx_push("engine.step")
             outputs = self._pipeline.step()
             nvtx_pop()
@@ -408,13 +562,38 @@ class ASREngine:
         :meth:`add_request` / :meth:`feed_chunk` will block until ``run``
         returns; use :meth:`step` in a loop instead if you need concurrent
         submission while draining.
+
+        With ``overlap_admit`` the prep thread runs lock-free, so this loops
+        per-step (releasing the lock between steps) and waits for in-flight
+        admission prep to drain rather than holding the lock across the whole
+        run.
         """
+        if self._overlap_admit:
+            return self._run_overlapped()
         with self._lock:
             final_outputs: List[RequestOutput] = []
             while self._pipeline.has_pending():
                 step_outputs = self.step()
                 final_outputs.extend(o for o in step_outputs if o.finished)
             return final_outputs
+
+    def _run_overlapped(self) -> List[RequestOutput]:
+        """``run`` variant for ``overlap_admit``: drain via per-step locking so
+        the lock-free prep thread can admit concurrently; yield the GIL when
+        idle so prep makes progress."""
+        final_outputs: List[RequestOutput] = []
+        while True:
+            step_outputs = self.step()
+            final_outputs.extend(o for o in step_outputs if o.finished)
+            with self._lock:
+                pending = self._pipeline.has_pending()
+            if not pending and self._num_admit_inflight() == 0:
+                break
+            if not step_outputs and not pending:
+                # Requests still being prepared by the prep thread — yield the
+                # GIL briefly so it can finish before we re-step.
+                time.sleep(0.0005)
+        return final_outputs
 
     # ------------------------------------------------------------------
     # Convenience API
@@ -487,6 +666,15 @@ class ASREngine:
 
     @property
     def num_waiting(self) -> int:
-        """Requests in the waiting queue (admission pending)."""
+        """Requests in the waiting queue (admission pending).
+
+        Includes requests accepted into the admission-prep pipeline but not yet
+        visible to the scheduler (``overlap_admit``), so callers — notably the
+        Rust dispatcher's idle check — don't treat the engine as idle while
+        admission prep is still in flight.
+        """
         with self._lock:
-            return self._pipeline.num_waiting()
+            n = self._pipeline.num_waiting()
+        if self._overlap_admit:
+            n += self._num_admit_inflight()
+        return n
