@@ -719,6 +719,65 @@ class GpuStreamingDecoder:
         tokens = _extract_tokens(out_tokens, out_lengths, batch, cfg.beam_size)
         return GpuDecoderResult(tokens=tokens, lengths=out_lengths, scores=out_scores)
 
+    def peek_states(
+        self, states: List[StreamState],
+    ) -> List[GpuDecoderResult]:
+        """Batched non-destructive snapshot for **many states in ONE D→H sync**.
+
+        Equivalent to calling :meth:`peek_state` once per state, but issues a
+        single device→host copy for the whole ready set instead of one per
+        stream.  The per-stream ``.cpu()`` in a Python loop — not the (tiny)
+        token payload nor the on-GPU read kernel — is the dominant streaming
+        interim-decode cost: each ``.cpu()`` is a full ``cudaStreamSynchronize``
+        that drains the pipeline.  Collapsing N syncs into one keeps live
+        partial transcripts while removing the per-stream stall.
+
+        Each read kernel writes into its slice of one preallocated output
+        tensor; the lone ``.cpu()`` then materialises every stream's tokens at
+        once.  Returns one :class:`GpuDecoderResult` per input state, in order.
+
+        States with ``batch != 1`` (not produced by the streaming engine) fall
+        back to the per-state path so the batched fast path can assume one row
+        per state.
+        """
+        n = len(states)
+        if n == 0:
+            return []
+        if any(s.batch != 1 for s in states):
+            return [self.peek_state(state=s) for s in states]
+
+        cfg = self._config
+        beam = cfg.beam_size
+        msl = cfg.max_seq_len
+        device = states[0].buffer.device
+        use_paged = 1 if cfg.use_paged_memory else 0
+
+        out_tokens = torch.empty(n, beam, msl, dtype=torch.int32, device=device)
+        out_lengths = torch.empty(n, beam, dtype=torch.int32, device=device)
+        out_scores = torch.empty(n, beam, dtype=torch.float32, device=device)
+        for i, s in enumerate(states):
+            self._mod.ctc_beam_search_read_state(
+                out_tokens[i : i + 1], out_lengths[i : i + 1], out_scores[i : i + 1],
+                s.buffer, s.step,
+                s.batch, beam, s.vocab_size, msl,
+                use_paged, cfg.page_size)
+
+        # Single device→host sync for the entire ready set.
+        out_tokens_cpu = out_tokens.cpu()
+        out_lengths_cpu = out_lengths.cpu()
+        results: List[GpuDecoderResult] = []
+        for i in range(n):
+            beams: List[List[int]] = []
+            for k in range(beam):
+                length = int(out_lengths_cpu[i, k])
+                beams.append(out_tokens_cpu[i, k, :length].tolist())
+            results.append(GpuDecoderResult(
+                tokens=[beams],
+                lengths=out_lengths[i : i + 1],
+                scores=out_scores[i : i + 1],
+            ))
+        return results
+
     def finalize_stream(
         self, state: Optional[StreamState] = None,
     ) -> GpuDecoderResult:

@@ -53,6 +53,8 @@ class OutputProcessor:
             )
         self._decode_type = decode_type
         self._config = config
+        # Streaming decode-step counter driving ``partial_decode_interval``.
+        self._stream_decode_step = 0
         self._sp = self._load_sentencepiece(config.sentencepiece_model)
         self._vocab: Optional[Dict[int, str]] = None
         if config.unit_table is not None:
@@ -206,27 +208,43 @@ class OutputProcessor:
         if not groups:
             return []
 
-        partials: List[RequestOutput] = []
+        # Always advance the decode state for every ready stream (one batched
+        # C++ launch per distinct chunk-T).  Collect the (req, state) pairs in a
+        # stable order so the optional interim read-back can be done in a single
+        # batched device→host sync below.
+        self._stream_decode_step += 1
         decoder = None
+        ordered_reqs: List[Request] = []
+        ordered_states = []
         for t_chunk, reqs in groups.items():
             log_probs_batch = torch.cat(group_logp[t_chunk], dim=0)
             states = [r.stream_context.get_ctc_state() for r in reqs]
             if decoder is None:
                 decoder = reqs[0].stream_context.ctc_state_manager.decoder
             decoder.decode_chunk_batch(log_probs_batch, states)
-            for req, state in zip(reqs, states):
-                # peek_state issues a non-destructive D2D copy of the beam
-                # buffer plus a D→H of the (small) token tensor — adds a
-                # sub-ms sync per stream per chunk in exchange for real
-                # interim transcripts.
-                snap = decoder.peek_state(state=state)
-                best = snap.tokens[0][0] if snap.tokens and snap.tokens[0] else []
-                partials.append(RequestOutput(
-                    request_id=req.request_id,
-                    text=self.detokenize(best),
-                    tokens=snap.tokens[0] if snap.tokens else [],
-                    finished=False,
-                ))
+            ordered_reqs.extend(reqs)
+            ordered_states.extend(states)
+
+        # Interim-partial cadence.  ``peek``ing the beam buffer back to the host
+        # is a per-stream ``cudaStreamSynchronize``; emit partials only every
+        # ``partial_decode_interval`` steps, and when we do, read every stream's
+        # tokens back in ONE batched D→H sync (``peek_states``) rather than one
+        # ``.cpu()`` per stream.  ``interval <= 0`` skips interim partials
+        # entirely (final transcript still produced by ``finalize_streaming``).
+        interval = getattr(self._config, "partial_decode_interval", 1)
+        if interval < 1 or (self._stream_decode_step % interval) != 0:
+            return []
+
+        snaps = decoder.peek_states(ordered_states)
+        partials: List[RequestOutput] = []
+        for req, snap in zip(ordered_reqs, snaps):
+            best = snap.tokens[0][0] if snap.tokens and snap.tokens[0] else []
+            partials.append(RequestOutput(
+                request_id=req.request_id,
+                text=self.detokenize(best),
+                tokens=snap.tokens[0] if snap.tokens else [],
+                finished=False,
+            ))
         return partials
 
     def decode_streaming_chunk(

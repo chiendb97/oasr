@@ -476,9 +476,18 @@ class InputProcessor:
             for n in sample_counts
         ]
         lengths_cpu = torch.tensor(sample_counts, dtype=torch.int64)
-        padded_cpu = torch.zeros(len(fbank_inputs), t_max, dtype=torch.float32)
+        # Zero only the *pad tail* of each row, not the whole buffer: the
+        # [0:n] region is immediately overwritten by the waveform copy, so the
+        # previous full ``torch.zeros`` spent ~B*T_max of CPU fill per step on
+        # bytes it then clobbered.  In steady state every row is exactly T_max
+        # long (all streams fed equal chunks) so no tail zeroing runs at all;
+        # only ragged / flush steps touch ``zero_``.
+        padded_cpu = torch.empty(len(fbank_inputs), t_max, dtype=torch.float32)
         for i, w in enumerate(fbank_inputs):
-            padded_cpu[i, : w.numel()] = w
+            n = w.numel()
+            padded_cpu[i, :n] = w
+            if n < t_max:
+                padded_cpu[i, n:].zero_()
         if device.type == "cuda":
             padded_cpu = padded_cpu.pin_memory()
             lengths_cpu = lengths_cpu.pin_memory()

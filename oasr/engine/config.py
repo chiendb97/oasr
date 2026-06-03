@@ -257,6 +257,18 @@ class EngineConfig:
     wfst_decoder_config: Optional[DecoderConfig] = None
     fst_path: Optional[str] = None
 
+    # Streaming interim-partial cadence.  After each streaming decode step the
+    # engine reads the best-so-far hypothesis back to the host to emit a partial
+    # transcript — a per-stream device→host sync that, profiled, is ~17% of
+    # streaming wall time (the token bytes are trivial; the blocking
+    # ``cudaStreamSynchronize`` is the cost).  ``1`` (default) emits a partial
+    # every step but via one batched read-back for the whole ready set rather
+    # than one ``.cpu()`` per stream.  ``N>1`` emits every N-th step (lower
+    # partial cadence, less sync).  ``<=0`` disables interim partials entirely
+    # (final transcript only) for throughput / non-interactive consumers — the
+    # decode state still advances every step; only the read-back is skipped.
+    partial_decode_interval: int = 1
+
     # Detokenization
     sentencepiece_model: Optional[str] = None
     unit_table: Optional[str] = None
