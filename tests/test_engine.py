@@ -39,6 +39,26 @@ def _wav_path(wav_dir: str, n: int = 0) -> str:
     return wavs[n]
 
 
+def _wav_waveform(wav_dir: str, n: int = 0):
+    """Load one wav into a 1-D float32 CPU waveform tensor.
+
+    The engine is waveform-only, so tests decode files here — exactly as the
+    serving entry point (``oasr-asr``) and the bench harness do — and never
+    hand a file path to the engine.
+    """
+    import torchaudio
+
+    wav, _sr = torchaudio.load(_wav_path(wav_dir, n))  # (C, T)
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    return wav.squeeze(0).float()
+
+
+def _wav_waveforms(wav_dir: str, count: int):
+    """List of ``count`` waveform tensors (see :func:`_wav_waveform`)."""
+    return [_wav_waveform(wav_dir, i) for i in range(count)]
+
+
 # ---------------------------------------------------------------------------
 # Unit tests — EngineConfig
 # ---------------------------------------------------------------------------
@@ -107,7 +127,7 @@ class TestRequest:
     def test_defaults(self):
         from oasr.engine.request import Request, RequestState
 
-        req = Request("audio.wav")
+        req = Request(torch.zeros(16000))
         assert req.state == RequestState.WAITING
         assert req.streaming is False
         assert req.request_id  # non-empty
@@ -115,7 +135,7 @@ class TestRequest:
     def test_has_pending_audio_false_initially(self):
         from oasr.engine.request import Request
 
-        req = Request("audio.wav")
+        req = Request(torch.zeros(16000))
         assert not req.has_pending_audio
 
     def test_has_pending_audio_true_after_enqueue(self):
@@ -123,7 +143,7 @@ class TestRequest:
 
         from oasr.engine.request import Request
 
-        req = Request("audio.wav", streaming=True)
+        req = Request(torch.zeros(16000), streaming=True)
         req.audio_chunks = deque([torch.zeros(16000)])
         req.audio_tail = torch.zeros(0)
         req.audio_final = True
@@ -132,7 +152,7 @@ class TestRequest:
     def test_custom_request_id(self):
         from oasr.engine.request import Request
 
-        req = Request("audio.wav", request_id="my-id")
+        req = Request(torch.zeros(16000), request_id="my-id")
         assert req.request_id == "my-id"
 
 
@@ -153,7 +173,7 @@ class TestScheduler:
 
         from oasr.engine.request import Request
 
-        req = Request("audio.wav", streaming=True)
+        req = Request(torch.zeros(16000), streaming=True)
         # Enqueue ``n_chunks`` fake audio-sample tensors so the request is
         # "still streaming" under the new audio-chunk admission model.
         req.audio_chunks = deque([torch.zeros(16000) for _ in range(n_chunks)])
@@ -249,49 +269,6 @@ class TestScheduler:
 
 
 # ---------------------------------------------------------------------------
-# Unit tests — InputProcessor
-# ---------------------------------------------------------------------------
-
-
-class TestInputProcessor:
-    def _make_config(self):
-        from oasr.engine.config import EngineConfig
-
-        return EngineConfig(ckpt_dir="/tmp/fake", chunk_size=16)
-
-    def test_load_audio_from_tensor(self):
-        from oasr.engine.input_processor import InputProcessor
-
-        cfg = self._make_config()
-        proc = InputProcessor(cfg, torch.device("cpu"))
-        wav = torch.randn(16000)
-        result = proc.load_audio(wav)
-        assert result.shape == (16000,)
-        assert result.dtype == torch.float32
-
-    def test_load_audio_from_numpy(self):
-        import numpy as np
-
-        from oasr.engine.input_processor import InputProcessor
-
-        cfg = self._make_config()
-        proc = InputProcessor(cfg, torch.device("cpu"))
-        wav_np = torch.randn(16000).numpy()
-        result = proc.load_audio(wav_np)
-        assert result.shape == (16000,)
-
-    def test_load_audio_from_file(self, wav_dir: str):
-        from oasr.engine.input_processor import InputProcessor
-
-        _require_wav_dir(wav_dir)
-        cfg = self._make_config()
-        proc = InputProcessor(cfg, torch.device("cpu"))
-        result = proc.load_audio(_wav_path(wav_dir, 0))
-        assert result.dim() == 1
-        assert result.shape[0] > 0
-
-
-# ---------------------------------------------------------------------------
 # Unit tests — OutputProcessor (detokenization)
 # ---------------------------------------------------------------------------
 
@@ -345,7 +322,7 @@ class TestOfflineTranscribe:
         _require_ckpt(ckpt_dir)
         _require_wav_dir(wav_dir)
         engine = self._make_engine(ckpt_dir, device)
-        text = engine.transcribe_offline(_wav_path(wav_dir, 0))
+        text = engine.transcribe_offline(_wav_waveform(wav_dir, 0))
         assert isinstance(text, str)
         assert len(text) > 0
 
@@ -356,8 +333,8 @@ class TestOfflineTranscribe:
         if len(wavs) < 4:
             pytest.skip(f"Need at least 4 .wav files in WAV directory, found {len(wavs)}")
         engine = self._make_engine(ckpt_dir, device)
-        paths = [_wav_path(wav_dir, i) for i in range(4)]
-        texts = engine.transcribe_offline(paths)
+        waves = _wav_waveforms(wav_dir, 4)
+        texts = engine.transcribe_offline(waves)
         assert isinstance(texts, list)
         assert len(texts) == 4
         assert all(isinstance(t, str) and len(t) > 0 for t in texts)
@@ -385,7 +362,7 @@ class TestASREngine:
         _require_ckpt(ckpt_dir)
         _require_wav_dir(wav_dir)
         engine = self._make_engine(ckpt_dir, device)
-        text = engine.transcribe(_wav_path(wav_dir, 0))
+        text = engine.transcribe(_wav_waveform(wav_dir, 0))
         assert isinstance(text, str)
         assert len(text) > 0
 
@@ -396,8 +373,8 @@ class TestASREngine:
         if len(wavs) < 3:
             pytest.skip(f"Need at least 3 .wav files in WAV directory, found {len(wavs)}")
         engine = self._make_engine(ckpt_dir, device)
-        paths = [_wav_path(wav_dir, i) for i in range(3)]
-        texts = engine.transcribe(paths)
+        waves = _wav_waveforms(wav_dir, 3)
+        texts = engine.transcribe(waves)
         assert isinstance(texts, list)
         assert len(texts) == 3
         assert all(isinstance(t, str) and len(t) > 0 for t in texts)
@@ -406,7 +383,7 @@ class TestASREngine:
         _require_ckpt(ckpt_dir)
         _require_wav_dir(wav_dir)
         engine = self._make_engine(ckpt_dir, device)
-        rid = engine.add_request(_wav_path(wav_dir, 0))
+        rid = engine.add_request(_wav_waveform(wav_dir, 0))
         results = engine.run()
         assert all(r.finished for r in results)
         assert any(r.request_id == rid for r in results)
@@ -437,7 +414,7 @@ class TestASREngine:
         if len(wavs) < 3:
             pytest.skip("Need at least 3 .wav files in WAV directory")
 
-        paths = [_wav_path(wav_dir, i) for i in range(3)]
+        waves = _wav_waveforms(wav_dir, 3)
 
         off_cfg = EngineConfig(
             ckpt_dir=ckpt_dir,
@@ -447,7 +424,7 @@ class TestASREngine:
             decoder_type="ctc_gpu",
         )
         off = ASREngine(off_cfg)
-        off_texts = off.transcribe_offline(paths)
+        off_texts = off.transcribe_offline(waves)
 
         cfg = EngineConfig(
             ckpt_dir=ckpt_dir,
@@ -459,7 +436,7 @@ class TestASREngine:
             max_batch_size=1,
         )
         on = ASREngine(cfg)
-        on_texts = on.transcribe(paths)
+        on_texts = on.transcribe(waves)
         for off_t, on_t in zip(off_texts, on_texts):
             assert on_t == off_t, \
                 f"streaming(B=1) != offline\n  offline: {off_t!r}\n  stream : {on_t!r}"
@@ -482,7 +459,7 @@ class TestASREngine:
         if len(wavs) < 4:
             pytest.skip("Need at least 4 .wav files in WAV directory")
 
-        paths = [_wav_path(wav_dir, i) for i in range(4)]
+        waves = _wav_waveforms(wav_dir, 4)
 
         off_cfg = EngineConfig(
             ckpt_dir=ckpt_dir,
@@ -492,10 +469,10 @@ class TestASREngine:
             decoder_type="ctc_gpu",
         )
         off = ASREngine(off_cfg)
-        off_texts = off.transcribe_offline(paths)
+        off_texts = off.transcribe_offline(waves)
 
         on = self._make_engine(ckpt_dir, device)  # max_batch_size=32 by default
-        on_texts = on.transcribe(paths)
+        on_texts = on.transcribe(waves)
 
         def _wer(ref: str, hyp: str) -> float:
             r, h = ref.split(), hyp.split()
@@ -514,7 +491,7 @@ class TestASREngine:
             return dp[len(r)][len(h)] / max(1, len(r))
 
         total = sum(_wer(ref, hyp) for ref, hyp in zip(off_texts, on_texts))
-        avg_wer = total / len(paths)
+        avg_wer = total / len(wavs)
         # Loose threshold: batched-fp16 vs offline-batched-fp16 typically
         # diverge by <5% WER on a handful of utterances; the drift comes
         # from reordered fp16 reductions in the per-layer matmuls and
@@ -526,7 +503,7 @@ class TestASREngine:
         _require_ckpt(ckpt_dir)
         _require_wav_dir(wav_dir)
         engine = self._make_engine(ckpt_dir, device)
-        engine.add_request(_wav_path(wav_dir, 0))
+        engine.add_request(_wav_waveform(wav_dir, 0))
         engine.run()
         assert engine.num_running == 0
         assert engine.num_waiting == 0
@@ -553,8 +530,8 @@ class TestASREngine:
         # Record initial free block count
         initial_free = engine._model_runner._block_pool.num_free_blocks
 
-        engine.add_request(_wav_path(wav_dir, 0))
-        engine.add_request(_wav_path(wav_dir, 1))
+        engine.add_request(_wav_waveform(wav_dir, 0))
+        engine.add_request(_wav_waveform(wav_dir, 1))
         engine.run()
 
         # All blocks should be returned to the pool

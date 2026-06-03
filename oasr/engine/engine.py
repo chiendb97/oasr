@@ -59,16 +59,22 @@ class ASREngine:
 
     Examples
     --------
+    The engine is **waveform-only**: ``audio`` arguments are waveform tensors
+    / numpy arrays at the model sample rate.  Decode audio files at the entry
+    point (the serving front-end, or here the harness) before admitting.
+
     Streaming::
 
         engine = ASREngine(EngineConfig(ckpt_dir="/path/to/ckpt"))
-        text = engine.transcribe("audio.wav")
+        wav, _sr = torchaudio.load("audio.wav")
+        text = engine.transcribe(wav.squeeze(0))
 
     Offline batch::
 
         cfg = EngineConfig(ckpt_dir="/path/to/ckpt", service_mode="offline")
         engine = ASREngine(cfg)
-        texts = engine.transcribe_offline(["a.wav", "b.wav", "c.wav"])
+        wavs = [torchaudio.load(p)[0].squeeze(0) for p in ("a.wav", "b.wav")]
+        texts = engine.transcribe_offline(wavs)
     """
 
     def __init__(self, config: EngineConfig) -> None:
@@ -177,7 +183,7 @@ class ASREngine:
                 )
 
         # Admission-prep overlap (offline only): a daemon thread runs the
-        # per-request ``prepare_offline`` (waveform load + scale + frame-count
+        # per-request ``prepare_offline`` (waveform normalise + frame-count
         # stamp) off the caller/step thread so it overlaps the GPU ``step()``.
         # The thread is lock-free — it only prepares and hands finished
         # requests to ``step()`` via ``_prep_out``; ``step`` drains that queue
@@ -204,7 +210,7 @@ class ASREngine:
 
     def add_request(
         self,
-        audio: Union[str, torch.Tensor, "np.ndarray"],
+        audio: Union[torch.Tensor, "np.ndarray"],
         request_id: Optional[str] = None,
         sample_rate: int = 16000,
         streaming: bool = True,
@@ -224,8 +230,10 @@ class ASREngine:
 
         Parameters
         ----------
-        audio : str, Tensor, or ndarray
-            Audio input (file path, waveform tensor, or NumPy array).
+        audio : Tensor or ndarray
+            A **waveform** at the model sample rate.  File decoding happens at
+            the entry point, never in the engine — passing a file path raises
+            ``TypeError``.
         request_id : str, optional
             Unique identifier.  Auto-generated if omitted.
         sample_rate : int
@@ -312,8 +320,8 @@ class ASREngine:
 
         Builds the (cheap) :class:`Request` objects on the caller's thread,
         returns their ids immediately, and hands the requests to the prep
-        thread.  The heavy ``prepare_offline`` (waveform load + scale + frame
-        stamp) then runs off the step thread; ``step()`` admits prepared
+        thread.  The ``prepare_offline`` (waveform normalise + frame stamp)
+        then runs off the step thread; ``step()`` admits prepared
         requests to the scheduler.  ``_admit_inflight`` is bumped before
         queueing so :attr:`num_waiting` reflects work the scheduler can't see
         yet (otherwise the dispatcher could idle-wait past pending admits).
@@ -397,9 +405,15 @@ class ASREngine:
         for b in sorted({int(s) for s in sizes if int(s) >= 1}):
             reqs: List[Request] = []
             for _ in range(b):
-                r = Request(audio=None, streaming=False, sample_rate=16000)
-                r.waveform = torch.zeros(n, dtype=torch.float32)
-                reqs.append(r)
+                # collate_gpu reads ``request.audio`` directly (the canonical
+                # waveform ``prepare_offline`` would have produced), so seed it.
+                reqs.append(
+                    Request(
+                        audio=torch.zeros(n, dtype=torch.float32),
+                        streaming=False,
+                        sample_rate=16000,
+                    )
+                )
             feats, lengths = self._input_processor.collate_gpu(reqs)
             log_probs, out_len = self._model_runner.forward_offline(feats, lengths)
             self._output_processor.decode_offline(log_probs, out_len)
@@ -601,16 +615,17 @@ class ASREngine:
 
     def transcribe(
         self,
-        audio: Union[str, List[str], torch.Tensor, "np.ndarray"],
+        audio: Union[torch.Tensor, "np.ndarray", List[Union[torch.Tensor, "np.ndarray"]]],
         sample_rate: int = 16000,
         streaming: bool = True,
     ) -> Union[str, List[str]]:
-        """Transcribe one or more audio inputs.
+        """Transcribe one or more **waveforms**.
 
         Parameters
         ----------
-        audio : str, list, Tensor, or ndarray
-            Single or multiple audio inputs.
+        audio : Tensor, ndarray, or list of those
+            One or more waveforms at the model sample rate.  Decode audio
+            files before calling — the engine is waveform-only.
         sample_rate : int
             Sample rate of the audio (Hz).
         streaming : bool, default ``True``
@@ -633,7 +648,7 @@ class ASREngine:
 
     def transcribe_offline(
         self,
-        audio: Union[str, List[str], torch.Tensor, "np.ndarray"],
+        audio: Union[torch.Tensor, "np.ndarray", List[Union[torch.Tensor, "np.ndarray"]]],
         sample_rate: int = 16000,
     ) -> Union[str, List[str]]:
         """Batch transcription convenience — :meth:`transcribe` with

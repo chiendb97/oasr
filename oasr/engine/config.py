@@ -99,7 +99,7 @@ class EngineConfig:
     # misconfiguration eagerly instead of silently routing into a
     # quiescent pipeline.
     service_mode: str = "streaming"
-    # Offline-only: overlap per-request admission prep (waveform load + scale +
+    # Offline-only: overlap per-request admission prep (waveform normalise +
     # frame-count stamp — the GIL-bound CPU cost of ``add_request[s_batch]``)
     # with the GPU ``step()`` of the previous batch.  A daemon prep thread does
     # the heavy ``prepare_offline`` lock-free and hands finished requests to

@@ -255,8 +255,18 @@ def test_e2e_streaming_concurrent_feeders(ckpt_dir: str, wav_dir: str):
 
     engine = ASREngine(EngineConfig(ckpt_dir=ckpt_dir, max_batch_size=8))
 
+    # The engine is waveform-only, so decode the files here (exactly as the
+    # serving entry point / feeder threads below do) rather than passing paths.
+    import soundfile as sf
+
+    def _load_wave(path: str):
+        samples, _sr = sf.read(path, dtype="float32")
+        if samples.ndim > 1:
+            samples = samples.mean(axis=1).astype("float32")
+        return samples
+
     # Baseline: serial submission, single-thread driver.
-    serial_texts = engine.transcribe(wavs, streaming=True)
+    serial_texts = engine.transcribe([_load_wave(p) for p in wavs], streaming=True)
     if isinstance(serial_texts, str):
         serial_texts = [serial_texts]
 
