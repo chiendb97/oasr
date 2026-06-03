@@ -248,18 +248,24 @@ def step(self) -> List[RequestOutput]:
 
 ## 5. Data Flow
 
+The engine is **waveform-only** — file decoding happens at the entry point
+(the serving front-end via `oasr-asr`, or the bench/test harness), never in
+the engine. `audio_scale` is applied on the **GPU after padding** in
+`collate_gpu` (offline).
+
 ```
-audio bytes / file path / Tensor
+Request.audio = waveform (Tensor / ndarray, at the model sample rate, or None)
         │
-        ▼
-InputProcessor.load_audio          ──▶ scale(audio_scale)
-        │                                │
    (offline)                        (streaming)
         │                                │
         ▼                                ▼
 prepare_offline                    prepare_streaming
-  → Request.waveform                 → Request.audio_chunks
-  → Request.num_frames               → Request.num_frames (exact estimate)
+  → canonicalises Request.audio      → Request.audio_chunks
+    in place (1-D f32 CPU)           → Request.num_frames (exact estimate)
+  → Request.num_frames
+        │                                │
+  collate_gpu: pad + scale          append_streaming_chunk: scale (CPU)
+  on the GPU (after padding)         per chunk
         │                                │
         └──────────────── Scheduler ─────┘
                               │
@@ -354,23 +360,32 @@ loaded encoder dimensions.
 ### 7.1 Offline batch transcription
 
 ```python
+import torchaudio
 from oasr.engine import ASREngine, EngineConfig
 
-engine = ASREngine(EngineConfig(ckpt_dir="/path/to/ckpt"))
+engine = ASREngine(EngineConfig(ckpt_dir="/path/to/ckpt", service_mode="offline"))
 
-text  = engine.transcribe_offline("audio.wav")
-texts = engine.transcribe_offline(["a.wav", "b.wav", "c.wav"])
+# The engine is waveform-only — decode files yourself (here in the harness;
+# in serving, oasr-asr does this at the entry point).
+def wav(p): return torchaudio.load(p)[0].squeeze(0).float()
+
+text  = engine.transcribe_offline(wav("audio.wav"))
+texts = engine.transcribe_offline([wav(p) for p in ("a.wav", "b.wav", "c.wav")])
 ```
 
 ### 7.2 Streaming, attached audio
 
 ```python
+import torchaudio
 from oasr.engine import ASREngine, EngineConfig
 
 engine = ASREngine(EngineConfig(ckpt_dir="/path/to/ckpt"))
 
-# All audio handed in up-front; engine runs to completion.
-texts = engine.transcribe(["a.wav", "b.wav", "c.wav"], streaming=True)
+def wav(p): return torchaudio.load(p)[0].squeeze(0).float()
+
+# All audio handed in up-front; engine splits it into chunks and runs to
+# completion (real-time clients instead use add_streaming_request + feed_chunk).
+texts = engine.transcribe([wav(p) for p in ("a.wav", "b.wav", "c.wav")], streaming=True)
 ```
 
 ### 7.3 Streaming, chunk-by-chunk feed (real-time serving)

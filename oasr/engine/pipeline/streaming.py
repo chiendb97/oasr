@@ -74,18 +74,35 @@ class StreamingPipeline(Pipeline):
     # ------------------------------------------------------------------
 
     def admit(self, request: Request) -> None:
-        """Prepare a streaming request and enqueue it for admission.
+        """Register a streaming request and enqueue it for admission.
 
-        Branches on ``request.audio is None``: an empty registration uses
-        :meth:`InputProcessor.prepare_streaming_open` (caller will push
-        audio later via :meth:`feed_chunk`); a pre-loaded waveform is
-        split into audio-chunk deque entries via
-        :meth:`InputProcessor.prepare_streaming`.
+        Streaming is chunk-by-chunk: :meth:`InputProcessor.prepare_streaming`
+        registers the request with an empty audio queue, then audio arrives
+        via :meth:`feed_chunk`.  Two entry shapes feed this:
+
+        * ``add_streaming_request`` — ``request.audio is None``; the caller
+          pushes chunks itself (the real-time / serving path).
+        * ``transcribe(waveform, streaming=True)`` — a full waveform is
+          attached up front; we split it into per-step audio chunks and
+          enqueue them here (the last marked final) so the step loop windows
+          it exactly like a live feed would.
+
+        The engine is waveform-only.
         """
-        if request.audio is None:
-            self._inp.prepare_streaming_open(request)
-        else:
-            self._inp.prepare_streaming(request)
+        self._inp.prepare_streaming(request)
+        if request.audio is not None:
+            wav = torch.as_tensor(request.audio, dtype=torch.float32, device="cpu").reshape(-1)
+            chunk_samples = self._inp.streaming_audio_chunk_samples
+            n = int(wav.numel())
+            if n == 0:
+                request.audio_final = True
+            else:
+                starts = range(0, n, chunk_samples)
+                last = n - (n % chunk_samples or chunk_samples)
+                for s in starts:
+                    self._inp.append_streaming_chunk(
+                        request, wav[s : s + chunk_samples], is_last=(s == last)
+                    )
         self._scheduler.add_request(request)
 
     def feed_chunk(

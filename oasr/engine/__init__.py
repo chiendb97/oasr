@@ -21,21 +21,28 @@ Components
 :class:`RequestState`
     Lifecycle state enum: WAITING → RUNNING → FINISHED.
 
+The engine is **waveform-only** — decode audio files at the entry point (the
+serving front-end, or the harness) and pass waveforms in.
+
 Quick start
 -----------
 Offline transcription::
 
+    import torchaudio
     from oasr.engine import ASREngine, EngineConfig
 
     engine = ASREngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))
-    text = engine.transcribe("audio.wav", streaming=False)
+    wav, _sr = torchaudio.load("audio.wav")
+    text = engine.transcribe(wav.squeeze(0), streaming=False)
 
 Streaming transcription (multiple concurrent requests)::
 
+    import torchaudio
     from oasr.engine import ASREngine, EngineConfig
 
     engine = ASREngine(EngineConfig(ckpt_dir="/path/to/checkpoint"))
-    texts = engine.transcribe(["a.wav", "b.wav", "c.wav"])
+    wavs = [torchaudio.load(p)[0].squeeze(0) for p in ("a.wav", "b.wav", "c.wav")]
+    texts = engine.transcribe(wavs)
 """
 
 from .config import EngineConfig

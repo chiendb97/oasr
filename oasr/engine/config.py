@@ -99,6 +99,16 @@ class EngineConfig:
     # misconfiguration eagerly instead of silently routing into a
     # quiescent pipeline.
     service_mode: str = "streaming"
+    # Offline-only: overlap per-request admission prep (waveform normalise +
+    # frame-count stamp — the GIL-bound CPU cost of ``add_request[s_batch]``)
+    # with the GPU ``step()`` of the previous batch.  A daemon prep thread does
+    # the heavy ``prepare_offline`` lock-free and hands finished requests to
+    # ``step()`` via a thread-safe queue (``step`` drains it under the engine
+    # lock it already holds — no extra locking, no ``run()`` deadlock).  Only
+    # the cheap ``Request`` construction stays on the caller's thread.  Default
+    # off; the serving front-end enables it (the GPU step is the overlap
+    # window).  No effect in streaming mode.
+    overlap_admit: bool = False
 
     # Streaming chunking
     chunk_size: int = 16

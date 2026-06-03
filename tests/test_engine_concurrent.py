@@ -75,8 +75,24 @@ def _make_patched_engine():
 
     engine._model_runner = MagicMock()
     engine._output_processor = MagicMock()
-    engine._offline_pipeline = MagicMock()
     engine._model = MagicMock()
+
+    # Real streaming pipeline over the real scheduler + mocked collaborators so
+    # admit / feed_chunk / abort / num_* route through ``self._pipeline`` exactly
+    # as in production (the engine delegates everything through it; the
+    # model-abstraction refactor replaced the old ``_offline_pipeline`` attr).
+    from oasr.engine.pipeline import StreamingPipeline
+
+    engine._pipeline = StreamingPipeline(
+        scheduler=engine._scheduler,
+        input_processor=engine._input_processor,
+        model_runner=engine._model_runner,
+        output_processor=engine._output_processor,
+        config=cfg,
+        device=engine._device,
+    )
+    # Admission-prep overlap is offline-only; the streaming lock tests bypass it.
+    engine._overlap_admit = False
 
     return engine
 
@@ -239,8 +255,18 @@ def test_e2e_streaming_concurrent_feeders(ckpt_dir: str, wav_dir: str):
 
     engine = ASREngine(EngineConfig(ckpt_dir=ckpt_dir, max_batch_size=8))
 
+    # The engine is waveform-only, so decode the files here (exactly as the
+    # serving entry point / feeder threads below do) rather than passing paths.
+    import soundfile as sf
+
+    def _load_wave(path: str):
+        samples, _sr = sf.read(path, dtype="float32")
+        if samples.ndim > 1:
+            samples = samples.mean(axis=1).astype("float32")
+        return samples
+
     # Baseline: serial submission, single-thread driver.
-    serial_texts = engine.transcribe(wavs, streaming=True)
+    serial_texts = engine.transcribe([_load_wave(p) for p in wavs], streaming=True)
     if isinstance(serial_texts, str):
         serial_texts = [serial_texts]
 

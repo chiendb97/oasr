@@ -99,3 +99,6 @@ checkpoints/
 # Logs
 *.log
 logs/
+
+# Profiling
+profiling*

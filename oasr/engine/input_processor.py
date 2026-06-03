@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -26,24 +27,18 @@ from .graph_cache import GraphedFeatureExtraction
 from .request import Request
 
 
-class _NullCtx:
-    """No-op context manager used when fbank doesn't need a dedicated stream."""
-
-    __slots__ = ()
-
-    def __enter__(self) -> "_NullCtx":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        return None
-
-
 class InputProcessor:
-    """Converts raw audio into model-ready features.
+    """Converts raw **waveforms** into model-ready features.
 
-    Handles audio loading (file paths, tensors, NumPy arrays), batched
-    feature extraction, and splitting full-length features into streaming
-    chunk windows.
+    The engine is waveform-only: ``audio`` is a 1-D float32 tensor (or numpy
+    array) at the model sample rate — file decoding happens at the entry point
+    (the serving front-end via ``oasr-asr``, or the bench/test harness), never
+    here.  Two paths share this class:
+
+    * **offline** — :meth:`prepare_offline` then :meth:`collate_gpu` (one
+      batched GPU fbank over a length-bucketed micro-batch);
+    * **streaming** — :meth:`prepare_streaming`, :meth:`append_streaming_chunk`,
+      :meth:`extract_streaming_batch` (per-step batched fbank across streams).
 
     CMVN is **not** applied here — it is baked into the model as a
     ``GlobalCMVN`` layer inside ``ConformerEncoder``.
@@ -66,6 +61,20 @@ class InputProcessor:
         self._config = config
         self._device = device
         self._feature_config: FeatureConfig = config.feature_config  # type: ignore[assignment]
+
+        # Offline collate staging buffers, reused across micro-batches so the
+        # slow allocations (``cudaHostAlloc`` for pinned host, device malloc)
+        # are paid once and grown geometrically.
+        #   ``_wav_flat``   — pinned **host** 1-D buffer holding the batch's
+        #                     waveforms packed end-to-end (no padding).  The
+        #                     only CPU-side copy in collate; a single async
+        #                     H2D ships it to the device.
+        #   ``_wav_padded`` — **device** 1-D buffer, viewed as ``(B, T_max)``,
+        #                     into which the packed waveforms are scattered.
+        #                     Zero-padding and the audio-scale multiply both
+        #                     run here on the GPU (see :meth:`collate_gpu`).
+        self._wav_flat: Optional[torch.Tensor] = None
+        self._wav_padded: Optional[torch.Tensor] = None
 
         # Shared CUDA Graph memory-pool handle injected by ``ASREngine`` so the
         # feature-extraction graph cache (added in Step 2 of the plan) shares
@@ -103,53 +112,6 @@ class InputProcessor:
             )
 
     # ------------------------------------------------------------------
-    # Audio loading
-    # ------------------------------------------------------------------
-
-    def load_audio(
-        self,
-        audio: Union[str, torch.Tensor, np.ndarray],
-        sample_rate: int = 16000,
-    ) -> torch.Tensor:
-        """Load and normalise audio to a 1-D float32 waveform tensor (CPU).
-
-        Parameters
-        ----------
-        audio : str, Tensor, or ndarray
-            File path, waveform tensor ``(T,)`` / ``(1, T)``, or NumPy array.
-        sample_rate : int
-            Expected sample rate.  If a file is loaded at a different rate it
-            is resampled to ``sample_rate``.
-
-        Returns
-        -------
-        torch.Tensor
-            1-D float32 CPU tensor of shape ``(T,)``.
-        """
-        scale = self._config.audio_scale
-        if isinstance(audio, str):
-            import torchaudio
-
-            waveform, sr = torchaudio.load(audio)  # (C, T)
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            if sr != sample_rate:
-                waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=sample_rate)
-            return (waveform.squeeze(0).float() * scale)
-        elif isinstance(audio, np.ndarray):
-            wav = torch.from_numpy(audio)
-            if wav.dtype != torch.float32:
-                wav = wav.float()
-            return wav.squeeze() * scale
-        elif isinstance(audio, torch.Tensor):
-            wav = audio.float()
-            if wav.dim() == 2:
-                wav = wav.squeeze(0)
-            return wav.cpu() * scale
-        else:
-            raise TypeError(f"Unsupported audio type: {type(audio)}")
-
-    # ------------------------------------------------------------------
     # Batched offline processing
     # ------------------------------------------------------------------
 
@@ -176,180 +138,156 @@ class InputProcessor:
     def prepare_offline(self, request: Request) -> None:
         """Register an offline request without running feature extraction.
 
-        Loads the waveform into ``request.waveform`` (cheap when the input is
-        already a tensor or numpy array) and stamps a cheap sample-count
-        based ``num_frames`` estimate so the scheduler can bucket by length
-        without a D2H sync.  Actual fbank/mfcc extraction is deferred to
-        :meth:`collate_gpu`, which runs the batched GPU fbank over the whole
-        micro-batch in one shot.
+        Canonicalises ``request.audio`` **in place** (→ 1-D float32 CPU
+        waveform) and stamps a cheap sample-count based ``num_frames`` estimate
+        so the scheduler can bucket by length without a D2H sync.  No audio
+        scaling happens here — the int16-scale multiply runs on the GPU after
+        padding in :meth:`collate_gpu`, which also runs the batched fbank/mfcc.
         """
-
-        wav = self.load_audio(request.audio, request.sample_rate)
-        request.waveform = wav
-        request.num_frames = self._estimate_num_frames(int(wav.numel()))
+        request.audio = torch.as_tensor(
+            request.audio, dtype=torch.float32, device="cpu"
+        ).reshape(-1)
+        request.num_frames = self._estimate_num_frames(int(request.audio.numel()))
         # Clear any stale feature cache from reused Request objects.
         request.features = None
         request.feature_lengths = None
+
+    def _flat_host(self, n: int) -> torch.Tensor:
+        """Reused pinned **host** 1-D buffer of length ``n`` (geometric growth).
+
+        Pinned so the subsequent ``.to(cuda, non_blocking=True)`` is a true
+        async H2D.  Reuse is safe on the synchronous offline path: the buffer
+        is fully transferred (and the batch D→H-synced at decode) before the
+        next collate overwrites it — :class:`OfflinePipeline` runs micro-batches
+        back-to-back on the default stream with no producer-thread overlap.
+        """
+        cur = 0 if self._wav_flat is None else self._wav_flat.numel()
+        if cur < n:
+            self._wav_flat = torch.empty(
+                max(n, cur * 2), dtype=torch.float32, pin_memory=True
+            )
+        return self._wav_flat[:n]
+
+    def _padded_device(self, batch: int, t_max: int) -> torch.Tensor:
+        """Reused **device** buffer viewed as ``(batch, t_max)`` (geometric
+        growth).  Holds the zero-padded, scaled waveform batch: the caller
+        zeroes it, scatters the packed waveforms in, then scales — all on the
+        GPU.  Reuse is safe for the same reason as :meth:`_flat_host`."""
+        need = batch * t_max
+        cur = 0 if self._wav_padded is None else self._wav_padded.numel()
+        if cur < need:
+            self._wav_padded = torch.empty(
+                max(need, cur * 2), dtype=torch.float32, device=self._device
+            )
+        return self._wav_padded[:need].view(batch, t_max)
 
     def collate_gpu(
         self,
         requests: List[Request],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Batched feature extraction on the GPU.
+        """Batched feature extraction for one offline micro-batch.
 
-        Pads waveforms to a single ``(B, T_max)`` tensor, ships it to the
-        device with one pinned non-blocking H2D, and runs fbank over the
-        whole batch in one call.
-
-        When the feature config matches the standard Kaldi-compliant
-        settings (see :func:`supports_batched_fbank` /
-        :func:`supports_batched_mfcc`), uses the truly batched
-        :func:`batched_fbank` / :func:`batched_mfcc` implementation that
-        issues a handful of fused kernels over the entire micro-batch —
-        ~10× faster than looping
-        :func:`torchaudio.compliance.kaldi.fbank` / ``mfcc`` per utterance
-        because it eliminates the per-call Python overhead.
-
-        Falls back to the per-utterance loop for unusual configs
-        (non-Povey windows, dithered, use_energy=True, etc.) so output
-        quality is preserved even when the fast path is unavailable.
+        Builds a padded + scaled ``(B, T_max)`` device batch from the requests'
+        waveforms (:meth:`_padded_waveform_batch`), runs fbank/mfcc over it in
+        one shot (:meth:`_fbank_batch`), then releases the host waveforms so the
+        GPU feature tensor owns the batch.  ``prepare_offline`` has already
+        canonicalised each ``request.audio`` to a 1-D float32 CPU waveform.
 
         Returns
         -------
         features : Tensor
-            ``(B, max_feat_frames, F)`` padded feature tensor in the
-            engine's configured dtype, on ``device``.
+            ``(B, max_feat_frames, F)`` padded features in the engine dtype,
+            on ``device``.
         feat_lengths : Tensor
-            ``(B,)`` int32 valid frame counts on ``device``.
+            ``(B,)`` valid frame counts on ``device``.
         """
         assert requests, "cannot collate empty batch"
 
-        waveforms: List[torch.Tensor] = []
+        waveforms = [r.audio for r in requests]
+        wav_lengths = torch.tensor([w.size(0) for w in waveforms], dtype=torch.int64)
+
+        wav_gpu = self._padded_waveform_batch(waveforms)
+        features, feat_lengths = self._fbank_batch(wav_gpu, wav_lengths)
+
+        # Release the host waveforms; the GPU feature tensor owns the batch now.
         for r in requests:
-            wav = r.waveform
-            if wav is None:
-                wav = self.load_audio(r.audio, r.sample_rate)
-            waveforms.append(wav)
-
-        wav_lengths = torch.tensor(
-            [w.size(0) for w in waveforms], dtype=torch.int64
-        )
-        T_max = int(wav_lengths.max().item())
-
-        # One pinned H2D for the whole micro-batch of waveforms.
-        padded_wav_cpu = torch.zeros(
-            len(waveforms), T_max, dtype=torch.float32
-        )
-        for i, w in enumerate(waveforms):
-            padded_wav_cpu[i, : w.size(0)] = w
-        if self._device.type == "cuda":
-            padded_wav_cpu = padded_wav_cpu.pin_memory()
-        wav_gpu = padded_wav_cpu.to(device=self._device, non_blocking=True)
-
-        fcfg = self._feature_config
-        if supports_batched_fbank(fcfg) or supports_batched_mfcc(fcfg):
-            lengths_gpu = wav_lengths.to(
-                device=self._device, non_blocking=True
-            )
-            batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
-            features_f32, feat_lengths = batched_fn(wav_gpu, lengths_gpu, fcfg)
-            features = features_f32.to(dtype=self._config.dtype)
-        else:
-            # Fall back to per-utterance fbank on GPU (still much faster
-            # than CPU pool for non-standard configs).
-            feat_list: List[torch.Tensor] = []
-            for i, L in enumerate(wav_lengths.tolist()):
-                feat_list.append(
-                    _extract_single(wav_gpu[i, :L], self._feature_config)
-                )
-            feat_lengths = torch.tensor(
-                [f.size(0) for f in feat_list],
-                dtype=torch.int32, device=self._device,
-            )
-            padded_feat = torch.nn.utils.rnn.pad_sequence(
-                feat_list, batch_first=True, padding_value=0.0
-            )
-            features = padded_feat.to(dtype=self._config.dtype)
-
-        # Release waveforms; the GPU feature tensor owns the batch now.
-        for r in requests:
-            r.waveform = None
-
+            r.audio = None
         return features, feat_lengths
 
-    # ------------------------------------------------------------------
-    # Streaming chunking
-    # ------------------------------------------------------------------
+    def _padded_waveform_batch(self, waveforms: List[torch.Tensor]) -> torch.Tensor:
+        """Pad 1-D waveforms into one ``(B, T_max)`` device tensor, zero-padded
+        and ``audio_scale``-scaled — with the GPU doing the heavy lifting.
 
-    def chunk_features(self, features: torch.Tensor) -> List[torch.Tensor]:
-        """Split a ``(1, T, F)`` feature tensor into overlapping chunk windows.
-
-        Kept for tests and legacy use.  The live streaming path now slices
-        encoder chunks directly out of ``Request.feature_buffer`` in the
-        engine step loop; this helper is no longer called for admission.
-
-        * stride = ``subsampling_rate * chunk_size``
-        * window = ``(chunk_size - 1) * subsampling_rate + right_context + 1``
+        On CUDA the CPU does a single copy (packing the waveforms end-to-end
+        into a reused **pinned** host buffer); one async H2D ships them over,
+        then the GPU zeroes a reused ``(B, T_max)`` buffer (the padding),
+        scatters each waveform into its row, and multiplies by ``audio_scale``
+        *after* padding.  This keeps the per-batch ``cudaHostAlloc`` and the
+        ``zero(B*T_max)`` off the CPU.
         """
-        cfg = self._config
-        stride = cfg.stride
-        window = cfg.decoding_window
-        num_frames = features.size(1)
-        context = cfg.right_context + 1
+        scale = self._config.audio_scale
+        wav_sizes = [w.size(0) for w in waveforms]
+        batch, t_max = len(waveforms), max(wav_sizes)
 
-        chunks: List[torch.Tensor] = []
-        for cur in range(0, num_frames - context + 1, stride):
-            end = min(cur + window, num_frames)
-            chunks.append(features[:, cur:end, :])
-        return chunks
+        if self._device.type != "cuda":
+            padded = torch.zeros(batch, t_max, dtype=torch.float32)
+            for i, (w, n) in enumerate(zip(waveforms, wav_sizes)):
+                if n:
+                    padded[i, :n] = w
+            return padded.mul_(scale) if scale != 1.0 else padded
 
-    # ------------------------------------------------------------------
-    # Streaming audio ingest + per-step batched fbank
-    # ------------------------------------------------------------------
+        flat = self._flat_host(sum(wav_sizes))  # pinned; sole CPU-side copy
+        off = 0
+        for w, n in zip(waveforms, wav_sizes):
+            if n:
+                flat[off : off + n] = w
+            off += n
+        flat_gpu = flat.to(self._device, non_blocking=True)  # one async H2D
+
+        padded = self._padded_device(batch, t_max)
+        padded.zero_()  # GPU zero-padding
+        off = 0
+        for i, n in enumerate(wav_sizes):
+            if n:
+                padded[i, :n] = flat_gpu[off : off + n]  # device-to-device
+            off += n
+        if scale != 1.0:
+            padded.mul_(scale)  # GPU scale, after padding
+        return padded
+
+    def _fbank_batch(
+        self, wav_gpu: torch.Tensor, wav_lengths: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run fbank/mfcc over a padded ``(B, T_max)`` waveform batch.
+
+        Uses the fused :func:`batched_fbank` / :func:`batched_mfcc` kernels for
+        standard Kaldi-compliant configs (the common case — a handful of kernels
+        over the whole micro-batch, ~10× faster than a per-utterance Python
+        loop).  Falls back to per-utterance extraction for unusual configs
+        (non-Povey windows, dither, ``use_energy``) so output quality is
+        preserved when the fast path is unavailable.
+        """
+        fcfg = self._feature_config
+        if supports_batched_fbank(fcfg) or supports_batched_mfcc(fcfg):
+            lengths_gpu = wav_lengths.to(self._device, non_blocking=True)
+            batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
+            features_f32, feat_lengths = batched_fn(wav_gpu, lengths_gpu, fcfg)
+            return features_f32.to(dtype=self._config.dtype), feat_lengths
+
+        feat_list = [
+            _extract_single(wav_gpu[i, :n], fcfg)
+            for i, n in enumerate(wav_lengths.tolist())
+        ]
+        feat_lengths = torch.tensor(
+            [f.size(0) for f in feat_list], dtype=torch.int32, device=self._device
+        )
+        padded_feat = torch.nn.utils.rnn.pad_sequence(
+            feat_list, batch_first=True, padding_value=0.0
+        )
+        return padded_feat.to(dtype=self._config.dtype), feat_lengths
+
 
     def prepare_streaming(self, request: Request) -> None:
-        """Register a streaming request from a full waveform (legacy API).
-
-        Splits the raw waveform into **audio-sample** chunks that the engine
-        then feeds into the fbank path incrementally — one chunk per step per
-        stream.  Only the tail of the previous chunk is re-used when
-        extracting features, so the engine never looks at future audio when
-        processing the current chunk.
-
-        The default audio-chunk size corresponds to ``stride`` feature frames
-        (i.e. one encoder chunk worth of new audio): at 16 kHz with a 10 ms
-        hop and ``chunk_size=16``/``subsampling_rate=4`` that's 10240 samples
-        ≈ 640 ms.
-
-        Prefer :meth:`prepare_streaming_open` + :meth:`append_streaming_chunk`
-        for chunk-by-chunk feeding, which models a real-time client more
-        faithfully and avoids the up-front waveform load.
-        """
-        wav = request.waveform if request.waveform is not None \
-            else self.load_audio(request.audio, request.sample_rate)
-
-        # Keep the waveform on CPU float32 for fbank; GPU promotion is batched
-        # in ``extract_streaming_batch``.
-        wav_cpu = wav.detach()
-        if wav_cpu.device.type != "cpu":
-            wav_cpu = wav_cpu.cpu()
-
-        chunk_samples = self.streaming_audio_chunk_samples
-        chunks: "deque[torch.Tensor]" = deque()
-        n = wav_cpu.numel()
-        for start in range(0, n, chunk_samples):
-            chunks.append(wav_cpu[start: start + chunk_samples].contiguous())
-
-        request.audio_chunks = chunks
-        request.audio_tail = wav_cpu.new_empty(0)
-        request.audio_final = True  # whole-waveform API — no more audio will arrive
-        request.num_frames = self._estimate_num_frames(n)
-        request.feature_buffer = None
-        request.feature_frames = 0
-        request.feature_cursor = 0
-        request.waveform = None
-
-    def prepare_streaming_open(self, request: Request) -> None:
         """Register an empty streaming request — chunks arrive via
         :meth:`append_streaming_chunk`.
 
@@ -364,7 +302,6 @@ class InputProcessor:
         request.feature_buffer = None
         request.feature_frames = 0
         request.feature_cursor = 0
-        request.waveform = None
 
     def append_streaming_chunk(
         self,
@@ -377,7 +314,7 @@ class InputProcessor:
         Parameters
         ----------
         request : Request
-            A request previously initialised with :meth:`prepare_streaming_open`.
+            A request previously initialised with :meth:`prepare_streaming`.
         chunk : Tensor or ndarray
             1-D audio samples (CPU or GPU; converted to CPU float32).
         is_last : bool
@@ -387,27 +324,20 @@ class InputProcessor:
         if request.audio_chunks is None:
             raise RuntimeError(
                 "append_streaming_chunk called on a request that was not "
-                "initialised via prepare_streaming_open"
+                "initialised via prepare_streaming"
             )
         if request.audio_final:
             raise RuntimeError(
                 f"feed_chunk after is_last=True for request {request.request_id}"
             )
 
-        # Normalise to CPU float32 1-D, scaled like load_audio does.
+        # Normalise to a 1-D float32 CPU waveform (shared with the offline path)
+        # and apply the int16 ``audio_scale``.  Streaming keeps its scale on the
+        # CPU: it's a tiny per-chunk multiply feeding the chunk+tail concat, not
+        # the offline batch pad (the GPU scale-after-pad in ``collate_gpu`` is
+        # offline-only).
+        wav = torch.as_tensor(chunk, dtype=torch.float32, device="cpu").reshape(-1)
         scale = self._config.audio_scale
-        if isinstance(chunk, np.ndarray):
-            wav: torch.Tensor = torch.from_numpy(chunk)
-        elif isinstance(chunk, torch.Tensor):
-            wav = chunk
-        else:  # type: ignore[unreachable]
-            raise TypeError(f"Unsupported chunk type: {type(chunk)}")
-        if wav.dtype != torch.float32:
-            wav = wav.float()
-        if wav.dim() == 2:
-            wav = wav.squeeze(0)
-        if wav.device.type != "cpu":
-            wav = wav.cpu()
         if scale != 1.0:
             wav = wav * scale
         wav = wav.contiguous()
@@ -455,18 +385,36 @@ class InputProcessor:
         """
         if not requests:
             return
+        frame_len = self._feature_config.frame_length_samples
 
-        fcfg = self._feature_config
-        frame_shift = fcfg.frame_shift_samples
-        frame_len = fcfg.frame_length_samples
-        feat_dim = fcfg.output_dim
-        dtype = self._config.dtype
-        device = self._device
+        fbank_inputs, fbank_reqs, fbank_flush = self._collect_streaming_inputs(
+            requests, frame_len
+        )
+        if not fbank_reqs:
+            return
 
-        # Collect per-stream (combined waveform, is_final_flush) pairs.
-        combined: List[torch.Tensor] = []
-        targets: List[Request] = []
-        is_flush: List[bool] = []
+        feats, feat_lens_cpu = self._run_streaming_features(
+            fbank_inputs, fbank_flush, cuda_stream
+        )
+        self._distribute_streaming_features(
+            fbank_reqs, fbank_inputs, fbank_flush, feats, feat_lens_cpu
+        )
+
+    def _collect_streaming_inputs(
+        self, requests: List[Request], frame_len: int
+    ) -> Tuple[List[torch.Tensor], List[Request], List[bool]]:
+        """Pop one pending chunk per stream, prepend its ``audio_tail``, and
+        return the per-stream combined waveforms ready for fbank.
+
+        Returns ``(fbank_inputs, fbank_reqs, fbank_flush)`` aligned by index.
+        A stream whose combined buffer is still shorter than one frame (and is
+        not a final flush) keeps its tail and is skipped this step.  No stream
+        ever looks past its own enqueued audio — we fuse across *different*
+        streams, never across future chunks of the same stream.
+        """
+        fbank_inputs: List[torch.Tensor] = []
+        fbank_reqs: List[Request] = []
+        fbank_flush: List[bool] = []
         for req in requests:
             if req.audio_chunks is None or req.audio_tail is None:
                 continue
@@ -477,150 +425,132 @@ class InputProcessor:
                 flush = req.audio_final and not req.audio_chunks \
                     and cat.numel() >= frame_len
                 # On the very last chunk pad the tail so the final partial
-                # frame still gets emitted (mirrors
-                # ``_StreamingFeatureExtractor._flush_torchaudio``).
-                if req.audio_final and not req.audio_chunks:
-                    if cat.numel() < frame_len:
-                        pad = cat.new_zeros(frame_len - cat.numel())
-                        cat = torch.cat([cat, pad])
-                        flush = True
-                combined.append(cat)
-                targets.append(req)
-                is_flush.append(flush)
+                # frame still gets emitted.
+                if req.audio_final and not req.audio_chunks and cat.numel() < frame_len:
+                    cat = torch.cat([cat, cat.new_zeros(frame_len - cat.numel())])
+                    flush = True
             elif req.audio_final and req.audio_tail.numel() > 0:
-                # No chunks left but tail still carries unconsumed samples
-                # (can happen when the whole waveform was < chunk_samples).
+                # No chunks left but the tail still carries unconsumed samples
+                # (whole waveform was < chunk_samples).
                 cat = req.audio_tail
                 if cat.numel() < frame_len:
-                    pad = cat.new_zeros(frame_len - cat.numel())
-                    cat = torch.cat([cat, pad])
-                combined.append(cat)
-                targets.append(req)
-                is_flush.append(True)
-
-        if not targets:
-            return
-
-        # Drop streams whose combined buffer is still shorter than one
-        # frame — they need more audio before fbank can produce anything.
-        # Keep their tail updated and retry next step.
-        fbank_inputs: List[torch.Tensor] = []
-        fbank_reqs: List[Request] = []
-        fbank_flush: List[bool] = []
-        for req, cat, flush in zip(targets, combined, is_flush):
+                    cat = torch.cat([cat, cat.new_zeros(frame_len - cat.numel())])
+                flush = True
+            else:
+                continue
+            # Too-short non-final buffers wait for more audio next step.
             if cat.numel() < frame_len and not flush:
                 req.audio_tail = cat
                 continue
             fbank_inputs.append(cat)
             fbank_reqs.append(req)
             fbank_flush.append(flush)
+        return fbank_inputs, fbank_reqs, fbank_flush
 
-        if not fbank_reqs:
-            return
+    def _run_streaming_features(
+        self,
+        fbank_inputs: List[torch.Tensor],
+        fbank_flush: List[bool],
+        cuda_stream: Optional["torch.cuda.Stream"],
+    ) -> Tuple[torch.Tensor, List[int]]:
+        """Pad the combined waveforms to ``(B, T_max)`` and run fbank/mfcc.
+
+        Returns ``(feats, feat_lens_cpu)`` — ``feats`` a device tensor, and the
+        host-side per-stream frame counts (Kaldi snip_edges formula, so the
+        fbank-output length tensor is never D→H synced).  Prefers the captured
+        feature CUDA-graph in steady state, the eager batched kernel otherwise,
+        and a per-utterance CPU extraction for non-standard configs.
+        """
+        fcfg = self._feature_config
+        frame_shift = fcfg.frame_shift_samples
+        frame_len = fcfg.frame_length_samples
+        feat_dim = fcfg.output_dim
+        dtype = self._config.dtype
+        device = self._device
 
         nvtx_push("pad+pin")
-        # Host-side waveform sample counts and the deterministic Kaldi
-        # snip_edges frame count formula give us ``feat_lens`` without a
-        # GPU→CPU sync on the fbank-output length tensor.
         sample_counts = [w.numel() for w in fbank_inputs]
-        T_max = max(sample_counts)
+        t_max = max(sample_counts)
         feat_lens_cpu: List[int] = [
             ((n - frame_len) // frame_shift + 1) if n >= frame_len else 0
             for n in sample_counts
         ]
         lengths_cpu = torch.tensor(sample_counts, dtype=torch.int64)
-
-        padded_cpu = torch.zeros(len(fbank_inputs), T_max, dtype=torch.float32)
+        padded_cpu = torch.zeros(len(fbank_inputs), t_max, dtype=torch.float32)
         for i, w in enumerate(fbank_inputs):
             padded_cpu[i, : w.numel()] = w
         if device.type == "cuda":
             padded_cpu = padded_cpu.pin_memory()
-            lengths_cpu_pin = lengths_cpu.pin_memory()
-        else:
-            lengths_cpu_pin = lengths_cpu
+            lengths_cpu = lengths_cpu.pin_memory()
         nvtx_pop()
 
         use_batched = device.type == "cuda" and (
             supports_batched_fbank(fcfg) or supports_batched_mfcc(fcfg)
         )
-        # If a dedicated CUDA stream was provided, run the H2D copy and the
-        # feature kernel on it so they can overlap with the encoder forward
-        # on the default stream.  The caller is responsible for inserting
-        # the event-wait before reading feature_buffer.
-        use_alt_stream = use_batched and cuda_stream is not None
-        if use_batched:
-            stream_ctx = (
-                torch.cuda.stream(cuda_stream) if use_alt_stream
-                else _NullCtx()
-            )
-            batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
-
-            # Captured-graph fast path: only used in steady state (no flush)
-            # and when the cohort fits the largest pre-built B bucket and the
-            # combined waveform fits ``t_pad``. Any miss falls through to the
-            # eager path with no warm-up cost beyond a host-side branch.
-            feats: Optional[torch.Tensor] = None
-            fg = self._feature_graph
-            if (
-                fg is not None
-                and not any(fbank_flush)
-                and padded_cpu.size(1) <= fg.t_pad
-            ):
-                with stream_ctx:
-                    nvtx_push("feature_graph_replay")
-                    feats_view = fg.replay(
-                        len(fbank_inputs), padded_cpu, lengths_cpu_pin
-                    )
-                    nvtx_pop()
-                if feats_view is not None:
-                    feats = feats_view[: len(fbank_inputs)]
-
-            if feats is None:
-                with stream_ctx:
-                    nvtx_push("h2d")
-                    wav_gpu = padded_cpu.to(device=device, non_blocking=True)
-                    lengths_gpu = lengths_cpu_pin.to(device=device, non_blocking=True)
-                    nvtx_pop()
-                    nvtx_push("feature")
-                    feats_f32, _feat_lens_gpu = batched_fn(wav_gpu, lengths_gpu, fcfg)
-                    feats = feats_f32.to(dtype=dtype)
-                    # feat_lens_cpu was computed host-side above; the GPU
-                    # ``feat_lens`` tensor is left unused to avoid the D2H sync.
-                    nvtx_pop()
-        else:
-            # Fallback: per-utt CPU/torchaudio fbank.  Used by non-Povey
-            # configs and CPU-only devices.
-            feat_list: List[torch.Tensor] = []
-            feat_lens_cpu_list: List[int] = []
-            for i, w in enumerate(fbank_inputs):
-                f = _extract_single(w, fcfg)
-                feat_list.append(f)
-                feat_lens_cpu_list.append(f.size(0))
-            max_nf = max(feat_lens_cpu_list) if feat_lens_cpu_list else 0
-            feats_cpu = torch.zeros(
-                len(feat_list), max_nf, feat_dim, dtype=torch.float32
-            )
+        if not use_batched:
+            # Per-utterance CPU/torchaudio fallback (non-Povey configs, CPU).
+            feat_list = [_extract_single(w, fcfg) for w in fbank_inputs]
+            feat_lens_cpu = [f.size(0) for f in feat_list]
+            max_nf = max(feat_lens_cpu) if feat_lens_cpu else 0
+            feats_cpu = torch.zeros(len(feat_list), max_nf, feat_dim, dtype=torch.float32)
             for i, f in enumerate(feat_list):
                 feats_cpu[i, : f.size(0)] = f
             feats = feats_cpu.to(device=device, dtype=dtype, non_blocking=True)
-            feat_lens_cpu = feat_lens_cpu_list
+            return feats, feat_lens_cpu
 
-        # Distribute new frames back into per-stream buffers and update tails.
+        # A dedicated feature stream (when provided) overlaps the H2D + kernel
+        # with the encoder forward on the default stream; the caller inserts the
+        # event-wait before reading ``feature_buffer``.
+        stream_ctx = (
+            torch.cuda.stream(cuda_stream) if cuda_stream is not None else nullcontext()
+        )
+        batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
+
+        # Captured-graph fast path: steady state only (no flush) and within the
+        # pre-built B bucket + ``t_pad``.  Any miss falls through to eager.
+        fg = self._feature_graph
+        if fg is not None and not any(fbank_flush) and padded_cpu.size(1) <= fg.t_pad:
+            with stream_ctx:
+                nvtx_push("feature_graph_replay")
+                feats_view = fg.replay(len(fbank_inputs), padded_cpu, lengths_cpu)
+                nvtx_pop()
+            if feats_view is not None:
+                return feats_view[: len(fbank_inputs)], feat_lens_cpu
+
+        with stream_ctx:
+            nvtx_push("h2d")
+            wav_gpu = padded_cpu.to(device=device, non_blocking=True)
+            lengths_gpu = lengths_cpu.to(device=device, non_blocking=True)
+            nvtx_pop()
+            nvtx_push("feature")
+            feats_f32, _ = batched_fn(wav_gpu, lengths_gpu, fcfg)
+            feats = feats_f32.to(dtype=dtype)
+            nvtx_pop()
+        return feats, feat_lens_cpu
+
+    def _distribute_streaming_features(
+        self,
+        fbank_reqs: List[Request],
+        fbank_inputs: List[torch.Tensor],
+        fbank_flush: List[bool],
+        feats: torch.Tensor,
+        feat_lens_cpu: List[int],
+    ) -> None:
+        """Append each stream's new feature frames to its ring buffer and reset
+        its ``audio_tail`` to the samples beyond the last consumed frame."""
+        frame_shift = self._feature_config.frame_shift_samples
+        feat_dim = self._feature_config.output_dim
         nvtx_push("distribute")
         for i, req in enumerate(fbank_reqs):
             new_nf = int(feat_lens_cpu[i])
             if new_nf > 0:
-                new_feats = feats[i, :new_nf, :]  # (new_nf, F) view on device
-                self._append_features(req, new_feats, feat_dim)
-            # New tail = samples beyond the last consumed frame
+                self._append_features(req, feats[i, :new_nf, :], feat_dim)
             consumed = new_nf * frame_shift
             cat = fbank_inputs[i]
-            if fbank_flush[i]:
+            if fbank_flush[i] or consumed >= cat.numel():
                 req.audio_tail = cat.new_empty(0)
-            elif consumed < cat.numel():
-                req.audio_tail = cat[consumed:].contiguous()
             else:
-                req.audio_tail = cat.new_empty(0)
+                req.audio_tail = cat[consumed:].contiguous()
         nvtx_pop()
 
     def _append_features(

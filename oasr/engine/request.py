@@ -61,9 +61,12 @@ class Request:
 
     Parameters
     ----------
-    audio : str or Tensor or ndarray
-        Either a file path (``str``), a raw waveform ``torch.Tensor`` of
-        shape ``(num_samples,)`` or ``(1, num_samples)``, or a NumPy array.
+    audio : Tensor or ndarray
+        A raw **waveform** — ``torch.Tensor`` of shape ``(num_samples,)`` or
+        ``(1, num_samples)``, or a NumPy array — at the model sample rate.
+        The engine is waveform-only; file decoding happens at the entry point
+        (the serving front-end via ``oasr-asr``, or the bench/test harness),
+        never inside the engine.
     request_id : str, optional
         Unique identifier.  Auto-generated (UUID4 hex) if not provided.
     streaming : bool
@@ -75,17 +78,27 @@ class Request:
 
     def __init__(
         self,
-        audio: Optional[Union[str, torch.Tensor, "np.ndarray"]] = None,
+        audio: Optional[Union[torch.Tensor, "np.ndarray"]] = None,
         request_id: Optional[str] = None,
         streaming: bool = False,
         sample_rate: int = 16000,
         priority: int = DEFAULT_PRIORITY,
     ) -> None:
         self.request_id: str = request_id or uuid.uuid4().hex
-        # ``audio`` is optional for the chunk-by-chunk streaming API
-        # (``ASREngine.add_streaming_request`` registers a stream then
-        # ``ASREngine.feed_chunk`` pushes individual chunks afterwards).
-        self.audio: Optional[Union[str, torch.Tensor, "np.ndarray"]] = audio
+        # The engine's single audio input slot — always a **waveform** (1-D
+        # float32 samples) or ``None``; the engine never takes file paths
+        # (decode at the entry point).  Its role depends on the mode:
+        #   * offline — the input waveform.  ``prepare_offline`` canonicalises
+        #     it in place (→ 1-D float32 CPU), ``collate_gpu`` consumes it and
+        #     then clears it to ``None`` once the GPU feature tensor owns the
+        #     batch.
+        #   * streaming — ``None`` for the chunk-by-chunk API
+        #     (``add_streaming_request`` + ``feed_chunk``), or a pre-loaded
+        #     waveform that ``StreamingPipeline.admit`` splits into chunks
+        #     (``transcribe(..., streaming=True)``).
+        # ndarray / ``(1, T)`` / non-float32 inputs are accepted and normalised
+        # on first use — there is no separate "raw vs. normalised" field.
+        self.audio: Optional[Union[torch.Tensor, "np.ndarray"]] = audio
         self.streaming: bool = streaming
         self.sample_rate: int = sample_rate
         self.priority: int = priority
@@ -97,9 +110,6 @@ class Request:
         # Populated by InputProcessor
         self.features: Optional[torch.Tensor] = None          # (1, T, F)
         self.feature_lengths: Optional[torch.Tensor] = None   # (1,)
-        # Offline-path raw waveform (CPU, scaled) held between ``add_request`` and
-        # the batched ``collate_gpu`` call.  Released once features are built.
-        self.waveform: Optional[torch.Tensor] = None  # (T_samples,) CPU float32
         # Number of feature frames.  For offline this starts as a cheap
         # sample-count-derived estimate so the scheduler can bucket before
         # features are extracted, and is overwritten with the exact value

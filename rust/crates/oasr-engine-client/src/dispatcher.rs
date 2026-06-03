@@ -89,6 +89,11 @@ pub struct DispatcherConfig {
     /// have been drained.  Should be <= ``max_inbound_per_tick`` and
     /// roughly match the engine's ``max_batch_size``.
     pub admit_threshold: usize,
+    /// When true, accumulate per-tick sub-stage timings (intake, admit incl.
+    /// audio→numpy, step, output extract, route) + effective batch size and
+    /// log a rolling summary every ~2 s at INFO.  Off by default — pure
+    /// diagnostics for the service↔engine gap decomposition.
+    pub trace_dispatch: bool,
 }
 
 impl Default for DispatcherConfig {
@@ -103,7 +108,76 @@ impl Default for DispatcherConfig {
             // concurrency=64 without a visible p50 hit.
             admit_window: Duration::from_millis(3),
             admit_threshold: 64,
+            trace_dispatch: false,
         }
+    }
+}
+
+/// Rolling accumulator for per-tick dispatcher sub-stage timings.  Only
+/// touched on ticks that actually stepped the engine; logged + reset every
+/// ~2 s when `DispatcherConfig::trace_dispatch` is set.  All `*_us` are
+/// summed microseconds over the window.
+#[derive(Debug)]
+struct DispatchTrace {
+    ticks: u64,
+    n_admit: u64,
+    n_out: u64,
+    intake_us: u64,
+    admit_us: u64,
+    step_us: u64,
+    extract_us: u64,
+    route_us: u64,
+    last_log: Instant,
+}
+
+impl DispatchTrace {
+    fn new() -> Self {
+        Self {
+            ticks: 0,
+            n_admit: 0,
+            n_out: 0,
+            intake_us: 0,
+            admit_us: 0,
+            step_us: 0,
+            extract_us: 0,
+            route_us: 0,
+            last_log: Instant::now(),
+        }
+    }
+
+    fn reset(&mut self) {
+        // Start a fresh ~2 s window from *now* (Self::new() stamps last_log).
+        *self = Self::new();
+    }
+
+    /// Log a rolling summary every ~2 s, then reset the window.  Reports
+    /// per-tick means (the natural unit — each tick is one `engine.step()`)
+    /// plus the effective batch (outputs/tick) and the share of wall time the
+    /// dispatcher thread spends *outside* the GPU step (intake+admit+extract+
+    /// route) — i.e. the serial overhead that starves the GPU.
+    fn maybe_log(&mut self, label: &str) {
+        if self.last_log.elapsed() < Duration::from_secs(2) || self.ticks == 0 {
+            return;
+        }
+        let t = self.ticks as f64;
+        let intake = self.intake_us as f64 / t / 1000.0;
+        let admit = self.admit_us as f64 / t / 1000.0;
+        let step = self.step_us as f64 / t / 1000.0;
+        let extract = self.extract_us as f64 / t / 1000.0;
+        let route = self.route_us as f64 / t / 1000.0;
+        let overhead = intake + admit + extract + route;
+        let total = overhead + step;
+        let overhead_pct = if total > 0.0 { 100.0 * overhead / total } else { 0.0 };
+        info!(
+            label = %label,
+            ticks = self.ticks,
+            batch = format!("{:.1}", self.n_out as f64 / t),
+            admit_per_tick = format!("{:.1}", self.n_admit as f64 / t),
+            "dispatch[ms/tick]: intake={intake:.2} admit={admit:.2} step={step:.2} \
+             extract={extract:.2} route={route:.2} | non-step overhead={overhead:.2}ms \
+             ({overhead_pct:.0}% of {total:.2}ms/tick)"
+        );
+        self.reset();
     }
 }
 
@@ -162,8 +236,12 @@ fn run_dispatcher(
     let mut tick_events: Vec<Event> = Vec::new();
     let mut admit_batch: Vec<AdmitSpec> = Vec::with_capacity(64);
 
+    let trace_enabled = cfg.trace_dispatch;
+    let mut trace = DispatchTrace::new();
+
     loop {
         // ---- Drain inbound commands (non-blocking up to per-tick budget) ----
+        let intake_t0 = Instant::now();
         while envs.len() < cfg.max_inbound_per_tick {
             match cmd_rx.try_recv() {
                 Ok(env) => envs.push(env),
@@ -218,12 +296,34 @@ fn run_dispatcher(
             }
         }
 
+        let t_intake = intake_t0.elapsed();
         let received_any = !envs.is_empty();
+        // Count admit commands this tick *before* they're drained (effective
+        // batch trace).  Cheap O(n) scan, skipped unless tracing.
+        let n_admit = if trace_enabled {
+            envs.iter()
+                .filter(|e| {
+                    matches!(
+                        e.cmd,
+                        Cmd::CreateOffline { .. } | Cmd::CreateStreaming { .. }
+                    )
+                })
+                .count() as u64
+        } else {
+            0
+        };
 
         // ---- ONE Python::with_gil for replay + step ----
         tick_events.clear();
         admit_batch.clear();
-        let (running, waiting): (u32, u32) = Python::with_gil(|py| {
+        let (running, waiting, t_admit, t_step, t_extract, n_out): (
+            u32,
+            u32,
+            Duration,
+            Duration,
+            Duration,
+            u64,
+        ) = Python::with_gil(|py| {
             let bound = engine.bind_engine(py);
 
             // Replay drained envelopes in FIFO order, coalescing contiguous
@@ -231,6 +331,7 @@ fn run_dispatcher(
             // the Python side.  Non-admit cmds (FeedChunk, Cancel, Ping)
             // force a flush first so request_id ordering across the
             // CreateStreaming → FeedChunk boundary is preserved.
+            let admit_t0 = Instant::now();
             for env in envs.drain(..) {
                 match &env.cmd {
                     Cmd::CreateOffline { .. } | Cmd::CreateStreaming { .. } => {
@@ -268,16 +369,40 @@ fn run_dispatcher(
                 &shared,
                 &mut tick_events,
             );
+            let t_admit = admit_t0.elapsed();
 
             // Decide whether to step.  `engine.step()` is fast when there's
             // nothing running, but skipping it saves a Python call on each
             // truly-idle tick.
             let (running, waiting) = PyEngine::load_locked(&bound);
             let pending = running > 0 || waiting > 0;
+            let mut t_step = Duration::ZERO;
+            let mut t_extract = Duration::ZERO;
+            let mut n_out = 0u64;
             if pending {
-                match PyEngine::step_locked(py, &bound) {
-                    Ok(events) => tick_events.extend(events),
+                let step_t0 = Instant::now();
+                match PyEngine::step_raw(&bound) {
+                    Ok(list) => {
+                        t_step = step_t0.elapsed();
+                        n_out = list.len() as u64;
+                        let extract_t0 = Instant::now();
+                        match PyEngine::extract_events(&list) {
+                            Ok(events) => tick_events.extend(events),
+                            Err(e) => {
+                                error!(label = %shared.label, "engine.step extract failed: {e}");
+                                for rid in shared.router.all_request_ids() {
+                                    tick_events.push(Event::Error {
+                                        request_id: rid,
+                                        code: ErrorCode::Internal,
+                                        message: format!("engine.step extract error: {e}"),
+                                    });
+                                }
+                            }
+                        }
+                        t_extract = extract_t0.elapsed();
+                    }
                     Err(e) => {
+                        t_step = step_t0.elapsed();
                         error!(label = %shared.label, "engine.step failed: {e}");
                         // Surface a synthetic Error to every in-flight request
                         // so callers don't hang.  Continue — the engine may
@@ -294,10 +419,12 @@ fn run_dispatcher(
             }
 
             // Refresh load after step (terminal events drop in-flight count).
-            PyEngine::load_locked(&bound)
+            let (running, waiting) = PyEngine::load_locked(&bound);
+            (running, waiting, t_admit, t_step, t_extract, n_out)
         });
 
         // ---- Route events outside the GIL ----
+        let route_t0 = Instant::now();
         for evt in tick_events.drain(..) {
             let terminal = evt.is_terminal();
             let rid_present = evt.request_id().is_some();
@@ -305,6 +432,20 @@ fn run_dispatcher(
             if terminal && rid_present {
                 shared.load.fetch_sub(1, Ordering::Relaxed);
             }
+        }
+        let t_route = route_t0.elapsed();
+
+        // ---- Dispatch trace accounting (diagnostics; gated by flag) ----
+        if trace_enabled && (t_step > Duration::ZERO || n_out > 0) {
+            trace.ticks += 1;
+            trace.n_admit += n_admit;
+            trace.n_out += n_out;
+            trace.intake_us += t_intake.as_micros() as u64;
+            trace.admit_us += t_admit.as_micros() as u64;
+            trace.step_us += t_step.as_micros() as u64;
+            trace.extract_us += t_extract.as_micros() as u64;
+            trace.route_us += t_route.as_micros() as u64;
+            trace.maybe_log(&shared.label);
         }
 
         // ---- Refresh load + heartbeat ----
