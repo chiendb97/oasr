@@ -119,14 +119,25 @@ class ModelRunner:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def prewarm_encoder_graphs(self, batch_sizes: Sequence[int]) -> None:
-        """Pre-capture ``GraphedEncoderForward`` at every B in ``batch_sizes``.
+    def prewarm_encoder_graphs(
+        self,
+        batch_sizes: Sequence[int],
+        cache_t1_buckets: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Pre-capture ``GraphedEncoderForward`` over a (B, cache_t1) ladder.
 
         Triggers the lazy capture path with dummy zero-filled inputs so the
-        first real chunk at each preferred B replays instead of paying the
-        capture latency on the request path.  All captures use
-        ``cache_t1_bucket=0`` (empty cache) and ``T_input == window``; the
-        cache_t1 ladder is populated lazily on first traffic.
+        first real chunk at each ``(B, cache_t1_bucket)`` shape **replays**
+        instead of paying the ~capture latency on the request path.  This is
+        an interactive-latency win: without it a live stream pays a blocking
+        ``cudaGraphInstantiate`` the first time each new ``cache_t1`` bucket
+        appears mid-request (every ~64 encoder frames as the stream grows),
+        producing a bimodal step-latency tail.
+
+        ``cache_t1_buckets`` is the list of host-side cache_t1 values to
+        capture (each rounded up to the kernel ``N_BLOCK`` multiple).  ``None``
+        keeps the legacy behaviour of capturing only ``cache_t1_bucket=0``
+        (empty cache) — the rest of the ladder then captures lazily.
 
         No-op when CUDA graphs are disabled, ``_graph_cache`` is ``None``,
         or ``batch_sizes`` is empty.  Must be called **before** any stream
@@ -134,7 +145,9 @@ class ModelRunner:
         guaranteed unused — the persistent ``block_table`` and CNN buffer
         rows default to zero, which is also what the warmup forward will
         read.  ``GraphedEncoderForward._capture`` snapshots and restores the
-        CNN buffer rows it touches, so pre-warm is non-destructive.
+        CNN buffer rows it touches, so pre-warm is non-destructive.  The
+        captured graph reads ``offset`` from a buffer at replay, so one
+        capture per bucket serves every real offset within that bucket.
         """
         if self._graph_cache is None or not batch_sizes:
             return
@@ -145,6 +158,13 @@ class ModelRunner:
         if seen[-1] > cap:
             raise ValueError(f"prewarm batch size {seen[-1]} exceeds max_batch_size {cap}")
 
+        if cache_t1_buckets is None:
+            buckets: List[int] = [0]
+        else:
+            buckets = sorted(
+                {round_up_bucket(int(c)) for c in cache_t1_buckets if int(c) >= 0}
+            ) or [0]
+
         device = self._att_mgr.block_table.device
         window = self._config.decoding_window
         feat_dim = self._config.feature_config.output_dim
@@ -152,16 +172,17 @@ class ModelRunner:
 
         for B in seen:
             slot_ids = torch.arange(B, dtype=torch.long, device=device)
-            offsets = torch.zeros(B, dtype=torch.int32, device=device)
             xs = torch.zeros(B, window, feat_dim, dtype=dtype, device=device)
-            self._graph_cache.replay(
-                B,
-                window,
-                0,
-                xs=xs,
-                slot_ids=slot_ids,
-                offsets=offsets,
-            )
+            for bucket in buckets:
+                offsets = torch.full((B,), bucket, dtype=torch.int32, device=device)
+                self._graph_cache.replay(
+                    B,
+                    window,
+                    bucket,
+                    xs=xs,
+                    slot_ids=slot_ids,
+                    offsets=offsets,
+                )
 
     # ------------------------------------------------------------------
     # Offline forward
@@ -485,6 +506,22 @@ class ModelRunner:
             and (req.audio_tail is None or req.audio_tail.numel() == 0)
             and available <= window
         )
+        # Skip the all-silence trailing partial.  With finalize silence-padding
+        # (``EngineConfig.finalize_silence_pad``) the last real-audio window is
+        # a FULL window (decoded on the encoder CUDA-graph fast path), so any
+        # sub-window final chunk lies entirely within the appended silence —
+        # forwarding it would only emit blanks while taking the slow eager
+        # sub-window path (which the streaming graph also mis-encodes at B>1).
+        # Skipping it recovers full streaming throughput with no transcript
+        # change.  When padding is disabled the sub-window tail carries real
+        # audio, so it must still be forwarded (eager, via the guard below).
+        if (
+            getattr(self._config, "finalize_silence_pad", True)
+            and is_final_window
+            and chunk.size(1) < window
+        ):
+            req.feature_cursor = req.feature_frames
+            return
         if chunk.size(1) < context:
             if is_final_window:
                 req.feature_cursor = req.feature_frames
@@ -508,7 +545,20 @@ class ModelRunner:
         cache_t1_bucket = round_up_bucket(req.offset)
         nvtx_push("single.encoder_call")
         log_probs = None
-        if self._use_cuda_graphs and self._graph_cache is not None:
+        # Only graph **full-window** chunks. Sub-window (partial/final-tail)
+        # chunks must run eager: the cute attention reads the relative-position
+        # bias tile unpredicated along T_q (padded to the kernel's M_BLOCK), and
+        # for a short T_q the over-read past the real bias rows is benign in
+        # eager mode (adjacent allocations are mapped) but reads stale data once
+        # the captured graph carves its own memory pool — corrupting the last
+        # chunk's attention (observed: a ~33-magnitude log-prob error on the
+        # final sub-window chunk that flips borderline decodes vs eager). These
+        # chunks are at most one per stream, so eager costs nothing.
+        if (
+            self._use_cuda_graphs
+            and self._graph_cache is not None
+            and chunk.size(1) == window
+        ):
             log_probs = self._graph_cache.replay(
                 1,
                 chunk.size(1),

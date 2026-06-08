@@ -18,6 +18,8 @@ from typing import ClassVar, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
+from oasr.utils.nvtx import nvtx_pop, nvtx_push
+
 from ..request import Request, RequestOutput, RequestState
 from ..scheduler import Scheduler
 from .base import Pipeline
@@ -136,8 +138,12 @@ class OfflinePipeline(Pipeline):
 
         outputs: List[RequestOutput] = []
         for c in chunks:
+            nvtx_push(f"offline.micro_batch[B={len(c)}]")
+            nvtx_push("offline.collate")
             features, lengths = self._collate(c)
+            nvtx_pop()
             outputs.extend(self._gpu_stage(c, features, lengths))
+            nvtx_pop()  # offline.micro_batch
 
         # Restore original arrival order (sort-by-length changes positions).
         if orig_indices is None:
@@ -284,8 +290,12 @@ class OfflinePipeline(Pipeline):
         lengths: torch.Tensor,
     ) -> List[RequestOutput]:
         """Forward + CTC decode + finalise on the default stream."""
+        nvtx_push("offline.forward")
         log_probs, output_lengths = self._mr.forward_offline(features, lengths)
+        nvtx_pop()
+        nvtx_push("offline.decode")
         outputs = self._op.decode_offline(log_probs, output_lengths)
+        nvtx_pop()
 
         for req, out in zip(chunk, outputs):
             out.request_id = req.request_id

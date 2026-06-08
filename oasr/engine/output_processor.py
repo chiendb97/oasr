@@ -11,6 +11,7 @@ import torch
 
 from oasr.ctc_decode import GpuDecoderResult, ctc_beam_search_decode
 from oasr.decode import Decoder, DecoderResult
+from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from .config import EngineConfig
 from .request import Request, RequestOutput
@@ -55,6 +56,11 @@ class OutputProcessor:
         self._config = config
         # Streaming decode-step counter driving ``partial_decode_interval``.
         self._stream_decode_step = 0
+        # Pipelined interim read-back: the previous emit step's in-flight
+        # ``peek_states_async`` handle plus the requests it covers and the
+        # decoder that issued it.  Consumed one step later so the blocking
+        # device→host sync leaves the critical path (see ``decode_streaming_batch``).
+        self._pending_peek = None  # type: ignore[var-annotated]
         self._sp = self._load_sentencepiece(config.sentencepiece_model)
         self._vocab: Optional[Dict[int, str]] = None
         if config.unit_table is not None:
@@ -213,6 +219,7 @@ class OutputProcessor:
         # stable order so the optional interim read-back can be done in a single
         # batched device→host sync below.
         self._stream_decode_step += 1
+        nvtx_push("decode_advance")
         decoder = None
         ordered_reqs: List[Request] = []
         ordered_states = []
@@ -224,20 +231,67 @@ class OutputProcessor:
             decoder.decode_chunk_batch(log_probs_batch, states)
             ordered_reqs.extend(reqs)
             ordered_states.extend(states)
+        nvtx_pop()  # decode_advance
 
-        # Interim-partial cadence.  ``peek``ing the beam buffer back to the host
-        # is a per-stream ``cudaStreamSynchronize``; emit partials only every
-        # ``partial_decode_interval`` steps, and when we do, read every stream's
-        # tokens back in ONE batched D→H sync (``peek_states``) rather than one
-        # ``.cpu()`` per stream.  ``interval <= 0`` skips interim partials
-        # entirely (final transcript still produced by ``finalize_streaming``).
+        # Interim-partial cadence.  Reading the beam buffer back to the host is
+        # a blocking ``cudaStreamSynchronize`` that, profiled, costs about as
+        # much as the decode compute itself — and it drains the GPU before the
+        # next step's encoder can be dispatched.  We *pipeline* it: each emit
+        # step issues a **non-blocking** batched read-back (``peek_states_async``)
+        # for the current ready set, and emits the partials collected from the
+        # **previous** emit step's handle (whose copy completed during the
+        # intervening step).  Partials therefore lag exactly one emit step
+        # (~one chunk), which the interactive contract allows; the final
+        # transcript still comes from the blocking ``finalize_streaming``.
+        # ``partial_decode_interval <= 0`` skips interim partials entirely
+        # (decode state still advances; only the read-back is skipped).
         interval = getattr(self._config, "partial_decode_interval", 1)
         if interval < 1 or (self._stream_decode_step % interval) != 0:
             return []
 
-        snaps = decoder.peek_states(ordered_states)
+        nvtx_push("partial_readback")
+        if not getattr(self._config, "pipeline_partial_readback", False):
+            # Default: blocking read-back, emit this step's partial now (lowest
+            # first-token latency — the interactive path).
+            snaps = decoder.peek_states(ordered_states)
+            partials = []
+            for req, snap in zip(ordered_reqs, snaps):
+                best = snap.tokens[0][0] if snap.tokens and snap.tokens[0] else []
+                partials.append(RequestOutput(
+                    request_id=req.request_id,
+                    text=self.detokenize(best),
+                    tokens=snap.tokens[0] if snap.tokens else [],
+                    finished=False,
+                ))
+            nvtx_pop()  # partial_readback
+            return partials
+        # Opt-in: pipelined (non-blocking) read-back — emit the previous emit
+        # step's partial (one-chunk lag), issue this step's async read-back for
+        # collection next time.  Backlog/throughput mode.
+        partials = self._collect_pending_partials()
+        handle = decoder.peek_states_async(ordered_states)
+        self._pending_peek = (ordered_reqs, handle, decoder)
+        nvtx_pop()  # partial_readback
+        return partials
+
+    def _collect_pending_partials(self) -> List[RequestOutput]:
+        """Materialise the previous emit step's pipelined read-back, if any.
+
+        Skips requests whose stream was finalised in the meantime
+        (``stream_context is None``) — their final transcript has already been
+        emitted, so a stale interim partial must not follow it.
+        """
+        if self._pending_peek is None:
+            return []
+        prev_reqs, handle, decoder = self._pending_peek
+        self._pending_peek = None
+        if handle is None or not prev_reqs:
+            return []
+        snaps = decoder.peek_states_collect(handle)
         partials: List[RequestOutput] = []
-        for req, snap in zip(ordered_reqs, snaps):
+        for req, snap in zip(prev_reqs, snaps):
+            if req.stream_context is None:
+                continue  # finalised since issue — final already emitted
             best = snap.tokens[0][0] if snap.tokens and snap.tokens[0] else []
             partials.append(RequestOutput(
                 request_id=req.request_id,

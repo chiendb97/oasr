@@ -345,6 +345,21 @@ class InputProcessor:
         request.audio_chunks.append(wav)
         request.samples_enqueued += wav.numel()
         if is_last:
+            # Flush the final word with trailing silence so the last
+            # real-audio encoder window is a FULL window rather than a short
+            # partial tail.  A partial final window (a) gives the CTC decoder
+            # too few frames to emit the last word's tokens — measured to
+            # truncate final words (WER 8.54%→6.89% on 100 LJSpeech utts) —
+            # and (b) is the only chunk that takes the sub-window encoder path,
+            # which the streaming CUDA-graph mis-encodes at B>1 (see
+            # ``ModelRunner._forward_single``).  One ``decoding_window`` of
+            # silence makes every real-audio window full (graph fast path) and
+            # decodes the trailing silence to blanks.  Opt out via
+            # ``EngineConfig.finalize_silence_pad = False``.
+            if getattr(self._config, "finalize_silence_pad", True):
+                pad = self._config.decoding_window * self._feature_config.frame_shift_samples
+                request.audio_chunks.append(torch.zeros(pad, dtype=torch.float32))
+                request.samples_enqueued += pad
             request.audio_final = True
         # Keep the scheduler's bucket estimate roughly in sync.  O(1) using
         # the running total instead of re-summing the deque per chunk.

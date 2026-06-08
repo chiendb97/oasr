@@ -113,6 +113,14 @@ class EngineConfig:
     # Streaming chunking
     chunk_size: int = 16
     num_left_chunks: int = -1
+    # On the final streaming chunk (``is_last``), append one ``decoding_window``
+    # of trailing silence so the last real-audio encoder window is FULL rather
+    # than a short partial tail.  Recovers the final word the CTC decoder would
+    # otherwise truncate (measured WER 8.54%→6.89% on 100 LJSpeech utts) and
+    # keeps every real-audio window on the encoder CUDA-graph fast path (the
+    # sub-window path is both slow-eager and graph-incorrect at B>1).  The
+    # trailing silence decodes to blanks.  Set ``False`` to disable.
+    finalize_silence_pad: bool = True
 
     # Batching
     # Encoder forward batch size — used in both modes since the service runs
@@ -268,6 +276,19 @@ class EngineConfig:
     # (final transcript only) for throughput / non-interactive consumers — the
     # decode state still advances every step; only the read-back is skipped.
     partial_decode_interval: int = 1
+    # Pipeline the interim-partial read-back.  When ``False`` (default) each
+    # emit step reads the beam buffer back with a blocking
+    # ``cudaStreamSynchronize`` and emits *this* step's partial immediately —
+    # the lowest first-token latency, best for **interactive** streaming.  When
+    # ``True`` the read-back is issued non-blocking and the partial from the
+    # *previous* emit step is emitted instead (a one-chunk lag), taking the
+    # blocking sync off the critical path — a backlog/throughput optimization.
+    # The final transcript (``finalize_streaming``) is always a blocking read,
+    # so end-of-stream output is identical either way.  Off by default because
+    # the engine's primary streaming target is interactive latency, which the
+    # one-chunk partial lag regresses for no reliable throughput gain at low
+    # concurrency.
+    pipeline_partial_readback: bool = False
 
     # Detokenization
     sentencepiece_model: Optional[str] = None

@@ -18,6 +18,7 @@ from oasr.models import build_model_from_checkpoint
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from .config import EngineConfig
+from .graph_cache import round_up_bucket
 from .input_processor import InputProcessor
 from .model_runner import ModelRunner
 from .output_processor import OutputProcessor
@@ -128,18 +129,37 @@ class ASREngine:
         # throughput features land in one place regardless of mode.
         self._pipeline: Pipeline = self._build_pipeline(config)
 
-        # Pre-warm the encoder CUDA-Graph cache at each preferred batch
-        # size so the first real chunk replays instead of capturing.  Skipped
-        # silently when graphs are off, the model_runner has no graph cache,
-        # or no preferred sizes are configured.  Best-effort: a failure here
-        # falls back to lazy capture on first traffic.
+        # Pre-warm the streaming encoder CUDA-Graph cache over a (B, cache_t1)
+        # ladder so a live stream never pays a blocking lazy capture
+        # mid-request (the interactive-latency tail: every new cache_t1 bucket
+        # as the stream grows would otherwise trigger a ~cudaGraphInstantiate
+        # stall).  We capture B in ``{1, max_batch_size} ∪ preferred`` (the
+        # single-live-stream and full-cohort shapes) across a bucket ladder
+        # covering the first ``prewarm_chunks`` encoder chunks — the
+        # latency-critical stream ramp plus most short/medium utterances.
+        # Deeper buckets (long utterances) and intermediate cohort-drain B
+        # values still capture lazily (one-time).  Streaming-only: offline
+        # never runs the streaming encoder forward.  Best-effort.
         if (
-            config.preferred_batch_size
-            and self._device.type == "cuda"
+            self._device.type == "cuda"
             and bool(config.use_cuda_graphs)
+            and config.service_mode == "streaming"
         ):
             try:
-                self._model_runner.prewarm_encoder_graphs(config.preferred_batch_size)
+                pref = [int(b) for b in (config.preferred_batch_size or [])]
+                batch_sizes = sorted({1, int(config.max_batch_size), *pref})
+                prewarm_chunks = (
+                    config.num_left_chunks
+                    if config.num_left_chunks and config.num_left_chunks > 0
+                    else 32
+                )
+                cs = int(config.chunk_size)
+                buckets = sorted(
+                    {round_up_bucket(cs * k) for k in range(int(prewarm_chunks) + 2)}
+                )
+                self._model_runner.prewarm_encoder_graphs(
+                    batch_sizes, cache_t1_buckets=buckets
+                )
             except Exception as exc:  # pragma: no cover
                 logger.warning(
                     "Encoder graph pre-warm failed (will capture on first " "chunk instead): %s",

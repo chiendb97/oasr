@@ -90,6 +90,23 @@ class GpuDecoderResult:
     scores: Optional[torch.Tensor] = None
 
 
+@dataclass
+class PeekHandle:
+    """In-flight handle from :meth:`GpuStreamingDecoder.peek_states_async`.
+
+    Either holds an async copy (``event`` + pinned ``tokens_cpu``/
+    ``lengths_cpu``) consumed by :meth:`peek_states_collect` on a later step,
+    or precomputed ``eager`` results for the ``batch != 1`` fallback.
+    """
+
+    n: int
+    beam: int
+    event: Optional["torch.cuda.Event"] = None
+    tokens_cpu: Optional[torch.Tensor] = None
+    lengths_cpu: Optional[torch.Tensor] = None
+    eager: Optional[List[GpuDecoderResult]] = None
+
+
 class StreamState:
     """Per-request GPU state for streaming CTC beam search.
 
@@ -333,6 +350,19 @@ class GpuStreamingDecoder:
             if 0.0 < self._config.blank_threshold < 1.0
             else None
         )
+
+        # Persistent buffers for the pipelined (non-blocking) interim
+        # read-back (``peek_states_async`` / ``peek_states_collect``).  Sized
+        # lazily to the largest ready set seen and reused across steps so the
+        # async D→H copy doesn't pay a per-step pinned-host allocation.  Device
+        # buffers receive the per-state read kernels; pinned host buffers are
+        # the non_blocking copy destinations.
+        self._peek_cap: int = 0
+        self._peek_dev_tokens: Optional[torch.Tensor] = None
+        self._peek_dev_lengths: Optional[torch.Tensor] = None
+        self._peek_dev_scores: Optional[torch.Tensor] = None
+        self._peek_host_tokens: Optional[torch.Tensor] = None
+        self._peek_host_lengths: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -776,6 +806,108 @@ class GpuStreamingDecoder:
                 lengths=out_lengths[i : i + 1],
                 scores=out_scores[i : i + 1],
             ))
+        return results
+
+    # ------------------------------------------------------------------
+    # Pipelined (non-blocking) interim read-back
+    # ------------------------------------------------------------------
+
+    def _ensure_peek_buffers(self, n: int, beam: int, msl: int,
+                             device: torch.device) -> None:
+        """(Re)allocate the persistent peek device/pinned buffers to hold ``n``."""
+        if (
+            self._peek_dev_tokens is not None
+            and self._peek_cap >= n
+            and self._peek_dev_tokens.device == device
+        ):
+            return
+        self._peek_cap = n
+        self._peek_dev_tokens = torch.empty(n, beam, msl, dtype=torch.int32, device=device)
+        self._peek_dev_lengths = torch.empty(n, beam, dtype=torch.int32, device=device)
+        # Scores are required by the read kernel but unused for interim
+        # partials; keep a discardable device buffer (never copied to host).
+        self._peek_dev_scores = torch.empty(n, beam, dtype=torch.float32, device=device)
+        pin = device.type == "cuda"
+        self._peek_host_tokens = torch.empty(
+            n, beam, msl, dtype=torch.int32, pin_memory=pin)
+        self._peek_host_lengths = torch.empty(
+            n, beam, dtype=torch.int32, pin_memory=pin)
+
+    def peek_states_async(self, states: List[StreamState]) -> Optional["PeekHandle"]:
+        """Issue a **non-blocking** batched interim read-back.
+
+        Runs the per-state read kernels into persistent device buffers, then
+        kicks off an async device→host copy into persistent pinned buffers and
+        records a CUDA event — **without synchronising**.  The caller consumes
+        the result on a later step via :meth:`peek_states_collect`, by which
+        time a full encoder+decode step has elapsed so the copy is already
+        complete.  This removes the per-step blocking ``cudaStreamSynchronize``
+        from the streaming critical path (it was ≈ the decode compute itself);
+        partials lag exactly one emit step (~one chunk), which the engine's
+        interactive contract allows.  The final transcript still comes from the
+        blocking :meth:`finalize_stream`, so end-of-stream output is unaffected.
+
+        Returns ``None`` for an empty set.  States with ``batch != 1`` fall back
+        to an eager (blocking) snapshot wrapped in the handle.
+        """
+        n = len(states)
+        if n == 0:
+            return None
+        cfg = self._config
+        beam = cfg.beam_size
+        msl = cfg.max_seq_len
+        if any(s.batch != 1 for s in states):
+            return PeekHandle(
+                n=n, beam=beam,
+                eager=[self.peek_state(state=s) for s in states],
+            )
+
+        device = states[0].buffer.device
+        use_paged = 1 if cfg.use_paged_memory else 0
+        self._ensure_peek_buffers(n, beam, msl, device)
+        dev_tok = self._peek_dev_tokens[:n]
+        dev_len = self._peek_dev_lengths[:n]
+        dev_sco = self._peek_dev_scores[:n]
+        for i, s in enumerate(states):
+            self._mod.ctc_beam_search_read_state(
+                dev_tok[i : i + 1], dev_len[i : i + 1], dev_sco[i : i + 1],
+                s.buffer, s.step,
+                s.batch, beam, s.vocab_size, msl,
+                use_paged, cfg.page_size)
+        host_tok = self._peek_host_tokens[:n]
+        host_len = self._peek_host_lengths[:n]
+        host_tok.copy_(dev_tok, non_blocking=True)
+        host_len.copy_(dev_len, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        return PeekHandle(
+            n=n, beam=beam, event=ev,
+            tokens_cpu=host_tok, lengths_cpu=host_len,
+        )
+
+    def peek_states_collect(self, handle: Optional["PeekHandle"]) -> List[GpuDecoderResult]:
+        """Materialise the tokens from a :meth:`peek_states_async` handle.
+
+        Synchronises on the recorded event (cheap — the copy completed during
+        the intervening step) and reads the pinned host buffers into Python
+        token lists.  Only ``tokens`` are populated (interim partials don't use
+        scores).
+        """
+        if handle is None:
+            return []
+        if handle.eager is not None:
+            return handle.eager
+        handle.event.synchronize()
+        n, beam = handle.n, handle.beam
+        tok = handle.tokens_cpu
+        ln = handle.lengths_cpu
+        results: List[GpuDecoderResult] = []
+        for i in range(n):
+            beams: List[List[int]] = []
+            for k in range(beam):
+                length = int(ln[i, k])
+                beams.append(tok[i, k, :length].tolist())
+            results.append(GpuDecoderResult(tokens=[beams], lengths=None, scores=None))
         return results
 
     def finalize_stream(
