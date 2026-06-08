@@ -345,6 +345,21 @@ class InputProcessor:
         request.audio_chunks.append(wav)
         request.samples_enqueued += wav.numel()
         if is_last:
+            # Flush the final word with trailing silence so the last
+            # real-audio encoder window is a FULL window rather than a short
+            # partial tail.  A partial final window (a) gives the CTC decoder
+            # too few frames to emit the last word's tokens — measured to
+            # truncate final words (WER 8.54%→6.89% on 100 LJSpeech utts) —
+            # and (b) is the only chunk that takes the sub-window encoder path,
+            # which the streaming CUDA-graph mis-encodes at B>1 (see
+            # ``ModelRunner._forward_single``).  One ``decoding_window`` of
+            # silence makes every real-audio window full (graph fast path) and
+            # decodes the trailing silence to blanks.  Opt out via
+            # ``EngineConfig.finalize_silence_pad = False``.
+            if getattr(self._config, "finalize_silence_pad", True):
+                pad = self._config.decoding_window * self._feature_config.frame_shift_samples
+                request.audio_chunks.append(torch.zeros(pad, dtype=torch.float32))
+                request.samples_enqueued += pad
             request.audio_final = True
         # Keep the scheduler's bucket estimate roughly in sync.  O(1) using
         # the running total instead of re-summing the deque per chunk.
@@ -476,9 +491,18 @@ class InputProcessor:
             for n in sample_counts
         ]
         lengths_cpu = torch.tensor(sample_counts, dtype=torch.int64)
-        padded_cpu = torch.zeros(len(fbank_inputs), t_max, dtype=torch.float32)
+        # Zero only the *pad tail* of each row, not the whole buffer: the
+        # [0:n] region is immediately overwritten by the waveform copy, so the
+        # previous full ``torch.zeros`` spent ~B*T_max of CPU fill per step on
+        # bytes it then clobbered.  In steady state every row is exactly T_max
+        # long (all streams fed equal chunks) so no tail zeroing runs at all;
+        # only ragged / flush steps touch ``zero_``.
+        padded_cpu = torch.empty(len(fbank_inputs), t_max, dtype=torch.float32)
         for i, w in enumerate(fbank_inputs):
-            padded_cpu[i, : w.numel()] = w
+            n = w.numel()
+            padded_cpu[i, :n] = w
+            if n < t_max:
+                padded_cpu[i, n:].zero_()
         if device.type == "cuda":
             padded_cpu = padded_cpu.pin_memory()
             lengths_cpu = lengths_cpu.pin_memory()
