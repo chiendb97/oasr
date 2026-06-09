@@ -105,6 +105,11 @@ pub struct Cli {
     pub trace_dispatch: bool,
     #[arg(long, default_value = "info")]
     pub log_level: String,
+    /// Log output format: ``text`` (default, human-readable) or ``json``
+    /// (one JSON object per line, including span fields such as ``rid``, for
+    /// ingestion by log aggregators).  Unknown values fall back to ``text``.
+    #[arg(long, default_value = "text")]
+    pub log_format: String,
 }
 
 impl Cli {

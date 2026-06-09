@@ -34,10 +34,7 @@ pub enum Cmd {
     },
 
     /// Push one audio chunk into an open streaming request.
-    FeedChunk {
-        request_id: String,
-        is_last: bool,
-    },
+    FeedChunk { request_id: String, is_last: bool },
 
     /// Abort a request; the engine frees its cache and emits a final
     /// [`Event::Error`] with code [`ErrorCode::Shutdown`].

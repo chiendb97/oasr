@@ -22,7 +22,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::trace;
 use uuid::Uuid;
 
-use crate::dispatcher::{spawn as spawn_dispatcher, CmdEnvelope, DispatcherConfig, DispatcherShared};
+use crate::dispatcher::{
+    spawn as spawn_dispatcher, CmdEnvelope, DispatcherConfig, DispatcherShared,
+};
 use crate::handle::{OfflineHandle, StreamingHandle};
 use crate::pyengine::PyEngine;
 use crate::router::RouterActor;
@@ -117,7 +119,8 @@ impl EngineClient {
     /// the dispatcher wakes from `idle_sleep` and processes the Ping.
     pub async fn ping(&self, timeout: Duration) -> Result<Event, EngineClientError> {
         let pre = self.last_pong_at();
-        self.send_envelope(CmdEnvelope::new(Cmd::Ping { seq: 0 }, None)).await?;
+        self.send_envelope(CmdEnvelope::new(Cmd::Ping { seq: 0 }, None))
+            .await?;
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(t) = self.last_pong_at() {
@@ -174,7 +177,8 @@ impl EngineClient {
         priority: i32,
     ) -> Result<StreamingHandle, EngineClientError> {
         let request_id = Uuid::new_v4().simple().to_string();
-        self.open_streaming_with_id(request_id, sample_rate, priority).await
+        self.open_streaming_with_id(request_id, sample_rate, priority)
+            .await
     }
 
     pub async fn open_streaming_with_id(

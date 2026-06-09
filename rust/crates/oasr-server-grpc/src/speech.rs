@@ -4,6 +4,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures::Stream;
@@ -14,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{error, warn};
+use tracing::{debug, error, field, info, info_span, warn, Instrument, Span};
 
 use crate::pb;
 
@@ -59,9 +60,7 @@ fn map_encoding(enc: i32) -> Result<(PcmEncoding, Option<&'static str>), Status>
     use pb::recognition_config::AudioEncoding;
     let ae = AudioEncoding::try_from(enc).unwrap_or(AudioEncoding::EncodingUnspecified);
     match ae {
-        AudioEncoding::EncodingUnspecified => {
-            Err(Status::invalid_argument("encoding must be set"))
-        }
+        AudioEncoding::EncodingUnspecified => Err(Status::invalid_argument("encoding must be set")),
         AudioEncoding::Linear16 => Ok((PcmEncoding::I16Le, None)),
         AudioEncoding::Linear32f => Ok((PcmEncoding::F32Le, None)),
         AudioEncoding::Wav => Ok((PcmEncoding::F32Le, Some("audio/wav"))),
@@ -81,6 +80,15 @@ fn map_error(code: ErrorCode, message: String) -> Status {
     }
 }
 
+/// Log a client-side request rejection at DEBUG and return the `Status`
+/// unchanged.  Used for request-validation failures (missing config,
+/// unsupported encoding, decode errors) so they can be threaded through
+/// `?` / `map_err` without losing observability.
+fn log_reject(st: Status) -> Status {
+    debug!(code = ?st.code(), reason = st.message(), "grpc request rejected");
+    st
+}
+
 /// Build STT v1 alternatives from a single Final/Partial event payload.
 ///
 /// `text` is the canonical decoded transcript (top hypothesis).  `tokens` is
@@ -97,13 +105,20 @@ fn build_alternatives(
     } else {
         max_alternatives as usize
     };
-    let rows = if tokens.is_empty() { vec![Vec::new()] } else { tokens };
+    let rows = if tokens.is_empty() {
+        vec![Vec::new()]
+    } else {
+        tokens
+    };
     rows.into_iter()
         .take(cap)
         .enumerate()
         .map(|(i, ids)| pb::SpeechRecognitionAlternative {
             transcript: if i == 0 { text.clone() } else { String::new() },
-            confidence: scores.as_ref().and_then(|s| s.get(i).copied()).unwrap_or(0.0),
+            confidence: scores
+                .as_ref()
+                .and_then(|s| s.get(i).copied())
+                .unwrap_or(0.0),
             tokens: ids,
         })
         .collect()
@@ -115,66 +130,98 @@ impl pb::speech_server::Speech for SpeechService {
         &self,
         req: Request<pb::RecognizeRequest>,
     ) -> Result<Response<pb::RecognizeResponse>, Status> {
-        if self.mode != ServiceMode::Offline {
-            return Err(Status::failed_precondition(
-                "server is running in streaming mode; use StreamingRecognize",
-            ));
-        }
+        // Per-request span; `rid` is recorded once the engine admits the
+        // request so all downstream events carry it.
+        let span = info_span!("grpc.recognize", rid = field::Empty);
+        async move {
+            let start = Instant::now();
 
-        let pb::RecognizeRequest { config, audio } = req.into_inner();
-        let cfg = config.ok_or_else(|| Status::invalid_argument("config required"))?;
-        let max_alts = cfg.max_alternatives;
-
-        let audio_bytes = match audio.and_then(|a| a.audio_source) {
-            Some(pb::recognition_audio::AudioSource::Content(b)) => b,
-            Some(pb::recognition_audio::AudioSource::Uri(_)) => {
-                return Err(Status::unimplemented("audio.uri is not supported"));
+            if self.mode != ServiceMode::Offline {
+                return Err(log_reject(Status::failed_precondition(
+                    "server is running in streaming mode; use StreamingRecognize",
+                )));
             }
-            None => return Err(Status::invalid_argument("audio.content required")),
-        };
 
-        let sr = if cfg.sample_rate_hertz == 0 {
-            16_000
-        } else {
-            cfg.sample_rate_hertz
-        };
-        let (pcm_enc, ct_hint) = map_encoding(cfg.encoding)?;
-        let decoded = decode_audio(ct_hint, &audio_bytes, pcm_enc, Some(sr))
-            .map_err(|e| Status::invalid_argument(format!("audio decode: {e}")))?;
+            let pb::RecognizeRequest { config, audio } = req.into_inner();
+            let cfg =
+                config.ok_or_else(|| log_reject(Status::invalid_argument("config required")))?;
+            let max_alts = cfg.max_alternatives;
 
-        let handle = self
-            .pool
-            .submit_offline(decoded.samples, decoded.sample_rate, cfg.priority)
-            .await
-            .map_err(|e| Status::resource_exhausted(format!("submit failed: {e}")))?;
-        let rid = handle.request_id.clone();
-        let ev = handle
-            .finish()
-            .await
-            .map_err(|_| Status::internal("engine channel closed"))?;
-        self.pool.release(&rid);
+            let audio_bytes = match audio.and_then(|a| a.audio_source) {
+                Some(pb::recognition_audio::AudioSource::Content(b)) => b,
+                Some(pb::recognition_audio::AudioSource::Uri(_)) => {
+                    return Err(log_reject(Status::unimplemented("audio.uri is not supported")));
+                }
+                None => return Err(log_reject(Status::invalid_argument("audio.content required"))),
+            };
 
-        match ev {
-            Event::Final {
-                request_id,
-                text,
-                tokens,
-                scores,
-            } => Ok(Response::new(pb::RecognizeResponse {
-                results: vec![pb::SpeechRecognitionResult {
-                    alternatives: build_alternatives(text, tokens, scores, max_alts),
-                    channel_tag: 0,
-                    result_end_time: None,
-                    language_code: String::new(),
-                }],
-                request_id,
-            })),
-            Event::Error { code, message, .. } => Err(map_error(code, message)),
-            other => {
-                error!("unexpected non-terminal event for offline rid: {other:?}");
-                Err(Status::internal("unexpected event type"))
+            let sr = if cfg.sample_rate_hertz == 0 {
+                16_000
+            } else {
+                cfg.sample_rate_hertz
+            };
+            let (pcm_enc, ct_hint) = map_encoding(cfg.encoding).map_err(log_reject)?;
+            let decoded = decode_audio(ct_hint, &audio_bytes, pcm_enc, Some(sr))
+                .map_err(|e| log_reject(Status::invalid_argument(format!("audio decode: {e}"))))?;
+
+            let sample_rate = decoded.sample_rate;
+            let n_samples = decoded.samples.len() / 4;
+            let handle = self
+                .pool
+                .submit_offline(decoded.samples, sample_rate, cfg.priority)
+                .await
+                .map_err(|e| {
+                    warn!(%e, "grpc recognize submit rejected");
+                    Status::resource_exhausted(format!("submit failed: {e}"))
+                })?;
+            let rid = handle.request_id.clone();
+            Span::current().record("rid", rid.as_str());
+            let ev = handle.finish().await.map_err(|_| {
+                error!(rid = %rid, "engine channel closed");
+                Status::internal("engine channel closed")
+            })?;
+            self.pool.release(&rid);
+
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            match ev {
+                Event::Final {
+                    request_id,
+                    text,
+                    tokens,
+                    scores,
+                } => {
+                    let n_tokens = tokens.first().map_or(0, |t| t.len());
+                    info!(
+                        rid = %request_id,
+                        sample_rate,
+                        n_samples,
+                        n_tokens,
+                        elapsed_ms,
+                        transcript = %text,
+                        "recognize ok"
+                    );
+                    Ok(Response::new(pb::RecognizeResponse {
+                        results: vec![pb::SpeechRecognitionResult {
+                            alternatives: build_alternatives(text, tokens, scores, max_alts),
+                            channel_tag: 0,
+                            result_end_time: None,
+                            language_code: String::new(),
+                        }],
+                        request_id,
+                    }))
+                }
+                Event::Error { code, message, .. } => {
+                    warn!(rid = %rid, code = ?code, elapsed_ms, reason = %message, "recognize error");
+                    Err(map_error(code, message))
+                }
+                other => {
+                    error!(rid = %rid, elapsed_ms, "unexpected non-terminal event for offline request: {other:?}");
+                    Err(Status::internal("unexpected event type"))
+                }
             }
         }
+        .instrument(span)
+        .await
     }
 
     type StreamingRecognizeStream =
@@ -185,9 +232,9 @@ impl pb::speech_server::Speech for SpeechService {
         req: Request<Streaming<pb::StreamingRecognizeRequest>>,
     ) -> Result<Response<Self::StreamingRecognizeStream>, Status> {
         if self.mode != ServiceMode::Streaming {
-            return Err(Status::failed_precondition(
+            return Err(log_reject(Status::failed_precondition(
                 "server is running in offline mode; use Recognize",
-            ));
+            )));
         }
 
         let mut inbound = req.into_inner();
@@ -197,26 +244,30 @@ impl pb::speech_server::Speech for SpeechService {
         let first = inbound
             .next()
             .await
-            .ok_or_else(|| Status::invalid_argument("missing streaming_config first message"))?
-            .map_err(|e| Status::internal(format!("stream recv: {e}")))?;
+            .ok_or_else(|| {
+                log_reject(Status::invalid_argument(
+                    "missing streaming_config first message",
+                ))
+            })?
+            .map_err(|e| log_reject(Status::internal(format!("stream recv: {e}"))))?;
 
         let scfg = match first.streaming_request {
             Some(pb::streaming_recognize_request::StreamingRequest::StreamingConfig(c)) => c,
             _ => {
-                return Err(Status::invalid_argument(
+                return Err(log_reject(Status::invalid_argument(
                     "first message must carry streaming_config",
-                ))
+                )))
             }
         };
         let rcfg = scfg
             .config
-            .ok_or_else(|| Status::invalid_argument("missing recognition config"))?;
+            .ok_or_else(|| log_reject(Status::invalid_argument("missing recognition config")))?;
         let sr = if rcfg.sample_rate_hertz == 0 {
             16_000
         } else {
             rcfg.sample_rate_hertz
         };
-        let (pcm_enc, _ct_hint) = map_encoding(rcfg.encoding)?;
+        let (pcm_enc, _ct_hint) = map_encoding(rcfg.encoding).map_err(log_reject)?;
         let want_partials = scfg.interim_results;
         let max_alts = rcfg.max_alternatives;
 
@@ -224,12 +275,23 @@ impl pb::speech_server::Speech for SpeechService {
             .pool
             .open_streaming(sr, rcfg.priority)
             .await
-            .map_err(|e| Status::resource_exhausted(format!("submit failed: {e}")))?;
+            .map_err(|e| {
+                warn!(%e, "grpc streaming open rejected");
+                Status::resource_exhausted(format!("submit failed: {e}"))
+            })?;
 
         let pool = Arc::clone(&self.pool);
         let rid = handle.request_id.clone();
 
+        // Per-request span carrying `rid`; the streaming work runs in the
+        // spawned task below, instrumented with this span so every per-chunk
+        // / per-event log line is correlated.
+        let span = info_span!("grpc.stream", rid = %rid);
+        info!(parent: &span, sample_rate = sr, want_partials, "stream opened");
+
         tokio::spawn(async move {
+            let start = Instant::now();
+            let mut n_partials: u64 = 0;
             // ``inbound_done`` flips once the client half-closes so we stop
             // polling the inbound stream — otherwise tokio::select! keeps
             // racing on a fused-None stream and we'd call ``flush_last``
@@ -242,6 +304,7 @@ impl pb::speech_server::Speech for SpeechService {
                         match ev {
                             Some(Event::Partial { text, tokens, scores, .. }) => {
                                 if !want_partials { continue; }
+                                n_partials += 1;
                                 let resp = pb::StreamingRecognizeResponse {
                                     results: vec![pb::StreamingRecognitionResult {
                                         alternatives: build_alternatives(text, tokens, scores, max_alts),
@@ -256,6 +319,7 @@ impl pb::speech_server::Speech for SpeechService {
                                 let _ = out_tx.send(Ok(resp)).await;
                             }
                             Some(Event::Final { text, tokens, scores, .. }) => {
+                                let transcript = text.clone();
                                 let resp = pb::StreamingRecognizeResponse {
                                     results: vec![pb::StreamingRecognitionResult {
                                         alternatives: build_alternatives(text, tokens, scores, max_alts),
@@ -269,15 +333,28 @@ impl pb::speech_server::Speech for SpeechService {
                                 };
                                 let _ = out_tx.send(Ok(resp)).await;
                                 handle.finish();
+                                info!(
+                                    n_partials,
+                                    elapsed_ms = start.elapsed().as_millis() as u64,
+                                    transcript = %transcript,
+                                    "stream final"
+                                );
                                 break;
                             }
                             Some(Event::Error { code, message, .. }) => {
+                                warn!(
+                                    code = ?code,
+                                    elapsed_ms = start.elapsed().as_millis() as u64,
+                                    reason = %message,
+                                    "stream error"
+                                );
                                 let _ = out_tx.send(Err(map_error(code, message))).await;
                                 handle.finish();
                                 break;
                             }
                             Some(_) => {} // Accepted / Pong / Overloaded — ignored at this layer.
                             None => {
+                                error!("event stream closed before terminal event");
                                 let _ = out_tx.send(Err(Status::internal("event stream closed"))).await;
                                 break;
                             }
@@ -290,6 +367,7 @@ impl pb::speech_server::Speech for SpeechService {
                                     let chunk = match decode_raw_pcm(&bytes, pcm_enc, sr) {
                                         Ok(d) => d.samples,
                                         Err(e) => {
+                                            debug!(reason = %e, "stream chunk pcm decode failed");
                                             let _ = out_tx.send(Err(Status::invalid_argument(format!("pcm decode: {e}")))).await;
                                             continue;
                                         }
@@ -299,10 +377,12 @@ impl pb::speech_server::Speech for SpeechService {
                                         break;
                                     }
                                 } else {
+                                    debug!("stream chunk missing audio_content");
                                     let _ = out_tx.send(Err(Status::invalid_argument("expected audio_content"))).await;
                                 }
                             }
                             Some(Err(e)) => {
+                                warn!(reason = %e, "stream inbound error");
                                 let _ = out_tx.send(Err(Status::internal(format!("inbound: {e}")))).await;
                                 break;
                             }
@@ -311,6 +391,7 @@ impl pb::speech_server::Speech for SpeechService {
                                 // stop polling the inbound stream.  Keep
                                 // draining events until Final / Error.
                                 inbound_done = true;
+                                debug!("client half-closed; flushing final chunk");
                                 let _ = handle.flush_last(Bytes::new()).await;
                             }
                         }
@@ -318,7 +399,7 @@ impl pb::speech_server::Speech for SpeechService {
                 }
             }
             pool.release(&rid);
-        });
+        }.instrument(span));
 
         let out_stream = ReceiverStream::new(out_rx);
         Ok(Response::new(Box::pin(out_stream)))

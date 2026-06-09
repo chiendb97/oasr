@@ -19,7 +19,7 @@ mod config;
 pub use config::Cli;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -31,7 +31,7 @@ use oasr_server_grpc::{ServiceMode as GrpcServiceMode, SpeechService, SPEECH_SER
 use oasr_server_http::{build_router, ServerState, ServiceMode as HttpServiceMode};
 use tokio::signal;
 use tonic_health::ServingStatus;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Run the server to completion: build the engine, start the HTTP + gRPC
@@ -40,7 +40,7 @@ use tracing_subscriber::EnvFilter;
 /// Builds its own multi-threaded tokio runtime so it can be driven from a
 /// synchronous entry point (`fn main` or an extension-module function).
 pub fn run(cli: Cli) -> Result<()> {
-    init_tracing(&cli.log_level);
+    init_tracing(&cli.log_level, &cli.log_format);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -52,11 +52,29 @@ pub fn run(cli: Cli) -> Result<()> {
 /// Install the tracing subscriber.  Uses `try_init` because when imported as
 /// an extension module the host interpreter may already have one — in that
 /// case we keep the existing subscriber instead of panicking.
-fn init_tracing(log_level: &str) {
+///
+/// `log_format` selects the output formatter: `"json"` emits one JSON object
+/// per line (with span fields such as `rid` inlined) for log aggregators; any
+/// other value uses the human-readable text formatter.
+fn init_tracing(log_level: &str, log_format: &str) {
     let filter = EnvFilter::try_new(log_level)
         .or_else(|_| EnvFilter::try_from_default_env())
         .unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    match log_format.to_ascii_lowercase().as_str() {
+        "json" => {
+            let _ = tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .try_init();
+        }
+        "text" => {
+            let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+        }
+        other => {
+            let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+            warn!(log_format = %other, "unknown --log-format; falling back to text");
+        }
+    }
 }
 
 async fn serve(cli: Cli) -> Result<()> {
@@ -77,13 +95,34 @@ async fn serve(cli: Cli) -> Result<()> {
         .parse()
         .expect("validated by GrpcServiceMode parse above");
 
+    info!(
+        label = %cli.engine_label,
+        service_mode = %cli.service_mode,
+        max_concurrent_requests = cli.max_concurrent_requests,
+        http_bind = %cli.http_bind,
+        grpc_bind = %cli.grpc_bind,
+        "starting oasr-server"
+    );
+
     // ---- Build the in-process engine ----
     let engine_cfg_json = cli
         .build_engine_config_json()
         .context("build engine config")?;
     info!(label = %cli.engine_label, "loading ASREngine");
+    let load_t0 = Instant::now();
     let engine = PyEngine::new(&engine_cfg_json).context("build PyEngine")?;
-    info!(label = %cli.engine_label, "ASREngine loaded");
+    let model = engine.model_info();
+    info!(
+        label = %cli.engine_label,
+        load_ms = load_t0.elapsed().as_millis() as u64,
+        device = ?model.device,
+        dtype = ?model.dtype,
+        chunk_size = ?model.chunk_size,
+        max_batch_size = ?model.max_batch_size,
+        decoder_type = ?model.decoder_type,
+        vocab_size = ?model.vocab_size,
+        "ASREngine loaded"
+    );
 
     let mut client_cfg = EngineClientConfig::new(cli.engine_label.clone());
     client_cfg.dispatcher = DispatcherConfig {
@@ -97,7 +136,10 @@ async fn serve(cli: Cli) -> Result<()> {
 
     // Wait briefly for the dispatcher to take its first tick so /readyz
     // doesn't flap on startup.
-    let _ = client.ping(Duration::from_secs(10)).await;
+    match client.ping(Duration::from_secs(10)).await {
+        Ok(_) => debug!(label = %cli.engine_label, "dispatcher ready"),
+        Err(e) => warn!(label = %cli.engine_label, "dispatcher not ready within 10s: {e}"),
+    }
 
     let pool = Arc::new(EnginePool::new(vec![client]));
 
