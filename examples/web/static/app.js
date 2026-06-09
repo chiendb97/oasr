@@ -137,15 +137,11 @@ function openStream(onFinalClose) {
   ws.binaryType = "arraybuffer";
   ws.onmessage = (ev) => {
     let m;
-    try { m = JSON.parse(ev.data); }
-    catch { console.warn("[oasr ws] non-JSON frame:", ev.data); return; }
-    console.log("[oasr ws] recv", m.type, JSON.stringify(m.transcript ?? m.error ?? ""));
+    try { m = JSON.parse(ev.data); } catch { return; }
     if (m.type === "partial") setPartial(m.transcript);
     else if (m.type === "final") commitFinal(m.transcript);
     else if (m.type === "error") setStatus("Server error: " + m.error, "error");
     else if (m.type === "done") { try { ws.close(); } catch {} }
-    console.log("[oasr ws] DOM now committed=", JSON.stringify(committedEl.textContent),
-                "partial=", JSON.stringify(partialEl.textContent));
   };
   ws.onerror = () => setStatus("WebSocket error (is the bridge running?)", "error");
   ws.onclose = () => onFinalClose && onFinalClose();
@@ -228,8 +224,6 @@ let micStream = null;
 let micNodes = null;
 let micChunks = []; // for offline mic
 let micWs = null; // for streaming mic
-let micPeak = 0; // debug: max |sample| seen this session
-let micSamples = 0; // debug: total samples captured this session
 
 // ---- live waveform visualizer + timer --------------------------------------
 
@@ -344,10 +338,6 @@ async function startMic() {
   analyser.smoothingTimeConstant = 0.6;
   source.connect(analyser);
   micChunks = [];
-  micPeak = 0;
-  micSamples = 0;
-  console.log("[oasr mic] AudioContext sampleRate =", micCtx.sampleRate,
-              "(requested", TARGET_SR + ")");
 
   if (mode === "streaming") {
     micWs = openStream(() => {});
@@ -359,11 +349,6 @@ async function startMic() {
 
   proc.onaudioprocess = (e) => {
     const frame = resampleTo16k(e.inputBuffer.getChannelData(0), micCtx.sampleRate);
-    for (let i = 0; i < frame.length; i++) {
-      const a = Math.abs(frame[i]);
-      if (a > micPeak) micPeak = a;
-    }
-    micSamples += frame.length;
     if (mode === "streaming") {
       if (micWs && micWs.readyState === WebSocket.OPEN) micWs.send(frame.buffer);
     } else {
@@ -388,13 +373,6 @@ async function stopMic() {
   const mode = getMode();
   recording = false;
   exitRecordingUI();
-
-  console.log("[oasr mic] captured", micSamples, "samples ≈",
-              (micSamples / TARGET_SR).toFixed(2), "s, peak |amp| =",
-              micPeak.toFixed(4),
-              micSamples === 0 ? "→ onaudioprocess never fired!"
-              : micPeak < 0.01 ? "→ effectively SILENT (mic not capturing)"
-              : "→ signal looks OK");
 
   // Tear down the audio graph.
   try { micNodes.proc.disconnect(); micNodes.source.disconnect(); micNodes.mute.disconnect(); } catch {}

@@ -17,7 +17,7 @@
 
 * { box-sizing: border-box; }
 
-html, body { height: 100%; }
+html, body { min-height: 100vh; }
 
 body {
   margin: 0;
@@ -30,6 +30,7 @@ body {
   background-attachment: fixed;
   display: flex;
   justify-content: center;
+  align-items: flex-start;
   padding: 2.5rem 1rem 3rem;
 }
 
