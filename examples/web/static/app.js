@@ -137,11 +137,15 @@ function openStream(onFinalClose) {
   ws.binaryType = "arraybuffer";
   ws.onmessage = (ev) => {
     let m;
-    try { m = JSON.parse(ev.data); } catch { return; }
+    try { m = JSON.parse(ev.data); }
+    catch { console.warn("[oasr ws] non-JSON frame:", ev.data); return; }
+    console.log("[oasr ws] recv", m.type, JSON.stringify(m.transcript ?? m.error ?? ""));
     if (m.type === "partial") setPartial(m.transcript);
     else if (m.type === "final") commitFinal(m.transcript);
     else if (m.type === "error") setStatus("Server error: " + m.error, "error");
     else if (m.type === "done") { try { ws.close(); } catch {} }
+    console.log("[oasr ws] DOM now committed=", JSON.stringify(committedEl.textContent),
+                "partial=", JSON.stringify(partialEl.textContent));
   };
   ws.onerror = () => setStatus("WebSocket error (is the bridge running?)", "error");
   ws.onclose = () => onFinalClose && onFinalClose();
