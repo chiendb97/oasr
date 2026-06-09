@@ -174,11 +174,17 @@ async def _offline_via_stream(raw: bytes, sample_rate: int) -> Tuple[str, str]:
         stub = pb_grpc.SpeechStub(ch)
         async for resp in stub.StreamingRecognize(requests()):
             rid = resp.request_id or rid
+            print(f"[bridge] offline resp rid={resp.request_id} "
+                  f"n_results={len(resp.results)}", flush=True)
             for result in resp.results:
                 text = _top_transcript(result)
+                print(f"[bridge]   is_final={result.is_final} "
+                      f"alts={len(result.alternatives)} transcript={text!r}", flush=True)
                 partial_text = text
                 if result.is_final:
                     final_text = text
+    print(f"[bridge] offline returning text={ (final_text or partial_text).strip()!r}",
+          flush=True)
     return (final_text or partial_text).strip(), rid
 
 
@@ -270,10 +276,16 @@ def build_app():
             async def relay():
                 try:
                     async for resp in call:
+                        print(f"[bridge] stream resp rid={resp.request_id} "
+                              f"n_results={len(resp.results)}", flush=True)
                         for result in resp.results:
+                            text = _top_transcript(result)
+                            print(f"[bridge]   relay is_final={result.is_final} "
+                                  f"alts={len(result.alternatives)} "
+                                  f"transcript={text!r}", flush=True)
                             await ws.send_json({
                                 "type": "final" if result.is_final else "partial",
-                                "transcript": _top_transcript(result),
+                                "transcript": text,
                                 "request_id": resp.request_id,
                             })
                 except grpc.aio.AioRpcError as exc:
