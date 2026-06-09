@@ -84,6 +84,7 @@ def get_pb():
     if _PB is not None:
         return _PB
     try:
+        import grpc_tools
         from grpc_tools import protoc
     except ImportError as exc:  # pragma: no cover - dependency hint
         raise SystemExit(
@@ -94,10 +95,15 @@ def get_pb():
     if not proto.is_file():
         raise SystemExit(f"proto file not found: {proto}")
 
+    # grpcio-tools bundles the well-known protos (google/protobuf/*.proto) under
+    # its _proto dir; add it to the import path so duration.proto resolves.
+    well_known = Path(grpc_tools.__file__).parent / "_proto"
+
     out = Path(tempfile.mkdtemp(prefix="oasr-webdemo-grpc-"))
     rc = protoc.main([
         "protoc",
         f"--proto_path={proto.parent}",
+        f"--proto_path={well_known}",
         f"--python_out={out}",
         f"--grpc_python_out={out}",
         str(proto),
