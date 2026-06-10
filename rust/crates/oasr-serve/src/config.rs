@@ -26,7 +26,7 @@ pub struct Cli {
     #[arg(long)]
     pub ckpt_dir: Option<PathBuf>,
     /// torch.dtype string ("float16" | "bfloat16" | "float32").
-    #[arg(long, default_value = "float16")]
+    #[arg(long, default_value = "bfloat16")]
     pub dtype: String,
     /// Service mode — the engine runs in exactly one mode per lifecycle.
     /// "streaming" (default) accepts chunk-by-chunk requests via the gRPC
