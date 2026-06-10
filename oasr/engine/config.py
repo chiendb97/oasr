@@ -87,7 +87,10 @@ class EngineConfig:
     ckpt_dir: str = ""
     checkpoint_name: str = "final.pt"
     device: str = "cuda"
-    dtype: torch.dtype = torch.float16
+    # bfloat16 by default: same exponent range as fp32, so wide-activation
+    # models (e.g. conv2d6 subsampling, which can hit ~5e4 at the embed) do
+    # not overflow the way fp16 (max 65504) does.
+    dtype: torch.dtype = torch.bfloat16
 
     # Service mode — the engine runs in exactly one mode per lifecycle,
     # never both.  ``"streaming"`` admits chunk-by-chunk requests (paged

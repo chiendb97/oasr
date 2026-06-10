@@ -372,7 +372,7 @@ def _run_config(
     """Run one benchmark configuration and write results to *output*."""
 
     if dtype is None:
-        dtype = torch.float16
+        dtype = torch.bfloat16
 
     is_streaming = subroutine.startswith("streaming")
     is_wfst = subroutine.endswith("wfst")
@@ -564,7 +564,7 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     num_left_chunks = getattr(args, "num_left_chunks", -1)
     max_packed_frames = getattr(args, "max_packed_frames", 6000) or 6000
     max_batch_frames = getattr(args, "max_batch_frames", None)
-    dtype_str = getattr(args, "dtype", "float16") or "float16"
+    dtype_str = getattr(args, "dtype", "bfloat16") or "bfloat16"
     # E2E benchmarks are slower — default to fewer iterations
     num_iters = min(getattr(args, "num_iters", 5), 20)
 
@@ -681,7 +681,7 @@ Examples:
     parser.add_argument("--num-left-chunks", type=int, default=-1,
                         help="Left-context chunks for streaming; -1 = unlimited (default: -1)")
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"],
-                        default="float16", help="Model precision (default: float16)")
+                        default="bfloat16", help="Model precision (default: bfloat16)")
     parser.add_argument("--num-iters", type=int, default=5,
                         help="Number of timed iterations (default: 5)")
     parser.add_argument("--output-path", default=None, help="CSV output path")

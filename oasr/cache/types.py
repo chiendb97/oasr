@@ -61,7 +61,7 @@ class CacheConfig:
     cache_seqlens, CNN cache, and feature buffer tensors. Each admitted stream
     gets a slot id in ``[0, max_batch_size)`` via ``StreamSlotPool``."""
     device: torch.device = field(default_factory=lambda: torch.device("cuda"))
-    dtype: torch.dtype = torch.float16
+    dtype: torch.dtype = torch.bfloat16
 
     @property
     def kv_last_dim(self) -> int:

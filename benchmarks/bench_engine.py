@@ -166,8 +166,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dtype",
         choices=["float16", "bfloat16", "float32"],
-        default="float16",
-        help="Model and cache precision (default: float16)",
+        default="bfloat16",
+        help="Model and cache precision (default: bfloat16)",
     )
 
     # --- Timing ---

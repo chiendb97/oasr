@@ -89,7 +89,7 @@ class CacheConfig:
     max_num_blocks: int = 1024      # total pool size
     max_blocks_per_seq: int = 512   # block_table capacity per stream
     device: torch.device = ...
-    dtype:  torch.dtype  = torch.float16
+    dtype:  torch.dtype  = torch.bfloat16
 ```
 
 Derived properties of interest:

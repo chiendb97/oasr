@@ -704,7 +704,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(reads $MAX_BATCH_SIZE if set; default: engine config)")
     p.add_argument("--chunk-size", type=int, default=None,
                    help="Encoder chunk size (frames) for the engine (default: engine config)")
-    p.add_argument("--dtype", default="float16",
+    p.add_argument("--dtype", default="bfloat16",
                    choices=("float16", "bfloat16", "float32"))
     p.add_argument("--ready-timeout-s", type=int, default=180)
     p.add_argument("--server-log-level", default="warn")
