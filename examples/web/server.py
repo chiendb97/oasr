@@ -48,6 +48,7 @@ STATIC_DIR = HERE / "static"
 DEFAULT_PROTO = HERE.parents[1] / "rust" / "proto" / "oasr_speech_v1.proto"
 # Serve the repo's canonical logo rather than duplicating the PNG under static/.
 LOGO_PATH = HERE.parents[1] / "docs" / "assets" / "logos" / "oasr-logo-text.png"
+LOGO_ONLY_PATH = HERE.parents[1] / "docs" / "assets" / "logos" / "oasr-logo-only.png"
 
 # Bypass any ``http_proxy``/``HTTPS_PROXY`` so we reach the loopback server
 # directly, mirroring examples/recognize/grpc_client.py.
@@ -312,6 +313,10 @@ def build_app():
     @app.get("/oasr-logo-text.png")
     async def logo():
         return FileResponse(str(LOGO_PATH), media_type="image/png")
+
+    @app.get("/oasr-logo-only.png")
+    async def logo_only():
+        return FileResponse(str(LOGO_ONLY_PATH), media_type="image/png")
 
     # Static files last so /api/* and the logo route match first.
     app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

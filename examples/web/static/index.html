@@ -4,15 +4,15 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>OASR Speech Recognition</title>
-  <link rel="icon" href="/oasr-logo-text.png" />
+  <title>Automatic Speech Recognition</title>
+  <link rel="icon" href="/oasr-logo-only.png" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <main class="card">
     <header class="hero">
       <img class="logo" src="/oasr-logo-text.png" alt="OASR" />
-      <p class="sub">Speech-to-text in your browser — upload a file or record from your mic.</p>
+      <p class="sub">Automatic Speech Recognition in your browser.</p>
     </header>
 
     <section class="controls">
@@ -49,29 +49,19 @@
 
       <div id="mic-panel" class="panel mic-stage hidden">
         <button id="record-btn" class="record-orb" type="button" aria-label="Start recording">
-          <svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="currentColor"
+          <svg class="orb-mic" viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="currentColor"
                stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <rect x="9" y="2" width="6" height="12" rx="3"></rect>
             <path d="M5 10a7 7 0 0 0 14 0"></path>
             <line x1="12" y1="19" x2="12" y2="22"></line>
           </svg>
+          <span class="orb-stop" aria-hidden="true"></span>
         </button>
         <p id="rec-hint" class="rec-hint">Tap to record</p>
-
-        <div id="rec-live" class="rec-live hidden">
-          <canvas id="visualizer" class="visualizer"></canvas>
-          <div class="rec-controls">
-            <span class="rec-dot" aria-hidden="true"></span>
-            <span id="timer" class="timer">0:00</span>
-            <button id="stop-btn" class="stop-square" type="button" aria-label="Stop recording">
-              <span class="stop-glyph"></span>
-            </button>
-          </div>
-        </div>
       </div>
     </section>
 
-    <p id="status" class="status">Ready.</p>
+    <p id="status" class="status hidden"></p>
 
     <section class="result">
       <div class="result-head"><h2>Transcript</h2></div>
@@ -81,9 +71,7 @@
     </section>
 
     <footer>
-      <small>Bridge relays to the OASR gRPC server. Microphone needs a
-      <strong>secure context</strong> — open via <code>http://localhost</code>
-      or serve over HTTPS. File upload works anywhere.</small>
+      <small>Bridge relays to the OASR gRPC server.</small>
     </footer>
   </main>
 

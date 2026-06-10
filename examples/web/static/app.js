@@ -15,16 +15,12 @@ const $ = (id) => document.getElementById(id);
 const fileInput = $("file-input");
 const transcribeBtn = $("transcribe-btn");
 const recordBtn = $("record-btn");
-const stopBtn = $("stop-btn");
 const statusEl = $("status");
 const committedEl = $("committed");
 const partialEl = $("partial");
 const uploadPanel = $("upload-panel");
 const micPanel = $("mic-panel");
-const recLive = $("rec-live");
 const recHint = $("rec-hint");
-const timerEl = $("timer");
-const visualizer = $("visualizer");
 
 const getMode = () => document.querySelector('input[name="mode"]:checked').value;
 const getSource = () => document.querySelector('input[name="source"]:checked').value;
@@ -57,6 +53,7 @@ function setOffline(text) {
 function setStatus(msg, kind = "") {
   statusEl.textContent = msg;
   statusEl.className = "status" + (kind ? " " + kind : "");
+  statusEl.classList.toggle("hidden", !msg);
 }
 
 let busy = false;
@@ -71,7 +68,6 @@ function refreshControls() {
   transcribeBtn.disabled = busy || !fileInput.files.length;
   const micOk = micUnavailableReason() === null;
   recordBtn.disabled = (busy && !recording) || (!recording && !micOk);
-  stopBtn.disabled = !recording;
 }
 
 // ---- audio helpers ---------------------------------------------------------
@@ -225,91 +221,18 @@ let micNodes = null;
 let micChunks = []; // for offline mic
 let micWs = null; // for streaming mic
 
-// ---- live waveform visualizer + timer --------------------------------------
-
-let analyser = null;
-let vizRaf = 0;
-let timerInt = 0;
-let recStart = 0;
-
-function fmtTime(ms) {
-  const s = Math.floor(ms / 1000);
-  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
-}
+// ---- recording UI ----------------------------------------------------------
 
 function enterRecordingUI() {
-  recordBtn.classList.add("hidden");
-  if (recHint) recHint.classList.add("hidden");
-  if (recLive) recLive.classList.remove("hidden");
-  recStart = performance.now();
-  if (timerEl) timerEl.textContent = "0:00";
-  timerInt = setInterval(() => {
-    if (timerEl) timerEl.textContent = fmtTime(performance.now() - recStart);
-  }, 250);
+  recordBtn.classList.add("recording");
+  recordBtn.setAttribute("aria-label", "Stop recording");
+  if (recHint) recHint.textContent = "Recording… tap to stop";
 }
 
 function exitRecordingUI() {
-  recordBtn.classList.remove("hidden");
-  if (recHint) recHint.classList.remove("hidden");
-  if (recLive) recLive.classList.add("hidden");
-  if (timerInt) { clearInterval(timerInt); timerInt = 0; }
-  if (vizRaf) { cancelAnimationFrame(vizRaf); vizRaf = 0; }
-}
-
-function roundRect(ctx, x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
-}
-
-// A scrolling amplitude waveform (newest sample on the right), driven by the
-// real mic signal via an AnalyserNode — ElevenLabs-style.
-function startVisualizer() {
-  if (!visualizer || !analyser) return;
-  const ctx = visualizer.getContext("2d");
-  const dpr = window.devicePixelRatio || 1;
-  const cssW = visualizer.clientWidth || 480;
-  const cssH = visualizer.clientHeight || 88;
-  visualizer.width = Math.round(cssW * dpr);
-  visualizer.height = Math.round(cssH * dpr);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-  const BARS = 64;
-  const history = new Float32Array(BARS);
-  const timeData = new Uint8Array(analyser.fftSize);
-  const gap = 3;
-  const barW = (cssW - gap * (BARS - 1)) / BARS;
-  const mid = cssH / 2;
-  const grad = ctx.createLinearGradient(0, 0, 0, cssH);
-  grad.addColorStop(0, "#20c4e8");
-  grad.addColorStop(1, "#2f74e0");
-
-  const draw = () => {
-    vizRaf = requestAnimationFrame(draw);
-    analyser.getByteTimeDomainData(timeData);
-    let sum = 0;
-    for (let i = 0; i < timeData.length; i++) {
-      const v = (timeData[i] - 128) / 128;
-      sum += v * v;
-    }
-    const rms = Math.sqrt(sum / timeData.length);
-    history.copyWithin(0, 1);
-    history[BARS - 1] = rms;
-
-    ctx.clearRect(0, 0, cssW, cssH);
-    ctx.fillStyle = grad;
-    for (let i = 0; i < BARS; i++) {
-      const amp = Math.min(1, history[i] * 3.4); // perceptual boost
-      const h = Math.max(2, amp * (cssH - 8));
-      roundRect(ctx, i * (barW + gap), mid - h / 2, barW, h, Math.min(barW / 2, 3));
-      ctx.fill();
-    }
-  };
-  draw();
+  recordBtn.classList.remove("recording");
+  recordBtn.setAttribute("aria-label", "Start recording");
+  if (recHint) recHint.textContent = "Tap to record";
 }
 
 async function startMic() {
@@ -332,11 +255,6 @@ async function startMic() {
   const proc = micCtx.createScriptProcessor(4096, 1, 1);
   const mute = micCtx.createGain();
   mute.gain.value = 0; // avoid echoing the mic to the speakers
-  // AnalyserNode taps the live signal to drive the waveform visualizer.
-  analyser = micCtx.createAnalyser();
-  analyser.fftSize = 2048;
-  analyser.smoothingTimeConstant = 0.6;
-  source.connect(analyser);
   micChunks = [];
 
   if (mode === "streaming") {
@@ -364,8 +282,7 @@ async function startMic() {
   recording = true;
   refreshControls();
   enterRecordingUI();
-  startVisualizer();
-  setStatus(mode === "streaming" ? "Recording + streaming…" : "Recording…", "busy");
+  setStatus("");
 }
 
 async function stopMic() {
@@ -376,10 +293,8 @@ async function stopMic() {
 
   // Tear down the audio graph.
   try { micNodes.proc.disconnect(); micNodes.source.disconnect(); micNodes.mute.disconnect(); } catch {}
-  try { if (analyser) analyser.disconnect(); } catch {}
   try { micStream.getTracks().forEach((t) => t.stop()); } catch {}
   try { await micCtx.close(); } catch {}
-  analyser = null;
 
   if (mode === "streaming") {
     if (micWs && micWs.readyState === WebSocket.OPEN) {
@@ -409,9 +324,9 @@ document.querySelectorAll('input[name="source"]').forEach((el) =>
     refreshControls();
     if (getSource() === "mic") {
       const reason = micUnavailableReason();
-      setStatus(reason || "Microphone ready.", reason ? "error" : "");
+      setStatus(reason || "", reason ? "error" : "");
     } else {
-      setStatus("Ready.");
+      setStatus("");
     }
   }));
 document.querySelectorAll('input[name="mode"]').forEach((el) =>
@@ -440,8 +355,7 @@ transcribeBtn.addEventListener("click", async () => {
   }
 });
 
-recordBtn.addEventListener("click", () => { if (!recording) startMic(); });
-stopBtn.addEventListener("click", stopMic);
+recordBtn.addEventListener("click", () => { recording ? stopMic() : startMic(); });
 
 // ---- init ------------------------------------------------------------------
 

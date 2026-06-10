@@ -165,15 +165,14 @@ body {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0.85rem;
-  min-height: 210px;
-  padding: 1.25rem 0 0.25rem;
+  gap: 0.7rem;
+  padding: 0.5rem 0 0.25rem;
 }
 
 .record-orb {
   position: relative;
-  width: 104px;
-  height: 104px;
+  width: 84px;
+  height: 84px;
   border: none;
   border-radius: 50%;
   cursor: pointer;
@@ -188,6 +187,15 @@ body {
 .record-orb:active:not(:disabled) { transform: scale(0.97); }
 .record-orb:disabled { opacity: 0.45; cursor: not-allowed; }
 .record-orb:focus-visible { outline: 3px solid rgba(47, 116, 224, 0.45); outline-offset: 4px; }
+.record-orb svg,
+.orb-stop { grid-area: 1 / 1; }
+.orb-stop {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  background: #fff;
+  display: none;
+}
 .record-orb::after {
   content: "";
   position: absolute;
@@ -202,51 +210,24 @@ body {
   100% { transform: scale(1.28); opacity: 0; }
 }
 
-.rec-hint { margin: 0; color: var(--muted); font-size: 0.95rem; }
+/* Recording state lives in the orb itself: red, pulsing, stop glyph. */
+.record-orb.recording {
+  background: linear-gradient(135deg, #ff6b6b 0%, #e8344b 100%);
+  box-shadow: 0 18px 38px -14px rgba(232, 52, 75, 0.7);
+  animation: orb-pulse 1.4s ease-in-out infinite;
+}
+.record-orb.recording .orb-mic { display: none; }
+.record-orb.recording .orb-stop { display: block; }
+.record-orb.recording::after {
+  border-color: rgba(232, 52, 75, 0.5);
+  animation-duration: 1.4s;
+}
+@keyframes orb-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+}
 
-.rec-live {
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 1.1rem;
-}
-.visualizer {
-  width: 100%;
-  height: 88px;
-  display: block;
-  background: linear-gradient(180deg, #fbfdff 0%, #f3f9ff 100%);
-  border: 1px solid var(--line);
-  border-radius: 16px;
-}
-.rec-controls { display: flex; align-items: center; gap: 0.9rem; }
-.rec-dot {
-  width: 11px; height: 11px; border-radius: 50%;
-  background: #ff4d5e;
-  animation: blink 1s steps(2, start) infinite;
-}
-@keyframes blink { 50% { opacity: 0.25; } }
-.timer {
-  font-variant-numeric: tabular-nums;
-  font-weight: 700;
-  font-size: 1.25rem;
-  color: var(--ink);
-  min-width: 3.4ch;
-  text-align: center;
-}
-.stop-square {
-  width: 54px; height: 54px;
-  border-radius: 50%;
-  cursor: pointer;
-  background: #fff;
-  border: 1.5px solid var(--line);
-  display: grid;
-  place-items: center;
-  transition: background 0.15s ease, border-color 0.15s ease, transform 0.12s ease;
-}
-.stop-square:hover:not(:disabled) { border-color: #ff8a96; background: #fff5f6; transform: translateY(-1px); }
-.stop-square:focus-visible { outline: 2px solid #ff4d5e; outline-offset: 2px; }
-.stop-glyph { width: 16px; height: 16px; border-radius: 4px; background: #ff4d5e; display: block; }
+.rec-hint { margin: 0; color: var(--muted); font-size: 0.95rem; }
 
 /* ---- status -------------------------------------------------------------- */
 
@@ -259,6 +240,7 @@ body {
   font-size: 0.9rem;
   font-weight: 500;
 }
+.status.hidden { display: none; }
 .status.busy { background: var(--busy-bg); color: var(--busy-fg); }
 .status.ok { background: var(--ok-bg); color: var(--ok-fg); }
 .status.error { background: var(--err-bg); color: var(--err-fg); }
