@@ -530,23 +530,18 @@ class ASREngine:
                 config=config,
                 device=self._device,
             )
-        # Offline: one executor handles both the padded length-aware path
-        # (``max_batch_frames`` cap, ``None`` → count-based micro-batching)
-        # and sequence packing (gapless varlen forward, summed post-subsampling
-        # budget).  Packing takes precedence over ``max_batch_frames`` inside
-        # the splitter when both are set.
+        # Offline: the scheduler partitions each batch into micro-batches
+        # (length-bucketed, padded-frame-capped, or sequence-packed — all
+        # driven by ``EngineConfig``).  The executor only needs ``enable_packing``
+        # to pick the forward variant; it stays consistent with the scheduler's
+        # partitioner because both read the same config flag.
         return OfflineExecutor(
             scheduler=self._scheduler,
             input_processor=self._input_processor,
             model_runner=self._model_runner,
             output_processor=self._output_processor,
-            micro_batch_size=int(config.max_batch_size),
             device=self._device,
-            preferred_sizes=config.preferred_batch_size,
-            max_batch_frames=config.max_batch_frames,
             enable_packing=config.enable_sequence_packing,
-            max_packed_frames=int(config.max_packed_frames),
-            subsampling_rate=config.subsampling_rate,
         )
 
     def _validate_mode(self, streaming: bool) -> None:

@@ -73,10 +73,10 @@ The engine no longer has a separate `OfflineEngine` subclass — pass
 | `engine.py` | `ASREngine` | Top-level façade.  Owns one of each subsystem and the step loop.  Use `transcribe(...)` for streaming and `transcribe_offline(...)` for batch. |
 | `config.py` | `EngineConfig` | Unified dataclass aggregating model / cache / feature / decoding / detokenization settings. Auto-detects SentencePiece model and `units.txt`. |
 | `request.py` | `Request`, `RequestOutput`, `RequestState` | Single-request representation, output container, lifecycle enum (`WAITING → RUNNING → FINISHED`). |
-| `scheduler.py` | `Scheduler`, `SchedulerOutput` | Dynamic-batching admission control and length bucketing. See `scheduler.md`. |
+| `scheduler.py` | `Scheduler`, `SchedulerOutput` | Dynamic-batching admission control, length bucketing, and offline micro-batch partition (`split_offline_batch`: count/preferred, padded-frame, or sequence-packed). See `scheduler.md`. |
 | `input_processor.py` | `InputProcessor` | Audio loading, batched GPU fbank/MFCC, streaming chunk-split, CMVN-free (CMVN is in the model). |
 | `model_runner.py` | `ModelRunner` | Wraps `ConformerModel`. Owns the cache managers; runs `forward_offline`, `forward_streaming_step`, and the batched paged path. |
-| `executor/offline.py` | `OfflineExecutor` | Splits an offline batch into length-bucketed micro-batches (fbank → forward → decode → finalise), run back-to-back; optionally sequence-packed when `enable_sequence_packing` is set. |
+| `executor/offline.py` | `OfflineExecutor` | Runs each scheduler-partitioned micro-batch (fbank → forward → decode → finalise) back-to-back; sequence-packed forward when `enable_sequence_packing` is set. |
 | `executor/streaming.py` | `StreamingExecutor` | Chunk-by-chunk streaming with paged KV cache; partial outputs per tick, final on drain. |
 | `output_processor.py` | `OutputProcessor` | CTC decode (GPU beam / k2 WFST) and SentencePiece-or-units detokenization. |
 
@@ -98,8 +98,8 @@ step():
 
 `OfflineExecutor.run` then:
 
-1. Length-bucket and split into micro-batches of size
-   `max_batch_size` each.
+1. Ask the scheduler to partition the batch into micro-batches
+   (`Scheduler.split_offline_batch`: length-bucketed / padded-frame / packed).
 2. Run batched GPU fbank over each micro-batch.
 3. Run micro-batches back-to-back on the default stream
    (fbank → forward → decode → finalise); with `enable_sequence_packing`

@@ -251,7 +251,7 @@ When set, `preferred_batch_size` also:
   latency on the request path.
 - Defaults `feature_graph_batch_buckets` to the same list, so the
   encoder graph cache and the feature graph cache share one B ladder.
-- Snaps `OfflineExecutor._split_chunks` to the preferred sizes — each
+- Snaps `Scheduler.split_offline_batch` to the preferred sizes — each
   micro-batch is the largest preferred value `<= remaining`, falling
   back to the remainder for the (rare) trailing odd chunk.
 

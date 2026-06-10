@@ -124,6 +124,30 @@ class Scheduler:
             req.state = RequestState.RUNNING
         return batch
 
+    def split_offline_batch(
+        self, batch: List[Request]
+    ) -> Tuple[List[List[Request]], Optional[List[int]]]:
+        """Partition a selected offline batch into encoder micro-batches.
+
+        :meth:`schedule_offline` decides *which* requests form this step's
+        batch; this decides *how* they are grouped for the encoder forward.
+        Dispatch order: sequence packing (one gapless packed row per chunk) →
+        padded-frame budget → count / preferred-size.  All paths length-sort
+        the batch to keep each micro-batch tight.
+
+        Returns ``(chunks, orig_indices)`` where ``orig_indices[pos]`` is the
+        input index of the request at flat output position ``pos`` — the caller
+        uses it to restore arrival order after the length sort.  ``orig_indices``
+        is ``None`` when no reordering was applied (single-chunk fast path).
+        """
+        if not batch:
+            return [], None
+        if self._config.enable_sequence_packing:
+            return self._split_packs(batch)
+        if self._config.max_batch_frames is not None:
+            return self._split_by_frames(batch)
+        return self._split_by_count(batch)
+
     def schedule_streaming(self) -> Tuple[List[Request], List[Request]]:
         """Admit waiting streaming requests up to ``max_batch_size``.
 
@@ -403,6 +427,122 @@ class Scheduler:
         while q and len(batch) < cap:
             batch.append(q.popleft())
         return batch
+
+    # ------------------------------------------------------------------
+    # Internal — offline micro-batch partition
+    # ------------------------------------------------------------------
+
+    def _split_packs(
+        self, batch: List[Request]
+    ) -> Tuple[List[List[Request]], Optional[List[int]]]:
+        """Group utterances into packs bounded by a post-subsampling budget.
+
+        Length-sorts then greedily fills a pack until the summed estimated
+        post-subsampling length (``num_frames // subsampling_rate``) would
+        exceed ``max_packed_frames``.  A single oversized utterance ships as
+        its own pack.  Each returned chunk is exactly one packed row for the
+        gapless varlen ``forward_offline_packed``.
+        """
+        enumerated = sorted(enumerate(batch), key=lambda p: p[1].num_frames)
+        ordered = [r for _, r in enumerated]
+        orig_indices: Optional[List[int]] = [i for i, _ in enumerated]
+
+        budget = max(1, int(self._config.max_packed_frames))
+        sr = max(1, int(self._config.subsampling_rate))
+        chunks: List[List[Request]] = []
+        cur: List[Request] = []
+        cur_sum = 0
+        for r in ordered:
+            tlen = max(1, int(r.num_frames) // sr)
+            if cur and cur_sum + tlen > budget:
+                chunks.append(cur)
+                cur = [r]
+                cur_sum = tlen
+            else:
+                cur.append(r)
+                cur_sum += tlen
+        if cur:
+            chunks.append(cur)
+        return chunks, orig_indices
+
+    def _split_by_frames(
+        self, batch: List[Request]
+    ) -> Tuple[List[List[Request]], Optional[List[int]]]:
+        """Split ``batch`` into micro-batches bounded by a padded-frame budget.
+
+        Length-sorts then greedily accumulates requests into a chunk until
+        adding the next would push the padded width ``max_len * (count + 1)``
+        over ``max_batch_frames`` — or the count over ``max_batch_size``.  A
+        single request always ships even if it alone exceeds the budget (it
+        can't be split in non-packing mode).
+        """
+        budget = self._config.max_batch_frames
+        assert budget is not None
+        mb = max(1, int(self._config.max_batch_size))
+
+        enumerated = sorted(enumerate(batch), key=lambda p: p[1].num_frames)
+        ordered = [r for _, r in enumerated]
+        orig_indices: Optional[List[int]] = [i for i, _ in enumerated]
+
+        chunks: List[List[Request]] = []
+        cur: List[Request] = []
+        cur_max = 0
+        for r in ordered:
+            rlen = max(1, r.num_frames)
+            new_max = max(cur_max, rlen)
+            if cur and (new_max * (len(cur) + 1) > budget or len(cur) >= mb):
+                chunks.append(cur)
+                cur = [r]
+                cur_max = rlen
+            else:
+                cur.append(r)
+                cur_max = new_max
+        if cur:
+            chunks.append(cur)
+        return chunks, orig_indices
+
+    def _split_by_count(
+        self, batch: List[Request]
+    ) -> Tuple[List[List[Request]], Optional[List[int]]]:
+        """Partition by count, snapping to ``preferred_batch_size`` when set.
+
+        With preferred sizes configured, greedily peels off the largest
+        preferred value ``<= remaining`` (capped by ``max_batch_size``); the
+        tail (smaller than the smallest preferred) ships as one odd chunk.
+        Otherwise balances into even chunks of at most ``max_batch_size`` to
+        avoid a tiny trailing micro-batch.
+        """
+        n = len(batch)
+        mb = max(1, int(self._config.max_batch_size))
+        pbs = self._config.preferred_batch_size
+
+        # Fast path: a single micro-batch when nothing forces a split.
+        if n <= mb and not pbs:
+            return [list(batch)], None
+
+        enumerated = sorted(enumerate(batch), key=lambda p: p[1].num_frames)
+        ordered = [r for _, r in enumerated]
+        orig_indices: Optional[List[int]] = [i for i, _ in enumerated]
+
+        chunks: List[List[Request]] = []
+        if pbs:
+            idx = 0
+            while idx < n:
+                remaining = n - idx
+                size = self._snap_to_preferred(min(remaining, mb))
+                if size == 0:
+                    size = remaining  # tail < min(preferred); one odd chunk.
+                chunks.append(ordered[idx: idx + size])
+                idx += size
+        else:
+            nchunks = (n + mb - 1) // mb
+            base, rem = divmod(n, nchunks)
+            idx = 0
+            for i in range(nchunks):
+                size = base + (1 if i < rem else 0)
+                chunks.append(ordered[idx: idx + size])
+                idx += size
+        return chunks, orig_indices
 
     # ------------------------------------------------------------------
     # Internal — priority/length ordering

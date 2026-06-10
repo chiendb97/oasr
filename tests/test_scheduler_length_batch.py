@@ -8,22 +8,19 @@ points:
 
 * ``Scheduler._build_offline_batch`` stops adding length-similar peers once
   the padded width would exceed the budget.
-* ``OfflineExecutor._split_by_frames`` re-splits an admitted pool into
-  micro-batches each under the budget, length-sorted to stay tight.
+* ``Scheduler.split_offline_batch`` (frame path) re-splits a selected batch
+  into micro-batches each under the budget, length-sorted to stay tight.
 
 Both are pure-Python and need no GPU / model.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import List, Optional
 
 import pytest
-import torch
 
 from oasr.engine.config import EngineConfig
-from oasr.engine.executor import OfflineExecutor
 from oasr.engine.request import Request
 from oasr.engine.scheduler import Scheduler
 
@@ -54,20 +51,9 @@ def _make_offline(num_frames: int = 200) -> Request:
     return req
 
 
-def _make_executor(
-    *, max_batch_frames: Optional[int], mb: int = 64
-) -> OfflineExecutor:
-    """Build an executor with stub IO — only ``_split_chunks`` is exercised."""
-    inp = SimpleNamespace(_config=SimpleNamespace(dtype=torch.float32))
-    return OfflineExecutor(
-        scheduler=SimpleNamespace(),
-        input_processor=inp,
-        model_runner=SimpleNamespace(),
-        output_processor=SimpleNamespace(),
-        micro_batch_size=mb,
-        device=torch.device("cpu"),
-        max_batch_frames=max_batch_frames,
-    )
+def _make_scheduler(*, max_batch_frames: Optional[int], mb: int = 64) -> Scheduler:
+    """Build a scheduler whose ``split_offline_batch`` (frame path) is exercised."""
+    return Scheduler(_make_config(max_batch_frames=max_batch_frames, max_batch_size=mb))
 
 
 def _make_requests(num_frames_list: List[int]) -> List[Request]:
@@ -143,24 +129,24 @@ class TestSchedulerFrameCap:
 
 
 # ---------------------------------------------------------------------------
-# Executor frame-budget split
+# Scheduler frame-budget split (split_offline_batch, frame path)
 # ---------------------------------------------------------------------------
 
 
 class TestSplitByFrames:
     def test_budget_respected_per_chunk(self):
-        pipe = _make_executor(max_batch_frames=800)
+        sched = _make_scheduler(max_batch_frames=800)
         reqs = _make_requests([200] * 10)
-        chunks, _ = pipe._split_chunks(reqs)
+        chunks, _ = sched.split_offline_batch(reqs)
         # 200 * 4 = 800 fits; 200 * 5 = 1000 does not → chunks of 4.
         assert [len(c) for c in chunks] == [4, 4, 2]
         for c in chunks:
             assert max(r.num_frames for r in c) * len(c) <= 800
 
     def test_length_sorted_chunks(self):
-        pipe = _make_executor(max_batch_frames=600)
+        sched = _make_scheduler(max_batch_frames=600)
         reqs = _make_requests([100, 300, 50, 300, 100, 50])
-        chunks, orig = pipe._split_chunks(reqs)
+        chunks, orig = sched.split_offline_batch(reqs)
         assert orig is not None
         flat = [r.num_frames for c in chunks for r in c]
         assert flat == sorted(flat)
@@ -168,16 +154,16 @@ class TestSplitByFrames:
             assert max(r.num_frames for r in c) * len(c) <= 600
 
     def test_lone_oversized_ships_alone(self):
-        pipe = _make_executor(max_batch_frames=500)
+        sched = _make_scheduler(max_batch_frames=500)
         reqs = _make_requests([100, 100, 900, 100])
-        chunks, _ = pipe._split_chunks(reqs)
+        chunks, _ = sched.split_offline_batch(reqs)
         # The 900-frame utt must be in a singleton chunk.
         singletons = [c for c in chunks if len(c) == 1]
         assert any(c[0].num_frames == 900 for c in singletons)
 
     def test_micro_batch_count_cap(self):
         # Budget is generous, but mb=3 caps each chunk at 3.
-        pipe = _make_executor(max_batch_frames=10_000, mb=3)
+        sched = _make_scheduler(max_batch_frames=10_000, mb=3)
         reqs = _make_requests([10] * 9)
-        chunks, _ = pipe._split_chunks(reqs)
+        chunks, _ = sched.split_offline_batch(reqs)
         assert [len(c) for c in chunks] == [3, 3, 3]
