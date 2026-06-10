@@ -1,0 +1,292 @@
+/* Copyright 2024 OASR Authors / SPDX-License-Identifier: Apache-2.0 */
+
+:root {
+  --ink: #15233f;        /* navy from the logo wordmark */
+  --muted: #5b6b85;
+  --cyan: #1fc3e8;
+  --blue: #2f74e0;
+  --grad: linear-gradient(135deg, #20c4e8 0%, #2f74e0 100%);
+  --card: #ffffff;
+  --line: #e6eef9;
+  --soft: #eef5fd;
+  --ok-bg: #e7f9f0; --ok-fg: #15875a;
+  --err-bg: #ffeef0; --err-fg: #d23b4e;
+  --busy-bg: #e9f2ff; --busy-fg: #2f74e0;
+  --shadow: 0 24px 60px -28px rgba(33, 90, 160, 0.45), 0 2px 10px rgba(33, 90, 160, 0.08);
+}
+
+* { box-sizing: border-box; }
+
+html, body { min-height: 100vh; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(1100px 520px at 50% -8%, #d6ecff 0%, rgba(238, 246, 255, 0) 60%),
+    radial-gradient(900px 500px at 110% 10%, #e3f7ff 0%, rgba(246, 251, 255, 0) 55%),
+    linear-gradient(180deg, #f4f9ff 0%, #eef5fd 100%);
+  background-attachment: fixed;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 2.5rem 1rem 3rem;
+}
+
+/* ---- card ---------------------------------------------------------------- */
+
+.card {
+  position: relative;
+  width: 100%;
+  max-width: 720px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  box-shadow: var(--shadow);
+  padding: 2rem 2rem 1.75rem;
+  overflow: hidden;
+}
+.card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 6px;
+  background: var(--grad);
+}
+
+/* ---- hero ---------------------------------------------------------------- */
+
+.hero { text-align: center; margin: 0.5rem 0 1.5rem; }
+.logo {
+  width: 100%;
+  max-width: 320px;
+  height: auto;
+  display: block;
+  margin: 0 auto 0.4rem;
+}
+.sub { margin: 0; color: var(--muted); font-size: 1rem; }
+
+/* ---- segmented toggles --------------------------------------------------- */
+
+.controls { display: flex; flex-direction: column; gap: 1rem; }
+.toggles { display: flex; gap: 1rem; flex-wrap: wrap; }
+
+.segmented { flex: 1 1 240px; border: none; margin: 0; padding: 0; min-width: 0; }
+.segmented legend {
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0 0 0.4rem;
+}
+.seg-options {
+  display: flex;
+  gap: 5px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 5px;
+}
+.seg-options label {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 0.5rem 0.6rem;
+  border-radius: 10px;
+  cursor: pointer;
+  color: var(--muted);
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+.seg-options input { position: absolute; opacity: 0; width: 0; height: 0; }
+.seg-label { font-weight: 700; font-size: 0.95rem; }
+.seg-sub { font-size: 0.72rem; opacity: 0.8; }
+.seg-options label:hover { color: var(--ink); }
+.seg-options label:has(input:checked) {
+  background: #fff;
+  color: var(--blue);
+  box-shadow: 0 2px 8px rgba(20, 40, 80, 0.12);
+}
+.seg-options label:has(input:focus-visible) { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+/* ---- panels (upload / mic) ----------------------------------------------- */
+
+.panel { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+.panel.hidden { display: none; }
+
+.file-drop {
+  flex: 1 1 260px;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.7rem 0.9rem;
+  background: var(--soft);
+  border: 1.5px dashed #c5d8f0;
+  border-radius: 14px;
+  cursor: pointer;
+  color: var(--muted);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.file-drop:hover { border-color: var(--blue); background: #eaf2ff; }
+.file-icon { font-size: 1.2rem; }
+.file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-drop input[type="file"] { display: none; }
+
+/* ---- buttons ------------------------------------------------------------- */
+
+.btn {
+  border: none;
+  border-radius: 12px;
+  padding: 0.7rem 1.4rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  transition: transform 0.12s ease, box-shadow 0.15s ease, opacity 0.15s ease, filter 0.15s ease;
+}
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+.btn-primary {
+  color: #fff;
+  background: var(--grad);
+  box-shadow: 0 10px 22px -10px rgba(47, 116, 224, 0.7);
+}
+.btn-primary:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.04); }
+
+/* ---- microphone recorder (ElevenLabs-style) ------------------------------ */
+
+.mic-stage {
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.7rem;
+  padding: 0.5rem 0 0.25rem;
+}
+
+.record-orb {
+  position: relative;
+  width: 84px;
+  height: 84px;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  color: #fff;
+  background: var(--grad);
+  display: grid;
+  place-items: center;
+  box-shadow: 0 18px 38px -14px rgba(47, 116, 224, 0.65);
+  transition: transform 0.15s ease, filter 0.15s ease;
+}
+.record-orb:hover:not(:disabled) { transform: translateY(-2px) scale(1.03); filter: brightness(1.05); }
+.record-orb:active:not(:disabled) { transform: scale(0.97); }
+.record-orb:disabled { opacity: 0.45; cursor: not-allowed; }
+.record-orb:focus-visible { outline: 3px solid rgba(47, 116, 224, 0.45); outline-offset: 4px; }
+.record-orb svg,
+.orb-stop { grid-area: 1 / 1; }
+.orb-stop {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  background: #fff;
+  display: none;
+}
+.record-orb::after {
+  content: "";
+  position: absolute;
+  inset: -7px;
+  border-radius: 50%;
+  border: 2px solid rgba(47, 116, 224, 0.4);
+  animation: orb-ring 2.2s ease-out infinite;
+}
+.record-orb:disabled::after { display: none; }
+@keyframes orb-ring {
+  0% { transform: scale(0.92); opacity: 0.7; }
+  100% { transform: scale(1.28); opacity: 0; }
+}
+
+/* Recording state lives in the orb itself: red, pulsing, stop glyph. */
+.record-orb.recording {
+  background: linear-gradient(135deg, #ff6b6b 0%, #e8344b 100%);
+  box-shadow: 0 18px 38px -14px rgba(232, 52, 75, 0.7);
+  animation: orb-pulse 1.4s ease-in-out infinite;
+}
+.record-orb.recording .orb-mic { display: none; }
+.record-orb.recording .orb-stop { display: block; }
+.record-orb.recording::after {
+  border-color: rgba(232, 52, 75, 0.5);
+  animation-duration: 1.4s;
+}
+@keyframes orb-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+}
+
+.rec-hint { margin: 0; color: var(--muted); font-size: 0.95rem; }
+
+/* ---- status -------------------------------------------------------------- */
+
+.status {
+  margin: 0;
+  padding: 0.6rem 0.9rem;
+  border-radius: 12px;
+  background: var(--soft);
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+.status.hidden { display: none; }
+.status.busy { background: var(--busy-bg); color: var(--busy-fg); }
+.status.ok { background: var(--ok-bg); color: var(--ok-fg); }
+.status.error { background: var(--err-bg); color: var(--err-fg); }
+
+/* ---- transcript ---------------------------------------------------------- */
+
+.result { margin-top: 1.4rem; }
+.result-head h2 {
+  margin: 0 0 0.5rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.transcript {
+  min-height: 7rem;
+  padding: 1.1rem 1.2rem;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #fbfdff 0%, #f5faff 100%);
+  border: 1px solid var(--line);
+  font-size: 1.18rem;
+  line-height: 1.6;
+  color: var(--ink);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.transcript:has(#committed:empty):has(#partial:empty)::before {
+  content: "Your transcript will appear here…";
+  color: #9aa7bd;
+}
+.partial { color: var(--muted); font-style: italic; }
+
+/* ---- footer -------------------------------------------------------------- */
+
+footer { margin-top: 1.6rem; text-align: center; }
+footer small { color: var(--muted); }
+code {
+  color: var(--blue);
+  background: var(--soft);
+  padding: 0.05rem 0.35rem;
+  border-radius: 6px;
+  font-size: 0.85em;
+}
+
+@media (max-width: 560px) {
+  .card { padding: 1.5rem 1.2rem; border-radius: 18px; }
+  .toggles { flex-direction: column; }
+}

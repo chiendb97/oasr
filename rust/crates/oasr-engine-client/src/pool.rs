@@ -77,7 +77,9 @@ impl EnginePool {
         let k = self
             .pick_least_loaded()
             .ok_or_else(|| EngineClientError::WorkerDown("no healthy workers".into()))?;
-        self.workers[k].submit_offline(audio, sample_rate, priority).await
+        self.workers[k]
+            .submit_offline(audio, sample_rate, priority)
+            .await
     }
 
     /// Open a streaming request, sticky to the chosen worker for subsequent

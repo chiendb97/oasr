@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<!-- Copyright 2024 OASR Authors / SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Automatic Speech Recognition</title>
+  <link rel="icon" href="/oasr-logo-only.png" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="card">
+    <header class="hero">
+      <img class="logo" src="/oasr-logo-text.png" alt="OASR" />
+      <p class="sub">Automatic Speech Recognition in your browser.</p>
+    </header>
+
+    <section class="controls">
+      <div class="toggles">
+        <fieldset class="segmented">
+          <legend>Mode</legend>
+          <div class="seg-options">
+            <label><input type="radio" name="mode" value="offline" checked />
+              <span class="seg-label">Offline</span><span class="seg-sub">one-shot</span></label>
+            <label><input type="radio" name="mode" value="streaming" />
+              <span class="seg-label">Streaming</span><span class="seg-sub">live</span></label>
+          </div>
+        </fieldset>
+
+        <fieldset class="segmented">
+          <legend>Source</legend>
+          <div class="seg-options">
+            <label><input type="radio" name="source" value="upload" checked />
+              <span class="seg-label">Upload</span><span class="seg-sub">file</span></label>
+            <label><input type="radio" name="source" value="mic" />
+              <span class="seg-label">Microphone</span><span class="seg-sub">record</span></label>
+          </div>
+        </fieldset>
+      </div>
+
+      <div id="upload-panel" class="panel">
+        <label class="file-drop" for="file-input">
+          <span class="file-icon">🎵</span>
+          <span id="file-name" class="file-name">Choose an audio file…</span>
+          <input type="file" id="file-input" accept="audio/*" />
+        </label>
+        <button id="transcribe-btn" class="btn btn-primary" type="button" disabled>Transcribe</button>
+      </div>
+
+      <div id="mic-panel" class="panel mic-stage hidden">
+        <button id="record-btn" class="record-orb" type="button" aria-label="Start recording">
+          <svg class="orb-mic" viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="9" y="2" width="6" height="12" rx="3"></rect>
+            <path d="M5 10a7 7 0 0 0 14 0"></path>
+            <line x1="12" y1="19" x2="12" y2="22"></line>
+          </svg>
+          <span class="orb-stop" aria-hidden="true"></span>
+        </button>
+        <p id="rec-hint" class="rec-hint">Tap to record</p>
+      </div>
+    </section>
+
+    <p id="status" class="status hidden"></p>
+
+    <section class="result">
+      <div class="result-head"><h2>Transcript</h2></div>
+      <div id="transcript" class="transcript">
+        <span id="committed"></span><span id="partial" class="partial"></span>
+      </div>
+    </section>
+
+    <footer>
+      <small>Bridge relays to the OASR gRPC server.</small>
+    </footer>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

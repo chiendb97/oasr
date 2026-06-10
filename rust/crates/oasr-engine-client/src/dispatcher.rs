@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use pyo3::prelude::*;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::pyengine::{engine_error_event, AdmitSpec, PyEngine, PyEngineError};
 use crate::router::RouterActor;
@@ -167,7 +167,11 @@ impl DispatchTrace {
         let route = self.route_us as f64 / t / 1000.0;
         let overhead = intake + admit + extract + route;
         let total = overhead + step;
-        let overhead_pct = if total > 0.0 { 100.0 * overhead / total } else { 0.0 };
+        let overhead_pct = if total > 0.0 {
+            100.0 * overhead / total
+        } else {
+            0.0
+        };
         info!(
             label = %label,
             ticks = self.ticks,
@@ -351,24 +355,12 @@ fn run_dispatcher(
                             &shared,
                             &mut tick_events,
                         );
-                        handle_nonadmit_cmd_locked(
-                            py,
-                            &bound,
-                            env,
-                            &shared,
-                            &mut tick_events,
-                        );
+                        handle_nonadmit_cmd_locked(py, &bound, env, &shared, &mut tick_events);
                     }
                 }
             }
             // Drain any remaining admits before stepping.
-            flush_admit_batch_locked(
-                py,
-                &bound,
-                &mut admit_batch,
-                &shared,
-                &mut tick_events,
-            );
+            flush_admit_batch_locked(py, &bound, &mut admit_batch, &shared, &mut tick_events);
             let t_admit = admit_t0.elapsed();
 
             // Decide whether to step.  `engine.step()` is fast when there's
@@ -389,8 +381,9 @@ fn run_dispatcher(
                         match PyEngine::extract_events(&list) {
                             Ok(events) => tick_events.extend(events),
                             Err(e) => {
-                                error!(label = %shared.label, "engine.step extract failed: {e}");
-                                for rid in shared.router.all_request_ids() {
+                                let rids = shared.router.all_request_ids();
+                                error!(label = %shared.label, n_affected = rids.len(), "engine.step extract failed: {e}");
+                                for rid in rids {
                                     tick_events.push(Event::Error {
                                         request_id: rid,
                                         code: ErrorCode::Internal,
@@ -403,11 +396,12 @@ fn run_dispatcher(
                     }
                     Err(e) => {
                         t_step = step_t0.elapsed();
-                        error!(label = %shared.label, "engine.step failed: {e}");
+                        let rids = shared.router.all_request_ids();
+                        error!(label = %shared.label, n_affected = rids.len(), "engine.step failed: {e}");
                         // Surface a synthetic Error to every in-flight request
                         // so callers don't hang.  Continue — the engine may
                         // recover on the next tick.
-                        for rid in shared.router.all_request_ids() {
+                        for rid in rids {
                             tick_events.push(Event::Error {
                                 request_id: rid,
                                 code: ErrorCode::Internal,
@@ -462,6 +456,13 @@ fn run_dispatcher(
             };
             if due {
                 last_overload_emit = Some(Instant::now());
+                warn!(
+                    label = %shared.label,
+                    running,
+                    waiting,
+                    cap = cfg.max_concurrent_requests,
+                    "engine overloaded"
+                );
             }
         }
 
@@ -476,9 +477,7 @@ fn run_dispatcher(
         // we keep busy-iterating so streaming requests continue to advance
         // at the engine's natural cadence.
         if !received_any && running == 0 && waiting == 0 {
-            match rt_handle
-                .block_on(tokio::time::timeout(IDLE_RECV_TIMEOUT, cmd_rx.recv()))
-            {
+            match rt_handle.block_on(tokio::time::timeout(IDLE_RECV_TIMEOUT, cmd_rx.recv())) {
                 Ok(Some(env)) => envs.push(env),
                 Ok(None) => {
                     info!(label = %shared.label, "command channel closed; dispatcher exit");
@@ -516,20 +515,25 @@ fn enqueue_admit_locked(
             sample_rate,
             priority,
         } => {
-            if shared.load.load(Ordering::Relaxed) >= max_concurrent {
+            let load = shared.load.load(Ordering::Relaxed);
+            if load >= max_concurrent {
+                warn!(
+                    label = %shared.label,
+                    rid = %request_id,
+                    load,
+                    cap = max_concurrent,
+                    "admission rejected: at capacity"
+                );
                 out_events.push(Event::Error {
                     request_id: request_id.clone(),
                     code: ErrorCode::Busy,
-                    message: format!(
-                        "in-flight {} >= cap {}",
-                        shared.load.load(Ordering::Relaxed),
-                        max_concurrent
-                    ),
+                    message: format!("in-flight {load} >= cap {max_concurrent}"),
                 });
                 return;
             }
             let audio = payload.unwrap_or_default();
             if audio.is_empty() {
+                debug!(label = %shared.label, rid = %request_id, "rejected: empty audio payload");
                 out_events.push(Event::Error {
                     request_id: request_id.clone(),
                     code: ErrorCode::InvalidCmd,
@@ -551,15 +555,19 @@ fn enqueue_admit_locked(
             sample_rate,
             priority,
         } => {
-            if shared.load.load(Ordering::Relaxed) >= max_concurrent {
+            let load = shared.load.load(Ordering::Relaxed);
+            if load >= max_concurrent {
+                warn!(
+                    label = %shared.label,
+                    rid = %request_id,
+                    load,
+                    cap = max_concurrent,
+                    "admission rejected: at capacity"
+                );
                 out_events.push(Event::Error {
                     request_id: request_id.clone(),
                     code: ErrorCode::Busy,
-                    message: format!(
-                        "in-flight {} >= cap {}",
-                        shared.load.load(Ordering::Relaxed),
-                        max_concurrent
-                    ),
+                    message: format!("in-flight {load} >= cap {max_concurrent}"),
                 });
                 return;
             }
@@ -674,6 +682,7 @@ fn handle_nonadmit_cmd_locked<'py>(
         } => {
             let chunk = payload.unwrap_or_default();
             if let Err(e) = PyEngine::feed_chunk_locked(py, bound, &request_id, &chunk, is_last) {
+                warn!(label = %shared.label, rid = %request_id, "feed_chunk failed: {e}");
                 out_events.push(engine_error_event(&request_id, &e));
             }
         }

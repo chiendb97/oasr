@@ -1,0 +1,6 @@
+# Dependencies for the OASR web demo bridge (examples/web/server.py).
+# These are demo-only and intentionally NOT added to the oasr package.
+fastapi
+uvicorn[standard]
+grpcio
+grpcio-tools

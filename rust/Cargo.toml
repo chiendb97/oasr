@@ -43,7 +43,7 @@ futures = "0.3"
 anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

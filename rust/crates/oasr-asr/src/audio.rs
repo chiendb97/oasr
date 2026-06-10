@@ -185,7 +185,10 @@ mod tests {
         assert_eq!(samples.len(), src.len());
         for (i, s) in samples.iter().enumerate() {
             let expected = (src[i] as f32) / 32768.0;
-            assert!((s - expected).abs() < 1e-6, "mismatch at {i}: {s} != {expected}");
+            assert!(
+                (s - expected).abs() < 1e-6,
+                "mismatch at {i}: {s} != {expected}"
+            );
         }
     }
 

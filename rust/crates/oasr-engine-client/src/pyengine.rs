@@ -270,12 +270,7 @@ impl PyEngine {
         Ok(())
     }
 
-    pub fn feed_chunk(
-        &self,
-        rid: &str,
-        chunk: &[u8],
-        is_last: bool,
-    ) -> Result<(), PyEngineError> {
+    pub fn feed_chunk(&self, rid: &str, chunk: &[u8], is_last: bool) -> Result<(), PyEngineError> {
         Python::with_gil(|py| {
             let bound = self.engine.bind(py);
             Self::feed_chunk_locked(py, &bound, rid, chunk, is_last)
@@ -331,9 +326,7 @@ impl PyEngine {
     /// marshaling its fields.  Split out from [`step_locked`] so callers (the
     /// dispatcher) can time the GPU-bound step separately from the per-output
     /// PyO3 extraction in [`extract_events`].
-    pub fn step_raw<'py>(
-        bound: &Bound<'py, PyAny>,
-    ) -> Result<Bound<'py, PyList>, PyEngineError> {
+    pub fn step_raw<'py>(bound: &Bound<'py, PyAny>) -> Result<Bound<'py, PyList>, PyEngineError> {
         let outputs = bound.call_method0("step")?;
         let list: Bound<'py, PyList> = outputs.downcast_into()?;
         Ok(list)

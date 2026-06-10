@@ -48,16 +48,22 @@ DEFAULT_PROTO = (
 def load_stubs(proto_path: Path):
     """Compile ``oasr_speech_v1.proto`` and import the generated modules."""
     try:
+        import grpc_tools
         from grpc_tools import protoc
     except ImportError as exc:
         raise SystemExit(
             "missing grpcio-tools (install with `pip install grpcio grpcio-tools`)"
         ) from exc
 
+    # grpcio-tools bundles the well-known protos (google/protobuf/*.proto) under
+    # its _proto dir; add it to the import path so duration.proto resolves.
+    well_known = Path(grpc_tools.__file__).parent / "_proto"
+
     out = Path(tempfile.mkdtemp(prefix="oasr-example-grpc-"))
     rc = protoc.main([
         "protoc",
         f"--proto_path={proto_path.parent}",
+        f"--proto_path={well_known}",
         f"--python_out={out}",
         f"--grpc_python_out={out}",
         str(proto_path),
