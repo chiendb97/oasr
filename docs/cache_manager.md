@@ -343,7 +343,7 @@ log_probs, new_cnn = model.forward_chunk_paged(
 
 `BlockPool.allocate` / `free` are guarded by a `threading.Lock`. The other
 managers are **not** thread-safe internally. They are expected to be called
-only from the engine's main step loop. `OfflinePipeline` runs CPU-side fbank
+only from the engine's main step loop. `OfflineExecutor` runs CPU-side fbank
 on a producer thread but never touches the cache managers; only the consumer
 thread that performs the GPU forward calls into them.
 

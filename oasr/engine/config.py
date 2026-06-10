@@ -42,7 +42,7 @@ class EngineConfig:
     max_batch_size : int
         Encoder forward batch size.  In streaming mode it caps the running
         pool and sizes the paged KV cache; in offline mode it is the GPU
-        forward width of each pipeline micro-batch.  The service runs in
+        forward width of each executor micro-batch.  The service runs in
         one mode at a time, never both.  ``preferred_batch_size`` is layered
         on top as a Triton-style soft cap (snap-to-preferred admission)
         while ``max_batch_size`` remains the hard cap on resources.
@@ -66,10 +66,10 @@ class EngineConfig:
         with dither disabled (``dither=0.0``) for deterministic inference.
     decoder_type : str
         Which GPU CTC decoder to use:
-        ``"ctc_gpu"`` — GPU beam search via ``GpuStreamingDecoder`` (default),
+        ``"ctc_cuda"`` — GPU beam search via ``GpuStreamingDecoder`` (default),
         ``"ctc_wfst"`` — k2 WFST beam search (GPU, requires a k2 build).
-    gpu_decoder_config : GpuDecoderConfig, optional
-        Config for ``decoder_type="ctc_gpu"``.  Defaults to
+    ctc_decoder_config : GpuDecoderConfig, optional
+        Config for ``decoder_type="ctc_cuda"``.  Defaults to
         ``GpuDecoderConfig()``.
     wfst_decoder_config : DecoderConfig, optional
         Config for ``decoder_type="ctc_wfst"``.  Defaults to
@@ -97,7 +97,7 @@ class EngineConfig:
     # ``streaming`` flag matches this mode and raises ``ValueError`` on
     # drift — the Rust dispatcher relies on this to surface
     # misconfiguration eagerly instead of silently routing into a
-    # quiescent pipeline.
+    # quiescent executor.
     service_mode: str = "streaming"
     # Offline-only: overlap per-request admission prep (waveform normalise +
     # frame-count stamp — the GIL-bound CPU cost of ``add_request[s_batch]``)
@@ -128,7 +128,7 @@ class EngineConfig:
     # the running pool, sizes the paged KV cache, and is the captured
     # CUDA-Graph B.  In offline mode it is the GPU forward width: the
     # scheduler admits one ``max_batch_size`` length-bucketed batch per
-    # ``step()`` and :class:`OfflinePipeline` runs it as a single forward.
+    # ``step()`` and :class:`OfflineExecutor` runs it as a single forward.
     max_batch_size: int = 32
     # Triton-style preferred batch sizes.  When set, the scheduler snaps
     # streaming admission and offline batch construction to one of these B
@@ -158,10 +158,10 @@ class EngineConfig:
     # Length-aware batching: hard cap on **padded** input frames per offline
     # micro-batch, i.e. ``max_len * batch_size`` in pre-subsampling feature
     # frames (the same unit as ``Request.num_frames``).  ``None`` (default)
-    # bounds each :class:`OfflinePipeline` micro-batch solely by
+    # bounds each :class:`OfflineExecutor` micro-batch solely by
     # ``max_batch_size``.  When set, length-sorted requests are greedily grouped
     # into micro-batches bounded by this padded-frame budget (via
-    # ``OfflinePipeline._split_by_frames``) so a mixed short/long pool never
+    # ``OfflineExecutor._split_by_frames``) so a mixed short/long pool never
     # forms an over-padded forward — exact-equivalent to the standard padded
     # forward, only the batch composition changes.  Independent of sequence
     # packing (``enable_sequence_packing``), which packs to a gapless varlen
@@ -189,7 +189,7 @@ class EngineConfig:
     # admission (one new request per freed slot).
     streaming_cohort_admit: bool = True
 
-    # Sequence packing (offline only).  When ``True`` the offline pipeline
+    # Sequence packing (offline only).  When ``True`` the offline executor
     # concatenates several utterances into one packed encoder forward instead
     # of padding each micro-batch to its max length.  Attention is restricted
     # to same-utterance tokens via ``cu_seqlens`` (varlen FMHA on the cute
@@ -201,7 +201,7 @@ class EngineConfig:
     # governs the *non*-packing length-aware mode).
     enable_sequence_packing: bool = False
     # Token budget for one packed encoder row, in **post-subsampling** encoder
-    # frames (≈ input_frames / 4).  ``PackingPipeline`` greedily fills a packed
+    # frames (≈ input_frames / 4).  The offline executor (packing mode) greedily fills a packed
     # row with whole utterances until the next one would push the summed
     # post-subsampling length (plus per-segment conv gap-frames) over this
     # budget, then spills into another row.  Sized to keep one packed forward
@@ -260,8 +260,8 @@ class EngineConfig:
     # kernel rather than an N-times Python loop (~50× faster per-utt at common
     # batch sizes, ~5 ms decode for 64 reqs).  Set to ``"ctc_wfst"`` for the
     # k2 WFST beam search (also GPU) when ``fst_path`` is provided.
-    decoder_type: str = "ctc_gpu"
-    gpu_decoder_config: Optional[GpuDecoderConfig] = None
+    decoder_type: str = "ctc_cuda"
+    ctc_decoder_config: Optional[GpuDecoderConfig] = None
     wfst_decoder_config: Optional[DecoderConfig] = None
     fst_path: Optional[str] = None
 
@@ -276,7 +276,7 @@ class EngineConfig:
     # (final transcript only) for throughput / non-interactive consumers — the
     # decode state still advances every step; only the read-back is skipped.
     partial_decode_interval: int = 1
-    # Pipeline the interim-partial read-back.  When ``False`` (default) each
+    # Overlap the interim-partial read-back.  When ``False`` (default) each
     # emit step reads the beam buffer back with a blocking
     # ``cudaStreamSynchronize`` and emits *this* step's partial immediately —
     # the lowest first-token latency, best for **interactive** streaming.  When
@@ -288,7 +288,7 @@ class EngineConfig:
     # the engine's primary streaming target is interactive latency, which the
     # one-chunk partial lag regresses for no reliable throughput gain at low
     # concurrency.
-    pipeline_partial_readback: bool = False
+    overlap_partial_readback: bool = False
 
     # Detokenization
     sentencepiece_model: Optional[str] = None
@@ -308,9 +308,9 @@ class EngineConfig:
             raise ValueError(
                 f"service_mode must be 'streaming' or 'offline', got " f"{self.service_mode!r}"
             )
-        if self.decoder_type not in ("ctc_gpu", "ctc_wfst"):
+        if self.decoder_type not in ("ctc_cuda", "ctc_wfst"):
             raise ValueError(
-                f"decoder_type must be 'ctc_gpu' or 'ctc_wfst', got "
+                f"decoder_type must be 'ctc_cuda' or 'ctc_wfst', got "
                 f"{self.decoder_type!r}. CPU decoders are no longer exposed "
                 "through the engine; use the standalone oasr.decode API for those."
             )
@@ -328,8 +328,8 @@ class EngineConfig:
                 )
         if self.feature_config is None:
             self.feature_config = FeatureConfig(dither=0.0)
-        if self.gpu_decoder_config is None:
-            self.gpu_decoder_config = GpuDecoderConfig()
+        if self.ctc_decoder_config is None:
+            self.ctc_decoder_config = GpuDecoderConfig()
         if self.wfst_decoder_config is None:
             self.wfst_decoder_config = DecoderConfig(search_type="wfst")
         # Normalise preferred_batch_size: dedupe, sort, validate each <= cap.

@@ -35,7 +35,7 @@ class InputProcessor:
     (the serving front-end via ``oasr-asr``, or the bench/test harness), never
     here.  Two paths share this class:
 
-    * **offline** — :meth:`prepare_offline` then :meth:`collate_gpu` (one
+    * **offline** — :meth:`prepare_offline` then :meth:`collate` (one
       batched GPU fbank over a length-bucketed micro-batch);
     * **streaming** — :meth:`prepare_streaming`, :meth:`append_streaming_chunk`,
       :meth:`extract_streaming_batch` (per-step batched fbank across streams).
@@ -72,7 +72,7 @@ class InputProcessor:
         #   ``_wav_padded`` — **device** 1-D buffer, viewed as ``(B, T_max)``,
         #                     into which the packed waveforms are scattered.
         #                     Zero-padding and the audio-scale multiply both
-        #                     run here on the GPU (see :meth:`collate_gpu`).
+        #                     run here on the GPU (see :meth:`collate`).
         self._wav_flat: Optional[torch.Tensor] = None
         self._wav_padded: Optional[torch.Tensor] = None
 
@@ -142,7 +142,7 @@ class InputProcessor:
         waveform) and stamps a cheap sample-count based ``num_frames`` estimate
         so the scheduler can bucket by length without a D2H sync.  No audio
         scaling happens here — the int16-scale multiply runs on the GPU after
-        padding in :meth:`collate_gpu`, which also runs the batched fbank/mfcc.
+        padding in :meth:`collate`, which also runs the batched fbank/mfcc.
         """
         request.audio = torch.as_tensor(
             request.audio, dtype=torch.float32, device="cpu"
@@ -158,7 +158,7 @@ class InputProcessor:
         Pinned so the subsequent ``.to(cuda, non_blocking=True)`` is a true
         async H2D.  Reuse is safe on the synchronous offline path: the buffer
         is fully transferred (and the batch D→H-synced at decode) before the
-        next collate overwrites it — :class:`OfflinePipeline` runs micro-batches
+        next collate overwrites it — :class:`OfflineExecutor` runs micro-batches
         back-to-back on the default stream with no producer-thread overlap.
         """
         cur = 0 if self._wav_flat is None else self._wav_flat.numel()
@@ -181,7 +181,7 @@ class InputProcessor:
             )
         return self._wav_padded[:need].view(batch, t_max)
 
-    def collate_gpu(
+    def collate(
         self,
         requests: List[Request],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -206,8 +206,8 @@ class InputProcessor:
         waveforms = [r.audio for r in requests]
         wav_lengths = torch.tensor([w.size(0) for w in waveforms], dtype=torch.int64)
 
-        wav_gpu = self._padded_waveform_batch(waveforms)
-        features, feat_lengths = self._fbank_batch(wav_gpu, wav_lengths)
+        wav_device = self._padded_waveform_batch(waveforms)
+        features, feat_lengths = self._fbank_batch(wav_device, wav_lengths)
 
         # Release the host waveforms; the GPU feature tensor owns the batch now.
         for r in requests:
@@ -242,21 +242,21 @@ class InputProcessor:
             if n:
                 flat[off : off + n] = w
             off += n
-        flat_gpu = flat.to(self._device, non_blocking=True)  # one async H2D
+        flat_device = flat.to(self._device, non_blocking=True)  # one async H2D
 
         padded = self._padded_device(batch, t_max)
         padded.zero_()  # GPU zero-padding
         off = 0
         for i, n in enumerate(wav_sizes):
             if n:
-                padded[i, :n] = flat_gpu[off : off + n]  # device-to-device
+                padded[i, :n] = flat_device[off : off + n]  # device-to-device
             off += n
         if scale != 1.0:
             padded.mul_(scale)  # GPU scale, after padding
         return padded
 
     def _fbank_batch(
-        self, wav_gpu: torch.Tensor, wav_lengths: torch.Tensor
+        self, wav_device: torch.Tensor, wav_lengths: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run fbank/mfcc over a padded ``(B, T_max)`` waveform batch.
 
@@ -269,13 +269,13 @@ class InputProcessor:
         """
         fcfg = self._feature_config
         if supports_batched_fbank(fcfg) or supports_batched_mfcc(fcfg):
-            lengths_gpu = wav_lengths.to(self._device, non_blocking=True)
+            lengths_device = wav_lengths.to(self._device, non_blocking=True)
             batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
-            features_f32, feat_lengths = batched_fn(wav_gpu, lengths_gpu, fcfg)
+            features_f32, feat_lengths = batched_fn(wav_device, lengths_device, fcfg)
             return features_f32.to(dtype=self._config.dtype), feat_lengths
 
         feat_list = [
-            _extract_single(wav_gpu[i, :n], fcfg)
+            _extract_single(wav_device[i, :n], fcfg)
             for i, n in enumerate(wav_lengths.tolist())
         ]
         feat_lengths = torch.tensor(
@@ -334,7 +334,7 @@ class InputProcessor:
         # Normalise to a 1-D float32 CPU waveform (shared with the offline path)
         # and apply the int16 ``audio_scale``.  Streaming keeps its scale on the
         # CPU: it's a tiny per-chunk multiply feeding the chunk+tail concat, not
-        # the offline batch pad (the GPU scale-after-pad in ``collate_gpu`` is
+        # the offline batch pad (the GPU scale-after-pad in ``collate`` is
         # offline-only).
         wav = torch.as_tensor(chunk, dtype=torch.float32, device="cpu").reshape(-1)
         scale = self._config.audio_scale
@@ -543,11 +543,11 @@ class InputProcessor:
 
         with stream_ctx:
             nvtx_push("h2d")
-            wav_gpu = padded_cpu.to(device=device, non_blocking=True)
-            lengths_gpu = lengths_cpu.to(device=device, non_blocking=True)
+            wav_device = padded_cpu.to(device=device, non_blocking=True)
+            lengths_device = lengths_cpu.to(device=device, non_blocking=True)
             nvtx_pop()
             nvtx_push("feature")
-            feats_f32, _ = batched_fn(wav_gpu, lengths_gpu, fcfg)
+            feats_f32, _ = batched_fn(wav_device, lengths_device, fcfg)
             feats = feats_f32.to(dtype=dtype)
             nvtx_pop()
         return feats, feat_lens_cpu

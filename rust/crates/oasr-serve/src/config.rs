@@ -41,7 +41,8 @@ pub struct Cli {
     /// Encoder chunk size (frames).
     #[arg(long)]
     pub chunk_size: Option<u32>,
-    /// Decoder type.
+    /// Decoder type: `ctc_cuda` (GPU CTC beam, engine default) or `ctc_wfst`
+    /// (k2 WFST). Forwarded verbatim to the Python `EngineConfig.decoder_type`.
     #[arg(long)]
     pub decoder_type: Option<String>,
     /// Offline only: overlap per-request admission prep (waveform load + scale

@@ -314,7 +314,7 @@ class TestOfflineTranscribe:
             device=str(device),
             dtype=torch.float16,
             service_mode="offline",
-            decoder_type="ctc_gpu",
+            decoder_type="ctc_cuda",
         )
         return ASREngine(cfg)
 
@@ -352,7 +352,7 @@ class TestASREngine:
             ckpt_dir=ckpt_dir,
             device=str(device),
             dtype=torch.float16,
-            decoder_type="ctc_gpu",
+            decoder_type="ctc_cuda",
             chunk_size=16,
             num_left_chunks=-1,
         )
@@ -399,7 +399,7 @@ class TestASREngine:
         frame-for-frame with the offline batched forward.
 
         This was briefly ``xfail`` while GPU-DEC-1 (``docs/known_issues.md``)
-        was open: the ``ctc_gpu`` decoder's blank-frame-skip mislabelled a
+        was open: the ``ctc_cuda`` decoder's blank-frame-skip mislabelled a
         freshly emitted non-blank token as "ends in blank", so the next
         identical frame extended (CTC repeat) instead of collapsing and
         duplicated the token (e.g. ``EXHIBITION`` → ``EXHIBIT EXHIBITIONION``).
@@ -421,7 +421,7 @@ class TestASREngine:
             device=str(device),
             dtype=torch.float16,
             service_mode="offline",
-            decoder_type="ctc_gpu",
+            decoder_type="ctc_cuda",
         )
         off = ASREngine(off_cfg)
         off_texts = off.transcribe_offline(waves)
@@ -430,7 +430,7 @@ class TestASREngine:
             ckpt_dir=ckpt_dir,
             device=str(device),
             dtype=torch.float16,
-            decoder_type="ctc_gpu",
+            decoder_type="ctc_cuda",
             chunk_size=16,
             num_left_chunks=-1,
             max_batch_size=1,
@@ -466,7 +466,7 @@ class TestASREngine:
             device=str(device),
             dtype=torch.float16,
             service_mode="offline",
-            decoder_type="ctc_gpu",
+            decoder_type="ctc_cuda",
         )
         off = ASREngine(off_cfg)
         off_texts = off.transcribe_offline(waves)
@@ -522,7 +522,7 @@ class TestASREngine:
             ckpt_dir=ckpt_dir,
             device=str(device),
             dtype=torch.float16,
-            decoder_type="ctc_gpu",
+            decoder_type="ctc_cuda",
             chunk_size=16,
             max_num_blocks=512,
         )

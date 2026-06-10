@@ -136,7 +136,7 @@ Error responses use the canonical Google error envelope:
         "dtype": "torch.float16",
         "chunk_size": 16,
         "max_batch_size": 64,
-        "decoder_type": "ctc_gpu",
+        "decoder_type": "ctc_cuda",
         "vocab_size": 5000
       }
     }

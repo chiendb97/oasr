@@ -27,7 +27,7 @@ class OutputProcessor:
 
     Supports two GPU decoder types controlled by ``config.decoder_type``:
 
-    * ``"ctc_gpu"`` — GPU CTC prefix beam search via
+    * ``"ctc_cuda"`` — GPU CTC prefix beam search via
       :func:`~oasr.ctc_decode.ctc_beam_search_decode` (offline) or
       :class:`~oasr.ctc_decode.GpuStreamingDecoder` (streaming).
     * ``"ctc_wfst"`` — k2 WFST beam search (GPU; requires a k2 build).
@@ -56,7 +56,7 @@ class OutputProcessor:
         self._config = config
         # Streaming decode-step counter driving ``partial_decode_interval``.
         self._stream_decode_step = 0
-        # Pipelined interim read-back: the previous emit step's in-flight
+        # Overlapped interim read-back: the previous emit step's in-flight
         # ``peek_states_async`` handle plus the requests it covers and the
         # decoder that issued it.  Consumed one step later so the blocking
         # device→host sync leaves the critical path (see ``decode_streaming_batch``).
@@ -89,16 +89,16 @@ class OutputProcessor:
         List[RequestOutput]
             One output per batch element (best hypothesis, finished=True).
         """
-        if self._config.decoder_type == "ctc_gpu":
-            return self._decode_offline_gpu(log_probs, lengths)
+        if self._config.decoder_type == "ctc_cuda":
+            return self._decode_offline_ctc(log_probs, lengths)
         return self._decode_offline_wfst(log_probs, lengths)
 
-    def _decode_offline_gpu(
+    def _decode_offline_ctc(
         self,
         log_probs: torch.Tensor,
         lengths: torch.Tensor,
     ) -> List[RequestOutput]:
-        cfg = self._config.gpu_decoder_config
+        cfg = self._config.ctc_decoder_config
         assert cfg is not None
         result: GpuDecoderResult = ctc_beam_search_decode(
             log_probs,
@@ -162,10 +162,10 @@ class OutputProcessor:
     ) -> List[RequestOutput]:
         """Batched streaming decode for **N ready streams** in one call.
 
-        For the ``ctc_gpu`` decoder we issue a single C++ launcher
+        For the ``ctc_cuda`` decoder we issue a single C++ launcher
         (:meth:`~oasr.ctc_decode.GpuStreamingDecoder.decode_chunk_batch`)
         over all ready streams at once, replacing the per-stream Python
-        loop in :meth:`~oasr.engine.pipeline.streaming.StreamingPipeline.step`.
+        loop in :meth:`~oasr.engine.executor.streaming.StreamingExecutor.step`.
         For the ``ctc_wfst`` decoder we fall back to a per-stream Python
         loop here — the k2 decoder is single-threaded per-request anyway.
 
@@ -185,7 +185,7 @@ class OutputProcessor:
         """
         if not requests:
             return []
-        if self._config.decoder_type != "ctc_gpu":
+        if self._config.decoder_type != "ctc_cuda":
             outputs: List[RequestOutput] = []
             for req in requests:
                 lp = log_probs_map.get(req.request_id)
@@ -236,7 +236,7 @@ class OutputProcessor:
         # Interim-partial cadence.  Reading the beam buffer back to the host is
         # a blocking ``cudaStreamSynchronize`` that, profiled, costs about as
         # much as the decode compute itself — and it drains the GPU before the
-        # next step's encoder can be dispatched.  We *pipeline* it: each emit
+        # next step's encoder can be dispatched.  We *overlap* it: each emit
         # step issues a **non-blocking** batched read-back (``peek_states_async``)
         # for the current ready set, and emits the partials collected from the
         # **previous** emit step's handle (whose copy completed during the
@@ -250,7 +250,7 @@ class OutputProcessor:
             return []
 
         nvtx_push("partial_readback")
-        if not getattr(self._config, "pipeline_partial_readback", False):
+        if not getattr(self._config, "overlap_partial_readback", False):
             # Default: blocking read-back, emit this step's partial now (lowest
             # first-token latency — the interactive path).
             snaps = decoder.peek_states(ordered_states)
@@ -265,7 +265,7 @@ class OutputProcessor:
                 ))
             nvtx_pop()  # partial_readback
             return partials
-        # Opt-in: pipelined (non-blocking) read-back — emit the previous emit
+        # Opt-in: overlapped (non-blocking) read-back — emit the previous emit
         # step's partial (one-chunk lag), issue this step's async read-back for
         # collection next time.  Backlog/throughput mode.
         partials = self._collect_pending_partials()
@@ -275,7 +275,7 @@ class OutputProcessor:
         return partials
 
     def _collect_pending_partials(self) -> List[RequestOutput]:
-        """Materialise the previous emit step's pipelined read-back, if any.
+        """Materialise the previous emit step's overlapped read-back, if any.
 
         Skips requests whose stream was finalised in the meantime
         (``stream_context is None``) — their final transcript has already been
@@ -323,7 +323,7 @@ class OutputProcessor:
         ctx = request.stream_context
         assert ctx is not None, "stream_context must be allocated before decoding"
 
-        if self._config.decoder_type == "ctc_gpu":
+        if self._config.decoder_type == "ctc_cuda":
             handle = ctx.get_decoder()
             handle.decode_chunk(log_probs)
             # ``peek`` is a non-destructive D2D snapshot of the beam buffer;
@@ -370,7 +370,7 @@ class OutputProcessor:
         RequestOutput
             Final output with ``finished=True``.
         """
-        if self._config.decoder_type == "ctc_gpu":
+        if self._config.decoder_type == "ctc_cuda":
             ctx = request.stream_context
             assert ctx is not None
             handle = ctx.get_decoder()

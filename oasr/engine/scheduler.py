@@ -128,7 +128,7 @@ class Scheduler:
         """Admit waiting streaming requests up to ``max_batch_size``.
 
         Returns ``(newly_admitted, running_streams)`` — freshly-promoted
-        streams (the engine/pipeline allocates their KV cache on the first
+        streams (the engine/executor allocates their KV cache on the first
         list) and the full running pool the caller should iterate this
         step.
         """
@@ -142,7 +142,7 @@ class Scheduler:
         """Legacy compositional helper — combines :meth:`schedule_offline`
         and :meth:`schedule_streaming` into one :class:`SchedulerOutput`.
 
-        Mode-specific pipelines call the finer-grained methods directly so
+        Mode-specific executors call the finer-grained methods directly so
         they don't pay for the other mode's queue scan.  Retained for
         tests that exercise both queues in one shared scheduler instance.
         """
@@ -261,7 +261,7 @@ class Scheduler:
         """Construct one length-bucketed offline batch.
 
         Policy dispatch lives here.  The batch cap is ``max_batch_size`` —
-        one micro-batch per ``step()``, which :class:`OfflinePipeline` runs
+        one micro-batch per ``step()``, which :class:`OfflineExecutor` runs
         as a single offline forward (length-bucketed by feature length).
         Bucket tolerance is ``length_bucket_ratio``.  Requests whose
         ``waited_for`` exceeds ``max_wait_time`` become forced anchors —
@@ -270,7 +270,7 @@ class Scheduler:
 
         When ``preferred_batch_size`` is set, the final batch size is
         snapped down to a preferred value (unless force-flushed) so the
-        pipeline emits micro-batches at known graph-captured / autotuned
+        executor emits micro-batches at known graph-captured / autotuned
         widths.  Trailing requests are returned to the head of the queue
         for the next step — keeping length-similarity intact.
         """

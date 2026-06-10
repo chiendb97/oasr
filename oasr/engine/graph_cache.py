@@ -367,8 +367,8 @@ class _CapturedFeatureShape:
     padded_host_buf: torch.Tensor   # (B_bucket, T_pad) float32, pinned
     lengths_host_buf: torch.Tensor  # (B_bucket,)       int64,   pinned
     # Device buffers — captured-graph destinations for the H2D copies.
-    wav_gpu_buf: torch.Tensor       # (B_bucket, T_pad) float32, cuda
-    lengths_gpu_buf: torch.Tensor   # (B_bucket,)       int64,   cuda
+    wav_device_buf: torch.Tensor       # (B_bucket, T_pad) float32, cuda
+    lengths_device_buf: torch.Tensor   # (B_bucket,)       int64,   cuda
     # Captured output. Aliases the graph pool's output allocation; callers
     # must consume (or copy) before the next replay.
     feats_out: torch.Tensor         # (B_bucket, num_frames_max, feat_dim)
@@ -559,8 +559,8 @@ class GraphedFeatureExtraction:
             padded_host = padded_host.pin_memory()
             lengths_host = lengths_host.pin_memory()
 
-        wav_gpu = torch.zeros(bucket, T_pad, dtype=torch.float32, device=device)
-        lengths_gpu = torch.zeros(bucket, dtype=torch.int64, device=device)
+        wav_device = torch.zeros(bucket, T_pad, dtype=torch.float32, device=device)
+        lengths_device = torch.zeros(bucket, dtype=torch.int64, device=device)
 
         # Seed lengths_host with T_pad so the warmup hits the same kernel
         # tile shapes the captured replay will hit.
@@ -571,9 +571,9 @@ class GraphedFeatureExtraction:
         out_dtype = self._output_dtype
 
         def _run() -> torch.Tensor:
-            wav_gpu.copy_(padded_host, non_blocking=True)
-            lengths_gpu.copy_(lengths_host, non_blocking=True)
-            feats_f32, _ = batched_fn(wav_gpu, lengths_gpu, fcfg)
+            wav_device.copy_(padded_host, non_blocking=True)
+            lengths_device.copy_(lengths_host, non_blocking=True)
+            feats_f32, _ = batched_fn(wav_device, lengths_device, fcfg)
             return feats_f32.to(dtype=out_dtype)
 
         # Warmup once on the default stream so any one-shot kernel/workspace
@@ -589,8 +589,8 @@ class GraphedFeatureExtraction:
             graph=graph,
             padded_host_buf=padded_host,
             lengths_host_buf=lengths_host,
-            wav_gpu_buf=wav_gpu,
-            lengths_gpu_buf=lengths_gpu,
+            wav_device_buf=wav_device,
+            lengths_device_buf=lengths_device,
             feats_out=feats_out,
         )
 

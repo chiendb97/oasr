@@ -1,8 +1,8 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for ``OfflinePipeline._split_chunks`` with preferred batch sizes.
+"""Tests for ``OfflineExecutor._split_chunks`` with preferred batch sizes.
 
-Exercises the pure-Python splitter in isolation by instantiating the pipeline
+Exercises the pure-Python splitter in isolation by instantiating the executor
 with stub IO objects; no GPU / model required.
 """
 
@@ -13,14 +13,14 @@ from typing import List, Optional, Sequence
 
 import torch
 
-from oasr.engine.pipeline import OfflinePipeline
+from oasr.engine.executor import OfflineExecutor
 from oasr.engine.request import Request
 
 
-def _make_pipeline(preferred_sizes: Optional[Sequence[int]], mb: int = 8) -> OfflinePipeline:
-    """Build a pipeline with stub IO — only ``_split_chunks`` is exercised."""
+def _make_executor(preferred_sizes: Optional[Sequence[int]], mb: int = 8) -> OfflineExecutor:
+    """Build an executor with stub IO — only ``_split_chunks`` is exercised."""
     inp = SimpleNamespace(_config=SimpleNamespace(dtype=torch.float32))
-    return OfflinePipeline(
+    return OfflineExecutor(
         scheduler=SimpleNamespace(),
         input_processor=inp,
         model_runner=SimpleNamespace(),
@@ -47,27 +47,27 @@ def _chunk_sizes(chunks):
 class TestSplitChunksPreferred:
     def test_greedy_peel_to_largest_preferred(self):
         # 11 requests, preferred [4, 8], mb=8 → [8, 3] (tail < min preferred)
-        pipe = _make_pipeline(preferred_sizes=[4, 8], mb=8)
+        pipe = _make_executor(preferred_sizes=[4, 8], mb=8)
         reqs = _make_requests([i * 10 for i in range(11)])
         chunks, _ = pipe._split_chunks(reqs)
         assert _chunk_sizes(chunks) == [8, 3]
 
     def test_exact_multiple_no_tail(self):
-        pipe = _make_pipeline(preferred_sizes=[4, 8], mb=8)
+        pipe = _make_executor(preferred_sizes=[4, 8], mb=8)
         reqs = _make_requests([i * 10 for i in range(16)])
         chunks, _ = pipe._split_chunks(reqs)
         assert _chunk_sizes(chunks) == [8, 8]
 
     def test_smaller_than_max_preferred_picks_lower(self):
         # 7 requests, preferred [4, 8] — first chunk snaps to 4, tail = 3
-        pipe = _make_pipeline(preferred_sizes=[4, 8], mb=8)
+        pipe = _make_executor(preferred_sizes=[4, 8], mb=8)
         reqs = _make_requests([i * 10 for i in range(7)])
         chunks, _ = pipe._split_chunks(reqs)
         assert _chunk_sizes(chunks) == [4, 3]
 
     def test_micro_batch_caps_chunk_size(self):
         # mb=4 caps the chunk size even though preferred allows 8.
-        pipe = _make_pipeline(preferred_sizes=[4, 8], mb=4)
+        pipe = _make_executor(preferred_sizes=[4, 8], mb=4)
         reqs = _make_requests([i * 10 for i in range(12)])
         chunks, _ = pipe._split_chunks(reqs)
         assert _chunk_sizes(chunks) == [4, 4, 4]
@@ -76,7 +76,7 @@ class TestSplitChunksPreferred:
 class TestSplitChunksLegacy:
     def test_balanced_split_when_pbs_none(self):
         # 11 requests, mb=8 — legacy balance picks 2 chunks ≈ [6, 5].
-        pipe = _make_pipeline(preferred_sizes=None, mb=8)
+        pipe = _make_executor(preferred_sizes=None, mb=8)
         reqs = _make_requests([i * 10 for i in range(11)])
         chunks, _ = pipe._split_chunks(reqs)
         sizes = _chunk_sizes(chunks)
@@ -85,7 +85,7 @@ class TestSplitChunksLegacy:
         assert max(sizes) - min(sizes) <= 1
 
     def test_single_chunk_when_n_le_mb(self):
-        pipe = _make_pipeline(preferred_sizes=None, mb=8)
+        pipe = _make_executor(preferred_sizes=None, mb=8)
         reqs = _make_requests([10] * 5)
         chunks, orig = pipe._split_chunks(reqs)
         assert _chunk_sizes(chunks) == [5]
@@ -95,7 +95,7 @@ class TestSplitChunksLegacy:
 class TestSortByLength:
     def test_chunks_are_length_sorted(self):
         # Mixed lengths; chunks should land in ascending num_frames order.
-        pipe = _make_pipeline(preferred_sizes=[4], mb=8)
+        pipe = _make_executor(preferred_sizes=[4], mb=8)
         reqs = _make_requests([100, 10, 50, 200, 80, 30, 60, 20])
         chunks, orig = pipe._split_chunks(reqs)
         # 8 requests, preferred=[4] → [4, 4].

@@ -8,7 +8,7 @@ points:
 
 * ``Scheduler._build_offline_batch`` stops adding length-similar peers once
   the padded width would exceed the budget.
-* ``OfflinePipeline._split_by_frames`` re-splits an admitted pool into
+* ``OfflineExecutor._split_by_frames`` re-splits an admitted pool into
   micro-batches each under the budget, length-sorted to stay tight.
 
 Both are pure-Python and need no GPU / model.
@@ -23,7 +23,7 @@ import pytest
 import torch
 
 from oasr.engine.config import EngineConfig
-from oasr.engine.pipeline import OfflinePipeline
+from oasr.engine.executor import OfflineExecutor
 from oasr.engine.request import Request
 from oasr.engine.scheduler import Scheduler
 
@@ -54,12 +54,12 @@ def _make_offline(num_frames: int = 200) -> Request:
     return req
 
 
-def _make_pipeline(
+def _make_executor(
     *, max_batch_frames: Optional[int], mb: int = 64
-) -> OfflinePipeline:
-    """Build a pipeline with stub IO — only ``_split_chunks`` is exercised."""
+) -> OfflineExecutor:
+    """Build an executor with stub IO — only ``_split_chunks`` is exercised."""
     inp = SimpleNamespace(_config=SimpleNamespace(dtype=torch.float32))
-    return OfflinePipeline(
+    return OfflineExecutor(
         scheduler=SimpleNamespace(),
         input_processor=inp,
         model_runner=SimpleNamespace(),
@@ -143,13 +143,13 @@ class TestSchedulerFrameCap:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline frame-budget split
+# Executor frame-budget split
 # ---------------------------------------------------------------------------
 
 
 class TestSplitByFrames:
     def test_budget_respected_per_chunk(self):
-        pipe = _make_pipeline(max_batch_frames=800)
+        pipe = _make_executor(max_batch_frames=800)
         reqs = _make_requests([200] * 10)
         chunks, _ = pipe._split_chunks(reqs)
         # 200 * 4 = 800 fits; 200 * 5 = 1000 does not → chunks of 4.
@@ -158,7 +158,7 @@ class TestSplitByFrames:
             assert max(r.num_frames for r in c) * len(c) <= 800
 
     def test_length_sorted_chunks(self):
-        pipe = _make_pipeline(max_batch_frames=600)
+        pipe = _make_executor(max_batch_frames=600)
         reqs = _make_requests([100, 300, 50, 300, 100, 50])
         chunks, orig = pipe._split_chunks(reqs)
         assert orig is not None
@@ -168,7 +168,7 @@ class TestSplitByFrames:
             assert max(r.num_frames for r in c) * len(c) <= 600
 
     def test_lone_oversized_ships_alone(self):
-        pipe = _make_pipeline(max_batch_frames=500)
+        pipe = _make_executor(max_batch_frames=500)
         reqs = _make_requests([100, 100, 900, 100])
         chunks, _ = pipe._split_chunks(reqs)
         # The 900-frame utt must be in a singleton chunk.
@@ -177,7 +177,7 @@ class TestSplitByFrames:
 
     def test_micro_batch_count_cap(self):
         # Budget is generous, but mb=3 caps each chunk at 3.
-        pipe = _make_pipeline(max_batch_frames=10_000, mb=3)
+        pipe = _make_executor(max_batch_frames=10_000, mb=3)
         reqs = _make_requests([10] * 9)
         chunks, _ = pipe._split_chunks(reqs)
         assert [len(c) for c in chunks] == [3, 3, 3]
