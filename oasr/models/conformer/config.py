@@ -49,7 +49,7 @@ class ConformerEncoderConfig:
     # Activation (Conformer typically uses swish)
     activation_type: str = "swish"
 
-    # Input layer: "conv2d", "linear", "conv2d6", "conv2d8"
+    # Input layer / subsampling: "conv2d" (4x), "conv2d2", "conv2d6", "conv2d8"
     input_layer: str = "conv2d"
     # Whether to apply LayerNorm after the embed linear projection
     embed_layer_norm: bool = True
@@ -66,8 +66,7 @@ class ConformerModelConfig(BaseModelConfig):
     """Top-level Conformer model config (encoder + CTC head)."""
 
     model_type: str = "conformer"
-    encoder: ConformerEncoderConfig = field(
-        default_factory=ConformerEncoderConfig)
+    encoder: ConformerEncoderConfig = field(default_factory=ConformerEncoderConfig)
     # For ASR: vocab_size for the CTC head (inherited from BaseModelConfig).
 
     @property
@@ -96,5 +95,6 @@ class ConformerModelConfig(BaseModelConfig):
         """Build from a dict (e.g. HuggingFace config)."""
         encoder_dict = d.get("encoder", d)
         encoder = ConformerEncoderConfig(
-            **{k: v for k, v in encoder_dict.items() if hasattr(ConformerEncoderConfig, k)})
+            **{k: v for k, v in encoder_dict.items() if hasattr(ConformerEncoderConfig, k)}
+        )
         return cls(encoder=encoder, vocab_size=d.get("vocab_size"))

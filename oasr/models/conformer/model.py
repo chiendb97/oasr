@@ -13,13 +13,14 @@ import torch.nn.functional as F
 from torch import nn
 
 import oasr
-from oasr.layers.linear import Linear, LinearActivation
-from oasr.layers.conv import PointwiseConv1d, DepthwiseConv1d, Conv2dActivation
-from oasr.layers.norm import LayerNorm, GlobalCMVN
 from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.slot_cnn import SlotCnnCache
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention
+from oasr.layers.conv import Conv2dActivation, DepthwiseConv1d, PointwiseConv1d
+from oasr.layers.linear import Linear, LinearActivation
+from oasr.layers.norm import GlobalCMVN, LayerNorm
 from oasr.utils import get_norm, get_norm_activation
+
 from ..base import BaseAsrModel, BaseEncoder
 from ..heads.ctc import CTCHead
 from .config import ConformerEncoderConfig, ConformerModelConfig
@@ -276,8 +277,36 @@ class RelPositionalEncoding(nn.Module):
         return torch.nn.functional.embedding(index, self.pe[0])
 
 
+# (kernel_size, stride) per Conv2d layer, applied to both the time (H) and
+# frequency (W) axes.  The first layer always has ``in_channels == 1``; the
+# rest have ``in_channels == out_channels == odim``.  These mirror WeNet's
+# Conv2dSubsampling{4,6,8}; rate 2 is the natural single-conv generalization
+# (WeNet's own 2x subsampler is 1-D, for Whisper).  Rate 1 = no convolution
+# (linear-only).
+_SUBSAMPLING_CONV_SPECS = {
+    1: (),
+    2: ((3, 2),),
+    4: ((3, 2), (3, 2)),
+    6: ((3, 2), (5, 3)),
+    8: ((3, 2), (3, 2), (3, 2)),
+}
+
+
 class Conv2dSubsampling(nn.Module):
-    """Conv2d subsampling module (e.g. 4x) + linear + positional encoding (WeNet Conv2dSubsampling4)."""
+    """Conv2d subsampling + linear + positional encoding (WeNet).
+
+    Stacks ``Conv2d -> ReLU`` blocks (fused via CUTLASS in NHWC layout) to
+    subsample the time axis by ``subsampling_rate`` (1/2/4/6/8), flattens the
+    surviving frequency bins into the channel axis, and projects to ``odim``
+    with an optional ``LayerNorm``.  ``subsampling_rate == 1`` is the
+    no-convolution (linear-only) case.
+
+    The convolution stack, the embed-linear input dimension, the temporal
+    ``right_context`` and the per-layer mask stride are all derived from
+    :data:`_SUBSAMPLING_CONV_SPECS`, so the WeNet variants differ only by their
+    spec.  Named subclasses (:class:`Conv2dSubsampling2`,
+    :class:`Conv2dSubsampling4`, ...) pin the rate.
+    """
 
     # v2 = ``self.out[0].weight`` columns reordered from WeNet's ``(C, F)``
     # c-major flatten to NHWC's natural ``(F, C)`` f-major flatten so the
@@ -292,29 +321,47 @@ class Conv2dSubsampling(nn.Module):
         embed_layer_norm: bool = True,
     ):
         super().__init__()
+        if subsampling_rate not in _SUBSAMPLING_CONV_SPECS:
+            raise NotImplementedError(
+                f"subsampling_rate={subsampling_rate} "
+                f"(supported: {sorted(_SUBSAMPLING_CONV_SPECS)})"
+            )
         self.pos_enc = RelPositionalEncoding(
             odim,
             max_len=5000,
         )
 
         self.subsampling_rate = subsampling_rate
-        if subsampling_rate == 4:
-            # Both convs use fused conv + ReLU via CUTLASS Ampere Tensor Core
-            # Implicit GEMM (NHWC layout). IC=1 uses kAnalytic iterator.
-            self.conv1 = Conv2dActivation(1, odim, 3, stride=2, activation_type="relu")
-            self.conv2 = Conv2dActivation(odim, odim, 3, stride=2, activation_type="relu")
-            self.linear_dim = odim * (((idim - 1) // 2 - 1) // 2)
-        elif subsampling_rate == 1:
-            self.conv1 = None
-            self.conv2 = None
-            self.linear_dim = idim
-        else:
-            raise NotImplementedError(f"subsampling_rate={subsampling_rate}")
+        self._conv_specs = _SUBSAMPLING_CONV_SPECS[subsampling_rate]
+
+        # Build the Conv2d -> ReLU stack.  Each conv fuses ReLU via CUTLASS
+        # Ampere Tensor Core Implicit GEMM (NHWC layout).  The first conv has
+        # IC=1 (kAnalytic iterator); subsequent convs have IC=odim.  Both axes
+        # share the same kernel/stride, matching WeNet.
+        convs: List[nn.Module] = []
+        in_ch = 1
+        freq = idim
+        for kernel, stride in self._conv_specs:
+            convs.append(
+                Conv2dActivation(in_ch, odim, kernel, stride=stride, activation_type="relu")
+            )
+            in_ch = odim
+            freq = (freq - kernel) // stride + 1
+        self.convs = nn.ModuleList(convs)
+        self.linear_dim = odim * freq if convs else idim
+
         layers = [Linear(self.linear_dim, odim)]
         if embed_layer_norm:
             layers.append(LayerNorm(odim, eps=1e-5))
         self.out = nn.Sequential(*layers)
-        self.right_context = 6 if subsampling_rate == 4 else 0
+
+        # right_context = sum_l (kernel_l - 1) * (product of strides before l).
+        right_context = 0
+        rate = 1
+        for kernel, stride in self._conv_specs:
+            right_context += (kernel - 1) * rate
+            rate *= stride
+        self.right_context = right_context
 
     def _load_from_state_dict(
         self,
@@ -328,29 +375,35 @@ class Conv2dSubsampling(nn.Module):
     ):
         """Remap legacy keys and reorder the embed-linear weight.
 
-        * Old ``nn.Sequential`` layout:
-          ``conv.0.{weight,bias}`` → ``conv1.{weight,bias}``;
-          ``conv.2.{weight,bias}`` → ``conv2.{weight,bias}``.
+        * Conv keys: WeNet stores the conv stack as an ``nn.Sequential``
+          (``conv.0``, ``conv.2``, ... with ReLU at the odd indices); older
+          OASR checkpoints used per-conv attributes (``conv1``, ``conv2``,
+          ...).  Both map onto this module's ``convs.{i}`` ModuleList.
           (Conv2dActivation's own ``_load_from_state_dict`` handles the
           ``[K, IC, R, S] → [K, R, S, IC]`` weight permutation.)
+        * Linear key: WeNet's 6x/8x subsamplers use a bare ``linear`` rather
+          than the 4x ``out.0``; remap it onto ``out.0``.
         * v1 → v2: the embed linear ``self.out[0].weight`` was trained
           against a ``(C, F)`` c-major flatten of the NHWC conv output.
           We now flatten in NHWC-natural ``(F, C)`` order at runtime, so
           we permute the weight's input axis on load.  Driven by
           ``local_metadata['version']`` (``< 2`` ⇒ legacy).
         """
-        remap = {
-            prefix + "conv.0.weight": prefix + "conv1.weight",
-            prefix + "conv.0.bias": prefix + "conv1.bias",
-            prefix + "conv.2.weight": prefix + "conv2.weight",
-            prefix + "conv.2.bias": prefix + "conv2.bias",
-        }
+        remap = {}
+        for i in range(len(self.convs)):
+            for suffix in ("weight", "bias"):
+                # WeNet Sequential index (ReLU occupies the odd indices).
+                remap[prefix + f"conv.{2 * i}.{suffix}"] = prefix + f"convs.{i}.{suffix}"
+                # Legacy OASR per-conv attribute name (1-based).
+                remap[prefix + f"conv{i + 1}.{suffix}"] = prefix + f"convs.{i}.{suffix}"
+        for suffix in ("weight", "bias"):
+            remap[prefix + f"linear.{suffix}"] = prefix + f"out.0.{suffix}"
         for old_key, new_key in remap.items():
             if old_key in state_dict:
                 state_dict[new_key] = state_dict.pop(old_key)
 
         version = local_metadata.get("version", 1)
-        if version < 2 and self.conv1 is not None:
+        if version < 2 and len(self.convs) > 0:
             out_w_key = prefix + "out.0.weight"
             if out_w_key in state_dict:
                 w = state_dict[out_w_key]  # (odim, C*F)
@@ -381,18 +434,60 @@ class Conv2dSubsampling(nn.Module):
         x_mask: torch.Tensor,
         offset: Union[int, torch.Tensor] = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.conv1 is not None:
-            x = x.unsqueeze(-1)  # [N, T,   F,  1   ] NHWC
-            x = self.conv1(x)  # [N, T',  F', odim] NHWC (fused ReLU)
-            x = self.conv2(x)  # [N, T'', F'', odim] NHWC (fused ReLU)
+        if len(self.convs) > 0:
+            x = x.unsqueeze(-1)  # [N, T, F, 1] NHWC
+            for conv in self.convs:
+                x = conv(x)  # [N, T', F', odim] NHWC (fused ReLU)
             b, t, f, c = x.size()
             # NHWC-natural flatten: inner index is (f, c).  The embed
             # linear's input axis is permuted at load time to match.
             x = x.reshape(b, t, f * c)
-            x_mask = x_mask[:, :, 2::2][:, :, 2::2]
+            # Subsample the time mask the same way each conv subsamples the
+            # time axis: a kernel-k stride-s conv keeps frames ``k-1::s``.
+            for kernel, stride in self._conv_specs:
+                x_mask = x_mask[:, :, kernel - 1 :: stride]
         x = self.out(x)
         x, pos_emb = self.pos_enc(x, offset)
         return x, pos_emb, x_mask
+
+
+class Conv2dSubsampling2(Conv2dSubsampling):
+    """Conv2d subsampling to 1/2 length (single 3x3 stride-2 conv)."""
+
+    def __init__(self, idim: int, odim: int, embed_layer_norm: bool = True):
+        super().__init__(idim, odim, subsampling_rate=2, embed_layer_norm=embed_layer_norm)
+
+
+class Conv2dSubsampling4(Conv2dSubsampling):
+    """Conv2d subsampling to 1/4 length (WeNet Conv2dSubsampling4)."""
+
+    def __init__(self, idim: int, odim: int, embed_layer_norm: bool = True):
+        super().__init__(idim, odim, subsampling_rate=4, embed_layer_norm=embed_layer_norm)
+
+
+class Conv2dSubsampling6(Conv2dSubsampling):
+    """Conv2d subsampling to 1/6 length (WeNet Conv2dSubsampling6)."""
+
+    def __init__(self, idim: int, odim: int, embed_layer_norm: bool = True):
+        super().__init__(idim, odim, subsampling_rate=6, embed_layer_norm=embed_layer_norm)
+
+
+class Conv2dSubsampling8(Conv2dSubsampling):
+    """Conv2d subsampling to 1/8 length (WeNet Conv2dSubsampling8)."""
+
+    def __init__(self, idim: int, odim: int, embed_layer_norm: bool = True):
+        super().__init__(idim, odim, subsampling_rate=8, embed_layer_norm=embed_layer_norm)
+
+
+# WeNet ``input_layer`` strings -> subsampling class.  ``"conv2d"`` is the 4x
+# default; the rate-suffixed names select the matching subsampler.
+_INPUT_LAYER_SUBSAMPLING = {
+    "conv2d2": Conv2dSubsampling2,
+    "conv2d": Conv2dSubsampling4,
+    "conv2d4": Conv2dSubsampling4,
+    "conv2d6": Conv2dSubsampling6,
+    "conv2d8": Conv2dSubsampling8,
+}
 
 
 # -----------------------------------------------------------------------------
@@ -595,15 +690,14 @@ class ConformerEncoder(BaseEncoder):
         self._output_size = config.output_size
         # Depthwise-conv left-context kernel for streaming; 1 == no CNN cache.
         self._conv_kernel_size = config.cnn_module_kernel if config.use_cnn_module else 1
-        if config.input_layer == "conv2d":
-            self.embed = Conv2dSubsampling(
-                config.input_size,
-                config.output_size,
-                subsampling_rate=4,
-                embed_layer_norm=config.embed_layer_norm,
-            )
-        else:
+        subsampling_cls = _INPUT_LAYER_SUBSAMPLING.get(config.input_layer)
+        if subsampling_cls is None:
             raise NotImplementedError(f"input_layer={config.input_layer}")
+        self.embed = subsampling_cls(
+            config.input_size,
+            config.output_size,
+            embed_layer_norm=config.embed_layer_norm,
+        )
         self.normalize_before = config.normalize_before
         self.final_norm = config.final_norm
         self.after_norm = get_norm(config.layer_norm_type)(config.output_size, eps=config.norm_eps)
