@@ -79,14 +79,14 @@ class ModelRunner:
             and bool(getattr(config, "use_ctc_cuda_graphs", True))
             and torch.device(config.device).type == "cuda"
         )
-        if config.decoder_type == "ctc_gpu":
+        if config.decoder_type == "ctc_cuda":
             self._ctc_mgr: CtcStateCacheManager = CtcStateCacheManager(
-                config.gpu_decoder_config,
+                config.ctc_decoder_config,
                 use_cuda_graphs=ctc_graphs_enabled,
             )
         else:
             self._ctc_mgr = CtcStateCacheManager(
-                config.gpu_decoder_config,
+                config.ctc_decoder_config,
                 use_cuda_graphs=ctc_graphs_enabled,
             )
 
@@ -407,7 +407,7 @@ class ModelRunner:
             s is not None for s in slot_ids_host
         ), "all batched streams must have an allocated slot_id"
         device = self._att_mgr.block_table.device
-        slot_ids_gpu = torch.tensor(slot_ids_host, dtype=torch.long, device=device)
+        slot_ids_device = torch.tensor(slot_ids_host, dtype=torch.long, device=device)
 
         # 1. Prepare per-stream write blocks — one allocator call + one
         #    scatter onto the persistent block_table.
@@ -423,11 +423,11 @@ class ModelRunner:
             req.feature_buffer[req.feature_cursor : req.feature_cursor + window] for req in group
         ]
         xs = torch.stack(feature_chunks, dim=0)  # (B, window, F)
-        cnn_cache = SlotCnnCache(buffer=self._cnn_mgr.buffer, slot_ids=slot_ids_gpu)
+        cnn_cache = SlotCnnCache(buffer=self._cnn_mgr.buffer, slot_ids=slot_ids_device)
 
         # 3. Per-stream encoder-frame offsets (always a tensor for the
         #    graphed path; the eager fallback accepts the same tensor).
-        offsets_gpu = torch.tensor(
+        offsets_device = torch.tensor(
             [req.offset for req in group],
             dtype=torch.int32,
             device=device,
@@ -448,16 +448,16 @@ class ModelRunner:
                 xs.size(1),
                 cache_t1_bucket,
                 xs=xs,
-                slot_ids=slot_ids_gpu,
-                offsets=offsets_gpu,
+                slot_ids=slot_ids_device,
+                offsets=offsets_device,
             )
         if log_probs is None:
-            batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_gpu)
+            batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_device)
             for c in batched_att_caches:
                 c.host_seqlen_max = max_offset
             log_probs = self._model.forward_chunk_paged(
                 xs,
-                offsets_gpu,
+                offsets_device,
                 batched_att_caches,
                 cnn_cache,
                 cache_t1=max_offset,
@@ -538,9 +538,9 @@ class ModelRunner:
         self._att_mgr.prepare_chunks_batched([req.stream_id])  # type: ignore[arg-type]
 
         device = self._att_mgr.block_table.device
-        slot_ids_gpu = torch.tensor([req.slot_id], dtype=torch.long, device=device)
-        offsets_gpu = torch.tensor([req.offset], dtype=torch.int32, device=device)
-        cnn_cache = SlotCnnCache(buffer=self._cnn_mgr.buffer, slot_ids=slot_ids_gpu)
+        slot_ids_device = torch.tensor([req.slot_id], dtype=torch.long, device=device)
+        offsets_device = torch.tensor([req.offset], dtype=torch.int32, device=device)
+        cnn_cache = SlotCnnCache(buffer=self._cnn_mgr.buffer, slot_ids=slot_ids_device)
 
         cache_t1_bucket = round_up_bucket(req.offset)
         nvtx_push("single.encoder_call")
@@ -564,16 +564,16 @@ class ModelRunner:
                 chunk.size(1),
                 cache_t1_bucket,
                 xs=chunk,
-                slot_ids=slot_ids_gpu,
-                offsets=offsets_gpu,
+                slot_ids=slot_ids_device,
+                offsets=offsets_device,
             )
         if log_probs is None:
-            batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_gpu)
+            batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_device)
             for c in batched_att_caches:
                 c.host_seqlen_max = req.offset
             log_probs = self._model.forward_chunk_paged(
                 chunk,
-                offsets_gpu,
+                offsets_device,
                 batched_att_caches,
                 cnn_cache,
                 cache_t1=req.offset,

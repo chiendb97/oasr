@@ -77,7 +77,7 @@ class SchedulerOutput:
 
 The engine's step loop reads:
 
-- `offline_batch` → forwarded through `OfflinePipeline.run` and finalised.
+- `offline_batch` → forwarded through `OfflineExecutor.run` and finalised.
 - `newly_admitted` (streaming subset) → `ModelRunner.allocate_stream`.
 - `running_streams` → drives the per-step fbank-extract / forward / decode
   passes; the engine, not the scheduler, decides per request whether to
@@ -251,7 +251,7 @@ When set, `preferred_batch_size` also:
   latency on the request path.
 - Defaults `feature_graph_batch_buckets` to the same list, so the
   encoder graph cache and the feature graph cache share one B ladder.
-- Snaps `OfflinePipeline._split_chunks` to the preferred sizes — each
+- Snaps `Scheduler.split_offline_batch` to the preferred sizes — each
   micro-batch is the largest preferred value `<= remaining`, falling
   back to the remainder for the (rare) trailing odd chunk.
 
@@ -395,7 +395,7 @@ while sched.has_pending():
    cohort boundaries — measure both on your traffic before deciding.
 6. **Offline admission is one `max_batch_size` batch per step.**
    The scheduler admits a single length-bucketed batch of up to
-   `max_batch_size` requests, which `OfflinePipeline` runs as one offline
+   `max_batch_size` requests, which `OfflineExecutor` runs as one offline
    forward (GPU fbank → forward → decode). For larger batches, raise
    `max_batch_size`.
 

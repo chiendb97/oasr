@@ -1,6 +1,6 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Chunk-by-chunk streaming pipeline with paged KV cache."""
+"""Chunk-by-chunk streaming executor with paged KV cache."""
 
 from __future__ import annotations
 
@@ -17,13 +17,13 @@ from ..model_runner import ModelRunner
 from ..output_processor import OutputProcessor
 from ..request import Request, RequestOutput
 from ..scheduler import Scheduler
-from .base import Pipeline
+from .base import Executor
 
 
-class StreamingPipeline(Pipeline):
+class StreamingExecutor(Executor):
     """Streaming inference with one encoder chunk per active stream per tick.
 
-    See :class:`oasr.engine.pipeline.base.Pipeline` for the per-tick
+    See :class:`oasr.engine.executor.base.Executor` for the per-tick
     protocol.  Each :meth:`step`:
 
     1. Admits waiting streams up to ``max_batch_size`` and allocates their
@@ -70,7 +70,7 @@ class StreamingPipeline(Pipeline):
         )
 
     # ------------------------------------------------------------------
-    # Pipeline ABC
+    # Executor ABC
     # ------------------------------------------------------------------
 
     def admit(self, request: Request) -> None:

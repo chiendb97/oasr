@@ -77,13 +77,12 @@ def _make_patched_engine():
     engine._output_processor = MagicMock()
     engine._model = MagicMock()
 
-    # Real streaming pipeline over the real scheduler + mocked collaborators so
-    # admit / feed_chunk / abort / num_* route through ``self._pipeline`` exactly
-    # as in production (the engine delegates everything through it; the
-    # model-abstraction refactor replaced the old ``_offline_pipeline`` attr).
-    from oasr.engine.pipeline import StreamingPipeline
+    # Real streaming executor over the real scheduler + mocked collaborators so
+    # admit / feed_chunk / abort / num_* route through ``self._executor`` exactly
+    # as in production (the engine delegates everything through it).
+    from oasr.engine.executor import StreamingExecutor
 
-    engine._pipeline = StreamingPipeline(
+    engine._executor = StreamingExecutor(
         scheduler=engine._scheduler,
         input_processor=engine._input_processor,
         model_runner=engine._model_runner,

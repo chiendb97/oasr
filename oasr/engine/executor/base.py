@@ -1,21 +1,20 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Pipeline abstract base class.
+"""Executor abstract base class.
 
 The engine runs in exactly one mode per service lifecycle — streaming OR
-offline, never both.  A :class:`Pipeline` encapsulates everything
+offline, never both.  An :class:`Executor` encapsulates everything
 mode-specific: admission, per-tick orchestration (fbank, forward, decode,
 finalise), and cache lifecycle.  The engine itself is mode-agnostic and
-delegates each public entry point to ``self._pipeline``.
+delegates each public entry point to ``self._executor``.
 
 Concrete implementations:
 
-* :class:`oasr.engine.pipeline.OfflinePipeline` — length-bucketed
-  micro-batches with depth-N CPU/GPU overlap; one final output per request
+* :class:`oasr.engine.executor.OfflineExecutor` — length-bucketed
+  micro-batches (optionally sequence-packed); one final output per request
   when its micro-batch drains.
-* :class:`oasr.engine.pipeline.StreamingPipeline` — chunk-by-chunk per
+* :class:`oasr.engine.executor.StreamingExecutor` — chunk-by-chunk per
   stream with paged KV cache; partial outputs per tick, final on drain.
-  (Added in step 3 of the refactor.)
 """
 
 from __future__ import annotations
@@ -29,10 +28,10 @@ import torch
 from ..request import Request, RequestOutput
 
 
-class Pipeline(ABC):
-    """Abstract per-tick pipeline for streaming or offline inference."""
+class Executor(ABC):
+    """Abstract per-tick executor for streaming or offline inference."""
 
-    #: Class-level mode tag.  ``True`` for streaming pipelines, ``False``
+    #: Class-level mode tag.  ``True`` for streaming executors, ``False``
     #: for offline.  Used by :meth:`ASREngine.add_request` to validate that
     #: incoming requests match the configured service mode.
     streaming: ClassVar[bool]
@@ -59,8 +58,8 @@ class Pipeline(ABC):
     ) -> None:
         """Push one audio chunk into a streaming request.
 
-        Streaming pipelines append the chunk to the request's audio deque.
-        Offline pipelines raise :class:`NotImplementedError`.
+        Streaming executors append the chunk to the request's audio deque.
+        Offline executors raise :class:`NotImplementedError`.
         """
 
     @abstractmethod
@@ -75,9 +74,9 @@ class Pipeline(ABC):
     def step(self) -> List[RequestOutput]:
         """Execute one engine tick worth of work; return any outputs.
 
-        Streaming pipelines emit partial outputs per active stream and
+        Streaming executors emit partial outputs per active stream and
         final outputs for streams whose audio has been fully consumed.
-        Offline pipelines emit one final output per request when its
+        Offline executors emit one final output per request when its
         micro-batch drains.  May return an empty list when no work is
         ready.
         """

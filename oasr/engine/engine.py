@@ -22,11 +22,10 @@ from .graph_cache import round_up_bucket
 from .input_processor import InputProcessor
 from .model_runner import ModelRunner
 from .output_processor import OutputProcessor
-from .pipeline import (
-    OfflinePipeline,
-    PackingPipeline,
-    Pipeline,
-    StreamingPipeline,
+from .executor import (
+    Executor,
+    OfflineExecutor,
+    StreamingExecutor,
 )
 from .request import Request, RequestOutput
 from .scheduler import Scheduler
@@ -43,13 +42,13 @@ class ASREngine:
     single-pass forward, one final output per request) — never both
     within the same lifecycle.
 
-    The engine is a thin orchestrator over one :class:`Pipeline`
+    The engine is a thin orchestrator over one :class:`Executor`
     instance: every public entry (``add_*``, ``feed_chunk``, ``abort``,
-    ``step``, ``run``, status) routes through ``self._pipeline``.
+    ``step``, ``run``, status) routes through ``self._executor``.
     Throughput features land either as shared changes to
     :class:`InputProcessor` / :class:`ModelRunner` /
-    :class:`OutputProcessor` (picked up by either pipeline) or as
-    explicit, deliberate changes to a single pipeline implementation —
+    :class:`OutputProcessor` (picked up by either executor) or as
+    explicit, deliberate changes to a single executor implementation —
     the two modes never share dead branches.
 
     Parameters
@@ -120,14 +119,14 @@ class ASREngine:
         self._model_runner = ModelRunner(model, config, cache_config, graph_pool=self._graph_pool)
         self._output_processor = OutputProcessor(config, decode_type=model.decode_type)
 
-        # Build exactly one pipeline matching ``config.service_mode``.
+        # Build exactly one executor matching ``config.service_mode``.
         # The other mode's machinery (paged KV cache vs. persistent
         # producer thread) never wakes up, so there's no point paying
         # the construction cost or holding the dead references.  All
         # three building-block singletons (``InputProcessor`` /
         # ``ModelRunner`` / ``OutputProcessor``) are still shared so
         # throughput features land in one place regardless of mode.
-        self._pipeline: Pipeline = self._build_pipeline(config)
+        self._executor: Executor = self._build_executor(config)
 
         # Pre-warm the streaming encoder CUDA-Graph cache over a (B, cache_t1)
         # ladder so a live stream never pays a blocking lazy capture
@@ -241,7 +240,7 @@ class ASREngine:
         Both paths defer actual feature extraction until the engine step
         loop can batch it: streaming ingests audio **chunk by chunk** inside
         ``step()`` (batched across all active streams in one GPU fbank
-        call), and the offline pipeline batches fbank within each GPU
+        call), and the offline executor batches fbank within each GPU
         micro-batch.  What :meth:`add_request` does synchronously is load
         the waveform, stamp a cheap but exact (Kaldi ``snip_edges``
         formula) frame count so the scheduler can bucket by length, and
@@ -284,7 +283,7 @@ class ASREngine:
             return req.request_id
         with self._lock:
             self._validate_mode(streaming)
-            self._pipeline.admit(req)
+            self._executor.admit(req)
         return req.request_id
 
     def add_requests_batch(self, specs: List[Dict]) -> List[str]:
@@ -327,7 +326,7 @@ class ASREngine:
                     priority=priority,
                 )
                 self._validate_mode(streaming)
-                self._pipeline.admit(req)
+                self._executor.admit(req)
                 request_ids.append(req.request_id)
         return request_ids
 
@@ -356,7 +355,7 @@ class ASREngine:
                 sample_rate=int(spec.get("sample_rate", 16000)),
                 priority=int(spec.get("priority", 0)),
             )
-            self._validate_mode(req.streaming)  # reads immutable pipeline.streaming
+            self._validate_mode(req.streaming)  # reads immutable executor.streaming
             reqs.append(req)
             request_ids.append(req.request_id)
         with self._admit_inflight_lock:
@@ -425,7 +424,7 @@ class ASREngine:
         for b in sorted({int(s) for s in sizes if int(s) >= 1}):
             reqs: List[Request] = []
             for _ in range(b):
-                # collate_gpu reads ``request.audio`` directly (the canonical
+                # collate reads ``request.audio`` directly (the canonical
                 # waveform ``prepare_offline`` would have produced), so seed it.
                 reqs.append(
                     Request(
@@ -434,7 +433,7 @@ class ASREngine:
                         sample_rate=16000,
                     )
                 )
-            feats, lengths = self._input_processor.collate_gpu(reqs)
+            feats, lengths = self._input_processor.collate(reqs)
             log_probs, out_len = self._model_runner.forward_offline(feats, lengths)
             self._output_processor.decode_offline(log_probs, out_len)
         torch.cuda.synchronize()
@@ -476,7 +475,7 @@ class ASREngine:
         )
         with self._lock:
             self._validate_mode(True)
-            self._pipeline.admit(req)
+            self._executor.admit(req)
         return req.request_id
 
     def feed_chunk(
@@ -507,23 +506,23 @@ class ASREngine:
         already been finalised.
         """
         with self._lock:
-            # ``OfflinePipeline.feed_chunk`` raises ``NotImplementedError``,
+            # ``OfflineExecutor.feed_chunk`` raises ``NotImplementedError``,
             # so this also serves as the mode check on offline engines.
-            self._pipeline.feed_chunk(request_id, chunk, is_last=is_last)
+            self._executor.feed_chunk(request_id, chunk, is_last=is_last)
 
     def abort_request(self, request_id: str) -> None:
         """Remove a request from the engine, freeing cache if allocated."""
         with self._lock:
-            self._pipeline.abort(request_id)
+            self._executor.abort(request_id)
 
     # ------------------------------------------------------------------
-    # Internal — pipeline construction and mode validation
+    # Internal — executor construction and mode validation
     # ------------------------------------------------------------------
 
-    def _build_pipeline(self, config: EngineConfig) -> Pipeline:
-        """Construct the single pipeline matching ``config.service_mode``."""
+    def _build_executor(self, config: EngineConfig) -> Executor:
+        """Construct the single executor matching ``config.service_mode``."""
         if config.service_mode == "streaming":
-            return StreamingPipeline(
+            return StreamingExecutor(
                 scheduler=self._scheduler,
                 input_processor=self._input_processor,
                 model_runner=self._model_runner,
@@ -531,28 +530,18 @@ class ASREngine:
                 config=config,
                 device=self._device,
             )
-        common = dict(
+        # Offline: the scheduler partitions each batch into micro-batches
+        # (length-bucketed, padded-frame-capped, or sequence-packed — all
+        # driven by ``EngineConfig``).  The executor only needs ``enable_packing``
+        # to pick the forward variant; it stays consistent with the scheduler's
+        # partitioner because both read the same config flag.
+        return OfflineExecutor(
             scheduler=self._scheduler,
             input_processor=self._input_processor,
             model_runner=self._model_runner,
             output_processor=self._output_processor,
-            micro_batch_size=int(config.max_batch_size),
             device=self._device,
-            preferred_sizes=config.preferred_batch_size,
-        )
-        if config.enable_sequence_packing:
-            # Sequence packing: gapless varlen attention, summed-frame budget.
-            return PackingPipeline(
-                max_packed_frames=int(config.max_packed_frames),
-                subsampling_rate=config.subsampling_rate,
-                **common,
-            )
-        # Length-aware batching: plain padded offline forward with a
-        # padded-frame cap (``max_len * count``) driving micro-batch formation.
-        # ``None`` falls back to count-based micro-batching.
-        return OfflinePipeline(
-            max_batch_frames=config.max_batch_frames,
-            **common,
+            enable_packing=config.enable_sequence_packing,
         )
 
     def _validate_mode(self, streaming: bool) -> None:
@@ -560,12 +549,12 @@ class ASREngine:
         doesn't match ``config.service_mode``.
 
         Routing a mismatched request would silently land it in the wrong
-        pipeline (offline ``admit`` on a streaming engine would just
+        executor (offline ``admit`` on a streaming engine would just
         never run; streaming ``admit`` on an offline engine would
         produce empty outputs).  Surface the error eagerly so the caller
         can re-deploy with the right ``service_mode``.
         """
-        if streaming != self._pipeline.streaming:
+        if streaming != self._executor.streaming:
             raise ValueError(
                 f"Request streaming={streaming} does not match configured "
                 f"service_mode={self._config.service_mode!r}.  The engine "
@@ -578,14 +567,14 @@ class ASREngine:
     # ------------------------------------------------------------------
 
     def step(self) -> List[RequestOutput]:
-        """Execute one engine step — one call into the configured pipeline."""
+        """Execute one engine step — one call into the configured executor."""
         with self._lock:
             if self._overlap_admit:
                 # Admit requests the prep thread finished preparing since the
                 # last step (cheap scheduler enqueue under the lock we hold).
                 self._drain_prepared()
             nvtx_push("engine.step")
-            outputs = self._pipeline.step()
+            outputs = self._executor.step()
             nvtx_pop()
             return outputs
 
@@ -606,7 +595,7 @@ class ASREngine:
             return self._run_overlapped()
         with self._lock:
             final_outputs: List[RequestOutput] = []
-            while self._pipeline.has_pending():
+            while self._executor.has_pending():
                 step_outputs = self.step()
                 final_outputs.extend(o for o in step_outputs if o.finished)
             return final_outputs
@@ -620,7 +609,7 @@ class ASREngine:
             step_outputs = self.step()
             final_outputs.extend(o for o in step_outputs if o.finished)
             with self._lock:
-                pending = self._pipeline.has_pending()
+                pending = self._executor.has_pending()
             if not pending and self._num_admit_inflight() == 0:
                 break
             if not step_outputs and not pending:
@@ -674,7 +663,7 @@ class ASREngine:
         """Batch transcription convenience — :meth:`transcribe` with
         ``streaming=False``.
 
-        Inputs flow through the dynamic-batching offline pipeline
+        Inputs flow through the dynamic-batching offline executor
         (length-bucketed micro-batches, CPU/GPU overlap).  Use this when
         real-time partials are not needed — it's strictly faster than the
         streaming path on the same audio.
@@ -690,26 +679,26 @@ class ASREngine:
         """Currently-active requests.
 
         For streaming mode: streams admitted to the running pool.  For
-        offline mode: requests submitted to the persistent pipeline but
+        offline mode: requests submitted to the persistent executor but
         not yet drained back as outputs.  In both cases the Rust
         dispatcher uses ``num_running + num_waiting`` to decide whether
         to skip a step / enter an idle wait, so the count must include
         any work still in flight.
         """
         with self._lock:
-            return self._pipeline.num_running()
+            return self._executor.num_running()
 
     @property
     def num_waiting(self) -> int:
         """Requests in the waiting queue (admission pending).
 
-        Includes requests accepted into the admission-prep pipeline but not yet
+        Includes requests accepted into the admission-prep queue but not yet
         visible to the scheduler (``overlap_admit``), so callers — notably the
         Rust dispatcher's idle check — don't treat the engine as idle while
         admission prep is still in flight.
         """
         with self._lock:
-            n = self._pipeline.num_waiting()
+            n = self._executor.num_waiting()
         if self._overlap_admit:
             n += self._num_admit_inflight()
         return n

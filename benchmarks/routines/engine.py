@@ -11,8 +11,8 @@ Metrics
 
 Subroutines
 -----------
-* ``offline``         — ``ASREngine.transcribe_offline`` (batch forward, ctc_gpu).
-* ``streaming``       — ``ASREngine.transcribe`` (chunk-by-chunk, ctc_gpu).
+* ``offline``         — ``ASREngine.transcribe_offline`` (batch forward, ctc_cuda).
+* ``streaming``       — ``ASREngine.transcribe`` (chunk-by-chunk, ctc_cuda).
 * ``offline_wfst``    — offline path with WFST decoder (requires --wfst-path).
 * ``streaming_wfst``  — streaming path with WFST decoder (requires --wfst-path).
 """
@@ -400,7 +400,7 @@ def _run_config(
     n = len(waveforms)
     avg_dur = sum(durations) / n
 
-    decoder_type = "ctc_wfst" if is_wfst else "ctc_gpu"
+    decoder_type = "ctc_wfst" if is_wfst else "ctc_cuda"
     dtype_str = {torch.float16: "float16", torch.bfloat16: "bfloat16",
                  torch.float32: "float32"}.get(dtype, "float16")
 

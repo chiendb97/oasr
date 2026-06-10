@@ -18,7 +18,7 @@ cache) work in one pool, with length-aware bucketing and CPU/GPU overlap.
 2. **Owning shared GPU resources** — the paged KV block pool, CNN cache
    manager, CTC state manager — through `ModelRunner`.
 3. **Routing requests** through the scheduler into either the offline
-   pipeline or the streaming step path.
+   executor or the streaming step path.
 4. **Driving the step loop**: schedule → ingest fbank → forward → decode
    → finalise.
 5. **Exposing a high-level API**:
@@ -47,7 +47,7 @@ The engine no longer has a separate `OfflineEngine` subclass — pass
    │           │                  │                           │
    │           │   ┌──────────────┴────────────┐              │
    │           │   ▼                           ▼              │
-   │           │ OfflinePipeline       streaming step path    │
+   │           │ OfflineExecutor       streaming step path    │
    │           │ (micro-batches,       (per-step batched      │
    │           │  CPU/GPU overlap)      paged forward)        │
    │           │   │                           │              │
@@ -73,10 +73,11 @@ The engine no longer has a separate `OfflineEngine` subclass — pass
 | `engine.py` | `ASREngine` | Top-level façade.  Owns one of each subsystem and the step loop.  Use `transcribe(...)` for streaming and `transcribe_offline(...)` for batch. |
 | `config.py` | `EngineConfig` | Unified dataclass aggregating model / cache / feature / decoding / detokenization settings. Auto-detects SentencePiece model and `units.txt`. |
 | `request.py` | `Request`, `RequestOutput`, `RequestState` | Single-request representation, output container, lifecycle enum (`WAITING → RUNNING → FINISHED`). |
-| `scheduler.py` | `Scheduler`, `SchedulerOutput` | Dynamic-batching admission control and length bucketing. See `scheduler.md`. |
+| `scheduler.py` | `Scheduler`, `SchedulerOutput` | Dynamic-batching admission control, length bucketing, and offline micro-batch partition (`split_offline_batch`: count/preferred, padded-frame, or sequence-packed). See `scheduler.md`. |
 | `input_processor.py` | `InputProcessor` | Audio loading, batched GPU fbank/MFCC, streaming chunk-split, CMVN-free (CMVN is in the model). |
 | `model_runner.py` | `ModelRunner` | Wraps `ConformerModel`. Owns the cache managers; runs `forward_offline`, `forward_streaming_step`, and the batched paged path. |
-| `pipeline.py` | `OfflinePipeline` | Producer/consumer pipeline that splits an offline batch into length-bucketed micro-batches and overlaps fbank with forward+decode. |
+| `executor/offline.py` | `OfflineExecutor` | Runs each scheduler-partitioned micro-batch (fbank → forward → decode → finalise) back-to-back; sequence-packed forward when `enable_sequence_packing` is set. |
+| `executor/streaming.py` | `StreamingExecutor` | Chunk-by-chunk streaming with paged KV cache; partial outputs per tick, final on drain. |
 | `output_processor.py` | `OutputProcessor` | CTC decode (GPU beam / k2 WFST) and SentencePiece-or-units detokenization. |
 
 ## 4. Core Algorithms and Workflows
@@ -92,18 +93,17 @@ add_request(audio, streaming=False):
 step():
     sched = scheduler.schedule()
     if sched.offline_batch:
-        outputs = OfflinePipeline.run(sched.offline_batch)
+        outputs = OfflineExecutor.run(sched.offline_batch)
 ```
 
-`OfflinePipeline.run` then:
+`OfflineExecutor.run` then:
 
-1. Length-bucket and split into micro-batches of size
-   `max_batch_size` each.
-2. Pad and ship features to the device (or run batched GPU fbank on a
-   dedicated CUDA stream).
-3. Pipeline depth `D` allows up to `D` micro-batches in flight: a
-   producer thread runs fbank for chunk `k+1` while the main thread
-   forwards + decodes chunk `k` on the default stream.
+1. Ask the scheduler to partition the batch into micro-batches
+   (`Scheduler.split_offline_batch`: length-bucketed / padded-frame / packed).
+2. Run batched GPU fbank over each micro-batch.
+3. Run micro-batches back-to-back on the default stream
+   (fbank → forward → decode → finalise); with `enable_sequence_packing`
+   each micro-batch is one gapless varlen-attention packed row.
 4. Restore the original input order before returning.
 
 ### 4.2 Streaming transcription (chunk-by-chunk)
@@ -203,9 +203,9 @@ def step(self) -> List[RequestOutput]:
         if req.streaming:
             self._model_runner.allocate_stream(req)
 
-    # 2. offline batch (if any) — pipelined CPU/GPU overlap
+    # 2. offline batch (if any) — micro-batches run back-to-back
     if sched.offline_batch:
-        outputs.extend(self._offline_pipeline.run(sched.offline_batch))
+        outputs.extend(self._executor.run(sched.offline_batch))
 
     running = sched.running_streams
     if running:
@@ -251,7 +251,7 @@ def step(self) -> List[RequestOutput]:
 The engine is **waveform-only** — file decoding happens at the entry point
 (the serving front-end via `oasr-asr`, or the bench/test harness), never in
 the engine. `audio_scale` is applied on the **GPU after padding** in
-`collate_gpu` (offline).
+`collate` (offline).
 
 ```
 Request.audio = waveform (Tensor / ndarray, at the model sample rate, or None)
@@ -264,16 +264,16 @@ prepare_offline                    prepare_streaming
     in place (1-D f32 CPU)           → Request.num_frames (exact estimate)
   → Request.num_frames
         │                                │
-  collate_gpu: pad + scale          append_streaming_chunk: scale (CPU)
+  collate: pad + scale          append_streaming_chunk: scale (CPU)
   on the GPU (after padding)         per chunk
         │                                │
         └──────────────── Scheduler ─────┘
                               │
             ┌─────────────────┴──────────────────┐
             ▼                                    ▼
-     OfflinePipeline                    streaming step:
-       collate_gpu/cpu                    extract_streaming_batch  → _feat_stream
-       _gpu_stage:                          (writes feature_buffer)
+     OfflineExecutor                    streaming step:
+       collate/cpu                    extract_streaming_batch  → _feat_stream
+       _run_stage:                          (writes feature_buffer)
          forward_offline                  forward_streaming_step
          decode_offline                   _forward_batched_paged | _forward_single
                                           decode_streaming_chunk → CTC
@@ -335,8 +335,8 @@ prepare_offline                    prepare_streaming
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `decoder_type` | `"ctc_gpu"` | `ctc_gpu` (GPU CTC beam) / `ctc_wfst` (k2 WFST, GPU). |
-| `gpu_decoder_config` | `GpuDecoderConfig()` | GPU CTC config (beam, blank ID, thresholds). |
+| `decoder_type` | `"ctc_cuda"` | `ctc_cuda` (GPU CTC beam) / `ctc_wfst` (k2 WFST, GPU). |
+| `ctc_decoder_config` | `GpuDecoderConfig()` | GPU CTC config (beam, blank ID, thresholds). |
 | `wfst_decoder_config` | `DecoderConfig(search_type="wfst")` | k2 WFST decoder config. |
 | `fst_path` | `None` | Required for `ctc_wfst`. |
 | `sentencepiece_model` | auto-detected | `.model` in `ckpt_dir`. |
@@ -420,8 +420,8 @@ results = engine.run()                # one engine handles both pools
 ```python
 engine = ASREngine(EngineConfig(
     ckpt_dir=...,
-    decoder_type="ctc_gpu",
-    gpu_decoder_config=GpuDecoderConfig(beam_size=10, blank_threshold=0.95),
+    decoder_type="ctc_cuda",
+    ctc_decoder_config=GpuDecoderConfig(beam_size=10, blank_threshold=0.95),
 ))
 ```
 
@@ -450,7 +450,7 @@ engine = ASREngine(EngineConfig(
    latency.
 2. **A CUDA stream overlaps streaming fbank and forward.** `_feat_stream`
    runs the streaming fbank kernel; the default stream waits on a recorded
-   event before reading `feature_buffer`. The offline pipeline runs its
+   event before reading `feature_buffer`. The offline executor runs its
    micro-batches sequentially (GPU fbank → forward → decode), so it needs
    no extra stream.
 3. **Length bucketing trade-off.** `length_bucket_ratio=0` (default)
