@@ -49,6 +49,31 @@ class RMSNorm(nn.Module):
         return oasr.rms_norm(x, self.weight, self.bias, self.eps)
 
 
+class BiasNorm(nn.Module):
+    """Zipformer BiasNorm: a cheap LayerNorm replacement (last-dim).
+
+    ``scales = mean((x - bias)**2, dim=-1, keepdim=True)**-0.5 * exp(log_scale)``;
+    ``output = x * scales``.  Parameter names (``bias``, ``log_scale``) mirror
+    icefall so a checkpoint loads 1:1.  Inference-only — normalises over the last
+    dimension (``channel_dim == -1``).
+    """
+
+    def __init__(
+        self,
+        num_channels: int,
+        log_scale: float = 1.0,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        self.num_channels = num_channels
+        self.log_scale = nn.Parameter(torch.tensor(log_scale, device=device, dtype=dtype))
+        self.bias = nn.Parameter(torch.zeros(num_channels, device=device, dtype=dtype))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return oasr.bias_norm(x, self.bias, self.log_scale)
+
+
 class GroupNorm(nn.Module):
     """Wrapper for group normalization kernel."""
 
@@ -244,7 +269,7 @@ class GlobalCMVN(nn.Module):
 
 
 __all__ = [
-    "LayerNorm", "RMSNorm", "GroupNorm",
+    "LayerNorm", "RMSNorm", "GroupNorm", "BiasNorm",
     "BatchNorm1d", "BatchNormSwish", "AddLayerNorm",
     "LayerNormActivation", "RMSNormActivation", "BatchNormActivation",
     "GlobalCMVN",

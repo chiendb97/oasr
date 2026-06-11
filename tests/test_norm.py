@@ -168,5 +168,56 @@ class TestAddLayerNorm:
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
 
+def _ref_bias_norm(x: torch.Tensor, bias: torch.Tensor, log_scale: torch.Tensor) -> torch.Tensor:
+    """icefall BiasNorm reference (channel_dim == -1), computed in fp32."""
+    xf = x.float()
+    b = bias.float()
+    scales = torch.mean((xf - b) ** 2, dim=-1, keepdim=True) ** -0.5 * log_scale.float().exp()
+    return (xf * scales).to(x.dtype)
+
+
+class TestBiasNorm:
+    """Tests for oasr.bias_norm() functional API (Zipformer BiasNorm)."""
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 64, 128),
+            (2, 128, 256),
+            (4, 250, 384),
+            (2, 8, 50, 64),  # 4D
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_bias_norm(self, shape, dtype):
+        hidden_size = shape[-1]
+        x = torch.randn(*shape, device="cuda", dtype=dtype)
+        bias = torch.randn(hidden_size, device="cuda", dtype=dtype) * 0.1
+        log_scale = torch.tensor(0.7, device="cuda", dtype=dtype)
+
+        output = oasr.bias_norm(x, bias, log_scale)
+        expected = _ref_bias_norm(x, bias, log_scale)
+
+        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (2e-2, 2e-2)
+        torch.testing.assert_close(output.float(), expected.float(), rtol=rtol, atol=atol)
+
+    def test_bias_norm_non_vec_aligned(self):
+        """Hidden size not divisible by 4 must fall back to the scalar path."""
+        x = torch.randn(2, 32, 130, device="cuda", dtype=torch.float32)
+        bias = torch.randn(130, device="cuda", dtype=torch.float32) * 0.1
+        log_scale = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+        output = oasr.bias_norm(x, bias, log_scale)
+        torch.testing.assert_close(output, _ref_bias_norm(x, bias, log_scale), rtol=1e-4, atol=1e-4)
+
+    def test_bias_norm_destination_passing(self):
+        x = torch.randn(2, 128, 256, device="cuda", dtype=torch.float32)
+        bias = torch.randn(256, device="cuda", dtype=torch.float32) * 0.1
+        log_scale = torch.tensor(0.3, device="cuda", dtype=torch.float32)
+        out = torch.empty_like(x)
+        result = oasr.bias_norm(x, bias, log_scale, out=out)
+        assert result.data_ptr() == out.data_ptr()
+        torch.testing.assert_close(out, _ref_bias_norm(x, bias, log_scale), rtol=1e-4, atol=1e-4)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

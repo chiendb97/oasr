@@ -614,6 +614,61 @@ __global__ void cmvnKernel(const T* __restrict__ input, T* __restrict__ output,
 }
 
 // =============================================================================
+// BiasNorm Kernel (Zipformer)
+// =============================================================================
+//
+// scales = mean((x - bias)^2, dim=-1, keepdim=True) ** -0.5 * exp(log_scale)
+// output = x * scales
+//
+// ``bias`` is a per-channel (last-dim) vector; ``log_scale`` is a 1-element
+// tensor.  No eps term (matches icefall's inference-time BiasNorm).
+
+template <typename T, int VecSize>
+__global__ void biasNormKernel(const T* __restrict__ input, T* __restrict__ output,
+                               const T* __restrict__ bias, const T* __restrict__ log_scale,
+                               int hidden_size) {
+    using VecT = oasr::Vec<T, VecSize>;
+
+    const int row_idx = blockIdx.x;
+    const T* row_input = input + row_idx * hidden_size;
+    T* row_output = output + row_idx * hidden_size;
+
+    const int vec_hidden_size = hidden_size / VecSize;
+
+    __shared__ float smem;
+
+    // Phase 1: mean of (x - bias)^2 over the row (bias is shared across rows).
+    float local_sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_bias;
+        v_in.load(row_input + i * VecSize);
+        v_bias.load(bias + i * VecSize);
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            float diff = static_cast<float>(v_in[j]) - static_cast<float>(v_bias[j]);
+            local_sum_sq = std::fmaf(diff, diff, local_sum_sq);
+        }
+    }
+
+    float mean_sq =
+        blockBroadcast(blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size), &smem);
+    float scale = rsqrtf(mean_sq) * expf(static_cast<float>(log_scale[0]));
+
+    // Phase 2: output = x * scale.
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in;
+        v_in.load(row_input + i * VecSize);
+
+        oasr::Vec<float, VecSize> vals;
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            vals[j] = static_cast<float>(v_in[j]) * scale;
+        }
+        oasr::vecCast<T>(vals).store(row_output + i * VecSize);
+    }
+}
+
+// =============================================================================
 // Typed Launcher Functions (raw pointer interface, returning cudaError_t)
 // =============================================================================
 
@@ -636,6 +691,29 @@ cudaError_t LayerNorm(const T* input, const T* weight, const T* bias, T* output,
         int block_size = alignedBlockSize(static_cast<int>(hidden_size));
         layerNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
             input, output, weight, bias, static_cast<int>(hidden_size), eps);
+    }
+    return cudaGetLastError();
+}
+
+// ---- BiasNorm ----
+
+template <typename T>
+cudaError_t BiasNorm(const T* input, const T* bias, const T* log_scale, T* output,
+                     unsigned int num_rows, unsigned int hidden_size, cudaStream_t stream) {
+    constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
+
+    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
+                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
+                   isAligned<T, VecSize>(output) && isAligned<T, VecSize>(bias);
+
+    if (use_vec) {
+        int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
+        biasNormKernel<T, VecSize><<<num_rows, block_size, 0, stream>>>(
+            input, output, bias, log_scale, static_cast<int>(hidden_size));
+    } else {
+        int block_size = alignedBlockSize(static_cast<int>(hidden_size));
+        biasNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
+            input, output, bias, log_scale, static_cast<int>(hidden_size));
     }
     return cudaGetLastError();
 }

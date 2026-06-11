@@ -46,6 +46,37 @@ void layernorm(TensorView output, TensorView input, TensorView weight, Optional 
 }
 
 // =============================================================================
+// BiasNorm launcher (Zipformer)
+// =============================================================================
+
+void bias_norm(TensorView output, TensorView input, TensorView bias, TensorView log_scale) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output);
+    CHECK_INPUT(bias);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+
+    unsigned int num_rows = 1;
+    for (int i = 0; i < input.ndim() - 1; ++i) {
+        num_rows *= input.size(i);
+    }
+    unsigned int hidden_size = input.size(input.ndim() - 1);
+
+    cudaStream_t stream = get_stream(input.device());
+
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+        cudaError_t status = norm::BiasNorm<c_type>(
+            static_cast<const c_type*>(input.data_ptr()),
+            static_cast<const c_type*>(bias.data_ptr()),
+            static_cast<const c_type*>(log_scale.data_ptr()),
+            static_cast<c_type*>(output.data_ptr()), num_rows, hidden_size, stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "BiasNorm kernel failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
+// =============================================================================
 // RMSNorm launcher
 // =============================================================================
 

@@ -3,7 +3,9 @@
 from .conv import DepthwiseConv1d, PointwiseConv1d, Conv2d, Conv2dActivation
 from .feature import Fbank, Mfcc
 from .linear import Linear
-from .norm import LayerNorm, RMSNorm, GroupNorm, BatchNorm1d, AddLayerNorm, GlobalCMVN
+from .norm import (
+    LayerNorm, RMSNorm, GroupNorm, BiasNorm, BatchNorm1d, AddLayerNorm, GlobalCMVN,
+)
 from .softmax import Softmax
 from .topk import TopK
 
@@ -22,6 +24,7 @@ __all__ = [
     "LayerNorm",
     "RMSNorm",
     "GroupNorm",
+    "BiasNorm",
     "BatchNorm1d",
     "AddLayerNorm",
     "GlobalCMVN",

@@ -70,6 +70,34 @@ def rms_norm(
 
 
 @oasr_api
+def bias_norm(
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    log_scale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Apply Zipformer BiasNorm over the last dimension.
+
+    Computes ``scales = mean((x - bias)**2, dim=-1, keepdim=True)**-0.5 *
+    exp(log_scale)`` then ``output = x * scales``.  No eps term (matches
+    icefall's inference-time BiasNorm).
+
+    Args:
+        input: Input tensor ``[..., num_channels]``.
+        bias: Per-channel bias ``[num_channels]``.
+        log_scale: Scalar (1-element) log-scale tensor.
+        out: Optional pre-allocated output tensor.
+
+    Returns:
+        Normalized tensor with the same shape as input.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    _get_norm_module().bias_norm(out, input, bias, log_scale)
+    return out
+
+
+@oasr_api
 def batch_norm_1d(
     input: torch.Tensor,
     weight: torch.Tensor,

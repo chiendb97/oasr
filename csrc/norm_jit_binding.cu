@@ -10,6 +10,7 @@ void layernorm(TensorView output, TensorView input, TensorView weight, Optional 
                double eps);
 void rmsnorm(TensorView output, TensorView input, TensorView weight, Optional bias_opt,
              double eps);
+void bias_norm(TensorView output, TensorView input, TensorView bias, TensorView log_scale);
 void batchnorm1d(TensorView output, TensorView input, TensorView weight, TensorView bias,
                  TensorView running_mean, TensorView running_var, double eps);
 void groupnorm(TensorView output, TensorView input, TensorView weight, TensorView bias,
@@ -30,6 +31,7 @@ void cmvn(TensorView output, TensorView input, TensorView mean, TensorView istd)
 // TVM-FFI symbol exports
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(layernorm, layernorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm, rmsnorm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bias_norm, bias_norm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(batchnorm1d, batchnorm1d);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(groupnorm, groupnorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(addlayernorm, addlayernorm);
