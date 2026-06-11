@@ -19,6 +19,8 @@ from typing import Tuple
 import torch
 from torch import Tensor, nn
 
+from oasr.layers.linear import Linear
+
 from .scaling import BiasNorm, SwooshL, SwooshR
 
 
@@ -116,7 +118,7 @@ class Conv2dSubsampling(nn.Module):
         self.out_width = (((in_channels - 1) // 2) - 1) // 2
         self.layer3_channels = layer3_channels
 
-        self.out = nn.Linear(self.out_width * layer3_channels, out_channels)
+        self.out = Linear(self.out_width * layer3_channels, out_channels)
         self.out_norm = BiasNorm(out_channels)
 
     def forward(self, x: Tensor, x_lens: Tensor) -> Tuple[Tensor, Tensor]:

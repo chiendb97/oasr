@@ -86,16 +86,20 @@ def _load_reference(tmp_path):
 
 
 def _tiny_encoder_config(causal=False, chunk_size=(-1,), left_context_frames=(-1,)):
+    # All derived projection dims must be multiples of 8: the OASR GEMM kernels
+    # (oasr.gemm / oasr.layers.Linear) require N % 8 == K % 8 == 0.  encoder_dim
+    # and feedforward_dim are multiples of 32 so the 3/4 and 5/4 feed-forward
+    # widths (and the 3/4 nonlin-attention hidden) stay 8-aligned.
     return ZipformerEncoderConfig(
         feature_dim=80,
         downsampling_factor=(1, 2),
-        encoder_dim=(48, 64),
+        encoder_dim=(64, 96),
         num_encoder_layers=(1, 1),
         query_head_dim=(8,),
         pos_head_dim=(4,),
         value_head_dim=(6,),
         num_heads=(4, 4),
-        feedforward_dim=(48, 64),
+        feedforward_dim=(64, 96),
         cnn_module_kernel=(15, 15),
         pos_dim=16,
         causal=causal,
@@ -148,7 +152,7 @@ class TestZipformerRegistry:
         # cache_spec from the live model and from the config must agree.
         assert model.cache_spec == cfg.cache_spec
         # output dim == max(encoder_dim)
-        assert model.encoder.output_size == 64
+        assert model.encoder.output_size == 96
         assert model.cache_spec.num_layers == 2  # 1 + 1
         assert model.cache_spec.conv_kernel_size == 1  # no slot-CNN cache
 
@@ -177,22 +181,39 @@ class TestZipformerRegistry:
 
 
 class TestZipformerParity:
+    """Parity vs the fp32 icefall reference.
+
+    The OASR port runs on CUDA in FP16 (its CUDA GEMM / norm / activation kernels
+    are half-precision); the icefall reference stays in FP32 on CPU.  Tolerances
+    are loosened to FP16-with-FP32-accumulation reality (measured max-abs ~9e-3
+    against reference values up to ~5.7), versus the exact match the pure-torch
+    port used to achieve.
+    """
+
+    # FP16 (FP32 GEMM accumulation) vs FP32 reference.
+    _RTOL = 2e-2
+    _ATOL = 2e-2
+
     def test_offline_parity(self, tmp_path):
+        if not torch.cuda.is_available():
+            pytest.skip("OASR kernels require CUDA")
         ref_zip, ref_sub = _load_reference(tmp_path)
         sys.path.insert(0, _ref_dir())
         from icefall.utils import make_pad_mask as ref_make_pad_mask  # type: ignore
 
         torch.manual_seed(1234)
         enc_cfg = _tiny_encoder_config()
-        ref_embed, ref_enc = _build_reference(ref_zip, ref_sub, enc_cfg)
+        ref_embed, ref_enc = _build_reference(ref_zip, ref_sub, enc_cfg)  # CPU fp32
 
         model = ZipformerModel(ZipformerModelConfig(encoder=enc_cfg, vocab_size=32)).eval()
-        # Identical weights: module names mirror icefall, so this is a strict load.
+        # Identical weights: module names mirror icefall, so this is a strict load
+        # (depthwise-conv weights are transposed [C,1,K]->[K,1,C] by the load hook).
         model.encoder.encoder_embed.load_state_dict(ref_embed.state_dict())
         model.encoder.encoder.load_state_dict(ref_enc.state_dict())
+        model = model.half().cuda().eval()
 
         B, T = 2, 96
-        x = torch.randn(B, T, enc_cfg.feature_dim)
+        x = torch.randn(B, T, enc_cfg.feature_dim)  # CPU fp32 input shared by both
         xl = torch.tensor([T, T - 10], dtype=torch.int32)
 
         with torch.no_grad():
@@ -201,14 +222,18 @@ class TestZipformerParity:
             ref_out, ref_lens = ref_enc(xe.permute(1, 0, 2), xle, spm)
             ref_out = ref_out.permute(1, 0, 2)
 
-            my_out, my_masks = model.encoder(x, xl)
+            my_out, my_masks = model.encoder(x.half().cuda(), xl.cuda())
             my_lens = my_masks.squeeze(1).sum(-1)
 
         assert my_out.shape == ref_out.shape, (my_out.shape, ref_out.shape)
-        torch.testing.assert_close(my_out, ref_out, rtol=1e-4, atol=1e-4)
-        assert torch.equal(my_lens.to(ref_lens.dtype), ref_lens)
+        torch.testing.assert_close(
+            my_out.float().cpu(), ref_out, rtol=self._RTOL, atol=self._ATOL
+        )
+        assert torch.equal(my_lens.cpu().to(ref_lens.dtype), ref_lens)
 
     def test_streaming_parity(self, tmp_path):
+        if not torch.cuda.is_available():
+            pytest.skip("OASR kernels require CUDA")
         ref_zip, ref_sub = _load_reference(tmp_path)
 
         torch.manual_seed(4321)
@@ -216,20 +241,21 @@ class TestZipformerParity:
         enc_cfg = _tiny_encoder_config(
             causal=True, chunk_size=(C,), left_context_frames=(L,)
         )
-        ref_embed, ref_enc = _build_reference(ref_zip, ref_sub, enc_cfg)
+        ref_embed, ref_enc = _build_reference(ref_zip, ref_sub, enc_cfg)  # CPU fp32
 
         model = ZipformerModel(ZipformerModelConfig(encoder=enc_cfg, vocab_size=32)).eval()
         model.encoder.encoder_embed.load_state_dict(ref_embed.state_dict())
         model.encoder.encoder.load_state_dict(ref_enc.state_dict())
+        model = model.half().cuda().eval()
 
         B = 2
-        # Init states (port + reference, identical zeros).
-        my_states = model.get_streaming_init_states(B)
+        # Init states (port on CUDA/fp16, reference on CPU/fp32; identical zeros).
+        my_states = model.get_streaming_init_states(B, device="cuda", dtype=torch.float16)
         ref_embed_state = ref_embed.get_init_states(B)
         ref_enc_states = ref_enc.get_init_states(B)
 
         chunk_T = 45  # -> (45-7)//2 - 3 = 16 subsampled frames
-        x = torch.randn(B, chunk_T, enc_cfg.feature_dim)
+        x = torch.randn(B, chunk_T, enc_cfg.feature_dim)  # CPU fp32 shared input
         xl = torch.full((B,), chunk_T, dtype=torch.int32)
 
         with torch.no_grad():
@@ -241,7 +267,11 @@ class TestZipformerParity:
             ref_out = ref_out.permute(1, 0, 2)
 
             # port one-chunk streaming
-            my_hidden, my_lens, _ = model.encoder.streaming_forward(x, xl, my_states)
+            my_hidden, my_lens, _ = model.encoder.streaming_forward(
+                x.half().cuda(), xl.cuda(), my_states
+            )
 
         assert my_hidden.shape == ref_out.shape, (my_hidden.shape, ref_out.shape)
-        torch.testing.assert_close(my_hidden, ref_out, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(
+            my_hidden.float().cpu(), ref_out, rtol=self._RTOL, atol=self._ATOL
+        )

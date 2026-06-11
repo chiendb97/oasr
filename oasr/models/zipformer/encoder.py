@@ -23,12 +23,22 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
+import oasr
+from oasr.layers.conv import DepthwiseConv1d
+from oasr.layers.linear import Linear
+
 from .scaling import (
     ActivationDropoutAndLinear,
     BiasNorm,
     ChunkCausalDepthwiseConv1d,
     convert_num_channels,
 )
+
+# NOTE: the attention score / value products stay on ``torch.matmul``.  Zipformer's
+# head dims (pos_head_dim=4, value_head_dim=6/12) and the rel-pos length (always
+# odd: 2*T-1) violate ``oasr.bmm``'s CUTLASS 8-element N/K alignment, so the fused
+# GEMM cannot run these shapes.  The big projections (in_proj/out_proj/linear_pos)
+# and the softmax do go through OASR kernels.
 
 
 def _to_tuple(x, length: int):
@@ -108,8 +118,8 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
 
         key_head_dim = query_head_dim
         in_proj_dim = (query_head_dim + key_head_dim + pos_head_dim) * num_heads
-        self.in_proj = nn.Linear(embed_dim, in_proj_dim, bias=True)
-        self.linear_pos = nn.Linear(pos_dim, num_heads * pos_head_dim, bias=False)
+        self.in_proj = Linear(embed_dim, in_proj_dim, bias=True)
+        self.linear_pos = Linear(pos_dim, num_heads * pos_head_dim, bias=False)
 
     def forward(
         self,
@@ -166,7 +176,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
             assert key_padding_mask.shape == (batch_size, seq_len), key_padding_mask.shape
             attn_scores = attn_scores.masked_fill(key_padding_mask.unsqueeze(1), -1000)
 
-        return attn_scores.softmax(dim=-1)
+        return oasr.softmax(attn_scores.contiguous())
 
     def streaming_forward(
         self,
@@ -196,9 +206,9 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         p = p.reshape(seq_len, batch_size, num_heads, pos_head_dim)
         k = k.reshape(k_len, batch_size, num_heads, query_head_dim)
 
-        q = q.permute(2, 1, 0, 3)
-        p = p.permute(2, 1, 0, 3)
-        k = k.permute(2, 1, 3, 0)
+        q = q.permute(2, 1, 0, 3)  # (head, batch, time1, query_head_dim)
+        p = p.permute(2, 1, 0, 3)  # (head, batch, time1, pos_head_dim)
+        k = k.permute(2, 1, 3, 0)  # (head, batch, d_k, k_len)
 
         attn_scores = torch.matmul(q, k)
 
@@ -222,7 +232,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
             assert key_padding_mask.shape == (batch_size, k_len), key_padding_mask.shape
             attn_scores = attn_scores.masked_fill(key_padding_mask.unsqueeze(1), -1000)
 
-        return attn_scores.softmax(dim=-1), cached_key
+        return oasr.softmax(attn_scores.contiguous()), cached_key
 
 
 class SelfAttention(nn.Module):
@@ -230,8 +240,8 @@ class SelfAttention(nn.Module):
 
     def __init__(self, embed_dim: int, num_heads: int, value_head_dim: int):
         super().__init__()
-        self.in_proj = nn.Linear(embed_dim, num_heads * value_head_dim, bias=True)
-        self.out_proj = nn.Linear(num_heads * value_head_dim, embed_dim, bias=True)
+        self.in_proj = Linear(embed_dim, num_heads * value_head_dim, bias=True)
+        self.out_proj = Linear(num_heads * value_head_dim, embed_dim, bias=True)
 
     def forward(self, x: Tensor, attn_weights: Tensor) -> Tensor:
         (seq_len, batch_size, embed_dim) = x.shape
@@ -261,7 +271,7 @@ class SelfAttention(nn.Module):
 class FeedforwardModule(nn.Module):
     def __init__(self, embed_dim: int, feedforward_dim: int):
         super().__init__()
-        self.in_proj = nn.Linear(embed_dim, feedforward_dim)
+        self.in_proj = Linear(embed_dim, feedforward_dim)
         self.out_proj = ActivationDropoutAndLinear(
             feedforward_dim, embed_dim, activation="SwooshL", bias=True
         )
@@ -278,9 +288,9 @@ class NonlinAttention(nn.Module):
     def __init__(self, channels: int, hidden_channels: int):
         super().__init__()
         self.hidden_channels = hidden_channels
-        self.in_proj = nn.Linear(channels, hidden_channels * 3, bias=True)
+        self.in_proj = Linear(channels, hidden_channels * 3, bias=True)
         self.tanh = nn.Tanh()
-        self.out_proj = nn.Linear(hidden_channels, channels, bias=True)
+        self.out_proj = Linear(hidden_channels, channels, bias=True)
 
     def forward(self, x: Tensor, attn_weights: Tensor) -> Tensor:
         x = self.in_proj(x)
@@ -331,18 +341,18 @@ class ConvolutionModule(nn.Module):
         bottleneck_dim = channels
         self.causal = causal
 
-        self.in_proj = nn.Linear(channels, 2 * bottleneck_dim)
-        self.sigmoid = nn.Sigmoid()
+        # GLU gating (chunk + sigmoid + mul) is fused into ``oasr.glu`` in forward.
+        self.in_proj = Linear(channels, 2 * bottleneck_dim)
 
         if causal:
             self.depthwise_conv = ChunkCausalDepthwiseConv1d(
                 channels=bottleneck_dim, kernel_size=kernel_size
             )
         else:
-            self.depthwise_conv = nn.Conv1d(
-                in_channels=bottleneck_dim,
-                out_channels=bottleneck_dim,
-                groups=bottleneck_dim,
+            # ``oasr.depthwise_conv1d`` works in (batch, time, channels); the
+            # icefall [C, 1, K] weight is converted to [K, 1, C] on load.
+            self.depthwise_conv = DepthwiseConv1d(
+                channels=bottleneck_dim,
                 kernel_size=kernel_size,
                 padding=kernel_size // 2,
             )
@@ -357,18 +367,18 @@ class ConvolutionModule(nn.Module):
         src_key_padding_mask: Optional[Tensor] = None,
         chunk_size: int = -1,
     ) -> Tensor:
-        x = self.in_proj(x)  # (time, batch, 2*channels)
-        x, s = x.chunk(2, dim=2)
-        s = self.sigmoid(s)
-        x = x * s
+        x = oasr.glu(self.in_proj(x))  # (time, batch, channels)
         x = x.permute(1, 2, 0)  # (batch, channels, time)
         if src_key_padding_mask is not None:
             x = x.masked_fill(src_key_padding_mask.unsqueeze(1).expand_as(x), 0.0)
         if chunk_size >= 0:
             assert self.causal, "Must initialize with causal=True to use chunk_size"
             x = self.depthwise_conv(x, chunk_size=chunk_size)
-        else:
+        elif self.causal:
             x = self.depthwise_conv(x)
+        else:
+            # oasr depthwise expects (batch, time, channels).
+            x = self.depthwise_conv(x.transpose(1, 2).contiguous()).transpose(1, 2)
         x = x.permute(2, 0, 1)  # (time, batch, channels)
         x = self.out_proj(x)
         return x
@@ -376,10 +386,7 @@ class ConvolutionModule(nn.Module):
     def streaming_forward(
         self, x: Tensor, cache: Tensor, src_key_padding_mask: Tensor
     ) -> Tuple[Tensor, Tensor]:
-        x = self.in_proj(x)
-        x, s = x.chunk(2, dim=2)
-        s = self.sigmoid(s)
-        x = x * s
+        x = oasr.glu(self.in_proj(x))  # (time, batch, channels)
         x = x.permute(1, 2, 0)  # (batch, channels, time)
         if src_key_padding_mask is not None:
             x = x.masked_fill(src_key_padding_mask.unsqueeze(1).expand_as(x), 0.0)
