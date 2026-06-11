@@ -62,3 +62,55 @@ void swish(TensorView output, TensorView input) {
         return true;
     });
 }
+
+// =============================================================================
+// Swoosh-L launcher (elementwise; input/output must be contiguous)
+// =============================================================================
+
+void swoosh_l(TensorView output, TensorView input) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output);
+
+    int64_t n = 1;
+    for (int i = 0; i < input.ndim(); ++i) {
+        n *= input.size(i);
+    }
+
+    cudaStream_t stream = get_stream(input.device());
+
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+        cudaError_t status = activation::SwooshL<c_type>(
+            static_cast<const c_type*>(input.data_ptr()),
+            static_cast<c_type*>(output.data_ptr()),
+            static_cast<int>(n), stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "SwooshL kernel failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
+// =============================================================================
+// Swoosh-R launcher (elementwise; input/output must be contiguous)
+// =============================================================================
+
+void swoosh_r(TensorView output, TensorView input) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output);
+
+    int64_t n = 1;
+    for (int i = 0; i < input.ndim(); ++i) {
+        n *= input.size(i);
+    }
+
+    cudaStream_t stream = get_stream(input.device());
+
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+        cudaError_t status = activation::SwooshR<c_type>(
+            static_cast<const c_type*>(input.data_ptr()),
+            static_cast<c_type*>(output.data_ptr()),
+            static_cast<int>(n), stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "SwooshR kernel failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}

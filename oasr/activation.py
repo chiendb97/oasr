@@ -72,3 +72,45 @@ def swish(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tens
         out = torch.empty_like(input)
     _get_activation_module().swish(out, input)
     return out
+
+
+@oasr_api
+def swoosh_l(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Zipformer Swoosh-L activation: ``log(1 + exp(x - 4)) - 0.08 x - 0.035``.
+
+    Elementwise over a flat contiguous buffer (shape-agnostic). A non-contiguous
+    input is made contiguous first.
+
+    Args:
+        input: Input tensor.
+        out: Optional pre-allocated output tensor.
+
+    Returns:
+        Output tensor with same shape as input.
+    """
+    input = input.contiguous()
+    if out is None:
+        out = torch.empty_like(input)
+    _get_activation_module().swoosh_l(out, input)
+    return out
+
+
+@oasr_api
+def swoosh_r(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Zipformer Swoosh-R activation: ``log(1 + exp(x - 1)) - 0.08 x - 0.313261687``.
+
+    Elementwise over a flat contiguous buffer (shape-agnostic). A non-contiguous
+    input is made contiguous first.
+
+    Args:
+        input: Input tensor.
+        out: Optional pre-allocated output tensor.
+
+    Returns:
+        Output tensor with same shape as input.
+    """
+    input = input.contiguous()
+    if out is None:
+        out = torch.empty_like(input)
+    _get_activation_module().swoosh_r(out, input)
+    return out

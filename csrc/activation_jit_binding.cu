@@ -8,7 +8,11 @@
 // Forward declarations of launcher functions
 void glu(TensorView output, TensorView input);
 void swish(TensorView output, TensorView input);
+void swoosh_l(TensorView output, TensorView input);
+void swoosh_r(TensorView output, TensorView input);
 
 // TVM-FFI symbol exports
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(glu, glu);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(swish, swish);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(swoosh_l, swoosh_l);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(swoosh_r, swoosh_r);

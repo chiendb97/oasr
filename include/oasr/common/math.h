@@ -41,6 +41,27 @@ __device__ __forceinline__ T swish(T x) {
     return x * sigmoid(x);
 }
 
+// Numerically stable softplus: log(1 + exp(x)) = max(x, 0) + log1p(exp(-|x|)).
+template <typename T>
+__device__ __forceinline__ T softplus(T x) {
+    float xf = float(x);
+    return T(fmaxf(xf, 0.0f) + log1pf(expf(-fabsf(xf))));
+}
+
+// Zipformer Swoosh-L: log(1 + exp(x - 4)) - 0.08 x - 0.035.
+template <typename T>
+__device__ __forceinline__ T swoosh_l(T x) {
+    float xf = float(x);
+    return T(float(softplus(xf - 4.0f)) - 0.08f * xf - 0.035f);
+}
+
+// Zipformer Swoosh-R: log(1 + exp(x - 1)) - 0.08 x - 0.313261687.
+template <typename T>
+__device__ __forceinline__ T swoosh_r(T x) {
+    float xf = float(x);
+    return T(float(softplus(xf - 1.0f)) - 0.08f * xf - 0.313261687f);
+}
+
 // =============================================================================
 // Activation Functors for Kernel Fusion
 // =============================================================================

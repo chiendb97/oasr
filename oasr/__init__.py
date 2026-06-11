@@ -15,12 +15,12 @@ import types as _types
 # Functional API (FlashInfer style)
 # =============================================================================
 from .activation import (
-    glu, swish,
+    glu, swish, swoosh_l, swoosh_r,
     ACTIVATION_RELU, ACTIVATION_GELU, ACTIVATION_SWISH,
     get_activation_type_id,
 )
 from .norm import (
-    layer_norm, rms_norm, batch_norm_1d, group_norm, add_layer_norm,
+    layer_norm, rms_norm, bias_norm, batch_norm_1d, group_norm, add_layer_norm,
     layer_norm_activation, rms_norm_activation, batch_norm_activation, batch_norm_swish,
     cmvn,
 )
@@ -71,6 +71,7 @@ from .layers import (
     LayerNorm,
     RMSNorm,
     GroupNorm,
+    BiasNorm,
     BatchNorm1d,
     AddLayerNorm,
     GlobalCMVN,
@@ -159,8 +160,11 @@ __all__ = [
     # Functional API
     "glu",
     "swish",
+    "swoosh_l",
+    "swoosh_r",
     "layer_norm",
     "rms_norm",
+    "bias_norm",
     "batch_norm_1d",
     "group_norm",
     "add_layer_norm",
@@ -205,6 +209,7 @@ __all__ = [
     "LayerNorm",
     "RMSNorm",
     "GroupNorm",
+    "BiasNorm",
     "BatchNorm1d",
     "AddLayerNorm",
     "GlobalCMVN",

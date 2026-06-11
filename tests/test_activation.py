@@ -74,5 +74,62 @@ class TestSwish:
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
 
+def _ref_swoosh_l(x: torch.Tensor) -> torch.Tensor:
+    zero = torch.zeros((), dtype=x.dtype, device=x.device)
+    return torch.logaddexp(zero, x - 4.0) - 0.08 * x - 0.035
+
+
+def _ref_swoosh_r(x: torch.Tensor) -> torch.Tensor:
+    zero = torch.zeros((), dtype=x.dtype, device=x.device)
+    return torch.logaddexp(zero, x - 1.0) - 0.08 * x - 0.313261687
+
+
+class TestSwoosh:
+    """Tests for oasr.swoosh_l() / oasr.swoosh_r() functional API."""
+
+    @pytest.mark.parametrize(
+        "fn,ref", [(oasr.swoosh_l, _ref_swoosh_l), (oasr.swoosh_r, _ref_swoosh_r)]
+    )
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (2, 128, 256),  # vec4-aligned last dim
+            (4, 250, 384),
+            (2, 8, 50, 19),  # 4D (conv-output-like)
+            (2, 128, 255),  # non-vec-aligned last dim -> scalar path
+        ],
+    )
+    def test_swoosh_fp32(self, fn, ref, shape):
+        x = torch.randn(*shape, device="cuda", dtype=torch.float32)
+        torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "fn,ref", [(oasr.swoosh_l, _ref_swoosh_l), (oasr.swoosh_r, _ref_swoosh_r)]
+    )
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_swoosh_half(self, fn, ref, dtype):
+        x = torch.randn(4, 200, 512, device="cuda", dtype=dtype)
+        torch.testing.assert_close(fn(x), ref(x), rtol=2e-2, atol=2e-2)
+
+    def test_swoosh_large_magnitude(self):
+        """Numerical stability over a wide input range (softplus must not overflow)."""
+        x = torch.linspace(-60.0, 60.0, 4096, device="cuda", dtype=torch.float32).reshape(1, 64, 64)
+        torch.testing.assert_close(oasr.swoosh_l(x), _ref_swoosh_l(x), rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(oasr.swoosh_r(x), _ref_swoosh_r(x), rtol=1e-5, atol=1e-5)
+
+    def test_swoosh_noncontiguous(self):
+        """A non-contiguous (transposed) input is handled by an internal .contiguous()."""
+        x = torch.randn(2, 256, 128, device="cuda", dtype=torch.float32).transpose(1, 2)
+        assert not x.is_contiguous()
+        torch.testing.assert_close(oasr.swoosh_l(x), _ref_swoosh_l(x), rtol=1e-5, atol=1e-5)
+
+    def test_swoosh_destination_passing(self):
+        x = torch.randn(2, 128, 256, device="cuda", dtype=torch.float32)
+        out = torch.empty_like(x)
+        result = oasr.swoosh_r(x, out=out)
+        assert result.data_ptr() == out.data_ptr()
+        torch.testing.assert_close(out, _ref_swoosh_r(x), rtol=1e-5, atol=1e-5)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
