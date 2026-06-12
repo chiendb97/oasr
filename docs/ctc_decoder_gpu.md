@@ -195,7 +195,15 @@ probability and no confident non-blank.
 
 ### 3.4 Per-step main loop
 
-For step `s ≥ 1`, the host launcher
+> **Fused fast path (production default).** For `beam ≤ 32`
+> (`FUSED_MAX_BEAM`) the five kernels described in §3.4.1–3.4.5 are
+> replaced by a **single fused kernel per step**
+> (`fused::fused_step_kernel`, one block per batch row) — see §3.4.6.
+> The multi-kernel pipeline below remains the reference semantics, the
+> `beam > 32` fallback, and the A/B baseline
+> (`OASR_CTC_FUSED=0` selects it explicitly).
+
+For step `s ≥ 1`, the legacy host launcher
 `ctc_prefix_beam_search_step` (or `_paged`) runs five kernels in
 order. Let `t = select_seqs[bid, s]` denote the current acoustic
 frame; let `t_prev = select_seqs[bid, s - 1]`. When intervening
@@ -451,6 +459,79 @@ The `__syncthreads()` between Pass 1 and Pass 2 ensures every
 `free_page` push is visible before any `alloc_page` pop, otherwise an
 allocator could miss a page that just became free.
 
+#### 3.4.6 Fused single-kernel step (`fused::fused_step_kernel`, beam ≤ 32)
+
+Profiling on RTX 5090 showed `topk_phase1_kernel` alone at ~75 % of
+decoder GPU time: every frame materialises the full
+`[beam × vocab]` `ptable`/`ptablen` score matrix to global memory and
+extracts the top `beam` with a streaming block radix sort over all
+`beam × vocab` items. But the score matrix is **separable**: for an
+"ordinary" char `c` of beam `k`
+
+```
+score(k, c) = lp[c] + A_k,     A_k = logsumexp(prev_blank, prev_nonblank)
+```
+
+so the per-beam ranking of ordinary chars *is* the ranking of `lp`.
+The only per-beam exceptions are the blank slot, the repeated
+last-char slot, the optional space slot, and slots zeroed by the
+duplicate-prefix merge. The global top-`beam` over all `(k, c)` pairs
+is therefore contained in
+
+```
+{ top-K_all chars of lp } × beams  ∪  per-beam special slots
+K_all = beam + 3 + max_patches      (≤ 2·beam + 2)
+```
+
+`fused_step_kernel` (one 256-thread block per batch row, flat and
+paged variants via a `PAGED` template flag) does the whole step:
+
+1. **Snapshot** per-beam state (`pprev`, `clast`, `clen`) into shared
+   memory, applying the collapsed-blank correction.
+2. **Merge map**: the §3.4.3 pair condition over `beam²` pairs,
+   recorded as per-row patch lists (chars zeroed) and per-row merge
+   sources (for the blank-slot fold).
+3. **Vocab top-K_all** via a block-wide byte-radix select
+   (`block_topk_select`): per-warp 256-bin histograms, a warp-shuffle
+   suffix-scan to find the threshold bin, refining one byte at a time.
+   Keys are `(sortable_f32(lp), ~char)` composites, so ties resolve by
+   ascending char id and termination is guaranteed. Sortable keys are
+   cached in shared memory (`VKEY_CACHE`) when the vocab fits.
+4. **Score candidates** (`≈ beam × (K_all + 3)`) with the exact
+   §3.4.1/3.4.2 formulas; merge folds accumulate in ascending
+   source-beam order (the legacy cross-block fold was racy).
+5. **Select + rank** the global top-`beam` with the same radix select
+   over `(score, ~id)` keys plus a warp-shuffle bitonic sort.
+6. **State update** identical to §3.4.5 (sub-warp `clist` copy, or the
+   paged fork/CoW passes). `pprev` for the winners is recomputed
+   analytically — bit-identical to the legacy table read since
+   `ptable == NEG_INF` for every non-blank slot.
+
+`ptable`/`ptablen` and the phase-1 top-k buffers are **not allocated**
+when the fused path is active (`layout_has_prob_tables`), shrinking a
+`B=1, beam=10, V=5000` streaming state from ~440 KB to ~40 KB.
+
+Determinism notes (differences from the legacy pipeline, validated by
+`tests/test_ctc_decoder_fused_parity.py`):
+
+- Exact score ties may rank in a different beam order (legacy radix
+  stability vs `(score desc, id asc)` composites). Scores are
+  bit-identical; only the order of equal-scored beams can differ.
+- The merge fold into a beam's blank slot is ordered (ascending source
+  beam); the legacy fold was a racy cross-block read-modify-write.
+- The paged allocator is **partitioned per batch row** (row `b` owns
+  pages `[b·ppr, (b+1)·ppr)`), pass-2 CoW pool pushes are deferred
+  past the last pop, and self-forks skip the free/re-acquire cycle.
+  The legacy shared pool could pop a `free_pool` slot before the
+  concurrent push wrote it and could push still-referenced pages,
+  which made large paged offline decodes nondeterministic (corrupted
+  low-rank beams).
+
+The offline launchers also pass the step index by value
+(`step_const`) so no per-step device-counter update is needed; the
+streaming path passes `-1` and reads the device-resident counter so
+captured CUDA graphs stay valid across frames (§8).
+
 ### 3.5 Frame selection (offline only)
 
 Before the main loop, the offline launcher runs
@@ -626,6 +707,12 @@ Paged mode saves memory on `clist` (which is dropped) but adds
 length sequences.
 
 ## 6. Per-Step Kernel Pipeline
+
+For `beam ≤ 32` both launchers dispatch the fused fast path instead:
+`fused::fused_first_step_kernel` at step 0 and one
+`fused::fused_step_kernel<256, BEAM_CAP ∈ {16, 32}, PAGED>` per
+subsequent step (§3.4.6). The table below is the legacy / `beam > 32`
+/ `OASR_CTC_FUSED=0` pipeline.
 
 `ctc_prefix_beam_search_step` (flat) and
 `ctc_prefix_beam_search_step_paged` (paged) launch the same kernel
@@ -815,7 +902,16 @@ across requests without `cudaMalloc`.
 Workspace size is a pure function of these knobs plus `(batch,
 vocab_size)`. There is no autotuning: the kernels use compile-time
 template parameters tuned for the typical shape (`BLOCK_SIZE=128`,
-`ITEMS_PER_THREAD={2, 4}`).
+`ITEMS_PER_THREAD={2, 4}`; fused path `BLOCK_SIZE=256`,
+`BEAM_CAP ∈ {16, 32}`).
+
+The environment variable `OASR_CTC_FUSED=0` selects a separately
+compiled module (`ctc_decoder_legacy`, built with
+`-DOASR_CTC_DISABLE_FUSED`) that forces the legacy multi-kernel step
+pipeline for every beam size — an emergency rollback and the A/B
+baseline for `tests/test_ctc_decoder_fused_parity.py`. The two
+variants use different workspace layouts; never share a decoder or
+`StreamState` across a mid-process flag flip.
 
 ## 12. Usage Examples
 
@@ -960,6 +1056,26 @@ wrong buffer returns stale state from a previous step.
 8. **Alignment.** `align16(beam)` and `align16(max_seq_len)` keep
    strided memcpys aligned. Don't pass tiny `max_seq_len`; you'll pay
    alignment overhead for no benefit.
+9. **Fused step results (RTX 5090, 2026-06).** With the §3.4.6 fused
+   kernel, measured by `benchmarks/bench_ctc_decoder.py` (fused vs
+   legacy in one run):
+
+   | Workload | Legacy | Fused | Speedup |
+   |---|---|---|---|
+   | offline (16, 200, 5000, beam 10) | 10.80 ms | 3.92 ms | **2.75×** |
+   | offline (64, 200, 5000, beam 10) | 25.82 ms | 8.57 ms | **3.01×** |
+   | offline (16, 200, 5000, beam 20) | 18.75 ms | 6.60 ms | **2.84×** |
+   | offline (16, 200, 1000, beam 10) | 5.95 ms | 3.38 ms | 1.76× |
+   | streaming (V 5000, beam 10), per decoded frame | 39.4 µs | 16.9 µs | **2.34×** |
+
+   The per-step kernel went from 5 kernels / ~41 µs (of which
+   `topk_phase1` ≈ 31 µs) to 1 kernel / ~10 µs, and the kernel is now
+   latency-bound (SM/memory utilisation < 2 %) — further gains need
+   restructuring across steps (e.g. hoisting the vocab top-K out of
+   the sequential loop as a chunk-level pre-pass), not more
+   micro-optimisation. Engine-level effect (Conformer U2++ Librispeech,
+   `bench_engine.py`, 64 utts, max batch 32): streaming 159 → 190
+   utts/s (+19 %), offline 1328 → 1505 utts/s (+13 %).
 
 ## 15. Extension Points
 

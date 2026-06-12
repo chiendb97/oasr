@@ -45,13 +45,20 @@ struct PagedSequenceState {
     // GPU: [num_pages] — per-page reference count (CPU-driven during init/step)
     int* ref_counts;
 
-    // GPU: [1] — atomic counter for page allocation (next available physical page)
+    // Allocator state is PARTITIONED PER BATCH ROW: pages are never shared
+    // across rows, and a shared pool would let one row's pop race another
+    // row's in-flight push (free_pool_size is bumped before free_pool[slot]
+    // is written), handing out stale page indices.  Row b owns physical pages
+    // [b * ppr, (b+1) * ppr) with ppr = num_pages / batch.
+
+    // GPU: [batch] — per-row bump counter (next fresh physical page of the row)
     int* next_free_page;
 
-    // GPU: [num_pages] — stack of recycled physical page indices (ref_count dropped to 0)
+    // GPU: [num_pages] — per-row stacks of recycled physical page indices;
+    // row b uses free_pool[b * ppr .. (b+1) * ppr)
     int* free_pool;
 
-    // GPU: [1] — number of valid entries in free_pool (top of stack)
+    // GPU: [batch] — per-row number of valid entries in the row's free_pool stack
     int* free_pool_size;
 
     // Scalars (host-accessible after copying StreamingState from GPU)
@@ -103,26 +110,27 @@ inline size_t calculate_paged_region_size(int batch, int beam, int max_seq_len,
     total += paged_align_size(sizeof(int) * num_pages * page_size);
     total += paged_align_size(sizeof(int) * batch * beam * max_lp) * 2;
     total += paged_align_size(sizeof(int) * num_pages);  // ref_counts
-    total += paged_align_size(sizeof(int));              // next_free_page
-    total += paged_align_size(sizeof(int) * num_pages);  // free_pool
-    total += paged_align_size(sizeof(int));              // free_pool_size
+    total += paged_align_size(sizeof(int) * batch);      // next_free_page (per row)
+    total += paged_align_size(sizeof(int) * num_pages);  // free_pool (per-row stacks)
+    total += paged_align_size(sizeof(int) * batch);      // free_pool_size (per row)
     return total;
 }
 
-// Device-side initialisation of PagedSequenceState.  A single kernel launch
-// writes:
-//   block_table[0][bk][lp] = (lp == 0) ? bk : INVALID_PAGE
+// Device-side initialisation of PagedSequenceState.  With ppr = pages per
+// row (= num_pages / batch), a single kernel launch writes:
+//   block_table[0][(b * beam + k)][lp] = (lp == 0) ? b * ppr + k : INVALID_PAGE
 //   block_table[1][bk][lp] = INVALID_PAGE
-//   ref_counts[i] = (i < batch*beam) ? 1 : 0
-//   *next_free_page = batch * beam
-//   *free_pool_size = 0
+//   ref_counts[i] = (i % ppr < beam && i < batch * ppr) ? 1 : 0
+//   next_free_page[b] = b * ppr + beam      (absolute page index, per row)
+//   free_pool_size[b] = 0
 // This replaces the previous host-side new[] + cudaMemcpyAsync + sync sequence.
 __global__ void init_paged_state_kernel(int* __restrict__ block_table0,
                                         int* __restrict__ block_table1,
                                         int* __restrict__ ref_counts,
                                         int* __restrict__ next_free_page,
                                         int* __restrict__ free_pool_size,
-                                        int batch, int beam, int max_lp, int num_pages) {
+                                        int batch, int beam, int max_lp, int num_pages,
+                                        int pages_per_row) {
     const int total_bt = batch * beam * max_lp;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = blockDim.x * gridDim.x;
@@ -130,18 +138,20 @@ __global__ void init_paged_state_kernel(int* __restrict__ block_table0,
     for (int i = tid; i < total_bt; i += stride) {
         int lp = i % max_lp;
         int bk = i / max_lp;
-        block_table0[i] = (lp == 0) ? bk : INVALID_PAGE;
+        int b = bk / beam;
+        int k = bk - b * beam;
+        block_table0[i] = (lp == 0) ? (b * pages_per_row + k) : INVALID_PAGE;
         block_table1[i] = INVALID_PAGE;
     }
 
-    const int bxb = batch * beam;
     for (int i = tid; i < num_pages; i += stride) {
-        ref_counts[i] = (i < bxb) ? 1 : 0;
+        ref_counts[i] =
+            (i < batch * pages_per_row && (i % pages_per_row) < beam) ? 1 : 0;
     }
 
-    if (tid == 0) {
-        *next_free_page = bxb;
-        *free_pool_size = 0;
+    for (int b = tid; b < batch; b += stride) {
+        next_free_page[b] = b * pages_per_row + beam;
+        free_pool_size[b] = 0;
     }
 }
 
@@ -170,9 +180,9 @@ inline void init_paged_state(PagedSequenceState* ps, void* workspace,
     PAGED_ALLOC(block_table[0], int, batch * beam * max_lp)
     PAGED_ALLOC(block_table[1], int, batch * beam * max_lp)
     PAGED_ALLOC(ref_counts, int, num_pages)
-    PAGED_ALLOC(next_free_page, int, 1)
+    PAGED_ALLOC(next_free_page, int, batch)
     PAGED_ALLOC(free_pool, int, num_pages)
-    PAGED_ALLOC(free_pool_size, int, 1)
+    PAGED_ALLOC(free_pool_size, int, batch)
 
 #undef PAGED_ALLOC
 
@@ -185,7 +195,7 @@ inline void init_paged_state(PagedSequenceState* ps, void* workspace,
     init_paged_state_kernel<<<blocks, threads, 0, stream>>>(
         ps->block_table[0], ps->block_table[1], ps->ref_counts,
         ps->next_free_page, ps->free_pool_size,
-        batch, beam, max_lp, num_pages);
+        batch, beam, max_lp, num_pages, num_pages / max(batch, 1));
     // free_pool contents are uninitialised (only valid indices are used via free_pool_size)
 }
 
@@ -326,7 +336,7 @@ struct InternalData {
     float* ptable;   // [batch * beam * ldc] blank-path probability table
     float* ptablen;  // [batch * beam * ldc] nonblank-path probability table
     int* clast;      // [batch * ldbeam] last character in each beam
-    int* ptid;       // [batch * ldbeam] (unused, kept for ABI compatibility)
+    int* ptid;       // [batch * ldbeam] (unused; offline reuses it as d_step scratch)
     float* score;    // [batch * ldbeam] beam scores
 
     // Top-K buffers (Phase 1 output: [batch * MAX_BLOCKS_PER_BATCH * beam])
@@ -363,9 +373,14 @@ __inline__ __device__ float logprob_add(float a, float b) {
 // =============================================================================
 // Paged memory helpers — allocate/free a physical page atomically.
 //
+// All three pointers are ROW-LOCAL: callers pass free_pool + bid * ppr,
+// free_pool_size + bid, next_free_page + bid.  Only the batch row's own block
+// ever touches them, so pushes and pops never race across blocks.
+//
 // alloc_page: prefer recycled pages from free_pool over fresh allocation.
-//   Call only AFTER __syncthreads() that follows the fork phase so that all
-//   free_page pushes are visible before any pop.
+//   Call only AFTER a __syncthreads() that follows the last free_page push so
+//   the pushed pool entries are visible before any pop (free_pool_size is
+//   bumped before free_pool[slot] is written; the barrier orders the pair).
 //
 // free_page: decrement ref_count; if it reaches zero, push the page index onto
 //   the free_pool stack.  The push is safe to call from multiple concurrent
@@ -1249,6 +1264,811 @@ __global__ void fixup_parity_kernel(const int* __restrict__ select_seq_lens, int
 }
 
 // =============================================================================
+// Fused single-kernel beam-search step (beam <= FUSED_MAX_BEAM)
+// -----------------------------------------------------------------------------
+// The legacy step pipeline materialises the full [beam x vocab] ptable/ptablen
+// score matrix to global memory and extracts the top-`beam` entries with a
+// streaming block radix sort over all beam*vocab items (5 kernels per frame;
+// topk_phase1 alone is ~75% of decoder GPU time at vocab=5000).
+//
+// The score matrix is separable: for an "ordinary" char c of beam k,
+//     score(k, c) = lp[c] + A_k,   A_k = logsumexp(prev_blank, prev_nonblank)
+// so the per-beam ranking of ordinary chars is the ranking of lp itself.  The
+// only per-beam exceptions are the blank slot, the repeated-last-char slot,
+// the optional space slot, and slots zeroed by the duplicate-prefix merge.
+// Hence the global top-`beam` over all (k, c) pairs is contained in
+//     { top-K_all chars of lp } x beams  ∪  per-beam special slots,
+// with K_all = beam + 3 + max_patches  (<= 2*beam + 2), because at most
+// blank/last-char/space/patched chars can displace ordinary candidates.
+//
+// One fused kernel per (batch row, step) therefore: snapshots beam state,
+// builds the merge map, radix-selects the top-K_all lp chars, scores ~beam *
+// (K_all + 3) candidates with the exact legacy formulas, selects + bitonic-
+// sorts the global top-`beam`, and applies the legacy phase-2 state update
+// (flat clist copy or paged fork/CoW).  ptable/ptablen are never materialised
+// (they are not allocated when the fused path is active; see
+// layout_has_prob_tables).
+//
+// Determinism: candidate keys are (score, ~id) composites, so ties resolve by
+// ascending id = beam_idx * ldc + char — matching the stable order of the
+// legacy radix sort.  Unlike the legacy merge_kernel, the duplicate-prefix
+// fold into a beam's blank slot is accumulated in ascending source-beam order
+// instead of racy cross-block read-modify-writes, and the paged fork skips
+// self-forks instead of free+re-acquire (which could push a still-referenced
+// page onto the free pool).  Both legacy behaviours were nondeterministic.
+//
+// The legacy kernels remain for beam > FUSED_MAX_BEAM and for A/B validation
+// (compile with -DOASR_CTC_DISABLE_FUSED, exposed via OASR_CTC_FUSED=0).
+// =============================================================================
+
+static constexpr int FUSED_MAX_BEAM = 32;
+
+inline bool step_uses_fused(int beam) {
+#ifdef OASR_CTC_DISABLE_FUSED
+    (void)beam;
+    return false;
+#else
+    return beam <= FUSED_MAX_BEAM;
+#endif
+}
+
+// ptable/ptablen (and the phase-1 top-k buffers) are only needed by the
+// legacy step pipeline; the fused kernel computes scores analytically.
+inline bool layout_has_prob_tables(int beam) { return !step_uses_fused(beam); }
+
+namespace fused {
+
+// --- monotone float <-> uint32 mapping (descending float == descending uint) --
+
+__device__ __forceinline__ uint32_t f32_sortable(float f) {
+    uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+__device__ __forceinline__ float sortable_f32(uint32_t s) {
+    uint32_t u = (s & 0x80000000u) ? (s & 0x7fffffffu) : ~s;
+    return __uint_as_float(u);
+}
+
+// Composite sort key: score in the high 32 bits, bit-flipped id in the low 32
+// bits.  Descending key order == (score desc, id asc); keys are unique per id.
+__device__ __forceinline__ uint64_t make_ckey(float score, uint32_t id) {
+    return (uint64_t(f32_sortable(score)) << 32) | uint64_t(0xffffffffu - id);
+}
+
+__device__ __forceinline__ uint32_t ckey_id(uint64_t k) {
+    return 0xffffffffu - uint32_t(k & 0xffffffffu);
+}
+
+__device__ __forceinline__ float ckey_score(uint64_t k) {
+    return sortable_f32(uint32_t(k >> 32));
+}
+
+// --- block-wide top-K selection via byte-radix refinement --------------------
+
+template <int BLOCK_SIZE>
+struct SelectScratch {
+    static constexpr int WARPS = BLOCK_SIZE / 32;
+    int warp_hist[WARPS][256];
+    int out_n;
+    int bstar, gt, eq;
+};
+
+// Selects (a superset containing exactly) the top-K keys by descending u64 key
+// from n items.  Keys must be unique (callers embed the item id in the low
+// bits), which guarantees termination with an exact count by the last byte
+// level.  Each selected item is emitted exactly once via emit(slot, i, key);
+// slot order is arbitrary.  Returns the count: min(n, K) <= count <= MAX_OUT,
+// where MAX_OUT (>= K) bounds the overshoot of the final whole-bin collect.
+template <int BLOCK_SIZE, int MAX_OUT, typename KeyFn, typename EmitFn>
+__device__ int block_topk_select(int n, int K, KeyFn key_at, EmitFn emit,
+                                 SelectScratch<BLOCK_SIZE>* s) {
+    const int tid = threadIdx.x;
+    const int warp = tid / 32;
+    if (tid == 0) s->out_n = 0;
+    __syncthreads();
+
+    if (n <= K) {
+        for (int i = tid; i < n; i += BLOCK_SIZE)
+            emit(atomicAdd(&s->out_n, 1), i, key_at(i));
+        __syncthreads();
+        return n;
+    }
+
+    uint64_t prefix = 0;
+    int plen = 0;  // bits matched from the MSB, multiple of 8
+    int collected = 0;
+    int K_rem = K;
+
+    for (int level = 0; level < 8; ++level) {
+        const int shift = 56 - 8 * level;
+        for (int b = tid; b < SelectScratch<BLOCK_SIZE>::WARPS * 256; b += BLOCK_SIZE)
+            (&s->warp_hist[0][0])[b] = 0;
+        __syncthreads();
+        for (int i = tid; i < n; i += BLOCK_SIZE) {
+            uint64_t k = key_at(i);
+            if (plen && (k >> (64 - plen)) != prefix)
+                continue;
+            atomicAdd(&s->warp_hist[warp][(k >> shift) & 0xff], 1);
+        }
+        __syncthreads();
+        // Warp 0 reduces the per-warp histograms and finds b* = the highest
+        // byte bin whose suffix-cumulative count reaches K_rem (gt = items
+        // strictly above b*, always < K_rem).  Each lane owns 8 bins; lane
+        // suffix-sums combine via shuffles — a serial 256-bin scan here costs
+        // microseconds of dependent shared-memory latency per level.
+        if (tid < 32) {
+            const int base = tid * 8;
+            int v[8], loc[8];
+            int acc = 0;
+#pragma unroll
+            for (int q = 7; q >= 0; --q) {
+                int sum = 0;
+#pragma unroll
+                for (int w = 0; w < SelectScratch<BLOCK_SIZE>::WARPS; ++w)
+                    sum += s->warp_hist[w][base + q];
+                v[q] = sum;
+                acc += sum;
+                loc[q] = acc;  // suffix-sum within this lane's bins
+            }
+            // Inclusive suffix-sum of lane totals over the warp.
+            int lane_suffix = acc;
+#pragma unroll
+            for (int off = 1; off < 32; off <<= 1) {
+                int x = __shfl_down_sync(0xffffffffu, lane_suffix, off);
+                if (tid + off < 32)
+                    lane_suffix += x;
+            }
+            const int suffix_higher = lane_suffix - acc;  // bins of higher lanes
+#pragma unroll
+            for (int q = 7; q >= 0; --q) {
+                int s_q = loc[q] + suffix_higher;
+                int s_q1 = (q == 7) ? suffix_higher : loc[q + 1] + suffix_higher;
+                if (s_q >= K_rem && s_q1 < K_rem) {  // true for exactly one (lane, q)
+                    s->bstar = base + q;
+                    s->gt = s_q1;
+                    s->eq = v[q];
+                }
+            }
+        }
+        __syncthreads();
+        const int bstar = s->bstar, gt = s->gt, eq = s->eq;
+        if (collected + gt + eq <= MAX_OUT) {
+            // Everything in bins >= b* fits in the output budget: collect it
+            // all and stop (may exceed K; callers sort and truncate).
+            for (int i = tid; i < n; i += BLOCK_SIZE) {
+                uint64_t k = key_at(i);
+                if (plen && (k >> (64 - plen)) != prefix)
+                    continue;
+                if (int((k >> shift) & 0xff) >= bstar)
+                    emit(atomicAdd(&s->out_n, 1), i, k);
+            }
+            __syncthreads();
+            collected += gt + eq;
+            break;
+        }
+        // Refine: collect bins > b* (gt < K_rem items), recurse into bin b*.
+        for (int i = tid; i < n; i += BLOCK_SIZE) {
+            uint64_t k = key_at(i);
+            if (plen && (k >> (64 - plen)) != prefix)
+                continue;
+            if (int((k >> shift) & 0xff) > bstar)
+                emit(atomicAdd(&s->out_n, 1), i, k);
+        }
+        __syncthreads();
+        collected += gt;
+        K_rem -= gt;
+        prefix = (prefix << 8) | uint64_t(bstar);
+        plen += 8;
+    }
+    return collected;
+}
+
+__device__ __forceinline__ uint64_t shfl_xor_u64(uint64_t v, int mask) {
+    uint32_t hi = __shfl_xor_sync(0xffffffffu, uint32_t(v >> 32), mask);
+    uint32_t lo = __shfl_xor_sync(0xffffffffu, uint32_t(v), mask);
+    return (uint64_t(hi) << 32) | uint64_t(lo);
+}
+
+// In-place bitonic sort of 64 u64 keys in shared memory, descending.  Warp 0
+// holds two elements per lane in registers and exchanges via shuffles — no
+// block barriers inside the 21-stage network.  All threads must call
+// (trailing __syncthreads publishes the result).
+template <int BLOCK_SIZE>
+__device__ void bitonic_sort64_desc(uint64_t* keys) {
+    const int tid = threadIdx.x;
+    if (tid < 32) {
+        uint64_t a = keys[tid];        // element i = tid
+        uint64_t b = keys[tid + 32];   // element i = tid + 32
+        for (int k = 2; k <= 64; k <<= 1) {
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                if (j < 32) {
+                    // Partner is j apart within the same register vector.
+                    uint64_t pa = shfl_xor_u64(a, j);
+                    bool keep_max_a = (((tid & j) == 0) == ((tid & k) == 0));
+                    a = keep_max_a ? (a > pa ? a : pa) : (a < pa ? a : pa);
+                    uint64_t pb = shfl_xor_u64(b, j);
+                    bool keep_max_b = (((tid & j) == 0) == (((tid + 32) & k) == 0));
+                    b = keep_max_b ? (b > pb ? b : pb) : (b < pb ? b : pb);
+                } else {
+                    // j == 32 (k == 64): partner is the other register, same
+                    // lane; the final merge block is descending for all i.
+                    uint64_t mx = a > b ? a : b;
+                    uint64_t mn = a < b ? a : b;
+                    a = mx;
+                    b = mn;
+                }
+            }
+        }
+        keys[tid] = a;
+        keys[tid + 32] = b;
+    }
+    __syncthreads();
+}
+
+// --- fused first step ---------------------------------------------------------
+
+template <int BLOCK_SIZE>
+struct FirstStepSmem {
+    static constexpr int RANK_BUF = 64;
+    static constexpr int VKEY_CACHE = 6144;
+    uint64_t rank[RANK_BUF];
+    int n_sel;
+    int beam_char[FUSED_MAX_BEAM];
+    float beam_lp[FUSED_MAX_BEAM];
+    // Sortable lp keys cached in shared memory (vocab <= VKEY_CACHE) so the
+    // multi-pass radix select re-reads smem instead of cold global memory.
+    uint32_t vkeys[VKEY_CACHE];
+    SelectScratch<BLOCK_SIZE> sel;
+};
+
+// Drop-in replacement for first_step_kernel / first_step_paged_kernel
+// (PAGED selects the token-write target).  Semantics identical: top
+// nb_beams non-blank chars of the first selected frame become beams 0..nb-1
+// (ties by ascending char id, like the stable legacy sort); slot beam-1 is
+// the empty/blank prefix when beam > 1.
+template <int BLOCK_SIZE, bool PAGED>
+__global__ __launch_bounds__(BLOCK_SIZE) void fused_first_step_kernel(
+    const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
+    const int* __restrict__ select_seqs, const int* __restrict__ select_seq_lens,
+    float2* __restrict__ pprev, int* __restrict__ clast, int* __restrict__ clen,
+    int* __restrict__ clist, int* __restrict__ page_storage, int page_size,
+    int pages_per_row, float* __restrict__ score, int beam, int ldbeam, int ldseq_len,
+    int vocab_size, int blank_id, int batch, int max_seq_len) {
+    __shared__ FirstStepSmem<BLOCK_SIZE> s;
+    const int bid = blockIdx.x;
+    if (bid >= batch)
+        return;
+    if (select_seq_lens[bid] == 0)
+        return;
+    const int tid = threadIdx.x;
+    const int first_t = select_seqs[bid * max_seq_len];
+    const float* lp_row =
+        log_prob + (size_t)bid * batch_stride + (size_t)first_t * seq_stride;
+    const int nb_beams = (beam > 1) ? beam - 1 : beam;
+
+    const bool use_vcache = (vocab_size <= FirstStepSmem<BLOCK_SIZE>::VKEY_CACHE);
+    if (use_vcache) {
+        for (int c = tid; c < vocab_size; c += BLOCK_SIZE)
+            s.vkeys[c] = f32_sortable(lp_row[(size_t)c * vocab_stride]);
+        __syncthreads();
+    }
+
+    // Top-(nb_beams + 1) so a high-probability blank can be discarded
+    // post-sort while still leaving nb_beams non-blank chars.
+    {
+        auto key_at = [&](int c) -> uint64_t {
+            uint32_t sk = use_vcache ? s.vkeys[c]
+                                     : f32_sortable(lp_row[(size_t)c * vocab_stride]);
+            return (uint64_t(sk) << 32) | uint64_t(0xffffffffu - uint32_t(c));
+        };
+        auto emit = [&](int slot, int /*c*/, uint64_t k) {
+            if (slot < FirstStepSmem<BLOCK_SIZE>::RANK_BUF)
+                s.rank[slot] = k;
+        };
+        int cnt = block_topk_select<BLOCK_SIZE, FirstStepSmem<BLOCK_SIZE>::RANK_BUF>(
+            vocab_size, nb_beams + 1, key_at, emit, &s.sel);
+        if (tid == 0)
+            s.n_sel = cnt;
+    }
+    __syncthreads();
+    for (int i = tid; i < FirstStepSmem<BLOCK_SIZE>::RANK_BUF; i += BLOCK_SIZE)
+        if (i >= s.n_sel)
+            s.rank[i] = 0;  // sorts last
+    __syncthreads();
+    bitonic_sort64_desc<BLOCK_SIZE>(s.rank);
+
+    if (tid == 0) {
+        int out = 0;
+        for (int r = 0; r < s.n_sel && out < nb_beams; ++r) {
+            int c = (int)ckey_id(s.rank[r]);
+            if (c == blank_id)
+                continue;
+            s.beam_char[out] = c;
+            s.beam_lp[out] = ckey_score(s.rank[r]);
+            ++out;
+        }
+        for (; out < nb_beams; ++out)
+            s.beam_char[out] = -1;
+    }
+    __syncthreads();
+
+    for (int k = tid; k < nb_beams; k += BLOCK_SIZE) {
+        int base = bid * ldbeam + k;
+        int token = s.beam_char[k];
+        if (token >= 0) {
+            // Prefix [token] ends in a non-blank: mass goes in the non-blank
+            // slot (see the legacy first_step_kernel for the full rationale).
+            pprev[base] = make_float2(NEG_INF, s.beam_lp[k]);
+            if (PAGED) {
+                page_storage[(size_t)(bid * pages_per_row + k) * page_size] = token;
+            } else {
+                clist[(size_t)(bid * beam + k) * ldseq_len] = token;
+            }
+            clen[base] = 1;
+            clast[base] = token;
+            score[base] = s.beam_lp[k];
+        } else {
+            pprev[base] = make_float2(NEG_INF, NEG_INF);
+            clast[base] = blank_id;
+            clen[base] = 0;
+            score[base] = NEG_INF;
+        }
+    }
+
+    if (beam > 1 && tid == 0) {
+        int base = bid * ldbeam + (beam - 1);
+        float blank_prob = lp_row[(size_t)blank_id * vocab_stride];
+        pprev[base] = make_float2(blank_prob, NEG_INF);
+        clast[base] = blank_id;
+        clen[base] = 0;
+        score[base] = blank_prob;
+    }
+}
+
+// --- fused beam-search step ----------------------------------------------------
+
+template <int BLOCK_SIZE, int BEAM_CAP>
+struct FusedStepSmem {
+    static constexpr int K_ALL_CAP = 2 * BEAM_CAP + 2;
+    static constexpr int C_BUF = K_ALL_CAP + 8;  // slack lets the select stop early
+    static constexpr int CAND_CAP = BEAM_CAP * (C_BUF + 3);
+    static constexpr int RANK_BUF = 64;
+    // Sortable lp keys cached in shared memory (vocab <= VKEY_CACHE) so the
+    // multi-pass radix select re-reads smem instead of cold global memory.
+    // The 32-beam variant shrinks the cache to stay under the 48 KB static
+    // shared-memory limit.
+    static constexpr int VKEY_CACHE = (BEAM_CAP <= 16) ? 6144 : 2048;
+
+    // Per-beam state snapshot (after the blank-frame adjustment)
+    float2 prev[BEAM_CAP];
+    float A[BEAM_CAP];  // logsumexp(prev.x, prev.y)
+    int s_clast[BEAM_CAP];
+    int s_clen[BEAM_CAP];
+    float lp_clast[BEAM_CAP];  // log_prob[t, clast[k]]
+    // Duplicate-prefix merge map
+    int patch_chars[BEAM_CAP][BEAM_CAP];   // chars zeroed in row k by a merge
+    int8_t merge_src[BEAM_CAP][BEAM_CAP];  // shorter rows folded into row k
+    int patch_cnt[BEAM_CAP];
+    int merge_cnt[BEAM_CAP];
+    // Shared vocab candidates (top-K_all lp chars of this frame)
+    int c_chars[C_BUF];
+    float c_lp[C_BUF];
+    int c_n;
+    // Scored candidates and final ranking
+    uint64_t ckeys[CAND_CAP];
+    int cand_n;
+    uint64_t rank[RANK_BUF];
+    // Paged CoW releases deferred past the last alloc_page pop (see Phase 6)
+    int defer_free[BEAM_CAP];
+    int defer_n;
+    // Broadcast scalars
+    float lp_blank, lp_space;
+    int k_all;
+    uint32_t vkeys[VKEY_CACHE];
+    SelectScratch<BLOCK_SIZE> sel;
+};
+
+// One block per batch row; replaces prob_matrix + prob_space_blank + merge +
+// topk_phase1 + topk_phase2 (and their paged variants).  Score formulas and
+// the state-update logic mirror the legacy kernels exactly — see the section
+// comment above for the candidate-set argument and the deterministic-ordering
+// differences.
+template <int BLOCK_SIZE, int BEAM_CAP, bool PAGED>
+__global__ __launch_bounds__(BLOCK_SIZE) void fused_step_kernel(
+    const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
+    const int* __restrict__ select_seqs, const int* __restrict__ select_seq_lens,
+    const int* __restrict__ d_step, int step_const, float2* __restrict__ pprev,
+    int* __restrict__ clast, const int* __restrict__ clen_src, int* __restrict__ clen_dst,
+    const int* __restrict__ clist_src, int* __restrict__ clist_dst, float* __restrict__ score,
+    int ldc, int beam, int ldbeam, int ldseq_len, int batch, int blank_id, int space_id,
+    int max_seq_len, int* __restrict__ page_storage, const int* __restrict__ block_table_src,
+    int* __restrict__ block_table_dst, int* __restrict__ ref_counts,
+    int* __restrict__ next_free_page, int* __restrict__ free_pool,
+    int* __restrict__ free_pool_size, int page_size, int max_lp, int pages_per_row) {
+    using Smem = FusedStepSmem<BLOCK_SIZE, BEAM_CAP>;
+    __shared__ Smem s;
+
+    const int bid = blockIdx.x;
+    if (bid >= batch)
+        return;
+    // step_const >= 0 is the offline fast path (the host loop knows the step,
+    // saving a per-step device-counter update); -1 reads the device-resident
+    // counter so a captured streaming graph stays valid across frames.
+    const int step = (step_const >= 0) ? step_const : __ldg(d_step);
+    if (step >= select_seq_lens[bid])
+        return;
+    const int tid = threadIdx.x;
+
+    if (PAGED) {
+        // Row-local allocator views (see the alloc_page/free_page comment).
+        free_pool += bid * pages_per_row;
+        free_pool_size += bid;
+        next_free_page += bid;
+    }
+
+    // Width-max_seq_len ring (no-op modulo for offline); see
+    // set_select_seq_step_kernel for the streaming rationale.
+    const int t = select_seqs[bid * max_seq_len + step % max_seq_len];
+    const int t_prev = select_seqs[bid * max_seq_len + (step - 1) % max_seq_len];
+    const bool need_add_blank = (t > t_prev + 1);
+    const float* lp_row = log_prob + (size_t)bid * batch_stride + (size_t)t * seq_stride;
+
+    // --- Phase 1: snapshot per-beam state (with blank-frame adjustment) -----
+    for (int k = tid; k < beam; k += BLOCK_SIZE) {
+        float2 raw = pprev[bid * ldbeam + k];
+        float2 prev =
+            need_add_blank ? make_float2(logsumexp(raw.x, raw.y), NEG_INF) : raw;
+        s.prev[k] = prev;
+        s.A[k] = logsumexp(prev.x, prev.y);
+        int lc = clast[bid * ldbeam + k];
+        s.s_clast[k] = lc;
+        s.s_clen[k] = clen_src[bid * ldbeam + k];
+        s.lp_clast[k] = lp_row[(size_t)lc * vocab_stride];
+        s.patch_cnt[k] = 0;
+        s.merge_cnt[k] = 0;
+    }
+    if (tid == 0) {
+        s.lp_blank = lp_row[(size_t)blank_id * vocab_stride];
+        s.lp_space = (space_id >= 0) ? lp_row[(size_t)space_id * vocab_stride] : NEG_INF;
+        s.cand_n = 0;
+        s.defer_n = 0;
+    }
+    __syncthreads();
+
+    // --- Phase 2: merge map (same pair condition as legacy merge_kernel) ----
+    for (int p = tid; p < beam * beam; p += BLOCK_SIZE) {
+        const int i = p / beam;        // shorter beam
+        const int j = p - i * beam;    // longer beam (j = i + clast[j])
+        if (s.s_clen[j] - 1 != s.s_clen[i])
+            continue;
+        bool eq;
+        if (PAGED) {
+            eq = paged_memory::paged_seq_compare(page_storage, block_table_src, bid, j, i,
+                                                 s.s_clen[i], beam, page_size, max_lp);
+        } else {
+            eq = seq_compare(s.s_clen[i],
+                             clist_src + (size_t)(bid * beam + j) * ldseq_len,
+                             clist_src + (size_t)(bid * beam + i) * ldseq_len);
+        }
+        if (!eq)
+            continue;
+        int pp = atomicAdd(&s.patch_cnt[i], 1);
+        s.patch_chars[i][pp] = s.s_clast[j];
+        int mm = atomicAdd(&s.merge_cnt[j], 1);
+        s.merge_src[j][mm] = (int8_t)i;
+    }
+    __syncthreads();
+
+    // Sort each merge-source list so the blank-slot fold below accumulates in
+    // ascending source-beam order (the legacy cross-block fold was racy and
+    // had no defined order); compute K_all from the worst-case patch count.
+    for (int k = tid; k < beam; k += BLOCK_SIZE) {
+        int m = s.merge_cnt[k];
+        for (int a = 1; a < m; ++a) {
+            int8_t v = s.merge_src[k][a];
+            int b = a - 1;
+            while (b >= 0 && s.merge_src[k][b] > v) {
+                s.merge_src[k][b + 1] = s.merge_src[k][b];
+                --b;
+            }
+            s.merge_src[k][b + 1] = v;
+        }
+    }
+    if (tid == 0) {
+        int mp = 0;
+        for (int k = 0; k < beam; ++k)
+            mp = max(mp, s.patch_cnt[k]);
+        // beam ordinaries + blank + last-char + space, displaced by patches.
+        s.k_all = min(beam + 3 + mp, Smem::K_ALL_CAP);
+    }
+    __syncthreads();
+
+    // --- Phase 3: shared vocab top-K_all -------------------------------------
+    const bool use_vcache = (ldc <= Smem::VKEY_CACHE);
+    if (use_vcache) {
+        for (int c = tid; c < ldc; c += BLOCK_SIZE)
+            s.vkeys[c] = f32_sortable(lp_row[(size_t)c * vocab_stride]);
+        __syncthreads();
+    }
+    {
+        auto key_at = [&](int c) -> uint64_t {
+            uint32_t sk = use_vcache ? s.vkeys[c]
+                                     : f32_sortable(lp_row[(size_t)c * vocab_stride]);
+            return (uint64_t(sk) << 32) | uint64_t(0xffffffffu - uint32_t(c));
+        };
+        auto emit = [&](int slot, int c, uint64_t k) {
+            if (slot < Smem::C_BUF) {
+                s.c_chars[slot] = c;
+                s.c_lp[slot] = ckey_score(k);
+            }
+        };
+        int cnt = block_topk_select<BLOCK_SIZE, Smem::C_BUF>(ldc, s.k_all, key_at, emit,
+                                                             &s.sel);
+        if (tid == 0)
+            s.c_n = cnt;
+    }
+    __syncthreads();
+
+    // Candidate value helpers — these reproduce the legacy ptable/ptablen
+    // entries bit-exactly (for every non-blank slot ptable == NEG_INF, so the
+    // legacy key logsumexp(ptable, ptablen) equals ptablen).
+    auto is_patched = [&](int k, int c) -> bool {
+        int pc = s.patch_cnt[k];
+        for (int a = 0; a < pc; ++a)
+            if (s.patch_chars[k][a] == c)
+                return true;
+        return false;
+    };
+    // ptablen value of non-blank slot (k, c).
+    auto nonblank_slot_pn = [&](int k, int c, float lp_c) -> float {
+        if (is_patched(k, c))
+            return NEG_INF;
+        if (space_id >= 0 && c == space_id)
+            return logprob_add(lp_c, s.A[k]);  // space ignores the same-char rule
+        if (c == s.s_clast[k])
+            return logprob_add(lp_c, s.prev[k].x);  // repeat needs a blank path
+        return logprob_add(lp_c, s.A[k]);
+    };
+    // (ptable, ptablen) of the blank slot of row k, including the merge folds
+    // (the legacy ptable fold adds only NEG_INF terms — an exact no-op).
+    auto blank_slot = [&](int k, float* out_p) -> float {
+        float p = logprob_add(s.lp_blank, s.A[k]);
+        float pn = (need_add_blank || s.s_clast[k] == blank_id)
+                       ? NEG_INF
+                       : logprob_add(s.lp_clast[k], s.prev[k].y);
+        int m = s.merge_cnt[k];
+        for (int a = 0; a < m; ++a) {
+            int i = s.merge_src[k][a];
+            // Value of slot (i, clast[k]) as written by the legacy prob
+            // kernels, before any patching.
+            float contrib;
+            if (space_id >= 0 && s.s_clast[k] == space_id)
+                contrib = logprob_add(s.lp_space, s.A[i]);
+            else if (s.s_clast[i] == s.s_clast[k])
+                contrib = logprob_add(s.lp_clast[k], s.prev[i].x);
+            else
+                contrib = logprob_add(s.lp_clast[k], s.A[i]);
+            pn = logsumexp(pn, contrib);
+        }
+        *out_p = p;
+        return pn;
+    };
+
+    // --- Phase 4: enumerate + score candidates -------------------------------
+    const int c_n = s.c_n;
+    const int per_row = c_n + 3;
+    for (int e = tid; e < beam * per_row; e += BLOCK_SIZE) {
+        const int k = e / per_row;
+        const int j = e - k * per_row;
+        float key_val;
+        int c;
+        if (j < c_n) {
+            c = s.c_chars[j];
+            if (c == blank_id)
+                continue;  // blank slot handled at j == c_n
+            key_val = nonblank_slot_pn(k, c, s.c_lp[j]);
+        } else if (j == c_n) {
+            c = blank_id;
+            float p;
+            float pn = blank_slot(k, &p);
+            key_val = logsumexp(p, pn);
+        } else if (j == c_n + 1) {
+            // Last-char slot, unless already covered by the shared list.
+            c = s.s_clast[k];
+            if (c == blank_id)
+                continue;
+            bool in_c = false;
+            for (int a = 0; a < c_n; ++a)
+                if (s.c_chars[a] == c) {
+                    in_c = true;
+                    break;
+                }
+            if (in_c)
+                continue;
+            key_val = nonblank_slot_pn(k, c, s.lp_clast[k]);
+        } else {
+            // Space slot, unless covered by the shared list or the last-char slot.
+            if (space_id < 0 || space_id == blank_id)
+                continue;
+            c = space_id;
+            if (c == s.s_clast[k])
+                continue;
+            bool in_c = false;
+            for (int a = 0; a < c_n; ++a)
+                if (s.c_chars[a] == c) {
+                    in_c = true;
+                    break;
+                }
+            if (in_c)
+                continue;
+            key_val = nonblank_slot_pn(k, c, s.lp_space);
+        }
+        int slot = atomicAdd(&s.cand_n, 1);
+        if (slot < Smem::CAND_CAP)
+            s.ckeys[slot] = make_ckey(key_val, (uint32_t)(k * ldc + c));
+    }
+    __syncthreads();
+
+    // --- Phase 5: global top-beam select + rank ------------------------------
+    {
+        const int n_cand = min(s.cand_n, Smem::CAND_CAP);
+        auto key_at = [&](int i) -> uint64_t { return s.ckeys[i]; };
+        auto emit = [&](int slot, int /*i*/, uint64_t k) {
+            if (slot < Smem::RANK_BUF)
+                s.rank[slot] = k;
+        };
+        block_topk_select<BLOCK_SIZE, Smem::RANK_BUF>(n_cand, beam, key_at, emit, &s.sel);
+    }
+    __syncthreads();
+    for (int i = tid; i < Smem::RANK_BUF; i += BLOCK_SIZE)
+        if (i >= s.sel.out_n)
+            s.rank[i] = 0;  // sorts last
+    __syncthreads();
+    bitonic_sort64_desc<BLOCK_SIZE>(s.rank);
+
+    // --- Phase 6: state update (legacy topk_phase2 semantics) ----------------
+    constexpr int WRITE_THREADS = 8;
+    const int sub = tid / WRITE_THREADS;
+    const int lane = tid % WRITE_THREADS;
+    const int n_sub = BLOCK_SIZE / WRITE_THREADS;
+
+    if (PAGED) {
+        // Pass 1: fork block tables (release old dst refs, acquire src refs).
+        for (int out_beam = sub; out_beam < beam; out_beam += n_sub) {
+            int id = (int)ckey_id(s.rank[out_beam]);
+            int src_beam = id / ldc;
+            int prevlen = s.s_clen[src_beam];
+            int n_pages = (prevlen > 0) ? (prevlen + page_size - 1) / page_size : 0;
+            int bk_src = bid * beam + src_beam;
+            int bk_dst = bid * beam + out_beam;
+            for (int p = lane; p < n_pages; p += WRITE_THREADS) {
+                int phys = block_table_src[bk_src * max_lp + p];
+                int old_phys = block_table_dst[bk_dst * max_lp + p];
+                if (old_phys == phys)
+                    continue;  // self-fork: net refcount no-op (legacy
+                               // free+re-acquire could push a live page)
+                if (old_phys != paged_memory::INVALID_PAGE)
+                    free_page(old_phys, free_pool, free_pool_size, ref_counts);
+                block_table_dst[bk_dst * max_lp + p] = phys;
+                atomicAdd(&ref_counts[phys], 1);
+            }
+        }
+        // All free_page pushes must be visible before any alloc_page pop.
+        __syncthreads();
+    }
+
+    for (int out_beam = sub; out_beam < beam; out_beam += n_sub) {
+        uint64_t kk = s.rank[out_beam];
+        int id = (int)ckey_id(kk);
+        int src_beam = id / ldc;
+        int char_id = id - src_beam * ldc;
+        int prevlen = s.s_clen[src_beam];
+
+        if (!PAGED) {
+            // Parallel clist copy (WRITE_THREADS threads per output beam).
+            for (int q = lane; q < prevlen; q += WRITE_THREADS)
+                clist_dst[(size_t)(bid * beam + out_beam) * ldseq_len + q] =
+                    clist_src[(size_t)(bid * beam + src_beam) * ldseq_len + q];
+        }
+        if (lane != 0)
+            continue;
+
+        int dst = bid * ldbeam + out_beam;
+        if (PAGED) {
+            int bk_dst = bid * beam + out_beam;
+            const int out_cap = max_lp * page_size;
+            if (char_id == blank_id) {
+                clast[dst] = s.s_clast[src_beam];
+                clen_dst[dst] = prevlen;
+            } else if (prevlen >= out_cap) {
+                // Output cap reached: keep the prefix, stop appending tokens.
+                clast[dst] = char_id;
+                clen_dst[dst] = out_cap;
+            } else {
+                clast[dst] = char_id;
+                clen_dst[dst] = prevlen + 1;
+                int write_pos = prevlen;
+                int last_lp = write_pos / page_size;
+                int off = write_pos - last_lp * page_size;
+                if (off == 0) {
+                    int new_phys = alloc_page(free_pool, free_pool_size, next_free_page);
+                    block_table_dst[bk_dst * max_lp + last_lp] = new_phys;
+                    ref_counts[new_phys] = 1;
+                    page_storage[new_phys * page_size + 0] = char_id;
+                } else {
+                    int bt_idx = bk_dst * max_lp + last_lp;
+                    int phys = block_table_dst[bt_idx];
+                    if (ref_counts[phys] > 1) {
+                        // Copy-on-write: the last page is shared.  The pool
+                        // push for the released reference is DEFERRED past the
+                        // last alloc_page pop of this step — a concurrent pop
+                        // could otherwise read the reserved free_pool slot
+                        // before this thread writes it.
+                        int new_phys =
+                            alloc_page(free_pool, free_pool_size, next_free_page);
+                        for (int q = 0; q < page_size; ++q)
+                            page_storage[new_phys * page_size + q] =
+                                page_storage[phys * page_size + q];
+                        block_table_dst[bt_idx] = new_phys;
+                        if (atomicSub(&ref_counts[phys], 1) == 1) {
+                            int dslot = atomicAdd(&s.defer_n, 1);
+                            s.defer_free[dslot] = phys;
+                        }
+                        ref_counts[new_phys] = 1;
+                        phys = new_phys;
+                    }
+                    page_storage[phys * page_size + off] = char_id;
+                }
+            }
+        } else {
+            if (char_id == blank_id) {
+                // Blank extension: keep same prefix, propagate last char.
+                clast[dst] = s.s_clast[src_beam];
+                clen_dst[dst] = prevlen;
+            } else {
+                // Non-blank extension; cap clen at the clist capacity (see the
+                // legacy topk_phase2_kernel for the streaming rationale).
+                clast[dst] = char_id;
+                if (prevlen < ldseq_len) {
+                    clen_dst[dst] = prevlen + 1;
+                    clist_dst[(size_t)(bid * beam + out_beam) * ldseq_len + prevlen] =
+                        char_id;
+                } else {
+                    clen_dst[dst] = ldseq_len;
+                }
+            }
+        }
+
+        score[dst] = ckey_score(kk);
+
+        // pprev for the next step is this slot's (ptable, ptablen) split,
+        // recomputed analytically (identical to the legacy table read).
+        float2 ppn;
+        if (char_id == blank_id) {
+            float p;
+            float pn = blank_slot(src_beam, &p);
+            ppn = make_float2(p, pn);
+        } else {
+            float lp_c = lp_row[(size_t)char_id * vocab_stride];
+            ppn = make_float2(NEG_INF, nonblank_slot_pn(src_beam, char_id, lp_c));
+        }
+        pprev[dst] = ppn;
+    }
+
+    if (PAGED) {
+        // Flush the deferred CoW releases now that no alloc_page pop can run.
+        __syncthreads();
+        for (int i = tid; i < s.defer_n; i += BLOCK_SIZE) {
+            int slot = atomicAdd(free_pool_size, 1);
+            free_pool[slot] = s.defer_free[i];
+        }
+    }
+}
+
+}  // namespace fused
+
+// =============================================================================
 // Host-side workspace management
 // =============================================================================
 
@@ -1266,17 +2086,21 @@ inline size_t calculate_workspace_size(int batch, int beam, int vocab_size, int 
     int ldc = vocab_size;
 
     size_t total = 0;
-    total += align_size(sizeof(float2) * batch * ldbeam);             // pprev
-    total += align_size(sizeof(float) * batch * beam * ldc);          // ptable
-    total += align_size(sizeof(float) * batch * beam * ldc);          // ptablen
+    total += align_size(sizeof(float2) * batch * ldbeam);  // pprev
+    if (layout_has_prob_tables(beam)) {
+        total += align_size(sizeof(float) * batch * beam * ldc);  // ptable
+        total += align_size(sizeof(float) * batch * beam * ldc);  // ptablen
+    }
     total += align_size(sizeof(int) * batch * ldbeam);                // clast
     total += align_size(sizeof(int) * batch * ldbeam) * 2;            // clen[0..1]
     total += align_size(sizeof(int) * batch * beam * ldseq_len) * 2;  // clist[0..1]
     total += align_size(sizeof(int) * batch * ldbeam);                // ptid (unused)
     total += align_size(sizeof(float) * batch * ldbeam);              // score
-    // topk buffers: batch * MAX_BLOCKS_PER_BATCH * beam (Phase 1 output)
-    total += align_size(sizeof(float) * batch * MAX_BLOCKS_PER_BATCH * beam);
-    total += align_size(sizeof(int) * batch * MAX_BLOCKS_PER_BATCH * beam);
+    if (layout_has_prob_tables(beam)) {
+        // topk buffers: batch * MAX_BLOCKS_PER_BATCH * beam (Phase 1 output)
+        total += align_size(sizeof(float) * batch * MAX_BLOCKS_PER_BATCH * beam);
+        total += align_size(sizeof(int) * batch * MAX_BLOCKS_PER_BATCH * beam);
+    }
     total += align_size(sizeof(int) * batch * max_seq_len);  // select_seqs
     total += align_size(sizeof(int) * batch);                // select_seq_lens
     total += align_size(sizeof(float) * batch * ldc);        // d_lp_frame_buf (Step 4 capture)
@@ -1308,8 +2132,13 @@ inline void init_internal_data(InternalData* data, void* workspace, int batch, i
     ptr += align_size(sizeof(type) * (count));
 
     ALLOC_BUF(pprev, float2, batch * ldbeam)
-    ALLOC_BUF(ptable, float, batch * beam * ldc)
-    ALLOC_BUF(ptablen, float, batch * beam * ldc)
+    if (layout_has_prob_tables(beam)) {
+        ALLOC_BUF(ptable, float, batch * beam * ldc)
+        ALLOC_BUF(ptablen, float, batch * beam * ldc)
+    } else {
+        data->ptable = nullptr;
+        data->ptablen = nullptr;
+    }
     ALLOC_BUF(clast, int, batch* ldbeam)
     ALLOC_BUF(clen[0], int, batch* ldbeam)
     ALLOC_BUF(clen[1], int, batch* ldbeam)
@@ -1317,8 +2146,13 @@ inline void init_internal_data(InternalData* data, void* workspace, int batch, i
     ALLOC_BUF(clist[1], int, batch * beam * ldseq_len)
     ALLOC_BUF(ptid, int, batch* ldbeam)
     ALLOC_BUF(score, float, batch* ldbeam)
-    ALLOC_BUF(topk_key_buffer, float, batch * MAX_BLOCKS_PER_BATCH * beam)
-    ALLOC_BUF(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
+    if (layout_has_prob_tables(beam)) {
+        ALLOC_BUF(topk_key_buffer, float, batch * MAX_BLOCKS_PER_BATCH * beam)
+        ALLOC_BUF(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
+    } else {
+        data->topk_key_buffer = nullptr;
+        data->topk_value_buffer = nullptr;
+    }
     ALLOC_BUF(select_seqs, int, batch* max_seq_len)
     ALLOC_BUF(select_seq_lens, int, batch)
     ALLOC_BUF(d_lp_frame_buf, float, batch * ldc)
@@ -1338,15 +2172,19 @@ inline size_t calculate_paged_workspace_size(int batch, int beam, int vocab_size
 
     size_t total = 0;
     total += align_size(sizeof(float2) * batch * ldbeam);
-    total += align_size(sizeof(float) * batch * beam * ldc);
-    total += align_size(sizeof(float) * batch * beam * ldc);
+    if (layout_has_prob_tables(beam)) {
+        total += align_size(sizeof(float) * batch * beam * ldc);
+        total += align_size(sizeof(float) * batch * beam * ldc);
+    }
     total += align_size(sizeof(int) * batch * ldbeam);
     total += align_size(sizeof(int) * batch * ldbeam) * 2;  // clen[0..1]
     // clist[0..1] are OMITTED — replaced by paged region
     total += align_size(sizeof(int) * batch * ldbeam);      // ptid
     total += align_size(sizeof(float) * batch * ldbeam);
-    total += align_size(sizeof(float) * batch * MAX_BLOCKS_PER_BATCH * beam);
-    total += align_size(sizeof(int) * batch * MAX_BLOCKS_PER_BATCH * beam);
+    if (layout_has_prob_tables(beam)) {
+        total += align_size(sizeof(float) * batch * MAX_BLOCKS_PER_BATCH * beam);
+        total += align_size(sizeof(int) * batch * MAX_BLOCKS_PER_BATCH * beam);
+    }
     total += align_size(sizeof(int) * batch * max_seq_len);
     total += align_size(sizeof(int) * batch);
     total += align_size(sizeof(float) * batch * ldc);  // d_lp_frame_buf (Step 4 capture)
@@ -1389,16 +2227,26 @@ inline void init_internal_data_paged(InternalData* data, void* workspace,
     ptr += align_size(sizeof(type) * (count));
 
     ALLOC_BUF_P(pprev, float2, batch * ldbeam)
-    ALLOC_BUF_P(ptable, float, batch * beam * ldc)
-    ALLOC_BUF_P(ptablen, float, batch * beam * ldc)
+    if (layout_has_prob_tables(beam)) {
+        ALLOC_BUF_P(ptable, float, batch * beam * ldc)
+        ALLOC_BUF_P(ptablen, float, batch * beam * ldc)
+    } else {
+        data->ptable = nullptr;
+        data->ptablen = nullptr;
+    }
     ALLOC_BUF_P(clast, int, batch * ldbeam)
     ALLOC_BUF_P(clen[0], int, batch * ldbeam)
     ALLOC_BUF_P(clen[1], int, batch * ldbeam)
     // clist[0] and clist[1] are NOT allocated; paged region follows instead
     ALLOC_BUF_P(ptid, int, batch * ldbeam)
     ALLOC_BUF_P(score, float, batch * ldbeam)
-    ALLOC_BUF_P(topk_key_buffer, float, batch * MAX_BLOCKS_PER_BATCH * beam)
-    ALLOC_BUF_P(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
+    if (layout_has_prob_tables(beam)) {
+        ALLOC_BUF_P(topk_key_buffer, float, batch * MAX_BLOCKS_PER_BATCH * beam)
+        ALLOC_BUF_P(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
+    } else {
+        data->topk_key_buffer = nullptr;
+        data->topk_value_buffer = nullptr;
+    }
     ALLOC_BUF_P(select_seqs, int, batch * max_seq_len)
     ALLOC_BUF_P(select_seq_lens, int, batch)
     ALLOC_BUF_P(d_lp_frame_buf, float, batch * ldc)
@@ -1418,7 +2266,7 @@ inline cudaError_t ctc_prefix_beam_search_step(InternalData* data, const float* 
                                                int batch_stride, int seq_stride, int vocab_stride,
                                                int step, bool is_last_step, int blank_id,
                                                int space_id, cudaStream_t stream,
-                                               const int* d_step) {
+                                               const int* d_step, bool d_step_dynamic = true) {
     int batch = data->batch;
     int beam = data->beam;
     int ldc = data->ldc;
@@ -1435,6 +2283,35 @@ inline cudaError_t ctc_prefix_beam_search_step(InternalData* data, const float* 
     // across multiple frames at the same parity.
     int src_parity = (step == 0) ? 0 : ((step - 1) % 2);
     int dst_parity = (step == 0) ? 0 : (step % 2);
+
+    if (step_uses_fused(beam)) {
+        constexpr int FUSED_BLOCK = 256;
+        if (step == 0) {
+            fused::fused_first_step_kernel<FUSED_BLOCK, false><<<batch, FUSED_BLOCK, 0, stream>>>(
+                log_prob, batch_stride, seq_stride, vocab_stride, data->select_seqs,
+                data->select_seq_lens, data->pprev, data->clast, data->clen[0],
+                data->clist[0], /*page_storage=*/nullptr, /*page_size=*/0,
+                /*pages_per_row=*/0, data->score, beam, ldbeam, ldseq_len,
+                data->vocab_size, blank_id, batch, max_seq_len);
+        } else {
+            const int step_const = d_step_dynamic ? -1 : step;
+#define OASR_LAUNCH_FUSED_STEP(BEAM_CAP)                                                       \
+    fused::fused_step_kernel<FUSED_BLOCK, BEAM_CAP, false><<<batch, FUSED_BLOCK, 0, stream>>>( \
+        log_prob, batch_stride, seq_stride, vocab_stride, data->select_seqs,                   \
+        data->select_seq_lens, d_step, step_const, data->pprev, data->clast,                   \
+        data->clen[src_parity], data->clen[dst_parity], data->clist[src_parity],               \
+        data->clist[dst_parity], data->score, ldc, beam, ldbeam, ldseq_len, batch, blank_id,   \
+        space_id, max_seq_len, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,  \
+        0, 0, 0)
+            if (beam <= 16) {
+                OASR_LAUNCH_FUSED_STEP(16);
+            } else {
+                OASR_LAUNCH_FUSED_STEP(32);
+            }
+#undef OASR_LAUNCH_FUSED_STEP
+        }
+        return cudaGetLastError();
+    }
 
     if (step == 0) {
         // Initialise beam state from the first selected frame.  Parallel block-wide
@@ -1527,8 +2404,11 @@ inline cudaError_t ctc_beam_search_decode_batch(
     // ptable and ptablen must start at NEG_INF so that stale entries from
     // previous steps (or the initial state) don't corrupt probability lookups.
     // 0xcc → float bit pattern ≈ -1.7e38, which is effectively -FLT_MAX.
-    cudaMemsetAsync(data.ptable, 0xcc, sizeof(float) * batch * beam * data.ldc, stream);
-    cudaMemsetAsync(data.ptablen, 0xcc, sizeof(float) * batch * beam * data.ldc, stream);
+    // (Not allocated when the fused step path is active.)
+    if (data.ptable) {
+        cudaMemsetAsync(data.ptable, 0xcc, sizeof(float) * batch * beam * data.ldc, stream);
+        cudaMemsetAsync(data.ptablen, 0xcc, sizeof(float) * batch * beam * data.ldc, stream);
+    }
     cudaMemsetAsync(data.select_seq_lens, 0, sizeof(int) * batch, stream);
 
     // Blank threshold: convert from probability space to log space.
@@ -1558,29 +2438,25 @@ inline cudaError_t ctc_beam_search_decode_batch(
     delete[] h_select_lens;
     data.max_select_seq_len = max_select;
 
-    // Scratch device int holding the current step value; refreshed before each
-    // inner-launcher call.  Kernels read ``*d_step`` instead of taking a host
-    // scalar so the streaming path can capture a shape-stable CUDA Graph in
-    // Step 4.  Offline batch is one alloc + ``max_select`` host→device memcpy
-    // updates per call; cheap relative to the per-step kernel work.
-    int* d_step_scratch = nullptr;
-    cudaError_t alloc_err = cudaMalloc(&d_step_scratch, sizeof(int));
-    if (alloc_err != cudaSuccess)
-        return alloc_err;
+    // The fused path receives the step by value (d_step_dynamic=false), so no
+    // per-step device-counter update is needed.  The legacy kernels read
+    // ``*d_step``; reuse the otherwise-unused ``ptid`` buffer as the scratch
+    // counter (saves a cudaMalloc/cudaFree per decode call) and refresh it
+    // with a per-step H2D copy.
+    int* d_step_scratch = data.ptid;
+    const bool fused_path = step_uses_fused(beam);
 
     // Main decode loop.
     for (int step = 0; step < max_select; ++step) {
-        cudaMemcpyAsync(d_step_scratch, &step, sizeof(int), cudaMemcpyHostToDevice, stream);
+        if (!fused_path)
+            cudaMemcpyAsync(d_step_scratch, &step, sizeof(int), cudaMemcpyHostToDevice, stream);
         bool is_last = (step == max_select - 1);
         cudaError_t err = ctc_prefix_beam_search_step(
             &data, log_prob, batch_stride, seq_stride, vocab_stride, step, is_last, blank_id,
-            space_id, stream, d_step_scratch);
-        if (err != cudaSuccess) {
-            cudaFree(d_step_scratch);
+            space_id, stream, d_step_scratch, /*d_step_dynamic=*/false);
+        if (err != cudaSuccess)
             return err;
-        }
     }
-    cudaFree(d_step_scratch);
 
     // Determine which double-buffer holds final results.
     // step=0 → clen[0]/clist[0]; step=N-1 where N>1 → clen[(N-1)%2]/clist[(N-1)%2].
@@ -1622,7 +2498,7 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
     InternalData* data, const float* log_prob,
     int batch_stride, int seq_stride, int vocab_stride,
     int step, int blank_id, int space_id, cudaStream_t stream,
-    const int* d_step);
+    const int* d_step, bool d_step_dynamic = true);
 
 // =============================================================================
 // Streaming state
@@ -1681,9 +2557,12 @@ inline void init_streaming_state(void* state_buffer, int batch, int beam, int vo
                     stream);
     cudaMemsetAsync(state.data.clist[1], 0xff, sizeof(int) * batch * beam * state.data.ldseq_len,
                     stream);
-    cudaMemsetAsync(state.data.ptable, 0xcc, sizeof(float) * batch * beam * state.data.ldc, stream);
-    cudaMemsetAsync(state.data.ptablen, 0xcc, sizeof(float) * batch * beam * state.data.ldc,
-                    stream);
+    if (state.data.ptable) {
+        cudaMemsetAsync(state.data.ptable, 0xcc, sizeof(float) * batch * beam * state.data.ldc,
+                        stream);
+        cudaMemsetAsync(state.data.ptablen, 0xcc, sizeof(float) * batch * beam * state.data.ldc,
+                        stream);
+    }
 
     // In streaming mode all frames are selected (no blank filtering); set up
     // select_seqs as identity mapping [0, 1, ..., max_seq_len-1] via kernel
@@ -1727,8 +2606,13 @@ inline void setup_internal_data_pointers(InternalData* data, void* workspace, in
     ptr += align_size(sizeof(type) * (count));
 
     ALLOC_BUF(pprev, float2, batch * ldbeam)
-    ALLOC_BUF(ptable, float, batch * beam * ldc)
-    ALLOC_BUF(ptablen, float, batch * beam * ldc)
+    if (layout_has_prob_tables(beam)) {
+        ALLOC_BUF(ptable, float, batch * beam * ldc)
+        ALLOC_BUF(ptablen, float, batch * beam * ldc)
+    } else {
+        data->ptable = nullptr;
+        data->ptablen = nullptr;
+    }
     ALLOC_BUF(clast, int, batch* ldbeam)
     ALLOC_BUF(clen[0], int, batch* ldbeam)
     ALLOC_BUF(clen[1], int, batch* ldbeam)
@@ -1736,8 +2620,13 @@ inline void setup_internal_data_pointers(InternalData* data, void* workspace, in
     ALLOC_BUF(clist[1], int, batch * beam * ldseq_len)
     ALLOC_BUF(ptid, int, batch* ldbeam)
     ALLOC_BUF(score, float, batch* ldbeam)
-    ALLOC_BUF(topk_key_buffer, float, batch * MAX_BLOCKS_PER_BATCH * beam)
-    ALLOC_BUF(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
+    if (layout_has_prob_tables(beam)) {
+        ALLOC_BUF(topk_key_buffer, float, batch * MAX_BLOCKS_PER_BATCH * beam)
+        ALLOC_BUF(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
+    } else {
+        data->topk_key_buffer = nullptr;
+        data->topk_value_buffer = nullptr;
+    }
     ALLOC_BUF(select_seqs, int, batch* max_seq_len)
     ALLOC_BUF(select_seq_lens, int, batch)
     ALLOC_BUF(d_lp_frame_buf, float, batch * ldc)
@@ -1773,15 +2662,25 @@ inline void setup_internal_data_paged_pointers(InternalData* data, void* workspa
     ptr += align_size(sizeof(type) * (count));
 
     ALLOC_BUF_P(pprev, float2, batch * ldbeam)
-    ALLOC_BUF_P(ptable, float, batch * beam * ldc)
-    ALLOC_BUF_P(ptablen, float, batch * beam * ldc)
+    if (layout_has_prob_tables(beam)) {
+        ALLOC_BUF_P(ptable, float, batch * beam * ldc)
+        ALLOC_BUF_P(ptablen, float, batch * beam * ldc)
+    } else {
+        data->ptable = nullptr;
+        data->ptablen = nullptr;
+    }
     ALLOC_BUF_P(clast, int, batch * ldbeam)
     ALLOC_BUF_P(clen[0], int, batch * ldbeam)
     ALLOC_BUF_P(clen[1], int, batch * ldbeam)
     ALLOC_BUF_P(ptid, int, batch * ldbeam)
     ALLOC_BUF_P(score, float, batch * ldbeam)
-    ALLOC_BUF_P(topk_key_buffer, float, batch * MAX_BLOCKS_PER_BATCH * beam)
-    ALLOC_BUF_P(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
+    if (layout_has_prob_tables(beam)) {
+        ALLOC_BUF_P(topk_key_buffer, float, batch * MAX_BLOCKS_PER_BATCH * beam)
+        ALLOC_BUF_P(topk_value_buffer, int, batch * MAX_BLOCKS_PER_BATCH * beam)
+    } else {
+        data->topk_key_buffer = nullptr;
+        data->topk_value_buffer = nullptr;
+    }
     ALLOC_BUF_P(select_seqs, int, batch * max_seq_len)
     ALLOC_BUF_P(select_seq_lens, int, batch)
     ALLOC_BUF_P(d_lp_frame_buf, float, batch * ldc)
@@ -1807,9 +2706,9 @@ inline void setup_internal_data_paged_pointers(InternalData* data, void* workspa
     PAGED_ALLOC_P(block_table[0], int, batch * beam * max_lp)
     PAGED_ALLOC_P(block_table[1], int, batch * beam * max_lp)
     PAGED_ALLOC_P(ref_counts, int, num_pages)
-    PAGED_ALLOC_P(next_free_page, int, 1)
+    PAGED_ALLOC_P(next_free_page, int, batch)
     PAGED_ALLOC_P(free_pool, int, num_pages)
-    PAGED_ALLOC_P(free_pool_size, int, 1)
+    PAGED_ALLOC_P(free_pool_size, int, batch)
 
 #undef PAGED_ALLOC_P
 }
@@ -1974,7 +2873,8 @@ __global__ __launch_bounds__(BLOCK_SIZE) void first_step_paged_kernel(
     const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
     const int* __restrict__ select_seqs, const int* __restrict__ select_seq_lens,
     float2* __restrict__ pprev, int* __restrict__ clast, int* __restrict__ clen,
-    float* __restrict__ score, int* __restrict__ page_storage, int page_size, int beam, int ldbeam,
+    float* __restrict__ score, int* __restrict__ page_storage, int page_size,
+    int pages_per_row, int beam, int ldbeam,
     int vocab_size, int blank_id, int batch, int max_seq_len) {
     const int bid = blockIdx.x;
     if (bid >= batch)
@@ -2054,7 +2954,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void first_step_paged_kernel(
             // Prefix [token] ends in a non-blank: mass goes in the non-blank
             // slot (see flat first_step_kernel for the full rationale).
             pprev[base] = make_float2(NEG_INF, key);
-            int phys = bid * beam + k;
+            int phys = bid * pages_per_row + k;
             page_storage[phys * page_size + 0] = token;
             clen[base] = 1;
             clast[base] = token;
@@ -2155,13 +3055,18 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_paged_kernel(
     int* __restrict__ block_table_src, int* __restrict__ block_table_dst,
     int* __restrict__ ref_counts, int* __restrict__ next_free_page,
     int* __restrict__ free_pool, int* __restrict__ free_pool_size,
-    int page_size, int max_lp) {
+    int page_size, int max_lp, int pages_per_row) {
     const int bid = blockIdx.x;
     if (bid >= batch)
         return;
     int step = __ldg(d_step);
     if (step >= select_seq_lens[bid])
         return;
+
+    // Row-local allocator views (see the alloc_page/free_page comment).
+    free_pool += bid * pages_per_row;
+    free_pool_size += bid;
+    next_free_page += bid;
 
     const int tx = threadIdx.x;
     const int rw_offset = bid * items_per_batch;
@@ -2453,7 +3358,7 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
     InternalData* data, const float* log_prob,
     int batch_stride, int seq_stride, int vocab_stride,
     int step, int blank_id, int space_id, cudaStream_t stream,
-    const int* d_step) {
+    const int* d_step, bool d_step_dynamic) {
     auto& ps = data->paged;
     int batch = data->batch;
     int beam = data->beam;
@@ -2464,12 +3369,44 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
     int src_parity = (step == 0) ? 0 : ((step - 1) % 2);
     int dst_parity = (step == 0) ? 0 : (step % 2);
 
+    if (step_uses_fused(beam)) {
+        constexpr int FUSED_BLOCK = 256;
+        const int fused_ppr = ps.num_pages / max(batch, 1);
+        if (step == 0) {
+            fused::fused_first_step_kernel<FUSED_BLOCK, true><<<batch, FUSED_BLOCK, 0, stream>>>(
+                log_prob, batch_stride, seq_stride, vocab_stride, data->select_seqs,
+                data->select_seq_lens, data->pprev, data->clast, data->clen[0],
+                /*clist=*/nullptr, ps.page_storage, ps.page_size, fused_ppr, data->score,
+                beam, ldbeam, data->ldseq_len, data->vocab_size, blank_id, batch, max_seq_len);
+        } else {
+            const int step_const = d_step_dynamic ? -1 : step;
+#define OASR_LAUNCH_FUSED_STEP_PAGED(BEAM_CAP)                                                \
+    fused::fused_step_kernel<FUSED_BLOCK, BEAM_CAP, true><<<batch, FUSED_BLOCK, 0, stream>>>( \
+        log_prob, batch_stride, seq_stride, vocab_stride, data->select_seqs,                  \
+        data->select_seq_lens, d_step, step_const, data->pprev, data->clast,                  \
+        data->clen[src_parity], data->clen[dst_parity], /*clist_src=*/nullptr,                \
+        /*clist_dst=*/nullptr, data->score, ldc, beam, ldbeam, data->ldseq_len, batch,        \
+        blank_id, space_id, max_seq_len, ps.page_storage, ps.block_table[src_parity],         \
+        ps.block_table[dst_parity], ps.ref_counts, ps.next_free_page, ps.free_pool,          \
+        ps.free_pool_size, ps.page_size, ps.max_logical_pages, fused_ppr)
+            if (beam <= 16) {
+                OASR_LAUNCH_FUSED_STEP_PAGED(16);
+            } else {
+                OASR_LAUNCH_FUSED_STEP_PAGED(32);
+            }
+#undef OASR_LAUNCH_FUSED_STEP_PAGED
+        }
+        return cudaGetLastError();
+    }
+
+    const int pages_per_row = ps.num_pages / max(batch, 1);
+
     if (step == 0) {
         first_step_paged_kernel<128, 4><<<batch, 128, 0, stream>>>(
             log_prob, batch_stride, seq_stride, vocab_stride,
             data->select_seqs, data->select_seq_lens,
             data->pprev, data->clast, data->clen[0], data->score,
-            ps.page_storage, ps.page_size,
+            ps.page_storage, ps.page_size, pages_per_row,
             beam, ldbeam, data->vocab_size, blank_id, batch, max_seq_len);
     } else {
         // --- Probability matrix (same as flat) ---
@@ -2536,7 +3473,7 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
                 ps.block_table[src_parity], ps.block_table[dst_parity],
                 ps.ref_counts, ps.next_free_page,
                 ps.free_pool, ps.free_pool_size,
-                ps.page_size, ps.max_logical_pages);
+                ps.page_size, ps.max_logical_pages, pages_per_row);
         }
     }
 
@@ -2566,8 +3503,10 @@ inline cudaError_t ctc_beam_search_decode_batch_paged(
     cudaMemsetAsync(data.clast, 0, sizeof(int) * batch * data.ldbeam, stream);
     cudaMemsetAsync(data.clen[0], 0, sizeof(int) * batch * data.ldbeam, stream);
     cudaMemsetAsync(data.clen[1], 0, sizeof(int) * batch * data.ldbeam, stream);
-    cudaMemsetAsync(data.ptable, 0xcc, sizeof(float) * batch * beam * data.ldc, stream);
-    cudaMemsetAsync(data.ptablen, 0xcc, sizeof(float) * batch * beam * data.ldc, stream);
+    if (data.ptable) {
+        cudaMemsetAsync(data.ptable, 0xcc, sizeof(float) * batch * beam * data.ldc, stream);
+        cudaMemsetAsync(data.ptablen, 0xcc, sizeof(float) * batch * beam * data.ldc, stream);
+    }
     cudaMemsetAsync(data.select_seq_lens, 0, sizeof(int) * batch, stream);
 
     float log_threshold = (blank_threshold <= 0.0f)   ? NEG_INF
@@ -2593,22 +3532,20 @@ inline cudaError_t ctc_beam_search_decode_batch_paged(
     delete[] h_select_lens;
     data.max_select_seq_len = max_select;
 
-    int* d_step_scratch = nullptr;
-    cudaError_t alloc_err = cudaMalloc(&d_step_scratch, sizeof(int));
-    if (alloc_err != cudaSuccess)
-        return alloc_err;
+    // See ctc_beam_search_decode_batch: ptid doubles as the legacy step
+    // counter; the fused path takes the step by value.
+    int* d_step_scratch = data.ptid;
+    const bool fused_path = step_uses_fused(beam);
 
     for (int step = 0; step < max_select; ++step) {
-        cudaMemcpyAsync(d_step_scratch, &step, sizeof(int), cudaMemcpyHostToDevice, stream);
+        if (!fused_path)
+            cudaMemcpyAsync(d_step_scratch, &step, sizeof(int), cudaMemcpyHostToDevice, stream);
         cudaError_t err = ctc_prefix_beam_search_step_paged(
             &data, log_prob, batch_stride, seq_stride, vocab_stride,
-            step, blank_id, space_id, stream, d_step_scratch);
-        if (err != cudaSuccess) {
-            cudaFree(d_step_scratch);
+            step, blank_id, space_id, stream, d_step_scratch, /*d_step_dynamic=*/false);
+        if (err != cudaSuccess)
             return err;
-        }
     }
-    cudaFree(d_step_scratch);
 
     auto& ps = data.paged;
 
@@ -2653,8 +3590,12 @@ inline void init_streaming_state_paged(void* state_buffer, int batch, int beam,
     cudaMemsetAsync(state.data.clast, 0, sizeof(int) * batch * state.data.ldbeam, stream);
     cudaMemsetAsync(state.data.clen[0], 0, sizeof(int) * batch * state.data.ldbeam, stream);
     cudaMemsetAsync(state.data.clen[1], 0, sizeof(int) * batch * state.data.ldbeam, stream);
-    cudaMemsetAsync(state.data.ptable, 0xcc, sizeof(float) * batch * beam * state.data.ldc, stream);
-    cudaMemsetAsync(state.data.ptablen, 0xcc, sizeof(float) * batch * beam * state.data.ldc, stream);
+    if (state.data.ptable) {
+        cudaMemsetAsync(state.data.ptable, 0xcc, sizeof(float) * batch * beam * state.data.ldc,
+                        stream);
+        cudaMemsetAsync(state.data.ptablen, 0xcc, sizeof(float) * batch * beam * state.data.ldc,
+                        stream);
+    }
 
     // Identity frame mapping via kernel (no host allocation, no stream sync).
     {

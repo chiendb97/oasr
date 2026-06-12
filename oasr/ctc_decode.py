@@ -40,13 +40,14 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
 
-from oasr.utils.nvtx import nvtx_pop, nvtx_push
 from oasr.api_logging import oasr_api
+from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 
 @dataclass
@@ -132,11 +133,11 @@ class StreamState:
         Vocabulary size this state was initialized for.
     """
 
-    __slots__ = ("buffer", "step", "actual_frame_idx", "batch", "vocab_size",
-                 "_buffer_bytes")
+    __slots__ = ("buffer", "step", "actual_frame_idx", "batch", "vocab_size", "_buffer_bytes")
 
-    def __init__(self, buffer: torch.Tensor, batch: int, vocab_size: int,
-                 buffer_bytes: int) -> None:
+    def __init__(
+        self, buffer: torch.Tensor, batch: int, vocab_size: int, buffer_bytes: int
+    ) -> None:
         self.buffer: torch.Tensor = buffer
         self.step: int = 0
         self.actual_frame_idx: int = 0
@@ -189,14 +190,27 @@ class StreamHandle:
 
 
 @functools.cache
-def _get_ctc_decoder_module():
+def _get_ctc_decoder_module_variant(use_fused: bool):
     from oasr.jit.ctc_decoder import gen_ctc_decoder_module
 
-    return gen_ctc_decoder_module().build_and_load()
+    return gen_ctc_decoder_module(use_fused).build_and_load()
 
 
-def _extract_tokens(out_tokens: torch.Tensor, out_lengths: torch.Tensor,
-                    batch: int, beam_size: int) -> List[List[List[int]]]:
+def _get_ctc_decoder_module():
+    """Resolve the decoder module, honouring the ``OASR_CTC_FUSED`` kill switch.
+
+    ``OASR_CTC_FUSED=0`` selects a separately compiled module with the fused
+    single-kernel beam-search step disabled (legacy multi-kernel pipeline).
+    The two variants use different workspace layouts, so a decoder/state must
+    never be shared across a mid-process flag flip.
+    """
+    use_fused = os.environ.get("OASR_CTC_FUSED", "1") != "0"
+    return _get_ctc_decoder_module_variant(use_fused)
+
+
+def _extract_tokens(
+    out_tokens: torch.Tensor, out_lengths: torch.Tensor, batch: int, beam_size: int
+) -> List[List[List[int]]]:
     """Convert padded token tensor to nested Python lists."""
     out_tokens_cpu = out_tokens.cpu()
     out_lengths_cpu = out_lengths.cpu()
@@ -262,7 +276,8 @@ def ctc_beam_search_decode(
 
     if use_paged_memory:
         ws_bytes = mod.ctc_decoder_paged_workspace_size(
-            batch, beam_size, vocab_size, ws_seq_len, page_size)
+            batch, beam_size, vocab_size, ws_seq_len, page_size
+        )
     else:
         ws_bytes = mod.ctc_decoder_workspace_size(batch, beam_size, vocab_size, ws_seq_len)
     workspace = torch.empty(int(ws_bytes), dtype=torch.uint8, device=device)
@@ -274,15 +289,28 @@ def ctc_beam_search_decode(
 
     if use_paged_memory:
         mod.ctc_beam_search_decode_paged(
-            out_tokens, out_lengths, out_scores,
-            log_prob, seq_lengths, workspace,
-            beam_size, blank_id, blank_threshold, page_size,
+            out_tokens,
+            out_lengths,
+            out_scores,
+            log_prob,
+            seq_lengths,
+            workspace,
+            beam_size,
+            blank_id,
+            blank_threshold,
+            page_size,
         )
     else:
         mod.ctc_beam_search_decode(
-            out_tokens, out_lengths, out_scores,
-            log_prob, seq_lengths, workspace,
-            beam_size, blank_id, blank_threshold,
+            out_tokens,
+            out_lengths,
+            out_scores,
+            log_prob,
+            seq_lengths,
+            workspace,
+            beam_size,
+            blank_id,
+            blank_threshold,
         )
 
     tokens = _extract_tokens(out_tokens, out_lengths, batch, beam_size)
@@ -323,8 +351,7 @@ class GpuStreamingDecoder:
     >>> r2 = decoder.finalize_stream(state=s2)
     """
 
-    def __init__(self, config: Optional[GpuDecoderConfig] = None,
-                 *, use_cuda_graphs: bool = True):
+    def __init__(self, config: Optional[GpuDecoderConfig] = None, *, use_cuda_graphs: bool = True):
         self._config = config or GpuDecoderConfig()
         self._mod = _get_ctc_decoder_module()
 
@@ -375,42 +402,51 @@ class GpuStreamingDecoder:
             return self._cached_size_val
         cfg = self._config
         if cfg.use_paged_memory:
-            val = int(self._mod.ctc_decoder_paged_state_size(
-                batch, cfg.beam_size, vocab_size, cfg.max_seq_len, cfg.page_size))
+            val = int(
+                self._mod.ctc_decoder_paged_state_size(
+                    batch, cfg.beam_size, vocab_size, cfg.max_seq_len, cfg.page_size
+                )
+            )
         else:
-            val = int(self._mod.ctc_decoder_state_size(
-                batch, cfg.beam_size, vocab_size, cfg.max_seq_len))
+            val = int(
+                self._mod.ctc_decoder_state_size(batch, cfg.beam_size, vocab_size, cfg.max_seq_len)
+            )
         self._cached_size_key = key
         self._cached_size_val = val
         return val
 
-    def _init_gpu_state(self, buffer: torch.Tensor,
-                        batch: int, vocab_size: int) -> None:
+    def _init_gpu_state(self, buffer: torch.Tensor, batch: int, vocab_size: int) -> None:
         """Run the C++ state initializer on *buffer* (memset + header)."""
         cfg = self._config
         if cfg.use_paged_memory:
             self._mod.ctc_beam_search_init_state_paged(
-                buffer, batch, cfg.beam_size,
-                vocab_size, cfg.max_seq_len, cfg.blank_id, cfg.page_size)
+                buffer,
+                batch,
+                cfg.beam_size,
+                vocab_size,
+                cfg.max_seq_len,
+                cfg.blank_id,
+                cfg.page_size,
+            )
         else:
             self._mod.ctc_beam_search_init_state(
-                buffer, batch, cfg.beam_size,
-                vocab_size, cfg.max_seq_len, cfg.blank_id)
+                buffer, batch, cfg.beam_size, vocab_size, cfg.max_seq_len, cfg.blank_id
+            )
 
     def _resolve_state(self, state: Optional[StreamState]) -> StreamState:
         """Return *state* if given, else fall back to the internal default."""
         s = state if state is not None else self._state
         if s is None:
-            raise RuntimeError(
-                "Call init_stream() or pass a StreamState created by create_state()")
+            raise RuntimeError("Call init_stream() or pass a StreamState created by create_state()")
         return s
 
     # ------------------------------------------------------------------
     # Explicit state management (multi-request / interleaved API)
     # ------------------------------------------------------------------
 
-    def create_state(self, batch: int, vocab_size: int,
-                     device: Optional[torch.device] = None) -> StreamState:
+    def create_state(
+        self, batch: int, vocab_size: int, device: Optional[torch.device] = None
+    ) -> StreamState:
         """Create and initialize a new per-request state.
 
         The returned :class:`StreamState` can be passed to
@@ -440,10 +476,13 @@ class GpuStreamingDecoder:
         self._init_gpu_state(buf, batch, vocab_size)
         return StreamState(buf, batch, vocab_size, required)
 
-    def reset_state(self, state: StreamState,
-                    batch: Optional[int] = None,
-                    vocab_size: Optional[int] = None,
-                    device: Optional[torch.device] = None) -> None:
+    def reset_state(
+        self,
+        state: StreamState,
+        batch: Optional[int] = None,
+        vocab_size: Optional[int] = None,
+        device: Optional[torch.device] = None,
+    ) -> None:
         """Reinitialize an existing state for a new request.
 
         The GPU buffer inside *state* is reused when the new parameters
@@ -499,8 +538,9 @@ class GpuStreamingDecoder:
     # Single-request convenience API (backward-compatible)
     # ------------------------------------------------------------------
 
-    def init_stream(self, batch: int, vocab_size: int,
-                    device: Optional[torch.device] = None) -> None:
+    def init_stream(
+        self, batch: int, vocab_size: int, device: Optional[torch.device] = None
+    ) -> None:
         """Initialize (or re-initialize) the internal default state.
 
         Equivalent to ``create_state`` on first call, then
@@ -526,8 +566,7 @@ class GpuStreamingDecoder:
     # Decoding
     # ------------------------------------------------------------------
 
-    def decode_chunk(self, log_prob: torch.Tensor,
-                     state: Optional[StreamState] = None) -> None:
+    def decode_chunk(self, log_prob: torch.Tensor, state: Optional[StreamState] = None) -> None:
         """Process one chunk of log-probability frames.
 
         Parameters
@@ -560,23 +599,32 @@ class GpuStreamingDecoder:
         if blank_log_thresh is not None:
             is_speech_mask = (
                 log_prob[:, :, cfg.blank_id]
-                .min(dim=0).values
-                .lt_(blank_log_thresh)
+                .min(dim=0)
+                .values.lt_(blank_log_thresh)
                 .to(torch.uint8)
                 .cpu()
             )
         else:
             is_speech_mask = torch.empty(0, dtype=torch.uint8)
 
-        new_step = int(self._mod.ctc_beam_search_chunk(
-            s.buffer, log_prob, is_speech_mask,
-            cfg.beam_size, cfg.blank_id,
-            s.step, cfg.blank_threshold,
-            s.actual_frame_idx,
-            s.batch, s.vocab_size, cfg.max_seq_len,
-            1 if cfg.use_paged_memory else 0, cfg.page_size,
-            1 if self._use_cuda_graphs else 0,
-        ))
+        new_step = int(
+            self._mod.ctc_beam_search_chunk(
+                s.buffer,
+                log_prob,
+                is_speech_mask,
+                cfg.beam_size,
+                cfg.blank_id,
+                s.step,
+                cfg.blank_threshold,
+                s.actual_frame_idx,
+                s.batch,
+                s.vocab_size,
+                cfg.max_seq_len,
+                1 if cfg.use_paged_memory else 0,
+                cfg.page_size,
+                1 if self._use_cuda_graphs else 0,
+            )
+        )
 
         # The chunk launcher decodes ``min(active_frames, max_seq_len -
         # start_step)`` frames; we know ``frame_idx`` advances by the chunk
@@ -624,8 +672,8 @@ class GpuStreamingDecoder:
             return
         if log_probs.size(0) != n:
             raise ValueError(
-                f"log_probs.shape[0] ({log_probs.size(0)}) must equal "
-                f"len(states) ({n})")
+                f"log_probs.shape[0] ({log_probs.size(0)}) must equal " f"len(states) ({n})"
+            )
 
         chunk_t = log_probs.size(1)
         if chunk_t == 0:
@@ -643,16 +691,16 @@ class GpuStreamingDecoder:
             if s.batch != batch or s.vocab_size != vocab_size:
                 raise ValueError(
                     "decode_chunk_batch: all states must share (batch, "
-                    "vocab_size); got mixed values")
+                    "vocab_size); got mixed values"
+                )
 
         state_ptrs = torch.tensor(
-            [s.buffer.data_ptr() for s in states],
-            dtype=torch.int64, device="cpu")
-        start_steps = torch.tensor(
-            [s.step for s in states], dtype=torch.int32, device="cpu")
+            [s.buffer.data_ptr() for s in states], dtype=torch.int64, device="cpu"
+        )
+        start_steps = torch.tensor([s.step for s in states], dtype=torch.int32, device="cpu")
         start_frame_idxs = torch.tensor(
-            [s.actual_frame_idx for s in states],
-            dtype=torch.int32, device="cpu")
+            [s.actual_frame_idx for s in states], dtype=torch.int32, device="cpu"
+        )
 
         if is_speech_mask is None:
             # Mirror the single-state path: when blank_threshold is set,
@@ -674,19 +722,28 @@ class GpuStreamingDecoder:
                 mask_tensor = torch.empty(0, dtype=torch.uint8, device="cpu")
         else:
             mask_tensor = is_speech_mask.to(
-                dtype=torch.uint8, device="cpu", copy=False).contiguous()
-            if mask_tensor.dim() != 2 or mask_tensor.size(0) != n or \
-                    mask_tensor.size(1) != chunk_t:
+                dtype=torch.uint8, device="cpu", copy=False
+            ).contiguous()
+            if mask_tensor.dim() != 2 or mask_tensor.size(0) != n or mask_tensor.size(1) != chunk_t:
                 raise ValueError(
                     f"is_speech_mask must be (N={n}, chunk_T={chunk_t}); "
-                    f"got {tuple(mask_tensor.shape)}")
+                    f"got {tuple(mask_tensor.shape)}"
+                )
 
         self._mod.ctc_beam_search_chunk_batched(
-            state_ptrs, log_probs, mask_tensor,
-            start_steps, start_frame_idxs,
-            cfg.beam_size, cfg.blank_id, cfg.blank_threshold,
-            batch, vocab_size, cfg.max_seq_len,
-            1 if cfg.use_paged_memory else 0, cfg.page_size,
+            state_ptrs,
+            log_probs,
+            mask_tensor,
+            start_steps,
+            start_frame_idxs,
+            cfg.beam_size,
+            cfg.blank_id,
+            cfg.blank_threshold,
+            batch,
+            vocab_size,
+            cfg.max_seq_len,
+            1 if cfg.use_paged_memory else 0,
+            cfg.page_size,
             1 if self._use_cuda_graphs else 0,
         )
 
@@ -703,7 +760,8 @@ class GpuStreamingDecoder:
         nvtx_pop()
 
     def peek_state(
-        self, state: Optional[StreamState] = None,
+        self,
+        state: Optional[StreamState] = None,
     ) -> GpuDecoderResult:
         """Snapshot the current best-so-far hypothesis from ``state``.
 
@@ -732,25 +790,32 @@ class GpuStreamingDecoder:
         batch = s.batch
 
         out_tokens = torch.empty(
-            batch, cfg.beam_size, cfg.max_seq_len,
-            dtype=torch.int32, device=device)
-        out_lengths = torch.empty(
-            batch, cfg.beam_size, dtype=torch.int32, device=device)
-        out_scores = torch.empty(
-            batch, cfg.beam_size, dtype=torch.float32, device=device)
+            batch, cfg.beam_size, cfg.max_seq_len, dtype=torch.int32, device=device
+        )
+        out_lengths = torch.empty(batch, cfg.beam_size, dtype=torch.int32, device=device)
+        out_scores = torch.empty(batch, cfg.beam_size, dtype=torch.float32, device=device)
 
         use_paged = 1 if cfg.use_paged_memory else 0
         self._mod.ctc_beam_search_read_state(
-            out_tokens, out_lengths, out_scores,
-            s.buffer, s.step,
-            batch, cfg.beam_size, s.vocab_size, cfg.max_seq_len,
-            use_paged, cfg.page_size)
+            out_tokens,
+            out_lengths,
+            out_scores,
+            s.buffer,
+            s.step,
+            batch,
+            cfg.beam_size,
+            s.vocab_size,
+            cfg.max_seq_len,
+            use_paged,
+            cfg.page_size,
+        )
 
         tokens = _extract_tokens(out_tokens, out_lengths, batch, cfg.beam_size)
         return GpuDecoderResult(tokens=tokens, lengths=out_lengths, scores=out_scores)
 
     def peek_states(
-        self, states: List[StreamState],
+        self,
+        states: List[StreamState],
     ) -> List[GpuDecoderResult]:
         """Batched non-destructive snapshot for **many states in ONE D→H sync**.
 
@@ -787,10 +852,18 @@ class GpuStreamingDecoder:
         out_scores = torch.empty(n, beam, dtype=torch.float32, device=device)
         for i, s in enumerate(states):
             self._mod.ctc_beam_search_read_state(
-                out_tokens[i : i + 1], out_lengths[i : i + 1], out_scores[i : i + 1],
-                s.buffer, s.step,
-                s.batch, beam, s.vocab_size, msl,
-                use_paged, cfg.page_size)
+                out_tokens[i : i + 1],
+                out_lengths[i : i + 1],
+                out_scores[i : i + 1],
+                s.buffer,
+                s.step,
+                s.batch,
+                beam,
+                s.vocab_size,
+                msl,
+                use_paged,
+                cfg.page_size,
+            )
 
         # Single device→host sync for the entire ready set.
         out_tokens_cpu = out_tokens.cpu()
@@ -801,19 +874,20 @@ class GpuStreamingDecoder:
             for k in range(beam):
                 length = int(out_lengths_cpu[i, k])
                 beams.append(out_tokens_cpu[i, k, :length].tolist())
-            results.append(GpuDecoderResult(
-                tokens=[beams],
-                lengths=out_lengths[i : i + 1],
-                scores=out_scores[i : i + 1],
-            ))
+            results.append(
+                GpuDecoderResult(
+                    tokens=[beams],
+                    lengths=out_lengths[i : i + 1],
+                    scores=out_scores[i : i + 1],
+                )
+            )
         return results
 
     # ------------------------------------------------------------------
     # Pipelined (non-blocking) interim read-back
     # ------------------------------------------------------------------
 
-    def _ensure_peek_buffers(self, n: int, beam: int, msl: int,
-                             device: torch.device) -> None:
+    def _ensure_peek_buffers(self, n: int, beam: int, msl: int, device: torch.device) -> None:
         """(Re)allocate the persistent peek device/pinned buffers to hold ``n``."""
         if (
             self._peek_dev_tokens is not None
@@ -828,10 +902,8 @@ class GpuStreamingDecoder:
         # partials; keep a discardable device buffer (never copied to host).
         self._peek_dev_scores = torch.empty(n, beam, dtype=torch.float32, device=device)
         pin = device.type == "cuda"
-        self._peek_host_tokens = torch.empty(
-            n, beam, msl, dtype=torch.int32, pin_memory=pin)
-        self._peek_host_lengths = torch.empty(
-            n, beam, dtype=torch.int32, pin_memory=pin)
+        self._peek_host_tokens = torch.empty(n, beam, msl, dtype=torch.int32, pin_memory=pin)
+        self._peek_host_lengths = torch.empty(n, beam, dtype=torch.int32, pin_memory=pin)
 
     def peek_states_async(self, states: List[StreamState]) -> Optional["PeekHandle"]:
         """Issue a **non-blocking** batched interim read-back.
@@ -858,7 +930,8 @@ class GpuStreamingDecoder:
         msl = cfg.max_seq_len
         if any(s.batch != 1 for s in states):
             return PeekHandle(
-                n=n, beam=beam,
+                n=n,
+                beam=beam,
                 eager=[self.peek_state(state=s) for s in states],
             )
 
@@ -870,10 +943,18 @@ class GpuStreamingDecoder:
         dev_sco = self._peek_dev_scores[:n]
         for i, s in enumerate(states):
             self._mod.ctc_beam_search_read_state(
-                dev_tok[i : i + 1], dev_len[i : i + 1], dev_sco[i : i + 1],
-                s.buffer, s.step,
-                s.batch, beam, s.vocab_size, msl,
-                use_paged, cfg.page_size)
+                dev_tok[i : i + 1],
+                dev_len[i : i + 1],
+                dev_sco[i : i + 1],
+                s.buffer,
+                s.step,
+                s.batch,
+                beam,
+                s.vocab_size,
+                msl,
+                use_paged,
+                cfg.page_size,
+            )
         host_tok = self._peek_host_tokens[:n]
         host_len = self._peek_host_lengths[:n]
         host_tok.copy_(dev_tok, non_blocking=True)
@@ -881,8 +962,11 @@ class GpuStreamingDecoder:
         ev = torch.cuda.Event()
         ev.record()
         return PeekHandle(
-            n=n, beam=beam, event=ev,
-            tokens_cpu=host_tok, lengths_cpu=host_len,
+            n=n,
+            beam=beam,
+            event=ev,
+            tokens_cpu=host_tok,
+            lengths_cpu=host_len,
         )
 
     def peek_states_collect(self, handle: Optional["PeekHandle"]) -> List[GpuDecoderResult]:
@@ -911,7 +995,8 @@ class GpuStreamingDecoder:
         return results
 
     def finalize_stream(
-        self, state: Optional[StreamState] = None,
+        self,
+        state: Optional[StreamState] = None,
     ) -> GpuDecoderResult:
         """Read the final hypothesis from ``state`` at end-of-stream.
 

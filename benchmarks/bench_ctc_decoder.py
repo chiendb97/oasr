@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
-"""OASR CTC Decoder Benchmark — OASR vs torchaudio CUCTCDecoder."""
+"""OASR CTC Decoder Benchmark — fused vs legacy step pipeline (and torchaudio).
 
+By default compares the fused single-kernel beam-search step (the production
+path for beam <= 32) against OASR's legacy multi-kernel pipeline, for both
+offline batch decode and chunked streaming decode.
+
+torchaudio's CUCTCDecoder comparison is opt-in via ``--torchaudio``: its CUDA
+decoder hard-crashes (illegal address + core dump) on SM120 GPUs, taking the
+whole benchmark process down.
+
+Usage:
+  python benchmarks/bench_ctc_decoder.py                 # fused vs legacy
+  python benchmarks/bench_ctc_decoder.py --no-legacy     # fused only
+  python benchmarks/bench_ctc_decoder.py --torchaudio    # also CUCTCDecoder
+"""
+
+import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -12,24 +28,29 @@ import torch.nn.functional as F
 from benchmarks.routines.bench_utils import bench_fn
 
 # (batch, seq_len, vocab_size, beam_size)
-SHAPES = [
+OFFLINE_SHAPES = [
     (1, 200, 100, 10),
-    (4, 200, 100, 10),
     (16, 200, 100, 10),
-    (32, 200, 100, 10),
     (1, 200, 1000, 10),
-    (4, 200, 1000, 10),
     (16, 200, 1000, 10),
-    (32, 200, 1000, 10),
     (1, 200, 5000, 10),
     (4, 200, 5000, 10),
     (16, 200, 5000, 10),
+    (64, 200, 5000, 10),
     (16, 50, 1000, 10),
-    (16, 100, 1000, 10),
     (16, 500, 1000, 10),
-    (16, 200, 1000, 5),
-    (16, 200, 1000, 20),
+    (16, 200, 5000, 4),
+    (16, 200, 5000, 20),
 ]
+
+# (vocab_size, beam_size, n_streams)
+STREAMING_SHAPES = [
+    (5000, 10, 1),
+    (5000, 10, 8),
+    (1000, 10, 8),
+]
+STREAM_CHUNK_T = 16
+STREAM_CHUNKS_PER_ITER = 2
 
 BLANK_THRESHOLD = 1.0
 BLANK_ID = 0
@@ -40,68 +61,98 @@ _COL_SHAPE = 26
 _COL_TIME = 14
 _COL_SPEEDUP = 10
 
-_HEADER = (
-    f"{'(B,T,V,beam)':>{_COL_SHAPE}}"
-    f"  {'OASR':>{_COL_TIME}}"
-    f"  {'torchaudio':>{_COL_TIME}}"
-    f"  {'Speedup':>{_COL_SPEEDUP}}"
-)
-_SEP = "-" * len(_HEADER)
-_TITLE = "OASR CTC Decoder Benchmark"
-_TITLE_SEP = "=" * len(_HEADER)
-
 
 def _fmt_time(ms):
-    return f"{ms:.4f}ms"
+    return f"{ms:.4f}ms" if ms is not None else "N/A"
 
 
-def _fmt_speedup(speedup):
-    return f"{speedup:.2f}x"
+def _fmt_speedup(base_ms, ms):
+    if base_ms is None or ms is None:
+        return "N/A"
+    return f"{ms / base_ms:.2f}x"
 
 
-def _fmt_na():
-    return "N/A"
-
-
-def _make_inputs(batch, seq_len, vocab_size):
-    logits = torch.randn(batch, seq_len, vocab_size, device="cuda")
+def _make_inputs(batch, seq_len, vocab_size, seed=0):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    logits = torch.randn(batch, seq_len, vocab_size, device="cuda", generator=gen)
     log_prob = F.log_softmax(logits, dim=-1)
     seq_lengths = torch.full((batch,), seq_len, dtype=torch.int32, device="cuda")
     return log_prob, seq_lengths
 
 
-def _make_oasr_fn(log_prob, seq_lengths, beam_size, max_seq_len):
+class _ForcedVariant:
+    """Pin the OASR decoder module variant (fused / legacy) via OASR_CTC_FUSED."""
+
+    def __init__(self, use_fused):
+        self._value = "1" if use_fused else "0"
+        self._saved = None
+
+    def __enter__(self):
+        self._saved = os.environ.get("OASR_CTC_FUSED")
+        os.environ["OASR_CTC_FUSED"] = self._value
+        return self
+
+    def __exit__(self, *exc):
+        if self._saved is None:
+            os.environ.pop("OASR_CTC_FUSED", None)
+        else:
+            os.environ["OASR_CTC_FUSED"] = self._saved
+        return False
+
+
+def _bench_oasr_offline(log_prob, seq_lengths, beam_size, max_seq_len, use_fused):
     from oasr.ctc_decode import ctc_beam_search_decode
 
-    # Warm up once to trigger JIT compilation before timed runs.
-    ctc_beam_search_decode(
-        log_prob,
-        seq_lengths,
-        beam_size=beam_size,
-        blank_id=BLANK_ID,
-        blank_threshold=BLANK_THRESHOLD,
-        max_seq_len=max_seq_len,
-    )
-    torch.cuda.synchronize()
+    with _ForcedVariant(use_fused):
 
-    def fn():
-        ctc_beam_search_decode(
-            log_prob,
-            seq_lengths,
+        def fn():
+            ctc_beam_search_decode(
+                log_prob,
+                seq_lengths,
+                beam_size=beam_size,
+                blank_id=BLANK_ID,
+                blank_threshold=BLANK_THRESHOLD,
+                max_seq_len=max_seq_len,
+            )
+
+        fn()
+        torch.cuda.synchronize()
+        ms, _ = bench_fn(fn, dry_run_iters=WARMUP, num_iters=ITERS, use_cuda_events=True)
+    return ms
+
+
+def _bench_oasr_streaming(vocab_size, beam_size, n_streams, use_fused):
+    from oasr.ctc_decode import GpuDecoderConfig, GpuStreamingDecoder
+
+    with _ForcedVariant(use_fused):
+        cfg = GpuDecoderConfig(
             beam_size=beam_size,
             blank_id=BLANK_ID,
             blank_threshold=BLANK_THRESHOLD,
-            max_seq_len=max_seq_len,
+            max_seq_len=200,
         )
+        dec = GpuStreamingDecoder(cfg)
+        states = [dec.create_state(1, vocab_size) for _ in range(n_streams)]
+        chunks = [
+            _make_inputs(1, STREAM_CHUNK_T, vocab_size, seed=i)[0]
+            for i in range(STREAM_CHUNKS_PER_ITER)
+        ]
 
-    return fn
+        def fn():
+            for state in states:
+                for chunk in chunks:
+                    dec.decode_chunk(chunk, state=state)
+
+        fn()
+        torch.cuda.synchronize()
+        ms, _ = bench_fn(fn, dry_run_iters=3, num_iters=ITERS, use_cuda_events=True)
+    frames = n_streams * STREAM_CHUNKS_PER_ITER * STREAM_CHUNK_T
+    return 1000.0 * ms / frames  # us per decoded frame
 
 
-def _make_torchaudio_fn(log_prob, seq_lengths, vocab_size, beam_size):
+def _bench_torchaudio(log_prob, seq_lengths, vocab_size, beam_size):
     from torchaudio.models.decoder import CUCTCDecoder
 
-    # Keep one extra sentinel token to avoid sporadic out-of-range ids produced
-    # by torchaudio's CUDA decoder in high-beam settings.
     vocab_list = ["<blank>"] + [f"t{i}" for i in range(1, vocab_size + 1)]
     decoder = CUCTCDecoder(
         vocab_list=vocab_list,
@@ -110,82 +161,85 @@ def _make_torchaudio_fn(log_prob, seq_lengths, vocab_size, beam_size):
         nbest=beam_size,
         blank_skip_threshold=BLANK_THRESHOLD,
     )
-
-    # Warm up once so setup allocations do not affect timed runs.
     decoder(log_prob, seq_lengths)
     torch.cuda.synchronize()
 
     def fn():
         decoder(log_prob, seq_lengths)
 
-    return fn
-
-
-def _row(shape_str, oasr_ms, torchaudio_ms):
-    oasr_col = _fmt_time(oasr_ms) if oasr_ms is not None else _fmt_na()
-    torchaudio_col = _fmt_time(torchaudio_ms) if torchaudio_ms is not None else _fmt_na()
-    speedup_col = (
-        _fmt_speedup(torchaudio_ms / oasr_ms)
-        if oasr_ms is not None and torchaudio_ms is not None
-        else _fmt_na()
-    )
-    return (
-        f"{shape_str:>{_COL_SHAPE}}"
-        f"  {oasr_col:>{_COL_TIME}}"
-        f"  {torchaudio_col:>{_COL_TIME}}"
-        f"  {speedup_col:>{_COL_SPEEDUP}}"
-    )
-
-
-def _run_shape(batch, seq_len, vocab_size, beam_size):
-    log_prob, seq_lengths = _make_inputs(batch, seq_len, vocab_size)
-    max_seq_len = seq_len
-
-    oasr_ms = None
-    torchaudio_ms = None
-
-    try:
-        oasr_fn = _make_oasr_fn(log_prob, seq_lengths, beam_size, max_seq_len)
-        oasr_ms, _ = bench_fn(
-            oasr_fn,
-            dry_run_iters=WARMUP,
-            num_iters=ITERS,
-            use_cuda_events=True,
-        )
-    except Exception as err:
-        print(f"[WARN] OASR failed for ({batch},{seq_len},{vocab_size},{beam_size}): {err}")
-
-    try:
-        torchaudio_fn = _make_torchaudio_fn(log_prob, seq_lengths, vocab_size, beam_size)
-        torchaudio_ms, _ = bench_fn(
-            torchaudio_fn,
-            dry_run_iters=WARMUP,
-            num_iters=ITERS,
-            use_cuda_events=True,
-        )
-    except Exception as err:
-        print(
-            f"[WARN] torchaudio failed for ({batch},{seq_len},{vocab_size},{beam_size}): {err}"
-        )
-
-    return oasr_ms, torchaudio_ms
+    ms, _ = bench_fn(fn, dry_run_iters=WARMUP, num_iters=ITERS, use_cuda_events=True)
+    return ms
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--no-legacy",
+        action="store_true",
+        help="skip the legacy OASR pipeline column (avoids a second JIT compile)",
+    )
+    parser.add_argument(
+        "--torchaudio",
+        action="store_true",
+        help="also benchmark torchaudio CUCTCDecoder (crashes on SM120 — opt-in)",
+    )
+    args = parser.parse_args()
+
     if not torch.cuda.is_available():
         print("CUDA not available")
         return
 
-    print(_TITLE)
-    print(_TITLE_SEP)
-    print(_HEADER)
-    print(_SEP)
+    cols = ["OASR fused"]
+    if not args.no_legacy:
+        cols.append("OASR legacy")
+    if args.torchaudio:
+        cols.append("torchaudio")
 
-    for batch, seq_len, vocab_size, beam_size in SHAPES:
-        oasr_ms, torchaudio_ms = _run_shape(batch, seq_len, vocab_size, beam_size)
-        shape_str = f"({batch},{seq_len},{vocab_size},{beam_size})"
-        print(_row(shape_str, oasr_ms, torchaudio_ms))
+    header = f"{'(B,T,V,beam)':>{_COL_SHAPE}}" + "".join(f"  {c:>{_COL_TIME}}" for c in cols)
+    if len(cols) > 1:
+        header += f"  {'Speedup':>{_COL_SPEEDUP}}"
+    print("OASR CTC Decoder Benchmark — offline batch decode")
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
 
+    for batch, seq_len, vocab_size, beam_size in OFFLINE_SHAPES:
+        log_prob, seq_lengths = _make_inputs(batch, seq_len, vocab_size)
+        fused_ms = _bench_oasr_offline(log_prob, seq_lengths, beam_size, seq_len, True)
+        row = [fused_ms]
+        if not args.no_legacy:
+            row.append(_bench_oasr_offline(log_prob, seq_lengths, beam_size, seq_len, False))
+        if args.torchaudio:
+            try:
+                row.append(_bench_torchaudio(log_prob, seq_lengths, vocab_size, beam_size))
+            except Exception as err:  # pragma: no cover - external decoder
+                print(f"[WARN] torchaudio failed: {err}")
+                row.append(None)
+        line = f"{f'({batch},{seq_len},{vocab_size},{beam_size})':>{_COL_SHAPE}}"
+        line += "".join(f"  {_fmt_time(ms):>{_COL_TIME}}" for ms in row)
+        if len(row) > 1:
+            line += f"  {_fmt_speedup(row[0], row[1]):>{_COL_SPEEDUP}}"
+        print(line)
+
+    print()
+    header2 = f"{'(V,beam,streams)':>{_COL_SHAPE}}" + "".join(
+        f"  {c:>{_COL_TIME}}" for c in cols if not c.startswith("torchaudio")
+    )
+    if not args.no_legacy:
+        header2 += f"  {'Speedup':>{_COL_SPEEDUP}}"
+    print("Streaming chunked decode (us / decoded frame, batch=1 states)")
+    print("=" * len(header2))
+    print(header2)
+    print("-" * len(header2))
+    for vocab_size, beam_size, n_streams in STREAMING_SHAPES:
+        fused_us = _bench_oasr_streaming(vocab_size, beam_size, n_streams, True)
+        line = f"{f'({vocab_size},{beam_size},{n_streams})':>{_COL_SHAPE}}"
+        line += f"  {f'{fused_us:.2f}us':>{_COL_TIME}}"
+        if not args.no_legacy:
+            legacy_us = _bench_oasr_streaming(vocab_size, beam_size, n_streams, False)
+            line += f"  {f'{legacy_us:.2f}us':>{_COL_TIME}}"
+            line += f"  {f'{legacy_us / fused_us:.2f}x':>{_COL_SPEEDUP}}"
+        print(line)
     print()
 
 
