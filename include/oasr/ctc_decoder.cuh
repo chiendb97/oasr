@@ -474,10 +474,9 @@ __global__ void init_streaming_select_kernel(int* __restrict__ select_seqs,
 // We move both counters into device-resident int32 scalars at offsets 0/4 of
 // the (otherwise unused) state-buffer header so kernels can read them via a
 // single ``__ldg`` at block entry and the host loop can advance them with a
-// trivial captureable kernel.  A third scalar at offset 8 holds the current
-// frame's row index into the chunk-level top-K pre-pass buffers.
+// trivial captureable kernel.
 //
-// STATE_HEADER_SIZE is large enough to hold these 12 bytes already — the
+// STATE_HEADER_SIZE is large enough to hold these 8 bytes already — the
 // previous comment in ``init_streaming_state`` noted the header region was
 // reserved but unused.
 // =============================================================================
@@ -488,18 +487,12 @@ __host__ __device__ inline int* device_step_ptr(void* state_buffer) {
 __host__ __device__ inline int* device_frame_idx_ptr(void* state_buffer) {
     return reinterpret_cast<int*>(reinterpret_cast<char*>(state_buffer) + sizeof(int));
 }
-// Third counter: row index into the chunk-level top-K pre-pass buffers for the
-// current frame.  Captured streaming graphs read it the same way as d_step.
-__host__ __device__ inline int* device_prepass_row_ptr(void* state_buffer) {
-    return reinterpret_cast<int*>(reinterpret_cast<char*>(state_buffer) + 2 * sizeof(int));
-}
 
 // Single-thread kernels: cheap and captureable. Launch <<<1, 1>>>.
-__global__ inline void set_counters_kernel(int* d_step, int* d_frame_idx, int* d_prepass_row,
-                                           int step, int frame_idx, int prepass_row) {
+__global__ inline void set_counters_kernel(int* d_step, int* d_frame_idx, int step,
+                                           int frame_idx) {
     *d_step = step;
     *d_frame_idx = frame_idx;
-    *d_prepass_row = prepass_row;
 }
 __global__ inline void advance_counters_kernel(int* d_step, int* d_frame_idx) {
     *d_step += 1;
@@ -508,11 +501,9 @@ __global__ inline void advance_counters_kernel(int* d_step, int* d_frame_idx) {
 __global__ inline void advance_frame_idx_kernel(int* d_frame_idx) { *d_frame_idx += 1; }
 
 inline cudaError_t set_stream_counters(void* state_buffer, int step, int frame_idx,
-                                       cudaStream_t stream, int prepass_row = 0) {
+                                       cudaStream_t stream) {
     set_counters_kernel<<<1, 1, 0, stream>>>(device_step_ptr(state_buffer),
-                                             device_frame_idx_ptr(state_buffer),
-                                             device_prepass_row_ptr(state_buffer), step,
-                                             frame_idx, prepass_row);
+                                             device_frame_idx_ptr(state_buffer), step, frame_idx);
     return cudaGetLastError();
 }
 inline cudaError_t advance_stream_counters(void* state_buffer, cudaStream_t stream) {
@@ -1699,57 +1690,33 @@ struct FusedStepSmem {
 // comment above for the candidate-set argument and the deterministic-ordering
 // differences.
 //
-// Pre-pass mode: when ``pre_cnt != nullptr`` the Phase-3 vocab select is
-// replaced by a load of the frame's precomputed top-K candidates (see
-// fused_topk_prepass_kernel).  The row index comes from ``prepass_row_const``
-// when >= 0 (offline: host knows the tile-relative step) or from the
-// device-resident ``*d_prepass_row`` counter (streaming graphs).  The
+// Pre-pass mode: when ``pre_cnt_row >= 0`` the Phase-3 vocab select is
+// replaced by a load of the frame's precomputed top-K candidates from
+// ``pre_chars_row`` / ``pre_lp_row`` (see fused_topk_prepass_kernel).  The
 // precomputed list is a superset of the in-kernel selection (K = 2*beam + 2
 // >= any reachable k_all), and every scored candidate is an exact slot of the
 // conceptual score matrix, so the global top-beam — and hence the decode — is
-// unchanged.
+// unchanged.  ``pre_cnt_row < 0`` keeps the in-kernel vocab select.
+//
+// This body is shared by ``fused_step_kernel`` (one frame per launch) and
+// ``fused_chunk_kernel`` (in-kernel frame loop).  Callers resolve the
+// double-buffer parity (clen/clist/block_table src vs dst) and row-localize
+// the paged allocator views; the body ends without a trailing barrier (the
+// chunk loop inserts one between frames).
 template <int BLOCK_SIZE, int BEAM_CAP, bool PAGED>
-__global__ __launch_bounds__(BLOCK_SIZE) void fused_step_kernel(
-    const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
-    const int* __restrict__ select_seqs, const int* __restrict__ select_seq_lens,
-    const int* __restrict__ d_step, int step_const, float2* __restrict__ pprev,
-    int* __restrict__ clast, const int* __restrict__ clen_src, int* __restrict__ clen_dst,
-    const int* __restrict__ clist_src, int* __restrict__ clist_dst, float* __restrict__ score,
-    int ldc, int beam, int ldbeam, int ldseq_len, int batch, int blank_id, int space_id,
-    int max_seq_len, int* __restrict__ page_storage, const int* __restrict__ block_table_src,
+__device__ __forceinline__ void fused_step_body(
+    FusedStepSmem<BLOCK_SIZE, BEAM_CAP>& s, int bid, const float* __restrict__ lp_row,
+    int vocab_stride, bool need_add_blank, int pre_cnt_row,
+    const int* __restrict__ pre_chars_row, const float* __restrict__ pre_lp_row,
+    float2* __restrict__ pprev, int* __restrict__ clast, const int* __restrict__ clen_src,
+    int* __restrict__ clen_dst, const int* __restrict__ clist_src, int* __restrict__ clist_dst,
+    float* __restrict__ score, int ldc, int beam, int ldbeam, int ldseq_len, int blank_id,
+    int space_id, int* __restrict__ page_storage, const int* __restrict__ block_table_src,
     int* __restrict__ block_table_dst, int* __restrict__ ref_counts,
     int* __restrict__ next_free_page, int* __restrict__ free_pool,
-    int* __restrict__ free_pool_size, int page_size, int max_lp, int pages_per_row,
-    const int* __restrict__ pre_chars, const float* __restrict__ pre_lp,
-    const int* __restrict__ pre_cnt, const int* __restrict__ d_prepass_row,
-    int prepass_row_const) {
+    int* __restrict__ free_pool_size, int page_size, int max_lp) {
     using Smem = FusedStepSmem<BLOCK_SIZE, BEAM_CAP>;
-    __shared__ Smem s;
-
-    const int bid = blockIdx.x;
-    if (bid >= batch)
-        return;
-    // step_const >= 0 is the offline fast path (the host loop knows the step,
-    // saving a per-step device-counter update); -1 reads the device-resident
-    // counter so a captured streaming graph stays valid across frames.
-    const int step = (step_const >= 0) ? step_const : __ldg(d_step);
-    if (step >= select_seq_lens[bid])
-        return;
     const int tid = threadIdx.x;
-
-    if (PAGED) {
-        // Row-local allocator views (see the alloc_page/free_page comment).
-        free_pool += bid * pages_per_row;
-        free_pool_size += bid;
-        next_free_page += bid;
-    }
-
-    // Width-max_seq_len ring (no-op modulo for offline); see
-    // set_select_seq_step_kernel for the streaming rationale.
-    const int t = select_seqs[bid * max_seq_len + step % max_seq_len];
-    const int t_prev = select_seqs[bid * max_seq_len + (step - 1) % max_seq_len];
-    const bool need_add_blank = (t > t_prev + 1);
-    const float* lp_row = log_prob + (size_t)bid * batch_stride + (size_t)t * seq_stride;
 
     // --- Phase 1: snapshot per-beam state (with blank-frame adjustment) -----
     for (int k = tid; k < beam; k += BLOCK_SIZE) {
@@ -1822,16 +1789,14 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_step_kernel(
     __syncthreads();
 
     // --- Phase 3: shared vocab top-K_all -------------------------------------
-    if (pre_cnt != nullptr) {
+    if (pre_cnt_row >= 0) {
         // Chunk-level pre-pass mode: load the frame's precomputed candidates
         // (top 2*beam+2 by lp, a superset of the in-kernel top-k_all) instead
         // of scanning the vocab on this kernel's critical path.
-        const int row = (prepass_row_const >= 0) ? prepass_row_const : __ldg(d_prepass_row);
-        const int off = (row * batch + bid) * Smem::C_BUF;
-        const int cn = min(__ldg(&pre_cnt[row * batch + bid]), Smem::C_BUF);
+        const int cn = min(pre_cnt_row, Smem::C_BUF);
         for (int i = tid; i < cn; i += BLOCK_SIZE) {
-            s.c_chars[i] = pre_chars[off + i];
-            s.c_lp[i] = pre_lp[off + i];
+            s.c_chars[i] = pre_chars_row[i];
+            s.c_lp[i] = pre_lp_row[i];
         }
         if (tid == 0)
             s.c_n = cn;
@@ -2116,6 +2081,242 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_step_kernel(
     }
 }
 
+// One frame per launch — used by the single-frame streaming API and as the
+// step kernel captured into the legacy-path CUDA graphs.  Resolves the frame
+// via select_seqs and keeps the in-kernel vocab select (no pre-pass).
+template <int BLOCK_SIZE, int BEAM_CAP, bool PAGED>
+__global__ __launch_bounds__(BLOCK_SIZE) void fused_step_kernel(
+    const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
+    const int* __restrict__ select_seqs, const int* __restrict__ select_seq_lens,
+    const int* __restrict__ d_step, int step_const, float2* __restrict__ pprev,
+    int* __restrict__ clast, const int* __restrict__ clen_src, int* __restrict__ clen_dst,
+    const int* __restrict__ clist_src, int* __restrict__ clist_dst, float* __restrict__ score,
+    int ldc, int beam, int ldbeam, int ldseq_len, int batch, int blank_id, int space_id,
+    int max_seq_len, int* __restrict__ page_storage, const int* __restrict__ block_table_src,
+    int* __restrict__ block_table_dst, int* __restrict__ ref_counts,
+    int* __restrict__ next_free_page, int* __restrict__ free_pool,
+    int* __restrict__ free_pool_size, int page_size, int max_lp, int pages_per_row) {
+    using Smem = FusedStepSmem<BLOCK_SIZE, BEAM_CAP>;
+    __shared__ Smem s;
+
+    const int bid = blockIdx.x;
+    if (bid >= batch)
+        return;
+    // step_const >= 0 is the offline fast path (the host loop knows the step,
+    // saving a per-step device-counter update); -1 reads the device-resident
+    // counter so a captured streaming graph stays valid across frames.
+    const int step = (step_const >= 0) ? step_const : __ldg(d_step);
+    if (step >= select_seq_lens[bid])
+        return;
+
+    if (PAGED) {
+        // Row-local allocator views (see the alloc_page/free_page comment).
+        free_pool += bid * pages_per_row;
+        free_pool_size += bid;
+        next_free_page += bid;
+    }
+
+    // Width-max_seq_len ring (no-op modulo for offline); see
+    // set_select_seq_step_kernel for the streaming rationale.
+    const int t = select_seqs[bid * max_seq_len + step % max_seq_len];
+    const int t_prev = select_seqs[bid * max_seq_len + (step - 1) % max_seq_len];
+    const bool need_add_blank = (t > t_prev + 1);
+    const float* lp_row = log_prob + (size_t)bid * batch_stride + (size_t)t * seq_stride;
+
+    fused_step_body<BLOCK_SIZE, BEAM_CAP, PAGED>(
+        s, bid, lp_row, vocab_stride, need_add_blank, /*pre_cnt_row=*/-1, nullptr, nullptr,
+        pprev, clast, clen_src, clen_dst, clist_src, clist_dst, score, ldc, beam, ldbeam,
+        ldseq_len, blank_id, space_id, page_storage, block_table_src, block_table_dst,
+        ref_counts, next_free_page, free_pool, free_pool_size, page_size, max_lp);
+}
+
+// --- multi-frame fused chunk kernel --------------------------------------------
+//
+// One launch decodes a whole PREPASS_TILE tile of frames: each block owns one
+// batch row and loops the tile's frames in-kernel, carrying beam state across
+// iterations (global state writes by a block are visible to its own reads
+// after __syncthreads()).  This removes the per-frame launch chain — counter
+// kernels, d_lp_frame_buf copies and CUDA-graph replays — that dominated the
+// latency-bound step after the pre-pass hoist.
+//
+// Two modes:
+//   * streaming == 0 (offline): frame row r covers step_begin + r through the
+//     select_seqs indirection; a row returns once step >= select_seq_lens.
+//   * streaming == 1 (chunk): frame row r covers chunk position
+//     chunk_frame_begin + r; bit r of mask_lo/mask_hi gates decoding (clear =
+//     blank-skip frame, which advances only the frame index).  ``step`` and
+//     the actual frame index start at step_begin / frame_begin and advance
+//     in-kernel; the select_seqs ring is maintained inline (replacing
+//     set_select_seq_step_kernel).
+//
+// step == 0 of a stream runs the first-step initialisation from the same
+// pre-pass candidates (a superset of the top-(nb_beams + 1) chars the
+// dedicated first-step kernels select, so the greedy non-blank pick below is
+// identical).  Double-buffer parity is resolved per step in-kernel.
+template <int BLOCK_SIZE, int BEAM_CAP, bool PAGED>
+__global__ __launch_bounds__(BLOCK_SIZE) void fused_chunk_kernel(
+    const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
+    int* __restrict__ select_seqs, const int* __restrict__ select_seq_lens, int step_begin,
+    int frame_begin, int chunk_frame_begin, int tile_len, unsigned long long mask_lo,
+    unsigned long long mask_hi, int streaming, float2* __restrict__ pprev,
+    int* __restrict__ clast, int* __restrict__ clen0, int* __restrict__ clen1,
+    int* __restrict__ clist0, int* __restrict__ clist1, float* __restrict__ score, int ldc,
+    int beam, int ldbeam, int ldseq_len, int batch, int blank_id, int space_id,
+    int max_seq_len, int* __restrict__ page_storage, int* __restrict__ block_table0,
+    int* __restrict__ block_table1, int* __restrict__ ref_counts,
+    int* __restrict__ next_free_page, int* __restrict__ free_pool,
+    int* __restrict__ free_pool_size, int page_size, int max_lp, int pages_per_row,
+    const int* __restrict__ pre_chars, const float* __restrict__ pre_lp,
+    const int* __restrict__ pre_cnt) {
+    using Smem = FusedStepSmem<BLOCK_SIZE, BEAM_CAP>;
+    __shared__ Smem s;
+
+    const int bid = blockIdx.x;
+    if (bid >= batch)
+        return;
+    const int tid = threadIdx.x;
+
+    if (PAGED) {
+        // Row-local allocator views (see the alloc_page/free_page comment).
+        free_pool += bid * pages_per_row;
+        free_pool_size += bid;
+        next_free_page += bid;
+    }
+
+    const int sel_len = select_seq_lens[bid];  // INT_MAX in streaming
+    int step = step_begin;
+
+    for (int r = 0; r < tile_len; ++r) {
+        if (streaming) {
+            // Blank-skip frames advance only the frame index (implicit:
+            // frame_begin + r tracks it); uniform across the block.
+            const bool dec =
+                (r < 64) ? ((mask_lo >> r) & 1ull) : ((mask_hi >> (r - 64)) & 1ull);
+            if (!dec)
+                continue;
+        }
+        if (step >= sel_len)
+            return;  // offline: this row decoded all its selected frames
+
+        int frame_for_gap;  // index used for the skipped-blank-frame gap test
+        const float* lp_row;
+        if (streaming) {
+            const int t = chunk_frame_begin + r;
+            frame_for_gap = frame_begin + r;
+            lp_row = log_prob + (size_t)bid * batch_stride + (size_t)t * seq_stride;
+        } else {
+            const int t = select_seqs[bid * max_seq_len + step % max_seq_len];
+            frame_for_gap = t;
+            lp_row = log_prob + (size_t)bid * batch_stride + (size_t)t * seq_stride;
+        }
+
+        // Pre-pass candidates for this frame (row r of the tile buffers).
+        const int pre_off = (r * batch + bid) * Smem::C_BUF;
+        const int cn = min(__ldg(&pre_cnt[r * batch + bid]), Smem::C_BUF);
+
+        if (step == 0) {
+            // --- First step: init beams from the top non-blank chars --------
+            // (inline replacement for fused_first_step_kernel, fed by the
+            // pre-pass superset instead of a fresh vocab scan).
+            if (streaming && tid == 0)
+                select_seqs[bid * max_seq_len] = frame_for_gap;
+            const int nb_beams = (beam > 1) ? beam - 1 : beam;
+            for (int i = tid; i < cn; i += BLOCK_SIZE) {
+                s.c_chars[i] = pre_chars[pre_off + i];
+                s.c_lp[i] = pre_lp[pre_off + i];
+            }
+            __syncthreads();
+            {
+                auto key_at = [&](int i) -> uint64_t {
+                    return (uint64_t(f32_sortable(s.c_lp[i])) << 32) |
+                           uint64_t(0xffffffffu - uint32_t(s.c_chars[i]));
+                };
+                auto emit = [&](int slot, int /*i*/, uint64_t k) {
+                    if (slot < Smem::RANK_BUF)
+                        s.rank[slot] = k;
+                };
+                block_topk_select<BLOCK_SIZE, Smem::RANK_BUF>(cn, nb_beams + 1, key_at, emit,
+                                                              &s.sel);
+            }
+            __syncthreads();
+            for (int i = tid; i < Smem::RANK_BUF; i += BLOCK_SIZE)
+                if (i >= s.sel.out_n)
+                    s.rank[i] = 0;  // sorts last
+            __syncthreads();
+            bitonic_sort64_desc<BLOCK_SIZE>(s.rank);
+            if (tid == 0) {
+                // Greedy non-blank pick in descending order; stage the new
+                // beams in the (otherwise unused at step 0) snapshot arrays.
+                int out = 0;
+                for (int rr = 0; rr < s.sel.out_n && out < nb_beams; ++rr) {
+                    int c = (int)ckey_id(s.rank[rr]);
+                    if (c == blank_id)
+                        continue;
+                    s.s_clast[out] = c;
+                    s.lp_clast[out] = ckey_score(s.rank[rr]);
+                    ++out;
+                }
+                for (; out < nb_beams; ++out)
+                    s.s_clast[out] = -1;
+            }
+            __syncthreads();
+            for (int k = tid; k < nb_beams; k += BLOCK_SIZE) {
+                int base = bid * ldbeam + k;
+                int token = s.s_clast[k];
+                if (token >= 0) {
+                    // Prefix [token] ends in a non-blank: mass goes in the
+                    // non-blank slot (see the legacy first_step_kernel).
+                    pprev[base] = make_float2(NEG_INF, s.lp_clast[k]);
+                    if (PAGED) {
+                        page_storage[(size_t)(bid * pages_per_row + k) * page_size] = token;
+                    } else {
+                        clist0[(size_t)(bid * beam + k) * ldseq_len] = token;
+                    }
+                    clen0[base] = 1;
+                    clast[base] = token;
+                    score[base] = s.lp_clast[k];
+                } else {
+                    pprev[base] = make_float2(NEG_INF, NEG_INF);
+                    clast[base] = blank_id;
+                    clen0[base] = 0;
+                    score[base] = NEG_INF;
+                }
+            }
+            if (beam > 1 && tid == 0) {
+                int base = bid * ldbeam + (beam - 1);
+                float blank_prob = lp_row[(size_t)blank_id * vocab_stride];
+                pprev[base] = make_float2(blank_prob, NEG_INF);
+                clast[base] = blank_id;
+                clen0[base] = 0;
+                score[base] = blank_prob;
+            }
+        } else {
+            // --- Regular step ------------------------------------------------
+            // Gap test against the previous decoded frame (ring entry written
+            // by the previous iteration, a previous chunk, or init_select).
+            const int prev_frame =
+                select_seqs[bid * max_seq_len + (step - 1) % max_seq_len];
+            const bool need_add_blank = (frame_for_gap > prev_frame + 1);
+            if (streaming && tid == 0)
+                select_seqs[bid * max_seq_len + step % max_seq_len] = frame_for_gap;
+
+            const int srcp = (step - 1) & 1;
+            const int dstp = step & 1;
+            fused_step_body<BLOCK_SIZE, BEAM_CAP, PAGED>(
+                s, bid, lp_row, vocab_stride, need_add_blank, cn, pre_chars + pre_off,
+                pre_lp + pre_off, pprev, clast, srcp ? clen1 : clen0, dstp ? clen1 : clen0,
+                srcp ? clist1 : clist0, dstp ? clist1 : clist0, score, ldc, beam, ldbeam,
+                ldseq_len, blank_id, space_id, page_storage,
+                srcp ? block_table1 : block_table0, dstp ? block_table1 : block_table0,
+                ref_counts, next_free_page, free_pool, free_pool_size, page_size, max_lp);
+        }
+
+        // Publish this step's global-state writes to the next iteration.
+        __syncthreads();
+        ++step;
+    }
+}
+
 // --- chunk-level vocab top-K pre-pass -----------------------------------------
 //
 // The fused step is sequential across frames (beam-state dependency) and
@@ -2132,13 +2333,16 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_step_kernel(
 //     skipped (the step kernel guards identically, so those buffer rows are
 //     never read).
 //   * select_seqs == nullptr (streaming): block row r covers chunk frame
-//     step_begin + r directly.  Masked (blank-skip) frames are ranked too;
-//     their rows are simply never consumed.
+//     step_begin + r directly.
+//
+// Bit r of mask_lo/mask_hi gates row r (clear = blank-skip frame, never
+// consumed by the chunk kernel — its block exits immediately).
 template <int BLOCK_SIZE, int MAX_OUT>
 __global__ __launch_bounds__(BLOCK_SIZE) void fused_topk_prepass_kernel(
     const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
     const int* __restrict__ select_seqs, const int* __restrict__ select_seq_lens,
-    int step_begin, int K, int* __restrict__ pre_chars, float* __restrict__ pre_lp,
+    int step_begin, int K, unsigned long long mask_lo, unsigned long long mask_hi,
+    int* __restrict__ pre_chars, float* __restrict__ pre_lp,
     int* __restrict__ pre_cnt, int vocab_size, int batch, int max_seq_len) {
     constexpr int VKEY_CACHE = 6144;
     struct PrepassSmem {
@@ -2150,6 +2354,8 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_topk_prepass_kernel(
     const int bid = blockIdx.y;
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
+    if (!((row < 64) ? ((mask_lo >> row) & 1ull) : ((mask_hi >> (row - 64)) & 1ull)))
+        return;
     int t;
     if (select_seqs != nullptr) {
         const int step = step_begin + row;
@@ -2200,11 +2406,14 @@ inline constexpr int fused_prepass_stride(int beam) {
 // (tile_len <= PREPASS_TILE).  Offline callers pass select_seqs /
 // select_seq_lens and step_begin = the tile's first step; streaming callers
 // pass select_seqs == nullptr and step_begin = the tile's first chunk frame.
-// No-op on the legacy layout (pre-pass buffers not allocated).
+// Bit r of mask_lo/mask_hi gates row r (streaming blank-skip; all-ones for
+// offline).  No-op on the legacy layout (pre-pass buffers not allocated).
 inline cudaError_t launch_fused_topk_prepass(const InternalData* data, const float* log_prob,
                                              int batch_stride, int seq_stride, int vocab_stride,
                                              const int* select_seqs, const int* select_seq_lens,
-                                             int step_begin, int tile_len, cudaStream_t stream) {
+                                             int step_begin, int tile_len, cudaStream_t stream,
+                                             unsigned long long mask_lo = ~0ull,
+                                             unsigned long long mask_hi = ~0ull) {
     if (data->pre_chars == nullptr || tile_len <= 0)
         return cudaSuccess;
     constexpr int FUSED_BLOCK = 256;
@@ -2215,6 +2424,7 @@ inline cudaError_t launch_fused_topk_prepass(const InternalData* data, const flo
                                      fused::FusedStepSmem<FUSED_BLOCK, BEAM_CAP>::C_BUF>        \
         <<<grid, FUSED_BLOCK, 0, stream>>>(log_prob, batch_stride, seq_stride, vocab_stride,    \
                                            select_seqs, select_seq_lens, step_begin, K,         \
+                                           mask_lo, mask_hi,                                    \
                                            data->pre_chars, data->pre_lp, data->pre_cnt,        \
                                            data->vocab_size, data->batch, data->max_seq_len)
     if (data->beam <= 16) {
@@ -2223,6 +2433,52 @@ inline cudaError_t launch_fused_topk_prepass(const InternalData* data, const flo
         OASR_LAUNCH_FUSED_PREPASS(32);
     }
 #undef OASR_LAUNCH_FUSED_PREPASS
+    return cudaGetLastError();
+}
+
+// Launch the multi-frame fused chunk kernel over one pre-pass tile.  Offline:
+// streaming=false, step_begin = the tile's first step, frames resolved via
+// select_seqs, mask all-ones.  Streaming: streaming=true, frame row r covers
+// chunk position chunk_frame_begin + r gated by mask bit r; step_begin /
+// frame_begin are the stream's counters at row 0.  Callers guarantee
+// step_uses_fused(beam) (pre-pass buffers present).
+inline cudaError_t launch_fused_chunk(const InternalData* data, const float* log_prob,
+                                      int batch_stride, int seq_stride, int vocab_stride,
+                                      int step_begin, int frame_begin, int chunk_frame_begin,
+                                      int tile_len, unsigned long long mask_lo,
+                                      unsigned long long mask_hi, bool streaming, int blank_id,
+                                      int space_id, cudaStream_t stream) {
+    if (tile_len <= 0)
+        return cudaSuccess;
+    constexpr int FUSED_BLOCK = 256;
+    const auto& ps = data->paged;
+    const bool paged = ps.is_enabled();
+    const int fused_ppr = paged ? ps.num_pages / (data->batch > 0 ? data->batch : 1) : 0;
+#define OASR_LAUNCH_FUSED_CHUNK(BEAM_CAP, PAGED_)                                              \
+    fused::fused_chunk_kernel<FUSED_BLOCK, BEAM_CAP, PAGED_>                                   \
+        <<<data->batch, FUSED_BLOCK, 0, stream>>>(                                             \
+            log_prob, batch_stride, seq_stride, vocab_stride, data->select_seqs,               \
+            data->select_seq_lens, step_begin, frame_begin, chunk_frame_begin, tile_len,       \
+            mask_lo, mask_hi, streaming ? 1 : 0, data->pprev, data->clast, data->clen[0],      \
+            data->clen[1], data->clist[0], data->clist[1], data->score, data->ldc,             \
+            data->beam, data->ldbeam, data->ldseq_len, data->batch, blank_id, space_id,        \
+            data->max_seq_len, ps.page_storage, ps.block_table[0], ps.block_table[1],          \
+            ps.ref_counts, ps.next_free_page, ps.free_pool, ps.free_pool_size, ps.page_size,   \
+            ps.max_logical_pages, fused_ppr, data->pre_chars, data->pre_lp, data->pre_cnt)
+    if (data->beam <= 16) {
+        if (paged) {
+            OASR_LAUNCH_FUSED_CHUNK(16, true);
+        } else {
+            OASR_LAUNCH_FUSED_CHUNK(16, false);
+        }
+    } else {
+        if (paged) {
+            OASR_LAUNCH_FUSED_CHUNK(32, true);
+        } else {
+            OASR_LAUNCH_FUSED_CHUNK(32, false);
+        }
+    }
+#undef OASR_LAUNCH_FUSED_CHUNK
     return cudaGetLastError();
 }
 
@@ -2458,9 +2714,7 @@ inline cudaError_t ctc_prefix_beam_search_step(InternalData* data, const float* 
                                                int batch_stride, int seq_stride, int vocab_stride,
                                                int step, bool is_last_step, int blank_id,
                                                int space_id, cudaStream_t stream,
-                                               const int* d_step, bool d_step_dynamic = true,
-                                               const int* d_prepass_row = nullptr,
-                                               int prepass_row_const = -1) {
+                                               const int* d_step, bool d_step_dynamic = true) {
     int batch = data->batch;
     int beam = data->beam;
     int ldc = data->ldc;
@@ -2489,10 +2743,6 @@ inline cudaError_t ctc_prefix_beam_search_step(InternalData* data, const float* 
                 data->vocab_size, blank_id, batch, max_seq_len);
         } else {
             const int step_const = d_step_dynamic ? -1 : step;
-            // Pre-pass mode only when the caller provided a row source (the
-            // single-frame API passes neither and keeps the in-kernel select).
-            const bool use_prepass = (data->pre_chars != nullptr) &&
-                                     (d_prepass_row != nullptr || prepass_row_const >= 0);
 #define OASR_LAUNCH_FUSED_STEP(BEAM_CAP)                                                       \
     fused::fused_step_kernel<FUSED_BLOCK, BEAM_CAP, false><<<batch, FUSED_BLOCK, 0, stream>>>( \
         log_prob, batch_stride, seq_stride, vocab_stride, data->select_seqs,                   \
@@ -2500,9 +2750,7 @@ inline cudaError_t ctc_prefix_beam_search_step(InternalData* data, const float* 
         data->clen[src_parity], data->clen[dst_parity], data->clist[src_parity],               \
         data->clist[dst_parity], data->score, ldc, beam, ldbeam, ldseq_len, batch, blank_id,   \
         space_id, max_seq_len, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,  \
-        0, 0, 0, use_prepass ? data->pre_chars : nullptr,                                      \
-        use_prepass ? data->pre_lp : nullptr, use_prepass ? data->pre_cnt : nullptr,           \
-        d_prepass_row, prepass_row_const)
+        0, 0, 0)
             if (beam <= 16) {
                 OASR_LAUNCH_FUSED_STEP(16);
             } else {
@@ -2646,9 +2894,10 @@ inline cudaError_t ctc_beam_search_decode_batch(
     int* d_step_scratch = data.ptid;
     const bool fused_path = step_uses_fused(beam);
 
-    // Main decode loop, tiled by PREPASS_TILE: each tile first ranks the vocab
-    // of all its frames in one parallel pre-pass (grid = tile_len x batch), so
-    // the sequential fused steps only load precomputed candidates.
+    // Main decode loop, tiled by PREPASS_TILE.  Fused path: two launches per
+    // tile — the parallel vocab top-K pre-pass (grid = tile_len x batch) and
+    // one fused chunk kernel that loops the tile's steps in-kernel (first
+    // step included).  Legacy path: one multi-kernel step per frame.
     for (int tile_begin = 0; tile_begin < max_select; tile_begin += PREPASS_TILE) {
         const int tile_len = min(PREPASS_TILE, max_select - tile_begin);
         if (fused_path) {
@@ -2657,17 +2906,20 @@ inline cudaError_t ctc_beam_search_decode_batch(
                 data.select_seq_lens, tile_begin, tile_len, stream);
             if (perr != cudaSuccess)
                 return perr;
+            cudaError_t cerr = launch_fused_chunk(
+                &data, log_prob, batch_stride, seq_stride, vocab_stride,
+                /*step_begin=*/tile_begin, /*frame_begin=*/0, /*chunk_frame_begin=*/0,
+                tile_len, ~0ull, ~0ull, /*streaming=*/false, blank_id, space_id, stream);
+            if (cerr != cudaSuccess)
+                return cerr;
+            continue;
         }
         for (int step = tile_begin; step < tile_begin + tile_len; ++step) {
-            if (!fused_path)
-                cudaMemcpyAsync(d_step_scratch, &step, sizeof(int), cudaMemcpyHostToDevice,
-                                stream);
+            cudaMemcpyAsync(d_step_scratch, &step, sizeof(int), cudaMemcpyHostToDevice, stream);
             bool is_last = (step == max_select - 1);
             cudaError_t err = ctc_prefix_beam_search_step(
                 &data, log_prob, batch_stride, seq_stride, vocab_stride, step, is_last, blank_id,
-                space_id, stream, d_step_scratch, /*d_step_dynamic=*/false,
-                /*d_prepass_row=*/nullptr,
-                /*prepass_row_const=*/fused_path ? (step - tile_begin) : -1);
+                space_id, stream, d_step_scratch, /*d_step_dynamic=*/false);
             if (err != cudaSuccess)
                 return err;
         }
@@ -2713,8 +2965,7 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
     InternalData* data, const float* log_prob,
     int batch_stride, int seq_stride, int vocab_stride,
     int step, int blank_id, int space_id, cudaStream_t stream,
-    const int* d_step, bool d_step_dynamic = true,
-    const int* d_prepass_row = nullptr, int prepass_row_const = -1);
+    const int* d_step, bool d_step_dynamic = true);
 
 // =============================================================================
 // Streaming state
@@ -2763,7 +3014,7 @@ inline void init_streaming_state(void* state_buffer, int batch, int beam, int vo
     // Zero the device-resident streaming counters (step / actual_frame_index)
     // so the first ``streaming_step`` call sees step==0 / frame_idx==0 unless
     // the caller writes different start values via ``set_stream_counters``.
-    cudaMemsetAsync(state_buffer, 0, sizeof(int) * 3, stream);
+    cudaMemsetAsync(state_buffer, 0, sizeof(int) * 2, stream);
 
     // Initialise GPU buffers.
     cudaMemsetAsync(state.data.clast, 0, sizeof(int) * batch * state.data.ldbeam, stream);
@@ -3021,7 +3272,7 @@ inline cudaError_t streaming_step_persistent(
     void* state_buffer, const float* log_prob_frame, int batch_stride, int vocab_stride,
     int blank_id, int space_id, int batch, int beam, int vocab_size, int max_seq_len,
     int use_paged_memory, int page_size, int num_pages, int step_for_parity,
-    cudaStream_t stream, bool use_prepass = false) {
+    cudaStream_t stream) {
     void* workspace = reinterpret_cast<char*>(state_buffer) + STATE_HEADER_SIZE;
 
     InternalData data;
@@ -3042,33 +3293,31 @@ inline cudaError_t streaming_step_persistent(
     }
 
     const int* d_step = device_step_ptr(state_buffer);
-    // The chunk launchers run the per-tile vocab top-K pre-pass before the
-    // per-frame loop and set the prepass-row counter alongside step/frame_idx;
-    // the fused step then loads candidates indexed by ``*d_prepass_row``.
-    const int* d_prepass_row =
-        use_prepass ? device_prepass_row_ptr(state_buffer) : nullptr;
     if (use_paged_memory) {
         return ctc_prefix_beam_search_step_paged(&data, log_prob_frame, batch_stride, 0,
                                                  vocab_stride, step_for_parity, blank_id,
-                                                 space_id, stream, d_step,
-                                                 /*d_step_dynamic=*/true, d_prepass_row);
+                                                 space_id, stream, d_step);
     } else {
         bool is_last = false;
         return ctc_prefix_beam_search_step(&data, log_prob_frame, batch_stride, 0, vocab_stride,
                                            step_for_parity, is_last, blank_id, space_id, stream,
-                                           d_step, /*d_step_dynamic=*/true, d_prepass_row);
+                                           d_step);
     }
 }
 
-// Launch the streaming (identity-frame) pre-pass for one chunk tile directly
-// from a state buffer.  ``log_prob_chunk`` is the stream's chunk base; rows
-// [tile_begin, tile_begin + tile_len) are ranked into pre-pass buffer rows
-// [0, tile_len).  No-op on the legacy layout.  Used by the chunk launchers.
-inline cudaError_t streaming_chunk_prepass(void* state_buffer, const float* log_prob_chunk,
-                                           int batch_stride, int seq_stride, int vocab_stride,
-                                           int tile_begin, int tile_len, int batch, int beam,
-                                           int vocab_size, int max_seq_len, int use_paged_memory,
-                                           int page_size, int num_pages, cudaStream_t stream) {
+// Decode one chunk tile for a streaming state on the fused path: one parallel
+// vocab top-K pre-pass + one multi-frame fused chunk kernel — no per-frame
+// launches, no d_lp_frame_buf copies, no CUDA graphs.  ``log_prob_chunk`` is
+// the stream's chunk base; bit r of mask_lo/mask_hi gates chunk frame
+// ``tile_begin + r`` (clear = blank-skip); ``step_begin`` / ``frame_begin``
+// are the stream's counters at row 0 of the tile.  Caller guarantees
+// step_uses_fused(beam).  Used by the chunk launchers in csrc.
+inline cudaError_t streaming_decode_chunk_fused(
+    void* state_buffer, const float* log_prob_chunk, int batch_stride, int seq_stride,
+    int vocab_stride, int tile_begin, int tile_len, int step_begin, int frame_begin,
+    unsigned long long mask_lo, unsigned long long mask_hi, int blank_id, int space_id,
+    int batch, int beam, int vocab_size, int max_seq_len, int use_paged_memory, int page_size,
+    int num_pages, cudaStream_t stream) {
     void* workspace = reinterpret_cast<char*>(state_buffer) + STATE_HEADER_SIZE;
     InternalData data;
     if (use_paged_memory) {
@@ -3077,9 +3326,15 @@ inline cudaError_t streaming_chunk_prepass(void* state_buffer, const float* log_
     } else {
         setup_internal_data_pointers(&data, workspace, batch, beam, vocab_size, max_seq_len);
     }
-    return launch_fused_topk_prepass(&data, log_prob_chunk, batch_stride, seq_stride,
-                                     vocab_stride, /*select_seqs=*/nullptr,
-                                     /*select_seq_lens=*/nullptr, tile_begin, tile_len, stream);
+    cudaError_t err = launch_fused_topk_prepass(
+        &data, log_prob_chunk, batch_stride, seq_stride, vocab_stride, /*select_seqs=*/nullptr,
+        /*select_seq_lens=*/nullptr, tile_begin, tile_len, stream, mask_lo, mask_hi);
+    if (err != cudaSuccess)
+        return err;
+    return launch_fused_chunk(&data, log_prob_chunk, batch_stride, seq_stride, vocab_stride,
+                              step_begin, frame_begin, /*chunk_frame_begin=*/tile_begin,
+                              tile_len, mask_lo, mask_hi, /*streaming=*/true, blank_id, space_id,
+                              stream);
 }
 
 inline cudaError_t read_streaming_results(void* state_buffer, int* out_tokens, int* out_lengths,
@@ -3622,8 +3877,7 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
     InternalData* data, const float* log_prob,
     int batch_stride, int seq_stride, int vocab_stride,
     int step, int blank_id, int space_id, cudaStream_t stream,
-    const int* d_step, bool d_step_dynamic,
-    const int* d_prepass_row, int prepass_row_const) {
+    const int* d_step, bool d_step_dynamic) {
     auto& ps = data->paged;
     int batch = data->batch;
     int beam = data->beam;
@@ -3645,10 +3899,6 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
                 beam, ldbeam, data->ldseq_len, data->vocab_size, blank_id, batch, max_seq_len);
         } else {
             const int step_const = d_step_dynamic ? -1 : step;
-            // Pre-pass mode only when the caller provided a row source (the
-            // single-frame API passes neither and keeps the in-kernel select).
-            const bool use_prepass = (data->pre_chars != nullptr) &&
-                                     (d_prepass_row != nullptr || prepass_row_const >= 0);
 #define OASR_LAUNCH_FUSED_STEP_PAGED(BEAM_CAP)                                                \
     fused::fused_step_kernel<FUSED_BLOCK, BEAM_CAP, true><<<batch, FUSED_BLOCK, 0, stream>>>( \
         log_prob, batch_stride, seq_stride, vocab_stride, data->select_seqs,                  \
@@ -3657,9 +3907,7 @@ inline cudaError_t ctc_prefix_beam_search_step_paged(
         /*clist_dst=*/nullptr, data->score, ldc, beam, ldbeam, data->ldseq_len, batch,        \
         blank_id, space_id, max_seq_len, ps.page_storage, ps.block_table[src_parity],         \
         ps.block_table[dst_parity], ps.ref_counts, ps.next_free_page, ps.free_pool,          \
-        ps.free_pool_size, ps.page_size, ps.max_logical_pages, fused_ppr,                     \
-        use_prepass ? data->pre_chars : nullptr, use_prepass ? data->pre_lp : nullptr,        \
-        use_prepass ? data->pre_cnt : nullptr, d_prepass_row, prepass_row_const)
+        ps.free_pool_size, ps.page_size, ps.max_logical_pages, fused_ppr)
             if (beam <= 16) {
                 OASR_LAUNCH_FUSED_STEP_PAGED(16);
             } else {
@@ -3804,8 +4052,8 @@ inline cudaError_t ctc_beam_search_decode_batch_paged(
     data.max_select_seq_len = max_select;
 
     // See ctc_beam_search_decode_batch: ptid doubles as the legacy step
-    // counter; the fused path takes the step by value.  The loop is tiled by
-    // PREPASS_TILE with one parallel vocab top-K pre-pass per tile.
+    // counter; the fused path runs two launches per PREPASS_TILE tile (vocab
+    // top-K pre-pass + in-kernel multi-step chunk kernel).
     int* d_step_scratch = data.ptid;
     const bool fused_path = step_uses_fused(beam);
 
@@ -3817,16 +4065,19 @@ inline cudaError_t ctc_beam_search_decode_batch_paged(
                 data.select_seq_lens, tile_begin, tile_len, stream);
             if (perr != cudaSuccess)
                 return perr;
+            cudaError_t cerr = launch_fused_chunk(
+                &data, log_prob, batch_stride, seq_stride, vocab_stride,
+                /*step_begin=*/tile_begin, /*frame_begin=*/0, /*chunk_frame_begin=*/0,
+                tile_len, ~0ull, ~0ull, /*streaming=*/false, blank_id, space_id, stream);
+            if (cerr != cudaSuccess)
+                return cerr;
+            continue;
         }
         for (int step = tile_begin; step < tile_begin + tile_len; ++step) {
-            if (!fused_path)
-                cudaMemcpyAsync(d_step_scratch, &step, sizeof(int), cudaMemcpyHostToDevice,
-                                stream);
+            cudaMemcpyAsync(d_step_scratch, &step, sizeof(int), cudaMemcpyHostToDevice, stream);
             cudaError_t err = ctc_prefix_beam_search_step_paged(
                 &data, log_prob, batch_stride, seq_stride, vocab_stride,
-                step, blank_id, space_id, stream, d_step_scratch, /*d_step_dynamic=*/false,
-                /*d_prepass_row=*/nullptr,
-                /*prepass_row_const=*/fused_path ? (step - tile_begin) : -1);
+                step, blank_id, space_id, stream, d_step_scratch, /*d_step_dynamic=*/false);
             if (err != cudaSuccess)
                 return err;
         }
@@ -3869,7 +4120,7 @@ inline void init_streaming_state_paged(void* state_buffer, int batch, int beam,
 
     // Header is no longer read; skip the StreamingState memcpy.  Zero the
     // device-resident streaming counters (mirrors the flat init path).
-    cudaMemsetAsync(state_buffer, 0, sizeof(int) * 3, stream);
+    cudaMemsetAsync(state_buffer, 0, sizeof(int) * 2, stream);
 
     // Initialise beam-state buffers
     cudaMemsetAsync(state.data.clast, 0, sizeof(int) * batch * state.data.ldbeam, stream);

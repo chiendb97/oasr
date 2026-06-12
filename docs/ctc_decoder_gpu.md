@@ -546,30 +546,56 @@ state. So the ranking is hoisted out of the sequential loop:
   frames with grid `(tile_len, batch)` — full GPU parallelism — and
   emits each frame's top-`(2·beam + 2)` chars + log-probs into the
   `pre_chars` / `pre_lp` / `pre_cnt` workspace buffers (layout
-  `[row][batch][C_BUF]`).
-- `fused_step_kernel` in pre-pass mode (`pre_cnt != nullptr`) replaces
-  its Phase-3 vocab scan with a load of ≤ `C_BUF` precomputed
-  candidates. The precomputed list is a *superset* of the in-kernel
-  top-`k_all` selection, and every scored candidate is an exact slot of
-  the conceptual score matrix, so the global top-beam — and hence the
+  `[row][batch][C_BUF]`). Bit `r` of a by-value 128-bit mask
+  (`mask_lo`/`mask_hi`) gates row `r`, so blank-skip frames are not
+  ranked at all.
+- The step body (`fused_step_body`) in pre-pass mode replaces its
+  Phase-3 vocab scan with a load of ≤ `C_BUF` precomputed candidates.
+  The precomputed list is a *superset* of the in-kernel top-`k_all`
+  selection, and every scored candidate is an exact slot of the
+  conceptual score matrix, so the global top-beam — and hence the
   decode — is unchanged (validated by the §3.4.6 parity suite plus
-  cross-tile fused-vs-legacy checks).
+  exact old-vs-new output comparisons across tile boundaries and
+  masks).
 
-Row indexing mirrors the step counter: offline passes the tile-relative
-step by value (`prepass_row_const = step − tile_begin`); streaming
-reads a third device-resident counter (`*d_prepass_row`, state-header
-offset 8) that the chunk launchers set per frame alongside
-`step`/`frame_idx`, so captured CUDA graphs stay valid across frames.
 Offline indexes frames through `select_seqs`; streaming ranks chunk
-positions directly (masked blank frames are ranked too — their rows are
-simply never consumed). The single-frame `ctc_beam_search_step` API
-passes neither and keeps the in-kernel select as a fallback.
+positions directly. The single-frame `ctc_beam_search_step` API keeps
+the in-kernel select (`fused_step_kernel` wrapper, `pre_cnt_row = -1`).
 
-RTX 5090, fused path before → after the pre-pass: offline
-`(1, 200, 5000, 10)` 2.50 ms → 1.60 ms (−36 %), `(16, 200, 5000, 10)`
-3.93 ms → 3.19 ms (−19 %); streaming `(V=5000, beam=10)` 16.9 →
-12.4 µs/frame (−27 %). Fused-vs-legacy speedup at vocab 5000 rises
-from ~2.3–3× to ~3.2–4.7×.
+#### 3.4.8 Multi-frame chunk kernel (`fused::fused_chunk_kernel`)
+
+With the vocab scan hoisted, the remaining per-frame cost was the
+launch chain itself: a counter kernel + a `d_lp_frame_buf` D2D copy +
+a CUDA-graph replay per decoded frame (~12 µs/frame at V=5000).
+`fused_chunk_kernel` removes the chain: one launch decodes a whole
+pre-pass tile, each block owning one batch row and looping the tile's
+frames in-kernel with the beam-state dependency carried across
+iterations (a block's global-state writes are visible to its own reads
+after `__syncthreads()`).
+
+- Frame gating, counters and parity are all in-kernel: the blank-skip
+  mask travels as the same two by-value 64-bit words as the pre-pass
+  (no H2D copy), `step`/`frame_idx` advance from by-value starting
+  values, the `select_seqs` ring write (formerly
+  `set_select_seq_step_kernel`) is inlined, and the
+  clen/clist/block_table double-buffer parity is a pointer swap per
+  iteration.
+- `step == 0` runs the first-step initialisation inline from the same
+  pre-pass candidates (a superset of the top-`(nb_beams + 1)` chars the
+  dedicated first-step kernels select, so the greedy non-blank pick is
+  identical).
+- Per tile the whole decode is **two launches** (pre-pass + chunk
+  kernel) per stream. The offline loops use the same kernel in
+  `select_seqs` mode: `ceil(max_select / 128) × 2` launches total.
+  CUDA graphs are no longer used on the fused path (`use_cuda_graphs`
+  is ignored there); the per-frame graph machinery remains only for the
+  legacy / `beam > 32` / `OASR_CTC_FUSED=0` chunk path.
+
+RTX 5090, fused path across the two optimisations (§3.4.7 + §3.4.8):
+offline `(1, 200, 5000, 10)` 2.50 → 1.60 → 1.42 ms, `(16, 200, 5000,
+10)` 3.93 → 3.19 → 2.87 ms; streaming `(V=5000, beam=10)` 16.9 → 12.4
+→ 8.2 µs/frame (2.06× total). Fused-vs-legacy speedup at vocab 5000
+rises from ~2.3–3× to ~3.3–5.3×.
 
 ### 3.5 Frame selection (offline only)
 
@@ -749,13 +775,15 @@ length sequences.
 
 ## 6. Per-Step Kernel Pipeline
 
-For `beam ≤ 32` both launchers dispatch the fused fast path instead:
-`fused::fused_first_step_kernel` at step 0, one
-`fused::fused_topk_prepass_kernel` per `PREPASS_TILE`-frame tile
-(§3.4.7), and one
-`fused::fused_step_kernel<256, BEAM_CAP ∈ {16, 32}, PAGED>` per
-subsequent step (§3.4.6). The table below is the legacy / `beam > 32`
-/ `OASR_CTC_FUSED=0` pipeline.
+For `beam ≤ 32` both the offline decode loops and the chunk launchers
+dispatch the fused fast path instead: per `PREPASS_TILE`-frame tile,
+one `fused::fused_topk_prepass_kernel` (§3.4.7) followed by one
+`fused::fused_chunk_kernel<256, BEAM_CAP ∈ {16, 32}, PAGED>` that loops
+the tile's frames in-kernel — first step included (§3.4.8).  The
+single-frame `ctc_beam_search_step` API still launches
+`fused::fused_first_step_kernel` / `fused::fused_step_kernel` per frame
+(§3.4.6).  The table below is the legacy / `beam > 32` /
+`OASR_CTC_FUSED=0` pipeline.
 
 `ctc_prefix_beam_search_step` (flat) and
 `ctc_prefix_beam_search_step_paged` (paged) launch the same kernel
@@ -825,11 +853,13 @@ end of utterance:
     ctc_beam_search_read_state  ──▶ flat memcpy or gather_paged_results
 ```
 
-`ctc_beam_search_chunk` is the production hot path. It loops in C++
-calling `streaming_step` for every active frame; an optional CPU
-`is_speech_mask` (uint8) lets the caller skip blank-dominated frames
-without re-launching from Python. Returns the new `step` (capped at
-`max_seq_len`); the caller maintains `frame_idx` itself.
+`ctc_beam_search_chunk` is the production hot path. On the fused path
+(`beam ≤ 32`) it issues two launches per `PREPASS_TILE` tile — vocab
+top-K pre-pass + multi-frame chunk kernel (§3.4.7/§3.4.8) — with the
+optional CPU `is_speech_mask` (uint8) folded into a by-value 128-bit
+bitmap; on the legacy path it loops per active frame (captured CUDA
+graphs or eager `streaming_step_persistent`). Returns the new `step`;
+the caller maintains `frame_idx` itself.
 
 `streaming_step` rebuilds `InternalData` from the dimensions the caller
 passes (no GPU read), updates `select_seqs[b, step]` to reflect the
