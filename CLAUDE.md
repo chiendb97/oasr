@@ -364,3 +364,4 @@ Two skill files provide step-by-step workflows for common tasks:
 | `OASR_ATTN_BACKEND` | `sdpa` (force SDPA), `cute` (require CuteDSL FMHA, raise on unsupported arch or import failure), `auto` (default — use cute on sm_80 / sm_86 / sm_89 / sm_120 when CuteDSL imports, else warn + fall back to SDPA) |
 | `OASR_RS_BIN` | Absolute path to an `oasr-server` executable; overrides the `oasr-server`-on-`$PATH` / `rust/target/release/` lookup used by `bench_service.py` |
 | `OASR_USE_K2` | Set to `1` to build the WFST decoder (requires `pip install k2` and a k2 source tree at `K2_SOURCE_DIR` — default `/opt/k2-src`) |
+| `OASR_CTC_FUSED` | Set to `0` to force the legacy multi-kernel CTC beam-search step (compiles a separate `ctc_decoder_legacy` JIT module). Default: fused single-kernel step for `beam <= 32` (~2.3–3× faster; see `docs/ctc_decoder_gpu.md` §3.4.6). Rollback / A/B-parity switch — set before process start |
