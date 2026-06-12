@@ -2153,11 +2153,18 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_step_kernel(
 // pre-pass candidates (a superset of the top-(nb_beams + 1) chars the
 // dedicated first-step kernels select, so the greedy non-blank pick below is
 // identical).  Double-buffer parity is resolved per step in-kernel.
+//
+// The loop lives in ``fused_chunk_loop`` so the single-state kernel and the
+// multi-stream batched kernel share it; callers pass the state's own buffer
+// pointers (paged allocator views already row-localised) plus that block's
+// ``bid``.  ``log_prob`` is the state's lp base — the loop adds
+// ``bid * batch_stride`` itself.
 template <int BLOCK_SIZE, int BEAM_CAP, bool PAGED>
-__global__ __launch_bounds__(BLOCK_SIZE) void fused_chunk_kernel(
-    const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
-    int* __restrict__ select_seqs, const int* __restrict__ select_seq_lens, int step_begin,
-    int frame_begin, int chunk_frame_begin, int tile_len, unsigned long long mask_lo,
+__device__ __forceinline__ void fused_chunk_loop(
+    FusedStepSmem<BLOCK_SIZE, BEAM_CAP>& s, int bid, const float* __restrict__ log_prob,
+    int batch_stride, int seq_stride, int vocab_stride, int* __restrict__ select_seqs,
+    const int* __restrict__ select_seq_lens, int step_begin, int frame_begin,
+    int chunk_frame_begin, int tile_len, unsigned long long mask_lo,
     unsigned long long mask_hi, int streaming, float2* __restrict__ pprev,
     int* __restrict__ clast, int* __restrict__ clen0, int* __restrict__ clen1,
     int* __restrict__ clist0, int* __restrict__ clist1, float* __restrict__ score, int ldc,
@@ -2169,19 +2176,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_chunk_kernel(
     const int* __restrict__ pre_chars, const float* __restrict__ pre_lp,
     const int* __restrict__ pre_cnt) {
     using Smem = FusedStepSmem<BLOCK_SIZE, BEAM_CAP>;
-    __shared__ Smem s;
-
-    const int bid = blockIdx.x;
-    if (bid >= batch)
-        return;
     const int tid = threadIdx.x;
-
-    if (PAGED) {
-        // Row-local allocator views (see the alloc_page/free_page comment).
-        free_pool += bid * pages_per_row;
-        free_pool_size += bid;
-        next_free_page += bid;
-    }
 
     const int sel_len = select_seq_lens[bid];  // INT_MAX in streaming
     int step = step_begin;
@@ -2317,6 +2312,145 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_chunk_kernel(
     }
 }
 
+// Single-state chunk kernel: one block per batch row of one stream.
+template <int BLOCK_SIZE, int BEAM_CAP, bool PAGED>
+__global__ __launch_bounds__(BLOCK_SIZE) void fused_chunk_kernel(
+    const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
+    int* __restrict__ select_seqs, const int* __restrict__ select_seq_lens, int step_begin,
+    int frame_begin, int chunk_frame_begin, int tile_len, unsigned long long mask_lo,
+    unsigned long long mask_hi, int streaming, float2* __restrict__ pprev,
+    int* __restrict__ clast, int* __restrict__ clen0, int* __restrict__ clen1,
+    int* __restrict__ clist0, int* __restrict__ clist1, float* __restrict__ score, int ldc,
+    int beam, int ldbeam, int ldseq_len, int batch, int blank_id, int space_id,
+    int max_seq_len, int* __restrict__ page_storage, int* __restrict__ block_table0,
+    int* __restrict__ block_table1, int* __restrict__ ref_counts,
+    int* __restrict__ next_free_page, int* __restrict__ free_pool,
+    int* __restrict__ free_pool_size, int page_size, int max_lp, int pages_per_row,
+    const int* __restrict__ pre_chars, const float* __restrict__ pre_lp,
+    const int* __restrict__ pre_cnt) {
+    using Smem = FusedStepSmem<BLOCK_SIZE, BEAM_CAP>;
+    __shared__ Smem s;
+
+    const int bid = blockIdx.x;
+    if (bid >= batch)
+        return;
+
+    if (PAGED) {
+        // Row-local allocator views (see the alloc_page/free_page comment).
+        free_pool += bid * pages_per_row;
+        free_pool_size += bid;
+        next_free_page += bid;
+    }
+
+    fused_chunk_loop<BLOCK_SIZE, BEAM_CAP, PAGED>(
+        s, bid, log_prob, batch_stride, seq_stride, vocab_stride, select_seqs,
+        select_seq_lens, step_begin, frame_begin, chunk_frame_begin, tile_len, mask_lo,
+        mask_hi, streaming, pprev, clast, clen0, clen1, clist0, clist1, score, ldc, beam,
+        ldbeam, ldseq_len, batch, blank_id, space_id, max_seq_len, page_storage,
+        block_table0, block_table1, ref_counts, next_free_page, free_pool, free_pool_size,
+        page_size, max_lp, pages_per_row, pre_chars, pre_lp, pre_cnt);
+}
+
+// --- multi-stream batched chunk decode ------------------------------------------
+//
+// ``ctc_beam_search_chunk_batched`` used to launch the (pre-pass + chunk
+// kernel) pair once per stream on one CUDA stream, leaving N independent
+// streams to run as one serial chain N tiles deep.  The batched kernels fold
+// a *group* of up to FusedStreamGroup::CAP streams into a single launch
+// (grid = group_size x batch blocks), so the serial depth per tile drops from
+// N to ceil(N / CAP).
+//
+// All streams of a group share one config (engine invariant) and therefore
+// one workspace layout; per-stream state lives at ``base + delta[slot]``
+// relative to the group's first stream, so the kernels take the first
+// stream's pointers plus a by-value array of byte deltas — no device-side
+// pointer table, no H2D upload.  Per-stream counters and blank-skip masks
+// ride in the same by-value struct (32 B per stream; CAP = 64 keeps the
+// kernel-parameter block ~2.4 KB, comfortably under the 4 KB CUDA limit).
+struct FusedStreamGroup {
+    static constexpr int CAP = 64;
+    long long delta[CAP];  // state-buffer byte offset vs the group's first stream
+    unsigned long long mask_lo[CAP];
+    unsigned long long mask_hi[CAP];
+    int step_begin[CAP];
+    int frame_begin[CAP];
+    int n;  // active streams in this group (<= CAP)
+};
+
+__device__ __forceinline__ char* group_shift(const void* p, long long d) {
+    return const_cast<char*>(reinterpret_cast<const char*>(p)) + d;
+}
+
+// Grid: (group_size * batch) blocks; block i covers (stream slot i / batch,
+// batch row i % batch).  ``log_prob`` points at the group's first stream's
+// rows of the stacked (N, T, V) chunk tensor; state row ``bid`` of stream
+// slot ``si`` reads lp row ``si + bid`` (same convention as the per-stream
+// launcher, where each state's rows follow its stream index).
+template <int BLOCK_SIZE, int BEAM_CAP, bool PAGED>
+__global__ __launch_bounds__(BLOCK_SIZE) void fused_chunk_batched_kernel(
+    const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
+    FusedStreamGroup grp, int chunk_frame_begin, int tile_len, int* __restrict__ select_seqs0,
+    const int* __restrict__ select_seq_lens0, float2* __restrict__ pprev0,
+    int* __restrict__ clast0, int* __restrict__ clen00, int* __restrict__ clen10,
+    int* __restrict__ clist00, int* __restrict__ clist10, float* __restrict__ score0,
+    int ldc, int beam, int ldbeam, int ldseq_len, int batch, int blank_id, int space_id,
+    int max_seq_len, int* __restrict__ page_storage0, int* __restrict__ block_table00,
+    int* __restrict__ block_table10, int* __restrict__ ref_counts0,
+    int* __restrict__ next_free_page0, int* __restrict__ free_pool0,
+    int* __restrict__ free_pool_size0, int page_size, int max_lp, int pages_per_row,
+    const int* __restrict__ pre_chars0, const float* __restrict__ pre_lp0,
+    const int* __restrict__ pre_cnt0) {
+    using Smem = FusedStepSmem<BLOCK_SIZE, BEAM_CAP>;
+    __shared__ Smem s;
+
+    const int si = blockIdx.x / batch;   // stream slot within the group
+    const int bid = blockIdx.x - si * batch;
+    if (si >= grp.n)
+        return;
+    const long long d = grp.delta[si];
+
+    int* select_seqs = reinterpret_cast<int*>(group_shift(select_seqs0, d));
+    const int* select_seq_lens = reinterpret_cast<const int*>(group_shift(select_seq_lens0, d));
+    float2* pprev = reinterpret_cast<float2*>(group_shift(pprev0, d));
+    int* clast = reinterpret_cast<int*>(group_shift(clast0, d));
+    int* clen0 = reinterpret_cast<int*>(group_shift(clen00, d));
+    int* clen1 = reinterpret_cast<int*>(group_shift(clen10, d));
+    int* clist0 = PAGED ? nullptr : reinterpret_cast<int*>(group_shift(clist00, d));
+    int* clist1 = PAGED ? nullptr : reinterpret_cast<int*>(group_shift(clist10, d));
+    float* score = reinterpret_cast<float*>(group_shift(score0, d));
+    const int* pre_chars = reinterpret_cast<const int*>(group_shift(pre_chars0, d));
+    const float* pre_lp = reinterpret_cast<const float*>(group_shift(pre_lp0, d));
+    const int* pre_cnt = reinterpret_cast<const int*>(group_shift(pre_cnt0, d));
+
+    int* page_storage = nullptr;
+    int* block_table0 = nullptr;
+    int* block_table1 = nullptr;
+    int* ref_counts = nullptr;
+    int* next_free_page = nullptr;
+    int* free_pool = nullptr;
+    int* free_pool_size = nullptr;
+    if (PAGED) {
+        page_storage = reinterpret_cast<int*>(group_shift(page_storage0, d));
+        block_table0 = reinterpret_cast<int*>(group_shift(block_table00, d));
+        block_table1 = reinterpret_cast<int*>(group_shift(block_table10, d));
+        ref_counts = reinterpret_cast<int*>(group_shift(ref_counts0, d));
+        // Row-local allocator views (see the alloc_page/free_page comment).
+        next_free_page = reinterpret_cast<int*>(group_shift(next_free_page0, d)) + bid;
+        free_pool =
+            reinterpret_cast<int*>(group_shift(free_pool0, d)) + bid * pages_per_row;
+        free_pool_size = reinterpret_cast<int*>(group_shift(free_pool_size0, d)) + bid;
+    }
+
+    fused_chunk_loop<BLOCK_SIZE, BEAM_CAP, PAGED>(
+        s, bid, log_prob + (size_t)si * batch_stride, batch_stride, seq_stride, vocab_stride,
+        select_seqs, select_seq_lens, grp.step_begin[si], grp.frame_begin[si],
+        chunk_frame_begin, tile_len, grp.mask_lo[si], grp.mask_hi[si], /*streaming=*/1,
+        pprev, clast, clen0, clen1, clist0, clist1, score, ldc, beam, ldbeam, ldseq_len,
+        batch, blank_id, space_id, max_seq_len, page_storage, block_table0, block_table1,
+        ref_counts, next_free_page, free_pool, free_pool_size, page_size, max_lp,
+        pages_per_row, pre_chars, pre_lp, pre_cnt);
+}
+
 // --- chunk-level vocab top-K pre-pass -----------------------------------------
 //
 // The fused step is sequential across frames (beam-state dependency) and
@@ -2337,6 +2471,45 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_chunk_kernel(
 //
 // Bit r of mask_lo/mask_hi gates row r (clear = blank-skip frame, never
 // consumed by the chunk kernel — its block exits immediately).
+template <int BLOCK_SIZE>
+struct PrepassSmem {
+    static constexpr int VKEY_CACHE = 6144;
+    uint32_t vkeys[VKEY_CACHE];
+    SelectScratch<BLOCK_SIZE> sel;
+};
+
+// Rank one frame's vocab and emit the top-K chars + log-probs; shared by the
+// single-state and the multi-stream batched pre-pass kernels.
+template <int BLOCK_SIZE, int MAX_OUT>
+__device__ __forceinline__ void prepass_rank_row(PrepassSmem<BLOCK_SIZE>& s,
+                                                 const float* __restrict__ lp_row,
+                                                 int vocab_stride, int K, int vocab_size,
+                                                 int* __restrict__ out_chars,
+                                                 float* __restrict__ out_lp,
+                                                 int* __restrict__ out_cnt) {
+    const int tid = threadIdx.x;
+    const bool use_vcache = (vocab_size <= PrepassSmem<BLOCK_SIZE>::VKEY_CACHE);
+    if (use_vcache) {
+        for (int c = tid; c < vocab_size; c += BLOCK_SIZE)
+            s.vkeys[c] = f32_sortable(lp_row[(size_t)c * vocab_stride]);
+        __syncthreads();
+    }
+
+    auto key_at = [&](int c) -> uint64_t {
+        uint32_t sk = use_vcache ? s.vkeys[c] : f32_sortable(lp_row[(size_t)c * vocab_stride]);
+        return (uint64_t(sk) << 32) | uint64_t(0xffffffffu - uint32_t(c));
+    };
+    auto emit = [&](int slot, int c, uint64_t k) {
+        if (slot < MAX_OUT) {
+            out_chars[slot] = c;
+            out_lp[slot] = ckey_score(k);
+        }
+    };
+    int cnt = block_topk_select<BLOCK_SIZE, MAX_OUT>(vocab_size, K, key_at, emit, &s.sel);
+    if (tid == 0)
+        *out_cnt = min(cnt, MAX_OUT);
+}
+
 template <int BLOCK_SIZE, int MAX_OUT>
 __global__ __launch_bounds__(BLOCK_SIZE) void fused_topk_prepass_kernel(
     const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
@@ -2344,16 +2517,10 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_topk_prepass_kernel(
     int step_begin, int K, unsigned long long mask_lo, unsigned long long mask_hi,
     int* __restrict__ pre_chars, float* __restrict__ pre_lp,
     int* __restrict__ pre_cnt, int vocab_size, int batch, int max_seq_len) {
-    constexpr int VKEY_CACHE = 6144;
-    struct PrepassSmem {
-        uint32_t vkeys[VKEY_CACHE];
-        SelectScratch<BLOCK_SIZE> sel;
-    };
-    __shared__ PrepassSmem s;
+    __shared__ PrepassSmem<BLOCK_SIZE> s;
 
     const int bid = blockIdx.y;
     const int row = blockIdx.x;
-    const int tid = threadIdx.x;
     if (!((row < 64) ? ((mask_lo >> row) & 1ull) : ((mask_hi >> (row - 64)) & 1ull)))
         return;
     int t;
@@ -2369,27 +2536,44 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_topk_prepass_kernel(
     }
     const float* lp_row = log_prob + (size_t)bid * batch_stride + (size_t)t * seq_stride;
 
-    const bool use_vcache = (vocab_size <= VKEY_CACHE);
-    if (use_vcache) {
-        for (int c = tid; c < vocab_size; c += BLOCK_SIZE)
-            s.vkeys[c] = f32_sortable(lp_row[(size_t)c * vocab_stride]);
-        __syncthreads();
-    }
+    const int out_off = (row * batch + bid) * MAX_OUT;
+    prepass_rank_row<BLOCK_SIZE, MAX_OUT>(s, lp_row, vocab_stride, K, vocab_size,
+                                          pre_chars + out_off, pre_lp + out_off,
+                                          pre_cnt + row * batch + bid);
+}
+
+// Multi-stream batched pre-pass: grid (tile_len, group_size * batch).  Frame
+// indexing is identity (streaming chunk positions); per-stream output buffers
+// sit at ``ptr0 + grp.delta[slot]`` and per-stream mask bits gate each row.
+template <int BLOCK_SIZE, int MAX_OUT>
+__global__ __launch_bounds__(BLOCK_SIZE) void fused_topk_prepass_batched_kernel(
+    const float* __restrict__ log_prob, int batch_stride, int seq_stride, int vocab_stride,
+    FusedStreamGroup grp, int frame_begin, int K, int* __restrict__ pre_chars0,
+    float* __restrict__ pre_lp0, int* __restrict__ pre_cnt0, int vocab_size, int batch) {
+    __shared__ PrepassSmem<BLOCK_SIZE> s;
+
+    const int row = blockIdx.x;
+    const int si = blockIdx.y / batch;
+    const int bid = blockIdx.y - si * batch;
+    if (si >= grp.n)
+        return;
+    if (!((row < 64) ? ((grp.mask_lo[si] >> row) & 1ull)
+                     : ((grp.mask_hi[si] >> (row - 64)) & 1ull)))
+        return;
+
+    const long long d = grp.delta[si];
+    int* pre_chars = reinterpret_cast<int*>(group_shift(pre_chars0, d));
+    float* pre_lp = reinterpret_cast<float*>(group_shift(pre_lp0, d));
+    int* pre_cnt = reinterpret_cast<int*>(group_shift(pre_cnt0, d));
+
+    const int t = frame_begin + row;
+    const float* lp_row =
+        log_prob + (size_t)(si + bid) * batch_stride + (size_t)t * seq_stride;
 
     const int out_off = (row * batch + bid) * MAX_OUT;
-    auto key_at = [&](int c) -> uint64_t {
-        uint32_t sk = use_vcache ? s.vkeys[c] : f32_sortable(lp_row[(size_t)c * vocab_stride]);
-        return (uint64_t(sk) << 32) | uint64_t(0xffffffffu - uint32_t(c));
-    };
-    auto emit = [&](int slot, int c, uint64_t k) {
-        if (slot < MAX_OUT) {
-            pre_chars[out_off + slot] = c;
-            pre_lp[out_off + slot] = ckey_score(k);
-        }
-    };
-    int cnt = block_topk_select<BLOCK_SIZE, MAX_OUT>(vocab_size, K, key_at, emit, &s.sel);
-    if (tid == 0)
-        pre_cnt[row * batch + bid] = min(cnt, MAX_OUT);
+    prepass_rank_row<BLOCK_SIZE, MAX_OUT>(s, lp_row, vocab_stride, K, vocab_size,
+                                          pre_chars + out_off, pre_lp + out_off,
+                                          pre_cnt + row * batch + bid);
 }
 
 }  // namespace fused
@@ -2479,6 +2663,61 @@ inline cudaError_t launch_fused_chunk(const InternalData* data, const float* log
         }
     }
 #undef OASR_LAUNCH_FUSED_CHUNK
+    return cudaGetLastError();
+}
+
+// Launch one (batched pre-pass + batched chunk kernel) pair for a GROUP of
+// streams over one tile.  ``data`` describes the group's first stream;
+// per-stream byte deltas, counters and blank-skip masks ride in ``grp`` (by
+// value — no device-side pointer table or H2D upload).  ``log_prob`` points
+// at the group's first stream's rows of the stacked (N, T, V) chunk tensor;
+// ``tile_begin`` is the tile's first chunk frame.
+inline cudaError_t launch_fused_chunk_batched(const InternalData* data, const float* log_prob,
+                                              int batch_stride, int seq_stride, int vocab_stride,
+                                              const fused::FusedStreamGroup& grp, int tile_begin,
+                                              int tile_len, int blank_id, int space_id,
+                                              cudaStream_t stream) {
+    if (tile_len <= 0 || grp.n <= 0)
+        return cudaSuccess;
+    constexpr int FUSED_BLOCK = 256;
+    const auto& ps = data->paged;
+    const bool paged = ps.is_enabled();
+    const int fused_ppr = paged ? ps.num_pages / (data->batch > 0 ? data->batch : 1) : 0;
+    const int K = 2 * data->beam + 2;
+    dim3 pre_grid(tile_len, grp.n * data->batch);
+    const int chunk_blocks = grp.n * data->batch;
+#define OASR_LAUNCH_FUSED_BATCHED(BEAM_CAP, PAGED_)                                            \
+    do {                                                                                       \
+        fused::fused_topk_prepass_batched_kernel<                                              \
+            FUSED_BLOCK, fused::FusedStepSmem<FUSED_BLOCK, BEAM_CAP>::C_BUF>                   \
+            <<<pre_grid, FUSED_BLOCK, 0, stream>>>(                                            \
+                log_prob, batch_stride, seq_stride, vocab_stride, grp, tile_begin, K,          \
+                data->pre_chars, data->pre_lp, data->pre_cnt, data->vocab_size, data->batch);  \
+        fused::fused_chunk_batched_kernel<FUSED_BLOCK, BEAM_CAP, PAGED_>                       \
+            <<<chunk_blocks, FUSED_BLOCK, 0, stream>>>(                                        \
+                log_prob, batch_stride, seq_stride, vocab_stride, grp, tile_begin, tile_len,   \
+                data->select_seqs, data->select_seq_lens, data->pprev, data->clast,            \
+                data->clen[0], data->clen[1], data->clist[0], data->clist[1], data->score,     \
+                data->ldc, data->beam, data->ldbeam, data->ldseq_len, data->batch, blank_id,   \
+                space_id, data->max_seq_len, ps.page_storage, ps.block_table[0],               \
+                ps.block_table[1], ps.ref_counts, ps.next_free_page, ps.free_pool,             \
+                ps.free_pool_size, ps.page_size, ps.max_logical_pages, fused_ppr,              \
+                data->pre_chars, data->pre_lp, data->pre_cnt);                                 \
+    } while (0)
+    if (data->beam <= 16) {
+        if (paged) {
+            OASR_LAUNCH_FUSED_BATCHED(16, true);
+        } else {
+            OASR_LAUNCH_FUSED_BATCHED(16, false);
+        }
+    } else {
+        if (paged) {
+            OASR_LAUNCH_FUSED_BATCHED(32, true);
+        } else {
+            OASR_LAUNCH_FUSED_BATCHED(32, false);
+        }
+    }
+#undef OASR_LAUNCH_FUSED_BATCHED
     return cudaGetLastError();
 }
 
@@ -3335,6 +3574,139 @@ inline cudaError_t streaming_decode_chunk_fused(
                               step_begin, frame_begin, /*chunk_frame_begin=*/tile_begin,
                               tile_len, mask_lo, mask_hi, /*streaming=*/true, blank_id, space_id,
                               stream);
+}
+
+// Decode one chunk for N streams (shared config) with grouped launches: per
+// group of up to FusedStreamGroup::CAP streams and PREPASS_TILE tile, ONE
+// batched pre-pass + ONE batched chunk kernel.  Streams of a group decode
+// concurrently (grid = group x batch blocks) instead of as a serial
+// per-stream launch chain — states are fully independent (own buffers, own
+// per-row paged-allocator partitions), so concurrency cannot change results.
+//
+// ``state_ptrs`` / ``masks`` / ``steps`` / ``frame_idxs`` are HOST arrays
+// (steps / frame_idxs are updated in place, mirroring the per-stream path).
+// State pointers must be distinct and share the buffer layout; the per-stream
+// byte deltas must be ALIGN_BYTES-multiples for the shared-offset trick
+// (torch CUDA allocations are 512-byte aligned, so this always holds for
+// states allocated by the Python wrapper); other streams fall back to the
+// single-state path.  Caller guarantees step_uses_fused(beam).
+inline cudaError_t streaming_decode_chunk_fused_batched(
+    const int64_t* state_ptrs, int n_streams, const float* log_prob, int batch_stride,
+    int seq_stride, int vocab_stride, int chunk_t, const uint8_t* mask_data, int mask_stride0,
+    int* steps, int* frame_idxs, int blank_id, int space_id, int batch, int beam,
+    int vocab_size, int max_seq_len, int use_paged_memory, int page_size, int num_pages,
+    cudaStream_t stream) {
+    using fused::FusedStreamGroup;
+    for (int g0 = 0; g0 < n_streams; g0 += FusedStreamGroup::CAP) {
+        const int gn = min(FusedStreamGroup::CAP, n_streams - g0);
+
+        // Group prototype: the first stream's pointers; every other stream's
+        // state sits at a constant byte delta (identical layout).
+        void* base0 = reinterpret_cast<void*>(state_ptrs[g0]);
+        void* workspace = reinterpret_cast<char*>(base0) + STATE_HEADER_SIZE;
+        InternalData data;
+        if (use_paged_memory) {
+            setup_internal_data_paged_pointers(&data, workspace, batch, beam, vocab_size,
+                                               max_seq_len, page_size, num_pages);
+        } else {
+            setup_internal_data_pointers(&data, workspace, batch, beam, vocab_size, max_seq_len);
+        }
+
+        FusedStreamGroup grp;
+        grp.n = gn;
+        bool deltas_ok = true;
+        for (int s = 0; s < gn; ++s) {
+            const long long d = static_cast<long long>(state_ptrs[g0 + s] - state_ptrs[g0]);
+            grp.delta[s] = d;
+            // The internal-pointer round-up must cancel identically for every
+            // stream; deltas that are ALIGN_BYTES-multiples guarantee it.
+            if (d % ALIGN_BYTES != 0)
+                deltas_ok = false;
+        }
+        if (!deltas_ok) {
+            // Misaligned state buffers (non-torch embedder): per-stream path.
+            for (int s = 0; s < gn; ++s) {
+                const int i = g0 + s;
+                const float* lp_base = log_prob + (size_t)i * batch_stride;
+                for (int tile_begin = 0; tile_begin < chunk_t; tile_begin += PREPASS_TILE) {
+                    const int tile_len = min(PREPASS_TILE, chunk_t - tile_begin);
+                    unsigned long long lo = ~0ull, hi = ~0ull;
+                    int n_active = tile_len;
+                    if (mask_data) {
+                        const uint8_t* m =
+                            mask_data + (size_t)i * mask_stride0 + tile_begin;
+                        lo = hi = 0;
+                        n_active = 0;
+                        for (int r = 0; r < tile_len; ++r) {
+                            if (!m[r])
+                                continue;
+                            if (r < 64) {
+                                lo |= 1ull << r;
+                            } else {
+                                hi |= 1ull << (r - 64);
+                            }
+                            ++n_active;
+                        }
+                    }
+                    if (n_active > 0) {
+                        cudaError_t err = streaming_decode_chunk_fused(
+                            reinterpret_cast<void*>(state_ptrs[i]), lp_base, batch_stride,
+                            seq_stride, vocab_stride, tile_begin, tile_len, steps[i],
+                            frame_idxs[i], lo, hi, blank_id, space_id, batch, beam,
+                            vocab_size, max_seq_len, use_paged_memory, page_size, num_pages,
+                            stream);
+                        if (err != cudaSuccess)
+                            return err;
+                        steps[i] += n_active;
+                    }
+                    frame_idxs[i] += tile_len;
+                }
+            }
+            continue;
+        }
+
+        const float* lp_group = log_prob + (size_t)g0 * batch_stride;
+        for (int tile_begin = 0; tile_begin < chunk_t; tile_begin += PREPASS_TILE) {
+            const int tile_len = min(PREPASS_TILE, chunk_t - tile_begin);
+            bool any_active = false;
+            for (int s = 0; s < gn; ++s) {
+                unsigned long long lo = ~0ull, hi = ~0ull;
+                int n_active = tile_len;
+                if (mask_data) {
+                    const uint8_t* m =
+                        mask_data + (size_t)(g0 + s) * mask_stride0 + tile_begin;
+                    lo = hi = 0;
+                    n_active = 0;
+                    for (int r = 0; r < tile_len; ++r) {
+                        if (!m[r])
+                            continue;
+                        if (r < 64) {
+                            lo |= 1ull << r;
+                        } else {
+                            hi |= 1ull << (r - 64);
+                        }
+                        ++n_active;
+                    }
+                }
+                grp.mask_lo[s] = lo;
+                grp.mask_hi[s] = hi;
+                grp.step_begin[s] = steps[g0 + s];
+                grp.frame_begin[s] = frame_idxs[g0 + s];
+                steps[g0 + s] += n_active;
+                frame_idxs[g0 + s] += tile_len;
+                any_active = any_active || (n_active > 0);
+            }
+            if (!any_active)
+                continue;
+            cudaError_t err =
+                launch_fused_chunk_batched(&data, lp_group, batch_stride, seq_stride,
+                                           vocab_stride, grp, tile_begin, tile_len, blank_id,
+                                           space_id, stream);
+            if (err != cudaSuccess)
+                return err;
+        }
+    }
+    return cudaSuccess;
 }
 
 inline cudaError_t read_streaming_results(void* state_buffer, int* out_tokens, int* out_lengths,

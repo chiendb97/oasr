@@ -728,57 +728,23 @@ void ctc_beam_search_chunk_batched(TensorView state_ptrs,
 
   cudaStream_t stream = get_stream(log_prob_chunk.device());
 
-  // ----- Fused multi-frame path (beam <= 32) -----
-  // Per stream and PREPASS_TILE tile: one parallel vocab top-K pre-pass + one
-  // fused chunk kernel looping the tile's frames in-kernel (see
-  // ctc_beam_search_chunk).  No graphs, counter kernels, or per-frame copies.
+  // ----- Fused multi-frame batched path (beam <= 32) -----
+  // Groups of up to FusedStreamGroup::CAP streams decode CONCURRENTLY: per
+  // group and PREPASS_TILE tile, one batched vocab top-K pre-pass + one
+  // batched chunk kernel (grid = group x batch blocks), per-stream state
+  // reached via by-value byte deltas off the group's first stream.  The
+  // serial launch depth per engine step drops from N streams to
+  // ceil(N / CAP) groups.  No graphs, counter kernels, or per-frame copies.
   if (ctc_decoder::step_uses_fused(static_cast<int>(beam))) {
-    for (int i = 0; i < n_streams; ++i) {
-      void* sptr = reinterpret_cast<void*>(state_ptr_array[i]);
-      const float* lp_base = lp_data_all + static_cast<size_t>(i) * batch_stride;
-      const uint8_t* mask_data = mask_data_all
-          ? mask_data_all + static_cast<size_t>(i) * mask_stride0
-          : nullptr;
-      int step = steps_host[i];
-      int frame_idx = frame_idxs_host[i];
-
-      for (int tile_begin = 0; tile_begin < chunk_t;
-           tile_begin += ctc_decoder::PREPASS_TILE) {
-        const int tile_len =
-            std::min<int>(ctc_decoder::PREPASS_TILE, chunk_t - tile_begin);
-        unsigned long long mask_lo = ~0ull, mask_hi = ~0ull;
-        int n_active = tile_len;
-        if (mask_data) {
-          mask_lo = mask_hi = 0;
-          n_active = 0;
-          for (int r = 0; r < tile_len; ++r) {
-            if (!mask_data[tile_begin + r]) continue;
-            if (r < 64) {
-              mask_lo |= 1ull << r;
-            } else {
-              mask_hi |= 1ull << (r - 64);
-            }
-            ++n_active;
-          }
-        }
-        if (n_active > 0) {
-          cudaError_t cerr = ctc_decoder::streaming_decode_chunk_fused(
-              sptr, lp_base, batch_stride, seq_stride, vocab_stride, tile_begin,
-              tile_len, step, /*frame_begin=*/frame_idx, mask_lo, mask_hi,
-              static_cast<int>(blank_id), -1, static_cast<int>(batch),
-              static_cast<int>(beam), static_cast<int>(vocab_size),
-              static_cast<int>(max_seq_len), static_cast<int>(use_paged_memory),
-              static_cast<int>(page_size), 0, stream);
-          TVM_FFI_ICHECK(cerr == cudaSuccess)
-              << "CTC fused chunk decode failed: " << cudaGetErrorString(cerr);
-          step += n_active;
-        }
-        frame_idx += tile_len;
-      }
-
-      steps_host[i] = step;
-      frame_idxs_host[i] = frame_idx;
-    }
+    cudaError_t cerr = ctc_decoder::streaming_decode_chunk_fused_batched(
+        state_ptr_array, n_streams, lp_data_all, batch_stride, seq_stride,
+        vocab_stride, chunk_t, mask_data_all, mask_stride0, steps_host,
+        frame_idxs_host, static_cast<int>(blank_id), -1, static_cast<int>(batch),
+        static_cast<int>(beam), static_cast<int>(vocab_size),
+        static_cast<int>(max_seq_len), static_cast<int>(use_paged_memory),
+        static_cast<int>(page_size), 0, stream);
+    TVM_FFI_ICHECK(cerr == cudaSuccess)
+        << "CTC batched fused chunk decode failed: " << cudaGetErrorString(cerr);
     return;
   }
 

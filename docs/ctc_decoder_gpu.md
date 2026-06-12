@@ -597,6 +597,33 @@ offline `(1, 200, 5000, 10)` 2.50 → 1.60 → 1.42 ms, `(16, 200, 5000,
 → 8.2 µs/frame (2.06× total). Fused-vs-legacy speedup at vocab 5000
 rises from ~2.3–3× to ~3.3–5.3×.
 
+#### 3.4.9 Multi-stream batched chunk decode (`fused::fused_chunk_batched_kernel`)
+
+`ctc_beam_search_chunk_batched` (the engine's `decode_chunk_batch` hot
+path) used to launch the §3.4.8 pair once per stream on one CUDA
+stream — N independent streams ran as a serial chain N deep. The
+batched kernels fold a **group** of up to `FusedStreamGroup::CAP = 64`
+streams into a single launch pair per tile: the batched pre-pass runs
+grid `(tile_len, group × batch)` and the batched chunk kernel grid
+`(group × batch)`, each block decoding its own stream's frames
+concurrently.
+
+All streams share one config (engine invariant) and therefore one
+workspace layout, so per-stream state is reached as `first_stream_ptr +
+delta[slot]` — the group's byte deltas, per-stream `step`/`frame_idx`
+counters and blank-skip bitmaps travel **by value** in one ~2 KB
+kernel-parameter struct (no device pointer table, no H2D upload).
+Streams are fully independent (own buffers, own per-row paged-allocator
+partitions), so concurrent blocks cannot interact and results are
+bit-identical to the sequential path. Deltas must be 128-byte-aligned
+for the shared-offset trick (always true for torch-allocated states);
+misaligned groups fall back to per-stream launches.
+
+RTX 5090, `decode_chunk_batch` (V=5000, beam=10, 16-frame chunks,
+threshold 0.95, paged): N=8 streams 0.86 → 0.13 ms/engine-step
+(6.6×), N=64 6.7 → 0.17 ms (39×), N=128 13.5 → 0.32 ms (42×) — decode
+cost per engine step is now nearly flat in the number of streams.
+
 ### 3.5 Frame selection (offline only)
 
 Before the main loop, the offline launcher runs
@@ -853,13 +880,15 @@ end of utterance:
     ctc_beam_search_read_state  ──▶ flat memcpy or gather_paged_results
 ```
 
-`ctc_beam_search_chunk` is the production hot path. On the fused path
-(`beam ≤ 32`) it issues two launches per `PREPASS_TILE` tile — vocab
-top-K pre-pass + multi-frame chunk kernel (§3.4.7/§3.4.8) — with the
-optional CPU `is_speech_mask` (uint8) folded into a by-value 128-bit
-bitmap; on the legacy path it loops per active frame (captured CUDA
-graphs or eager `streaming_step_persistent`). Returns the new `step`;
-the caller maintains `frame_idx` itself.
+`ctc_beam_search_chunk` is the single-stream hot path. On the fused
+path (`beam ≤ 32`) it issues two launches per `PREPASS_TILE` tile —
+vocab top-K pre-pass + multi-frame chunk kernel (§3.4.7/§3.4.8) — with
+the optional CPU `is_speech_mask` (uint8) folded into a by-value
+128-bit bitmap; on the legacy path it loops per active frame (captured
+CUDA graphs or eager `streaming_step_persistent`). Returns the new
+`step`; the caller maintains `frame_idx` itself.
+`ctc_beam_search_chunk_batched` (the engine hot path) additionally
+folds groups of up to 64 streams into each launch pair (§3.4.9).
 
 `streaming_step` rebuilds `InternalData` from the dimensions the caller
 passes (no GPU read), updates `select_seqs[b, step]` to reflect the
