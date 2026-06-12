@@ -5,6 +5,7 @@
 
 #include <oasr/ctc_decoder.cuh>
 
+#include <algorithm>
 #include <functional>
 #include <mutex>
 #include <unordered_map>
@@ -121,12 +122,17 @@ cudaError_t ensure_graphs_captured(CtcStreamGraphCache* cache, void* state_ptr) 
     // with stale counters (duplicated tokens).  A by-value kernel launch is
     // captured/ordered on the stream with no host-memory aliasing, so it is
     // race-free across all frames and parities.
+    // ``use_prepass=true``: the captured fused step reads its frame's vocab
+    // top-K candidates from the pre-pass buffers (row = ``*d_prepass_row``);
+    // the chunk launchers run the pre-pass per tile and set the row counter
+    // per frame before each replay.  On the legacy layout the flag is a no-op
+    // (pre-pass buffers are not allocated).
     auto launch_step = [&](int step_for_parity) -> cudaError_t {
         return ctc_decoder::streaming_step_persistent(
             state_ptr, data.d_lp_frame_buf, batch_stride, vocab_stride,
             cache->blank_id, -1, cache->batch, cache->beam, cache->vocab_size,
             cache->max_seq_len, cache->use_paged_memory, cache->page_size, 0,
-            step_for_parity, capture_stream);
+            step_for_parity, capture_stream, /*use_prepass=*/true);
     };
 
     err = capture_one_graph(&cache->graph_first, capture_stream,
@@ -521,44 +527,60 @@ int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk
 
   if (cache != nullptr) {
     const size_t lp_row_bytes = sizeof(float) * static_cast<size_t>(vocab_size);
-    for (int t = 0; t < chunk_t; ++t) {
-      // No ``step >= max_seq_len`` cap: ``step`` counts decoded frames, which
-      // can exceed the output-token cap (max_seq_len) for long streams.
-      // ``select_seqs`` is a ring of width max_seq_len (kernels index it
-      // ``% max_seq_len``) and clen is capped in topk_phase2, so an unbounded
-      // step is safe.
-      if (mask_data && !mask_data[t]) {
-        // Blank: host-only frame_idx increment.  The next non-blank's
-        // captured H2D will push the updated value to the device.
+    for (int tile_begin = 0; tile_begin < chunk_t;
+         tile_begin += ctc_decoder::PREPASS_TILE) {
+      const int tile_len =
+          std::min<int>(ctc_decoder::PREPASS_TILE, chunk_t - tile_begin);
+      // Chunk-level pre-pass: rank every tile frame's vocab in one parallel
+      // launch so the sequential per-frame replays below only load
+      // precomputed candidates (no-op on the legacy layout).
+      cudaError_t perr = ctc_decoder::streaming_chunk_prepass(
+          state_buffer.data_ptr(), lp_data, batch_stride, seq_stride,
+          vocab_stride, tile_begin, tile_len, static_cast<int>(batch),
+          static_cast<int>(beam), static_cast<int>(vocab_size),
+          static_cast<int>(max_seq_len), static_cast<int>(use_paged_memory),
+          static_cast<int>(page_size), 0, stream);
+      TVM_FFI_ICHECK(perr == cudaSuccess)
+          << "CTC chunk pre-pass failed: " << cudaGetErrorString(perr);
+      for (int t = tile_begin; t < tile_begin + tile_len; ++t) {
+        // No ``step >= max_seq_len`` cap: ``step`` counts decoded frames,
+        // which can exceed the output-token cap (max_seq_len) for long
+        // streams.  ``select_seqs`` is a ring of width max_seq_len (kernels
+        // index it ``% max_seq_len``) and clen is capped in topk_phase2, so
+        // an unbounded step is safe.
+        if (mask_data && !mask_data[t]) {
+          // Blank: host-only frame_idx increment.  The next non-blank's
+          // captured H2D will push the updated value to the device.
+          ++frame_idx;
+          continue;
+        }
+        // Set the device counters by value on the stream (race-free, ordered
+        // before the graph that reads them).  See ensure_graphs_captured.
+        ctc_decoder::set_stream_counters(state_buffer.data_ptr(), step,
+                                         frame_idx, stream, t - tile_begin);
+        // Refresh ``d_lp_frame_buf`` from this frame's log-prob slice.
+        const float* lp_frame = lp_data + static_cast<size_t>(t) * seq_stride;
+        cudaError_t cerr = cudaMemcpy2DAsync(
+            cache->d_lp_frame_buf, lp_row_bytes,
+            lp_frame, static_cast<size_t>(batch_stride) * sizeof(float),
+            lp_row_bytes, static_cast<size_t>(batch),
+            cudaMemcpyDeviceToDevice, stream);
+        TVM_FFI_ICHECK(cerr == cudaSuccess)
+            << "CTC chunk D2D copy failed: " << cudaGetErrorString(cerr);
+        cudaGraphExec_t g;
+        if (step == 0) {
+          g = cache->graph_first;
+        } else if (step & 1) {
+          g = cache->graph_odd;
+        } else {
+          g = cache->graph_even;
+        }
+        cudaError_t lerr = cudaGraphLaunch(g, stream);
+        TVM_FFI_ICHECK(lerr == cudaSuccess)
+            << "CTC chunk graph launch failed: " << cudaGetErrorString(lerr);
+        ++step;
         ++frame_idx;
-        continue;
       }
-      // Set the device counters by value on the stream (race-free, ordered
-      // before the graph that reads them).  See ensure_graphs_captured.
-      ctc_decoder::set_stream_counters(state_buffer.data_ptr(), step, frame_idx,
-                                       stream);
-      // Refresh ``d_lp_frame_buf`` from this frame's log-prob slice.
-      const float* lp_frame = lp_data + static_cast<size_t>(t) * seq_stride;
-      cudaError_t cerr = cudaMemcpy2DAsync(
-          cache->d_lp_frame_buf, lp_row_bytes,
-          lp_frame, static_cast<size_t>(batch_stride) * sizeof(float),
-          lp_row_bytes, static_cast<size_t>(batch),
-          cudaMemcpyDeviceToDevice, stream);
-      TVM_FFI_ICHECK(cerr == cudaSuccess)
-          << "CTC chunk D2D copy failed: " << cudaGetErrorString(cerr);
-      cudaGraphExec_t g;
-      if (step == 0) {
-        g = cache->graph_first;
-      } else if (step & 1) {
-        g = cache->graph_odd;
-      } else {
-        g = cache->graph_even;
-      }
-      cudaError_t lerr = cudaGraphLaunch(g, stream);
-      TVM_FFI_ICHECK(lerr == cudaSuccess)
-          << "CTC chunk graph launch failed: " << cudaGetErrorString(lerr);
-      ++step;
-      ++frame_idx;
     }
     return static_cast<int64_t>(step);
   }
@@ -571,30 +593,43 @@ int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk
   // pre-Step-3's per-frame host scalar args for one extra counter launch per
   // non-blank, but recovers the per-blank no-op behaviour that Step 3
   // accidentally regressed.
-  for (int t = 0; t < chunk_t; ++t) {
-    // No step cap — see the graph-path loop above; select_seqs is a ring and
-    // clen is capped in-kernel, so step may exceed max_seq_len safely.
-    if (mask_data && !mask_data[t]) {
+  for (int tile_begin = 0; tile_begin < chunk_t;
+       tile_begin += ctc_decoder::PREPASS_TILE) {
+    const int tile_len =
+        std::min<int>(ctc_decoder::PREPASS_TILE, chunk_t - tile_begin);
+    cudaError_t perr = ctc_decoder::streaming_chunk_prepass(
+        state_buffer.data_ptr(), lp_data, batch_stride, seq_stride,
+        vocab_stride, tile_begin, tile_len, static_cast<int>(batch),
+        static_cast<int>(beam), static_cast<int>(vocab_size),
+        static_cast<int>(max_seq_len), static_cast<int>(use_paged_memory),
+        static_cast<int>(page_size), 0, stream);
+    TVM_FFI_ICHECK(perr == cudaSuccess)
+        << "CTC chunk pre-pass failed: " << cudaGetErrorString(perr);
+    for (int t = tile_begin; t < tile_begin + tile_len; ++t) {
+      // No step cap — see the graph-path loop above; select_seqs is a ring
+      // and clen is capped in-kernel, so step may exceed max_seq_len safely.
+      if (mask_data && !mask_data[t]) {
+        ++frame_idx;
+        continue;
+      }
+      ctc_decoder::set_stream_counters(state_buffer.data_ptr(), step, frame_idx,
+                                       stream, t - tile_begin);
+      const float* lp_frame = lp_data + static_cast<size_t>(t) * seq_stride;
+      cudaError_t status = ctc_decoder::streaming_step_persistent(
+          state_buffer.data_ptr(), lp_frame,
+          batch_stride, vocab_stride,
+          static_cast<int>(blank_id), -1,
+          static_cast<int>(batch), static_cast<int>(beam),
+          static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
+          static_cast<int>(use_paged_memory), static_cast<int>(page_size),
+          0,  // num_pages=0 → auto
+          step,  // host parity / step==0 selector
+          stream, /*use_prepass=*/true);
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "CTC chunk step failed: " << cudaGetErrorString(status);
+      ++step;
       ++frame_idx;
-      continue;
     }
-    ctc_decoder::set_stream_counters(state_buffer.data_ptr(), step, frame_idx,
-                                     stream);
-    const float* lp_frame = lp_data + static_cast<size_t>(t) * seq_stride;
-    cudaError_t status = ctc_decoder::streaming_step_persistent(
-        state_buffer.data_ptr(), lp_frame,
-        batch_stride, vocab_stride,
-        static_cast<int>(blank_id), -1,
-        static_cast<int>(batch), static_cast<int>(beam),
-        static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
-        static_cast<int>(use_paged_memory), static_cast<int>(page_size),
-        0,  // num_pages=0 → auto
-        step,  // host parity / step==0 selector
-        stream);
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "CTC chunk step failed: " << cudaGetErrorString(status);
-    ++step;
-    ++frame_idx;
   }
   return static_cast<int64_t>(step);
 }
@@ -747,62 +782,92 @@ void ctc_beam_search_chunk_batched(TensorView state_ptrs,
 
     if (cache != nullptr) {
       const size_t lp_row_bytes = sizeof(float) * static_cast<size_t>(vocab_size);
-      for (int t = 0; t < chunk_t; ++t) {
-        // No step cap (ring select_seqs + in-kernel clen cap) — see
-        // ctc_beam_search_chunk.
-        if (mask_data && !mask_data[t]) {
+      for (int tile_begin = 0; tile_begin < chunk_t;
+           tile_begin += ctc_decoder::PREPASS_TILE) {
+        const int tile_len =
+            std::min<int>(ctc_decoder::PREPASS_TILE, chunk_t - tile_begin);
+        // Chunk-level pre-pass for this stream's tile (see
+        // ctc_beam_search_chunk); no-op on the legacy layout.
+        cudaError_t perr = ctc_decoder::streaming_chunk_prepass(
+            sptr, lp_base, batch_stride, seq_stride, vocab_stride, tile_begin,
+            tile_len, static_cast<int>(batch), static_cast<int>(beam),
+            static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
+            static_cast<int>(use_paged_memory), static_cast<int>(page_size), 0,
+            stream);
+        TVM_FFI_ICHECK(perr == cudaSuccess)
+            << "CTC chunk pre-pass failed: " << cudaGetErrorString(perr);
+        for (int t = tile_begin; t < tile_begin + tile_len; ++t) {
+          // No step cap (ring select_seqs + in-kernel clen cap) — see
+          // ctc_beam_search_chunk.
+          if (mask_data && !mask_data[t]) {
+            ++frame_idx;
+            continue;
+          }
+          // Race-free by-value counter set on the stream (see
+          // ensure_graphs_captured / the single-state chunk launcher).
+          ctc_decoder::set_stream_counters(sptr, step, frame_idx, stream,
+                                           t - tile_begin);
+          const float* lp_frame = lp_base + static_cast<size_t>(t) * seq_stride;
+          cudaError_t cerr = cudaMemcpy2DAsync(
+              cache->d_lp_frame_buf, lp_row_bytes,
+              lp_frame, static_cast<size_t>(batch_stride) * sizeof(float),
+              lp_row_bytes, static_cast<size_t>(batch),
+              cudaMemcpyDeviceToDevice, stream);
+          TVM_FFI_ICHECK(cerr == cudaSuccess)
+              << "CTC chunk D2D copy failed: " << cudaGetErrorString(cerr);
+          cudaGraphExec_t g;
+          if (step == 0) {
+            g = cache->graph_first;
+          } else if (step & 1) {
+            g = cache->graph_odd;
+          } else {
+            g = cache->graph_even;
+          }
+          cudaError_t lerr = cudaGraphLaunch(g, stream);
+          TVM_FFI_ICHECK(lerr == cudaSuccess)
+              << "CTC chunk graph launch failed: " << cudaGetErrorString(lerr);
+          ++step;
           ++frame_idx;
-          continue;
         }
-        // Race-free by-value counter set on the stream (see
-        // ensure_graphs_captured / the single-state chunk launcher).
-        ctc_decoder::set_stream_counters(sptr, step, frame_idx, stream);
-        const float* lp_frame = lp_base + static_cast<size_t>(t) * seq_stride;
-        cudaError_t cerr = cudaMemcpy2DAsync(
-            cache->d_lp_frame_buf, lp_row_bytes,
-            lp_frame, static_cast<size_t>(batch_stride) * sizeof(float),
-            lp_row_bytes, static_cast<size_t>(batch),
-            cudaMemcpyDeviceToDevice, stream);
-        TVM_FFI_ICHECK(cerr == cudaSuccess)
-            << "CTC chunk D2D copy failed: " << cudaGetErrorString(cerr);
-        cudaGraphExec_t g;
-        if (step == 0) {
-          g = cache->graph_first;
-        } else if (step & 1) {
-          g = cache->graph_odd;
-        } else {
-          g = cache->graph_even;
-        }
-        cudaError_t lerr = cudaGraphLaunch(g, stream);
-        TVM_FFI_ICHECK(lerr == cudaSuccess)
-            << "CTC chunk graph launch failed: " << cudaGetErrorString(lerr);
-        ++step;
-        ++frame_idx;
       }
     } else {
       // Eager fallback — same as ``ctc_beam_search_chunk``.
-      for (int t = 0; t < chunk_t; ++t) {
-        // No step cap (ring select_seqs + in-kernel clen cap).
-        if (mask_data && !mask_data[t]) {
-          ++frame_idx;
-          continue;
-        }
-        ctc_decoder::set_stream_counters(sptr, step, frame_idx, stream);
-        const float* lp_frame = lp_base + static_cast<size_t>(t) * seq_stride;
-        cudaError_t status = ctc_decoder::streaming_step_persistent(
-            sptr, lp_frame,
-            batch_stride, vocab_stride,
-            static_cast<int>(blank_id), -1,
-            static_cast<int>(batch), static_cast<int>(beam),
+      for (int tile_begin = 0; tile_begin < chunk_t;
+           tile_begin += ctc_decoder::PREPASS_TILE) {
+        const int tile_len =
+            std::min<int>(ctc_decoder::PREPASS_TILE, chunk_t - tile_begin);
+        cudaError_t perr = ctc_decoder::streaming_chunk_prepass(
+            sptr, lp_base, batch_stride, seq_stride, vocab_stride, tile_begin,
+            tile_len, static_cast<int>(batch), static_cast<int>(beam),
             static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
-            static_cast<int>(use_paged_memory), static_cast<int>(page_size),
-            0,  // num_pages=0 → auto
-            step,
+            static_cast<int>(use_paged_memory), static_cast<int>(page_size), 0,
             stream);
-        TVM_FFI_ICHECK(status == cudaSuccess)
-            << "CTC chunk step failed: " << cudaGetErrorString(status);
-        ++step;
-        ++frame_idx;
+        TVM_FFI_ICHECK(perr == cudaSuccess)
+            << "CTC chunk pre-pass failed: " << cudaGetErrorString(perr);
+        for (int t = tile_begin; t < tile_begin + tile_len; ++t) {
+          // No step cap (ring select_seqs + in-kernel clen cap).
+          if (mask_data && !mask_data[t]) {
+            ++frame_idx;
+            continue;
+          }
+          ctc_decoder::set_stream_counters(sptr, step, frame_idx, stream,
+                                           t - tile_begin);
+          const float* lp_frame = lp_base + static_cast<size_t>(t) * seq_stride;
+          cudaError_t status = ctc_decoder::streaming_step_persistent(
+              sptr, lp_frame,
+              batch_stride, vocab_stride,
+              static_cast<int>(blank_id), -1,
+              static_cast<int>(batch), static_cast<int>(beam),
+              static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
+              static_cast<int>(use_paged_memory), static_cast<int>(page_size),
+              0,  // num_pages=0 → auto
+              step,
+              stream, /*use_prepass=*/true);
+          TVM_FFI_ICHECK(status == cudaSuccess)
+              << "CTC chunk step failed: " << cudaGetErrorString(status);
+          ++step;
+          ++frame_idx;
+        }
       }
     }
 

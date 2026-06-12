@@ -532,6 +532,45 @@ The offline launchers also pass the step index by value
 streaming path passes `-1` and reads the device-resident counter so
 captured CUDA graphs stay valid across frames (§8).
 
+#### 3.4.7 Chunk-level vocab top-K pre-pass (`fused::fused_topk_prepass_kernel`)
+
+After §3.4.6 the fused step is **latency-bound** (<2 % SM utilisation):
+one block per batch row, serialised frame-to-frame by the beam-state
+dependency. Its dominant critical-path component was step 3 above —
+the multi-pass byte-radix select over the whole vocab. But that
+ranking depends only on the frame's `lp`, not on beam state, and
+`K_all = beam + 3 + max_patches ≤ 2·beam + 2` for *any* reachable
+state. So the ranking is hoisted out of the sequential loop:
+
+- `fused_topk_prepass_kernel` runs once per tile of `PREPASS_TILE = 128`
+  frames with grid `(tile_len, batch)` — full GPU parallelism — and
+  emits each frame's top-`(2·beam + 2)` chars + log-probs into the
+  `pre_chars` / `pre_lp` / `pre_cnt` workspace buffers (layout
+  `[row][batch][C_BUF]`).
+- `fused_step_kernel` in pre-pass mode (`pre_cnt != nullptr`) replaces
+  its Phase-3 vocab scan with a load of ≤ `C_BUF` precomputed
+  candidates. The precomputed list is a *superset* of the in-kernel
+  top-`k_all` selection, and every scored candidate is an exact slot of
+  the conceptual score matrix, so the global top-beam — and hence the
+  decode — is unchanged (validated by the §3.4.6 parity suite plus
+  cross-tile fused-vs-legacy checks).
+
+Row indexing mirrors the step counter: offline passes the tile-relative
+step by value (`prepass_row_const = step − tile_begin`); streaming
+reads a third device-resident counter (`*d_prepass_row`, state-header
+offset 8) that the chunk launchers set per frame alongside
+`step`/`frame_idx`, so captured CUDA graphs stay valid across frames.
+Offline indexes frames through `select_seqs`; streaming ranks chunk
+positions directly (masked blank frames are ranked too — their rows are
+simply never consumed). The single-frame `ctc_beam_search_step` API
+passes neither and keeps the in-kernel select as a fallback.
+
+RTX 5090, fused path before → after the pre-pass: offline
+`(1, 200, 5000, 10)` 2.50 ms → 1.60 ms (−36 %), `(16, 200, 5000, 10)`
+3.93 ms → 3.19 ms (−19 %); streaming `(V=5000, beam=10)` 16.9 →
+12.4 µs/frame (−27 %). Fused-vs-legacy speedup at vocab 5000 rises
+from ~2.3–3× to ~3.2–4.7×.
+
 ### 3.5 Frame selection (offline only)
 
 Before the main loop, the offline launcher runs
@@ -635,6 +674,8 @@ required between streaming steps.
 | `topk_value_buffer` | `[B, MAX_BLOCKS_PER_BATCH, beam]` `int` | Phase 1 top-K values. |
 | `select_seqs` | `[B, max_seq_len]` `int` | Frame indices that survive blank-skip. Identity in streaming. |
 | `select_seq_lens` | `[B]` `int` | Number of valid entries in `select_seqs[b]`. |
+| `pre_chars`, `pre_lp` | `[PREPASS_TILE, B, C_BUF]` `int` / `float` | Per-frame vocab top-K candidates from the chunk-level pre-pass (§3.4.7; fused layout only). |
+| `pre_cnt` | `[PREPASS_TILE, B]` `int` | Valid candidates per pre-pass row. |
 | `paged` | `PagedSequenceState` | Paged-mode memory descriptor (null pointers in flat mode). |
 
 `ldbeam = align16(beam)` and `ldseq_len = align16(max_seq_len)` — 16-element
@@ -709,7 +750,9 @@ length sequences.
 ## 6. Per-Step Kernel Pipeline
 
 For `beam ≤ 32` both launchers dispatch the fused fast path instead:
-`fused::fused_first_step_kernel` at step 0 and one
+`fused::fused_first_step_kernel` at step 0, one
+`fused::fused_topk_prepass_kernel` per `PREPASS_TILE`-frame tile
+(§3.4.7), and one
 `fused::fused_step_kernel<256, BEAM_CAP ∈ {16, 32}, PAGED>` per
 subsequent step (§3.4.6). The table below is the legacy / `beam > 32`
 / `OASR_CTC_FUSED=0` pipeline.
