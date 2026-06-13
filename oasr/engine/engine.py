@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from oasr.models import build_model_from_checkpoint
+from oasr.models import from_pretrained
 
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
@@ -90,9 +90,12 @@ class ASREngine:
         dtype = config.dtype
 
         logger.info("Loading model from %s ...", config.ckpt_dir)
-        model, model_config = build_model_from_checkpoint(
+        # ``from_pretrained`` accepts a local checkpoint dir (the common case —
+        # a straight pass-through to ``build_model_from_checkpoint``) or a
+        # HuggingFace Hub repo id, which it downloads first.
+        model, model_config = from_pretrained(
             config.ckpt_dir,
-            config.checkpoint_name,
+            checkpoint_name=config.checkpoint_name,
             device=device_str,
             dtype=dtype,
         )

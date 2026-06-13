@@ -16,15 +16,6 @@ from .base import (
     CacheSpec,
     DecodeType,
 )
-from .registry import (
-    ModelEntry,
-    build_model_from_checkpoint,
-    get_model_entry,
-    list_models,
-    register_model,
-    resolve_architecture,
-)
-from .heads import CTCHead
 
 # Importing the architecture packages triggers their register_model() calls.
 from .conformer import (
@@ -35,6 +26,16 @@ from .conformer import (
     ConformerModelConfig,
     ConvolutionModule,
     PositionwiseFeedForward,
+)
+from .heads import CTCHead
+from .loaders import from_pretrained
+from .registry import (
+    ModelEntry,
+    build_model_from_checkpoint,
+    get_model_entry,
+    list_models,
+    register_model,
+    resolve_architecture,
 )
 from .zipformer import (
     ZipformerEncoder,
@@ -54,6 +55,7 @@ __all__ = [
     # Registry / factory
     "ModelEntry",
     "build_model_from_checkpoint",
+    "from_pretrained",
     "get_model_entry",
     "list_models",
     "register_model",

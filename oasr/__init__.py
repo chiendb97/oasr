@@ -129,6 +129,14 @@ from .decode import Decoder, DecoderConfig, DecoderResult
 
 def __getattr__(name: str):
     """Lazily expose C extension symbols (kernels, enums, synchronize, ...)."""
+    # Model loader — lazy so ``import oasr`` doesn't eagerly pull in every
+    # architecture package (they self-register on first use).
+    if name == "from_pretrained":
+        from oasr.models import from_pretrained as _fp
+
+        globals()["from_pretrained"] = _fp
+        return _fp
+
     _C = globals().get("_C")
     if _C is None:
         try:
@@ -152,6 +160,8 @@ def __getattr__(name: str):
 
 __all__ = [
     "__version__",
+    # Model loading
+    "from_pretrained",
     # Activation constants
     "ACTIVATION_RELU",
     "ACTIVATION_GELU",

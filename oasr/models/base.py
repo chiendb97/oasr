@@ -266,6 +266,20 @@ class BaseAsrModel(nn.Module, ABC):
         """Build a model (random weights) from its config + format aux buffers."""
         raise NotImplementedError
 
+    @classmethod
+    def from_pretrained(cls, model_id_or_path: str, **kwargs: Any) -> "BaseAsrModel":
+        """Load a weight-loaded model from a local dir or HuggingFace Hub id.
+
+        Thin convenience wrapper over :func:`oasr.models.from_pretrained` that
+        **auto-detects** the architecture from the checkpoint (so the concrete
+        subclass it is called on is advisory).  Returns the model only; use the
+        module-level function if you also need the config object.
+        """
+        from oasr.models.loaders import from_pretrained as _from_pretrained
+
+        model, _config = _from_pretrained(model_id_or_path, **kwargs)
+        return model
+
     @abstractmethod
     def load_weights(self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False) -> None:
         """Map an external checkpoint state-dict into this model's parameters.
