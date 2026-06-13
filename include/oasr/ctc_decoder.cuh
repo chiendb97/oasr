@@ -1485,6 +1485,37 @@ __device__ __forceinline__ uint64_t shfl_xor_u64(uint64_t v, int mask) {
     return (uint64_t(hi) << 32) | uint64_t(lo);
 }
 
+__device__ __forceinline__ uint64_t warp_cmpx_u64(uint64_t v, int j, bool keep_max) {
+    uint64_t p = shfl_xor_u64(v, j);
+    return keep_max ? (v > p ? v : p) : (v < p ? v : p);
+}
+
+// Bitonic sort of 32 keys, one per lane, by warp shuffles (15 compare-exchange
+// stages, no barriers).  DESC selects the overall direction.
+template <bool DESC>
+__device__ __forceinline__ uint64_t warp_bitonic_sort32(uint64_t v) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int k = 2; k <= 32; k <<= 1) {
+#pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            const bool asc_block = DESC ? ((lane & k) != 0) : ((lane & k) == 0);
+            const bool lower = ((lane & j) == 0);
+            v = warp_cmpx_u64(v, j, /*keep_max=*/asc_block != lower);
+        }
+    }
+    return v;
+}
+
+// Sort a bitonic 32-key sequence descending (5 stages).
+__device__ __forceinline__ uint64_t warp_bitonic_merge32_desc(uint64_t v) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int j = 16; j > 0; j >>= 1)
+        v = warp_cmpx_u64(v, j, /*keep_max=*/(lane & j) == 0);
+    return v;
+}
+
 // In-place bitonic sort of 64 u64 keys in shared memory, descending.  Warp 0
 // holds two elements per lane in registers and exchanges via shuffles — no
 // block barriers inside the 21-stage network.  All threads must call
@@ -1662,18 +1693,25 @@ struct FusedStepSmem {
     int s_clen[BEAM_CAP];
     float lp_clast[BEAM_CAP];  // log_prob[t, clast[k]]
     // Duplicate-prefix merge map
-    int patch_chars[BEAM_CAP][BEAM_CAP];   // chars zeroed in row k by a merge
-    int8_t merge_src[BEAM_CAP][BEAM_CAP];  // shorter rows folded into row k
+    int patch_chars[BEAM_CAP][BEAM_CAP];  // chars zeroed in row k by a merge
     int patch_cnt[BEAM_CAP];
-    int merge_cnt[BEAM_CAP];
+    // Bit i set = shorter row i folds into row k's blank slot; iterating set
+    // bits ascending reproduces the (previously sorted) ascending source-beam
+    // fold order with no sort pass.  BEAM_CAP <= 32 fits one word.
+    unsigned int merge_mask[BEAM_CAP];
     // Shared vocab candidates (top-K_all lp chars of this frame)
     int c_chars[C_BUF];
     float c_lp[C_BUF];
     int c_n;
-    // Scored candidates and final ranking
+    // Scored candidates and final ranking.  ckeys doubles as the scatter
+    // destination of the rank-by-count ordering (slots [0, RANK_BUF) are dead
+    // as candidates by then).
     uint64_t ckeys[CAND_CAP];
-    int cand_n;
     uint64_t rank[RANK_BUF];
+    int rank_cnt[BLOCK_SIZE / RANK_BUF][RANK_BUF];  // per-part greater-counts
+    // Per-warp streaming top-K survivors (Phase 5): warp w stashes its local
+    // top-beam at wtop[w * beam ..); the rank-by-count merge orders the union.
+    uint64_t wtop[(BLOCK_SIZE / 32) * BEAM_CAP];
     // Paged CoW releases deferred past the last alloc_page pop (see Phase 6)
     int defer_free[BEAM_CAP];
     int defer_n;
@@ -1683,6 +1721,37 @@ struct FusedStepSmem {
     uint32_t vkeys[VKEY_CACHE];
     SelectScratch<BLOCK_SIZE> sel;
 };
+
+// Order the RANK_BUF keys in ``s.rank`` descending into ``s.ckeys[0..63]`` by
+// rank-by-counting: every key's position is the number of strictly greater
+// keys (keys are unique, so positions are a bijection — identical output to
+// a full sort, but one all-warp pass instead of a warp-0-only 21-stage
+// bitonic network).  All threads must call; trailing barrier publishes.
+template <int BLOCK_SIZE, int BEAM_CAP>
+__device__ __forceinline__ void rank64_desc(FusedStepSmem<BLOCK_SIZE, BEAM_CAP>& s) {
+    using Smem = FusedStepSmem<BLOCK_SIZE, BEAM_CAP>;
+    constexpr int PARTS = BLOCK_SIZE / Smem::RANK_BUF;
+    constexpr int SPAN = Smem::RANK_BUF / PARTS;
+    static_assert(BLOCK_SIZE % Smem::RANK_BUF == 0, "rank64_desc thread partition");
+    const int tid = threadIdx.x;
+    const int i = tid % Smem::RANK_BUF;
+    const int part = tid / Smem::RANK_BUF;
+    const uint64_t ki = s.rank[i];
+    int cnt = 0;
+#pragma unroll
+    for (int j = part * SPAN; j < (part + 1) * SPAN; ++j)
+        cnt += (s.rank[j] > ki) ? 1 : 0;
+    s.rank_cnt[part][i] = cnt;
+    __syncthreads();
+    if (tid < Smem::RANK_BUF) {
+        int pos = 0;
+#pragma unroll
+        for (int p = 0; p < PARTS; ++p)
+            pos += s.rank_cnt[p][tid];
+        s.ckeys[pos] = s.rank[tid];
+    }
+    __syncthreads();
+}
 
 // One block per batch row; replaces prob_matrix + prob_space_blank + merge +
 // topk_phase1 + topk_phase2 (and their paged variants).  Score formulas and
@@ -1718,6 +1787,22 @@ __device__ __forceinline__ void fused_step_body(
     using Smem = FusedStepSmem<BLOCK_SIZE, BEAM_CAP>;
     const int tid = threadIdx.x;
 
+#ifdef OASR_CTC_PHASE_PROF
+    // TEMPORARY phase-latency instrumentation (build with
+    // -DOASR_CTC_PHASE_PROF); prints per-frame phase cycles from tid 0.
+    unsigned long long prof_t = 0, prof_acc[8] = {0};
+    if (tid == 0) prof_t = clock64();
+#define OASR_PROF_T(slot)                       \
+    __syncthreads();                            \
+    if (tid == 0) {                             \
+        unsigned long long t_ = clock64();      \
+        prof_acc[slot] += t_ - prof_t;          \
+        prof_t = t_;                            \
+    }
+#else
+#define OASR_PROF_T(slot)
+#endif
+
     // --- Phase 1: snapshot per-beam state (with blank-frame adjustment) -----
     for (int k = tid; k < beam; k += BLOCK_SIZE) {
         float2 raw = pprev[bid * ldbeam + k];
@@ -1730,15 +1815,25 @@ __device__ __forceinline__ void fused_step_body(
         s.s_clen[k] = clen_src[bid * ldbeam + k];
         s.lp_clast[k] = lp_row[(size_t)lc * vocab_stride];
         s.patch_cnt[k] = 0;
-        s.merge_cnt[k] = 0;
+        s.merge_mask[k] = 0u;
+    }
+    // Pre-pass candidate load rides in the same pass: it is independent of
+    // beam state, so its global-memory latency hides behind the snapshot
+    // reads and the former standalone Phase-3 barrier disappears.
+    if (pre_cnt_row >= 0) {
+        const int cn = min(pre_cnt_row, Smem::C_BUF);
+        for (int i = tid; i < cn; i += BLOCK_SIZE) {
+            s.c_chars[i] = pre_chars_row[i];
+            s.c_lp[i] = pre_lp_row[i];
+        }
     }
     if (tid == 0) {
         s.lp_blank = lp_row[(size_t)blank_id * vocab_stride];
         s.lp_space = (space_id >= 0) ? lp_row[(size_t)space_id * vocab_stride] : NEG_INF;
-        s.cand_n = 0;
         s.defer_n = 0;
     }
     __syncthreads();
+    OASR_PROF_T(0)
 
     // --- Phase 2: merge map (same pair condition as legacy merge_kernel) ----
     for (int p = tid; p < beam * beam; p += BLOCK_SIZE) {
@@ -1759,54 +1854,31 @@ __device__ __forceinline__ void fused_step_body(
             continue;
         int pp = atomicAdd(&s.patch_cnt[i], 1);
         s.patch_chars[i][pp] = s.s_clast[j];
-        int mm = atomicAdd(&s.merge_cnt[j], 1);
-        s.merge_src[j][mm] = (int8_t)i;
+        // Bitmask instead of an (atomically appended, then sorted) source
+        // list: iterating set bits ascending IS the ascending-source fold
+        // order, so the sort pass and its barrier disappear.
+        atomicOr(&s.merge_mask[j], 1u << i);
     }
     __syncthreads();
+    OASR_PROF_T(1)
 
-    // Sort each merge-source list so the blank-slot fold below accumulates in
-    // ascending source-beam order (the legacy cross-block fold was racy and
-    // had no defined order); compute K_all from the worst-case patch count.
-    for (int k = tid; k < beam; k += BLOCK_SIZE) {
-        int m = s.merge_cnt[k];
-        for (int a = 1; a < m; ++a) {
-            int8_t v = s.merge_src[k][a];
-            int b = a - 1;
-            while (b >= 0 && s.merge_src[k][b] > v) {
-                s.merge_src[k][b + 1] = s.merge_src[k][b];
-                --b;
-            }
-            s.merge_src[k][b + 1] = v;
+    // --- Phase 3 (in-kernel fallback only): vocab top-K_all ------------------
+    // Pre-pass mode skips this entirely (candidates already in smem, and
+    // k_all is only consumed by this select).
+    if (pre_cnt_row < 0) {
+        if (tid == 0) {
+            int mp = 0;
+            for (int k = 0; k < beam; ++k)
+                mp = max(mp, s.patch_cnt[k]);
+            // beam ordinaries + blank + last-char + space, displaced by patches.
+            s.k_all = min(beam + 3 + mp, Smem::K_ALL_CAP);
         }
-    }
-    if (tid == 0) {
-        int mp = 0;
-        for (int k = 0; k < beam; ++k)
-            mp = max(mp, s.patch_cnt[k]);
-        // beam ordinaries + blank + last-char + space, displaced by patches.
-        s.k_all = min(beam + 3 + mp, Smem::K_ALL_CAP);
-    }
-    __syncthreads();
-
-    // --- Phase 3: shared vocab top-K_all -------------------------------------
-    if (pre_cnt_row >= 0) {
-        // Chunk-level pre-pass mode: load the frame's precomputed candidates
-        // (top 2*beam+2 by lp, a superset of the in-kernel top-k_all) instead
-        // of scanning the vocab on this kernel's critical path.
-        const int cn = min(pre_cnt_row, Smem::C_BUF);
-        for (int i = tid; i < cn; i += BLOCK_SIZE) {
-            s.c_chars[i] = pre_chars_row[i];
-            s.c_lp[i] = pre_lp_row[i];
-        }
-        if (tid == 0)
-            s.c_n = cn;
-    } else {
         const bool use_vcache = (ldc <= Smem::VKEY_CACHE);
         if (use_vcache) {
             for (int c = tid; c < ldc; c += BLOCK_SIZE)
                 s.vkeys[c] = f32_sortable(lp_row[(size_t)c * vocab_stride]);
-            __syncthreads();
         }
+        __syncthreads();  // publishes k_all + the vkey cache
         auto key_at = [&](int c) -> uint64_t {
             uint32_t sk = use_vcache ? s.vkeys[c]
                                      : f32_sortable(lp_row[(size_t)c * vocab_stride]);
@@ -1822,8 +1894,8 @@ __device__ __forceinline__ void fused_step_body(
                                                              &s.sel);
         if (tid == 0)
             s.c_n = cnt;
+        __syncthreads();
     }
-    __syncthreads();
 
     // Candidate value helpers — these reproduce the legacy ptable/ptablen
     // entries bit-exactly (for every non-blank slot ptable == NEG_INF, so the
@@ -1852,9 +1924,10 @@ __device__ __forceinline__ void fused_step_body(
         float pn = (need_add_blank || s.s_clast[k] == blank_id)
                        ? NEG_INF
                        : logprob_add(s.lp_clast[k], s.prev[k].y);
-        int m = s.merge_cnt[k];
-        for (int a = 0; a < m; ++a) {
-            int i = s.merge_src[k][a];
+        unsigned int m = s.merge_mask[k];
+        while (m) {
+            const int i = __ffs(m) - 1;  // ascending source-beam fold order
+            m &= m - 1;
             // Value of slot (i, clast[k]) as written by the legacy prob
             // kernels, before any patching.
             float contrib;
@@ -1871,17 +1944,27 @@ __device__ __forceinline__ void fused_step_body(
     };
 
     // --- Phase 4: enumerate + score candidates -------------------------------
-    const int c_n = s.c_n;
+    // Every slot e writes exactly one key: real candidates their composite
+    // (score, ~id) key, skipped slots (blank/last-char/space duplicates) the
+    // unique low value ``e`` — all real keys are >= 2^54 (any float score's
+    // sortable form is >= 0x007fffff), so dummies sort strictly below every
+    // real candidate and can never displace one from the top beam.  Fixed
+    // slots replace the previous atomicAdd compaction, whose serialized
+    // same-address increments dominated this phase.
+    const int c_n = (pre_cnt_row >= 0) ? min(pre_cnt_row, Smem::C_BUF) : s.c_n;
     const int per_row = c_n + 3;
-    for (int e = tid; e < beam * per_row; e += BLOCK_SIZE) {
+    const int n_cand = beam * per_row;  // <= CAND_CAP by construction
+    for (int e = tid; e < n_cand; e += BLOCK_SIZE) {
         const int k = e / per_row;
         const int j = e - k * per_row;
         float key_val;
         int c;
         if (j < c_n) {
             c = s.c_chars[j];
-            if (c == blank_id)
-                continue;  // blank slot handled at j == c_n
+            if (c == blank_id) {  // blank slot handled at j == c_n
+                s.ckeys[e] = (uint64_t)e;
+                continue;
+            }
             key_val = nonblank_slot_pn(k, c, s.c_lp[j]);
         } else if (j == c_n) {
             c = blank_id;
@@ -1891,69 +1974,108 @@ __device__ __forceinline__ void fused_step_body(
         } else if (j == c_n + 1) {
             // Last-char slot, unless already covered by the shared list.
             c = s.s_clast[k];
-            if (c == blank_id)
+            bool in_c = (c == blank_id);
+            for (int a = 0; !in_c && a < c_n; ++a)
+                in_c = (s.c_chars[a] == c);
+            if (in_c) {
+                s.ckeys[e] = (uint64_t)e;
                 continue;
-            bool in_c = false;
-            for (int a = 0; a < c_n; ++a)
-                if (s.c_chars[a] == c) {
-                    in_c = true;
-                    break;
-                }
-            if (in_c)
-                continue;
+            }
             key_val = nonblank_slot_pn(k, c, s.lp_clast[k]);
         } else {
             // Space slot, unless covered by the shared list or the last-char slot.
-            if (space_id < 0 || space_id == blank_id)
-                continue;
             c = space_id;
-            if (c == s.s_clast[k])
+            bool in_c = (space_id < 0 || space_id == blank_id || c == s.s_clast[k]);
+            for (int a = 0; !in_c && a < c_n; ++a)
+                in_c = (s.c_chars[a] == c);
+            if (in_c) {
+                s.ckeys[e] = (uint64_t)e;
                 continue;
-            bool in_c = false;
-            for (int a = 0; a < c_n; ++a)
-                if (s.c_chars[a] == c) {
-                    in_c = true;
-                    break;
-                }
-            if (in_c)
-                continue;
+            }
             key_val = nonblank_slot_pn(k, c, s.lp_space);
         }
-        int slot = atomicAdd(&s.cand_n, 1);
-        if (slot < Smem::CAND_CAP)
-            s.ckeys[slot] = make_ckey(key_val, (uint32_t)(k * ldc + c));
+        s.ckeys[e] = make_ckey(key_val, (uint32_t)(k * ldc + c));
     }
     __syncthreads();
+    OASR_PROF_T(2)
 
     // --- Phase 5: global top-beam select + rank ------------------------------
+    // Per-warp streaming top-32 over a contiguous candidate slice — register
+    // bitonic networks, no block barriers — then one rank-by-count merge of
+    // the per-warp top-beam survivors.  Two barriers replace the multi-level
+    // byte-radix select (~4 barriers + a warp-0 histogram reduce per level)
+    // that dominated this phase.  Exactness: every global top-beam key is in
+    // its warp's top-beam (keys are unique, the order is total), and out-of-
+    // range lanes load unique low pad keys (< 2^32, below every real key).
     {
-        const int n_cand = min(s.cand_n, Smem::CAND_CAP);
-        auto key_at = [&](int i) -> uint64_t { return s.ckeys[i]; };
-        auto emit = [&](int slot, int /*i*/, uint64_t k) {
-            if (slot < Smem::RANK_BUF)
-                s.rank[slot] = k;
+        constexpr int WARPS = BLOCK_SIZE / 32;
+        const int warp = tid >> 5;
+        const int lane = tid & 31;
+        const int span = (n_cand + WARPS - 1) / WARPS;
+        const int begin = warp * span;
+        const int end = min(begin + span, n_cand);
+        auto load = [&](int idx) -> uint64_t {
+            return (idx < end) ? s.ckeys[idx] : (uint64_t)(Smem::CAND_CAP + idx);
         };
-        block_topk_select<BLOCK_SIZE, Smem::RANK_BUF>(n_cand, beam, key_at, emit, &s.sel);
+        // cur: warp-local running top-32, sorted descending across lanes.
+        uint64_t cur = warp_bitonic_sort32<true>(load(begin + lane));
+        for (int base = begin + 32; base < end; base += 32) {
+            // Classic bitonic top-K stream: sort the new batch ascending;
+            // the elementwise max against the descending top-32 keeps the 32
+            // largest of the union and is bitonic — a 5-stage merge re-sorts.
+            uint64_t nv = warp_bitonic_sort32<false>(load(base + lane));
+            cur = warp_bitonic_merge32_desc(cur > nv ? cur : nv);
+        }
+        if (lane < beam)
+            s.wtop[warp * beam + lane] = cur;
+        __syncthreads();
+        OASR_PROF_T(3)
+        // Rank the m = WARPS * beam survivors by counting strictly greater
+        // keys (unique keys -> exact descending positions); the top RANK_BUF
+        // land in s.rank, of which Phase 6 reads [0, beam).
+        const int m = WARPS * beam;
+        if (tid < m) {
+            const uint64_t ki = s.wtop[tid];
+            int pos = 0;
+            for (int j = 0; j < m; ++j)
+                pos += (s.wtop[j] > ki) ? 1 : 0;
+            if (pos < Smem::RANK_BUF)
+                s.rank[pos] = ki;
+        }
     }
     __syncthreads();
-    for (int i = tid; i < Smem::RANK_BUF; i += BLOCK_SIZE)
-        if (i >= s.sel.out_n)
-            s.rank[i] = 0;  // sorts last
-    __syncthreads();
-    bitonic_sort64_desc<BLOCK_SIZE>(s.rank);
+    OASR_PROF_T(4)
 
     // --- Phase 6: state update (legacy topk_phase2 semantics) ----------------
+    // beam <= BLOCK_SIZE / WRITE_THREADS, so every sub-warp owns at most ONE
+    // output beam: the winner's identity is resolved once up front and the
+    // scattered lp_row[char_id] load (needed only for the final pprev
+    // recompute) is issued before the paged fork pass, hiding its latency
+    // behind the fork's global RMW chains.  Straight-line (loop-free) form so
+    // every warp lane reaches the CoW shuffles below.
     constexpr int WRITE_THREADS = 8;
+    static_assert(BEAM_CAP <= BLOCK_SIZE / WRITE_THREADS, "one output beam per sub-warp");
     const int sub = tid / WRITE_THREADS;
     const int lane = tid % WRITE_THREADS;
-    const int n_sub = BLOCK_SIZE / WRITE_THREADS;
+
+    const int out_beam = sub;
+    const bool own = (out_beam < beam);
+    uint64_t kk = 0;
+    int src_beam = 0, char_id = 0, prevlen = 0;
+    float lp_c_pref = 0.f;
+    if (own) {
+        kk = s.rank[out_beam];
+        const int id = (int)ckey_id(kk);
+        src_beam = id / ldc;
+        char_id = id - src_beam * ldc;
+        prevlen = s.s_clen[src_beam];
+        if (lane == 0 && char_id != blank_id)
+            lp_c_pref = lp_row[(size_t)char_id * vocab_stride];
+    }
 
     if (PAGED) {
         // Pass 1: fork block tables (release old dst refs, acquire src refs).
-        for (int out_beam = sub; out_beam < beam; out_beam += n_sub) {
-            int id = (int)ckey_id(s.rank[out_beam]);
-            int src_beam = id / ldc;
-            int prevlen = s.s_clen[src_beam];
+        if (own) {
             int n_pages = (prevlen > 0) ? (prevlen + page_size - 1) / page_size : 0;
             int bk_src = bid * beam + src_beam;
             int bk_dst = bid * beam + out_beam;
@@ -1973,23 +2095,20 @@ __device__ __forceinline__ void fused_step_body(
         __syncthreads();
     }
 
-    for (int out_beam = sub; out_beam < beam; out_beam += n_sub) {
-        uint64_t kk = s.rank[out_beam];
-        int id = (int)ckey_id(kk);
-        int src_beam = id / ldc;
-        int char_id = id - src_beam * ldc;
-        int prevlen = s.s_clen[src_beam];
-
-        if (!PAGED) {
-            // Parallel clist copy (WRITE_THREADS threads per output beam).
-            for (int q = lane; q < prevlen; q += WRITE_THREADS)
-                clist_dst[(size_t)(bid * beam + out_beam) * ldseq_len + q] =
-                    clist_src[(size_t)(bid * beam + src_beam) * ldseq_len + q];
-        }
-        if (lane != 0)
-            continue;
-
-        int dst = bid * ldbeam + out_beam;
+    // Pass 2: append / CoW + state writes.  A needed copy-on-write is split:
+    // lane 0 takes the decision and allocates, all WRITE_THREADS lanes of the
+    // sub-warp copy the page in parallel (the former lane-0 serial copy was a
+    // page_size-long dependent global load/store chain), then lane 0 finishes
+    // in the original order (block-table write, release, token write).
+    int cow_old = -1, cow_new = -1, cow_bt = -1, cow_off = 0;
+    const int dst = bid * ldbeam + out_beam;
+    if (own && !PAGED) {
+        // Parallel clist copy (WRITE_THREADS threads per output beam).
+        for (int q = lane; q < prevlen; q += WRITE_THREADS)
+            clist_dst[(size_t)(bid * beam + out_beam) * ldseq_len + q] =
+                clist_src[(size_t)(bid * beam + src_beam) * ldseq_len + q];
+    }
+    if (own && lane == 0) {
         if (PAGED) {
             int bk_dst = bid * beam + out_beam;
             const int out_cap = max_lp * page_size;
@@ -2015,25 +2134,20 @@ __device__ __forceinline__ void fused_step_body(
                     int bt_idx = bk_dst * max_lp + last_lp;
                     int phys = block_table_dst[bt_idx];
                     if (ref_counts[phys] > 1) {
-                        // Copy-on-write: the last page is shared.  The pool
-                        // push for the released reference is DEFERRED past the
-                        // last alloc_page pop of this step — a concurrent pop
-                        // could otherwise read the reserved free_pool slot
-                        // before this thread writes it.
-                        int new_phys =
-                            alloc_page(free_pool, free_pool_size, next_free_page);
-                        for (int q = 0; q < page_size; ++q)
-                            page_storage[new_phys * page_size + q] =
-                                page_storage[phys * page_size + q];
-                        block_table_dst[bt_idx] = new_phys;
-                        if (atomicSub(&ref_counts[phys], 1) == 1) {
-                            int dslot = atomicAdd(&s.defer_n, 1);
-                            s.defer_free[dslot] = phys;
-                        }
-                        ref_counts[new_phys] = 1;
-                        phys = new_phys;
+                        // Copy-on-write: the last page is shared.  Allocate
+                        // here; the copy + handover run below on the whole
+                        // sub-warp.  (The pool push for the released
+                        // reference stays DEFERRED past the last alloc_page
+                        // pop of this step — a concurrent pop could otherwise
+                        // read the reserved free_pool slot before this thread
+                        // writes it.)
+                        cow_new = alloc_page(free_pool, free_pool_size, next_free_page);
+                        cow_old = phys;
+                        cow_bt = bt_idx;
+                        cow_off = off;
+                    } else {
+                        page_storage[phys * page_size + off] = char_id;
                     }
-                    page_storage[phys * page_size + off] = char_id;
                 }
             }
         } else {
@@ -2054,7 +2168,30 @@ __device__ __forceinline__ void fused_step_body(
                 }
             }
         }
+    }
+    if (PAGED) {
+        // Every warp lane executes the segment shuffles (sub-warps that own
+        // no beam or need no CoW broadcast -1 and skip the copy).
+        cow_old = __shfl_sync(0xffffffffu, cow_old, 0, WRITE_THREADS);
+        cow_new = __shfl_sync(0xffffffffu, cow_new, 0, WRITE_THREADS);
+        if (cow_new >= 0) {
+            for (int q = lane; q < page_size; q += WRITE_THREADS)
+                page_storage[cow_new * page_size + q] =
+                    page_storage[cow_old * page_size + q];
+        }
+        __syncwarp();
+        if (own && lane == 0 && cow_new >= 0) {
+            block_table_dst[cow_bt] = cow_new;
+            if (atomicSub(&ref_counts[cow_old], 1) == 1) {
+                int dslot = atomicAdd(&s.defer_n, 1);
+                s.defer_free[dslot] = cow_old;
+            }
+            ref_counts[cow_new] = 1;
+            page_storage[cow_new * page_size + cow_off] = char_id;
+        }
+    }
 
+    if (own && lane == 0) {
         score[dst] = ckey_score(kk);
 
         // pprev for the next step is this slot's (ptable, ptablen) split,
@@ -2065,8 +2202,7 @@ __device__ __forceinline__ void fused_step_body(
             float pn = blank_slot(src_beam, &p);
             ppn = make_float2(p, pn);
         } else {
-            float lp_c = lp_row[(size_t)char_id * vocab_stride];
-            ppn = make_float2(NEG_INF, nonblank_slot_pn(src_beam, char_id, lp_c));
+            ppn = make_float2(NEG_INF, nonblank_slot_pn(src_beam, char_id, lp_c_pref));
         }
         pprev[dst] = ppn;
     }
@@ -2079,6 +2215,13 @@ __device__ __forceinline__ void fused_step_body(
             free_pool[slot] = s.defer_free[i];
         }
     }
+    OASR_PROF_T(5)
+#ifdef OASR_CTC_PHASE_PROF
+    if (tid == 0)
+        printf("PROF p1=%llu p2=%llu p4=%llu sel=%llu rank=%llu p6=%llu\n", prof_acc[0],
+               prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4], prof_acc[5]);
+#endif
+#undef OASR_PROF_T
 }
 
 // One frame per launch — used by the single-frame streaming API and as the
@@ -2236,19 +2379,19 @@ __device__ __forceinline__ void fused_chunk_loop(
             __syncthreads();
             for (int i = tid; i < Smem::RANK_BUF; i += BLOCK_SIZE)
                 if (i >= s.sel.out_n)
-                    s.rank[i] = 0;  // sorts last
+                    s.rank[i] = (uint64_t)(Smem::CAND_CAP + i);  // unique; sorts last
             __syncthreads();
-            bitonic_sort64_desc<BLOCK_SIZE>(s.rank);
+            rank64_desc<BLOCK_SIZE, BEAM_CAP>(s);  // descending into s.ckeys
             if (tid == 0) {
                 // Greedy non-blank pick in descending order; stage the new
                 // beams in the (otherwise unused at step 0) snapshot arrays.
                 int out = 0;
                 for (int rr = 0; rr < s.sel.out_n && out < nb_beams; ++rr) {
-                    int c = (int)ckey_id(s.rank[rr]);
+                    int c = (int)ckey_id(s.ckeys[rr]);
                     if (c == blank_id)
                         continue;
                     s.s_clast[out] = c;
-                    s.lp_clast[out] = ckey_score(s.rank[rr]);
+                    s.lp_clast[out] = ckey_score(s.ckeys[rr]);
                     ++out;
                 }
                 for (; out < nb_beams; ++out)

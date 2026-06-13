@@ -591,11 +591,11 @@ after `__syncthreads()`).
   is ignored there); the per-frame graph machinery remains only for the
   legacy / `beam > 32` / `OASR_CTC_FUSED=0` chunk path.
 
-RTX 5090, fused path across the two optimisations (§3.4.7 + §3.4.8):
-offline `(1, 200, 5000, 10)` 2.50 → 1.60 → 1.42 ms, `(16, 200, 5000,
-10)` 3.93 → 3.19 → 2.87 ms; streaming `(V=5000, beam=10)` 16.9 → 12.4
-→ 8.2 µs/frame (2.06× total). Fused-vs-legacy speedup at vocab 5000
-rises from ~2.3–3× to ~3.3–5.3×.
+RTX 5090, fused path across the optimisation series (§3.4.7 → §3.4.10):
+offline `(1, 200, 5000, 10)` 2.50 → 1.60 → 1.42 → 1.11 ms, `(16, 200,
+5000, 10)` 3.93 → 3.19 → 2.87 → 2.55 ms; streaming `(V=5000, beam=10)`
+16.9 → 12.4 → 8.2 → 6.6 µs/frame (2.6× total). Fused-vs-legacy speedup
+at vocab 5000 rises from ~2.3–3× to ~3.5–6.8×.
 
 #### 3.4.9 Multi-stream batched chunk decode (`fused::fused_chunk_batched_kernel`)
 
@@ -620,9 +620,41 @@ for the shared-offset trick (always true for torch-allocated states);
 misaligned groups fall back to per-stream launches.
 
 RTX 5090, `decode_chunk_batch` (V=5000, beam=10, 16-frame chunks,
-threshold 0.95, paged): N=8 streams 0.86 → 0.13 ms/engine-step
-(6.6×), N=64 6.7 → 0.17 ms (39×), N=128 13.5 → 0.32 ms (42×) — decode
-cost per engine step is now nearly flat in the number of streams.
+threshold 0.95, paged): N=8 streams 0.86 → 0.10 ms/engine-step
+(8.6×), N=64 6.7 → 0.14 ms (47×), N=128 13.5 → 0.26 ms (51×, incl.
+§3.4.10) — decode cost per engine step is now nearly flat in the
+number of streams.
+
+#### 3.4.10 Intra-step latency (barrier-bound phases)
+
+With launches gone, warp-stall sampling showed the chunk kernel >50 %
+**barrier-stalled**: one block per row, so every `__syncthreads()`
+costs the slowest warp's segment latency. Per-frame `clock64()` phase
+timing (`-DOASR_CTC_PHASE_PROF`, prints per-frame cycles from the
+chunk kernel) attributed ~22 % to the Phase-5 byte-radix select, ~39 %
+to the Phase-6 state update. Changes, all bit-exact by construction:
+
+- **Phase 5** — per-warp streaming top-32 over a contiguous candidate
+  slice using register bitonic networks (`warp_bitonic_sort32` /
+  `warp_bitonic_merge32_desc`, no block barriers), then one
+  rank-by-count merge of the `warps × beam` survivors. Two barriers
+  replace ~4 per radix level; measured 4.3k → 1.6k cycles/frame
+  (+1.5k in the merge).
+- **Phase 6** — each sub-warp owns at most one output beam
+  (`beam ≤ 32`), so the winner's `lp_row[char_id]` load is issued
+  before the paged fork pass (latency hidden behind the fork's global
+  RMWs), and the copy-on-write page copy runs on all 8 sub-warp lanes
+  instead of a lane-0 serial `page_size`-long chain. 7.5k → 5.4k
+  cycles/frame.
+- **Phases 1–4** — candidates are scored into fixed slots (skipped
+  slots write unique low dummy keys that sort below every real key)
+  instead of `atomicAdd`-compacted ones; the merge-source list +
+  insertion sort became a per-beam bitmask iterated in ascending-bit
+  order; the pre-pass candidate load rides in the Phase-1 snapshot
+  pass; `k_all` is only computed on the in-kernel-select fallback.
+
+Frame time 19.3k → 15.4k cycles (−20 %); the remaining profile is
+~30 % Phase-4 scoring, ~35 % Phase-6 global update, ~20 % select+rank.
 
 ### 3.5 Frame selection (offline only)
 

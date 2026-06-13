@@ -75,6 +75,25 @@ def _get_target_sm() -> int:
 # ---------------------------------------------------------------------------
 
 
+# Header roots every JIT source may transitively include.  They must be part
+# of the cache key: ``build_and_load`` short-circuits on an existing library
+# without consulting ninja's dependency tracking, so a header-only edit that
+# is absent from the hash would silently keep loading the stale binary.
+_PROJECT_HEADER_ROOTS = (
+    (env.OASR_INCLUDE_DIR, (".h", ".cuh", ".inc")),
+    (env.OASR_CSRC_DIR, (".h",)),
+)
+
+
+def _project_headers():
+    for root, suffixes in _PROJECT_HEADER_ROOTS:
+        if not root.is_dir():
+            continue
+        for p in sorted(root.rglob("*")):
+            if p.suffix in suffixes and p.is_file():
+                yield root, p
+
+
 class JitSpec:
     """Specification for a JIT-compiled CUDA module.
 
@@ -99,7 +118,8 @@ class JitSpec:
         self.extra_ldflags = extra_ldflags or []
 
     def _content_hash(self) -> str:
-        """Compute hash of all source files + flags for cache invalidation."""
+        """Compute hash of all source files + project headers + flags for
+        cache invalidation."""
         h = hashlib.sha256()
         h.update(self.name.encode())
         for flag in sorted(self.extra_cuda_cflags):
@@ -111,6 +131,9 @@ class JitSpec:
                 h.update(src.read_bytes())
             else:
                 h.update(str(src).encode())
+        for root, hdr in _project_headers():
+            h.update(str(hdr.relative_to(root)).encode())
+            h.update(hdr.read_bytes())
         return h.hexdigest()[:16]
 
     def _get_lib_dir(self) -> Path:
