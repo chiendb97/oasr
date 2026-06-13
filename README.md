@@ -33,13 +33,17 @@ OASR is flexible and easy to use with:
 
 ## Supported Models
 
-| Model        | Status      |
-|--------------|-------------|
-| Conformer    | ✅ Available |
-| Paraformer   | 🔲 Planned  |
-| Branchformer | 🔲 Planned  |
-| Zipformer    | 🔲 Planned  |
-| Transducer   | 🔲 Planned  |
+| Model        | Status                          |
+|--------------|---------------------------------|
+| Conformer    | ✅ Available (offline + streaming) |
+| Zipformer    | ✅ Available (offline; streaming wired) |
+| Paraformer   | 🔲 Planned                       |
+| Branchformer | 🔲 Planned                       |
+| Transducer   | 🔲 Planned (decode seam ready)   |
+
+New encoder architectures, decode families (CTC / transducer / AED / LLM),
+streaming runtimes, batching policies, and checkpoint loaders each plug in via a
+registry — see [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
@@ -169,6 +173,7 @@ grpcurl -plaintext -import-path rust/proto -proto oasr_speech_v1.proto \
 
 | Document                                             | Covers                                                |
 |------------------------------------------------------|-------------------------------------------------------|
+| [`docs/architecture.md`](docs/architecture.md)       | Engine extension points (the per-axis registries)     |
 | [`docs/engine.md`](docs/engine.md)                   | Engine step loop, batching, CUDA Graph capture        |
 | [`docs/engine_concurrency.md`](docs/engine_concurrency.md) | Engine thread-safety and multi-process scaling   |
 | [`docs/scheduler.md`](docs/scheduler.md)             | Request scheduling, starvation bounds, micro-batching |
