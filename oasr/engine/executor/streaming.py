@@ -118,7 +118,10 @@ class StreamingExecutor(Executor):
     def abort(self, request_id: str) -> None:
         """Remove a streaming request, freeing its cache slot if any."""
         req = self._scheduler.abort_request(request_id)
-        if req is not None and req.stream_context is not None:
+        # ``stream_id`` is the admission marker (set by the scheduler when a
+        # stream is promoted to RUNNING) — present for both paged and stateful
+        # backends, whereas ``stream_context`` is ``None`` for stateful streams.
+        if req is not None and req.stream_id is not None:
             self._op.free_session(req)
             self._mr.free_stream(req)
 

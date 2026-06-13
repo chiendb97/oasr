@@ -140,6 +140,26 @@ class ZipformerEncoder(BaseEncoder):
         """2x Conv2dSubsampling embed × ``output_downsampling_factor`` = total."""
         return 2 * self.config.output_downsampling_factor
 
+    @property
+    def streaming_chunk_frames(self) -> int:
+        """Input fbank frames consumed per steady-state streaming chunk.
+
+        ``chunk_size`` is in embed-output frames (Zipformer2 input); the
+        Conv2dSubsampling embed is 2×, so the steady-state input chunk is
+        ``chunk_size * 2`` frames (the first chunk's extra conv context is
+        absorbed by the embed's cached left-pad init state).  Requires a
+        causal/streaming config (``chunk_size > 0``).
+        """
+        cs = self.config.chunk_size
+        cs = cs[0] if isinstance(cs, (tuple, list)) else cs
+        cs = int(cs)
+        if cs <= 0:
+            raise ValueError(
+                "ZipformerEncoder is not configured for streaming "
+                f"(chunk_size={cs}); build with causal=True and chunk_size>0."
+            )
+        return cs * 2
+
 
 class ZipformerModel(BaseAsrModel):
     """Zipformer + CTC head (icefall ``egs/librispeech/ASR/zipformer``, ``--use-ctc 1``)."""
