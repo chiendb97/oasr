@@ -113,8 +113,6 @@ class Joiner(nn.Module, ABC):
     """Transducer joiner: combine an encoder frame and a prediction → vocab logits."""
 
     @abstractmethod
-    def forward(
-        self, encoder_out: torch.Tensor, prediction_out: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, encoder_out: torch.Tensor, prediction_out: torch.Tensor) -> torch.Tensor:
         """``(B, D_enc)`` ⊕ ``(B, D_pred)`` → ``(B, V)`` logits."""
         raise NotImplementedError

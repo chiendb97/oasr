@@ -183,9 +183,7 @@ class ZipformerModel(BaseAsrModel):
         return self.ctc(hidden), out_lens, new_states
 
     # -- weight loading -----------------------------------------------------
-    def load_weights(
-        self, state_dict: Mapping[str, Tensor], *, strict: bool = False
-    ) -> None:
+    def load_weights(self, state_dict: Mapping[str, Tensor], *, strict: bool = False) -> None:
         """Map an icefall ``AsrModel`` state-dict into this model.
 
         icefall keys ``encoder_embed.*`` / ``encoder.*`` / ``ctc_output.1.*`` map

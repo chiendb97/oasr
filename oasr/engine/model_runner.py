@@ -13,7 +13,6 @@ from oasr.cache import (
     BlockPool,
     CacheConfig,
     CnnCacheManager,
-    CtcStateCacheManager,
     StreamContext,
     StreamSlotPool,
 )
@@ -73,22 +72,9 @@ class ModelRunner:
         self._att_mgr = AttentionCacheManager(self._block_pool, cache_config)
         self._cnn_mgr = CnnCacheManager(cache_config)
         self._slot_pool = StreamSlotPool(cache_config.max_batch_size)
-        # Only create the CTC state manager when using the GPU decoder
-        ctc_graphs_enabled = (
-            bool(getattr(config, "use_cuda_graphs", True))
-            and bool(getattr(config, "use_ctc_cuda_graphs", True))
-            and torch.device(config.device).type == "cuda"
-        )
-        if config.decoder_type == "ctc_cuda":
-            self._ctc_mgr: CtcStateCacheManager = CtcStateCacheManager(
-                config.ctc_decoder_config,
-                use_cuda_graphs=ctc_graphs_enabled,
-            )
-        else:
-            self._ctc_mgr = CtcStateCacheManager(
-                config.ctc_decoder_config,
-                use_cuda_graphs=ctc_graphs_enabled,
-            )
+        # CTC beam state is decode-side and now owned by the decode strategy
+        # (``oasr.engine.decode.CtcGpuDecodeStrategy``), so it works for any
+        # encoder streaming kind — the runner only manages the *encoder* caches.
 
         # CUDA Graph cache for the steady-state batched paged forward.
         # Captures lazily on first encounter of each (B_active, cache_t1
@@ -236,10 +222,11 @@ class ModelRunner:
     # ------------------------------------------------------------------
 
     def allocate_stream(self, request: Request) -> StreamContext:
-        """Allocate KV + CNN + CTC cache buffers for a streaming request.
+        """Allocate the encoder KV + CNN cache buffers for a streaming request.
 
-        Assigns a :class:`~oasr.cache.StreamContext` to
-        ``request.stream_context``.
+        Assigns an encoder-only :class:`~oasr.cache.StreamContext` to
+        ``request.stream_context``.  The CTC beam state is allocated separately
+        by the decode strategy (``OutputProcessor.create_session``).
 
         Parameters
         ----------
@@ -254,17 +241,16 @@ class ModelRunner:
         """
         sid = request.stream_id
         assert sid is not None, "stream_id must be assigned before allocate_stream"
-        vocab_size = self._config._model_config.vocab_size or 5002  # type: ignore[union-attr]
-        device = torch.device(self._config.device)
 
         slot_id = self._slot_pool.allocate()
         request.slot_id = slot_id
 
         self._att_mgr.allocate_stream(sid, slot_id=slot_id)
         self._cnn_mgr.allocate_stream(sid, slot_id=slot_id)
-        self._ctc_mgr.allocate_stream(sid, batch=1, vocab_size=vocab_size, device=device)
 
-        ctx = StreamContext(sid, self._att_mgr, self._cnn_mgr, self._ctc_mgr)
+        # Encoder-only context (att + CNN).  The CTC decode session is created
+        # separately by the decode strategy (``OutputProcessor.create_session``).
+        ctx = StreamContext(sid, self._att_mgr, self._cnn_mgr)
         request.stream_context = ctx
         return ctx
 
@@ -554,11 +540,7 @@ class ModelRunner:
         # chunk's attention (observed: a ~33-magnitude log-prob error on the
         # final sub-window chunk that flips borderline decodes vs eager). These
         # chunks are at most one per stream, so eager costs nothing.
-        if (
-            self._use_cuda_graphs
-            and self._graph_cache is not None
-            and chunk.size(1) == window
-        ):
+        if self._use_cuda_graphs and self._graph_cache is not None and chunk.size(1) == window:
             log_probs = self._graph_cache.replay(
                 1,
                 chunk.size(1),

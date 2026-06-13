@@ -111,9 +111,7 @@ class BaseEncoder(nn.Module, ABC):
     supports_paged_streaming: bool = False
 
     @abstractmethod
-    def forward(
-        self, xs: torch.Tensor, xs_lens: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Offline forward → ``(hidden (B, T_out, D), masks (B, 1, T_out) bool)``."""
         raise NotImplementedError
 
@@ -133,18 +131,14 @@ class BaseEncoder(nn.Module, ABC):
         = True``).  Other encoders expose their own streaming API.
         """
         del xs, offset, att_caches, cnn_cache, att_mask, cache_t1
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support paged-KV streaming"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support paged-KV streaming")
 
     def forward_packed(
         self, xs: torch.Tensor, xs_lens: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sequence-packing offline forward (optional).  Default: unsupported."""
         del xs, xs_lens
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support sequence packing"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support sequence packing")
 
     # -- introspection used to build CacheSpec ------------------------------
     @property
@@ -216,9 +210,7 @@ class BaseEncoder(nn.Module, ABC):
         implement this (paged encoders use :meth:`forward_chunk_paged`).
         """
         del batch_size, device, dtype
-        raise NotImplementedError(
-            f"{type(self).__name__} does not expose a stateful streaming API"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not expose a stateful streaming API")
 
     def streaming_forward(
         self,
@@ -231,9 +223,7 @@ class BaseEncoder(nn.Module, ABC):
         Default: unsupported (see :meth:`get_streaming_init_states`).
         """
         del xs, xs_lens, states
-        raise NotImplementedError(
-            f"{type(self).__name__} does not expose a stateful streaming API"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not expose a stateful streaming API")
 
     @property
     def cache_spec(self) -> CacheSpec:
@@ -277,9 +267,7 @@ class BaseAsrModel(nn.Module, ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def load_weights(
-        self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False
-    ) -> None:
+    def load_weights(self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False) -> None:
         """Map an external checkpoint state-dict into this model's parameters.
 
         Each architecture owns the name-mapping / fusion knowledge (vLLM-style);
