@@ -474,13 +474,13 @@ def _run_config(
         median_ms=median_ms,
         std_ms=std_ms,
         extra={
-            "rtf": round(rtf, 4),
+            "rtf": round(rtf, 8),
             "throughput_utts_per_sec": round(throughput, 2),
             "total_audio_s": round(sum(durations), 2),
         },
     )
     output.write_result(result)
-    print(f"         RTF={rtf:.4f}  throughput={throughput:.2f} utts/s  "
+    print(f"         RTF={rtf:.8f}  throughput={throughput:.2f} utts/s  "
           f"total_audio={sum(durations):.1f}s")
 
 
