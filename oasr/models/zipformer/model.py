@@ -128,6 +128,18 @@ class ZipformerEncoder(BaseEncoder):
     def output_size(self) -> int:
         return max(self.config.encoder_dim)
 
+    # -- streaming spec ----------------------------------------------------
+    @property
+    def streaming_kind(self) -> str:
+        """Zipformer owns per-layer recurrent state (icefall 6-tensor caches),
+        so it uses the engine's *stateful* streaming backend, not paged-KV."""
+        return "stateful"
+
+    @property
+    def subsampling_rate(self) -> int:
+        """2x Conv2dSubsampling embed × ``output_downsampling_factor`` = total."""
+        return 2 * self.config.output_downsampling_factor
+
 
 class ZipformerModel(BaseAsrModel):
     """Zipformer + CTC head (icefall ``egs/librispeech/ASR/zipformer``, ``--use-ctc 1``)."""
