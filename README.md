@@ -39,7 +39,7 @@ OASR is flexible and easy to use with:
 | Zipformer    | ✅ Available (offline; streaming wired) |
 | Paraformer   | 🔲 Planned                       |
 | Branchformer | 🔲 Planned                       |
-| Transducer   | 🔲 Planned (decode seam ready)   |
+| Transducer   | 🟡 Offline greedy RNNT (streaming/beam WIP) |
 
 New encoder architectures, decode families (CTC / transducer / AED / LLM),
 streaming runtimes, batching policies, and checkpoint loaders each plug in via a

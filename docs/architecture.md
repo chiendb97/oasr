@@ -72,12 +72,22 @@ flags.
 
 ## Status of the autoregressive path
 
-CTC (GPU prefix-beam + WFST) is fully wired across offline + streaming. The
-transducer / AED / LLM seam is defined end to end — `BaseDecoder`,
-`DecodeStrategy(consumes="hidden")` skeletons, and the `encode_*` hidden-state
-entry points — but the autoregressive decode *loop* (decoder-side KV cache,
-beam/greedy search, per-token batching) is an extension point, not yet
-implemented. The Conformer (paged) and Zipformer (stateful) streaming backends
-are both wired; Zipformer's stateful streaming is validated at the backend level
-(state threading) — full engine-level streaming additionally needs a streaming
-Zipformer checkpoint.
+CTC (GPU prefix-beam + WFST) is fully wired across offline + streaming.
+
+**Transducer (RNNT) — offline greedy is implemented.** `oasr/models/transducer/`
+(stateless predictor + joiner) + `TransducerDecodeStrategy` run frame-synchronous
+greedy over encoder hidden states; the offline executor feeds `encode_offline`
+(hidden) when the strategy's `consumes == "hidden"`. Validated batched-vs-reference
+on a tiny model (`tests/test_transducer.py`). Remaining transducer work:
+**streaming** greedy (predictor state + frame pointer threaded across chunks),
+**beam** search, batched-predictor throughput, and a `CheckpointConverter` so
+`from_pretrained` loads icefall pruned-transducer checkpoints.
+
+**AED / LLM** remain registered skeletons (`consumes="hidden"`, raise) — they need
+a label-synchronous decoder with a decoder-side KV cache (reuse
+`oasr.cache.BlockPool` / `AttentionCacheManager`).
+
+The Conformer (paged) and Zipformer (stateful) streaming backends are both wired;
+Zipformer's stateful streaming is validated at the backend level (state threading)
+— full engine-level streaming additionally needs a streaming Zipformer checkpoint.
+Encoders with `streaming_kind="none"` use the no-op offline-only backend.

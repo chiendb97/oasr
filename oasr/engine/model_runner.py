@@ -128,6 +128,19 @@ class ModelRunner:
         """
         return self._model.forward_offline_packed(features, lengths)
 
+    @torch.no_grad()
+    def encode_offline(
+        self,
+        features: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encoder-only offline forward → ``(hidden (B, T, D), out_lengths)``.
+
+        For autoregressive decode strategies (``consumes == "hidden"``) that own
+        their head/decoder (transducer / AED / LLM) instead of the fused CTC head.
+        """
+        return self._model.encode_offline(features, lengths)
+
     # ------------------------------------------------------------------
     # Streaming (delegated to the backend)
     # ------------------------------------------------------------------

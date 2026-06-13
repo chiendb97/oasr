@@ -38,11 +38,13 @@ class OutputProcessor:
         for CTC).  Defaults to ``"ctc"``.
     """
 
-    def __init__(self, config: EngineConfig, decode_type: str = "ctc") -> None:
+    def __init__(self, config: EngineConfig, decode_type: str = "ctc", model=None) -> None:
         self._config = config
         self._decode_type = decode_type
         self._detok = Detokenizer(config.sentencepiece_model, config.unit_table)
-        self._strategy = build_decode_strategy(decode_type, config, self._detok)
+        # ``model`` is threaded to the strategy so autoregressive families can
+        # reach ``model.decoder`` / ``model.joiner`` (CTC strategies ignore it).
+        self._strategy = build_decode_strategy(decode_type, config, self._detok, model)
 
     @property
     def strategy(self):

@@ -176,13 +176,18 @@ class OfflineExecutor(Executor):
         and finalisation are identical for both.
         """
         nvtx_push("offline.forward")
-        if self._enable_packing:
-            log_probs, output_lengths = self._mr.forward_offline_packed(features, lengths)
+        if self._op.strategy.consumes == "hidden":
+            # Autoregressive families (transducer/AED/LLM) consume raw encoder
+            # hidden states and own their decoder; CTC consumes the fused-head
+            # log-probs (the CUDA-graph fast path).
+            enc_out, output_lengths = self._mr.encode_offline(features, lengths)
+        elif self._enable_packing:
+            enc_out, output_lengths = self._mr.forward_offline_packed(features, lengths)
         else:
-            log_probs, output_lengths = self._mr.forward_offline(features, lengths)
+            enc_out, output_lengths = self._mr.forward_offline(features, lengths)
         nvtx_pop()
         nvtx_push("offline.decode")
-        outputs = self._op.decode_offline(log_probs, output_lengths)
+        outputs = self._op.decode_offline(enc_out, output_lengths)
         nvtx_pop()
 
         for req, out in zip(chunk, outputs):

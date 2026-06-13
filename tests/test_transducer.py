@@ -98,3 +98,56 @@ def test_greedy_context_size_1():
         outs = strat.decode_offline(hidden, lengths)
     for b in range(2):
         assert outs[b].tokens[0] == _ref_greedy(hidden[b], int(lengths[b]), model, 3)
+
+
+def test_offline_executor_takes_hidden_branch_for_transducer():
+    """End-to-end offline wiring: OutputProcessor(transducer) + OfflineExecutor
+    must call encode_offline (not forward_offline) and emit greedy tokens."""
+    from oasr.engine.executor.offline import OfflineExecutor
+    from oasr.engine.output_processor import OutputProcessor
+    from oasr.engine.request import Request
+
+    torch.manual_seed(2)
+    model = _build_model(context_size=2)
+    cfg = SimpleNamespace(sentencepiece_model=None, unit_table=None, transducer_max_sym_per_frame=5)
+    op = OutputProcessor(cfg, decode_type="transducer", model=model)
+    assert op.strategy.consumes == "hidden"
+    assert type(op.strategy).__name__ == "TransducerDecodeStrategy"
+
+    B, T = 2, 16
+    hidden = torch.randn(B, T, ENC_DIM)
+    lengths = torch.tensor([T, 9])
+
+    class StubMR:
+        def encode_offline(self, feats, lens):
+            return feats, lens  # treat the collated "features" as encoder hidden
+
+        def forward_offline(self, feats, lens):
+            raise AssertionError("CTC path must not run for a transducer")
+
+        forward_offline_packed = forward_offline
+
+    class StubInp:
+        def collate(self, chunk):
+            return hidden, lengths
+
+    class StubSched:
+        def split_offline_batch(self, batch):
+            return [batch], None
+
+    reqs = [Request(None, streaming=False) for _ in range(B)]
+    ex = OfflineExecutor(
+        scheduler=StubSched(),
+        input_processor=StubInp(),
+        model_runner=StubMR(),
+        output_processor=op,
+        device=torch.device("cpu"),
+        enable_packing=False,
+    )
+    outs = ex.run(reqs)
+    assert len(outs) == B
+    for b in range(B):
+        ref = _ref_greedy(hidden[b], int(lengths[b]), model, 5)
+        assert outs[b].tokens[0] == ref
+        assert outs[b].request_id == reqs[b].request_id
+        assert outs[b].finished

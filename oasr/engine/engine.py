@@ -131,7 +131,7 @@ class ASREngine:
         config._decoding_window_override = self._model_runner.decoding_window
         config._stride_override = self._model_runner.stride
 
-        self._output_processor = OutputProcessor(config, decode_type=model.decode_type)
+        self._output_processor = OutputProcessor(config, decode_type=model.decode_type, model=model)
 
         # Build exactly one executor matching ``config.service_mode``.
         # The other mode's machinery (paged KV cache vs. persistent

@@ -9,7 +9,7 @@ decorating it with :func:`register_streaming_backend`.
 """
 
 # Import for side effects: each module registers its backend on import.
-from . import paged, stateful  # noqa: E402,F401
+from . import none, paged, stateful  # noqa: E402,F401
 from .base import (
     StreamingEncoderBackend,
     build_streaming_backend,
