@@ -372,27 +372,44 @@ class EngineConfig:
     # Subsampling constants for Conv2dSubsampling (4× with right_context=6)
     # ------------------------------------------------------------------
 
+    # These four geometry properties default to the Conformer/Conv2dSubsampling
+    # values so a standalone ``EngineConfig`` (no model) stays usable.  The
+    # engine **overrides** them after loading the model (``ASREngine`` sets
+    # ``_*_override`` from ``model.encoder`` / the streaming backend) so they
+    # reflect the actual architecture's streaming geometry — Conformer is
+    # unchanged (4 / 6 / 67 / 64), Zipformer reports its stateful window.
+
     @property
     def subsampling_rate(self) -> int:
-        """4× temporal subsampling from Conv2dSubsampling."""
-        return 4
+        """Total temporal subsampling factor (input frames per encoder frame)."""
+        ov = getattr(self, "_subsampling_rate_override", None)
+        return ov if ov is not None else 4
 
     @property
     def right_context(self) -> int:
-        """Right context frames required by Conv2dSubsampling."""
-        return 6
+        """Future input frames the subsampling needs beyond one chunk."""
+        ov = getattr(self, "_right_context_override", None)
+        return ov if ov is not None else 6
 
     @property
     def decoding_window(self) -> int:
         """Input feature frames consumed per encoder chunk.
 
-        ``(chunk_size - 1) * subsampling_rate + right_context + 1``
+        Default (Conformer): ``(chunk_size - 1) * subsampling_rate +
+        right_context + 1``.  Overridden by the engine from the streaming
+        backend (e.g. Zipformer's non-overlapping stateful window).
         """
+        ov = getattr(self, "_decoding_window_override", None)
+        if ov is not None:
+            return ov
         return (self.chunk_size - 1) * self.subsampling_rate + self.right_context + 1
 
     @property
     def stride(self) -> int:
         """Feature frame stride between consecutive chunk windows."""
+        ov = getattr(self, "_stride_override", None)
+        if ov is not None:
+            return ov
         return self.subsampling_rate * self.chunk_size
 
     # ------------------------------------------------------------------

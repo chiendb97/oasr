@@ -117,6 +117,17 @@ class ASREngine:
         self._input_processor = InputProcessor(config, self._device, graph_pool=self._graph_pool)
         self._scheduler = Scheduler(config)
         self._model_runner = ModelRunner(model, config, cache_config, graph_pool=self._graph_pool)
+
+        # Source the streaming geometry from the model's encoder + the streaming
+        # backend so the executor / input processor window the feature buffer per
+        # the actual architecture (Conformer paged vs Zipformer stateful) rather
+        # than hardcoded Conformer constants.  For Conformer these equal the old
+        # defaults (4 / 6 / 67 / 64) — zero behaviour change.
+        config._subsampling_rate_override = model.encoder.subsampling_rate
+        config._right_context_override = model.encoder.right_context
+        config._decoding_window_override = self._model_runner.decoding_window
+        config._stride_override = self._model_runner.stride
+
         self._output_processor = OutputProcessor(config, decode_type=model.decode_type)
 
         # Build exactly one executor matching ``config.service_mode``.
@@ -153,12 +164,8 @@ class ASREngine:
                     else 32
                 )
                 cs = int(config.chunk_size)
-                buckets = sorted(
-                    {round_up_bucket(cs * k) for k in range(int(prewarm_chunks) + 2)}
-                )
-                self._model_runner.prewarm_encoder_graphs(
-                    batch_sizes, cache_t1_buckets=buckets
-                )
+                buckets = sorted({round_up_bucket(cs * k) for k in range(int(prewarm_chunks) + 2)})
+                self._model_runner.prewarm_encoder_graphs(batch_sizes, cache_t1_buckets=buckets)
             except Exception as exc:  # pragma: no cover
                 logger.warning(
                     "Encoder graph pre-warm failed (will capture on first " "chunk instead): %s",
@@ -168,8 +175,10 @@ class ASREngine:
         # Warm up the cute FMHA compile cache so the first request
         # doesn't pay JIT-compile latency. Skipped on CPU and on archs
         # where the cute backend isn't available (warmup_fmha is a no-op
-        # in those cases).
-        if self._device.type == "cuda":
+        # in those cases).  Conformer-specific (reads ``encoder.encoders``);
+        # encoders without that stacked-layer layout (e.g. Zipformer, which
+        # uses torch matmul attention) skip it.
+        if self._device.type == "cuda" and hasattr(model.encoder, "encoders"):
             from oasr.jit.attention import warmup_fmha
 
             try:
@@ -197,9 +206,7 @@ class ASREngine:
             try:
                 self._prewarm_offline()
             except Exception as exc:  # pragma: no cover
-                logger.warning(
-                    "Offline prewarm failed (first request will be slow): %s", exc
-                )
+                logger.warning("Offline prewarm failed (first request will be slow): %s", exc)
 
         # Admission-prep overlap (offline only): a daemon thread runs the
         # per-request ``prepare_offline`` (waveform normalise + frame-count

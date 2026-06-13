@@ -61,6 +61,17 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         self._cache_config = cache_config
         self._graph_pool = graph_pool
 
+        # Window geometry derived from the *encoder* (not hardcoded): a chunk of
+        # ``chunk_size`` encoder frames needs ``(chunk_size-1)*sub + right_context
+        # + 1`` input frames, advancing ``sub*chunk_size`` per step.
+        enc = model.encoder
+        sub = int(enc.subsampling_rate)
+        rc = int(enc.right_context)
+        cs = int(config.chunk_size)
+        self._window = (cs - 1) * sub + rc + 1
+        self._stride = sub * cs
+        self._context = rc + 1
+
         # Build shared cache infrastructure.
         self._block_pool = BlockPool(cache_config)
         self._att_mgr = AttentionCacheManager(self._block_pool, cache_config)
@@ -81,7 +92,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
                 self._cnn_mgr,
                 cache_dtype=cache_config.dtype,
                 device=torch.device(config.device),
-                window=config.decoding_window,
+                window=self._window,
                 feat_dim=config.feature_config.output_dim,
                 cnn_cache_frames=cache_config.cnn_cache_frames,
                 num_layers=cache_config.num_layers,
@@ -97,11 +108,11 @@ class PagedStreamingBackend(StreamingEncoderBackend):
 
     @property
     def decoding_window(self) -> int:
-        return self._config.decoding_window
+        return self._window
 
     @property
     def stride(self) -> int:
-        return self._config.stride
+        return self._stride
 
     @property
     def block_pool(self) -> BlockPool:
@@ -160,7 +171,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             ) or [0]
 
         device = self._att_mgr.block_table.device
-        window = self._config.decoding_window
+        window = self._window
         feat_dim = self._config.feature_config.output_dim
         dtype = self._cache_config.dtype
 
@@ -236,10 +247,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         Returns ``{request_id: log_probs (1, chunk_size, V)}``; requests with
         no remaining chunks are omitted.
         """
-        cfg = self._config
-        window = cfg.decoding_window
-        stride = cfg.stride
-        context = cfg.right_context + 1
+        window = self._window
+        stride = self._stride
+        context = self._context
 
         results: Dict[str, torch.Tensor] = {}
 
