@@ -5,6 +5,7 @@
 
 #include <oasr/ctc_decoder.cuh>
 
+#include <algorithm>
 #include <functional>
 #include <mutex>
 #include <unordered_map>
@@ -458,24 +459,70 @@ int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk
 
   cudaStream_t stream = get_stream(state_buffer.device());
 
-  // Host-side counters drive the loop.  Blank frames simply increment
-  // ``frame_idx`` (no kernel launch).  Non-blank frames either (a) push the
-  // current ``(step, frame_idx)`` into the captured graph's pinned host
-  // buffer + ``cudaGraphLaunch`` (graph fast path), or (b) write to the
-  // device counters via ``set_stream_counters`` + run ``streaming_step_persistent``
-  // (eager fallback).  Pre-Step-4 launched one kernel per blank frame; for
-  // 80%-blank streams that was the dominant launch-overhead source.
   int step = static_cast<int>(start_step);
   int frame_idx = static_cast<int>(start_frame_idx);
 
+  // ----- Fused multi-frame path (beam <= 32) -----
+  // Two launches per PREPASS_TILE tile: the parallel vocab top-K pre-pass and
+  // one fused chunk kernel that loops the tile's frames in-kernel, carrying
+  // beam state across frames.  The blank-skip mask travels as two by-value
+  // 64-bit bitmaps, so blank frames cost nothing and no per-frame counter
+  // kernels, d_lp_frame_buf copies, or CUDA-graph replays remain
+  // (``use_cuda_graphs`` is ignored on this path).  No ``step >= max_seq_len``
+  // cap: ``step`` counts decoded frames, which can exceed the output-token
+  // cap (max_seq_len) for long streams — select_seqs is a ring of width
+  // max_seq_len and clen is capped in-kernel.
+  if (ctc_decoder::step_uses_fused(static_cast<int>(beam))) {
+    for (int tile_begin = 0; tile_begin < chunk_t;
+         tile_begin += ctc_decoder::PREPASS_TILE) {
+      const int tile_len =
+          std::min<int>(ctc_decoder::PREPASS_TILE, chunk_t - tile_begin);
+      unsigned long long mask_lo = ~0ull, mask_hi = ~0ull;
+      int n_active = tile_len;
+      if (mask_data) {
+        mask_lo = mask_hi = 0;
+        n_active = 0;
+        for (int r = 0; r < tile_len; ++r) {
+          if (!mask_data[tile_begin + r]) continue;
+          if (r < 64) {
+            mask_lo |= 1ull << r;
+          } else {
+            mask_hi |= 1ull << (r - 64);
+          }
+          ++n_active;
+        }
+      }
+      if (n_active > 0) {
+        cudaError_t cerr = ctc_decoder::streaming_decode_chunk_fused(
+            state_buffer.data_ptr(), lp_data, batch_stride, seq_stride,
+            vocab_stride, tile_begin, tile_len, step,
+            /*frame_begin=*/frame_idx, mask_lo, mask_hi,
+            static_cast<int>(blank_id), -1, static_cast<int>(batch),
+            static_cast<int>(beam), static_cast<int>(vocab_size),
+            static_cast<int>(max_seq_len), static_cast<int>(use_paged_memory),
+            static_cast<int>(page_size), 0, stream);
+        TVM_FFI_ICHECK(cerr == cudaSuccess)
+            << "CTC fused chunk decode failed: " << cudaGetErrorString(cerr);
+        step += n_active;
+      }
+      frame_idx += tile_len;
+    }
+    return static_cast<int64_t>(step);
+  }
+
+  // ----- Legacy path (beam > 32 / OASR_CTC_FUSED=0) -----
+  // Host-side counters drive the loop.  Blank frames simply increment
+  // ``frame_idx`` (no kernel launch).  Non-blank frames either (a) push the
+  // current ``(step, frame_idx)`` to the device counters + ``cudaGraphLaunch``
+  // (graph fast path), or (b) the same counter write + eager
+  // ``streaming_step_persistent``.
+
   // ----- Graph-captured fast path -----
   // When the caller opted in via ``use_cuda_graphs=1``, lazily capture the
-  // three per-state non-blank graphs (first / odd / even).  Each captured
-  // graph begins with an H2D ``cudaMemcpyAsync`` that refreshes the device
-  // counters from the per-state pinned host buffer; per non-blank frame we
-  // do one D2D for the log-prob slice + one ``cudaGraphLaunch``.  Falls
-  // through to the eager path on capture failure (graph cache not populated)
-  // so behaviour is safe by default.
+  // three per-state non-blank graphs (first / odd / even).  Per non-blank
+  // frame we do one by-value counter write + one D2D for the log-prob slice
+  // + one ``cudaGraphLaunch``.  Falls through to the eager path on capture
+  // failure (graph cache not populated) so behaviour is safe by default.
   CtcStreamGraphCache* cache = nullptr;
   if (use_cuda_graphs) {
     std::lock_guard<std::mutex> lock(g_ctc_graph_mutex);
@@ -522,11 +569,7 @@ int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk
   if (cache != nullptr) {
     const size_t lp_row_bytes = sizeof(float) * static_cast<size_t>(vocab_size);
     for (int t = 0; t < chunk_t; ++t) {
-      // No ``step >= max_seq_len`` cap: ``step`` counts decoded frames, which
-      // can exceed the output-token cap (max_seq_len) for long streams.
-      // ``select_seqs`` is a ring of width max_seq_len (kernels index it
-      // ``% max_seq_len``) and clen is capped in topk_phase2, so an unbounded
-      // step is safe.
+      // No ``step >= max_seq_len`` cap — see the fused-path comment above.
       if (mask_data && !mask_data[t]) {
         // Blank: host-only frame_idx increment.  The next non-blank's
         // captured H2D will push the updated value to the device.
@@ -567,13 +610,10 @@ int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk
   // Blanks: host-only ``++frame_idx`` (no kernel launch).  Non-blanks: one
   // ``set_stream_counters`` to refresh the device counters that the
   // step-aware kernels read via ``__ldg(d_step)``, then
-  // ``streaming_step_persistent`` (no internal counter advance).  Trades
-  // pre-Step-3's per-frame host scalar args for one extra counter launch per
-  // non-blank, but recovers the per-blank no-op behaviour that Step 3
-  // accidentally regressed.
+  // ``streaming_step_persistent`` (no internal counter advance).
   for (int t = 0; t < chunk_t; ++t) {
-    // No step cap — see the graph-path loop above; select_seqs is a ring and
-    // clen is capped in-kernel, so step may exceed max_seq_len safely.
+    // No step cap — see the fused-path comment above; select_seqs is a ring
+    // and clen is capped in-kernel, so step may exceed max_seq_len safely.
     if (mask_data && !mask_data[t]) {
       ++frame_idx;
       continue;
@@ -688,6 +728,27 @@ void ctc_beam_search_chunk_batched(TensorView state_ptrs,
 
   cudaStream_t stream = get_stream(log_prob_chunk.device());
 
+  // ----- Fused multi-frame batched path (beam <= 32) -----
+  // Groups of up to FusedStreamGroup::CAP streams decode CONCURRENTLY: per
+  // group and PREPASS_TILE tile, one batched vocab top-K pre-pass + one
+  // batched chunk kernel (grid = group x batch blocks), per-stream state
+  // reached via by-value byte deltas off the group's first stream.  The
+  // serial launch depth per engine step drops from N streams to
+  // ceil(N / CAP) groups.  No graphs, counter kernels, or per-frame copies.
+  if (ctc_decoder::step_uses_fused(static_cast<int>(beam))) {
+    cudaError_t cerr = ctc_decoder::streaming_decode_chunk_fused_batched(
+        state_ptr_array, n_streams, lp_data_all, batch_stride, seq_stride,
+        vocab_stride, chunk_t, mask_data_all, mask_stride0, steps_host,
+        frame_idxs_host, static_cast<int>(blank_id), -1, static_cast<int>(batch),
+        static_cast<int>(beam), static_cast<int>(vocab_size),
+        static_cast<int>(max_seq_len), static_cast<int>(use_paged_memory),
+        static_cast<int>(page_size), 0, stream);
+    TVM_FFI_ICHECK(cerr == cudaSuccess)
+        << "CTC batched fused chunk decode failed: " << cudaGetErrorString(cerr);
+    return;
+  }
+
+  // ----- Legacy path (beam > 32 / OASR_CTC_FUSED=0) -----
   // ----- Resolve graph caches up-front under one lock -----
   // Holding the mutex across all N lookups beats N independent acquisitions
   // and lets first-time captures on this engine step share the same critical
