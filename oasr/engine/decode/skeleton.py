@@ -42,9 +42,10 @@ class _AutoregressiveSkeleton(DecodeStrategy):
 
     consumes: ClassVar[str] = "hidden"
 
-    def __init__(self, config: "EngineConfig", detok: "Detokenizer") -> None:
+    def __init__(self, config: "EngineConfig", detok: "Detokenizer", model=None) -> None:
         self._config = config
         self._detok = detok
+        self._model = model
 
     def _unimplemented(self) -> "RequestOutput":
         raise NotImplementedError(
@@ -69,13 +70,6 @@ class _AutoregressiveSkeleton(DecodeStrategy):
 
     def finalize(self, request: Request) -> RequestOutput:
         self._unimplemented()
-
-
-@register_decode_strategy("transducer")
-class TransducerDecodeStrategy(_AutoregressiveSkeleton):
-    """RNNT / transducer (frame-synchronous prediction-net + joiner beam)."""
-
-    decode_type: ClassVar[str] = "transducer"
 
 
 @register_decode_strategy("aed")

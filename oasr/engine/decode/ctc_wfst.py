@@ -30,7 +30,7 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
     decode_type: ClassVar[str] = "ctc"
     consumes: ClassVar[str] = "log_probs"
 
-    def __init__(self, config: "EngineConfig", detok: "Detokenizer") -> None:
+    def __init__(self, config: "EngineConfig", detok: "Detokenizer", model=None) -> None:
         self._config = config
         self._detok = detok
 

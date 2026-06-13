@@ -62,7 +62,6 @@ class BaseDecoder(nn.Module, ABC):
         """Build the initial per-request decoder state for ``batch_size`` hyps."""
         raise NotImplementedError
 
-    @abstractmethod
     def step(
         self,
         prev_tokens: torch.Tensor,
@@ -71,6 +70,10 @@ class BaseDecoder(nn.Module, ABC):
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, DecoderState]:
         """One autoregressive step → ``(logits (B, V), new_state)``.
+
+        Optional generic AR entry point for label-synchronous drivers (AED /
+        LLM).  Frame-synchronous families (transducer) drive their predictor +
+        joiner directly from the decode strategy and need not implement this.
 
         Parameters
         ----------
@@ -82,7 +85,10 @@ class BaseDecoder(nn.Module, ABC):
         state : DecoderState
             The cache returned by the previous :meth:`step` / :meth:`init_state`.
         """
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement the generic step(); its "
+            "decode strategy drives it directly."
+        )
 
 
 class PredictionNetwork(nn.Module, ABC):

@@ -55,11 +55,20 @@ def test_ar_strategies_resolve_and_consume_hidden(dt):
     assert s.consumes == "hidden"
 
 
-@pytest.mark.parametrize("dt", ["transducer", "aed", "llm"])
-def test_ar_strategies_raise_not_implemented(dt):
+@pytest.mark.parametrize("dt", ["aed", "llm"])
+def test_aed_llm_skeletons_raise_not_implemented(dt):
     s = build_decode_strategy(dt, _stub_config(), Detokenizer(None, None))
     with pytest.raises(NotImplementedError):
         s.decode_offline(None, None)
+    with pytest.raises(NotImplementedError):
+        s.finalize(None)
+
+
+def test_transducer_offline_implemented_streaming_not():
+    # transducer is a real strategy now: decode_offline works (tested in
+    # test_transducer.py); only its streaming path is a follow-up.
+    s = build_decode_strategy("transducer", _stub_config(), Detokenizer(None, None))
+    assert type(s).__name__ == "TransducerDecodeStrategy"
     with pytest.raises(NotImplementedError):
         s.finalize(None)
 

@@ -29,6 +29,8 @@ import torch
 from ..request import Request, RequestOutput
 
 if TYPE_CHECKING:
+    from oasr.models.base import BaseAsrModel
+
     from ..config import EngineConfig
     from .detokenize import Detokenizer
 
@@ -121,11 +123,16 @@ def _strategy_name(decode_type: str, config: "EngineConfig") -> str:
 
 
 def build_decode_strategy(
-    decode_type: str, config: "EngineConfig", detok: "Detokenizer"
+    decode_type: str,
+    config: "EngineConfig",
+    detok: "Detokenizer",
+    model: "BaseAsrModel" = None,
 ) -> DecodeStrategy:
     """Construct the decode strategy for a model's ``decode_type``.
 
-    Raises ``NotImplementedError`` with the available names when the family /
+    ``model`` is threaded through so autoregressive strategies can reach
+    ``model.decoder`` / ``model.joiner`` (CTC strategies ignore it).  Raises
+    ``NotImplementedError`` with the available names when the family /
     ``decoder_type`` has no registered strategy (the extension point for new
     decode families).
     """
@@ -137,4 +144,4 @@ def build_decode_strategy(
             f"(resolved name {name!r}).  Registered: {sorted(_REGISTRY)}.  "
             "Add one by subclassing DecodeStrategy + @register_decode_strategy."
         )
-    return cls(config, detok)
+    return cls(config, detok, model)
