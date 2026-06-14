@@ -1018,6 +1018,7 @@ def _ensure_backends_registered() -> None:
     """Import backend modules to trigger registration."""
     from .backends import conv2d as _conv2d_backends  # noqa: F401
     from .backends import gemm as _gemm_backends  # noqa: F401
+    from .backends import torch_gemm as _torch_gemm_backends  # noqa: F401
 
 
 def is_tuning_enabled() -> bool:

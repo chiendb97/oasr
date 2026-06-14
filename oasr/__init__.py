@@ -257,3 +257,10 @@ __all__ = [
     "ActivationType",
     "NormType",
 ]
+
+# Opt-in GEMM-shape capture: if OASR_CAPTURE_GEMM=<path> is set, wrap the
+# functional GEMM entries to record real (op, M, N, K) shapes and dump on exit.
+# Cheap no-op otherwise.
+from .tune.capture import maybe_autostart as _maybe_autostart_capture
+
+_maybe_autostart_capture()
