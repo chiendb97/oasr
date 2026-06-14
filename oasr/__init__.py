@@ -21,6 +21,7 @@ from .activation import (
 )
 from .norm import (
     layer_norm, rms_norm, bias_norm, batch_norm_1d, group_norm, add_layer_norm,
+    add_layer_norm_residual,
     layer_norm_activation, rms_norm_activation, batch_norm_activation, batch_norm_swish,
     cmvn,
 )
@@ -178,6 +179,7 @@ __all__ = [
     "batch_norm_1d",
     "group_norm",
     "add_layer_norm",
+    "add_layer_norm_residual",
     "layer_norm_activation",
     "rms_norm_activation",
     "batch_norm_activation",

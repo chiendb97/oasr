@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import List, Mapping, Optional, Tuple, Union
 
 import torch
@@ -31,6 +32,14 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+
+
+# Rollback / A-B-parity switch for the fused add+LayerNorm encoder-layer path
+# (folds each pre-norm residual-add + scale into the following LayerNorm via
+# ``oasr.add_layer_norm_residual``).  Decode-identical to the per-op path; set
+# ``OASR_FUSED_ADDNORM=0`` before process start to force the legacy per-op
+# residual adds.  Read once at import so it is stable across CUDA-graph capture.
+_FUSED_ADDNORM_ENABLED = os.environ.get("OASR_FUSED_ADDNORM", "1") != "0"
 
 
 def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -581,6 +590,69 @@ class ConformerEncoderLayer(nn.Module):
             self.norm_conv = None
             self.norm_final = None
 
+        # Eligibility for the fused add+LayerNorm fast path: the standard
+        # pre-norm macaron+conv Conformer block where every norm folded into is
+        # a :class:`~oasr.layers.norm.LayerNorm` (so ``add_layer_norm_residual``
+        # applies).  Other configs (post-norm, no macaron/conv, rms/batch norm)
+        # use the original per-op path unchanged.
+        self._fused_addnorm = (
+            _FUSED_ADDNORM_ENABLED
+            and self.normalize_before
+            and self.feed_forward_macaron is not None
+            and self.conv_module is not None
+            and all(
+                isinstance(n, LayerNorm)
+                for n in (self.norm_mha, self.norm_conv, self.norm_ff, self.norm_final)
+            )
+        )
+
+    def _forward_fused(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        pos_emb: torch.Tensor,
+        mask_pad: torch.Tensor,
+        att_cache: Union[PagedKVCache, None],
+        cnn_cache: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Union[PagedKVCache, None], torch.Tensor]:
+        """Pre-norm macaron+conv forward with each residual-add folded into the
+        following LayerNorm (``oasr.add_layer_norm_residual``).
+
+        Bit-identical to :meth:`forward`'s general path: the fused kernel
+        computes ``s = residual + ff_scale * sublayer`` and ``LayerNorm(s)`` in
+        one launch, returning ``s`` as the carried residual.  Removes the four
+        standalone residual adds and the two macaron/FFN scale-muls per layer.
+        """
+        # Macaron FFN: the first norm has no preceding residual-add to fold, so
+        # it stays standalone; its add folds into ``norm_mha``.
+        residual = x
+        x = self.norm_ff_macaron(x)
+        mac_out = self.feed_forward_macaron(x)
+        x, residual = oasr.add_layer_norm_residual(
+            mac_out, residual, self.norm_mha.weight, self.norm_mha.bias,
+            self.norm_mha.eps, self.ff_scale,
+        )
+        # Self-attention: add folds into ``norm_conv``.
+        x_att, new_att_cache = self.self_attn(x, mask, pos_emb, att_cache)
+        x, residual = oasr.add_layer_norm_residual(
+            x_att, residual, self.norm_conv.weight, self.norm_conv.bias,
+            self.norm_conv.eps, 1.0,
+        )
+        # Convolution: add folds into ``norm_ff``.
+        x_conv, new_cnn_cache = self.conv_module(x, mask_pad, cnn_cache)
+        x, residual = oasr.add_layer_norm_residual(
+            x_conv, residual, self.norm_ff.weight, self.norm_ff.bias,
+            self.norm_ff.eps, 1.0,
+        )
+        # FFN: add folds into ``norm_final`` (the carried residual is no longer
+        # needed, so the sum output is discarded).
+        ff_out = self.feed_forward(x)
+        x, _ = oasr.add_layer_norm_residual(
+            ff_out, residual, self.norm_final.weight, self.norm_final.bias,
+            self.norm_final.eps, self.ff_scale,
+        )
+        return x, new_att_cache, new_cnn_cache
+
     def forward(
         self,
         x: torch.Tensor,
@@ -590,6 +662,8 @@ class ConformerEncoderLayer(nn.Module):
         att_cache: Union[PagedKVCache, None] = None,
         cnn_cache: torch.Tensor = torch.zeros(0, 0, 0),
     ) -> Tuple[torch.Tensor, Union[PagedKVCache, None], torch.Tensor]:
+        if self._fused_addnorm:
+            return self._forward_fused(x, mask, pos_emb, mask_pad, att_cache, cnn_cache)
         if self.feed_forward_macaron is not None:
             residual = x
             if self.normalize_before:
@@ -640,7 +714,7 @@ class ConformerEncoderLayer(nn.Module):
             residual = x
             if self.normalize_before:
                 x = self.norm_ff_macaron(x)
-            x = residual + self.ff_scale * self.feed_forward_macaron(x)
+            x = torch.add(residual, self.feed_forward_macaron(x), alpha=self.ff_scale)
             if not self.normalize_before:
                 x = self.norm_ff_macaron(x)
         residual = x
@@ -661,7 +735,7 @@ class ConformerEncoderLayer(nn.Module):
         residual = x
         if self.normalize_before:
             x = self.norm_ff(x)
-        x = residual + self.ff_scale * self.feed_forward(x)
+        x = torch.add(residual, self.feed_forward(x), alpha=self.ff_scale)
         if not self.normalize_before:
             x = self.norm_ff(x)
         if self.conv_module is not None:

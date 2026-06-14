@@ -184,6 +184,53 @@ def add_layer_norm(
 
 
 @oasr_api
+def add_layer_norm_residual(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+    alpha: float = 1.0,
+    out: Optional[torch.Tensor] = None,
+    residual_out: Optional[torch.Tensor] = None,
+):
+    """Fused Add + LayerNorm that also returns the un-normalized sum.
+
+    Computes, in a single kernel launch::
+
+        s   = residual + alpha * input
+        out = LayerNorm(s)            # == s normalized, scaled, shifted
+
+    and returns ``(out, s)``.  ``s`` is the value a pre-norm residual stream
+    carries forward, so this folds the per-sublayer ``x = residual + a*sub(x)``
+    add (and its scale) into the *following* LayerNorm with no extra elementwise
+    kernels.  Bit-identical to ``layer_norm(residual + alpha * input)``.
+
+    Args:
+        input: Sub-layer output ``[..., hidden]``.
+        residual: Residual stream ``[..., hidden]``.
+        weight: LayerNorm scale ``[hidden]``.
+        bias: LayerNorm offset ``[hidden]`` (optional).
+        eps: Epsilon for numerical stability.
+        alpha: Scale applied to ``input`` before the residual add.
+        out: Optional pre-allocated normalized output tensor.
+        residual_out: Optional pre-allocated sum (``s``) output tensor.
+
+    Returns:
+        ``(out, residual_out)`` — the normalized tensor and the un-normalized
+        residual sum, both shaped like ``input``.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    if residual_out is None:
+        residual_out = torch.empty_like(input)
+    _get_norm_module().addlayernorm_residual(
+        out, residual_out, input, residual, weight, bias, eps, alpha
+    )
+    return out, residual_out
+
+
+@oasr_api
 def layer_norm_activation(
     input: torch.Tensor,
     weight: torch.Tensor,

@@ -382,6 +382,108 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
 }
 
 // =============================================================================
+// Fused Add + LayerNorm with residual passthrough
+//
+// Computes, per row:
+//     s        = residual + alpha * input          (stored to residual_out)
+//     output   = LayerNorm(s) * weight + bias
+// ``residual_out`` carries the *unnormalized* sum so the caller can chain it
+// as the residual for the next pre-norm sub-layer (Conformer / Transformer
+// pre-norm pattern).  ``s`` is materialised once in ``residual_out`` and the
+// mean / variance / normalize passes read it back, so the output is bit-
+// identical to ``layer_norm(residual + alpha * input)`` performed by two
+// separate ops — but in a single launch with one fewer DRAM round-trip of the
+// intermediate sum.
+// =============================================================================
+
+template <typename T, int VecSize>
+__global__ void addLayerNormResidualKernel(const T* __restrict__ input,
+                                           const T* __restrict__ residual,
+                                           T* __restrict__ output,
+                                           T* __restrict__ residual_out,
+                                           const T* __restrict__ weight,
+                                           const T* __restrict__ bias, int hidden_size, float eps,
+                                           float alpha) {
+    using VecT = oasr::Vec<T, VecSize>;
+
+    const int row_idx = blockIdx.x;
+    const T* row_input = input + row_idx * hidden_size;
+    const T* row_residual = residual + row_idx * hidden_size;
+    T* row_output = output + row_idx * hidden_size;
+    T* row_res_out = residual_out + row_idx * hidden_size;
+
+    const int vec_hidden_size = hidden_size / VecSize;
+
+    __shared__ float smem[2];
+
+    // Phase 0: materialise s = residual + alpha * input into residual_out so
+    // the subsequent passes (and the caller's next sub-layer) read one tensor.
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_res, v_s;
+        v_in.load(row_input + i * VecSize);
+        v_res.load(row_residual + i * VecSize);
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            v_s[j] = static_cast<T>(static_cast<float>(v_res[j]) +
+                                    alpha * static_cast<float>(v_in[j]));
+        }
+        v_s.store(row_res_out + i * VecSize);
+    }
+
+    // Phase 1: mean of s.
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_s;
+        v_s.load(row_res_out + i * VecSize);
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            local_sum += static_cast<float>(v_s[j]);
+        }
+    }
+    float mean =
+        blockBroadcast(blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
+
+    // Phase 2: variance of s.
+    float local_var = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_s;
+        v_s.load(row_res_out + i * VecSize);
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            float diff = static_cast<float>(v_s[j]) - mean;
+            local_var = std::fmaf(diff, diff, local_var);
+        }
+    }
+    float inv_std = rsqrtf(
+        blockBroadcast(blockReduceSum(local_var) / static_cast<float>(hidden_size), &smem[1]) +
+        eps);
+
+    // Phase 3: normalize + affine.
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_s, v_weight;
+        v_s.load(row_res_out + i * VecSize);
+        v_weight.load(weight + i * VecSize);
+
+        oasr::Vec<float, VecSize> vals;
+#pragma unroll
+        for (int j = 0; j < VecSize; j++) {
+            vals[j] = (static_cast<float>(v_s[j]) - mean) * inv_std * static_cast<float>(v_weight[j]);
+        }
+
+        if (bias != nullptr) {
+            VecT v_bias;
+            v_bias.load(bias + i * VecSize);
+#pragma unroll
+            for (int j = 0; j < VecSize; j++) {
+                vals[j] += static_cast<float>(v_bias[j]);
+            }
+        }
+
+        oasr::vecCast<T>(vals).store(row_output + i * VecSize);
+    }
+}
+
+// =============================================================================
 // Activation Dispatch Helper
 // =============================================================================
 
@@ -820,6 +922,33 @@ cudaError_t AddLayerNorm(const T* input, const T* residual, const T* weight, con
         int block_size = alignedBlockSize(static_cast<int>(hidden_size));
         addLayerNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
             input, residual, output, weight, bias, static_cast<int>(hidden_size), eps);
+    }
+    return cudaGetLastError();
+}
+
+// ---- AddLayerNormResidual ----
+
+template <typename T>
+cudaError_t AddLayerNormResidual(const T* input, const T* residual, const T* weight, const T* bias,
+                                 T* output, T* residual_out, unsigned int num_rows,
+                                 unsigned int hidden_size, float eps, float alpha,
+                                 cudaStream_t stream) {
+    constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
+
+    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
+                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(residual) &&
+                   isAligned<T, VecSize>(output) && isAligned<T, VecSize>(residual_out);
+
+    if (use_vec) {
+        int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
+        addLayerNormResidualKernel<T, VecSize><<<num_rows, block_size, 0, stream>>>(
+            input, residual, output, residual_out, weight, bias, static_cast<int>(hidden_size), eps,
+            alpha);
+    } else {
+        int block_size = alignedBlockSize(static_cast<int>(hidden_size));
+        addLayerNormResidualKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
+            input, residual, output, residual_out, weight, bias, static_cast<int>(hidden_size), eps,
+            alpha);
     }
     return cudaGetLastError();
 }

@@ -168,6 +168,35 @@ class TestAddLayerNorm:
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
 
+class TestAddLayerNormResidual:
+    """Tests for oasr.add_layer_norm_residual() (fused add+LN + residual sum)."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    @pytest.mark.parametrize("alpha", [1.0, 0.5])
+    @pytest.mark.parametrize("has_bias", [True, False])
+    def test_add_layer_norm_residual(self, dtype, alpha, has_bias):
+        batch_size, seq_len, hidden_size = 2, 128, 256
+        eps = 1e-5
+        x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+        residual = torch.randn_like(x)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+        bias = torch.randn(hidden_size, device="cuda", dtype=dtype) if has_bias else None
+
+        out, res_out = oasr.add_layer_norm_residual(
+            x, residual, weight, bias, eps, alpha
+        )
+
+        # Reference matches the unfused pre-norm path: the residual sum is
+        # materialised in-dtype (s = residual + alpha*x), then LayerNorm(s).
+        s_ref = residual + alpha * x
+        expected = torch.nn.functional.layer_norm(s_ref, (hidden_size,), weight, bias, eps)
+
+        # The carried residual sum is bit-exact to the in-dtype add.
+        torch.testing.assert_close(res_out, s_ref, rtol=0, atol=0)
+        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
+        torch.testing.assert_close(out, expected, rtol=rtol, atol=atol)
+
+
 def _ref_bias_norm(x: torch.Tensor, bias: torch.Tensor, log_scale: torch.Tensor) -> torch.Tensor:
     """icefall BiasNorm reference (channel_dim == -1), computed in fp32."""
     xf = x.float()
