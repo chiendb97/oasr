@@ -301,11 +301,12 @@ def benchmark_shape(shape: RepShape, warmup: int, rep: int) -> Optional[List[Tac
 
 def _cutlass_literal(tactic, sm: int) -> str:
     d = dict(tactic.config)
+    extra = ", stream_k=True" if d.get("stream_k", 0) else ""
     return (
         "CutlassGemmConfig("
         f"block_m={d['block_m']}, block_n={d['block_n']}, block_k={d['block_k']}, "
         f"warp_m={d['warp_m']}, warp_n={d['warp_n']}, warp_k={d['warp_k']}, "
-        f"kStages={d['kStages']}, kSmVersion={sm}, split_k={d.get('split_k', 1)})"
+        f"kStages={d['kStages']}, kSmVersion={sm}, split_k={d.get('split_k', 1)}{extra})"
     )
 
 
@@ -376,10 +377,13 @@ def print_report(per_shape, reps, sm) -> None:
         w = _pick_winner(res)
         d = next((t for t in res if t.is_default), None)
         sp = (d.median_ms / w.median_ms) if d and w.median_ms > 0 else float("nan")
-        wname = w.tactic.backend if w.tactic.backend == "torch" else \
-            f"cutlass {dict(w.tactic.config).get('block_m')}x" \
-            f"{dict(w.tactic.config).get('block_n')}s{dict(w.tactic.config).get('kStages')}" \
-            f"k{dict(w.tactic.config).get('split_k')}"
+        if w.tactic.backend == "torch":
+            wname = "torch"
+        else:
+            _c = dict(w.tactic.config)
+            _sk = "sk" if _c.get("stream_k", 0) else ""
+            wname = (f"cutlass {_c.get('block_m')}x{_c.get('block_n')}"
+                     f"s{_c.get('kStages')}k{_c.get('split_k')}{_sk}")
         mm = "inf" if r.m_max is None else str(r.m_max)
         print(f"{r.op:16} {r.N:>6} {r.K:>6} {r.M:>7} {mm:>7}  "
               f"{wname:>26} {w.median_ms:>9.4f} "

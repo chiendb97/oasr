@@ -150,6 +150,9 @@ def _make_bmm_runner(cfg: Union[CutlassGemmConfig, CutlassGemmConfigSm90]):
 
 
 for _cfg in _all_autotune_configs.values():
+    # Stream-K is a GEMM-only template path; bmm has no Stream-K variants.
+    if getattr(_cfg, "stream_k", False):
+        continue
     _tactic = Tactic("cutlass", config=_cfg.to_tactic_config())
     _is_default = (_cfg.compile_name == _GEMM_DEFAULT.compile_name
                    and getattr(_cfg, "split_k", 1) == 1)
@@ -180,6 +183,9 @@ def _make_group_gemm_runner(cfg: Union[CutlassGemmConfig, CutlassGemmConfigSm90]
 
 
 for _cfg in _all_autotune_configs.values():
+    # Stream-K is a GEMM-only template path; group_gemm has no Stream-K variants.
+    if getattr(_cfg, "stream_k", False):
+        continue
     _tactic = Tactic("cutlass", config=_cfg.to_tactic_config())
     _is_default = (_cfg.compile_name == _GEMM_DEFAULT.compile_name
                    and getattr(_cfg, "split_k", 1) == 1)

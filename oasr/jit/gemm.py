@@ -73,6 +73,7 @@ class CutlassGemmConfig:
     kStages: int
     kSmVersion: int
     split_k: int = 1          # runtime split-K factor (1 = disabled)
+    stream_k: bool = False    # Stream-K decomposition (compile-time; thin-GEMM fill)
 
     @property
     def name(self) -> str:
@@ -83,20 +84,24 @@ class CutlassGemmConfig:
         parts.append(f"s{self.kStages}")
         if self.split_k != 1:
             parts.append(f"spk{self.split_k}")
+        if self.stream_k:
+            parts.append("sk")
         return "_".join(parts)
 
     @property
     def compile_name(self) -> str:
         """Config name used as the compiled binary key.
 
-        Encodes tile shape, warp shape, and kStages (all compile-time
-        template parameters).  Excludes ``split_k`` (runtime argument)
-        so variants differing only in split-K share a single compiled ``.so``.
+        Encodes tile shape, warp shape, kStages, and the Stream-K flag (all
+        compile-time template parameters).  Excludes ``split_k`` (runtime
+        argument) so variants differing only in split-K share a single ``.so``.
         """
         parts = [f"sm{self.kSmVersion}"]
         parts.append(f"b{self.block_m}x{self.block_n}x{self.block_k}")
         parts.append(f"w{self.warp_m}x{self.warp_n}x{self.warp_k}")
         parts.append(f"s{self.kStages}")
+        if self.stream_k:
+            parts.append("sk")
         return "_".join(parts)
 
     @property
@@ -114,6 +119,7 @@ class CutlassGemmConfig:
             ("warp_k", self.warp_k),
             ("kStages", self.kStages),
             ("split_k", self.split_k),
+            ("stream_k", int(self.stream_k)),
         ]
         return tuple(items)
 
@@ -422,14 +428,59 @@ def _get_sm100_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
     return seen
 
 
+# Stream-K variants are part of the autotune candidate space by default, so
+# ``oasr.autotune()`` can select them where they win — e.g. deep-K thin GEMMs, or
+# other models / GPUs where the data-parallel grid starves the SMs.  On the
+# captured ASR workload they narrow the data-parallel→cuBLAS gap but don't beat
+# cuBLAS (see scripts/tune_asr_gemm.py), so the production heuristic rules don't
+# reference them — but they remain tunable.  Set OASR_GEMM_STREAMK=0 for a leaner
+# production build that never autotunes (skips compiling the Stream-K kernels).
+_STREAMK_ENABLED = os.environ.get("OASR_GEMM_STREAMK", "1") != "0"
+
+# Curated tile set for Stream-K variants.  Stream-K helps when there are too few
+# output tiles to fill the GPU (small M, N=256, large K), so we cover small
+# block_m tiles plus a couple of large tiles for the single-output-tile case.
+_STREAMK_TILES: List[TileShape] = [
+    TileShape(block_m=16,  block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=32,  block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64),
+    TileShape(block_m=64,  block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64),
+    TileShape(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=64, warp_k=64),
+    TileShape(block_m=128, block_n=256, block_k=64, warp_m=64, warp_n=64, warp_k=64),
+]
+
+
+def _build_streamk_configs(
+    sm: int, tiles: List[TileShape], stage_list: List[int], smem_limit: int
+) -> Dict[str, CutlassGemmConfig]:
+    """Build Stream-K GEMM configs (split_k=1; the swizzle balances K across SMs)."""
+    seen: Dict[str, CutlassGemmConfig] = {}
+    for tile in tiles:
+        for kStages in stage_list:
+            if _smem_bytes(tile.block_m, tile.block_n, tile.block_k, kStages) > smem_limit:
+                continue
+            cfg = CutlassGemmConfig(
+                block_m=tile.block_m, block_n=tile.block_n, block_k=tile.block_k,
+                warp_m=tile.warp_m, warp_n=tile.warp_n, warp_k=tile.warp_k,
+                kStages=kStages, kSmVersion=sm, split_k=1, stream_k=True,
+            )
+            seen[cfg.name] = cfg
+    return seen
+
+
 def _get_sm120_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
     """SM120 (GeForce Blackwell / RTX 50 series) configs.
 
     The CUTLASS 3.x SM120 CollectiveBuilder supports only F8/F6/F4 MMA, so
     FP16/BF16 GEMM on SM120 is routed through the CUTLASS 2.x tensor-op path
     using the Sm80 forward-compatible instructions (mma.sync.aligned.m16n8k16).
+
+    Also includes Stream-K variants (gemm family only — see ``_render_all_variants``
+    and the backend registration, which confine Stream-K configs to GEMM).
     """
-    return _build_sm_lt90_configs(sm, TileShapeConfigs, [3, 4], [1, 2, 4], _SM_MAX_SMEM_BYTES[120])
+    cfgs = _build_sm_lt90_configs(sm, TileShapeConfigs, [3, 4], [1, 2, 4], _SM_MAX_SMEM_BYTES[120])
+    if _STREAMK_ENABLED:
+        cfgs.update(_build_streamk_configs(sm, _STREAMK_TILES, [3], _SM_MAX_SMEM_BYTES[120]))
+    return cfgs
 
 
 def get_all_autotune_configs(
@@ -508,6 +559,11 @@ def _render_all_variants(
     source_paths = []
 
     for config_name, cfg in unique_configs.items():
+        # Stream-K is implemented in the GEMM template only; skip SK configs for
+        # bmm / group_gemm (their templates have no Stream-K path).
+        if family != "gemm" and getattr(cfg, "stream_k", False):
+            continue
+
         func_name = f"{family}_{config_name}"
         variant_file_name = f"{family}_sm{sm}_{config_name}"
 
@@ -524,6 +580,7 @@ def _render_all_variants(
                 warp_k=cfg.warp_k,
                 stages=cfg.kStages,
                 sm_version=sm,
+                stream_k=getattr(cfg, "stream_k", False),
                 with_activation=with_activation,
             )
         else:
