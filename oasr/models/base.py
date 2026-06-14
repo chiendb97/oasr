@@ -33,6 +33,13 @@ from torch import nn
 if TYPE_CHECKING:
     from oasr.cache.paged_kv import PagedKVCache
     from oasr.cache.slot_cnn import SlotCnnCache
+    from oasr.models.decoders import BaseDecoder
+
+# Streaming-cache model an encoder uses, read by the engine to select a
+# ``StreamingEncoderBackend``.  Values: "paged" (engine paged-KV + slot-CNN,
+# Conformer-style), "stateful" (encoder owns per-layer recurrent state,
+# Zipformer-style), "none" (offline-only).  Kept a plain ``str``.
+StreamingKind = str
 
 # Decode-path selector. ``OutputProcessor`` dispatches on this. Kept as a plain
 # ``str`` (values: "ctc", "transducer", "aed") so heads can declare it without
@@ -104,9 +111,7 @@ class BaseEncoder(nn.Module, ABC):
     supports_paged_streaming: bool = False
 
     @abstractmethod
-    def forward(
-        self, xs: torch.Tensor, xs_lens: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Offline forward → ``(hidden (B, T_out, D), masks (B, 1, T_out) bool)``."""
         raise NotImplementedError
 
@@ -126,18 +131,14 @@ class BaseEncoder(nn.Module, ABC):
         = True``).  Other encoders expose their own streaming API.
         """
         del xs, offset, att_caches, cnn_cache, att_mask, cache_t1
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support paged-KV streaming"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support paged-KV streaming")
 
     def forward_packed(
         self, xs: torch.Tensor, xs_lens: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sequence-packing offline forward (optional).  Default: unsupported."""
         del xs, xs_lens
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support sequence packing"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support sequence packing")
 
     # -- introspection used to build CacheSpec ------------------------------
     @property
@@ -169,6 +170,61 @@ class BaseEncoder(nn.Module, ABC):
         """Depthwise-conv kernel for streaming left-context; 1 == no CNN cache."""
         return 1
 
+    # -- streaming spec (read by the engine to pick a StreamingEncoderBackend) --
+    @property
+    def streaming_kind(self) -> "StreamingKind":
+        """Streaming-cache model this encoder uses.
+
+        ``"paged"`` — the engine's paged-KV + slot-CNN cache (Conformer-style);
+        the encoder implements :meth:`forward_chunk_paged`.
+        ``"stateful"`` — the encoder owns per-layer recurrent state
+        (Zipformer-style); it implements :meth:`get_streaming_init_states` /
+        :meth:`streaming_forward` instead.
+        ``"none"`` — offline only.
+
+        Default derives from :attr:`supports_paged_streaming`; stateful encoders
+        override this to return ``"stateful"``.
+        """
+        return "paged" if self.supports_paged_streaming else "none"
+
+    @property
+    def subsampling_rate(self) -> int:
+        """Total temporal subsampling factor (input frames per encoder frame)."""
+        return 1
+
+    @property
+    def right_context(self) -> int:
+        """Extra future input frames the subsampling needs beyond one chunk."""
+        return 0
+
+    # -- stateful streaming (``streaming_kind == "stateful"`` encoders) --------
+    def get_streaming_init_states(
+        self,
+        batch_size: int = 1,
+        device: torch.device = torch.device("cpu"),
+        dtype: torch.dtype = torch.float32,
+    ) -> List[torch.Tensor]:
+        """Initial per-request streaming state for a stateful encoder.
+
+        Default: unsupported.  Only ``streaming_kind == "stateful"`` encoders
+        implement this (paged encoders use :meth:`forward_chunk_paged`).
+        """
+        del batch_size, device, dtype
+        raise NotImplementedError(f"{type(self).__name__} does not expose a stateful streaming API")
+
+    def streaming_forward(
+        self,
+        xs: torch.Tensor,
+        xs_lens: torch.Tensor,
+        states: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Stateful chunk forward → ``(hidden (B, chunk, D), out_lens, new_states)``.
+
+        Default: unsupported (see :meth:`get_streaming_init_states`).
+        """
+        del xs, xs_lens, states
+        raise NotImplementedError(f"{type(self).__name__} does not expose a stateful streaming API")
+
     @property
     def cache_spec(self) -> CacheSpec:
         """Streaming cache descriptor derived from the live encoder dims."""
@@ -195,6 +251,13 @@ class BaseAsrModel(nn.Module, ABC):
 
     encoder: BaseEncoder
     head: BaseHead
+    # Autoregressive decoder (transducer / AED / LLM).  CTC models leave this
+    # unset and use :attr:`head` instead; AR model subclasses register
+    # ``self.decoder = <BaseDecoder>`` in ``__init__``.  Declared as a bare
+    # annotation (no class-level value) so it never shadows the registered
+    # submodule via ``nn.Module.__getattr__``; read it with
+    # ``getattr(self, "decoder", None)``.
+    decoder: Optional["BaseDecoder"]
 
     # -- construction & weights --------------------------------------------
     @classmethod
@@ -203,10 +266,22 @@ class BaseAsrModel(nn.Module, ABC):
         """Build a model (random weights) from its config + format aux buffers."""
         raise NotImplementedError
 
+    @classmethod
+    def from_pretrained(cls, model_id_or_path: str, **kwargs: Any) -> "BaseAsrModel":
+        """Load a weight-loaded model from a local dir or HuggingFace Hub id.
+
+        Thin convenience wrapper over :func:`oasr.models.from_pretrained` that
+        **auto-detects** the architecture from the checkpoint (so the concrete
+        subclass it is called on is advisory).  Returns the model only; use the
+        module-level function if you also need the config object.
+        """
+        from oasr.models.loaders import from_pretrained as _from_pretrained
+
+        model, _config = _from_pretrained(model_id_or_path, **kwargs)
+        return model
+
     @abstractmethod
-    def load_weights(
-        self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False
-    ) -> None:
+    def load_weights(self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False) -> None:
         """Map an external checkpoint state-dict into this model's parameters.
 
         Each architecture owns the name-mapping / fusion knowledge (vLLM-style);
@@ -221,7 +296,19 @@ class BaseAsrModel(nn.Module, ABC):
         return self.encoder.cache_spec
 
     @property
+    def streaming_kind(self) -> "StreamingKind":
+        """Streaming-cache model (delegates to the encoder)."""
+        return self.encoder.streaming_kind
+
+    @property
     def decode_type(self) -> DecodeType:
+        """Decode family driving the engine's ``DecodeStrategy``.
+
+        AR models declare it via :attr:`decoder`; CTC models via :attr:`head`.
+        """
+        decoder = getattr(self, "decoder", None)
+        if decoder is not None:
+            return decoder.decode_type
         return self.head.decode_type
 
     # -- engine-facing forward entry points --------------------------------
@@ -230,23 +317,58 @@ class BaseAsrModel(nn.Module, ABC):
         """``(B, 1, T)`` bool mask → ``(B,)`` int32 valid output lengths."""
         return masks.squeeze(1).sum(dim=-1).to(torch.int32)
 
-    def forward_offline(
+    # -- encoder-only (acoustic hidden states; AR decode strategies use these) --
+    def encode_offline(
         self, features: torch.Tensor, lengths: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Batched offline forward → ``(log_probs (B, T, V), out_lengths (B,))``."""
-        hidden, masks = self.encoder(features, lengths)
-        return self.head(hidden), self._lengths_from_mask(masks)
+        """Batched offline encode → ``(hidden (B, T, D), out_lengths (B,))``.
 
-    def forward_offline_packed(
+        Returns the raw encoder hidden states (no head/decoder).  CTC decoding
+        goes through :meth:`forward_offline` (encoder+head fused for the
+        CUDA-graph fast path); autoregressive families consume this hidden.
+        """
+        hidden, masks = self.encoder(features, lengths)
+        return hidden, self._lengths_from_mask(masks)
+
+    def encode_offline_packed(
         self, features: torch.Tensor, lengths: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sequence-packing offline forward → ``(log_probs, out_lengths)``."""
+        """Sequence-packing offline encode → ``(hidden, out_lengths)``."""
         if not self.encoder.supports_packing:
             raise NotImplementedError(
                 f"{type(self).__name__} encoder does not support sequence packing"
             )
         hidden, masks = self.encoder.forward_packed(features, lengths)
-        return self.head(hidden), self._lengths_from_mask(masks)
+        return hidden, self._lengths_from_mask(masks)
+
+    def encode_chunk_paged(
+        self,
+        input_features: torch.Tensor,
+        offset: Union[int, torch.Tensor],
+        att_caches: List["PagedKVCache"],
+        cnn_cache: "SlotCnnCache",
+        att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
+        cache_t1: int = -1,
+    ) -> torch.Tensor:
+        """Streaming chunk encode → encoder hidden ``(B, chunk, D)`` (no head)."""
+        return self.encoder.forward_chunk_paged(
+            input_features, offset, att_caches, cnn_cache, att_mask, cache_t1
+        )
+
+    # -- encoder + head fused (CTC fast path; CUDA-graph captured) -------------
+    def forward_offline(
+        self, features: torch.Tensor, lengths: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Batched offline forward → ``(log_probs (B, T, V), out_lengths (B,))``."""
+        hidden, out_lengths = self.encode_offline(features, lengths)
+        return self.head(hidden), out_lengths
+
+    def forward_offline_packed(
+        self, features: torch.Tensor, lengths: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sequence-packing offline forward → ``(log_probs, out_lengths)``."""
+        hidden, out_lengths = self.encode_offline_packed(features, lengths)
+        return self.head(hidden), out_lengths
 
     def forward_chunk_paged(
         self,
@@ -258,7 +380,7 @@ class BaseAsrModel(nn.Module, ABC):
         cache_t1: int = -1,
     ) -> torch.Tensor:
         """Streaming chunk forward → head output ``(B, chunk, V)``."""
-        hidden = self.encoder.forward_chunk_paged(
+        hidden = self.encode_chunk_paged(
             input_features, offset, att_caches, cnn_cache, att_mask, cache_t1
         )
         return self.head(hidden)

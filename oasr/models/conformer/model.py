@@ -813,6 +813,16 @@ class ConformerEncoder(BaseEncoder):
         """Depthwise-conv kernel for streaming left-context; 1 == no CNN cache."""
         return self._conv_kernel_size
 
+    @property
+    def subsampling_rate(self) -> int:
+        """Total temporal subsampling factor from the input subsampling module."""
+        return self.embed.subsampling_rate
+
+    @property
+    def right_context(self) -> int:
+        """Future input frames the subsampling needs beyond one chunk window."""
+        return self.embed.right_context
+
     # ------------------------------------------------------------------
     # Paged-cache forward
     # ------------------------------------------------------------------

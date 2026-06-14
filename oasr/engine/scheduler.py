@@ -28,6 +28,12 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
+from .batching import (
+    build_batching_policy,
+    build_partition_policy,
+    snap_to_preferred,
+    sort_by_length,
+)
 from .config import EngineConfig
 from .request import Request, RequestState
 
@@ -92,6 +98,11 @@ class Scheduler:
         self._index: Dict[str, Request] = {}
         self._next_stream_id: int = 0
 
+        # Pluggable offline batch-selection + micro-batch partition policies.
+        # New policies plug in via the batching registries — no scheduler edits.
+        self._batching_policy = build_batching_policy(config)
+        self._partition_policy = build_partition_policy(config)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -118,8 +129,11 @@ class Scheduler:
         an empty list when no batch is ready.  Each batch is admitted-then-
         finalised in the same step; offline requests never enter
         ``_running`` (that pool tracks streaming admissions only).
+
+        Batch *selection* is delegated to the configured
+        :class:`~oasr.engine.batching.BatchingPolicy` (fcfs / bucket / sjf).
         """
-        batch = self._build_offline_batch()
+        batch = self._batching_policy.select_offline_batch(self._offline_waiting, self._config)
         for req in batch:
             req.state = RequestState.RUNNING
         return batch
@@ -139,14 +153,13 @@ class Scheduler:
         input index of the request at flat output position ``pos`` — the caller
         uses it to restore arrival order after the length sort.  ``orig_indices``
         is ``None`` when no reordering was applied (single-chunk fast path).
+
+        The *how* (count / frames / packing) is delegated to the configured
+        :class:`~oasr.engine.batching.PartitionPolicy`.
         """
         if not batch:
             return [], None
-        if self._config.enable_sequence_packing:
-            return self._split_packs(batch)
-        if self._config.max_batch_frames is not None:
-            return self._split_by_frames(batch)
-        return self._split_by_count(batch)
+        return self._partition_policy.split(batch, self._config)
 
     def schedule_streaming(self) -> Tuple[List[Request], List[Request]]:
         """Admit waiting streaming requests up to ``max_batch_size``.
@@ -252,12 +265,12 @@ class Scheduler:
         cfg = self._config
         policy = cfg.schedule_policy
         if cfg.streaming_cohort_admit or policy == "sjf":
-            self._sort_by_length(self._streaming_waiting)
+            sort_by_length(self._streaming_waiting)
 
         n_avail = min(budget, len(self._streaming_waiting))
         if cfg.preferred_batch_size is not None:
             candidate = len(self._running) + n_avail
-            target = self._snap_to_preferred(candidate)
+            target = snap_to_preferred(candidate, cfg.preferred_batch_size)
             n_admit = max(0, target - len(self._running))
             if n_admit == 0:
                 oldest = self._streaming_waiting[0]
@@ -278,282 +291,8 @@ class Scheduler:
         return admitted
 
     # ------------------------------------------------------------------
-    # Internal — offline batching
-    # ------------------------------------------------------------------
-
-    def _build_offline_batch(self) -> List[Request]:
-        """Construct one length-bucketed offline batch.
-
-        Policy dispatch lives here.  The batch cap is ``max_batch_size`` —
-        one micro-batch per ``step()``, which :class:`OfflineExecutor` runs
-        as a single offline forward (length-bucketed by feature length).
-        Bucket tolerance is ``length_bucket_ratio``.  Requests whose
-        ``waited_for`` exceeds ``max_wait_time`` become forced anchors —
-        they ship next step regardless of whether length-similar peers are
-        available.
-
-        When ``preferred_batch_size`` is set, the final batch size is
-        snapped down to a preferred value (unless force-flushed) so the
-        executor emits micro-batches at known graph-captured / autotuned
-        widths.  Trailing requests are returned to the head of the queue
-        for the next step — keeping length-similarity intact.
-        """
-        q = self._offline_waiting
-        if not q:
-            return []
-
-        cfg = self._config
-        cap = max(1, cfg.max_batch_size)
-        policy = cfg.schedule_policy
-
-        # Forced-flush anchor if the oldest request has waited too long.
-        force_flush = q[0].waited_for >= cfg.max_wait_time
-
-        batch: List[Request]
-        if policy == "fcfs":
-            batch = []
-            while q and len(batch) < cap:
-                batch.append(q.popleft())
-            return self._snap_offline_batch(batch, q, force_flush)
-
-        if policy == "sjf" and not force_flush:
-            self._sort_by_length(q)
-
-        # "bucket" (default) and "sjf" both do length-aware selection.
-        anchor = q.popleft()
-        anchor_len = max(1, anchor.num_frames)
-        batch = [anchor]
-        min_len = anchor_len
-        max_len = anchor_len
-
-        if force_flush:
-            # Keep strict FIFO for this batch — don't reorder the queue just
-            # because we've exceeded the wait deadline.
-            batch = self._fill_batch_fifo(batch, q, cap)
-            return self._snap_offline_batch(batch, q, force_flush=True)
-
-        ratio = cfg.length_bucket_ratio
-        pad_cap = cfg.max_offline_pad_ratio
-        frame_cap = cfg.max_batch_frames
-
-        i = 0
-        while i < len(q) and len(batch) < cap:
-            cand = q[i]
-            cand_len = max(1, cand.num_frames)
-            new_min = min(min_len, cand_len)
-            new_max = max(max_len, cand_len)
-
-            if ratio > 0 and new_min / new_max < ratio:
-                i += 1
-                continue
-
-            # Padded-frame budget: would adding this request push the padded
-            # width ``new_max * (batch_size + 1)`` over ``max_batch_frames``?
-            # The anchor always ships even if it alone exceeds the budget — a
-            # single utterance can't be split in non-packing mode.
-            if frame_cap is not None and new_max * (len(batch) + 1) > frame_cap:
-                i += 1
-                continue
-
-            # Pad-waste guard: would adding this request push total padded
-            # compute above ``pad_cap`` × useful compute?
-            useful = sum(max(1, r.num_frames) for r in batch) + cand_len
-            padded = new_max * (len(batch) + 1)
-            if pad_cap > 0 and padded / useful > pad_cap:
-                i += 1
-                continue
-
-            batch.append(cand)
-            min_len = new_min
-            max_len = new_max
-            del q[i]
-
-        return self._snap_offline_batch(batch, q, force_flush=False)
-
-    def _snap_offline_batch(
-        self,
-        batch: List[Request],
-        q: Deque[Request],
-        force_flush: bool,
-    ) -> List[Request]:
-        """Trim a built batch to a preferred batch size, when configured.
-
-        Returns the overflow back to the head of ``q`` preserving order so
-        the next step picks them up (length-similarity intact).  Skipped
-        entirely when ``preferred_batch_size`` is unset.  When ``force_flush``
-        is true the batch ships as-is — the wait-deadline overrides the
-        preferred-size constraint.
-        """
-        cfg = self._config
-        if cfg.preferred_batch_size is None or force_flush or not batch:
-            return batch
-        target = self._snap_to_preferred(len(batch))
-        if target == 0:
-            # Below the smallest preferred — hold everything and wait for
-            # more arrivals.  ``max_wait_time`` triggers force_flush above.
-            q.extendleft(reversed(batch))
-            return []
-        if target < len(batch):
-            overflow = batch[target:]
-            batch = batch[:target]
-            q.extendleft(reversed(overflow))
-        return batch
-
-    def _snap_to_preferred(self, candidate: int) -> int:
-        """Largest configured preferred batch size ``<= candidate``.
-
-        Returns ``0`` when ``preferred_batch_size`` is unset/empty or when
-        ``candidate`` is below the smallest preferred value.  The config
-        normaliser guarantees ``preferred_batch_size`` is sorted ascending.
-        """
-        pbs = self._config.preferred_batch_size
-        if not pbs or candidate < pbs[0]:
-            return 0
-        snapped = 0
-        for v in pbs:
-            if v <= candidate:
-                snapped = v
-            else:
-                break
-        return snapped
-
-    @staticmethod
-    def _fill_batch_fifo(
-        batch: List[Request],
-        q: Deque[Request],
-        cap: int,
-    ) -> List[Request]:
-        """Fill a forced-flush batch with strict FIFO order up to ``cap``."""
-        while q and len(batch) < cap:
-            batch.append(q.popleft())
-        return batch
-
-    # ------------------------------------------------------------------
-    # Internal — offline micro-batch partition
-    # ------------------------------------------------------------------
-
-    def _split_packs(
-        self, batch: List[Request]
-    ) -> Tuple[List[List[Request]], Optional[List[int]]]:
-        """Group utterances into packs bounded by a post-subsampling budget.
-
-        Length-sorts then greedily fills a pack until the summed estimated
-        post-subsampling length (``num_frames // subsampling_rate``) would
-        exceed ``max_packed_frames``.  A single oversized utterance ships as
-        its own pack.  Each returned chunk is exactly one packed row for the
-        gapless varlen ``forward_offline_packed``.
-        """
-        enumerated = sorted(enumerate(batch), key=lambda p: p[1].num_frames)
-        ordered = [r for _, r in enumerated]
-        orig_indices: Optional[List[int]] = [i for i, _ in enumerated]
-
-        budget = max(1, int(self._config.max_packed_frames))
-        sr = max(1, int(self._config.subsampling_rate))
-        chunks: List[List[Request]] = []
-        cur: List[Request] = []
-        cur_sum = 0
-        for r in ordered:
-            tlen = max(1, int(r.num_frames) // sr)
-            if cur and cur_sum + tlen > budget:
-                chunks.append(cur)
-                cur = [r]
-                cur_sum = tlen
-            else:
-                cur.append(r)
-                cur_sum += tlen
-        if cur:
-            chunks.append(cur)
-        return chunks, orig_indices
-
-    def _split_by_frames(
-        self, batch: List[Request]
-    ) -> Tuple[List[List[Request]], Optional[List[int]]]:
-        """Split ``batch`` into micro-batches bounded by a padded-frame budget.
-
-        Length-sorts then greedily accumulates requests into a chunk until
-        adding the next would push the padded width ``max_len * (count + 1)``
-        over ``max_batch_frames`` — or the count over ``max_batch_size``.  A
-        single request always ships even if it alone exceeds the budget (it
-        can't be split in non-packing mode).
-        """
-        budget = self._config.max_batch_frames
-        assert budget is not None
-        mb = max(1, int(self._config.max_batch_size))
-
-        enumerated = sorted(enumerate(batch), key=lambda p: p[1].num_frames)
-        ordered = [r for _, r in enumerated]
-        orig_indices: Optional[List[int]] = [i for i, _ in enumerated]
-
-        chunks: List[List[Request]] = []
-        cur: List[Request] = []
-        cur_max = 0
-        for r in ordered:
-            rlen = max(1, r.num_frames)
-            new_max = max(cur_max, rlen)
-            if cur and (new_max * (len(cur) + 1) > budget or len(cur) >= mb):
-                chunks.append(cur)
-                cur = [r]
-                cur_max = rlen
-            else:
-                cur.append(r)
-                cur_max = new_max
-        if cur:
-            chunks.append(cur)
-        return chunks, orig_indices
-
-    def _split_by_count(
-        self, batch: List[Request]
-    ) -> Tuple[List[List[Request]], Optional[List[int]]]:
-        """Partition by count, snapping to ``preferred_batch_size`` when set.
-
-        With preferred sizes configured, greedily peels off the largest
-        preferred value ``<= remaining`` (capped by ``max_batch_size``); the
-        tail (smaller than the smallest preferred) ships as one odd chunk.
-        Otherwise balances into even chunks of at most ``max_batch_size`` to
-        avoid a tiny trailing micro-batch.
-        """
-        n = len(batch)
-        mb = max(1, int(self._config.max_batch_size))
-        pbs = self._config.preferred_batch_size
-
-        # Fast path: a single micro-batch when nothing forces a split.
-        if n <= mb and not pbs:
-            return [list(batch)], None
-
-        enumerated = sorted(enumerate(batch), key=lambda p: p[1].num_frames)
-        ordered = [r for _, r in enumerated]
-        orig_indices: Optional[List[int]] = [i for i, _ in enumerated]
-
-        chunks: List[List[Request]] = []
-        if pbs:
-            idx = 0
-            while idx < n:
-                remaining = n - idx
-                size = self._snap_to_preferred(min(remaining, mb))
-                if size == 0:
-                    size = remaining  # tail < min(preferred); one odd chunk.
-                chunks.append(ordered[idx: idx + size])
-                idx += size
-        else:
-            nchunks = (n + mb - 1) // mb
-            base, rem = divmod(n, nchunks)
-            idx = 0
-            for i in range(nchunks):
-                size = base + (1 if i < rem else 0)
-                chunks.append(ordered[idx: idx + size])
-                idx += size
-        return chunks, orig_indices
-
-    # ------------------------------------------------------------------
     # Internal — priority/length ordering
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _sort_by_length(queue: Deque[Request]) -> None:
-        """In-place stable sort of ``queue`` by (priority, num_frames)."""
-        ordered = sorted(queue, key=lambda r: (r.priority, r.num_frames))
-        queue.clear()
-        queue.extend(ordered)
 
     def _insert_ordered(self, queue: Deque[Request], request: Request) -> None:
         """Append respecting priority.  Lower priority value inserts earlier.

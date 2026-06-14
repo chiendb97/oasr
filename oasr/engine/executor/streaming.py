@@ -65,8 +65,7 @@ class StreamingExecutor(Executor):
         # encoder forward is async, so once dispatched the GPU can run
         # both kernels concurrently when they live on different streams).
         self._feat_stream: Optional[torch.cuda.Stream] = (
-            torch.cuda.Stream(device=device)
-            if device.type == "cuda" else None
+            torch.cuda.Stream(device=device) if device.type == "cuda" else None
         )
 
     # ------------------------------------------------------------------
@@ -113,15 +112,17 @@ class StreamingExecutor(Executor):
     ) -> None:
         req = self._scheduler.find_request(request_id)
         if req is None:
-            raise KeyError(
-                f"feed_chunk: unknown or finished request_id {request_id!r}"
-            )
+            raise KeyError(f"feed_chunk: unknown or finished request_id {request_id!r}")
         self._inp.append_streaming_chunk(req, chunk, is_last=is_last)
 
     def abort(self, request_id: str) -> None:
         """Remove a streaming request, freeing its cache slot if any."""
         req = self._scheduler.abort_request(request_id)
-        if req is not None and req.stream_context is not None:
+        # ``stream_id`` is the admission marker (set by the scheduler when a
+        # stream is promoted to RUNNING) — present for both paged and stateful
+        # backends, whereas ``stream_context`` is ``None`` for stateful streams.
+        if req is not None and req.stream_id is not None:
+            self._op.free_session(req)
             self._mr.free_stream(req)
 
     def step(self) -> List[RequestOutput]:
@@ -134,7 +135,8 @@ class StreamingExecutor(Executor):
         if newly_admitted:
             nvtx_push("allocate_stream")
             for req in newly_admitted:
-                self._mr.allocate_stream(req)
+                self._mr.allocate_stream(req)  # encoder KV + CNN cache
+                self._op.create_session(req)  # decode-side beam state
             nvtx_pop()
 
         if not running:
@@ -150,12 +152,11 @@ class StreamingExecutor(Executor):
         if needs_feat:
             nvtx_push("extract_fbank")
             self._inp.extract_streaming_batch(
-                needs_feat, cuda_stream=self._feat_stream,
+                needs_feat,
+                cuda_stream=self._feat_stream,
             )
             if self._feat_stream is not None:
-                torch.cuda.current_stream(self._device).wait_stream(
-                    self._feat_stream
-                )
+                torch.cuda.current_stream(self._device).wait_stream(self._feat_stream)
             nvtx_pop()
 
         # 2. For each stream whose feature buffer now holds at least one
@@ -164,9 +165,7 @@ class StreamingExecutor(Executor):
         ready = [r for r in running if r.has_ready_encoder_chunk(window)]
         if ready:
             nvtx_push("forward_streaming")
-            log_probs_map: Dict[str, torch.Tensor] = (
-                self._mr.forward_streaming_step(ready)
-            )
+            log_probs_map: Dict[str, torch.Tensor] = self._mr.forward_streaming_step(ready)
             nvtx_pop()
             nvtx_push("decode_streaming")
             partials = self._op.decode_streaming_batch(ready, log_probs_map)
@@ -184,23 +183,23 @@ class StreamingExecutor(Executor):
         #    first step.
         nvtx_push("finalize_streams")
         for req in list(running):
-            if req.audio_final \
-                    and (not req.has_pending_audio) \
-                    and (not req.has_ready_encoder_chunk(window)):
+            if (
+                req.audio_final
+                and (not req.has_pending_audio)
+                and (not req.has_ready_encoder_chunk(window))
+            ):
                 final = self._op.finalize_streaming(req)
                 req.output = final
                 outputs.append(final)
-                self._mr.free_stream(req)
+                self._op.free_session(req)  # decode-side beam state
+                self._mr.free_stream(req)  # encoder KV + CNN cache
                 self._scheduler.finish_request(req.request_id)
         nvtx_pop()
 
         return outputs
 
     def has_pending(self) -> bool:
-        return (
-            self._scheduler.num_waiting_streaming > 0
-            or self._scheduler.num_running > 0
-        )
+        return self._scheduler.num_waiting_streaming > 0 or self._scheduler.num_running > 0
 
     def num_running(self) -> int:
         return self._scheduler.num_running

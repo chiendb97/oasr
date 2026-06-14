@@ -27,7 +27,7 @@ Typical usage (paged-only)::
 
 from __future__ import annotations
 
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -55,8 +55,12 @@ class StreamContext:
         Shared paged attention KV cache manager.
     cnn_cache : CnnCacheManager
         Per-stream CNN cache manager.
-    ctc_state : CtcStateCacheManager
-        Per-stream CTC decoder state manager.
+    ctc_state : CtcStateCacheManager, optional
+        Per-stream CTC decoder state manager.  Optional: the engine now owns
+        CTC beam state inside the decode strategy (so it works for any encoder
+        streaming kind), and builds an *encoder-only* context with
+        ``ctc_state=None``.  Standalone users (and the cache tests) may still
+        pass one to use :meth:`get_decoder` / :meth:`get_ctc_state` directly.
 
     Examples
     --------
@@ -75,7 +79,7 @@ class StreamContext:
         stream_id: int,
         attention_cache: AttentionCacheManager,
         cnn_cache: CnnCacheManager,
-        ctc_state: CtcStateCacheManager,
+        ctc_state: Optional[CtcStateCacheManager] = None,
     ) -> None:
         self._stream_id = stream_id
         self._attention_cache = attention_cache
@@ -118,6 +122,7 @@ class StreamContext:
         GpuStreamingDecoder or StreamHandle
             Ready for ``decode_chunk()`` and ``finalize_stream()`` calls.
         """
+        assert self._ctc_state is not None, "StreamContext has no CTC state manager"
         return self._ctc_state.get_decoder(self._stream_id)
 
     def get_ctc_state(self) -> StreamState:
@@ -127,11 +132,13 @@ class StreamContext:
         (:meth:`~oasr.ctc_decode.GpuStreamingDecoder.decode_chunk_batch`)
         which feeds an array of states into a single C++ launcher.
         """
+        assert self._ctc_state is not None, "StreamContext has no CTC state manager"
         return self._ctc_state.get_states([self._stream_id])[0]
 
     @property
-    def ctc_state_manager(self) -> CtcStateCacheManager:
-        """Underlying :class:`CtcStateCacheManager` (shared across streams)."""
+    def ctc_state_manager(self) -> Optional[CtcStateCacheManager]:
+        """Underlying :class:`CtcStateCacheManager` (shared across streams), or
+        ``None`` for an encoder-only context."""
         return self._ctc_state
 
     def get_att_caches(self) -> List[PagedKVCache]:
@@ -197,4 +204,5 @@ class StreamContext:
         """
         self._attention_cache.free_stream(self._stream_id)
         self._cnn_cache.free_stream(self._stream_id)
-        self._ctc_state.free_stream(self._stream_id)
+        if self._ctc_state is not None:
+            self._ctc_state.free_stream(self._stream_id)
