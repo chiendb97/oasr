@@ -211,6 +211,48 @@ void addlayernorm(TensorView output, TensorView input, TensorView residual, Tens
 }
 
 // =============================================================================
+// AddLayerNormResidual launcher
+// =============================================================================
+
+void addlayernorm_residual(TensorView output, TensorView residual_out, TensorView input,
+                           TensorView residual, TensorView weight, Optional bias_opt, double eps,
+                           double alpha) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output);
+    CHECK_INPUT(residual);
+    CHECK_INPUT(residual_out);
+    CHECK_INPUT(weight);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual_out);
+
+    unsigned int num_rows = 1;
+    for (int i = 0; i < input.ndim() - 1; ++i) {
+        num_rows *= input.size(i);
+    }
+    unsigned int hidden_size = input.size(input.ndim() - 1);
+
+    cudaStream_t stream = get_stream(input.device());
+
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+        const c_type* bias_ptr = nullptr;
+        if (bias_opt.has_value()) {
+            bias_ptr = static_cast<const c_type*>(bias_opt.value().data_ptr());
+        }
+        cudaError_t status = norm::AddLayerNormResidual<c_type>(
+            static_cast<const c_type*>(input.data_ptr()),
+            static_cast<const c_type*>(residual.data_ptr()),
+            static_cast<const c_type*>(weight.data_ptr()), bias_ptr,
+            static_cast<c_type*>(output.data_ptr()),
+            static_cast<c_type*>(residual_out.data_ptr()), num_rows, hidden_size,
+            static_cast<float>(eps), static_cast<float>(alpha), stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "AddLayerNormResidual kernel failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
+// =============================================================================
 // CMVN launcher
 // =============================================================================
 
