@@ -1,6 +1,7 @@
 """High-level Python layer wrappers (Conv, Linear, Norm, ...)."""
 
 from .conv import DepthwiseConv1d, PointwiseConv1d, Conv2d, Conv2dActivation
+from .ctc import CtcProjection
 from .feature import Fbank, Mfcc
 from .linear import Linear
 from .norm import (
@@ -15,6 +16,8 @@ __all__ = [
     "PointwiseConv1d",
     "Conv2d",
     "Conv2dActivation",
+    # CTC projection
+    "CtcProjection",
     # Feature extraction
     "Fbank",
     "Mfcc",
