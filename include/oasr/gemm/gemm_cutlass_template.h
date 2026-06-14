@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 
 #ifdef __GNUC__
     #pragma GCC diagnostic push
@@ -21,7 +22,9 @@
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/gemm/device/gemm_batched.h>
 #include <cutlass/gemm/device/gemm_grouped.h>
+#include <cutlass/gemm/device/gemm_universal.h>
 #include <cutlass/gemm/kernel/default_gemm_grouped.h>
+#include <cutlass/gemm/threadblock/threadblock_swizzle_streamk.h>
 #include <cutlass/layout/matrix.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/util/device_memory.h>
@@ -42,8 +45,13 @@ namespace gemm {
 // CutlassGemmKernel — CUTLASS 2.x GEMM template
 //==============================================================================
 
+// ``kStreamK`` selects the Stream-K decomposition (``GemmUniversal`` +
+// ``ThreadblockSwizzleStreamK``) instead of the data-parallel ``device::Gemm``.
+// Stream-K distributes the K-reduction across all SMs and reduces partials with
+// an in-kernel fixup, which fills the GPU on thin GEMMs (small M, few output
+// tiles) where the data-parallel grid leaves most SMs idle.
 template <typename CutlassGemmConfig, typename ElementA, typename ElementB, typename ElementCD,
-          ActivationType activation_type>
+          ActivationType activation_type, bool kStreamK = false>
 struct CutlassGemmKernel {
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::ColumnMajor;
@@ -62,26 +70,52 @@ struct CutlassGemmKernel {
     using WarpShape = typename CutlassGemmConfig::WarpShape;
     using InstructionShape = typename CutlassGemmConfig::InstructionShape;
 
-    using SwizzleThreadblock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
-
     using EpilogueOp = typename FusionEpilogueOp<activation_type, AlignmentEpilogue, ElementCD,
                                                  ElementComputeEpilogue, ElementCD>::type;
 
     static constexpr int Stages = CutlassGemmConfig::Stages;
 
-    using Gemm =
+    // Data-parallel (identity swizzle) classic device GEMM.
+    using GemmBasic =
         cutlass::gemm::device::Gemm<ElementA, LayoutA, ElementB, LayoutB, ElementCD, LayoutCD,
                                     ElementAccumulator, MMAOp, SmArch, ThreadblockShape, WarpShape,
-                                    InstructionShape, EpilogueOp, SwizzleThreadblock, Stages,
-                                    AlignmentA, AlignmentB>;
+                                    InstructionShape, EpilogueOp,
+                                    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+                                    Stages, AlignmentA, AlignmentB>;
+
+    // Stream-K (GemmUniversal): same template parameters, only the swizzle differs.
+    using GemmStreamK = cutlass::gemm::device::GemmUniversal<
+        ElementA, LayoutA, ElementB, LayoutB, ElementCD, LayoutCD, ElementAccumulator, MMAOp,
+        SmArch, ThreadblockShape, WarpShape, InstructionShape, EpilogueOp,
+        cutlass::gemm::threadblock::ThreadblockSwizzleStreamK, Stages, AlignmentA, AlignmentB>;
+
+    using Gemm = std::conditional_t<kStreamK, GemmStreamK, GemmBasic>;
 
     static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
                           int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldc,
                           ElementComputeEpilogue alpha, cudaStream_t stream,
                           int split_k_slices = 1) {
         float beta = (C == nullptr) ? 0.0f : 1.0f;
-        typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0}, {D, ldc},
-                                      {alpha, beta}, split_k_slices);
+
+        auto args = [&]() -> typename Gemm::Arguments {
+            if constexpr (kStreamK) {
+                // GemmUniversal kGemm mode; the bias vector C[N] broadcasts over
+                // rows via stride_c = 0.  avail_sms = -1 → use all device SMs for
+                // Stream-K load balancing.
+                return typename Gemm::Arguments(
+                    cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K},
+                    /*batch_count=*/1, {alpha, beta}, A, B, C, D,
+                    /*batch_stride_A=*/static_cast<int64_t>(M) * K,
+                    /*batch_stride_B=*/static_cast<int64_t>(N) * K,
+                    /*batch_stride_C=*/static_cast<int64_t>(0),
+                    /*batch_stride_D=*/static_cast<int64_t>(M) * N,
+                    /*stride_a=*/lda, /*stride_b=*/ldb, /*stride_c=*/static_cast<int64_t>(0),
+                    /*stride_d=*/ldc, /*avail_sms=*/-1);
+            } else {
+                return typename Gemm::Arguments({M, N, K}, {A, lda}, {B, ldb}, {C, 0}, {D, ldc},
+                                                {alpha, beta}, split_k_slices);
+            }
+        }();
 
         Gemm gemm_op;
         cutlass::Status status = gemm_op.can_implement(args);

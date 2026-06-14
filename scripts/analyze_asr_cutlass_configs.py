@@ -5,6 +5,23 @@
 enumerate_asr_configs.py — Enumerate GEMM and CONV2D problem sizes for ASR
 model families and query nvMatmulHeuristics for all supported CUTLASS configs.
 
+.. note::
+    This script derives shapes *analytically* and asks nvMatmulHeuristics for
+    *predicted* configs.  Two limitations make its output unsuitable for tuning
+    the engine directly: (1) it enumerates a 10×10 (batch × duration) grid over
+    five model families, producing thousands of shapes; (2) the predicted CUTLASS
+    configs do not map to the fixed set OASR actually compiles, and the analytic
+    derivation assumes attention projections / scores hit the OASR GEMM path
+    (they are ``torch.nn.Linear`` / ``oasr.fmha``).
+
+    For actually choosing kernels, use ``scripts/tune_asr_gemm.py`` — it captures
+    the REAL shapes a workload issues (via ``OASR_CAPTURE_GEMM``), buckets them
+    into a representative set, REAL-benchmarks OASR's actual candidate kernels
+    (CUTLASS variants + torch/cuBLAS) on the GPU, and emits the production
+    selection rules.  This module is retained as the analytic shape library
+    (``MODEL_REGISTRY`` + ``derive_problems``) that ``tune_asr_gemm.py``'s
+    ``--mode analytic`` fallback reuses.
+
 Supported model families:  conformer, zipformer, branchformer, paraformer, transducer
 Supported model sizes:     base, large
 Supported CUTLASS targets: CUTLASS2, CUTLASS3 (where supported by nvMatmulHeuristics)

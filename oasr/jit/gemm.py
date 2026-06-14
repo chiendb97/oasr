@@ -8,6 +8,7 @@ selects which pre-compiled variant to call — no JIT during tuning.
 """
 
 import itertools
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Union
 from .core import gen_jit_spec, _get_target_sm, JitSpec
@@ -72,6 +73,7 @@ class CutlassGemmConfig:
     kStages: int
     kSmVersion: int
     split_k: int = 1          # runtime split-K factor (1 = disabled)
+    stream_k: bool = False    # Stream-K decomposition (compile-time; thin-GEMM fill)
 
     @property
     def name(self) -> str:
@@ -82,20 +84,24 @@ class CutlassGemmConfig:
         parts.append(f"s{self.kStages}")
         if self.split_k != 1:
             parts.append(f"spk{self.split_k}")
+        if self.stream_k:
+            parts.append("sk")
         return "_".join(parts)
 
     @property
     def compile_name(self) -> str:
         """Config name used as the compiled binary key.
 
-        Encodes tile shape, warp shape, and kStages (all compile-time
-        template parameters).  Excludes ``split_k`` (runtime argument)
-        so variants differing only in split-K share a single compiled ``.so``.
+        Encodes tile shape, warp shape, kStages, and the Stream-K flag (all
+        compile-time template parameters).  Excludes ``split_k`` (runtime
+        argument) so variants differing only in split-K share a single ``.so``.
         """
         parts = [f"sm{self.kSmVersion}"]
         parts.append(f"b{self.block_m}x{self.block_n}x{self.block_k}")
         parts.append(f"w{self.warp_m}x{self.warp_n}x{self.warp_k}")
         parts.append(f"s{self.kStages}")
+        if self.stream_k:
+            parts.append("sk")
         return "_".join(parts)
 
     @property
@@ -113,6 +119,7 @@ class CutlassGemmConfig:
             ("warp_k", self.warp_k),
             ("kStages", self.kStages),
             ("split_k", self.split_k),
+            ("stream_k", int(self.stream_k)),
         ]
         return tuple(items)
 
@@ -421,14 +428,59 @@ def _get_sm100_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
     return seen
 
 
+# Stream-K variants are part of the autotune candidate space by default, so
+# ``oasr.autotune()`` can select them where they win — e.g. deep-K thin GEMMs, or
+# other models / GPUs where the data-parallel grid starves the SMs.  On the
+# captured ASR workload they narrow the data-parallel→cuBLAS gap but don't beat
+# cuBLAS (see scripts/tune_asr_gemm.py), so the production heuristic rules don't
+# reference them — but they remain tunable.  Set OASR_GEMM_STREAMK=0 for a leaner
+# production build that never autotunes (skips compiling the Stream-K kernels).
+_STREAMK_ENABLED = os.environ.get("OASR_GEMM_STREAMK", "1") != "0"
+
+# Curated tile set for Stream-K variants.  Stream-K helps when there are too few
+# output tiles to fill the GPU (small M, N=256, large K), so we cover small
+# block_m tiles plus a couple of large tiles for the single-output-tile case.
+_STREAMK_TILES: List[TileShape] = [
+    TileShape(block_m=16,  block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=32,  block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64),
+    TileShape(block_m=64,  block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64),
+    TileShape(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=64, warp_k=64),
+    TileShape(block_m=128, block_n=256, block_k=64, warp_m=64, warp_n=64, warp_k=64),
+]
+
+
+def _build_streamk_configs(
+    sm: int, tiles: List[TileShape], stage_list: List[int], smem_limit: int
+) -> Dict[str, CutlassGemmConfig]:
+    """Build Stream-K GEMM configs (split_k=1; the swizzle balances K across SMs)."""
+    seen: Dict[str, CutlassGemmConfig] = {}
+    for tile in tiles:
+        for kStages in stage_list:
+            if _smem_bytes(tile.block_m, tile.block_n, tile.block_k, kStages) > smem_limit:
+                continue
+            cfg = CutlassGemmConfig(
+                block_m=tile.block_m, block_n=tile.block_n, block_k=tile.block_k,
+                warp_m=tile.warp_m, warp_n=tile.warp_n, warp_k=tile.warp_k,
+                kStages=kStages, kSmVersion=sm, split_k=1, stream_k=True,
+            )
+            seen[cfg.name] = cfg
+    return seen
+
+
 def _get_sm120_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
     """SM120 (GeForce Blackwell / RTX 50 series) configs.
 
     The CUTLASS 3.x SM120 CollectiveBuilder supports only F8/F6/F4 MMA, so
     FP16/BF16 GEMM on SM120 is routed through the CUTLASS 2.x tensor-op path
     using the Sm80 forward-compatible instructions (mma.sync.aligned.m16n8k16).
+
+    Also includes Stream-K variants (gemm family only — see ``_render_all_variants``
+    and the backend registration, which confine Stream-K configs to GEMM).
     """
-    return _build_sm_lt90_configs(sm, TileShapeConfigs, [3, 4], [1, 2, 4], _SM_MAX_SMEM_BYTES[120])
+    cfgs = _build_sm_lt90_configs(sm, TileShapeConfigs, [3, 4], [1, 2, 4], _SM_MAX_SMEM_BYTES[120])
+    if _STREAMK_ENABLED:
+        cfgs.update(_build_streamk_configs(sm, _STREAMK_TILES, [3], _SM_MAX_SMEM_BYTES[120]))
+    return cfgs
 
 
 def get_all_autotune_configs(
@@ -507,6 +559,11 @@ def _render_all_variants(
     source_paths = []
 
     for config_name, cfg in unique_configs.items():
+        # Stream-K is implemented in the GEMM template only; skip SK configs for
+        # bmm / group_gemm (their templates have no Stream-K path).
+        if family != "gemm" and getattr(cfg, "stream_k", False):
+            continue
+
         func_name = f"{family}_{config_name}"
         variant_file_name = f"{family}_sm{sm}_{config_name}"
 
@@ -523,6 +580,7 @@ def _render_all_variants(
                 warp_k=cfg.warp_k,
                 stages=cfg.kStages,
                 sm_version=sm,
+                stream_k=getattr(cfg, "stream_k", False),
                 with_activation=with_activation,
             )
         else:
@@ -664,3 +722,77 @@ else:
         kStages=3,
         kSmVersion=_sm,
     )
+
+
+# =============================================================================
+# Shape-aware production config selection (non-autotuned path)
+# =============================================================================
+#
+# The non-tuning path in ``oasr/gemm.py`` historically used a single fixed config
+# (GEMM_DEFAULT, 128x128x64) for EVERY shape — wasteful at the small M (token
+# count) seen in streaming and conv/FF GEMMs.  These rules, generated by
+# ``scripts/tune_asr_gemm.py`` from REAL on-GPU benchmarks of the captured ASR
+# workload (WeNet u2pp Conformer-CTC base, bf16, RTX 5090 / SM120), map each
+# ``(op, N, K)`` to an ascending list of ``(m_max, choice)`` where ``choice`` is a
+# ``CutlassGemmConfig`` or the string ``"torch"`` (cuBLAS, which wins on thin
+# contract GEMMs).  ``select_default_config`` returns the first entry whose
+# ``m_max >= M`` (``None`` = catch-all), else ``GEMM_DEFAULT``.  Regenerate with::
+#
+#     OASR_CAPTURE_GEMM=shapes.json python benchmarks/bench_engine.py \
+#         --subroutines offline streaming --cuda-graphs off ...
+#     python scripts/tune_asr_gemm.py --mode capture --shapes shapes.json \
+#         --gpu <uuid> --emit-rules rules.py
+#
+_GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
+    ("gemm", 256, 256): [
+        (1024, CutlassGemmConfig(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~720: cutlass 0.0061ms (2.00x vs default)
+        (None, CutlassGemmConfig(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~9472: cutlass 0.0143ms (1.00x vs default)
+    ],
+    ("gemm", 256, 2048): [
+        (1024, "torch"),  # M~720: torch 0.0163ms (3.14x vs default)
+        (None, CutlassGemmConfig(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~9472: cutlass 0.0553ms (1.04x vs default)
+    ],
+    ("gemm", 256, 4864): [
+        (1024, "torch"),  # M~720: torch 0.0209ms (5.39x vs default)
+        (None, CutlassGemmConfig(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~9472: cutlass 0.1270ms (1.02x vs default)
+    ],
+    ("gemm", 512, 256): [
+        (512, CutlassGemmConfig(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~330: cutlass 0.0061ms (2.00x vs default)
+        (1024, CutlassGemmConfig(block_m=32, block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~960: cutlass 0.0082ms (1.50x vs default)
+        (2048, CutlassGemmConfig(block_m=64, block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~1440: cutlass 0.0082ms (1.50x vs default)
+        (None, CutlassGemmConfig(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~16704: cutlass 0.0369ms (1.05x vs default)
+    ],
+    ("gemm_activation", 2048, 256): [
+        (256, CutlassGemmConfig(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64, kStages=4, kSmVersion=120, split_k=1)),  # M~176: cutlass 0.0082ms (1.50x vs default)
+        (512, CutlassGemmConfig(block_m=64, block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~448: cutlass 0.0102ms (1.21x vs default)
+        (None, CutlassGemmConfig(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~9472: cutlass 0.0717ms (1.00x vs default)
+    ],
+}
+
+# Half-precision dtype strings the rules apply to (the kernels + SMEM budgets
+# assume 2-byte operands; fp32 keeps GEMM_DEFAULT).
+_HEURISTIC_DTYPES = ("torch.float16", "torch.bfloat16")
+
+# Rollback / A-B-parity switch (read once at import): set OASR_GEMM_HEURISTIC=0
+# to force the legacy fixed-config path (every shape → GEMM_DEFAULT).
+_HEURISTIC_ENABLED = os.environ.get("OASR_GEMM_HEURISTIC", "1") != "0"
+
+
+def select_default_config(op: str, M: int, N: int, K: int, dtype, sm: int):
+    """Pick a GEMM config for the non-autotuned production path.
+
+    Returns a :class:`CutlassGemmConfig`, the string ``"torch"`` (dispatch to
+    cuBLAS), or :data:`GEMM_DEFAULT`.  Pure function of the shape, so it is
+    CUDA-graph safe (same choice on every capture/replay).  Unknown ops/shapes,
+    non-SM120 arches, and non-half dtypes fall back to ``GEMM_DEFAULT`` — i.e.
+    byte-identical to the previous fixed behaviour.
+    """
+    if not _HEURISTIC_ENABLED or sm != 120 or str(dtype) not in _HEURISTIC_DTYPES:
+        return GEMM_DEFAULT
+    rules = _GEMM_HEURISTIC_RULES_SM120.get((op, int(N), int(K)))
+    if rules is None:
+        return GEMM_DEFAULT
+    for m_max, choice in rules:
+        if m_max is None or M <= m_max:
+            return choice
+    return GEMM_DEFAULT

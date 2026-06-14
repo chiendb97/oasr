@@ -62,6 +62,66 @@ def _default_group_gemm_fn():
     return getattr(_get_group_gemm_module(), group_gemm_func_name(GEMM_DEFAULT))
 
 
+@functools.cache
+def _target_sm() -> int:
+    from oasr.jit.core import _get_target_sm
+
+    return _get_target_sm()
+
+
+@functools.cache
+def _gemm_fn(compile_name: str, activation: bool):
+    """Resolve a compiled GEMM variant by ``compile_name`` (cached → a stable
+    callable per shape, which keeps CUDA-graph capture/replay deterministic)."""
+    suffix = "_activation" if activation else ""
+    return getattr(_get_gemm_module(), f"gemm_{compile_name}{suffix}")
+
+
+def _dispatch_gemm(out2d, A2d, B, C, N, K) -> None:
+    """Shape-aware non-tuning dispatch for ``gemm``.
+
+    Picks a per-shape config via the heuristic rules (CUTLASS variant or torch/
+    cuBLAS); any failure falls through to the fixed ``GEMM_DEFAULT`` so a bad rule
+    can never break inference.
+    """
+    try:
+        from oasr.jit.gemm import select_default_config
+
+        choice = select_default_config("gemm", A2d.shape[0], N, K, A2d.dtype, _target_sm())
+        if choice == "torch":
+            from oasr.gemm_torch import torch_gemm
+
+            torch_gemm(out2d, A2d, B, C, 1)
+        else:
+            _gemm_fn(choice.compile_name, False)(out2d, A2d, B, C, choice.split_k)
+        return
+    except Exception:
+        pass
+    _default_gemm_fn()(out2d, A2d, B, C, 1)
+
+
+def _dispatch_gemm_activation(out2d, A2d, B, C, activation_type, N, K) -> None:
+    """Shape-aware non-tuning dispatch for ``gemm_activation`` (see ``_dispatch_gemm``)."""
+    try:
+        from oasr.jit.gemm import select_default_config
+
+        choice = select_default_config(
+            "gemm_activation", A2d.shape[0], N, K, A2d.dtype, _target_sm()
+        )
+        if choice == "torch":
+            from oasr.gemm_torch import torch_gemm_activation
+
+            torch_gemm_activation(out2d, A2d, B, C, activation_type, 1)
+        else:
+            _gemm_fn(choice.compile_name, True)(
+                out2d, A2d, B, C, activation_type, choice.split_k
+            )
+        return
+    except Exception:
+        pass
+    _default_gemm_activation_fn()(out2d, A2d, B, C, activation_type, 1)
+
+
 @oasr_api
 def gemm(
     A: torch.Tensor,
@@ -102,7 +162,7 @@ def gemm(
         )
         return out
 
-    _default_gemm_fn()(out.reshape(-1, N), A.reshape(-1, K), B, C, 1)
+    _dispatch_gemm(out.reshape(-1, N), A.reshape(-1, K), B, C, N, K)
     return out
 
 
@@ -232,8 +292,8 @@ def gemm_activation(
         )
         return out
 
-    _default_gemm_activation_fn()(out.reshape(-1, N),
-                                   A.reshape(-1, K), B, C, activation_type, 1)
+    _dispatch_gemm_activation(out.reshape(-1, N), A.reshape(-1, K), B, C,
+                              activation_type, N, K)
     return out
 
 

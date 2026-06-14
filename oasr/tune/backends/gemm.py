@@ -19,6 +19,7 @@ from oasr.tune.autotuner import BackendEntry, _global_registry, OpKey, Tactic
 from oasr.jit.gemm import (
     CutlassGemmConfig,
     CutlassGemmConfigSm90,
+    GEMM_DEFAULT,
     get_all_autotune_configs,
     get_unique_compile_configs,
     gemm_func_name,
@@ -38,26 +39,11 @@ _all_autotune_configs = get_all_autotune_configs(_sm)
 # Compile set — deduplicated by compile_name; used to determine the default.
 _all_compile_configs = get_unique_compile_configs(_sm)
 
-# Default configs (mid-range tile, split_k=1)
-_GEMM_DEFAULT_SM_LT90 = CutlassGemmConfig(
-    block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=64, warp_k=64, kStages=3, kSmVersion=_sm, split_k=1
-)
-_GEMM_DEFAULT_SM90 = CutlassGemmConfigSm90(
-    tile_m=128,
-    tile_n=128,
-    tile_k=128,
-    cluster_m=1,
-    cluster_n=1,
-    pingpong=False,
-    is_dynamic_persistent=False,
-    swap_ab=False,
-    max_swizzle_size=8,
-    use_tma_gather=False,
-    kSMs=1,
-    kStages=3,
-    kSmVersion=_sm,
-)
-_GEMM_DEFAULT = _GEMM_DEFAULT_SM_LT90 if _sm < 90 else _GEMM_DEFAULT_SM90
+# Use the canonical default from oasr.jit.gemm so the fallback tactic matches the
+# non-tuning production path for every arch (notably SM120, which uses the
+# CUTLASS 2.x / SM<90 path — re-deriving the default here previously mis-picked
+# the SM90 config and left no candidate flagged as the fallback).
+_GEMM_DEFAULT = GEMM_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +150,9 @@ def _make_bmm_runner(cfg: Union[CutlassGemmConfig, CutlassGemmConfigSm90]):
 
 
 for _cfg in _all_autotune_configs.values():
+    # Stream-K is a GEMM-only template path; bmm has no Stream-K variants.
+    if getattr(_cfg, "stream_k", False):
+        continue
     _tactic = Tactic("cutlass", config=_cfg.to_tactic_config())
     _is_default = (_cfg.compile_name == _GEMM_DEFAULT.compile_name
                    and getattr(_cfg, "split_k", 1) == 1)
@@ -194,6 +183,9 @@ def _make_group_gemm_runner(cfg: Union[CutlassGemmConfig, CutlassGemmConfigSm90]
 
 
 for _cfg in _all_autotune_configs.values():
+    # Stream-K is a GEMM-only template path; group_gemm has no Stream-K variants.
+    if getattr(_cfg, "stream_k", False):
+        continue
     _tactic = Tactic("cutlass", config=_cfg.to_tactic_config())
     _is_default = (_cfg.compile_name == _GEMM_DEFAULT.compile_name
                    and getattr(_cfg, "split_k", 1) == 1)

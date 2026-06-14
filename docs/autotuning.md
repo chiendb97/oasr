@@ -59,14 +59,21 @@ oasr.disable_autotune()         # saves cache and disables
 
 Autotuning is available for operations backed by CUTLASS tile variants:
 
-| Operation          | Variants | Notes                           |
-| ------------------ | -------: | ------------------------------- |
-| `gemm`             |       11 | Includes split-K variants       |
-| `gemm_activation`  |       11 | Fused GEMM + activation         |
-| `bmm`              |        9 | Batched GEMM (no split-K)       |
-| `group_gemm`       |        9 | Grouped GEMM (no split-K)       |
-| `conv2d`           |        6 | NHWC implicit GEMM              |
-| `conv2d_activation` |       6 | Fused Conv2D + activation       |
+| Operation          | Variants | Notes                                          |
+| ------------------ | -------: | ---------------------------------------------- |
+| `gemm`             |      11+ | split-K + Stream-K variants, plus a torch/cuBLAS candidate |
+| `gemm_activation`  |      11+ | Fused GEMM + activation (same candidate set)   |
+| `bmm`              |       9+ | Batched GEMM (no split-K) + torch candidate    |
+| `group_gemm`       |        9 | Grouped GEMM (no split-K)                      |
+| `conv2d`           |        6 | NHWC implicit GEMM                             |
+| `conv2d_activation` |       6 | Fused Conv2D + activation                      |
+
+In addition to the CUTLASS tile variants, the GEMM ops register a **torch/cuBLAS**
+candidate (`Tactic("torch")`) — cuBLAS wins on thin shapes — and, on SM120,
+**Stream-K** variants (`Tactic` configs with `stream_k=1`; `GemmUniversal` +
+`ThreadblockSwizzleStreamK`) that distribute the K-reduction across all SMs to fill
+the GPU on thin/deep-K GEMMs. Stream-K is in the candidate space by default; set
+`OASR_GEMM_STREAMK=0` to exclude it from leaner production builds that never autotune.
 
 Operations without tile variants (e.g., `depthwise_conv1d`, `layer_norm`)
 are unaffected by autotuning and always use their default kernel.
