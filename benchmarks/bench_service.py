@@ -9,9 +9,9 @@ binary.  Mirrors the CLI shape of ``benchmarks/bench_engine.py`` so the same
 
 Subroutines (one or more)
 -------------------------
-``offline``         ``POST /v1/speech:recognize`` (Google STT v1-shaped JSON,
-                    audio as base64), N concurrent clients.  Reports RTF,
-                    total throughput, p50 / p95 / p99 latency.
+``offline``         ``POST /v1/speech:recognize`` (raw PCM body, config in the
+                    query string — no base64/JSON), N concurrent clients.
+                    Reports RTF, total throughput, p50 / p95 / p99 latency.
 ``grpc_offline``    Unary ``oasr.speech.v1.Speech/Recognize``.
 ``grpc_streaming``  Bidi ``oasr.speech.v1.Speech/StreamingRecognize``.  Each
                     client opens one stream, feeds fixed-duration chunks,
@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import os
 import statistics
@@ -342,7 +341,7 @@ class RunStats:
 
 
 # ---------------------------------------------------------------------------
-# Offline benchmark — POST /v1/speech:recognize (JSON + base64 audio)
+# Offline benchmark — POST /v1/speech:recognize (raw PCM body, query-string config)
 # ---------------------------------------------------------------------------
 
 
@@ -379,12 +378,18 @@ async def _bench_offline(
     concurrency: int,
     wire_encoding: str,
 ) -> RunStats:
+    """Offline HTTP recognition: POST raw PCM to ``/v1/speech:recognize``.
+
+    The request body is the raw PCM payload and the config rides in the query
+    string (``?encoding=…&sample_rate=…``) — no base64, no JSON request envelope
+    (the endpoint is raw-PCM only).  ``wav`` sends the on-disk WAV container as
+    the body with ``encoding=WAV`` (the server decodes it); ``i16_le`` /
+    ``f32_le`` send headerless PCM.
+    """
     import httpx
 
     enc_name = _WIRE_TO_ENCODING[wire_encoding]
-    stats = RunStats(
-        name=f"offline (POST /v1/speech:recognize, encoding={enc_name})"
-    )
+    stats = RunStats(name=f"offline (POST /v1/speech:recognize, encoding={enc_name})")
     sem = asyncio.Semaphore(concurrency)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
@@ -392,21 +397,14 @@ async def _bench_offline(
         async def one(sample: Sample) -> None:
             async with sem:
                 raw = _to_wire_bytes(sample.samples, wire_encoding, sample.wav_bytes)
-                body = {
-                    "config": {
-                        "encoding": enc_name,
-                        "sampleRateHertz": sample.sample_rate,
-                        "languageCode": "en-US",
-                    },
-                    "audio": {
-                        "content": base64.b64encode(raw).decode("ascii"),
-                    },
-                }
+                params = {"encoding": enc_name, "sample_rate": sample.sample_rate}
                 start = time.perf_counter()
                 try:
                     resp = await client.post(
                         f"{http_url}/v1/speech:recognize",
-                        json=body,
+                        params=params,
+                        content=raw,
+                        headers={"content-type": "application/octet-stream"},
                     )
                     elapsed_ms = (time.perf_counter() - start) * 1000.0
                     if resp.status_code == 503:
@@ -415,7 +413,7 @@ async def _bench_offline(
                     if resp.status_code != 200:
                         stats.n_fail += 1
                         return
-                    _ = resp.json()  # validate JSON shape
+                    _ = resp.json()  # validate JSON response shape
                     stats.n_ok += 1
                     stats.latencies_ms.append(elapsed_ms)
                     stats.total_audio_s += sample.duration_s
