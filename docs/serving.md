@@ -43,7 +43,7 @@ for its entire lifecycle; the mismatched RPC returns `FAILED_PRECONDITION`.
 
 | Surface | Path / Service | Notes |
 |---|---|---|
-| HTTP | `POST /v1/speech:recognize` | Synchronous unary recognition (offline mode). |
+| HTTP | `POST /v1/speech:recognize` | Synchronous unary recognition (offline mode). Raw PCM body, config in the query string (no base64/JSON). |
 | HTTP | `GET /v1/models` | Loaded model metadata. |
 | HTTP | `GET /healthz` | Process liveness. |
 | HTTP | `GET /readyz` | 200 once the engine dispatcher has produced its first Pong. |
@@ -63,19 +63,28 @@ binary (`POST /v1/transcriptions`) endpoints have been removed.
 
 ### `POST /v1/speech:recognize`
 
-Request body mirrors Google's STT v1 JSON transcoding.  Audio is carried
-inline as base64 in `audio.content` (a `uri` field is reserved but returns
-`UNIMPLEMENTED`).
+The request **body is the raw audio payload** (no base64, no JSON envelope) and
+the recognition config travels in the **query string**.  Dropping the base64 +
+JSON request framing avoids the ~33% wire inflation and a multi-MB JSON parse —
+measured at **~2× the throughput** of a base64-JSON body at moderate
+concurrency (188 → 377 req/s at c=128 on the reference box).  The response is a
+small JSON `RecognizeResponse` (transcript + tokens — no base64).
 
 ```bash
-# Base64-encode and POST a WAV file
-B64=$(base64 -w0 audio.wav)
-curl -sS -X POST http://127.0.0.1:8080/v1/speech:recognize \
-     -H 'Content-Type: application/json' \
-     -d "$(jq -n --arg b64 "$B64" \
-           '{config:{encoding:"WAV",sampleRateHertz:16000,languageCode:"en-US"},
-             audio:{content:$b64}}')" | jq
+# POST a WAV container (server reads the embedded sample rate)
+curl -sS -X POST 'http://127.0.0.1:8080/v1/speech:recognize?encoding=WAV' \
+     -H 'Content-Type: application/octet-stream' \
+     --data-binary @audio.wav | jq
+
+# POST headerless raw PCM (little-endian f32 mono)
+curl -sS -X POST \
+  'http://127.0.0.1:8080/v1/speech:recognize?encoding=LINEAR32F&sample_rate=16000' \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary @audio.f32 | jq
 ```
+
+Query parameters: `encoding` (required), `sample_rate` (default 16000; ignored
+for `WAV`), `priority`, `max_alternatives`.
 
 `encoding` accepted values:
 
@@ -83,8 +92,10 @@ curl -sS -X POST http://127.0.0.1:8080/v1/speech:recognize \
 |---|---|
 | `LINEAR16` | Little-endian 16-bit signed PCM, mono. |
 | `LINEAR32F` | Little-endian 32-bit float PCM, mono *(OASR extension)*. |
-| `WAV` | RIFF/WAV container; embedded sample rate wins over `sampleRateHertz` *(OASR extension)*. |
+| `WAV` | RIFF/WAV container in the body; embedded sample rate wins over `sample_rate` *(OASR extension)*. |
 | any other Google STT v1 codec | Returns `UNIMPLEMENTED`. |
+
+> For the lowest-overhead binary transport, gRPC `Recognize` is still preferred.
 
 Success response (`200`):
 
@@ -113,10 +124,10 @@ Error responses use the canonical Google error envelope:
 
 | HTTP status | `status` field | When |
 |---|---|---|
-| 400 | `INVALID_ARGUMENT` | malformed JSON, missing encoding, bad audio bytes, missing `audio.content` |
+| 400 | `INVALID_ARGUMENT` | missing/empty body, missing `encoding`, undecodable audio bytes |
 | 400 | `FAILED_PRECONDITION` | server is in `streaming` mode |
 | 404 | `NOT_FOUND` | unknown request id (internal bug) |
-| 501 | `UNIMPLEMENTED` | unsupported encoding, `audio.uri` |
+| 501 | `UNIMPLEMENTED` | unsupported encoding |
 | 503 | `RESOURCE_EXHAUSTED` | over-capacity, retry with backoff |
 | 503 | `UNAVAILABLE` | dispatcher shutting down or engine lost |
 | 500 | `INTERNAL` | otherwise |
@@ -239,9 +250,16 @@ Available subroutines:
 
 | Name | Transport |
 |---|---|
-| `offline` | `POST /v1/speech:recognize` (HTTP, JSON+base64) |
+| `offline` | `POST /v1/speech:recognize` (HTTP, raw PCM body — no base64/JSON) |
 | `grpc_offline` | gRPC `Recognize` |
 | `grpc_streaming` | gRPC `StreamingRecognize` |
+
+> **Throughput note.** For high-throughput offline serving prefer **gRPC**
+> (`grpc_offline`) — it stays well ahead of the HTTP path at scale on the
+> reference box. The HTTP `offline` path uses a raw-PCM body (no base64/JSON),
+> which is ~2× a base64-JSON body would be. The remaining gap between gRPC and
+> the raw engine ceiling is GPU-bound + online-padding bound; scale out with
+> **one `oasr-server` process per GPU** to multiply total throughput.
 
 Output reports requests `ok` / `rejected` (server backpressure —
 `RESOURCE_EXHAUSTED`) / `fail` (transport errors), wall-clock time, total

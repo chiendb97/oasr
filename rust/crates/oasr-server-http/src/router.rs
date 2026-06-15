@@ -50,6 +50,7 @@ impl std::str::FromStr for ServiceMode {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Speech-to-Text v1 (Google STT v1-shaped surface).
+        // Raw PCM body, config in the query string (no base64/JSON).
         .route(
             "/v1/speech:recognize",
             post(crate::recognize::handle_recognize),

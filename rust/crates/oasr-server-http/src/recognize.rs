@@ -2,17 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Synchronous recognition: `POST /v1/speech:recognize`.
 //!
-//! Body is JSON mirroring the gRPC `RecognizeRequest` / Google STT v1
-//! transcoding convention.  Audio is carried inline as base64 in
-//! `audio.content`.
+//! The request body is the **raw PCM payload** (no base64, no JSON envelope)
+//! and the recognition config rides in the query string
+//! (`?encoding=LINEAR16&sample_rate=16000`).  Dropping the base64 + JSON request
+//! framing avoids the ~33% wire inflation and a multi-MB JSON parse (~2× the
+//! throughput of a base64-JSON body under load).  The response is a small JSON
+//! `RecognizeResponse` (transcript + tokens — no base64).
 
 use std::time::Instant;
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine as _;
 use bytes::Bytes;
 use oasr_asr::{decode_audio, PcmEncoding};
 use oasr_wire::{ErrorCode, Event};
@@ -22,43 +23,6 @@ use tracing::{debug, error, field, info, info_span, warn, Instrument, Span};
 use crate::router::{AppState, ServiceMode};
 
 pub const MAX_BODY: usize = 256 * 1024 * 1024;
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecognitionConfig {
-    #[serde(default)]
-    pub encoding: String,
-    #[serde(default)]
-    pub sample_rate_hertz: u32,
-    #[serde(default)]
-    pub language_code: String,
-    #[serde(default)]
-    pub max_alternatives: u32,
-    #[serde(default)]
-    pub model: String,
-    #[serde(default)]
-    pub audio_channel_count: u32,
-    #[serde(default)]
-    pub priority: i32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecognitionAudio {
-    /// Base64-encoded audio bytes.
-    #[serde(default)]
-    pub content: String,
-    /// Currently unsupported; presence triggers `UNIMPLEMENTED`.
-    #[serde(default)]
-    pub uri: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecognizeRequest {
-    pub config: RecognitionConfig,
-    pub audio: RecognitionAudio,
-}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,7 +66,7 @@ fn is_zero_i32(v: &i32) -> bool {
     *v == 0
 }
 
-/// Map the JSON encoding string to a `(pcm_encoding, content_type_hint)`
+/// Map the `encoding` query value to a `(pcm_encoding, content_type_hint)`
 /// pair.  Names follow the proto enum spelling so the REST + gRPC surfaces
 /// agree.
 fn map_encoding(
@@ -112,7 +76,7 @@ fn map_encoding(
         "" | "ENCODING_UNSPECIFIED" => Err((
             StatusCode::BAD_REQUEST,
             "INVALID_ARGUMENT",
-            "config.encoding must be set".into(),
+            "encoding query parameter must be set".into(),
         )),
         "LINEAR16" => Ok((PcmEncoding::I16Le, None)),
         "LINEAR32F" => Ok((PcmEncoding::F32Le, None)),
@@ -191,8 +155,33 @@ fn error_from_event_code(code: ErrorCode) -> (StatusCode, &'static str) {
     }
 }
 
+/// Query parameters for `POST /v1/speech:recognize`.  The request body is the
+/// raw PCM audio; all recognition config travels here in the query string.
+#[derive(Debug, Deserialize)]
+pub struct RawParams {
+    /// PCM encoding name: `LINEAR16` (i16-LE), `LINEAR32F` (f32-LE), or `WAV`
+    /// (RIFF container in the body).  Same spelling as the proto enum.
+    #[serde(default)]
+    pub encoding: String,
+    /// Sample rate in Hz (default 16000; ignored for `WAV`, which carries its
+    /// own header).
+    #[serde(default)]
+    pub sample_rate: u32,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub max_alternatives: u32,
+}
+
+/// `POST /v1/speech:recognize?encoding=LINEAR16&sample_rate=16000`
+///
+/// Offline unary recognition.  The request **body is the raw PCM payload** (no
+/// base64, no JSON envelope); config rides in the query string.  Avoids the
+/// ~33% base64 inflation and the JSON parse of a multi-MB body.  The response is
+/// a small JSON `RecognizeResponse`.
 pub async fn handle_recognize(
     State(s): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<RawParams>,
     body: axum::body::Body,
 ) -> axum::response::Response {
     // Per-request span; `rid` is recorded once the engine assigns one (after
@@ -219,54 +208,24 @@ pub async fn handle_recognize(
                 );
             }
         };
-
-        let req: RecognizeRequest = match serde_json::from_slice(&bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                return reject(
-                    StatusCode::BAD_REQUEST,
-                    "INVALID_ARGUMENT",
-                    format!("invalid request JSON: {e}"),
-                );
-            }
-        };
-
-        if !req.audio.uri.is_empty() {
-            return reject(
-                StatusCode::NOT_IMPLEMENTED,
-                "UNIMPLEMENTED",
-                "audio.uri is not supported",
-            );
-        }
-        if req.audio.content.is_empty() {
+        if bytes.is_empty() {
             return reject(
                 StatusCode::BAD_REQUEST,
                 "INVALID_ARGUMENT",
-                "audio.content (base64) is required",
+                "request body (raw PCM audio) is required",
             );
         }
 
-        let audio_bytes = match STANDARD.decode(req.audio.content.as_bytes()) {
-            Ok(b) => b,
-            Err(e) => {
-                return reject(
-                    StatusCode::BAD_REQUEST,
-                    "INVALID_ARGUMENT",
-                    format!("audio.content base64 decode: {e}"),
-                );
-            }
-        };
-
-        let (pcm_enc, ct_hint) = match map_encoding(&req.config.encoding) {
+        let (pcm_enc, ct_hint) = match map_encoding(&params.encoding) {
             Ok(p) => p,
             Err((status, code, msg)) => return reject(status, code, msg),
         };
-        let sr = if req.config.sample_rate_hertz == 0 {
+        let sr = if params.sample_rate == 0 {
             16_000
         } else {
-            req.config.sample_rate_hertz
+            params.sample_rate
         };
-        let decoded = match decode_audio(ct_hint, &audio_bytes, pcm_enc, Some(sr)) {
+        let decoded = match decode_audio(ct_hint, &bytes, pcm_enc, Some(sr)) {
             Ok(d) => d,
             Err(e) => {
                 return reject(
@@ -277,88 +236,106 @@ pub async fn handle_recognize(
             }
         };
 
-        let max_alts = req.config.max_alternatives;
-        let priority = req.config.priority;
-        let sample_rate = decoded.sample_rate;
         let audio_buf: Bytes = decoded.samples;
-        let n_samples = audio_buf.len() / 4;
-
-        let handle = match s.pool.submit_offline(audio_buf, sample_rate, priority).await {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(%e, "recognize submit rejected");
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "RESOURCE_EXHAUSTED",
-                    format!("submit failed: {e}"),
-                );
-            }
-        };
-        let rid = handle.request_id.clone();
-        Span::current().record("rid", rid.as_str());
-        let ev = match handle.finish().await {
-            Ok(e) => e,
-            Err(_) => {
-                error!(rid = %rid, "engine channel closed before result");
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "INTERNAL",
-                    "engine channel closed before result",
-                );
-            }
-        };
-        s.pool.release(&rid);
-
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        match ev {
-            Event::Final {
-                request_id,
-                text,
-                tokens,
-                scores,
-            } => {
-                let n_tokens = tokens.first().map_or(0, |t| t.len());
-                info!(
-                    rid = %request_id,
-                    sample_rate,
-                    n_samples,
-                    n_tokens,
-                    elapsed_ms,
-                    transcript = %text,
-                    "recognize ok"
-                );
-                Json(RecognizeResponse {
-                    results: vec![SpeechRecognitionResult {
-                        alternatives: build_alternatives(text, tokens, scores, max_alts),
-                        channel_tag: 0,
-                        language_code: String::new(),
-                    }],
-                    request_id,
-                })
-                .into_response()
-            }
-            Event::Error { code, message, .. } => {
-                let (status, code_name) = error_from_event_code(code);
-                warn!(
-                    rid = %rid,
-                    code = ?code,
-                    status = status.as_u16(),
-                    elapsed_ms,
-                    reason = %message,
-                    "recognize error"
-                );
-                error_response(status, code_name, message)
-            }
-            other => {
-                error!(rid = %rid, elapsed_ms, "unexpected non-terminal event for offline request: {other:?}");
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "INTERNAL",
-                    "unexpected event type",
-                )
-            }
-        }
+        run_offline(
+            &s,
+            audio_buf,
+            decoded.sample_rate,
+            params.priority,
+            params.max_alternatives,
+            start,
+        )
+        .await
     }
     .instrument(span)
     .await
+}
+
+/// Shared offline submit → await → response tail for both the JSON and raw-PCM
+/// recognise handlers.  ``audio_buf`` is f32-LE mono samples (already decoded);
+/// records ``rid`` on the current span once the engine assigns one.
+async fn run_offline(
+    s: &AppState,
+    audio_buf: Bytes,
+    sample_rate: u32,
+    priority: i32,
+    max_alts: u32,
+    start: Instant,
+) -> axum::response::Response {
+    let n_samples = audio_buf.len() / 4;
+    let handle = match s.pool.submit_offline(audio_buf, sample_rate, priority).await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(%e, "recognize submit rejected");
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RESOURCE_EXHAUSTED",
+                format!("submit failed: {e}"),
+            );
+        }
+    };
+    let rid = handle.request_id.clone();
+    Span::current().record("rid", rid.as_str());
+    let ev = match handle.finish().await {
+        Ok(e) => e,
+        Err(_) => {
+            error!(rid = %rid, "engine channel closed before result");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "engine channel closed before result",
+            );
+        }
+    };
+    s.pool.release(&rid);
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    match ev {
+        Event::Final {
+            request_id,
+            text,
+            tokens,
+            scores,
+        } => {
+            let n_tokens = tokens.first().map_or(0, |t| t.len());
+            info!(
+                rid = %request_id,
+                sample_rate,
+                n_samples,
+                n_tokens,
+                elapsed_ms,
+                transcript = %text,
+                "recognize ok"
+            );
+            Json(RecognizeResponse {
+                results: vec![SpeechRecognitionResult {
+                    alternatives: build_alternatives(text, tokens, scores, max_alts),
+                    channel_tag: 0,
+                    language_code: String::new(),
+                }],
+                request_id,
+            })
+            .into_response()
+        }
+        Event::Error { code, message, .. } => {
+            let (status, code_name) = error_from_event_code(code);
+            warn!(
+                rid = %rid,
+                code = ?code,
+                status = status.as_u16(),
+                elapsed_ms,
+                reason = %message,
+                "recognize error"
+            );
+            error_response(status, code_name, message)
+        }
+        other => {
+            error!(rid = %rid, elapsed_ms, "unexpected non-terminal event for offline request: {other:?}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "unexpected event type",
+            )
+        }
+    }
 }
