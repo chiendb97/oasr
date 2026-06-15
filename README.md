@@ -41,10 +41,6 @@ OASR is flexible and easy to use with:
 | Branchformer | 🔲 Planned                       |
 | Transducer   | 🟡 Offline greedy RNNT (streaming/beam WIP) |
 
-New encoder architectures, decode families (CTC / transducer / AED / LLM),
-streaming runtimes, batching policies, and checkpoint loaders each plug in via a
-registry — see [`docs/architecture.md`](docs/architecture.md).
-
 ---
 
 ## Getting Started
