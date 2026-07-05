@@ -224,6 +224,48 @@ CUDA_VISIBLE_DEVICES=1 oasr-server \
 Put any L4/L7 load balancer (nginx, envoy, …) in front — sticky routing is
 not required since one process serves a request end-to-end.
 
+### Processes per GPU — mode-dependent (measured, RTX 5090/SM120)
+
+The right number of `oasr-server` processes **per GPU** differs by service mode:
+
+| Mode | Recommended | Why |
+|---|---|---|
+| **offline** | **1 / GPU** | The batched forward saturates the GPU. Two engines on one GPU thrash on CUDA-graph capture + memory and **regress ~17×** (measured 114 vs 1911 utts/s aggregate). Scale offline only **across** GPUs. |
+| **streaming** | **2–3 / GPU** | Chunk-by-chunk decoding is launch/CPU-bound and leaves the GPU under-utilised. A second process (a second GIL) interleaves kernel launches and fills the idle: **+34% aggregate at 2/GPU** (257→346 utts/s). |
+
+For streaming, enabling **CUDA MPS** (`nvidia-cuda-mps-control -d`) lets the
+processes' kernels run concurrently rather than time-slice, improving the
+multiplier further. Each process is independent — front them with the same
+load balancer.
+
+### Streaming throughput knobs: `--max-batch-size`, `--chunk-size`, processes/GPU
+
+Three composable levers, in order of simplicity (all measured on the reference box):
+
+1. **`--max-batch-size` 64→256: +21%** (262→316 utts/s). Batches more streams into each
+   encoder/fbank/CTC launch, amortising the launch overhead. Simplest (one knob), but
+   **diminishing returns** (64→128 is only +4%) and each step gets ~3–4× longer, so it
+   **raises per-stream chunk latency** — use it for throughput-biased / batch streaming, not
+   interactive. Needs `--max-num-blocks` ≥ `max_batch_size × blocks_per_seq`.
+2. **`--chunk-size` 16→32: +24%** (299→372 utts/s). Twice the audio per step → half the steps.
+   Same latency tradeoff (keep `16` for interactive first-token latency).
+3. **2–3 processes/GPU: +34%** (see table above). The only lever that **also preserves
+   per-stream latency** (each process keeps a modest batch) — it adds a second Python GIL,
+   breaking the single-GIL launch-issuing ceiling that batch/chunk alone cannot.
+
+They stack: throughput-biased → big batch + chunk32 (+ extra processes for the GIL-bound
+remainder); interactive/low-latency → keep batch+chunk modest and scale with processes.
+
+### Tuning knobs (exposed on `oasr-server`)
+
+Beyond `--max-batch-size` / `--chunk-size` / `--preferred-batch-sizes` /
+`--schedule-policy` / `--max-offline-pad-ratio`, the server now forwards the full
+`EngineConfig` tuning surface: `--max-batch-frames`, `--length-bucket-ratio`,
+`--max-wait-time`, `--streaming-cohort-admit`, `--partial-decode-interval`,
+`--overlap-partial-readback`, `--enable-sequence-packing` / `--max-packed-frames`,
+and the (default-off, **keep off** — measured to regress) `--use-ctc-cuda-graphs`
+/ `--use-feature-cuda-graphs`. `oasr-server --help` lists them all.
+
 ## Benchmarking
 
 `benchmarks/bench_service.py` is a load generator for `oasr-server`.  It

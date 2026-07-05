@@ -743,29 +743,35 @@ else:
 #     python scripts/tune_asr_gemm.py --mode capture --shapes shapes.json \
 #         --gpu <uuid> --emit-rules rules.py
 #
+# Regenerated 2026-06-29 under LOCKED clocks (GPU-03584f13, RTX 5090/SM120) from a
+# fresh offline+streaming engine capture (scripts/tune_asr_gemm.py).  Key change vs
+# the prior table: the deep-K thin contract GEMMs (N=256, K∈{2048,4864} and the
+# 512×256 / gemm_activation catch-alls) now route to cuBLAS for ALL large M — the
+# old table fell through to GEMM_DEFAULT (128×128) above m_max=1024, which loses
+# 1.10–1.32× to cuBLAS on the offline batched shapes (docs/gemm_perf_report.md R1).
 _GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
     ("gemm", 256, 256): [
-        (1024, CutlassGemmConfig(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~720: cutlass 0.0061ms (2.00x vs default)
-        (None, CutlassGemmConfig(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~9472: cutlass 0.0143ms (1.00x vs default)
+        (512, "torch"),  # M~416: torch 0.0061ms (2.00x vs default)
+        (1024, CutlassGemmConfig(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64, kStages=4, kSmVersion=120, split_k=1)),  # M~848: cutlass 0.0062ms (1.97x vs default)
+        (None, "torch"),  # M~15872: torch 0.0205ms (1.10x vs default)
     ],
     ("gemm", 256, 2048): [
-        (1024, "torch"),  # M~720: torch 0.0163ms (3.14x vs default)
-        (None, CutlassGemmConfig(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~9472: cutlass 0.0553ms (1.04x vs default)
+        (None, "torch"),  # M~15872: torch 0.0920ms (1.18x vs default)
     ],
     ("gemm", 256, 4864): [
-        (1024, "torch"),  # M~720: torch 0.0209ms (5.39x vs default)
-        (None, CutlassGemmConfig(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~9472: cutlass 0.1270ms (1.02x vs default)
+        (None, "torch"),  # M~15872: torch 0.2007ms (1.32x vs default)
     ],
     ("gemm", 512, 256): [
-        (512, CutlassGemmConfig(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~330: cutlass 0.0061ms (2.00x vs default)
-        (1024, CutlassGemmConfig(block_m=32, block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~960: cutlass 0.0082ms (1.50x vs default)
-        (2048, CutlassGemmConfig(block_m=64, block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~1440: cutlass 0.0082ms (1.50x vs default)
-        (None, CutlassGemmConfig(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~16704: cutlass 0.0369ms (1.05x vs default)
+        (64, "torch"),  # M~60: torch 0.0061ms (2.00x vs default)
+        (512, CutlassGemmConfig(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64, kStages=4, kSmVersion=120, split_k=1)),  # M~390: cutlass 0.0061ms (2.00x vs default)
+        (1024, CutlassGemmConfig(block_m=32, block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64, kStages=4, kSmVersion=120, split_k=1)),  # M~780: cutlass 0.0078ms (1.58x vs default)
+        (2048, CutlassGemmConfig(block_m=64, block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~1590: cutlass 0.0083ms (1.48x vs default)
+        (None, "torch"),  # M~16768: torch 0.0368ms (1.05x vs default)
     ],
     ("gemm_activation", 2048, 256): [
-        (256, CutlassGemmConfig(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64, kStages=4, kSmVersion=120, split_k=1)),  # M~176: cutlass 0.0082ms (1.50x vs default)
-        (512, CutlassGemmConfig(block_m=64, block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~448: cutlass 0.0102ms (1.21x vs default)
-        (None, CutlassGemmConfig(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~9472: cutlass 0.0717ms (1.00x vs default)
+        (256, CutlassGemmConfig(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~160: cutlass 0.0082ms (1.51x vs default)
+        (512, CutlassGemmConfig(block_m=64, block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~416: cutlass 0.0102ms (1.35x vs default)
+        (None, "torch"),  # M~15872: torch 0.1213ms (0.98x vs default)
     ],
 }
 

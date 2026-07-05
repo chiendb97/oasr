@@ -81,18 +81,21 @@ class TestSelectDefaultConfig:
         assert select_default_config("gemm", 64, 256, 4864, torch.bfloat16, 120) == "torch"
 
     @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
-    def test_small_m_picks_small_tile(self):
-        cfg = select_default_config("gemm", 64, 256, 256, torch.bfloat16, 120)
+    def test_small_m_avoids_large_default(self):
+        # At small M the selector never wastes the 128-row default: on (256,256)
+        # cuBLAS wins outright at the smallest M, and a tall-thin CUTLASS tile
+        # wins in the mid band — measured under locked clocks, never 128x128.
+        assert select_default_config("gemm", 64, 256, 256, torch.bfloat16, 120) == "torch"
+        cfg = select_default_config("gemm", 848, 256, 256, torch.bfloat16, 120)
         assert isinstance(cfg, CutlassGemmConfig)
         assert cfg.block_m < 128  # a tall-thin tile, not the 128-row default
 
     @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
-    def test_large_m_uses_large_tile(self):
-        # At large offline M a full 128x128 tile wins (the sweep may pick a
-        # marginally-better warp shape than GEMM_DEFAULT, but never a small tile).
-        cfg = select_default_config("gemm", 16000, 256, 2048, torch.bfloat16, 120)
-        assert isinstance(cfg, CutlassGemmConfig)
-        assert (cfg.block_m, cfg.block_n) == (128, 128)
+    def test_large_m_contract_routes_to_torch(self):
+        # The deep-K thin contract GEMM (FF-down, N=256 K=2048) loses to cuBLAS
+        # at ALL M on SM120 — the locked-clock re-tune routes it to torch even at
+        # large offline M (docs/gemm_perf_report.md R1), not the 128x128 default.
+        assert select_default_config("gemm", 16000, 256, 2048, torch.bfloat16, 120) == "torch"
 
     @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
     @pytest.mark.parametrize("op,N,K", [("gemm", n, k) for (n, k) in _FF_CONV_SHAPES]

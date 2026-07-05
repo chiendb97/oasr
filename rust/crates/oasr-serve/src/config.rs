@@ -73,6 +73,58 @@ pub struct Cli {
     /// 10-20 to 30-60 on mixed-length traffic.
     #[arg(long)]
     pub max_offline_pad_ratio: Option<f64>,
+    /// Offline length-aware batching: hard cap on **padded** input frames per
+    /// micro-batch (``max_len * batch_size`` in pre-subsampling frames).  Unset
+    /// bounds each micro-batch solely by ``max_batch_size``.  Exact-equivalent
+    /// to the padded forward — only batch composition changes — so it trims
+    /// padded GPU waste on mixed-length offline traffic without accuracy drift.
+    #[arg(long)]
+    pub max_batch_frames: Option<u32>,
+    /// Offline length-bucket tolerance: group requests so ``min_len/max_len >=
+    /// this`` within a batch.  ``0`` disables (engine default), relying solely
+    /// on ``max_offline_pad_ratio``.
+    #[arg(long)]
+    pub length_bucket_ratio: Option<f64>,
+    /// Max seconds a waiting request may sit before it is force-admitted even
+    /// without an ideal length-bucket peer (starvation bound).  Engine default
+    /// 0.2.
+    #[arg(long)]
+    pub max_wait_time: Option<f64>,
+    /// Streaming: when true (engine default) admission length-sorts the waiting
+    /// queue so each batched paged forward is length-similar.  Pass ``false``
+    /// for ``schedule_policy``-ordered admission (lower per-stream latency, more
+    /// padded compute).
+    #[arg(long)]
+    pub streaming_cohort_admit: Option<bool>,
+    /// Streaming: capture the CTC decode step into a per-state CUDA graph.
+    /// Engine default false (the per-non-blank D2H of log-prob slices outweighs
+    /// the launch saving at production scale); enable for small-B / many-short-
+    /// utterance deployments.
+    #[arg(long)]
+    pub use_ctc_cuda_graphs: Option<bool>,
+    /// Streaming: capture the batched fbank/mfcc feature extraction into a CUDA
+    /// graph per B bucket.  Engine default false; enable for fixed preferred-B
+    /// deployments where the launch saving beats the per-replay copy.
+    #[arg(long)]
+    pub use_feature_cuda_graphs: Option<bool>,
+    /// Streaming interim-partial cadence: ``1`` (engine default) emits a partial
+    /// every step (one batched D2H read-back), ``N>1`` every N-th step, ``<=0``
+    /// disables interim partials (final transcript only) for throughput.
+    #[arg(long)]
+    pub partial_decode_interval: Option<i64>,
+    /// Streaming: issue the interim-partial read-back non-blocking and emit the
+    /// previous step's partial (one-chunk lag) so the blocking sync leaves the
+    /// critical path.  Engine default false (lowest first-token latency).
+    #[arg(long)]
+    pub overlap_partial_readback: Option<bool>,
+    /// Offline: pack several utterances into one gapless varlen encoder forward
+    /// instead of padding each micro-batch.  Requires ``service_mode=offline``.
+    #[arg(long)]
+    pub enable_sequence_packing: Option<bool>,
+    /// Token budget (post-subsampling encoder frames) for one packed row when
+    /// ``enable_sequence_packing`` is set.  Engine default 8192.
+    #[arg(long)]
+    pub max_packed_frames: Option<u32>,
     /// Full EngineConfig JSON file; values override individual flags above.
     #[arg(long)]
     pub engine_config: Option<PathBuf>,
@@ -174,6 +226,40 @@ impl Cli {
                 obj.entry("max_offline_pad_ratio")
                     .or_insert(Value::Number(n));
             }
+        }
+        if let Some(v) = self.max_batch_frames {
+            obj.entry("max_batch_frames").or_insert(Value::Number(v.into()));
+        }
+        if let Some(r) = self.length_bucket_ratio {
+            if let Some(n) = serde_json::Number::from_f64(r) {
+                obj.entry("length_bucket_ratio").or_insert(Value::Number(n));
+            }
+        }
+        if let Some(r) = self.max_wait_time {
+            if let Some(n) = serde_json::Number::from_f64(r) {
+                obj.entry("max_wait_time").or_insert(Value::Number(n));
+            }
+        }
+        if let Some(b) = self.streaming_cohort_admit {
+            obj.entry("streaming_cohort_admit").or_insert(Value::Bool(b));
+        }
+        if let Some(b) = self.use_ctc_cuda_graphs {
+            obj.entry("use_ctc_cuda_graphs").or_insert(Value::Bool(b));
+        }
+        if let Some(b) = self.use_feature_cuda_graphs {
+            obj.entry("use_feature_cuda_graphs").or_insert(Value::Bool(b));
+        }
+        if let Some(v) = self.partial_decode_interval {
+            obj.entry("partial_decode_interval").or_insert(Value::Number(v.into()));
+        }
+        if let Some(b) = self.overlap_partial_readback {
+            obj.entry("overlap_partial_readback").or_insert(Value::Bool(b));
+        }
+        if let Some(b) = self.enable_sequence_packing {
+            obj.entry("enable_sequence_packing").or_insert(Value::Bool(b));
+        }
+        if let Some(v) = self.max_packed_frames {
+            obj.entry("max_packed_frames").or_insert(Value::Number(v.into()));
         }
         // device defaults to "cuda" — EngineConfig falls back if absent.
 
