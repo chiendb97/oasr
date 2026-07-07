@@ -1,0 +1,207 @@
+#pragma once
+
+// Shared device-side infrastructure for the WFST decoder kernels: score-ordering helpers,
+// the device graph view + arc-range accessors, per-lane counters, and the Workspace/Sizes
+// PODs passed by value into every kernel. Framework-agnostic (no Torch); #included into
+// the single decoder translation unit (csrc/decoder.cu) together with the per-family
+// kernel headers. See .claude/skills/add-cuda-kernel/SKILL.md.
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <climits>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+
+namespace oasr::wfst {
+namespace kernels {
+
+constexpr uint32_t kEmptyKey = 0xFFFFFFFFu;
+constexpr float kNegInf = -INFINITY;
+constexpr int kMaxProbes = 256;
+
+// Overflow bits (DecodeResult::overflow).
+constexpr uint32_t kOverflowCand = 1u;      // candidate buffer full
+constexpr uint32_t kOverflowHash = 2u;      // probe bound exceeded
+constexpr uint32_t kOverflowArena = 4u;     // shared winners arena full
+constexpr uint32_t kOverflowClaims = 8u;    // raw distinct-state claims list full
+constexpr uint32_t kOverflowKept = 16u;     // surviving frontier > main_q
+
+// Lane phase for the current step.
+enum Phase : int32_t {
+  kPhaseReal = 0,      // emitting expansion of frame t
+  kPhaseFinal = 1,     // final step, real -1 arcs
+  kPhaseRedirect = 2,  // final step, allow_partial redirect (no reachable final arc)
+  kPhaseDone = 3,
+  kPhaseEps = 4,       // epsilon-closure pass over the just-built frontier (TLG)
+};
+
+// Monotonic float->uint mapping: uint compare == float compare.
+__host__ __device__ inline uint32_t BitsOfFloat(float f) {
+#ifdef __CUDA_ARCH__
+  return __float_as_uint(f);
+#else
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  return u;
+#endif
+}
+__host__ __device__ inline float FloatOfBits(uint32_t u) {
+#ifdef __CUDA_ARCH__
+  return __uint_as_float(u);
+#else
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+#endif
+}
+__host__ __device__ inline uint32_t FloatToOrderedUint(float f) {
+  const uint32_t u = BitsOfFloat(f);
+  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__host__ __device__ inline float OrderedUintToFloat(uint32_t u) {
+  u = (u & 0x80000000u) ? (u & 0x7FFFFFFFu) : ~u;
+  return FloatOfBits(u);
+}
+
+struct LaneCounters {
+  int32_t frontier_size;
+  int32_t next_raw;      // #next-frontier entries appended by hash claimers this step
+  int32_t cand_count;    // #candidates appended this step
+  int32_t t;             // current step (== frame index; == T means final step)
+  int32_t T;             // real frames for this lane (INT32_MAX while streaming = k2
+                         // online beam semantics; FinalizeStream sets T = t)
+  int32_t chunk_start;   // first frame of the current chunk (log-prob row 0)
+  int32_t chunk_end;     // decode while t < chunk_end (offline: T + 1)
+  int32_t log_len;       // streaming: winners used in this lane's region
+  int32_t cand_consumed; // eps mode: candidates already resolved this frame
+  int32_t cand_emit;     // candidates [0, cand_emit) are emitting/final; rest are eps
+  int32_t phase;
+  int32_t has_valid_final;
+  int32_t total_arcs;    // arcs to expand this step
+  float dyn_beam;
+  uint32_t running_max;  // ordered-uint of the step's best end score
+  uint32_t overflow;
+  int32_t status;        // 0 running, 1 ok-finished, 2 dead
+  int32_t reached_final;
+  float final_score;
+  int32_t final_tok;     // winners-arena index (GLOBAL) of the accepted final token
+  float lat_best;        // interval prune: reference score for the loose keep rule
+  // redirect two-pass helpers
+  int32_t redirect_claimed;
+};
+
+struct DeviceGraph {
+  const int32_t* row_splits;
+  const int32_t* final_count;
+  const int32_t* eps_count;  // nullptr on epsilon-free graphs
+  const int2* dest_ilabel;
+  const float* weight;
+  int32_t num_states;
+  int32_t vocab_size;
+  int32_t start_state;
+  bool finals_at_end;
+  bool eps_first;
+};
+
+__device__ inline int32_t EpsCountOf(const DeviceGraph& g, int32_t s) {
+  return g.eps_count != nullptr ? g.eps_count[s] : 0;
+}
+__device__ inline int32_t RestBegin(const DeviceGraph& g, int32_t s) {
+  return g.row_splits[s] + (g.finals_at_end ? 0 : g.final_count[s]);
+}
+__device__ inline int32_t RestEnd(const DeviceGraph& g, int32_t s) {
+  return g.row_splits[s + 1] - (g.finals_at_end ? g.final_count[s] : 0);
+}
+__device__ inline int32_t EmitBegin(const DeviceGraph& g, int32_t s) {
+  return RestBegin(g, s) + (g.eps_first ? EpsCountOf(g, s) : 0);
+}
+__device__ inline int32_t EmitCount(const DeviceGraph& g, int32_t s) {
+  return RestEnd(g, s) - RestBegin(g, s) - EpsCountOf(g, s);
+}
+__device__ inline int32_t EpsBegin(const DeviceGraph& g, int32_t s) {
+  return g.eps_first ? RestBegin(g, s) : RestEnd(g, s) - EpsCountOf(g, s);
+}
+__device__ inline int32_t FinalBegin(const DeviceGraph& g, int32_t s) {
+  return g.finals_at_end ? g.row_splits[s + 1] - g.final_count[s] : g.row_splits[s];
+}
+
+struct Workspace {
+  // Frontier (double-buffered), per lane, capacity main_q.
+  int32_t* tok_state[2];
+  float* tok_score[2];
+  int32_t* tok_winner[2];      // GLOBAL winners-arena index of the token
+  int32_t* tok_emit_begin;     // first arc to expand per token (phase-dependent), cur only
+  int32_t* arc_offsets;        // per lane: exclusive prefix sums, [main_q + 1]
+  // Next-frontier raw claims {state, hash_slot}.
+  int2* next_claims;
+  // Per-step candidates {prev_local, arc}.
+  int2* cand;
+  // Recombination hash.
+  uint32_t* hash_key;
+  unsigned long long* hash_payload;
+  int32_t* hash_pos;  // eps mode: state -> frontier position map (per claimed slot)
+  // Shared winners arena {prev_global, arc}: all lanes allocate blocks from one pool via
+  // the global cursor. Statistical sizing — per-lane worst case would need 10s of GB.
+  int2* winners;
+  int32_t* arena_cursor;  // single global counter
+  // Backtracked best-path arcs per lane (reversed), filled by BacktrackKernel.
+  int32_t* arc_out;      // [lane][path_cap]
+  int32_t* arc_out_len;  // [lane]
+  // Lattice mode: per-token forward scores + backward scores (ordered-uint; 0 == -inf),
+  // parallel to the winners arena; candidate arena {src_tok, dest_tok, arc|redirect_bit,
+  // end_bits} with per-(lane,frame) segments.
+  float* cand_end;  // [lane][cand_cap], end scores of this step's candidates
+  float* tok_fwd;
+  uint32_t* tok_bwd;
+  int4* lat;
+  int4* lat2;         // interval-prune scratch (compaction bounce buffer)
+  int32_t* lat_cursor;
+  int32_t* lat2_cursor;
+  int2* lat_seg;  // [lane][step] = {base, count}
+  // Backward-pruned lattice arc records, 6 x i32 each:
+  // {src_tok, dst_tok, label, arc_map, score_bits, t}; per-lane counts in lat_out_len.
+  int32_t* lat_out;
+  int32_t* lat_out_cursor;
+  int32_t* lat_out_len;  // [lane]
+  LaneCounters* lanes;
+  // Debug snapshots.
+  int2* snap;         // {state, score-bits}, [lane][frame][main_q]
+  int32_t* snap_len;  // [lane][frame]
+};
+
+struct Sizes {
+  int32_t lanes;
+  int32_t main_q;      // surviving-frontier capacity
+  int32_t claims_cap;  // raw distinct-state claims per step (loose-admit superset)
+  int32_t cand_cap;
+  int32_t hash_cap;   // power of two
+  int32_t lp_half;    // log-probs stored as fp16
+  int32_t arena_cap;  // shared winners-arena entries (global)
+  int32_t path_cap;   // max best-path arcs per lane (max_frames + 2)
+  int32_t lat_cap;    // shared lattice-candidate arena entries (0 = 1-best mode)
+  int32_t stream_log_cap;  // streaming: per-lane winners region (0 = batch mode)
+  int32_t snap_frames;  // 0 = disabled
+};
+
+constexpr int32_t kRedirectArcBit = 1 << 30;  // lattice arc labeled -1 (allow_partial)
+constexpr int32_t kEpsArcBit = 1 << 29;       // lattice arc from an epsilon hop (label 0;
+                                              // src and dst tokens share a frame)
+
+// Log-prob load: fp32 or fp16 storage, f32 accumulation everywhere.
+__device__ inline float LoadLp(const void* lp, int64_t idx, bool half) {
+  return half ? __half2float(__ldg(reinterpret_cast<const __half*>(lp) + idx))
+              : __ldg(reinterpret_cast<const float*>(lp) + idx);
+}
+
+__device__ inline uint32_t HashState(uint32_t s, uint32_t mask) {
+  s ^= s >> 16;
+  s *= 0x85ebca6bu;
+  s ^= s >> 13;
+  s *= 0xc2b2ae35u;
+  s ^= s >> 16;
+  return s & mask;
+}
+
+}  // namespace kernels
+}  // namespace oasr::wfst

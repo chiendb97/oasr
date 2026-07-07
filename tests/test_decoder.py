@@ -687,8 +687,17 @@ class TestDecoderAPI:
         with _pytest.raises(ValueError, match="Unknown search_type"):
             Decoder(config)
 
-    def test_wfst_no_k2_raises(self):
-        """Requesting WFST without K2 raises RuntimeError with a helpful message."""
+    def test_wfst_requires_fst(self):
+        """search_type='wfst' without an fst path raises a helpful ValueError."""
+        from oasr.decode import Decoder, DecoderConfig
+        import pytest as _pytest
+
+        config = DecoderConfig(search_type="wfst")
+        with _pytest.raises(ValueError, match="decoding FST path must be provided"):
+            Decoder(config)
+
+    def test_wfst_k2_backend_no_k2_raises(self):
+        """Selecting the k2 WFST backend without K2 raises a helpful RuntimeError."""
         from oasr.decode import Decoder, DecoderConfig
         import oasr.decoder as _d
         import pytest as _pytest
@@ -696,9 +705,9 @@ class TestDecoderAPI:
         if _d.k2_available:
             pytest.skip("K2 is available; skipping 'no-K2' error test.")
 
-        config = DecoderConfig(search_type="wfst")
+        config = DecoderConfig(search_type="wfst", wfst_backend="k2")
         with _pytest.raises(RuntimeError, match="K2 WFST decoder is not available"):
-            Decoder(config)
+            Decoder(config, fst="/nonexistent/graph.pt")
 
     def test_decoder_config_property(self):
         """Decoder.config returns the original DecoderConfig."""

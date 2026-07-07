@@ -50,9 +50,12 @@ _decoder_c = _load_c_decoder()
 if _decoder_c is not None:
     ContextGraph = _decoder_c.ContextGraph
     k2_available: bool = getattr(_decoder_c, "k2_available", False)
+    # True when oasr was built with OASR_USE_WFST_DECODER=1 (in-tree CUDA WFST decoder).
+    wfst_decoder_available: bool = getattr(_decoder_c, "wfst_decoder_available", False)
 else:
     ContextGraph = None  # type: ignore[assignment,misc]
     k2_available: bool = False  # type: ignore[assignment]
+    wfst_decoder_available: bool = False  # type: ignore[assignment]
 
 
 __all__ = [
@@ -66,4 +69,5 @@ __all__ = [
     "CtcWfstBeamSearch",
     "ContextGraph",
     "k2_available",
+    "wfst_decoder_available",
 ]

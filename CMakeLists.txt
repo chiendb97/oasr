@@ -11,6 +11,7 @@ project(oasr LANGUAGES CXX CUDA)
 # pybind11 module (_C) that exposes it.
 option(BUILD_PYTHON "Build Python bindings (_C pybind11 module)" ON)
 option(OASR_USE_K2 "Enable K2 WFST beam search decoder (requires K2)" OFF)
+option(OASR_USE_WFST_DECODER "Enable in-tree GPU WFST beam-search decoder (CUDA)" OFF)
 
 # =============================================================================
 # Global settings
@@ -195,6 +196,35 @@ if(OASR_USE_K2)
 endif()
 
 # =============================================================================
+# Optional: in-tree GPU WFST decoder (CUDA)
+# =============================================================================
+# Self-contained CUDA beam-search decoder migrated from the standalone `wfst`
+# project.  No external dependencies at decode time (k2 is only needed offline
+# to export a graph to hlg.img).  decoder.cu is a single translation unit that
+# #includes all kernel headers, so it must NOT be split or built with separable
+# compilation (see the CUDA_SEPARABLE_COMPILATION OFF below).
+if(OASR_USE_WFST_DECODER)
+    list(APPEND OASR_SOURCES
+        csrc/decoder/wfst/graph_io.cc
+        csrc/decoder/wfst/cpu_reference.cc
+        csrc/decoder/wfst/decoder.cu)
+    list(APPEND OASR_HEADERS
+        # Kernel-related headers (pure CUDA, no host/framework deps)
+        include/oasr/wfst/config.h
+        include/oasr/wfst/kernels/common.cuh
+        include/oasr/wfst/kernels/init.cuh
+        include/oasr/wfst/kernels/frame.cuh
+        include/oasr/wfst/kernels/epsilon.cuh
+        include/oasr/wfst/kernels/lattice.cuh
+        include/oasr/wfst/kernels/backtrack.cuh
+        # Host-side decoder interface / graph I/O / CPU reference
+        csrc/decoder/wfst/graph.h
+        csrc/decoder/wfst/decoder.h
+        csrc/decoder/wfst/cpu_reference.h)
+    message(STATUS "In-tree GPU WFST decoder enabled")
+endif()
+
+# =============================================================================
 # Library target (decoder only — kernel launchers are JIT-compiled at runtime)
 # =============================================================================
 add_library(oasr_core STATIC ${OASR_SOURCES} ${OASR_HEADERS})
@@ -218,6 +248,20 @@ if(OASR_USE_K2)
     target_link_libraries(oasr_core PUBLIC k2context k2_torch)
     message(STATUS "K2 source dir (internal headers): ${K2_SOURCE_DIR}")
     message(STATUS "Linking oasr_core with K2 (offline + streaming decoders)")
+endif()
+
+if(OASR_USE_WFST_DECODER)
+    # Propagates to the _C pybind module (drives the #ifdef in pybind_decoder.h).
+    target_compile_definitions(oasr_core PUBLIC OASR_USE_WFST_DECODER)
+    # Single-TU decoder.cu: keep whole-program codegen (no device-side linking).
+    set_target_properties(oasr_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+    # decoder.cu uses cudaMalloc / cudaGraph* — link the CUDA runtime.
+    target_link_libraries(oasr_core PUBLIC CUDA::cudart)
+    # -lineinfo scoped to this TU for profiler line tables (parity with the wfst
+    # build; non-codegen, so it does not affect numerics or perf).
+    set_source_files_properties(csrc/decoder/wfst/decoder.cu
+        PROPERTIES COMPILE_OPTIONS "-lineinfo")
+    message(STATUS "Linking oasr_core with the in-tree GPU WFST decoder")
 endif()
 
 # =============================================================================
@@ -280,5 +324,6 @@ message(STATUS "Build type:         ${CMAKE_BUILD_TYPE}")
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "Python bindings:    ${BUILD_PYTHON}")
 message(STATUS "K2 WFST decoder:    ${OASR_USE_K2}")
+message(STATUS "WFST GPU decoder:   ${OASR_USE_WFST_DECODER}")
 message(STATUS "================================")
 message(STATUS "")

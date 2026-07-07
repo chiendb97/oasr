@@ -9,6 +9,7 @@ the session lifecycle methods stay no-ops (inherited from the base).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, ClassVar, Dict, List
 
 import torch
@@ -42,14 +43,19 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
         self, enc_out: torch.Tensor, enc_lengths: torch.Tensor
     ) -> List[RequestOutput]:
         cfg = self._config.wfst_decoder_config
+        # Size the GPU offline decoder's lane pool to the engine's batch width so the
+        # whole batch decodes in one GPU launch — batched throughput is the headline
+        # perf lever (B=1: 1560x vs B=32: 5964x on the reference stack). No-op for the
+        # k2 backend, which decodes one utterance per call.
+        if getattr(cfg, "wfst_backend", "gpu").lower() == "gpu":
+            lanes = max(int(self._config.max_batch_size), cfg.wfst_max_offline_lanes)
+            if lanes != cfg.wfst_max_offline_lanes:
+                cfg = replace(cfg, wfst_max_offline_lanes=lanes)
         decoder = Decoder(cfg, fst=self._config.fst_path)
 
-        lengths_list = enc_lengths.cpu().tolist()
+        results: List[DecoderResult] = decoder.decode_batch(enc_out, enc_lengths)
         outputs = []
-        for b in range(enc_out.size(0)):
-            t = int(lengths_list[b])
-            logp = enc_out[b, :t, :]  # (T, V)
-            result: DecoderResult = decoder.decode(logp)
+        for result in results:
             best = result.tokens[0] if result.tokens else []
             text = self._detok.detokenize(best)
             outputs.append(
