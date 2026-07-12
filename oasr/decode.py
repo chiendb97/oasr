@@ -140,11 +140,12 @@ def _make_searcher(config: DecoderConfig, fst=None):
             )
         backend = (config.wfst_backend or "gpu").lower()
         if backend == "gpu":
-            if not _dec.wfst_decoder_available:
+            # The in-tree CUDA decoder is JIT-compiled on first use (no build flag);
+            # it only needs a CUDA device.
+            if not torch.cuda.is_available():
                 raise RuntimeError(
-                    "The in-tree GPU WFST decoder is not available. "
-                    "Rebuild with OASR_USE_WFST_DECODER=1 to enable it "
-                    "(or set DecoderConfig.wfst_backend='k2' to use the k2 backend)."
+                    "The GPU WFST decoder requires CUDA. Set "
+                    "DecoderConfig.wfst_backend='k2' to use the k2 backend instead."
                 )
             from oasr.decoder.wfst_decoder import WfstDecoderOptions, WfstDecoderSearch
 

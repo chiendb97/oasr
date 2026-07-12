@@ -3,7 +3,7 @@
 // Path-extraction and table-hygiene kernels: streaming partial-hypothesis backtrack, the
 // final best-path backtrack (one thread per lane walks the winners chain), and the
 // end-of-batch hash sanitize that wipes lanes whose claim/probe lists overflowed.
-#include "oasr/wfst/kernels/common.cuh"
+#include "oasr/wfst/common.cuh"
 
 namespace oasr::wfst {
 namespace kernels {

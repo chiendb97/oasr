@@ -5,11 +5,14 @@
 Two groups:
 
 * Self-contained toy-graph tests build a tiny .img in a tmp dir and exercise the full
-  stack (graph load -> GPU decode -> backtrack) with no external assets. They run
-  whenever CUDA is present and oasr was built with ``OASR_USE_WFST_DECODER=1``.
+  stack (JIT compile -> graph load -> GPU decode -> backtrack) with no external assets.
+  They run whenever CUDA is present and the JIT module compiles.
 * Real-graph smoke tests drive the public ``oasr.decode.Decoder`` API through the GPU
   backend; they need a decoding graph via ``OASR_TEST_FST`` (an HLG ``.pt`` or a prebuilt
   ``.img``).
+
+The CUDA decoder is JIT-compiled on first use (``oasr.jit.wfst_decoder``); the stateful
+decoder lives behind an int64 handle and results come back through CPU output tensors.
 """
 
 import math
@@ -25,18 +28,16 @@ import torch
 # ---------------------------------------------------------------------------
 
 
-def _c_decoder():
-    """Return oasr._C.decoder if the in-tree GPU WFST decoder is built, else skip."""
+def _module():
+    """Return the JIT-compiled WFST decoder module, or skip if unavailable."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
     try:
-        import oasr._C as _C
-    except Exception as exc:  # pragma: no cover
-        pytest.skip(f"oasr._C unavailable: {exc}")
-    dec = getattr(_C, "decoder", None)
-    if dec is None or not getattr(dec, "wfst_decoder_available", False):
-        pytest.skip("in-tree GPU WFST decoder not built (reinstall with OASR_USE_WFST_DECODER=1)")
-    return dec
+        from oasr.decoder.wfst_decoder import _get_module
+
+        return _get_module()
+    except Exception as exc:  # pragma: no cover - JIT toolchain missing
+        pytest.skip(f"WFST decoder JIT module unavailable: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -92,9 +93,22 @@ def _toy_logp(labels, device="cpu") -> torch.Tensor:
     return lp
 
 
+def _cpu_decode(mod, graph_handle, logp_cpu, min_active=1, max_active=100):
+    """Run the module's CPU reference; return (words, score, ok)."""
+    cap = max(1, logp_cpu.size(0) * 4)
+    out_words = torch.empty((cap,), dtype=torch.int32)
+    out_wlen = torch.empty((1,), dtype=torch.int32)
+    out_score = torch.empty((1,), dtype=torch.float64)
+    out_meta = torch.empty((3,), dtype=torch.int32)
+    mod.wfst_cpu_decode(graph_handle, logp_cpu, 20.0, 8.0, min_active, max_active, 1, 0, 3,
+                        out_words, out_wlen, out_score, out_meta)
+    length = min(int(out_wlen[0]), cap)
+    return out_words[:length].tolist(), float(out_score[0]), bool(out_meta[0])
+
+
 @pytest.fixture(scope="module")
 def toy_fst(tmp_path_factory):
-    _c_decoder()  # skip early if no CUDA / not built
+    _module()  # skip early if no CUDA / JIT unavailable
     path = str(tmp_path_factory.mktemp("wfst") / "toy.img")
     _write_toy_graph(path)
     return path
@@ -107,32 +121,30 @@ def toy_fst(tmp_path_factory):
 
 def test_toy_gpu_matches_cpu_reference(toy_fst):
     """GPU decode == CPU reference == the expected word sequence."""
-    dec = _c_decoder()
-    g = dec.load_graph(toy_fst)
-    lp = _toy_logp([1, 2])  # exactly consume labels 1, 2
+    from oasr.decoder.wfst_decoder import WfstDecoderOptions, WfstDecoderSearch, _get_graph
 
-    cpu = dec.cpu_decode(g, lp, search_beam=20.0, output_beam=8.0,
-                         min_active=1, max_active=100, allow_partial=True)
-    gd = dec.GpuDecoder(g, search_beam=20.0, output_beam=8.0, min_active=1, max_active=100,
-                        allow_partial=True, max_lanes=2, max_frames=16, device=0,
-                        main_q_factor=8, cand_factor=6)
-    outs = gd.decode_batch(lp.unsqueeze(0).cuda().contiguous(),
-                           torch.tensor([lp.size(0)], dtype=torch.int32))
-    gpu = outs[0]
+    mod = _module()
+    opts = WfstDecoderOptions(min_active_states=1, max_active_states=100,
+                              blank_skip_thresh=1.0, max_frames=16, max_offline_lanes=2)
+    searcher = WfstDecoderSearch(toy_fst, opts)
+    tokens, scores = searcher.decode_offline(_toy_logp([1, 2], "cuda"))
+    gpu_words, gpu_score = tokens[0], scores[0]
 
-    assert cpu["ok"] and gpu["ok"]
-    assert list(cpu["words"]) == _TOY_WORDS
-    assert list(gpu["words"]) == list(cpu["words"])
-    assert gpu["score"] == pytest.approx(cpu["score"], abs=1e-4)
+    cpu_words, cpu_score, cpu_ok = _cpu_decode(mod, _get_graph(toy_fst), _toy_logp([1, 2]))
+
+    assert cpu_ok
+    assert cpu_words == _TOY_WORDS
+    assert gpu_words == cpu_words
+    assert gpu_score == pytest.approx(cpu_score, abs=1e-4)
 
 
 def test_toy_batched_offline_equivalence(toy_fst):
     """decode_offline_batch on a padded, mixed-length batch == per-row decode_offline."""
-    _c_decoder()
+    _module()
     from oasr.decoder.wfst_decoder import WfstDecoderOptions, WfstDecoderSearch
 
     opts = WfstDecoderOptions(min_active_states=1, max_active_states=100,
-                          blank_skip_thresh=1.0, max_frames=32, max_offline_lanes=4)
+                              blank_skip_thresh=1.0, max_frames=32, max_offline_lanes=4)
     searcher = WfstDecoderSearch(toy_fst, opts)
 
     rows = [
@@ -170,7 +182,7 @@ FST = os.environ.get(
 
 @pytest.fixture(scope="module")
 def wfst_decoder_cls():
-    _c_decoder()  # CUDA + in-tree build
+    _module()  # CUDA + JIT available
     if not os.path.exists(FST):
         pytest.skip(f"no decoding graph at {FST} (set OASR_TEST_FST)")
     from oasr.decode import Decoder, DecoderConfig

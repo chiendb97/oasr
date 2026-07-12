@@ -11,9 +11,6 @@
 #ifdef OASR_USE_K2
 #include "decoder/ctc_wfst_beam_search.h"
 #endif
-#ifdef OASR_USE_WFST_DECODER
-#include "pybind_wfst_decoder.h"
-#endif
 
 namespace py = pybind11;
 
@@ -232,17 +229,6 @@ inline void registerDecoderBindings(py::module_& m) {
 #else
     decoder_mod.attr("k2_available") = false;
 #endif  // OASR_USE_K2
-
-    // -----------------------------------------------------------------
-    // In-tree GPU WFST decoder (self-contained CUDA; see pybind_wfst_decoder.h).
-    // Exposes decoder.Graph / load_graph / cpu_decode / GpuDecoder.
-    // -----------------------------------------------------------------
-#ifdef OASR_USE_WFST_DECODER
-    registerWfstDecoderBindings(decoder_mod);
-    decoder_mod.attr("wfst_decoder_available") = true;
-#else
-    decoder_mod.attr("wfst_decoder_available") = false;
-#endif  // OASR_USE_WFST_DECODER
 }
 
 }  // namespace pybind

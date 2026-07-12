@@ -3,7 +3,7 @@
 // Setup kernels: batch init (K0, batch size device-resident so captured graphs are
 // batch-agnostic) and the streaming lane-lifecycle kernels (stream create, chunk begin,
 // finalize-prep).
-#include "oasr/wfst/kernels/common.cuh"
+#include "oasr/wfst/common.cuh"
 
 namespace oasr::wfst {
 namespace kernels {

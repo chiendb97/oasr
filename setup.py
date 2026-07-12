@@ -188,13 +188,6 @@ class CMakeBuild(build_ext):
         else:
             cmake_args.append("-DOASR_USE_K2=OFF")
 
-        # In-tree GPU WFST decoder (self-contained CUDA; no external deps at
-        # decode time).  Opt-in, mirroring OASR_USE_K2.
-        if os.environ.get("OASR_USE_WFST_DECODER", "0") == "1":
-            cmake_args.append("-DOASR_USE_WFST_DECODER=ON")
-        else:
-            cmake_args.append("-DOASR_USE_WFST_DECODER=OFF")
-
         # Build arguments
         build_args = ["--config", build_type]
         

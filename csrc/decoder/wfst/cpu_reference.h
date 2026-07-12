@@ -4,7 +4,7 @@
 #include <utility>
 #include <vector>
 
-#include "oasr/wfst/config.h"
+#include "decoder/wfst/config.h"
 #include "decoder/wfst/graph.h"
 
 namespace oasr::wfst {

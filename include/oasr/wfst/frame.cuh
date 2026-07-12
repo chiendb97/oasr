@@ -4,8 +4,8 @@
 // prefix sums), K2a Max (exact per-step cutoff), K2b Expand (admit + hash recombine),
 // K3 Finalize (exact filter + winner resolution + frontier build). DecoderConfig drives
 // the beam/phase logic.
-#include "oasr/wfst/config.h"
-#include "oasr/wfst/kernels/common.cuh"
+#include "decoder/wfst/config.h"
+#include "oasr/wfst/common.cuh"
 
 namespace oasr::wfst {
 namespace kernels {

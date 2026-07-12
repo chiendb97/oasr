@@ -1,27 +1,27 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""GPU WFST beam search backed by the standalone ``wfst`` decoder.
+"""GPU WFST beam search over the in-tree CUDA decoder (JIT-compiled).
 
 Drop-in replacement for the k2-based WFST path in :mod:`oasr.decode`: exposes the same
 duck-typed searcher protocol (``reset`` / ``search`` / ``finalize_search`` +
 ``outputs`` / ``likelihood`` / ``times``) plus a batched-exact ``decode_offline`` fast
 path. Log-probs stay on the GPU end to end (``wants_device_tensor = True``).
 
-The heavyweight state — graph image and GPU decoder instances — is shared process-wide
-through a cache keyed by (graph, options, device): offline strategies construct
-:class:`oasr.decode.Decoder` per call and streaming holds one per request, so per-object
-construction must stay cheap. Streaming searchers borrow a channel from one shared
-multi-channel decoder and release it on ``finalize_search`` (or GC).
+The CUDA decoder is compiled on first use via TVM-FFI JIT (``oasr.jit.wfst_decoder``),
+mirroring the GPU CTC decoder. The stateful ``GpuDecoder`` C++ object lives behind an
+opaque ``int64`` handle; decode results (host-side after backtrack) are returned through
+caller-allocated CPU output tensors. The heavyweight state — graph image and decoder
+instances — is shared process-wide through caches keyed by (graph, options, device), so
+per-``WfstDecoderSearch`` construction stays cheap. Streaming searchers borrow a channel
+from one shared multi-channel decoder and release it on ``finalize_search`` (or GC).
 
-Graphs: pass either a prebuilt ``.img`` (built by
-:mod:`oasr.decoder.wfst.graph_export`) or a k2 ``HLG.pt`` — the latter is exported once
-and cached next to the source file. The CUDA decoder itself is the in-tree
-``oasr._C.decoder`` module (built with ``OASR_USE_WFST_DECODER=1``); no external ``wfst``
-checkout is required.
+Graphs: pass either a prebuilt ``.img`` (built by :mod:`oasr.decoder.wfst.graph_export`)
+or a k2 ``HLG.pt`` — the latter is exported once and cached next to the source file.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 import threading
 from pathlib import Path
@@ -30,7 +30,6 @@ from typing import List, Optional
 import torch
 
 _lock = threading.Lock()
-_lib = None
 _graphs: dict = {}
 _offline: dict = {}
 _streaming: dict = {}
@@ -39,23 +38,12 @@ _OFFLINE_MAX_LANES = 8
 _STREAM_CHUNK_FRAMES = 128
 
 
-def _get_lib():
-    """Return the in-tree GPU WFST decoder module (``oasr._C.decoder``).
+@functools.cache
+def _get_module():
+    """Return the JIT-compiled WFST decoder module (compiled on first use)."""
+    from oasr.jit.wfst_decoder import gen_wfst_decoder_module
 
-    Raises if oasr was not built with the decoder (``OASR_USE_WFST_DECODER=1``).
-    """
-    global _lib
-    if _lib is None:
-        import oasr._C as _C
-
-        decoder = _C.decoder
-        if not getattr(decoder, "wfst_decoder_available", False):
-            raise RuntimeError(
-                "the in-tree GPU WFST decoder is not available; reinstall oasr with "
-                "OASR_USE_WFST_DECODER=1 to enable it"
-            )
-        _lib = decoder
-    return _lib
+    return gen_wfst_decoder_module().build_and_load()
 
 
 def _resolve_graph_image(fst: str) -> str:
@@ -71,11 +59,12 @@ def _resolve_graph_image(fst: str) -> str:
     return str(cache)
 
 
-def _get_graph(fst: str):
+def _get_graph(fst: str) -> int:
+    """Return the process-wide graph handle for *fst* (loading it once)."""
     with _lock:
         if fst not in _graphs:
-            lib = _get_lib()
-            _graphs[fst] = lib.load_graph(_resolve_graph_image(fst))
+            mod = _get_module()
+            _graphs[fst] = int(mod.wfst_load_graph(_resolve_graph_image(fst)))
         return _graphs[fst]
 
 
@@ -118,58 +107,88 @@ class WfstDecoderOptions:
         self.max_offline_lanes = max_offline_lanes
 
 
-def _get_offline_decoder(fst: str, opts: WfstDecoderOptions, device: int):
+def _get_offline_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> int:
     key = _decoder_key(fst, opts, device) + (opts.max_frames, opts.max_offline_lanes)
     graph = _get_graph(fst)  # takes _lock itself; resolve before re-acquiring
     with _lock:
         if key not in _offline:
-            lib = _get_lib()
-            _offline[key] = lib.GpuDecoder(
-                graph,
-                search_beam=opts.search_beam,
-                output_beam=opts.output_beam,
-                min_active=opts.min_active_states,
-                max_active=opts.max_active_states,
-                allow_partial=True,
-                max_lanes=opts.max_offline_lanes,
-                max_frames=opts.max_frames,
-                device=device,
-                main_q_factor=32,
-                cand_factor=3,
-            )
+            mod = _get_module()
+            _offline[key] = int(mod.wfst_create_decoder(
+                graph, opts.search_beam, opts.output_beam,
+                opts.min_active_states, opts.max_active_states, 1,  # allow_partial
+                opts.max_offline_lanes, opts.max_frames, device,
+                32, 3,        # main_q_factor, cand_factor (offline: bench-proven)
+                1,            # use_cuda_graphs
+                0, 0, 0,      # lattice, fp16_logprobs, streaming
+                0, 3,         # lat_prune_interval, eps_iterations
+            ))
         return _offline[key]
 
 
-def _get_streaming_decoder(fst: str, opts: WfstDecoderOptions, device: int):
+def _get_streaming_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> int:
     key = _decoder_key(fst, opts, device) + (opts.max_streams,)
     graph = _get_graph(fst)  # takes _lock itself; resolve before re-acquiring
     with _lock:
         if key not in _streaming:
-            lib = _get_lib()
-            _streaming[key] = lib.GpuDecoder(
-                graph,
-                search_beam=opts.search_beam,
-                output_beam=opts.output_beam,
-                min_active=opts.min_active_states,
-                max_active=opts.max_active_states,
-                allow_partial=True,
-                max_lanes=opts.max_streams,
-                max_frames=_STREAM_CHUNK_FRAMES,
-                device=device,
-                main_q_factor=16,
-                cand_factor=4,
-                streaming=True,
-            )
+            mod = _get_module()
+            _streaming[key] = int(mod.wfst_create_decoder(
+                graph, opts.search_beam, opts.output_beam,
+                opts.min_active_states, opts.max_active_states, 1,  # allow_partial
+                opts.max_streams, _STREAM_CHUNK_FRAMES, device,
+                16, 4,        # main_q_factor, cand_factor (streaming)
+                1,            # use_cuda_graphs
+                0, 0, 1,      # lattice, fp16_logprobs, streaming=1
+                0, 3,         # lat_prune_interval, eps_iterations
+            ))
         return _streaming[key]
 
 
+def _run_decode_batch(mod, dec_handle: int, packed: torch.Tensor, lens: List[int]):
+    """Decode a padded ``[g, T, V]`` CUDA batch; return (words_per_row, scores, oks).
+
+    Results marshal through caller-allocated CPU tensors. ``words`` per lane <= frames
+    for HLG, so ``cap = T`` almost never truncates; if a lane's true word count exceeds
+    ``cap`` (multi-word arcs), we re-run with a large-enough buffer — ``decode_batch`` is
+    idempotent (deterministic, same CUDA-graph bucket), so the re-run reproduces it.
+    """
+    g = int(packed.size(0))
+    lens_t = torch.tensor(lens, dtype=torch.int32)
+    cap = max(1, int(packed.size(1)))
+    out_words = out_wlen = out_scores = out_meta = None
+    for _ in range(2):
+        out_words = torch.empty((g, cap), dtype=torch.int32)
+        out_wlen = torch.empty((g,), dtype=torch.int32)
+        out_scores = torch.empty((g,), dtype=torch.float64)
+        out_meta = torch.empty((g, 3), dtype=torch.int32)
+        mod.wfst_decode_batch(dec_handle, packed, lens_t, out_words, out_wlen, out_scores, out_meta)
+        need = int(out_wlen.max().item()) if g else 0
+        if need <= cap:
+            break
+        cap = need  # widen and re-run (idempotent)
+    words: List[List[int]] = []
+    scores: List[float] = []
+    oks: List[bool] = []
+    wl = out_wlen.tolist()
+    ok = out_meta[:, 0].tolist()
+    sc = out_scores.tolist()
+    for b in range(g):
+        if ok[b]:
+            length = min(int(wl[b]), cap)
+            words.append(out_words[b, :length].tolist())
+            scores.append(float(sc[b]))
+        else:
+            words.append([])
+            scores.append(0.0)
+        oks.append(bool(ok[b]))
+    return words, scores, oks
+
+
 class WfstDecoderSearch:
-    """Searcher-protocol adapter over the wfst GPU decoder.
+    """Searcher-protocol adapter over the in-tree GPU WFST decoder.
 
     Offline (``decode_offline``) runs the exact offline beam semantics in one batched
     call; the streaming protocol (``reset`` / ``search`` / ``finalize_search``) maps to
-    a channel of the shared streaming decoder (k2-online beam semantics, identical to
-    the previous OnlineDenseIntersecter flavor).
+    a channel of the shared streaming decoder (k2-online beam semantics).
     """
 
     wants_device_tensor = True
@@ -178,8 +197,10 @@ class WfstDecoderSearch:
         self._fst = fst
         self._opts = opts
         self._channel: Optional[int] = None
-        self._stream_dec = None
+        self._stream_dec: Optional[int] = None
+        self._mod = None
         self._device: Optional[int] = None
+        self._fed_frames = 0
         self._outputs: List[List[int]] = []
         self._likelihood: List[float] = []
 
@@ -199,6 +220,7 @@ class WfstDecoderSearch:
 
     def reset(self) -> None:
         self._release()
+        self._fed_frames = 0
         self._outputs = []
         self._likelihood = []
 
@@ -207,32 +229,57 @@ class WfstDecoderSearch:
         logp = self._prepare(logp)
         if logp.size(0) == 0:
             return
+        mod = _get_module()
         if self._channel is None:
             self._device = logp.device.index or 0
+            self._mod = mod
             self._stream_dec = _get_streaming_decoder(self._fst, self._opts, self._device)
-            self._channel = self._stream_dec.create_stream()
+            self._channel = int(mod.wfst_create_stream(self._stream_dec))
             if self._channel < 0:
                 raise RuntimeError(
                     f"no free WFST stream channels (max_streams={self._opts.max_streams})"
                 )
-        partial = None
+        partial_words: Optional[List[int]] = None
         for start in range(0, logp.size(0), _STREAM_CHUNK_FRAMES):
             piece = logp[start : start + _STREAM_CHUNK_FRAMES].unsqueeze(0).contiguous()
-            out = self._stream_dec.advance_chunk(
-                [self._channel], piece, torch.tensor([piece.size(1)]), partial=True
+            tc = int(piece.size(1))
+            self._fed_frames += tc
+            cap = max(1, self._fed_frames)  # cumulative best-path words <= fed frames (HLG)
+            out_words = torch.empty((1, cap), dtype=torch.int32)
+            out_wlen = torch.empty((1,), dtype=torch.int32)
+            out_channels = torch.empty((1,), dtype=torch.int32)
+            out_overflow = torch.empty((1,), dtype=torch.int32)
+            mod.wfst_advance_chunk(
+                self._stream_dec,
+                torch.tensor([self._channel], dtype=torch.int32),
+                piece,
+                torch.tensor([tc], dtype=torch.int32),
+                1,  # want_partial
+                out_words, out_wlen, out_channels, out_overflow,
             )
-            partial = out[0]
-        if partial is not None:
-            self._outputs = [list(partial["words"])]
+            partial_words = out_words[0, : min(int(out_wlen[0]), cap)].tolist()
+        if partial_words is not None:
+            self._outputs = [partial_words]
             self._likelihood = [0.0]
 
     def finalize_search(self) -> None:
         if self._channel is None:
             return
-        result = self._stream_dec.finalize_stream(self._channel)
+        mod = self._mod or _get_module()
+        cap = max(1, self._fed_frames)
+        out_words = torch.empty((cap,), dtype=torch.int32)
+        out_wlen = torch.empty((1,), dtype=torch.int32)
+        out_score = torch.empty((1,), dtype=torch.float64)
+        out_meta = torch.empty((3,), dtype=torch.int32)
+        mod.wfst_finalize_stream(self._stream_dec, self._channel, out_words, out_wlen,
+                                 out_score, out_meta)
         self._release()
-        self._outputs = [list(result["words"])] if result["ok"] else [[]]
-        self._likelihood = [float(result["score"])] if result["ok"] else [0.0]
+        if int(out_meta[0]):
+            self._outputs = [out_words[: min(int(out_wlen[0]), cap)].tolist()]
+            self._likelihood = [float(out_score[0])]
+        else:
+            self._outputs = [[]]
+            self._likelihood = [0.0]
 
     # -- offline fast path ---------------------------------------------------
 
@@ -241,10 +288,10 @@ class WfstDecoderSearch:
         logp = self._prepare(logp)
         device = logp.device.index or 0
         dec = _get_offline_decoder(self._fst, self._opts, device)
-        out = dec.decode_batch(logp.unsqueeze(0).contiguous(), torch.tensor([logp.size(0)]))[0]
-        if out["ok"]:
-            return [list(out["words"])], [float(out["score"])]
-        return [[]], [0.0]
+        words, scores, _ = _run_decode_batch(
+            _get_module(), dec, logp.unsqueeze(0).contiguous(), [int(logp.size(0))]
+        )
+        return [words[0]], [scores[0]]
 
     def decode_offline_batch(self, enc_out: torch.Tensor, enc_lengths):
         """Exact offline decode of a padded ``[B, T, V]`` batch; returns (tokens, scores).
@@ -270,6 +317,7 @@ class WfstDecoderSearch:
             return tokens, scores
         device = enc_out.device.index or 0
         dec = _get_offline_decoder(self._fst, self._opts, device)
+        mod = _get_module()
         lanes = max(1, self._opts.max_offline_lanes)
         for start in range(0, batch, lanes):
             stop = min(start + lanes, batch)
@@ -287,11 +335,10 @@ class WfstDecoderSearch:
                 if t > 0:
                     packed[i, :t] = r
                 lens.append(t)
-            outs = dec.decode_batch(packed.contiguous(), torch.tensor(lens, dtype=torch.int32))
-            for i, out in enumerate(outs):
-                if out["ok"]:
-                    tokens[start + i] = list(out["words"])
-                    scores[start + i] = float(out["score"])
+            w, s, _ = _run_decode_batch(mod, dec, packed.contiguous(), lens)
+            for i in range(len(w)):
+                tokens[start + i] = w[i]
+                scores[start + i] = s[i]
         return tokens, scores
 
     # -- helpers ---------------------------------------------------------------
@@ -313,8 +360,11 @@ class WfstDecoderSearch:
         return logp.contiguous()
 
     def _release(self) -> None:
-        if self._channel is not None and self._stream_dec is not None:
-            self._stream_dec.release_stream(self._channel)
+        if self._channel is not None and self._stream_dec is not None and self._mod is not None:
+            try:
+                self._mod.wfst_release_stream(self._stream_dec, self._channel)
+            except Exception:
+                pass
         self._channel = None
 
     def __del__(self) -> None:  # channel safety net for aborted requests

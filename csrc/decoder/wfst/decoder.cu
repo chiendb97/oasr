@@ -19,12 +19,12 @@
 
 #include "decoder/wfst/decoder.h"
 
-#include "oasr/wfst/kernels/backtrack.cuh"
-#include "oasr/wfst/kernels/common.cuh"
-#include "oasr/wfst/kernels/epsilon.cuh"
-#include "oasr/wfst/kernels/frame.cuh"
-#include "oasr/wfst/kernels/init.cuh"
-#include "oasr/wfst/kernels/lattice.cuh"
+#include "oasr/wfst/backtrack.cuh"
+#include "oasr/wfst/common.cuh"
+#include "oasr/wfst/epsilon.cuh"
+#include "oasr/wfst/frame.cuh"
+#include "oasr/wfst/init.cuh"
+#include "oasr/wfst/lattice.cuh"
 
 #define WFST_CUDA_CHECK(expr)                                                       \
   do {                                                                              \

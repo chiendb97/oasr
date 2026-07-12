@@ -2,16 +2,16 @@
 """Migration parity gate: in-tree GPU WFST decoder vs the external ``_wfst.so``.
 
 Decodes identical GPU log-prob batches on the same graph through both the in-tree
-``oasr._C.decoder`` and the standalone ``wfst`` project's ``_wfst`` extension, and asserts
-that every lane's ``words``, ``score`` (within ``--score-atol``) and ``overflow`` match.
-The in-tree decoder is the same CUDA source compiled with the same flags and SM arch, so
-results should be bit-for-bit identical — this script guards the migration against drift
-and is the concrete evidence for the "output parity vs the original wfst" acceptance
-criterion.
+JIT-compiled decoder (``oasr.jit.wfst_decoder``, driven over TVM-FFI via int64 handles)
+and the standalone ``wfst`` project's pybind ``_wfst`` extension, and asserts that every
+lane's ``words``, ``score`` (within ``--score-atol``) and ``overflow`` match.  The in-tree
+decoder is the same CUDA source compiled with the same flags/SM arch, so results are
+bit-for-bit identical — this guards the migration against drift and is the concrete
+evidence for the "output parity vs the original wfst" acceptance criterion.
 
-Requires: oasr built with ``OASR_USE_WFST_DECODER=1`` and the external ``wfst`` repo built
-(``--wfst-home``, default ``/data01/kilm/users/chiendb/projects/wfst``) with its
-``data/`` assets present.
+Requires: a CUDA build of oasr (the decoder JIT-compiles on first use) and the external
+``wfst`` repo built (``--wfst-home``, default ``/data01/kilm/users/chiendb/projects/wfst``)
+with its ``data/`` assets present.
 
 Example::
 
@@ -52,22 +52,58 @@ def make_batches(log_probs, batch_size, device):
     return out
 
 
-def make_decoder(lib, graph_path, args, device, t_max, max_lanes):
-    graph = lib.load_graph(graph_path)
-    dec = lib.GpuDecoder(
-        graph,
-        search_beam=args.search_beam,
-        output_beam=args.output_beam,
-        min_active=args.min_active,
-        max_active=args.max_active,
-        allow_partial=True,
-        max_lanes=max_lanes,
-        max_frames=t_max,
-        device=device.index,
-        main_q_factor=32,
-        cand_factor=3,
-    )
-    return graph, dec  # keep graph referenced (decoder borrows it)
+class IntreeDecoder:
+    """In-tree JIT decoder driven over TVM-FFI int64 handles."""
+
+    def __init__(self, args, device, t_max, max_lanes):
+        from oasr.jit.wfst_decoder import gen_wfst_decoder_module
+
+        self.mod = gen_wfst_decoder_module().build_and_load()
+        self.dev = device
+        gh = int(self.mod.wfst_load_graph(args.graph))
+        self.dec = int(self.mod.wfst_create_decoder(
+            gh, args.search_beam, args.output_beam, args.min_active, args.max_active, 1,
+            max_lanes, t_max, device.index, 32, 3, 1, 0, 0, 0, 0, 3))
+
+    def decode(self, batch, lengths):
+        g = int(batch.size(0))
+        lens_t = lengths.to(torch.int32).cpu()
+        cap = max(1, int(batch.size(1)))
+        while True:
+            ow = torch.empty((g, cap), dtype=torch.int32)
+            wl = torch.empty((g,), dtype=torch.int32)
+            sc = torch.empty((g,), dtype=torch.float64)
+            meta = torch.empty((g, 3), dtype=torch.int32)
+            self.mod.wfst_decode_batch(self.dec, batch.contiguous(), lens_t, ow, wl, sc, meta)
+            if g == 0 or int(wl.max()) <= cap:
+                break
+            cap = int(wl.max())
+        return [
+            (ow[b, : min(int(wl[b]), cap)].tolist(), float(sc[b]), int(meta[b, 2]))
+            for b in range(g)
+        ]
+
+
+class ExternalDecoder:
+    """External standalone-wfst pybind decoder (``_wfst.so``)."""
+
+    def __init__(self, args, device, t_max, max_lanes):
+        py = str(Path(args.wfst_home) / "python")
+        if py not in sys.path:
+            sys.path.insert(0, py)
+        from wfst_decoder import get_lib
+
+        lib = get_lib()
+        self.graph = lib.load_graph(args.graph)  # keep referenced (decoder borrows it)
+        self.dec = lib.GpuDecoder(
+            self.graph, search_beam=args.search_beam, output_beam=args.output_beam,
+            min_active=args.min_active, max_active=args.max_active, allow_partial=True,
+            max_lanes=max_lanes, max_frames=t_max, device=device.index,
+            main_q_factor=32, cand_factor=3)
+
+    def decode(self, batch, lengths):
+        outs = self.dec.decode_batch(batch.contiguous(), lengths.to(torch.int32).cpu())
+        return [(list(o["words"]), float(o["score"]), int(o["overflow"])) for o in outs]
 
 
 def main():
@@ -88,53 +124,34 @@ def main():
     device = torch.device(args.device)
     torch.cuda.set_device(device)
 
-    import oasr._C as _C
-
-    if not getattr(_C.decoder, "wfst_decoder_available", False):
-        raise SystemExit("oasr was not built with OASR_USE_WFST_DECODER=1 (in-tree decoder missing)")
-    intree = _C.decoder
-
-    py = str(Path(args.wfst_home) / "python")
-    if py not in sys.path:
-        sys.path.insert(0, py)
-    from wfst_decoder import get_lib
-
-    external = get_lib()
-
     log_probs = load_dump(args.logprobs, args.num_utts)
     t_max = max(lp.size(0) for lp in log_probs)
     max_lanes = max(args.batch)
 
-    _g_in, dec_in = make_decoder(intree, args.graph, args, device, t_max, max_lanes)
-    _g_ex, dec_ex = make_decoder(external, args.graph, args, device, t_max, max_lanes)
+    intree = IntreeDecoder(args, device, t_max, max_lanes)
+    external = ExternalDecoder(args, device, t_max, max_lanes)
 
     total = mism = 0
     for b in args.batch:
         b_mism = 0
         for batch, lengths in make_batches(log_probs, b, device):
-            oi = dec_in.decode_batch(batch, lengths)
-            oe = dec_ex.decode_batch(batch, lengths)
-            for a, c in zip(oi, oe):
+            oi = intree.decode(batch, lengths)
+            oe = external.decode(batch, lengths)
+            for (wi, si, fi), (we, se, fe) in zip(oi, oe):
                 total += 1
-                w_ok = list(a["words"]) == list(c["words"])
-                s_ok = abs(a["score"] - c["score"]) <= args.score_atol
-                o_ok = a["overflow"] == c["overflow"]
-                if not (w_ok and s_ok and o_ok):
+                if not (wi == we and abs(si - se) <= args.score_atol and fi == fe):
                     mism += 1
                     b_mism += 1
                     if mism <= 10:
-                        print(
-                            f"  MISMATCH B={b}: words_ok={w_ok} "
-                            f"score={a['score']:.5f}/{c['score']:.5f} "
-                            f"overflow={a['overflow']}/{c['overflow']}"
-                        )
+                        print(f"  MISMATCH B={b}: words_ok={wi == we} "
+                              f"score={si:.5f}/{se:.5f} overflow={fi}/{fe}")
         print(f"B={b}: {b_mism} mismatch(es)")
 
     ok = total - mism
     print(f"\n{ok}/{total} lanes identical (words + score + overflow).")
     if mism:
         raise SystemExit(f"PARITY FAILED: {mism} mismatch(es)")
-    print("PARITY OK: in-tree decoder == external _wfst on every lane.")
+    print("PARITY OK: in-tree JIT decoder == external _wfst on every lane.")
 
 
 if __name__ == "__main__":

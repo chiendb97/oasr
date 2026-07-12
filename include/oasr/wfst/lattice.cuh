@@ -3,7 +3,7 @@
 // Lattice kernels: eager GPU backward output-beam prune, interval pruning for long-form
 // audio, flat arc-record emission, and post-closure canonical candidate persistence.
 // Active only in lattice mode (Sizes::lat_cap > 0).
-#include "oasr/wfst/kernels/common.cuh"
+#include "oasr/wfst/common.cuh"
 
 namespace oasr::wfst {
 namespace kernels {

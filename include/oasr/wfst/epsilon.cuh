@@ -3,7 +3,7 @@
 // Epsilon-closure kernels (TLG graphs): resolve a closure pass's payload winners into the
 // live frontier, and the end-of-step claim cleanup that keeps hash claims live across the
 // closure passes. No-ops on epsilon-free graphs (DeviceGraph::eps_count == nullptr).
-#include "oasr/wfst/kernels/common.cuh"
+#include "oasr/wfst/common.cuh"
 
 namespace oasr::wfst {
 namespace kernels {
