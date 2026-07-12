@@ -13,7 +13,9 @@ namespace kernels {
 // forward[src] + arc + backward[dst] >= best - output_beam, backward seeded 0 at the
 // final token. tok_bwd stores ordered-uint scores with 0 == unreachable.
 __global__ void LatInitBwdKernel(Workspace ws) {
-  const int32_t n = *ws.arena_cursor;
+  // Clamp: the cursor keeps counting past the committed capacity on overflow (the
+  // failed appends are flagged, not written).
+  const int32_t n = min(*ws.arena_cursor, *ws.arena_limit);
   for (int32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
        i += gridDim.x * blockDim.x)
     ws.tok_bwd[i] = 0u;
@@ -86,6 +88,7 @@ __global__ void LatIntervalCompactKernel(Workspace ws, Sizes sz, float output_be
   const int32_t lane = blockIdx.x;
   const LaneCounters& lc = ws.lanes[lane];
   const float best = lc.lat_best;
+  const int32_t lat_lim = *ws.lat_limit;
   __shared__ int32_t sh_scan[1024];
   __shared__ int32_t sh_base;
   __shared__ int32_t sh_frame_total;
@@ -130,7 +133,7 @@ __global__ void LatIntervalCompactKernel(Workspace ws, Sizes sz, float output_be
                 FloatOfBits(static_cast<uint32_t>(e.w)) + OrderedUintToFloat(bd) >=
                     best - output_beam);
       }
-      if (keep && sh_base + my_prefix + written < sz.lat_cap) {
+      if (keep && sh_base + my_prefix + written < lat_lim) {
         ws.lat2[sh_base + my_prefix + written] = e;
         ++written;
       }
@@ -197,7 +200,7 @@ __global__ void LatEmitKernel(Workspace ws, Sizes sz, DeviceGraph g, float outpu
             int32_t* rec = ws.lat_out + static_cast<int64_t>(idx) * 8;
             rec[0] = e.x;
             rec[1] = e.y;
-            rec[2] = redirect ? -1 : (is_eps ? 0 : g.dest_ilabel[arc].y);
+            rec[2] = redirect ? -1 : (is_eps ? 0 : ArcIlabel(g, arc));
             rec[3] = arc;
             rec[4] = static_cast<int32_t>(BitsOfFloat(end - ws.tok_fwd[e.x]));
             rec[5] = t;  // segment index: frame t persists as segment t+1; seg 0 = the
@@ -240,19 +243,20 @@ __global__ void LatPersistKernel(Workspace ws, Sizes sz, DeviceGraph g) {
   const uint32_t mask = sz.hash_cap - 1;
 
   __shared__ int32_t sh_base;
+  const int32_t lat_lim = *ws.lat_limit;  // committed lattice-arena capacity
   if (threadIdx.x == 0) {
     sh_base = (total > 0) ? atomicAdd(ws.lat_cursor, total) : 0;
     int32_t count = total;
-    if (sh_base + count > sz.lat_cap) {
+    if (sh_base + count > lat_lim) {
       atomicOr(&lc.overflow, kOverflowArena);
-      count = max(0, sz.lat_cap - sh_base);
+      count = max(0, lat_lim - sh_base);
     }
     ws.lat_seg[lane64 * sz.path_cap + seg_idx] = make_int2(sh_base, count);
   }
   __syncthreads();
   const int32_t emit_boundary = lc.cand_emit;
   for (int32_t j = threadIdx.x; j < total; j += blockDim.x) {
-    if (sh_base + j >= sz.lat_cap) break;
+    if (sh_base + j >= lat_lim) break;
     const int2 c = cand[j];
     const bool is_eps = j >= emit_boundary;
     int32_t dest_tok = -1;
@@ -261,7 +265,7 @@ __global__ void LatPersistKernel(Workspace ws, Sizes sz, DeviceGraph g) {
       dest_tok = cur_winner[0];  // the single super-final token
       arc_field |= kRedirectArcBit;
     } else {
-      const uint32_t key = static_cast<uint32_t>(g.dest_ilabel[c.y].x);
+      const uint32_t key = static_cast<uint32_t>(ArcDest(g, c.y));
       uint32_t h = HashState(key, mask);
       for (int probe = 0; probe < kMaxProbes; ++probe) {
         const uint32_t k = hkey[h];

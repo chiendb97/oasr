@@ -80,6 +80,7 @@ struct LaneCounters {
   int32_t has_valid_final;
   int32_t total_arcs;    // arcs to expand this step
   float dyn_beam;
+  float max_lp;          // kPhaseReal: max log-prob of this lane's frame row (else 0)
   uint32_t running_max;  // ordered-uint of the step's best end score
   uint32_t overflow;
   int32_t status;        // 0 running, 1 ok-finished, 2 dead
@@ -95,14 +96,28 @@ struct DeviceGraph {
   const int32_t* row_splits;
   const int32_t* final_count;
   const int32_t* eps_count;  // nullptr on epsilon-free graphs
-  const int2* dest_ilabel;
+  // Arc columns are split (SoA) so each kernel loads only what it needs: the max
+  // pre-pass never touches dest, and expand touches dest only for beam survivors.
+  const int32_t* arc_dest;
+  const uint16_t* arc_ilabel;  // 0xFFFF encodes ilabel -1 (final arcs)
   const float* weight;
+  const float* emit_maxw;  // per state: max weight over its EMITTING arcs (-inf if none)
   int32_t num_states;
   int32_t vocab_size;
   int32_t start_state;
   bool finals_at_end;
   bool eps_first;
 };
+
+constexpr uint16_t kIlabelFinal = 0xFFFFu;
+
+__device__ inline int32_t ArcDest(const DeviceGraph& g, int32_t arc) {
+  return g.arc_dest[arc];
+}
+__device__ inline int32_t ArcIlabel(const DeviceGraph& g, int32_t arc) {
+  const uint16_t v = g.arc_ilabel[arc];
+  return v == kIlabelFinal ? -1 : static_cast<int32_t>(v);
+}
 
 __device__ inline int32_t EpsCountOf(const DeviceGraph& g, int32_t s) {
   return g.eps_count != nullptr ? g.eps_count[s] : 0;
@@ -132,7 +147,9 @@ struct Workspace {
   float* tok_score[2];
   int32_t* tok_winner[2];      // GLOBAL winners-arena index of the token
   int32_t* tok_emit_begin;     // first arc to expand per token (phase-dependent), cur only
+  float* tok_ub;               // per token: score + emit_maxw[state] (kPhaseReal), cur only
   int32_t* arc_offsets;        // per lane: exclusive prefix sums, [main_q + 1]
+  int32_t* lane_arc_offsets;   // [lanes + 1]: exclusive scan of total_arcs (K2 flattening)
   // Next-frontier raw claims {state, hash_slot}.
   int2* next_claims;
   // Per-step candidates {prev_local, arc}.
@@ -143,8 +160,13 @@ struct Workspace {
   int32_t* hash_pos;  // eps mode: state -> frontier position map (per claimed slot)
   // Shared winners arena {prev_global, arc}: all lanes allocate blocks from one pool via
   // the global cursor. Statistical sizing — per-lane worst case would need 10s of GB.
+  // The arena (and the lattice arenas) are lazily-committed regions; the device-resident
+  // limits below carry the currently committed capacity so the host can grow the
+  // physical backing between (idempotent) decode attempts without re-capturing graphs.
   int2* winners;
   int32_t* arena_cursor;  // single global counter
+  int32_t* arena_limit;   // committed winners-arena entries (== sz.arena_cap when eager)
+  int32_t* lat_limit;     // committed lattice-arena entries (== sz.lat_cap when eager)
   // Backtracked best-path arcs per lane (reversed), filled by BacktrackKernel.
   int32_t* arc_out;      // [lane][path_cap]
   int32_t* arc_out_len;  // [lane]
@@ -201,6 +223,61 @@ __device__ inline uint32_t HashState(uint32_t s, uint32_t mask) {
   s *= 0xc2b2ae35u;
   s ^= s >> 16;
   return s & mask;
+}
+
+// ---------------------------------------------------------------------------
+// Block-wide inclusive scan of one int32 per thread (warp shuffles + one shared
+// round). blockDim.x must be a multiple of 32 and <= 1024; warp_scratch needs 32
+// int32 slots. Contains __syncthreads (call from uniform control flow); safe to
+// call in a loop back-to-back (trailing sync protects the scratch).
+__device__ inline int32_t BlockInclusiveScan(int32_t x, int32_t* warp_scratch) {
+  const int32_t lane = threadIdx.x & 31;
+  const int32_t wid = threadIdx.x >> 5;
+  int32_t v = x;
+#pragma unroll
+  for (int32_t d = 1; d < 32; d <<= 1) {
+    const int32_t y = __shfl_up_sync(0xFFFFFFFFu, v, d);
+    if (lane >= d) v += y;
+  }
+  if (lane == 31) warp_scratch[wid] = v;
+  __syncthreads();
+  if (wid == 0) {
+    const int32_t nw = static_cast<int32_t>(blockDim.x) >> 5;
+    int32_t w = (threadIdx.x < nw) ? warp_scratch[threadIdx.x] : 0;
+#pragma unroll
+    for (int32_t d = 1; d < 32; d <<= 1) {
+      const int32_t y = __shfl_up_sync(0xFFFFFFFFu, w, d);
+      if (lane >= d) w += y;
+    }
+    warp_scratch[threadIdx.x] = w;
+  }
+  __syncthreads();
+  if (wid > 0) v += warp_scratch[wid - 1];
+  __syncthreads();
+  return v;
+}
+
+// ---------------------------------------------------------------------------
+// Largest i in [0, n) with offsets[i] <= slot (offsets nondecreasing, n >= 1).
+__device__ inline int32_t UpperTokenGlobal(const int32_t* offsets, int32_t n, int32_t slot) {
+  int32_t lo = 0, hi = n - 1;
+  while (lo < hi) {
+    const int32_t mid = (lo + hi + 1) >> 1;
+    if (offsets[mid] <= slot) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
+__device__ inline uint32_t WarpMaxU32(uint32_t v) {
+#if __CUDA_ARCH__ >= 800
+  return __reduce_max_sync(0xFFFFFFFFu, v);
+#else
+#pragma unroll
+  for (int32_t d = 16; d > 0; d >>= 1)
+    v = max(v, __shfl_down_sync(0xFFFFFFFFu, v, d));
+  return __shfl_sync(0xFFFFFFFFu, v, 0);
+#endif
 }
 
 }  // namespace kernels

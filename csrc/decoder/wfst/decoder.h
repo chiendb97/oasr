@@ -73,6 +73,18 @@ class GpuDecoder {
   // token belongs to one (lane, frame).
   const std::vector<int32_t>& LastLatticeRecords() const;
 
+  // Device-memory accounting. The winners/lattice arenas and the log-prob staging are
+  // lazily-committed regions: `reserved_bytes` is their stable virtual reservation,
+  // `committed_bytes` the physical memory actually mapped; `fixed_bytes` covers the
+  // eagerly-allocated workspace plus the graph image on device.
+  struct MemStats {
+    int64_t reserved_bytes = 0;
+    int64_t committed_bytes = 0;
+    int64_t fixed_bytes = 0;
+    int64_t arena_high_water = 0;  // max end-of-batch winners-arena entries observed
+  };
+  MemStats GetMemStats() const;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

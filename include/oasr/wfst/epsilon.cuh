@@ -30,7 +30,7 @@ __global__ void EpsResolveKernel(Workspace ws, Sizes sz, DeviceGraph g) {
 
   for (int32_t j = c0 + threadIdx.x; j < c1; j += blockDim.x) {
     const int2 c = cand[j];
-    const uint32_t key = static_cast<uint32_t>(g.dest_ilabel[c.y].x);
+    const uint32_t key = static_cast<uint32_t>(ArcDest(g, c.y));
     uint32_t h = HashState(key, mask);
     int32_t slot = -1;
     for (int probe = 0; probe < kMaxProbes; ++probe) {
@@ -57,7 +57,7 @@ __global__ void EpsResolveKernel(Workspace ws, Sizes sz, DeviceGraph g) {
       widx = lane * sz.stream_log_cap + off;
     } else {
       widx = atomicAdd(ws.arena_cursor, 1);
-      if (widx >= sz.arena_cap) {
+      if (widx >= *ws.arena_limit) {
         atomicOr(&lc.overflow, kOverflowArena);
         continue;
       }

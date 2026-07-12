@@ -18,6 +18,7 @@ int64_t wfst_create_decoder(int64_t graph_handle, double search_beam, double out
                             int64_t lattice, int64_t fp16_logprobs, int64_t streaming,
                             int64_t lat_prune_interval, int64_t eps_iterations);
 void wfst_free_decoder(int64_t handle);
+void wfst_decoder_mem_stats(int64_t handle, TensorView out_stats);
 void wfst_decode_batch(int64_t handle, TensorView log_probs, TensorView lengths,
                        TensorView out_words, TensorView out_word_lens, TensorView out_scores,
                        TensorView out_meta);
@@ -41,6 +42,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_free_graph, wfst_free_graph);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_graph_info, wfst_graph_info);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_create_decoder, wfst_create_decoder);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_free_decoder, wfst_free_decoder);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_decoder_mem_stats, wfst_decoder_mem_stats);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_decode_batch, wfst_decode_batch);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_create_stream, wfst_create_stream);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_release_stream, wfst_release_stream);

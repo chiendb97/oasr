@@ -134,6 +134,20 @@ int64_t wfst_create_decoder(int64_t graph_handle, double search_beam, double out
 
 void wfst_free_decoder(int64_t handle) { delete reinterpret_cast<DecoderHandle*>(handle); }
 
+// out_stats: CPU int64 [4] = {reserved_bytes, committed_bytes, fixed_bytes,
+// arena_high_water_entries} for the decoder's device memory.
+void wfst_decoder_mem_stats(int64_t handle, TensorView out_stats) {
+  auto* dh = reinterpret_cast<DecoderHandle*>(handle);
+  TVM_FFI_ICHECK(dh != nullptr) << "null decoder handle";
+  check_cpu(out_stats, "out_stats");
+  const GpuDecoder::MemStats s = dh->dec->GetMemStats();
+  int64_t* p = static_cast<int64_t*>(out_stats.data_ptr());
+  p[0] = s.reserved_bytes;
+  p[1] = s.committed_bytes;
+  p[2] = s.fixed_bytes;
+  p[3] = s.arena_high_water;
+}
+
 // ---------------------------------------------------------------------------
 // Offline batched decode
 // ---------------------------------------------------------------------------
