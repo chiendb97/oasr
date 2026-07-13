@@ -206,7 +206,9 @@ Non-CUTLASS kernels (Conv1D, Norm, Activation) use `*_dispatch.inc` files with V
   - `gemm/` — `gemm.cuh` facade → `cutlass_gemm_configs.h` / `gemm_cutlass_template.h` / `gemm_cutlass.h`. Also `bmm.cuh`, `group_gemm.cuh`.
 - **`csrc/`** — TVM-FFI launcher layer (`<family>.cu`) and JIT binding exports (`<family>_jit_binding.cu`). Also contains `tvm_ffi_utils.h` with DLPack dtype dispatch and validation macros.
 - **`csrc/templates/`** — Jinja2 templates for config-specific CUTLASS instantiations (`gemm_cutlass_template.cu.jinja`, `bmm_cutlass_template.cu.jinja`, `group_gemm_cutlass_template.cu.jinja`).
-- **`csrc/decoder/`** — decoder implementations, split by placement: `ctc/cpu/` holds the CPU-side C++ decoders (CTC greedy search, prefix beam search, WFST beam search via k2, streaming WFST decoder, `ContextGraph` for phrase boosting, and shared `common/utils`), while `wfst/` holds the in-tree GPU WFST decoder (TVM-FFI JIT).
+- **`csrc/decoder/`** — decoder implementations, grouped by decode family:
+  - `ctc/` — **GPU** CTC prefix-beam-search TVM-FFI launcher + JIT binding (`ctc_decoder.cu`, `ctc_decoder_jit_binding.cu`), JIT-compiled at runtime via `oasr/jit/ctc_decoder.py` (this is the one JIT launcher/binding pair that does **not** live at the `csrc/` root — see the binding pattern below). `ctc/cpu/` holds the **CPU-side** C++ decoders compiled into `_C.so` via CMake: CTC greedy search, prefix beam search, WFST beam search (via k2), streaming WFST decoder, `ContextGraph` for phrase boosting, and shared `common/utils`.
+  - `wfst/` — in-tree **GPU WFST** beam-search decoder (TVM-FFI JIT). Its exact-semantics CPU reference oracle is test-only and lives in a separate JIT module under `csrc/tests/wfst/` (kept out of the production decoder library).
 - **`csrc/pybind/`** — pybind11 module for decoder bindings and legacy enums (`pybind_main.cpp`, `pybind_decoder.h`).
 
 ### Dispatch modes
@@ -277,12 +279,12 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
 
 | File | Covers |
 |------|--------|
+| `docs/architecture.md` | One-registry-per-extension-axis design (decode family / streaming backend / batching policy / model / checkpoint) |
 | `docs/autotuning.md` | `oasr.tune` design, `oasr.autotune()` API, JSON cache format |
 | `docs/benchmarks.md` | Engine vs. service bench recipes, `.env` workflow, RTF / latency interpretation |
 | `docs/cache_manager.md` | `BlockPool` / `AttentionCacheManager` / `CnnCacheManager` / `StreamContext` semantics |
 | `docs/ctc_decoder_gpu.md` | `GpuStreamingDecoder` single- vs. multi-request flows, paged-memory options |
 | `docs/engine.md` | `ASREngine` step loop, batching, CUDA Graph capture |
-| `docs/engine_concurrency.md` | Engine thread-safety (RLock), worker thread modes, multi-process scaling |
 | `docs/scheduler.md` | Streaming + offline request scheduling, starvation bounds, micro-batching |
 | `docs/serving.md` | Rust `oasr-server` frontend: HTTP/gRPC/WebSocket API, in-process PyO3 engine, wire format |
 | `docs/wfst_decoder_gpu.md` | In-tree GPU WFST decoder: k2-parity semantics, kernel pipeline, graph image, lazy-commit memory model, TVM-FFI API, streaming |
