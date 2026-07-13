@@ -282,39 +282,36 @@ struct GpuDecoder::Impl {
   // n_steps frame-steps (no init). Shared by offline decode, chunk advance, and graph
   // capture; all launch configurations are capacity-sized (capture-stable). Even n_steps
   // preserves the global frontier-buffer parity (required across streaming chunks).
-  void LaunchFrameSteps(cudaStream_t s, const void* lp, int64_t lane_stride,
-                        int64_t frame_stride, int32_t n_steps) {
+  // Log-prob location comes from the device-resident descriptor (SetLpDesc).
+  void LaunchFrameSteps(cudaStream_t s, int32_t n_steps) {
     const DecoderConfig& cfg = opts.cfg;
     const unsigned xb = static_cast<unsigned>(ExpandBlocksFor(sz.lanes));
     Workspace w = ws;
     for (int32_t step = 0; step < n_steps; ++step) {
-      ScanKernel<<<static_cast<unsigned>(sz.lanes), 1024, 0, s>>>(w, sz, dg, cfg, 0, lp,
-                                                                  lane_stride, frame_stride);
+      ScanKernel<<<static_cast<unsigned>(sz.lanes), 1024, 0, s>>>(w, sz, dg, cfg, 0);
       LaneScanKernel<<<1, 32, 0, s>>>(w, sz);
-      MaxKernel<<<xb, 256, 0, s>>>(w, sz, dg, lp, lane_stride, frame_stride);
-      ExpandKernel<<<xb, 256, 0, s>>>(w, sz, dg, lp, lane_stride, frame_stride);
+      MaxKernel<<<xb, 256, 0, s>>>(w, sz, dg);
+      ExpandKernel<<<xb, 256, 0, s>>>(w, sz, dg);
       FinalizeKernel<<<static_cast<unsigned>(sz.lanes), 1024, 0, s>>>(w, sz, dg, cfg);
       std::swap(w.tok_state[0], w.tok_state[1]);
       std::swap(w.tok_score[0], w.tok_score[1]);
       std::swap(w.tok_winner[0], w.tok_winner[1]);
-      LaunchStepTail(s, w, lp, lane_stride, frame_stride);
+      LaunchStepTail(s, w);
     }
   }
 
   // Post-swap step tail: epsilon-closure passes, canonical lattice persistence, and the
   // end-of-step claim cleanup (claims stay live through K3 in eps/lattice modes).
-  void LaunchStepTail(cudaStream_t s, const Workspace& w, const void* lp,
-                      int64_t lane_stride, int64_t frame_stride) {
+  void LaunchStepTail(cudaStream_t s, const Workspace& w) {
     const DecoderConfig& cfg = opts.cfg;
     const bool eps = dg.eps_count != nullptr;
     if (eps) {
       const unsigned xb = static_cast<unsigned>(ExpandBlocksFor(sz.lanes));
       for (int32_t it = 0; it < cfg.eps_iterations; ++it) {
-        ScanKernel<<<static_cast<unsigned>(sz.lanes), 1024, 0, s>>>(
-            w, sz, dg, cfg, 1, lp, lane_stride, frame_stride);
+        ScanKernel<<<static_cast<unsigned>(sz.lanes), 1024, 0, s>>>(w, sz, dg, cfg, 1);
         LaneScanKernel<<<1, 32, 0, s>>>(w, sz);
-        MaxKernel<<<xb, 256, 0, s>>>(w, sz, dg, lp, lane_stride, frame_stride);
-        ExpandKernel<<<xb, 256, 0, s>>>(w, sz, dg, lp, lane_stride, frame_stride);
+        MaxKernel<<<xb, 256, 0, s>>>(w, sz, dg);
+        ExpandKernel<<<xb, 256, 0, s>>>(w, sz, dg);
         EpsResolveKernel<<<static_cast<unsigned>(sz.lanes), 256, 0, s>>>(w, sz, dg);
       }
     }
@@ -326,48 +323,41 @@ struct GpuDecoder::Impl {
 
   // Offline pass: init (+ initial epsilon closure of the start frontier, persisted as
   // lattice segment 0) + steps.
-  void LaunchSteps(cudaStream_t s, const void* lp, int64_t lane_stride,
-                   int64_t frame_stride, int32_t last_step) {
+  void LaunchSteps(cudaStream_t s, int32_t last_step) {
     InitKernel<<<(sz.lanes + 255) / 256, 256, 0, s>>>(ws, sz, dg, d_T, d_batch,
                                                       opts.cfg.search_beam);
-    if (dg.eps_count != nullptr || sz.lat_cap > 0)
-      LaunchStepTail(s, ws, lp, lane_stride, frame_stride);
-    LaunchFrameSteps(s, lp, lane_stride, frame_stride, last_step + 1);
+    if (dg.eps_count != nullptr || sz.lat_cap > 0) LaunchStepTail(s, ws);
+    LaunchFrameSteps(s, last_step + 1);
   }
 
+  // Points the decode kernels at a [lanes, frames, vocab] log-prob block (strides in
+  // elements). One tiny H2D per decode; captured graphs read the descriptor at replay,
+  // so offline batches decode the caller's tensor in place.
+  LpDesc lp_desc_host{};
+  void SetLpDesc(const void* base, int64_t lane_stride, int64_t frame_stride,
+                 cudaStream_t s) {
+    lp_desc_host = LpDesc{reinterpret_cast<unsigned long long>(base),
+                          static_cast<long long>(lane_stride),
+                          static_cast<long long>(frame_stride)};
+    WFST_CUDA_CHECK(cudaMemcpyAsync(ws.lp_desc, &lp_desc_host, sizeof(LpDesc),
+                                    cudaMemcpyHostToDevice, s));
+  }
+
+  // Streaming only: the per-channel chunk slots AdvanceChunk scatters into (offline
+  // decodes read the caller's tensor in place through the descriptor).
   void EnsureStaging(int64_t vocab_stride) {
     if (d_lp_staging == nullptr) {
       lp_stride = vocab_stride;
       const size_t bytes = static_cast<size_t>(sz.lanes) * opts.cfg.max_frames *
                            vocab_stride * lp_elem();
-      // Minimum-granularity chunks: the per-lane row prefixes are strided through the
-      // region, so large chunks would end up committing the padding holes too.
       staging_mem.Reserve(bytes, opts.device, 1);
-      // Streaming chunk slots are small and rewritten constantly: commit them all.
-      // Batch mode commits per-lane row prefixes as batches actually need them.
-      if (opts.cfg.streaming) staging_mem.EnsurePrefix(bytes);
+      staging_mem.EnsurePrefix(bytes);  // small, rewritten constantly: commit all
       d_lp_staging = staging_mem.ptr();
+      SetLpDesc(d_lp_staging, static_cast<int64_t>(opts.cfg.max_frames) * lp_stride,
+                lp_stride, stream);
     }
     if (vocab_stride != lp_stride)
       throw std::runtime_error("log_probs vocab stride changed between calls");
-  }
-
-  // Commits each of the first `batch` lanes' staging prefix for `rows` frame rows and
-  // stages the caller's [batch, rows, vocab] block into the per-lane slots. Per-lane 1-D
-  // copies (not one 2-D copy): each copy must stay inside its lane's committed prefix —
-  // the driver rejects copies whose validated span crosses unmapped holes.
-  void StageLogProbs(const void* d_log_probs, int64_t batch, int64_t rows, cudaStream_t s) {
-    const size_t elem = lp_elem();
-    const size_t row_bytes = static_cast<size_t>(lp_stride) * elem;
-    const size_t lane_bytes = static_cast<size_t>(opts.cfg.max_frames) * row_bytes;
-    for (int64_t b = 0; b < batch; ++b) {
-      staging_mem.EnsureRange(static_cast<size_t>(b) * lane_bytes,
-                              static_cast<size_t>(rows) * row_bytes);
-      WFST_CUDA_CHECK(cudaMemcpyAsync(
-          static_cast<char*>(d_lp_staging) + static_cast<size_t>(b) * lane_bytes,
-          static_cast<const char*>(d_log_probs) + static_cast<size_t>(b) * rows * row_bytes,
-          static_cast<size_t>(rows) * row_bytes, cudaMemcpyDeviceToDevice, s));
-    }
   }
 
   int32_t BucketFor(int32_t T_max) const {
@@ -396,9 +386,7 @@ struct GpuDecoder::Impl {
       if (b == bucket) return e;
     }
     cudaGraphExec_t exec = CaptureGraph([&](cudaStream_t cs) {
-      LaunchSteps(cs, d_lp_staging,
-                  static_cast<int64_t>(opts.cfg.max_frames) * lp_stride, lp_stride,
-                  bucket - 1);
+      LaunchSteps(cs, bucket - 1);
       BacktrackKernel<<<(sz.lanes + 63) / 64, 64, 0, cs>>>(ws, sz);
       HashSanitizeKernel<<<dim3(64, static_cast<unsigned>(sz.lanes)), 256, 0, cs>>>(ws, sz);
     });
@@ -412,9 +400,7 @@ struct GpuDecoder::Impl {
       if (b == n_steps) return e;
     }
     cudaGraphExec_t exec = CaptureGraph([&](cudaStream_t cs) {
-      LaunchFrameSteps(cs, d_lp_staging,
-                       static_cast<int64_t>(opts.cfg.max_frames) * lp_stride, lp_stride,
-                       n_steps);
+      LaunchFrameSteps(cs, n_steps);
     });
     steps_execs.emplace_back(n_steps, exec);
     return exec;
@@ -429,9 +415,7 @@ struct GpuDecoder::Impl {
     }
     cudaGraphExec_t exec = CaptureGraph([&](cudaStream_t cs) {
       ChunkBeginKernel<<<(sz.lanes + 63) / 64, 64, 0, cs>>>(ws, sz, d_T);
-      LaunchFrameSteps(cs, d_lp_staging,
-                       static_cast<int64_t>(opts.cfg.max_frames) * lp_stride, lp_stride,
-                       bucket);
+      LaunchFrameSteps(cs, bucket);
       HashSanitizeKernel<<<dim3(64, static_cast<unsigned>(sz.lanes)), 256, 0, cs>>>(ws, sz);
     });
     chunk_execs.emplace_back(bucket, exec);
@@ -606,6 +590,8 @@ struct GpuDecoder::Impl {
     // GC has a released prefix.
     ws.gc_floor = Alloc<int32_t>(1);
     WFST_CUDA_CHECK(cudaMemset(ws.gc_floor, 0, sizeof(int32_t)));
+    ws.lp_desc = Alloc<LpDesc>(1);
+    WFST_CUDA_CHECK(cudaMemset(ws.lp_desc, 0, sizeof(LpDesc)));
     if (cfg.gc_interval > 0) {
       ws.gc_conv = Alloc<int32_t>(L);
       ws.fin_arcs = Alloc<int32_t>(L * sz.fin_cap);
@@ -727,10 +713,9 @@ int32_t GpuDecoder::CreateStream() {
                                                im.opts.cfg.search_beam);
     if (im.dg.eps_count != nullptr) {
       // Initial closure of the start frontier. Touches only this lane's state (other
-      // lanes gate on phase), and launches no buffer swap — parity is preserved.
-      im.LaunchStepTail(im.stream, im.ws, im.d_lp_staging,
-                        static_cast<int64_t>(im.opts.cfg.max_frames) * im.lp_stride,
-                        im.lp_stride);
+      // lanes gate on phase), and launches no buffer swap — parity is preserved. The
+      // eps phase never reads log-probs, so the descriptor state is irrelevant here.
+      im.LaunchStepTail(im.stream, im.ws);
     }
     return lane;
   }
@@ -799,9 +784,7 @@ std::vector<GpuDecoder::StreamPartial> GpuDecoder::AdvanceChunk(
     } else {
       const int32_t steps = (max_len + 7) / 8 * 8;  // even: parity invariant
       ChunkBeginKernel<<<(sz.lanes + 63) / 64, 64, 0, im.stream>>>(im.ws, sz, im.d_T);
-      im.LaunchFrameSteps(im.stream, im.d_lp_staging,
-                          static_cast<int64_t>(cfg.max_frames) * im.lp_stride,
-                          im.lp_stride, steps);
+      im.LaunchFrameSteps(im.stream, steps);
       HashSanitizeKernel<<<dim3(64, static_cast<unsigned>(sz.lanes)), 256, 0, im.stream>>>(
           im.ws, sz);
     }
@@ -872,9 +855,7 @@ DecodeResult GpuDecoder::FinalizeStream(int32_t channel) {
   FinalizePrepKernel<<<1, 1, 0, im.stream>>>(im.ws, channel);
   // Two steps (even, parity invariant): step 1 = the final step for this channel; step 2
   // idles every lane. Other channels sit outside their chunk_end and just carry over.
-  im.LaunchFrameSteps(im.stream, im.d_lp_staging,
-                      static_cast<int64_t>(im.opts.cfg.max_frames) * im.lp_stride,
-                      im.lp_stride, 2);
+  im.LaunchFrameSteps(im.stream, 2);
   BacktrackKernel<<<(sz.lanes + 63) / 64, 64, 0, im.stream>>>(im.ws, sz);
 
   LaneCounters lc{};
@@ -947,12 +928,10 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
   for (int32_t attempt = 0;; ++attempt) {
     if (interval_mode) {
       // Segmented loop with periodic lattice-arena pruning (long-form audio).
-      im.EnsureStaging(vocab_stride);
-      im.StageLogProbs(d_log_probs, batch, max_frames, im.stream);
+      im.SetLpDesc(d_log_probs, max_frames * vocab_stride, vocab_stride, im.stream);
       if (gc_on) im.GcAttemptBegin();  // InitKernel rewrites the arena base
       InitKernel<<<(sz.lanes + 255) / 256, 256, 0, im.stream>>>(im.ws, sz, im.dg, im.d_T,
                                                                 im.d_batch, cfg.search_beam);
-      const int64_t lane_stride = static_cast<int64_t>(cfg.max_frames) * im.lp_stride;
       const int32_t total_steps = T_max + 1;
       const dim3 bwd_grid(64, static_cast<unsigned>(batch));
       int32_t done = 0;
@@ -961,7 +940,7 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
         if (use_graphs) {
           WFST_CUDA_CHECK(cudaGraphLaunch(im.StepsExec(n), im.stream));
         } else {
-          im.LaunchFrameSteps(im.stream, im.d_lp_staging, lane_stride, im.lp_stride, n);
+          im.LaunchFrameSteps(im.stream, n);
         }
         done += n;
         if (done < total_steps) {
@@ -991,15 +970,11 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
       // 1-best segmented loop: same kernels and order as the whole-batch graph, split
       // into even-step segment graphs so the winners-log GC can run from the host in
       // between (never inside a captured graph).
-      im.EnsureStaging(vocab_stride);
-      im.StageLogProbs(d_log_probs, batch, max_frames, im.stream);
+      im.SetLpDesc(d_log_probs, max_frames * vocab_stride, vocab_stride, im.stream);
       im.GcAttemptBegin();
       InitKernel<<<(sz.lanes + 255) / 256, 256, 0, im.stream>>>(im.ws, sz, im.dg, im.d_T,
                                                                 im.d_batch, cfg.search_beam);
-      if (im.dg.eps_count != nullptr)
-        im.LaunchStepTail(im.stream, im.ws, im.d_lp_staging,
-                          static_cast<int64_t>(cfg.max_frames) * im.lp_stride, im.lp_stride);
-      const int64_t lane_stride = static_cast<int64_t>(cfg.max_frames) * im.lp_stride;
+      if (im.dg.eps_count != nullptr) im.LaunchStepTail(im.stream, im.ws);
       const int32_t total_steps = T_max + 1;
       int32_t done = 0;
       while (done < total_steps) {
@@ -1007,7 +982,7 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
         if (use_graphs) {
           WFST_CUDA_CHECK(cudaGraphLaunch(im.StepsExec(n), im.stream));
         } else {
-          im.LaunchFrameSteps(im.stream, im.d_lp_staging, lane_stride, im.lp_stride, n);
+          im.LaunchFrameSteps(im.stream, n);
         }
         done += n;
         if (done < total_steps) im.RunWinnersGc();
@@ -1016,13 +991,13 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
       HashSanitizeKernel<<<dim3(64, static_cast<unsigned>(sz.lanes)), 256, 0, im.stream>>>(
           im.ws, sz);
     } else if (use_graphs) {
-      // Stage log-probs into the decoder-owned buffer so kernel pointers are capture-
-      // stable: per-lane D2D copies of T*V rows into max_frames*V-stride slots.
-      im.EnsureStaging(vocab_stride);
-      im.StageLogProbs(d_log_probs, batch, max_frames, im.stream);
+      // The captured graph reads the caller's tensor in place via the descriptor —
+      // one 24 B H2D replaces the old staging reservation + per-lane copies.
+      im.SetLpDesc(d_log_probs, max_frames * vocab_stride, vocab_stride, im.stream);
       WFST_CUDA_CHECK(cudaGraphLaunch(im.GraphExecForBucket(T_max), im.stream));
     } else {
-      im.LaunchSteps(im.stream, d_log_probs, max_frames * vocab_stride, vocab_stride, T_max);
+      im.SetLpDesc(d_log_probs, max_frames * vocab_stride, vocab_stride, im.stream);
+      im.LaunchSteps(im.stream, T_max);
       BacktrackKernel<<<(sz.lanes + 63) / 64, 64, 0, im.stream>>>(im.ws, sz);
       HashSanitizeKernel<<<dim3(64, static_cast<unsigned>(sz.lanes)), 256, 0, im.stream>>>(
           im.ws, sz);

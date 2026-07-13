@@ -94,6 +94,10 @@ struct LaneCounters {
   int32_t gc_root;       // streaming GC: logical id of the lane's finalized sentinel;
                          // [gc_root, log_len) is the live ring window (tail position:
                          // keeps the hot fields above at their pre-GC offsets)
+  // Absolute pointer to this lane's CURRENT log-prob row, computed by K1 from the
+  // device-resident LpDesc (0 outside kPhaseReal). K2a/K2b read it off the lane-counter
+  // line they already touch — the hot kernels never load the descriptor.
+  unsigned long long lp_row_ptr;
 };
 
 struct DeviceGraph {
@@ -144,6 +148,17 @@ __device__ inline int32_t EpsBegin(const DeviceGraph& g, int32_t s) {
 __device__ inline int32_t FinalBegin(const DeviceGraph& g, int32_t s) {
   return g.finals_at_end ? g.row_splits[s + 1] - g.final_count[s] : g.row_splits[s];
 }
+
+// Log-prob access descriptor, device-resident: captured graphs bake kernel parameters,
+// so the lp base pointer and strides live in device memory and are re-written (one 24 B
+// H2D) before every launch — offline batches decode the CALLER's [B, T, V] tensor in
+// place (no staging buffer, no per-lane copies); streaming points it at the fixed
+// per-channel staging slots once. Strides are in elements.
+struct LpDesc {
+  unsigned long long base;
+  long long lane_stride;
+  long long frame_stride;  // == the row length (vocab stride) for the K1 row max
+};
 
 struct Workspace {
   // Frontier (double-buffered), per lane, capacity main_q.
@@ -197,6 +212,7 @@ struct Workspace {
   int32_t* gc_conv;   // [lanes]; INT32_MAX none, -1 aborted (defensive)
   int32_t* fin_arcs;  // [lane][path_cap]
   int32_t* fin_len;   // [lanes]
+  LpDesc* lp_desc;  // [1]; see LpDesc
   // First winners index still physically mapped (0 unless GC released a prefix).
   // Fault shield for every winners chain walk: clean lanes stop at their finalized
   // sentinel (always >= the floor), but an arena-overflow-degraded lane can carry a

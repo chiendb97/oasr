@@ -23,8 +23,7 @@ namespace kernels {
 // K1: per-lane CTA — phase decision, k2 dynamic-beam update, degree prefix sums,
 // per-token upper bounds, and the frame's max log-prob (for the K2 skip tests).
 __global__ void ScanKernel(Workspace ws, Sizes sz, DeviceGraph g, DecoderConfig cfg,
-                           int32_t eps_pass, const void* log_probs, int64_t lp_lane_stride,
-                           int64_t lp_frame_stride) {
+                           int32_t eps_pass) {
   const int32_t lane = blockIdx.x;
   LaneCounters& lc = ws.lanes[lane];
   __shared__ int32_t sh_ws[32];  // warp scratch for BlockInclusiveScan
@@ -145,13 +144,16 @@ __global__ void ScanKernel(Workspace ws, Sizes sz, DeviceGraph g, DecoderConfig 
 
   // Frame max log-prob (kPhaseReal): upper-bound term for the K2 skip tests. Reducing
   // over the full row (a superset of the labels arcs index) keeps the bound safe.
+  // Also publishes the lane's absolute row pointer for the K2 kernels.
   if (phase == kPhaseReal) {
-    const int64_t lp_row = static_cast<int64_t>(lane) * lp_lane_stride +
-                           static_cast<int64_t>(lc.t - lc.chunk_start) * lp_frame_stride;
+    const LpDesc lpd = *ws.lp_desc;
     const bool lp_half = sz.lp_half != 0;
+    const int64_t lp_row = static_cast<int64_t>(lane) * lpd.lane_stride +
+                           static_cast<int64_t>(lc.t - lc.chunk_start) * lpd.frame_stride;
+    const void* row = reinterpret_cast<const char*>(lpd.base) + lp_row * (lp_half ? 2 : 4);
     float m = kNegInf;
-    for (int64_t i = threadIdx.x; i < lp_frame_stride; i += blockDim.x) {
-      m = max(m, LoadLp(log_probs, lp_row + i, lp_half));
+    for (int64_t i = threadIdx.x; i < lpd.frame_stride; i += blockDim.x) {
+      m = max(m, LoadLp(row, i, lp_half));
     }
 #pragma unroll
     for (int32_t d = 16; d > 0; d >>= 1) m = max(m, __shfl_down_sync(0xFFFFFFFFu, m, d));
@@ -161,9 +163,11 @@ __global__ void ScanKernel(Workspace ws, Sizes sz, DeviceGraph g, DecoderConfig 
       const int32_t nw = static_cast<int32_t>(blockDim.x) >> 5;
       for (int32_t w = 1; w < nw; ++w) m = max(m, sh_fmax[w]);
       lc.max_lp = m;
+      lc.lp_row_ptr = reinterpret_cast<unsigned long long>(row);
     }
   } else if (threadIdx.x == 0) {
     lc.max_lp = 0.0f;  // final/redirect arcs carry no acoustic term
+    lc.lp_row_ptr = 0ull;
   }
   __syncthreads();
 
@@ -240,15 +244,14 @@ struct K2Lane {
   const int32_t* emit_begin;
   const float* tok_score;
   const float* tok_ub;
-  int64_t lp_row;
+  const void* lp_row;  // absolute row pointer published by K1 (0 outside kPhaseReal)
   int32_t n;
   int32_t total;
   int32_t phase;
   float max_lp;
 };
 
-__device__ inline K2Lane MakeK2Lane(const Workspace& ws, const Sizes& sz, int32_t lane,
-                                    int64_t lp_lane_stride, int64_t lp_frame_stride) {
+__device__ inline K2Lane MakeK2Lane(const Workspace& ws, const Sizes& sz, int32_t lane) {
   K2Lane v;
   const int64_t lane64 = lane;
   v.lc = &ws.lanes[lane];
@@ -260,22 +263,20 @@ __device__ inline K2Lane MakeK2Lane(const Workspace& ws, const Sizes& sz, int32_
   v.total = v.lc->total_arcs;
   v.phase = v.lc->phase;
   v.max_lp = v.lc->max_lp;
-  v.lp_row = lane64 * lp_lane_stride +
-             static_cast<int64_t>(v.lc->t - v.lc->chunk_start) * lp_frame_stride;
+  v.lp_row = reinterpret_cast<const void*>(v.lc->lp_row_ptr);
   return v;
 }
 
 // One arc slot of the max pass; returns the ordered end score (0 when skipped).
-__device__ inline uint32_t MaxSlotEnd(const K2Lane& v, const DeviceGraph& g, const void* lp,
-                                      bool lp_half, int32_t slot, int32_t tok,
-                                      int32_t tok_off) {
+__device__ inline uint32_t MaxSlotEnd(const K2Lane& v, const DeviceGraph& g, bool lp_half,
+                                      int32_t slot, int32_t tok, int32_t tok_off) {
   const bool real = (v.phase == kPhaseReal);
   // Upper-bound skip: fp add is monotone, so ub >= every end score of this token; a
   // skipped arc is dominated by an already-posted end score and cannot change the max.
   if (real && !(FloatToOrderedUint(v.tok_ub[tok] + v.max_lp) > v.lc->running_max)) return 0;
   const int32_t arc = v.emit_begin[tok] + (slot - tok_off);
   float end = v.tok_score[tok] + g.weight[arc];
-  if (real) end += LoadLp(lp, v.lp_row + ArcIlabel(g, arc), lp_half);
+  if (real) end += LoadLp(v.lp_row, ArcIlabel(g, arc), lp_half);
   return FloatToOrderedUint(end);
 }
 
@@ -287,8 +288,7 @@ __device__ inline uint32_t MaxSlotEnd(const K2Lane& v, const DeviceGraph& g, con
 // they may use warp intrinsics).
 template <typename SlotBody, typename StripEnd>
 __device__ inline void WarpWalkSlots(const Workspace& ws, const Sizes& sz, int32_t begin,
-                                     int32_t end, int64_t lp_lane_stride,
-                                     int64_t lp_frame_stride, SlotBody&& slot_body,
+                                     int32_t end, SlotBody&& slot_body,
                                      StripEnd&& strip_end) {
   constexpr uint32_t kFull = 0xFFFFFFFFu;
   const int32_t lane_id = static_cast<int32_t>(threadIdx.x) & 31;
@@ -297,7 +297,7 @@ __device__ inline void WarpWalkSlots(const Workspace& ws, const Sizes& sz, int32
     const int32_t l = UpperTokenGlobal(ws.lane_arc_offsets, sz.lanes, pos);
     const int32_t seg_begin = ws.lane_arc_offsets[l];
     const int32_t seg_end = min(end, ws.lane_arc_offsets[l + 1]);
-    const K2Lane v = MakeK2Lane(ws, sz, l, lp_lane_stride, lp_frame_stride);
+    const K2Lane v = MakeK2Lane(ws, sz, l);
     int32_t s = pos - seg_begin;  // local slot cursor (warp-uniform)
     const int32_t s_end = seg_end - seg_begin;
     // Token cursor: invariant offsets[base_tok] == off_prev <= every remaining slot.
@@ -353,8 +353,7 @@ __device__ inline void WarpWalkSlots(const Workspace& ws, const Sizes& sz, int32
 // already dominated — the final max is still exact (every skipped arc is <= an already
 // posted end score). Running on the full arc set before K2b makes the admit cutoff
 // exact, so the admitted candidate/claim sets equal the true in-beam sets.
-__global__ void MaxKernel(Workspace ws, Sizes sz, DeviceGraph g, const void* log_probs,
-                          int64_t lp_lane_stride, int64_t lp_frame_stride) {
+__global__ void MaxKernel(Workspace ws, Sizes sz, DeviceGraph g) {
   const int32_t grand = ws.lane_arc_offsets[sz.lanes];
   if (grand == 0) return;
   const bool lp_half = sz.lp_half != 0;
@@ -367,10 +366,9 @@ __global__ void MaxKernel(Workspace ws, Sizes sz, DeviceGraph g, const void* log
 
   uint32_t strip_max = 0;
   WarpWalkSlots(
-      ws, sz, begin, end, lp_lane_stride, lp_frame_stride,
+      ws, sz, begin, end,
       [&](int32_t, const K2Lane& v, int32_t slot, int32_t tok, int32_t off, bool valid) {
-        if (valid) strip_max = max(strip_max, MaxSlotEnd(v, g, log_probs, lp_half, slot,
-                                                         tok, off));
+        if (valid) strip_max = max(strip_max, MaxSlotEnd(v, g, lp_half, slot, tok, off));
       },
       [&](const K2Lane& v) {
         // Post per strip so later strips (and other warps) can skip dominated tokens.
@@ -383,7 +381,7 @@ __global__ void MaxKernel(Workspace ws, Sizes sz, DeviceGraph g, const void* log
 
 // One arc slot of the expand pass (admit + hash recombine; also the redirect claim).
 __device__ inline void ExpandSlot(const Workspace& ws, const Sizes& sz, const DeviceGraph& g,
-                                  const K2Lane& v, int32_t lane, const void* lp, bool lp_half,
+                                  const K2Lane& v, int32_t lane, bool lp_half,
                                   int32_t slot, int32_t tok, int32_t tok_off) {
   LaneCounters& lc = *v.lc;
   const int64_t lane64 = lane;
@@ -408,7 +406,7 @@ __device__ inline void ExpandSlot(const Workspace& ws, const Sizes& sz, const De
   // Token-level skip: no arc of this token can pass the (exact) beam test.
   if (real && !(v.tok_ub[tok] + v.max_lp > cur_max - beam)) return;
   float end = v.tok_score[tok] + g.weight[arc];
-  if (real) end += LoadLp(lp, v.lp_row + ArcIlabel(g, arc), lp_half);
+  if (real) end += LoadLp(v.lp_row, ArcIlabel(g, arc), lp_half);
   // final phase: acoustic 0 for -1 arcs
 
   const uint32_t ordered_end = FloatToOrderedUint(end);
@@ -477,8 +475,7 @@ __device__ inline void ExpandSlot(const Workspace& ws, const Sizes& sz, const De
 
 // K2b: admit + hash recombine with the exact cutoff from K2a, over the flattened slot
 // space (same walker as K2a).
-__global__ void ExpandKernel(Workspace ws, Sizes sz, DeviceGraph g, const void* log_probs,
-                             int64_t lp_lane_stride, int64_t lp_frame_stride) {
+__global__ void ExpandKernel(Workspace ws, Sizes sz, DeviceGraph g) {
   const int32_t grand = ws.lane_arc_offsets[sz.lanes];
   if (grand == 0) return;
   const bool lp_half = sz.lp_half != 0;
@@ -490,9 +487,9 @@ __global__ void ExpandKernel(Workspace ws, Sizes sz, DeviceGraph g, const void* 
   const int32_t end = min(begin + span, grand);
 
   WarpWalkSlots(
-      ws, sz, begin, end, lp_lane_stride, lp_frame_stride,
+      ws, sz, begin, end,
       [&](int32_t l, const K2Lane& v, int32_t slot, int32_t tok, int32_t off, bool valid) {
-        if (valid) ExpandSlot(ws, sz, g, v, l, log_probs, lp_half, slot, tok, off);
+        if (valid) ExpandSlot(ws, sz, g, v, l, lp_half, slot, tok, off);
       },
       [](const K2Lane&) {});
 }

@@ -170,6 +170,10 @@ void wfst_decode_batch(int64_t handle, TensorView log_probs, TensorView lengths,
   const int64_t batch = log_probs.size(0);
   const int64_t max_frames = log_probs.size(1);
   const int64_t vocab = log_probs.size(2);
+  // The decode kernels read the tensor in place (device-resident descriptor).
+  TVM_FFI_ICHECK(log_probs.stride(2) == 1 && log_probs.stride(1) == vocab &&
+                 log_probs.stride(0) == max_frames * vocab)
+      << "log_probs must be a packed [B, T, V] tensor";
   std::vector<int32_t> frames = read_i32(lengths, batch);
   const int64_t cap = out_words.size(out_words.ndim() - 1);
 

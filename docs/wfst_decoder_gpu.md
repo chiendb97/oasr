@@ -43,9 +43,9 @@ the GPU CTC decoder. There is no build flag; `pip install` never compiles it.
 ## 2. High-Level Architecture
 
 ```
-              log_probs [B, T, V] (fp32 or fp16, CUDA)
-                              │  per-lane D2D copies into the decoder-owned
-                              ▼  staging buffer (capture-stable pointers)
+              log_probs [B, T, V] (fp32 or fp16, CUDA, packed)
+                              │  read in place: device-resident LpDesc carries
+                              ▼  base+strides (captured graphs stay valid)
       ┌──────────────────────────────────────────────────────┐
       │ K0  InitKernel      batch init; d_batch device-      │
       │                     resident → graphs batch-agnostic │
@@ -289,7 +289,7 @@ path_cap   = max_frames + 2
 | Hash `key u32 + payload u64` (+`hash_pos` i32 eps/lattice) | SoA | `lanes × hash_cap` | eager |
 | **Winners log** `{prev, arc}` | int2, global cursor | `arena_cap` | **lazy (VMM)** |
 | Lattice arenas (`lat`, `lat2`, `tok_fwd`, `tok_bwd`, `lat_out`) | — | `lat_cap` / `arena_cap` | **lazy (VMM)** |
-| Log-prob staging | `[lanes, max_frames, V]` | fp32/fp16 | **lazy (VMM)**, per-lane row prefixes |
+| Log-prob staging (STREAMING only) | `[lanes, max_frames, V]` | fp32/fp16 | **lazy (VMM)**; offline decodes the caller's tensor in place via the device-resident `LpDesc` |
 
 At the offline defaults the Python wrapper uses (`main_q_factor=32`,
 `cand_factor=3`, `max_active=10000`): `main_q` 320k, `hash_cap` 2Mi slots
@@ -320,10 +320,14 @@ winners, 64 MiB lattice, 32 MiB lattice-out.
 
 Two placement rules follow from VMM semantics:
 
-- the log-prob staging is committed as **per-lane row prefixes**
-  (`rows ≤ max(T)` of each batch), and staging copies are per-lane 1-D
-  `cudaMemcpyAsync` — a single 2-D copy would validate a span crossing
-  unmapped holes and fail with `invalid argument`;
+- offline decodes have **no staging at all**: the kernels read the log-prob
+  base pointer and strides from a device-resident descriptor (`LpDesc`,
+  rewritten with one 24 B H2D before every decode — captured graphs read it
+  at replay), so the caller's packed `[B, T, V]` tensor is consumed in place.
+  K1 publishes each lane's absolute row pointer into its `LaneCounters`, so
+  the hot K2 kernels never touch the descriptor. Streaming keeps a small
+  fully-committed staging block (`AdvanceChunk` scatters caller rows into
+  fixed per-channel slots) and points the descriptor at it once;
 - streaming winners regions are interleaved per channel, not a prefix:
   `stream_log_cap` (default `arena_cap / lanes`, override with
   `DecoderConfig::stream_log_entries`) is rounded up to whole mapping chunks,
@@ -398,7 +402,7 @@ GC is rejected: every token stays reachable by construction.
 Measured (tiled LJSpeech, T 1800–3000, 32 lanes, RTX 5090): words + scores
 identical GC on/off; winners committed drops from the 264 MiB high-water +
 growth curve to a sliding ~64–128 MiB window (whole-decoder committed 2346 →
-1930 MiB — the remainder is log-prob staging, see §14); decode +4.2% at N=64,
+96 MiB together with the in-place log-prob descriptor); decode +4.2% at N=64,
 +2.3% at N=128, +1.6% at N=256. Recommended: `gc_interval=128` for T > 2000;
 leave 0 for short utterances (the segmented loop and window bookkeeping only
 pay off when the log outgrows its window).
@@ -605,9 +609,11 @@ nsys profile --cuda-graph-trace=node -t cuda python benchmarks/bench_wfst.py ...
 
 - **Vocab < 65,535** (u16 ilabel encoding); checked at graph upload.
 - **Lattice records are not exposed over TVM-FFI** yet (C++ API only).
-- **Streaming winners arena commits fully**; PagedAttention-style per-channel
-  block paging is the designed follow-up (§6.3) if high channel counts make
-  the footprint matter.
+- **Lattice-mode `tok_fwd`/`tok_bwd` stay prefix-committed** under winners GC
+  (records reference old token ids); token renumbering during interval
+  compaction would bound them.
+- Streaming logical ids hit the int32 wall after ~2^31 appends per channel
+  (~35 h of continuous audio); recycle channels at utterance boundaries.
 - Per-lane eager workspace (hash ≈ half of it) is capacity-policy sized for
   k2's soft-`max_active` transients; shrinking it safely needs occupancy
   telemetry first.
