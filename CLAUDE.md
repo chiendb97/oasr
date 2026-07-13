@@ -206,7 +206,7 @@ Non-CUTLASS kernels (Conv1D, Norm, Activation) use `*_dispatch.inc` files with V
   - `gemm/` — `gemm.cuh` facade → `cutlass_gemm_configs.h` / `gemm_cutlass_template.h` / `gemm_cutlass.h`. Also `bmm.cuh`, `group_gemm.cuh`.
 - **`csrc/`** — TVM-FFI launcher layer (`<family>.cu`) and JIT binding exports (`<family>_jit_binding.cu`). Also contains `tvm_ffi_utils.h` with DLPack dtype dispatch and validation macros.
 - **`csrc/templates/`** — Jinja2 templates for config-specific CUTLASS instantiations (`gemm_cutlass_template.cu.jinja`, `bmm_cutlass_template.cu.jinja`, `group_gemm_cutlass_template.cu.jinja`).
-- **`csrc/decoder/`** — CPU-side C++ decoder implementations: CTC greedy search, prefix beam search, WFST beam search (via k2), streaming WFST decoder, and `ContextGraph` for phrase boosting.
+- **`csrc/decoder/`** — decoder implementations, split by placement: `ctc/cpu/` holds the CPU-side C++ decoders (CTC greedy search, prefix beam search, WFST beam search via k2, streaming WFST decoder, `ContextGraph` for phrase boosting, and shared `common/utils`), while `wfst/` holds the in-tree GPU WFST decoder (TVM-FFI JIT).
 - **`csrc/pybind/`** — pybind11 module for decoder bindings and legacy enums (`pybind_main.cpp`, `pybind_decoder.h`).
 
 ### Dispatch modes

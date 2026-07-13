@@ -32,11 +32,6 @@ void wfst_advance_chunk(int64_t handle, TensorView channels, TensorView log_prob
                         TensorView out_overflow);
 void wfst_finalize_stream(int64_t handle, int64_t channel, TensorView out_words,
                           TensorView out_word_len, TensorView out_score, TensorView out_meta);
-void wfst_cpu_decode(int64_t graph_handle, TensorView log_probs, double search_beam,
-                     double output_beam, int64_t min_active, int64_t max_active,
-                     int64_t allow_partial, int64_t online, int64_t eps_iterations,
-                     TensorView out_words, TensorView out_word_len, TensorView out_score,
-                     TensorView out_meta);
 
 // TVM-FFI symbol exports
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_load_graph, wfst_load_graph);
@@ -50,4 +45,3 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_create_stream, wfst_create_stream);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_release_stream, wfst_release_stream);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_advance_chunk, wfst_advance_chunk);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_finalize_stream, wfst_finalize_stream);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(wfst_cpu_decode, wfst_cpu_decode);

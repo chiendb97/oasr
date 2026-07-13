@@ -142,10 +142,10 @@ endif()
 # Kernel launchers + JIT bindings are compiled at runtime by the JIT system.
 # ---------------------------------------------------------------------------
 set(OASR_SOURCES
-    csrc/decoder/common/utils.cc
-    csrc/decoder/context_graph.cc
-    csrc/decoder/ctc_prefix_beam_search.cc
-    csrc/decoder/ctc_greedy_search.cc
+    csrc/decoder/ctc/cpu/common/utils.cc
+    csrc/decoder/ctc/cpu/context_graph.cc
+    csrc/decoder/ctc/cpu/ctc_prefix_beam_search.cc
+    csrc/decoder/ctc/cpu/ctc_greedy_search.cc
 )
 
 set(OASR_HEADERS
@@ -157,11 +157,11 @@ set(OASR_HEADERS
     include/oasr/common/epilogue_functors.h
 
     # Decoder headers
-    csrc/decoder/common/utils.h
-    csrc/decoder/context_graph.h
-    csrc/decoder/ctc_prefix_beam_search.h
-    csrc/decoder/ctc_greedy_search.h
-    csrc/decoder/ctc_wfst_beam_search.h
+    csrc/decoder/ctc/cpu/common/utils.h
+    csrc/decoder/ctc/cpu/context_graph.h
+    csrc/decoder/ctc/cpu/ctc_prefix_beam_search.h
+    csrc/decoder/ctc/cpu/ctc_greedy_search.h
+    csrc/decoder/ctc/cpu/ctc_wfst_beam_search.h
 )
 
 # =============================================================================
@@ -189,8 +189,8 @@ if(OASR_USE_K2)
             "  cmake -DK2_SOURCE_DIR=/opt/k2-src ...")
     endif()
 
-    list(APPEND OASR_SOURCES csrc/decoder/ctc_wfst_beam_search.cc)
-    list(APPEND OASR_SOURCES csrc/decoder/ctc_wfst_streaming_decoder.cc)
+    list(APPEND OASR_SOURCES csrc/decoder/ctc/cpu/ctc_wfst_beam_search.cc)
+    list(APPEND OASR_SOURCES csrc/decoder/ctc/cpu/ctc_wfst_streaming_decoder.cc)
     message(STATUS "K2 WFST decoder enabled (k2 version: ${k2_VERSION})")
 endif()
 

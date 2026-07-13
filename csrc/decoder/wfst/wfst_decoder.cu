@@ -21,15 +21,12 @@
 #include <tvm/ffi/string.h>
 
 #include "decoder/wfst/config.h"
-#include "decoder/wfst/cpu_reference.h"
 #include "decoder/wfst/decoder.h"
 #include "decoder/wfst/graph.h"
 #include "tvm_ffi_utils.h"
 
 namespace {
 
-using oasr::wfst::CpuDecode;
-using oasr::wfst::CpuDecodeResult;
 using oasr::wfst::DecodeResult;
 using oasr::wfst::DecoderConfig;
 using oasr::wfst::GpuDecoder;
@@ -253,41 +250,4 @@ void wfst_finalize_stream(int64_t handle, int64_t channel, TensorView out_words,
   meta[0] = r.ok ? 1 : 0;
   meta[1] = r.reached_final ? 1 : 0;
   meta[2] = static_cast<int32_t>(r.overflow);
-}
-
-// ---------------------------------------------------------------------------
-// CPU reference (exact-semantics oracle, used by tests)
-// ---------------------------------------------------------------------------
-// log_probs: CPU float32 [T, V].  out_* as in finalize (out_meta[2] always 0).
-void wfst_cpu_decode(int64_t graph_handle, TensorView log_probs, double search_beam,
-                     double output_beam, int64_t min_active, int64_t max_active,
-                     int64_t allow_partial, int64_t online, int64_t eps_iterations,
-                     TensorView out_words, TensorView out_word_len, TensorView out_score,
-                     TensorView out_meta) {
-  auto* gh = reinterpret_cast<GraphHandle*>(graph_handle);
-  TVM_FFI_ICHECK(gh != nullptr) << "null graph handle";
-  check_cpu(log_probs, "log_probs");
-  TVM_FFI_ICHECK(log_probs.ndim() == 2) << "log_probs must be [T, V]";
-  const int64_t num_frames = log_probs.size(0);
-  const int64_t vocab = log_probs.size(1);
-
-  DecoderConfig cfg;
-  cfg.search_beam = static_cast<float>(search_beam);
-  cfg.output_beam = static_cast<float>(output_beam);
-  cfg.min_active_states = static_cast<int32_t>(min_active);
-  cfg.max_active_states = static_cast<int32_t>(max_active);
-  cfg.allow_partial = allow_partial != 0;
-  cfg.eps_iterations = static_cast<int32_t>(eps_iterations);
-
-  CpuDecodeResult r = CpuDecode(*gh->graph, static_cast<const float*>(log_probs.data_ptr()),
-                                static_cast<int32_t>(num_frames), static_cast<int32_t>(vocab),
-                                cfg, online != 0);
-  const int64_t cap = out_words.size(out_words.ndim() - 1);
-  write_words(static_cast<int32_t*>(out_words.data_ptr()), cap,
-              static_cast<int32_t*>(out_word_len.data_ptr()), r.words);
-  static_cast<double*>(out_score.data_ptr())[0] = r.score;
-  int32_t* meta = static_cast<int32_t*>(out_meta.data_ptr());
-  meta[0] = r.ok ? 1 : 0;
-  meta[1] = r.reached_final ? 1 : 0;
-  meta[2] = 0;
 }

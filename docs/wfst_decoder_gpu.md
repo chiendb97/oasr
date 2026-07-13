@@ -529,7 +529,12 @@ the gc-off path, whose word list is exactly the truncated suffix.
 | `wfst_decoder_mem_stats(h, out_i64[4])` | `{reserved, committed, fixed, arena_high_water}` bytes/entries |
 | `wfst_decode_batch(h, lp[B,T,V] cuda, lengths cpu, out_words[B,cap], out_word_lens, out_scores f64, out_meta[B,3])` | offline batched decode; `out_meta = {ok, reached_final, overflow}` |
 | `wfst_create_stream / wfst_advance_chunk / wfst_finalize_stream / wfst_release_stream` | streaming lifecycle (§8) |
-| `wfst_cpu_decode(graph_h, lp[T,V] cpu, ...)` | exact-semantics CPU oracle (tests) |
+
+The exact-semantics CPU oracle (`wfst_cpu_decode(graph_path, lp[T,V] cpu, ...)`) is
+**not** exported by this module. It lives in a separate, test-only JIT module
+(`oasr.jit.wfst_decoder.gen_wfst_cpu_reference_module`, sources under `csrc/tests/wfst/`)
+so the production decoder library carries no reference-decoder code; it takes a graph-image
+*path* (loads the image itself) rather than a decoder handle.
 
 A decoder handle co-owns its graph image (word lookups during backtrack), so
 freeing the graph handle first is safe. Instances are not thread-safe; one
@@ -602,8 +607,10 @@ nsys profile --cuda-graph-trace=node -t cuda python benchmarks/bench_wfst.py ...
   GPU batches through the in-tree JIT decoder and the standalone project's
   `_wfst.so`; asserts every lane's words, score and overflow match. Any
   kernel change must keep this at 0 mismatches (score ties excepted, §3).
-- `csrc/decoder/wfst/cpu_reference.cc` — the executable k2-semantics spec
-  (offline + online beam modes), reachable from Python via `wfst_cpu_decode`.
+- `csrc/tests/wfst/cpu_reference.cc` — the executable k2-semantics spec
+  (offline + online beam modes), reachable from Python via `wfst_cpu_decode`
+  in the test-only `gen_wfst_cpu_reference_module` (kept out of the production
+  decoder library).
 
 ## 14. Limitations and Follow-Ups
 

@@ -1,4 +1,4 @@
-#include "decoder/wfst/cpu_reference.h"
+#include "tests/wfst/cpu_reference.h"
 
 #include <algorithm>
 #include <cmath>

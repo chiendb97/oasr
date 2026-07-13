@@ -20,8 +20,8 @@
 #include <utility>
 #include <vector>
 
-#include "decoder/common/utils.h"
-#include "decoder/context_graph.h"
+#include "decoder/ctc/cpu/common/utils.h"
+#include "decoder/ctc/cpu/context_graph.h"
 
 namespace oasr {
 namespace decoder {

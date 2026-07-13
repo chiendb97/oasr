@@ -13,7 +13,7 @@
 // k2's public C API (only installed header in the pip package)
 #include "k2/torch_api.h"
 
-#include "decoder/common/utils.h"
+#include "decoder/ctc/cpu/common/utils.h"
 
 namespace oasr {
 namespace decoder {

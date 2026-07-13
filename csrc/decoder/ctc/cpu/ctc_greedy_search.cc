@@ -1,7 +1,7 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "decoder/ctc_greedy_search.h"
+#include "decoder/ctc/cpu/ctc_greedy_search.h"
 
 #include <algorithm>
 

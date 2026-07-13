@@ -40,6 +40,22 @@ def _module():
         pytest.skip(f"WFST decoder JIT module unavailable: {exc}")
 
 
+def _cpu_reference_module():
+    """Return the test-only WFST CPU reference JIT module (the parity oracle), or skip.
+
+    Built separately from the production decoder module (``gen_wfst_cpu_reference_module``)
+    so the shipping decoder carries no reference-decoder code.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    try:
+        from oasr.jit.wfst_decoder import gen_wfst_cpu_reference_module
+
+        return gen_wfst_cpu_reference_module().build_and_load()
+    except Exception as exc:  # pragma: no cover - JIT toolchain missing
+        pytest.skip(f"WFST CPU reference JIT module unavailable: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Toy graph: 0 -(1)-> 1 -(2)-> 2 -(-1)-> 3, with blank (label 0) self-loops so it
 # accepts [blank* 1 blank* 2 blank*] -> words [10, 20]. Epsilon-free, k2 conventions.
@@ -93,14 +109,19 @@ def _toy_logp(labels, device="cpu") -> torch.Tensor:
     return lp
 
 
-def _cpu_decode(mod, graph_handle, logp_cpu, min_active=1, max_active=100):
-    """Run the module's CPU reference; return (words, score, ok)."""
+def _cpu_decode(graph_path, logp_cpu, min_active=1, max_active=100):
+    """Run the test-only CPU reference oracle over the .img at *graph_path*.
+
+    Returns (words, score, ok). The oracle loads the graph image itself, so it takes a
+    path rather than a production graph handle.
+    """
+    mod = _cpu_reference_module()
     cap = max(1, logp_cpu.size(0) * 4)
     out_words = torch.empty((cap,), dtype=torch.int32)
     out_wlen = torch.empty((1,), dtype=torch.int32)
     out_score = torch.empty((1,), dtype=torch.float64)
     out_meta = torch.empty((3,), dtype=torch.int32)
-    mod.wfst_cpu_decode(graph_handle, logp_cpu, 20.0, 8.0, min_active, max_active, 1, 0, 3,
+    mod.wfst_cpu_decode(graph_path, logp_cpu, 20.0, 8.0, min_active, max_active, 1, 0, 3,
                         out_words, out_wlen, out_score, out_meta)
     length = min(int(out_wlen[0]), cap)
     return out_words[:length].tolist(), float(out_score[0]), bool(out_meta[0])
@@ -121,16 +142,15 @@ def toy_fst(tmp_path_factory):
 
 def test_toy_gpu_matches_cpu_reference(toy_fst):
     """GPU decode == CPU reference == the expected word sequence."""
-    from oasr.decoder.wfst_decoder import WfstDecoderOptions, WfstDecoderSearch, _get_graph
+    from oasr.decoder.wfst_decoder import WfstDecoderOptions, WfstDecoderSearch
 
-    mod = _module()
     opts = WfstDecoderOptions(min_active_states=1, max_active_states=100,
                               blank_skip_thresh=1.0, max_frames=16, max_offline_lanes=2)
     searcher = WfstDecoderSearch(toy_fst, opts)
     tokens, scores = searcher.decode_offline(_toy_logp([1, 2], "cuda"))
     gpu_words, gpu_score = tokens[0], scores[0]
 
-    cpu_words, cpu_score, cpu_ok = _cpu_decode(mod, _get_graph(toy_fst), _toy_logp([1, 2]))
+    cpu_words, cpu_score, cpu_ok = _cpu_decode(toy_fst, _toy_logp([1, 2]))
 
     assert cpu_ok
     assert cpu_words == _TOY_WORDS
