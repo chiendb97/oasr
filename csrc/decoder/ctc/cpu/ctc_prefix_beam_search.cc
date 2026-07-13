@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "decoder/ctc_prefix_beam_search.h"
+#include "decoder/ctc/cpu/ctc_prefix_beam_search.h"
 
 #include <algorithm>
 #include <cassert>
 #include <unordered_map>
 #include <utility>
 
-#include "decoder/common/utils.h"
+#include "decoder/ctc/cpu/common/utils.h"
 
 namespace oasr {
 namespace decoder {

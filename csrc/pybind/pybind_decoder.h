@@ -5,11 +5,11 @@
 
 #include <torch/extension.h>
 
-#include "decoder/context_graph.h"
-#include "decoder/ctc_greedy_search.h"
-#include "decoder/ctc_prefix_beam_search.h"
+#include "decoder/ctc/cpu/context_graph.h"
+#include "decoder/ctc/cpu/ctc_greedy_search.h"
+#include "decoder/ctc/cpu/ctc_prefix_beam_search.h"
 #ifdef OASR_USE_K2
-#include "decoder/ctc_wfst_beam_search.h"
+#include "decoder/ctc/cpu/ctc_wfst_beam_search.h"
 #endif
 
 namespace py = pybind11;

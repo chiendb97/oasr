@@ -1,7 +1,7 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "decoder/ctc_wfst_streaming_decoder.h"
+#include "decoder/ctc/cpu/ctc_wfst_streaming_decoder.h"
 
 #if defined(OASR_USE_K2)
 

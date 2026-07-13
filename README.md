@@ -28,7 +28,7 @@ OASR is flexible and easy to use with:
 
 - A single engine for both offline and streaming inference
 - Seamless integration with popular Hugging Face, WeNet, and Icefall models
-- Multiple decoders: CTC greedy, CTC prefix beam (CPU & GPU), and WFST beam search
+- Multiple decoders: CTC greedy, CTC prefix beam (CPU & GPU), and WFST beam search (CPU via k2 and an in-tree GPU decoder)
 - A production Rust frontend with HTTP and gRPC APIs
 
 ## Supported Models
@@ -171,10 +171,10 @@ grpcurl -plaintext -import-path rust/proto -proto oasr_speech_v1.proto \
 |------------------------------------------------------|-------------------------------------------------------|
 | [`docs/architecture.md`](docs/architecture.md)       | Engine extension points (the per-axis registries)     |
 | [`docs/engine.md`](docs/engine.md)                   | Engine step loop, batching, CUDA Graph capture        |
-| [`docs/engine_concurrency.md`](docs/engine_concurrency.md) | Engine thread-safety and multi-process scaling   |
 | [`docs/scheduler.md`](docs/scheduler.md)             | Request scheduling, starvation bounds, micro-batching |
 | [`docs/cache_manager.md`](docs/cache_manager.md)     | Paged streaming cache (`BlockPool`, `StreamContext`)  |
 | [`docs/ctc_decoder_gpu.md`](docs/ctc_decoder_gpu.md) | GPU CTC decoder, single- and multi-request flows      |
+| [`docs/wfst_decoder_gpu.md`](docs/wfst_decoder_gpu.md) | In-tree GPU WFST decoder: k2-parity semantics, kernel pipeline, streaming |
 | [`docs/serving.md`](docs/serving.md)                 | Serving frontend, wire format, deployment             |
 | [`docs/benchmarks.md`](docs/benchmarks.md)           | Engine and service benchmark recipes                  |
 | [`docs/autotuning.md`](docs/autotuning.md)           | Kernel auto-tuning API and cache format               |

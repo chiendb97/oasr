@@ -1,7 +1,7 @@
 # GPU CTC Prefix Beam Search Decoder
 
 The CTC prefix beam search decoder (`include/oasr/ctc_decoder.cuh` +
-`csrc/ctc_decoder.cu`) is OASR's GPU-resident CTC decoder. It performs
+`csrc/decoder/ctc/ctc_decoder.cu`) is OASR's GPU-resident CTC decoder. It performs
 batched offline decoding and per-frame streaming decoding entirely on the
 device, with no host loop or per-frame H2D/D2H synchronisation in the
 hot path.

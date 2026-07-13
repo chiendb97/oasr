@@ -15,8 +15,8 @@ def gen_ctc_decoder_module(use_fused: bool = True) -> JitSpec:
     testing and as an emergency rollback (``OASR_CTC_FUSED=0``).
     """
     sources = [
-        env.OASR_CSRC_DIR / "ctc_decoder.cu",
-        env.OASR_CSRC_DIR / "ctc_decoder_jit_binding.cu",
+        env.OASR_CSRC_DIR / "decoder" / "ctc" / "ctc_decoder.cu",
+        env.OASR_CSRC_DIR / "decoder" / "ctc" / "ctc_decoder_jit_binding.cu",
     ]
     if not use_fused:
         return gen_jit_spec(

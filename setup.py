@@ -187,7 +187,7 @@ class CMakeBuild(build_ext):
                 cmake_args.append(f"-DK2_SOURCE_DIR={k2_src}")
         else:
             cmake_args.append("-DOASR_USE_K2=OFF")
-        
+
         # Build arguments
         build_args = ["--config", build_type]
         

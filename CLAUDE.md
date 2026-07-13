@@ -155,13 +155,15 @@ python benchmarks/bench_engine.py \
 python benchmarks/bench_service.py \
     --ckpt-dir [CKPT_DIR] \
     --audio-dir [AUDIO_DIR] \
-    --subroutines [offline|streaming|grpc_offline|grpc_streaming|whisper] \
+    --subroutines [offline|grpc_offline|grpc_streaming|whisper] \
     --num-utterances [NUM_UTTERANCES] \
     --concurrency [CONCURRENCY] \
     --max-batch-size [MAX_BATCH_SIZE] \
     --chunk-ms [CHUNK_MS] \
     --wire-encoding [f32_le|i16_le] \
-    --realtime [0|1]
+    --realtime [0|1] \
+    --decoder-type [ctc_cuda|ctc_wfst] \
+    --fst-path [/path/to/lang_bpe/HLG.pt]   # ctc_wfst only
 ```
 
 `--wire-encoding` (default `i16_le`) chooses the PCM format the bench client
@@ -204,7 +206,9 @@ Non-CUTLASS kernels (Conv1D, Norm, Activation) use `*_dispatch.inc` files with V
   - `gemm/` — `gemm.cuh` facade → `cutlass_gemm_configs.h` / `gemm_cutlass_template.h` / `gemm_cutlass.h`. Also `bmm.cuh`, `group_gemm.cuh`.
 - **`csrc/`** — TVM-FFI launcher layer (`<family>.cu`) and JIT binding exports (`<family>_jit_binding.cu`). Also contains `tvm_ffi_utils.h` with DLPack dtype dispatch and validation macros.
 - **`csrc/templates/`** — Jinja2 templates for config-specific CUTLASS instantiations (`gemm_cutlass_template.cu.jinja`, `bmm_cutlass_template.cu.jinja`, `group_gemm_cutlass_template.cu.jinja`).
-- **`csrc/decoder/`** — CPU-side C++ decoder implementations: CTC greedy search, prefix beam search, WFST beam search (via k2), streaming WFST decoder, and `ContextGraph` for phrase boosting.
+- **`csrc/decoder/`** — decoder implementations, grouped by decode family:
+  - `ctc/` — **GPU** CTC prefix-beam-search TVM-FFI launcher + JIT binding (`ctc_decoder.cu`, `ctc_decoder_jit_binding.cu`), JIT-compiled at runtime via `oasr/jit/ctc_decoder.py` (this is the one JIT launcher/binding pair that does **not** live at the `csrc/` root — see the binding pattern below). `ctc/cpu/` holds the **CPU-side** C++ decoders compiled into `_C.so` via CMake: CTC greedy search, prefix beam search, WFST beam search (via k2), streaming WFST decoder, `ContextGraph` for phrase boosting, and shared `common/utils`.
+  - `wfst/` — in-tree **GPU WFST** beam-search decoder (TVM-FFI JIT). Its exact-semantics CPU reference oracle is test-only and lives in a separate JIT module under `csrc/tests/wfst/` (kept out of the production decoder library).
 - **`csrc/pybind/`** — pybind11 module for decoder bindings and legacy enums (`pybind_main.cpp`, `pybind_decoder.h`).
 
 ### Dispatch modes
@@ -275,14 +279,15 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
 
 | File | Covers |
 |------|--------|
+| `docs/architecture.md` | One-registry-per-extension-axis design (decode family / streaming backend / batching policy / model / checkpoint) |
 | `docs/autotuning.md` | `oasr.tune` design, `oasr.autotune()` API, JSON cache format |
 | `docs/benchmarks.md` | Engine vs. service bench recipes, `.env` workflow, RTF / latency interpretation |
 | `docs/cache_manager.md` | `BlockPool` / `AttentionCacheManager` / `CnnCacheManager` / `StreamContext` semantics |
 | `docs/ctc_decoder_gpu.md` | `GpuStreamingDecoder` single- vs. multi-request flows, paged-memory options |
 | `docs/engine.md` | `ASREngine` step loop, batching, CUDA Graph capture |
-| `docs/engine_concurrency.md` | Engine thread-safety (RLock), worker thread modes, multi-process scaling |
 | `docs/scheduler.md` | Streaming + offline request scheduling, starvation bounds, micro-batching |
 | `docs/serving.md` | Rust `oasr-server` frontend: HTTP/gRPC/WebSocket API, in-process PyO3 engine, wire format |
+| `docs/wfst_decoder_gpu.md` | In-tree GPU WFST decoder: k2-parity semantics, kernel pipeline, graph image, lazy-commit memory model, TVM-FFI API, streaming |
 - **`layers/`** — Thin `nn.Module`-style wrappers around functional API: `conv.py`, `linear.py`, `norm.py`, `feature.py`, `softmax.py`, `topk.py`, `attention/`, `rotary_embedding/`, plus `ctc.py` (`CtcProjection` — fused `log_softmax(x @ Wᵀ + b)` via `oasr.gemm_log_softmax`, used by `CTCHead`).
 - **`models/`** — Architecture-agnostic model layer (vLLM/SGLang-style). `base.py` (`BaseAsrModel`/`BaseEncoder`/`BaseHead`/`CacheSpec`/`DecodeType`): the engine touches a model only through `encode_offline`/`encode_chunk_paged` (raw hidden) + fused `forward_offline`/`forward_chunk_paged` (encoder+head → log-probs, the CTC fast path), `cache_spec`, `decode_type`, and `encoder.streaming_kind`/`subsampling_rate`/`right_context`. `registry.py` (`register_model`, `build_model_from_checkpoint`, `CheckpointConverter`) + `loaders.py` (`from_pretrained` — local dir or HuggingFace Hub id, exposed as `oasr.from_pretrained`). `decoders/` holds the autoregressive `BaseDecoder`/`PredictionNetwork`/`Joiner` contracts (transducer/AED/LLM extension points). `heads/ctc.py` (`CTCHead`).
   - **`models/conformer/`** — Conformer (`model.py`, `config.py`), `WenetConverter` (`convert.py`); `streaming_kind="paged"`, supports sequence packing.
@@ -322,6 +327,8 @@ Routing policy: single in-process engine per process — no sticky map needed at
 | `--preferred-batch-sizes` | none | comma list, pre-warms CUDA-Graph capture per B |
 | `--schedule-policy` | engine default (`bucket`) | `bucket` / `fcfs` / `sjf` |
 | `--max-offline-pad-ratio` | engine default (`4.0`) | padded-waste cap for `bucket` policy |
+| `--decoder-type` | engine default (`ctc_cuda`) | `ctc_cuda` / `ctc_wfst` (in-tree GPU WFST) |
+| `--fst-path` | none | WFST graph for `ctc_wfst`: prebuilt `.img` or k2 `HLG.pt` (words.txt beside it = word table) |
 
 Admission coalescing batches contiguous `CreateOffline`/`CreateStreaming` envelopes into one `add_requests_batch` Python call — turns 10–20-deep service batches into 32–64 under `asyncio.gather`-style bursts. `FeedChunk`/`Cancel`/`Ping` flush the admit batch first to preserve `CreateStreaming → FeedChunk` ordering. The Python-side `oasr/serving/` directory still exists but is dead code from the binary's perspective; `bench_service.py` rejects `--num-workers > 1` with a helpful error pointing at the new "one process per GPU" topology.
 

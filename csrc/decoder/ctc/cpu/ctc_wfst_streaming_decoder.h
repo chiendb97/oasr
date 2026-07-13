@@ -23,8 +23,8 @@
 #include <k2/csrc/intersect_dense_pruned.h>  // OnlineDenseIntersecter, DecodeStateInfo
 #include <k2/torch/csrc/fsa_class.h>          // full k2::FsaClass definition
 
-#include "decoder/common/utils.h"
-#include "decoder/ctc_wfst_beam_search.h"  // CtcWfstBeamSearchOptions
+#include "decoder/ctc/cpu/common/utils.h"
+#include "decoder/ctc/cpu/ctc_wfst_beam_search.h"  // CtcWfstBeamSearchOptions
 
 namespace oasr {
 namespace decoder {
