@@ -105,3 +105,6 @@ logs/
 
 # Profiling
 profiling*
+
+# Local artifacts
+.artifacts/
