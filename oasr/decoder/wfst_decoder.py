@@ -156,7 +156,11 @@ def _get_streaming_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> i
                 0, 0, 1,      # lattice, fp16_logprobs, streaming=1
                 0, 3,         # lat_prune_interval, eps_iterations
                 opts.arena_budget_entries, opts.stream_log_entries,
-                0,            # gc_interval (winners GC is offline-only in v1)
+                # Streaming GC always on: it runs once per chunk (the value is just the
+                # enable switch here), drains finalized arcs to the host, and makes the
+                # per-channel winners region a ring — streams are no longer length-capped
+                # and long-stream results no longer truncate to the last path_cap arcs.
+                opts.gc_interval or 2,
             ))
         return _streaming[key]
 

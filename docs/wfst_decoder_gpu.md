@@ -333,6 +333,8 @@ Two placement rules follow from VMM semantics:
   0). `ReleaseStream` also deadens the lane's device counters
   (`StreamResetKernel`) before unmapping — the shared per-step kernels and
   `BacktrackKernel` gate on lane status, so nothing walks a released chain.
+  With per-chunk GC (§8.1) the slice is a ring and `stream_log_entries` sizes
+  the live window (one 32 MiB chunk ≈ 4Mi entries suffices), not the stream.
 
 `DecoderConfig::arena_budget_entries` (0 = the `min(512Mi, max(64Mi,
 16Mi·lanes))` formula above) caps the winners-arena reservation for
@@ -463,11 +465,37 @@ subset of channels per call: each channel's rows stage into its lane slot,
 (step count rounded up to a multiple of 8 — **even**, preserving the global
 frontier-buffer parity across chunks) advances every requested lane; lanes
 outside their window idle-carry their frontier. Winners live in per-lane
-regions (`stream_log_cap`) so ids stay monotonic across chunks; partial
-hypotheses (`want_partial`) backtrack from the best current-frontier token.
-`FinalizeStream` arms `T = t` and runs two steps (the final step + one idle
-step, keeping parity), then backtracks. Lattice mode is not supported with
-streaming.
+regions addressed by LOGICAL monotonic ids (`WinnersEntry` maps them onto the
+lane's fixed ring); partial hypotheses (`want_partial`) backtrack from the
+best current-frontier token. `FinalizeStream` arms `T = t` and runs two steps
+(the final step + one idle step, keeping parity), then backtracks. Lattice
+mode is not supported with streaming.
+
+### 8.1 Per-chunk GC: unbounded streams (`gc_interval > 0`)
+
+With `gc_interval = 0` a channel's region is a hard cap on stream length
+(`kOverflowArena` once `log_len` hits `stream_log_cap`) **and** long-stream
+backtracks silently truncate to the newest `path_cap = max_frames + 2` arcs —
+a T=251 utterance streamed in 128-frame chunks returns only the suffix of its
+words. `gc_interval > 0` (any even value; the streaming Python wrapper always
+enables it) fixes both: after every `AdvanceChunk`, a lane-local GC round
+(`StreamGc*` kernels, outside the captured chunk graph) finds each live
+channel's convergence point, cuts the chain there, and drains the finalized
+golden-prefix arcs to a host-side per-channel list. The region becomes a
+**ring** over logical ids — `gc_root` (the finalized sentinel) is the
+writer's wrap guard, so `stream_log_cap` / `stream_log_entries` turns into a
+live-**window** size (32 MiB default granularity) instead of a stream-length
+cap. Partial and final results are the host prefix + the device tail (the
+tail walk stops at the sentinel; `path_cap` grows to `fin_cap ≥ 4096` so a
+lagging tail fits). The per-round drain is bounded by `fin_cap` arcs via a
+phase-ring emit (a backlog from a convergence stall catches up at `fin_cap`
+per round); a window overrun (convergence never found) keeps the flagged
+`kOverflowArena` degrade-not-corrupt semantics.
+
+Measured: an hour-long synthetic stream (90k frames, LJS tiled) decodes with
+constant 42 MiB committed and results bit-identical between a minimal ring
+(4Mi entries, wrapped ~3×) and a 32Mi-entry ring — and identical scores to
+the gc-off path, whose word list is exactly the truncated suffix.
 
 ## 9. Orchestration and CUDA-Graph Replay
 

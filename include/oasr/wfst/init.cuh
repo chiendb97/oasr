@@ -81,8 +81,9 @@ __global__ void StreamCreateKernel(Workspace ws, Sizes sz, DeviceGraph g, int32_
   lc.log_len = 1;
   ws.tok_state[0][static_cast<int64_t>(lane) * sz.main_q] = g.start_state;
   ws.tok_score[0][static_cast<int64_t>(lane) * sz.main_q] = 0.0f;
-  ws.tok_winner[0][static_cast<int64_t>(lane) * sz.main_q] = lane * sz.stream_log_cap;
-  ws.winners[static_cast<int64_t>(lane) * sz.stream_log_cap] = make_int2(-1, -1);
+  // Streaming pointer fields hold LOGICAL per-lane ids (ring-translated on access).
+  ws.tok_winner[0][static_cast<int64_t>(lane) * sz.main_q] = 0;
+  WinnersEntry(ws, sz, lane, 0) = make_int2(-1, -1);
 }
 
 // d_chunk_len[lane] > 0 opens a chunk for the lane; 0 leaves it idle this call.

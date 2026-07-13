@@ -61,7 +61,7 @@ __global__ void GcStampKernel(Workspace ws, Sizes sz) {
   // an unstamped tail only makes walkers report a deeper hit, never a wrong one.
   const int32_t floor = *ws.gc_floor;
   int32_t w = anchor;
-  for (int32_t hops = 0; w >= floor && hops < sz.path_cap; ++hops) {
+  for (int32_t hops = 0; w >= floor && hops < sz.fin_cap; ++hops) {
     const int2 e = ws.winners[w];
     if (e.y >= 0) ws.winners[w].y = e.y | kGcStampBit;
     if (e.x == w) break;
@@ -80,13 +80,13 @@ __global__ void GcConvergeKernel(Workspace ws, Sizes sz) {
   for (int32_t i = 1 + threadIdx.x; i < lc.frontier_size; i += blockDim.x) {
     int32_t w = winner[i];
     int32_t hit = -1;  // stays -1 on a hop-cap abort: host skips the release round
-    for (int32_t hops = 0; w >= floor && hops < sz.path_cap; ++hops) {
+    for (int32_t hops = 0; w >= floor && hops < sz.fin_cap; ++hops) {
       const int2 e = ws.winners[w];
       hit = w;  // terminal fallback: the shared root is on the anchor chain too
       if (e.y >= 0 && (e.y & kGcStampBit)) break;
       if (e.x == w) break;
       w = e.x;
-      if (hops == sz.path_cap - 1) hit = -1;  // cap hit without a stamp: abort lane
+      if (hops == sz.fin_cap - 1) hit = -1;  // cap hit without a stamp: abort lane
     }
     atomicMin(&ws.gc_conv[lane], hit);
   }
@@ -108,7 +108,7 @@ __global__ void GcFinalizeKernel(Workspace ws, Sizes sz) {
   // are read by later steps and the final backtrack.
   const int32_t floor = *ws.gc_floor;
   int32_t w = anchor;
-  for (int32_t hops = 0; w >= floor && hops < sz.path_cap; ++hops) {
+  for (int32_t hops = 0; w >= floor && hops < sz.fin_cap; ++hops) {
     const int2 e = ws.winners[w];
     if (e.y >= 0 && (e.y & kGcStampBit)) ws.winners[w].y = e.y & ~kGcStampBit;
     if (w == conv || e.x == w) break;
@@ -131,13 +131,13 @@ __global__ void GcFinalizeKernel(Workspace ws, Sizes sz) {
   }
   // Emit the golden prefix, newest -> oldest (host reverses). Entries below conv are on
   // the stamped anchor chain; mask the stamp on emit (the memory itself is garbage).
-  int32_t* fin = ws.fin_arcs + static_cast<int64_t>(lane) * sz.path_cap;
+  int32_t* fin = ws.fin_arcs + static_cast<int64_t>(lane) * sz.fin_cap;
   int32_t len = 0;
   w = start;
   while (w >= floor) {
     const int2 e = ws.winners[w];
     if (e.y >= 0) {
-      if (len >= sz.path_cap) {  // defensive; matches Backtrack's own truncation cap
+      if (len >= sz.fin_cap) {  // defensive; matches Backtrack's own truncation cap
         atomicOr(&lc.overflow, kOverflowArena);
         break;
       }
@@ -147,6 +147,110 @@ __global__ void GcFinalizeKernel(Workspace ws, Sizes sz) {
     w = e.x;
   }
   ws.fin_len[lane] = len;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming (per-lane ring) GC — one round per AdvanceChunk. The ring never unmaps
+// while a channel is open, so this is not about physical memory: it advances gc_root
+// (the writer's wrap guard) and drains finalized golden-prefix arcs to the host BEFORE
+// the ring laps them, making stream_log_cap a live-window size instead of a hard cap
+// on stream length (it also lifts the path_cap truncation of long-stream backtracks:
+// device tails stay within the window; the host owns everything older).
+
+__global__ void StreamGcStampKernel(Workspace ws, Sizes sz) {
+  const int32_t lane = blockIdx.x * blockDim.x + threadIdx.x;
+  if (lane >= sz.lanes) return;
+  ws.fin_len[lane] = 0;
+  const LaneCounters& lc = ws.lanes[lane];
+  // Only live, clean lanes: finished lanes already delivered their result through
+  // FinalizeStream (their window stops growing), overflow-degraded lanes may carry
+  // stale pointers (walk them read-only at most — ring memory is always mapped, but a
+  // bogus root advance would degrade them further).
+  if (lc.status != 0 || lc.frontier_size <= 0 || (lc.overflow & kOverflowArena) != 0) {
+    ws.gc_conv[lane] = -1;
+    return;
+  }
+  const int32_t anchor = ws.tok_winner[0][static_cast<int64_t>(lane) * sz.main_q];
+  ws.gc_conv[lane] = anchor;
+  // Stamp depth only needs to cover walker merge points (recombination is shallow —
+  // a few frames), not the whole window; deeper walkers abort the round harmlessly.
+  int32_t w = anchor;
+  for (int32_t hops = 0; w >= 0 && hops < sz.fin_cap; ++hops) {
+    int2& e = WinnersEntry(ws, sz, lane, w);
+    if (e.y >= 0) e.y = e.y | kGcStampBit;
+    if (e.x == w) break;
+    w = e.x;
+  }
+}
+
+__global__ void StreamGcConvergeKernel(Workspace ws, Sizes sz) {
+  const int32_t lane = blockIdx.x;
+  const LaneCounters& lc = ws.lanes[lane];
+  if (ws.gc_conv[lane] < 0 || lc.status != 0 || lc.frontier_size <= 1) return;
+  const int32_t* winner = ws.tok_winner[0] + static_cast<int64_t>(lane) * sz.main_q;
+  for (int32_t i = 1 + threadIdx.x; i < lc.frontier_size; i += blockDim.x) {
+    int32_t w = winner[i];
+    int32_t hit = -1;
+    for (int32_t hops = 0; w >= 0 && hops < sz.fin_cap; ++hops) {
+      const int2 e = WinnersEntry(ws, sz, lane, w);
+      hit = w;
+      if (e.y >= 0 && (e.y & kGcStampBit)) break;
+      if (e.x == w) break;
+      w = e.x;
+      if (hops == sz.fin_cap - 1) hit = -1;  // merge deeper than the stamp range
+    }
+    atomicMin(&ws.gc_conv[lane], hit);
+  }
+}
+
+// Clear stamps, then walk the segment below the convergence point ONCE, emitting arcs
+// into fin_arcs as a phase ring keyed by the emit counter: the ring retains the OLDEST
+// min(total, fin_cap) arcs, a cut pointer lagging fin_cap emits behind the walk lands
+// on the entry just above them, and fin_len reports the TOTAL so the host unscrambles
+// the phase ((total-1) % fin_cap backwards) and detects how much was drained. Bounded
+// drain per round; a backlog (convergence stall) catches up at fin_cap arcs per round.
+__global__ void StreamGcFinalizeKernel(Workspace ws, Sizes sz) {
+  const int32_t lane = blockIdx.x * blockDim.x + threadIdx.x;
+  if (lane >= sz.lanes) return;
+  LaneCounters& lc = ws.lanes[lane];
+  const int32_t conv = ws.gc_conv[lane];
+  if (conv < 0) return;
+  const int32_t anchor = ws.tok_winner[0][static_cast<int64_t>(lane) * sz.main_q];
+  // Clear the stamps on [anchor, conv] (same bounded traversal as the stamp pass).
+  int32_t w = anchor;
+  for (int32_t hops = 0; w >= 0 && hops < sz.fin_cap; ++hops) {
+    int2& e = WinnersEntry(ws, sz, lane, w);
+    if (e.y >= 0 && (e.y & kGcStampBit)) e.y = e.y & ~kGcStampBit;
+    if (w == conv || e.x == w) break;
+    w = e.x;
+  }
+  if (w != conv) return;  // conv off the stamped range (defensive): skip the round
+  int32_t* fin = ws.fin_arcs + static_cast<int64_t>(lane) * sz.fin_cap;
+  int32_t emits = 0;
+  int32_t cut = conv;      // lags fin_cap emits behind the walk
+  int32_t lag = 0;
+  w = WinnersEntry(ws, sz, lane, conv).x;
+  while (w >= 0) {
+    const int2 e = WinnersEntry(ws, sz, lane, w);
+    if (e.y >= 0) {
+      fin[emits % sz.fin_cap] = e.y & ~kGcStampBit;
+      ++emits;
+      if (lag >= sz.fin_cap) {
+        // advance the cut one chain hop (skipping nothing: every hop below conv in a
+        // streaming ring carries an arc except the terminal start token)
+        cut = WinnersEntry(ws, sz, lane, cut).x;
+      } else {
+        ++lag;
+      }
+    }
+    if (e.x == w) break;
+    w = e.x;
+  }
+  ws.fin_len[lane] = emits;
+  if (emits == 0) return;
+  // Sentinel the cut and advance the writer's wrap guard: [gc_root, log_len) is live.
+  WinnersEntry(ws, sz, lane, cut).x = INT32_MIN;
+  lc.gc_root = cut;
 }
 
 }  // namespace kernels

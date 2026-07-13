@@ -73,7 +73,8 @@ struct LaneCounters {
                          // online beam semantics; FinalizeStream sets T = t)
   int32_t chunk_start;   // first frame of the current chunk (log-prob row 0)
   int32_t chunk_end;     // decode while t < chunk_end (offline: T + 1)
-  int32_t log_len;       // streaming: winners used in this lane's region
+  int32_t log_len;       // streaming: LOGICAL winners appended in this lane (monotonic;
+                         // the ring maps logical -> physical, see WinnersEntry)
   int32_t cand_consumed; // eps mode: candidates already resolved this frame
   int32_t cand_emit;     // candidates [0, cand_emit) are emitting/final; rest are eps
   int32_t phase;
@@ -90,6 +91,9 @@ struct LaneCounters {
   float lat_best;        // interval prune: reference score for the loose keep rule
   // redirect two-pass helpers
   int32_t redirect_claimed;
+  int32_t gc_root;       // streaming GC: logical id of the lane's finalized sentinel;
+                         // [gc_root, log_len) is the live ring window (tail position:
+                         // keeps the hot fields above at their pre-GC offsets)
 };
 
 struct DeviceGraph {
@@ -214,9 +218,24 @@ struct Sizes {
   int32_t arena_cap;  // shared winners-arena entries (global)
   int32_t path_cap;   // max best-path arcs per lane (max_frames + 2)
   int32_t lat_cap;    // shared lattice-candidate arena entries (0 = 1-best mode)
-  int32_t stream_log_cap;  // streaming: per-lane winners region (0 = batch mode)
+  int32_t stream_log_cap;  // streaming: per-lane winners RING entries (0 = batch mode)
+  int32_t fin_cap;    // GC: per-lane finalized-arc staging entries (0 = GC off)
   int32_t snap_frames;  // 0 = disabled
 };
+
+// Winners access: batch mode uses global indices verbatim; streaming stores LOGICAL
+// per-lane monotonic ids in every pointer field (tok_winner, final_tok, entry.x) and
+// maps them onto the lane's fixed ring here. Ids stay monotonic so chain order,
+// sentinels (-1 start, INT32_MIN finalized root) and log_len semantics survive wraps;
+// the writer never laps the live window (K3/EpsResolve guard against gc_root).
+__device__ inline int2& WinnersEntry(const Workspace& ws, const Sizes& sz, int32_t lane,
+                                     int32_t idx) {
+  const int64_t phys =
+      sz.stream_log_cap > 0
+          ? static_cast<int64_t>(lane) * sz.stream_log_cap + (idx % sz.stream_log_cap)
+          : static_cast<int64_t>(idx);
+  return ws.winners[phys];
+}
 
 constexpr int32_t kRedirectArcBit = 1 << 30;  // lattice arc labeled -1 (allow_partial)
 constexpr int32_t kEpsArcBit = 1 << 29;       // lattice arc from an epsilon hop (label 0;

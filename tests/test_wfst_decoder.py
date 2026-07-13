@@ -197,6 +197,53 @@ def test_toy_winners_gc_matches_plain(toy_fst):
     assert s2[0] == s1[0]
 
 
+def test_toy_streaming_gc_recovers_full_path(toy_fst):
+    """Per-chunk streaming GC (ring + host-drained prefix) returns the FULL word
+    sequence for streams longer than path_cap; the legacy (gc=0) decoder truncates the
+    device backtrack to the newest chunk+2 arcs and loses the early words."""
+    import torch
+
+    from oasr.decoder.wfst_decoder import _get_graph
+    from oasr.jit.wfst_decoder import gen_wfst_decoder_module
+
+    mod = _module()
+    graph = _get_graph(toy_fst)
+    labels = [1] + [0] * 40 + [2] + [0] * 18  # T=60 >> chunk+2
+    logp = _toy_logp(labels, "cuda")
+    chunk = 8
+
+    def run(gc):
+        dec = int(mod.wfst_create_decoder(
+            graph, 20.0, 8.0, 1, 100, 1, 1, chunk, 0, 16, 4, 1, 0, 0, 1, 0, 3, 0, 0, gc))
+        ch = int(mod.wfst_create_stream(dec))
+        assert ch >= 0
+        for s in range(0, logp.size(0), chunk):
+            piece = logp[s : s + chunk].unsqueeze(0).contiguous()
+            outs = [torch.empty((1, 8), dtype=torch.int32),
+                    torch.empty((1,), dtype=torch.int32),
+                    torch.empty((1,), dtype=torch.int32),
+                    torch.empty((1,), dtype=torch.int32)]
+            mod.wfst_advance_chunk(dec, torch.tensor([ch], dtype=torch.int32), piece,
+                                   torch.tensor([piece.size(1)], dtype=torch.int32), 0,
+                                   *outs)
+        ow = torch.empty((64,), dtype=torch.int32)
+        wl = torch.empty((1,), dtype=torch.int32)
+        sc = torch.empty((1,), dtype=torch.float64)
+        meta = torch.empty((3,), dtype=torch.int32)
+        mod.wfst_finalize_stream(dec, ch, ow, wl, sc, meta)
+        words = ow[: min(int(wl[0]), 64)].tolist()
+        mod.wfst_free_decoder(dec)
+        return words, float(sc[0]), int(meta[0])
+
+    w_gc, s_gc, ok_gc = run(gc=2)
+    w_legacy, s_legacy, ok_legacy = run(gc=0)
+    assert ok_gc and ok_legacy
+    assert s_gc == pytest.approx(s_legacy, abs=1e-6)  # decode dynamics untouched
+    assert w_gc == _TOY_WORDS  # full path recovered (word 10 sits on the first arc)
+    assert w_legacy == w_gc[len(w_gc) - len(w_legacy):]  # legacy = truncated suffix
+    assert len(w_legacy) < len(w_gc)
+
+
 # ---------------------------------------------------------------------------
 # Real-graph smoke tests via the public Decoder API (need OASR_TEST_FST)
 # ---------------------------------------------------------------------------

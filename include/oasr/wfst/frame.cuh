@@ -568,15 +568,22 @@ __global__ void FinalizeKernel(Workspace ws, Sizes sz, DeviceGraph g, DecoderCon
     if (threadIdx.x == blockDim.x - 1) sh_round = incl;
     __syncthreads();
     // Allocate this round's winners block: shared arena (batch mode) or the lane's own
-    // region (streaming mode — per-lane monotonic ids survive across chunks).
+    // ring (streaming — LOGICAL monotonic ids survive across chunks and ring wraps; the
+    // live window [gc_root, log_len) must never exceed the ring, so an overrunning
+    // round is dropped-and-flagged rather than lapping live entries).
     if (threadIdx.x == 0) {
       const int32_t round_kept = sh_round;
       if (sz.stream_log_cap > 0) {
-        sh_base = lane * sz.stream_log_cap + lc.log_len;
-        if (round_kept > 0 && lc.log_len + round_kept > sz.stream_log_cap) {
+        sh_base = lc.log_len;
+        // Window-form arithmetic: the live window stays tiny even when the logical ids
+        // approach the int32 wall (~2^31 appends per channel). The clamp also pulls an
+        // EpsResolve counter overshoot back to the window edge, as the absolute-min
+        // form did.
+        const int32_t window = lc.log_len - lc.gc_root;
+        if (round_kept > 0 && window + round_kept > sz.stream_log_cap) {
           atomicOr(&lc.overflow, kOverflowArena);
         }
-        lc.log_len = min(lc.log_len + round_kept, sz.stream_log_cap);
+        lc.log_len = lc.gc_root + min(window + round_kept, sz.stream_log_cap);
       } else {
         sh_base = (round_kept > 0) ? atomicAdd(ws.arena_cursor, round_kept) : 0;
       }
@@ -591,9 +598,9 @@ __global__ void FinalizeKernel(Workspace ws, Sizes sz, DeviceGraph g, DecoderCon
       const int32_t out = sh_kept + incl - 1;
       const int32_t widx = sh_base + incl - 1;
       const int32_t widx_cap =
-          (sz.stream_log_cap > 0) ? (lane + 1) * sz.stream_log_cap : arena_lim;
+          (sz.stream_log_cap > 0) ? lc.gc_root + sz.stream_log_cap : arena_lim;
       if (widx < widx_cap && out < sz.main_q) {
-        ws.winners[widx] = make_int2(cur_winner[prev_local], arc);
+        WinnersEntry(ws, sz, lane, widx) = make_int2(cur_winner[prev_local], arc);
         nxt_state[out] = state;
         nxt_score[out] = score;
         nxt_winner[out] = widx;
@@ -601,8 +608,7 @@ __global__ void FinalizeKernel(Workspace ws, Sizes sz, DeviceGraph g, DecoderCon
         if (keep_hash) ws.hash_pos[lane64 * sz.hash_cap + hslot] = out;
         widx_or_dead = widx;
       } else {
-        const int32_t arena_edge = (sz.stream_log_cap > 0) ? sz.arena_cap : arena_lim;
-        atomicOr(&lc.overflow, widx >= arena_edge ? kOverflowArena : kOverflowKept);
+        atomicOr(&lc.overflow, widx >= widx_cap ? kOverflowArena : kOverflowKept);
       }
     }
     if (r < raw && hslot >= 0) {

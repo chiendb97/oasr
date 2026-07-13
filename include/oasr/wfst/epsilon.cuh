@@ -49,12 +49,12 @@ __global__ void EpsResolveKernel(Workspace ws, Sizes sz, DeviceGraph g) {
 
     int32_t widx;
     if (sz.stream_log_cap > 0) {
-      const int32_t off = atomicAdd(&lc.log_len, 1);
-      if (off >= sz.stream_log_cap) {
+      const int32_t off = atomicAdd(&lc.log_len, 1);  // logical id (K3 re-clamps)
+      if (off - lc.gc_root >= sz.stream_log_cap) {
         atomicOr(&lc.overflow, kOverflowArena);
         continue;
       }
-      widx = lane * sz.stream_log_cap + off;
+      widx = off;
     } else {
       widx = atomicAdd(ws.arena_cursor, 1);
       if (widx >= *ws.arena_limit) {
@@ -62,7 +62,7 @@ __global__ void EpsResolveKernel(Workspace ws, Sizes sz, DeviceGraph g) {
         continue;
       }
     }
-    ws.winners[widx] = make_int2(tok_winner[c.x], c.y);
+    WinnersEntry(ws, sz, lane, widx) = make_int2(tok_winner[c.x], c.y);
     if (sz.lat_cap > 0) ws.tok_fwd[widx] = score;
 
     const int32_t pos = hpos[slot];

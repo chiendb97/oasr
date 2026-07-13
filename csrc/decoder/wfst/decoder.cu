@@ -92,6 +92,9 @@ struct GpuDecoder::Impl {
   size_t gc_lo_bytes = 0;
   std::vector<std::vector<int32_t>> gc_prefix;
   std::vector<int32_t> gc_conv_h, gc_flen_h, gc_fin_h;  // host readback scratch
+  // Streaming GC: per-channel finalized prefix (arcs + the words they map to),
+  // drained once per AdvanceChunk round; prepended to every partial/final backtrack.
+  std::vector<std::vector<int32_t>> stream_arcs, stream_words;
 
   template <typename T>
   T* Alloc(int64_t count) {
@@ -205,7 +208,7 @@ struct GpuDecoder::Impl {
     WFST_CUDA_CHECK(cudaMemcpyAsync(gc_flen_h.data(), ws.fin_len, sz.lanes * 4,
                                     cudaMemcpyDeviceToHost, stream));
     WFST_CUDA_CHECK(cudaMemcpyAsync(gc_fin_h.data(), ws.fin_arcs,
-                                    static_cast<int64_t>(sz.lanes) * sz.path_cap * 4,
+                                    static_cast<int64_t>(sz.lanes) * sz.fin_cap * 4,
                                     cudaMemcpyDeviceToHost, stream));
     WFST_CUDA_CHECK(cudaMemcpyAsync(&cursor, ws.arena_cursor, 4, cudaMemcpyDeviceToHost,
                                     stream));
@@ -216,9 +219,9 @@ struct GpuDecoder::Impl {
     for (int32_t lane = 0; lane < sz.lanes; ++lane) {
       if (gc_conv_h[lane] < 0) abort_release = true;  // defensive converge abort
       else watermark = std::min<int64_t>(watermark, gc_conv_h[lane]);
-      const int32_t n = std::min(gc_flen_h[lane], sz.path_cap);
+      const int32_t n = std::min(gc_flen_h[lane], sz.fin_cap);
       if (n > 0) {
-        const int32_t* fin = gc_fin_h.data() + static_cast<int64_t>(lane) * sz.path_cap;
+        const int32_t* fin = gc_fin_h.data() + static_cast<int64_t>(lane) * sz.fin_cap;
         auto& pre = gc_prefix[lane];
         pre.insert(pre.end(), std::reverse_iterator<const int32_t*>(fin + n),
                    std::reverse_iterator<const int32_t*>(fin));
@@ -242,6 +245,38 @@ struct GpuDecoder::Impl {
     const int64_t target_hi =
         std::min<int64_t>(sz.arena_cap, static_cast<int64_t>(cursor) + gc_headroom);
     if (target_hi > arena_limit_host) GcCommitWindow(target_hi);
+  }
+
+  // ---- Streaming GC (per-lane rings; one round per AdvanceChunk) --------------------
+
+  // Kernel half: advance each live channel's ring root and stage its finalized arcs.
+  // The caller folds the fin_len/fin_arcs readback into its own async batch + sync.
+  void LaunchStreamGc() {
+    StreamGcStampKernel<<<(sz.lanes + 63) / 64, 64, 0, stream>>>(ws, sz);
+    StreamGcConvergeKernel<<<static_cast<unsigned>(sz.lanes), 256, 0, stream>>>(ws, sz);
+    StreamGcFinalizeKernel<<<(sz.lanes + 63) / 64, 64, 0, stream>>>(ws, sz);
+  }
+
+  // Host half (after the sync): unscramble each channel's phase ring — fin_len reports
+  // TOTAL emits, the buffer retains the OLDEST min(total, fin_cap) — and append arcs +
+  // their words to the channel's prefix (oldest -> newest).
+  void DrainStreamGc() {
+    const GraphImage& g = *host_graph;
+    for (int32_t lane = 0; lane < sz.lanes; ++lane) {
+      if (!channel_used[lane]) continue;
+      const int32_t total = gc_flen_h[lane];
+      if (total <= 0) continue;
+      const int32_t take = std::min(total, sz.fin_cap);
+      const int32_t* fin = gc_fin_h.data() + static_cast<int64_t>(lane) * sz.fin_cap;
+      auto& arcs = stream_arcs[lane];
+      auto& words = stream_words[lane];
+      for (int32_t k = total - 1; k >= total - take; --k) {
+        const int32_t a = fin[k % sz.fin_cap];
+        arcs.push_back(a);
+        for (int32_t j = g.aux_row_splits[a]; j < g.aux_row_splits[a + 1]; ++j)
+          if (g.aux_pool[j] > 0) words.push_back(g.aux_pool[j]);
+      }
+    }
   }
 
   // n_steps frame-steps (no init). Shared by offline decode, chunk advance, and graph
@@ -441,14 +476,17 @@ struct GpuDecoder::Impl {
     if (cfg.gc_interval < 0 || (cfg.gc_interval & 1))
       throw std::runtime_error("gc_interval must be even (buffer-parity invariant)");
     if (cfg.gc_interval > 0) {
-      if (cfg.streaming)
-        throw std::runtime_error("winners-log GC is offline-only (v1)");
       if (cfg.lattice && cfg.lat_prune_interval == 0)
         throw std::runtime_error(
             "winners-log GC in lattice mode requires lat_prune_interval > 0 (pure "
             "lattice keeps every token reachable; nothing is collectible)");
       if (g.num_arcs >= (1LL << 30))
         throw std::runtime_error("winners-log GC requires graph arc ids < 2^30");
+      // Streaming: fin_cap bounds the per-round host drain AND the device backtrack
+      // tail (path_cap) — the tail spans the live window (conv lag + chunk), not one
+      // chunk. Offline keeps path_cap; its GC segments always fit it.
+      sz.fin_cap = cfg.streaming ? std::max(cfg.max_frames + 2, 4096) : sz.path_cap;
+      if (cfg.streaming) sz.path_cap = sz.fin_cap;
     }
     // Interval mode holds only ~one window of candidates — a much smaller arena works.
     sz.lat_cap = !cfg.lattice ? 0
@@ -570,12 +608,16 @@ struct GpuDecoder::Impl {
     WFST_CUDA_CHECK(cudaMemset(ws.gc_floor, 0, sizeof(int32_t)));
     if (cfg.gc_interval > 0) {
       ws.gc_conv = Alloc<int32_t>(L);
-      ws.fin_arcs = Alloc<int32_t>(L * sz.path_cap);
+      ws.fin_arcs = Alloc<int32_t>(L * sz.fin_cap);
       ws.fin_len = Alloc<int32_t>(L);
       gc_prefix.resize(sz.lanes);
       gc_conv_h.resize(sz.lanes);
       gc_flen_h.resize(sz.lanes);
-      gc_fin_h.resize(static_cast<int64_t>(sz.lanes) * sz.path_cap);
+      gc_fin_h.resize(static_cast<int64_t>(sz.lanes) * sz.fin_cap);
+      if (cfg.streaming) {
+        stream_arcs.resize(sz.lanes);
+        stream_words.resize(sz.lanes);
+      }
     }
     ws.lat_limit = ws.arena_limit;  // aliased when lattice mode is off (never read)
     if (sz.lat_cap > 0) {
@@ -674,6 +716,10 @@ int32_t GpuDecoder::CreateStream() {
   for (int32_t lane = 0; lane < im.sz.lanes; ++lane) {
     if (im.channel_used[lane]) continue;
     im.channel_used[lane] = true;
+    if (im.opts.cfg.gc_interval > 0) {
+      im.stream_arcs[lane].clear();
+      im.stream_words[lane].clear();
+    }
     // Map this channel's winners slice (unmapped while the channel was closed).
     im.winners_mem.EnsureRange(static_cast<size_t>(lane) * im.StreamSliceBytes(),
                                im.StreamSliceBytes());
@@ -703,6 +749,10 @@ void GpuDecoder::ReleaseStream(int32_t channel) {
   im.winners_mem.ReleaseRange(static_cast<size_t>(channel) * im.StreamSliceBytes(),
                               im.StreamSliceBytes());
   im.channel_used[channel] = false;
+  if (im.opts.cfg.gc_interval > 0) {
+    im.stream_arcs[channel].clear();
+    im.stream_words[channel].clear();
+  }
 }
 
 std::vector<GpuDecoder::StreamPartial> GpuDecoder::AdvanceChunk(
@@ -742,6 +792,7 @@ std::vector<GpuDecoder::StreamPartial> GpuDecoder::AdvanceChunk(
   WFST_CUDA_CHECK(cudaMemcpyAsync(im.d_T, h_len.data(), sz.lanes * sizeof(int32_t),
                                   cudaMemcpyHostToDevice, im.stream));
 
+  const bool gc_on = cfg.gc_interval > 0;
   if (max_len > 0) {
     if (im.opts.use_cuda_graphs && !im.opts.debug_snapshots) {
       WFST_CUDA_CHECK(cudaGraphLaunch(im.ChunkExecForSteps(max_len), im.stream));
@@ -754,6 +805,7 @@ std::vector<GpuDecoder::StreamPartial> GpuDecoder::AdvanceChunk(
       HashSanitizeKernel<<<dim3(64, static_cast<unsigned>(sz.lanes)), 256, 0, im.stream>>>(
           im.ws, sz);
     }
+    if (gc_on) im.LaunchStreamGc();  // outside the captured chunk graph
   }
 
   std::vector<StreamPartial> out(channels.size());
@@ -775,19 +827,32 @@ std::vector<GpuDecoder::StreamPartial> GpuDecoder::AdvanceChunk(
                                     arc_len.size() * sizeof(int32_t),
                                     cudaMemcpyDeviceToHost, im.stream));
   }
+  if (gc_on && max_len > 0) {
+    WFST_CUDA_CHECK(cudaMemcpyAsync(im.gc_flen_h.data(), im.ws.fin_len, sz.lanes * 4,
+                                    cudaMemcpyDeviceToHost, im.stream));
+    WFST_CUDA_CHECK(cudaMemcpyAsync(im.gc_fin_h.data(), im.ws.fin_arcs,
+                                    static_cast<int64_t>(sz.lanes) * sz.fin_cap * 4,
+                                    cudaMemcpyDeviceToHost, im.stream));
+  }
   WFST_CUDA_CHECK(cudaStreamSynchronize(im.stream));
+  if (gc_on && max_len > 0) im.DrainStreamGc();
 
   const GraphImage& g = *im.host_graph;
   for (size_t i = 0; i < channels.size(); ++i) {
     const int32_t lane = channels[i];
     out[i].channel = lane;
     out[i].overflow = lanes[lane].overflow;
-    if (want_partial && arc_len[lane] > 0) {
-      const int32_t* path = arc_out.data() + static_cast<int64_t>(lane) * sz.path_cap;
-      for (int32_t k = arc_len[lane] - 1; k >= 0; --k) {
-        const int32_t a = path[k];
-        for (int32_t j = g.aux_row_splits[a]; j < g.aux_row_splits[a + 1]; ++j) {
-          if (g.aux_pool[j] > 0) out[i].words.push_back(g.aux_pool[j]);
+    if (want_partial) {
+      // Full hypothesis = the GC-drained prefix words + the device tail (the tail walk
+      // stops at the ring's finalized sentinel).
+      if (gc_on) out[i].words = im.stream_words[lane];
+      if (arc_len[lane] > 0) {
+        const int32_t* path = arc_out.data() + static_cast<int64_t>(lane) * sz.path_cap;
+        for (int32_t k = arc_len[lane] - 1; k >= 0; --k) {
+          const int32_t a = path[k];
+          for (int32_t j = g.aux_row_splits[a]; j < g.aux_row_splits[a + 1]; ++j) {
+            if (g.aux_pool[j] > 0) out[i].words.push_back(g.aux_pool[j]);
+          }
         }
       }
     }
@@ -831,8 +896,9 @@ DecodeResult GpuDecoder::FinalizeStream(int32_t channel) {
   r.reached_final = lc.reached_final != 0;
   r.score = lc.final_score;
   if (r.ok) {
-    r.arc_path.assign(path.begin(), path.begin() + plen);
-    std::reverse(r.arc_path.begin(), r.arc_path.end());
+    // Full path = the GC-drained golden prefix (empty without GC) + the device tail.
+    if (im.opts.cfg.gc_interval > 0) r.arc_path = im.stream_arcs[channel];
+    for (int32_t k = plen - 1; k >= 0; --k) r.arc_path.push_back(path[k]);
     const GraphImage& g = *im.host_graph;
     for (int32_t a : r.arc_path) {
       for (int32_t j = g.aux_row_splits[a]; j < g.aux_row_splits[a + 1]; ++j) {
