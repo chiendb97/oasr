@@ -75,7 +75,7 @@ class IntreeEngine:
             self.graph, self.args.search_beam, self.args.output_beam,
             self.args.min_active, self.args.max_active, 1,  # allow_partial
             max_lanes, self.t_max, self.device.index,
-            main_q_factor, 3, 1, 0, 0, 0, 0, 3, 0, 0))
+            main_q_factor, 3, 1, 0, 0, 0, 0, 3, 0, 0, 0))
 
     def _decode_into(self, dec, batch, lens_t):
         g = int(batch.size(0))

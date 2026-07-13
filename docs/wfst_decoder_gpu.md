@@ -348,7 +348,60 @@ decode (primary HLG, fp32, T≈250):
 | bench: 32 lanes, mqf 32, max_frames 1024 | 7,260 MiB | **2,712 MiB** (fixed 2,405 + committed 280 of 4,722 reserved) |
 | production offline: 8 lanes, mqf 32 | ~2.6–3.1 GiB | **1,410 MiB** |
 
-### 6.3 Why lazy commitment and not block-table paging
+### 6.3 Winners-log GC for long-form audio (`gc_interval`)
+
+Even lazily committed, the winners log grows O(T·lanes): every step appends the
+surviving frontier and nothing is ever reclaimed. For long-form audio
+(`T ≳ 2000`) that is hundreds of MiB of physical memory holding almost
+entirely dead entries — only entries reachable from the current frontier are
+live, and beam chains converge to a single common ancestor within a short
+window, so per lane everything below that ancestor is a finalized "golden
+prefix" and, log-wide, garbage is a *prefix* of the append order.
+
+`DecoderConfig::gc_interval = N` (> 0, even; trailing arg of
+`wfst_create_decoder`, `WfstDecoderOptions.gc_interval`) enables a GC round
+every N offline steps. 1-best mode swaps the whole-batch graph for a segmented
+host loop of cached `StepsExec` graphs (same kernels, same order — results are
+bit-identical, verified against the external decoder at 576/576); interval-
+lattice mode piggybacks on its existing prune points. GC never runs inside a
+captured graph. Each round:
+
+1. **Convergence find** — per lane, stamp the anchor chain (frontier token 0,
+   or `final_tok` once finished) via bit 30 of the arc field (`kGcStampBit`;
+   arc ids < 2^30 enforced at construction), then walk every other frontier
+   token until it hits a stamp; the deepest hit is the lane's convergence
+   point (chains are strictly index-decreasing, so walks are short and exact).
+2. **Prefix finalization** — cut the chain at the convergence point
+   (`prev = INT32_MIN` sentinel; `-1` still means start token), emit the arcs
+   below it into a per-lane staging buffer the host drains and prepends to the
+   final backtrack. Fully decoded lanes (1-best) emit their entire remaining
+   chain and set `final_tok = kGcDoneTok`, so early finishers stop pinning the
+   watermark in mixed-length batches.
+3. **Window slide** — the committed winners window becomes
+   `[chunk_floor(min-over-lanes convergence), cursor + headroom)`:
+   `ReleaseRange` unmaps whole chunks behind the watermark, `EnsureRange`
+   tops up ahead of the global cursor. The headroom (init 64 MiB) doubles via
+   the normal grow-and-retry path if a segment outruns it. A device-resident
+   `gc_floor` bounds every winners walk — clean lanes stop at their sentinel
+   anyway; an arena-overflow-degraded lane (whose frontier can carry stale
+   pointers, and which GC therefore skips and stops releasing for) must fail
+   soft rather than touch unmapped memory.
+
+Lattice-mode caveat: only the winners log is windowed — surviving lattice
+records reference arbitrarily old token ids, so `tok_fwd`/`tok_bwd` stay
+prefix-committed (token renumbering during interval compaction would be
+required to window them; see §14). In pure lattice mode (no interval prune)
+GC is rejected: every token stays reachable by construction.
+
+Measured (tiled LJSpeech, T 1800–3000, 32 lanes, RTX 5090): words + scores
+identical GC on/off; winners committed drops from the 264 MiB high-water +
+growth curve to a sliding ~64–128 MiB window (whole-decoder committed 2346 →
+1930 MiB — the remainder is log-prob staging, see §14); decode +4.2% at N=64,
++2.3% at N=128, +1.6% at N=256. Recommended: `gc_interval=128` for T > 2000;
+leave 0 for short utterances (the segmented loop and window bookkeeping only
+pay off when the log outgrows its window).
+
+### 6.4 Why lazy commitment and not block-table paging
 
 The batch-mode winners log is append-only through a single global cursor —
 it is already perfectly packed, so a PagedAttention-style block table would

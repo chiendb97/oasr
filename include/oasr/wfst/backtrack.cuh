@@ -35,9 +35,10 @@ __global__ void PartialBacktrackKernel(Workspace ws, Sizes sz, const int32_t* d_
     __syncthreads();
   }
   if (threadIdx.x == 0) {
+    const int32_t floor = *ws.gc_floor;
     int32_t w = winner[static_cast<int32_t>(sh_best[0] & 0xFFFFFFFFull)];
     int32_t len = 0;
-    while (w >= 0 && len < sz.path_cap) {
+    while (w >= floor && len < sz.path_cap) {
       const int2 e = ws.winners[w];
       if (e.y >= 0) out[len++] = e.y;
       if (e.x == w) break;
@@ -72,8 +73,9 @@ __global__ void BacktrackKernel(Workspace ws, Sizes sz) {
   int32_t* out = ws.arc_out + static_cast<int64_t>(lane) * sz.path_cap;
   int32_t len = 0;
   if (lc.status == 1) {
+    const int32_t floor = *ws.gc_floor;
     int32_t w = lc.final_tok;
-    while (w >= 0 && len < sz.path_cap) {
+    while (w >= floor && len < sz.path_cap) {
       const int2 e = ws.winners[w];
       if (e.y >= 0) out[len++] = e.y;
       if (e.x == w) break;  // safety

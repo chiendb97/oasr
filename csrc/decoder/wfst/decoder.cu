@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <stdexcept>
 #include <vector>
 
@@ -24,6 +25,7 @@
 #include "oasr/wfst/common.cuh"
 #include "oasr/wfst/epsilon.cuh"
 #include "oasr/wfst/frame.cuh"
+#include "oasr/wfst/gc.cuh"
 #include "oasr/wfst/init.cuh"
 #include "oasr/wfst/lattice.cuh"
 
@@ -80,6 +82,16 @@ struct GpuDecoder::Impl {
   int32_t lat_out_limit_host = 0;
   int64_t fixed_bytes = 0;           // eager cudaMalloc workspace + graph image
   int32_t arena_high_water = 0;      // max end-of-batch arena cursor observed
+
+  // Winners-log GC (cfg.gc_interval > 0): the committed winners window is
+  // [gc_lo_bytes, arena_limit_host * 8) — released behind the finalized watermark,
+  // topped up `gc_headroom` entries ahead of the cursor after each segment. The host
+  // accumulates each lane's finalized golden-prefix arcs (oldest -> newest) here and
+  // prepends them to the device backtrack at the end of the batch.
+  int64_t gc_headroom = kInitArenaEntries;
+  size_t gc_lo_bytes = 0;
+  std::vector<std::vector<int32_t>> gc_prefix;
+  std::vector<int32_t> gc_conv_h, gc_flen_h, gc_fin_h;  // host readback scratch
 
   template <typename T>
   T* Alloc(int64_t count) {
@@ -141,6 +153,95 @@ struct GpuDecoder::Impl {
     if (sz.lat_cap == 0 || lat_out_limit_host >= lat_out_cap) return false;
     SetLatOutCommit(std::max<int64_t>(needed, static_cast<int64_t>(lat_out_limit_host) * 2));
     return true;
+  }
+
+  // ---- Winners-log GC (cfg.gc_interval > 0, offline) -------------------------------
+
+  // Commits the winners window [gc_lo_bytes, hi_entries * 8) and publishes hi_entries
+  // as the device append limit. Lattice mode also extends the PREFIX commitment of the
+  // per-token score arrays: surviving lattice records reference arbitrarily old token
+  // ids, so tok_fwd/tok_bwd cannot be released below the watermark (token renumbering
+  // would be required); only the winners log itself is windowed.
+  void GcCommitWindow(int64_t hi_entries) {
+    if (winners_mem.lazy()) {
+      winners_mem.EnsureRange(gc_lo_bytes,
+                              static_cast<size_t>(hi_entries) * sizeof(int2) - gc_lo_bytes);
+      if (sz.lat_cap > 0) {
+        tok_fwd_mem.EnsurePrefix(static_cast<size_t>(hi_entries) * 4);
+        tok_bwd_mem.EnsurePrefix(static_cast<size_t>(hi_entries) * 4);
+      }
+      arena_limit_host = static_cast<int32_t>(hi_entries);
+      WFST_CUDA_CHECK(
+          cudaMemcpy(ws.arena_limit, &arena_limit_host, 4, cudaMemcpyHostToDevice));
+    }
+    // Eager fallback: everything is committed and arena_limit == arena_cap already.
+  }
+
+  // Start-of-attempt window reset: InitKernel rewrites the start tokens at the arena
+  // base, so the window snaps back to a [0, headroom) prefix; anything mapped above it
+  // from the previous batch's window is released (exact-window invariant).
+  void GcAttemptBegin() {
+    for (auto& p : gc_prefix) p.clear();
+    gc_lo_bytes = 0;
+    WFST_CUDA_CHECK(cudaMemsetAsync(ws.gc_floor, 0, sizeof(int32_t), stream));
+    if (!winners_mem.lazy()) return;
+    const int64_t win = std::min<int64_t>(sz.arena_cap, gc_headroom);
+    winners_mem.ReleaseRange(static_cast<size_t>(win) * sizeof(int2),
+                             winners_mem.reserved() - static_cast<size_t>(win) * sizeof(int2));
+    GcCommitWindow(win);
+  }
+
+  // One GC round, called between segment graphs with the frontier buffers in their
+  // canonical (even-parity) order: convergence find + prefix finalization on device,
+  // then host-side prefix drain, chunk release below the watermark, and window top-up
+  // ahead of the cursor.
+  void RunWinnersGc() {
+    GcStampKernel<<<(sz.lanes + 63) / 64, 64, 0, stream>>>(ws, sz);
+    GcConvergeKernel<<<static_cast<unsigned>(sz.lanes), 256, 0, stream>>>(ws, sz);
+    GcFinalizeKernel<<<(sz.lanes + 63) / 64, 64, 0, stream>>>(ws, sz);
+    int32_t cursor = 0;
+    WFST_CUDA_CHECK(cudaMemcpyAsync(gc_conv_h.data(), ws.gc_conv, sz.lanes * 4,
+                                    cudaMemcpyDeviceToHost, stream));
+    WFST_CUDA_CHECK(cudaMemcpyAsync(gc_flen_h.data(), ws.fin_len, sz.lanes * 4,
+                                    cudaMemcpyDeviceToHost, stream));
+    WFST_CUDA_CHECK(cudaMemcpyAsync(gc_fin_h.data(), ws.fin_arcs,
+                                    static_cast<int64_t>(sz.lanes) * sz.path_cap * 4,
+                                    cudaMemcpyDeviceToHost, stream));
+    WFST_CUDA_CHECK(cudaMemcpyAsync(&cursor, ws.arena_cursor, 4, cudaMemcpyDeviceToHost,
+                                    stream));
+    WFST_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    bool abort_release = false;
+    int64_t watermark = INT32_MAX;
+    for (int32_t lane = 0; lane < sz.lanes; ++lane) {
+      if (gc_conv_h[lane] < 0) abort_release = true;  // defensive converge abort
+      else watermark = std::min<int64_t>(watermark, gc_conv_h[lane]);
+      const int32_t n = std::min(gc_flen_h[lane], sz.path_cap);
+      if (n > 0) {
+        const int32_t* fin = gc_fin_h.data() + static_cast<int64_t>(lane) * sz.path_cap;
+        auto& pre = gc_prefix[lane];
+        pre.insert(pre.end(), std::reverse_iterator<const int32_t*>(fin + n),
+                   std::reverse_iterator<const int32_t*>(fin));
+      }
+    }
+    if (!winners_mem.lazy()) return;
+    if (!abort_release) {
+      if (watermark == INT32_MAX) watermark = cursor;  // every lane dead: all garbage
+      const size_t chunk = winners_mem.chunk();
+      const size_t wm_bytes =
+          static_cast<size_t>(watermark) * sizeof(int2) / chunk * chunk;
+      if (wm_bytes > gc_lo_bytes) {
+        // Publish the fault-shield floor BEFORE unmapping (the stream is idle here;
+        // any later walk of a stale degraded-lane pointer stops at the floor).
+        const int32_t floor = static_cast<int32_t>(wm_bytes / sizeof(int2));
+        WFST_CUDA_CHECK(cudaMemcpy(ws.gc_floor, &floor, 4, cudaMemcpyHostToDevice));
+        winners_mem.ReleaseRange(gc_lo_bytes, wm_bytes - gc_lo_bytes);
+        gc_lo_bytes = wm_bytes;
+      }
+    }
+    const int64_t target_hi =
+        std::min<int64_t>(sz.arena_cap, static_cast<int64_t>(cursor) + gc_headroom);
+    if (target_hi > arena_limit_host) GcCommitWindow(target_hi);
   }
 
   // n_steps frame-steps (no init). Shared by offline decode, chunk advance, and graph
@@ -337,6 +438,18 @@ struct GpuDecoder::Impl {
     sz.path_cap = cfg.max_frames + 2;
     if (cfg.lat_prune_interval < 0 || (cfg.lat_prune_interval & 1))
       throw std::runtime_error("lat_prune_interval must be even (buffer-parity invariant)");
+    if (cfg.gc_interval < 0 || (cfg.gc_interval & 1))
+      throw std::runtime_error("gc_interval must be even (buffer-parity invariant)");
+    if (cfg.gc_interval > 0) {
+      if (cfg.streaming)
+        throw std::runtime_error("winners-log GC is offline-only (v1)");
+      if (cfg.lattice && cfg.lat_prune_interval == 0)
+        throw std::runtime_error(
+            "winners-log GC in lattice mode requires lat_prune_interval > 0 (pure "
+            "lattice keeps every token reachable; nothing is collectible)");
+      if (g.num_arcs >= (1LL << 30))
+        throw std::runtime_error("winners-log GC requires graph arc ids < 2^30");
+    }
     // Interval mode holds only ~one window of candidates — a much smaller arena works.
     sz.lat_cap = !cfg.lattice ? 0
                  : cfg.lat_prune_interval > 0
@@ -451,6 +564,19 @@ struct GpuDecoder::Impl {
     ws.lanes = Alloc<LaneCounters>(L);
     d_T = Alloc<int32_t>(L);
     d_batch = Alloc<int32_t>(1);
+    // Always present (backtrack kernels read it unconditionally); non-zero only while
+    // GC has a released prefix.
+    ws.gc_floor = Alloc<int32_t>(1);
+    WFST_CUDA_CHECK(cudaMemset(ws.gc_floor, 0, sizeof(int32_t)));
+    if (cfg.gc_interval > 0) {
+      ws.gc_conv = Alloc<int32_t>(L);
+      ws.fin_arcs = Alloc<int32_t>(L * sz.path_cap);
+      ws.fin_len = Alloc<int32_t>(L);
+      gc_prefix.resize(sz.lanes);
+      gc_conv_h.resize(sz.lanes);
+      gc_flen_h.resize(sz.lanes);
+      gc_fin_h.resize(static_cast<int64_t>(sz.lanes) * sz.path_cap);
+    }
     ws.lat_limit = ws.arena_limit;  // aliased when lattice mode is off (never read)
     if (sz.lat_cap > 0) {
       ws.cand_end = Alloc<float>(L * sz.cand_cap);
@@ -742,6 +868,7 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
 
   const bool use_graphs = im.opts.use_cuda_graphs && !im.opts.debug_snapshots;
   const bool interval_mode = cfg.lattice && cfg.lat_prune_interval > 0;
+  const bool gc_on = cfg.gc_interval > 0;
   std::vector<LaneCounters> lanes(batch);
   std::vector<int32_t> arc_out(batch * sz.path_cap);
   std::vector<int32_t> arc_len(batch);
@@ -756,6 +883,7 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
       // Segmented loop with periodic lattice-arena pruning (long-form audio).
       im.EnsureStaging(vocab_stride);
       im.StageLogProbs(d_log_probs, batch, max_frames, im.stream);
+      if (gc_on) im.GcAttemptBegin();  // InitKernel rewrites the arena base
       InitKernel<<<(sz.lanes + 255) / 256, 256, 0, im.stream>>>(im.ws, sz, im.dg, im.d_T,
                                                                 im.d_batch, cfg.search_beam);
       const int64_t lane_stride = static_cast<int64_t>(cfg.max_frames) * im.lp_stride;
@@ -787,7 +915,36 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
               im.ws.lat, im.ws.lat2, static_cast<int64_t>(im.lat_limit_host) * sizeof(int4),
               cudaMemcpyDeviceToDevice, im.stream));
           LatSwapBackKernel<<<1, 1, 0, im.stream>>>(im.ws);
+          if (gc_on) im.RunWinnersGc();
         }
+      }
+      BacktrackKernel<<<(sz.lanes + 63) / 64, 64, 0, im.stream>>>(im.ws, sz);
+      HashSanitizeKernel<<<dim3(64, static_cast<unsigned>(sz.lanes)), 256, 0, im.stream>>>(
+          im.ws, sz);
+    } else if (gc_on) {
+      // 1-best segmented loop: same kernels and order as the whole-batch graph, split
+      // into even-step segment graphs so the winners-log GC can run from the host in
+      // between (never inside a captured graph).
+      im.EnsureStaging(vocab_stride);
+      im.StageLogProbs(d_log_probs, batch, max_frames, im.stream);
+      im.GcAttemptBegin();
+      InitKernel<<<(sz.lanes + 255) / 256, 256, 0, im.stream>>>(im.ws, sz, im.dg, im.d_T,
+                                                                im.d_batch, cfg.search_beam);
+      if (im.dg.eps_count != nullptr)
+        im.LaunchStepTail(im.stream, im.ws, im.d_lp_staging,
+                          static_cast<int64_t>(cfg.max_frames) * im.lp_stride, im.lp_stride);
+      const int64_t lane_stride = static_cast<int64_t>(cfg.max_frames) * im.lp_stride;
+      const int32_t total_steps = T_max + 1;
+      int32_t done = 0;
+      while (done < total_steps) {
+        const int32_t n = std::min(cfg.gc_interval, ((total_steps - done) + 1) / 2 * 2);
+        if (use_graphs) {
+          WFST_CUDA_CHECK(cudaGraphLaunch(im.StepsExec(n), im.stream));
+        } else {
+          im.LaunchFrameSteps(im.stream, im.d_lp_staging, lane_stride, im.lp_stride, n);
+        }
+        done += n;
+        if (done < total_steps) im.RunWinnersGc();
       }
       BacktrackKernel<<<(sz.lanes + 63) / 64, 64, 0, im.stream>>>(im.ws, sz);
       HashSanitizeKernel<<<dim3(64, static_cast<unsigned>(sz.lanes)), 256, 0, im.stream>>>(
@@ -842,7 +999,16 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
     if ((!arena_ovf && !lat_truncated) || attempt >= Impl::kMaxGrowAttempts) break;
     bool grew = false;
     if (arena_ovf) {
-      grew |= im.GrowArena();
+      if (gc_on) {
+        // A segment outran the committed window: widen the headroom and re-run (the
+        // whole decode is idempotent; GcAttemptBegin resets the window and prefixes).
+        if (im.winners_mem.lazy() && im.gc_headroom < sz.arena_cap) {
+          im.gc_headroom = std::min<int64_t>(sz.arena_cap, im.gc_headroom * 2);
+          grew = true;
+        }
+      } else {
+        grew |= im.GrowArena();
+      }
       grew |= im.GrowLat();
     }
     if (lat_truncated) grew |= im.GrowLatOut(n_lat_records);
@@ -870,9 +1036,13 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
     r.reached_final = lc.reached_final != 0;
     r.score = lc.final_score;
     if (!r.ok) continue;
+    // Full path = the GC-finalized golden prefix (host-side, oldest -> newest; empty
+    // without GC) + the device backtrack tail (reversed newest -> oldest).
     const int32_t* path = arc_out.data() + b * sz.path_cap;
-    r.arc_path.assign(path, path + arc_len[b]);
-    std::reverse(r.arc_path.begin(), r.arc_path.end());
+    if (gc_on) r.arc_path = im.gc_prefix[b];
+    r.arc_path.insert(r.arc_path.end(),
+                      std::reverse_iterator<const int32_t*>(path + arc_len[b]),
+                      std::reverse_iterator<const int32_t*>(path));
     for (int32_t a : r.arc_path) {
       for (int32_t j = g.aux_row_splits[a]; j < g.aux_row_splits[a + 1]; ++j) {
         if (g.aux_pool[j] > 0) r.words.push_back(g.aux_pool[j]);

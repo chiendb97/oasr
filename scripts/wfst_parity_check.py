@@ -63,7 +63,8 @@ class IntreeDecoder:
         gh = int(self.mod.wfst_load_graph(args.graph))
         self.dec = int(self.mod.wfst_create_decoder(
             gh, args.search_beam, args.output_beam, args.min_active, args.max_active, 1,
-            max_lanes, t_max, device.index, 32, 3, 1, 0, 0, 0, 0, 3, 0, 0))
+            max_lanes, t_max, device.index, 32, 3, 1, 0, 0, 0, 0, 3, 0, 0,
+            args.gc_interval))
 
     def decode(self, batch, lengths):
         g = int(batch.size(0))
@@ -118,6 +119,9 @@ def main():
     p.add_argument("--min-active", type=int, default=30)
     p.add_argument("--max-active", type=int, default=10000)
     p.add_argument("--score-atol", type=float, default=1e-4)
+    p.add_argument("--gc-interval", type=int, default=0,
+                   help="in-tree winners-log GC cadence (0 = off); results must be "
+                        "identical either way — parity with GC on proves GC exactness")
     p.add_argument("--device", default="cuda:0")
     args = p.parse_args()
 

@@ -169,6 +169,34 @@ def test_toy_batched_offline_equivalence(toy_fst):
     assert list(b_tokens[0]) == _TOY_WORDS
 
 
+def test_toy_winners_gc_matches_plain(toy_fst):
+    """gc_interval > 0 (segmented decode + winners-log GC + host prefix merge) must
+    reproduce the plain decode exactly, including across repeats on the same decoder."""
+    _module()
+    from oasr.decoder.wfst_decoder import WfstDecoderOptions, WfstDecoderSearch
+
+    labels = ([1] + [0] * 29 + [2] + [0] * 29) * 1  # T=60 >> gc_interval
+    logp = _toy_logp(labels, "cuda")
+    plain = WfstDecoderSearch(
+        toy_fst,
+        WfstDecoderOptions(min_active_states=1, max_active_states=100,
+                           blank_skip_thresh=1.0, max_frames=64, max_offline_lanes=2),
+    )
+    gc = WfstDecoderSearch(
+        toy_fst,
+        WfstDecoderOptions(min_active_states=1, max_active_states=100,
+                           blank_skip_thresh=1.0, max_frames=64, max_offline_lanes=2,
+                           gc_interval=8),
+    )
+    t0, s0 = plain.decode_offline(logp)
+    t1, s1 = gc.decode_offline(logp)
+    t2, s2 = gc.decode_offline(logp)  # repeat: window/prefix reset across batches
+    assert t0[0] == _TOY_WORDS
+    assert t1[0] == t0[0] and t2[0] == t0[0]
+    assert s1[0] == pytest.approx(s0[0], abs=1e-6)
+    assert s2[0] == s1[0]
+
+
 # ---------------------------------------------------------------------------
 # Real-graph smoke tests via the public Decoder API (need OASR_TEST_FST)
 # ---------------------------------------------------------------------------

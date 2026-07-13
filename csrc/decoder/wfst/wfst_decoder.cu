@@ -106,7 +106,8 @@ int64_t wfst_create_decoder(int64_t graph_handle, double search_beam, double out
                             int64_t main_q_factor, int64_t cand_factor, int64_t use_cuda_graphs,
                             int64_t lattice, int64_t fp16_logprobs, int64_t streaming,
                             int64_t lat_prune_interval, int64_t eps_iterations,
-                            int64_t arena_budget_entries, int64_t stream_log_entries) {
+                            int64_t arena_budget_entries, int64_t stream_log_entries,
+                            int64_t gc_interval) {
   auto* gh = reinterpret_cast<GraphHandle*>(graph_handle);
   TVM_FFI_ICHECK(gh != nullptr) << "null graph handle";
 
@@ -127,6 +128,7 @@ int64_t wfst_create_decoder(int64_t graph_handle, double search_beam, double out
   opts.cfg.eps_iterations = static_cast<int32_t>(eps_iterations);
   opts.cfg.arena_budget_entries = arena_budget_entries;
   opts.cfg.stream_log_entries = stream_log_entries;
+  opts.cfg.gc_interval = static_cast<int32_t>(gc_interval);
   opts.device = static_cast<int>(device);
   opts.debug_snapshots = false;
   opts.use_cuda_graphs = use_cuda_graphs != 0;

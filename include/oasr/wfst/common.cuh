@@ -187,6 +187,18 @@ struct Workspace {
   int32_t* lat_out_cursor;
   int32_t* lat_out_len;  // [lane]
   LaneCounters* lanes;
+  // Winners-log GC (offline long-form, cfg.gc_interval > 0): per-lane convergence
+  // point of the current frontier's chains, and the finalized golden-prefix arcs the
+  // host drains between segment graphs (newest -> oldest as walked).
+  int32_t* gc_conv;   // [lanes]; INT32_MAX none, -1 aborted (defensive)
+  int32_t* fin_arcs;  // [lane][path_cap]
+  int32_t* fin_len;   // [lanes]
+  // First winners index still physically mapped (0 unless GC released a prefix).
+  // Fault shield for every winners chain walk: clean lanes stop at their finalized
+  // sentinel (always >= the floor), but an arena-overflow-degraded lane can carry a
+  // stale frontier pointer below it (its frontier counts appends the full arena
+  // dropped) — such a walk must stop rather than touch unmapped memory.
+  int32_t* gc_floor;  // [1], always allocated
   // Debug snapshots.
   int2* snap;         // {state, score-bits}, [lane][frame][main_q]
   int32_t* snap_len;  // [lane][frame]
@@ -209,6 +221,13 @@ struct Sizes {
 constexpr int32_t kRedirectArcBit = 1 << 30;  // lattice arc labeled -1 (allow_partial)
 constexpr int32_t kEpsArcBit = 1 << 29;       // lattice arc from an epsilon hop (label 0;
                                               // src and dst tokens share a frame)
+constexpr int32_t kGcStampBit = 1 << 30;      // winners-GC convergence stamp, set on the
+                                              // anchor chain's arc field during a GC round
+                                              // and cleared before the next decode step
+                                              // (requires graph arc ids < 2^30)
+constexpr int32_t kGcDoneTok = -2;            // final_tok value of a fully-finalized lane
+                                              // (whole path emitted host-side; Backtrack's
+                                              // w >= 0 loop no-ops without reading winners)
 
 // Log-prob load: fp32 or fp16 storage, f32 accumulation everywhere.
 __device__ inline float LoadLp(const void* lp, int64_t idx, bool half) {

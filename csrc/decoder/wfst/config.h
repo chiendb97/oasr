@@ -23,6 +23,11 @@ struct DecoderConfig {
   int32_t max_lanes = 32;      // max concurrent utterances per batch
   int32_t max_frames = 4096;   // max T per utterance (final step excluded)
 
+  int32_t gc_interval = 0;  // >0 (even): winners-log GC every N offline steps. 1-best
+                            // runs a segmented host loop; interval-lattice mode GCs at
+                            // its prune points. Frees the finalized log prefix, so long
+                            // audio needs O(live window) winners memory instead of O(T).
+
   // Winners-log budgets (entries of 8 bytes). 0 keeps the built-in formulas:
   // arena budget = min(512Mi, max(64Mi, 16Mi * max_lanes)); per-channel streaming
   // region = arena budget / max_lanes. The streaming region is rounded up to whole

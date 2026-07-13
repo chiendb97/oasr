@@ -77,6 +77,7 @@ def _decoder_key(fst: str, opts: "WfstDecoderOptions", device: int) -> tuple:
         opts.max_active_states,
         opts.arena_budget_entries,
         opts.stream_log_entries,
+        opts.gc_interval,
         device,
     )
 
@@ -97,6 +98,7 @@ class WfstDecoderOptions:
         max_offline_lanes: int = _OFFLINE_MAX_LANES,
         arena_budget_entries: int = 0,
         stream_log_entries: int = 0,
+        gc_interval: int = 0,
     ) -> None:
         self.blank = blank
         self.search_beam = search_beam
@@ -114,6 +116,9 @@ class WfstDecoderOptions:
         # sizes each streaming channel's region (committed per active channel).
         self.arena_budget_entries = arena_budget_entries
         self.stream_log_entries = stream_log_entries
+        # >0 (even): offline winners-log GC cadence in steps — long audio decodes in
+        # O(live window) winners memory instead of O(T). Off by default.
+        self.gc_interval = gc_interval
 
 
 def _get_offline_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> int:
@@ -131,6 +136,7 @@ def _get_offline_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> int
                 0, 0, 0,      # lattice, fp16_logprobs, streaming
                 0, 3,         # lat_prune_interval, eps_iterations
                 opts.arena_budget_entries, opts.stream_log_entries,
+                opts.gc_interval,
             ))
         return _offline[key]
 
@@ -150,6 +156,7 @@ def _get_streaming_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> i
                 0, 0, 1,      # lattice, fp16_logprobs, streaming=1
                 0, 3,         # lat_prune_interval, eps_iterations
                 opts.arena_budget_entries, opts.stream_log_entries,
+                0,            # gc_interval (winners GC is offline-only in v1)
             ))
         return _streaming[key]
 
