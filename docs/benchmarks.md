@@ -79,6 +79,16 @@ python benchmarks/bench_engine.py \
     --max-batch-size "$MAX_BATCH_SIZE" \
     --num-utterances "$NUM_UTTERANCES"
 
+# WFST decoding (in-tree GPU decoder) — pass the lang dir (contains HLG.pt;
+# words.txt beside it provides the word table) or a direct .img/.pt path.
+# The HLG.pt is exported to a cached .img next to it on first use.
+python benchmarks/bench_engine.py \
+    --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
+    --wfst-path /path/to/lang_bpe \
+    --subroutines offline_wfst streaming_wfst \
+    --max-batch-size "$MAX_BATCH_SIZE" \
+    --num-utterances "$NUM_UTTERANCES"
+
 # CUDA-Graph toggle — captured (default) vs eager replay for profiling
 python benchmarks/bench_engine.py \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
@@ -145,6 +155,19 @@ python benchmarks/bench_service.py \
     --concurrency "$CONCURRENCY" \
     --max-batch-size "$MAX_BATCH_SIZE" \
     --wire-encoding f32_le
+
+# WFST decoding end to end (server runs the in-tree GPU WFST decoder):
+# --fst-path takes a prebuilt .img or a k2 HLG.pt (exported + cached on first
+# use); the words.txt beside it provides the word table. Works for the
+# grpc_offline / grpc_streaming subroutines the same way.
+python benchmarks/bench_service.py \
+    --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
+    --subroutines offline \
+    --decoder-type ctc_wfst \
+    --fst-path /path/to/lang_bpe/HLG.pt \
+    --num-utterances "$NUM_UTTERANCES" \
+    --concurrency "$CONCURRENCY" \
+    --max-batch-size "$MAX_BATCH_SIZE"
 
 # Streaming (WS /v1/stream) — no realtime pacing for max-rate test
 python benchmarks/bench_service.py \

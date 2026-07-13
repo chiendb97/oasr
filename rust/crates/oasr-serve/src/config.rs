@@ -42,9 +42,15 @@ pub struct Cli {
     #[arg(long)]
     pub chunk_size: Option<u32>,
     /// Decoder type: `ctc_cuda` (GPU CTC beam, engine default) or `ctc_wfst`
-    /// (k2 WFST). Forwarded verbatim to the Python `EngineConfig.decoder_type`.
+    /// (in-tree GPU WFST beam search). Forwarded verbatim to the Python
+    /// `EngineConfig.decoder_type`.
     #[arg(long)]
     pub decoder_type: Option<String>,
+    /// WFST decoding graph for `--decoder-type ctc_wfst`: a prebuilt `.img`
+    /// image or a k2 `HLG.pt` (exported + cached on first use). Forwarded to
+    /// `EngineConfig.fst_path`.
+    #[arg(long)]
+    pub fst_path: Option<String>,
     /// Offline only: overlap per-request admission prep (waveform load + scale
     /// + frame stamp) with the GPU ``step()`` on a daemon prep thread.  Helps
     /// at high concurrency (a deep backlog to pipeline); can slightly regress
@@ -209,6 +215,9 @@ impl Cli {
             obj.entry("decoder_type")
                 .or_insert(Value::String(s.clone()));
         }
+        if let Some(s) = &self.fst_path {
+            obj.entry("fst_path").or_insert(Value::String(s.clone()));
+        }
         if self.overlap_admit {
             obj.entry("overlap_admit").or_insert(Value::Bool(true));
         }
@@ -228,7 +237,8 @@ impl Cli {
             }
         }
         if let Some(v) = self.max_batch_frames {
-            obj.entry("max_batch_frames").or_insert(Value::Number(v.into()));
+            obj.entry("max_batch_frames")
+                .or_insert(Value::Number(v.into()));
         }
         if let Some(r) = self.length_bucket_ratio {
             if let Some(n) = serde_json::Number::from_f64(r) {
@@ -241,25 +251,31 @@ impl Cli {
             }
         }
         if let Some(b) = self.streaming_cohort_admit {
-            obj.entry("streaming_cohort_admit").or_insert(Value::Bool(b));
+            obj.entry("streaming_cohort_admit")
+                .or_insert(Value::Bool(b));
         }
         if let Some(b) = self.use_ctc_cuda_graphs {
             obj.entry("use_ctc_cuda_graphs").or_insert(Value::Bool(b));
         }
         if let Some(b) = self.use_feature_cuda_graphs {
-            obj.entry("use_feature_cuda_graphs").or_insert(Value::Bool(b));
+            obj.entry("use_feature_cuda_graphs")
+                .or_insert(Value::Bool(b));
         }
         if let Some(v) = self.partial_decode_interval {
-            obj.entry("partial_decode_interval").or_insert(Value::Number(v.into()));
+            obj.entry("partial_decode_interval")
+                .or_insert(Value::Number(v.into()));
         }
         if let Some(b) = self.overlap_partial_readback {
-            obj.entry("overlap_partial_readback").or_insert(Value::Bool(b));
+            obj.entry("overlap_partial_readback")
+                .or_insert(Value::Bool(b));
         }
         if let Some(b) = self.enable_sequence_packing {
-            obj.entry("enable_sequence_packing").or_insert(Value::Bool(b));
+            obj.entry("enable_sequence_packing")
+                .or_insert(Value::Bool(b));
         }
         if let Some(v) = self.max_packed_frames {
-            obj.entry("max_packed_frames").or_insert(Value::Number(v.into()));
+            obj.entry("max_packed_frames")
+                .or_insert(Value::Number(v.into()));
         }
         // device defaults to "cuda" — EngineConfig falls back if absent.
 

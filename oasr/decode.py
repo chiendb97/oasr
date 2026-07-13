@@ -81,6 +81,14 @@ class DecoderConfig:
     # GPU backend only: lane pool for batched offline decode (decode_batch fills up to
     # this many lanes per GPU launch). The engine raises this to max_batch_size.
     wfst_max_offline_lanes: int = 8
+    # GPU backend only: concurrent streaming channels of the shared streaming decoder.
+    # The engine raises this to max_batch_size (its concurrent stream pool cap).
+    wfst_max_streams: int = 32
+    # GPU backend only: per-channel winners RING entries (8 bytes each, committed per
+    # ACTIVE channel; rounded up to whole 32 MiB mapping chunks). 0 = decoder formula
+    # (arena budget / channels). With the per-chunk GC the ring is a live window, not a
+    # stream-length cap, so one chunk (4Mi entries = 32 MiB) is plenty.
+    wfst_stream_log_entries: int = 0
 
     # Context biasing (phrase boosting)
     context_phrases: Optional[List[List[int]]] = None
@@ -157,13 +165,14 @@ def _make_searcher(config: DecoderConfig, fst=None):
                 max_active_states=config.wfst_max_active_states,
                 blank_skip_thresh=config.wfst_blank_skip_thresh,
                 max_offline_lanes=config.wfst_max_offline_lanes,
+                max_streams=config.wfst_max_streams,
+                stream_log_entries=config.wfst_stream_log_entries,
             )
             searcher = WfstDecoderSearch(fst, opts)
         elif backend == "k2":
             if not _dec.k2_available:
                 raise RuntimeError(
-                    "K2 WFST decoder is not available. "
-                    "Rebuild with OASR_USE_K2=1 to enable it."
+                    "K2 WFST decoder is not available. " "Rebuild with OASR_USE_K2=1 to enable it."
                 )
             opts = _dec.CtcWfstBeamSearchOptions()
             opts.blank = config.blank
@@ -176,9 +185,7 @@ def _make_searcher(config: DecoderConfig, fst=None):
             opts.blank_skip_thresh = config.wfst_blank_skip_thresh
             searcher = _dec.CtcWfstBeamSearch.from_file(fst, opts)
         else:
-            raise ValueError(
-                f"Unknown wfst_backend {config.wfst_backend!r}. Choose 'gpu' or 'k2'."
-            )
+            raise ValueError(f"Unknown wfst_backend {config.wfst_backend!r}. Choose 'gpu' or 'k2'.")
 
     else:
         raise ValueError(

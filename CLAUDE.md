@@ -155,13 +155,15 @@ python benchmarks/bench_engine.py \
 python benchmarks/bench_service.py \
     --ckpt-dir [CKPT_DIR] \
     --audio-dir [AUDIO_DIR] \
-    --subroutines [offline|streaming|grpc_offline|grpc_streaming|whisper] \
+    --subroutines [offline|grpc_offline|grpc_streaming|whisper] \
     --num-utterances [NUM_UTTERANCES] \
     --concurrency [CONCURRENCY] \
     --max-batch-size [MAX_BATCH_SIZE] \
     --chunk-ms [CHUNK_MS] \
     --wire-encoding [f32_le|i16_le] \
-    --realtime [0|1]
+    --realtime [0|1] \
+    --decoder-type [ctc_cuda|ctc_wfst] \
+    --fst-path [/path/to/lang_bpe/HLG.pt]   # ctc_wfst only
 ```
 
 `--wire-encoding` (default `i16_le`) chooses the PCM format the bench client
@@ -323,6 +325,8 @@ Routing policy: single in-process engine per process — no sticky map needed at
 | `--preferred-batch-sizes` | none | comma list, pre-warms CUDA-Graph capture per B |
 | `--schedule-policy` | engine default (`bucket`) | `bucket` / `fcfs` / `sjf` |
 | `--max-offline-pad-ratio` | engine default (`4.0`) | padded-waste cap for `bucket` policy |
+| `--decoder-type` | engine default (`ctc_cuda`) | `ctc_cuda` / `ctc_wfst` (in-tree GPU WFST) |
+| `--fst-path` | none | WFST graph for `ctc_wfst`: prebuilt `.img` or k2 `HLG.pt` (words.txt beside it = word table) |
 
 Admission coalescing batches contiguous `CreateOffline`/`CreateStreaming` envelopes into one `add_requests_batch` Python call — turns 10–20-deep service batches into 32–64 under `asyncio.gather`-style bursts. `FeedChunk`/`Cancel`/`Ping` flush the admit batch first to preserve `CreateStreaming → FeedChunk` ordering. The Python-side `oasr/serving/` directory still exists but is dead code from the binary's perspective; `bench_service.py` rejects `--num-workers > 1` with a helpful error pointing at the new "one process per GPU" topology.
 
