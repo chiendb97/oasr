@@ -75,6 +75,8 @@ def _decoder_key(fst: str, opts: "WfstDecoderOptions", device: int) -> tuple:
         opts.output_beam,
         opts.min_active_states,
         opts.max_active_states,
+        opts.arena_budget_entries,
+        opts.stream_log_entries,
         device,
     )
 
@@ -93,6 +95,8 @@ class WfstDecoderOptions:
         max_frames: int = 4096,
         max_streams: int = 32,
         max_offline_lanes: int = _OFFLINE_MAX_LANES,
+        arena_budget_entries: int = 0,
+        stream_log_entries: int = 0,
     ) -> None:
         self.blank = blank
         self.search_beam = search_beam
@@ -105,6 +109,11 @@ class WfstDecoderOptions:
         # Lane pool of the shared offline decoder; a batched decode of B utterances
         # fills up to this many lanes per GPU launch (larger B is sub-batched).
         self.max_offline_lanes = max_offline_lanes
+        # Winners-log budgets (8-byte entries); 0 keeps the decoder's built-in formulas.
+        # `arena_budget_entries` caps the shared offline arena; `stream_log_entries`
+        # sizes each streaming channel's region (committed per active channel).
+        self.arena_budget_entries = arena_budget_entries
+        self.stream_log_entries = stream_log_entries
 
 
 def _get_offline_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> int:
@@ -121,6 +130,7 @@ def _get_offline_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> int
                 1,            # use_cuda_graphs
                 0, 0, 0,      # lattice, fp16_logprobs, streaming
                 0, 3,         # lat_prune_interval, eps_iterations
+                opts.arena_budget_entries, opts.stream_log_entries,
             ))
         return _offline[key]
 
@@ -139,6 +149,7 @@ def _get_streaming_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> i
                 1,            # use_cuda_graphs
                 0, 0, 1,      # lattice, fp16_logprobs, streaming=1
                 0, 3,         # lat_prune_interval, eps_iterations
+                opts.arena_budget_entries, opts.stream_log_entries,
             ))
         return _streaming[key]
 

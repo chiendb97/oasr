@@ -63,7 +63,7 @@ class IntreeDecoder:
         gh = int(self.mod.wfst_load_graph(args.graph))
         self.dec = int(self.mod.wfst_create_decoder(
             gh, args.search_beam, args.output_beam, args.min_active, args.max_active, 1,
-            max_lanes, t_max, device.index, 32, 3, 1, 0, 0, 0, 0, 3))
+            max_lanes, t_max, device.index, 32, 3, 1, 0, 0, 0, 0, 3, 0, 0))
 
     def decode(self, batch, lengths):
         g = int(batch.size(0))

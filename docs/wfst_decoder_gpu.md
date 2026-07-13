@@ -324,9 +324,20 @@ Two placement rules follow from VMM semantics:
   (`rows ≤ max(T)` of each batch), and staging copies are per-lane 1-D
   `cudaMemcpyAsync` — a single 2-D copy would validate a span crossing
   unmapped holes and fail with `invalid argument`;
-- streaming decoders commit their winners arena fully at construction: the
-  per-channel regions (`stream_log_cap = arena_cap / lanes` each) are
-  interleaved, not a prefix.
+- streaming winners regions are interleaved per channel, not a prefix:
+  `stream_log_cap` (default `arena_cap / lanes`, override with
+  `DecoderConfig::stream_log_entries`) is rounded up to whole mapping chunks,
+  each channel's slice is committed at `CreateStream` and unmapped at
+  `ReleaseStream` (`LazyRegion::ReleaseRange`), so the streaming footprint
+  tracks **active** channels instead of `max_lanes` (32 idle channels: 4 GiB →
+  0). `ReleaseStream` also deadens the lane's device counters
+  (`StreamResetKernel`) before unmapping — the shared per-step kernels and
+  `BacktrackKernel` gate on lane status, so nothing walks a released chain.
+
+`DecoderConfig::arena_budget_entries` (0 = the `min(512Mi, max(64Mi,
+16Mi·lanes))` formula above) caps the winners-arena reservation for
+memory-constrained deployments; both budget knobs are trailing arguments of
+`wfst_create_decoder`.
 
 `wfst_decoder_mem_stats(handle, out_i64[4])` reports
 `{reserved, committed, fixed, arena_high_water}`. Measured after the first

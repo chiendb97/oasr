@@ -323,8 +323,16 @@ struct GpuDecoder::Impl {
     // Pools scale with lane count so small rescue instances stay cheap.
     const int64_t want =
         static_cast<int64_t>(sz.lanes) * (cfg.max_frames + 2) * sz.main_q;
+    if (cfg.arena_budget_entries < 0 || cfg.stream_log_entries < 0)
+      throw std::runtime_error("arena_budget_entries / stream_log_entries must be >= 0");
+    // Entry indices are int32 device-side; leave headroom for the streaming per-chunk
+    // rounding below (< one chunk per lane).
+    constexpr int64_t kMaxArenaEntries = 1LL << 30;
     const int64_t arena_budget =
-        std::min<int64_t>(512LL << 20, std::max<int64_t>(64LL << 20, (16LL << 20) * sz.lanes));
+        cfg.arena_budget_entries > 0
+            ? std::min<int64_t>(cfg.arena_budget_entries, kMaxArenaEntries)
+            : std::min<int64_t>(512LL << 20,
+                                std::max<int64_t>(64LL << 20, (16LL << 20) * sz.lanes));
     sz.arena_cap = static_cast<int32_t>(std::min<int64_t>(want, arena_budget));
     sz.path_cap = cfg.max_frames + 2;
     if (cfg.lat_prune_interval < 0 || (cfg.lat_prune_interval & 1))
@@ -337,7 +345,23 @@ struct GpuDecoder::Impl {
                      : static_cast<int32_t>(std::min<int64_t>(
                            128LL << 20, std::max<int64_t>(32LL << 20, (4LL << 20) * sz.lanes)));
     sz.lp_half = cfg.fp16_logprobs ? 1 : 0;
-    sz.stream_log_cap = cfg.streaming ? sz.arena_cap / sz.lanes : 0;
+    sz.stream_log_cap = 0;
+    if (cfg.streaming) {
+      // Per-channel slices commit at CreateStream and unmap at ReleaseStream, so each
+      // slice is rounded up to whole physical mapping chunks (no chunk straddles two
+      // channels; the reservation grows by < one chunk per lane).
+      int64_t cap = cfg.stream_log_entries > 0
+                        ? std::min<int64_t>(cfg.stream_log_entries,
+                                            (1LL << 30) / sz.lanes)
+                        : sz.arena_cap / sz.lanes;
+      const size_t chunk = LazyRegion::ChunkBytesFor(o.device);
+      if (chunk > 0) {
+        const int64_t per_chunk = static_cast<int64_t>(chunk / sizeof(int2));
+        cap = (cap + per_chunk - 1) / per_chunk * per_chunk;
+      }
+      sz.stream_log_cap = static_cast<int32_t>(cap);
+      sz.arena_cap = static_cast<int32_t>(cap * sz.lanes);
+    }
     if (cfg.streaming && cfg.lattice)
       throw std::runtime_error("lattice mode is not supported with streaming (v1)");
     channel_used.assign(sz.lanes, false);
@@ -451,11 +475,18 @@ struct GpuDecoder::Impl {
       ws.lat_out_cursor = Alloc<int32_t>(1);
       ws.lat_out_len = Alloc<int32_t>(L);
     }
-    // Initial physical commitment. Streaming partitions the winners arena into fixed
-    // per-lane regions (not a prefix), so it commits fully; batch mode starts small and
-    // grows on demand.
+    // Initial physical commitment. Streaming commits nothing here: each channel's slice
+    // is mapped at CreateStream and unmapped at ReleaseStream, so the footprint tracks
+    // ACTIVE channels. Batch mode starts small and grows on demand. Streaming lane
+    // counters must be explicitly deadened — no InitKernel runs in streaming mode, and
+    // a never-created lane would otherwise carry recycled-allocation garbage into the
+    // shared per-step kernels (BacktrackKernel walks any lane with status == 1).
     if (cfg.streaming) {
-      SetArenaCommit(sz.arena_cap);
+      arena_limit_host = sz.arena_cap;  // streaming appends bound against stream_log_cap
+      WFST_CUDA_CHECK(
+          cudaMemcpy(ws.arena_limit, &arena_limit_host, 4, cudaMemcpyHostToDevice));
+      StreamResetKernel<<<(sz.lanes + 63) / 64, 64, 0, stream>>>(ws, sz, -1);
+      WFST_CUDA_CHECK(cudaStreamSynchronize(stream));
     } else {
       SetArenaCommit(std::min<int64_t>(sz.arena_cap, kInitArenaEntries));
     }
@@ -473,8 +504,14 @@ struct GpuDecoder::Impl {
         cudaMemset(ws.hash_payload, 0, L * sz.hash_cap * sizeof(unsigned long long)));
   }
 
+  size_t StreamSliceBytes() const {
+    return static_cast<size_t>(sz.stream_log_cap) * sizeof(int2);
+  }
+
   ~Impl() {
     for (auto& [b, e] : graph_execs) cudaGraphExecDestroy(e);
+    for (auto& [b, e] : chunk_execs) cudaGraphExecDestroy(e);
+    for (auto& [b, e] : steps_execs) cudaGraphExecDestroy(e);
     for (void* p : allocs) cudaFree(p);
     if (stream != nullptr) cudaStreamDestroy(stream);
   }
@@ -511,6 +548,9 @@ int32_t GpuDecoder::CreateStream() {
   for (int32_t lane = 0; lane < im.sz.lanes; ++lane) {
     if (im.channel_used[lane]) continue;
     im.channel_used[lane] = true;
+    // Map this channel's winners slice (unmapped while the channel was closed).
+    im.winners_mem.EnsureRange(static_cast<size_t>(lane) * im.StreamSliceBytes(),
+                               im.StreamSliceBytes());
     StreamCreateKernel<<<1, 1, 0, im.stream>>>(im.ws, im.sz, im.dg, lane,
                                                im.opts.cfg.search_beam);
     if (im.dg.eps_count != nullptr) {
@@ -527,7 +567,16 @@ int32_t GpuDecoder::CreateStream() {
 
 void GpuDecoder::ReleaseStream(int32_t channel) {
   Impl& im = *impl_;
-  if (channel >= 0 && channel < im.sz.lanes) im.channel_used[channel] = false;
+  if (channel < 0 || channel >= im.sz.lanes || !im.channel_used[channel]) return;
+  WFST_CUDA_CHECK(cudaSetDevice(im.opts.device));
+  // Deaden the lane BEFORE unmapping its winners slice, and drain the stream so no
+  // in-flight kernel still reads the slice: the shared per-step kernels gate on
+  // status / frontier_size, so nothing walks the released chain afterwards.
+  StreamResetKernel<<<(im.sz.lanes + 63) / 64, 64, 0, im.stream>>>(im.ws, im.sz, channel);
+  WFST_CUDA_CHECK(cudaStreamSynchronize(im.stream));
+  im.winners_mem.ReleaseRange(static_cast<size_t>(channel) * im.StreamSliceBytes(),
+                              im.StreamSliceBytes());
+  im.channel_used[channel] = false;
 }
 
 std::vector<GpuDecoder::StreamPartial> GpuDecoder::AdvanceChunk(

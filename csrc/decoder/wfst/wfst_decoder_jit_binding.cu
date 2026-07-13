@@ -16,7 +16,8 @@ int64_t wfst_create_decoder(int64_t graph_handle, double search_beam, double out
                             int64_t max_lanes, int64_t max_frames, int64_t device,
                             int64_t main_q_factor, int64_t cand_factor, int64_t use_cuda_graphs,
                             int64_t lattice, int64_t fp16_logprobs, int64_t streaming,
-                            int64_t lat_prune_interval, int64_t eps_iterations);
+                            int64_t lat_prune_interval, int64_t eps_iterations,
+                            int64_t arena_budget_entries, int64_t stream_log_entries);
 void wfst_free_decoder(int64_t handle);
 void wfst_decoder_mem_stats(int64_t handle, TensorView out_stats);
 void wfst_decode_batch(int64_t handle, TensorView log_probs, TensorView lengths,

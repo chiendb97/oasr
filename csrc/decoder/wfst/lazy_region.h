@@ -96,6 +96,51 @@ class LazyRegion {
   // Prefix commit convenience: ensures [0, bytes).
   void EnsurePrefix(size_t bytes) { EnsureRange(0, bytes); }
 
+  // Unmaps and releases the physical chunks FULLY contained in [offset, offset + bytes).
+  // Partially-covered edge chunks stay mapped (callers wanting exact release must pass
+  // chunk-aligned ranges). No-op on the eager fallback. The caller must guarantee no
+  // in-flight or future GPU work touches the range until it is re-committed.
+  void ReleaseRange(size_t offset, size_t bytes) {
+    if (!lazy_ || bytes == 0) return;
+    if (offset + bytes > va_) throw std::runtime_error("LazyRegion: range beyond reservation");
+    const size_t k0 = (offset + chunk_ - 1) / chunk_;            // first fully-inside chunk
+    const size_t k1_end = (offset + bytes) / chunk_;             // one past the last
+    for (size_t k = k0; k < k1_end; ++k) {
+      if (!mapped_[k]) continue;
+      const CUdeviceptr addr = reinterpret_cast<CUdeviceptr>(base_) + k * chunk_;
+      Check(cuMemUnmap(addr, chunk_), "cuMemUnmap");
+      Check(cuMemRelease(handles_[k]), "cuMemRelease");
+      mapped_[k] = false;
+      handles_[k] = CUmemGenericAllocationHandle{};
+      committed_ -= chunk_;
+    }
+  }
+
+  // Physical mapping unit chosen at Reserve (0 before Reserve or on the eager fallback).
+  size_t chunk() const { return lazy_ ? chunk_ : 0; }
+
+  // The mapping unit Reserve would pick on `device` for `chunk_target` (0 when the
+  // driver lacks VMM support). Lets callers size chunk-aligned sub-regions up front.
+  static size_t ChunkBytesFor(int device, size_t chunk_target = kChunkTarget) {
+    int vmm = 0;
+    CUdevice dev = 0;
+    if (cuDeviceGet(&dev, device) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED,
+                             dev) != CUDA_SUCCESS ||
+        vmm == 0)
+      return 0;
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device;
+    size_t gran = 0;
+    if (cuMemGetAllocationGranularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) !=
+            CUDA_SUCCESS ||
+        gran == 0)
+      return 0;
+    return ((chunk_target + gran - 1) / gran) * gran;
+  }
+
   void* ptr() const { return base_; }
   size_t reserved() const { return va_; }
   size_t committed() const { return committed_; }

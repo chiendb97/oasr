@@ -23,6 +23,13 @@ struct DecoderConfig {
   int32_t max_lanes = 32;      // max concurrent utterances per batch
   int32_t max_frames = 4096;   // max T per utterance (final step excluded)
 
+  // Winners-log budgets (entries of 8 bytes). 0 keeps the built-in formulas:
+  // arena budget = min(512Mi, max(64Mi, 16Mi * max_lanes)); per-channel streaming
+  // region = arena budget / max_lanes. The streaming region is rounded up to whole
+  // physical mapping chunks (its slices commit/unmap per channel).
+  int64_t arena_budget_entries = 0;
+  int64_t stream_log_entries = 0;
+
   bool lattice = false;        // persist per-frame candidates for lattice extraction
   int32_t lat_prune_interval = 0;  // >0 (even): prune the lattice arena every N frames
                                    // (k2-style window-loose rule; bounds memory for long
