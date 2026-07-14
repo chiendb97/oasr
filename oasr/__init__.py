@@ -30,7 +30,7 @@ from .conv import (
     depthwise_conv1d_silu, causal_conv1d, conv2d_activation,
 )
 from .gemm import gemm, bmm, group_gemm, gemm_activation, gemm_log_softmax
-from .softmax import softmax
+from .softmax import log_softmax, softmax
 from .attention import fmha
 from .topk import topk
 from .fft import rfft, rfft_power
@@ -195,6 +195,7 @@ __all__ = [
     "group_gemm",
     "gemm_activation",
     "gemm_log_softmax",
+    "log_softmax",
     "softmax",
     "topk",
     "rfft",

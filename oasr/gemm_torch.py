@@ -45,11 +45,11 @@ def torch_gemm_activation(out, A, B, C, activation_type: int, split_k_slices: in
         torch.matmul(A, B.t(), out=out)
     else:
         torch.addmm(C, A, B.t(), out=out)
-    if activation_type == 0:        # RELU
+    if activation_type == 0:  # RELU
         torch.relu_(out)
-    elif activation_type == 1:      # GELU (erf form, matches LinearCombinationGELU)
+    elif activation_type == 1:  # GELU (erf form, matches LinearCombinationGELU)
         out.copy_(F.gelu(out))
-    elif activation_type == 2:      # SWISH / SiLU (matches LinearCombinationSilu)
+    elif activation_type == 2:  # SWISH / SiLU (matches LinearCombinationSilu)
         F.silu(out, inplace=True)
     else:
         raise ValueError(f"Unsupported activation_type: {activation_type}")
@@ -58,3 +58,17 @@ def torch_gemm_activation(out, A, B, C, activation_type: int, split_k_slices: in
 def torch_bmm(out, A, B) -> None:
     """``out[b,M,N] = A[b,M,K] @ B[b,N,K]ᵀ`` — written in place into ``out``."""
     torch.bmm(A, B.transpose(-1, -2), out=out)
+
+
+def torch_gemm_log_softmax(out, A, B, C=None, split_k_slices: int = 1) -> None:
+    """``out = log_softmax(A @ Bᵀ (+ C), dim=-1)`` — written in place into ``out``.
+
+    The all-torch counterpart of the fused CUTLASS ``gemm_log_softmax`` (the
+    CTC head).  ``torch.log_softmax`` supports ``out is input`` (element-wise
+    final pass), so no intermediate buffer is allocated.
+    """
+    if C is None:
+        torch.matmul(A, B.t(), out=out)
+    else:
+        torch.addmm(C, A, B.t(), out=out)
+    torch.log_softmax(out, dim=-1, out=out)

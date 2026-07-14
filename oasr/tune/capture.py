@@ -9,10 +9,10 @@ actually go through ``oasr.fmha``.  The only trustworthy source of the shapes th
 reach the OASR-tunable CUTLASS path is the workload itself.
 
 This module wraps the functional entry points (:func:`oasr.gemm`,
-:func:`oasr.gemm_activation`, :func:`oasr.bmm`, :func:`oasr.group_gemm`) with thin
-recorders that log ``(op, M, N, K, dtype)`` plus a call count and a FLOP weight,
-then forward to the original.  Overhead is one dict update per call — negligible
-next to a GEMM launch.
+:func:`oasr.gemm_activation`, :func:`oasr.bmm`, :func:`oasr.group_gemm`,
+:func:`oasr.gemm_log_softmax`) with thin recorders that log ``(op, M, N, K,
+dtype)`` plus a call count and a FLOP weight, then forward to the original.
+Overhead is one dict update per call — negligible next to a GEMM launch.
 
 Two ways to drive it:
 
@@ -46,7 +46,8 @@ logger = logging.getLogger("oasr.tune")
 
 # Functional entry points patched during capture (attribute names on the ``oasr``
 # package, which is how the layers call them: ``oasr.gemm(...)`` etc.).
-_PATCH_NAMES = ("gemm", "gemm_activation", "bmm", "group_gemm")
+# ``gemm_log_softmax`` is the CTC head (``oasr.layers.ctc.CtcProjection``).
+_PATCH_NAMES = ("gemm", "gemm_activation", "bmm", "group_gemm", "gemm_log_softmax")
 
 
 def _dtype_str(dtype) -> str:
@@ -102,9 +103,7 @@ class GemmShapeRecorder:
 
     def aggregate(self) -> List[_ShapeStat]:
         with self._lock:
-            return sorted(
-                self._stats.values(), key=lambda s: s.total_flops, reverse=True
-            )
+            return sorted(self._stats.values(), key=lambda s: s.total_flops, reverse=True)
 
     def to_json(self, path: str) -> None:
         data = {"version": 1, "stats": [s.to_dict() for s in self.aggregate()]}
@@ -112,9 +111,7 @@ class GemmShapeRecorder:
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
         os.replace(tmp, path)
-        logger.info(
-            "[capture] wrote %d shape groups to %s", len(self._stats), path
-        )
+        logger.info("[capture] wrote %d shape groups to %s", len(self._stats), path)
 
     @staticmethod
     def load_json(path: str) -> List[_ShapeStat]:

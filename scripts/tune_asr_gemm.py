@@ -240,7 +240,25 @@ def _alloc_args(shape: RepShape):
     out = torch.empty(M, N, device=dev, dtype=dt)
     if shape.op == "gemm_activation":
         return out, A, B, C, _ACTIVATION_SWISH
+    # gemm and gemm_log_softmax share the (out, A, B, C) runner signature
     return out, A, B, C
+
+
+def _reference_output(shape: RepShape, args):
+    """fp32 reference for the numerics guard (None → no check for this op)."""
+    import torch
+    import torch.nn.functional as F
+
+    if shape.op == "bmm":
+        out, A, B = args
+        return torch.matmul(A.float(), B.float().transpose(-1, -2))
+    out, A, B, C = args[:4]
+    ref = torch.addmm(C.float(), A.float(), B.float().t())
+    if shape.op == "gemm_activation":
+        return F.silu(ref)
+    if shape.op == "gemm_log_softmax":
+        return F.log_softmax(ref, dim=-1)
+    return ref
 
 
 class TacticResult:
@@ -254,26 +272,41 @@ def _pick_winner(results: List["TacticResult"], tie_tol: float = 0.05) -> "Tacti
     """Pick the winner, breaking near-ties deterministically.
 
     At small M many tiles bottom out at the same latency floor, so the raw
-    fastest flips arbitrarily between equivalent tiles.  Among all tactics within
-    ``tie_tol`` of the measured best, prefer (in order): torch, then the smallest
-    ``(block_m, block_n, kStages, split_k)`` CUTLASS tile.  This keeps adjacent
-    M-buckets consistent without changing genuine winners (a backend that is
-    truly faster than the tolerance band is always kept).
+    fastest flips arbitrarily between equivalent tiles.  Among all tactics
+    within ``tie_tol`` of the measured best, prefer structures by launch cost
+    (fewer kernels / no per-launch workspace work first) with CUTLASS ahead of
+    torch on ties, then the smallest ``(block_m, block_n, kStages, split_k)``
+    tile.  Preference order: plain CUTLASS (or the fused launcher), CUTLASS
+    serial split-K (single launch), torch, parallel split-K (2 launches),
+    Stream-K (memset + kernel).  A backend that is truly faster than the
+    tolerance band is always kept.
     """
     best_ms = results[0].median_ms
     band = [r for r in results if r.median_ms <= best_ms * (1.0 + tie_tol)]
 
     def key(r):
         if r.tactic.backend == "torch":
+            return (2, 0, 0, 0, 0)
+        if r.tactic.backend == "cutlass_fused":
             return (0, 0, 0, 0, 0)
         c = dict(r.tactic.config)
-        return (1, c.get("block_m", 1 << 30), c.get("block_n", 1 << 30),
+        if c.get("stream_k", 0):
+            rank = 4
+        elif c.get("parallel_split_k", 0):
+            rank = 3
+        elif c.get("split_k", 1) > 1:
+            rank = 1
+        else:
+            rank = 0
+        return (rank, c.get("block_m", 1 << 30), c.get("block_n", 1 << 30),
                 c.get("kStages", 0), c.get("split_k", 1))
 
     return min(band, key=key)
 
 
 def benchmark_shape(shape: RepShape, warmup: int, rep: int) -> Optional[List[TacticResult]]:
+    import torch
+
     from oasr.tune.autotuner import _ensure_backends_registered, _global_registry, OpKey
 
     _ensure_backends_registered()
@@ -282,10 +315,32 @@ def benchmark_shape(shape: RepShape, warmup: int, rep: int) -> Optional[List[Tac
     if not candidates:
         return None
     args = _alloc_args(shape)
+    ref = _reference_output(shape, args)
+
+    # Numerics guard: a tactic whose max abs error exceeds 4× the torch
+    # backend's own low-precision error is disqualified (e.g. very deep serial
+    # split-K accumulates partials in the output dtype).
+    torch_err = None
+    for entry in candidates:
+        if entry.tactic.backend == "torch":
+            try:
+                entry.get_runner()(*args)
+                torch.cuda.synchronize()
+                torch_err = (args[0].float() - ref).abs().max().item()
+            except Exception:
+                pass
+            break
+
     results: List[TacticResult] = []
     for entry in candidates:
         try:
             runner = entry.get_runner()
+            runner(*args)
+            torch.cuda.synchronize()
+            if torch_err is not None:
+                err = (args[0].float() - ref).abs().max().item()
+                if err > max(4.0 * torch_err, 1e-3):
+                    continue  # numerically disqualified
             ms = _bench(lambda: runner(*args), warmup, rep)
         except Exception:
             ms = float("inf")
@@ -302,6 +357,8 @@ def benchmark_shape(shape: RepShape, warmup: int, rep: int) -> Optional[List[Tac
 def _cutlass_literal(tactic, sm: int) -> str:
     d = dict(tactic.config)
     extra = ", stream_k=True" if d.get("stream_k", 0) else ""
+    if d.get("parallel_split_k", 0):
+        extra += ", parallel_split_k=True"
     return (
         "CutlassGemmConfig("
         f"block_m={d['block_m']}, block_n={d['block_n']}, block_k={d['block_k']}, "
@@ -313,6 +370,8 @@ def _cutlass_literal(tactic, sm: int) -> str:
 def _choice_literal(tactic, sm: int, is_default: bool) -> str:
     if tactic.backend == "torch":
         return '"torch"'
+    if tactic.backend == "cutlass_fused":
+        return '"fused"'
     if is_default:
         return "GEMM_DEFAULT"
     return _cutlass_literal(tactic, sm)
@@ -329,6 +388,10 @@ def emit_rules(per_shape: Dict[Tuple, List[TacticResult]], reps: List[RepShape],
     lines = [f"_GEMM_HEURISTIC_RULES_SM{sm}: Dict[Tuple[str, int, int], list] = {{"]
     for (op, N, K), grp in sorted(by_key.items()):
         grp.sort(key=lambda r: (r.m_max is None, r.m_max or 0))
+        # The literal a rule-less lookup falls back to (see select_default_config
+        # / _dispatch_gemm_log_softmax): the fused launcher for the CTC head,
+        # GEMM_DEFAULT for everything else.
+        fallback_literal = '"fused"' if op == "gemm_log_softmax" else "GEMM_DEFAULT"
         rule_entries = []  # (m_max | None, choice_literal, comment)
         all_default = True
         for r in grp:
@@ -339,14 +402,14 @@ def emit_rules(per_shape: Dict[Tuple, List[TacticResult]], reps: List[RepShape],
             default = next((t for t in res if t.is_default), None)
             speedup = (default.median_ms / winner.median_ms) if default and winner.median_ms > 0 else 1.0
             choice = _choice_literal(winner.tactic, sm, winner.is_default)
-            if choice != "GEMM_DEFAULT":
+            if choice != fallback_literal:
                 all_default = False
             rule_entries.append(
                 (r.m_max, choice,
                  f"M~{r.M}: {winner.tactic.backend} {winner.median_ms:.4f}ms "
                  f"({speedup:.2f}x vs default)"))
         if all_default or not rule_entries:
-            continue  # every bucket == default → omit; falls back to GEMM_DEFAULT
+            continue  # every bucket == the fallback → omit the rule entirely
         # Collapse runs of identical choice (ascending m_max): a later, larger
         # threshold subsumes earlier same-choice buckets.
         merged = []
@@ -379,11 +442,14 @@ def print_report(per_shape, reps, sm) -> None:
         sp = (d.median_ms / w.median_ms) if d and w.median_ms > 0 else float("nan")
         if w.tactic.backend == "torch":
             wname = "torch"
+        elif w.tactic.backend == "cutlass_fused":
+            wname = "fused"
         else:
             _c = dict(w.tactic.config)
             _sk = "sk" if _c.get("stream_k", 0) else ""
+            _pk = "pk" if _c.get("parallel_split_k", 0) else ""
             wname = (f"cutlass {_c.get('block_m')}x{_c.get('block_n')}"
-                     f"s{_c.get('kStages')}k{_c.get('split_k')}{_sk}")
+                     f"s{_c.get('kStages')}k{_c.get('split_k')}{_sk}{_pk}")
         mm = "inf" if r.m_max is None else str(r.m_max)
         print(f"{r.op:16} {r.N:>6} {r.K:>6} {r.M:>7} {mm:>7}  "
               f"{wname:>26} {w.median_ms:>9.4f} "

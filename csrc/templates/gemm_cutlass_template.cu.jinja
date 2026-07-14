@@ -17,6 +17,9 @@ using Config = oasr::gemm::CutlassGemmConfig<{{ tile_m }}, {{ tile_n }}, {{ tile
 // Stream-K decomposition for this variant (thin-GEMM occupancy fill).
 constexpr bool kUseStreamK = {{ 'true' if stream_k else 'false' }};
 
+// Parallel split-K (partials + reduction kernel) for this variant.
+constexpr bool kUseParallelSplitK = {{ 'true' if parallel_split_k else 'false' }};
+
 // =============================================================================
 // Helper: map CUDA types to CUTLASS types
 // =============================================================================
@@ -73,7 +76,7 @@ void {{ func_name }}(TensorView output, TensorView A, TensorView B, Optional C_o
 
         auto status = oasr::gemm::CutlassGemmKernel<
             Config, CutlassType, CutlassType, CutlassType,
-            oasr::ActivationType::IDENTITY, kUseStreamK>::run(
+            oasr::ActivationType::IDENTITY, kUseStreamK, kUseParallelSplitK>::run(
                 reinterpret_cast<const CutlassType*>(A.data_ptr()),
                 reinterpret_cast<const CutlassType*>(B.data_ptr()),
                 C_ptr,
@@ -125,7 +128,7 @@ void {{ func_name }}_activation(TensorView output, TensorView A, TensorView B, O
         if (activation == ActivationType::RELU) {
             status = oasr::gemm::CutlassGemmKernel<
                 Config, CutlassType, CutlassType, CutlassType,
-                oasr::ActivationType::RELU, kUseStreamK>::run(
+                oasr::ActivationType::RELU, kUseStreamK, kUseParallelSplitK>::run(
                     reinterpret_cast<const CutlassType*>(A.data_ptr()),
                     reinterpret_cast<const CutlassType*>(B.data_ptr()),
                     C_ptr,
@@ -135,7 +138,7 @@ void {{ func_name }}_activation(TensorView output, TensorView A, TensorView B, O
         } else if (activation == ActivationType::GELU) {
             status = oasr::gemm::CutlassGemmKernel<
                 Config, CutlassType, CutlassType, CutlassType,
-                oasr::ActivationType::GELU, kUseStreamK>::run(
+                oasr::ActivationType::GELU, kUseStreamK, kUseParallelSplitK>::run(
                     reinterpret_cast<const CutlassType*>(A.data_ptr()),
                     reinterpret_cast<const CutlassType*>(B.data_ptr()),
                     C_ptr,
@@ -145,7 +148,7 @@ void {{ func_name }}_activation(TensorView output, TensorView A, TensorView B, O
         } else if (activation == ActivationType::SWISH) {
             status = oasr::gemm::CutlassGemmKernel<
                 Config, CutlassType, CutlassType, CutlassType,
-                oasr::ActivationType::SWISH, kUseStreamK>::run(
+                oasr::ActivationType::SWISH, kUseStreamK, kUseParallelSplitK>::run(
                     reinterpret_cast<const CutlassType*>(A.data_ptr()),
                     reinterpret_cast<const CutlassType*>(B.data_ptr()),
                     C_ptr,

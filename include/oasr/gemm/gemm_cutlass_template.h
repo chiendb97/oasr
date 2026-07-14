@@ -19,14 +19,17 @@
 #endif
 
 #include <cutlass/cutlass.h>
+#include <cutlass/epilogue/thread/conversion_op.h>
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/gemm/device/gemm_batched.h>
 #include <cutlass/gemm/device/gemm_grouped.h>
+#include <cutlass/gemm/device/gemm_splitk_parallel.h>
 #include <cutlass/gemm/device/gemm_universal.h>
 #include <cutlass/gemm/kernel/default_gemm_grouped.h>
 #include <cutlass/gemm/threadblock/threadblock_swizzle_streamk.h>
 #include <cutlass/layout/matrix.h>
 #include <cutlass/numeric_types.h>
+#include <cutlass/reduction/thread/reduction_operators.h>
 #include <cutlass/util/device_memory.h>
 
 #ifdef __GNUC__
@@ -36,6 +39,7 @@
 #include <oasr/common/epilogue_functors.h>
 #include <oasr/common/graph_safe_workspace.h>
 #include <oasr/common/utils.h>
+#include <oasr/common/workspace_cache.h>
 #include <oasr/gemm/cutlass_gemm_configs.h>
 
 namespace oasr {
@@ -50,8 +54,19 @@ namespace gemm {
 // Stream-K distributes the K-reduction across all SMs and reduces partials with
 // an in-kernel fixup, which fills the GPU on thin GEMMs (small M, few output
 // tiles) where the data-parallel grid leaves most SMs idle.
+//
+// ``kParallelSplitK`` selects ``GemmSplitKParallel``: each K-partition writes
+// fp32 partials to workspace and a reduction kernel applies the epilogue once.
+// Unlike serial split-K it is valid for fused activations (the activation is
+// applied post-reduction) and needs no workspace zeroing.
+//
+// Serial split-K (``kStreamK == kParallelSplitK == false``, split_k_slices > 1)
+// runs as a SINGLE kernel launch: the per-tile semaphores come from a
+// persistent pre-zeroed workspace (``workspace_cache.h``) and the kernel itself
+// restores the locks to zero (final K-slice releases 0), so the per-launch
+// ``cudaMemsetAsync`` of ``device::Gemm::initialize`` is skipped.
 template <typename CutlassGemmConfig, typename ElementA, typename ElementB, typename ElementCD,
-          ActivationType activation_type, bool kStreamK = false>
+          ActivationType activation_type, bool kStreamK = false, bool kParallelSplitK = false>
 struct CutlassGemmKernel {
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::ColumnMajor;
@@ -75,13 +90,16 @@ struct CutlassGemmKernel {
 
     static constexpr int Stages = CutlassGemmConfig::Stages;
 
-    // Data-parallel (identity swizzle) classic device GEMM.
+    // Data-parallel (identity swizzle) classic device GEMM.  SplitKSerial=true
+    // enables the runtime ``split_k_slices`` argument (semaphore-serialized
+    // K-partition reduction); with split_k_slices == 1 the kernel is identical
+    // to the non-split-K instantiation.
     using GemmBasic =
         cutlass::gemm::device::Gemm<ElementA, LayoutA, ElementB, LayoutB, ElementCD, LayoutCD,
                                     ElementAccumulator, MMAOp, SmArch, ThreadblockShape, WarpShape,
                                     InstructionShape, EpilogueOp,
                                     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-                                    Stages, AlignmentA, AlignmentB>;
+                                    Stages, AlignmentA, AlignmentB, /*SplitKSerial=*/true>;
 
     // Stream-K (GemmUniversal): same template parameters, only the swizzle differs.
     using GemmStreamK = cutlass::gemm::device::GemmUniversal<
@@ -97,45 +115,169 @@ struct CutlassGemmKernel {
                           int split_k_slices = 1) {
         float beta = (C == nullptr) ? 0.0f : 1.0f;
 
-        auto args = [&]() -> typename Gemm::Arguments {
-            if constexpr (kStreamK) {
-                // GemmUniversal kGemm mode; the bias vector C[N] broadcasts over
-                // rows via stride_c = 0.  avail_sms = -1 → use all device SMs for
-                // Stream-K load balancing.
-                return typename Gemm::Arguments(
-                    cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K},
-                    /*batch_count=*/1, {alpha, beta}, A, B, C, D,
-                    /*batch_stride_A=*/static_cast<int64_t>(M) * K,
-                    /*batch_stride_B=*/static_cast<int64_t>(N) * K,
-                    /*batch_stride_C=*/static_cast<int64_t>(0),
-                    /*batch_stride_D=*/static_cast<int64_t>(M) * N,
-                    /*stride_a=*/lda, /*stride_b=*/ldb, /*stride_c=*/static_cast<int64_t>(0),
-                    /*stride_d=*/ldc, /*avail_sms=*/-1);
-            } else {
-                return typename Gemm::Arguments({M, N, K}, {A, lda}, {B, ldb}, {C, 0}, {D, ldc},
-                                                {alpha, beta}, split_k_slices);
-            }
-        }();
+        if constexpr (kParallelSplitK) {
+            return runParallelSplitK(A, B, C, D, M, N, K, lda, ldb, ldc, alpha, beta, stream,
+                                     split_k_slices);
+        } else if constexpr (kStreamK) {
+            // GemmUniversal kGemm mode; the bias vector C[N] broadcasts over
+            // rows via stride_c = 0.  avail_sms = -1 → use all device SMs for
+            // Stream-K load balancing.
+            typename Gemm::Arguments args(
+                cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K},
+                /*batch_count=*/1, {alpha, beta}, A, B, C, D,
+                /*batch_stride_A=*/static_cast<int64_t>(M) * K,
+                /*batch_stride_B=*/static_cast<int64_t>(N) * K,
+                /*batch_stride_C=*/static_cast<int64_t>(0),
+                /*batch_stride_D=*/static_cast<int64_t>(M) * N,
+                /*stride_a=*/lda, /*stride_b=*/ldb, /*stride_c=*/static_cast<int64_t>(0),
+                /*stride_d=*/ldc, /*avail_sms=*/-1);
 
-        Gemm gemm_op;
-        cutlass::Status status = gemm_op.can_implement(args);
-        if (status != cutlass::Status::kSuccess) {
+            Gemm gemm_op;
+            if (gemm_op.can_implement(args) != cutlass::Status::kSuccess) {
+                return GemmStatus::NOT_SUPPORTED;
+            }
+
+            // The Stream-K barrier workspace must be re-zeroed every launch
+            // (initialize() does that), but the allocation itself is reusable —
+            // prefer the persistent scratch buffer over per-call alloc/free.
+            size_t workspace_size = Gemm::get_workspace_size(args);
+            void* cached = getCachedWorkspace(workspace_size, stream, WorkspacePool::kScratch);
+            if (cached != nullptr) {
+                return runInitialized(gemm_op, args, cached, stream);
+            }
+            oasr::GraphSafeWorkspace workspace(workspace_size, stream);
+            return runInitialized(gemm_op, args, workspace.get(), stream);
+        } else {
+            if (activation_type != ActivationType::IDENTITY && split_k_slices > 1) {
+                // Serial split-K applies the epilogue per K-partition, which
+                // would nest the activation around partial sums — wrong math.
+                // (Parallel split-K variants handle fused activations.)
+                return GemmStatus::NOT_SUPPORTED;
+            }
+
+            typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0}, {D, ldc},
+                                          {alpha, beta}, split_k_slices);
+            Gemm gemm_op;
+            if (gemm_op.can_implement(args) != cutlass::Status::kSuccess) {
+                return GemmStatus::NOT_SUPPORTED;
+            }
+
+            if (split_k_slices > 1) {
+                size_t workspace_size = Gemm::get_workspace_size(args);
+                void* semaphore =
+                    getCachedWorkspace(workspace_size, stream, WorkspacePool::kZeroedSemaphore);
+                if (semaphore != nullptr) {
+                    // Single-launch fast path: semaphores are pre-zeroed and
+                    // self-restoring, so skip initialize()'s cudaMemsetAsync.
+                    return runSerialSplitKPreZeroed(args, static_cast<int*>(semaphore), stream);
+                }
+                // Fallback (cache disabled, OOM, or first touch during CUDA
+                // graph capture): legacy per-call workspace + memset.
+                oasr::GraphSafeWorkspace workspace(workspace_size, stream);
+                return runInitialized(gemm_op, args, workspace.get(), stream);
+            }
+
+            return runInitialized(gemm_op, args, nullptr, stream);
+        }
+    }
+
+private:
+    /// initialize() + run() with the given workspace (legacy CUTLASS flow).
+    static GemmStatus runInitialized(Gemm& gemm_op, typename Gemm::Arguments const& args,
+                                     void* workspace, cudaStream_t stream) {
+        if (gemm_op.initialize(args, workspace, stream) != cutlass::Status::kSuccess) {
+            return GemmStatus::INTERNAL_ERROR;
+        }
+        if (gemm_op(stream) != cutlass::Status::kSuccess) {
+            return GemmStatus::CUTLASS_ERROR;
+        }
+        return GemmStatus::SUCCESS;
+    }
+
+    /// Serial split-K without the per-launch semaphore memset.  Mirrors
+    /// ``device::Gemm::initialize`` + ``run`` (params construction, smem
+    /// opt-in, kernel launch) minus the ``cudaMemsetAsync`` — valid because
+    /// *semaphore* points at pre-zeroed memory and the kernel's final K-slice
+    /// releases each tile's lock back to 0 (``cutlass/gemm/kernel/gemm.h``).
+    static GemmStatus runSerialSplitKPreZeroed(typename GemmBasic::Arguments const& args,
+                                               int* semaphore, cudaStream_t stream) {
+        using GemmKernelT = typename GemmBasic::GemmKernel;
+
+        typename GemmBasic::ThreadblockSwizzle threadblock_swizzle;
+        cutlass::gemm::GemmCoord grid_shape = threadblock_swizzle.get_tiled_shape(
+            args.problem_size, {ThreadblockShape::kM, ThreadblockShape::kN, ThreadblockShape::kK},
+            args.split_k_slices);
+
+        typename GemmKernelT::Params params{args.problem_size,
+                                            grid_shape,
+                                            args.ref_A.non_const_ref(),
+                                            args.ref_B.non_const_ref(),
+                                            args.ref_C.non_const_ref(),
+                                            args.ref_D,
+                                            args.epilogue,
+                                            semaphore,
+                                            args.gather_A_indices,
+                                            args.gather_B_indices,
+                                            args.scatter_D_indices};
+
+        dim3 grid = threadblock_swizzle.get_grid_shape(grid_shape);
+        dim3 block(GemmKernelT::kThreadCount, 1, 1);
+        int smem_size = static_cast<int>(sizeof(typename GemmKernelT::SharedStorage));
+        if (smem_size >= (48 << 10)) {
+            if (cudaFuncSetAttribute(cutlass::Kernel<GemmKernelT>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     smem_size) != cudaSuccess) {
+                return GemmStatus::INTERNAL_ERROR;
+            }
+        }
+
+        cutlass::Kernel<GemmKernelT><<<grid, block, smem_size, stream>>>(params);
+        return (cudaGetLastError() == cudaSuccess) ? GemmStatus::SUCCESS
+                                                   : GemmStatus::CUTLASS_ERROR;
+    }
+
+    /// Parallel split-K: fp32 partials + reduction kernel applying the
+    /// (possibly activation-fused) epilogue exactly once.  Workspace needs no
+    /// zeroing (partials are fully overwritten before the reduction reads).
+    static GemmStatus runParallelSplitK(const ElementA* A, const ElementB* B, const ElementCD* C,
+                                        ElementCD* D, int M, int N, int K, int64_t lda,
+                                        int64_t ldb, int64_t ldc, float alpha, float beta,
+                                        cudaStream_t stream, int split_k_slices) {
+        if (split_k_slices <= 1) {
+            return GemmStatus::NOT_SUPPORTED;  // only registered with slices > 1
+        }
+
+        using ConvertScaledOp =
+            cutlass::epilogue::thread::Convert<ElementAccumulator, EpilogueOp::kCount,
+                                               ElementAccumulator>;
+        using ReductionOp = cutlass::reduction::thread::ReduceAdd<
+            ElementAccumulator, typename EpilogueOp::ElementAccumulator, EpilogueOp::kCount>;
+        using GemmPk = cutlass::gemm::device::GemmSplitKParallel<
+            ElementA, LayoutA, ElementB, LayoutB, ElementCD, LayoutCD, ElementAccumulator, MMAOp,
+            SmArch, ThreadblockShape, WarpShape, InstructionShape, EpilogueOp, ConvertScaledOp,
+            ReductionOp, cutlass::gemm::threadblock::GemmSplitKHorizontalThreadblockSwizzle,
+            Stages, AlignmentA, AlignmentB>;
+
+        typename GemmPk::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, 0}, {D, ldc},
+                                        {alpha, beta}, split_k_slices);
+        GemmPk gemm_op;
+        if (GemmPk::can_implement(args) != cutlass::Status::kSuccess) {
             return GemmStatus::NOT_SUPPORTED;
         }
 
-        size_t workspace_size = Gemm::get_workspace_size(args);
-        oasr::GraphSafeWorkspace workspace(workspace_size, stream);
+        size_t workspace_size = GemmPk::get_workspace_size(args);
+        void* workspace = getCachedWorkspace(workspace_size, stream, WorkspacePool::kScratch);
+        oasr::GraphSafeWorkspace fallback(workspace == nullptr ? workspace_size : 0, stream);
+        if (workspace == nullptr) {
+            workspace = fallback.get();
+        }
 
-        status = gemm_op.initialize(args, workspace.get(), stream);
-        if (status != cutlass::Status::kSuccess) {
+        if (gemm_op.initialize(args, workspace) != cutlass::Status::kSuccess) {
             return GemmStatus::INTERNAL_ERROR;
         }
-
-        status = gemm_op(stream);
-        if (status != cutlass::Status::kSuccess) {
+        if (gemm_op.run(stream) != cutlass::Status::kSuccess) {
             return GemmStatus::CUTLASS_ERROR;
         }
-
         return GemmStatus::SUCCESS;
     }
 };
