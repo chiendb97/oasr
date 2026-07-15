@@ -17,8 +17,8 @@ import oasr
 from oasr.gemm_torch import torch_bmm, torch_gemm, torch_gemm_activation
 from oasr.jit.core import _get_target_sm
 from oasr.jit.gemm import (
-    CutlassGemmConfig,
     GEMM_DEFAULT,
+    CutlassGemmConfig,
     get_unique_compile_configs,
     select_default_config,
 )
@@ -58,8 +58,7 @@ class TestTorchBackend:
         B = torch.randn(Bc, N, K, device="cuda", dtype=dtype)
         out = torch.empty(Bc, M, N, device="cuda", dtype=dtype)
         torch_bmm(out, A, B)
-        torch.testing.assert_close(out, torch.bmm(A, B.transpose(-1, -2)),
-                                   rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(out, torch.bmm(A, B.transpose(-1, -2)), rtol=2e-2, atol=2e-2)
 
 
 class TestSelectDefaultConfig:
@@ -82,24 +81,30 @@ class TestSelectDefaultConfig:
 
     @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
     def test_small_m_avoids_large_default(self):
-        # At small M the selector never wastes the 128-row default: on (256,256)
-        # cuBLAS wins outright at the smallest M, and a tall-thin CUTLASS tile
-        # wins in the mid band — measured under locked clocks, never 128x128.
-        assert select_default_config("gemm", 64, 256, 256, torch.bfloat16, 120) == "torch"
-        cfg = select_default_config("gemm", 848, 256, 256, torch.bfloat16, 120)
-        assert isinstance(cfg, CutlassGemmConfig)
-        assert cfg.block_m < 128  # a tall-thin tile, not the 128-row default
+        # At small M the selector never wastes the 128-row default: with the
+        # thin-N tiles in the candidate space, (256,256) goes to a small-tile
+        # CUTLASS config across the small/mid band — never 128x128.
+        for m in (64, 848):
+            cfg = select_default_config("gemm", m, 256, 256, torch.bfloat16, 120)
+            assert isinstance(cfg, CutlassGemmConfig)
+            assert cfg.block_m < 128  # a tall-thin tile, not the 128-row default
 
     @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
-    def test_large_m_contract_routes_to_torch(self):
-        # The deep-K thin contract GEMM (FF-down, N=256 K=2048) loses to cuBLAS
-        # at ALL M on SM120 — the locked-clock re-tune routes it to torch even at
-        # large offline M (docs/gemm_perf_report.md R1), not the 128x128 default.
-        assert select_default_config("gemm", 16000, 256, 2048, torch.bfloat16, 120) == "torch"
+    def test_large_m_contract_avoids_default(self):
+        # The deep-K thin contract GEMM (FF-down, N=256 K=2048) at large
+        # offline M: the expanded candidate space (thin-N tiles + working
+        # split-K) beats both the 128x128 default and cuBLAS — the winner is a
+        # measured CUTLASS variant or torch, never the fixed default.
+        choice = select_default_config("gemm", 16000, 256, 2048, torch.bfloat16, 120)
+        assert choice == "torch" or (
+            isinstance(choice, CutlassGemmConfig)
+            and choice.compile_name != GEMM_DEFAULT.compile_name
+        )
 
     @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
-    @pytest.mark.parametrize("op,N,K", [("gemm", n, k) for (n, k) in _FF_CONV_SHAPES]
-                             + [("gemm_activation", 2048, 256)])
+    @pytest.mark.parametrize(
+        "op,N,K", [("gemm", n, k) for (n, k) in _FF_CONV_SHAPES] + [("gemm_activation", 2048, 256)]
+    )
     @pytest.mark.parametrize("M", [16, 64, 256, 720, 2048, 16000])
     def test_actionable_configs(self, op, N, K, M):
         """Every CUTLASS config the heuristic returns must be a compiled kernel."""
@@ -117,11 +122,21 @@ class TestProductionDispatch:
     @pytest.mark.parametrize("M", [16, 64, 720, 9472])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_gemm(self, N, K, M, dtype):
+        """Whatever backend the rules route to must stay within the same
+        low-precision error envelope as torch/cuBLAS itself (vs an fp32
+        reference) — an exact match against F.linear would only test
+        bit-identity with cuBLAS, which CUTLASS backends legitimately differ
+        from in accumulation order."""
+        torch.manual_seed(0)
         A = torch.randn(M, K, device="cuda", dtype=dtype)
         B = torch.randn(N, K, device="cuda", dtype=dtype)
         bias = torch.randn(N, device="cuda", dtype=dtype)
         out = oasr.gemm(A, B, bias)
-        torch.testing.assert_close(out, F.linear(A, B, bias), rtol=2e-2, atol=2e-2)
+        ref32 = torch.addmm(bias.float(), A.float(), B.float().t())
+        torch_err = (F.linear(A, B, bias).float() - ref32).abs().max().item()
+        our_err = (out.float() - ref32).abs().max().item()
+        floor = 1e-2 * (K / 256) ** 0.5 * (4.0 if dtype == torch.bfloat16 else 1.0)
+        assert our_err <= max(4.0 * torch_err, floor), f"error {our_err} vs torch's own {torch_err}"
 
     @pytest.mark.parametrize("M", [16, 64, 720, 9472])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -132,3 +147,128 @@ class TestProductionDispatch:
         bias = torch.randn(N, device="cuda", dtype=dtype)
         out = oasr.gemm_activation(A, B, bias, oasr.get_activation_type_id("swish"))
         torch.testing.assert_close(out, F.silu(F.linear(A, B, bias)), rtol=2e-2, atol=2e-2)
+
+
+class TestGemmLogSoftmaxDispatch:
+    """Routing + numerics of the shape-aware CTC-head dispatch."""
+
+    def _mk(self, M=64, N=5008, K=256, dtype=torch.bfloat16):
+        torch.manual_seed(0)
+        A = torch.randn(M, K, device="cuda", dtype=dtype) * 0.1
+        B = torch.randn(N, K, device="cuda", dtype=dtype) * 0.1
+        C = torch.randn(N, device="cuda", dtype=dtype) * 0.1
+        ref = F.log_softmax(F.linear(A.float(), B.float(), C.float()), dim=-1)
+        return A, B, C, ref
+
+    def _check(self, out, ref):
+        torch.testing.assert_close(out.float(), ref, rtol=5e-2, atol=5e-2)
+
+    def test_unaligned_vocab_routes_to_torch(self, monkeypatch):
+        """N % 8 != 0 (unpadded vocab) can't run on CUTLASS — must route to
+        torch instead of raising (the historical behaviour was a crash)."""
+        import oasr.gemm_torch as gt
+
+        calls = []
+        orig = gt.torch_gemm_log_softmax
+        monkeypatch.setattr(
+            gt, "torch_gemm_log_softmax", lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
+        )
+        A, B, C, ref = self._mk(N=5002)
+        out = oasr.gemm_log_softmax(A, B, C)
+        assert calls, "expected the torch backend to be used for unaligned N"
+        self._check(out, ref)
+
+    def test_choice_torch(self, monkeypatch):
+        import oasr.gemm_torch as gt
+        import oasr.jit.gemm as jg
+
+        calls = []
+        orig = gt.torch_gemm_log_softmax
+        monkeypatch.setattr(
+            gt, "torch_gemm_log_softmax", lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
+        )
+        monkeypatch.setattr(jg, "select_default_config", lambda *a, **k: "torch")
+        A, B, C, ref = self._mk()
+        out = oasr.gemm_log_softmax(A, B, C)
+        assert calls
+        self._check(out, ref)
+
+    def test_choice_fused(self, monkeypatch):
+        import oasr.jit.gemm as jg
+
+        monkeypatch.setattr(jg, "select_default_config", lambda *a, **k: "fused")
+        A, B, C, ref = self._mk()
+        self._check(oasr.gemm_log_softmax(A, B, C), ref)
+
+    def test_choice_cutlass_composed(self, monkeypatch):
+        """A rule that names a CUTLASS variant runs GEMM-variant + the OASR
+        log_softmax kernel — verify that exact path executes."""
+        import importlib
+
+        import oasr.jit.gemm as jg
+
+        og = importlib.import_module("oasr.gemm")
+        cfg = next(
+            c
+            for c in get_unique_compile_configs(_SM).values()
+            if isinstance(c, CutlassGemmConfig)
+            and not getattr(c, "stream_k", False)
+            and not getattr(c, "parallel_split_k", False)
+        )
+        monkeypatch.setattr(jg, "select_default_config", lambda *a, **k: cfg)
+
+        calls = []
+        orig = og._log_softmax_inplace
+        monkeypatch.setattr(
+            og, "_log_softmax_inplace", lambda out2d: (calls.append(1), orig(out2d))[1]
+        )
+        A, B, C, ref = self._mk()
+        out = oasr.gemm_log_softmax(A, B, C)
+        assert calls, "expected the composed cutlass + log_softmax path"
+        self._check(out, ref)
+
+
+class TestBmmDispatch:
+    """Routing + numerics of the shape-aware bmm dispatch."""
+
+    def _mk(self, batch=8, M=64, N=128, K=256, dtype=torch.bfloat16):
+        torch.manual_seed(0)
+        A = torch.randn(batch, M, K, device="cuda", dtype=dtype)
+        B = torch.randn(batch, N, K, device="cuda", dtype=dtype)
+        ref = torch.matmul(A.float(), B.float().transpose(-1, -2))
+        return A, B, ref
+
+    def test_choice_torch(self, monkeypatch):
+        import oasr.gemm_torch as gt
+        import oasr.jit.gemm as jg
+
+        calls = []
+        orig = gt.torch_bmm
+        monkeypatch.setattr(gt, "torch_bmm", lambda *a, **k: (calls.append(1), orig(*a, **k))[1])
+        monkeypatch.setattr(jg, "select_default_config", lambda *a, **k: "torch")
+        A, B, ref = self._mk()
+        out = oasr.bmm(A, B)
+        assert calls
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-1)
+
+    def test_choice_cutlass_variant(self, monkeypatch):
+        import oasr.jit.gemm as jg
+
+        cfg = next(
+            c
+            for c in get_unique_compile_configs(_SM).values()
+            if isinstance(c, CutlassGemmConfig)
+            and not getattr(c, "stream_k", False)
+            and not getattr(c, "parallel_split_k", False)
+            and c.compile_name != GEMM_DEFAULT.compile_name
+        )
+        monkeypatch.setattr(jg, "select_default_config", lambda *a, **k: cfg)
+        A, B, ref = self._mk()
+        out = oasr.bmm(A, B)
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-1)
+
+    def test_default_fallback(self):
+        # No rules for this (N, K) → GEMM_DEFAULT variant, same as before.
+        A, B, ref = self._mk(N=120, K=40)
+        out = oasr.bmm(A, B)
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-1)

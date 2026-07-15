@@ -11,9 +11,9 @@ import itertools
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Union
-from .core import gen_jit_spec, _get_target_sm, JitSpec
-from . import env
 
+from . import env
+from .core import JitSpec, _get_target_sm, gen_jit_spec
 
 # =============================================================================
 # Tile configuration helpers (SM<90)
@@ -23,6 +23,7 @@ from . import env
 @dataclass(frozen=True)
 class TileShape:
     """A CUTLASS tile configuration for GEMM or Conv2D (SM<90)."""
+
     block_m: int
     block_n: int
     block_k: int
@@ -34,6 +35,7 @@ class TileShape:
 @dataclass(frozen=True)
 class TileShapeSm90:
     """Legacy SM90 tile shape; retained for external callers."""
+
     BM: int
     BN: int
     BK: int
@@ -42,6 +44,7 @@ class TileShapeSm90:
 @dataclass(frozen=True)
 class ClusterShape:
     """Legacy cluster shape; retained for external callers."""
+
     CM: int
     CN: int
     CK: int
@@ -63,7 +66,13 @@ class CutlassGemmConfig:
         encoded in ``compile_name`` (same binary serves all split-k factors)
         but IS included in ``name`` and ``to_tactic_config`` so the autotuner
         can explore and cache results per split-k value.
+      - ``parallel_split_k`` selects the ``GemmSplitKParallel`` decomposition
+        (compile-time): fp32 partials + a reduction kernel that applies the
+        epilogue once.  Valid for fused activations (unlike serial split-K,
+        which nests the activation per K-partition and is rejected by the
+        kernel); the runtime ``split_k`` factor must be > 1.
     """
+
     block_m: int
     block_n: int
     block_k: int
@@ -72,8 +81,9 @@ class CutlassGemmConfig:
     warp_k: int
     kStages: int
     kSmVersion: int
-    split_k: int = 1          # runtime split-K factor (1 = disabled)
-    stream_k: bool = False    # Stream-K decomposition (compile-time; thin-GEMM fill)
+    split_k: int = 1  # runtime split-K factor (1 = disabled)
+    stream_k: bool = False  # Stream-K decomposition (compile-time; thin-GEMM fill)
+    parallel_split_k: bool = False  # GemmSplitKParallel (compile-time; deep-K thin fill)
 
     @property
     def name(self) -> str:
@@ -86,15 +96,18 @@ class CutlassGemmConfig:
             parts.append(f"spk{self.split_k}")
         if self.stream_k:
             parts.append("sk")
+        if self.parallel_split_k:
+            parts.append("pk")
         return "_".join(parts)
 
     @property
     def compile_name(self) -> str:
         """Config name used as the compiled binary key.
 
-        Encodes tile shape, warp shape, kStages, and the Stream-K flag (all
-        compile-time template parameters).  Excludes ``split_k`` (runtime
-        argument) so variants differing only in split-K share a single ``.so``.
+        Encodes tile shape, warp shape, kStages, and the Stream-K / parallel
+        split-K flags (all compile-time template parameters).  Excludes
+        ``split_k`` (runtime argument) so variants differing only in split-K
+        share a single ``.so``.
         """
         parts = [f"sm{self.kSmVersion}"]
         parts.append(f"b{self.block_m}x{self.block_n}x{self.block_k}")
@@ -102,6 +115,8 @@ class CutlassGemmConfig:
         parts.append(f"s{self.kStages}")
         if self.stream_k:
             parts.append("sk")
+        if self.parallel_split_k:
+            parts.append("pk")
         return "_".join(parts)
 
     @property
@@ -120,6 +135,7 @@ class CutlassGemmConfig:
             ("kStages", self.kStages),
             ("split_k", self.split_k),
             ("stream_k", int(self.stream_k)),
+            ("parallel_split_k", int(self.parallel_split_k)),
         ]
         return tuple(items)
 
@@ -139,19 +155,20 @@ class CutlassGemmConfigSm90:
       ``max_swizzle_size``                   —  Shared-memory swizzle bound
       ``use_tma_gather``                     —  TMA gather for A (SM100 only)
     """
+
     tile_m: int
     tile_n: int
-    tile_k: int              # 128 for SM90/SM120 (WGMMA width)
+    tile_k: int  # 128 for SM90/SM120 (WGMMA width)
     cluster_m: int
     cluster_n: int
-    pingpong: bool           # True = Pingpong, False = Cooperative (SM90/SM120)
+    pingpong: bool  # True = Pingpong, False = Cooperative (SM90/SM120)
     is_dynamic_persistent: bool  # Dynamic persistent / CLC scheduler (SM100)
-    swap_ab: bool            # Swap A and B operands
-    max_swizzle_size: int    # Max swizzle size for SMEM layout
-    use_tma_gather: bool     # TMA gather for A (SM100 only)
-    kSMs: int                # 1 or 2 (SM100 only; always 1 for SM90/SM120)
-    kStages: int             # Pipeline stages (typically 3)
-    kSmVersion: int          # 90, 100, or 120
+    swap_ab: bool  # Swap A and B operands
+    max_swizzle_size: int  # Max swizzle size for SMEM layout
+    use_tma_gather: bool  # TMA gather for A (SM100 only)
+    kSMs: int  # 1 or 2 (SM100 only; always 1 for SM90/SM120)
+    kStages: int  # Pipeline stages (typically 3)
+    kSmVersion: int  # 90, 100, or 120
 
     @property
     def name(self) -> str:
@@ -213,23 +230,34 @@ class CutlassGemmConfigSm90:
 # Retained for backward compatibility (conv.py and external callers).
 # Internal config generation uses the per-SM functions below.
 TileShapeConfigs: List[TileShape] = [
-    TileShape(block_m=16,  block_n=128, block_k=64, warp_m=16,  warp_n=32, warp_k=64),
-    TileShape(block_m=128, block_n=16,  block_k=64, warp_m=32,  warp_n=16, warp_k=64),
-    TileShape(block_m=32,  block_n=128, block_k=64, warp_m=32,  warp_n=32, warp_k=64),
-    TileShape(block_m=128, block_n=32,  block_k=64, warp_m=32,  warp_n=32, warp_k=64),
-    TileShape(block_m=64,  block_n=128, block_k=64, warp_m=32,  warp_n=64, warp_k=64),
-    TileShape(block_m=128, block_n=64,  block_k=64, warp_m=64,  warp_n=32, warp_k=64),
-    TileShape(block_m=64,  block_n=128, block_k=64, warp_m=64,  warp_n=32, warp_k=64),
-    TileShape(block_m=128, block_n=64,  block_k=64, warp_m=64,  warp_n=32, warp_k=64),
-    TileShape(block_m=128, block_n=128, block_k=64, warp_m=64,  warp_n=32, warp_k=64),
-    TileShape(block_m=128, block_n=128, block_k=64, warp_m=64,  warp_n=64, warp_k=64),
+    TileShape(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=128, block_n=16, block_k=64, warp_m=32, warp_n=16, warp_k=64),
+    TileShape(block_m=32, block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64),
+    TileShape(block_m=128, block_n=32, block_k=64, warp_m=32, warp_n=32, warp_k=64),
+    TileShape(block_m=64, block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64),
+    TileShape(block_m=128, block_n=64, block_k=64, warp_m=64, warp_n=32, warp_k=64),
+    TileShape(block_m=64, block_n=128, block_k=64, warp_m=64, warp_n=32, warp_k=64),
+    TileShape(block_m=128, block_n=64, block_k=64, warp_m=64, warp_n=32, warp_k=64),
+    TileShape(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=32, warp_k=64),
+    TileShape(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=64, warp_k=64),
     TileShape(block_m=128, block_n=128, block_k=64, warp_m=128, warp_n=32, warp_k=64),
-    TileShape(block_m=128, block_n=256, block_k=64, warp_m=64,  warp_n=64, warp_k=64),
-    TileShape(block_m=256, block_n=128, block_k=64, warp_m=64,  warp_n=64, warp_k=64),
-    TileShape(block_m=16,  block_n=256, block_k=64, warp_m=16,  warp_n=64, warp_k=64),
-    TileShape(block_m=256, block_n=16,  block_k=64, warp_m=64,  warp_n=16, warp_k=64),
+    TileShape(block_m=128, block_n=256, block_k=64, warp_m=64, warp_n=64, warp_k=64),
+    TileShape(block_m=256, block_n=128, block_k=64, warp_m=64, warp_n=64, warp_k=64),
+    TileShape(block_m=16, block_n=256, block_k=64, warp_m=16, warp_n=64, warp_k=64),
+    TileShape(block_m=256, block_n=16, block_k=64, warp_m=64, warp_n=16, warp_k=64),
 ]
 
+
+# Extra thin-N tiles for the GEMM families (not shared with conv2d, which
+# imports TileShapeConfigs above).  ASR encoder GEMMs are output-thin
+# (N=256/512): block_n=64 quadruples the column-tile count vs the 128/256-wide
+# tiles, which — combined with split-K — is what lets CUTLASS fill the GPU on
+# small-M shapes where cuBLAS's bespoke thin kernels used to win.
+GemmExtraTileConfigs: List[TileShape] = [
+    TileShape(block_m=16, block_n=64, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=32, block_n=64, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=64, block_n=64, block_k=64, warp_m=32, warp_n=32, warp_k=64),
+]
 
 # =============================================================================
 # SM<90 config generation — SMEM-analysed per-SM tile × warp × stage × split_k
@@ -248,10 +276,10 @@ def _smem_bytes(BM: int, BN: int, BK: int, kStages: int, dtype_bytes: int = 2) -
 # Maximum shared memory per threadblock per architecture (bytes).
 # CUTLASS 2.x opts in to the maximum via cudaFuncSetAttribute at runtime.
 _SM_MAX_SMEM_BYTES: Dict[int, int] = {
-    75: 64  * 1024,   # Turing
-    80: 164 * 1024,   # Ampere A100
-    86: 100 * 1024,   # Ampere RTX 30-series
-    89: 100 * 1024,   # Ada Lovelace
+    75: 64 * 1024,  # Turing
+    80: 164 * 1024,  # Ampere A100
+    86: 100 * 1024,  # Ampere RTX 30-series
+    89: 100 * 1024,  # Ada Lovelace
     # SM120 (GeForce Blackwell / RTX 50 series) — CUTLASS 3.x SM120 TMA builder
     # is F8F6F4-only, so FP16/BF16 GEMM on SM120 falls back to the CUTLASS 2.x
     # path using the Sm80 tensor-op specialisations (see CutlassArch<120>).
@@ -271,12 +299,14 @@ def _build_sm_lt90_configs(
 
     Iterates over the provided ``tiles`` (``TileShape`` instances from
     ``TileShapeConfigs``), expanding across ``stage_list`` and ``split_k_list``.
-    Two constraints are applied:
+    Three constraints are applied:
 
     1. **SMEM fit** — kStages×(block_m+block_n)×block_k×dtype_bytes ≤ smem_limit.
        Software-pipelined operand buffers must fit in shared memory.
     2. **split_k applicability** — split_k>1 is only registered when
        block_m≤128 and block_n≤128 (shapes likely to be K-bound).
+    3. **deep split_k** — split_k>4 only for block_m≤64 tiles (deep K-splits
+       exist to fill the GPU on small-M shapes; large-M tiles never need them).
 
     Divisibility and warp-count validity are guaranteed by ``TileShapeConfigs``.
 
@@ -294,9 +324,16 @@ def _build_sm_lt90_configs(
                 # 2. split_k applicability
                 if split_k > 1 and (tile.block_m > 128 or tile.block_n > 128):
                     continue
+                # 3. deep split_k only for small-M tiles
+                if split_k > 4 and tile.block_m > 64:
+                    continue
                 cfg = CutlassGemmConfig(
-                    block_m=tile.block_m, block_n=tile.block_n, block_k=tile.block_k,
-                    warp_m=tile.warp_m, warp_n=tile.warp_n, warp_k=tile.warp_k,
+                    block_m=tile.block_m,
+                    block_n=tile.block_n,
+                    block_k=tile.block_k,
+                    warp_m=tile.warp_m,
+                    warp_n=tile.warp_n,
+                    warp_k=tile.warp_k,
                     kStages=kStages,
                     kSmVersion=sm,
                     split_k=split_k,
@@ -307,24 +344,34 @@ def _build_sm_lt90_configs(
     return seen
 
 
+# Tiles used by the GEMM families on the CUTLASS 2.x path: the conv2d-shared
+# base set plus the thin-N extras.
+_GEMM_TILES: List[TileShape] = TileShapeConfigs + GemmExtraTileConfigs
+
+# Runtime split-K ladder.  Deep factors ({8, 16}) matter on small-M deep-K
+# shapes (one M-tile row, few output tiles); the applicability constraints in
+# ``_build_sm_lt90_configs`` confine them to block_m ≤ 64 tiles.
+_SPLIT_K_LIST = [1, 2, 4, 8, 16]
+
+
 def _get_sm75_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
-    """SM75 (Turing): kStages ∈ {2,3}, split_k ∈ {1,2,4}, tiles from TileShapeConfigs."""
-    return _build_sm_lt90_configs(sm, TileShapeConfigs, [2, 3], [1, 2, 4], _SM_MAX_SMEM_BYTES[75])
+    """SM75 (Turing): kStages ∈ {2,3}, tiles from _GEMM_TILES."""
+    return _build_sm_lt90_configs(sm, _GEMM_TILES, [2, 3], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[75])
 
 
 def _get_sm80_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
-    """SM80 (Ampere A100): kStages ∈ {3,4}, split_k ∈ {1,2,4}, tiles from TileShapeConfigs."""
-    return _build_sm_lt90_configs(sm, TileShapeConfigs, [3, 4], [1, 2, 4], _SM_MAX_SMEM_BYTES[80])
+    """SM80 (Ampere A100): kStages ∈ {3,4}, tiles from _GEMM_TILES."""
+    return _build_sm_lt90_configs(sm, _GEMM_TILES, [3, 4], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[80])
 
 
 def _get_sm86_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
-    """SM86 (Ampere RTX 30-series): kStages=3, split_k ∈ {1,2,4}, tiles from TileShapeConfigs."""
-    return _build_sm_lt90_configs(sm, TileShapeConfigs, [3], [1, 2, 4], _SM_MAX_SMEM_BYTES[86])
+    """SM86 (Ampere RTX 30-series): kStages=3, tiles from _GEMM_TILES."""
+    return _build_sm_lt90_configs(sm, _GEMM_TILES, [3], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[86])
 
 
 def _get_sm89_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
-    """SM89 (Ada Lovelace): kStages=3, split_k ∈ {1,2,4}, tiles from TileShapeConfigs."""
-    return _build_sm_lt90_configs(sm, TileShapeConfigs, [3], [1, 2, 4], _SM_MAX_SMEM_BYTES[89])
+    """SM89 (Ada Lovelace): kStages=3, tiles from _GEMM_TILES."""
+    return _build_sm_lt90_configs(sm, _GEMM_TILES, [3], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[89])
 
 
 # =============================================================================
@@ -343,18 +390,24 @@ def _get_sm90_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
 
     # Cooperative (non-pingpong) tile shapes
     tile_mn_coop = [
-        (256, 128), (256, 160), (256, 192), (256, 208),
-        (128, 224), (128, 256),
+        (256, 128),
+        (256, 160),
+        (256, 192),
+        (256, 208),
+        (128, 224),
+        (128, 256),
     ]
     # Pingpong tile shapes
     tile_mn_pingpong = [
-        (128, 128), (128, 160), (128, 192), (128, 208),
+        (128, 128),
+        (128, 160),
+        (128, 192),
+        (128, 208),
         (192, 128),
     ]
-    tile_mn_vals = (
-        [(m, n, False) for m, n in tile_mn_coop] +
-        [(m, n, True) for m, n in tile_mn_pingpong]
-    )
+    tile_mn_vals = [(m, n, False) for m, n in tile_mn_coop] + [
+        (m, n, True) for m, n in tile_mn_pingpong
+    ]
     cluster_vals = [(1, 2), (2, 1)]
 
     seen: Dict[str, CutlassGemmConfigSm90] = {}
@@ -441,9 +494,9 @@ _STREAMK_ENABLED = os.environ.get("OASR_GEMM_STREAMK", "1") != "0"
 # output tiles to fill the GPU (small M, N=256, large K), so we cover small
 # block_m tiles plus a couple of large tiles for the single-output-tile case.
 _STREAMK_TILES: List[TileShape] = [
-    TileShape(block_m=16,  block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64),
-    TileShape(block_m=32,  block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64),
-    TileShape(block_m=64,  block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64),
+    TileShape(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=32, block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64),
+    TileShape(block_m=64, block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64),
     TileShape(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=64, warp_k=64),
     TileShape(block_m=128, block_n=256, block_k=64, warp_m=64, warp_n=64, warp_k=64),
 ]
@@ -459,11 +512,63 @@ def _build_streamk_configs(
             if _smem_bytes(tile.block_m, tile.block_n, tile.block_k, kStages) > smem_limit:
                 continue
             cfg = CutlassGemmConfig(
-                block_m=tile.block_m, block_n=tile.block_n, block_k=tile.block_k,
-                warp_m=tile.warp_m, warp_n=tile.warp_n, warp_k=tile.warp_k,
-                kStages=kStages, kSmVersion=sm, split_k=1, stream_k=True,
+                block_m=tile.block_m,
+                block_n=tile.block_n,
+                block_k=tile.block_k,
+                warp_m=tile.warp_m,
+                warp_n=tile.warp_n,
+                warp_k=tile.warp_k,
+                kStages=kStages,
+                kSmVersion=sm,
+                split_k=1,
+                stream_k=True,
             )
             seen[cfg.name] = cfg
+    return seen
+
+
+# Parallel split-K (GemmSplitKParallel) variants: partials + reduction kernel,
+# epilogue applied once post-reduction — the only split-K decomposition that is
+# valid for fused activations.  Confined to the gemm family (like Stream-K).
+# Set OASR_GEMM_SPLITK_PARALLEL=0 to skip compiling these variants.
+_SPLITK_PARALLEL_ENABLED = os.environ.get("OASR_GEMM_SPLITK_PARALLEL", "1") != "0"
+
+# Curated tiles for parallel split-K: small block_m (the deep splits exist for
+# small-M shapes) across the thin-N and 128-wide column tiles.
+_SPLITK_PARALLEL_TILES: List[TileShape] = [
+    TileShape(block_m=16, block_n=64, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=32, block_n=64, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=64, block_n=64, block_k=64, warp_m=32, warp_n=32, warp_k=64),
+    TileShape(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=32, block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64),
+]
+
+
+def _build_splitk_parallel_configs(
+    sm: int, tiles: List[TileShape], stage_list: List[int], smem_limit: int
+) -> Dict[str, CutlassGemmConfig]:
+    """Build parallel split-K GEMM configs (runtime split_k ∈ {2,4,8,16})."""
+    seen: Dict[str, CutlassGemmConfig] = {}
+    for tile in tiles:
+        for kStages in stage_list:
+            if _smem_bytes(tile.block_m, tile.block_n, tile.block_k, kStages) > smem_limit:
+                continue
+            for split_k in _SPLIT_K_LIST:
+                if split_k == 1:
+                    continue  # parallel split-K requires > 1 slices
+                cfg = CutlassGemmConfig(
+                    block_m=tile.block_m,
+                    block_n=tile.block_n,
+                    block_k=tile.block_k,
+                    warp_m=tile.warp_m,
+                    warp_n=tile.warp_n,
+                    warp_k=tile.warp_k,
+                    kStages=kStages,
+                    kSmVersion=sm,
+                    split_k=split_k,
+                    parallel_split_k=True,
+                )
+                seen[cfg.name] = cfg
     return seen
 
 
@@ -474,12 +579,19 @@ def _get_sm120_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
     FP16/BF16 GEMM on SM120 is routed through the CUTLASS 2.x tensor-op path
     using the Sm80 forward-compatible instructions (mma.sync.aligned.m16n8k16).
 
-    Also includes Stream-K variants (gemm family only — see ``_render_all_variants``
-    and the backend registration, which confine Stream-K configs to GEMM).
+    Also includes Stream-K and parallel split-K variants (gemm family only —
+    see ``_render_all_variants`` and the backend registration, which confine
+    them to GEMM).
     """
-    cfgs = _build_sm_lt90_configs(sm, TileShapeConfigs, [3, 4], [1, 2, 4], _SM_MAX_SMEM_BYTES[120])
+    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [3, 4], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[120])
     if _STREAMK_ENABLED:
         cfgs.update(_build_streamk_configs(sm, _STREAMK_TILES, [3], _SM_MAX_SMEM_BYTES[120]))
+    if _SPLITK_PARALLEL_ENABLED:
+        cfgs.update(
+            _build_splitk_parallel_configs(
+                sm, _SPLITK_PARALLEL_TILES, [3, 4], _SM_MAX_SMEM_BYTES[120]
+            )
+        )
     return cfgs
 
 
@@ -551,17 +663,20 @@ def _render_all_variants(
     Returns:
         List of Path objects for the rendered ``.cu`` files.
     """
-    from .templates import render_template
     from .cubin_loader import write_if_different
+    from .templates import render_template
 
     sm = _get_target_sm()
     unique_configs = get_unique_compile_configs(sm)
     source_paths = []
 
     for config_name, cfg in unique_configs.items():
-        # Stream-K is implemented in the GEMM template only; skip SK configs for
-        # bmm / group_gemm (their templates have no Stream-K path).
-        if family != "gemm" and getattr(cfg, "stream_k", False):
+        # Stream-K and parallel split-K are implemented in the GEMM template
+        # only; skip those configs for bmm / group_gemm (their templates have
+        # no Stream-K / parallel split-K path).
+        if family != "gemm" and (
+            getattr(cfg, "stream_k", False) or getattr(cfg, "parallel_split_k", False)
+        ):
             continue
 
         func_name = f"{family}_{config_name}"
@@ -581,6 +696,7 @@ def _render_all_variants(
                 stages=cfg.kStages,
                 sm_version=sm,
                 stream_k=getattr(cfg, "stream_k", False),
+                parallel_split_k=getattr(cfg, "parallel_split_k", False),
                 with_activation=with_activation,
             )
         else:
@@ -704,7 +820,14 @@ if _sm < 90 or _sm == 120:
     # SM120 uses the CUTLASS 2.x (SM<90) path for FP16/BF16 — see
     # ``_get_sm120_configs`` above.
     GEMM_DEFAULT: Union[CutlassGemmConfig, CutlassGemmConfigSm90] = CutlassGemmConfig(
-        block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=64, warp_k=64, kStages=3, kSmVersion=_sm
+        block_m=128,
+        block_n=128,
+        block_k=64,
+        warp_m=64,
+        warp_n=64,
+        warp_k=64,
+        kStages=3,
+        kSmVersion=_sm,
     )
 else:
     GEMM_DEFAULT = CutlassGemmConfigSm90(
@@ -743,35 +866,332 @@ else:
 #     python scripts/tune_asr_gemm.py --mode capture --shapes shapes.json \
 #         --gpu <uuid> --emit-rules rules.py
 #
-# Regenerated 2026-06-29 under LOCKED clocks (GPU-03584f13, RTX 5090/SM120) from a
-# fresh offline+streaming engine capture (scripts/tune_asr_gemm.py).  Key change vs
-# the prior table: the deep-K thin contract GEMMs (N=256, K∈{2048,4864} and the
-# 512×256 / gemm_activation catch-alls) now route to cuBLAS for ALL large M — the
-# old table fell through to GEMM_DEFAULT (128×128) above m_max=1024, which loses
-# 1.10–1.32× to cuBLAS on the offline batched shapes (docs/gemm_perf_report.md R1).
+# Regenerated 2026-07-14 under LOCKED clocks (GPU-03584f13, RTX 5090/SM120) from a
+# fresh offline+streaming engine capture, over the EXPANDED candidate space:
+# thin-N 16/32/64x64 tiles, working serial split-K (single-launch via the
+# pre-zeroed persistent semaphore workspace), parallel split-K ("pk",
+# GemmSplitKParallel), Stream-K, and the composed / fused / torch backends for
+# the CTC head ("gemm_log_softmax": "fused" = the legacy single-call launcher).
+# Key changes vs the 2026-06-29 table: CUTLASS now wins most cells outright —
+# the thin-N tiles take the K=256 shapes at every M (1.2-2.0x vs default), the
+# deep-K contract GEMMs split between torch and pk/Stream-K/serial-split-K
+# variants, and the CTC head leaves the fixed 16x128 fused tile above M=64
+# (up to 1.8x at offline M).
 _GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
     ("gemm", 256, 256): [
-        (512, "torch"),  # M~416: torch 0.0061ms (2.00x vs default)
-        (1024, CutlassGemmConfig(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64, kStages=4, kSmVersion=120, split_k=1)),  # M~848: cutlass 0.0062ms (1.97x vs default)
+        (
+            512,
+            CutlassGemmConfig(
+                block_m=16,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~416: cutlass 0.0061ms (2.00x vs default)
+        (
+            1024,
+            CutlassGemmConfig(
+                block_m=16,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=4,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~896: cutlass 0.0062ms (1.99x vs default)
+        (
+            2048,
+            CutlassGemmConfig(
+                block_m=32,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~1992: cutlass 0.0082ms (1.50x vs default)
         (None, "torch"),  # M~15872: torch 0.0205ms (1.10x vs default)
     ],
     ("gemm", 256, 2048): [
-        (None, "torch"),  # M~15872: torch 0.0920ms (1.18x vs default)
+        (64, "torch"),  # M~48: torch 0.0082ms (6.25x vs default)
+        (
+            128,
+            CutlassGemmConfig(
+                block_m=32,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=4,
+                kSmVersion=120,
+                split_k=8,
+                parallel_split_k=True,
+            ),
+        ),  # M~128: cutlass 0.0088ms (5.84x vs default)
+        (512, "torch"),  # M~416: torch 0.0102ms (5.00x vs default)
+        (
+            1024,
+            CutlassGemmConfig(
+                block_m=32,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=4,
+                kSmVersion=120,
+                split_k=2,
+            ),
+        ),  # M~896: cutlass 0.0143ms (3.57x vs default)
+        (
+            2048,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=64,
+                block_k=64,
+                warp_m=32,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=2,
+            ),
+        ),  # M~1992: cutlass 0.0205ms (2.50x vs default)
+        (
+            None,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=128,
+                block_k=64,
+                warp_m=32,
+                warp_n=64,
+                warp_k=64,
+                kStages=4,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~15872: cutlass 0.0901ms (1.17x vs default)
     ],
     ("gemm", 256, 4864): [
-        (None, "torch"),  # M~15872: torch 0.2007ms (1.32x vs default)
+        (
+            16,
+            CutlassGemmConfig(
+                block_m=16,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=4,
+                kSmVersion=120,
+                split_k=8,
+                parallel_split_k=True,
+            ),
+        ),  # M~16: cutlass 0.0107ms (10.54x vs default)
+        (1024, "torch"),  # M~896: torch 0.0225ms (5.09x vs default)
+        (
+            2048,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=128,
+                block_k=64,
+                warp_m=32,
+                warp_n=64,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+                stream_k=True,
+            ),
+        ),  # M~1992: cutlass 0.0370ms (3.10x vs default)
+        (
+            None,
+            CutlassGemmConfig(
+                block_m=128,
+                block_n=128,
+                block_k=64,
+                warp_m=64,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=2,
+            ),
+        ),  # M~15872: cutlass 0.2112ms (1.25x vs default)
     ],
     ("gemm", 512, 256): [
-        (64, "torch"),  # M~60: torch 0.0061ms (2.00x vs default)
-        (512, CutlassGemmConfig(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64, kStages=4, kSmVersion=120, split_k=1)),  # M~390: cutlass 0.0061ms (2.00x vs default)
-        (1024, CutlassGemmConfig(block_m=32, block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64, kStages=4, kSmVersion=120, split_k=1)),  # M~780: cutlass 0.0078ms (1.58x vs default)
-        (2048, CutlassGemmConfig(block_m=64, block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~1590: cutlass 0.0083ms (1.48x vs default)
-        (None, "torch"),  # M~16768: torch 0.0368ms (1.05x vs default)
+        (
+            1024,
+            CutlassGemmConfig(
+                block_m=16,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~780: cutlass 0.0082ms (1.50x vs default)
+        (
+            2048,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=64,
+                block_k=64,
+                warp_m=32,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~1680: cutlass 0.0082ms (1.49x vs default)
+        (
+            4096,
+            CutlassGemmConfig(
+                block_m=128,
+                block_n=64,
+                block_k=64,
+                warp_m=64,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~2104: cutlass 0.0096ms (1.27x vs default)
+        (16384, "torch"),  # M~10368: torch 0.0205ms (1.10x vs default)
+        (
+            None,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=64,
+                block_k=64,
+                warp_m=32,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~16768: cutlass 0.0348ms (1.12x vs default)
     ],
     ("gemm_activation", 2048, 256): [
-        (256, CutlassGemmConfig(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~160: cutlass 0.0082ms (1.51x vs default)
-        (512, CutlassGemmConfig(block_m=64, block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64, kStages=3, kSmVersion=120, split_k=1)),  # M~416: cutlass 0.0102ms (1.35x vs default)
-        (None, "torch"),  # M~15872: torch 0.1213ms (0.98x vs default)
+        (
+            64,
+            CutlassGemmConfig(
+                block_m=16,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~48: cutlass 0.0062ms (1.98x vs default)
+        (
+            128,
+            CutlassGemmConfig(
+                block_m=16,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=4,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~128: cutlass 0.0062ms (1.98x vs default)
+        (
+            256,
+            CutlassGemmConfig(
+                block_m=16,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~176: cutlass 0.0082ms (1.50x vs default)
+        (
+            512,
+            CutlassGemmConfig(
+                block_m=32,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~416: cutlass 0.0102ms (1.39x vs default)
+        (
+            None,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=64,
+                block_k=64,
+                warp_m=32,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~15872: cutlass 0.1044ms (1.18x vs default)
+    ],
+    ("gemm_log_softmax", 5008, 256): [
+        (64, "fused"),  # M~48: cutlass_fused 0.0102ms (1.00x vs default)
+        (
+            128,
+            CutlassGemmConfig(
+                block_m=32,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~128: cutlass 0.0123ms (1.17x vs default)
+        (
+            None,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=64,
+                block_k=64,
+                warp_m=32,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M~15872: cutlass 0.4054ms (1.80x vs default)
     ],
 }
 
@@ -787,9 +1207,12 @@ _HEURISTIC_ENABLED = os.environ.get("OASR_GEMM_HEURISTIC", "1") != "0"
 def select_default_config(op: str, M: int, N: int, K: int, dtype, sm: int):
     """Pick a GEMM config for the non-autotuned production path.
 
-    Returns a :class:`CutlassGemmConfig`, the string ``"torch"`` (dispatch to
-    cuBLAS), or :data:`GEMM_DEFAULT`.  Pure function of the shape, so it is
-    CUDA-graph safe (same choice on every capture/replay).  Unknown ops/shapes,
+    ``op`` is one of ``"gemm"``, ``"gemm_activation"``, ``"bmm"``, or
+    ``"gemm_log_softmax"``.  Returns a :class:`CutlassGemmConfig`, the string
+    ``"torch"`` (dispatch to cuBLAS), the string ``"fused"`` (the single-call
+    fused CUTLASS launcher — ``gemm_log_softmax`` only), or
+    :data:`GEMM_DEFAULT`.  Pure function of the shape, so it is CUDA-graph
+    safe (same choice on every capture/replay).  Unknown ops/shapes,
     non-SM120 arches, and non-half dtypes fall back to ``GEMM_DEFAULT`` — i.e.
     byte-identical to the previous fixed behaviour.
     """

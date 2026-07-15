@@ -10,9 +10,13 @@ the shape-aware production selector in :mod:`oasr.gemm`, so a tuned ``"torch"``
 tactic dispatches identically in both the autotuning and production paths.
 """
 
+from oasr.gemm_torch import (
+    torch_bmm,
+    torch_gemm,
+    torch_gemm_activation,
+    torch_gemm_log_softmax,
+)
 from oasr.tune.autotuner import BackendEntry, OpKey, Tactic, _global_registry
-from oasr.gemm_torch import torch_bmm, torch_gemm, torch_gemm_activation
-
 
 _global_registry.register(
     OpKey("gemm", "gemm"),
@@ -40,6 +44,16 @@ _global_registry.register(
         tactic=Tactic("torch"),
         is_available=lambda: True,
         get_runner=lambda: torch_bmm,
+        is_fallback=False,
+    ),
+)
+
+_global_registry.register(
+    OpKey("gemm", "gemm_log_softmax"),
+    BackendEntry(
+        tactic=Tactic("torch"),
+        is_available=lambda: True,
+        get_runner=lambda: torch_gemm_log_softmax,
         is_fallback=False,
     ),
 )

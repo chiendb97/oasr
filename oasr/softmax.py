@@ -35,3 +35,27 @@ def softmax(
         out = torch.empty_like(input)
     _get_softmax_module().softmax(out, input)
     return out
+
+
+@oasr_api
+def log_softmax(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Apply log_softmax along the last dimension.
+
+    In-place is supported (``out is input``); the composed
+    ``oasr.gemm_log_softmax`` dispatch path relies on that to normalise the
+    GEMM output buffer without an extra allocation.
+
+    Args:
+        input: Input tensor of any shape [..., num_cols] (CUDA).
+        out: Optional pre-allocated output tensor (same shape as input).
+
+    Returns:
+        Log-softmax values with the same shape as input.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    _get_softmax_module().log_softmax(out, input)
+    return out

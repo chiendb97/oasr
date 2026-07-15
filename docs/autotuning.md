@@ -59,21 +59,34 @@ oasr.disable_autotune()         # saves cache and disables
 
 Autotuning is available for operations backed by CUTLASS tile variants:
 
-| Operation          | Variants | Notes                                          |
-| ------------------ | -------: | ---------------------------------------------- |
-| `gemm`             |      11+ | split-K + Stream-K variants, plus a torch/cuBLAS candidate |
-| `gemm_activation`  |      11+ | Fused GEMM + activation (same candidate set)   |
-| `bmm`              |       9+ | Batched GEMM (no split-K) + torch candidate    |
-| `group_gemm`       |        9 | Grouped GEMM (no split-K)                      |
-| `conv2d`           |        6 | NHWC implicit GEMM                             |
-| `conv2d_activation` |       6 | Fused Conv2D + activation                      |
+| Operation          | Notes                                          |
+| ------------------ | ---------------------------------------------- |
+| `gemm`             | Serial split-K (deep factors up to 16), parallel split-K, Stream-K, thin-N tiles, plus a torch/cuBLAS candidate |
+| `gemm_activation`  | Fused GEMM + activation — serial split-K > 1 excluded (per-partition activation is invalid); parallel split-K variants apply the activation once post-reduction |
+| `gemm_log_softmax` | The CTC head: every GEMM variant composed with the OASR online log_softmax kernel, the legacy single-call fused launcher (`Tactic("cutlass_fused")`, the fallback), and a torch candidate |
+| `bmm`              | Batched GEMM (tile-only; no split-K / Stream-K) + torch candidate |
+| `group_gemm`       | Grouped GEMM (tile-only)                       |
+| `conv2d`           | NHWC implicit GEMM                             |
+| `conv2d_activation` | Fused Conv2D + activation                     |
 
 In addition to the CUTLASS tile variants, the GEMM ops register a **torch/cuBLAS**
-candidate (`Tactic("torch")`) — cuBLAS wins on thin shapes — and, on SM120,
-**Stream-K** variants (`Tactic` configs with `stream_k=1`; `GemmUniversal` +
-`ThreadblockSwizzleStreamK`) that distribute the K-reduction across all SMs to fill
-the GPU on thin/deep-K GEMMs. Stream-K is in the candidate space by default; set
-`OASR_GEMM_STREAMK=0` to exclude it from leaner production builds that never autotune.
+candidate (`Tactic("torch")`) — cuBLAS wins on some thin shapes — and, on SM120,
+two K-decompositions that fill the GPU on thin/deep-K GEMMs where the
+data-parallel grid leaves SMs idle:
+
+* **Stream-K** (`stream_k=1`; `GemmUniversal` + `ThreadblockSwizzleStreamK`) —
+  balances the K-reduction across all SMs with an in-kernel fixup.  Set
+  `OASR_GEMM_STREAMK=0` to exclude from the compile set.
+* **Parallel split-K** (`parallel_split_k=1`; `GemmSplitKParallel`) — fp32
+  partials + a reduction kernel that applies the (possibly activation-fused)
+  epilogue exactly once.  Set `OASR_GEMM_SPLITK_PARALLEL=0` to exclude.
+
+Serial split-K (`split_k > 1` on a plain config) runs as a **single kernel
+launch**: the per-tile semaphores live in a persistent pre-zeroed workspace
+(`include/oasr/common/workspace_cache.h`) and the kernel restores them itself,
+so there is no per-launch allocation or memset (that ritual costs ~4 µs — the
+historical CUTLASS-vs-cuBLAS gap on thin ASR GEMMs).  Set
+`OASR_GEMM_WS_CACHE=0` to fall back to per-call workspaces.
 
 Operations without tile variants (e.g., `depthwise_conv1d`, `layer_norm`)
 are unaffected by autotuning and always use their default kernel.
