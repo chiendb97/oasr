@@ -8,25 +8,25 @@ import logging
 import queue
 import threading
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
-from oasr.models import from_pretrained
-
+from oasr.models import PretrainedModel, load_pretrained
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from .config import EngineConfig
-from .graph_cache import round_up_bucket
-from .input_processor import InputProcessor
-from .model_runner import ModelRunner
-from .output_processor import OutputProcessor
 from .executor import (
     Executor,
     OfflineExecutor,
     StreamingExecutor,
 )
+from .graph_cache import round_up_bucket
+from .input_processor import InputProcessor
+from .model_runner import ModelRunner
+from .output_processor import OutputProcessor
 from .request import Request, RequestOutput
 from .scheduler import Scheduler
 
@@ -90,17 +90,21 @@ class ASREngine:
         dtype = config.dtype
 
         logger.info("Loading model from %s ...", config.ckpt_dir)
-        # ``from_pretrained`` accepts a local checkpoint dir (the common case —
-        # a straight pass-through to ``build_model_from_checkpoint``) or a
-        # HuggingFace Hub repo id, which it downloads first.
-        model, model_config = from_pretrained(
+        # ``load_pretrained`` accepts a local checkpoint dir (the common case —
+        # a straight pass-through to the registry loader) or a HuggingFace Hub
+        # repo id, which it downloads first.  Beyond the model it surfaces the
+        # converter-emitted tokenizer / feature specs, which fill any
+        # engine-config fields the caller left unset.
+        loaded = load_pretrained(
             config.ckpt_dir,
             checkpoint_name=config.checkpoint_name,
             device=device_str,
             dtype=dtype,
         )
+        model, model_config = loaded.model, loaded.config
         self._model = model
         config._model_config = model_config
+        tokenizer = self._apply_checkpoint_specs(config, loaded)
 
         self._device = torch.device(device_str)
         cache_config = config.build_cache_config(model.cache_spec)
@@ -131,7 +135,9 @@ class ASREngine:
         config._decoding_window_override = self._model_runner.decoding_window
         config._stride_override = self._model_runner.stride
 
-        self._output_processor = OutputProcessor(config, decode_type=model.decode_type, model=model)
+        self._output_processor = OutputProcessor(
+            config, decode_type=model.decode_type, model=model, tokenizer=tokenizer
+        )
 
         # Build exactly one executor matching ``config.service_mode``.
         # The other mode's machinery (paged KV cache vs. persistent
@@ -524,6 +530,63 @@ class ASREngine:
         """Remove a request from the engine, freeing cache if allocated."""
         with self._lock:
             self._executor.abort(request_id)
+
+    # ------------------------------------------------------------------
+    # Internal — checkpoint-derived specs (features + tokenizer)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_checkpoint_specs(config: EngineConfig, loaded: PretrainedModel):
+        """Fill engine defaults from the converter-emitted checkpoint specs.
+
+        Explicit ``EngineConfig`` values always win, but a spec-vs-override
+        mismatch logs loudly.  Returns the :class:`oasr.tokenizers.Tokenizer`
+        to inject into the :class:`OutputProcessor` (``None`` → legacy sniffed
+        ``sentencepiece_model`` / ``unit_table`` paths).
+        """
+        spec = loaded.feature_spec
+        if spec is not None:
+            if getattr(config, "_feature_config_explicit", False):
+                diffs = spec.mismatches(config.feature_config)
+                if diffs:
+                    logger.warning(
+                        "Explicit feature_config disagrees with the checkpoint's "
+                        "FeatureSpec (%s); the explicit config wins, but this "
+                        "usually degrades accuracy",
+                        "; ".join(diffs),
+                    )
+            else:
+                config.feature_config = spec.to_feature_config()
+
+        tok_spec = loaded.tokenizer_spec
+        if tok_spec is None:
+            return None
+        if getattr(config, "_tokenizer_paths_explicit", False):
+            spec_table = tok_spec.files.get("table")
+            if (
+                config.unit_table is not None
+                and spec_table is not None
+                and Path(config.unit_table).resolve() != Path(spec_table).resolve()
+            ):
+                logger.warning(
+                    "Explicit unit_table %s differs from the checkpoint's tokenizer "
+                    "spec (%s); the explicit table wins",
+                    config.unit_table,
+                    spec_table,
+                )
+            return None
+        try:
+            from oasr.tokenizers import build_tokenizer
+
+            return build_tokenizer(tok_spec)
+        except Exception as exc:
+            logger.warning(
+                "Could not build tokenizer from checkpoint spec %r (%s); falling "
+                "back to the legacy sniffed detokenizer paths",
+                tok_spec.kind,
+                exc,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Internal — executor construction and mode validation

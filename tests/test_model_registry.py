@@ -44,7 +44,70 @@ class TestRegistry:
         # WeNet dirs are identified by train.yaml; default fallback is conformer.
         (tmp_path / "train.yaml").write_text("encoder: conformer\n")
         assert resolve_architecture(tmp_path) == "conformer"
-        assert resolve_architecture(tmp_path / "missing") == "conformer"  # fallback
+        with pytest.warns(DeprecationWarning, match="falling back"):
+            assert resolve_architecture(tmp_path / "missing") == "conformer"  # fallback
+
+    def test_resolve_architecture_explicit_override(self, tmp_path):
+        # The override wins with no sniffing, and is validated eagerly.
+        assert resolve_architecture(tmp_path, architecture="zipformer") == "zipformer"
+        with pytest.raises(KeyError):
+            resolve_architecture(tmp_path, architecture="does-not-exist")
+
+    def test_resolve_architecture_ambiguity_raises(self, tmp_path):
+        (tmp_path / "train.yaml").write_text("encoder: conformer\n")
+
+        class AlwaysDetects:
+            def detect(self, ckpt_dir):
+                return True
+
+            def build_config(self, ckpt_dir):
+                raise NotImplementedError
+
+            def build_aux(self, ckpt_dir):
+                return {}
+
+            def load_state_dict(self, ckpt_dir, checkpoint_name, map_location):
+                return {}
+
+        from oasr.models import registry as R
+
+        register_model(
+            "greedy-test-arch",
+            model_cls=ConformerModel,
+            config_cls=ConformerModelConfig,
+            converter=AlwaysDetects(),
+        )
+        try:
+            with pytest.raises(ValueError, match="Ambiguous checkpoint format"):
+                resolve_architecture(tmp_path)
+        finally:
+            del R._REGISTRY["greedy-test-arch"]
+
+    def test_icefall_detect_tightened(self, tmp_path):
+        import torch
+
+        # A bare arbitrarily-named .pt no longer detects as icefall.
+        loose = tmp_path / "loose"
+        loose.mkdir()
+        torch.save({}, loose / "whatever.pt")
+        with pytest.warns(DeprecationWarning):
+            resolve_architecture(loose)
+
+        # Conventional icefall layouts still detect.
+        named = tmp_path / "named"
+        named.mkdir()
+        torch.save({}, named / "pretrained.pt")
+        assert resolve_architecture(named) == "zipformer"
+
+        exp = tmp_path / "exp_layout"
+        (exp / "exp").mkdir(parents=True)
+        torch.save({}, exp / "exp" / "epoch-30.pt")
+        assert resolve_architecture(exp) == "zipformer"
+
+        tokens = tmp_path / "tokens_layout"
+        tokens.mkdir()
+        (tokens / "tokens.txt").write_text("<blk> 0\n")
+        assert resolve_architecture(tokens) == "zipformer"
 
     def test_register_is_idempotent(self):
         before = get_model_entry("conformer")
@@ -110,3 +173,20 @@ class TestLoadWeights:
         assert model.ctc.ctc_lo.bias.shape[0] == 32
         # The padded rows are zero-filled.
         assert model.ctc.ctc_lo.weight[30:].abs().sum().item() == 0.0
+
+    def test_load_weights_returns_report(self):
+        """Every checkpoint key is accounted for: mapped or dropped, never silent."""
+        import torch
+
+        from oasr.models import LoadReport
+
+        model = ConformerModel.from_config(_tiny_config())
+        sd = dict(model.state_dict())
+        sd["decoder.some.branch.weight"] = torch.zeros(1)
+
+        report = model.load_weights(sd)
+        assert isinstance(report, LoadReport)
+        assert report.dropped == ["decoder.some.branch.weight"]
+        assert not report.missing
+        assert set(report.mapped) == {k for k in sd if k != "decoder.some.branch.weight"}
+        assert "dropped" in report.summary()

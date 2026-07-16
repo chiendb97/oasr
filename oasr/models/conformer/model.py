@@ -22,7 +22,7 @@ from oasr.layers.linear import Linear, LinearActivation
 from oasr.layers.norm import GlobalCMVN, LayerNorm
 from oasr.utils import get_norm, get_norm_activation
 
-from ..base import BaseAsrModel, BaseEncoder
+from ..base import BaseAsrModel, BaseEncoder, LoadReport
 from ..heads.ctc import CTCHead
 from .config import ConformerEncoderConfig, ConformerModelConfig
 from .packing import PackedLayout, build_packed_layout, pack_hidden, unpack_hidden
@@ -1063,12 +1063,16 @@ class ConformerModel(BaseAsrModel):
         probs = self.ctc(hidden_states)
         return probs
 
+    # Positional-encoding table is rebuilt from config; absent from checkpoints
+    # and skipped by the native format.
+    _computed_buffer_suffixes = ("pos_enc.pe",)
+
     def load_weights(
         self,
         state_dict: Mapping[str, torch.Tensor],
         *,
         strict: bool = False,
-    ) -> None:
+    ) -> LoadReport:
         """Load a WeNet-format state-dict into this model.
 
         Keeps only the ``encoder.*`` parameters and the ``ctc.ctc_lo.*``
@@ -1077,8 +1081,12 @@ class ConformerModel(BaseAsrModel):
         reshaping (fused QKV, Conv2d reorder) is handled by the layers'
         ``_load_from_state_dict`` hooks.  ``encoder.embed.pos_enc.pe`` is a
         computed buffer and is expected to be absent from the checkpoint.
+        Every non-consumed checkpoint key lands in ``LoadReport.dropped``
+        (e.g. the U2++ ``decoder.*`` rescoring branch).
         """
+        ctc_keys = ("ctc.ctc_lo.weight", "ctc.ctc_lo.bias")
         sd = {k: v for k, v in state_dict.items() if k.startswith("encoder.")}
+        dropped = [k for k in state_dict if not k.startswith("encoder.") and k not in ctc_keys]
 
         target_vocab = self.ctc.ctc_lo.weight.shape[0]
         ctc_w = state_dict["ctc.ctc_lo.weight"]
@@ -1097,3 +1105,5 @@ class ConformerModel(BaseAsrModel):
             logger.warning("Unexpected missing keys: %s", real_missing)
         if unexpected:
             logger.warning("Unexpected keys in checkpoint: %s", unexpected)
+        mapped = [k for k in sd if k not in unexpected]
+        return LoadReport(mapped=mapped, dropped=dropped, missing=real_missing)

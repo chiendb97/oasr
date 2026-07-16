@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..base import BaseAsrModel, BaseEncoder
+from ..base import BaseAsrModel, BaseEncoder, LoadReport
 from ..heads.ctc import CTCHead
 from .config import ZipformerEncoderConfig, ZipformerModelConfig
 from .encoder import Zipformer2, _to_tuple
@@ -203,16 +203,20 @@ class ZipformerModel(BaseAsrModel):
         return self.ctc(hidden), out_lens, new_states
 
     # -- weight loading -----------------------------------------------------
-    def load_weights(self, state_dict: Mapping[str, Tensor], *, strict: bool = False) -> None:
+    def load_weights(self, state_dict: Mapping[str, Tensor], *, strict: bool = False) -> LoadReport:
         """Map an icefall ``AsrModel`` state-dict into this model.
 
         icefall keys ``encoder_embed.*`` / ``encoder.*`` / ``ctc_output.1.*`` map
         to ``encoder.encoder_embed.*`` / ``encoder.encoder.*`` / ``ctc.ctc_lo.*``.
-        Transducer / attention-decoder parameters (if present) are ignored.  The
-        CTC weight/bias is zero-padded up to this model's (8-aligned) vocab when
-        the checkpoint's vocab is smaller (the GEMM kernels require N % 8 == 0).
+        The CTC weight/bias is zero-padded up to this model's (8-aligned) vocab
+        when the checkpoint's vocab is smaller (the GEMM kernels require
+        N % 8 == 0).  Non-consumed checkpoint keys (transducer predictor/joiner,
+        attention decoder, pruned-RNNT ``simple_*_proj``) land in
+        ``LoadReport.dropped`` — the registry decides which of those are
+        expected vs. a named capability loss.
         """
         remapped = {}
+        dropped = []
         for k, v in state_dict.items():
             if k.startswith("encoder_embed."):
                 remapped["encoder.encoder_embed." + k[len("encoder_embed.") :]] = v
@@ -220,7 +224,8 @@ class ZipformerModel(BaseAsrModel):
                 remapped["encoder.encoder." + k[len("encoder.") :]] = v
             elif k.startswith("ctc_output.1."):
                 remapped["ctc.ctc_lo." + k[len("ctc_output.1.") :]] = v
-            # else: decoder / joiner / simple_*_proj / attention_decoder -> ignored
+            else:
+                dropped.append(k)
 
         if "ctc.ctc_lo.weight" in remapped:
             target_vocab = self.ctc.ctc_lo.weight.shape[0]
@@ -236,3 +241,5 @@ class ZipformerModel(BaseAsrModel):
             logger.warning("Missing keys when loading Zipformer weights: %s", missing)
         if unexpected:
             logger.warning("Unexpected keys when loading Zipformer weights: %s", unexpected)
+        mapped = [k for k in remapped if k not in unexpected]
+        return LoadReport(mapped=mapped, dropped=dropped, missing=list(missing))

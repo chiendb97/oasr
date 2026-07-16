@@ -18,6 +18,11 @@ CUDA_ARCHITECTURES=80 pip install -e .
 # Install with serving extras (HTTP/WebSocket client libs for benchmarks)
 pip install -e .[serving]
 
+# Optional extras: [hub] (huggingface_hub + safetensors — Hub download & native
+# checkpoint I/O), [tokenizers] (sentencepiece + tokenizers — TokenizerSpec
+# kinds beyond symbol_table)
+pip install -e .[hub,tokenizers]
+
 # Optional: build the Rust serving frontend as a standalone binary
 cd rust && cargo build --release
 ```
@@ -261,9 +266,15 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
   - `batching/` — pluggable `BatchingPolicy` (`fcfs`/`bucket`/`sjf`) + `PartitionPolicy` (`count`/`frames`/`packing`) the scheduler delegates to.
 - **`features/`** — Batched audio feature extraction (FBANK / MFCC):
   - `FeatureConfig` — shared config for sample rate, mel bins, frame length/shift, dither, etc.
+  - `FeatureSpec` (`spec.py`) — **checkpoint-derived** feature description emitted by checkpoint converters (kind / sample rate / dim / frame geometry / LFR / normalize / audio_scale). The engine materializes `feature_config` from it unless the caller set one explicitly (mismatch logs a warning). `kind ∈ {"kaldi_fbank", "kaldi_mfcc"}` today; `whisper_logmel` / `raw` land with their model packages.
   - `fbank_batch` / `mfcc_batch` / `extract_features_batch` — offline batch extraction over padded `(B, T)` or list of waveforms.
   - `BatchedStreamingFeatureExtractor` — `B` parallel chunked streams (`process_chunk` / `flush`).
   - Backends: `torchaudio.compliance.kaldi` (default) and optional `kaldifeat` GPU path. Batched FBANK/MFCC in `batched.py`.
+- **`tokenizers/`** — Tokenizer axis (sixth registry): `Tokenizer` ABC (`decode`/`encode`/`vocab_size`/`special_ids`) + `TokenizerSpec` (kind + asset files + options) emitted by checkpoint converters and built via `build_tokenizer(spec)`. Kinds: `symbol_table` (units.txt/tokens.txt — bit-compatible with the legacy `Detokenizer`, default `special_ids={0,1,2}`), `sentencepiece` (icefall bpe.model; ids == piece ids), `huggingface` (tokenizer.json); `whisper` lands with the Whisper package. `engine/decode/detokenize.py::Detokenizer` is now a thin adapter over this axis.
+- **`checkpoints/`** — Checkpoint bundles + native format:
+  - `bundle.py` — `ConvertedCheckpoint` (config, aux, weights, `TokenizerSpec`, `FeatureSpec`, `DecodingDefaults`, `source_format`); `convert_checkpoint()` adapts legacy 4-method converters (fills metadata via the historical path sniffing).
+  - `native.py` — round-trippable native format: `oasr_config.json` (format_version 1) + `model.safetensors` (post-`load_weights` state dict — loads via strict `load_state_dict`, no name mapping; model-declared `_computed_buffer_suffixes` like Conformer's `pos_enc.pe` are skipped) + `tokenizer/` assets. Native state dicts get the model's own `_metadata` stamped at load so version-gated `_load_from_state_dict` remaps don't re-fire.
+  - `convert.py` — `oasr-convert <src> <dst>` CLI (also `python -m oasr.checkpoints.convert`) materializing any supported dir as a native bundle.
 - **`cache/`** — Paged-memory streaming cache manager for chunk-by-chunk Conformer inference:
   - `CacheConfig` — master config (layers, heads, dims, chunk size, block size, pool capacity).
   - `BlockPool` — fixed-size paged KV pool; blocks are allocated/freed per stream.
@@ -289,7 +300,7 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
 | `docs/serving.md` | Rust `oasr-server` frontend: HTTP/gRPC/WebSocket API, in-process PyO3 engine, wire format |
 | `docs/wfst_decoder_gpu.md` | In-tree GPU WFST decoder: k2-parity semantics, kernel pipeline, graph image, lazy-commit memory model, TVM-FFI API, streaming |
 - **`layers/`** — Thin `nn.Module`-style wrappers around functional API: `conv.py`, `linear.py`, `norm.py`, `feature.py`, `softmax.py`, `topk.py`, `attention/`, `rotary_embedding/`, plus `ctc.py` (`CtcProjection` — fused `log_softmax(x @ Wᵀ + b)` via `oasr.gemm_log_softmax`, used by `CTCHead`).
-- **`models/`** — Architecture-agnostic model layer (vLLM/SGLang-style). `base.py` (`BaseAsrModel`/`BaseEncoder`/`BaseHead`/`CacheSpec`/`DecodeType`): the engine touches a model only through `encode_offline`/`encode_chunk_paged` (raw hidden) + fused `forward_offline`/`forward_chunk_paged` (encoder+head → log-probs, the CTC fast path), `cache_spec`, `decode_type`, and `encoder.streaming_kind`/`subsampling_rate`/`right_context`. `registry.py` (`register_model`, `build_model_from_checkpoint`, `CheckpointConverter`) + `loaders.py` (`from_pretrained` — local dir or HuggingFace Hub id, exposed as `oasr.from_pretrained`). `decoders/` holds the autoregressive `BaseDecoder`/`PredictionNetwork`/`Joiner` contracts (transducer/AED/LLM extension points). `heads/ctc.py` (`CTCHead`).
+- **`models/`** — Architecture-agnostic model layer (vLLM/SGLang-style). `base.py` (`BaseAsrModel`/`BaseEncoder`/`BaseHead`/`CacheSpec`/`DecodeType`/`LoadReport`): the engine touches a model only through `encode_offline`/`encode_chunk_paged` (raw hidden) + fused `forward_offline`/`forward_chunk_paged` (encoder+head → log-probs, the CTC fast path), `cache_spec`, `decode_type`, and `encoder.streaming_kind`/`subsampling_rate`/`right_context`. `registry.py` (`register_model`, `build_model_from_checkpoint`, `load_checkpoint_bundle`, `CheckpointConverter`) + `loaders.py` (`from_pretrained` — local dir or HuggingFace Hub id, exposed as `oasr.from_pretrained`; `load_pretrained` additionally returns the tokenizer/feature/decoding specs + `LoadReport`, and is what `ASREngine` uses). Checkpoint resolution precedence: **native format** (`oasr_config.json`) → explicit `architecture=` → converter `detect()` (exactly one match; multiple → error; zero → deprecated `"conformer"` fallback with `DeprecationWarning`). `load_weights` returns a `LoadReport{mapped,dropped,missing}` — the registry warns on dropped weights per the converter's `expected_unused_prefixes` (silent, e.g. icefall `simple_*_proj`) / `capability_drop_hints` (named warning, e.g. the U2++ `decoder.*` rescoring branch). `decoders/` holds the autoregressive `BaseDecoder`/`PredictionNetwork`/`Joiner` contracts (transducer/AED/LLM extension points). `heads/ctc.py` (`CTCHead`).
   - **`models/conformer/`** — Conformer (`model.py`, `config.py`), `WenetConverter` (`convert.py`); `streaming_kind="paged"`, supports sequence packing.
   - **`models/zipformer/`** — Zipformer CTC ported from icefall (`model.py`, `encoder.py`, `subsampling.py`, `scaling.py`, `config.py`), `IcefallConverter` (infers config from checkpoint shapes); `streaming_kind="stateful"` (its own per-layer recurrent cache).
   - **`models/transducer/`** — RNNT model (`model.py` `TransducerModel`, `decoder.py` stateless predictor, `joiner.py`, `config.py`); `decode_type="transducer"`. The matching `TransducerDecodeStrategy` (`engine/decode/transducer.py`, `consumes="hidden"`) is registered, but the model package itself is **not yet wired into the model registry** (no `register_model`, not imported by `models/__init__.py`) — it is the in-progress RNNT extension point, not a loadable architecture yet.

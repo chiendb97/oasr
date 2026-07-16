@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposal — awaiting review |
+| **Status** | Accepted — in execution (Phase 0 foundations implemented on `feat/multi-paradigm-phase0`, 2026-07-16) |
 | **Date** | 2026-07-13 |
 | **Baseline** | `main` @ `339395d` (code references below are accurate at this commit) |
 | **Related** | `docs/architecture.md` (current seams), `docs/engine.md`, `docs/serving.md`, `docs/scheduler.md` |

@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple
 
 import torch
 import yaml
@@ -31,6 +31,9 @@ from oasr.layers.norm import GlobalCMVN
 
 from .config import ConformerEncoderConfig, ConformerModelConfig
 from .model import ConformerModel
+
+if TYPE_CHECKING:
+    from oasr.checkpoints import ConvertedCheckpoint
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +81,7 @@ def load_global_cmvn(cmvn_path: str) -> GlobalCMVN:
     frame_num = raw["frame_num"]
 
     mean = mean_stat / frame_num
-    variance = var_stat / frame_num - mean ** 2
+    variance = var_stat / frame_num - mean**2
     istd = 1.0 / torch.sqrt(torch.clamp(variance, min=1e-20))
     return GlobalCMVN(mean, istd)
 
@@ -92,6 +95,17 @@ class WenetConverter:
     name-mapping / vocab-padding lives in
     :meth:`ConformerModel.load_weights`.
     """
+
+    #: Weight-drop accounting (read by the registry after ``load_weights``):
+    #: nothing in a WeNet dir is *expected* to be dropped silently, and dropping
+    #: the U2++ bi-transformer decoder is a named capability loss.
+    expected_unused_prefixes: Tuple[str, ...] = ()
+    capability_drop_hints: Dict[str, str] = {
+        "decoder.": (
+            "the U2++ attention-decoder (CTC+AED rescoring) branch is not loaded; "
+            "attention rescoring lands with the multi-paradigm Phase 2"
+        ),
+    }
 
     def detect(self, ckpt_dir: Path) -> bool:
         """A WeNet experiment dir is identified by its ``train.yaml``."""
@@ -122,6 +136,70 @@ class WenetConverter:
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Required file not found: {ckpt_path}")
         return torch.load(str(ckpt_path), map_location=map_location)
+
+    # -- complete-bundle conversion (tokenizer / feature / decoding specs) ----
+
+    def build_tokenizer_spec(self, ckpt_dir: Path):
+        """WeNet decodes with ``units.txt`` unit ids → a ``symbol_table`` spec.
+
+        The SentencePiece ``.model`` (when shipped) is *not* the decode
+        tokenizer — its piece ids differ from the CTC unit ids.
+        """
+        from oasr.tokenizers import TokenizerSpec
+
+        for fname in ("units.txt", "words.txt"):
+            table = Path(ckpt_dir) / fname
+            if table.exists():
+                return TokenizerSpec(kind="symbol_table", files={"table": str(table)})
+        return None
+
+    def build_feature_spec(self, ckpt_dir: Path, raw: Optional[Dict[str, Any]] = None):
+        """FBANK geometry from ``train.yaml``'s ``dataset_conf`` (engine defaults
+        stop being blind guesses).  Dither is forced to 0.0 — a training-time
+        augmentation, always off at inference."""
+        from oasr.features import FeatureSpec
+
+        if raw is None:
+            raw = parse_wenet_yaml(str(Path(ckpt_dir) / "train.yaml"))
+        dataset_conf = raw.get("dataset_conf") or {}
+        fbank = dataset_conf.get("fbank_conf") or {}
+        resample = dataset_conf.get("resample_conf") or {}
+        return FeatureSpec(
+            kind="kaldi_fbank",
+            sample_rate=int(resample.get("resample_rate", 16000)),
+            feature_dim=int(fbank.get("num_mel_bins", raw.get("input_dim", 80))),
+            frame_length_ms=float(fbank.get("frame_length", 25)),
+            frame_shift_ms=float(fbank.get("frame_shift", 10)),
+            dither=0.0,
+            normalize="global_cmvn" if (Path(ckpt_dir) / "global_cmvn").exists() else None,
+            audio_scale=32768.0,
+        )
+
+    def convert(
+        self, ckpt_dir: Path, checkpoint_name: str = "final.pt", map_location: Any = "cpu"
+    ) -> "ConvertedCheckpoint":
+        """Full conversion: config + aux + weights + tokenizer/feature/decoding specs."""
+        from oasr.checkpoints import ConvertedCheckpoint, DecodingDefaults
+
+        ckpt_dir = Path(ckpt_dir)
+        raw = parse_wenet_yaml(str(ckpt_dir / "train.yaml"))
+        config = build_config_from_wenet(raw)
+        # WeNet convention: <blank>=0, <unk>=1, <sos/eos> = last unit of the
+        # *unpadded* vocab (output_dim - 1).
+        raw_vocab = raw.get("output_dim")
+        sos_eos = int(raw_vocab) - 1 if raw_vocab else None
+        return ConvertedCheckpoint(
+            architecture="conformer",
+            model_config=config,
+            aux=self.build_aux(ckpt_dir),
+            state_dict=self.load_state_dict(ckpt_dir, checkpoint_name, map_location),
+            tokenizer=self.build_tokenizer_spec(ckpt_dir),
+            features=self.build_feature_spec(ckpt_dir, raw),
+            decoding=DecodingDefaults(
+                default_decode_type="ctc", blank_id=0, unk_id=1, sos_id=sos_eos, eos_id=sos_eos
+            ),
+            source_format="wenet",
+        )
 
 
 def load_wenet_checkpoint(
@@ -165,23 +243,24 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    parser = argparse.ArgumentParser(
-        description="Load a WeNet Conformer checkpoint into OASR."
-    )
+    parser = argparse.ArgumentParser(description="Load a WeNet Conformer checkpoint into OASR.")
     parser.add_argument(
         "ckpt_dir",
         help="Path to the WeNet experiment directory.",
     )
     parser.add_argument(
-        "--checkpoint", default="final.pt",
+        "--checkpoint",
+        default="final.pt",
         help="Checkpoint filename (default: final.pt).",
     )
     parser.add_argument(
-        "--device", default="cpu",
+        "--device",
+        default="cpu",
         help="Device to load onto (default: cpu).",
     )
     parser.add_argument(
-        "--save", default=None,
+        "--save",
+        default=None,
         help="If set, save the converted OASR state dict to this path.",
     )
     args = parser.parse_args()

@@ -24,7 +24,7 @@ Anything conforming to that interface plugs in without engine changes.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Tuple, Union
 
 import torch
@@ -61,6 +61,30 @@ class CacheSpec:
     head_dim: int
     hidden_dim: int
     conv_kernel_size: int = 1
+
+
+@dataclass
+class LoadReport:
+    """Weight-load accounting returned by :meth:`BaseAsrModel.load_weights`.
+
+    Kills silent weight drops: every checkpoint key is either *mapped* into the
+    model or listed in *dropped*; *missing* holds model keys the checkpoint did
+    not fill (beyond declared computed buffers).  The registry cross-references
+    *dropped* against the converter's ``expected_unused_prefixes`` /
+    ``capability_drop_hints`` and logs a warning naming any capability lost.
+    """
+
+    mapped: List[str] = field(default_factory=list)
+    dropped: List[str] = field(default_factory=list)
+    missing: List[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        parts = [f"{len(self.mapped)} tensors loaded"]
+        if self.dropped:
+            parts.append(f"{len(self.dropped)} checkpoint tensors dropped")
+        if self.missing:
+            parts.append(f"{len(self.missing)} model tensors not filled")
+        return "LoadReport: " + ", ".join(parts)
 
 
 @dataclass
@@ -280,13 +304,22 @@ class BaseAsrModel(nn.Module, ABC):
         model, _config = _from_pretrained(model_id_or_path, **kwargs)
         return model
 
+    #: State-dict keys the model recomputes from config (e.g. positional-encoding
+    #: tables).  The native checkpoint format skips them at save time and
+    #: tolerates them missing at load time.  Suffix-matched against full keys.
+    _computed_buffer_suffixes: Tuple[str, ...] = ()
+
     @abstractmethod
-    def load_weights(self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False) -> None:
+    def load_weights(
+        self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False
+    ) -> Optional["LoadReport"]:
         """Map an external checkpoint state-dict into this model's parameters.
 
         Each architecture owns the name-mapping / fusion knowledge (vLLM-style);
         in-module reshaping (e.g. fused QKV, conv reorder) is handled by the
-        layers' ``_load_from_state_dict`` hooks.
+        layers' ``_load_from_state_dict`` hooks.  Returns a :class:`LoadReport`
+        (``None`` allowed for legacy implementations) so no checkpoint tensor is
+        ever dropped silently.
         """
         raise NotImplementedError
 

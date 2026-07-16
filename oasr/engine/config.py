@@ -329,6 +329,14 @@ class EngineConfig:
                 raise ValueError(
                     f"max_packed_frames must be a positive int, got " f"{self.max_packed_frames!r}"
                 )
+        # Track which of the checkpoint-derivable fields the caller set
+        # explicitly, so a converter-emitted FeatureSpec / TokenizerSpec can
+        # fill the defaults without overriding a deliberate choice (the engine
+        # warns loudly when an explicit value disagrees with the spec).
+        self._feature_config_explicit = self.feature_config is not None
+        self._tokenizer_paths_explicit = (
+            self.sentencepiece_model is not None or self.unit_table is not None
+        )
         if self.feature_config is None:
             self.feature_config = FeatureConfig(dither=0.0)
         if self.ctc_decoder_config is None:
@@ -354,7 +362,10 @@ class EngineConfig:
             # caches share one ladder; explicit override still wins.
             if self.feature_graph_batch_buckets is None:
                 self.feature_graph_batch_buckets = list(cleaned)
-        # Auto-detect SentencePiece model and unit table from checkpoint dir
+        # Auto-detect SentencePiece model and unit table from checkpoint dir.
+        # Deprecated fallback: when the checkpoint conversion emits a
+        # TokenizerSpec (WeNet / icefall / native all do), the engine builds the
+        # tokenizer from the spec and these sniffed paths are ignored.
         if self.ckpt_dir and os.path.isdir(self.ckpt_dir):
             if self.sentencepiece_model is None:
                 for fname in os.listdir(self.ckpt_dir):

@@ -38,10 +38,17 @@ class OutputProcessor:
         for CTC).  Defaults to ``"ctc"``.
     """
 
-    def __init__(self, config: EngineConfig, decode_type: str = "ctc", model=None) -> None:
+    def __init__(
+        self, config: EngineConfig, decode_type: str = "ctc", model=None, tokenizer=None
+    ) -> None:
         self._config = config
         self._decode_type = decode_type
-        self._detok = Detokenizer(config.sentencepiece_model, config.unit_table)
+        # ``tokenizer`` (an :class:`oasr.tokenizers.Tokenizer` built from the
+        # checkpoint's converter-emitted TokenizerSpec) takes precedence; the
+        # config paths are the legacy sniffed fallback.
+        self._detok = Detokenizer(
+            config.sentencepiece_model, config.unit_table, tokenizer=tokenizer
+        )
         # ``model`` is threaded to the strategy so autoregressive families can
         # reach ``model.decoder`` / ``model.joiner`` (CTC strategies ignore it).
         self._strategy = build_decode_strategy(decode_type, config, self._detok, model)

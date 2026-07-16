@@ -15,6 +15,7 @@ from .base import (
     BaseModelConfig,
     CacheSpec,
     DecodeType,
+    LoadReport,
 )
 
 # Importing the architecture packages triggers their register_model() calls.
@@ -28,12 +29,14 @@ from .conformer import (
     PositionwiseFeedForward,
 )
 from .heads import CTCHead
-from .loaders import from_pretrained
+from .loaders import PretrainedModel, from_pretrained, load_pretrained
 from .registry import (
     ModelEntry,
     build_model_from_checkpoint,
     get_model_entry,
+    instantiate_from_bundle,
     list_models,
+    load_checkpoint_bundle,
     register_model,
     resolve_architecture,
 )
@@ -52,12 +55,17 @@ __all__ = [
     "BaseModelConfig",
     "CacheSpec",
     "DecodeType",
+    "LoadReport",
     # Registry / factory
     "ModelEntry",
+    "PretrainedModel",
     "build_model_from_checkpoint",
     "from_pretrained",
     "get_model_entry",
+    "instantiate_from_bundle",
     "list_models",
+    "load_checkpoint_bundle",
+    "load_pretrained",
     "register_model",
     "resolve_architecture",
     # Heads

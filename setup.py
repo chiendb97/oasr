@@ -234,19 +234,23 @@ def get_long_description() -> str:
     return ""
 
 
-# Requirements
+# Requirements.  Keep in sync with pyproject.toml ([project] dependencies /
+# optional-dependencies) — pyproject.toml is the source of truth.
 install_requires = [
     "numpy>=1.20.0",
     "apache-tvm-ffi>=0.1.0",
     "jinja2>=3.0",
+    "PyYAML>=5.4",
     "filelock>=3.0",
     "packaging>=21.0",
 ]
 
 extras_require = {
     "audio": [
+        "torchaudio>=0.11.0",
         "soundfile>=0.12.0",
         "librosa>=0.10.0",
+        "kaldifeat>=1.22; python_version>='3.8'",
     ],
     "serving": [
         # Client libs used by benchmarks/bench_service.py + scripts/ws_stream.py.
@@ -255,18 +259,28 @@ extras_require = {
         "httpx>=0.27.0",
         "websockets>=12.0",
     ],
+    "hub": [
+        "huggingface_hub>=0.20.0",
+        "safetensors>=0.4.0",
+    ],
+    "tokenizers": [
+        "sentencepiece>=0.1.99",
+        "tokenizers>=0.15.0",
+    ],
+    "wfst": [
+        "k2>=1.24",
+        "kaldilm",
+    ],
     "dev": [
         "pytest>=7.0.0",
         "pytest-cov>=4.0.0",
         "black>=23.0.0",
         "isort>=5.12.0",
         "mypy>=1.0.0",
+        "ruff>=0.1.0",
     ],
     "all": [
-        "soundfile>=0.12.0",
-        "librosa>=0.10.0",
-        "httpx>=0.27.0",
-        "websockets>=12.0",
+        "oasr[audio,serving,hub,tokenizers]",
     ],
 }
 
