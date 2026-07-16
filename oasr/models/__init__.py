@@ -40,6 +40,10 @@ from .registry import (
     register_model,
     resolve_architecture,
 )
+from .transducer import (
+    TransducerModel,
+    TransducerModelConfig,
+)
 from .zipformer import (
     ZipformerEncoder,
     ZipformerEncoderConfig,
@@ -83,4 +87,7 @@ __all__ = [
     "ZipformerEncoder",
     "ZipformerEncoderConfig",
     "ZipformerModelConfig",
+    # Transducer (RNNT)
+    "TransducerModel",
+    "TransducerModelConfig",
 ]

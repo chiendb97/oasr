@@ -1,15 +1,18 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Transducer (RNNT) components + greedy decode-loop tests (CPU, no checkpoint).
+"""Transducer (RNNT) components, greedy decode, converter + engine-wiring tests.
 
-The batched greedy in ``TransducerDecodeStrategy.decode_offline`` is validated
-against an obviously-correct per-utterance reference loop on the same tiny model.
+The batched greedy in ``TransducerDecodeStrategy`` (offline *and* streaming) is
+validated against an obviously-correct per-utterance reference loop on the same
+tiny model; the icefall pruned-transducer converter is validated on a synthetic
+icefall-format checkpoint (CPU, no real checkpoint needed).
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -151,3 +154,329 @@ def test_offline_executor_takes_hidden_branch_for_transducer():
         assert outs[b].tokens[0] == ref
         assert outs[b].request_id == reqs[b].request_id
         assert outs[b].finished
+
+
+# --------------------------------------------------------------------------- #
+# Streaming greedy (session state threaded across chunks)
+# --------------------------------------------------------------------------- #
+
+
+def _cfg(max_sym=5, partial_interval=1):
+    return SimpleNamespace(
+        transducer_max_sym_per_frame=max_sym,
+        partial_decode_interval=partial_interval,
+    )
+
+
+def _stream(strat, rid, hidden, chunk_sizes):
+    """Feed ``hidden`` (1, T, D) to ``strat`` in chunks; return the final tokens."""
+    req = SimpleNamespace(request_id=rid)
+    strat.create_session(req)
+    t = 0
+    for cs in chunk_sizes:
+        chunk = hidden[:, t : t + cs]
+        if chunk.size(1):
+            strat.decode_streaming_batch([req], {rid: chunk})
+        t += cs
+    final = strat.finalize(req)
+    strat.free_session(req)
+    return final
+
+
+def test_streaming_matches_offline_tokens():
+    """Chunked greedy with carried predictor state == one-shot offline greedy."""
+    torch.manual_seed(3)
+    model = _build_model(context_size=2)
+    T = 32
+    hidden = torch.randn(1, T, ENC_DIM)
+
+    strat = TransducerDecodeStrategy(_cfg(), Detokenizer(None, None), model)
+    with torch.no_grad():
+        offline = strat.decode_offline(hidden, torch.tensor([T]))[0].tokens[0]
+
+    for chunks in ([8, 8, 8, 8], [16, 16], [5, 11, 9, 7], [1] * T):
+        strat2 = TransducerDecodeStrategy(_cfg(), Detokenizer(None, None), model)
+        with torch.no_grad():
+            final = _stream(strat2, "s", hidden, chunks)
+        assert final.tokens[0] == offline, chunks
+        assert final.finished
+
+
+def test_streaming_batch_mixed_chunk_lengths():
+    """One tick with different chunk lengths (grouped) == each stream alone."""
+    torch.manual_seed(4)
+    model = _build_model(context_size=2)
+    strat = TransducerDecodeStrategy(_cfg(), Detokenizer(None, None), model)
+    h_a = torch.randn(1, 16, ENC_DIM)
+    h_b = torch.randn(1, 12, ENC_DIM)
+
+    ra, rb = SimpleNamespace(request_id="a"), SimpleNamespace(request_id="b")
+    strat.create_session(ra)
+    strat.create_session(rb)
+    with torch.no_grad():
+        strat.decode_streaming_batch([ra, rb], {"a": h_a[:, :8], "b": h_b[:, :6]})
+        strat.decode_streaming_batch([ra, rb], {"a": h_a[:, 8:], "b": h_b[:, 6:]})
+    fa, fb = strat.finalize(ra), strat.finalize(rb)
+
+    solo = TransducerDecodeStrategy(_cfg(), Detokenizer(None, None), model)
+    with torch.no_grad():
+        assert fa.tokens[0] == _stream(solo, "sa", h_a, [8, 8]).tokens[0]
+        assert fb.tokens[0] == _stream(solo, "sb", h_b, [6, 6]).tokens[0]
+
+
+def test_streaming_partial_cadence():
+    torch.manual_seed(5)
+    model = _build_model()
+    hidden = torch.randn(1, 8, ENC_DIM)
+    req = SimpleNamespace(request_id="p")
+
+    # interval 2: partial on every 2nd chunk only.
+    strat = TransducerDecodeStrategy(_cfg(partial_interval=2), Detokenizer(None, None), model)
+    strat.create_session(req)
+    with torch.no_grad():
+        assert strat.decode_streaming_batch([req], {"p": hidden[:, :4]}) == []
+        outs = strat.decode_streaming_batch([req], {"p": hidden[:, 4:]})
+    assert len(outs) == 1 and not outs[0].finished
+
+    # interval 0: partials disabled; state still advances and finalize works.
+    strat0 = TransducerDecodeStrategy(_cfg(partial_interval=0), Detokenizer(None, None), model)
+    req0 = SimpleNamespace(request_id="p0")
+    strat0.create_session(req0)
+    with torch.no_grad():
+        assert strat0.decode_streaming_batch([req0], {"p0": hidden[:, :4]}) == []
+        assert strat0.decode_streaming_batch([req0], {"p0": hidden[:, 4:]}) == []
+        final0 = strat0.finalize(req0)
+    strat1 = TransducerDecodeStrategy(_cfg(partial_interval=1), Detokenizer(None, None), model)
+    with torch.no_grad():
+        assert final0.tokens[0] == _stream(strat1, "x", hidden, [4, 4]).tokens[0]
+
+
+def test_finalize_without_chunks_is_empty():
+    model = _build_model()
+    strat = TransducerDecodeStrategy(_cfg(), Detokenizer(None, None), model)
+    req = SimpleNamespace(request_id="empty")
+    strat.create_session(req)
+    out = strat.finalize(req)
+    assert out.finished and out.tokens == [[]] and out.text == ""
+
+
+# --------------------------------------------------------------------------- #
+# Icefall pruned-transducer converter (synthetic checkpoint)
+# --------------------------------------------------------------------------- #
+
+
+def _tiny_zipformer_transducer():
+    from oasr.models.transducer import TransducerModelConfig
+    from oasr.models.zipformer.config import ZipformerEncoderConfig
+
+    enc_cfg = ZipformerEncoderConfig(
+        feature_dim=80,
+        downsampling_factor=(1, 2),
+        encoder_dim=(64, 96),
+        num_encoder_layers=(1, 1),
+        query_head_dim=(8,),
+        pos_head_dim=(4,),
+        value_head_dim=(6,),
+        num_heads=(4, 4),
+        feedforward_dim=(64, 96),
+        cnn_module_kernel=(15, 15),
+        pos_dim=16,
+        causal=False,
+    )
+    cfg = TransducerModelConfig(
+        encoder_type="zipformer",
+        encoder=enc_cfg,
+        vocab_size=30,
+        decoder_dim=24,
+        joiner_dim=20,
+        context_size=2,
+        blank_id=0,
+    )
+    torch.manual_seed(6)
+    return TransducerModel.from_config(cfg), cfg
+
+
+def _to_icefall_sd(model):
+    """OASR transducer state dict → icefall AsrModel layout (reverse of load).
+
+    Reverses both the key remap (``encoder.encoder_embed.*`` →
+    ``encoder_embed.*`` etc.) and the depthwise-conv weight transpose: OASR's
+    ``DepthwiseConv1d`` stores ``(K, 1, C)`` and its shape-gated
+    ``_load_from_state_dict`` hook converts icefall's ``(C, 1, K)`` on load.
+    """
+    sd = {}
+    for k, v in model.state_dict().items():
+        ik = k[len("encoder.") :] if k.startswith("encoder.") else k
+        if ik.endswith("depthwise_conv.weight") and v.ndim == 3 and v.shape[1] == 1:
+            v = v.permute(2, 1, 0).contiguous()
+        sd[ik] = v
+    return sd
+
+
+@pytest.fixture(scope="module")
+def icefall_transducer_dir(tmp_path_factory):
+    """Synthetic icefall pruned-transducer experiment dir (tiny random model)."""
+    model, cfg = _tiny_zipformer_transducer()
+    sd = _to_icefall_sd(model)
+    # Pruned-RNNT training heads (declared-expected drops) + a hybrid CTC branch.
+    sd["simple_am_proj.weight"] = torch.randn(30, 96)
+    sd["simple_lm_proj.weight"] = torch.randn(30, 24)
+    sd["ctc_output.1.weight"] = torch.randn(30, 96)
+    sd["ctc_output.1.bias"] = torch.randn(30)
+
+    d = tmp_path_factory.mktemp("icefall_transducer")
+    torch.save({"model": sd}, d / "pretrained.pt")
+    (d / "tokens.txt").write_text("<blk> 0\n<sos/eos> 1\n<unk> 2\nHE 3\nLO 4\n")
+    return d, model, cfg
+
+
+class TestIcefallTransducerConverter:
+    def test_not_auto_detected(self, icefall_transducer_dir):
+        """The dir sniffs as zipformer (CTC); transducer is explicit-only."""
+        from oasr.models import resolve_architecture
+
+        d, _, _ = icefall_transducer_dir
+        assert resolve_architecture(d) == "zipformer"
+        assert resolve_architecture(d, architecture="transducer") == "transducer"
+
+    def test_config_inference_and_weight_round_trip(self, icefall_transducer_dir):
+        from oasr.models.registry import instantiate_from_bundle, load_checkpoint_bundle
+
+        d, src_model, src_cfg = icefall_transducer_dir
+        arch, bundle = load_checkpoint_bundle(d, architecture="transducer")
+        assert arch == "transducer" and bundle.source_format == "icefall"
+        cfg = bundle.model_config
+        assert cfg.encoder_type == "zipformer"
+        assert (cfg.vocab_size, cfg.decoder_dim, cfg.joiner_dim, cfg.context_size) == (
+            30,
+            24,
+            20,
+            2,
+        )
+        assert bundle.decoding.default_decode_type == "transducer"
+        assert bundle.tokenizer is not None and bundle.tokenizer.kind == "symbol_table"
+
+        model, _, report = instantiate_from_bundle(arch, bundle)
+        assert model.decode_type == "transducer"
+        # Every source tensor round-trips exactly.
+        src_sd, dst_sd = src_model.state_dict(), model.state_dict()
+        assert set(src_sd) == set(dst_sd)
+        for k in src_sd:
+            assert torch.equal(src_sd[k], dst_sd[k]), k
+        # Drops are fully accounted: simple_* expected, ctc_output a named hint.
+        assert report is not None and not report.missing
+        assert {k.split(".")[0] for k in report.dropped} == {
+            "simple_am_proj",
+            "simple_lm_proj",
+            "ctc_output",
+        }
+
+    def test_ctc_hint_warns(self, icefall_transducer_dir, caplog):
+        import logging
+
+        from oasr.models.registry import instantiate_from_bundle, load_checkpoint_bundle
+
+        d, _, _ = icefall_transducer_dir
+        arch, bundle = load_checkpoint_bundle(d, architecture="transducer")
+        with caplog.at_level(logging.WARNING, logger="oasr.models.registry"):
+            instantiate_from_bundle(arch, bundle)
+        joined = " ".join(r.message for r in caplog.records)
+        assert "ctc_output.*" in joined and "architecture='zipformer'" in joined
+        assert "simple_am_proj" not in joined  # declared-expected: silent
+
+    def test_native_round_trip(self, icefall_transducer_dir, tmp_path):
+        pytest.importorskip("safetensors")
+        from oasr.checkpoints.convert import convert_to_native
+        from oasr.models.registry import instantiate_from_bundle, load_checkpoint_bundle
+
+        d, src_model, _ = icefall_transducer_dir
+        native = tmp_path / "native"
+        convert_to_native(str(d), str(native), architecture="transducer")
+        arch, bundle = load_checkpoint_bundle(native)
+        assert arch == "transducer" and bundle.source_format == "native"
+        model, cfg, _ = instantiate_from_bundle(arch, bundle)
+        assert cfg.encoder_type == "zipformer" and cfg.context_size == 2
+        src_sd, dst_sd = src_model.state_dict(), model.state_dict()
+        assert set(src_sd) == set(dst_sd)
+        for k in src_sd:
+            assert torch.equal(src_sd[k], dst_sd[k]), k
+
+
+# --------------------------------------------------------------------------- #
+# Engine end-to-end (native conformer-transducer checkpoint, GPU)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
+class TestEngineTransducer:
+    @pytest.fixture(scope="class")
+    def native_ckpt(self, tmp_path_factory):
+        pytest.importorskip("safetensors")
+        from oasr.checkpoints import save_native
+        from oasr.checkpoints.bundle import DecodingDefaults
+        from oasr.models.conformer.config import ConformerEncoderConfig
+        from oasr.models.transducer import TransducerModelConfig
+
+        enc = ConformerEncoderConfig(
+            input_size=80,
+            output_size=64,
+            # 2 heads → head_dim 32: the CuteDSL FMHA can't implement
+            # head_dim 16 (4 heads @ 64) on the paged streaming path.
+            num_blocks=2,
+            attention_heads=2,
+            linear_units=128,
+            cnn_module_kernel=15,
+            # Streaming conformers are causal (the paged CNN cache carries the
+            # depthwise conv's left context; non-causal convs keep none).
+            causal=True,
+            embed_layer_norm=False,
+        )
+        cfg = TransducerModelConfig(
+            encoder_type="conformer",
+            encoder=enc,
+            vocab_size=32,
+            decoder_dim=24,
+            joiner_dim=20,
+            context_size=2,
+        )
+        torch.manual_seed(7)
+        model = TransducerModel.from_config(cfg).eval()
+        d = tmp_path_factory.mktemp("native_transducer")
+        save_native(
+            d,
+            architecture="transducer",
+            model=model,
+            model_config=cfg,
+            decoding=DecodingDefaults(default_decode_type="transducer"),
+        )
+        return d
+
+    def test_offline_engine(self, native_ckpt):
+        from oasr.engine import ASREngine, EngineConfig
+
+        cfg = EngineConfig(ckpt_dir=str(native_ckpt), service_mode="offline", max_batch_size=2)
+        engine = ASREngine(cfg)
+        torch.manual_seed(8)
+        wavs = [torch.randn(16000), torch.randn(24000)]
+        texts = engine.transcribe_offline(wavs)
+        assert len(texts) == 2 and all(isinstance(t, str) for t in texts)
+
+    def test_streaming_engine(self, native_ckpt):
+        """Streaming path: hidden-mode paged backend (eager) + session greedy."""
+        from oasr.engine import ASREngine, EngineConfig
+
+        cfg = EngineConfig(
+            ckpt_dir=str(native_ckpt),
+            service_mode="streaming",
+            max_batch_size=2,
+            max_num_blocks=256,
+            max_blocks_per_seq=64,
+        )
+        engine = ASREngine(cfg)
+        # Hidden mode must have routed the paged backend off the fused head.
+        backend = engine._model_runner.streaming_backend  # noqa: SLF001
+        assert backend._consumes == "hidden"  # noqa: SLF001
+        assert backend._graph_cache is None  # noqa: SLF001
+        torch.manual_seed(9)
+        text = engine.transcribe(torch.randn(32000))
+        assert isinstance(text, str)

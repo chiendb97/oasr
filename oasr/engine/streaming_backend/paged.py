@@ -55,11 +55,21 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         cache_config: "CacheConfig",
         *,
         graph_pool: Optional[Tuple[int, int]] = None,
+        consumes: str = "log_probs",
     ) -> None:
         self._model = model
         self._config = config
         self._cache_config = cache_config
         self._graph_pool = graph_pool
+        # What the active decode strategy consumes.  "log_probs" runs the fused
+        # encoder+head ``forward_chunk_paged`` (today's CUDA-graph fast path);
+        # "hidden" runs the encoder-only ``encode_chunk_paged`` **eagerly** —
+        # graph capture for hidden mode is deferred until a shape proves hot
+        # (the capture machinery bakes in a (B, chunk, V) log-probs buffer).
+        self._consumes = consumes
+        self._chunk_forward = (
+            model.encode_chunk_paged if consumes == "hidden" else model.forward_chunk_paged
+        )
 
         # Window geometry derived from the *encoder* (not hardcoded): a chunk of
         # ``chunk_size`` encoder frames needs ``(chunk_size-1)*sub + right_context
@@ -81,9 +91,12 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         # CUDA Graph cache for the steady-state batched paged forward.
         # Captures lazily on first encounter of each (B_active, cache_t1
         # bucket) shape. Eager fallback is used for non-CUDA devices, when
-        # graphs are disabled, or for partial/final windows.
+        # graphs are disabled, for partial/final windows, or for hidden-mode
+        # strategies (the captured graph bakes in the fused-head output).
         self._use_cuda_graphs = (
-            config.use_cuda_graphs and torch.device(config.device).type == "cuda"
+            config.use_cuda_graphs
+            and torch.device(config.device).type == "cuda"
+            and consumes == "log_probs"
         )
         if self._use_cuda_graphs:
             self._graph_cache: Optional[GraphedEncoderForward] = GraphedEncoderForward(
@@ -376,7 +389,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_device)
             for c in batched_att_caches:
                 c.host_seqlen_max = max_offset
-            log_probs = self._model.forward_chunk_paged(
+            log_probs = self._chunk_forward(
                 xs,
                 offsets_device,
                 batched_att_caches,
@@ -488,7 +501,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_device)
             for c in batched_att_caches:
                 c.host_seqlen_max = req.offset
-            log_probs = self._model.forward_chunk_paged(
+            log_probs = self._chunk_forward(
                 chunk,
                 offsets_device,
                 batched_att_caches,

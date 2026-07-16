@@ -10,12 +10,18 @@ with :func:`register_decode_strategy`.
 
 # Import for side effects: each module registers its strategy on import.
 from . import ctc_gpu, ctc_wfst, skeleton, transducer  # noqa: E402,F401
-from .base import DecodeStrategy, build_decode_strategy, register_decode_strategy
+from .base import (
+    DecodeStrategy,
+    build_decode_strategy,
+    get_decode_strategy_class,
+    register_decode_strategy,
+)
 from .detokenize import Detokenizer
 
 __all__ = [
     "DecodeStrategy",
     "Detokenizer",
     "build_decode_strategy",
+    "get_decode_strategy_class",
     "register_decode_strategy",
 ]

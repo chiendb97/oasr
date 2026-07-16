@@ -268,6 +268,12 @@ class EngineConfig:
     wfst_decoder_config: Optional[DecoderConfig] = None
     fst_path: Optional[str] = None
 
+    # Transducer (RNNT) greedy decode: cap on non-blank emissions per encoder
+    # frame.  Safety bound against degenerate loops; applied uniformly so
+    # results are deterministic.  Only read by ``decode_type == "transducer"``
+    # models (see ``oasr/engine/decode/transducer.py``).
+    transducer_max_sym_per_frame: int = 10
+
     # Streaming interim-partial cadence.  After each streaming decode step the
     # engine reads the best-so-far hypothesis back to the host to emit a partial
     # transcript — a per-stream device→host sync that, profiled, is ~17% of
@@ -321,6 +327,11 @@ class EngineConfig:
             raise ValueError(
                 f"max_batch_frames must be a positive int or None, got "
                 f"{self.max_batch_frames!r}"
+            )
+        if self.transducer_max_sym_per_frame < 1:
+            raise ValueError(
+                f"transducer_max_sym_per_frame must be >= 1, got "
+                f"{self.transducer_max_sym_per_frame!r}"
             )
         if self.enable_sequence_packing:
             if self.service_mode != "offline":

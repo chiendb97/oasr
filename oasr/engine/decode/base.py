@@ -122,16 +122,12 @@ def _strategy_name(decode_type: str, config: "EngineConfig") -> str:
     return decode_type
 
 
-def build_decode_strategy(
-    decode_type: str,
-    config: "EngineConfig",
-    detok: "Detokenizer",
-    model: "BaseAsrModel" = None,
-) -> DecodeStrategy:
-    """Construct the decode strategy for a model's ``decode_type``.
+def get_decode_strategy_class(decode_type: str, config: "EngineConfig") -> Type[DecodeStrategy]:
+    """Resolve the strategy *class* for a model's ``decode_type``.
 
-    ``model`` is threaded through so autoregressive strategies can reach
-    ``model.decoder`` / ``model.joiner`` (CTC strategies ignore it).  Raises
+    Lets the engine read class-level strategy metadata (notably ``consumes``)
+    **before** any component is constructed — the ``ModelRunner`` / streaming
+    backends need it at build time, ahead of the ``OutputProcessor``.  Raises
     ``NotImplementedError`` with the available names when the family /
     ``decoder_type`` has no registered strategy (the extension point for new
     decode families).
@@ -144,4 +140,18 @@ def build_decode_strategy(
             f"(resolved name {name!r}).  Registered: {sorted(_REGISTRY)}.  "
             "Add one by subclassing DecodeStrategy + @register_decode_strategy."
         )
-    return cls(config, detok, model)
+    return cls
+
+
+def build_decode_strategy(
+    decode_type: str,
+    config: "EngineConfig",
+    detok: "Detokenizer",
+    model: "BaseAsrModel" = None,
+) -> DecodeStrategy:
+    """Construct the decode strategy for a model's ``decode_type``.
+
+    ``model`` is threaded through so autoregressive strategies can reach
+    ``model.decoder`` / ``model.joiner`` (CTC strategies ignore it).
+    """
+    return get_decode_strategy_class(decode_type, config)(config, detok, model)

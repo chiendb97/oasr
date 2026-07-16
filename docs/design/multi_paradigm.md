@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Accepted — in execution (Phase 0 foundations implemented on `feat/multi-paradigm-phase0`, 2026-07-16) |
+| **Status** | Accepted — in execution (Phases 0–1 implemented on `feat/multi-paradigm-phase0`, 2026-07-16; Phase 1 note: transducer beam search + real-checkpoint WER parity deferred — no icefall transducer checkpoint on the dev box) |
 | **Date** | 2026-07-13 |
 | **Baseline** | `main` @ `339395d` (code references below are accurate at this commit) |
 | **Related** | `docs/architecture.md` (current seams), `docs/engine.md`, `docs/serving.md`, `docs/scheduler.md` |

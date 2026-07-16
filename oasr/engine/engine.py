@@ -18,6 +18,7 @@ from oasr.models import PretrainedModel, load_pretrained
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from .config import EngineConfig
+from .decode import get_decode_strategy_class
 from .executor import (
     Executor,
     OfflineExecutor,
@@ -123,7 +124,22 @@ class ASREngine:
 
         self._input_processor = InputProcessor(config, self._device, graph_pool=self._graph_pool)
         self._scheduler = Scheduler(config)
-        self._model_runner = ModelRunner(model, config, cache_config, graph_pool=self._graph_pool)
+        # Resolve the decode strategy's declared input ("log_probs" vs "hidden")
+        # from the registry *class* before any component is built — the
+        # streaming backends route their per-chunk forward on it, and the
+        # OutputProcessor (which owns the strategy instance) is constructed
+        # only after the runner (it needs the runner-derived geometry).
+        consumes = get_decode_strategy_class(model.decode_type, config).consumes
+        if config.enable_sequence_packing and consumes == "hidden":
+            logger.warning(
+                "enable_sequence_packing is ignored for decode_type=%r: the "
+                "hidden-states offline path runs the plain padded encode "
+                "(packed hidden is a planned multi-paradigm follow-up)",
+                model.decode_type,
+            )
+        self._model_runner = ModelRunner(
+            model, config, cache_config, graph_pool=self._graph_pool, consumes=consumes
+        )
 
         # Source the streaming geometry from the model's encoder + the streaming
         # backend so the executor / input processor window the feature buffer per

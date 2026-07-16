@@ -115,3 +115,96 @@ class TestStatefulStreamingBackend:
         for r in reqs:
             backend.free(r)
         assert not backend._states  # noqa: SLF001
+
+    def test_hidden_mode_routes_to_encoder(self):
+        """consumes='hidden' must thread chunks through the *encoder-only*
+        streaming forward (raw hidden states, no CTC head)."""
+        model = self._build_model()
+        cfg = SimpleNamespace(device="cuda", dtype=torch.float16, chunk_size=16)
+        backend = build_streaming_backend("stateful", model, cfg, None, consumes="hidden")
+        window = backend.decoding_window
+
+        feats = torch.randn(window * 2, 80, dtype=torch.float16, device="cuda")
+        req = _make_request(0, feats)
+        backend.allocate(req)
+
+        got = []
+        for _ in range(2):
+            out = backend.forward_step([req])
+            got.append(out[req.request_id].clone())
+
+        with torch.no_grad():
+            state = model.get_streaming_init_states(1, device="cuda", dtype=torch.float16)
+            for k in range(2):
+                chunk = feats[k * window : (k + 1) * window].unsqueeze(0)
+                lens = torch.tensor([window], dtype=torch.int32, device="cuda")
+                hidden, _ol, state = model.encoder.streaming_forward(chunk, lens, state)
+                torch.testing.assert_close(got[k], hidden)
+        # Hidden = encoder dim (max stack dim 96), not the 32-entry vocab.
+        assert got[0].shape[-1] == 96
+        backend.free(req)
+
+
+# --------------------------------------------------------------------------- #
+# consumes routing (constructor-level; no CUDA / no forward needed)
+# --------------------------------------------------------------------------- #
+
+
+class _RoutingEncoderStub:
+    streaming_kind = "paged"
+    subsampling_rate = 4
+    right_context = 6
+
+
+class _RoutingModelStub:
+    """Just enough surface for PagedStreamingBackend.__init__ routing checks."""
+
+    encoder = _RoutingEncoderStub()
+
+    def forward_chunk_paged(self, *a, **k):  # fused encoder+head
+        raise AssertionError("not called in this test")
+
+    def encode_chunk_paged(self, *a, **k):  # encoder-only
+        raise AssertionError("not called in this test")
+
+
+def _paged_backend(consumes):
+    from oasr.cache import CacheConfig
+    from oasr.engine.streaming_backend.paged import PagedStreamingBackend
+
+    cache_cfg = CacheConfig(
+        num_layers=2,
+        n_kv_head=4,
+        head_dim=16,
+        hidden_dim=64,
+        kernel_size=15,
+        chunk_size=16,
+        num_left_chunks=-1,
+        block_size_frames=16,
+        max_num_blocks=32,
+        max_blocks_per_seq=8,
+        max_batch_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    cfg = SimpleNamespace(
+        device="cpu",
+        dtype=torch.float32,
+        chunk_size=16,
+        use_cuda_graphs=True,  # must still be disabled by hidden routing / cpu
+        feature_config=SimpleNamespace(output_dim=80),
+    )
+    model = _RoutingModelStub()
+    return (
+        PagedStreamingBackend(model, cfg, cache_cfg, consumes=consumes),
+        model,
+    )
+
+
+def test_paged_backend_consumes_routing():
+    backend, model = _paged_backend("hidden")
+    assert backend._chunk_forward.__func__ is _RoutingModelStub.encode_chunk_paged  # noqa: SLF001
+    assert backend._graph_cache is None  # noqa: SLF001
+
+    backend, model = _paged_backend("log_probs")
+    assert backend._chunk_forward.__func__ is _RoutingModelStub.forward_chunk_paged  # noqa: SLF001

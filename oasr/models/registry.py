@@ -121,6 +121,8 @@ def _ensure_builtins() -> None:
         import oasr.models.conformer  # noqa: F401
     if "zipformer" not in _REGISTRY:
         import oasr.models.zipformer  # noqa: F401
+    if "transducer" not in _REGISTRY:
+        import oasr.models.transducer  # noqa: F401
 
 
 def get_model_entry(name: str) -> ModelEntry:

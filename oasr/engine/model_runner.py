@@ -49,18 +49,22 @@ class ModelRunner:
         cache_config: CacheConfig,
         *,
         graph_pool: Optional[Tuple[int, int]] = None,
+        consumes: str = "log_probs",
     ) -> None:
         self._model = model
         self._config = config
         self._cache_config = cache_config
 
         # Pick the streaming runtime from the encoder's declared cache model.
+        # ``consumes`` (the active decode strategy's declared input) routes the
+        # backend's per-chunk forward: fused head vs. raw hidden states.
         self._streaming_backend: StreamingEncoderBackend = build_streaming_backend(
             model.encoder.streaming_kind,
             model,
             config,
             cache_config,
             graph_pool=graph_pool,
+            consumes=consumes,
         )
 
     # ------------------------------------------------------------------

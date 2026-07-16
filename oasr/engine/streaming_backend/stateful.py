@@ -50,11 +50,19 @@ class StatefulStreamingBackend(StreamingEncoderBackend):
         cache_config: "CacheConfig",
         *,
         graph_pool: Optional[Tuple[int, int]] = None,
+        consumes: str = "log_probs",
     ) -> None:
         self._model = model
         self._config = config
         self._device = torch.device(config.device)
         self._dtype = config.dtype
+        # What the active decode strategy consumes: "log_probs" threads chunks
+        # through ``model.streaming_forward`` (encoder + head); "hidden" calls
+        # the encoder's own ``streaming_forward`` (raw hidden states) for
+        # autoregressive families.  Same (out, out_lens, new_states) contract.
+        self._chunk_forward = (
+            model.encoder.streaming_forward if consumes == "hidden" else model.streaming_forward
+        )
         # Per-request encoder streaming state (the encoder's own recurrent cache).
         self._states: Dict[int, List[torch.Tensor]] = {}
 
@@ -132,13 +140,11 @@ class StatefulStreamingBackend(StreamingEncoderBackend):
             chunk = chunk.to(device=self._device, dtype=self._dtype)
             lens = torch.tensor([chunk.size(1)], dtype=torch.int32, device=self._device)
 
-            log_probs, _out_lens, new_states = self._model.streaming_forward(
-                chunk, lens, self._states[sid]
-            )
+            out, _out_lens, new_states = self._chunk_forward(chunk, lens, self._states[sid])
             self._states[sid] = new_states
 
             req.feature_cursor += stride
-            req.offset += int(log_probs.size(1))
-            results[req.request_id] = log_probs
+            req.offset += int(out.size(1))
+            results[req.request_id] = out
 
         return results

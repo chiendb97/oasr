@@ -64,13 +64,14 @@ def test_aed_llm_skeletons_raise_not_implemented(dt):
         s.finalize(None)
 
 
-def test_transducer_offline_implemented_streaming_not():
-    # transducer is a real strategy now: decode_offline works (tested in
-    # test_transducer.py); only its streaming path is a follow-up.
+def test_transducer_offline_and_streaming_implemented():
+    # transducer is a full strategy: decode_offline + streaming sessions (both
+    # tested in test_transducer.py).  finalize on a request with no session
+    # yields an empty final transcript rather than raising.
     s = build_decode_strategy("transducer", _stub_config(), Detokenizer(None, None))
     assert type(s).__name__ == "TransducerDecodeStrategy"
-    with pytest.raises(NotImplementedError):
-        s.finalize(None)
+    out = s.finalize(SimpleNamespace(request_id="never-decoded"))
+    assert out.finished and out.tokens == [[]] and out.text == ""
 
 
 def test_build_unknown_decode_type_raises():
