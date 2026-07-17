@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Optional, Union
+from typing import Deque, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -47,6 +47,10 @@ class RequestOutput:
     finished : bool
         ``True`` when decoding is complete; ``False`` for partial streaming
         results.
+    timestamps : List[Tuple[float, float]], optional
+        Per-token ``(start_s, end_s)`` times for the **best** hypothesis,
+        aligned with ``tokens[0]``.  Emitted by decode families that produce
+        alignments (Paraformer's CIF fire positions); ``None`` otherwise.
     """
 
     request_id: str
@@ -54,6 +58,7 @@ class RequestOutput:
     tokens: List[List[int]]
     scores: Optional[List[float]] = None
     finished: bool = False
+    timestamps: Optional[List[Tuple[float, float]]] = None
 
 
 class Request:
@@ -108,8 +113,8 @@ class Request:
         self.state: RequestState = RequestState.WAITING
 
         # Populated by InputProcessor
-        self.features: Optional[torch.Tensor] = None          # (1, T, F)
-        self.feature_lengths: Optional[torch.Tensor] = None   # (1,)
+        self.features: Optional[torch.Tensor] = None  # (1, T, F)
+        self.feature_lengths: Optional[torch.Tensor] = None  # (1,)
         # Number of feature frames.  For offline this starts as a cheap
         # sample-count-derived estimate so the scheduler can bucket before
         # features are extracted, and is overwritten with the exact value
@@ -166,8 +171,7 @@ class Request:
     def has_pending_audio(self) -> bool:
         """True if audio samples still need to be turned into features."""
         return bool(self.audio_chunks) or (
-            self.audio_final and self.audio_tail is not None
-            and self.audio_tail.numel() > 0
+            self.audio_final and self.audio_tail is not None and self.audio_tail.numel() > 0
         )
 
     def has_ready_encoder_chunk(self, window: int) -> bool:

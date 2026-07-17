@@ -19,6 +19,7 @@ from oasr.features.batched import (
     supports_batched_fbank,
     supports_batched_mfcc,
 )
+from oasr.features.lfr import apply_lfr_batch, lfr_output_length
 
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
@@ -130,10 +131,14 @@ class InputProcessor:
         if cfg.snip_edges:
             if num_samples < frame_length:
                 return 0
-            return (num_samples - frame_length) // frame_shift + 1
-        if num_samples <= 0:
+            est = (num_samples - frame_length) // frame_shift + 1
+        elif num_samples <= 0:
             return 0
-        return (num_samples + frame_shift // 2) // frame_shift
+        else:
+            est = (num_samples + frame_shift // 2) // frame_shift
+        if cfg.lfr_enabled:
+            est = lfr_output_length(est, cfg.lfr_n)
+        return est
 
     def prepare_offline(self, request: Request) -> None:
         """Register an offline request without running feature extraction.
@@ -144,9 +149,9 @@ class InputProcessor:
         scaling happens here — the int16-scale multiply runs on the GPU after
         padding in :meth:`collate`, which also runs the batched fbank/mfcc.
         """
-        request.audio = torch.as_tensor(
-            request.audio, dtype=torch.float32, device="cpu"
-        ).reshape(-1)
+        request.audio = torch.as_tensor(request.audio, dtype=torch.float32, device="cpu").reshape(
+            -1
+        )
         request.num_frames = self._estimate_num_frames(int(request.audio.numel()))
         # Clear any stale feature cache from reused Request objects.
         request.features = None
@@ -163,9 +168,7 @@ class InputProcessor:
         """
         cur = 0 if self._wav_flat is None else self._wav_flat.numel()
         if cur < n:
-            self._wav_flat = torch.empty(
-                max(n, cur * 2), dtype=torch.float32, pin_memory=True
-            )
+            self._wav_flat = torch.empty(max(n, cur * 2), dtype=torch.float32, pin_memory=True)
         return self._wav_flat[:n]
 
     def _padded_device(self, batch: int, t_max: int) -> torch.Tensor:
@@ -278,20 +281,21 @@ class InputProcessor:
             lengths_device = wav_lengths.to(self._device, non_blocking=True)
             batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
             features_f32, feat_lengths = batched_fn(wav_device, lengths_device, fcfg)
-            return features_f32.to(dtype=self._config.dtype), feat_lengths
-
-        feat_list = [
-            _extract_single(wav_device[i, :n], fcfg)
-            for i, n in enumerate(wav_lengths.tolist())
-        ]
-        feat_lengths = torch.tensor(
-            [f.size(0) for f in feat_list], dtype=torch.int32, device=self._device
-        )
-        padded_feat = torch.nn.utils.rnn.pad_sequence(
-            feat_list, batch_first=True, padding_value=0.0
-        )
-        return padded_feat.to(dtype=self._config.dtype), feat_lengths
-
+        else:
+            feat_list = [
+                _extract_single(wav_device[i, :n], fcfg) for i, n in enumerate(wav_lengths.tolist())
+            ]
+            feat_lengths = torch.tensor(
+                [f.size(0) for f in feat_list], dtype=torch.int32, device=self._device
+            )
+            features_f32 = torch.nn.utils.rnn.pad_sequence(
+                feat_list, batch_first=True, padding_value=0.0
+            )
+        if fcfg.lfr_enabled:
+            features_f32, feat_lengths = apply_lfr_batch(
+                features_f32, feat_lengths, fcfg.lfr_m, fcfg.lfr_n
+            )
+        return features_f32.to(dtype=self._config.dtype), feat_lengths
 
     def prepare_streaming(self, request: Request) -> None:
         """Register an empty streaming request — chunks arrive via
@@ -301,6 +305,11 @@ class InputProcessor:
         runs and no waveform load happens here; the engine starts processing
         as soon as the first chunk lands.
         """
+        if self._feature_config.lfr_enabled:
+            raise NotImplementedError(
+                "LFR feature stacking is offline-only; the streaming feature "
+                "path does not window LFR frames across chunks"
+            )
         request.audio_chunks = deque()
         request.audio_tail = torch.empty(0, dtype=torch.float32)
         request.audio_final = False
@@ -333,9 +342,7 @@ class InputProcessor:
                 "initialised via prepare_streaming"
             )
         if request.audio_final:
-            raise RuntimeError(
-                f"feed_chunk after is_last=True for request {request.request_id}"
-            )
+            raise RuntimeError(f"feed_chunk after is_last=True for request {request.request_id}")
 
         # Normalise to a 1-D float32 CPU waveform (shared with the offline path)
         # and apply the int16 ``audio_scale``.  Streaming keeps its scale on the
@@ -408,15 +415,11 @@ class InputProcessor:
             return
         frame_len = self._feature_config.frame_length_samples
 
-        fbank_inputs, fbank_reqs, fbank_flush = self._collect_streaming_inputs(
-            requests, frame_len
-        )
+        fbank_inputs, fbank_reqs, fbank_flush = self._collect_streaming_inputs(requests, frame_len)
         if not fbank_reqs:
             return
 
-        feats, feat_lens_cpu = self._run_streaming_features(
-            fbank_inputs, fbank_flush, cuda_stream
-        )
+        feats, feat_lens_cpu = self._run_streaming_features(fbank_inputs, fbank_flush, cuda_stream)
         self._distribute_streaming_features(
             fbank_reqs, fbank_inputs, fbank_flush, feats, feat_lens_cpu
         )
@@ -441,10 +444,8 @@ class InputProcessor:
                 continue
             if req.audio_chunks:
                 chunk = req.audio_chunks.popleft()
-                cat = chunk if req.audio_tail.numel() == 0 \
-                    else torch.cat([req.audio_tail, chunk])
-                flush = req.audio_final and not req.audio_chunks \
-                    and cat.numel() >= frame_len
+                cat = chunk if req.audio_tail.numel() == 0 else torch.cat([req.audio_tail, chunk])
+                flush = req.audio_final and not req.audio_chunks and cat.numel() >= frame_len
                 # On the very last chunk pad the tail so the final partial
                 # frame still gets emitted.
                 if req.audio_final and not req.audio_chunks and cat.numel() < frame_len:
@@ -493,8 +494,7 @@ class InputProcessor:
         sample_counts = [w.numel() for w in fbank_inputs]
         t_max = max(sample_counts)
         feat_lens_cpu: List[int] = [
-            ((n - frame_len) // frame_shift + 1) if n >= frame_len else 0
-            for n in sample_counts
+            ((n - frame_len) // frame_shift + 1) if n >= frame_len else 0 for n in sample_counts
         ]
         lengths_cpu = torch.tensor(sample_counts, dtype=torch.int64)
         # Zero only the *pad tail* of each row, not the whole buffer: the
@@ -531,9 +531,7 @@ class InputProcessor:
         # A dedicated feature stream (when provided) overlaps the H2D + kernel
         # with the encoder forward on the default stream; the caller inserts the
         # event-wait before reading ``feature_buffer``.
-        stream_ctx = (
-            torch.cuda.stream(cuda_stream) if cuda_stream is not None else nullcontext()
-        )
+        stream_ctx = torch.cuda.stream(cuda_stream) if cuda_stream is not None else nullcontext()
         batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
 
         # Captured-graph fast path: steady state only (no flush) and within the
@@ -602,9 +600,8 @@ class InputProcessor:
 
         # Compact the buffer if the consumed prefix is a large share of it
         # (cheap amortised, avoids unbounded growth on long streams).
-        if buf is not None and request.feature_cursor > 0 \
-                and request.feature_cursor >= have // 2:
-            keep = buf[request.feature_cursor: have].contiguous()
+        if buf is not None and request.feature_cursor > 0 and request.feature_cursor >= have // 2:
+            keep = buf[request.feature_cursor : have].contiguous()
             request.feature_buffer = keep
             buf = request.feature_buffer
             request.feature_frames = keep.size(0)
@@ -620,5 +617,5 @@ class InputProcessor:
             request.feature_buffer = new_buf
             buf = new_buf
 
-        buf[have: have + n_new] = new_frames
+        buf[have : have + n_new] = new_frames
         request.feature_frames = have + n_new

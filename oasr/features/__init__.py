@@ -36,12 +36,14 @@ from __future__ import annotations
 
 from .backends import extract_features_batch, fbank_batch, mfcc_batch
 from .config import FeatureConfig
+from .lfr import apply_lfr_batch
 from .spec import FeatureSpec
 from .streaming import BatchedStreamingFeatureExtractor
 
 __all__ = [
     "FeatureConfig",
     "FeatureSpec",
+    "apply_lfr_batch",
     "fbank_batch",
     "mfcc_batch",
     "extract_features_batch",

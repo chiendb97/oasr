@@ -136,6 +136,12 @@ class ASREngine:
                 "of those, or leave decode_method=None for the model default."
             )
         self._decode_method = decode_method
+        if config.service_mode == "streaming" and model.streaming_kind == "none":
+            raise ValueError(
+                "this checkpoint's encoder is offline-only (streaming_kind="
+                "'none'); it exposes no chunk forward for the streaming "
+                "runtime. Use service_mode='offline'."
+            )
         # Resolve the decode strategy's declared input ("log_probs" / "hidden"
         # / "both") from the registry *class* before any component is built —
         # the streaming backends route their per-chunk forward on it, and the
@@ -227,10 +233,16 @@ class ASREngine:
         # Warm up the cute FMHA compile cache so the first request
         # doesn't pay JIT-compile latency. Skipped on CPU and on archs
         # where the cute backend isn't available (warmup_fmha is a no-op
-        # in those cases).  Conformer-specific (reads ``encoder.encoders``);
-        # encoders without that stacked-layer layout (e.g. Zipformer, which
-        # uses torch matmul attention) skip it.
-        if self._device.type == "cuda" and hasattr(model.encoder, "encoders"):
+        # in those cases).  Conformer-specific: requires the stacked-layer
+        # layout AND the paged-FMHA attention interface (``self_attn.h_kv``);
+        # encoders with their own attention (Zipformer's torch matmul, the
+        # Paraformer SANM blocks) skip it.
+        if (
+            self._device.type == "cuda"
+            and hasattr(model.encoder, "encoders")
+            and len(getattr(model.encoder, "encoders", [])) > 0
+            and hasattr(getattr(model.encoder.encoders[0], "self_attn", None), "h_kv")
+        ):
             from oasr.jit.attention import warmup_fmha
 
             try:

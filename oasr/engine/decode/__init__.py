@@ -9,7 +9,7 @@ with :func:`register_decode_strategy`.
 """
 
 # Import for side effects: each module registers its strategy on import.
-from . import aed, ctc_gpu, ctc_wfst, rescoring, skeleton, transducer  # noqa: E402,F401
+from . import aed, ctc_gpu, ctc_wfst, paraformer, rescoring, skeleton, transducer  # noqa: E402,F401
 from .base import (
     DecodeStrategy,
     EncodeOutput,

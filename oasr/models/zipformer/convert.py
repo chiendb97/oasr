@@ -170,6 +170,8 @@ class IcefallConverter:
         ckpt_dir = Path(ckpt_dir)
         if (ckpt_dir / "train.yaml").exists():
             return False  # that's a WeNet/Conformer experiment dir
+        if (ckpt_dir / "config.yaml").exists():
+            return False  # a FunASR model dir (Paraformer & friends), despite model.pt
         if self._find_tokenizer_asset(ckpt_dir, "tokens.txt") is not None:
             return True
         if self._find_tokenizer_asset(ckpt_dir, "bpe.model") is not None:

@@ -125,6 +125,8 @@ def _ensure_builtins() -> None:
         import oasr.models.transducer  # noqa: F401
     if "whisper" not in _REGISTRY:
         import oasr.models.whisper  # noqa: F401
+    if "paraformer" not in _REGISTRY:
+        import oasr.models.paraformer  # noqa: F401
 
 
 def get_model_entry(name: str) -> ModelEntry:

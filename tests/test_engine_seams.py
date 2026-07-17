@@ -43,6 +43,7 @@ def test_decode_registry_has_builtins():
         "transducer",
         "aed",
         "llm",
+        "paraformer",
     }
 
 

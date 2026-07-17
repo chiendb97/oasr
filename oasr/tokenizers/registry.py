@@ -40,6 +40,8 @@ def _ensure_builtins() -> None:
         import oasr.tokenizers.huggingface  # noqa: F401
     if "whisper" not in _REGISTRY:
         import oasr.tokenizers.whisper  # noqa: F401
+    if "funasr_char" not in _REGISTRY:
+        import oasr.tokenizers.funasr_char  # noqa: F401
 
 
 def list_tokenizers() -> List[str]:

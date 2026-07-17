@@ -39,6 +39,8 @@ class FeatureSpec:
     # Low-frame-rate stacking: stack lfr_m frames, advance lfr_n (1/1 = off).
     lfr_m: int = 1
     lfr_n: int = 1
+    # Kaldi analysis window ("povey" default; FunASR frontends use "hamming").
+    window_type: str = "povey"
     # Feature normalization applied model-side (e.g. "global_cmvn"); None = none.
     normalize: Optional[str] = None
     # Waveform scale the checkpoint expects before feature extraction (Kaldi
@@ -72,6 +74,9 @@ class FeatureSpec:
             frame_length_ms=self.frame_length_ms,
             frame_shift_ms=self.frame_shift_ms,
             dither=self.dither,
+            window_type=self.window_type,
+            lfr_m=self.lfr_m,
+            lfr_n=self.lfr_n,
         )
         if self.kind == "kaldi_mfcc":
             cfg.num_ceps = self.feature_dim
@@ -98,13 +103,19 @@ class FeatureSpec:
         if self.kind not in _KALDI_KINDS:
             return [f"kind: spec={self.kind!r} config=kaldi ({config.feature_type!r})"]
         diffs = []
+        # ``feature_dim`` is the pre-LFR dimension (mel bins / cepstra);
+        # ``config.output_dim`` already folds the LFR stacking in.
+        base_dim = config.num_ceps if self.kind == "kaldi_mfcc" else config.num_mel_bins
         pairs = [
             ("feature_type", _KALDI_KINDS[self.kind], config.feature_type),
             ("sample_rate", self.sample_rate, config.sample_rate),
-            ("feature_dim", self.feature_dim, config.output_dim),
+            ("feature_dim", self.feature_dim, base_dim),
             ("frame_length_ms", self.frame_length_ms, config.frame_length_ms),
             ("frame_shift_ms", self.frame_shift_ms, config.frame_shift_ms),
             ("dither", self.dither, config.dither),
+            ("window_type", self.window_type, config.window_type),
+            ("lfr_m", self.lfr_m, config.lfr_m),
+            ("lfr_n", self.lfr_n, config.lfr_n),
         ]
         for name, spec_v, cfg_v in pairs:
             if spec_v != cfg_v:

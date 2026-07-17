@@ -71,6 +71,12 @@ class FeatureConfig:
     high_freq: float = 0.0
     snip_edges: bool = True
     backend: str = "torchaudio"
+    # Low-frame-rate stacking (FunASR/Paraformer): stack ``lfr_m`` consecutive
+    # frames (replicating the first/last frame at the edges) and advance by
+    # ``lfr_n`` — 80-mel LFR 7/6 yields 560-dim features at a 60 ms hop.
+    # ``1/1`` disables.  Offline-only: the streaming feature path rejects it.
+    lfr_m: int = 1
+    lfr_n: int = 1
     # Whisper log-mel only (``feature_type="whisper_logmel"``): every
     # utterance is padded/trimmed to this many seconds (30 s → 3000 frames →
     # 1500 encoder positions) and globally max-normalized, per the Whisper
@@ -85,9 +91,7 @@ class FeatureConfig:
                 f"got {self.feature_type!r}"
             )
         if self.backend not in ("torchaudio", "kaldifeat"):
-            raise ValueError(
-                f"backend must be 'torchaudio' or 'kaldifeat', got {self.backend!r}"
-            )
+            raise ValueError(f"backend must be 'torchaudio' or 'kaldifeat', got {self.backend!r}")
         if self.sample_rate <= 0:
             raise ValueError(f"sample_rate must be positive, got {self.sample_rate}")
         if self.frame_length_ms <= 0 or self.frame_shift_ms <= 0:
@@ -97,6 +101,8 @@ class FeatureConfig:
                 f"frame_shift_ms ({self.frame_shift_ms}) must be <= "
                 f"frame_length_ms ({self.frame_length_ms})"
             )
+        if self.lfr_m < 1 or self.lfr_n < 1:
+            raise ValueError(f"lfr_m/lfr_n must be >= 1, got {self.lfr_m}/{self.lfr_n}")
 
     @property
     def frame_length_samples(self) -> int:
@@ -110,5 +116,11 @@ class FeatureConfig:
 
     @property
     def output_dim(self) -> int:
-        """Dimensionality of each output feature vector."""
-        return self.num_ceps if self.feature_type == "mfcc" else self.num_mel_bins
+        """Dimensionality of each output feature vector (after LFR stacking)."""
+        base = self.num_ceps if self.feature_type == "mfcc" else self.num_mel_bins
+        return base * self.lfr_m
+
+    @property
+    def lfr_enabled(self) -> bool:
+        """Whether low-frame-rate stacking is active."""
+        return self.lfr_m != 1 or self.lfr_n != 1
