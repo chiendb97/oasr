@@ -8,10 +8,29 @@ encoder-decoder), and LLM-based families instead run an **autoregressive**
 decoder token-by-token; this package defines the contract the engine's
 ``DecodeStrategy`` drives for those families.
 
-Only the interfaces live here today — concrete decoders ship with their model
-families.  See ``oasr/engine/decode/`` for the matching decode strategies.
+Besides the interfaces, this package ships the WeNet/ESPnet-compatible
+:class:`TransformerDecoder` / :class:`BiTransformerDecoder` (U2++ attention
+rescoring + AED generation).  See ``oasr/engine/decode/`` for the matching
+decode strategies.
 """
 
 from .base import BaseDecoder, DecoderState, Joiner, PredictionNetwork
+from .transformer_decoder import (
+    BiTransformerDecoder,
+    TransformerDecoder,
+    TransformerDecoderConfig,
+    add_sos_eos,
+    reverse_pad_list,
+)
 
-__all__ = ["BaseDecoder", "DecoderState", "Joiner", "PredictionNetwork"]
+__all__ = [
+    "BaseDecoder",
+    "BiTransformerDecoder",
+    "DecoderState",
+    "Joiner",
+    "PredictionNetwork",
+    "TransformerDecoder",
+    "TransformerDecoderConfig",
+    "add_sos_eos",
+    "reverse_pad_list",
+]

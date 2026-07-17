@@ -18,7 +18,7 @@ from oasr.models import PretrainedModel, load_pretrained
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from .config import EngineConfig
-from .decode import get_decode_strategy_class
+from .decode import EncodeOutput, get_decode_strategy_class
 from .executor import (
     Executor,
     OfflineExecutor,
@@ -124,18 +124,45 @@ class ASREngine:
 
         self._input_processor = InputProcessor(config, self._device, graph_pool=self._graph_pool)
         self._scheduler = Scheduler(config)
-        # Resolve the decode strategy's declared input ("log_probs" vs "hidden")
-        # from the registry *class* before any component is built — the
-        # streaming backends route their per-chunk forward on it, and the
+        # Decode-method selection: ``config.decode_method`` picks among the
+        # checkpoint's advertised capabilities; ``None`` runs the model's
+        # default family (the unchanged production path).
+        decode_method = config.decode_method or model.default_decode_type
+        capabilities = model.capabilities
+        if decode_method not in capabilities:
+            raise ValueError(
+                f"decode_method={decode_method!r} is not a capability of this "
+                f"checkpoint (capabilities: {sorted(capabilities)}). Pick one "
+                "of those, or leave decode_method=None for the model default."
+            )
+        self._decode_method = decode_method
+        # Resolve the decode strategy's declared input ("log_probs" / "hidden"
+        # / "both") from the registry *class* before any component is built —
+        # the streaming backends route their per-chunk forward on it, and the
         # OutputProcessor (which owns the strategy instance) is constructed
         # only after the runner (it needs the runner-derived geometry).
-        consumes = get_decode_strategy_class(model.decode_type, config).consumes
-        if config.enable_sequence_packing and consumes == "hidden":
+        strategy_cls = get_decode_strategy_class(decode_method, config)
+        consumes = strategy_cls.consumes
+        if consumes == "both" and config.service_mode == "streaming":
+            raise ValueError(
+                f"decode_method={decode_method!r} is offline-only: its strategy "
+                "consumes both encoder hidden states and log-probs, which the "
+                "streaming chunk forward does not produce (final-only streaming "
+                "rescoring is a planned follow-up). Use service_mode='offline'."
+            )
+        if strategy_cls.incremental and config.service_mode == "streaming":
+            raise ValueError(
+                f"decode_method={decode_method!r} is offline-only: label-"
+                "synchronous AR decoding (AED/LLM) is not genuinely streamable. "
+                "Use service_mode='offline'."
+            )
+        if config.enable_sequence_packing and consumes in ("hidden", "both"):
             logger.warning(
-                "enable_sequence_packing is ignored for decode_type=%r: the "
-                "hidden-states offline path runs the plain padded encode "
+                "enable_sequence_packing is ignored for decode_method=%r: the "
+                "%s offline path runs the plain padded encode "
                 "(packed hidden is a planned multi-paradigm follow-up)",
-                model.decode_type,
+                decode_method,
+                "hidden-states" if consumes == "hidden" else "hidden+log-probs",
             )
         self._model_runner = ModelRunner(
             model, config, cache_config, graph_pool=self._graph_pool, consumes=consumes
@@ -152,7 +179,7 @@ class ASREngine:
         config._stride_override = self._model_runner.stride
 
         self._output_processor = OutputProcessor(
-            config, decode_type=model.decode_type, model=model, tokenizer=tokenizer
+            config, decode_type=decode_method, model=model, tokenizer=tokenizer
         )
 
         # Build exactly one executor matching ``config.service_mode``.
@@ -466,8 +493,24 @@ class ASREngine:
                     )
                 )
             feats, lengths = self._input_processor.collate(reqs)
-            log_probs, out_len = self._model_runner.forward_offline(feats, lengths)
-            self._output_processor.decode_offline(log_probs, out_len)
+            # Mirror OfflineExecutor._run_stage's consumes routing so the
+            # prewarm exercises (and initialises) the same path production
+            # requests take.
+            strategy = self._output_processor.strategy
+            consumes = strategy.consumes
+            if consumes == "hidden":
+                enc_out, out_len = self._model_runner.encode_offline(feats, lengths)
+            elif consumes == "both":
+                hidden, out_len = self._model_runner.encode_offline(feats, lengths)
+                enc_out = EncodeOutput(
+                    hidden=hidden, log_probs=self._model_runner.apply_head(hidden)
+                )
+            else:
+                enc_out, out_len = self._model_runner.forward_offline(feats, lengths)
+            # Incremental strategies have no one-shot decode; the encoder
+            # forward above is the expensive warmup either way.
+            if not strategy.incremental:
+                self._output_processor.decode_offline(enc_out, out_len)
         torch.cuda.synchronize()
 
     def add_streaming_request(
@@ -573,6 +616,20 @@ class ASREngine:
                     )
             else:
                 config.feature_config = spec.to_feature_config()
+            # The waveform scale the checkpoint was trained on travels with
+            # the spec too (Kaldi frontends: 32768.0 int16 scale; Whisper:
+            # 1.0).  An explicit non-default engine value wins with a warning.
+            if getattr(config, "_audio_scale_explicit", False):
+                if float(config.audio_scale) != float(spec.audio_scale):
+                    logger.warning(
+                        "Explicit audio_scale %.1f differs from the checkpoint's "
+                        "FeatureSpec (%.1f); the explicit value wins, but this "
+                        "usually breaks recognition",
+                        config.audio_scale,
+                        spec.audio_scale,
+                    )
+            else:
+                config.audio_scale = float(spec.audio_scale)
 
         tok_spec = loaded.tokenizer_spec
         if tok_spec is None:
@@ -631,6 +688,12 @@ class ASREngine:
             output_processor=self._output_processor,
             device=self._device,
             enable_packing=config.enable_sequence_packing,
+            decode_steps_per_tick=config.decode_steps_per_tick,
+            max_decode_slots=(
+                config.max_decode_slots
+                if config.max_decode_slots is not None
+                else config.max_batch_size
+            ),
         )
 
     def _validate_mode(self, streaming: bool) -> None:

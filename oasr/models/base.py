@@ -334,15 +334,33 @@ class BaseAsrModel(nn.Module, ABC):
         return self.encoder.streaming_kind
 
     @property
-    def decode_type(self) -> DecodeType:
-        """Decode family driving the engine's ``DecodeStrategy``.
+    def default_decode_type(self) -> DecodeType:
+        """Decode family the engine runs when the caller picks none.
 
         AR models declare it via :attr:`decoder`; CTC models via :attr:`head`.
+        Hybrid models (e.g. CTC + AED-rescoring) override this to name their
+        production default and expose the rest via :attr:`capabilities`.
         """
         decoder = getattr(self, "decoder", None)
         if decoder is not None:
             return decoder.decode_type
         return self.head.decode_type
+
+    @property
+    def capabilities(self) -> frozenset:
+        """Decode families this checkpoint's weights support.
+
+        ``EngineConfig.decode_method`` must name one of these (``None`` selects
+        :attr:`default_decode_type`).  Single-objective models get the derived
+        one-element set for free; hybrids (U2++ CTC+AED) override to advertise
+        every branch they loaded.
+        """
+        return frozenset({self.default_decode_type})
+
+    @property
+    def decode_type(self) -> DecodeType:
+        """Compatibility alias for :attr:`default_decode_type`."""
+        return self.default_decode_type
 
     # -- engine-facing forward entry points --------------------------------
     @staticmethod

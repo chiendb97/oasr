@@ -145,6 +145,16 @@ class ModelRunner:
         """
         return self._model.encode_offline(features, lengths)
 
+    @torch.no_grad()
+    def apply_head(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Head forward over pre-computed encoder hidden → ``(B, T, V)`` log-probs.
+
+        Used by the ``consumes == "both"`` offline path (CTC+AED rescoring):
+        one :meth:`encode_offline` pass plus this head call yields the hidden
+        states *and* the CTC log-probs without a second encoder forward.
+        """
+        return self._model.head(hidden)
+
     # ------------------------------------------------------------------
     # Streaming (delegated to the backend)
     # ------------------------------------------------------------------

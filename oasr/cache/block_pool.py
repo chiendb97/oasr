@@ -83,6 +83,11 @@ class BlockPool:
     # ------------------------------------------------------------------
 
     @property
+    def config(self) -> CacheConfig:
+        """The pool's cache configuration (geometry, device, dtype)."""
+        return self._config
+
+    @property
     def num_free_blocks(self) -> int:
         """Number of currently available physical blocks."""
         with self._lock:

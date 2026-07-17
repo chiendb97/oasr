@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ..base import BaseModelConfig, CacheSpec
+from ..decoders.transformer_decoder import TransformerDecoderConfig
 
 
 @dataclass
@@ -63,11 +64,17 @@ class ConformerEncoderConfig:
 
 @dataclass
 class ConformerModelConfig(BaseModelConfig):
-    """Top-level Conformer model config (encoder + CTC head)."""
+    """Top-level Conformer model config (encoder + CTC head + optional AED decoder)."""
 
     model_type: str = "conformer"
     encoder: ConformerEncoderConfig = field(default_factory=ConformerEncoderConfig)
     # For ASR: vocab_size for the CTC head (inherited from BaseModelConfig).
+    # U2++ attention-decoder branch (CTC+AED rescoring).  ``None`` (default) is
+    # a pure-CTC model; the WeNet converter fills this from ``train.yaml``'s
+    # ``decoder_conf`` when the checkpoint carries a (bi)transformer decoder.
+    # Its ``vocab_size`` is the *raw* (unpadded) vocab — the AED branch is
+    # plain torch linears, not the 8-aligned CTC GEMM head.
+    decoder: Optional[TransformerDecoderConfig] = None
 
     @property
     def cache_spec(self) -> CacheSpec:
@@ -92,9 +99,11 @@ class ConformerModelConfig(BaseModelConfig):
 
     @classmethod
     def from_dict(cls, d: dict) -> ConformerModelConfig:
-        """Build from a dict (e.g. HuggingFace config)."""
+        """Build from a dict (e.g. HuggingFace config / native ``oasr_config.json``)."""
         encoder_dict = d.get("encoder", d)
         encoder = ConformerEncoderConfig(
             **{k: v for k, v in encoder_dict.items() if hasattr(ConformerEncoderConfig, k)}
         )
-        return cls(encoder=encoder, vocab_size=d.get("vocab_size"))
+        decoder_dict = d.get("decoder")
+        decoder = TransformerDecoderConfig.from_dict(decoder_dict) if decoder_dict else None
+        return cls(encoder=encoder, vocab_size=d.get("vocab_size"), decoder=decoder)

@@ -36,7 +36,14 @@ def _stub_config(decoder_type="ctc_cuda"):
 
 
 def test_decode_registry_has_builtins():
-    assert set(DECODE_REGISTRY) == {"ctc_cuda", "ctc_wfst", "transducer", "aed", "llm"}
+    assert set(DECODE_REGISTRY) == {
+        "ctc_cuda",
+        "ctc_wfst",
+        "ctc_aed_rescoring",
+        "transducer",
+        "aed",
+        "llm",
+    }
 
 
 def test_build_ctc_strategies_by_decoder_type():
@@ -48,16 +55,27 @@ def test_build_ctc_strategies_by_decoder_type():
     assert gpu.consumes == "log_probs" and gpu.decode_type == "ctc"
 
 
-@pytest.mark.parametrize("dt", ["transducer", "aed", "llm"])
+@pytest.mark.parametrize("dt", ["transducer", "llm"])
 def test_ar_strategies_resolve_and_consume_hidden(dt):
     s = build_decode_strategy(dt, _stub_config(), Detokenizer(None, None))
     assert s.decode_type == dt
     assert s.consumes == "hidden"
 
 
-@pytest.mark.parametrize("dt", ["aed", "llm"])
-def test_aed_llm_skeletons_raise_not_implemented(dt):
-    s = build_decode_strategy(dt, _stub_config(), Detokenizer(None, None))
+def test_aed_is_incremental_and_needs_a_capable_model():
+    """``aed`` is a real strategy now: it declares the incremental protocol
+    and refuses models without the batched prefill/step decoder surface."""
+    from oasr.engine.decode import get_decode_strategy_class
+
+    cls = get_decode_strategy_class("aed", _stub_config())
+    assert cls.__name__ == "AedDecodeStrategy"
+    assert cls.consumes == "hidden" and cls.incremental is True
+    with pytest.raises(ValueError, match="prefill"):
+        build_decode_strategy("aed", _stub_config(), Detokenizer(None, None))
+
+
+def test_llm_skeleton_raises_not_implemented():
+    s = build_decode_strategy("llm", _stub_config(), Detokenizer(None, None))
     with pytest.raises(NotImplementedError):
         s.decode_offline(None, None)
     with pytest.raises(NotImplementedError):

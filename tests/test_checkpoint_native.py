@@ -250,6 +250,97 @@ class TestNativeFormat:
         assert torch.equal(o1, o2) and torch.equal(l1, l2)
 
 
+@pytest.fixture(scope="module")
+def wenet_hybrid_dir(tmp_path_factory):
+    """A synthetic U2++-style dir: CTC + bitransformer decoder branch."""
+    from oasr.models.decoders import TransformerDecoderConfig
+
+    d = tmp_path_factory.mktemp("wenet_hybrid_ckpt")
+    (d / "train.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "input_dim": 80,
+                "output_dim": 30,
+                "encoder_conf": {
+                    "output_size": 64,
+                    "num_blocks": 2,
+                    "attention_heads": 4,
+                    "linear_units": 128,
+                    "cnn_module_kernel": 15,
+                },
+                "decoder": "bitransformer",
+                "decoder_conf": {
+                    "attention_heads": 2,
+                    "linear_units": 64,
+                    "num_blocks": 2,
+                    "r_num_blocks": 1,
+                },
+                "model_conf": {"ctc_weight": 0.3, "reverse_weight": 0.3},
+            }
+        )
+    )
+    (d / "units.txt").write_text(UNITS, encoding="utf-8")
+
+    cfg = _tiny_model_config()
+    cfg.decoder = TransformerDecoderConfig(
+        vocab_size=30,
+        encoder_output_size=64,
+        attention_heads=2,
+        linear_units=64,
+        num_blocks=2,
+        r_num_blocks=1,
+        sos_id=29,
+        eos_id=29,
+        reverse_weight=0.3,
+    )
+    torch.manual_seed(1)
+    m = ConformerModel.from_config(cfg)
+    sd = {k: v for k, v in m.state_dict().items() if not k.endswith("pos_enc.pe")}
+    sd["ctc.ctc_lo.weight"] = sd["ctc.ctc_lo.weight"][:30].clone()
+    sd["ctc.ctc_lo.bias"] = sd["ctc.ctc_lo.bias"][:30].clone()
+    torch.save(sd, d / "final.pt")
+    return d
+
+
+class TestHybridDecoderBranch:
+    def test_converter_builds_decoder_config(self, wenet_hybrid_dir):
+        arch, bundle = load_checkpoint_bundle(wenet_hybrid_dir)
+        dec = bundle.model_config.decoder
+        assert dec is not None
+        assert (dec.num_blocks, dec.r_num_blocks) == (2, 1)
+        assert (dec.vocab_size, dec.sos_id, dec.eos_id) == (30, 29, 29)
+        assert dec.reverse_weight == pytest.approx(0.3)
+
+    def test_decoder_branch_loads_without_drops(self, wenet_hybrid_dir, caplog):
+        arch, bundle = load_checkpoint_bundle(wenet_hybrid_dir)
+        with caplog.at_level(logging.WARNING, logger="oasr.models.registry"):
+            model, _, report = instantiate_from_bundle(arch, bundle)
+        assert not [k for k in report.dropped if k.startswith("decoder.")]
+        assert not report.missing
+        assert sorted(model.capabilities) == ["ctc", "ctc_aed_rescoring"]
+        assert model.default_decode_type == "ctc"
+        assert "rescoring" not in " ".join(r.message for r in caplog.records)
+
+    def test_native_round_trip_preserves_decoder(self, wenet_hybrid_dir, tmp_path_factory):
+        pytest.importorskip("safetensors")
+        from oasr.checkpoints.convert import convert_to_native
+
+        out = tmp_path_factory.mktemp("native_hybrid") / "bundle"
+        convert_to_native(str(wenet_hybrid_dir), str(out))
+
+        arch1, b1 = load_checkpoint_bundle(wenet_hybrid_dir)
+        m1, _, _ = instantiate_from_bundle(arch1, b1)
+        arch2, b2 = load_checkpoint_bundle(out)
+        assert b2.source_format == "native"
+        m2, cfg2, _ = instantiate_from_bundle(arch2, b2)
+        assert cfg2.decoder is not None and cfg2.decoder.r_num_blocks == 1
+        assert sorted(m2.capabilities) == ["ctc", "ctc_aed_rescoring"]
+        sd1, sd2 = m1.state_dict(), m2.state_dict()
+        assert set(sd1) == set(sd2)
+        for k in sd1:
+            assert torch.equal(sd1[k], sd2[k]), k
+
+
 class TestConvertedCheckpointDataclass:
     def test_defaults(self):
         b = ConvertedCheckpoint(architecture="conformer", model_config=_tiny_model_config())

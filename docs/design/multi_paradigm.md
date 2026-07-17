@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Accepted — in execution (Phases 0–1 implemented on `feat/multi-paradigm-phase0`, 2026-07-16; Phase 1 note: transducer beam search + real-checkpoint WER parity deferred — no icefall transducer checkpoint on the dev box) |
+| **Status** | Accepted — in execution (Phases 0–2 implemented on `feat/multi-paradigm-phase0`, 2026-07-16. Phase 1 note: transducer beam search + real-checkpoint WER parity deferred — no icefall transducer checkpoint on the dev box. Phase 2 note: U2++ rescoring validated against the WeNet reference loop on the real checkpoint; Whisper greedy validated on LJSpeech ground truth (`transformers` parity test importorskip-gated); AED beam search, token-streaming partials, and paged decoder-KV integration into the `aed` strategy deferred — `DecoderKVCacheManager` (K6) ships tested but the strategy uses dense per-request KV) |
 | **Date** | 2026-07-13 |
 | **Baseline** | `main` @ `339395d` (code references below are accurate at this commit) |
 | **Related** | `docs/architecture.md` (current seams), `docs/engine.md`, `docs/serving.md`, `docs/scheduler.md` |

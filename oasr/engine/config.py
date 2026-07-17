@@ -268,11 +268,43 @@ class EngineConfig:
     wfst_decoder_config: Optional[DecoderConfig] = None
     fst_path: Optional[str] = None
 
+    # Decode-method selection among the model's capabilities.  ``None``
+    # (default) runs ``model.default_decode_type`` — the unchanged production
+    # behaviour.  Set to another capability the checkpoint advertises (e.g.
+    # ``"ctc_aed_rescoring"`` on a U2++ hybrid) to opt in; the engine validates
+    # the name against ``model.capabilities`` at construction.
+    decode_method: Optional[str] = None
+
+    # CTC+AED attention rescoring (``decode_method="ctc_aed_rescoring"``).
+    # ``rescoring_ctc_weight`` fuses the CTC n-best score into the decoder
+    # score (WeNet's decode-time ``ctc_weight``; 0.5 is the WeNet U2++ recipe
+    # setting — distinct from the 0.3 *training* loss weight).
+    # ``rescoring_reverse_weight`` weights the right-to-left decoder pass;
+    # ``None`` uses the checkpoint's trained ``reverse_weight`` (0.0 on plain
+    # transformer decoders — the reverse pass is then skipped entirely).
+    # The n-best width is ``ctc_decoder_config.beam_size``.
+    rescoring_ctc_weight: float = 0.5
+    rescoring_reverse_weight: Optional[float] = None
+
     # Transducer (RNNT) greedy decode: cap on non-blank emissions per encoder
     # frame.  Safety bound against degenerate loops; applied uniformly so
     # results are deterministic.  Only read by ``decode_type == "transducer"``
     # models (see ``oasr/engine/decode/transducer.py``).
     transducer_max_sym_per_frame: int = 10
+
+    # Incremental (label-synchronous AR) decode — AED / LLM strategies only.
+    # ``decode_steps_per_tick`` caps the *batched* decoder steps one engine
+    # ``step()`` runs across all pending requests, keeping per-tick work
+    # bounded (the serving dispatcher's contract; see keystone K2 in
+    # docs/design/multi_paradigm.md).  ``max_decode_slots`` caps how many
+    # AR requests may be in flight before new-batch admission pauses;
+    # ``None`` defaults to ``max_batch_size``.  Both are inert for
+    # frame-synchronous strategies (CTC / transducer / rescoring).
+    decode_steps_per_tick: int = 32
+    max_decode_slots: Optional[int] = None
+
+    # AR generation length cap (per request), read by incremental strategies.
+    max_new_tokens: int = 448
 
     # Streaming interim-partial cadence.  After each streaming decode step the
     # engine reads the best-so-far hypothesis back to the host to emit a partial
@@ -333,6 +365,17 @@ class EngineConfig:
                 f"transducer_max_sym_per_frame must be >= 1, got "
                 f"{self.transducer_max_sym_per_frame!r}"
             )
+        if self.decode_steps_per_tick < 1:
+            raise ValueError(
+                f"decode_steps_per_tick must be >= 1, got {self.decode_steps_per_tick!r}"
+            )
+        if self.max_decode_slots is not None and self.max_decode_slots < 1:
+            raise ValueError(
+                f"max_decode_slots must be a positive int or None, got "
+                f"{self.max_decode_slots!r}"
+            )
+        if self.max_new_tokens < 1:
+            raise ValueError(f"max_new_tokens must be >= 1, got {self.max_new_tokens!r}")
         if self.enable_sequence_packing:
             if self.service_mode != "offline":
                 raise ValueError("enable_sequence_packing requires service_mode='offline'")
@@ -344,6 +387,10 @@ class EngineConfig:
         # explicitly, so a converter-emitted FeatureSpec / TokenizerSpec can
         # fill the defaults without overriding a deliberate choice (the engine
         # warns loudly when an explicit value disagrees with the spec).
+        # ``audio_scale`` counts as explicit only when it differs from the
+        # class default (32768.0 — setting the default explicitly is a no-op);
+        # Whisper checkpoints need the spec to flip it to 1.0.
+        self._audio_scale_explicit = self.audio_scale != 32768.0
         self._feature_config_explicit = self.feature_config is not None
         self._tokenizer_paths_explicit = (
             self.sentencepiece_model is not None or self.unit_table is not None

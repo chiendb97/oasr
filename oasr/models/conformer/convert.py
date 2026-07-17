@@ -29,6 +29,7 @@ import yaml
 
 from oasr.layers.norm import GlobalCMVN
 
+from ..decoders.transformer_decoder import TransformerDecoderConfig
 from .config import ConformerEncoderConfig, ConformerModelConfig
 from .model import ConformerModel
 
@@ -63,12 +64,42 @@ def build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
         embed_layer_norm=False,
     )
 
-    vocab_size = raw.get("output_dim")
+    raw_vocab = raw.get("output_dim")
+    vocab_size = raw_vocab
     if vocab_size % 8 != 0:
         vocab_size = (vocab_size // 8 + 1) * 8
+
+    # U2/U2++ AED decoder branch: keep the (bi)transformer decoder for the
+    # ``ctc_aed_rescoring`` capability.  The decoder's vocab is the *raw*
+    # (unpadded) output_dim; WeNet's <sos/eos> is the last raw unit.
+    decoder_cfg = None
+    dec_name = raw.get("decoder")
+    dec = raw.get("decoder_conf") or {}
+    if dec_name in ("transformer", "bitransformer") and raw_vocab:
+        model_conf = raw.get("model_conf") or {}
+        decoder_cfg = TransformerDecoderConfig(
+            vocab_size=int(raw_vocab),
+            encoder_output_size=encoder_cfg.output_size,
+            attention_heads=dec.get("attention_heads", 4),
+            linear_units=dec.get("linear_units", 2048),
+            num_blocks=dec.get("num_blocks", 6),
+            r_num_blocks=dec.get("r_num_blocks", 0) if dec_name == "bitransformer" else 0,
+            sos_id=int(raw_vocab) - 1,
+            eos_id=int(raw_vocab) - 1,
+            reverse_weight=float(model_conf.get("reverse_weight", 0.0)),
+        )
+    elif dec_name:
+        logger.warning(
+            "train.yaml declares decoder=%r, which OASR does not model; the "
+            "checkpoint's decoder.* weights will be dropped and attention "
+            "rescoring will be unavailable",
+            dec_name,
+        )
+
     return ConformerModelConfig(
         encoder=encoder_cfg,
         vocab_size=vocab_size,
+        decoder=decoder_cfg,
     )
 
 
@@ -97,13 +128,16 @@ class WenetConverter:
     """
 
     #: Weight-drop accounting (read by the registry after ``load_weights``):
-    #: nothing in a WeNet dir is *expected* to be dropped silently, and dropping
-    #: the U2++ bi-transformer decoder is a named capability loss.
+    #: nothing in a WeNet dir is *expected* to be dropped silently.  The U2++
+    #: (bi)transformer decoder loads as the ``ctc_aed_rescoring`` capability;
+    #: this hint only fires for decoder types OASR does not model (the
+    #: ``decoder.*`` weights are then dropped by ``load_weights``).
     expected_unused_prefixes: Tuple[str, ...] = ()
     capability_drop_hints: Dict[str, str] = {
         "decoder.": (
-            "the U2++ attention-decoder (CTC+AED rescoring) branch is not loaded; "
-            "attention rescoring lands with the multi-paradigm Phase 2"
+            "the attention-decoder (CTC+AED rescoring) branch was not loaded "
+            "(unsupported decoder type in train.yaml); attention rescoring is "
+            "unavailable for this checkpoint"
         ),
     }
 

@@ -71,11 +71,18 @@ class FeatureConfig:
     high_freq: float = 0.0
     snip_edges: bool = True
     backend: str = "torchaudio"
+    # Whisper log-mel only (``feature_type="whisper_logmel"``): every
+    # utterance is padded/trimmed to this many seconds (30 s → 3000 frames →
+    # 1500 encoder positions) and globally max-normalized, per the Whisper
+    # recipe.  Kaldi fields above are ignored except ``sample_rate`` /
+    # ``num_mel_bins``; the STFT geometry is fixed (n_fft 400, hop 160).
+    whisper_chunk_seconds: float = 30.0
 
     def __post_init__(self) -> None:
-        if self.feature_type not in ("fbank", "mfcc"):
+        if self.feature_type not in ("fbank", "mfcc", "whisper_logmel"):
             raise ValueError(
-                f"feature_type must be 'fbank' or 'mfcc', got {self.feature_type!r}"
+                f"feature_type must be 'fbank', 'mfcc', or 'whisper_logmel', "
+                f"got {self.feature_type!r}"
             )
         if self.backend not in ("torchaudio", "kaldifeat"):
             raise ValueError(

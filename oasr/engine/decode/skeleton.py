@@ -72,11 +72,7 @@ class _AutoregressiveSkeleton(DecodeStrategy):
         self._unimplemented()
 
 
-@register_decode_strategy("aed")
-class AedDecodeStrategy(_AutoregressiveSkeleton):
-    """Attention encoder-decoder (label-synchronous beam with cross-attention)."""
-
-    decode_type: ClassVar[str] = "aed"
+# "aed" is a full implementation now — see ``oasr/engine/decode/aed.py``.
 
 
 @register_decode_strategy("llm")

@@ -268,6 +268,12 @@ class InputProcessor:
         preserved when the fast path is unavailable.
         """
         fcfg = self._feature_config
+        if fcfg.feature_type == "whisper_logmel":
+            from oasr.features.whisper import batched_whisper_logmel
+
+            lengths_device = wav_lengths.to(self._device, non_blocking=True)
+            features_f32, feat_lengths = batched_whisper_logmel(wav_device, lengths_device, fcfg)
+            return features_f32.to(dtype=self._config.dtype), feat_lengths
         if supports_batched_fbank(fcfg) or supports_batched_mfcc(fcfg):
             lengths_device = wav_lengths.to(self._device, non_blocking=True)
             batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank

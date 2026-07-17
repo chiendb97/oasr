@@ -55,6 +55,7 @@ from oasr.cache.slot_pool import StreamSlotPool
 from oasr.cache.attention_cache import AttentionCacheManager
 from oasr.cache.cnn_cache import CnnCacheManager
 from oasr.cache.ctc_state import CtcStateCacheManager
+from oasr.cache.decoder_kv import DecoderKVCacheManager
 from oasr.cache.stream import StreamContext
 
 __all__ = [
@@ -66,5 +67,6 @@ __all__ = [
     "AttentionCacheManager",
     "CnnCacheManager",
     "CtcStateCacheManager",
+    "DecoderKVCacheManager",
     "StreamContext",
 ]

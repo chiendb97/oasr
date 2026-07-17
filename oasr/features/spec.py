@@ -54,11 +54,17 @@ class FeatureSpec:
         return cls(**{k: v for k, v in d.items() if k in known})
 
     def to_feature_config(self) -> FeatureConfig:
-        """Materialize a :class:`FeatureConfig` for the Kaldi-backed kinds."""
+        """Materialize a :class:`FeatureConfig` for the supported kinds."""
+        if self.kind == "whisper_logmel":
+            return FeatureConfig(
+                feature_type="whisper_logmel",
+                sample_rate=self.sample_rate,
+                num_mel_bins=self.feature_dim,
+            )
         if self.kind not in _KALDI_KINDS:
             raise ValueError(
                 f"FeatureSpec kind {self.kind!r} has no FeatureConfig mapping; "
-                f"supported: {sorted(_KALDI_KINDS)}"
+                f"supported: {sorted(_KALDI_KINDS) + ['whisper_logmel']}"
             )
         cfg = FeatureConfig(
             feature_type=_KALDI_KINDS[self.kind],
@@ -79,6 +85,16 @@ class FeatureSpec:
         Only the fields the spec pins are compared; returns human-readable
         ``"name: spec=... config=..."`` strings (empty list = compatible).
         """
+        if self.kind == "whisper_logmel":
+            diffs = []
+            for name, spec_v, cfg_v in [
+                ("feature_type", "whisper_logmel", config.feature_type),
+                ("sample_rate", self.sample_rate, config.sample_rate),
+                ("feature_dim", self.feature_dim, config.num_mel_bins),
+            ]:
+                if spec_v != cfg_v:
+                    diffs.append(f"{name}: spec={spec_v!r} config={cfg_v!r}")
+            return diffs
         if self.kind not in _KALDI_KINDS:
             return [f"kind: spec={self.kind!r} config=kaldi ({config.feature_type!r})"]
         diffs = []

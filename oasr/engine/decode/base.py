@@ -15,14 +15,17 @@ The engine drives a strategy through ``OutputProcessor`` (a thin facade):
   on finalize/abort.
 
 ``consumes`` declares what the runner should feed the strategy: ``"log_probs"``
-(CTC — encoder+head fused, the CUDA-graph fast path) or ``"hidden"`` (raw encoder
-states for autoregressive families that own their head/decoder).
+(CTC — encoder+head fused, the CUDA-graph fast path), ``"hidden"`` (raw encoder
+states for autoregressive families that own their head/decoder), or ``"both"``
+(one encoder pass + head applied — an :class:`EncodeOutput` carrying hidden
+*and* log-probs, needed for CTC+AED rescoring).
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Type
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Type
 
 import torch
 
@@ -32,7 +35,22 @@ if TYPE_CHECKING:
     from oasr.models.base import BaseAsrModel
 
     from ..config import EngineConfig
+    from ..generation import StepBudget
     from .detokenize import Detokenizer
+
+
+@dataclass
+class EncodeOutput:
+    """Encoder products for strategies consuming more than one tensor.
+
+    The offline executor passes a plain hidden / log-probs tensor for
+    ``consumes == "hidden"`` / ``"log_probs"`` (the unchanged fast paths) and
+    an :class:`EncodeOutput` for ``consumes == "both"`` — one encoder forward,
+    both views.  Lengths stay a separate argument (same for every view).
+    """
+
+    hidden: Optional[torch.Tensor] = None
+    log_probs: Optional[torch.Tensor] = None
 
 
 class DecodeStrategy(ABC):
@@ -46,8 +64,13 @@ class DecodeStrategy(ABC):
 
     #: Decode family this strategy serves ("ctc", "transducer", "aed", "llm").
     decode_type: ClassVar[str]
-    #: Encoder output the engine feeds: "log_probs" (fused head) or "hidden".
+    #: Encoder output the engine feeds: "log_probs" (fused head), "hidden",
+    #: or "both" (an :class:`EncodeOutput` with hidden + log-probs).
     consumes: ClassVar[str] = "log_probs"
+    #: Label-synchronous AR strategies (AED / LLM) set this True and implement
+    #: the incremental protocol below; the offline executor then runs bounded
+    #: decoder steps per tick instead of the one-shot :meth:`decode_offline`.
+    incremental: ClassVar[bool] = False
 
     # -- offline -----------------------------------------------------------
     @abstractmethod
@@ -60,6 +83,31 @@ class DecodeStrategy(ABC):
         ``request_id=""`` — the executor fills the id), in batch order.
         """
         raise NotImplementedError
+
+    # -- incremental offline protocol (``incremental = True`` strategies) ---
+    def begin_offline(
+        self,
+        requests: List[Request],
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+    ) -> None:
+        """Prefill for a freshly-encoded micro-batch: stash the encoder
+        output, initialize per-request hypotheses + decoder state.  The
+        requests stay ``RUNNING`` across engine steps; their outputs are
+        produced by :meth:`advance`.  Only ``incremental = True`` strategies
+        implement this."""
+        raise NotImplementedError(f"{type(self).__name__} is not an incremental strategy")
+
+    def advance(self, budget: "StepBudget") -> List[RequestOutput]:
+        """Run at most ``budget.max_steps`` *batched* decoder steps across all
+        pending requests (continuous batching) and return the outputs produced
+        this tick — partials (``finished=False``) and/or finals.  The executor
+        finalizes requests whose output has ``finished=True``."""
+        raise NotImplementedError(f"{type(self).__name__} is not an incremental strategy")
+
+    def has_pending(self) -> bool:
+        """Whether any request begun via :meth:`begin_offline` is unfinished."""
+        return False
 
     # -- streaming session lifecycle --------------------------------------
     def create_session(self, request: Request) -> None:
@@ -112,10 +160,11 @@ def register_decode_strategy(name: str):
 
 
 def _strategy_name(decode_type: str, config: "EngineConfig") -> str:
-    """Resolve the registry key from the model's decode family + engine config.
+    """Resolve the registry key from the decode family + engine config.
 
-    CTC splits into GPU vs WFST by ``config.decoder_type``; AR families key
-    directly on ``decode_type``.
+    ``decode_type`` is either the model's default family or an explicit
+    ``EngineConfig.decode_method`` capability name.  CTC splits into GPU vs
+    WFST by ``config.decoder_type``; every other family keys directly.
     """
     if decode_type == "ctc":
         return config.decoder_type  # "ctc_cuda" | "ctc_wfst"
