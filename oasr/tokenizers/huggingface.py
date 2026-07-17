@@ -3,23 +3,37 @@
 """HuggingFace ``tokenizer.json`` tokenizer (AED / LLM checkpoints).
 
 Wraps the ``tokenizers`` fast-tokenizer runtime directly (no ``transformers``
-dependency).  Emitted by HF-format converters (Whisper / speech-LLM) in later
-phases; registered here so the axis is complete from day one.
+dependency).  Emitted by HF-format converters (Whisper / speech-LLM).
+
+Some HF checkpoints (Qwen2-Audio among them) declare added special tokens only
+in ``tokenizer_config.json``'s ``added_tokens_decoder`` — ``transformers``
+merges them into the fast tokenizer at load time, and prompt encoding breaks
+without them (``<|audio_bos|>`` would BPE-split into plain text).  When the
+spec carries a ``tokenizer_config`` file, the missing entries are added here
+the same way: in declared-id order, relying on the backend's sequential id
+assignment, with a loud warning if any id lands somewhere else.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import FrozenSet, List, Optional, Sequence
 
 from .base import Tokenizer, TokenizerSpec
 from .registry import register_tokenizer
+
+logger = logging.getLogger(__name__)
 
 
 class HuggingFaceTokenizer(Tokenizer):
     """Wraps a ``tokenizers.Tokenizer`` loaded from a ``tokenizer.json``."""
 
     def __init__(
-        self, tokenizer_json_path: str, special_ids: Optional[FrozenSet[int]] = None
+        self,
+        tokenizer_json_path: str,
+        special_ids: Optional[FrozenSet[int]] = None,
+        tokenizer_config_path: Optional[str] = None,
     ) -> None:
         try:
             from tokenizers import Tokenizer as HFTokenizer
@@ -30,9 +44,45 @@ class HuggingFaceTokenizer(Tokenizer):
                 "`pip install oasr[tokenizers]` or `pip install tokenizers`"
             ) from exc
         self._tok = HFTokenizer.from_file(tokenizer_json_path)
+        if tokenizer_config_path:
+            self._merge_added_tokens(tokenizer_config_path)
         # HF tokenizers know their own added special tokens; the explicit set is
         # an additional strip list on top of skip_special_tokens=True.
         self._special_ids = frozenset() if special_ids is None else special_ids
+
+    def _merge_added_tokens(self, tokenizer_config_path: str) -> None:
+        """Add ``added_tokens_decoder`` entries missing from ``tokenizer.json``."""
+        from tokenizers import AddedToken
+
+        with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        entries = sorted((cfg.get("added_tokens_decoder") or {}).items(), key=lambda kv: int(kv[0]))
+        for tid, info in entries:
+            content = info["content"]
+            if self._tok.token_to_id(content) is not None:
+                continue
+            token = AddedToken(
+                content,
+                single_word=bool(info.get("single_word", False)),
+                lstrip=bool(info.get("lstrip", False)),
+                rstrip=bool(info.get("rstrip", False)),
+                normalized=bool(info.get("normalized", False)),
+                special=bool(info.get("special", True)),
+            )
+            if token.special:
+                self._tok.add_special_tokens([token])
+            else:
+                self._tok.add_tokens([token])
+            got = self._tok.token_to_id(content)
+            if got != int(tid):
+                logger.warning(
+                    "added token %r landed at id %s (tokenizer_config.json "
+                    "declares %s) — encode/decode ids may not match the "
+                    "checkpoint",
+                    content,
+                    got,
+                    tid,
+                )
 
     @classmethod
     def from_spec(cls, spec: TokenizerSpec) -> "HuggingFaceTokenizer":
@@ -40,6 +90,7 @@ class HuggingFaceTokenizer(Tokenizer):
         return cls(
             spec.files["tokenizer"],
             special_ids=None if ids is None else frozenset(int(i) for i in ids),
+            tokenizer_config_path=spec.files.get("tokenizer_config"),
         )
 
     @property

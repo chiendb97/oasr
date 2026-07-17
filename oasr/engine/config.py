@@ -306,6 +306,11 @@ class EngineConfig:
     # AR generation length cap (per request), read by incremental strategies.
     max_new_tokens: int = 448
 
+    # Speech-LLM user prompt (``decode_method="llm"``): the text placed in the
+    # checkpoint's chat template next to the audio (e.g. Qwen2-Audio's ASR
+    # prompt).  ``None`` uses the model config's ``default_user_prompt``.
+    llm_prompt: Optional[str] = None
+
     # Streaming interim-partial cadence.  After each streaming decode step the
     # engine reads the best-so-far hypothesis back to the host to emit a partial
     # transcript — a per-stream device→host sync that, profiled, is ~17% of

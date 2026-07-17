@@ -127,6 +127,8 @@ def _ensure_builtins() -> None:
         import oasr.models.whisper  # noqa: F401
     if "paraformer" not in _REGISTRY:
         import oasr.models.paraformer  # noqa: F401
+    if "speech_llm" not in _REGISTRY:
+        import oasr.models.speech_llm  # noqa: F401
 
 
 def get_model_entry(name: str) -> ModelEntry:
@@ -288,9 +290,12 @@ def instantiate_from_bundle(
         report = model.load_weights(bundle.state_dict)
         _log_load_report(report, entry.converter, arch)
 
-    model = model.to(device=device)
+    # Cast on the host first, then move: a big LLM checkpoint held fp32 may
+    # not fit the GPU at all (8.4B fp32 = 33.6 GB), and the bf16 transfer is
+    # half the PCIe traffic.  CPU vs GPU casts round identically.
     if dtype is not None:
         model = model.to(dtype=dtype)
+    model = model.to(device=device)
     model.eval()
     return model, bundle.model_config, report
 
@@ -317,8 +322,10 @@ def build_model_from_checkpoint(
         dtype: Optional dtype to cast the model into after loading.
         architecture: Explicit registry key, skipping format detection.
     """
+    # State dict host-side, model moved last — see the matching note in
+    # ``loaders.load_pretrained`` (a GPU-mapped bundle would double-book VRAM).
     arch, bundle = load_checkpoint_bundle(
-        ckpt_dir, checkpoint_name, map_location=device, architecture=architecture
+        ckpt_dir, checkpoint_name, map_location="cpu", architecture=architecture
     )
     model, config, _report = instantiate_from_bundle(arch, bundle, device=device, dtype=dtype)
     logger.info("Loaded %r model from %s (eval mode)", arch, ckpt_dir)

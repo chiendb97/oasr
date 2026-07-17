@@ -13,9 +13,10 @@ Reproduces ``whisper.audio.log_mel_spectrogram`` + ``pad_or_trim``:
 * ``log10`` clamped at 1e-10, floored at ``max - 8``, then ``(x + 4) / 4``.
 
 The global max-normalization couples frames within one utterance but not
-across utterances, so the batch dimension is safe.  Output frame counts are
-uniform (all rows = 3000 frames), which is what makes the Whisper encoder's
-fixed 1500-position geometry work.
+across utterances, so the batch dimension is safe.  The feature tensor is
+always the full window (all rows = 3000 frames — the Whisper encoder's fixed
+1500-position geometry); the returned lengths carry each row's *real* frame
+count for consumers that mask padding (the Qwen2-Audio tower).
 """
 
 from __future__ import annotations
@@ -79,8 +80,11 @@ def batched_whisper_logmel(
         ``(B, n_frames, num_mel_bins)`` float32 — ``n_frames`` = 3000 for the
         standard 30 s window.
     feat_lengths : Tensor
-        ``(B,)`` int32, all equal to ``n_frames`` (Whisper consumes the padded
-        30 s window as real input by design).
+        ``(B,)`` int32 — *real* per-row frame counts ``ceil(len / hop)``
+        clamped to ``n_frames`` (HF ``WhisperFeatureExtractor``'s
+        ``attention_mask`` semantics).  Whisper-style consumers treat the
+        padded 30 s window as real input and ignore these; masked consumers
+        (the Qwen2-Audio tower) key their padding mask off them.
     """
     assert waveforms.dim() == 2, "waveforms must be (B, T)"
     B, T = waveforms.shape
@@ -112,4 +116,7 @@ def batched_whisper_logmel(
 
     features = log_spec.transpose(1, 2).contiguous()  # (B, n_frames, n_mels)
     n_frames = features.size(1)
-    return features, torch.full((B,), n_frames, dtype=torch.int32, device=device)
+    # HF attention-mask frame count: samples at indices 0, hop, 2·hop, … < len.
+    feat_lengths = torch.div(lengths.to(device) + _HOP - 1, _HOP, rounding_mode="floor")
+    feat_lengths = feat_lengths.clamp(max=n_frames).to(torch.int32)
+    return features, feat_lengths

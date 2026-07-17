@@ -56,7 +56,7 @@ def test_build_ctc_strategies_by_decoder_type():
     assert gpu.consumes == "log_probs" and gpu.decode_type == "ctc"
 
 
-@pytest.mark.parametrize("dt", ["transducer", "llm"])
+@pytest.mark.parametrize("dt", ["transducer"])
 def test_ar_strategies_resolve_and_consume_hidden(dt):
     s = build_decode_strategy(dt, _stub_config(), Detokenizer(None, None))
     assert s.decode_type == dt
@@ -75,12 +75,16 @@ def test_aed_is_incremental_and_needs_a_capable_model():
         build_decode_strategy("aed", _stub_config(), Detokenizer(None, None))
 
 
-def test_llm_skeleton_raises_not_implemented():
-    s = build_decode_strategy("llm", _stub_config(), Detokenizer(None, None))
-    with pytest.raises(NotImplementedError):
-        s.decode_offline(None, None)
-    with pytest.raises(NotImplementedError):
-        s.finalize(None)
+def test_llm_is_incremental_and_needs_a_capable_model():
+    """``llm`` is a real strategy now: it declares the incremental protocol
+    and refuses models without the speech-LLM prompt/decoder surface."""
+    from oasr.engine.decode import get_decode_strategy_class
+
+    cls = get_decode_strategy_class("llm", _stub_config())
+    assert cls.__name__ == "LlmDecodeStrategy"
+    assert cls.consumes == "hidden" and cls.incremental is True
+    with pytest.raises(ValueError, match="prefill"):
+        build_decode_strategy("llm", _stub_config(), Detokenizer(None, None))
 
 
 def test_transducer_offline_and_streaming_implemented():

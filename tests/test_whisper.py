@@ -53,11 +53,14 @@ def _tiny_config(**overrides):
 class TestWhisperLogmel:
     CFG = FeatureConfig(feature_type="whisper_logmel", whisper_chunk_seconds=1.0)
 
-    def test_shapes_and_uniform_lengths(self):
+    def test_shapes_and_true_lengths(self):
         wav = torch.randn(3, 12000) * 0.1
         feats, lens = batched_whisper_logmel(wav, torch.tensor([12000, 8000, 4000]), self.CFG)
+        # Features always span the padded window; lengths carry the real
+        # ceil(len/hop) frame counts (HF attention-mask semantics — the
+        # Whisper encoder ignores them, the Qwen2-Audio tower masks by them).
         assert feats.shape == (3, 100, 80)
-        assert lens.tolist() == [100, 100, 100]  # padded window is real input
+        assert lens.tolist() == [75, 50, 25]
 
     def test_normalization_range(self):
         wav = torch.randn(1, 16000) * 0.5

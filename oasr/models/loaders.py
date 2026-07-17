@@ -150,8 +150,13 @@ def load_pretrained(
         cache_dir=cache_dir,
         allow_patterns=allow_patterns,
     )
+    # The bundle's state dict always lands host-side: mapping it onto the GPU
+    # would keep a full second weight copy resident (the bundle stays alive
+    # for its specs) while the model moves over — an 8.4B-parameter speech-LLM
+    # checkpoint then cannot fit at all.  ``instantiate_from_bundle`` moves the
+    # weight-loaded model to ``device`` as its final step.
     arch, bundle = load_checkpoint_bundle(
-        local_dir, checkpoint_name, map_location=device, architecture=architecture
+        local_dir, checkpoint_name, map_location="cpu", architecture=architecture
     )
     model, config, report = instantiate_from_bundle(arch, bundle, device=device, dtype=dtype)
     logger.info("Loaded %r model from %s (eval mode)", arch, local_dir)
