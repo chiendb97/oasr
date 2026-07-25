@@ -514,6 +514,7 @@ fn enqueue_admit_locked(
             request_id,
             sample_rate,
             priority,
+            decoding,
         } => {
             let load = shared.load.load(Ordering::Relaxed);
             if load >= max_concurrent {
@@ -547,6 +548,7 @@ fn enqueue_admit_locked(
                 audio,
                 sample_rate,
                 priority,
+                decoding,
             });
             out_events.push(Event::Accepted { request_id });
         }
@@ -554,6 +556,7 @@ fn enqueue_admit_locked(
             request_id,
             sample_rate,
             priority,
+            decoding,
         } => {
             let load = shared.load.load(Ordering::Relaxed);
             if load >= max_concurrent {
@@ -576,6 +579,7 @@ fn enqueue_admit_locked(
                 rid: request_id.clone(),
                 sample_rate,
                 priority,
+                decoding,
             });
             out_events.push(Event::Accepted { request_id });
         }

@@ -18,7 +18,10 @@ length and — for Whisper's fixed 30 s window — uniform encoder length), and
 each ``advance`` round-robins one batched decoder step across groups until the
 tick budget is spent.  Rows leave their group as they emit EOS or hit the
 length cap; finished requests produce final outputs (greedy emits finals only
-— token-streaming partials land with the LLM phase).
+— token-streaming partials land with the LLM phase).  Per-request
+:class:`~oasr.engine.request.DecodingOptions` carry a generation cap and
+sampling knobs; ``prompt`` is ignored (Whisper's SOT sequence is
+checkpoint-fixed).
 """
 
 from __future__ import annotations
@@ -28,7 +31,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
-from ..request import Request, RequestOutput
+from ..generation import select_next_tokens
+from ..request import DecodingOptions, Request, RequestOutput
 from .base import DecodeStrategy, register_decode_strategy
 
 if TYPE_CHECKING:
@@ -49,13 +53,15 @@ class _Group:
         requests: List[Request],
         state: Dict[str, Any],
         last_logits: torch.Tensor,
-        max_new_tokens: int,
+        max_new_rows: List[int],
+        opts_rows: List[Optional[DecodingOptions]],
     ) -> None:
         self.requests = list(requests)
         self.state = state
-        self.last_logits = last_logits  # (B_active, V) — pending argmax input
+        self.last_logits = last_logits  # (B_active, V) — pending selection input
         self.tokens: List[List[int]] = [[] for _ in requests]
-        self.max_new_tokens = max_new_tokens
+        self.max_new = list(max_new_rows)  # per-row generation cap
+        self.opts = list(opts_rows)  # per-row DecodingOptions (None = defaults)
 
 
 @register_decode_strategy("aed")
@@ -87,8 +93,8 @@ class AedDecodeStrategy(DecodeStrategy):
         self._eos = int(mcfg.eos_token_id)
         self._suppress = sorted(set(int(t) for t in mcfg.suppress_tokens))
         self._begin_suppress = sorted(set(int(t) for t in mcfg.begin_suppress_tokens))
-        cap = int(mcfg.max_target_positions) - len(self._prompt) - 1
-        self._max_new_tokens = max(1, min(int(config.max_new_tokens), cap))
+        self._cap = int(mcfg.max_target_positions) - len(self._prompt) - 1
+        self._max_new_tokens = max(1, min(int(config.max_new_tokens), self._cap))
         self._groups: List[_Group] = []
 
     # ------------------------------------------------------------------
@@ -105,9 +111,21 @@ class AedDecodeStrategy(DecodeStrategy):
         device = enc_out.device
         prompt = torch.tensor(self._prompt, dtype=torch.long, device=device)
         prompt_ids = prompt.unsqueeze(0).expand(enc_out.size(0), -1).contiguous()
+        # Per-row generation cap: DecodingOptions.max_new_tokens (else the
+        # engine default) clamped by the decoder's position capacity
+        # (``self._max_new_tokens`` already folds the config cap + capacity).
+        opts_rows: List[Optional[DecodingOptions]] = [
+            getattr(r, "decoding", None) for r in requests
+        ]
+        max_new_rows: List[int] = []
+        for opts in opts_rows:
+            if opts is not None and opts.max_new_tokens is not None:
+                max_new_rows.append(max(1, min(int(opts.max_new_tokens), self._cap)))
+            else:
+                max_new_rows.append(self._max_new_tokens)
         with torch.no_grad():
             logits, state = self._decoder.prefill(enc_out, prompt_ids)
-        self._groups.append(_Group(requests, state, logits, self._max_new_tokens))
+        self._groups.append(_Group(requests, state, logits, max_new_rows, opts_rows))
 
     def has_pending(self) -> bool:
         return bool(self._groups)
@@ -130,23 +148,28 @@ class AedDecodeStrategy(DecodeStrategy):
             logits[:, self._suppress] = float("-inf")
         if first_step and self._begin_suppress:
             logits[:, self._begin_suppress] = float("-inf")
-        next_tokens = logits.argmax(dim=-1)  # (B_active,)
+        next_tokens = select_next_tokens(logits, group.opts)  # (B_active,)
 
         toks = next_tokens.cpu().tolist()
         finished_rows: List[int] = []
+        reasons: Dict[int, str] = {}
         for row, tok in enumerate(toks):
             if tok == self._eos:
                 finished_rows.append(row)
+                reasons[row] = "stop"
             else:
                 group.tokens[row].append(int(tok))
-                if len(group.tokens[row]) >= group.max_new_tokens:
+                if len(group.tokens[row]) >= group.max_new[row]:
                     finished_rows.append(row)
+                    reasons[row] = "length"
 
-        outputs = [self._finalize_row(group, row) for row in finished_rows]
+        outputs = [self._finalize_row(group, row, reasons[row]) for row in finished_rows]
         if finished_rows:
             keep = [r for r in range(len(group.requests)) if r not in finished_rows]
             group.requests = [group.requests[r] for r in keep]
             group.tokens = [group.tokens[r] for r in keep]
+            group.max_new = [group.max_new[r] for r in keep]
+            group.opts = [group.opts[r] for r in keep]
             if keep:
                 keep_idx = torch.tensor(keep, dtype=torch.long, device=next_tokens.device)
                 group.state = self._decoder.select(group.state, keep_idx)
@@ -157,13 +180,14 @@ class AedDecodeStrategy(DecodeStrategy):
                 group.last_logits, group.state = self._decoder.step(next_tokens, group.state)
         return outputs
 
-    def _finalize_row(self, group: _Group, row: int) -> RequestOutput:
+    def _finalize_row(self, group: _Group, row: int, reason: str) -> RequestOutput:
         tokens = group.tokens[row]
         return RequestOutput(
             request_id=group.requests[row].request_id,
             text=self._detok.detokenize(tokens),
             tokens=[tokens],
             finished=True,
+            finish_reason=reason,
         )
 
     # ------------------------------------------------------------------
@@ -177,6 +201,8 @@ class AedDecodeStrategy(DecodeStrategy):
                 keep = [r for r in range(len(group.requests)) if r != row]
                 group.requests.pop(row)
                 group.tokens.pop(row)
+                group.max_new.pop(row)
+                group.opts.pop(row)
                 if keep:
                     keep_idx = torch.tensor(keep, dtype=torch.long, device=group.last_logits.device)
                     group.state = self._decoder.select(group.state, keep_idx)

@@ -111,6 +111,46 @@ class ZipformerEncoder(BaseEncoder):
         out = out.permute(1, 0, 2)  # (B, T'', Cmax)
         return out, out_lens, [new_embed] + new_enc
 
+    # -- batched-state streaming (stateful backend batching) ----------------
+    #
+    # State layout (``get_streaming_init_states``): ``states[0]`` is the
+    # embed ConvNeXt cache ``(B, C, pad, freq)`` — batch dim 0 — followed by
+    # six tensors per layer: ``cached_key (L, B, K)``,
+    # ``cached_nonlin_attn (1, B, L, H)``, ``cached_val1/2 (L, B, V)``
+    # (batch dim 1) and ``cached_conv1/2 (B, C, P)`` (batch dim 0).  Same
+    # per-kind dims as icefall's ``streaming_decode.py`` stack/unstack.
+    _STATE_BATCH_DIM_CYCLE = (1, 1, 1, 1, 0, 0)
+
+    def _state_batch_dim(self, i: int) -> int:
+        return 0 if i == 0 else self._STATE_BATCH_DIM_CYCLE[(i - 1) % 6]
+
+    def stack_streaming_states(self, states_list: List[List[Tensor]]) -> List[Tensor]:
+        """Stack per-stream state lists into one batched state list.
+
+        Enables the stateful streaming backend to run one ``B = N`` chunk
+        forward over N streams instead of N sequential ``B = 1`` forwards.
+        """
+        n = len(states_list[0])
+        return [
+            torch.cat([s[i] for s in states_list], dim=self._state_batch_dim(i)) for i in range(n)
+        ]
+
+    def unstack_streaming_states(self, states: List[Tensor]) -> List[List[Tensor]]:
+        """Split a batched state list back into per-stream state lists.
+
+        Returns views into the batched tensors (no copy); each stream's next
+        chunk re-stacks them, so the shared storage is transient.
+        """
+        outs: List[List[Tensor]] = []
+        for i, t in enumerate(states):
+            dim = self._state_batch_dim(i)
+            rows = t.split(1, dim=dim)
+            if not outs:
+                outs = [[] for _ in range(len(rows))]
+            for b, row in enumerate(rows):
+                outs[b].append(row)
+        return outs
+
     # -- introspection (feeds CacheSpec) -----------------------------------
     @property
     def num_encoder_layers(self) -> int:

@@ -9,7 +9,7 @@
 
 use bytes::Bytes;
 use numpy::{PyArray1, PyArrayMethods};
-use oasr_wire::{ErrorCode, Event, ModelInfo};
+use oasr_wire::{DecodingParams, ErrorCode, Event, ModelInfo};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use thiserror::Error;
@@ -26,11 +26,13 @@ pub enum AdmitSpec {
         audio: Bytes,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<DecodingParams>,
     },
     Streaming {
         rid: String,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<DecodingParams>,
     },
 }
 
@@ -166,14 +168,16 @@ impl PyEngine {
         audio: &[u8],
         sample_rate: u32,
         priority: i32,
+        decoding: Option<&DecodingParams>,
     ) -> Result<(), PyEngineError> {
         Python::with_gil(|py| {
             let bound = self.engine.bind(py);
-            Self::add_offline_locked(py, &bound, rid, audio, sample_rate, priority)
+            Self::add_offline_locked(py, &bound, rid, audio, sample_rate, priority, decoding)
         })
     }
 
     /// GIL-already-held variant of [`add_offline`].
+    #[allow(clippy::too_many_arguments)]
     pub fn add_offline_locked<'py>(
         py: Python<'py>,
         bound: &Bound<'py, PyAny>,
@@ -181,6 +185,7 @@ impl PyEngine {
         audio: &[u8],
         sample_rate: u32,
         priority: i32,
+        decoding: Option<&DecodingParams>,
     ) -> Result<(), PyEngineError> {
         let arr = audio_bytes_to_numpy(py, audio)?;
         let kwargs = PyDict::new_bound(py);
@@ -189,6 +194,9 @@ impl PyEngine {
         kwargs.set_item("sample_rate", sample_rate)?;
         kwargs.set_item("streaming", false)?;
         kwargs.set_item("priority", priority)?;
+        if let Some(dict) = decoding_params_dict(py, decoding)? {
+            kwargs.set_item("decoding", dict)?;
+        }
         bound.call_method("add_request", (), Some(&kwargs))?;
         Ok(())
     }
@@ -198,10 +206,11 @@ impl PyEngine {
         rid: &str,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<&DecodingParams>,
     ) -> Result<(), PyEngineError> {
         Python::with_gil(|py| {
             let bound = self.engine.bind(py);
-            Self::add_streaming_locked(py, &bound, rid, sample_rate, priority)
+            Self::add_streaming_locked(py, &bound, rid, sample_rate, priority, decoding)
         })
     }
 
@@ -212,11 +221,15 @@ impl PyEngine {
         rid: &str,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<&DecodingParams>,
     ) -> Result<(), PyEngineError> {
         let kwargs = PyDict::new_bound(py);
         kwargs.set_item("request_id", rid)?;
         kwargs.set_item("sample_rate", sample_rate)?;
         kwargs.set_item("priority", priority)?;
+        if let Some(dict) = decoding_params_dict(py, decoding)? {
+            kwargs.set_item("decoding", dict)?;
+        }
         bound.call_method("add_streaming_request", (), Some(&kwargs))?;
         Ok(())
     }
@@ -245,6 +258,7 @@ impl PyEngine {
                     audio,
                     sample_rate,
                     priority,
+                    decoding,
                 } => {
                     let arr = audio_bytes_to_numpy(py, audio)?;
                     d.set_item("audio", arr)?;
@@ -252,16 +266,23 @@ impl PyEngine {
                     d.set_item("sample_rate", *sample_rate)?;
                     d.set_item("streaming", false)?;
                     d.set_item("priority", *priority)?;
+                    if let Some(dict) = decoding_params_dict(py, decoding.as_ref())? {
+                        d.set_item("decoding", dict)?;
+                    }
                 }
                 AdmitSpec::Streaming {
                     rid,
                     sample_rate,
                     priority,
+                    decoding,
                 } => {
                     d.set_item("request_id", rid.as_str())?;
                     d.set_item("sample_rate", *sample_rate)?;
                     d.set_item("streaming", true)?;
                     d.set_item("priority", *priority)?;
+                    if let Some(dict) = decoding_params_dict(py, decoding.as_ref())? {
+                        d.set_item("decoding", dict)?;
+                    }
                 }
             }
             list.append(d)?;
@@ -354,11 +375,26 @@ impl PyEngine {
                 .and_then(|x| x.extract::<Option<Vec<f32>>>().ok())
                 .unwrap_or(None);
             let evt = if finished {
+                let nbest_texts: Option<Vec<String>> = item
+                    .getattr("nbest_texts")
+                    .ok()
+                    .and_then(|x| x.extract::<Option<Vec<String>>>().ok())
+                    .unwrap_or(None);
+                // Last-token end time from the engine's per-token timestamps
+                // (families with alignments — Paraformer CIF); None otherwise.
+                let end_time_s: Option<f32> = item
+                    .getattr("timestamps")
+                    .ok()
+                    .and_then(|x| x.extract::<Option<Vec<(f32, f32)>>>().ok())
+                    .unwrap_or(None)
+                    .and_then(|ts| ts.last().map(|&(_, end)| end));
                 Event::Final {
                     request_id: rid,
                     text,
                     tokens,
                     scores,
+                    nbest_texts,
+                    end_time_s,
                 }
             } else {
                 Event::Partial {
@@ -372,6 +408,40 @@ impl PyEngine {
         }
         Ok(events)
     }
+}
+
+/// Build the Python-side `decoding` kwargs dict from [`DecodingParams`].
+/// Returns `Ok(None)` when there are no params (or all fields are unset) so
+/// callers skip the kwarg and the engine sees `decoding=None` — the fast
+/// path stays allocation-free.
+fn decoding_params_dict<'py>(
+    py: Python<'py>,
+    params: Option<&DecodingParams>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let p = match params {
+        Some(p) if !p.is_empty() => p,
+        _ => return Ok(None),
+    };
+    let d = PyDict::new_bound(py);
+    if let Some(v) = p.n_best {
+        d.set_item("n_best", v)?;
+    }
+    if let Some(v) = p.max_new_tokens {
+        d.set_item("max_new_tokens", v)?;
+    }
+    if let Some(v) = p.temperature {
+        d.set_item("temperature", v)?;
+    }
+    if let Some(v) = p.top_k {
+        d.set_item("top_k", v)?;
+    }
+    if let Some(v) = p.top_p {
+        d.set_item("top_p", v)?;
+    }
+    if let Some(v) = &p.prompt {
+        d.set_item("prompt", v.as_str())?;
+    }
+    Ok(Some(d))
 }
 
 /// Decode raw little-endian f32 audio bytes into a writable numpy array on

@@ -12,5 +12,6 @@ across all pending requests (see ``DecodeStrategy.begin_offline`` /
 """
 
 from .budget import Hypothesis, StepBudget
+from .sampling import select_next_tokens
 
-__all__ = ["Hypothesis", "StepBudget"]
+__all__ = ["Hypothesis", "StepBudget", "select_next_tokens"]

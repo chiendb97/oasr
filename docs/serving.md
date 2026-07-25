@@ -84,7 +84,12 @@ curl -sS -X POST \
 ```
 
 Query parameters: `encoding` (required), `sample_rate` (default 16000; ignored
-for `WAV`), `priority`, `max_alternatives`.
+for `WAV`), `priority`, `max_alternatives`, plus the per-request decoding
+options (autoregressive decode families only — AED / speech-LLM; CTC ignores
+them): `max_new_tokens`, `temperature` (0 = greedy), `top_k`, `top_p`,
+`prompt` (speech-LLM user-prompt override).  `max_alternatives > 1` makes the
+engine detokenize that many n-best hypotheses (beam decode families), so
+every returned alternative carries a real transcript.
 
 `encoding` accepted values:
 
@@ -106,15 +111,22 @@ Success response (`200`):
       "alternatives": [
         {
           "transcript": "hello world",
-          "confidence": 0.0,
+          "confidence": 0.93,
           "tokens": [12, 305, 119]
         }
-      ]
+      ],
+      "resultEndTimeS": 3.42
     }
   ],
   "requestId": "8f4c9b..."
 }
 ```
+
+`confidence` is the hypothesis's softmax-normalized posterior among the
+returned n-best scores (`0.0` when the decode family emits a single
+hypothesis — Google's "unset when unavailable" convention).
+`resultEndTimeS` (end time of the last decoded token, seconds) appears only
+for decode families with token alignments (Paraformer CIF).
 
 Error responses use the canonical Google error envelope:
 
@@ -160,8 +172,14 @@ Exactly one entry — the single model loaded by this process.
 ## gRPC
 
 Service: `oasr.speech.v1.Speech` in `rust/proto/oasr_speech_v1.proto`.
-Messages mirror Google's v1 schema; `tokens` (CTC token IDs) and `requestId`
-are OASR extensions in the reserved field-number range.
+Messages mirror Google's v1 schema; `tokens` (CTC token IDs), `requestId`,
+and the `RecognitionConfig` decoding extensions (`max_new_tokens`,
+`temperature`, `top_k`, `top_p`, `prompt` — per-request `DecodingOptions`
+for the AR decode families) are OASR extensions in the reserved
+field-number range.  `max_alternatives` is honored (n-best transcripts on
+beam decode families), `confidence` carries the softmax-normalized n-best
+posterior, and `result_end_time` is set when the decode family produces
+token alignments (Paraformer CIF).
 
 ### `Recognize` (unary, offline mode)
 
@@ -266,6 +284,16 @@ Beyond `--max-batch-size` / `--chunk-size` / `--preferred-batch-sizes` /
 and the (default-off, **keep off** — measured to regress) `--use-ctc-cuda-graphs`
 / `--use-feature-cuda-graphs`. `oasr-server --help` lists them all.
 
+Multi-paradigm serving: `--decode-method` selects among the checkpoint's
+advertised capabilities (e.g. `ctc_aed_rescoring` on a U2++ hybrid, `llm` on
+a Qwen2-Audio checkpoint; unset = model default, validated at startup).  The
+incremental AR families additionally take `--max-new-tokens`,
+`--decode-steps-per-tick` (bounded batched decoder steps per engine tick —
+the dispatcher-starvation guard), `--max-decode-slots` (in-flight AR request
+cap), and `--llm-prompt` (deployment-wide speech-LLM user prompt; per-request
+`prompt` decoding options override it).  LLM decode emits token-streaming
+partials over the same `Event::Partial` wire streaming CTC uses.
+
 ## Benchmarking
 
 `benchmarks/bench_service.py` is a load generator for `oasr-server`.  It
@@ -329,6 +357,5 @@ partials-per-request.
   feature on `oasr-asr`.
 - TLS termination — assume a reverse proxy handles it.
 - `LongRunningRecognize` (Google STT v1 LRO) — not implemented.
-- `RecognitionConfig.language_code`, `model`, `audio_channel_count`,
-  `max_alternatives` semantics beyond clipping the alternative list, and
+- `RecognitionConfig.language_code`, `model`, `audio_channel_count`, and
   `StreamingRecognitionConfig.single_utterance` — accepted, ignored.

@@ -128,6 +128,9 @@ class FakeOutputProcessor:
     def decode_offline(self, enc_out, enc_lengths):
         return self.strategy.decode_offline(enc_out, enc_lengths)
 
+    def fill_nbest_texts(self, request, output):
+        return None
+
 
 def _make_executor(target_lens, *, steps_per_tick=4, slots=8):
     strat = FakeIncrementalStrategy(target_lens)

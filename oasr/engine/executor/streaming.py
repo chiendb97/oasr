@@ -189,6 +189,7 @@ class StreamingExecutor(Executor):
                 and (not req.has_ready_encoder_chunk(window))
             ):
                 final = self._op.finalize_streaming(req)
+                self._op.fill_nbest_texts(req, final)
                 req.output = final
                 outputs.append(final)
                 self._op.free_session(req)  # decode-side beam state

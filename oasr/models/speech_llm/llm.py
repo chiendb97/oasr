@@ -18,9 +18,17 @@ output projections, SiLU gate-up-down MLP — exposing the same
   position, attending the full cache through a key-padding mask.
 
 The KV state is a plain dict of dense per-layer tensors; rows are dropped with
-:meth:`select` as requests finish (continuous batching).  Paged-KV storage
-(``DecoderKVCacheManager``) is the planned optimization; the state layout is
-already per-request-row so the swap is local.
+:meth:`select` as requests finish (continuous batching).  When the caller
+passes ``capacity`` to :meth:`prefill` (the ``llm`` strategy does — prompt
+length + the batch's generation cap), the per-layer K/V buffers are
+**preallocated** to that capacity and each step writes its one token slot in
+place — removing the per-step ``torch.cat`` that re-copies the whole cache
+(measured ~10% of a 7B decode step at B=4, growing with B).  Without
+``capacity`` the legacy cat-growth path is used (direct ``prefill``/``step``
+callers, tests).  Paged-KV storage (``DecoderKVCacheManager`` + the paged
+FMHA) remains blocked on the CuteDSL masked-tile fix — left-padded prompts
+are exactly the heavily key-padded batch shape that kernel currently NaNs on,
+so attention stays on SDPA.
 """
 
 from __future__ import annotations
@@ -175,24 +183,63 @@ class Qwen2Lm(BaseDecoder):
         attn_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Shared prefill/step trunk: run every layer, appending to the KV state."""
+        t_prev = state["len"]
+        t_new = x.size(1)
         for i, layer in enumerate(self.layers):
             residual = x
             h = layer.input_layernorm(x)
             q, k_new, v_new = layer.self_attn.qkv(h, cos, sin)
-            if state["k"][i] is not None:
-                k = torch.cat([state["k"][i], k_new], dim=2)
-                v = torch.cat([state["v"][i], v_new], dim=2)
-            else:
-                k, v = k_new, v_new
-            state["k"][i], state["v"][i] = k, v
+            k, v = self._append_kv(state, i, t_prev, k_new, v_new)
             x = residual + layer.self_attn.attend(q, k, v, attn_mask)
             residual = x
             h = layer.post_attention_layernorm(x)
             x = residual + layer.mlp(h)
+        state["len"] = t_prev + t_new
         return x
 
+    @staticmethod
+    def _append_kv(
+        state: Dict[str, Any],
+        i: int,
+        t_prev: int,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Append layer ``i``'s new K/V and return the full cache views.
+
+        Preallocated mode (``state["cap"]`` set and roomy): write the new
+        tokens into their slots in place, return ``[:t]`` views — no copy of
+        the existing cache.  Legacy mode (no capacity, or overflow): cat-grow.
+        """
+        t_new = k_new.size(2)
+        cap = state["cap"]
+        k_buf, v_buf = state["k"][i], state["v"][i]
+        if cap is not None and k_buf is None:
+            # First append (prefill): allocate the full-capacity buffers.
+            B, h_kv, _, d = k_new.shape
+            k_buf = k_new.new_empty(B, h_kv, cap, d)
+            v_buf = v_new.new_empty(B, h_kv, cap, d)
+            state["k"][i], state["v"][i] = k_buf, v_buf
+        if cap is not None and t_prev + t_new <= cap:
+            k_buf[:, :, t_prev : t_prev + t_new] = k_new
+            v_buf[:, :, t_prev : t_prev + t_new] = v_new
+            return k_buf[:, :, : t_prev + t_new], v_buf[:, :, : t_prev + t_new]
+        # Legacy growth (no capacity hint, or capacity overflow).  An
+        # overflowing preallocated buffer degrades to cat of the valid slice.
+        if k_buf is not None:
+            k = torch.cat([k_buf[:, :, :t_prev], k_new], dim=2) if t_prev else k_new
+            v = torch.cat([v_buf[:, :, :t_prev], v_new], dim=2) if t_prev else v_new
+        else:
+            k, v = k_new, v_new
+        state["k"][i], state["v"][i] = k, v
+        state["cap"] = None  # buffers are now exact-length; stay on cat-growth
+        return k, v
+
     def prefill(
-        self, inputs_embeds: torch.Tensor, valid: torch.Tensor
+        self,
+        inputs_embeds: torch.Tensor,
+        valid: torch.Tensor,
+        capacity: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Start generation over a **left-padded** embedded prompt.
 
@@ -200,6 +247,11 @@ class Qwen2Lm(BaseDecoder):
         spliced in), ``valid (B, P)`` bool (False = left pad) →
         ``(logits (B, V) at the last position, state)``.  With left padding
         the last position is the newest real token for every row.
+
+        ``capacity`` (optional): total KV length this generation may reach
+        (prompt + generation cap).  When given, the per-layer K/V buffers are
+        preallocated once and each :meth:`step` writes its token slot in
+        place instead of re-copying the cache via ``torch.cat``.
         """
         B, P, _ = inputs_embeds.shape
         device = inputs_embeds.device
@@ -222,6 +274,8 @@ class Qwen2Lm(BaseDecoder):
             "v": [None] * n,
             "key_valid": valid,
             "pos": valid.long().sum(dim=1),  # per-row next rotary position
+            "len": 0,  # tokens cached so far (uniform across layers)
+            "cap": None if capacity is None else max(int(capacity), P),
         }
         x = self._forward_layers(inputs_embeds, cos, sin, state, attn_mask)
         logits = self.lm_head(self.norm(x[:, -1:]))
@@ -253,6 +307,8 @@ class Qwen2Lm(BaseDecoder):
         out: Dict[str, Any] = {
             "key_valid": state["key_valid"].index_select(0, keep),
             "pos": state["pos"].index_select(0, keep),
+            "len": state["len"],
+            "cap": state["cap"],
         }
         for key in ("k", "v"):
             out[key] = [t.index_select(0, keep) for t in state[key]]

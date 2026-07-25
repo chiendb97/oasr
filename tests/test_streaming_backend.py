@@ -101,7 +101,12 @@ class TestStatefulStreamingBackend:
             for r in reqs:
                 backend_out[r.stream_id].append(out[r.request_id].clone())
 
-        # Manual reference: independent streaming_forward loop with the same chunks.
+        # Manual reference: independent streaming_forward loop with the same
+        # chunks.  The backend batches same-length streams into one B=N
+        # forward, so fp16 log-probs may differ from the B=1 reference by
+        # kernel reduction order (~one ulp, measured flat across chunks — a
+        # state bug would compound); the decode-relevant argmax must match
+        # exactly.
         with torch.no_grad():
             for sid in (0, 1):
                 state = model.get_streaming_init_states(1, device="cuda", dtype=torch.float16)
@@ -109,12 +114,90 @@ class TestStatefulStreamingBackend:
                     chunk = feats[sid][k * window : (k + 1) * window].unsqueeze(0)
                     lens = torch.tensor([window], dtype=torch.int32, device="cuda")
                     lp, _ol, state = model.streaming_forward(chunk, lens, state)
-                    torch.testing.assert_close(backend_out[sid][k], lp)
+                    torch.testing.assert_close(backend_out[sid][k], lp, atol=1e-2, rtol=1e-2)
+                    assert torch.equal(backend_out[sid][k].argmax(-1), lp.argmax(-1))
 
         # Free releases per-request state.
         for r in reqs:
             backend.free(r)
         assert not backend._states  # noqa: SLF001
+
+    def test_batched_grouping_with_short_tail(self):
+        """Mixed chunk lengths: full-window streams batch together; a stream
+        on its final short tail runs in its own singleton group.  Every
+        stream's output must match its independent B=1 reference loop."""
+        model = self._build_model()
+        cfg = SimpleNamespace(device="cuda", dtype=torch.float16, chunk_size=16)
+        backend = build_streaming_backend("stateful", model, cfg, None)
+        window = backend.decoding_window
+
+        # Streams 0/1: two full windows.  Stream 2: one full window + a
+        # half-window tail (audio_final so the tail is deemed ready).
+        lengths = {0: 2 * window, 1: 2 * window, 2: window + window // 2}
+        feats = {
+            sid: torch.randn(n, 80, dtype=torch.float16, device="cuda")
+            for sid, n in lengths.items()
+        }
+        reqs = [_make_request(sid, feats[sid]) for sid in feats]
+        for r in reqs:
+            r.audio_final = True
+            backend.allocate(r)
+
+        # Spy on the singleton path: only the tail chunk should take it.
+        singles: list = []
+        orig_forward_one = backend._forward_one  # noqa: SLF001
+
+        def spy(req):
+            singles.append(req.stream_id)
+            return orig_forward_one(req)
+
+        backend._forward_one = spy  # noqa: SLF001
+
+        backend_out = {sid: [] for sid in feats}
+        for _ in range(2):
+            out = backend.forward_step(reqs)
+            for r in reqs:
+                if r.request_id in out:
+                    backend_out[r.stream_id].append(out[r.request_id].clone())
+        # Tick 1: all three at a full window → one batched B=3 forward.
+        # Tick 2: streams 0/1 batch (B=2); stream 2's short tail is singleton.
+        assert singles == [2]
+
+        with torch.no_grad():
+            for sid, total in lengths.items():
+                state = model.get_streaming_init_states(1, device="cuda", dtype=torch.float16)
+                cursor = 0
+                for lp_backend in backend_out[sid]:
+                    t = min(window, total - cursor)
+                    chunk = feats[sid][cursor : cursor + t].unsqueeze(0)
+                    lens = torch.tensor([t], dtype=torch.int32, device="cuda")
+                    lp, _ol, state = model.streaming_forward(chunk, lens, state)
+                    torch.testing.assert_close(lp_backend, lp, atol=1e-2, rtol=1e-2)
+                    assert torch.equal(lp_backend.argmax(-1), lp.argmax(-1))
+                    cursor += t
+        for r in reqs:
+            backend.free(r)
+
+    def test_stack_unstack_roundtrip(self):
+        """Encoder state stack/unstack must be mutually inverse and produce
+        the same shapes as a natively batched init."""
+        model = self._build_model()
+        enc = model.encoder
+        singles = [
+            model.get_streaming_init_states(1, device="cuda", dtype=torch.float16) for _ in range(3)
+        ]
+        # Give each stream distinct state contents.
+        for i, st in enumerate(singles):
+            for t in st:
+                t.fill_(float(i + 1))
+        stacked = enc.stack_streaming_states(singles)
+        native = model.get_streaming_init_states(3, device="cuda", dtype=torch.float16)
+        assert [t.shape for t in stacked] == [t.shape for t in native]
+        unstacked = enc.unstack_streaming_states(stacked)
+        assert len(unstacked) == 3
+        for st, ref in zip(unstacked, singles):
+            for a, b in zip(st, ref):
+                assert torch.equal(a, b)
 
     def test_hidden_mode_routes_to_encoder(self):
         """consumes='hidden' must thread chunks through the *encoder-only*

@@ -13,12 +13,25 @@
 //   `UNIMPLEMENTED`.
 // - `RecognitionConfig.priority` is a non-Google extension preserved for
 //   parity with the previous OASR API.
+// - `RecognitionConfig.max_new_tokens` / `temperature` / `top_k` / `top_p` /
+//   `prompt` are non-Google extensions mapped to the engine's per-request
+//   DecodingOptions (autoregressive decode families only — AED / speech-LLM;
+//   frame-synchronous CTC ignores them).
 // - `SpeechRecognitionAlternative.tokens` is a non-Google extension that
 //   carries the raw CTC token IDs alongside the transcript.
+// - `SpeechRecognitionAlternative.confidence` is the softmax-normalized
+//   posterior of the hypothesis among the returned n-best scores (0.0 when
+//   the decode family emits a single hypothesis, matching Google's
+//   "unset when unavailable").
+// - `SpeechRecognitionResult.result_end_time` is set when the decode family
+//   produces token alignments (Paraformer CIF): the end time of the last
+//   decoded token.
 // - `RecognizeResponse.request_id` / `StreamingRecognizeResponse.request_id`
 //   are non-Google extensions carrying the server-assigned request UUID.
-// - `language_code`, `model`, `max_alternatives`, `audio_channel_count`,
-//   `single_utterance`, `speech_event_type` are accepted but not honored.
+// - `max_alternatives` is honored: the engine detokenizes up to that many
+//   n-best hypotheses (beam decode families).
+// - `language_code`, `model`, `audio_channel_count`, `single_utterance`,
+//   `speech_event_type` are accepted but not honored.
 
 syntax = "proto3";
 
@@ -61,10 +74,16 @@ message RecognitionConfig {
     AudioEncoding encoding             = 1;
     uint32        sample_rate_hertz    = 2;
     string        language_code        = 3;  // accepted, ignored
-    uint32        max_alternatives     = 4;  // bounded at server side
+    uint32        max_alternatives     = 4;  // n-best transcripts (beam decode families)
     string        model                = 5;  // accepted, ignored (single model per process)
     uint32        audio_channel_count  = 6;  // accepted, ignored (mono only)
     int32         priority             = 100; // OASR extension
+    // OASR extensions → per-request DecodingOptions (AR families only).
+    uint32        max_new_tokens       = 101; // 0 = engine default
+    float         temperature          = 102; // 0 = greedy (default)
+    uint32        top_k                = 103; // 0 = disabled
+    float         top_p                = 104; // 0 = disabled (i.e. 1.0)
+    string        prompt               = 105; // speech-LLM user prompt override
 }
 
 // ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use oasr_wire::{Cmd, Event};
+use oasr_wire::{Cmd, DecodingParams, Event};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::trace;
@@ -147,6 +147,7 @@ impl EngineClient {
         audio: Bytes,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<DecodingParams>,
     ) -> Result<OfflineHandle, EngineClientError> {
         let request_id = Uuid::new_v4().simple().to_string();
         let (tx, rx) = oneshot::channel::<Event>();
@@ -164,6 +165,7 @@ impl EngineClient {
                 request_id: request_id.clone(),
                 sample_rate,
                 priority,
+                decoding,
             },
             Some(audio),
         );
@@ -175,9 +177,10 @@ impl EngineClient {
         &self,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<DecodingParams>,
     ) -> Result<StreamingHandle, EngineClientError> {
         let request_id = Uuid::new_v4().simple().to_string();
-        self.open_streaming_with_id(request_id, sample_rate, priority)
+        self.open_streaming_with_id(request_id, sample_rate, priority, decoding)
             .await
     }
 
@@ -186,6 +189,7 @@ impl EngineClient {
         request_id: String,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<DecodingParams>,
     ) -> Result<StreamingHandle, EngineClientError> {
         let event_rx = self
             .shared
@@ -197,6 +201,7 @@ impl EngineClient {
                 request_id: request_id.clone(),
                 sample_rate,
                 priority,
+                decoding,
             },
             None,
         );

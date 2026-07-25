@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use bytes::Bytes;
 use oasr_asr::{decode_audio, PcmEncoding};
-use oasr_wire::{ErrorCode, Event};
+use oasr_wire::{score_posteriors, DecodingParams, ErrorCode, Event};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, field, info, info_span, warn, Instrument, Span};
 
@@ -41,6 +41,10 @@ pub struct SpeechRecognitionResult {
     pub channel_tag: i32,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub language_code: String,
+    /// End time (seconds) of the last decoded token; present only for decode
+    /// families with token alignments (Paraformer CIF).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_end_time_s: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,6 +97,7 @@ fn build_alternatives(
     text: String,
     tokens: Vec<Vec<u32>>,
     scores: Option<Vec<f32>>,
+    nbest_texts: Option<Vec<String>>,
     max_alts: u32,
 ) -> Vec<SpeechRecognitionAlternative> {
     let cap = if max_alts == 0 { 1 } else { max_alts as usize };
@@ -101,14 +106,22 @@ fn build_alternatives(
     } else {
         tokens
     };
+    let confidences = score_posteriors(&scores);
     rows.into_iter()
         .take(cap)
         .enumerate()
         .map(|(i, ids)| SpeechRecognitionAlternative {
-            transcript: if i == 0 { text.clone() } else { String::new() },
-            confidence: scores
+            transcript: if i == 0 {
+                text.clone()
+            } else {
+                nbest_texts
+                    .as_ref()
+                    .and_then(|ts| ts.get(i).cloned())
+                    .unwrap_or_default()
+            },
+            confidence: confidences
                 .as_ref()
-                .and_then(|s| s.get(i).copied())
+                .and_then(|c| c.get(i).copied())
                 .unwrap_or(0.0),
             tokens: ids,
         })
@@ -171,6 +184,35 @@ pub struct RawParams {
     pub priority: i32,
     #[serde(default)]
     pub max_alternatives: u32,
+    /// Per-request DecodingOptions (autoregressive decode families only —
+    /// AED / speech-LLM; CTC ignores them).  Mirror the gRPC
+    /// `RecognitionConfig` extension fields.
+    #[serde(default)]
+    pub max_new_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+impl RawParams {
+    /// Map the query-string knobs to the engine's per-request
+    /// [`DecodingParams`]; `None` when every knob is at its default.
+    fn decoding_params(&self) -> Option<DecodingParams> {
+        let p = DecodingParams {
+            n_best: (self.max_alternatives > 1).then_some(self.max_alternatives),
+            max_new_tokens: self.max_new_tokens.filter(|&v| v > 0),
+            temperature: self.temperature.filter(|&v| v > 0.0),
+            top_k: self.top_k.filter(|&v| v > 0),
+            top_p: self.top_p.filter(|&v| v > 0.0),
+            prompt: self.prompt.clone().filter(|s| !s.is_empty()),
+        };
+        (!p.is_empty()).then_some(p)
+    }
 }
 
 /// `POST /v1/speech:recognize?encoding=LINEAR16&sample_rate=16000`
@@ -237,12 +279,14 @@ pub async fn handle_recognize(
         };
 
         let audio_buf: Bytes = decoded.samples;
+        let decoding = params.decoding_params();
         run_offline(
             &s,
             audio_buf,
             decoded.sample_rate,
             params.priority,
             params.max_alternatives,
+            decoding,
             start,
         )
         .await
@@ -260,10 +304,15 @@ async fn run_offline(
     sample_rate: u32,
     priority: i32,
     max_alts: u32,
+    decoding: Option<DecodingParams>,
     start: Instant,
 ) -> axum::response::Response {
     let n_samples = audio_buf.len() / 4;
-    let handle = match s.pool.submit_offline(audio_buf, sample_rate, priority).await {
+    let handle = match s
+        .pool
+        .submit_offline(audio_buf, sample_rate, priority, decoding)
+        .await
+    {
         Ok(h) => h,
         Err(e) => {
             warn!(%e, "recognize submit rejected");
@@ -296,6 +345,8 @@ async fn run_offline(
             text,
             tokens,
             scores,
+            nbest_texts,
+            end_time_s,
         } => {
             let n_tokens = tokens.first().map_or(0, |t| t.len());
             info!(
@@ -309,9 +360,10 @@ async fn run_offline(
             );
             Json(RecognizeResponse {
                 results: vec![SpeechRecognitionResult {
-                    alternatives: build_alternatives(text, tokens, scores, max_alts),
+                    alternatives: build_alternatives(text, tokens, scores, nbest_texts, max_alts),
                     channel_tag: 0,
                     language_code: String::new(),
+                    result_end_time_s: end_time_s,
                 }],
                 request_id,
             })

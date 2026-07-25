@@ -51,6 +51,35 @@ pub struct Cli {
     /// `EngineConfig.fst_path`.
     #[arg(long)]
     pub fst_path: Option<String>,
+    /// Decode-method selection among the checkpoint's capabilities (e.g.
+    /// `ctc_aed_rescoring` on a U2++ hybrid, `llm` on a speech-LLM).  Unset
+    /// runs the model's default decode family.  Forwarded to
+    /// `EngineConfig.decode_method`; the engine validates the name against
+    /// `model.capabilities` at startup.
+    #[arg(long)]
+    pub decode_method: Option<String>,
+    /// Speech-LLM only: the user prompt placed in the checkpoint's chat
+    /// template next to the audio.  Unset uses the checkpoint's default ASR
+    /// prompt.  Forwarded to `EngineConfig.llm_prompt`; per-request `prompt`
+    /// decoding options override it.
+    #[arg(long)]
+    pub llm_prompt: Option<String>,
+    /// AR generation length cap per request (AED / LLM decode families).
+    /// Engine default 448.  Per-request `max_new_tokens` decoding options
+    /// override it.
+    #[arg(long)]
+    pub max_new_tokens: Option<u32>,
+    /// Incremental (AED / LLM) decode: max batched decoder steps one engine
+    /// tick runs across all pending requests — the bounded-work-per-tick
+    /// contract that keeps AR decode from starving the dispatcher.  Engine
+    /// default 32.
+    #[arg(long)]
+    pub decode_steps_per_tick: Option<u32>,
+    /// Incremental (AED / LLM) decode: max AR requests in flight before
+    /// new-batch admission pauses.  Unset defaults to the engine's
+    /// max_batch_size.
+    #[arg(long)]
+    pub max_decode_slots: Option<u32>,
     /// Offline only: overlap per-request admission prep (waveform load + scale
     /// + frame stamp) with the GPU ``step()`` on a daemon prep thread.  Helps
     /// at high concurrency (a deep backlog to pipeline); can slightly regress
@@ -217,6 +246,25 @@ impl Cli {
         }
         if let Some(s) = &self.fst_path {
             obj.entry("fst_path").or_insert(Value::String(s.clone()));
+        }
+        if let Some(s) = &self.decode_method {
+            obj.entry("decode_method")
+                .or_insert(Value::String(s.clone()));
+        }
+        if let Some(s) = &self.llm_prompt {
+            obj.entry("llm_prompt").or_insert(Value::String(s.clone()));
+        }
+        if let Some(v) = self.max_new_tokens {
+            obj.entry("max_new_tokens")
+                .or_insert(Value::Number(v.into()));
+        }
+        if let Some(v) = self.decode_steps_per_tick {
+            obj.entry("decode_steps_per_tick")
+                .or_insert(Value::Number(v.into()));
+        }
+        if let Some(v) = self.max_decode_slots {
+            obj.entry("max_decode_slots")
+                .or_insert(Value::Number(v.into()));
         }
         if self.overlap_admit {
             obj.entry("overlap_admit").or_insert(Value::Bool(true));

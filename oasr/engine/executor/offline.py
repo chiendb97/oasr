@@ -286,6 +286,7 @@ class OfflineExecutor(Executor):
         for req, out in zip(chunk, outputs):
             out.request_id = req.request_id
             out.finished = True
+            self._op.fill_nbest_texts(req, out)
             req.output = out
             req.state = RequestState.FINISHED
         return outputs

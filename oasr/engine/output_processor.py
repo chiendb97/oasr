@@ -103,3 +103,21 @@ class OutputProcessor:
     def detokenize(self, token_ids: List[int]) -> str:
         """Convert a list of token IDs to text (see :class:`Detokenizer`)."""
         return self._detok.detokenize(token_ids)
+
+    def fill_nbest_texts(self, request: Request, output: RequestOutput) -> None:
+        """Detokenize the top-N hypotheses into ``output.nbest_texts``.
+
+        Applies only when the request asked for ``DecodingOptions.n_best > 1``
+        and the decode family produced multiple hypothesis rows (CTC / WFST
+        beams); greedy families carry a single row and are left untouched.
+        Called by the executors on **final** outputs — interim partials always
+        carry the best hypothesis only.
+        """
+        opts = request.decoding
+        n = int(opts.n_best) if opts is not None else 1
+        if n <= 1 or not output.tokens or len(output.tokens) <= 1:
+            return
+        texts = [output.text]
+        for row in output.tokens[1:n]:
+            texts.append(self._detok.detokenize(row))
+        output.nbest_texts = texts

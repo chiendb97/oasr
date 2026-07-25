@@ -28,7 +28,7 @@ from .graph_cache import round_up_bucket
 from .input_processor import InputProcessor
 from .model_runner import ModelRunner
 from .output_processor import OutputProcessor
-from .request import Request, RequestOutput
+from .request import DecodingOptions, Request, RequestOutput
 from .scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
@@ -305,6 +305,7 @@ class ASREngine:
         sample_rate: int = 16000,
         streaming: bool = True,
         priority: int = 0,
+        decoding: Optional[Union[DecodingOptions, Dict]] = None,
     ) -> str:
         """Add a new request to the engine.
 
@@ -333,6 +334,10 @@ class ASREngine:
             path; ``False`` routes it through the batched offline path.
         priority : int, default ``0``
             Lower values are scheduled first within each waiting queue.
+        decoding : DecodingOptions or dict, optional
+            Per-request decoding options (n-best, generation cap, sampling,
+            prompt).  A plain dict is coerced — the PyO3 dispatcher passes
+            one.  ``None`` keeps every engine default.
 
         Returns
         -------
@@ -345,6 +350,7 @@ class ASREngine:
             streaming=streaming,
             sample_rate=sample_rate,
             priority=priority,
+            decoding=DecodingOptions.coerce(decoding),
         )
         if self._overlap_admit:
             self._validate_mode(streaming)
@@ -369,6 +375,8 @@ class ASREngine:
         - ``sample_rate``: int, defaults to ``16000``.
         - ``streaming``: bool, defaults to ``True``.
         - ``priority``: int, defaults to ``0``.
+        - ``decoding``: optional :class:`DecodingOptions` or plain dict of
+          per-request decoding options.
 
         Holds ``self._lock`` for the whole batch — one acquire/release pair
         instead of N — and avoids N round-trips across the PyO3 boundary
@@ -395,6 +403,7 @@ class ASREngine:
                     streaming=streaming,
                     sample_rate=sample_rate,
                     priority=priority,
+                    decoding=DecodingOptions.coerce(spec.get("decoding")),
                 )
                 self._validate_mode(streaming)
                 self._executor.admit(req)
@@ -425,6 +434,7 @@ class ASREngine:
                 streaming=bool(spec.get("streaming", True)),
                 sample_rate=int(spec.get("sample_rate", 16000)),
                 priority=int(spec.get("priority", 0)),
+                decoding=DecodingOptions.coerce(spec.get("decoding")),
             )
             self._validate_mode(req.streaming)  # reads immutable executor.streaming
             reqs.append(req)
@@ -530,6 +540,7 @@ class ASREngine:
         request_id: Optional[str] = None,
         sample_rate: int = 16000,
         priority: int = 0,
+        decoding: Optional[Union[DecodingOptions, Dict]] = None,
     ) -> str:
         """Open a chunk-by-chunk streaming request.
 
@@ -547,6 +558,8 @@ class ASREngine:
             Sample rate of the audio that will be fed via :meth:`feed_chunk`.
         priority : int, default ``0``
             Lower values are scheduled first within the streaming queue.
+        decoding : DecodingOptions or dict, optional
+            Per-request decoding options; see :meth:`add_request`.
 
         Returns
         -------
@@ -559,6 +572,7 @@ class ASREngine:
             streaming=True,
             sample_rate=sample_rate,
             priority=priority,
+            decoding=DecodingOptions.coerce(decoding),
         )
         with self._lock:
             self._validate_mode(True)

@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures::Stream;
 use oasr_asr::{decode_audio, decode_raw_pcm, PcmEncoding};
 use oasr_engine_client::EnginePool;
-use oasr_wire::{ErrorCode, Event};
+use oasr_wire::{score_posteriors, DecodingParams, ErrorCode, Event};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -89,15 +89,41 @@ fn log_reject(st: Status) -> Status {
     st
 }
 
+/// Map the proto `RecognitionConfig` decoding extensions to the engine's
+/// per-request [`DecodingParams`].  Returns `None` when every knob is at its
+/// proto default (0 / empty) so the common path sends nothing.
+fn decoding_params(cfg: &pb::RecognitionConfig) -> Option<DecodingParams> {
+    let p = DecodingParams {
+        n_best: (cfg.max_alternatives > 1).then_some(cfg.max_alternatives),
+        max_new_tokens: (cfg.max_new_tokens > 0).then_some(cfg.max_new_tokens),
+        temperature: (cfg.temperature > 0.0).then_some(cfg.temperature),
+        top_k: (cfg.top_k > 0).then_some(cfg.top_k),
+        top_p: (cfg.top_p > 0.0).then_some(cfg.top_p),
+        prompt: (!cfg.prompt.is_empty()).then(|| cfg.prompt.clone()),
+    };
+    (!p.is_empty()).then_some(p)
+}
+
+/// Seconds → protobuf `Duration` (audio times are small and non-negative).
+fn duration_from_secs(t: f32) -> prost_types::Duration {
+    let secs = t.max(0.0);
+    prost_types::Duration {
+        seconds: secs as i64,
+        nanos: ((secs - secs.floor()) * 1e9) as i32,
+    }
+}
+
 /// Build STT v1 alternatives from a single Final/Partial event payload.
 ///
 /// `text` is the canonical decoded transcript (top hypothesis).  `tokens` is
-/// the engine's per-hypothesis token-id list; row 0 aligns with `text`,
-/// additional rows surface as alternatives with empty transcripts.
+/// the engine's per-hypothesis token-id list; row 0 aligns with `text`, and
+/// rows the engine detokenized (per the request's `max_alternatives`) carry
+/// their transcript in `nbest_texts`.
 fn build_alternatives(
     text: String,
     tokens: Vec<Vec<u32>>,
     scores: Option<Vec<f32>>,
+    nbest_texts: Option<Vec<String>>,
     max_alternatives: u32,
 ) -> Vec<pb::SpeechRecognitionAlternative> {
     let cap = if max_alternatives == 0 {
@@ -110,14 +136,22 @@ fn build_alternatives(
     } else {
         tokens
     };
+    let confidences = score_posteriors(&scores);
     rows.into_iter()
         .take(cap)
         .enumerate()
         .map(|(i, ids)| pb::SpeechRecognitionAlternative {
-            transcript: if i == 0 { text.clone() } else { String::new() },
-            confidence: scores
+            transcript: if i == 0 {
+                text.clone()
+            } else {
+                nbest_texts
+                    .as_ref()
+                    .and_then(|ts| ts.get(i).cloned())
+                    .unwrap_or_default()
+            },
+            confidence: confidences
                 .as_ref()
-                .and_then(|s| s.get(i).copied())
+                .and_then(|c| c.get(i).copied())
                 .unwrap_or(0.0),
             tokens: ids,
         })
@@ -146,6 +180,7 @@ impl pb::speech_server::Speech for SpeechService {
             let cfg =
                 config.ok_or_else(|| log_reject(Status::invalid_argument("config required")))?;
             let max_alts = cfg.max_alternatives;
+            let decoding = decoding_params(&cfg);
 
             let audio_bytes = match audio.and_then(|a| a.audio_source) {
                 Some(pb::recognition_audio::AudioSource::Content(b)) => b,
@@ -168,7 +203,7 @@ impl pb::speech_server::Speech for SpeechService {
             let n_samples = decoded.samples.len() / 4;
             let handle = self
                 .pool
-                .submit_offline(decoded.samples, sample_rate, cfg.priority)
+                .submit_offline(decoded.samples, sample_rate, cfg.priority, decoding)
                 .await
                 .map_err(|e| {
                     warn!(%e, "grpc recognize submit rejected");
@@ -189,6 +224,8 @@ impl pb::speech_server::Speech for SpeechService {
                     text,
                     tokens,
                     scores,
+                    nbest_texts,
+                    end_time_s,
                 } => {
                     let n_tokens = tokens.first().map_or(0, |t| t.len());
                     info!(
@@ -202,9 +239,15 @@ impl pb::speech_server::Speech for SpeechService {
                     );
                     Ok(Response::new(pb::RecognizeResponse {
                         results: vec![pb::SpeechRecognitionResult {
-                            alternatives: build_alternatives(text, tokens, scores, max_alts),
+                            alternatives: build_alternatives(
+                                text,
+                                tokens,
+                                scores,
+                                nbest_texts,
+                                max_alts,
+                            ),
                             channel_tag: 0,
-                            result_end_time: None,
+                            result_end_time: end_time_s.map(duration_from_secs),
                             language_code: String::new(),
                         }],
                         request_id,
@@ -270,10 +313,11 @@ impl pb::speech_server::Speech for SpeechService {
         let (pcm_enc, _ct_hint) = map_encoding(rcfg.encoding).map_err(log_reject)?;
         let want_partials = scfg.interim_results;
         let max_alts = rcfg.max_alternatives;
+        let decoding = decoding_params(&rcfg);
 
         let mut handle = self
             .pool
-            .open_streaming(sr, rcfg.priority)
+            .open_streaming(sr, rcfg.priority, decoding)
             .await
             .map_err(|e| {
                 warn!(%e, "grpc streaming open rejected");
@@ -307,7 +351,7 @@ impl pb::speech_server::Speech for SpeechService {
                                 n_partials += 1;
                                 let resp = pb::StreamingRecognizeResponse {
                                     results: vec![pb::StreamingRecognitionResult {
-                                        alternatives: build_alternatives(text, tokens, scores, max_alts),
+                                        alternatives: build_alternatives(text, tokens, scores, None, max_alts),
                                         is_final: false,
                                         stability: 0.0,
                                         result_end_time: None,
@@ -318,14 +362,14 @@ impl pb::speech_server::Speech for SpeechService {
                                 };
                                 let _ = out_tx.send(Ok(resp)).await;
                             }
-                            Some(Event::Final { text, tokens, scores, .. }) => {
+                            Some(Event::Final { text, tokens, scores, nbest_texts, end_time_s, .. }) => {
                                 let transcript = text.clone();
                                 let resp = pb::StreamingRecognizeResponse {
                                     results: vec![pb::StreamingRecognitionResult {
-                                        alternatives: build_alternatives(text, tokens, scores, max_alts),
+                                        alternatives: build_alternatives(text, tokens, scores, nbest_texts, max_alts),
                                         is_final: true,
                                         stability: 1.0,
-                                        result_end_time: None,
+                                        result_end_time: end_time_s.map(duration_from_secs),
                                         language_code: String::new(),
                                     }],
                                     speech_event_type: pb::SpeechEventType::SpeechEventUnspecified as i32,

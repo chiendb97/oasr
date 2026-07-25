@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Optional, Tuple, Union
+from typing import Deque, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -28,6 +28,89 @@ class RequestState(enum.Enum):
 # Default priority level (lower value = higher priority).
 # Streaming requests default to this; offline can be bumped lower-priority.
 DEFAULT_PRIORITY = 0
+
+
+@dataclass
+class DecodingOptions:
+    """Per-request decoding options.
+
+    Engine-level knobs (kernel beam width, tick budgets, decoder type) stay on
+    :class:`~oasr.engine.config.EngineConfig`; this carries only what may vary
+    request to request.  Every field has a "no effect" default, so an absent /
+    default-constructed options object reproduces today's behaviour exactly.
+
+    Attributes
+    ----------
+    n_best : int
+        How many hypotheses to detokenize into
+        :attr:`RequestOutput.nbest_texts` on the **final** output (the serving
+        layer maps ``max_alternatives`` here).  ``1`` (default) fills only
+        :attr:`RequestOutput.text`.  Only beam families (CTC / WFST /
+        rescoring) produce more than one hypothesis; greedy families ignore
+        values above what they emit.  Interim streaming partials always carry
+        the best hypothesis only.
+    max_new_tokens : int, optional
+        Per-request generation cap for the incremental AR strategies
+        (AED / LLM), overriding ``EngineConfig.max_new_tokens``; still clamped
+        by the model's position-embedding capacity.  Ignored by
+        frame-synchronous families.
+    temperature : float
+        ``0.0`` (default) — greedy.  ``> 0`` enables sampling for the AR
+        strategies: logits are divided by the temperature before the
+        ``top_k`` / ``top_p`` filters and a multinomial draw.  Sampling uses
+        the process-global torch generator (seed with ``torch.manual_seed``
+        for reproducibility).
+    top_k : int
+        Keep only the ``k`` highest-probability tokens before sampling.
+        ``0`` (default) disables the filter.  Only meaningful with
+        ``temperature > 0``.
+    top_p : float
+        Nucleus sampling — keep the smallest set of tokens whose cumulative
+        probability reaches ``top_p``.  ``1.0`` (default) disables the
+        filter.  Only meaningful with ``temperature > 0``.
+    prompt : str, optional
+        Per-request user prompt for the speech-LLM strategy, overriding
+        ``EngineConfig.llm_prompt`` / the checkpoint default.  Ignored by
+        every other family (Whisper's SOT sequence is checkpoint-fixed).
+    """
+
+    n_best: int = 1
+    max_new_tokens: Optional[int] = None
+    temperature: float = 0.0
+    top_k: int = 0
+    top_p: float = 1.0
+    prompt: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.n_best < 1:
+            raise ValueError(f"n_best must be >= 1, got {self.n_best!r}")
+        if self.max_new_tokens is not None and self.max_new_tokens < 1:
+            raise ValueError(f"max_new_tokens must be >= 1 or None, got {self.max_new_tokens!r}")
+        if self.temperature < 0.0:
+            raise ValueError(f"temperature must be >= 0, got {self.temperature!r}")
+        if self.top_k < 0:
+            raise ValueError(f"top_k must be >= 0, got {self.top_k!r}")
+        if not (0.0 < self.top_p <= 1.0):
+            raise ValueError(f"top_p must be in (0, 1], got {self.top_p!r}")
+
+    @property
+    def sampling(self) -> bool:
+        """Whether this request draws tokens instead of taking the argmax."""
+        return self.temperature > 0.0
+
+    @classmethod
+    def coerce(cls, value: Union["DecodingOptions", Mapping, None]) -> Optional["DecodingOptions"]:
+        """Normalise an options value from a Python or PyO3 caller.
+
+        Accepts ``None`` (no options), an existing :class:`DecodingOptions`,
+        or a plain mapping (the Rust dispatcher passes a dict) whose ``None``
+        values are treated as "use the default".
+        """
+        if value is None or isinstance(value, cls):
+            return value
+        fields = ("n_best", "max_new_tokens", "temperature", "top_k", "top_p", "prompt")
+        kwargs = {k: value[k] for k in fields if k in value and value[k] is not None}
+        return cls(**kwargs)
 
 
 @dataclass
@@ -51,6 +134,17 @@ class RequestOutput:
         Per-token ``(start_s, end_s)`` times for the **best** hypothesis,
         aligned with ``tokens[0]``.  Emitted by decode families that produce
         alignments (Paraformer's CIF fire positions); ``None`` otherwise.
+    nbest_texts : List[str], optional
+        Detokenized transcripts for the top hypotheses, aligned with
+        ``tokens`` rows (``nbest_texts[0] == text``).  Filled on final
+        outputs when the request asked for ``DecodingOptions.n_best > 1``
+        and the decode family produced multiple hypotheses; ``None``
+        otherwise.
+    finish_reason : str, optional
+        Why generation stopped, for the incremental AR families:
+        ``"stop"`` (EOS emitted) or ``"length"`` (``max_new_tokens`` hit).
+        ``None`` for frame-synchronous families (they always consume the
+        full audio) and for partial outputs.
     """
 
     request_id: str
@@ -59,6 +153,8 @@ class RequestOutput:
     scores: Optional[List[float]] = None
     finished: bool = False
     timestamps: Optional[List[Tuple[float, float]]] = None
+    nbest_texts: Optional[List[str]] = None
+    finish_reason: Optional[str] = None
 
 
 class Request:
@@ -79,6 +175,9 @@ class Request:
         paged attention cache.  If ``False``, use the single-pass offline path.
     sample_rate : int
         Sample rate of the audio in Hz.
+    decoding : DecodingOptions, optional
+        Per-request decoding options (n-best, generation cap, sampling,
+        prompt).  ``None`` keeps every engine default.
     """
 
     def __init__(
@@ -88,8 +187,10 @@ class Request:
         streaming: bool = False,
         sample_rate: int = 16000,
         priority: int = DEFAULT_PRIORITY,
+        decoding: Optional[DecodingOptions] = None,
     ) -> None:
         self.request_id: str = request_id or uuid.uuid4().hex
+        self.decoding: Optional[DecodingOptions] = decoding
         # The engine's single audio input slot — always a **waveform** (1-D
         # float32 samples) or ``None``; the engine never takes file paths
         # (decode at the entry point).  Its role depends on the mode:

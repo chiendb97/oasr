@@ -417,8 +417,144 @@ class TestLlmStrategy:
     def test_llm_prompt_override(self):
         strategy_default, _ = self._strategy_and_model()
         strategy_custom, _ = self._strategy_and_model(llm_prompt="Transcribe.")
-        assert strategy_custom._suffix_ids != strategy_default._suffix_ids
+        assert strategy_custom._default_suffix_ids != strategy_default._default_suffix_ids
         assert strategy_custom._prefix_ids == strategy_default._prefix_ids
+
+    def test_per_request_prompt_override(self):
+        from types import SimpleNamespace
+
+        from oasr.engine.request import DecodingOptions
+
+        strategy, _ = self._strategy_and_model()
+        default_req = SimpleNamespace(request_id="r0", decoding=None)
+        custom_req = SimpleNamespace(
+            request_id="r1", decoding=DecodingOptions(prompt="Transcribe.")
+        )
+        default_ids = strategy._suffix_ids_for(default_req)
+        custom_ids = strategy._suffix_ids_for(custom_req)
+        assert default_ids == strategy._default_suffix_ids
+        assert custom_ids != default_ids
+        # Memoised: same list object on repeat lookup.
+        assert strategy._suffix_ids_for(custom_req) is custom_ids
+
+    def test_per_request_max_new_tokens_and_finish_reason(self):
+        from types import SimpleNamespace
+
+        from oasr.engine.generation import StepBudget
+        from oasr.engine.request import DecodingOptions
+
+        # Engine default 64, request caps row 1 at 3 — the capped row must
+        # stop with finish_reason="length" after exactly 3 tokens (the tiny
+        # random fixture never emits EOS that early).
+        strategy, model = self._strategy_and_model(max_new_tokens=64)
+        mel = torch.randn(2, 3000, 128)
+        with torch.no_grad():
+            emb, elens = model.encode_offline(mel, torch.tensor([300, 190]))
+        reqs = [
+            SimpleNamespace(request_id="r0", decoding=None),
+            SimpleNamespace(request_id="r1", decoding=DecodingOptions(max_new_tokens=3)),
+        ]
+        strategy.begin_offline(reqs, emb, elens)
+        finals = {}
+        for _ in range(100):
+            for out in strategy.advance(StepBudget(max_steps=8)):
+                if out.finished:
+                    finals[out.request_id] = out
+            if "r1" in finals:
+                break
+        assert "r1" in finals
+        assert len(finals["r1"].tokens[0]) == 3
+        assert finals["r1"].finish_reason == "length"
+
+    def test_preallocated_kv_matches_cat_growth(self):
+        """The in-place preallocated KV path (``prefill(capacity=...)``) must
+        be logit- and token-identical to the legacy cat-growth path, across
+        step and select (row drop)."""
+        from oasr.models.loaders import load_pretrained
+
+        loaded = load_pretrained(SPEECH_LLM_TINY, device="cpu", dtype=torch.float32)
+        lm = loaded.model.language_model
+        torch.manual_seed(0)
+        B, P, D = 3, 17, loaded.model.config.text_hidden_size
+        emb = torch.randn(B, P, D)
+        valid = torch.ones(B, P, dtype=torch.bool)
+        valid[0, :5] = False
+        valid[2, :2] = False
+
+        def run(capacity):
+            with torch.no_grad():
+                logits, state = lm.prefill(emb, valid, capacity=capacity)
+                seq = [logits.clone()]
+                toks = logits.argmax(-1)
+                for step in range(6):
+                    logits, state = lm.step(toks, state)
+                    seq.append(logits.clone())
+                    toks = logits.argmax(-1)
+                    if step == 2:  # drop the middle row mid-generation
+                        keep = torch.tensor([0, 2])
+                        state = lm.select(state, keep)
+                        toks = toks.index_select(0, keep)
+            return seq
+
+        legacy = run(None)
+        prealloc = run(P + 16)
+        for a, b in zip(legacy, prealloc):
+            torch.testing.assert_close(a, b)
+
+    def test_preallocated_kv_overflow_falls_back(self):
+        """Stepping past the declared capacity must degrade to cat-growth,
+        not corrupt the cache."""
+        from oasr.models.loaders import load_pretrained
+
+        loaded = load_pretrained(SPEECH_LLM_TINY, device="cpu", dtype=torch.float32)
+        lm = loaded.model.language_model
+        torch.manual_seed(0)
+        P, D = 9, loaded.model.config.text_hidden_size
+        emb = torch.randn(1, P, D)
+        valid = torch.ones(1, P, dtype=torch.bool)
+
+        def run(capacity):
+            with torch.no_grad():
+                logits, state = lm.prefill(emb, valid, capacity=capacity)
+                out = [logits.clone()]
+                toks = logits.argmax(-1)
+                for _ in range(5):
+                    logits, state = lm.step(toks, state)
+                    out.append(logits.clone())
+                    toks = logits.argmax(-1)
+            return out
+
+        legacy = run(None)
+        tight = run(P + 2)  # overflows on the 3rd step
+        for a, b in zip(legacy, tight):
+            torch.testing.assert_close(a, b)
+
+    def test_sampling_topk1_matches_greedy(self):
+        from types import SimpleNamespace
+
+        from oasr.engine.generation import StepBudget
+        from oasr.engine.request import DecodingOptions
+
+        # temperature>0 with top_k=1 is argmax-by-construction, so the sampled
+        # row must produce exactly the greedy transcript — this exercises the
+        # sampling code path deterministically.
+        def run(decoding):
+            strategy, model = self._strategy_and_model(max_new_tokens=8)
+            torch.manual_seed(0)
+            mel = torch.zeros(1, 3000, 128)
+            with torch.no_grad():
+                emb, elens = model.encode_offline(mel, torch.tensor([300]))
+            req = SimpleNamespace(request_id="r0", decoding=decoding)
+            strategy.begin_offline([req], emb, elens)
+            for _ in range(50):
+                for out in strategy.advance(StepBudget(max_steps=8)):
+                    if out.finished:
+                        return out.tokens[0]
+            raise AssertionError("did not finish")
+
+        greedy = run(None)
+        sampled = run(DecodingOptions(temperature=2.0, top_k=1))
+        assert sampled == greedy
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +614,56 @@ class TestEngineE2E:
             ASREngine(
                 EngineConfig(ckpt_dir=SPEECH_LLM_TINY, service_mode="offline", decode_method="ctc")
             )
+
+    def test_sustained_backlog_bounded_ticks_no_starvation(self):
+        """Dispatcher-contract test under a sustained AR backlog.
+
+        A one-model-per-process deployment's "mixed load" is a stream of LLM
+        offline requests whose generations overlap fresh admissions.  The
+        serving dispatcher runs ``engine.step()`` synchronously per tick, so
+        the engine must guarantee (1) bounded work per tick — no request's
+        transcript may grow by more than ``decode_steps_per_tick`` tokens
+        between consecutive ticks; (2) the in-flight decode pool stays capped
+        by ``max_decode_slots`` (+ one just-admitted batch); (3) late
+        arrivals are neither dead-locked nor starved — everything finishes.
+        """
+        from oasr.engine import ASREngine, EngineConfig
+
+        audios = self._audios()
+        cfg = EngineConfig(
+            ckpt_dir=SPEECH_LLM_TINY,
+            service_mode="offline",
+            max_batch_size=2,
+            max_new_tokens=16,
+            decode_steps_per_tick=2,
+            max_decode_slots=2,
+        )
+        eng = ASREngine(cfg)
+        n_req = 6
+        ids = [
+            eng.add_request(audios[i % len(audios)], sample_rate=16000, streaming=False)
+            for i in range(n_req)
+        ]
+        finals = {}
+        last_len = {rid: 0 for rid in ids}
+        for _ in range(600):
+            outs = eng.step()
+            # (2) pending decode pool bounded: slots + at most one fresh batch.
+            assert eng.num_running <= cfg.max_decode_slots + cfg.max_batch_size
+            for o in outs:
+                # (1) bounded per-tick progress per request.
+                grown = len(o.tokens[0]) - last_len[o.request_id]
+                assert grown <= cfg.decode_steps_per_tick, (
+                    f"request advanced {grown} tokens in one tick "
+                    f"(budget {cfg.decode_steps_per_tick})"
+                )
+                last_len[o.request_id] = len(o.tokens[0])
+                if o.finished:
+                    finals[o.request_id] = o
+            if len(finals) == n_req:
+                break
+        # (3) no starvation / deadlock.
+        assert set(finals) == set(ids)
 
 
 # ---------------------------------------------------------------------------

@@ -1,21 +1,23 @@
 # Engine Architecture — Extension Points
 
 OASR's inference engine is built around **one registry per extension axis** so new
-model architectures, decode families, streaming runtimes, batching policies, and
-checkpoint formats plug in by *subclassing a base + registering* — never by
-editing the engine core. This mirrors the `model_executor` split in vLLM / SGLang,
-adapted to ASR (an acoustic **encoder** feeding a **decode** stage that is either
-non-autoregressive CTC or an autoregressive transducer/AED/LLM loop).
+model architectures, decode families, streaming runtimes, batching policies,
+checkpoint formats, and tokenizers plug in by *subclassing a base + registering* —
+never by editing the engine core. This mirrors the `model_executor` split in
+vLLM / SGLang, adapted to ASR (an acoustic **encoder** feeding a **decode** stage
+that is either non-autoregressive CTC/Paraformer or an autoregressive
+transducer/AED/LLM loop).
 
-## The five seams
+## The six seams
 
 | Axis | Base class | Registry / builder | Selected by |
 |------|-----------|--------------------|-------------|
-| Encoder architecture | `oasr.models.BaseEncoder` / `BaseAsrModel` | `oasr.models.registry` (`register_model`, `build_model_from_checkpoint`) | checkpoint architecture (`CheckpointConverter.detect`) |
+| Encoder architecture | `oasr.models.BaseEncoder` / `BaseAsrModel` | `oasr.models.registry` (`register_model`, `build_model_from_checkpoint`) | native format → `architecture=` override → `CheckpointConverter.detect` (see `docs/checkpoints.md`) |
 | Checkpoint format | `oasr.models.registry.CheckpointConverter` | same registry; `oasr.from_pretrained` resolves local dir / HF Hub id | `converter.detect()` |
-| Decode family | `oasr.engine.decode.DecodeStrategy` | `oasr.engine.decode` (`register_decode_strategy`, `build_decode_strategy`) | `model.decode_type` (+ `config.decoder_type` for CTC) |
+| Decode family | `oasr.engine.decode.DecodeStrategy` | `oasr.engine.decode` (`register_decode_strategy`, `build_decode_strategy`) | `EngineConfig.decode_method` validated against `model.capabilities`, else `model.default_decode_type` (+ `config.decoder_type` splits CTC into `ctc_cuda` / `ctc_wfst`) |
 | Streaming runtime | `oasr.engine.streaming_backend.StreamingEncoderBackend` | `oasr.engine.streaming_backend` (`register_streaming_backend`, `build_streaming_backend`) | `model.encoder.streaming_kind` |
 | Batching | `oasr.engine.batching.BatchingPolicy` / `PartitionPolicy` | `oasr.engine.batching` (`register_*_policy`, `build_*_policy`) | `config.schedule_policy` / partition flags |
+| Tokenizer | `oasr.tokenizers.Tokenizer` | `oasr.tokenizers` (`register_tokenizer`, `build_tokenizer`) | converter-emitted `TokenizerSpec.kind` (see `docs/tokenizers.md`) |
 
 ## Data flow
 
@@ -32,7 +34,10 @@ Request → InputProcessor (fbank) → Scheduler (BatchingPolicy + PartitionPoli
   states; the fused `forward_offline` / `forward_chunk_paged` (encoder+head →
   log-probs) are the CTC fast path that CUDA-graph capture preserves.
 - A `DecodeStrategy` declares `consumes` = `"log_probs"` (CTC fused-head fast
-  path) or `"hidden"` (autoregressive families drive `model.decoder` themselves).
+  path), `"hidden"` (autoregressive families drive `model.decoder` themselves),
+  or `"both"` (hidden + log-probs — CTC+AED rescoring); and `incremental = True`
+  for label-synchronous AR families driven via the bounded
+  `begin_offline` / `advance(StepBudget)` / `has_pending` protocol.
 - The encoder declares `streaming_kind` (`"paged"` / `"stateful"` / `"none"`) plus
   `subsampling_rate` / `right_context` / (stateful) `streaming_chunk_frames`; the
   engine reads streaming geometry from there, not from hardcoded constants.
@@ -48,15 +53,20 @@ Request → InputProcessor (fbank) → Scheduler (BatchingPolicy + PartitionPoli
 3. A `CheckpointConverter` + `register_model("foo", ...)` in the package
    `__init__`. No engine edits.
 
-**Add a decode family** (e.g. RNNT / AED / LLM):
-1. `class FooDecoder(BaseDecoder)` (`oasr.models.decoders`) — `init_state` +
-   `step`. Transducers compose a `PredictionNetwork` + `Joiner`.
-2. `@register_decode_strategy("transducer")` on a `DecodeStrategy` with
-   `consumes="hidden"`, driving `model.decoder.step(...)` token-by-token over a
-   decoder-side KV/state cache (reuse `oasr.cache.BlockPool` /
-   `AttentionCacheManager` for AED/LLM self/cross-attention KV).
-   The `transducer` / `aed` / `llm` names already resolve to documented skeletons
-   in `oasr/engine/decode/skeleton.py` — replace the body.
+**Add a decode family** (e.g. a new AR paradigm):
+1. `class FooDecoder(BaseDecoder)` (`oasr.models.decoders`) — for
+   frame-synchronous families `init_state` + `step`; for label-synchronous AR
+   families the batched incremental surface `prefill` / `step` / `select`
+   (see `oasr/models/whisper/model.py` and `oasr/models/speech_llm/llm.py`).
+   Transducers compose a `PredictionNetwork` + `Joiner`.
+2. `@register_decode_strategy("foo")` on a `DecodeStrategy`.  Frame-synchronous:
+   implement `decode_offline` (one shot).  Label-synchronous AR: set
+   `incremental = True` and implement `begin_offline` / `advance(StepBudget)` /
+   `has_pending` — the offline executor then runs at most
+   `EngineConfig.decode_steps_per_tick` batched decoder steps per engine tick
+   (bounded work for the serving dispatcher).  Working references:
+   `transducer.py` (frame-sync greedy, offline + streaming sessions),
+   `rescoring.py` (`consumes="both"`), `aed.py` / `llm.py` (incremental).
 
 **Add a streaming runtime:** `@register_streaming_backend("my_kind")` on a
 `StreamingEncoderBackend` (`allocate` / `forward_step` / `free` + window
@@ -70,24 +80,30 @@ flags.
 `build_config` / `build_aux` / `load_state_dict`) + `register_model`;
 `from_pretrained` auto-detects it for both local dirs and HF Hub ids.
 
-## Status of the autoregressive path
+## Paradigm status (all five wired)
 
-CTC (GPU prefix-beam + WFST) is fully wired across offline + streaming.
+| Paradigm | Model package | Strategy | Mode |
+|---|---|---|---|
+| CTC (GPU prefix-beam / WFST) | `conformer`, `zipformer` | `ctc_cuda` / `ctc_wfst` | offline + streaming |
+| Transducer (RNNT greedy) | `transducer` (icefall converter, explicit `architecture=`) | `transducer` (`consumes="hidden"`) | offline + streaming |
+| CTC+AED rescoring (U2++) | `conformer` (decoder branch kept) | `ctc_aed_rescoring` (`consumes="both"`, opt-in via `decode_method`) | offline |
+| AED (Whisper) | `whisper` (HF converter) | `aed` (incremental greedy) | offline |
+| Paraformer (NAR) | `paraformer` (FunASR converter) | `paraformer` (one-shot, CIF timestamps) | offline |
+| LLM-ASR (Qwen2-Audio) | `speech_llm` (HF converter) | `llm` (incremental greedy, token-streaming partials) | offline |
 
-**Transducer (RNNT) — offline greedy is implemented.** `oasr/models/transducer/`
-(stateless predictor + joiner) + `TransducerDecodeStrategy` run frame-synchronous
-greedy over encoder hidden states; the offline executor feeds `encode_offline`
-(hidden) when the strategy's `consumes == "hidden"`. Validated batched-vs-reference
-on a tiny model (`tests/test_transducer.py`). Remaining transducer work:
-**streaming** greedy (predictor state + frame pointer threaded across chunks),
-**beam** search, batched-predictor throughput, and a `CheckpointConverter` so
-`from_pretrained` loads icefall pruned-transducer checkpoints.
+Per-request `DecodingOptions` (`oasr.engine.DecodingOptions` — n-best, generation
+cap, sampling knobs, LLM prompt override) ride on `Request` and through the
+serving front-end; engine-level knobs stay on `EngineConfig`.
 
-**AED / LLM** remain registered skeletons (`consumes="hidden"`, raise) — they need
-a label-synchronous decoder with a decoder-side KV cache (reuse
-`oasr.cache.BlockPool` / `AttentionCacheManager`).
+The Conformer (paged) and Zipformer (stateful) streaming backends are both wired.
+The stateful backend **batches** ready streams: when the encoder exposes
+`stack_streaming_states` / `unstack_streaming_states` (Zipformer does), all
+same-chunk-length streams run as one `B = N` forward (3.5–24× over the previous
+sequential `B = 1` loop at pool sizes 4–32).  Encoders with
+`streaming_kind="none"` are rejected in streaming service mode.
 
-The Conformer (paged) and Zipformer (stateful) streaming backends are both wired;
-Zipformer's stateful streaming is validated at the backend level (state threading)
-— full engine-level streaming additionally needs a streaming Zipformer checkpoint.
-Encoders with `streaming_kind="none"` use the no-op offline-only backend.
+Deferred follow-ups (measured rationale in `docs/design/multi_paradigm.md`):
+AED/transducer beam search, paged decoder-KV via the CuteDSL FMHA (blocked on the
+masked-tile fix for heavily key-padded rows — exactly the left-padded LLM prompt
+shape), and decoder-step CUDA graphs (the prerequisite — capacity-preallocated
+static KV buffers in `Qwen2Lm` — has landed).
