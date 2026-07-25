@@ -291,3 +291,25 @@ def test_paged_backend_consumes_routing():
 
     backend, model = _paged_backend("log_probs")
     assert backend._chunk_forward.__func__ is _RoutingModelStub.forward_chunk_paged  # noqa: SLF001
+
+
+def test_paged_backend_gates_capacity_exhausted_stream():
+    """An out-of-cache stream must be flagged, not dispatched into the forward.
+
+    Regression: with unlimited history the pool eventually has no free block, and
+    the allocator raised ``BlockPool exhausted`` from inside the encoder forward.
+    The model stub's ``forward_chunk_paged`` raises, so reaching it fails the test.
+    """
+    backend, _model = _paged_backend("log_probs")
+    req = _make_request(stream_id=0, feature_buffer=torch.zeros(1024, 80))
+    req.feature_frames = 1024
+    req.feature_cursor = 0
+    backend.allocate(req)
+
+    # Drain the pool behind the manager's back so the next chunk has nowhere to go.
+    pool = backend.block_pool
+    pool.allocate(pool.num_free_blocks)
+
+    results = backend.forward_step([req])
+    assert results == {}
+    assert req.cache_exhausted is True

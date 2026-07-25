@@ -113,7 +113,7 @@ class HFWhisperConverter:
             return load_file(str(st_path), device=str(map_location))
         bin_path = ckpt_dir / "pytorch_model.bin"
         if bin_path.exists():
-            return torch.load(str(bin_path), map_location=map_location)
+            return torch.load(str(bin_path), map_location=map_location, weights_only=True)
         raise FileNotFoundError(f"no model.safetensors or pytorch_model.bin under {ckpt_dir}")
 
     # -- complete-bundle conversion ------------------------------------------

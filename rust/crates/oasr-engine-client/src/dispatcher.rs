@@ -26,7 +26,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::pyengine::{engine_error_event, AdmitSpec, PyEngine, PyEngineError};
+use crate::pyengine::{engine_error_event, AdmitSpec, PyEngine};
 use crate::router::RouterActor;
 
 /// Maximum time the dispatcher blocks waiting for a command on an idle tick.
@@ -34,6 +34,90 @@ use crate::router::RouterActor;
 /// that `/readyz` doesn't go stale under pure-idle conditions.  When a sender
 /// lands an envelope inside the window, `recv()` returns immediately.
 const IDLE_RECV_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Consecutive `engine.step()` failures after which this process stops
+/// advertising readiness.  A single failure is recoverable (the offending
+/// requests are errored and aborted); a run of them means the engine is wedged,
+/// and staying "ready" would turn every arriving request into an INTERNAL error.
+const MAX_CONSECUTIVE_STEP_FAILURES: u32 = 3;
+
+/// Prometheus metric names exported from the dispatcher tick.
+///
+/// The tick histogram is the load-bearing one: one engine tick holds the GIL for
+/// admit + step + extract, so its p99 *is* the worst-case latency a cancel, a new
+/// admission, or a streaming partial can experience.  Autoregressive decode makes
+/// that number model-dependent (a batched 7B decoder step is orders of magnitude
+/// slower than a CTC chunk), so it has to be observable rather than assumed.
+pub(crate) mod metric {
+    pub const TICK_SECONDS: &str = "oasr_dispatch_tick_seconds";
+    pub const ADMIT_SECONDS: &str = "oasr_dispatch_admit_seconds";
+    pub const STEP_SECONDS: &str = "oasr_engine_step_seconds";
+    pub const EXTRACT_SECONDS: &str = "oasr_dispatch_extract_seconds";
+    pub const ROUTE_SECONDS: &str = "oasr_dispatch_route_seconds";
+    pub const RUNNING: &str = "oasr_engine_running";
+    pub const WAITING: &str = "oasr_engine_waiting";
+    pub const OUTPUTS: &str = "oasr_engine_outputs_total";
+    pub const ADMITTED: &str = "oasr_requests_admitted_total";
+    pub const REJECTED: &str = "oasr_requests_rejected_total";
+    pub const BUSY: &str = "oasr_requests_busy_total";
+    pub const STEP_FAILURES: &str = "oasr_engine_step_failures_total";
+    pub const EVENTS_DROPPED: &str = "oasr_events_dropped_total";
+    pub const EVENTS_DEFERRED: &str = "oasr_events_deferred_total";
+}
+
+/// Register descriptions once so `/metrics` is self-documenting even before the
+/// first request lands.
+fn describe_metrics() {
+    metrics::describe_histogram!(
+        metric::TICK_SECONDS,
+        metrics::Unit::Seconds,
+        "Wall time of one dispatcher tick (GIL held: admit + step + extract)"
+    );
+    metrics::describe_histogram!(
+        metric::ADMIT_SECONDS,
+        metrics::Unit::Seconds,
+        "Time replaying admission commands into Python per tick"
+    );
+    metrics::describe_histogram!(
+        metric::STEP_SECONDS,
+        metrics::Unit::Seconds,
+        "Time in ASREngine.step() per tick"
+    );
+    metrics::describe_histogram!(
+        metric::EXTRACT_SECONDS,
+        metrics::Unit::Seconds,
+        "Time converting RequestOutputs into events per tick"
+    );
+    metrics::describe_histogram!(
+        metric::ROUTE_SECONDS,
+        metrics::Unit::Seconds,
+        "Time routing events to per-request channels per tick (GIL released)"
+    );
+    metrics::describe_gauge!(
+        metric::RUNNING,
+        "Requests the engine reports as running (incl. parked AR generations)"
+    );
+    metrics::describe_gauge!(metric::WAITING, "Requests waiting for admission");
+    metrics::describe_counter!(metric::OUTPUTS, "RequestOutputs returned by step()");
+    metrics::describe_counter!(metric::ADMITTED, "Requests accepted by the engine");
+    metrics::describe_counter!(
+        metric::REJECTED,
+        "Requests the engine rejected at admission (invalid options, mode mismatch)"
+    );
+    metrics::describe_counter!(
+        metric::BUSY,
+        "Requests refused because max_concurrent_requests was reached"
+    );
+    metrics::describe_counter!(metric::STEP_FAILURES, "ASREngine.step() raised");
+    metrics::describe_counter!(
+        metric::EVENTS_DROPPED,
+        "Non-terminal events (partials) dropped because a client's channel was full"
+    );
+    metrics::describe_counter!(
+        metric::EVENTS_DEFERRED,
+        "Terminal events handed to a background task because the channel was full"
+    );
+}
 
 /// One outbound command + optional binary payload.
 pub struct CmdEnvelope {
@@ -242,6 +326,11 @@ fn run_dispatcher(
 
     let trace_enabled = cfg.trace_dispatch;
     let mut trace = DispatchTrace::new();
+    // Run of consecutive `engine.step()` failures; see the step-failure block
+    // below.  Reaching MAX_CONSECUTIVE_STEP_FAILURES stops the readiness
+    // heartbeat so this process is drained instead of erroring every request.
+    let mut consecutive_step_failures: u32 = 0;
+    describe_metrics();
 
     loop {
         // ---- Drain inbound commands (non-blocking up to per-tick budget) ----
@@ -320,13 +409,15 @@ fn run_dispatcher(
         // ---- ONE Python::with_gil for replay + step ----
         tick_events.clear();
         admit_batch.clear();
-        let (running, waiting, t_admit, t_step, t_extract, n_out): (
+        let tick_t0 = Instant::now();
+        let (running, waiting, t_admit, t_step, t_extract, n_out, step_failed): (
             u32,
             u32,
             Duration,
             Duration,
             Duration,
             u64,
+            bool,
         ) = Python::with_gil(|py| {
             let bound = engine.bind_engine(py);
 
@@ -371,6 +462,7 @@ fn run_dispatcher(
             let mut t_step = Duration::ZERO;
             let mut t_extract = Duration::ZERO;
             let mut n_out = 0u64;
+            let mut step_failed = false;
             if pending {
                 let step_t0 = Instant::now();
                 match PyEngine::step_raw(&bound) {
@@ -398,24 +490,46 @@ fn run_dispatcher(
                         t_step = step_t0.elapsed();
                         let rids = shared.router.all_request_ids();
                         error!(label = %shared.label, n_affected = rids.len(), "engine.step failed: {e}");
-                        // Surface a synthetic Error to every in-flight request
-                        // so callers don't hang.  Continue — the engine may
-                        // recover on the next tick.
+                        // Surface a synthetic Error to every in-flight request so
+                        // callers don't hang, **and abort them in Python**.
+                        // Without the abort the offending state survives — an
+                        // incremental strategy's failing decode group stays in its
+                        // pending pool and raises again on the next tick, so every
+                        // newly admitted request inherits the same error forever.
+                        // Aborting is also what the error we just sent implies.
                         for rid in rids {
+                            if let Err(abort_err) = PyEngine::abort_locked(&bound, &rid) {
+                                warn!(
+                                    label = %shared.label,
+                                    rid = %rid,
+                                    "abort after step failure did not succeed: {abort_err}"
+                                );
+                            }
                             tick_events.push(Event::Error {
                                 request_id: rid,
                                 code: ErrorCode::Internal,
                                 message: format!("engine.step error: {e}"),
                             });
                         }
+                        step_failed = true;
                     }
                 }
             }
 
             // Refresh load after step (terminal events drop in-flight count).
             let (running, waiting) = PyEngine::load_locked(&bound);
-            (running, waiting, t_admit, t_step, t_extract, n_out)
+            (
+                running,
+                waiting,
+                t_admit,
+                t_step,
+                t_extract,
+                n_out,
+                step_failed,
+            )
         });
+
+        let t_tick = tick_t0.elapsed();
 
         // ---- Route events outside the GIL ----
         let route_t0 = Instant::now();
@@ -428,6 +542,26 @@ fn run_dispatcher(
             }
         }
         let t_route = route_t0.elapsed();
+
+        // ---- Metrics ----
+        //
+        // Recorded on every non-idle tick.  A tick that did nothing (no admits,
+        // no step, no outputs) would otherwise flood the tick histogram with
+        // near-zero samples and hide the p99 that matters.
+        if t_step > Duration::ZERO || n_admit > 0 || n_out > 0 {
+            metrics::histogram!(metric::TICK_SECONDS).record(t_tick.as_secs_f64());
+            metrics::histogram!(metric::ADMIT_SECONDS).record(t_admit.as_secs_f64());
+            metrics::histogram!(metric::EXTRACT_SECONDS).record(t_extract.as_secs_f64());
+            metrics::histogram!(metric::ROUTE_SECONDS).record(t_route.as_secs_f64());
+            if t_step > Duration::ZERO {
+                metrics::histogram!(metric::STEP_SECONDS).record(t_step.as_secs_f64());
+            }
+            if n_out > 0 {
+                metrics::counter!(metric::OUTPUTS).increment(n_out);
+            }
+        }
+        metrics::gauge!(metric::RUNNING).set(running as f64);
+        metrics::gauge!(metric::WAITING).set(waiting as f64);
 
         // ---- Dispatch trace accounting (diagnostics; gated by flag) ----
         if trace_enabled && (t_step > Duration::ZERO || n_out > 0) {
@@ -442,11 +576,40 @@ fn run_dispatcher(
             trace.maybe_log(&shared.label);
         }
 
+        // ---- Step-failure tracking ----
+        //
+        // A single failure is errored + aborted above and the engine usually
+        // recovers.  A *run* of failures means the engine is wedged (a corrupt
+        // CUDA context, an OOM we cannot unwind), and continuing to accept
+        // traffic just converts every arriving request into an INTERNAL error.
+        // Stop refreshing the heartbeat so `/readyz` and the gRPC health check
+        // go NotServing and the load balancer drains this process.
+        if step_failed {
+            consecutive_step_failures += 1;
+            metrics::counter!(metric::STEP_FAILURES).increment(1);
+            if consecutive_step_failures == MAX_CONSECUTIVE_STEP_FAILURES {
+                error!(
+                    label = %shared.label,
+                    failures = consecutive_step_failures,
+                    "engine.step failed {consecutive_step_failures} times in a row; \
+                     marking this process not-ready (restart required)"
+                );
+            }
+        } else {
+            if consecutive_step_failures >= MAX_CONSECUTIVE_STEP_FAILURES {
+                info!(label = %shared.label, "engine.step recovered; marking ready again");
+            }
+            consecutive_step_failures = 0;
+        }
+        let healthy = consecutive_step_failures < MAX_CONSECUTIVE_STEP_FAILURES;
+
         // ---- Refresh load + heartbeat ----
         shared.load.store(running + waiting, Ordering::Relaxed);
-        shared
-            .last_event_at_ms
-            .store(now_millis(epoch), Ordering::Relaxed);
+        if healthy {
+            shared
+                .last_event_at_ms
+                .store(now_millis(epoch), Ordering::Relaxed);
+        }
 
         // ---- Optional overload signal ----
         if running + waiting >= cfg.max_concurrent_requests {
@@ -525,6 +688,7 @@ fn enqueue_admit_locked(
                     cap = max_concurrent,
                     "admission rejected: at capacity"
                 );
+                metrics::counter!(metric::BUSY).increment(1);
                 out_events.push(Event::Error {
                     request_id: request_id.clone(),
                     code: ErrorCode::Busy,
@@ -567,6 +731,7 @@ fn enqueue_admit_locked(
                     cap = max_concurrent,
                     "admission rejected: at capacity"
                 );
+                metrics::counter!(metric::BUSY).increment(1);
                 out_events.push(Event::Error {
                     request_id: request_id.clone(),
                     code: ErrorCode::Busy,
@@ -603,11 +768,12 @@ fn enqueue_admit_locked(
     }
 }
 
-/// Replay the accumulated `admit_batch` via a single Python call.  On
-/// success we leave the previously-pushed `Accepted` events in `out_events`
-/// untouched.  On failure we walk the batch, decrement the load atomic per
-/// spec (`enqueue_admit_locked` bumped it optimistically), and replace the
-/// trailing `Accepted` events with `Error` events for the same rids.
+/// Replay the accumulated `admit_batch` via a single Python call.
+///
+/// The Python side validates and admits **per spec**, so the common failure
+/// (one client's out-of-range option) comes back as a per-spec message and only
+/// that request's `Accepted` is rewritten into an `Error`.  An `Err` from the
+/// call itself is batch-wide and rewrites every spec in the batch.
 ///
 /// Empties `admit_batch` on every call.
 fn flush_admit_batch_locked<'py>(
@@ -621,47 +787,74 @@ fn flush_admit_batch_locked<'py>(
         return;
     }
     match PyEngine::add_requests_batch_locked(py, bound, admit_batch) {
-        Ok(()) => {
-            admit_batch.clear();
+        Ok(per_spec) => {
+            rewrite_rejected_admits(admit_batch, shared, out_events, &per_spec);
         }
         Err(e) => {
-            rollback_admit_batch(admit_batch, shared, out_events, &e);
+            let msg = format!("{e}");
+            let all: Vec<Option<String>> = vec![Some(msg); admit_batch.len()];
+            rewrite_rejected_admits(admit_batch, shared, out_events, &all);
         }
     }
 }
 
-fn rollback_admit_batch(
+/// Turn per-spec rejection messages into `Error` events for the matching rids.
+///
+/// `errors[i]` corresponds to `admit_batch[i]`; `None` means admitted.  A
+/// rejected spec's previously-pushed `Accepted` is replaced in place, found by
+/// **rid** rather than by position: `enqueue_admit_locked` can interleave
+/// `Error` events (capacity / empty-audio rejections) among the `Accepted`s, so
+/// the tail of `out_events` is not necessarily one `Accepted` per spec.
+///
+/// Note we do **not** decrement `shared.load` here: the event we write is
+/// terminal, and the tick's routing loop decrements once per terminal event.
+/// Decrementing in both places double-counted and briefly under-reported load,
+/// which reads as spare capacity to `EngineClient::load()`.
+///
+/// Empties `admit_batch`.
+fn rewrite_rejected_admits(
     admit_batch: &mut Vec<AdmitSpec>,
     shared: &DispatcherShared,
     out_events: &mut Vec<Event>,
-    err: &PyEngineError,
+    errors: &[Option<String>],
 ) {
-    // Roll back the speculative load bumps and rewrite the trailing
-    // Accepted events into Error events for the same rids.  We assume the
-    // last N `Accepted` events correspond to this admit batch in order —
-    // safe because `enqueue_admit_locked` pushes them in lockstep with
-    // `admit_batch` appends and no other code path touches `out_events`
-    // between admit accumulation and flush.
     let n = admit_batch.len();
-    let start = out_events.len().saturating_sub(n);
-    let mut idx = start;
-    for spec in admit_batch.drain(..) {
-        shared.load.fetch_sub(1, Ordering::Relaxed);
-        let rid = spec.request_id().to_owned();
-        // Defensive: only overwrite if the slot really is an Accepted for this rid.
-        if idx < out_events.len() {
-            let matches = matches!(
-                &out_events[idx],
-                Event::Accepted { request_id } if request_id == &rid
-            );
-            if matches {
-                out_events[idx] = engine_error_event(&rid, err);
-                idx += 1;
-                continue;
-            }
+    let mut n_rejected = 0usize;
+    for (i, spec) in admit_batch.drain(..).enumerate() {
+        let Some(msg) = errors.get(i).and_then(|e| e.as_deref()) else {
+            continue; // admitted; its Accepted event stands
+        };
+        n_rejected += 1;
+        let rid = spec.request_id();
+        // InvalidCmd maps to INVALID_ARGUMENT / 400 on both front-ends — a
+        // rejected option is a client error, not an engine fault.
+        let ev = Event::Error {
+            request_id: rid.to_owned(),
+            code: ErrorCode::InvalidCmd,
+            message: msg.to_owned(),
+        };
+        match out_events
+            .iter()
+            .rposition(|e| matches!(e, Event::Accepted { request_id } if request_id == rid))
+        {
+            Some(pos) => out_events[pos] = ev,
+            // No Accepted to replace (shouldn't happen): append so the client
+            // still gets a terminal event instead of hanging.
+            None => out_events.push(ev),
         }
-        // Fall back to appending if the slot doesn't line up (shouldn't happen).
-        out_events.push(engine_error_event(&rid, err));
+    }
+    if n_rejected > 0 {
+        metrics::counter!(metric::REJECTED).increment(n_rejected as u64);
+        warn!(
+            label = %shared.label,
+            n_rejected,
+            n_batch = n,
+            "engine rejected admits (per-request; batch-mates unaffected)"
+        );
+    }
+    let admitted = n.saturating_sub(n_rejected);
+    if admitted > 0 {
+        metrics::counter!(metric::ADMITTED).increment(admitted as u64);
     }
 }
 

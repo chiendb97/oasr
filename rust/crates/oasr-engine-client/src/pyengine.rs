@@ -121,7 +121,7 @@ impl PyEngine {
             let engine_cls = engine_mod.getattr("ASREngine")?;
             let engine = engine_cls.call1((engine_cfg.clone(),))?;
 
-            let model_info = collect_model_info(py, &engine_cfg).unwrap_or_default();
+            let model_info = collect_model_info(py, &engine_cfg, &engine).unwrap_or_default();
 
             Ok(Self {
                 engine: engine.unbind(),
@@ -234,20 +234,25 @@ impl PyEngine {
         Ok(())
     }
 
-    /// Bulk admission entry — calls `ASREngine.add_requests_batch(list)` in
-    /// **one** Python method invocation across all `specs`.  GIL must already
+    /// Bulk admission entry — calls `ASREngine.add_requests_batch_checked(list)`
+    /// in **one** Python method invocation across all `specs`.  GIL must already
     /// be held; intended to be called by the dispatcher inside its tick's
     /// `Python::with_gil` scope after draining contiguous admit envelopes.
-    /// Returns `Ok(())` when the Python batch call succeeds — callers that
-    /// need per-request error fan-out can call the single-shot
-    /// `add_*_locked` helpers in a loop instead.
+    ///
+    /// Returns one entry per spec, in order: `None` when that spec was admitted,
+    /// `Some(message)` when the engine rejected it.  A rejection is scoped to its
+    /// own request — the `_checked` Python entry point validates and admits per
+    /// spec instead of raising for the batch, so one client's bad `top_p` can no
+    /// longer error every request that happened to coalesce with it.  `Err` is
+    /// reserved for a genuinely batch-wide failure (the Python call itself
+    /// raising, e.g. an engine-level fault).
     pub fn add_requests_batch_locked<'py>(
         py: Python<'py>,
         bound: &Bound<'py, PyAny>,
         specs: &[AdmitSpec],
-    ) -> Result<(), PyEngineError> {
+    ) -> Result<Vec<Option<String>>, PyEngineError> {
         if specs.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let list = PyList::empty_bound(py);
         for spec in specs {
@@ -287,8 +292,28 @@ impl PyEngine {
             }
             list.append(d)?;
         }
-        bound.call_method1("add_requests_batch", (list,))?;
-        Ok(())
+        let out = bound.call_method1("add_requests_batch_checked", (list,))?;
+        let rows: Vec<Bound<'py, PyAny>> = out.extract()?;
+        let mut errors: Vec<Option<String>> = Vec::with_capacity(specs.len());
+        for row in rows.iter() {
+            // `{"request_id": str}` on success, `{..., "error": str}` on rejection.
+            let err = row
+                .get_item("error")
+                .ok()
+                .and_then(|v| v.extract::<Option<String>>().ok())
+                .flatten();
+            errors.push(err);
+        }
+        // Defensive: a length mismatch would misattribute errors, so treat it as
+        // batch-wide rather than guessing which spec each row belongs to.
+        if errors.len() != specs.len() {
+            return Err(PyEngineError::Py(format!(
+                "add_requests_batch_checked returned {} rows for {} specs",
+                errors.len(),
+                specs.len()
+            )));
+        }
+        Ok(errors)
     }
 
     pub fn feed_chunk(&self, rid: &str, chunk: &[u8], is_last: bool) -> Result<(), PyEngineError> {
@@ -471,7 +496,11 @@ fn audio_bytes_to_numpy<'py>(py: Python<'py>, audio: &[u8]) -> PyResult<Bound<'p
     Ok(arr)
 }
 
-fn collect_model_info(_py: Python<'_>, cfg: &Bound<'_, PyAny>) -> PyResult<ModelInfo> {
+fn collect_model_info(
+    _py: Python<'_>,
+    cfg: &Bound<'_, PyAny>,
+    engine: &Bound<'_, PyAny>,
+) -> PyResult<ModelInfo> {
     let mut info = ModelInfo::default();
     info.ckpt_dir = cfg
         .getattr("ckpt_dir")
@@ -505,6 +534,25 @@ fn collect_model_info(_py: Python<'_>, cfg: &Bound<'_, PyAny>) -> PyResult<Model
                 .and_then(|x| x.extract::<u32>().ok());
         }
     }
+    // Read the *resolved* mode / family off the engine, not the config: the
+    // engine validates `decode_method` against the checkpoint's capabilities and
+    // rejects offline-only families in streaming mode, so it is the authority on
+    // what this process can actually serve.
+    info.service_mode = engine
+        .getattr("service_mode")
+        .ok()
+        .and_then(|x| x.extract::<Option<String>>().ok())
+        .unwrap_or_default();
+    info.decode_method = engine
+        .getattr("decode_method")
+        .ok()
+        .and_then(|x| x.extract::<Option<String>>().ok())
+        .unwrap_or_default();
+    info.capabilities = engine
+        .getattr("capabilities")
+        .ok()
+        .and_then(|x| x.extract::<Vec<String>>().ok())
+        .unwrap_or_default();
     Ok(info)
 }
 

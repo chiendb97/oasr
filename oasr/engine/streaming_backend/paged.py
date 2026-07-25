@@ -11,6 +11,7 @@ encoder streaming models can plug in alongside it — behaviour is unchanged.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
     from oasr.models.base import BaseAsrModel
 
     from ..config import EngineConfig
+
+logger = logging.getLogger(__name__)
 
 
 @register_streaming_backend("paged")
@@ -276,6 +279,22 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             if not req.has_ready_encoder_chunk(window):
                 continue
             if req.feature_buffer is None:
+                continue
+            # Capacity gate: with unlimited history a long-running stream
+            # eventually exhausts its share of the paged pool (or its
+            # block_table row).  Detect it here and let the executor finalize
+            # the stream — the allocator would otherwise raise inside the
+            # forward, which the dispatcher fans out to every in-flight
+            # request.
+            if req.stream_id is not None and self._att_mgr.at_capacity(req.stream_id):
+                if not req.cache_exhausted:
+                    req.cache_exhausted = True
+                    logger.warning(
+                        "stream %s reached its encoder-cache capacity (%d frames); "
+                        "finalizing with the transcript decoded so far",
+                        req.request_id,
+                        self._cache_config.max_stream_frames,
+                    )
                 continue
 
             available = req.feature_frames - req.feature_cursor

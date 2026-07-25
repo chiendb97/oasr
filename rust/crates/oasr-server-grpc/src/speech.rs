@@ -90,18 +90,24 @@ fn log_reject(st: Status) -> Status {
 }
 
 /// Map the proto `RecognitionConfig` decoding extensions to the engine's
-/// per-request [`DecodingParams`].  Returns `None` when every knob is at its
-/// proto default (0 / empty) so the common path sends nothing.
-fn decoding_params(cfg: &pb::RecognitionConfig) -> Option<DecodingParams> {
-    let p = DecodingParams {
+/// per-request [`DecodingParams`].  Returns `Ok(None)` when every knob is at its
+/// proto default (0 / empty) so the common path sends nothing, and
+/// `INVALID_ARGUMENT` for out-of-range values.
+///
+/// Validating here rather than letting the Python `DecodingOptions` raise is
+/// what keeps a bad value scoped to its own request: bulk admission coalesces
+/// many envelopes into one Python call, so a raise there fails the whole batch.
+fn decoding_params(cfg: &pb::RecognitionConfig) -> Result<Option<DecodingParams>, Status> {
+    DecodingParams {
         n_best: (cfg.max_alternatives > 1).then_some(cfg.max_alternatives),
         max_new_tokens: (cfg.max_new_tokens > 0).then_some(cfg.max_new_tokens),
         temperature: (cfg.temperature > 0.0).then_some(cfg.temperature),
         top_k: (cfg.top_k > 0).then_some(cfg.top_k),
         top_p: (cfg.top_p > 0.0).then_some(cfg.top_p),
         prompt: (!cfg.prompt.is_empty()).then(|| cfg.prompt.clone()),
-    };
-    (!p.is_empty()).then_some(p)
+    }
+    .validated()
+    .map_err(Status::invalid_argument)
 }
 
 /// Seconds → protobuf `Duration` (audio times are small and non-negative).
@@ -180,7 +186,7 @@ impl pb::speech_server::Speech for SpeechService {
             let cfg =
                 config.ok_or_else(|| log_reject(Status::invalid_argument("config required")))?;
             let max_alts = cfg.max_alternatives;
-            let decoding = decoding_params(&cfg);
+            let decoding = decoding_params(&cfg).map_err(log_reject)?;
 
             let audio_bytes = match audio.and_then(|a| a.audio_source) {
                 Some(pb::recognition_audio::AudioSource::Content(b)) => b,
@@ -313,7 +319,7 @@ impl pb::speech_server::Speech for SpeechService {
         let (pcm_enc, _ct_hint) = map_encoding(rcfg.encoding).map_err(log_reject)?;
         let want_partials = scfg.interim_results;
         let max_alts = rcfg.max_alternatives;
-        let decoding = decoding_params(&rcfg);
+        let decoding = decoding_params(&rcfg).map_err(log_reject)?;
 
         let mut handle = self
             .pool

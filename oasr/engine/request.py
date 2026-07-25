@@ -29,6 +29,13 @@ class RequestState(enum.Enum):
 # Streaming requests default to this; offline can be bumped lower-priority.
 DEFAULT_PRIORITY = 0
 
+#: Sampling-temperature bounds for :class:`DecodingOptions`.  ``0`` means greedy;
+#: any other value must land in ``[MIN_TEMPERATURE, MAX_TEMPERATURE]`` so
+#: ``logits / temperature`` can neither overflow to ``inf`` nor flatten the
+#: distribution into a no-op.  The serving layer clamps to the same range.
+MIN_TEMPERATURE = 0.01
+MAX_TEMPERATURE = 100.0
+
 
 @dataclass
 class DecodingOptions:
@@ -88,6 +95,18 @@ class DecodingOptions:
             raise ValueError(f"max_new_tokens must be >= 1 or None, got {self.max_new_tokens!r}")
         if self.temperature < 0.0:
             raise ValueError(f"temperature must be >= 0, got {self.temperature!r}")
+        # A temperature between 0 and MIN_TEMPERATURE divides the logits by a
+        # near-zero number: the result overflows to ±inf and ``torch.multinomial``
+        # then raises *inside* the decoder step, for the whole batched group.
+        # Values that small are numerically indistinguishable from greedy anyway,
+        # so ask for greedy explicitly instead.
+        if 0.0 < self.temperature < MIN_TEMPERATURE:
+            raise ValueError(
+                f"temperature must be 0 (greedy) or >= {MIN_TEMPERATURE}, got "
+                f"{self.temperature!r}"
+            )
+        if self.temperature > MAX_TEMPERATURE:
+            raise ValueError(f"temperature must be <= {MAX_TEMPERATURE}, got {self.temperature!r}")
         if self.top_k < 0:
             raise ValueError(f"top_k must be >= 0, got {self.top_k!r}")
         if not (0.0 < self.top_p <= 1.0):
@@ -260,6 +279,12 @@ class Request:
         # Populated by ModelRunner (streaming only)
         self.stream_context: Optional[StreamContext] = None
         self.offset: int = 0  # encoder output frame offset
+        # Set by the streaming backend when this stream's encoder cache can grow
+        # no further (paged pool / block-table capacity reached with unlimited
+        # history).  The executor finalizes such streams with the transcript
+        # decoded so far and ``finish_reason="length"`` rather than letting the
+        # allocator raise mid-forward.
+        self.cache_exhausted: bool = False
 
         # Final output
         self.output: Optional[RequestOutput] = None

@@ -149,3 +149,101 @@ def test_build_unknown_batching_policy_raises():
     cfg = SimpleNamespace(schedule_policy="round-robin")
     with pytest.raises(NotImplementedError, match="No batching policy"):
         build_batching_policy(cfg)
+
+
+# --------------------------------------------------------------------------- #
+# Bulk admission fault isolation
+# --------------------------------------------------------------------------- #
+
+
+class _FakeExecutor:
+    """Minimal Executor surface for the admission path."""
+
+    streaming = False
+
+    def __init__(self):
+        self.admitted = []
+
+    def admit(self, request):
+        self.admitted.append(request.request_id)
+
+
+def _admission_engine(*, overlap=False):
+    """An ``ASREngine`` with only the attributes the admission path touches.
+
+    ``ASREngine.__init__`` loads a checkpoint, which these tests deliberately
+    avoid: bulk admission is pure request-construction + validation.
+    """
+    import queue
+    import threading
+
+    from oasr.engine.engine import ASREngine
+
+    eng = ASREngine.__new__(ASREngine)
+    eng._lock = threading.RLock()
+    eng._config = SimpleNamespace(service_mode="offline")
+    eng._executor = _FakeExecutor()
+    eng._overlap_admit = overlap
+    eng._input_processor = SimpleNamespace(check_audio_duration=lambda audio: None)
+    eng._prep_in = queue.Queue()
+    eng._admit_inflight = 0
+    eng._admit_inflight_lock = threading.Lock()
+    return eng
+
+
+def test_bulk_admission_isolates_a_bad_spec():
+    """One malformed spec must not fail its batch-mates.
+
+    Regression: the dispatcher coalesces up to ``admit_threshold`` envelopes into
+    one ``add_requests_batch`` call, so a batch-wide raise turned one client's
+    out-of-range ``top_p`` into an INTERNAL error for dozens of unrelated
+    requests.
+    """
+    eng = _admission_engine()
+    specs = [
+        {"request_id": "good-1", "streaming": False},
+        {"request_id": "bad", "streaming": False, "decoding": {"top_p": 1.5}},
+        {"request_id": "good-2", "streaming": False},
+    ]
+    results = eng.add_requests_batch_checked(specs)
+
+    assert [r["request_id"] for r in results] == ["good-1", "bad", "good-2"]
+    assert "error" not in results[0] and "error" not in results[2]
+    assert "top_p" in results[1]["error"]
+    # The rejected spec never reached the executor; the others did.
+    assert eng._executor.admitted == ["good-1", "good-2"]
+
+
+def test_bulk_admission_reports_mode_mismatch_per_spec():
+    eng = _admission_engine()
+    results = eng.add_requests_batch_checked(
+        [{"request_id": "a", "streaming": False}, {"request_id": "b", "streaming": True}]
+    )
+    assert "error" not in results[0]
+    assert "service_mode" in results[1]["error"]
+    assert eng._executor.admitted == ["a"]
+
+
+def test_overlap_admission_isolates_a_bad_spec():
+    eng = _admission_engine(overlap=True)
+    results = eng.add_requests_batch_checked(
+        [
+            {"request_id": "a", "streaming": False},
+            {"request_id": "bad", "streaming": False, "decoding": {"temperature": 1e-30}},
+        ]
+    )
+    assert "error" not in results[0]
+    assert "temperature" in results[1]["error"]
+    # Only the valid request was queued for prep and counted as in-flight.
+    assert eng._admit_inflight == 1
+    assert eng._prep_in.qsize() == 1
+
+
+def test_add_requests_batch_still_raises_for_python_callers():
+    eng = _admission_engine()
+    with pytest.raises(ValueError, match="top_p"):
+        eng.add_requests_batch(
+            [{"request_id": "bad", "streaming": False, "decoding": {"top_p": 2.0}}]
+        )
+    # And returns plain ids on the happy path.
+    assert eng.add_requests_batch([{"request_id": "ok", "streaming": False}]) == ["ok"]

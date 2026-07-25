@@ -245,6 +245,26 @@ class TestAbort:
         assert not ex.has_pending()
 
 
+class TestShutdown:
+    def test_shutdown_releases_pending_decode_state(self):
+        """Teardown must free parked AR sessions, not leave them to the GC."""
+        ex, strat = _make_executor({"a": 50, "b": 50}, steps_per_tick=1)
+        ra, rb = _admit(ex, "a"), _admit(ex, "b")
+        ex.step()  # prefill both; neither finishes
+        assert ex.num_running() == 2
+
+        ex.shutdown()
+
+        assert sorted(strat.freed) == ["a", "b"]
+        assert ra.state == RequestState.FINISHED and rb.state == RequestState.FINISHED
+        assert ex.num_running() == 0
+
+    def test_shutdown_is_a_noop_without_pending(self):
+        ex, strat = _make_executor({"a": 1})
+        ex.shutdown()
+        assert strat.freed == []
+
+
 class TestOneShotUnaffected:
     def test_one_shot_strategy_never_parks(self):
         class OneShot(DecodeStrategy):

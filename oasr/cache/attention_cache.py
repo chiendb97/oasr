@@ -78,11 +78,15 @@ class AttentionCacheManager:
         # so the batched paged forward only needs two ``index_select`` calls
         # to pull active-batch metadata, not a Python loop over B streams.
         self._block_table = torch.zeros(
-            config.max_batch_size, config.max_blocks_per_seq,
-            dtype=torch.int32, device=config.device,
+            config.max_batch_size,
+            config.max_blocks_per_seq,
+            dtype=torch.int32,
+            device=config.device,
         )
         self._cache_seqlens = torch.zeros(
-            config.max_batch_size, dtype=torch.int32, device=config.device,
+            config.max_batch_size,
+            dtype=torch.int32,
+            device=config.device,
         )
 
         # Pre-built per-layer PagedKVCache descriptors pointing at the FULL
@@ -142,9 +146,7 @@ class AttentionCacheManager:
         if stream_id in self._streams:
             raise ValueError(f"Attention cache for stream {stream_id} already allocated.")
         if not (0 <= slot_id < self._config.max_batch_size):
-            raise ValueError(
-                f"slot_id {slot_id} out of range [0, {self._config.max_batch_size})"
-            )
+            raise ValueError(f"slot_id {slot_id} out of range [0, {self._config.max_batch_size})")
         for s in self._streams.values():
             if s.slot_id == slot_id:
                 raise ValueError(f"slot_id {slot_id} already in use")
@@ -167,6 +169,32 @@ class AttentionCacheManager:
     def slot_of(self, stream_id: int) -> int:
         """Return the slot id bound to ``stream_id``."""
         return self._get_state(stream_id).slot_id
+
+    # ------------------------------------------------------------------
+    # Capacity
+    # ------------------------------------------------------------------
+
+    def at_capacity(self, stream_id: int) -> bool:
+        """Whether ``stream_id`` cannot accept another chunk's worth of cache.
+
+        With eviction enabled a stream is never at capacity — the oldest block
+        is recycled instead.  With unlimited history (``num_left_chunks < 0``,
+        the default) growth is bounded by
+        :attr:`~oasr.cache.CacheConfig.blocks_per_stream`, and additionally by
+        the pool actually having a free block.  The streaming backend consults
+        this **before** dispatching a chunk so an exhausted stream is finalized
+        cleanly instead of raising ``BlockPool exhausted`` (or indexing past the
+        block table) from inside the forward.
+        """
+        if self._config.max_logical_blocks is not None:
+            return False  # eviction recycles a block; growth is bounded already
+        state = self._get_state(stream_id)
+        held = len(state.logical_blocks)
+        if held + 1 > self._config.blocks_per_stream:
+            return True
+        if held + 1 > self._block_table.size(1):
+            return True
+        return self._pool.num_free_blocks < 1
 
     # ------------------------------------------------------------------
     # Paged-mode access and mutation
@@ -230,8 +258,8 @@ class AttentionCacheManager:
         state = self._get_state(stream_id)
         cfg = self._config
         slot = state.slot_id
-        block_table_view = self._block_table[slot: slot + 1]
-        cache_seqlens_view = self._cache_seqlens[slot: slot + 1]
+        block_table_view = self._block_table[slot : slot + 1]
+        cache_seqlens_view = self._cache_seqlens[slot : slot + 1]
         host_seqlen = state.num_committed_frames
         caches: List[PagedKVCache] = []
         for layer in range(cfg.num_layers):
@@ -249,7 +277,8 @@ class AttentionCacheManager:
         return caches
 
     def get_paged_state_views(
-        self, stream_id: int,
+        self,
+        stream_id: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(block_table_row, cache_seqlens_row)`` views for the stream.
 
@@ -258,12 +287,13 @@ class AttentionCacheManager:
         state = self._get_state(stream_id)
         slot = state.slot_id
         return (
-            self._block_table[slot: slot + 1],
-            self._cache_seqlens[slot: slot + 1],
+            self._block_table[slot : slot + 1],
+            self._cache_seqlens[slot : slot + 1],
         )
 
     def get_batched_paged_caches(
-        self, slot_ids_gpu: torch.Tensor,
+        self,
+        slot_ids_gpu: torch.Tensor,
     ) -> Tuple[List[PagedKVCache], torch.Tensor, torch.Tensor]:
         """Return per-layer paged caches indexed by an active-batch slot tensor.
 
@@ -362,13 +392,11 @@ class AttentionCacheManager:
             self._cache_seqlens[slot] = state.num_committed_frames
             # Shift this stream's block_table row left by one entry.
             n = len(state.logical_blocks)
-            self._block_table[slot, :n] = self._block_table[slot, 1: n + 1].clone()
+            self._block_table[slot, :n] = self._block_table[slot, 1 : n + 1].clone()
             self._block_table[slot, n] = 0
 
     def _get_state(self, stream_id: int) -> _StreamKVState:
         try:
             return self._streams[stream_id]
         except KeyError:
-            raise KeyError(
-                f"Attention cache for stream {stream_id} not allocated."
-            ) from None
+            raise KeyError(f"Attention cache for stream {stream_id} not allocated.") from None

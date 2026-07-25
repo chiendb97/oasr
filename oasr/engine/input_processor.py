@@ -20,7 +20,6 @@ from oasr.features.batched import (
     supports_batched_mfcc,
 )
 from oasr.features.lfr import apply_lfr_batch, lfr_output_length
-
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from .config import EngineConfig
@@ -140,6 +139,42 @@ class InputProcessor:
             est = lfr_output_length(est, cfg.lfr_n)
         return est
 
+    def check_audio_duration(self, audio) -> None:
+        """Public duration guard, callable before the waveform is canonicalised.
+
+        The engine calls this on the *admitting* thread so an over-long request
+        raises back to the caller even when ``overlap_admit`` defers
+        :meth:`prepare_offline` to the prep thread (where a raise would only be
+        logged, leaving the client waiting for an output that never comes).
+        No-op for frontends without a fixed window.
+        """
+        if audio is None or self._feature_config.fixed_window_seconds is None:
+            return
+        self._check_input_duration(int(torch.as_tensor(audio).numel()))
+
+    def _check_input_duration(self, num_samples: int) -> None:
+        """Reject audio longer than a fixed-window frontend can represent.
+
+        Frontends with a :attr:`~oasr.features.FeatureConfig.fixed_window_seconds`
+        (``whisper_logmel``: the 30 s Whisper window, shared by Qwen2-Audio) pad
+        *and trim* every utterance to that window, so longer audio would be
+        silently dropped and the caller would receive a plausible transcript of
+        the first N seconds only.  Fail loudly at admission instead — long-form
+        decoding needs windowed inference, which is a separate feature.
+        """
+        window_s = self._feature_config.fixed_window_seconds
+        if window_s is None:
+            return
+        limit = int(self._feature_config.sample_rate * window_s)
+        if num_samples > limit:
+            got_s = num_samples / float(self._feature_config.sample_rate)
+            raise ValueError(
+                f"audio is {got_s:.1f}s but this checkpoint's frontend "
+                f"({self._feature_config.feature_type}) is fixed to a "
+                f"{window_s:.0f}s window; longer audio would be silently "
+                "truncated. Segment the audio before submitting it."
+            )
+
     def prepare_offline(self, request: Request) -> None:
         """Register an offline request without running feature extraction.
 
@@ -148,10 +183,14 @@ class InputProcessor:
         so the scheduler can bucket by length without a D2H sync.  No audio
         scaling happens here — the int16-scale multiply runs on the GPU after
         padding in :meth:`collate`, which also runs the batched fbank/mfcc.
+
+        Raises ``ValueError`` when the audio exceeds a fixed-window frontend's
+        capacity (see :meth:`_check_input_duration`).
         """
         request.audio = torch.as_tensor(request.audio, dtype=torch.float32, device="cpu").reshape(
             -1
         )
+        self._check_input_duration(int(request.audio.numel()))
         request.num_frames = self._estimate_num_frames(int(request.audio.numel()))
         # Clear any stale feature cache from reused Request objects.
         request.features = None

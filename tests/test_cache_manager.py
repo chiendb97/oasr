@@ -26,7 +26,6 @@ from oasr.cache import (
 )
 from oasr.cache.attention_cache import _StreamKVState
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -151,13 +150,19 @@ class TestBlockPool:
         assert v_out.shape[0] == 0
 
     def test_gather_preserves_values(self):
-        cfg = make_config(max_num_blocks=4, block_size_frames=2, n_kv_head=1, head_dim=4)
+        # chunk_size tracks block_size_frames: CacheConfig requires one chunk to
+        # fit in one block (these pool-only tests don't otherwise use chunk_size).
+        cfg = make_config(
+            max_num_blocks=4, block_size_frames=2, chunk_size=2, n_kv_head=1, head_dim=4
+        )
         pool = BlockPool(cfg)
         ids = pool.allocate(2)
         k0, v0 = pool.get_kv_block_view(0, ids[0])
         k1, v1 = pool.get_kv_block_view(0, ids[1])
-        k0[:] = 1.0; v0[:] = 10.0
-        k1[:] = 2.0; v1[:] = 20.0
+        k0[:] = 1.0
+        v0[:] = 10.0
+        k1[:] = 2.0
+        v1[:] = 20.0
         k_out, v_out = pool.gather_kv_blocks(layer=0, block_ids=ids)
         # First 2 frames block 0, next 2 frames block 1.
         assert k_out[:2].allclose(torch.ones_like(k_out[:2]))
@@ -166,13 +171,22 @@ class TestBlockPool:
         assert v_out[2:].allclose(torch.full_like(v_out[2:], 20.0))
 
     def test_layer_independence(self):
-        cfg = make_config(num_layers=2, max_num_blocks=4, block_size_frames=2, n_kv_head=1, head_dim=4)
+        cfg = make_config(
+            num_layers=2,
+            max_num_blocks=4,
+            block_size_frames=2,
+            chunk_size=2,
+            n_kv_head=1,
+            head_dim=4,
+        )
         pool = BlockPool(cfg)
         (bid,) = pool.allocate(1)
         k0, v0 = pool.get_kv_block_view(0, bid)
         k1, v1 = pool.get_kv_block_view(1, bid)
-        k0[:] = 1.0; v0[:] = 1.0
-        k1[:] = 2.0; v1[:] = 2.0
+        k0[:] = 1.0
+        v0[:] = 1.0
+        k1[:] = 2.0
+        v1[:] = 2.0
         k0r, v0r = pool.get_kv_block_view(0, bid)
         k1r, v1r = pool.get_kv_block_view(1, bid)
         assert k0r.allclose(torch.ones(2, 1, 4))
@@ -304,8 +318,11 @@ class TestAttentionCacheManager:
     def test_eviction_with_num_left_chunks(self):
         # max_logical_blocks=2 from num_left_chunks=2 (chunk_size=block_size_frames=4)
         cfg = make_config(
-            num_layers=1, chunk_size=4, block_size_frames=4,
-            num_left_chunks=2, max_num_blocks=16,
+            num_layers=1,
+            chunk_size=4,
+            block_size_frames=4,
+            num_left_chunks=2,
+            max_num_blocks=16,
         )
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
@@ -360,6 +377,110 @@ class TestAttentionCacheManager:
         for c in caches[1:]:
             assert c.block_table.data_ptr() == caches[0].block_table.data_ptr()
             assert c.cache_seqlens.data_ptr() == caches[0].cache_seqlens.data_ptr()
+
+
+# ---------------------------------------------------------------------------
+# Capacity accounting / validation
+# ---------------------------------------------------------------------------
+
+
+class TestCacheConfigValidation:
+    """``CacheConfig`` must reject geometries that silently corrupt or overflow."""
+
+    def test_chunk_larger_than_block_rejected(self):
+        # One block is allocated per chunk, so a chunk wider than a block would
+        # spill into the next logical block (the following chunk's page).
+        with pytest.raises(ValueError, match="block_size_frames"):
+            make_config(chunk_size=32, block_size_frames=16)
+
+    def test_chunk_equal_to_block_allowed(self):
+        cfg = make_config(chunk_size=16, block_size_frames=16)
+        assert cfg.chunk_size == cfg.block_size_frames
+
+    def test_block_table_too_narrow_for_history_rejected(self):
+        with pytest.raises(ValueError, match="max_blocks_per_seq"):
+            CacheConfig(
+                chunk_size=4,
+                block_size_frames=4,
+                num_left_chunks=1000,
+                max_blocks_per_seq=4,
+                device=CPU,
+                dtype=torch.float32,
+            )
+
+    def test_blocks_per_stream_bounded_by_pool_fair_share(self):
+        cfg = make_config(max_num_blocks=64, block_size_frames=4)
+        cfg = CacheConfig(**{**cfg.__dict__, "max_batch_size": 8})
+        assert cfg.blocks_per_stream == 8  # 64 // 8
+        assert cfg.max_stream_frames == 32
+
+    def test_blocks_per_stream_bounded_by_block_table_width(self):
+        cfg = CacheConfig(
+            chunk_size=4,
+            block_size_frames=4,
+            max_num_blocks=4096,
+            max_batch_size=2,
+            max_blocks_per_seq=16,
+            device=CPU,
+            dtype=torch.float32,
+        )
+        assert cfg.blocks_per_stream == 16  # min(16, 4096 // 2)
+
+    def test_eviction_cap_wins_when_enabled(self):
+        cfg = make_config(num_left_chunks=2, chunk_size=4, block_size_frames=4)
+        assert cfg.blocks_per_stream == cfg.max_logical_blocks == 2
+
+
+class TestStreamCapacityGate:
+    """A stream must be reported at capacity *before* the allocator can fail.
+
+    Regression: with unlimited history (the default ``num_left_chunks=-1``)
+    eviction is disabled, so a long-running stream used to raise
+    ``RuntimeError: BlockPool exhausted`` from inside the encoder forward — an
+    exception the serving dispatcher fans out to every in-flight request.
+    """
+
+    def test_capacity_reported_before_pool_exhaustion(self):
+        cfg = CacheConfig(
+            num_layers=1,
+            n_kv_head=1,
+            head_dim=8,
+            hidden_dim=8,
+            kernel_size=3,
+            chunk_size=4,
+            block_size_frames=4,
+            max_num_blocks=6,
+            max_batch_size=2,
+            num_left_chunks=-1,
+            device=CPU,
+            dtype=torch.float32,
+        )
+        assert cfg.blocks_per_stream == 3
+        pool = BlockPool(cfg)
+        mgr = AttentionCacheManager(pool, cfg)
+        mgr.allocate_stream(0, slot_id=0)
+        mgr.allocate_stream(1, slot_id=1)
+
+        chunks = 0
+        while not (mgr.at_capacity(0) or mgr.at_capacity(1)):
+            # Would raise "BlockPool exhausted" if the gate were absent.
+            mgr.prepare_chunks_batched([0, 1])
+            mgr.commit_chunks_paged_batched([0, 1], cfg.chunk_size)
+            chunks += 1
+            assert chunks <= cfg.blocks_per_stream + 1, "capacity never reported"
+        assert chunks == cfg.blocks_per_stream
+        assert pool.num_free_blocks == 0
+
+    def test_never_at_capacity_when_eviction_enabled(self):
+        cfg = make_config(num_left_chunks=2, max_num_blocks=8, chunk_size=4, block_size_frames=4)
+        pool = BlockPool(cfg)
+        mgr = AttentionCacheManager(pool, cfg)
+        mgr.allocate_stream(0, slot_id=0)
+        for _ in range(20):
+            assert not mgr.at_capacity(0)
+            mgr.prepare_chunks_batched([0])
+            mgr.commit_chunks_paged_batched([0], cfg.chunk_size)
+        assert pool.num_free_blocks > 0
 
 
 # ---------------------------------------------------------------------------
@@ -452,9 +573,15 @@ class TestStreamContext:
 
     def _setup(self, num_left_chunks: int = -1) -> tuple:
         cfg = make_config(
-            num_layers=2, n_kv_head=2, head_dim=4, hidden_dim=8,
-            kernel_size=3, chunk_size=4, block_size_frames=4,
-            num_left_chunks=num_left_chunks, max_num_blocks=32,
+            num_layers=2,
+            n_kv_head=2,
+            head_dim=4,
+            hidden_dim=8,
+            kernel_size=3,
+            chunk_size=4,
+            block_size_frames=4,
+            num_left_chunks=num_left_chunks,
+            max_num_blocks=32,
         )
         pool = BlockPool(cfg)
         att_mgr = AttentionCacheManager(pool, cfg)
@@ -464,6 +591,7 @@ class TestStreamContext:
     def _make_stream(self, sid: int, att_mgr, cnn_mgr) -> StreamContext:
         # CtcStateCacheManager skipped for CPU tests; pass a stub.
         from unittest.mock import MagicMock
+
         ctc_mgr = MagicMock()
         ctc_mgr.free_stream = MagicMock()
         slot = self._next_slot
@@ -527,8 +655,13 @@ class TestStreamContext:
 class TestMultiStreamIsolation:
     def test_streams_have_independent_state(self):
         cfg = make_config(
-            num_layers=1, n_kv_head=1, head_dim=4, hidden_dim=8,
-            kernel_size=3, chunk_size=4, block_size_frames=4,
+            num_layers=1,
+            n_kv_head=1,
+            head_dim=4,
+            hidden_dim=8,
+            kernel_size=3,
+            chunk_size=4,
+            block_size_frames=4,
             max_num_blocks=32,
         )
         pool = BlockPool(cfg)
@@ -554,8 +687,13 @@ class TestMultiStreamIsolation:
 
     def test_partial_free_leaves_others_intact(self):
         cfg = make_config(
-            num_layers=1, n_kv_head=1, head_dim=4, hidden_dim=8,
-            kernel_size=3, chunk_size=4, block_size_frames=4,
+            num_layers=1,
+            n_kv_head=1,
+            head_dim=4,
+            hidden_dim=8,
+            kernel_size=3,
+            chunk_size=4,
+            block_size_frames=4,
             max_num_blocks=32,
         )
         pool = BlockPool(cfg)
@@ -582,9 +720,15 @@ class TestMultiStreamIsolation:
 
     def test_pool_accounting_after_partial_free(self):
         cfg = make_config(
-            num_layers=1, n_kv_head=1, head_dim=4, hidden_dim=8,
-            kernel_size=3, chunk_size=4, block_size_frames=4,
-            num_left_chunks=-1, max_num_blocks=32,
+            num_layers=1,
+            n_kv_head=1,
+            head_dim=4,
+            hidden_dim=8,
+            kernel_size=3,
+            chunk_size=4,
+            block_size_frames=4,
+            num_left_chunks=-1,
+            max_num_blocks=32,
         )
         pool = BlockPool(cfg)
         att_mgr = AttentionCacheManager(pool, cfg)

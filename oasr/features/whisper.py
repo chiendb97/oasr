@@ -22,6 +22,7 @@ count for consumers that mask padding (the Qwen2-Audio tower).
 from __future__ import annotations
 
 import functools
+import logging
 from typing import Tuple
 
 import torch
@@ -29,6 +30,8 @@ import torch
 from .config import FeatureConfig
 
 __all__ = ["batched_whisper_logmel"]
+
+logger = logging.getLogger(__name__)
 
 _N_FFT = 400
 _HOP = 160
@@ -97,6 +100,18 @@ def batched_whisper_logmel(
     if T < n_samples:
         wav = torch.nn.functional.pad(wav, (0, n_samples - T))
     elif T > n_samples:
+        # The engine rejects over-long audio at admission
+        # (``InputProcessor._check_input_duration``), so reaching here means a
+        # direct caller of this function bypassed that check.  Trim per the
+        # Whisper recipe but say so — a silent trim reads as a correct
+        # transcript of the whole utterance.
+        logger.warning(
+            "whisper_logmel: trimming %d samples to the %.0fs window (%d samples); "
+            "audio beyond the window is dropped",
+            T,
+            cfg.whisper_chunk_seconds,
+            n_samples,
+        )
         wav = wav[:, :n_samples]
 
     window = torch.hann_window(_N_FFT, device=device, dtype=wav.dtype)

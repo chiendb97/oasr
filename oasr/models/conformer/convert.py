@@ -65,6 +65,12 @@ def build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
     )
 
     raw_vocab = raw.get("output_dim")
+    if raw_vocab is None:
+        raise ValueError(
+            "train.yaml declares no `output_dim`, so the CTC vocabulary size is "
+            "unknown. Add it to train.yaml, or pass an explicit model config."
+        )
+    raw_vocab = int(raw_vocab)
     vocab_size = raw_vocab
     if vocab_size % 8 != 0:
         vocab_size = (vocab_size // 8 + 1) * 8
@@ -169,7 +175,7 @@ class WenetConverter:
         ckpt_path = Path(ckpt_dir) / checkpoint_name
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Required file not found: {ckpt_path}")
-        return torch.load(str(ckpt_path), map_location=map_location)
+        return torch.load(str(ckpt_path), map_location=map_location, weights_only=True)
 
     # -- complete-bundle conversion (tokenizer / feature / decoding specs) ----
 

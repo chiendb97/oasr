@@ -14,7 +14,13 @@ import torch
 from oasr.engine.decode.detokenize import Detokenizer
 from oasr.engine.generation import select_next_tokens
 from oasr.engine.output_processor import OutputProcessor
-from oasr.engine.request import DecodingOptions, Request, RequestOutput
+from oasr.engine.request import (
+    MAX_TEMPERATURE,
+    MIN_TEMPERATURE,
+    DecodingOptions,
+    Request,
+    RequestOutput,
+)
 
 
 class TestDecodingOptionsDataclass:
@@ -38,6 +44,18 @@ class TestDecodingOptionsDataclass:
             DecodingOptions(top_p=0.0)
         with pytest.raises(ValueError, match="top_p"):
             DecodingOptions(top_p=1.5)
+
+    def test_temperature_range(self):
+        """A near-zero temperature overflows ``logits / temperature`` to inf and
+        makes ``torch.multinomial`` raise inside the batched decoder step."""
+        with pytest.raises(ValueError, match="temperature"):
+            DecodingOptions(temperature=1e-30)
+        with pytest.raises(ValueError, match="temperature"):
+            DecodingOptions(temperature=1e6)
+        # Bounds themselves are accepted, and 0 stays the greedy sentinel.
+        assert DecodingOptions(temperature=MIN_TEMPERATURE).sampling
+        assert DecodingOptions(temperature=MAX_TEMPERATURE).sampling
+        assert not DecodingOptions(temperature=0.0).sampling
 
     def test_sampling_flag(self):
         assert not DecodingOptions(temperature=0.0).sampling

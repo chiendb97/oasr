@@ -190,22 +190,35 @@ class IcefallConverter:
         config = ZipformerModelConfig()
         ckpt = self._find_ckpt(Path(ckpt_dir))
         if ckpt is not None:
+            # Shape inference is the *only* source of architecture here, so a
+            # failure must not silently fall back to the LibriSpeech "M"
+            # defaults: that builds a plausible-looking but wrong model, which
+            # then fails much later with a raw shape-mismatch error (or, if the
+            # dims happen to coincide, loads and produces garbage).
             try:
-                sd = _extract_state_dict(torch.load(str(ckpt), map_location="cpu"))
-                config.encoder = infer_encoder_config(sd)
-                w = sd.get("ctc_output.1.weight")
-                if w is not None:
-                    vocab = int(w.shape[0])
-                    # GEMM kernels require N % 8 == 0; pad like the Conformer loader.
-                    if vocab % 8 != 0:
-                        vocab = (vocab // 8 + 1) * 8
-                    config.vocab_size = vocab
-            except Exception:  # pragma: no cover - best-effort inference
-                logger.warning(
-                    "Could not infer Zipformer config from %s; using 'M' defaults.",
-                    ckpt,
-                    exc_info=True,
+                sd = _extract_state_dict(
+                    torch.load(str(ckpt), map_location="cpu", weights_only=True)
                 )
+            except Exception as exc:
+                raise ValueError(
+                    f"could not read the icefall checkpoint {ckpt} to infer the "
+                    f"Zipformer architecture: {exc}"
+                ) from exc
+            try:
+                config.encoder = infer_encoder_config(sd)
+            except Exception as exc:
+                raise ValueError(
+                    f"could not infer the Zipformer architecture from {ckpt} "
+                    f"({exc}). Pass an explicit model config, or check that this "
+                    "is an icefall Zipformer checkpoint."
+                ) from exc
+            w = sd.get("ctc_output.1.weight")
+            if w is not None:
+                vocab = int(w.shape[0])
+                # GEMM kernels require N % 8 == 0; pad like the Conformer loader.
+                if vocab % 8 != 0:
+                    vocab = (vocab // 8 + 1) * 8
+                config.vocab_size = vocab
         logger.info(
             "Zipformer config: vocab_size=%s encoder_dim=%s num_encoder_layers=%s",
             config.vocab_size,
@@ -223,7 +236,9 @@ class IcefallConverter:
         ckpt = self._find_ckpt(Path(ckpt_dir), checkpoint_name)
         if ckpt is None:
             raise FileNotFoundError(f"No icefall checkpoint (*.pt) found under {ckpt_dir}")
-        return _extract_state_dict(torch.load(str(ckpt), map_location=map_location))
+        return _extract_state_dict(
+            torch.load(str(ckpt), map_location=map_location, weights_only=True)
+        )
 
     # -- complete-bundle conversion (tokenizer / feature / decoding specs) ----
 

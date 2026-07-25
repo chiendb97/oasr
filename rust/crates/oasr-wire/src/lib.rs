@@ -39,11 +39,84 @@ pub struct DecodingParams {
     pub prompt: Option<String>,
 }
 
+/// Sampling-temperature bounds, mirroring `oasr.engine.request.MIN_TEMPERATURE`
+/// / `MAX_TEMPERATURE`.  Outside this range (and non-zero) the Python side
+/// raises, so the front-ends reject here instead — a raise from inside
+/// `add_requests_batch` used to fail every coalesced admit in the same batch.
+pub const MIN_TEMPERATURE: f32 = 0.01;
+pub const MAX_TEMPERATURE: f32 = 100.0;
+/// Upper bound on `n_best` (proto `max_alternatives`).  Google's STT caps
+/// alternatives at 30; anything beyond that is a client bug, and `u32::MAX`
+/// would be accepted silently otherwise.
+pub const MAX_N_BEST: u32 = 30;
+/// Upper bound on a speech-LLM prompt override, in bytes.  A long prompt eats
+/// the AR generation budget (the LM's position capacity is shared between
+/// prompt and output), so an unbounded one silently clamps generation to a
+/// single token.
+pub const MAX_PROMPT_BYTES: usize = 4096;
+
 impl DecodingParams {
     /// Whether every field is `None` — callers skip building the Python-side
     /// options dict entirely in that case.
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// Validate the ranges the Python `DecodingOptions` enforces.
+    ///
+    /// Returns a client-facing message on the first violation.  Both front-ends
+    /// call this at request-mapping time so an out-of-range value becomes
+    /// `INVALID_ARGUMENT` for *that* request, rather than an `INTERNAL` error
+    /// for every request in the admit batch it happened to land in.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(n) = self.n_best {
+            if n > MAX_N_BEST {
+                return Err(format!("max_alternatives must be <= {MAX_N_BEST}, got {n}"));
+            }
+        }
+        if let Some(t) = self.temperature {
+            if !t.is_finite() {
+                return Err(format!("temperature must be finite, got {t}"));
+            }
+            if t < 0.0 {
+                return Err(format!("temperature must be >= 0, got {t}"));
+            }
+            if t > 0.0 && t < MIN_TEMPERATURE {
+                return Err(format!(
+                    "temperature must be 0 (greedy) or >= {MIN_TEMPERATURE}, got {t}"
+                ));
+            }
+            if t > MAX_TEMPERATURE {
+                return Err(format!("temperature must be <= {MAX_TEMPERATURE}, got {t}"));
+            }
+        }
+        if let Some(p) = self.top_p {
+            if !p.is_finite() || p <= 0.0 || p > 1.0 {
+                return Err(format!("top_p must be in (0, 1], got {p}"));
+            }
+        }
+        if let Some(prompt) = &self.prompt {
+            if prompt.len() > MAX_PROMPT_BYTES {
+                return Err(format!(
+                    "prompt must be <= {MAX_PROMPT_BYTES} bytes, got {}",
+                    prompt.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `Some(params)` when anything was set and the ranges check out;
+    /// `None` when nothing was set (the allocation-free fast path).
+    ///
+    /// Front-ends build params with the "unset or zero means default" filters
+    /// and then funnel through this one place, so the two surfaces cannot drift.
+    pub fn validated(self) -> Result<Option<Self>, String> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        self.validate()?;
+        Ok(Some(self))
     }
 }
 
@@ -214,10 +287,23 @@ pub struct ModelInfo {
     pub chunk_size: Option<u32>,
     #[serde(default)]
     pub max_batch_size: Option<u32>,
+    /// CTC *kernel* selector (`ctc_cuda` / `ctc_wfst`) — not the decode family.
     #[serde(default)]
     pub decoder_type: Option<String>,
     #[serde(default)]
     pub vocab_size: Option<u32>,
+    /// The mode the engine was actually built for, read back from it rather than
+    /// from the CLI flag: several decode families are offline-only, and the two
+    /// sources used to be able to disagree silently.
+    #[serde(default)]
+    pub service_mode: Option<String>,
+    /// The resolved decode family running in this process (`ctc`, `transducer`,
+    /// `aed`, `llm`, `paraformer`, `ctc_aed_rescoring`).
+    #[serde(default)]
+    pub decode_method: Option<String>,
+    /// Every decode family this checkpoint could serve.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[cfg(test)]
@@ -232,6 +318,101 @@ mod tests {
             ..Default::default()
         }
         .is_empty());
+    }
+
+    #[test]
+    fn validated_passes_through_empty_and_ok() {
+        // Nothing set → no params dict is built at all.
+        assert!(DecodingParams::default().validated().unwrap().is_none());
+        let ok = DecodingParams {
+            n_best: Some(5),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            top_k: Some(40),
+            max_new_tokens: Some(64),
+            prompt: Some("transcribe".into()),
+        };
+        assert_eq!(ok.clone().validated().unwrap(), Some(ok));
+    }
+
+    #[test]
+    fn validated_rejects_out_of_range() {
+        // Each of these used to reach Python and raise from inside
+        // `add_requests_batch`, failing every coalesced admit in the batch.
+        let cases = [
+            (
+                "top_p",
+                DecodingParams {
+                    top_p: Some(1.5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "temperature",
+                DecodingParams {
+                    temperature: Some(1e-30),
+                    ..Default::default()
+                },
+            ),
+            (
+                "temperature",
+                DecodingParams {
+                    temperature: Some(1e6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "temperature",
+                DecodingParams {
+                    temperature: Some(f32::NAN),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_alternatives",
+                DecodingParams {
+                    n_best: Some(u32::MAX),
+                    ..Default::default()
+                },
+            ),
+            (
+                "prompt",
+                DecodingParams {
+                    prompt: Some("x".repeat(MAX_PROMPT_BYTES + 1)),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (field, params) in cases {
+            let err = params
+                .validated()
+                .expect_err(&format!("{field} should have been rejected"));
+            assert!(err.contains(field), "message {err:?} should name {field}");
+        }
+    }
+
+    #[test]
+    fn validated_accepts_the_bounds_themselves() {
+        for t in [MIN_TEMPERATURE, MAX_TEMPERATURE] {
+            assert!(DecodingParams {
+                temperature: Some(t),
+                ..Default::default()
+            }
+            .validated()
+            .is_ok());
+        }
+        assert!(DecodingParams {
+            top_p: Some(1.0),
+            ..Default::default()
+        }
+        .validated()
+        .is_ok());
+        assert!(DecodingParams {
+            n_best: Some(MAX_N_BEST),
+            ..Default::default()
+        }
+        .validated()
+        .is_ok());
     }
 
     #[test]

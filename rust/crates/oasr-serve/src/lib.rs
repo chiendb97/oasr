@@ -86,14 +86,12 @@ async fn serve(cli: Cli) -> Result<()> {
         }
     };
 
-    let grpc_mode: GrpcServiceMode = cli
+    // Validate the flag early (a typo should fail before we load a model), but
+    // the *authoritative* mode comes from the engine once it is built — see below.
+    let _: GrpcServiceMode = cli
         .service_mode
         .parse()
         .map_err(|e: String| anyhow::anyhow!("invalid --service-mode: {e}"))?;
-    let http_mode: HttpServiceMode = cli
-        .service_mode
-        .parse()
-        .expect("validated by GrpcServiceMode parse above");
 
     info!(
         label = %cli.engine_label,
@@ -120,9 +118,42 @@ async fn serve(cli: Cli) -> Result<()> {
         chunk_size = ?model.chunk_size,
         max_batch_size = ?model.max_batch_size,
         decoder_type = ?model.decoder_type,
+        decode_method = ?model.decode_method,
+        capabilities = ?model.capabilities,
+        service_mode = ?model.service_mode,
         vocab_size = ?model.vocab_size,
         "ASREngine loaded"
     );
+
+    // ---- Engine-authoritative service mode ----
+    //
+    // The engine's mode can differ from `--service-mode`: `--engine-config` JSON
+    // wins on the Python side, and several decode families are offline-only.  If
+    // the front-ends trusted the flag they would reject requests this engine can
+    // serve (and accept ones it cannot, which then fail deep inside admission).
+    // Take the engine's answer and say so when it disagrees with the flag.
+    let effective_mode = match model.service_mode.as_deref() {
+        Some(m) => {
+            if m != cli.service_mode {
+                warn!(
+                    label = %cli.engine_label,
+                    flag = %cli.service_mode,
+                    engine = %m,
+                    decode_method = ?model.decode_method,
+                    "--service-mode disagrees with the engine (engine-config JSON or an \
+                     offline-only decode family); using the engine's mode"
+                );
+            }
+            m.to_string()
+        }
+        None => cli.service_mode.clone(),
+    };
+    let grpc_mode: GrpcServiceMode = effective_mode
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("engine reported an unknown service_mode: {e}"))?;
+    let http_mode: HttpServiceMode = effective_mode
+        .parse()
+        .expect("validated by GrpcServiceMode parse above");
 
     let mut client_cfg = EngineClientConfig::new(cli.engine_label.clone());
     client_cfg.dispatcher = DispatcherConfig {

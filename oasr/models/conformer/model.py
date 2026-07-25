@@ -630,27 +630,43 @@ class ConformerEncoderLayer(nn.Module):
         x = self.norm_ff_macaron(x)
         mac_out = self.feed_forward_macaron(x)
         x, residual = oasr.add_layer_norm_residual(
-            mac_out, residual, self.norm_mha.weight, self.norm_mha.bias,
-            self.norm_mha.eps, self.ff_scale,
+            mac_out,
+            residual,
+            self.norm_mha.weight,
+            self.norm_mha.bias,
+            self.norm_mha.eps,
+            self.ff_scale,
         )
         # Self-attention: add folds into ``norm_conv``.
         x_att, new_att_cache = self.self_attn(x, mask, pos_emb, att_cache)
         x, residual = oasr.add_layer_norm_residual(
-            x_att, residual, self.norm_conv.weight, self.norm_conv.bias,
-            self.norm_conv.eps, 1.0,
+            x_att,
+            residual,
+            self.norm_conv.weight,
+            self.norm_conv.bias,
+            self.norm_conv.eps,
+            1.0,
         )
         # Convolution: add folds into ``norm_ff``.
         x_conv, new_cnn_cache = self.conv_module(x, mask_pad, cnn_cache)
         x, residual = oasr.add_layer_norm_residual(
-            x_conv, residual, self.norm_ff.weight, self.norm_ff.bias,
-            self.norm_ff.eps, 1.0,
+            x_conv,
+            residual,
+            self.norm_ff.weight,
+            self.norm_ff.bias,
+            self.norm_ff.eps,
+            1.0,
         )
         # FFN: add folds into ``norm_final`` (the carried residual is no longer
         # needed, so the sum output is discarded).
         ff_out = self.feed_forward(x)
         x, _ = oasr.add_layer_norm_residual(
-            ff_out, residual, self.norm_final.weight, self.norm_final.bias,
-            self.norm_final.eps, self.ff_scale,
+            ff_out,
+            residual,
+            self.norm_final.weight,
+            self.norm_final.bias,
+            self.norm_final.eps,
+            self.ff_scale,
         )
         return x, new_att_cache, new_cnn_cache
 
@@ -1127,15 +1143,28 @@ class ConformerModel(BaseAsrModel):
             and not (load_decoder and k.startswith("decoder."))
         ]
 
-        target_vocab = self.ctc.ctc_lo.weight.shape[0]
-        ctc_w = state_dict["ctc.ctc_lo.weight"]
-        ctc_b = state_dict["ctc.ctc_lo.bias"]
-        pad = target_vocab - ctc_w.shape[0]
-        if pad > 0:
-            ctc_w = F.pad(ctc_w, (0, 0, 0, pad))
-            ctc_b = F.pad(ctc_b, (0, pad))
-        sd["ctc.ctc_lo.weight"] = ctc_w
-        sd["ctc.ctc_lo.bias"] = ctc_b
+        if "ctc.ctc_lo.weight" in state_dict and "ctc.ctc_lo.bias" in state_dict:
+            target_vocab = self.ctc.ctc_lo.weight.shape[0]
+            ctc_w = state_dict["ctc.ctc_lo.weight"]
+            ctc_b = state_dict["ctc.ctc_lo.bias"]
+            pad = target_vocab - ctc_w.shape[0]
+            if pad > 0:
+                ctc_w = F.pad(ctc_w, (0, 0, 0, pad))
+                ctc_b = F.pad(ctc_b, (0, pad))
+            sd["ctc.ctc_lo.weight"] = ctc_w
+            sd["ctc.ctc_lo.bias"] = ctc_b
+        else:
+            # An attention-only WeNet checkpoint (no CTC branch) used to die here
+            # with a bare KeyError.  Name the missing capability instead — the
+            # CTC head stays randomly initialised, and the registry's LoadReport
+            # accounting surfaces it via ``missing``.
+            raise ValueError(
+                "this checkpoint has no CTC branch (`ctc.ctc_lo.*` absent), so it "
+                "cannot be loaded as a CTC Conformer. Top-level key prefixes "
+                f"present: {sorted({k.split('.')[0] for k in state_dict})}. "
+                "Load an attention-only checkpoint with the architecture that "
+                "matches its objective."
+            )
 
         missing, unexpected = self.load_state_dict(sd, strict=strict)
         expected_missing = {"encoder.embed.pos_enc.pe"}

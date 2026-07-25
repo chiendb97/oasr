@@ -100,10 +100,34 @@ Derived properties of interest:
   causal depthwise conv per layer.
 - `max_logical_blocks → ceil(chunk_size * num_left_chunks / block_size_frames)`
   or `None` when history is unlimited.
+- `blocks_per_stream` — how many logical blocks one stream may hold before it is
+  **at capacity**: `max_logical_blocks` when eviction is on, else
+  `min(max_blocks_per_seq, max_num_blocks // max_batch_size)`.
+- `max_stream_frames → blocks_per_stream * block_size_frames` — the encoder-frame
+  ceiling per stream.
 
-The pool must be sized so that `max_num_blocks ≥ max_batch_size *
-max_logical_blocks` for the worst case, with extra headroom for short-lived
-oversubscription during cohort transitions.
+With eviction enabled (`num_left_chunks ≥ 0`) memory is bounded by construction:
+size the pool so `max_num_blocks ≥ max_batch_size * max_logical_blocks`, with
+headroom for short-lived oversubscription during cohort transitions.
+
+**With unlimited history (`num_left_chunks = -1`, the default) eviction is off,
+so every stream has a finite ceiling** — `max_stream_frames`, logged at INFO when
+the config is built (at the shipped defaults: 64 blocks ≈ 1024 encoder frames
+≈ 41 s of audio at 4× subsampling). A stream that reaches it is **finalized
+cleanly** with the transcript decoded so far and `finish_reason="length"`:
+`AttentionCacheManager.at_capacity(stream_id)` is consulted by the streaming
+backend *before* it dispatches a chunk, so the allocator can no longer raise
+`BlockPool exhausted` from inside the encoder forward (which the serving
+dispatcher used to fan out to every in-flight request). Raise `max_num_blocks` to
+lift the ceiling, or set `num_left_chunks` to bound history by eviction instead.
+
+`CacheConfig.__post_init__` rejects two geometries outright:
+
+- `chunk_size > block_size_frames` — one block is allocated per chunk, so a wider
+  chunk would spill into the next logical block, which `PagedKVCache`'s two-block
+  write path reads as the *following* chunk's page (silent KV corruption).
+- `max_blocks_per_seq < max_logical_blocks` — the block table cannot address the
+  history the config asks for.
 
 ## 4. Core Algorithms and Workflows
 

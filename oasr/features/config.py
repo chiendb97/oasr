@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -124,3 +125,26 @@ class FeatureConfig:
     def lfr_enabled(self) -> bool:
         """Whether low-frame-rate stacking is active."""
         return self.lfr_m != 1 or self.lfr_n != 1
+
+    @property
+    def fixed_window_seconds(self) -> Optional[float]:
+        """Audio window this frontend pads/trims every utterance to, if any.
+
+        ``None`` for the Kaldi frontends, whose cost tracks the real utterance
+        length.  ``whisper_logmel`` returns :attr:`whisper_chunk_seconds`: every
+        row is padded *and trimmed* to that window, so (a) audio beyond it would
+        be silently dropped — the engine rejects it at admission instead — and
+        (b) per-row encoder cost is **constant**, which the batching policies
+        need to know rather than inferring cost from frame counts.
+        """
+        if self.feature_type == "whisper_logmel":
+            return float(self.whisper_chunk_seconds)
+        return None
+
+    @property
+    def fixed_window_frames(self) -> Optional[int]:
+        """:attr:`fixed_window_seconds` expressed in output feature frames."""
+        secs = self.fixed_window_seconds
+        if secs is None:
+            return None
+        return int(secs * 1000.0 / self.frame_shift_ms)

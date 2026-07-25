@@ -116,6 +116,23 @@ class OfflineExecutor(Executor):
             return
         self._scheduler.abort_request(request_id)
 
+    def shutdown(self) -> None:
+        """Release in-flight incremental decode state.
+
+        Requests parked by an ``incremental`` strategy hold decoder-KV buffers
+        (dense, capacity-preallocated for the speech-LLM path), so dropping the
+        pool without telling the strategy leaks them until the next GC pass.
+        One-shot strategies never park and this is a no-op for them.
+        """
+        strategy = self._op.strategy
+        for req in list(self._pending.values()):
+            try:
+                strategy.free_session(req)
+            except Exception:  # pragma: no cover - defensive
+                pass
+            req.state = RequestState.FINISHED
+        self._pending.clear()
+
     def step(self) -> List[RequestOutput]:
         """One engine tick, always bounded work.
 

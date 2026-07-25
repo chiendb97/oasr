@@ -136,13 +136,28 @@ Error responses use the canonical Google error envelope:
 
 | HTTP status | `status` field | When |
 |---|---|---|
-| 400 | `INVALID_ARGUMENT` | missing/empty body, missing `encoding`, undecodable audio bytes |
+| 400 | `INVALID_ARGUMENT` | missing/empty body, missing `encoding`, undecodable audio bytes, out-of-range decoding options, audio longer than a fixed-window frontend allows |
 | 400 | `FAILED_PRECONDITION` | server is in `streaming` mode |
 | 404 | `NOT_FOUND` | unknown request id (internal bug) |
 | 501 | `UNIMPLEMENTED` | unsupported encoding |
 | 503 | `RESOURCE_EXHAUSTED` | over-capacity, retry with backoff |
 | 503 | `UNAVAILABLE` | dispatcher shutting down or engine lost |
 | 500 | `INTERNAL` | otherwise |
+
+**Rejections are per-request.** Decoding options are range-checked at the mapping
+layer (`oasr_wire::DecodingParams::validated`, shared by HTTP and gRPC) and the
+engine's bulk admission (`ASREngine.add_requests_batch_checked`) validates and
+admits per spec. Since the dispatcher coalesces up to `--admit-threshold`
+envelopes into one Python call, this matters: one client sending `top_p=1.5` gets
+a 400 while every request coalesced with it is served normally. Bounds:
+`temperature` ∈ {0} ∪ [0.01, 100], `top_p` ∈ (0, 1], `max_alternatives` ≤ 30,
+`prompt` ≤ 4096 bytes.
+
+Two engine-side rejections also surface here as 400s rather than as wrong output:
+audio exceeding a fixed-window frontend's capacity (`whisper_logmel`: the 30 s
+Whisper window, shared by Qwen2-Audio — longer audio used to be silently
+truncated), and a per-request `streaming` flag that disagrees with the engine's
+mode.
 
 ### `GET /v1/models`
 
@@ -160,7 +175,10 @@ Error responses use the canonical Google error envelope:
         "chunk_size": 16,
         "max_batch_size": 64,
         "decoder_type": "ctc_cuda",
-        "vocab_size": 5000
+        "vocab_size": 5000,
+        "service_mode": "offline",
+        "decode_method": "ctc",
+        "capabilities": ["ctc", "ctc_aed_rescoring"]
       }
     }
   ]
@@ -168,6 +186,14 @@ Error responses use the canonical Google error envelope:
 ```
 
 Exactly one entry — the single model loaded by this process.
+
+`service_mode` / `decode_method` / `capabilities` are read back **from the
+engine**, not from the CLI flags: `--engine-config` JSON wins on the Python side
+and several decode families are offline-only (`aed`, `llm`, `paraformer`,
+`ctc_aed_rescoring`), so the engine is the authority on what this process can
+serve. The front-ends configure themselves from the engine's `service_mode` and
+log a warning when `--service-mode` disagrees. Note `decoder_type` is only the
+CTC *kernel* selector (`ctc_cuda` / `ctc_wfst`) — `decode_method` is the family.
 
 ## gRPC
 
@@ -337,11 +363,31 @@ audio processed, **RTF**, throughput, and latency percentiles.  For
 `grpc_streaming` it also reports first-partial latency and
 partials-per-request.
 
+## Metrics (`GET /metrics`)
+
+Prometheus exposition of the values the dispatcher already computes per tick.
+
+| Metric | Type | What it tells you |
+|---|---|---|
+| `oasr_dispatch_tick_seconds` | histogram | Wall time of one tick, **GIL held** (admit + step + extract). Its p99 is the worst-case latency a cancel, a new admission, or a streaming partial can experience — the number to watch when running an autoregressive decode family, where a batched decoder step is orders of magnitude slower than a CTC chunk. |
+| `oasr_engine_step_seconds` | histogram | Time inside `ASREngine.step()`. |
+| `oasr_dispatch_{admit,extract,route}_seconds` | histogram | The tick's sub-stages; `route` runs with the GIL released. |
+| `oasr_engine_{running,waiting}` | gauge | Engine-reported queue depth. `running` includes parked AR generations. |
+| `oasr_engine_outputs_total` | counter | `RequestOutput`s returned by `step()`. |
+| `oasr_requests_{admitted,rejected,busy}_total` | counter | Accepted / rejected at admission (invalid options, mode mismatch) / refused at `--max-concurrent-requests`. |
+| `oasr_engine_step_failures_total` | counter | `step()` raised. Three consecutive failures stop the readiness heartbeat, so `/readyz` and the gRPC health check go NotServing and a load balancer drains the process. |
+| `oasr_events_{dropped,deferred}_total` | counter | Per-request channel was full: a partial was dropped (harmless — the next one supersedes it) or a **terminal** event was handed to a background task rather than lost. Sustained non-zero here means clients are reading slower than the engine emits. |
+
+`--trace-dispatch` additionally logs rolling 2 s means of the same sub-stages at
+INFO; the histograms above are the ones to alert on.
+
 ## Operational tips
 
 - Tune `--max-concurrent-requests` to a small multiple of the engine's
   `max_batch_size`.  Excess load returns HTTP 503 /
   gRPC `RESOURCE_EXHAUSTED` — clients should back off and retry.
+- Watch `oasr_dispatch_tick_seconds` p99. If it is far above your latency budget
+  on an AR decode family, lower `--decode-steps-per-tick`.
 - For local development, a single process pinned to one GPU keeps things
   simple; multi-GPU scale comes from running additional `oasr-server`
   processes behind a load balancer.

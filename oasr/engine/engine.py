@@ -354,6 +354,9 @@ class ASREngine:
         )
         if self._overlap_admit:
             self._validate_mode(streaming)
+            # Raise on the caller's thread: a fixed-window violation surfaced
+            # from the prep thread would only be logged.
+            self._input_processor.check_audio_duration(req.audio)
             with self._admit_inflight_lock:
                 self._admit_inflight += 1
             self._prep_in.put(req)
@@ -383,39 +386,68 @@ class ASREngine:
         when the Rust dispatcher coalesces a tick's worth of admits.
         Returns the assigned request ids in the same order.
 
-        When ``overlap_admit`` is enabled (offline), the heavy per-request
-        ``prepare_offline`` is deferred to the prep thread and this returns as
-        soon as the (cheap) ``Request`` objects are built and queued.
+        Raises on the first invalid spec (after admitting the valid ones).
+        Callers that need per-spec outcomes — the serving dispatcher, where one
+        malformed request must not fail its batch-mates — should use
+        :meth:`add_requests_batch_checked` instead.
+        """
+        results = self.add_requests_batch_checked(specs)
+        for res in results:
+            err = res.get("error")
+            if err:
+                raise ValueError(err)
+        return [str(res["request_id"]) for res in results]
+
+    def add_requests_batch_checked(self, specs: List[Dict]) -> List[Dict]:
+        """:meth:`add_requests_batch` with per-spec outcomes instead of a raise.
+
+        Returns one dict per spec, in order: ``{"request_id": str}`` on success,
+        ``{"request_id": str, "error": str}`` when that spec was rejected. A
+        rejected spec is never admitted and never enters the scheduler; every
+        other spec in the batch is admitted normally.
+
+        This is the entry point the PyO3 dispatcher uses. Bulk admission
+        coalesces up to ``admit_threshold`` envelopes into one call, so a
+        batch-wide raise would turn one client's bad ``top_p`` into an error for
+        dozens of unrelated requests.
         """
         if self._overlap_admit:
             return self._admit_batch_overlapped(specs)
-        request_ids: List[str] = []
+        results: List[Dict] = []
         with self._lock:
             for spec in specs:
-                audio = spec.get("audio")
-                rid = spec.get("request_id")
-                sample_rate = int(spec.get("sample_rate", 16000))
-                streaming = bool(spec.get("streaming", True))
-                priority = int(spec.get("priority", 0))
-                req = Request(
-                    audio=audio,
-                    request_id=rid,
-                    streaming=streaming,
-                    sample_rate=sample_rate,
-                    priority=priority,
-                    decoding=DecodingOptions.coerce(spec.get("decoding")),
-                )
-                self._validate_mode(streaming)
-                self._executor.admit(req)
-                request_ids.append(req.request_id)
-        return request_ids
+                results.append(self._admit_one_checked(spec))
+        return results
+
+    def _admit_one_checked(self, spec: Dict) -> Dict:
+        """Build + admit one spec, converting any rejection into a result dict.
+
+        Caller holds ``self._lock``.  ``request_id`` is echoed even on failure so
+        the caller can attribute the error without guessing.
+        """
+        rid = spec.get("request_id")
+        try:
+            streaming = bool(spec.get("streaming", True))
+            req = Request(
+                audio=spec.get("audio"),
+                request_id=rid,
+                streaming=streaming,
+                sample_rate=int(spec.get("sample_rate", 16000)),
+                priority=int(spec.get("priority", 0)),
+                decoding=DecodingOptions.coerce(spec.get("decoding")),
+            )
+            self._validate_mode(streaming)
+            self._executor.admit(req)
+        except Exception as exc:
+            return {"request_id": rid or "", "error": f"{type(exc).__name__}: {exc}"}
+        return {"request_id": req.request_id}
 
     # ------------------------------------------------------------------
     # Admission-prep overlap (offline)
     # ------------------------------------------------------------------
 
-    def _admit_batch_overlapped(self, specs: List[Dict]) -> List[str]:
-        """Overlap fast-path for :meth:`add_requests_batch` (offline only).
+    def _admit_batch_overlapped(self, specs: List[Dict]) -> List[Dict]:
+        """Overlap fast-path for :meth:`add_requests_batch_checked` (offline only).
 
         Builds the (cheap) :class:`Request` objects on the caller's thread,
         returns their ids immediately, and hands the requests to the prep
@@ -424,26 +456,37 @@ class ASREngine:
         requests to the scheduler.  ``_admit_inflight`` is bumped before
         queueing so :attr:`num_waiting` reflects work the scheduler can't see
         yet (otherwise the dispatcher could idle-wait past pending admits).
+
+        Per-spec rejections are reported like the non-overlap path: an invalid
+        spec is never queued for prep.
         """
         reqs: List[Request] = []
-        request_ids: List[str] = []
+        results: List[Dict] = []
         for spec in specs:
-            req = Request(
-                audio=spec.get("audio"),
-                request_id=spec.get("request_id"),
-                streaming=bool(spec.get("streaming", True)),
-                sample_rate=int(spec.get("sample_rate", 16000)),
-                priority=int(spec.get("priority", 0)),
-                decoding=DecodingOptions.coerce(spec.get("decoding")),
-            )
-            self._validate_mode(req.streaming)  # reads immutable executor.streaming
+            rid = spec.get("request_id")
+            try:
+                req = Request(
+                    audio=spec.get("audio"),
+                    request_id=rid,
+                    streaming=bool(spec.get("streaming", True)),
+                    sample_rate=int(spec.get("sample_rate", 16000)),
+                    priority=int(spec.get("priority", 0)),
+                    decoding=DecodingOptions.coerce(spec.get("decoding")),
+                )
+                self._validate_mode(req.streaming)  # reads immutable executor.streaming
+                # Raise here, not on the prep thread, where it would only be logged.
+                self._input_processor.check_audio_duration(req.audio)
+            except Exception as exc:
+                results.append({"request_id": rid or "", "error": f"{type(exc).__name__}: {exc}"})
+                continue
             reqs.append(req)
-            request_ids.append(req.request_id)
-        with self._admit_inflight_lock:
-            self._admit_inflight += len(reqs)
-        for req in reqs:
-            self._prep_in.put(req)
-        return request_ids
+            results.append({"request_id": req.request_id})
+        if reqs:
+            with self._admit_inflight_lock:
+                self._admit_inflight += len(reqs)
+            for req in reqs:
+                self._prep_in.put(req)
+        return results
 
     def _prep_loop(self) -> None:
         """Daemon: prepare queued offline requests off the step thread.
@@ -487,13 +530,22 @@ class ASREngine:
             return self._admit_inflight
 
     def shutdown(self) -> None:
-        """Stop the admission-prep thread (best-effort).  Safe to call twice;
-        a no-op when overlap admission is disabled."""
+        """Release engine-held resources (best-effort, idempotent).
+
+        Stops the admission-prep thread and drains the executor: incremental AR
+        strategies park requests with live decoder-KV buffers in the executor's
+        pending pool, and without an explicit release those only go away when
+        the garbage collector gets to them.
+        """
         t = self._prep_thread
         if t is not None and t.is_alive():
             self._prep_in.put(None)
             t.join(timeout=2.0)
         self._prep_thread = None
+        try:
+            self._executor.shutdown()
+        except Exception:  # pragma: no cover - defensive; shutdown must not raise
+            logger.exception("executor shutdown failed")
 
     def _prewarm_offline(self) -> None:
         """Run one dummy offline batch per preferred size to absorb one-time
@@ -851,6 +903,32 @@ class ASREngine:
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
+
+    @property
+    def service_mode(self) -> str:
+        """The mode this engine was built for — ``"streaming"`` or ``"offline"``.
+
+        The engine is the authority: several decode families are offline-only
+        (AED / LLM / Paraformer / rescoring) and are rejected at construction in
+        streaming mode, so a front-end that assumed the other mode would reject
+        requests this engine could serve — or accept ones it cannot.
+        """
+        return self._config.service_mode
+
+    @property
+    def decode_method(self) -> str:
+        """The resolved decode family actually running (never ``None``).
+
+        ``EngineConfig.decode_method`` if the caller pinned one, else the
+        model's ``default_decode_type``.  Distinct from
+        ``EngineConfig.decoder_type``, which only selects the CTC *kernel*.
+        """
+        return self._decode_method
+
+    @property
+    def capabilities(self) -> List[str]:
+        """Decode families this checkpoint could serve, sorted."""
+        return sorted(self._model.capabilities)
 
     @property
     def num_running(self) -> int:

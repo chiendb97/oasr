@@ -140,12 +140,19 @@ class FunASRParaformerConverter:
         ckpt = torch.load(str(ckpt_dir / name), map_location=map_location, weights_only=True)
         sd = dict(ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt)
         mvn_path = ckpt_dir / "am.mvn"
-        if mvn_path.exists():
-            shift, scale = load_am_mvn(mvn_path)
-            sd["encoder.cmvn_shift"] = shift
-            sd["encoder.cmvn_scale"] = scale
-        else:
-            logger.warning("%s: no am.mvn found — CMVN will be identity", ckpt_dir)
+        if not mvn_path.exists():
+            # Identity CMVN on a FunASR checkpoint does not degrade recognition,
+            # it destroys it — the encoder is trained on normalized features.
+            # A warning here reads as "slightly worse"; it is not.
+            raise FileNotFoundError(
+                f"{ckpt_dir}: am.mvn is missing. FunASR Paraformer encoders are "
+                "trained on CMVN-normalized features, so loading without it "
+                "produces garbage transcripts. Copy am.mvn from the model "
+                "repository next to model.pt."
+            )
+        shift, scale = load_am_mvn(mvn_path)
+        sd["encoder.cmvn_shift"] = shift
+        sd["encoder.cmvn_scale"] = scale
         return sd
 
     # -- complete-bundle conversion ------------------------------------------

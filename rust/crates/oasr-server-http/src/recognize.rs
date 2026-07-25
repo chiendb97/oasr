@@ -201,17 +201,22 @@ pub struct RawParams {
 
 impl RawParams {
     /// Map the query-string knobs to the engine's per-request
-    /// [`DecodingParams`]; `None` when every knob is at its default.
-    fn decoding_params(&self) -> Option<DecodingParams> {
-        let p = DecodingParams {
+    /// [`DecodingParams`]; `Ok(None)` when every knob is at its default, and a
+    /// client-facing message for out-of-range values.
+    ///
+    /// Shares [`DecodingParams::validated`] with the gRPC surface so the two
+    /// cannot drift, and so a bad value fails only its own request — the Python
+    /// `DecodingOptions` raise would take down the whole coalesced admit batch.
+    fn decoding_params(&self) -> Result<Option<DecodingParams>, String> {
+        DecodingParams {
             n_best: (self.max_alternatives > 1).then_some(self.max_alternatives),
             max_new_tokens: self.max_new_tokens.filter(|&v| v > 0),
             temperature: self.temperature.filter(|&v| v > 0.0),
             top_k: self.top_k.filter(|&v| v > 0),
             top_p: self.top_p.filter(|&v| v > 0.0),
             prompt: self.prompt.clone().filter(|s| !s.is_empty()),
-        };
-        (!p.is_empty()).then_some(p)
+        }
+        .validated()
     }
 }
 
@@ -279,7 +284,10 @@ pub async fn handle_recognize(
         };
 
         let audio_buf: Bytes = decoded.samples;
-        let decoding = params.decoding_params();
+        let decoding = match params.decoding_params() {
+            Ok(d) => d,
+            Err(msg) => return reject(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", msg),
+        };
         run_offline(
             &s,
             audio_buf,

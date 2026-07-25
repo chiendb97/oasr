@@ -70,7 +70,7 @@ class IcefallTransducerConverter(IcefallConverter):
             raise FileNotFoundError(f"No icefall checkpoint (*.pt) found under {ckpt_dir}")
         import torch
 
-        sd = _extract_state_dict(torch.load(str(ckpt), map_location="cpu"))
+        sd = _extract_state_dict(torch.load(str(ckpt), map_location="cpu", weights_only=True))
         return self.config_from_state_dict(sd)
 
     @staticmethod
