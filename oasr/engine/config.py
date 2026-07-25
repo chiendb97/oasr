@@ -302,6 +302,21 @@ class EngineConfig:
     # frame-synchronous strategies (CTC / transducer / rescoring).
     decode_steps_per_tick: int = 32
     max_decode_slots: Optional[int] = None
+    # Wall-clock cap on one engine tick's decode phase, in milliseconds.  The
+    # step cap above bounds *work*, not *time*, and one decoder step spans two
+    # orders of magnitude across models (measured: ~1.5 ms for whisper-tiny at
+    # B=8, ~18 ms for Qwen2-Audio-7B at B=4), so a fixed step count means a
+    # ~50 ms tick on one model and a ~580 ms tick on another.  The serving
+    # dispatcher holds the GIL for a whole tick, so that is the floor on cancel
+    # latency, admission latency, and the gap between streaming partials.
+    #
+    # Whichever limit binds first wins: light models still run many steps per
+    # tick, heavy models stop early and stream tokens at an interactive cadence.
+    # The deadline stops *starting* steps rather than preempting one, so the real
+    # bound is ``max_tick_ms + one step``.  ``0`` disables it (step cap only).
+    # Inert for frame-synchronous strategies (CTC / transducer / rescoring),
+    # which do not use the incremental protocol.
+    max_tick_ms: float = 25.0
 
     # AR generation length cap (per request), read by incremental strategies.
     max_new_tokens: int = 448
@@ -381,6 +396,8 @@ class EngineConfig:
             )
         if self.max_new_tokens < 1:
             raise ValueError(f"max_new_tokens must be >= 1, got {self.max_new_tokens!r}")
+        if self.max_tick_ms < 0:
+            raise ValueError(f"max_tick_ms must be >= 0 (0 disables), got {self.max_tick_ms!r}")
         if self.enable_sequence_packing:
             if self.service_mode != "offline":
                 raise ValueError("enable_sequence_packing requires service_mode='offline'")

@@ -112,12 +112,18 @@ class _Qwen2Attention(nn.Module):
         v: torch.Tensor,
         attn_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """SDPA over the (possibly grouped) KV → ``(B, T_q, D)``."""
-        if self.h_kv != self.h:
-            rep = self.h // self.h_kv
-            k = k.repeat_interleave(rep, dim=1)
-            v = v.repeat_interleave(rep, dim=1)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        """SDPA over the (possibly grouped) KV → ``(B, T_q, D)``.
+
+        Grouped KV is expanded **inside** SDPA via ``enable_gqa`` rather than by
+        materialising ``k.repeat_interleave(h // h_kv, dim=1)``: that copy is the
+        whole cache, per layer, per token, so it scales with ``B × context`` and
+        would undo the in-place capacity-preallocated KV writes above it.  (The
+        published Qwen2-Audio-7B has ``h_kv == h``, so this only bites a
+        grouped-KV speech-LLM — but that is the common shape elsewhere.)
+        """
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, enable_gqa=self.h_kv != self.h
+        )
         B, _, T_q, _ = out.shape
         out = out.transpose(1, 2).contiguous().view(B, T_q, self.h * self.d_k)
         return self.o_proj(out)

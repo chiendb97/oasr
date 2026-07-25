@@ -62,10 +62,15 @@ Request → InputProcessor (fbank) → Scheduler (BatchingPolicy + PartitionPoli
 2. `@register_decode_strategy("foo")` on a `DecodeStrategy`.  Frame-synchronous:
    implement `decode_offline` (one shot).  Label-synchronous AR: set
    `incremental = True` and implement `begin_offline` / `advance(StepBudget)` /
-   `has_pending` — the offline executor then runs at most
-   `EngineConfig.decode_steps_per_tick` batched decoder steps per engine tick
-   (bounded work for the serving dispatcher).  Working references:
-   `transducer.py` (frame-sync greedy, offline + streaming sessions),
+   `has_pending`.  Call `budget.take()` before every batched decoder step and
+   stop when it returns `False`: the budget carries **both** a step cap
+   (`EngineConfig.decode_steps_per_tick`) and a wall-clock deadline
+   (`EngineConfig.max_tick_ms`), whichever binds first.  The deadline is the one
+   that matters for a serving deployment — the dispatcher holds the GIL for a
+   whole tick, and step cost is model-dependent (measured: ~1.5 ms/step for
+   whisper-tiny at `B=8` vs ~18 ms/step for Qwen2-Audio-7B at `B=4`), so a step
+   count alone lets one model's tick run 10× longer than another's.  Working
+   references: `transducer.py` (frame-sync greedy, offline + streaming sessions),
    `rescoring.py` (`consumes="both"`), `aed.py` / `llm.py` (incremental).
 
 **Add a streaming runtime:** `@register_streaming_backend("my_kind")` on a

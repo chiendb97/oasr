@@ -772,6 +772,7 @@ class ASREngine:
                 if config.max_decode_slots is not None
                 else config.max_batch_size
             ),
+            max_tick_ms=config.max_tick_ms,
         )
 
     def _validate_mode(self, streaming: bool) -> None:

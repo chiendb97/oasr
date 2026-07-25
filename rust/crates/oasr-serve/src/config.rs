@@ -75,6 +75,15 @@ pub struct Cli {
     /// default 32.
     #[arg(long)]
     pub decode_steps_per_tick: Option<u32>,
+    /// Incremental (AED / LLM) decode: wall-clock cap on one tick's decode phase,
+    /// in milliseconds.  The step cap above bounds work, not time, and step cost
+    /// is model-dependent (measured: ~1.5 ms/step for whisper-tiny at B=8 vs
+    /// ~18 ms/step for Qwen2-Audio-7B at B=4), so this is what actually bounds
+    /// cancel latency, admission latency and the streaming-partial interval —
+    /// the dispatcher holds the GIL for a whole tick.  Engine default 25;
+    /// 0 disables (step cap only).
+    #[arg(long)]
+    pub max_tick_ms: Option<f64>,
     /// Incremental (AED / LLM) decode: max AR requests in flight before
     /// new-batch admission pauses.  Unset defaults to the engine's
     /// max_batch_size.
@@ -265,6 +274,11 @@ impl Cli {
         if let Some(v) = self.max_decode_slots {
             obj.entry("max_decode_slots")
                 .or_insert(Value::Number(v.into()));
+        }
+        if let Some(v) = self.max_tick_ms {
+            if let Some(num) = serde_json::Number::from_f64(v) {
+                obj.entry("max_tick_ms").or_insert(Value::Number(num));
+            }
         }
         if self.overlap_admit {
             obj.entry("overlap_admit").or_insert(Value::Bool(true));

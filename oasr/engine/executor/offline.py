@@ -31,6 +31,11 @@ from ..request import Request, RequestOutput, RequestState
 from ..scheduler import Scheduler
 from .base import Executor
 
+#: Consecutive ticks that may skip admission because the decode budget was spent.
+#: Bounds how long a saturated decode pool can defer new prefills; past this the
+#: next tick admits regardless, so admission cannot starve indefinitely.
+_MAX_SKIPPED_ADMITS = 8
+
 
 class OfflineExecutor(Executor):
     """Execute scheduled offline batches as sequential micro-batches.
@@ -60,6 +65,7 @@ class OfflineExecutor(Executor):
         enable_packing: bool = False,
         decode_steps_per_tick: int = 32,
         max_decode_slots: Optional[int] = None,
+        max_tick_ms: float = 0.0,
     ) -> None:
         self._scheduler = scheduler
         self._inp = input_processor
@@ -73,13 +79,23 @@ class OfflineExecutor(Executor):
         # Incremental (label-synchronous AR) decode support: requests begun
         # via ``strategy.begin_offline`` park here in state RUNNING and are
         # driven by ``strategy.advance(StepBudget)`` — at most
-        # ``decode_steps_per_tick`` batched decoder steps per engine tick, so
-        # one tick always does bounded work (the serving dispatcher's
-        # contract).  ``max_decode_slots`` gates new-batch admission while the
-        # pending pool is full.  Both are inert for one-shot strategies.
+        # ``decode_steps_per_tick`` batched decoder steps **and** at most
+        # ``max_tick_ms`` of wall clock per engine tick, so one tick always does
+        # bounded work *in time* (the serving dispatcher's contract; a step count
+        # alone does not bound it, since step cost is model-dependent).
+        # ``max_decode_slots`` gates new-batch admission while the pending pool
+        # is full.  All three are inert for one-shot strategies.
         self._decode_steps_per_tick = int(decode_steps_per_tick)
         self._max_decode_slots = max_decode_slots
+        self._max_tick_ms = float(max_tick_ms)
         self._pending: Dict[str, Request] = {}
+        # A tick that spent its whole budget advancing does not also prefill a new
+        # micro-batch — prefill is the largest single blob in a tick (audio tower
+        # + projector + an LM forward over the whole prompt), and stacking it on
+        # top of a full decode budget defeats the point of bounding the tick.
+        # Counted so admission can never starve: after ``_MAX_SKIPPED_ADMITS``
+        # consecutive skips the next tick admits regardless.
+        self._skipped_admits = 0
 
     # ------------------------------------------------------------------
     # Executor ABC
@@ -138,18 +154,39 @@ class OfflineExecutor(Executor):
 
         One-shot strategies (CTC / WFST / transducer / rescoring): pull a
         batch and run it to completion — unchanged.  Incremental strategies
-        (AED / LLM): first advance every pending request by at most
-        ``decode_steps_per_tick`` batched decoder steps, then — if decode
-        slots remain — admit + encode + prefill one new batch.
+        (AED / LLM): first advance every pending request within the tick budget
+        (``decode_steps_per_tick`` steps *and* ``max_tick_ms`` of wall clock),
+        then — if the budget wasn't spent and decode slots remain — admit +
+        encode + prefill one new batch.
         """
         outputs: List[RequestOutput] = []
         strategy = self._op.strategy
+        budget_spent = False
         if strategy.incremental and strategy.has_pending():
-            outputs.extend(self._advance_pending())
-        if self._admission_open():
+            outputs, budget_spent = self._advance_pending()
+        if self._may_admit(budget_spent) and self._admission_open():
             batch = self._scheduler.schedule_offline()
             outputs.extend(self.run(batch))
         return outputs
+
+    def _may_admit(self, budget_spent: bool) -> bool:
+        """Whether this tick should also prefill a new batch.
+
+        Prefill is unbudgeted and the largest single blob in a tick, so a tick
+        that already spent its decode budget skips it — otherwise the tick bound
+        is ``budget + prefill`` and the deadline buys nothing.  Bounded skipping:
+        after ``_MAX_SKIPPED_ADMITS`` consecutive skips a batch is admitted
+        regardless, so a steady stream of long generations cannot starve
+        admission indefinitely.
+        """
+        if not budget_spent:
+            self._skipped_admits = 0
+            return True
+        if self._skipped_admits >= _MAX_SKIPPED_ADMITS:
+            self._skipped_admits = 0
+            return True
+        self._skipped_admits += 1
+        return False
 
     def has_pending(self) -> bool:
         return self._scheduler.num_waiting_offline > 0 or bool(self._pending)
@@ -222,12 +259,16 @@ class OfflineExecutor(Executor):
             return not self._pending
         return len(self._pending) < int(self._max_decode_slots)
 
-    def _advance_pending(self) -> List[RequestOutput]:
-        """Run one budgeted ``strategy.advance`` pass and finalise any
-        requests it finished."""
+    def _advance_pending(self) -> Tuple[List[RequestOutput], bool]:
+        """Run one budgeted ``strategy.advance`` pass and finalise what it finished.
+
+        Returns ``(outputs, budget_spent)``; ``budget_spent`` tells :meth:`step`
+        whether this tick still has room to prefill a new batch.
+        """
         from ..generation import StepBudget
 
-        outputs = self._op.strategy.advance(StepBudget(max_steps=self._decode_steps_per_tick))
+        budget = StepBudget.for_tick(self._decode_steps_per_tick, self._max_tick_ms)
+        outputs = self._op.strategy.advance(budget)
         for out in outputs:
             if not out.finished:
                 continue
@@ -235,7 +276,7 @@ class OfflineExecutor(Executor):
             if req is not None:
                 req.output = out
                 req.state = RequestState.FINISHED
-        return outputs
+        return outputs, budget.exhausted()
 
     # ------------------------------------------------------------------
     # Stage helpers

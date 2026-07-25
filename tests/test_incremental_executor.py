@@ -8,6 +8,7 @@ bounded steps per tick, the pending pool lifecycle, admission gating, abort —
 independent of any real model (Whisper etc. plug into the same seam).
 """
 
+import time
 from typing import Dict, List
 
 import pytest
@@ -32,6 +33,8 @@ class FakeIncrementalStrategy(DecodeStrategy):
         self.states: Dict[str, List[int]] = {}
         self.freed: List[str] = []
         self.steps_per_tick: List[int] = []
+        #: Simulated per-batched-step cost, for wall-clock budget assertions.
+        self.step_delay_s: float = 0.0
 
     # -- incremental protocol ------------------------------------------
     def begin_offline(self, requests, enc_out, enc_lengths):
@@ -43,6 +46,8 @@ class FakeIncrementalStrategy(DecodeStrategy):
         steps = 0
         while self.states and budget.take():
             steps += 1
+            if self.step_delay_s:
+                time.sleep(self.step_delay_s)
             for rid in list(self.states):
                 self.states[rid].append(len(self.states[rid]) + 1)
                 if len(self.states[rid]) >= self.target_lens[rid]:
@@ -178,16 +183,29 @@ class TestIncrementalLifecycle:
         assert strat.steps_per_tick == [4, 4, 2]
 
     def test_continuous_batching_across_requests(self):
-        """A request admitted later joins the same advance loop mid-flight."""
-        ex, strat = _make_executor({"a": 6, "b": 2}, steps_per_tick=2)
+        """A request admitted later joins the advance loop mid-flight.
+
+        It joins on the *next* tick, not the one that spent its decode budget:
+        prefill is unbudgeted, so stacking it on top of a full budget would make
+        the real tick bound ``budget + prefill``.  See
+        :class:`TestTickBudget.test_admission_deferred_when_budget_spent`.
+        """
+        ex, strat = _make_executor({"a": 8, "b": 2}, steps_per_tick=2)
         _admit(ex, "a")
         ex.step()  # prefill a
-        ex.step()  # a: 2/6
+        ex.step()  # a: 2/8 — budget spent
         _admit(ex, "b")
-        outs = ex.step()  # advance (a:4/6) then prefill b — same tick
-        assert outs == [] and ex.num_running() == 2
-        outs = ex.step()  # a hits 6 and b hits 2 in the same 2-step tick
-        assert sorted(o.request_id for o in outs) == ["a", "b"]
+        outs = ex.step()  # a: 4/8; budget spent again, so b's prefill waits
+        assert outs == [] and ex.num_running() == 1
+
+        # b joins on a later tick and then advances in the same batched loop as a.
+        finals = []
+        for _ in range(20):
+            if not ex.has_pending():
+                break
+            finals.extend(o for o in ex.step() if o.finished)
+        assert sorted(o.request_id for o in finals) == ["a", "b"]
+        assert ex.num_running() == 0
 
     def test_run_drives_to_completion(self):
         """engine.run()-style loop: step until has_pending() clears."""
@@ -310,6 +328,78 @@ class TestStepBudget:
         assert b.take() and b.take() and not b.take()
         assert b.exhausted() and b.remaining == 0
         assert b.used == 2
+
+    def test_no_deadline_by_default(self):
+        b = StepBudget(max_steps=4)
+        assert b.deadline_s is None
+        assert not b.out_of_time()
+
+    def test_deadline_stops_further_steps(self):
+        """The wall-clock limit binds even when steps remain.
+
+        A step count alone does not bound tick *time* — one decoder step is
+        ~1.5 ms on whisper-tiny and ~18 ms on a 7B, so a fixed 32-step tick spans
+        ~50 ms to ~580 ms across models.
+        """
+        b = StepBudget.for_tick(max_steps=1000, max_tick_ms=5.0)
+        assert b.take()  # first step is always granted
+        time.sleep(0.02)  # blow through the 5 ms deadline
+        assert b.out_of_time()
+        assert not b.take()
+        assert b.exhausted()
+        assert b.remaining > 0  # steps left; time is what ran out
+
+    def test_first_step_always_granted(self):
+        """Progress beats holding a deadline a single step cannot fit inside."""
+        b = StepBudget.for_tick(max_steps=8, max_tick_ms=0.0001)
+        time.sleep(0.005)
+        assert b.take()
+        assert not b.take()
+
+    def test_for_tick_without_deadline(self):
+        b = StepBudget.for_tick(max_steps=3, max_tick_ms=0.0)
+        assert b.deadline_s is None
+        assert b.take() and b.take() and b.take() and not b.take()
+
+
+class TestTickBudget:
+    """Tick-level composition of the budget with admission (C1 + C4)."""
+
+    def test_admission_deferred_when_budget_spent(self):
+        ex, strat = _make_executor({"a": 100}, steps_per_tick=2, slots=8)
+        _admit(ex, "a")
+        ex.step()  # prefill a
+        _admit(ex, "b")
+        ex.step()  # spends both steps on a → b's prefill is deferred
+        assert ex.num_running() == 1
+
+    def test_admission_forced_after_repeated_skips(self):
+        """A saturated decode pool must not starve admission indefinitely."""
+        from oasr.engine.executor.offline import _MAX_SKIPPED_ADMITS
+
+        ex, strat = _make_executor({"a": 10_000}, steps_per_tick=1, slots=8)
+        _admit(ex, "a")
+        ex.step()  # prefill a
+        _admit(ex, "b")
+        for _ in range(_MAX_SKIPPED_ADMITS):
+            ex.step()
+            assert ex.num_running() == 1, "b should still be deferred"
+        ex.step()  # the forced-admission tick
+        assert ex.num_running() == 2
+
+    def test_wall_clock_budget_bounds_a_tick(self):
+        """With a slow strategy the tick stops on time, not on the step count."""
+        ex, strat = _make_executor({"a": 10_000}, steps_per_tick=1000, slots=8)
+        strat.step_delay_s = 0.004  # ~4 ms per batched step
+        ex._max_tick_ms = 20.0  # noqa: SLF001 - exercising the executor's budget
+        _admit(ex, "a")
+        ex.step()  # prefill
+        t0 = time.perf_counter()
+        ex.step()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        # Deadline stops *starting* steps, so the bound is deadline + one step.
+        assert elapsed_ms < 20.0 + 8.0, f"tick ran {elapsed_ms:.1f}ms"
+        assert strat.steps_per_tick[-1] < 1000
 
 
 if __name__ == "__main__":

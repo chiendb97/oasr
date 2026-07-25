@@ -314,11 +314,30 @@ Multi-paradigm serving: `--decode-method` selects among the checkpoint's
 advertised capabilities (e.g. `ctc_aed_rescoring` on a U2++ hybrid, `llm` on
 a Qwen2-Audio checkpoint; unset = model default, validated at startup).  The
 incremental AR families additionally take `--max-new-tokens`,
-`--decode-steps-per-tick` (bounded batched decoder steps per engine tick —
-the dispatcher-starvation guard), `--max-decode-slots` (in-flight AR request
-cap), and `--llm-prompt` (deployment-wide speech-LLM user prompt; per-request
-`prompt` decoding options override it).  LLM decode emits token-streaming
-partials over the same `Event::Partial` wire streaming CTC uses.
+`--decode-steps-per-tick` (step cap per engine tick), `--max-tick-ms`
+(wall-clock cap per tick — the actual dispatcher-starvation guard),
+`--max-decode-slots` (in-flight AR request cap), and `--llm-prompt`
+(deployment-wide speech-LLM user prompt; per-request `prompt` decoding options
+override it).  LLM decode emits token-streaming partials over the same
+`Event::Partial` wire streaming CTC uses.
+
+**`--max-tick-ms` is the knob that bounds latency, not `--decode-steps-per-tick`.**
+A step count bounds work, not time, and step cost is model-dependent, so one
+fixed step budget behaves very differently per model. Measured at
+`--decode-steps-per-tick 32`, `B=4`, on `Qwen2-Audio-7B-Instruct`:
+
+| `--max-tick-ms` | tick p50 | tick p99 | tokens/s |
+|---|---|---|---|
+| `0` (step cap only) | 173 ms | 579 ms | 135.3 |
+| `25` (default) | 37 ms | 151 ms | 134.8 |
+
+Since the dispatcher holds the GIL for a whole tick, the p99 column is the floor
+on cancel latency, admission latency, and the interval between streaming
+partials — cut 3.8× here for a 0.3% throughput cost (within run-to-run noise).
+The residual 151 ms p99 is the **prefill** tick (audio tower + projector + one LM
+forward over the whole prompt), which the decode deadline deliberately does not
+bound; a tick that spends its decode budget will not also prefill, so the two
+never stack.
 
 ## Benchmarking
 
