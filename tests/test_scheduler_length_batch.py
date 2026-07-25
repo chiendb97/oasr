@@ -167,3 +167,78 @@ class TestSplitByFrames:
         reqs = _make_requests([10] * 9)
         chunks, _ = sched.split_offline_batch(reqs)
         assert [len(c) for c in chunks] == [3, 3, 3]
+
+
+# ---------------------------------------------------------------------------
+# Fixed-window frontends: cost is constant per row (H11)
+# ---------------------------------------------------------------------------
+
+
+class TestFixedWindowCostModel:
+    """A ``whisper_logmel`` frontend pads *and trims* every utterance to 30 s, so
+    every row costs the same and the encoder throws the real lengths away.  The
+    length-aware knobs must not split batches to avoid padding waste that does not
+    exist, and ``max_batch_frames`` must count the real padded width.
+    """
+
+    @staticmethod
+    def _cfg(**kw):
+        from oasr.features import FeatureConfig
+
+        return EngineConfig(
+            device="cpu",
+            service_mode="offline",
+            feature_config=FeatureConfig(
+                feature_type="whisper_logmel", num_mel_bins=128, dither=0.0
+            ),
+            **kw,
+        )
+
+    @staticmethod
+    def _reqs(frames):
+        out = []
+        for i, n in enumerate(frames):
+            r = Request(audio=None, request_id=f"r{i}", streaming=False)
+            r.num_frames = n
+            out.append(r)
+        return out
+
+    def test_cost_is_the_window_not_the_utterance(self):
+        from oasr.engine.batching.base import request_cost_frames
+
+        cfg = self._cfg()
+        assert cfg.feature_config.fixed_window_frames == 3000
+        short, long = self._reqs([98, 2900])
+        assert request_cost_frames(short, cfg) == 3000
+        assert request_cost_frames(long, cfg) == 3000
+
+    def test_kaldi_frontend_still_costs_its_own_length(self):
+        from oasr.engine.batching.base import request_cost_frames
+
+        cfg = EngineConfig(device="cpu", service_mode="offline")
+        assert cfg.feature_config.fixed_window_frames is None
+        (r,) = self._reqs([137])
+        assert request_cost_frames(r, cfg) == 137
+
+    def test_mixed_lengths_batch_together(self):
+        """The pad-ratio guard used to split a 1 s + 30 s pair for nothing."""
+        cfg = self._cfg(max_batch_size=8, max_offline_pad_ratio=1.5, length_bucket_ratio=0.8)
+        sched = Scheduler(cfg)
+        for r in self._reqs([98, 2900, 300, 1500]):
+            sched.add_request(r)
+        batch = sched.schedule_offline()
+        assert len(batch) == 4, "equal-cost rows must not be split by padding heuristics"
+
+    def test_frame_budget_counts_the_real_window(self):
+        """``max_batch_frames`` bounds padded frames; under a fixed window it must
+        use 3000/row, not the ~98 a 1 s clip reports."""
+        cfg = self._cfg(max_batch_size=8, max_batch_frames=6000)
+        sched = Scheduler(cfg)
+        for r in self._reqs([98] * 4):
+            sched.add_request(r)
+        batch = sched.schedule_offline()
+        chunks, _ = sched.split_offline_batch(batch)
+        assert all(len(c) <= 2 for c in chunks), (
+            f"6000-frame budget at 3000/row allows 2 rows per micro-batch, got "
+            f"{[len(c) for c in chunks]}"
+        )

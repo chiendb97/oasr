@@ -32,6 +32,12 @@ class WhisperTokenizer(HuggingFaceTokenizer):
     def __init__(self, tokenizer_json_path: str, eot_id: int) -> None:
         super().__init__(tokenizer_json_path, special_ids=frozenset({int(eot_id)}))
         self._eot_id = int(eot_id)
+        # ``decode`` keeps only ids below ``eot_id``, so *everything* at or above
+        # it is stripped — the language / task / timestamp control block, ~1500
+        # ids, not just ``<|endoftext|>``.  ``special_ids`` has to say so: a
+        # caller filtering a hypothesis by it would otherwise leak control markup
+        # that ``decode`` removes.
+        self._special_ids = frozenset(range(self._eot_id, self.vocab_size))
 
     @classmethod
     def from_spec(cls, spec: TokenizerSpec) -> "WhisperTokenizer":
@@ -40,6 +46,10 @@ class WhisperTokenizer(HuggingFaceTokenizer):
     @property
     def eot_id(self) -> int:
         return self._eot_id
+
+    @property
+    def special_ids(self):
+        return self._special_ids
 
     def decode(self, ids: Sequence[int]) -> str:
         text_ids: List[int] = [int(t) for t in ids if t < self._eot_id]

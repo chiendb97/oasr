@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List
 
-from ..base import BaseModelConfig, CacheSpec
+from ..base import BaseModelConfig
 
 # The processor-side ChatML template around the audio slot (verbatim from
 # Qwen2AudioProcessor.default_chat_template with one user turn holding one
@@ -80,21 +80,3 @@ class SpeechLlmModelConfig(BaseModelConfig):
     @property
     def text_head_dim(self) -> int:
         return self.text_hidden_size // self.text_num_attention_heads
-
-    @property
-    def cache_spec(self) -> CacheSpec:
-        return CacheSpec(
-            num_layers=self.audio_encoder_layers,
-            n_kv_head=self.audio_encoder_attention_heads,
-            head_dim=self.audio_head_dim,
-            hidden_dim=self.audio_d_model,
-            conv_kernel_size=1,
-        )
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "SpeechLlmModelConfig":
-        known = {f for f in cls.__dataclass_fields__}
-        kwargs = {k: v for k, v in d.items() if k in known}
-        if kwargs.get("eos_token_ids") is not None:
-            kwargs["eos_token_ids"] = [int(t) for t in kwargs["eos_token_ids"]]
-        return cls(**kwargs)

@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from ..base import BaseModelConfig, CacheSpec
+from ..base import BaseModelConfig
 
 
 @dataclass
@@ -49,16 +49,6 @@ class WhisperModelConfig(BaseModelConfig):
     def head_dim(self) -> int:
         return self.d_model // self.encoder_attention_heads
 
-    @property
-    def cache_spec(self) -> CacheSpec:
-        return CacheSpec(
-            num_layers=self.encoder_layers,
-            n_kv_head=self.encoder_attention_heads,
-            head_dim=self.head_dim,
-            hidden_dim=self.d_model,
-            conv_kernel_size=1,
-        )
-
     def sot_sequence(self) -> List[int]:
         """The decoder prompt: ``<|startoftranscript|>`` + forced ids in
         position order (language, task, ``<|notimestamps|>``)."""
@@ -66,13 +56,3 @@ class WhisperModelConfig(BaseModelConfig):
         for _pos, tok in sorted(self.forced_decoder_ids, key=lambda pt: pt[0]):
             prompt.append(int(tok))
         return prompt
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "WhisperModelConfig":
-        known = {f for f in cls.__dataclass_fields__}
-        kwargs = {k: v for k, v in d.items() if k in known}
-        if kwargs.get("forced_decoder_ids"):
-            kwargs["forced_decoder_ids"] = [
-                (int(p), int(t)) for p, t in kwargs["forced_decoder_ids"]
-            ]
-        return cls(**kwargs)

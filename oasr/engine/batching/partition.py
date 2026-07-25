@@ -12,7 +12,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, ClassVar, List, Optional
 
 from ..request import Request
-from .base import PartitionPolicy, PartitionResult, register_partition_policy, snap_to_preferred
+from .base import (
+    PartitionPolicy,
+    PartitionResult,
+    register_partition_policy,
+    request_cost_frames,
+    snap_to_preferred,
+)
 
 if TYPE_CHECKING:
     from ..config import EngineConfig
@@ -77,7 +83,7 @@ class FramePartition(PartitionPolicy):
         cur: List[Request] = []
         cur_max = 0
         for r in ordered:
-            rlen = max(1, r.num_frames)
+            rlen = request_cost_frames(r, config)
             new_max = max(cur_max, rlen)
             if cur and (new_max * (len(cur) + 1) > budget or len(cur) >= mb):
                 chunks.append(cur)

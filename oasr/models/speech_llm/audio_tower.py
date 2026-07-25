@@ -142,14 +142,6 @@ class Qwen2AudioTower(BaseEncoder):
         return self._cfg.audio_encoder_layers
 
     @property
-    def n_kv_head(self) -> int:
-        return self._cfg.audio_encoder_attention_heads
-
-    @property
-    def head_dim(self) -> int:
-        return self._cfg.audio_head_dim
-
-    @property
     def output_size(self) -> int:
         return self._cfg.audio_d_model
 

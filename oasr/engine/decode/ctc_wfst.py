@@ -42,8 +42,7 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
     consumes: ClassVar[str] = "log_probs"
 
     def __init__(self, config: "EngineConfig", detok: "Detokenizer", model=None) -> None:
-        self._config = config
-        self._detok = detok
+        super().__init__(config, detok, model)
         # Streaming decoder sizing (GPU backend): every concurrent stream borrows a
         # channel from one shared multi-channel decoder, so the pool must cover the
         # engine's concurrent stream cap. Each channel's winners ring commits only

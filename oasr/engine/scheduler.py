@@ -122,7 +122,7 @@ class Scheduler:
             self._insert_ordered(self._offline_waiting, request)
         self._index[request.request_id] = request
 
-    def schedule_offline(self) -> List[Request]:
+    def schedule_offline(self, limit: Optional[int] = None) -> List[Request]:
         """Pick one length-bucketed offline batch from the offline queue.
 
         Marks each picked request RUNNING and returns the batch.  Returns
@@ -133,7 +133,9 @@ class Scheduler:
         Batch *selection* is delegated to the configured
         :class:`~oasr.engine.batching.BatchingPolicy` (fcfs / bucket / sjf).
         """
-        batch = self._batching_policy.select_offline_batch(self._offline_waiting, self._config)
+        batch = self._batching_policy.select_offline_batch(
+            self._offline_waiting, self._config, limit
+        )
         for req in batch:
             req.state = RequestState.RUNNING
         return batch

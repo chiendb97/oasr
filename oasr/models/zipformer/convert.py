@@ -14,10 +14,11 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
+from ..registry import DETECT_ASSET_LAYOUT
 from .config import ZipformerEncoderConfig, ZipformerModelConfig
 from .model import ZipformerModel
 
@@ -158,6 +159,10 @@ class IcefallConverter:
                 return d / name
         return None
 
+    #: only filename / asset conventions; other formats ship the same filenames, so this claim outranks a weaker one
+    #: (see :func:`oasr.models.registry.resolve_architecture`).
+    detect_specificity: ClassVar[int] = DETECT_ASSET_LAYOUT
+
     def detect(self, ckpt_dir: Path) -> bool:
         """Specific icefall markers only (the old "any ``.pt``" rule over-claimed).
 
@@ -166,12 +171,17 @@ class IcefallConverter:
         (``pretrained.pt``, ``epoch-*.pt``, ...).  A directory holding a single
         arbitrarily-named ``.pt`` no longer detects as icefall — pass
         ``architecture="zipformer"`` for such dirs.
+
+        These are all filename conventions other frameworks share — a WeNet dir has
+        ``final.pt``, a FunASR dir has ``model.pt`` — so this converter used to carry
+        ``return False`` guards for ``train.yaml`` and ``config.yaml``, i.e. WeNet's
+        and FunASR's markers hardcoded inside *icefall's* detector.  That made a 7th
+        format an edit here.  Replaced by
+        :attr:`detect_specificity` = ``DETECT_ASSET_LAYOUT``: those formats name
+        themselves in a config file and outrank this claim, so the guards are gone
+        and this method states only what icefall itself looks like.
         """
         ckpt_dir = Path(ckpt_dir)
-        if (ckpt_dir / "train.yaml").exists():
-            return False  # that's a WeNet/Conformer experiment dir
-        if (ckpt_dir / "config.yaml").exists():
-            return False  # a FunASR model dir (Paraformer & friends), despite model.pt
         if self._find_tokenizer_asset(ckpt_dir, "tokens.txt") is not None:
             return True
         if self._find_tokenizer_asset(ckpt_dir, "bpe.model") is not None:

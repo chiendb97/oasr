@@ -30,6 +30,27 @@ def _stub_config(decoder_type="ctc_cuda"):
     )
 
 
+def _stub_model(capability):
+    """Smallest object satisfying ``capability``'s declared surface.
+
+    Built from :data:`oasr.models.interfaces.CAPABILITIES` so it cannot drift from
+    the contract it is standing in for: add a required member to a spec and every
+    stub grows it automatically.
+    """
+    from oasr.models.interfaces import CAPABILITIES
+
+    root = SimpleNamespace()
+    for path in CAPABILITIES[capability].requires:
+        cur = root
+        parts = path.split(".")
+        for part in parts[:-1]:
+            if not hasattr(cur, part):
+                setattr(cur, part, SimpleNamespace())
+            cur = getattr(cur, part)
+        setattr(cur, parts[-1], lambda *a, **k: None)
+    return root
+
+
 # --------------------------------------------------------------------------- #
 # Decode-strategy registry / dispatch
 # --------------------------------------------------------------------------- #
@@ -49,8 +70,9 @@ def test_decode_registry_has_builtins():
 
 def test_build_ctc_strategies_by_decoder_type():
     detok = Detokenizer(None, None)
-    gpu = build_decode_strategy("ctc", _stub_config("ctc_cuda"), detok)
-    wfst = build_decode_strategy("ctc", _stub_config("ctc_wfst"), detok)
+    model = _stub_model("ctc")
+    gpu = build_decode_strategy("ctc", _stub_config("ctc_cuda"), detok, model)
+    wfst = build_decode_strategy("ctc", _stub_config("ctc_wfst"), detok, model)
     assert type(gpu).__name__ == "CtcGpuDecodeStrategy"
     assert type(wfst).__name__ == "CtcWfstDecodeStrategy"
     assert gpu.consumes == "log_probs" and gpu.decode_type == "ctc"
@@ -58,7 +80,7 @@ def test_build_ctc_strategies_by_decoder_type():
 
 @pytest.mark.parametrize("dt", ["transducer"])
 def test_ar_strategies_resolve_and_consume_hidden(dt):
-    s = build_decode_strategy(dt, _stub_config(), Detokenizer(None, None))
+    s = build_decode_strategy(dt, _stub_config(), Detokenizer(None, None), _stub_model(dt))
     assert s.decode_type == dt
     assert s.consumes == "hidden"
 
@@ -91,7 +113,9 @@ def test_transducer_offline_and_streaming_implemented():
     # transducer is a full strategy: decode_offline + streaming sessions (both
     # tested in test_transducer.py).  finalize on a request with no session
     # yields an empty final transcript rather than raising.
-    s = build_decode_strategy("transducer", _stub_config(), Detokenizer(None, None))
+    s = build_decode_strategy(
+        "transducer", _stub_config(), Detokenizer(None, None), _stub_model("transducer")
+    )
     assert type(s).__name__ == "TransducerDecodeStrategy"
     out = s.finalize(SimpleNamespace(request_id="never-decoded"))
     assert out.finished and out.tokens == [[]] and out.text == ""

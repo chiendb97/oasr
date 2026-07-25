@@ -37,8 +37,7 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
     consumes: ClassVar[str] = "log_probs"
 
     def __init__(self, config: "EngineConfig", detok: "Detokenizer", model=None) -> None:
-        self._config = config
-        self._detok = detok
+        super().__init__(config, detok, model)
         self._device = torch.device(config.device)
         mcfg = getattr(config, "_model_config", None)
         self._vocab_size = (getattr(mcfg, "vocab_size", None) or 5002) if mcfg else 5002

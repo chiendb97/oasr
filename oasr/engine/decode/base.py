@@ -72,6 +72,28 @@ class DecodeStrategy(ABC):
     #: decoder steps per tick instead of the one-shot :meth:`decode_offline`.
     incremental: ClassVar[bool] = False
 
+    def __init__(
+        self,
+        config: "EngineConfig",
+        detok: "Detokenizer",
+        model: "BaseAsrModel" = None,
+    ) -> None:
+        """Store the three things every strategy gets, and validate the model.
+
+        The capability check lives **here** rather than only in
+        :func:`build_decode_strategy` so that constructing a strategy directly —
+        which is public, and what tests do — is guarded too.  A strategy whose
+        model lacks the surface it will reach for should say so now, with the
+        missing members named, instead of raising ``AttributeError`` from the
+        middle of a decode.
+        """
+        from oasr.models.interfaces import require_capability
+
+        require_capability(model, self.decode_type, decode_method=self.decode_type)
+        self._config = config
+        self._detok = detok
+        self._model = model
+
     # -- offline -----------------------------------------------------------
     @abstractmethod
     def decode_offline(
@@ -202,5 +224,15 @@ def build_decode_strategy(
 
     ``model`` is threaded through so autoregressive strategies can reach
     ``model.decoder`` / ``model.joiner`` (CTC strategies ignore it).
+
+    The model's surface is validated here, once, against
+    :data:`oasr.models.interfaces.CAPABILITIES` — so a checkpoint advertising a
+    capability it cannot actually serve fails at engine construction with a
+    message naming the missing members, instead of at first decode with an
+    ``AttributeError`` (or not at all, for the families that used to check
+    nothing).
     """
+    from oasr.models.interfaces import require_capability
+
+    require_capability(model, decode_type, decode_method=decode_type)
     return get_decode_strategy_class(decode_type, config)(config, detok, model)

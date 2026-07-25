@@ -16,10 +16,11 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Mapping, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Mapping, Tuple
 
 import torch
 
+from ..registry import DETECT_KEYED_VALUE
 from .config import WhisperModelConfig
 
 if TYPE_CHECKING:
@@ -40,6 +41,10 @@ class HFWhisperConverter:
     #: silent, expected drop when the snapshot materializes it.
     expected_unused_prefixes: Tuple[str, ...] = ("proj_out.",)
     capability_drop_hints: Dict[str, str] = {}
+
+    #: the architecture is named in ``config.json`` (``model_type == "whisper"``), so this claim outranks a weaker one
+    #: (see :func:`oasr.models.registry.resolve_architecture`).
+    detect_specificity: ClassVar[int] = DETECT_KEYED_VALUE
 
     def detect(self, ckpt_dir: Path) -> bool:
         cfg_path = Path(ckpt_dir) / "config.json"

@@ -55,14 +55,9 @@ class AedDecodeStrategy(IncrementalArStrategy):
         model: "BaseAsrModel" = None,
     ) -> None:
         super().__init__(config, detok, model)
-        decoder = getattr(model, "decoder", None) if model is not None else None
-        mcfg = getattr(model, "config", None)
-        if decoder is None or not hasattr(decoder, "prefill"):
-            raise ValueError(
-                "decode_method='aed' needs a model whose decoder exposes the "
-                "batched incremental surface (prefill/step/select) — e.g. the "
-                "'whisper' architecture."
-            )
+        # Surface validation lives in ``build_decode_strategy`` via
+        # ``oasr.models.interfaces.CAPABILITIES["aed"]`` — one table, one message.
+        mcfg = model.config
         self._prompt = list(mcfg.sot_sequence())
         self._eos = int(mcfg.eos_token_id)
         self._suppress = sorted(set(int(t) for t in mcfg.suppress_tokens))

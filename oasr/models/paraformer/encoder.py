@@ -103,14 +103,6 @@ class SANMEncoder(BaseEncoder):
         return self._config.encoder_num_blocks
 
     @property
-    def n_kv_head(self) -> int:
-        return self._config.encoder_attention_heads
-
-    @property
-    def head_dim(self) -> int:
-        return self._config.encoder_output_size // self._config.encoder_attention_heads
-
-    @property
     def output_size(self) -> int:
         return self._config.encoder_output_size
 

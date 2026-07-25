@@ -35,15 +35,30 @@ Batched parallel streams::
 from __future__ import annotations
 
 from .backends import extract_features_batch, fbank_batch, mfcc_batch
+from .batched import batched_fbank, batched_mfcc
 from .config import FeatureConfig
 from .lfr import apply_lfr_batch
+from .registry import (
+    ExtractorSpec,
+    build_extractor,
+    list_extractors,
+    register_extractor,
+)
 from .spec import FeatureSpec
 from .streaming import BatchedStreamingFeatureExtractor
+from .whisper import batched_whisper_logmel
 
 __all__ = [
     "FeatureConfig",
     "FeatureSpec",
     "apply_lfr_batch",
+    "ExtractorSpec",
+    "register_extractor",
+    "build_extractor",
+    "list_extractors",
+    "batched_fbank",
+    "batched_mfcc",
+    "batched_whisper_logmel",
     "fbank_batch",
     "mfcc_batch",
     "extract_features_batch",

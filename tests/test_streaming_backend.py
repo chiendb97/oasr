@@ -313,3 +313,62 @@ def test_paged_backend_gates_capacity_exhausted_stream():
     results = backend.forward_step([req])
     assert results == {}
     assert req.cache_exhausted is True
+
+
+class TestOfflineModeSkipsTheStreamingBackend:
+    """``service_mode="offline"`` must not build the paged backend (H13).
+
+    ``service_mode`` pins the engine to one executor for its lifetime and rejects
+    mismatched requests at admission, so an offline engine can never reach a
+    streaming forward — yet ``ModelRunner`` used to build the real backend anyway,
+    which constructs ``BlockPool`` + ``AttentionCacheManager`` + ``CnnCacheManager``
+    (~0.4 GB of VRAM at the defaults) and holds them for the process lifetime.  That
+    lands on exactly the offline / speech-LLM deployments where VRAM is tightest.
+    """
+
+    def _spy(self, monkeypatch):
+        from oasr.engine import model_runner as mr
+
+        seen = {}
+
+        def _fake_build(kind, model, config, cache_config, **kw):
+            seen["kind"] = kind
+            seen["cache_config"] = cache_config
+            return SimpleNamespace(decoding_window=0, stride=0)
+
+        monkeypatch.setattr(mr, "build_streaming_backend", _fake_build)
+        return mr, seen
+
+    def _model(self, streaming_kind):
+        return SimpleNamespace(encoder=SimpleNamespace(streaming_kind=streaming_kind))
+
+    @pytest.mark.parametrize("encoder_kind", ["paged", "stateful"])
+    def test_offline_mode_selects_the_no_op_backend(self, monkeypatch, encoder_kind):
+        mr, seen = self._spy(monkeypatch)
+        cfg = SimpleNamespace(service_mode="offline")
+        mr.ModelRunner(self._model(encoder_kind), cfg, object())
+        assert seen["kind"] == "none"
+
+    @pytest.mark.parametrize("encoder_kind", ["paged", "stateful"])
+    def test_streaming_mode_still_selects_the_encoders_own_backend(self, monkeypatch, encoder_kind):
+        mr, seen = self._spy(monkeypatch)
+        cfg = SimpleNamespace(service_mode="streaming")
+        mr.ModelRunner(self._model(encoder_kind), cfg, object())
+        assert seen["kind"] == encoder_kind
+
+    def test_offline_only_encoder_is_unchanged(self, monkeypatch):
+        mr, seen = self._spy(monkeypatch)
+        cfg = SimpleNamespace(service_mode="streaming")
+        mr.ModelRunner(self._model("none"), cfg, None)
+        assert seen["kind"] == "none"
+        assert seen["cache_config"] is None
+
+
+def test_no_streaming_backend_accepts_a_missing_cache_config():
+    """An offline-only encoder reports ``cache_spec is None``, so the engine has no
+    ``CacheConfig`` to hand down — the placeholder backend must take that."""
+    backend = build_streaming_backend("none", object(), object(), None)
+    assert backend.decoding_window == 0
+    assert backend.stride == 0
+    with pytest.raises(NotImplementedError, match="does not support streaming"):
+        backend.forward_step([])

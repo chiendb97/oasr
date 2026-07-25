@@ -204,6 +204,18 @@ class ZipformerEncoder(BaseEncoder):
 class ZipformerModel(BaseAsrModel):
     """Zipformer + CTC head (icefall ``egs/librispeech/ASR/zipformer``, ``--use-ctc 1``)."""
 
+    @property
+    def default_decode_type(self) -> str:
+        return "ctc"
+
+    @property
+    def capabilities(self) -> frozenset:
+        """Declared, not derived: the conformance test in
+        ``tests/test_model_contract.py`` checks every registered architecture's
+        advertised capabilities against ``oasr.models.interfaces.CAPABILITIES``,
+        and can only do that without building the model when it is a constant."""
+        return frozenset({"ctc"})
+
     def __init__(self, config: ZipformerModelConfig):
         super().__init__()
         self.config = config

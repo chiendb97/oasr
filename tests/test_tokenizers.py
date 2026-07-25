@@ -151,3 +151,60 @@ class TestHuggingFace:
         assert tok.encode("hello world") == [2, 3]
         assert tok.decode([2, 3]) == "hello world"
         assert tok.vocab_size == 4
+
+
+# ---------------------------------------------------------------------------
+# Registry-wide contract (T1 / T2)
+# ---------------------------------------------------------------------------
+
+
+class TestTokenizerContract:
+    """Properties every registered kind must hold, checked over the registry.
+
+    Pure metadata + a symbol-table instance: no optional deps, no checkpoints, so
+    this runs everywhere.  Instance-level behaviour for the dependency-bearing
+    kinds is covered by the per-kind tests above.
+    """
+
+    def test_registry_has_the_documented_kinds(self):
+        from oasr.tokenizers import list_tokenizers
+
+        assert set(list_tokenizers()) == {
+            "symbol_table",
+            "sentencepiece",
+            "huggingface",
+            "whisper",
+            "funasr_char",
+        }
+
+    def test_supports_encode_is_declared_per_kind(self):
+        """``hasattr(tok, "encode")`` cannot answer this — ``encode`` is abstract
+        on the ABC, so it is always present even where it raises."""
+        from oasr.tokenizers import SymbolTableTokenizer
+        from oasr.tokenizers.base import Tokenizer
+
+        assert Tokenizer.supports_encode is True  # opt-out, not opt-in
+        assert SymbolTableTokenizer.supports_encode is False
+        assert hasattr(SymbolTableTokenizer, "encode"), "the misleading attribute is still there"
+
+    def test_decode_only_kind_raises_from_encode(self, tmp_path):
+        table = tmp_path / "units.txt"
+        table.write_text("<blank> 0\n<unk> 1\n<sos/eos> 2\nhi 3\n")
+        tok = SymbolTableTokenizer(str(table))
+        assert not tok.supports_encode
+        with pytest.raises(NotImplementedError):
+            tok.encode("hi")
+
+    def test_special_ids_are_what_decode_strips(self, tmp_path):
+        """The contract: filtering by ``special_ids`` yields what decode keeps."""
+        table = tmp_path / "units.txt"
+        table.write_text("<blank> 0\n<unk> 1\n<sos/eos> 2\n▁he 3\nllo 4\n")
+        tok = SymbolTableTokenizer(str(table))
+        ids = [0, 3, 4, 2, 1]
+        assert tok.decode(ids) == tok.decode([i for i in ids if i not in tok.special_ids])
+
+    def test_vocab_size_is_stable_and_cheap(self, tmp_path):
+        table = tmp_path / "units.txt"
+        table.write_text("\n".join(f"p{i} {i}" for i in range(64)))
+        tok = SymbolTableTokenizer(str(table))
+        assert tok.vocab_size == 64 == tok.vocab_size  # repeat reads agree

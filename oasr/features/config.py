@@ -86,11 +86,13 @@ class FeatureConfig:
     whisper_chunk_seconds: float = 30.0
 
     def __post_init__(self) -> None:
-        if self.feature_type not in ("fbank", "mfcc", "whisper_logmel"):
-            raise ValueError(
-                f"feature_type must be 'fbank', 'mfcc', or 'whisper_logmel', "
-                f"got {self.feature_type!r}"
-            )
+        # Validated against the extractor registry, so registering an out-of-tree
+        # frontend makes its ``feature_type`` legal without editing this list.
+        from .registry import list_extractors
+
+        kinds = list_extractors()
+        if self.feature_type not in kinds:
+            raise ValueError(f"feature_type must be one of {kinds}, got {self.feature_type!r}")
         if self.backend not in ("torchaudio", "kaldifeat"):
             raise ValueError(f"backend must be 'torchaudio' or 'kaldifeat', got {self.backend!r}")
         if self.sample_rate <= 0:
@@ -130,16 +132,27 @@ class FeatureConfig:
     def fixed_window_seconds(self) -> Optional[float]:
         """Audio window this frontend pads/trims every utterance to, if any.
 
-        ``None`` for the Kaldi frontends, whose cost tracks the real utterance
-        length.  ``whisper_logmel`` returns :attr:`whisper_chunk_seconds`: every
+        Declared by the registered extractor
+        (:attr:`~oasr.features.ExtractorSpec.window_seconds_attr`), not by a name
+        check here.  ``None`` for the Kaldi frontends, whose cost tracks the real
+        utterance length.  ``whisper_logmel`` resolves to :attr:`whisper_chunk_seconds`: every
         row is padded *and trimmed* to that window, so (a) audio beyond it would
         be silently dropped — the engine rejects it at admission instead — and
         (b) per-row encoder cost is **constant**, which the batching policies
         need to know rather than inferring cost from frame counts.
         """
-        if self.feature_type == "whisper_logmel":
-            return float(self.whisper_chunk_seconds)
-        return None
+        from .registry import build_extractor
+
+        try:
+            spec = build_extractor(self)
+        except NotImplementedError:
+            # An unregistered ``feature_type`` is caught where it matters (the
+            # engine resolves an extractor at construction).  A bare config object
+            # makes no window claim.
+            return None
+        if spec.window_seconds_attr is None:
+            return None
+        return float(getattr(self, spec.window_seconds_attr))
 
     @property
     def fixed_window_frames(self) -> Optional[int]:

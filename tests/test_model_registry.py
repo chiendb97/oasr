@@ -44,8 +44,10 @@ class TestRegistry:
         # WeNet dirs are identified by train.yaml; default fallback is conformer.
         (tmp_path / "train.yaml").write_text("encoder: conformer\n")
         assert resolve_architecture(tmp_path) == "conformer"
-        with pytest.warns(DeprecationWarning, match="falling back"):
-            assert resolve_architecture(tmp_path / "missing") == "conformer"  # fallback
+        # An unrecognized dir is now refused instead of being guessed as conformer:
+        # the guess used to surface as a shape error deep inside weight loading.
+        with pytest.raises(ValueError, match="No registered converter recognized"):
+            resolve_architecture(tmp_path / "missing")
 
     def test_resolve_architecture_explicit_override(self, tmp_path):
         # The override wins with no sniffing, and is validated eagerly.
@@ -53,8 +55,9 @@ class TestRegistry:
         with pytest.raises(KeyError):
             resolve_architecture(tmp_path, architecture="does-not-exist")
 
-    def test_resolve_architecture_ambiguity_raises(self, tmp_path):
-        (tmp_path / "train.yaml").write_text("encoder: conformer\n")
+    @staticmethod
+    def _always_detects(specificity=None):
+        """A converter that claims every directory, at a chosen specificity."""
 
         class AlwaysDetects:
             def detect(self, ckpt_dir):
@@ -69,19 +72,106 @@ class TestRegistry:
             def load_state_dict(self, ckpt_dir, checkpoint_name, map_location):
                 return {}
 
+        if specificity is not None:
+            AlwaysDetects.detect_specificity = specificity
+        return AlwaysDetects()
+
+    def _with_greedy(self, converter):
+        """Register ``converter`` as a throwaway architecture, then clean up."""
+        from contextlib import contextmanager
+
         from oasr.models import registry as R
 
-        register_model(
-            "greedy-test-arch",
-            model_cls=ConformerModel,
-            config_cls=ConformerModelConfig,
-            converter=AlwaysDetects(),
-        )
-        try:
+        @contextmanager
+        def _ctx():
+            register_model(
+                "greedy-test-arch",
+                model_cls=ConformerModel,
+                config_cls=ConformerModelConfig,
+                converter=converter,
+            )
+            try:
+                yield
+            finally:
+                del R._REGISTRY["greedy-test-arch"]
+
+        return _ctx()
+
+    def test_resolve_architecture_ambiguity_raises(self, tmp_path):
+        """A **tie** at the top specificity is still an error.
+
+        Note what changed: two matches at *different* specificities are no longer
+        ambiguous (see the next test), because that is the normal case — a FunASR
+        dir also satisfies icefall's filename rule.  Only an unresolvable tie is.
+        """
+        from oasr.models.registry import DETECT_NAMED_CONFIG
+
+        (tmp_path / "train.yaml").write_text("encoder: conformer\n")  # conformer matches
+        with self._with_greedy(self._always_detects(DETECT_NAMED_CONFIG)):
             with pytest.raises(ValueError, match="Ambiguous checkpoint format"):
                 resolve_architecture(tmp_path)
-        finally:
-            del R._REGISTRY["greedy-test-arch"]
+
+    def test_more_specific_detect_wins_over_a_weaker_one(self, tmp_path):
+        """Ranking replaced the negative guards that used to live inside
+        ``IcefallConverter.detect`` (``return False`` if ``train.yaml`` exists)."""
+        from oasr.models.registry import DETECT_ASSET_LAYOUT
+
+        (tmp_path / "train.yaml").write_text("encoder: conformer\n")
+        with self._with_greedy(self._always_detects(DETECT_ASSET_LAYOUT)):
+            # conformer declares DETECT_NAMED_CONFIG (20) > 10 — no ambiguity.
+            assert resolve_architecture(tmp_path) == "conformer"
+
+    def test_a_converter_declaring_nothing_gets_the_weakest_level(self, tmp_path):
+        (tmp_path / "train.yaml").write_text("encoder: conformer\n")
+        with self._with_greedy(self._always_detects()):  # no detect_specificity
+            assert resolve_architecture(tmp_path) == "conformer"
+
+    def test_specificity_levels_are_ordered(self):
+        from oasr.models.registry import (
+            DETECT_ASSET_LAYOUT,
+            DETECT_KEYED_VALUE,
+            DETECT_NAMED_CONFIG,
+        )
+
+        assert DETECT_ASSET_LAYOUT < DETECT_NAMED_CONFIG < DETECT_KEYED_VALUE
+
+    def test_every_builtin_converter_declares_its_specificity(self):
+        """A converter that forgets to declare falls back to the weakest level,
+        which would silently lose to anything — make the omission visible."""
+        from oasr.models.registry import get_model_entry, list_models
+
+        for arch in list_models():
+            converter = get_model_entry(arch).converter
+            assert hasattr(converter, "detect_specificity"), (
+                f"{arch}'s converter does not declare detect_specificity; it would "
+                "default to the weakest level and lose every contested directory"
+            )
+
+    def test_icefall_detect_declares_no_negative_guards(self, tmp_path):
+        """The regression this replaces: FunASR / WeNet markers hardcoded inside
+        *icefall's* detector, so adding a format meant editing an unrelated file.
+
+        Both dirs still resolve correctly — now because the other converter's claim
+        is more specific, not because ``IcefallConverter`` knows about it."""
+        import torch
+
+        from oasr.models.registry import get_model_entry
+
+        icefall = get_model_entry("zipformer").converter
+
+        funasr = tmp_path / "funasr"
+        funasr.mkdir()
+        (funasr / "config.yaml").write_text("model: Paraformer\n")
+        torch.save({}, funasr / "model.pt")  # also an icefall-conventional name
+        assert icefall.detect(funasr) is True, "icefall's own rule still matches"
+        assert resolve_architecture(funasr) == "paraformer", "but the specific one wins"
+
+        wenet = tmp_path / "wenet"
+        wenet.mkdir()
+        (wenet / "train.yaml").write_text("encoder: conformer\n")
+        (wenet / "tokens.txt").write_text("<blank> 0\n")  # an icefall asset marker
+        assert icefall.detect(wenet) is True
+        assert resolve_architecture(wenet) == "conformer"
 
     def test_icefall_detect_tightened(self, tmp_path):
         import torch
@@ -90,7 +180,7 @@ class TestRegistry:
         loose = tmp_path / "loose"
         loose.mkdir()
         torch.save({}, loose / "whatever.pt")
-        with pytest.warns(DeprecationWarning):
+        with pytest.raises(ValueError, match="No registered converter recognized"):
             resolve_architecture(loose)
 
         # Conventional icefall layouts still detect.

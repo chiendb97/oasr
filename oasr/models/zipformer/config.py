@@ -11,9 +11,9 @@ of truth and are overridable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Any, ClassVar, Mapping, Optional, Tuple
 
-from ..base import BaseModelConfig, CacheSpec
+from ..base import BaseModelConfig, CacheSpec, coerce_config
 from .encoder import _to_tuple
 
 
@@ -78,13 +78,11 @@ class ZipformerModelConfig(BaseModelConfig):
             conv_kernel_size=1,
         )
 
-    @classmethod
-    def from_dict(cls, d: dict) -> "ZipformerModelConfig":
-        """Build from a dict (e.g. icefall args). Unknown keys are ignored."""
-        encoder_dict = d.get("encoder", d)
-        fields = {f for f in ZipformerEncoderConfig.__dataclass_fields__}
-        encoder = ZipformerEncoderConfig(
-            **{k: tuple(v) if isinstance(v, list) else v
-               for k, v in encoder_dict.items() if k in fields}
-        )
-        return cls(encoder=encoder, vocab_size=d.get("vocab_size", 500))
+    # icefall args arrive **flat**, so ``encoder`` may be either nested under an
+    # ``"encoder"`` key or spread across the top level.  The many
+    # ``Tuple[int, ...]`` fields need no special handling any more: the inherited
+    # reader restores tuples from the declared type, replacing the ad-hoc
+    # ``tuple(v) if isinstance(v, list) else v``.
+    _from_dict_overrides: ClassVar[Mapping[str, Any]] = {
+        "encoder": lambda d: coerce_config(ZipformerEncoderConfig, d.get("encoder", d)),
+    }

@@ -51,8 +51,3 @@ class ParaformerModelConfig(BaseModelConfig):
     blank_id: int = 0
     sos_id: int = 1
     eos_id: int = 2
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "ParaformerModelConfig":
-        known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in d.items() if k in known})

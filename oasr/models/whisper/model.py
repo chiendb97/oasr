@@ -132,14 +132,6 @@ class WhisperEncoder(BaseEncoder):
         return self._cfg.encoder_layers
 
     @property
-    def n_kv_head(self) -> int:
-        return self._cfg.encoder_attention_heads
-
-    @property
-    def head_dim(self) -> int:
-        return self._cfg.head_dim
-
-    @property
     def output_size(self) -> int:
         return self._cfg.d_model
 
@@ -273,6 +265,18 @@ class WhisperDecoder(BaseDecoder):
 
 class WhisperModel(BaseAsrModel):
     """Whisper for OASR: offline AED decoding via the incremental protocol."""
+
+    @property
+    def default_decode_type(self) -> str:
+        return "aed"
+
+    @property
+    def capabilities(self) -> frozenset:
+        """Declared, not derived: the conformance test in
+        ``tests/test_model_contract.py`` checks every registered architecture's
+        advertised capabilities against ``oasr.models.interfaces.CAPABILITIES``,
+        and can only do that without building the model when it is a constant."""
+        return frozenset({"aed"})
 
     def __init__(self, config: WhisperModelConfig) -> None:
         super().__init__()

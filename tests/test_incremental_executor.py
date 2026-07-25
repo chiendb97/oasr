@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from oasr.engine.decode.base import DecodeStrategy
-from oasr.engine.executor.offline import OfflineExecutor
+from oasr.engine.executor.offline import _MAX_SKIPPED_ADMITS, OfflineExecutor
 from oasr.engine.generation import StepBudget
 from oasr.engine.request import Request, RequestOutput, RequestState
 
@@ -97,8 +97,9 @@ class FakeScheduler:
     def add_request(self, req):
         self.waiting.append(req)
 
-    def schedule_offline(self):
-        batch, self.waiting = self.waiting, []
+    def schedule_offline(self, limit=None):
+        cap = len(self.waiting) if limit is None else max(0, int(limit))
+        batch, self.waiting = self.waiting[:cap], self.waiting[cap:]
         return batch
 
     def split_offline_batch(self, batch):
@@ -162,6 +163,56 @@ def _make_executor(
         max_decode_slots=slots,
         decode_admit_window_ms=admit_window_ms,
         max_batch_size=max_batch_size,
+    )
+    return ex, strat
+
+
+class OneShotStrategy(DecodeStrategy):
+    """Frame-synchronous stand-in: decodes a whole batch in one tick, never parks."""
+
+    decode_type = "ctc"
+    consumes = "log_probs"
+
+    def decode_offline(self, enc_out, enc_lengths):
+        return [
+            RequestOutput(request_id="", text="x", tokens=[[1]], finished=True)
+            for _ in range(enc_out.shape[0])
+        ]
+
+    def decode_streaming_batch(self, requests, enc_out_map):
+        raise NotImplementedError
+
+    def decode_streaming_chunk(self, request, enc_out):
+        raise NotImplementedError
+
+    def finalize(self, request):
+        raise NotImplementedError
+
+
+class LogProbRunner(FakeModelRunner):
+    def forward_offline(self, features, lengths):
+        return torch.zeros(features.shape[0], 2, 5), lengths
+
+
+def _stub_ctc_model():
+    """Minimal object satisfying CAPABILITIES["ctc"] (head + forward_offline)."""
+    return SimpleNamespace(head=lambda *a: None, forward_offline=lambda *a: None)
+
+
+def _make_one_shot_executor(**kwargs):
+    """Executor driving a frame-synchronous strategy (no pending pool)."""
+    strat = OneShotStrategy(
+        SimpleNamespace(max_new_tokens=8),
+        SimpleNamespace(detokenize=lambda ids: ""),
+        _stub_ctc_model(),
+    )
+    ex = OfflineExecutor(
+        scheduler=FakeScheduler(),
+        input_processor=FakeInputProcessor(),
+        model_runner=LogProbRunner(),
+        output_processor=FakeOutputProcessor(strat),
+        device=torch.device("cpu"),
+        **kwargs,
     )
     return ex, strat
 
@@ -300,36 +351,7 @@ class TestShutdown:
 
 class TestOneShotUnaffected:
     def test_one_shot_strategy_never_parks(self):
-        class OneShot(DecodeStrategy):
-            decode_type = "ctc"
-            consumes = "log_probs"
-
-            def decode_offline(self, enc_out, enc_lengths):
-                return [
-                    RequestOutput(request_id="", text="x", tokens=[], finished=True)
-                    for _ in range(enc_out.shape[0])
-                ]
-
-            def decode_streaming_batch(self, requests, enc_out_map):
-                raise NotImplementedError
-
-            def decode_streaming_chunk(self, request, enc_out):
-                raise NotImplementedError
-
-            def finalize(self, request):
-                raise NotImplementedError
-
-        class LogProbRunner(FakeModelRunner):
-            def forward_offline(self, features, lengths):
-                return torch.zeros(features.shape[0], 2, 5), lengths
-
-        ex = OfflineExecutor(
-            scheduler=FakeScheduler(),
-            input_processor=FakeInputProcessor(),
-            model_runner=LogProbRunner(),
-            output_processor=FakeOutputProcessor(OneShot()),
-            device=torch.device("cpu"),
-        )
+        ex, _ = _make_one_shot_executor()
         req = _admit(ex, "a")
         outs = ex.step()
         assert len(outs) == 1 and outs[0].finished and outs[0].request_id == "a"
@@ -622,38 +644,73 @@ class TestArAdmissionWindow:
         so holding them back would be pure added latency.
         """
 
-        class OneShot(DecodeStrategy):
-            decode_type = "ctc"
-            consumes = "log_probs"
-
-            def decode_offline(self, enc_out, enc_lengths):
-                return [
-                    RequestOutput(request_id="", text="x", tokens=[[1]], finished=True)
-                    for _ in range(enc_out.shape[0])
-                ]
-
-            def decode_streaming_batch(self, requests, enc_out_map):
-                raise NotImplementedError
-
-            def decode_streaming_chunk(self, request, enc_out):
-                raise NotImplementedError
-
-            def finalize(self, request):
-                raise NotImplementedError
-
-        class LogProbRunner(FakeModelRunner):
-            def forward_offline(self, features, lengths):
-                return torch.zeros(features.shape[0], 2, 5), lengths
-
-        ex = OfflineExecutor(
-            scheduler=FakeScheduler(),
-            input_processor=FakeInputProcessor(),
-            model_runner=LogProbRunner(),
-            output_processor=FakeOutputProcessor(OneShot()),
-            device=torch.device("cpu"),
-            decode_admit_window_ms=10_000.0,  # would stall an AR strategy
-            max_batch_size=8,
-        )
+        # A window that would stall an AR strategy indefinitely.
+        ex, _ = _make_one_shot_executor(decode_admit_window_ms=10_000.0, max_batch_size=8)
         _admit(ex, "a")
         outs = ex.step()  # admitted and finalised despite the window
         assert [o.request_id for o in outs] == ["a"]
+
+
+class TestDecodeSlotCap:
+    """``max_decode_slots`` must be a hard cap, not a soft gate (C3).
+
+    ``_admission_open`` only answers "is there *a* free slot".  Without a limit on
+    the selection itself, a tick with one slot free still pulled a full
+    ``max_batch_size`` batch and prefilled all of it — overshooting the cap by up
+    to ``max_batch_size - 1`` requests' worth of preallocated decoder KV.  That is
+    an OOM path, not a slowdown.
+    """
+
+    def test_batch_is_capped_at_the_free_slots(self):
+        ex, strat = _make_executor({f"r{i}": 50 for i in range(6)}, slots=4, steps_per_tick=1)
+        for i in range(6):
+            _admit(ex, f"r{i}")
+        ex.step()  # first tick: 4 slots free → prefill exactly 4
+        assert ex.num_running() == 4
+        assert ex.num_waiting() == 2, "the surplus must stay queued, not be prefilled"
+
+    def test_partially_full_pool_admits_only_the_remainder(self):
+        ex, strat = _make_executor({f"r{i}": 50 for i in range(5)}, slots=3, steps_per_tick=1)
+        _admit(ex, "r0")
+        ex.step()  # 1 in flight, 2 slots left
+        for i in (1, 2, 3, 4):
+            _admit(ex, f"r{i}")
+        # Advance until a tick admits again (budget-spent ticks defer prefill).
+        for _ in range(_MAX_SKIPPED_ADMITS + 2):
+            ex.step()
+            if ex.num_running() > 1:
+                break
+        assert ex.num_running() == 3, f"pool exceeded max_decode_slots: {ex.num_running()}"
+
+    def test_unlimited_slots_are_bounded_by_max_batch_size_only(self):
+        ex, strat = _make_executor({f"r{i}": 2 for i in range(4)}, slots=None, steps_per_tick=8)
+        for i in range(4):
+            _admit(ex, f"r{i}")
+        ex.step()
+        assert ex.num_running() == 4  # no slot cap → the whole batch prefills
+
+    def test_one_shot_strategies_are_not_slot_limited(self):
+        """A frame-synchronous family finalises within its tick and holds no slot."""
+        ex, _ = _make_one_shot_executor(max_decode_slots=1)
+        assert ex._admission_limit() is None  # noqa: SLF001
+
+
+class TestPrefillRejection:
+    """A prefill OOM must reject its own batch, not the whole tick (C3)."""
+
+    def test_oom_during_prefill_rejects_the_batch(self):
+        ex, strat = _make_executor({"a": 5, "b": 5}, steps_per_tick=4)
+
+        def _boom(requests, enc_out, enc_lengths):
+            raise torch.cuda.OutOfMemoryError("simulated")
+
+        strat.begin_offline = _boom
+        ra, rb = _admit(ex, "a"), _admit(ex, "b")
+        outs = ex.step()
+
+        assert sorted(o.request_id for o in outs) == ["a", "b"]
+        assert all(o.finished and o.finish_reason == "error" and o.text == "" for o in outs)
+        assert ra.state == RequestState.FINISHED and rb.state == RequestState.FINISHED
+        # Nothing parked, so the next tick is clean rather than re-raising.
+        assert ex.num_running() == 0 and not ex.has_pending()
+        assert ex.step() == []

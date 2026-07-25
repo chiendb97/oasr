@@ -57,25 +57,20 @@ class LlmDecodeStrategy(IncrementalArStrategy):
         model: "BaseAsrModel" = None,
     ) -> None:
         super().__init__(config, detok, model)
-        decoder = getattr(model, "decoder", None) if model is not None else None
-        mcfg = getattr(model, "config", None)
-        if (
-            decoder is None
-            or not hasattr(decoder, "prefill")
-            or not hasattr(decoder, "embed_tokens")
-            or not hasattr(mcfg, "prompt_prefix")
-        ):
-            raise ValueError(
-                "decode_method='llm' needs a speech-LLM model whose decoder "
-                "exposes the batched incremental surface (prefill/step/select) "
-                "plus prompt-template config — e.g. the 'speech_llm' architecture."
-            )
+        # Model-surface validation lives in ``build_decode_strategy`` via
+        # ``oasr.models.interfaces.CAPABILITIES["llm"]`` — one table, one message.
+        mcfg = model.config
         tokenizer = detok.tokenizer
-        if tokenizer is None or not hasattr(tokenizer, "encode"):
+        # ``hasattr(tokenizer, "encode")`` cannot answer this: ``encode`` is
+        # abstract on ``Tokenizer``, so it is always present — and the
+        # symbol-table kind (every WeNet/icefall checkpoint) raises from it.
+        if tokenizer is None or not tokenizer.supports_encode:
             raise ValueError(
-                "decode_method='llm' needs the checkpoint's tokenizer to encode "
-                "the prompt template; the loaded checkpoint carries no usable "
-                "TokenizerSpec (install `tokenizers` / re-convert the checkpoint)."
+                "decode_method='llm' needs a tokenizer that can *encode* the "
+                "prompt template; this checkpoint's tokenizer "
+                f"({type(tokenizer).__name__ if tokenizer else None}) is "
+                "decode-only. Re-convert the checkpoint with a tokenizer spec "
+                "that carries the real vocabulary (huggingface / sentencepiece)."
             )
         self._mcfg = mcfg
         self._tokenizer = tokenizer

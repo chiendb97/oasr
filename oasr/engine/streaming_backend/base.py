@@ -110,7 +110,7 @@ def build_streaming_backend(
     streaming_kind: str,
     model: "BaseAsrModel",
     config: "EngineConfig",
-    cache_config: "CacheConfig",
+    cache_config: "Optional[CacheConfig]",
     *,
     graph_pool=None,
     consumes: str = "log_probs",

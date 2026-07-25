@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Mapping, Optional, Tuple
 
 import torch
 import yaml
@@ -30,6 +30,7 @@ import yaml
 from oasr.layers.norm import GlobalCMVN
 
 from ..decoders.transformer_decoder import TransformerDecoderConfig
+from ..registry import DETECT_NAMED_CONFIG
 from .config import ConformerEncoderConfig, ConformerModelConfig
 from .model import ConformerModel
 
@@ -146,6 +147,10 @@ class WenetConverter:
             "unavailable for this checkpoint"
         ),
     }
+
+    #: ``train.yaml`` identifies WeNet, not a specific architecture, so this claim outranks a weaker one
+    #: (see :func:`oasr.models.registry.resolve_architecture`).
+    detect_specificity: ClassVar[int] = DETECT_NAMED_CONFIG
 
     def detect(self, ckpt_dir: Path) -> bool:
         """A WeNet experiment dir is identified by its ``train.yaml``."""

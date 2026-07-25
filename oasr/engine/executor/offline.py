@@ -19,6 +19,7 @@ decode + finalise tail is identical for both.
 
 from __future__ import annotations
 
+import logging
 from typing import ClassVar, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -30,6 +31,8 @@ from ..decode.base import EncodeOutput
 from ..request import Request, RequestOutput, RequestState
 from ..scheduler import Scheduler
 from .base import Executor
+
+logger = logging.getLogger(__name__)
 
 #: Consecutive ticks that may skip admission because the decode budget was spent.
 #: Bounds how long a saturated decode pool can defer new prefills; past this the
@@ -172,9 +175,46 @@ class OfflineExecutor(Executor):
         if strategy.incremental and strategy.has_pending():
             outputs, budget_spent = self._advance_pending()
         if self._may_admit(budget_spent) and self._batch_wide_enough() and self._admission_open():
-            batch = self._scheduler.schedule_offline()
+            # Cap the batch at the decode slots actually free.  ``_admission_open``
+            # only answers "is there *a* slot"; without this limit a tick with one
+            # free slot would still pull a full ``max_batch_size`` batch and
+            # prefill all of it, overshooting ``max_decode_slots`` by up to
+            # ``max_batch_size - 1`` requests' worth of decoder KV — an OOM path,
+            # not a slowdown, since prefill preallocates per row.
+            batch = self._scheduler.schedule_offline(limit=self._admission_limit())
             outputs.extend(self.run(batch))
         return outputs
+
+    def _reject(self, request: Request, reason: str) -> RequestOutput:
+        """Terminal output for a request the executor could not start.
+
+        Marked ``finished`` with ``finish_reason="error"`` so the caller sees a
+        result instead of waiting on a request that will never run; the serving
+        layer maps the empty transcript + reason onto its error envelope.
+        """
+        request.state = RequestState.FINISHED
+        out = RequestOutput(
+            request_id=request.request_id,
+            text="",
+            tokens=[[]],
+            finished=True,
+            finish_reason="error",
+        )
+        request.output = out
+        logger.debug("rejected request %s: %s", request.request_id, reason)
+        return out
+
+    def _admission_limit(self) -> Optional[int]:
+        """Decode slots free right now; ``None`` for one-shot strategies.
+
+        One-shot families finalise within the tick that admits them, so they hold
+        no slots and are bounded by ``max_batch_size`` alone.
+        """
+        if not self._op.strategy.incremental:
+            return None
+        if self._max_decode_slots is None:
+            return None
+        return max(0, int(self._max_decode_slots) - len(self._pending))
 
     def _batch_wide_enough(self) -> bool:
         """Whether the waiting queue should be prefilled now, or held to widen.
@@ -362,7 +402,24 @@ class OfflineExecutor(Executor):
             # in the pending pool in state RUNNING; ``step()`` drives them via
             # budgeted ``advance`` calls until the strategy finishes each one.
             nvtx_push("offline.prefill")
-            strategy.begin_offline(chunk, enc_out, output_lengths)
+            try:
+                strategy.begin_offline(chunk, enc_out, output_lengths)
+            except torch.cuda.OutOfMemoryError as exc:
+                # Prefill preallocates this micro-batch's decoder KV, so it is
+                # where an over-committed pool actually fails.  Reject *this
+                # batch* with an attributable error rather than letting the
+                # exception escape ``step()`` — the serving dispatcher turns a
+                # failed step into an INTERNAL error for every in-flight
+                # request, so one over-large batch would take down its peers.
+                nvtx_pop()
+                logger.warning(
+                    "decoder-KV prefill ran out of memory for %d request(s); "
+                    "rejecting the batch (lower max_decode_slots / "
+                    "max_new_tokens, or raise the memory budget): %s",
+                    len(chunk),
+                    exc,
+                )
+                return [self._reject(req, "prefill out of memory") for req in chunk]
             for req in chunk:
                 req.state = RequestState.RUNNING
                 self._pending[req.request_id] = req

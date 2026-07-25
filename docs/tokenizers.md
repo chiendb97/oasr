@@ -51,3 +51,24 @@ behaviour.  Decode strategies reach the tokenizer via `detok.tokenizer`
 Per-request n-best transcripts (`DecodingOptions.n_best` /
 `RequestOutput.nbest_texts`) are detokenized through the same tokenizer by
 the executors on final outputs.
+
+## Which direction each kind supports
+
+`decode` is universal; `encode` is not.  A `symbol_table` tokenizer holds only an
+id→piece map, so it can render output but cannot turn a prompt back into ids —
+which is why `Tokenizer.supports_encode` exists.  Test **that**, never
+`hasattr(tok, "encode")`: `encode` is abstract on the ABC, so the attribute is
+always present even on the kinds that raise from it.
+
+| kind | `supports_encode` | `special_ids` reports |
+|---|---|---|
+| `symbol_table` | ✗ (decode-only) | `{0, 1, 2}` |
+| `sentencepiece` | ✓ | `{0, 1, 2}` |
+| `huggingface` | ✓ | spec-provided (stripping delegates to `skip_special_tokens`) |
+| `whisper` | ✓ | the whole control block, `eot_id … vocab_size` |
+| `funasr_char` | ✓ | spec-provided |
+
+`special_ids` means exactly *what `decode` strips*, so filtering a hypothesis by it
+yields the tokens `decode` would keep.  Whisper's `decode` drops every id at or
+above `eot_id` (language / task / timestamp markers), so it reports that whole
+range — reporting only `{eot_id}` would let a caller leak control markup.

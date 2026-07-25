@@ -36,6 +36,18 @@ class TransducerModel(BaseAsrModel):
     # harmless no-op for Zipformer front-ends (no matching keys).
     _computed_buffer_suffixes = ("pos_enc.pe",)
 
+    @property
+    def default_decode_type(self) -> str:
+        return "transducer"
+
+    @property
+    def capabilities(self) -> frozenset:
+        """Declared, not derived: the conformance test in
+        ``tests/test_model_contract.py`` checks every registered architecture's
+        advertised capabilities against ``oasr.models.interfaces.CAPABILITIES``,
+        and can only do that without building the model when it is a constant."""
+        return frozenset({"transducer"})
+
     def __init__(
         self,
         encoder: BaseEncoder,

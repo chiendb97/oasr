@@ -38,15 +38,16 @@ class ModelRunner:
         Loaded model already moved to the target device in eval mode.
     config : EngineConfig
         Engine configuration.
-    cache_config : CacheConfig
-        Cache configuration derived from the model.
+    cache_config : CacheConfig or None
+        Cache configuration derived from the model; ``None`` for an offline-only
+        encoder, which has no streaming cache to size.
     """
 
     def __init__(
         self,
         model: BaseAsrModel,
         config: EngineConfig,
-        cache_config: CacheConfig,
+        cache_config: Optional[CacheConfig],
         *,
         graph_pool: Optional[Tuple[int, int]] = None,
         consumes: str = "log_probs",
@@ -58,8 +59,19 @@ class ModelRunner:
         # Pick the streaming runtime from the encoder's declared cache model.
         # ``consumes`` (the active decode strategy's declared input) routes the
         # backend's per-chunk forward: fused head vs. raw hidden states.
+        #
+        # ``service_mode`` pins the engine to one executor for its lifetime and
+        # mismatched requests are rejected at admission, so an offline engine can
+        # never reach a streaming forward — building the real backend would hold the
+        # paged KV pool plus the CNN-cache tensors (~0.4 GB at the defaults) for
+        # nothing, on exactly the offline/LLM deployments where VRAM is tightest
+        # (H13).  ``NoStreamingBackend`` allocates nothing and raises with an
+        # actionable message if a streaming path is somehow reached.
+        streaming_kind = model.encoder.streaming_kind
+        if config.service_mode == "offline":
+            streaming_kind = "none"
         self._streaming_backend: StreamingEncoderBackend = build_streaming_backend(
-            model.encoder.streaming_kind,
+            streaming_kind,
             model,
             config,
             cache_config,

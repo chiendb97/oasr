@@ -20,7 +20,9 @@ One vectorized greedy core (:meth:`_greedy_loop`) serves both paths:
 
 The per-emit row loop is fully vectorized: label windows shift via a masked
 ``torch.cat``, and emitted tokens are collected as per-step snapshots read back
-in one sync at loop end.
+in one sync at loop end.  Loop *control* costs one host sync per iteration (the
+predictor-recompute gate) plus one per ``_TERMINATION_CHECK_STRIDE`` iterations;
+see that constant for why the second one is amortized and the first is not.
 """
 
 from __future__ import annotations
@@ -38,6 +40,40 @@ if TYPE_CHECKING:
 
     from ..config import EngineConfig
     from .detokenize import Detokenizer
+
+
+#: Greedy iterations between host-side termination checks (H7).
+#:
+#: The loop used to sync **twice** per iteration — once on ``active.any()`` to
+#: decide whether to stop, once on ``emit.any()`` to decide whether to recompute
+#: the predictor — so a 400-frame utterance cost ~800+ blocking device→host round
+#: trips.  Checking termination every N iterations instead trades up to N-1 inert
+#: iterations (one joiner call each, mutating nothing) for N-1 fewer syncs.
+#:
+#: 16 is comfortably past the point where the remaining ``emit.any()`` sync
+#: dominates the count, so a larger stride buys nothing measurable while the
+#: worst-case overshoot grows linearly.  Measured on a 12-layer / d=256 /
+#: vocab-500 transducer, fp16, against the two-sync loop — token-identical at
+#: every shape:
+#:
+#: ===============  ==========  ===============  ===============
+#: shape            tokens/fr   syncs (before)   speedup (after)
+#: ===============  ==========  ===============  ===============
+#: B=1  T=400       0.01        807 → 442        1.11x
+#: B=8  T=400       0.04        863 → 459        1.09x
+#: B=32 T=400       0.06        887 → 476        1.09x
+#: B=32 T=400       3.68        4203 → 2244      1.09x
+#: B=32 T=1500      3.75        14953 → 7956     1.05x
+#: ===============  ==========  ===============  ===============
+#:
+#: The review also proposed dropping the ``emit.any()`` sync (recompute the
+#: predictor unconditionally — semantically identical, since a non-emitting row's
+#: window is left untouched by the ``torch.where`` and so reprojects to the same
+#: value).  Measured, that is **regime-dependent and wrong for real audio**: 1.2x
+#: faster when nearly every frame emits, but **0.59x** — a 1.7x regression — on
+#: blank-dominated audio, which is what a trained transducer actually produces.
+#: The branch skips a real predictor forward, not merely a host round trip.
+_TERMINATION_CHECK_STRIDE = 16
 
 
 @dataclass
@@ -63,9 +99,7 @@ class TransducerDecodeStrategy(DecodeStrategy):
         detok: "Detokenizer",
         model: "BaseAsrModel" = None,
     ) -> None:
-        self._config = config
-        self._detok = detok
-        self._model = model
+        super().__init__(config, detok, model)
         # Cap on non-blank emissions per frame (safety against degenerate loops;
         # the same cap is applied uniformly so results are deterministic).
         self._max_sym = int(getattr(config, "transducer_max_sym_per_frame", 10))
@@ -107,34 +141,47 @@ class TransducerDecodeStrategy(DecodeStrategy):
         sym = torch.zeros(B, dtype=torch.long, device=device)
         rows = torch.arange(B, device=device)
         no_emit = torch.full((B,), -1, dtype=torch.long, device=device)
+        zero_sym = torch.zeros_like(sym)
         emitted: List[torch.Tensor] = []  # per-step (B,) token snapshots, -1 = no emit
 
         max_steps = int(T) * (max_sym + 1) + B + 1  # termination safety bound
-        for _ in range(max_steps):
-            active = t < lengths
-            if not bool(active.any()):
+        done = 0
+        while done < max_steps:
+            # Termination is checked once per block rather than per iteration (see
+            # _TERMINATION_CHECK_STRIDE).  Overshooting is inert: once every row
+            # has t >= its length, ``active`` is all-false, so ``emit`` and
+            # ``advance`` are too and nothing mutates — the extra iterations
+            # cost one joiner call each and change no state.
+            for _ in range(min(_TERMINATION_CHECK_STRIDE, max_steps - done)):
+                done += 1
+                active = t < lengths
+
+                enc_t = enc_proj[rows, t.clamp(max=T - 1)]  # (B, J)
+                logits = joiner(enc_t, dec_proj, project_input=False)  # (B, V)
+                tok = logits.argmax(dim=-1)  # (B,)
+
+                is_blank = (tok == blank) | (sym >= max_sym)
+                emit = active & ~is_blank
+                advance = active & is_blank
+
+                # This sync stays: the branch skips a real predictor forward, not
+                # just a host round trip, and dropping it costs more than it saves
+                # on blank-dominated audio (measured below).
+                if bool(emit.any()):
+                    # Shift the emitted label into each emitting row's window; rows
+                    # that didn't emit keep their window, so the batched predictor
+                    # recompute reproduces their previous projection exactly.
+                    shifted = torch.cat([context[:, 1:], tok.unsqueeze(1)], dim=1)
+                    context = torch.where(emit.unsqueeze(1), shifted, context)
+                    dec_proj = joiner.decoder_proj(decoder(context))
+                    emitted.append(torch.where(emit, tok, no_emit))
+                    sym = sym + emit.long()
+
+                t = t + advance.long()
+                sym = torch.where(advance, zero_sym, sym)
+
+            if not bool((t < lengths).any()):
                 break
-
-            enc_t = enc_proj[rows, t.clamp(max=T - 1)]  # (B, J)
-            logits = joiner(enc_t, dec_proj, project_input=False)  # (B, V)
-            tok = logits.argmax(dim=-1)  # (B,)
-
-            is_blank = (tok == blank) | (sym >= max_sym)
-            emit = active & ~is_blank
-            advance = active & is_blank
-
-            if bool(emit.any()):
-                # Shift the emitted label into each emitting row's window; rows
-                # that didn't emit keep their window, so the batched predictor
-                # recompute reproduces their previous projection exactly.
-                shifted = torch.cat([context[:, 1:], tok.unsqueeze(1)], dim=1)
-                context = torch.where(emit.unsqueeze(1), shifted, context)
-                dec_proj = joiner.decoder_proj(decoder(context))
-                emitted.append(torch.where(emit, tok, no_emit))
-                sym = sym + emit.long()
-
-            t = t + advance.long()
-            sym = torch.where(advance, torch.zeros_like(sym), sym)
 
         if emitted:
             # One host readback for the whole loop.
@@ -161,7 +208,6 @@ class TransducerDecodeStrategy(DecodeStrategy):
     def decode_offline(
         self, enc_out: torch.Tensor, enc_lengths: torch.Tensor
     ) -> List[RequestOutput]:
-        assert self._model is not None, "TransducerDecodeStrategy needs the model"
         B = enc_out.size(0)
         context, dec_proj = self._init_state(B, enc_out.device)
         hyps, _, _ = self._greedy_loop(enc_out, enc_lengths, context, dec_proj)
@@ -199,7 +245,6 @@ class TransducerDecodeStrategy(DecodeStrategy):
     def decode_streaming_batch(
         self, requests: List[Request], enc_out_map: Dict[str, torch.Tensor]
     ) -> List[RequestOutput]:
-        assert self._model is not None, "TransducerDecodeStrategy needs the model"
         ready = [r for r in requests if r.request_id in enc_out_map]
         if not ready:
             return []

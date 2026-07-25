@@ -9,9 +9,9 @@ config dataclass) while matching Conformer hyperparameters from WeNet.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, ClassVar, Mapping, Optional
 
-from ..base import BaseModelConfig, CacheSpec
+from ..base import BaseModelConfig, CacheSpec, coerce_config
 from ..decoders.transformer_decoder import TransformerDecoderConfig
 
 
@@ -97,13 +97,15 @@ class ConformerModelConfig(BaseModelConfig):
             conv_kernel_size=conv_kernel,
         )
 
-    @classmethod
-    def from_dict(cls, d: dict) -> ConformerModelConfig:
-        """Build from a dict (e.g. HuggingFace config / native ``oasr_config.json``)."""
-        encoder_dict = d.get("encoder", d)
-        encoder = ConformerEncoderConfig(
-            **{k: v for k, v in encoder_dict.items() if hasattr(ConformerEncoderConfig, k)}
-        )
-        decoder_dict = d.get("decoder")
-        decoder = TransformerDecoderConfig.from_dict(decoder_dict) if decoder_dict else None
-        return cls(encoder=encoder, vocab_size=d.get("vocab_size"), decoder=decoder)
+    # ``encoder`` accepts a **flat** dict as well as a nested one: WeNet-derived
+    # dicts put encoder hyperparameters at the top level.  Everything else —
+    # ``vocab_size``, the optional nested ``decoder`` — is handled by the inherited
+    # type-driven reader.
+    #
+    # This field used to be filtered with ``hasattr(ConformerEncoderConfig, k)``,
+    # which drops any field declared *without* a default (a defaultless dataclass
+    # field is not a class attribute), so such a field silently defaulted itself on
+    # every native round-trip.
+    _from_dict_overrides: ClassVar[Mapping[str, Any]] = {
+        "encoder": lambda d: coerce_config(ConformerEncoderConfig, d.get("encoder", d)),
+    }

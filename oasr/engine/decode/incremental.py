@@ -126,9 +126,7 @@ class IncrementalArStrategy(DecodeStrategy):
         detok: "Detokenizer",
         model: "BaseAsrModel" = None,
     ) -> None:
-        self._config = config
-        self._detok = detok
-        self._model = model
+        super().__init__(config, detok, model)
         self._groups: List[ArGroup] = []
 
     # ------------------------------------------------------------------

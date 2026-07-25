@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Sequence
+from typing import Any, ClassVar, Dict, FrozenSet, List, Sequence
 
 # Historical engine-wide default: <blank>=0, <unk>=1, <sos/eos>=2 are stripped
 # from decoded output.  Kept as the default for spec-less construction so the
@@ -65,7 +65,18 @@ class TokenizerSpec:
 
 
 class Tokenizer(ABC):
-    """Both directions of the text boundary for one checkpoint's vocabulary."""
+    """Both directions of the text boundary for one checkpoint's vocabulary.
+
+    ``decode`` is universal; ``encode`` is not.  A ``symbol_table`` tokenizer
+    (every WeNet checkpoint, most icefall ones) holds only an id→piece map, so it
+    can render output but cannot turn a prompt back into ids.  Callers that need
+    the encode direction — the speech-LLM prompt template, hotword boosting — must
+    test :attr:`supports_encode`, **not** ``hasattr(tok, "encode")``: ``encode`` is
+    abstract here, so the attribute always exists and the check always passes.
+    """
+
+    #: Whether :meth:`encode` is implemented.  ``False`` means decode-only.
+    supports_encode: ClassVar[bool] = True
 
     @property
     @abstractmethod
@@ -75,7 +86,13 @@ class Tokenizer(ABC):
     @property
     @abstractmethod
     def special_ids(self) -> FrozenSet[int]:
-        """Token ids stripped from decoded output (blank / unk / sos-eos / pad)."""
+        """Token ids :meth:`decode` strips from its output.
+
+        The contract is exactly that — *what decode removes* — so a caller can
+        filter a hypothesis itself and get the same tokens ``decode`` would keep.
+        Kinds that delegate stripping to an upstream tokenizer still have to
+        report the ids it will drop.
+        """
         raise NotImplementedError
 
     @abstractmethod

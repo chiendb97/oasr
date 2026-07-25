@@ -12,10 +12,11 @@ Resolution precedence (see ``docs/design/multi_paradigm.md`` §7.1):
 
 1. native OASR format (``oasr_config.json``) — loaded directly, no conversion;
 2. explicit ``architecture=`` override — that converter, no sniffing;
-3. converter ``detect()`` sniffing — exactly one match wins; multiple matches
-   raise (ambiguity), zero matches fall back to ``"conformer"`` with a
-   :class:`DeprecationWarning` (this fallback becomes an error in a future
-   release — pass ``architecture=`` for loosely-structured dirs).
+3. converter ``detect()`` sniffing — every registered converter is probed and
+   the claims are ranked by ``detect_specificity`` (a converter that read the
+   architecture out of a config file outranks one matching filenames only), so
+   the most specific claim wins; a tie at the top raises, and **zero** claims
+   raise too (pass ``architecture=`` for loosely-structured dirs).
 
 Adding a new architecture is a self-contained, three-line registration in the
 architecture's package ``__init__`` (see ``oasr/models/conformer/__init__.py``);
@@ -25,10 +26,20 @@ no engine or registry edits are required.
 from __future__ import annotations
 
 import logging
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Type, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
 
 import torch
 
@@ -71,8 +82,22 @@ class CheckpointConverter(Protocol):
       the capability.
     """
 
+    #: How *specific* this converter's :meth:`detect` is.  When several converters
+    #: claim the same directory the registry keeps only the highest-specificity
+    #: group, so a weak filename-based matcher cannot shadow a converter that read
+    #: the architecture out of a config file.  Use one of the ``DETECT_*``
+    #: constants; the default is the weakest level.
+    detect_specificity: ClassVar[int]
+
     def detect(self, ckpt_dir: Path) -> bool:
-        """Return True if *ckpt_dir* looks like this converter's format."""
+        """Return True if *ckpt_dir* looks like this converter's format.
+
+        Declare only **positive** markers.  Do not add negative guards for other
+        formats ("return False if train.yaml exists") — that puts one format's
+        knowledge inside another's converter, so adding a 7th format means editing
+        an unrelated one.  Set :attr:`detect_specificity` instead and let the
+        registry rank.
+        """
         ...
 
     def build_config(self, ckpt_dir: Path) -> BaseModelConfig: ...
@@ -82,6 +107,25 @@ class CheckpointConverter(Protocol):
     def load_state_dict(
         self, ckpt_dir: Path, checkpoint_name: str, map_location: Any
     ) -> Mapping[str, torch.Tensor]: ...
+
+
+#: ``detect()`` specificity levels, ranked.  A directory can satisfy several
+#: converters at once — a FunASR Paraformer dir carries a ``model.pt`` that looks
+#: like icefall's, a WeNet dir carries a ``final.pt`` — and the right answer is
+#: always the converter that identified the format most precisely.  Ranking
+#: replaced the alternative, which was negative guards ("``return False`` if
+#: ``config.yaml`` exists") living inside an *unrelated* converter.
+#:
+#: ``DETECT_KEYED_VALUE`` — a named config file whose declared field names this
+#: architecture (``config.json: model_type == "whisper"``).  Unambiguous.
+DETECT_KEYED_VALUE = 30
+#: ``DETECT_NAMED_CONFIG`` — the presence of a framework-specific config file
+#: (WeNet's ``train.yaml``).  Identifies the framework, not the architecture.
+DETECT_NAMED_CONFIG = 20
+#: ``DETECT_ASSET_LAYOUT`` — filename / asset conventions only (an ``exp/`` layout,
+#: ``epoch-*.pt``, a ``tokens.txt`` beside the weights).  The weakest signal, and
+#: the default for a converter that declares nothing.
+DETECT_ASSET_LAYOUT = 10
 
 
 @dataclass(frozen=True)
@@ -95,8 +139,9 @@ class ModelEntry:
 
 _REGISTRY: Dict[str, ModelEntry] = {}
 
-# Historical default when no converter claims a checkpoint dir.  Deprecated:
-# scheduled to become a hard error listing registered candidates.
+# The historical default when no converter claimed a checkpoint dir.  No longer
+# used for resolution — kept only so the error message can name what used to
+# happen, since a caller hitting it was very likely relying on the guess.
 _FALLBACK_ARCHITECTURE = "conformer"
 
 
@@ -152,9 +197,14 @@ def resolve_architecture(ckpt_dir: Path, architecture: Optional[str] = None) -> 
 
     Native checkpoints answer from ``oasr_config.json``; an explicit
     *architecture* skips sniffing; otherwise every registered converter's
-    :meth:`CheckpointConverter.detect` is probed — exactly one claim wins,
-    multiple claims raise ``ValueError`` (pass ``architecture=``), and zero
-    claims fall back to ``"conformer"`` with a :class:`DeprecationWarning`.
+    :meth:`CheckpointConverter.detect` is probed and the claims are **ranked** by
+    ``detect_specificity`` — the most specific claim wins, a tie at the top raises
+    ``ValueError``, and no claim at all raises too (pass ``architecture=``).
+
+    Ranking is what lets each ``detect()`` state only positive markers: several
+    formats share filenames (a FunASR dir carries a ``model.pt``, a WeNet dir a
+    ``final.pt``), which previously forced *one* converter to carry ``return False``
+    guards naming the *others*' markers.
     """
     _ensure_builtins()
     path = Path(ckpt_dir)
@@ -174,29 +224,47 @@ def resolve_architecture(ckpt_dir: Path, architecture: Optional[str] = None) -> 
         get_model_entry(architecture)  # validate eagerly
         return architecture
 
-    matches = []
+    matches: List[Tuple[int, str]] = []
     for name, entry in _REGISTRY.items():
         try:
             if entry.converter.detect(path):
-                matches.append(name)
+                specificity = int(
+                    getattr(entry.converter, "detect_specificity", DETECT_ASSET_LAYOUT)
+                )
+                matches.append((specificity, name))
         except Exception:  # pragma: no cover - detection must never hard-fail
             logger.debug("detect() raised for %r", name, exc_info=True)
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
+
+    if matches:
+        # Several converters legitimately claim one directory (a FunASR dir holds a
+        # ``model.pt`` that also satisfies icefall's asset rule).  Keep the most
+        # specific claim; only a genuine tie is ambiguous.
+        best = max(s for s, _ in matches)
+        winners = sorted(name for s, name in matches if s == best)
+        if len(winners) == 1:
+            if len(matches) > 1:
+                logger.debug(
+                    "%s detected as %r (specificity %d); also matched by %s",
+                    path,
+                    winners[0],
+                    best,
+                    sorted(n for s, n in matches if s != best),
+                )
+            return winners[0]
         raise ValueError(
-            f"Ambiguous checkpoint format at {path}: detected by {sorted(matches)}. "
-            "Pass architecture=<name> to disambiguate."
+            f"Ambiguous checkpoint format at {path}: detected by {winners} at the "
+            f"same specificity ({best}). Pass architecture=<name> to disambiguate."
         )
-    warnings.warn(
-        f"No registered converter detected the format of {path}; falling back to "
-        f"architecture '{_FALLBACK_ARCHITECTURE}'. This fallback is deprecated and "
-        "will become an error — pass architecture=<name> explicitly "
-        f"(registered: {sorted(_REGISTRY)}).",
-        DeprecationWarning,
-        stacklevel=2,
+    raise ValueError(
+        f"No registered converter recognized the checkpoint format at {path}. "
+        f"Pass architecture=<name> explicitly (registered: {sorted(_REGISTRY)}), or "
+        "convert the directory first with `oasr-convert <src> <dst>`.\n"
+        "This used to fall back to "
+        f"architecture={_FALLBACK_ARCHITECTURE!r} with a DeprecationWarning, which "
+        "guessed WeNet/Conformer for anything unrecognized and then failed deep "
+        "inside weight loading with a shape error — the guess is now refused at the "
+        "point where the information is actually missing."
     )
-    return _FALLBACK_ARCHITECTURE
 
 
 def load_checkpoint_bundle(

@@ -5,9 +5,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any, ClassVar, Dict, Mapping
 
-from ..base import BaseModelConfig, CacheSpec
+from ..base import BaseModelConfig, CacheSpec, coerce_config
 from ..conformer.config import ConformerEncoderConfig
 
 
@@ -33,30 +33,23 @@ class TransducerModelConfig(BaseModelConfig):
     def cache_spec(self) -> CacheSpec:
         return self.encoder.cache_spec
 
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "TransducerModelConfig":
-        """Build from a dict (native-format ``oasr_config.json``)."""
-        encoder_type = d.get("encoder_type", "conformer")
-        encoder_dict = d.get("encoder", {})
-        if encoder_type == "zipformer":
-            from ..zipformer.config import ZipformerEncoderConfig
+    # ``encoder: Any`` is genuinely polymorphic — its class is decided by the sibling
+    # ``encoder_type`` key, which no annotation can express — so it is the one field
+    # here that needs a hook.  The flat scalars used to be listed in a hardcoded
+    # ``known`` tuple, a fourth spelling of "filter to known fields" that silently
+    # dropped any field added after it was written; they now come from
+    # ``__dataclass_fields__`` like everywhere else.
+    _from_dict_overrides: ClassVar[Mapping[str, Any]] = {
+        "encoder": lambda d: _encoder_config_from_dict(
+            d.get("encoder_type", "conformer"), d.get("encoder", {})
+        ),
+    }
 
-            fields = set(ZipformerEncoderConfig.__dataclass_fields__)
-            encoder = ZipformerEncoderConfig(
-                **{
-                    k: tuple(v) if isinstance(v, list) else v
-                    for k, v in encoder_dict.items()
-                    if k in fields
-                }
-            )
-        else:
-            fields = set(ConformerEncoderConfig.__dataclass_fields__)
-            encoder = ConformerEncoderConfig(
-                **{k: v for k, v in encoder_dict.items() if k in fields}
-            )
-        known = ("vocab_size", "decoder_dim", "joiner_dim", "context_size", "blank_id")
-        return cls(
-            encoder_type=encoder_type,
-            encoder=encoder,
-            **{k: d[k] for k in known if k in d},
-        )
+
+def _encoder_config_from_dict(encoder_type: str, d: Dict[str, Any]):
+    """Build the acoustic front-end config named by ``encoder_type``."""
+    if encoder_type == "zipformer":
+        from ..zipformer.config import ZipformerEncoderConfig
+
+        return coerce_config(ZipformerEncoderConfig, d)
+    return coerce_config(ConformerEncoderConfig, d)

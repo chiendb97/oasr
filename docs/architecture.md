@@ -2,13 +2,14 @@
 
 OASR's inference engine is built around **one registry per extension axis** so new
 model architectures, decode families, streaming runtimes, batching policies,
-checkpoint formats, and tokenizers plug in by *subclassing a base + registering* —
+checkpoint formats, tokenizers, and feature frontends plug in by *subclassing a base
++ registering* —
 never by editing the engine core. This mirrors the `model_executor` split in
 vLLM / SGLang, adapted to ASR (an acoustic **encoder** feeding a **decode** stage
 that is either non-autoregressive CTC/Paraformer or an autoregressive
 transducer/AED/LLM loop).
 
-## The six seams
+## The seven seams
 
 | Axis | Base class | Registry / builder | Selected by |
 |------|-----------|--------------------|-------------|
@@ -18,6 +19,7 @@ transducer/AED/LLM loop).
 | Streaming runtime | `oasr.engine.streaming_backend.StreamingEncoderBackend` | `oasr.engine.streaming_backend` (`register_streaming_backend`, `build_streaming_backend`) | `model.encoder.streaming_kind` |
 | Batching | `oasr.engine.batching.BatchingPolicy` / `PartitionPolicy` | `oasr.engine.batching` (`register_*_policy`, `build_*_policy`) | `config.schedule_policy` / partition flags |
 | Tokenizer | `oasr.tokenizers.Tokenizer` | `oasr.tokenizers` (`register_tokenizer`, `build_tokenizer`) | converter-emitted `TokenizerSpec.kind` (see `docs/tokenizers.md`) |
+| Feature frontend | `oasr.features.ExtractorSpec` | `oasr.features` (`register_extractor`, `build_extractor`) | `FeatureConfig.feature_type`, materialized from the converter-emitted `FeatureSpec` |
 
 ## Data flow
 
@@ -59,7 +61,14 @@ Request → InputProcessor (fbank) → Scheduler (BatchingPolicy + PartitionPoli
    families the batched incremental surface `prefill` / `step` / `select`
    (see `oasr/models/whisper/model.py` and `oasr/models/speech_llm/llm.py`).
    Transducers compose a `PredictionNetwork` + `Joiner`.
-2. `@register_decode_strategy("foo")` on a `DecodeStrategy`.  Frame-synchronous:
+2. Declare the family's required model surface in
+   `oasr/models/interfaces.py::CAPABILITIES` — dotted attribute paths plus a one-line
+   `why`.  `build_decode_strategy` validates every model against it once, so a
+   checkpoint advertising a capability it cannot serve fails at engine construction
+   naming the missing members, and `tests/test_model_contract.py` checks the table
+   against every registered architecture (built tiny on CPU).  This is the answer to
+   "what must a model implement to support family X".
+3. `@register_decode_strategy("foo")` on a `DecodeStrategy`.  Frame-synchronous:
    implement `decode_offline` (one shot).  Label-synchronous AR: set
    `incremental = True` and implement `begin_offline` / `advance(StepBudget)` /
    `has_pending`.  Call `budget.take()` before every batched decoder step and
@@ -84,6 +93,29 @@ flags.
 **Add a checkpoint format:** implement `CheckpointConverter` (`detect` /
 `build_config` / `build_aux` / `load_state_dict`) + `register_model`;
 `from_pretrained` auto-detects it for both local dirs and HF Hub ids.
+
+**Add a feature frontend** (e.g. raw waveform for wav2vec, an 8 kHz telephony
+recipe):
+1. Write the batch function — `(padded_waveforms (B, T), lengths (B,), FeatureConfig)
+   → (features (B, T', F) fp32, feat_lengths (B,))`.  LFR stacking is **not** part of
+   it: the engine applies `apply_lfr_batch` over any extractor's output.
+2. `register_extractor(ExtractorSpec(kind="my_kind", fn=..., ...))`.  Two declared
+   properties carry real consequences, so set them deliberately:
+   * `supports_streaming=False` if the frontend normalizes over a fixed window and
+     therefore cannot consume a growing buffer — `prepare_streaming` then rejects the
+     request with an actionable message instead of producing wrong features;
+   * `window_seconds_attr="..."` names the `FeatureConfig` field holding that window.
+     `FeatureConfig.fixed_window_seconds`/`_frames` read it, which is what tells the
+     batching policies that **every row costs the same** regardless of its length
+     (otherwise `max_offline_pad_ratio` splits batches to avoid padding waste that
+     does not exist) and lets the engine reject over-long audio at admission rather
+     than silently transcribing a prefix.
+3. Emit `FeatureSpec(kind=...)` from the checkpoint converter so the engine
+   materializes the matching `FeatureConfig` automatically.
+
+`FeatureConfig.feature_type` is validated against the registry, so registering the
+kind is what makes it legal — no edit to the config, the `InputProcessor`, or the
+CUDA-graph feature cache.
 
 ## Paradigm status (all five wired)
 

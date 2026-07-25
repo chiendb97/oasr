@@ -11,14 +11,9 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from oasr.features import FeatureConfig
+from oasr.features import FeatureConfig, build_extractor
 from oasr.features.backends import _extract as _extract_single
-from oasr.features.batched import (
-    batched_fbank,
-    batched_mfcc,
-    supports_batched_fbank,
-    supports_batched_mfcc,
-)
+from oasr.features.batched import supports_batched_fbank, supports_batched_mfcc
 from oasr.features.lfr import apply_lfr_batch, lfr_output_length
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
@@ -61,6 +56,11 @@ class InputProcessor:
         self._config = config
         self._device = device
         self._feature_config: FeatureConfig = config.feature_config  # type: ignore[assignment]
+        # Resolve the frontend once, through the feature registry, so the batch
+        # path stays architecture-agnostic (F1).  Raises here — at engine
+        # construction — for an unregistered ``feature_type`` rather than on the
+        # first request.
+        self._extractor = build_extractor(self._feature_config)
 
         # Offline collate staging buffers, reused across micro-batches so the
         # slow allocations (``cudaHostAlloc`` for pinned host, device malloc)
@@ -300,36 +300,22 @@ class InputProcessor:
     def _fbank_batch(
         self, wav_device: torch.Tensor, wav_lengths: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run fbank/mfcc over a padded ``(B, T_max)`` waveform batch.
+        """Run the checkpoint's frontend over a padded ``(B, T_max)`` waveform batch.
 
-        Uses the fused :func:`batched_fbank` / :func:`batched_mfcc` kernels for
-        standard Kaldi-compliant configs (the common case — a handful of kernels
-        over the whole micro-batch, ~10× faster than a per-utterance Python
-        loop).  Falls back to per-utterance extraction for unusual configs
-        (non-Povey windows, dither, ``use_energy``) so output quality is
-        preserved when the fast path is unavailable.
+        Which frontend runs is resolved once at construction through the feature
+        registry (:func:`oasr.features.build_extractor`), so this stays
+        architecture-agnostic: a new frontend registers an
+        :class:`~oasr.features.ExtractorSpec` and needs no engine edit.  The Kaldi
+        extractor internally picks the fused kernel or a per-utterance fallback
+        depending on how exotic the config is.
+
+        LFR stacking is a post-transform over any extractor's output, applied here
+        rather than inside an extractor (offline only — ``prepare_streaming``
+        rejects LFR configs, which cannot be windowed across chunks).
         """
         fcfg = self._feature_config
-        if fcfg.feature_type == "whisper_logmel":
-            from oasr.features.whisper import batched_whisper_logmel
-
-            lengths_device = wav_lengths.to(self._device, non_blocking=True)
-            features_f32, feat_lengths = batched_whisper_logmel(wav_device, lengths_device, fcfg)
-            return features_f32.to(dtype=self._config.dtype), feat_lengths
-        if supports_batched_fbank(fcfg) or supports_batched_mfcc(fcfg):
-            lengths_device = wav_lengths.to(self._device, non_blocking=True)
-            batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
-            features_f32, feat_lengths = batched_fn(wav_device, lengths_device, fcfg)
-        else:
-            feat_list = [
-                _extract_single(wav_device[i, :n], fcfg) for i, n in enumerate(wav_lengths.tolist())
-            ]
-            feat_lengths = torch.tensor(
-                [f.size(0) for f in feat_list], dtype=torch.int32, device=self._device
-            )
-            features_f32 = torch.nn.utils.rnn.pad_sequence(
-                feat_list, batch_first=True, padding_value=0.0
-            )
+        lengths_device = wav_lengths.to(self._device, non_blocking=True)
+        features_f32, feat_lengths = self._extractor(wav_device, lengths_device, fcfg)
         if fcfg.lfr_enabled:
             features_f32, feat_lengths = apply_lfr_batch(
                 features_f32, feat_lengths, fcfg.lfr_m, fcfg.lfr_n
@@ -344,6 +330,13 @@ class InputProcessor:
         runs and no waveform load happens here; the engine starts processing
         as soon as the first chunk lands.
         """
+        if not self._extractor.supports_streaming:
+            raise NotImplementedError(
+                f"the {self._extractor.kind!r} frontend cannot run incrementally "
+                "(it normalises over a fixed window, so it needs the whole "
+                "utterance); this checkpoint is offline-only. Use "
+                "service_mode='offline'."
+            )
         if self._feature_config.lfr_enabled:
             raise NotImplementedError(
                 "LFR feature stacking is offline-only; the streaming feature "
@@ -571,7 +564,6 @@ class InputProcessor:
         # with the encoder forward on the default stream; the caller inserts the
         # event-wait before reading ``feature_buffer``.
         stream_ctx = torch.cuda.stream(cuda_stream) if cuda_stream is not None else nullcontext()
-        batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
 
         # Captured-graph fast path: steady state only (no flush) and within the
         # pre-built B bucket + ``t_pad``.  Any miss falls through to eager.
@@ -590,7 +582,7 @@ class InputProcessor:
             lengths_device = lengths_cpu.to(device=device, non_blocking=True)
             nvtx_pop()
             nvtx_push("feature")
-            feats_f32, _ = batched_fn(wav_device, lengths_device, fcfg)
+            feats_f32, _ = self._extractor(wav_device, lengths_device, fcfg)
             feats = feats_f32.to(dtype=dtype)
             nvtx_pop()
         return feats, feat_lens_cpu

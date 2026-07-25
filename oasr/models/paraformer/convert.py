@@ -16,10 +16,11 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Mapping, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Mapping, Tuple
 
 import torch
 
+from ..registry import DETECT_KEYED_VALUE
 from .config import ParaformerModelConfig
 
 if TYPE_CHECKING:
@@ -78,6 +79,10 @@ class FunASRParaformerConverter:
         "ctc.": "a CTC branch (CTC decoding of Paraformer checkpoints is not wired)",
         "bias_encoder": "a contextual-biasing branch (hotword models are unsupported)",
     }
+
+    #: the architecture is named in ``config.yaml`` (``model: Paraformer``), so this claim outranks a weaker one
+    #: (see :func:`oasr.models.registry.resolve_architecture`).
+    detect_specificity: ClassVar[int] = DETECT_KEYED_VALUE
 
     def detect(self, ckpt_dir: Path) -> bool:
         cfg_path = Path(ckpt_dir) / "config.yaml"

@@ -11,7 +11,7 @@ prompt encoding carry a ``sentencepiece`` / ``huggingface`` spec instead.
 
 from __future__ import annotations
 
-from typing import Dict, FrozenSet, List, Optional, Sequence
+from typing import ClassVar, Dict, FrozenSet, List, Optional, Sequence
 
 from .base import DEFAULT_SPECIAL_IDS, Tokenizer, TokenizerSpec
 from .registry import register_tokenizer
@@ -34,6 +34,9 @@ def load_symbol_table(path: str) -> Dict[int, str]:
 
 class SymbolTableTokenizer(Tokenizer):
     """Id → piece lookup over a ``units.txt`` / ``tokens.txt`` file."""
+
+    #: Decode-only: the table is id→piece, so there is no reverse map.
+    supports_encode: ClassVar[bool] = False
 
     def __init__(self, table_path: str, special_ids: Optional[FrozenSet[int]] = None) -> None:
         self._table = load_symbol_table(table_path)

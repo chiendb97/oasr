@@ -48,14 +48,9 @@ class ParaformerDecodeStrategy(DecodeStrategy):
         detok: "Detokenizer",
         model: "BaseAsrModel" = None,
     ) -> None:
-        if model is None or not hasattr(model, "predict") or not hasattr(model, "nar_decode"):
-            raise ValueError(
-                "the paraformer strategy needs a model exposing the "
-                "predict/nar_decode contract (CIF predictor + NAR decoder)"
-            )
-        self._config = config
-        self._detok = detok
-        self._model = model
+        super().__init__(config, detok, model)
+        # Surface validation lives in ``build_decode_strategy`` via
+        # ``oasr.models.interfaces.CAPABILITIES["paraformer"]``.
         mcfg = model.config
         self._filtered_ids = {int(mcfg.blank_id), int(mcfg.sos_id), int(mcfg.eos_id)}
         # Seconds per encoder frame: feature hop × LFR decimation.

@@ -51,11 +51,22 @@ class _FakeModelConfig:
 
 
 class _FakeModel:
-    """Just enough surface for CtcAedRescoringStrategy: decoder + config.decoder."""
+    """The full ``ctc_aed_rescoring`` surface, with only the decoder half real.
+
+    These tests drive the fusion arithmetic directly off a precomputed ``hidden``,
+    so ``head`` / ``encode_offline`` are never called — but they are part of the
+    capability contract (:data:`oasr.models.interfaces.CAPABILITIES`), which the
+    strategy constructor validates, so a fake that omitted them would be claiming
+    a capability it cannot serve.  Stub them rather than weaken the check.
+    """
 
     def __init__(self, decoder, decoder_cfg):
         self.decoder = decoder
         self.config = _FakeModelConfig(decoder_cfg)
+        self.head = object()
+
+    def encode_offline(self, *args, **kwargs):  # pragma: no cover - contract only
+        raise AssertionError("fusion-math tests pass `hidden` in directly")
 
 
 def _tiny_decoder(seed=0, r_num_blocks=2):
@@ -233,8 +244,12 @@ class TestFusionMath:
 
         class _NoDecoder:
             config = _FakeModelConfig(None)
+            head = object()
 
-        with pytest.raises(ValueError, match="attention-decoder branch"):
+            def encode_offline(self, *a, **k):
+                raise AssertionError("unreachable")
+
+        with pytest.raises(ValueError, match=r"ctc_aed_rescoring.*is missing:.*\bdecoder\b"):
             CtcAedRescoringStrategy(cfg, Detokenizer(None, None), _NoDecoder())
 
 

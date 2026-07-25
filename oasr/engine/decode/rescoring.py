@@ -63,17 +63,11 @@ class CtcAedRescoringStrategy(DecodeStrategy):
         detok: "Detokenizer",
         model: "BaseAsrModel" = None,
     ) -> None:
-        decoder = getattr(model, "decoder", None) if model is not None else None
-        decoder_cfg = getattr(getattr(model, "config", None), "decoder", None)
-        if decoder is None or decoder_cfg is None:
-            raise ValueError(
-                "decode_method='ctc_aed_rescoring' needs a checkpoint with an "
-                "attention-decoder branch (model.decoder + config.decoder); "
-                "this model has none. Hybrid WeNet U2/U2++ checkpoints "
-                "advertise it via model.capabilities."
-            )
-        self._config = config
-        self._detok = detok
+        super().__init__(config, detok, model)
+        # Surface validation lives in ``build_decode_strategy`` via
+        # ``oasr.models.interfaces.CAPABILITIES["ctc_aed_rescoring"]``.
+        decoder = model.decoder
+        decoder_cfg = model.config.decoder
         self._decoder = decoder
         self._sos = int(decoder_cfg.sos_id)
         self._eos = int(decoder_cfg.eos_id)

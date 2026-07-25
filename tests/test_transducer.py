@@ -480,3 +480,46 @@ class TestEngineTransducer:
         torch.manual_seed(9)
         text = engine.transcribe(torch.randn(32000))
         assert isinstance(text, str)
+
+    @pytest.mark.parametrize("stride", [1, 2, 3, 64])
+    def test_greedy_is_invariant_to_the_termination_check_stride(self, native_ckpt, stride):
+        """The greedy loop checks termination once per block, not per iteration (H7).
+
+        Overshooting a block boundary must be **inert**: once every row has
+        ``t >= its length``, ``active`` is all-false, so ``emit`` / ``advance`` are
+        too and no state mutates.  ``stride=1`` reproduces the old per-iteration
+        check exactly, so it is the reference — any stride must agree with it, both
+        offline (one loop to the row length) and streaming (a short loop per chunk,
+        where the overshoot is proportionally largest).
+        """
+        from oasr.engine import ASREngine, EngineConfig
+        from oasr.engine.decode import transducer as transducer_mod
+
+        torch.manual_seed(11)
+        wavs = [torch.randn(n) for n in (8000, 16000, 24000)]
+        original = transducer_mod._TERMINATION_CHECK_STRIDE  # noqa: SLF001
+
+        def transcribe(value, streaming):
+            transducer_mod._TERMINATION_CHECK_STRIDE = value  # noqa: SLF001
+            if streaming:
+                cfg = EngineConfig(
+                    ckpt_dir=str(native_ckpt),
+                    service_mode="streaming",
+                    max_batch_size=3,
+                    max_num_blocks=512,
+                    max_blocks_per_seq=64,
+                )
+                engine = ASREngine(cfg)
+                return [engine.transcribe(w) for w in wavs]
+            cfg = EngineConfig(ckpt_dir=str(native_ckpt), service_mode="offline", max_batch_size=3)
+            return ASREngine(cfg).transcribe_offline(wavs)
+
+        try:
+            for streaming in (False, True):
+                reference = transcribe(1, streaming)
+                assert transcribe(stride, streaming) == reference, (
+                    f"{'streaming' if streaming else 'offline'} greedy diverged at "
+                    f"stride={stride}; the block overshoot is not inert"
+                )
+        finally:
+            transducer_mod._TERMINATION_CHECK_STRIDE = original  # noqa: SLF001

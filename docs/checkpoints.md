@@ -25,11 +25,29 @@ loaded.model, loaded.config, loaded.tokenizer_spec, loaded.feature_spec
    picks that converter, no sniffing.  Required for icefall
    pruned-transducer dirs (they sniff as `zipformer`, and hybrid checkpoints
    carry both branches).
-3. **Converter detection** — each registered `CheckpointConverter.detect()`
-   inspects the directory for its format markers; exactly one may claim it.
-   Multiple matches → error listing the candidates.  Zero matches → the
-   deprecated `"conformer"` fallback fires with a `DeprecationWarning`
-   (it becomes an error one release later).
+3. **Converter detection** — every registered `CheckpointConverter.detect()`
+   inspects the directory for its own format markers, and the claims are
+   **ranked** by `detect_specificity`:
+
+   | Level | Meaning | Declared by |
+   |---|---|---|
+   | `DETECT_KEYED_VALUE` (30) | a named config file whose field names the architecture (`config.json: model_type == "whisper"`, `config.yaml: model: Paraformer`) | `whisper`, `speech_llm`, `paraformer` |
+   | `DETECT_NAMED_CONFIG` (20) | a framework-specific config file exists (WeNet's `train.yaml`) — identifies the framework, not the architecture | `conformer` |
+   | `DETECT_ASSET_LAYOUT` (10) | filename / asset conventions only (`exp/` layout, `epoch-*.pt`, `tokens.txt` beside the weights) — the default for a converter that declares nothing | `zipformer`, `transducer` |
+
+   The highest-specificity claim wins; a **tie** at the top raises, listing the
+   candidates (pass `architecture=`).  **Zero** claims also raises now — the old
+   `"conformer"` fallback guessed WeNet for anything unrecognized and then failed
+   deep inside weight loading with a shape error, so the guess is refused where the
+   information is actually missing.
+
+   Ranking exists so each `detect()` can state **only positive markers**. Several
+   formats share filenames — a FunASR dir carries a `model.pt`, a WeNet dir a
+   `final.pt`, both of which satisfy icefall's asset rule — and the previous answer
+   was `return False` guards *inside `IcefallConverter.detect`* naming WeNet's and
+   FunASR's markers. That put one format's knowledge in another's converter, so a
+   7th format meant editing an unrelated file. **When adding a converter, declare
+   `detect_specificity` and never add a negative guard for another format.**
 
 ## Converter contract
 

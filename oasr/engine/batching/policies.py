@@ -9,13 +9,31 @@ snapping, and ``max_wait_time`` forced-flush semantics.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, Deque, List
+from typing import TYPE_CHECKING, ClassVar, Deque, List, Optional
 
 from ..request import Request
-from .base import BatchingPolicy, register_batching_policy, snap_to_preferred, sort_by_length
+from .base import (
+    BatchingPolicy,
+    register_batching_policy,
+    request_cost_frames,
+    snap_to_preferred,
+    sort_by_length,
+)
 
 if TYPE_CHECKING:
     from ..config import EngineConfig
+
+
+def _batch_cap(config: "EngineConfig", limit: "Optional[int]") -> int:
+    """Batch width for one selection: ``max_batch_size``, narrowed by ``limit``.
+
+    Always at least 1 — a caller with zero slots free is expected not to call at
+    all, and returning 0 here would stall the queue silently.
+    """
+    cap = max(1, config.max_batch_size)
+    if limit is not None:
+        cap = max(1, min(cap, int(limit)))
+    return cap
 
 
 def snap_offline_batch(
@@ -55,12 +73,12 @@ class FcfsPolicy(BatchingPolicy):
     name: ClassVar[str] = "fcfs"
 
     def select_offline_batch(
-        self, queue: "Deque[Request]", config: "EngineConfig"
+        self, queue: "Deque[Request]", config: "EngineConfig", limit: Optional[int] = None
     ) -> List[Request]:
         q = queue
         if not q:
             return []
-        cap = max(1, config.max_batch_size)
+        cap = _batch_cap(config, limit)
         force_flush = q[0].waited_for >= config.max_wait_time
         batch: List[Request] = []
         while q and len(batch) < cap:
@@ -75,18 +93,18 @@ class _LengthAwarePolicy(BatchingPolicy):
         """Reorder the queue before anchor selection.  Default: no-op."""
 
     def select_offline_batch(
-        self, queue: "Deque[Request]", config: "EngineConfig"
+        self, queue: "Deque[Request]", config: "EngineConfig", limit: Optional[int] = None
     ) -> List[Request]:
         q = queue
         if not q:
             return []
-        cap = max(1, config.max_batch_size)
+        cap = _batch_cap(config, limit)
         # Forced-flush anchor if the oldest request has waited too long.
         force_flush = q[0].waited_for >= config.max_wait_time
         self._preorder(q, config, force_flush)
 
         anchor = q.popleft()
-        anchor_len = max(1, anchor.num_frames)
+        anchor_len = request_cost_frames(anchor, config)
         batch = [anchor]
         min_len = anchor_len
         max_len = anchor_len
@@ -104,7 +122,7 @@ class _LengthAwarePolicy(BatchingPolicy):
         i = 0
         while i < len(q) and len(batch) < cap:
             cand = q[i]
-            cand_len = max(1, cand.num_frames)
+            cand_len = request_cost_frames(cand, config)
             new_min = min(min_len, cand_len)
             new_max = max(max_len, cand_len)
 
@@ -121,7 +139,7 @@ class _LengthAwarePolicy(BatchingPolicy):
 
             # Pad-waste guard: would adding this push total padded compute above
             # ``pad_cap`` × useful compute?
-            useful = sum(max(1, r.num_frames) for r in batch) + cand_len
+            useful = sum(request_cost_frames(r, config) for r in batch) + cand_len
             padded = new_max * (len(batch) + 1)
             if pad_cap > 0 and padded / useful > pad_cap:
                 i += 1

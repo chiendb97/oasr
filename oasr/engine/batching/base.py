@@ -44,6 +44,29 @@ PartitionResult = Tuple[List[List[Request]], Optional[List[int]]]
 # ----------------------------------------------------------------------------
 
 
+def request_cost_frames(request: Request, config: "EngineConfig") -> int:
+    """Feature frames this request will actually cost the encoder.
+
+    Normally that is its own length (``num_frames``).  But a **fixed-window**
+    frontend pads *and trims* every utterance to one size — ``whisper_logmel``
+    forces the 30 s Whisper window, shared by Qwen2-Audio — so every row costs the
+    same no matter how long it was, and the encoder discards the real lengths
+    entirely (``WhisperEncoder.forward`` does ``del xs_lens``).
+
+    Reading ``num_frames`` there makes every length-aware decision wrong in the
+    same direction: ``length_bucket_ratio`` and ``max_offline_pad_ratio`` split
+    batches to avoid padding waste that does not exist (a 2 s and a 30 s clip cost
+    *the same*), and ``max_batch_frames`` under-counts the real padded width by up
+    to ~30x, so it stops bounding memory. Asking the config for the cost fixes all
+    three at once, and any future fixed-window frontend inherits the fix.
+    """
+    fcfg = getattr(config, "feature_config", None)
+    fixed = getattr(fcfg, "fixed_window_frames", None) if fcfg is not None else None
+    if fixed:
+        return int(fixed)
+    return max(1, int(request.num_frames))
+
+
 def sort_by_length(queue: Deque[Request]) -> None:
     """In-place stable sort of ``queue`` by ``(priority, num_frames)``."""
     ordered = sorted(queue, key=lambda r: (r.priority, r.num_frames))
@@ -80,8 +103,21 @@ class BatchingPolicy(ABC):
     name: ClassVar[str]
 
     @abstractmethod
-    def select_offline_batch(self, queue: Deque[Request], config: "EngineConfig") -> List[Request]:
-        """Pop and return one offline batch; leftover requests stay in ``queue``."""
+    def select_offline_batch(
+        self,
+        queue: Deque[Request],
+        config: "EngineConfig",
+        limit: Optional[int] = None,
+    ) -> List[Request]:
+        """Pop and return one offline batch; leftover requests stay in ``queue``.
+
+        ``limit`` caps the batch below ``config.max_batch_size`` for this call
+        only.  The incremental AR executor passes its remaining decode slots:
+        without it, a tick with one free slot would still pull a full
+        ``max_batch_size`` batch and prefill all of it, overshooting
+        ``max_decode_slots`` by up to ``max_batch_size - 1`` requests' worth of
+        decoder KV.
+        """
         raise NotImplementedError
 
 

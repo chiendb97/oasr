@@ -108,7 +108,14 @@ class ASREngine:
         tokenizer = self._apply_checkpoint_specs(config, loaded)
 
         self._device = torch.device(device_str)
-        cache_config = config.build_cache_config(model.cache_spec)
+        # ``cache_spec`` is ``None`` for an offline-only encoder (Whisper,
+        # Paraformer, the Qwen2-Audio tower), in which case no streaming cache is
+        # built at all — previously every engine allocated the paged KV pool plus
+        # the CNN-cache tensors (~0.4 GB at the defaults) even when nothing could
+        # ever read them, on exactly the LLM/offline deployments where VRAM is
+        # tightest (H13).
+        cache_spec = model.cache_spec
+        cache_config = config.build_cache_config(cache_spec) if cache_spec is not None else None
 
         # CUDA Graph capture: each cache type (encoder, feature extraction,
         # CTC) owns its own ``torch.cuda.graph_pool_handle()``. Sharing one
@@ -181,8 +188,15 @@ class ASREngine:
         # defaults (4 / 6 / 67 / 64) — zero behaviour change.
         config._subsampling_rate_override = model.encoder.subsampling_rate
         config._right_context_override = model.encoder.right_context
-        config._decoding_window_override = self._model_runner.decoding_window
-        config._stride_override = self._model_runner.stride
+        # A backend that allocates no streaming state reports ``0`` for both (the
+        # offline-only ``none`` backend, and any engine pinned to offline mode, which
+        # now selects it — see ``ModelRunner``).  Leave the config's own values in
+        # place rather than stamping zeros onto an engine nobody will stream through:
+        # the geometry is still introspectable, and an accidental reader gets a
+        # plausible window instead of a division by zero.
+        if self._model_runner.decoding_window > 0:
+            config._decoding_window_override = self._model_runner.decoding_window
+            config._stride_override = self._model_runner.stride
 
         self._output_processor = OutputProcessor(
             config, decode_type=decode_method, model=model, tokenizer=tokenizer
