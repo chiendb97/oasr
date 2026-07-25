@@ -279,6 +279,7 @@ def _time_offline_stepwise(
     waveforms: List[torch.Tensor],
     durations: List[float],
     num_iters: int,
+    admit_mode: str = "burst",
 ) -> tuple[float, float, float, dict[str, Any]]:
     """Offline timing with an explicit ``step()`` loop, for the decode families.
 
@@ -289,6 +290,19 @@ def _time_offline_stepwise(
     the same public API the dispatcher does — ``add_request`` then ``step()``
     until the engine drains — and times each tick individually.
 
+    ``admit_mode`` controls *when* requests arrive, which matters a great deal for
+    the incremental families:
+
+    * ``"burst"`` — everything up front, so the scheduler forms one wide batch.
+      The flattering case, and what a batch-transcription job looks like.
+    * ``"trickle"`` — one request per tick, reproducing an interactive service
+      where arrivals are independent. Each arrival is prefilled separately, so
+      this is the case that exposes how well the strategy batches *across*
+      independently-admitted requests (keystone C2).
+
+    Comparing the two isolates batching efficiency from raw decoder speed: the
+    same total work, the same tokens, only the arrival pattern differs.
+
     Each tick is followed by ``cuda.synchronize()`` so the GPU work it queued is
     attributed to it rather than to a later tick.  That makes the per-tick numbers
     slightly conservative and the total directly comparable to
@@ -298,21 +312,28 @@ def _time_offline_stepwise(
     -------
     (median_ms, std_ms, rtf, extra)
         ``extra`` carries ``tick_p50_ms`` / ``tick_p99_ms`` / ``ticks`` /
-        ``tokens`` / ``tokens_per_sec``.
+        ``tokens`` / ``tokens_per_sec`` / ``admit_mode``.
     """
     total_duration = sum(durations)
     cuda = torch.cuda.is_available()
+    trickle = admit_mode == "trickle"
     # Generous cap: even a fully serialised AR run finishes well inside this, and
     # it turns a stuck engine into a clear error instead of a hung benchmark.
     max_ticks = 100_000
 
     def _run_all() -> tuple[list[float], int]:
-        for w in waveforms:
-            engine.add_request(w, streaming=False)
+        pending = list(waveforms)
+        if not trickle:
+            for w in pending:
+                engine.add_request(w, streaming=False)
+            pending = []
         ticks: list[float] = []
         tokens = 0
         for _ in range(max_ticks):
-            if engine.num_running + engine.num_waiting == 0:
+            if pending:
+                # One arrival per tick — the interactive-service pattern.
+                engine.add_request(pending.pop(0), streaming=False)
+            elif engine.num_running + engine.num_waiting == 0:
                 break
             t0 = time.perf_counter()
             outputs = engine.step()
@@ -351,6 +372,7 @@ def _time_offline_stepwise(
 
     all_ticks.sort()
     extra = {
+        "admit_mode": admit_mode,
         "ticks": len(all_ticks) // max(1, num_iters),
         "tick_p50_ms": round(_percentile(all_ticks, 50), 3),
         "tick_p99_ms": round(_percentile(all_ticks, 99), 3),
@@ -532,6 +554,8 @@ def _run_config(
     use_cuda_graphs: Optional[bool] = None,
     max_packed_frames: int = 6000,
     max_batch_frames: Optional[int] = None,
+    admit_mode: str = "burst",
+    decode_admit_window_ms: float = 0.0,
 ) -> None:
     """Run one benchmark configuration and write results to *output*."""
 
@@ -616,6 +640,7 @@ def _run_config(
                 enable_sequence_packing=is_packing,
                 max_packed_frames=max_packed_frames,
                 max_batch_frames=max_batch_frames if is_length_batch else None,
+                decode_admit_window_ms=decode_admit_window_ms,
                 **({"decode_method": decode_method} if decode_method else {}),
             )
             engine = ASREngine(cfg)
@@ -630,13 +655,17 @@ def _run_config(
                 )
             else:
                 shape_str = f"N={n}, batch={max_batch_size}, avg_dur={avg_dur:.1f}s"
+                if family is not None:
+                    shape_str += f", admit={admit_mode}"
+                    if decode_admit_window_ms:
+                        shape_str += f"+{decode_admit_window_ms:.0f}ms"
             _warmup_engine(engine, waveforms, is_streaming=False)
             if family is not None:
                 # Family subroutines report tick latency + tokens/s on top of
                 # the shared metrics; the CTC gates keep the original timing
                 # path untouched so their numbers stay comparable over time.
                 median_ms, std_ms, rtf, extra_metrics = _time_offline_stepwise(
-                    engine, waveforms, durations, num_iters
+                    engine, waveforms, durations, num_iters, admit_mode=admit_mode
                 )
             else:
                 median_ms, std_ms, rtf = _time_offline(engine, waveforms, durations, num_iters)
@@ -767,6 +796,17 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
         "offline_packing subroutine (default: 6000).",
     )
     parser.add_argument(
+        "--admit-mode",
+        type=str,
+        default="burst",
+        choices=("burst", "trickle"),
+        help="Arrival pattern for the per-family subroutines: 'burst' adds every "
+        "request up front (one wide scheduler batch); 'trickle' adds one per engine "
+        "tick, reproducing independent interactive arrivals. Same work either way — "
+        "the delta isolates how well a decode family batches across separately "
+        "admitted requests (default: burst).",
+    )
+    parser.add_argument(
         "--max-batch-frames",
         type=int,
         default=None,
@@ -822,6 +862,7 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
             output=output,
             max_packed_frames=max_packed_frames,
             max_batch_frames=max_batch_frames,
+            admit_mode=getattr(args, "admit_mode", "burst") or "burst",
         )
 
 

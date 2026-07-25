@@ -66,6 +66,8 @@ class OfflineExecutor(Executor):
         decode_steps_per_tick: int = 32,
         max_decode_slots: Optional[int] = None,
         max_tick_ms: float = 0.0,
+        decode_admit_window_ms: float = 0.0,
+        max_batch_size: int = 32,
     ) -> None:
         self._scheduler = scheduler
         self._inp = input_processor
@@ -88,6 +90,11 @@ class OfflineExecutor(Executor):
         self._decode_steps_per_tick = int(decode_steps_per_tick)
         self._max_decode_slots = max_decode_slots
         self._max_tick_ms = float(max_tick_ms)
+        # AR admission coalescing: hold a thin waiting queue briefly so
+        # near-simultaneous arrivals prefill as one decode batch (see
+        # :meth:`_batch_wide_enough`).  ``0`` disables.
+        self._decode_admit_window_ms = float(decode_admit_window_ms)
+        self._max_batch_size = int(max_batch_size)
         self._pending: Dict[str, Request] = {}
         # A tick that spent its whole budget advancing does not also prefill a new
         # micro-batch — prefill is the largest single blob in a tick (audio tower
@@ -164,10 +171,35 @@ class OfflineExecutor(Executor):
         budget_spent = False
         if strategy.incremental and strategy.has_pending():
             outputs, budget_spent = self._advance_pending()
-        if self._may_admit(budget_spent) and self._admission_open():
+        if self._may_admit(budget_spent) and self._batch_wide_enough() and self._admission_open():
             batch = self._scheduler.schedule_offline()
             outputs.extend(self.run(batch))
         return outputs
+
+    def _batch_wide_enough(self) -> bool:
+        """Whether the waiting queue should be prefilled now, or held to widen.
+
+        Only for incremental strategies, and only when
+        ``EngineConfig.decode_admit_window_ms`` is set.  An AR decoder step is
+        weight-read bound, so two decode groups cost roughly twice one group of
+        the same total rows — total forwards is the sum over groups of each
+        group's step count.  Groups cannot be merged afterwards (both decoder
+        surfaces keep a shared scalar generation offset), so the only lever is to
+        let near-simultaneous arrivals accumulate into **one** batch first.
+
+        Holds until either the queue reaches ``max_batch_size`` or the oldest
+        waiting request has waited out the window.
+        """
+        window_ms = self._decode_admit_window_ms
+        if window_ms <= 0 or not self._op.strategy.incremental:
+            return True
+        n_waiting = self._scheduler.num_waiting_offline
+        if n_waiting == 0:
+            return True  # nothing to hold
+        if n_waiting >= self._max_batch_size:
+            return True  # as wide as the engine will ever forward
+        oldest = self._scheduler.oldest_offline_wait()
+        return oldest is None or (oldest * 1000.0) >= window_ms
 
     def _may_admit(self, budget_spent: bool) -> bool:
         """Whether this tick should also prefill a new batch.

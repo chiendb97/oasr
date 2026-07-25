@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Tests for the incremental decode protocol in the offline executor (K2).
+"""Tests for the incremental decode protocol (K2), both sides of the seam.
 
-Pure CPU: every engine component around ``OfflineExecutor`` is a small fake,
-and the strategy is a synthetic ``incremental=True`` implementation that emits
-one token per batched decoder step.  This pins the executor-side contract —
-bounded steps per tick, the pending pool lifecycle, admission gating, abort —
-independent of any real model (Whisper etc. plug into the same seam).
+Pure CPU, no checkpoints — every engine component is a small fake.
+
+* ``TestIncrementalLifecycle`` / ``TestAdmissionGating`` / ``TestAbort`` /
+  ``TestShutdown`` / ``TestStepBudget`` / ``TestTickBudget`` pin the
+  **executor** side: bounded work per tick (step cap *and* wall-clock deadline),
+  the pending-pool lifecycle, admission gating and deferral, abort, teardown.
+* ``TestIncrementalArBase`` pins the **strategy** side — the shared
+  :class:`~oasr.engine.decode.incremental.IncrementalArStrategy` that AED and the
+  speech-LLM sit on, driven through a fake decoder so a third AR family can be
+  written against a tested contract (two hooks) rather than by copying a sibling.
 """
 
 import time
+from types import SimpleNamespace
 from typing import Dict, List
 
 import pytest
@@ -102,6 +108,11 @@ class FakeScheduler:
     def num_waiting_offline(self):
         return len(self.waiting)
 
+    def oldest_offline_wait(self):
+        if not self.waiting:
+            return None
+        return max(r.waited_for for r in self.waiting)
+
     def abort_request(self, request_id):
         self.waiting = [r for r in self.waiting if r.request_id != request_id]
 
@@ -137,7 +148,9 @@ class FakeOutputProcessor:
         return None
 
 
-def _make_executor(target_lens, *, steps_per_tick=4, slots=8):
+def _make_executor(
+    target_lens, *, steps_per_tick=4, slots=8, admit_window_ms=0.0, max_batch_size=32
+):
     strat = FakeIncrementalStrategy(target_lens)
     ex = OfflineExecutor(
         scheduler=FakeScheduler(),
@@ -147,6 +160,8 @@ def _make_executor(target_lens, *, steps_per_tick=4, slots=8):
         device=torch.device("cpu"),
         decode_steps_per_tick=steps_per_tick,
         max_decode_slots=slots,
+        decode_admit_window_ms=admit_window_ms,
+        max_batch_size=max_batch_size,
     )
     return ex, strat
 
@@ -404,3 +419,241 @@ class TestTickBudget:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# Shared incremental-AR base (H1): the seam a third AR family plugs into
+# ---------------------------------------------------------------------------
+
+
+class _FakeArDecoder:
+    """Minimal batched incremental decoder surface (prefill / step / select).
+
+    Emits token ``id = row_seed + position`` so per-row token streams are
+    distinguishable and row/state alignment is checkable after compaction.
+    """
+
+    def __init__(self, vocab: int = 32):
+        self.vocab = vocab
+        self.select_calls: list[list[int]] = []
+
+    def _logits(self, seeds: torch.Tensor, pos: int) -> torch.Tensor:
+        out = torch.full((seeds.numel(), self.vocab), -1e4)
+        for row, seed in enumerate(seeds.tolist()):
+            out[row, (int(seed) + pos) % self.vocab] = 10.0
+        return out
+
+    def prefill(self, enc_out, valid_or_prompt, capacity=None):
+        del capacity
+        B = enc_out.size(0)
+        seeds = torch.arange(1, B + 1)
+        return self._logits(seeds, 0), {"seeds": seeds, "pos": 1}
+
+    def step(self, tokens, state):
+        # Logits for the *current* position, then advance — so row ``seed``
+        # emits seed, seed+1, seed+2, ... with no gap.
+        logits = self._logits(state["seeds"], state["pos"])
+        return logits, {"seeds": state["seeds"], "pos": state["pos"] + 1}
+
+    def select(self, state, keep):
+        self.select_calls.append(keep.tolist())
+        return {"seeds": state["seeds"].index_select(0, keep.cpu()), "pos": state["pos"]}
+
+
+def _ar_strategy(*, partials: bool, eos_token: int = -1, max_new_tokens: int = 4):
+    """A minimal IncrementalArStrategy subclass over the fake decoder."""
+    from oasr.engine.decode.incremental import IncrementalArStrategy, Prefill
+
+    class _Strategy(IncrementalArStrategy):
+        decode_type = "fake_ar"
+        emit_partials = partials
+
+        def _prefill(self, requests, enc_out, enc_lengths):
+            logits, state = self._decoder().prefill(enc_out, None)
+            return Prefill(
+                state=state,
+                logits=logits,
+                max_new=[self._row_cap(r, 999) for r in requests],
+            )
+
+        def _is_eos(self, token):
+            return token == eos_token
+
+    decoder = _FakeArDecoder()
+    model = SimpleNamespace(decoder=decoder)
+    detok = SimpleNamespace(detokenize=lambda ids: " ".join(map(str, ids)))
+    cfg = SimpleNamespace(max_new_tokens=max_new_tokens)
+    return _Strategy(cfg, detok, model), decoder
+
+
+class TestIncrementalArBase:
+    """The shared base must be usable from the two required hooks alone."""
+
+    def _requests(self, n):
+        return [Request(audio=None, request_id=f"r{i}", streaming=False) for i in range(n)]
+
+    def _drive(self, strat, reqs, steps_per_tick=8, max_ticks=20):
+        strat.begin_offline(reqs, torch.zeros(len(reqs), 2, 4), torch.tensor([2] * len(reqs)))
+        finals, partials = {}, {}
+        for _ in range(max_ticks):
+            if not strat.has_pending():
+                break
+            for out in strat.advance(StepBudget(max_steps=steps_per_tick)):
+                if out.finished:
+                    finals[out.request_id] = out
+                else:
+                    partials.setdefault(out.request_id, []).append(len(out.tokens[0]))
+        return finals, partials
+
+    def test_length_cap_finishes_every_row(self):
+        strat, _ = _ar_strategy(partials=False, max_new_tokens=3)
+        reqs = self._requests(3)
+        finals, partials = self._drive(strat, reqs)
+        assert sorted(finals) == ["r0", "r1", "r2"]
+        assert all(len(f.tokens[0]) == 3 for f in finals.values())
+        assert all(f.finish_reason == "length" for f in finals.values())
+        assert partials == {}, "emit_partials=False must emit finals only"
+        assert not strat.has_pending()
+
+    def test_partials_when_enabled(self):
+        strat, _ = _ar_strategy(partials=True, max_new_tokens=4)
+        finals, partials = self._drive(strat, self._requests(2), steps_per_tick=1)
+        assert sorted(partials) == ["r0", "r1"]
+        # One partial per tick per active row, monotonically growing.
+        for lens in partials.values():
+            assert lens == sorted(lens) and lens[0] >= 1
+        assert sorted(finals) == ["r0", "r1"]
+
+    def test_eos_stops_a_row_without_emitting_the_token(self):
+        # Row 0 emits ids 1,2,3...; make id 2 the EOS so r0 stops after one token.
+        strat, _ = _ar_strategy(partials=False, eos_token=2, max_new_tokens=9)
+        finals, _ = self._drive(strat, self._requests(2))
+        assert finals["r0"].finish_reason == "stop"
+        assert finals["r0"].tokens[0] == [1], "EOS itself must not be emitted"
+
+    def test_rows_stay_aligned_after_compaction(self):
+        """A row leaving must compact host bookkeeping and decoder state together.
+
+        Row ``i`` emits ``i+1, i+2, ...``; with EOS = 2 the three rows retire in
+        three different ways, so any row/state misalignment shows up as a wrong
+        token stream rather than a crash: r1 hits EOS immediately (empty), r0 hits
+        it on its second token, r2 never does and runs to the cap.
+        """
+        strat, decoder = _ar_strategy(partials=False, eos_token=2, max_new_tokens=4)
+        finals, _ = self._drive(strat, self._requests(3))
+        assert len(finals) == 3
+        assert decoder.select_calls, "select must be called when a row retires"
+        assert finals["r1"].tokens[0] == [] and finals["r1"].finish_reason == "stop"
+        assert finals["r0"].tokens[0] == [1] and finals["r0"].finish_reason == "stop"
+        assert finals["r2"].tokens[0] == [3, 4, 5, 6]
+        assert finals["r2"].finish_reason == "length"
+
+    def test_free_session_drops_one_row(self):
+        strat, decoder = _ar_strategy(partials=False, max_new_tokens=50)
+        reqs = self._requests(3)
+        strat.begin_offline(reqs, torch.zeros(3, 2, 4), torch.tensor([2, 2, 2]))
+        strat.advance(StepBudget(max_steps=1))
+        strat.free_session(reqs[1])
+        group = strat._groups[0]  # noqa: SLF001 - asserting internal alignment
+        assert [r.request_id for r in group.requests] == ["r0", "r2"]
+        assert group.last_logits.size(0) == 2
+        assert decoder.select_calls[-1] == [0, 2]
+
+    def test_non_applicable_surfaces_raise(self):
+        strat, _ = _ar_strategy(partials=False)
+        for call in (
+            lambda: strat.decode_offline(torch.zeros(1, 2, 4), torch.tensor([2])),
+            lambda: strat.decode_streaming_batch([], {}),
+            lambda: strat.decode_streaming_chunk(None, torch.zeros(1, 2, 4)),
+            lambda: strat.finalize(None),
+        ):
+            with pytest.raises(NotImplementedError, match="fake_ar"):
+                call()
+
+
+class TestArAdmissionWindow:
+    """Coalescing thin arrivals into one decode batch (C2).
+
+    An AR decoder step is weight-read bound, so its cost barely depends on how
+    many rows it carries: two decode groups cost roughly twice one group of the
+    same total rows.  Measured on Qwen2-Audio-7B (4 utterances, 124 tokens),
+    arriving together took 922 ms vs 1614 ms arriving one per tick — identical
+    work.  Groups cannot be merged afterwards (both decoder surfaces keep a
+    shared scalar generation offset), so admission is where this is fixed.
+    """
+
+    def test_window_holds_a_thin_batch(self):
+        ex, strat = _make_executor({"a": 4, "b": 4}, admit_window_ms=10_000.0, max_batch_size=8)
+        _admit(ex, "a")
+        # The window has not elapsed and the queue is far from max_batch_size,
+        # so nothing is prefilled yet.
+        assert ex.step() == []
+        assert ex.num_running() == 0
+        assert ex.num_waiting() == 1
+
+    def test_window_releases_once_the_batch_is_wide(self):
+        """Reaching max_batch_size releases immediately — no point waiting."""
+        ex, strat = _make_executor({"a": 4, "b": 4}, admit_window_ms=10_000.0, max_batch_size=2)
+        _admit(ex, "a")
+        assert ex.step() == [] and ex.num_running() == 0  # 1 < 2, held
+        _admit(ex, "b")
+        ex.step()  # 2 >= 2 → prefilled together, as ONE group
+        assert ex.num_running() == 2
+
+    def test_window_releases_when_it_expires(self):
+        ex, strat = _make_executor({"a": 3}, admit_window_ms=0.001, max_batch_size=8)
+        _admit(ex, "a")
+        time.sleep(0.005)  # blow through the 1 µs window
+        ex.step()
+        assert ex.num_running() == 1
+
+    def test_disabled_by_default(self):
+        """Zero window = today's behaviour: prefill the first arrival at once."""
+        ex, strat = _make_executor({"a": 3}, max_batch_size=8)
+        _admit(ex, "a")
+        ex.step()
+        assert ex.num_running() == 1
+
+    def test_inert_for_one_shot_strategies(self):
+        """A frame-synchronous strategy must never be held back by the window.
+
+        Only label-synchronous decoding pays the per-group penalty the window
+        exists to avoid; CTC / transducer / rescoring decode a batch in one shot,
+        so holding them back would be pure added latency.
+        """
+
+        class OneShot(DecodeStrategy):
+            decode_type = "ctc"
+            consumes = "log_probs"
+
+            def decode_offline(self, enc_out, enc_lengths):
+                return [
+                    RequestOutput(request_id="", text="x", tokens=[[1]], finished=True)
+                    for _ in range(enc_out.shape[0])
+                ]
+
+            def decode_streaming_batch(self, requests, enc_out_map):
+                raise NotImplementedError
+
+            def decode_streaming_chunk(self, request, enc_out):
+                raise NotImplementedError
+
+            def finalize(self, request):
+                raise NotImplementedError
+
+        class LogProbRunner(FakeModelRunner):
+            def forward_offline(self, features, lengths):
+                return torch.zeros(features.shape[0], 2, 5), lengths
+
+        ex = OfflineExecutor(
+            scheduler=FakeScheduler(),
+            input_processor=FakeInputProcessor(),
+            model_runner=LogProbRunner(),
+            output_processor=FakeOutputProcessor(OneShot()),
+            device=torch.device("cpu"),
+            decode_admit_window_ms=10_000.0,  # would stall an AR strategy
+            max_batch_size=8,
+        )
+        _admit(ex, "a")
+        outs = ex.step()  # admitted and finalised despite the window
+        assert [o.request_id for o in outs] == ["a"]

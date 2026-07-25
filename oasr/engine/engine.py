@@ -773,6 +773,8 @@ class ASREngine:
                 else config.max_batch_size
             ),
             max_tick_ms=config.max_tick_ms,
+            decode_admit_window_ms=config.decode_admit_window_ms,
+            max_batch_size=config.max_batch_size,
         )
 
     def _validate_mode(self, streaming: bool) -> None:

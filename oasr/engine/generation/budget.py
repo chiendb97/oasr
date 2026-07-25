@@ -1,12 +1,16 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Per-tick decoder-step budget + hypothesis bookkeeping for AR strategies."""
+"""Per-tick budget for the incremental AR decode strategies.
+
+Row/hypothesis bookkeeping lives with the strategies themselves
+(:class:`oasr.engine.decode.incremental.ArGroup`), which own the tensors it has
+to stay aligned with."""
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -72,18 +76,3 @@ class StepBudget:
             return False
         self.used += 1
         return True
-
-
-@dataclass
-class Hypothesis:
-    """One request's in-flight AR hypothesis (greedy: a single growing row).
-
-    Beam strategies keep one :class:`Hypothesis` per beam entry.  ``score``
-    accumulates token log-probs; ``finished`` flips on EOS or on hitting the
-    request's ``max_new_tokens``.
-    """
-
-    tokens: List[int] = field(default_factory=list)
-    score: float = 0.0
-    finished: bool = False
-    finish_reason: Optional[str] = None  # "eos" | "length"

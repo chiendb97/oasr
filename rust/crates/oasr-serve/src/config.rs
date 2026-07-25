@@ -84,6 +84,15 @@ pub struct Cli {
     /// 0 disables (step cap only).
     #[arg(long)]
     pub max_tick_ms: Option<f64>,
+    /// Incremental (AED / LLM) decode: hold a thin waiting queue this many
+    /// milliseconds so near-simultaneous arrivals prefill as **one** decode
+    /// batch.  An AR decoder step is weight-read bound, so its cost barely
+    /// depends on how many rows it carries — two decode groups cost roughly
+    /// twice one group of the same total rows, and groups cannot be merged after
+    /// the fact (both decoder surfaces keep a shared scalar generation offset).
+    /// Trades first-token latency for throughput; engine default 0 (off).
+    #[arg(long)]
+    pub decode_admit_window_ms: Option<f64>,
     /// Incremental (AED / LLM) decode: max AR requests in flight before
     /// new-batch admission pauses.  Unset defaults to the engine's
     /// max_batch_size.
@@ -278,6 +287,12 @@ impl Cli {
         if let Some(v) = self.max_tick_ms {
             if let Some(num) = serde_json::Number::from_f64(v) {
                 obj.entry("max_tick_ms").or_insert(Value::Number(num));
+            }
+        }
+        if let Some(v) = self.decode_admit_window_ms {
+            if let Some(num) = serde_json::Number::from_f64(v) {
+                obj.entry("decode_admit_window_ms")
+                    .or_insert(Value::Number(num));
             }
         }
         if self.overlap_admit {

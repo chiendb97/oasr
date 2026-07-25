@@ -11,7 +11,7 @@ across all pending requests (see ``DecodeStrategy.begin_offline`` /
 ``advance`` / ``has_pending`` in ``oasr/engine/decode/base.py``).
 """
 
-from .budget import Hypothesis, StepBudget
+from .budget import StepBudget
 from .sampling import select_next_tokens
 
-__all__ = ["Hypothesis", "StepBudget", "select_next_tokens"]
+__all__ = ["StepBudget", "select_next_tokens"]

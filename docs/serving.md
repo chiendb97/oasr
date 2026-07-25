@@ -316,10 +316,30 @@ a Qwen2-Audio checkpoint; unset = model default, validated at startup).  The
 incremental AR families additionally take `--max-new-tokens`,
 `--decode-steps-per-tick` (step cap per engine tick), `--max-tick-ms`
 (wall-clock cap per tick — the actual dispatcher-starvation guard),
-`--max-decode-slots` (in-flight AR request cap), and `--llm-prompt`
+`--decode-admit-window-ms` (coalesce near-simultaneous arrivals into one decode
+batch), `--max-decode-slots` (in-flight AR request cap), and `--llm-prompt`
 (deployment-wide speech-LLM user prompt; per-request `prompt` decoding options
 override it).  LLM decode emits token-streaming partials over the same
 `Event::Partial` wire streaming CTC uses.
+
+**`--decode-admit-window-ms` is the knob that buys AR throughput.** An AR decoder
+step is weight-read bound, so its cost barely depends on how many rows it carries:
+total decoder forwards is the *sum over groups* of each group's step count, and
+groups cannot be merged after the fact (both decoder surfaces keep a shared scalar
+generation offset — per-row offsets are the prerequisite, shared with paged decoder
+KV). So requests that arrive together are much cheaper than the same requests
+arriving apart. Measured on `Qwen2-Audio-7B-Instruct`, 4 utterances / 124 tokens:
+
+| arrival | window | total | tokens/s |
+|---|---|---|---|
+| together | — | 922 ms | 134.5 |
+| one per tick | 0 (default) | 1588 ms | 78.1 |
+| one per tick | 200 ms | 982 ms | 126.3 |
+
+The window holds a thin waiting queue until it reaches `max_batch_size` or expires,
+recovering ~92% of the loss. It costs up to one window of first-token latency for an
+*isolated* request, so it is **off by default** — turn it on for
+throughput-oriented deployments, leave it off when time-to-first-token dominates.
 
 **`--max-tick-ms` is the knob that bounds latency, not `--decode-steps-per-tick`.**
 A step count bounds work, not time, and step cost is model-dependent, so one

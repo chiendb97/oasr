@@ -329,6 +329,16 @@ class Scheduler:
     def num_waiting_offline(self) -> int:
         return len(self._offline_waiting)
 
+    def oldest_offline_wait(self) -> Optional[float]:
+        """Seconds the longest-waiting offline request has been queued.
+
+        ``None`` when the offline queue is empty.  Read by the offline executor's
+        AR admission window, which trades a bounded wait for a wider decode batch.
+        """
+        if not self._offline_waiting:
+            return None
+        return max(req.waited_for for req in self._offline_waiting)
+
     @property
     def num_running(self) -> int:
         """Number of currently active streaming requests."""
