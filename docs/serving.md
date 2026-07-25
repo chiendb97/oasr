@@ -32,8 +32,10 @@ oasr-server \
 ```
 
 `oasr-server --help` lists every flag.  `--service-mode` pins the engine to
-either `offline` (sync `Recognize`) or `streaming` (bidi `StreamingRecognize`)
-for its entire lifecycle; the mismatched RPC returns `FAILED_PRECONDITION`.
+either `offline` or `streaming` for its entire lifecycle.  A `streaming` engine
+rejects the unary `Recognize` with `FAILED_PRECONDITION`; an `offline` engine
+serves **both** RPCs — see [Streaming text out of an offline
+engine](#streaming-text-out-of-an-offline-engine).
 
 > Building the workspace with `cargo build --release` instead produces the same
 > server as the `rust/target/release/oasr-server` binary; substitute that path
@@ -49,7 +51,7 @@ for its entire lifecycle; the mismatched RPC returns `FAILED_PRECONDITION`.
 | HTTP | `GET /readyz` | 200 once the engine dispatcher has produced its first Pong. |
 | HTTP | `GET /metrics` | Prometheus exposition. |
 | gRPC | `oasr.speech.v1.Speech/Recognize` | Synchronous unary (offline mode). |
-| gRPC | `oasr.speech.v1.Speech/StreamingRecognize` | Bidi streaming (streaming mode). |
+| gRPC | `oasr.speech.v1.Speech/StreamingRecognize` | Bidi streaming. In `streaming` mode audio is fed to the engine chunk by chunk; in `offline` mode audio is buffered until half-close and the **text** streams back (token streaming for AR families). |
 | gRPC | `grpc.health.v1.Health/Check` and `Watch` | Standard gRPC health checking. |
 
 REST is sync only — there is **no HTTP streaming endpoint** (no WebSocket, no
@@ -218,7 +220,7 @@ grpcurl -plaintext -import-path rust/proto -proto oasr_speech_v1.proto \
         127.0.0.1:50051 oasr.speech.v1.Speech/Recognize
 ```
 
-### `StreamingRecognize` (bidi, streaming mode)
+### `StreamingRecognize` (bidi)
 
 The first inbound message **must** carry `streaming_config.config`;
 subsequent messages carry `audio_content` (raw PCM bytes in the declared
@@ -230,6 +232,38 @@ with `is_final=true` on the terminal frame.
 python scripts/grpc_stream.py --addr 127.0.0.1:50051 \
     --wav tests/fixtures/hello.wav --chunk-ms 640
 ```
+
+#### Streaming text out of an offline engine
+
+Four decode families are offline-only — `aed`, `llm`, `paraformer` and
+`ctc_aed_rescoring` — because they cannot start before the utterance is complete
+(and `whisper_logmel` normalizes over a fixed 30 s window).  That is a constraint
+on **audio in**, not on **text out**: the autoregressive families emit one partial
+per request per engine tick, which is the normal token-streaming UX for an LLM
+ASR client.
+
+So `StreamingRecognize` is served in `offline` mode too, with a different
+mechanism: the server buffers the inbound `audio_content` frames, submits the
+utterance as **one** offline request on client half-close, and then streams the
+generated text back as interim results.  The client-visible shape is identical —
+`is_final=false` partials followed by one `is_final=true` final.
+
+Two consequences to plan for:
+
+* **`--max-tick-ms` sets the inter-token cadence.**  It bounds how long the
+  dispatcher holds the GIL per tick, and one partial is emitted per tick, so it is
+  a *user-visible latency knob* here rather than only an internal bound.  Measured
+  on Qwen2-Audio-7B-Instruct, `--max-tick-ms 25`, one 10 s utterance: first token
+  at **184 ms**, 21 interim responses, inter-partial gap min 27.9 / median 39.7 /
+  max 45.9 ms, final at 998 ms.
+* **One-shot families are unaffected.**  A CTC / Paraformer / rescoring engine
+  produces a single final through the same path (`interim_results` simply yields
+  nothing extra) — verified against a WeNet Conformer: exactly one response.
+
+Half-close is the submit trigger; a client that never half-closes gets no result,
+exactly like a unary client that never finishes its request body.  A client that
+disconnects mid-generation cancels the request, so the AR row stops occupying a
+decode slot instead of running to its `max_new_tokens` cap.
 
 ### gRPC health checking
 

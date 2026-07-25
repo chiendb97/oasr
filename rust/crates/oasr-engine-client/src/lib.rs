@@ -23,7 +23,7 @@ pub mod router;
 
 pub use client::{EngineClient, EngineClientConfig};
 pub use dispatcher::CmdEnvelope;
-pub use handle::{OfflineHandle, StreamingHandle};
+pub use handle::{OfflineHandle, OfflineStreamHandle, StreamingHandle};
 pub use pool::EnginePool;
 pub use pyengine::{PyEngine, PyEngineError};
 

@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::dispatcher::{
     spawn as spawn_dispatcher, CmdEnvelope, DispatcherConfig, DispatcherShared,
 };
-use crate::handle::{OfflineHandle, StreamingHandle};
+use crate::handle::{OfflineHandle, OfflineStreamHandle, StreamingHandle};
 use crate::pyengine::PyEngine;
 use crate::router::RouterActor;
 use crate::EngineClientError;
@@ -171,6 +171,63 @@ impl EngineClient {
         );
         self.send_envelope(envelope).await?;
         Ok(OfflineHandle::new(request_id, rx))
+    }
+
+    /// Submit an offline request and keep the **whole** event stream.
+    ///
+    /// [`Self::submit_offline`] registers a small channel and spawns a drain task
+    /// that throws away every non-terminal event, so the per-tick
+    /// `Event::Partial`s the autoregressive strategies produce could never reach a
+    /// client — token streaming was built end-to-end and then discarded one layer
+    /// from the wire. This variant hands the stream to the caller instead.
+    ///
+    /// Audio still arrives in one shot: an offline-only decode family (`aed`,
+    /// `llm`, `paraformer`, `ctc_aed_rescoring`) cannot consume a growing buffer.
+    /// What is decoupled here is *chunked audio in* from *incremental text out* —
+    /// only the latter is what a speech-LLM client actually wants.
+    pub async fn submit_offline_streaming(
+        &self,
+        audio: Bytes,
+        sample_rate: u32,
+        priority: i32,
+        decoding: Option<DecodingParams>,
+    ) -> Result<OfflineStreamHandle, EngineClientError> {
+        let request_id = Uuid::new_v4().simple().to_string();
+        self.submit_offline_streaming_with_id(request_id, audio, sample_rate, priority, decoding)
+            .await
+    }
+
+    pub async fn submit_offline_streaming_with_id(
+        &self,
+        request_id: String,
+        audio: Bytes,
+        sample_rate: u32,
+        priority: i32,
+        decoding: Option<DecodingParams>,
+    ) -> Result<OfflineStreamHandle, EngineClientError> {
+        // Full ``event_channel_cap`` rather than the unary path's 8: an AR request
+        // emits {Accepted, Partial x N, Final}, and N is the token count.
+        let event_rx = self
+            .shared
+            .router
+            .register(request_id.clone(), self.cfg.event_channel_cap);
+        let stream = ReceiverStream::new(event_rx);
+        let envelope = CmdEnvelope::new(
+            Cmd::CreateOffline {
+                request_id: request_id.clone(),
+                sample_rate,
+                priority,
+                decoding,
+            },
+            Some(audio),
+        );
+        self.send_envelope(envelope).await?;
+        Ok(OfflineStreamHandle::new(
+            request_id,
+            stream,
+            self.cmd_tx.clone(),
+            self.shared.router.clone(),
+        ))
     }
 
     pub async fn open_streaming(
