@@ -8,7 +8,7 @@ class, and a format converter that knows how to read a checkpoint directory.
 uses to turn a checkpoint dir into a live, weight-loaded model — analogous to
 vLLM / SGLang's model registry + loader split.
 
-Resolution precedence (see ``docs/design/multi_paradigm.md`` §7.1):
+Resolution precedence (see ``.artifacts/multi_paradigm.md`` §7.1):
 
 1. native OASR format (``oasr_config.json``) — loaded directly, no conversion;
 2. explicit ``architecture=`` override — that converter, no sniffing;

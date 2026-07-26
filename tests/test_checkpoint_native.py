@@ -3,7 +3,7 @@
 """Tests for the ConvertedCheckpoint bundle + native format (CPU; one GPU parity test).
 
 Covers the Phase-0 seams of the multi-paradigm plan
-(``docs/design/multi_paradigm.md``): converter-emitted tokenizer / feature /
+(``.artifacts/multi_paradigm.md``): converter-emitted tokenizer / feature /
 decoding specs, the legacy 4-method converter adapter, LoadReport accounting
 (no silent weight drops), and the ``convert → native → load`` round trip being
 identical to the direct load.

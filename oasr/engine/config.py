@@ -310,7 +310,7 @@ class EngineConfig:
     # ``decode_steps_per_tick`` caps the *batched* decoder steps one engine
     # ``step()`` runs across all pending requests, keeping per-tick work
     # bounded (the serving dispatcher's contract; see keystone K2 in
-    # docs/design/multi_paradigm.md).  ``max_decode_slots`` caps how many
+    # .artifacts/multi_paradigm.md).  ``max_decode_slots`` caps how many
     # AR requests may be in flight before new-batch admission pauses;
     # ``None`` defaults to ``max_batch_size``.  Both are inert for
     # frame-synchronous strategies (CTC / transducer / rescoring).

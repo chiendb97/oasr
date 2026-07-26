@@ -207,7 +207,7 @@ same-chunk-length streams run as one `B = N` forward (3.5–24× over the previo
 sequential `B = 1` loop at pool sizes 4–32).  Encoders with
 `streaming_kind="none"` are rejected in streaming service mode.
 
-Deferred follow-ups (measured rationale in `docs/design/multi_paradigm.md`):
+Deferred follow-ups (measured rationale in `.artifacts/multi_paradigm.md`):
 AED/transducer beam search, paged decoder-KV via the CuteDSL FMHA (blocked on the
 masked-tile fix for heavily key-padded rows — exactly the left-padded LLM prompt
 shape), and decoder-step CUDA graphs (the prerequisite — capacity-preallocated
