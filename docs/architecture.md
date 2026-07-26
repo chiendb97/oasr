@@ -81,18 +81,86 @@ Request → InputProcessor (fbank) → Scheduler (BatchingPolicy + PartitionPoli
    count alone lets one model's tick run 10× longer than another's.  Working
    references: `transducer.py` (frame-sync greedy, offline + streaming sessions),
    `rescoring.py` (`consumes="both"`), `aed.py` / `llm.py` (incremental).
+4. Declare the family's knobs as an **options dataclass** and point
+   `options_cls` at it (`oasr/engine/decode/options.py`).  Read them through
+   `self.options`; do **not** add fields to `EngineConfig`.  Each field is
+   `option(default, legacy=..., doc=...)`, where `legacy` names a deprecated flat
+   `EngineConfig` attribute carrying the same default — that is how the existing
+   families keep their public API and their `oasr-server` flags working.
+   Resolution order is defaults → legacy field → `EngineConfig.decode_options`,
+   and an unknown key in `decode_options` **raises** at engine construction
+   naming the valid ones.  Operators reach every knob through the generic
+   `oasr-server --decode-option k=v`, typed from the declared default, so a new
+   family needs no new flag.  This is what stopped `EngineConfig` growing a field
+   per family (it had accumulated nine) and what stopped a Whisper engine
+   constructing a CTC beam config and a WFST config it would never read.
+
+   A knob that governs the *tick loop* rather than one family — `max_tick_ms`,
+   `decode_steps_per_tick`, `max_decode_slots`, `decode_kv_budget_gib` — still
+   belongs on `EngineConfig`: the executor owns those, not the strategy.
+
+   Per-**request** options are a different axis: they live on
+   `oasr.engine.DecodingOptions`, are mirrored by `oasr_wire::DecodingParams`,
+   and the two key sets are asserted equal at engine startup
+   (`DecodingOptions.assert_matches_wire_keys`).  Adding one on a single side
+   used to give an option that was accepted and silently ignored.
 
 **Add a streaming runtime:** `@register_streaming_backend("my_kind")` on a
 `StreamingEncoderBackend` (`allocate` / `forward_step` / `free` + window
 geometry); have the encoder report `streaming_kind = "my_kind"`.
 
+The `consumes` axis is orthogonal to this one and must stay that way.  A backend
+gets the decode strategy's declared `consumes` and picks the matching chunk
+forward — fused `forward_chunk_paged` (encoder + head → log-probs) or
+encoder-only `encode_chunk_paged` (→ hidden).  Everything downstream of that
+choice, CUDA-graph capture included, must treat the result as an opaque
+`(B, chunk, C)` tensor: `GraphedEncoderForward` takes the *callable* and never
+inspects its output, so `consumes` never decides which optimisations a family
+gets.  It used to — capture was gated on `consumes == "log_probs"`, which made
+streaming transducer ~3.5× slower than it needed to be for no reason beyond a
+hardcoded output-buffer name.
+
+One contract the backend owns: a captured graph reuses **one output buffer per
+shape key**, so a tensor it hands out is live only until the next replay at that
+key.  `PagedStreamingBackend` copies exactly when a step can replay a key twice
+(a `B=1` cohort plus a single, or two singles — singles always replay at `B=1`).
+
+**Beam search** is available to both AR shapes and is worth reading before adding
+a third: `decode/transducer_beam.py` (frame-synchronous) keeps hypotheses on the
+**device** because it runs one beam step per encoder frame and a host-side
+reorder would be Θ(T²); `decode/incremental_beam.py` (label-synchronous) keeps
+them as host lists because an AR step is a full decoder forward and `k` list
+copies are free next to it.  The label-synchronous one needs **no new model
+method**: `select(state, idx)` is an `index_select`, so repeated indices both
+expand a prefilled batch into a `B*k` grid and reorder it onto each slot's
+parent.  Both are gated by the same property — beam width 1 must reproduce
+greedy token-for-token — which is the only exactness oracle available without a
+reference implementation.
+
 **Add a batching / partition policy:** `@register_batching_policy("my")` /
 `@register_partition_policy("my")`; set `config.schedule_policy` or the partition
 flags.
 
-**Add a checkpoint format:** implement `CheckpointConverter` (`detect` /
-`build_config` / `build_aux` / `load_state_dict`) + `register_model`;
-`from_pretrained` auto-detects it for both local dirs and HF Hub ids.
+**Add a checkpoint format:** subclass `BaseCheckpointConverter`
+(`oasr/models/converter.py`), declare `architecture` / `source_format` /
+`default_checkpoint_name` / `default_decode_type` / `detect_specificity`, and
+implement three methods — `detect`, `build_config`, `load_state_dict`.  Then
+`register_model`; `from_pretrained` auto-detects it for both local dirs and HF
+Hub ids.
+
+The base provides the bundle assembly (`convert()` was the same twelve lines in
+all six converters), the HuggingFace weight-loading chain
+(sharded safetensors → single → `.bin`, all with `weights_only=True`), and the
+shared `whisper_logmel` feature spec.  Two optional hooks matter:
+`build_decoding_defaults(config, ckpt_dir)` for blank/sos/eos ids, and
+`build_config_for_convert(ckpt_dir, state_dict)` for formats that *infer* the
+architecture from tensor shapes — overriding it reuses the weights `convert`
+already loaded instead of deserialising a multi-GB checkpoint twice.
+
+Inheriting is optional: the registry still accepts anything satisfying the
+protocol, so out-of-tree converters keep working.  Out-of-tree *architectures*
+need no edit here at all — declare a `oasr.models` entry point and the registry
+imports it on first access.
 
 **Add a feature frontend** (e.g. raw waveform for wav2vec, an 8 kHz telephony
 recipe):

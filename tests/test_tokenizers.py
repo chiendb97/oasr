@@ -9,6 +9,7 @@ import pytest
 from oasr.tokenizers import (
     DEFAULT_SPECIAL_IDS,
     SymbolTableTokenizer,
+    Tokenizer,
     TokenizerSpec,
     build_tokenizer,
     list_tokenizers,
@@ -208,3 +209,84 @@ class TestTokenizerContract:
         table.write_text("\n".join(f"p{i} {i}" for i in range(64)))
         tok = SymbolTableTokenizer(str(table))
         assert tok.vocab_size == 64 == tok.vocab_size  # repeat reads agree
+
+
+class TestIncrementalDecode:
+    """T3: a partial must not re-decode the whole prefix every time.
+
+    The contract is that incremental decoding is *indistinguishable* from full
+    decoding — concatenating every delta equals ``decode(all_ids)``, and
+    ``state["text"]`` holds the full transcript at every step.  Any override
+    that trades correctness for speed fails here.
+    """
+
+    def _drive(self, tok, ids, chunk):
+        """Feed ``ids`` through ``decode_incremental`` in chunks of ``chunk``."""
+        state = tok.new_decode_state()
+        deltas = []
+        for i in range(0, len(ids), chunk):
+            deltas.append(tok.decode_incremental(ids[i : i + chunk], state))
+        return deltas, state
+
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 100])
+    def test_symbol_table_matches_full_decode(self, units_file, chunk):
+        tok = build_tokenizer(TokenizerSpec(kind="symbol_table", files={"table": str(units_file)}))
+        ids = [2, 4, 5, 6, 3, 4]
+        deltas, state = self._drive(tok, ids, chunk)
+        assert state["text"] == tok.decode(ids)
+        assert "".join(deltas) == tok.decode(ids)
+
+    def test_symbol_table_skips_special_ids_incrementally(self, units_file):
+        tok = build_tokenizer(TokenizerSpec(kind="symbol_table", files={"table": str(units_file)}))
+        ids = [0, 2, 4, 1, 5, 6, 0]
+        _, state = self._drive(tok, ids, 2)
+        assert state["text"] == tok.decode(ids)
+
+    def test_symbol_table_is_actually_incremental(self, units_file):
+        """Not just correct — it must stop re-decoding the prefix.
+
+        ``symbol_table`` rendering is piece-local, so the override exists; the
+        guard is that it never calls the O(prefix) ``decode``.
+        """
+        tok = build_tokenizer(TokenizerSpec(kind="symbol_table", files={"table": str(units_file)}))
+        calls = []
+        original = tok.decode
+        tok.decode = lambda ids: (calls.append(len(list(ids))), original(ids))[1]
+        self._drive(tok, [2, 4, 5, 6], 1)
+        assert not calls, "the fast path fell back to a full decode"
+
+    @pytest.mark.parametrize("chunk", [1, 3])
+    def test_huggingface_matches_full_decode(self, chunk):
+        tokenizers = pytest.importorskip("tokenizers")
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+
+        vocab = {"[UNK]": 0, "hello": 1, "world": 2, "again": 3, "and": 4}
+        t = tokenizers.Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+        t.pre_tokenizer = Whitespace()
+        import tempfile
+        from pathlib import Path
+
+        d = Path(tempfile.mkdtemp())
+        t.save(str(d / "tokenizer.json"))
+        tok = build_tokenizer(
+            TokenizerSpec(kind="huggingface", files={"tokenizer": str(d / "tokenizer.json")})
+        )
+        ids = [1, 2, 4, 3, 1, 2, 4, 3, 1, 2] * 6  # long enough to force re-anchoring
+        deltas, state = self._drive(tok, ids, chunk)
+        assert "".join(deltas) == tok.decode(ids)
+        assert state["text"] == tok.decode(ids)
+
+    def test_default_fallback_is_correct_for_every_kind(self, units_file):
+        """A kind with no override still returns deltas that sum to the whole."""
+
+        class NoOverride(SymbolTableTokenizer):
+            # Force the base-class fallback path.
+            decode_incremental = Tokenizer.decode_incremental
+            new_decode_state = Tokenizer.new_decode_state
+
+        tok = NoOverride(str(units_file))
+        ids = [2, 4, 5, 6]
+        deltas, state = self._drive(tok, ids, 2)
+        assert "".join(deltas) == tok.decode(ids)
+        assert state["text"] == tok.decode(ids)

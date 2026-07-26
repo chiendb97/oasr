@@ -746,3 +746,239 @@ class TestMultiStreamIsolation:
         att_mgr.free_stream(0)
         att_mgr.free_stream(2)
         assert pool.num_free_blocks == initial - 2
+
+
+class TestBlockPoolFreeValidation:
+    """M6: a double free hands one physical block to two streams.
+
+    Each then overwrites the other's KV with no error anywhere — two silently
+    wrong transcripts.  It costs a set membership to catch here and is
+    effectively undiagnosable downstream.
+    """
+
+    def _pool(self, n=8):
+        from oasr.cache import BlockPool
+        from oasr.cache.types import CacheConfig
+
+        return BlockPool(
+            CacheConfig(
+                num_layers=1,
+                n_kv_head=1,
+                head_dim=8,
+                hidden_dim=8,
+                kernel_size=3,
+                chunk_size=4,
+                num_left_chunks=-1,
+                block_size_frames=4,
+                max_num_blocks=n,
+                max_blocks_per_seq=4,
+                max_batch_size=2,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        )
+
+    def test_double_free_raises(self):
+        pool = self._pool()
+        ids = pool.allocate(2)
+        pool.free(ids)
+        with pytest.raises(ValueError, match="already free"):
+            pool.free(ids)
+
+    def test_double_free_within_one_call_raises(self):
+        pool = self._pool()
+        bid = pool.allocate(1)[0]
+        with pytest.raises(ValueError, match="already free"):
+            pool.free([bid, bid])
+
+    def test_out_of_range_raises(self):
+        pool = self._pool(n=8)
+        with pytest.raises(ValueError, match="out of range"):
+            pool.free([99])
+        with pytest.raises(ValueError, match="out of range"):
+            pool.free([-1])
+
+    def test_empty_free_is_a_noop(self):
+        pool = self._pool()
+        before = pool.num_free_blocks
+        pool.free([])
+        assert pool.num_free_blocks == before
+
+    def test_normal_free_still_returns_blocks(self):
+        pool = self._pool(n=8)
+        ids = pool.allocate(3)
+        assert pool.num_free_blocks == 5
+        pool.free(ids)
+        assert pool.num_free_blocks == 8
+
+
+class TestBatchedEviction:
+    """M2: eviction must cost a fixed number of kernels, not 4 per stream.
+
+    The per-stream version ran a GPU ``.clone()`` of the block-table row plus
+    three scalar GPU writes for every stream every chunk — measured 10.7% of
+    streaming throughput at ``num_left_chunks=8`` and 15.4% at 4, which is why
+    nobody enabled it.  Batching took that to 3.4% / 4.9%.
+
+    Not the ring block table the review proposed: a ring is a *kernel* change to
+    the paged FMHA, a path with two known defects, and batching removes the cost
+    that was actually there.
+    """
+
+    def _mgr(self, num_left_chunks, streams=4, blocks_per_seq=8, recycle=False):
+        from oasr.cache import AttentionCacheManager, BlockPool
+        from oasr.cache.types import CacheConfig
+
+        cfg = CacheConfig(
+            num_layers=1,
+            n_kv_head=1,
+            head_dim=8,
+            hidden_dim=8,
+            kernel_size=3,
+            chunk_size=4,
+            num_left_chunks=num_left_chunks,
+            recycle_streaming_history=recycle,
+            block_size_frames=4,
+            max_num_blocks=streams * blocks_per_seq,
+            max_blocks_per_seq=blocks_per_seq,
+            max_batch_size=streams,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        pool = BlockPool(cfg)
+        mgr = AttentionCacheManager(pool, cfg)
+        for sid in range(streams):
+            mgr.allocate_stream(sid, slot_id=sid)
+        return mgr, pool, cfg
+
+    def _drive(self, mgr, streams, chunks):
+        for _ in range(chunks):
+            mgr.prepare_chunks_batched(list(range(streams)))
+            mgr.commit_chunks_paged_batched(list(range(streams)), 4)
+
+    def test_batched_matches_per_stream_eviction(self):
+        """The batched path must evict exactly what the per-stream one did.
+
+        Same blocks, same block table, same ``cache_seqlens`` — the equivalence
+        oracle for a pure refactor.
+        """
+        n, chunks = 4, 12
+        a, pool_a, _ = self._mgr(num_left_chunks=8)
+        b, pool_b, _ = self._mgr(num_left_chunks=8)
+        # ``a`` uses the batched entry point, ``b`` the single-stream one.
+        for _ in range(chunks):
+            a.prepare_chunks_batched(list(range(n)))
+            a.commit_chunks_paged_batched(list(range(n)), 4)
+            b.prepare_chunks_batched(list(range(n)))
+            for sid in range(n):
+                b.commit_chunk_paged(sid, 4)
+        assert torch.equal(a.block_table, b.block_table)
+        assert torch.equal(a.cache_seqlens, b.cache_seqlens)
+        assert pool_a.num_free_blocks == pool_b.num_free_blocks
+        for sid in range(n):
+            assert a._streams[sid].logical_blocks == b._streams[sid].logical_blocks  # noqa: SLF001
+
+    def test_history_stays_at_the_cap(self):
+        n = 4
+        mgr, _pool, cfg = self._mgr(num_left_chunks=8)
+        cap = cfg.max_logical_blocks
+        self._drive(mgr, n, chunks=20)
+        for sid in range(n):
+            assert len(mgr._streams[sid].logical_blocks) == cap  # noqa: SLF001
+        assert (mgr.cache_seqlens == cap * cfg.block_size_frames).all()
+
+    def test_a_pool_sized_to_the_invariant_does_not_exhaust(self):
+        """Eviction must free *before* allocating.
+
+        Eviction used to run only at commit, i.e. after the allocation, so a
+        stream at its cap had to be handed a block before giving one back — the
+        pool silently needed ``max_batch_size`` blocks of headroom beyond the
+        documented ``max_num_blocks >= max_batch_size * max_logical_blocks``, and
+        a pool sized exactly to it raised ``BlockPool exhausted`` the moment the
+        cap was reached.  This is that config.
+        """
+        n, per = 4, 8
+        mgr, pool, cfg = self._mgr(num_left_chunks=8, streams=n, blocks_per_seq=per)
+        assert pool.num_blocks == n * cfg.max_logical_blocks, "sized to the invariant"
+        self._drive(mgr, n, chunks=30)  # well past the cap
+        assert pool.num_free_blocks == 0  # fully utilised, never over-subscribed
+
+    def test_block_table_rows_hold_the_right_physical_blocks(self):
+        """The shift must preserve logical order, oldest first."""
+        n = 2
+        mgr, _pool, cfg = self._mgr(num_left_chunks=8, streams=n)
+        self._drive(mgr, n, chunks=15)
+        for sid in range(n):
+            held = mgr._streams[sid].logical_blocks  # noqa: SLF001
+            slot = mgr.slot_of(sid)
+            row = mgr.block_table[slot, : len(held)].tolist()
+            assert row == held
+            # Everything past the logical end must be blank.
+            assert mgr.block_table[slot, len(held) :].sum().item() == 0
+
+
+class TestRecycleStreamingHistory:
+    """M1(3): recycling at the ceiling instead of terminating the stream."""
+
+    def _cfg(self, recycle, streams=4, blocks_per_seq=8):
+        from oasr.cache.types import CacheConfig
+
+        return CacheConfig(
+            num_layers=1,
+            n_kv_head=1,
+            head_dim=8,
+            hidden_dim=8,
+            kernel_size=3,
+            chunk_size=4,
+            num_left_chunks=-1,
+            recycle_streaming_history=recycle,
+            block_size_frames=4,
+            max_num_blocks=streams * blocks_per_seq,
+            max_blocks_per_seq=blocks_per_seq,
+            max_batch_size=streams,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+    def test_off_by_default_keeps_unlimited_history(self):
+        cfg = self._cfg(recycle=False)
+        assert cfg.max_logical_blocks is None
+
+    def test_on_derives_the_cap_from_the_configured_ceiling(self):
+        """The cap is exactly where the stream would otherwise be terminated."""
+        cfg = self._cfg(recycle=True)
+        assert cfg.max_logical_blocks == cfg.blocks_per_stream
+
+    def test_an_explicit_cap_still_wins(self):
+        from oasr.cache.types import CacheConfig
+
+        cfg = CacheConfig(
+            num_layers=1,
+            n_kv_head=1,
+            head_dim=8,
+            hidden_dim=8,
+            kernel_size=3,
+            chunk_size=4,
+            num_left_chunks=4,
+            recycle_streaming_history=True,
+            block_size_frames=4,
+            max_num_blocks=64,
+            max_blocks_per_seq=16,
+            max_batch_size=4,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        assert cfg.max_logical_blocks == 4
+
+    def test_a_stream_is_never_at_capacity_when_recycling(self):
+        """The whole point: the stream keeps going instead of being finalised."""
+        from oasr.cache import AttentionCacheManager, BlockPool
+
+        cfg = self._cfg(recycle=True)
+        mgr = AttentionCacheManager(BlockPool(cfg), cfg)
+        mgr.allocate_stream(0, slot_id=0)
+        for _ in range(40):  # far past blocks_per_stream
+            assert not mgr.at_capacity(0)
+            mgr.prepare_chunks_batched([0])
+            mgr.commit_chunks_paged_batched([0], 4)
+        assert len(mgr._streams[0].logical_blocks) == cfg.blocks_per_stream  # noqa: SLF001

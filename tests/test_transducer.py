@@ -419,9 +419,14 @@ class TestEngineTransducer:
 
         enc = ConformerEncoderConfig(
             input_size=80,
-            output_size=64,
-            # 2 heads → head_dim 32: the CuteDSL FMHA can't implement
-            # head_dim 16 (4 heads @ 64) on the paged streaming path.
+            # head_dim 64 (128 / 2).  Bounded on both sides: the CuteDSL FMHA
+            # cannot implement head_dim 16, and at head_dim **32** its paged
+            # streaming path reads stale memory under CUDA-graph capture — a
+            # pre-existing defect that also hits CTC, measured as a run-to-run
+            # varying ~1e-1 log-prob delta vs eager at every model width.  The
+            # old 64/2 fixture sat exactly there; it went unnoticed only
+            # because hidden mode used to be excluded from capture.
+            output_size=128,
             num_blocks=2,
             attention_heads=2,
             linear_units=128,
@@ -462,7 +467,7 @@ class TestEngineTransducer:
         assert len(texts) == 2 and all(isinstance(t, str) for t in texts)
 
     def test_streaming_engine(self, native_ckpt):
-        """Streaming path: hidden-mode paged backend (eager) + session greedy."""
+        """Streaming path: hidden-mode paged backend + session greedy."""
         from oasr.engine import ASREngine, EngineConfig
 
         cfg = EngineConfig(
@@ -473,13 +478,59 @@ class TestEngineTransducer:
             max_blocks_per_seq=64,
         )
         engine = ASREngine(cfg)
-        # Hidden mode must have routed the paged backend off the fused head.
+        # Hidden mode must have routed the paged backend off the fused head...
         backend = engine._model_runner.streaming_backend  # noqa: SLF001
         assert backend._consumes == "hidden"  # noqa: SLF001
-        assert backend._graph_cache is None  # noqa: SLF001
+        # ...and must still get CUDA-graph capture: the capture takes whichever
+        # chunk-forward the strategy routed to, so hidden mode is not a
+        # second-class streaming path (H3).
+        assert backend._graph_cache is not None  # noqa: SLF001
         torch.manual_seed(9)
         text = engine.transcribe(torch.randn(32000))
         assert isinstance(text, str)
+
+    def test_streaming_graph_capture_is_token_identical_to_eager(self, native_ckpt):
+        """Capturing the encoder-only chunk forward must not move a single token.
+
+        The gate for H3: graph replay reuses pre-allocated input/output buffers
+        and a private memory pool, so a capture that baked in the wrong buffer
+        or missed a cache write shows up here as a token divergence rather than
+        as a plausible-looking transcript.
+        """
+        from oasr.engine import ASREngine, EngineConfig
+
+        def run(use_graphs: bool):
+            cfg = EngineConfig(
+                ckpt_dir=str(native_ckpt),
+                service_mode="streaming",
+                max_batch_size=4,
+                max_num_blocks=256,
+                max_blocks_per_seq=64,
+                use_cuda_graphs=use_graphs,
+            )
+            engine = ASREngine(cfg)
+            assert (
+                engine._model_runner.streaming_backend._graph_cache is not None  # noqa: SLF001
+            ) is use_graphs
+            torch.manual_seed(21)
+            wavs = [torch.randn(16000 + 4000 * i) for i in range(4)]
+            ids = [engine.add_streaming_request(request_id=f"g{i}") for i in range(4)]
+            for rid, w in zip(ids, wavs):
+                engine.feed_chunk(rid, w, is_last=True)
+            finals = {}
+            for _ in range(2000):
+                for out in engine.step():
+                    if out.finished:
+                        finals[out.request_id] = list(out.tokens[0]) if out.tokens else []
+                if not (engine.num_running or engine.num_waiting):
+                    break
+            return finals
+
+        eager = run(False)
+        graphed = run(True)
+        assert set(eager) == set(graphed) == {f"g{i}" for i in range(4)}
+        for rid in eager:
+            assert graphed[rid] == eager[rid], rid
 
     @pytest.mark.parametrize("stride", [1, 2, 3, 64])
     def test_greedy_is_invariant_to_the_termination_check_stride(self, native_ckpt, stride):
@@ -523,3 +574,170 @@ class TestEngineTransducer:
                 )
         finally:
             transducer_mod._TERMINATION_CHECK_STRIDE = original  # noqa: SLF001
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="beam search runs on the model device")
+class TestTransducerBeamSearch:
+    """Modified beam search (P4), validated by properties rather than an oracle.
+
+    There is no conformer-transducer checkpoint in the tree, so WER is not
+    available — and a WER number on random weights would be meaningless anyway.
+    What *is* available are four properties that a correct implementation must
+    have and a buggy one almost certainly breaks.
+    """
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        from oasr.models.conformer.config import ConformerEncoderConfig
+        from oasr.models.transducer import TransducerModel, TransducerModelConfig
+
+        enc = ConformerEncoderConfig(
+            input_size=80,
+            output_size=64,
+            num_blocks=2,
+            attention_heads=2,
+            linear_units=128,
+            cnn_module_kernel=15,
+            causal=True,
+            embed_layer_norm=False,
+        )
+        cfg = TransducerModelConfig(
+            encoder_type="conformer",
+            encoder=enc,
+            vocab_size=48,
+            decoder_dim=32,
+            joiner_dim=32,
+            context_size=2,
+        )
+        torch.manual_seed(11)
+        return TransducerModel.from_config(cfg).eval().to("cuda", torch.float32)
+
+    def _set_blank_bias(self, model, bias):
+        """Steer the emission rate; random weights almost never pick blank."""
+        with torch.no_grad():
+            b = model.joiner.output_linear.bias
+            b.zero_()
+            b[int(model.blank_id)] = bias
+
+    def _enc(self, model, B=4, T=40):
+        torch.manual_seed(3)
+        enc = torch.randn(B, T, model.encoder.output_size, device="cuda")
+        lengths = torch.tensor([T, T - 5, T - 11, T][:B], device="cuda")
+        return enc, lengths
+
+    def _strategy(self, model, beam, max_sym):
+        from oasr.engine.decode.transducer import TransducerDecodeStrategy
+
+        cfg = SimpleNamespace(
+            device="cuda",
+            transducer_max_sym_per_frame=max_sym,
+            decode_options={"beam_size": beam},
+            partial_decode_interval=1,
+        )
+        detok = SimpleNamespace(
+            detokenize=lambda ids: " ".join(map(str, ids)),
+            new_state=lambda: {"ids": [], "text": ""},
+            detokenize_incremental=lambda n, st: "",
+        )
+        return TransducerDecodeStrategy(cfg, detok, model)
+
+    def _beam_rows(self, model, enc, lengths, beam):
+        from oasr.engine.decode.transducer_beam import beam_search_chunk, init_beam_state
+
+        st = init_beam_state(model.decoder, enc.size(0), beam, enc.device, capacity=enc.size(1))
+        st = beam_search_chunk(model, enc, lengths, st)
+        return st.hypotheses()
+
+    @pytest.mark.parametrize("blank_bias", [2.0, 0.5, -1.0])
+    def test_beam_one_reproduces_greedy(self, model, blank_bias):
+        """``beam=1`` and greedy at ``max_sym_per_frame=1`` are the same algorithm.
+
+        Both take the argmax and advance one frame, so they must agree token for
+        token.  This is the exactness gate: an off-by-one in the parent gather,
+        the blank handling or the token scatter shows up here immediately, where
+        a WER comparison would hide it.  Parameterised over the blank bias so the
+        check covers the all-blank, sparse and dense emission regimes — with
+        random weights argmax almost never picks blank, and an emit-nothing run
+        would pass trivially.
+        """
+        self._set_blank_bias(model, blank_bias)
+        enc, lengths = self._enc(model)
+        strat = self._strategy(model, beam=1, max_sym=1)
+        ctx, dp = strat._init_state(enc.size(0), enc.device)  # noqa: SLF001
+        greedy, _, _ = strat._greedy_loop(enc, lengths, ctx, dp)  # noqa: SLF001
+        rows, _ = self._beam_rows(model, enc, lengths, beam=1)
+        assert [r[0] for r in rows] == greedy
+
+    def test_wider_beams_never_score_worse(self, model):
+        """A wider beam explores a superset, so its best cannot be worse."""
+        self._set_blank_bias(model, 0.5)
+        enc, lengths = self._enc(model)
+        prev = None
+        for k in (1, 2, 4, 8):
+            _, scores = self._beam_rows(model, enc, lengths, beam=k)
+            best = [s[0] for s in scores]
+            if prev is not None:
+                for i, (now, before) in enumerate(zip(best, prev)):
+                    assert now >= before - 1e-4, f"beam {k} regressed on row {i}"
+            prev = best
+
+    def test_nbest_is_ordered_and_sized(self, model):
+        """``n_best`` finally means something for this family (T5)."""
+        self._set_blank_bias(model, 0.5)
+        enc, lengths = self._enc(model)
+        rows, scores = self._beam_rows(model, enc, lengths, beam=4)
+        for b in range(enc.size(0)):
+            assert len(rows[b]) == 4 and len(scores[b]) == 4
+            assert scores[b] == sorted(scores[b], reverse=True)
+
+    def test_padding_frames_do_not_touch_a_short_row(self, model):
+        """A short utterance in a mixed batch must decode as if it were alone.
+
+        The per-row ``active`` mask is what guarantees this; without it the
+        padding frames the batch forced on a short row would keep extending its
+        hypothesis.
+        """
+        self._set_blank_bias(model, 0.5)
+        enc, lengths = self._enc(model)
+        rows_batched, _ = self._beam_rows(model, enc, lengths, beam=4)
+        for b in range(enc.size(0)):
+            L = int(lengths[b])
+            solo, _ = self._beam_rows(
+                model, enc[b : b + 1, :L], lengths[b : b + 1].clamp(max=L), beam=4
+            )
+            assert rows_batched[b] == solo[0], f"row {b} differs when batched"
+
+    def test_streaming_beam_matches_offline_beam(self, model):
+        """Chunked beam search must equal one-shot beam search over the same audio.
+
+        The session carries the ``(1, k, ...)`` state across chunks and the group
+        is re-stacked every tick (streams are grouped by chunk length), so this is
+        the test that the stack/select round trip preserves the beam exactly.
+        """
+        from oasr.engine.decode.transducer_beam import (
+            beam_search_chunk,
+            init_beam_state,
+            select_rows,
+            stack_states,
+        )
+
+        self._set_blank_bias(model, 0.5)
+        B, T, chunk = 3, 36, 12
+        torch.manual_seed(5)
+        enc = torch.randn(B, T, model.encoder.output_size, device="cuda")
+        lengths = torch.full((B,), T, dtype=torch.long, device="cuda")
+        offline, _ = self._beam_rows(model, enc, lengths, beam=4)
+
+        # Chunked, with a stack/select round trip between every chunk.
+        per_stream = [init_beam_state(model.decoder, 1, 4, enc.device) for _ in range(B)]
+        for start in range(0, T, chunk):
+            piece = enc[:, start : start + chunk]
+            lens = torch.full((B,), piece.size(1), dtype=torch.long, device=enc.device)
+            state = stack_states(per_stream)
+            state = beam_search_chunk(model, piece, lens, state)
+            per_stream = [
+                select_rows(state, torch.tensor([b], device=enc.device)) for b in range(B)
+            ]
+        streamed = [s.hypotheses()[0][0] for s in per_stream]
+        for b in range(B):
+            assert streamed[b] == offline[b], f"stream/offline beam differ on row {b}"

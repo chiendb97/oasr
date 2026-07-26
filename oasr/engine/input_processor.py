@@ -75,6 +75,14 @@ class InputProcessor:
         #                     run here on the GPU (see :meth:`collate`).
         self._wav_flat: Optional[torch.Tensor] = None
         self._wav_padded: Optional[torch.Tensor] = None
+        # Streaming staging (M5) — grow-once, so a step does not page-lock.
+        self._stream_flat: Optional[torch.Tensor] = None
+        self._stream_lens: Optional[torch.Tensor] = None
+        # Ceiling on a *retained* staging buffer, in float32 elements (M4).
+        # Default 256 Mi elements = 1 GiB, comfortably above
+        # ``max_batch_size`` x a full-length utterance at 16 kHz; a batch past
+        # it allocates per call rather than pinning that much for good.
+        self._max_staging_elems = int(getattr(config, "max_staging_elems", None) or (256 << 20))
 
         # Shared CUDA Graph memory-pool handle injected by ``ASREngine`` so the
         # feature-extraction graph cache (added in Step 2 of the plan) shares
@@ -204,11 +212,39 @@ class InputProcessor:
         is fully transferred (and the batch D→H-synced at decode) before the
         next collate overwrites it — :class:`OfflineExecutor` runs micro-batches
         back-to-back on the default stream with no producer-thread overlap.
+
+        Beyond :attr:`_max_staging_elems` the buffer is **not** retained: pinned
+        memory is a process-global scarce resource and geometric growth sized by
+        the longest utterance ever seen never shrinks, so one outlier request
+        would hold its peak for the process lifetime.  Past the cap we allocate
+        per call and let it go.
         """
+        # Pinning is a CUDA operation and *fails* without a usable device, so
+        # it follows the engine's device rather than being unconditional — a
+        # CPU engine gains nothing from page-locked host memory anyway.
+        pin = self._device.type == "cuda"
+        if n > self._max_staging_elems:
+            return torch.empty(n, dtype=torch.float32, pin_memory=pin)
         cur = 0 if self._wav_flat is None else self._wav_flat.numel()
         if cur < n:
-            self._wav_flat = torch.empty(max(n, cur * 2), dtype=torch.float32, pin_memory=True)
+            self._wav_flat = torch.empty(
+                min(max(n, cur * 2), self._max_staging_elems),
+                dtype=torch.float32,
+                pin_memory=pin,
+            )
         return self._wav_flat[:n]
+
+    def release_staging(self) -> None:
+        """Drop the reusable staging buffers (called on engine teardown / idle).
+
+        Without this the pinned host buffer and its device twin survive as long
+        as the ``InputProcessor`` does, which for a long-lived server is the
+        process.
+        """
+        self._wav_flat = None
+        self._wav_padded = None
+        self._stream_flat = None
+        self._stream_lens = None
 
     def _padded_device(self, batch: int, t_max: int) -> torch.Tensor:
         """Reused **device** buffer viewed as ``(batch, t_max)`` (geometric
@@ -216,12 +252,45 @@ class InputProcessor:
         zeroes it, scatters the packed waveforms in, then scales — all on the
         GPU.  Reuse is safe for the same reason as :meth:`_flat_host`."""
         need = batch * t_max
+        if need > self._max_staging_elems:
+            return torch.empty(need, dtype=torch.float32, device=self._device).view(batch, t_max)
         cur = 0 if self._wav_padded is None else self._wav_padded.numel()
         if cur < need:
             self._wav_padded = torch.empty(
-                max(need, cur * 2), dtype=torch.float32, device=self._device
+                min(max(need, cur * 2), self._max_staging_elems),
+                dtype=torch.float32,
+                device=self._device,
             )
         return self._wav_padded[:need].view(batch, t_max)
+
+    def _stream_host(self, batch: int, t_max: int) -> torch.Tensor:
+        """Reused pinned ``(batch, t_max)`` host buffer for streaming staging.
+
+        Same grow-once discipline as :meth:`_flat_host`, and safe for the same
+        reason plus one more: the streaming H2D is issued on the feature stream
+        and the caller inserts an event-wait before the next step reads the
+        result, so the copy has completed before this buffer is rewritten.
+        """
+        need = batch * t_max
+        cur = 0 if self._stream_flat is None else self._stream_flat.numel()
+        if cur < need:
+            self._stream_flat = torch.empty(
+                max(need, cur * 2),
+                dtype=torch.float32,
+                pin_memory=(self._device.type == "cuda"),
+            )
+        return self._stream_flat[:need].view(batch, t_max)
+
+    def _stream_lengths_host(self, batch: int) -> torch.Tensor:
+        """Reused pinned ``(batch,)`` int64 host buffer for streaming lengths."""
+        cur = 0 if self._stream_lens is None else self._stream_lens.numel()
+        if cur < batch:
+            self._stream_lens = torch.empty(
+                max(batch, cur * 2),
+                dtype=torch.int64,
+                pin_memory=(self._device.type == "cuda"),
+            )
+        return self._stream_lens[:batch]
 
     def collate(
         self,
@@ -317,8 +386,15 @@ class InputProcessor:
         lengths_device = wav_lengths.to(self._device, non_blocking=True)
         features_f32, feat_lengths = self._extractor(wav_device, lengths_device, fcfg)
         if fcfg.lfr_enabled:
+            # ``features_f32`` is padded to the batch's widest row, so its own
+            # T bounds every per-row length — pass it so LFR need not sync to
+            # read the max off the device.
             features_f32, feat_lengths = apply_lfr_batch(
-                features_f32, feat_lengths, fcfg.lfr_m, fcfg.lfr_n
+                features_f32,
+                feat_lengths,
+                fcfg.lfr_m,
+                fcfg.lfr_n,
+                max_length=int(features_f32.size(1)),
             )
         return features_f32.to(dtype=self._config.dtype), feat_lengths
 
@@ -535,15 +611,19 @@ class InputProcessor:
         # bytes it then clobbered.  In steady state every row is exactly T_max
         # long (all streams fed equal chunks) so no tail zeroing runs at all;
         # only ragged / flush steps touch ``zero_``.
-        padded_cpu = torch.empty(len(fbank_inputs), t_max, dtype=torch.float32)
+        # Reused pinned staging: ``pin_memory()`` is a ``cudaHostAlloc`` + copy,
+        # and this ran **twice per streaming step** on the default path (the
+        # stable-buffer variant existed only behind ``use_feature_cuda_graphs``,
+        # which is off by default).  Page-locking is a kernel-level operation
+        # that also serialises against the driver, so at streaming cadence it is
+        # a per-step tax for a buffer whose shape barely changes.
+        padded_cpu = self._stream_host(len(fbank_inputs), t_max)
         for i, w in enumerate(fbank_inputs):
             n = w.numel()
             padded_cpu[i, :n] = w
             if n < t_max:
                 padded_cpu[i, n:].zero_()
-        if device.type == "cuda":
-            padded_cpu = padded_cpu.pin_memory()
-            lengths_cpu = lengths_cpu.pin_memory()
+        lengths_cpu = self._stream_lengths_host(len(fbank_inputs)).copy_(lengths_cpu)
         nvtx_pop()
 
         use_batched = device.type == "cuda" and (

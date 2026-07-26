@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, ClassVar, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -98,6 +98,37 @@ class LoadReport:
         if self.missing:
             parts.append(f"{len(self.missing)} model tensors not filled")
         return "LoadReport: " + ", ".join(parts)
+
+    @classmethod
+    def build(
+        cls,
+        loaded: Mapping[str, Any],
+        missing: Sequence[str],
+        unexpected: Sequence[str],
+        dropped: Optional[Sequence[str]] = None,
+        expected_missing: Sequence[str] = (),
+    ) -> "LoadReport":
+        """Assemble a report from a ``load_state_dict`` result.
+
+        One builder because the six models disagreed on two things that matter.
+        *Membership*: four tested ``k not in unexpected`` against a **list**, so
+        the accounting was O(n²) in checkpoint size — noticeable on an 8 B
+        model. *Completeness*: only two folded ``unexpected`` into ``dropped``,
+        so for the other four the registry's capability-drop check never saw the
+        keys the model actually refused, which is exactly the silent weight drop
+        :class:`LoadReport` exists to prevent.
+
+        ``expected_missing`` names model keys a checkpoint is not required to
+        fill (computed buffers such as Conformer's ``pos_enc.pe``); they are
+        filtered out rather than reported.
+        """
+        unexpected_set = set(unexpected)
+        skip = set(expected_missing)
+        return cls(
+            mapped=[k for k in loaded if k not in unexpected_set],
+            dropped=list(dropped or ()) + list(unexpected),
+            missing=[k for k in missing if k not in skip],
+        )
 
 
 def coerce_config(cls: type, d: Mapping[str, Any]) -> Any:

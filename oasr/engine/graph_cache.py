@@ -5,11 +5,19 @@
 A standalone PyTorch :class:`torch.cuda.CUDAGraph` is captured per
 ``(B_active, cache_t1_bucket)`` shape. Captures are lazy on first
 encounter; replays reuse pre-allocated input buffers (``xs``,
-``slot_ids``, ``offset``) and the captured output buffer ``log_probs``.
+``slot_ids``, ``offset``) and the captured output buffer.
 The CNN cache is read/written in place inside the captured forward via
 a :class:`~oasr.cache.SlotCnnCache` descriptor, so the persistent
 ``CnnCacheManager`` buffer is updated directly without a separate
 post-replay scatter.
+
+The captured callable is injected (``chunk_forward``), so the same machinery
+serves both streaming shapes: the fused ``forward_chunk_paged``
+(encoder + CTC head → ``(B, chunk, V)`` log-probs) that one-shot families
+consume, and the encoder-only ``encode_chunk_paged``
+(→ ``(B, chunk, D)`` hidden) that ``consumes="hidden"`` families such as the
+transducer consume.  Nothing here inspects the output beyond its identity as a
+tensor, so a new streaming decode family needs no change in this file.
 
 Steady-state streaming is launch-bound — the model's 12-layer conformer
 encoder issues ~200 small kernels per chunk, and at 32 streams ×
@@ -36,7 +44,7 @@ Capture constraints
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import tvm_ffi
@@ -70,29 +78,27 @@ class _CapturedShape:
     # each replay we refresh them with the current state via copy_().
     batched_block_table: torch.Tensor
     batched_cache_seqlens: torch.Tensor
-    log_probs_out: torch.Tensor
+    output_buf: torch.Tensor
 
 
 class GraphedEncoderForward:
-    """Lazy CUDA-Graph cache for the batched paged encoder forward.
+    """Lazy CUDA-Graph cache for the batched paged chunk forward.
 
     Parameters
     ----------
-    model : BaseAsrModel
-        The model whose ``forward_chunk_paged`` is captured.
+    chunk_forward : callable
+        The chunk forward to capture, invoked as
+        ``chunk_forward(xs, offset, att_caches, cnn_cache, cache_t1=...)``.
+        Pass ``model.forward_chunk_paged`` for the fused encoder+head path
+        (``(B, chunk, V)`` log-probs) or ``model.encode_chunk_paged`` for the
+        encoder-only path (``(B, chunk, D)`` hidden).  The capture is
+        output-shape agnostic; only the frame count ``size(1)`` is read back by
+        the caller.
     att_mgr, cnn_mgr : cache managers
         Provide the persistent batched paging / CNN-cache tensors that the
         graph reads from.
-    cache_dtype, device :
-        Dtype / device of the persistent state.
-    window : int
-        Input feature frames per chunk (``cfg.decoding_window``).
-    feat_dim : int
-        Input feature dimensionality.
-    cnn_cache_frames : int
-        CNN cache frames (== ``kernel_size - 1``).
-    num_layers, hidden_dim : int
-        Encoder dimensions used to allocate the persistent CNN buffer.
+    device : torch.device
+        Device of the persistent state (used to synchronise around capture).
     pool : tuple of int, optional
         Shared CUDA Graph memory-pool handle (from
         ``torch.cuda.graph_pool_handle()``) used by every engine-level
@@ -102,29 +108,17 @@ class GraphedEncoderForward:
 
     def __init__(
         self,
-        model,
+        chunk_forward: Callable[..., torch.Tensor],
         att_mgr: AttentionCacheManager,
         cnn_mgr: CnnCacheManager,
         *,
-        cache_dtype: torch.dtype,
         device: torch.device,
-        window: int,
-        feat_dim: int,
-        cnn_cache_frames: int,
-        num_layers: int,
-        hidden_dim: int,
         pool: Optional[Tuple[int, int]] = None,
     ) -> None:
-        self._model = model
+        self._chunk_forward = chunk_forward
         self._att_mgr = att_mgr
         self._cnn_mgr = cnn_mgr
-        self._cache_dtype = cache_dtype
         self._device = device
-        self._window = window
-        self._feat_dim = feat_dim
-        self._cnn_cache_frames = cnn_cache_frames
-        self._num_layers = num_layers
-        self._hidden_dim = hidden_dim
 
         # Captured graph cache, keyed by (B_active, cache_t1_bucket).
         # All captures share one CUDA Graph memory pool so that the
@@ -201,11 +195,13 @@ class GraphedEncoderForward:
 
         Returns
         -------
-        log_probs : Tensor or None
-            ``(B, chunk_size, vocab_size)`` log-softmax output. **Aliases
-            the captured buffer**; callers must consume it before the next
-            replay or clone. Returns ``None`` when the per-shape capture
-            cache is saturated (caller falls back to eager mode).
+        out : Tensor or None
+            Whatever ``chunk_forward`` produces — ``(B, chunk_size, vocab_size)``
+            log-probs for the fused path, ``(B, chunk_size, hidden_dim)`` for the
+            encoder-only path. **Aliases the captured buffer**; callers must
+            consume it before the next replay at the same shape key, or clone.
+            Returns ``None`` when the per-shape capture cache is saturated
+            (caller falls back to eager mode).
         """
         key = (B, T_input, cache_t1_bucket)
         state = self._captured.get(key)
@@ -241,7 +237,7 @@ class GraphedEncoderForward:
         )
 
         state.graph.replay()
-        return state.log_probs_out
+        return state.output_buf
 
     # ------------------------------------------------------------------
     # Capture
@@ -302,7 +298,7 @@ class GraphedEncoderForward:
         cnn_cache = SlotCnnCache(buffer=self._cnn_mgr.buffer, slot_ids=slot_ids_buf)
 
         def _run() -> torch.Tensor:
-            return self._model.forward_chunk_paged(
+            return self._chunk_forward(
                 xs_buf,
                 offset_buf,
                 caches,
@@ -336,7 +332,7 @@ class GraphedEncoderForward:
         # captured into ``graph`` (rather than escaping to the default
         # stream and tripping ``cudaErrorIllegalAddress`` on replay).
         with tvm_ffi.use_torch_stream(torch.cuda.graph(graph, pool=self._pool)):
-            log_probs_out = _run()
+            output_buf = _run()
 
         # Restore again so the first real replay (line below in caller)
         # reads the engine's pre-chunk CNN state.
@@ -349,7 +345,7 @@ class GraphedEncoderForward:
             offset_buf=offset_buf,
             batched_block_table=batched_bt,
             batched_cache_seqlens=batched_cs,
-            log_probs_out=log_probs_out,
+            output_buf=output_buf,
         )
 
 

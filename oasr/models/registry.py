@@ -158,22 +158,70 @@ def register_model(
     _REGISTRY[name] = ModelEntry(model_cls, config_cls, converter)
 
 
+#: Built-in model packages, imported on first registry access so their
+#: ``register_model`` calls run.  A list, not an if-chain: adding an
+#: architecture is one entry, and it cannot drift out of sync with
+#: ``models/__init__`` the way six hand-written guards did.
+_BUILTIN_PACKAGES: Tuple[str, ...] = (
+    "conformer",
+    "zipformer",
+    "transducer",
+    "whisper",
+    "paraformer",
+    "speech_llm",
+)
+
+#: setuptools entry-point group for out-of-tree architectures.  A third-party
+#: package declares ``[project.entry-points."oasr.models"] my_arch = "pkg.mod"``
+#: and its module is imported on first registry access, so ``register_model``
+#: runs without anyone editing this file.  That closes the last "adding a model
+#: means editing engine core" gap in the extensibility scorecard.
+_ENTRY_POINT_GROUP = "oasr.models"
+
+_builtins_loaded = False
+
+
 def _ensure_builtins() -> None:
-    """Import built-in model packages so their ``register_model`` calls run."""
-    # Importing each package triggers its __init__ registration. Kept lazy to
-    # avoid an import cycle (each arch imports this module to register).
-    if "conformer" not in _REGISTRY:
-        import oasr.models.conformer  # noqa: F401
-    if "zipformer" not in _REGISTRY:
-        import oasr.models.zipformer  # noqa: F401
-    if "transducer" not in _REGISTRY:
-        import oasr.models.transducer  # noqa: F401
-    if "whisper" not in _REGISTRY:
-        import oasr.models.whisper  # noqa: F401
-    if "paraformer" not in _REGISTRY:
-        import oasr.models.paraformer  # noqa: F401
-    if "speech_llm" not in _REGISTRY:
-        import oasr.models.speech_llm  # noqa: F401
+    """Import built-in + entry-point model packages so registration runs."""
+    global _builtins_loaded
+    if _builtins_loaded:
+        return
+    # Kept lazy to avoid an import cycle (each arch imports this module to
+    # register).  The flag makes this a no-op after the first call rather than
+    # a per-access membership scan.
+    import importlib
+
+    for pkg in _BUILTIN_PACKAGES:
+        importlib.import_module(f"oasr.models.{pkg}")
+    _load_entry_point_models()
+    _builtins_loaded = True
+
+
+def _load_entry_point_models() -> None:
+    """Import any third-party architectures advertised via entry points.
+
+    A broken plugin must not take down the built-in models with it, so each
+    import failure is warned about and skipped — a user who installed an
+    incompatible plugin should still be able to run Conformer.
+    """
+    try:
+        from importlib.metadata import entry_points
+    except ImportError:  # pragma: no cover - Python < 3.8
+        return
+    try:
+        found = entry_points(group=_ENTRY_POINT_GROUP)
+    except TypeError:  # pragma: no cover - Python < 3.10 selection API
+        found = entry_points().get(_ENTRY_POINT_GROUP, [])  # type: ignore[attr-defined]
+    for ep in found:
+        try:
+            ep.load()
+        except Exception as exc:  # pragma: no cover - depends on installed pkgs
+            logger.warning(
+                "could not load model plugin %r from entry point group %r: %s",
+                getattr(ep, "name", ep),
+                _ENTRY_POINT_GROUP,
+                exc,
+            )
 
 
 def get_model_entry(name: str) -> ModelEntry:

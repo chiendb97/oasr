@@ -68,5 +68,30 @@ class SymbolTableTokenizer(Tokenizer):
             "tokenizer spec for checkpoints that need prompt encoding"
         )
 
+    def decode_incremental(self, new_ids, state):
+        """Truly incremental: this kind's rendering is piece-local.
+
+        ``decode`` is a table lookup, a join, a ``▁`` → space substitution and a
+        ``strip``.  Every step but the strip is per-piece, so appending tokens
+        cannot change how earlier ones render — the only coupling is the leading
+        / trailing whitespace that ``strip`` removes.  Track the unstripped join
+        and strip on the way out, and the cost is O(new tokens) rather than
+        O(whole prefix) per partial.
+        """
+        raw = state.get("raw", "")
+        ids = state.setdefault("ids", [])
+        for t in new_ids:
+            t = int(t)
+            ids.append(t)
+            if t not in self._special_ids:
+                raw += self._table.get(t, "")
+        state["raw"] = raw
+        full = raw.replace("▁", " ").strip()
+        prev = state.get("text", "")
+        state["text"] = full
+        # Leading-space stripping means a delta can start mid-word only on the
+        # very first emission; after that the prefix is stable.
+        return full[len(prev) :] if full.startswith(prev) else full
+
 
 register_tokenizer("symbol_table", SymbolTableTokenizer.from_spec)

@@ -23,6 +23,7 @@ name mapping:
 from __future__ import annotations
 
 import math
+from typing import Dict, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +35,26 @@ from torch import nn
 LAYER_NORM_EPS = 1e-12
 
 
+#: Cache of computed PE tables, keyed by ``(depth, device_str)``.  Values are
+#: fp32 ``(1, L, depth)`` tensors, grown (never shrunk) as longer audio arrives.
+_PE_CACHE: Dict[Tuple[int, str], torch.Tensor] = {}
+#: Rounding for the cached PE length, so a few distinct audio lengths do not
+#: each trigger a rebuild.
+_PE_GROWTH = 512
+
+
+def _build_pe_fp32(length: int, depth: int, device: torch.device) -> torch.Tensor:
+    """The FunASR PE table, always computed in fp32."""
+    positions = torch.arange(1, length + 1, device=device, dtype=torch.float32)
+    half = depth // 2
+    log_timescale_increment = math.log(10000.0) / (depth / 2 - 1)
+    inv_timescales = torch.exp(
+        torch.arange(half, device=device, dtype=torch.float32) * -log_timescale_increment
+    )
+    scaled_time = positions.unsqueeze(1) * inv_timescales.unsqueeze(0)
+    return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1).unsqueeze(0)
+
+
 def sinusoidal_position_encoding(
     length: int, depth: int, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -41,15 +62,25 @@ def sinusoidal_position_encoding(
 
     ``pe[:, t] = [sin(t·inv), cos(t·inv)]`` with ``inv_i = exp(-i·ln(10000) /
     (depth/2 - 1))`` — note the concatenated (not interleaved) sin/cos halves.
+
+    Two things this fixes over recomputing inline per forward (N1):
+
+    * **Built in fp32, cast on the way out.**  Under fp16 the integer position
+      ladder ``arange(1, L+1)`` is exact only to 2048; past that consecutive
+      positions start colliding, and every trig value derived from them is
+      wrong.  FunASR computes in fp32, so matching it is also a parity
+      requirement, not only a precision nicety.
+    * **Cached per (depth, device).**  It is a pure function of those plus the
+      length, and it was rebuilt — arange, exp, outer product, two trig passes,
+      a cat — on *every* encoder forward.
     """
-    positions = torch.arange(1, length + 1, device=device, dtype=dtype)
-    half = depth // 2
-    log_timescale_increment = math.log(10000.0) / (depth / 2 - 1)
-    inv_timescales = torch.exp(
-        torch.arange(half, device=device, dtype=dtype) * -log_timescale_increment
-    )
-    scaled_time = positions.unsqueeze(1) * inv_timescales.unsqueeze(0)
-    return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1).unsqueeze(0)
+    key = (int(depth), str(device))
+    cached = _PE_CACHE.get(key)
+    if cached is None or cached.size(1) < length:
+        grown = ((length + _PE_GROWTH - 1) // _PE_GROWTH) * _PE_GROWTH
+        cached = _build_pe_fp32(max(grown, length), depth, device)
+        _PE_CACHE[key] = cached
+    return cached[:, :length].to(dtype=dtype)
 
 
 class FsmnBlock(nn.Module):

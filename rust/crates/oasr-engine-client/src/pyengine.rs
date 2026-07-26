@@ -10,6 +10,7 @@
 use bytes::Bytes;
 use numpy::{PyArray1, PyArrayMethods};
 use oasr_wire::{DecodingParams, ErrorCode, Event, ModelInfo};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use thiserror::Error;
@@ -89,6 +90,10 @@ impl PyEngine {
     /// `engine_worker._load_engine_config` did the same.
     pub fn new(engine_config_json: &str) -> Result<Self, PyEngineError> {
         Python::with_gil(|py| {
+            // Before anything else: the per-request option table must agree
+            // across the boundary, or options silently vanish (S9).
+            assert_decoding_option_keys_match(py)?;
+
             // Parse the JSON into a Python dict using `json.loads` so we keep
             // serde out of the GIL critical section.
             let json_mod = PyModule::import_bound(py, "json")?;
@@ -413,6 +418,11 @@ impl PyEngine {
                     .and_then(|x| x.extract::<Option<Vec<(f32, f32)>>>().ok())
                     .unwrap_or(None)
                     .and_then(|ts| ts.last().map(|&(_, end)| end));
+                let finish_reason: Option<String> = item
+                    .getattr("finish_reason")
+                    .ok()
+                    .and_then(|x| x.extract::<Option<String>>().ok())
+                    .unwrap_or(None);
                 Event::Final {
                     request_id: rid,
                     text,
@@ -420,6 +430,7 @@ impl PyEngine {
                     scores,
                     nbest_texts,
                     end_time_s,
+                    finish_reason,
                 }
             } else {
                 Event::Partial {
@@ -447,26 +458,68 @@ fn decoding_params_dict<'py>(
         Some(p) if !p.is_empty() => p,
         _ => return Ok(None),
     };
+    // Keys come from `DecodingParams::OPTION_KEYS`, the single source of truth
+    // on this side, so a field added to the struct cannot quietly miss the dict
+    // (`option_keys_cover_every_field` in oasr-wire enforces the match, and
+    // `assert_decoding_option_keys_match` enforces it against Python).
     let d = PyDict::new_bound(py);
-    if let Some(v) = p.n_best {
-        d.set_item("n_best", v)?;
-    }
-    if let Some(v) = p.max_new_tokens {
-        d.set_item("max_new_tokens", v)?;
-    }
-    if let Some(v) = p.temperature {
-        d.set_item("temperature", v)?;
-    }
-    if let Some(v) = p.top_k {
-        d.set_item("top_k", v)?;
-    }
-    if let Some(v) = p.top_p {
-        d.set_item("top_p", v)?;
-    }
-    if let Some(v) = &p.prompt {
-        d.set_item("prompt", v.as_str())?;
+    for key in DecodingParams::OPTION_KEYS {
+        match *key {
+            "n_best" => {
+                if let Some(v) = p.n_best {
+                    d.set_item(key, v)?;
+                }
+            }
+            "max_new_tokens" => {
+                if let Some(v) = p.max_new_tokens {
+                    d.set_item(key, v)?;
+                }
+            }
+            "temperature" => {
+                if let Some(v) = p.temperature {
+                    d.set_item(key, v)?;
+                }
+            }
+            "top_k" => {
+                if let Some(v) = p.top_k {
+                    d.set_item(key, v)?;
+                }
+            }
+            "top_p" => {
+                if let Some(v) = p.top_p {
+                    d.set_item(key, v)?;
+                }
+            }
+            "prompt" => {
+                if let Some(v) = &p.prompt {
+                    d.set_item(key, v.as_str())?;
+                }
+            }
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "DecodingParams::OPTION_KEYS names {other:?} but \
+                     decoding_params_dict has no arm for it"
+                )))
+            }
+        }
     }
     Ok(Some(d))
+}
+
+/// Cross-check the per-request option table against Python, once, at startup.
+///
+/// Silent drift is the failure mode S9 catalogued: a field added on one side
+/// only makes requests carrying that option accepted and ignored, with nothing
+/// logged at either end. One call turns that into a startup error naming the
+/// keys that disagree.
+pub fn assert_decoding_option_keys_match(py: Python<'_>) -> PyResult<()> {
+    let request_mod = py.import_bound("oasr.engine.request")?;
+    let options = request_mod.getattr("DecodingOptions")?;
+    options.call_method1(
+        "assert_matches_wire_keys",
+        (DecodingParams::OPTION_KEYS.to_vec(),),
+    )?;
+    Ok(())
 }
 
 /// Decode raw little-endian f32 audio bytes into a writable numpy array on

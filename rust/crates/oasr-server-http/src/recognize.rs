@@ -45,6 +45,11 @@ pub struct SpeechRecognitionResult {
     /// families with token alignments (Paraformer CIF).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_end_time_s: Option<f32>,
+    /// Why generation stopped — `"stop"` (EOS) or `"length"` (hit the
+    /// generation cap).  Present only for the AR families; without it a
+    /// truncated transcript looks exactly like a complete one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -355,6 +360,7 @@ async fn run_offline(
             scores,
             nbest_texts,
             end_time_s,
+            finish_reason,
         } => {
             let n_tokens = tokens.first().map_or(0, |t| t.len());
             info!(
@@ -372,6 +378,7 @@ async fn run_offline(
                     channel_tag: 0,
                     language_code: String::new(),
                     result_end_time_s: end_time_s,
+                    finish_reason,
                 }],
                 request_id,
             })

@@ -56,6 +56,24 @@ pub const MAX_N_BEST: u32 = 30;
 pub const MAX_PROMPT_BYTES: usize = 4096;
 
 impl DecodingParams {
+    /// The per-request option names, in declaration order.
+    ///
+    /// The one place the option table is written down on this side of the PyO3
+    /// boundary. `decoding_params_dict` builds the Python dict from these keys,
+    /// and the engine asserts at startup that they equal
+    /// `oasr.engine.DecodingOptions.option_keys()`. Adding a field to this
+    /// struct without adding it here fails `option_keys_cover_every_field`
+    /// below; adding it on only one side of the boundary fails at startup.
+    /// Neither can degrade into an option that is accepted and ignored.
+    pub const OPTION_KEYS: &'static [&'static str] = &[
+        "n_best",
+        "max_new_tokens",
+        "temperature",
+        "top_k",
+        "top_p",
+        "prompt",
+    ];
+
     /// Whether every field is `None` — callers skip building the Python-side
     /// options dict entirely in that case.
     pub fn is_empty(&self) -> bool {
@@ -201,6 +219,14 @@ pub enum Event {
         /// Paraformer CIF).  Maps to the proto `result_end_time`.
         #[serde(default)]
         end_time_s: Option<f32>,
+        /// Why generation stopped: `"stop"` (EOS) or `"length"` (hit
+        /// `max_new_tokens` / the cache ceiling).  Without it a transcript
+        /// truncated by the generation cap is indistinguishable from a
+        /// complete one at the API — the client cannot tell that asking for
+        /// more tokens would have produced more text.  `None` for the
+        /// one-shot families, which have no such distinction.
+        #[serde(default)]
+        finish_reason: Option<String>,
     },
 
     /// Per-request error (also used for shutdown / worker-lost notifications).
@@ -309,6 +335,38 @@ pub struct ModelInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `OPTION_KEYS` must name every field of `DecodingParams`.
+    ///
+    /// The first link of the S9 chain: struct → `OPTION_KEYS` → the Python
+    /// dataclass (asserted at engine startup). Without this, adding a field
+    /// here and forgetting the const gives an option that serialises over the
+    /// wire, never reaches the dict, and reports nothing.
+    #[test]
+    fn option_keys_cover_every_field() {
+        let all = DecodingParams {
+            n_best: Some(1),
+            max_new_tokens: Some(1),
+            temperature: Some(1.0),
+            top_k: Some(1),
+            top_p: Some(1.0),
+            prompt: Some("x".into()),
+        };
+        let json = serde_json::to_value(&all).expect("serialize");
+        let mut fields: Vec<&str> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        let mut keys: Vec<&str> = DecodingParams::OPTION_KEYS.to_vec();
+        fields.sort_unstable();
+        keys.sort_unstable();
+        assert_eq!(
+            fields, keys,
+            "DecodingParams fields and OPTION_KEYS disagree; update both"
+        );
+    }
 
     #[test]
     fn decoding_params_is_empty() {

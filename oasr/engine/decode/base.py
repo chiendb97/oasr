@@ -71,6 +71,11 @@ class DecodeStrategy(ABC):
     #: the incremental protocol below; the offline executor then runs bounded
     #: decoder steps per tick instead of the one-shot :meth:`decode_offline`.
     incremental: ClassVar[bool] = False
+    #: Options dataclass this family owns, or ``None`` for a family with no
+    #: knobs.  Resolved into :attr:`options` by the constructor — see
+    #: :mod:`oasr.engine.decode.options`.  Declaring one here is what keeps a
+    #: new family from having to add fields to ``EngineConfig``.
+    options_cls: ClassVar[Optional[type]] = None
 
     def __init__(
         self,
@@ -78,7 +83,8 @@ class DecodeStrategy(ABC):
         detok: "Detokenizer",
         model: "BaseAsrModel" = None,
     ) -> None:
-        """Store the three things every strategy gets, and validate the model.
+        """Store the three things every strategy gets, validate the model,
+        and resolve this family's options.
 
         The capability check lives **here** rather than only in
         :func:`build_decode_strategy` so that constructing a strategy directly —
@@ -89,10 +95,14 @@ class DecodeStrategy(ABC):
         """
         from oasr.models.interfaces import require_capability
 
+        from .options import build_options
+
         require_capability(model, self.decode_type, decode_method=self.decode_type)
         self._config = config
         self._detok = detok
         self._model = model
+        #: This family's resolved options (``None`` when ``options_cls`` is).
+        self.options = build_options(self.options_cls, config)
 
     # -- offline -----------------------------------------------------------
     @abstractmethod
@@ -130,6 +140,17 @@ class DecodeStrategy(ABC):
     def has_pending(self) -> bool:
         """Whether any request begun via :meth:`begin_offline` is unfinished."""
         return False
+
+    def kv_bytes_per_row(self) -> Optional[int]:
+        """Decoder-KV bytes one in-flight row can occupy, or ``None`` if unbounded.
+
+        Admission uses this to budget in **bytes** rather than request count
+        (C3): a batch of 30 s utterances preallocates far more decoder KV than
+        the same number of 2 s ones, so a slot cap alone does not bound memory.
+        ``None`` (the default, and every one-shot family) leaves the byte budget
+        disabled — those families allocate no decoder KV at all.
+        """
+        return None
 
     # -- streaming session lifecycle --------------------------------------
     def create_session(self, request: Request) -> None:

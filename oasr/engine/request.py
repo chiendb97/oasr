@@ -4,12 +4,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Mapping, Optional, Tuple, Union
+from typing import Deque, Iterable, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -127,9 +128,41 @@ class DecodingOptions:
         """
         if value is None or isinstance(value, cls):
             return value
-        fields = ("n_best", "max_new_tokens", "temperature", "top_k", "top_p", "prompt")
-        kwargs = {k: value[k] for k in fields if k in value and value[k] is not None}
+        # Drive the key set off the dataclass, never a literal list: a hardcoded
+        # tuple silently drops any field added to one side and not the other,
+        # with no error at either end.  ``option_keys`` is the same set the Rust
+        # front-end asserts against at startup.
+        kwargs = {k: value[k] for k in cls.option_keys() if k in value and value[k] is not None}
         return cls(**kwargs)
+
+    @classmethod
+    def option_keys(cls) -> Tuple[str, ...]:
+        """The per-request option names, in declaration order.
+
+        The single source of truth for the option table that crosses PyO3.
+        ``oasr-wire``'s ``DecodingParams`` must produce exactly these keys;
+        :func:`assert_matches_wire_keys` checks that at engine construction so a
+        rename fails fast instead of silently dropping the option.
+        """
+        return tuple(f.name for f in dataclasses.fields(cls))
+
+    @classmethod
+    def assert_matches_wire_keys(cls, keys: Iterable[str]) -> None:
+        """Fail loudly if the Rust option table has drifted from this dataclass.
+
+        Called once from the PyO3 boundary at startup.  Without it, adding a
+        field on one side only means requests carrying that option are accepted
+        and ignored — the exact silent drift S9 catalogued, and unobservable
+        from either end.
+        """
+        theirs, ours = set(keys), set(cls.option_keys())
+        if theirs != ours:
+            raise ValueError(
+                "per-request decoding option tables disagree across the PyO3 "
+                f"boundary: only in Rust {sorted(theirs - ours)}, only in Python "
+                f"{sorted(ours - theirs)}. Update oasr_wire::DecodingParams and "
+                "oasr.engine.DecodingOptions together."
+            )
 
 
 @dataclass

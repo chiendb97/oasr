@@ -92,6 +92,24 @@ class SpeechLlmModel(BaseAsrModel):
             key = "language_model." + key[len("language_model.model.") :]
         return key
 
+    @property
+    def decoder_cache_spec(self):
+        """Per-layer KV geometry of the language model, for admission budgeting.
+
+        Uses ``text_num_key_value_heads`` rather than the attention-head count:
+        with GQA the KV cache is sized by the *key/value* heads, which is the
+        whole point of GQA.  On the shipped Qwen2-Audio-7B the two are equal.
+        """
+        from oasr.models.base import CacheSpec
+
+        cfg = self.config
+        return CacheSpec(
+            num_layers=int(cfg.text_num_hidden_layers),
+            n_kv_head=int(cfg.text_num_key_value_heads),
+            head_dim=int(cfg.text_head_dim),
+            hidden_dim=int(cfg.text_hidden_size),
+        )
+
     def load_weights(
         self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False
     ) -> LoadReport:
@@ -112,11 +130,9 @@ class SpeechLlmModel(BaseAsrModel):
         missing, unexpected = self.load_state_dict(sd, strict=strict)
         if unexpected:
             logger.warning("Unexpected keys in speech-LLM checkpoint: %s", unexpected[:8])
-            dropped.extend(unexpected)
         if missing:
             logger.warning("Speech-LLM model keys not filled: %s", missing[:8])
-        mapped = [k for k in sd if k not in set(unexpected)]
-        return LoadReport(mapped=mapped, dropped=dropped, missing=list(missing))
+        return LoadReport.build(sd, missing, unexpected, dropped)
 
     # -- engine-facing compute ------------------------------------------------
     def encode_offline(

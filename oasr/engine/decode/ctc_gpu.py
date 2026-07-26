@@ -13,20 +13,39 @@ encoder cache.
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Set
 
 import torch
 
 from oasr.cache.ctc_state import CtcStateCacheManager
-from oasr.ctc_decode import GpuDecoderResult, ctc_beam_search_decode
+from oasr.ctc_decode import GpuDecoderConfig, GpuDecoderResult, ctc_beam_search_decode
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from ..request import Request, RequestOutput
 from .base import DecodeStrategy, register_decode_strategy
+from .options import option_factory
 
 if TYPE_CHECKING:
     from ..config import EngineConfig
     from .detokenize import Detokenizer
+
+
+@dataclass(frozen=True)
+class CtcGpuOptions:
+    """Options for ``decoder_type="ctc_cuda"``.
+
+    ``decoder_config`` is built lazily by the factory, so an engine running a
+    non-CTC family never constructs a beam config it will not read — that
+    instantiation used to happen in ``EngineConfig.__post_init__`` for *every*
+    engine, Whisper and speech-LLM included.
+    """
+
+    decoder_config: GpuDecoderConfig = option_factory(
+        GpuDecoderConfig,
+        legacy="ctc_decoder_config",
+        doc="GPU prefix-beam-search config (beam_size, blank_id, ...).",
+    )
 
 
 @register_decode_strategy("ctc_cuda")
@@ -35,18 +54,34 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
 
     decode_type: ClassVar[str] = "ctc"
     consumes: ClassVar[str] = "log_probs"
+    options_cls: ClassVar[type] = CtcGpuOptions
 
     def __init__(self, config: "EngineConfig", detok: "Detokenizer", model=None) -> None:
         super().__init__(config, detok, model)
         self._device = torch.device(config.device)
         mcfg = getattr(config, "_model_config", None)
-        self._vocab_size = (getattr(mcfg, "vocab_size", None) or 5002) if mcfg else 5002
+        vocab = getattr(mcfg, "vocab_size", None) if mcfg is not None else None
+        if vocab is None:
+            # No magic number: the beam state is sized by this, and a wrong
+            # value is either an out-of-bounds read or silently truncated
+            # vocabulary.  The engine always stamps ``_model_config`` before
+            # building a strategy, so reaching here means a caller constructed
+            # one by hand without it.
+            raise ValueError(
+                "CtcGpuDecodeStrategy needs the model's vocab_size; "
+                "EngineConfig._model_config is unset (the engine sets it after "
+                "loading the checkpoint)."
+            )
+        self._vocab_size = int(vocab)
 
         # CTC-graph capture is gated by both the global and CTC-specific flags
-        # (and CUDA).  Matches the prior ``ModelRunner`` gating exactly.
+        # (and CUDA).  Defaults here mirror ``EngineConfig``: ``use_cuda_graphs``
+        # is True, ``use_ctc_cuda_graphs`` is **False** — the getattr fallback
+        # used to say True for both, so a config object without the field would
+        # have silently enabled a path the engine keeps off by default.
         self._ctc_graphs_enabled = (
             bool(getattr(config, "use_cuda_graphs", True))
-            and bool(getattr(config, "use_ctc_cuda_graphs", True))
+            and bool(getattr(config, "use_ctc_cuda_graphs", False))
             and self._device.type == "cuda"
         )
         # Per-request beam state, built lazily on first streaming admission so
@@ -66,8 +101,7 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
     def decode_offline(
         self, enc_out: torch.Tensor, enc_lengths: torch.Tensor
     ) -> List[RequestOutput]:
-        cfg = self._config.ctc_decoder_config
-        assert cfg is not None
+        cfg = self.options.decoder_config
         result: GpuDecoderResult = ctc_beam_search_decode(
             enc_out,
             enc_lengths,
@@ -103,7 +137,7 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
     def _ensure_ctc_mgr(self) -> CtcStateCacheManager:
         if self._ctc_mgr is None:
             self._ctc_mgr = CtcStateCacheManager(
-                self._config.ctc_decoder_config,
+                self.options.decoder_config,
                 use_cuda_graphs=self._ctc_graphs_enabled,
             )
         return self._ctc_mgr

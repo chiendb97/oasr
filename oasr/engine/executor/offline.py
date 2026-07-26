@@ -68,6 +68,7 @@ class OfflineExecutor(Executor):
         enable_packing: bool = False,
         decode_steps_per_tick: int = 32,
         max_decode_slots: Optional[int] = None,
+        decode_kv_budget_gib: Optional[float] = None,
         max_tick_ms: float = 0.0,
         decode_admit_window_ms: float = 0.0,
         max_batch_size: int = 32,
@@ -92,6 +93,7 @@ class OfflineExecutor(Executor):
         # is full.  All three are inert for one-shot strategies.
         self._decode_steps_per_tick = int(decode_steps_per_tick)
         self._max_decode_slots = max_decode_slots
+        self._decode_kv_budget_gib = decode_kv_budget_gib
         self._max_tick_ms = float(max_tick_ms)
         # AR admission coalescing: hold a thin waiting queue briefly so
         # near-simultaneous arrivals prefill as one decode batch (see
@@ -210,11 +212,36 @@ class OfflineExecutor(Executor):
         One-shot families finalise within the tick that admits them, so they hold
         no slots and are bounded by ``max_batch_size`` alone.
         """
-        if not self._op.strategy.incremental:
+        strategy = self._op.strategy
+        if not strategy.incremental:
             return None
-        if self._max_decode_slots is None:
+        limits = []
+        if self._max_decode_slots is not None:
+            limits.append(max(0, int(self._max_decode_slots) - len(self._pending)))
+        rows_by_bytes = self._rows_within_kv_budget(strategy)
+        if rows_by_bytes is not None:
+            limits.append(rows_by_bytes)
+        return min(limits) if limits else None
+
+    def _rows_within_kv_budget(self, strategy) -> Optional[int]:
+        """Rows still affordable under ``decode_kv_budget_gib``, or ``None``.
+
+        Budgeting by request count does not bound decoder-KV memory: the
+        footprint of a row is its position budget times the model's per-token
+        rate, and prefill preallocates all of it up front.  Returns ``None``
+        when either the budget or the model's per-row footprint is unknown, so
+        an unmeasurable model keeps today's slot-only behaviour rather than
+        being throttled by a guess.
+        """
+        budget_gib = self._decode_kv_budget_gib
+        if not budget_gib:
             return None
-        return max(0, int(self._max_decode_slots) - len(self._pending))
+        per_row = strategy.kv_bytes_per_row()
+        if not per_row:
+            return None
+        total = int(budget_gib * (1024**3))
+        in_flight = len(self._pending) * per_row
+        return max(0, (total - in_flight) // per_row)
 
     def _batch_wide_enough(self) -> bool:
         """Whether the waiting queue should be prefilled now, or held to widen.
@@ -346,6 +373,12 @@ class OfflineExecutor(Executor):
                 continue
             req = self._pending.pop(out.request_id, None)
             if req is not None:
+                # Same finalisation the one-shot path does.  ``fill_nbest_texts``
+                # was missing here: it only mattered once an AR family could emit
+                # more than one hypothesis, which beam search is exactly when —
+                # before that every incremental final carried a single row and the
+                # call would have been a no-op.
+                self._op.fill_nbest_texts(req, out)
                 req.output = out
                 req.state = RequestState.FINISHED
         return outputs, budget.exhausted()

@@ -110,5 +110,53 @@ class HuggingFaceTokenizer(Tokenizer):
     def encode(self, text: str) -> List[int]:
         return list(self._tok.encode(text, add_special_tokens=False).ids)
 
+    #: Ids re-decoded on each incremental call, before the newly added ones.
+    #: Byte-level BPE means one token can be a fragment of a UTF-8 sequence, so
+    #: a token cannot be decoded alone; a bounded left window is enough because
+    #: no BPE merge spans more than a few tokens.  Large enough to be safe,
+    #: small enough that per-partial cost stops growing with the transcript.
+    _INCREMENTAL_WINDOW = 16
+
+    def decode_incremental(self, new_ids, state):
+        """Windowed incremental decode (HF ``TextIteratorStreamer`` strategy).
+
+        Decoding each token alone is wrong here: byte-level BPE emits fragments
+        of multi-byte characters, which render as U+FFFD in isolation.  Decoding
+        the full prefix every tick is correct but Θ(n²) over a generation.  So
+        decode a bounded suffix window, diff it against the same window's
+        previous rendering, and append the difference — cost per partial is
+        constant in the transcript length instead of linear.
+        """
+        ids = state.setdefault("ids", [])
+        ids.extend(int(i) for i in new_ids)
+        # The window is anchored at a fixed index, not a fixed length — a window
+        # that slides every call re-bases the string it is being diffed against,
+        # so the "new suffix" would be computed against a different span each
+        # time.  With a stable anchor, ``decode(ids[anchor:])`` only ever grows.
+        anchor = state.get("anchor", 0)
+        rendered = self.decode(ids[anchor:])
+        prev_window = state.get("window_text", "")
+        if not rendered.startswith(prev_window):
+            # Appending re-rendered part of the window (a merge absorbed an
+            # earlier token).  Recompute in full rather than emit a wrong delta.
+            full = self.decode(ids)
+            prev = state.get("text", "")
+            state["text"] = full
+            state["window_text"] = rendered
+            return full[len(prev) :] if full.startswith(prev) else full
+
+        delta = rendered[len(prev_window) :]
+        state["text"] = state.get("text", "") + delta
+        if len(ids) - anchor > 2 * self._INCREMENTAL_WINDOW:
+            # Re-anchor, keeping a window of left context so the next decode
+            # still has enough neighbours to render byte-BPE fragments.  The
+            # accumulated ``text`` is authoritative and unaffected.
+            anchor = len(ids) - self._INCREMENTAL_WINDOW
+            state["anchor"] = anchor
+            state["window_text"] = self.decode(ids[anchor:])
+        else:
+            state["window_text"] = rendered
+        return delta
+
 
 register_tokenizer("huggingface", HuggingFaceTokenizer.from_spec)

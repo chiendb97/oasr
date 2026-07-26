@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Paged-KV streaming backend (Conformer-style encoders).
 
-Owns the shared paged KV-cache pool + slot-CNN cache and runs the
-``forward_chunk_paged`` (encoder + CTC head fused) path with CUDA-graph capture.
-This is the engine's original streaming runtime, extracted behind the
-:class:`~oasr.engine.streaming_backend.base.StreamingEncoderBackend` seam so other
-encoder streaming models can plug in alongside it — behaviour is unchanged.
+Owns the shared paged KV-cache pool + slot-CNN cache and runs the chunk forward
+the active decode strategy asked for — fused ``forward_chunk_paged``
+(encoder + CTC head) or encoder-only ``encode_chunk_paged`` — with CUDA-graph
+capture either way.  This is the engine's original streaming runtime, extracted
+behind the :class:`~oasr.engine.streaming_backend.base.StreamingEncoderBackend`
+seam so other encoder streaming models can plug in alongside it.
 """
 
 from __future__ import annotations
@@ -65,10 +66,10 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         self._cache_config = cache_config
         self._graph_pool = graph_pool
         # What the active decode strategy consumes.  "log_probs" runs the fused
-        # encoder+head ``forward_chunk_paged`` (today's CUDA-graph fast path);
-        # "hidden" runs the encoder-only ``encode_chunk_paged`` **eagerly** —
-        # graph capture for hidden mode is deferred until a shape proves hot
-        # (the capture machinery bakes in a (B, chunk, V) log-probs buffer).
+        # encoder+head ``forward_chunk_paged``; "hidden" runs the encoder-only
+        # ``encode_chunk_paged`` (transducer & friends, which own their own
+        # joint network).  Both are CUDA-graph captured — the capture machinery
+        # takes the callable and never inspects its output shape.
         self._consumes = consumes
         self._chunk_forward = (
             model.encode_chunk_paged if consumes == "hidden" else model.forward_chunk_paged
@@ -93,26 +94,20 @@ class PagedStreamingBackend(StreamingEncoderBackend):
 
         # CUDA Graph cache for the steady-state batched paged forward.
         # Captures lazily on first encounter of each (B_active, cache_t1
-        # bucket) shape. Eager fallback is used for non-CUDA devices, when
-        # graphs are disabled, for partial/final windows, or for hidden-mode
-        # strategies (the captured graph bakes in the fused-head output).
+        # bucket) shape.  Eager fallback is used for non-CUDA devices, when
+        # graphs are disabled, and for partial/final windows.  Whichever
+        # ``_chunk_forward`` the strategy routed to is what gets captured, so
+        # hidden-mode families (transducer) get the same ~200-kernel-to-one
+        # collapse the fused CTC path has always had.
         self._use_cuda_graphs = (
-            config.use_cuda_graphs
-            and torch.device(config.device).type == "cuda"
-            and consumes == "log_probs"
+            config.use_cuda_graphs and torch.device(config.device).type == "cuda"
         )
         if self._use_cuda_graphs:
             self._graph_cache: Optional[GraphedEncoderForward] = GraphedEncoderForward(
-                model,
+                self._chunk_forward,
                 self._att_mgr,
                 self._cnn_mgr,
-                cache_dtype=cache_config.dtype,
                 device=torch.device(config.device),
-                window=self._window,
-                feat_dim=config.feature_config.output_dim,
-                cnn_cache_frames=cache_config.cnn_cache_frames,
-                num_layers=cache_config.num_layers,
-                hidden_dim=cache_config.hidden_dim,
                 pool=self._graph_pool,
             )
         else:
@@ -231,12 +226,20 @@ class PagedStreamingBackend(StreamingEncoderBackend):
 
     def free(self, request: Request) -> None:
         """Release all encoder cache resources for a finished streaming request."""
-        if request.stream_context is not None:
-            request.stream_context.free()
-            request.stream_context = None
-        if request.slot_id is not None:
-            self._slot_pool.free(request.slot_id)
-            request.slot_id = None
+        # ``try/finally``: the slot must come back even if cache teardown
+        # raises.  ``CnnCacheManager.free_stream`` raises ``KeyError`` for an
+        # unknown stream, and the KV blocks are released before it — so the
+        # pre-``finally`` order returned the blocks but leaked the slot, and
+        # slots are capped at ``max_batch_size``.  Each leak permanently reduced
+        # the pool's capacity, with nothing to reclaim it.
+        try:
+            if request.stream_context is not None:
+                request.stream_context.free()
+                request.stream_context = None
+        finally:
+            if request.slot_id is not None:
+                self._slot_pool.free(request.slot_id)
+                request.slot_id = None
 
     # ------------------------------------------------------------------
     # Streaming forward step
@@ -260,8 +263,10 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         offsets or partial/final windows fall back to per-stream
         ``forward_chunk_paged``.
 
-        Returns ``{request_id: log_probs (1, chunk_size, V)}``; requests with
-        no remaining chunks are omitted.
+        Returns ``{request_id: (1, chunk_size, C)}`` — log-probs (``C = V``) for
+        ``consumes="log_probs"`` strategies, encoder hidden (``C = D``) for
+        ``consumes="hidden"`` ones; requests with no remaining chunks are
+        omitted.
         """
         window = self._window
         stride = self._stride
@@ -314,16 +319,28 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             # one paged forward regardless of offset. FlexAttention's
             # block-mask is built from per-stream cache_seqlens, and the
             # encoder builds per-stream pos_emb when offsets differ.
+            # ``_forward_single`` always replays at ``B=1``, so a cohort wider
+            # than one row can never share a shape key with one — only a B=1
+            # cohort followed by a single needs the copy.  That keeps the
+            # steady-state hot path (a full cohort, no finalizing stream)
+            # allocation-free.
             self._forward_batched_paged(
                 batchable,
                 window,
                 stride,
                 context,
                 results,
+                detach=len(batchable) == 1 and bool(fallback),
             )
 
-        for req in fallback:
-            self._forward_single(req, window, stride, context, results)
+        for i, req in enumerate(fallback):
+            # Same reasoning as the batched path: every graph replay hands back
+            # a buffer the *next* replay at that shape key overwrites, and two
+            # full-window finals in one step share a key whenever their offsets
+            # land in the same bucket.  Only the last single is safe to alias.
+            self._forward_single(
+                req, window, stride, context, results, detach=i < len(fallback) - 1
+            )
 
         return results
 
@@ -338,6 +355,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         stride: int,
         context: int,
         results: Dict[str, torch.Tensor],
+        detach: bool = False,
     ) -> None:
         """Run one paged forward on ``B = len(group)`` stacked streams.
 
@@ -394,9 +412,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         #    cache_t1 grows in N_BLOCK-sized steps.
         nvtx_push("encoder_call")
         cache_t1_bucket = round_up_bucket(max_offset)
-        log_probs = None
+        out = None
         if self._use_cuda_graphs and self._graph_cache is not None:
-            log_probs = self._graph_cache.replay(
+            out = self._graph_cache.replay(
                 B_active,
                 xs.size(1),
                 cache_t1_bucket,
@@ -404,18 +422,25 @@ class PagedStreamingBackend(StreamingEncoderBackend):
                 slot_ids=slot_ids_device,
                 offsets=offsets_device,
             )
-        if log_probs is None:
+            # The replay buffer is owned by the capture and is reused by the
+            # next replay at this same shape key.  A later ``_forward_single``
+            # in this very step can land on that key, which would silently
+            # rewrite the rows we are about to hand out; ``detach`` says the
+            # caller saw that risk.  See ``forward_step`` for when it applies.
+            if out is not None and detach:
+                out = out.clone()
+        if out is None:
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_device)
             for c in batched_att_caches:
                 c.host_seqlen_max = max_offset
-            log_probs = self._chunk_forward(
+            out = self._chunk_forward(
                 xs,
                 offsets_device,
                 batched_att_caches,
                 cnn_cache,
                 cache_t1=max_offset,
             )
-        actual_frames = log_probs.size(1)
+        actual_frames = out.size(1)
         nvtx_pop()
 
         # 5. Commit: KV cache_seqlens scatter + host-side cursor / result
@@ -426,7 +451,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         for b, req in enumerate(group):
             req.offset += actual_frames
             req.feature_cursor += stride
-            results[req.request_id] = log_probs[b : b + 1]
+            results[req.request_id] = out[b : b + 1]
         nvtx_pop()
         nvtx_pop()  # batched_paged
 
@@ -441,6 +466,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         stride: int,
         context: int,
         results: Dict[str, torch.Tensor],
+        detach: bool = False,
     ) -> None:
         """Run one paged forward for a single request.
 
@@ -497,7 +523,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
 
         cache_t1_bucket = round_up_bucket(req.offset)
         nvtx_push("single.encoder_call")
-        log_probs = None
+        out = None
         # Only graph **full-window** chunks. Sub-window (partial/final-tail)
         # chunks must run eager: the cute attention reads the relative-position
         # bias tile unpredicated along T_q (padded to the kernel's M_BLOCK), and
@@ -508,7 +534,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         # final sub-window chunk that flips borderline decodes vs eager). These
         # chunks are at most one per stream, so eager costs nothing.
         if self._use_cuda_graphs and self._graph_cache is not None and chunk.size(1) == window:
-            log_probs = self._graph_cache.replay(
+            out = self._graph_cache.replay(
                 1,
                 chunk.size(1),
                 cache_t1_bucket,
@@ -516,11 +542,13 @@ class PagedStreamingBackend(StreamingEncoderBackend):
                 slot_ids=slot_ids_device,
                 offsets=offsets_device,
             )
-        if log_probs is None:
+            if out is not None and detach:
+                out = out.clone()
+        if out is None:
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_device)
             for c in batched_att_caches:
                 c.host_seqlen_max = req.offset
-            log_probs = self._chunk_forward(
+            out = self._chunk_forward(
                 chunk,
                 offsets_device,
                 batched_att_caches,
@@ -528,7 +556,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
                 cache_t1=req.offset,
             )
         nvtx_pop()
-        actual_frames = log_probs.size(1)
+        actual_frames = out.size(1)
 
         # Commit cache state — KV cache_seqlens scatter only; CNN cache
         # was scattered in place by the encoder.
@@ -540,4 +568,4 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             req.feature_cursor = req.feature_frames
         else:
             req.feature_cursor += stride
-        results[req.request_id] = log_probs
+        results[req.request_id] = out

@@ -69,11 +69,9 @@ class ParaformerModel(BaseAsrModel):
         missing, unexpected = self.load_state_dict(sd, strict=strict)
         if unexpected:
             logger.warning("Unexpected keys in Paraformer checkpoint: %s", unexpected[:8])
-            dropped.extend(unexpected)
         if missing:
             logger.warning("Paraformer model keys not filled: %s", missing[:8])
-        mapped = [k for k in sd if k not in set(unexpected)]
-        return LoadReport(mapped=mapped, dropped=dropped, missing=list(missing))
+        return LoadReport.build(sd, missing, unexpected, dropped)
 
     # -- SupportsParaformer compute contract ----------------------------------
     def predict(

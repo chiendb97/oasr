@@ -95,8 +95,12 @@ class AedDecodeStrategy(IncrementalArStrategy):
     def _process_logits(self, logits: torch.Tensor, group: ArGroup) -> torch.Tensor:
         """Apply Whisper's suppress lists.
 
-        ``begin_suppress_tokens`` applies only to the first generated position;
-        rows in a group advance in lockstep, so any row's token count identifies it.
+        ``begin_suppress_tokens`` applies only to the first generated position.
+        The group answers that via ``first_generation_step`` rather than this
+        method inspecting ``group.tokens`` — a beam group's ``tokens`` is ``B x k``
+        *nested* lists, so ``not tokens[0]`` would be ``False`` from step one and
+        the begin-suppress list would never be applied.
+
         Out-of-place (``index_fill``) because ``logits`` may alias
         ``group.last_logits``.
         """
@@ -104,8 +108,7 @@ class AedDecodeStrategy(IncrementalArStrategy):
             logits = logits.index_fill(
                 1, self._ids(self._suppress_idx, self._suppress, logits), -torch.inf
             )
-        first_step = not group.tokens[0] if group.tokens else True
-        if first_step and self._begin_suppress:
+        if group.first_generation_step and self._begin_suppress:
             logits = logits.index_fill(
                 1, self._ids(self._begin_suppress_idx, self._begin_suppress, logits), -torch.inf
             )

@@ -67,6 +67,7 @@ fn partial_response(
             stability: 0.0,
             result_end_time: None,
             language_code: String::new(),
+            finish_reason: String::new(),
         }],
         speech_event_type: pb::SpeechEventType::SpeechEventUnspecified as i32,
         request_id: rid.to_string(),
@@ -82,6 +83,7 @@ fn final_response(
     scores: Option<Vec<f32>>,
     nbest_texts: Option<Vec<String>>,
     end_time_s: Option<f32>,
+    finish_reason: Option<String>,
     max_alts: u32,
 ) -> pb::StreamingRecognizeResponse {
     pb::StreamingRecognizeResponse {
@@ -91,6 +93,7 @@ fn final_response(
             stability: 1.0,
             result_end_time: end_time_s.map(duration_from_secs),
             language_code: String::new(),
+            finish_reason: finish_reason.unwrap_or_default(),
         }],
         speech_event_type: pb::SpeechEventType::SpeechEventUnspecified as i32,
         request_id: rid.to_string(),
@@ -372,6 +375,7 @@ impl SpeechService {
                             scores,
                             nbest_texts,
                             end_time_s,
+                            finish_reason,
                             ..
                         } => {
                             let transcript = text.clone();
@@ -383,6 +387,7 @@ impl SpeechService {
                                     scores,
                                     nbest_texts,
                                     end_time_s,
+                                    finish_reason,
                                     cfg.max_alts,
                                 )))
                                 .await;
@@ -488,6 +493,7 @@ impl pb::speech_server::Speech for SpeechService {
                     scores,
                     nbest_texts,
                     end_time_s,
+                    finish_reason,
                 } => {
                     let n_tokens = tokens.first().map_or(0, |t| t.len());
                     info!(
@@ -509,6 +515,7 @@ impl pb::speech_server::Speech for SpeechService {
                                 max_alts,
                             ),
                             channel_tag: 0,
+                            finish_reason: finish_reason.unwrap_or_default(),
                             result_end_time: end_time_s.map(duration_from_secs),
                             language_code: String::new(),
                         }],
@@ -634,10 +641,13 @@ impl pb::speech_server::Speech for SpeechService {
                                 let resp = partial_response(&rid, text, tokens, scores, max_alts);
                                 let _ = out_tx.send(Ok(resp)).await;
                             }
-                            Some(Event::Final { text, tokens, scores, nbest_texts, end_time_s, .. }) => {
+                            Some(Event::Final {
+                                text, tokens, scores, nbest_texts, end_time_s, finish_reason, ..
+                            }) => {
                                 let transcript = text.clone();
                                 let resp = final_response(
-                                    &rid, text, tokens, scores, nbest_texts, end_time_s, max_alts,
+                                    &rid, text, tokens, scores, nbest_texts, end_time_s,
+                                    finish_reason, max_alts,
                                 );
                                 let _ = out_tx.send(Ok(resp)).await;
                                 handle.finish();
@@ -743,6 +753,7 @@ mod tests {
             None,
             None,
             Some(1.5),
+            Some("length".into()),
             1,
         );
         let res = &r.results[0];
@@ -751,6 +762,33 @@ mod tests {
         let d = res.result_end_time.as_ref().expect("end time");
         assert_eq!(d.seconds, 1);
         assert_eq!(d.nanos, 500_000_000);
+        // A truncated transcript must be distinguishable from a complete one.
+        assert_eq!(res.finish_reason, "length");
+    }
+
+    /// The one-shot families set no `finish_reason`; proto3 has no optional
+    /// string, so "absent" is the empty string — never the word "stop".
+    #[test]
+    fn final_response_without_a_finish_reason_leaves_it_empty() {
+        let r = final_response(
+            "rid-4",
+            "x".into(),
+            vec![vec![1]],
+            None,
+            None,
+            None,
+            None,
+            1,
+        );
+        assert_eq!(r.results[0].finish_reason, "");
+    }
+
+    /// Interim results are mid-generation by definition.
+    #[test]
+    fn partial_response_never_carries_a_finish_reason() {
+        let r = partial_response("rid-5", "partial".into(), vec![vec![1]], None, 1);
+        assert_eq!(r.results[0].finish_reason, "");
+        assert!(!r.results[0].is_final);
     }
 
     /// A partial must never advertise alternatives it has no transcript for:
@@ -776,7 +814,16 @@ mod tests {
 
     #[test]
     fn max_alternatives_zero_means_one() {
-        let r = final_response("r", "x".into(), vec![vec![1], vec![2]], None, None, None, 0);
+        let r = final_response(
+            "r",
+            "x".into(),
+            vec![vec![1], vec![2]],
+            None,
+            None,
+            None,
+            None,
+            0,
+        );
         assert_eq!(r.results[0].alternatives.len(), 1);
     }
 

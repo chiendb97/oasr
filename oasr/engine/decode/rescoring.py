@@ -28,15 +28,17 @@ a planned follow-up); the streaming entry points below raise defensively.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, List
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
-from oasr.ctc_decode import ctc_beam_search_decode
+from oasr.ctc_decode import GpuDecoderConfig, ctc_beam_search_decode
 from oasr.models.decoders.transformer_decoder import add_sos_eos, reverse_pad_list
 
 from ..request import Request, RequestOutput
 from .base import DecodeStrategy, EncodeOutput, register_decode_strategy
+from .options import option, option_factory
 
 if TYPE_CHECKING:
     from oasr.models.base import BaseAsrModel
@@ -46,8 +48,56 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: Rows per fp32 upcast chunk in :meth:`_gather_scores`.  Bounds the transient
+#: to ``rows * L * V`` floats regardless of batch or beam width; large enough
+#: that the loop is a handful of iterations at realistic shapes.
+_SCORE_CHUNK_ROWS = 32
+
 #: Padding marker for hypothesis tensors (WeNet ``IGNORE_ID``).
 _IGNORE_ID = -1
+
+
+@dataclass(frozen=True)
+class RescoringOptions:
+    """Options for CTC n-best + attention-decoder rescoring."""
+
+    ctc_weight: float = option(
+        0.5,
+        legacy="rescoring_ctc_weight",
+        doc="Weight of the CTC n-best score in the WeNet fusion.",
+    )
+    reverse_weight: Optional[float] = option(
+        None,
+        legacy="rescoring_reverse_weight",
+        doc="Right-to-left decoder weight; None uses the checkpoint's trained value.",
+    )
+    nbest: Optional[int] = option(
+        None,
+        doc=(
+            "Hypotheses rescored per utterance.  None = the full CTC beam.  "
+            "Decouples decoder cost from beam width: the decoder pass is "
+            "B*nbest rows, so a wide beam need not multiply it."
+        ),
+    )
+    demote_empty_hyps: bool = option(
+        False,
+        doc=(
+            "Rank empty hypotheses last unless every hypothesis is empty.  An "
+            "empty prefix scores a bare log p(eos|sos), which can out-rank a "
+            "real transcript whose CTC score is very negative.  Off by default: "
+            "WeNet's attention_rescoring re-ranks the whole beam including "
+            "empty rows, and that is what the parity oracle pins."
+        ),
+    )
+    decoder_config: GpuDecoderConfig = option_factory(
+        GpuDecoderConfig,
+        legacy="ctc_decoder_config",
+        doc="CTC beam config used for stage 1 (shared with decoder_type=ctc_cuda).",
+    )
+
+    def __post_init__(self) -> None:
+        if self.nbest is not None and self.nbest < 1:
+            raise ValueError(f"nbest must be >= 1 or None, got {self.nbest!r}")
 
 
 @register_decode_strategy("ctc_aed_rescoring")
@@ -56,6 +106,7 @@ class CtcAedRescoringStrategy(DecodeStrategy):
 
     decode_type = "ctc_aed_rescoring"
     consumes = "both"
+    options_cls = RescoringOptions
 
     def __init__(
         self,
@@ -72,10 +123,13 @@ class CtcAedRescoringStrategy(DecodeStrategy):
         self._sos = int(decoder_cfg.sos_id)
         self._eos = int(decoder_cfg.eos_id)
         self._vocab = int(decoder_cfg.vocab_size)
-        self._ctc_weight = float(config.rescoring_ctc_weight)
+        self._ctc_weight = float(self.options.ctc_weight)
+        # None → rescore the whole CTC beam (previous behaviour).
+        self._nbest = self.options.nbest
+        self._demote_empty = bool(self.options.demote_empty_hyps)
         # None → the checkpoint's trained reverse weight; explicitly 0.0 (or a
         # decoder without a right-to-left branch) skips the reverse pass.
-        rw = config.rescoring_reverse_weight
+        rw = self.options.reverse_weight
         self._reverse_weight = float(decoder_cfg.reverse_weight if rw is None else rw)
         if self._reverse_weight > 0.0 and not getattr(decoder, "has_reverse", False):
             logger.warning(
@@ -97,8 +151,7 @@ class CtcAedRescoringStrategy(DecodeStrategy):
             f"EncodeOutput, got {type(enc_out).__name__}"
         )
         hidden, log_probs = enc_out.hidden, enc_out.log_probs
-        cfg = self._config.ctc_decoder_config
-        assert cfg is not None
+        cfg = self.options.decoder_config
 
         # ---- stage 1: CTC n-best (GPU prefix beam search) -----------------
         result = ctc_beam_search_decode(
@@ -112,9 +165,17 @@ class CtcAedRescoringStrategy(DecodeStrategy):
             page_size=cfg.page_size,
         )
         B = hidden.size(0)
-        beam = cfg.beam_size
         device = hidden.device
-        ctc_scores = result.scores.to(device=device, dtype=torch.float32)  # (B, beam)
+        # Rescoring width is decoupled from the CTC kernel's beam.  The decoder
+        # pass is ``B * beam`` rows and the encoder memory is replicated the
+        # same way, so a wide CTC beam used to multiply decoder cost for
+        # hypotheses far below the fusion cutoff.  The beam is already ordered
+        # by CTC score, so the top ``nbest`` are exactly the candidates worth
+        # the decoder pass.  ``None`` keeps the full beam (previous behaviour).
+        beam = int(cfg.beam_size)
+        if self._nbest is not None:
+            beam = min(beam, self._nbest)
+        ctc_scores = result.scores[:, :beam].to(device=device, dtype=torch.float32)  # (B, beam)
 
         # ---- stage 2: one batched teacher-forced decoder pass --------------
         hyps: List[List[int]] = [
@@ -166,6 +227,12 @@ class CtcAedRescoringStrategy(DecodeStrategy):
 
         fused = att_scores.view(B, beam) + self._ctc_weight * ctc_scores
         fused = fused.masked_fill(~valid_hyp.view(B, beam), float("-inf"))
+        if self._demote_empty:
+            # Only where a real alternative exists — an all-empty row is a
+            # legitimate result for silence, and -inf-ing it would make the
+            # ranking arbitrary rather than empty.
+            empty = (hyps_lens == 0).view(B, beam)
+            fused = fused.masked_fill(empty & ~empty.all(dim=1, keepdim=True), float("-inf"))
 
         fused_cpu = fused.cpu().tolist()
         outputs: List[RequestOutput] = []
@@ -193,11 +260,26 @@ class CtcAedRescoringStrategy(DecodeStrategy):
         layout (``hyp + [eos]``, ``_IGNORE_ID``-padded) — position ``j`` of
         ``ys_out`` is scored by decoder step ``j``, which matches WeNet's
         ``decoder_out[i][j][hyp[j]] … + decoder_out[i][len][eos]``.
+
+        Only ``n * L`` scalars are ever read, so materialising a full
+        ``(n, L, V)`` fp32 ``log_softmax`` to index into is pure waste: at
+        ``B=16, nbest=10, L=50, V=5000`` that is ~160 MB of transient, on top of
+        the ~160 MB fp32 upcast feeding it.  ``log p(y) = logit_y - logsumexp``
+        reads the same numbers with an ``(n, L)`` result, and the upcast is
+        chunked over rows so the peak no longer scales with the beam.
+
+        Numerically identical to the previous form up to fp32 rounding —
+        ``log_softmax`` computes exactly this, and both reduce in fp32.
         """
-        lp = torch.log_softmax(logits.float(), dim=-1)
         mask = ys_out != _IGNORE_ID
         idx = ys_out.masked_fill(~mask, 0).unsqueeze(-1)
-        tok_lp = lp.gather(2, idx).squeeze(-1)  # (n, L)
+        n = logits.size(0)
+        tok_lp = torch.empty((n, logits.size(1)), dtype=torch.float32, device=logits.device)
+        step = max(1, min(n, _SCORE_CHUNK_ROWS))
+        for s in range(0, n, step):
+            e = min(s + step, n)
+            lg = logits[s:e].float()
+            tok_lp[s:e] = lg.gather(2, idx[s:e]).squeeze(-1) - lg.logsumexp(dim=-1)
         return (tok_lp * mask).sum(dim=1)
 
     # ------------------------------------------------------------------

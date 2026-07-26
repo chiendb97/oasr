@@ -1167,11 +1167,11 @@ class ConformerModel(BaseAsrModel):
             )
 
         missing, unexpected = self.load_state_dict(sd, strict=strict)
-        expected_missing = {"encoder.embed.pos_enc.pe"}
-        real_missing = [k for k in missing if k not in expected_missing]
-        if real_missing:
-            logger.warning("Unexpected missing keys: %s", real_missing)
+        report = LoadReport.build(
+            sd, missing, unexpected, dropped, expected_missing={"encoder.embed.pos_enc.pe"}
+        )
+        if report.missing:
+            logger.warning("Unexpected missing keys: %s", report.missing)
         if unexpected:
             logger.warning("Unexpected keys in checkpoint: %s", unexpected)
-        mapped = [k for k in sd if k not in unexpected]
-        return LoadReport(mapped=mapped, dropped=dropped, missing=real_missing)
+        return report

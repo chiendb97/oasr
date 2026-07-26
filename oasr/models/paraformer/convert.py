@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Dict, Mapping, Tuple
 
 import torch
 
+from ..converter import BaseCheckpointConverter
 from ..registry import DETECT_KEYED_VALUE
 from .config import ParaformerModelConfig
 
@@ -71,7 +72,7 @@ def load_am_mvn(path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
     return shift, scale
 
 
-class FunASRParaformerConverter:
+class FunASRParaformerConverter(BaseCheckpointConverter):
     """Checkpoint converter for FunASR ``model: Paraformer`` dirs."""
 
     expected_unused_prefixes: Tuple[str, ...] = ()
@@ -80,6 +81,10 @@ class FunASRParaformerConverter:
         "bias_encoder": "a contextual-biasing branch (hotword models are unsupported)",
     }
 
+    architecture: ClassVar[str] = "paraformer"
+    source_format: ClassVar[str] = "funasr"
+    default_checkpoint_name: ClassVar[str] = "model.pt"
+    default_decode_type: ClassVar[str] = "paraformer"
     #: the architecture is named in ``config.yaml`` (``model: Paraformer``), so this claim outranks a weaker one
     #: (see :func:`oasr.models.registry.resolve_architecture`).
     detect_specificity: ClassVar[int] = DETECT_KEYED_VALUE
@@ -196,25 +201,12 @@ class FunASRParaformerConverter:
             normalize=None,  # CMVN is model-side (encoder.cmvn_* buffers)
         )
 
-    def convert(
-        self, ckpt_dir: Path, checkpoint_name: str = "model.pt", map_location: Any = "cpu"
-    ) -> "ConvertedCheckpoint":
-        from oasr.checkpoints import ConvertedCheckpoint, DecodingDefaults
+    def build_decoding_defaults(self, config, ckpt_dir: Path):
+        from oasr.checkpoints import DecodingDefaults
 
-        ckpt_dir = Path(ckpt_dir)
-        config = self.build_config(ckpt_dir)
-        return ConvertedCheckpoint(
-            architecture="paraformer",
-            model_config=config,
-            aux={},
-            state_dict=self.load_state_dict(ckpt_dir, checkpoint_name, map_location),
-            tokenizer=self.build_tokenizer_spec(ckpt_dir),
-            features=self.build_feature_spec(ckpt_dir),
-            decoding=DecodingDefaults(
-                default_decode_type="paraformer",
-                blank_id=config.blank_id,
-                sos_id=config.sos_id,
-                eos_id=config.eos_id,
-            ),
-            source_format="funasr",
+        return DecodingDefaults(
+            default_decode_type=self.default_decode_type,
+            blank_id=config.blank_id,
+            sos_id=config.sos_id,
+            eos_id=config.eos_id,
         )

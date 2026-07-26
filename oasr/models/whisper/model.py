@@ -289,6 +289,29 @@ class WhisperModel(BaseAsrModel):
         del aux
         return cls(config)
 
+    @property
+    def decoder_cache_spec(self):
+        """Per-layer KV geometry of the **decoder**, for admission budgeting (C3).
+
+        Distinct from ``cache_spec``, which describes the *encoder* paged-KV
+        layout the streaming backend sizes.  Whisper is offline-only, so it has
+        no encoder cache spec at all — but its AR decoder still allocates KV per
+        generated token, and that is what bounds how many rows can be in flight.
+
+        Self-attention only: cross-attention KV is computed once from the
+        encoder output and does not grow per token, so it does not belong in a
+        per-token rate.
+        """
+        from oasr.models.base import CacheSpec
+
+        cfg = self.config
+        return CacheSpec(
+            num_layers=int(cfg.decoder_layers),
+            n_kv_head=int(cfg.decoder_attention_heads),
+            head_dim=int(cfg.d_model) // int(cfg.decoder_attention_heads),
+            hidden_dim=int(cfg.d_model),
+        )
+
     def load_weights(
         self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False
     ) -> LoadReport:
@@ -310,5 +333,4 @@ class WhisperModel(BaseAsrModel):
             logger.warning("Unexpected keys in Whisper checkpoint: %s", unexpected[:8])
         if missing:
             logger.warning("Whisper model keys not filled: %s", missing[:8])
-        mapped = [k for k in sd if k not in unexpected]
-        return LoadReport(mapped=mapped, dropped=dropped, missing=list(missing))
+        return LoadReport.build(sd, missing, unexpected, dropped)

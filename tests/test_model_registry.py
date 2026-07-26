@@ -280,3 +280,74 @@ class TestLoadWeights:
         assert not report.missing
         assert set(report.mapped) == {k for k in sd if k != "decoder.some.branch.weight"}
         assert "dropped" in report.summary()
+
+
+class TestModelDiscovery:
+    """Adding an architecture must not mean editing the registry (N8).
+
+    The registry used to carry a hand-written six-branch if-chain, and
+    ``oasr/models/__init__`` a separate hand-written import list — which had
+    already drifted: ``__init__`` exported conformer / transducer / zipformer
+    only, while the registry knew all six.  One list plus entry-point discovery
+    removes both the drift and the edit.
+    """
+
+    def test_builtin_list_matches_the_registry(self):
+        from oasr.models.registry import _BUILTIN_PACKAGES, list_models
+
+        assert set(_BUILTIN_PACKAGES) == set(list_models())
+
+    def test_every_builtin_package_is_exported(self):
+        """``oasr.models`` must re-export each package, not just the old three."""
+        import oasr.models as m
+        from oasr.models.registry import _BUILTIN_PACKAGES
+
+        for pkg in _BUILTIN_PACKAGES:
+            mod = __import__(f"oasr.models.{pkg}", fromlist=["*"])
+            exported = [n for n in getattr(mod, "__all__", []) if n.endswith("Model")]
+            assert exported, f"{pkg} exports no *Model name"
+            for name in exported:
+                assert name in m.__all__, f"{pkg}: {name} missing from oasr.models.__all__"
+
+    def test_entry_point_plugins_are_loaded(self, monkeypatch):
+        """A third-party architecture registers via an entry point, no edit here."""
+        from oasr.models import registry
+
+        loaded = []
+
+        class _EP:
+            name = "plugin_arch"
+
+            def load(self):
+                loaded.append(self.name)
+
+        monkeypatch.setattr(registry, "_builtins_loaded", False)
+        monkeypatch.setattr(registry, "_load_entry_point_models", lambda: _EP().load())
+        registry.list_models()
+        assert loaded == ["plugin_arch"]
+
+    def test_a_broken_plugin_does_not_break_the_builtins(self, monkeypatch, caplog):
+        """An incompatible plugin must degrade to a warning, not an import error.
+
+        Otherwise one bad third-party package makes the whole framework
+        unusable, including the architectures that ship in-tree.
+        """
+        import logging
+
+        from oasr.models import registry
+
+        class _BadEP:
+            name = "broken"
+
+            def load(self):
+                raise ImportError("boom")
+
+        # Drive the loader directly with a failing entry point.
+        import importlib.metadata as md
+
+        monkeypatch.setattr(md, "entry_points", lambda **kw: [_BadEP()])
+        with caplog.at_level(logging.WARNING):
+            registry._load_entry_point_models()
+        assert any("broken" in r.getMessage() for r in caplog.records)
+        # The built-ins are still reachable.
+        assert "conformer" in registry.list_models()

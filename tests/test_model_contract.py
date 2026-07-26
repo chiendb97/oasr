@@ -92,8 +92,35 @@ class TestRegisteredModels:
 
     def test_converter_surface(self, arch):
         conv = get_model_entry(arch).converter
-        for member in ("detect", "build_config", "load_state_dict", "convert"):
+        for member in (
+            "detect",
+            "build_config",
+            "load_state_dict",
+            "convert",
+            "build_aux",
+            "build_tokenizer_spec",
+            "build_feature_spec",
+            "build_decoding_defaults",
+        ):
             assert hasattr(conv, member), f"{arch}: converter is missing {member}()"
+        for member in ("detect_specificity", "expected_unused_prefixes", "capability_drop_hints"):
+            assert hasattr(conv, member), f"{arch}: converter is missing {member}"
+
+    def test_converter_declares_its_own_identity(self, arch):
+        """Class attributes, not literals buried in a hand-written ``convert()``.
+
+        ``BaseCheckpointConverter.convert`` reads these, so a subclass that
+        inherits another converter (the transducer one extends icefall's) and
+        forgets to re-declare them would silently emit a bundle labelled with
+        its parent's architecture.
+        """
+        conv = get_model_entry(arch).converter
+        assert (
+            conv.architecture == arch
+        ), f"{arch}: converter reports architecture={conv.architecture!r}"
+        assert conv.source_format, f"{arch}: converter declares no source_format"
+        assert conv.default_checkpoint_name, f"{arch}: no default_checkpoint_name"
+        assert conv.default_decode_type, f"{arch}: no default_decode_type"
 
     @staticmethod
     def _declared(model_cls, name):

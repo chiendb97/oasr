@@ -121,7 +121,13 @@ class TransducerModel(BaseAsrModel):
         heads, a hybrid ``ctc_output.*`` branch) lands in
         ``LoadReport.dropped`` for the registry to account for.
         """
-        zipformer_front = type(self.encoder).__name__ == "ZipformerEncoder"
+        # ``isinstance``, not a class-name string: a name comparison silently
+        # takes the wrong branch for any subclass (or a same-named class from
+        # another module), which here means the encoder keys are not remapped
+        # and every encoder weight is quietly dropped.
+        from oasr.models.zipformer.model import ZipformerEncoder
+
+        zipformer_front = isinstance(self.encoder, ZipformerEncoder)
         remapped = {}
         dropped = []
         for k, v in state_dict.items():
@@ -145,5 +151,4 @@ class TransducerModel(BaseAsrModel):
             logger.warning("Missing keys when loading transducer weights: %s", real_missing)
         if unexpected:
             logger.warning("Unexpected keys when loading transducer weights: %s", unexpected)
-        mapped = [k for k in remapped if k not in unexpected]
-        return LoadReport(mapped=mapped, dropped=dropped, missing=real_missing)
+        return LoadReport.build(remapped, real_missing, unexpected, dropped)

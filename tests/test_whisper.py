@@ -255,3 +255,305 @@ class TestEngineWhisperE2E:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
+@pytest.mark.skipif(
+    not os.path.exists(os.path.join(WHISPER_CKPT, "model.safetensors")),
+    reason="whisper snapshot absent",
+)
+class TestAedBeamSearch:
+    """Beam search over the incremental AR protocol (P4).
+
+    The decoder surface needs no beam-specific method: ``select`` is an
+    ``index_select``, which permits repeated indices, so one call both expands
+    ``B`` prefilled rows into ``B * k`` and reorders the grid onto each new slot's
+    parent.
+    """
+
+    def _audios(self, n=2):
+        import torchaudio
+
+        wavs = sorted(glob.glob(os.path.join(WAV_DIR, "*.wav")))[:n]
+        if len(wavs) < n:
+            pytest.skip(f"need {n} wavs under {WAV_DIR}")
+        return [torchaudio.load(w)[0].squeeze(0) for w in wavs]
+
+    def _run(self, audios, *, beam, n_best=1, force_beam_path=False):
+        from oasr.engine import ASREngine, DecodingOptions, EngineConfig
+
+        cfg = EngineConfig(
+            ckpt_dir=WHISPER_CKPT,
+            service_mode="offline",
+            max_batch_size=4,
+            decode_steps_per_tick=64,
+            decode_options={"beam_size": beam},
+        )
+        eng = ASREngine(cfg)
+        if force_beam_path:
+            # ``beam_size=1`` takes the greedy branch by construction; to compare
+            # the two algorithms we need width 1 *through the beam code*.
+            self._force_beam_group_at_width_one(eng)
+        try:
+            ids = [
+                eng.add_request(audio=a, streaming=False, decoding=DecodingOptions(n_best=n_best))
+                for a in audios
+            ]
+            got = {}
+            for _ in range(20000):
+                for out in eng.step():
+                    if out.finished:
+                        got[out.request_id] = out
+                if not (eng.num_running or eng.num_waiting):
+                    break
+            assert len(got) == len(ids), "not every request finished"
+            return [got[i] for i in ids]
+        finally:
+            del eng
+            torch.cuda.empty_cache()
+
+    @staticmethod
+    def _force_beam_group_at_width_one(eng):
+        """Route prefill down the beam branch while keeping the width at 1.
+
+        In production ``begin_offline`` picks greedy for ``beam_size == 1``, which
+        is right — greedy is cheaper and identical.  To *compare* the two
+        implementations the test needs width 1 through the beam code, so it
+        replaces the dispatch rather than lying about the configured width.
+        """
+        strat = eng._output_processor.strategy  # noqa: SLF001
+
+        def begin_offline(requests, enc_out, enc_lengths):
+            plan = strat._prefill(requests, enc_out, enc_lengths)  # noqa: SLF001
+            opts = [getattr(r, "decoding", None) for r in requests]
+            strat._groups.append(  # noqa: SLF001
+                strat._make_beam_group(requests, plan, opts)  # noqa: SLF001
+            )
+
+        strat.begin_offline = begin_offline
+
+    def test_beam_width_one_reproduces_greedy(self):
+        """Beam search at width 1 *is* greedy — same argmax, same sequence.
+
+        The exactness gate: an error in the expand, the parent reorder, the EOS
+        bookkeeping or the token fed back into ``step`` shows up here as a
+        wrong transcript rather than as a slightly different WER.  (It caught a
+        real one: without feeding the chosen token back through ``step``, every
+        slot re-picked its first token and the transcript became that token
+        repeated to the generation cap.)
+        """
+        audios = self._audios(2)
+        greedy = self._run(audios, beam=1)
+        beam1 = self._run(audios, beam=1, force_beam_path=True)
+        for i, (g, b) in enumerate(zip(greedy, beam1)):
+            assert b.tokens[0] == g.tokens[0], f"utt {i}: {b.text!r} != {g.text!r}"
+
+    @pytest.mark.parametrize("beam", [2, 4])
+    def test_wider_beams_keep_the_transcript(self, beam):
+        """A broken beam shows up as truncation or repetition, not a subtle WER."""
+        outs = self._run(self._audios(2), beam=beam)
+        assert "printing" in outs[0].text.lower()
+        assert "modern" in outs[1].text.lower()
+        assert all(o.finish_reason == "stop" for o in outs)
+
+    def test_nbest_is_populated_ordered_and_capped(self):
+        """T5's point: ``n_best`` finally means something for an AR family."""
+        outs = self._run(self._audios(2), beam=4, n_best=4)
+        for out in outs:
+            assert out.scores is not None
+            assert out.scores == sorted(out.scores, reverse=True)
+            assert 1 < len(out.tokens) <= 4
+            assert out.nbest_texts is not None
+            assert out.nbest_texts[0] == out.text
+            assert len(out.nbest_texts) == len(out.tokens)
+
+    def test_length_penalty_changes_ranking_not_correctness(self):
+        """``length_penalty=0`` is the raw log-prob sum — still a valid transcript.
+
+        Raw sums favour short hypotheses, which is why the GNMT normalisation is
+        the default; both must still transcribe the audio.
+        """
+        from oasr.engine import ASREngine, EngineConfig
+
+        for penalty in (0.0, 1.0):
+            cfg = EngineConfig(
+                ckpt_dir=WHISPER_CKPT,
+                service_mode="offline",
+                max_batch_size=2,
+                decode_steps_per_tick=64,
+                decode_options={"beam_size": 4, "length_penalty": penalty},
+            )
+            eng = ASREngine(cfg)
+            try:
+                text = eng.transcribe_offline(self._audios(1))[0]
+                text = text.text if hasattr(text, "text") else text
+                assert "printing" in text.lower(), (penalty, text)
+            finally:
+                del eng
+                torch.cuda.empty_cache()
+
+
+class TestLongFormMerge:
+    """The stitching primitives, tested without a model (pure functions)."""
+
+    def test_split_covers_the_whole_waveform(self):
+        from oasr.engine.longform import split_windows
+
+        audio = torch.arange(1000, dtype=torch.float32)
+        wins = split_windows(audio, window_samples=300, overlap_samples=0)
+        assert torch.equal(torch.cat(wins), audio)
+        assert [w.numel() for w in wins] == [300, 300, 300, 100]
+
+    def test_overlapped_split_shares_audio(self):
+        from oasr.engine.longform import split_windows
+
+        audio = torch.arange(1000, dtype=torch.float32)
+        wins = split_windows(audio, window_samples=300, overlap_samples=100)
+        # Stride 200: starts at 0, 200, 400, ...
+        assert torch.equal(wins[0][200:], wins[1][:100])
+        assert torch.cat([w[:200] for w in wins[:-1]] + [wins[-1]]).numel() >= 1000
+
+    def test_short_audio_is_one_window(self):
+        from oasr.engine.longform import split_windows
+
+        audio = torch.zeros(50)
+        assert len(split_windows(audio, 300, 100)) == 1
+
+    @pytest.mark.parametrize(
+        "pieces,expected",
+        [
+            (["a b c", "c d e"], "a b c d e"),
+            (["a b c", "b c d"], "a b c d"),
+            (["a b", "c d"], "a b c d"),  # no overlap at all
+            (["hello world", ""], "hello world"),
+            (["", "hello"], "hello"),
+            (["a b c d", "A B c d e"], "a b c d e"),  # case-insensitive match
+        ],
+    )
+    def test_merge_drops_duplicated_overlap(self, pieces, expected):
+        from oasr.engine.longform import merge_texts
+
+        assert merge_texts(pieces) == expected
+
+    def test_merge_prefers_the_longest_overlap(self):
+        """A short spurious match must not win over the real one."""
+        from oasr.engine.longform import merge_texts
+
+        assert merge_texts(["x a b c", "a b c y"]) == "x a b c y"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
+@pytest.mark.skipif(
+    not os.path.exists(os.path.join(WHISPER_CKPT, "model.safetensors")),
+    reason="whisper snapshot absent",
+)
+class TestLongFormEngine:
+    """Long-form decoding end to end (P4 — the real fix behind C5).
+
+    C5 turned a silent 30 s truncation into a clean rejection.  This turns the
+    rejection into a transcript: the request is fanned out into windows, decoded
+    through the normal batched path, and fanned back into one output, so the
+    caller sees one request id and the serving layer needs no change.
+    """
+
+    def _audio(self, n_clips=8):
+        import torchaudio
+
+        wavs = sorted(glob.glob(os.path.join(WAV_DIR, "*.wav")))[:n_clips]
+        if len(wavs) < n_clips:
+            pytest.skip(f"need {n_clips} wavs under {WAV_DIR}")
+        return torch.cat([torchaudio.load(w)[0].squeeze(0) for w in wavs])
+
+    def _engine(self, long_form, overlap=1.0):
+        from oasr.engine import ASREngine, EngineConfig
+
+        return ASREngine(
+            EngineConfig(
+                ckpt_dir=WHISPER_CKPT,
+                service_mode="offline",
+                max_batch_size=8,
+                decode_steps_per_tick=64,
+                long_form=long_form,
+                long_form_overlap_seconds=overlap,
+            )
+        )
+
+    def _drain(self, eng, audio, rid="long"):
+        eng.add_request(audio=audio, request_id=rid, streaming=False)
+        got = {}
+        for _ in range(50000):
+            for out in eng.step():
+                if out.finished:
+                    got[out.request_id] = out
+            if not (eng.num_running or eng.num_waiting):
+                break
+        return got
+
+    def test_over_window_audio_is_still_rejected_when_disabled(self):
+        """C5's guard must survive: opting out means rejection, not truncation."""
+        eng = self._engine(False)
+        try:
+            with pytest.raises(ValueError, match="fixed to a 30s window"):
+                eng.add_request(audio=self._audio(), streaming=False)
+        finally:
+            del eng
+            torch.cuda.empty_cache()
+
+    def test_whole_file_is_transcribed_as_one_output(self):
+        audio = self._audio()
+        assert audio.numel() / 16000 > 30, "fixture must exceed one window"
+        eng = self._engine(True)
+        try:
+            got = self._drain(eng, audio)
+            # One id in, one id out — the windows are an implementation detail.
+            assert set(got) == {"long"}
+            text = got["long"].text.lower()
+            # Content from the first *and* the last window must be present; the
+            # bug this fixes is a transcript of the first 30 s only.
+            assert "printing" in text
+            assert sum(k in text for k in ("modern", "chinese", "exhibition")) >= 2
+            assert got["long"].finish_reason == "stop"
+        finally:
+            del eng
+            torch.cuda.empty_cache()
+
+    def test_short_audio_takes_the_normal_path(self):
+        """Enabling long-form must not perturb requests that fit a window."""
+        import torchaudio
+
+        wav = sorted(glob.glob(os.path.join(WAV_DIR, "*.wav")))[0]
+        audio = torchaudio.load(wav)[0].squeeze(0)
+        eng = self._engine(True)
+        try:
+            got = self._drain(eng, audio, rid="short")
+            assert set(got) == {"short"}
+            assert "printing" in got["short"].text.lower()
+        finally:
+            del eng
+            torch.cuda.empty_cache()
+
+    def test_zero_overlap_also_works(self):
+        eng = self._engine(True, overlap=0.0)
+        try:
+            got = self._drain(eng, self._audio())
+            assert "printing" in got["long"].text.lower()
+        finally:
+            del eng
+            torch.cuda.empty_cache()
+
+    def test_aborting_a_parent_aborts_its_windows(self):
+        """The executor knows the windows, not the parent id.
+
+        Without the fan-out-aware abort the cancelled file would keep decoding
+        and its outputs would accumulate in the tracker forever.
+        """
+        eng = self._engine(True)
+        try:
+            eng.add_request(audio=self._audio(), request_id="doomed", streaming=False)
+            assert eng.num_waiting + eng.num_running > 1, "expected several windows"
+            eng.abort_request("doomed")
+            assert eng.num_waiting + eng.num_running == 0
+            assert not eng._longform  # noqa: SLF001  tracker drained
+        finally:
+            del eng
+            torch.cuda.empty_cache()

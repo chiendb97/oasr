@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping, Tuple
 
 import torch
 
+from ..converter import BaseCheckpointConverter
 from ..registry import DETECT_KEYED_VALUE
 from .config import SpeechLlmModelConfig
 
@@ -51,13 +52,17 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
-class HFQwen2AudioConverter:
+class HFQwen2AudioConverter(BaseCheckpointConverter):
     """Checkpoint converter for HF ``model_type: "qwen2_audio"`` snapshots."""
 
     #: Rotary tables are computed buffers when a snapshot materializes them.
     expected_unused_prefixes: Tuple[str, ...] = ()
     capability_drop_hints: Dict[str, str] = {}
 
+    architecture: ClassVar[str] = "speech_llm"
+    source_format: ClassVar[str] = "huggingface"
+    default_checkpoint_name: ClassVar[str] = "model.safetensors"
+    default_decode_type: ClassVar[str] = "llm"
     #: the architecture is named in ``config.json`` (``model_type == "qwen2_audio"``), so this claim outranks a weaker one
     #: (see :func:`oasr.models.registry.resolve_architecture`).
     detect_specificity: ClassVar[int] = DETECT_KEYED_VALUE
@@ -108,33 +113,10 @@ class HFQwen2AudioConverter:
             pad_token_id=int(pad),
         )
 
-    def build_aux(self, ckpt_dir: Path) -> Dict[str, Any]:
-        return {}
-
     def load_state_dict(
         self, ckpt_dir: Path, checkpoint_name: str, map_location: Any
     ) -> Mapping[str, torch.Tensor]:
-        ckpt_dir = Path(ckpt_dir)
-        index_path = ckpt_dir / "model.safetensors.index.json"
-        if index_path.exists():
-            from safetensors.torch import load_file
-
-            shards = sorted(set(_read_json(index_path)["weight_map"].values()))
-            sd: Dict[str, torch.Tensor] = {}
-            for shard in shards:
-                sd.update(load_file(str(ckpt_dir / shard), device=str(map_location)))
-            return sd
-        st_path = ckpt_dir / "model.safetensors"
-        if st_path.exists():
-            from safetensors.torch import load_file
-
-            return load_file(str(st_path), device=str(map_location))
-        bin_path = ckpt_dir / "pytorch_model.bin"
-        if bin_path.exists():
-            return torch.load(str(bin_path), map_location=map_location, weights_only=True)
-        raise FileNotFoundError(
-            f"no model.safetensors[.index.json] or pytorch_model.bin under {ckpt_dir}"
-        )
+        return self.load_hf_state_dict(ckpt_dir, map_location)
 
     # -- complete-bundle conversion ------------------------------------------
 
@@ -154,39 +136,15 @@ class HFQwen2AudioConverter:
         return TokenizerSpec(kind="huggingface", files=files)
 
     def build_feature_spec(self, ckpt_dir: Path):
-        from oasr.features import FeatureSpec
-
         raw = _read_json(Path(ckpt_dir) / "config.json")
-        n_mels = int(raw.get("audio_config", {}).get("num_mel_bins", 128))
-        return FeatureSpec(
-            kind="whisper_logmel",
-            sample_rate=16000,
-            feature_dim=n_mels,
-            frame_length_ms=25.0,  # n_fft 400 @ 16 kHz
-            frame_shift_ms=10.0,  # hop 160
-            dither=0.0,
-            audio_scale=1.0,
-        )
+        return self.whisper_logmel_spec(raw.get("audio_config", {}).get("num_mel_bins", 128))
 
-    def convert(
-        self, ckpt_dir: Path, checkpoint_name: str = "model.safetensors", map_location: Any = "cpu"
-    ) -> "ConvertedCheckpoint":
-        from oasr.checkpoints import ConvertedCheckpoint, DecodingDefaults
+    def build_decoding_defaults(self, config, ckpt_dir: Path):
+        from oasr.checkpoints import DecodingDefaults
 
-        ckpt_dir = Path(ckpt_dir)
-        config = self.build_config(ckpt_dir)
-        return ConvertedCheckpoint(
-            architecture="speech_llm",
-            model_config=config,
-            aux={},
-            state_dict=self.load_state_dict(ckpt_dir, checkpoint_name, map_location),
-            tokenizer=self.build_tokenizer_spec(ckpt_dir),
-            features=self.build_feature_spec(ckpt_dir),
-            decoding=DecodingDefaults(
-                default_decode_type="llm",
-                blank_id=0,
-                sos_id=config.pad_token_id,
-                eos_id=config.eos_token_ids[-1],
-            ),
-            source_format="huggingface",
+        return DecodingDefaults(
+            default_decode_type=self.default_decode_type,
+            blank_id=0,
+            sos_id=config.pad_token_id,
+            eos_id=config.eos_token_ids[-1],
         )

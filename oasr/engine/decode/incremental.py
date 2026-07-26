@@ -40,13 +40,23 @@ from __future__ import annotations
 import logging
 from abc import abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 
 from ..generation import select_next_tokens
 from ..request import DecodingOptions, Request, RequestOutput
 from .base import DecodeStrategy
+from .incremental_beam import (
+    DEAD_SCORE,
+    ArBeamGroup,
+    expand_indices,
+    global_parent_rows,
+    initial_scores,
+    is_finite_score,
+    topk_step,
+)
+from .options import option
 
 if TYPE_CHECKING:
     from oasr.models.base import BaseAsrModel
@@ -82,10 +92,22 @@ class ArGroup:
     opts: List[Optional[DecodingOptions]]
     #: Tokens generated so far, per row.
     tokens: List[List[int]] = field(default_factory=list)
+    #: Per-row incremental-detokenization state (T3).  AR generation only ever
+    #: appends, so a partial can decode just the new ids instead of the whole
+    #: prefix — at 32 tokens/tick over a 448-token run that is ~3.1k
+    #: token-decodes replaced by 448.
+    detok_state: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.tokens:
             self.tokens = [[] for _ in self.requests]
+        if not self.detok_state:
+            self.detok_state = [{} for _ in self.requests]
+
+    @property
+    def first_generation_step(self) -> bool:
+        """Whether no token has been generated yet (rows advance in lockstep)."""
+        return not any(self.tokens)
 
     def keep_rows(self, keep: List[int]) -> None:
         """Drop every row not in ``keep`` from the host-side bookkeeping."""
@@ -93,6 +115,7 @@ class ArGroup:
         self.tokens = [self.tokens[r] for r in keep]
         self.max_new = [self.max_new[r] for r in keep]
         self.opts = [self.opts[r] for r in keep]
+        self.detok_state = [self.detok_state[r] for r in keep]
 
 
 @dataclass
@@ -106,6 +129,45 @@ class Prefill:
     max_new: List[int]
 
 
+@dataclass(frozen=True)
+class ArOptions:
+    """Options shared by every incremental autoregressive family.
+
+    Subclass to add family-specific knobs (see ``LlmOptions``); the base's
+    ``max_new_tokens`` stays a single declaration so AED and LLM cannot drift.
+    """
+
+    max_new_tokens: int = option(
+        448,
+        legacy="max_new_tokens",
+        doc="Default generation cap; DecodingOptions.max_new_tokens overrides per request.",
+    )
+    beam_size: int = option(
+        1,
+        doc=(
+            "1 (default) = greedy.  >1 runs beam search over the same incremental "
+            "protocol, which is also what makes DecodingOptions.n_best return "
+            "real alternatives for the AR families."
+        ),
+    )
+    length_penalty: float = option(
+        1.0,
+        doc=(
+            "GNMT length normalisation exponent applied when ranking beam "
+            "hypotheses; 0 disables it (raw log-prob sums, which favour short "
+            "transcripts).  Ignored by greedy."
+        ),
+    )
+
+    def __post_init__(self) -> None:
+        if self.max_new_tokens < 1:
+            raise ValueError(f"max_new_tokens must be >= 1, got {self.max_new_tokens!r}")
+        if self.beam_size < 1:
+            raise ValueError(f"beam_size must be >= 1, got {self.beam_size!r}")
+        if self.length_penalty < 0.0:
+            raise ValueError(f"length_penalty must be >= 0, got {self.length_penalty!r}")
+
+
 class IncrementalArStrategy(DecodeStrategy):
     """Base for ``incremental = True`` strategies (AED / speech-LLM).
 
@@ -116,6 +178,7 @@ class IncrementalArStrategy(DecodeStrategy):
 
     consumes: ClassVar[str] = "hidden"
     incremental: ClassVar[bool] = True
+    options_cls: ClassVar[type] = ArOptions
     #: Emit a ``finished=False`` output per advanced request per tick.  Greedy AED
     #: reports finals only; the speech-LLM path streams tokens.
     emit_partials: ClassVar[bool] = False
@@ -163,6 +226,43 @@ class IncrementalArStrategy(DecodeStrategy):
         return getattr(self._model, "decoder", None)
 
     # ------------------------------------------------------------------
+    # Admission budgeting (C3)
+    # ------------------------------------------------------------------
+
+    def kv_bytes_per_row(self) -> Optional[int]:
+        """Worst-case decoder-KV bytes for one row at its generation cap.
+
+        ``2 (K and V) * layers * kv_heads * head_dim * itemsize`` per token,
+        times the row's position budget.  The position budget is
+        ``prompt + max_new_tokens``, and the prompt length is knowable ahead of
+        the encode **because these families run a fixed-window frontend** — a
+        speech-LLM's audio prompt is the same length for a 2 s clip and a 30 s
+        one.  That is what makes a pre-admission byte estimate meaningful here
+        and not for a variable-length frontend.
+
+        ``None`` when the model does not declare ``decoder_cache_spec``; the
+        budget then stays off rather than guessing a footprint.
+        """
+        spec = getattr(self._model, "decoder_cache_spec", None)
+        if spec is None:
+            return None
+        itemsize = torch.empty((), dtype=self._config.dtype).element_size()
+        per_token = 2 * spec.num_layers * spec.n_kv_head * spec.head_dim * itemsize
+        return int(per_token) * int(self._position_budget())
+
+    def _position_budget(self) -> int:
+        """Positions one row can occupy: prompt estimate + generation cap."""
+        return int(self._prompt_len_estimate()) + int(self.options.max_new_tokens)
+
+    def _prompt_len_estimate(self) -> int:
+        """Upper bound on the prefill prompt length, in decoder positions.
+
+        Overridden by families whose prompt is more than a few control tokens
+        (the speech-LLM splices ~750 audio embeddings into it).
+        """
+        return 8
+
+    # ------------------------------------------------------------------
     # Per-request generation cap
     # ------------------------------------------------------------------
 
@@ -175,13 +275,22 @@ class IncrementalArStrategy(DecodeStrategy):
         requested = (
             opts.max_new_tokens
             if opts is not None and opts.max_new_tokens is not None
-            else int(self._config.max_new_tokens)
+            else int(self.options.max_new_tokens)
         )
         return max(1, min(int(requested), capacity))
 
     # ------------------------------------------------------------------
     # Incremental protocol (shared)
     # ------------------------------------------------------------------
+
+    @property
+    def _beam(self) -> int:
+        """Configured beam width (1 = greedy)."""
+        return int(getattr(self.options, "beam_size", 1))
+
+    @property
+    def _length_penalty(self) -> float:
+        return float(getattr(self.options, "length_penalty", 1.0))
 
     def begin_offline(
         self,
@@ -190,14 +299,41 @@ class IncrementalArStrategy(DecodeStrategy):
         enc_lengths: torch.Tensor,
     ) -> None:
         plan = self._prefill(requests, enc_out, enc_lengths)
+        opts = [getattr(r, "decoding", None) for r in requests]
+        if self._beam > 1:
+            self._groups.append(self._make_beam_group(requests, plan, opts))
+            return
         self._groups.append(
             ArGroup(
                 requests=list(requests),
                 state=plan.state,
                 last_logits=plan.logits,
                 max_new=list(plan.max_new),
-                opts=[getattr(r, "decoding", None) for r in requests],
+                opts=opts,
             )
+        )
+
+    def _make_beam_group(self, requests, plan, opts) -> ArBeamGroup:
+        """Widen a prefilled ``B``-row state into a ``B * k`` beam grid.
+
+        The expansion is one ``select`` with repeated indices — the decoder
+        surface needs no beam-specific method, so any model that supports greedy
+        AR decode supports beam search unchanged.
+        """
+        k = self._beam
+        B = len(requests)
+        device = plan.logits.device
+        idx = expand_indices(B, k, device)
+        state = self._decoder().select(plan.state, idx)
+        logits = plan.logits.index_select(0, idx)
+        return ArBeamGroup(
+            requests=list(requests),
+            state=state,
+            last_logits=logits,
+            beam=k,
+            max_new=list(plan.max_new),
+            opts=opts,
+            scores=initial_scores(B, k, device),
         )
 
     def has_pending(self) -> bool:
@@ -210,13 +346,19 @@ class IncrementalArStrategy(DecodeStrategy):
             # Round-robin: pop the front group, advance it one batched step,
             # re-queue it at the back if it still has active rows.
             group = self._groups.pop(0)
-            outputs.extend(self._advance_group(group))
+            if isinstance(group, ArBeamGroup):
+                outputs.extend(self._advance_beam_group(group))
+            else:
+                outputs.extend(self._advance_group(group))
             if group.requests:
                 self._groups.append(group)
                 if not any(g is group for g in advanced):
                     advanced.append(group)
-        if self.emit_partials:
-            outputs.extend(self._partials(advanced))
+        if self.emit_partials and advanced:
+            beams = [g for g in advanced if isinstance(g, ArBeamGroup)]
+            greedy = [g for g in advanced if not isinstance(g, ArBeamGroup)]
+            outputs.extend(self._partials(greedy))
+            outputs.extend(self._beam_partials(beams))
         return outputs
 
     def _advance_group(self, group: ArGroup) -> List[RequestOutput]:
@@ -251,6 +393,168 @@ class IncrementalArStrategy(DecodeStrategy):
                 group.last_logits, group.state = self._decoder().step(next_tokens, group.state)
         return outputs
 
+    # ------------------------------------------------------------------
+    # Beam advance
+    # ------------------------------------------------------------------
+
+    def _advance_beam_group(self, group: ArBeamGroup) -> List[RequestOutput]:
+        """One batched beam step over every live slot of every live request.
+
+        Structure mirrors :meth:`_advance_group` — score, reorder, retire, step —
+        with three differences: selection is a per-request top-``k`` over the
+        flattened ``(k, V)`` grid rather than a per-row argmax; a slot emitting
+        EOS is *set aside* as a completed candidate instead of retiring its
+        request; and a request retires only once its whole beam is done.
+
+        The ``step`` at the end is the part that is easy to leave out and
+        impossible to miss once it is: without feeding the chosen token back into
+        the decoder, ``last_logits`` never changes and every slot re-picks its
+        first token forever.
+        """
+        logits = self._process_logits(group.last_logits.float(), group)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        new_scores, parent, token = topk_step(log_probs, group.scores, group.beam)
+
+        # Reorder the decoder state so flat row ``b * k + j`` carries slot j's
+        # parent state.  One ``select`` with (possibly repeated) parent indices.
+        group.state = self._decoder().select(group.state, global_parent_rows(parent, group.beam))
+        chosen = token.reshape(-1)  # (B * k,) token to feed each new slot
+
+        # Host-side bookkeeping: extend each new slot from its parent, and move
+        # EOS slots into the completed pool.  ``k`` list copies per step is
+        # nothing next to a decoder forward (see incremental_beam's docstring).
+        parent_h = parent.tolist()
+        token_h = token.tolist()
+        scores_h = new_scores.tolist()
+        group.steps += 1
+        for b in range(group.batch):
+            src = group.tokens[b]
+            fresh: List[List[int]] = []
+            for j in range(group.beam):
+                p, tok, sc = parent_h[b][j], int(token_h[b][j]), scores_h[b][j]
+                if not is_finite_score(sc):
+                    # Every live slot was already expanded, so this entry came
+                    # from a dead parent — leave it dead, never resurrect it.
+                    fresh.append([])
+                    new_scores[b, j] = DEAD_SCORE
+                elif self._is_eos(tok):
+                    # Complete: banked as a candidate, and out of the running so
+                    # it stops consuming a slot.  EOS itself is not part of the
+                    # hypothesis.
+                    group.finished[b].append((sc, list(src[p])))
+                    fresh.append([])
+                    new_scores[b, j] = DEAD_SCORE
+                else:
+                    fresh.append(src[p] + [tok])
+            group.tokens[b] = fresh
+        group.scores = new_scores
+
+        outputs, keep = self._retire_finished_requests(group)
+        if group.requests:
+            # Restrict the fed tokens to the surviving slots, in the same flat
+            # order ``_retire_finished_requests`` left the state in.
+            if keep is not None:
+                chosen = chosen.index_select(0, keep)
+            with torch.no_grad():
+                group.last_logits, group.state = self._decoder().step(chosen, group.state)
+        return outputs
+
+    def _retire_finished_requests(
+        self, group: ArBeamGroup
+    ) -> Tuple[List[RequestOutput], Optional[torch.Tensor]]:
+        """Emit + drop requests whose beam is exhausted or capped.
+
+        Returns the outputs plus, when anything was dropped, the flat slot rows
+        that survived — the caller needs them to line its per-slot tensors up
+        with the shrunken state.
+        """
+        done: List[int] = []
+        reasons: Dict[int, str] = {}
+        live_h = group.scores.tolist()
+        for b in range(group.batch):
+            live = sum(1 for sc in live_h[b] if is_finite_score(sc))
+            if len(group.finished[b]) >= group.beam or live == 0:
+                done.append(b)
+                reasons[b] = "stop"
+            elif group.steps >= group.max_new[b]:
+                done.append(b)
+                # Only "length" when nothing completed — a request whose best
+                # candidate ended on EOS did stop, it just also ran long.
+                reasons[b] = "stop" if group.finished[b] else "length"
+
+        outputs = [self._finalize_beam_request(group, b, reasons[b]) for b in done]
+        if not done:
+            return outputs, None
+
+        keep = [b for b in range(group.batch) if b not in set(done)]
+        slot_rows: Optional[torch.Tensor] = None
+        if keep:
+            device = group.scores.device
+            slot_rows = torch.tensor(
+                [b * group.beam + j for b in keep for j in range(group.beam)],
+                dtype=torch.long,
+                device=device,
+            )
+            group.state = self._decoder().select(group.state, slot_rows)
+            group.scores = group.scores.index_select(
+                0, torch.tensor(keep, dtype=torch.long, device=device)
+            )
+        group.requests = [group.requests[b] for b in keep]
+        group.tokens = [group.tokens[b] for b in keep]
+        group.finished = [group.finished[b] for b in keep]
+        group.max_new = [group.max_new[b] for b in keep]
+        group.opts = [group.opts[b] for b in keep]
+        return outputs, slot_rows
+
+    def _finalize_beam_request(self, group: ArBeamGroup, index: int, reason: str) -> RequestOutput:
+        rows, scores = group.ranked(index, self._length_penalty)
+        best = rows[0] if rows else []
+        return RequestOutput(
+            request_id=group.requests[index].request_id,
+            text=self._detok.detokenize(best),
+            tokens=rows or [[]],
+            scores=scores or None,
+            finished=True,
+            finish_reason=reason,
+        )
+
+    def _beam_partials(self, advanced: List[ArBeamGroup]) -> List[RequestOutput]:
+        """Interim outputs from each request's current best hypothesis.
+
+        The best hypothesis can be *revised* between steps (a different slot
+        wins), so unlike greedy this is not an append-only stream — the full
+        transcript is re-decoded rather than extended, and the client replaces
+        rather than appends (which the wire contract already requires).
+        """
+        outputs: List[RequestOutput] = []
+        for group in advanced:
+            for b, req in enumerate(group.requests):
+                best, _score, _done = group.best(b, self._length_penalty)
+                if best:
+                    outputs.append(
+                        RequestOutput(
+                            request_id=req.request_id,
+                            text=self._detok.detokenize(best),
+                            tokens=[list(best)],
+                            finished=False,
+                        )
+                    )
+        return outputs
+
+    def _row_text(self, group: ArGroup, row: int) -> str:
+        """Full transcript for a row, decoding only the ids added since last call.
+
+        Keeps ``RequestOutput.text`` the complete transcript (the wire contract
+        is unchanged — clients replace, not append) while the *work* is
+        incremental.  ``state["text"]`` is what the tokenizer axis maintains.
+        """
+        state = group.detok_state[row]
+        tokens = group.tokens[row]
+        seen = len(state.get("ids", ()))
+        if seen < len(tokens):
+            self._detok.detokenize_incremental(tokens[seen:], state)
+        return state.get("text", "")
+
     def _partials(self, advanced: List[ArGroup]) -> List[RequestOutput]:
         """One ``finished=False`` output per still-active request that moved."""
         outputs: List[RequestOutput] = []
@@ -261,7 +565,7 @@ class IncrementalArStrategy(DecodeStrategy):
                     outputs.append(
                         RequestOutput(
                             request_id=req.request_id,
-                            text=self._detok.detokenize(tokens),
+                            text=self._row_text(group, row),
                             tokens=[list(tokens)],
                             finished=False,
                         )
@@ -272,7 +576,7 @@ class IncrementalArStrategy(DecodeStrategy):
         tokens = group.tokens[row]
         return RequestOutput(
             request_id=group.requests[row].request_id,
-            text=self._detok.detokenize(tokens),
+            text=self._row_text(group, row),
             tokens=[tokens],
             finished=True,
             finish_reason=reason,
@@ -284,15 +588,36 @@ class IncrementalArStrategy(DecodeStrategy):
 
     def free_session(self, request: Request) -> None:
         for group in self._groups:
-            if request in group.requests:
-                row = group.requests.index(request)
-                keep = [r for r in range(len(group.requests)) if r != row]
-                group.keep_rows(keep)
+            if request not in group.requests:
+                continue
+            row = group.requests.index(request)
+            keep = [r for r in range(len(group.requests)) if r != row]
+            if isinstance(group, ArBeamGroup):
+                # A beam request owns ``beam`` consecutive decoder rows.
+                device = group.last_logits.device
                 if keep:
-                    keep_idx = torch.tensor(keep, dtype=torch.long, device=group.last_logits.device)
-                    group.state = self._decoder().select(group.state, keep_idx)
-                    group.last_logits = group.last_logits.index_select(0, keep_idx)
+                    slot_rows = torch.tensor(
+                        [b * group.beam + j for b in keep for j in range(group.beam)],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    group.state = self._decoder().select(group.state, slot_rows)
+                    group.last_logits = group.last_logits.index_select(0, slot_rows)
+                    group.scores = group.scores.index_select(
+                        0, torch.tensor(keep, dtype=torch.long, device=device)
+                    )
+                group.requests = [group.requests[b] for b in keep]
+                group.tokens = [group.tokens[b] for b in keep]
+                group.finished = [group.finished[b] for b in keep]
+                group.max_new = [group.max_new[b] for b in keep]
+                group.opts = [group.opts[b] for b in keep]
                 break
+            group.keep_rows(keep)
+            if keep:
+                keep_idx = torch.tensor(keep, dtype=torch.long, device=group.last_logits.device)
+                group.state = self._decoder().select(group.state, keep_idx)
+                group.last_logits = group.last_logits.index_select(0, keep_idx)
+            break
         self._groups = [g for g in self._groups if g.requests]
 
     # ------------------------------------------------------------------

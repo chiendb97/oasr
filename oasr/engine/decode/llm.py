@@ -21,13 +21,15 @@ override, a generation cap, and sampling knobs; the default remains greedy.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Set, Tuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Set, Tuple
 
 import torch
 
 from ..request import Request
 from .base import register_decode_strategy
-from .incremental import IncrementalArStrategy, Prefill
+from .incremental import ArOptions, IncrementalArStrategy, Prefill
+from .options import option
 
 if TYPE_CHECKING:
     from oasr.models.base import BaseAsrModel
@@ -43,11 +45,26 @@ logger = logging.getLogger(__name__)
 _PROMPT_CACHE_MAX = 64
 
 
+@dataclass(frozen=True)
+class LlmOptions(ArOptions):
+    """Speech-LLM options: the AR base's cap plus the default user prompt."""
+
+    prompt: Optional[str] = option(
+        None,
+        legacy="llm_prompt",
+        doc=(
+            "Default user prompt spliced into the ChatML template.  None uses "
+            "the checkpoint's.  DecodingOptions.prompt overrides per request."
+        ),
+    )
+
+
 @register_decode_strategy("llm")
 class LlmDecodeStrategy(IncrementalArStrategy):
     """Incremental greedy LLM decoding (Qwen2-Audio-style speech LLM)."""
 
     decode_type: ClassVar[str] = "llm"
+    options_cls: ClassVar[type] = LlmOptions
     emit_partials: ClassVar[bool] = True
 
     def __init__(
@@ -75,13 +92,27 @@ class LlmDecodeStrategy(IncrementalArStrategy):
         self._mcfg = mcfg
         self._tokenizer = tokenizer
 
-        user_prompt = config.llm_prompt or mcfg.default_user_prompt
+        user_prompt = self.options.prompt or mcfg.default_user_prompt
         suffix_text = mcfg.prompt_suffix.format(prompt=user_prompt)
         self._prefix_ids: List[int] = list(tokenizer.encode(mcfg.prompt_prefix))
         self._default_suffix_ids: List[int] = list(tokenizer.encode(suffix_text))
         # Per-prompt suffix-ids memo for DecodingOptions.prompt overrides.
         self._suffix_cache: Dict[str, List[int]] = {}
         self._eos: Set[int] = set(int(t) for t in mcfg.eos_token_ids)
+
+    def _prompt_len_estimate(self) -> int:
+        """Prompt positions per row: ChatML text + the spliced audio embeddings.
+
+        The audio half is constant because the frontend is fixed-window — a 30 s
+        window always yields the same number of tower outputs — so this is a
+        real bound, not an average.  Two poolings of a Whisper-geometry tower:
+        ``(mel - 1)//2 + 1`` then ``(feat - 2)//2 + 1``, then AvgPool1d(2).
+        """
+        mel_frames = int(self._config.feature_config.fixed_window_frames or 3000)
+        feat = (mel_frames - 1) // 2 + 1
+        audio_tokens = ((feat - 2) // 2 + 1) // 2
+        text_tokens = len(self._prefix_ids) + len(self._default_suffix_ids)
+        return int(audio_tokens + text_tokens)
 
     def _suffix_ids_for(self, request: Request) -> List[int]:
         """Suffix token ids for one request's chat template.

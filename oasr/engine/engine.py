@@ -8,6 +8,7 @@ import logging
 import queue
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -26,6 +27,7 @@ from .executor import (
 )
 from .graph_cache import round_up_bucket
 from .input_processor import InputProcessor
+from .longform import LongFormTracker
 from .model_runner import ModelRunner
 from .output_processor import OutputProcessor
 from .request import DecodingOptions, Request, RequestOutput
@@ -77,6 +79,14 @@ class ASREngine:
         wavs = [torchaudio.load(p)[0].squeeze(0) for p in ("a.wav", "b.wav")]
         texts = engine.transcribe_offline(wavs)
     """
+
+    #: Long-form fan-out tracker, ``None`` unless ``EngineConfig.long_form`` is
+    #: set and the frontend has a fixed window.  Declared at class level, not
+    #: only assigned in ``__init__``, because ``abort_request`` / ``step`` read it
+    #: on every call and the concurrency tests drive a hand-built engine through
+    #: ``__new__`` — an attribute that exists only after a full construction
+    #: would make those entry points depend on construction order.
+    _longform: Optional["LongFormTracker"] = None
 
     def __init__(self, config: EngineConfig) -> None:
         # Engine-wide re-entrant lock guarding scheduler queues and per-request
@@ -308,9 +318,88 @@ class ASREngine:
             )
             self._prep_thread.start()
 
+        # Long-form fan-out (C5's real fix).  Only meaningful for a *fixed-window*
+        # frontend: without one, a long request already decodes end to end and
+        # segmenting it would only cost accuracy.
+        self._longform: Optional[LongFormTracker] = None
+        self._longform_window_samples = 0
+        self._longform_overlap_samples = 0
+        window_s = config.feature_config.fixed_window_seconds
+        if getattr(config, "long_form", False):
+            if window_s is None:
+                logger.warning(
+                    "long_form=True but the %r frontend has no fixed window; "
+                    "long audio already decodes whole, so segmentation is off",
+                    config.feature_config.feature_type,
+                )
+            else:
+                sr = int(config.feature_config.sample_rate)
+                self._longform = LongFormTracker()
+                self._longform_window_samples = int(sr * window_s)
+                self._longform_overlap_samples = int(
+                    sr * min(float(config.long_form_overlap_seconds), window_s / 2.0)
+                )
+                logger.info(
+                    "long-form decoding enabled: %.0fs windows, %.2fs overlap",
+                    window_s,
+                    self._longform_overlap_samples / sr,
+                )
+
     # ------------------------------------------------------------------
     # Request management
     # ------------------------------------------------------------------
+
+    def _maybe_fan_out_longform(
+        self,
+        audio,
+        request_id: Optional[str],
+        sample_rate: int,
+        priority: int,
+        decoding,
+    ) -> Optional[str]:
+        """Split over-window audio into per-window child requests.
+
+        Returns the parent request id when the audio was fanned out, or ``None``
+        when it fits one window and should be admitted normally.  The caller sees
+        one id either way; :meth:`step` merges the children back.
+        """
+        from .longform import split_windows
+
+        wave = torch.as_tensor(audio, dtype=torch.float32, device="cpu").reshape(-1)
+        if int(wave.numel()) <= self._longform_window_samples:
+            return None
+
+        windows = split_windows(wave, self._longform_window_samples, self._longform_overlap_samples)
+        parent_id = request_id or uuid.uuid4().hex
+        stride = self._longform_window_samples - self._longform_overlap_samples
+        child_ids: List[str] = []
+        starts: List[float] = []
+        for i, _w in enumerate(windows):
+            child_ids.append(self._longform.child_id(parent_id, i))
+            starts.append((i * stride) / float(sample_rate))
+        self._longform.register(parent_id, child_ids, starts)
+        logger.debug(
+            "long-form request %s: %.1fs -> %d windows",
+            parent_id,
+            wave.numel() / float(sample_rate),
+            len(windows),
+        )
+        # Bulk admission so the windows land in one batch — they are independent,
+        # which is exactly what makes the batched path applicable here.
+        self.add_requests_batch(
+            [
+                {
+                    "audio": w,
+                    "request_id": cid,
+                    "sample_rate": sample_rate,
+                    "streaming": False,
+                    "priority": priority,
+                    "decoding": decoding,
+                }
+                for cid, w in zip(child_ids, windows)
+            ]
+        )
+        return parent_id
 
     def add_request(
         self,
@@ -358,6 +447,12 @@ class ASREngine:
         str
             The assigned ``request_id``.
         """
+        if self._longform is not None and not streaming:
+            fanned = self._maybe_fan_out_longform(
+                audio, request_id, sample_rate, priority, decoding
+            )
+            if fanned is not None:
+                return fanned
         req = Request(
             audio,
             request_id=request_id,
@@ -546,10 +641,12 @@ class ASREngine:
     def shutdown(self) -> None:
         """Release engine-held resources (best-effort, idempotent).
 
-        Stops the admission-prep thread and drains the executor: incremental AR
-        strategies park requests with live decoder-KV buffers in the executor's
-        pending pool, and without an explicit release those only go away when
-        the garbage collector gets to them.
+        Stops the admission-prep thread, drains the executor, and releases the
+        input processor's staging buffers: incremental AR strategies park
+        requests with live decoder-KV buffers in the executor's pending pool,
+        and the staging buffers hold pinned host memory (a process-global
+        resource) — without an explicit release both only go away when the
+        garbage collector gets to them.
         """
         t = self._prep_thread
         if t is not None and t.is_alive():
@@ -560,6 +657,10 @@ class ASREngine:
             self._executor.shutdown()
         except Exception:  # pragma: no cover - defensive; shutdown must not raise
             logger.exception("executor shutdown failed")
+        try:
+            self._input_processor.release_staging()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("staging release failed")
 
     def _prewarm_offline(self) -> None:
         """Run one dummy offline batch per preferred size to absorb one-time
@@ -678,8 +779,19 @@ class ASREngine:
             self._executor.feed_chunk(request_id, chunk, is_last=is_last)
 
     def abort_request(self, request_id: str) -> None:
-        """Remove a request from the engine, freeing cache if allocated."""
+        """Remove a request from the engine, freeing cache if allocated.
+
+        A long-form parent id is not known to the executor — the windows are —
+        so aborting one has to abort every window it fanned out to, or the
+        cancelled file keeps decoding and its outputs pile up in the tracker.
+        """
         with self._lock:
+            if self._longform is not None:
+                children = self._longform.abandon(request_id)
+                if children:
+                    for cid in children:
+                        self._executor.abort(cid)
+                    return
             self._executor.abort(request_id)
 
     # ------------------------------------------------------------------
@@ -786,6 +898,7 @@ class ASREngine:
                 if config.max_decode_slots is not None
                 else config.max_batch_size
             ),
+            decode_kv_budget_gib=config.decode_kv_budget_gib,
             max_tick_ms=config.max_tick_ms,
             decode_admit_window_ms=config.decode_admit_window_ms,
             max_batch_size=config.max_batch_size,
@@ -823,6 +936,9 @@ class ASREngine:
             nvtx_push("engine.step")
             outputs = self._executor.step()
             nvtx_pop()
+            if self._longform is not None and self._longform:
+                # Replace per-window child outputs with one stitched parent.
+                outputs = self._longform.absorb(outputs)
             return outputs
 
     def run(self) -> List[RequestOutput]:

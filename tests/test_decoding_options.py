@@ -167,3 +167,25 @@ class TestNbestTexts:
         out = self._output([[5, 6]])
         self._op().fill_nbest_texts(req, out)
         assert out.nbest_texts is None
+
+    def test_rows_are_truncated_before_crossing_pyo3(self):
+        """CTC ships its whole beam regardless of n_best; Rust discards the rest.
+
+        Marshalling 10-16 rows to deliver 2 is pure cost on the GIL-holding
+        dispatcher thread, so the engine trims to what was asked for.
+        """
+        req = Request(audio=None, decoding=DecodingOptions(n_best=2))
+        out = self._output([[5, 6], [7, 8], [9], [10], [11]])
+        out.scores = [-1.0, -2.0, -3.0, -4.0, -5.0]
+        self._op().fill_nbest_texts(req, out)
+        assert len(out.tokens) == 2
+        assert out.scores == [-1.0, -2.0]
+        assert out.nbest_texts == ["5 6", "7 8"]
+
+    def test_a_single_hypothesis_is_left_alone(self):
+        """Greedy families must not have their one row trimmed away."""
+        req = Request(audio=None, decoding=DecodingOptions(n_best=5))
+        out = self._output([[5, 6]])
+        self._op().fill_nbest_texts(req, out)
+        assert out.tokens == [[5, 6]]
+        assert out.nbest_texts is None

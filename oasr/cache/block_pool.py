@@ -74,9 +74,7 @@ class BlockPool:
         self._v_pool = torch.zeros(*pool_shape, dtype=cfg.dtype, device=cfg.device)
 
         # Free list: all block IDs are initially free.
-        self._free_list: collections.deque[int] = collections.deque(
-            range(cfg.max_num_blocks)
-        )
+        self._free_list: collections.deque[int] = collections.deque(range(cfg.max_num_blocks))
 
     # ------------------------------------------------------------------
     # Properties
@@ -86,6 +84,11 @@ class BlockPool:
     def config(self) -> CacheConfig:
         """The pool's cache configuration (geometry, device, dtype)."""
         return self._config
+
+    @property
+    def num_blocks(self) -> int:
+        """Total physical blocks in the pool."""
+        return int(self._config.max_num_blocks)
 
     @property
     def num_free_blocks(self) -> int:
@@ -131,12 +134,33 @@ class BlockPool:
     def free(self, block_ids: List[int]) -> None:
         """Return physical blocks to the free list.
 
+        Validates that each id is in range and not already free.  A double free
+        is the worst failure this class can have: the block lands on the free
+        list twice, two different streams are later handed the *same* physical
+        block, and each silently overwrites the other's KV — no error, just
+        wrong transcripts for both.  Cheap to detect here, effectively
+        impossible to diagnose downstream.
+
         Parameters
         ----------
         block_ids : list[int]
             Physical block IDs to release.  Passing an empty list is a no-op.
         """
+        if not block_ids:
+            return
         with self._lock:
+            free_set = set(self._free_list)
+            for bid in block_ids:
+                if not 0 <= bid < self.num_blocks:
+                    raise ValueError(
+                        f"BlockPool.free: block id {bid} out of range " f"[0, {self.num_blocks})"
+                    )
+                if bid in free_set:
+                    raise ValueError(
+                        f"BlockPool.free: block {bid} is already free (double "
+                        "free would hand one physical block to two streams)"
+                    )
+                free_set.add(bid)
             self._free_list.extend(block_ids)
 
     # ------------------------------------------------------------------
@@ -162,9 +186,7 @@ class BlockPool:
         """
         return self._k_pool[layer], self._v_pool[layer]
 
-    def get_kv_block_view(
-        self, layer: int, block_id: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_kv_block_view(self, layer: int, block_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return direct views into K and V slabs for one layer and block.
 
         The returned tensors are *views* — writes are reflected in the pool.
@@ -206,13 +228,20 @@ class BlockPool:
         cfg = self._config
         if not block_ids:
             empty = torch.empty(
-                0, cfg.n_kv_head, cfg.head_dim,
-                dtype=cfg.dtype, device=cfg.device,
+                0,
+                cfg.n_kv_head,
+                cfg.head_dim,
+                dtype=cfg.dtype,
+                device=cfg.device,
             )
             return empty, empty.clone()
 
         idx = torch.tensor(block_ids, dtype=torch.long, device=self._k_pool.device)
         n, bsf = len(block_ids), cfg.block_size_frames
-        k = torch.index_select(self._k_pool[layer], 0, idx).reshape(n * bsf, cfg.n_kv_head, cfg.head_dim)
-        v = torch.index_select(self._v_pool[layer], 0, idx).reshape(n * bsf, cfg.n_kv_head, cfg.head_dim)
+        k = torch.index_select(self._k_pool[layer], 0, idx).reshape(
+            n * bsf, cfg.n_kv_head, cfg.head_dim
+        )
+        v = torch.index_select(self._v_pool[layer], 0, idx).reshape(
+            n * bsf, cfg.n_kv_head, cfg.head_dim
+        )
         return k, v

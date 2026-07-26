@@ -19,6 +19,10 @@ from .base import (
 )
 
 # Importing the architecture packages triggers their register_model() calls.
+# Every built-in package is imported here, and the same list drives
+# ``registry._BUILTIN_PACKAGES``; ``tests/test_model_registry.py`` asserts the
+# two agree, since they drifted apart once already (this file exported only
+# conformer / transducer / zipformer while the registry knew all six).
 from .conformer import (
     ConformerEncoder,
     ConformerEncoderConfig,
@@ -30,6 +34,7 @@ from .conformer import (
 )
 from .heads import CTCHead
 from .loaders import PretrainedModel, from_pretrained, load_pretrained
+from .paraformer import ParaformerModel, ParaformerModelConfig
 from .registry import (
     ModelEntry,
     build_model_from_checkpoint,
@@ -40,10 +45,12 @@ from .registry import (
     register_model,
     resolve_architecture,
 )
+from .speech_llm import SpeechLlmModel, SpeechLlmModelConfig
 from .transducer import (
     TransducerModel,
     TransducerModelConfig,
 )
+from .whisper import WhisperModel, WhisperModelConfig
 from .zipformer import (
     ZipformerEncoder,
     ZipformerEncoderConfig,
@@ -90,4 +97,13 @@ __all__ = [
     # Transducer (RNNT)
     "TransducerModel",
     "TransducerModelConfig",
+    # Whisper (AED)
+    "WhisperModel",
+    "WhisperModelConfig",
+    # Paraformer (NAR)
+    "ParaformerModel",
+    "ParaformerModelConfig",
+    # Speech-LLM (Qwen2-Audio)
+    "SpeechLlmModel",
+    "SpeechLlmModelConfig",
 ]

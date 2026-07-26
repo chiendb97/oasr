@@ -154,6 +154,45 @@ def _build_strategy(monkeypatch, tmp_path, model, result, **cfg_overrides):
     return rescoring_mod.CtcAedRescoringStrategy(cfg, Detokenizer(None, None), model)
 
 
+class TestScoreGathering:
+    """H12: reading n*L scalars must not materialise an (n, L, V) log_softmax."""
+
+    def _reference(self, logits, ys_out):
+        """The previous implementation, verbatim."""
+        from oasr.engine.decode.rescoring import _IGNORE_ID
+
+        lp = torch.log_softmax(logits.float(), dim=-1)
+        mask = ys_out != _IGNORE_ID
+        idx = ys_out.masked_fill(~mask, 0).unsqueeze(-1)
+        return (lp.gather(2, idx).squeeze(-1) * mask).sum(dim=1)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    @pytest.mark.parametrize("n,L,V", [(1, 3, 17), (7, 5, 64), (70, 4, 33)])
+    def test_matches_the_log_softmax_form(self, dtype, n, L, V):
+        from oasr.engine.decode.rescoring import _IGNORE_ID, CtcAedRescoringStrategy
+
+        torch.manual_seed(n * 100 + L)
+        logits = torch.randn(n, L, V, dtype=dtype)
+        ys_out = torch.randint(0, V, (n, L))
+        # Ragged: pad the tail of every other row.
+        ys_out[::2, -1] = _IGNORE_ID
+        got = CtcAedRescoringStrategy._gather_scores(logits, ys_out)
+        want = self._reference(logits, ys_out)
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+    def test_row_count_beyond_one_chunk_is_covered(self):
+        """``n`` larger than the chunk size must still cover every row."""
+        from oasr.engine.decode.rescoring import _SCORE_CHUNK_ROWS, CtcAedRescoringStrategy
+
+        n = _SCORE_CHUNK_ROWS * 2 + 3
+        torch.manual_seed(1)
+        logits = torch.randn(n, 3, 11)
+        ys_out = torch.randint(0, 11, (n, 3))
+        got = CtcAedRescoringStrategy._gather_scores(logits, ys_out)
+        torch.testing.assert_close(got, self._reference(logits, ys_out), rtol=1e-5, atol=1e-5)
+        assert got.shape == (n,)
+
+
 class TestFusionMath:
     @pytest.mark.parametrize("reverse_weight", [0.0, 0.3])
     def test_vectorized_matches_naive_loop(self, monkeypatch, tmp_path, reverse_weight):

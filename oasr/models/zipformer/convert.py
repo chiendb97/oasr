@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping, Optional, 
 
 import torch
 
+from ..converter import BaseCheckpointConverter
 from ..registry import DETECT_ASSET_LAYOUT
 from .config import ZipformerEncoderConfig, ZipformerModelConfig
 from .model import ZipformerModel
@@ -97,7 +98,7 @@ def _extract_state_dict(obj: Any) -> Mapping[str, torch.Tensor]:
     return obj
 
 
-class IcefallConverter:
+class IcefallConverter(BaseCheckpointConverter):
     """Checkpoint converter for icefall Zipformer experiment directories.
 
     Implements the :class:`~oasr.models.registry.CheckpointConverter` protocol.
@@ -160,6 +161,10 @@ class IcefallConverter:
         return None
 
     #: only filename / asset conventions; other formats ship the same filenames, so this claim outranks a weaker one
+    architecture: ClassVar[str] = "zipformer"
+    source_format: ClassVar[str] = "icefall"
+    default_checkpoint_name: ClassVar[str] = "pretrained.pt"
+    default_decode_type: ClassVar[str] = "ctc"
     #: (see :func:`oasr.models.registry.resolve_architecture`).
     detect_specificity: ClassVar[int] = DETECT_ASSET_LAYOUT
 
@@ -194,9 +199,37 @@ class IcefallConverter:
                 return True
         return False
 
+    def config_from_state_dict(
+        self, sd: Mapping[str, torch.Tensor], source: str = "state dict"
+    ) -> ZipformerModelConfig:
+        """Infer the architecture + vocab from checkpoint tensor shapes.
+
+        Split out of :meth:`build_config` so :meth:`build_config_for_convert`
+        can reuse weights that are already in memory — icefall ships no config
+        file, so this is the only source of architecture, and reading the file
+        twice to get it was the slowest step of a conversion.
+        """
+        config = ZipformerModelConfig()
+        try:
+            config.encoder = infer_encoder_config(sd)
+        except Exception as exc:
+            raise ValueError(
+                f"could not infer the Zipformer architecture from {source} "
+                f"({exc}). Pass an explicit model config, or check that this "
+                "is an icefall Zipformer checkpoint."
+            ) from exc
+        w = sd.get("ctc_output.1.weight")
+        if w is not None:
+            vocab = int(w.shape[0])
+            # GEMM kernels require N % 8 == 0; pad like the Conformer loader.
+            if vocab % 8 != 0:
+                vocab = (vocab // 8 + 1) * 8
+            config.vocab_size = vocab
+        return config
+
     def build_config(self, ckpt_dir: Path) -> ZipformerModelConfig:
         """Build the model config, inferring the encoder architecture + vocab from
-        the checkpoint shapes (falls back to the LibriSpeech "M" defaults)."""
+        the checkpoint shapes."""
         config = ZipformerModelConfig()
         ckpt = self._find_ckpt(Path(ckpt_dir))
         if ckpt is not None:
@@ -214,21 +247,7 @@ class IcefallConverter:
                     f"could not read the icefall checkpoint {ckpt} to infer the "
                     f"Zipformer architecture: {exc}"
                 ) from exc
-            try:
-                config.encoder = infer_encoder_config(sd)
-            except Exception as exc:
-                raise ValueError(
-                    f"could not infer the Zipformer architecture from {ckpt} "
-                    f"({exc}). Pass an explicit model config, or check that this "
-                    "is an icefall Zipformer checkpoint."
-                ) from exc
-            w = sd.get("ctc_output.1.weight")
-            if w is not None:
-                vocab = int(w.shape[0])
-                # GEMM kernels require N % 8 == 0; pad like the Conformer loader.
-                if vocab % 8 != 0:
-                    vocab = (vocab // 8 + 1) * 8
-                config.vocab_size = vocab
+            config = self.config_from_state_dict(sd, source=str(ckpt))
         logger.info(
             "Zipformer config: vocab_size=%s encoder_dim=%s num_encoder_layers=%s",
             config.vocab_size,
@@ -283,24 +302,19 @@ class IcefallConverter:
             audio_scale=32768.0,
         )
 
-    def convert(
-        self, ckpt_dir: Path, checkpoint_name: str = "pretrained.pt", map_location: Any = "cpu"
-    ) -> "ConvertedCheckpoint":
-        """Full conversion: config + weights + tokenizer/feature/decoding specs."""
-        from oasr.checkpoints import ConvertedCheckpoint, DecodingDefaults
+    def build_config_for_convert(self, ckpt_dir: Path, state_dict):
+        """Infer from the already-loaded weights — icefall ships no config file.
 
-        ckpt_dir = Path(ckpt_dir)
-        return ConvertedCheckpoint(
-            architecture="zipformer",
-            model_config=self.build_config(ckpt_dir),
-            aux=self.build_aux(ckpt_dir),
-            state_dict=self.load_state_dict(ckpt_dir, checkpoint_name, map_location),
-            tokenizer=self.build_tokenizer_spec(ckpt_dir),
-            features=self.build_feature_spec(ckpt_dir),
-            # icefall CTC: <blk>=0; sos/eos unused by CTC decode.
-            decoding=DecodingDefaults(default_decode_type="ctc", blank_id=0),
-            source_format="icefall",
-        )
+        ``build_config`` would ``torch.load`` the same (multi-GB) checkpoint a
+        second time just to read tensor shapes.
+        """
+        return self.config_from_state_dict(_extract_state_dict(state_dict))
+
+    def build_decoding_defaults(self, config, ckpt_dir: Path):
+        from oasr.checkpoints import DecodingDefaults
+
+        # icefall CTC: <blk>=0; sos/eos unused by CTC decode.
+        return DecodingDefaults(default_decode_type=self.default_decode_type, blank_id=0)
 
 
 def load_icefall_checkpoint(

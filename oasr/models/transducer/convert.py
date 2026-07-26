@@ -43,6 +43,10 @@ class IcefallTransducerConverter(IcefallConverter):
     the bundle's decoding defaults.
     """
 
+    architecture: ClassVar[str] = "transducer"
+    default_checkpoint_name: ClassVar[str] = "pretrained.pt"
+    default_decode_type: ClassVar[str] = "transducer"
+
     #: The pruned-RNNT ``simple_*_proj`` heads are training-only; a hybrid
     #: ``ctc_output.*`` branch is a named capability (load it with
     #: ``architecture="zipformer"`` instead).
@@ -99,24 +103,14 @@ class IcefallTransducerConverter(IcefallConverter):
             blank_id=0,  # icefall convention: <blk> = 0
         )
 
-    def convert(
-        self, ckpt_dir: Path, checkpoint_name: str = "pretrained.pt", map_location: Any = "cpu"
-    ) -> "ConvertedCheckpoint":
-        """Full conversion: config + weights + tokenizer/feature/decoding specs."""
-        from oasr.checkpoints import ConvertedCheckpoint, DecodingDefaults
+    def build_config_for_convert(self, ckpt_dir: Path, state_dict):
+        """Shape-infer from the loaded weights (icefall ships no config file)."""
+        return self.config_from_state_dict(state_dict)
 
-        ckpt_dir = Path(ckpt_dir)
-        state_dict = self.load_state_dict(ckpt_dir, checkpoint_name, map_location)
-        return ConvertedCheckpoint(
-            architecture="transducer",
-            model_config=self.config_from_state_dict(state_dict),
-            aux={},
-            state_dict=state_dict,
-            tokenizer=self.build_tokenizer_spec(ckpt_dir),
-            features=self.build_feature_spec(ckpt_dir),
-            decoding=DecodingDefaults(default_decode_type="transducer", blank_id=0),
-            source_format="icefall",
-        )
+    def build_decoding_defaults(self, config, ckpt_dir: Path):
+        from oasr.checkpoints import DecodingDefaults
+
+        return DecodingDefaults(default_decode_type=self.default_decode_type, blank_id=0)
 
 
 def load_icefall_transducer_checkpoint(

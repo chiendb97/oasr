@@ -29,6 +29,7 @@ import yaml
 
 from oasr.layers.norm import GlobalCMVN
 
+from ..converter import BaseCheckpointConverter
 from ..decoders.transformer_decoder import TransformerDecoderConfig
 from ..registry import DETECT_NAMED_CONFIG
 from .config import ConformerEncoderConfig, ConformerModelConfig
@@ -124,7 +125,7 @@ def load_global_cmvn(cmvn_path: str) -> GlobalCMVN:
     return GlobalCMVN(mean, istd)
 
 
-class WenetConverter:
+class WenetConverter(BaseCheckpointConverter):
     """Checkpoint converter for WeNet Conformer experiment directories.
 
     Implements the :class:`~oasr.models.registry.CheckpointConverter` protocol:
@@ -148,6 +149,10 @@ class WenetConverter:
         ),
     }
 
+    architecture: ClassVar[str] = "conformer"
+    source_format: ClassVar[str] = "wenet"
+    default_checkpoint_name: ClassVar[str] = "final.pt"
+    default_decode_type: ClassVar[str] = "ctc"
     #: ``train.yaml`` identifies WeNet, not a specific architecture, so this claim outranks a weaker one
     #: (see :func:`oasr.models.registry.resolve_architecture`).
     detect_specificity: ClassVar[int] = DETECT_NAMED_CONFIG
@@ -220,30 +225,20 @@ class WenetConverter:
             audio_scale=32768.0,
         )
 
-    def convert(
-        self, ckpt_dir: Path, checkpoint_name: str = "final.pt", map_location: Any = "cpu"
-    ) -> "ConvertedCheckpoint":
-        """Full conversion: config + aux + weights + tokenizer/feature/decoding specs."""
-        from oasr.checkpoints import ConvertedCheckpoint, DecodingDefaults
+    def build_decoding_defaults(self, config, ckpt_dir: Path):
+        from oasr.checkpoints import DecodingDefaults
 
-        ckpt_dir = Path(ckpt_dir)
-        raw = parse_wenet_yaml(str(ckpt_dir / "train.yaml"))
-        config = build_config_from_wenet(raw)
         # WeNet convention: <blank>=0, <unk>=1, <sos/eos> = last unit of the
-        # *unpadded* vocab (output_dim - 1).
-        raw_vocab = raw.get("output_dim")
+        # *unpadded* vocab (output_dim - 1), which only train.yaml knows —
+        # config.vocab_size is 8-padded for the GEMM kernels.
+        raw_vocab = parse_wenet_yaml(str(Path(ckpt_dir) / "train.yaml")).get("output_dim")
         sos_eos = int(raw_vocab) - 1 if raw_vocab else None
-        return ConvertedCheckpoint(
-            architecture="conformer",
-            model_config=config,
-            aux=self.build_aux(ckpt_dir),
-            state_dict=self.load_state_dict(ckpt_dir, checkpoint_name, map_location),
-            tokenizer=self.build_tokenizer_spec(ckpt_dir),
-            features=self.build_feature_spec(ckpt_dir, raw),
-            decoding=DecodingDefaults(
-                default_decode_type="ctc", blank_id=0, unk_id=1, sos_id=sos_eos, eos_id=sos_eos
-            ),
-            source_format="wenet",
+        return DecodingDefaults(
+            default_decode_type=self.default_decode_type,
+            blank_id=0,
+            unk_id=1,
+            sos_id=sos_eos,
+            eos_id=sos_eos,
         )
 
 

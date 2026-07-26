@@ -38,6 +38,12 @@ _HOP = 160
 
 
 @functools.lru_cache(maxsize=8)
+@functools.lru_cache(maxsize=8)
+def _hann_window(device_str: str) -> torch.Tensor:
+    """fp32 Hann window for the STFT, cached per device."""
+    return torch.hann_window(_N_FFT, device=torch.device(device_str), dtype=torch.float32)
+
+
 def _mel_filters(sample_rate: int, n_mels: int, device_str: str) -> torch.Tensor:
     """Slaney-normalized slaney-scale mel filterbank ``(n_mels, n_fft//2 + 1)``.
 
@@ -95,6 +101,14 @@ def batched_whisper_logmel(
     n_samples = int(cfg.sample_rate * cfg.whisper_chunk_seconds)
 
     # Zero anything past each row's valid length, then pad/trim to 30 s.
+    #
+    # The engine's ``InputProcessor`` already zeroes the padded tail, so for the
+    # engine path this repeats a (B, T) elementwise pass (~61 MB at B=32) that
+    # changes nothing.  Kept anyway: skipping it would need an extra argument
+    # only this extractor honours, and the whole point of the feature registry
+    # (F1) is that every frontend has the *same* ``(wav, lengths, cfg)``
+    # signature.  A per-extractor escape hatch would put the branch back in the
+    # shared caller, which is what F1 removed.  Direct callers rely on it too.
     idx = torch.arange(T, device=device).unsqueeze(0)
     wav = waveforms * (idx < lengths.to(device).unsqueeze(1))
     if T < n_samples:
@@ -114,9 +128,15 @@ def batched_whisper_logmel(
         )
         wav = wav[:, :n_samples]
 
-    window = torch.hann_window(_N_FFT, device=device, dtype=wav.dtype)
+    # Cached like the mel filters: a 400-point window is small, but rebuilding
+    # it per call is a kernel launch + allocation on every batch for a constant.
     stft = torch.stft(
-        wav.float(), _N_FFT, _HOP, window=window.float(), center=True, return_complex=True
+        wav.float(),
+        _N_FFT,
+        _HOP,
+        window=_hann_window(str(device)),
+        center=True,
+        return_complex=True,
     )
     magnitudes = stft[..., :-1].abs() ** 2  # (B, n_freqs, n_frames)
 

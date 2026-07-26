@@ -28,12 +28,20 @@ see that constant for why the second one is amortized and the first is not.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 
 from ..request import Request, RequestOutput
 from .base import DecodeStrategy, register_decode_strategy
+from .options import option
+from .transducer_beam import (
+    BeamState,
+    beam_search_chunk,
+    init_beam_state,
+    select_rows,
+    stack_states,
+)
 
 if TYPE_CHECKING:
     from oasr.models.base import BaseAsrModel
@@ -78,12 +86,70 @@ _TERMINATION_CHECK_STRIDE = 16
 
 @dataclass
 class _Session:
-    """Per-stream greedy state carried across chunks."""
+    """Per-stream decode state carried across chunks.
+
+    Greedy uses ``context`` / ``dec_proj`` / ``hyp``; beam search uses ``beam``
+    (a ``(1, k, ...)`` :class:`BeamState`) and refreshes ``hyp`` from its best
+    hypothesis after each chunk, so the partial/final emission path and the
+    incremental detokenizer are shared between the two.
+    """
 
     context: torch.Tensor  # (1, context_size) int64 label window
     dec_proj: torch.Tensor  # (1, J) predictor projection for that window
     hyp: List[int] = field(default_factory=list)
+    #: Beam-search state, ``None`` for greedy.
+    beam: Optional["BeamState"] = None
+    #: Per-hypothesis token lists + scores from the last beam chunk (n-best).
+    nbest: Optional[Tuple[List[List[int]], List[float]]] = None
     steps: int = 0  # decoded chunks (drives the partial-emit cadence)
+    #: Incremental-detokenization state (T3).  Greedy transducer decode only
+    #: appends to ``hyp``, so a partial decodes just the new ids rather than
+    #: re-rendering the whole transcript every chunk.
+    detok: Dict[str, Any] = field(default_factory=dict)
+
+    def text(self, detok) -> str:
+        """Full transcript, decoding only what was appended since last call.
+
+        Incremental decoding assumes the hypothesis only grows.  Greedy
+        guarantees that; **beam search does not** — a later frame can promote a
+        different beam entry, rewriting the prefix.  So verify the recorded ids
+        are still a prefix of ``hyp`` and re-decode from scratch when they are
+        not.  Silently feeding ``hyp[seen:]`` after a revision would splice the
+        tail of the new hypothesis onto the text of the old one.
+        """
+        seen_ids = self.detok.get("ids", [])
+        seen = len(seen_ids)
+        if seen > len(self.hyp) or seen_ids != self.hyp[:seen]:
+            self.detok.clear()
+            seen = 0
+        if seen < len(self.hyp):
+            detok.detokenize_incremental(self.hyp[seen:], self.detok)
+        return self.detok.get("text", "")
+
+
+@dataclass(frozen=True)
+class TransducerOptions:
+    """Options for the frame-synchronous transducer greedy decode."""
+
+    max_sym_per_frame: int = option(
+        10,
+        legacy="transducer_max_sym_per_frame",
+        doc="Cap on tokens emitted at one encoder frame before advancing.",
+    )
+    beam_size: int = option(
+        1,
+        doc=(
+            "1 (default) = greedy.  >1 runs icefall-style modified beam search "
+            "(at most one symbol per frame), which is also what makes "
+            "DecodingOptions.n_best return real alternatives for this family."
+        ),
+    )
+
+    def __post_init__(self) -> None:
+        if self.max_sym_per_frame < 1:
+            raise ValueError(f"max_sym_per_frame must be >= 1, got {self.max_sym_per_frame!r}")
+        if self.beam_size < 1:
+            raise ValueError(f"beam_size must be >= 1, got {self.beam_size!r}")
 
 
 @register_decode_strategy("transducer")
@@ -92,6 +158,7 @@ class TransducerDecodeStrategy(DecodeStrategy):
 
     decode_type: ClassVar[str] = "transducer"
     consumes: ClassVar[str] = "hidden"
+    options_cls: ClassVar[type] = TransducerOptions
 
     def __init__(
         self,
@@ -102,7 +169,9 @@ class TransducerDecodeStrategy(DecodeStrategy):
         super().__init__(config, detok, model)
         # Cap on non-blank emissions per frame (safety against degenerate loops;
         # the same cap is applied uniformly so results are deterministic).
-        self._max_sym = int(getattr(config, "transducer_max_sym_per_frame", 10))
+        self._max_sym = int(self.options.max_sym_per_frame)
+        #: >1 selects modified beam search over the greedy loop.
+        self._beam = int(self.options.beam_size)
         # Interim-partial cadence (shared engine knob): emit a partial every
         # N-th chunk; <= 0 disables partials (final transcript only).
         self._partial_interval = int(getattr(config, "partial_decode_interval", 1))
@@ -208,6 +277,8 @@ class TransducerDecodeStrategy(DecodeStrategy):
     def decode_offline(
         self, enc_out: torch.Tensor, enc_lengths: torch.Tensor
     ) -> List[RequestOutput]:
+        if self._beam > 1:
+            return self._decode_offline_beam(enc_out, enc_lengths)
         B = enc_out.size(0)
         context, dec_proj = self._init_state(B, enc_out.device)
         hyps, _, _ = self._greedy_loop(enc_out, enc_lengths, context, dec_proj)
@@ -216,6 +287,32 @@ class TransducerDecodeStrategy(DecodeStrategy):
                 request_id="",
                 text=self._detok.detokenize(hyps[b]),
                 tokens=[hyps[b]],
+                finished=True,
+            )
+            for b in range(B)
+        ]
+
+    @torch.no_grad()
+    def _decode_offline_beam(
+        self, enc_out: torch.Tensor, enc_lengths: torch.Tensor
+    ) -> List[RequestOutput]:
+        """Modified beam search over the whole utterance.
+
+        Emits **all** ``beam_size`` hypotheses in ``tokens`` / ``scores``, best
+        first, so ``DecodingOptions.n_best`` finally means something for this
+        family (``OutputProcessor.fill_nbest_texts`` then detokenizes and trims
+        to what the request asked for).
+        """
+        B, T = enc_out.size(0), enc_out.size(1)
+        state = init_beam_state(self._model.decoder, B, self._beam, enc_out.device, capacity=T)
+        state = beam_search_chunk(self._model, enc_out, enc_lengths, state)
+        rows, scores = state.hypotheses()
+        return [
+            RequestOutput(
+                request_id="",
+                text=self._detok.detokenize(rows[b][0]),
+                tokens=rows[b],
+                scores=scores[b],
                 finished=True,
             )
             for b in range(B)
@@ -259,27 +356,64 @@ class TransducerDecodeStrategy(DecodeStrategy):
             enc = torch.cat([enc_out_map[r.request_id] for r in group], dim=0)  # (B, T, D)
             device = enc.device
             sessions = [self._session(r.request_id, device) for r in group]
-            context = torch.cat([s.context for s in sessions], dim=0)
-            dec_proj = torch.cat([s.dec_proj for s in sessions], dim=0)
             lengths = torch.full((len(group),), T_chunk, dtype=torch.long, device=device)
 
-            new_hyps, context, dec_proj = self._greedy_loop(enc, lengths, context, dec_proj)
+            if self._beam > 1:
+                self._advance_beam(group, sessions, enc, lengths)
+            else:
+                self._advance_greedy(group, sessions, enc, lengths)
 
-            for b, (req, s) in enumerate(zip(group, sessions)):
-                s.context = context[b : b + 1]
-                s.dec_proj = dec_proj[b : b + 1]
-                s.hyp.extend(new_hyps[b])
+            for req, s in zip(group, sessions):
                 s.steps += 1
                 if self._partial_interval > 0 and s.steps % self._partial_interval == 0:
                     outputs.append(
                         RequestOutput(
                             request_id=req.request_id,
-                            text=self._detok.detokenize(s.hyp),
+                            text=s.text(self._detok),
                             tokens=[list(s.hyp)],
                             finished=False,
                         )
                     )
         return outputs
+
+    def _advance_greedy(self, group, sessions, enc, lengths) -> None:
+        """One batched greedy loop over the group's chunk; append per session."""
+        context = torch.cat([s.context for s in sessions], dim=0)
+        dec_proj = torch.cat([s.dec_proj for s in sessions], dim=0)
+        new_hyps, context, dec_proj = self._greedy_loop(enc, lengths, context, dec_proj)
+        for b, s in enumerate(sessions):
+            s.context = context[b : b + 1]
+            s.dec_proj = dec_proj[b : b + 1]
+            s.hyp.extend(new_hyps[b])
+
+    def _advance_beam(self, group, sessions, enc, lengths) -> None:
+        """One batched beam-search pass over the group's chunk.
+
+        The group's membership changes every tick (streams are grouped by chunk
+        length), so the per-stream ``(1, k, ...)`` states are stacked here and
+        split back afterwards — the same regrouping the greedy path does for its
+        label window, just over four tensors instead of two.
+
+        ``hyp`` is **replaced**, not extended: the beam's best entry can change
+        as later frames arrive, and appending would splice a revised hypothesis
+        onto the stale prefix.  ``_Session.text`` detects that and re-decodes.
+        """
+        state = stack_states(
+            [
+                (
+                    s.beam
+                    if s.beam is not None
+                    else init_beam_state(self._model.decoder, 1, self._beam, enc.device)
+                )
+                for s in sessions
+            ]
+        )
+        state = beam_search_chunk(self._model, enc, lengths, state)
+        rows, scores = state.hypotheses()
+        for b, s in enumerate(sessions):
+            s.beam = select_rows(state, torch.tensor([b], device=enc.device))
+            s.nbest = (rows[b], scores[b])
+            s.hyp = list(rows[b][0])
 
     def decode_streaming_chunk(self, request: Request, enc_out: torch.Tensor) -> RequestOutput:
         outs = self.decode_streaming_batch([request], {request.request_id: enc_out})
@@ -290,7 +424,7 @@ class TransducerDecodeStrategy(DecodeStrategy):
         hyp = list(s.hyp) if s is not None else []
         return RequestOutput(
             request_id=request.request_id,
-            text=self._detok.detokenize(hyp),
+            text=s.text(self._detok) if s is not None else "",
             tokens=[hyp],
             finished=False,
         )
@@ -303,9 +437,19 @@ class TransducerDecodeStrategy(DecodeStrategy):
         """
         s: Optional[_Session] = self._sessions.get(request.request_id)
         hyp = list(s.hyp) if s is not None else []
+        # Beam search carries real alternatives; greedy has exactly one row.
+        if s is not None and s.nbest is not None:
+            rows, scores = s.nbest
+            return RequestOutput(
+                request_id=request.request_id,
+                text=s.text(self._detok),
+                tokens=[list(r) for r in rows],
+                scores=list(scores),
+                finished=True,
+            )
         return RequestOutput(
             request_id=request.request_id,
-            text=self._detok.detokenize(hyp),
+            text=s.text(self._detok) if s is not None else "",
             tokens=[hyp],
             finished=True,
         )

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -68,14 +68,21 @@ class EngineConfig:
         Which GPU CTC decoder to use:
         ``"ctc_cuda"`` — GPU beam search via ``GpuStreamingDecoder`` (default),
         ``"ctc_wfst"`` — k2 WFST beam search (GPU, requires a k2 build).
-    ctc_decoder_config : GpuDecoderConfig, optional
-        Config for ``decoder_type="ctc_cuda"``.  Defaults to
-        ``GpuDecoderConfig()``.
-    wfst_decoder_config : DecoderConfig, optional
-        Config for ``decoder_type="ctc_wfst"``.  Defaults to
-        ``DecoderConfig(search_type="wfst")``.
-    fst_path : str, optional
-        Path to the WFST FST file (only needed for ``"ctc_wfst"``).
+        This is a **registry selector** (it picks the strategy), not a family
+        option, so it stays here.
+    decode_options : dict
+        Per-family decode knobs, validated against the active strategy's
+        ``options_cls``.  Adding a decode family needs no new field here — see
+        ``oasr.engine.decode.options`` and ``docs/architecture.md``.
+    ctc_decoder_config, wfst_decoder_config, fst_path, rescoring_ctc_weight,
+    rescoring_reverse_weight, transducer_max_sym_per_frame, max_new_tokens,
+    llm_prompt
+        **Deprecated aliases.**  These are per-family options that now live on
+        the owning strategy (``strategy.options``).  They still work — the
+        public API and every ``oasr-server`` flag map onto them — and each
+        carries the same default as the option it aliases, but new knobs should
+        go in the family's ``options_cls`` and be set through
+        ``decode_options``.
     sentencepiece_model : str, optional
         Path to a SentencePiece ``.model`` file for detokenization.
         Auto-detected from ``ckpt_dir`` if not provided.
@@ -275,6 +282,13 @@ class EngineConfig:
     # the name against ``model.capabilities`` at construction.
     decode_method: Optional[str] = None
 
+    # Generic per-family decode knobs, validated by the active strategy's
+    # ``options_cls`` (see ``oasr.engine.decode.options``).  This is what lets a
+    # new decode family ship its own configuration **without** adding fields
+    # here — and what ``oasr-server --decode-option k=v`` writes into.  Unknown
+    # keys raise at engine construction, naming the valid ones.
+    decode_options: Dict[str, Any] = field(default_factory=dict)
+
     # CTC+AED attention rescoring (``decode_method="ctc_aed_rescoring"``).
     # ``rescoring_ctc_weight`` fuses the CTC n-best score into the decoder
     # score (WeNet's decode-time ``ctc_weight``; 0.5 is the WeNet U2++ recipe
@@ -302,6 +316,52 @@ class EngineConfig:
     # frame-synchronous strategies (CTC / transducer / rescoring).
     decode_steps_per_tick: int = 32
     max_decode_slots: Optional[int] = None
+    # Ceiling on total **decoder-KV** bytes across in-flight AR requests, in
+    # GiB.  ``max_decode_slots`` bounds admission by request *count*, which does
+    # not bound memory: a row's KV footprint is its position budget (prompt +
+    # generation cap) times the model's per-token rate, and prefill preallocates
+    # all of it.  Sizing formula, mirroring the one used for the WFST arenas:
+    #
+    #     bytes/row = 2 * layers * kv_heads * head_dim * itemsize
+    #                   * (prompt_positions + max_new_tokens)
+    #
+    # Both factors are knowable before the encode for these families because
+    # they run a fixed-window frontend.  ``None`` (default) leaves the byte
+    # budget off and keeps the slot cap as the only limit.
+    decode_kv_budget_gib: Optional[float] = None
+
+    # Long-form decoding for fixed-window frontends (``whisper_logmel``).  With
+    # a fixed window, audio longer than it is *rejected* at admission (C5) —
+    # honest, but it refuses work the model can do.  Setting this fans a long
+    # request out into consecutive windows, decodes them through the normal
+    # batched path, and stitches one output.
+    #
+    # A request-lifecycle knob, not a per-family option: one request becoming N
+    # encoder passes and one output is the engine's business, the same way
+    # ``max_decode_slots`` is.
+    #
+    # The windows are decoded **in parallel**, so a long file costs about one
+    # window of wall clock rather than N sequential decodes.  The price is
+    # boundary accuracy — see ``oasr/engine/longform.py`` for the trade-off
+    # against OpenAI's sequential, previous-text-conditioned loop.
+    # Streaming: recycle the oldest KV block at capacity instead of terminating
+    # the stream (M1(3)).  With unlimited history a stream grows one block per
+    # encoder chunk until it hits the ceiling the block table and pool impose,
+    # and today it is finalised there with ``finish_reason="length"`` — correct
+    # but a hard limit on stream duration.  Recycling makes memory bounded by
+    # construction and lets a stream run indefinitely.
+    #
+    # Measured on the WeNet conformer: identical transcripts (0.00% WER) for
+    # audio inside the retained window, and past it the recycling run decodes
+    # the whole file where unlimited truncates.  Off by default because it does
+    # change the model's attention span for very long streams; the eviction path
+    # itself now costs ~3-5% (was 11-15% before batching).
+    recycle_streaming_history: bool = False
+
+    long_form: bool = False
+    # Audio shared between adjacent long-form windows.  Overlapping lets the
+    # stitcher drop duplicated words at a cut instead of losing one; 0 disables.
+    long_form_overlap_seconds: float = 1.0
     # Wall-clock cap on one engine tick's decode phase, in milliseconds.  The
     # step cap above bounds *work*, not *time*, and one decoder step spans two
     # orders of magnitude across models (measured: ~1.5 ms for whisper-tiny at
@@ -411,6 +471,15 @@ class EngineConfig:
             raise ValueError(
                 f"decode_steps_per_tick must be >= 1, got {self.decode_steps_per_tick!r}"
             )
+        if self.long_form_overlap_seconds < 0:
+            raise ValueError(
+                "long_form_overlap_seconds must be >= 0, got " f"{self.long_form_overlap_seconds!r}"
+            )
+        if self.decode_kv_budget_gib is not None and self.decode_kv_budget_gib <= 0:
+            raise ValueError(
+                "decode_kv_budget_gib must be > 0 or None (disabled), got "
+                f"{self.decode_kv_budget_gib!r}"
+            )
         if self.max_decode_slots is not None and self.max_decode_slots < 1:
             raise ValueError(
                 f"max_decode_slots must be a positive int or None, got "
@@ -446,10 +515,12 @@ class EngineConfig:
         )
         if self.feature_config is None:
             self.feature_config = FeatureConfig(dither=0.0)
-        if self.ctc_decoder_config is None:
-            self.ctc_decoder_config = GpuDecoderConfig()
-        if self.wfst_decoder_config is None:
-            self.wfst_decoder_config = DecoderConfig(search_type="wfst")
+        # ``ctc_decoder_config`` / ``wfst_decoder_config`` are deliberately left
+        # ``None`` here.  They are **CTC-family** options and are built by the
+        # CTC strategies' ``options_cls`` factories, so an engine running
+        # Whisper / speech-LLM / Paraformer no longer constructs a beam config
+        # and a WFST config it will never read (the leak §3.2 of the design doc
+        # flagged).  Read them through ``strategy.options.decoder_config``.
         # Normalise preferred_batch_size: dedupe, sort, validate each <= cap.
         if self.preferred_batch_size is not None:
             cleaned = sorted({int(v) for v in self.preferred_batch_size})
@@ -551,6 +622,7 @@ class EngineConfig:
             kernel_size=cache_spec.conv_kernel_size,
             chunk_size=self.chunk_size,
             num_left_chunks=self.num_left_chunks,
+            recycle_streaming_history=self.recycle_streaming_history,
             block_size_frames=self.block_size_frames,
             max_num_blocks=self.max_num_blocks,
             max_blocks_per_seq=self.max_blocks_per_seq,

@@ -458,3 +458,57 @@ class TestEngineE2E:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestPositionEncodingCache:
+    """N1: the PE is a pure function — build it once, in fp32.
+
+    It was rebuilt on every encoder forward (arange, exp, outer product, two
+    trig passes, a cat) *in the compute dtype*, which under fp16 makes the
+    integer position ladder exact only to 2048 — past that consecutive
+    positions collide and every derived value is wrong.  FunASR computes in
+    fp32, so this is a parity requirement too.
+    """
+
+    def _pe(self, length, depth=512, dtype=torch.float32):
+        from oasr.models.paraformer.modules import sinusoidal_position_encoding
+
+        return sinusoidal_position_encoding(length, depth, torch.device("cpu"), dtype)
+
+    def test_shape_and_dtype(self):
+        out = self._pe(37, depth=64, dtype=torch.float16)
+        assert out.shape == (1, 37, 64)
+        assert out.dtype == torch.float16
+
+    def test_repeated_calls_agree(self):
+        a = self._pe(64, depth=64)
+        b = self._pe(64, depth=64)
+        assert torch.equal(a, b)
+
+    def test_a_longer_request_extends_the_table_consistently(self):
+        """A cached prefix must not change when the table grows."""
+        short = self._pe(16, depth=64).clone()
+        long = self._pe(4000, depth=64)
+        torch.testing.assert_close(long[:, :16], short)
+
+    def test_fp16_positions_stay_exact_past_2048(self):
+        """The reason for building in fp32.
+
+        In fp16 ``arange(1, L+1)`` stops being exact at 2048, so positions 2049
+        and 2050 both round to 2050 and produce *identical* encodings.  Built in
+        fp32 and cast afterwards, they stay distinct.
+        """
+        pe = self._pe(3000, depth=64, dtype=torch.float16)
+        assert not torch.equal(pe[0, 2048], pe[0, 2049]), "positions collapsed in fp16"
+
+    def test_matches_a_direct_fp32_reference(self):
+        import math
+
+        depth, length = 64, 40
+        positions = torch.arange(1, length + 1, dtype=torch.float32)
+        inv = torch.exp(
+            torch.arange(depth // 2, dtype=torch.float32) * -(math.log(10000.0) / (depth / 2 - 1))
+        )
+        st = positions.unsqueeze(1) * inv.unsqueeze(0)
+        want = torch.cat([torch.sin(st), torch.cos(st)], dim=1).unsqueeze(0)
+        torch.testing.assert_close(self._pe(length, depth=depth), want)

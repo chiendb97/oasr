@@ -26,6 +26,31 @@ from oasr.engine.generation import StepBudget
 from oasr.engine.request import Request, RequestOutput, RequestState
 
 
+def _fake_detok(render=lambda ids: " ".join(map(str, ids))):
+    """A stand-in Detokenizer covering the *whole* contract, not just decode.
+
+    ``IncrementalArStrategy`` decodes partials incrementally (T3), so a fake
+    carrying only ``detokenize`` no longer satisfies the surface it is
+    substituted for.  Implementing both here — over the same ``render`` — keeps
+    the fake honest instead of narrowing the production path to whatever the
+    fake happens to provide.
+    """
+
+    def incremental(new_ids, state):
+        ids = state.setdefault("ids", [])
+        ids.extend(int(i) for i in new_ids)
+        full = render(ids)
+        prev = state.get("text", "")
+        state["text"] = full
+        return full[len(prev) :] if full.startswith(prev) else full
+
+    return SimpleNamespace(
+        detokenize=render,
+        new_state=lambda: {"ids": [], "text": ""},
+        detokenize_incremental=incremental,
+    )
+
+
 class FakeIncrementalStrategy(DecodeStrategy):
     """Emits one token per advance step; request ``r`` finishes after
     ``target_lens[r]`` tokens.  Counts batched steps for budget assertions."""
@@ -203,7 +228,7 @@ def _make_one_shot_executor(**kwargs):
     """Executor driving a frame-synchronous strategy (no pending pool)."""
     strat = OneShotStrategy(
         SimpleNamespace(max_new_tokens=8),
-        SimpleNamespace(detokenize=lambda ids: ""),
+        _fake_detok(lambda ids: ""),
         _stub_ctc_model(),
     )
     ex = OfflineExecutor(
@@ -503,7 +528,7 @@ def _ar_strategy(*, partials: bool, eos_token: int = -1, max_new_tokens: int = 4
 
     decoder = _FakeArDecoder()
     model = SimpleNamespace(decoder=decoder)
-    detok = SimpleNamespace(detokenize=lambda ids: " ".join(map(str, ids)))
+    detok = _fake_detok()
     cfg = SimpleNamespace(max_new_tokens=max_new_tokens)
     return _Strategy(cfg, detok, model), decoder
 
@@ -714,3 +739,69 @@ class TestPrefillRejection:
         # Nothing parked, so the next tick is clean rather than re-raising.
         assert ex.num_running() == 0 and not ex.has_pending()
         assert ex.step() == []
+
+
+class TestDecodeKvByteBudget:
+    """C3: admission must bound decoder-KV **bytes**, not just request count.
+
+    A row's footprint is ``(prompt + max_new_tokens) * per-token rate`` and
+    prefill preallocates all of it, so N slots of 30 s utterances cost far more
+    than N slots of 2 s ones.  The slot cap alone therefore does not bound
+    memory — which is an OOM path, not a slowdown.
+    """
+
+    def _executor(self, budget_gib, per_row_bytes, pending=0):
+        from oasr.engine.executor.offline import OfflineExecutor
+
+        strategy = SimpleNamespace(
+            incremental=True,
+            kv_bytes_per_row=lambda: per_row_bytes,
+            has_pending=lambda: False,
+        )
+        ex = OfflineExecutor.__new__(OfflineExecutor)
+        ex._op = SimpleNamespace(strategy=strategy)
+        ex._max_decode_slots = None
+        ex._decode_kv_budget_gib = budget_gib
+        ex._pending = {f"r{i}": None for i in range(pending)}
+        return ex
+
+    def test_budget_caps_rows(self):
+        gib = 1024**3
+        ex = self._executor(budget_gib=1.0, per_row_bytes=gib // 4)
+        assert ex._admission_limit() == 4
+
+    def test_in_flight_rows_are_charged(self):
+        gib = 1024**3
+        ex = self._executor(budget_gib=1.0, per_row_bytes=gib // 4, pending=3)
+        assert ex._admission_limit() == 1
+
+    def test_a_full_budget_admits_nothing(self):
+        gib = 1024**3
+        ex = self._executor(budget_gib=1.0, per_row_bytes=gib // 2, pending=2)
+        assert ex._admission_limit() == 0
+
+    def test_disabled_budget_is_unlimited(self):
+        ex = self._executor(budget_gib=None, per_row_bytes=1024)
+        assert ex._admission_limit() is None
+
+    def test_unmeasurable_model_is_not_throttled(self):
+        """A model that declares no per-row footprint keeps slot-only behaviour.
+
+        Guessing a footprint would silently reduce throughput on every model
+        that has not declared ``decoder_cache_spec``.
+        """
+        ex = self._executor(budget_gib=1.0, per_row_bytes=None)
+        assert ex._admission_limit() is None
+
+    def test_the_tighter_of_slots_and_bytes_wins(self):
+        gib = 1024**3
+        ex = self._executor(budget_gib=1.0, per_row_bytes=gib // 8)
+        ex._max_decode_slots = 3
+        assert ex._admission_limit() == 3, "slot cap should bind here"
+        ex._max_decode_slots = 32
+        assert ex._admission_limit() == 8, "byte budget should bind here"
+
+    def test_one_shot_families_are_unaffected(self):
+        ex = self._executor(budget_gib=1.0, per_row_bytes=1024)
+        ex._op.strategy.incremental = False
+        assert ex._admission_limit() is None

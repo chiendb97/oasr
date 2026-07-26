@@ -69,6 +69,52 @@ pub struct Cli {
     /// override it.
     #[arg(long)]
     pub max_new_tokens: Option<u32>,
+    /// Ceiling on total decoder-KV bytes across in-flight AR requests, in GiB.
+    ///
+    /// `--max-decode-slots` bounds admission by request *count*, which does not
+    /// bound memory: a row's KV footprint is its position budget (prompt +
+    /// generation cap) times the model's per-token rate, and prefill
+    /// preallocates all of it.  Unset leaves the byte budget off.
+    #[arg(long)]
+    pub decode_kv_budget_gib: Option<f64>,
+    /// Streaming: recycle the oldest KV block when a stream reaches its cache
+    /// ceiling, instead of finalising it with `finish_reason="length"`.
+    ///
+    /// Makes streaming memory bounded by construction and lets a stream run
+    /// indefinitely.  Measured identical (0.00% WER) for audio inside the
+    /// retained window; past it the recycling run decodes the whole file where
+    /// unlimited history truncates.  Off by default because it does change the
+    /// attention span for very long streams.
+    #[arg(long, default_value_t = false)]
+    pub recycle_streaming_history: bool,
+    /// Decode audio longer than a fixed-window frontend's window (Whisper /
+    /// Qwen2-Audio's 30 s) by splitting it into windows and stitching the
+    /// transcripts, instead of rejecting it.
+    ///
+    /// Windows decode in parallel, so a long file costs about one window of
+    /// wall clock rather than N sequential decodes; the price is boundary
+    /// accuracy, which `--long-form-overlap-seconds` mitigates.
+    #[arg(long, default_value_t = false)]
+    pub long_form: bool,
+    /// Audio shared between adjacent long-form windows, in seconds.  Overlapping
+    /// lets the stitcher drop words duplicated at a cut instead of losing one.
+    /// Engine default 1.0; 0 disables.
+    #[arg(long)]
+    pub long_form_overlap_seconds: Option<f64>,
+    /// Generic per-family decode knob, repeatable: `--decode-option k=v`.
+    ///
+    /// Forwarded verbatim to `EngineConfig.decode_options` and validated
+    /// against the **active** decode family's option set at engine
+    /// construction, so an unknown or misspelled key is a startup error naming
+    /// the valid ones rather than a silently ignored flag.  This is what lets a
+    /// newly registered decode family expose its configuration without a new
+    /// flag here — and it reaches the three knobs that never got one
+    /// (`rescoring_ctc_weight`, `rescoring_reverse_weight`,
+    /// `transducer_max_sym_per_frame`) as `ctc_weight`, `reverse_weight` and
+    /// `max_sym_per_frame`.  Values are typed from the option's declared
+    /// default, so `--decode-option ctc_weight=0.3` arrives as a float.
+    #[arg(long = "decode-option", value_name = "KEY=VALUE")]
+    pub decode_option: Vec<String>,
     /// Incremental (AED / LLM) decode: max batched decoder steps one engine
     /// tick runs across all pending requests — the bounded-work-per-tick
     /// contract that keeps AR decode from starving the dispatcher.  Engine
@@ -275,6 +321,39 @@ impl Cli {
         if let Some(v) = self.max_new_tokens {
             obj.entry("max_new_tokens")
                 .or_insert(Value::Number(v.into()));
+        }
+        if self.recycle_streaming_history {
+            obj.entry("recycle_streaming_history")
+                .or_insert(Value::Bool(true));
+        }
+        if self.long_form {
+            obj.entry("long_form").or_insert(Value::Bool(true));
+        }
+        if let Some(v) = self.long_form_overlap_seconds {
+            if let Some(num) = serde_json::Number::from_f64(v) {
+                obj.entry("long_form_overlap_seconds")
+                    .or_insert(Value::Number(num));
+            }
+        }
+        if let Some(v) = self.decode_kv_budget_gib {
+            if let Some(num) = serde_json::Number::from_f64(v) {
+                obj.entry("decode_kv_budget_gib")
+                    .or_insert(Value::Number(num));
+            }
+        }
+        if !self.decode_option.is_empty() {
+            // Pass the raw `k=v` strings through; the engine types each value
+            // from the active family's declared default and rejects unknown
+            // keys.  Doing the typing here would mean this crate tracking every
+            // family's option table — exactly the drift S9 is about.
+            let mut opts = serde_json::Map::new();
+            for pair in &self.decode_option {
+                let (k, v) = pair.split_once('=').ok_or_else(|| {
+                    anyhow::anyhow!("--decode-option expects KEY=VALUE, got {pair:?}")
+                })?;
+                opts.insert(k.trim().to_string(), Value::String(v.to_string()));
+            }
+            obj.entry("decode_options").or_insert(Value::Object(opts));
         }
         if let Some(v) = self.decode_steps_per_tick {
             obj.entry("decode_steps_per_tick")

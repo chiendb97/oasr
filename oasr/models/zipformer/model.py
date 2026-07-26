@@ -293,5 +293,4 @@ class ZipformerModel(BaseAsrModel):
             logger.warning("Missing keys when loading Zipformer weights: %s", missing)
         if unexpected:
             logger.warning("Unexpected keys when loading Zipformer weights: %s", unexpected)
-        mapped = [k for k in remapped if k not in unexpected]
-        return LoadReport(mapped=mapped, dropped=dropped, missing=list(missing))
+        return LoadReport.build(remapped, missing, unexpected, dropped)
