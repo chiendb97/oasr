@@ -11,15 +11,10 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from oasr.features import FeatureConfig
+from oasr.features import FeatureConfig, build_extractor
 from oasr.features.backends import _extract as _extract_single
-from oasr.features.batched import (
-    batched_fbank,
-    batched_mfcc,
-    supports_batched_fbank,
-    supports_batched_mfcc,
-)
-
+from oasr.features.batched import supports_batched_fbank, supports_batched_mfcc
+from oasr.features.lfr import apply_lfr_batch, lfr_output_length
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from .config import EngineConfig
@@ -61,6 +56,11 @@ class InputProcessor:
         self._config = config
         self._device = device
         self._feature_config: FeatureConfig = config.feature_config  # type: ignore[assignment]
+        # Resolve the frontend once, through the feature registry, so the batch
+        # path stays architecture-agnostic (F1).  Raises here — at engine
+        # construction — for an unregistered ``feature_type`` rather than on the
+        # first request.
+        self._extractor = build_extractor(self._feature_config)
 
         # Offline collate staging buffers, reused across micro-batches so the
         # slow allocations (``cudaHostAlloc`` for pinned host, device malloc)
@@ -75,6 +75,14 @@ class InputProcessor:
         #                     run here on the GPU (see :meth:`collate`).
         self._wav_flat: Optional[torch.Tensor] = None
         self._wav_padded: Optional[torch.Tensor] = None
+        # Streaming staging (M5) — grow-once, so a step does not page-lock.
+        self._stream_flat: Optional[torch.Tensor] = None
+        self._stream_lens: Optional[torch.Tensor] = None
+        # Ceiling on a *retained* staging buffer, in float32 elements (M4).
+        # Default 256 Mi elements = 1 GiB, comfortably above
+        # ``max_batch_size`` x a full-length utterance at 16 kHz; a batch past
+        # it allocates per call rather than pinning that much for good.
+        self._max_staging_elems = int(getattr(config, "max_staging_elems", None) or (256 << 20))
 
         # Shared CUDA Graph memory-pool handle injected by ``ASREngine`` so the
         # feature-extraction graph cache (added in Step 2 of the plan) shares
@@ -130,10 +138,50 @@ class InputProcessor:
         if cfg.snip_edges:
             if num_samples < frame_length:
                 return 0
-            return (num_samples - frame_length) // frame_shift + 1
-        if num_samples <= 0:
+            est = (num_samples - frame_length) // frame_shift + 1
+        elif num_samples <= 0:
             return 0
-        return (num_samples + frame_shift // 2) // frame_shift
+        else:
+            est = (num_samples + frame_shift // 2) // frame_shift
+        if cfg.lfr_enabled:
+            est = lfr_output_length(est, cfg.lfr_n)
+        return est
+
+    def check_audio_duration(self, audio) -> None:
+        """Public duration guard, callable before the waveform is canonicalised.
+
+        The engine calls this on the *admitting* thread so an over-long request
+        raises back to the caller even when ``overlap_admit`` defers
+        :meth:`prepare_offline` to the prep thread (where a raise would only be
+        logged, leaving the client waiting for an output that never comes).
+        No-op for frontends without a fixed window.
+        """
+        if audio is None or self._feature_config.fixed_window_seconds is None:
+            return
+        self._check_input_duration(int(torch.as_tensor(audio).numel()))
+
+    def _check_input_duration(self, num_samples: int) -> None:
+        """Reject audio longer than a fixed-window frontend can represent.
+
+        Frontends with a :attr:`~oasr.features.FeatureConfig.fixed_window_seconds`
+        (``whisper_logmel``: the 30 s Whisper window, shared by Qwen2-Audio) pad
+        *and trim* every utterance to that window, so longer audio would be
+        silently dropped and the caller would receive a plausible transcript of
+        the first N seconds only.  Fail loudly at admission instead — long-form
+        decoding needs windowed inference, which is a separate feature.
+        """
+        window_s = self._feature_config.fixed_window_seconds
+        if window_s is None:
+            return
+        limit = int(self._feature_config.sample_rate * window_s)
+        if num_samples > limit:
+            got_s = num_samples / float(self._feature_config.sample_rate)
+            raise ValueError(
+                f"audio is {got_s:.1f}s but this checkpoint's frontend "
+                f"({self._feature_config.feature_type}) is fixed to a "
+                f"{window_s:.0f}s window; longer audio would be silently "
+                "truncated. Segment the audio before submitting it."
+            )
 
     def prepare_offline(self, request: Request) -> None:
         """Register an offline request without running feature extraction.
@@ -143,10 +191,14 @@ class InputProcessor:
         so the scheduler can bucket by length without a D2H sync.  No audio
         scaling happens here — the int16-scale multiply runs on the GPU after
         padding in :meth:`collate`, which also runs the batched fbank/mfcc.
+
+        Raises ``ValueError`` when the audio exceeds a fixed-window frontend's
+        capacity (see :meth:`_check_input_duration`).
         """
-        request.audio = torch.as_tensor(
-            request.audio, dtype=torch.float32, device="cpu"
-        ).reshape(-1)
+        request.audio = torch.as_tensor(request.audio, dtype=torch.float32, device="cpu").reshape(
+            -1
+        )
+        self._check_input_duration(int(request.audio.numel()))
         request.num_frames = self._estimate_num_frames(int(request.audio.numel()))
         # Clear any stale feature cache from reused Request objects.
         request.features = None
@@ -160,13 +212,39 @@ class InputProcessor:
         is fully transferred (and the batch D→H-synced at decode) before the
         next collate overwrites it — :class:`OfflineExecutor` runs micro-batches
         back-to-back on the default stream with no producer-thread overlap.
+
+        Beyond :attr:`_max_staging_elems` the buffer is **not** retained: pinned
+        memory is a process-global scarce resource and geometric growth sized by
+        the longest utterance ever seen never shrinks, so one outlier request
+        would hold its peak for the process lifetime.  Past the cap we allocate
+        per call and let it go.
         """
+        # Pinning is a CUDA operation and *fails* without a usable device, so
+        # it follows the engine's device rather than being unconditional — a
+        # CPU engine gains nothing from page-locked host memory anyway.
+        pin = self._device.type == "cuda"
+        if n > self._max_staging_elems:
+            return torch.empty(n, dtype=torch.float32, pin_memory=pin)
         cur = 0 if self._wav_flat is None else self._wav_flat.numel()
         if cur < n:
             self._wav_flat = torch.empty(
-                max(n, cur * 2), dtype=torch.float32, pin_memory=True
+                min(max(n, cur * 2), self._max_staging_elems),
+                dtype=torch.float32,
+                pin_memory=pin,
             )
         return self._wav_flat[:n]
+
+    def release_staging(self) -> None:
+        """Drop the reusable staging buffers (called on engine teardown / idle).
+
+        Without this the pinned host buffer and its device twin survive as long
+        as the ``InputProcessor`` does, which for a long-lived server is the
+        process.
+        """
+        self._wav_flat = None
+        self._wav_padded = None
+        self._stream_flat = None
+        self._stream_lens = None
 
     def _padded_device(self, batch: int, t_max: int) -> torch.Tensor:
         """Reused **device** buffer viewed as ``(batch, t_max)`` (geometric
@@ -174,12 +252,45 @@ class InputProcessor:
         zeroes it, scatters the packed waveforms in, then scales — all on the
         GPU.  Reuse is safe for the same reason as :meth:`_flat_host`."""
         need = batch * t_max
+        if need > self._max_staging_elems:
+            return torch.empty(need, dtype=torch.float32, device=self._device).view(batch, t_max)
         cur = 0 if self._wav_padded is None else self._wav_padded.numel()
         if cur < need:
             self._wav_padded = torch.empty(
-                max(need, cur * 2), dtype=torch.float32, device=self._device
+                min(max(need, cur * 2), self._max_staging_elems),
+                dtype=torch.float32,
+                device=self._device,
             )
         return self._wav_padded[:need].view(batch, t_max)
+
+    def _stream_host(self, batch: int, t_max: int) -> torch.Tensor:
+        """Reused pinned ``(batch, t_max)`` host buffer for streaming staging.
+
+        Same grow-once discipline as :meth:`_flat_host`, and safe for the same
+        reason plus one more: the streaming H2D is issued on the feature stream
+        and the caller inserts an event-wait before the next step reads the
+        result, so the copy has completed before this buffer is rewritten.
+        """
+        need = batch * t_max
+        cur = 0 if self._stream_flat is None else self._stream_flat.numel()
+        if cur < need:
+            self._stream_flat = torch.empty(
+                max(need, cur * 2),
+                dtype=torch.float32,
+                pin_memory=(self._device.type == "cuda"),
+            )
+        return self._stream_flat[:need].view(batch, t_max)
+
+    def _stream_lengths_host(self, batch: int) -> torch.Tensor:
+        """Reused pinned ``(batch,)`` int64 host buffer for streaming lengths."""
+        cur = 0 if self._stream_lens is None else self._stream_lens.numel()
+        if cur < batch:
+            self._stream_lens = torch.empty(
+                max(batch, cur * 2),
+                dtype=torch.int64,
+                pin_memory=(self._device.type == "cuda"),
+            )
+        return self._stream_lens[:batch]
 
     def collate(
         self,
@@ -258,34 +369,34 @@ class InputProcessor:
     def _fbank_batch(
         self, wav_device: torch.Tensor, wav_lengths: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run fbank/mfcc over a padded ``(B, T_max)`` waveform batch.
+        """Run the checkpoint's frontend over a padded ``(B, T_max)`` waveform batch.
 
-        Uses the fused :func:`batched_fbank` / :func:`batched_mfcc` kernels for
-        standard Kaldi-compliant configs (the common case — a handful of kernels
-        over the whole micro-batch, ~10× faster than a per-utterance Python
-        loop).  Falls back to per-utterance extraction for unusual configs
-        (non-Povey windows, dither, ``use_energy``) so output quality is
-        preserved when the fast path is unavailable.
+        Which frontend runs is resolved once at construction through the feature
+        registry (:func:`oasr.features.build_extractor`), so this stays
+        architecture-agnostic: a new frontend registers an
+        :class:`~oasr.features.ExtractorSpec` and needs no engine edit.  The Kaldi
+        extractor internally picks the fused kernel or a per-utterance fallback
+        depending on how exotic the config is.
+
+        LFR stacking is a post-transform over any extractor's output, applied here
+        rather than inside an extractor (offline only — ``prepare_streaming``
+        rejects LFR configs, which cannot be windowed across chunks).
         """
         fcfg = self._feature_config
-        if supports_batched_fbank(fcfg) or supports_batched_mfcc(fcfg):
-            lengths_device = wav_lengths.to(self._device, non_blocking=True)
-            batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
-            features_f32, feat_lengths = batched_fn(wav_device, lengths_device, fcfg)
-            return features_f32.to(dtype=self._config.dtype), feat_lengths
-
-        feat_list = [
-            _extract_single(wav_device[i, :n], fcfg)
-            for i, n in enumerate(wav_lengths.tolist())
-        ]
-        feat_lengths = torch.tensor(
-            [f.size(0) for f in feat_list], dtype=torch.int32, device=self._device
-        )
-        padded_feat = torch.nn.utils.rnn.pad_sequence(
-            feat_list, batch_first=True, padding_value=0.0
-        )
-        return padded_feat.to(dtype=self._config.dtype), feat_lengths
-
+        lengths_device = wav_lengths.to(self._device, non_blocking=True)
+        features_f32, feat_lengths = self._extractor(wav_device, lengths_device, fcfg)
+        if fcfg.lfr_enabled:
+            # ``features_f32`` is padded to the batch's widest row, so its own
+            # T bounds every per-row length — pass it so LFR need not sync to
+            # read the max off the device.
+            features_f32, feat_lengths = apply_lfr_batch(
+                features_f32,
+                feat_lengths,
+                fcfg.lfr_m,
+                fcfg.lfr_n,
+                max_length=int(features_f32.size(1)),
+            )
+        return features_f32.to(dtype=self._config.dtype), feat_lengths
 
     def prepare_streaming(self, request: Request) -> None:
         """Register an empty streaming request — chunks arrive via
@@ -295,6 +406,18 @@ class InputProcessor:
         runs and no waveform load happens here; the engine starts processing
         as soon as the first chunk lands.
         """
+        if not self._extractor.supports_streaming:
+            raise NotImplementedError(
+                f"the {self._extractor.kind!r} frontend cannot run incrementally "
+                "(it normalises over a fixed window, so it needs the whole "
+                "utterance); this checkpoint is offline-only. Use "
+                "service_mode='offline'."
+            )
+        if self._feature_config.lfr_enabled:
+            raise NotImplementedError(
+                "LFR feature stacking is offline-only; the streaming feature "
+                "path does not window LFR frames across chunks"
+            )
         request.audio_chunks = deque()
         request.audio_tail = torch.empty(0, dtype=torch.float32)
         request.audio_final = False
@@ -327,9 +450,7 @@ class InputProcessor:
                 "initialised via prepare_streaming"
             )
         if request.audio_final:
-            raise RuntimeError(
-                f"feed_chunk after is_last=True for request {request.request_id}"
-            )
+            raise RuntimeError(f"feed_chunk after is_last=True for request {request.request_id}")
 
         # Normalise to a 1-D float32 CPU waveform (shared with the offline path)
         # and apply the int16 ``audio_scale``.  Streaming keeps its scale on the
@@ -402,15 +523,11 @@ class InputProcessor:
             return
         frame_len = self._feature_config.frame_length_samples
 
-        fbank_inputs, fbank_reqs, fbank_flush = self._collect_streaming_inputs(
-            requests, frame_len
-        )
+        fbank_inputs, fbank_reqs, fbank_flush = self._collect_streaming_inputs(requests, frame_len)
         if not fbank_reqs:
             return
 
-        feats, feat_lens_cpu = self._run_streaming_features(
-            fbank_inputs, fbank_flush, cuda_stream
-        )
+        feats, feat_lens_cpu = self._run_streaming_features(fbank_inputs, fbank_flush, cuda_stream)
         self._distribute_streaming_features(
             fbank_reqs, fbank_inputs, fbank_flush, feats, feat_lens_cpu
         )
@@ -435,10 +552,8 @@ class InputProcessor:
                 continue
             if req.audio_chunks:
                 chunk = req.audio_chunks.popleft()
-                cat = chunk if req.audio_tail.numel() == 0 \
-                    else torch.cat([req.audio_tail, chunk])
-                flush = req.audio_final and not req.audio_chunks \
-                    and cat.numel() >= frame_len
+                cat = chunk if req.audio_tail.numel() == 0 else torch.cat([req.audio_tail, chunk])
+                flush = req.audio_final and not req.audio_chunks and cat.numel() >= frame_len
                 # On the very last chunk pad the tail so the final partial
                 # frame still gets emitted.
                 if req.audio_final and not req.audio_chunks and cat.numel() < frame_len:
@@ -487,8 +602,7 @@ class InputProcessor:
         sample_counts = [w.numel() for w in fbank_inputs]
         t_max = max(sample_counts)
         feat_lens_cpu: List[int] = [
-            ((n - frame_len) // frame_shift + 1) if n >= frame_len else 0
-            for n in sample_counts
+            ((n - frame_len) // frame_shift + 1) if n >= frame_len else 0 for n in sample_counts
         ]
         lengths_cpu = torch.tensor(sample_counts, dtype=torch.int64)
         # Zero only the *pad tail* of each row, not the whole buffer: the
@@ -497,15 +611,19 @@ class InputProcessor:
         # bytes it then clobbered.  In steady state every row is exactly T_max
         # long (all streams fed equal chunks) so no tail zeroing runs at all;
         # only ragged / flush steps touch ``zero_``.
-        padded_cpu = torch.empty(len(fbank_inputs), t_max, dtype=torch.float32)
+        # Reused pinned staging: ``pin_memory()`` is a ``cudaHostAlloc`` + copy,
+        # and this ran **twice per streaming step** on the default path (the
+        # stable-buffer variant existed only behind ``use_feature_cuda_graphs``,
+        # which is off by default).  Page-locking is a kernel-level operation
+        # that also serialises against the driver, so at streaming cadence it is
+        # a per-step tax for a buffer whose shape barely changes.
+        padded_cpu = self._stream_host(len(fbank_inputs), t_max)
         for i, w in enumerate(fbank_inputs):
             n = w.numel()
             padded_cpu[i, :n] = w
             if n < t_max:
                 padded_cpu[i, n:].zero_()
-        if device.type == "cuda":
-            padded_cpu = padded_cpu.pin_memory()
-            lengths_cpu = lengths_cpu.pin_memory()
+        lengths_cpu = self._stream_lengths_host(len(fbank_inputs)).copy_(lengths_cpu)
         nvtx_pop()
 
         use_batched = device.type == "cuda" and (
@@ -525,10 +643,7 @@ class InputProcessor:
         # A dedicated feature stream (when provided) overlaps the H2D + kernel
         # with the encoder forward on the default stream; the caller inserts the
         # event-wait before reading ``feature_buffer``.
-        stream_ctx = (
-            torch.cuda.stream(cuda_stream) if cuda_stream is not None else nullcontext()
-        )
-        batched_fn = batched_mfcc if fcfg.feature_type == "mfcc" else batched_fbank
+        stream_ctx = torch.cuda.stream(cuda_stream) if cuda_stream is not None else nullcontext()
 
         # Captured-graph fast path: steady state only (no flush) and within the
         # pre-built B bucket + ``t_pad``.  Any miss falls through to eager.
@@ -547,7 +662,7 @@ class InputProcessor:
             lengths_device = lengths_cpu.to(device=device, non_blocking=True)
             nvtx_pop()
             nvtx_push("feature")
-            feats_f32, _ = batched_fn(wav_device, lengths_device, fcfg)
+            feats_f32, _ = self._extractor(wav_device, lengths_device, fcfg)
             feats = feats_f32.to(dtype=dtype)
             nvtx_pop()
         return feats, feat_lens_cpu
@@ -596,9 +711,8 @@ class InputProcessor:
 
         # Compact the buffer if the consumed prefix is a large share of it
         # (cheap amortised, avoids unbounded growth on long streams).
-        if buf is not None and request.feature_cursor > 0 \
-                and request.feature_cursor >= have // 2:
-            keep = buf[request.feature_cursor: have].contiguous()
+        if buf is not None and request.feature_cursor > 0 and request.feature_cursor >= have // 2:
+            keep = buf[request.feature_cursor : have].contiguous()
             request.feature_buffer = keep
             buf = request.feature_buffer
             request.feature_frames = keep.size(0)
@@ -614,5 +728,5 @@ class InputProcessor:
             request.feature_buffer = new_buf
             buf = new_buf
 
-        buf[have: have + n_new] = new_frames
+        buf[have : have + n_new] = new_frames
         request.feature_frames = have + n_new

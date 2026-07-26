@@ -5,11 +5,19 @@
 A standalone PyTorch :class:`torch.cuda.CUDAGraph` is captured per
 ``(B_active, cache_t1_bucket)`` shape. Captures are lazy on first
 encounter; replays reuse pre-allocated input buffers (``xs``,
-``slot_ids``, ``offset``) and the captured output buffer ``log_probs``.
+``slot_ids``, ``offset``) and the captured output buffer.
 The CNN cache is read/written in place inside the captured forward via
 a :class:`~oasr.cache.SlotCnnCache` descriptor, so the persistent
 ``CnnCacheManager`` buffer is updated directly without a separate
 post-replay scatter.
+
+The captured callable is injected (``chunk_forward``), so the same machinery
+serves both streaming shapes: the fused ``forward_chunk_paged``
+(encoder + CTC head → ``(B, chunk, V)`` log-probs) that one-shot families
+consume, and the encoder-only ``encode_chunk_paged``
+(→ ``(B, chunk, D)`` hidden) that ``consumes="hidden"`` families such as the
+transducer consume.  Nothing here inspects the output beyond its identity as a
+tensor, so a new streaming decode family needs no change in this file.
 
 Steady-state streaming is launch-bound — the model's 12-layer conformer
 encoder issues ~200 small kernels per chunk, and at 32 streams ×
@@ -36,7 +44,7 @@ Capture constraints
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import tvm_ffi
@@ -45,14 +53,8 @@ from oasr.cache.attention_cache import AttentionCacheManager
 from oasr.cache.cnn_cache import CnnCacheManager
 from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.slot_cnn import SlotCnnCache
-from oasr.features import FeatureConfig
-from oasr.features.batched import (
-    batched_fbank,
-    batched_mfcc,
-    supports_batched_fbank,
-    supports_batched_mfcc,
-)
-
+from oasr.features import FeatureConfig, build_extractor
+from oasr.features.batched import supports_batched_fbank, supports_batched_mfcc
 
 # N_BLOCK tile size of the FMHA kernel; T_kv must be a multiple of this.
 _KERNEL_N_BLOCK = 64
@@ -76,29 +78,27 @@ class _CapturedShape:
     # each replay we refresh them with the current state via copy_().
     batched_block_table: torch.Tensor
     batched_cache_seqlens: torch.Tensor
-    log_probs_out: torch.Tensor
+    output_buf: torch.Tensor
 
 
 class GraphedEncoderForward:
-    """Lazy CUDA-Graph cache for the batched paged encoder forward.
+    """Lazy CUDA-Graph cache for the batched paged chunk forward.
 
     Parameters
     ----------
-    model : BaseAsrModel
-        The model whose ``forward_chunk_paged`` is captured.
+    chunk_forward : callable
+        The chunk forward to capture, invoked as
+        ``chunk_forward(xs, offset, att_caches, cnn_cache, cache_t1=...)``.
+        Pass ``model.forward_chunk_paged`` for the fused encoder+head path
+        (``(B, chunk, V)`` log-probs) or ``model.encode_chunk_paged`` for the
+        encoder-only path (``(B, chunk, D)`` hidden).  The capture is
+        output-shape agnostic; only the frame count ``size(1)`` is read back by
+        the caller.
     att_mgr, cnn_mgr : cache managers
         Provide the persistent batched paging / CNN-cache tensors that the
         graph reads from.
-    cache_dtype, device :
-        Dtype / device of the persistent state.
-    window : int
-        Input feature frames per chunk (``cfg.decoding_window``).
-    feat_dim : int
-        Input feature dimensionality.
-    cnn_cache_frames : int
-        CNN cache frames (== ``kernel_size - 1``).
-    num_layers, hidden_dim : int
-        Encoder dimensions used to allocate the persistent CNN buffer.
+    device : torch.device
+        Device of the persistent state (used to synchronise around capture).
     pool : tuple of int, optional
         Shared CUDA Graph memory-pool handle (from
         ``torch.cuda.graph_pool_handle()``) used by every engine-level
@@ -108,29 +108,17 @@ class GraphedEncoderForward:
 
     def __init__(
         self,
-        model,
+        chunk_forward: Callable[..., torch.Tensor],
         att_mgr: AttentionCacheManager,
         cnn_mgr: CnnCacheManager,
         *,
-        cache_dtype: torch.dtype,
         device: torch.device,
-        window: int,
-        feat_dim: int,
-        cnn_cache_frames: int,
-        num_layers: int,
-        hidden_dim: int,
         pool: Optional[Tuple[int, int]] = None,
     ) -> None:
-        self._model = model
+        self._chunk_forward = chunk_forward
         self._att_mgr = att_mgr
         self._cnn_mgr = cnn_mgr
-        self._cache_dtype = cache_dtype
         self._device = device
-        self._window = window
-        self._feat_dim = feat_dim
-        self._cnn_cache_frames = cnn_cache_frames
-        self._num_layers = num_layers
-        self._hidden_dim = hidden_dim
 
         # Captured graph cache, keyed by (B_active, cache_t1_bucket).
         # All captures share one CUDA Graph memory pool so that the
@@ -207,11 +195,13 @@ class GraphedEncoderForward:
 
         Returns
         -------
-        log_probs : Tensor or None
-            ``(B, chunk_size, vocab_size)`` log-softmax output. **Aliases
-            the captured buffer**; callers must consume it before the next
-            replay or clone. Returns ``None`` when the per-shape capture
-            cache is saturated (caller falls back to eager mode).
+        out : Tensor or None
+            Whatever ``chunk_forward`` produces — ``(B, chunk_size, vocab_size)``
+            log-probs for the fused path, ``(B, chunk_size, hidden_dim)`` for the
+            encoder-only path. **Aliases the captured buffer**; callers must
+            consume it before the next replay at the same shape key, or clone.
+            Returns ``None`` when the per-shape capture cache is saturated
+            (caller falls back to eager mode).
         """
         key = (B, T_input, cache_t1_bucket)
         state = self._captured.get(key)
@@ -221,7 +211,12 @@ class GraphedEncoderForward:
                 # will fall back to eager mode for this chunk.
                 return None
             state = self._capture(
-                B, T_input, cache_t1_bucket, xs, slot_ids, offsets,
+                B,
+                T_input,
+                cache_t1_bucket,
+                xs,
+                slot_ids,
+                offsets,
             )
             self._captured[key] = state
 
@@ -236,13 +231,13 @@ class GraphedEncoderForward:
         # before replay. The captured graph reads from these specific
         # buffer addresses; without the refresh the kernel would see
         # the pre-capture snapshot.
-        torch.index_select(self._att_mgr.block_table, 0, slot_ids,
-                           out=state.batched_block_table)
-        torch.index_select(self._att_mgr.cache_seqlens, 0, slot_ids,
-                           out=state.batched_cache_seqlens)
+        torch.index_select(self._att_mgr.block_table, 0, slot_ids, out=state.batched_block_table)
+        torch.index_select(
+            self._att_mgr.cache_seqlens, 0, slot_ids, out=state.batched_cache_seqlens
+        )
 
         state.graph.replay()
-        return state.log_probs_out
+        return state.output_buf
 
     # ------------------------------------------------------------------
     # Capture
@@ -303,8 +298,11 @@ class GraphedEncoderForward:
         cnn_cache = SlotCnnCache(buffer=self._cnn_mgr.buffer, slot_ids=slot_ids_buf)
 
         def _run() -> torch.Tensor:
-            return self._model.forward_chunk_paged(
-                xs_buf, offset_buf, caches, cnn_cache,
+            return self._chunk_forward(
+                xs_buf,
+                offset_buf,
+                caches,
+                cnn_cache,
                 cache_t1=cache_t1_bucket,
             )
 
@@ -334,7 +332,7 @@ class GraphedEncoderForward:
         # captured into ``graph`` (rather than escaping to the default
         # stream and tripping ``cudaErrorIllegalAddress`` on replay).
         with tvm_ffi.use_torch_stream(torch.cuda.graph(graph, pool=self._pool)):
-            log_probs_out = _run()
+            output_buf = _run()
 
         # Restore again so the first real replay (line below in caller)
         # reads the engine's pre-chunk CNN state.
@@ -347,7 +345,7 @@ class GraphedEncoderForward:
             offset_buf=offset_buf,
             batched_block_table=batched_bt,
             batched_cache_seqlens=batched_cs,
-            log_probs_out=log_probs_out,
+            output_buf=output_buf,
         )
 
 
@@ -364,14 +362,14 @@ class _CapturedFeatureShape:
     # Pinned host buffers: caller writes the current chunk into these before
     # ``graph.replay()``. Addresses are stable for the cache's lifetime
     # because the buffers are allocated once.
-    padded_host_buf: torch.Tensor   # (B_bucket, T_pad) float32, pinned
+    padded_host_buf: torch.Tensor  # (B_bucket, T_pad) float32, pinned
     lengths_host_buf: torch.Tensor  # (B_bucket,)       int64,   pinned
     # Device buffers — captured-graph destinations for the H2D copies.
-    wav_device_buf: torch.Tensor       # (B_bucket, T_pad) float32, cuda
-    lengths_device_buf: torch.Tensor   # (B_bucket,)       int64,   cuda
+    wav_device_buf: torch.Tensor  # (B_bucket, T_pad) float32, cuda
+    lengths_device_buf: torch.Tensor  # (B_bucket,)       int64,   cuda
     # Captured output. Aliases the graph pool's output allocation; callers
     # must consume (or copy) before the next replay.
-    feats_out: torch.Tensor         # (B_bucket, num_frames_max, feat_dim)
+    feats_out: torch.Tensor  # (B_bucket, num_frames_max, feat_dim)
 
 
 class GraphedFeatureExtraction:
@@ -428,7 +426,9 @@ class GraphedFeatureExtraction:
         self._device = device
         self._fcfg = feature_config
         self._output_dtype = output_dtype
-        self._is_mfcc = (feature_config.feature_type == "mfcc")
+        # Resolved through the feature registry so a new frontend needs no edit
+        # here; the captured graph only cares that it is one callable.
+        self._extractor = build_extractor(feature_config)
 
         frame_len = int(feature_config.frame_length_samples)
         frame_shift = int(feature_config.frame_shift_samples)
@@ -454,8 +454,7 @@ class GraphedFeatureExtraction:
             cleaned = sorted({int(x) for x in batch_buckets if int(x) >= 1})
             if not cleaned:
                 raise ValueError(
-                    "feature_graph_batch_buckets must contain at least one "
-                    "positive integer"
+                    "feature_graph_batch_buckets must contain at least one " "positive integer"
                 )
             self._buckets = cleaned
 
@@ -566,7 +565,7 @@ class GraphedFeatureExtraction:
         # tile shapes the captured replay will hit.
         lengths_host.fill_(T_pad)
 
-        batched_fn = batched_mfcc if self._is_mfcc else batched_fbank
+        batched_fn = self._extractor
         fcfg = self._fcfg
         out_dtype = self._output_dtype
 

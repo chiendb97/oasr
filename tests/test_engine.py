@@ -8,6 +8,7 @@ import glob
 import os
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,16 +21,12 @@ import torch
 
 def _require_ckpt(ckpt_dir: str) -> None:
     if not ckpt_dir or not Path(ckpt_dir).exists():
-        pytest.skip(
-            "WeNet checkpoint dir not set or not found; set CKPT_DIR env var or --ckpt-dir"
-        )
+        pytest.skip("WeNet checkpoint dir not set or not found; set CKPT_DIR env var or --ckpt-dir")
 
 
 def _require_wav_dir(wav_dir: str) -> None:
     if not wav_dir or not Path(wav_dir).is_dir():
-        pytest.skip(
-            "WAV directory not set or not found; use --wav-dir or WAV_DIR"
-        )
+        pytest.skip("WAV directory not set or not found; use --wav-dir or WAV_DIR")
     if not glob.glob(os.path.join(wav_dir, "*.wav")):
         pytest.skip("No .wav files found in WAV directory")
 
@@ -274,27 +271,54 @@ class TestScheduler:
 
 
 class TestOutputProcessorDetokenize:
-    def test_detokenize_sentencepiece(self, ckpt_dir: str):
+    """Detokenization off a real checkpoint's ``units.txt``.
+
+    ``OutputProcessor`` builds a decode strategy, and since the capability table
+    landed (H2) a strategy with **no model** is rejected — "no surface means
+    rejected", deliberately, because the old duck-typed checks disagreed with
+    each other about ``model=None``.  These tests only exercise the detokenizer,
+    so they supply the minimal CTC surface rather than asking the facade to
+    accept a model-less construction.  (They had been failing since H2 and went
+    unnoticed because every verification run had ``CKPT_DIR`` unset, which
+    skipped them.)
+    """
+
+    @staticmethod
+    def _ctc_model():
+        """Smallest object satisfying ``CAPABILITIES["ctc"]``.
+
+        The bodies raise: these tests must never reach a forward, and a stub that
+        silently returned something would hide it if they did.
+        """
+
+        def _unreachable(*_a, **_k):
+            raise AssertionError("detokenization must not run a forward")
+
+        return SimpleNamespace(head=_unreachable, forward_offline=_unreachable)
+
+    def _proc(self, ckpt_dir: str):
         from oasr.engine.config import EngineConfig
         from oasr.engine.output_processor import OutputProcessor
 
         _require_ckpt(ckpt_dir)
         cfg = EngineConfig(ckpt_dir=ckpt_dir)
-        proc = OutputProcessor(cfg)
+        # The engine stamps ``_model_config`` after loading the checkpoint; the
+        # CTC strategy needs its ``vocab_size`` to size the beam state and now
+        # *raises* rather than falling back to a magic 5002 (N7).  Read the real
+        # value off the checkpoint so the stub is not a fiction.
+        with open(Path(ckpt_dir) / "units.txt", encoding="utf-8") as f:
+            vocab = sum(1 for line in f if line.strip())
+        cfg._model_config = SimpleNamespace(vocab_size=vocab)
+        return OutputProcessor(cfg, model=self._ctc_model())
+
+    def test_detokenize_sentencepiece(self, ckpt_dir: str):
         # Blank and sos/eos tokens should be stripped
-        text = proc.detokenize([0, 2])
-        assert text == ""
+        assert self._proc(ckpt_dir).detokenize([0, 2]) == ""
 
     def test_detokenize_nonempty(self, ckpt_dir: str):
-        from oasr.engine.config import EngineConfig
-        from oasr.engine.output_processor import OutputProcessor
-
-        _require_ckpt(ckpt_dir)
-        cfg = EngineConfig(ckpt_dir=ckpt_dir)
-        proc = OutputProcessor(cfg)
         # Try a known token id > 2 (should produce something)
-        text = proc.detokenize([16])  # token 16 = '▁ABOUT'
-        assert isinstance(text, str)
+        text = self._proc(ckpt_dir).detokenize([16])  # token 16 = '▁ABOUT'
+        assert isinstance(text, str) and text
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +362,7 @@ class TestOfflineTranscribe:
         assert isinstance(texts, list)
         assert len(texts) == 4
         assert all(isinstance(t, str) and len(t) > 0 for t in texts)
+
 
 # ---------------------------------------------------------------------------
 # Integration tests — ASREngine (streaming)
@@ -389,7 +414,10 @@ class TestASREngine:
         assert any(r.request_id == rid for r in results)
 
     def test_streaming_matches_offline_single_stream(
-        self, device, ckpt_dir: str, wav_dir: str,
+        self,
+        device,
+        ckpt_dir: str,
+        wav_dir: str,
     ):
         """With ``max_batch_size=1`` streaming must reproduce offline exactly.
 
@@ -438,11 +466,15 @@ class TestASREngine:
         on = ASREngine(cfg)
         on_texts = on.transcribe(waves)
         for off_t, on_t in zip(off_texts, on_texts):
-            assert on_t == off_t, \
-                f"streaming(B=1) != offline\n  offline: {off_t!r}\n  stream : {on_t!r}"
+            assert (
+                on_t == off_t
+            ), f"streaming(B=1) != offline\n  offline: {off_t!r}\n  stream : {on_t!r}"
 
     def test_streaming_batched_matches_offline_wer(
-        self, device, ckpt_dir: str, wav_dir: str,
+        self,
+        device,
+        ckpt_dir: str,
+        wav_dir: str,
     ):
         """Batched streaming is numerically close to offline (fp16 ULP-level).
 
@@ -496,8 +528,7 @@ class TestASREngine:
         # diverge by <5% WER on a handful of utterances; the drift comes
         # from reordered fp16 reductions in the per-layer matmuls and
         # paged attention, *not* from wrong streaming logic.
-        assert avg_wer < 0.05, \
-            f"Batched streaming diverged too far from offline: WER={avg_wer:.3f}"
+        assert avg_wer < 0.05, f"Batched streaming diverged too far from offline: WER={avg_wer:.3f}"
 
     def test_engine_idle_after_run(self, device, ckpt_dir: str, wav_dir: str):
         _require_ckpt(ckpt_dir)

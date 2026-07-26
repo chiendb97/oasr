@@ -32,8 +32,10 @@ oasr-server \
 ```
 
 `oasr-server --help` lists every flag.  `--service-mode` pins the engine to
-either `offline` (sync `Recognize`) or `streaming` (bidi `StreamingRecognize`)
-for its entire lifecycle; the mismatched RPC returns `FAILED_PRECONDITION`.
+either `offline` or `streaming` for its entire lifecycle.  A `streaming` engine
+rejects the unary `Recognize` with `FAILED_PRECONDITION`; an `offline` engine
+serves **both** RPCs — see [Streaming text out of an offline
+engine](#streaming-text-out-of-an-offline-engine).
 
 > Building the workspace with `cargo build --release` instead produces the same
 > server as the `rust/target/release/oasr-server` binary; substitute that path
@@ -49,7 +51,7 @@ for its entire lifecycle; the mismatched RPC returns `FAILED_PRECONDITION`.
 | HTTP | `GET /readyz` | 200 once the engine dispatcher has produced its first Pong. |
 | HTTP | `GET /metrics` | Prometheus exposition. |
 | gRPC | `oasr.speech.v1.Speech/Recognize` | Synchronous unary (offline mode). |
-| gRPC | `oasr.speech.v1.Speech/StreamingRecognize` | Bidi streaming (streaming mode). |
+| gRPC | `oasr.speech.v1.Speech/StreamingRecognize` | Bidi streaming. In `streaming` mode audio is fed to the engine chunk by chunk; in `offline` mode audio is buffered until half-close and the **text** streams back (token streaming for AR families). |
 | gRPC | `grpc.health.v1.Health/Check` and `Watch` | Standard gRPC health checking. |
 
 REST is sync only — there is **no HTTP streaming endpoint** (no WebSocket, no
@@ -84,7 +86,12 @@ curl -sS -X POST \
 ```
 
 Query parameters: `encoding` (required), `sample_rate` (default 16000; ignored
-for `WAV`), `priority`, `max_alternatives`.
+for `WAV`), `priority`, `max_alternatives`, plus the per-request decoding
+options (autoregressive decode families only — AED / speech-LLM; CTC ignores
+them): `max_new_tokens`, `temperature` (0 = greedy), `top_k`, `top_p`,
+`prompt` (speech-LLM user-prompt override).  `max_alternatives > 1` makes the
+engine detokenize that many n-best hypotheses (beam decode families), so
+every returned alternative carries a real transcript.
 
 `encoding` accepted values:
 
@@ -106,15 +113,22 @@ Success response (`200`):
       "alternatives": [
         {
           "transcript": "hello world",
-          "confidence": 0.0,
+          "confidence": 0.93,
           "tokens": [12, 305, 119]
         }
-      ]
+      ],
+      "resultEndTimeS": 3.42
     }
   ],
   "requestId": "8f4c9b..."
 }
 ```
+
+`confidence` is the hypothesis's softmax-normalized posterior among the
+returned n-best scores (`0.0` when the decode family emits a single
+hypothesis — Google's "unset when unavailable" convention).
+`resultEndTimeS` (end time of the last decoded token, seconds) appears only
+for decode families with token alignments (Paraformer CIF).
 
 Error responses use the canonical Google error envelope:
 
@@ -124,13 +138,28 @@ Error responses use the canonical Google error envelope:
 
 | HTTP status | `status` field | When |
 |---|---|---|
-| 400 | `INVALID_ARGUMENT` | missing/empty body, missing `encoding`, undecodable audio bytes |
+| 400 | `INVALID_ARGUMENT` | missing/empty body, missing `encoding`, undecodable audio bytes, out-of-range decoding options, audio longer than a fixed-window frontend allows |
 | 400 | `FAILED_PRECONDITION` | server is in `streaming` mode |
 | 404 | `NOT_FOUND` | unknown request id (internal bug) |
 | 501 | `UNIMPLEMENTED` | unsupported encoding |
 | 503 | `RESOURCE_EXHAUSTED` | over-capacity, retry with backoff |
 | 503 | `UNAVAILABLE` | dispatcher shutting down or engine lost |
 | 500 | `INTERNAL` | otherwise |
+
+**Rejections are per-request.** Decoding options are range-checked at the mapping
+layer (`oasr_wire::DecodingParams::validated`, shared by HTTP and gRPC) and the
+engine's bulk admission (`ASREngine.add_requests_batch_checked`) validates and
+admits per spec. Since the dispatcher coalesces up to `--admit-threshold`
+envelopes into one Python call, this matters: one client sending `top_p=1.5` gets
+a 400 while every request coalesced with it is served normally. Bounds:
+`temperature` ∈ {0} ∪ [0.01, 100], `top_p` ∈ (0, 1], `max_alternatives` ≤ 30,
+`prompt` ≤ 4096 bytes.
+
+Two engine-side rejections also surface here as 400s rather than as wrong output:
+audio exceeding a fixed-window frontend's capacity (`whisper_logmel`: the 30 s
+Whisper window, shared by Qwen2-Audio — longer audio used to be silently
+truncated), and a per-request `streaming` flag that disagrees with the engine's
+mode.
 
 ### `GET /v1/models`
 
@@ -148,7 +177,10 @@ Error responses use the canonical Google error envelope:
         "chunk_size": 16,
         "max_batch_size": 64,
         "decoder_type": "ctc_cuda",
-        "vocab_size": 5000
+        "vocab_size": 5000,
+        "service_mode": "offline",
+        "decode_method": "ctc",
+        "capabilities": ["ctc", "ctc_aed_rescoring"]
       }
     }
   ]
@@ -157,11 +189,25 @@ Error responses use the canonical Google error envelope:
 
 Exactly one entry — the single model loaded by this process.
 
+`service_mode` / `decode_method` / `capabilities` are read back **from the
+engine**, not from the CLI flags: `--engine-config` JSON wins on the Python side
+and several decode families are offline-only (`aed`, `llm`, `paraformer`,
+`ctc_aed_rescoring`), so the engine is the authority on what this process can
+serve. The front-ends configure themselves from the engine's `service_mode` and
+log a warning when `--service-mode` disagrees. Note `decoder_type` is only the
+CTC *kernel* selector (`ctc_cuda` / `ctc_wfst`) — `decode_method` is the family.
+
 ## gRPC
 
 Service: `oasr.speech.v1.Speech` in `rust/proto/oasr_speech_v1.proto`.
-Messages mirror Google's v1 schema; `tokens` (CTC token IDs) and `requestId`
-are OASR extensions in the reserved field-number range.
+Messages mirror Google's v1 schema; `tokens` (CTC token IDs), `requestId`,
+and the `RecognitionConfig` decoding extensions (`max_new_tokens`,
+`temperature`, `top_k`, `top_p`, `prompt` — per-request `DecodingOptions`
+for the AR decode families) are OASR extensions in the reserved
+field-number range.  `max_alternatives` is honored (n-best transcripts on
+beam decode families), `confidence` carries the softmax-normalized n-best
+posterior, and `result_end_time` is set when the decode family produces
+token alignments (Paraformer CIF).
 
 ### `Recognize` (unary, offline mode)
 
@@ -174,7 +220,7 @@ grpcurl -plaintext -import-path rust/proto -proto oasr_speech_v1.proto \
         127.0.0.1:50051 oasr.speech.v1.Speech/Recognize
 ```
 
-### `StreamingRecognize` (bidi, streaming mode)
+### `StreamingRecognize` (bidi)
 
 The first inbound message **must** carry `streaming_config.config`;
 subsequent messages carry `audio_content` (raw PCM bytes in the declared
@@ -186,6 +232,38 @@ with `is_final=true` on the terminal frame.
 python scripts/grpc_stream.py --addr 127.0.0.1:50051 \
     --wav tests/fixtures/hello.wav --chunk-ms 640
 ```
+
+#### Streaming text out of an offline engine
+
+Four decode families are offline-only — `aed`, `llm`, `paraformer` and
+`ctc_aed_rescoring` — because they cannot start before the utterance is complete
+(and `whisper_logmel` normalizes over a fixed 30 s window).  That is a constraint
+on **audio in**, not on **text out**: the autoregressive families emit one partial
+per request per engine tick, which is the normal token-streaming UX for an LLM
+ASR client.
+
+So `StreamingRecognize` is served in `offline` mode too, with a different
+mechanism: the server buffers the inbound `audio_content` frames, submits the
+utterance as **one** offline request on client half-close, and then streams the
+generated text back as interim results.  The client-visible shape is identical —
+`is_final=false` partials followed by one `is_final=true` final.
+
+Two consequences to plan for:
+
+* **`--max-tick-ms` sets the inter-token cadence.**  It bounds how long the
+  dispatcher holds the GIL per tick, and one partial is emitted per tick, so it is
+  a *user-visible latency knob* here rather than only an internal bound.  Measured
+  on Qwen2-Audio-7B-Instruct, `--max-tick-ms 25`, one 10 s utterance: first token
+  at **184 ms**, 21 interim responses, inter-partial gap min 27.9 / median 39.7 /
+  max 45.9 ms, final at 998 ms.
+* **One-shot families are unaffected.**  A CTC / Paraformer / rescoring engine
+  produces a single final through the same path (`interim_results` simply yields
+  nothing extra) — verified against a WeNet Conformer: exactly one response.
+
+Half-close is the submit trigger; a client that never half-closes gets no result,
+exactly like a unary client that never finishes its request body.  A client that
+disconnects mid-generation cancels the request, so the AR row stops occupying a
+decode slot instead of running to its `max_new_tokens` cap.
 
 ### gRPC health checking
 
@@ -266,6 +344,55 @@ Beyond `--max-batch-size` / `--chunk-size` / `--preferred-batch-sizes` /
 and the (default-off, **keep off** — measured to regress) `--use-ctc-cuda-graphs`
 / `--use-feature-cuda-graphs`. `oasr-server --help` lists them all.
 
+Multi-paradigm serving: `--decode-method` selects among the checkpoint's
+advertised capabilities (e.g. `ctc_aed_rescoring` on a U2++ hybrid, `llm` on
+a Qwen2-Audio checkpoint; unset = model default, validated at startup).  The
+incremental AR families additionally take `--max-new-tokens`,
+`--decode-steps-per-tick` (step cap per engine tick), `--max-tick-ms`
+(wall-clock cap per tick — the actual dispatcher-starvation guard),
+`--decode-admit-window-ms` (coalesce near-simultaneous arrivals into one decode
+batch), `--max-decode-slots` (in-flight AR request cap), and `--llm-prompt`
+(deployment-wide speech-LLM user prompt; per-request `prompt` decoding options
+override it).  LLM decode emits token-streaming partials over the same
+`Event::Partial` wire streaming CTC uses.
+
+**`--decode-admit-window-ms` is the knob that buys AR throughput.** An AR decoder
+step is weight-read bound, so its cost barely depends on how many rows it carries:
+total decoder forwards is the *sum over groups* of each group's step count, and
+groups cannot be merged after the fact (both decoder surfaces keep a shared scalar
+generation offset — per-row offsets are the prerequisite, shared with paged decoder
+KV). So requests that arrive together are much cheaper than the same requests
+arriving apart. Measured on `Qwen2-Audio-7B-Instruct`, 4 utterances / 124 tokens:
+
+| arrival | window | total | tokens/s |
+|---|---|---|---|
+| together | — | 922 ms | 134.5 |
+| one per tick | 0 (default) | 1588 ms | 78.1 |
+| one per tick | 200 ms | 982 ms | 126.3 |
+
+The window holds a thin waiting queue until it reaches `max_batch_size` or expires,
+recovering ~92% of the loss. It costs up to one window of first-token latency for an
+*isolated* request, so it is **off by default** — turn it on for
+throughput-oriented deployments, leave it off when time-to-first-token dominates.
+
+**`--max-tick-ms` is the knob that bounds latency, not `--decode-steps-per-tick`.**
+A step count bounds work, not time, and step cost is model-dependent, so one
+fixed step budget behaves very differently per model. Measured at
+`--decode-steps-per-tick 32`, `B=4`, on `Qwen2-Audio-7B-Instruct`:
+
+| `--max-tick-ms` | tick p50 | tick p99 | tokens/s |
+|---|---|---|---|
+| `0` (step cap only) | 173 ms | 579 ms | 135.3 |
+| `25` (default) | 37 ms | 151 ms | 134.8 |
+
+Since the dispatcher holds the GIL for a whole tick, the p99 column is the floor
+on cancel latency, admission latency, and the interval between streaming
+partials — cut 3.8× here for a 0.3% throughput cost (within run-to-run noise).
+The residual 151 ms p99 is the **prefill** tick (audio tower + projector + one LM
+forward over the whole prompt), which the decode deadline deliberately does not
+bound; a tick that spends its decode budget will not also prefill, so the two
+never stack.
+
 ## Benchmarking
 
 `benchmarks/bench_service.py` is a load generator for `oasr-server`.  It
@@ -309,11 +436,31 @@ audio processed, **RTF**, throughput, and latency percentiles.  For
 `grpc_streaming` it also reports first-partial latency and
 partials-per-request.
 
+## Metrics (`GET /metrics`)
+
+Prometheus exposition of the values the dispatcher already computes per tick.
+
+| Metric | Type | What it tells you |
+|---|---|---|
+| `oasr_dispatch_tick_seconds` | histogram | Wall time of one tick, **GIL held** (admit + step + extract). Its p99 is the worst-case latency a cancel, a new admission, or a streaming partial can experience — the number to watch when running an autoregressive decode family, where a batched decoder step is orders of magnitude slower than a CTC chunk. |
+| `oasr_engine_step_seconds` | histogram | Time inside `ASREngine.step()`. |
+| `oasr_dispatch_{admit,extract,route}_seconds` | histogram | The tick's sub-stages; `route` runs with the GIL released. |
+| `oasr_engine_{running,waiting}` | gauge | Engine-reported queue depth. `running` includes parked AR generations. |
+| `oasr_engine_outputs_total` | counter | `RequestOutput`s returned by `step()`. |
+| `oasr_requests_{admitted,rejected,busy}_total` | counter | Accepted / rejected at admission (invalid options, mode mismatch) / refused at `--max-concurrent-requests`. |
+| `oasr_engine_step_failures_total` | counter | `step()` raised. Three consecutive failures stop the readiness heartbeat, so `/readyz` and the gRPC health check go NotServing and a load balancer drains the process. |
+| `oasr_events_{dropped,deferred}_total` | counter | Per-request channel was full: a partial was dropped (harmless — the next one supersedes it) or a **terminal** event was handed to a background task rather than lost. Sustained non-zero here means clients are reading slower than the engine emits. |
+
+`--trace-dispatch` additionally logs rolling 2 s means of the same sub-stages at
+INFO; the histograms above are the ones to alert on.
+
 ## Operational tips
 
 - Tune `--max-concurrent-requests` to a small multiple of the engine's
   `max_batch_size`.  Excess load returns HTTP 503 /
   gRPC `RESOURCE_EXHAUSTED` — clients should back off and retry.
+- Watch `oasr_dispatch_tick_seconds` p99. If it is far above your latency budget
+  on an AR decode family, lower `--decode-steps-per-tick`.
 - For local development, a single process pinned to one GPU keeps things
   simple; multi-GPU scale comes from running additional `oasr-server`
   processes behind a load balancer.
@@ -329,6 +476,5 @@ partials-per-request.
   feature on `oasr-asr`.
 - TLS termination — assume a reverse proxy handles it.
 - `LongRunningRecognize` (Google STT v1 LRO) — not implemented.
-- `RecognitionConfig.language_code`, `model`, `audio_channel_count`,
-  `max_alternatives` semantics beyond clipping the alternative list, and
+- `RecognitionConfig.language_code`, `model`, `audio_channel_count`, and
   `StreamingRecognitionConfig.single_utterance` — accepted, ignored.

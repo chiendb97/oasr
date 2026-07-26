@@ -181,14 +181,24 @@ class StreamingExecutor(Executor):
         #    audio is otherwise indistinguishable from a drained one and
         #    would be finalised with an empty transcript on the very
         #    first step.
+        #
+        #    A stream whose encoder cache is exhausted (``cache_exhausted``,
+        #    set by the streaming backend's capacity gate) is finalised too,
+        #    regardless of whether the client closed it: it can make no
+        #    further progress, so returning the transcript decoded so far with
+        #    ``finish_reason="length"`` beats holding its slot forever.
         nvtx_push("finalize_streams")
         for req in list(running):
-            if (
+            drained = (
                 req.audio_final
                 and (not req.has_pending_audio)
                 and (not req.has_ready_encoder_chunk(window))
-            ):
+            )
+            if drained or req.cache_exhausted:
                 final = self._op.finalize_streaming(req)
+                self._op.fill_nbest_texts(req, final)
+                if req.cache_exhausted and final.finish_reason is None:
+                    final.finish_reason = "length"
                 req.output = final
                 outputs.append(final)
                 self._op.free_session(req)  # decode-side beam state

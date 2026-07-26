@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use oasr_wire::Event;
+use oasr_wire::{DecodingParams, Event};
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::client::EngineClient;
-use crate::handle::{OfflineHandle, StreamingHandle};
+use crate::handle::{OfflineHandle, OfflineStreamHandle, StreamingHandle};
 use crate::EngineClientError;
 
 /// Owned by `oasr-server`; shared across HTTP and gRPC stacks via `Arc<_>`.
@@ -73,12 +73,34 @@ impl EnginePool {
         audio: Bytes,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<DecodingParams>,
     ) -> Result<OfflineHandle, EngineClientError> {
         let k = self
             .pick_least_loaded()
             .ok_or_else(|| EngineClientError::WorkerDown("no healthy workers".into()))?;
         self.workers[k]
-            .submit_offline(audio, sample_rate, priority)
+            .submit_offline(audio, sample_rate, priority, decoding)
+            .await
+    }
+
+    /// Submit an offline request whose *events* stream back incrementally.
+    ///
+    /// Sticky like `open_streaming`, because the caller keeps pulling events from
+    /// the worker it was admitted to.
+    pub async fn submit_offline_streaming(
+        &self,
+        audio: Bytes,
+        sample_rate: u32,
+        priority: i32,
+        decoding: Option<DecodingParams>,
+    ) -> Result<OfflineStreamHandle, EngineClientError> {
+        let k = self
+            .pick_least_loaded()
+            .ok_or_else(|| EngineClientError::WorkerDown("no healthy workers".into()))?;
+        let rid = Uuid::new_v4().simple().to_string();
+        self.sticky.insert(rid.clone(), k);
+        self.workers[k]
+            .submit_offline_streaming_with_id(rid, audio, sample_rate, priority, decoding)
             .await
     }
 
@@ -88,6 +110,7 @@ impl EnginePool {
         &self,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<DecodingParams>,
     ) -> Result<StreamingHandle, EngineClientError> {
         let k = self
             .pick_least_loaded()
@@ -95,7 +118,7 @@ impl EnginePool {
         let rid = Uuid::new_v4().simple().to_string();
         self.sticky.insert(rid.clone(), k);
         let handle = self.workers[k]
-            .open_streaming_with_id(rid.clone(), sample_rate, priority)
+            .open_streaming_with_id(rid.clone(), sample_rate, priority, decoding)
             .await?;
         Ok(handle)
     }

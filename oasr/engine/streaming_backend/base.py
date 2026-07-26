@@ -35,7 +35,13 @@ if TYPE_CHECKING:
 
 
 class StreamingEncoderBackend(ABC):
-    """Per-tick streaming encoder runtime for one encoder streaming kind."""
+    """Per-tick streaming encoder runtime for one encoder streaming kind.
+
+    ``forward_step`` produces what the active decode strategy declared via its
+    ``consumes`` class attribute: ``"log_probs"`` (encoder + head fused) or
+    ``"hidden"`` (raw encoder states).  Backends receive the value at
+    construction (:func:`build_streaming_backend`).
+    """
 
     #: Encoder ``streaming_kind`` this backend serves.
     streaming_kind: ClassVar[str]
@@ -104,15 +110,19 @@ def build_streaming_backend(
     streaming_kind: str,
     model: "BaseAsrModel",
     config: "EngineConfig",
-    cache_config: "CacheConfig",
+    cache_config: "Optional[CacheConfig]",
     *,
     graph_pool=None,
+    consumes: str = "log_probs",
 ) -> StreamingEncoderBackend:
     """Construct the streaming backend for an encoder's ``streaming_kind``.
 
-    Raises ``NotImplementedError`` (listing the registered kinds) when the
-    encoder declares a kind with no backend — the extension point for new
-    streaming runtimes.
+    ``consumes`` is the active decode strategy's declared input
+    (``"log_probs"`` — fused encoder+head, the CUDA-graph fast path — or
+    ``"hidden"`` — raw encoder states for autoregressive families); the backend
+    routes its per-chunk forward accordingly.  Raises ``NotImplementedError``
+    (listing the registered kinds) when the encoder declares a kind with no
+    backend — the extension point for new streaming runtimes.
     """
     cls = _REGISTRY.get(streaming_kind)
     if cls is None:
@@ -121,4 +131,4 @@ def build_streaming_backend(
             f"Registered: {sorted(_REGISTRY)}.  Add one by subclassing "
             "StreamingEncoderBackend + @register_streaming_backend."
         )
-    return cls(model, config, cache_config, graph_pool=graph_pool)
+    return cls(model, config, cache_config, graph_pool=graph_pool, consumes=consumes)

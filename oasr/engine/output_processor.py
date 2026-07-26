@@ -38,10 +38,17 @@ class OutputProcessor:
         for CTC).  Defaults to ``"ctc"``.
     """
 
-    def __init__(self, config: EngineConfig, decode_type: str = "ctc", model=None) -> None:
+    def __init__(
+        self, config: EngineConfig, decode_type: str = "ctc", model=None, tokenizer=None
+    ) -> None:
         self._config = config
         self._decode_type = decode_type
-        self._detok = Detokenizer(config.sentencepiece_model, config.unit_table)
+        # ``tokenizer`` (an :class:`oasr.tokenizers.Tokenizer` built from the
+        # checkpoint's converter-emitted TokenizerSpec) takes precedence; the
+        # config paths are the legacy sniffed fallback.
+        self._detok = Detokenizer(
+            config.sentencepiece_model, config.unit_table, tokenizer=tokenizer
+        )
         # ``model`` is threaded to the strategy so autoregressive families can
         # reach ``model.decoder`` / ``model.joiner`` (CTC strategies ignore it).
         self._strategy = build_decode_strategy(decode_type, config, self._detok, model)
@@ -96,3 +103,44 @@ class OutputProcessor:
     def detokenize(self, token_ids: List[int]) -> str:
         """Convert a list of token IDs to text (see :class:`Detokenizer`)."""
         return self._detok.detokenize(token_ids)
+
+    def fill_nbest_texts(self, request: Request, output: RequestOutput) -> None:
+        """Detokenize the top-N hypotheses into ``output.nbest_texts``.
+
+        Applies only when the request asked for ``DecodingOptions.n_best > 1``
+        and the decode family produced multiple hypothesis rows (CTC / WFST
+        beams); greedy families carry a single row and are left untouched.
+        Called by the executors on **final** outputs — interim partials always
+        carry the best hypothesis only.
+        """
+        opts = request.decoding
+        n = int(opts.n_best) if opts is not None else 1
+        if n <= 1 or not output.tokens:
+            return
+        if len(output.tokens) <= 1:
+            # A greedy family produced one hypothesis and always will.  Say so
+            # at DEBUG rather than silently returning `max_alternatives` worth
+            # of nothing: a client asking for 5 alternatives from `aed` / `llm`
+            # / `transducer` / `paraformer` cannot otherwise tell the request
+            # was honoured-and-empty from unsupported.  Deliberately reads only
+            # `output` — this method is a pure function of (request, output),
+            # which is what lets it be tested without an engine.
+            logger.debug(
+                "n_best=%d requested but this decode family produced a single "
+                "hypothesis; returning one alternative",
+                n,
+            )
+            return
+        texts = [output.text]
+        for row in output.tokens[1:n]:
+            texts.append(self._detok.detokenize(row))
+        output.nbest_texts = texts
+        # Truncate the token rows to what was asked for, before they cross the
+        # PyO3 boundary.  CTC ships its **whole** beam (default 10-16 rows) for
+        # every request regardless of `n_best`, and the serving layer discards
+        # all but the first `n` — so the extra rows are pure marshalling cost on
+        # the GIL-holding dispatcher thread.
+        if len(output.tokens) > n:
+            output.tokens = output.tokens[:n]
+            if output.scores is not None and len(output.scores) > n:
+                output.scores = output.scores[:n]

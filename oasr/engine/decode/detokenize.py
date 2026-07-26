@@ -2,17 +2,29 @@
 # SPDX-License-Identifier: Apache-2.0
 """Token-id → text detokenization, shared by every decode strategy.
 
-Strips special tokens (blank / unk / sos-eos), looks up BPE piece strings via
-``units.txt``, and joins them treating ``▁`` (U+2581) as a word boundary.  The
-SentencePiece model is loaded when available but **not** used for decoding —
-its internal piece ids differ from the CTC output ids (which come from
-``units.txt``); it is kept only for callers that want the processor object.
+Since the tokenizer axis landed (:mod:`oasr.tokenizers`), this class is a thin
+backward-compatible adapter: when the engine has a converter-emitted
+:class:`~oasr.tokenizers.TokenizerSpec` it injects the built
+:class:`~oasr.tokenizers.Tokenizer` here; the legacy path (``unit_table`` /
+``sentencepiece_model`` file paths, engine-side sniffing) builds the same
+``symbol_table`` tokenizer and is decode-for-decode identical to the historical
+behavior: strip special ids {0, 1, 2}, join ``units.txt`` pieces, treat ``▁``
+(U+2581) as a word boundary.
+
+``sentencepiece_model`` is accepted and ignored.  It used to be eagerly loaded
+here — file I/O plus a resident model at engine init for every checkpoint dir
+containing a ``*.model``, which the engine auto-sniffed — but nothing ever read
+it: SentencePiece piece ids differ from the CTC output ids (which come from
+``units.txt``), so it could not have been used for decoding.  The parameter
+stays for callers passing it positionally.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
+
+from oasr.tokenizers import SymbolTableTokenizer, Tokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -21,64 +33,66 @@ SPECIAL_IDS = frozenset([0, 1, 2])
 
 
 class Detokenizer:
-    """Maps decoded token-id sequences to text using ``units.txt`` pieces."""
+    """Maps decoded token-id sequences to text via a :class:`Tokenizer`."""
 
     def __init__(
         self,
         sentencepiece_model: Optional[str] = None,
         unit_table: Optional[str] = None,
+        tokenizer: Optional[Tokenizer] = None,
     ) -> None:
-        self._sp = self._load_sentencepiece(sentencepiece_model)
-        self._vocab: Optional[Dict[int, str]] = None
-        if unit_table is not None:
-            self._vocab = self._load_unit_table(unit_table)
+        self._tokenizer: Optional[Tokenizer] = tokenizer
+        if self._tokenizer is None and unit_table is not None:
+            self._tokenizer = SymbolTableTokenizer(unit_table, special_ids=SPECIAL_IDS)
+
+    @property
+    def tokenizer(self) -> Optional[Tokenizer]:
+        """The underlying tokenizer (``None`` when only the id-join fallback exists)."""
+        return self._tokenizer
 
     def detokenize(self, token_ids: List[int]) -> str:
         """Convert a list of token IDs to text.
 
-        Strips special tokens (blank, unk, sos/eos), looks up ``units.txt``
-        piece strings, then joins treating ``▁`` (U+2581) as a word boundary.
+        Delegates to the tokenizer when one is available; otherwise strips the
+        default special ids and joins the raw ids as a last resort.
         """
-        filtered = [t for t in token_ids if t not in SPECIAL_IDS]
-        if not filtered:
-            return ""
-
-        if self._vocab is not None:
-            pieces = [self._vocab.get(t, "") for t in filtered]
-            text = "".join(pieces)
-            return text.replace("▁", " ").strip()
+        if self._tokenizer is not None:
+            return self._tokenizer.decode(token_ids)
 
         # Last resort: join as-is
+        filtered = [t for t in token_ids if t not in SPECIAL_IDS]
         return " ".join(str(t) for t in filtered)
 
     # ------------------------------------------------------------------
-    # Loaders
+    # Incremental detokenization (T3)
     # ------------------------------------------------------------------
+    #
+    # For the append-only families — AR generation and transducer greedy — a
+    # partial extends the previous hypothesis rather than replacing it, so
+    # re-decoding the whole prefix every tick is Θ(n²) for no new information.
+    # These two methods let such a strategy feed only what it just produced.
+    #
+    # CTC prefix beam search deliberately does **not** use them: its best
+    # hypothesis can be re-ranked between chunks, so the prefix is not monotone
+    # and "what's new" is undefined.
 
-    @staticmethod
-    def _load_sentencepiece(path: Optional[str]):
-        if path is None:
-            return None
-        try:
-            import sentencepiece as spm
+    def new_state(self) -> Dict[str, Any]:
+        """Fresh per-request incremental-decode state."""
+        if self._tokenizer is not None:
+            return self._tokenizer.new_decode_state()
+        return {"ids": [], "text": ""}
 
-            sp = spm.SentencePieceProcessor()
-            sp.Load(path)
-            return sp
-        except Exception as exc:
-            logger.warning("Could not load SentencePiece model %s: %s", path, exc)
-            return None
+    def detokenize_incremental(self, new_ids: Sequence[int], state: Dict[str, Any]) -> str:
+        """Extend a hypothesis by ``new_ids``; return the text delta.
 
-    @staticmethod
-    def _load_unit_table(path: str) -> Dict[int, str]:
-        vocab: Dict[int, str] = {}
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                parts = line.split()
-                if len(parts) == 2:
-                    token, idx = parts[0], int(parts[1])
-                    vocab[idx] = token
-        return vocab
+        ``state["text"]`` carries the full transcript so far.  Concatenating
+        every delta equals :meth:`detokenize` over the accumulated ids.
+        """
+        if self._tokenizer is not None:
+            return self._tokenizer.decode_incremental(new_ids, state)
+        ids = state.setdefault("ids", [])
+        ids.extend(int(i) for i in new_ids)
+        full = self.detokenize(ids)
+        prev = state.get("text", "")
+        state["text"] = full
+        return full[len(prev) :] if full.startswith(prev) else full

@@ -38,29 +38,45 @@ class ModelRunner:
         Loaded model already moved to the target device in eval mode.
     config : EngineConfig
         Engine configuration.
-    cache_config : CacheConfig
-        Cache configuration derived from the model.
+    cache_config : CacheConfig or None
+        Cache configuration derived from the model; ``None`` for an offline-only
+        encoder, which has no streaming cache to size.
     """
 
     def __init__(
         self,
         model: BaseAsrModel,
         config: EngineConfig,
-        cache_config: CacheConfig,
+        cache_config: Optional[CacheConfig],
         *,
         graph_pool: Optional[Tuple[int, int]] = None,
+        consumes: str = "log_probs",
     ) -> None:
         self._model = model
         self._config = config
         self._cache_config = cache_config
 
         # Pick the streaming runtime from the encoder's declared cache model.
+        # ``consumes`` (the active decode strategy's declared input) routes the
+        # backend's per-chunk forward: fused head vs. raw hidden states.
+        #
+        # ``service_mode`` pins the engine to one executor for its lifetime and
+        # mismatched requests are rejected at admission, so an offline engine can
+        # never reach a streaming forward — building the real backend would hold the
+        # paged KV pool plus the CNN-cache tensors (~0.4 GB at the defaults) for
+        # nothing, on exactly the offline/LLM deployments where VRAM is tightest
+        # (H13).  ``NoStreamingBackend`` allocates nothing and raises with an
+        # actionable message if a streaming path is somehow reached.
+        streaming_kind = model.encoder.streaming_kind
+        if config.service_mode == "offline":
+            streaming_kind = "none"
         self._streaming_backend: StreamingEncoderBackend = build_streaming_backend(
-            model.encoder.streaming_kind,
+            streaming_kind,
             model,
             config,
             cache_config,
             graph_pool=graph_pool,
+            consumes=consumes,
         )
 
     # ------------------------------------------------------------------
@@ -140,6 +156,16 @@ class ModelRunner:
         their head/decoder (transducer / AED / LLM) instead of the fused CTC head.
         """
         return self._model.encode_offline(features, lengths)
+
+    @torch.no_grad()
+    def apply_head(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Head forward over pre-computed encoder hidden → ``(B, T, V)`` log-probs.
+
+        Used by the ``consumes == "both"`` offline path (CTC+AED rescoring):
+        one :meth:`encode_offline` pass plus this head call yields the hidden
+        states *and* the CTC log-probs without a second encoder forward.
+        """
+        return self._model.head(hidden)
 
     # ------------------------------------------------------------------
     # Streaming (delegated to the backend)

@@ -22,7 +22,8 @@ from oasr.layers.linear import Linear, LinearActivation
 from oasr.layers.norm import GlobalCMVN, LayerNorm
 from oasr.utils import get_norm, get_norm_activation
 
-from ..base import BaseAsrModel, BaseEncoder
+from ..base import BaseAsrModel, BaseEncoder, LoadReport
+from ..decoders.transformer_decoder import BiTransformerDecoder
 from ..heads.ctc import CTCHead
 from .config import ConformerEncoderConfig, ConformerModelConfig
 from .packing import PackedLayout, build_packed_layout, pack_hidden, unpack_hidden
@@ -629,27 +630,43 @@ class ConformerEncoderLayer(nn.Module):
         x = self.norm_ff_macaron(x)
         mac_out = self.feed_forward_macaron(x)
         x, residual = oasr.add_layer_norm_residual(
-            mac_out, residual, self.norm_mha.weight, self.norm_mha.bias,
-            self.norm_mha.eps, self.ff_scale,
+            mac_out,
+            residual,
+            self.norm_mha.weight,
+            self.norm_mha.bias,
+            self.norm_mha.eps,
+            self.ff_scale,
         )
         # Self-attention: add folds into ``norm_conv``.
         x_att, new_att_cache = self.self_attn(x, mask, pos_emb, att_cache)
         x, residual = oasr.add_layer_norm_residual(
-            x_att, residual, self.norm_conv.weight, self.norm_conv.bias,
-            self.norm_conv.eps, 1.0,
+            x_att,
+            residual,
+            self.norm_conv.weight,
+            self.norm_conv.bias,
+            self.norm_conv.eps,
+            1.0,
         )
         # Convolution: add folds into ``norm_ff``.
         x_conv, new_cnn_cache = self.conv_module(x, mask_pad, cnn_cache)
         x, residual = oasr.add_layer_norm_residual(
-            x_conv, residual, self.norm_ff.weight, self.norm_ff.bias,
-            self.norm_ff.eps, 1.0,
+            x_conv,
+            residual,
+            self.norm_ff.weight,
+            self.norm_ff.bias,
+            self.norm_ff.eps,
+            1.0,
         )
         # FFN: add folds into ``norm_final`` (the carried residual is no longer
         # needed, so the sum output is discarded).
         ff_out = self.feed_forward(x)
         x, _ = oasr.add_layer_norm_residual(
-            ff_out, residual, self.norm_final.weight, self.norm_final.bias,
-            self.norm_final.eps, self.ff_scale,
+            ff_out,
+            residual,
+            self.norm_final.weight,
+            self.norm_final.bias,
+            self.norm_final.eps,
+            self.ff_scale,
         )
         return x, new_att_cache, new_cnn_cache
 
@@ -1038,11 +1055,28 @@ class ConformerModel(BaseAsrModel):
             config.vocab_size,
             config.encoder.output_size,
         )
+        # U2++ attention-decoder branch (optional; ``decoder.left_decoder.*``
+        # checkpoint keys map 1:1).  Used by the ``ctc_aed_rescoring`` decode
+        # strategy; CTC stays the default decode path either way.
+        if config.decoder is not None:
+            self.decoder = BiTransformerDecoder(config.decoder)
 
     @property
     def head(self) -> CTCHead:
         """The decode-side head (alias for ``self.ctc``)."""
         return self.ctc
+
+    @property
+    def default_decode_type(self) -> str:
+        """CTC is always the production default; the AED branch (when present)
+        is the opt-in ``ctc_aed_rescoring`` capability, never the default."""
+        return "ctc"
+
+    @property
+    def capabilities(self) -> frozenset:
+        if getattr(self, "decoder", None) is not None:
+            return frozenset({"ctc", "ctc_aed_rescoring"})
+        return frozenset({"ctc"})
 
     @classmethod
     def from_config(
@@ -1063,37 +1097,81 @@ class ConformerModel(BaseAsrModel):
         probs = self.ctc(hidden_states)
         return probs
 
+    # Positional-encoding table is rebuilt from config; absent from checkpoints
+    # and skipped by the native format.
+    _computed_buffer_suffixes = ("pos_enc.pe",)
+
     def load_weights(
         self,
         state_dict: Mapping[str, torch.Tensor],
         *,
         strict: bool = False,
-    ) -> None:
+    ) -> LoadReport:
         """Load a WeNet-format state-dict into this model.
 
-        Keeps only the ``encoder.*`` parameters and the ``ctc.ctc_lo.*``
-        projection, zero-padding the CTC weight/bias up to this model's
-        (8-aligned) vocab when the checkpoint's vocab is smaller.  In-module
-        reshaping (fused QKV, Conv2d reorder) is handled by the layers'
+        Keeps the ``encoder.*`` parameters, the ``ctc.ctc_lo.*`` projection
+        (zero-padded up to this model's 8-aligned vocab when the checkpoint's
+        vocab is smaller), and — when this model was built with an AED decoder
+        branch (``config.decoder``) — the U2++ ``decoder.*`` weights, mapped
+        1:1 (a plain-``transformer`` checkpoint's ``decoder.decoders.*`` keys
+        are remapped into ``decoder.left_decoder.*``).  In-module reshaping
+        (fused QKV, Conv2d reorder) is handled by the layers'
         ``_load_from_state_dict`` hooks.  ``encoder.embed.pos_enc.pe`` is a
         computed buffer and is expected to be absent from the checkpoint.
+        Every non-consumed checkpoint key lands in ``LoadReport.dropped``
+        (e.g. ``decoder.*`` on a model configured without the AED branch).
         """
+        ctc_keys = ("ctc.ctc_lo.weight", "ctc.ctc_lo.bias")
+        load_decoder = getattr(self, "decoder", None) is not None
         sd = {k: v for k, v in state_dict.items() if k.startswith("encoder.")}
+        if load_decoder:
+            for k, v in state_dict.items():
+                if not k.startswith("decoder."):
+                    continue
+                # WeNet's plain ``transformer`` decoder registers layers as
+                # ``decoder.decoders.*``; ours always nests the forward branch
+                # under ``left_decoder`` (the bitransformer layout).
+                if k.startswith(("decoder.left_decoder.", "decoder.right_decoder.")):
+                    sd[k] = v
+                else:
+                    sd["decoder.left_decoder." + k[len("decoder.") :]] = v
+        dropped = [
+            k
+            for k in state_dict
+            if not k.startswith("encoder.")
+            and k not in ctc_keys
+            and not (load_decoder and k.startswith("decoder."))
+        ]
 
-        target_vocab = self.ctc.ctc_lo.weight.shape[0]
-        ctc_w = state_dict["ctc.ctc_lo.weight"]
-        ctc_b = state_dict["ctc.ctc_lo.bias"]
-        pad = target_vocab - ctc_w.shape[0]
-        if pad > 0:
-            ctc_w = F.pad(ctc_w, (0, 0, 0, pad))
-            ctc_b = F.pad(ctc_b, (0, pad))
-        sd["ctc.ctc_lo.weight"] = ctc_w
-        sd["ctc.ctc_lo.bias"] = ctc_b
+        if "ctc.ctc_lo.weight" in state_dict and "ctc.ctc_lo.bias" in state_dict:
+            target_vocab = self.ctc.ctc_lo.weight.shape[0]
+            ctc_w = state_dict["ctc.ctc_lo.weight"]
+            ctc_b = state_dict["ctc.ctc_lo.bias"]
+            pad = target_vocab - ctc_w.shape[0]
+            if pad > 0:
+                ctc_w = F.pad(ctc_w, (0, 0, 0, pad))
+                ctc_b = F.pad(ctc_b, (0, pad))
+            sd["ctc.ctc_lo.weight"] = ctc_w
+            sd["ctc.ctc_lo.bias"] = ctc_b
+        else:
+            # An attention-only WeNet checkpoint (no CTC branch) used to die here
+            # with a bare KeyError.  Name the missing capability instead — the
+            # CTC head stays randomly initialised, and the registry's LoadReport
+            # accounting surfaces it via ``missing``.
+            raise ValueError(
+                "this checkpoint has no CTC branch (`ctc.ctc_lo.*` absent), so it "
+                "cannot be loaded as a CTC Conformer. Top-level key prefixes "
+                f"present: {sorted({k.split('.')[0] for k in state_dict})}. "
+                "Load an attention-only checkpoint with the architecture that "
+                "matches its objective."
+            )
 
         missing, unexpected = self.load_state_dict(sd, strict=strict)
-        expected_missing = {"encoder.embed.pos_enc.pe"}
-        real_missing = [k for k in missing if k not in expected_missing]
-        if real_missing:
-            logger.warning("Unexpected missing keys: %s", real_missing)
+        report = LoadReport.build(
+            sd, missing, unexpected, dropped, expected_missing={"encoder.embed.pos_enc.pe"}
+        )
+        if report.missing:
+            logger.warning("Unexpected missing keys: %s", report.missing)
         if unexpected:
             logger.warning("Unexpected keys in checkpoint: %s", unexpected)
+        return report

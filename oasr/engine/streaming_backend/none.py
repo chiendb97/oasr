@@ -10,7 +10,7 @@ Any streaming operation raises a clear error; the window geometry is reported as
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, Dict, List
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional
 
 import torch
 
@@ -34,11 +34,12 @@ class NoStreamingBackend(StreamingEncoderBackend):
         self,
         model: "BaseAsrModel",
         config: "EngineConfig",
-        cache_config: "CacheConfig",
+        cache_config: "Optional[CacheConfig]",
         *,
         graph_pool=None,
+        consumes: str = "log_probs",
     ) -> None:
-        del model, config, cache_config, graph_pool
+        del model, config, cache_config, graph_pool, consumes
 
     @staticmethod
     def _unsupported():

@@ -51,6 +51,99 @@ pub struct Cli {
     /// `EngineConfig.fst_path`.
     #[arg(long)]
     pub fst_path: Option<String>,
+    /// Decode-method selection among the checkpoint's capabilities (e.g.
+    /// `ctc_aed_rescoring` on a U2++ hybrid, `llm` on a speech-LLM).  Unset
+    /// runs the model's default decode family.  Forwarded to
+    /// `EngineConfig.decode_method`; the engine validates the name against
+    /// `model.capabilities` at startup.
+    #[arg(long)]
+    pub decode_method: Option<String>,
+    /// Speech-LLM only: the user prompt placed in the checkpoint's chat
+    /// template next to the audio.  Unset uses the checkpoint's default ASR
+    /// prompt.  Forwarded to `EngineConfig.llm_prompt`; per-request `prompt`
+    /// decoding options override it.
+    #[arg(long)]
+    pub llm_prompt: Option<String>,
+    /// AR generation length cap per request (AED / LLM decode families).
+    /// Engine default 448.  Per-request `max_new_tokens` decoding options
+    /// override it.
+    #[arg(long)]
+    pub max_new_tokens: Option<u32>,
+    /// Ceiling on total decoder-KV bytes across in-flight AR requests, in GiB.
+    ///
+    /// `--max-decode-slots` bounds admission by request *count*, which does not
+    /// bound memory: a row's KV footprint is its position budget (prompt +
+    /// generation cap) times the model's per-token rate, and prefill
+    /// preallocates all of it.  Unset leaves the byte budget off.
+    #[arg(long)]
+    pub decode_kv_budget_gib: Option<f64>,
+    /// Streaming: recycle the oldest KV block when a stream reaches its cache
+    /// ceiling, instead of finalising it with `finish_reason="length"`.
+    ///
+    /// Makes streaming memory bounded by construction and lets a stream run
+    /// indefinitely.  Measured identical (0.00% WER) for audio inside the
+    /// retained window; past it the recycling run decodes the whole file where
+    /// unlimited history truncates.  Off by default because it does change the
+    /// attention span for very long streams.
+    #[arg(long, default_value_t = false)]
+    pub recycle_streaming_history: bool,
+    /// Decode audio longer than a fixed-window frontend's window (Whisper /
+    /// Qwen2-Audio's 30 s) by splitting it into windows and stitching the
+    /// transcripts, instead of rejecting it.
+    ///
+    /// Windows decode in parallel, so a long file costs about one window of
+    /// wall clock rather than N sequential decodes; the price is boundary
+    /// accuracy, which `--long-form-overlap-seconds` mitigates.
+    #[arg(long, default_value_t = false)]
+    pub long_form: bool,
+    /// Audio shared between adjacent long-form windows, in seconds.  Overlapping
+    /// lets the stitcher drop words duplicated at a cut instead of losing one.
+    /// Engine default 1.0; 0 disables.
+    #[arg(long)]
+    pub long_form_overlap_seconds: Option<f64>,
+    /// Generic per-family decode knob, repeatable: `--decode-option k=v`.
+    ///
+    /// Forwarded verbatim to `EngineConfig.decode_options` and validated
+    /// against the **active** decode family's option set at engine
+    /// construction, so an unknown or misspelled key is a startup error naming
+    /// the valid ones rather than a silently ignored flag.  This is what lets a
+    /// newly registered decode family expose its configuration without a new
+    /// flag here — and it reaches the three knobs that never got one
+    /// (`rescoring_ctc_weight`, `rescoring_reverse_weight`,
+    /// `transducer_max_sym_per_frame`) as `ctc_weight`, `reverse_weight` and
+    /// `max_sym_per_frame`.  Values are typed from the option's declared
+    /// default, so `--decode-option ctc_weight=0.3` arrives as a float.
+    #[arg(long = "decode-option", value_name = "KEY=VALUE")]
+    pub decode_option: Vec<String>,
+    /// Incremental (AED / LLM) decode: max batched decoder steps one engine
+    /// tick runs across all pending requests — the bounded-work-per-tick
+    /// contract that keeps AR decode from starving the dispatcher.  Engine
+    /// default 32.
+    #[arg(long)]
+    pub decode_steps_per_tick: Option<u32>,
+    /// Incremental (AED / LLM) decode: wall-clock cap on one tick's decode phase,
+    /// in milliseconds.  The step cap above bounds work, not time, and step cost
+    /// is model-dependent (measured: ~1.5 ms/step for whisper-tiny at B=8 vs
+    /// ~18 ms/step for Qwen2-Audio-7B at B=4), so this is what actually bounds
+    /// cancel latency, admission latency and the streaming-partial interval —
+    /// the dispatcher holds the GIL for a whole tick.  Engine default 25;
+    /// 0 disables (step cap only).
+    #[arg(long)]
+    pub max_tick_ms: Option<f64>,
+    /// Incremental (AED / LLM) decode: hold a thin waiting queue this many
+    /// milliseconds so near-simultaneous arrivals prefill as **one** decode
+    /// batch.  An AR decoder step is weight-read bound, so its cost barely
+    /// depends on how many rows it carries — two decode groups cost roughly
+    /// twice one group of the same total rows, and groups cannot be merged after
+    /// the fact (both decoder surfaces keep a shared scalar generation offset).
+    /// Trades first-token latency for throughput; engine default 0 (off).
+    #[arg(long)]
+    pub decode_admit_window_ms: Option<f64>,
+    /// Incremental (AED / LLM) decode: max AR requests in flight before
+    /// new-batch admission pauses.  Unset defaults to the engine's
+    /// max_batch_size.
+    #[arg(long)]
+    pub max_decode_slots: Option<u32>,
     /// Offline only: overlap per-request admission prep (waveform load + scale
     /// + frame stamp) with the GPU ``step()`` on a daemon prep thread.  Helps
     /// at high concurrency (a deep backlog to pipeline); can slightly regress
@@ -217,6 +310,69 @@ impl Cli {
         }
         if let Some(s) = &self.fst_path {
             obj.entry("fst_path").or_insert(Value::String(s.clone()));
+        }
+        if let Some(s) = &self.decode_method {
+            obj.entry("decode_method")
+                .or_insert(Value::String(s.clone()));
+        }
+        if let Some(s) = &self.llm_prompt {
+            obj.entry("llm_prompt").or_insert(Value::String(s.clone()));
+        }
+        if let Some(v) = self.max_new_tokens {
+            obj.entry("max_new_tokens")
+                .or_insert(Value::Number(v.into()));
+        }
+        if self.recycle_streaming_history {
+            obj.entry("recycle_streaming_history")
+                .or_insert(Value::Bool(true));
+        }
+        if self.long_form {
+            obj.entry("long_form").or_insert(Value::Bool(true));
+        }
+        if let Some(v) = self.long_form_overlap_seconds {
+            if let Some(num) = serde_json::Number::from_f64(v) {
+                obj.entry("long_form_overlap_seconds")
+                    .or_insert(Value::Number(num));
+            }
+        }
+        if let Some(v) = self.decode_kv_budget_gib {
+            if let Some(num) = serde_json::Number::from_f64(v) {
+                obj.entry("decode_kv_budget_gib")
+                    .or_insert(Value::Number(num));
+            }
+        }
+        if !self.decode_option.is_empty() {
+            // Pass the raw `k=v` strings through; the engine types each value
+            // from the active family's declared default and rejects unknown
+            // keys.  Doing the typing here would mean this crate tracking every
+            // family's option table — exactly the drift S9 is about.
+            let mut opts = serde_json::Map::new();
+            for pair in &self.decode_option {
+                let (k, v) = pair.split_once('=').ok_or_else(|| {
+                    anyhow::anyhow!("--decode-option expects KEY=VALUE, got {pair:?}")
+                })?;
+                opts.insert(k.trim().to_string(), Value::String(v.to_string()));
+            }
+            obj.entry("decode_options").or_insert(Value::Object(opts));
+        }
+        if let Some(v) = self.decode_steps_per_tick {
+            obj.entry("decode_steps_per_tick")
+                .or_insert(Value::Number(v.into()));
+        }
+        if let Some(v) = self.max_decode_slots {
+            obj.entry("max_decode_slots")
+                .or_insert(Value::Number(v.into()));
+        }
+        if let Some(v) = self.max_tick_ms {
+            if let Some(num) = serde_json::Number::from_f64(v) {
+                obj.entry("max_tick_ms").or_insert(Value::Number(num));
+            }
+        }
+        if let Some(v) = self.decode_admit_window_ms {
+            if let Some(num) = serde_json::Number::from_f64(v) {
+                obj.entry("decode_admit_window_ms")
+                    .or_insert(Value::Number(num));
+            }
         }
         if self.overlap_admit {
             obj.entry("overlap_admit").or_insert(Value::Bool(true));

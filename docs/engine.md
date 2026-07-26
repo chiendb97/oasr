@@ -469,31 +469,43 @@ engine = ASREngine(EngineConfig(
 
 ## 10. Extension Points
 
-- **Custom feature extraction.** Override `FeatureConfig` and pass it
-  through `EngineConfig.feature_config`. To plug in an entirely new
-  backend, change `oasr.features.backends._extract` or hook in
-  `InputProcessor.load_audio` / `extract_features_batch`.
-- **Custom decoder.** Add a new branch in
-  `OutputProcessor.decode_offline` / `decode_streaming_chunk` /
-  `finalize_streaming` and a corresponding entry in
-  `EngineConfig.decoder_type`.
-- **Custom model.** `ModelRunner` is hard-wired to `ConformerModel`. To
-  support a different architecture, mirror its `encoder` / `ctc` /
-  `forward_chunk_paged` / `forward_chunk` interface, then swap the
-  factory call in `ASREngine.__init__`.
-- **Custom scheduler.** Subclass `Scheduler` and replace
-  `self._scheduler` in `ASREngine.__init__`. The engine only depends on
-  the `SchedulerOutput` shape and on `add_request`, `schedule`,
-  `finish_request`, `abort_request`, `find_request`, `has_pending`,
-  `num_running`, `num_waiting`.
+Every extension lands through a registry — subclass a base, register under a
+name, and the engine picks it up by configuration. **Never edit the engine
+core to add a variant.** `docs/architecture.md` is the authoritative map
+(seams table + cookbook); the summary:
+
+- **New model architecture** → model package under `oasr/models/<arch>/`
+  (`BaseAsrModel` / `BaseEncoder`) + a `CheckpointConverter`, registered via
+  `register_model`. The engine touches models only through the base-class
+  surface (`forward_offline` / `encode_offline` / `forward_chunk_paged` /
+  `cache_spec` / `capabilities` / `encoder.streaming_kind`). See
+  `docs/checkpoints.md` for the converter contract and native format.
+- **New decode family** → `DecodeStrategy` + `@register_decode_strategy`.
+  Declare `consumes` (`"log_probs"` / `"hidden"` / `"both"`) and, for
+  label-synchronous AR families, `incremental = True` with the bounded
+  `begin_offline` / `advance(StepBudget)` / `has_pending` protocol. Selected
+  per deployment by `EngineConfig.decode_method` (validated against
+  `model.capabilities`); per-request knobs ride on
+  `DecodingOptions` (`Request.decoding`).
+- **New streaming runtime** → `StreamingEncoderBackend` +
+  `@register_streaming_backend`, keyed by the encoder's `streaming_kind`.
+  Implement `allocate` / `forward_step` / `free` + window geometry. Expose
+  `stack_streaming_states` / `unstack_streaming_states` on the encoder to get
+  batched (one `B = N` forward) stateful streaming for free.
+- **New batching / partition policy** → `@register_batching_policy` /
+  `@register_partition_policy`; select via `EngineConfig.schedule_policy` and
+  the partition flags.
+- **New tokenizer kind** → `Tokenizer` subclass + `register_tokenizer`,
+  selected by the converter-emitted `TokenizerSpec.kind`. See
+  `docs/tokenizers.md`.
+- **Feature extraction** is checkpoint-derived: converters emit a
+  `FeatureSpec` the engine materializes into `FeatureConfig`; an explicit
+  `EngineConfig.feature_config` still overrides (with a loud mismatch
+  warning).
 - **Streaming preemption.** Currently absent. To add it, extend the
   scheduler to evict a low-priority running stream, then have
   `ASREngine` call `ModelRunner.free_stream` and re-queue the request.
   No public API changes required.
-- **Streaming vs offline at the API.** Both paths share the same engine
-  instance; pass `streaming=False` (or call `transcribe_offline`) to take
-  the batched offline path.  No subclassing is needed — the historical
-  `OfflineEngine` class was removed in favour of this unified surface.
 
 ## 11. Quick Reference
 
@@ -505,6 +517,11 @@ engine = ASREngine(EngineConfig(ckpt_dir=..., **knobs))
 rid = engine.add_request(audio, streaming=True/False, priority=0)
 rid = engine.add_streaming_request()       # then feed_chunk
 engine.feed_chunk(rid, chunk, is_last=False)
+
+# per-request decoding options (n-best, AR generation cap, sampling, LLM prompt)
+from oasr.engine import DecodingOptions
+rid = engine.add_request(audio, streaming=False,
+                         decoding=DecodingOptions(n_best=3, max_new_tokens=64))
 
 # stepping
 outputs = engine.step()                    # one tick, returns partials+finals

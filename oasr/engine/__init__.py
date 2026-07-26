@@ -20,6 +20,8 @@ Components
     Transcription result for a single request.
 :class:`RequestState`
     Lifecycle state enum: WAITING → RUNNING → FINISHED.
+:class:`DecodingOptions`
+    Per-request decoding options (n-best, generation cap, sampling, prompt).
 
 The engine is **waveform-only** — decode audio files at the entry point (the
 serving front-end, or the harness) and pass waveforms in.
@@ -47,11 +49,12 @@ Streaming transcription (multiple concurrent requests)::
 
 from .config import EngineConfig
 from .engine import ASREngine
-from .request import Request, RequestOutput, RequestState
+from .request import DecodingOptions, Request, RequestOutput, RequestState
 
 __all__ = [
     "EngineConfig",
     "ASREngine",
+    "DecodingOptions",
     "Request",
     "RequestOutput",
     "RequestState",

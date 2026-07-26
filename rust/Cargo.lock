@@ -1084,6 +1084,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
+ "metrics",
  "numpy",
  "oasr-wire",
  "parking_lot",

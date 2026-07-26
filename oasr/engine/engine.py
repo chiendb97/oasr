@@ -8,26 +8,29 @@ import logging
 import queue
 import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
-from oasr.models import from_pretrained
-
+from oasr.models import PretrainedModel, load_pretrained
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from .config import EngineConfig
-from .graph_cache import round_up_bucket
-from .input_processor import InputProcessor
-from .model_runner import ModelRunner
-from .output_processor import OutputProcessor
+from .decode import EncodeOutput, get_decode_strategy_class
 from .executor import (
     Executor,
     OfflineExecutor,
     StreamingExecutor,
 )
-from .request import Request, RequestOutput
+from .graph_cache import round_up_bucket
+from .input_processor import InputProcessor
+from .longform import LongFormTracker
+from .model_runner import ModelRunner
+from .output_processor import OutputProcessor
+from .request import DecodingOptions, Request, RequestOutput
 from .scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
@@ -77,6 +80,14 @@ class ASREngine:
         texts = engine.transcribe_offline(wavs)
     """
 
+    #: Long-form fan-out tracker, ``None`` unless ``EngineConfig.long_form`` is
+    #: set and the frontend has a fixed window.  Declared at class level, not
+    #: only assigned in ``__init__``, because ``abort_request`` / ``step`` read it
+    #: on every call and the concurrency tests drive a hand-built engine through
+    #: ``__new__`` — an attribute that exists only after a full construction
+    #: would make those entry points depend on construction order.
+    _longform: Optional["LongFormTracker"] = None
+
     def __init__(self, config: EngineConfig) -> None:
         # Engine-wide re-entrant lock guarding scheduler queues and per-request
         # audio mutations. Held by every public entry (add_*, feed_chunk,
@@ -90,20 +101,31 @@ class ASREngine:
         dtype = config.dtype
 
         logger.info("Loading model from %s ...", config.ckpt_dir)
-        # ``from_pretrained`` accepts a local checkpoint dir (the common case —
-        # a straight pass-through to ``build_model_from_checkpoint``) or a
-        # HuggingFace Hub repo id, which it downloads first.
-        model, model_config = from_pretrained(
+        # ``load_pretrained`` accepts a local checkpoint dir (the common case —
+        # a straight pass-through to the registry loader) or a HuggingFace Hub
+        # repo id, which it downloads first.  Beyond the model it surfaces the
+        # converter-emitted tokenizer / feature specs, which fill any
+        # engine-config fields the caller left unset.
+        loaded = load_pretrained(
             config.ckpt_dir,
             checkpoint_name=config.checkpoint_name,
             device=device_str,
             dtype=dtype,
         )
+        model, model_config = loaded.model, loaded.config
         self._model = model
         config._model_config = model_config
+        tokenizer = self._apply_checkpoint_specs(config, loaded)
 
         self._device = torch.device(device_str)
-        cache_config = config.build_cache_config(model.cache_spec)
+        # ``cache_spec`` is ``None`` for an offline-only encoder (Whisper,
+        # Paraformer, the Qwen2-Audio tower), in which case no streaming cache is
+        # built at all — previously every engine allocated the paged KV pool plus
+        # the CNN-cache tensors (~0.4 GB at the defaults) even when nothing could
+        # ever read them, on exactly the LLM/offline deployments where VRAM is
+        # tightest (H13).
+        cache_spec = model.cache_spec
+        cache_config = config.build_cache_config(cache_spec) if cache_spec is not None else None
 
         # CUDA Graph capture: each cache type (encoder, feature extraction,
         # CTC) owns its own ``torch.cuda.graph_pool_handle()``. Sharing one
@@ -119,7 +141,55 @@ class ASREngine:
 
         self._input_processor = InputProcessor(config, self._device, graph_pool=self._graph_pool)
         self._scheduler = Scheduler(config)
-        self._model_runner = ModelRunner(model, config, cache_config, graph_pool=self._graph_pool)
+        # Decode-method selection: ``config.decode_method`` picks among the
+        # checkpoint's advertised capabilities; ``None`` runs the model's
+        # default family (the unchanged production path).
+        decode_method = config.decode_method or model.default_decode_type
+        capabilities = model.capabilities
+        if decode_method not in capabilities:
+            raise ValueError(
+                f"decode_method={decode_method!r} is not a capability of this "
+                f"checkpoint (capabilities: {sorted(capabilities)}). Pick one "
+                "of those, or leave decode_method=None for the model default."
+            )
+        self._decode_method = decode_method
+        if config.service_mode == "streaming" and model.streaming_kind == "none":
+            raise ValueError(
+                "this checkpoint's encoder is offline-only (streaming_kind="
+                "'none'); it exposes no chunk forward for the streaming "
+                "runtime. Use service_mode='offline'."
+            )
+        # Resolve the decode strategy's declared input ("log_probs" / "hidden"
+        # / "both") from the registry *class* before any component is built —
+        # the streaming backends route their per-chunk forward on it, and the
+        # OutputProcessor (which owns the strategy instance) is constructed
+        # only after the runner (it needs the runner-derived geometry).
+        strategy_cls = get_decode_strategy_class(decode_method, config)
+        consumes = strategy_cls.consumes
+        if consumes == "both" and config.service_mode == "streaming":
+            raise ValueError(
+                f"decode_method={decode_method!r} is offline-only: its strategy "
+                "consumes both encoder hidden states and log-probs, which the "
+                "streaming chunk forward does not produce (final-only streaming "
+                "rescoring is a planned follow-up). Use service_mode='offline'."
+            )
+        if strategy_cls.incremental and config.service_mode == "streaming":
+            raise ValueError(
+                f"decode_method={decode_method!r} is offline-only: label-"
+                "synchronous AR decoding (AED/LLM) is not genuinely streamable. "
+                "Use service_mode='offline'."
+            )
+        if config.enable_sequence_packing and consumes in ("hidden", "both"):
+            logger.warning(
+                "enable_sequence_packing is ignored for decode_method=%r: the "
+                "%s offline path runs the plain padded encode "
+                "(packed hidden is a planned multi-paradigm follow-up)",
+                decode_method,
+                "hidden-states" if consumes == "hidden" else "hidden+log-probs",
+            )
+        self._model_runner = ModelRunner(
+            model, config, cache_config, graph_pool=self._graph_pool, consumes=consumes
+        )
 
         # Source the streaming geometry from the model's encoder + the streaming
         # backend so the executor / input processor window the feature buffer per
@@ -128,10 +198,19 @@ class ASREngine:
         # defaults (4 / 6 / 67 / 64) — zero behaviour change.
         config._subsampling_rate_override = model.encoder.subsampling_rate
         config._right_context_override = model.encoder.right_context
-        config._decoding_window_override = self._model_runner.decoding_window
-        config._stride_override = self._model_runner.stride
+        # A backend that allocates no streaming state reports ``0`` for both (the
+        # offline-only ``none`` backend, and any engine pinned to offline mode, which
+        # now selects it — see ``ModelRunner``).  Leave the config's own values in
+        # place rather than stamping zeros onto an engine nobody will stream through:
+        # the geometry is still introspectable, and an accidental reader gets a
+        # plausible window instead of a division by zero.
+        if self._model_runner.decoding_window > 0:
+            config._decoding_window_override = self._model_runner.decoding_window
+            config._stride_override = self._model_runner.stride
 
-        self._output_processor = OutputProcessor(config, decode_type=model.decode_type, model=model)
+        self._output_processor = OutputProcessor(
+            config, decode_type=decode_method, model=model, tokenizer=tokenizer
+        )
 
         # Build exactly one executor matching ``config.service_mode``.
         # The other mode's machinery (paged KV cache vs. persistent
@@ -178,10 +257,16 @@ class ASREngine:
         # Warm up the cute FMHA compile cache so the first request
         # doesn't pay JIT-compile latency. Skipped on CPU and on archs
         # where the cute backend isn't available (warmup_fmha is a no-op
-        # in those cases).  Conformer-specific (reads ``encoder.encoders``);
-        # encoders without that stacked-layer layout (e.g. Zipformer, which
-        # uses torch matmul attention) skip it.
-        if self._device.type == "cuda" and hasattr(model.encoder, "encoders"):
+        # in those cases).  Conformer-specific: requires the stacked-layer
+        # layout AND the paged-FMHA attention interface (``self_attn.h_kv``);
+        # encoders with their own attention (Zipformer's torch matmul, the
+        # Paraformer SANM blocks) skip it.
+        if (
+            self._device.type == "cuda"
+            and hasattr(model.encoder, "encoders")
+            and len(getattr(model.encoder, "encoders", [])) > 0
+            and hasattr(getattr(model.encoder.encoders[0], "self_attn", None), "h_kv")
+        ):
             from oasr.jit.attention import warmup_fmha
 
             try:
@@ -233,9 +318,88 @@ class ASREngine:
             )
             self._prep_thread.start()
 
+        # Long-form fan-out (C5's real fix).  Only meaningful for a *fixed-window*
+        # frontend: without one, a long request already decodes end to end and
+        # segmenting it would only cost accuracy.
+        self._longform: Optional[LongFormTracker] = None
+        self._longform_window_samples = 0
+        self._longform_overlap_samples = 0
+        window_s = config.feature_config.fixed_window_seconds
+        if getattr(config, "long_form", False):
+            if window_s is None:
+                logger.warning(
+                    "long_form=True but the %r frontend has no fixed window; "
+                    "long audio already decodes whole, so segmentation is off",
+                    config.feature_config.feature_type,
+                )
+            else:
+                sr = int(config.feature_config.sample_rate)
+                self._longform = LongFormTracker()
+                self._longform_window_samples = int(sr * window_s)
+                self._longform_overlap_samples = int(
+                    sr * min(float(config.long_form_overlap_seconds), window_s / 2.0)
+                )
+                logger.info(
+                    "long-form decoding enabled: %.0fs windows, %.2fs overlap",
+                    window_s,
+                    self._longform_overlap_samples / sr,
+                )
+
     # ------------------------------------------------------------------
     # Request management
     # ------------------------------------------------------------------
+
+    def _maybe_fan_out_longform(
+        self,
+        audio,
+        request_id: Optional[str],
+        sample_rate: int,
+        priority: int,
+        decoding,
+    ) -> Optional[str]:
+        """Split over-window audio into per-window child requests.
+
+        Returns the parent request id when the audio was fanned out, or ``None``
+        when it fits one window and should be admitted normally.  The caller sees
+        one id either way; :meth:`step` merges the children back.
+        """
+        from .longform import split_windows
+
+        wave = torch.as_tensor(audio, dtype=torch.float32, device="cpu").reshape(-1)
+        if int(wave.numel()) <= self._longform_window_samples:
+            return None
+
+        windows = split_windows(wave, self._longform_window_samples, self._longform_overlap_samples)
+        parent_id = request_id or uuid.uuid4().hex
+        stride = self._longform_window_samples - self._longform_overlap_samples
+        child_ids: List[str] = []
+        starts: List[float] = []
+        for i, _w in enumerate(windows):
+            child_ids.append(self._longform.child_id(parent_id, i))
+            starts.append((i * stride) / float(sample_rate))
+        self._longform.register(parent_id, child_ids, starts)
+        logger.debug(
+            "long-form request %s: %.1fs -> %d windows",
+            parent_id,
+            wave.numel() / float(sample_rate),
+            len(windows),
+        )
+        # Bulk admission so the windows land in one batch — they are independent,
+        # which is exactly what makes the batched path applicable here.
+        self.add_requests_batch(
+            [
+                {
+                    "audio": w,
+                    "request_id": cid,
+                    "sample_rate": sample_rate,
+                    "streaming": False,
+                    "priority": priority,
+                    "decoding": decoding,
+                }
+                for cid, w in zip(child_ids, windows)
+            ]
+        )
+        return parent_id
 
     def add_request(
         self,
@@ -244,6 +408,7 @@ class ASREngine:
         sample_rate: int = 16000,
         streaming: bool = True,
         priority: int = 0,
+        decoding: Optional[Union[DecodingOptions, Dict]] = None,
     ) -> str:
         """Add a new request to the engine.
 
@@ -272,21 +437,35 @@ class ASREngine:
             path; ``False`` routes it through the batched offline path.
         priority : int, default ``0``
             Lower values are scheduled first within each waiting queue.
+        decoding : DecodingOptions or dict, optional
+            Per-request decoding options (n-best, generation cap, sampling,
+            prompt).  A plain dict is coerced — the PyO3 dispatcher passes
+            one.  ``None`` keeps every engine default.
 
         Returns
         -------
         str
             The assigned ``request_id``.
         """
+        if self._longform is not None and not streaming:
+            fanned = self._maybe_fan_out_longform(
+                audio, request_id, sample_rate, priority, decoding
+            )
+            if fanned is not None:
+                return fanned
         req = Request(
             audio,
             request_id=request_id,
             streaming=streaming,
             sample_rate=sample_rate,
             priority=priority,
+            decoding=DecodingOptions.coerce(decoding),
         )
         if self._overlap_admit:
             self._validate_mode(streaming)
+            # Raise on the caller's thread: a fixed-window violation surfaced
+            # from the prep thread would only be logged.
+            self._input_processor.check_audio_duration(req.audio)
             with self._admit_inflight_lock:
                 self._admit_inflight += 1
             self._prep_in.put(req)
@@ -308,44 +487,76 @@ class ASREngine:
         - ``sample_rate``: int, defaults to ``16000``.
         - ``streaming``: bool, defaults to ``True``.
         - ``priority``: int, defaults to ``0``.
+        - ``decoding``: optional :class:`DecodingOptions` or plain dict of
+          per-request decoding options.
 
         Holds ``self._lock`` for the whole batch — one acquire/release pair
         instead of N — and avoids N round-trips across the PyO3 boundary
         when the Rust dispatcher coalesces a tick's worth of admits.
         Returns the assigned request ids in the same order.
 
-        When ``overlap_admit`` is enabled (offline), the heavy per-request
-        ``prepare_offline`` is deferred to the prep thread and this returns as
-        soon as the (cheap) ``Request`` objects are built and queued.
+        Raises on the first invalid spec (after admitting the valid ones).
+        Callers that need per-spec outcomes — the serving dispatcher, where one
+        malformed request must not fail its batch-mates — should use
+        :meth:`add_requests_batch_checked` instead.
+        """
+        results = self.add_requests_batch_checked(specs)
+        for res in results:
+            err = res.get("error")
+            if err:
+                raise ValueError(err)
+        return [str(res["request_id"]) for res in results]
+
+    def add_requests_batch_checked(self, specs: List[Dict]) -> List[Dict]:
+        """:meth:`add_requests_batch` with per-spec outcomes instead of a raise.
+
+        Returns one dict per spec, in order: ``{"request_id": str}`` on success,
+        ``{"request_id": str, "error": str}`` when that spec was rejected. A
+        rejected spec is never admitted and never enters the scheduler; every
+        other spec in the batch is admitted normally.
+
+        This is the entry point the PyO3 dispatcher uses. Bulk admission
+        coalesces up to ``admit_threshold`` envelopes into one call, so a
+        batch-wide raise would turn one client's bad ``top_p`` into an error for
+        dozens of unrelated requests.
         """
         if self._overlap_admit:
             return self._admit_batch_overlapped(specs)
-        request_ids: List[str] = []
+        results: List[Dict] = []
         with self._lock:
             for spec in specs:
-                audio = spec.get("audio")
-                rid = spec.get("request_id")
-                sample_rate = int(spec.get("sample_rate", 16000))
-                streaming = bool(spec.get("streaming", True))
-                priority = int(spec.get("priority", 0))
-                req = Request(
-                    audio=audio,
-                    request_id=rid,
-                    streaming=streaming,
-                    sample_rate=sample_rate,
-                    priority=priority,
-                )
-                self._validate_mode(streaming)
-                self._executor.admit(req)
-                request_ids.append(req.request_id)
-        return request_ids
+                results.append(self._admit_one_checked(spec))
+        return results
+
+    def _admit_one_checked(self, spec: Dict) -> Dict:
+        """Build + admit one spec, converting any rejection into a result dict.
+
+        Caller holds ``self._lock``.  ``request_id`` is echoed even on failure so
+        the caller can attribute the error without guessing.
+        """
+        rid = spec.get("request_id")
+        try:
+            streaming = bool(spec.get("streaming", True))
+            req = Request(
+                audio=spec.get("audio"),
+                request_id=rid,
+                streaming=streaming,
+                sample_rate=int(spec.get("sample_rate", 16000)),
+                priority=int(spec.get("priority", 0)),
+                decoding=DecodingOptions.coerce(spec.get("decoding")),
+            )
+            self._validate_mode(streaming)
+            self._executor.admit(req)
+        except Exception as exc:
+            return {"request_id": rid or "", "error": f"{type(exc).__name__}: {exc}"}
+        return {"request_id": req.request_id}
 
     # ------------------------------------------------------------------
     # Admission-prep overlap (offline)
     # ------------------------------------------------------------------
 
-    def _admit_batch_overlapped(self, specs: List[Dict]) -> List[str]:
-        """Overlap fast-path for :meth:`add_requests_batch` (offline only).
+    def _admit_batch_overlapped(self, specs: List[Dict]) -> List[Dict]:
+        """Overlap fast-path for :meth:`add_requests_batch_checked` (offline only).
 
         Builds the (cheap) :class:`Request` objects on the caller's thread,
         returns their ids immediately, and hands the requests to the prep
@@ -354,25 +565,37 @@ class ASREngine:
         requests to the scheduler.  ``_admit_inflight`` is bumped before
         queueing so :attr:`num_waiting` reflects work the scheduler can't see
         yet (otherwise the dispatcher could idle-wait past pending admits).
+
+        Per-spec rejections are reported like the non-overlap path: an invalid
+        spec is never queued for prep.
         """
         reqs: List[Request] = []
-        request_ids: List[str] = []
+        results: List[Dict] = []
         for spec in specs:
-            req = Request(
-                audio=spec.get("audio"),
-                request_id=spec.get("request_id"),
-                streaming=bool(spec.get("streaming", True)),
-                sample_rate=int(spec.get("sample_rate", 16000)),
-                priority=int(spec.get("priority", 0)),
-            )
-            self._validate_mode(req.streaming)  # reads immutable executor.streaming
+            rid = spec.get("request_id")
+            try:
+                req = Request(
+                    audio=spec.get("audio"),
+                    request_id=rid,
+                    streaming=bool(spec.get("streaming", True)),
+                    sample_rate=int(spec.get("sample_rate", 16000)),
+                    priority=int(spec.get("priority", 0)),
+                    decoding=DecodingOptions.coerce(spec.get("decoding")),
+                )
+                self._validate_mode(req.streaming)  # reads immutable executor.streaming
+                # Raise here, not on the prep thread, where it would only be logged.
+                self._input_processor.check_audio_duration(req.audio)
+            except Exception as exc:
+                results.append({"request_id": rid or "", "error": f"{type(exc).__name__}: {exc}"})
+                continue
             reqs.append(req)
-            request_ids.append(req.request_id)
-        with self._admit_inflight_lock:
-            self._admit_inflight += len(reqs)
-        for req in reqs:
-            self._prep_in.put(req)
-        return request_ids
+            results.append({"request_id": req.request_id})
+        if reqs:
+            with self._admit_inflight_lock:
+                self._admit_inflight += len(reqs)
+            for req in reqs:
+                self._prep_in.put(req)
+        return results
 
     def _prep_loop(self) -> None:
         """Daemon: prepare queued offline requests off the step thread.
@@ -416,13 +639,28 @@ class ASREngine:
             return self._admit_inflight
 
     def shutdown(self) -> None:
-        """Stop the admission-prep thread (best-effort).  Safe to call twice;
-        a no-op when overlap admission is disabled."""
+        """Release engine-held resources (best-effort, idempotent).
+
+        Stops the admission-prep thread, drains the executor, and releases the
+        input processor's staging buffers: incremental AR strategies park
+        requests with live decoder-KV buffers in the executor's pending pool,
+        and the staging buffers hold pinned host memory (a process-global
+        resource) — without an explicit release both only go away when the
+        garbage collector gets to them.
+        """
         t = self._prep_thread
         if t is not None and t.is_alive():
             self._prep_in.put(None)
             t.join(timeout=2.0)
         self._prep_thread = None
+        try:
+            self._executor.shutdown()
+        except Exception:  # pragma: no cover - defensive; shutdown must not raise
+            logger.exception("executor shutdown failed")
+        try:
+            self._input_processor.release_staging()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("staging release failed")
 
     def _prewarm_offline(self) -> None:
         """Run one dummy offline batch per preferred size to absorb one-time
@@ -444,8 +682,24 @@ class ASREngine:
                     )
                 )
             feats, lengths = self._input_processor.collate(reqs)
-            log_probs, out_len = self._model_runner.forward_offline(feats, lengths)
-            self._output_processor.decode_offline(log_probs, out_len)
+            # Mirror OfflineExecutor._run_stage's consumes routing so the
+            # prewarm exercises (and initialises) the same path production
+            # requests take.
+            strategy = self._output_processor.strategy
+            consumes = strategy.consumes
+            if consumes == "hidden":
+                enc_out, out_len = self._model_runner.encode_offline(feats, lengths)
+            elif consumes == "both":
+                hidden, out_len = self._model_runner.encode_offline(feats, lengths)
+                enc_out = EncodeOutput(
+                    hidden=hidden, log_probs=self._model_runner.apply_head(hidden)
+                )
+            else:
+                enc_out, out_len = self._model_runner.forward_offline(feats, lengths)
+            # Incremental strategies have no one-shot decode; the encoder
+            # forward above is the expensive warmup either way.
+            if not strategy.incremental:
+                self._output_processor.decode_offline(enc_out, out_len)
         torch.cuda.synchronize()
 
     def add_streaming_request(
@@ -453,6 +707,7 @@ class ASREngine:
         request_id: Optional[str] = None,
         sample_rate: int = 16000,
         priority: int = 0,
+        decoding: Optional[Union[DecodingOptions, Dict]] = None,
     ) -> str:
         """Open a chunk-by-chunk streaming request.
 
@@ -470,6 +725,8 @@ class ASREngine:
             Sample rate of the audio that will be fed via :meth:`feed_chunk`.
         priority : int, default ``0``
             Lower values are scheduled first within the streaming queue.
+        decoding : DecodingOptions or dict, optional
+            Per-request decoding options; see :meth:`add_request`.
 
         Returns
         -------
@@ -482,6 +739,7 @@ class ASREngine:
             streaming=True,
             sample_rate=sample_rate,
             priority=priority,
+            decoding=DecodingOptions.coerce(decoding),
         )
         with self._lock:
             self._validate_mode(True)
@@ -521,9 +779,91 @@ class ASREngine:
             self._executor.feed_chunk(request_id, chunk, is_last=is_last)
 
     def abort_request(self, request_id: str) -> None:
-        """Remove a request from the engine, freeing cache if allocated."""
+        """Remove a request from the engine, freeing cache if allocated.
+
+        A long-form parent id is not known to the executor — the windows are —
+        so aborting one has to abort every window it fanned out to, or the
+        cancelled file keeps decoding and its outputs pile up in the tracker.
+        """
         with self._lock:
+            if self._longform is not None:
+                children = self._longform.abandon(request_id)
+                if children:
+                    for cid in children:
+                        self._executor.abort(cid)
+                    return
             self._executor.abort(request_id)
+
+    # ------------------------------------------------------------------
+    # Internal — checkpoint-derived specs (features + tokenizer)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_checkpoint_specs(config: EngineConfig, loaded: PretrainedModel):
+        """Fill engine defaults from the converter-emitted checkpoint specs.
+
+        Explicit ``EngineConfig`` values always win, but a spec-vs-override
+        mismatch logs loudly.  Returns the :class:`oasr.tokenizers.Tokenizer`
+        to inject into the :class:`OutputProcessor` (``None`` → legacy sniffed
+        ``sentencepiece_model`` / ``unit_table`` paths).
+        """
+        spec = loaded.feature_spec
+        if spec is not None:
+            if getattr(config, "_feature_config_explicit", False):
+                diffs = spec.mismatches(config.feature_config)
+                if diffs:
+                    logger.warning(
+                        "Explicit feature_config disagrees with the checkpoint's "
+                        "FeatureSpec (%s); the explicit config wins, but this "
+                        "usually degrades accuracy",
+                        "; ".join(diffs),
+                    )
+            else:
+                config.feature_config = spec.to_feature_config()
+            # The waveform scale the checkpoint was trained on travels with
+            # the spec too (Kaldi frontends: 32768.0 int16 scale; Whisper:
+            # 1.0).  An explicit non-default engine value wins with a warning.
+            if getattr(config, "_audio_scale_explicit", False):
+                if float(config.audio_scale) != float(spec.audio_scale):
+                    logger.warning(
+                        "Explicit audio_scale %.1f differs from the checkpoint's "
+                        "FeatureSpec (%.1f); the explicit value wins, but this "
+                        "usually breaks recognition",
+                        config.audio_scale,
+                        spec.audio_scale,
+                    )
+            else:
+                config.audio_scale = float(spec.audio_scale)
+
+        tok_spec = loaded.tokenizer_spec
+        if tok_spec is None:
+            return None
+        if getattr(config, "_tokenizer_paths_explicit", False):
+            spec_table = tok_spec.files.get("table")
+            if (
+                config.unit_table is not None
+                and spec_table is not None
+                and Path(config.unit_table).resolve() != Path(spec_table).resolve()
+            ):
+                logger.warning(
+                    "Explicit unit_table %s differs from the checkpoint's tokenizer "
+                    "spec (%s); the explicit table wins",
+                    config.unit_table,
+                    spec_table,
+                )
+            return None
+        try:
+            from oasr.tokenizers import build_tokenizer
+
+            return build_tokenizer(tok_spec)
+        except Exception as exc:
+            logger.warning(
+                "Could not build tokenizer from checkpoint spec %r (%s); falling "
+                "back to the legacy sniffed detokenizer paths",
+                tok_spec.kind,
+                exc,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Internal — executor construction and mode validation
@@ -552,6 +892,16 @@ class ASREngine:
             output_processor=self._output_processor,
             device=self._device,
             enable_packing=config.enable_sequence_packing,
+            decode_steps_per_tick=config.decode_steps_per_tick,
+            max_decode_slots=(
+                config.max_decode_slots
+                if config.max_decode_slots is not None
+                else config.max_batch_size
+            ),
+            decode_kv_budget_gib=config.decode_kv_budget_gib,
+            max_tick_ms=config.max_tick_ms,
+            decode_admit_window_ms=config.decode_admit_window_ms,
+            max_batch_size=config.max_batch_size,
         )
 
     def _validate_mode(self, streaming: bool) -> None:
@@ -586,6 +936,9 @@ class ASREngine:
             nvtx_push("engine.step")
             outputs = self._executor.step()
             nvtx_pop()
+            if self._longform is not None and self._longform:
+                # Replace per-window child outputs with one stitched parent.
+                outputs = self._longform.absorb(outputs)
             return outputs
 
     def run(self) -> List[RequestOutput]:
@@ -683,6 +1036,32 @@ class ASREngine:
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
+
+    @property
+    def service_mode(self) -> str:
+        """The mode this engine was built for — ``"streaming"`` or ``"offline"``.
+
+        The engine is the authority: several decode families are offline-only
+        (AED / LLM / Paraformer / rescoring) and are rejected at construction in
+        streaming mode, so a front-end that assumed the other mode would reject
+        requests this engine could serve — or accept ones it cannot.
+        """
+        return self._config.service_mode
+
+    @property
+    def decode_method(self) -> str:
+        """The resolved decode family actually running (never ``None``).
+
+        ``EngineConfig.decode_method`` if the caller pinned one, else the
+        model's ``default_decode_type``.  Distinct from
+        ``EngineConfig.decoder_type``, which only selects the CTC *kernel*.
+        """
+        return self._decode_method
+
+    @property
+    def capabilities(self) -> List[str]:
+        """Decode families this checkpoint could serve, sorted."""
+        return sorted(self._model.capabilities)
 
     @property
     def num_running(self) -> int:

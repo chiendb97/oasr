@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..base import BaseAsrModel, BaseEncoder
+from ..base import BaseAsrModel, BaseEncoder, LoadReport
 from ..heads.ctc import CTCHead
 from .config import ZipformerEncoderConfig, ZipformerModelConfig
 from .encoder import Zipformer2, _to_tuple
@@ -111,6 +111,46 @@ class ZipformerEncoder(BaseEncoder):
         out = out.permute(1, 0, 2)  # (B, T'', Cmax)
         return out, out_lens, [new_embed] + new_enc
 
+    # -- batched-state streaming (stateful backend batching) ----------------
+    #
+    # State layout (``get_streaming_init_states``): ``states[0]`` is the
+    # embed ConvNeXt cache ``(B, C, pad, freq)`` — batch dim 0 — followed by
+    # six tensors per layer: ``cached_key (L, B, K)``,
+    # ``cached_nonlin_attn (1, B, L, H)``, ``cached_val1/2 (L, B, V)``
+    # (batch dim 1) and ``cached_conv1/2 (B, C, P)`` (batch dim 0).  Same
+    # per-kind dims as icefall's ``streaming_decode.py`` stack/unstack.
+    _STATE_BATCH_DIM_CYCLE = (1, 1, 1, 1, 0, 0)
+
+    def _state_batch_dim(self, i: int) -> int:
+        return 0 if i == 0 else self._STATE_BATCH_DIM_CYCLE[(i - 1) % 6]
+
+    def stack_streaming_states(self, states_list: List[List[Tensor]]) -> List[Tensor]:
+        """Stack per-stream state lists into one batched state list.
+
+        Enables the stateful streaming backend to run one ``B = N`` chunk
+        forward over N streams instead of N sequential ``B = 1`` forwards.
+        """
+        n = len(states_list[0])
+        return [
+            torch.cat([s[i] for s in states_list], dim=self._state_batch_dim(i)) for i in range(n)
+        ]
+
+    def unstack_streaming_states(self, states: List[Tensor]) -> List[List[Tensor]]:
+        """Split a batched state list back into per-stream state lists.
+
+        Returns views into the batched tensors (no copy); each stream's next
+        chunk re-stacks them, so the shared storage is transient.
+        """
+        outs: List[List[Tensor]] = []
+        for i, t in enumerate(states):
+            dim = self._state_batch_dim(i)
+            rows = t.split(1, dim=dim)
+            if not outs:
+                outs = [[] for _ in range(len(rows))]
+            for b, row in enumerate(rows):
+                outs[b].append(row)
+        return outs
+
     # -- introspection (feeds CacheSpec) -----------------------------------
     @property
     def num_encoder_layers(self) -> int:
@@ -164,6 +204,18 @@ class ZipformerEncoder(BaseEncoder):
 class ZipformerModel(BaseAsrModel):
     """Zipformer + CTC head (icefall ``egs/librispeech/ASR/zipformer``, ``--use-ctc 1``)."""
 
+    @property
+    def default_decode_type(self) -> str:
+        return "ctc"
+
+    @property
+    def capabilities(self) -> frozenset:
+        """Declared, not derived: the conformance test in
+        ``tests/test_model_contract.py`` checks every registered architecture's
+        advertised capabilities against ``oasr.models.interfaces.CAPABILITIES``,
+        and can only do that without building the model when it is a constant."""
+        return frozenset({"ctc"})
+
     def __init__(self, config: ZipformerModelConfig):
         super().__init__()
         self.config = config
@@ -203,16 +255,20 @@ class ZipformerModel(BaseAsrModel):
         return self.ctc(hidden), out_lens, new_states
 
     # -- weight loading -----------------------------------------------------
-    def load_weights(self, state_dict: Mapping[str, Tensor], *, strict: bool = False) -> None:
+    def load_weights(self, state_dict: Mapping[str, Tensor], *, strict: bool = False) -> LoadReport:
         """Map an icefall ``AsrModel`` state-dict into this model.
 
         icefall keys ``encoder_embed.*`` / ``encoder.*`` / ``ctc_output.1.*`` map
         to ``encoder.encoder_embed.*`` / ``encoder.encoder.*`` / ``ctc.ctc_lo.*``.
-        Transducer / attention-decoder parameters (if present) are ignored.  The
-        CTC weight/bias is zero-padded up to this model's (8-aligned) vocab when
-        the checkpoint's vocab is smaller (the GEMM kernels require N % 8 == 0).
+        The CTC weight/bias is zero-padded up to this model's (8-aligned) vocab
+        when the checkpoint's vocab is smaller (the GEMM kernels require
+        N % 8 == 0).  Non-consumed checkpoint keys (transducer predictor/joiner,
+        attention decoder, pruned-RNNT ``simple_*_proj``) land in
+        ``LoadReport.dropped`` — the registry decides which of those are
+        expected vs. a named capability loss.
         """
         remapped = {}
+        dropped = []
         for k, v in state_dict.items():
             if k.startswith("encoder_embed."):
                 remapped["encoder.encoder_embed." + k[len("encoder_embed.") :]] = v
@@ -220,7 +276,8 @@ class ZipformerModel(BaseAsrModel):
                 remapped["encoder.encoder." + k[len("encoder.") :]] = v
             elif k.startswith("ctc_output.1."):
                 remapped["ctc.ctc_lo." + k[len("ctc_output.1.") :]] = v
-            # else: decoder / joiner / simple_*_proj / attention_decoder -> ignored
+            else:
+                dropped.append(k)
 
         if "ctc.ctc_lo.weight" in remapped:
             target_vocab = self.ctc.ctc_lo.weight.shape[0]
@@ -236,3 +293,4 @@ class ZipformerModel(BaseAsrModel):
             logger.warning("Missing keys when loading Zipformer weights: %s", missing)
         if unexpected:
             logger.warning("Unexpected keys when loading Zipformer weights: %s", unexpected)
+        return LoadReport.build(remapped, missing, unexpected, dropped)

@@ -19,16 +19,25 @@ decode + finalise tail is identical for both.
 
 from __future__ import annotations
 
-from typing import ClassVar, List, Optional, Tuple, Union
+import logging
+from typing import ClassVar, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
+from ..decode.base import EncodeOutput
 from ..request import Request, RequestOutput, RequestState
 from ..scheduler import Scheduler
 from .base import Executor
+
+logger = logging.getLogger(__name__)
+
+#: Consecutive ticks that may skip admission because the decode budget was spent.
+#: Bounds how long a saturated decode pool can defer new prefills; past this the
+#: next tick admits regardless, so admission cannot starve indefinitely.
+_MAX_SKIPPED_ADMITS = 8
 
 
 class OfflineExecutor(Executor):
@@ -57,6 +66,12 @@ class OfflineExecutor(Executor):
         output_processor,
         device: torch.device,
         enable_packing: bool = False,
+        decode_steps_per_tick: int = 32,
+        max_decode_slots: Optional[int] = None,
+        decode_kv_budget_gib: Optional[float] = None,
+        max_tick_ms: float = 0.0,
+        decode_admit_window_ms: float = 0.0,
+        max_batch_size: int = 32,
     ) -> None:
         self._scheduler = scheduler
         self._inp = input_processor
@@ -67,6 +82,32 @@ class OfflineExecutor(Executor):
         # partitioner reads the same flag off ``EngineConfig`` to emit packed
         # rows, so the two stay consistent for the engine's lifetime.
         self._enable_packing = bool(enable_packing)
+        # Incremental (label-synchronous AR) decode support: requests begun
+        # via ``strategy.begin_offline`` park here in state RUNNING and are
+        # driven by ``strategy.advance(StepBudget)`` — at most
+        # ``decode_steps_per_tick`` batched decoder steps **and** at most
+        # ``max_tick_ms`` of wall clock per engine tick, so one tick always does
+        # bounded work *in time* (the serving dispatcher's contract; a step count
+        # alone does not bound it, since step cost is model-dependent).
+        # ``max_decode_slots`` gates new-batch admission while the pending pool
+        # is full.  All three are inert for one-shot strategies.
+        self._decode_steps_per_tick = int(decode_steps_per_tick)
+        self._max_decode_slots = max_decode_slots
+        self._decode_kv_budget_gib = decode_kv_budget_gib
+        self._max_tick_ms = float(max_tick_ms)
+        # AR admission coalescing: hold a thin waiting queue briefly so
+        # near-simultaneous arrivals prefill as one decode batch (see
+        # :meth:`_batch_wide_enough`).  ``0`` disables.
+        self._decode_admit_window_ms = float(decode_admit_window_ms)
+        self._max_batch_size = int(max_batch_size)
+        self._pending: Dict[str, Request] = {}
+        # A tick that spent its whole budget advancing does not also prefill a new
+        # micro-batch — prefill is the largest single blob in a tick (audio tower
+        # + projector + an LM forward over the whole prompt), and stacking it on
+        # top of a full decode budget defeats the point of bounding the tick.
+        # Counted so admission can never starve: after ``_MAX_SKIPPED_ADMITS``
+        # consecutive skips the next tick admits regardless.
+        self._skipped_admits = 0
 
     # ------------------------------------------------------------------
     # Executor ABC
@@ -89,31 +130,179 @@ class OfflineExecutor(Executor):
         )
 
     def abort(self, request_id: str) -> None:
-        """Drop a request from the offline waiting queue.
+        """Drop a request — from the waiting queue, or (for incremental
+        strategies) from the in-flight pending pool, releasing its decoder
+        state via ``free_session``.
 
-        Offline requests don't allocate a per-stream cache, so there is
-        nothing to free beyond the scheduler entry itself.
+        One-shot offline requests don't allocate a per-stream cache, so there
+        is nothing to free beyond the scheduler entry itself.
         """
+        req = self._pending.pop(request_id, None)
+        if req is not None:
+            self._op.strategy.free_session(req)
+            req.state = RequestState.FINISHED
+            return
         self._scheduler.abort_request(request_id)
 
+    def shutdown(self) -> None:
+        """Release in-flight incremental decode state.
+
+        Requests parked by an ``incremental`` strategy hold decoder-KV buffers
+        (dense, capacity-preallocated for the speech-LLM path), so dropping the
+        pool without telling the strategy leaks them until the next GC pass.
+        One-shot strategies never park and this is a no-op for them.
+        """
+        strategy = self._op.strategy
+        for req in list(self._pending.values()):
+            try:
+                strategy.free_session(req)
+            except Exception:  # pragma: no cover - defensive
+                pass
+            req.state = RequestState.FINISHED
+        self._pending.clear()
+
     def step(self) -> List[RequestOutput]:
-        """One engine tick: pull a batch from the scheduler and run it to
-        completion (split → fbank → forward → decode → finalise)."""
-        batch = self._scheduler.schedule_offline()
-        return self.run(batch)
+        """One engine tick, always bounded work.
+
+        One-shot strategies (CTC / WFST / transducer / rescoring): pull a
+        batch and run it to completion — unchanged.  Incremental strategies
+        (AED / LLM): first advance every pending request within the tick budget
+        (``decode_steps_per_tick`` steps *and* ``max_tick_ms`` of wall clock),
+        then — if the budget wasn't spent and decode slots remain — admit +
+        encode + prefill one new batch.
+        """
+        outputs: List[RequestOutput] = []
+        strategy = self._op.strategy
+        budget_spent = False
+        if strategy.incremental and strategy.has_pending():
+            outputs, budget_spent = self._advance_pending()
+        if self._may_admit(budget_spent) and self._batch_wide_enough() and self._admission_open():
+            # Cap the batch at the decode slots actually free.  ``_admission_open``
+            # only answers "is there *a* slot"; without this limit a tick with one
+            # free slot would still pull a full ``max_batch_size`` batch and
+            # prefill all of it, overshooting ``max_decode_slots`` by up to
+            # ``max_batch_size - 1`` requests' worth of decoder KV — an OOM path,
+            # not a slowdown, since prefill preallocates per row.
+            batch = self._scheduler.schedule_offline(limit=self._admission_limit())
+            outputs.extend(self.run(batch))
+        return outputs
+
+    def _reject(self, request: Request, reason: str) -> RequestOutput:
+        """Terminal output for a request the executor could not start.
+
+        Marked ``finished`` with ``finish_reason="error"`` so the caller sees a
+        result instead of waiting on a request that will never run; the serving
+        layer maps the empty transcript + reason onto its error envelope.
+        """
+        request.state = RequestState.FINISHED
+        out = RequestOutput(
+            request_id=request.request_id,
+            text="",
+            tokens=[[]],
+            finished=True,
+            finish_reason="error",
+        )
+        request.output = out
+        logger.debug("rejected request %s: %s", request.request_id, reason)
+        return out
+
+    def _admission_limit(self) -> Optional[int]:
+        """Decode slots free right now; ``None`` for one-shot strategies.
+
+        One-shot families finalise within the tick that admits them, so they hold
+        no slots and are bounded by ``max_batch_size`` alone.
+        """
+        strategy = self._op.strategy
+        if not strategy.incremental:
+            return None
+        limits = []
+        if self._max_decode_slots is not None:
+            limits.append(max(0, int(self._max_decode_slots) - len(self._pending)))
+        rows_by_bytes = self._rows_within_kv_budget(strategy)
+        if rows_by_bytes is not None:
+            limits.append(rows_by_bytes)
+        return min(limits) if limits else None
+
+    def _rows_within_kv_budget(self, strategy) -> Optional[int]:
+        """Rows still affordable under ``decode_kv_budget_gib``, or ``None``.
+
+        Budgeting by request count does not bound decoder-KV memory: the
+        footprint of a row is its position budget times the model's per-token
+        rate, and prefill preallocates all of it up front.  Returns ``None``
+        when either the budget or the model's per-row footprint is unknown, so
+        an unmeasurable model keeps today's slot-only behaviour rather than
+        being throttled by a guess.
+        """
+        budget_gib = self._decode_kv_budget_gib
+        if not budget_gib:
+            return None
+        per_row = strategy.kv_bytes_per_row()
+        if not per_row:
+            return None
+        total = int(budget_gib * (1024**3))
+        in_flight = len(self._pending) * per_row
+        return max(0, (total - in_flight) // per_row)
+
+    def _batch_wide_enough(self) -> bool:
+        """Whether the waiting queue should be prefilled now, or held to widen.
+
+        Only for incremental strategies, and only when
+        ``EngineConfig.decode_admit_window_ms`` is set.  An AR decoder step is
+        weight-read bound, so two decode groups cost roughly twice one group of
+        the same total rows — total forwards is the sum over groups of each
+        group's step count.  Groups cannot be merged afterwards (both decoder
+        surfaces keep a shared scalar generation offset), so the only lever is to
+        let near-simultaneous arrivals accumulate into **one** batch first.
+
+        Holds until either the queue reaches ``max_batch_size`` or the oldest
+        waiting request has waited out the window.
+        """
+        window_ms = self._decode_admit_window_ms
+        if window_ms <= 0 or not self._op.strategy.incremental:
+            return True
+        n_waiting = self._scheduler.num_waiting_offline
+        if n_waiting == 0:
+            return True  # nothing to hold
+        if n_waiting >= self._max_batch_size:
+            return True  # as wide as the engine will ever forward
+        oldest = self._scheduler.oldest_offline_wait()
+        return oldest is None or (oldest * 1000.0) >= window_ms
+
+    def _may_admit(self, budget_spent: bool) -> bool:
+        """Whether this tick should also prefill a new batch.
+
+        Prefill is unbudgeted and the largest single blob in a tick, so a tick
+        that already spent its decode budget skips it — otherwise the tick bound
+        is ``budget + prefill`` and the deadline buys nothing.  Bounded skipping:
+        after ``_MAX_SKIPPED_ADMITS`` consecutive skips a batch is admitted
+        regardless, so a steady stream of long generations cannot starve
+        admission indefinitely.
+        """
+        if not budget_spent:
+            self._skipped_admits = 0
+            return True
+        if self._skipped_admits >= _MAX_SKIPPED_ADMITS:
+            self._skipped_admits = 0
+            return True
+        self._skipped_admits += 1
+        return False
 
     def has_pending(self) -> bool:
-        return self._scheduler.num_waiting_offline > 0
+        return self._scheduler.num_waiting_offline > 0 or bool(self._pending)
 
     def num_running(self) -> int:
-        """Offline requests admit-and-finalise within a single ``step()``;
-        they never park in a running pool, so this is always ``0``."""
-        return 0
+        """One-shot offline requests admit-and-finalise within a single
+        ``step()`` and never park; incremental requests park in the pending
+        pool until their strategy finishes them."""
+        return len(self._pending)
 
     def num_waiting(self) -> int:
         return self._scheduler.num_waiting_offline
 
     def find_request(self, request_id: str) -> Optional[Request]:
+        req = self._pending.get(request_id)
+        if req is not None:
+            return req
         return self._scheduler.find_request(request_id)
 
     # ------------------------------------------------------------------
@@ -125,6 +314,9 @@ class OfflineExecutor(Executor):
 
         The scheduler partitions ``batch`` into micro-batches (and length-sorts
         them); this restores the original arrival order before returning.
+        For incremental strategies this encodes + prefills only — the batch
+        parks in the pending pool and outputs arrive from later ``step()``
+        ticks, so the return is empty.
         """
         if not batch:
             return []
@@ -141,12 +333,55 @@ class OfflineExecutor(Executor):
             nvtx_pop()  # offline.micro_batch
 
         # Restore original arrival order (the length sort changed positions).
-        if orig_indices is None:
+        # Incremental prefill produces no outputs — nothing to restore.
+        if orig_indices is None or not outputs:
             return outputs
         restored: List[Optional[RequestOutput]] = [None] * len(outputs)
         for pos, orig in enumerate(orig_indices):
             restored[orig] = outputs[pos]
         return [r for r in restored if r is not None]
+
+    # ------------------------------------------------------------------
+    # Incremental decode (label-synchronous AR strategies)
+    # ------------------------------------------------------------------
+
+    def _admission_open(self) -> bool:
+        """Whether this tick may admit a new offline batch.
+
+        Always true for one-shot strategies.  For incremental strategies the
+        pending pool gates admission: a full pool means the tick spends its
+        budget advancing in-flight requests instead of prefilling new ones.
+        """
+        if not self._op.strategy.incremental:
+            return True
+        if self._max_decode_slots is None:
+            return not self._pending
+        return len(self._pending) < int(self._max_decode_slots)
+
+    def _advance_pending(self) -> Tuple[List[RequestOutput], bool]:
+        """Run one budgeted ``strategy.advance`` pass and finalise what it finished.
+
+        Returns ``(outputs, budget_spent)``; ``budget_spent`` tells :meth:`step`
+        whether this tick still has room to prefill a new batch.
+        """
+        from ..generation import StepBudget
+
+        budget = StepBudget.for_tick(self._decode_steps_per_tick, self._max_tick_ms)
+        outputs = self._op.strategy.advance(budget)
+        for out in outputs:
+            if not out.finished:
+                continue
+            req = self._pending.pop(out.request_id, None)
+            if req is not None:
+                # Same finalisation the one-shot path does.  ``fill_nbest_texts``
+                # was missing here: it only mattered once an AR family could emit
+                # more than one hypothesis, which beam search is exactly when —
+                # before that every incremental final carried a single row and the
+                # call would have been a no-op.
+                self._op.fill_nbest_texts(req, out)
+                req.output = out
+                req.state = RequestState.FINISHED
+        return outputs, budget.exhausted()
 
     # ------------------------------------------------------------------
     # Stage helpers
@@ -176,16 +411,54 @@ class OfflineExecutor(Executor):
         and finalisation are identical for both.
         """
         nvtx_push("offline.forward")
-        if self._op.strategy.consumes == "hidden":
+        consumes = self._op.strategy.consumes
+        if consumes == "hidden":
             # Autoregressive families (transducer/AED/LLM) consume raw encoder
             # hidden states and own their decoder; CTC consumes the fused-head
             # log-probs (the CUDA-graph fast path).
             enc_out, output_lengths = self._mr.encode_offline(features, lengths)
+        elif consumes == "both":
+            # CTC+AED rescoring: one encoder pass, then the head applied on the
+            # side — the strategy needs the CTC log-probs (n-best) *and* the
+            # hidden states (decoder cross-attention memory).
+            hidden, output_lengths = self._mr.encode_offline(features, lengths)
+            enc_out = EncodeOutput(hidden=hidden, log_probs=self._mr.apply_head(hidden))
         elif self._enable_packing:
             enc_out, output_lengths = self._mr.forward_offline_packed(features, lengths)
         else:
             enc_out, output_lengths = self._mr.forward_offline(features, lengths)
         nvtx_pop()
+
+        strategy = self._op.strategy
+        if strategy.incremental:
+            # Label-synchronous AR (AED/LLM): prefill only.  The requests park
+            # in the pending pool in state RUNNING; ``step()`` drives them via
+            # budgeted ``advance`` calls until the strategy finishes each one.
+            nvtx_push("offline.prefill")
+            try:
+                strategy.begin_offline(chunk, enc_out, output_lengths)
+            except torch.cuda.OutOfMemoryError as exc:
+                # Prefill preallocates this micro-batch's decoder KV, so it is
+                # where an over-committed pool actually fails.  Reject *this
+                # batch* with an attributable error rather than letting the
+                # exception escape ``step()`` — the serving dispatcher turns a
+                # failed step into an INTERNAL error for every in-flight
+                # request, so one over-large batch would take down its peers.
+                nvtx_pop()
+                logger.warning(
+                    "decoder-KV prefill ran out of memory for %d request(s); "
+                    "rejecting the batch (lower max_decode_slots / "
+                    "max_new_tokens, or raise the memory budget): %s",
+                    len(chunk),
+                    exc,
+                )
+                return [self._reject(req, "prefill out of memory") for req in chunk]
+            for req in chunk:
+                req.state = RequestState.RUNNING
+                self._pending[req.request_id] = req
+            nvtx_pop()
+            return []
+
         nvtx_push("offline.decode")
         outputs = self._op.decode_offline(enc_out, output_lengths)
         nvtx_pop()
@@ -193,6 +466,7 @@ class OfflineExecutor(Executor):
         for req, out in zip(chunk, outputs):
             out.request_id = req.request_id
             out.finished = True
+            self._op.fill_nbest_texts(req, out)
             req.output = out
             req.state = RequestState.FINISHED
         return outputs

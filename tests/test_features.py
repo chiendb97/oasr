@@ -13,7 +13,6 @@ from typing import List
 import pytest
 import torch
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -28,9 +27,7 @@ def _have_torchaudio() -> bool:
         return False
 
 
-requires_torchaudio = pytest.mark.skipif(
-    not _have_torchaudio(), reason="torchaudio not installed"
-)
+requires_torchaudio = pytest.mark.skipif(not _have_torchaudio(), reason="torchaudio not installed")
 
 
 def _generate_waveform(
@@ -191,7 +188,9 @@ class TestBatchedFbank:
         assert feats.size(0) == B
         assert feats.size(2) == 80
         assert feat_lens.shape == (B,)
-        assert (feat_lens == feat_lens[0]).all(), "Uniform-length batch should have equal frame counts"
+        assert (
+            feat_lens == feat_lens[0]
+        ).all(), "Uniform-length batch should have equal frame counts"
 
         single = _ref_fbank_1d(wavs[0], dither=0.0)
         torch.testing.assert_close(feats[0, : feat_lens[0]], single, rtol=0.0, atol=0.0)
@@ -406,12 +405,14 @@ class TestBatchedStreaming:
             if fl is not None:
                 ref_parts.append(fl)
 
-            batched_cat = torch.cat(batched_parts[i], dim=0) if batched_parts[i] else torch.empty(0, 80)
+            batched_cat = (
+                torch.cat(batched_parts[i], dim=0) if batched_parts[i] else torch.empty(0, 80)
+            )
             ref_cat = torch.cat(ref_parts, dim=0) if ref_parts else torch.empty(0, 80)
 
-            assert batched_cat.shape == ref_cat.shape, (
-                f"Stream {i}: shape mismatch {batched_cat.shape} vs {ref_cat.shape}"
-            )
+            assert (
+                batched_cat.shape == ref_cat.shape
+            ), f"Stream {i}: shape mismatch {batched_cat.shape} vs {ref_cat.shape}"
             torch.testing.assert_close(
                 batched_cat,
                 ref_cat,
@@ -431,9 +432,7 @@ class TestBatchedStreaming:
         feats, feat_lens = ext.process_chunk(wavs)
 
         assert feats.size(0) == B
-        assert feat_lens[0] < feat_lens[1], (
-            "Longer chunk should produce more frames"
-        )
+        assert feat_lens[0] < feat_lens[1], "Longer chunk should produce more frames"
 
     def test_padded_tensor_with_lengths(self, fbank_config):
         from oasr.features import BatchedStreamingFeatureExtractor
@@ -545,9 +544,9 @@ class TestBatchedStreaming:
         for i in range(B):
             stream_cat = torch.cat(stream_parts[i], dim=0)
             n_off = int(offline_lens[i].item())
-            assert stream_cat.size(0) >= n_off, (
-                f"Stream {i}: streaming {stream_cat.size(0)} < offline {n_off}"
-            )
+            assert (
+                stream_cat.size(0) >= n_off
+            ), f"Stream {i}: streaming {stream_cat.size(0)} < offline {n_off}"
             torch.testing.assert_close(
                 stream_cat[:n_off],
                 offline_feats[i, :n_off],
@@ -670,7 +669,10 @@ class TestGraphedFeatureExtraction:
                 )[:B_active]
 
                 torch.testing.assert_close(
-                    feats_graph, feats_eager, rtol=0, atol=0,
+                    feats_graph,
+                    feats_eager,
+                    rtol=0,
+                    atol=0,
                     msg=f"B_active={B_active} T={T}",
                 )
 
@@ -697,9 +699,9 @@ class TestGraphedFeatureExtraction:
             wave = torch.randn(B_active, T, dtype=torch.float32) * 500.0
             lengths = torch.full((B_active,), T, dtype=torch.int64)
             feats_graph = gfe.replay(B_active, wave, lengths)[:B_active].clone()
-            feats_eager = self._eager_feats(
-                wave, lengths, bucket, gfe.t_pad, cfg, torch.float32
-            )[:B_active]
+            feats_eager = self._eager_feats(wave, lengths, bucket, gfe.t_pad, cfg, torch.float32)[
+                :B_active
+            ]
             torch.testing.assert_close(feats_graph, feats_eager, rtol=0, atol=0)
 
     def test_pick_bucket_returns_smallest_fit(self):
@@ -759,3 +761,68 @@ class TestGraphedFeatureExtraction:
         wave = torch.zeros(2, oversize_T, dtype=torch.float32)
         lengths = torch.tensor([oversize_T, oversize_T], dtype=torch.int64)
         assert gfe.replay(2, wave, lengths) is None
+
+
+class TestStagingBuffers:
+    """M4/M5: staging must be reused per step but bounded across the process."""
+
+    def _proc(self, **overrides):
+        from types import SimpleNamespace
+
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.input_processor import InputProcessor
+
+        cfg = EngineConfig(ckpt_dir="x", device="cpu", **overrides)
+        return InputProcessor(cfg, torch.device("cpu"))
+
+    def test_offline_buffer_is_reused_between_calls(self):
+        p = self._proc()
+        a = p._flat_host(1024)
+        b = p._flat_host(1024)
+        assert a.data_ptr() == b.data_ptr()
+
+    def test_offline_buffer_grows_geometrically(self):
+        p = self._proc()
+        p._flat_host(1024)
+        first = p._wav_flat.numel()
+        p._flat_host(first + 1)
+        assert p._wav_flat.numel() >= 2 * first
+
+    def test_an_outlier_batch_is_not_retained(self):
+        """One huge request must not pin its peak for the process lifetime.
+
+        Geometric growth sized by the longest utterance ever seen never shrinks,
+        and pinned host memory is process-global.
+        """
+        p = self._proc()
+        p._max_staging_elems = 4096
+        p._flat_host(1024)
+        retained = p._wav_flat.numel()
+        big = p._flat_host(1_000_000)
+        assert big.numel() == 1_000_000
+        assert p._wav_flat.numel() == retained, "the outlier was retained"
+
+    def test_retained_buffer_never_exceeds_the_cap(self):
+        p = self._proc()
+        p._max_staging_elems = 4096
+        p._flat_host(4096)
+        assert p._wav_flat.numel() <= 4096
+
+    def test_streaming_staging_is_reused(self):
+        p = self._proc()
+        a = p._stream_host(4, 100)
+        b = p._stream_host(4, 100)
+        assert a.data_ptr() == b.data_ptr()
+        la = p._stream_lengths_host(4)
+        lb = p._stream_lengths_host(4)
+        assert la.data_ptr() == lb.data_ptr()
+
+    def test_release_drops_everything(self):
+        p = self._proc()
+        p._flat_host(64)
+        p._stream_host(2, 8)
+        p._stream_lengths_host(2)
+        p.release_staging()
+        assert p._wav_flat is None
+        assert p._stream_flat is None
+        assert p._stream_lens is None

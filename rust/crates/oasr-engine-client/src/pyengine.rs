@@ -9,7 +9,8 @@
 
 use bytes::Bytes;
 use numpy::{PyArray1, PyArrayMethods};
-use oasr_wire::{ErrorCode, Event, ModelInfo};
+use oasr_wire::{DecodingParams, ErrorCode, Event, ModelInfo};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use thiserror::Error;
@@ -26,11 +27,13 @@ pub enum AdmitSpec {
         audio: Bytes,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<DecodingParams>,
     },
     Streaming {
         rid: String,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<DecodingParams>,
     },
 }
 
@@ -87,6 +90,10 @@ impl PyEngine {
     /// `engine_worker._load_engine_config` did the same.
     pub fn new(engine_config_json: &str) -> Result<Self, PyEngineError> {
         Python::with_gil(|py| {
+            // Before anything else: the per-request option table must agree
+            // across the boundary, or options silently vanish (S9).
+            assert_decoding_option_keys_match(py)?;
+
             // Parse the JSON into a Python dict using `json.loads` so we keep
             // serde out of the GIL critical section.
             let json_mod = PyModule::import_bound(py, "json")?;
@@ -119,7 +126,7 @@ impl PyEngine {
             let engine_cls = engine_mod.getattr("ASREngine")?;
             let engine = engine_cls.call1((engine_cfg.clone(),))?;
 
-            let model_info = collect_model_info(py, &engine_cfg).unwrap_or_default();
+            let model_info = collect_model_info(py, &engine_cfg, &engine).unwrap_or_default();
 
             Ok(Self {
                 engine: engine.unbind(),
@@ -166,14 +173,16 @@ impl PyEngine {
         audio: &[u8],
         sample_rate: u32,
         priority: i32,
+        decoding: Option<&DecodingParams>,
     ) -> Result<(), PyEngineError> {
         Python::with_gil(|py| {
             let bound = self.engine.bind(py);
-            Self::add_offline_locked(py, &bound, rid, audio, sample_rate, priority)
+            Self::add_offline_locked(py, &bound, rid, audio, sample_rate, priority, decoding)
         })
     }
 
     /// GIL-already-held variant of [`add_offline`].
+    #[allow(clippy::too_many_arguments)]
     pub fn add_offline_locked<'py>(
         py: Python<'py>,
         bound: &Bound<'py, PyAny>,
@@ -181,6 +190,7 @@ impl PyEngine {
         audio: &[u8],
         sample_rate: u32,
         priority: i32,
+        decoding: Option<&DecodingParams>,
     ) -> Result<(), PyEngineError> {
         let arr = audio_bytes_to_numpy(py, audio)?;
         let kwargs = PyDict::new_bound(py);
@@ -189,6 +199,9 @@ impl PyEngine {
         kwargs.set_item("sample_rate", sample_rate)?;
         kwargs.set_item("streaming", false)?;
         kwargs.set_item("priority", priority)?;
+        if let Some(dict) = decoding_params_dict(py, decoding)? {
+            kwargs.set_item("decoding", dict)?;
+        }
         bound.call_method("add_request", (), Some(&kwargs))?;
         Ok(())
     }
@@ -198,10 +211,11 @@ impl PyEngine {
         rid: &str,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<&DecodingParams>,
     ) -> Result<(), PyEngineError> {
         Python::with_gil(|py| {
             let bound = self.engine.bind(py);
-            Self::add_streaming_locked(py, &bound, rid, sample_rate, priority)
+            Self::add_streaming_locked(py, &bound, rid, sample_rate, priority, decoding)
         })
     }
 
@@ -212,29 +226,38 @@ impl PyEngine {
         rid: &str,
         sample_rate: u32,
         priority: i32,
+        decoding: Option<&DecodingParams>,
     ) -> Result<(), PyEngineError> {
         let kwargs = PyDict::new_bound(py);
         kwargs.set_item("request_id", rid)?;
         kwargs.set_item("sample_rate", sample_rate)?;
         kwargs.set_item("priority", priority)?;
+        if let Some(dict) = decoding_params_dict(py, decoding)? {
+            kwargs.set_item("decoding", dict)?;
+        }
         bound.call_method("add_streaming_request", (), Some(&kwargs))?;
         Ok(())
     }
 
-    /// Bulk admission entry — calls `ASREngine.add_requests_batch(list)` in
-    /// **one** Python method invocation across all `specs`.  GIL must already
+    /// Bulk admission entry — calls `ASREngine.add_requests_batch_checked(list)`
+    /// in **one** Python method invocation across all `specs`.  GIL must already
     /// be held; intended to be called by the dispatcher inside its tick's
     /// `Python::with_gil` scope after draining contiguous admit envelopes.
-    /// Returns `Ok(())` when the Python batch call succeeds — callers that
-    /// need per-request error fan-out can call the single-shot
-    /// `add_*_locked` helpers in a loop instead.
+    ///
+    /// Returns one entry per spec, in order: `None` when that spec was admitted,
+    /// `Some(message)` when the engine rejected it.  A rejection is scoped to its
+    /// own request — the `_checked` Python entry point validates and admits per
+    /// spec instead of raising for the batch, so one client's bad `top_p` can no
+    /// longer error every request that happened to coalesce with it.  `Err` is
+    /// reserved for a genuinely batch-wide failure (the Python call itself
+    /// raising, e.g. an engine-level fault).
     pub fn add_requests_batch_locked<'py>(
         py: Python<'py>,
         bound: &Bound<'py, PyAny>,
         specs: &[AdmitSpec],
-    ) -> Result<(), PyEngineError> {
+    ) -> Result<Vec<Option<String>>, PyEngineError> {
         if specs.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let list = PyList::empty_bound(py);
         for spec in specs {
@@ -245,6 +268,7 @@ impl PyEngine {
                     audio,
                     sample_rate,
                     priority,
+                    decoding,
                 } => {
                     let arr = audio_bytes_to_numpy(py, audio)?;
                     d.set_item("audio", arr)?;
@@ -252,22 +276,49 @@ impl PyEngine {
                     d.set_item("sample_rate", *sample_rate)?;
                     d.set_item("streaming", false)?;
                     d.set_item("priority", *priority)?;
+                    if let Some(dict) = decoding_params_dict(py, decoding.as_ref())? {
+                        d.set_item("decoding", dict)?;
+                    }
                 }
                 AdmitSpec::Streaming {
                     rid,
                     sample_rate,
                     priority,
+                    decoding,
                 } => {
                     d.set_item("request_id", rid.as_str())?;
                     d.set_item("sample_rate", *sample_rate)?;
                     d.set_item("streaming", true)?;
                     d.set_item("priority", *priority)?;
+                    if let Some(dict) = decoding_params_dict(py, decoding.as_ref())? {
+                        d.set_item("decoding", dict)?;
+                    }
                 }
             }
             list.append(d)?;
         }
-        bound.call_method1("add_requests_batch", (list,))?;
-        Ok(())
+        let out = bound.call_method1("add_requests_batch_checked", (list,))?;
+        let rows: Vec<Bound<'py, PyAny>> = out.extract()?;
+        let mut errors: Vec<Option<String>> = Vec::with_capacity(specs.len());
+        for row in rows.iter() {
+            // `{"request_id": str}` on success, `{..., "error": str}` on rejection.
+            let err = row
+                .get_item("error")
+                .ok()
+                .and_then(|v| v.extract::<Option<String>>().ok())
+                .flatten();
+            errors.push(err);
+        }
+        // Defensive: a length mismatch would misattribute errors, so treat it as
+        // batch-wide rather than guessing which spec each row belongs to.
+        if errors.len() != specs.len() {
+            return Err(PyEngineError::Py(format!(
+                "add_requests_batch_checked returned {} rows for {} specs",
+                errors.len(),
+                specs.len()
+            )));
+        }
+        Ok(errors)
     }
 
     pub fn feed_chunk(&self, rid: &str, chunk: &[u8], is_last: bool) -> Result<(), PyEngineError> {
@@ -354,11 +405,32 @@ impl PyEngine {
                 .and_then(|x| x.extract::<Option<Vec<f32>>>().ok())
                 .unwrap_or(None);
             let evt = if finished {
+                let nbest_texts: Option<Vec<String>> = item
+                    .getattr("nbest_texts")
+                    .ok()
+                    .and_then(|x| x.extract::<Option<Vec<String>>>().ok())
+                    .unwrap_or(None);
+                // Last-token end time from the engine's per-token timestamps
+                // (families with alignments — Paraformer CIF); None otherwise.
+                let end_time_s: Option<f32> = item
+                    .getattr("timestamps")
+                    .ok()
+                    .and_then(|x| x.extract::<Option<Vec<(f32, f32)>>>().ok())
+                    .unwrap_or(None)
+                    .and_then(|ts| ts.last().map(|&(_, end)| end));
+                let finish_reason: Option<String> = item
+                    .getattr("finish_reason")
+                    .ok()
+                    .and_then(|x| x.extract::<Option<String>>().ok())
+                    .unwrap_or(None);
                 Event::Final {
                     request_id: rid,
                     text,
                     tokens,
                     scores,
+                    nbest_texts,
+                    end_time_s,
+                    finish_reason,
                 }
             } else {
                 Event::Partial {
@@ -372,6 +444,82 @@ impl PyEngine {
         }
         Ok(events)
     }
+}
+
+/// Build the Python-side `decoding` kwargs dict from [`DecodingParams`].
+/// Returns `Ok(None)` when there are no params (or all fields are unset) so
+/// callers skip the kwarg and the engine sees `decoding=None` — the fast
+/// path stays allocation-free.
+fn decoding_params_dict<'py>(
+    py: Python<'py>,
+    params: Option<&DecodingParams>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let p = match params {
+        Some(p) if !p.is_empty() => p,
+        _ => return Ok(None),
+    };
+    // Keys come from `DecodingParams::OPTION_KEYS`, the single source of truth
+    // on this side, so a field added to the struct cannot quietly miss the dict
+    // (`option_keys_cover_every_field` in oasr-wire enforces the match, and
+    // `assert_decoding_option_keys_match` enforces it against Python).
+    let d = PyDict::new_bound(py);
+    for key in DecodingParams::OPTION_KEYS {
+        match *key {
+            "n_best" => {
+                if let Some(v) = p.n_best {
+                    d.set_item(key, v)?;
+                }
+            }
+            "max_new_tokens" => {
+                if let Some(v) = p.max_new_tokens {
+                    d.set_item(key, v)?;
+                }
+            }
+            "temperature" => {
+                if let Some(v) = p.temperature {
+                    d.set_item(key, v)?;
+                }
+            }
+            "top_k" => {
+                if let Some(v) = p.top_k {
+                    d.set_item(key, v)?;
+                }
+            }
+            "top_p" => {
+                if let Some(v) = p.top_p {
+                    d.set_item(key, v)?;
+                }
+            }
+            "prompt" => {
+                if let Some(v) = &p.prompt {
+                    d.set_item(key, v.as_str())?;
+                }
+            }
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "DecodingParams::OPTION_KEYS names {other:?} but \
+                     decoding_params_dict has no arm for it"
+                )))
+            }
+        }
+    }
+    Ok(Some(d))
+}
+
+/// Cross-check the per-request option table against Python, once, at startup.
+///
+/// Silent drift is the failure mode S9 catalogued: a field added on one side
+/// only makes requests carrying that option accepted and ignored, with nothing
+/// logged at either end. One call turns that into a startup error naming the
+/// keys that disagree.
+pub fn assert_decoding_option_keys_match(py: Python<'_>) -> PyResult<()> {
+    let request_mod = py.import_bound("oasr.engine.request")?;
+    let options = request_mod.getattr("DecodingOptions")?;
+    options.call_method1(
+        "assert_matches_wire_keys",
+        (DecodingParams::OPTION_KEYS.to_vec(),),
+    )?;
+    Ok(())
 }
 
 /// Decode raw little-endian f32 audio bytes into a writable numpy array on
@@ -401,7 +549,11 @@ fn audio_bytes_to_numpy<'py>(py: Python<'py>, audio: &[u8]) -> PyResult<Bound<'p
     Ok(arr)
 }
 
-fn collect_model_info(_py: Python<'_>, cfg: &Bound<'_, PyAny>) -> PyResult<ModelInfo> {
+fn collect_model_info(
+    _py: Python<'_>,
+    cfg: &Bound<'_, PyAny>,
+    engine: &Bound<'_, PyAny>,
+) -> PyResult<ModelInfo> {
     let mut info = ModelInfo::default();
     info.ckpt_dir = cfg
         .getattr("ckpt_dir")
@@ -435,6 +587,25 @@ fn collect_model_info(_py: Python<'_>, cfg: &Bound<'_, PyAny>) -> PyResult<Model
                 .and_then(|x| x.extract::<u32>().ok());
         }
     }
+    // Read the *resolved* mode / family off the engine, not the config: the
+    // engine validates `decode_method` against the checkpoint's capabilities and
+    // rejects offline-only families in streaming mode, so it is the authority on
+    // what this process can actually serve.
+    info.service_mode = engine
+        .getattr("service_mode")
+        .ok()
+        .and_then(|x| x.extract::<Option<String>>().ok())
+        .unwrap_or_default();
+    info.decode_method = engine
+        .getattr("decode_method")
+        .ok()
+        .and_then(|x| x.extract::<Option<String>>().ok())
+        .unwrap_or_default();
+    info.capabilities = engine
+        .getattr("capabilities")
+        .ok()
+        .and_then(|x| x.extract::<Vec<String>>().ok())
+        .unwrap_or_default();
     Ok(info)
 }
 

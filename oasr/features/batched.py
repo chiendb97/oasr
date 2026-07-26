@@ -14,7 +14,7 @@ used by the OASR offline pipeline:
 * ``dither=0`` (deterministic inference)
 * ``use_energy=False``
 * ``snip_edges=True``
-* ``window_type='povey'``
+* ``window_type='povey'`` or ``'hamming'`` (FunASR/Paraformer frontends)
 * ``preemphasis_coefficient=0.97``
 * ``remove_dc_offset=True`` (default)
 * ``round_to_power_of_two=True``
@@ -47,7 +47,7 @@ __all__ = [
 def _supports_common(cfg: FeatureConfig) -> bool:
     return (
         cfg.backend == "torchaudio"
-        and cfg.window_type == "povey"
+        and cfg.window_type in ("povey", "hamming")
         and cfg.dither == 0.0
         and cfg.snip_edges is True
         and cfg.use_energy is False
@@ -97,10 +97,10 @@ def _mel_banks(
     bin_hz = torch.arange(num_bins_fft, dtype=torch.float32) * (sample_rate / n_fft)
     bin_mel = _to_mel(bin_hz)
 
-    left = mel_edges[:-2].unsqueeze(1)    # (num_bins, 1)
+    left = mel_edges[:-2].unsqueeze(1)  # (num_bins, 1)
     center = mel_edges[1:-1].unsqueeze(1)  # (num_bins, 1)
-    right = mel_edges[2:].unsqueeze(1)    # (num_bins, 1)
-    bin_mel = bin_mel.unsqueeze(0)        # (1, num_bins_fft)
+    right = mel_edges[2:].unsqueeze(1)  # (num_bins, 1)
+    bin_mel = bin_mel.unsqueeze(0)  # (1, num_bins_fft)
 
     up = (bin_mel - left) / (center - left)
     down = (right - bin_mel) / (right - center)
@@ -109,13 +109,21 @@ def _mel_banks(
 
 
 @lru_cache(maxsize=16)
-def _povey_window(
-    frame_length: int, device: torch.device, dtype: torch.dtype
+def _frame_window(
+    frame_length: int, window_type: str, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Povey window:  (0.5 - 0.5*cos(2π n/(N-1)))**0.85."""
+    """Kaldi analysis window (matches ``torchaudio.compliance.kaldi``).
+
+    ``povey``:  ``(0.5 - 0.5*cos(2π n/(N-1)))**0.85``;
+    ``hamming``: ``0.54 - 0.46*cos(2π n/(N-1))``.
+    """
     i = torch.arange(frame_length, device=device, dtype=dtype)
-    w = 0.5 - 0.5 * torch.cos(2 * math.pi * i / (frame_length - 1))
-    return w.pow(0.85)
+    a = 2 * math.pi * i / (frame_length - 1)
+    if window_type == "povey":
+        return (0.5 - 0.5 * torch.cos(a)).pow(0.85)
+    if window_type == "hamming":
+        return 0.54 - 0.46 * torch.cos(a)
+    raise ValueError(f"unsupported window_type for the batched kernel: {window_type!r}")
 
 
 @lru_cache(maxsize=16)
@@ -133,7 +141,7 @@ def _dct_matrix(
     with ``norm='ortho'``.
     """
     M = num_mel_bins
-    n = torch.arange(M, dtype=torch.float64).unsqueeze(0)    # (1, M)
+    n = torch.arange(M, dtype=torch.float64).unsqueeze(0)  # (1, M)
     k = torch.arange(num_ceps, dtype=torch.float64).unsqueeze(1)  # (num_ceps, 1)
     dct = torch.cos(math.pi * (n + 0.5) * k / M) * math.sqrt(2.0 / M)
     dct[0, :] = 1.0 / math.sqrt(M)
@@ -165,9 +173,7 @@ def _next_power_of_two(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
-def _log_mel_pipeline(
-    waveforms: torch.Tensor, cfg: FeatureConfig
-) -> Tuple[torch.Tensor, int]:
+def _log_mel_pipeline(waveforms: torch.Tensor, cfg: FeatureConfig) -> Tuple[torch.Tensor, int]:
     """Shared fbank pipeline producing the log-mel tensor + frame count.
 
     Returns ``(log_mel, num_frames)`` where ``log_mel`` has shape
@@ -200,23 +206,28 @@ def _log_mel_pipeline(
     preem[..., 1:] = frames[..., 1:] - preemph * frames[..., :-1]
     preem[..., 0] = frames[..., 0] - preemph * frames[..., 0]
 
-    # Step 3: Povey window.
-    window = _povey_window(frame_length, device, dtype)
+    # Step 3: analysis window (povey / hamming).
+    window = _frame_window(frame_length, cfg.window_type, device, dtype)
     windowed = preem * window
 
     # Step 4: FFT at the next power of two ≥ frame_length.
     n_fft = _next_power_of_two(frame_length)
     if n_fft > frame_length:
         windowed = torch.nn.functional.pad(windowed, (0, n_fft - frame_length))
-    spectrum = torch.fft.rfft(windowed, n=n_fft)           # (B, N, n_fft/2+1) complex
-    power = spectrum.real.pow(2) + spectrum.imag.pow(2)    # (B, N, n_fft/2+1)
+    spectrum = torch.fft.rfft(windowed, n=n_fft)  # (B, N, n_fft/2+1) complex
+    power = spectrum.real.pow(2) + spectrum.imag.pow(2)  # (B, N, n_fft/2+1)
 
     # Step 5: mel filterbank.
     mel_mat = _mel_banks(
-        num_mel, n_fft, cfg.sample_rate, cfg.low_freq, cfg.high_freq,
-        device=device, dtype=dtype,
+        num_mel,
+        n_fft,
+        cfg.sample_rate,
+        cfg.low_freq,
+        cfg.high_freq,
+        device=device,
+        dtype=dtype,
     )
-    mel_energies = torch.matmul(power, mel_mat.t())        # (B, N, num_mel)
+    mel_energies = torch.matmul(power, mel_mat.t())  # (B, N, num_mel)
 
     # Step 6: log (with a tiny floor to avoid log(0)).  Kaldi uses log energy
     # directly; with energy_floor=0 torchaudio applies ``torch.clamp(min=eps)``
@@ -226,14 +237,13 @@ def _log_mel_pipeline(
     return log_mel, log_mel.size(1)
 
 
-def _feat_lengths(
-    lengths: torch.Tensor, frame_length: int, frame_shift: int
-) -> torch.Tensor:
+def _feat_lengths(lengths: torch.Tensor, frame_length: int, frame_shift: int) -> torch.Tensor:
     """Kaldi snip_edges frame-count formula, returned as int32."""
     if lengths.dtype != torch.int64:
         lengths = lengths.long()
     return torch.clamp(
-        (lengths - frame_length) // frame_shift + 1, min=0,
+        (lengths - frame_length) // frame_shift + 1,
+        min=0,
     ).to(torch.int32)
 
 
@@ -271,9 +281,7 @@ def batched_fbank(
             log_mel,
             torch.zeros(B, dtype=torch.int32, device=device),
         )
-    feat_lengths = _feat_lengths(
-        lengths, cfg.frame_length_samples, cfg.frame_shift_samples
-    )
+    feat_lengths = _feat_lengths(lengths, cfg.frame_length_samples, cfg.frame_shift_samples)
     return log_mel, feat_lengths
 
 
@@ -318,13 +326,14 @@ def batched_mfcc(
 
     # DCT-II + cepstral liftering.
     dct = _dct_matrix(num_ceps, cfg.num_mel_bins, device=device, dtype=dtype)
-    mfcc = torch.matmul(log_mel, dct.t())                # (B, N, num_ceps)
+    mfcc = torch.matmul(log_mel, dct.t())  # (B, N, num_ceps)
     lifter = _cepstral_lifter(
-        num_ceps, cfg.cepstral_lifter, device=device, dtype=dtype,
+        num_ceps,
+        cfg.cepstral_lifter,
+        device=device,
+        dtype=dtype,
     )
     mfcc = mfcc * lifter
 
-    feat_lengths = _feat_lengths(
-        lengths, cfg.frame_length_samples, cfg.frame_shift_samples
-    )
+    feat_lengths = _feat_lengths(lengths, cfg.frame_length_samples, cfg.frame_shift_samples)
     return mfcc, feat_lengths

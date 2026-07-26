@@ -9,9 +9,10 @@ config dataclass) while matching Conformer hyperparameters from WeNet.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, ClassVar, Mapping, Optional
 
-from ..base import BaseModelConfig, CacheSpec
+from ..base import BaseModelConfig, CacheSpec, coerce_config
+from ..decoders.transformer_decoder import TransformerDecoderConfig
 
 
 @dataclass
@@ -63,11 +64,17 @@ class ConformerEncoderConfig:
 
 @dataclass
 class ConformerModelConfig(BaseModelConfig):
-    """Top-level Conformer model config (encoder + CTC head)."""
+    """Top-level Conformer model config (encoder + CTC head + optional AED decoder)."""
 
     model_type: str = "conformer"
     encoder: ConformerEncoderConfig = field(default_factory=ConformerEncoderConfig)
     # For ASR: vocab_size for the CTC head (inherited from BaseModelConfig).
+    # U2++ attention-decoder branch (CTC+AED rescoring).  ``None`` (default) is
+    # a pure-CTC model; the WeNet converter fills this from ``train.yaml``'s
+    # ``decoder_conf`` when the checkpoint carries a (bi)transformer decoder.
+    # Its ``vocab_size`` is the *raw* (unpadded) vocab — the AED branch is
+    # plain torch linears, not the 8-aligned CTC GEMM head.
+    decoder: Optional[TransformerDecoderConfig] = None
 
     @property
     def cache_spec(self) -> CacheSpec:
@@ -90,11 +97,15 @@ class ConformerModelConfig(BaseModelConfig):
             conv_kernel_size=conv_kernel,
         )
 
-    @classmethod
-    def from_dict(cls, d: dict) -> ConformerModelConfig:
-        """Build from a dict (e.g. HuggingFace config)."""
-        encoder_dict = d.get("encoder", d)
-        encoder = ConformerEncoderConfig(
-            **{k: v for k, v in encoder_dict.items() if hasattr(ConformerEncoderConfig, k)}
-        )
-        return cls(encoder=encoder, vocab_size=d.get("vocab_size"))
+    # ``encoder`` accepts a **flat** dict as well as a nested one: WeNet-derived
+    # dicts put encoder hyperparameters at the top level.  Everything else —
+    # ``vocab_size``, the optional nested ``decoder`` — is handled by the inherited
+    # type-driven reader.
+    #
+    # This field used to be filtered with ``hasattr(ConformerEncoderConfig, k)``,
+    # which drops any field declared *without* a default (a defaultless dataclass
+    # field is not a class attribute), so such a field silently defaulted itself on
+    # every native round-trip.
+    _from_dict_overrides: ClassVar[Mapping[str, Any]] = {
+        "encoder": lambda d: coerce_config(ConformerEncoderConfig, d.get("encoder", d)),
+    }

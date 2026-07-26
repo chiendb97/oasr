@@ -1,0 +1,157 @@
+# Copyright 2024 OASR Authors
+# SPDX-License-Identifier: Apache-2.0
+"""Whisper log-mel spectrogram frontend (batched, GPU-friendly).
+
+Reproduces ``whisper.audio.log_mel_spectrogram`` + ``pad_or_trim``:
+
+* input waveforms at **[-1, 1] float scale** (``FeatureSpec.audio_scale = 1.0``
+  — unlike the Kaldi int16-scale frontends);
+* pad/trim every utterance to 30 s (480 000 samples @ 16 kHz);
+* STFT ``n_fft=400, hop=160``, Hann window, centered/reflect, magnitude²,
+  last frame dropped → 3000 frames;
+* slaney-scale mel filterbank (matches librosa's default, which Whisper uses);
+* ``log10`` clamped at 1e-10, floored at ``max - 8``, then ``(x + 4) / 4``.
+
+The global max-normalization couples frames within one utterance but not
+across utterances, so the batch dimension is safe.  The feature tensor is
+always the full window (all rows = 3000 frames — the Whisper encoder's fixed
+1500-position geometry); the returned lengths carry each row's *real* frame
+count for consumers that mask padding (the Qwen2-Audio tower).
+"""
+
+from __future__ import annotations
+
+import functools
+import logging
+from typing import Tuple
+
+import torch
+
+from .config import FeatureConfig
+
+__all__ = ["batched_whisper_logmel"]
+
+logger = logging.getLogger(__name__)
+
+_N_FFT = 400
+_HOP = 160
+
+
+@functools.lru_cache(maxsize=8)
+@functools.lru_cache(maxsize=8)
+def _hann_window(device_str: str) -> torch.Tensor:
+    """fp32 Hann window for the STFT, cached per device."""
+    return torch.hann_window(_N_FFT, device=torch.device(device_str), dtype=torch.float32)
+
+
+def _mel_filters(sample_rate: int, n_mels: int, device_str: str) -> torch.Tensor:
+    """Slaney-normalized slaney-scale mel filterbank ``(n_mels, n_fft//2 + 1)``.
+
+    ``torchaudio.functional.melscale_fbanks(..., norm="slaney",
+    mel_scale="slaney")`` is numerically identical to
+    ``librosa.filters.mel(...)`` — the table Whisper ships in its assets.
+    """
+    from torchaudio.functional import melscale_fbanks
+
+    fb = melscale_fbanks(
+        n_freqs=_N_FFT // 2 + 1,
+        f_min=0.0,
+        f_max=sample_rate / 2.0,
+        n_mels=n_mels,
+        sample_rate=sample_rate,
+        norm="slaney",
+        mel_scale="slaney",
+    )  # (n_freqs, n_mels)
+    return fb.t().contiguous().to(torch.device(device_str))
+
+
+def batched_whisper_logmel(
+    waveforms: torch.Tensor,
+    lengths: torch.Tensor,
+    cfg: FeatureConfig,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Batched Whisper log-mel features.
+
+    Parameters
+    ----------
+    waveforms : Tensor
+        ``(B, T)`` float32 waveforms at **[-1, 1]** scale.
+    lengths : Tensor
+        ``(B,)`` valid sample counts (samples past each length are zeroed
+        before the pad/trim so padding never leaks energy).
+    cfg : FeatureConfig
+        ``feature_type="whisper_logmel"``; reads ``sample_rate``,
+        ``num_mel_bins``, ``whisper_chunk_seconds``.
+
+    Returns
+    -------
+    features : Tensor
+        ``(B, n_frames, num_mel_bins)`` float32 — ``n_frames`` = 3000 for the
+        standard 30 s window.
+    feat_lengths : Tensor
+        ``(B,)`` int32 — *real* per-row frame counts ``ceil(len / hop)``
+        clamped to ``n_frames`` (HF ``WhisperFeatureExtractor``'s
+        ``attention_mask`` semantics).  Whisper-style consumers treat the
+        padded 30 s window as real input and ignore these; masked consumers
+        (the Qwen2-Audio tower) key their padding mask off them.
+    """
+    assert waveforms.dim() == 2, "waveforms must be (B, T)"
+    B, T = waveforms.shape
+    device = waveforms.device
+    n_samples = int(cfg.sample_rate * cfg.whisper_chunk_seconds)
+
+    # Zero anything past each row's valid length, then pad/trim to 30 s.
+    #
+    # The engine's ``InputProcessor`` already zeroes the padded tail, so for the
+    # engine path this repeats a (B, T) elementwise pass (~61 MB at B=32) that
+    # changes nothing.  Kept anyway: skipping it would need an extra argument
+    # only this extractor honours, and the whole point of the feature registry
+    # (F1) is that every frontend has the *same* ``(wav, lengths, cfg)``
+    # signature.  A per-extractor escape hatch would put the branch back in the
+    # shared caller, which is what F1 removed.  Direct callers rely on it too.
+    idx = torch.arange(T, device=device).unsqueeze(0)
+    wav = waveforms * (idx < lengths.to(device).unsqueeze(1))
+    if T < n_samples:
+        wav = torch.nn.functional.pad(wav, (0, n_samples - T))
+    elif T > n_samples:
+        # The engine rejects over-long audio at admission
+        # (``InputProcessor._check_input_duration``), so reaching here means a
+        # direct caller of this function bypassed that check.  Trim per the
+        # Whisper recipe but say so — a silent trim reads as a correct
+        # transcript of the whole utterance.
+        logger.warning(
+            "whisper_logmel: trimming %d samples to the %.0fs window (%d samples); "
+            "audio beyond the window is dropped",
+            T,
+            cfg.whisper_chunk_seconds,
+            n_samples,
+        )
+        wav = wav[:, :n_samples]
+
+    # Cached like the mel filters: a 400-point window is small, but rebuilding
+    # it per call is a kernel launch + allocation on every batch for a constant.
+    stft = torch.stft(
+        wav.float(),
+        _N_FFT,
+        _HOP,
+        window=_hann_window(str(device)),
+        center=True,
+        return_complex=True,
+    )
+    magnitudes = stft[..., :-1].abs() ** 2  # (B, n_freqs, n_frames)
+
+    filters = _mel_filters(cfg.sample_rate, cfg.num_mel_bins, str(device))
+    mel = filters @ magnitudes  # (B, n_mels, n_frames)
+
+    log_spec = torch.clamp(mel, min=1e-10).log10()
+    # Per-utterance max floor (amax over mel+time of each row, not the batch).
+    row_max = log_spec.amax(dim=(1, 2), keepdim=True)
+    log_spec = torch.maximum(log_spec, row_max - 8.0)
+    log_spec = (log_spec + 4.0) / 4.0
+
+    features = log_spec.transpose(1, 2).contiguous()  # (B, n_frames, n_mels)
+    n_frames = features.size(1)
+    # HF attention-mask frame count: samples at indices 0, hop, 2·hop, … < len.
+    feat_lengths = torch.div(lengths.to(device) + _HOP - 1, _HOP, rounding_mode="floor")
+    feat_lengths = feat_lengths.clamp(max=n_frames).to(torch.int32)
+    return features, feat_lengths

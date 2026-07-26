@@ -14,12 +14,17 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
+from ..converter import BaseCheckpointConverter
+from ..registry import DETECT_ASSET_LAYOUT
 from .config import ZipformerEncoderConfig, ZipformerModelConfig
 from .model import ZipformerModel
+
+if TYPE_CHECKING:
+    from oasr.checkpoints import ConvertedCheckpoint
 
 logger = logging.getLogger(__name__)
 
@@ -93,11 +98,31 @@ def _extract_state_dict(obj: Any) -> Mapping[str, torch.Tensor]:
     return obj
 
 
-class IcefallConverter:
+class IcefallConverter(BaseCheckpointConverter):
     """Checkpoint converter for icefall Zipformer experiment directories.
 
     Implements the :class:`~oasr.models.registry.CheckpointConverter` protocol.
     """
+
+    #: Weight-drop accounting (read by the registry after ``load_weights``):
+    #: the pruned-RNNT ``simple_*_proj`` heads are training-only, so dropping
+    #: them is expected; the transducer / attention-decoder branches are named
+    #: capability losses.
+    expected_unused_prefixes: Tuple[str, ...] = ("simple_am_proj", "simple_lm_proj")
+    capability_drop_hints: Dict[str, str] = {
+        "decoder.": (
+            "the transducer predictor branch is not loaded; transducer decode "
+            "lands with the multi-paradigm Phase 1"
+        ),
+        "joiner.": (
+            "the transducer joiner branch is not loaded; transducer decode "
+            "lands with the multi-paradigm Phase 1"
+        ),
+        "attention_decoder.": (
+            "the attention-decoder branch is not loaded; AED decode lands with "
+            "the multi-paradigm Phase 2"
+        ),
+    }
 
     def _find_ckpt(self, ckpt_dir: Path, checkpoint_name: Optional[str] = None) -> Optional[Path]:
         ckpt_dir = Path(ckpt_dir)
@@ -120,37 +145,139 @@ class IcefallConverter:
                 return pts[0]
         return None
 
-    def detect(self, ckpt_dir: Path) -> bool:
-        """An icefall dir has a ``.pt`` checkpoint but no WeNet ``train.yaml``."""
+    @staticmethod
+    def _tokenizer_dirs_under(root: Path) -> List[Path]:
+        """``root`` itself, ``root/data``, and ``root/data/lang_*``."""
+        dirs = [root, root / "data"]
+        if (root / "data").is_dir():
+            dirs.extend(sorted((root / "data").glob("lang_*")))
+        return dirs
+
+    def _tokenizer_search_dirs(self, ckpt_dir: Path) -> List[Path]:
+        """Where icefall keeps tokenizer assets.
+
+        An icefall release puts the weights in ``<root>/exp`` and the tokenizer in
+        ``<root>/data/lang_*`` — **siblings**.  So the search covers the parent
+        too when the parent has a ``data/`` directory: pointing at ``exp/`` is a
+        natural thing to do (it is where the weights are, and ``_find_ckpt``
+        accepts it), and without this the bundle loads with ``tokenizer=None``,
+        the engine falls back to joining raw ids, and the transcript comes out as
+        numbers with no error anywhere.
+
+        The checkpoint dir's own assets are searched first, so a self-contained
+        directory is never overridden by a sibling.
+        """
         ckpt_dir = Path(ckpt_dir)
-        if (ckpt_dir / "train.yaml").exists():
-            return False  # that's a WeNet/Conformer experiment dir
-        return self._find_ckpt(ckpt_dir) is not None
+        dirs = self._tokenizer_dirs_under(ckpt_dir)
+        parent = ckpt_dir.parent
+        if parent != ckpt_dir and (parent / "data").is_dir():
+            dirs.extend(self._tokenizer_dirs_under(parent))
+        seen, out = set(), []
+        for d in dirs:
+            if d.is_dir() and d not in seen:
+                seen.add(d)
+                out.append(d)
+        return out
+
+    def _find_tokenizer_asset(self, ckpt_dir: Path, name: str) -> Optional[Path]:
+        for d in self._tokenizer_search_dirs(ckpt_dir):
+            if (d / name).exists():
+                return d / name
+        return None
+
+    #: only filename / asset conventions; other formats ship the same filenames, so this claim outranks a weaker one
+    architecture: ClassVar[str] = "zipformer"
+    source_format: ClassVar[str] = "icefall"
+    default_checkpoint_name: ClassVar[str] = "pretrained.pt"
+    default_decode_type: ClassVar[str] = "ctc"
+    #: (see :func:`oasr.models.registry.resolve_architecture`).
+    detect_specificity: ClassVar[int] = DETECT_ASSET_LAYOUT
+
+    def detect(self, ckpt_dir: Path) -> bool:
+        """Specific icefall markers only (the old "any ``.pt``" rule over-claimed).
+
+        Positive markers: ``tokens.txt`` / ``bpe.model`` assets, an ``exp/``
+        checkpoint layout, or icefall's conventional checkpoint filenames
+        (``pretrained.pt``, ``epoch-*.pt``, ...).  A directory holding a single
+        arbitrarily-named ``.pt`` no longer detects as icefall — pass
+        ``architecture="zipformer"`` for such dirs.
+
+        These are all filename conventions other frameworks share — a WeNet dir has
+        ``final.pt``, a FunASR dir has ``model.pt`` — so this converter used to carry
+        ``return False`` guards for ``train.yaml`` and ``config.yaml``, i.e. WeNet's
+        and FunASR's markers hardcoded inside *icefall's* detector.  That made a 7th
+        format an edit here.  Replaced by
+        :attr:`detect_specificity` = ``DETECT_ASSET_LAYOUT``: those formats name
+        themselves in a config file and outrank this claim, so the guards are gone
+        and this method states only what icefall itself looks like.
+        """
+        ckpt_dir = Path(ckpt_dir)
+        if self._find_tokenizer_asset(ckpt_dir, "tokens.txt") is not None:
+            return True
+        if self._find_tokenizer_asset(ckpt_dir, "bpe.model") is not None:
+            return True
+        for d in (ckpt_dir, ckpt_dir / "exp"):
+            for c in _NAMED_CANDIDATES:
+                if (d / c).exists():
+                    return True
+            if next(iter(d.glob("epoch-*.pt")), None) is not None:
+                return True
+        return False
+
+    def config_from_state_dict(
+        self, sd: Mapping[str, torch.Tensor], source: str = "state dict"
+    ) -> ZipformerModelConfig:
+        """Infer the architecture + vocab from checkpoint tensor shapes.
+
+        Split out of :meth:`build_config` so :meth:`build_config_for_convert`
+        can reuse weights that are already in memory — icefall ships no config
+        file, so this is the only source of architecture, and reading the file
+        twice to get it was the slowest step of a conversion.
+        """
+        config = ZipformerModelConfig()
+        try:
+            config.encoder = infer_encoder_config(sd)
+        except Exception as exc:
+            raise ValueError(
+                f"could not infer the Zipformer architecture from {source} "
+                f"({exc}). Pass an explicit model config, or check that this "
+                "is an icefall Zipformer checkpoint."
+            ) from exc
+        w = sd.get("ctc_output.1.weight")
+        if w is not None:
+            vocab = int(w.shape[0])
+            # GEMM kernels require N % 8 == 0; pad like the Conformer loader.
+            if vocab % 8 != 0:
+                vocab = (vocab // 8 + 1) * 8
+            config.vocab_size = vocab
+        return config
 
     def build_config(self, ckpt_dir: Path) -> ZipformerModelConfig:
         """Build the model config, inferring the encoder architecture + vocab from
-        the checkpoint shapes (falls back to the LibriSpeech "M" defaults)."""
+        the checkpoint shapes."""
         config = ZipformerModelConfig()
         ckpt = self._find_ckpt(Path(ckpt_dir))
         if ckpt is not None:
+            # Shape inference is the *only* source of architecture here, so a
+            # failure must not silently fall back to the LibriSpeech "M"
+            # defaults: that builds a plausible-looking but wrong model, which
+            # then fails much later with a raw shape-mismatch error (or, if the
+            # dims happen to coincide, loads and produces garbage).
             try:
-                sd = _extract_state_dict(torch.load(str(ckpt), map_location="cpu"))
-                config.encoder = infer_encoder_config(sd)
-                w = sd.get("ctc_output.1.weight")
-                if w is not None:
-                    vocab = int(w.shape[0])
-                    # GEMM kernels require N % 8 == 0; pad like the Conformer loader.
-                    if vocab % 8 != 0:
-                        vocab = (vocab // 8 + 1) * 8
-                    config.vocab_size = vocab
-            except Exception:  # pragma: no cover - best-effort inference
-                logger.warning(
-                    "Could not infer Zipformer config from %s; using 'M' defaults.",
-                    ckpt, exc_info=True,
+                sd = _extract_state_dict(
+                    torch.load(str(ckpt), map_location="cpu", weights_only=True)
                 )
+            except Exception as exc:
+                raise ValueError(
+                    f"could not read the icefall checkpoint {ckpt} to infer the "
+                    f"Zipformer architecture: {exc}"
+                ) from exc
+            config = self.config_from_state_dict(sd, source=str(ckpt))
         logger.info(
             "Zipformer config: vocab_size=%s encoder_dim=%s num_encoder_layers=%s",
-            config.vocab_size, config.encoder.encoder_dim, config.encoder.num_encoder_layers,
+            config.vocab_size,
+            config.encoder.encoder_dim,
+            config.encoder.num_encoder_layers,
         )
         return config
 
@@ -163,7 +290,56 @@ class IcefallConverter:
         ckpt = self._find_ckpt(Path(ckpt_dir), checkpoint_name)
         if ckpt is None:
             raise FileNotFoundError(f"No icefall checkpoint (*.pt) found under {ckpt_dir}")
-        return _extract_state_dict(torch.load(str(ckpt), map_location=map_location))
+        return _extract_state_dict(
+            torch.load(str(ckpt), map_location=map_location, weights_only=True)
+        )
+
+    # -- complete-bundle conversion (tokenizer / feature / decoding specs) ----
+
+    def build_tokenizer_spec(self, ckpt_dir: Path):
+        """icefall ships ``bpe.model`` (SentencePiece — the CTC ids *are* the
+        piece ids) and/or ``tokens.txt``; prefer the SentencePiece model (it can
+        also encode), fall back to the symbol table.  Fixes the historical gap
+        where zipformer checkpoints got no symbol table at all (the engine only
+        sniffed ``units.txt``/``words.txt``)."""
+        from oasr.tokenizers import TokenizerSpec
+
+        bpe = self._find_tokenizer_asset(ckpt_dir, "bpe.model")
+        if bpe is not None:
+            return TokenizerSpec(kind="sentencepiece", files={"model": str(bpe)})
+        tokens = self._find_tokenizer_asset(ckpt_dir, "tokens.txt")
+        if tokens is not None:
+            return TokenizerSpec(kind="symbol_table", files={"table": str(tokens)})
+        return None
+
+    def build_feature_spec(self, ckpt_dir: Path):
+        """icefall LibriSpeech recipes: 80-dim FBANK @16 kHz (dither off at inference)."""
+        from oasr.features import FeatureSpec
+
+        return FeatureSpec(
+            kind="kaldi_fbank",
+            sample_rate=16000,
+            feature_dim=80,
+            frame_length_ms=25.0,
+            frame_shift_ms=10.0,
+            dither=0.0,
+            normalize=None,
+            audio_scale=32768.0,
+        )
+
+    def build_config_for_convert(self, ckpt_dir: Path, state_dict):
+        """Infer from the already-loaded weights — icefall ships no config file.
+
+        ``build_config`` would ``torch.load`` the same (multi-GB) checkpoint a
+        second time just to read tensor shapes.
+        """
+        return self.config_from_state_dict(_extract_state_dict(state_dict))
+
+    def build_decoding_defaults(self, config, ckpt_dir: Path):
+        from oasr.checkpoints import DecodingDefaults
+
+        # icefall CTC: <blk>=0; sos/eos unused by CTC decode.
+        return DecodingDefaults(default_decode_type=self.default_decode_type, blank_id=0)
 
 
 def load_icefall_checkpoint(

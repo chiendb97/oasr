@@ -15,11 +15,27 @@ Subroutines
 * ``streaming``       — ``ASREngine.transcribe`` (chunk-by-chunk, ctc_cuda).
 * ``offline_wfst``    — offline path with WFST decoder (requires --wfst-path).
 * ``streaming_wfst``  — streaming path with WFST decoder (requires --wfst-path).
+
+Per-decode-family subroutines (see :data:`FAMILY_SUBROUTINES`) cover the
+non-CTC paradigms: ``transducer_offline`` / ``transducer_streaming``,
+``paraformer_offline``, ``rescoring_offline``, ``aed_offline``, ``llm_offline``.
+Each requires a ``--ckpt-dir`` whose checkpoint advertises the matching
+capability and **skips with a message** otherwise, so a family subroutine can
+never silently report CTC numbers under a non-CTC name.
+
+They are timed with an explicit ``engine.step()`` loop rather than ``run()``, and
+report two extra metrics the AR families live or die by:
+
+* ``tick_p50_ms`` / ``tick_p99_ms`` — per-``step()`` wall time. One tick is what
+  the serving dispatcher holds the GIL for, so its p99 bounds cancel latency,
+  admission latency, and the streaming-partial cadence. For an incremental
+  strategy a tick is up to ``decode_steps_per_tick`` batched decoder steps, which
+  is why the number is model-dependent and has to be measured.
+* ``tokens_per_sec`` / ``tokens`` — generated (or emitted) tokens, the unit of
+  work for label-synchronous decoding, where ``utts/s`` hides transcript length.
 """
 
 from __future__ import annotations
-from benchmarks.routines.bench_utils import BenchResult, OutputWriter
-from oasr.engine import ASREngine, EngineConfig
 
 import argparse
 import glob
@@ -30,10 +46,31 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from benchmarks.routines.bench_utils import BenchResult, OutputWriter
+from oasr.engine import ASREngine, EngineConfig
+
+#: Per-decode-family subroutines: ``name → (service_mode, capability,
+#: decode_method)``.  ``capability`` is the entry in ``model.capabilities`` the
+#: checkpoint must advertise; ``decode_method`` is ``None`` when the model's
+#: default already selects the family (only rescoring must be opted into, since
+#: a U2++ hybrid defaults to plain CTC).
+FAMILY_SUBROUTINES: dict[str, tuple[str, str, Optional[str]]] = {
+    "transducer_offline": ("offline", "transducer", None),
+    "transducer_streaming": ("streaming", "transducer", None),
+    "paraformer_offline": ("offline", "paraformer", None),
+    "rescoring_offline": ("offline", "ctc_aed_rescoring", "ctc_aed_rescoring"),
+    "aed_offline": ("offline", "aed", None),
+    "llm_offline": ("offline", "llm", None),
+}
 
 SUBROUTINES = [
-    "offline", "streaming", "offline_wfst", "streaming_wfst",
-    "offline_packing", "offline_length_batch",
+    "offline",
+    "streaming",
+    "offline_wfst",
+    "streaming_wfst",
+    "offline_packing",
+    "offline_length_batch",
+    *FAMILY_SUBROUTINES,
 ]
 
 # ---------------------------------------------------------------------------
@@ -63,11 +100,48 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
     "offline_length_batch": [
         {"num_utterances": 10, "max_batch_size": 32},
     ],
+    # Family sweeps: batch width is the axis that matters for the AR families
+    # (a decoder step's cost is dominated by the weight read, so it amortises
+    # across the batch — the whole point of continuous batching).
+    "transducer_offline": [
+        {"num_utterances": 10, "max_batch_size": 4},
+        {"num_utterances": 10, "max_batch_size": 16},
+    ],
+    "transducer_streaming": [
+        {"num_utterances": 10, "chunk_size": 16},
+    ],
+    "paraformer_offline": [
+        {"num_utterances": 10, "max_batch_size": 8},
+        {"num_utterances": 10, "max_batch_size": 32},
+    ],
+    "rescoring_offline": [
+        {"num_utterances": 10, "max_batch_size": 8},
+    ],
+    "aed_offline": [
+        {"num_utterances": 10, "max_batch_size": 4},
+        {"num_utterances": 10, "max_batch_size": 8},
+    ],
+    "llm_offline": [
+        {"num_utterances": 8, "max_batch_size": 4},
+        {"num_utterances": 8, "max_batch_size": 8},
+    ],
 }
 
 
 def get_default_configs() -> dict[str, list[dict[str, Any]]]:
     return DEFAULT_CONFIGS
+
+
+def _is_streaming_subroutine(subroutine: str) -> bool:
+    """Whether *subroutine* runs the engine in streaming mode.
+
+    Family subroutines declare their mode in :data:`FAMILY_SUBROUTINES` (e.g.
+    ``transducer_streaming``), so the name-prefix rule alone is not enough.
+    """
+    family = FAMILY_SUBROUTINES.get(subroutine)
+    if family is not None:
+        return family[0] == "streaming"
+    return subroutine.startswith("streaming")
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +204,7 @@ def _load_waveforms(
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
         if sr != sample_rate:
-            waveform = torchaudio.functional.resample(
-                waveform, orig_freq=sr, new_freq=sample_rate
-            )
+            waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=sample_rate)
         wav = waveform.squeeze(0).float()
         waveforms.append(wav)
         durations.append(wav.shape[-1] / sample_rate)
@@ -202,6 +274,122 @@ def _time_offline(
     return median_ms, std_ms, rtf
 
 
+def _time_offline_stepwise(
+    engine: ASREngine,
+    waveforms: List[torch.Tensor],
+    durations: List[float],
+    num_iters: int,
+    admit_mode: str = "burst",
+) -> tuple[float, float, float, dict[str, Any]]:
+    """Offline timing with an explicit ``step()`` loop, for the decode families.
+
+    ``transcribe_offline`` hides the tick structure behind ``run()``, but for the
+    incremental families the tick *is* the unit that matters: the serving
+    dispatcher holds the GIL for exactly one ``step()``, so per-tick p99 bounds
+    how long a cancel, an admission, or a partial can be delayed.  This drives
+    the same public API the dispatcher does — ``add_request`` then ``step()``
+    until the engine drains — and times each tick individually.
+
+    ``admit_mode`` controls *when* requests arrive, which matters a great deal for
+    the incremental families:
+
+    * ``"burst"`` — everything up front, so the scheduler forms one wide batch.
+      The flattering case, and what a batch-transcription job looks like.
+    * ``"trickle"`` — one request per tick, reproducing an interactive service
+      where arrivals are independent. Each arrival is prefilled separately, so
+      this is the case that exposes how well the strategy batches *across*
+      independently-admitted requests (keystone C2).
+
+    Comparing the two isolates batching efficiency from raw decoder speed: the
+    same total work, the same tokens, only the arrival pattern differs.
+
+    Each tick is followed by ``cuda.synchronize()`` so the GPU work it queued is
+    attributed to it rather than to a later tick.  That makes the per-tick numbers
+    slightly conservative and the total directly comparable to
+    :func:`_time_offline`.
+
+    Returns
+    -------
+    (median_ms, std_ms, rtf, extra)
+        ``extra`` carries ``tick_p50_ms`` / ``tick_p99_ms`` / ``ticks`` /
+        ``tokens`` / ``tokens_per_sec`` / ``admit_mode``.
+    """
+    total_duration = sum(durations)
+    cuda = torch.cuda.is_available()
+    trickle = admit_mode == "trickle"
+    # Generous cap: even a fully serialised AR run finishes well inside this, and
+    # it turns a stuck engine into a clear error instead of a hung benchmark.
+    max_ticks = 100_000
+
+    def _run_all() -> tuple[list[float], int]:
+        pending = list(waveforms)
+        if not trickle:
+            for w in pending:
+                engine.add_request(w, streaming=False)
+            pending = []
+        ticks: list[float] = []
+        tokens = 0
+        for _ in range(max_ticks):
+            if pending:
+                # One arrival per tick — the interactive-service pattern.
+                engine.add_request(pending.pop(0), streaming=False)
+            elif engine.num_running + engine.num_waiting == 0:
+                break
+            t0 = time.perf_counter()
+            outputs = engine.step()
+            if cuda:
+                torch.cuda.synchronize()
+            ticks.append((time.perf_counter() - t0) * 1000.0)
+            for out in outputs:
+                if out.finished and out.tokens:
+                    tokens += len(out.tokens[0])
+        else:
+            raise RuntimeError(
+                f"engine did not drain within {max_ticks} steps "
+                f"(running={engine.num_running}, waiting={engine.num_waiting})"
+            )
+        return ticks, tokens
+
+    # Warmup (also absorbs any lazy JIT / graph capture on this path).
+    _run_all()
+    if cuda:
+        torch.cuda.synchronize()
+
+    times_ms: list[float] = []
+    all_ticks: list[float] = []
+    tokens_total = 0
+    for _ in range(num_iters):
+        t0 = time.perf_counter()
+        ticks, tokens = _run_all()
+        times_ms.append((time.perf_counter() - t0) * 1000.0)
+        all_ticks.extend(ticks)
+        tokens_total += tokens
+
+    times_ms.sort()
+    median_ms = times_ms[len(times_ms) // 2]
+    std_ms = statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0
+    rtf = (median_ms / 1000.0) / total_duration
+
+    all_ticks.sort()
+    extra = {
+        "admit_mode": admit_mode,
+        "ticks": len(all_ticks) // max(1, num_iters),
+        "tick_p50_ms": round(_percentile(all_ticks, 50), 3),
+        "tick_p99_ms": round(_percentile(all_ticks, 99), 3),
+        "tokens": tokens_total // max(1, num_iters),
+        "tokens_per_sec": round((tokens_total / max(1, num_iters)) / (median_ms / 1000.0), 2),
+    }
+    return median_ms, std_ms, rtf, extra
+
+
+def _percentile(sorted_values: List[float], pct: float) -> float:
+    """Nearest-rank percentile of an already-sorted list (0.0 when empty)."""
+    if not sorted_values:
+        return 0.0
+    idx = int(round((pct / 100.0) * (len(sorted_values) - 1)))
+    return sorted_values[max(0, min(idx, len(sorted_values) - 1))]
+
+
 def _warmup_engine(
     engine: Any,
     waveforms: List[torch.Tensor],
@@ -257,9 +445,7 @@ def _warmup_engine(
         torch.cuda.synchronize()
 
 
-def _split_waveform_into_chunks(
-    wav: torch.Tensor, chunk_samples: int
-) -> List[torch.Tensor]:
+def _split_waveform_into_chunks(wav: torch.Tensor, chunk_samples: int) -> List[torch.Tensor]:
     """Split a 1-D waveform into per-call chunks of ``chunk_samples`` samples.
 
     The final chunk may be shorter.  Chunks are contiguous CPU float32 views
@@ -268,7 +454,7 @@ def _split_waveform_into_chunks(
     n = wav.numel()
     chunks: List[torch.Tensor] = []
     for start in range(0, n, chunk_samples):
-        chunks.append(wav[start: start + chunk_samples].contiguous())
+        chunks.append(wav[start : start + chunk_samples].contiguous())
     return chunks
 
 
@@ -368,13 +554,21 @@ def _run_config(
     use_cuda_graphs: Optional[bool] = None,
     max_packed_frames: int = 6000,
     max_batch_frames: Optional[int] = None,
+    admit_mode: str = "burst",
+    decode_admit_window_ms: float = 0.0,
 ) -> None:
     """Run one benchmark configuration and write results to *output*."""
 
     if dtype is None:
         dtype = torch.bfloat16
 
-    is_streaming = subroutine.startswith("streaming")
+    family = FAMILY_SUBROUTINES.get(subroutine)
+    if family is not None:
+        family_mode, capability, decode_method = family
+        is_streaming = family_mode == "streaming"
+    else:
+        capability = decode_method = None
+        is_streaming = subroutine.startswith("streaming")
     is_wfst = subroutine.endswith("wfst")
     is_packing = subroutine == "offline_packing"
     is_length_batch = subroutine == "offline_length_batch"
@@ -401,9 +595,13 @@ def _run_config(
     avg_dur = sum(durations) / n
 
     decoder_type = "ctc_wfst" if is_wfst else "ctc_cuda"
-    dtype_str = {torch.float16: "float16", torch.bfloat16: "bfloat16",
-                 torch.float32: "float32"}.get(dtype, "float16")
+    dtype_str = {
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+        torch.float32: "float32",
+    }.get(dtype, "float16")
 
+    extra_metrics: dict[str, Any] = {}
     try:
         if is_streaming:
             cfg_kwargs = dict(
@@ -417,17 +615,19 @@ def _run_config(
                 max_batch_size=max_batch_size,
                 fst_path=fst_file,
             )
+            if decode_method is not None:
+                cfg_kwargs["decode_method"] = decode_method
             if use_cuda_graphs is not None:
                 cfg_kwargs["use_cuda_graphs"] = use_cuda_graphs
             cfg = EngineConfig(**cfg_kwargs)
             engine: Any = ASREngine(cfg)
+            if not _family_matches(engine, subroutine, capability):
+                return
             shape_str = (
-                f"N={n}, chunk={chunk_size}, max_bs={max_batch_size}, "
-                f"avg_dur={avg_dur:.1f}s"
+                f"N={n}, chunk={chunk_size}, max_bs={max_batch_size}, " f"avg_dur={avg_dur:.1f}s"
             )
             _warmup_engine(engine, waveforms, is_streaming=True)
-            median_ms, std_ms, rtf = _time_streaming(
-                engine, waveforms, durations, num_iters)
+            median_ms, std_ms, rtf = _time_streaming(engine, waveforms, durations, num_iters)
         else:
             cfg = EngineConfig(
                 ckpt_dir=ckpt_dir,
@@ -440,13 +640,14 @@ def _run_config(
                 enable_sequence_packing=is_packing,
                 max_packed_frames=max_packed_frames,
                 max_batch_frames=max_batch_frames if is_length_batch else None,
+                decode_admit_window_ms=decode_admit_window_ms,
+                **({"decode_method": decode_method} if decode_method else {}),
             )
             engine = ASREngine(cfg)
+            if not _family_matches(engine, subroutine, capability):
+                return
             if is_packing:
-                shape_str = (
-                    f"N={n}, pack_frames={max_packed_frames}, "
-                    f"avg_dur={avg_dur:.1f}s"
-                )
+                shape_str = f"N={n}, pack_frames={max_packed_frames}, " f"avg_dur={avg_dur:.1f}s"
             elif is_length_batch:
                 shape_str = (
                     f"N={n}, batch_frames={max_batch_frames}, "
@@ -454,12 +655,24 @@ def _run_config(
                 )
             else:
                 shape_str = f"N={n}, batch={max_batch_size}, avg_dur={avg_dur:.1f}s"
+                if family is not None:
+                    shape_str += f", admit={admit_mode}"
+                    if decode_admit_window_ms:
+                        shape_str += f"+{decode_admit_window_ms:.0f}ms"
             _warmup_engine(engine, waveforms, is_streaming=False)
-            median_ms, std_ms, rtf = _time_offline(
-                engine, waveforms, durations, num_iters)
+            if family is not None:
+                # Family subroutines report tick latency + tokens/s on top of
+                # the shared metrics; the CTC gates keep the original timing
+                # path untouched so their numbers stay comparable over time.
+                median_ms, std_ms, rtf, extra_metrics = _time_offline_stepwise(
+                    engine, waveforms, durations, num_iters, admit_mode=admit_mode
+                )
+            else:
+                median_ms, std_ms, rtf = _time_offline(engine, waveforms, durations, num_iters)
     except Exception as exc:
         print(f"  [ERROR] {subroutine}: {exc}")
         import traceback
+
         traceback.print_exc()
         return
 
@@ -477,11 +690,50 @@ def _run_config(
             "rtf": round(rtf, 8),
             "throughput_utts_per_sec": round(throughput, 2),
             "total_audio_s": round(sum(durations), 2),
+            **extra_metrics,
         },
     )
     output.write_result(result)
-    print(f"         RTF={rtf:.8f}  throughput={throughput:.2f} utts/s  "
-          f"total_audio={sum(durations):.1f}s")
+    print(
+        f"         RTF={rtf:.8f}  throughput={throughput:.2f} utts/s  "
+        f"total_audio={sum(durations):.1f}s"
+    )
+    if extra_metrics:
+        print(
+            f"         tokens/s={extra_metrics['tokens_per_sec']:.2f}  "
+            f"tokens={extra_metrics['tokens']}  "
+            f"ticks={extra_metrics['ticks']}  "
+            f"tick_p50={extra_metrics['tick_p50_ms']:.2f}ms  "
+            f"tick_p99={extra_metrics['tick_p99_ms']:.2f}ms"
+        )
+
+
+def _family_matches(engine: Any, subroutine: str, capability: Optional[str]) -> bool:
+    """Verify the loaded checkpoint actually runs the family this subroutine names.
+
+    Without this a ``--ckpt-dir`` pointing at a CTC Conformer would happily run
+    ``aed_offline`` — the engine falls back to the model's default family — and the
+    result would be filed under a name it has nothing to do with.  Skips loudly
+    instead, naming what the checkpoint does support.
+    """
+    if capability is None:
+        return True
+    caps = list(getattr(engine, "capabilities", []))
+    resolved = getattr(engine, "decode_method", None)
+    if capability not in caps:
+        print(
+            f"  [SKIP] {subroutine}: this checkpoint advertises {caps} — "
+            f"{capability!r} is not among them. Point --ckpt-dir at a "
+            f"{capability} checkpoint."
+        )
+        return False
+    if resolved != capability:
+        print(
+            f"  [SKIP] {subroutine}: engine resolved decode_method={resolved!r}, "
+            f"not {capability!r}; refusing to report it under this name."
+        )
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +760,7 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         help="WFST directory (containing HLG.pt) or path to HLG.pt "
-             "(required for *_wfst subroutines)",
+        "(required for *_wfst subroutines)",
     )
     parser.add_argument(
         "--num-utterances",
@@ -521,8 +773,8 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="Encoder forward batch size — streaming concurrent pool cap "
-             "and offline pipeline micro-batch width. "
-             "Default: 32 for streaming; sweep 1/4/8 for offline.",
+        "and offline pipeline micro-batch width. "
+        "Default: 32 for streaming; sweep 1/4/8 for offline.",
     )
     parser.add_argument(
         "--chunk-size",
@@ -541,14 +793,25 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=6000,
         help="Post-subsampling token budget per packed row for the "
-             "offline_packing subroutine (default: 6000).",
+        "offline_packing subroutine (default: 6000).",
+    )
+    parser.add_argument(
+        "--admit-mode",
+        type=str,
+        default="burst",
+        choices=("burst", "trickle"),
+        help="Arrival pattern for the per-family subroutines: 'burst' adds every "
+        "request up front (one wide scheduler batch); 'trickle' adds one per engine "
+        "tick, reproducing independent interactive arrivals. Same work either way — "
+        "the delta isolates how well a decode family batches across separately "
+        "admitted requests (default: burst).",
     )
     parser.add_argument(
         "--max-batch-frames",
         type=int,
         default=None,
         help="Padded-frame budget (max_len * batch) for the "
-             "offline_length_batch subroutine (input feature frames).",
+        "offline_length_batch subroutine (input feature frames).",
     )
 
 
@@ -576,9 +839,10 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     fst_file = _resolve_fst_file(wfst_path)
 
     from benchmarks.routines.bench_utils import parse_dtype
+
     dtype = parse_dtype(dtype_str)
 
-    is_streaming = subroutine.startswith("streaming")
+    is_streaming = _is_streaming_subroutine(subroutine)
     default_mbs = 32 if is_streaming else 4
 
     for cfg in _resolve_configs(args, subroutine):
@@ -598,12 +862,11 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
             output=output,
             max_packed_frames=max_packed_frames,
             max_batch_frames=max_batch_frames,
+            admit_mode=getattr(args, "admit_mode", "burst") or "burst",
         )
 
 
-def _resolve_configs(
-    args: argparse.Namespace, subroutine: str
-) -> list[dict[str, Any]]:
+def _resolve_configs(args: argparse.Namespace, subroutine: str) -> list[dict[str, Any]]:
     """Return a list of config dicts for the sweep.
 
     If the user passed explicit shape args, run a single config; otherwise
@@ -614,15 +877,21 @@ def _resolve_configs(
     chunk_size = getattr(args, "chunk_size", None)
 
     if (
-        subroutine in (
-            "offline", "offline_wfst", "offline_packing", "offline_length_batch",
+        subroutine
+        in (
+            "offline",
+            "offline_wfst",
+            "offline_packing",
+            "offline_length_batch",
         )
         and max_batch_size is not None
     ):
-        return [{
-            "num_utterances": num_utterances or 10,
-            "max_batch_size": max_batch_size,
-        }]
+        return [
+            {
+                "num_utterances": num_utterances or 10,
+                "max_batch_size": max_batch_size,
+            }
+        ]
     if subroutine in ("streaming", "streaming_wfst") and chunk_size is not None:
         return [{"num_utterances": num_utterances or 10, "chunk_size": chunk_size}]
 
@@ -662,28 +931,42 @@ Examples:
       --subroutines offline streaming offline_wfst streaming_wfst
 """,
     )
-    parser.add_argument("--ckpt-dir", required=True,
-                        help="WeNet checkpoint directory")
-    parser.add_argument("--audio-dir", required=True,
-                        help="Directory with .wav files")
+    parser.add_argument("--ckpt-dir", required=True, help="WeNet checkpoint directory")
+    parser.add_argument("--audio-dir", required=True, help="Directory with .wav files")
     parser.add_argument(
-        "--wfst-path", default=None,
+        "--wfst-path",
+        default=None,
         help="WFST directory (HLG.pt) or path to HLG.pt",
     )
-    parser.add_argument("--num-utterances", type=int, default=10,
-                        help="Number of .wav files per run (default: 10)")
-    parser.add_argument("--max-batch-size", type=int, default=None,
-                        help="Encoder forward batch size — streaming concurrent pool "
-                             "cap and offline pipeline micro-batch width. "
-                             "Default: 32 for streaming, 4 for offline.")
-    parser.add_argument("--chunk-size", type=int, default=16,
-                        help="Encoder chunk size for streaming (default: 16)")
-    parser.add_argument("--num-left-chunks", type=int, default=-1,
-                        help="Left-context chunks for streaming; -1 = unlimited (default: -1)")
-    parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"],
-                        default="bfloat16", help="Model precision (default: bfloat16)")
-    parser.add_argument("--num-iters", type=int, default=5,
-                        help="Number of timed iterations (default: 5)")
+    parser.add_argument(
+        "--num-utterances", type=int, default=10, help="Number of .wav files per run (default: 10)"
+    )
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=None,
+        help="Encoder forward batch size — streaming concurrent pool "
+        "cap and offline pipeline micro-batch width. "
+        "Default: 32 for streaming, 4 for offline.",
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=16, help="Encoder chunk size for streaming (default: 16)"
+    )
+    parser.add_argument(
+        "--num-left-chunks",
+        type=int,
+        default=-1,
+        help="Left-context chunks for streaming; -1 = unlimited (default: -1)",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=["float16", "bfloat16", "float32"],
+        default="bfloat16",
+        help="Model precision (default: bfloat16)",
+    )
+    parser.add_argument(
+        "--num-iters", type=int, default=5, help="Number of timed iterations (default: 5)"
+    )
     parser.add_argument("--output-path", default=None, help="CSV output path")
     parser.add_argument(
         "--subroutines",
@@ -695,6 +978,7 @@ Examples:
     args = parser.parse_args()
 
     from benchmarks.routines.bench_utils import parse_dtype
+
     dtype = parse_dtype(args.dtype)
 
     fst_file = _resolve_fst_file(args.wfst_path)
@@ -705,7 +989,7 @@ Examples:
 
     for sub in args.subroutines:
         output.write_header(f"--- {sub} ---")
-        is_streaming = sub.startswith("streaming")
+        is_streaming = _is_streaming_subroutine(sub)
         default_mbs = 32 if is_streaming else 4
         max_batch_size = args.max_batch_size if explicit_mbs else default_mbs
         _run_config(

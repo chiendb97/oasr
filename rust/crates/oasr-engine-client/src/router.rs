@@ -8,7 +8,9 @@ use dashmap::DashMap;
 use oasr_wire::Event;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, warn};
+
+use crate::dispatcher::metric;
 
 /// Owned per-worker; thread-safe via `Arc<...>` clones.
 #[derive(Clone, Default)]
@@ -67,9 +69,17 @@ impl RouterActor {
         }
     }
 
-    /// Synchronous-context variant that uses `try_send` and won't await.
-    /// Used by the ZMQ reader thread (a std::thread) that doesn't have a
-    /// Tokio runtime handle.
+    /// Synchronous-context variant used by the dispatcher thread (a
+    /// `std::thread`), which must never block on a slow client.
+    ///
+    /// Delivery is `try_send`, so a full per-request channel means something has
+    /// to give.  The policy is **terminal-event-preserving**: partials are
+    /// droppable (the next one supersedes them), but a dropped `Final` / `Error`
+    /// is a lost transcript — the receiver then sees its stream close with no
+    /// terminal event and the front-ends turn that into a 500 / `INTERNAL`.
+    /// So a full channel with a terminal event hands delivery to a background
+    /// task instead of discarding it.  The registration is only removed once the
+    /// terminal event is actually on its way.
     pub fn route_blocking(&self, event: Event) {
         let Some(rid) = event.request_id().map(|s| s.to_owned()) else {
             return;
@@ -78,7 +88,42 @@ impl RouterActor {
         let sender = self.inner.get(&rid).map(|kv| kv.value().clone());
         if let Some(tx) = sender {
             if let Err(e) = tx.try_send(event) {
-                warn!(rid = %rid, "router: per-request channel full or closed: {e}");
+                match e {
+                    mpsc::error::TrySendError::Full(ev) if terminal => {
+                        // Deliver out-of-band rather than lose the result. The
+                        // dispatcher thread runs inside the runtime context
+                        // (`Handle::enter`), so a handle is available here.
+                        match tokio::runtime::Handle::try_current() {
+                            Ok(handle) => {
+                                metrics::counter!(metric::EVENTS_DEFERRED).increment(1);
+                                warn!(
+                                    rid = %rid,
+                                    "router: channel full on a terminal event; deferring delivery"
+                                );
+                                handle.spawn(async move {
+                                    let _ = tx.send(ev).await;
+                                });
+                            }
+                            Err(_) => {
+                                metrics::counter!(metric::EVENTS_DROPPED).increment(1);
+                                warn!(
+                                    rid = %rid,
+                                    "router: channel full on a terminal event and no runtime \
+                                     handle to defer to; result lost"
+                                );
+                            }
+                        }
+                    }
+                    mpsc::error::TrySendError::Full(_) => {
+                        // A partial; the next one carries the same transcript.
+                        metrics::counter!(metric::EVENTS_DROPPED).increment(1);
+                        debug!(rid = %rid, "router: dropped a partial (channel full)");
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        metrics::counter!(metric::EVENTS_DROPPED).increment(1);
+                        debug!(rid = %rid, "router: receiver gone; event discarded");
+                    }
+                }
             }
         }
         if terminal {

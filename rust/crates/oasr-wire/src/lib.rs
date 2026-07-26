@@ -12,6 +12,132 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Per-request decoding options forwarded verbatim into the Python engine's
+/// `DecodingOptions` (see `oasr/engine/request.py`).  Every field is
+/// optional; `None` keeps the engine default, so a default-constructed
+/// params value is indistinguishable from not sending one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DecodingParams {
+    /// Hypotheses to detokenize into `Event::Final::nbest_texts`
+    /// (maps from the proto `max_alternatives`).
+    #[serde(default)]
+    pub n_best: Option<u32>,
+    /// Per-request generation cap for the AR families (AED / LLM).
+    #[serde(default)]
+    pub max_new_tokens: Option<u32>,
+    /// `> 0` enables sampling for the AR families (default greedy).
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Top-k filter (0 = disabled); only meaningful with `temperature > 0`.
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    /// Nucleus filter in (0, 1]; only meaningful with `temperature > 0`.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Speech-LLM user-prompt override (ignored by other families).
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// Sampling-temperature bounds, mirroring `oasr.engine.request.MIN_TEMPERATURE`
+/// / `MAX_TEMPERATURE`.  Outside this range (and non-zero) the Python side
+/// raises, so the front-ends reject here instead — a raise from inside
+/// `add_requests_batch` used to fail every coalesced admit in the same batch.
+pub const MIN_TEMPERATURE: f32 = 0.01;
+pub const MAX_TEMPERATURE: f32 = 100.0;
+/// Upper bound on `n_best` (proto `max_alternatives`).  Google's STT caps
+/// alternatives at 30; anything beyond that is a client bug, and `u32::MAX`
+/// would be accepted silently otherwise.
+pub const MAX_N_BEST: u32 = 30;
+/// Upper bound on a speech-LLM prompt override, in bytes.  A long prompt eats
+/// the AR generation budget (the LM's position capacity is shared between
+/// prompt and output), so an unbounded one silently clamps generation to a
+/// single token.
+pub const MAX_PROMPT_BYTES: usize = 4096;
+
+impl DecodingParams {
+    /// The per-request option names, in declaration order.
+    ///
+    /// The one place the option table is written down on this side of the PyO3
+    /// boundary. `decoding_params_dict` builds the Python dict from these keys,
+    /// and the engine asserts at startup that they equal
+    /// `oasr.engine.DecodingOptions.option_keys()`. Adding a field to this
+    /// struct without adding it here fails `option_keys_cover_every_field`
+    /// below; adding it on only one side of the boundary fails at startup.
+    /// Neither can degrade into an option that is accepted and ignored.
+    pub const OPTION_KEYS: &'static [&'static str] = &[
+        "n_best",
+        "max_new_tokens",
+        "temperature",
+        "top_k",
+        "top_p",
+        "prompt",
+    ];
+
+    /// Whether every field is `None` — callers skip building the Python-side
+    /// options dict entirely in that case.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Validate the ranges the Python `DecodingOptions` enforces.
+    ///
+    /// Returns a client-facing message on the first violation.  Both front-ends
+    /// call this at request-mapping time so an out-of-range value becomes
+    /// `INVALID_ARGUMENT` for *that* request, rather than an `INTERNAL` error
+    /// for every request in the admit batch it happened to land in.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(n) = self.n_best {
+            if n > MAX_N_BEST {
+                return Err(format!("max_alternatives must be <= {MAX_N_BEST}, got {n}"));
+            }
+        }
+        if let Some(t) = self.temperature {
+            if !t.is_finite() {
+                return Err(format!("temperature must be finite, got {t}"));
+            }
+            if t < 0.0 {
+                return Err(format!("temperature must be >= 0, got {t}"));
+            }
+            if t > 0.0 && t < MIN_TEMPERATURE {
+                return Err(format!(
+                    "temperature must be 0 (greedy) or >= {MIN_TEMPERATURE}, got {t}"
+                ));
+            }
+            if t > MAX_TEMPERATURE {
+                return Err(format!("temperature must be <= {MAX_TEMPERATURE}, got {t}"));
+            }
+        }
+        if let Some(p) = self.top_p {
+            if !p.is_finite() || p <= 0.0 || p > 1.0 {
+                return Err(format!("top_p must be in (0, 1], got {p}"));
+            }
+        }
+        if let Some(prompt) = &self.prompt {
+            if prompt.len() > MAX_PROMPT_BYTES {
+                return Err(format!(
+                    "prompt must be <= {MAX_PROMPT_BYTES} bytes, got {}",
+                    prompt.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `Some(params)` when anything was set and the ranges check out;
+    /// `None` when nothing was set (the allocation-free fast path).
+    ///
+    /// Front-ends build params with the "unset or zero means default" filters
+    /// and then funnel through this one place, so the two surfaces cannot drift.
+    pub fn validated(self) -> Result<Option<Self>, String> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        self.validate()?;
+        Ok(Some(self))
+    }
+}
+
 /// Commands sent into the engine dispatcher.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
@@ -23,6 +149,8 @@ pub enum Cmd {
         sample_rate: u32,
         #[serde(default)]
         priority: i32,
+        #[serde(default)]
+        decoding: Option<DecodingParams>,
     },
 
     /// Open a streaming request.  Audio chunks arrive via [`Cmd::FeedChunk`].
@@ -31,6 +159,8 @@ pub enum Cmd {
         sample_rate: u32,
         #[serde(default)]
         priority: i32,
+        #[serde(default)]
+        decoding: Option<DecodingParams>,
     },
 
     /// Push one audio chunk into an open streaming request.
@@ -78,6 +208,25 @@ pub enum Event {
         text: String,
         tokens: Vec<Vec<u32>>,
         scores: Option<Vec<f32>>,
+        /// Detokenized top-N transcripts aligned with `tokens` rows
+        /// (`nbest_texts[0] == text`); present only when the request asked
+        /// for more than one alternative and the decode family produced
+        /// multiple hypotheses.
+        #[serde(default)]
+        nbest_texts: Option<Vec<String>>,
+        /// End time (seconds) of the last decoded token, from the engine's
+        /// per-token timestamps (decode families with alignments —
+        /// Paraformer CIF).  Maps to the proto `result_end_time`.
+        #[serde(default)]
+        end_time_s: Option<f32>,
+        /// Why generation stopped: `"stop"` (EOS) or `"length"` (hit
+        /// `max_new_tokens` / the cache ceiling).  Without it a transcript
+        /// truncated by the generation cap is indistinguishable from a
+        /// complete one at the API — the client cannot tell that asking for
+        /// more tokens would have produced more text.  `None` for the
+        /// one-shot families, which have no such distinction.
+        #[serde(default)]
+        finish_reason: Option<String>,
     },
 
     /// Per-request error (also used for shutdown / worker-lost notifications).
@@ -133,6 +282,24 @@ pub enum ErrorCode {
     WorkerLost,
 }
 
+/// Softmax-normalized posteriors over the returned n-best scores.
+///
+/// The engine's `scores` are per-hypothesis log-probabilities; the serving
+/// `confidence` fields are [0, 1] estimates, so both front-ends report each
+/// hypothesis's posterior among the n-best.  With fewer than two hypotheses
+/// there is nothing to normalize against — returns `None` and the caller
+/// leaves `confidence` at 0.0 (Google's "unset when unavailable").
+pub fn score_posteriors(scores: &Option<Vec<f32>>) -> Option<Vec<f32>> {
+    let s = scores.as_ref()?;
+    if s.len() < 2 {
+        return None;
+    }
+    let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = s.iter().map(|&v| (v - m).exp()).collect();
+    let z: f32 = exps.iter().sum();
+    Some(exps.into_iter().map(|e| e / z).collect())
+}
+
 /// Static model metadata returned in `Pong.model_info`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelInfo {
@@ -146,8 +313,198 @@ pub struct ModelInfo {
     pub chunk_size: Option<u32>,
     #[serde(default)]
     pub max_batch_size: Option<u32>,
+    /// CTC *kernel* selector (`ctc_cuda` / `ctc_wfst`) — not the decode family.
     #[serde(default)]
     pub decoder_type: Option<String>,
     #[serde(default)]
     pub vocab_size: Option<u32>,
+    /// The mode the engine was actually built for, read back from it rather than
+    /// from the CLI flag: several decode families are offline-only, and the two
+    /// sources used to be able to disagree silently.
+    #[serde(default)]
+    pub service_mode: Option<String>,
+    /// The resolved decode family running in this process (`ctc`, `transducer`,
+    /// `aed`, `llm`, `paraformer`, `ctc_aed_rescoring`).
+    #[serde(default)]
+    pub decode_method: Option<String>,
+    /// Every decode family this checkpoint could serve.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `OPTION_KEYS` must name every field of `DecodingParams`.
+    ///
+    /// The first link of the S9 chain: struct → `OPTION_KEYS` → the Python
+    /// dataclass (asserted at engine startup). Without this, adding a field
+    /// here and forgetting the const gives an option that serialises over the
+    /// wire, never reaches the dict, and reports nothing.
+    #[test]
+    fn option_keys_cover_every_field() {
+        let all = DecodingParams {
+            n_best: Some(1),
+            max_new_tokens: Some(1),
+            temperature: Some(1.0),
+            top_k: Some(1),
+            top_p: Some(1.0),
+            prompt: Some("x".into()),
+        };
+        let json = serde_json::to_value(&all).expect("serialize");
+        let mut fields: Vec<&str> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        let mut keys: Vec<&str> = DecodingParams::OPTION_KEYS.to_vec();
+        fields.sort_unstable();
+        keys.sort_unstable();
+        assert_eq!(
+            fields, keys,
+            "DecodingParams fields and OPTION_KEYS disagree; update both"
+        );
+    }
+
+    #[test]
+    fn decoding_params_is_empty() {
+        assert!(DecodingParams::default().is_empty());
+        assert!(!DecodingParams {
+            n_best: Some(3),
+            ..Default::default()
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn validated_passes_through_empty_and_ok() {
+        // Nothing set → no params dict is built at all.
+        assert!(DecodingParams::default().validated().unwrap().is_none());
+        let ok = DecodingParams {
+            n_best: Some(5),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            top_k: Some(40),
+            max_new_tokens: Some(64),
+            prompt: Some("transcribe".into()),
+        };
+        assert_eq!(ok.clone().validated().unwrap(), Some(ok));
+    }
+
+    #[test]
+    fn validated_rejects_out_of_range() {
+        // Each of these used to reach Python and raise from inside
+        // `add_requests_batch`, failing every coalesced admit in the batch.
+        let cases = [
+            (
+                "top_p",
+                DecodingParams {
+                    top_p: Some(1.5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "temperature",
+                DecodingParams {
+                    temperature: Some(1e-30),
+                    ..Default::default()
+                },
+            ),
+            (
+                "temperature",
+                DecodingParams {
+                    temperature: Some(1e6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "temperature",
+                DecodingParams {
+                    temperature: Some(f32::NAN),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_alternatives",
+                DecodingParams {
+                    n_best: Some(u32::MAX),
+                    ..Default::default()
+                },
+            ),
+            (
+                "prompt",
+                DecodingParams {
+                    prompt: Some("x".repeat(MAX_PROMPT_BYTES + 1)),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (field, params) in cases {
+            let err = params
+                .validated()
+                .expect_err(&format!("{field} should have been rejected"));
+            assert!(err.contains(field), "message {err:?} should name {field}");
+        }
+    }
+
+    #[test]
+    fn validated_accepts_the_bounds_themselves() {
+        for t in [MIN_TEMPERATURE, MAX_TEMPERATURE] {
+            assert!(DecodingParams {
+                temperature: Some(t),
+                ..Default::default()
+            }
+            .validated()
+            .is_ok());
+        }
+        assert!(DecodingParams {
+            top_p: Some(1.0),
+            ..Default::default()
+        }
+        .validated()
+        .is_ok());
+        assert!(DecodingParams {
+            n_best: Some(MAX_N_BEST),
+            ..Default::default()
+        }
+        .validated()
+        .is_ok());
+    }
+
+    #[test]
+    fn score_posteriors_normalizes() {
+        // Equal scores → uniform posterior.
+        let p = score_posteriors(&Some(vec![-5.0, -5.0])).unwrap();
+        assert!((p[0] - 0.5).abs() < 1e-6 && (p[1] - 0.5).abs() < 1e-6);
+        // Ordering preserved, sums to 1.
+        let p = score_posteriors(&Some(vec![-1.0, -2.0, -4.0])).unwrap();
+        assert!(p[0] > p[1] && p[1] > p[2]);
+        assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn score_posteriors_unavailable() {
+        assert!(score_posteriors(&None).is_none());
+        assert!(score_posteriors(&Some(vec![])).is_none());
+        // Single hypothesis: nothing to normalize against.
+        assert!(score_posteriors(&Some(vec![-3.0])).is_none());
+    }
+
+    #[test]
+    fn cmd_decoding_defaults_deserialize() {
+        // Old-shape command JSON (no `decoding` key) must still deserialize.
+        let j = r#"{"type":"CreateOffline","request_id":"r","sample_rate":16000}"#;
+        let cmd: Cmd = serde_json::from_str(j).unwrap();
+        match cmd {
+            Cmd::CreateOffline {
+                priority, decoding, ..
+            } => {
+                assert_eq!(priority, 0);
+                assert!(decoding.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }

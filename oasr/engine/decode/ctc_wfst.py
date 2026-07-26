@@ -17,15 +17,16 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional
 
 import torch
 
-from oasr.decode import Decoder, DecoderResult
+from oasr.decode import Decoder, DecoderConfig, DecoderResult
 
 from ..request import Request, RequestOutput
 from .base import DecodeStrategy, register_decode_strategy
+from .options import option, option_factory
 
 if TYPE_CHECKING:
     from ..config import EngineConfig
@@ -34,22 +35,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _default_wfst_config() -> DecoderConfig:
+    return DecoderConfig(search_type="wfst")
+
+
+@dataclass(frozen=True)
+class CtcWfstOptions:
+    """Options for ``decoder_type="ctc_wfst"``."""
+
+    decoder_config: DecoderConfig = option_factory(
+        _default_wfst_config,
+        legacy="wfst_decoder_config",
+        doc="WFST beam-search config (beams, backend, arena budgets).",
+    )
+    fst_path: Optional[str] = option(
+        None,
+        legacy="fst_path",
+        doc="Decoding graph: a prebuilt .img or a k2 HLG.pt (words.txt beside it).",
+    )
+
+
 @register_decode_strategy("ctc_wfst")
 class CtcWfstDecodeStrategy(DecodeStrategy):
     """CTC decoding via a k2 WFST beam search (GPU; requires a k2 build)."""
 
     decode_type: ClassVar[str] = "ctc"
     consumes: ClassVar[str] = "log_probs"
+    options_cls: ClassVar[type] = CtcWfstOptions
 
     def __init__(self, config: "EngineConfig", detok: "Detokenizer", model=None) -> None:
-        self._config = config
-        self._detok = detok
+        super().__init__(config, detok, model)
         # Streaming decoder sizing (GPU backend): every concurrent stream borrows a
         # channel from one shared multi-channel decoder, so the pool must cover the
         # engine's concurrent stream cap. Each channel's winners ring commits only
         # while the channel is open; one 32 MiB mapping chunk (4Mi entries) per
         # channel is ample — the per-chunk GC keeps the live window at ~one chunk.
-        cfg = config.wfst_decoder_config
+        cfg = self.options.decoder_config
         max_bs = int(getattr(config, "max_batch_size", 0) or 0)
         if cfg is not None and getattr(cfg, "wfst_backend", "gpu").lower() == "gpu":
             streams = max(max_bs, cfg.wfst_max_streams)
@@ -57,7 +78,7 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
             if (streams, log_entries) != (cfg.wfst_max_streams, cfg.wfst_stream_log_entries):
                 cfg = replace(cfg, wfst_max_streams=streams, wfst_stream_log_entries=log_entries)
         self._stream_cfg = cfg
-        self._words = self._load_word_table(getattr(config, "fst_path", None))
+        self._words = self._load_word_table(self.options.fst_path)
 
     @staticmethod
     def _load_word_table(fst_path: Optional[str]) -> Optional[Dict[int, str]]:
@@ -92,7 +113,7 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
     def decode_offline(
         self, enc_out: torch.Tensor, enc_lengths: torch.Tensor
     ) -> List[RequestOutput]:
-        cfg = self._config.wfst_decoder_config
+        cfg = self.options.decoder_config
         # Size the GPU offline decoder's lane pool to the engine's batch width so the
         # whole batch decodes in one GPU launch — batched throughput is the headline
         # perf lever (B=1: 1560x vs B=32: 5964x on the reference stack). No-op for the
@@ -101,7 +122,7 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
             lanes = max(int(self._config.max_batch_size), cfg.wfst_max_offline_lanes)
             if lanes != cfg.wfst_max_offline_lanes:
                 cfg = replace(cfg, wfst_max_offline_lanes=lanes)
-        decoder = Decoder(cfg, fst=self._config.fst_path)
+        decoder = Decoder(cfg, fst=self.options.fst_path)
 
         results: List[DecoderResult] = decoder.decode_batch(enc_out, enc_lengths)
         outputs = []
@@ -136,7 +157,7 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
 
     def decode_streaming_chunk(self, request: Request, enc_out: torch.Tensor) -> RequestOutput:
         if not hasattr(request, "_wfst_decoder"):
-            request._wfst_decoder = Decoder(self._stream_cfg, fst=self._config.fst_path)
+            request._wfst_decoder = Decoder(self._stream_cfg, fst=self.options.fst_path)
             request._wfst_decoder.init_stream()
 
         chunk_logp = enc_out.squeeze(0)  # (1, T, V) -> (T, V)

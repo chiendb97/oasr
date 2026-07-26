@@ -15,14 +15,17 @@ The engine drives a strategy through ``OutputProcessor`` (a thin facade):
   on finalize/abort.
 
 ``consumes`` declares what the runner should feed the strategy: ``"log_probs"``
-(CTC — encoder+head fused, the CUDA-graph fast path) or ``"hidden"`` (raw encoder
-states for autoregressive families that own their head/decoder).
+(CTC — encoder+head fused, the CUDA-graph fast path), ``"hidden"`` (raw encoder
+states for autoregressive families that own their head/decoder), or ``"both"``
+(one encoder pass + head applied — an :class:`EncodeOutput` carrying hidden
+*and* log-probs, needed for CTC+AED rescoring).
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Type
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Type
 
 import torch
 
@@ -32,7 +35,22 @@ if TYPE_CHECKING:
     from oasr.models.base import BaseAsrModel
 
     from ..config import EngineConfig
+    from ..generation import StepBudget
     from .detokenize import Detokenizer
+
+
+@dataclass
+class EncodeOutput:
+    """Encoder products for strategies consuming more than one tensor.
+
+    The offline executor passes a plain hidden / log-probs tensor for
+    ``consumes == "hidden"`` / ``"log_probs"`` (the unchanged fast paths) and
+    an :class:`EncodeOutput` for ``consumes == "both"`` — one encoder forward,
+    both views.  Lengths stay a separate argument (same for every view).
+    """
+
+    hidden: Optional[torch.Tensor] = None
+    log_probs: Optional[torch.Tensor] = None
 
 
 class DecodeStrategy(ABC):
@@ -46,8 +64,45 @@ class DecodeStrategy(ABC):
 
     #: Decode family this strategy serves ("ctc", "transducer", "aed", "llm").
     decode_type: ClassVar[str]
-    #: Encoder output the engine feeds: "log_probs" (fused head) or "hidden".
+    #: Encoder output the engine feeds: "log_probs" (fused head), "hidden",
+    #: or "both" (an :class:`EncodeOutput` with hidden + log-probs).
     consumes: ClassVar[str] = "log_probs"
+    #: Label-synchronous AR strategies (AED / LLM) set this True and implement
+    #: the incremental protocol below; the offline executor then runs bounded
+    #: decoder steps per tick instead of the one-shot :meth:`decode_offline`.
+    incremental: ClassVar[bool] = False
+    #: Options dataclass this family owns, or ``None`` for a family with no
+    #: knobs.  Resolved into :attr:`options` by the constructor — see
+    #: :mod:`oasr.engine.decode.options`.  Declaring one here is what keeps a
+    #: new family from having to add fields to ``EngineConfig``.
+    options_cls: ClassVar[Optional[type]] = None
+
+    def __init__(
+        self,
+        config: "EngineConfig",
+        detok: "Detokenizer",
+        model: "BaseAsrModel" = None,
+    ) -> None:
+        """Store the three things every strategy gets, validate the model,
+        and resolve this family's options.
+
+        The capability check lives **here** rather than only in
+        :func:`build_decode_strategy` so that constructing a strategy directly —
+        which is public, and what tests do — is guarded too.  A strategy whose
+        model lacks the surface it will reach for should say so now, with the
+        missing members named, instead of raising ``AttributeError`` from the
+        middle of a decode.
+        """
+        from oasr.models.interfaces import require_capability
+
+        from .options import build_options
+
+        require_capability(model, self.decode_type, decode_method=self.decode_type)
+        self._config = config
+        self._detok = detok
+        self._model = model
+        #: This family's resolved options (``None`` when ``options_cls`` is).
+        self.options = build_options(self.options_cls, config)
 
     # -- offline -----------------------------------------------------------
     @abstractmethod
@@ -60,6 +115,42 @@ class DecodeStrategy(ABC):
         ``request_id=""`` — the executor fills the id), in batch order.
         """
         raise NotImplementedError
+
+    # -- incremental offline protocol (``incremental = True`` strategies) ---
+    def begin_offline(
+        self,
+        requests: List[Request],
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+    ) -> None:
+        """Prefill for a freshly-encoded micro-batch: stash the encoder
+        output, initialize per-request hypotheses + decoder state.  The
+        requests stay ``RUNNING`` across engine steps; their outputs are
+        produced by :meth:`advance`.  Only ``incremental = True`` strategies
+        implement this."""
+        raise NotImplementedError(f"{type(self).__name__} is not an incremental strategy")
+
+    def advance(self, budget: "StepBudget") -> List[RequestOutput]:
+        """Run at most ``budget.max_steps`` *batched* decoder steps across all
+        pending requests (continuous batching) and return the outputs produced
+        this tick — partials (``finished=False``) and/or finals.  The executor
+        finalizes requests whose output has ``finished=True``."""
+        raise NotImplementedError(f"{type(self).__name__} is not an incremental strategy")
+
+    def has_pending(self) -> bool:
+        """Whether any request begun via :meth:`begin_offline` is unfinished."""
+        return False
+
+    def kv_bytes_per_row(self) -> Optional[int]:
+        """Decoder-KV bytes one in-flight row can occupy, or ``None`` if unbounded.
+
+        Admission uses this to budget in **bytes** rather than request count
+        (C3): a batch of 30 s utterances preallocates far more decoder KV than
+        the same number of 2 s ones, so a slot cap alone does not bound memory.
+        ``None`` (the default, and every one-shot family) leaves the byte budget
+        disabled — those families allocate no decoder KV at all.
+        """
+        return None
 
     # -- streaming session lifecycle --------------------------------------
     def create_session(self, request: Request) -> None:
@@ -112,26 +203,23 @@ def register_decode_strategy(name: str):
 
 
 def _strategy_name(decode_type: str, config: "EngineConfig") -> str:
-    """Resolve the registry key from the model's decode family + engine config.
+    """Resolve the registry key from the decode family + engine config.
 
-    CTC splits into GPU vs WFST by ``config.decoder_type``; AR families key
-    directly on ``decode_type``.
+    ``decode_type`` is either the model's default family or an explicit
+    ``EngineConfig.decode_method`` capability name.  CTC splits into GPU vs
+    WFST by ``config.decoder_type``; every other family keys directly.
     """
     if decode_type == "ctc":
         return config.decoder_type  # "ctc_cuda" | "ctc_wfst"
     return decode_type
 
 
-def build_decode_strategy(
-    decode_type: str,
-    config: "EngineConfig",
-    detok: "Detokenizer",
-    model: "BaseAsrModel" = None,
-) -> DecodeStrategy:
-    """Construct the decode strategy for a model's ``decode_type``.
+def get_decode_strategy_class(decode_type: str, config: "EngineConfig") -> Type[DecodeStrategy]:
+    """Resolve the strategy *class* for a model's ``decode_type``.
 
-    ``model`` is threaded through so autoregressive strategies can reach
-    ``model.decoder`` / ``model.joiner`` (CTC strategies ignore it).  Raises
+    Lets the engine read class-level strategy metadata (notably ``consumes``)
+    **before** any component is constructed — the ``ModelRunner`` / streaming
+    backends need it at build time, ahead of the ``OutputProcessor``.  Raises
     ``NotImplementedError`` with the available names when the family /
     ``decoder_type`` has no registered strategy (the extension point for new
     decode families).
@@ -144,4 +232,28 @@ def build_decode_strategy(
             f"(resolved name {name!r}).  Registered: {sorted(_REGISTRY)}.  "
             "Add one by subclassing DecodeStrategy + @register_decode_strategy."
         )
-    return cls(config, detok, model)
+    return cls
+
+
+def build_decode_strategy(
+    decode_type: str,
+    config: "EngineConfig",
+    detok: "Detokenizer",
+    model: "BaseAsrModel" = None,
+) -> DecodeStrategy:
+    """Construct the decode strategy for a model's ``decode_type``.
+
+    ``model`` is threaded through so autoregressive strategies can reach
+    ``model.decoder`` / ``model.joiner`` (CTC strategies ignore it).
+
+    The model's surface is validated here, once, against
+    :data:`oasr.models.interfaces.CAPABILITIES` — so a checkpoint advertising a
+    capability it cannot actually serve fails at engine construction with a
+    message naming the missing members, instead of at first decode with an
+    ``AttributeError`` (or not at all, for the families that used to check
+    nothing).
+    """
+    from oasr.models.interfaces import require_capability
+
+    require_capability(model, decode_type, decode_method=decode_type)
+    return get_decode_strategy_class(decode_type, config)(config, detok, model)

@@ -10,22 +10,33 @@ layers (:mod:`oasr.layers`) compose into an encoder (:class:`BaseEncoder`) plus
 a head (:class:`BaseHead`), wrapped by a model (:class:`BaseAsrModel`) that the
 engine drives through a stable interface.
 
-The engine touches a model only through:
+What the engine touches on **every** model:
 
-* :attr:`BaseAsrModel.cache_spec` — to size the streaming KV / CNN caches,
-* :attr:`BaseAsrModel.decode_type` — to pick the decode algorithm,
-* :meth:`BaseAsrModel.forward_offline` / :meth:`forward_offline_packed` /
-  :meth:`forward_chunk_paged` — the three forward entry points,
-* :meth:`BaseAsrModel.from_config` / :meth:`load_weights` — construction.
+* :meth:`BaseAsrModel.from_config` / :meth:`load_weights` — construction;
+* :attr:`BaseAsrModel.capabilities` / :attr:`default_decode_type` — which decode
+  families this checkpoint can serve, and which one to run by default;
+* :attr:`BaseAsrModel.cache_spec` (``None`` for offline-only encoders) and
+  ``encoder.streaming_kind`` / ``subsampling_rate`` / ``right_context`` — cache
+  sizing and streaming geometry;
+* :meth:`encode_offline` (raw hidden) and/or the fused
+  :meth:`forward_offline` / :meth:`forward_offline_packed` /
+  :meth:`forward_chunk_paged` — which of these is called depends on the active
+  strategy's ``consumes``.
 
-Anything conforming to that interface plugs in without engine changes.
+Beyond that, **each decode family reaches for its own surface** — ``model.decoder``,
+``model.joiner``, ``model.predict``/``nar_decode``, specific ``model.config`` fields.
+That per-family requirement is not prose here: it is the declarative table in
+:mod:`oasr.models.interfaces` (``CAPABILITIES``), which
+``build_decode_strategy`` validates every model against once, and which
+``tests/test_model_contract.py`` checks against every registered architecture.  Read
+that table for the authoritative list; keep it in sync when a family's needs change.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, ClassVar, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -41,9 +52,11 @@ if TYPE_CHECKING:
 # Zipformer-style), "none" (offline-only).  Kept a plain ``str``.
 StreamingKind = str
 
-# Decode-path selector. ``OutputProcessor`` dispatches on this. Kept as a plain
-# ``str`` (values: "ctc", "transducer", "aed") so heads can declare it without
-# importing an enum; only "ctc" is wired today.
+# Decode-path selector, resolved to a registered ``DecodeStrategy`` by
+# ``oasr.engine.decode.build_decode_strategy``.  Kept a plain ``str`` so heads and
+# decoders can declare it without importing an enum.  Wired families: "ctc"
+# (splitting into ``ctc_cuda`` / ``ctc_wfst`` on ``EngineConfig.decoder_type``),
+# "transducer", "ctc_aed_rescoring", "aed", "llm", "paraformer".
 DecodeType = str
 
 
@@ -64,6 +77,162 @@ class CacheSpec:
 
 
 @dataclass
+class LoadReport:
+    """Weight-load accounting returned by :meth:`BaseAsrModel.load_weights`.
+
+    Kills silent weight drops: every checkpoint key is either *mapped* into the
+    model or listed in *dropped*; *missing* holds model keys the checkpoint did
+    not fill (beyond declared computed buffers).  The registry cross-references
+    *dropped* against the converter's ``expected_unused_prefixes`` /
+    ``capability_drop_hints`` and logs a warning naming any capability lost.
+    """
+
+    mapped: List[str] = field(default_factory=list)
+    dropped: List[str] = field(default_factory=list)
+    missing: List[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        parts = [f"{len(self.mapped)} tensors loaded"]
+        if self.dropped:
+            parts.append(f"{len(self.dropped)} checkpoint tensors dropped")
+        if self.missing:
+            parts.append(f"{len(self.missing)} model tensors not filled")
+        return "LoadReport: " + ", ".join(parts)
+
+    @classmethod
+    def build(
+        cls,
+        loaded: Mapping[str, Any],
+        missing: Sequence[str],
+        unexpected: Sequence[str],
+        dropped: Optional[Sequence[str]] = None,
+        expected_missing: Sequence[str] = (),
+    ) -> "LoadReport":
+        """Assemble a report from a ``load_state_dict`` result.
+
+        One builder because the six models disagreed on two things that matter.
+        *Membership*: four tested ``k not in unexpected`` against a **list**, so
+        the accounting was O(n²) in checkpoint size — noticeable on an 8 B
+        model. *Completeness*: only two folded ``unexpected`` into ``dropped``,
+        so for the other four the registry's capability-drop check never saw the
+        keys the model actually refused, which is exactly the silent weight drop
+        :class:`LoadReport` exists to prevent.
+
+        ``expected_missing`` names model keys a checkpoint is not required to
+        fill (computed buffers such as Conformer's ``pos_enc.pe``); they are
+        filtered out rather than reported.
+        """
+        unexpected_set = set(unexpected)
+        skip = set(expected_missing)
+        return cls(
+            mapped=[k for k in loaded if k not in unexpected_set],
+            dropped=list(dropped or ()) + list(unexpected),
+            missing=[k for k in missing if k not in skip],
+        )
+
+
+def coerce_config(cls: type, d: Mapping[str, Any]) -> Any:
+    """Build dataclass ``cls`` from ``d``, coercing values by declared field type.
+
+    The native checkpoint format writes configs with a generic ``asdict``
+    (:mod:`oasr.checkpoints.native`) but every config hand-wrote the read side, in
+    **four** different spellings of "filter to known fields": ``__dataclass_fields__``,
+    ``hasattr(SomeConfig, k)`` (which admits properties and methods, and misses a field
+    declared without a default — such a field is not a class attribute), a hardcoded
+    ``known`` tuple of field names, and two of the six additionally hand-restoring
+    tuples with ``tuple(v) if isinstance(v, list) else v``.
+
+    None of them was losing data at the time this was written — checked, rather than
+    assumed: no config had a defaultless field, ``ConformerEncoderConfig`` exposed no
+    public non-field attribute, and the two configs with ``Tuple`` fields were the two
+    that hand-restored them.  The problem is that each spelling fails on the *next*
+    edit, differently and quietly: add a field and the hardcoded tuple drops it (it
+    already omitted ``model_type`` / ``encoder_type``); add a ``Tuple`` field to a config
+    without the ad-hoc restore and it comes back a ``list``, which compares unequal and
+    breaks anything that indexes it as a tuple; add a property whose name collides with
+    a checkpoint key and ``hasattr`` lets it through into the constructor.  One reader
+    driven by the declared types removes the class of bug instead of the instances, and
+    ``tests/test_config_round_trip.py`` now pins it for every registered architecture.
+
+    Coercions, all derived from the annotation rather than from the value:
+
+    * ``Tuple[X, ...]`` → ``tuple`` (JSON has no tuples, so every tuple field came
+      back as a list — the reason two configs carried an ad-hoc
+      ``tuple(v) if isinstance(v, list) else v``);
+    * ``List[X]`` / ``Tuple[X, Y]`` → elements coerced recursively, which is how
+      ``List[Tuple[int, int]]`` (Whisper's ``forced_decoder_ids``) round-trips;
+    * a nested dataclass → recursed into;
+    * ``Optional[X]`` → ``None`` passes through, anything else coerces to ``X``;
+    * ``Any`` and primitives → left alone.
+
+    Unknown keys are ignored (checkpoint configs legitimately carry extra keys).
+    A field whose declared type cannot be resolved is passed through untouched
+    rather than raising: a config is data, and refusing to load one because an
+    annotation is exotic would be worse than under-coercing it.
+    """
+    import dataclasses
+    import typing
+
+    try:
+        hints = typing.get_type_hints(cls)
+    except Exception:  # pragma: no cover - unresolvable forward refs
+        hints = {}
+
+    overrides = getattr(cls, "_from_dict_overrides", {})
+    kwargs: dict = {}
+    for name in getattr(cls, "__dataclass_fields__", {}):
+        if name in overrides:
+            hook = overrides[name]
+            if (out := hook(d)) is not _UNSET:
+                kwargs[name] = out
+            continue
+        if name not in d:
+            continue
+        kwargs[name] = _coerce_value(hints.get(name, typing.Any), d[name], dataclasses, typing)
+    return cls(**kwargs)
+
+
+class _Unset:
+    """Sentinel: an override hook declining to supply a value."""
+
+
+_UNSET = _Unset()
+
+
+def _coerce_value(hint: Any, value: Any, dataclasses, typing) -> Any:
+    """Coerce one JSON value against one declared type hint."""
+    origin, args = typing.get_origin(hint), typing.get_args(hint)
+
+    # Optional[X] / Union[...]: None passes through; otherwise try the first
+    # non-None member.  Configs do not use genuinely ambiguous unions.
+    if origin is typing.Union:
+        if value is None:
+            return None
+        for arg in args:
+            if arg is not type(None):
+                return _coerce_value(arg, value, dataclasses, typing)
+        return value
+
+    if origin in (tuple, list) and isinstance(value, (list, tuple)):
+        # Tuple[X, ...] is homogeneous; Tuple[X, Y] is positional.
+        if origin is tuple and len(args) == 2 and args[1] is Ellipsis:
+            elem_hints = [args[0]] * len(value)
+        elif origin is tuple and args:
+            elem_hints = list(args)
+        elif args:
+            elem_hints = [args[0]] * len(value)
+        else:
+            elem_hints = [typing.Any] * len(value)
+        coerced = [_coerce_value(h, v, dataclasses, typing) for h, v in zip(elem_hints, value)]
+        return tuple(coerced) if origin is tuple else coerced
+
+    if dataclasses.is_dataclass(hint) and isinstance(value, Mapping):
+        return coerce_config(hint, value)
+
+    return value
+
+
+@dataclass
 class BaseModelConfig:
     """Common model-config fields shared by every architecture.
 
@@ -71,10 +240,25 @@ class BaseModelConfig:
     hyperparameters (e.g. :class:`~oasr.models.conformer.ConformerModelConfig`).
     ``model_type`` keys the model registry; ``vocab_size`` is read by the engine
     and the serving layer.
+
+    :meth:`from_dict` is inherited and type-driven (see :func:`coerce_config`), so a
+    subclass normally needs no reader at all.  Override
+    :attr:`_from_dict_overrides` — ``{field_name: hook(full_dict) -> value}`` — only
+    for a field the annotation cannot describe: a polymorphic one
+    (``TransducerModelConfig.encoder``, whose class depends on a sibling
+    ``encoder_type`` key) or one read from a legacy flat layout.
     """
 
     model_type: str = "base"
     vocab_size: Optional[int] = None
+
+    #: ``{field: hook(source_dict) -> value | _UNSET}``.  See the class docstring.
+    _from_dict_overrides: ClassVar[Mapping[str, Any]] = {}
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> "BaseModelConfig":
+        """Build from a native ``oasr_config.json`` (or any superset dict)."""
+        return coerce_config(cls, d)
 
 
 class BaseHead(nn.Module, ABC):
@@ -147,17 +331,33 @@ class BaseEncoder(nn.Module, ABC):
         """Number of encoder layers (== paged KV cache layers)."""
         raise NotImplementedError
 
+    # ``n_kv_head`` / ``head_dim`` describe the *engine's paged-KV* layout, so only
+    # ``streaming_kind="paged"`` encoders need them.  They were abstract, which
+    # forced every offline-only encoder (Whisper, Paraformer SANM, the Qwen2-Audio
+    # tower) to implement two properties purely to satisfy the ABC — ceremony that
+    # reads as a requirement.  They are now paired with the existing
+    # ``supports_paged_streaming`` flag: an encoder that sets it True must override
+    # both, and one that does not need not.  Deliberately a raising default rather
+    # than a separate mixin the paged encoders inherit — the default is reachable
+    # from any encoder reference and says *why* the geometry is absent, which an
+    # ``AttributeError`` from a missing mixin would not.
     @property
-    @abstractmethod
     def n_kv_head(self) -> int:
-        """Number of KV attention heads per layer."""
-        raise NotImplementedError
+        """Number of KV attention heads per layer (paged streaming only)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not declare a paged-KV layout "
+            "(n_kv_head/head_dim); those are required only for "
+            'streaming_kind="paged" encoders.'
+        )
 
     @property
-    @abstractmethod
     def head_dim(self) -> int:
-        """Per-head key/value dimension."""
-        raise NotImplementedError
+        """Per-head key/value dimension (paged streaming only)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not declare a paged-KV layout "
+            "(n_kv_head/head_dim); those are required only for "
+            'streaming_kind="paged" encoders.'
+        )
 
     @property
     @abstractmethod
@@ -226,8 +426,16 @@ class BaseEncoder(nn.Module, ABC):
         raise NotImplementedError(f"{type(self).__name__} does not expose a stateful streaming API")
 
     @property
-    def cache_spec(self) -> CacheSpec:
-        """Streaming cache descriptor derived from the live encoder dims."""
+    def cache_spec(self) -> Optional[CacheSpec]:
+        """Streaming cache descriptor derived from the live encoder dims.
+
+        ``None`` for an offline-only encoder (``streaming_kind == "none"``): there
+        is no streaming cache to size, and asking for one would mean reporting a
+        paged-KV geometry the encoder does not have.  The engine skips building a
+        ``CacheConfig`` in that case, so no paged pool is allocated.
+        """
+        if self.streaming_kind == "none":
+            return None
         return CacheSpec(
             num_layers=self.num_encoder_layers,
             n_kv_head=self.n_kv_head,
@@ -280,19 +488,29 @@ class BaseAsrModel(nn.Module, ABC):
         model, _config = _from_pretrained(model_id_or_path, **kwargs)
         return model
 
+    #: State-dict keys the model recomputes from config (e.g. positional-encoding
+    #: tables).  The native checkpoint format skips them at save time and
+    #: tolerates them missing at load time.  Suffix-matched against full keys.
+    _computed_buffer_suffixes: Tuple[str, ...] = ()
+
     @abstractmethod
-    def load_weights(self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False) -> None:
+    def load_weights(
+        self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False
+    ) -> Optional["LoadReport"]:
         """Map an external checkpoint state-dict into this model's parameters.
 
         Each architecture owns the name-mapping / fusion knowledge (vLLM-style);
         in-module reshaping (e.g. fused QKV, conv reorder) is handled by the
-        layers' ``_load_from_state_dict`` hooks.
+        layers' ``_load_from_state_dict`` hooks.  Returns a :class:`LoadReport`
+        (``None`` allowed for legacy implementations) so no checkpoint tensor is
+        ever dropped silently.
         """
         raise NotImplementedError
 
     # -- engine-facing metadata --------------------------------------------
     @property
-    def cache_spec(self) -> CacheSpec:
+    def cache_spec(self) -> Optional[CacheSpec]:
+        """Streaming cache descriptor, or ``None`` for an offline-only encoder."""
         return self.encoder.cache_spec
 
     @property
@@ -301,15 +519,33 @@ class BaseAsrModel(nn.Module, ABC):
         return self.encoder.streaming_kind
 
     @property
-    def decode_type(self) -> DecodeType:
-        """Decode family driving the engine's ``DecodeStrategy``.
+    def default_decode_type(self) -> DecodeType:
+        """Decode family the engine runs when the caller picks none.
 
         AR models declare it via :attr:`decoder`; CTC models via :attr:`head`.
+        Hybrid models (e.g. CTC + AED-rescoring) override this to name their
+        production default and expose the rest via :attr:`capabilities`.
         """
         decoder = getattr(self, "decoder", None)
         if decoder is not None:
             return decoder.decode_type
         return self.head.decode_type
+
+    @property
+    def capabilities(self) -> frozenset:
+        """Decode families this checkpoint's weights support.
+
+        ``EngineConfig.decode_method`` must name one of these (``None`` selects
+        :attr:`default_decode_type`).  Single-objective models get the derived
+        one-element set for free; hybrids (U2++ CTC+AED) override to advertise
+        every branch they loaded.
+        """
+        return frozenset({self.default_decode_type})
+
+    @property
+    def decode_type(self) -> DecodeType:
+        """Compatibility alias for :attr:`default_decode_type`."""
+        return self.default_decode_type
 
     # -- engine-facing forward entry points --------------------------------
     @staticmethod

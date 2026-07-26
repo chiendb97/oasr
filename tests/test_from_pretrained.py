@@ -19,7 +19,7 @@ def test_from_pretrained_local_passthrough(tmp_path, monkeypatch):
 
     seen = {}
 
-    def fake_build(local_dir, checkpoint_name, device=None, dtype=None):
+    def fake_build(local_dir, checkpoint_name, device=None, dtype=None, architecture=None):
         seen["args"] = (str(local_dir), checkpoint_name, device, dtype)
         return ("MODEL", "CONFIG")
 
@@ -46,7 +46,9 @@ def test_from_pretrained_hf_download(tmp_path, monkeypatch):
     import oasr.models.loaders as L
 
     monkeypatch.setattr(
-        L, "build_model_from_checkpoint", lambda d, n, device=None, dtype=None: ("M", "C")
+        L,
+        "build_model_from_checkpoint",
+        lambda d, n, device=None, dtype=None, architecture=None: ("M", "C"),
     )
     out = L.from_pretrained("some-org/some-asr-model", revision="v1")
     assert out == ("M", "C")

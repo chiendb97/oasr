@@ -73,10 +73,16 @@ def _envint(name: str, default):
     except ValueError:
         raise SystemExit(f"env var {name}={v!r} is not an int")
 
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from benchmarks.routines.bench_utils import OutputWriter
-from benchmarks.routines.engine import SUBROUTINES, _resolve_fst_file, _run_config
+from benchmarks.routines.engine import (
+    SUBROUTINES,
+    _is_streaming_subroutine,
+    _resolve_fst_file,
+    _run_config,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -104,7 +110,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="DIR|FILE",
         help="WFST directory (containing HLG.pt) or direct path to HLG.pt; "
-             "required for *_wfst subroutines",
+        "required for *_wfst subroutines",
     )
 
     # --- Subroutine selection ---
@@ -128,9 +134,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_envint("MAX_BATCH_SIZE", None),
         metavar="N",
         help="Encoder forward batch size — streaming concurrent pool cap "
-             "and offline pipeline micro-batch width. "
-             "Reads $MAX_BATCH_SIZE if set; otherwise sweeps "
-             "32 (streaming) / 4 (offline).",
+        "and offline pipeline micro-batch width. "
+        "Reads $MAX_BATCH_SIZE if set; otherwise sweeps "
+        "32 (streaming) / 4 (offline).",
     )
 
     # --- Streaming / chunking ---
@@ -140,8 +146,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="N",
-        help="Encoder output frames per streaming chunk "
-             "(default: sweep 8 / 16 / 32 when unset)",
+        help="Encoder output frames per streaming chunk " "(default: sweep 8 / 16 / 32 when unset)",
     )
     stream_group.add_argument(
         "--num-left-chunks",
@@ -159,7 +164,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_envint("NUM_UTTERANCES", 10),
         metavar="N",
         help="Number of .wav files per benchmark run "
-             "(reads $NUM_UTTERANCES if set; otherwise default: 10)",
+        "(reads $NUM_UTTERANCES if set; otherwise default: 10)",
     )
 
     # --- Precision ---
@@ -188,12 +193,33 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--admit-mode",
+        choices=["burst", "trickle"],
+        default="burst",
+        help="Arrival pattern for the per-family subroutines: 'burst' adds every "
+        "request up front (one wide scheduler batch); 'trickle' adds one per "
+        "engine tick, reproducing independent interactive arrivals. Same total "
+        "work — the delta isolates how well a decode family batches across "
+        "separately admitted requests.",
+    )
+
+    parser.add_argument(
+        "--decode-admit-window-ms",
+        type=float,
+        default=0.0,
+        help="Incremental (AED / LLM) decode: hold a thin waiting queue this long "
+        "so near-simultaneous arrivals prefill as ONE decode batch. An AR "
+        "decoder step is weight-read bound, so two groups cost ~2x one group "
+        "of the same total rows. Default 0 (off).",
+    )
+
+    parser.add_argument(
         "--cuda-graphs",
         choices=["on", "off"],
         default=None,
         help="Enable / disable CUDA Graph capture for the streaming encoder "
-             "forward. Defaults to the engine config setting "
-             "(``EngineConfig.use_cuda_graphs``).",
+        "forward. Defaults to the engine config setting "
+        "(``EngineConfig.use_cuda_graphs``).",
     )
 
     return parser
@@ -208,6 +234,7 @@ def main() -> None:
     output.write_header("OASR ASR Engine Benchmark")
 
     import torch
+
     dtype_map = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
@@ -221,7 +248,7 @@ def main() -> None:
 
     for sub in args.subroutines:
         output.write_header(f"--- {sub} ---")
-        is_streaming = sub.startswith("streaming")
+        is_streaming = _is_streaming_subroutine(sub)
         default_mbs = 32 if is_streaming else 4
         max_batch_size = args.max_batch_size if explicit_mbs else default_mbs
         _run_config(
@@ -237,6 +264,8 @@ def main() -> None:
             dtype=dtype,
             output=output,
             use_cuda_graphs=(args.cuda_graphs == "on" if args.cuda_graphs else None),
+            admit_mode=args.admit_mode,
+            decode_admit_window_ms=args.decode_admit_window_ms,
         )
 
     output.finalize()

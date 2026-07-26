@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -68,14 +68,21 @@ class EngineConfig:
         Which GPU CTC decoder to use:
         ``"ctc_cuda"`` — GPU beam search via ``GpuStreamingDecoder`` (default),
         ``"ctc_wfst"`` — k2 WFST beam search (GPU, requires a k2 build).
-    ctc_decoder_config : GpuDecoderConfig, optional
-        Config for ``decoder_type="ctc_cuda"``.  Defaults to
-        ``GpuDecoderConfig()``.
-    wfst_decoder_config : DecoderConfig, optional
-        Config for ``decoder_type="ctc_wfst"``.  Defaults to
-        ``DecoderConfig(search_type="wfst")``.
-    fst_path : str, optional
-        Path to the WFST FST file (only needed for ``"ctc_wfst"``).
+        This is a **registry selector** (it picks the strategy), not a family
+        option, so it stays here.
+    decode_options : dict
+        Per-family decode knobs, validated against the active strategy's
+        ``options_cls``.  Adding a decode family needs no new field here — see
+        ``oasr.engine.decode.options`` and ``docs/architecture.md``.
+    ctc_decoder_config, wfst_decoder_config, fst_path, rescoring_ctc_weight,
+    rescoring_reverse_weight, transducer_max_sym_per_frame, max_new_tokens,
+    llm_prompt
+        **Deprecated aliases.**  These are per-family options that now live on
+        the owning strategy (``strategy.options``).  They still work — the
+        public API and every ``oasr-server`` flag map onto them — and each
+        carries the same default as the option it aliases, but new knobs should
+        go in the family's ``options_cls`` and be set through
+        ``decode_options``.
     sentencepiece_model : str, optional
         Path to a SentencePiece ``.model`` file for detokenization.
         Auto-detected from ``ckpt_dir`` if not provided.
@@ -268,6 +275,139 @@ class EngineConfig:
     wfst_decoder_config: Optional[DecoderConfig] = None
     fst_path: Optional[str] = None
 
+    # Decode-method selection among the model's capabilities.  ``None``
+    # (default) runs ``model.default_decode_type`` — the unchanged production
+    # behaviour.  Set to another capability the checkpoint advertises (e.g.
+    # ``"ctc_aed_rescoring"`` on a U2++ hybrid) to opt in; the engine validates
+    # the name against ``model.capabilities`` at construction.
+    decode_method: Optional[str] = None
+
+    # Generic per-family decode knobs, validated by the active strategy's
+    # ``options_cls`` (see ``oasr.engine.decode.options``).  This is what lets a
+    # new decode family ship its own configuration **without** adding fields
+    # here — and what ``oasr-server --decode-option k=v`` writes into.  Unknown
+    # keys raise at engine construction, naming the valid ones.
+    decode_options: Dict[str, Any] = field(default_factory=dict)
+
+    # CTC+AED attention rescoring (``decode_method="ctc_aed_rescoring"``).
+    # ``rescoring_ctc_weight`` fuses the CTC n-best score into the decoder
+    # score (WeNet's decode-time ``ctc_weight``; 0.5 is the WeNet U2++ recipe
+    # setting — distinct from the 0.3 *training* loss weight).
+    # ``rescoring_reverse_weight`` weights the right-to-left decoder pass;
+    # ``None`` uses the checkpoint's trained ``reverse_weight`` (0.0 on plain
+    # transformer decoders — the reverse pass is then skipped entirely).
+    # The n-best width is ``ctc_decoder_config.beam_size``.
+    rescoring_ctc_weight: float = 0.5
+    rescoring_reverse_weight: Optional[float] = None
+
+    # Transducer (RNNT) greedy decode: cap on non-blank emissions per encoder
+    # frame.  Safety bound against degenerate loops; applied uniformly so
+    # results are deterministic.  Only read by ``decode_type == "transducer"``
+    # models (see ``oasr/engine/decode/transducer.py``).
+    transducer_max_sym_per_frame: int = 10
+
+    # Incremental (label-synchronous AR) decode — AED / LLM strategies only.
+    # ``decode_steps_per_tick`` caps the *batched* decoder steps one engine
+    # ``step()`` runs across all pending requests, keeping per-tick work
+    # bounded (the serving dispatcher's contract; see keystone K2 in
+    # .artifacts/multi_paradigm.md).  ``max_decode_slots`` caps how many
+    # AR requests may be in flight before new-batch admission pauses;
+    # ``None`` defaults to ``max_batch_size``.  Both are inert for
+    # frame-synchronous strategies (CTC / transducer / rescoring).
+    decode_steps_per_tick: int = 32
+    max_decode_slots: Optional[int] = None
+    # Ceiling on total **decoder-KV** bytes across in-flight AR requests, in
+    # GiB.  ``max_decode_slots`` bounds admission by request *count*, which does
+    # not bound memory: a row's KV footprint is its position budget (prompt +
+    # generation cap) times the model's per-token rate, and prefill preallocates
+    # all of it.  Sizing formula, mirroring the one used for the WFST arenas:
+    #
+    #     bytes/row = 2 * layers * kv_heads * head_dim * itemsize
+    #                   * (prompt_positions + max_new_tokens)
+    #
+    # Both factors are knowable before the encode for these families because
+    # they run a fixed-window frontend.  ``None`` (default) leaves the byte
+    # budget off and keeps the slot cap as the only limit.
+    decode_kv_budget_gib: Optional[float] = None
+
+    # Long-form decoding for fixed-window frontends (``whisper_logmel``).  With
+    # a fixed window, audio longer than it is *rejected* at admission (C5) —
+    # honest, but it refuses work the model can do.  Setting this fans a long
+    # request out into consecutive windows, decodes them through the normal
+    # batched path, and stitches one output.
+    #
+    # A request-lifecycle knob, not a per-family option: one request becoming N
+    # encoder passes and one output is the engine's business, the same way
+    # ``max_decode_slots`` is.
+    #
+    # The windows are decoded **in parallel**, so a long file costs about one
+    # window of wall clock rather than N sequential decodes.  The price is
+    # boundary accuracy — see ``oasr/engine/longform.py`` for the trade-off
+    # against OpenAI's sequential, previous-text-conditioned loop.
+    # Streaming: recycle the oldest KV block at capacity instead of terminating
+    # the stream (M1(3)).  With unlimited history a stream grows one block per
+    # encoder chunk until it hits the ceiling the block table and pool impose,
+    # and today it is finalised there with ``finish_reason="length"`` — correct
+    # but a hard limit on stream duration.  Recycling makes memory bounded by
+    # construction and lets a stream run indefinitely.
+    #
+    # Measured on the WeNet conformer: identical transcripts (0.00% WER) for
+    # audio inside the retained window, and past it the recycling run decodes
+    # the whole file where unlimited truncates.  Off by default because it does
+    # change the model's attention span for very long streams; the eviction path
+    # itself now costs ~3-5% (was 11-15% before batching).
+    recycle_streaming_history: bool = False
+
+    long_form: bool = False
+    # Audio shared between adjacent long-form windows.  Overlapping lets the
+    # stitcher drop duplicated words at a cut instead of losing one; 0 disables.
+    long_form_overlap_seconds: float = 1.0
+    # Wall-clock cap on one engine tick's decode phase, in milliseconds.  The
+    # step cap above bounds *work*, not *time*, and one decoder step spans two
+    # orders of magnitude across models (measured: ~1.5 ms for whisper-tiny at
+    # B=8, ~18 ms for Qwen2-Audio-7B at B=4), so a fixed step count means a
+    # ~50 ms tick on one model and a ~580 ms tick on another.  The serving
+    # dispatcher holds the GIL for a whole tick, so that is the floor on cancel
+    # latency, admission latency, and the gap between streaming partials.
+    #
+    # Whichever limit binds first wins: light models still run many steps per
+    # tick, heavy models stop early and stream tokens at an interactive cadence.
+    # The deadline stops *starting* steps rather than preempting one, so the real
+    # bound is ``max_tick_ms + one step``.  ``0`` disables it (step cap only).
+    # Inert for frame-synchronous strategies (CTC / transducer / rescoring),
+    # which do not use the incremental protocol.
+    max_tick_ms: float = 25.0
+    # Incremental (AED / LLM) decode: wait up to this many milliseconds for more
+    # arrivals before prefilling a decode batch, so requests that arrive close
+    # together generate in **one** batch instead of several.
+    #
+    # Why this matters more than it looks: an AR decoder step is weight-read
+    # bound, so its cost barely depends on how many rows it carries.  Two decode
+    # groups therefore cost about twice one group of the same total rows — total
+    # forwards is the *sum over groups* of each group's step count.  Measured on
+    # Qwen2-Audio-7B, 4 utterances / 124 tokens: arriving together took 922 ms
+    # (134 tok/s); arriving one per tick took 1614 ms (77 tok/s) for identical
+    # work, purely because two groups formed instead of one.
+    #
+    # Groups cannot be merged after the fact: both decoder surfaces keep a
+    # **shared scalar** generation offset (``WhisperDecoder`` ``state["pos"]``,
+    # ``Qwen2Lm`` ``state["len"]``), so rows at different positions cannot share
+    # a forward.  Per-row offsets are the prerequisite — the same one paged
+    # decoder-KV needs.  Until then, coalescing at admission is the lever.
+    #
+    # Trade-off: it delays the first token of an *isolated* request by up to this
+    # window.  Default ``0`` (off) keeps today's latency; raise it for
+    # throughput-oriented deployments.  Bounded by ``max_wait_time`` regardless.
+    decode_admit_window_ms: float = 0.0
+
+    # AR generation length cap (per request), read by incremental strategies.
+    max_new_tokens: int = 448
+
+    # Speech-LLM user prompt (``decode_method="llm"``): the text placed in the
+    # checkpoint's chat template next to the audio (e.g. Qwen2-Audio's ASR
+    # prompt).  ``None`` uses the model config's ``default_user_prompt``.
+    llm_prompt: Optional[str] = None
+
     # Streaming interim-partial cadence.  After each streaming decode step the
     # engine reads the best-so-far hypothesis back to the host to emit a partial
     # transcript — a per-stream device→host sync that, profiled, is ~17% of
@@ -322,6 +462,38 @@ class EngineConfig:
                 f"max_batch_frames must be a positive int or None, got "
                 f"{self.max_batch_frames!r}"
             )
+        if self.transducer_max_sym_per_frame < 1:
+            raise ValueError(
+                f"transducer_max_sym_per_frame must be >= 1, got "
+                f"{self.transducer_max_sym_per_frame!r}"
+            )
+        if self.decode_steps_per_tick < 1:
+            raise ValueError(
+                f"decode_steps_per_tick must be >= 1, got {self.decode_steps_per_tick!r}"
+            )
+        if self.long_form_overlap_seconds < 0:
+            raise ValueError(
+                "long_form_overlap_seconds must be >= 0, got " f"{self.long_form_overlap_seconds!r}"
+            )
+        if self.decode_kv_budget_gib is not None and self.decode_kv_budget_gib <= 0:
+            raise ValueError(
+                "decode_kv_budget_gib must be > 0 or None (disabled), got "
+                f"{self.decode_kv_budget_gib!r}"
+            )
+        if self.max_decode_slots is not None and self.max_decode_slots < 1:
+            raise ValueError(
+                f"max_decode_slots must be a positive int or None, got "
+                f"{self.max_decode_slots!r}"
+            )
+        if self.max_new_tokens < 1:
+            raise ValueError(f"max_new_tokens must be >= 1, got {self.max_new_tokens!r}")
+        if self.max_tick_ms < 0:
+            raise ValueError(f"max_tick_ms must be >= 0 (0 disables), got {self.max_tick_ms!r}")
+        if self.decode_admit_window_ms < 0:
+            raise ValueError(
+                "decode_admit_window_ms must be >= 0 (0 disables), got "
+                f"{self.decode_admit_window_ms!r}"
+            )
         if self.enable_sequence_packing:
             if self.service_mode != "offline":
                 raise ValueError("enable_sequence_packing requires service_mode='offline'")
@@ -329,12 +501,26 @@ class EngineConfig:
                 raise ValueError(
                     f"max_packed_frames must be a positive int, got " f"{self.max_packed_frames!r}"
                 )
+        # Track which of the checkpoint-derivable fields the caller set
+        # explicitly, so a converter-emitted FeatureSpec / TokenizerSpec can
+        # fill the defaults without overriding a deliberate choice (the engine
+        # warns loudly when an explicit value disagrees with the spec).
+        # ``audio_scale`` counts as explicit only when it differs from the
+        # class default (32768.0 — setting the default explicitly is a no-op);
+        # Whisper checkpoints need the spec to flip it to 1.0.
+        self._audio_scale_explicit = self.audio_scale != 32768.0
+        self._feature_config_explicit = self.feature_config is not None
+        self._tokenizer_paths_explicit = (
+            self.sentencepiece_model is not None or self.unit_table is not None
+        )
         if self.feature_config is None:
             self.feature_config = FeatureConfig(dither=0.0)
-        if self.ctc_decoder_config is None:
-            self.ctc_decoder_config = GpuDecoderConfig()
-        if self.wfst_decoder_config is None:
-            self.wfst_decoder_config = DecoderConfig(search_type="wfst")
+        # ``ctc_decoder_config`` / ``wfst_decoder_config`` are deliberately left
+        # ``None`` here.  They are **CTC-family** options and are built by the
+        # CTC strategies' ``options_cls`` factories, so an engine running
+        # Whisper / speech-LLM / Paraformer no longer constructs a beam config
+        # and a WFST config it will never read (the leak §3.2 of the design doc
+        # flagged).  Read them through ``strategy.options.decoder_config``.
         # Normalise preferred_batch_size: dedupe, sort, validate each <= cap.
         if self.preferred_batch_size is not None:
             cleaned = sorted({int(v) for v in self.preferred_batch_size})
@@ -354,7 +540,10 @@ class EngineConfig:
             # caches share one ladder; explicit override still wins.
             if self.feature_graph_batch_buckets is None:
                 self.feature_graph_batch_buckets = list(cleaned)
-        # Auto-detect SentencePiece model and unit table from checkpoint dir
+        # Auto-detect SentencePiece model and unit table from checkpoint dir.
+        # Deprecated fallback: when the checkpoint conversion emits a
+        # TokenizerSpec (WeNet / icefall / native all do), the engine builds the
+        # tokenizer from the spec and these sniffed paths are ignored.
         if self.ckpt_dir and os.path.isdir(self.ckpt_dir):
             if self.sentencepiece_model is None:
                 for fname in os.listdir(self.ckpt_dir):
@@ -433,6 +622,7 @@ class EngineConfig:
             kernel_size=cache_spec.conv_kernel_size,
             chunk_size=self.chunk_size,
             num_left_chunks=self.num_left_chunks,
+            recycle_streaming_history=self.recycle_streaming_history,
             block_size_frames=self.block_size_frames,
             max_num_blocks=self.max_num_blocks,
             max_blocks_per_seq=self.max_blocks_per_seq,

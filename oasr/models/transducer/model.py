@@ -5,26 +5,48 @@
 Engine integration: ``decode_type`` resolves to ``"transducer"`` (via the
 predictor's class attribute), so the engine selects
 :class:`~oasr.engine.decode.TransducerDecodeStrategy`.  That strategy consumes
-raw encoder hidden states (``ModelRunner.encode_offline``) and drives this
-model's ``decoder`` (predictor) + ``joiner`` directly — frame-synchronous greedy
-search — rather than the fused CTC head path.
+raw encoder hidden states (``consumes="hidden"``) and drives this model's
+``decoder`` (predictor) + ``joiner`` directly — frame-synchronous greedy
+search — rather than the fused CTC head path.  Streaming follows the encoder:
+a Conformer front-end streams through the paged-KV backend
+(``encode_chunk_paged``), a Zipformer front-end through the stateful backend
+(``encoder.streaming_forward``); both feed the strategy hidden states.
 """
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+import logging
+from typing import Any, List, Mapping, Optional, Tuple
 
 import torch
 
-from ..base import BaseAsrModel, BaseEncoder
+from ..base import BaseAsrModel, BaseEncoder, LoadReport
 from ..decoders.base import BaseDecoder, Joiner
 from .config import TransducerModelConfig
 from .decoder import StatelessDecoder
 from .joiner import TransducerJoiner
 
+logger = logging.getLogger(__name__)
+
 
 class TransducerModel(BaseAsrModel):
     """Encoder + stateless predictor (``decoder``) + ``joiner``."""
+
+    # Conformer front-ends rebuild the positional-encoding table from config;
+    # harmless no-op for Zipformer front-ends (no matching keys).
+    _computed_buffer_suffixes = ("pos_enc.pe",)
+
+    @property
+    def default_decode_type(self) -> str:
+        return "transducer"
+
+    @property
+    def capabilities(self) -> frozenset:
+        """Declared, not derived: the conformance test in
+        ``tests/test_model_contract.py`` checks every registered architecture's
+        advertised capabilities against ``oasr.models.interfaces.CAPABILITIES``,
+        and can only do that without building the model when it is a constant."""
+        return frozenset({"transducer"})
 
     def __init__(
         self,
@@ -54,10 +76,16 @@ class TransducerModel(BaseAsrModel):
     def from_config(
         cls, config: TransducerModelConfig, global_cmvn: Optional[Any] = None, **aux: Any
     ) -> "TransducerModel":
-        from ..conformer.model import ConformerEncoder
+        if config.encoder_type == "zipformer":
+            from ..zipformer.model import ZipformerEncoder
 
-        encoder = ConformerEncoder(config.encoder, global_cmvn)
-        enc_dim = config.encoder.output_size
+            encoder: BaseEncoder = ZipformerEncoder(config.encoder)
+            enc_dim = encoder.output_size
+        else:
+            from ..conformer.model import ConformerEncoder
+
+            encoder = ConformerEncoder(config.encoder, global_cmvn)
+            enc_dim = config.encoder.output_size
         vocab = config.vocab_size
         assert vocab is not None, "TransducerModelConfig.vocab_size must be set"
         decoder = StatelessDecoder(
@@ -66,17 +94,61 @@ class TransducerModel(BaseAsrModel):
         joiner = TransducerJoiner(enc_dim, config.decoder_dim, config.joiner_dim, vocab)
         return cls(encoder, decoder, joiner, blank_id=config.blank_id)
 
-    def load_weights(self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False) -> None:
-        """Load ``encoder.*`` / ``decoder.*`` / ``joiner.*`` weights.
+    # -- stateful streaming passthrough (Zipformer-style front-ends) ---------
+    def get_streaming_init_states(
+        self,
+        batch_size: int = 1,
+        device: torch.device = torch.device("cpu"),
+        dtype: Optional[torch.dtype] = None,
+    ) -> List[torch.Tensor]:
+        """Initial encoder streaming state (``dtype`` defaults to param dtype)."""
+        if dtype is None:
+            dtype = next(self.parameters()).dtype
+        return self.encoder.get_streaming_init_states(batch_size, device, dtype)
 
-        Placeholder loader (no transducer checkpoint is validated yet): a real
-        ``CheckpointConverter`` (e.g. an icefall pruned-transducer converter)
-        would handle vocab padding + the pruned ``simple_*_proj`` aux heads.
+    def load_weights(
+        self, state_dict: Mapping[str, torch.Tensor], *, strict: bool = False
+    ) -> LoadReport:
+        """Map an icefall transducer state-dict into this model.
+
+        Encoder keys follow the front-end: Zipformer front-ends remap icefall's
+        ``encoder_embed.*`` / ``encoder.*`` to ``encoder.encoder_embed.*`` /
+        ``encoder.encoder.*`` (same rule as :class:`ZipformerModel`); Conformer
+        front-ends take ``encoder.*`` as-is.  The predictor (``decoder.*`` —
+        icefall's stateless ``Decoder``: ``embedding`` / ``conv``) and the
+        ``joiner.*`` (``encoder_proj`` / ``decoder_proj`` / ``output_linear``)
+        map 1:1.  Everything else (``simple_*_proj`` pruned-RNNT training
+        heads, a hybrid ``ctc_output.*`` branch) lands in
+        ``LoadReport.dropped`` for the registry to account for.
         """
-        missing, unexpected = self.load_state_dict(dict(state_dict), strict=strict)
-        if missing or unexpected:
-            import logging
+        # ``isinstance``, not a class-name string: a name comparison silently
+        # takes the wrong branch for any subclass (or a same-named class from
+        # another module), which here means the encoder keys are not remapped
+        # and every encoder weight is quietly dropped.
+        from oasr.models.zipformer.model import ZipformerEncoder
 
-            logging.getLogger(__name__).warning(
-                "Transducer load_weights: missing=%s unexpected=%s", missing, unexpected
-            )
+        zipformer_front = isinstance(self.encoder, ZipformerEncoder)
+        remapped = {}
+        dropped = []
+        for k, v in state_dict.items():
+            if k.startswith("decoder.") or k.startswith("joiner."):
+                remapped[k] = v
+            elif zipformer_front and k.startswith("encoder_embed."):
+                remapped["encoder.encoder_embed." + k[len("encoder_embed.") :]] = v
+            elif zipformer_front and k.startswith("encoder."):
+                remapped["encoder.encoder." + k[len("encoder.") :]] = v
+            elif not zipformer_front and k.startswith("encoder."):
+                remapped[k] = v
+            else:
+                dropped.append(k)
+
+        missing, unexpected = self.load_state_dict(remapped, strict=strict)
+        expected_missing_suffixes = self._computed_buffer_suffixes
+        real_missing = [
+            k for k in missing if not any(k.endswith(s) for s in expected_missing_suffixes)
+        ]
+        if real_missing:
+            logger.warning("Missing keys when loading transducer weights: %s", real_missing)
+        if unexpected:
+            logger.warning("Unexpected keys when loading transducer weights: %s", unexpected)
+        return LoadReport.build(remapped, real_missing, unexpected, dropped)

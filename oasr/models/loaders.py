@@ -14,15 +14,40 @@ resolution.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
-from .base import BaseAsrModel, BaseModelConfig
-from .registry import build_model_from_checkpoint
+from .base import BaseAsrModel, BaseModelConfig, LoadReport
+from .registry import build_model_from_checkpoint, instantiate_from_bundle, load_checkpoint_bundle
+
+if TYPE_CHECKING:
+    from oasr.checkpoints import DecodingDefaults
+    from oasr.features import FeatureSpec
+    from oasr.tokenizers import TokenizerSpec
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PretrainedModel:
+    """A loaded model plus the checkpoint-derived metadata that travels with it.
+
+    Returned by :func:`load_pretrained`.  The engine consumes the specs
+    (tokenizer / features / decoding) instead of sniffing ``ckpt_dir`` paths;
+    ``load_report`` is ``None`` for native checkpoints (strict load, nothing
+    dropped).
+    """
+
+    model: BaseAsrModel
+    config: BaseModelConfig
+    architecture: str
+    tokenizer_spec: Optional["TokenizerSpec"]
+    feature_spec: Optional["FeatureSpec"]
+    decoding: "DecodingDefaults"
+    load_report: Optional[LoadReport]
 
 
 def _resolve_to_local_dir(
@@ -68,8 +93,13 @@ def from_pretrained(
     revision: Optional[str] = None,
     cache_dir: Optional[str] = None,
     allow_patterns: Optional[List[str]] = None,
+    architecture: Optional[str] = None,
 ) -> Tuple[BaseAsrModel, BaseModelConfig]:
     """Load an ASR model + config from a local dir or a HuggingFace Hub id.
+
+    Native OASR checkpoints (``oasr_config.json``, written by ``oasr-convert``)
+    load directly with no format conversion; other dirs go through the detected
+    (or explicitly overridden) format converter.
 
     Args:
         model_id_or_path: Local checkpoint directory, or a HuggingFace Hub repo
@@ -81,6 +111,7 @@ def from_pretrained(
         revision: Hub revision (branch / tag / commit) when downloading.
         cache_dir: Hub cache directory override.
         allow_patterns: Restrict which Hub files are downloaded.
+        architecture: Explicit registry key, skipping format detection.
 
     Returns:
         ``(model, config)`` — the live model in eval mode and its config.
@@ -91,4 +122,50 @@ def from_pretrained(
         cache_dir=cache_dir,
         allow_patterns=allow_patterns,
     )
-    return build_model_from_checkpoint(local_dir, checkpoint_name, device=device, dtype=dtype)
+    return build_model_from_checkpoint(
+        local_dir, checkpoint_name, device=device, dtype=dtype, architecture=architecture
+    )
+
+
+def load_pretrained(
+    model_id_or_path: Union[str, Path],
+    *,
+    checkpoint_name: str = "final.pt",
+    device: str = "cpu",
+    dtype: Optional[torch.dtype] = None,
+    revision: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+    allow_patterns: Optional[List[str]] = None,
+    architecture: Optional[str] = None,
+) -> PretrainedModel:
+    """:func:`from_pretrained`, but returning the full :class:`PretrainedModel`.
+
+    Same resolution pipeline; additionally surfaces the converter-emitted
+    tokenizer / feature / decoding specs and the weight-load report, so callers
+    (the engine, ``oasr-convert``) never re-derive checkpoint metadata.
+    """
+    local_dir = _resolve_to_local_dir(
+        model_id_or_path,
+        revision=revision,
+        cache_dir=cache_dir,
+        allow_patterns=allow_patterns,
+    )
+    # The bundle's state dict always lands host-side: mapping it onto the GPU
+    # would keep a full second weight copy resident (the bundle stays alive
+    # for its specs) while the model moves over — an 8.4B-parameter speech-LLM
+    # checkpoint then cannot fit at all.  ``instantiate_from_bundle`` moves the
+    # weight-loaded model to ``device`` as its final step.
+    arch, bundle = load_checkpoint_bundle(
+        local_dir, checkpoint_name, map_location="cpu", architecture=architecture
+    )
+    model, config, report = instantiate_from_bundle(arch, bundle, device=device, dtype=dtype)
+    logger.info("Loaded %r model from %s (eval mode)", arch, local_dir)
+    return PretrainedModel(
+        model=model,
+        config=config,
+        architecture=arch,
+        tokenizer_spec=bundle.tokenizer,
+        feature_spec=bundle.features,
+        decoding=bundle.decoding,
+        load_report=report,
+    )
