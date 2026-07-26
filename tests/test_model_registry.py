@@ -351,3 +351,107 @@ class TestModelDiscovery:
         assert any("broken" in r.getMessage() for r in caplog.records)
         # The built-ins are still reachable.
         assert "conformer" in registry.list_models()
+
+
+class TestExpectedUnusedMatching:
+    """A normal WeNet checkpoint must not report "unrecognized tensors".
+
+    WeNet builds ``concat_linear`` in every encoder/decoder layer unconditionally
+    and only *uses* it when ``concat_after=True``, so a checkpoint trained with
+    the default carries ~24 unused parameters.  ``expected_unused_prefixes``
+    matched by key **prefix** only, which cannot express
+    ``encoder.encoders.N.concat_linear.*`` — so they were reported as
+    unrecognized, and the ``decoder.*`` ones fell through to the capability hint,
+    which then announced that attention rescoring was unavailable **on a
+    checkpoint whose decoder had loaded fine**.  A false capability warning is
+    worse than a noisy one.
+    """
+
+    def _report(self, dropped):
+        from oasr.models.base import LoadReport
+
+        return LoadReport(mapped=["encoder.x"], dropped=list(dropped), missing=[])
+
+    def _warn(self, caplog, dropped, expected=(), hints=None):
+        import logging
+        from types import SimpleNamespace
+
+        from oasr.models import registry
+
+        conv = SimpleNamespace(
+            expected_unused_prefixes=tuple(expected),
+            capability_drop_hints=dict(hints or {}),
+        )
+        with caplog.at_level(logging.WARNING):
+            registry._log_load_report(self._report(dropped), conv, "conformer")  # noqa: SLF001
+        return [r.getMessage() for r in caplog.records]
+
+    def test_a_dotted_component_is_matched_not_just_a_prefix(self, caplog):
+        dropped = [
+            "encoder.encoders.0.concat_linear.weight",
+            "decoder.left_decoder.decoders.0.concat_linear1.bias",
+        ]
+        msgs = self._warn(caplog, dropped, expected=("concat_linear",))
+        assert not msgs, f"expected silence, got {msgs}"
+
+    def test_a_genuinely_unknown_tensor_still_warns(self, caplog):
+        msgs = self._warn(caplog, ["encoder.mystery.weight"], expected=("concat_linear",))
+        assert any("unrecognized" in m for m in msgs)
+
+    def test_a_prefix_declaration_still_works(self, caplog):
+        """icefall's ``simple_am_proj`` is a real prefix — do not regress it."""
+        msgs = self._warn(caplog, ["simple_am_proj.weight"], expected=("simple_am_proj",))
+        assert not msgs, msgs
+
+    def test_undeclared_concat_linear_would_trip_the_capability_hint(self, caplog):
+        """The bug being fixed, pinned: without the declaration the hint lies."""
+        msgs = self._warn(
+            caplog,
+            ["decoder.left_decoder.decoders.0.concat_linear1.bias"],
+            expected=(),
+            hints={"decoder.": "attention rescoring is unavailable"},
+        )
+        assert any("attention rescoring is unavailable" in m for m in msgs)
+
+    def test_the_wenet_converter_declares_it(self):
+        from oasr.models.conformer.convert import WenetConverter
+
+        assert "concat_linear" in WenetConverter.expected_unused_prefixes
+
+
+class TestConcatAfterIsRejected:
+    """OASR's Conformer implements only the residual form.
+
+    ``concat_after=True`` replaces each sub-layer's residual add with
+    ``concat_linear(cat([x, out]))``.  Silently ignoring it loads a
+    plausible-looking model that computes something else — the same
+    raise-instead-of-guess rule the icefall shape-inference fallback follows.
+    """
+
+    def _yaml(self, **enc):
+        return {"input_dim": 80, "output_dim": 100, "encoder_conf": dict(enc)}
+
+    def test_encoder_concat_after_raises(self):
+        from oasr.models.conformer.convert import build_config_from_wenet
+
+        with pytest.raises(ValueError, match="concat_after"):
+            build_config_from_wenet(self._yaml(concat_after=True))
+
+    def test_decoder_concat_after_raises(self):
+        from oasr.models.conformer.convert import build_config_from_wenet
+
+        raw = self._yaml()
+        raw["decoder_conf"] = {"concat_after": True}
+        with pytest.raises(ValueError, match="concat_after"):
+            build_config_from_wenet(raw)
+
+    def test_the_default_is_accepted(self):
+        from oasr.models.conformer.convert import build_config_from_wenet
+
+        cfg = build_config_from_wenet(self._yaml(output_size=256))
+        assert cfg.encoder.output_size == 256
+
+    def test_explicit_false_is_accepted(self):
+        from oasr.models.conformer.convert import build_config_from_wenet
+
+        assert build_config_from_wenet(self._yaml(concat_after=False)) is not None

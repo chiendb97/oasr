@@ -145,14 +145,39 @@ class IcefallConverter(BaseCheckpointConverter):
                 return pts[0]
         return None
 
+    @staticmethod
+    def _tokenizer_dirs_under(root: Path) -> List[Path]:
+        """``root`` itself, ``root/data``, and ``root/data/lang_*``."""
+        dirs = [root, root / "data"]
+        if (root / "data").is_dir():
+            dirs.extend(sorted((root / "data").glob("lang_*")))
+        return dirs
+
     def _tokenizer_search_dirs(self, ckpt_dir: Path) -> List[Path]:
-        """Where icefall keeps tokenizer assets: the dir itself, ``data/``, and
-        ``data/lang_*`` recipe layouts."""
+        """Where icefall keeps tokenizer assets.
+
+        An icefall release puts the weights in ``<root>/exp`` and the tokenizer in
+        ``<root>/data/lang_*`` — **siblings**.  So the search covers the parent
+        too when the parent has a ``data/`` directory: pointing at ``exp/`` is a
+        natural thing to do (it is where the weights are, and ``_find_ckpt``
+        accepts it), and without this the bundle loads with ``tokenizer=None``,
+        the engine falls back to joining raw ids, and the transcript comes out as
+        numbers with no error anywhere.
+
+        The checkpoint dir's own assets are searched first, so a self-contained
+        directory is never overridden by a sibling.
+        """
         ckpt_dir = Path(ckpt_dir)
-        dirs = [ckpt_dir, ckpt_dir / "data"]
-        if (ckpt_dir / "data").is_dir():
-            dirs.extend(sorted((ckpt_dir / "data").glob("lang_*")))
-        return [d for d in dirs if d.is_dir()]
+        dirs = self._tokenizer_dirs_under(ckpt_dir)
+        parent = ckpt_dir.parent
+        if parent != ckpt_dir and (parent / "data").is_dir():
+            dirs.extend(self._tokenizer_dirs_under(parent))
+        seen, out = set(), []
+        for d in dirs:
+            if d.is_dir() and d not in seen:
+                seen.add(d)
+                out.append(d)
+        return out
 
     def _find_tokenizer_asset(self, ckpt_dir: Path, name: str) -> Optional[Path]:
         for d in self._tokenizer_search_dirs(ckpt_dir):

@@ -226,9 +226,7 @@ class TestZipformerParity:
             my_lens = my_masks.squeeze(1).sum(-1)
 
         assert my_out.shape == ref_out.shape, (my_out.shape, ref_out.shape)
-        torch.testing.assert_close(
-            my_out.float().cpu(), ref_out, rtol=self._RTOL, atol=self._ATOL
-        )
+        torch.testing.assert_close(my_out.float().cpu(), ref_out, rtol=self._RTOL, atol=self._ATOL)
         assert torch.equal(my_lens.cpu().to(ref_lens.dtype), ref_lens)
 
     def test_streaming_parity(self, tmp_path):
@@ -238,9 +236,7 @@ class TestZipformerParity:
 
         torch.manual_seed(4321)
         L, C = 32, 16
-        enc_cfg = _tiny_encoder_config(
-            causal=True, chunk_size=(C,), left_context_frames=(L,)
-        )
+        enc_cfg = _tiny_encoder_config(causal=True, chunk_size=(C,), left_context_frames=(L,))
         ref_embed, ref_enc = _build_reference(ref_zip, ref_sub, enc_cfg)  # CPU fp32
 
         model = ZipformerModel(ZipformerModelConfig(encoder=enc_cfg, vocab_size=32)).eval()
@@ -275,3 +271,184 @@ class TestZipformerParity:
         torch.testing.assert_close(
             my_hidden.float().cpu(), ref_out, rtol=self._RTOL, atol=self._ATOL
         )
+
+
+# --------------------------------------------------------------------------- #
+# Real icefall checkpoint (weights + tokenizer from an actual release)
+# --------------------------------------------------------------------------- #
+
+ZIPFORMER_CKPT = os.environ.get(
+    "ZIPFORMER_CKPT",
+    "/data01/kilm/users/chiendb/models/asr/icefall-asr-librispeech-zipformer-large-cr-ctc-20241018",
+)
+ZIP_WAV_DIR = os.environ.get(
+    "WAV_DIR", "/data01/kilm/users/chiendb/data/asr/ljspeech-sr16k-dataset/wavs"
+)
+
+
+def _zip_ckpt_present() -> bool:
+    from pathlib import Path
+
+    root = Path(ZIPFORMER_CKPT)
+    if not root.is_dir():
+        return False
+    # An HF snapshot can be present as *dangling LFS symlinks* with no payload,
+    # which is not a usable checkpoint — require a readable, non-empty file.
+    return any(p.is_file() and p.stat().st_size > 0 for p in root.rglob("*.pt"))
+
+
+@pytest.mark.skipif(not _zip_ckpt_present(), reason="icefall zipformer release absent")
+class TestRealIcefallCheckpoint:
+    """The converter against a real release, not a synthetic state dict.
+
+    icefall ships **no config file** — ``IcefallConverter`` infers the whole
+    architecture from tensor shapes, which is the one part of the checkpoint layer
+    that cannot be validated with random weights.  This release documents its own
+    geometry in ``exp/train.sh``, so the inference has a ground truth to be
+    checked against.
+    """
+
+    #: From ``exp/train.sh`` of the ``-large-cr-ctc-20241018`` release.
+    WANT_LAYERS = (2, 2, 4, 5, 4, 2)
+    WANT_DIM = (192, 256, 512, 768, 512, 256)
+    WANT_FF = (512, 768, 1536, 2048, 1536, 768)
+
+    @pytest.fixture(scope="class")
+    def bundle(self):
+        from oasr.models.registry import load_checkpoint_bundle
+
+        return load_checkpoint_bundle(ZIPFORMER_CKPT)
+
+    def test_detected_and_bundled(self, bundle):
+        arch, b = bundle
+        assert arch == "zipformer"
+        assert b.source_format == "icefall"
+        assert b.decoding.default_decode_type == "ctc"
+        # icefall CTC blank is id 0.
+        assert b.decoding.blank_id == 0
+
+    def test_shape_inference_matches_the_training_config(self, bundle):
+        """The claim that could not be tested without real weights.
+
+        A wrong inference builds a plausible-looking model that either dies with a
+        raw shape error much later or — if the dims happen to coincide — loads and
+        produces garbage.  Checked against the geometry the release itself
+        documents.
+        """
+        _arch, b = bundle
+        enc = b.model_config.encoder
+        assert tuple(enc.num_encoder_layers) == self.WANT_LAYERS
+        assert tuple(enc.encoder_dim) == self.WANT_DIM
+        assert tuple(enc.feedforward_dim) == self.WANT_FF
+        assert enc.causal is False, "this release is the non-streaming (offline) model"
+
+    def test_vocab_comes_from_the_ctc_head(self, bundle):
+        _arch, b = bundle
+        # lang_bpe_500 → 500 units + blank/unk/sos-eos, padded to a multiple of 8
+        # for the GEMM kernels.
+        assert b.model_config.vocab_size % 8 == 0
+        assert 500 <= b.model_config.vocab_size <= 512
+
+    def test_tokenizer_travels_with_the_checkpoint(self, bundle):
+        _arch, b = bundle
+        assert b.tokenizer is not None, "no TokenizerSpec — decode would emit raw ids"
+        assert b.tokenizer.kind == "sentencepiece"
+
+    def test_tokenizer_is_found_from_the_exp_subdir_too(self):
+        """icefall puts weights in ``exp/`` and the tokenizer in ``data/`` — siblings.
+
+        ``_find_ckpt`` accepts ``<root>/exp``, so pointing there is natural; without
+        searching the parent the bundle loaded with ``tokenizer=None`` and the
+        engine silently fell back to joining raw token ids — a transcript of
+        numbers, with no error anywhere.
+        """
+        from pathlib import Path
+
+        from oasr.models.registry import load_checkpoint_bundle
+
+        exp = Path(ZIPFORMER_CKPT) / "exp"
+        if not exp.is_dir():
+            pytest.skip("release has no exp/ subdir")
+        _arch, b = load_checkpoint_bundle(exp)
+        assert b.tokenizer is not None and b.tokenizer.kind == "sentencepiece"
+
+    def test_weights_load_exactly(self, bundle):
+        """No missing tensors, no dropped tensors — the inference was right.
+
+        This is the assertion that a synthetic checkpoint cannot make: a random
+        state dict is generated *from* the config, so it fits by construction.
+        """
+        from oasr.models.registry import instantiate_from_bundle
+
+        arch, b = bundle
+        model, cfg, report = instantiate_from_bundle(arch, b, device="cpu", dtype=torch.float32)
+        assert not report.missing, f"model tensors not filled: {report.missing[:8]}"
+        assert not report.dropped, f"checkpoint tensors dropped: {report.dropped[:8]}"
+        assert len(report.mapped) > 500, "suspiciously few tensors mapped"
+        assert sorted(model.capabilities) == ["ctc"]
+        assert model.encoder.streaming_kind == "stateful"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
+    @pytest.mark.skipif(not os.path.isdir(ZIP_WAV_DIR), reason="WAV_DIR not set or not found")
+    class TestEngineE2E:
+        """Offline + streaming transcription of real audio on real weights."""
+
+        def _audios(self, n=2):
+            import glob
+
+            import torchaudio
+
+            wavs = sorted(glob.glob(os.path.join(ZIP_WAV_DIR, "*.wav")))[:n]
+            if len(wavs) < n:
+                pytest.skip(f"need {n} wavs under {ZIP_WAV_DIR}")
+            return [torchaudio.load(w)[0].squeeze(0) for w in wavs]
+
+        def _engine(self, mode):
+            from oasr.engine import ASREngine, EngineConfig
+
+            return ASREngine(
+                EngineConfig(
+                    ckpt_dir=ZIPFORMER_CKPT,
+                    service_mode=mode,
+                    max_batch_size=4,
+                    dtype=torch.float16,
+                )
+            )
+
+        def test_offline_transcribes_real_audio(self):
+            eng = self._engine("offline")
+            try:
+                texts = eng.transcribe_offline(self._audios(2))
+                texts = [t.text if hasattr(t, "text") else t for t in texts]
+                assert "printing" in texts[0].lower(), texts[0]
+                assert "modern" in texts[1].lower(), texts[1]
+            finally:
+                del eng
+                torch.cuda.empty_cache()
+
+        def test_streaming_agrees_with_offline(self):
+            """The stateful backend on real weights.
+
+            A non-streaming (``causal=False``) release decoded chunk-by-chunk will
+            not match offline exactly — it was never trained for it — so this
+            asserts the transcript is *recognisably right* rather than identical.
+            """
+            offline = self._engine("offline")
+            try:
+                ref = offline.transcribe_offline(self._audios(1))[0]
+                ref = ref.text if hasattr(ref, "text") else ref
+            finally:
+                del offline
+                torch.cuda.empty_cache()
+
+            eng = self._engine("streaming")
+            try:
+                got = eng.transcribe(self._audios(1)[0])
+                got = got.text if hasattr(got, "text") else got
+            finally:
+                del eng
+                torch.cuda.empty_cache()
+            assert got.strip(), "streaming produced an empty transcript"
+            ref_words = set(ref.lower().split())
+            hit = sum(1 for w in got.lower().split() if w in ref_words)
+            assert hit >= max(3, len(ref_words) // 3), f"ref={ref!r} got={got!r}"

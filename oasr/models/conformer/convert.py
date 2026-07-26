@@ -49,6 +49,21 @@ def parse_wenet_yaml(yaml_path: str) -> Dict[str, Any]:
 def build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
     """Translate a WeNet ``train.yaml`` into a :class:`ConformerModelConfig`."""
     enc = raw.get("encoder_conf", {})
+    # ``concat_after`` replaces each sub-layer's residual add with
+    # ``concat_linear(cat([x, sublayer_out]))``.  OASR's encoder implements only
+    # the residual form, so honouring a checkpoint that asks for the other one is
+    # impossible — and *ignoring* it would load a plausible-looking model that
+    # silently computes something else.  Fail where the information is, rather
+    # than shipping wrong transcripts.  (Checkpoints trained with the default
+    # still *carry* the unused ``concat_linear`` parameters, which is why the
+    # converter declares them expected-unused.)
+    for section in ("encoder_conf", "decoder_conf"):
+        if raw.get(section, {}).get("concat_after"):
+            raise ValueError(
+                f"train.yaml sets {section}.concat_after=True, which this "
+                "Conformer implementation does not support (it uses the residual "
+                "form). Loading it would silently compute a different model."
+            )
     encoder_cfg = ConformerEncoderConfig(
         input_size=raw.get("input_dim", 80),
         output_size=enc.get("output_size", 256),
@@ -140,7 +155,17 @@ class WenetConverter(BaseCheckpointConverter):
     #: (bi)transformer decoder loads as the ``ctc_aed_rescoring`` capability;
     #: this hint only fires for decoder types OASR does not model (the
     #: ``decoder.*`` weights are then dropped by ``load_weights``).
-    expected_unused_prefixes: Tuple[str, ...] = ()
+    #: WeNet's ``ConformerEncoderLayer`` / ``DecoderLayer`` build
+    #: ``concat_linear`` unconditionally and only *use* it when
+    #: ``concat_after=True``, so a checkpoint trained with the default carries
+    #: the parameters unused.  Declaring them keeps a normal checkpoint quiet
+    #: (they were reported as two dozen "unrecognized tensors", and the
+    #: ``decoder.*`` ones fell through to the capability hint below, which then
+    #: wrongly announced that attention rescoring was unavailable).
+    #:
+    #: OASR does not implement ``concat_after``; ``build_config_from_wenet``
+    #: rejects a checkpoint that asks for it rather than silently ignoring it.
+    expected_unused_prefixes: Tuple[str, ...] = ("concat_linear",)
     capability_drop_hints: Dict[str, str] = {
         "decoder.": (
             "the attention-decoder (CTC+AED rescoring) branch was not loaded "

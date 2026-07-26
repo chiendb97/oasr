@@ -73,9 +73,11 @@ class CheckpointConverter(Protocol):
       bundle (tokenizer / feature / decoding specs travel with the
       checkpoint).  Converters without it go through the legacy adapter in
       :func:`oasr.checkpoints.convert_checkpoint`.
-    * ``expected_unused_prefixes: Tuple[str, ...]`` — checkpoint key prefixes
-      that are *expected* to be dropped (e.g. icefall's ``simple_*_proj``
-      training-only projections); dropping these is logged at DEBUG only.
+    * ``expected_unused_prefixes: Tuple[str, ...]`` — checkpoint keys that are
+      *expected* to be dropped; logged at DEBUG only.  Each entry matches as a
+      key **prefix** (icefall's ``simple_am_proj``) or as a dotted **component**
+      anywhere in the key (WeNet's ``concat_linear``, which lives at
+      ``encoder.encoders.N.concat_linear.*``).
     * ``capability_drop_hints: Mapping[str, str]`` — key prefix → description
       of the capability lost when those weights are dropped (e.g. the U2++
       ``decoder.*`` rescoring branch); dropping these logs one WARNING naming
@@ -355,7 +357,18 @@ def _log_load_report(report: Optional[LoadReport], converter: Any, arch: str) ->
     expected = tuple(getattr(converter, "expected_unused_prefixes", ()))
     hints: Mapping[str, str] = getattr(converter, "capability_drop_hints", {})
 
-    unexpected = [k for k in report.dropped if not any(k.startswith(p) for p in expected)]
+    def _is_expected(key: str) -> bool:
+        # A declaration matches either as a key **prefix** (icefall's
+        # ``simple_am_proj``) or as a dotted **component** anywhere in the key
+        # (WeNet's ``concat_linear``, which appears as
+        # ``encoder.encoders.N.concat_linear.weight``).  Prefix-only matching
+        # cannot express the second, and without it a normal WeNet checkpoint
+        # reports two dozen "unrecognized tensors" — and worse, they fall through
+        # to the ``decoder.`` capability hint, which then claims attention
+        # rescoring is unavailable on a checkpoint whose decoder loaded fine.
+        return any(key.startswith(p) or f".{p}" in key for p in expected)
+
+    unexpected = [k for k in report.dropped if not _is_expected(k)]
     if len(unexpected) < len(report.dropped):
         logger.debug(
             "%s: %d expected-unused checkpoint tensors skipped (%s)",
