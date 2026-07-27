@@ -313,7 +313,24 @@ class IcefallConverter(BaseCheckpointConverter):
         return None
 
     def build_feature_spec(self, ckpt_dir: Path):
-        """icefall LibriSpeech recipes: 80-dim FBANK @16 kHz (dither off at inference)."""
+        """icefall LibriSpeech recipes: 80-dim FBANK @16 kHz (dither off at inference).
+
+        ``audio_scale=1.0`` is load-bearing and differs from WeNet. icefall
+        computes FBANK through lhotse, which feeds the waveform in as the
+        ``[-1, 1]`` float that ``torchaudio.load`` returns; WeNet multiplies by
+        ``1 << 15`` first (see ``ConformerModel``'s converter). Scaling by
+        32768 offsets every log-mel bin by ``2*log(32768) ~= 20.8``, which is
+        a large enough distribution shift that the acoustic model drops the
+        leading token of an utterance -- measured on
+        ``icefall-asr-librispeech-zipformer-large-cr-ctc-20241018``, LJ001-0001
+        decoded as "TING IN THE ONLY SENSE ..." instead of "PRINTING IN THE
+        ONLY SENSE ...". At 1.0 both LJ001-0001 and LJ001-0002 match their
+        ground-truth transcripts exactly.
+
+        The architecture-parity tests cannot catch this: they feed identical
+        features to OASR and the icefall reference, so a frontend-convention
+        error cancels out on both sides.
+        """
         from oasr.features import FeatureSpec
 
         return FeatureSpec(
@@ -324,7 +341,7 @@ class IcefallConverter(BaseCheckpointConverter):
             frame_shift_ms=10.0,
             dither=0.0,
             normalize=None,
-            audio_scale=32768.0,
+            audio_scale=1.0,
         )
 
     def build_config_for_convert(self, ckpt_dir: Path, state_dict):

@@ -130,6 +130,28 @@ class TestSentencePiece:
         assert tok.vocab_size == 16
         assert tok.decode([]) == ""
 
+    def test_decode_drops_ids_past_the_piece_count(self, sp_model):
+        """A CTC head padded wider than the tokenizer must not crash decode.
+
+        icefall's zipformer-large ships ``ctc_lo`` with 504 rows against a
+        500-piece ``bpe.model``, so the beam search can legitimately emit a
+        class that is not a piece. SentencePiece answers those with
+        ``Out of range: piece id is out of range``; letting that propagate
+        turns one junk frame into a failed request.
+        """
+        tok = build_tokenizer(
+            TokenizerSpec(
+                kind="sentencepiece",
+                files={"model": str(sp_model)},
+                options={"special_ids": [0, 1, 2]},
+            )
+        )
+        ids = tok.encode("hello world")
+        pad_id = tok.vocab_size + 3  # GEMM-alignment padding class
+        assert tok.decode(ids + [pad_id]) == tok.decode(ids)
+        assert tok.decode([pad_id]) == ""
+        assert tok.decode([-1]) == ""
+
 
 class TestHuggingFace:
     @pytest.fixture(scope="class")

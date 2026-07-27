@@ -47,6 +47,9 @@ RIGHT_CONTEXT = 6
 #   (chunk_size - 1) * subsample_rate + right_context + 1
 CHUNK_INPUT_TIME = (CHUNK_SIZE - 1) * SUBSAMPLE_RATE + RIGHT_CONTEXT + 1  # 67
 NUM_FEAT = 80  # log-mel bins
+# Waveform scaling the WeNet fbank frontend expects (int16 range); mirrors
+# EngineConfig.audio_scale / FeatureSpec.audio_scale.
+AUDIO_SCALE = 32768.0
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +91,15 @@ def _read_audio_and_extract_features(
 
     audio, sr = torchaudio.load(path)
     assert sr == 16000, f"expected 16 kHz audio, got {sr}"
+    # WeNet/Kaldi fbank is computed on int16-range samples, so the waveform
+    # must be scaled by AUDIO_SCALE before extraction -- this is what the
+    # engine does with ``FeatureSpec.audio_scale`` / ``EngineConfig.audio_scale``
+    # (oasr/engine/input_processor.py). torchaudio.load returns [-1, 1]
+    # floats; feeding those in unscaled shifts every log-mel bin by
+    # ~log(32768**2) and puts the input far outside the training
+    # distribution, at which point the model correctly emits nothing but
+    # blanks and the CTC transcript comes back empty.
+    audio = audio * AUDIO_SCALE
     cfg = FeatureConfig(
         sample_rate=16000,
         num_mel_bins=NUM_FEAT,

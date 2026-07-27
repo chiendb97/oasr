@@ -144,10 +144,15 @@ class TestZipformerRegistry:
         assert isinstance(entry.converter, IcefallConverter)
 
     def test_contract(self):
-        cfg = ZipformerModelConfig(encoder=_tiny_encoder_config(), vocab_size=32)
+        # Streaming-capable (causal) config: advertises the stateful backend and
+        # therefore reports a cache geometry.
+        cfg = ZipformerModelConfig(
+            encoder=_tiny_encoder_config(causal=True, chunk_size=(8,)), vocab_size=32
+        )
         model = ZipformerModel.from_config(cfg).eval()
         assert model.decode_type == "ctc"
         assert model.head is model.ctc
+        assert model.encoder.streaming_kind == "stateful"
         assert isinstance(model.cache_spec, CacheSpec)
         # cache_spec from the live model and from the config must agree.
         assert model.cache_spec == cfg.cache_spec
@@ -155,6 +160,22 @@ class TestZipformerRegistry:
         assert model.encoder.output_size == 96
         assert model.cache_spec.num_layers == 2  # 1 + 1
         assert model.cache_spec.conv_kernel_size == 1  # no slot-CNN cache
+
+    def test_non_causal_config_is_offline_only(self):
+        """``causal=False`` has no chunk-wise forward, so it must not claim one.
+
+        Keeps ``streaming_kind`` and ``cache_spec`` in lockstep: an encoder that
+        cannot stream reports no streaming cache, which is what lets the engine
+        refuse streaming service mode at construction and skip allocating a
+        paged pool it would never use.
+        """
+        cfg = ZipformerModelConfig(encoder=_tiny_encoder_config(), vocab_size=32)
+        model = ZipformerModel.from_config(cfg).eval()
+        assert model.encoder.config.causal is False
+        assert model.encoder.streaming_kind == "none"
+        assert model.cache_spec is None
+        with pytest.raises(ValueError, match="not configured for streaming"):
+            _ = model.encoder.streaming_chunk_frames
 
     def test_forward_shapes(self):
         # The CTC head uses the CUDA-only gemm_log_softmax kernel.
@@ -386,7 +407,23 @@ class TestRealIcefallCheckpoint:
         assert not report.dropped, f"checkpoint tensors dropped: {report.dropped[:8]}"
         assert len(report.mapped) > 500, "suspiciously few tensors mapped"
         assert sorted(model.capabilities) == ["ctc"]
-        assert model.encoder.streaming_kind == "stateful"
+        # This release is `cr-ctc`, i.e. non-causal, so it is offline-only and
+        # must say so; a causal release would report "stateful" here.
+        expect = "stateful" if model.encoder.config.causal else "none"
+        assert model.encoder.streaming_kind == expect
+
+    def test_feature_spec_uses_icefall_audio_scale(self, bundle):
+        """icefall computes FBANK via lhotse on the [-1, 1] waveform.
+
+        WeNet's ``audio_scale=32768`` offsets every log-mel bin by ~20.8 and
+        costs the leading token of the transcript (see
+        ``IcefallConverter.build_feature_spec``), so this pins the convention
+        at the source rather than only through an end-to-end transcript.
+        """
+        _, b = bundle
+        assert b.features is not None
+        assert b.features.audio_scale == 1.0
+        assert b.features.kind == "kaldi_fbank"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
     @pytest.mark.skipif(not os.path.isdir(ZIP_WAV_DIR), reason="WAV_DIR not set or not found")
@@ -415,16 +452,40 @@ class TestRealIcefallCheckpoint:
                 )
             )
 
+        # LJSpeech ground truth for LJ001-0001 / LJ001-0002. Asserted in full,
+        # not by keyword: the bug this guards against (an icefall checkpoint
+        # loaded with WeNet's audio_scale=32768) dropped only the *leading*
+        # token -- "TING IN THE ONLY SENSE ..." and "BEING COMPARATIVELY
+        # MODERN" -- which a substring check on "printing"/"modern" happily
+        # passes for the second utterance.
+        GROUND_TRUTH = [
+            "printing in the only sense with which we are at present concerned "
+            "differs from most if not from all the arts and crafts represented "
+            "in the exhibition",
+            "in being comparatively modern",
+        ]
+
         def test_offline_transcribes_real_audio(self):
             eng = self._engine("offline")
             try:
                 texts = eng.transcribe_offline(self._audios(2))
                 texts = [t.text if hasattr(t, "text") else t for t in texts]
-                assert "printing" in texts[0].lower(), texts[0]
-                assert "modern" in texts[1].lower(), texts[1]
             finally:
                 del eng
                 torch.cuda.empty_cache()
+            for got, want in zip(texts, self.GROUND_TRUTH):
+                assert got.lower().strip() == want, f"got={got!r} want={want!r}"
+
+        def _is_causal_release(self) -> bool:
+            from oasr.models import build_model_from_checkpoint
+
+            m = build_model_from_checkpoint(
+                ZIPFORMER_CKPT, device="cpu", dtype=torch.float32
+            )
+            m = m[0] if isinstance(m, tuple) else m
+            kind = m.encoder.streaming_kind
+            del m
+            return kind != "none"
 
         def test_streaming_agrees_with_offline(self):
             """The stateful backend on real weights.
@@ -433,6 +494,11 @@ class TestRealIcefallCheckpoint:
             not match offline exactly — it was never trained for it — so this
             asserts the transcript is *recognisably right* rather than identical.
             """
+            if not self._is_causal_release():
+                pytest.skip(
+                    "checkpoint is a non-causal (causal=False) release: it has no "
+                    "chunk-wise forward, so streaming is refused by design"
+                )
             offline = self._engine("offline")
             try:
                 ref = offline.transcribe_offline(self._audios(1))[0]
@@ -452,3 +518,17 @@ class TestRealIcefallCheckpoint:
             ref_words = set(ref.lower().split())
             hit = sum(1 for w in got.lower().split() if w in ref_words)
             assert hit >= max(3, len(ref_words) // 3), f"ref={ref!r} got={got!r}"
+
+        def test_streaming_mode_is_refused_at_construction(self):
+            """A non-causal release must fail at engine build, not first request.
+
+            Regression guard for ``ZipformerEncoder.streaming_kind``: it used to
+            claim ``"stateful"`` from the config's mere existence, so an engine
+            pinned to streaming built happily and then raised out of
+            ``streaming_chunk_frames`` once a request arrived.
+            """
+            if self._is_causal_release():
+                pytest.skip("checkpoint is a causal release; streaming is supported")
+            with pytest.raises((ValueError, RuntimeError)) as ei:
+                self._engine("streaming")
+            assert "stream" in str(ei.value).lower(), ei.value

@@ -455,25 +455,54 @@ def test_capture_is_deterministic_and_exact_at_head_dim_64(dim, heads, batch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require CUDA")
 @pytest.mark.xfail(
     strict=True,
-    reason="pre-existing: CuteDSL FMHA reads uninitialised pool memory at head_dim 32",
+    reason="pre-existing: WAW race in the CuteDSL FMHA cp.async K ring at head_dim 32",
 )
 @pytest.mark.parametrize("dim,heads", _HD32_GEOMETRIES)
 def test_graph_capture_is_reproducible_at_head_dim_32(dim, heads):
     """Known defect: at head_dim 32, capture is not even self-consistent.
 
     Two independent captures of the *same* shape, fed the *same* input, disagree
-    by ~1e-1 in log-probs.  Nothing in the computation is random, so a
-    difference between two runs can only come from reading memory the capture
-    never initialised — the over-read that
-    ``PagedStreamingBackend._forward_single`` already documents for sub-window
-    chunks, benign in eager mode because adjacent allocations happen to be
-    mapped, stale once the graph carves its own pool.
+    by ~1e-1 in log-probs.  Nothing in the computation is random, so a difference
+    between two runs means unsynchronised concurrency.
+
+    **Diagnosed to a shared-memory write-after-write race in the cp.async K ring**
+    (not, as previously recorded here, a read of uninitialised memory)::
+
+        compute-sanitizer --tool racecheck --racecheck-report hazard \\
+            pytest "tests/test_streaming_backend.py::\\
+    test_graph_capture_is_reproducible_at_head_dim_32[64-2]"
+
+        Error: Potential WAW hazard detected (invalid memcpy_async
+        synchronization) at __shared__ 0x1800 in block (0,1,1):
+            Write Thread (64,0,0) at ...FmhaSm120...+0x990
+            Write Thread  (0,0,0) at ...FmhaSm120...+0x9c0
+        RACECHECK SUMMARY: 176 errors
+
+    Two threads write the same ``sK`` address (0x1800 lands in the ``sK``
+    MemRange, past sQ's 0x1000) from two different cp.async issue sites, so the
+    ring's stage synchronisation lets one stage be written while another write to
+    it is still outstanding.  ``num_stages`` and the
+    ``cp_async_wait_group(2 * num_stages - 1)`` prologue/loop wait counts are the
+    place to look.
+
+    Three facts that bound it:
+
+    * ``head_dim 64`` is **clean** — racecheck reports *0* hazards, so the
+      production geometry (every checkpoint in the tree) is unaffected.  The
+      32-wide swizzle path (``make_smem_swizzle_atom`` returns
+      ``smem_k_block_size=32``, swizzle bits 2) is the one that races.
+    * ``OASR_ATTN_BACKEND=sdpa`` makes this test XPASS, which is what localises
+      the defect to the cute kernel rather than the capture machinery.  It is
+      also a 1.75 s discriminator versus a 12 s cute run.
+    * ``--tool initcheck`` reports **0** uninitialised reads and the test XPASSes
+      under it, because the sanitizer serialises execution.  That is what refuted
+      the original stale-memory reading.
 
     Asserting **self**-consistency rather than agreement-with-eager is what makes
     this test deterministic.  A graph-vs-eager assertion is *flaky* here: whether
-    the stale bytes happen to differ from the correct ones depends on allocator
-    history, so it XPASSes in some processes.  Self-inconsistency needs no oracle
-    and cannot be accidentally satisfied.
+    the racing write lands before or after the read depends on scheduling, so it
+    XPASSes in some processes.  Self-inconsistency needs no oracle and cannot be
+    accidentally satisfied.
 
     Measured axes (`B` = streams in the cohort):
 
@@ -493,6 +522,13 @@ def test_graph_capture_is_reproducible_at_head_dim_32(dim, heads):
     64/2 geometry on the captured path and made its token-identity gate flaky.
 
     Fixing it belongs in the FMHA kernel, alongside the masked-tile NaN bug.
+
+    Ruled out, recorded so it is not retried: adding a CTA barrier before the
+    epilogue's ``sO``-into-``sQ`` write (FlashAttention's
+    ``if (Share_Q_K_smem) __syncthreads()``).  The alias here *is*
+    unconditional, but racecheck's hazard count is unchanged by the barrier
+    (176 before and after) and reports no ``sQ`` hazard at all, so the epilogue
+    is already correctly synchronised and the barrier only costs the hot path.
     """
     runs = _drive_capture(dim, heads, batch=2)
     assert runs["graph_vs_graph"] == 0.0, f"capture is not reproducible: {runs}"
