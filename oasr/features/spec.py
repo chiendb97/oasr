@@ -9,11 +9,15 @@ extracts the features the checkpoint was trained with instead of applying an
 engine-side default.  An explicit ``EngineConfig.feature_config`` still wins,
 but a spec-vs-override mismatch logs loudly.
 
-``kind`` keys the (future) extractor registry: ``"kaldi_fbank"`` /
-``"kaldi_mfcc"`` map onto today's :class:`FeatureConfig` backends;
-``"whisper_logmel"`` and ``"raw"`` land with their model packages.  ``lfr_m`` /
-``lfr_n`` describe low-frame-rate stacking (Paraformer consumes 80×7 = 560-dim
-LFR features); ``1/1`` means off.
+``kind`` keys the extractor registry (:mod:`oasr.features.registry`):
+``"kaldi_fbank"`` / ``"kaldi_mfcc"`` map onto the Kaldi backends,
+``"whisper_logmel"`` onto the fixed-window Whisper recipe; ``"raw"`` lands with
+its model package.  ``lfr_m`` / ``lfr_n`` describe low-frame-rate stacking
+(Paraformer consumes 80×7 = 560-dim LFR features); ``1/1`` means off.
+
+Not every field applies to every kind — the ``whisper_logmel`` recipe fixes its
+own frame geometry — so :meth:`FeatureSpec.mismatches` reports a spec that asks
+for something a kind cannot honour rather than dropping the request silently.
 """
 
 from __future__ import annotations
@@ -43,9 +47,17 @@ class FeatureSpec:
     window_type: str = "povey"
     # Feature normalization applied model-side (e.g. "global_cmvn"); None = none.
     normalize: Optional[str] = None
-    # Waveform scale the checkpoint expects before feature extraction (Kaldi
-    # checkpoints are trained on int16-scale audio → 32768.0 for [-1, 1] input).
+    # Waveform scale the checkpoint expects before feature extraction. This is a
+    # per-*framework* convention, not a global default: WeNet trains on
+    # int16-scale audio (32768.0) while icefall/lhotse feed the [-1, 1] float
+    # straight through (1.0). A wrong value is not noisy -- it offsets every
+    # log-mel bin by a constant and costs the transcript's leading token.
     audio_scale: float = 32768.0
+    # Analysis window for a *fixed-window* frontend (``whisper_logmel``), in
+    # seconds; ``None`` keeps the frontend's own default (Whisper's 30 s).
+    # Without this a converter cannot pin a non-30 s window, and the engine's
+    # admission duration check and batching cost model both read the window.
+    window_seconds: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -55,14 +67,35 @@ class FeatureSpec:
         known = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in d.items() if k in known})
 
+    #: Spec fields the ``whisper_logmel`` recipe fixes internally and therefore
+    #: cannot honour, mapped to the value that means "not requested". A converter
+    #: setting one of these is stating something that would be silently dropped,
+    #: so :meth:`mismatches` reports it rather than ignoring it.
+    _WHISPER_FIXED_FIELDS = {
+        "frame_length_ms": 25.0,   # n_fft 400 @ 16 kHz
+        "frame_shift_ms": 10.0,    # hop 160 @ 16 kHz
+        "dither": 0.0,
+        "window_type": "povey",    # the recipe uses a Hann window
+        "lfr_m": 1,
+        "lfr_n": 1,
+    }
+
     def to_feature_config(self) -> FeatureConfig:
         """Materialize a :class:`FeatureConfig` for the supported kinds."""
         if self.kind == "whisper_logmel":
-            return FeatureConfig(
+            cfg = FeatureConfig(
                 feature_type="whisper_logmel",
                 sample_rate=self.sample_rate,
                 num_mel_bins=self.feature_dim,
             )
+            # The Whisper recipe hardcodes its frame geometry (n_fft 400 / hop
+            # 160 / Hann / slaney mels), so only the three fields
+            # ``oasr.features.whisper`` actually reads are carried across:
+            # sample_rate, num_mel_bins and the window. Copying the rest would
+            # put numbers on the config that the extractor ignores.
+            if self.window_seconds is not None:
+                cfg.whisper_chunk_seconds = self.window_seconds
+            return cfg
         if self.kind not in _KALDI_KINDS:
             raise ValueError(
                 f"FeatureSpec kind {self.kind!r} has no FeatureConfig mapping; "
@@ -92,13 +125,31 @@ class FeatureSpec:
         """
         if self.kind == "whisper_logmel":
             diffs = []
-            for name, spec_v, cfg_v in [
+            pairs = [
                 ("feature_type", "whisper_logmel", config.feature_type),
                 ("sample_rate", self.sample_rate, config.sample_rate),
                 ("feature_dim", self.feature_dim, config.num_mel_bins),
-            ]:
+            ]
+            # The window is honoured (oasr/features/whisper.py reads
+            # ``whisper_chunk_seconds``), so a disagreement is a real one. Only
+            # compare when the spec pins it; ``None`` means "the frontend's
+            # default", which any config value satisfies.
+            if self.window_seconds is not None:
+                pairs.append(
+                    ("window_seconds", self.window_seconds, config.whisper_chunk_seconds)
+                )
+            for name, spec_v, cfg_v in pairs:
                 if spec_v != cfg_v:
                     diffs.append(f"{name}: spec={spec_v!r} config={cfg_v!r}")
+            # Fields the recipe fixes internally: report a spec that asks for
+            # something else, instead of dropping the request silently.
+            for name, inert in self._WHISPER_FIXED_FIELDS.items():
+                asked = getattr(self, name)
+                if asked != inert:
+                    diffs.append(
+                        f"{name}: spec={asked!r} but the whisper_logmel recipe "
+                        f"fixes it at {inert!r} and cannot honour the request"
+                    )
             return diffs
         if self.kind not in _KALDI_KINDS:
             return [f"kind: spec={self.kind!r} config=kaldi ({config.feature_type!r})"]
