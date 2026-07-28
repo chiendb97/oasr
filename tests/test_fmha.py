@@ -269,3 +269,47 @@ def test_fmha_gqa_validation(fmha, cuda):
     v = torch.randn(1, 3, 16, 64, device=cuda, dtype=torch.float16)
     with pytest.raises(ValueError, match="divisible"):
         fmha(q, k, v, softmax_scale=0.125)
+
+
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("mask_floor", [-1e8, -1e10, -1e12])
+def test_fmha_finite_mask_floor_stays_finite(fmha, cuda, dtype, mask_floor):
+    """A heavily key-padded row masked with a large *finite* floor must not NaN.
+
+    OASR's Conformer does not mask key padding with ``-inf``; it adds a large
+    finite floor (``-1e10``, see ``RelPositionMultiHeadedAttention``). In fp16
+    that saturates to ``-inf`` and the old kernel was accidentally safe, but
+    bf16 keeps it finite -- and the online softmax then computed its ``exp2``
+    argument as ``S * c - row_max * c``. Under ``fastmath`` the compiler
+    contracts that to an FMA which subtracts the *rounded* ``fl(row_max * c)``
+    from a full-precision ``S * c``, so the element attaining the max came out
+    **positive** by up to half a ULP -- 64 at ``row_max ~ -1e10``. ``exp2(64)``
+    is 1.8e19, a few consecutive fully-masked K-blocks pushed ``acc_O`` to inf,
+    and the next rescale turned ``inf * 0`` into NaN: a whole batch row of NaN
+    log-probs and a silently empty transcript.
+
+    The geometry below is the one that fails: a short valid prefix so that
+    several whole 64-column K-blocks are fully masked, and a V large enough to
+    overflow once P is inflated. ``mask_floor`` is swept because the half-ULP,
+    and hence the blow-up, scales with it.
+    """
+    B, H, T, D, valid = 1, 4, 208, 64, 46
+    torch.manual_seed(0)
+    q = torch.randn(B, H, T, D, device=cuda, dtype=dtype)
+    k = torch.randn(B, H, T, D, device=cuda, dtype=dtype)
+    v = torch.randn(B, H, T, D, device=cuda, dtype=dtype) * 6.0
+    floor = torch.zeros(B, 1, 1, T, device=cuda, dtype=torch.float32)
+    floor[..., valid:] = mask_floor
+    bias = ((torch.randn(B, H, T, T, device=cuda, dtype=torch.float32) * 0.5) + floor)
+    scale = 1.0 / math.sqrt(D)
+    bias = (bias * scale).to(dtype)
+
+    out = fmha(q, k, v, softmax_scale=scale, attn_bias=bias)
+    assert torch.isfinite(out).all(), (
+        f"{int((~torch.isfinite(out)).sum())} non-finite entries with a finite "
+        f"mask floor of {mask_floor:g}"
+    )
+    # And it must still be *right*, not merely finite: the valid rows attend
+    # only over the unmasked prefix.
+    ref = _ref_fmha(q, k, v, scale, attn_bias=bias)
+    torch.testing.assert_close(out[:, :, :valid], ref[:, :, :valid], atol=2e-2, rtol=2e-2)

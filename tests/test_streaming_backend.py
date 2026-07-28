@@ -453,20 +453,22 @@ def test_capture_is_deterministic_and_exact_at_head_dim_64(dim, heads, batch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require CUDA")
-@pytest.mark.xfail(
-    strict=True,
-    reason="pre-existing: WAW race in the CuteDSL FMHA cp.async K ring at head_dim 32",
-)
 @pytest.mark.parametrize("dim,heads", _HD32_GEOMETRIES)
 def test_graph_capture_is_reproducible_at_head_dim_32(dim, heads):
-    """Known defect: at head_dim 32, capture is not even self-consistent.
+    """Regression guard for a fixed defect: capture must be self-consistent.
 
-    Two independent captures of the *same* shape, fed the *same* input, disagree
-    by ~1e-1 in log-probs.  Nothing in the computation is random, so a difference
-    between two runs means unsynchronised concurrency.
+    Until 2026-07-27 two independent captures of the *same* shape, fed the *same*
+    input, disagreed by ~1e-1 in log-probs at head_dim 32.  Nothing in the
+    computation is random, so a difference between two runs meant unsynchronised
+    concurrency.
 
-    **Diagnosed to a shared-memory write-after-write race in the cp.async K ring**
-    (not, as previously recorded here, a read of uninitialised memory)::
+    **Generalised by** :func:`test_paged_load_is_race_free_across_block_sizes`:
+    the defect was in the paged K/V load and depended on ``head_dim`` *and*
+    ``block_size_frames`` together, not on ``head_dim`` alone.  This test is the
+    narrower historical case, kept because it is the shape the bug was found on.
+
+    **It was a shared-memory write-after-write race** (not, as recorded for a
+    while, a read of uninitialised memory)::
 
         compute-sanitizer --tool racecheck --racecheck-report hazard \\
             pytest "tests/test_streaming_backend.py::\\
@@ -478,19 +480,23 @@ def test_graph_capture_is_reproducible_at_head_dim_32(dim, heads):
             Write Thread  (0,0,0) at ...FmhaSm120...+0x9c0
         RACECHECK SUMMARY: 176 errors
 
-    Two threads write the same ``sK`` address (0x1800 lands in the ``sK``
-    MemRange, past sQ's 0x1000) from two different cp.async issue sites, so the
-    ring's stage synchronisation lets one stage be written while another write to
-    it is still outstanding.  ``num_stages`` and the
-    ``cp_async_wait_group(2 * num_stages - 1)`` prologue/loop wait counts are the
-    place to look.
+    The two writers are in ``_paged_load_kv_tile``, which used to slice smem into
+    ``(block_size, head_dim)`` sub-tiles and re-partition each one; the copy's
+    32-row per-pass extent then spilled 16 rows into the next page.  0x1800 is
+    ``sQ``'s 0x1000 plus 0x800, i.e. ``sK`` stage 0 row 32 — exactly where page
+    1's spill meets page 2's own write, and the reported threads are 0 and 64,
+    exactly the pair the arithmetic predicts.  (It is **not** the cp.async ring's
+    ``num_stages`` / ``cp_async_wait_group`` counts; those match FlashAttention's
+    SM80 path instruction for instruction.)
 
     Three facts that bound it:
 
-    * ``head_dim 64`` is **clean** — racecheck reports *0* hazards, so the
-      production geometry (every checkpoint in the tree) is unaffected.  The
-      32-wide swizzle path (``make_smem_swizzle_atom`` returns
-      ``smem_k_block_size=32``, swizzle bits 2) is the one that races.
+    * It is **not head_dim-32-specific**, and this test's name is therefore too
+      narrow — it fires whenever the copy's per-pass row extent exceeds
+      ``block_size_frames``.  head_dim 64 with ``block_size_frames=8`` races too,
+      and every shipped checkpoint is head_dim 64; only the default page height
+      of 16 kept it out of production.  See
+      :func:`test_paged_load_is_race_free_across_block_sizes`.
     * ``OASR_ATTN_BACKEND=sdpa`` makes this test XPASS, which is what localises
       the defect to the cute kernel rather than the capture machinery.  It is
       also a 1.75 s discriminator versus a 12 s cute run.
@@ -521,7 +527,15 @@ def test_graph_capture_is_reproducible_at_head_dim_32(dim, heads):
     because extending capture to hidden mode (H3) put the transducer fixture's
     64/2 geometry on the captured path and made its token-identity gate flaky.
 
-    Fixing it belongs in the FMHA kernel, alongside the masked-tile NaN bug.
+    **Fixed 2026-07-27.** ``_paged_load_kv_tile`` now partitions the whole
+    ``(N_BLOCK, D)`` tile once and varies the *gmem source per row*, mirroring
+    ``flash_attn/cute/paged_kv.py::PagedKVManager.load_KV``, so every smem element
+    has exactly one writer for any ``(head_dim, block_size)`` pair.  Verified:
+    racecheck went **176 errors -> 0**, all three head_dim-32 geometries went from
+    xfail to pass, and reverting only the loader makes
+    :func:`test_paged_load_is_race_free_across_block_sizes` fail on exactly the two
+    spilling parametrisations and pass on the two exact-fit ones.  Streaming
+    throughput is unchanged (the cp.async count per thread is identical).
 
     Ruled out, recorded so it is not retried: adding a CTA barrier before the
     epilogue's ``sO``-into-``sQ`` write (FlashAttention's
@@ -534,18 +548,31 @@ def test_graph_capture_is_reproducible_at_head_dim_32(dim, heads):
     assert runs["graph_vs_graph"] == 0.0, f"capture is not reproducible: {runs}"
 
 
-def _drive_capture(dim: int, heads: int, batch: int, n_chunks: int = 5) -> dict:
-    """Run one tiny conformer three ways: eager, graphed, graphed again.
+def _drive_capture(
+    dim: int, heads: int, batch: int, n_chunks: int = 5, block_size: int = 16
+) -> dict:
+    """Run one tiny conformer four ways: eager twice, graphed twice.
 
-    Returns ``{"graph_vs_eager": float, "graph_vs_graph": float}`` — the second
-    is the oracle-free signal, since two identical captures of a deterministic
-    computation must agree.
+    Returns ``{"graph_vs_eager", "graph_vs_graph", "eager_vs_eager"}``.  The two
+    self-comparisons are the oracle-free signals: nothing in the computation is
+    random, so two runs of the *same* path must agree bit for bit.
+    ``eager_vs_eager`` catches a data race even with capture switched off, which
+    is what distinguishes a race from a capture-pool artefact.
+
+    ``block_size`` is the paged-KV page height (``CacheConfig.block_size_frames``);
+    it is a parameter because the paged loader's correctness depends on how it
+    compares with the gmem copy's per-pass row extent — see
+    :func:`test_paged_load_is_race_free_across_block_sizes`.  The encoder chunk
+    follows it: ``CacheConfig`` requires ``chunk_size <= block_size_frames`` (one
+    page is allocated per chunk), so a narrow page implies a narrow chunk.
     """
     from oasr.cache.types import CacheConfig
     from oasr.engine.streaming_backend.paged import PagedStreamingBackend
     from oasr.models.conformer.config import ConformerEncoderConfig, ConformerModelConfig
     from oasr.models.conformer.model import ConformerModel
 
+    # CacheConfig requires chunk_size <= block_size_frames.
+    chunk = min(16, block_size)
     dtype = torch.float16
     enc = ConformerEncoderConfig(
         input_size=80,
@@ -570,16 +597,16 @@ def _drive_capture(dim: int, heads: int, batch: int, n_chunks: int = 5) -> dict:
         head_dim=spec.head_dim,
         hidden_dim=spec.hidden_dim,
         kernel_size=spec.conv_kernel_size,
-        chunk_size=16,
+        chunk_size=chunk,
         num_left_chunks=-1,
-        block_size_frames=16,
+        block_size_frames=block_size,
         max_num_blocks=64 * batch,
         max_blocks_per_seq=64,
         max_batch_size=batch,
         device=torch.device("cuda"),
         dtype=dtype,
     )
-    window = (16 - 1) * model.encoder.subsampling_rate + model.encoder.right_context + 1
+    window = (chunk - 1) * model.encoder.subsampling_rate + model.encoder.right_context + 1
     torch.manual_seed(21)
     feats = [
         torch.randn(window * (n_chunks + 1), 80, dtype=dtype, device="cuda") * 0.5
@@ -590,7 +617,7 @@ def _drive_capture(dim: int, heads: int, batch: int, n_chunks: int = 5) -> dict:
         cfg = SimpleNamespace(
             device="cuda",
             dtype=dtype,
-            chunk_size=16,
+            chunk_size=chunk,
             use_cuda_graphs=graphs,
             finalize_silence_pad=True,
             feature_config=SimpleNamespace(output_dim=80),
@@ -612,8 +639,68 @@ def _drive_capture(dim: int, heads: int, batch: int, n_chunks: int = 5) -> dict:
     def worst(a, b):
         return max((x - y).abs().max().item() for sid in a for x, y in zip(a[sid], b.get(sid, [])))
 
-    eager, g1, g2 = drive(False), drive(True), drive(True)
-    return {"graph_vs_eager": worst(eager, g1), "graph_vs_graph": worst(g1, g2)}
+    e1, e2, g1, g2 = drive(False), drive(False), drive(True), drive(True)
+    return {
+        "graph_vs_eager": worst(e1, g1),
+        "graph_vs_graph": worst(g1, g2),
+        "eager_vs_eager": worst(e1, e2),
+    }
+
+
+#: ``(model_dim, n_heads, block_size)`` combinations for the paged-load race
+#: guard below.  The first entry of each pair is a geometry where the gmem
+#: copy's per-pass row extent *exceeds* the paged page height, which is the
+#: condition that used to corrupt smem; the second is the exact-fit control.
+_PAGED_RACE_GEOMETRIES = [
+    # head_dim 32 -> smem_k_block 32 -> 128*8/32 = 32 rows per pass.
+    (64, 2, 16),   # 32 rows vs page 16 -> used to spill 16 rows
+    (64, 2, 32),   # exact fit
+    # head_dim 64 -> smem_k_block 64 -> 128*8/64 = 16 rows per pass.
+    (256, 4, 8),   # 16 rows vs page 8 -> used to spill 8 rows (production width!)
+    (256, 4, 16),  # exact fit, the shipped default
+]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require CUDA")
+@pytest.mark.parametrize("dim,heads,block_size", _PAGED_RACE_GEOMETRIES)
+def test_paged_load_is_race_free_across_block_sizes(dim, heads, block_size):
+    """The paged K/V smem load must not depend on page height vs copy extent.
+
+    ``_paged_load_kv_tile`` used to slice smem into ``(block_size, head_dim)``
+    sub-tiles and re-run ``partition_D`` on each one.  The gmem tiled copy covers
+    ``num_threads * async_elems // smem_k_block_size`` **rows** per pass — a
+    function of ``head_dim``, not of ``block_size`` — so whenever that exceeded
+    ``block_size`` the surplus threads wrote rows past the end of their sub-tile,
+    straight into the next page's rows, which that page's own copy also wrote.
+    Two writers, *different* source pages, no synchronisation: the values were
+    wrong, not merely non-reproducible.
+
+    ==========  =============  ==========  =========================
+    head_dim    rows per pass  page height  before the fix
+    ==========  =============  ==========  =========================
+    32          32             16           16 rows spilled
+    64          16             8            8 rows spilled
+    64          16             16           exact fit (shipped default)
+    ==========  =============  ==========  =========================
+
+    Note the ``head_dim 64 / block_size 8`` row: the defect was **not**
+    head_dim-32-specific, and every shipped checkpoint is head_dim 64.  Reaching
+    it needs ``block_size_frames < 16``, and since ``CacheConfig`` also requires
+    ``chunk_size <= block_size_frames`` that means a low-latency streaming
+    deployment (chunk 8) rather than an arbitrary one — plausible, but not the
+    default.  So the shipped default of 16 is the only thing that kept this out
+    of production, which is a thinner margin than "head_dim 64 is clean" implied.
+
+    Asserted as **self**-consistency (two eager runs, two captured runs) rather
+    than against a reference: the computation is deterministic, so any run-to-run
+    difference is a race, and that needs no oracle.  ``eager_vs_eager`` is the
+    load-bearing assertion — it holds with capture switched off, which is what
+    separates a genuine race from a graph-pool artefact.
+    """
+    runs = _drive_capture(dim, heads, batch=2, block_size=block_size)
+    assert runs["eager_vs_eager"] == 0.0, f"eager path is not deterministic: {runs}"
+    assert runs["graph_vs_graph"] == 0.0, f"capture is not reproducible: {runs}"
+    assert runs["graph_vs_eager"] == 0.0, f"graph diverged from eager: {runs}"
 
 
 class _StubAttMgr:
