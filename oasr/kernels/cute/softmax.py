@@ -27,6 +27,11 @@ call ``exp2`` (faster than ``exp`` on Ampere). The factor is folded into
 ``S`` *and* the ``(row_max_prev - row_max_cur)`` delta -- both inside the
 same ``exp2`` -- so the math is algebraically identical to a plain
 ``softmax`` over the unscaled logits.
+
+Both ``exp2`` arguments are formed as ``(a - b) * scale_log2`` and **never**
+as ``a * scale_log2 - b * scale_log2``. The two are algebraically equal but
+not numerically equal under ``fastmath``, and the difference is the
+correctness of the whole block -- see :meth:`Softmax.online_softmax`.
 """
 
 # PEP 563 (deferred annotations) breaks CuteDSL Constexpr detection;
@@ -144,11 +149,37 @@ class Softmax:
                 0.0 if row_max_cur == -cutlass.Float32.inf else row_max_cur
             )
 
-            # P = exp2((S - row_max_cur) * scale_log2). Distributing
-            # ``scale_log2`` inside exp2 is mathematically equivalent and
-            # lets us share the constant across all elements.
+            # P = exp2((S - row_max_cur) * scale_log2).
+            #
+            # Subtract **first**, then scale. The algebraically identical
+            # ``acc_S_row * scale_log2 - row_max_cur * scale_log2`` is *not*
+            # numerically identical under ``fastmath``: the compiler contracts
+            # it to an FMA, which evaluates ``acc_S * c`` at full internal
+            # precision but subtracts the already-rounded ``fl(row_max * c)``.
+            # When ``fl(row_max * c)`` rounded down, the result is **positive**
+            # for the very element that attained the max -- by up to half a ULP
+            # of ``row_max * c``. That silently breaks the invariant the whole
+            # online softmax rests on (``arg <= 0``, so ``exp2(arg) <= 1``).
+            #
+            # It is harmless while masked scores are ``-inf`` (exactly 0 either
+            # way), which is why it survived so long. But OASR's Conformer masks
+            # key padding with a large *finite* floor (-1e10, see
+            # ``RelPositionMultiHeadedAttention``), and in bf16 that stays
+            # finite where fp16 saturates to -inf. At ``row_max ~ -1e10`` the
+            # half-ULP is 64, so P jumped to ``exp2(64) ~ 1.8e19``; a few
+            # consecutive fully-masked K-blocks then drove ``acc_O`` to inf and
+            # the next rescale turned ``inf * 0`` into NaN -- an entire batch row
+            # of NaN log-probs and a silently empty transcript.
+            #
+            # Subtracting first makes the subtraction *exact* (Sterbenz: the two
+            # operands are within a factor of two) and one multiply by a positive
+            # constant cannot flip the sign, so ``arg <= 0`` holds by
+            # construction. FlashAttention reached the same conclusion for the
+            # rescale below -- ``flash_attn/cute/softmax.py`` keeps the
+            # two-multiply form commented out directly above the subtract-first
+            # one it actually uses.
             row_p = cute.math.exp2(
-                acc_S_row * scale_log2 - row_max_cur * scale_log2,
+                (acc_S_row - row_max_cur) * scale_log2,
                 fastmath=True,
             )
             row_sum_cur = row_p.reduce(
@@ -156,9 +187,13 @@ class Softmax:
             )
 
             if cutlass.const_expr(not is_first):
-                # Rescale prior row_sum + acc_O by the delta exp.
+                # Rescale prior row_sum + acc_O by the delta exp. Subtract-first
+                # for the same reason as the P computation above: ``row_max`` is
+                # non-decreasing, so ``prev - cur <= 0`` exactly, whereas the
+                # two-multiply form can round positive and inflate the carried
+                # ``acc_O`` instead of shrinking it.
                 delta_exp = cute.math.exp2(
-                    row_max_prev[r] * scale_log2 - row_max_cur * scale_log2,
+                    (row_max_prev[r] - row_max_cur) * scale_log2,
                     fastmath=True,
                 )
                 row_sum_cur = row_sum_cur + self.row_sum[r] * delta_exp

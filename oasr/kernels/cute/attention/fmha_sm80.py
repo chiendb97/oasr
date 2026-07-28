@@ -1491,28 +1491,100 @@ class FmhaSm80(FmhaBase):
 
         ``mKV`` is ``(num_blocks, block_size, H_kv, D)`` (the per-layer pool
         view). ``sKV`` is the destination smem with ``(N_BLOCK, D)`` shape.
-        We slice the smem into ``blocks_per_n_tile`` sub-tiles and issue
-        one cp.async per logical block. Lives on ``self`` so cute.jit
-        captures ``self._block_size`` / ``self._head_dim_padded`` /
-        ``self._blocks_per_n_tile`` as class-level constexprs and avoids
-        flattening a free-standing PagedKVManager into runtime if-regions.
+
+        Partitions the **whole** ``(N_BLOCK, D)`` tile once — exactly as the
+        dense path does — so every smem element has exactly one writer, and
+        then varies the *gmem source per partitioned row*: tile row ``r`` lives
+        in logical block ``r // block_size`` at offset ``r % block_size``. This
+        mirrors ``FlashAttentionForwardBase``'s paged loader
+        (``flash_attn/cute/paged_kv.py::PagedKVManager.load_KV``), which
+        likewise keeps the canonical full-tile partition and looks the page up
+        per row.
+
+        It must not be written the obvious other way round -- slicing smem into
+        ``blocks_per_n_tile`` sub-tiles of ``(block_size, D)`` and re-running
+        ``partition_D`` on each. The gmem tiled copy's thread layout covers
+        ``num_threads * async_elems // smem_k_block_size`` **rows** per pass,
+        which is a property of ``head_dim``, not of ``block_size``; when it
+        exceeds ``block_size`` the surplus threads address rows past the end of
+        their sub-tile, i.e. straight into the *next* block's rows, which that
+        block's own copy also writes. Concretely at fp16 / 128 threads:
+
+        =========  ==============  ===========  ===========================
+        head_dim   smem_k_block    tiler rows   vs ``block_size`` 16
+        =========  ==============  ===========  ===========================
+        64         64              16           exact fit, one writer per row
+        32         32              32           **16 rows spill** -> WAW race
+        =========  ==============  ===========  ===========================
+
+        That was a real defect: ``compute-sanitizer racecheck`` reported
+        ``Potential WAW hazard ... at __shared__ 0x1800``, threads 0 and 64,
+        176 errors at head_dim 32 and **0** at head_dim 64 — and 0x1800 is
+        exactly ``sK`` stage 0 row 32, the row where block 1's spill meets
+        block 2's own write. Symptom: two independent CUDA-graph captures of
+        the same streaming shape disagreed by ~1e-1 in log-probs.
+
+        Lives on ``self`` so cute.jit captures ``self._block_size`` /
+        ``self._head_dim_padded`` / ``self._blocks_per_n_tile`` as class-level
+        constexprs and avoids flattening a free-standing PagedKVManager into
+        runtime if-regions.
         """
+        async_elems = async_copy_elements(self._dtype)
+        cKV = cute.make_identity_tensor(
+            (self._n_block_size, self._head_dim_padded)
+        )
+        tKVsKV = gmem_thr_copy.partition_D(sKV)
+        tKVcKV = gmem_thr_copy.partition_S(cKV)
         n_logical_base = n_block * self._blocks_per_n_tile
-        for i in cutlass.range_constexpr(self._blocks_per_n_tile):
-            phys = mBlockTable[batch_idx, n_logical_base + i]
-            gKV_block = cute.local_tile(
-                mKV[phys, None, kv_head, None],
-                (self._block_size, self._head_dim_padded),
-                (0, 0),
+
+        for m in cutlass.range_constexpr(cute.size(tKVsKV, mode=[1])):
+            row = tKVcKV[0, m, 0][0]
+            blk = row // self._block_size
+            off = row % self._block_size
+            phys = mBlockTable[batch_idx, n_logical_base + blk]
+            # (D,) contiguous slice of this row's physical page, re-viewed as
+            # (async_elems, D // async_elems) so one cp.async covers one vector.
+            gKV_row = cute.tiled_divide(
+                mKV[phys, off, kv_head, None], (async_elems,)
             )
-            sKV_sub = cute.local_tile(
-                sKV,
-                (self._block_size, self._head_dim_padded),
-                (i, 0),
-            )
-            tKVgKV = gmem_thr_copy.partition_S(gKV_block)
-            tKVsKV = gmem_thr_copy.partition_D(sKV_sub)
-            cute.copy(gmem_tiled_copy, tKVgKV, tKVsKV)
+            for k in cutlass.range_constexpr(cute.size(tKVsKV, mode=[2])):
+                ki = tKVcKV[0, 0, k][1] // async_elems
+                cute.copy(
+                    gmem_tiled_copy, gKV_row[None, ki], tKVsKV[None, m, k]
+                )
+
+    @cute.jit
+    def _load_bias_tile_predicated(
+        self,
+        mBias, batch_size, num_head,
+        m_block, n_block, thr_mma, tBias, rBias,
+    ):
+        """Bounds-predicated bias fragment load; OOB entries read as 0.
+
+        Slower than ``cute.autovec_copy`` (the per-element predicate breaks
+        vectorization) but it never forms an out-of-bounds *address*, which
+        the unpredicated path does for any tile that straddles the end of
+        ``(T_q, T_k)``.
+        """
+        mcS = cute.make_identity_tensor(mBias.layout.shape)
+        cS = cute.local_tile(
+            mcS[batch_size, num_head, None, None],
+            (self._m_block_size, self._n_block_size),
+            (m_block, n_block),
+        )
+        tScS = thr_mma.partition_C(cS)
+        tScS_mn = make_acc_mn_view(tScS)
+
+        rBiasPred = cute.make_fragment_like(tBias, cutlass.Boolean)
+        rBiasPred_mn = make_acc_mn_view(rBiasPred)
+        for r in cutlass.range_constexpr(cute.size(rBiasPred_mn.shape[0])):
+            row_ok = cute.elem_less(tScS_mn[r, 0][2], mBias.shape[2])
+            for c in cutlass.range_constexpr(cute.size(rBiasPred_mn.shape[1])):
+                rBiasPred_mn[r, c] = row_ok and cute.elem_less(
+                    tScS_mn[r, c][3], mBias.shape[3]
+                )
+        rBias.fill(0)
+        cute.basic_copy_if(rBiasPred, tBias, rBias)
 
     @cute.jit
     def _add_bias_tile(
@@ -1538,19 +1610,25 @@ class FmhaSm80(FmhaBase):
         of the add. The old per-element form burned ~60 us per call on
         the (1,8,8,256,1024,64) shape.
 
-        Two paths, dispatched at compile time on the constexpr
-        ``self._bias_aligned``:
+        Two paths, dispatched on the constexpr ``self._bias_aligned`` and
+        then on whether this tile is interior:
 
         * **aligned** (``T_k`` is even — every real-world bias tensor we
-          ship): unpredicated ``cute.autovec_copy`` emits b32 col-pair loads.
-          OOB rows/cols (when ``T_q`` / ``T_k`` don't divide the tile) read
-          stale gmem; the values are harmless because ``AttentionMask.apply``
-          overwrites those acc_S slots with -inf afterwards.
-        * **unaligned** (``T_k`` is odd, e.g. 33-frame audio batches in the
-          test suite): falls back to predicated ``cute.basic_copy_if`` —
+          ship) **and interior**: unpredicated ``cute.autovec_copy`` emits
+          b32 col-pair loads. This is the steady-state path; for the
+          (1,8,8,256,1024,64) bench shape every tile is interior.
+        * **boundary tile** (``T_q`` / ``T_k`` don't divide the tile, so the
+          tile straddles the end) **or unaligned** (``T_k`` is odd, e.g.
+          33-frame audio batches in the test suite): predicated
+          ``cute.basic_copy_if`` via :meth:`_load_bias_tile_predicated` —
           slower because the per-element predicate breaks vectorization,
-          but safe against the b32-vs-2-byte-aligned-row-stride fault that
-          unpredicated autovec hits.
+          but it never forms an out-of-bounds address.
+
+        The boundary case used to take the unpredicated path on the theory
+        that OOB *values* are harmless (``AttentionMask.apply`` overwrites
+        those acc_S slots with -inf afterwards). That was true of the values
+        and false of the addresses: it read past the end of the allocation
+        and faulted.
         """
         gBias = cute.local_tile(
             mBias[batch_size, num_head, None, None],
@@ -1561,32 +1639,39 @@ class FmhaSm80(FmhaBase):
 
         rBias = cute.make_fragment_like(tBias, self._dtype)
         if cutlass.const_expr(self._bias_aligned):
-            # Fast path: T_k % 2 == 0 guarantees the col-pair (2 fp16) is
-            # 4-byte aligned at every (q_row, k_col) start, so a b32 load
-            # never faults. OOB read residues are masked to -inf later.
-            cute.autovec_copy(tBias, rBias)
-        else:
-            # Safe path: build a per-element bounds predicate and use
-            # predicated copy so we never read OOB / misaligned addresses.
-            mcS = cute.make_identity_tensor(mBias.layout.shape)
-            cS = cute.local_tile(
-                mcS[batch_size, num_head, None, None],
-                (self._m_block_size, self._n_block_size),
-                (m_block, n_block),
+            # Fast path is only address-safe on a tile that lies wholly
+            # inside (T_q, T_k). An unpredicated copy reads the tile's full
+            # m_block_size x n_block_size footprint, so a *boundary* tile
+            # addresses up to m_block_size-1 rows past the last real row --
+            # at a short varlen segment (8x8 = 64 elements) a 64x64 tile
+            # reads ~500 elements past the block, i.e. past the end of the
+            # packed buffer. The values were always discarded (the mask
+            # overwrites those acc_S slots), but the addresses are not
+            # optional: this faulted for real with an illegal memory access
+            # whenever the allocator left the next page unmapped.
+            rows_interior = cute.elem_less(
+                (m_block + 1) * self._m_block_size - 1, mBias.shape[2]
             )
-            tScS = thr_mma.partition_C(cS)
-            tScS_mn = make_acc_mn_view(tScS)
-
-            rBiasPred = cute.make_fragment_like(tBias, cutlass.Boolean)
-            rBiasPred_mn = make_acc_mn_view(rBiasPred)
-            for r in cutlass.range_constexpr(cute.size(rBiasPred_mn.shape[0])):
-                row_ok = cute.elem_less(tScS_mn[r, 0][2], mBias.shape[2])
-                for c in cutlass.range_constexpr(cute.size(rBiasPred_mn.shape[1])):
-                    rBiasPred_mn[r, c] = row_ok and cute.elem_less(
-                        tScS_mn[r, c][3], mBias.shape[3]
-                    )
-            rBias.fill(0)
-            cute.basic_copy_if(rBiasPred, tBias, rBias)
+            cols_interior = cute.elem_less(
+                (n_block + 1) * self._n_block_size - 1, mBias.shape[3]
+            )
+            if rows_interior and cols_interior:
+                # T_k % 2 == 0 guarantees the col-pair (2 fp16) is 4-byte
+                # aligned at every (q_row, k_col) start, so the b32 load
+                # never faults and autovec emits col-pair reads.
+                cute.autovec_copy(tBias, rBias)
+            else:
+                self._load_bias_tile_predicated(
+                    mBias, batch_size, num_head,
+                    m_block, n_block, thr_mma, tBias, rBias,
+                )
+        else:
+            # T_k is odd: every tile risks the b32-vs-2-byte-aligned-row-
+            # stride fault, so predicate unconditionally.
+            self._load_bias_tile_predicated(
+                mBias, batch_size, num_head,
+                m_block, n_block, thr_mma, tBias, rBias,
+            )
 
         # Pure-compute add. On the aligned path, OOB rBias entries hold
         # stale gmem (will be -inf masked later). On the unaligned path,

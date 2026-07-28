@@ -51,6 +51,13 @@ Request → InputProcessor (fbank) → Scheduler (BatchingPolicy + PartitionPoli
    properties, and (for streaming) either `forward_chunk_paged`
    (`streaming_kind="paged"`) or `get_streaming_init_states`/`streaming_forward`
    (`streaming_kind="stateful"`).
+   `streaming_kind` must describe what *this config's weights* can actually do,
+   not what the class implements — return `"none"` when the loaded checkpoint has
+   no chunk-wise path (Zipformer does this for `causal=False`). It is the value
+   the engine gates on: `"none"` makes streaming service mode fail at
+   construction with a clear message and makes `cache_spec` `None` so no paged
+   pool is allocated. An encoder that over-claims builds an engine that raises on
+   its first request instead.
 2. `class FooModel(BaseAsrModel)` with `from_config` + `load_weights`.
 3. A `CheckpointConverter` + `register_model("foo", ...)` in the package
    `__init__`. No engine edits.

@@ -18,9 +18,20 @@ import pytest
 import torch
 import yaml
 
+# This module *is* the comparison against upstream WeNet, so it genuinely needs
+# the `wenet` package. Skip the module when it is absent instead of failing
+# collection: a bare `from wenet...` here made `pytest tests/` error out
+# entirely, which is why every verification command in the repo's docs carried
+# `--ignore=tests/test_conformer.py`. Install it (`pip install wenet`) to enable
+# the conformer parity oracle.
+pytest.importorskip(
+    "wenet",
+    reason="upstream WeNet reference not installed; conformer parity oracle skipped",
+)
+
 from wenet.models.transformer import encoder as wenet_encoder  # type: ignore  # noqa: E402
-from wenet.utils.common import mask_to_bias  # type: ignore
-from wenet.utils.init_model import init_model  # type: ignore
+from wenet.utils.common import mask_to_bias  # type: ignore  # noqa: E402
+from wenet.utils.init_model import init_model  # type: ignore  # noqa: E402
 
 from oasr.models.conformer import (  # noqa: E402
     ConformerEncoder,

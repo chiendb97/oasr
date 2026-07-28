@@ -239,3 +239,83 @@ class TestOfflinePathUsesTheRegistry:
         # 42 frames stacked 7-wide with stride 6 → ceil(42/6) = 7 output frames × 560
         assert feats.shape == (1, 7, 560)
         assert lens.tolist() == [7]
+
+
+class TestFeatureSpecCarriesWhatTheExtractorReads:
+    """``FeatureSpec`` -> ``FeatureConfig`` must not silently drop a pinned field.
+
+    The Whisper recipe hardcodes its frame geometry, so only three fields are
+    actually read by ``oasr.features.whisper``: ``sample_rate``,
+    ``num_mel_bins`` and ``whisper_chunk_seconds``.  The window used to have no
+    spec field at all, so a converter could not pin a non-30 s window — and the
+    window is load-bearing twice over: ``check_audio_duration`` rejects longer
+    audio against it, and the batching cost model prices every row at it.
+    """
+
+    def test_window_seconds_reaches_the_feature_config(self):
+        from oasr.features.spec import FeatureSpec
+
+        spec = FeatureSpec(kind="whisper_logmel", feature_dim=128, window_seconds=10.0)
+        cfg = spec.to_feature_config()
+        assert cfg.feature_type == "whisper_logmel"
+        assert cfg.num_mel_bins == 128
+        assert cfg.whisper_chunk_seconds == 10.0
+        # And the registry-driven window property agrees, so admission and the
+        # batching cost model see the pinned value rather than the default.
+        assert cfg.fixed_window_seconds == 10.0
+
+    def test_window_seconds_none_keeps_the_frontend_default(self):
+        from oasr.features.spec import FeatureSpec
+
+        cfg = FeatureSpec(kind="whisper_logmel").to_feature_config()
+        assert cfg.whisper_chunk_seconds == 30.0
+
+    def test_mismatch_reports_a_disagreeing_window(self):
+        from oasr.features.config import FeatureConfig
+        from oasr.features.spec import FeatureSpec
+
+        spec = FeatureSpec(kind="whisper_logmel", feature_dim=80, window_seconds=10.0)
+        cfg = FeatureConfig(feature_type="whisper_logmel", num_mel_bins=80)  # 30 s
+        diffs = spec.mismatches(cfg)
+        assert any("window_seconds" in d for d in diffs), diffs
+        # A spec that pins nothing must not complain about the default.
+        assert FeatureSpec(kind="whisper_logmel", feature_dim=80).mismatches(cfg) == []
+
+    def test_mismatch_reports_fields_the_recipe_cannot_honour(self):
+        """A converter asking whisper_logmel for LFR is stating a lie; say so.
+
+        Previously ``mismatches()`` compared 3 fields for this kind versus 9 for
+        Kaldi, so an ignored request looked like agreement.
+        """
+        from oasr.features.config import FeatureConfig
+        from oasr.features.spec import FeatureSpec
+
+        cfg = FeatureConfig(feature_type="whisper_logmel", num_mel_bins=80)
+        spec = FeatureSpec(kind="whisper_logmel", feature_dim=80, lfr_m=7, lfr_n=6)
+        diffs = spec.mismatches(cfg)
+        assert any("lfr_m" in d and "cannot honour" in d for d in diffs), diffs
+        assert any("lfr_n" in d for d in diffs), diffs
+
+    def test_round_trip_preserves_window_seconds(self):
+        from oasr.features.spec import FeatureSpec
+
+        spec = FeatureSpec(kind="whisper_logmel", window_seconds=12.5)
+        assert FeatureSpec.from_dict(spec.to_dict()) == spec
+
+    # 80 = whisper-*, 128 = Qwen2-Audio; both converters delegate to the shared
+    # BaseCheckpointConverter.whisper_logmel_spec, so these are all the shipped
+    # values.
+    @pytest.mark.parametrize("mels", [80, 128])
+    def test_shipped_whisper_specs_are_self_consistent(self, mels):
+        """Every converter-emitted whisper spec must agree with its own config.
+
+        Guards the pairing rather than the values: ``mismatches`` is what the
+        engine logs on a spec-vs-override disagreement, so a spec that disagreed
+        with the config it itself produces would warn on every startup — and the
+        new "the recipe cannot honour this" checks would fire on real
+        checkpoints if they were miscalibrated.
+        """
+        from oasr.models.converter import BaseCheckpointConverter
+
+        spec = BaseCheckpointConverter.whisper_logmel_spec(mels)
+        assert spec.mismatches(spec.to_feature_config()) == []

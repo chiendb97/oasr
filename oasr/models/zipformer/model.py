@@ -170,10 +170,32 @@ class ZipformerEncoder(BaseEncoder):
 
     # -- streaming spec ----------------------------------------------------
     @property
+    def _streaming_capable(self) -> bool:
+        """Whether this *config* can be decoded chunk-by-chunk at all.
+
+        icefall only trains the chunk-wise path when ``causal=True`` with a
+        positive ``chunk_size``; a non-causal release (e.g. the
+        ``zipformer-large-cr-ctc`` CTC models) has no streaming forward.
+        """
+        cs = self.config.chunk_size
+        cs = cs[0] if isinstance(cs, (tuple, list)) else cs
+        return bool(self.config.causal) and int(cs) > 0
+
+    @property
     def streaming_kind(self) -> str:
         """Zipformer owns per-layer recurrent state (icefall 6-tensor caches),
-        so it uses the engine's *stateful* streaming backend, not paged-KV."""
-        return "stateful"
+        so it uses the engine's *stateful* streaming backend, not paged-KV.
+
+        Reports ``"none"`` for a non-causal config rather than claiming a
+        capability the weights don't have. That distinction is load-bearing:
+        the engine refuses any ``streaming_kind == "none"`` model in streaming
+        service mode *at construction*, so a non-causal checkpoint now fails
+        with a clear message up front instead of building an engine that
+        raises out of :attr:`streaming_chunk_frames` on its first request.
+        It also makes :attr:`BaseEncoder.cache_spec` ``None``, so no paged
+        pool is allocated for weights that can never stream.
+        """
+        return "stateful" if self._streaming_capable else "none"
 
     @property
     def subsampling_rate(self) -> int:
