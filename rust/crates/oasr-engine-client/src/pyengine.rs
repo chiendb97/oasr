@@ -606,6 +606,13 @@ fn collect_model_info(
         .ok()
         .and_then(|x| x.extract::<Vec<String>>().ok())
         .unwrap_or_default();
+    // Also engine-authoritative: `feature_config` is materialized from the
+    // checkpoint's `FeatureSpec` during construction unless the caller pinned
+    // one, so the CLI/JSON config is not a reliable source.
+    info.sample_rate = engine
+        .getattr("sample_rate")
+        .ok()
+        .and_then(|x| x.extract::<u32>().ok());
     Ok(info)
 }
 

@@ -85,8 +85,8 @@ curl -sS -X POST \
   --data-binary @audio.f32 | jq
 ```
 
-Query parameters: `encoding` (required), `sample_rate` (default 16000; ignored
-for `WAV`), `priority`, `max_alternatives`, plus the per-request decoding
+Query parameters: `encoding` (required), `sample_rate` (defaults to the model's
+own rate; ignored for `WAV`), `priority`, `max_alternatives`, plus the per-request decoding
 options (autoregressive decode families only — AED / speech-LLM; CTC ignores
 them): `max_new_tokens`, `temperature` (0 = greedy), `top_k`, `top_p`,
 `prompt` (speech-LLM user-prompt override).  `max_alternatives > 1` makes the
@@ -103,6 +103,47 @@ every returned alternative carries a real transcript.
 | any other Google STT v1 codec | Returns `UNIMPLEMENTED`. |
 
 > For the lowest-overhead binary transport, gRPC `Recognize` is still preferred.
+
+### Sample rates
+
+The **engine accepts exactly one rate** — the model's, from the checkpoint's
+`FeatureSpec` (16 kHz for every checkpoint in tree, reported as `sample_rate` in
+`GET /v1/models`).  It does not resample: every frame count comes from
+`FeatureConfig.sample_rate` and the mel filterbank is built for it, so audio at
+another rate would be transcribed at the wrong speed — confidently, and with no
+error anywhere.  `ASREngine` therefore *rejects* a mismatched
+`Request.sample_rate` outright.
+
+The front-end converts instead, so clients need not care.  Any rate in
+`[4000, 384000]` Hz is accepted on both surfaces and resampled to the model's
+rate (windowed-sinc via `rubato`, in `oasr-asr::resample`) before the waveform
+crosses PyO3; anything outside that range is `INVALID_ARGUMENT`.  The streaming
+RPC keeps one resampler per stream, so the filter state carries across chunks
+and the tail is flushed on half-close.  Cost is a few hundred µs per
+audio-second on one core — negligible next to the GPU step, and skipped entirely
+when the rates already match (the common 16 kHz case builds no filter).
+
+Measured on 12 LJSpeech utterances (201 words) against the u2pp-conformer
+checkpoint, taking each file's **native 16 kHz transcript as the reference** and
+feeding the same audio resampled to another rate:
+
+| Client rate | Divergence from native 16 kHz |
+|---|---|
+| 44100 Hz | **0.00%** — transcript-identical |
+| 8000 Hz | **6.47%** — the missing 4–8 kHz band, not a resampler artifact |
+
+Two things worth knowing:
+
+- **8 kHz telephony is correct but degraded**, which is what that 6.47% is.
+  Upsampling cannot invent the band above 4 kHz that the source never carried.
+  The honest fix is an 8 kHz model variant, which the feature-frontend registry
+  already anticipates.  For scale: the same 8 kHz bytes submitted *without*
+  conversion — what happened before this existed — decoded to
+  `LAURE HO OFRESS WILL NOT CUT TWOS FROM NORTH THE SECOND HER UNCLE` in place
+  of `PRINTING IN THE ONLY SENSE WITH WHICH WE ARE AT PRESENT CONCERNED …`.
+- **A WAV body's header wins.**  It is the only rate signal for `encoding=WAV`,
+  so a 44.1 kHz media file is converted from 44.1 kHz even if the client also
+  passes `sample_rate=16000`.
 
 Success response (`200`):
 
@@ -180,7 +221,8 @@ mode.
         "vocab_size": 5000,
         "service_mode": "offline",
         "decode_method": "ctc",
-        "capabilities": ["ctc", "ctc_aed_rescoring"]
+        "capabilities": ["ctc", "ctc_aed_rescoring"],
+        "sample_rate": 16000
       }
     }
   ]
@@ -189,7 +231,8 @@ mode.
 
 Exactly one entry — the single model loaded by this process.
 
-`service_mode` / `decode_method` / `capabilities` are read back **from the
+`service_mode` / `decode_method` / `capabilities` / `sample_rate` are read back
+**from the
 engine**, not from the CLI flags: `--engine-config` JSON wins on the Python side
 and several decode families are offline-only (`aed`, `llm`, `paraformer`,
 `ctc_aed_rescoring`), so the engine is the authority on what this process can
@@ -227,6 +270,14 @@ subsequent messages carry `audio_content` (raw PCM bytes in the declared
 encoding).  Set `streaming_config.interim_results=false` to suppress
 partials.  Each response message contains one `StreamingRecognitionResult`
 with `is_final=true` on the terminal frame.
+
+`sampleRateHertz` is validated at *open*, before any audio is admitted, and a
+non-model rate builds one resampler for the life of the stream (see
+[Sample rates](#sample-rates)).  Two consequences for a resampling stream: an
+outbound chunk is not the same duration as the inbound one that produced it (the
+filter holds up to ~64 ms back), and a chunk that splits a sample across the
+message boundary is still `INVALID_ARGUMENT` — frame your chunks on whole
+samples.
 
 ```bash
 python scripts/grpc_stream.py --addr 127.0.0.1:50051 \

@@ -330,6 +330,11 @@ pub struct ModelInfo {
     /// Every decode family this checkpoint could serve.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// The waveform sample rate the engine accepts, in Hz.  Read off the
+    /// engine's resolved feature config: the engine does **not** resample, so
+    /// the front-ends convert client audio to this rate before submitting.
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
 }
 
 #[cfg(test)]

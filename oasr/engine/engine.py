@@ -349,6 +349,25 @@ class ASREngine:
     # Request management
     # ------------------------------------------------------------------
 
+    def _resolve_sample_rate(self, sample_rate: Optional[int]) -> int:
+        """Validate a caller-supplied rate, or default to the model's.
+
+        ``None`` means "whatever this checkpoint runs at" — the only rate the
+        engine can serve, since every frame count comes from
+        ``feature_config.sample_rate`` and nothing here resamples.  Anything else
+        must match it exactly; see
+        :meth:`~oasr.engine.input_processor.InputProcessor.check_sample_rate` for
+        why a mismatch cannot be allowed through.
+
+        Resolved on the *caller's* thread so the raise reaches them: under
+        ``overlap_admit`` the same check inside ``prepare_offline`` runs on the
+        prep thread, where it would only be logged.
+        """
+        if sample_rate is None:
+            return int(self._config.feature_config.sample_rate)
+        self._input_processor.check_sample_rate(sample_rate)
+        return int(sample_rate)
+
     def _maybe_fan_out_longform(
         self,
         audio,
@@ -405,7 +424,7 @@ class ASREngine:
         self,
         audio: Union[torch.Tensor, "np.ndarray"],
         request_id: Optional[str] = None,
-        sample_rate: int = 16000,
+        sample_rate: Optional[int] = None,
         streaming: bool = True,
         priority: int = 0,
         decoding: Optional[Union[DecodingOptions, Dict]] = None,
@@ -430,8 +449,12 @@ class ASREngine:
             ``TypeError``.
         request_id : str, optional
             Unique identifier.  Auto-generated if omitted.
-        sample_rate : int
-            Audio sample rate in Hz.
+        sample_rate : int, optional
+            Sample rate of ``audio`` in Hz.  Defaults to the model's own rate.
+            The engine does **not** resample: any other value raises
+            ``ValueError`` rather than transcribing the audio at the wrong
+            speed.  Resample at the entry point (the ``oasr-server`` front-end
+            does this for you).
         streaming : bool, default ``True``
             ``True`` routes the request through the paged-cache streaming
             path; ``False`` routes it through the batched offline path.
@@ -447,17 +470,16 @@ class ASREngine:
         str
             The assigned ``request_id``.
         """
+        sr = self._resolve_sample_rate(sample_rate)
         if self._longform is not None and not streaming:
-            fanned = self._maybe_fan_out_longform(
-                audio, request_id, sample_rate, priority, decoding
-            )
+            fanned = self._maybe_fan_out_longform(audio, request_id, sr, priority, decoding)
             if fanned is not None:
                 return fanned
         req = Request(
             audio,
             request_id=request_id,
             streaming=streaming,
-            sample_rate=sample_rate,
+            sample_rate=sr,
             priority=priority,
             decoding=DecodingOptions.coerce(decoding),
         )
@@ -484,7 +506,8 @@ class ASREngine:
           otherwise the raw waveform (``str`` / ``Tensor`` / ``ndarray``)
           that ``add_request`` would accept.
         - ``request_id``: optional pre-assigned id.
-        - ``sample_rate``: int, defaults to ``16000``.
+        - ``sample_rate``: int, defaults to the model's rate (the only other
+          accepted value; see :meth:`add_request`).
         - ``streaming``: bool, defaults to ``True``.
         - ``priority``: int, defaults to ``0``.
         - ``decoding``: optional :class:`DecodingOptions` or plain dict of
@@ -541,7 +564,7 @@ class ASREngine:
                 audio=spec.get("audio"),
                 request_id=rid,
                 streaming=streaming,
-                sample_rate=int(spec.get("sample_rate", 16000)),
+                sample_rate=self._resolve_sample_rate(spec.get("sample_rate")),
                 priority=int(spec.get("priority", 0)),
                 decoding=DecodingOptions.coerce(spec.get("decoding")),
             )
@@ -578,7 +601,7 @@ class ASREngine:
                     audio=spec.get("audio"),
                     request_id=rid,
                     streaming=bool(spec.get("streaming", True)),
-                    sample_rate=int(spec.get("sample_rate", 16000)),
+                    sample_rate=self._resolve_sample_rate(spec.get("sample_rate")),
                     priority=int(spec.get("priority", 0)),
                     decoding=DecodingOptions.coerce(spec.get("decoding")),
                 )
@@ -668,7 +691,8 @@ class ASREngine:
         request.  Uses silent waveforms so it exercises the real
         fbank → encoder → CTC-decode path at representative shapes."""
         sizes = self._config.preferred_batch_size or [int(self._config.max_batch_size)]
-        n = 16000 * 6  # ~6 s of audio — representative frame count
+        sr = int(self._config.feature_config.sample_rate)
+        n = sr * 6  # ~6 s of audio — representative frame count
         for b in sorted({int(s) for s in sizes if int(s) >= 1}):
             reqs: List[Request] = []
             for _ in range(b):
@@ -678,7 +702,7 @@ class ASREngine:
                     Request(
                         audio=torch.zeros(n, dtype=torch.float32),
                         streaming=False,
-                        sample_rate=16000,
+                        sample_rate=sr,
                     )
                 )
             feats, lengths = self._input_processor.collate(reqs)
@@ -705,7 +729,7 @@ class ASREngine:
     def add_streaming_request(
         self,
         request_id: Optional[str] = None,
-        sample_rate: int = 16000,
+        sample_rate: Optional[int] = None,
         priority: int = 0,
         decoding: Optional[Union[DecodingOptions, Dict]] = None,
     ) -> str:
@@ -721,8 +745,11 @@ class ASREngine:
         ----------
         request_id : str, optional
             Unique identifier.  Auto-generated (UUID4 hex) if omitted.
-        sample_rate : int
+        sample_rate : int, optional
             Sample rate of the audio that will be fed via :meth:`feed_chunk`.
+            Defaults to the model's own rate, and must equal it — the engine
+            does not resample, and rejecting here (at open) beats discovering
+            it after the client has been told the stream is live.
         priority : int, default ``0``
             Lower values are scheduled first within the streaming queue.
         decoding : DecodingOptions or dict, optional
@@ -737,7 +764,7 @@ class ASREngine:
             audio=None,
             request_id=request_id,
             streaming=True,
-            sample_rate=sample_rate,
+            sample_rate=self._resolve_sample_rate(sample_rate),
             priority=priority,
             decoding=DecodingOptions.coerce(decoding),
         )
@@ -988,7 +1015,7 @@ class ASREngine:
     def transcribe(
         self,
         audio: Union[torch.Tensor, "np.ndarray", List[Union[torch.Tensor, "np.ndarray"]]],
-        sample_rate: int = 16000,
+        sample_rate: Optional[int] = None,
         streaming: bool = True,
     ) -> Union[str, List[str]]:
         """Transcribe one or more **waveforms**.
@@ -998,8 +1025,9 @@ class ASREngine:
         audio : Tensor, ndarray, or list of those
             One or more waveforms at the model sample rate.  Decode audio
             files before calling — the engine is waveform-only.
-        sample_rate : int
-            Sample rate of the audio (Hz).
+        sample_rate : int, optional
+            Sample rate of the audio (Hz); defaults to the model's own and must
+            equal it.  See :meth:`add_request`.
         streaming : bool, default ``True``
             ``True`` uses the chunk-by-chunk streaming path; ``False`` uses
             the batched offline path.  Offline is strictly faster when
@@ -1021,7 +1049,7 @@ class ASREngine:
     def transcribe_offline(
         self,
         audio: Union[torch.Tensor, "np.ndarray", List[Union[torch.Tensor, "np.ndarray"]]],
-        sample_rate: int = 16000,
+        sample_rate: Optional[int] = None,
     ) -> Union[str, List[str]]:
         """Batch transcription convenience — :meth:`transcribe` with
         ``streaming=False``.
@@ -1062,6 +1090,19 @@ class ASREngine:
     def capabilities(self) -> List[str]:
         """Decode families this checkpoint could serve, sorted."""
         return sorted(self._model.capabilities)
+
+    @property
+    def sample_rate(self) -> int:
+        """The **only** waveform sample rate this engine accepts, in Hz.
+
+        Comes from the resolved feature config (checkpoint-derived via
+        :class:`~oasr.features.FeatureSpec` unless the caller pinned one), which
+        is what every frame count is computed from.  A request's own
+        ``sample_rate`` is *not* used for feature extraction — it is validated
+        against this and rejected on mismatch — so a front-end must resample to
+        this rate before submitting.
+        """
+        return int(self._config.feature_config.sample_rate)
 
     @property
     def num_running(self) -> int:

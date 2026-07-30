@@ -202,13 +202,22 @@ def _admission_engine(*, overlap=False):
     import threading
 
     from oasr.engine.engine import ASREngine
+    from oasr.engine.input_processor import InputProcessor
+    from oasr.features import FeatureConfig
 
     eng = ASREngine.__new__(ASREngine)
     eng._lock = threading.RLock()
-    eng._config = SimpleNamespace(service_mode="offline")
+    eng._config = SimpleNamespace(
+        service_mode="offline",
+        # Admission resolves/validates the request rate against this.
+        feature_config=FeatureConfig(sample_rate=16000),
+    )
     eng._executor = _FakeExecutor()
     eng._overlap_admit = overlap
-    eng._input_processor = SimpleNamespace(check_audio_duration=lambda audio: None)
+    eng._longform = None
+    eng._input_processor = InputProcessor.__new__(InputProcessor)
+    eng._input_processor._feature_config = eng._config.feature_config
+    eng._input_processor.check_audio_duration = lambda audio: None
     eng._prep_in = queue.Queue()
     eng._admit_inflight = 0
     eng._admit_inflight_lock = threading.Lock()
@@ -271,3 +280,74 @@ def test_add_requests_batch_still_raises_for_python_callers():
         )
     # And returns plain ids on the happy path.
     assert eng.add_requests_batch([{"request_id": "ok", "streaming": False}]) == ["ok"]
+
+
+# --------------------------------------------------------------------------- #
+# Sample-rate admission (C2)
+# --------------------------------------------------------------------------- #
+
+
+def test_admission_defaults_the_sample_rate_to_the_models():
+    """An omitted rate means the model's, not a hardcoded 16 kHz.
+
+    ``Request.sample_rate`` used to default to 16000 independently of the
+    checkpoint, which is only harmless because every in-tree checkpoint happens
+    to run at 16 kHz.
+    """
+    import torch
+
+    eng = _admission_engine()
+    object.__setattr__(eng._config.feature_config, "sample_rate", 8000)
+    eng.add_request(torch.zeros(800), request_id="r", streaming=False)
+    assert eng._executor.admitted == ["r"]
+    assert eng._resolve_sample_rate(None) == 8000
+
+
+def test_admission_rejects_a_mismatched_sample_rate():
+    """The engine does not resample, so a mismatch must fail, not transcribe.
+
+    This is the only silent wrong-answer path a default configuration had: the
+    rate rode all the way to ``Request.sample_rate`` and was then used for
+    nothing, while features came out of a filterbank built for another rate.
+    """
+    import torch
+
+    eng = _admission_engine()
+    with pytest.raises(ValueError, match="8000 Hz.*requires 16000 Hz"):
+        eng.add_request(torch.zeros(8000), request_id="r", sample_rate=8000, streaming=False)
+    assert eng._executor.admitted == []
+
+
+def test_bulk_admission_isolates_a_mismatched_sample_rate():
+    """Per-spec, like every other admission rejection — one client's 44.1 kHz
+    upload must not fail the coalesced batch it landed in."""
+    import torch
+
+    eng = _admission_engine()
+    results = eng.add_requests_batch_checked(
+        [
+            {"request_id": "ok", "audio": torch.zeros(160), "streaming": False},
+            {
+                "request_id": "bad",
+                "audio": torch.zeros(441),
+                "sample_rate": 44100,
+                "streaming": False,
+            },
+        ]
+    )
+    assert "error" not in results[0]
+    assert "44100 Hz" in results[1]["error"]
+    assert eng._executor.admitted == ["ok"]
+
+
+def test_overlap_admission_rejects_on_the_callers_thread():
+    """Under ``overlap_admit`` the same check inside ``prepare_offline`` runs on
+    the prep thread, where a raise is only logged and the client waits forever
+    for an output that never comes."""
+    import torch
+
+    eng = _admission_engine(overlap=True)
+    with pytest.raises(ValueError, match="requires 16000 Hz"):
+        eng.add_request(torch.zeros(8000), request_id="r", sample_rate=8000, streaming=False)
+    assert eng._admit_inflight == 0
+    assert eng._prep_in.qsize() == 0

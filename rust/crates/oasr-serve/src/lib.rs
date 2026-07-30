@@ -122,8 +122,24 @@ async fn serve(cli: Cli) -> Result<()> {
         capabilities = ?model.capabilities,
         service_mode = ?model.service_mode,
         vocab_size = ?model.vocab_size,
+        sample_rate = ?model.sample_rate,
         "ASREngine loaded"
     );
+
+    // The rate every handler resamples client audio to.  An engine that did not
+    // report one (an older/stubbed engine object) falls back to 16 kHz, which is
+    // what every checkpoint in tree uses — but say so, because getting this
+    // wrong is silent: the transcript comes back confident and wrong.
+    let engine_sample_rate = match model.sample_rate {
+        Some(sr) => sr,
+        None => {
+            warn!(
+                label = %cli.engine_label,
+                "engine did not report a sample rate; assuming 16000 Hz for client resampling"
+            );
+            16_000
+        }
+    };
 
     // ---- Engine-authoritative service mode ----
     //
@@ -178,6 +194,7 @@ async fn serve(cli: Cli) -> Result<()> {
         pool: Arc::clone(&pool),
         prometheus,
         service_mode: http_mode,
+        sample_rate: engine_sample_rate,
     });
 
     // ---- HTTP server ----
@@ -210,7 +227,7 @@ async fn serve(cli: Cli) -> Result<()> {
         .await;
 
     let grpc_handle = tokio::spawn(async move {
-        let svc = SpeechService::new(grpc_pool, grpc_mode);
+        let svc = SpeechService::new(grpc_pool, grpc_mode, engine_sample_rate);
         info!("gRPC listening on {grpc_bind}");
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(SpeechServer::new(svc))

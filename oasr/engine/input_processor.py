@@ -147,6 +147,38 @@ class InputProcessor:
             est = lfr_output_length(est, cfg.lfr_n)
         return est
 
+    def check_sample_rate(self, sample_rate: Optional[int]) -> None:
+        """Reject a request whose audio is not at the model's sample rate.
+
+        The engine is **waveform-only at the model's rate**: every frame count
+        here comes from :attr:`FeatureConfig.sample_rate`, and the mel filterbank
+        is built for it.  ``Request.sample_rate`` is carried through the whole
+        stack but feeds nothing except long-form window arithmetic, so audio at
+        another rate is interpreted as if it were at the model's — 8 kHz
+        telephony plays back at double speed to the frontend, 44.1 kHz media at
+        a third — and the client gets a confident, wrong transcript with no
+        error anywhere.
+
+        Resampling belongs at the entry point, not here: the serving front-end
+        (``oasr-asr``) converts before the waveform crosses PyO3, so nothing
+        reaching this check should ever mismatch.  Callers driving the engine
+        directly (benchmarks, tests, notebooks) get a loud failure instead of a
+        plausible transcript.
+
+        ``None`` is accepted as "unspecified" and treated as the model's rate.
+        """
+        if sample_rate is None:
+            return
+        want = int(self._feature_config.sample_rate)
+        got = int(sample_rate)
+        if got != want:
+            raise ValueError(
+                f"audio is declared at {got} Hz but this checkpoint's frontend "
+                f"({self._feature_config.feature_type}) requires {want} Hz; the "
+                "engine does not resample. Resample the waveform before "
+                "submitting it (the oasr-server front-end does this for you)."
+            )
+
     def check_audio_duration(self, audio) -> None:
         """Public duration guard, callable before the waveform is canonicalised.
 
@@ -192,9 +224,11 @@ class InputProcessor:
         scaling happens here — the int16-scale multiply runs on the GPU after
         padding in :meth:`collate`, which also runs the batched fbank/mfcc.
 
-        Raises ``ValueError`` when the audio exceeds a fixed-window frontend's
+        Raises ``ValueError`` when the audio is not at the model's sample rate
+        (see :meth:`check_sample_rate`) or exceeds a fixed-window frontend's
         capacity (see :meth:`_check_input_duration`).
         """
+        self.check_sample_rate(request.sample_rate)
         request.audio = torch.as_tensor(request.audio, dtype=torch.float32, device="cpu").reshape(
             -1
         )
@@ -405,7 +439,12 @@ class InputProcessor:
         Sets up the streaming state with an empty audio queue.  No fbank
         runs and no waveform load happens here; the engine starts processing
         as soon as the first chunk lands.
+
+        Rejects a rate mismatch at *open* time (see :meth:`check_sample_rate`) —
+        the alternative is discovering it on the first chunk, after the client
+        has already been told the stream is live.
         """
+        self.check_sample_rate(request.sample_rate)
         if not self._extractor.supports_streaming:
             raise NotImplementedError(
                 f"the {self._extractor.kind!r} frontend cannot run incrementally "

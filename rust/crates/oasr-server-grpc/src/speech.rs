@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use futures::Stream;
-use oasr_asr::{decode_audio, decode_raw_pcm, PcmEncoding};
+use oasr_asr::{decode_audio, PcmEncoding, PcmStream};
 use oasr_engine_client::EnginePool;
 use oasr_wire::{score_posteriors, DecodingParams, ErrorCode, Event};
 use tokio::sync::mpsc;
@@ -44,11 +44,18 @@ impl std::str::FromStr for ServiceMode {
 pub struct SpeechService {
     pool: Arc<EnginePool>,
     mode: ServiceMode,
+    /// The engine's waveform sample rate in Hz; inbound audio is resampled to
+    /// it before submission (the engine does not resample).
+    sample_rate: u32,
 }
 
 impl SpeechService {
-    pub fn new(pool: Arc<EnginePool>, mode: ServiceMode) -> Self {
-        Self { pool, mode }
+    pub fn new(pool: Arc<EnginePool>, mode: ServiceMode, sample_rate: u32) -> Self {
+        Self {
+            pool,
+            mode,
+            sample_rate,
+        }
     }
 }
 
@@ -215,8 +222,10 @@ fn build_alternatives(
 /// Inputs for [`SpeechService::streaming_over_offline`], grouped so the call site
 /// does not take eight positional arguments.
 struct StreamOverOfflineCfg {
-    sample_rate: u32,
-    pcm_enc: PcmEncoding,
+    /// Chunk decoder, already bound to the client's rate and the model's.  It
+    /// carries the resampler's filter state, so it must live for the whole
+    /// stream rather than be rebuilt per chunk.
+    pcm: PcmStream,
     priority: i32,
     decoding: Option<DecodingParams>,
     want_partials: bool,
@@ -244,14 +253,18 @@ impl SpeechService {
         mut inbound: Streaming<pb::StreamingRecognizeRequest>,
         out_tx: mpsc::Sender<Result<pb::StreamingRecognizeResponse, Status>>,
         out_rx: mpsc::Receiver<Result<pb::StreamingRecognizeResponse, Status>>,
-        cfg: StreamOverOfflineCfg,
+        mut cfg: StreamOverOfflineCfg,
     ) -> Result<Response<<Self as pb::speech_server::Speech>::StreamingRecognizeStream>, Status>
     {
         let pool = Arc::clone(&self.pool);
         let span = info_span!("grpc.stream_offline", rid = field::Empty);
+        let source_rate = cfg.pcm.source_rate();
+        let target_rate = cfg.pcm.target_rate();
         info!(
             parent: &span,
-            sample_rate = cfg.sample_rate,
+            sample_rate = source_rate,
+            model_sample_rate = target_rate,
+            resampling = cfg.pcm.is_resampling(),
             want_partials = cfg.want_partials,
             "stream opened (offline engine: buffering audio, streaming text)"
         );
@@ -269,8 +282,8 @@ impl SpeechService {
                                 pb::streaming_recognize_request::StreamingRequest::AudioContent(
                                     bytes,
                                 ),
-                            ) => match decode_raw_pcm(&bytes, cfg.pcm_enc, cfg.sample_rate) {
-                                Ok(d) => buffered.extend_from_slice(&d.samples),
+                            ) => match cfg.pcm.decode_chunk(&bytes) {
+                                Ok(samples) => buffered.extend_from_slice(&samples),
                                 Err(e) => {
                                     debug!(reason = %e, "stream chunk pcm decode failed");
                                     let _ = out_tx
@@ -303,6 +316,20 @@ impl SpeechService {
                     }
                 }
 
+                // Release the frames still inside the resampler; without this the
+                // utterance loses its last ~filter-length of audio, which is the
+                // final word.
+                match cfg.pcm.flush() {
+                    Ok(tail) => buffered.extend_from_slice(&tail),
+                    Err(e) => {
+                        debug!(reason = %e, "stream resampler flush failed");
+                        let _ = out_tx
+                            .send(Err(Status::internal(format!("resample: {e}"))))
+                            .await;
+                        return;
+                    }
+                }
+
                 if buffered.is_empty() {
                     let _ = out_tx
                         .send(Err(Status::invalid_argument(
@@ -317,7 +344,7 @@ impl SpeechService {
                 let mut handle = match pool
                     .submit_offline_streaming(
                         Bytes::from(buffered),
-                        cfg.sample_rate,
+                        target_rate,
                         cfg.priority,
                         cfg.decoding,
                     )
@@ -458,13 +485,27 @@ impl pb::speech_server::Speech for SpeechService {
             };
 
             let sr = if cfg.sample_rate_hertz == 0 {
-                16_000
+                self.sample_rate
             } else {
                 cfg.sample_rate_hertz
             };
             let (pcm_enc, ct_hint) = map_encoding(cfg.encoding).map_err(log_reject)?;
-            let decoded = decode_audio(ct_hint, &audio_bytes, pcm_enc, Some(sr))
-                .map_err(|e| log_reject(Status::invalid_argument(format!("audio decode: {e}"))))?;
+            // Convert to the engine's rate before submitting: the engine derives
+            // every frame count from its own feature config and ignores the
+            // request's rate, so unconverted 8 kHz / 44.1 kHz audio decoded to a
+            // confident, wrong transcript.
+            let decoded =
+                decode_audio(ct_hint, &audio_bytes, pcm_enc, Some(sr), Some(self.sample_rate))
+                    .map_err(|e| {
+                        log_reject(Status::invalid_argument(format!("audio decode: {e}")))
+                    })?;
+            if decoded.sample_rate != sr {
+                debug!(
+                    from_hz = sr,
+                    to_hz = decoded.sample_rate,
+                    "resampled request audio to the model rate"
+                );
+            }
 
             let sample_rate = decoded.sample_rate;
             let n_samples = decoded.samples.len() / 4;
@@ -568,12 +609,20 @@ impl pb::speech_server::Speech for SpeechService {
         let rcfg = scfg
             .config
             .ok_or_else(|| log_reject(Status::invalid_argument("missing recognition config")))?;
+        // An unset rate means "the model's own" — the only value that could ever
+        // have worked before resampling existed.
         let sr = if rcfg.sample_rate_hertz == 0 {
-            16_000
+            self.sample_rate
         } else {
             rcfg.sample_rate_hertz
         };
         let (pcm_enc, _ct_hint) = map_encoding(rcfg.encoding).map_err(log_reject)?;
+        // One decoder for the whole stream: it holds the resampler's filter
+        // state, so per-chunk construction would stamp a discontinuity into the
+        // waveform at every chunk boundary.  Built here, before anything is
+        // admitted, so an implausible `sample_rate_hertz` is rejected at open.
+        let mut pcm = PcmStream::new(pcm_enc, sr, self.sample_rate)
+            .map_err(|e| log_reject(Status::invalid_argument(format!("audio config: {e}"))))?;
         let want_partials = scfg.interim_results;
         let max_alts = rcfg.max_alternatives;
         let decoding = decoding_params(&rcfg).map_err(log_reject)?;
@@ -593,8 +642,7 @@ impl pb::speech_server::Speech for SpeechService {
                     out_tx,
                     out_rx,
                     StreamOverOfflineCfg {
-                        sample_rate: sr,
-                        pcm_enc,
+                        pcm,
                         priority: rcfg.priority,
                         decoding,
                         want_partials,
@@ -604,9 +652,11 @@ impl pb::speech_server::Speech for SpeechService {
                 .await;
         }
 
+        // The engine is told the rate it will actually receive — the model's —
+        // not the client's, because `pcm` converts on the way in.
         let mut handle = self
             .pool
-            .open_streaming(sr, rcfg.priority, decoding)
+            .open_streaming(self.sample_rate, rcfg.priority, decoding)
             .await
             .map_err(|e| {
                 warn!(%e, "grpc streaming open rejected");
@@ -620,7 +670,14 @@ impl pb::speech_server::Speech for SpeechService {
         // spawned task below, instrumented with this span so every per-chunk
         // / per-event log line is correlated.
         let span = info_span!("grpc.stream", rid = %rid);
-        info!(parent: &span, sample_rate = sr, want_partials, "stream opened");
+        info!(
+            parent: &span,
+            sample_rate = sr,
+            model_sample_rate = self.sample_rate,
+            resampling = pcm.is_resampling(),
+            want_partials,
+            "stream opened"
+        );
 
         tokio::spawn(async move {
             let start = Instant::now();
@@ -682,14 +739,20 @@ impl pb::speech_server::Speech for SpeechService {
                         match msg {
                             Some(Ok(m)) => {
                                 if let Some(pb::streaming_recognize_request::StreamingRequest::AudioContent(bytes)) = m.streaming_request {
-                                    let chunk = match decode_raw_pcm(&bytes, pcm_enc, sr) {
-                                        Ok(d) => d.samples,
+                                    let chunk = match pcm.decode_chunk(&bytes) {
+                                        Ok(samples) => samples,
                                         Err(e) => {
                                             debug!(reason = %e, "stream chunk pcm decode failed");
                                             let _ = out_tx.send(Err(Status::invalid_argument(format!("pcm decode: {e}")))).await;
                                             continue;
                                         }
                                     };
+                                    // A resampling stream can hold a chunk back
+                                    // inside the filter; feeding an empty chunk
+                                    // would just cost the engine a step.
+                                    if chunk.is_empty() {
+                                        continue;
+                                    }
                                     if handle.push_chunk(chunk).await.is_err() {
                                         warn!("grpc bidi: audio channel dropped");
                                         break;
@@ -708,9 +771,15 @@ impl pb::speech_server::Speech for SpeechService {
                                 // Client half-closed: send is_last once and
                                 // stop polling the inbound stream.  Keep
                                 // draining events until Final / Error.
+                                // The resampler's tail rides out on the final
+                                // chunk; dropping it would cut the last word.
                                 inbound_done = true;
-                                debug!("client half-closed; flushing final chunk");
-                                let _ = handle.flush_last(Bytes::new()).await;
+                                let tail = pcm.flush().unwrap_or_else(|e| {
+                                    warn!(reason = %e, "resampler flush failed; dropping tail");
+                                    Bytes::new()
+                                });
+                                debug!(tail_samples = tail.len() / 4, "client half-closed; flushing final chunk");
+                                let _ = handle.flush_last(tail).await;
                             }
                         }
                     }
