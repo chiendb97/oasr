@@ -4,7 +4,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::Stream;
@@ -47,6 +47,8 @@ pub struct SpeechService {
     /// The engine's waveform sample rate in Hz; inbound audio is resampled to
     /// it before submission (the engine does not resample).
     sample_rate: u32,
+    /// Abort a streaming RPC idle this long.  `None` disables.
+    stream_idle_timeout: Option<Duration>,
 }
 
 impl SpeechService {
@@ -55,7 +57,43 @@ impl SpeechService {
             pool,
             mode,
             sample_rate,
+            stream_idle_timeout: None,
         }
+    }
+
+    /// Abort a streaming RPC that goes `d` without an inbound audio message
+    /// (before half-close) or a decode event (after).
+    ///
+    /// This is deliberately *not* a `tonic::transport::Server::timeout`: that
+    /// applies to every request including `StreamingRecognize`, so it would cut
+    /// off healthy long-lived streams.  A live stream cannot be bounded by
+    /// total duration, only by inactivity.
+    pub fn with_stream_idle_timeout(mut self, d: Option<Duration>) -> Self {
+        self.stream_idle_timeout = d;
+        self
+    }
+}
+
+/// Await `fut`, mapping an idle-timeout elapse to `DEADLINE_EXCEEDED`.
+/// `None` waits forever, which is what an operator gets by setting the knob
+/// to 0.
+async fn with_idle<F, T>(timeout: Option<Duration>, fut: F) -> Result<T, Status>
+where
+    F: std::future::Future<Output = T>,
+{
+    match timeout {
+        None => Ok(fut.await),
+        Some(d) => tokio::time::timeout(d, fut)
+            .await
+            .map_err(|_| Status::deadline_exceeded(format!("stream idle for {}s", d.as_secs()))),
+    }
+}
+
+/// A timer for a `select!` arm that simply never fires when the bound is off.
+async fn sleep_opt(d: Option<Duration>) {
+    match d {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -230,6 +268,8 @@ struct StreamOverOfflineCfg {
     decoding: Option<DecodingParams>,
     want_partials: bool,
     max_alts: u32,
+    /// Abort if the client goes this long without sending audio.
+    idle_timeout: Option<Duration>,
 }
 
 impl SpeechService {
@@ -276,7 +316,18 @@ impl SpeechService {
                 // ---- 1. drain the inbound audio -------------------------------
                 let mut buffered: Vec<u8> = Vec::new();
                 loop {
-                    match inbound.next().await {
+                    // A client that opens a stream and then vanishes without
+                    // closing the connection would otherwise hold this task —
+                    // and, once admitted, an engine slot — forever.
+                    let next = match with_idle(cfg.idle_timeout, inbound.next()).await {
+                        Ok(n) => n,
+                        Err(status) => {
+                            warn!(reason = %status, "stream idle timeout before half-close");
+                            let _ = out_tx.send(Err(status)).await;
+                            return;
+                        }
+                    };
+                    match next {
                         Some(Ok(m)) => match m.streaming_request {
                             Some(
                                 pb::streaming_recognize_request::StreamingRequest::AudioContent(
@@ -367,7 +418,25 @@ impl SpeechService {
 
                 // ---- 3. stream the text out -----------------------------------
                 let mut n_partials: u64 = 0;
-                while let Some(ev) = handle.events.next().await {
+                loop {
+                    // Same bound after half-close: an engine that stops
+                    // producing events for this request (wedged, or a lost
+                    // terminal) must not park the RPC indefinitely.
+                    let ev = match with_idle(cfg.idle_timeout, handle.events.next()).await {
+                        Ok(Some(ev)) => ev,
+                        Ok(None) => {
+                            error!("event stream closed before terminal event");
+                            let _ = out_tx
+                                .send(Err(Status::internal("event stream closed")))
+                                .await;
+                            break;
+                        }
+                        Err(status) => {
+                            warn!(rid = %rid, reason = %status, "no decode event within the idle timeout");
+                            let _ = out_tx.send(Err(status)).await;
+                            break;
+                        }
+                    };
                     match ev {
                         Event::Partial {
                             text,
@@ -647,6 +716,7 @@ impl pb::speech_server::Speech for SpeechService {
                         decoding,
                         want_partials,
                         max_alts,
+                        idle_timeout: self.stream_idle_timeout,
                     },
                 )
                 .await;
@@ -679,6 +749,7 @@ impl pb::speech_server::Speech for SpeechService {
             "stream opened"
         );
 
+        let idle_timeout = self.stream_idle_timeout;
         tokio::spawn(async move {
             let start = Instant::now();
             let mut n_partials: u64 = 0;
@@ -688,9 +759,24 @@ impl pb::speech_server::Speech for SpeechService {
             // repeatedly, which the engine rejects with "feed_chunk after
             // is_last=True".
             let mut inbound_done = false;
+            // Reset on every event or chunk; firing means neither side has
+            // moved, so the RPC is holding an engine slot for nobody.
+            let mut idle = std::pin::pin!(sleep_opt(idle_timeout));
             loop {
                 tokio::select! {
+                    _ = &mut idle => {
+                        warn!(
+                            rid = %rid,
+                            elapsed_ms = start.elapsed().as_millis() as u64,
+                            "stream idle timeout; cancelling"
+                        );
+                        let _ = out_tx.send(Err(Status::deadline_exceeded("stream idle"))).await;
+                        // Fall through to `pool.release`; dropping `handle`
+                        // un-disarmed cancels the request engine-side.
+                        break;
+                    }
                     ev = handle.events.next() => {
+                        idle.set(sleep_opt(idle_timeout));
                         match ev {
                             Some(Event::Partial { text, tokens, scores, .. }) => {
                                 if !want_partials { continue; }
@@ -736,6 +822,7 @@ impl pb::speech_server::Speech for SpeechService {
                         }
                     }
                     msg = inbound.next(), if !inbound_done => {
+                        idle.set(sleep_opt(idle_timeout));
                         match msg {
                             Some(Ok(m)) => {
                                 if let Some(pb::streaming_recognize_request::StreamingRequest::AudioContent(bytes)) = m.streaming_request {

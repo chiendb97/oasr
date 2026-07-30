@@ -13,6 +13,8 @@ use axum::{
     Router,
 };
 use serde_json::json;
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::ServerState;
@@ -43,18 +45,48 @@ impl std::str::FromStr for ServiceMode {
     }
 }
 
+/// Bounds applied to the recognition route.  Both are optional so a test (or a
+/// deployment that terminates policy at a proxy) can turn them off.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RouterLimits {
+    /// Deadline for one request, end to end.
+    pub request_timeout: Option<Duration>,
+    /// Max requests processed concurrently; the rest queue.
+    pub max_inflight: Option<usize>,
+}
+
 /// Build the axum Router for the Google STT v1-shaped HTTP API.
 ///
 /// REST is synchronous-only: streaming clients must use the gRPC
 /// `StreamingRecognize` RPC.
-pub fn build_router(state: AppState) -> Router {
+pub fn build_router(state: AppState, limits: RouterLimits) -> Router {
+    // The bounds go on the recognition route only.  `/healthz`, `/readyz` and
+    // `/metrics` are exactly what an operator needs answered *while* the
+    // service is saturated, so putting them behind the same concurrency limit
+    // would make a busy server look like a dead one to its own probes.
+    let mut recognize: Router<AppState> = Router::new().route(
+        "/v1/speech:recognize",
+        post(crate::recognize::handle_recognize),
+    );
+    if let Some(n) = limits.max_inflight {
+        // Bounds how many multi-MiB bodies can be resident at once; excess
+        // requests wait for a permit rather than each parking a buffer.
+        // *Global*, not per-layer-instance: axum clones the service per
+        // connection, and the plain `ConcurrencyLimitLayer` would hand each
+        // clone its own budget — a limit that scales with connection count is
+        // not a limit.
+        recognize = recognize.layer(GlobalConcurrencyLimitLayer::new(n));
+    }
+    if let Some(d) = limits.request_timeout {
+        // Applied outside the concurrency limit so the deadline covers time
+        // spent *queued* for a permit, not just time being served.
+        recognize = recognize.layer(TimeoutLayer::new(d));
+    }
+
     Router::new()
         // Speech-to-Text v1 (Google STT v1-shaped surface).
         // Raw PCM body, config in the query string (no base64/JSON).
-        .route(
-            "/v1/speech:recognize",
-            post(crate::recognize::handle_recognize),
-        )
+        .merge(recognize)
         // Models.
         .route("/v1/models", get(handle_models))
         // Operability.
@@ -69,8 +101,13 @@ async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+/// A heartbeat older than this means the engine is not serving.  The gRPC
+/// health watcher polls the same signal on the same bound, so `/readyz` and
+/// `grpc.health.v1.Health/Check` cannot disagree about this process.
+pub const READY_STALE_AFTER: Duration = Duration::from_secs(5);
+
 async fn handle_ready(State(s): State<AppState>) -> impl IntoResponse {
-    if s.pool.any_ready(Duration::from_secs(5)) {
+    if s.pool.any_ready(READY_STALE_AFTER) {
         (StatusCode::OK, "ready")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not ready")

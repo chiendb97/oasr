@@ -342,8 +342,13 @@ Routing policy: single in-process engine per process — no sticky map needed at
 | `--engine-label` | `engine` | tracing label |
 | `--service-mode` | `streaming` | `streaming` or `offline` — pins the engine for its lifetime |
 | `--max-concurrent-requests` | `256` | engine-side admission cap; over-cap admits emit `Event::Overloaded` |
-| `--admit-window-ms` | `3` | wait up to N ms after first envelope for siblings before stepping (HTTP burst coalescing); `0` disables |
+| `--admit-window-ms` | `3` | wait up to N ms after first envelope for siblings before stepping (HTTP burst coalescing); `0` disables. Entered only for an **admissions-only** batch — a `Cancel`/`FeedChunk` in hand (or landing mid-window) ends the wait, since it used to tax the two most latency-sensitive commands for the full window |
 | `--admit-threshold` | `64` | stop coalescing early when this many envelopes drained |
+| `--max-audio-mib` | `256` | one cap for the HTTP body **and** gRPC `max_decoding_message_size` (tonic's undeclared 4 MiB default was a 64× asymmetry) |
+| `--request-timeout-secs` | `300` | deadline for a unary request, incl. time queued behind the concurrency limit; `0` disables |
+| `--stream-idle-timeout-secs` | `300` | abort a streaming RPC idle this long (no inbound audio, or no decode event after half-close); `0` disables. Not a blanket gRPC deadline — that would cut off healthy long streams |
+| `--max-inflight-connections` | `4 ×` admission cap | per-listener concurrency (bounds resident multi-MiB bodies); `/healthz`,`/readyz`,`/metrics` exempt; `0` disables |
+| `--shutdown-grace-secs` | `10` | drain deadline after SIGTERM before listeners are dropped |
 | `--preferred-batch-sizes` | none | comma list, pre-warms CUDA-Graph capture per B |
 | `--schedule-policy` | engine default (`bucket`) | `bucket` / `fcfs` / `sjf` |
 | `--max-offline-pad-ratio` | engine default (`4.0`) | padded-waste cap for `bucket` policy |
@@ -357,7 +362,11 @@ Routing policy: single in-process engine per process — no sticky map needed at
 
 Per-request decoding options travel the whole stack: proto `RecognitionConfig` extensions (`max_alternatives` honored + fields 101–105: `max_new_tokens`/`temperature`/`top_k`/`top_p`/`prompt`) and matching HTTP query params → `oasr_wire::DecodingParams` on `Cmd::Create*` → a `decoding` dict kwarg into `add_request[s_batch]` → `oasr.engine.DecodingOptions`. `Event::Final` carries `nbest_texts` (engine-detokenized alternatives) + `end_time_s` (last CIF timestamp) → proto `result_end_time`; `confidence` is the softmax-normalized posterior among the returned n-best scores (`oasr_wire::score_posteriors`; 0.0 when a family emits a single hypothesis).
 
-Admission coalescing batches contiguous `CreateOffline`/`CreateStreaming` envelopes into one `add_requests_batch` Python call — turns 10–20-deep service batches into 32–64 under `asyncio.gather`-style bursts. `FeedChunk`/`Cancel`/`Ping` flush the admit batch first to preserve `CreateStreaming → FeedChunk` ordering. The Python-side `oasr/serving/` directory still exists but is dead code from the binary's perspective; `bench_service.py` rejects `--num-workers > 1` with a helpful error pointing at the new "one process per GPU" topology.
+Admission coalescing batches contiguous `CreateOffline`/`CreateStreaming` envelopes into one `add_requests_batch` Python call — turns 10–20-deep service batches into 32–64 under `asyncio.gather`-style bursts. `FeedChunk`/`Cancel`/`Ping` flush the admit batch first to preserve `CreateStreaming → FeedChunk` ordering. The command channel's depth is **derived** from `--max-concurrent-requests` (2×, floor 64) rather than fixed, because a queued `CreateOffline` holds its whole audio payload.
+
+Tick pacing has two waits, both a bounded `recv` (an arriving command wakes them in ~10 µs) rather than a sleep: `IDLE_RECV_TIMEOUT` (500 ms) when the engine is empty, and `NO_WORK_BACKOFF` (2 ms) after a tick that received nothing, emitted nothing, **and** ran faster than `NO_WORK_TICK_MAX` (1 ms). The second exists because "the engine has requests" ≠ "the engine has work": one open stream waiting on the client's next 640 ms chunk used to spin the thread through empty steps for the whole session — measured **95.9% → 4.2% of a core**, transcript-identical, with the loaded-path A/B a wash (RTF 552 vs 550, first-partial p50 19 vs 18 ms). Gating on tick *duration* is what keeps it off the working paths; an AR decode group grinding through its per-tick step budget costs far more than 1 ms even when it emits nothing.
+
+All three request handles (`StreamingHandle`, `OfflineStreamHandle`, and now the unary `OfflineHandle` behind HTTP `speech:recognize` / gRPC `Recognize`) arm `CancelOnDrop`, so a client disconnect stops the request instead of letting it run to completion on a slot nobody is waiting for; `oasr_requests_cancelled_total` counts them. Shutdown is `with_graceful_shutdown`/`serve_with_shutdown` + a bounded join, and the gRPC health reporter is driven by a watcher polling the same readiness signal `/readyz` reads (it was previously set once at startup and never re-evaluated, so a wedged engine answered `SERVING` forever). The Python-side `oasr/serving/` directory still exists but is dead code from the binary's perspective; `bench_service.py` rejects `--num-workers > 1` with a helpful error pointing at the new "one process per GPU" topology.
 
 ### Engine concurrency
 
