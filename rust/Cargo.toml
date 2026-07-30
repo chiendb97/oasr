@@ -80,6 +80,11 @@ hyper = { version = "1", features = ["full"] }
 
 # Audio
 hound = "3.5"
+# Sinc resampling for client audio that is not at the model's sample rate.
+# `default-features = false` drops the optional FFT resampler (and with it the
+# realfft / num-complex / rustfft tree) — the async sinc resampler is the only
+# one we use.
+rubato = { version = "0.16", default-features = false }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

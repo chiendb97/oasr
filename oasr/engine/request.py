@@ -226,7 +226,10 @@ class Request:
         If ``True``, process via the chunk-by-chunk streaming path with
         paged attention cache.  If ``False``, use the single-pass offline path.
     sample_rate : int
-        Sample rate of the audio in Hz.
+        Sample rate of the audio in Hz.  Must equal the model's own rate — the
+        engine does not resample and derives every frame count from
+        ``FeatureConfig.sample_rate``; admission rejects a mismatch.  Prefer
+        letting :meth:`ASREngine.add_request` default it.
     decoding : DecodingOptions, optional
         Per-request decoding options (n-best, generation cap, sampling,
         prompt).  ``None`` keeps every engine default.

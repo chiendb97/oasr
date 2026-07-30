@@ -17,4 +17,8 @@ pub struct ServerState {
     pub pool: Arc<EnginePool>,
     pub prometheus: Option<PrometheusHandle>,
     pub service_mode: ServiceMode,
+    /// The engine's waveform sample rate in Hz.  Handlers resample client audio
+    /// to this before submitting — the engine ignores a request's declared rate
+    /// and computes every frame count from its own.
+    pub sample_rate: u32,
 }

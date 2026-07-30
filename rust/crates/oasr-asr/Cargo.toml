@@ -8,5 +8,6 @@ description = "Audio decoding helpers (WAV + raw PCM) used by the OASR Rust fron
 [dependencies]
 bytes = { workspace = true }
 hound = { workspace = true }
+rubato = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

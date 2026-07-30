@@ -181,8 +181,10 @@ pub struct RawParams {
     /// (RIFF container in the body).  Same spelling as the proto enum.
     #[serde(default)]
     pub encoding: String,
-    /// Sample rate in Hz (default 16000; ignored for `WAV`, which carries its
-    /// own header).
+    /// Sample rate in Hz of the body's PCM (ignored for `WAV`, which carries
+    /// its own header).  Unset means the model's own rate.  Anything else is
+    /// resampled to the model's rate server-side; rates outside
+    /// `[4000, 384000]` are rejected.
     #[serde(default)]
     pub sample_rate: u32,
     #[serde(default)]
@@ -272,12 +274,19 @@ pub async fn handle_recognize(
             Ok(p) => p,
             Err((status, code, msg)) => return reject(status, code, msg),
         };
+        // An unset `sample_rate` means "the model's own rate" — the only value
+        // that could ever have worked before resampling existed.
         let sr = if params.sample_rate == 0 {
-            16_000
+            s.sample_rate
         } else {
             params.sample_rate
         };
-        let decoded = match decode_audio(ct_hint, &bytes, pcm_enc, Some(sr)) {
+        // Resample to the engine's rate here, in the front-end: the engine
+        // derives every frame count from its own `FeatureConfig.sample_rate` and
+        // ignores the request's, so 8 kHz telephony or 44.1 kHz media reaching it
+        // unconverted produced a confident, wrong transcript.  A WAV body carries
+        // its own rate in the header, which is what `decode_audio` converts from.
+        let decoded = match decode_audio(ct_hint, &bytes, pcm_enc, Some(sr), Some(s.sample_rate)) {
             Ok(d) => d,
             Err(e) => {
                 return reject(
@@ -287,6 +296,14 @@ pub async fn handle_recognize(
                 );
             }
         };
+
+        if decoded.sample_rate != sr {
+            debug!(
+                from_hz = sr,
+                to_hz = decoded.sample_rate,
+                "resampled request audio to the model rate"
+            );
+        }
 
         let audio_buf: Bytes = decoded.samples;
         let decoding = match params.decoding_params() {
