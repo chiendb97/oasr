@@ -537,15 +537,31 @@ fn audio_bytes_to_numpy<'py>(py: Python<'py>, audio: &[u8]) -> PyResult<Bound<'p
     // `np.frombuffer`.
     let elem = std::mem::size_of::<f32>();
     let n = audio.len() / elem;
-    // SAFETY: `new_bound` returns an uninitialized, contiguous 1-D array of
-    // `n` f32; we immediately initialize every one of its `n * elem` bytes via
-    // a single non-overlapping copy from `audio` (a distinct allocation).
-    let arr = unsafe {
-        let arr = PyArray1::<f32>::new_bound(py, n, false);
-        let dst = arr.as_slice_mut().expect("fresh 1-D array is contiguous");
-        std::ptr::copy_nonoverlapping(audio.as_ptr(), dst.as_mut_ptr().cast::<u8>(), n * elem);
-        arr
-    };
+    // SAFETY: the array is left uninitialized only until the copy below fills
+    // every one of its `n * elem` bytes.  `f32` has no drop glue, so the early
+    // return on the (unreachable) contiguity error frees it safely too.
+    let arr = unsafe { PyArray1::<f32>::new_bound(py, n, false) };
+    {
+        // Contiguity is an invariant of a freshly allocated 1-D array, but it
+        // comes back as a `Result` and this runs on the **dispatcher's OS
+        // thread** — the one thread that owns the GIL and the engine.  An
+        // `expect` here would unwind, drop the command receiver, and kill the
+        // single GPU worker for the life of the process (every later submit
+        // failing `WorkerDown`) without crashing the process or logging a
+        // cause: a silent one-way failure. Propagating turns a violated
+        // invariant into one failed request.
+        // SAFETY: no other reference to `arr` exists; the slice is dropped
+        // before `arr` is handed back.
+        let dst = unsafe { arr.as_slice_mut() }.map_err(|e| {
+            PyRuntimeError::new_err(format!("fresh 1-D numpy array is not contiguous: {e}"))
+        })?;
+        // SAFETY: `dst` is `n` contiguous, f32-aligned elements owned by a
+        // freshly allocated array; `audio` is a distinct allocation of at
+        // least `n * elem` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(audio.as_ptr(), dst.as_mut_ptr().cast::<u8>(), n * elem);
+        }
+    }
     Ok(arr)
 }
 

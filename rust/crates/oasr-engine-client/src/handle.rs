@@ -9,7 +9,9 @@
 //! handle without an explicit `finish` emits a `Cmd::Cancel`.
 //!
 //! [`OfflineHandle`] is a oneshot future that resolves with the Final or
-//! Error event.
+//! Error event.  All three handles arm [`CancelOnDrop`]: a client that goes
+//! away is the normal case, and the engine has to hear about it or the request
+//! keeps computing on a slot nobody is waiting for.
 
 use bytes::Bytes;
 use oasr_wire::{Cmd, Event};
@@ -176,18 +178,43 @@ impl OfflineStreamHandle {
 }
 
 /// Offline request handle: await a single final result.
+///
+/// Cancel-on-drop is armed like the streaming handles', and it matters just as
+/// much here even though the client sends its audio in one shot: this handle
+/// backs **both** `POST /v1/speech:recognize` and the gRPC unary `Recognize`,
+/// and both front-ends' handler futures are dropped when the client
+/// disconnects.  Without the guard the request kept computing and kept holding
+/// its `--max-concurrent-requests` slot — for an autoregressive family, the
+/// whole `max_new_tokens` generation, burned on nobody.
 pub struct OfflineHandle {
     pub request_id: String,
     rx: oneshot::Receiver<Event>,
+    cancel: CancelOnDrop,
 }
 
 impl OfflineHandle {
-    pub(crate) fn new(request_id: String, rx: oneshot::Receiver<Event>) -> Self {
-        Self { request_id, rx }
+    pub(crate) fn new(
+        request_id: String,
+        rx: oneshot::Receiver<Event>,
+        cmd_tx: mpsc::Sender<CmdEnvelope>,
+        router: RouterActor,
+    ) -> Self {
+        Self {
+            cancel: CancelOnDrop::arm(request_id.clone(), cmd_tx, router),
+            request_id,
+            rx,
+        }
     }
 
     /// Await the final result event.
+    ///
+    /// The guard is disarmed only once the terminal event is in hand.  Dropping
+    /// this future before then — which is what a client disconnect does — leaves
+    /// it armed and cancels the request.
     pub async fn finish(self) -> Result<Event, oneshot::error::RecvError> {
-        self.rx.await
+        let Self { rx, mut cancel, .. } = self;
+        let ev = rx.await;
+        cancel.disarm();
+        ev
     }
 }

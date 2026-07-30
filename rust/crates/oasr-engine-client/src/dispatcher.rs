@@ -35,6 +35,27 @@ use crate::router::RouterActor;
 /// lands an envelope inside the window, `recv()` returns immediately.
 const IDLE_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How long the dispatcher waits on the command channel after a tick that did
+/// no work while the engine still has requests in flight.
+///
+/// Without this the loop spun: the idle block below only engages when
+/// `running == 0 && waiting == 0`, so a single open streaming session — which
+/// spends most of its life waiting for the *client's* next 640 ms chunk — kept
+/// the thread stepping an engine with nothing to do, pinning a core and
+/// thrashing the GIL for the whole session.  This is a `recv` with a timeout,
+/// not a sleep: an arriving `FeedChunk` wakes it in ~10 µs, so the streaming
+/// path pays nothing.
+const NO_WORK_BACKOFF: Duration = Duration::from_millis(2);
+
+/// A tick faster than this, that produced nothing and received nothing, is
+/// treated as a no-op and backs off.
+///
+/// Gating on tick *duration* is what keeps the backoff off the working paths: a
+/// tick that is genuinely computing — an autoregressive decode group grinding
+/// through `decode_steps_per_tick`, a paged streaming forward — costs far more
+/// than this and never qualifies, even when it emits no output that tick.
+const NO_WORK_TICK_MAX: Duration = Duration::from_millis(1);
+
 /// Consecutive `engine.step()` failures after which this process stops
 /// advertising readiness.  A single failure is recoverable (the offending
 /// requests are errored and aborted); a run of them means the engine is wedged,
@@ -61,6 +82,7 @@ pub(crate) mod metric {
     pub const REJECTED: &str = "oasr_requests_rejected_total";
     pub const BUSY: &str = "oasr_requests_busy_total";
     pub const STEP_FAILURES: &str = "oasr_engine_step_failures_total";
+    pub const CANCELLED: &str = "oasr_requests_cancelled_total";
     pub const EVENTS_DROPPED: &str = "oasr_events_dropped_total";
     pub const EVENTS_DEFERRED: &str = "oasr_events_deferred_total";
 }
@@ -109,6 +131,10 @@ fn describe_metrics() {
         "Requests refused because max_concurrent_requests was reached"
     );
     metrics::describe_counter!(metric::STEP_FAILURES, "ASREngine.step() raised");
+    metrics::describe_counter!(
+        metric::CANCELLED,
+        "Requests aborted before completion (usually a client disconnect)"
+    );
     metrics::describe_counter!(
         metric::EVENTS_DROPPED,
         "Non-terminal events (partials) dropped because a client's channel was full"
@@ -355,15 +381,19 @@ fn run_dispatcher(
         // over ~1-3 ms, so a 3 ms window grows per-step batches from 10-20
         // to 32-64 without a measurable p50 hit.  Skipped when:
         //   * no envelopes arrived this tick (nothing to coalesce);
+        //   * **any** drained envelope is not an admission — see below;
         //   * already at threshold;
         //   * engine is at >=25% load cap (admission is no longer the
         //     bottleneck — step the queue immediately);
         //   * window is zero (knob disabled).
-        if !envs.is_empty()
-            && envs.len() < cfg.admit_threshold
-            && cfg.admit_window > Duration::ZERO
-            && shared.load.load(Ordering::Relaxed) * 4 < cfg.max_concurrent_requests
-        {
+        //
+        // The "admissions only" condition is what keeps this a throughput knob
+        // instead of a latency tax on everything else.  The window exists to
+        // batch *admissions*; it used to be entered on envelope count alone, so
+        // a lone `Cancel` or `FeedChunk` — the two most latency-sensitive
+        // commands there are — sat here for the full `--admit-window-ms` before
+        // the dispatcher even entered the GIL.
+        if should_coalesce(&envs, &cfg, shared.load.load(Ordering::Relaxed)) {
             let deadline = Instant::now() + cfg.admit_window;
             while envs.len() < cfg.admit_threshold {
                 let remaining = match deadline.checked_duration_since(Instant::now()) {
@@ -371,7 +401,16 @@ fn run_dispatcher(
                     _ => break,
                 };
                 match rt_handle.block_on(tokio::time::timeout(remaining, cmd_rx.recv())) {
-                    Ok(Some(env)) => envs.push(env),
+                    Ok(Some(env)) => {
+                        // A latency-sensitive command landing mid-window ends
+                        // the wait — same reason the window is not entered with
+                        // one already in hand.
+                        let admit = is_admit(&env.cmd);
+                        envs.push(env);
+                        if !admit {
+                            break;
+                        }
+                    }
                     Ok(None) => {
                         info!(label = %shared.label, "command channel closed; dispatcher exit");
                         return;
@@ -629,18 +668,37 @@ fn run_dispatcher(
             }
         }
 
-        // ---- Idle wakeup ----
+        // ---- Idle / no-work wakeup ----
         //
-        // If nothing came in AND the engine has no work pending, wait on the
-        // channel until a sender lands an envelope.  Bounded by
-        // `IDLE_RECV_TIMEOUT` so the heartbeat keeps refreshing during long
-        // idle periods (otherwise `/readyz` would go stale).  Replaces the
-        // historical 1 ms poll loop with a ~10 µs scheduler wake when a
-        // command arrives during the wait window.  When pending work exists
-        // we keep busy-iterating so streaming requests continue to advance
-        // at the engine's natural cadence.
-        if !received_any && running == 0 && waiting == 0 {
-            match rt_handle.block_on(tokio::time::timeout(IDLE_RECV_TIMEOUT, cmd_rx.recv())) {
+        // Two cases wait on the channel rather than looping straight back, and
+        // both are a bounded `recv` — not a sleep — so a command arriving
+        // during the wait resumes the loop in ~10 µs and costs the request
+        // nothing:
+        //
+        // 1. **Fully idle** (nothing received, nothing in the engine): wait up
+        //    to `IDLE_RECV_TIMEOUT`.  The bound exists so the heartbeat keeps
+        //    refreshing during long idle periods, otherwise `/readyz` goes
+        //    stale.
+        //
+        // 2. **Work in flight but this tick did nothing**: wait up to
+        //    `NO_WORK_BACKOFF`.  The engine having requests is not the same as
+        //    the engine having *something to do* — an open streaming session
+        //    spends most of its life waiting for the client's next chunk, and
+        //    the loop used to spin through empty steps for the whole session,
+        //    pinning a core and thrashing the GIL.  `NO_WORK_TICK_MAX` is what
+        //    keeps this off the working paths: a tick that is actually
+        //    computing costs far more than a millisecond even when it emits
+        //    nothing (an AR decode group grinding through its per-tick step
+        //    budget), so it never qualifies.
+        let idle = !received_any && running == 0 && waiting == 0;
+        let spinning = did_nothing(received_any, n_out, t_tick);
+        if idle || spinning {
+            let wait = if idle {
+                IDLE_RECV_TIMEOUT
+            } else {
+                NO_WORK_BACKOFF
+            };
+            match rt_handle.block_on(tokio::time::timeout(wait, cmd_rx.recv())) {
                 Ok(Some(env)) => envs.push(env),
                 Ok(None) => {
                     info!(label = %shared.label, "command channel closed; dispatcher exit");
@@ -654,6 +712,41 @@ fn run_dispatcher(
             // `envs` with any siblings already in the channel.
         }
     }
+}
+
+/// Is this an admission command (as opposed to chunk / cancel / ping)?
+fn is_admit(cmd: &Cmd) -> bool {
+    matches!(cmd, Cmd::CreateOffline { .. } | Cmd::CreateStreaming { .. })
+}
+
+/// Should the dispatcher hold this tick's envelopes open for siblings?
+///
+/// The window is a *throughput* knob for admissions, so it only applies to a
+/// batch that is nothing but admissions.  It used to be entered on envelope
+/// count alone, which taxed the two most latency-sensitive commands there are:
+/// a lone `Cancel` or `FeedChunk` waited the full `--admit-window-ms` before the
+/// dispatcher even entered the GIL.
+fn should_coalesce(envs: &[CmdEnvelope], cfg: &DispatcherConfig, load: u32) -> bool {
+    !envs.is_empty()
+        && envs.len() < cfg.admit_threshold
+        && cfg.admit_window > Duration::ZERO
+        // Past ~25% of the cap admission is no longer the bottleneck; step the
+        // queue instead of growing it.
+        && load * 4 < cfg.max_concurrent_requests
+        && envs.iter().all(|e| is_admit(&e.cmd))
+}
+
+/// Did this tick accomplish nothing, so the loop should wait on the channel
+/// rather than immediately step again?
+///
+/// The engine having requests in flight is not the same as the engine having
+/// something to do: an open streaming session spends most of its life waiting
+/// for the client's next chunk.  `NO_WORK_TICK_MAX` is what keeps this off the
+/// working paths — a tick that is genuinely computing costs far more than a
+/// millisecond even when it emits nothing that tick (an AR decode group
+/// grinding through its per-tick step budget), so it never qualifies.
+fn did_nothing(received_any: bool, n_out: u64, t_tick: Duration) -> bool {
+    !received_any && n_out == 0 && t_tick < NO_WORK_TICK_MAX
 }
 
 /// Run cap-check + validate audio for one admit envelope.  On success, bump
@@ -884,8 +977,15 @@ fn handle_nonadmit_cmd_locked<'py>(
             }
         }
         Cmd::Cancel { request_id } => {
-            let _ = PyEngine::abort_locked(bound, &request_id);
+            // Logged because the usual source is a client disconnect, which is
+            // otherwise invisible: the request simply stops producing events and
+            // an operator has no way to tell that from an engine that dropped it.
+            debug!(label = %shared.label, rid = %request_id, "cancelling request");
+            if let Err(e) = PyEngine::abort_locked(bound, &request_id) {
+                warn!(label = %shared.label, rid = %request_id, "abort failed: {e}");
+            }
             shared.router.remove(&request_id);
+            metrics::counter!(metric::CANCELLED).increment(1);
         }
         // Create* should never reach here — the dispatcher routes them to
         // enqueue_admit_locked.  If one slips through, fall back to the
@@ -893,5 +993,115 @@ fn handle_nonadmit_cmd_locked<'py>(
         Cmd::CreateOffline { .. } | Cmd::CreateStreaming { .. } => {
             error!(label = %shared.label, "internal: Create* cmd reached handle_nonadmit_cmd_locked");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn admit(rid: &str) -> CmdEnvelope {
+        CmdEnvelope::new(
+            Cmd::CreateOffline {
+                request_id: rid.into(),
+                sample_rate: 16_000,
+                priority: 0,
+                decoding: None,
+            },
+            Some(Bytes::from_static(b"\0\0\0\0")),
+        )
+    }
+
+    fn chunk(rid: &str) -> CmdEnvelope {
+        CmdEnvelope::new(
+            Cmd::FeedChunk {
+                request_id: rid.into(),
+                is_last: false,
+            },
+            Some(Bytes::from_static(b"\0\0\0\0")),
+        )
+    }
+
+    fn cancel(rid: &str) -> CmdEnvelope {
+        CmdEnvelope::new(
+            Cmd::Cancel {
+                request_id: rid.into(),
+            },
+            None,
+        )
+    }
+
+    fn cfg() -> DispatcherConfig {
+        DispatcherConfig::default()
+    }
+
+    #[test]
+    fn a_thin_batch_of_admissions_coalesces() {
+        assert!(should_coalesce(&[admit("a"), admit("b")], &cfg(), 0));
+    }
+
+    /// The regression this predicate exists for: a cancel or a chunk must reach
+    /// the engine on the next tick, not after `--admit-window-ms`.  Cancels are
+    /// what free a decode slot, and chunks are the streaming critical path.
+    #[test]
+    fn a_latency_sensitive_command_skips_the_window() {
+        assert!(!should_coalesce(&[cancel("a")], &cfg(), 0));
+        assert!(!should_coalesce(&[chunk("a")], &cfg(), 0));
+        // Even mixed in with admissions — one delayed cancel is worse than one
+        // under-full admission batch.
+        assert!(!should_coalesce(&[admit("a"), chunk("b")], &cfg(), 0));
+        assert!(!should_coalesce(&[chunk("b"), admit("a")], &cfg(), 0));
+    }
+
+    #[test]
+    fn nothing_to_coalesce_or_already_full_skips_the_window() {
+        assert!(!should_coalesce(&[], &cfg(), 0));
+        let full: Vec<CmdEnvelope> = (0..cfg().admit_threshold).map(|_| admit("a")).collect();
+        assert!(!should_coalesce(&full, &cfg(), 0));
+    }
+
+    #[test]
+    fn a_loaded_engine_skips_the_window() {
+        let c = cfg();
+        assert!(!should_coalesce(
+            &[admit("a")],
+            &c,
+            c.max_concurrent_requests / 4
+        ));
+    }
+
+    #[test]
+    fn a_zero_window_disables_coalescing() {
+        let c = DispatcherConfig {
+            admit_window: Duration::ZERO,
+            ..cfg()
+        };
+        assert!(!should_coalesce(&[admit("a")], &c, 0));
+    }
+
+    /// The spin this guards against: an open streaming session leaves
+    /// `running > 0` for its whole life, so the idle block never engaged and the
+    /// loop stepped an engine with nothing to do until the client's next chunk.
+    #[test]
+    fn an_empty_fast_tick_backs_off() {
+        assert!(did_nothing(false, 0, Duration::from_micros(50)));
+    }
+
+    /// ...and the three ways a tick earns the right to loop straight back.
+    #[test]
+    fn a_tick_that_did_something_does_not_back_off() {
+        // Commands arrived — more may be queued behind them.
+        assert!(!did_nothing(true, 0, Duration::from_micros(50)));
+        // Outputs were produced — the engine is mid-stride.
+        assert!(!did_nothing(false, 3, Duration::from_micros(50)));
+        // Slow tick with no output: an AR decode group grinding through its
+        // per-tick step budget.  Backing off here would directly slow
+        // generation, which is why the gate is tick *duration* and not
+        // "running > 0".
+        assert!(!did_nothing(false, 0, Duration::from_millis(48)));
     }
 }

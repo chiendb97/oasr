@@ -30,11 +30,33 @@ use crate::pyengine::PyEngine;
 use crate::router::RouterActor;
 use crate::EngineClientError;
 
-pub const DEFAULT_CMD_CHANNEL_CAP: usize = 1024;
 pub const DEFAULT_EVENT_CHANNEL_CAP: usize = 64;
+
+/// Floor on the command channel so a tiny `max_concurrent_requests` still
+/// leaves room for the non-admission traffic (chunks, cancels, pings).
+pub const MIN_CMD_CHANNEL_CAP: usize = 64;
+
+/// Command-channel depth for a given admission cap.
+///
+/// The two bounds have to be related, because every buffered `CreateOffline`
+/// carries its **full audio payload** in `CmdEnvelope::payload`: a fixed 1024
+/// against a default cap of 256 meant up to 4× the admissible work could sit in
+/// the channel — each up to `--max-audio-mib` — before a sender blocked, and
+/// that wait is undeadlined.  Two per admissible request covers one in-flight
+/// `FeedChunk`/`Cancel` per open stream on top of its admission, which is the
+/// most a well-behaved front-end has outstanding at once.
+pub fn cmd_channel_cap_for(max_concurrent_requests: u32) -> usize {
+    (max_concurrent_requests as usize)
+        .saturating_mul(2)
+        .max(MIN_CMD_CHANNEL_CAP)
+}
 
 #[derive(Debug, Clone)]
 pub struct EngineClientConfig {
+    /// Depth of the dispatcher command channel.  Defaults to
+    /// [`cmd_channel_cap_for`] of the dispatcher's `max_concurrent_requests`
+    /// and is recomputed by [`EngineClient::start`] unless a caller overrode it
+    /// after construction.
     pub cmd_channel_cap: usize,
     pub event_channel_cap: usize,
     pub label: String,
@@ -43,12 +65,22 @@ pub struct EngineClientConfig {
 
 impl EngineClientConfig {
     pub fn new(label: impl Into<String>) -> Self {
+        let dispatcher = DispatcherConfig::default();
         Self {
-            cmd_channel_cap: DEFAULT_CMD_CHANNEL_CAP,
+            cmd_channel_cap: cmd_channel_cap_for(dispatcher.max_concurrent_requests),
             event_channel_cap: DEFAULT_EVENT_CHANNEL_CAP,
             label: label.into(),
-            dispatcher: DispatcherConfig::default(),
+            dispatcher,
         }
+    }
+
+    /// Re-derive [`Self::cmd_channel_cap`] from the current dispatcher cap.
+    ///
+    /// Callers build the config, then overwrite `dispatcher` wholesale from the
+    /// CLI; without this the channel would keep the depth implied by the
+    /// *default* cap rather than the configured one.
+    pub fn sync_cmd_channel_cap(&mut self) {
+        self.cmd_channel_cap = cmd_channel_cap_for(self.dispatcher.max_concurrent_requests);
     }
 }
 
@@ -170,7 +202,12 @@ impl EngineClient {
             Some(audio),
         );
         self.send_envelope(envelope).await?;
-        Ok(OfflineHandle::new(request_id, rx))
+        Ok(OfflineHandle::new(
+            request_id,
+            rx,
+            self.cmd_tx.clone(),
+            self.shared.router.clone(),
+        ))
     }
 
     /// Submit an offline request and keep the **whole** event stream.
@@ -294,5 +331,49 @@ impl EngineClient {
             trace!(label = %self.cfg.label, "send_envelope: receiver dropped");
             EngineClientError::WorkerDown(self.cfg.label.clone())
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two bounds must stay related.  A fixed 1024-deep command channel
+    /// against a default admission cap of 256 meant up to 4x the admissible
+    /// work could buffer — **each envelope carrying its full audio payload** —
+    /// before a sender blocked, on an undeadlined wait.
+    #[test]
+    fn the_channel_cap_follows_the_admission_cap() {
+        for cap in [1u32, 8, 64, 256, 1024] {
+            let depth = cmd_channel_cap_for(cap);
+            assert!(
+                depth >= cap as usize,
+                "cap {cap} must not be able to block its own admissions (depth {depth})"
+            );
+            assert!(
+                depth <= (cap as usize).saturating_mul(2).max(MIN_CMD_CHANNEL_CAP),
+                "cap {cap} buffers far more than the admissible work (depth {depth})"
+            );
+        }
+    }
+
+    /// A tiny cap still needs room for chunks, cancels and pings.
+    #[test]
+    fn a_small_admission_cap_keeps_a_usable_floor() {
+        assert_eq!(cmd_channel_cap_for(1), MIN_CMD_CHANNEL_CAP);
+    }
+
+    /// Callers overwrite `dispatcher` wholesale after `new()`, so the derived
+    /// depth has to be re-synced or it silently keeps the *default* cap's value.
+    #[test]
+    fn sync_picks_up_a_dispatcher_cap_set_after_construction() {
+        let mut cfg = EngineClientConfig::new("t");
+        cfg.dispatcher.max_concurrent_requests = 16;
+        cfg.sync_cmd_channel_cap();
+        assert_eq!(cfg.cmd_channel_cap, cmd_channel_cap_for(16));
     }
 }

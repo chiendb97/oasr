@@ -320,8 +320,14 @@ decode slot instead of running to its `max_new_tokens` cap.
 
 The binary exposes the standard `grpc.health.v1.Health` service.  Both an
 empty service name (overall process health) and `oasr.speech.v1.Speech`
-report `SERVING` once the engine dispatcher has produced its first tick, and
-flip to `NOT_SERVING` during shutdown.
+track **engine readiness**, re-evaluated once a second against the same
+dispatcher heartbeat `/readyz` reads and on the same 5 s staleness bound, so the
+two probes cannot disagree about a process.  That means a wedged engine — three
+consecutive `step()` failures, after which the dispatcher stops the heartbeat —
+now drains: the check goes `NOT_SERVING` and a k8s deployment following the
+probe recipe below actually removes the pod.  A shutdown signal also flips it
+`NOT_SERVING` *before* the drain, so a load balancer sees the transition while
+in-flight requests are still finishing.
 
 ```bash
 # k8s-style probe
@@ -500,10 +506,39 @@ Prometheus exposition of the values the dispatcher already computes per tick.
 | `oasr_engine_outputs_total` | counter | `RequestOutput`s returned by `step()`. |
 | `oasr_requests_{admitted,rejected,busy}_total` | counter | Accepted / rejected at admission (invalid options, mode mismatch) / refused at `--max-concurrent-requests`. |
 | `oasr_engine_step_failures_total` | counter | `step()` raised. Three consecutive failures stop the readiness heartbeat, so `/readyz` and the gRPC health check go NotServing and a load balancer drains the process. |
+| `oasr_requests_cancelled_total` | counter | Requests aborted before completion — almost always a client disconnect. A rising count next to a flat `oasr_engine_outputs_total` means clients are giving up before the engine answers. |
 | `oasr_events_{dropped,deferred}_total` | counter | Per-request channel was full: a partial was dropped (harmless — the next one supersedes it) or a **terminal** event was handed to a background task rather than lost. Sustained non-zero here means clients are reading slower than the engine emits. |
 
 `--trace-dispatch` additionally logs rolling 2 s means of the same sub-stages at
 INFO; the histograms above are the ones to alert on.
+
+## Limits, timeouts and shutdown
+
+Every bound below is explicit and logged at startup (`"serving limits"`), because
+the defaults that bit hardest were the ones nobody had written down.
+
+| Flag | Default | What it bounds |
+|---|---|---|
+| `--max-audio-mib` | `256` | Largest audio payload per request. Drives **both** the HTTP body cap and gRPC's `max_decoding_message_size`. One number, because tonic's undeclared 4 MiB default against HTTP's 256 MiB meant the same ~2-minute clip was accepted on REST and rejected on the surface this doc recommends for offline throughput. |
+| `--request-timeout-secs` | `300` | Deadline for one **unary** request (HTTP `speech:recognize`, gRPC `Recognize`), covering time queued behind the concurrency limit. `0` disables. |
+| `--stream-idle-timeout-secs` | `300` | Aborts a streaming RPC that goes this long with no inbound audio (before half-close) or no decode event (after). `0` disables. Deliberately *not* a blanket gRPC deadline — that would cut off healthy long-lived streams; a live stream can only be bounded by inactivity. |
+| `--max-inflight-connections` | `4 x --max-concurrent-requests` | Requests either listener processes at once; the rest queue (and are eventually cut off by the timeout). Bounds how many multi-MiB bodies are resident. `/healthz`, `/readyz` and `/metrics` are **exempt** — a saturated server must still answer its own probes. `0` disables. |
+| `--shutdown-grace-secs` | `10` | How long in-flight requests get to finish after SIGTERM/SIGINT before the listeners are dropped. |
+
+The dispatcher's command channel is derived from `--max-concurrent-requests`
+(2x, floor 64) rather than fixed, because every queued `CreateOffline` envelope
+holds its full audio payload: the two bounds have to be related or the channel
+buffers several times the admissible work, each up to `--max-audio-mib`.
+
+**Shutdown is graceful.**  SIGTERM flips the gRPC health check and `/readyz` to
+not-serving, stops both listeners accepting, and waits up to the grace period for
+in-flight requests to complete.  Measured: 64 requests in flight at SIGTERM, 64
+completed `200`, drained in 141 ms.
+
+**Client disconnects cancel.**  All three request handles — streaming, offline
+streaming, and the unary one behind HTTP `speech:recognize` / gRPC `Recognize` —
+cancel their engine request when the handler future is dropped.  Watch
+`oasr_requests_cancelled_total`.
 
 ## Operational tips
 

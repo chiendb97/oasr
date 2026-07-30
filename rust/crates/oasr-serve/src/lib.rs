@@ -28,11 +28,16 @@ use oasr_engine_client::{
 };
 use oasr_server_grpc::pb::speech_server::SpeechServer;
 use oasr_server_grpc::{ServiceMode as GrpcServiceMode, SpeechService, SPEECH_SERVICE_NAME};
-use oasr_server_http::{build_router, ServerState, ServiceMode as HttpServiceMode};
+use oasr_server_http::{
+    build_router, RouterLimits, ServerState, ServiceMode as HttpServiceMode, READY_STALE_AFTER,
+};
 use tokio::signal;
 use tonic_health::ServingStatus;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// How often the health watcher re-evaluates engine readiness.
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Run the server to completion: build the engine, start the HTTP + gRPC
 /// listeners, and block until a shutdown signal arrives.
@@ -179,6 +184,20 @@ async fn serve(cli: Cli) -> Result<()> {
         trace_dispatch: cli.trace_dispatch,
         ..DispatcherConfig::default()
     };
+    // The command channel buffers whole audio payloads, so its depth has to
+    // follow the admission cap rather than sit at an unrelated constant.
+    client_cfg.sync_cmd_channel_cap();
+    info!(
+        label = %cli.engine_label,
+        max_concurrent_requests = cli.max_concurrent_requests,
+        cmd_channel_cap = client_cfg.cmd_channel_cap,
+        max_audio_mib = cli.max_audio_mib,
+        request_timeout_secs = cli.request_timeout_secs,
+        stream_idle_timeout_secs = cli.stream_idle_timeout_secs,
+        max_inflight_connections = ?cli.inflight_limit(),
+        shutdown_grace_secs = cli.shutdown_grace_secs,
+        "serving limits"
+    );
     let client = Arc::new(EngineClient::start(engine, client_cfg));
 
     // Wait briefly for the dispatcher to take its first tick so /readyz
@@ -195,67 +214,148 @@ async fn serve(cli: Cli) -> Result<()> {
         prometheus,
         service_mode: http_mode,
         sample_rate: engine_sample_rate,
+        max_body_bytes: cli.max_audio_bytes(),
     });
 
+    // One broadcast of the shutdown signal to both listeners; each stops
+    // accepting and lets its in-flight requests finish.
+    let (shutdown_tx, mut http_shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    let mut grpc_shutdown_rx = shutdown_tx.subscribe();
+
     // ---- HTTP server ----
-    let http_router = build_router(Arc::clone(&state));
+    let http_router = build_router(
+        Arc::clone(&state),
+        RouterLimits {
+            request_timeout: cli.request_timeout(),
+            max_inflight: cli.inflight_limit(),
+        },
+    );
     let http_bind = cli.http_bind;
     let http_listener = tokio::net::TcpListener::bind(http_bind)
         .await
         .with_context(|| format!("bind http {http_bind}"))?;
     info!("HTTP listening on http://{http_bind}");
     let http_handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(http_listener, http_router).await {
+        let serve = axum::serve(http_listener, http_router).with_graceful_shutdown(async move {
+            let _ = http_shutdown_rx.recv().await;
+        });
+        if let Err(e) = serve.await {
             error!("axum serve: {e}");
         }
+        debug!("HTTP listener drained");
     });
 
     // ---- gRPC server (Speech + standard Health) ----
     let grpc_bind = cli.grpc_bind;
     let grpc_pool = Arc::clone(&pool);
+    let grpc_idle = cli.stream_idle_timeout();
+    let grpc_max_message = cli.max_audio_bytes();
+    let grpc_conn_limit = cli.inflight_limit();
 
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
-    // Mark the Speech service as serving from the start: the engine
-    // dispatcher has already completed its first tick above and the pool is
-    // accepting work.  An empty service name flips the overall process
-    // health, which Kubernetes / gRPC LBs probe by default.
+    // Start NOT_SERVING and let the watcher below promote us: the reporter has
+    // to track the *engine*, not the process.  It used to be set once at
+    // startup and once at shutdown, so after the dispatcher gave up on a wedged
+    // engine — at which point `/readyz` correctly 503s — `grpc.health.v1
+    // Health/Check` still answered SERVING forever, and a deployment following
+    // this doc's `grpc-health-probe` advice would never drain the pod.
     health_reporter
-        .set_service_status(SPEECH_SERVICE_NAME, ServingStatus::Serving)
+        .set_service_status(SPEECH_SERVICE_NAME, ServingStatus::NotServing)
         .await;
-    health_reporter
-        .set_service_status("", ServingStatus::Serving)
-        .await;
+    let health_pool = Arc::clone(&pool);
+    let mut health_shutdown_rx = shutdown_tx.subscribe();
+    let health_handle = tokio::spawn(async move {
+        let mut reporter = health_reporter;
+        let mut serving: Option<bool> = None;
+        loop {
+            // Same signal `/readyz` reads, on the same staleness bound, so the
+            // two probes cannot disagree about this process.
+            let ready = health_pool.any_ready(READY_STALE_AFTER);
+            if serving != Some(ready) {
+                let status = if ready {
+                    ServingStatus::Serving
+                } else {
+                    ServingStatus::NotServing
+                };
+                if serving.is_some() {
+                    warn!(ready, "engine readiness changed; updating gRPC health");
+                }
+                reporter
+                    .set_service_status(SPEECH_SERVICE_NAME, status)
+                    .await;
+                // The empty service name is the overall-process health that
+                // Kubernetes and gRPC load balancers probe by default.
+                reporter.set_service_status("", status).await;
+                serving = Some(ready);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(HEALTH_POLL_INTERVAL) => {}
+                _ = health_shutdown_rx.recv() => {
+                    reporter
+                        .set_service_status(SPEECH_SERVICE_NAME, ServingStatus::NotServing)
+                        .await;
+                    reporter.set_service_status("", ServingStatus::NotServing).await;
+                    return;
+                }
+            }
+        }
+    });
 
     let grpc_handle = tokio::spawn(async move {
-        let svc = SpeechService::new(grpc_pool, grpc_mode, engine_sample_rate);
+        let svc = SpeechService::new(grpc_pool, grpc_mode, engine_sample_rate)
+            .with_stream_idle_timeout(grpc_idle);
         info!("gRPC listening on {grpc_bind}");
-        if let Err(e) = tonic::transport::Server::builder()
-            .add_service(SpeechServer::new(svc))
+        // Both message-size limits are set explicitly.  tonic's default
+        // decoding cap is 4 MiB, which silently rejected any unary `Recognize`
+        // carrying more than ~2 minutes of 16 kHz PCM while HTTP accepted
+        // 256 MiB of the same audio — a 64x asymmetry on the surface the docs
+        // recommend for offline throughput.
+        let speech = SpeechServer::new(svc)
+            .max_decoding_message_size(grpc_max_message)
+            .max_encoding_message_size(grpc_max_message);
+        let mut builder = tonic::transport::Server::builder();
+        if let Some(n) = grpc_conn_limit {
+            builder = builder.concurrency_limit_per_connection(n);
+        }
+        let serve = builder
+            .add_service(speech)
             .add_service(health_service)
-            .serve(grpc_bind)
-            .await
-        {
+            .serve_with_shutdown(grpc_bind, async move {
+                let _ = grpc_shutdown_rx.recv().await;
+            });
+        if let Err(e) = serve.await {
             error!("tonic serve: {e}");
         }
+        debug!("gRPC listener drained");
     });
 
     // ---- Wait for shutdown ----
     wait_for_signal().await;
-    info!("shutdown signal received; draining");
+    let grace = Duration::from_secs(cli.shutdown_grace_secs);
+    info!(
+        grace_secs = cli.shutdown_grace_secs,
+        "shutdown signal received; draining"
+    );
 
-    // Flip health to NOT_SERVING so probes in-flight see the transition.
-    health_reporter
-        .set_service_status(SPEECH_SERVICE_NAME, ServingStatus::NotServing)
-        .await;
-    health_reporter
-        .set_service_status("", ServingStatus::NotServing)
-        .await;
+    // Tell every listener to stop accepting.  Both then finish their in-flight
+    // requests; the health watcher flips to NOT_SERVING on the same signal, so
+    // a load balancer sees the transition while the drain is still running.
+    let _ = shutdown_tx.send(());
 
-    http_handle.abort();
-    grpc_handle.abort();
-
-    // Brief grace period for in-flight handlers.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait for the drain, bounded.  The previous code called `abort()` on both
+    // tasks — hard-cancelling every in-flight request — and *then* slept 500 ms,
+    // which helped nothing because there was no longer anything to wait for.
+    let drained = tokio::time::timeout(grace, async {
+        let _ = tokio::join!(http_handle, grpc_handle, health_handle);
+    })
+    .await;
+    match drained {
+        Ok(()) => info!("listeners drained cleanly"),
+        Err(_) => warn!(
+            grace_secs = cli.shutdown_grace_secs,
+            "drain deadline elapsed with requests still in flight; exiting anyway"
+        ),
+    }
 
     info!("bye");
     Ok(())

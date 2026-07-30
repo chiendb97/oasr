@@ -22,6 +22,9 @@ use tracing::{debug, error, field, info, info_span, warn, Instrument, Span};
 
 use crate::router::{AppState, ServiceMode};
 
+/// Fallback body cap, used only when a caller builds a [`ServerState`] without
+/// one.  The served value comes from `--max-audio-mib` via
+/// [`crate::ServerState::max_body_bytes`], which the gRPC surface reads too.
 pub const MAX_BODY: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
@@ -252,7 +255,7 @@ pub async fn handle_recognize(
             );
         }
 
-        let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
+        let bytes = match axum::body::to_bytes(body, s.max_body_bytes).await {
             Ok(b) => b,
             Err(e) => {
                 return reject(

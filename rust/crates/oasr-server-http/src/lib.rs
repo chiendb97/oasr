@@ -5,7 +5,7 @@
 pub mod recognize;
 pub mod router;
 
-pub use router::{build_router, AppState, ServiceMode};
+pub use router::{build_router, AppState, RouterLimits, ServiceMode, READY_STALE_AFTER};
 
 use std::sync::Arc;
 
@@ -21,4 +21,7 @@ pub struct ServerState {
     /// to this before submitting — the engine ignores a request's declared rate
     /// and computes every frame count from its own.
     pub sample_rate: u32,
+    /// Largest accepted request body, in bytes.  Shared with the gRPC
+    /// `max_decoding_message_size` so the two surfaces accept the same audio.
+    pub max_body_bytes: usize,
 }

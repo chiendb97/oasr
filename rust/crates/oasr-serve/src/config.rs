@@ -238,6 +238,36 @@ pub struct Cli {
     pub grpc_bind: SocketAddr,
     #[arg(long, default_value_t = 256)]
     pub max_concurrent_requests: u32,
+    /// Largest audio payload one request may carry, in MiB.  Drives **both**
+    /// the HTTP body cap and the gRPC `max_decoding_message_size`, because
+    /// tonic's undeclared 4 MiB default against HTTP's 256 MiB meant the same
+    /// audio was accepted on one surface and rejected on the other — and the
+    /// docs recommend gRPC as the higher-throughput offline path.
+    #[arg(long, default_value_t = 256)]
+    pub max_audio_mib: usize,
+    /// Deadline for a single **unary** request (HTTP `speech:recognize`,
+    /// gRPC `Recognize`), in seconds.  0 disables.  Streaming RPCs are bounded
+    /// by `--stream-idle-timeout-secs` instead: a blanket deadline would kill
+    /// healthy long-lived streams.
+    #[arg(long, default_value_t = 300)]
+    pub request_timeout_secs: u64,
+    /// Abort a streaming RPC that has gone this long without an inbound audio
+    /// message (before half-close) or a decode event (after), in seconds.
+    /// 0 disables.  Without it a client that opens a stream and vanishes
+    /// without closing the connection holds an engine slot indefinitely.
+    #[arg(long, default_value_t = 300)]
+    pub stream_idle_timeout_secs: u64,
+    /// Max requests either listener will process concurrently; excess ones
+    /// queue (and are eventually cut off by the timeouts above) rather than
+    /// each parking a multi-MiB body.  0 disables.  Defaults to
+    /// 4x `--max-concurrent-requests`, i.e. deep enough that the engine's own
+    /// admission cap is what clients actually see.
+    #[arg(long)]
+    pub max_inflight_connections: Option<usize>,
+    /// How long to let in-flight requests finish after a shutdown signal
+    /// before the listeners are dropped, in seconds.
+    #[arg(long, default_value_t = 10)]
+    pub shutdown_grace_secs: u64,
     /// Dispatcher admission coalescing window in milliseconds.  After the
     /// first envelope arrives in a tick, wait up to this long for siblings
     /// to land before stepping.  ``0`` disables (step ASAP).  Default 3 ms
@@ -265,6 +295,31 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Largest accepted audio payload in bytes (shared by both front-ends).
+    pub fn max_audio_bytes(&self) -> usize {
+        self.max_audio_mib.saturating_mul(1024 * 1024)
+    }
+
+    /// Concurrency limit for each listener, defaulted from the admission cap.
+    pub fn inflight_limit(&self) -> Option<usize> {
+        let n = self
+            .max_inflight_connections
+            .unwrap_or_else(|| (self.max_concurrent_requests as usize).saturating_mul(4));
+        (n > 0).then_some(n)
+    }
+
+    /// Per-request deadline for the unary surfaces, if enabled.
+    pub fn request_timeout(&self) -> Option<std::time::Duration> {
+        (self.request_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.request_timeout_secs))
+    }
+
+    /// Idle bound for the streaming RPCs, if enabled.
+    pub fn stream_idle_timeout(&self) -> Option<std::time::Duration> {
+        (self.stream_idle_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.stream_idle_timeout_secs))
+    }
+
     /// Build the full EngineConfig JSON object handed to `PyEngine::new`.
     pub fn build_engine_config_json(&self) -> Result<String> {
         let mut obj: Map<String, Value> = if let Some(p) = &self.engine_config {
@@ -436,5 +491,71 @@ impl Cli {
         // device defaults to "cuda" — EngineConfig falls back if absent.
 
         Ok(serde_json::to_string(&Value::Object(obj))?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn cli(extra: &[&str]) -> Cli {
+        let mut argv = vec!["oasr-server", "--ckpt-dir", "/tmp/ckpt"];
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv).expect("parse")
+    }
+
+    /// One knob feeds both surfaces.  They used to disagree by 64x — tonic's
+    /// undeclared 4 MiB default against HTTP's explicit 256 MiB — so the same
+    /// audio was accepted on one and rejected on the other, on the surface the
+    /// docs recommend for offline throughput.
+    #[test]
+    fn the_audio_cap_is_one_number_for_both_front_ends() {
+        assert_eq!(cli(&[]).max_audio_bytes(), 256 * 1024 * 1024);
+        assert_eq!(
+            cli(&["--max-audio-mib", "8"]).max_audio_bytes(),
+            8 * 1024 * 1024
+        );
+    }
+
+    /// The connection bound defaults above the engine's admission cap so the
+    /// engine's own `Busy` is what clients see, not a queue in the listener.
+    #[test]
+    fn the_inflight_limit_defaults_above_the_admission_cap() {
+        let c = cli(&["--max-concurrent-requests", "256"]);
+        assert_eq!(c.inflight_limit(), Some(1024));
+        assert!(c.inflight_limit().unwrap() > c.max_concurrent_requests as usize);
+    }
+
+    #[test]
+    fn limits_are_individually_disablable() {
+        assert_eq!(
+            cli(&["--max-inflight-connections", "0"]).inflight_limit(),
+            None
+        );
+        assert_eq!(
+            cli(&["--request-timeout-secs", "0"]).request_timeout(),
+            None
+        );
+        assert_eq!(
+            cli(&["--stream-idle-timeout-secs", "0"]).stream_idle_timeout(),
+            None
+        );
+    }
+
+    #[test]
+    fn timeouts_parse_into_durations() {
+        assert_eq!(
+            cli(&["--request-timeout-secs", "30"]).request_timeout(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            cli(&["--stream-idle-timeout-secs", "45"]).stream_idle_timeout(),
+            Some(std::time::Duration::from_secs(45))
+        );
     }
 }
