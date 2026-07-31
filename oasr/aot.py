@@ -22,19 +22,19 @@ def gen_all_modules() -> List:
         List of JitSpec objects for all kernel modules.
     """
     from oasr.jit.activation import gen_activation_module
-    from oasr.jit.norm import gen_norm_module
-    from oasr.jit.conv import gen_conv_module, gen_conv2d_module, gen_cudnn_conv2d_module
-    from oasr.jit.gemm import (
-        gen_gemm_module,
-        gen_bmm_module,
-        gen_group_gemm_module,
-        gen_gemm_log_softmax_module,
-    )
+    from oasr.jit.conv import gen_conv2d_module, gen_conv_module, gen_cudnn_conv2d_module
     from oasr.jit.ctc_decoder import gen_ctc_decoder_module
+    from oasr.jit.features import gen_features_module
+    from oasr.jit.fft import gen_fft_module
+    from oasr.jit.gemm import (
+        gen_bmm_module,
+        gen_gemm_log_softmax_module,
+        gen_gemm_module,
+        gen_group_gemm_module,
+    )
+    from oasr.jit.norm import gen_norm_module
     from oasr.jit.softmax import gen_softmax_module
     from oasr.jit.topk import gen_topk_module
-    from oasr.jit.fft import gen_fft_module
-    from oasr.jit.features import gen_features_module
 
     return [
         gen_activation_module(),

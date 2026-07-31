@@ -71,7 +71,7 @@ def _envint(name: str, default):
     try:
         return int(v)
     except ValueError:
-        raise SystemExit(f"env var {name}={v!r} is not an int")
+        raise SystemExit(f"env var {name}={v!r} is not an int") from None
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

@@ -34,7 +34,6 @@ Two-step capture workflow (recommended)::
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import statistics
 import sys
@@ -69,8 +68,10 @@ class RepShape:
         self.weight = weight
 
     def __repr__(self):
-        return (f"RepShape({self.op} M={self.M} N={self.N} K={self.K} "
-                f"{self.dtype} batch={self.batch} m_max={self.m_max})")
+        return (
+            f"RepShape({self.op} M={self.M} N={self.N} K={self.K} "
+            f"{self.dtype} batch={self.batch} m_max={self.m_max})"
+        )
 
 
 def _ladder_edge(m: int) -> int:
@@ -108,8 +109,10 @@ def buckets_from_stats(stats, coverage: float) -> List[RepShape]:
         K = st.K if hasattr(st, "K") else st["K"]
         dtype = st.dtype if hasattr(st, "dtype") else st["dtype"]
         batch = st.batch if hasattr(st, "batch") else st.get("batch", 1)
-        m_counts = st.m_counts if hasattr(st, "m_counts") else Counter(
-            {int(m): c for m, c in st["m_counts"].items()}
+        m_counts = (
+            st.m_counts
+            if hasattr(st, "m_counts")
+            else Counter({int(m): c for m, c in st["m_counts"].items()})
         )
 
         # Snap observed M into ladder buckets.
@@ -141,8 +144,7 @@ def buckets_from_stats(stats, coverage: float) -> List[RepShape]:
 
         for edge in sorted(kept):
             rep_m = _weighted_median(per_edge_counts[edge])
-            reps.append(RepShape(op, rep_m, N, K, dtype, batch, edge,
-                                 per_edge_flops[edge]))
+            reps.append(RepShape(op, rep_m, N, K, dtype, batch, edge, per_edge_flops[edge]))
     # Mark the largest kept bucket per (op,N,K,dtype,batch) as the catch-all.
     by_group: Dict[Tuple, List[RepShape]] = defaultdict(list)
     for r in reps:
@@ -164,6 +166,7 @@ def shapes_from_analytic(families, sizes, batches, durations, dtype, coverage):
     """Analytic fallback — reuse derive_problems, keep only OASR-path ops."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from analyze_asr_cutlass_configs import MODEL_REGISTRY, derive_problems
+
     from oasr.tune.capture import GemmShapeRecorder
 
     rec = GemmShapeRecorder()
@@ -188,7 +191,7 @@ def shapes_from_analytic(families, sizes, batches, durations, dtype, coverage):
 def _oasr_op_for(op_name: str) -> Optional[str]:
     """Map an analytic op_name to the OASR functional op, or None if off-path."""
     if op_name.endswith("_expand"):
-        return "gemm_activation"   # FF/conv expand fuse swish
+        return "gemm_activation"  # FF/conv expand fuse swish
     if op_name.endswith("_contract"):
         return "gemm"
     return None
@@ -298,8 +301,13 @@ def _pick_winner(results: List["TacticResult"], tie_tol: float = 0.05) -> "Tacti
             rank = 1
         else:
             rank = 0
-        return (rank, c.get("block_m", 1 << 30), c.get("block_n", 1 << 30),
-                c.get("kStages", 0), c.get("split_k", 1))
+        return (
+            rank,
+            c.get("block_m", 1 << 30),
+            c.get("block_n", 1 << 30),
+            c.get("kStages", 0),
+            c.get("split_k", 1),
+        )
 
     return min(band, key=key)
 
@@ -307,7 +315,7 @@ def _pick_winner(results: List["TacticResult"], tie_tol: float = 0.05) -> "Tacti
 def benchmark_shape(shape: RepShape, warmup: int, rep: int) -> Optional[List[TacticResult]]:
     import torch
 
-    from oasr.tune.autotuner import _ensure_backends_registered, _global_registry, OpKey
+    from oasr.tune.autotuner import OpKey, _ensure_backends_registered, _global_registry
 
     _ensure_backends_registered()
     op_key = OpKey("gemm", shape.op)
@@ -341,7 +349,10 @@ def benchmark_shape(shape: RepShape, warmup: int, rep: int) -> Optional[List[Tac
                 err = (args[0].float() - ref).abs().max().item()
                 if err > max(4.0 * torch_err, 1e-3):
                     continue  # numerically disqualified
-            ms = _bench(lambda: runner(*args), warmup, rep)
+            # Bind `runner` at definition time: it is a loop variable, and the
+            # late-binding form only happens to work because _bench calls back
+            # synchronously within this iteration.
+            ms = _bench(lambda r=runner: r(*args), warmup, rep)
         except Exception:
             ms = float("inf")
         results.append(TacticResult(entry.tactic, ms, entry.is_fallback))
@@ -377,8 +388,7 @@ def _choice_literal(tactic, sm: int, is_default: bool) -> str:
     return _cutlass_literal(tactic, sm)
 
 
-def emit_rules(per_shape: Dict[Tuple, List[TacticResult]], reps: List[RepShape],
-               sm: int) -> str:
+def emit_rules(per_shape: Dict[Tuple, List[TacticResult]], reps: List[RepShape], sm: int) -> str:
     """Build the _GEMM_HEURISTIC_RULES_SM<sm> Python literal from sweep winners."""
     # Group reps by (op, N, K) and order by m_max (None last).
     by_key: Dict[Tuple[str, int, int], List[RepShape]] = defaultdict(list)
@@ -400,14 +410,20 @@ def emit_rules(per_shape: Dict[Tuple, List[TacticResult]], reps: List[RepShape],
                 continue
             winner = _pick_winner(res)
             default = next((t for t in res if t.is_default), None)
-            speedup = (default.median_ms / winner.median_ms) if default and winner.median_ms > 0 else 1.0
+            speedup = (
+                (default.median_ms / winner.median_ms) if default and winner.median_ms > 0 else 1.0
+            )
             choice = _choice_literal(winner.tactic, sm, winner.is_default)
             if choice != fallback_literal:
                 all_default = False
             rule_entries.append(
-                (r.m_max, choice,
-                 f"M~{r.M}: {winner.tactic.backend} {winner.median_ms:.4f}ms "
-                 f"({speedup:.2f}x vs default)"))
+                (
+                    r.m_max,
+                    choice,
+                    f"M~{r.M}: {winner.tactic.backend} {winner.median_ms:.4f}ms "
+                    f"({speedup:.2f}x vs default)",
+                )
+            )
         if all_default or not rule_entries:
             continue  # every bucket == the fallback → omit the rule entirely
         # Collapse runs of identical choice (ascending m_max): a later, larger
@@ -429,8 +445,10 @@ def emit_rules(per_shape: Dict[Tuple, List[TacticResult]], reps: List[RepShape],
 
 def print_report(per_shape, reps, sm) -> None:
     print("\n" + "=" * 92)
-    print(f"{'op':16} {'N':>6} {'K':>6} {'M':>7} {'m_max':>7}  "
-          f"{'winner':>26} {'win ms':>9} {'dflt ms':>9} {'speedup':>8}")
+    print(
+        f"{'op':16} {'N':>6} {'K':>6} {'M':>7} {'m_max':>7}  "
+        f"{'winner':>26} {'win ms':>9} {'dflt ms':>9} {'speedup':>8}"
+    )
     print("-" * 92)
     reps_sorted = sorted(reps, key=lambda r: (r.op, r.N, r.K, r.M))
     for r in reps_sorted:
@@ -448,12 +466,16 @@ def print_report(per_shape, reps, sm) -> None:
             _c = dict(w.tactic.config)
             _sk = "sk" if _c.get("stream_k", 0) else ""
             _pk = "pk" if _c.get("parallel_split_k", 0) else ""
-            wname = (f"cutlass {_c.get('block_m')}x{_c.get('block_n')}"
-                     f"s{_c.get('kStages')}k{_c.get('split_k')}{_sk}{_pk}")
+            wname = (
+                f"cutlass {_c.get('block_m')}x{_c.get('block_n')}"
+                f"s{_c.get('kStages')}k{_c.get('split_k')}{_sk}{_pk}"
+            )
         mm = "inf" if r.m_max is None else str(r.m_max)
-        print(f"{r.op:16} {r.N:>6} {r.K:>6} {r.M:>7} {mm:>7}  "
-              f"{wname:>26} {w.median_ms:>9.4f} "
-              f"{(d.median_ms if d else float('nan')):>9.4f} {sp:>7.2f}x")
+        print(
+            f"{r.op:16} {r.N:>6} {r.K:>6} {r.M:>7} {mm:>7}  "
+            f"{wname:>26} {w.median_ms:>9.4f} "
+            f"{(d.median_ms if d else float('nan')):>9.4f} {sp:>7.2f}x"
+        )
     print("=" * 92 + "\n")
 
 
@@ -463,18 +485,27 @@ def print_report(per_shape, reps, sm) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--mode", choices=["capture", "analytic"], default="capture")
     p.add_argument("--shapes", help="captured shapes JSON (OASR_CAPTURE_GEMM output)")
-    p.add_argument("--gpu", default=None,
-                   help="CUDA_VISIBLE_DEVICES value (index or GPU-UUID). Set before torch import.")
-    p.add_argument("--coverage", type=float, default=0.97,
-                   help="keep top FLOP buckets until this fraction of group FLOPs is covered")
+    p.add_argument(
+        "--gpu",
+        default=None,
+        help="CUDA_VISIBLE_DEVICES value (index or GPU-UUID). Set before torch import.",
+    )
+    p.add_argument(
+        "--coverage",
+        type=float,
+        default=0.97,
+        help="keep top FLOP buckets until this fraction of group FLOPs is covered",
+    )
     p.add_argument("--warmup", type=int, default=25)
     p.add_argument("--rep", type=int, default=100)
-    p.add_argument("--emit-rules", metavar="FILE",
-                   help="write the _GEMM_HEURISTIC_RULES Python literal here")
+    p.add_argument(
+        "--emit-rules", metavar="FILE", help="write the _GEMM_HEURISTIC_RULES Python literal here"
+    )
     # analytic-mode knobs
     p.add_argument("--families", nargs="+", default=["conformer"])
     p.add_argument("--sizes", nargs="+", default=["base"])
@@ -496,14 +527,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.mode == "capture":
         if not args.shapes:
-            print("ERROR: --mode capture requires --shapes <captured json> "
-                  "(produce it via OASR_CAPTURE_GEMM=… python benchmarks/bench_engine.py …)",
-                  file=sys.stderr)
+            print(
+                "ERROR: --mode capture requires --shapes <captured json> "
+                "(produce it via OASR_CAPTURE_GEMM=… python benchmarks/bench_engine.py …)",
+                file=sys.stderr,
+            )
             return 2
         reps = shapes_from_capture(args.shapes, args.coverage)
     else:
-        reps = shapes_from_analytic(args.families, args.sizes, args.batches,
-                                    args.durations, args.dtype, args.coverage)
+        reps = shapes_from_analytic(
+            args.families, args.sizes, args.batches, args.durations, args.dtype, args.coverage
+        )
 
     if not reps:
         print("No representative shapes found.", file=sys.stderr)

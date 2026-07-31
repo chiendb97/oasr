@@ -13,22 +13,22 @@ import oasr
 from benchmarks.routines.bench_utils import bench_fn
 
 SHAPES = [
-    (4,  250,  256,  512),
-    (32,  250,  256,  512),
-    (64,  250,  256,  512),
-    (64,  250,  512, 1024),
-    (64,  250,  256, 2048),
-    (64,  250,  512, 2048),
-    (64,  500,  256,  512),
-    (64,  500,  512, 1024),
+    (4, 250, 256, 512),
+    (32, 250, 256, 512),
+    (64, 250, 256, 512),
+    (64, 250, 512, 1024),
+    (64, 250, 256, 2048),
+    (64, 250, 512, 2048),
+    (64, 500, 256, 512),
+    (64, 500, 512, 1024),
 ]
 
 DTYPES = [torch.float16, torch.bfloat16]
 DTYPE_NAMES = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
 
-_COL_SHAPE  = 28
-_COL_TIME   = 14
-_COL_TFLOPS =  8
+_COL_SHAPE = 28
+_COL_TIME = 14
+_COL_TFLOPS = 8
 
 _HEADER = (
     f"{'(B,T,IC,OC)':>{_COL_SHAPE}}"
@@ -36,8 +36,8 @@ _HEADER = (
     f"  {'CUTLASS':>{_COL_TIME}}  {'TFLOPS':>{_COL_TFLOPS}}"
     f"  {'PyTorch':>{_COL_TIME}}  {'TFLOPS':>{_COL_TFLOPS}}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR Pointwise Conv1D Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR Pointwise Conv1D Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
@@ -80,7 +80,8 @@ def _run_shape(B, T, IC, OC, dtype):
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available"); return
+        print("CUDA not available")
+        return
 
     print(_TITLE)
     print(_TITLE_SEP)

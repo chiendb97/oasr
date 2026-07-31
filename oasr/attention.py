@@ -36,7 +36,6 @@ import torch.nn.functional as F
 from .api_logging import oasr_api
 from .jit.attention import get_compiled_fmha, select_backend
 
-
 __all__ = ["fmha", "fmha_varlen"]
 
 
@@ -52,6 +51,7 @@ __all__ = ["fmha", "fmha_varlen"]
 try:
     import cuda.bindings.driver as _cuda_driver
     import cutlass as _cutlass
+
     _CUstream = _cuda_driver.CUstream
     _Float32 = _cutlass.Float32
     _Int32 = _cutlass.Int32
@@ -162,8 +162,11 @@ def _ensure_canonical(t: torch.Tensor) -> torch.Tensor:
 # SDPA reference path (fallback)
 # ---------------------------------------------------------------------------
 
+
 def _length_to_pad_bias(
-    cache_seqlens: torch.Tensor, T_kv: int, dtype: torch.dtype,
+    cache_seqlens: torch.Tensor,
+    T_kv: int,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
     """Build (B, 1, 1, T_kv) additive mask: 0 in [0, len), -inf outside."""
     arange = torch.arange(T_kv, device=cache_seqlens.device)
@@ -184,12 +187,12 @@ def _gather_paged_kv(
     num_blocks_per_seq = block_table.size(1)
 
     block_ids = block_table.long()
-    k_full = k_pool[block_ids].reshape(
-        B, num_blocks_per_seq * block_size, H_kv, D
-    ).permute(0, 2, 1, 3)
-    v_full = v_pool[block_ids].reshape(
-        B, num_blocks_per_seq * block_size, H_kv, D
-    ).permute(0, 2, 1, 3)
+    k_full = (
+        k_pool[block_ids].reshape(B, num_blocks_per_seq * block_size, H_kv, D).permute(0, 2, 1, 3)
+    )
+    v_full = (
+        v_pool[block_ids].reshape(B, num_blocks_per_seq * block_size, H_kv, D).permute(0, 2, 1, 3)
+    )
     return k_full, v_full
 
 
@@ -227,7 +230,7 @@ def _sdpa_varlen_reference(
         ks = k[ka:kb].transpose(0, 1).unsqueeze(0)
         vs = v[ka:kb].transpose(0, 1).unsqueeze(0)
         if attn_bias is not None and bo is not None:
-            bias_s = attn_bias[bo[s]:bo[s + 1]].view(1, H, qb - qa, kb - ka)
+            bias_s = attn_bias[bo[s] : bo[s + 1]].view(1, H, qb - qa, kb - ka)
         else:
             bias_s = None
         out_s = _sdpa_reference(qs, ks, vs, softmax_scale, bias_s, None)
@@ -272,7 +275,11 @@ def _sdpa_reference(
         full_mask = None
 
     return F.scaled_dot_product_attention(
-        q, k, v, attn_mask=full_mask, scale=softmax_scale,
+        q,
+        k,
+        v,
+        attn_mask=full_mask,
+        scale=softmax_scale,
     )
 
 
@@ -280,12 +287,22 @@ def _sdpa_reference(
 # Validation (single-pass; only run when validate=True)
 # ---------------------------------------------------------------------------
 
+
 def _validate_inputs(
-    q, k, v,
-    attn_bias, cache_seqlens, block_table, out,
+    q,
+    k,
+    v,
+    attn_bias,
+    cache_seqlens,
+    block_table,
+    out,
     paged: bool,
-    B: int, H: int, T_q: int, D: int,
-    H_kv: int, T_k: int,
+    B: int,
+    H: int,
+    T_q: int,
+    D: int,
+    H_kv: int,
+    T_k: int,
 ):
     """Single walk over Q/K/V/bias/seqlens/block_table/out shapes + dtypes."""
     if q.dim() != 4:
@@ -298,13 +315,10 @@ def _validate_inputs(
                 f"got {tuple(k.shape)} / {tuple(v.shape)}"
             )
         if k.shape != v.shape:
-            raise ValueError(
-                f"k and v must have identical shape: {k.shape} vs {v.shape}"
-            )
+            raise ValueError(f"k and v must have identical shape: {k.shape} vs {v.shape}")
         if k.size(3) != D:
             raise ValueError(
-                f"paged k head_dim mismatch with q: q={tuple(q.shape)}, "
-                f"k={tuple(k.shape)}"
+                f"paged k head_dim mismatch with q: q={tuple(q.shape)}, " f"k={tuple(k.shape)}"
             )
         if cache_seqlens is None:
             raise ValueError("paged mode requires cache_seqlens")
@@ -321,9 +335,7 @@ def _validate_inputs(
         if k.shape != v.shape:
             raise ValueError(f"k and v must have identical shape: {k.shape} vs {v.shape}")
         if k.size(0) != B or k.size(3) != D:
-            raise ValueError(
-                f"k batch/D mismatch with q: q={tuple(q.shape)}, k={tuple(k.shape)}"
-            )
+            raise ValueError(f"k batch/D mismatch with q: q={tuple(q.shape)}, k={tuple(k.shape)}")
 
     if H % H_kv != 0:
         raise ValueError(f"H ({H}) must be divisible by H_kv ({H_kv})")
@@ -343,12 +355,8 @@ def _validate_inputs(
                 f"got {tuple(attn_bias.shape)}"
             )
 
-    if cache_seqlens is not None and (
-        cache_seqlens.dim() != 1 or cache_seqlens.size(0) != B
-    ):
-        raise ValueError(
-            f"cache_seqlens must be (B,) = ({B},); got {tuple(cache_seqlens.shape)}"
-        )
+    if cache_seqlens is not None and (cache_seqlens.dim() != 1 or cache_seqlens.size(0) != B):
+        raise ValueError(f"cache_seqlens must be (B,) = ({B},); got {tuple(cache_seqlens.shape)}")
 
     if out is not None and (out.shape != q.shape or out.dtype != q.dtype):
         raise ValueError(
@@ -360,6 +368,7 @@ def _validate_inputs(
 # ---------------------------------------------------------------------------
 # Public functional API
 # ---------------------------------------------------------------------------
+
 
 @oasr_api
 def fmha(
@@ -416,7 +425,9 @@ def fmha(
         # capture.  The SDPA fallback trims oversized bias, so this is
         # backend-neutral.
         attn_bias, block_table = _pad_paged_inputs(
-            attn_bias, block_table, block_size=block_size,
+            attn_bias,
+            block_table,
+            block_size=block_size,
         )
         T_k = block_table.size(1) * block_size
     else:
@@ -426,8 +437,20 @@ def fmha(
 
     if validate:
         _validate_inputs(
-            q, k, v, attn_bias, cache_seqlens, block_table, out,
-            paged, B, H, T_q, D, H_kv, T_k,
+            q,
+            k,
+            v,
+            attn_bias,
+            cache_seqlens,
+            block_table,
+            out,
+            paged,
+            B,
+            H,
+            T_q,
+            D,
+            H_kv,
+            T_k,
         )
         # Convenience dtype coercions; only run when validating.
         if attn_bias is not None and attn_bias.dtype != q.dtype:
@@ -446,7 +469,9 @@ def fmha(
         # the output directly in canonical contiguous_format so the kernel
         # writes land in the tensor we hand back.
         out = torch.empty(
-            q.shape, dtype=q.dtype, device=q.device,
+            q.shape,
+            dtype=q.dtype,
+            device=q.device,
             memory_format=torch.contiguous_format,
         )
 
@@ -459,14 +484,29 @@ def fmha(
             k_dense, v_dense = k, v
         out.copy_(
             _sdpa_reference(
-                q, k_dense, v_dense, softmax_scale, attn_bias, cache_seqlens,
+                q,
+                k_dense,
+                v_dense,
+                softmax_scale,
+                attn_bias,
+                cache_seqlens,
             )
         )
         return out
 
     return _call_cute_dsl(
-        q, k, v, out, B=B, H=H, T_q=T_q, D=D, H_kv=H_kv, T_k=T_k,
-        paged=paged, block_size=block_size,
+        q,
+        k,
+        v,
+        out,
+        B=B,
+        H=H,
+        T_q=T_q,
+        D=D,
+        H_kv=H_kv,
+        T_k=T_k,
+        paged=paged,
+        block_size=block_size,
         softmax_scale=softmax_scale,
         attn_bias=attn_bias,
         cache_seqlens=cache_seqlens,
@@ -480,7 +520,14 @@ def fmha(
 
 
 def _validate_varlen_inputs(
-    q, k, v, cu_seqlens_q, cu_seqlens_k, attn_bias, bias_offsets, out,
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    attn_bias,
+    bias_offsets,
+    out,
 ) -> None:
     if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
         raise ValueError(
@@ -552,7 +599,14 @@ def fmha_varlen(
     """
     if validate:
         _validate_varlen_inputs(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, attn_bias, bias_offsets, out,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            attn_bias,
+            bias_offsets,
+            out,
         )
         if attn_bias is not None and attn_bias.dtype != q.dtype:
             attn_bias = attn_bias.to(q.dtype)
@@ -563,7 +617,9 @@ def fmha_varlen(
 
     if out is None:
         out = torch.empty(
-            q.shape, dtype=q.dtype, device=q.device,
+            q.shape,
+            dtype=q.dtype,
+            device=q.device,
             memory_format=torch.contiguous_format,
         )
 
@@ -574,16 +630,29 @@ def fmha_varlen(
         and _varlen_cute_available()
     ):
         return _call_cute_dsl_varlen(
-            q, k, v, out,
+            q,
+            k,
+            v,
+            out,
             softmax_scale=softmax_scale,
-            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
-            attn_bias=attn_bias, bias_offsets=bias_offsets,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            attn_bias=attn_bias,
+            bias_offsets=bias_offsets,
         )
 
     return _sdpa_varlen_reference(
-        q, k, v, softmax_scale, cu_seqlens_q, cu_seqlens_k,
-        attn_bias, bias_offsets, out,
+        q,
+        k,
+        v,
+        softmax_scale,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        attn_bias,
+        bias_offsets,
+        out,
     )
 
 
@@ -621,9 +690,12 @@ def _call_cute_dsl_varlen(
     has_bias = attn_bias is not None
 
     fn = get_compiled_fmha_varlen(
-        head_dim=D, dtype_str=dtype_str,
-        num_heads=H, num_kv_heads=H_kv,
-        has_bias=has_bias, bias_aligned=False,
+        head_dim=D,
+        dtype_str=dtype_str,
+        num_heads=H,
+        num_kv_heads=H_kv,
+        has_bias=has_bias,
+        bias_aligned=False,
     )
 
     q_t = _ensure_canonical(q)
@@ -644,8 +716,17 @@ def _call_cute_dsl_varlen(
 
     stream = _CUstream(torch.cuda.current_stream().cuda_stream)
     fn(
-        q_t, k_t, v_t, o_t, bias_t, bias_off_t, cu_q, cu_k,
-        _Int32(int(max_seqlen_q)), _Float32(float(softmax_scale)), stream,
+        q_t,
+        k_t,
+        v_t,
+        o_t,
+        bias_t,
+        bias_off_t,
+        cu_q,
+        cu_k,
+        _Int32(int(max_seqlen_q)),
+        _Float32(float(softmax_scale)),
+        stream,
     )
     if o_t.data_ptr() != out.data_ptr():
         out.copy_(o_t)
@@ -655,6 +736,7 @@ def _call_cute_dsl_varlen(
 # ---------------------------------------------------------------------------
 # CuteDSL kernel invocation
 # ---------------------------------------------------------------------------
+
 
 def _pad_paged_inputs(
     attn_bias: Optional[torch.Tensor],
@@ -685,8 +767,12 @@ def _pad_paged_inputs(
     if T_q_padded > T_q or T_kv_padded > T_kv:
         B, H = attn_bias.shape[:2]
         padded = torch.zeros(
-            B, H, T_q_padded, T_kv_padded,
-            dtype=attn_bias.dtype, device=attn_bias.device,
+            B,
+            H,
+            T_q_padded,
+            T_kv_padded,
+            dtype=attn_bias.dtype,
+            device=attn_bias.device,
         )
         padded[:, :, :T_q, :T_kv] = attn_bias
         attn_bias = padded
@@ -704,8 +790,14 @@ def _call_cute_dsl(
     v: torch.Tensor,
     out: torch.Tensor,
     *,
-    B: int, H: int, T_q: int, D: int, H_kv: int, T_k: int,
-    paged: bool, block_size: int,
+    B: int,
+    H: int,
+    T_q: int,
+    D: int,
+    H_kv: int,
+    T_k: int,
+    paged: bool,
+    block_size: int,
     softmax_scale: float,
     attn_bias: Optional[torch.Tensor],
     cache_seqlens: Optional[torch.Tensor],
@@ -735,10 +827,13 @@ def _call_cute_dsl(
     bias_aligned = attn_bias is not None and (attn_bias.size(-1) % 2 == 0)
 
     fn = get_compiled_fmha(
-        head_dim=D, dtype_str=dtype_str,
-        num_heads=H, num_kv_heads=H_kv,
+        head_dim=D,
+        dtype_str=dtype_str,
+        num_heads=H,
+        num_kv_heads=H_kv,
         has_bias=(attn_bias is not None),
-        paged=paged, block_size=block_size,
+        paged=paged,
+        block_size=block_size,
         bias_aligned=bias_aligned,
     )
 
@@ -768,8 +863,7 @@ def _call_cute_dsl(
 
     stream = _CUstream(torch.cuda.current_stream().cuda_stream)
     # TVM-FFI compiled callable accepts torch tensors directly.
-    fn(q_t, k_t, v_t, o_t, bias_t, seqlens_t, block_table_t,
-       _Float32(float(softmax_scale)), stream)
+    fn(q_t, k_t, v_t, o_t, bias_t, seqlens_t, block_table_t, _Float32(float(softmax_scale)), stream)
     # When ``out`` had non-canonical strides (e.g. caller passed a transpose
     # view) ``_ensure_canonical`` allocated a fresh canonical buffer that the
     # cute kernel writes to; copy the result back so the caller's reference

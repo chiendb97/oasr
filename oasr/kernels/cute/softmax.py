@@ -134,9 +134,7 @@ class Softmax:
             acc_S_row = acc_S_mn[r, None].load()
 
             # Row-max from this tile, reduced across the 4-thread row quad.
-            row_max_cur = acc_S_row.reduce(
-                cute.ReductionOp.MAX, -cutlass.Float32.inf, 0
-            )
+            row_max_cur = acc_S_row.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, 0)
             row_max_cur = quad_reduce_max(row_max_cur)
             if cutlass.const_expr(not is_first):
                 row_max_cur = cute.arch.fmax(row_max_prev[r], row_max_cur)
@@ -145,9 +143,7 @@ class Softmax:
             # subsequent ``exp(-inf - -inf)`` is NaN. Replace by 0 so
             # ``exp(-inf - 0) = 0`` and row_sum stays 0; downstream
             # arithmetic stays finite.
-            row_max_cur = (
-                0.0 if row_max_cur == -cutlass.Float32.inf else row_max_cur
-            )
+            row_max_cur = 0.0 if row_max_cur == -cutlass.Float32.inf else row_max_cur
 
             # P = exp2((S - row_max_cur) * scale_log2).
             #
@@ -182,9 +178,7 @@ class Softmax:
                 (acc_S_row - row_max_cur) * scale_log2,
                 fastmath=True,
             )
-            row_sum_cur = row_p.reduce(
-                cute.ReductionOp.ADD, cutlass.Float32.zero, 0
-            )
+            row_sum_cur = row_p.reduce(cute.ReductionOp.ADD, cutlass.Float32.zero, 0)
 
             if cutlass.const_expr(not is_first):
                 # Rescale prior row_sum + acc_O by the delta exp. Subtract-first

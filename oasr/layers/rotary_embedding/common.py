@@ -39,9 +39,7 @@ def apply_rotary_emb_google(
         Rotated tensor of same shape as x.
     """
     # x: [batch, time, heads, dim]
-    x_ = torch.view_as_complex(
-        torch.stack(torch.chunk(x.float(), 2, dim=-1), dim=-1)
-    )
+    x_ = torch.view_as_complex(torch.stack(torch.chunk(x.float(), 2, dim=-1), dim=-1))
     x_out = torch.view_as_real(x_ * freqs_cis).type_as(x)
     x_out = torch.cat(torch.chunk(x_out, 2, dim=-1), dim=-2)
     x_out = x_out.reshape(x_out.shape[0], x_out.shape[1], x_out.shape[2], -1)
@@ -74,7 +72,7 @@ def register_apply_rotary_emb(style: str):
     """Decorator to register an apply function for a RoPE style."""
 
     def decorator(
-        fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
         _APPLY_ROTARY_EMB[style] = fn
         return fn
@@ -103,9 +101,7 @@ def get_apply_rotary_emb(style: str) -> Callable[[torch.Tensor, torch.Tensor], t
         ValueError: If style is not registered.
     """
     if style not in _APPLY_ROTARY_EMB:
-        raise ValueError(
-            f"Unknown RoPE style '{style}', supported: {list(_APPLY_ROTARY_EMB)}"
-        )
+        raise ValueError(f"Unknown RoPE style '{style}', supported: {list(_APPLY_ROTARY_EMB)}")
     return _APPLY_ROTARY_EMB[style]
 
 

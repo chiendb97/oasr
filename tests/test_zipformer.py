@@ -14,9 +14,9 @@ Point ``ICEFALL_ZIPFORMER_DIR`` at a checkout of
 files under ``/tmp/icefall_ref``.
 """
 
-import os
 import sys
 
+import assets
 import pytest
 import torch
 
@@ -35,18 +35,9 @@ from oasr.models.zipformer import IcefallConverter
 # --------------------------------------------------------------------------- #
 
 
-def _ref_dir():
-    for cand in (os.environ.get("ICEFALL_ZIPFORMER_DIR"), "/tmp/icefall_ref"):
-        if cand and os.path.exists(os.path.join(cand, "zipformer.py")):
-            return cand
-    return None
-
-
 def _load_reference(tmp_path):
     """Import icefall zipformer/subsampling with stubbed icefall-only deps."""
-    ref = _ref_dir()
-    if ref is None:
-        pytest.skip("icefall zipformer reference not found (set ICEFALL_ZIPFORMER_DIR)")
+    ref = assets.require("ICEFALL_ZIPFORMER_DIR")
 
     stub = tmp_path / "_zip_stubs"
     stub.mkdir(exist_ok=True)
@@ -219,7 +210,7 @@ class TestZipformerParity:
         if not torch.cuda.is_available():
             pytest.skip("OASR kernels require CUDA")
         ref_zip, ref_sub = _load_reference(tmp_path)
-        sys.path.insert(0, _ref_dir())
+        sys.path.insert(0, assets.require("ICEFALL_ZIPFORMER_DIR"))
         from icefall.utils import make_pad_mask as ref_make_pad_mask  # type: ignore
 
         torch.manual_seed(1234)
@@ -298,27 +289,13 @@ class TestZipformerParity:
 # Real icefall checkpoint (weights + tokenizer from an actual release)
 # --------------------------------------------------------------------------- #
 
-ZIPFORMER_CKPT = os.environ.get(
-    "ZIPFORMER_CKPT",
-    "/data01/kilm/users/chiendb/models/asr/icefall-asr-librispeech-zipformer-large-cr-ctc-20241018",
-)
-ZIP_WAV_DIR = os.environ.get(
-    "WAV_DIR", "/data01/kilm/users/chiendb/data/asr/ljspeech-sr16k-dataset/wavs"
-)
+# Declared in tests/assets.py, including the "dangling LFS symlink" probe: an
+# HF snapshot can be present with no payload, which is not a usable checkpoint.
+ZIPFORMER_CKPT = assets.declared("ZIPFORMER_CKPT")
+ZIP_WAV_DIR = assets.declared("WAV_DIR")
 
 
-def _zip_ckpt_present() -> bool:
-    from pathlib import Path
-
-    root = Path(ZIPFORMER_CKPT)
-    if not root.is_dir():
-        return False
-    # An HF snapshot can be present as *dangling LFS symlinks* with no payload,
-    # which is not a usable checkpoint — require a readable, non-empty file.
-    return any(p.is_file() and p.stat().st_size > 0 for p in root.rglob("*.pt"))
-
-
-@pytest.mark.skipif(not _zip_ckpt_present(), reason="icefall zipformer release absent")
+@pytest.mark.requires_assets("ZIPFORMER_CKPT")
 class TestRealIcefallCheckpoint:
     """The converter against a real release, not a synthetic state dict.
 
@@ -426,18 +403,14 @@ class TestRealIcefallCheckpoint:
         assert b.features.kind == "kaldi_fbank"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
-    @pytest.mark.skipif(not os.path.isdir(ZIP_WAV_DIR), reason="WAV_DIR not set or not found")
+    @pytest.mark.requires_assets("WAV_DIR")
     class TestEngineE2E:
         """Offline + streaming transcription of real audio on real weights."""
 
         def _audios(self, n=2):
-            import glob
-
             import torchaudio
 
-            wavs = sorted(glob.glob(os.path.join(ZIP_WAV_DIR, "*.wav")))[:n]
-            if len(wavs) < n:
-                pytest.skip(f"need {n} wavs under {ZIP_WAV_DIR}")
+            wavs = assets.require_wavs(n)
             return [torchaudio.load(w)[0].squeeze(0) for w in wavs]
 
         def _engine(self, mode):
@@ -479,9 +452,7 @@ class TestRealIcefallCheckpoint:
         def _is_causal_release(self) -> bool:
             from oasr.models import build_model_from_checkpoint
 
-            m = build_model_from_checkpoint(
-                ZIPFORMER_CKPT, device="cpu", dtype=torch.float32
-            )
+            m = build_model_from_checkpoint(ZIPFORMER_CKPT, device="cpu", dtype=torch.float32)
             m = m[0] if isinstance(m, tuple) else m
             kind = m.encoder.streaming_kind
             del m

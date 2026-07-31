@@ -72,13 +72,13 @@ DEFAULT_CONFIGS: Dict[str, list[dict[str, Any]]] = {
         {"batch": 64, "num_frames": 500, "num_mel": 80, "num_ceps": 40},
     ],
     "fbank_pipeline": [
-        {"batch": 8,  "audio_seconds": 5.0},
+        {"batch": 8, "audio_seconds": 5.0},
         {"batch": 32, "audio_seconds": 5.0},
         {"batch": 64, "audio_seconds": 5.0},
         {"batch": 32, "audio_seconds": 10.0},
     ],
     "mfcc_pipeline": [
-        {"batch": 8,  "audio_seconds": 5.0},
+        {"batch": 8, "audio_seconds": 5.0},
         {"batch": 32, "audio_seconds": 5.0},
         {"batch": 64, "audio_seconds": 5.0},
         {"batch": 32, "audio_seconds": 10.0},
@@ -183,9 +183,7 @@ def setup_fbank_preprocess(batch, num_frames, frame_length, n_fft, dtype=torch.f
     coef = 0.97
 
     def oasr_fn():
-        return oasr.feature.fbank_preprocess(
-            frames, window, n_fft=n_fft, preemph_coef=coef
-        )
+        return oasr.feature.fbank_preprocess(frames, window, n_fft=n_fft, preemph_coef=coef)
 
     def torch_fn():
         # Equivalent vectorized batched op chain matching the OASR kernel.
@@ -288,7 +286,7 @@ def _torchaudio_fbank_loop(waveforms: torch.Tensor, sample_rate: int, num_mel: i
     for i in range(waveforms.size(0)):
         out.append(
             torchaudio.compliance.kaldi.fbank(
-                waveforms[i:i + 1],
+                waveforms[i : i + 1],
                 sample_frequency=float(sample_rate),
                 num_mel_bins=num_mel,
                 frame_length=25.0,
@@ -408,7 +406,7 @@ def _torchaudio_mfcc_loop(
     for i in range(waveforms.size(0)):
         out.append(
             torchaudio.compliance.kaldi.mfcc(
-                waveforms[i:i + 1],
+                waveforms[i : i + 1],
                 sample_frequency=float(sample_rate),
                 num_mel_bins=num_mel,
                 num_ceps=num_ceps,
@@ -502,15 +500,23 @@ PIPELINE_SETUP = {
 def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch", type=int, default=None, help="Batch size")
     parser.add_argument("--num-frames", type=int, default=None, help="Frames per utterance")
-    parser.add_argument("--frame-length", type=int, default=None,
-                        help="Frame length in samples (preprocess)")
+    parser.add_argument(
+        "--frame-length", type=int, default=None, help="Frame length in samples (preprocess)"
+    )
     parser.add_argument("--n-fft", type=int, default=None, help="FFT length")
-    parser.add_argument("--n-freq", type=int, default=None,
-                        help="Frequency bin count = n_fft/2+1 (mel_log)")
+    parser.add_argument(
+        "--n-freq", type=int, default=None, help="Frequency bin count = n_fft/2+1 (mel_log)"
+    )
     parser.add_argument("--num-mel", type=int, default=None, help="Number of mel bins")
-    parser.add_argument("--num-ceps", type=int, default=None, help="Number of cepstral coefficients")
-    parser.add_argument("--audio-seconds", type=float, default=None,
-                        help="Audio duration per utterance (pipeline subroutines)")
+    parser.add_argument(
+        "--num-ceps", type=int, default=None, help="Number of cepstral coefficients"
+    )
+    parser.add_argument(
+        "--audio-seconds",
+        type=float,
+        default=None,
+        help="Audio duration per utterance (pipeline subroutines)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -521,8 +527,8 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
 def _bytes_accessed(subroutine: str, cfg: dict, dtype: torch.dtype) -> int:
     elem = dtype_size(dtype)
     if subroutine == "fbank_preprocess":
-        b, n, l, nf = cfg["batch"], cfg["num_frames"], cfg["frame_length"], cfg["n_fft"]
-        return (b * n * l + l + b * n * nf) * elem
+        b, n, flen, nf = cfg["batch"], cfg["num_frames"], cfg["frame_length"], cfg["n_fft"]
+        return (b * n * flen + flen + b * n * nf) * elem
     if subroutine == "mel_log":
         b, n, f, m = cfg["batch"], cfg["num_frames"], cfg["n_freq"], cfg["num_mel"]
         return (b * n * f + m * f + b * n * m) * elem
@@ -587,8 +593,13 @@ def get_fn_map(subroutine: str, *fns: Callable) -> Dict[str, Callable]:
 # ---------------------------------------------------------------------------
 
 
-def _refcheck(subroutine: str, fn_map: Dict[str, Callable], shape_str: str,
-              allow_mismatch: bool, verbose: bool) -> bool:
+def _refcheck(
+    subroutine: str,
+    fn_map: Dict[str, Callable],
+    shape_str: str,
+    allow_mismatch: bool,
+    verbose: bool,
+) -> bool:
     """Compare backends. Returns True if all checks pass (or were skipped)."""
     if "cuda" not in fn_map:
         return True
@@ -633,32 +644,43 @@ def _refcheck(subroutine: str, fn_map: Dict[str, Callable], shape_str: str,
 
 def _resolve_configs(args, subroutine: str) -> list[dict[str, Any]]:
     if subroutine == "fbank_preprocess":
-        if all(getattr(args, k, None) is not None
-               for k in ("batch", "num_frames", "frame_length", "n_fft")):
-            return [{
-                "batch": args.batch,
-                "num_frames": args.num_frames,
-                "frame_length": args.frame_length,
-                "n_fft": args.n_fft,
-            }]
+        if all(
+            getattr(args, k, None) is not None
+            for k in ("batch", "num_frames", "frame_length", "n_fft")
+        ):
+            return [
+                {
+                    "batch": args.batch,
+                    "num_frames": args.num_frames,
+                    "frame_length": args.frame_length,
+                    "n_fft": args.n_fft,
+                }
+            ]
     elif subroutine == "mel_log":
-        if all(getattr(args, k, None) is not None
-               for k in ("batch", "num_frames", "n_freq", "num_mel")):
-            return [{
-                "batch": args.batch,
-                "num_frames": args.num_frames,
-                "n_freq": args.n_freq,
-                "num_mel": args.num_mel,
-            }]
+        if all(
+            getattr(args, k, None) is not None for k in ("batch", "num_frames", "n_freq", "num_mel")
+        ):
+            return [
+                {
+                    "batch": args.batch,
+                    "num_frames": args.num_frames,
+                    "n_freq": args.n_freq,
+                    "num_mel": args.num_mel,
+                }
+            ]
     elif subroutine == "dct_lifter":
-        if all(getattr(args, k, None) is not None
-               for k in ("batch", "num_frames", "num_mel", "num_ceps")):
-            return [{
-                "batch": args.batch,
-                "num_frames": args.num_frames,
-                "num_mel": args.num_mel,
-                "num_ceps": args.num_ceps,
-            }]
+        if all(
+            getattr(args, k, None) is not None
+            for k in ("batch", "num_frames", "num_mel", "num_ceps")
+        ):
+            return [
+                {
+                    "batch": args.batch,
+                    "num_frames": args.num_frames,
+                    "num_mel": args.num_mel,
+                    "num_ceps": args.num_ceps,
+                }
+            ]
     elif subroutine in ("fbank_pipeline", "mfcc_pipeline"):
         if args.batch is not None and args.audio_seconds is not None:
             return [{"batch": args.batch, "audio_seconds": args.audio_seconds}]
@@ -679,8 +701,10 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     dtype_str = getattr(args, "dtype", "float32")
     dtype = parse_dtype(dtype_str)
     if dtype != torch.float32:
-        print(f"  [WARNING] feature kernels only support float32, "
-              f"got {dtype_str}. Forcing float32.")
+        print(
+            f"  [WARNING] feature kernels only support float32, "
+            f"got {dtype_str}. Forcing float32."
+        )
         dtype_str = "float32"
         dtype = torch.float32
 
@@ -717,16 +741,18 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
                 use_cuda_events=use_cuda_events,
             )
             bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
-            output.write_result(BenchResult(
-                routine="feature",
-                subroutine=subroutine,
-                backend=backend,
-                shape=shape_str,
-                dtype=dtype_str,
-                median_ms=median_ms,
-                std_ms=std_ms,
-                bandwidth_tb_s=bw,
-            ))
+            output.write_result(
+                BenchResult(
+                    routine="feature",
+                    subroutine=subroutine,
+                    backend=backend,
+                    shape=shape_str,
+                    dtype=dtype_str,
+                    median_ms=median_ms,
+                    std_ms=std_ms,
+                    bandwidth_tb_s=bw,
+                )
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -753,12 +779,18 @@ def run_standalone(variants: Tuple[str, ...] = ()) -> None:
                 for backend, fn in fn_map.items():
                     median_ms, std_ms = bench_fn(fn)
                     bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
-                    output.write_result(BenchResult(
-                        routine="feature", subroutine=sub, backend=backend,
-                        shape=shape_str, dtype="float32",
-                        median_ms=median_ms, std_ms=std_ms,
-                        bandwidth_tb_s=bw,
-                    ))
+                    output.write_result(
+                        BenchResult(
+                            routine="feature",
+                            subroutine=sub,
+                            backend=backend,
+                            shape=shape_str,
+                            dtype="float32",
+                            median_ms=median_ms,
+                            std_ms=std_ms,
+                            bandwidth_tb_s=bw,
+                        )
+                    )
         output.finalize()
 
     run_main("Feature Extraction", pcfg, setup_funcs, benchmark)

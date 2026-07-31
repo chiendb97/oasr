@@ -30,9 +30,7 @@ def oasr_api(func):
                     arg_summaries.append(f"Tensor({a.shape}, {a.dtype})")
                 else:
                     arg_summaries.append(repr(a))
-            logger.debug(
-                "oasr.%s(%s)", func.__name__, ", ".join(arg_summaries)
-            )
+            logger.debug("oasr.%s(%s)", func.__name__, ", ".join(arg_summaries))
         try:
             return func(*args, **kwargs)
         except Exception:

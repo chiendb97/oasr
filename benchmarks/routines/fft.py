@@ -138,8 +138,10 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
         bytes_accessed = _fft_bytes(b, f, n, subroutine, dtype)
         shape_str = f"[{b}, {f}, n_fft={n}]"
 
-        if do_check and "torch" in backends and any(
-            bk in fn_map and bk != "torch" for bk in backends
+        if (
+            do_check
+            and "torch" in backends
+            and any(bk in fn_map and bk != "torch" for bk in backends)
         ):
             oasr_out = oasr_fn()
             pytorch_out = pytorch_fn()
@@ -162,16 +164,18 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
                 use_cuda_events=use_cuda_events,
             )
             bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
-            output.write_result(BenchResult(
-                routine="fft",
-                subroutine=subroutine,
-                backend=backend,
-                shape=shape_str,
-                dtype=dtype_str,
-                median_ms=median_ms,
-                std_ms=std_ms,
-                bandwidth_tb_s=bw,
-            ))
+            output.write_result(
+                BenchResult(
+                    routine="fft",
+                    subroutine=subroutine,
+                    backend=backend,
+                    shape=shape_str,
+                    dtype=dtype_str,
+                    median_ms=median_ms,
+                    std_ms=std_ms,
+                    bandwidth_tb_s=bw,
+                )
+            )
 
 
 def _resolve_configs(args, subroutine):
@@ -215,12 +219,18 @@ def run_standalone(variant: str = "rfft") -> None:
                 for backend, fn in get_fn_map(sub, oasr_fn, pytorch_fn).items():
                     median_ms, std_ms = bench_fn(fn)
                     bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
-                    output.write_result(BenchResult(
-                        routine="fft", subroutine=sub, backend=backend,
-                        shape=shape_str, dtype="float32",
-                        median_ms=median_ms, std_ms=std_ms,
-                        bandwidth_tb_s=bw,
-                    ))
+                    output.write_result(
+                        BenchResult(
+                            routine="fft",
+                            subroutine=sub,
+                            backend=backend,
+                            shape=shape_str,
+                            dtype="float32",
+                            median_ms=median_ms,
+                            std_ms=std_ms,
+                            bandwidth_tb_s=bw,
+                        )
+                    )
         output.finalize()
 
     run_main(f"{variant.upper()} FFT Kernel", pcfg, setup_funcs, benchmark)

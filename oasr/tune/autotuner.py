@@ -14,10 +14,8 @@ import logging
 import os
 import tempfile
 import threading
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
@@ -263,9 +261,7 @@ class BackendRegistry:
         candidates = self.get_candidates(op_key)
         return candidates[0] if candidates else None
 
-    def get_entry_for_tactic(
-        self, op_key: OpKey, tactic: Tactic
-    ) -> Optional[BackendEntry]:
+    def get_entry_for_tactic(self, op_key: OpKey, tactic: Tactic) -> Optional[BackendEntry]:
         """Find the entry matching a specific tactic, or ``None``."""
         for entry in self._entries.get(op_key, []):
             if entry.tactic == tactic and entry.is_available():
@@ -494,9 +490,7 @@ class AutoTuner:
         # 1. Cache lookup
         tactic = self.search_cache(profile_key)
         if tactic is not None:
-            logger.debug(
-                "Cache hit for %s -> %s", profile_key.to_str(), tactic.backend
-            )
+            logger.debug("Cache hit for %s -> %s", profile_key.to_str(), tactic.backend)
             self._execute(op_key, tactic, runner_args)
             return
 
@@ -520,9 +514,7 @@ class AutoTuner:
     # Profiling (merged from _profiler.py)
     # -----------------------------------------------------------------
 
-    def _profile_single_kernel(
-        self, tactic: Tactic, runner: Callable, args: tuple
-    ) -> TuneResult:
+    def _profile_single_kernel(self, tactic: Tactic, runner: Callable, args: tuple) -> TuneResult:
         """Benchmark a single tactic by timing its execution."""
         try:
             # Try triton.testing.do_bench first (more accurate)
@@ -546,9 +538,7 @@ class AutoTuner:
                 pass
 
             # Fallback: CUDA events
-            median, min_ms, max_ms = _bench_cuda_events(
-                runner, args, self.warmup, self.repeat
-            )
+            median, min_ms, max_ms = _bench_cuda_events(runner, args, self.warmup, self.repeat)
             return TuneResult(
                 tactic=tactic,
                 median_ms=median,
@@ -598,16 +588,12 @@ class AutoTuner:
             result = self._profile_single_kernel(entry.tactic, runner, args)
             results.append(result)
             if result.status == "ok":
-                logger.info(
-                    "  %s: %.4f ms", entry.tactic.backend, result.median_ms
-                )
+                logger.info("  %s: %.4f ms", entry.tactic.backend, result.median_ms)
             else:
                 self.stats.failed_profiling_count[op_str] = (
                     self.stats.failed_profiling_count.get(op_str, 0) + 1
                 )
-                logger.debug(
-                    "  %s: FAILED (%s)", entry.tactic.backend, result.error_msg
-                )
+                logger.debug("  %s: FAILED (%s)", entry.tactic.backend, result.error_msg)
         results.sort(key=lambda r: r.median_ms)
         return results
 
@@ -678,9 +664,7 @@ class AutoTuner:
             )
             return self._fallback_tactic(op_key, profile_key)
 
-    def _fallback_tactic(
-        self, op_key: OpKey, profile_key: ProfileKey
-    ) -> Optional[Tactic]:
+    def _fallback_tactic(self, op_key: OpKey, profile_key: ProfileKey) -> Optional[Tactic]:
         """Return the fallback tactic for *op_key*."""
         entry = self._registry.get_fallback(op_key)
         if entry is not None:
@@ -705,8 +689,7 @@ class AutoTuner:
             entry = self._registry.get_fallback(op_key)
             if entry is None:
                 raise RuntimeError(
-                    f"Cached tactic {tactic} for {op_key} is unavailable "
-                    "and no fallback exists."
+                    f"Cached tactic {tactic} for {op_key} is unavailable " "and no fallback exists."
                 )
             logger.warning(
                 "Cached tactic %s unavailable, falling back to %s",
@@ -778,9 +761,7 @@ class AutoTuner:
         dir_name = os.path.dirname(abs_path)
         if dir_name:
             os.makedirs(dir_name, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            dir=dir_name, suffix=".tmp", prefix=".autotuner_"
-        )
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp", prefix=".autotuner_")
         try:
             data = {
                 _METADATA_KEY: original_metadata or current_meta,
@@ -846,8 +827,7 @@ class AutoTuner:
             }
             if mismatches:
                 details = ", ".join(
-                    f"{k}: saved={old} vs current={new}"
-                    for k, (old, new) in mismatches.items()
+                    f"{k}: saved={old} vs current={new}" for k, (old, new) in mismatches.items()
                 )
                 logger.warning(
                     "[Autotuner]: Cache file %s has environment differences (%s). "
@@ -860,9 +840,7 @@ class AutoTuner:
         entries = data.get("entries", {})
         # Handle legacy format (no "entries" wrapper)
         if not entries and "version" not in data:
-            entries = {
-                k: v for k, v in data.items() if k not in (_METADATA_KEY, "env")
-            }
+            entries = {k: v for k, v in data.items() if k not in (_METADATA_KEY, "env")}
 
         with self._lock:
             self._file_configs.clear()
@@ -874,9 +852,11 @@ class AutoTuner:
                     # FlashInfer format: [runner_name, tactic_value]
                     self._file_configs[key_str] = Tactic(
                         backend=str(entry_data[0]),
-                        config=_json_to_tactic(entry_data[1])
-                        if isinstance(entry_data[1], (list, dict))
-                        else (),
+                        config=(
+                            _json_to_tactic(entry_data[1])
+                            if isinstance(entry_data[1], (list, dict))
+                            else ()
+                        ),
                     )
 
         logger.info("[Autotuner]: Loaded %d configs from %s", len(entries), path)
@@ -1016,9 +996,11 @@ _active_cache_path: Optional[str] = None
 
 def _ensure_backends_registered() -> None:
     """Import backend modules to trigger registration."""
-    from .backends import conv2d as _conv2d_backends  # noqa: F401
-    from .backends import gemm as _gemm_backends  # noqa: F401
-    from .backends import torch_gemm as _torch_gemm_backends  # noqa: F401
+    from .backends import (  # noqa: F401
+        conv2d as _conv2d_backends,
+        gemm as _gemm_backends,
+        torch_gemm as _torch_gemm_backends,
+    )
 
 
 def is_tuning_enabled() -> bool:

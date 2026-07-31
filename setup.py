@@ -22,7 +22,7 @@ def get_ext_suffix():
 
 class CMakeExtension(Extension):
     """A CMake extension module."""
-    
+
     def __init__(self, name: str, sourcedir: str = ""):
         super().__init__(name, sources=[])
         self.sourcedir = os.path.abspath(sourcedir)
@@ -136,32 +136,32 @@ def _detect_cuda_architectures() -> str:
 
 class CMakeBuild(build_ext):
     """Build extension using CMake."""
-    
+
     def build_extension(self, ext: CMakeExtension) -> None:
         # Ensure output directory exists
         ext_dir = Path(self.get_ext_fullpath(ext.name)).parent.absolute()
         ext_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Build directory
         build_dir = Path(self.build_temp).absolute()
         build_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # CMake configuration
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={ext_dir}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
             "-DBUILD_PYTHON=ON",
         ]
-        
+
         # Torch cmake prefix (for find_package(Torch))
         torch_prefix = _find_torch_cmake_prefix()
         if torch_prefix:
             cmake_args.append(f"-DCMAKE_PREFIX_PATH={torch_prefix}")
-        
+
         # Build type
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         cmake_args.append(f"-DCMAKE_BUILD_TYPE={build_type}")
-        
+
         # CUDA architectures: honour explicit override, otherwise auto-detect
         # from available GPUs via PyTorch.  Fall back to a conservative modern
         # set (80+) that works on CUDA 11.8+ without requiring Volta support.
@@ -190,19 +190,19 @@ class CMakeBuild(build_ext):
 
         # Build arguments
         build_args = ["--config", build_type]
-        
+
         # Parallel build
         if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
             cpu_count = os.cpu_count() or 1
             build_args.extend(["-j", str(cpu_count)])
-        
+
         # Run CMake configure
         print(f"CMake configure: {' '.join(cmake_args)}")
         subprocess.check_call(
             ["cmake", ext.sourcedir] + cmake_args,
             cwd=build_dir
         )
-        
+
         # Run CMake build (extension is built directly into ext_dir)
         print(f"CMake build: {' '.join(build_args)}")
         subprocess.check_call(
@@ -215,14 +215,14 @@ def get_version() -> str:
     """Get version from package __init__.py."""
     version_file = Path(__file__).parent / "oasr" / "__init__.py"
     version = "0.1.0"
-    
+
     if version_file.exists():
         with open(version_file) as f:
             for line in f:
                 if line.startswith("__version__"):
                     version = line.split("=")[1].strip().strip('"\'')
                     break
-    
+
     return version
 
 
@@ -295,21 +295,21 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/your-org/oasr",
     license="Apache-2.0",
-    
+
     # Package configuration
     packages=find_packages(include=["oasr", "oasr.*"]),
-    
+
     # C++ extension
     ext_modules=[CMakeExtension("oasr._C", sourcedir=".")],
     cmdclass={"build_ext": CMakeBuild},
-    
+
     # Dependencies
     python_requires=">=3.8",
     install_requires=install_requires,
     extras_require=extras_require,
     # Keep egg-info metadata under build/ instead of polluting the source tree
     options={"egg_info": {"egg_base": "build"}},
-    
+
     # Classifiers
     classifiers=[
         "Development Status :: 3 - Alpha",
@@ -327,7 +327,7 @@ setup(
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
         "Topic :: Multimedia :: Sound/Audio :: Speech",
     ],
-    
+
     # Include package data
     include_package_data=True,
     zip_safe=False,

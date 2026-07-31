@@ -14,10 +14,9 @@ import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import k2
-import torch
 
 # Type alias: a lexicon is a list of (word, [token, ...]) pairs.
 Lexicon = List[Tuple[str, List[str]]]
@@ -222,9 +221,7 @@ def lexicon_to_fst_no_sil(
         assert len(pieces) > 0, f"Word {word!r} has no pronunciation"
         cur_state = loop_state
         word_id = word2id[word]
-        piece_ids = [
-            token2id[p] if p in token2id else token2id["<unk>"] for p in pieces
-        ]
+        piece_ids = [token2id[p] if p in token2id else token2id["<unk>"] for p in pieces]
 
         for i in range(len(piece_ids) - 1):
             w = word_id if i == 0 else eps

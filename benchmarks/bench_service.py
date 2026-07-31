@@ -67,7 +67,7 @@ def _envint(name: str, default):
     try:
         return int(v)
     except ValueError:
-        raise SystemExit(f"env var {name}={v!r} is not an int")
+        raise SystemExit(f"env var {name}={v!r} is not an int") from None
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +317,10 @@ class RunStats:
         rtf = self.total_audio_s / self.wall_s if self.wall_s > 0 else float("inf")
         rps = self.n_ok / self.wall_s if self.wall_s > 0 else 0.0
         lat = sorted(self.latencies_ms)
-        p = lambda q: lat[min(len(lat) - 1, int(q * len(lat)))]
+
+        def p(q):
+            return lat[min(len(lat) - 1, int(q * len(lat)))]
+
         lines = [
             f"{self.name}:",
             f"  requests   ok={self.n_ok}  rejected={self.n_rejected}  fail={self.n_fail}",

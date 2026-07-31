@@ -9,30 +9,21 @@ absent.  ``TestRealCheckpoint`` additionally needs the full
 Qwen2-Audio-7B-Instruct snapshot at ``SPEECH_LLM_CKPT``.
 """
 
-import glob
 import os
 
+import assets
 import pytest
 import torch
 
-SPEECH_LLM_TINY = os.environ.get(
-    "SPEECH_LLM_TINY", "/data01/kilm/users/chiendb/models/asr/qwen2-audio-tiny-random"
-)
-SPEECH_LLM_CKPT = os.environ.get(
-    "SPEECH_LLM_CKPT", "/data01/kilm/users/chiendb/models/asr/qwen2-audio-7b-instruct"
-)
-WAV_DIR = os.environ.get(
-    "WAV_DIR", "/data01/kilm/users/chiendb/data/asr/ljspeech-sr16k-dataset/wavs"
-)
+# Declared once in tests/assets.py; the markers below gate through the same
+# path, so --strict-assets can turn "fixture absent" into a failure.
+SPEECH_LLM_TINY = assets.declared("SPEECH_LLM_TINY")
+SPEECH_LLM_CKPT = assets.declared("SPEECH_LLM_CKPT")
+WAV_DIR = assets.declared("WAV_DIR")
 
-_tiny_present = os.path.exists(os.path.join(SPEECH_LLM_TINY, "model.safetensors"))
-_tiny_ref_present = os.path.exists(os.path.join(SPEECH_LLM_TINY, "oasr_ref", "ref.pt"))
-_real_present = os.path.exists(os.path.join(SPEECH_LLM_CKPT, "model.safetensors.index.json"))
-
-needs_tiny = pytest.mark.skipif(not _tiny_present, reason="tiny qwen2-audio fixture absent")
-needs_tiny_ref = pytest.mark.skipif(
-    not _tiny_ref_present, reason="tiny fixture HF reference absent"
-)
+needs_tiny = pytest.mark.requires_assets("SPEECH_LLM_TINY")
+needs_tiny_ref = pytest.mark.requires_assets("SPEECH_LLM_TINY", "SPEECH_LLM_TINY_REF")
+needs_real = pytest.mark.requires_assets("SPEECH_LLM_CKPT")
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +331,7 @@ class TestHFParityTinyFixture:
         mels = [r["input_features"].transpose(1, 2) for r in ref["rows"]]
         mlens = [int(r["feature_attention_mask"].sum()) for r in ref["rows"]]
         ours = self._greedy(loaded, prompt_ids, mels, mlens)
-        for i, r in enumerate(ref["rows"]):
+        for i in range(len(ref["rows"])):
             assert ours[i] == ref["batched"]["generated"][i]
 
 
@@ -569,9 +560,7 @@ class TestEngineE2E:
     def _audios(self, n=2):
         import torchaudio
 
-        wavs = sorted(glob.glob(os.path.join(WAV_DIR, "*.wav")))[:n]
-        if len(wavs) < n:
-            pytest.skip(f"not enough wavs under {WAV_DIR}")
+        wavs = assets.require_wavs(n)
         return [torchaudio.load(w)[0].squeeze(0) for w in wavs]
 
     def test_offline_with_streaming_partials(self):
@@ -645,7 +634,7 @@ class TestEngineE2E:
             for i in range(n_req)
         ]
         finals = {}
-        last_len = {rid: 0 for rid in ids}
+        last_len = dict.fromkeys(ids, 0)
         for _ in range(600):
             outs = eng.step()
             # (2) pending decode pool bounded: slots + at most one fresh batch.
@@ -673,16 +662,14 @@ class TestEngineE2E:
 
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
-@pytest.mark.skipif(not _real_present, reason="Qwen2-Audio-7B snapshot absent")
+@needs_real
 class TestRealCheckpoint:
     def test_engine_transcribes_lj(self):
         import torchaudio
 
         from oasr.engine import ASREngine, EngineConfig
 
-        wavs = sorted(glob.glob(os.path.join(WAV_DIR, "*.wav")))[:2]
-        if len(wavs) < 2:
-            pytest.skip(f"not enough wavs under {WAV_DIR}")
+        wavs = assets.require_wavs(2)
         audios = [torchaudio.load(w)[0].squeeze(0) for w in wavs]
         cfg = EngineConfig(ckpt_dir=SPEECH_LLM_CKPT, service_mode="offline", max_new_tokens=96)
         eng = ASREngine(cfg)

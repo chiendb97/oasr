@@ -6,6 +6,12 @@ import torch
 
 import oasr
 
+# Every test in this module allocates directly on ``device="cuda"`` and calls a
+# JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
+# what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
+# instead of a wall of `RuntimeError: No CUDA GPUs are available`.
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+
 
 N_FFT_VALUES = [8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
@@ -71,7 +77,7 @@ class TestRfft:
 
     def test_rfft_cpu_error(self):
         x = torch.randn(4, 256, dtype=torch.float32)
-        with pytest.raises(Exception):
+        with pytest.raises(RuntimeError, match="CUDA tensor"):
             oasr.rfft(x)
 
 

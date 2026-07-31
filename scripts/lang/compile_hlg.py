@@ -43,13 +43,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import k2
 import torch
-
 from lang_utils import LangDir
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--lang-dir",
         type=str,
@@ -115,12 +115,8 @@ def compile_HLG(lang_dir: Path, lm_dir: Path, lm: str) -> k2.Fsa:
 
     # Use the cached .pt only when it is *newer* than the .fst.txt source to
     # avoid stale caches after words.txt or ARPA changes.
-    g_pt_fresh = (
-        g_pt.is_file()
-        and (
-            not g_fst_txt.is_file()
-            or g_pt.stat().st_mtime >= g_fst_txt.stat().st_mtime
-        )
+    g_pt_fresh = g_pt.is_file() and (
+        not g_fst_txt.is_file() or g_pt.stat().st_mtime >= g_fst_txt.stat().st_mtime
     )
     if g_pt_fresh:
         logging.info(f"Loading pre-compiled G from {g_pt}")
@@ -168,9 +164,9 @@ def compile_HLG(lang_dir: Path, lm_dir: Path, lm: str) -> k2.Fsa:
     labels[labels >= first_token_disambig_id] = 0
     LG.labels = labels
 
-    assert isinstance(LG.aux_labels, k2.RaggedTensor), (
-        "LG.aux_labels is expected to be a RaggedTensor after k2.determinize()."
-    )
+    assert isinstance(
+        LG.aux_labels, k2.RaggedTensor
+    ), "LG.aux_labels is expected to be a RaggedTensor after k2.determinize()."
     LG.aux_labels.values[LG.aux_labels.values >= first_word_disambig_id] = 0
 
     # ------------------------------------------------------------------

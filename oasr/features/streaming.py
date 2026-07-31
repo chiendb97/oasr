@@ -216,9 +216,7 @@ class BatchedStreamingFeatureExtractor:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
         self._config = config
         self._batch_size = batch_size
-        self._extractors = [
-            _StreamingFeatureExtractor(config) for _ in range(batch_size)
-        ]
+        self._extractors = [_StreamingFeatureExtractor(config) for _ in range(batch_size)]
 
     @property
     def config(self) -> FeatureConfig:
@@ -244,8 +242,7 @@ class BatchedStreamingFeatureExtractor:
         wavs = _to_wav_list(waveforms, lengths)
         if len(wavs) != self._batch_size:
             raise ValueError(
-                f"Expected {self._batch_size} waveforms (one per stream), "
-                f"got {len(wavs)}"
+                f"Expected {self._batch_size} waveforms (one per stream), " f"got {len(wavs)}"
             )
 
         feat_list: List[Optional[torch.Tensor]] = [
@@ -254,9 +251,7 @@ class BatchedStreamingFeatureExtractor:
         return _collate_optional_features(feat_list, self._config.output_dim)
 
     def flush(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        feat_list: List[Optional[torch.Tensor]] = [
-            e.flush() for e in self._extractors
-        ]
+        feat_list: List[Optional[torch.Tensor]] = [e.flush() for e in self._extractors]
         return _collate_optional_features(feat_list, self._config.output_dim)
 
     def reset(self, stream_indices: Optional[List[int]] = None) -> None:

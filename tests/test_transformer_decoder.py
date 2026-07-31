@@ -19,6 +19,7 @@ import os
 import sys
 import types
 
+import assets
 import pytest
 import torch
 
@@ -29,33 +30,30 @@ from oasr.models.decoders import (
     reverse_pad_list,
 )
 
-WENET_REF = os.environ.get("WENET_REF_DIR", "/tmp/wenet_ref")
-CKPT_DIR = os.environ.get(
-    "CKPT_DIR",
-    "/data01/kilm/users/chiendb/models/asr/am/20210610_u2pp_conformer_exp_librispeech",
-)
+# Declared in tests/assets.py so --strict-assets can make these fatal.
+WENET_REF = assets.declared("WENET_REF_DIR")
+CKPT_DIR = assets.declared("CKPT_DIR")
 
 
 def _small_config(**overrides):
-    base = dict(
-        vocab_size=50,
-        encoder_output_size=32,
-        attention_heads=2,
-        linear_units=64,
-        num_blocks=2,
-        r_num_blocks=2,
-        sos_id=49,
-        eos_id=49,
-        reverse_weight=0.3,
-    )
+    base = {
+        "vocab_size": 50,
+        "encoder_output_size": 32,
+        "attention_heads": 2,
+        "linear_units": 64,
+        "num_blocks": 2,
+        "r_num_blocks": 2,
+        "sos_id": 49,
+        "eos_id": 49,
+        "reverse_weight": 0.3,
+    }
     base.update(overrides)
     return TransformerDecoderConfig(**base)
 
 
 def _import_wenet_ref():
     """Import the upstream WeNet decoder from the reference source tree."""
-    if not os.path.exists(os.path.join(WENET_REF, "transformer", "decoder.py")):
-        pytest.skip(f"WeNet reference sources not found at {WENET_REF} (set WENET_REF_DIR)")
+    assets.require("WENET_REF_DIR")
     import typeguard
 
     # WeNet v2.0.1 targets the typeguard 2.x API; shim it for 3.x/4.x installs.
@@ -69,8 +67,10 @@ def _import_wenet_ref():
         mod.__path__ = [WENET_REF + sub]
         sys.modules[name] = mod
     from wenet.transformer.decoder import BiTransformerDecoder as WenetBiDecoder
-    from wenet.utils.common import add_sos_eos as w_add_sos_eos
-    from wenet.utils.common import reverse_pad_list as w_reverse_pad_list
+    from wenet.utils.common import (
+        add_sos_eos as w_add_sos_eos,
+        reverse_pad_list as w_reverse_pad_list,
+    )
 
     return WenetBiDecoder, w_add_sos_eos, w_reverse_pad_list
 
@@ -168,9 +168,7 @@ class TestWenetParity:
     def test_real_checkpoint_parity(self):
         """Bit-level oracle on the real U2++ decoder weights (fp32, CPU)."""
         WenetBiDecoder, _, _ = _import_wenet_ref()
-        ckpt = os.path.join(CKPT_DIR, "final.pt")
-        if not os.path.exists(ckpt):
-            pytest.skip(f"no U2++ checkpoint at {CKPT_DIR} (set CKPT_DIR)")
+        ckpt = os.path.join(assets.require("CKPT_DIR"), "final.pt")
         sd = torch.load(ckpt, map_location="cpu")
         if "state_dict" in sd:
             sd = sd["state_dict"]
@@ -281,13 +279,13 @@ class TestConformerDecoderLoading:
 
         torch.manual_seed(3)
         src = ConformerModel(self._model_config())
-        sd = {k: v for k, v in src.state_dict().items()}
+        sd = dict(src.state_dict().items())
         dst = ConformerModel(self._model_config())
         report = dst.load_weights(sd)
         assert not [k for k in report.dropped if k.startswith("decoder.")]
         for k in ("decoder.left_decoder.embed.0.weight", "decoder.right_decoder.output_layer.bias"):
             assert torch.equal(dst.state_dict()[k], sd[k])
-        assert sorted(model_caps := dst.capabilities) == ["ctc", "ctc_aed_rescoring"]
+        assert sorted(dst.capabilities) == ["ctc", "ctc_aed_rescoring"]
         assert dst.default_decode_type == "ctc"
         assert dst.decode_type == "ctc"  # alias must not flip to the AED branch
 
@@ -318,7 +316,7 @@ class TestConformerDecoderLoading:
         from oasr.models.conformer.model import ConformerModel
 
         src = ConformerModel(self._model_config())
-        sd = {k: v for k, v in src.state_dict().items()}
+        sd = dict(src.state_dict().items())
         dst = ConformerModel(self._model_config(with_decoder=False))
         report = dst.load_weights(sd)
         dropped_dec = [k for k in report.dropped if k.startswith("decoder.")]

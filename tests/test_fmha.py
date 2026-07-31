@@ -16,17 +16,17 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Optional, Tuple
+from typing import Optional
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-
 # ---------------------------------------------------------------------------
 # Reference: a clean SDPA path that mirrors oasr.fmha_forward's contract.
 # Used to compare both backends against a single source of truth.
 # ---------------------------------------------------------------------------
+
 
 def _ref_fmha(
     q: torch.Tensor,
@@ -63,7 +63,11 @@ def _ref_fmha(
             full_mask = full_mask + m
 
     return F.scaled_dot_product_attention(
-        q, k, v, attn_mask=full_mask, scale=softmax_scale,
+        q,
+        k,
+        v,
+        attn_mask=full_mask,
+        scale=softmax_scale,
     )
 
 
@@ -73,15 +77,15 @@ def _ref_fmha(
 
 _SHAPES = [
     # (B, H, H_kv, T_q, T_k, D)
-    (1, 4, 4, 8, 16, 64),     # smallest streaming chunk
-    (4, 4, 4, 8, 64, 64),     # bigger batch
-    (1, 4, 4, 16, 32, 64),    # T_q not 8
-    (2, 8, 8, 8, 128, 64),    # bigger H
-    (2, 8, 1, 8, 64, 64),     # MQA
-    (2, 8, 2, 8, 64, 64),     # GQA
-    (1, 4, 4, 64, 256, 64),   # offline-ish shape
-    (1, 4, 4, 16, 249, 64),   # T_k not divisible by 8 (real audio frame counts)
-    (2, 4, 4, 16, 33, 64),    # tiny odd T_k
+    (1, 4, 4, 8, 16, 64),  # smallest streaming chunk
+    (4, 4, 4, 8, 64, 64),  # bigger batch
+    (1, 4, 4, 16, 32, 64),  # T_q not 8
+    (2, 8, 8, 8, 128, 64),  # bigger H
+    (2, 8, 1, 8, 64, 64),  # MQA
+    (2, 8, 2, 8, 64, 64),  # GQA
+    (1, 4, 4, 64, 256, 64),  # offline-ish shape
+    (1, 4, 4, 16, 249, 64),  # T_k not divisible by 8 (real audio frame counts)
+    (2, 4, 4, 16, 33, 64),  # tiny odd T_k
 ]
 
 _DTYPES = [torch.float16]
@@ -92,6 +96,7 @@ if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="module")
 def cuda():
@@ -105,9 +110,11 @@ def fmha():
     """Import oasr.fmha_forward and force a fresh backend probe."""
     # Force a re-read of the env var since other tests may have set/unset it.
     from oasr.jit.attention import set_backend_mode
+
     mode = os.environ.get("OASR_ATTN_BACKEND", "auto").lower()
     set_backend_mode(mode)
     from oasr import fmha
+
     return fmha
 
 
@@ -157,7 +164,8 @@ def test_fmha_with_length_mask(fmha, cuda, dtype, shape):
     base = max(1, T_k // 4)
     seqlens = torch.tensor(
         [base if i < B // 2 else T_k for i in range(B)],
-        dtype=torch.int32, device=cuda,
+        dtype=torch.int32,
+        device=cuda,
     )
     scale = 1.0 / math.sqrt(D)
 
@@ -178,7 +186,8 @@ def test_fmha_bias_and_mask(fmha, cuda, dtype, shape):
     bias = torch.randn(B, H, T_q, T_k, device=cuda, dtype=dtype) * 0.1
     seqlens = torch.tensor(
         [max(1, T_k - i) for i in range(B)],
-        dtype=torch.int32, device=cuda,
+        dtype=torch.int32,
+        device=cuda,
     )
     scale = 1.0 / math.sqrt(D)
 
@@ -189,11 +198,11 @@ def test_fmha_bias_and_mask(fmha, cuda, dtype, shape):
 
 _PAGED_SHAPES = [
     # (B, H, H_kv, T_q, max_blocks_per_seq, D, block_size)
-    (1, 4, 4, 8, 4, 64, 16),     # MHA, single stream
-    (2, 4, 4, 8, 4, 64, 16),     # MHA, two streams
-    (3, 8, 2, 16, 8, 64, 16),    # GQA, multi-stream, longer kv
-    (1, 4, 4, 8, 8, 64, 32),     # different block_size
-    (2, 8, 1, 8, 4, 64, 16),     # MQA
+    (1, 4, 4, 8, 4, 64, 16),  # MHA, single stream
+    (2, 4, 4, 8, 4, 64, 16),  # MHA, two streams
+    (3, 8, 2, 16, 8, 64, 16),  # GQA, multi-stream, longer kv
+    (1, 4, 4, 8, 8, 64, 32),  # different block_size
+    (2, 8, 1, 8, 4, 64, 16),  # MQA
 ]
 
 
@@ -208,46 +217,60 @@ def test_fmha_paged_matches_sdpa(fmha, cuda, dtype, shape, with_bias):
     torch.manual_seed(11)
     num_pool_blocks = max(B * max_blocks_per_seq + 4, 16)
     k_pool = torch.randn(
-        num_pool_blocks, block_size, H_kv, D, device=cuda, dtype=dtype,
+        num_pool_blocks,
+        block_size,
+        H_kv,
+        D,
+        device=cuda,
+        dtype=dtype,
     )
     v_pool = torch.randn(
-        num_pool_blocks, block_size, H_kv, D, device=cuda, dtype=dtype,
+        num_pool_blocks,
+        block_size,
+        H_kv,
+        D,
+        device=cuda,
+        dtype=dtype,
     )
 
     # Per-stream block table picks distinct blocks.
     block_ids = torch.randperm(num_pool_blocks)[: B * max_blocks_per_seq]
     block_table = block_ids.reshape(B, max_blocks_per_seq).to(
-        dtype=torch.int32, device=cuda,
+        dtype=torch.int32,
+        device=cuda,
     )
     # Per-stream cache_seqlens: vary across streams.
     cache_seqlens = torch.tensor(
         [min(T_kv_max - 4 - 2 * b, T_kv_max - 1) for b in range(B)],
-        dtype=torch.int32, device=cuda,
+        dtype=torch.int32,
+        device=cuda,
     )
 
     q = torch.randn(B, H, T_q, D, device=cuda, dtype=dtype)
-    bias = (
-        torch.randn(B, H, T_q, T_kv_max, device=cuda, dtype=dtype) * 0.1
-        if with_bias else None
-    )
+    bias = torch.randn(B, H, T_q, T_kv_max, device=cuda, dtype=dtype) * 0.1 if with_bias else None
     scale = 1.0 / math.sqrt(D)
 
     out = fmha(
-        q, k_pool, v_pool,
-        softmax_scale=scale, attn_bias=bias,
-        cache_seqlens=cache_seqlens, block_table=block_table,
+        q,
+        k_pool,
+        v_pool,
+        softmax_scale=scale,
+        attn_bias=bias,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
     )
 
     # Reference: gather and call SDPA.
     block_ids_long = block_table.long()
-    k_full = k_pool[block_ids_long].reshape(
-        B, T_kv_max, H_kv, D
-    ).permute(0, 2, 1, 3)
-    v_full = v_pool[block_ids_long].reshape(
-        B, T_kv_max, H_kv, D
-    ).permute(0, 2, 1, 3)
+    k_full = k_pool[block_ids_long].reshape(B, T_kv_max, H_kv, D).permute(0, 2, 1, 3)
+    v_full = v_pool[block_ids_long].reshape(B, T_kv_max, H_kv, D).permute(0, 2, 1, 3)
     ref = _ref_fmha(
-        q, k_full, v_full, scale, attn_bias=bias, cache_seqlens=cache_seqlens,
+        q,
+        k_full,
+        v_full,
+        scale,
+        attn_bias=bias,
+        cache_seqlens=cache_seqlens,
     )
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
@@ -300,7 +323,7 @@ def test_fmha_finite_mask_floor_stays_finite(fmha, cuda, dtype, mask_floor):
     v = torch.randn(B, H, T, D, device=cuda, dtype=dtype) * 6.0
     floor = torch.zeros(B, 1, 1, T, device=cuda, dtype=torch.float32)
     floor[..., valid:] = mask_floor
-    bias = ((torch.randn(B, H, T, T, device=cuda, dtype=torch.float32) * 0.5) + floor)
+    bias = (torch.randn(B, H, T, T, device=cuda, dtype=torch.float32) * 0.5) + floor
     scale = 1.0 / math.sqrt(D)
     bias = (bias * scale).to(dtype)
 

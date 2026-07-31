@@ -140,15 +140,17 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
                 num_iters=num_iters,
                 use_cuda_events=use_cuda_events,
             )
-            output.write_result(BenchResult(
-                routine="composite",
-                subroutine=subroutine,
-                backend=backend,
-                shape=shape_str,
-                dtype=dtype_str,
-                median_ms=median_ms,
-                std_ms=std_ms,
-            ))
+            output.write_result(
+                BenchResult(
+                    routine="composite",
+                    subroutine=subroutine,
+                    backend=backend,
+                    shape=shape_str,
+                    dtype=dtype_str,
+                    median_ms=median_ms,
+                    std_ms=std_ms,
+                )
+            )
 
 
 def _resolve_configs(args, subroutine):
@@ -184,11 +186,17 @@ def run_standalone() -> None:
             shape_str = f"[{cfg['batch']}, {cfg['seq']}, {cfg['d_model']}] k={cfg['kernel_size']}"
             for backend, fn in [("cuda", oasr_fn), ("torch", pytorch_fn)]:
                 median_ms, std_ms = bench_fn(fn)
-                output.write_result(BenchResult(
-                    routine="composite", subroutine="conv_block", backend=backend,
-                    shape=shape_str, dtype="float16",
-                    median_ms=median_ms, std_ms=std_ms,
-                ))
+                output.write_result(
+                    BenchResult(
+                        routine="composite",
+                        subroutine="conv_block",
+                        backend=backend,
+                        shape=shape_str,
+                        dtype="float16",
+                        median_ms=median_ms,
+                        std_ms=std_ms,
+                    )
+                )
         output.finalize()
 
     run_main("Conv Block Kernel", pcfg, setup_funcs, benchmark)

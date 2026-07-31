@@ -16,7 +16,6 @@ from typing import Any, Callable
 
 import torch
 
-
 # ---------------------------------------------------------------------------
 # Timing
 # ---------------------------------------------------------------------------
@@ -332,23 +331,32 @@ def make_bench_parser(description: str, kernels: list[str]) -> argparse.Argument
         epilog=f"\nAvailable kernels:\n  {kernel_list}\n",
     )
     parser.add_argument(
-        "--profile", action="store_true",
+        "--profile",
+        action="store_true",
         help="Run in profiling mode (single iterations for ncu)",
     )
     parser.add_argument(
-        "--kernel", nargs="+", default=["all"],
+        "--kernel",
+        nargs="+",
+        default=["all"],
         help='Kernel(s) to profile (use "all" for all kernels)',
     )
     parser.add_argument(
-        "--target", choices=["oasr", "pytorch", "both"], default="oasr",
+        "--target",
+        choices=["oasr", "pytorch", "both"],
+        default="oasr",
         help="Which implementation to profile (default: oasr)",
     )
     parser.add_argument(
-        "--warmup", type=int, default=3,
+        "--warmup",
+        type=int,
+        default=3,
         help="Number of warmup iterations for profiling (default: 3)",
     )
     parser.add_argument(
-        "--iters", type=int, default=1,
+        "--iters",
+        type=int,
+        default=1,
         help="Number of profile iterations (default: 1)",
     )
     return parser
@@ -387,9 +395,7 @@ def run_profile(
 
         if target in ("pytorch", "both"):
             print("  Running PyTorch kernel...")
-            profile_kernel(
-                f"pytorch_{kernel_name}", pytorch_fn, warmup=warmup, profile_iters=iters
-            )
+            profile_kernel(f"pytorch_{kernel_name}", pytorch_fn, warmup=warmup, profile_iters=iters)
 
         print("  Done.")
 

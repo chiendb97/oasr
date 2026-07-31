@@ -15,7 +15,11 @@ version = "0.1.0"
 description = "Open Automatic Speech Recognition - High-performance ASR inference framework"
 readme = "README.md"
 license = {text = "Apache-2.0"}
-requires-python = ">=3.8"
+# 3.10 is the real floor, not an aspiration: oasr/decoder/wfst/graph_image.py
+# annotates defaults with PEP 604 unions (``np.ndarray | None``) and has no
+# ``from __future__ import annotations``, so importing it on 3.9 raises
+# TypeError at def time.  CI runs test-cpu on 3.10 so the claim stays tested.
+requires-python = ">=3.10"
 authors = [
     {name = "OASR Contributors"},
 ]
@@ -36,8 +40,6 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Programming Language :: C++",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -121,7 +123,7 @@ binding = "PyO3"
 
 [tool.black]
 line-length = 100
-target-version = ["py38", "py39", "py310", "py311", "py312"]
+target-version = ["py310", "py311", "py312"]
 include = '\.pyi?$'
 exclude = '''
 /(
@@ -142,17 +144,34 @@ exclude = '''
 profile = "black"
 line_length = 100
 skip = [".git", "third_party", "build", "dist"]
+# isort and ruff's `I` rules both sort imports, and CI runs both — they have to
+# agree or every run flips the file back.  These three settings are the ones
+# where their defaults differ; keep them in lockstep with [tool.ruff.lint.isort].
+known_first_party = ["oasr", "benchmarks"]
+combine_as_imports = true
+force_sort_within_sections = false
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
+# Type-checking third-party sources (torch in particular) is neither our job
+# nor achievable — torch's own sources do not type-check cleanly, and mypy
+# aborted the whole run on them before this was set.
+follow_imports = "silent"
 exclude = [
     "third_party",
     "build",
     "dist",
 ]
+
+# CuteDSL kernels are written against `cutlass.cute`, whose decorators rewrite
+# the function bodies; mypy sees the DSL's injected names as undefined.  ~90%
+# of the repo's `name-defined` errors came from here and none were real.
+[[tool.mypy.overrides]]
+module = "oasr.kernels.cute.*"
+ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -166,7 +185,15 @@ markers = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py38"
+target-version = "py310"
+exclude = [
+    ".git",
+    "third_party",
+    "build",
+    "dist",
+]
+
+[tool.ruff.lint]
 select = [
     "E",   # pycodestyle errors
     "W",   # pycodestyle warnings
@@ -178,10 +205,28 @@ select = [
 ignore = [
     "E501",  # line too long (handled by black)
     "B008",  # function call in default argument
+    # B905 (`zip(..., strict=)`) only became reachable when target-version moved
+    # to py310.  It is a real bug class — a short zip truncates silently — but
+    # deciding strict=True per call site needs to know the lengths always match,
+    # and there are 38 of them across the engine and the kernels.  Enabling it
+    # is tracked as a follow-up; turning it on blind would be a guess, not a fix.
+    "B905",
 ]
-exclude = [
-    ".git",
-    "third_party",
-    "build",
-    "dist",
-]
+
+[tool.ruff.lint.per-file-ignores]
+# Package facades re-export their public surface; the imports are the point.
+# `oasr/__init__.py` additionally interleaves imports with the lazy `_C` loader,
+# so its E402s are structural.
+"oasr/__init__.py" = ["F401", "E402"]
+"oasr/**/__init__.py" = ["F401"]
+# Benchmark entry points insert the repo root on sys.path before importing
+# `benchmarks.*`; the routine modules import kernels for their registration
+# side effect and re-export helpers the CLI resolves by name.
+"benchmarks/*.py" = ["E402"]
+"benchmarks/routines/*.py" = ["F401", "E402"]
+
+# Mirror of [tool.isort] — see the note there.
+[tool.ruff.lint.isort]
+known-first-party = ["oasr", "benchmarks"]
+combine-as-imports = true
+force-sort-within-sections = false

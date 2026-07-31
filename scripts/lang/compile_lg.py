@@ -27,21 +27,31 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import k2
 import torch
-
 from lang_utils import LangDir
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--lang-dir", type=str, required=True,
-                        help="Lang directory with L_disambig.pt, tokens.txt, words.txt.")
-    parser.add_argument("--lm", type=str, default="G_3_gram",
-                        help="Stem name of the LM file (default: G_3_gram).")
-    parser.add_argument("--lm-dir", type=str, default="data/lm",
-                        help="Directory containing the LM file (default: data/lm).")
-    parser.add_argument("--overwrite", action="store_true",
-                        help="Overwrite existing LG.pt if it already exists.")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--lang-dir",
+        type=str,
+        required=True,
+        help="Lang directory with L_disambig.pt, tokens.txt, words.txt.",
+    )
+    parser.add_argument(
+        "--lm", type=str, default="G_3_gram", help="Stem name of the LM file (default: G_3_gram)."
+    )
+    parser.add_argument(
+        "--lm-dir",
+        type=str,
+        default="data/lm",
+        help="Directory containing the LM file (default: data/lm).",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Overwrite existing LG.pt if it already exists."
+    )
     return parser.parse_args()
 
 

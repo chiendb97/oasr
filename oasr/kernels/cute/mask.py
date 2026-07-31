@@ -96,13 +96,9 @@ class AttentionMask:
                     # k_col > q_row  -> mask
                     masked = masked or cute.elem_less(q_row, k_col)
                 if cutlass.const_expr(self.window_right >= 0):
-                    masked = masked or cute.elem_less(
-                        q_row + self.window_right, k_col
-                    )
+                    masked = masked or cute.elem_less(q_row + self.window_right, k_col)
                 if cutlass.const_expr(self.window_left >= 0):
-                    masked = masked or cute.elem_less(
-                        k_col + self.window_left, q_row
-                    )
+                    masked = masked or cute.elem_less(k_col + self.window_left, q_row)
                 if masked:
                     acc_S_mn[r, c] = -cutlass.Float32.inf
 

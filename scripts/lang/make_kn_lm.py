@@ -89,8 +89,8 @@ class CountsForHistory:
     def __init__(self):
         self.word_to_count: dict = defaultdict(int)
         self.word_to_context: dict = defaultdict(set)
-        self.word_to_f: dict = {}   # discounted probability
-        self.word_to_bow: dict = {} # back-off weight
+        self.word_to_f: dict = {}  # discounted probability
+        self.word_to_bow: dict = {}  # back-off weight
         self.total_count: int = 0
 
     def words(self):
@@ -174,23 +174,18 @@ class NgramCounts:
         n = self.ngram_order - 1
         for counts_for_hist in self.counts[n].values():
             for w, c in counts_for_hist.word_to_count.items():
-                counts_for_hist.word_to_f[w] = (
-                    max(c - self.d[n], 0) / counts_for_hist.total_count
-                )
+                counts_for_hist.word_to_f[w] = max(c - self.d[n], 0) / counts_for_hist.total_count
 
         # Lower orders: f(_z) = max(n(*_z) - D, 0) / n(*_*)
         for n in range(self.ngram_order - 1):
             for counts_for_hist in self.counts[n].values():
                 n_star_star = sum(
-                    len(counts_for_hist.word_to_context[w])
-                    for w in counts_for_hist.word_to_count
+                    len(counts_for_hist.word_to_context[w]) for w in counts_for_hist.word_to_count
                 )
                 for w in counts_for_hist.word_to_count:
                     if n_star_star != 0:
                         n_star_z = len(counts_for_hist.word_to_context[w])
-                        counts_for_hist.word_to_f[w] = (
-                            max(n_star_z - self.d[n], 0) / n_star_star
-                        )
+                        counts_for_hist.word_to_f[w] = max(n_star_z - self.d[n], 0) / n_star_star
                     else:
                         # Histories beginning with <s> have no "modified count".
                         n_star_z = counts_for_hist.word_to_count[w]
@@ -223,9 +218,7 @@ class NgramCounts:
                     sum_z1_f_z = sum(_counts.word_to_f.get(u, 0) for u in a_counts.word_to_f)
 
                     if sum_z1_f_z < 1:
-                        counts_for_hist.word_to_bow[w] = (1.0 - sum_z1_f_a_z) / (
-                            1.0 - sum_z1_f_z
-                        )
+                        counts_for_hist.word_to_bow[w] = (1.0 - sum_z1_f_a_z) / (1.0 - sum_z1_f_z)
                     else:
                         counts_for_hist.word_to_bow[w] = None
 
@@ -236,9 +229,7 @@ class NgramCounts:
         """Write the LM in ARPA format to *fout*."""
         print("\\data\\", file=fout)
         for hist_len in range(self.ngram_order):
-            total = sum(
-                len(ch.word_to_f) for ch in self.counts[hist_len].values()
-            )
+            total = sum(len(ch.word_to_f) for ch in self.counts[hist_len].values())
             print(f"ngram {hist_len + 1}={total}", file=fout)
         print("", file=fout)
 

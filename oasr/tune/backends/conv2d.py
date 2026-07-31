@@ -16,16 +16,16 @@ import functools
 import logging
 from typing import Union
 
-from oasr.tune.autotuner import BackendEntry, _global_registry, OpKey, Tactic
 from oasr.jit.conv import (
+    CONV2D_DEFAULT,
     CutlassConv2dConfig,
     CutlassConv2dConfigSm90,
-    CONV2D_DEFAULT,
-    get_all_conv2d_autotune_configs,
-    conv2d_func_name,
     conv2d_activation_func_name,
+    conv2d_func_name,
+    get_all_conv2d_autotune_configs,
 )
 from oasr.jit.core import _get_target_sm
+from oasr.tune.autotuner import BackendEntry, OpKey, Tactic, _global_registry
 
 logger = logging.getLogger("oasr.tune")
 
@@ -38,6 +38,7 @@ _all_autotune_configs = get_all_conv2d_autotune_configs(_sm)
 # ---------------------------------------------------------------------------
 # cuDNN module loaders
 # ---------------------------------------------------------------------------
+
 
 @functools.cache
 def _get_cudnn_conv2d_module():
@@ -59,15 +60,18 @@ def _has_cudnn() -> bool:
 # Pre-compiled CUTLASS module (contains ALL variants)
 # ---------------------------------------------------------------------------
 
+
 @functools.cache
 def _get_conv2d_module():
     from oasr.jit.conv import gen_conv2d_module
+
     return gen_conv2d_module().build_and_load()
 
 
 # ---------------------------------------------------------------------------
 # CUTLASS tile-variant runner factories
 # ---------------------------------------------------------------------------
+
 
 def _make_conv2d_runner(cfg: Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]):
     """Create a CUTLASS Conv2D runner for a specific variant."""
@@ -97,7 +101,7 @@ def _make_conv2d_activation_runner(cfg: Union[CutlassConv2dConfig, CutlassConv2d
 
 for _cfg in _all_autotune_configs.values():
     _tactic = Tactic("cutlass", config=_cfg.to_tactic_config())
-    _is_default = (_cfg.compile_name == CONV2D_DEFAULT.compile_name)
+    _is_default = _cfg.compile_name == CONV2D_DEFAULT.compile_name
 
     _global_registry.register(
         OpKey("conv", "conv2d"),
@@ -123,6 +127,7 @@ for _cfg in _all_autotune_configs.values():
 # ---------------------------------------------------------------------------
 # Registration: cuDNN backends
 # ---------------------------------------------------------------------------
+
 
 def _cudnn_conv2d_runner():
     mod = _get_cudnn_conv2d_module()

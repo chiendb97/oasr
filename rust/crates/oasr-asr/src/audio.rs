@@ -157,13 +157,13 @@ impl PcmStream {
 fn pcm_to_f32(body: &[u8], encoding: PcmEncoding) -> Result<Vec<f32>, AudioError> {
     match encoding {
         PcmEncoding::F32Le => {
-            if body.len() % 4 != 0 {
+            if !body.len().is_multiple_of(4) {
                 return Err(AudioError::Misaligned(body.len(), 4));
             }
             Ok(bytes_to_f32(body))
         }
         PcmEncoding::I16Le => {
-            if body.len() % 2 != 0 {
+            if !body.len().is_multiple_of(2) {
                 return Err(AudioError::Misaligned(body.len(), 2));
             }
             Ok(body
@@ -274,14 +274,14 @@ pub fn decode_raw_pcm(
 ) -> Result<DecodedAudio, AudioError> {
     let samples = match encoding {
         PcmEncoding::F32Le => {
-            if body.len() % 4 != 0 {
+            if !body.len().is_multiple_of(4) {
                 return Err(AudioError::Misaligned(body.len(), 4));
             }
             // Caller-provided f32 → pass through (assume mono).
             Bytes::copy_from_slice(body)
         }
         PcmEncoding::I16Le => {
-            if body.len() % 2 != 0 {
+            if !body.len().is_multiple_of(2) {
                 return Err(AudioError::Misaligned(body.len(), 2));
             }
             let n = body.len() / 2;

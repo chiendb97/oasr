@@ -14,7 +14,7 @@ The base class only defines the contract. The dispatcher in
 
 from __future__ import annotations
 
-from typing import Any, Optional, Type
+from typing import Any, Type
 
 # CuteDSL imports are deferred so this module can be imported on machines
 # without a working CuteDSL install (e.g., for documentation builds).
@@ -72,7 +72,7 @@ class FmhaBase:
         self,
         *,
         head_dim: int,
-        dtype: Any,                       # cutlass.Float16 or cutlass.BFloat16
+        dtype: Any,  # cutlass.Float16 or cutlass.BFloat16
         num_heads: int,
         num_kv_heads: int,
         has_bias: bool = False,
@@ -149,9 +149,7 @@ class FmhaBase:
         raise NotImplementedError
 
     def __call__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "FmhaBase is abstract; instantiate a per-arch subclass."
-        )
+        raise NotImplementedError("FmhaBase is abstract; instantiate a per-arch subclass.")
 
 
 def pick_arch_cls(major: int, minor: int) -> Type[FmhaBase]:
@@ -169,9 +167,11 @@ def pick_arch_cls(major: int, minor: int) -> Type[FmhaBase]:
     # Local imports keep CuteDSL out of base.py's import path.
     if sm == 120:
         from .fmha_sm120 import FmhaSm120
+
         return FmhaSm120
     if sm in (80, 86, 89):
         from .fmha_sm80 import FmhaSm80
+
         return FmhaSm80
     raise NotImplementedError(
         f"oasr CuteDSL attention has no kernel for sm{sm} yet "

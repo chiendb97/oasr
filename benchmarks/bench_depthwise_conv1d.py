@@ -26,25 +26,25 @@ CONFIGS = [
 DTYPES = [torch.float16]
 DTYPE_NAMES = {torch.float16: "float16"}
 
-_COL_SHAPE  = 30
-_COL_TIME   = 12
-_COL_METRIC =  9
+_COL_SHAPE = 30
+_COL_TIME = 12
+_COL_METRIC = 9
 
 _HEADER = (
     f"{'shape':>{_COL_SHAPE}}"
     f"  {'CUDA':>{_COL_TIME}}  {'BW(TB/s)':>{_COL_METRIC}}"
     f"  {'PyTorch':>{_COL_TIME}}  {'BW(TB/s)':>{_COL_METRIC}}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR Depthwise Conv1D Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR Depthwise Conv1D Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
 def _bw_tb_s(cfg, dtype, ms):
     batch, seq, ch, ks = cfg["batch"], cfg["seq"], cfg["channels"], cfg["kernel_size"]
     out_len = seq - ks + 1 + ks // 2 * 2
-    elem    = dtype_size(dtype)
-    nbytes  = (batch * seq * ch + ks * ch + ch + batch * out_len * ch) * elem
+    elem = dtype_size(dtype)
+    nbytes = (batch * seq * ch + ks * ch + ch + batch * out_len * ch) * elem
     return nbytes / (ms * 1e-3) / 1e12
 
 
@@ -67,7 +67,8 @@ def _row(shape_str, times, cfg, dtype):
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available"); return
+        print("CUDA not available")
+        return
 
     print(_TITLE)
     print(_TITLE_SEP)
@@ -80,7 +81,7 @@ def main():
             cuda_fn, pytorch_fn = setup_depthwise_conv1d(
                 cfg["batch"], cfg["seq"], cfg["channels"], cfg["kernel_size"], dtype
             )
-            cuda_ms,    _ = bench_fn(cuda_fn)
+            cuda_ms, _ = bench_fn(cuda_fn)
             pytorch_ms, _ = bench_fn(pytorch_fn)
             shape_str = f"[{cfg['batch']},{cfg['seq']},{cfg['channels']}] k={cfg['kernel_size']}"
             # order: CUDA, PyTorch

@@ -7,6 +7,12 @@ import torch.nn.functional as F
 
 import oasr
 
+# Every test in this module allocates directly on ``device="cuda"`` and calls a
+# JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
+# what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
+# instead of a wall of `RuntimeError: No CUDA GPUs are available`.
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+
 
 class TestSoftmax:
     """Tests for oasr.softmax() functional API."""
@@ -57,9 +63,7 @@ class TestSoftmax:
         assert not torch.isnan(output).any()
         assert not torch.isinf(output).any()
         # uniform distribution expected
-        torch.testing.assert_close(
-            output, torch.full_like(output, 1.0 / 128), rtol=1e-4, atol=1e-4
-        )
+        torch.testing.assert_close(output, torch.full_like(output, 1.0 / 128), rtol=1e-4, atol=1e-4)
 
     def test_softmax_2d_input(self):
         """Softmax should work on 2D inputs."""
@@ -71,5 +75,5 @@ class TestSoftmax:
     def test_softmax_cpu_error(self):
         """CPU tensors should raise an error."""
         x = torch.randn(2, 64, 128, dtype=torch.float32)
-        with pytest.raises(Exception):
+        with pytest.raises(RuntimeError, match="CUDA tensor"):
             oasr.softmax(x)

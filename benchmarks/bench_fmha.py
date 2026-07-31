@@ -36,7 +36,7 @@ _SETUP = {
 }
 
 _COL_SHAPE = 36
-_COL_TIME  = 14
+_COL_TIME = 14
 _COL_TFLOPS = 8
 
 _HEADER = (
@@ -45,8 +45,8 @@ _HEADER = (
     f"  {'PyTorch':>{_COL_TIME}}  {'TFLOPS':>{_COL_TFLOPS}}"
     f"  {'speedup':>9}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR FMHA Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR FMHA Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
@@ -66,7 +66,7 @@ def _fmt_speedup(cute_ms, pt_ms):
 
 def _row(shape_str, cute_ms, pt_ms, cfg):
     cute_tf = compute_fmha_tflops(cfg["B"], cfg["H"], cfg["T_q"], cfg["T_k"], cfg["D"], cute_ms)
-    pt_tf   = compute_fmha_tflops(cfg["B"], cfg["H"], cfg["T_q"], cfg["T_k"], cfg["D"], pt_ms)
+    pt_tf = compute_fmha_tflops(cfg["B"], cfg["H"], cfg["T_q"], cfg["T_k"], cfg["D"], pt_ms)
     parts = [f"{shape_str:>{_COL_SHAPE}}"]
     parts.append(f"  {_fmt_time(cute_ms):>{_COL_TIME}}  {_fmt_tflops(cute_tf):>{_COL_TFLOPS}}")
     parts.append(f"  {_fmt_time(pt_ms):>{_COL_TIME}}  {_fmt_tflops(pt_tf):>{_COL_TFLOPS}}")
@@ -75,26 +75,25 @@ def _row(shape_str, cute_ms, pt_ms, cfg):
 
 
 def _shape_str(cfg):
-    return (
-        f"({cfg['B']},{cfg['H']},{cfg['H_kv']},"
-        f"{cfg['T_q']},{cfg['T_k']},{cfg['D']})"
-    )
+    return f"({cfg['B']},{cfg['H']},{cfg['H_kv']}," f"{cfg['T_q']},{cfg['T_k']},{cfg['D']})"
 
 
 def _run_shape(sub, cfg, dtype):
     setup = _SETUP[sub]
     cute_fn, pt_fn = setup(cfg, dtype)
     # Warm caches + first-call CuteDSL compile.
-    cute_fn(); pt_fn()
+    cute_fn()
+    pt_fn()
     torch.cuda.synchronize()
     cute_ms, _ = bench_fn(cute_fn)
-    pt_ms,   _ = bench_fn(pt_fn)
+    pt_ms, _ = bench_fn(pt_fn)
     return cute_ms, pt_ms
 
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available"); return
+        print("CUDA not available")
+        return
 
     print(_TITLE)
     print(_TITLE_SEP)

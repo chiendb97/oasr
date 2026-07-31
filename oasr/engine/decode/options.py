@@ -38,7 +38,7 @@ about: a typo'd option that changes nothing and reports nothing.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Dict, List, Mapping, Optional, Type
+from typing import Any, Dict, List, Mapping, Optional
 
 
 def option(default: Any, *, legacy: Optional[str] = None, doc: str = "") -> Any:

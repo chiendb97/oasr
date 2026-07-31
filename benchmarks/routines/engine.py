@@ -604,17 +604,17 @@ def _run_config(
     extra_metrics: dict[str, Any] = {}
     try:
         if is_streaming:
-            cfg_kwargs = dict(
-                ckpt_dir=ckpt_dir,
-                device="cuda",
-                dtype=dtype,
-                service_mode="streaming",
-                decoder_type=decoder_type,
-                chunk_size=chunk_size,
-                num_left_chunks=num_left_chunks,
-                max_batch_size=max_batch_size,
-                fst_path=fst_file,
-            )
+            cfg_kwargs = {
+                "ckpt_dir": ckpt_dir,
+                "device": "cuda",
+                "dtype": dtype,
+                "service_mode": "streaming",
+                "decoder_type": decoder_type,
+                "chunk_size": chunk_size,
+                "num_left_chunks": num_left_chunks,
+                "max_batch_size": max_batch_size,
+                "fst_path": fst_file,
+            }
             if decode_method is not None:
                 cfg_kwargs["decode_method"] = decode_method
             if use_cuda_graphs is not None:

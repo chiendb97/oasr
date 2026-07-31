@@ -18,8 +18,7 @@ def _get_core():
     _C = importlib.import_module("oasr._C")
     if not getattr(_C.decoder, "k2_available", False):
         raise RuntimeError(
-            "K2 WFST decoder is not available. "
-            "Rebuild with OASR_USE_K2=1 to enable it."
+            "K2 WFST decoder is not available. " "Rebuild with OASR_USE_K2=1 to enable it."
         )
     return _C.decoder._WfstBeamSearchCore
 

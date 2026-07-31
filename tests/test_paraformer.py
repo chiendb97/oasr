@@ -11,19 +11,18 @@ transcript for ``example/asr_example.wav``.
 
 import os
 
+import assets
 import numpy as np
 import pytest
 import torch
 
-PARA_CKPT = os.environ.get(
-    "OASR_PARAFORMER_CKPT", "/data01/kilm/users/chiendb/models/asr/paraformer-zh"
-)
-REF_PT = os.path.join(PARA_CKPT, "oasr_ref", "ref.pt")
+# Declared once in tests/assets.py so --strict-assets can make a missing
+# checkpoint fatal instead of silently green.
+PARA_CKPT = assets.declared("OASR_PARAFORMER_CKPT")
+REF_PT = os.path.join(assets.declared("OASR_PARAFORMER_REF"), "ref.pt")
 
-has_ckpt = os.path.exists(os.path.join(PARA_CKPT, "model.pt"))
-has_ref = os.path.exists(REF_PT)
-needs_ckpt = pytest.mark.skipif(not has_ckpt, reason=f"no paraformer checkpoint at {PARA_CKPT}")
-needs_ref = pytest.mark.skipif(not has_ref, reason=f"no FunASR reference capture at {REF_PT}")
+needs_ckpt = pytest.mark.requires_assets("OASR_PARAFORMER_CKPT")
+needs_ref = pytest.mark.requires_assets("OASR_PARAFORMER_CKPT", "OASR_PARAFORMER_REF")
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +426,7 @@ class TestEngineE2E:
         import torchaudio
 
         wav = torchaudio.load(os.path.join(PARA_CKPT, "example", "asr_example.wav"))[0].squeeze(0)
-        rid = engine.add_request(wav, request_id="ts", streaming=False)
+        engine.add_request(wav, request_id="ts", streaming=False)
         outs = []
         while not outs:
             outs = engine.step()

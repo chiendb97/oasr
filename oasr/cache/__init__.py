@@ -47,16 +47,16 @@ Per-request usage (paged-only)::
     ctx.free()
 """
 
-from oasr.cache.types import CacheConfig
-from oasr.cache.block_pool import BlockPool
-from oasr.cache.paged_kv import PagedKVCache
-from oasr.cache.slot_cnn import SlotCnnCache
-from oasr.cache.slot_pool import StreamSlotPool
 from oasr.cache.attention_cache import AttentionCacheManager
+from oasr.cache.block_pool import BlockPool
 from oasr.cache.cnn_cache import CnnCacheManager
 from oasr.cache.ctc_state import CtcStateCacheManager
 from oasr.cache.decoder_kv import DecoderKVCacheManager
+from oasr.cache.paged_kv import PagedKVCache
+from oasr.cache.slot_cnn import SlotCnnCache
+from oasr.cache.slot_pool import StreamSlotPool
 from oasr.cache.stream import StreamContext
+from oasr.cache.types import CacheConfig
 
 __all__ = [
     "CacheConfig",

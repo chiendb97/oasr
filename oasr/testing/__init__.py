@@ -54,21 +54,15 @@ def bench_gpu_time(
         try:
             import triton.testing as triton_testing
 
-            median_ms = triton_testing.do_bench(
-                _run, warmup=dry_run_iters, rep=repeat_iters
-            )
+            median_ms = triton_testing.do_bench(_run, warmup=dry_run_iters, rep=repeat_iters)
             # Quick std estimate via CUDA events
-            _, std_s = _cuda_events_bench(
-                _run, dry_run_iters=2, num_iters=min(repeat_iters, 10)
-            )
+            _, std_s = _cuda_events_bench(_run, dry_run_iters=2, num_iters=min(repeat_iters, 10))
             return median_ms * 1e-3, std_s
         except ImportError:
             pass
 
     # Fallback: CUDA events
-    return _cuda_events_bench(
-        _run, dry_run_iters=dry_run_iters, num_iters=repeat_iters
-    )
+    return _cuda_events_bench(_run, dry_run_iters=dry_run_iters, num_iters=repeat_iters)
 
 
 def _cuda_events_bench(

@@ -43,7 +43,9 @@ def _read_backend_mode() -> str:
     if mode not in _VALID_BACKENDS:
         logger.warning(
             "%s=%r is invalid; valid choices are %s. Falling back to 'auto'.",
-            _BACKEND_ENV, mode, _VALID_BACKENDS,
+            _BACKEND_ENV,
+            mode,
+            _VALID_BACKENDS,
         )
         mode = "auto"
     return mode
@@ -78,6 +80,7 @@ def set_backend_mode(mode: str) -> None:
 # Capability probe
 # ---------------------------------------------------------------------------
 
+
 @functools.cache
 def _capability_probe() -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
     """Detect (major, minor) compute capability and which backend is usable.
@@ -88,6 +91,7 @@ def _capability_probe() -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
     """
     try:
         import torch
+
         if not torch.cuda.is_available():
             return None, "sdpa"
         cap = torch.cuda.get_device_capability()
@@ -105,13 +109,15 @@ def _capability_probe() -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
         # re-raise in 'cute'.
         try:
             from oasr.kernels.cute.attention.base import pick_arch_cls
+
             pick_arch_cls(*cap)
         except Exception as exc:
             if _BACKEND_MODE == "cute":
                 raise
             logger.warning(
                 "OASR CuteDSL attention requested but CuteDSL import failed (%s); "
-                "falling back to PyTorch SDPA.", exc,
+                "falling back to PyTorch SDPA.",
+                exc,
             )
             return cap, "sdpa"
         return cap, "cute"
@@ -142,6 +148,7 @@ def select_backend() -> str:
 # this moves the one-time probe cost out of the first ``fmha()`` call.
 try:
     import torch as _torch_probe
+
     if _torch_probe.cuda.is_available():
         _RESOLVED_BACKEND = _capability_probe()[1]
     del _torch_probe
@@ -155,11 +162,12 @@ except Exception:
 # Compile cache
 # ---------------------------------------------------------------------------
 
+
 @functools.cache
 def _compiled_fmha(
     arch: Tuple[int, int],
     head_dim: int,
-    dtype_str: str,                  # "float16" or "bfloat16"
+    dtype_str: str,  # "float16" or "bfloat16"
     num_heads: int,
     num_kv_heads: int,
     has_bias: bool,
@@ -190,12 +198,17 @@ def _compiled_fmha(
         raise ValueError(f"unsupported dtype {dtype_str!r} (need float16 or bfloat16)")
 
     from oasr.kernels.cute.attention.base import pick_arch_cls
+
     cls = pick_arch_cls(*arch)
     if not cls.can_implement(
-        dtype=cute_dtype, head_dim=head_dim,
-        m_block_size=m_block, n_block_size=n_block,
-        num_threads=num_threads, has_bias=has_bias,
-        paged=paged, block_size=block_size,
+        dtype=cute_dtype,
+        head_dim=head_dim,
+        m_block_size=m_block,
+        n_block_size=n_block,
+        num_threads=num_threads,
+        has_bias=has_bias,
+        paged=paged,
+        block_size=block_size,
         bias_aligned=bias_aligned,
     ):
         raise RuntimeError(
@@ -206,10 +219,16 @@ def _compiled_fmha(
             f"bias_aligned={bias_aligned}"
         )
     inst = cls(
-        head_dim=head_dim, dtype=cute_dtype,
-        num_heads=num_heads, num_kv_heads=num_kv_heads,
-        has_bias=has_bias, paged=paged, block_size=block_size,
-        m_block_size=m_block, n_block_size=n_block, num_threads=num_threads,
+        head_dim=head_dim,
+        dtype=cute_dtype,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        has_bias=has_bias,
+        paged=paged,
+        block_size=block_size,
+        m_block_size=m_block,
+        n_block_size=n_block,
+        num_threads=num_threads,
         bias_aligned=bias_aligned,
     )
 
@@ -227,16 +246,12 @@ def _compiled_fmha(
         # use ``max_blocks_per_seq * block_size``.
         max_blocks_per_seq = max(n_block // block_size, 1)
         num_blocks = max(max_blocks_per_seq, 2)
-        k = torch.empty(num_blocks, block_size, H_kv, head_dim,
-                        dtype=torch_dtype, device=device)
-        v = torch.empty(num_blocks, block_size, H_kv, head_dim,
-                        dtype=torch_dtype, device=device)
+        k = torch.empty(num_blocks, block_size, H_kv, head_dim, dtype=torch_dtype, device=device)
+        v = torch.empty(num_blocks, block_size, H_kv, head_dim, dtype=torch_dtype, device=device)
         T_k_logical = max_blocks_per_seq * block_size
     else:
-        k = torch.empty(B, H_kv, T_k_dense, head_dim,
-                        dtype=torch_dtype, device=device)
-        v = torch.empty(B, H_kv, T_k_dense, head_dim,
-                        dtype=torch_dtype, device=device)
+        k = torch.empty(B, H_kv, T_k_dense, head_dim, dtype=torch_dtype, device=device)
+        v = torch.empty(B, H_kv, T_k_dense, head_dim, dtype=torch_dtype, device=device)
         T_k_logical = T_k_dense
 
     # cp.async with 128-bit copies requires the head-dim ptr to be
@@ -257,6 +272,7 @@ def _compiled_fmha(
     # uses (cute_dsl_utils.py::to_cute_tensor with enable_tvm_ffi=True).
     elem_bits = 16 if dtype_str == "float16" else 16  # bf16 is also 16b
     align_div = 128 // elem_bits
+
     def _wrap(t: torch.Tensor) -> "cute.Tensor":
         return (
             from_dlpack(t, assumed_align=16, enable_tvm_ffi=True)
@@ -268,47 +284,60 @@ def _compiled_fmha(
             )
         )
 
-    mQ = _wrap(q); mK = _wrap(k); mV = _wrap(v); mO = _wrap(o)
+    mQ = _wrap(q)
+    mK = _wrap(k)
+    mV = _wrap(v)
+    mO = _wrap(o)
     if has_bias:
-        bias = torch.empty(B, H, T_q, T_k_logical,
-                           dtype=torch_dtype, device=device)
+        bias = torch.empty(B, H, T_q, T_k_logical, dtype=torch_dtype, device=device)
         mBias = _wrap(bias)
     else:
         # Zero-rank dummy: cute.rank(mBias) > 0 in the kernel == False.
         mBias = from_dlpack(
             torch.empty((), dtype=torch_dtype, device=device),
-            assumed_align=16, enable_tvm_ffi=True,
+            assumed_align=16,
+            enable_tvm_ffi=True,
         )
 
     seqlens = torch.zeros(B, dtype=torch.int32, device=device)
-    mCacheSeqlens = (
-        from_dlpack(seqlens, assumed_align=4, enable_tvm_ffi=True)
-        .mark_layout_dynamic(leading_dim=0)
+    mCacheSeqlens = from_dlpack(seqlens, assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
+        leading_dim=0
     )
 
     if paged:
         block_table = torch.zeros(
-            B, max(n_block // block_size, 1),
-            dtype=torch.int32, device=device,
+            B,
+            max(n_block // block_size, 1),
+            dtype=torch.int32,
+            device=device,
         )
-        mBlockTable = (
-            from_dlpack(block_table, assumed_align=4, enable_tvm_ffi=True)
-            .mark_layout_dynamic(leading_dim=block_table.dim() - 1)
-        )
+        mBlockTable = from_dlpack(
+            block_table, assumed_align=4, enable_tvm_ffi=True
+        ).mark_layout_dynamic(leading_dim=block_table.dim() - 1)
     else:
         # Zero-rank dummy when paged=False; kernel never reads it.
         mBlockTable = from_dlpack(
             torch.empty((), dtype=torch.int32, device=device),
-            assumed_align=4, enable_tvm_ffi=True,
+            assumed_align=4,
+            enable_tvm_ffi=True,
         )
 
     import cuda.bindings.driver as cuda_driver
+
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    softmax_scale = cutlass.Float32(1.0 / (head_dim ** 0.5))
+    softmax_scale = cutlass.Float32(1.0 / (head_dim**0.5))
     return cute.compile(
-        inst, mQ, mK, mV, mO, mBias, mCacheSeqlens, mBlockTable,
-        softmax_scale, stream,
+        inst,
+        mQ,
+        mK,
+        mV,
+        mO,
+        mBias,
+        mCacheSeqlens,
+        mBlockTable,
+        softmax_scale,
+        stream,
         options="--enable-tvm-ffi",
     )
 
@@ -332,9 +361,17 @@ def get_compiled_fmha(
     if cap is None:
         raise RuntimeError("no CUDA device available")
     return _compiled_fmha(
-        cap, head_dim, dtype_str, num_heads, num_kv_heads,
-        has_bias, paged, block_size,
-        m_block, n_block, num_threads,
+        cap,
+        head_dim,
+        dtype_str,
+        num_heads,
+        num_kv_heads,
+        has_bias,
+        paged,
+        block_size,
+        m_block,
+        n_block,
+        num_threads,
         bias_aligned,
     )
 
@@ -342,6 +379,7 @@ def get_compiled_fmha(
 # ---------------------------------------------------------------------------
 # Variable-length (sequence-packed) compile cache
 # ---------------------------------------------------------------------------
+
 
 @functools.cache
 def _compiled_fmha_varlen(
@@ -377,19 +415,31 @@ def _compiled_fmha_varlen(
         raise ValueError(f"unsupported dtype {dtype_str!r}")
 
     from oasr.kernels.cute.attention.base import pick_arch_cls
+
     cls = pick_arch_cls(*arch)
     if not cls.can_implement(
-        dtype=cute_dtype, head_dim=head_dim,
-        m_block_size=m_block, n_block_size=n_block,
-        num_threads=num_threads, has_bias=has_bias,
-        paged=False, varlen=True, bias_aligned=bias_aligned,
+        dtype=cute_dtype,
+        head_dim=head_dim,
+        m_block_size=m_block,
+        n_block_size=n_block,
+        num_threads=num_threads,
+        has_bias=has_bias,
+        paged=False,
+        varlen=True,
+        bias_aligned=bias_aligned,
     ):
         raise RuntimeError("FmhaSm80.can_implement(varlen=True) returned False")
     inst = cls(
-        head_dim=head_dim, dtype=cute_dtype,
-        num_heads=num_heads, num_kv_heads=num_kv_heads,
-        has_bias=has_bias, paged=False, varlen=True,
-        m_block_size=m_block, n_block_size=n_block, num_threads=num_threads,
+        head_dim=head_dim,
+        dtype=cute_dtype,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        has_bias=has_bias,
+        paged=False,
+        varlen=True,
+        m_block_size=m_block,
+        n_block_size=n_block,
+        num_threads=num_threads,
         bias_aligned=bias_aligned,
     )
 
@@ -411,7 +461,9 @@ def _compiled_fmha_varlen(
             from_dlpack(t, assumed_align=16, enable_tvm_ffi=True)
             .mark_layout_dynamic(leading_dim=t.dim() - 1)
             .mark_compact_shape_dynamic(
-                mode=t.dim() - 1, stride_order=t.dim_order(), divisibility=align_div,
+                mode=t.dim() - 1,
+                stride_order=t.dim_order(),
+                divisibility=align_div,
             )
         )
 
@@ -419,39 +471,53 @@ def _compiled_fmha_varlen(
 
     if has_bias:
         bias = torch.empty(H * total_q * total_k, dtype=torch_dtype, device=device)
-        mBias = (
-            from_dlpack(bias, assumed_align=16, enable_tvm_ffi=True)
-            .mark_layout_dynamic(leading_dim=0)
+        mBias = from_dlpack(bias, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
+            leading_dim=0
         )
         bias_off = torch.zeros(S + 1, dtype=torch.int32, device=device)
-        mBiasOff = (
-            from_dlpack(bias_off, assumed_align=4, enable_tvm_ffi=True)
-            .mark_layout_dynamic(leading_dim=0)
+        mBiasOff = from_dlpack(bias_off, assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
+            leading_dim=0
         )
     else:
         mBias = from_dlpack(
             torch.empty((), dtype=torch_dtype, device=device),
-            assumed_align=16, enable_tvm_ffi=True,
+            assumed_align=16,
+            enable_tvm_ffi=True,
         )
         mBiasOff = from_dlpack(
             torch.empty((), dtype=torch.int32, device=device),
-            assumed_align=4, enable_tvm_ffi=True,
+            assumed_align=4,
+            enable_tvm_ffi=True,
         )
 
     cu_q = torch.zeros(S + 1, dtype=torch.int32, device=device)
     cu_k = torch.zeros(S + 1, dtype=torch.int32, device=device)
-    mCuQ = from_dlpack(cu_q, assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
-    mCuK = from_dlpack(cu_k, assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
+    mCuQ = from_dlpack(cu_q, assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
+        leading_dim=0
+    )
+    mCuK = from_dlpack(cu_k, assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
+        leading_dim=0
+    )
 
     import cuda.bindings.driver as cuda_driver
+
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    softmax_scale = cutlass.Float32(1.0 / (head_dim ** 0.5))
+    softmax_scale = cutlass.Float32(1.0 / (head_dim**0.5))
     max_seqlen_q = cutlass.Int32(max(m_block, 8))
 
     return cute.compile(
         inst.forward_varlen,
-        mQ, mK, mV, mO, mBias, mBiasOff, mCuQ, mCuK,
-        max_seqlen_q, softmax_scale, stream,
+        mQ,
+        mK,
+        mV,
+        mO,
+        mBias,
+        mBiasOff,
+        mCuQ,
+        mCuK,
+        max_seqlen_q,
+        softmax_scale,
+        stream,
         options="--enable-tvm-ffi",
     )
 
@@ -473,8 +539,16 @@ def get_compiled_fmha_varlen(
     if cap is None:
         raise RuntimeError("no CUDA device available")
     return _compiled_fmha_varlen(
-        cap, head_dim, dtype_str, num_heads, num_kv_heads,
-        has_bias, m_block, n_block, num_threads, bias_aligned,
+        cap,
+        head_dim,
+        dtype_str,
+        num_heads,
+        num_kv_heads,
+        has_bias,
+        m_block,
+        n_block,
+        num_threads,
+        bias_aligned,
     )
 
 
@@ -482,15 +556,16 @@ def get_compiled_fmha_varlen(
 # Warmup helper
 # ---------------------------------------------------------------------------
 
+
 def warmup_fmha(
     *,
     n_head: int,
     n_kv_head: int,
     head_dim: int,
-    max_batch_size: int,         # noqa: ARG001 -- reserved for future use
-    chunk_size: int,             # noqa: ARG001
-    max_attention_key_size: int, # noqa: ARG001
-    device: Any,                 # noqa: ARG001
+    max_batch_size: int,  # noqa: ARG001 -- reserved for future use
+    chunk_size: int,  # noqa: ARG001
+    max_attention_key_size: int,  # noqa: ARG001
+    device: Any,  # noqa: ARG001
     dtype: Any,
 ) -> None:
     """Eagerly populate the compile cache for a given Conformer config.
@@ -502,17 +577,20 @@ def warmup_fmha(
         return
     import torch
 
-    dtype_str = "float16" if dtype == torch.float16 else (
-        "bfloat16" if dtype == torch.bfloat16 else None
+    dtype_str = (
+        "float16" if dtype == torch.float16 else ("bfloat16" if dtype == torch.bfloat16 else None)
     )
     if dtype_str is None:
         return
     for has_bias in (False, True):
         try:
             get_compiled_fmha(
-                head_dim=head_dim, dtype_str=dtype_str,
-                num_heads=n_head, num_kv_heads=n_kv_head,
-                has_bias=has_bias, paged=False,
+                head_dim=head_dim,
+                dtype_str=dtype_str,
+                num_heads=n_head,
+                num_kv_heads=n_kv_head,
+                has_bias=has_bias,
+                paged=False,
             )
         except Exception as exc:
             logger.warning("warmup_fmha (has_bias=%s) failed: %s", has_bias, exc)

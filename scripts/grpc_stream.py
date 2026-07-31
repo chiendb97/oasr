@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.util
-import os
 import shutil
 import sys
 import tempfile
@@ -44,13 +43,12 @@ def _gen_stubs(proto_path: Path):
     try:
         from grpc_tools import protoc
     except ImportError as e:
-        sys.stderr.write(
-            "missing grpcio-tools (install with `pip install grpcio grpcio-tools`)\n"
-        )
+        sys.stderr.write("missing grpcio-tools (install with `pip install grpcio grpcio-tools`)\n")
         raise SystemExit(1) from e
-    if shutil.which("protoc") is None and not (
-        Path(sys.prefix) / "lib" / "site-packages" / "grpc_tools"
-    ).exists():
+    if (
+        shutil.which("protoc") is None
+        and not (Path(sys.prefix) / "lib" / "site-packages" / "grpc_tools").exists()
+    ):
         # grpc_tools bundles its own protoc; just use the entry point.
         pass
 
@@ -92,16 +90,15 @@ async def run(addr: str, wav: Path, chunk_ms: int, proto: Path) -> int:
             )
             yield pb.StreamingRecognizeRequest(
                 streaming_config=pb.StreamingRecognitionConfig(
-                    config=cfg, interim_results=True,
+                    config=cfg,
+                    interim_results=True,
                 )
             )
             for i in range(0, len(samples), chunk_samples):
-                chunk = samples[i:i + chunk_samples]
+                chunk = samples[i : i + chunk_samples]
                 if chunk.size == 0:
                     break
-                yield pb.StreamingRecognizeRequest(
-                    audio_content=chunk.astype("<f4").tobytes()
-                )
+                yield pb.StreamingRecognizeRequest(audio_content=chunk.astype("<f4").tobytes())
 
         responses = stub.StreamingRecognize(requests())
         async for resp in responses:

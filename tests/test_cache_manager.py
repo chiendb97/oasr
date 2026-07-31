@@ -24,7 +24,6 @@ from oasr.cache import (
     CtcStateCacheManager,
     StreamContext,
 )
-from oasr.cache.attention_cache import _StreamKVState
 
 # ---------------------------------------------------------------------------
 # Fixtures

@@ -57,9 +57,7 @@ class SentencePieceTokenizer(Tokenizer):
         # turn a junk frame into a failed request (and, under the batched
         # admit path, take its batch-mates with it), so drop them instead.
         n = self.vocab_size
-        filtered = [
-            int(t) for t in ids if t not in self._special_ids and 0 <= int(t) < n
-        ]
+        filtered = [int(t) for t in ids if t not in self._special_ids and 0 <= int(t) < n]
         if not filtered:
             return ""
         return self._sp.DecodeIds(filtered)

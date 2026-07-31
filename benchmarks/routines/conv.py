@@ -246,7 +246,9 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch", type=int, default=None, help="Batch size")
     parser.add_argument("--seq", type=int, default=None, help="Sequence length (1D conv)")
     parser.add_argument("--channels", type=int, default=None, help="Input channels")
-    parser.add_argument("--out-channels", type=int, default=None, help="Output channels (pointwise)")
+    parser.add_argument(
+        "--out-channels", type=int, default=None, help="Output channels (pointwise)"
+    )
     parser.add_argument("--kernel-size", type=int, default=None, help="Kernel size (1D conv)")
     parser.add_argument("--height", type=int, default=None, help="Input height (2D conv)")
     parser.add_argument("--width", type=int, default=None, help="Input width (2D conv)")
@@ -255,12 +257,16 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--filter-w", type=int, default=3, help="Filter width (2D conv)")
     parser.add_argument("--pad", type=int, default=0, help="Padding")
     parser.add_argument("--stride", type=int, default=1, help="Stride")
-    parser.add_argument("--activation", type=str, default=None, help="Activation (swish, relu, gelu)")
-    parser.add_argument("--autotune", action="store_true",
-                        help="Enable autotuning for pointwise_conv1d subroutines")
+    parser.add_argument(
+        "--activation", type=str, default=None, help="Activation (swish, relu, gelu)"
+    )
+    parser.add_argument(
+        "--autotune", action="store_true", help="Enable autotuning for pointwise_conv1d subroutines"
+    )
     parser.add_argument("--cache", type=str, default=None, help="Autotune cache file path")
-    parser.add_argument("--no-tune", action="store_true",
-                        help="Use cached configs only (no profiling)")
+    parser.add_argument(
+        "--no-tune", action="store_true", help="Use cached configs only (no profiling)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -270,13 +276,15 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
 
 def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     subroutine = getattr(args, "subroutine", "depthwise_conv1d")
-    if (
-        getattr(args, "autotune", False)
-        and subroutine in ("pointwise_conv1d", "pointwise_conv1d_activation")
+    if getattr(args, "autotune", False) and subroutine in (
+        "pointwise_conv1d",
+        "pointwise_conv1d_activation",
     ):
         tune_mode = not getattr(args, "no_tune", False)
         cache = getattr(args, "cache", None)
-        _benchmark_pointwise_conv1d_autotune(args, subroutine, tune_mode=tune_mode, cache_path=cache)
+        _benchmark_pointwise_conv1d_autotune(
+            args, subroutine, tune_mode=tune_mode, cache_path=cache
+        )
         return
 
     dtype_str = getattr(args, "dtype", "float16")
@@ -318,16 +326,18 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
                 use_cuda_events=use_cuda_events,
             )
             tflops = _compute_tflops(subroutine, cfg, median_ms)
-            output.write_result(BenchResult(
-                routine="conv",
-                subroutine=subroutine,
-                backend=backend,
-                shape=shape_str,
-                dtype=dtype_str,
-                median_ms=median_ms,
-                std_ms=std_ms,
-                tflops=tflops,
-            ))
+            output.write_result(
+                BenchResult(
+                    routine="conv",
+                    subroutine=subroutine,
+                    backend=backend,
+                    shape=shape_str,
+                    dtype=dtype_str,
+                    median_ms=median_ms,
+                    std_ms=std_ms,
+                    tflops=tflops,
+                )
+            )
 
 
 def _resolve_configs(args, subroutine):
@@ -345,7 +355,9 @@ def _resolve_conv1d_configs(args, subroutine):
 
     if subroutine in ("pointwise_conv1d", "pointwise_conv1d_activation"):
         if all(v is not None for v in [batch, seq, channels, out_channels]):
-            return [{"batch": batch, "seq": seq, "channels": channels, "out_channels": out_channels}]
+            return [
+                {"batch": batch, "seq": seq, "channels": channels, "out_channels": out_channels}
+            ]
     elif all(v is not None for v in [batch, seq, channels, kernel_size]):
         return [{"batch": batch, "seq": seq, "channels": channels, "kernel_size": kernel_size}]
 
@@ -364,7 +376,9 @@ def _resolve_conv2d_configs(args, subroutine):
     stride = getattr(args, "stride", 1)
 
     if all(v is not None for v in [N, H, W, IC, K]):
-        return [{"N": N, "H": H, "W": W, "IC": IC, "K": K, "R": R, "S": S, "pad": pad, "stride": stride}]
+        return [
+            {"N": N, "H": H, "W": W, "IC": IC, "K": K, "R": R, "S": S, "pad": pad, "stride": stride}
+        ]
 
     return DEFAULT_CONFIGS.get(subroutine, [])
 
@@ -388,13 +402,29 @@ def _setup_for_config(subroutine, cfg, dtype):
         )
     elif subroutine == "conv2d":
         return setup_conv2d(
-            cfg["N"], cfg["H"], cfg["W"], cfg["IC"], cfg["K"],
-            cfg["R"], cfg["S"], cfg["pad"], cfg["stride"], dtype,
+            cfg["N"],
+            cfg["H"],
+            cfg["W"],
+            cfg["IC"],
+            cfg["K"],
+            cfg["R"],
+            cfg["S"],
+            cfg["pad"],
+            cfg["stride"],
+            dtype,
         )
     elif subroutine == "conv2d_activation":
         return setup_conv2d_activation(
-            cfg["N"], cfg["H"], cfg["W"], cfg["IC"], cfg["K"],
-            cfg["R"], cfg["S"], cfg["pad"], cfg["stride"], dtype=dtype,
+            cfg["N"],
+            cfg["H"],
+            cfg["W"],
+            cfg["IC"],
+            cfg["K"],
+            cfg["R"],
+            cfg["S"],
+            cfg["pad"],
+            cfg["stride"],
+            dtype=dtype,
         )
     else:
         raise ValueError(f"Unknown conv subroutine: {subroutine}")
@@ -431,7 +461,12 @@ def _shape_str(subroutine, cfg):
 
 def get_fn_map(subroutine, oasr_fn, pytorch_fn):
     """Return {backend_name: fn} for conv subroutines."""
-    if subroutine in ("conv2d", "conv2d_activation", "pointwise_conv1d", "pointwise_conv1d_activation"):
+    if subroutine in (
+        "conv2d",
+        "conv2d_activation",
+        "pointwise_conv1d",
+        "pointwise_conv1d_activation",
+    ):
         return {"cutlass": oasr_fn, "torch": pytorch_fn}
     return {"cuda": oasr_fn, "torch": pytorch_fn}
 
@@ -461,6 +496,7 @@ def _benchmark_pointwise_conv1d_autotune(args, subroutine, *, tune_mode=True, ca
     print()
 
     from benchmarks.routines.bench_utils import parse_dtype
+
     dtype_str = getattr(args, "dtype", "float16")
     dtype = parse_dtype(dtype_str)
 
@@ -501,6 +537,7 @@ def _benchmark_pointwise_conv1d_autotune(args, subroutine, *, tune_mode=True, ca
                 config_str = "default"
 
             import oasr.tune as _tune_mod
+
             prev = _tune_mod._enabled
             _tune_mod._enabled = False
             default_fn, _ = _setup_for_config(subroutine, cfg, dtype)
@@ -564,12 +601,18 @@ def run_standalone(variant: str = "depthwise_conv1d") -> None:
                 for backend, fn in get_fn_map(sub, oasr_fn, pytorch_fn).items():
                     median_ms, std_ms = bench_fn(fn)
                     tflops = _compute_tflops(sub, cfg, median_ms)
-                    output.write_result(BenchResult(
-                        routine="conv", subroutine=sub, backend=backend,
-                        shape=shape_str, dtype="float16",
-                        median_ms=median_ms, std_ms=std_ms,
-                        tflops=tflops,
-                    ))
+                    output.write_result(
+                        BenchResult(
+                            routine="conv",
+                            subroutine=sub,
+                            backend=backend,
+                            shape=shape_str,
+                            dtype="float16",
+                            median_ms=median_ms,
+                            std_ms=std_ms,
+                            tflops=tflops,
+                        )
+                    )
         output.finalize()
 
     run_main(title, pcfg, setup_funcs, benchmark)

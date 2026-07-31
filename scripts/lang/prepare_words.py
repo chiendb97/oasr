@@ -35,7 +35,6 @@ import argparse
 import sys
 from pathlib import Path
 
-
 # Leading symbols: fixed low IDs (must stay before real words).
 LEADING_SYMBOLS = ["<eps>", "<UNK>"]
 # Trailing symbols: disambiguation / sentence-boundary — MUST come after all
@@ -96,8 +95,7 @@ def main():
 
     all_special = set(LEADING_SYMBOLS + TRAILING_SYMBOLS)
     words = sorted(
-        w for w, c in word_counts.items()
-        if c >= args.min_count and w not in all_special
+        w for w, c in word_counts.items() if c >= args.min_count and w not in all_special
     )
 
     out_path = lang_dir / "words.txt"

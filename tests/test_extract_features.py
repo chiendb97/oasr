@@ -15,11 +15,9 @@ import torch
 torchaudio = pytest.importorskip("torchaudio")
 import torchaudio.compliance.kaldi as kaldi  # noqa: E402
 
-import oasr  # noqa: E402
 from oasr.feature import dct_lifter, fbank_preprocess, mel_log  # noqa: E402
 from oasr.features import FeatureConfig  # noqa: E402
 from oasr.layers import Fbank, Mfcc  # noqa: E402
-
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -93,8 +91,12 @@ class TestFbankPreprocess:
         x = torch.randn(2, 8, 200, device="cuda", dtype=torch.float32)
         w = torch.ones(200, device="cuda", dtype=torch.float32)
         out = fbank_preprocess(
-            x, w, n_fft=256, preemph_coef=0.0,
-            remove_dc_offset=False, apply_preemph=False,
+            x,
+            w,
+            n_fft=256,
+            preemph_coef=0.0,
+            remove_dc_offset=False,
+            apply_preemph=False,
         )
         # With no DC removal, no preemph, unit window: out is just zero-padded x.
         ref = torch.nn.functional.pad(x, (0, 56))
@@ -179,16 +181,12 @@ class TestFbank:
 
         ref = _kaldi_fbank(wav, cfg)
         # Drop the synthetic batch dim from torchaudio output.
-        torch.testing.assert_close(
-            feats[0, : feat_lens[0]], ref.to("cuda"), rtol=1e-3, atol=1e-2
-        )
+        torch.testing.assert_close(feats[0, : feat_lens[0]], ref.to("cuda"), rtol=1e-3, atol=1e-2)
 
     def test_batched(self):
         cfg = FeatureConfig(num_mel_bins=80)
         fb = Fbank(cfg).cuda()
-        wavs = torch.stack(
-            [_make_sine(16000, 1.0), _make_sine(16000, 1.0, freq=440.0)], dim=0
-        )
+        wavs = torch.stack([_make_sine(16000, 1.0), _make_sine(16000, 1.0, freq=440.0)], dim=0)
         feats, feat_lens = fb(wavs.cuda())
 
         for i in range(2):
@@ -248,9 +246,7 @@ class TestMfcc:
         feats, feat_lens = mf(wav.cuda())
 
         ref = _kaldi_mfcc(wav, cfg)
-        torch.testing.assert_close(
-            feats[0, : feat_lens[0]], ref.to("cuda"), rtol=1e-3, atol=1e-2
-        )
+        torch.testing.assert_close(feats[0, : feat_lens[0]], ref.to("cuda"), rtol=1e-3, atol=1e-2)
 
     def test_output_shape_and_dtype(self):
         cfg = FeatureConfig(feature_type="mfcc", num_mel_bins=23, num_ceps=13)
@@ -261,8 +257,7 @@ class TestMfcc:
         assert feats.dtype == torch.float32
 
     def test_no_lifter(self):
-        cfg = FeatureConfig(feature_type="mfcc", num_mel_bins=23, num_ceps=13,
-                            cepstral_lifter=0.0)
+        cfg = FeatureConfig(feature_type="mfcc", num_mel_bins=23, num_ceps=13, cepstral_lifter=0.0)
         mf = Mfcc(cfg).cuda()
         # Just verify it runs and produces sensible output.
         wav = torch.randn(1, 16000, device="cuda")

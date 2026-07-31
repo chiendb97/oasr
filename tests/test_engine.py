@@ -9,7 +9,6 @@ import os
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -17,18 +16,6 @@ import torch
 # ---------------------------------------------------------------------------
 # Helpers (paths from conftest: --ckpt-dir / CKPT_DIR, --wav-dir / WAV_DIR)
 # ---------------------------------------------------------------------------
-
-
-def _require_ckpt(ckpt_dir: str) -> None:
-    if not ckpt_dir or not Path(ckpt_dir).exists():
-        pytest.skip("WeNet checkpoint dir not set or not found; set CKPT_DIR env var or --ckpt-dir")
-
-
-def _require_wav_dir(wav_dir: str) -> None:
-    if not wav_dir or not Path(wav_dir).is_dir():
-        pytest.skip("WAV directory not set or not found; use --wav-dir or WAV_DIR")
-    if not glob.glob(os.path.join(wav_dir, "*.wav")):
-        pytest.skip("No .wav files found in WAV directory")
 
 
 def _wav_path(wav_dir: str, n: int = 0) -> str:
@@ -83,7 +70,6 @@ class TestEngineConfig:
     def test_autodetect_sentencepiece(self, ckpt_dir: str):
         from oasr.engine.config import EngineConfig
 
-        _require_ckpt(ckpt_dir)
         cfg = EngineConfig(ckpt_dir=ckpt_dir)
         assert cfg.sentencepiece_model is not None
         assert cfg.sentencepiece_model.endswith(".model")
@@ -92,7 +78,6 @@ class TestEngineConfig:
     def test_autodetect_unit_table(self, ckpt_dir: str):
         from oasr.engine.config import EngineConfig
 
-        _require_ckpt(ckpt_dir)
         cfg = EngineConfig(ckpt_dir=ckpt_dir)
         assert cfg.unit_table is not None
         assert os.path.exists(cfg.unit_table)
@@ -136,7 +121,6 @@ class TestRequest:
         assert not req.has_pending_audio
 
     def test_has_pending_audio_true_after_enqueue(self):
-        from collections import deque
 
         from oasr.engine.request import Request
 
@@ -166,7 +150,6 @@ class TestScheduler:
         return cfg
 
     def _make_request(self, n_chunks=3):
-        from collections import deque
 
         from oasr.engine.request import Request
 
@@ -300,7 +283,6 @@ class TestOutputProcessorDetokenize:
         from oasr.engine.config import EngineConfig
         from oasr.engine.output_processor import OutputProcessor
 
-        _require_ckpt(ckpt_dir)
         cfg = EngineConfig(ckpt_dir=ckpt_dir)
         # The engine stamps ``_model_config`` after loading the checkpoint; the
         # CTC strategy needs its ``vocab_size`` to size the beam state and now
@@ -343,16 +325,12 @@ class TestOfflineTranscribe:
         return ASREngine(cfg)
 
     def test_transcribe_single(self, device, ckpt_dir: str, wav_dir: str):
-        _require_ckpt(ckpt_dir)
-        _require_wav_dir(wav_dir)
         engine = self._make_engine(ckpt_dir, device)
         text = engine.transcribe_offline(_wav_waveform(wav_dir, 0))
         assert isinstance(text, str)
         assert len(text) > 0
 
     def test_transcribe_batch(self, device, ckpt_dir: str, wav_dir: str):
-        _require_ckpt(ckpt_dir)
-        _require_wav_dir(wav_dir)
         wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
         if len(wavs) < 4:
             pytest.skip(f"Need at least 4 .wav files in WAV directory, found {len(wavs)}")
@@ -384,16 +362,12 @@ class TestASREngine:
         return ASREngine(cfg)
 
     def test_transcribe_single(self, device, ckpt_dir: str, wav_dir: str):
-        _require_ckpt(ckpt_dir)
-        _require_wav_dir(wav_dir)
         engine = self._make_engine(ckpt_dir, device)
         text = engine.transcribe(_wav_waveform(wav_dir, 0))
         assert isinstance(text, str)
         assert len(text) > 0
 
     def test_transcribe_batch(self, device, ckpt_dir: str, wav_dir: str):
-        _require_ckpt(ckpt_dir)
-        _require_wav_dir(wav_dir)
         wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
         if len(wavs) < 3:
             pytest.skip(f"Need at least 3 .wav files in WAV directory, found {len(wavs)}")
@@ -405,8 +379,6 @@ class TestASREngine:
         assert all(isinstance(t, str) and len(t) > 0 for t in texts)
 
     def test_run_returns_only_finished(self, device, ckpt_dir: str, wav_dir: str):
-        _require_ckpt(ckpt_dir)
-        _require_wav_dir(wav_dir)
         engine = self._make_engine(ckpt_dir, device)
         rid = engine.add_request(_wav_waveform(wav_dir, 0))
         results = engine.run()
@@ -436,8 +408,6 @@ class TestASREngine:
         """
         from oasr.engine import ASREngine, EngineConfig
 
-        _require_ckpt(ckpt_dir)
-        _require_wav_dir(wav_dir)
         wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
         if len(wavs) < 3:
             pytest.skip("Need at least 3 .wav files in WAV directory")
@@ -485,8 +455,6 @@ class TestASREngine:
         """
         from oasr.engine import ASREngine, EngineConfig
 
-        _require_ckpt(ckpt_dir)
-        _require_wav_dir(wav_dir)
         wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
         if len(wavs) < 4:
             pytest.skip("Need at least 4 .wav files in WAV directory")
@@ -531,8 +499,6 @@ class TestASREngine:
         assert avg_wer < 0.05, f"Batched streaming diverged too far from offline: WER={avg_wer:.3f}"
 
     def test_engine_idle_after_run(self, device, ckpt_dir: str, wav_dir: str):
-        _require_ckpt(ckpt_dir)
-        _require_wav_dir(wav_dir)
         engine = self._make_engine(ckpt_dir, device)
         engine.add_request(_wav_waveform(wav_dir, 0))
         engine.run()
@@ -543,8 +509,6 @@ class TestASREngine:
     def test_memory_cleanup_after_streaming(self, device, ckpt_dir: str, wav_dir: str):
         from oasr.engine import ASREngine, EngineConfig
 
-        _require_ckpt(ckpt_dir)
-        _require_wav_dir(wav_dir)
         wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
         if len(wavs) < 2:
             pytest.skip(f"Need at least 2 .wav files in WAV directory, found {len(wavs)}")

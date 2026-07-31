@@ -14,12 +14,12 @@ for Q/K/V, ``tile_to_shape`` helper). The implementations are OASR-native.
 
 from typing import Tuple
 
-import cutlass
 import cutlass.cute as cute
 
 
 def make_smem_swizzle_atom(
-    dtype, head_dim_block: int,
+    dtype,
+    head_dim_block: int,
 ) -> Tuple[cute.ComposedLayout, int]:
     """Build the 8x``head_dim_block`` smem swizzle atom for Q/K/V smem.
 
@@ -43,14 +43,18 @@ def make_smem_swizzle_atom(
 
 
 def make_smem_layout(
-    atom: cute.ComposedLayout, rows: int, cols: int,
+    atom: cute.ComposedLayout,
+    rows: int,
+    cols: int,
 ) -> cute.ComposedLayout:
     """Tile ``atom`` to cover the ``(rows, cols)`` smem region."""
     return cute.tile_to_shape(atom, (rows, cols), (0, 1))
 
 
 def make_v_transpose_view(
-    sV: cute.Tensor, head_dim_padded: int, n_block_size: int,
+    sV: cute.Tensor,
+    head_dim_padded: int,
+    n_block_size: int,
     num_stages: int = 1,
 ) -> cute.Tensor:
     """Return a logical k-major view of the V smem tile for the PV gemm.

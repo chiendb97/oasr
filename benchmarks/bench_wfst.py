@@ -71,11 +71,30 @@ class IntreeEngine:
         self.overflows = 0
 
     def _make(self, max_lanes, main_q_factor):
-        return int(self.mod.wfst_create_decoder(
-            self.graph, self.args.search_beam, self.args.output_beam,
-            self.args.min_active, self.args.max_active, 1,  # allow_partial
-            max_lanes, self.t_max, self.device.index,
-            main_q_factor, 3, 1, 0, 0, 0, 0, 3, 0, 0, 0))
+        return int(
+            self.mod.wfst_create_decoder(
+                self.graph,
+                self.args.search_beam,
+                self.args.output_beam,
+                self.args.min_active,
+                self.args.max_active,
+                1,  # allow_partial
+                max_lanes,
+                self.t_max,
+                self.device.index,
+                main_q_factor,
+                3,
+                1,
+                0,
+                0,
+                0,
+                0,
+                3,
+                0,
+                0,
+                0,
+            )
+        )
 
     def _decode_into(self, dec, batch, lens_t):
         g = int(batch.size(0))
@@ -130,10 +149,18 @@ class ExternalEngine:
 
     def _make(self, max_lanes, main_q_factor):
         return self.lib.GpuDecoder(
-            self.graph, search_beam=self.args.search_beam, output_beam=self.args.output_beam,
-            min_active=self.args.min_active, max_active=self.args.max_active, allow_partial=True,
-            max_lanes=max_lanes, max_frames=self.t_max, device=self.device.index,
-            main_q_factor=main_q_factor, cand_factor=3)
+            self.graph,
+            search_beam=self.args.search_beam,
+            output_beam=self.args.output_beam,
+            min_active=self.args.min_active,
+            max_active=self.args.max_active,
+            allow_partial=True,
+            max_lanes=max_lanes,
+            max_frames=self.t_max,
+            device=self.device.index,
+            main_q_factor=main_q_factor,
+            cand_factor=3,
+        )
 
     def decode(self, batch, lengths):
         outs = self.dec.decode_batch(batch.contiguous(), lengths.to(torch.int32).cpu())
@@ -175,7 +202,9 @@ def run_time(engine, gpu_batches, args):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--graph", default=str(DEFAULT_WFST_HOME / "data/hlg/primary.img"))
-    p.add_argument("--logprobs", default=str(DEFAULT_WFST_HOME / "data/logprobs/primary-ljs2000.pt"))
+    p.add_argument(
+        "--logprobs", default=str(DEFAULT_WFST_HOME / "data/logprobs/primary-ljs2000.pt")
+    )
     p.add_argument("--batch", type=int, nargs="+", default=[1, 8, 32])
     p.add_argument("--search-beam", type=float, default=20.0)
     p.add_argument("--output-beam", type=float, default=8.0)
@@ -185,8 +214,11 @@ def main():
     p.add_argument("--num-batches", type=int, default=6)
     p.add_argument("--frame-sec", type=float, default=0.04, help="seconds per frame (RTF scale)")
     p.add_argument("--device", default="cuda:0")
-    p.add_argument("--compare-external", action="store_true",
-                   help="also time the external _wfst.so build (perf A/B)")
+    p.add_argument(
+        "--compare-external",
+        action="store_true",
+        help="also time the external _wfst.so build (perf A/B)",
+    )
     p.add_argument("--wfst-home", default=str(DEFAULT_WFST_HOME))
     args = p.parse_args()
     args.max_batch = max(args.batch)
@@ -202,7 +234,9 @@ def main():
 
     for b in args.batch:
         gpu_batches = make_gpu_batches(log_probs, b, device, args.frame_sec)
-        print(f"=== B={b} beam={args.search_beam}/{args.output_beam} max_active={args.max_active} ===")
+        print(
+            f"=== B={b} beam={args.search_beam}/{args.output_beam} max_active={args.max_active} ==="
+        )
         for engine in engines:
             run_time(engine, gpu_batches, args)
         del gpu_batches

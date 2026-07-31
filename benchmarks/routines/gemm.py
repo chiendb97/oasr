@@ -162,7 +162,9 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--M", type=int, default=None, help="M dimension")
     parser.add_argument("--N", type=int, default=None, help="N dimension")
     parser.add_argument("--K", type=int, default=None, help="K dimension")
-    parser.add_argument("--batch-count", type=int, default=None, help="Batch count (bmm/group_gemm)")
+    parser.add_argument(
+        "--batch-count", type=int, default=None, help="Batch count (bmm/group_gemm)"
+    )
     parser.add_argument("--autotune", action="store_true", help="Enable autotuning (gemm only)")
     parser.add_argument("--cache", type=str, default=None, help="Autotune cache path")
     parser.add_argument("--no-tune", action="store_true", help="Use cached configs only")
@@ -180,6 +182,7 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     dtype = torch.float16
     if dtype_str:
         from benchmarks.routines.bench_utils import parse_dtype
+
         dtype = parse_dtype(dtype_str)
 
     do_check = getattr(args, "refcheck", False)
@@ -218,16 +221,18 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
                 use_cuda_events=use_cuda_events,
             )
             tflops = _compute_tflops(subroutine, cfg, median_ms)
-            output.write_result(BenchResult(
-                routine="gemm",
-                subroutine=subroutine,
-                backend=backend,
-                shape=shape_str,
-                dtype=dtype_str,
-                median_ms=median_ms,
-                std_ms=std_ms,
-                tflops=tflops,
-            ))
+            output.write_result(
+                BenchResult(
+                    routine="gemm",
+                    subroutine=subroutine,
+                    backend=backend,
+                    shape=shape_str,
+                    dtype=dtype_str,
+                    median_ms=median_ms,
+                    std_ms=std_ms,
+                    tflops=tflops,
+                )
+            )
 
 
 def _resolve_configs(args: argparse.Namespace, subroutine: str) -> list[dict]:
@@ -274,9 +279,7 @@ def _compute_tflops(subroutine: str, cfg: dict, time_ms: float) -> float:
         return compute_bmm_tflops(cfg["B"], cfg["M"], cfg["N"], cfg["K"], time_ms)
     elif subroutine == "group_gemm":
         # Approximate: num_groups * M * N * K
-        return compute_gemm_tflops(
-            cfg["num_groups"] * cfg["M"], cfg["N"], cfg["K"], time_ms
-        )
+        return compute_gemm_tflops(cfg["num_groups"] * cfg["M"], cfg["N"], cfg["K"], time_ms)
     else:  # gemm, gemm_activation
         return compute_gemm_tflops(cfg["M"], cfg["N"], cfg["K"], time_ms)
 
@@ -334,8 +337,13 @@ def _run_standalone_gemm() -> None:
         kernels = list(PROFILE_CONFIGS.keys()) if "all" in args.kernel else args.kernel
         setup_funcs = {"gemm": lambda: setup_gemm(*PROFILE_CONFIGS["gemm"])}
         run_profile(
-            "GEMM Kernel", {"gemm": PROFILE_CONFIGS["gemm"]}, setup_funcs,
-            kernels, target=args.target, warmup=args.warmup, iters=args.iters,
+            "GEMM Kernel",
+            {"gemm": PROFILE_CONFIGS["gemm"]},
+            setup_funcs,
+            kernels,
+            target=args.target,
+            warmup=args.warmup,
+            iters=args.iters,
         )
     elif args.autotune:
         _benchmark_gemm_autotune(cache_path=args.cache, tune_mode=not args.no_tune)
@@ -348,11 +356,18 @@ def _run_standalone_gemm() -> None:
             for backend, fn in [("cutlass", oasr_fn), ("torch", pytorch_fn)]:
                 median_ms, std_ms = bench_fn(fn)
                 tflops = compute_gemm_tflops(cfg["M"], cfg["N"], cfg["K"], median_ms)
-                output.write_result(BenchResult(
-                    routine="gemm", subroutine="gemm", backend=backend,
-                    shape=shape, dtype="float16",
-                    median_ms=median_ms, std_ms=std_ms, tflops=tflops,
-                ))
+                output.write_result(
+                    BenchResult(
+                        routine="gemm",
+                        subroutine="gemm",
+                        backend=backend,
+                        shape=shape,
+                        dtype="float16",
+                        median_ms=median_ms,
+                        std_ms=std_ms,
+                        tflops=tflops,
+                    )
+                )
         output.finalize()
 
 
@@ -369,14 +384,22 @@ def _run_standalone_bmm() -> None:
             for backend, fn in [("cutlass", oasr_fn), ("torch", pytorch_fn)]:
                 median_ms, std_ms = bench_fn(fn)
                 tflops = compute_bmm_tflops(cfg["B"], cfg["M"], cfg["N"], cfg["K"], median_ms)
-                output.write_result(BenchResult(
-                    routine="gemm", subroutine="bmm", backend=backend,
-                    shape=shape, dtype="float16",
-                    median_ms=median_ms, std_ms=std_ms, tflops=tflops,
-                ))
+                output.write_result(
+                    BenchResult(
+                        routine="gemm",
+                        subroutine="bmm",
+                        backend=backend,
+                        shape=shape,
+                        dtype="float16",
+                        median_ms=median_ms,
+                        std_ms=std_ms,
+                        tflops=tflops,
+                    )
+                )
         output.finalize()
 
     from benchmarks.routines.bench_utils import run_main
+
     run_main("Batched GEMM (BMM) Kernel", {"bmm": PROFILE_CONFIGS["bmm"]}, setup_funcs, benchmark)
 
 
@@ -385,9 +408,11 @@ def _run_standalone_group_gemm() -> None:
     profile_cfg = PROFILE_CONFIGS["group_gemm"]
     setup_funcs = {
         "group_gemm": lambda: setup_group_gemm(
-            [profile_cfg[1:]] * profile_cfg[0]
-            if len(profile_cfg) == 4
-            else [(profile_cfg[1], profile_cfg[2], profile_cfg[3])] * profile_cfg[0],
+            (
+                [profile_cfg[1:]] * profile_cfg[0]
+                if len(profile_cfg) == 4
+                else [(profile_cfg[1], profile_cfg[2], profile_cfg[3])] * profile_cfg[0]
+            ),
         ),
     }
 
@@ -407,14 +432,22 @@ def _run_standalone_group_gemm() -> None:
             for backend, fn in [("cutlass", oasr_fn), ("torch", pytorch_fn)]:
                 median_ms, std_ms = bench_fn(fn)
                 tflops = compute_gemm_tflops(num_groups * M, N, K, median_ms)
-                output.write_result(BenchResult(
-                    routine="gemm", subroutine="group_gemm", backend=backend,
-                    shape=config_str, dtype="bfloat16",
-                    median_ms=median_ms, std_ms=std_ms, tflops=tflops,
-                ))
+                output.write_result(
+                    BenchResult(
+                        routine="gemm",
+                        subroutine="group_gemm",
+                        backend=backend,
+                        shape=config_str,
+                        dtype="bfloat16",
+                        median_ms=median_ms,
+                        std_ms=std_ms,
+                        tflops=tflops,
+                    )
+                )
         output.finalize()
 
     from benchmarks.routines.bench_utils import run_main
+
     run_main(
         "Grouped GEMM Kernel",
         {"group_gemm": PROFILE_CONFIGS["group_gemm"]},
@@ -425,10 +458,10 @@ def _run_standalone_group_gemm() -> None:
 
 def _benchmark_gemm_autotune(cache_path=None, tune_mode=True):
     """Autotuning benchmark (preserved from bench_gemm.py)."""
+    import oasr.tune as _tune_mod
     from oasr.tune import get_selected_config
     from oasr.tune._types import OpKey
     from oasr.tune.kernel_configs import GEMM_TILE_CONFIGS
-    import oasr.tune as _tune_mod
 
     num_variants = len(GEMM_TILE_CONFIGS)
     mode_str = "PROFILING" if tune_mode else "CACHED"

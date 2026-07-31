@@ -74,7 +74,8 @@ def gemm_with_smem_prefetch(
             rB_copy_view[None, None, k_next],
         )
         cute.gemm(
-            tiled_mma, acc,
+            tiled_mma,
+            acc,
             rA_for_mma[None, None, k],
             rB_for_mma[None, None, k],
             acc,
@@ -111,7 +112,8 @@ def gemm_rs(
             rB_copy_view[None, None, k_next],
         )
         cute.gemm(
-            tiled_mma, acc,
+            tiled_mma,
+            acc,
             rA_view[None, None, k],
             rB_for_mma[None, None, k],
             acc,

@@ -132,9 +132,7 @@ def mel_log(
             f"got shape {tuple(out.shape)} dtype {out.dtype}"
         )
 
-    _get_features_module().mel_log(
-        out, power.contiguous(), mel_mat.contiguous(), float(log_floor)
-    )
+    _get_features_module().mel_log(out, power.contiguous(), mel_mat.contiguous(), float(log_floor))
     return out
 
 

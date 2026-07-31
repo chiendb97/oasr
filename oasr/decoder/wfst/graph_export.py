@@ -67,7 +67,9 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--vocab-size", type=int, default=None)
     parser.add_argument(
-        "--epsilon-id", type=int, default=None,
+        "--epsilon-id",
+        type=int,
+        default=None,
         help="label id to treat as epsilon (TLG graphs; NEVER set for k2 HLG where 0=blank)",
     )
     args = parser.parse_args()

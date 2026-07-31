@@ -653,10 +653,10 @@ def _drive_capture(
 #: condition that used to corrupt smem; the second is the exact-fit control.
 _PAGED_RACE_GEOMETRIES = [
     # head_dim 32 -> smem_k_block 32 -> 128*8/32 = 32 rows per pass.
-    (64, 2, 16),   # 32 rows vs page 16 -> used to spill 16 rows
-    (64, 2, 32),   # exact fit
+    (64, 2, 16),  # 32 rows vs page 16 -> used to spill 16 rows
+    (64, 2, 32),  # exact fit
     # head_dim 64 -> smem_k_block 64 -> 128*8/64 = 16 rows per pass.
-    (256, 4, 8),   # 16 rows vs page 8 -> used to spill 8 rows (production width!)
+    (256, 4, 8),  # 16 rows vs page 8 -> used to spill 8 rows (production width!)
     (256, 4, 16),  # exact fit, the shipped default
 ]
 

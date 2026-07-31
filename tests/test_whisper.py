@@ -6,9 +6,7 @@ use the real ``openai/whisper-tiny`` snapshot at ``WHISPER_CKPT`` and skip
 when it is absent.
 """
 
-import glob
-import os
-
+import assets
 import pytest
 import torch
 
@@ -16,31 +14,32 @@ from oasr.features import FeatureConfig
 from oasr.features.whisper import batched_whisper_logmel
 from oasr.models.whisper import WhisperModel, WhisperModelConfig
 
-WHISPER_CKPT = os.environ.get("WHISPER_CKPT", "/data01/kilm/users/chiendb/models/asr/whisper-tiny")
-WAV_DIR = os.environ.get(
-    "WAV_DIR", "/data01/kilm/users/chiendb/data/asr/ljspeech-sr16k-dataset/wavs"
-)
+# Gated inputs are declared once in tests/assets.py; `declared()` gives the
+# path the suite would use and the `requires_assets` marker does the gating,
+# so a missing snapshot can be made fatal with --strict-assets.
+WHISPER_CKPT = assets.declared("WHISPER_CKPT")
+WAV_DIR = assets.declared("WAV_DIR")
 
 
 def _tiny_config(**overrides):
-    base = dict(
-        vocab_size=64,
-        d_model=32,
-        encoder_layers=2,
-        decoder_layers=2,
-        encoder_attention_heads=2,
-        decoder_attention_heads=2,
-        encoder_ffn_dim=64,
-        decoder_ffn_dim=64,
-        num_mel_bins=80,
-        max_source_positions=50,  # 1 s window → 100 frames → 50 positions
-        max_target_positions=32,
-        decoder_start_token_id=60,
-        eos_token_id=61,
-        forced_decoder_ids=[(1, 62)],
-        suppress_tokens=[0, 1],
-        begin_suppress_tokens=[2],
-    )
+    base = {
+        "vocab_size": 64,
+        "d_model": 32,
+        "encoder_layers": 2,
+        "decoder_layers": 2,
+        "encoder_attention_heads": 2,
+        "decoder_attention_heads": 2,
+        "encoder_ffn_dim": 64,
+        "decoder_ffn_dim": 64,
+        "num_mel_bins": 80,
+        "max_source_positions": 50,  # 1 s window → 100 frames → 50 positions
+        "max_target_positions": 32,
+        "decoder_start_token_id": 60,
+        "eos_token_id": 61,
+        "forced_decoder_ids": [(1, 62)],
+        "suppress_tokens": [0, 1],
+        "begin_suppress_tokens": [2],
+    }
     base.update(overrides)
     return WhisperModelConfig(**base)
 
@@ -88,10 +87,7 @@ class TestWhisperLogmel:
         solo, _ = batched_whisper_logmel(w1.unsqueeze(0), torch.tensor([5000]), self.CFG)
         assert torch.allclose(both[0], solo[0], atol=1e-5)
 
-    @pytest.mark.skipif(
-        not os.path.exists(os.path.join(WHISPER_CKPT, "config.json")),
-        reason="whisper snapshot absent",
-    )
+    @pytest.mark.requires_assets("WHISPER_CKPT")
     def test_matches_transformers_feature_extractor(self):
         transformers = pytest.importorskip("transformers")
         fe = transformers.WhisperFeatureExtractor()
@@ -150,10 +146,7 @@ class TestDecoderIncremental:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    not os.path.exists(os.path.join(WHISPER_CKPT, "model.safetensors")),
-    reason="whisper snapshot absent",
-)
+@pytest.mark.requires_assets("WHISPER_CKPT")
 class TestConverter:
     def test_detect_and_bundle(self):
         from oasr.models.registry import load_checkpoint_bundle
@@ -204,10 +197,7 @@ class TestConverter:
 
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
-@pytest.mark.skipif(
-    not os.path.exists(os.path.join(WHISPER_CKPT, "model.safetensors")),
-    reason="whisper snapshot absent",
-)
+@pytest.mark.requires_assets("WHISPER_CKPT")
 class TestEngineWhisperE2E:
     @pytest.fixture(scope="class")
     def engine(self):
@@ -225,9 +215,7 @@ class TestEngineWhisperE2E:
         torch.cuda.empty_cache()
 
     def test_transcribe_offline(self, engine):
-        wavs = sorted(glob.glob(os.path.join(WAV_DIR, "*.wav")))[:2]
-        if not wavs:
-            pytest.skip(f"no wavs under {WAV_DIR}")
+        wavs = assets.require_wavs(2)
         import torchaudio
 
         audios = [torchaudio.load(w)[0].squeeze(0) for w in wavs]
@@ -258,10 +246,7 @@ if __name__ == "__main__":
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
-@pytest.mark.skipif(
-    not os.path.exists(os.path.join(WHISPER_CKPT, "model.safetensors")),
-    reason="whisper snapshot absent",
-)
+@pytest.mark.requires_assets("WHISPER_CKPT")
 class TestAedBeamSearch:
     """Beam search over the incremental AR protocol (P4).
 
@@ -274,9 +259,7 @@ class TestAedBeamSearch:
     def _audios(self, n=2):
         import torchaudio
 
-        wavs = sorted(glob.glob(os.path.join(WAV_DIR, "*.wav")))[:n]
-        if len(wavs) < n:
-            pytest.skip(f"need {n} wavs under {WAV_DIR}")
+        wavs = assets.require_wavs(n)
         return [torchaudio.load(w)[0].squeeze(0) for w in wavs]
 
     def _run(self, audios, *, beam, n_best=1, force_beam_path=False):
@@ -443,10 +426,7 @@ class TestLongFormMerge:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
-@pytest.mark.skipif(
-    not os.path.exists(os.path.join(WHISPER_CKPT, "model.safetensors")),
-    reason="whisper snapshot absent",
-)
+@pytest.mark.requires_assets("WHISPER_CKPT")
 class TestLongFormEngine:
     """Long-form decoding end to end (P4 — the real fix behind C5).
 
@@ -459,9 +439,7 @@ class TestLongFormEngine:
     def _audio(self, n_clips=8):
         import torchaudio
 
-        wavs = sorted(glob.glob(os.path.join(WAV_DIR, "*.wav")))[:n_clips]
-        if len(wavs) < n_clips:
-            pytest.skip(f"need {n_clips} wavs under {WAV_DIR}")
+        wavs = assets.require_wavs(n_clips)
         return torch.cat([torchaudio.load(w)[0].squeeze(0) for w in wavs])
 
     def _engine(self, long_form, overlap=1.0):
@@ -521,7 +499,7 @@ class TestLongFormEngine:
         """Enabling long-form must not perturb requests that fit a window."""
         import torchaudio
 
-        wav = sorted(glob.glob(os.path.join(WAV_DIR, "*.wav")))[0]
+        wav = assets.require_wavs(1)[0]
         audio = torchaudio.load(wav)[0].squeeze(0)
         eng = self._engine(True)
         try:

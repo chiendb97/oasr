@@ -36,7 +36,7 @@ from .config import ConformerEncoderConfig, ConformerModelConfig
 from .model import ConformerModel
 
 if TYPE_CHECKING:
-    from oasr.checkpoints import ConvertedCheckpoint
+    pass
 
 logger = logging.getLogger(__name__)
 

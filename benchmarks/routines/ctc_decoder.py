@@ -46,7 +46,9 @@ def get_default_configs() -> dict[str, list[dict[str, Any]]]:
 def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch", type=int, default=None, help="Batch size")
     parser.add_argument("--seq-len", type=int, default=None, dest="seq_len", help="Sequence length")
-    parser.add_argument("--vocab", type=int, default=None, dest="vocab_size", help="Vocabulary size")
+    parser.add_argument(
+        "--vocab", type=int, default=None, dest="vocab_size", help="Vocabulary size"
+    )
     parser.add_argument("--beam", type=int, default=None, dest="beam_size", help="Beam size")
 
 
@@ -110,12 +112,14 @@ def _resolve_configs(args: argparse.Namespace, subroutine: str) -> list[dict[str
     vocab_size = getattr(args, "vocab_size", None)
     beam_size = getattr(args, "beam_size", None)
     if any(v is not None for v in [batch, seq_len, vocab_size, beam_size]):
-        return [{
-            "batch": batch if batch is not None else 16,
-            "seq_len": seq_len if seq_len is not None else 200,
-            "vocab_size": vocab_size if vocab_size is not None else 1000,
-            "beam_size": beam_size if beam_size is not None else 10,
-        }]
+        return [
+            {
+                "batch": batch if batch is not None else 16,
+                "seq_len": seq_len if seq_len is not None else 200,
+                "vocab_size": vocab_size if vocab_size is not None else 1000,
+                "beam_size": beam_size if beam_size is not None else 10,
+            }
+        ]
     return DEFAULT_CONFIGS.get(subroutine, DEFAULT_CONFIGS["beam_search"])
 
 
@@ -171,15 +175,17 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
                     num_iters=num_iters,
                     use_cuda_events=use_cuda_events,
                 )
-                output.write_result(BenchResult(
-                    routine="ctc_decoder",
-                    subroutine=subroutine,
-                    backend=backend,
-                    shape=shape_str,
-                    dtype="float32",
-                    median_ms=median_ms,
-                    std_ms=std_ms,
-                ))
+                output.write_result(
+                    BenchResult(
+                        routine="ctc_decoder",
+                        subroutine=subroutine,
+                        backend=backend,
+                        shape=shape_str,
+                        dtype="float32",
+                        median_ms=median_ms,
+                        std_ms=std_ms,
+                    )
+                )
             except Exception as err:
                 print(f"[WARNING] {backend} failed for {shape_str}: {err}")
 

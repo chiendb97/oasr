@@ -60,8 +60,8 @@ class AedDecodeStrategy(IncrementalArStrategy):
         mcfg = model.config
         self._prompt = list(mcfg.sot_sequence())
         self._eos = int(mcfg.eos_token_id)
-        self._suppress = sorted(set(int(t) for t in mcfg.suppress_tokens))
-        self._begin_suppress = sorted(set(int(t) for t in mcfg.begin_suppress_tokens))
+        self._suppress = sorted({int(t) for t in mcfg.suppress_tokens})
+        self._begin_suppress = sorted({int(t) for t in mcfg.begin_suppress_tokens})
         # Remaining decoder positions once the prompt is in place.
         self._cap = int(mcfg.max_target_positions) - len(self._prompt) - 1
         # Suppress-id index tensors, materialised per device on first use: an

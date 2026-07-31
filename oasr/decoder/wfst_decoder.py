@@ -127,17 +127,30 @@ def _get_offline_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> int
     with _lock:
         if key not in _offline:
             mod = _get_module()
-            _offline[key] = int(mod.wfst_create_decoder(
-                graph, opts.search_beam, opts.output_beam,
-                opts.min_active_states, opts.max_active_states, 1,  # allow_partial
-                opts.max_offline_lanes, opts.max_frames, device,
-                32, 3,        # main_q_factor, cand_factor (offline: bench-proven)
-                1,            # use_cuda_graphs
-                0, 0, 0,      # lattice, fp16_logprobs, streaming
-                0, 3,         # lat_prune_interval, eps_iterations
-                opts.arena_budget_entries, opts.stream_log_entries,
-                opts.gc_interval,
-            ))
+            _offline[key] = int(
+                mod.wfst_create_decoder(
+                    graph,
+                    opts.search_beam,
+                    opts.output_beam,
+                    opts.min_active_states,
+                    opts.max_active_states,
+                    1,  # allow_partial
+                    opts.max_offline_lanes,
+                    opts.max_frames,
+                    device,
+                    32,
+                    3,  # main_q_factor, cand_factor (offline: bench-proven)
+                    1,  # use_cuda_graphs
+                    0,
+                    0,
+                    0,  # lattice, fp16_logprobs, streaming
+                    0,
+                    3,  # lat_prune_interval, eps_iterations
+                    opts.arena_budget_entries,
+                    opts.stream_log_entries,
+                    opts.gc_interval,
+                )
+            )
         return _offline[key]
 
 
@@ -147,21 +160,34 @@ def _get_streaming_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> i
     with _lock:
         if key not in _streaming:
             mod = _get_module()
-            _streaming[key] = int(mod.wfst_create_decoder(
-                graph, opts.search_beam, opts.output_beam,
-                opts.min_active_states, opts.max_active_states, 1,  # allow_partial
-                opts.max_streams, _STREAM_CHUNK_FRAMES, device,
-                16, 4,        # main_q_factor, cand_factor (streaming)
-                1,            # use_cuda_graphs
-                0, 0, 1,      # lattice, fp16_logprobs, streaming=1
-                0, 3,         # lat_prune_interval, eps_iterations
-                opts.arena_budget_entries, opts.stream_log_entries,
-                # Streaming GC always on: it runs once per chunk (the value is just the
-                # enable switch here), drains finalized arcs to the host, and makes the
-                # per-channel winners region a ring — streams are no longer length-capped
-                # and long-stream results no longer truncate to the last path_cap arcs.
-                opts.gc_interval or 2,
-            ))
+            _streaming[key] = int(
+                mod.wfst_create_decoder(
+                    graph,
+                    opts.search_beam,
+                    opts.output_beam,
+                    opts.min_active_states,
+                    opts.max_active_states,
+                    1,  # allow_partial
+                    opts.max_streams,
+                    _STREAM_CHUNK_FRAMES,
+                    device,
+                    16,
+                    4,  # main_q_factor, cand_factor (streaming)
+                    1,  # use_cuda_graphs
+                    0,
+                    0,
+                    1,  # lattice, fp16_logprobs, streaming=1
+                    0,
+                    3,  # lat_prune_interval, eps_iterations
+                    opts.arena_budget_entries,
+                    opts.stream_log_entries,
+                    # Streaming GC always on: it runs once per chunk (the value is just the
+                    # enable switch here), drains finalized arcs to the host, and makes the
+                    # per-channel winners region a ring — streams are no longer length-capped
+                    # and long-stream results no longer truncate to the last path_cap arcs.
+                    opts.gc_interval or 2,
+                )
+            )
         return _streaming[key]
 
 
@@ -277,7 +303,10 @@ class WfstDecoderSearch:
                 piece,
                 torch.tensor([tc], dtype=torch.int32),
                 1,  # want_partial
-                out_words, out_wlen, out_channels, out_overflow,
+                out_words,
+                out_wlen,
+                out_channels,
+                out_overflow,
             )
             partial_words = out_words[0, : min(int(out_wlen[0]), cap)].tolist()
         if partial_words is not None:
@@ -293,8 +322,9 @@ class WfstDecoderSearch:
         out_wlen = torch.empty((1,), dtype=torch.int32)
         out_score = torch.empty((1,), dtype=torch.float64)
         out_meta = torch.empty((3,), dtype=torch.int32)
-        mod.wfst_finalize_stream(self._stream_dec, self._channel, out_words, out_wlen,
-                                 out_score, out_meta)
+        mod.wfst_finalize_stream(
+            self._stream_dec, self._channel, out_words, out_wlen, out_score, out_meta
+        )
         self._release()
         if int(out_meta[0]):
             self._outputs = [out_words[: min(int(out_wlen[0]), cap)].tolist()]

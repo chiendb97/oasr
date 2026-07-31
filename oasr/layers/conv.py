@@ -33,14 +33,14 @@ class DepthwiseConv1d(nn.Module):
         self.kernel_size = kernel_size
         self.padding = padding
 
-        self.weight = nn.Parameter(torch.empty(
-            kernel_size, 1, channels, device=device, dtype=dtype))
+        self.weight = nn.Parameter(
+            torch.empty(kernel_size, 1, channels, device=device, dtype=dtype)
+        )
         torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         if bias:
             fan_in = kernel_size
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            self.bias = nn.Parameter(torch.empty(
-                channels, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.empty(channels, device=device, dtype=dtype))
             torch.nn.init.uniform_(self.bias, -bound, bound)
         else:
             self.bias = None
@@ -104,18 +104,17 @@ class PointwiseConv1d(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.activation = (
-            None if activation_type is None
-            else oasr.get_activation_type_id(activation_type)
+            None if activation_type is None else oasr.get_activation_type_id(activation_type)
         )
 
-        self.weight = nn.Parameter(torch.empty(
-            out_channels, in_channels, 1, device=device, dtype=dtype))
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, 1, device=device, dtype=dtype)
+        )
         torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         if bias:
             fan_in = in_channels
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            self.bias = nn.Parameter(torch.empty(
-                out_channels, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.empty(out_channels, device=device, dtype=dtype))
             torch.nn.init.uniform_(self.bias, -bound, bound)
         else:
             self.bias = None
@@ -158,10 +157,14 @@ class Conv2d(nn.Module):
         dtype=None,
     ):
         super().__init__()
-        kernel_h, kernel_w = (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        kernel_h, kernel_w = (
+            (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        )
         pad_h, pad_w = (padding, padding) if isinstance(padding, int) else tuple(padding)
         stride_h, stride_w = (stride, stride) if isinstance(stride, int) else tuple(stride)
-        dilation_h, dilation_w = (dilation, dilation) if isinstance(dilation, int) else tuple(dilation)
+        dilation_h, dilation_w = (
+            (dilation, dilation) if isinstance(dilation, int) else tuple(dilation)
+        )
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -189,10 +192,15 @@ class Conv2d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [N, H, W, in_channels] -> [N, P, Q, out_channels]."""
         return oasr.conv2d(
-            x, self.weight, self.bias,
-            self.padding[0], self.padding[1],
-            self.stride[0], self.stride[1],
-            self.dilation[0], self.dilation[1],
+            x,
+            self.weight,
+            self.bias,
+            self.padding[0],
+            self.padding[1],
+            self.stride[0],
+            self.stride[1],
+            self.dilation[0],
+            self.dilation[1],
         )
 
     def _load_from_state_dict(
@@ -256,10 +264,14 @@ class Conv2dActivation(nn.Module):
         dtype=None,
     ):
         super().__init__()
-        kernel_h, kernel_w = (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        kernel_h, kernel_w = (
+            (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        )
         pad_h, pad_w = (padding, padding) if isinstance(padding, int) else tuple(padding)
         stride_h, stride_w = (stride, stride) if isinstance(stride, int) else tuple(stride)
-        dilation_h, dilation_w = (dilation, dilation) if isinstance(dilation, int) else tuple(dilation)
+        dilation_h, dilation_w = (
+            (dilation, dilation) if isinstance(dilation, int) else tuple(dilation)
+        )
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -285,11 +297,16 @@ class Conv2dActivation(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [N, H, W, in_channels] -> [N, P, Q, out_channels]."""
         return oasr.conv2d_activation(
-            x, self.weight, self.bias,
+            x,
+            self.weight,
+            self.bias,
             self.activation,
-            self.padding[0], self.padding[1],
-            self.stride[0], self.stride[1],
-            self.dilation[0], self.dilation[1],
+            self.padding[0],
+            self.padding[1],
+            self.stride[0],
+            self.stride[1],
+            self.dilation[0],
+            self.dilation[1],
         )
 
     def _load_from_state_dict(

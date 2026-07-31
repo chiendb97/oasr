@@ -48,26 +48,34 @@ pytest tests/ -m "not slow"
 pytest tests/test_engine_concurrent.py -m concurrent -v
 ```
 
-Tests live under `tests/`. Functional API tests follow a flat `tests/test_<kernel>.py` layout (FlashInfer convention). The conftest at `tests/conftest.py` provides fixtures: `device` (CUDA, skips if unavailable), `dtype`/`dtype_all` (FP32/FP16/BF16), `batch_seq_hidden` (common shape tuples). Default pytest options (`-v --tb=short`) are set in `pyproject.toml`. Registered markers: `slow` (long-running, skip with `-m 'not slow'`) and `concurrent` (multi-thread engine stress, opt-in).
+Tests live under `tests/`. Functional API tests follow a flat `tests/test_<kernel>.py` layout (FlashInfer convention). The conftest at `tests/conftest.py` provides fixtures: `device` (CUDA, skips if unavailable), `dtype`/`dtype_all` (FP32/FP16/BF16), `batch_seq_hidden` (common shape tuples), plus `ckpt_dir` / `wav_dir` / `audio_path` / `lang_dir` (which now **gate** rather than return `""`). Default pytest options (`-v --tb=short`) are set in `pyproject.toml`. Registered markers: `slow` (long-running, skip with `-m 'not slow'`), `concurrent` (multi-thread engine stress, opt-in), `cuda`, and `requires_assets(*names)`.
+
+**External assets are declared once, in `tests/assets.py`** — checkpoints, audio dirs, decoding graphs, and upstream reference source trees, each with the marker file that proves it is really present (a dangling-LFS-symlink HF snapshot is not a usable checkpoint). `assets.require(...)` / `assets.require_wavs(n)` / `@pytest.mark.requires_assets(...)` are the only skip sites, so every skip is counted and every run prints an `external assets:` table saying what it did **not** cover. Never read the gating env var directly in a test: that ad-hoc pattern is exactly what let `pytest tests/` report a fully green suite while silently skipping every real-checkpoint test (and hid the `audio_scale` bug). `--strict-assets` turns those skips into failures — what `test-gpu.yml` runs — with `--allow-missing-asset NAME` naming each exception in the workflow file. `--min-passed N` is a coverage floor for the CPU job. See `docs/ci.md`.
 
 ## Linting & Formatting
 
 ```bash
+pip install -r requirements-dev.txt   # pinned; CI gates on these exact versions
+
 # Format Python code
-black oasr/ tests/ benchmarks/
-isort oasr/ tests/ benchmarks/
+black oasr/ tests/ benchmarks/ scripts/
+isort oasr/ tests/ benchmarks/ scripts/
 
 # Lint
-ruff check oasr/ tests/ benchmarks/
+ruff check oasr/ tests/ benchmarks/ scripts/
 
-# Type check
-mypy oasr/
+# Type check (a per-file ratchet, not a zero-error gate)
+python scripts/mypy_ratchet.py
 
 # Format C++/CUDA (requires clang-format)
 clang-format -i csrc/**/*.cu csrc/**/*.h csrc/**/*.cpp
 ```
 
 Style: Python uses 100-char line length (black + isort/black profile). C++ uses Google style with 100-char limit and C++17.
+
+`isort` and ruff's `I` rules **both** sort imports and are configured to agree (`known_first_party`/`combine_as_imports`/`force_sort_within_sections` are mirrored between `[tool.isort]` and `[tool.ruff.lint.isort]`); change them together or the two tools will fight and CI will flap. `mypy oasr/` reports ~495 errors, nearly all untyped-torch noise, so `scripts/mypy_ratchet.py` gates on *no file getting worse* against `ci/mypy-baseline.json` (`--update` after a cleanup). `B905` (`zip(strict=)`) is ignored — 38 call sites, each needing a per-site length judgement; enabling it is a follow-up.
+
+CI lives in `.github/workflows/`: `lint.yml` and `test-cpu.yml` on every PR (GitHub-hosted, nothing built — `import oasr` works without `_C.so`/`_core.so` because kernels JIT on first *call*), `test-gpu.yml` nightly on a self-hosted `oasr-gpu` runner with `--strict-assets`. `.pre-commit-config.yaml` mirrors the fast half locally. Full detail in `docs/ci.md`.
 
 ### Rust workspace (`rust/`)
 
@@ -77,7 +85,8 @@ cargo build --release      # builds default-members (incl. the oasr-server binar
 cargo test                 # tests default-members
 cargo test -p oasr-asr     # tests a single crate
 cargo fmt                  # rustfmt (run before committing Rust changes)
-cargo clippy
+cargo clippy --all-targets -- -D warnings
+cargo clippy -p oasr-core --lib -- -D warnings   # excluded from default-members
 ```
 
 **Do not run `cargo build/test --workspace`.** `oasr-core` (the `oasr._core`
@@ -297,6 +306,7 @@ CUTLASS is fetched from GitHub (v4.4.2) at CMake time if not present under `thir
 | `docs/autotuning.md` | `oasr.tune` design, `oasr.autotune()` API, JSON cache format |
 | `docs/benchmarks.md` | Engine vs. service bench recipes, `.env` workflow, RTF / latency interpretation |
 | `docs/cache_manager.md` | `BlockPool` / `AttentionCacheManager` / `CnnCacheManager` / `StreamContext` semantics |
+| `docs/ci.md` | CI workflows, the `tests/assets.py` gate + `--strict-assets`, the mypy ratchet, why the CPU job builds nothing |
 | `docs/checkpoints.md` | Checkpoint resolution precedence, converter contract, native format, `LoadReport` discipline |
 | `docs/ctc_decoder_gpu.md` | `GpuStreamingDecoder` single- vs. multi-request flows, paged-memory options |
 | `docs/engine.md` | `ASREngine` step loop, batching, CUDA Graph capture |
@@ -400,7 +410,7 @@ Two skill files provide step-by-step workflows for common tasks:
 
 ## Key constraints
 
-- Requires CUDA >= 11.8, CMake >= 3.18, Python >= 3.8.
+- Requires CUDA >= 11.8, CMake >= 3.18, Python >= 3.10 (`oasr/decoder/wfst/graph_image.py` annotates defaults with PEP 604 unions and has no `from __future__ import annotations`, so 3.9 raises at import; `test-cpu.yml` runs 3.10 so the floor stays tested).
 - cuDNN is optional; some features are disabled if not found.
 - C++ standard: C++17. CUDA flags include `--expt-relaxed-constexpr`, `--expt-extended-lambda`, `-O3`, `--use_fast_math`.
 - The compiled `_C.so` lives inside the Python package at `oasr/`; do not import `oasr` before building.

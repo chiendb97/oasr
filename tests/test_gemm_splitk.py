@@ -22,6 +22,13 @@ from oasr.gemm import _get_gemm_module
 from oasr.jit.core import _get_target_sm
 from oasr.jit.gemm import CutlassGemmConfig, get_unique_compile_configs
 
+# Every test in this module allocates directly on ``device="cuda"`` and calls a
+# JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
+# what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
+# instead of a wall of `RuntimeError: No CUDA GPUs are available`.
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+
+
 _SM = _get_target_sm()
 
 

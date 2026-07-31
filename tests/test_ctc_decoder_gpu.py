@@ -16,10 +16,10 @@ from oasr.ctc_decode import (
     ctc_beam_search_decode,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_logp_gpu(T: int, V: int, best_path: list, device="cuda") -> torch.Tensor:
     """Build a [1, T, V] log-prob tensor with clear winner tokens.
@@ -59,6 +59,7 @@ def _make_batched_logp_gpu(batch_paths: list, V: int, device="cuda"):
 # Offline decode tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.cuda
 class TestCtcDecoderGpuOffline:
     """Tests for offline GPU CTC prefix beam search decode."""
@@ -70,13 +71,13 @@ class TestCtcDecoderGpuOffline:
         logp = _make_logp_gpu(5, V, [1, 0, 2, 0, 3], device)
         seq_lengths = torch.tensor([5], dtype=torch.int32, device=device)
 
-        result = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
-                                        blank_id=0, blank_threshold=1.0,
-                                        max_seq_len=10)
+        result = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=3, blank_id=0, blank_threshold=1.0, max_seq_len=10
+        )
 
         assert isinstance(result, GpuDecoderResult)
-        assert len(result.tokens) == 1       # batch=1
-        assert len(result.tokens[0]) == 3    # beam=3
+        assert len(result.tokens) == 1  # batch=1
+        assert len(result.tokens[0]) == 3  # beam=3
         # Best beam should contain [1, 2, 3]
         assert result.tokens[0][0] == [1, 2, 3]
 
@@ -90,9 +91,9 @@ class TestCtcDecoderGpuOffline:
         logp = _make_logp_gpu(5, V, [0, 0, 0, 0, 0], device)
         seq_lengths = torch.tensor([5], dtype=torch.int32, device=device)
 
-        result = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
-                                        blank_id=0, blank_threshold=0.99,
-                                        max_seq_len=10)
+        result = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=3, blank_id=0, blank_threshold=0.99, max_seq_len=10
+        )
 
         # All frames are blank with prob=1.0, exceeding threshold=0.99,
         # so they are all filtered out, resulting in empty output
@@ -106,9 +107,9 @@ class TestCtcDecoderGpuOffline:
         logp = _make_logp_gpu(3, V, [1, 0, 1], device)
         seq_lengths = torch.tensor([3], dtype=torch.int32, device=device)
 
-        result = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
-                                        blank_id=0, blank_threshold=1.0,
-                                        max_seq_len=10)
+        result = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=3, blank_id=0, blank_threshold=1.0, max_seq_len=10
+        )
 
         best = result.tokens[0][0]
         # tok1, blank, tok1 → [1, 1] (blank separates the two 1s)
@@ -130,15 +131,21 @@ class TestCtcDecoderGpuOffline:
         logp = _make_logp_gpu(4, V, [1, 0, 1, 1], device)
         seq_lengths = torch.tensor([4], dtype=torch.int32, device=device)
 
-        result = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
-                                        blank_id=0, blank_threshold=0.98,
-                                        max_seq_len=10)
+        result = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=3, blank_id=0, blank_threshold=0.98, max_seq_len=10
+        )
         assert result.tokens[0][0] == [1, 1]
 
         # Paged path goes through the parallel topk_phase2_paged_kernel.
-        paged = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
-                                       blank_id=0, blank_threshold=0.98,
-                                       max_seq_len=10, use_paged_memory=True)
+        paged = ctc_beam_search_decode(
+            logp,
+            seq_lengths,
+            beam_size=3,
+            blank_id=0,
+            blank_threshold=0.98,
+            max_seq_len=10,
+            use_paged_memory=True,
+        )
         assert paged.tokens[0][0] == [1, 1]
 
     def test_repeat_after_leading_skipped_blank_collapses(self, device):
@@ -155,24 +162,24 @@ class TestCtcDecoderGpuOffline:
         logp = _make_logp_gpu(3, V, [0, 1, 1], device)
         seq_lengths = torch.tensor([3], dtype=torch.int32, device=device)
 
-        result = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
-                                        blank_id=0, blank_threshold=0.98,
-                                        max_seq_len=10)
+        result = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=3, blank_id=0, blank_threshold=0.98, max_seq_len=10
+        )
         assert result.tokens[0][0] == [1]
 
     def test_batched_decode(self, device):
         """Multiple utterances decoded in parallel."""
         V = 6
         paths = [
-            [1, 0, 2, 0, 3],       # → [1, 2, 3]
-            [4, 0, 5],             # → [4, 5]
-            [1, 0, 1, 0, 1, 0, 2], # → [1, 1, 1, 2]
+            [1, 0, 2, 0, 3],  # → [1, 2, 3]
+            [4, 0, 5],  # → [4, 5]
+            [1, 0, 1, 0, 1, 0, 2],  # → [1, 1, 1, 2]
         ]
         logp, seq_lengths = _make_batched_logp_gpu(paths, V, device)
 
-        result = ctc_beam_search_decode(logp, seq_lengths, beam_size=5,
-                                        blank_id=0, blank_threshold=1.0,
-                                        max_seq_len=20)
+        result = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=5, blank_id=0, blank_threshold=1.0, max_seq_len=20
+        )
 
         assert len(result.tokens) == 3
         assert result.tokens[0][0] == [1, 2, 3]
@@ -189,9 +196,9 @@ class TestCtcDecoderGpuOffline:
         ]
         logp, seq_lengths = _make_batched_logp_gpu(paths, V, device)
 
-        result = ctc_beam_search_decode(logp, seq_lengths, beam_size=3,
-                                        blank_id=0, blank_threshold=1.0,
-                                        max_seq_len=10)
+        result = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=3, blank_id=0, blank_threshold=1.0, max_seq_len=10
+        )
 
         assert result.tokens[0][0] == [1, 2]
         assert result.tokens[1][0] == [3, 4, 1]
@@ -202,8 +209,9 @@ class TestCtcDecoderGpuOffline:
         logp = _make_logp_gpu(8, V, [1, 0, 2, 0, 3, 0, 4, 0], device)
         seq_lengths = torch.tensor([8], dtype=torch.int32, device=device)
 
-        result = ctc_beam_search_decode(logp, seq_lengths, beam_size=beam,
-                                        blank_id=0, max_seq_len=20)
+        result = ctc_beam_search_decode(
+            logp, seq_lengths, beam_size=beam, blank_id=0, max_seq_len=20
+        )
 
         assert result.lengths.shape == (1, beam)
         assert result.scores.shape == (1, beam)
@@ -217,6 +225,7 @@ class TestCtcDecoderGpuOffline:
 # ---------------------------------------------------------------------------
 # Streaming decode tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.cuda
 class TestCtcDecoderGpuStreaming:
@@ -250,13 +259,11 @@ class TestCtcDecoderGpuStreaming:
         """
         V = 4
         for use_graphs in (False, True):
-            config = GpuDecoderConfig(beam_size=3, blank_id=0,
-                                      blank_threshold=0.98, max_seq_len=10)
+            config = GpuDecoderConfig(beam_size=3, blank_id=0, blank_threshold=0.98, max_seq_len=10)
             decoder = GpuStreamingDecoder(config, use_cuda_graphs=use_graphs)
             decoder.init_stream(batch=1, vocab_size=V, device=device)
             decoder.decode_chunk(_make_logp_gpu(4, V, [1, 0, 1, 1], device))
-            assert decoder.finalize_stream().tokens[0][0] == [1, 1], \
-                f"use_cuda_graphs={use_graphs}"
+            assert decoder.finalize_stream().tokens[0][0] == [1, 1], f"use_cuda_graphs={use_graphs}"
 
     def test_streaming_decodes_more_frames_than_output_cap(self, device):
         """Regression for GPU-DEC-2: streaming decodes more *frames* than the
@@ -273,19 +280,18 @@ class TestCtcDecoderGpuStreaming:
         V, msl, n_pad = 4, 8, 12
         T = n_pad + 2
         logp = torch.full((1, T, V), -1.0, dtype=torch.float32, device=device)
-        logp[0, :n_pad, 0] = 5.0       # P(blank) ~ 0.99 < 1.0 → decoded, no token
-        logp[0, n_pad, 1] = 5.0        # token 1
-        logp[0, n_pad + 1, 2] = 5.0    # token 2
+        logp[0, :n_pad, 0] = 5.0  # P(blank) ~ 0.99 < 1.0 → decoded, no token
+        logp[0, n_pad, 1] = 5.0  # token 1
+        logp[0, n_pad + 1, 2] = 5.0  # token 2
         for use_graphs in (False, True):
             dec = GpuStreamingDecoder(
-                GpuDecoderConfig(beam_size=4, blank_id=0, blank_threshold=1.0,
-                                 max_seq_len=msl),
-                use_cuda_graphs=use_graphs)
+                GpuDecoderConfig(beam_size=4, blank_id=0, blank_threshold=1.0, max_seq_len=msl),
+                use_cuda_graphs=use_graphs,
+            )
             dec.init_stream(batch=1, vocab_size=V, device=device)
             dec.decode_chunk(logp)
             assert dec.step > msl, f"step={dec.step} should exceed cap {msl}"
-            assert dec.finalize_stream().tokens[0][0] == [1, 2], \
-                f"use_cuda_graphs={use_graphs}"
+            assert dec.finalize_stream().tokens[0][0] == [1, 2], f"use_cuda_graphs={use_graphs}"
 
     def test_streaming_graph_multiframe_chunk_with_skips(self, device):
         """Regression for the captured-graph multi-frame chunk counter race.
@@ -312,11 +318,11 @@ class TestCtcDecoderGpuStreaming:
 
         def run(graphs):
             dec = GpuStreamingDecoder(
-                GpuDecoderConfig(beam_size=4, blank_id=0, blank_threshold=0.98,
-                                 max_seq_len=64),
-                use_cuda_graphs=graphs)
+                GpuDecoderConfig(beam_size=4, blank_id=0, blank_threshold=0.98, max_seq_len=64),
+                use_cuda_graphs=graphs,
+            )
             dec.init_stream(batch=1, vocab_size=V, device=device)
-            dec.decode_chunk(logp)   # whole sequence in ONE multi-frame chunk
+            dec.decode_chunk(logp)  # whole sequence in ONE multi-frame chunk
             return dec.finalize_stream().tokens[0][0]
 
         eager = run(False)
@@ -463,6 +469,7 @@ class TestCtcDecoderGpuStreaming:
 # Interleaved / explicit StreamState tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.cuda
 class TestCtcDecoderInterleaved:
     """Tests for interleaved multi-request decoding via explicit StreamState."""
@@ -598,6 +605,7 @@ class TestCtcDecoderInterleaved:
 # Workspace size tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.cuda
 class TestGpuDecoderWorkspace:
     """Tests for workspace and state buffer sizing."""
@@ -635,6 +643,7 @@ class TestGpuDecoderWorkspace:
 # High-level API integration via oasr namespace
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.cuda
 class TestCtcDecoderApiExport:
     """Test that GPU decoder is accessible via oasr namespace."""
@@ -651,6 +660,7 @@ class TestCtcDecoderApiExport:
 # Paged memory tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.cuda
 class TestCtcDecoderPagedOffline:
     """Tests for paged-memory GPU CTC prefix beam search (offline)."""
@@ -662,10 +672,18 @@ class TestCtcDecoderPagedOffline:
         seq_lengths = torch.tensor([5], dtype=torch.int32, device=device)
 
         result_flat = ctc_beam_search_decode(
-            logp, seq_lengths, beam_size=3, blank_id=0, blank_threshold=1.0, max_seq_len=10)
+            logp, seq_lengths, beam_size=3, blank_id=0, blank_threshold=1.0, max_seq_len=10
+        )
         result_paged = ctc_beam_search_decode(
-            logp, seq_lengths, beam_size=3, blank_id=0, blank_threshold=1.0, max_seq_len=10,
-            use_paged_memory=True, page_size=4)
+            logp,
+            seq_lengths,
+            beam_size=3,
+            blank_id=0,
+            blank_threshold=1.0,
+            max_seq_len=10,
+            use_paged_memory=True,
+            page_size=4,
+        )
 
         assert result_paged.tokens[0][0] == [1, 2, 3]
         assert result_paged.tokens == result_flat.tokens
@@ -681,10 +699,18 @@ class TestCtcDecoderPagedOffline:
         logp, seq_lengths = _make_batched_logp_gpu(paths, V, device)
 
         result_flat = ctc_beam_search_decode(
-            logp, seq_lengths, beam_size=5, blank_id=0, blank_threshold=1.0, max_seq_len=20)
+            logp, seq_lengths, beam_size=5, blank_id=0, blank_threshold=1.0, max_seq_len=20
+        )
         result_paged = ctc_beam_search_decode(
-            logp, seq_lengths, beam_size=5, blank_id=0, blank_threshold=1.0, max_seq_len=20,
-            use_paged_memory=True, page_size=4)
+            logp,
+            seq_lengths,
+            beam_size=5,
+            blank_id=0,
+            blank_threshold=1.0,
+            max_seq_len=20,
+            use_paged_memory=True,
+            page_size=4,
+        )
 
         assert result_paged.tokens == result_flat.tokens
 
@@ -709,8 +735,15 @@ class TestCtcDecoderPagedOffline:
         seq_lengths = torch.tensor([7], dtype=torch.int32, device=device)
 
         result = ctc_beam_search_decode(
-            logp, seq_lengths, beam_size=5, blank_id=0, blank_threshold=1.0, max_seq_len=10,
-            use_paged_memory=True, page_size=16)
+            logp,
+            seq_lengths,
+            beam_size=5,
+            blank_id=0,
+            blank_threshold=1.0,
+            max_seq_len=10,
+            use_paged_memory=True,
+            page_size=16,
+        )
 
         assert result.tokens[0][0] == [1, 2, 3, 4]
 
@@ -721,13 +754,20 @@ class TestCtcDecoderPagedOffline:
         # (page_size=4 means page boundary every 4 tokens)
         tokens = [t for tok in range(1, 21) for t in [tok % V or 1, 0]]
         T = len(tokens)
-        path_tokens = [t for t in tokens]
+        path_tokens = list(tokens)
         logp = _make_logp_gpu(T, V, path_tokens, device)
         seq_lengths = torch.tensor([T], dtype=torch.int32, device=device)
 
         result = ctc_beam_search_decode(
-            logp, seq_lengths, beam_size=1, blank_id=0, blank_threshold=1.0, max_seq_len=40,
-            use_paged_memory=True, page_size=4)
+            logp,
+            seq_lengths,
+            beam_size=1,
+            blank_id=0,
+            blank_threshold=1.0,
+            max_seq_len=40,
+            use_paged_memory=True,
+            page_size=4,
+        )
 
         # Result should be non-empty and have a positive score
         assert len(result.tokens[0][0]) > 0
@@ -744,8 +784,9 @@ class TestCtcDecoderPagedStreaming:
         path = [1, 0, 2, 0, 3]
 
         def _run(use_paged):
-            config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10,
-                                      use_paged_memory=use_paged, page_size=4)
+            config = GpuDecoderConfig(
+                beam_size=3, blank_id=0, max_seq_len=10, use_paged_memory=use_paged, page_size=4
+            )
             decoder = GpuStreamingDecoder(config)
             decoder.init_stream(batch=1, vocab_size=V, device=device)
             for tok in path:
@@ -769,8 +810,9 @@ class TestCtcDecoderPagedStreaming:
     def test_paged_streaming_reinit(self, device):
         """Re-calling init_stream in paged mode resets state."""
         V = 5
-        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10,
-                                  use_paged_memory=True, page_size=4)
+        config = GpuDecoderConfig(
+            beam_size=3, blank_id=0, max_seq_len=10, use_paged_memory=True, page_size=4
+        )
         decoder = GpuStreamingDecoder(config)
 
         decoder.init_stream(batch=1, vocab_size=V, device=device)
@@ -789,18 +831,26 @@ class TestCtcDecoderPagedStreaming:
 # Step 4: per-state captured CUDA Graph parity tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.cuda
 class TestCtcStreamingCudaGraphParity:
     """Bit-exact decode parity between the captured-graph and eager paths."""
 
-    def _decode_path(self, V: int, path: list, *, use_cuda_graphs: bool,
-                     beam: int = 3, max_seq_len: int = 32,
-                     blank_threshold: float = 0.0,
-                     device=torch.device("cuda")):
+    def _decode_path(
+        self,
+        V: int,
+        path: list,
+        *,
+        use_cuda_graphs: bool,
+        beam: int = 3,
+        max_seq_len: int = 32,
+        blank_threshold: float = 0.0,
+        device=torch.device("cuda"),
+    ):
         """Run a synthetic CTC decode over ``path`` with the given graph mode."""
-        cfg = GpuDecoderConfig(beam_size=beam, blank_id=0,
-                               max_seq_len=max_seq_len,
-                               blank_threshold=blank_threshold)
+        cfg = GpuDecoderConfig(
+            beam_size=beam, blank_id=0, max_seq_len=max_seq_len, blank_threshold=blank_threshold
+        )
         decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=use_cuda_graphs)
         decoder.init_stream(batch=1, vocab_size=V, device=device)
         decoder.decode_chunk(_make_logp_gpu(len(path), V, path, device))
@@ -812,33 +862,36 @@ class TestCtcStreamingCudaGraphParity:
             [1, 0, 2, 0, 3],
             [0, 0, 1, 0, 0, 2, 3, 0],
             [1, 1, 0, 2, 2, 0, 3],
-            [0, 0, 0, 0, 0],   # all-blank chunk
-            [1, 2, 3, 4],      # no blanks at all
-            [1] * 20,          # repeated non-blank
+            [0, 0, 0, 0, 0],  # all-blank chunk
+            [1, 2, 3, 4],  # no blanks at all
+            [1] * 20,  # repeated non-blank
         ],
     )
     def test_streaming_decode_matches_eager_graph_capture(self, path, device):
         """Decoded tokens / lengths / scores match eager path bit-exactly."""
         V = 6
-        r_eager = self._decode_path(V, path, use_cuda_graphs=False,
-                                    blank_threshold=0.0, device=device)
-        r_graph = self._decode_path(V, path, use_cuda_graphs=True,
-                                    blank_threshold=0.0, device=device)
-        assert r_eager.tokens == r_graph.tokens, (
-            f"path={path}: eager={r_eager.tokens}, graph={r_graph.tokens}")
-        torch.testing.assert_close(r_eager.lengths, r_graph.lengths,
-                                   rtol=0, atol=0)
-        torch.testing.assert_close(r_eager.scores, r_graph.scores,
-                                   rtol=0, atol=0)
+        r_eager = self._decode_path(
+            V, path, use_cuda_graphs=False, blank_threshold=0.0, device=device
+        )
+        r_graph = self._decode_path(
+            V, path, use_cuda_graphs=True, blank_threshold=0.0, device=device
+        )
+        assert (
+            r_eager.tokens == r_graph.tokens
+        ), f"path={path}: eager={r_eager.tokens}, graph={r_graph.tokens}"
+        torch.testing.assert_close(r_eager.lengths, r_graph.lengths, rtol=0, atol=0)
+        torch.testing.assert_close(r_eager.scores, r_graph.scores, rtol=0, atol=0)
 
     def test_streaming_decode_with_blank_threshold(self, device):
         """Blank-threshold skipping is preserved on the graph path."""
         V = 5
         path = [0, 0, 1, 0, 0, 0, 2, 0, 3, 0, 0]
-        r_eager = self._decode_path(V, path, use_cuda_graphs=False,
-                                    blank_threshold=0.5, device=device)
-        r_graph = self._decode_path(V, path, use_cuda_graphs=True,
-                                    blank_threshold=0.5, device=device)
+        r_eager = self._decode_path(
+            V, path, use_cuda_graphs=False, blank_threshold=0.5, device=device
+        )
+        r_graph = self._decode_path(
+            V, path, use_cuda_graphs=True, blank_threshold=0.5, device=device
+        )
         assert r_eager.tokens == r_graph.tokens
 
     def test_streaming_decode_multi_chunk_matches_eager(self, device):
@@ -851,8 +904,7 @@ class TestCtcStreamingCudaGraphParity:
         ]
 
         def run(use_cuda_graphs: bool):
-            cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=32,
-                                   blank_threshold=0.0)
+            cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=32, blank_threshold=0.0)
             decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=use_cuda_graphs)
             decoder.init_stream(batch=1, vocab_size=V, device=device)
             for c in chunks:
@@ -866,40 +918,35 @@ class TestCtcStreamingCudaGraphParity:
     def test_streaming_decode_state_pool_reuse_with_graphs(self, device):
         """Pooled state reuse (same shape) keeps captured graphs valid."""
         V = 5
-        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=32,
-                               blank_threshold=0.0)
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=32, blank_threshold=0.0)
         decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=True)
 
         state = decoder.create_state(batch=1, vocab_size=V, device=device)
-        decoder.decode_chunk(_make_logp_gpu(4, V, [1, 0, 2, 3], device),
-                             state=state)
+        decoder.decode_chunk(_make_logp_gpu(4, V, [1, 0, 2, 3], device), state=state)
         r1 = decoder.finalize_stream(state=state)
         assert r1.tokens[0][0] == [1, 2, 3]
 
         # Reuse the same state — graphs should still be valid.
         decoder.reset_state(state, batch=1, vocab_size=V, device=device)
-        decoder.decode_chunk(_make_logp_gpu(4, V, [4, 0, 1, 2], device),
-                             state=state)
+        decoder.decode_chunk(_make_logp_gpu(4, V, [4, 0, 1, 2], device), state=state)
         r2 = decoder.finalize_stream(state=state)
         assert r2.tokens[0][0] == [4, 1, 2]
 
     def test_streaming_decode_state_realloc_releases_graphs(self, device):
         """Resetting to a larger shape releases stale graphs and recaptures."""
-        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=32,
-                               blank_threshold=0.0)
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=32, blank_threshold=0.0)
         decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=True)
 
         state = decoder.create_state(batch=1, vocab_size=5, device=device)
-        decoder.decode_chunk(_make_logp_gpu(3, 5, [1, 0, 2], device),
-                             state=state)
+        decoder.decode_chunk(_make_logp_gpu(3, 5, [1, 0, 2], device), state=state)
         decoder.finalize_stream(state=state)
 
         # Bigger vocab forces a realloc → graphs released → recaptured.
         decoder.reset_state(state, batch=1, vocab_size=8, device=device)
-        decoder.decode_chunk(_make_logp_gpu(4, 8, [3, 0, 5, 7], device),
-                             state=state)
+        decoder.decode_chunk(_make_logp_gpu(4, 8, [3, 0, 5, 7], device), state=state)
         r = decoder.finalize_stream(state=state)
         assert r.tokens[0][0] == [3, 5, 7]
+
 
 # ---------------------------------------------------------------------------
 # Batched streaming decode (decode_chunk_batch) — parity vs per-stream path
@@ -911,11 +958,9 @@ class TestCtcDecoderBatchedChunk:
     """Parity tests for ``GpuStreamingDecoder.decode_chunk_batch``."""
 
     def _run_per_stream(self, decoder, paths, V, device):
-        states = [decoder.create_state(batch=1, vocab_size=V, device=device)
-                  for _ in paths]
+        states = [decoder.create_state(batch=1, vocab_size=V, device=device) for _ in paths]
         for s, path in zip(states, paths):
-            decoder.decode_chunk(_make_logp_gpu(len(path), V, path, device),
-                                 state=s)
+            decoder.decode_chunk(_make_logp_gpu(len(path), V, path, device), state=s)
         return [decoder.finalize_stream(state=s) for s in states], states
 
     def _run_batched(self, decoder, paths, V, device):
@@ -927,15 +972,13 @@ class TestCtcDecoderBatchedChunk:
             [_make_logp_gpu(max_T, V, p, device).squeeze(0) for p in padded],
             dim=0,
         )  # (N, T, V)
-        states = [decoder.create_state(batch=1, vocab_size=V, device=device)
-                  for _ in paths]
+        states = [decoder.create_state(batch=1, vocab_size=V, device=device) for _ in paths]
         decoder.decode_chunk_batch(logp, states)
         return [decoder.finalize_stream(state=s) for s in states], states
 
     def test_batched_matches_per_stream_no_graphs(self, device):
         V = 6
-        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=20,
-                               blank_threshold=0.0)
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=20, blank_threshold=0.0)
         paths = [[1, 0, 2, 0, 3], [4, 0, 5, 0, 1], [2, 0, 3, 0, 4]]
 
         d_per = GpuStreamingDecoder(cfg, use_cuda_graphs=False)
@@ -950,8 +993,7 @@ class TestCtcDecoderBatchedChunk:
 
     def test_batched_matches_per_stream_with_graphs(self, device):
         V = 6
-        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=20,
-                               blank_threshold=0.0)
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=20, blank_threshold=0.0)
         paths = [[1, 0, 2], [3, 0, 4], [5, 0, 1], [2, 0, 3]]
 
         d_per = GpuStreamingDecoder(cfg, use_cuda_graphs=True)
@@ -968,8 +1010,7 @@ class TestCtcDecoderBatchedChunk:
         # Use the default blank_threshold so the blank frame at t=1 is
         # skipped by the mask path — same behaviour as decode_chunk's
         # eager loop.
-        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10,
-                               blank_threshold=0.98)
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10, blank_threshold=0.98)
         decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=False)
         paths = [[1, 0, 2], [3, 0, 4]]
         _, states = self._run_batched(decoder, paths, V, device)
@@ -980,8 +1021,7 @@ class TestCtcDecoderBatchedChunk:
 
     def test_batched_blank_mask_skips_frames(self, device):
         V = 6
-        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10,
-                               blank_threshold=0.0)
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10, blank_threshold=0.0)
         decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=False)
         paths = [[1, 0, 2, 0, 3], [4, 0, 5, 0, 1]]
         N, T = 2, 5
@@ -992,12 +1032,12 @@ class TestCtcDecoderBatchedChunk:
         mask[:, 1] = 0
         mask[:, 3] = 0
         logp = torch.stack(
-            [_make_logp_gpu(T, V, p, device).squeeze(0) for p in paths], dim=0,
+            [_make_logp_gpu(T, V, p, device).squeeze(0) for p in paths],
+            dim=0,
         )
-        states = [decoder.create_state(batch=1, vocab_size=V, device=device)
-                  for _ in paths]
+        states = [decoder.create_state(batch=1, vocab_size=V, device=device) for _ in paths]
         decoder.decode_chunk_batch(logp, states, is_speech_mask=mask)
-        for i, (s, path) in enumerate(zip(states, paths)):
+        for s, path in zip(states, paths):
             r = decoder.finalize_stream(state=s)
             # Three non-blank frames produce three emit steps.
             assert s.step == 3
@@ -1005,8 +1045,7 @@ class TestCtcDecoderBatchedChunk:
 
     def test_batched_single_stream_matches_decode_chunk(self, device):
         V = 5
-        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10,
-                               blank_threshold=0.0)
+        cfg = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10, blank_threshold=0.0)
         decoder = GpuStreamingDecoder(cfg, use_cuda_graphs=True)
         path = [1, 0, 2, 0, 3]
         # Single-stream batched call should match the well-tested
@@ -1021,4 +1060,3 @@ class TestCtcDecoderBatchedChunk:
 
         assert r_bat.tokens[0][0] == r_per.tokens[0][0]
         assert s_bat.step == s_per.step
-

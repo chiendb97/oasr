@@ -17,15 +17,15 @@ OASR_TEMPLATE_DIR = _PROJECT_ROOT / "csrc" / "templates"
 
 # Generated source directory for Jinja2 templates
 OASR_GEN_SRC_DIR = pathlib.Path(
-    os.environ.get("OASR_GEN_SRC_DIR", pathlib.Path.home() /
-                   ".cache" / "oasr" / "generated")
+    os.environ.get("OASR_GEN_SRC_DIR", pathlib.Path.home() / ".cache" / "oasr" / "generated")
 )
 
 # JIT build directory (Ninja builds, compiled .so artifacts)
 OASR_JIT_DIR = pathlib.Path(
-    os.environ.get("OASR_JIT_DIR", os.environ.get(
-        "OASR_JIT_CACHE_DIR", pathlib.Path.home() / ".cache" / "oasr" / "jit"
-    ))
+    os.environ.get(
+        "OASR_JIT_DIR",
+        os.environ.get("OASR_JIT_CACHE_DIR", pathlib.Path.home() / ".cache" / "oasr" / "jit"),
+    )
 )
 
 # Backward-compatible alias
@@ -42,6 +42,7 @@ def _find_cutlass_include_dirs():
     2. 3rdparty/cutlass/ in the project tree
     3. FlashInfer's bundled CUTLASS copy
     """
+
     def _collect_dirs(cutlass_root):
         """Given a CUTLASS root dir, return all relevant include dirs."""
         dirs = []

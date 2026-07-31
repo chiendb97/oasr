@@ -23,6 +23,13 @@ from oasr.jit.gemm import (
     select_default_config,
 )
 
+# Every test in this module allocates directly on ``device="cuda"`` and calls a
+# JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
+# what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
+# instead of a wall of `RuntimeError: No CUDA GPUs are available`.
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+
+
 _SM = _get_target_sm()
 
 # (N, K) pairs that actually hit the OASR GEMM path for Conformer-CTC base.

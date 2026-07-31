@@ -9,7 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 
 from benchmarks.routines.bench_utils import bench_fn, dtype_size
-from benchmarks.routines.norm import setup_batch_norm, setup_batch_norm_swish, setup_batch_norm_activation
+from benchmarks.routines.norm import (
+    setup_batch_norm,
+    setup_batch_norm_activation,
+    setup_batch_norm_swish,
+)
 
 SUBROUTINES = {
     "batch_norm": [
@@ -34,8 +38,8 @@ SUBROUTINES = {
 DTYPES = [torch.float32]
 DTYPE_NAMES = {torch.float32: "float32"}
 
-_COL_SHAPE  = 20
-_COL_TIME   = 12
+_COL_SHAPE = 20
+_COL_TIME = 12
 _COL_METRIC = 10
 
 _HEADER = (
@@ -43,15 +47,15 @@ _HEADER = (
     f"  {'CUDA':>{_COL_TIME}}  {'BW(TB/s)':>{_COL_METRIC}}"
     f"  {'PyTorch':>{_COL_TIME}}  {'BW(TB/s)':>{_COL_METRIC}}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR BatchNorm Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR BatchNorm Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
 def _bw_tb_s(cfg, dtype, ms):
     b, s, h = cfg["batch"], cfg["seq"], cfg["hidden"]
-    elem    = dtype_size(dtype)
-    nbytes  = b * s * h * elem * 2 + h * elem * 4
+    elem = dtype_size(dtype)
+    nbytes = b * s * h * elem * 2 + h * elem * 4
     return nbytes / (ms * 1e-3) / 1e12
 
 
@@ -82,7 +86,7 @@ def _bench_sub(sub, cfgs, dtype):
         else:
             cuda_fn, pt_fn = setup_batch_norm_activation(b, s, h, dtype=dtype)
         cuda_ms, _ = bench_fn(cuda_fn)
-        pt_ms,   _ = bench_fn(pt_fn)
+        pt_ms, _ = bench_fn(pt_fn)
         shape_str = f"[{b},{s},{h}]"
         # order: CUDA, PyTorch
         print(_row(shape_str, [cuda_ms, pt_ms], cfg, dtype))
@@ -90,7 +94,8 @@ def _bench_sub(sub, cfgs, dtype):
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available"); return
+        print("CUDA not available")
+        return
 
     print(_TITLE)
     print(_TITLE_SEP)

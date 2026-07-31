@@ -16,7 +16,7 @@ a Conformer front-end streams through the paged-KV backend
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional
 
 import torch
 
