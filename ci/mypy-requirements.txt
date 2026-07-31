@@ -1,0 +1,20 @@
+# Environment for the mypy ratchet, pinned.
+#
+# `ci/mypy-baseline.json` stores per-file *error counts*, so the environment
+# that produces them has to be reproducible or the ratchet fires on somebody
+# else's release.  numpy is the load-bearing pin: mypy resolves third-party
+# stubs, and numpy's `.pyi` moves fast enough to change both the counts and
+# whether mypy runs at all (>= 2.5 triggers an INTERNAL ERROR on the
+# `np.lexsort` in oasr/decoder/wfst/lattice.py, which is excluded in
+# pyproject.toml for exactly that reason).  torch is *not* pinned here: the
+# count was verified identical on 2.12.0+cpu and 2.13.0+cpu.
+#
+# Bumping numpy is a deliberate act: bump, re-run
+# `python scripts/mypy_ratchet.py --update`, and commit both changes together.
+#
+#     pip install --index-url https://download.pytorch.org/whl/cpu torch
+#     pip install -r ci/mypy-requirements.txt -r requirements-dev.txt
+
+numpy==2.5.1
+jinja2==3.1.6
+PyYAML==6.0.3

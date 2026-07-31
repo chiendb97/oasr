@@ -7,7 +7,6 @@ import os
 
 import pytest
 import torch
-import torchaudio
 
 import oasr.decoder as _decoder_mod
 from oasr.decoder import (
@@ -26,6 +25,11 @@ pytest.importorskip(
     "oasr._C",
     reason="oasr._C not built (pip install -e . builds the CPU decoders)",
 )
+
+# Only the real-audio tests need it, but a bare module-level `import torchaudio`
+# turns an environment where it is unimportable into a *collection error* — the
+# whole session aborts with exit code 2 rather than skipping this file.
+torchaudio = pytest.importorskip("torchaudio")
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -46,19 +46,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 3.12 is pinned, not incidental: [tool.mypy] deliberately sets no
+      # `python_version`, because that setting also applies to third-party
+      # stubs and made mypy abort on numpy's PEP 695 `type` statements before
+      # it checked a line of this repo.  mypy therefore runs at the
+      # interpreter's version, so the interpreter is part of the baseline.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements-dev.txt
+          cache-dependency-path: |
+            requirements-dev.txt
+            ci/mypy-requirements.txt
 
       # mypy needs torch's stubs to say anything useful about this codebase;
-      # the CPU wheel is enough and avoids pulling the CUDA runtime.
+      # the CPU wheel is enough and avoids pulling the CUDA runtime.  The rest
+      # of the environment is pinned because the baseline counts errors that
+      # come out of those stubs — see ci/mypy-requirements.txt.
       - name: Install tooling + torch (CPU)
         run: |
-          pip install -r requirements-dev.txt
           pip install --index-url https://download.pytorch.org/whl/cpu torch
-          pip install numpy jinja2 PyYAML
+          pip install -r ci/mypy-requirements.txt -r requirements-dev.txt
 
       # Not "zero errors" — several hundred exist today, nearly all untyped-torch
       # noise.  The gate is that no file gets worse.  See scripts/mypy_ratchet.py.

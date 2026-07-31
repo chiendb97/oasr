@@ -54,7 +54,12 @@ def _small_config(**overrides):
 def _import_wenet_ref():
     """Import the upstream WeNet decoder from the reference source tree."""
     assets.require("WENET_REF_DIR")
-    import typeguard
+    # The reference *sources* being present does not mean their deps are: the
+    # WENET_REF_DIR asset is a source tree, and wenet's decoder imports
+    # typeguard.  Skip rather than fail on a box that has one but not the other.
+    typeguard = pytest.importorskip(
+        "typeguard", reason="wenet reference sources need typeguard (pip install typeguard)"
+    )
 
     # WeNet v2.0.1 targets the typeguard 2.x API; shim it for 3.x/4.x installs.
     if not hasattr(typeguard, "check_argument_types"):
