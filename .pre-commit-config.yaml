@@ -50,6 +50,20 @@ repos:
         args: [--fix]
         files: '^(oasr|tests|benchmarks|scripts)/.*\.py$'
 
+  - repo: local
+    hooks:
+      # A bare `checkpoints/` in .gitignore matches that directory name at any
+      # depth, which silently kept the whole `oasr/checkpoints/` package out of
+      # the repo: the local worktree had it, every clone did not, and it only
+      # surfaced when CI ran.  Only a check on the developer's machine can see
+      # this — on CI the files are already absent, so there is nothing to find.
+      - id: no-ignored-sources
+        name: no source file may be gitignored
+        entry: python scripts/check_no_ignored_sources.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
   # Rust hooks run against the local toolchain rather than a pinned mirror:
   # rustfmt/clippy ship with the toolchain, and pinning them separately from
   # rustup would just diverge.

@@ -129,6 +129,30 @@ python scripts/mypy_ratchet.py            # check against ci/mypy-baseline.json
 python scripts/mypy_ratchet.py --update   # after a cleanup, lower the numbers
 ```
 
+Because the baseline counts errors that come out of *third-party stubs*, the
+environment is part of it and is pinned in `ci/mypy-requirements.txt` — numpy
+above all; torch was verified to give an identical count on 2.12 and 2.13.
+Reproduce the CI environment with:
+
+```bash
+pip install --index-url https://download.pytorch.org/whl/cpu torch
+pip install -r ci/mypy-requirements.txt -r requirements-dev.txt
+```
+
+Two settings there are load-bearing and were arrived at the hard way:
+
+* **`[tool.mypy]` sets no `python_version`.** It applies to third-party stubs
+  too, so pinning it below the interpreter aborts the run before a line of this
+  repo is checked — `"3.8"` died on torch's `match` statements, and `"3.10"`
+  died on numpy's PEP 695 `type` statements ("Type statement is only supported
+  in Python 3.12 and greater"). mypy runs at the interpreter's version; CI pins
+  that to 3.12. Real 3.10 compatibility is covered by `test-cpu.yml` actually
+  running the suite on 3.10.
+* **`oasr/decoder/wfst/lattice.py` is excluded.** mypy 1.18 *and* 2.3 hit an
+  INTERNAL ERROR on its `np.lexsort` against numpy >= 2.5's stubs, which kills
+  the whole run; a per-module `ignore_errors` does not help, because the crash
+  happens during checking rather than reporting.
+
 A file whose count drops is reported as slack to reclaim, not an error, so a
 cleanup commit does not *have* to touch the baseline to stay green. A file whose
 count rises fails the job and names the file. Fix the new error or narrow it
@@ -156,6 +180,28 @@ Files whose every test allocates on `device="cuda"` carry a module-level
 `importorskip("oasr._C")`, so the CPU run is green and meaningful rather than a
 wall of `RuntimeError: No CUDA GPUs are available`. Today that is **672 passed,
 603 skipped**.
+
+One workflow rule follows from the first red run: **no pipes in a step that is
+supposed to gate.** GitHub runs steps under `bash -e`, so
+`pytest ... --collect-only | tail -5` reports *tail's* exit status. A collection
+error looked like a passing step, and the real failure only surfaced one step
+later as a bare `exit code 2` — which is pytest's `INTERRUPTED`, i.e. "a module
+failed to import", not "a test failed". A test module that imports a
+third-party package at module scope without `importorskip` can therefore take
+down the entire session; `tests/test_decoder.py` did exactly that with
+`torchaudio`.
+
+The second red run found something bigger than a CI bug: `.gitignore` had a
+bare `checkpoints/`, which matches a directory of that name at **any** depth, so
+the whole `oasr/checkpoints/` package — bundle loader, native format, the
+`oasr-convert` CLI — had never been committed. The local worktree had it; every
+clone did not; `pip install` from a clone produced a package that raised
+`ModuleNotFoundError: No module named 'oasr.checkpoints'`. It also meant black,
+isort and ruff had been silently skipping those four files, because all three
+respect `.gitignore`. The patterns are now anchored (`/checkpoints/`), and
+`scripts/check_no_ignored_sources.py` runs as a pre-commit hook to catch the
+next one — a check that only works locally, since on CI the files are already
+absent and there is nothing left to find.
 
 `--min-passed N` is the guard on that number. A CUDA guard added at the wrong
 scope, or an import that quietly turns a module into skips, otherwise shrinks

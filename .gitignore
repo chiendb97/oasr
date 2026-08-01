@@ -86,25 +86,31 @@ Makefile
 compile_commands.json
 
 # Model weights and data
+#
+# These directory patterns are anchored with a leading slash on purpose.  A
+# bare `checkpoints/` matches a directory of that name at *any* depth, which
+# silently excluded the whole `oasr/checkpoints/` package from the repo — the
+# clone built fine and then died at `from oasr.checkpoints import ...`.  Local
+# scratch dirs live at the repo root; anything under oasr/ is source.
 *.bin
 *.onnx
 *.pt
 *.pth
 *.safetensors
 *.ckpt
-data/
-./models/
-checkpoints/
+/data/
+/models/
+/checkpoints/
 
 # Claude
 .claude/
 
 # Logs
 *.log
-logs/
+/logs/
 
 # Profiling
-profiling*
+/profiling*
 
 # Local artifacts
 .artifacts/
