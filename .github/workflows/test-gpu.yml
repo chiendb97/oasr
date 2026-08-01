@@ -1,21 +1,36 @@
 name: test-gpu
 
-# The suite that actually exercises the kernels, on a self-hosted box with a
+# The suite that actually exercises the kernels, on the self-hosted box with a
 # GPU and the checkpoints.  Nightly plus manual, not per-push: a full run is
 # ~5 minutes of GPU and the runner is a single machine.
 #
-# The point of this workflow is `--strict-assets`.  `pytest tests/` reports a
-# fully green suite while silently skipping every real-checkpoint test, so a
-# green nightly proves nothing unless a missing checkpoint is a failure.  Any
-# asset this runner genuinely cannot have is named below with
-# `--allow-missing-asset`, so the gap lives in this file where it can be read,
-# rather than inside a skip nobody reads.
+# `test-gpu-modal.yml` is the same suite on rented Blackwell.  Use this one for
+# the nightly sweep — it is the SM this project ships on and the checkpoints are
+# already on disk — and Modal when the box is busy benchmarking, wedged, or when
+# you want a second SM.
 #
-# Runner prerequisites (label `oasr-gpu`):
-#   * an NVIDIA GPU + driver, CUDA toolkit, and a `pip install -e .` of this
-#     repo in the runner's environment (builds `oasr/_C.so` and `oasr._core`);
-#   * the checkpoints and audio at the paths in tests/assets.py, or the
-#     matching env vars exported in the runner's environment.
+# The point of both is `--strict-assets`.  `pytest tests/` reports a fully green
+# suite while silently skipping every real-checkpoint test, so a green nightly
+# proves nothing unless a missing checkpoint is a failure.  Any asset this
+# runner genuinely cannot have is named below with `--allow-missing-asset`, so
+# the gap lives in this file where it can be read, rather than inside a skip
+# nobody reads.
+#
+# ---------------------------------------------------------------------------
+# Registering the runner (once, on the GPU box)
+# ---------------------------------------------------------------------------
+#   Settings -> Actions -> Runners -> New self-hosted runner, then on the box:
+#     ./config.sh --url https://github.com/<owner>/oasr --token <TOKEN> \
+#                 --labels oasr-gpu --name oasr-5090 --unattended
+#     sudo ./svc.sh install && sudo ./svc.sh start
+#
+#   The runner's environment must already have: an NVIDIA driver + CUDA toolkit
+#   (the kernels JIT through nvcc), a `pip install -e .` of this repo, and the
+#   checkpoints at the paths in tests/assets.py — or those env vars exported in
+#   the service environment.
+#
+#   NOTE: this repo is public.  Do NOT add a `pull_request` trigger here: a fork
+#   PR would execute arbitrary code on your machine.  Run PR checks on Modal.
 
 on:
   schedule:
@@ -36,57 +51,42 @@ permissions:
   contents: read
 
 env:
-  # A checkpoint's absence is a failure, not a skip.  Two exceptions, both
-  # upstream *source trees* rather than model weights, and both only needed by
-  # parity oracles: install them on the runner to drop these lines.
+  # A checkpoint's absence is a failure, not a skip.  The exceptions are upstream
+  # *source trees* and a k2 lang dir rather than model weights, and are only
+  # needed by parity oracles: install them on the runner to drop these lines.
   STRICT: >-
     --strict-assets
     --allow-missing-asset WENET_REF_DIR
     --allow-missing-asset LANG_DIR
 
 jobs:
+  # The family split lives in ci/gpu_suites.py so the self-hosted matrix and the
+  # Modal fan-out cannot drift apart.  This job just publishes it.
+  matrix:
+    name: resolve suites
+    runs-on: ubuntu-latest
+    outputs:
+      suites: ${{ steps.build.outputs.suites }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: build
+        run: |
+          python ci/gpu_suites.py --check
+          echo "suites=$(python ci/gpu_suites.py --github-matrix)" >> "$GITHUB_OUTPUT"
+
   # Split by family so one failing area does not mask the rest, and so the box
   # dropping off the bus costs one suite instead of the sweep.
   suite:
     name: ${{ matrix.name }}
+    needs: matrix
     runs-on: [self-hosted, oasr-gpu]
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: kernels
-            paths: >-
-              tests/test_activation.py tests/test_norm.py tests/test_conv.py
-              tests/test_gemm.py tests/test_gemm_splitk.py tests/test_gemm_heuristic.py
-              tests/test_gemm_log_softmax.py tests/test_softmax.py tests/test_topk.py
-              tests/test_fft.py tests/test_cmvn.py tests/test_jit.py
-              tests/test_attention.py tests/test_fmha.py tests/test_fmha_varlen.py
-              tests/test_autotune.py
-          - name: decoders
-            paths: >-
-              tests/test_decoder.py tests/test_ctc_decoder_gpu.py
-              tests/test_ctc_decoder_fused_parity.py tests/test_wfst_decoder.py
-              tests/test_decoder_kv.py
-          - name: features
-            paths: >-
-              tests/test_features.py tests/test_features_registry.py
-              tests/test_extract_features.py tests/test_sample_rate.py
-          - name: engine
-            paths: >-
-              tests/test_engine.py tests/test_engine_seams.py tests/test_pipeline.py
-              tests/test_scheduler_length_batch.py tests/test_scheduler_preferred_batch.py
-              tests/test_scheduler_split.py tests/test_streaming_backend.py
-              tests/test_cache_manager.py tests/test_incremental_executor.py
-              tests/test_decode_options.py tests/test_decoding_options.py
-              tests/test_packing_encoder.py
-          - name: models
-            paths: >-
-              tests/test_conformer.py tests/test_zipformer.py tests/test_whisper.py
-              tests/test_paraformer.py tests/test_speech_llm.py tests/test_transducer.py
-              tests/test_transformer_decoder.py tests/test_rescoring.py
-              tests/test_model_contract.py tests/test_model_registry.py
-              tests/test_checkpoint_native.py tests/test_config_round_trip.py
-              tests/test_from_pretrained.py tests/test_tokenizers.py
+        include: ${{ fromJSON(needs.matrix.outputs.suites) }}
     steps:
       - uses: actions/checkout@v4
 

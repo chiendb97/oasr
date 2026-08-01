@@ -36,9 +36,14 @@ jobs:
       # isort and ruff's `I` rules both sort imports and are configured to
       # agree (see the note in pyproject.toml); running both is deliberate, so
       # a divergence introduced by a config edit shows up here.
-      - run: black --check --diff oasr/ tests/ benchmarks/ scripts/
-      - run: isort --check-only --diff oasr/ tests/ benchmarks/ scripts/
-      - run: ruff check --output-format=github oasr/ tests/ benchmarks/ scripts/
+      - run: black --check --diff oasr/ tests/ benchmarks/ scripts/ ci/
+      - run: isort --check-only --diff oasr/ tests/ benchmarks/ scripts/ ci/
+      - run: ruff check --output-format=github oasr/ tests/ benchmarks/ scripts/ ci/
+
+      # The GPU family split is shared by test-gpu.yml and ci/modal_app.py; a
+      # new tests/test_*.py that is in neither would never run on either
+      # backend, and the failure mode is silence.
+      - run: python ci/gpu_suites.py --check
 
   mypy:
     name: python (mypy ratchet)

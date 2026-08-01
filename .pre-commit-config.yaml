@@ -35,23 +35,32 @@ repos:
     rev: 26.3.1
     hooks:
       - id: black
-        files: '^(oasr|tests|benchmarks|scripts)/.*\.py$'
+        files: '^(oasr|tests|benchmarks|scripts|ci)/.*\.py$'
 
   - repo: https://github.com/PyCQA/isort
     rev: 8.0.1
     hooks:
       - id: isort
-        files: '^(oasr|tests|benchmarks|scripts)/.*\.py$'
+        files: '^(oasr|tests|benchmarks|scripts|ci)/.*\.py$'
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.14.2
     hooks:
       - id: ruff
         args: [--fix]
-        files: '^(oasr|tests|benchmarks|scripts)/.*\.py$'
+        files: '^(oasr|tests|benchmarks|scripts|ci)/.*\.py$'
 
   - repo: local
     hooks:
+      # The GPU family split is shared by test-gpu.yml and ci/modal_app.py; a
+      # new test file in neither would run on neither backend, silently.
+      - id: gpu-suites-check
+        name: gpu suite split covers every test file
+        entry: python ci/gpu_suites.py --check
+        language: system
+        pass_filenames: false
+        files: '^(tests/test_.*\.py|ci/gpu_suites\.py)$'
+
       # A bare `checkpoints/` in .gitignore matches that directory name at any
       # depth, which silently kept the whole `oasr/checkpoints/` package out of
       # the repo: the local worktree had it, every clone did not, and it only
