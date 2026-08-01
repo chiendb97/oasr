@@ -187,12 +187,13 @@ class OfflineExecutor(Executor):
             outputs.extend(self.run(batch))
         return outputs
 
-    def _reject(self, request: Request, reason: str) -> RequestOutput:
-        """Terminal output for a request the executor could not start.
+    def _reject(self, request: Request, reason: str, stage: str = "unknown") -> RequestOutput:
+        """Terminal output for a request the executor could not run.
 
         Marked ``finished`` with ``finish_reason="error"`` so the caller sees a
         result instead of waiting on a request that will never run; the serving
-        layer maps the empty transcript + reason onto its error envelope.
+        layer maps the empty transcript + reason onto its error envelope, and
+        ``stage`` becomes the label on ``oasr_requests_failed_total``.
         """
         request.state = RequestState.FINISHED
         out = RequestOutput(
@@ -201,9 +202,10 @@ class OfflineExecutor(Executor):
             tokens=[[]],
             finished=True,
             finish_reason="error",
+            error_stage=stage,
         )
         request.output = out
-        logger.debug("rejected request %s: %s", request.request_id, reason)
+        logger.debug("rejected request %s at %s: %s", request.request_id, stage, reason)
         return out
 
     def _admission_limit(self) -> Optional[int]:
@@ -326,10 +328,7 @@ class OfflineExecutor(Executor):
         outputs: List[RequestOutput] = []
         for c in chunks:
             nvtx_push(f"offline.micro_batch[B={len(c)}]")
-            nvtx_push("offline.collate")
-            features, lengths = self._collate(c)
-            nvtx_pop()
-            outputs.extend(self._run_stage(c, features, lengths))
+            outputs.extend(self._run_micro_batch(c))
             nvtx_pop()  # offline.micro_batch
 
         # Restore original arrival order (the length sort changed positions).
@@ -398,6 +397,63 @@ class OfflineExecutor(Executor):
         """
         return self._inp.collate(chunk)
 
+    def _run_micro_batch(self, chunk: List[Request]) -> List[RequestOutput]:
+        """Collate + run one micro-batch, isolating a failure to its cause.
+
+        Without this, any exception in feature collation, the encoder forward,
+        or CTC decode escapes ``step()`` — and the serving dispatcher turns a
+        failed step into an INTERNAL error for *every* in-flight request.  One
+        pathological input (a zero-length waveform, a NaN, an out-of-range
+        vocab id) was a multi-tenant outage.
+
+        On failure with more than one member the batch is re-run one request at
+        a time, so the peers that were only guilty of sharing a tick still get
+        their transcripts and the bad one is named.  That costs an extra pass
+        over a batch that already failed, and only over that batch.  OOM is the
+        exception: retrying under memory pressure is how a single over-large
+        request turns into a cascade, so it rejects the batch outright.
+        """
+        try:
+            nvtx_push("offline.collate")
+            try:
+                features, lengths = self._collate(chunk)
+            finally:
+                # Balanced even when _collate raises: an unpaired push
+                # mis-nests every range for the rest of a profiling session.
+                nvtx_pop()
+            return self._run_stage(chunk, features, lengths)
+        except torch.cuda.OutOfMemoryError as exc:
+            logger.warning(
+                "offline micro-batch of %d ran out of memory; rejecting it "
+                "(lower max_batch_size or the padded-waste cap): %s",
+                len(chunk),
+                exc,
+            )
+            return [self._reject(req, "out of memory", stage="offline_oom") for req in chunk]
+        except Exception as exc:  # noqa: BLE001 — one bad request must not take the tick
+            if len(chunk) == 1:
+                logger.warning(
+                    "offline request %s failed: %s: %s",
+                    chunk[0].request_id,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=logger.isEnabledFor(logging.DEBUG),
+                )
+                return [
+                    self._reject(chunk[0], f"{type(exc).__name__}: {exc}", stage="offline_forward")
+                ]
+            logger.warning(
+                "offline micro-batch of %d failed (%s: %s); re-running one at a time "
+                "to isolate the request responsible",
+                len(chunk),
+                type(exc).__name__,
+                exc,
+            )
+            outputs: List[RequestOutput] = []
+            for req in chunk:
+                outputs.extend(self._run_micro_batch([req]))
+            return outputs
+
     def _run_stage(
         self,
         chunk: List[Request],
@@ -452,7 +508,9 @@ class OfflineExecutor(Executor):
                     len(chunk),
                     exc,
                 )
-                return [self._reject(req, "prefill out of memory") for req in chunk]
+                return [
+                    self._reject(req, "prefill out of memory", stage="prefill_oom") for req in chunk
+                ]
             for req in chunk:
                 req.state = RequestState.RUNNING
                 self._pending[req.request_id] = req

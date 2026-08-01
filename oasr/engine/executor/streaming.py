@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import ClassVar, Dict, List, Optional, Union
 
 import numpy as np
@@ -15,9 +16,11 @@ from ..config import EngineConfig
 from ..input_processor import InputProcessor
 from ..model_runner import ModelRunner
 from ..output_processor import OutputProcessor
-from ..request import Request, RequestOutput
+from ..request import Request, RequestOutput, RequestState
 from ..scheduler import Scheduler
 from .base import Executor
+
+logger = logging.getLogger(__name__)
 
 
 class StreamingExecutor(Executor):
@@ -125,6 +128,57 @@ class StreamingExecutor(Executor):
             self._op.free_session(req)
             self._mr.free_stream(req)
 
+    def _fail_cohort(
+        self, cohort: List[Request], exc: BaseException, stage: str
+    ) -> List[RequestOutput]:
+        """Finalize a failed cohort with an error and free its caches.
+
+        The batched forward has no per-stream boundary — one call covers every
+        ready stream — so a failure inside it cannot be attributed to one of
+        them after the fact.  Retrying the cohort one stream at a time would
+        attribute it, but a partially-applied batched commit means the streams
+        that *did* advance would have their chunk committed twice, silently
+        corrupting KV.  Failing the cohort is the honest option.
+
+        What this still buys is the point of the exercise: streams outside the
+        cohort keep running, and the engine keeps ticking.  Before this, the
+        exception escaped ``step()`` and the serving dispatcher turned it into
+        an INTERNAL error for *every* in-flight request — a few such ticks and
+        the process drained.
+        """
+        logger.warning(
+            "streaming %s failed for %d stream(s) (%s: %s); finalizing them with an "
+            "error and leaving the rest of the pool running",
+            stage,
+            len(cohort),
+            type(exc).__name__,
+            exc,
+            exc_info=logger.isEnabledFor(logging.DEBUG),
+        )
+        outputs: List[RequestOutput] = []
+        for req in cohort:
+            out = RequestOutput(
+                request_id=req.request_id,
+                text="",
+                tokens=[[]],
+                finished=True,
+                finish_reason="error",
+                error_stage=stage,
+            )
+            req.output = out
+            req.state = RequestState.FINISHED
+            outputs.append(out)
+            # Free unconditionally: the cache state after a failed forward is
+            # unknown, and leaking a slot per failure exhausts the pool in a
+            # way that looks like a capacity bug rather than an error path.
+            for release in (self._op.free_session, self._mr.free_stream):
+                try:
+                    release(req)
+                except Exception:  # noqa: BLE001 — best effort during teardown
+                    logger.debug("failed releasing %s for %s", release, req.request_id)
+            self._scheduler.finish_request(req.request_id)
+        return outputs
+
     def step(self) -> List[RequestOutput]:
         nvtx_push("streaming.schedule")
         newly_admitted, running = self._scheduler.schedule_streaming()
@@ -151,13 +205,21 @@ class StreamingExecutor(Executor):
         needs_feat = [r for r in running if r.has_pending_audio]
         if needs_feat:
             nvtx_push("extract_fbank")
-            self._inp.extract_streaming_batch(
-                needs_feat,
-                cuda_stream=self._feat_stream,
-            )
-            if self._feat_stream is not None:
-                torch.cuda.current_stream(self._device).wait_stream(self._feat_stream)
-            nvtx_pop()
+            try:
+                self._inp.extract_streaming_batch(
+                    needs_feat,
+                    cuda_stream=self._feat_stream,
+                )
+                if self._feat_stream is not None:
+                    torch.cuda.current_stream(self._device).wait_stream(self._feat_stream)
+            except Exception as exc:  # noqa: BLE001 — see _fail_cohort
+                nvtx_pop()
+                outputs.extend(self._fail_cohort(needs_feat, exc, "streaming_features"))
+                running = [r for r in running if r.state is not RequestState.FINISHED]
+                if not running:
+                    return outputs
+            else:
+                nvtx_pop()
 
         # 2. For each stream whose feature buffer now holds at least one
         #    encoder window, run forward_chunk_paged.
@@ -165,12 +227,17 @@ class StreamingExecutor(Executor):
         ready = [r for r in running if r.has_ready_encoder_chunk(window)]
         if ready:
             nvtx_push("forward_streaming")
-            log_probs_map: Dict[str, torch.Tensor] = self._mr.forward_streaming_step(ready)
-            nvtx_pop()
-            nvtx_push("decode_streaming")
-            partials = self._op.decode_streaming_batch(ready, log_probs_map)
-            outputs.extend(partials)
-            nvtx_pop()
+            try:
+                log_probs_map: Dict[str, torch.Tensor] = self._mr.forward_streaming_step(ready)
+                nvtx_pop()
+                nvtx_push("decode_streaming")
+                partials = self._op.decode_streaming_batch(ready, log_probs_map)
+                outputs.extend(partials)
+                nvtx_pop()
+            except Exception as exc:  # noqa: BLE001 — see _fail_cohort
+                nvtx_pop()
+                outputs.extend(self._fail_cohort(ready, exc, "streaming_forward"))
+                running = [r for r in running if r.state is not RequestState.FINISHED]
 
         # 3. Finalise streams whose audio is exhausted and whose feature
         #    buffer has been fully consumed.  A stream can reach this

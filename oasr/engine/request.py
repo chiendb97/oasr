@@ -194,8 +194,15 @@ class RequestOutput:
     finish_reason : str, optional
         Why generation stopped, for the incremental AR families:
         ``"stop"`` (EOS emitted) or ``"length"`` (``max_new_tokens`` hit).
+        ``"error"`` when the executor could not run the request to completion.
         ``None`` for frame-synchronous families (they always consume the
         full audio) and for partial outputs.
+    error_stage : str, optional
+        Which stage failed, when ``finish_reason == "error"`` — e.g.
+        ``"offline_forward"``, ``"streaming_forward"``, ``"prefill_oom"``.
+        Set alongside ``finish_reason`` rather than folded into it so the
+        serving layer's error envelope stays a stable two-value vocabulary
+        while ``oasr_requests_failed_total{stage}`` still says *where*.
     """
 
     request_id: str
@@ -206,6 +213,7 @@ class RequestOutput:
     timestamps: Optional[List[Tuple[float, float]]] = None
     nbest_texts: Optional[List[str]] = None
     finish_reason: Optional[str] = None
+    error_stage: Optional[str] = None
 
 
 class Request:

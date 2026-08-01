@@ -183,6 +183,35 @@ class CacheConfig:
                 f"{self.num_left_chunks}); the block table cannot address the "
                 "cache this config asks for."
             )
+        if self.num_left_chunks >= 0:
+            # The pool-sizing invariant, documented in three places and until
+            # now checked in none.  With eviction enabled `at_capacity()`
+            # unconditionally returns False — the oldest block is recycled, so
+            # a stream is never "full" — which means there is no proactive
+            # capacity gate at all and safety rests entirely on the pool being
+            # big enough for every concurrent stream to hold its retained
+            # history.  Violate it and `BlockPool.allocate()` raises
+            # "BlockPool exhausted" from *inside the forward*, where it takes
+            # out the whole tick rather than one stream.  Checking here turns
+            # a runtime crash under load into a startup error with the
+            # arithmetic attached.
+            #
+            # Unlimited history (`num_left_chunks < 0`) needs no check: there
+            # `blocks_per_stream` is derived from `max_num_blocks //
+            # max_batch_size`, so the invariant holds by construction.
+            needed = self.max_batch_size * self.blocks_per_stream
+            if self.max_num_blocks < needed:
+                raise ValueError(
+                    f"max_num_blocks ({self.max_num_blocks}) cannot hold "
+                    f"{self.max_batch_size} concurrent streams of "
+                    f"{self.blocks_per_stream} blocks each = {needed} blocks "
+                    f"(num_left_chunks={self.num_left_chunks}, chunk_size="
+                    f"{self.chunk_size}, block_size_frames={self.block_size_frames}). "
+                    f"With eviction enabled there is no capacity gate, so the pool "
+                    f"would run dry inside the encoder forward. Raise max_num_blocks "
+                    f"to >= {needed}, lower max_batch_size, or shorten the retained "
+                    f"history."
+                )
         if evict_cap is None:
             # Unlimited history: growth is bounded by the pool's fair share and
             # the block-table width, so every stream has a finite ceiling.  Say
