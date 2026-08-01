@@ -43,6 +43,7 @@ def make_config(
     num_left_chunks: int = -1,
     block_size_frames: int = 4,
     max_num_blocks: int = 64,
+    max_batch_size: int = 32,
     device: torch.device = CPU,
     dtype: torch.dtype = torch.float32,
 ) -> CacheConfig:
@@ -56,6 +57,7 @@ def make_config(
         num_left_chunks=num_left_chunks,
         block_size_frames=block_size_frames,
         max_num_blocks=max_num_blocks,
+        max_batch_size=max_batch_size,
         device=device,
         dtype=dtype,
     )
@@ -322,6 +324,10 @@ class TestAttentionCacheManager:
             block_size_frames=4,
             num_left_chunks=2,
             max_num_blocks=16,
+            # One stream, so declare one: with eviction on, CacheConfig requires
+            # max_num_blocks >= max_batch_size * blocks_per_stream, and the
+            # default 32 would claim capacity this 16-block pool cannot back.
+            max_batch_size=1,
         )
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
@@ -471,7 +477,14 @@ class TestStreamCapacityGate:
         assert pool.num_free_blocks == 0
 
     def test_never_at_capacity_when_eviction_enabled(self):
-        cfg = make_config(num_left_chunks=2, max_num_blocks=8, chunk_size=4, block_size_frames=4)
+        # One stream (see the eviction test above for why max_batch_size is explicit).
+        cfg = make_config(
+            num_left_chunks=2,
+            max_num_blocks=8,
+            chunk_size=4,
+            block_size_frames=4,
+            max_batch_size=1,
+        )
         pool = BlockPool(cfg)
         mgr = AttentionCacheManager(pool, cfg)
         mgr.allocate_stream(0, slot_id=0)

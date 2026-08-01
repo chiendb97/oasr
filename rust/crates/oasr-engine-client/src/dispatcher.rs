@@ -83,6 +83,7 @@ pub(crate) mod metric {
     pub const BUSY: &str = "oasr_requests_busy_total";
     pub const STEP_FAILURES: &str = "oasr_engine_step_failures_total";
     pub const CANCELLED: &str = "oasr_requests_cancelled_total";
+    pub const FAILED: &str = "oasr_requests_failed_total";
     pub const EVENTS_DROPPED: &str = "oasr_events_dropped_total";
     pub const EVENTS_DEFERRED: &str = "oasr_events_deferred_total";
 }
@@ -134,6 +135,10 @@ fn describe_metrics() {
     metrics::describe_counter!(
         metric::CANCELLED,
         "Requests aborted before completion (usually a client disconnect)"
+    );
+    metrics::describe_counter!(
+        metric::FAILED,
+        "Requests the engine finished with an error, labelled by the stage that failed"
     );
     metrics::describe_counter!(
         metric::EVENTS_DROPPED,

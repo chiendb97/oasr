@@ -66,7 +66,7 @@ jobs:
 
       # --min-passed is a coverage floor, not a target: it fails the job if a
       # bad CUDA guard or a silent import failure shrinks the CPU surface.
-      # 626 is the observed count; 615 leaves room for small dependency drift
+      # 642 is the observed count; 630 leaves room for small dependency drift
       # without tolerating a module going dark.  Do not lower it to make a red
       # run pass — find what started skipping.
       - name: pytest
@@ -75,4 +75,4 @@ jobs:
         run: |
           python -m pytest tests/ \
             -m "not slow and not concurrent" \
-            -q -rs -rE --tb=short --min-passed 615
+            -q -rs -rE --tb=short --min-passed 630

@@ -423,6 +423,22 @@ impl PyEngine {
                     .ok()
                     .and_then(|x| x.extract::<Option<String>>().ok())
                     .unwrap_or(None);
+                if finish_reason.as_deref() == Some("error") {
+                    // `error_stage` says *which* stage failed (offline_forward,
+                    // streaming_forward, prefill_oom, ...).  It rides alongside
+                    // `finish_reason` rather than inside it so the wire keeps a
+                    // stable two-value error vocabulary while the metric can
+                    // still be broken down.  Absent on an older engine, hence
+                    // the fallback rather than a hard extract.
+                    let stage: String = item
+                        .getattr("error_stage")
+                        .ok()
+                        .and_then(|x| x.extract::<Option<String>>().ok())
+                        .flatten()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    metrics::counter!(crate::dispatcher::metric::FAILED, "stage" => stage)
+                        .increment(1);
+                }
                 Event::Final {
                     request_id: rid,
                     text,
