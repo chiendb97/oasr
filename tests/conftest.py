@@ -133,7 +133,16 @@ def pytest_report_header(config):
 
 
 def pytest_runtest_setup(item):
-    """Honour ``@pytest.mark.requires_assets(...)``."""
+    """Honour ``@pytest.mark.cuda`` and ``@pytest.mark.requires_assets(...)``."""
+    # `cuda` used to be registered and then ignored: gating came from whether a
+    # test happened to request the `device` fixture, so a test inside a
+    # `@pytest.mark.cuda` class that did not take `device` ran anyway.  One such
+    # test (`TestCtcStateCacheManager::test_get_unallocated_raises`) reached
+    # `GpuStreamingDecoder`, which JIT-compiles, and died on a runner with no
+    # nvcc.  The marker now means what it says.
+    if not torch.cuda.is_available() and next(item.iter_markers(name="cuda"), None) is not None:
+        pytest.skip("CUDA not available")
+
     for mark in item.iter_markers(name="requires_assets"):
         if mark.args:
             assets.require(*mark.args)
