@@ -7,6 +7,12 @@
 //! (`oasr/_server_cli.py`) imports this module and calls [`serve`], so the
 //! Rust front-end ships with the wheel instead of a separately-built binary.
 
+// `#[pyfunction]`'s expansion converts the result with `.into()` even when the
+// error type already is `PyErr`.  The lint fires in generated code that a
+// function-level `#[allow]` does not reach, and this crate is only the module
+// glue below, so scoping it to the crate costs no real coverage.
+#![allow(clippy::useless_conversion)]
+
 use clap::Parser;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;

@@ -24,7 +24,7 @@ from .config import ZipformerEncoderConfig, ZipformerModelConfig
 from .model import ZipformerModel
 
 if TYPE_CHECKING:
-    from oasr.checkpoints import ConvertedCheckpoint
+    pass
 
 logger = logging.getLogger(__name__)
 

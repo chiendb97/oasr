@@ -38,19 +38,23 @@ def _round_trip(cfg):
 #: ``List[Tuple[int, int]]``, and plain scalars that a hardcoded name list could
 #: silently omit.
 NON_DEFAULT = {
-    "conformer": lambda m: dict(vocab_size=4711),
-    "zipformer": lambda m: dict(vocab_size=4711),
-    "whisper": lambda m: dict(
-        vocab_size=4711,
-        forced_decoder_ids=[(1, 50259), (2, 50359), (3, 50363)],
-        suppress_tokens=[1, 2, 7],
-        begin_suppress_tokens=[220, 50257],
-    ),
-    "paraformer": lambda m: dict(vocab_size=4711),
-    "transducer": lambda m: dict(
-        vocab_size=4711, decoder_dim=99, joiner_dim=77, context_size=3, blank_id=5
-    ),
-    "speech_llm": lambda m: dict(vocab_size=4711, eos_token_ids=[1, 2, 3]),
+    "conformer": lambda m: {"vocab_size": 4711},
+    "zipformer": lambda m: {"vocab_size": 4711},
+    "whisper": lambda m: {
+        "vocab_size": 4711,
+        "forced_decoder_ids": [(1, 50259), (2, 50359), (3, 50363)],
+        "suppress_tokens": [1, 2, 7],
+        "begin_suppress_tokens": [220, 50257],
+    },
+    "paraformer": lambda m: {"vocab_size": 4711},
+    "transducer": lambda m: {
+        "vocab_size": 4711,
+        "decoder_dim": 99,
+        "joiner_dim": 77,
+        "context_size": 3,
+        "blank_id": 5,
+    },
+    "speech_llm": lambda m: {"vocab_size": 4711, "eos_token_ids": [1, 2, 3]},
 }
 
 

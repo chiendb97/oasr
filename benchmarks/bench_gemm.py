@@ -26,7 +26,7 @@ DTYPES = [torch.float16, torch.bfloat16]
 DTYPE_NAMES = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
 
 _COL_SHAPE = 20
-_COL_TIME  = 14
+_COL_TIME = 14
 _COL_TFLOPS = 8
 
 _HEADER = (
@@ -36,8 +36,8 @@ _HEADER = (
     f"  {'CUTLASS':>{_COL_TIME}}  {'TFLOPS':>{_COL_TFLOPS}}"
     f"  {'PyTorch':>{_COL_TIME}}  {'TFLOPS':>{_COL_TFLOPS}}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR GEMM Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR GEMM Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
@@ -64,15 +64,15 @@ def _row(shape_str, times, mnk):
 
 
 def _run_shape(M, N, K, dtype):
-    A  = torch.randn(M, K, device="cuda", dtype=dtype)
-    B  = torch.randn(N, K, device="cuda", dtype=dtype)
+    A = torch.randn(M, K, device="cuda", dtype=dtype)
+    B = torch.randn(N, K, device="cuda", dtype=dtype)
     Bt = B.t().contiguous()
 
     with oasr.autotune():
         oasr.gemm(A, B)
         autotune_ms, _ = bench_fn(lambda: oasr.gemm(A, B))
 
-    cublas_ms,  _ = bench_fn(lambda: torch.mm(A, Bt))
+    cublas_ms, _ = bench_fn(lambda: torch.mm(A, Bt))
     cutlass_ms, _ = bench_fn(lambda: oasr.gemm(A, B))
     pytorch_ms, _ = bench_fn(lambda: F.linear(A, B))
 
@@ -82,7 +82,8 @@ def _run_shape(M, N, K, dtype):
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available"); return
+        print("CUDA not available")
+        return
 
     print(_TITLE)
     print(_TITLE_SEP)

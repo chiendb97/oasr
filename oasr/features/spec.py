@@ -64,7 +64,7 @@ class FeatureSpec:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "FeatureSpec":
-        known = {f for f in cls.__dataclass_fields__}
+        known = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in d.items() if k in known})
 
     #: Spec fields the ``whisper_logmel`` recipe fixes internally and therefore
@@ -72,10 +72,10 @@ class FeatureSpec:
     #: setting one of these is stating something that would be silently dropped,
     #: so :meth:`mismatches` reports it rather than ignoring it.
     _WHISPER_FIXED_FIELDS = {
-        "frame_length_ms": 25.0,   # n_fft 400 @ 16 kHz
-        "frame_shift_ms": 10.0,    # hop 160 @ 16 kHz
+        "frame_length_ms": 25.0,  # n_fft 400 @ 16 kHz
+        "frame_shift_ms": 10.0,  # hop 160 @ 16 kHz
         "dither": 0.0,
-        "window_type": "povey",    # the recipe uses a Hann window
+        "window_type": "povey",  # the recipe uses a Hann window
         "lfr_m": 1,
         "lfr_n": 1,
     }
@@ -135,9 +135,7 @@ class FeatureSpec:
             # compare when the spec pins it; ``None`` means "the frontend's
             # default", which any config value satisfies.
             if self.window_seconds is not None:
-                pairs.append(
-                    ("window_seconds", self.window_seconds, config.whisper_chunk_seconds)
-                )
+                pairs.append(("window_seconds", self.window_seconds, config.whisper_chunk_seconds))
             for name, spec_v, cfg_v in pairs:
                 if spec_v != cfg_v:
                     diffs.append(f"{name}: spec={spec_v!r} config={cfg_v!r}")

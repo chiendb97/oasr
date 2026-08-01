@@ -29,8 +29,8 @@ from oasr.models.conformer.packing import build_packed_layout
 
 def _tol(dtype: torch.dtype) -> dict:
     if dtype == torch.float32:
-        return dict(rtol=2e-3, atol=2e-3)
-    return dict(rtol=3e-2, atol=3e-2)
+        return {"rtol": 2e-3, "atol": 2e-3}
+    return {"rtol": 3e-2, "atol": 3e-2}
 
 
 def _make_encoder(

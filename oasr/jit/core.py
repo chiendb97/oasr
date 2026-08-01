@@ -45,10 +45,14 @@ def _get_cuda_arch() -> Tuple[int, int]:
         pass
     # Fallback: use nvidia-smi
     try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            text=True,
-        ).strip().split("\n")[0]
+        out = (
+            subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                text=True,
+            )
+            .strip()
+            .split("\n")[0]
+        )
         major, minor = out.split(".")
         return (int(major), int(minor))
     except Exception:
@@ -60,8 +64,15 @@ def _get_target_sm() -> int:
     major, minor = _get_cuda_arch()
     sm = major * 10 + minor
     sm_to_arch = {
-        70: 70, 75: 75, 80: 80, 86: 86, 89: 89,
-        90: 90, 100: 100, 103: 103, 120: 120,
+        70: 70,
+        75: 75,
+        80: 80,
+        86: 86,
+        89: 89,
+        90: 90,
+        100: 100,
+        103: 103,
+        120: 120,
     }
     target_sm = 80
     for threshold in sorted(sm_to_arch.keys()):

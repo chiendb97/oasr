@@ -40,15 +40,15 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
         # (batch, frames, hidden, vocab) — typical Conformer-CTC heads.
         # CUTLASS FP16/BF16 GEMM requires N % 8 == 0; the real model's
         # convert.py pads the vocab the same way.
-        {"M": 16 * 250,  "N": 4240,  "K": 256},   # WeNet ASR vocab ≈ 4233 → 4240
-        {"M": 16 * 250,  "N": 4240,  "K": 512},
-        {"M": 32 * 500,  "N": 5000,  "K": 512},
-        {"M": 32 * 1000, "N": 8000,  "K": 512},
-        {"M": 64 * 250,  "N": 16000, "K": 512},
-        {"M": 64 * 500,  "N": 32000, "K": 512},
+        {"M": 16 * 250, "N": 4240, "K": 256},  # WeNet ASR vocab ≈ 4233 → 4240
+        {"M": 16 * 250, "N": 4240, "K": 512},
+        {"M": 32 * 500, "N": 5000, "K": 512},
+        {"M": 32 * 1000, "N": 8000, "K": 512},
+        {"M": 64 * 250, "N": 16000, "K": 512},
+        {"M": 64 * 500, "N": 32000, "K": 512},
         # Single-frame streaming step
-        {"M": 1,         "N": 4240,  "K": 256},
-        {"M": 1,         "N": 4240,  "K": 512},
+        {"M": 1, "N": 4240, "K": 256},
+        {"M": 1, "N": 4240, "K": 512},
     ],
 }
 
@@ -138,9 +138,7 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
 
         output.write_verbose(f"shape = {shape_str}, dtype = {dtype_str}", level=2)
 
-        if do_check and "torch" in backends and any(
-            b in fn_map and b != "torch" for b in backends
-        ):
+        if do_check and "torch" in backends and any(b in fn_map and b != "torch" for b in backends):
             oasr_out = oasr_fn()
             pytorch_out = pytorch_fn().to(dtype)
             # log_softmax tolerance must absorb FP16 GEMM noise on a wide N.
@@ -163,16 +161,18 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
                 use_cuda_events=use_cuda_events,
             )
             tflops = compute_gemm_tflops(M, N, K, median_ms)
-            output.write_result(BenchResult(
-                routine="gemm_log_softmax",
-                subroutine=subroutine,
-                backend=backend,
-                shape=shape_str,
-                dtype=dtype_str,
-                median_ms=median_ms,
-                std_ms=std_ms,
-                tflops=tflops,
-            ))
+            output.write_result(
+                BenchResult(
+                    routine="gemm_log_softmax",
+                    subroutine=subroutine,
+                    backend=backend,
+                    shape=shape_str,
+                    dtype=dtype_str,
+                    median_ms=median_ms,
+                    std_ms=std_ms,
+                    tflops=tflops,
+                )
+            )
 
 
 def _resolve_configs(args: argparse.Namespace, subroutine: str) -> list[dict]:
@@ -210,16 +210,18 @@ def run_standalone() -> None:
                 for backend, fn in get_fn_map(subroutine, oasr_fn, pytorch_fn).items():
                     median_ms, std_ms = bench_fn(fn)
                     tflops = compute_gemm_tflops(M, N, K, median_ms)
-                    output.write_result(BenchResult(
-                        routine="gemm_log_softmax",
-                        subroutine=subroutine,
-                        backend=backend,
-                        shape=shape_str,
-                        dtype=dtype_str,
-                        median_ms=median_ms,
-                        std_ms=std_ms,
-                        tflops=tflops,
-                    ))
+                    output.write_result(
+                        BenchResult(
+                            routine="gemm_log_softmax",
+                            subroutine=subroutine,
+                            backend=backend,
+                            shape=shape_str,
+                            dtype=dtype_str,
+                            median_ms=median_ms,
+                            std_ms=std_ms,
+                            tflops=tflops,
+                        )
+                    )
         output.finalize()
 
     run_main(

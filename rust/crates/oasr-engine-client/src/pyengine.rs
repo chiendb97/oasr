@@ -150,7 +150,7 @@ impl PyEngine {
     pub fn load(&self) -> (u32, u32) {
         Python::with_gil(|py| {
             let bound = self.engine.bind(py);
-            Self::load_locked(&bound)
+            Self::load_locked(bound)
         })
     }
 
@@ -177,7 +177,7 @@ impl PyEngine {
     ) -> Result<(), PyEngineError> {
         Python::with_gil(|py| {
             let bound = self.engine.bind(py);
-            Self::add_offline_locked(py, &bound, rid, audio, sample_rate, priority, decoding)
+            Self::add_offline_locked(py, bound, rid, audio, sample_rate, priority, decoding)
         })
     }
 
@@ -215,7 +215,7 @@ impl PyEngine {
     ) -> Result<(), PyEngineError> {
         Python::with_gil(|py| {
             let bound = self.engine.bind(py);
-            Self::add_streaming_locked(py, &bound, rid, sample_rate, priority, decoding)
+            Self::add_streaming_locked(py, bound, rid, sample_rate, priority, decoding)
         })
     }
 
@@ -324,7 +324,7 @@ impl PyEngine {
     pub fn feed_chunk(&self, rid: &str, chunk: &[u8], is_last: bool) -> Result<(), PyEngineError> {
         Python::with_gil(|py| {
             let bound = self.engine.bind(py);
-            Self::feed_chunk_locked(py, &bound, rid, chunk, is_last)
+            Self::feed_chunk_locked(py, bound, rid, chunk, is_last)
         })
     }
 
@@ -346,7 +346,7 @@ impl PyEngine {
     pub fn abort(&self, rid: &str) -> Result<(), PyEngineError> {
         Python::with_gil(|py| {
             let bound = self.engine.bind(py);
-            Self::abort_locked(&bound, rid)
+            Self::abort_locked(bound, rid)
         })
     }
 
@@ -360,7 +360,7 @@ impl PyEngine {
     pub fn step(&self) -> Result<Vec<Event>, PyEngineError> {
         Python::with_gil(|py| {
             let bound = self.engine.bind(py);
-            Self::step_locked(py, &bound)
+            Self::step_locked(py, bound)
         })
     }
 
@@ -570,66 +570,45 @@ fn collect_model_info(
     cfg: &Bound<'_, PyAny>,
     engine: &Bound<'_, PyAny>,
 ) -> PyResult<ModelInfo> {
-    let mut info = ModelInfo::default();
-    info.ckpt_dir = cfg
-        .getattr("ckpt_dir")
-        .ok()
-        .and_then(|x| x.extract::<Option<String>>().ok())
-        .unwrap_or_default();
-    info.device = cfg
-        .getattr("device")
-        .ok()
-        .and_then(|x| x.extract::<Option<String>>().ok())
-        .unwrap_or_default();
-    info.dtype = cfg.getattr("dtype").ok().map(|x| format!("{x}"));
-    info.chunk_size = cfg
-        .getattr("chunk_size")
-        .ok()
-        .and_then(|x| x.extract::<u32>().ok());
-    info.max_batch_size = cfg
-        .getattr("max_batch_size")
-        .ok()
-        .and_then(|x| x.extract::<u32>().ok());
-    info.decoder_type = cfg
-        .getattr("decoder_type")
-        .ok()
-        .and_then(|x| x.extract::<Option<String>>().ok())
-        .unwrap_or_default();
-    if let Ok(mc) = cfg.getattr("_model_config") {
-        if !mc.is_none() {
-            info.vocab_size = mc
-                .getattr("vocab_size")
-                .ok()
-                .and_then(|x| x.extract::<u32>().ok());
-        }
+    /// `obj.attr` as `T`, or the type's default when absent / not convertible.
+    fn attr_or_default<T: Default + for<'p> pyo3::FromPyObject<'p>>(
+        obj: &Bound<'_, PyAny>,
+        name: &str,
+    ) -> T {
+        obj.getattr(name)
+            .ok()
+            .and_then(|x| x.extract::<T>().ok())
+            .unwrap_or_default()
     }
-    // Read the *resolved* mode / family off the engine, not the config: the
-    // engine validates `decode_method` against the checkpoint's capabilities and
-    // rejects offline-only families in streaming mode, so it is the authority on
-    // what this process can actually serve.
-    info.service_mode = engine
-        .getattr("service_mode")
-        .ok()
-        .and_then(|x| x.extract::<Option<String>>().ok())
-        .unwrap_or_default();
-    info.decode_method = engine
-        .getattr("decode_method")
-        .ok()
-        .and_then(|x| x.extract::<Option<String>>().ok())
-        .unwrap_or_default();
-    info.capabilities = engine
-        .getattr("capabilities")
-        .ok()
-        .and_then(|x| x.extract::<Vec<String>>().ok())
-        .unwrap_or_default();
-    // Also engine-authoritative: `feature_config` is materialized from the
-    // checkpoint's `FeatureSpec` during construction unless the caller pinned
-    // one, so the CLI/JSON config is not a reliable source.
-    info.sample_rate = engine
-        .getattr("sample_rate")
-        .ok()
-        .and_then(|x| x.extract::<u32>().ok());
-    Ok(info)
+
+    let vocab_size = match cfg.getattr("_model_config") {
+        Ok(mc) if !mc.is_none() => mc
+            .getattr("vocab_size")
+            .ok()
+            .and_then(|x| x.extract::<u32>().ok()),
+        _ => None,
+    };
+
+    Ok(ModelInfo {
+        ckpt_dir: attr_or_default(cfg, "ckpt_dir"),
+        device: attr_or_default(cfg, "device"),
+        dtype: cfg.getattr("dtype").ok().map(|x| format!("{x}")),
+        chunk_size: attr_or_default(cfg, "chunk_size"),
+        max_batch_size: attr_or_default(cfg, "max_batch_size"),
+        decoder_type: attr_or_default(cfg, "decoder_type"),
+        vocab_size,
+        // Read the *resolved* mode / family off the engine, not the config: the
+        // engine validates `decode_method` against the checkpoint's capabilities
+        // and rejects offline-only families in streaming mode, so it is the
+        // authority on what this process can actually serve.
+        service_mode: attr_or_default(engine, "service_mode"),
+        decode_method: attr_or_default(engine, "decode_method"),
+        capabilities: attr_or_default(engine, "capabilities"),
+        // Also engine-authoritative: `feature_config` is materialized from the
+        // checkpoint's `FeatureSpec` during construction unless the caller pinned
+        // one, so the CLI/JSON config is not a reliable source.
+        sample_rate: attr_or_default(engine, "sample_rate"),
+    })
 }
 
 // Engine-level errors thrown by the Python side surface as Event::Error via

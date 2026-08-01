@@ -767,7 +767,6 @@ class TestStagingBuffers:
     """M4/M5: staging must be reused per step but bounded across the process."""
 
     def _proc(self, **overrides):
-        from types import SimpleNamespace
 
         from oasr.engine.config import EngineConfig
         from oasr.engine.input_processor import InputProcessor

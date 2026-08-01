@@ -23,7 +23,7 @@ Streaming is paged-only; dense ``forward_chunk`` and its accompanying
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 

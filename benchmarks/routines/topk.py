@@ -28,8 +28,8 @@ SUBROUTINES = ["topk"]
 
 DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
     "topk": [
-        {"batch": 64, "seq": 250, "channels": 256,  "k": 5},
-        {"batch": 64, "seq": 250, "channels": 512,  "k": 5},
+        {"batch": 64, "seq": 250, "channels": 256, "k": 5},
+        {"batch": 64, "seq": 250, "channels": 512, "k": 5},
         {"batch": 64, "seq": 250, "channels": 1024, "k": 5},
         {"batch": 64, "seq": 250, "channels": 2048, "k": 5},
         {"batch": 64, "seq": 250, "channels": 4096, "k": 5},
@@ -105,9 +105,7 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     configs = _resolve_configs(args, subroutine)
 
     for cfg in configs:
-        oasr_fn, pytorch_fn = setup_topk(
-            cfg["batch"], cfg["seq"], cfg["channels"], cfg["k"], dtype
-        )
+        oasr_fn, pytorch_fn = setup_topk(cfg["batch"], cfg["seq"], cfg["channels"], cfg["k"], dtype)
         fn_map = get_fn_map(subroutine, oasr_fn, pytorch_fn)
         backends = getattr(args, "backends", None) or list(fn_map.keys())
 
@@ -115,8 +113,10 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
         bytes_accessed = _topk_bytes(b, s, c, k, dtype)
         shape_str = f"[{b}, {s}, {c}] k={k}"
 
-        if do_check and "torch" in backends and any(
-            bk in fn_map and bk != "torch" for bk in backends
+        if (
+            do_check
+            and "torch" in backends
+            and any(bk in fn_map and bk != "torch" for bk in backends)
         ):
             oasr_vals, oasr_idxs = oasr_fn()
             pt_vals, _ = pytorch_fn()
@@ -137,16 +137,18 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
                 use_cuda_events=use_cuda_events,
             )
             bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
-            output.write_result(BenchResult(
-                routine="topk",
-                subroutine=subroutine,
-                backend=backend,
-                shape=shape_str,
-                dtype=dtype_str,
-                median_ms=median_ms,
-                std_ms=std_ms,
-                bandwidth_tb_s=bw,
-            ))
+            output.write_result(
+                BenchResult(
+                    routine="topk",
+                    subroutine=subroutine,
+                    backend=backend,
+                    shape=shape_str,
+                    dtype=dtype_str,
+                    median_ms=median_ms,
+                    std_ms=std_ms,
+                    bandwidth_tb_s=bw,
+                )
+            )
 
 
 def _resolve_configs(args, subroutine):
@@ -195,12 +197,18 @@ def run_standalone(variant: str = "topk") -> None:
                 for backend, fn in get_fn_map(sub, oasr_fn, pytorch_fn).items():
                     median_ms, std_ms = bench_fn(fn)
                     bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
-                    output.write_result(BenchResult(
-                        routine="topk", subroutine=sub, backend=backend,
-                        shape=shape_str, dtype="float16",
-                        median_ms=median_ms, std_ms=std_ms,
-                        bandwidth_tb_s=bw,
-                    ))
+                    output.write_result(
+                        BenchResult(
+                            routine="topk",
+                            subroutine=sub,
+                            backend=backend,
+                            shape=shape_str,
+                            dtype="float16",
+                            median_ms=median_ms,
+                            std_ms=std_ms,
+                            bandwidth_tb_s=bw,
+                        )
+                    )
         output.finalize()
 
     run_main(f"{variant.upper()} TopK Kernel", pcfg, setup_funcs, benchmark)

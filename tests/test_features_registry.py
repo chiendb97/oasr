@@ -30,8 +30,8 @@ from oasr.features import (
     build_extractor,
     list_extractors,
     register_extractor,
+    registry as registry_mod,
 )
-from oasr.features import registry as registry_mod
 
 
 @pytest.fixture

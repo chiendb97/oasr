@@ -17,11 +17,11 @@ import sysconfig
 from pathlib import Path
 from typing import List, Optional
 
-import tvm_ffi
 import torch
+import tvm_ffi
 
-from . import env as jit_env
 from ..compilation_context import CompilationContext
+from . import env as jit_env
 
 logger = logging.getLogger("oasr.jit")
 
@@ -69,15 +69,11 @@ def get_cuda_path() -> str:
         return cuda_home
     nvcc_path = subprocess.run(["which", "nvcc"], capture_output=True)
     if nvcc_path.returncode == 0:
-        cuda_home = os.path.dirname(
-            os.path.dirname(nvcc_path.stdout.decode("utf-8").strip())
-        )
+        cuda_home = os.path.dirname(os.path.dirname(nvcc_path.stdout.decode("utf-8").strip()))
     else:
         cuda_home = "/usr/local/cuda"
         if not os.path.exists(cuda_home):
-            raise RuntimeError(
-                f"Could not find nvcc and default {cuda_home=} doesn't exist"
-            )
+            raise RuntimeError(f"Could not find nvcc and default {cuda_home=} doesn't exist")
     return cuda_home
 
 
@@ -215,9 +211,7 @@ def build_cuda_cflags(
 
     if extra_cuda_cflags is not None:
         # If module provides -gencode flags, use those instead of global ones
-        module_has_gencode = any(
-            flag.startswith("-gencode=") for flag in extra_cuda_cflags
-        )
+        module_has_gencode = any(flag.startswith("-gencode=") for flag in extra_cuda_cflags)
         if module_has_gencode:
             global_non_arch_flags = [
                 flag for flag in global_flags if not flag.startswith("-gencode=")

@@ -55,9 +55,7 @@ class StreamSlotPool:
             If no slots are free.
         """
         if not self._free:
-            raise RuntimeError(
-                f"StreamSlotPool exhausted (capacity={self._capacity})."
-            )
+            raise RuntimeError(f"StreamSlotPool exhausted (capacity={self._capacity}).")
         return self._free.popleft()
 
     def free(self, slot_id: int) -> None:
@@ -69,9 +67,7 @@ class StreamSlotPool:
             If ``slot_id`` is out of range or already free.
         """
         if not (0 <= slot_id < self._capacity):
-            raise ValueError(
-                f"slot_id {slot_id} out of range [0, {self._capacity})"
-            )
+            raise ValueError(f"slot_id {slot_id} out of range [0, {self._capacity})")
         if slot_id in self._free:
             raise ValueError(f"slot_id {slot_id} is already free")
         self._free.append(slot_id)

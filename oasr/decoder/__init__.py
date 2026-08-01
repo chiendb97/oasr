@@ -22,20 +22,21 @@ from __future__ import annotations
 
 import importlib as _importlib
 
-from .search_interface import SearchInterface
-from .options import (
-    SearchType,
-    CtcGreedySearchOptions,
-    CtcPrefixBeamSearchOptions,
-    CtcWfstBeamSearchOptions,
-)
 from .ctc_greedy_search import CtcGreedySearch
 from .ctc_prefix_beam_search import CtcPrefixBeamSearch
 from .ctc_wfst_beam_search import CtcWfstBeamSearch
+from .options import (
+    CtcGreedySearchOptions,
+    CtcPrefixBeamSearchOptions,
+    CtcWfstBeamSearchOptions,
+    SearchType,
+)
+from .search_interface import SearchInterface
 
 # ---------------------------------------------------------------------------
 # ContextGraph and k2_available come from the compiled C++ extension.
 # ---------------------------------------------------------------------------
+
 
 def _load_c_decoder():
     try:

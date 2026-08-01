@@ -29,7 +29,6 @@ from oasr.tune import (
     is_tuning_enabled,
 )
 
-
 # =========================================================================
 # Tactic
 # =========================================================================
@@ -94,7 +93,7 @@ class TestProfileKey:
         assert key2.device_sm == key.device_sm
 
     def test_different_shapes_different_keys(self):
-        base = dict(op_key=OpKey("gemm", "gemm"), dtype="float16", device_sm=80)
+        base = {"op_key": OpKey("gemm", "gemm"), "dtype": "float16", "device_sm": 80}
         k1 = ProfileKey(shape_sig=(128, 256, 64), **base)
         k2 = ProfileKey(shape_sig=(256, 256, 64), **base)
         assert k1.to_str() != k2.to_str()
@@ -185,8 +184,10 @@ class TestAutoTuner:
         tuner = self._make_tuner()
         op_key = OpKey("gemm", "gemm")
         profile_key = ProfileKey(
-            op_key=op_key, shape_sig=(128, 256, 64),
-            dtype="float16", device_sm=80,
+            op_key=op_key,
+            shape_sig=(128, 256, 64),
+            dtype="float16",
+            device_sm=80,
         )
         tactic = Tactic("cutlass")
         tuner.profiling_cache[profile_key.to_str()] = tactic
@@ -195,8 +196,10 @@ class TestAutoTuner:
     def test_search_cache_miss_returns_none(self):
         tuner = self._make_tuner()
         profile_key = ProfileKey(
-            op_key=OpKey("gemm", "gemm"), shape_sig=(1,),
-            dtype="float16", device_sm=80,
+            op_key=OpKey("gemm", "gemm"),
+            shape_sig=(1,),
+            dtype="float16",
+            device_sm=80,
         )
         assert tuner.search_cache(profile_key) is None
 
@@ -215,8 +218,10 @@ class TestAutoTuner:
         )
 
         profile_key = ProfileKey(
-            op_key=op_key, shape_sig=(128, 256, 64),
-            dtype="float16", device_sm=80,
+            op_key=op_key,
+            shape_sig=(128, 256, 64),
+            dtype="float16",
+            device_sm=80,
         )
         tuner.profiling_cache[profile_key.to_str()] = Tactic("cutlass")
 
@@ -294,8 +299,10 @@ class TestAutoTuner:
     def test_clear_cache(self):
         tuner = self._make_tuner()
         profile_key = ProfileKey(
-            op_key=OpKey("gemm", "gemm"), shape_sig=(1,),
-            dtype="float16", device_sm=80,
+            op_key=OpKey("gemm", "gemm"),
+            shape_sig=(1,),
+            dtype="float16",
+            device_sm=80,
         )
         tuner.profiling_cache[profile_key.to_str()] = Tactic("cutlass")
         tuner.clear_cache()
@@ -391,13 +398,18 @@ class TestConfigPersistence:
 
     def test_load_warns_on_env_mismatch(self, tmp_path, caplog):
         path = tmp_path / "cache.json"
-        path.write_text(json.dumps({
-            "version": 1,
-            "_metadata": {"sm": "70", "cuda_version": "11.0"},
-            "entries": {},
-        }))
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "_metadata": {"sm": "70", "cuda_version": "11.0"},
+                    "entries": {},
+                }
+            )
+        )
 
         import logging
+
         tuner = AutoTuner(warmup=1, repeat=1)
         tuner._registry = BackendRegistry()
         with caplog.at_level(logging.WARNING, logger="oasr.tune"):
@@ -447,8 +459,10 @@ class TestAutotuneContextManager:
         # (dirty flag is only set when tuning produces a result).
         tuner = get_tuner()
         key = ProfileKey(
-            op_key=OpKey("gemm", "gemm"), shape_sig=(1, 1, 1),
-            dtype="float16", device_sm=80,
+            op_key=OpKey("gemm", "gemm"),
+            shape_sig=(1, 1, 1),
+            dtype="float16",
+            device_sm=80,
         )
         with autotune(True, cache=str(path)):
             tuner.profiling_cache[key.to_str()] = Tactic("cutlass")
@@ -471,34 +485,41 @@ class TestBackendRegistration:
 
     def test_gemm_backends_register(self):
         from oasr.tune.backends import gemm as _  # noqa: F401
+
         assert _global_registry.get_candidates(OpKey("gemm", "gemm"))
 
     def test_gemm_activation_backends_register(self):
         from oasr.tune.backends import gemm as _  # noqa: F401
+
         assert _global_registry.get_candidates(OpKey("gemm", "gemm_activation"))
 
     def test_bmm_backends_register(self):
         from oasr.tune.backends import gemm as _  # noqa: F401
+
         assert _global_registry.get_candidates(OpKey("gemm", "bmm"))
 
     def test_conv2d_backends_register(self):
         from oasr.tune.backends import conv2d as _  # noqa: F401
+
         assert _global_registry.get_candidates(OpKey("conv", "conv2d"))
 
     def test_gemm_has_cutlass_fallback(self):
         from oasr.tune.backends import gemm as _  # noqa: F401
+
         fb = _global_registry.get_fallback(OpKey("gemm", "gemm"))
         assert fb is not None
         assert fb.tactic.backend == "cutlass"
 
     def test_conv2d_has_cutlass_fallback(self):
         from oasr.tune.backends import conv2d as _  # noqa: F401
+
         fb = _global_registry.get_fallback(OpKey("conv", "conv2d"))
         assert fb is not None
         assert fb.tactic.backend == "cutlass"
 
     def test_gemm_tactics_are_unique(self):
         from oasr.tune.backends import gemm as _  # noqa: F401
+
         candidates = _global_registry.get_candidates(OpKey("gemm", "gemm"))
         tactics = [c.tactic for c in candidates]
         assert len(tactics) == len(set(tactics))

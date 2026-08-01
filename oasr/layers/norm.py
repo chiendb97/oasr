@@ -13,16 +13,16 @@ import oasr
 class LayerNorm(nn.Module):
     """Wrapper for layer normalization kernel."""
 
-    def __init__(self, normalized_shape: int, eps: float = 1e-5, bias: bool = True, device=None, dtype=None):
+    def __init__(
+        self, normalized_shape: int, eps: float = 1e-5, bias: bool = True, device=None, dtype=None
+    ):
         super().__init__()
         self.normalized_shape = normalized_shape
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(
-            normalized_shape, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(normalized_shape, device=device, dtype=dtype))
 
         if bias:
-            self.bias = nn.Parameter(torch.zeros(
-                normalized_shape, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.zeros(normalized_shape, device=device, dtype=dtype))
         else:
             self.bias = None
 
@@ -33,15 +33,15 @@ class LayerNorm(nn.Module):
 class RMSNorm(nn.Module):
     """Wrapper for RMS normalization kernel."""
 
-    def __init__(self, normalized_shape: int, eps: float = 1e-5, bias: bool = True, device=None, dtype=None):
+    def __init__(
+        self, normalized_shape: int, eps: float = 1e-5, bias: bool = True, device=None, dtype=None
+    ):
         super().__init__()
         self.normalized_shape = normalized_shape
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(
-            normalized_shape, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(normalized_shape, device=device, dtype=dtype))
         if bias:
-            self.bias = nn.Parameter(torch.zeros(
-                normalized_shape, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.zeros(normalized_shape, device=device, dtype=dtype))
         else:
             self.bias = None
 
@@ -77,16 +77,22 @@ class BiasNorm(nn.Module):
 class GroupNorm(nn.Module):
     """Wrapper for group normalization kernel."""
 
-    def __init__(self, num_channels: int, num_groups: int, eps: float = 1e-5, bias: bool = True, device=None, dtype=None):
+    def __init__(
+        self,
+        num_channels: int,
+        num_groups: int,
+        eps: float = 1e-5,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         self.num_channels = num_channels
         self.num_groups = num_groups
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(
-            num_channels, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(num_channels, device=device, dtype=dtype))
         if bias:
-            self.bias = nn.Parameter(torch.zeros(
-                num_channels, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.zeros(num_channels, device=device, dtype=dtype))
         else:
             self.bias = None
 
@@ -100,59 +106,59 @@ class BatchNorm1d(nn.Module):
     running_mean and running_var are registered as buffers (non-trainable).
     """
 
-    def __init__(self, num_channels: int, eps: float = 1e-5, bias: bool = True, device=None, dtype=None):
+    def __init__(
+        self, num_channels: int, eps: float = 1e-5, bias: bool = True, device=None, dtype=None
+    ):
         super().__init__()
         self.num_channels = num_channels
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(
-            num_channels, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(num_channels, device=device, dtype=dtype))
         if bias:
-            self.bias = nn.Parameter(torch.zeros(
-                num_channels, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.zeros(num_channels, device=device, dtype=dtype))
         else:
             self.bias = None
-        self.register_buffer("running_mean", torch.zeros(
-            num_channels, device=device, dtype=dtype))
-        self.register_buffer("running_var", torch.ones(
-            num_channels, device=device, dtype=dtype))
+        self.register_buffer("running_mean", torch.zeros(num_channels, device=device, dtype=dtype))
+        self.register_buffer("running_var", torch.ones(num_channels, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.batch_norm_1d(x, self.weight, self.bias, self.running_mean, self.running_var, self.eps)
+        return oasr.batch_norm_1d(
+            x, self.weight, self.bias, self.running_mean, self.running_var, self.eps
+        )
 
 
 class BatchNormSwish(nn.Module):
     """Wrapper for fused BatchNorm + Swish kernel."""
 
-    def __init__(self, num_channels: int, eps: float = 1e-5, bias: bool = True, device=None, dtype=None):
+    def __init__(
+        self, num_channels: int, eps: float = 1e-5, bias: bool = True, device=None, dtype=None
+    ):
         super().__init__()
         self.num_channels = num_channels
         self.eps = eps
 
-        self.weight = nn.Parameter(torch.ones(
-            num_channels, device=device, dtype=dtype))
-        self.bias = nn.Parameter(torch.zeros(
-            num_channels, device=device, dtype=dtype))
-        self.register_buffer("running_mean", torch.zeros(
-            num_channels, device=device, dtype=dtype))
-        self.register_buffer("running_var", torch.ones(
-            num_channels, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(num_channels, device=device, dtype=dtype))
+        self.bias = nn.Parameter(torch.zeros(num_channels, device=device, dtype=dtype))
+        self.register_buffer("running_mean", torch.zeros(num_channels, device=device, dtype=dtype))
+        self.register_buffer("running_var", torch.ones(num_channels, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.batch_norm_swish(x, self.weight, self.bias, self.running_mean, self.running_var, self.eps)
+        return oasr.batch_norm_swish(
+            x, self.weight, self.bias, self.running_mean, self.running_var, self.eps
+        )
 
 
 class AddLayerNorm(nn.Module):
     """Wrapper for fused add + layer norm: output = LayerNorm(x + residual)."""
 
-    def __init__(self, normalized_shape: int, eps: float = 1e-5, bias: bool = True, device=None, dtype=None):
+    def __init__(
+        self, normalized_shape: int, eps: float = 1e-5, bias: bool = True, device=None, dtype=None
+    ):
         super().__init__()
         self.normalized_shape = normalized_shape
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(
-            normalized_shape, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(normalized_shape, device=device, dtype=dtype))
         if bias:
-            self.bias = nn.Parameter(torch.zeros(
-                normalized_shape, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.zeros(normalized_shape, device=device, dtype=dtype))
         else:
             self.bias = None
 
@@ -180,17 +186,14 @@ class LayerNormActivation(nn.Module):
         self.normalized_shape = normalized_shape
         self.eps = eps
         self.activation_type = oasr.get_activation_type_id(activation)
-        self.weight = nn.Parameter(torch.ones(
-            normalized_shape, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(normalized_shape, device=device, dtype=dtype))
         if bias:
-            self.bias = nn.Parameter(torch.zeros(
-                normalized_shape, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.zeros(normalized_shape, device=device, dtype=dtype))
         else:
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.layer_norm_activation(
-            x, self.weight, self.bias, self.eps, self.activation_type)
+        return oasr.layer_norm_activation(x, self.weight, self.bias, self.eps, self.activation_type)
 
 
 class RMSNormActivation(nn.Module):
@@ -209,17 +212,14 @@ class RMSNormActivation(nn.Module):
         self.normalized_shape = normalized_shape
         self.eps = eps
         self.activation_type = oasr.get_activation_type_id(activation)
-        self.weight = nn.Parameter(torch.ones(
-            normalized_shape, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(normalized_shape, device=device, dtype=dtype))
         if bias:
-            self.bias = nn.Parameter(torch.zeros(
-                normalized_shape, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.zeros(normalized_shape, device=device, dtype=dtype))
         else:
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.rms_norm_activation(
-            x, self.weight, self.bias, self.eps, self.activation_type)
+        return oasr.rms_norm_activation(x, self.weight, self.bias, self.eps, self.activation_type)
 
 
 class BatchNormActivation(nn.Module):
@@ -237,19 +237,21 @@ class BatchNormActivation(nn.Module):
         self.num_channels = num_channels
         self.eps = eps
         self.activation_type = oasr.get_activation_type_id(activation)
-        self.weight = nn.Parameter(torch.ones(
-            num_channels, device=device, dtype=dtype))
-        self.bias = nn.Parameter(torch.zeros(
-            num_channels, device=device, dtype=dtype))
-        self.register_buffer("running_mean", torch.zeros(
-            num_channels, device=device, dtype=dtype))
-        self.register_buffer("running_var", torch.ones(
-            num_channels, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(num_channels, device=device, dtype=dtype))
+        self.bias = nn.Parameter(torch.zeros(num_channels, device=device, dtype=dtype))
+        self.register_buffer("running_mean", torch.zeros(num_channels, device=device, dtype=dtype))
+        self.register_buffer("running_var", torch.ones(num_channels, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return oasr.batch_norm_activation(
-            x, self.weight, self.bias, self.running_mean, self.running_var,
-            self.eps, self.activation_type)
+            x,
+            self.weight,
+            self.bias,
+            self.running_mean,
+            self.running_var,
+            self.eps,
+            self.activation_type,
+        )
 
 
 class GlobalCMVN(nn.Module):
@@ -269,8 +271,15 @@ class GlobalCMVN(nn.Module):
 
 
 __all__ = [
-    "LayerNorm", "RMSNorm", "GroupNorm", "BiasNorm",
-    "BatchNorm1d", "BatchNormSwish", "AddLayerNorm",
-    "LayerNormActivation", "RMSNormActivation", "BatchNormActivation",
+    "LayerNorm",
+    "RMSNorm",
+    "GroupNorm",
+    "BiasNorm",
+    "BatchNorm1d",
+    "BatchNormSwish",
+    "AddLayerNorm",
+    "LayerNormActivation",
+    "RMSNormActivation",
+    "BatchNormActivation",
     "GlobalCMVN",
 ]

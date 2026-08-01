@@ -72,7 +72,9 @@ def setup_softmax(batch_size, seq_len, channels, dtype=torch.float16):
 def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch", type=int, default=None, help="Batch size")
     parser.add_argument("--seq", type=int, default=None, help="Sequence length")
-    parser.add_argument("--channels", type=int, default=None, help="Channel dimension (softmax dim)")
+    parser.add_argument(
+        "--channels", type=int, default=None, help="Channel dimension (softmax dim)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -101,9 +103,7 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     configs = _resolve_configs(args, subroutine)
 
     for cfg in configs:
-        oasr_fn, pytorch_fn = setup_softmax(
-            cfg["batch"], cfg["seq"], cfg["channels"], dtype
-        )
+        oasr_fn, pytorch_fn = setup_softmax(cfg["batch"], cfg["seq"], cfg["channels"], dtype)
         fn_map = get_fn_map(subroutine, oasr_fn, pytorch_fn)
         backends = getattr(args, "backends", None) or list(fn_map.keys())
 
@@ -111,8 +111,10 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
         bytes_accessed = _softmax_bytes(b, s, c, dtype)
         shape_str = f"[{b}, {s}, {c}]"
 
-        if do_check and "torch" in backends and any(
-            bk in fn_map and bk != "torch" for bk in backends
+        if (
+            do_check
+            and "torch" in backends
+            and any(bk in fn_map and bk != "torch" for bk in backends)
         ):
             oasr_out = oasr_fn()
             pytorch_out = pytorch_fn()
@@ -133,16 +135,18 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
                 use_cuda_events=use_cuda_events,
             )
             bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
-            output.write_result(BenchResult(
-                routine="softmax",
-                subroutine=subroutine,
-                backend=backend,
-                shape=shape_str,
-                dtype=dtype_str,
-                median_ms=median_ms,
-                std_ms=std_ms,
-                bandwidth_tb_s=bw,
-            ))
+            output.write_result(
+                BenchResult(
+                    routine="softmax",
+                    subroutine=subroutine,
+                    backend=backend,
+                    shape=shape_str,
+                    dtype=dtype_str,
+                    median_ms=median_ms,
+                    std_ms=std_ms,
+                    bandwidth_tb_s=bw,
+                )
+            )
 
 
 def _resolve_configs(args, subroutine):
@@ -190,12 +194,18 @@ def run_standalone(variant: str = "softmax") -> None:
                 for backend, fn in get_fn_map(sub, oasr_fn, pytorch_fn).items():
                     median_ms, std_ms = bench_fn(fn)
                     bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
-                    output.write_result(BenchResult(
-                        routine="softmax", subroutine=sub, backend=backend,
-                        shape=shape_str, dtype="float16",
-                        median_ms=median_ms, std_ms=std_ms,
-                        bandwidth_tb_s=bw,
-                    ))
+                    output.write_result(
+                        BenchResult(
+                            routine="softmax",
+                            subroutine=sub,
+                            backend=backend,
+                            shape=shape_str,
+                            dtype="float16",
+                            median_ms=median_ms,
+                            std_ms=std_ms,
+                            bandwidth_tb_s=bw,
+                        )
+                    )
         output.finalize()
 
     run_main(f"{variant.upper()} Softmax Kernel", pcfg, setup_funcs, benchmark)

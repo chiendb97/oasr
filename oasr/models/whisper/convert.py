@@ -25,7 +25,7 @@ from ..registry import DETECT_KEYED_VALUE
 from .config import WhisperModelConfig
 
 if TYPE_CHECKING:
-    from oasr.checkpoints import ConvertedCheckpoint
+    pass
 
 logger = logging.getLogger(__name__)
 

@@ -46,9 +46,7 @@ def precompute_freqs_cis(
     Reference:
         https://github.com/wenet-e2e/wenet/blob/main/wenet/utils/rope_utils.py
     """
-    inv_freq = 1.0 / (
-        theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim)
-    )
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=inv_freq.device if device is None else device)
     freqs = torch.outer(t, inv_freq).float()
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
@@ -91,9 +89,7 @@ class RotaryEmbeddingBase(nn.Module):
 
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
         """Compute inverse frequencies. Override in subclasses for scaling variants."""
-        arange = torch.arange(0, self.rotary_dim, 2, dtype=torch.float)[
-            : (self.rotary_dim // 2)
-        ]
+        arange = torch.arange(0, self.rotary_dim, 2, dtype=torch.float)[: (self.rotary_dim // 2)]
         inv_freq = 1.0 / (base ** (arange / self.rotary_dim))
         return inv_freq
 

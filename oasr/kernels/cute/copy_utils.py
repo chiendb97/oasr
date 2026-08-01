@@ -13,12 +13,9 @@ O epilogue, ldmatrix.x4 for the QK and PV gemms).
 # PEP 563 (deferred annotations) breaks CuteDSL Constexpr detection;
 # do not enable.
 
-from typing import Tuple
 
-import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
-
 
 # 128-bit cp.async / universal copy: the widest contiguous load the
 # Ampere LSU supports without crossing alignment boundaries.
@@ -60,7 +57,10 @@ def make_ldmatrix_x4_atom(dtype, *, transpose: bool = False) -> cute.CopyAtom:
 
 
 def make_qkv_tiled_copy(
-    atom: cute.CopyAtom, num_threads: int, k_block_size: int, vec_elems: int,
+    atom: cute.CopyAtom,
+    num_threads: int,
+    k_block_size: int,
+    vec_elems: int,
 ) -> cute.TiledCopy:
     """Tile a cp.async atom across ``num_threads`` for Q/K/V loads.
 
@@ -79,7 +79,10 @@ def make_qkv_tiled_copy(
 
 
 def make_o_tiled_copy(
-    atom: cute.CopyAtom, num_threads: int, k_block_size: int, vec_elems: int,
+    atom: cute.CopyAtom,
+    num_threads: int,
+    k_block_size: int,
+    vec_elems: int,
 ) -> cute.TiledCopy:
     """Tiled-copy for the O epilogue (smem->gmem universal copy).
 

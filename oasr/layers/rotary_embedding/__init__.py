@@ -88,9 +88,7 @@ def get_rotary_embedding(
         )
     if rope_type == "yarn":
         scaling_factor = kwargs.get("scaling_factor", 1.0)
-        original_max = kwargs.get(
-            "original_max_position_embeddings", max_position_embeddings
-        )
+        original_max = kwargs.get("original_max_position_embeddings", max_position_embeddings)
         return YaRNScalingRotaryEmbedding(
             head_dim=head_dim,
             original_max_position_embeddings=original_max,

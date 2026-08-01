@@ -8,7 +8,6 @@ import dataclasses
 import enum
 import time
 import uuid
-from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Iterable, List, Mapping, Optional, Tuple, Union
 

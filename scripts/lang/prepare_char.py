@@ -34,7 +34,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import k2
 import torch
-
 from lang_utils import (
     Lexicon,
     add_disambig_symbols,

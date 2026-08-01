@@ -81,7 +81,7 @@ cudaError_t Conv2D(const T* input, const T* filter, const T* bias, T* output, in
     {
         constexpr int SM_VERSION = OASR_TARGET_SM;
         status = detail::dispatchConv2dWithSmVersion<SM_VERSION, T, T, T, oasr::ActivationType::IDENTITY>(input, filter, bias, output, N, H, W, IC, K, R, S, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, stream);
-        
+
     }
 #else
     int sm = oasr::getDeviceSmVersion();

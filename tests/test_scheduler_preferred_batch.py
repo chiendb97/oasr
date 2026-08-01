@@ -123,9 +123,7 @@ class TestStreamingAdmission:
 
     def test_force_flush_on_wait_deadline(self):
         # Below min preferred, but oldest has waited past max_wait_time.
-        sched = Scheduler(
-            _make_config(preferred_batch_size=[4, 8], max_wait_time=0.05)
-        )
+        sched = Scheduler(_make_config(preferred_batch_size=[4, 8], max_wait_time=0.05))
         for _ in range(3):
             req = _make_streaming()
             req.arrival_time = time.monotonic() - 1.0  # 1 s ago
@@ -204,9 +202,7 @@ class TestOfflineBatch:
         assert sched.num_waiting_offline == 3
 
     def test_force_flush_ships_sub_preferred(self):
-        sched = Scheduler(
-            _make_config(preferred_batch_size=[4, 8], max_wait_time=0.05)
-        )
+        sched = Scheduler(_make_config(preferred_batch_size=[4, 8], max_wait_time=0.05))
         for _ in range(3):
             req = _make_offline()
             req.arrival_time = time.monotonic() - 1.0

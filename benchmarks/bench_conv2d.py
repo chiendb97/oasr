@@ -13,22 +13,22 @@ from benchmarks.routines.bench_utils import bench_fn
 from benchmarks.routines.conv import setup_conv2d
 
 CONFIGS = [
-    {"N": 16, "H": 200, "W": 80,  "IC":   1, "K":  64, "R": 3, "S": 3, "pad": 0, "stride": 2},
-    {"N": 16, "H": 100, "W": 40,  "IC":  64, "K":  64, "R": 3, "S": 3, "pad": 0, "stride": 2},
-    {"N": 32, "H": 200, "W": 80,  "IC":   1, "K":  64, "R": 3, "S": 3, "pad": 0, "stride": 2},
-    {"N": 32, "H": 100, "W": 40,  "IC":  64, "K":  64, "R": 3, "S": 3, "pad": 0, "stride": 2},
-    {"N":  8, "H": 300, "W": 80,  "IC":   1, "K": 256, "R": 3, "S": 3, "pad": 0, "stride": 2},
-    {"N":  8, "H": 150, "W": 40,  "IC": 256, "K": 256, "R": 3, "S": 3, "pad": 0, "stride": 2},
-    {"N": 16, "H": 100, "W": 40,  "IC": 128, "K": 128, "R": 3, "S": 3, "pad": 1, "stride": 1},
-    {"N": 16, "H": 100, "W": 40,  "IC": 256, "K": 256, "R": 3, "S": 3, "pad": 1, "stride": 1},
+    {"N": 16, "H": 200, "W": 80, "IC": 1, "K": 64, "R": 3, "S": 3, "pad": 0, "stride": 2},
+    {"N": 16, "H": 100, "W": 40, "IC": 64, "K": 64, "R": 3, "S": 3, "pad": 0, "stride": 2},
+    {"N": 32, "H": 200, "W": 80, "IC": 1, "K": 64, "R": 3, "S": 3, "pad": 0, "stride": 2},
+    {"N": 32, "H": 100, "W": 40, "IC": 64, "K": 64, "R": 3, "S": 3, "pad": 0, "stride": 2},
+    {"N": 8, "H": 300, "W": 80, "IC": 1, "K": 256, "R": 3, "S": 3, "pad": 0, "stride": 2},
+    {"N": 8, "H": 150, "W": 40, "IC": 256, "K": 256, "R": 3, "S": 3, "pad": 0, "stride": 2},
+    {"N": 16, "H": 100, "W": 40, "IC": 128, "K": 128, "R": 3, "S": 3, "pad": 1, "stride": 1},
+    {"N": 16, "H": 100, "W": 40, "IC": 256, "K": 256, "R": 3, "S": 3, "pad": 1, "stride": 1},
 ]
 
 DTYPES = [torch.float16]
 DTYPE_NAMES = {torch.float16: "float16"}
 
-_COL_SHAPE  = 36
-_COL_TIME   = 12
-_COL_METRIC =  8
+_COL_SHAPE = 36
+_COL_TIME = 12
+_COL_METRIC = 8
 
 _HEADER = (
     f"{'shape':>{_COL_SHAPE}}"
@@ -36,8 +36,8 @@ _HEADER = (
     f"  {'CUTLASS':>{_COL_TIME}}  {'TFLOPS':>{_COL_METRIC}}"
     f"  {'PyTorch':>{_COL_TIME}}  {'TFLOPS':>{_COL_METRIC}}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR Conv2D Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR Conv2D Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
@@ -61,9 +61,7 @@ def _fmt_t(t):
 def _row(shape_str, times, cfg):
     parts = [f"{shape_str:>{_COL_SHAPE}}"]
     for ms in times:
-        parts.append(
-            f"  {_fmt(ms):>{_COL_TIME}}  {_fmt_t(_tflops(cfg, ms)):>{_COL_METRIC}}"
-        )
+        parts.append(f"  {_fmt(ms):>{_COL_TIME}}  {_fmt_t(_tflops(cfg, ms)):>{_COL_METRIC}}")
     return "".join(parts)
 
 
@@ -77,13 +75,13 @@ def _shape_str(cfg):
 
 def _run_shape(cfg, dtype):
     N, H, W = cfg["N"], cfg["H"], cfg["W"]
-    IC, K   = cfg["IC"], cfg["K"]
-    R, S    = cfg["R"], cfg["S"]
+    IC, K = cfg["IC"], cfg["K"]
+    R, S = cfg["R"], cfg["S"]
     pad, stride = cfg["pad"], cfg["stride"]
 
     x = torch.randn(N, H, W, IC, device="cuda", dtype=dtype)
     w = torch.randn(K, R, S, IC, device="cuda", dtype=dtype)
-    b = torch.randn(K,          device="cuda", dtype=dtype)
+    b = torch.randn(K, device="cuda", dtype=dtype)
 
     with oasr.autotune():
         oasr.conv2d(x, w, b, pad, pad, stride, stride)
@@ -99,7 +97,8 @@ def _run_shape(cfg, dtype):
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available"); return
+        print("CUDA not available")
+        return
 
     print(_TITLE)
     print(_TITLE_SEP)

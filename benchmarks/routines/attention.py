@@ -46,29 +46,29 @@ SUBROUTINES = [
 _BASE_CONFIGS: list[dict[str, Any]] = [
     # (B, H, H_kv, T_q, T_k, D)
     # Streaming-chunk shapes (Conformer)
-    {"B": 1,  "H": 4,  "H_kv": 4,  "T_q":   8,  "T_k":   16,  "D": 64},
-    {"B": 4,  "H": 4,  "H_kv": 4,  "T_q":   8,  "T_k":   64,  "D": 64},
-    {"B": 1,  "H": 4,  "H_kv": 4,  "T_q":  16,  "T_k":   32,  "D": 64},
-    {"B": 2,  "H": 8,  "H_kv": 8,  "T_q":   8,  "T_k":  128,  "D": 64},
-    {"B": 2,  "H": 8,  "H_kv": 1,  "T_q":   8,  "T_k":   64,  "D": 64},  # MQA
-    {"B": 2,  "H": 8,  "H_kv": 2,  "T_q":   8,  "T_k":   64,  "D": 64},  # GQA
+    {"B": 1, "H": 4, "H_kv": 4, "T_q": 8, "T_k": 16, "D": 64},
+    {"B": 4, "H": 4, "H_kv": 4, "T_q": 8, "T_k": 64, "D": 64},
+    {"B": 1, "H": 4, "H_kv": 4, "T_q": 16, "T_k": 32, "D": 64},
+    {"B": 2, "H": 8, "H_kv": 8, "T_q": 8, "T_k": 128, "D": 64},
+    {"B": 2, "H": 8, "H_kv": 1, "T_q": 8, "T_k": 64, "D": 64},  # MQA
+    {"B": 2, "H": 8, "H_kv": 2, "T_q": 8, "T_k": 64, "D": 64},  # GQA
     # Larger / offline shapes
-    {"B": 1,  "H": 4,  "H_kv": 4,  "T_q":  64,  "T_k":  256,  "D": 64},
-    {"B": 1,  "H": 8,  "H_kv": 8,  "T_q": 128,  "T_k":  512,  "D": 64},
-    {"B": 1,  "H": 8,  "H_kv": 8,  "T_q": 256,  "T_k": 1024,  "D": 64},
-    {"B": 4,  "H": 8,  "H_kv": 8,  "T_q": 256,  "T_k":  256,  "D": 64},
+    {"B": 1, "H": 4, "H_kv": 4, "T_q": 64, "T_k": 256, "D": 64},
+    {"B": 1, "H": 8, "H_kv": 8, "T_q": 128, "T_k": 512, "D": 64},
+    {"B": 1, "H": 8, "H_kv": 8, "T_q": 256, "T_k": 1024, "D": 64},
+    {"B": 4, "H": 8, "H_kv": 8, "T_q": 256, "T_k": 256, "D": 64},
 ]
 
 _PAGED_CONFIGS: list[dict[str, Any]] = [
     # (B, H, H_kv, T_q, T_k, D, block_size) -- T_k is padded to a multiple
     # of block_size at setup time. head_dim must be a multiple of 32 for
     # the paged kernel.
-    {"B": 1,  "H": 4,  "H_kv": 4,  "T_q":   8,  "T_k":   64,  "D": 64, "block_size": 16},
-    {"B": 4,  "H": 4,  "H_kv": 4,  "T_q":   8,  "T_k":   64,  "D": 64, "block_size": 16},
-    {"B": 2,  "H": 8,  "H_kv": 2,  "T_q":  16,  "T_k":  256,  "D": 64, "block_size": 16},  # GQA streaming
-    {"B": 1,  "H": 8,  "H_kv": 8,  "T_q":  64,  "T_k":  512,  "D": 64, "block_size": 16},
-    {"B": 1,  "H": 8,  "H_kv": 8,  "T_q": 128,  "T_k": 1024,  "D": 64, "block_size": 32},
-    {"B": 4,  "H": 8,  "H_kv": 2,  "T_q":  32,  "T_k":  512,  "D": 64, "block_size": 16},
+    {"B": 1, "H": 4, "H_kv": 4, "T_q": 8, "T_k": 64, "D": 64, "block_size": 16},
+    {"B": 4, "H": 4, "H_kv": 4, "T_q": 8, "T_k": 64, "D": 64, "block_size": 16},
+    {"B": 2, "H": 8, "H_kv": 2, "T_q": 16, "T_k": 256, "D": 64, "block_size": 16},  # GQA streaming
+    {"B": 1, "H": 8, "H_kv": 8, "T_q": 64, "T_k": 512, "D": 64, "block_size": 16},
+    {"B": 1, "H": 8, "H_kv": 8, "T_q": 128, "T_k": 1024, "D": 64, "block_size": 32},
+    {"B": 4, "H": 8, "H_kv": 2, "T_q": 32, "T_k": 512, "D": 64, "block_size": 16},
 ]
 
 
@@ -78,11 +78,11 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
 }
 
 PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
-    "fmha_offline": _BASE_CONFIGS[8],   # (1, 8, 8, 256, 1024, 64)
+    "fmha_offline": _BASE_CONFIGS[8],  # (1, 8, 8, 256, 1024, 64)
     "fmha_bias": _BASE_CONFIGS[8],
     "fmha_seqlens": _BASE_CONFIGS[8],
     "fmha_bias_seqlens": _BASE_CONFIGS[8],
-    "fmha_paged": _PAGED_CONFIGS[3],            # (1, 8, 8, 64, 512, 64)
+    "fmha_paged": _PAGED_CONFIGS[3],  # (1, 8, 8, 64, 512, 64)
     "fmha_paged_bias": _PAGED_CONFIGS[3],
 }
 
@@ -108,7 +108,9 @@ def compute_fmha_tflops(B: int, H: int, T_q: int, T_k: int, D: int, time_ms: flo
 # ---------------------------------------------------------------------------
 
 
-def _make_inputs(cfg: dict, dtype: torch.dtype, *, with_bias: bool, with_seqlens: bool, seed: int = 0):
+def _make_inputs(
+    cfg: dict, dtype: torch.dtype, *, with_bias: bool, with_seqlens: bool, seed: int = 0
+):
     B, H, H_kv = cfg["B"], cfg["H"], cfg["H_kv"]
     T_q, T_k, D = cfg["T_q"], cfg["T_k"], cfg["D"]
     g = torch.Generator(device="cuda").manual_seed(seed)
@@ -124,7 +126,8 @@ def _make_inputs(cfg: dict, dtype: torch.dtype, *, with_bias: bool, with_seqlens
         base = max(1, T_k // 4)
         seqlens = torch.tensor(
             [base if i < B // 2 else T_k for i in range(B)],
-            dtype=torch.int32, device="cuda",
+            dtype=torch.int32,
+            device="cuda",
         )
     return q, k, v, bias, seqlens
 
@@ -150,16 +153,21 @@ def _build_sdpa_mask(q, k, bias, seqlens):
 def _setup_common(cfg: dict, dtype: torch.dtype, *, with_bias: bool, with_seqlens: bool):
     """Build (oasr_fn, pytorch_fn) sharing the same input tensors."""
     q, k, v, bias, seqlens = _make_inputs(
-        cfg, dtype, with_bias=with_bias, with_seqlens=with_seqlens,
+        cfg,
+        dtype,
+        with_bias=with_bias,
+        with_seqlens=with_seqlens,
     )
     H, H_kv = q.size(1), k.size(1)
     D = q.size(-1)
-    scale = 1.0 / (D ** 0.5)
+    scale = 1.0 / (D**0.5)
     out = torch.empty_like(q)
 
     def oasr_fn():
         return oasr.fmha(
-            q, k, v,
+            q,
+            k,
+            v,
             softmax_scale=scale,
             attn_bias=bias,
             cache_seqlens=seqlens,
@@ -176,7 +184,11 @@ def _setup_common(cfg: dict, dtype: torch.dtype, *, with_bias: bool, with_seqlen
 
     def pytorch_fn():
         return F.scaled_dot_product_attention(
-            q, k_e, v_e, attn_mask=full_mask, scale=scale,
+            q,
+            k_e,
+            v_e,
+            attn_mask=full_mask,
+            scale=scale,
         )
 
     return oasr_fn, pytorch_fn
@@ -206,7 +218,11 @@ def setup_fmha_bias_seqlens(cfg: dict, dtype: torch.dtype = torch.float16):
 
 
 def _make_paged_inputs(
-    cfg: dict, dtype: torch.dtype, *, with_bias: bool, seed: int = 0,
+    cfg: dict,
+    dtype: torch.dtype,
+    *,
+    with_bias: bool,
+    seed: int = 0,
 ):
     B, H, H_kv = cfg["B"], cfg["H"], cfg["H_kv"]
     T_q, T_k, D = cfg["T_q"], cfg["T_k"], cfg["D"]
@@ -220,19 +236,33 @@ def _make_paged_inputs(
     q = torch.randn(B, H, T_q, D, dtype=dtype, device="cuda", generator=g)
     num_pool_blocks = max(B * max_blocks_per_seq + 4, 32)
     k_pool = torch.randn(
-        num_pool_blocks, block_size, H_kv, D, dtype=dtype, device="cuda", generator=g,
+        num_pool_blocks,
+        block_size,
+        H_kv,
+        D,
+        dtype=dtype,
+        device="cuda",
+        generator=g,
     )
     v_pool = torch.randn(
-        num_pool_blocks, block_size, H_kv, D, dtype=dtype, device="cuda", generator=g,
+        num_pool_blocks,
+        block_size,
+        H_kv,
+        D,
+        dtype=dtype,
+        device="cuda",
+        generator=g,
     )
     block_ids = torch.randperm(num_pool_blocks)[: B * max_blocks_per_seq]
     block_table = block_ids.reshape(B, max_blocks_per_seq).to(
-        dtype=torch.int32, device="cuda",
+        dtype=torch.int32,
+        device="cuda",
     )
     # Vary cache_seqlens across streams to exercise per-stream length mask.
     seqlens = torch.tensor(
         [max(1, T_k - 8 - 2 * b) for b in range(B)],
-        dtype=torch.int32, device="cuda",
+        dtype=torch.int32,
+        device="cuda",
     )
     bias = None
     if with_bias:
@@ -242,17 +272,21 @@ def _make_paged_inputs(
 
 def _setup_paged(cfg: dict, dtype: torch.dtype, *, with_bias: bool):
     q, k_pool, v_pool, block_table, seqlens, bias, T_k = _make_paged_inputs(
-        cfg, dtype, with_bias=with_bias,
+        cfg,
+        dtype,
+        with_bias=with_bias,
     )
     H, D = q.size(1), q.size(-1)
     H_kv = k_pool.size(2)
     block_size = k_pool.size(1)
-    scale = 1.0 / (D ** 0.5)
+    scale = 1.0 / (D**0.5)
     out = torch.empty_like(q)
 
     def oasr_fn():
         return oasr.fmha(
-            q, k_pool, v_pool,
+            q,
+            k_pool,
+            v_pool,
             softmax_scale=scale,
             attn_bias=bias,
             cache_seqlens=seqlens,
@@ -262,12 +296,8 @@ def _setup_paged(cfg: dict, dtype: torch.dtype, *, with_bias: bool):
 
     # Reference: gather + SDPA (mirrors the SDPA fallback path).
     block_ids_long = block_table.long()
-    k_full = k_pool[block_ids_long].reshape(
-        q.size(0), -1, H_kv, D
-    ).permute(0, 2, 1, 3)
-    v_full = v_pool[block_ids_long].reshape(
-        q.size(0), -1, H_kv, D
-    ).permute(0, 2, 1, 3)
+    k_full = k_pool[block_ids_long].reshape(q.size(0), -1, H_kv, D).permute(0, 2, 1, 3)
+    v_full = v_pool[block_ids_long].reshape(q.size(0), -1, H_kv, D).permute(0, 2, 1, 3)
     if H_kv != H:
         n_repeat = H // H_kv
         k_full = k_full.repeat_interleave(n_repeat, dim=1)
@@ -276,7 +306,11 @@ def _setup_paged(cfg: dict, dtype: torch.dtype, *, with_bias: bool):
 
     def pytorch_fn():
         return F.scaled_dot_product_attention(
-            q, k_full, v_full, attn_mask=full_mask, scale=scale,
+            q,
+            k_full,
+            v_full,
+            attn_mask=full_mask,
+            scale=scale,
         )
 
     # Stash the resolved T_k so the bench TFLOPS calculation uses the
@@ -313,8 +347,12 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
     """Add attention-specific CLI arguments."""
     parser.add_argument("--B", type=int, default=None, help="Batch size")
     parser.add_argument("--H", type=int, default=None, help="Number of query heads")
-    parser.add_argument("--H_kv", type=int, default=None,
-                        help="Number of K/V heads (defaults to H; H % H_kv must be 0)")
+    parser.add_argument(
+        "--H_kv",
+        type=int,
+        default=None,
+        help="Number of K/V heads (defaults to H; H % H_kv must be 0)",
+    )
     parser.add_argument("--T_q", type=int, default=None, help="Query length")
     parser.add_argument("--T_k", type=int, default=None, help="Key/value length")
     parser.add_argument("--D", type=int, default=None, help="Head dimension")
@@ -330,8 +368,7 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
     subroutine = getattr(args, "subroutine", None) or "fmha_offline"
     if subroutine not in SUBROUTINES:
         raise ValueError(
-            f"Unknown attention subroutine '{subroutine}'. "
-            f"Choose from: {SUBROUTINES}"
+            f"Unknown attention subroutine '{subroutine}'. " f"Choose from: {SUBROUTINES}"
         )
     dtype_str = getattr(args, "dtype", "float16")
     dtype = parse_dtype(dtype_str) if dtype_str else torch.float16
@@ -353,11 +390,7 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
 
         output.write_verbose(f"shape = {shape_str}, dtype = {dtype_str}", level=2)
 
-        if (
-            do_check
-            and "torch" in backends
-            and any(b in fn_map and b != "torch" for b in backends)
-        ):
+        if do_check and "torch" in backends and any(b in fn_map and b != "torch" for b in backends):
             oasr_out = oasr_fn()
             pytorch_out = pytorch_fn()
             passed, max_diff = check_close(oasr_out, pytorch_out)
@@ -377,18 +410,25 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
                 use_cuda_events=use_cuda_events,
             )
             tflops = compute_fmha_tflops(
-                cfg["B"], cfg["H"], cfg["T_q"], cfg["T_k"], cfg["D"], median_ms,
+                cfg["B"],
+                cfg["H"],
+                cfg["T_q"],
+                cfg["T_k"],
+                cfg["D"],
+                median_ms,
             )
-            output.write_result(BenchResult(
-                routine="attention",
-                subroutine=subroutine,
-                backend=backend,
-                shape=shape_str,
-                dtype=dtype_str,
-                median_ms=median_ms,
-                std_ms=std_ms,
-                tflops=tflops,
-            ))
+            output.write_result(
+                BenchResult(
+                    routine="attention",
+                    subroutine=subroutine,
+                    backend=backend,
+                    shape=shape_str,
+                    dtype=dtype_str,
+                    median_ms=median_ms,
+                    std_ms=std_ms,
+                    tflops=tflops,
+                )
+            )
 
 
 def _resolve_configs(args: argparse.Namespace, subroutine: str) -> list[dict]:
@@ -435,13 +475,25 @@ def run_standalone() -> None:
                     for backend, fn in [("cutlass", oasr_fn), ("torch", pytorch_fn)]:
                         median_ms, std_ms = bench_fn(fn)
                         tflops = compute_fmha_tflops(
-                            cfg["B"], cfg["H"], cfg["T_q"], cfg["T_k"], cfg["D"], median_ms,
+                            cfg["B"],
+                            cfg["H"],
+                            cfg["T_q"],
+                            cfg["T_k"],
+                            cfg["D"],
+                            median_ms,
                         )
-                        output.write_result(BenchResult(
-                            routine="attention", subroutine=sub, backend=backend,
-                            shape=shape, dtype=dtype_str,
-                            median_ms=median_ms, std_ms=std_ms, tflops=tflops,
-                        ))
+                        output.write_result(
+                            BenchResult(
+                                routine="attention",
+                                subroutine=sub,
+                                backend=backend,
+                                shape=shape,
+                                dtype=dtype_str,
+                                median_ms=median_ms,
+                                std_ms=std_ms,
+                                tflops=tflops,
+                            )
+                        )
         output.finalize()
 
     run_main("FMHA Kernel", profile_configs, setup_funcs, benchmark)

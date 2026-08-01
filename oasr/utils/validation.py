@@ -11,7 +11,6 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
-
 # ---------------------------------------------------------------------------
 # Device helpers
 # ---------------------------------------------------------------------------
@@ -159,8 +158,7 @@ def backend_requirement(
                     ranked = heuristic_func(suitable, *args, **kwargs)
                     if not ranked:
                         raise RuntimeError(
-                            f"No suitable backend found for the given inputs "
-                            f"on SM{cc}."
+                            f"No suitable backend found for the given inputs " f"on SM{cc}."
                         )
                     wrapper.suitable_auto_backends = ranked
                 elif backend is not None and backend in backend_checks:
@@ -176,8 +174,7 @@ def backend_requirement(
                     check_fn(*args, **kwargs)
                 elif backend is not None and backend not in backend_checks:
                     raise ValueError(
-                        f"Unknown backend '{backend}'. "
-                        f"Available: {list(backend_checks.keys())}"
+                        f"Unknown backend '{backend}'. " f"Available: {list(backend_checks.keys())}"
                     )
 
             return func(*args, **kwargs)

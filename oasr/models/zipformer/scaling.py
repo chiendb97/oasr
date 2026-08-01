@@ -107,7 +107,7 @@ class ChunkCausalDepthwiseConv1d(nn.Module):
         return conv(x.transpose(1, 2).contiguous()).transpose(1, 2)
 
     def forward(self, x: Tensor, chunk_size: int = -1) -> Tensor:
-        (batch_size, num_channels, seq_len) = x.shape
+        batch_size, num_channels, seq_len = x.shape
         left_pad = self.kernel_size // 2
         if chunk_size < 0 or chunk_size > seq_len:
             chunk_size = seq_len
@@ -128,12 +128,10 @@ class ChunkCausalDepthwiseConv1d(nn.Module):
 
         chunk_scale = self._get_chunk_scale(chunk_size)
         x_chunk = x_chunk * chunk_scale
-        x_chunk = x_chunk.reshape(
-            batch_size, num_chunks, num_channels, chunk_size
-        ).permute(0, 2, 1, 3)
-        x_chunk = x_chunk.reshape(batch_size, num_channels, num_chunks * chunk_size)[
-            ..., :seq_len
-        ]
+        x_chunk = x_chunk.reshape(batch_size, num_chunks, num_channels, chunk_size).permute(
+            0, 2, 1, 3
+        )
+        x_chunk = x_chunk.reshape(batch_size, num_channels, num_chunks * chunk_size)[..., :seq_len]
         return x_chunk + x_causal
 
     def _get_chunk_scale(self, chunk_size: int) -> Tensor:
@@ -151,7 +149,7 @@ class ChunkCausalDepthwiseConv1d(nn.Module):
         return 1.0 + (left_edge + right_edge)
 
     def streaming_forward(self, x: Tensor, cache: Tensor):
-        (batch_size, num_channels, seq_len) = x.shape
+        batch_size, num_channels, seq_len = x.shape
         left_pad = self.kernel_size // 2
         assert cache.shape[-1] == left_pad, (cache.shape[-1], left_pad)
         x = torch.cat([cache, x], dim=2)
@@ -183,9 +181,9 @@ class ActivationDropoutAndLinear(nn.Module):
         activation: str = "SwooshL",
     ):
         super().__init__()
-        l = nn.Linear(in_channels, out_channels, bias=bias)
-        self.weight = l.weight
-        self.register_parameter("bias", l.bias)
+        linear = nn.Linear(in_channels, out_channels, bias=bias)
+        self.weight = linear.weight
+        self.register_parameter("bias", linear.bias)
         self.activation = activation
 
     def forward(self, x: Tensor) -> Tensor:

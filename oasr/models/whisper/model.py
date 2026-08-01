@@ -18,7 +18,7 @@ dense per-layer KV cache carried in an opaque state dict.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn.functional as F

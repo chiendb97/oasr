@@ -8,6 +8,12 @@ import torch
 
 import oasr
 
+# Every test in this module allocates directly on ``device="cuda"`` and calls a
+# JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
+# what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
+# instead of a wall of `RuntimeError: No CUDA GPUs are available`.
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+
 
 class TestLayerNorm:
     """Tests for oasr.layer_norm() functional API."""
@@ -116,9 +122,12 @@ class TestBatchNorm1D:
         output = oasr.batch_norm_1d(x, weight, bias, running_mean, running_var, eps)
 
         # Reference: (x - mean) / sqrt(var + eps) * weight + bias
-        expected = ((x.float() - running_mean.float()) / torch.sqrt(
-            running_var.float() + eps
-        ) * weight.float() + bias.float()).to(dtype)
+        expected = (
+            (x.float() - running_mean.float())
+            / torch.sqrt(running_var.float() + eps)
+            * weight.float()
+            + bias.float()
+        ).to(dtype)
 
         rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
@@ -182,9 +191,7 @@ class TestAddLayerNormResidual:
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
         bias = torch.randn(hidden_size, device="cuda", dtype=dtype) if has_bias else None
 
-        out, res_out = oasr.add_layer_norm_residual(
-            x, residual, weight, bias, eps, alpha
-        )
+        out, res_out = oasr.add_layer_norm_residual(x, residual, weight, bias, eps, alpha)
 
         # Reference matches the unfused pre-norm path: the residual sum is
         # materialised in-dtype (s = residual + alpha*x), then LayerNorm(s).

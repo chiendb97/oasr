@@ -13,11 +13,9 @@ OASR-native and only cover what the SM80 / SM120 forward pass actually uses.
 # PEP 563 (deferred annotations) breaks CuteDSL Constexpr detection;
 # do not enable.
 
-from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
-
 
 LOG2_E = 1.4426950408889634074
 
@@ -37,6 +35,7 @@ def compute_softmax_scale_log2(softmax_scale: cutlass.Float32) -> cutlass.Float3
 # m16n8k16 lays out the accumulator so each row of the MMA-C tile is owned by
 # a 4-thread quad (tid % 4 in {0,1,2,3} share the same row). The row-max /
 # row-sum reductions therefore need a 2-step bfly shuffle (offsets 2 and 1).
+
 
 def _quad_reduce(val, op):
     val = op(val, cute.arch.shuffle_sync_bfly(val, offset=2, mask=-1, mask_and_clamp=31))
@@ -62,6 +61,7 @@ def quad_reduce_sum(val):
 # a multiply-high-shift sequence. The kernel only needs ``(divisor, mul_hi,
 # shift)`` -- evaluating them on the host avoids a 70-cycle integer divide
 # inside the kernel.
+
 
 class FastDivmod:
     """Holds the magic numbers for an unsigned 32-bit fast divmod.
@@ -103,6 +103,7 @@ class FastDivmod:
 # Score-mod helpers
 # ---------------------------------------------------------------------------
 
+
 def softcap(x: cutlass.Float32, cap: cutlass.Float32) -> cutlass.Float32:
     """``softcap(x, c) = c * tanh(x / c)``.
 
@@ -121,6 +122,7 @@ def softcap(x: cutlass.Float32, cap: cutlass.Float32) -> cutlass.Float32:
 # entry within the tile. The shape/stride swizzle below is identical to the
 # old _make_acc_tensor_mn_view in fmha_sm80.py but lives here so other
 # kernels can reuse it.
+
 
 def make_acc_mn_view(acc: cute.Tensor) -> cute.Tensor:
     """Re-layout an MMA-C accumulator into per-row indexing.

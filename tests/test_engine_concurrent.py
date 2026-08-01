@@ -21,13 +21,11 @@ import glob
 import os
 import random
 import threading
-from pathlib import Path
 from typing import List
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-
 
 pytestmark = pytest.mark.concurrent
 
@@ -62,6 +60,7 @@ def _make_patched_engine():
     engine._feat_stream = None
 
     from oasr.engine.scheduler import Scheduler
+
     engine._scheduler = Scheduler(cfg)
 
     # Stub the heavy collaborators. ``feed_chunk`` only calls
@@ -212,6 +211,7 @@ def test_property_reads_are_consistent_under_writes():
         t.start()
     # Let them race for a moment.
     import time
+
     time.sleep(0.5)
     stop.set()
     for t in threads:
@@ -225,32 +225,17 @@ def test_property_reads_are_consistent_under_writes():
 # ---------------------------------------------------------------------------
 
 
-def _require_ckpt(ckpt_dir: str) -> None:
-    if not ckpt_dir or not Path(ckpt_dir).exists():
-        pytest.skip("WeNet checkpoint dir not set; set CKPT_DIR or --ckpt-dir")
-
-
-def _require_wavs(wav_dir: str) -> List[str]:
-    if not wav_dir or not Path(wav_dir).is_dir():
-        pytest.skip("WAV directory not set; use --wav-dir or WAV_DIR")
-    wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
-    if not wavs:
-        pytest.skip("No .wav files found in WAV directory")
-    return wavs
-
-
 @pytest.mark.slow
 def test_e2e_streaming_concurrent_feeders(ckpt_dir: str, wav_dir: str):
     """Real engine: 4 streaming requests fed from 4 threads while a single
     step-loop thread drains.  Outputs must match the single-threaded baseline.
     """
-    import torch
     import torchaudio  # noqa: F401  — fail early if missing
+
     from oasr.engine.config import EngineConfig
     from oasr.engine.engine import ASREngine
 
-    _require_ckpt(ckpt_dir)
-    wavs = _require_wavs(wav_dir)[:4]
+    wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))[:4]
 
     engine = ASREngine(EngineConfig(ckpt_dir=ckpt_dir, max_batch_size=8))
 
@@ -276,6 +261,7 @@ def test_e2e_streaming_concurrent_feeders(ckpt_dir: str, wav_dir: str):
     def submit(wav_path: str):
         try:
             import soundfile as sf
+
             samples, sr = sf.read(wav_path, dtype="float32")
             if samples.ndim > 1:
                 samples = samples.mean(axis=1).astype("float32")
@@ -284,7 +270,7 @@ def test_e2e_streaming_concurrent_feeders(ckpt_dir: str, wav_dir: str):
             step = max(1, int(sr * 0.64))
             for start in range(0, len(samples), step):
                 is_last = (start + step) >= len(samples)
-                engine.feed_chunk(rid, samples[start:start + step], is_last=is_last)
+                engine.feed_chunk(rid, samples[start : start + step], is_last=is_last)
             results[rid] = wav_path
         except BaseException as e:
             errors.append(e)
@@ -296,14 +282,18 @@ def test_e2e_streaming_concurrent_feeders(ckpt_dir: str, wav_dir: str):
     # Main thread drives step() while feeders push.
     drained_outputs = []
     import time
+
     deadline = time.time() + 60.0
     while time.time() < deadline:
         outs = engine.step()
         for o in outs:
             if o.finished:
                 drained_outputs.append(o)
-        if not any(t.is_alive() for t in threads) and engine.num_running == 0 \
-                and engine.num_waiting == 0:
+        if (
+            not any(t.is_alive() for t in threads)
+            and engine.num_running == 0
+            and engine.num_waiting == 0
+        ):
             break
         time.sleep(0.001)
 
@@ -311,5 +301,6 @@ def test_e2e_streaming_concurrent_feeders(ckpt_dir: str, wav_dir: str):
         t.join()
 
     assert not errors, f"feeders raised: {errors!r}"
-    assert len(drained_outputs) == len(wavs), \
-        f"expected {len(wavs)} finals, got {len(drained_outputs)}"
+    assert len(drained_outputs) == len(
+        wavs
+    ), f"expected {len(wavs)} finals, got {len(drained_outputs)}"

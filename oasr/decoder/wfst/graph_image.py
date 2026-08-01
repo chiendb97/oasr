@@ -143,7 +143,7 @@ def read_image(path: str | Path) -> GraphImage:
         if version not in (1, 2):
             raise ValueError(f"unsupported version {version}")
         fmt = _HDR_V2 if version == 2 else _HDR_V1
-        (_, _, flags, n_states, n_arcs, vocab, start, aux_size, *offs) = struct.unpack(
+        _, _, flags, n_states, n_arcs, vocab, start, aux_size, *offs = struct.unpack(
             fmt, header[: struct.calcsize(fmt)]
         )
 
@@ -207,7 +207,9 @@ def build_image(
     # Contiguity + placement: finals must occupy either the first or the last
     # final_count[s] slots of every state's range.
     pos = np.arange(n_arcs, dtype=np.int64) - row_splits[:-1].astype(np.int64).repeat(deg)
-    finals_at_start = bool((pos[is_final] < final_count[src[is_final]]).all()) if is_final.any() else False
+    finals_at_start = (
+        bool((pos[is_final] < final_count[src[is_final]]).all()) if is_final.any() else False
+    )
     finals_at_end = (
         bool((pos[is_final] >= (deg.astype(np.int64) - final_count)[src[is_final]]).all())
         if is_final.any()

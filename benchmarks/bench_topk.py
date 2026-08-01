@@ -13,8 +13,8 @@ from benchmarks.routines.topk import setup_topk
 
 # (batch, seq, channels, k)
 CONFIGS = [
-    {"batch": 64, "seq": 250, "channels": 256,  "k": 5},
-    {"batch": 64, "seq": 250, "channels": 512,  "k": 5},
+    {"batch": 64, "seq": 250, "channels": 256, "k": 5},
+    {"batch": 64, "seq": 250, "channels": 512, "k": 5},
     {"batch": 64, "seq": 250, "channels": 1024, "k": 5},
     {"batch": 64, "seq": 250, "channels": 2048, "k": 5},
     {"batch": 64, "seq": 250, "channels": 4096, "k": 5},
@@ -25,8 +25,8 @@ CONFIGS = [
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 DTYPE_NAMES = {torch.float16: "float16", torch.bfloat16: "bfloat16", torch.float32: "float32"}
 
-_COL_SHAPE  = 26
-_COL_TIME   = 12
+_COL_SHAPE = 26
+_COL_TIME = 12
 _COL_METRIC = 10
 
 _HEADER = (
@@ -35,14 +35,14 @@ _HEADER = (
     f"  {'PyTorch':>{_COL_TIME}}  {'BW(TB/s)':>{_COL_METRIC}}"
     f"  {'Speedup':>8}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR TopK Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR TopK Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
 def _bw_tb_s(cfg, dtype, ms):
     b, s, c, k = cfg["batch"], cfg["seq"], cfg["channels"], cfg["k"]
-    elem   = dtype_size(dtype)
+    elem = dtype_size(dtype)
     nbytes = b * s * c * elem + b * s * k * (elem + 4)  # read input + write values + indices
     return nbytes / (ms * 1e-3) / 1e12
 
@@ -57,7 +57,7 @@ def _fmt_bw(bw):
 
 def _row(shape_str, cuda_ms, pt_ms, cfg, dtype):
     cuda_bw = _bw_tb_s(cfg, dtype, cuda_ms)
-    pt_bw   = _bw_tb_s(cfg, dtype, pt_ms)
+    pt_bw = _bw_tb_s(cfg, dtype, pt_ms)
     speedup = pt_ms / cuda_ms
     return (
         f"{shape_str:>{_COL_SHAPE}}"
@@ -84,7 +84,7 @@ def main():
             b, s, c, k = cfg["batch"], cfg["seq"], cfg["channels"], cfg["k"]
             cuda_fn, pt_fn = setup_topk(b, s, c, k, dtype)
             cuda_ms, _ = bench_fn(cuda_fn)
-            pt_ms,   _ = bench_fn(pt_fn)
+            pt_ms, _ = bench_fn(pt_fn)
             shape_str = f"[{b},{s},{c}] k={k}"
             print(_row(shape_str, cuda_ms, pt_ms, cfg, dtype))
 

@@ -1,0 +1,122 @@
+name: lint
+
+# Style + static analysis.  Everything here runs on a plain CPU runner with no
+# CUDA toolkit and no build: the Python linters read source, and the Rust jobs
+# only need cargo.  Nothing in this workflow imports `oasr`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: python (black / isort / ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install pinned tooling
+        run: pip install -r requirements-dev.txt
+
+      # isort and ruff's `I` rules both sort imports and are configured to
+      # agree (see the note in pyproject.toml); running both is deliberate, so
+      # a divergence introduced by a config edit shows up here.
+      - run: black --check --diff oasr/ tests/ benchmarks/ scripts/ ci/
+      - run: isort --check-only --diff oasr/ tests/ benchmarks/ scripts/ ci/
+      - run: ruff check --output-format=github oasr/ tests/ benchmarks/ scripts/ ci/
+
+      # The GPU family split is shared by test-gpu.yml and ci/modal_app.py; a
+      # new tests/test_*.py that is in neither would never run on either
+      # backend, and the failure mode is silence.
+      - run: python ci/gpu_suites.py --check
+
+  mypy:
+    name: python (mypy ratchet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.12 is pinned, not incidental: [tool.mypy] deliberately sets no
+      # `python_version`, because that setting also applies to third-party
+      # stubs and made mypy abort on numpy's PEP 695 `type` statements before
+      # it checked a line of this repo.  mypy therefore runs at the
+      # interpreter's version, so the interpreter is part of the baseline.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            ci/mypy-requirements.txt
+
+      # mypy needs torch's stubs to say anything useful about this codebase;
+      # the CPU wheel is enough and avoids pulling the CUDA runtime.  The rest
+      # of the environment is pinned because the baseline counts errors that
+      # come out of those stubs — see ci/mypy-requirements.txt.
+      - name: Install tooling + torch (CPU)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r ci/mypy-requirements.txt -r requirements-dev.txt
+
+      # Not "zero errors" — several hundred exist today, nearly all untyped-torch
+      # noise.  The gate is that no file gets worse.  See scripts/mypy_ratchet.py.
+      - run: python scripts/mypy_ratchet.py
+
+  rust:
+    name: rust (fmt / clippy / test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # tonic's build.rs compiles rust/proto/*.proto.
+      - name: Install protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # PyO3 links libpython; `oasr-server` enables pyo3/auto-initialize, so
+      # even `cargo check` needs the development headers present.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: cargo fmt
+        working-directory: rust
+        run: cargo fmt --check
+
+      # Never `--workspace`: oasr-core enables pyo3/extension-module while
+      # oasr-server enables pyo3/auto-initialize, and Cargo unifies features
+      # per build, so one invocation covering both fails to compile.  The
+      # default members are the binary side; oasr-core is linted separately.
+      - name: cargo clippy (default members)
+        working-directory: rust
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo clippy (oasr-core)
+        working-directory: rust
+        run: cargo clippy -p oasr-core --lib -- -D warnings
+
+      - name: cargo test
+        working-directory: rust
+        run: cargo test

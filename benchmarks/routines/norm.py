@@ -253,7 +253,9 @@ def setup_batch_norm_activation(
     torch_act = get_activation(activation_name).cuda()
 
     def oasr_fn():
-        return oasr.batch_norm_activation(x, gamma, beta, running_mean, running_var, eps, act_type_id)
+        return oasr.batch_norm_activation(
+            x, gamma, beta, running_mean, running_var, eps, act_type_id
+        )
 
     def pytorch_fn():
         bn_out = (x - running_mean) / torch.sqrt(running_var + eps) * gamma + beta
@@ -308,7 +310,9 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hidden", type=int, default=None, help="Hidden / channel dimension")
     parser.add_argument("--num-groups", type=int, default=32, help="Number of groups (group_norm)")
     parser.add_argument(
-        "--activation", type=str, default="swish",
+        "--activation",
+        type=str,
+        default="swish",
         help="Activation for fused variants (relu, gelu, swish)",
     )
 
@@ -372,16 +376,18 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
                 use_cuda_events=use_cuda_events,
             )
             bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
-            output.write_result(BenchResult(
-                routine="norm",
-                subroutine=subroutine,
-                backend=backend,
-                shape=shape_str,
-                dtype=dtype_str,
-                median_ms=median_ms,
-                std_ms=std_ms,
-                bandwidth_tb_s=bw,
-            ))
+            output.write_result(
+                BenchResult(
+                    routine="norm",
+                    subroutine=subroutine,
+                    backend=backend,
+                    shape=shape_str,
+                    dtype=dtype_str,
+                    median_ms=median_ms,
+                    std_ms=std_ms,
+                    bandwidth_tb_s=bw,
+                )
+            )
 
 
 def _resolve_configs(args, subroutine):
@@ -492,12 +498,18 @@ def run_standalone(variant: str = "layer_norm") -> None:
                 for backend, fn in [("cuda", oasr_fn), ("torch", pytorch_fn)]:
                     median_ms, std_ms = bench_fn(fn)
                     bw = compute_bandwidth_tb_s(bytes_accessed, median_ms)
-                    output.write_result(BenchResult(
-                        routine="norm", subroutine=sub, backend=backend,
-                        shape=shape_str, dtype="float16",
-                        median_ms=median_ms, std_ms=std_ms,
-                        bandwidth_tb_s=bw,
-                    ))
+                    output.write_result(
+                        BenchResult(
+                            routine="norm",
+                            subroutine=sub,
+                            backend=backend,
+                            shape=shape_str,
+                            dtype="float16",
+                            median_ms=median_ms,
+                            std_ms=std_ms,
+                            bandwidth_tb_s=bw,
+                        )
+                    )
         output.finalize()
 
     run_main(title, pcfg, setup_funcs, benchmark)

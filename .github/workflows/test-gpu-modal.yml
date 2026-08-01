@@ -1,0 +1,90 @@
+name: test-gpu-modal
+
+# The same GPU suite as test-gpu.yml, on a rented Blackwell instead of the
+# self-hosted box.  The job itself runs on a GitHub-hosted runner and only
+# holds a Modal token — the GPU work happens in `ci/modal_app.py`, so a fork PR
+# can never reach anyone's hardware.
+#
+# The default accelerator is RTX-PRO-6000: GB202 at compute capability 12.0,
+# the same sm_120 as the RTX 5090 this project is tuned for.  Anything else is
+# a different SM, which silently skips the SM120-gated suites — useful as a
+# second target, wrong as the only one.
+#
+# ---------------------------------------------------------------------------
+# Setup (once)
+# ---------------------------------------------------------------------------
+#   1. `pip install modal && modal token new`
+#   2. Repo Settings -> Secrets -> Actions: MODAL_TOKEN_ID, MODAL_TOKEN_SECRET
+#   3. Seed the checkpoints into the Volume, from a box that has them (~23 GiB):
+#        set -a; source .env; set +a
+#        export WAV_DIR="$AUDIO_DIR"
+#        export ZIPFORMER_CKPT=/path/to/icefall-...-zipformer-large-cr-ctc-...
+#        modal run ci/modal_app.py::seed_assets --dry-run   # check the plan
+#        modal run ci/modal_app.py::seed_assets
+#
+# Costs GPU-minutes per run, so this is dispatch + weekly rather than per-push.
+# Point it at a PR by dispatching with the branch selected.
+
+on:
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "Comma-separated suite names (empty = all). See ci/gpu_suites.py --list"
+        required: false
+        default: ""
+      gpu:
+        description: "Modal accelerator (RTX-PRO-6000 is sm_120, matching the 5090)"
+        required: false
+        default: "RTX-PRO-6000"
+      strict:
+        description: "Fail instead of skipping when a checkpoint is missing"
+        type: boolean
+        required: false
+        default: true
+  schedule:
+    # 03:30 UTC Sundays — offset from the self-hosted nightly so a shared
+    # failure is attributable to the code rather than to contention.
+    - cron: "30 3 * * 0"
+
+concurrency:
+  group: test-gpu-modal-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gpu:
+    name: modal (${{ github.event.inputs.gpu || 'RTX-PRO-6000' }})
+    runs-on: ubuntu-latest
+    # 5 suites in parallel on a rented GPU, plus image build on a cold cache.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install the Modal client
+        run: pip install modal
+
+      # ci/gpu_suites.py is the shared source of truth for the family split;
+      # fail here rather than silently not running a new test file.
+      - name: Check the suite split covers every test file
+        run: python ci/gpu_suites.py --check
+
+      - name: Run the GPU suite on Modal
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          OASR_MODAL_GPU: ${{ github.event.inputs.gpu || 'RTX-PRO-6000' }}
+        run: |
+          strict_flag="--strict"
+          if [ "${{ github.event.inputs.strict }}" = "false" ]; then
+            strict_flag="--no-strict"
+          fi
+          modal run ci/modal_app.py \
+            --suites "${{ github.event.inputs.suites }}" \
+            $strict_flag

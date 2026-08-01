@@ -9,6 +9,12 @@ import torch.nn.functional as F
 
 import oasr
 
+# Every test in this module allocates directly on ``device="cuda"`` and calls a
+# JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
+# what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
+# instead of a wall of `RuntimeError: No CUDA GPUs are available`.
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+
 
 class TestDepthwiseConv1D:
     """Tests for oasr.depthwise_conv1d() functional API."""
@@ -34,7 +40,9 @@ class TestDepthwiseConv1D:
         # PyTorch reference
         x_nchw = x.permute(0, 2, 1)
         weight_pt = weight.permute(1, 0).view(channels, 1, kernel_size)
-        ref_nchw = F.conv1d(x_nchw, weight_pt, bias=bias, stride=1, padding=padding, groups=channels)
+        ref_nchw = F.conv1d(
+            x_nchw, weight_pt, bias=bias, stride=1, padding=padding, groups=channels
+        )
         expected = ref_nchw.permute(0, 2, 1)
 
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
@@ -105,10 +113,15 @@ class TestConv2D:
         filt = torch.randn(K, R, S, IC, device="cuda", dtype=dtype)
 
         output = oasr.conv2d(
-            x, filt, bias=None,
-            pad_h=pad_h, pad_w=pad_w,
-            stride_h=stride_h, stride_w=stride_w,
-            dilation_h=dilation_h, dilation_w=dilation_w,
+            x,
+            filt,
+            bias=None,
+            pad_h=pad_h,
+            pad_w=pad_w,
+            stride_h=stride_h,
+            stride_w=stride_w,
+            dilation_h=dilation_h,
+            dilation_w=dilation_w,
         )
 
         # Check output shape
@@ -140,10 +153,15 @@ class TestConv2DCudnn:
         filt = torch.randn(K, R, S, IC, device="cuda", dtype=dtype)
 
         output = oasr.conv2d(
-            x, filt, bias=None,
-            pad_h=pad_h, pad_w=pad_w,
-            stride_h=stride_h, stride_w=stride_w,
-            dilation_h=dilation_h, dilation_w=dilation_w,
+            x,
+            filt,
+            bias=None,
+            pad_h=pad_h,
+            pad_w=pad_w,
+            stride_h=stride_h,
+            stride_w=stride_w,
+            dilation_h=dilation_h,
+            dilation_w=dilation_w,
         )
 
         # PyTorch reference: convert NHWC → NCHW for F.conv2d
@@ -151,8 +169,10 @@ class TestConv2DCudnn:
         # KRSC → KCRS (PyTorch standard)
         filt_nchw = filt.permute(0, 3, 1, 2).contiguous()
         ref_nchw = F.conv2d(
-            x_nchw.float(), filt_nchw.float(),
-            padding=(pad_h, pad_w), stride=(stride_h, stride_w),
+            x_nchw.float(),
+            filt_nchw.float(),
+            padding=(pad_h, pad_w),
+            stride=(stride_h, stride_w),
             dilation=(dilation_h, dilation_w),
         )
         expected = ref_nchw.permute(0, 2, 3, 1).to(dtype)
@@ -172,17 +192,24 @@ class TestConv2DCudnn:
         bias = torch.randn(K, device="cuda", dtype=dtype)
 
         output = oasr.conv2d(
-            x, filt, bias=bias,
-            pad_h=pad_h, pad_w=pad_w,
-            stride_h=stride_h, stride_w=stride_w,
+            x,
+            filt,
+            bias=bias,
+            pad_h=pad_h,
+            pad_w=pad_w,
+            stride_h=stride_h,
+            stride_w=stride_w,
         )
 
         # PyTorch reference
         x_nchw = x.permute(0, 3, 1, 2).contiguous()
         filt_nchw = filt.permute(0, 3, 1, 2).contiguous()
         ref_nchw = F.conv2d(
-            x_nchw.float(), filt_nchw.float(), bias=bias.float(),
-            padding=(pad_h, pad_w), stride=(stride_h, stride_w),
+            x_nchw.float(),
+            filt_nchw.float(),
+            bias=bias.float(),
+            padding=(pad_h, pad_w),
+            stride=(stride_h, stride_w),
         )
         expected = ref_nchw.permute(0, 2, 3, 1).to(dtype)
 
@@ -191,9 +218,9 @@ class TestConv2DCudnn:
     @pytest.mark.parametrize(
         "activation_type,activation_fn",
         [
-            (0, lambda x: torch.relu(x)),                       # RELU
-            (1, lambda x: torch.nn.functional.gelu(x)),         # GELU
-            (2, lambda x: torch.nn.functional.silu(x)),         # SWISH
+            (0, lambda x: torch.relu(x)),  # RELU
+            (1, lambda x: torch.nn.functional.gelu(x)),  # GELU
+            (2, lambda x: torch.nn.functional.silu(x)),  # SWISH
         ],
     )
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -206,18 +233,25 @@ class TestConv2DCudnn:
         bias = torch.randn(K, device="cuda", dtype=dtype)
 
         output = oasr.conv2d_activation(
-            x, filt, bias=bias,
+            x,
+            filt,
+            bias=bias,
             activation_type=activation_type,
-            pad_h=pad_h, pad_w=pad_w,
-            stride_h=stride_h, stride_w=stride_w,
+            pad_h=pad_h,
+            pad_w=pad_w,
+            stride_h=stride_h,
+            stride_w=stride_w,
         )
 
         # PyTorch reference
         x_nchw = x.permute(0, 3, 1, 2).contiguous()
         filt_nchw = filt.permute(0, 3, 1, 2).contiguous()
         ref_nchw = F.conv2d(
-            x_nchw.float(), filt_nchw.float(), bias=bias.float(),
-            padding=(pad_h, pad_w), stride=(stride_h, stride_w),
+            x_nchw.float(),
+            filt_nchw.float(),
+            bias=bias.float(),
+            padding=(pad_h, pad_w),
+            stride=(stride_h, stride_w),
         )
         expected = activation_fn(ref_nchw).permute(0, 2, 3, 1).to(dtype)
 

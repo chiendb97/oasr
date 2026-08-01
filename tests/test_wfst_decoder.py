@@ -16,12 +16,11 @@ decoder lives behind an int64 handle and results come back through CPU output te
 """
 
 import math
-import os
 
+import assets
 import numpy as np
 import pytest
 import torch
-
 
 # ---------------------------------------------------------------------------
 # Availability guard
@@ -71,11 +70,11 @@ def _write_toy_graph(path: str) -> None:
     num_states = 4
     # (src, dest, ilabel, weight), grouped by src, emitting-before-final within each src.
     arcs = [
-        (0, 0, 0, 0.0),   # 0: blank self-loop
-        (0, 1, 1, 0.0),   # 1: 0 -> 1 on label 1  (word 10)
-        (1, 1, 0, 0.0),   # 2: blank self-loop
-        (1, 2, 2, 0.0),   # 3: 1 -> 2 on label 2  (word 20)
-        (2, 2, 0, 0.0),   # 4: blank self-loop
+        (0, 0, 0, 0.0),  # 0: blank self-loop
+        (0, 1, 1, 0.0),  # 1: 0 -> 1 on label 1  (word 10)
+        (1, 1, 0, 0.0),  # 2: blank self-loop
+        (1, 2, 2, 0.0),  # 3: 1 -> 2 on label 2  (word 20)
+        (2, 2, 0, 0.0),  # 4: blank self-loop
         (2, 3, -1, 0.0),  # 5: 2 -> super-final (final arc)
     ]
     aux = {1: [10], 3: [20]}
@@ -94,8 +93,12 @@ def _write_toy_graph(path: str) -> None:
         aux_row_splits[i + 1] = len(pool)
 
     img = build_image(
-        row_splits, dest, ilabel, weight,
-        aux_row_splits=aux_row_splits, aux_pool=np.array(pool, dtype=np.int32),
+        row_splits,
+        dest,
+        ilabel,
+        weight,
+        aux_row_splits=aux_row_splits,
+        aux_pool=np.array(pool, dtype=np.int32),
         vocab_size=_TOY_VOCAB,
     )
     write_image(img, path)
@@ -121,8 +124,21 @@ def _cpu_decode(graph_path, logp_cpu, min_active=1, max_active=100):
     out_wlen = torch.empty((1,), dtype=torch.int32)
     out_score = torch.empty((1,), dtype=torch.float64)
     out_meta = torch.empty((3,), dtype=torch.int32)
-    mod.wfst_cpu_decode(graph_path, logp_cpu, 20.0, 8.0, min_active, max_active, 1, 0, 3,
-                        out_words, out_wlen, out_score, out_meta)
+    mod.wfst_cpu_decode(
+        graph_path,
+        logp_cpu,
+        20.0,
+        8.0,
+        min_active,
+        max_active,
+        1,
+        0,
+        3,
+        out_words,
+        out_wlen,
+        out_score,
+        out_meta,
+    )
     length = min(int(out_wlen[0]), cap)
     return out_words[:length].tolist(), float(out_score[0]), bool(out_meta[0])
 
@@ -144,8 +160,13 @@ def test_toy_gpu_matches_cpu_reference(toy_fst):
     """GPU decode == CPU reference == the expected word sequence."""
     from oasr.decoder.wfst_decoder import WfstDecoderOptions, WfstDecoderSearch
 
-    opts = WfstDecoderOptions(min_active_states=1, max_active_states=100,
-                              blank_skip_thresh=1.0, max_frames=16, max_offline_lanes=2)
+    opts = WfstDecoderOptions(
+        min_active_states=1,
+        max_active_states=100,
+        blank_skip_thresh=1.0,
+        max_frames=16,
+        max_offline_lanes=2,
+    )
     searcher = WfstDecoderSearch(toy_fst, opts)
     tokens, scores = searcher.decode_offline(_toy_logp([1, 2], "cuda"))
     gpu_words, gpu_score = tokens[0], scores[0]
@@ -163,14 +184,19 @@ def test_toy_batched_offline_equivalence(toy_fst):
     _module()
     from oasr.decoder.wfst_decoder import WfstDecoderOptions, WfstDecoderSearch
 
-    opts = WfstDecoderOptions(min_active_states=1, max_active_states=100,
-                              blank_skip_thresh=1.0, max_frames=32, max_offline_lanes=4)
+    opts = WfstDecoderOptions(
+        min_active_states=1,
+        max_active_states=100,
+        blank_skip_thresh=1.0,
+        max_frames=32,
+        max_offline_lanes=4,
+    )
     searcher = WfstDecoderSearch(toy_fst, opts)
 
     rows = [
-        _toy_logp([1, 2], "cuda"),        # T=2
-        _toy_logp([1, 0, 2], "cuda"),     # T=3, blank in the middle
-        _toy_logp([1, 2, 0], "cuda"),     # T=3, trailing blank
+        _toy_logp([1, 2], "cuda"),  # T=2
+        _toy_logp([1, 0, 2], "cuda"),  # T=3, blank in the middle
+        _toy_logp([1, 2, 0], "cuda"),  # T=3, trailing blank
     ]
     per_row = [searcher.decode_offline(r) for r in rows]  # each -> ([[words]], [score])
 
@@ -199,14 +225,24 @@ def test_toy_winners_gc_matches_plain(toy_fst):
     logp = _toy_logp(labels, "cuda")
     plain = WfstDecoderSearch(
         toy_fst,
-        WfstDecoderOptions(min_active_states=1, max_active_states=100,
-                           blank_skip_thresh=1.0, max_frames=64, max_offline_lanes=2),
+        WfstDecoderOptions(
+            min_active_states=1,
+            max_active_states=100,
+            blank_skip_thresh=1.0,
+            max_frames=64,
+            max_offline_lanes=2,
+        ),
     )
     gc = WfstDecoderSearch(
         toy_fst,
-        WfstDecoderOptions(min_active_states=1, max_active_states=100,
-                           blank_skip_thresh=1.0, max_frames=64, max_offline_lanes=2,
-                           gc_interval=8),
+        WfstDecoderOptions(
+            min_active_states=1,
+            max_active_states=100,
+            blank_skip_thresh=1.0,
+            max_frames=64,
+            max_offline_lanes=2,
+            gc_interval=8,
+        ),
     )
     t0, s0 = plain.decode_offline(logp)
     t1, s1 = gc.decode_offline(logp)
@@ -224,7 +260,6 @@ def test_toy_streaming_gc_recovers_full_path(toy_fst):
     import torch
 
     from oasr.decoder.wfst_decoder import _get_graph
-    from oasr.jit.wfst_decoder import gen_wfst_decoder_module
 
     mod = _module()
     graph = _get_graph(toy_fst)
@@ -233,19 +268,29 @@ def test_toy_streaming_gc_recovers_full_path(toy_fst):
     chunk = 8
 
     def run(gc):
-        dec = int(mod.wfst_create_decoder(
-            graph, 20.0, 8.0, 1, 100, 1, 1, chunk, 0, 16, 4, 1, 0, 0, 1, 0, 3, 0, 0, gc))
+        dec = int(
+            mod.wfst_create_decoder(
+                graph, 20.0, 8.0, 1, 100, 1, 1, chunk, 0, 16, 4, 1, 0, 0, 1, 0, 3, 0, 0, gc
+            )
+        )
         ch = int(mod.wfst_create_stream(dec))
         assert ch >= 0
         for s in range(0, logp.size(0), chunk):
             piece = logp[s : s + chunk].unsqueeze(0).contiguous()
-            outs = [torch.empty((1, 8), dtype=torch.int32),
-                    torch.empty((1,), dtype=torch.int32),
-                    torch.empty((1,), dtype=torch.int32),
-                    torch.empty((1,), dtype=torch.int32)]
-            mod.wfst_advance_chunk(dec, torch.tensor([ch], dtype=torch.int32), piece,
-                                   torch.tensor([piece.size(1)], dtype=torch.int32), 0,
-                                   *outs)
+            outs = [
+                torch.empty((1, 8), dtype=torch.int32),
+                torch.empty((1,), dtype=torch.int32),
+                torch.empty((1,), dtype=torch.int32),
+                torch.empty((1,), dtype=torch.int32),
+            ]
+            mod.wfst_advance_chunk(
+                dec,
+                torch.tensor([ch], dtype=torch.int32),
+                piece,
+                torch.tensor([piece.size(1)], dtype=torch.int32),
+                0,
+                *outs,
+            )
         ow = torch.empty((64,), dtype=torch.int32)
         wl = torch.empty((1,), dtype=torch.int32)
         sc = torch.empty((1,), dtype=torch.float64)
@@ -260,7 +305,7 @@ def test_toy_streaming_gc_recovers_full_path(toy_fst):
     assert ok_gc and ok_legacy
     assert s_gc == pytest.approx(s_legacy, abs=1e-6)  # decode dynamics untouched
     assert w_gc == _TOY_WORDS  # full path recovered (word 10 sits on the first arc)
-    assert w_legacy == w_gc[len(w_gc) - len(w_legacy):]  # legacy = truncated suffix
+    assert w_legacy == w_gc[len(w_gc) - len(w_legacy) :]  # legacy = truncated suffix
     assert len(w_legacy) < len(w_gc)
 
 
@@ -268,18 +313,14 @@ def test_toy_streaming_gc_recovers_full_path(toy_fst):
 # Real-graph smoke tests via the public Decoder API (need OASR_TEST_FST)
 # ---------------------------------------------------------------------------
 
-FST = os.environ.get(
-    "OASR_TEST_FST",
-    "/data01/kilm/users/chiendb/models/asr/lm/20210610_u2pp_conformer_exp_librispeech"
-    "/lang_bpe/HLG.pt",
-)
+# Declared in tests/assets.py so --strict-assets can make it fatal.
+FST = assets.declared("OASR_TEST_FST")
 
 
 @pytest.fixture(scope="module")
 def wfst_decoder_cls():
     _module()  # CUDA + JIT available
-    if not os.path.exists(FST):
-        pytest.skip(f"no decoding graph at {FST} (set OASR_TEST_FST)")
+    assets.require("OASR_TEST_FST")
     from oasr.decode import Decoder, DecoderConfig
 
     return Decoder, DecoderConfig

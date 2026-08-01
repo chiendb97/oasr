@@ -12,78 +12,92 @@ import sys as _sys
 import types as _types
 
 # =============================================================================
-# Functional API (FlashInfer style)
-# =============================================================================
-from .activation import (
-    glu, swish, swoosh_l, swoosh_r,
-    ACTIVATION_RELU, ACTIVATION_GELU, ACTIVATION_SWISH,
-    get_activation_type_id,
-)
-from .norm import (
-    layer_norm, rms_norm, bias_norm, batch_norm_1d, group_norm, add_layer_norm,
-    add_layer_norm_residual,
-    layer_norm_activation, rms_norm_activation, batch_norm_activation, batch_norm_swish,
-    cmvn,
-)
-from .conv import (
-    depthwise_conv1d, conv2d,
-    depthwise_conv1d_silu, causal_conv1d, conv2d_activation,
-)
-from .gemm import gemm, bmm, group_gemm, gemm_activation, gemm_log_softmax
-from .softmax import log_softmax, softmax
-from .attention import fmha
-from .topk import topk
-from .fft import rfft, rfft_power
-from .features import (
-    fbank_batch,
-    mfcc_batch,
-    extract_features_batch,
-    FeatureConfig,
-    BatchedStreamingFeatureExtractor,
-)
-from .feature import dct_lifter, fbank_preprocess, mel_log
-from .ctc_decode import (
-    ctc_beam_search_decode,
-    GpuStreamingDecoder,
-    GpuDecoderConfig,
-    GpuDecoderResult,
-    StreamState,
-    StreamHandle,
-)
-
-# =============================================================================
 # Autotuning
 # =============================================================================
-from . import tune
-from .tune import autotune, enable_autotune, disable_autotune
-
 # =============================================================================
 # nn.Module wrappers
 # =============================================================================
-from . import layers
+from . import layers, tune
+
+# =============================================================================
+# Functional API (FlashInfer style)
+# =============================================================================
+from .activation import (
+    ACTIVATION_GELU,
+    ACTIVATION_RELU,
+    ACTIVATION_SWISH,
+    get_activation_type_id,
+    glu,
+    swish,
+    swoosh_l,
+    swoosh_r,
+)
+from .attention import fmha
+from .conv import (
+    causal_conv1d,
+    conv2d,
+    conv2d_activation,
+    depthwise_conv1d,
+    depthwise_conv1d_silu,
+)
+from .ctc_decode import (
+    GpuDecoderConfig,
+    GpuDecoderResult,
+    GpuStreamingDecoder,
+    StreamHandle,
+    StreamState,
+    ctc_beam_search_decode,
+)
+from .feature import dct_lifter, fbank_preprocess, mel_log
+from .features import (
+    BatchedStreamingFeatureExtractor,
+    FeatureConfig,
+    extract_features_batch,
+    fbank_batch,
+    mfcc_batch,
+)
+from .fft import rfft, rfft_power
+from .gemm import bmm, gemm, gemm_activation, gemm_log_softmax, group_gemm
 from .layers import (
-    DepthwiseConv1d,
-    PointwiseConv1d,
+    AddLayerNorm,
+    BatchNorm1d,
+    BiasNorm,
     Conv2d as Conv2dModule,
     Conv2dActivation,
+    DepthwiseConv1d,
     Fbank,
-    Mfcc,
-    Linear,
-    LayerNorm,
-    RMSNorm,
-    GroupNorm,
-    BiasNorm,
-    BatchNorm1d,
-    AddLayerNorm,
     GlobalCMVN,
+    GroupNorm,
+    LayerNorm,
+    Linear,
+    Mfcc,
+    PointwiseConv1d,
+    RMSNorm,
     Softmax as SoftmaxModule,
     TopK as TopKModule,
 )
-
+from .norm import (
+    add_layer_norm,
+    add_layer_norm_residual,
+    batch_norm_1d,
+    batch_norm_activation,
+    batch_norm_swish,
+    bias_norm,
+    cmvn,
+    group_norm,
+    layer_norm,
+    layer_norm_activation,
+    rms_norm,
+    rms_norm_activation,
+)
+from .softmax import log_softmax, softmax
+from .topk import topk
+from .tune import autotune, disable_autotune, enable_autotune
 
 # =============================================================================
 # Legacy C extension support (backward compatibility)
 # =============================================================================
+
 
 def _register_c_extension():
     """Load the C extension and register its submodules in ``sys.modules``.
@@ -114,9 +128,9 @@ _register_c_extension()
 # =============================================================================
 from . import cache
 from .cache import (
-    CacheConfig,
-    BlockPool,
     AttentionCacheManager,
+    BlockPool,
+    CacheConfig,
     CnnCacheManager,
     CtcStateCacheManager,
     StreamContext,
@@ -144,17 +158,13 @@ def __getattr__(name: str):
             _C = _importlib.import_module("oasr._C")
             globals()["_C"] = _C
         except ImportError:
-            raise AttributeError(
-                f"module 'oasr' has no attribute {name!r}"
-            ) from None
+            raise AttributeError(f"module 'oasr' has no attribute {name!r}") from None
     if name == "_C":
         return _C
     try:
         attr = getattr(_C, name)
     except AttributeError:
-        raise AttributeError(
-            f"module 'oasr' has no attribute {name!r}"
-        ) from None
+        raise AttributeError(f"module 'oasr' has no attribute {name!r}") from None
     globals()[name] = attr
     return attr
 

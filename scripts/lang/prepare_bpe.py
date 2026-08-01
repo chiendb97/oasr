@@ -37,7 +37,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import k2
 import torch
-
 from lang_utils import (
     Lexicon,
     add_disambig_symbols,
@@ -97,8 +96,7 @@ def build_bpe_lexicon(
 
     if n_oov:
         print(
-            f"  WARNING: {n_oov} words had out-of-vocabulary BPE pieces; "
-            "mapped to <unk>.",
+            f"  WARNING: {n_oov} words had out-of-vocabulary BPE pieces; " "mapped to <unk>.",
             file=sys.stderr,
         )
     return lexicon
@@ -167,9 +165,7 @@ def main():
 
     print(f"Loading BPE token table from {units_file}", file=sys.stderr)
     token_sym_table_k2 = k2.SymbolTable.from_file(units_file)
-    token_sym_table: Dict[str, int] = {
-        s: token_sym_table_k2[s] for s in token_sym_table_k2.symbols
-    }
+    token_sym_table: Dict[str, int] = {s: token_sym_table_k2[s] for s in token_sym_table_k2.symbols}
     print(f"  {len(token_sym_table)} tokens loaded", file=sys.stderr)
 
     print(f"Loading word symbol table from {words_file}", file=sys.stderr)

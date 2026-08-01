@@ -5,6 +5,12 @@
 //! Exposes `oasr.speech.v1.Speech` plus the standard
 //! `grpc.health.v1.Health` health-checking service.
 
+// Every fallible helper in this crate returns `tonic::Status`, which is 176
+// bytes — that is tonic's error type, not ours, and boxing it at each call
+// site would only move the cost while breaking the `?` ergonomics the
+// generated service traits are built around.
+#![allow(clippy::result_large_err)]
+
 pub mod speech;
 
 pub mod pb {

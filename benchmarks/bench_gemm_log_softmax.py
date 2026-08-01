@@ -16,6 +16,5 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from benchmarks.routines.gemm_log_softmax import run_standalone
 
-
 if __name__ == "__main__":
     run_standalone()

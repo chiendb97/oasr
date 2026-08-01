@@ -19,6 +19,7 @@ if _ENABLED:  # pragma: no cover - profiling-only path
     nvtx_push = _nvtx.range_push
     nvtx_pop = _nvtx.range_pop
 else:
+
     def nvtx_push(name: str) -> None:
         pass
 

@@ -53,29 +53,20 @@ class NTKScalingRotaryEmbedding(RotaryEmbeddingBase):
         self.mixed_b = mixed_b
 
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
-        base_eff = base * (
-            self.scaling_factor if self.mixed_b is None else 1.0
-        )
+        base_eff = base * (self.scaling_factor if self.mixed_b is None else 1.0)
         inv_freq = 1.0 / (
             base_eff
             ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float)[
-                    : (self.rotary_dim // 2)
-                ]
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float)[: (self.rotary_dim // 2)]
                 / self.rotary_dim
             )
         )
         if self.mixed_b is None:
             inv_freq = inv_freq / (self.scaling_factor ** (2 / self.rotary_dim))
         else:
-            a = (
-                torch.tensor(self.scaling_factor).log()
-                / (self.rotary_dim / 2) ** self.mixed_b
-            )
+            a = torch.tensor(self.scaling_factor).log() / (self.rotary_dim / 2) ** self.mixed_b
             lambda_1_m = (
-                a
-                * torch.arange(1, self.rotary_dim // 2 + 1, dtype=torch.float)
-                ** self.mixed_b
+                a * torch.arange(1, self.rotary_dim // 2 + 1, dtype=torch.float) ** self.mixed_b
             ).exp()
             inv_freq = inv_freq / lambda_1_m
         return inv_freq

@@ -95,16 +95,16 @@ class PagedKVCache:
             blk_offset = offset % block_size
             if blk_offset + T <= block_size:
                 phys_blks = self.block_table[:, blk_logical].long()  # (B,)
-                self.k_cache[phys_blks, blk_offset: blk_offset + T] = k_data
-                self.v_cache[phys_blks, blk_offset: blk_offset + T] = v_data
+                self.k_cache[phys_blks, blk_offset : blk_offset + T] = k_data
+                self.v_cache[phys_blks, blk_offset : blk_offset + T] = v_data
             else:
                 first_n = block_size - blk_offset
                 phys_blks = self.block_table[:, blk_logical].long()
                 phys_blks_next = self.block_table[:, blk_logical + 1].long()
                 self.k_cache[phys_blks, blk_offset:block_size] = k_data[:, :first_n]
                 self.v_cache[phys_blks, blk_offset:block_size] = v_data[:, :first_n]
-                self.k_cache[phys_blks_next, 0: T - first_n] = k_data[:, first_n:]
-                self.v_cache[phys_blks_next, 0: T - first_n] = v_data[:, first_n:]
+                self.k_cache[phys_blks_next, 0 : T - first_n] = k_data[:, first_n:]
+                self.v_cache[phys_blks_next, 0 : T - first_n] = v_data[:, first_n:]
             return
 
         # Heterogeneous-offset scatter.
@@ -143,8 +143,12 @@ class PagedKVCache:
         H_kv, D = self.k_cache.size(2), self.k_cache.size(3)
         if max_total_kv == 0:
             empty = torch.zeros(
-                B, H_kv, 0, D,
-                dtype=self.k_cache.dtype, device=self.k_cache.device,
+                B,
+                H_kv,
+                0,
+                D,
+                dtype=self.k_cache.dtype,
+                device=self.k_cache.device,
             )
             return empty, empty.clone()
 
@@ -152,12 +156,12 @@ class PagedKVCache:
         num_blocks = (max_total_kv + block_size - 1) // block_size
         block_ids = self.block_table[:, :num_blocks].long()  # (B, num_blocks)
 
-        k_gathered = self.k_cache[block_ids].reshape(
-            B, num_blocks * block_size, H_kv, D
-        )[:, :max_total_kv]
-        v_gathered = self.v_cache[block_ids].reshape(
-            B, num_blocks * block_size, H_kv, D
-        )[:, :max_total_kv]
+        k_gathered = self.k_cache[block_ids].reshape(B, num_blocks * block_size, H_kv, D)[
+            :, :max_total_kv
+        ]
+        v_gathered = self.v_cache[block_ids].reshape(B, num_blocks * block_size, H_kv, D)[
+            :, :max_total_kv
+        ]
         return k_gathered.permute(0, 2, 1, 3), v_gathered.permute(0, 2, 1, 3)
 
 

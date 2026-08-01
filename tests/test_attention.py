@@ -27,7 +27,6 @@ import torch.nn.functional as F
 from oasr.cache import PagedKVCache
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention
 
-
 # Tests use n_feat=64, n_head=4 → d_k = 16.
 N_HEAD = 4
 N_FEAT = 64
@@ -38,9 +37,8 @@ def _ref_qkv(attn, x):
     """Replicate the module's fused-QKV projection (head-major (B, H, T, D))."""
     B, T, _ = x.shape
     qkv = attn.linear_qkv(x)
-    q, k, v = qkv.split(
-        (attn.inner_dim, attn.inner_kv_dim, attn.inner_kv_dim), dim=-1)
-    q = q.view(B, T, attn.h,    attn.d_k).transpose(1, 2)
+    q, k, v = qkv.split((attn.inner_dim, attn.inner_kv_dim, attn.inner_kv_dim), dim=-1)
+    q = q.view(B, T, attn.h, attn.d_k).transpose(1, 2)
     k = k.view(B, T, attn.h_kv, attn.d_k).transpose(1, 2)
     v = v.view(B, T, attn.h_kv, attn.d_k).transpose(1, 2)
     return q, k, v
@@ -57,7 +55,11 @@ def _ref_offline(attn, x, mask, pos_emb):
     matrix_bd = torch.matmul(q_v, p.transpose(-2, -1))
     attn_bias = (matrix_bd + mask.unsqueeze(1)) / math.sqrt(attn.d_k)
     out = F.scaled_dot_product_attention(
-        q_u, k, v, attn_mask=attn_bias, scale=1 / math.sqrt(attn.d_k),
+        q_u,
+        k,
+        v,
+        attn_mask=attn_bias,
+        scale=1 / math.sqrt(attn.d_k),
     )
     out = out.transpose(1, 2).contiguous().view(x.size(0), -1, attn.h * attn.d_k)
     return attn.linear_out(out)
@@ -98,7 +100,11 @@ def _ref_paged(attn, x, pos_emb, cache: PagedKVCache):
     matrix_bd = torch.matmul(q_v, p.transpose(-2, -1))
     attn_bias = (matrix_bd + pad_bias) / math.sqrt(attn.d_k)
     out = F.scaled_dot_product_attention(
-        q_u, k_full, v_full, attn_mask=attn_bias, scale=1 / math.sqrt(attn.d_k),
+        q_u,
+        k_full,
+        v_full,
+        attn_mask=attn_bias,
+        scale=1 / math.sqrt(attn.d_k),
     )
     out = out.transpose(1, 2).contiguous().view(x.size(0), -1, attn.h * attn.d_k)
     return attn.linear_out(out)
@@ -142,7 +148,8 @@ def test_paged_path_matches_sdpa(attn, device):
 
     block_table = torch.tensor(
         [[0, 1, 2, 5, 6, 7], [3, 4, 8, 9, 10, 11]],
-        dtype=torch.int32, device=device,
+        dtype=torch.int32,
+        device=device,
     )
     cache_seqlens = torch.tensor([10, 5], dtype=torch.int32, device=device)
 
@@ -165,9 +172,12 @@ def test_paged_path_matches_sdpa(attn, device):
     pos_emb = torch.randn(1, T_kv_max, N_FEAT, device=device)
 
     cache = PagedKVCache(
-        k_cache=k_pool, v_cache=v_pool,
-        block_table=block_table, cache_seqlens=cache_seqlens,
-        block_size=block_size, host_seqlen_max=10,
+        k_cache=k_pool,
+        v_cache=v_pool,
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
+        block_size=block_size,
+        host_seqlen_max=10,
     )
 
     k_pool_save = k_pool.clone()

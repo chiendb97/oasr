@@ -35,7 +35,7 @@ N_KV_HEAD = 4
 OUTPUT_SIZE = 256
 HEAD_DIM = OUTPUT_SIZE // N_KV_HEAD  # 64
 HIDDEN_DIM = 256
-KERNEL_SIZE = 15   # causal → lorder = 14
+KERNEL_SIZE = 15  # causal → lorder = 14
 VOCAB_SIZE_RAW = 5002
 VOCAB_SIZE = (VOCAB_SIZE_RAW + 7) // 8 * 8  # 5008 (padded to multiple of 8)
 
@@ -61,9 +61,7 @@ AUDIO_SCALE = 32768.0
 def model(ckpt_dir: str, device):
     """Load the U2++ Conformer from the checkpoint supplied via --ckpt-dir."""
     if not ckpt_dir or not (Path(ckpt_dir) / "final.pt").exists():
-        pytest.skip(
-            "Checkpoint not found; pass --ckpt-dir <path> or set CKPT_DIR"
-        )
+        pytest.skip("Checkpoint not found; pass --ckpt-dir <path> or set CKPT_DIR")
     from oasr.models.conformer import load_wenet_checkpoint
 
     m, _ = load_wenet_checkpoint(ckpt_dir, device=str(device), dtype=torch.float16)
@@ -157,8 +155,7 @@ def _make_chunks(
     """Return *n* random acoustic feature chunks ``(1, CHUNK_INPUT_TIME, NUM_FEAT)``."""
     torch.manual_seed(seed)
     return [
-        torch.randn(1, CHUNK_INPUT_TIME, NUM_FEAT, dtype=dtype, device=device)
-        for _ in range(n)
+        torch.randn(1, CHUNK_INPUT_TIME, NUM_FEAT, dtype=dtype, device=device) for _ in range(n)
     ]
 
 
@@ -226,7 +223,11 @@ def _cache_manager_streaming_paged(
             att_caches = ctx.get_att_caches()
             cnn_cache = ctx.get_cnn_cache()
             probs = model.forward_chunk_paged(
-                xs, offset, att_caches, cnn_cache, cache_t1=offset,
+                xs,
+                offset,
+                att_caches,
+                cnn_cache,
+                cache_t1=offset,
             )
             ctx.commit_chunk_paged(probs.size(1))
             ctx.get_decoder().decode_chunk(probs)
@@ -257,8 +258,11 @@ class TestPagedStreamingShapes:
         chunks = _make_chunks(n_chunks, seed=0, device=device, dtype=dtype)
 
         logits_list, _, result, pool = _cache_manager_streaming_paged(
-            model, chunks, num_left_chunks=num_left_chunks,
-            device=device, dtype=dtype,
+            model,
+            chunks,
+            num_left_chunks=num_left_chunks,
+            device=device,
+            dtype=dtype,
         )
 
         assert len(logits_list) == n_chunks
@@ -277,22 +281,32 @@ class TestPagedStreamingShapes:
 class TestPagedStreamingLogitsAreLogProbs:
     """Per-chunk paged streaming outputs are valid log-softmax distributions."""
 
-    @pytest.mark.parametrize("num_left_chunks,n_chunks", [
-        (-1, 3),
-        (2, 4),
-    ])
+    @pytest.mark.parametrize(
+        "num_left_chunks,n_chunks",
+        [
+            (-1, 3),
+            (2, 4),
+        ],
+    )
     def test_log_probs(self, model, device, num_left_chunks: int, n_chunks: int):
         dtype = torch.float16
         chunks = _make_chunks(n_chunks, seed=99, device=device, dtype=dtype)
 
         logits_list, _, _, pool = _cache_manager_streaming_paged(
-            model, chunks, num_left_chunks, device, dtype,
+            model,
+            chunks,
+            num_left_chunks,
+            device,
+            dtype,
         )
 
         for step, probs in enumerate(logits_list):
             sums = probs.exp().sum(dim=-1).float()
             torch.testing.assert_close(
-                sums, torch.ones_like(sums), rtol=1e-2, atol=1e-2,
+                sums,
+                torch.ones_like(sums),
+                rtol=1e-2,
+                atol=1e-2,
                 msg=f"chunk {step}: log-probs do not sum to 1",
             )
 
@@ -317,7 +331,12 @@ class TestCtcDecode:
         chunks = _make_chunks(n_chunks, seed=7, device=device, dtype=dtype)
 
         mgr_logits_list, _, mgr_result, pool = _cache_manager_streaming_paged(
-            model, chunks, num_left_chunks, device, dtype, beam_size=beam_size,
+            model,
+            chunks,
+            num_left_chunks,
+            device,
+            dtype,
+            beam_size=beam_size,
         )
         assert pool.num_free_blocks == pool.num_total_blocks
 
@@ -337,14 +356,12 @@ class TestCtcDecode:
         assert mgr_result.scores.shape == torch.Size([1, beam_size])
 
         scores = mgr_result.scores[0].cpu()
-        assert (scores[:-1] >= scores[1:]).all(), (
-            f"Beam scores not sorted: {scores.tolist()}"
-        )
+        assert (scores[:-1] >= scores[1:]).all(), f"Beam scores not sorted: {scores.tolist()}"
 
         for beam_tokens in mgr_result.tokens[0]:
-            assert all(0 <= t < VOCAB_SIZE for t in beam_tokens), (
-                f"Token out of range [0, {VOCAB_SIZE}): {beam_tokens}"
-            )
+            assert all(
+                0 <= t < VOCAB_SIZE for t in beam_tokens
+            ), f"Token out of range [0, {VOCAB_SIZE}): {beam_tokens}"
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +429,11 @@ class TestMultiStreamIsolation:
                     att_caches = ctx.get_att_caches()
                     cnn_cache = ctx.get_cnn_cache()
                     probs = model.forward_chunk_paged(
-                        xs, off, att_caches, cnn_cache, cache_t1=off,
+                        xs,
+                        off,
+                        att_caches,
+                        cnn_cache,
+                        cache_t1=off,
                     )
                     ctx.commit_chunk_paged(probs.size(1))
                     ctx.get_decoder().decode_chunk(probs)
@@ -427,10 +448,20 @@ class TestMultiStreamIsolation:
         ctx_a.free()
 
         bt_b_after, cs_b_after = ctx_b.get_paged_state_views()
-        torch.testing.assert_close(bt_b_after, bt_b_before, rtol=0.0, atol=0.0,
-                                   msg="Stream B's block_table changed after freeing A")
-        torch.testing.assert_close(cs_b_after, cs_b_before, rtol=0.0, atol=0.0,
-                                   msg="Stream B's cache_seqlens changed after freeing A")
+        torch.testing.assert_close(
+            bt_b_after,
+            bt_b_before,
+            rtol=0.0,
+            atol=0.0,
+            msg="Stream B's block_table changed after freeing A",
+        )
+        torch.testing.assert_close(
+            cs_b_after,
+            cs_b_before,
+            rtol=0.0,
+            atol=0.0,
+            msg="Stream B's cache_seqlens changed after freeing A",
+        )
 
         ctx_b.get_decoder().finalize_stream()
         ctx_b.free()
@@ -441,11 +472,10 @@ class TestMultiStreamIsolation:
 # Test 5: End-to-end paged streaming on real audio
 # ---------------------------------------------------------------------------
 
+
 def _skip_if_no_audio(audio_path: str) -> None:
     if not audio_path or not Path(audio_path).exists():
-        pytest.skip(
-            "Audio file not found; pass --audio-path <wav> or set AUDIO_PATH"
-        )
+        pytest.skip("Audio file not found; pass --audio-path <wav> or set AUDIO_PATH")
 
 
 class TestStreamingWithRealAudio:
@@ -468,9 +498,7 @@ class TestStreamingWithRealAudio:
             )
         return chunks
 
-    def test_forward_and_ctc_decode(
-        self, model, ckpt_dir: str, audio_path: str, device
-    ):
+    def test_forward_and_ctc_decode(self, model, ckpt_dir: str, audio_path: str, device):
         """Paged streaming → CTC beam search → non-empty transcript."""
         _skip_if_no_audio(audio_path)
 
@@ -480,7 +508,8 @@ class TestStreamingWithRealAudio:
         id2word = _build_id2word(ckpt_dir)
 
         _, _, streaming_result, pool = _cache_manager_streaming_paged(
-            model, chunks,
+            model,
+            chunks,
             num_left_chunks=-1,
             device=device,
             dtype=dtype,
@@ -488,23 +517,19 @@ class TestStreamingWithRealAudio:
             beam_size=beam_size,
         )
 
-        assert pool.num_free_blocks == pool.num_total_blocks, (
-            f"Block pool leak: {pool.num_free_blocks}/{pool.num_total_blocks} free"
-        )
+        assert (
+            pool.num_free_blocks == pool.num_total_blocks
+        ), f"Block pool leak: {pool.num_free_blocks}/{pool.num_total_blocks} free"
 
         assert streaming_result.lengths.shape == torch.Size([1, beam_size])
         assert streaming_result.scores.shape == torch.Size([1, beam_size])
 
         scores = streaming_result.scores[0].cpu()
-        assert (scores[:-1] >= scores[1:]).all(), (
-            f"Beam scores not sorted: {scores.tolist()}"
-        )
+        assert (scores[:-1] >= scores[1:]).all(), f"Beam scores not sorted: {scores.tolist()}"
 
         for beam_idx, beam_tokens in enumerate(streaming_result.tokens[0]):
             bad = [t for t in beam_tokens if not (0 <= t < VOCAB_SIZE)]
-            assert not bad, (
-                f"Beam {beam_idx} contains out-of-range token IDs: {bad}"
-            )
+            assert not bad, f"Beam {beam_idx} contains out-of-range token IDs: {bad}"
 
         top1_tokens = streaming_result.tokens[0][0]
         text = _tokens_to_text(top1_tokens, id2word)
@@ -515,9 +540,7 @@ class TestStreamingWithRealAudio:
             beam_text = _tokens_to_text(beam_tokens, id2word)
             print(f"  beam {beam_idx}: {beam_text!r}  (score {scores[beam_idx]:.3f})")
 
-    def test_cache_manager_pool_accounting(
-        self, model, audio_path: str, device
-    ):
+    def test_cache_manager_pool_accounting(self, model, audio_path: str, device):
         """Two real-audio paged streams share a pool; freeing one leaves the other intact."""
         _skip_if_no_audio(audio_path)
 
@@ -579,7 +602,11 @@ class TestStreamingWithRealAudio:
                     att_caches = ctx.get_att_caches()
                     cnn_cache = ctx.get_cnn_cache()
                     probs = model.forward_chunk_paged(
-                        xs, off, att_caches, cnn_cache, cache_t1=off,
+                        xs,
+                        off,
+                        att_caches,
+                        cnn_cache,
+                        cache_t1=off,
                     )
                     ctx.commit_chunk_paged(probs.size(1))
                     ctx.get_decoder().decode_chunk(probs)
@@ -593,14 +620,24 @@ class TestStreamingWithRealAudio:
         ctx_a.free()
 
         bt_b_after, cs_b_after = ctx_b.get_paged_state_views()
-        torch.testing.assert_close(bt_b_after, bt_b_before, rtol=0.0, atol=0.0,
-                                   msg="Stream B's block_table changed after freeing A")
-        torch.testing.assert_close(cs_b_after, cs_b_before, rtol=0.0, atol=0.0,
-                                   msg="Stream B's cache_seqlens changed after freeing A")
+        torch.testing.assert_close(
+            bt_b_after,
+            bt_b_before,
+            rtol=0.0,
+            atol=0.0,
+            msg="Stream B's block_table changed after freeing A",
+        )
+        torch.testing.assert_close(
+            cs_b_after,
+            cs_b_before,
+            rtol=0.0,
+            atol=0.0,
+            msg="Stream B's cache_seqlens changed after freeing A",
+        )
 
         ctx_b.get_decoder().finalize_stream()
         ctx_b.free()
 
-        assert pool.num_free_blocks == initial_free, (
-            f"Pool not fully recovered: {pool.num_free_blocks}/{initial_free} free blocks"
-        )
+        assert (
+            pool.num_free_blocks == initial_free
+        ), f"Pool not fully recovered: {pool.num_free_blocks}/{initial_free} free blocks"

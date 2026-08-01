@@ -8,8 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
-from benchmarks.routines.bench_utils import bench_fn, dtype_size
 from benchmarks.routines.activation import setup_swish
+from benchmarks.routines.bench_utils import bench_fn, dtype_size
 
 CONFIGS = [
     {"batch": 32, "seq": 250, "channels": 256},
@@ -21,8 +21,8 @@ CONFIGS = [
 DTYPES = [torch.float16]
 DTYPE_NAMES = {torch.float16: "float16"}
 
-_COL_SHAPE  = 22
-_COL_TIME   = 12
+_COL_SHAPE = 22
+_COL_TIME = 12
 _COL_METRIC = 10
 
 _HEADER = (
@@ -30,14 +30,14 @@ _HEADER = (
     f"  {'CUDA':>{_COL_TIME}}  {'BW(TB/s)':>{_COL_METRIC}}"
     f"  {'PyTorch':>{_COL_TIME}}  {'BW(TB/s)':>{_COL_METRIC}}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR Swish Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR Swish Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
 def _bw_tb_s(cfg, dtype, ms):
     b, s, c = cfg["batch"], cfg["seq"], cfg["channels"]
-    nbytes  = b * s * c * dtype_size(dtype) * 2
+    nbytes = b * s * c * dtype_size(dtype) * 2
     return nbytes / (ms * 1e-3) / 1e12
 
 
@@ -60,7 +60,8 @@ def _row(shape_str, times, cfg, dtype):
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available"); return
+        print("CUDA not available")
+        return
 
     print(_TITLE)
     print(_TITLE_SEP)
@@ -71,7 +72,7 @@ def main():
         print(_SEP)
         for cfg in CONFIGS:
             cuda_fn, pytorch_fn = setup_swish(cfg["batch"], cfg["seq"], cfg["channels"], dtype)
-            cuda_ms,    _ = bench_fn(cuda_fn)
+            cuda_ms, _ = bench_fn(cuda_fn)
             pytorch_ms, _ = bench_fn(pytorch_fn)
             shape_str = f"[{cfg['batch']},{cfg['seq']},{cfg['channels']}]"
             # order: CUDA, PyTorch

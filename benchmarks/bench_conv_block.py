@@ -22,9 +22,9 @@ CONFIGS = [
 DTYPES = [torch.float16]
 DTYPE_NAMES = {torch.float16: "float16"}
 
-_COL_SHAPE   = 28
-_COL_TIME    = 12
-_COL_SPEEDUP =  8
+_COL_SHAPE = 28
+_COL_TIME = 12
+_COL_SPEEDUP = 8
 
 _HEADER = (
     f"{'shape':>{_COL_SHAPE}}"
@@ -32,8 +32,8 @@ _HEADER = (
     f"  {'PyTorch':>{_COL_TIME}}"
     f"  {'Speedup':>{_COL_SPEEDUP}}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR Conv Block Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR Conv Block Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
@@ -57,7 +57,8 @@ def _row(shape_str, cuda_ms, pytorch_ms):
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available"); return
+        print("CUDA not available")
+        return
 
     print(_TITLE)
     print(_TITLE_SEP)
@@ -71,7 +72,7 @@ def main():
                 cfg["batch"], cfg["seq"], cfg["d_model"], cfg["kernel_size"], dtype
             )
             cuda_ms, _ = bench_fn(cuda_fn)
-            pt_ms,   _ = bench_fn(pt_fn)
+            pt_ms, _ = bench_fn(pt_fn)
             shape_str = f"[{cfg['batch']},{cfg['seq']},{cfg['d_model']}] k={cfg['kernel_size']}"
             # order: CUDA, PyTorch
             print(_row(shape_str, cuda_ms, pt_ms))

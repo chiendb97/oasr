@@ -34,13 +34,13 @@ class CtcProjection(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        self.weight = nn.Parameter(torch.empty(
-            out_features, in_features, device=device, dtype=dtype))
+        self.weight = nn.Parameter(
+            torch.empty(out_features, in_features, device=device, dtype=dtype)
+        )
         torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         if bias:
             bound = 1 / math.sqrt(in_features) if in_features > 0 else 0
-            self.bias = nn.Parameter(torch.empty(
-                out_features, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
             torch.nn.init.uniform_(self.bias, -bound, bound)
         else:
             self.bias = None

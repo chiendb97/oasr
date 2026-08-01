@@ -21,8 +21,8 @@ CONFIGS = [
 DTYPES = [torch.float32]
 DTYPE_NAMES = {torch.float32: "float32"}
 
-_COL_SHAPE  = 26
-_COL_TIME   = 12
+_COL_SHAPE = 26
+_COL_TIME = 12
 _COL_METRIC = 10
 
 _HEADER = (
@@ -30,15 +30,15 @@ _HEADER = (
     f"  {'CUDA':>{_COL_TIME}}  {'BW(TB/s)':>{_COL_METRIC}}"
     f"  {'PyTorch':>{_COL_TIME}}  {'BW(TB/s)':>{_COL_METRIC}}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR GroupNorm Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR GroupNorm Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
 def _bw_tb_s(cfg, dtype, ms):
     b, s, h = cfg["batch"], cfg["seq"], cfg["hidden"]
-    elem    = dtype_size(dtype)
-    nbytes  = b * s * h * elem * 2 + h * elem * 2
+    elem = dtype_size(dtype)
+    nbytes = b * s * h * elem * 2 + h * elem * 2
     return nbytes / (ms * 1e-3) / 1e12
 
 
@@ -61,7 +61,8 @@ def _row(shape_str, times, cfg, dtype):
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available"); return
+        print("CUDA not available")
+        return
 
     print(_TITLE)
     print(_TITLE_SEP)
@@ -74,7 +75,7 @@ def main():
             b, s, h, g = cfg["batch"], cfg["seq"], cfg["hidden"], cfg["num_groups"]
             cuda_fn, pt_fn = setup_group_norm(b, s, h, g, dtype)
             cuda_ms, _ = bench_fn(cuda_fn)
-            pt_ms,   _ = bench_fn(pt_fn)
+            pt_ms, _ = bench_fn(pt_fn)
             shape_str = f"[{b},{s},{h}] g={g}"
             # order: CUDA, PyTorch
             print(_row(shape_str, [cuda_ms, pt_ms], cfg, dtype))

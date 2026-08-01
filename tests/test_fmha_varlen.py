@@ -14,7 +14,6 @@ single-segment == dense, and many tiny segments.
 from __future__ import annotations
 
 import math
-from typing import List, Optional
 
 import pytest
 import torch
@@ -23,7 +22,7 @@ from oasr.attention import fmha, fmha_varlen
 
 
 def _tol(dtype):
-    return dict(rtol=2e-2, atol=2e-2)
+    return {"rtol": 2e-2, "atol": 2e-2}
 
 
 def _make_packed(seg_lens, H, H_kv, D, dtype, device):
@@ -61,7 +60,7 @@ def _ref_per_segment(q, k, v, cu, scale, bias, offsets, H):
         if bias is not None:
             # clone() → a fresh 16-byte-aligned allocation (the dense cute
             # kernel rejects misaligned bias slices of the packed buffer).
-            bias_s = bias[bo[s]:bo[s + 1]].view(1, H, b - a, b - a).clone()
+            bias_s = bias[bo[s] : bo[s + 1]].view(1, H, b - a, b - a).clone()
         out_s = fmha(qs, ks, vs, softmax_scale=scale, attn_bias=bias_s)
         out[a:b] = out_s.squeeze(0).transpose(0, 1)
     return out
@@ -83,10 +82,16 @@ def test_varlen_matches_per_segment_dense(dtype, seg_lens, with_bias, device):
         bias, offsets = _build_packed_bias(q, cu, H, D, dtype, device, scale)
 
     out = fmha_varlen(
-        q, k, v, softmax_scale=scale,
-        cu_seqlens_q=cu, cu_seqlens_k=cu,
-        max_seqlen_q=max(seg_lens), max_seqlen_k=max(seg_lens),
-        attn_bias=bias, bias_offsets=offsets,
+        q,
+        k,
+        v,
+        softmax_scale=scale,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=max(seg_lens),
+        max_seqlen_k=max(seg_lens),
+        attn_bias=bias,
+        bias_offsets=offsets,
     )
     ref = _ref_per_segment(q, k, v, cu, scale, bias, offsets, H)
     assert out.shape == q.shape
@@ -104,9 +109,14 @@ def test_varlen_gqa(dtype, gqa, device):
     seg_lens = [40, 55, 33]
     q, k, v, cu = _make_packed(seg_lens, H, H_kv, D, dtype, device)
     out = fmha_varlen(
-        q, k, v, softmax_scale=scale,
-        cu_seqlens_q=cu, cu_seqlens_k=cu,
-        max_seqlen_q=max(seg_lens), max_seqlen_k=max(seg_lens),
+        q,
+        k,
+        v,
+        softmax_scale=scale,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=max(seg_lens),
+        max_seqlen_k=max(seg_lens),
     )
     ref = _ref_per_segment(q, k, v, cu, scale, None, None, H)
     torch.testing.assert_close(out, ref, **_tol(dtype))
@@ -120,11 +130,23 @@ def test_varlen_single_segment_equals_dense(device):
     scale = 1.0 / math.sqrt(D)
     q, k, v, cu = _make_packed([T], H, H, D, dtype, device)
     out = fmha_varlen(
-        q, k, v, softmax_scale=scale,
-        cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=T, max_seqlen_k=T,
+        q,
+        k,
+        v,
+        softmax_scale=scale,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=T,
+        max_seqlen_k=T,
     )
-    dense = fmha(
-        q.transpose(0, 1).unsqueeze(0), k.transpose(0, 1).unsqueeze(0),
-        v.transpose(0, 1).unsqueeze(0), softmax_scale=scale,
-    ).squeeze(0).transpose(0, 1)
+    dense = (
+        fmha(
+            q.transpose(0, 1).unsqueeze(0),
+            k.transpose(0, 1).unsqueeze(0),
+            v.transpose(0, 1).unsqueeze(0),
+            softmax_scale=scale,
+        )
+        .squeeze(0)
+        .transpose(0, 1)
+    )
     torch.testing.assert_close(out, dense, **_tol(dtype))

@@ -19,9 +19,7 @@ def _get_fft_module():
 
 def _validate_n_fft(n_fft: int) -> None:
     if n_fft < 8 or n_fft > 2048 or (n_fft & (n_fft - 1)) != 0:
-        raise ValueError(
-            f"n_fft must be a power of two in [8, 2048], got {n_fft}"
-        )
+        raise ValueError(f"n_fft must be a power of two in [8, 2048], got {n_fft}")
 
 
 def _resolve_n_fft(input: torch.Tensor, n: Optional[int]) -> int:

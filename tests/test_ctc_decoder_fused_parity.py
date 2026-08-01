@@ -107,13 +107,13 @@ class TestFusedParityOffline:
         if batch > 1:
             seq_lengths[1] = max(2, seq // 2)
 
-        kwargs = dict(
-            beam_size=beam,
-            blank_id=0,
-            blank_threshold=thresh,
-            max_seq_len=seq,
-            use_paged_memory=paged,
-        )
+        kwargs = {
+            "beam_size": beam,
+            "blank_id": 0,
+            "blank_threshold": thresh,
+            "max_seq_len": seq,
+            "use_paged_memory": paged,
+        }
         with _ForcedVariant(use_fused=True):
             res_fused = ctc_beam_search_decode(lp, seq_lengths, **kwargs)
         with _ForcedVariant(use_fused=False):

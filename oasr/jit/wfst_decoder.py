@@ -19,9 +19,9 @@ _WFST_TESTS_DIR = env.OASR_CSRC_DIR / "tests" / "wfst"
 def gen_wfst_decoder_module() -> JitSpec:
     """Generate the JIT spec for the GPU WFST decoder."""
     sources = [
-        _WFST_DIR / "decoder.cu",          # GpuDecoder impl (single-TU with kernels)
-        _WFST_DIR / "graph_io.cc",         # hlg.img loader (host)
-        _WFST_DIR / "wfst_decoder.cu",     # TVM-FFI launcher (opaque-handle wrappers)
+        _WFST_DIR / "decoder.cu",  # GpuDecoder impl (single-TU with kernels)
+        _WFST_DIR / "graph_io.cc",  # hlg.img loader (host)
+        _WFST_DIR / "wfst_decoder.cu",  # TVM-FFI launcher (opaque-handle wrappers)
         _WFST_DIR / "wfst_decoder_jit_binding.cu",  # TVM-FFI exports
     ]
     # The decoder uses device lambdas / relaxed constexpr; --use_fast_math (in the
@@ -49,9 +49,9 @@ def gen_wfst_cpu_reference_module() -> JitSpec:
     pin GPU-decoder parity.  All sources are host-only (no device kernels).
     """
     sources = [
-        _WFST_TESTS_DIR / "cpu_reference.cc",               # exact-semantics oracle (host)
-        _WFST_DIR / "graph_io.cc",                          # hlg.img loader (host)
-        _WFST_TESTS_DIR / "wfst_cpu_reference.cu",          # TVM-FFI launcher (graph path in)
+        _WFST_TESTS_DIR / "cpu_reference.cc",  # exact-semantics oracle (host)
+        _WFST_DIR / "graph_io.cc",  # hlg.img loader (host)
+        _WFST_TESTS_DIR / "wfst_cpu_reference.cu",  # TVM-FFI launcher (graph path in)
         _WFST_TESTS_DIR / "wfst_cpu_reference_jit_binding.cu",  # TVM-FFI exports
     ]
     return gen_jit_spec(

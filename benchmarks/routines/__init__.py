@@ -36,9 +36,7 @@ ROUTINE_REGISTRY: dict[str, str] = {
 def get_routine(name: str) -> types.ModuleType:
     """Import and return the routine module for *name*."""
     if name not in ROUTINE_REGISTRY:
-        raise ValueError(
-            f"Unknown routine '{name}'. Available: {list(ROUTINE_REGISTRY.keys())}"
-        )
+        raise ValueError(f"Unknown routine '{name}'. Available: {list(ROUTINE_REGISTRY.keys())}")
     return importlib.import_module(ROUTINE_REGISTRY[name])
 
 

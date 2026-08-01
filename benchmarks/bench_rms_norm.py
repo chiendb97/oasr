@@ -22,8 +22,8 @@ CONFIGS = [
 DTYPES = [torch.float16, torch.bfloat16]
 DTYPE_NAMES = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
 
-_COL_SHAPE  = 20
-_COL_TIME   = 12
+_COL_SHAPE = 20
+_COL_TIME = 12
 _COL_METRIC = 10
 
 _HEADER = (
@@ -31,15 +31,15 @@ _HEADER = (
     f"  {'CUDA':>{_COL_TIME}}  {'BW(TB/s)':>{_COL_METRIC}}"
     f"  {'PyTorch':>{_COL_TIME}}  {'BW(TB/s)':>{_COL_METRIC}}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR RMSNorm Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR RMSNorm Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
 def _bw_tb_s(cfg, dtype, ms):
     b, s, h = cfg["batch"], cfg["seq"], cfg["hidden"]
-    elem    = dtype_size(dtype)
-    nbytes  = b * s * h * elem * 2 + h * elem
+    elem = dtype_size(dtype)
+    nbytes = b * s * h * elem * 2 + h * elem
     return nbytes / (ms * 1e-3) / 1e12
 
 
@@ -62,7 +62,8 @@ def _row(shape_str, times, cfg, dtype):
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available"); return
+        print("CUDA not available")
+        return
 
     print(_TITLE)
     print(_TITLE_SEP)
@@ -74,7 +75,7 @@ def main():
         for cfg in CONFIGS:
             cuda_fn, pt_fn = setup_rms_norm(cfg["batch"], cfg["seq"], cfg["hidden"], dtype)
             cuda_ms, _ = bench_fn(cuda_fn)
-            pt_ms,   _ = bench_fn(pt_fn)
+            pt_ms, _ = bench_fn(pt_fn)
             shape_str = f"[{cfg['batch']},{cfg['seq']},{cfg['hidden']}]"
             # order: CUDA, PyTorch
             print(_row(shape_str, [cuda_ms, pt_ms], cfg, dtype))

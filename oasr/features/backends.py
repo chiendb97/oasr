@@ -182,9 +182,7 @@ def _to_wav_list(
     )
 
 
-def _extract_batch_kaldifeat(
-    wavs: List[torch.Tensor], cfg: FeatureConfig
-) -> List[torch.Tensor]:
+def _extract_batch_kaldifeat(wavs: List[torch.Tensor], cfg: FeatureConfig) -> List[torch.Tensor]:
     """Native batched extraction via ``kaldifeat``."""
     import kaldifeat
 
@@ -218,9 +216,7 @@ def _extract_batch(
     else:
         feat_list = [_extract(w, cfg) for w in wavs]
 
-    feat_lengths = torch.tensor(
-        [f.size(0) for f in feat_list], dtype=torch.long
-    )
+    feat_lengths = torch.tensor([f.size(0) for f in feat_list], dtype=torch.long)
     max_frames = int(feat_lengths.max().item())
     B = len(feat_list)
     F = cfg.output_dim

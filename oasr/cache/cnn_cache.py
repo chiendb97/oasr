@@ -75,9 +75,7 @@ class CnnCacheManager:
         if stream_id in self._slots:
             raise ValueError(f"CNN cache for stream {stream_id} already allocated.")
         if not (0 <= slot_id < self._config.max_batch_size):
-            raise ValueError(
-                f"slot_id {slot_id} out of range [0, {self._config.max_batch_size})"
-            )
+            raise ValueError(f"slot_id {slot_id} out of range [0, {self._config.max_batch_size})")
         if slot_id in self._slots.values():
             raise ValueError(f"slot_id {slot_id} already in use")
         self._slots[stream_id] = slot_id
@@ -120,7 +118,7 @@ class CnnCacheManager:
             If ``stream_id`` is not allocated.
         """
         slot = self.slot_of(stream_id)
-        return self._buffer[:, slot: slot + 1]
+        return self._buffer[:, slot : slot + 1]
 
     def update(self, stream_id: int, new_cnn_cache: torch.Tensor) -> None:
         """Overwrite the CNN cache for a stream with the new chunk output.
@@ -139,12 +137,14 @@ class CnnCacheManager:
         """
         slot = self.slot_of(stream_id)
         expected = (
-            self._config.num_layers, 1,
-            self._config.cnn_cache_frames, self._config.hidden_dim,
+            self._config.num_layers,
+            1,
+            self._config.cnn_cache_frames,
+            self._config.hidden_dim,
         )
         if tuple(new_cnn_cache.shape) != expected:
             raise ValueError(
                 f"CNN cache shape mismatch for stream {stream_id}: "
                 f"expected {expected}, got {tuple(new_cnn_cache.shape)}."
             )
-        self._buffer[:, slot: slot + 1].copy_(new_cnn_cache)
+        self._buffer[:, slot : slot + 1].copy_(new_cnn_cache)

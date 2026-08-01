@@ -96,6 +96,7 @@ try:
         NvMatmulHeuristicsTarget,
         boolsToNvMatmulHeuristicsLayout,
     )
+
     NMH_AVAILABLE = True
 except ImportError:
     NMH_AVAILABLE = False
@@ -114,43 +115,43 @@ GPU_TABLE: Dict[str, Tuple[Any, str]] = {}
 if NMH_AVAILABLE:
     GPU_TABLE = {
         # Ampere (SM80 / SM86)
-        "A100_SXM_80GB":  (NvMatmulHeuristicsNvidiaGpu.A100_SXM_80GB, "sm_80"),
+        "A100_SXM_80GB": (NvMatmulHeuristicsNvidiaGpu.A100_SXM_80GB, "sm_80"),
         "A100_PCIE_80GB": (NvMatmulHeuristicsNvidiaGpu.A100_PCIE_80GB, "sm_80"),
-        "A30_PCIE":       (NvMatmulHeuristicsNvidiaGpu.A30_PCIE,       "sm_80"),
-        "A10_PCIE":       (NvMatmulHeuristicsNvidiaGpu.A10_PCIE,       "sm_86"),
-        "A40_PCIE":       (NvMatmulHeuristicsNvidiaGpu.A40_PCIE,       "sm_86"),
-        "RTX_3090":       (NvMatmulHeuristicsNvidiaGpu.RTX_3090,       "sm_86"),
-        "RTX_A6000":      (NvMatmulHeuristicsNvidiaGpu.RTX_A6000,      "sm_86"),
+        "A30_PCIE": (NvMatmulHeuristicsNvidiaGpu.A30_PCIE, "sm_80"),
+        "A10_PCIE": (NvMatmulHeuristicsNvidiaGpu.A10_PCIE, "sm_86"),
+        "A40_PCIE": (NvMatmulHeuristicsNvidiaGpu.A40_PCIE, "sm_86"),
+        "RTX_3090": (NvMatmulHeuristicsNvidiaGpu.RTX_3090, "sm_86"),
+        "RTX_A6000": (NvMatmulHeuristicsNvidiaGpu.RTX_A6000, "sm_86"),
         # Ada (SM89)
-        "L20":            (NvMatmulHeuristicsNvidiaGpu.L20,            "sm_89"),
-        "L40":            (NvMatmulHeuristicsNvidiaGpu.L40,            "sm_89"),
-        "L40S":           (NvMatmulHeuristicsNvidiaGpu.L40S,           "sm_89"),
-        "L4":             (NvMatmulHeuristicsNvidiaGpu.L4,             "sm_89"),
-        "RTX_4090":       (NvMatmulHeuristicsNvidiaGpu.RTX_4090,       "sm_89"),
-        "RTX_6000_ADA":   (NvMatmulHeuristicsNvidiaGpu.RTX_6000_ADA,  "sm_89"),
+        "L20": (NvMatmulHeuristicsNvidiaGpu.L20, "sm_89"),
+        "L40": (NvMatmulHeuristicsNvidiaGpu.L40, "sm_89"),
+        "L40S": (NvMatmulHeuristicsNvidiaGpu.L40S, "sm_89"),
+        "L4": (NvMatmulHeuristicsNvidiaGpu.L4, "sm_89"),
+        "RTX_4090": (NvMatmulHeuristicsNvidiaGpu.RTX_4090, "sm_89"),
+        "RTX_6000_ADA": (NvMatmulHeuristicsNvidiaGpu.RTX_6000_ADA, "sm_89"),
         # Hopper (SM90)
-        "H100_SXM":       (NvMatmulHeuristicsNvidiaGpu.H100_SXM,      "sm_90"),
-        "H100_PCIE":      (NvMatmulHeuristicsNvidiaGpu.H100_PCIE,     "sm_90"),
-        "H100_NVL":       (NvMatmulHeuristicsNvidiaGpu.H100_NVL,      "sm_90"),
-        "H200_SXM":       (NvMatmulHeuristicsNvidiaGpu.H200_SXM,      "sm_90"),
-        "H20_SXM":        (NvMatmulHeuristicsNvidiaGpu.H20_SXM,       "sm_90"),
+        "H100_SXM": (NvMatmulHeuristicsNvidiaGpu.H100_SXM, "sm_90"),
+        "H100_PCIE": (NvMatmulHeuristicsNvidiaGpu.H100_PCIE, "sm_90"),
+        "H100_NVL": (NvMatmulHeuristicsNvidiaGpu.H100_NVL, "sm_90"),
+        "H200_SXM": (NvMatmulHeuristicsNvidiaGpu.H200_SXM, "sm_90"),
+        "H20_SXM": (NvMatmulHeuristicsNvidiaGpu.H20_SXM, "sm_90"),
         # Blackwell (SM100 / SM120)
-        "B200":           (NvMatmulHeuristicsNvidiaGpu.B200,           "sm_100"),
-        "GB200_NVL":      (NvMatmulHeuristicsNvidiaGpu.GB200_NVL,     "sm_100"),
-        "GB300_NVL":      (NvMatmulHeuristicsNvidiaGpu.GB300_NVL,     "sm_100"),
-        "RTX_5080":       (NvMatmulHeuristicsNvidiaGpu.RTX_5080,      "sm_120"),
-        "RTX_5090":       (NvMatmulHeuristicsNvidiaGpu.RTX_5090,      "sm_120"),
-        "RTX_PRO_6000":   (NvMatmulHeuristicsNvidiaGpu.RTX_PRO_6000,  "sm_120"),
+        "B200": (NvMatmulHeuristicsNvidiaGpu.B200, "sm_100"),
+        "GB200_NVL": (NvMatmulHeuristicsNvidiaGpu.GB200_NVL, "sm_100"),
+        "GB300_NVL": (NvMatmulHeuristicsNvidiaGpu.GB300_NVL, "sm_100"),
+        "RTX_5080": (NvMatmulHeuristicsNvidiaGpu.RTX_5080, "sm_120"),
+        "RTX_5090": (NvMatmulHeuristicsNvidiaGpu.RTX_5090, "sm_120"),
+        "RTX_PRO_6000": (NvMatmulHeuristicsNvidiaGpu.RTX_PRO_6000, "sm_120"),
     }
 
 # Default GPU set: one representative per SM generation (data-center focused)
 DEFAULT_GPUS = [
-    "A100_SXM_80GB",   # SM80
-    "A10_PCIE",        # SM86
-    "L40S",            # SM89
-    "H100_SXM",        # SM90
-    "H200_SXM",        # SM90
-    "B200",            # SM100
+    "A100_SXM_80GB",  # SM80
+    "A10_PCIE",  # SM86
+    "L40S",  # SM89
+    "H100_SXM",  # SM90
+    "H200_SXM",  # SM90
+    "B200",  # SM100
 ]
 
 # CUTLASS targets to query: (label, NvMatmulHeuristicsTarget enum)
@@ -165,8 +166,8 @@ if NMH_AVAILABLE:
 # Format: A_dtype / B_dtype / C_dtype (H=FP16, B=BF16, S=FP32, I=INT8).
 # We query both FP32-accumulate and same-dtype-accumulate variants.
 DTYPE_PRECISIONS: Dict[str, List[str]] = {
-    "float16":  ["HSS", "HHS"],   # FP16 inputs: FP32-acc and FP16-acc
-    "bfloat16": ["BSS"],          # BF16 inputs: FP32-acc
+    "float16": ["HSS", "HHS"],  # FP16 inputs: FP32-acc and FP16-acc
+    "bfloat16": ["BSS"],  # BF16 inputs: FP32-acc
 }
 
 # Maximum number of configs to request per query.  The API returns ≤ this many.
@@ -177,6 +178,7 @@ MAX_CONFIGS_PER_QUERY = 512
 # Problem size dataclasses
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 @dataclass(frozen=True)
 class GemmProblem:
     """
@@ -185,25 +187,27 @@ class GemmProblem:
     batch=1 → standard GEMM.  batch>1 → batched GEMM (e.g. attention QK/AV).
     transA / transB reflect the memory layout of the operands.
     """
+
     M: int
     N: int
     K: int
     batch: int = 1
-    transA: bool = False    # False = row-major A (most linear layers)
-    transB: bool = True     # True = weight matrix stored transposed (PyTorch convention)
-    op_name: str = ""       # human-readable label for traceability
+    transA: bool = False  # False = row-major A (most linear layers)
+    transB: bool = True  # True = weight matrix stored transposed (PyTorch convention)
+    op_name: str = ""  # human-readable label for traceability
 
 
 @dataclass(frozen=True)
 class Conv2dProblem:
     """A single CONV2D in NCHW layout (N=batch, C=in-ch, H=time, W=freq)."""
-    N: int      # batch
-    C: int      # input channels
-    H: int      # input height (time frames)
-    W: int      # input width  (frequency bins)
-    K: int      # output channels
-    R: int      # kernel height
-    S: int      # kernel width
+
+    N: int  # batch
+    C: int  # input channels
+    H: int  # input height (time frames)
+    W: int  # input width  (frequency bins)
+    K: int  # output channels
+    R: int  # kernel height
+    S: int  # kernel width
     pad_h: int = 1
     pad_w: int = 1
     stride_h: int = 1
@@ -216,32 +220,34 @@ class Conv2dProblem:
 @dataclass
 class ConfigRecord:
     """One output row written to the JSONL file."""
+
     # ── model identity
     model_family: str
     model_size: str
     batch_size: int
     audio_duration_sec: int
     # ── op identity
-    op_type: str              # "gemm" | "conv2d"
-    function_name: str        # e.g. "ff1_expand", "attn_qk"
+    op_type: str  # "gemm" | "conv2d"
+    function_name: str  # e.g. "ff1_expand", "attn_qk"
     problem_size: Dict[str, Any]
     dtype: str
-    precision: str            # nvMatmulHeuristics precision string (e.g. "HSS")
+    precision: str  # nvMatmulHeuristics precision string (e.g. "HSS")
     # ── GPU / CUTLASS
-    gpu_target: str           # human-readable GPU label (e.g. "A100_SXM_80GB")
-    gpu_arch: str             # SM string (e.g. "sm_80")
-    cutlass_family: str       # "cutlass2" | "cutlass3" | "dry_run" | "nmh_unsupported"
+    gpu_target: str  # human-readable GPU label (e.g. "A100_SXM_80GB")
+    gpu_arch: str  # SM string (e.g. "sm_80")
+    cutlass_family: str  # "cutlass2" | "cutlass3" | "dry_run" | "nmh_unsupported"
     cutlass_config: Dict[str, Any]
     estimated_runtime_s: float = 0.0
     # ── extra metadata
     extra_meta: Dict[str, Any] = field(default_factory=dict)
-    status: str = "success"   # success | unsupported | no_config | error | dry_run
+    status: str = "success"  # success | unsupported | no_config | error | dry_run
     error_msg: str = ""
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Model architecture definitions
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 @dataclass
 class ConvSubsamplingSpec:
@@ -264,10 +270,12 @@ class ConvSubsamplingSpec:
 # After layer 1: (B, C, T//2, 40)
 # After layer 2: (B, C, T//4, 20)
 def _conv2d_subsampling(ch: int) -> ConvSubsamplingSpec:
-    return ConvSubsamplingSpec(layers=[
-        (1,  ch, 3, 3, 2, 2, 1),
-        (ch, ch, 3, 3, 2, 2, 1),
-    ])
+    return ConvSubsamplingSpec(
+        layers=[
+            (1, ch, 3, 3, 2, 2, 1),
+            (ch, ch, 3, 3, 2, 2, 1),
+        ]
+    )
 
 
 @dataclass
@@ -297,6 +305,7 @@ class EncoderConfig:
     frame_rate        Input frame rate in frames per second.
     mel_bins          Number of input mel-filterbank bins.
     """
+
     d_model: int
     num_layers: int
     num_heads: int
@@ -316,6 +325,7 @@ class EncoderConfig:
 @dataclass
 class ModelSpec:
     """Container for a complete ASR model's sub-network configurations."""
+
     name: str
     size: str
     encoder: EncoderConfig
@@ -351,20 +361,32 @@ class ModelSpec:
 #   WeNet does not publish a public "large" AISHELL config; paper values are used.
 
 CONFORMER_BASE = ModelSpec(
-    name="conformer", size="base",
+    name="conformer",
+    size="base",
     encoder=EncoderConfig(
-        d_model=256, num_layers=12, num_heads=4, ff_units=2048,
-        cnn_kernel=15, macaron=True, has_conv_module=True,
+        d_model=256,
+        num_layers=12,
+        num_heads=4,
+        ff_units=2048,
+        cnn_kernel=15,
+        macaron=True,
+        has_conv_module=True,
         subsampling=_conv2d_subsampling(256),
     ),
     vocab_size=5000,
 )
 
 CONFORMER_LARGE = ModelSpec(
-    name="conformer", size="large",
+    name="conformer",
+    size="large",
     encoder=EncoderConfig(
-        d_model=512, num_layers=17, num_heads=8, ff_units=2048,
-        cnn_kernel=32, macaron=True, has_conv_module=True,
+        d_model=512,
+        num_layers=17,
+        num_heads=8,
+        ff_units=2048,
+        cnn_kernel=32,
+        macaron=True,
+        has_conv_module=True,
         subsampling=_conv2d_subsampling(512),
     ),
     vocab_size=5000,
@@ -380,10 +402,17 @@ CONFORMER_LARGE = ModelSpec(
 #   other counts identical to base (num_blocks=24, cgmlp_conv_kernel=63).
 
 BRANCHFORMER_BASE = ModelSpec(
-    name="branchformer", size="base",
+    name="branchformer",
+    size="base",
     encoder=EncoderConfig(
-        d_model=256, num_layers=24, num_heads=4, ff_units=2048,
-        cnn_kernel=63, macaron=False, has_conv_module=False, skip_ff=True,
+        d_model=256,
+        num_layers=24,
+        num_heads=4,
+        ff_units=2048,
+        cnn_kernel=63,
+        macaron=False,
+        has_conv_module=False,
+        skip_ff=True,
         subsampling=_conv2d_subsampling(256),
     ),
     cgmlp_units=2048,
@@ -391,10 +420,17 @@ BRANCHFORMER_BASE = ModelSpec(
 )
 
 BRANCHFORMER_LARGE = ModelSpec(
-    name="branchformer", size="large",
+    name="branchformer",
+    size="large",
     encoder=EncoderConfig(
-        d_model=512, num_layers=24, num_heads=8, ff_units=3072,
-        cnn_kernel=63, macaron=False, has_conv_module=False, skip_ff=True,
+        d_model=512,
+        num_layers=24,
+        num_heads=8,
+        ff_units=3072,
+        cnn_kernel=63,
+        macaron=False,
+        has_conv_module=False,
+        skip_ff=True,
         subsampling=_conv2d_subsampling(512),
     ),
     cgmlp_units=3072,
@@ -419,26 +455,44 @@ BRANCHFORMER_LARGE = ModelSpec(
 #   All non-size parameters (SANM kernel=11, LFR=6, no Conv2D) match the large.
 
 PARAFORMER_BASE = ModelSpec(
-    name="paraformer", size="base",
+    name="paraformer",
+    size="base",
     encoder=EncoderConfig(
-        d_model=256, num_layers=12, num_heads=4, ff_units=2048,
-        cnn_kernel=11, macaron=False, has_conv_module=False,
-        subsampling=None, global_subsampling=6,
+        d_model=256,
+        num_layers=12,
+        num_heads=4,
+        ff_units=2048,
+        cnn_kernel=11,
+        macaron=False,
+        has_conv_module=False,
+        subsampling=None,
+        global_subsampling=6,
     ),
-    decoder_d_model=256, decoder_num_layers=6,
-    decoder_num_heads=4, decoder_ff_units=2048,
+    decoder_d_model=256,
+    decoder_num_layers=6,
+    decoder_num_heads=4,
+    decoder_ff_units=2048,
     vocab_size=8404,
 )
 
 PARAFORMER_LARGE = ModelSpec(
-    name="paraformer", size="large",
+    name="paraformer",
+    size="large",
     encoder=EncoderConfig(
-        d_model=512, num_layers=50, num_heads=4, ff_units=2048,
-        cnn_kernel=11, macaron=False, has_conv_module=False,
-        subsampling=None, global_subsampling=6,
+        d_model=512,
+        num_layers=50,
+        num_heads=4,
+        ff_units=2048,
+        cnn_kernel=11,
+        macaron=False,
+        has_conv_module=False,
+        subsampling=None,
+        global_subsampling=6,
     ),
-    decoder_d_model=512, decoder_num_layers=16,
-    decoder_num_heads=4, decoder_ff_units=2048,
+    decoder_d_model=512,
+    decoder_num_layers=16,
+    decoder_num_heads=4,
+    decoder_ff_units=2048,
     vocab_size=8404,
 )
 
@@ -453,25 +507,41 @@ PARAFORMER_LARGE = ModelSpec(
 # Reference: arXiv:1211.3711; icefall egs/librispeech/ASR/pruned_transducer_stateless7.
 
 TRANSDUCER_BASE = ModelSpec(
-    name="transducer", size="base",
+    name="transducer",
+    size="base",
     encoder=EncoderConfig(
-        d_model=256, num_layers=12, num_heads=4, ff_units=2048,
-        cnn_kernel=15, macaron=True, has_conv_module=True,
+        d_model=256,
+        num_layers=12,
+        num_heads=4,
+        ff_units=2048,
+        cnn_kernel=15,
+        macaron=True,
+        has_conv_module=True,
         subsampling=_conv2d_subsampling(256),
     ),
-    predictor_dim=512, predictor_num_layers=2,
-    joiner_dim=512, vocab_size=5000,
+    predictor_dim=512,
+    predictor_num_layers=2,
+    joiner_dim=512,
+    vocab_size=5000,
 )
 
 TRANSDUCER_LARGE = ModelSpec(
-    name="transducer", size="large",
+    name="transducer",
+    size="large",
     encoder=EncoderConfig(
-        d_model=512, num_layers=17, num_heads=8, ff_units=2048,
-        cnn_kernel=32, macaron=True, has_conv_module=True,
+        d_model=512,
+        num_layers=17,
+        num_heads=8,
+        ff_units=2048,
+        cnn_kernel=32,
+        macaron=True,
+        has_conv_module=True,
         subsampling=_conv2d_subsampling(512),
     ),
-    predictor_dim=1024, predictor_num_layers=2,
-    joiner_dim=1024, vocab_size=5000,
+    predictor_dim=1024,
+    predictor_num_layers=2,
+    joiner_dim=1024,
+    vocab_size=5000,
 )
 
 # ── Zipformer ─────────────────────────────────────────────────────────────────
@@ -506,33 +576,38 @@ TRANSDUCER_LARGE = ModelSpec(
 
 _ZM_STACKS = [
     # (d_model, num_heads, ff_units, num_layers, time_stride, cnn_kernel)
-    (192, 4, 512,  2, 1, 31),
-    (256, 4, 768,  2, 2, 31),
+    (192, 4, 512, 2, 1, 31),
+    (256, 4, 768, 2, 2, 31),
     (384, 4, 1024, 3, 4, 15),
     (512, 8, 1536, 4, 8, 15),
     (384, 4, 1024, 3, 4, 15),
-    (256, 4, 768,  2, 2, 31),
+    (256, 4, 768, 2, 2, 31),
 ]
 
 _ZL_STACKS = [
-    (192, 4, 512,  2, 1, 31),
-    (256, 4, 768,  2, 2, 31),
+    (192, 4, 512, 2, 1, 31),
+    (256, 4, 768, 2, 2, 31),
     (512, 4, 1536, 4, 4, 15),
     (768, 8, 2048, 5, 8, 15),
     (512, 4, 1536, 4, 4, 15),
-    (256, 4, 768,  2, 2, 31),
+    (256, 4, 768, 2, 2, 31),
 ]
 
 # Zipformer Q/K and V head dims (icefall --query-head-dim / --value-head-dim defaults)
 _ZF_QK_HEAD_DIM = 32
-_ZF_V_HEAD_DIM  = 12
+_ZF_V_HEAD_DIM = 12
 
 
 def _zipformer_stacks(table) -> Tuple[List[EncoderConfig], List[int]]:
     confs = [
         EncoderConfig(
-            d_model=dm, num_heads=nh, ff_units=ff, num_layers=nl,
-            cnn_kernel=ck, macaron=False, has_conv_module=True,
+            d_model=dm,
+            num_heads=nh,
+            ff_units=ff,
+            num_layers=nl,
+            cnn_kernel=ck,
+            macaron=False,
+            has_conv_module=True,
             subsampling=None,
             qk_head_dim=_ZF_QK_HEAD_DIM,
             v_head_dim=_ZF_V_HEAD_DIM,
@@ -549,7 +624,8 @@ _ZL_CONFS, _ZL_STRIDES = _zipformer_stacks(_ZL_STACKS)
 # Use the first stack as the representative "encoder" for field access;
 # actual GEMM generation iterates zipformer_stacks / zipformer_strides.
 ZIPFORMER_BASE = ModelSpec(
-    name="zipformer", size="base",
+    name="zipformer",
+    size="base",
     encoder=_ZM_CONFS[0],
     zipformer_stacks=_ZM_CONFS,
     zipformer_strides=_ZM_STRIDES,
@@ -557,7 +633,8 @@ ZIPFORMER_BASE = ModelSpec(
 )
 
 ZIPFORMER_LARGE = ModelSpec(
-    name="zipformer", size="large",
+    name="zipformer",
+    size="large",
     encoder=_ZL_CONFS[0],
     zipformer_stacks=_ZL_CONFS,
     zipformer_strides=_ZL_STRIDES,
@@ -566,22 +643,23 @@ ZIPFORMER_LARGE = ModelSpec(
 
 # Registry: (family, size) → ModelSpec
 MODEL_REGISTRY: Dict[Tuple[str, str], ModelSpec] = {
-    ("conformer",    "base"):  CONFORMER_BASE,
-    ("conformer",    "large"): CONFORMER_LARGE,
-    ("branchformer", "base"):  BRANCHFORMER_BASE,
+    ("conformer", "base"): CONFORMER_BASE,
+    ("conformer", "large"): CONFORMER_LARGE,
+    ("branchformer", "base"): BRANCHFORMER_BASE,
     ("branchformer", "large"): BRANCHFORMER_LARGE,
-    ("paraformer",   "base"):  PARAFORMER_BASE,
-    ("paraformer",   "large"): PARAFORMER_LARGE,
-    ("transducer",   "base"):  TRANSDUCER_BASE,
-    ("transducer",   "large"): TRANSDUCER_LARGE,
-    ("zipformer",    "base"):  ZIPFORMER_BASE,
-    ("zipformer",    "large"): ZIPFORMER_LARGE,
+    ("paraformer", "base"): PARAFORMER_BASE,
+    ("paraformer", "large"): PARAFORMER_LARGE,
+    ("transducer", "base"): TRANSDUCER_BASE,
+    ("transducer", "large"): TRANSDUCER_LARGE,
+    ("zipformer", "base"): ZIPFORMER_BASE,
+    ("zipformer", "large"): ZIPFORMER_LARGE,
 }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Problem size derivation
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 def _ceil_div(a: int, b: int) -> int:
     return math.ceil(a / b)
@@ -597,14 +675,14 @@ def _encoder_gemm_problems(enc: EncoderConfig, batch: int, T_prime: int) -> List
     D = enc.d_model
     H = enc.num_heads
     F = enc.ff_units
-    BH = batch * H       # batched attention: batch_count = batch * num_heads
+    BH = batch * H  # batched attention: batch_count = batch * num_heads
     BT = batch * T_prime
 
     # Per-head Q/K and V dimensions.
     # Standard attention: qk_dim = v_dim = d_model // num_heads.
     # Zipformer: qk_head_dim=32, v_head_dim=12 (decoupled from d_model).
     qk_dim = enc.qk_head_dim if enc.qk_head_dim is not None else D // H
-    v_dim  = enc.v_head_dim  if enc.v_head_dim  is not None else D // H
+    v_dim = enc.v_head_dim if enc.v_head_dim is not None else D // H
 
     problems: List[GemmProblem] = []
 
@@ -624,24 +702,36 @@ def _encoder_gemm_problems(enc: EncoderConfig, batch: int, T_prime: int) -> List
     # (For standard attention all four are d_model × d_model.)
     for proj in ("q_proj", "k_proj"):
         problems.append(GemmProblem(M=BT, N=H * qk_dim, K=D, op_name=f"attn_{proj}"))
-    problems.append(GemmProblem(M=BT, N=H * v_dim, K=D,       op_name="attn_v_proj"))
-    problems.append(GemmProblem(M=BT, N=D,         K=H * v_dim, op_name="attn_out_proj"))
+    problems.append(GemmProblem(M=BT, N=H * v_dim, K=D, op_name="attn_v_proj"))
+    problems.append(GemmProblem(M=BT, N=D, K=H * v_dim, op_name="attn_out_proj"))
 
     # QK score: (B*H, T', qk_dim) @ (B*H, qk_dim, T')
-    problems.append(GemmProblem(
-        M=T_prime, N=T_prime, K=qk_dim, batch=BH, op_name="attn_qk",
-    ))
+    problems.append(
+        GemmProblem(
+            M=T_prime,
+            N=T_prime,
+            K=qk_dim,
+            batch=BH,
+            op_name="attn_qk",
+        )
+    )
     # Context: (B*H, T', T') @ (B*H, T', v_dim)
-    problems.append(GemmProblem(
-        M=T_prime, N=v_dim, K=T_prime, batch=BH, op_name="attn_av",
-    ))
+    problems.append(
+        GemmProblem(
+            M=T_prime,
+            N=v_dim,
+            K=T_prime,
+            batch=BH,
+            op_name="attn_av",
+        )
+    )
 
     # ── Conformer conv module ────────────────────────────────────────────────
     # Pointwise expand:   (BT, D) → (BT, 2D)   [for GLU gating]
     # Pointwise contract: (BT, D) → (BT, D)
     if enc.has_conv_module:
         problems.append(GemmProblem(M=BT, N=2 * D, K=D, op_name="conv_pw_expand"))
-        problems.append(GemmProblem(M=BT, N=D,     K=D, op_name="conv_pw_contract"))
+        problems.append(GemmProblem(M=BT, N=D, K=D, op_name="conv_pw_contract"))
 
     return problems
 
@@ -655,13 +745,13 @@ def _branchformer_cgmlp_problems(spec: ModelSpec, batch: int, T_prime: int) -> L
     """
     if spec.cgmlp_units is None:
         return []
-    D  = spec.encoder.d_model
+    D = spec.encoder.d_model
     CU = spec.cgmlp_units
     BT = batch * T_prime
     return [
-        GemmProblem(M=BT, N=2 * CU, K=D,  op_name="cgmlp_expand"),
-        GemmProblem(M=BT, N=D,      K=CU, op_name="cgmlp_contract"),
-        GemmProblem(M=BT, N=D,      K=2 * D, op_name="branch_merge"),
+        GemmProblem(M=BT, N=2 * CU, K=D, op_name="cgmlp_expand"),
+        GemmProblem(M=BT, N=D, K=CU, op_name="cgmlp_contract"),
+        GemmProblem(M=BT, N=D, K=2 * D, op_name="branch_merge"),
     ]
 
 
@@ -675,9 +765,9 @@ def _decoder_gemm_problems(spec: ModelSpec, batch: int, T_enc: int) -> List[Gemm
     if spec.decoder_d_model is None:
         return []
 
-    D  = spec.decoder_d_model
-    H  = spec.decoder_num_heads
-    F  = spec.decoder_ff_units
+    D = spec.decoder_d_model
+    H = spec.decoder_num_heads
+    F = spec.decoder_ff_units
     NL = spec.decoder_num_layers
     hd = D // H
     T_dec = max(1, T_enc // 4)
@@ -691,24 +781,48 @@ def _decoder_gemm_problems(spec: ModelSpec, batch: int, T_enc: int) -> List[Gemm
         for proj in ("q", "k", "v"):
             problems.append(GemmProblem(M=BT_dec, N=D, K=D, op_name=f"dec_self_{proj}"))
         problems.append(GemmProblem(M=BT_dec, N=D, K=D, op_name="dec_self_out"))
-        problems.append(GemmProblem(
-            M=T_dec, N=T_dec, K=hd, batch=BH_dec, op_name="dec_self_qk",
-        ))
-        problems.append(GemmProblem(
-            M=T_dec, N=hd, K=T_dec, batch=BH_dec, op_name="dec_self_av",
-        ))
+        problems.append(
+            GemmProblem(
+                M=T_dec,
+                N=T_dec,
+                K=hd,
+                batch=BH_dec,
+                op_name="dec_self_qk",
+            )
+        )
+        problems.append(
+            GemmProblem(
+                M=T_dec,
+                N=hd,
+                K=T_dec,
+                batch=BH_dec,
+                op_name="dec_self_av",
+            )
+        )
 
         # Cross-attention  (Q: decoder, K/V: encoder)
         problems.append(GemmProblem(M=BT_dec, N=D, K=D, op_name="dec_cross_q"))
         problems.append(GemmProblem(M=BT_enc, N=D, K=D, op_name="dec_cross_k"))
         problems.append(GemmProblem(M=BT_enc, N=D, K=D, op_name="dec_cross_v"))
         problems.append(GemmProblem(M=BT_dec, N=D, K=D, op_name="dec_cross_out"))
-        problems.append(GemmProblem(
-            M=T_dec, N=T_enc, K=hd, batch=BH_dec, op_name="dec_cross_qk",
-        ))
-        problems.append(GemmProblem(
-            M=T_dec, N=hd, K=T_enc, batch=BH_dec, op_name="dec_cross_av",
-        ))
+        problems.append(
+            GemmProblem(
+                M=T_dec,
+                N=T_enc,
+                K=hd,
+                batch=BH_dec,
+                op_name="dec_cross_qk",
+            )
+        )
+        problems.append(
+            GemmProblem(
+                M=T_dec,
+                N=hd,
+                K=T_enc,
+                batch=BH_dec,
+                op_name="dec_cross_av",
+            )
+        )
 
         # FF
         problems.append(GemmProblem(M=BT_dec, N=F, K=D, op_name="dec_ff_expand"))
@@ -732,7 +846,7 @@ def _transducer_gemm_problems(spec: ModelSpec, batch: int, T_enc: int) -> List[G
 
     pd = spec.predictor_dim
     jd = spec.joiner_dim or pd
-    V  = spec.vocab_size or 5000
+    V = spec.vocab_size or 5000
     NL = spec.predictor_num_layers or 2
     enc_d = spec.encoder.d_model
     problems: List[GemmProblem] = []
@@ -741,25 +855,50 @@ def _transducer_gemm_problems(spec: ModelSpec, batch: int, T_enc: int) -> List[G
     input_dim = pd  # first layer uses predictor embedding dim (same as pd)
     for layer in range(NL):
         in_d = input_dim if layer == 0 else pd
-        problems.append(GemmProblem(
-            M=batch, N=4 * pd, K=in_d, op_name=f"lstm_layer{layer + 1}_input",
-        ))
-        problems.append(GemmProblem(
-            M=batch, N=4 * pd, K=pd, op_name=f"lstm_layer{layer + 1}_hidden",
-        ))
+        problems.append(
+            GemmProblem(
+                M=batch,
+                N=4 * pd,
+                K=in_d,
+                op_name=f"lstm_layer{layer + 1}_input",
+            )
+        )
+        problems.append(
+            GemmProblem(
+                M=batch,
+                N=4 * pd,
+                K=pd,
+                op_name=f"lstm_layer{layer + 1}_hidden",
+            )
+        )
 
     # Joiner: project encoder output (batch*T_enc, enc_d) → (batch*T_enc, jd)
-    problems.append(GemmProblem(
-        M=batch * T_enc, N=jd, K=enc_d, op_name="joiner_enc_proj",
-    ))
+    problems.append(
+        GemmProblem(
+            M=batch * T_enc,
+            N=jd,
+            K=enc_d,
+            op_name="joiner_enc_proj",
+        )
+    )
     # Joiner: project predictor output (batch, pd) → (batch, jd)
-    problems.append(GemmProblem(
-        M=batch, N=jd, K=pd, op_name="joiner_pred_proj",
-    ))
+    problems.append(
+        GemmProblem(
+            M=batch,
+            N=jd,
+            K=pd,
+            op_name="joiner_pred_proj",
+        )
+    )
     # Joiner output: (batch * T_enc, jd) → (batch * T_enc, V)
-    problems.append(GemmProblem(
-        M=batch * T_enc, N=V, K=jd, op_name="joiner_output",
-    ))
+    problems.append(
+        GemmProblem(
+            M=batch * T_enc,
+            N=V,
+            K=jd,
+            op_name="joiner_output",
+        )
+    )
 
     return problems
 
@@ -769,20 +908,31 @@ def _conv2d_problems(spec_sub: ConvSubsamplingSpec, batch: int, T: int) -> List[
     problems: List[Conv2dProblem] = []
     H, W = T, 80  # time frames × mel bins
     for i, (in_ch, out_ch, kH, kW, sH, sW, pad) in enumerate(spec_sub.layers):
-        problems.append(Conv2dProblem(
-            N=batch, C=in_ch, H=H, W=W,
-            K=out_ch, R=kH, S=kW,
-            pad_h=pad, pad_w=pad,
-            stride_h=sH, stride_w=sW,
-            op_name=f"conv2d_subsample_L{i + 1}",
-        ))
+        problems.append(
+            Conv2dProblem(
+                N=batch,
+                C=in_ch,
+                H=H,
+                W=W,
+                K=out_ch,
+                R=kH,
+                S=kW,
+                pad_h=pad,
+                pad_w=pad,
+                stride_h=sH,
+                stride_w=sW,
+                op_name=f"conv2d_subsample_L{i + 1}",
+            )
+        )
         H = _ceil_div(H, sH)
         W = _ceil_div(W, sW)
     return problems
 
 
 def derive_problems(
-    spec: ModelSpec, batch: int, duration_sec: int,
+    spec: ModelSpec,
+    batch: int,
+    duration_sec: int,
 ) -> Tuple[List[GemmProblem], List[Conv2dProblem]]:
     """
     Derive all GEMM and CONV2D problem sizes for a given (spec, batch, duration).
@@ -839,13 +989,18 @@ def derive_problems(
 
     # ── GEMM: CTC/output projection ──────────────────────────────────────────
     if spec.vocab_size is not None:
-        gemm_problems.append(GemmProblem(
-            M=batch * T_prime,
-            N=spec.vocab_size,
-            K=spec.encoder.d_model if spec.zipformer_stacks is None
-            else spec.zipformer_stacks[-1].d_model,
-            op_name="ctc_output",
-        ))
+        gemm_problems.append(
+            GemmProblem(
+                M=batch * T_prime,
+                N=spec.vocab_size,
+                K=(
+                    spec.encoder.d_model
+                    if spec.zipformer_stacks is None
+                    else spec.zipformer_stacks[-1].d_model
+                ),
+                op_name="ctc_output",
+            )
+        )
 
     return gemm_problems, conv2d_problems
 
@@ -867,9 +1022,21 @@ def dedup_conv2d(problems: List[Conv2dProblem]) -> List[Conv2dProblem]:
     seen: set = set()
     result: List[Conv2dProblem] = []
     for p in problems:
-        key = (p.N, p.C, p.H, p.W, p.K, p.R, p.S,
-               p.pad_h, p.pad_w, p.stride_h, p.stride_w,
-               p.dilation_h, p.dilation_w)
+        key = (
+            p.N,
+            p.C,
+            p.H,
+            p.W,
+            p.K,
+            p.R,
+            p.S,
+            p.pad_h,
+            p.pad_w,
+            p.stride_h,
+            p.stride_w,
+            p.dilation_h,
+            p.dilation_w,
+        )
         if key not in seen:
             seen.add(key)
             result.append(p)
@@ -880,26 +1047,27 @@ def dedup_conv2d(problems: List[Conv2dProblem]) -> List[Conv2dProblem]:
 # nvMatmulHeuristics query layer
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 def _gemm_config_to_dict(cfg) -> Dict[str, Any]:
     """Convert a GemmConfig object to a plain dict (all fields)."""
     return {
-        "layout":      cfg.layout,
-        "precision":   cfg.precision,
-        "stages":      cfg.stages,
-        "split_k":     cfg.split_k,
-        "cta_tile_m":  cfg.cta_tile_m,
-        "cta_tile_n":  cfg.cta_tile_n,
-        "cta_tile_k":  cfg.cta_tile_k,
+        "layout": cfg.layout,
+        "precision": cfg.precision,
+        "stages": cfg.stages,
+        "split_k": cfg.split_k,
+        "cta_tile_m": cfg.cta_tile_m,
+        "cta_tile_n": cfg.cta_tile_n,
+        "cta_tile_k": cfg.cta_tile_k,
         "warp_tile_m": cfg.warp_tile_m,
         "warp_tile_n": cfg.warp_tile_n,
         "warp_tile_k": cfg.warp_tile_k,
-        "instr_tile_m":cfg.instr_tile_m,
-        "instr_tile_n":cfg.instr_tile_n,
-        "instr_tile_k":cfg.instr_tile_k,
-        "cluster_m":   cfg.cluster_m,
-        "cluster_n":   cfg.cluster_n,
+        "instr_tile_m": cfg.instr_tile_m,
+        "instr_tile_n": cfg.instr_tile_n,
+        "instr_tile_k": cfg.instr_tile_k,
+        "cluster_m": cfg.cluster_m,
+        "cluster_n": cfg.cluster_n,
         "swizzle_factor": cfg.swizzle_factor,
-        "cta_order":   cfg.cta_order,
+        "cta_order": cfg.cta_order,
     }
 
 
@@ -912,13 +1080,14 @@ class NmhQueryEngine:
 
     def __init__(self, gpu_label: str, gpu_enum: Any, flags: int = 0):
         self._gpu_label = gpu_label
-        self._gpu_enum  = gpu_enum
-        self._flags     = flags
+        self._gpu_enum = gpu_enum
+        self._flags = flags
         # target_label → NvMatmulHeuristicsInterface
         self._interfaces: Dict[str, NvMatmulHeuristicsInterface] = {}
 
-    def _get_interface(self, cutlass_label: str, cutlass_target: Any,
-                       precision: str) -> NvMatmulHeuristicsInterface:
+    def _get_interface(
+        self, cutlass_label: str, cutlass_target: Any, precision: str
+    ) -> NvMatmulHeuristicsInterface:
         """Return (or create) an interface for the given CUTLASS target + precision."""
         key = f"{cutlass_label}_{precision}"
         if key not in self._interfaces:
@@ -951,12 +1120,16 @@ class NmhQueryEngine:
         iface = self._get_interface(cutlass_label, cutlass_target, precision)
         layout = boolsToNvMatmulHeuristicsLayout(problem.transA, problem.transB)
         nmh_problem = iface.makeNvMatmulHeuristicsProblem(
-            problem.M, problem.N, problem.K, layout, batch_size=problem.batch,
+            problem.M,
+            problem.N,
+            problem.K,
+            layout,
+            batch_size=problem.batch,
         )
         raw_results = iface.get(nmh_problem, count, iface._hardware_descriptor)
         return [
             {
-                "cutlass_config":    _gemm_config_to_dict(r["kernel"]),
+                "cutlass_config": _gemm_config_to_dict(r["kernel"]),
                 "estimated_runtime_s": r.get("runtime", 0.0),
             }
             for r in raw_results
@@ -966,6 +1139,7 @@ class NmhQueryEngine:
 # ═════════════════════════════════════════════════════════════════════════════
 # Core enumeration loop
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 def enumerate_configs(
     model_families: List[str],
@@ -1007,7 +1181,12 @@ def enumerate_configs(
             done += 1
             log.info(
                 "[%d/%d] %s/%s  batch=%d  duration=%ds",
-                done, n_total, family, size, batch, duration,
+                done,
+                n_total,
+                family,
+                size,
+                batch,
+                duration,
             )
 
             try:
@@ -1015,15 +1194,20 @@ def enumerate_configs(
             except Exception as exc:
                 log.error(
                     "Problem derivation failed for %s/%s b=%d d=%d: %s",
-                    family, size, batch, duration, exc,
+                    family,
+                    size,
+                    batch,
+                    duration,
+                    exc,
                 )
                 continue
 
-            gemm_list  = dedup_gemm(gemm_raw)
+            gemm_list = dedup_gemm(gemm_raw)
             conv2d_list = dedup_conv2d(conv2d_raw)
             log.debug(
                 "  → %d GEMM + %d Conv2D problems (after dedup)",
-                len(gemm_list), len(conv2d_list),
+                len(gemm_list),
+                len(conv2d_list),
             )
 
             # ── GEMM ─────────────────────────────────────────────────────────
@@ -1037,22 +1221,32 @@ def enumerate_configs(
 
                     for p in gemm_list:
                         prob_dict = {
-                            "M": p.M, "N": p.N, "K": p.K,
+                            "M": p.M,
+                            "N": p.N,
+                            "K": p.K,
                             "batch": p.batch,
-                            "transA": p.transA, "transB": p.transB,
+                            "transA": p.transA,
+                            "transB": p.transB,
                         }
-                        base = dict(
-                            model_family=family, model_size=size,
-                            batch_size=batch, audio_duration_sec=duration,
-                            op_type="gemm", function_name=p.op_name,
-                            problem_size=prob_dict, dtype=dtype,
-                            gpu_target=gpu_label, gpu_arch=gpu_arch,
-                        )
+                        base = {
+                            "model_family": family,
+                            "model_size": size,
+                            "batch_size": batch,
+                            "audio_duration_sec": duration,
+                            "op_type": "gemm",
+                            "function_name": p.op_name,
+                            "problem_size": prob_dict,
+                            "dtype": dtype,
+                            "gpu_target": gpu_label,
+                            "gpu_arch": gpu_arch,
+                        }
 
                         if dry_run:
                             yield ConfigRecord(
-                                **base, precision="dry_run",
-                                cutlass_family="dry_run", cutlass_config={},
+                                **base,
+                                precision="dry_run",
+                                cutlass_family="dry_run",
+                                cutlass_config={},
                                 status="dry_run",
                             )
                             continue
@@ -1083,19 +1277,32 @@ def enumerate_configs(
 
                     for p in conv2d_list:
                         prob_dict = {
-                            "N": p.N, "C": p.C, "H": p.H, "W": p.W,
-                            "K": p.K, "R": p.R, "S": p.S,
-                            "stride_h": p.stride_h, "stride_w": p.stride_w,
-                            "pad_h": p.pad_h, "pad_w": p.pad_w,
-                            "dilation_h": p.dilation_h, "dilation_w": p.dilation_w,
+                            "N": p.N,
+                            "C": p.C,
+                            "H": p.H,
+                            "W": p.W,
+                            "K": p.K,
+                            "R": p.R,
+                            "S": p.S,
+                            "stride_h": p.stride_h,
+                            "stride_w": p.stride_w,
+                            "pad_h": p.pad_h,
+                            "pad_w": p.pad_w,
+                            "dilation_h": p.dilation_h,
+                            "dilation_w": p.dilation_w,
                         }
                         yield ConfigRecord(
-                            model_family=family, model_size=size,
-                            batch_size=batch, audio_duration_sec=duration,
-                            op_type="conv2d", function_name=p.op_name,
-                            problem_size=prob_dict, dtype=dtype,
+                            model_family=family,
+                            model_size=size,
+                            batch_size=batch,
+                            audio_duration_sec=duration,
+                            op_type="conv2d",
+                            function_name=p.op_name,
+                            problem_size=prob_dict,
+                            dtype=dtype,
                             precision="n/a",
-                            gpu_target=gpu_label, gpu_arch=gpu_arch,
+                            gpu_target=gpu_label,
+                            gpu_arch=gpu_arch,
                             cutlass_family="nmh_unsupported",
                             cutlass_config={},
                             status="nmh_unsupported",
@@ -1126,7 +1333,11 @@ def _query_gemm_and_emit(
             status = "error"
         log.debug(
             "  NMH query failed  %s/%s  prec=%s  gpu=%s: %s",
-            cutlass_label, problem.op_name, precision, base_kwargs.get("gpu_target"), exc,
+            cutlass_label,
+            problem.op_name,
+            precision,
+            base_kwargs.get("gpu_target"),
+            exc,
         )
         yield ConfigRecord(
             **base_kwargs,
@@ -1163,6 +1374,7 @@ def _query_gemm_and_emit(
 # Output
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class JsonlWriter:
     """
     JSONL writer with cross-family merging.
@@ -1184,7 +1396,7 @@ class JsonlWriter:
     """
 
     def __init__(self, path: Path, merge: bool = True):
-        self._path  = path
+        self._path = path
         self._merge = merge
         # merge_key (str) → record dict; updated in-place when families merge
         self._records: Dict[str, dict] = {}
@@ -1203,7 +1415,9 @@ class JsonlWriter:
             self._fh.close()
         log.info(
             "Wrote %d records to %s  (%d cross-family merges performed)",
-            len(self._records), self._path, self._merged_count,
+            len(self._records),
+            self._path,
+            self._merged_count,
         )
 
     def write(self, record: ConfigRecord) -> None:
@@ -1223,9 +1437,17 @@ class JsonlWriter:
             {
                 k: d[k]
                 for k in (
-                    "model_size", "batch_size", "audio_duration_sec",
-                    "op_type", "problem_size", "dtype", "precision",
-                    "gpu_target", "cutlass_family", "cutlass_config", "status",
+                    "model_size",
+                    "batch_size",
+                    "audio_duration_sec",
+                    "op_type",
+                    "problem_size",
+                    "dtype",
+                    "precision",
+                    "gpu_target",
+                    "cutlass_family",
+                    "cutlass_config",
+                    "status",
                 )
             },
             sort_keys=True,
@@ -1257,10 +1479,10 @@ class JsonlWriter:
 # ═════════════════════════════════════════════════════════════════════════════
 
 _ALL_FAMILIES = sorted({f for f, _ in MODEL_REGISTRY})
-_ALL_SIZES    = ["base", "large"]
-_ALL_BATCHES  = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-_ALL_DURS     = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
-_ALL_DTYPES   = ["float16", "bfloat16"]
+_ALL_SIZES = ["base", "large"]
+_ALL_BATCHES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+_ALL_DURS = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+_ALL_DTYPES = ["float16", "bfloat16"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1271,30 +1493,48 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     p.add_argument(
-        "--families", nargs="+", default=_ALL_FAMILIES,
-        choices=_ALL_FAMILIES, metavar="FAMILY",
+        "--families",
+        nargs="+",
+        default=_ALL_FAMILIES,
+        choices=_ALL_FAMILIES,
+        metavar="FAMILY",
         help=f"Model families (default: all).  Choices: {_ALL_FAMILIES}",
     )
     p.add_argument(
-        "--sizes", nargs="+", default=_ALL_SIZES,
-        choices=_ALL_SIZES, metavar="SIZE",
+        "--sizes",
+        nargs="+",
+        default=_ALL_SIZES,
+        choices=_ALL_SIZES,
+        metavar="SIZE",
         help="Model sizes: base | large  (default: both)",
     )
     p.add_argument(
-        "--batches", nargs="+", type=int, default=_ALL_BATCHES, metavar="B",
+        "--batches",
+        nargs="+",
+        type=int,
+        default=_ALL_BATCHES,
+        metavar="B",
         help=f"Batch sizes (default: {_ALL_BATCHES})",
     )
     p.add_argument(
-        "--durations", nargs="+", type=int, default=_ALL_DURS, metavar="SEC",
+        "--durations",
+        nargs="+",
+        type=int,
+        default=_ALL_DURS,
+        metavar="SEC",
         help=f"Audio durations in seconds (default: {_ALL_DURS})",
     )
     p.add_argument(
-        "--dtypes", nargs="+", default=_ALL_DTYPES,
-        choices=["float16", "bfloat16", "float32"], metavar="DTYPE",
+        "--dtypes",
+        nargs="+",
+        default=_ALL_DTYPES,
+        choices=["float16", "bfloat16", "float32"],
+        metavar="DTYPE",
         help=f"Data types (default: {_ALL_DTYPES})",
     )
     p.add_argument(
-        "--gpus", nargs="+",
+        "--gpus",
+        nargs="+",
         default=DEFAULT_GPUS,
         choices=sorted(GPU_TABLE) if GPU_TABLE else [],
         metavar="GPU",
@@ -1304,32 +1544,41 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--output", "-o", default="asr_cutlass_configs.jsonl", metavar="FILE",
+        "--output",
+        "-o",
+        default="asr_cutlass_configs.jsonl",
+        metavar="FILE",
         help="Output JSONL file (default: asr_cutlass_configs.jsonl)",
     )
     p.add_argument(
-        "--no-dedup", action="store_true",
+        "--no-dedup",
+        action="store_true",
         help=(
             "Disable cross-family merging and write every record as-is, "
             "including duplicates across model families."
         ),
     )
     p.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help=(
             "Skip GPU heuristic queries.  "
             "Emits one placeholder record per problem size for shape inspection."
         ),
     )
     p.add_argument(
-        "--list-problems", action="store_true",
+        "--list-problems",
+        action="store_true",
         help=(
             "Print derived problem sizes to stdout as JSONL and exit "
             "(implies --dry-run, no output file written)."
         ),
     )
     p.add_argument(
-        "-v", "--verbose", action="count", default=0,
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
         help="Increase logging verbosity (-v INFO, -vv DEBUG)",
     )
     return p
@@ -1360,8 +1609,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     log.info(
         "families=%s  sizes=%s  batches=%s  durations=%s  dtypes=%s  gpus=%s",
-        args.families, args.sizes, args.batches, args.durations,
-        args.dtypes, args.gpus,
+        args.families,
+        args.sizes,
+        args.batches,
+        args.durations,
+        args.dtypes,
+        args.gpus,
     )
 
     if args.list_problems:
@@ -1381,24 +1634,46 @@ def main(argv: Optional[List[str]] = None) -> int:
                     key = ("gemm", p.M, p.N, p.K, p.batch)
                     if key not in seen_problems:
                         seen_problems.add(key)
-                        print(json.dumps({
-                            "model_family": family, "model_size": size,
-                            "batch_size": batch, "audio_duration_sec": duration,
-                            "op_type": "gemm", "function_name": p.op_name,
-                            "M": p.M, "N": p.N, "K": p.K, "batch_count": p.batch,
-                        }))
+                        print(
+                            json.dumps(
+                                {
+                                    "model_family": family,
+                                    "model_size": size,
+                                    "batch_size": batch,
+                                    "audio_duration_sec": duration,
+                                    "op_type": "gemm",
+                                    "function_name": p.op_name,
+                                    "M": p.M,
+                                    "N": p.N,
+                                    "K": p.K,
+                                    "batch_count": p.batch,
+                                }
+                            )
+                        )
                 for p in dedup_conv2d(conv2d_raw):
                     key = ("conv2d", p.N, p.C, p.H, p.W, p.K)
                     if key not in seen_problems:
                         seen_problems.add(key)
-                        print(json.dumps({
-                            "model_family": family, "model_size": size,
-                            "batch_size": batch, "audio_duration_sec": duration,
-                            "op_type": "conv2d", "function_name": p.op_name,
-                            "N": p.N, "C": p.C, "H": p.H, "W": p.W,
-                            "K": p.K, "R": p.R, "S": p.S,
-                            "stride": (p.stride_h, p.stride_w),
-                        }))
+                        print(
+                            json.dumps(
+                                {
+                                    "model_family": family,
+                                    "model_size": size,
+                                    "batch_size": batch,
+                                    "audio_duration_sec": duration,
+                                    "op_type": "conv2d",
+                                    "function_name": p.op_name,
+                                    "N": p.N,
+                                    "C": p.C,
+                                    "H": p.H,
+                                    "W": p.W,
+                                    "K": p.K,
+                                    "R": p.R,
+                                    "S": p.S,
+                                    "stride": (p.stride_h, p.stride_w),
+                                }
+                            )
+                        )
         return 0
 
     output_path = Path(args.output)

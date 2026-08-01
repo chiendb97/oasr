@@ -1,0 +1,21 @@
+# Lint / type-check / test tooling, pinned.
+#
+# These versions are pinned rather than floored because CI *gates* on them:
+# black and ruff reformat differently across releases, and the mypy ratchet in
+# ci/mypy-baseline.json counts errors that a different mypy would count
+# differently.  An unpinned toolchain turns a green PR red on an upstream
+# release with no change to this repo.
+#
+# Keep in lockstep with .pre-commit-config.yaml — a contributor's pre-commit
+# run and the lint job must produce the same bytes.
+#
+#     pip install -r requirements-dev.txt
+
+black==26.3.1
+isort==8.0.1
+ruff==0.14.2
+mypy==2.3.0
+types-PyYAML==6.0.12.20260724
+
+pytest==8.1.1
+pytest-cov==7.1.0

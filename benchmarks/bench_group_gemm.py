@@ -13,18 +13,18 @@ from benchmarks.routines.bench_utils import bench_fn
 from benchmarks.routines.gemm import setup_group_gemm
 
 CONFIGS = [
-    {"num_groups": 32,  "M": 256,   "N":  64, "K":  64},
-    {"num_groups": 32,  "M": 256,   "N": 128, "K":  64},
-    {"num_groups": 64,  "M": 16000, "N": 256, "K": 2048},
-    {"num_groups": 64,  "M": 16000, "N": 512, "K": 2048},
+    {"num_groups": 32, "M": 256, "N": 64, "K": 64},
+    {"num_groups": 32, "M": 256, "N": 128, "K": 64},
+    {"num_groups": 64, "M": 16000, "N": 256, "K": 2048},
+    {"num_groups": 64, "M": 16000, "N": 512, "K": 2048},
 ]
 
 DTYPES = [torch.bfloat16]
 DTYPE_NAMES = {torch.bfloat16: "bfloat16"}
 
-_COL_SHAPE  = 28
-_COL_TIME   = 14
-_COL_METRIC =  8
+_COL_SHAPE = 28
+_COL_TIME = 14
+_COL_METRIC = 8
 
 _HEADER = (
     f"{'shape':>{_COL_SHAPE}}"
@@ -32,8 +32,8 @@ _HEADER = (
     f"  {'CUTLASS':>{_COL_TIME}}  {'TFLOPS':>{_COL_METRIC}}"
     f"  {'PyTorch':>{_COL_TIME}}  {'TFLOPS':>{_COL_METRIC}}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR Group GEMM Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR Group GEMM Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
@@ -53,31 +53,29 @@ def _row(shape_str, times, cfg):
     g, M, N, K = cfg["num_groups"], cfg["M"], cfg["N"], cfg["K"]
     parts = [f"{shape_str:>{_COL_SHAPE}}"]
     for ms in times:
-        parts.append(
-            f"  {_fmt(ms):>{_COL_TIME}}  {_fmt_t(_tflops(g, M, N, K, ms)):>{_COL_METRIC}}"
-        )
+        parts.append(f"  {_fmt(ms):>{_COL_TIME}}  {_fmt_t(_tflops(g, M, N, K, ms)):>{_COL_METRIC}}")
     return "".join(parts)
 
 
 def _make_tensors(cfg, dtype):
     torch.manual_seed(0)
     g, M, N, K = cfg["num_groups"], cfg["M"], cfg["N"], cfg["K"]
-    low  = max(16, M // 2)
+    low = max(16, M // 2)
     high = max(low + 1, M * 2)
-    Ms     = torch.randint(low=low, high=high, size=(g,), device="cuda").tolist()
-    L      = sum(Ms)
-    A      = torch.randn(L, K, device="cuda", dtype=dtype)
-    B      = torch.randn(g, N, K, device="cuda", dtype=dtype)
+    Ms = torch.randint(low=low, high=high, size=(g,), device="cuda").tolist()
+    L = sum(Ms)
+    A = torch.randn(L, K, device="cuda", dtype=dtype)
+    B = torch.randn(g, N, K, device="cuda", dtype=dtype)
     offset = torch.cumsum(torch.tensor(Ms, dtype=torch.int32, device="cuda"), dim=0)
     return A, B, offset
 
 
 def _run_shape(cfg, dtype):
     g, M, N, K = cfg["num_groups"], cfg["M"], cfg["N"], cfg["K"]
-    low  = max(16, M // 2)
+    low = max(16, M // 2)
     high = max(low + 1, M * 2)
     torch.manual_seed(0)
-    Ms   = torch.randint(low=low, high=high, size=(g,), device="cuda").tolist()
+    Ms = torch.randint(low=low, high=high, size=(g,), device="cuda").tolist()
     problem_sizes = [(m, N, K) for m in Ms]
     oasr_fn, pytorch_fn = setup_group_gemm(problem_sizes, dtype)
 
@@ -96,7 +94,8 @@ def _run_shape(cfg, dtype):
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available"); return
+        print("CUDA not available")
+        return
 
     print(_TITLE)
     print(_TITLE_SEP)

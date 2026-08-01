@@ -28,9 +28,11 @@ import torch
 import torch.nn as nn
 
 import oasr
-from oasr.feature import dct_lifter as _cuda_dct_lifter
-from oasr.feature import fbank_preprocess as _cuda_fbank_preprocess
-from oasr.feature import mel_log as _cuda_mel_log
+from oasr.feature import (
+    dct_lifter as _cuda_dct_lifter,
+    fbank_preprocess as _cuda_fbank_preprocess,
+    mel_log as _cuda_mel_log,
+)
 from oasr.features.config import FeatureConfig
 
 __all__ = ["Fbank", "Mfcc"]
@@ -122,9 +124,7 @@ def _build_lifter(num_ceps: int, lifter_q: float) -> Optional[torch.Tensor]:
 
 def _frame_lengths(lengths: torch.Tensor, frame_length: int, frame_shift: int) -> torch.Tensor:
     """Number of valid frames per utterance under ``snip_edges=True``."""
-    return torch.clamp((lengths.long() - frame_length) // frame_shift + 1, min=0).to(
-        torch.int32
-    )
+    return torch.clamp((lengths.long() - frame_length) // frame_shift + 1, min=0).to(torch.int32)
 
 
 class Fbank(nn.Module):
@@ -255,7 +255,7 @@ class Fbank(nn.Module):
                 torch.zeros(B, dtype=torch.int32, device=device),
             )
 
-        power = oasr.rfft_power(windowed, n=self.n_fft)        # (B, F, n_fft//2+1)
+        power = oasr.rfft_power(windowed, n=self.n_fft)  # (B, F, n_fft//2+1)
         log_mel = _cuda_mel_log(power, self.mel_mat, log_floor=self._log_floor)  # (B, F, M)
 
         if fuse_postprocess is not None:
@@ -264,13 +264,9 @@ class Fbank(nn.Module):
             features = log_mel
 
         if lengths is None:
-            feat_lengths = torch.full(
-                (B,), num_frames, dtype=torch.int32, device=device
-            )
+            feat_lengths = torch.full((B,), num_frames, dtype=torch.int32, device=device)
         else:
-            feat_lengths = _frame_lengths(
-                lengths.to(device), self.frame_length, self.frame_shift
-            )
+            feat_lengths = _frame_lengths(lengths.to(device), self.frame_length, self.frame_shift)
         return features, feat_lengths
 
 

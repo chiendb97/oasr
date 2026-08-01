@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """JIT generator for softmax kernel."""
 
-from .core import gen_jit_spec, JitSpec
 from . import env
+from .core import JitSpec, gen_jit_spec
 
 
 def gen_softmax_module() -> JitSpec:

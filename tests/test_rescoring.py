@@ -9,11 +9,10 @@ Three tiers:
 * GPU end-to-end on the real U2++ checkpoint (skipped when absent).
 """
 
-import glob
-import os
 from dataclasses import dataclass
 from typing import List, Optional
 
+import assets
 import pytest
 import torch
 
@@ -24,13 +23,9 @@ from oasr.models.decoders import (
     reverse_pad_list,
 )
 
-CKPT_DIR = os.environ.get(
-    "CKPT_DIR",
-    "/data01/kilm/users/chiendb/models/asr/am/20210610_u2pp_conformer_exp_librispeech",
-)
-WAV_DIR = os.environ.get(
-    "WAV_DIR", "/data01/kilm/users/chiendb/data/asr/ljspeech-sr16k-dataset/wavs"
-)
+# Declared in tests/assets.py so --strict-assets can make these fatal.
+CKPT_DIR = assets.declared("CKPT_DIR")
+WAV_DIR = assets.declared("WAV_DIR")
 
 
 # ---------------------------------------------------------------------------
@@ -301,9 +296,7 @@ class TestFusionMath:
 class TestEngineSeams:
     @pytest.fixture(scope="class")
     def ckpt(self):
-        if not os.path.exists(os.path.join(CKPT_DIR, "final.pt")):
-            pytest.skip(f"no U2++ checkpoint at {CKPT_DIR} (set CKPT_DIR)")
-        return CKPT_DIR
+        return assets.require("CKPT_DIR")
 
     def test_unknown_decode_method_rejected(self, ckpt):
         from oasr.engine import ASREngine, EngineConfig
@@ -332,8 +325,7 @@ class TestEngineSeams:
 class TestEngineRescoringE2E:
     @pytest.fixture(scope="class")
     def engine(self):
-        if not os.path.exists(os.path.join(CKPT_DIR, "final.pt")):
-            pytest.skip(f"no U2++ checkpoint at {CKPT_DIR} (set CKPT_DIR)")
+        assets.require("CKPT_DIR")
         from oasr.engine import ASREngine, EngineConfig
 
         cfg = EngineConfig(
@@ -349,9 +341,7 @@ class TestEngineRescoringE2E:
 
     @pytest.fixture(scope="class")
     def audios(self):
-        wavs = sorted(glob.glob(os.path.join(WAV_DIR, "*.wav")))[:12]
-        if not wavs:
-            pytest.skip(f"no wavs under {WAV_DIR} (set WAV_DIR)")
+        wavs = assets.require_wavs(12)
         import torchaudio
 
         loaded = [torchaudio.load(w)[0].squeeze(0) for w in wavs]

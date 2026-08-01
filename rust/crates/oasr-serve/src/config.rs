@@ -144,10 +144,10 @@ pub struct Cli {
     /// max_batch_size.
     #[arg(long)]
     pub max_decode_slots: Option<u32>,
-    /// Offline only: overlap per-request admission prep (waveform load + scale
-    /// + frame stamp) with the GPU ``step()`` on a daemon prep thread.  Helps
-    /// at high concurrency (a deep backlog to pipeline); can slightly regress
-    /// at low concurrency due to GIL contention, so it is opt-in.  No effect in
+    /// Offline only: overlap per-request admission prep (waveform load, scale,
+    /// frame stamp) with the GPU ``step()`` on a daemon prep thread.  Helps at
+    /// high concurrency (a deep backlog to pipeline); can slightly regress at
+    /// low concurrency due to GIL contention, so it is opt-in.  No effect in
     /// streaming mode.
     #[arg(long, default_value_t = false)]
     pub overlap_admit: bool,

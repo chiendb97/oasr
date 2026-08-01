@@ -6,6 +6,12 @@ import torch
 
 import oasr
 
+# Every test in this module allocates directly on ``device="cuda"`` and calls a
+# JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
+# what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
+# instead of a wall of `RuntimeError: No CUDA GPUs are available`.
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+
 
 class TestTopK:
     """Tests for oasr.topk() functional API."""
@@ -100,7 +106,7 @@ class TestTopK:
     def test_topk_cpu_error(self):
         """CPU tensors must raise an error."""
         x = torch.randn(2, 64, 128, dtype=torch.float32)
-        with pytest.raises(Exception):
+        with pytest.raises(RuntimeError, match="CUDA tensor"):
             oasr.topk(x, 5)
 
     def test_topk_layer(self):

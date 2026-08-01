@@ -35,15 +35,76 @@ def _load(audio_dir: str, n: int):
 # aten op name -> coarse bucket
 def _bucket(name: str) -> str:
     n = name.lower()
-    if any(k in n for k in ("gemm", "cutlass", "addmm", "matmul", "bmm", "linear", "mm", "sm90", "sm80", "implicit", "conv")):
+    if any(
+        k in n
+        for k in (
+            "gemm",
+            "cutlass",
+            "addmm",
+            "matmul",
+            "bmm",
+            "linear",
+            "mm",
+            "sm90",
+            "sm80",
+            "implicit",
+            "conv",
+        )
+    ):
         if "conv" in n:
             return "conv"
         return "gemm"
     if any(k in n for k in ("layer_norm", "rms_norm", "batch_norm", "group_norm", "norm", "cmvn")):
         return "norm"
-    if any(k in n for k in ("cat", "copy", "index", "gather", "scatter", "slice", "select", "stack", "narrow", "pad", "contiguous", "clone", "to_copy", "permute", "transpose", "reshape", "view", "expand", "masked_fill", "zero", "fill", "arange", "empty", "set_")):
+    if any(
+        k in n
+        for k in (
+            "cat",
+            "copy",
+            "index",
+            "gather",
+            "scatter",
+            "slice",
+            "select",
+            "stack",
+            "narrow",
+            "pad",
+            "contiguous",
+            "clone",
+            "to_copy",
+            "permute",
+            "transpose",
+            "reshape",
+            "view",
+            "expand",
+            "masked_fill",
+            "zero",
+            "fill",
+            "arange",
+            "empty",
+            "set_",
+        )
+    ):
         return "copy/index"
-    if any(k in n for k in ("add", "mul", "sub", "div", "elementwise", "softmax", "exp", "rsqrt", "sigmoid", "silu", "glu", "where", "clamp", "neg")):
+    if any(
+        k in n
+        for k in (
+            "add",
+            "mul",
+            "sub",
+            "div",
+            "elementwise",
+            "softmax",
+            "exp",
+            "rsqrt",
+            "sigmoid",
+            "silu",
+            "glu",
+            "where",
+            "clamp",
+            "neg",
+        )
+    ):
         return "elementwise"
     return "other"
 
@@ -62,7 +123,9 @@ def _profile(engine, run_fn, label: str, topk: int = 35):
     evts = prof.key_averages()
     rows = []
     for e in evts:
-        cuda_us = float(getattr(e, "self_device_time_total", 0) or getattr(e, "self_cuda_time_total", 0))
+        cuda_us = float(
+            getattr(e, "self_device_time_total", 0) or getattr(e, "self_cuda_time_total", 0)
+        )
         if cuda_us <= 0:
             continue
         rows.append((e.key, cuda_us, e.count))
@@ -99,8 +162,11 @@ def main():
 
     if args.mode in ("offline", "both"):
         cfg = EngineConfig(
-            ckpt_dir=args.ckpt_dir, device="cuda", dtype=torch.float16,
-            service_mode="offline", decoder_type="ctc_cuda",
+            ckpt_dir=args.ckpt_dir,
+            device="cuda",
+            dtype=torch.float16,
+            service_mode="offline",
+            decoder_type="ctc_cuda",
             max_batch_size=args.max_batch_size,
         )
         eng = ASREngine(cfg)
@@ -111,9 +177,13 @@ def main():
 
     if args.mode in ("streaming", "both"):
         cfg = EngineConfig(
-            ckpt_dir=args.ckpt_dir, device="cuda", dtype=torch.float16,
-            service_mode="streaming", decoder_type="ctc_cuda",
-            chunk_size=args.chunk_size, max_batch_size=args.max_batch_size,
+            ckpt_dir=args.ckpt_dir,
+            device="cuda",
+            dtype=torch.float16,
+            service_mode="streaming",
+            decoder_type="ctc_cuda",
+            chunk_size=args.chunk_size,
+            max_batch_size=args.max_batch_size,
             use_cuda_graphs=False,  # expose ops to the profiler
         )
         eng = ASREngine(cfg)

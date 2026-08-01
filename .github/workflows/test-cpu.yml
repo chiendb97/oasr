@@ -1,0 +1,78 @@
+name: test-cpu
+
+# The fast feedback loop: the part of the suite that runs with no GPU.
+#
+# Nothing is built.  `oasr/_C*.so` (CMake + CUDA) and `oasr/_core*.so`
+# (setuptools-rust) are both absent here, and `import oasr` works without them
+# because the CUDA kernels JIT on first *call* and `_C` is loaded lazily.  So
+# the job puts the repo on PYTHONPATH and runs pytest directly; a full
+# `pip install -e .` would need the CUDA toolkit for a job that cannot use it.
+#
+# 3.10 is in the matrix because pyproject declares `requires-python = ">=3.10"`
+# — a floor nobody tests is a guess.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-cpu-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install runtime + test dependencies (CPU torch)
+        run: |
+          python -m pip install --upgrade pip
+          # torchcodec is not optional with torchaudio >= 2.11: `torchaudio.load`
+          # routes through it and raises ImportError without it.
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio torchcodec
+          # Runtime deps from pyproject [project.dependencies], plus the optional
+          # extras whose absence would otherwise turn tests into importorskips.
+          pip install numpy "apache-tvm-ffi>=0.1.0" "jinja2>=3.0" "PyYAML>=5.4"
+          pip install safetensors huggingface_hub sentencepiece tokenizers transformers soundfile
+          pip install -r requirements-dev.txt
+
+      - name: Report the environment
+        run: pip list
+
+      # No pipe here.  GitHub runs steps under `bash -e`, so `pytest ... | tail`
+      # reports *tail's* exit status — a collection error looked like a passing
+      # step, which is precisely how the first red run hid its own cause.
+      - name: Collect (a collection error must fail here, not later)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest tests/ --collect-only -q
+
+      # --min-passed is a coverage floor, not a target: it fails the job if a
+      # bad CUDA guard or a silent import failure shrinks the CPU surface.
+      # 626 is the observed count; 615 leaves room for small dependency drift
+      # without tolerating a module going dark.  Do not lower it to make a red
+      # run pass — find what started skipping.
+      - name: pytest
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m pytest tests/ \
+            -m "not slow and not concurrent" \
+            -q -rs -rE --tb=short --min-passed 615

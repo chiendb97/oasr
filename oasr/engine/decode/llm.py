@@ -98,7 +98,7 @@ class LlmDecodeStrategy(IncrementalArStrategy):
         self._default_suffix_ids: List[int] = list(tokenizer.encode(suffix_text))
         # Per-prompt suffix-ids memo for DecodingOptions.prompt overrides.
         self._suffix_cache: Dict[str, List[int]] = {}
-        self._eos: Set[int] = set(int(t) for t in mcfg.eos_token_ids)
+        self._eos: Set[int] = {int(t) for t in mcfg.eos_token_ids}
 
     def _prompt_len_estimate(self) -> int:
         """Prompt positions per row: ChatML text + the spliced audio embeddings.

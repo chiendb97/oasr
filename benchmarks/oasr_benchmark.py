@@ -48,7 +48,6 @@ if _project_root not in sys.path:
 from benchmarks.routines import get_routine, list_all_subroutines, list_routines
 from benchmarks.routines.bench_utils import OutputWriter, get_device_info, profile_kernel
 
-
 # ---------------------------------------------------------------------------
 # Argument parsing (two-stage)
 # ---------------------------------------------------------------------------
@@ -80,7 +79,7 @@ def _build_global_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         help="Backend(s) to benchmark. Per-family defaults: gemm/conv2d → cutlass torch; "
-             "norm/conv1d/activation/composite → cuda torch; ctc_decoder → oasr torchaudio",
+        "norm/conv1d/activation/composite → cuda torch; ctc_decoder → oasr torchaudio",
     )
     parser.add_argument(
         "--dtype",

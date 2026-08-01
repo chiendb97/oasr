@@ -13,7 +13,6 @@ Use ``rope_type="yarn"`` in ``get_rotary_embedding`` factory.
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import torch
 
@@ -27,9 +26,9 @@ def _yarn_find_correction_dim(
     max_position_embeddings: int = 2048,
 ) -> float:
     """Inverse dim formula to find dim based on number of rotations."""
-    return (
-        dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))
-    ) / (2 * math.log(base))
+    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
+        2 * math.log(base)
+    )
 
 
 def _yarn_find_correction_range(
@@ -79,9 +78,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbeddingBase):
         """
         super().__init__(
             head_dim=head_dim,
-            max_position_embeddings=int(
-                original_max_position_embeddings * scaling_factor
-            ),
+            max_position_embeddings=int(original_max_position_embeddings * scaling_factor),
             base=base,
             style=style,
         )
@@ -94,12 +91,9 @@ class YaRNScalingRotaryEmbedding(RotaryEmbeddingBase):
 
         # Precompute YaRN ramp mask
         low, high = _yarn_find_correction_range(
-            1, scaling_factor, self.rotary_dim // 2, base,
-            original_max_position_embeddings
+            1, scaling_factor, self.rotary_dim // 2, base, original_max_position_embeddings
         )
-        ramp = (torch.arange(self.rotary_dim // 2, dtype=torch.float) - low) / (
-            high - low + 1e-6
-        )
+        ramp = (torch.arange(self.rotary_dim // 2, dtype=torch.float) - low) / (high - low + 1e-6)
         self.register_buffer(
             "yarn_ramp",
             torch.clamp(ramp, 0, 1),
@@ -110,13 +104,11 @@ class YaRNScalingRotaryEmbedding(RotaryEmbeddingBase):
         inv_freq = 1.0 / (
             base
             ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float)[
-                    : (self.rotary_dim // 2)
-                ]
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float)[: (self.rotary_dim // 2)]
                 / self.rotary_dim
             )
         )
         # Apply YaRN interpolation scaling (ramp on same device as inv_freq)
         ramp = self.yarn_ramp.to(inv_freq.device)
-        inv_freq = inv_freq / (self.scaling_factor ** ramp)
+        inv_freq = inv_freq / (self.scaling_factor**ramp)
         return inv_freq

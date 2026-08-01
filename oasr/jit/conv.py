@@ -1,16 +1,14 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""JIT generator for convolution kernels.
-"""
+"""JIT generator for convolution kernels."""
 
 import itertools
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Union
 
-from .core import gen_jit_spec, _get_target_sm, JitSpec
-from .gemm import TileShape, TileShapeConfigs, _smem_bytes, _SM_MAX_SMEM_BYTES
 from . import env
-
+from .core import JitSpec, _get_target_sm, gen_jit_spec
+from .gemm import _SM_MAX_SMEM_BYTES, TileShape, TileShapeConfigs, _smem_bytes
 
 # =============================================================================
 # Conv2D config dataclasses  (mirror CutlassGemmConfig / CutlassGemmConfigSm90)
@@ -25,6 +23,7 @@ class CutlassConv2dConfig:
     absence of ``split_k`` — CUTLASS 2.x implicit GEMM does not provide a
     split-K splitter, so ``name == compile_name`` for Conv2D.
     """
+
     block_m: int
     block_n: int
     block_k: int
@@ -47,11 +46,15 @@ class CutlassConv2dConfig:
         return "_".join(parts)
 
     def to_tactic_config(self) -> Tuple[Tuple[str, int], ...]:
-        return tuple([
-            ("block_m", self.block_m), ("block_n", self.block_n), ("block_k", self.block_k),
-            ("warp_m", self.warp_m), ("warp_n", self.warp_n), ("warp_k", self.warp_k),
+        return (
+            ("block_m", self.block_m),
+            ("block_n", self.block_n),
+            ("block_k", self.block_k),
+            ("warp_m", self.warp_m),
+            ("warp_n", self.warp_n),
+            ("warp_k", self.warp_k),
             ("kStages", self.kStages),
-        ])
+        )
 
 
 @dataclass(frozen=True)
@@ -65,15 +68,16 @@ class CutlassConv2dConfigSm90:
 
     Conv2D has no runtime-only parameters, so ``name == compile_name``.
     """
+
     tile_m: int
     tile_n: int
-    tile_k: int             # 128 for SM90/SM120 (WGMMA width), matching GEMM
+    tile_k: int  # 128 for SM90/SM120 (WGMMA width), matching GEMM
     cluster_m: int
     cluster_n: int
-    pingpong: bool          # True = Pingpong, False = Cooperative (SM90/SM120)
-    kSMs: int               # 1 or 2 (SM100 only; always 1 for SM90/SM120)
+    pingpong: bool  # True = Pingpong, False = Cooperative (SM90/SM120)
+    kSMs: int  # 1 or 2 (SM100 only; always 1 for SM90/SM120)
     kStages: int
-    kSmVersion: int         # 90, 100, or 120
+    kSmVersion: int  # 90, 100, or 120
 
     @property
     def name(self) -> str:
@@ -90,12 +94,16 @@ class CutlassConv2dConfigSm90:
         return "_".join(parts)
 
     def to_tactic_config(self) -> Tuple[Tuple[str, int], ...]:
-        return tuple([
-            ("tile_m", self.tile_m), ("tile_n", self.tile_n), ("tile_k", self.tile_k),
-            ("cluster_m", self.cluster_m), ("cluster_n", self.cluster_n),
+        return (
+            ("tile_m", self.tile_m),
+            ("tile_n", self.tile_n),
+            ("tile_k", self.tile_k),
+            ("cluster_m", self.cluster_m),
+            ("cluster_n", self.cluster_n),
             ("pingpong", int(self.pingpong)),
-            ("kSMs", self.kSMs), ("kStages", self.kStages),
-        ])
+            ("kSMs", self.kSMs),
+            ("kStages", self.kStages),
+        )
 
 
 # =============================================================================
@@ -122,9 +130,14 @@ def _build_sm_lt90_conv2d_configs(
             if _smem_bytes(tile.block_m, tile.block_n, tile.block_k, kStages) > smem_limit:
                 continue
             cfg = CutlassConv2dConfig(
-                block_m=tile.block_m, block_n=tile.block_n, block_k=tile.block_k,
-                warp_m=tile.warp_m, warp_n=tile.warp_n, warp_k=tile.warp_k,
-                kStages=kStages, kSmVersion=sm,
+                block_m=tile.block_m,
+                block_n=tile.block_n,
+                block_k=tile.block_k,
+                warp_m=tile.warp_m,
+                warp_n=tile.warp_n,
+                warp_k=tile.warp_k,
+                kStages=kStages,
+                kSmVersion=sm,
             )
             key = cfg.compile_name
             if key not in seen:
@@ -168,17 +181,23 @@ def _get_sm90_conv2d_configs(sm: int) -> Dict[str, CutlassConv2dConfigSm90]:
     kStages = 3
 
     tile_mn_coop = [
-        (256, 128), (256, 160), (256, 192), (256, 208),
-        (128, 224), (128, 256),
+        (256, 128),
+        (256, 160),
+        (256, 192),
+        (256, 208),
+        (128, 224),
+        (128, 256),
     ]
     tile_mn_pingpong = [
-        (128, 128), (128, 160), (128, 192), (128, 208),
+        (128, 128),
+        (128, 160),
+        (128, 192),
+        (128, 208),
         (192, 128),
     ]
-    tile_mn_vals = (
-        [(m, n, False) for m, n in tile_mn_coop] +
-        [(m, n, True) for m, n in tile_mn_pingpong]
-    )
+    tile_mn_vals = [(m, n, False) for m, n in tile_mn_coop] + [
+        (m, n, True) for m, n in tile_mn_pingpong
+    ]
     cluster_vals = [(1, 2), (2, 1)]
 
     seen: Dict[str, CutlassConv2dConfigSm90] = {}
@@ -186,9 +205,15 @@ def _get_sm90_conv2d_configs(sm: int) -> Dict[str, CutlassConv2dConfigSm90]:
         tile_mn_vals, cluster_vals
     ):
         cfg = CutlassConv2dConfigSm90(
-            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            cluster_m=cluster_m, cluster_n=cluster_n,
-            pingpong=pingpong, kSMs=1, kStages=kStages, kSmVersion=sm,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            cluster_m=cluster_m,
+            cluster_n=cluster_n,
+            pingpong=pingpong,
+            kSMs=1,
+            kStages=kStages,
+            kSmVersion=sm,
         )
         key = cfg.compile_name
         if key not in seen:
@@ -216,9 +241,15 @@ def _get_sm100_conv2d_configs(sm: int) -> Dict[str, CutlassConv2dConfigSm90]:
     for tile_m, tile_n, (cluster_m, cluster_n) in tile_mn_cluster_vals:
         kSMs = 2 if cluster_m >= 2 else 1
         cfg = CutlassConv2dConfigSm90(
-            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            cluster_m=cluster_m, cluster_n=cluster_n,
-            pingpong=False, kSMs=kSMs, kStages=kStages, kSmVersion=sm,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            cluster_m=cluster_m,
+            cluster_n=cluster_n,
+            pingpong=False,
+            kSMs=kSMs,
+            kStages=kStages,
+            kSmVersion=sm,
         )
         key = cfg.compile_name
         if key not in seen:
@@ -283,13 +314,26 @@ if _sm < 90 or _sm == 120:
     # SM120 uses the CUTLASS 2.x (SM<90) path for FP16/BF16 — see
     # ``_get_sm120_conv2d_configs`` above.
     CONV2D_DEFAULT: Union[CutlassConv2dConfig, CutlassConv2dConfigSm90] = CutlassConv2dConfig(
-        block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=64, warp_k=64,
-        kStages=3, kSmVersion=_sm,
+        block_m=128,
+        block_n=128,
+        block_k=64,
+        warp_m=64,
+        warp_n=64,
+        warp_k=64,
+        kStages=3,
+        kSmVersion=_sm,
     )
 else:
     CONV2D_DEFAULT = CutlassConv2dConfigSm90(
-        tile_m=128, tile_n=128, tile_k=128, cluster_m=1, cluster_n=1,
-        pingpong=False, kSMs=1, kStages=3, kSmVersion=_sm,
+        tile_m=128,
+        tile_n=128,
+        tile_k=128,
+        cluster_m=1,
+        cluster_n=1,
+        pingpong=False,
+        kSMs=1,
+        kStages=3,
+        kSmVersion=_sm,
     )
 
 
@@ -316,8 +360,8 @@ def gen_conv_module() -> JitSpec:
 
 def _render_all_conv2d_variants() -> List:
     """Render Jinja templates for all unique Conv2D tile configs."""
-    from .templates import render_template
     from .cubin_loader import write_if_different
+    from .templates import render_template
 
     sm = _get_target_sm()
     unique_configs = get_unique_conv2d_compile_configs(sm)

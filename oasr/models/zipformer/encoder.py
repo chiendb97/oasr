@@ -244,7 +244,7 @@ class SelfAttention(nn.Module):
         self.out_proj = Linear(num_heads * value_head_dim, embed_dim, bias=True)
 
     def forward(self, x: Tensor, attn_weights: Tensor) -> Tensor:
-        (seq_len, batch_size, embed_dim) = x.shape
+        seq_len, batch_size, embed_dim = x.shape
         num_heads = attn_weights.shape[0]
         x = self.in_proj(x)
         x = x.reshape(seq_len, batch_size, num_heads, -1).permute(2, 1, 0, 3)
@@ -255,7 +255,7 @@ class SelfAttention(nn.Module):
     def streaming_forward(
         self, x: Tensor, attn_weights: Tensor, cached_val: Tensor, left_context_len: int
     ) -> Tuple[Tensor, Tensor]:
-        (seq_len, batch_size, embed_dim) = x.shape
+        seq_len, batch_size, embed_dim = x.shape
         num_heads = attn_weights.shape[0]
         seq_len2 = seq_len + left_context_len
         x = self.in_proj(x)
@@ -294,7 +294,7 @@ class NonlinAttention(nn.Module):
 
     def forward(self, x: Tensor, attn_weights: Tensor) -> Tensor:
         x = self.in_proj(x)
-        (seq_len, batch_size, _) = x.shape
+        seq_len, batch_size, _ = x.shape
         hidden_channels = self.hidden_channels
         s, x, y = x.chunk(3, dim=2)
         s = self.tanh(s)
@@ -313,7 +313,7 @@ class NonlinAttention(nn.Module):
         self, x: Tensor, attn_weights: Tensor, cached_x: Tensor, left_context_len: int
     ) -> Tuple[Tensor, Tensor]:
         x = self.in_proj(x)
-        (seq_len, batch_size, _) = x.shape
+        seq_len, batch_size, _ = x.shape
         hidden_channels = self.hidden_channels
         s, x, y = x.chunk(3, dim=2)
         s = self.tanh(s)
@@ -357,9 +357,7 @@ class ConvolutionModule(nn.Module):
                 padding=kernel_size // 2,
             )
 
-        self.out_proj = ActivationDropoutAndLinear(
-            bottleneck_dim, channels, activation="SwooshR"
-        )
+        self.out_proj = ActivationDropoutAndLinear(bottleneck_dim, channels, activation="SwooshR")
 
     def forward(
         self,
@@ -416,7 +414,7 @@ class SimpleDownsample(nn.Module):
         self.downsample = downsample
 
     def forward(self, src: Tensor) -> Tensor:
-        (seq_len, batch_size, in_channels) = src.shape
+        seq_len, batch_size, in_channels = src.shape
         ds = self.downsample
         d_seq_len = (seq_len + ds - 1) // ds
         pad = d_seq_len * ds - seq_len
@@ -437,7 +435,7 @@ class SimpleUpsample(nn.Module):
 
     def forward(self, src: Tensor) -> Tensor:
         upsample = self.upsample
-        (seq_len, batch_size, num_channels) = src.shape
+        seq_len, batch_size, num_channels = src.shape
         src = src.unsqueeze(1).expand(seq_len, upsample, batch_size, num_channels)
         return src.reshape(seq_len * upsample, batch_size, num_channels)
 
@@ -464,8 +462,11 @@ class Zipformer2EncoderLayer(nn.Module):
         self.bypass_mid = BypassModule(embed_dim)
 
         self.self_attn_weights = RelPositionMultiheadAttentionWeights(
-            embed_dim, pos_dim=pos_dim, num_heads=num_heads,
-            query_head_dim=query_head_dim, pos_head_dim=pos_head_dim,
+            embed_dim,
+            pos_dim=pos_dim,
+            num_heads=num_heads,
+            query_head_dim=query_head_dim,
+            pos_head_dim=pos_head_dim,
         )
         self.self_attn1 = SelfAttention(embed_dim, num_heads, value_head_dim)
         self.self_attn2 = SelfAttention(embed_dim, num_heads, value_head_dim)
@@ -535,8 +536,11 @@ class Zipformer2EncoderLayer(nn.Module):
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         src_orig = src
         attn_weights, cached_key = self.self_attn_weights.streaming_forward(
-            src, pos_emb=pos_emb, cached_key=cached_key,
-            left_context_len=left_context_len, key_padding_mask=src_key_padding_mask,
+            src,
+            pos_emb=pos_emb,
+            cached_key=cached_key,
+            left_context_len=left_context_len,
+            key_padding_mask=src_key_padding_mask,
         )
         src = src + self.feed_forward1(src)
 
@@ -546,7 +550,10 @@ class Zipformer2EncoderLayer(nn.Module):
         src = src + na
 
         self_attn, cached_val1 = self.self_attn1.streaming_forward(
-            src, attn_weights=attn_weights, cached_val=cached_val1, left_context_len=left_context_len
+            src,
+            attn_weights=attn_weights,
+            cached_val=cached_val1,
+            left_context_len=left_context_len,
         )
         src = src + self_attn
 
@@ -559,7 +566,10 @@ class Zipformer2EncoderLayer(nn.Module):
         src = self.bypass_mid(src_orig, src)
 
         self_attn, cached_val2 = self.self_attn2.streaming_forward(
-            src, attn_weights=attn_weights, cached_val=cached_val2, left_context_len=left_context_len
+            src,
+            attn_weights=attn_weights,
+            cached_val=cached_val2,
+            left_context_len=left_context_len,
         )
         src = src + self_attn
 
@@ -572,8 +582,13 @@ class Zipformer2EncoderLayer(nn.Module):
         src = self.norm(src)
         src = self.bypass(src_orig, src)
         return (
-            src, cached_key, cached_nonlin_attn, cached_val1, cached_val2,
-            cached_conv1, cached_conv2,
+            src,
+            cached_key,
+            cached_nonlin_attn,
+            cached_val1,
+            cached_val2,
+            cached_conv1,
+            cached_conv2,
         )
 
 
@@ -597,8 +612,11 @@ class Zipformer2Encoder(nn.Module):
         output = src
         for mod in self.layers:
             output = mod(
-                output, pos_emb, chunk_size=chunk_size,
-                attn_mask=attn_mask, src_key_padding_mask=src_key_padding_mask,
+                output,
+                pos_emb,
+                chunk_size=chunk_size,
+                attn_mask=attn_mask,
+                src_key_padding_mask=src_key_padding_mask,
             )
         return output
 
@@ -613,12 +631,18 @@ class Zipformer2Encoder(nn.Module):
         output = src
         new_states: List[Tensor] = []
         for i, mod in enumerate(self.layers):
-            (ck, cna, cv1, cv2, cc1, cc2) = states[i * 6 : (i + 1) * 6]
-            (output, nck, ncna, ncv1, ncv2, ncc1, ncc2) = mod.streaming_forward(
-                output, pos_emb,
-                cached_key=ck, cached_nonlin_attn=cna, cached_val1=cv1, cached_val2=cv2,
-                cached_conv1=cc1, cached_conv2=cc2,
-                left_context_len=left_context_len, src_key_padding_mask=src_key_padding_mask,
+            ck, cna, cv1, cv2, cc1, cc2 = states[i * 6 : (i + 1) * 6]
+            output, nck, ncna, ncv1, ncv2, ncc1, ncc2 = mod.streaming_forward(
+                output,
+                pos_emb,
+                cached_key=ck,
+                cached_nonlin_attn=cna,
+                cached_val1=cv1,
+                cached_val2=cv2,
+                cached_conv1=cc1,
+                cached_conv2=cc2,
+                left_context_len=left_context_len,
+                src_key_padding_mask=src_key_padding_mask,
             )
             new_states += [nck, ncna, ncv1, ncv2, ncc1, ncc2]
         return output, new_states
@@ -649,7 +673,9 @@ class DownsampledZipformer2Encoder(nn.Module):
         if attn_mask is not None:
             attn_mask = attn_mask[::ds, ::ds]
         src = self.encoder(
-            src, chunk_size=chunk_size // ds, attn_mask=attn_mask,
+            src,
+            chunk_size=chunk_size // ds,
+            attn_mask=attn_mask,
             src_key_padding_mask=src_key_padding_mask,
         )
         src = self.upsample(src)
@@ -666,7 +692,9 @@ class DownsampledZipformer2Encoder(nn.Module):
         src_orig = src
         src = self.downsample(src)
         src, new_states = self.encoder.streaming_forward(
-            src, states=states, left_context_len=left_context_len,
+            src,
+            states=states,
+            left_context_len=left_context_len,
             src_key_padding_mask=src_key_padding_mask,
         )
         src = self.upsample(src)

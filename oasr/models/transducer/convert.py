@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Mapping, Tuple
+from typing import TYPE_CHECKING, ClassVar, Dict, Mapping, Tuple
 
 from ..zipformer.convert import IcefallConverter, _extract_state_dict, infer_encoder_config
 from .config import TransducerModelConfig
@@ -29,7 +29,6 @@ from .model import TransducerModel
 if TYPE_CHECKING:
     import torch
 
-    from oasr.checkpoints import ConvertedCheckpoint
 
 logger = logging.getLogger(__name__)
 

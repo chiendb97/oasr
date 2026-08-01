@@ -14,16 +14,20 @@ class Timer:
 
     def __enter__(self):
         import time
+
         if self.cuda_sync:
             from oasr import synchronize
+
             synchronize()
         self._start_time = time.perf_counter()
         return self
 
     def __exit__(self, *args):
         import time
+
         if self.cuda_sync:
             from oasr import synchronize
+
             synchronize()
         self._elapsed = time.perf_counter() - self._start_time
         if self.name:

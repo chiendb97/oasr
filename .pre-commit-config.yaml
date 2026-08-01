@@ -1,0 +1,96 @@
+# Local mirror of the lint workflow, so a contributor finds out before pushing.
+#
+#     pip install pre-commit && pre-commit install
+#     pre-commit run --all-files      # one-off sweep
+#
+# Versions are pinned to the same releases as requirements-dev.txt: black and
+# ruff reformat differently across releases, so a drifting hook produces a diff
+# the lint job then rejects.  Change both files together.
+#
+# Not mirrored here: `mypy` and `cargo test`, which are too slow for a commit
+# hook.  Run `python scripts/mypy_ratchet.py` and `cd rust && cargo test`
+# before opening a PR, or let CI do it.
+
+default_language_version:
+  python: python3
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '^(third_party/|.*\.(patch|diff))'
+      - id: end-of-file-fixer
+        exclude: '^(third_party/|.*\.(pt|img|safetensors))'
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      # 1 MiB, not the 512 KiB default: docs/assets/logos/oasr-logo-only.png is
+      # 814 KiB and already tracked, and a hook that fires on existing content
+      # trains people to pass --no-verify.
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+
+  - repo: https://github.com/psf/black
+    rev: 26.3.1
+    hooks:
+      - id: black
+        files: '^(oasr|tests|benchmarks|scripts|ci)/.*\.py$'
+
+  - repo: https://github.com/PyCQA/isort
+    rev: 8.0.1
+    hooks:
+      - id: isort
+        files: '^(oasr|tests|benchmarks|scripts|ci)/.*\.py$'
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.2
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: '^(oasr|tests|benchmarks|scripts|ci)/.*\.py$'
+
+  - repo: local
+    hooks:
+      # The GPU family split is shared by test-gpu.yml and ci/modal_app.py; a
+      # new test file in neither would run on neither backend, silently.
+      - id: gpu-suites-check
+        name: gpu suite split covers every test file
+        entry: python ci/gpu_suites.py --check
+        language: system
+        pass_filenames: false
+        files: '^(tests/test_.*\.py|ci/gpu_suites\.py)$'
+
+      # A bare `checkpoints/` in .gitignore matches that directory name at any
+      # depth, which silently kept the whole `oasr/checkpoints/` package out of
+      # the repo: the local worktree had it, every clone did not, and it only
+      # surfaced when CI ran.  Only a check on the developer's machine can see
+      # this — on CI the files are already absent, so there is nothing to find.
+      - id: no-ignored-sources
+        name: no source file may be gitignored
+        entry: python scripts/check_no_ignored_sources.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
+  # Rust hooks run against the local toolchain rather than a pinned mirror:
+  # rustfmt/clippy ship with the toolchain, and pinning them separately from
+  # rustup would just diverge.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt (rust/)
+        entry: bash -c 'cd rust && cargo fmt --check'
+        language: system
+        files: '^rust/.*\.rs$'
+        pass_filenames: false
+
+      # Never `--workspace` here: oasr-core enables pyo3/extension-module while
+      # oasr-server enables pyo3/auto-initialize, and Cargo unifies features
+      # per build, so one invocation covering both fails to compile.
+      - id: cargo-clippy
+        name: cargo clippy (rust/, default members)
+        entry: bash -c 'cd rust && cargo clippy --all-targets -- -D warnings'
+        language: system
+        files: '^rust/.*\.rs$'
+        pass_filenames: false

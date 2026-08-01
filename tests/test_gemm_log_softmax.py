@@ -9,6 +9,12 @@ import torch.nn.functional as F
 
 import oasr
 
+# Every test in this module allocates directly on ``device="cuda"`` and calls a
+# JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
+# what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
+# instead of a wall of `RuntimeError: No CUDA GPUs are available`.
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+
 
 def _reference(A: torch.Tensor, B: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
     """Reference: F.log_softmax(F.linear(A, B, bias), dim=-1) in fp32."""
@@ -22,11 +28,11 @@ class TestGemmLogSoftmax:
     @pytest.mark.parametrize(
         "M,N,K",
         [
-            (64, 128, 256),     # power-of-two
-            (32, 1024, 128),    # wider vocab
-            (16, 2048, 256),    # vocab > tile_N (forces multi-tile rows)
-            (8, 5000, 512),     # CTC-like
-            (4, 40, 64),        # small N — CUTLASS still requires 8-alignment
+            (64, 128, 256),  # power-of-two
+            (32, 1024, 128),  # wider vocab
+            (16, 2048, 256),  # vocab > tile_N (forces multi-tile rows)
+            (8, 5000, 512),  # CTC-like
+            (4, 40, 64),  # small N — CUTLASS still requires 8-alignment
         ],
     )
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

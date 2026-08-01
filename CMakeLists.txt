@@ -227,7 +227,7 @@ if(BUILD_PYTHON)
     set(PYBIND_SOURCES
         csrc/pybind/pybind_main.cpp
     )
-    
+
     pybind11_add_module(_C ${PYBIND_SOURCES})
 
     target_include_directories(_C PRIVATE
@@ -236,7 +236,7 @@ if(BUILD_PYTHON)
         ${CUDAToolkit_INCLUDE_DIRS}
         ${TORCH_INCLUDE_DIRS}
     )
-    
+
     target_link_libraries(_C PRIVATE oasr_core ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIB})
     target_compile_options(_C PRIVATE ${TORCH_CXX_FLAGS})
 
@@ -253,7 +253,7 @@ if(BUILD_PYTHON)
     set_target_properties(_C PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY ${PYTHON_MODULE_OUTPUT_DIR}
     )
-    
+
     message(STATUS "Python module will be built to: ${PYTHON_MODULE_OUTPUT_DIR}/_C${CMAKE_SHARED_LIBRARY_SUFFIX}")
 endif()
 

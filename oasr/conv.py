@@ -74,8 +74,11 @@ def depthwise_conv1d(
         kernel_size = weight.shape[0]
         out_len = input.shape[1] + 2 * padding - kernel_size + 1
         out = torch.empty(
-            input.shape[0], out_len, input.shape[2],
-            device=input.device, dtype=input.dtype,
+            input.shape[0],
+            out_len,
+            input.shape[2],
+            device=input.device,
+            dtype=input.dtype,
         )
     _get_conv_module().depthwise_conv1d(out, input, weight, bias, padding)
     return out
@@ -133,12 +136,35 @@ def conv2d(
         K, R, S, _ = filter.shape
         get_tuner().dispatch(
             op_key=OpKey("conv", "conv2d"),
-            shape_sig=(N, H, W, _IC, K, R, S,
-                       stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w),
+            shape_sig=(
+                N,
+                H,
+                W,
+                _IC,
+                K,
+                R,
+                S,
+                stride_h,
+                stride_w,
+                pad_h,
+                pad_w,
+                dilation_h,
+                dilation_w,
+            ),
             dtype=input.dtype,
             device=input.device,
-            runner_args=(out, input, filter, bias,
-                         pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w),
+            runner_args=(
+                out,
+                input,
+                filter,
+                bias,
+                pad_h,
+                pad_w,
+                stride_h,
+                stride_w,
+                dilation_h,
+                dilation_w,
+            ),
         )
         return out
 
@@ -166,8 +192,11 @@ def depthwise_conv1d_silu(
         kernel_size = weight.shape[0]
         out_len = input.shape[1] + 2 * padding - kernel_size + 1
         out = torch.empty(
-            input.shape[0], out_len, input.shape[2],
-            device=input.device, dtype=input.dtype,
+            input.shape[0],
+            out_len,
+            input.shape[2],
+            device=input.device,
+            dtype=input.dtype,
         )
     _get_conv_module().depthwise_conv1d_silu(out, input, weight, bias, padding)
     return out
@@ -226,23 +255,65 @@ def conv2d_activation(
         K, R, S, _ = filter.shape
         get_tuner().dispatch(
             op_key=OpKey("conv", "conv2d_activation"),
-            shape_sig=(N, H, W, _IC, K, R, S,
-                       stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w),
+            shape_sig=(
+                N,
+                H,
+                W,
+                _IC,
+                K,
+                R,
+                S,
+                stride_h,
+                stride_w,
+                pad_h,
+                pad_w,
+                dilation_h,
+                dilation_w,
+            ),
             dtype=input.dtype,
             device=input.device,
-            runner_args=(out, input, filter, bias, activation_type,
-                         pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w),
+            runner_args=(
+                out,
+                input,
+                filter,
+                bias,
+                activation_type,
+                pad_h,
+                pad_w,
+                stride_h,
+                stride_w,
+                dilation_h,
+                dilation_w,
+            ),
         )
         return out
 
     if IC < _CUDNN_IC_THRESHOLD:
         _get_cudnn_conv2d_module().cudnn_conv2d_activation(
-            out, input, filter, bias, activation_type, pad_h, pad_w, stride_h, stride_w,
-            dilation_h, dilation_w,
+            out,
+            input,
+            filter,
+            bias,
+            activation_type,
+            pad_h,
+            pad_w,
+            stride_h,
+            stride_w,
+            dilation_h,
+            dilation_w,
         )
     else:
         _default_conv2d_activation_fn()(
-            out, input, filter, bias, activation_type, pad_h, pad_w, stride_h, stride_w,
-            dilation_h, dilation_w,
+            out,
+            input,
+            filter,
+            bias,
+            activation_type,
+            pad_h,
+            pad_w,
+            stride_h,
+            stride_w,
+            dilation_h,
+            dilation_w,
         )
     return out

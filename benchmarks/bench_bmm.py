@@ -13,20 +13,20 @@ from benchmarks.routines.bench_utils import bench_fn
 from benchmarks.routines.gemm import setup_bmm
 
 SHAPES = [
-    (256, 200, 200,  64),
-    (512, 200, 200,  64),
-    (512, 400, 400,  64),
-    ( 64, 200, 200,  64),
+    (256, 200, 200, 64),
+    (512, 200, 200, 64),
+    (512, 400, 400, 64),
+    (64, 200, 200, 64),
     (256, 400, 400, 128),
-    (128, 500, 500,  64),
+    (128, 500, 500, 64),
 ]
 
 DTYPES = [torch.float16, torch.bfloat16]
 DTYPE_NAMES = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
 
-_COL_SHAPE  = 22
-_COL_TIME   = 14
-_COL_METRIC =  8
+_COL_SHAPE = 22
+_COL_TIME = 14
+_COL_METRIC = 8
 
 _HEADER = (
     f"{'(B,M,N,K)':>{_COL_SHAPE}}"
@@ -34,8 +34,8 @@ _HEADER = (
     f"  {'CUTLASS':>{_COL_TIME}}  {'TFLOPS':>{_COL_METRIC}}"
     f"  {'PyTorch':>{_COL_TIME}}  {'TFLOPS':>{_COL_METRIC}}"
 )
-_SEP       = "-" * len(_HEADER)
-_TITLE     = "OASR BMM Benchmark"
+_SEP = "-" * len(_HEADER)
+_TITLE = "OASR BMM Benchmark"
 _TITLE_SEP = "=" * len(_HEADER)
 
 
@@ -55,14 +55,12 @@ def _row(shape_str, times, bmnk):
     B, M, N, K = bmnk
     parts = [f"{shape_str:>{_COL_SHAPE}}"]
     for ms in times:
-        parts.append(
-            f"  {_fmt(ms):>{_COL_TIME}}  {_fmt_t(_tflops(B, M, N, K, ms)):>{_COL_METRIC}}"
-        )
+        parts.append(f"  {_fmt(ms):>{_COL_TIME}}  {_fmt_t(_tflops(B, M, N, K, ms)):>{_COL_METRIC}}")
     return "".join(parts)
 
 
 def _run_shape(B, M, N, K, dtype):
-    A    = torch.randn(B, M, K, device="cuda", dtype=dtype)
+    A = torch.randn(B, M, K, device="cuda", dtype=dtype)
     Bmat = torch.randn(B, N, K, device="cuda", dtype=dtype)
 
     with oasr.autotune():
@@ -80,7 +78,8 @@ def _run_shape(B, M, N, K, dtype):
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available"); return
+        print("CUDA not available")
+        return
 
     print(_TITLE)
     print(_TITLE_SEP)

@@ -16,8 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from oasr.engine.decode.base import _REGISTRY as DECODE_REGISTRY
-from oasr.engine.decode.base import _strategy_name
+from oasr.engine.decode.base import _REGISTRY as DECODE_REGISTRY, _strategy_name
 from oasr.models.interfaces import CAPABILITIES, missing_members, require_capability
 from oasr.models.registry import get_model_entry, list_models
 
@@ -143,47 +142,47 @@ class TestRegisteredModels:
 #: Smallest config kwargs that still build each architecture on CPU.  Keeping the
 #: dims tiny is what lets this run as a unit test rather than an integration one.
 TINY_CONFIGS = {
-    "conformer": dict(vocab_size=64),
-    "zipformer": dict(vocab_size=64),
-    "whisper": dict(
-        encoder_layers=1,
-        decoder_layers=1,
-        d_model=64,
-        encoder_attention_heads=2,
-        decoder_attention_heads=2,
-        encoder_ffn_dim=64,
-        decoder_ffn_dim=64,
-        vocab_size=64,
-        max_source_positions=64,
-        max_target_positions=16,
-    ),
-    "paraformer": dict(
-        encoder_num_blocks=1,
-        decoder_num_blocks=1,
-        encoder_output_size=64,
-        encoder_attention_heads=2,
-        decoder_attention_heads=2,
-        encoder_linear_units=64,
-        decoder_linear_units=64,
-        vocab_size=64,
-        predictor_idim=64,
-        decoder_att_layer_num=1,
-    ),
-    "transducer": dict(vocab_size=64, decoder_dim=64, joiner_dim=64),
-    "speech_llm": dict(
-        vocab_size=64,
-        text_num_hidden_layers=1,
-        text_hidden_size=64,
-        text_num_attention_heads=2,
-        text_num_key_value_heads=1,
-        text_intermediate_size=64,
-        text_max_position_embeddings=64,
-        audio_encoder_layers=1,
-        audio_d_model=64,
-        audio_encoder_attention_heads=2,
-        audio_encoder_ffn_dim=64,
-        audio_max_source_positions=64,
-    ),
+    "conformer": {"vocab_size": 64},
+    "zipformer": {"vocab_size": 64},
+    "whisper": {
+        "encoder_layers": 1,
+        "decoder_layers": 1,
+        "d_model": 64,
+        "encoder_attention_heads": 2,
+        "decoder_attention_heads": 2,
+        "encoder_ffn_dim": 64,
+        "decoder_ffn_dim": 64,
+        "vocab_size": 64,
+        "max_source_positions": 64,
+        "max_target_positions": 16,
+    },
+    "paraformer": {
+        "encoder_num_blocks": 1,
+        "decoder_num_blocks": 1,
+        "encoder_output_size": 64,
+        "encoder_attention_heads": 2,
+        "decoder_attention_heads": 2,
+        "encoder_linear_units": 64,
+        "decoder_linear_units": 64,
+        "vocab_size": 64,
+        "predictor_idim": 64,
+        "decoder_att_layer_num": 1,
+    },
+    "transducer": {"vocab_size": 64, "decoder_dim": 64, "joiner_dim": 64},
+    "speech_llm": {
+        "vocab_size": 64,
+        "text_num_hidden_layers": 1,
+        "text_hidden_size": 64,
+        "text_num_attention_heads": 2,
+        "text_num_key_value_heads": 1,
+        "text_intermediate_size": 64,
+        "text_max_position_embeddings": 64,
+        "audio_encoder_layers": 1,
+        "audio_d_model": 64,
+        "audio_encoder_attention_heads": 2,
+        "audio_encoder_ffn_dim": 64,
+        "audio_max_source_positions": 64,
+    },
 }
 
 
@@ -245,7 +244,7 @@ class TestPagedKvGeometryIsOptIn:
             # Not "must raise" — an encoder is free to expose the dims.  The point is
             # that it is not *forced* to, and that the default failure is legible.
             try:
-                encoder.n_kv_head
+                encoder.n_kv_head  # noqa: B018  — the property access *is* the assertion
             except NotImplementedError as exc:
                 assert "paged-KV layout" in str(exc)
         else:
@@ -256,9 +255,9 @@ class TestPagedKvGeometryIsOptIn:
         """A bare encoder asked for paged geometry says why it has none."""
         model = _tiny_model("whisper")
         with pytest.raises(NotImplementedError, match=r"WhisperEncoder.*paged-KV layout"):
-            model.encoder.n_kv_head
+            model.encoder.n_kv_head  # noqa: B018  — the property access *is* the assertion
         with pytest.raises(NotImplementedError, match=r"WhisperEncoder.*paged-KV layout"):
-            model.encoder.head_dim
+            model.encoder.head_dim  # noqa: B018  — the property access *is* the assertion
 
 
 def test_hybrid_conformer_backs_its_rescoring_capability():

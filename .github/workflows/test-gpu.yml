@@ -1,0 +1,126 @@
+name: test-gpu
+
+# The suite that actually exercises the kernels, on the self-hosted box with a
+# GPU and the checkpoints.  Nightly plus manual, not per-push: a full run is
+# ~5 minutes of GPU and the runner is a single machine.
+#
+# `test-gpu-modal.yml` is the same suite on rented Blackwell.  Use this one for
+# the nightly sweep — it is the SM this project ships on and the checkpoints are
+# already on disk — and Modal when the box is busy benchmarking, wedged, or when
+# you want a second SM.
+#
+# The point of both is `--strict-assets`.  `pytest tests/` reports a fully green
+# suite while silently skipping every real-checkpoint test, so a green nightly
+# proves nothing unless a missing checkpoint is a failure.  Any asset this
+# runner genuinely cannot have is named below with `--allow-missing-asset`, so
+# the gap lives in this file where it can be read, rather than inside a skip
+# nobody reads.
+#
+# ---------------------------------------------------------------------------
+# Registering the runner (once, on the GPU box)
+# ---------------------------------------------------------------------------
+#   Settings -> Actions -> Runners -> New self-hosted runner, then on the box:
+#     ./config.sh --url https://github.com/<owner>/oasr --token <TOKEN> \
+#                 --labels oasr-gpu --name oasr-5090 --unattended
+#     sudo ./svc.sh install && sudo ./svc.sh start
+#
+#   The runner's environment must already have: an NVIDIA driver + CUDA toolkit
+#   (the kernels JIT through nvcc), a `pip install -e .` of this repo, and the
+#   checkpoints at the paths in tests/assets.py — or those env vars exported in
+#   the service environment.
+#
+#   NOTE: this repo is public.  Do NOT add a `pull_request` trigger here: a fork
+#   PR would execute arbitrary code on your machine.  Run PR checks on Modal.
+
+on:
+  schedule:
+    # 02:30 UTC nightly.
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+    inputs:
+      pytest_args:
+        description: "Extra args appended to every pytest invocation"
+        required: false
+        default: ""
+
+concurrency:
+  group: test-gpu
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # A checkpoint's absence is a failure, not a skip.  The exceptions are upstream
+  # *source trees* and a k2 lang dir rather than model weights, and are only
+  # needed by parity oracles: install them on the runner to drop these lines.
+  STRICT: >-
+    --strict-assets
+    --allow-missing-asset WENET_REF_DIR
+    --allow-missing-asset LANG_DIR
+
+jobs:
+  # The family split lives in ci/gpu_suites.py so the self-hosted matrix and the
+  # Modal fan-out cannot drift apart.  This job just publishes it.
+  matrix:
+    name: resolve suites
+    runs-on: ubuntu-latest
+    outputs:
+      suites: ${{ steps.build.outputs.suites }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: build
+        run: |
+          python ci/gpu_suites.py --check
+          echo "suites=$(python ci/gpu_suites.py --github-matrix)" >> "$GITHUB_OUTPUT"
+
+  # Split by family so one failing area does not mask the rest, and so the box
+  # dropping off the bus costs one suite instead of the sweep.
+  suite:
+    name: ${{ matrix.name }}
+    needs: matrix
+    runs-on: [self-hosted, oasr-gpu]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.suites) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the environment
+        run: |
+          nvidia-smi
+          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+
+      - name: pytest (${{ matrix.name }})
+        run: |
+          python -m pytest ${{ matrix.paths }} \
+            -m "not slow and not concurrent" \
+            -q -rs $STRICT ${{ github.event.inputs.pytest_args }}
+
+  # The opt-in markers, run once rather than per family.
+  slow-and-concurrent:
+    name: slow + concurrent
+    runs-on: [self-hosted, oasr-gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: pytest -m slow
+        run: python -m pytest tests/ -m "slow" -q -rs $STRICT
+      - name: pytest -m concurrent
+        run: python -m pytest tests/test_engine_concurrent.py -m concurrent -q -rs $STRICT
+
+  # Everything at once, to catch cross-file state the split matrix would hide
+  # (JIT cache collisions, CUDA-graph pool reuse, leaked engines).
+  full:
+    name: full suite
+    runs-on: [self-hosted, oasr-gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: pytest tests/
+        run: |
+          python -m pytest tests/ \
+            -m "not slow and not concurrent" \
+            -q -rs $STRICT ${{ github.event.inputs.pytest_args }}
