@@ -75,13 +75,20 @@ def normalizer(kind: str = "english") -> Normalizer:
             "that changing normalization changes every WER number, including the "
             "recorded references in ci/wer-reference.json."
         ) from exc
+    # `transformers` ships no stubs for these, so they arrive as `Any`.  Binding
+    # through a typed local turns that into an explicit assertion at the
+    # third-party boundary — "we require a str -> str callable" — which is worth
+    # more than a `# type: ignore[no-any-return]` saying only "be quiet".
+    norm: Normalizer
     if kind == "english":
         # The dict is Whisper's extra spelling map; empty means "no extra rules",
         # which is what the reference implementation defaults to.
-        return EnglishTextNormalizer({})
-    if kind == "basic":
-        return BasicTextNormalizer()
-    raise ValueError(f"unknown normalizer {kind!r}; expected english / basic / none")
+        norm = EnglishTextNormalizer({})
+    elif kind == "basic":
+        norm = BasicTextNormalizer()
+    else:
+        raise ValueError(f"unknown normalizer {kind!r}; expected english / basic / none")
+    return norm
 
 
 @dataclass(frozen=True)
