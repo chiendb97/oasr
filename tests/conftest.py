@@ -3,7 +3,7 @@
 Pytest configuration and shared fixtures for OASR tests.
 
 Two things beyond the usual fixtures live here, both aimed at making a green
-run mean something (see ``tests/assets.py`` and ``docs/ci.md``):
+run mean something (see ``tests/assets.py`` and ``.artifacts/ci.md``):
 
 ``--strict-assets``
     Turn "skipped because the checkpoint was not on this box" into a failure.
