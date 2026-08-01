@@ -78,6 +78,12 @@ SUITES: dict[str, list[str]] = {
         "tests/test_decoding_options.py",
         "tests/test_packing_encoder.py",
     ],
+    # Its own family so a WER regression is attributable at a glance rather than
+    # buried in a model-family failure — and because it is the one suite whose
+    # failure means "the output got worse", not "a tensor moved".
+    "accuracy": [
+        "tests/test_accuracy.py",
+    ],
     "models": [
         "tests/test_conformer.py",
         "tests/test_zipformer.py",
