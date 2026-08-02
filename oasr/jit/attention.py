@@ -74,6 +74,7 @@ def set_backend_mode(mode: str) -> None:
     # Clear the per-config compile cache when switching modes so re-tests see the change.
     _compiled_fmha.cache_clear()
     _capability_probe.cache_clear()
+    fmha_config_supported.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +341,58 @@ def _compiled_fmha(
         stream,
         options="--enable-tvm-ffi",
     )
+
+
+@functools.cache
+def fmha_config_supported(
+    *,
+    head_dim: int,
+    dtype_str: str,
+    has_bias: bool = False,
+    paged: bool = False,
+    block_size: int = 0,
+    m_block: int = 64,
+    n_block: int = 64,
+    num_threads: int = 128,
+    bias_aligned: bool = False,
+) -> bool:
+    """Would :func:`get_compiled_fmha` accept this configuration?
+
+    ``get_compiled_fmha`` *raises* on a shape the arch class cannot implement
+    — head_dim 128 on sm_120, for instance — which is the right contract for a
+    caller that asked for the kernel by name (``OASR_ATTN_BACKEND=cute`` means
+    "require it").  A caller that is merely *choosing* a backend needs to ask
+    first, so :class:`oasr.layers.Attention` uses this and quietly stays on
+    SDPA for shapes the kernel does not cover.  Answered from the arch class's
+    own ``can_implement``, so it cannot go stale as the kernel gains shapes.
+    """
+    cap = _capability_probe()[0]
+    if cap is None or select_backend() != "cute":
+        return False
+    try:
+        import cutlass
+
+        from oasr.kernels.cute.attention.base import pick_arch_cls
+
+        # CuteDSL ships no stubs, so its dtype singletons are invisible to mypy.
+        f16 = cutlass.Float16  # type: ignore[attr-defined]
+        bf16 = cutlass.BFloat16  # type: ignore[attr-defined]
+        cute_dtype = f16 if dtype_str == "float16" else bf16
+        return bool(
+            pick_arch_cls(*cap).can_implement(
+                dtype=cute_dtype,
+                head_dim=head_dim,
+                m_block_size=m_block,
+                n_block_size=n_block,
+                num_threads=num_threads,
+                has_bias=has_bias,
+                paged=paged,
+                block_size=block_size,
+                bias_aligned=bias_aligned,
+            )
+        )
+    except Exception:  # CuteDSL missing / probe failed -> SDPA is the answer
+        return False
 
 
 def get_compiled_fmha(

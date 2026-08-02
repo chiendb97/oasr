@@ -21,10 +21,20 @@ https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/zipformer/scal
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 import oasr
+from oasr.layers._backend import use_gemm_kernel
 from oasr.layers.conv import DepthwiseConv1d
+
+# BiasNorm is the waist's, not a private copy: ``oasr.layers.norm.BiasNorm``
+# already wrapped the ``oasr.bias_norm`` kernel with these exact parameter
+# names (``bias``, ``log_scale``), and Zipformer importing its own duplicate is
+# what H1 in the architecture review calls out as the sharpest case of the
+# layer library going unused by the one model that needs it.  Re-exported here
+# so icefall-shaped imports (``from .scaling import BiasNorm``) keep working.
+from oasr.layers.norm import BiasNorm as BiasNorm
 
 
 class SwooshL(nn.Module):
@@ -35,44 +45,6 @@ class SwooshL(nn.Module):
 class SwooshR(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return oasr.swoosh_r(x)
-
-
-class BiasNorm(nn.Module):
-    """A cheaper replacement for LayerNorm with a learnable bias + scalar scale.
-
-    ``scales = mean((x - bias)^2, dim=channel_dim) ** -0.5 * exp(log_scale)``;
-    output is ``x * scales``.  Normalisation over the last dim (the only mode the
-    Zipformer encoder uses) runs through the ``oasr.bias_norm`` CUDA kernel; a
-    non-last ``channel_dim`` keeps the original torch path for completeness.
-    """
-
-    def __init__(
-        self,
-        num_channels: int,
-        channel_dim: int = -1,
-        log_scale: float = 1.0,
-    ) -> None:
-        super().__init__()
-        self.num_channels = num_channels
-        self.channel_dim = channel_dim
-        self.log_scale = nn.Parameter(torch.tensor(log_scale))
-        self.bias = nn.Parameter(torch.empty(num_channels).normal_(mean=0, std=1e-4))
-
-    def forward(self, x: Tensor) -> Tensor:
-        assert x.shape[self.channel_dim] == self.num_channels
-        channel_dim = self.channel_dim
-        if channel_dim < 0:
-            channel_dim += x.ndim
-        if channel_dim == x.ndim - 1:
-            return oasr.bias_norm(x, self.bias, self.log_scale)
-        # Fallback torch path for a non-last channel dim (unused by the encoder).
-        bias = self.bias
-        for _ in range(channel_dim + 1, x.ndim):
-            bias = bias.unsqueeze(-1)
-        scales = (
-            torch.mean((x - bias) ** 2, dim=channel_dim, keepdim=True) ** -0.5
-        ) * self.log_scale.exp()
-        return x * scales
 
 
 class ChunkCausalDepthwiseConv1d(nn.Module):
@@ -182,6 +154,8 @@ class ActivationDropoutAndLinear(nn.Module):
     ):
         super().__init__()
         linear = nn.Linear(in_channels, out_channels, bias=bias)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.weight = linear.weight
         self.register_parameter("bias", linear.bias)
         self.activation = activation
@@ -193,7 +167,12 @@ class ActivationDropoutAndLinear(nn.Module):
             x = oasr.swoosh_r(x)
         else:
             raise ValueError(self.activation)
-        return oasr.gemm(x, self.weight, self.bias)
+        # Holds bare ``weight``/``bias`` (icefall's key layout has no ``.l.``
+        # level), so it cannot *be* an ``oasr.layers.Linear`` — but it goes
+        # through the same backend decision.
+        if use_gemm_kernel(x, self.in_channels, self.out_channels):
+            return oasr.gemm(x, self.weight, self.bias)
+        return F.linear(x, self.weight, self.bias)
 
 
 def convert_num_channels(x: Tensor, num_channels: int) -> Tensor:

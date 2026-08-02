@@ -783,7 +783,8 @@ cudaError_t LayerNorm(const T* input, const T* weight, const T* bias, T* output,
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
+                   isAligned<T, VecSize>(output);
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
@@ -829,7 +830,8 @@ cudaError_t RMSNorm(const T* input, const T* weight, const T* bias, T* output,
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
+                   isAligned<T, VecSize>(output);
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
@@ -887,8 +889,9 @@ cudaError_t GroupNorm(const T* input, const T* weight, const T* bias, T* output,
     size_t smem_bytes = sizeof(float) * (2 * num_groups + 2 * static_cast<unsigned int>(num_warps));
 
     bool use_vec = (static_cast<int>(channels_per_group) >= VecSize) &&
-                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output) &&
-                   isAligned<T, VecSize>(weight) && isAligned<T, VecSize>(bias);
+                   (channels_per_group % VecSize == 0) && isAligned<T, VecSize>(input) &&
+                   isAligned<T, VecSize>(output) && isAligned<T, VecSize>(weight) &&
+                   isAligned<T, VecSize>(bias);
 
     if (use_vec) {
         groupNormKernel<T, VecSize><<<num_blocks, block_size, smem_bytes, stream>>>(
@@ -911,8 +914,8 @@ cudaError_t AddLayerNorm(const T* input, const T* residual, const T* weight, con
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(residual) &&
-                   isAligned<T, VecSize>(output);
+                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
+                   isAligned<T, VecSize>(residual) && isAligned<T, VecSize>(output);
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
@@ -936,8 +939,9 @@ cudaError_t AddLayerNormResidual(const T* input, const T* residual, const T* wei
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(residual) &&
-                   isAligned<T, VecSize>(output) && isAligned<T, VecSize>(residual_out);
+                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
+                   isAligned<T, VecSize>(residual) && isAligned<T, VecSize>(output) &&
+                   isAligned<T, VecSize>(residual_out);
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
@@ -962,7 +966,8 @@ cudaError_t LayerNormActivation(const T* input, const T* weight, const T* bias, 
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
+                   isAligned<T, VecSize>(output);
 
     cudaError_t err = cudaSuccess;
     dispatchActivation(activation, [&](auto act) {
@@ -990,7 +995,8 @@ cudaError_t RMSNormActivation(const T* input, const T* weight, const T* bias, T*
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
+                   isAligned<T, VecSize>(output);
 
     cudaError_t err = cudaSuccess;
     dispatchActivation(activation, [&](auto act) {

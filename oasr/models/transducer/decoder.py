@@ -16,6 +16,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from oasr.layers import Embedding
+
 from ..decoders.base import BaseDecoder
 
 
@@ -42,7 +44,7 @@ class StatelessDecoder(BaseDecoder):
         self.decoder_dim = decoder_dim
         self.blank_id = blank_id
         self.context_size = context_size
-        self.embedding = nn.Embedding(vocab_size, decoder_dim, padding_idx=blank_id)
+        self.embedding = Embedding(vocab_size, decoder_dim, padding_idx=blank_id)
         if context_size > 1:
             # Depthwise conv over the label window (no padding: U == context_size
             # in → 1 frame out at decode time).

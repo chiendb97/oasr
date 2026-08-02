@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""Conformance test for the ``oasr.layers`` narrow waist (architecture review H1).
+
+Every registered architecture is built tiny on CPU and its module tree walked:
+no bare ``nn.Linear`` / ``nn.LayerNorm`` / ``nn.Embedding`` / ``nn.*Norm`` may
+appear.  That is the whole point of the test — the waist was *already there*
+and unused, and nothing stopped a new model from reaching past it.  Before this
+existed, four of six architectures were plain PyTorch: kernels, CUDA-graph
+capture and any future quantization applied to one and a half of them.
+
+Two properties make it a ratchet rather than a snapshot:
+
+* the tiny-config table is keyed off :func:`list_models`, so registering an
+  architecture without adding one **fails** here instead of being skipped;
+* exemptions are named individually with a reason (:data:`ALLOWED_BARE`), so a
+  gap is a line of code somebody has to write, not an omission.
+
+Also checks the waist's own contract: every layer module runs on CPU/fp32, and
+the kernel and torch paths agree on CUDA.  The equivalence is what makes the
+CPU parity oracles meaningful evidence about the GPU serving path.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+from torch import nn
+
+from oasr.layers import layers_backend_override
+from oasr.models.registry import get_model_entry, list_models
+
+# ---------------------------------------------------------------------------
+# What the waist replaces
+# ---------------------------------------------------------------------------
+
+#: torch modules an architecture must not instantiate directly.  Each has an
+#: ``oasr.layers`` counterpart with identical parameter layout, so the fix is
+#: always a one-line import change, never a checkpoint change.
+BANNED = (
+    nn.Linear,
+    nn.LayerNorm,
+    nn.Embedding,
+    nn.RMSNorm,
+    nn.GroupNorm,
+    nn.BatchNorm1d,
+    nn.MultiheadAttention,
+)
+
+#: Deliberate exemptions, as ``(architecture, dotted module path) -> reason``.
+#: Convolutions are **not** in :data:`BANNED` at all: ``oasr.layers.conv``
+#: covers depthwise / pointwise / 2-D, but the dense ``nn.Conv1d`` stems in the
+#: Whisper-geometry encoders have no counterpart yet, so banning the class
+#: would mean exempting most of its uses.  That gap is recorded in
+#: ``docs/architecture.md`` rather than pretended away here.
+ALLOWED_BARE: dict = {}
+
+
+def _tiny_configs():
+    """One small, CPU-buildable config per registered architecture.
+
+    Deliberately not derived from the config defaults: those are the *release*
+    recipes (Paraformer's is 220M parameters), and a conformance test that
+    allocates a real model per architecture stops being run.
+    """
+    from oasr.models.conformer.config import ConformerEncoderConfig, ConformerModelConfig
+    from oasr.models.decoders.transformer_decoder import TransformerDecoderConfig
+    from oasr.models.paraformer.config import ParaformerModelConfig
+    from oasr.models.speech_llm.config import SpeechLlmModelConfig
+    from oasr.models.transducer.config import TransducerModelConfig
+    from oasr.models.whisper.config import WhisperModelConfig
+    from oasr.models.zipformer.config import ZipformerEncoderConfig, ZipformerModelConfig
+
+    zip_enc = {
+        "feature_dim": 80,
+        "downsampling_factor": (1, 2),
+        "encoder_dim": (64, 96),
+        "num_encoder_layers": (1, 1),
+        "query_head_dim": (8,),
+        "pos_head_dim": (4,),
+        "value_head_dim": (6,),
+        "num_heads": (4, 4),
+        "feedforward_dim": (64, 96),
+        "cnn_module_kernel": (15, 15),
+        "pos_dim": 16,
+        "causal": False,
+    }
+    return {
+        # Conformer carries the optional U2++ AED branch, so configure it here:
+        # ``models/decoders/transformer_decoder.py`` is only reachable through
+        # a model, and it is one of the migrated files.
+        "conformer": ConformerModelConfig(
+            vocab_size=32,
+            encoder=ConformerEncoderConfig(
+                input_size=80, output_size=32, attention_heads=2, linear_units=64, num_blocks=2
+            ),
+            decoder=TransformerDecoderConfig(
+                vocab_size=32,
+                encoder_output_size=32,
+                attention_heads=2,
+                linear_units=64,
+                num_blocks=1,
+                r_num_blocks=1,
+            ),
+        ),
+        "zipformer": ZipformerModelConfig(vocab_size=32, encoder=ZipformerEncoderConfig(**zip_enc)),
+        "whisper": WhisperModelConfig(
+            vocab_size=64,
+            d_model=32,
+            encoder_layers=1,
+            decoder_layers=1,
+            encoder_attention_heads=2,
+            decoder_attention_heads=2,
+            encoder_ffn_dim=64,
+            decoder_ffn_dim=64,
+            num_mel_bins=80,
+            max_source_positions=50,
+            max_target_positions=32,
+        ),
+        "paraformer": ParaformerModelConfig(
+            vocab_size=64,
+            input_size=80,
+            encoder_output_size=32,
+            encoder_attention_heads=2,
+            encoder_linear_units=64,
+            encoder_num_blocks=2,
+            decoder_attention_heads=2,
+            decoder_linear_units=64,
+            decoder_num_blocks=1,
+            decoder_att_layer_num=1,
+            predictor_idim=32,
+        ),
+        "speech_llm": SpeechLlmModelConfig(
+            vocab_size=64,
+            audio_d_model=32,
+            audio_encoder_layers=1,
+            audio_encoder_attention_heads=2,
+            audio_encoder_ffn_dim=64,
+            audio_num_mel_bins=128,
+            audio_max_source_positions=25,
+            text_hidden_size=32,
+            text_num_hidden_layers=1,
+            text_num_attention_heads=2,
+            text_num_key_value_heads=2,
+            text_intermediate_size=64,
+        ),
+        "transducer": TransducerModelConfig(
+            encoder_type="zipformer",
+            encoder=ZipformerEncoderConfig(**zip_enc),
+            vocab_size=30,
+            decoder_dim=24,
+            joiner_dim=24,
+            context_size=2,
+            blank_id=0,
+        ),
+    }
+
+
+def _build(arch):
+    cfg = _tiny_configs()[arch]
+    return get_model_entry(arch).model_cls.from_config(cfg)
+
+
+def test_every_architecture_has_a_tiny_config():
+    """A new architecture must be added here, not silently skipped.
+
+    This is the assertion that turns the test into a ratchet: without it, the
+    parametrized test below would just cover fewer models over time.
+    """
+    missing = sorted(set(list_models()) - set(_tiny_configs()))
+    assert not missing, (
+        f"architectures with no tiny config in tests/test_layer_waist.py: {missing}; "
+        "add one so the waist conformance check actually covers them"
+    )
+
+
+@pytest.mark.parametrize("arch", list_models())
+def test_architecture_uses_the_layer_waist(arch):
+    """No bare torch layer anywhere in a registered architecture's tree."""
+    model = _build(arch)
+    offenders = [
+        f"{name or '<root>'}: {type(mod).__name__}"
+        for name, mod in model.named_modules()
+        if isinstance(mod, BANNED) and ALLOWED_BARE.get((arch, name)) is None
+    ]
+    assert not offenders, (
+        f"{arch} reaches past oasr.layers:\n  " + "\n  ".join(offenders) + "\n"
+        "Every one of these has an oasr.layers counterpart with the same parameter "
+        "layout — swapping it changes no checkpoint key."
+    )
+
+
+@pytest.mark.parametrize(
+    "oasr_cls,torch_cls,args",
+    [
+        ("Linear", nn.Linear, (8, 16)),
+        ("ColumnParallelLinear", nn.Linear, (8, 16)),
+        ("RowParallelLinear", nn.Linear, (8, 16)),
+        ("LinearActivation", nn.Linear, (8, 16)),
+        ("LayerNorm", nn.LayerNorm, (8,)),
+        ("Embedding", nn.Embedding, (10, 8)),
+    ],
+)
+def test_layer_parameter_layout_matches_torch(oasr_cls, torch_cls, args):
+    """Same parameter names and shapes as the ``nn.*`` module each one replaces.
+
+    This is what makes a migration a one-line import change: a checkpoint loads
+    by key *and* shape, so a layer that reorganized its weights would break
+    loading without breaking any forward — and no parity test would catch it,
+    because parity tests copy state dicts between two already-agreeing trees.
+    """
+    import oasr.layers as L
+
+    ours = {k: tuple(v.shape) for k, v in getattr(L, oasr_cls)(*args).named_parameters()}
+    theirs = {k: tuple(v.shape) for k, v in torch_cls(*args).named_parameters()}
+    assert ours == theirs
+
+
+@pytest.mark.parametrize("arch", list_models())
+def test_bias_free_layers_register_bias_as_none(arch):
+    """``bias=False`` must leave a registered ``None``, not a stray attribute:
+    ``load_state_dict`` reports an unexpected key either way, but only the
+    registered form keeps ``named_parameters()`` honest."""
+    model = _build(arch)
+    for name, mod in model.named_modules():
+        if hasattr(mod, "bias") and mod.bias is None:
+            assert "bias" in mod._parameters or "bias" in mod._buffers, (
+                f"{arch}.{name} has bias=None as a plain attribute; "
+                "use register_parameter('bias', None)"
+            )
+
+
+# ---------------------------------------------------------------------------
+# The waist's own contract
+# ---------------------------------------------------------------------------
+
+
+class TestLayersRunOnCpu:
+    """Every layer module works on CPU/fp32 — the property the parity oracles
+    and the whole CPU test suite depend on."""
+
+    def test_linear(self):
+        from oasr.layers import ColumnParallelLinear, Linear, RowParallelLinear
+
+        x = torch.randn(2, 3, 8)
+        for cls in (Linear, ColumnParallelLinear, RowParallelLinear):
+            m = cls(8, 16)
+            out = m(x)
+            torch.testing.assert_close(out, torch.nn.functional.linear(x, m.weight, m.bias))
+
+    def test_linear_unaligned_shape(self):
+        """N or K not divisible by 8 is a torch-path shape, not an error.
+        ``oasr.gemm`` raises on it (CUTLASS alignment-8 iterators), which is
+        exactly why the decision lives in the layer: Paraformer's 8404-token
+        vocabulary and icefall's 500 both land here."""
+        from oasr.layers import Linear
+
+        m = Linear(8, 500)
+        assert m(torch.randn(2, 8)).shape == (2, 500)
+
+    def test_norms(self):
+        from oasr.layers import BiasNorm, LayerNorm, RMSNorm
+
+        x = torch.randn(2, 3, 8)
+        torch.testing.assert_close(
+            LayerNorm(8)(x), torch.nn.functional.layer_norm(x, (8,), torch.ones(8), torch.zeros(8))
+        )
+        assert RMSNorm(8, bias=False)(x).shape == x.shape
+        assert BiasNorm(8)(x).shape == x.shape
+
+    def test_mlp_blocks(self):
+        from oasr.layers import FeedForward, GatedMLP
+
+        x = torch.randn(2, 3, 8)
+        ff = FeedForward(8, 16, activation="relu", names=("w_1", "w_2"))
+        assert set(dict(ff.named_parameters())) == {
+            "w_1.weight",
+            "w_1.bias",
+            "w_2.weight",
+            "w_2.bias",
+        }
+        assert ff(x).shape == x.shape
+
+        sanm = FeedForward(
+            8, 16, activation="relu", names=("w_1", "w_2"), out_bias=False, inner_norm_eps=1e-12
+        )
+        assert "norm.weight" in dict(sanm.named_parameters())
+        assert "w_2.bias" not in dict(sanm.named_parameters())
+
+        mlp = GatedMLP(8, 16)
+        assert set(dict(mlp.named_parameters())) == {
+            "gate_proj.weight",
+            "up_proj.weight",
+            "down_proj.weight",
+        }
+        assert mlp(x).shape == x.shape
+
+    def test_feedforward_rejects_unknown_activation(self):
+        from oasr.layers import FeedForward
+
+        with pytest.raises(ValueError, match="not known"):
+            FeedForward(8, 16, activation="mish")
+
+    def test_linear_activation_refuses_erf_gelu(self):
+        """``gelu`` must not resolve to the fused epilogue: that one is the tanh
+        approximation, and Whisper / Qwen2-Audio are trained on exact erf.
+        Silently fusing it would be an accuracy change no test would attribute."""
+        from oasr.layers import LinearActivation
+
+        with pytest.raises(ValueError, match="not fusable"):
+            LinearActivation(8, 16, activation_type="gelu")
+        assert LinearActivation(8, 16, activation_type="gelu_tanh")(torch.randn(2, 8)).shape == (
+            2,
+            16,
+        )
+
+    def test_attention_mask_forms(self):
+        from oasr.layers import Attention
+
+        a = Attention(2, 4)
+        q = a.split_heads(torch.randn(2, 5, 8))
+        k = a.split_heads(torch.randn(2, 7, 8))
+        v = a.split_heads(torch.randn(2, 7, 8))
+        assert a(q, k, v).shape == (2, 2, 5, 4)
+        assert a(q, k, v, kv_lens=torch.tensor([7, 3])).shape == (2, 2, 5, 4)
+        assert a(q, k, v, attn_mask=torch.ones(2, 1, 5, 7, dtype=torch.bool)).shape == (2, 2, 5, 4)
+        assert a(q, q, q, is_causal=True).shape == (2, 2, 5, 4)
+
+    def test_attention_kv_lens_equals_explicit_mask(self):
+        """The two spellings of right padding must agree, since models now use
+        whichever reaches the kernel."""
+        from oasr.layers import Attention
+
+        torch.manual_seed(0)
+        a = Attention(2, 4)
+        q, k, v = (a.split_heads(torch.randn(2, 5, 8)) for _ in range(3))
+        lens = torch.tensor([5, 2])
+        mask = (torch.arange(5).unsqueeze(0) < lens.unsqueeze(1)).view(2, 1, 1, 5)
+        torch.testing.assert_close(a(q, k, v, kv_lens=lens), a(q, k, v, attn_mask=mask))
+
+    def test_attention_gqa(self):
+        from oasr.layers import Attention
+
+        a = Attention(4, 4, num_kv_heads=2)
+        q = a.split_heads(torch.randn(2, 3, 16))
+        k = a.split_kv_heads(torch.randn(2, 3, 8))
+        v = a.split_kv_heads(torch.randn(2, 3, 8))
+        assert a(q, k, v).shape == (2, 4, 3, 4)
+
+    def test_rotary_matches_hf_formulation(self):
+        from oasr.layers import NeoxRotaryEmbedding, apply_rotary_pos_emb
+
+        rope = NeoxRotaryEmbedding(8, theta=10000.0)
+        # Per-row positions: the case the complex freqs_cis API cannot express.
+        pos = torch.tensor([[0, 1, 2], [0, 0, 1]])
+        cos, sin = rope(pos)
+        assert cos.shape == (2, 3, 8) and cos.dtype == torch.float32
+        q = torch.randn(2, 2, 3, 8)
+        q_rot, _ = apply_rotary_pos_emb(q, q, cos, sin)
+        # Position 0 is the identity rotation.
+        torch.testing.assert_close(q_rot[:, :, 0], q[:, :, 0])
+
+
+class TestBackendSwitch:
+    def test_torch_mode_is_the_debug_fallback(self):
+        from oasr.layers import Linear, layers_backend
+
+        with layers_backend_override("torch"):
+            assert layers_backend() == "torch"
+            assert Linear(8, 16)(torch.randn(2, 8)).shape == (2, 16)
+        assert layers_backend() == "auto"
+
+    def test_strict_mode_explains_the_fallback(self):
+        """``oasr`` mode is how a benchmark *proves* it is on the kernel path
+        rather than assuming it; on CPU everything must refuse, loudly."""
+        from oasr.layers import Linear
+
+        with layers_backend_override("oasr"):
+            with pytest.raises(RuntimeError, match="kernels are CUDA-only"):
+                Linear(8, 16)(torch.randn(2, 8))
+
+    def test_invalid_mode_rejected(self):
+        from oasr.layers import set_layers_backend
+
+        with pytest.raises(ValueError):
+            set_layers_backend("fastest")
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="kernel path needs CUDA")
+class TestKernelAndTorchPathsAgree:
+    """The two paths of each layer must compute the same thing.
+
+    Without this the CPU suite proves nothing about the served model: every
+    parity oracle in the repo runs the torch path.
+    """
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_linear(self, dtype):
+        from oasr.layers import Linear
+
+        m = Linear(64, 128).cuda().to(dtype)
+        x = torch.randn(4, 16, 64, device="cuda", dtype=dtype)
+        got = m(x)
+        with layers_backend_override("torch"):
+            ref = m(x)
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("activation", ["relu", "swish", "gelu_tanh"])
+    def test_linear_activation(self, activation):
+        from oasr.layers import LinearActivation
+
+        m = LinearActivation(64, 128, activation_type=activation).cuda().half()
+        x = torch.randn(4, 16, 64, device="cuda", dtype=torch.float16)
+        got = m(x)
+        with layers_backend_override("torch"):
+            ref = m(x)
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("hidden", [64, 100])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_norms(self, hidden, dtype):
+        """``hidden=100`` is not a multiple of the fp16 vector width (8).  The
+        launchers used to take the vectorized path anyway and fault the CUDA
+        context with a misaligned address; they now drop to the scalar kernel."""
+        from oasr.layers import AddLayerNorm, BiasNorm, LayerNorm, RMSNorm
+
+        x = torch.randn(4, 8, hidden, device="cuda", dtype=dtype)
+        for m in (
+            LayerNorm(hidden).cuda().to(dtype),
+            RMSNorm(hidden, bias=False).cuda().to(dtype),
+            BiasNorm(hidden).cuda().to(dtype),
+        ):
+            got = m(x)
+            with layers_backend_override("torch"):
+                ref = m(x)
+            torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+        add = AddLayerNorm(hidden).cuda().to(dtype)
+        r = torch.randn_like(x)
+        got = add(x, r)
+        with layers_backend_override("torch"):
+            ref = add(x, r)
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    def test_norm_refuses_non_contiguous_input(self):
+        """A conv encoder's ``transpose(1, 2)`` output is not row-contiguous and
+        the kernel addresses rows arithmetically, so it must take the torch
+        path rather than read the wrong memory."""
+        from oasr.layers import LayerNorm
+
+        m = LayerNorm(64).cuda().half()
+        x = torch.randn(4, 64, 8, device="cuda", dtype=torch.float16).transpose(1, 2)
+        assert not x.is_contiguous()
+        got = m(x)
+        with layers_backend_override("torch"):
+            ref = m(x.contiguous())
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    def test_attention(self, head_dim):
+        """``head_dim=128`` is a shape the CuteDSL kernel cannot implement on
+        sm_120; the waist asks before dispatching, so it must degrade rather
+        than raise."""
+        from oasr.layers import Attention
+
+        torch.manual_seed(0)
+        a = Attention(4, head_dim)
+        shape = (2, 4, 64, head_dim)
+        q, k, v = (torch.randn(*shape, device="cuda", dtype=torch.float16) for _ in range(3))
+        lens = torch.tensor([64, 20], device="cuda", dtype=torch.int32)
+        for kwargs in ({}, {"kv_lens": lens}):
+            got = a(q, k, v, **kwargs)
+            with layers_backend_override("torch"):
+                ref = a(q, k, v, **kwargs)
+            assert not torch.isnan(got).any()
+            torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)

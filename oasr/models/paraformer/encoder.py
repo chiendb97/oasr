@@ -18,6 +18,7 @@ from typing import Tuple
 import torch
 from torch import nn
 
+from oasr.layers import LayerNorm
 from oasr.models.base import BaseEncoder
 
 from .config import ParaformerModelConfig
@@ -49,13 +50,13 @@ class EncoderLayerSANM(nn.Module):
             config.encoder_sanm_shift,
         )
         self.feed_forward = EncoderFeedForward(size, config.encoder_linear_units)
-        self.norm1 = nn.LayerNorm(in_size, eps=LAYER_NORM_EPS)
-        self.norm2 = nn.LayerNorm(size, eps=LAYER_NORM_EPS)
+        self.norm1 = LayerNorm(in_size, eps=LAYER_NORM_EPS)
+        self.norm2 = LayerNorm(size, eps=LAYER_NORM_EPS)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.norm1(x)
-        x = self.self_attn(x, mask)
+        x = self.self_attn(x, mask, kv_lens=lens)
         if self.in_size == self.size:
             x = residual + x
 
@@ -77,14 +78,13 @@ class SANMEncoder(BaseEncoder):
         self.encoders = nn.ModuleList(
             [EncoderLayerSANM(d, d, config) for _ in range(config.encoder_num_blocks - 1)]
         )
-        self.after_norm = nn.LayerNorm(d, eps=LAYER_NORM_EPS)
+        self.after_norm = LayerNorm(d, eps=LAYER_NORM_EPS)
 
     def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(B, T, input_size)`` LFR features → ``(hidden (B, T, D), masks (B, 1, T))``."""
         B, T, _ = xs.shape
-        masks = (
-            torch.arange(T, device=xs.device).unsqueeze(0) < xs_lens.to(xs.device).unsqueeze(1)
-        ).unsqueeze(
+        lens = xs_lens.to(xs.device)
+        masks = (torch.arange(T, device=xs.device).unsqueeze(0) < lens.unsqueeze(1)).unsqueeze(
             1
         )  # (B, 1, T) bool
 
@@ -92,9 +92,9 @@ class SANMEncoder(BaseEncoder):
         xs = xs * self._config.encoder_output_size**0.5
         xs = xs + sinusoidal_position_encoding(T, xs.size(-1), xs.device, xs.dtype)
 
-        xs = self.encoders0[0](xs, masks)
+        xs = self.encoders0[0](xs, masks, lens)
         for layer in self.encoders:
-            xs = layer(xs, masks)
+            xs = layer(xs, masks, lens)
         return self.after_norm(xs), masks
 
     # -- BaseEncoder introspection ------------------------------------------

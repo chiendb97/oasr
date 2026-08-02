@@ -21,6 +21,69 @@ transducer/AED/LLM loop).
 | Tokenizer | `oasr.tokenizers.Tokenizer` | `oasr.tokenizers` (`register_tokenizer`, `build_tokenizer`) | converter-emitted `TokenizerSpec.kind` (see `docs/tokenizers.md`) |
 | Feature frontend | `oasr.features.ExtractorSpec` | `oasr.features` (`register_extractor`, `build_extractor`) | `FeatureConfig.feature_type`, materialized from the converter-emitted `FeatureSpec` |
 
+## The layer waist
+
+Orthogonal to the seven registries — which are about *what plugs in* — is the
+one about *what every architecture is built from*. Model implementations use
+`oasr.layers`, never `nn.Linear` / `nn.LayerNorm` / `nn.Embedding` directly.
+That is what makes a kernel improvement, CUDA-graph capture or a future
+quantized path apply to all six architectures instead of one.
+
+| What | Use |
+|---|---|
+| Projections | `Linear`, and the TP-shaped `ColumnParallelLinear` / `RowParallelLinear` where the shard axis is unambiguous (QKV and gate/up are column, output and down are row) |
+| Fused GEMM epilogue | `LinearActivation` — `relu` / `swish` / `gelu_tanh` only |
+| Normalization | `LayerNorm`, `RMSNorm`, `BiasNorm`, `AddLayerNorm`, … with the eps conventions named (`TORCH_EPS`, `ESPNET_EPS`, `QWEN2_RMS_EPS`) |
+| Embeddings | `Embedding` (alias `VocabParallelEmbedding`) |
+| Attention compute | `Attention` — takes projected, head-split q/k/v; the projections stay on the model under their checkpoint's names |
+| Position-wise FFN | `FeedForward`, `GatedMLP` — where the upstream layout already nests them under a name |
+| Rotary | `NeoxRotaryEmbedding` + `apply_rotary_pos_emb` for HF-style per-row positions; `RotaryEmbedding` for the complex `freqs_cis` form |
+
+Each layer owns **both** a kernel path and a torch path and chooses in
+`oasr.layers._backend`. The kernels have preconditions the reference does not
+— GEMM needs CUDA, fp16/bf16 and both dimensions 8-aligned; norms need CUDA and
+a contiguous input; the CuteDSL FMHA cannot compile every head dim — so the
+choice is per call, not per model. That is what lets the same model file serve
+fp16 on a 5090 and run the fp32 CPU parity oracle.
+
+Capability is necessary but not sufficient, and the two measured policies that
+make up the rest live here rather than in any model:
+
+* **Attention fuses only when there is a mask to fuse.** With `kv_lens` or an
+  additive bias the fused kernel is 1.7–1.9× faster than SDPA; with no mask at
+  all it is 1.25–1.87× *slower*, because the win was the fusion. Whisper, whose
+  attention is never masked, therefore runs SDPA end to end without any
+  model-side flag.
+* **GEMM has a work floor** (`GEMM_MIN_MACS`). Reaching CUTLASS costs a fixed
+  ~20 µs of Python; a batched encoder forward amortizes that, an eager
+  autoregressive decode step does not. The rule is a pure function of the call
+  — deliberately *not* relaxed under CUDA-graph capture, even though the cost
+  is free there: a capture-dependent branch makes the graph pick a different
+  kernel than eager, and that one-ulp fp16 difference reached the transducer
+  decoder as different tokens the first time it was tried.
+
+Net effect on the WER benchmark: Conformer and Zipformer within run-to-run
+noise, whisper-tiny p50 +5%, and every architecture now on the kernels at all.
+The residual is fixed per-call dispatch on the smallest model in the repo — the
+worst case for any waist — and its two fixes (cheaper GEMM dispatch, CUDA-graph
+capture of the AR step) are tracked separately.
+
+`OASR_LAYERS_BACKEND` overrides it process-wide: `torch` never calls a kernel
+(the debugging fallback — a numerical difference that survives it is not the
+kernels' fault), `oasr` raises instead of degrading for GEMM and norm (how you
+*prove* a model is on the kernel path rather than assuming it).
+
+`tests/test_layer_waist.py` is the ratchet: it builds every registered
+architecture tiny on CPU, walks `named_modules()`, and fails on a bare torch
+layer. Its tiny-config table is keyed off `list_models()`, so a new
+architecture with no entry fails rather than going uncovered.
+
+Two gaps are deliberate and named rather than papered over. Dense `nn.Conv1d`
+stems (Whisper-geometry encoders, the CIF alpha head) have no `oasr.layers`
+counterpart yet, so convolutions are not banned. And `fc1`/`fc2` stay flat
+`Linear`s in HF Whisper and the Qwen2-Audio tower: composing a `FeedForward`
+there would insert a level into every checkpoint key to save one `F.gelu`.
+
 ## Data flow
 
 ```
@@ -61,6 +124,10 @@ Request → InputProcessor (fbank) → Scheduler (BatchingPolicy + PartitionPoli
 2. `class FooModel(BaseAsrModel)` with `from_config` + `load_weights`.
 3. A `CheckpointConverter` + `register_model("foo", ...)` in the package
    `__init__`. No engine edits.
+4. Build it from `oasr.layers` (see **The layer waist** above) and add a tiny
+   config to `tests/test_layer_waist.py`. Both are enforced: the conformance
+   test fails on a bare `nn.Linear`, and it fails again if your architecture
+   has no tiny config to check.
 
 **Add a decode family** (e.g. a new AR paradigm):
 1. `class FooDecoder(BaseDecoder)` (`oasr.models.decoders`) — for

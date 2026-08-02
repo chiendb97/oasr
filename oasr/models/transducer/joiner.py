@@ -12,7 +12,8 @@ icefall so checkpoints load 1:1.
 from __future__ import annotations
 
 import torch
-from torch import nn
+
+from oasr.layers import ColumnParallelLinear, Linear
 
 from ..decoders.base import Joiner
 
@@ -22,9 +23,12 @@ class TransducerJoiner(Joiner):
         self, encoder_dim: int, decoder_dim: int, joiner_dim: int, vocab_size: int
     ) -> None:
         super().__init__()
-        self.encoder_proj = nn.Linear(encoder_dim, joiner_dim)
-        self.decoder_proj = nn.Linear(decoder_dim, joiner_dim)
-        self.output_linear = nn.Linear(joiner_dim, vocab_size)
+        self.encoder_proj = ColumnParallelLinear(encoder_dim, joiner_dim)
+        self.decoder_proj = ColumnParallelLinear(decoder_dim, joiner_dim)
+        # Vocabulary out-features are rarely 8-aligned (500 for the icefall BPE
+        # releases), so this one usually resolves to the torch path — the waist
+        # decides that per shape rather than the call site guessing.
+        self.output_linear = Linear(joiner_dim, vocab_size)
 
     def forward(
         self,

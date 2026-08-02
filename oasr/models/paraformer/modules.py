@@ -23,16 +23,24 @@ name mapping:
 from __future__ import annotations
 
 import math
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
+
+from oasr.layers import (
+    ESPNET_EPS,
+    Attention,
+    ColumnParallelLinear,
+    FeedForward,
+    RowParallelLinear,
+)
 
 #: FunASR (ESPnet) LayerNorm epsilon — NOT PyTorch's 1e-5 default.  The CIF
 #: acoustic embeddings have tiny per-row variance, where the eps choice shifts
-#: normalized values by whole percent.
-LAYER_NORM_EPS = 1e-12
+#: normalized values by whole percent.  The value lives in ``oasr.layers.norm``
+#: with the other ecosystem conventions; this alias keeps the local spelling.
+LAYER_NORM_EPS = ESPNET_EPS
 
 
 #: Cache of computed PE tables, keyed by ``(depth, device_str)``.  Values are
@@ -125,8 +133,10 @@ class SanmSelfAttention(nn.Module):
         assert n_feat % n_head == 0
         self.d_k = n_feat // n_head
         self.h = n_head
-        self.linear_q_k_v = nn.Linear(in_feat, n_feat * 3)
-        self.linear_out = nn.Linear(n_feat, n_feat)
+        self.linear_q_k_v = ColumnParallelLinear(in_feat, n_feat * 3)
+        self.linear_out = RowParallelLinear(n_feat, n_feat)
+        # ``q`` is pre-scaled below (FunASR's convention), hence scale 1.0.
+        self.attn = Attention(n_head, self.d_k, softmax_scale=1.0)
         self.fsmn_block = nn.Conv1d(
             n_feat, n_feat, kernel_size, stride=1, padding=0, groups=n_feat, bias=False
         )
@@ -143,22 +153,29 @@ class SanmSelfAttention(nn.Module):
         x = x + v
         return x * mask_btd
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor, kv_lens: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """``x (B, T, in_feat)``, ``mask (B, 1, T)`` bool → ``(B, T, n_feat)``.
 
-        Attention goes through SDPA rather than an explicit
+        Attention goes through the shared core rather than an explicit
         ``matmul → masked_fill → softmax → masked_fill → matmul``.  Measured on
         `paraformer-zh` (50 SANM blocks), ``B=8``, paired A/B: **1.28x** on ~5 s
         utterances and **1.17x** on ~25 s ones.
 
         Note the short case wins *more*, so the dominant effect is **kernel
         count**, not the ``(B, h, T, T)`` transients: the explicit form is five
-        kernels per block — 250 launches across the encoder — where SDPA is one,
-        and at ``T≈80`` the encoder is launch-bound.  The avoided transients
-        (~3 GiB at ``B=8`` / ``T=500``) are what keeps the win from shrinking to
-        nothing on long audio.
+        kernels per block — 250 launches across the encoder — where the fused
+        call is one, and at ``T≈80`` the encoder is launch-bound.  The avoided
+        transients (~3 GiB at ``B=8`` / ``T=500``) are what keeps the win from
+        shrinking to nothing on long audio.
 
-        ``q`` is pre-scaled above (FunASR's convention), hence ``scale=1.0``.
+        ``mask`` is still needed for the FSMN memory branch, which is
+        multiplicative; ``kv_lens`` says the same thing to attention in the
+        form the fused kernel takes.  Both describe right padding, so a
+        non-empty utterance always has a valid key and no row can softmax over
+        all ``-inf``.
+
         Not bit-exact vs the explicit form — different reduction order — so the
         FunASR oracle in ``tests/test_paraformer.py`` is the gate (encoder ≤2e-5,
         CIF fires bit-exact, transcript exact).
@@ -168,17 +185,15 @@ class SanmSelfAttention(nn.Module):
         mask_btd = mask.reshape(b, t, 1).to(v.dtype)
         fsmn_memory = self._forward_fsmn(v, mask_btd)
 
-        q_h = q.reshape(b, t, self.h, self.d_k).transpose(1, 2) * self.d_k ** (-0.5)
-        k_h = k.reshape(b, t, self.h, self.d_k).transpose(1, 2)
-        v_h = v.reshape(b, t, self.h, self.d_k).transpose(1, 2)
+        q_h = self.attn.split_heads(q) * self.d_k ** (-0.5)
+        k_h = self.attn.split_heads(k)
+        v_h = self.attn.split_heads(v)
 
-        # Key-padding only (bool: True attends).  Every query row shares this
-        # mask and a non-empty utterance always has a valid key, so no row can
-        # softmax over all -inf.  The old post-softmax ``masked_fill(..., 0.0)``
-        # was redundant — ``exp(-inf)`` is already 0.
-        att = F.scaled_dot_product_attention(q_h, k_h, v_h, attn_mask=mask.unsqueeze(1), scale=1.0)
-        att = att.transpose(1, 2).reshape(b, t, self.h * self.d_k)
-        return self.linear_out(att) + fsmn_memory
+        if kv_lens is None:
+            att = self.attn(q_h, k_h, v_h, attn_mask=mask.unsqueeze(1))
+        else:
+            att = self.attn(q_h, k_h, v_h, kv_lens=kv_lens)
+        return self.linear_out(self.attn.merge_heads(att)) + fsmn_memory
 
 
 class SanmCrossAttention(nn.Module):
@@ -189,47 +204,49 @@ class SanmCrossAttention(nn.Module):
         assert n_feat % n_head == 0
         self.d_k = n_feat // n_head
         self.h = n_head
-        self.linear_q = nn.Linear(n_feat, n_feat)
-        self.linear_k_v = nn.Linear(n_feat, n_feat * 2)
-        self.linear_out = nn.Linear(n_feat, n_feat)
+        self.linear_q = ColumnParallelLinear(n_feat, n_feat)
+        self.linear_k_v = ColumnParallelLinear(n_feat, n_feat * 2)
+        self.linear_out = RowParallelLinear(n_feat, n_feat)
+        self.attn = Attention(n_head, self.d_k)
 
     def forward(
-        self, x: torch.Tensor, memory: torch.Tensor, memory_mask: torch.Tensor
+        self, x: torch.Tensor, memory: torch.Tensor, memory_lens: torch.Tensor
     ) -> torch.Tensor:
-        """``x (B, U, D)``, ``memory (B, T, D)``, ``memory_mask (B, 1, T)``."""
-        b = x.size(0)
-        q_h = self.linear_q(x).reshape(b, -1, self.h, self.d_k).transpose(1, 2)
+        """``x (B, U, D)``, ``memory (B, T, D)``, ``memory_lens (B,)``.
+
+        The memory mask used to arrive as a ``(B, 1, T)`` tensor cast to the
+        activation dtype and handed to SDPA as ``attn_mask``.  SDPA reads a
+        non-bool mask as **additive**, so that ``{0.0, 1.0}`` tensor added
+        ``+1.0`` to every valid logit and left padded keys fully attendable
+        instead of masking them — invisible at ``B=1`` or with equal-length
+        rows (a constant shift cancels in softmax), wrong for a mixed-length
+        batch.  Passing the lengths and letting the attention core build the
+        mask fixes it and reaches the fused kernel; FunASR masks with ``-inf``,
+        which is what this now matches.  Gated by
+        ``tests/test_paraformer.py::TestCrossAttentionPadding``.
+        """
+        q_h = self.attn.split_heads(self.linear_q(x))
         k, v = torch.split(self.linear_k_v(memory), self.h * self.d_k, dim=-1)
-        k_h = k.reshape(b, -1, self.h, self.d_k).transpose(1, 2)
-        v_h = v.reshape(b, -1, self.h, self.d_k).transpose(1, 2)
+        k_h = self.attn.split_heads(k)
+        v_h = self.attn.split_heads(v)
 
-        # SDPA instead of an explicit (B, h, U, T) score matrix; the default
-        # ``1/sqrt(d_k)`` scale is what the explicit form applied, so no override.
-        att = F.scaled_dot_product_attention(q_h, k_h, v_h, attn_mask=memory_mask.unsqueeze(1))
-        att = att.transpose(1, 2).reshape(b, -1, self.h * self.d_k)
-        return self.linear_out(att)
+        # Default ``1/sqrt(d_k)`` scale — what the explicit form applied.
+        att = self.attn(q_h, k_h, v_h, kv_lens=memory_lens)
+        return self.linear_out(self.attn.merge_heads(att))
 
 
-class EncoderFeedForward(nn.Module):
+def EncoderFeedForward(idim: int, hidden_units: int) -> FeedForward:
     """``PositionwiseFeedForward``: w_1 → ReLU → w_2."""
-
-    def __init__(self, idim: int, hidden_units: int) -> None:
-        super().__init__()
-        self.w_1 = nn.Linear(idim, hidden_units)
-        self.w_2 = nn.Linear(hidden_units, idim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w_2(torch.relu(self.w_1(x)))
+    return FeedForward(idim, hidden_units, activation="relu", names=("w_1", "w_2"))
 
 
-class DecoderFeedForward(nn.Module):
+def DecoderFeedForward(idim: int, hidden_units: int) -> FeedForward:
     """``PositionwiseFeedForwardDecoderSANM``: w_1 → ReLU → LayerNorm → w_2 (no bias)."""
-
-    def __init__(self, idim: int, hidden_units: int) -> None:
-        super().__init__()
-        self.w_1 = nn.Linear(idim, hidden_units)
-        self.w_2 = nn.Linear(hidden_units, idim, bias=False)
-        self.norm = nn.LayerNorm(hidden_units, eps=LAYER_NORM_EPS)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w_2(self.norm(torch.relu(self.w_1(x))))
+    return FeedForward(
+        idim,
+        hidden_units,
+        activation="relu",
+        names=("w_1", "w_2"),
+        out_bias=False,
+        inner_norm_eps=LAYER_NORM_EPS,
+    )

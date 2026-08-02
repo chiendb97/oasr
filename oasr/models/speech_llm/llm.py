@@ -36,47 +36,21 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
+
+from oasr.layers import (
+    Attention,
+    ColumnParallelLinear,
+    Embedding,
+    GatedMLP,
+    NeoxRotaryEmbedding,
+    RMSNorm,
+    RowParallelLinear,
+    apply_rotary_pos_emb,
+)
 
 from ..decoders.base import BaseDecoder, DecoderState
 from .config import SpeechLlmModelConfig
-
-
-class Qwen2RMSNorm(nn.Module):
-    """RMSNorm with fp32 variance accumulation (HF ``Qwen2RMSNorm``)."""
-
-    def __init__(self, hidden_size: int, eps: float) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * x.to(input_dtype)
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-class _Rotary(nn.Module):
-    """Rotary table: fp32 ``cos``/``sin`` for arbitrary position tensors."""
-
-    def __init__(self, head_dim: int, theta: float) -> None:
-        super().__init__()
-        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def forward(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """``positions (..., )`` int → ``cos``/``sin`` ``(..., head_dim)`` fp32."""
-        freqs = positions.to(torch.float32).unsqueeze(-1) * self.inv_freq
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos(), emb.sin()
 
 
 class _Qwen2Attention(nn.Module):
@@ -86,23 +60,24 @@ class _Qwen2Attention(nn.Module):
         self.h = cfg.text_num_attention_heads
         self.h_kv = cfg.text_num_key_value_heads
         self.d_k = cfg.text_head_dim
-        self.q_proj = nn.Linear(d, self.h * self.d_k, bias=True)
-        self.k_proj = nn.Linear(d, self.h_kv * self.d_k, bias=True)
-        self.v_proj = nn.Linear(d, self.h_kv * self.d_k, bias=True)
-        self.o_proj = nn.Linear(self.h * self.d_k, d, bias=False)
+        self.q_proj = ColumnParallelLinear(d, self.h * self.d_k, bias=True)
+        self.k_proj = ColumnParallelLinear(d, self.h_kv * self.d_k, bias=True)
+        self.v_proj = ColumnParallelLinear(d, self.h_kv * self.d_k, bias=True)
+        self.o_proj = RowParallelLinear(self.h * self.d_k, d, bias=False)
+        # Every mask this decoder builds is either causal or left-padded (valid
+        # keys are ``[P - len, P)``, which is not a length), so the shared core
+        # resolves to SDPA on every call.  It is here for the head bookkeeping,
+        # the GQA handling and so a future paged/fused path is one edit.
+        self.attn = Attention(self.h, self.d_k, num_kv_heads=self.h_kv)
 
     def qkv(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project + rotate → ``q (B, h, T, d)``, ``k``/``v`` ``(B, h_kv, T, d)``."""
-        B, T, _ = x.shape
-        q = self.q_proj(x).view(B, T, self.h, self.d_k).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.h_kv, self.d_k).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.h_kv, self.d_k).transpose(1, 2)
-        cos = cos.to(q.dtype).unsqueeze(1)  # (B, 1, T, d)
-        sin = sin.to(q.dtype).unsqueeze(1)
-        q = q * cos + _rotate_half(q) * sin
-        k = k * cos + _rotate_half(k) * sin
+        q = self.attn.split_heads(self.q_proj(x))
+        k = self.attn.split_kv_heads(self.k_proj(x))
+        v = self.attn.split_kv_heads(self.v_proj(x))
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
         return q, k, v
 
     def attend(
@@ -112,42 +87,30 @@ class _Qwen2Attention(nn.Module):
         v: torch.Tensor,
         attn_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """SDPA over the (possibly grouped) KV → ``(B, T_q, D)``.
+        """Attention over the (possibly grouped) KV → ``(B, T_q, D)``.
 
-        Grouped KV is expanded **inside** SDPA via ``enable_gqa`` rather than by
+        Grouped KV is expanded **inside** the backend rather than by
         materialising ``k.repeat_interleave(h // h_kv, dim=1)``: that copy is the
         whole cache, per layer, per token, so it scales with ``B × context`` and
         would undo the in-place capacity-preallocated KV writes above it.  (The
         published Qwen2-Audio-7B has ``h_kv == h``, so this only bites a
         grouped-KV speech-LLM — but that is the common shape elsewhere.)
         """
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, enable_gqa=self.h_kv != self.h
-        )
-        B, _, T_q, _ = out.shape
-        out = out.transpose(1, 2).contiguous().view(B, T_q, self.h * self.d_k)
-        return self.o_proj(out)
-
-
-class _Qwen2Mlp(nn.Module):
-    def __init__(self, cfg: SpeechLlmModelConfig) -> None:
-        super().__init__()
-        d, i = cfg.text_hidden_size, cfg.text_intermediate_size
-        self.gate_proj = nn.Linear(d, i, bias=False)
-        self.up_proj = nn.Linear(d, i, bias=False)
-        self.down_proj = nn.Linear(i, d, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        out = self.attn(q, k, v, attn_mask=attn_mask)
+        return self.o_proj(self.attn.merge_heads(out))
 
 
 class _Qwen2Layer(nn.Module):
     def __init__(self, cfg: SpeechLlmModelConfig) -> None:
         super().__init__()
         self.self_attn = _Qwen2Attention(cfg)
-        self.mlp = _Qwen2Mlp(cfg)
-        self.input_layernorm = Qwen2RMSNorm(cfg.text_hidden_size, cfg.text_rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(cfg.text_hidden_size, cfg.text_rms_norm_eps)
+        self.mlp = GatedMLP(
+            cfg.text_hidden_size, cfg.text_intermediate_size, activation="silu", bias=False
+        )
+        self.input_layernorm = RMSNorm(cfg.text_hidden_size, eps=cfg.text_rms_norm_eps, bias=False)
+        self.post_attention_layernorm = RMSNorm(
+            cfg.text_hidden_size, eps=cfg.text_rms_norm_eps, bias=False
+        )
 
 
 class Qwen2Lm(BaseDecoder):
@@ -159,13 +122,13 @@ class Qwen2Lm(BaseDecoder):
     def __init__(self, cfg: SpeechLlmModelConfig) -> None:
         super().__init__()
         self._cfg = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.text_hidden_size)
+        self.embed_tokens = Embedding(cfg.vocab_size, cfg.text_hidden_size)
         self.layers = nn.ModuleList([_Qwen2Layer(cfg) for _ in range(cfg.text_num_hidden_layers)])
-        self.norm = Qwen2RMSNorm(cfg.text_hidden_size, cfg.text_rms_norm_eps)
-        self.lm_head = nn.Linear(cfg.text_hidden_size, cfg.vocab_size, bias=False)
+        self.norm = RMSNorm(cfg.text_hidden_size, eps=cfg.text_rms_norm_eps, bias=False)
+        self.lm_head = ColumnParallelLinear(cfg.text_hidden_size, cfg.vocab_size, bias=False)
         if cfg.text_tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
-        self.rotary = _Rotary(cfg.text_head_dim, cfg.text_rope_theta)
+        self.rotary = NeoxRotaryEmbedding(cfg.text_head_dim, cfg.text_rope_theta)
 
     def init_state(
         self,

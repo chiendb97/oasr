@@ -21,6 +21,8 @@ from typing import Any, Mapping, Tuple
 import torch
 from torch import nn
 
+from oasr.layers import Linear
+
 from ..base import BaseAsrModel, LoadReport
 from .audio_tower import Qwen2AudioTower
 from .config import SpeechLlmModelConfig
@@ -34,7 +36,7 @@ class _Projector(nn.Module):
 
     def __init__(self, config: SpeechLlmModelConfig) -> None:
         super().__init__()
-        self.linear = nn.Linear(config.audio_d_model, config.text_hidden_size, bias=True)
+        self.linear = Linear(config.audio_d_model, config.text_hidden_size, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x)

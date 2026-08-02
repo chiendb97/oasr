@@ -1,10 +1,25 @@
-"""High-level Python layer wrappers (Conv, Linear, Norm, ...)."""
+"""The narrow waist every model implementation goes through.
 
+A model built from these modules picks up the OASR CUDA kernels, CUDA-graph
+capture and (later) quantization automatically, and still loads its upstream
+checkpoint 1:1 — the layers are ``nn.Module``-compatible in parameter layout
+and fall back to torch wherever a kernel cannot run.  See
+``docs/architecture.md`` and :mod:`oasr.layers._backend`;
+``tests/test_layer_waist.py`` is what keeps architectures inside it.
+"""
+
+from ._backend import layers_backend, layers_backend_override, set_layers_backend
+from .attention import Attention, RelPositionMultiHeadedAttention
 from .conv import Conv2d, Conv2dActivation, DepthwiseConv1d, PointwiseConv1d
 from .ctc import CtcProjection
+from .embedding import Embedding, VocabParallelEmbedding
 from .feature import Fbank, Mfcc
-from .linear import Linear
+from .linear import ColumnParallelLinear, Linear, LinearActivation, RowParallelLinear
+from .mlp import FeedForward, GatedMLP
 from .norm import (
+    ESPNET_EPS,
+    QWEN2_RMS_EPS,
+    TORCH_EPS,
     AddLayerNorm,
     BatchNorm1d,
     BiasNorm,
@@ -13,10 +28,18 @@ from .norm import (
     LayerNorm,
     RMSNorm,
 )
+from .rotary_embedding import NeoxRotaryEmbedding, RotaryEmbedding, apply_rotary_pos_emb
 from .softmax import Softmax
 from .topk import TopK
 
 __all__ = [
+    # Backend selection
+    "layers_backend",
+    "layers_backend_override",
+    "set_layers_backend",
+    # Attention
+    "Attention",
+    "RelPositionMultiHeadedAttention",
     # Convolution
     "DepthwiseConv1d",
     "PointwiseConv1d",
@@ -24,11 +47,20 @@ __all__ = [
     "Conv2dActivation",
     # CTC projection
     "CtcProjection",
+    # Embedding
+    "Embedding",
+    "VocabParallelEmbedding",
     # Feature extraction
     "Fbank",
     "Mfcc",
     # Linear
     "Linear",
+    "LinearActivation",
+    "ColumnParallelLinear",
+    "RowParallelLinear",
+    # Feed-forward
+    "FeedForward",
+    "GatedMLP",
     # Normalization
     "LayerNorm",
     "RMSNorm",
@@ -37,6 +69,13 @@ __all__ = [
     "BatchNorm1d",
     "AddLayerNorm",
     "GlobalCMVN",
+    "TORCH_EPS",
+    "ESPNET_EPS",
+    "QWEN2_RMS_EPS",
+    # Rotary embedding
+    "RotaryEmbedding",
+    "NeoxRotaryEmbedding",
+    "apply_rotary_pos_emb",
     # Softmax
     "Softmax",
     # TopK

@@ -21,47 +21,63 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from oasr.layers import (
+    TORCH_EPS,
+    Attention,
+    ColumnParallelLinear,
+    Embedding,
+    LayerNorm,
+    RowParallelLinear,
+)
+
 from ..base import BaseEncoder
 from .config import SpeechLlmModelConfig
 
 
 class _TowerAttention(nn.Module):
-    """HF Whisper-style MHA (``k_proj`` bias-free) with a key-padding mask."""
+    """HF Whisper-style MHA (``k_proj`` bias-free) with a key-padding mask.
+
+    The mask is right padding — keys ``[0, feat_len)`` — so it travels as a
+    length vector, which :class:`oasr.layers.Attention` hands to the fused
+    kernel directly instead of materialising a ``(B, H, T, T)`` bias.
+    """
 
     def __init__(self, d_model: int, n_head: int) -> None:
         super().__init__()
         self.h = n_head
         self.d_k = d_model // n_head
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.q_proj = ColumnParallelLinear(d_model, d_model)
+        self.k_proj = ColumnParallelLinear(d_model, d_model, bias=False)
+        self.v_proj = ColumnParallelLinear(d_model, d_model)
+        self.out_proj = RowParallelLinear(d_model, d_model)
+        self.attn = Attention(n_head, self.d_k)
 
-    def forward(self, x: torch.Tensor, key_mask: torch.Tensor) -> torch.Tensor:
-        """``x (B, T, D)``, ``key_mask (B, 1, 1, T)`` additive float mask."""
-        B, T, _ = x.shape
-        q = self.q_proj(x).view(B, T, self.h, self.d_k).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.h, self.d_k).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.h, self.d_k).transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=key_mask)
-        out = out.transpose(1, 2).contiguous().view(B, T, self.h * self.d_k)
-        return self.out_proj(out)
+    def forward(self, x: torch.Tensor, kv_lens: torch.Tensor) -> torch.Tensor:
+        """``x (B, T, D)``, ``kv_lens (B,)`` valid key lengths."""
+        q = self.attn.split_heads(self.q_proj(x))
+        k = self.attn.split_heads(self.k_proj(x))
+        v = self.attn.split_heads(self.v_proj(x))
+        out = self.attn(q, k, v, kv_lens=kv_lens)
+        return self.out_proj(self.attn.merge_heads(out))
 
 
 class _TowerLayer(nn.Module):
+    """``fc1``/``fc2`` stay flat (HF's layout) and GELU is the exact erf form —
+    see the note in :class:`oasr.models.whisper.model._EncoderLayer`."""
+
     def __init__(self, cfg: SpeechLlmModelConfig) -> None:
         super().__init__()
         d = cfg.audio_d_model
         self.self_attn = _TowerAttention(d, cfg.audio_encoder_attention_heads)
-        self.self_attn_layer_norm = nn.LayerNorm(d)
-        self.fc1 = nn.Linear(d, cfg.audio_encoder_ffn_dim)
-        self.fc2 = nn.Linear(cfg.audio_encoder_ffn_dim, d)
-        self.final_layer_norm = nn.LayerNorm(d)
+        self.self_attn_layer_norm = LayerNorm(d, eps=TORCH_EPS)
+        self.fc1 = ColumnParallelLinear(d, cfg.audio_encoder_ffn_dim)
+        self.fc2 = RowParallelLinear(cfg.audio_encoder_ffn_dim, d)
+        self.final_layer_norm = LayerNorm(d, eps=TORCH_EPS)
 
-    def forward(self, x: torch.Tensor, key_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv_lens: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.self_attn_layer_norm(x)
-        x = residual + self.self_attn(x, key_mask)
+        x = residual + self.self_attn(x, kv_lens)
         residual = x
         x = self.final_layer_norm(x)
         return residual + self.fc2(F.gelu(self.fc1(x)))
@@ -80,9 +96,9 @@ class Qwen2AudioTower(BaseEncoder):
         self.conv1 = nn.Conv1d(cfg.audio_num_mel_bins, d, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(d, d, kernel_size=3, stride=2, padding=1)
         # HF materializes the sinusoidal table as a real (frozen) weight.
-        self.embed_positions = nn.Embedding(cfg.audio_max_source_positions, d)
+        self.embed_positions = Embedding(cfg.audio_max_source_positions, d)
         self.layers = nn.ModuleList([_TowerLayer(cfg) for _ in range(cfg.audio_encoder_layers)])
-        self.layer_norm = nn.LayerNorm(d)
+        self.layer_norm = LayerNorm(d, eps=TORCH_EPS)
         self.avg_pooler = nn.AvgPool1d(2, stride=2)
 
     @staticmethod
@@ -112,23 +128,24 @@ class Qwen2AudioTower(BaseEncoder):
         x = xs.transpose(1, 2)  # (B, n_mels, T)
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
-        x = x.transpose(1, 2)  # (B, T/2, D)
+        # Contiguous, or the whole residual stream keeps the conv's strided
+        # last dimension and every norm falls off the kernel path.
+        x = x.transpose(1, 2).contiguous()  # (B, T/2, D)
         T = x.size(1)
         x = x + self.embed_positions.weight[:T].to(x.dtype)
 
         lens = xs_lens.to(xs.device)
+        # Key padding only (queries unrestricted — HF semantics), expressed as
+        # per-row valid lengths so the attention core can push it into the
+        # kernel rather than building a (B, 1, 1, T) additive mask.
         feat_lens = self.feat_lengths(lens)
-        valid = torch.arange(T, device=xs.device).unsqueeze(0) < feat_lens.unsqueeze(1)
-        # Additive key-padding mask (queries unrestricted — HF semantics).
-        key_mask = torch.zeros(x.size(0), 1, 1, T, dtype=x.dtype, device=x.device)
-        key_mask.masked_fill_(~valid.view(-1, 1, 1, T), float("-inf"))
 
         for layer in self.layers:
-            x = layer(x, key_mask)
+            x = layer(x, feat_lens)
 
         x = x.permute(0, 2, 1)
         x = self.avg_pooler(x)
-        x = x.permute(0, 2, 1)
+        x = x.permute(0, 2, 1).contiguous()
         x = self.layer_norm(x)
 
         out_lens = self.output_lengths(lens).clamp(min=0)

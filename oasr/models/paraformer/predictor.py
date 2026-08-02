@@ -20,6 +20,8 @@ from typing import Tuple
 import torch
 from torch import nn
 
+from oasr.layers import Linear
+
 from .config import ParaformerModelConfig
 
 
@@ -104,7 +106,7 @@ class CifPredictor(nn.Module):
         self.cif_conv1d = nn.Conv1d(
             idim, idim, config.predictor_l_order + config.predictor_r_order + 1
         )
-        self.cif_output = nn.Linear(idim, 1)
+        self.cif_output = Linear(idim, 1)
         self.threshold = config.predictor_threshold
         self.tail_threshold = config.predictor_tail_threshold
 

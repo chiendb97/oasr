@@ -511,3 +511,70 @@ class TestPositionEncodingCache:
         st = positions.unsqueeze(1) * inv.unsqueeze(0)
         want = torch.cat([torch.sin(st), torch.cos(st)], dim=1).unsqueeze(0)
         torch.testing.assert_close(self._pe(length, depth=depth), want)
+
+
+# ---------------------------------------------------------------------------
+# Cross-attention key padding
+# ---------------------------------------------------------------------------
+
+
+class TestCrossAttentionPadding:
+    """The NAR decoder must not attend to encoder padding.
+
+    The memory mask used to reach SDPA as a ``(B, 1, T)`` tensor cast to the
+    activation dtype.  SDPA reads a non-bool ``attn_mask`` as **additive**, so
+    that ``{0.0, 1.0}`` tensor added ``+1.0`` to valid logits and left padded
+    keys fully attendable.  A constant shift cancels in softmax, so it was
+    invisible at ``B=1`` and with equal-length rows — which is every shape the
+    FunASR oracle exercises — and only corrupted mixed-length batches.
+
+    The gate is batch invariance: decoding an utterance alone and inside a
+    padded batch must agree.  It fails on the pre-fix module.
+    """
+
+    def _decoder(self, seed=0):
+        from oasr.models.paraformer.config import ParaformerModelConfig
+        from oasr.models.paraformer.decoder import ParaformerSANMDecoder
+
+        torch.manual_seed(seed)
+        cfg = ParaformerModelConfig(
+            vocab_size=32,
+            encoder_output_size=32,
+            decoder_attention_heads=2,
+            decoder_linear_units=64,
+            decoder_att_layer_num=2,
+            decoder_num_blocks=2,
+        )
+        return ParaformerSANMDecoder(cfg).eval()
+
+    def test_padded_batch_matches_single(self):
+        dec = self._decoder()
+        torch.manual_seed(1)
+        short_t, long_t, u = 5, 12, 3
+        memory = torch.randn(2, long_t, 32)
+        memory[0, short_t:] = 0.0  # row 0 is padded past `short_t`
+        embeds = torch.randn(2, u, 32)
+        lens = torch.tensor([short_t, long_t])
+        toks = torch.tensor([u, u])
+
+        with torch.no_grad():
+            batched, _ = dec(memory, lens, embeds, toks)
+            solo, _ = dec(memory[:1, :short_t], lens[:1], embeds[:1], toks[:1])
+        torch.testing.assert_close(batched[:1], solo, atol=1e-5, rtol=1e-5)
+
+    def test_padding_content_is_ignored(self):
+        """Changing what sits in the padded region must not move the output."""
+        dec = self._decoder(seed=2)
+        torch.manual_seed(3)
+        short_t, long_t, u = 4, 10, 2
+        memory = torch.randn(2, long_t, 32)
+        embeds = torch.randn(2, u, 32)
+        lens = torch.tensor([short_t, long_t])
+        toks = torch.tensor([u, u])
+
+        other = memory.clone()
+        other[0, short_t:] = torch.randn(long_t - short_t, 32) * 50.0
+        with torch.no_grad():
+            a, _ = dec(memory, lens, embeds, toks)
+            b, _ = dec(other, lens, embeds, toks)
+        torch.testing.assert_close(a[:1], b[:1], atol=1e-5, rtol=1e-5)
