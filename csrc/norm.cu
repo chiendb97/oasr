@@ -18,8 +18,8 @@ void layernorm(TensorView output, TensorView input, TensorView weight, Optional 
     CHECK_INPUT(input);
     CHECK_INPUT(output);
     CHECK_INPUT(weight);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+    CHECK_ROW_DENSE_INPUT(input);
+    CHECK_SAME_LAYOUT(input, output);
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -53,8 +53,8 @@ void bias_norm(TensorView output, TensorView input, TensorView bias, TensorView 
     CHECK_INPUT(input);
     CHECK_INPUT(output);
     CHECK_INPUT(bias);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+    CHECK_ROW_DENSE_INPUT(input);
+    CHECK_SAME_LAYOUT(input, output);
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -85,8 +85,8 @@ void rmsnorm(TensorView output, TensorView input, TensorView weight, Optional bi
     CHECK_INPUT(input);
     CHECK_INPUT(output);
     CHECK_INPUT(weight);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+    CHECK_ROW_DENSE_INPUT(input);
+    CHECK_SAME_LAYOUT(input, output);
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -182,8 +182,8 @@ void addlayernorm(TensorView output, TensorView input, TensorView residual, Tens
     CHECK_INPUT(output);
     CHECK_INPUT(residual);
     CHECK_INPUT(weight);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+    CHECK_ROW_DENSE_INPUT(input);
+    CHECK_SAME_LAYOUT(input, output);
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -222,9 +222,12 @@ void addlayernorm_residual(TensorView output, TensorView residual_out, TensorVie
     CHECK_INPUT(residual);
     CHECK_INPUT(residual_out);
     CHECK_INPUT(weight);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual_out);
+    CHECK_ROW_DENSE_INPUT(input);
+    CHECK_SAME_LAYOUT(input, output);
+    // This kernel reads `residual` and writes `residual_out` row-wise too, so
+    // both share the input's layout.
+    CHECK_SAME_LAYOUT(input, residual);
+    CHECK_SAME_LAYOUT(input, residual_out);
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -291,8 +294,8 @@ void layernorm_activation(TensorView output, TensorView input, TensorView weight
     CHECK_INPUT(input);
     CHECK_INPUT(output);
     CHECK_INPUT(weight);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+    CHECK_ROW_DENSE_INPUT(input);
+    CHECK_SAME_LAYOUT(input, output);
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -324,8 +327,8 @@ void rmsnorm_activation(TensorView output, TensorView input, TensorView weight, 
     CHECK_INPUT(input);
     CHECK_INPUT(output);
     CHECK_INPUT(weight);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+    CHECK_ROW_DENSE_INPUT(input);
+    CHECK_SAME_LAYOUT(input, output);
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {

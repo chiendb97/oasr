@@ -119,19 +119,6 @@ KERNEL_GAPS: Dict[str, KernelGap] = {
     g.id: g
     for g in (
         KernelGap(
-            id="norm-strided-rows",
-            what=(
-                "norm kernels address rows as `input + row * hidden_size`, so they "
-                "reject any input whose rows are not contiguous"
-            ),
-            fix=(
-                "kernel: take a row stride. Zipformer works in (T, B, C) and its "
-                "layer norm sees a transposed view; forcing contiguity in the model "
-                "instead would copy the whole activation (~18 MiB at T=1500 B=16 "
-                "d=384) to save ~5 us of norm, so the model layer is the wrong place"
-            ),
-        ),
-        KernelGap(
             id="fmha-head-dim",
             what=(
                 "a head_dim so large that even a single-stage cp.async ring "
@@ -328,6 +315,25 @@ def use_gemm_kernel(x: torch.Tensor, in_features: int, out_features: int) -> boo
     return True
 
 
+def is_row_dense(x: torch.Tensor) -> bool:
+    """Do ``x``'s trailing-dim rows tile its memory exactly, in some order?
+
+    The real precondition of a row-wise kernel walking ``base + row * row_len``
+    — see ``IsRowDense`` in ``csrc/tvm_ffi_utils.h``, which this mirrors.  It
+    accepts a *permuted* dense view (Zipformer's ``(T, B, C)`` transpose) and
+    rejects a padded one (``x[..., :32]`` of a wider buffer), where plain
+    ``is_contiguous()`` refuses both.
+    """
+    if x.dim() < 1 or x.stride(-1) != 1:
+        return False
+    span = 1
+    for extent, stride in zip(x.shape, x.stride()):
+        if extent > 1 and stride <= 0:
+            return False
+        span += (extent - 1) * stride
+    return span == x.numel()
+
+
 def use_norm_kernel(x: torch.Tensor) -> bool:
     """Should this normalization go through the OASR norm kernels?"""
     if layers_backend() == "torch":
@@ -336,8 +342,12 @@ def use_norm_kernel(x: torch.Tensor) -> bool:
         return out_of_scope("CPU tensor")
     if x.dtype not in NORM_DTYPES:
         return out_of_scope(f"dtype {x.dtype}")
-    if not x.is_contiguous():
-        return take_gap("norm-strided-rows", f"strides {tuple(x.stride())}")
+    if not is_row_dense(x):
+        # A padded row stride is not a kernel gap: the rows do not tile memory,
+        # so there is nothing for a row-wise kernel to walk.  ``torch.empty_like``
+        # does not preserve such strides either, so the output rows would not
+        # line up with the input's even if it did.
+        return take_policy("norm-rows-not-dense")
     return True
 
 
@@ -356,6 +366,7 @@ __all__ = [
     "SERVED_DTYPES",
     "format_gap_report",
     "gap_hits",
+    "is_row_dense",
     "layers_backend",
     "layers_backend_override",
     "policy_hits",

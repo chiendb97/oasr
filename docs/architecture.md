@@ -60,17 +60,32 @@ The remaining declared gaps, all of them kernel-side:
 
 | Gap | Missing | Costs |
 |---|---|---|
-| `norm-strided-rows` | norm kernels address rows as `input + row * hidden` | Zipformer works in `(T, B, C)`; forcing contiguity in the model would copy the whole activation (~18 MiB at T=1500 B=16 d=384) to save ~5 µs |
 | `fmha-head-dim` | head dims so wide that even a 1-deep cp.async ring overflows smem (>256 on a 99 KB arch) | nothing in-tree reaches it |
 | `fmha-mask-form` | FMHA has no causal mode and no left-padding mode | Whisper's prefill and Qwen2's left-padded prompts stay on SDPA |
 
-One gap that *was* here got closed in the kernel: the cp.async ring depth was
+`norm-strided-rows` was also here and is closed. Every norm kernel walks rows
+as `base + row * hidden`, and the launchers checked only `stride(-1) == 1` —
+both too weak and, once "fixed" to `is_contiguous()`, too strong. Too weak
+because a padded row stride (`x[..., :H]` of a wider buffer, `x[:, -1]` of a
+`(B, T, D)`) passes it and the kernel then reads the wrong memory *silently*.
+Too strong because a **permuted dense** view — Zipformer's `(T, B, C)`
+transpose — has rows that still tile memory exactly, so visiting them in memory
+order gives the identical result (normalization is per-row independent and
+`torch.empty_like` preserves the strides). The launchers now check the real
+precondition, `IsRowDense`: trailing dim contiguous *and* rows tiling memory
+with no gap or overlap. Zipformer's 100 `BiasNorm` calls per encoder forward
+moved onto the kernel, and the padded cases now raise instead of lying.
+
+One gap got closed in the kernel: the cp.async ring depth was
 hardcoded at 3 stages, so smem scaled straight off `head_dim` and a 64×64 tile
 at `head_dim=128` needed 112 KB against sm_120's 99 KB cap — refused outright,
 while sm_80's 163 KB took it fine, which is why it read as "no head_dim-128
 config" rather than as a budget bug. `FmhaSm80.select_num_stages` now sizes the
-ring to the arch (2 stages, 80 KB), and Paraformer's `d_k=128` SANM attention
-runs **2.05–2.56× faster** than the SDPA it was stranded on. The budget also
+ring to the arch (2 stages, 80 KB), so Paraformer's `d_k=128` SANM attention can
+reach the kernel at all — **1.16–1.34×** faster than the SDPA it was stranded
+on, measured with head-split views (see the policy note below; a first
+measurement on freshly allocated contiguous tensors said 2.05–2.56× and was not
+representative). The budget also
 now costs the *padded* head dim, matching what the layouts allocate — it used
 the raw value and under-counted by a third at e.g. `head_dim=72`.
 
@@ -84,11 +99,14 @@ one. `test_no_architecture_needs_an_unaligned_gemm` keeps them closed.
 Capability is necessary but not sufficient, and the two measured policies that
 make up the rest live here rather than in any model:
 
-* **Attention fuses only when there is a mask to fuse.** With `kv_lens` or an
-  additive bias the fused kernel is 1.7–1.9× faster than SDPA; with no mask at
-  all it is 1.25–1.87× *slower*, because the win was the fusion. Whisper, whose
-  attention is never masked, therefore runs SDPA end to end without any
-  model-side flag.
+* **Attention fuses only when there is a mask to fuse.** Measured with
+  head-split views, which is what real call sites pass: `kv_lens` shapes range
+  1.16–2.10× faster, unmasked is a wash at 1.01×, and a masked shape with a
+  short query extent can still *lose* at 0.90×. The fused kernel needs canonical
+  row-major q/k/v, so `_ensure_canonical` copies all three (35.3 → 68.7 µs at
+  `B8 H4 T500 D128`) — a per-call cost paid regardless of how little attention
+  work there is, and now the highest-value FMHA item. Whisper, whose attention is
+  never masked, runs SDPA end to end without any model-side flag.
 * **GEMM has a row floor** (`GEMM_MIN_ROWS`). CUTLASS tiles the M axis at 128
   rows, so a GEMM with fewer rows leaves most of every tile empty and cuBLAS's
   GEMV-shaped kernel wins. This started life as a floor on *total work* and

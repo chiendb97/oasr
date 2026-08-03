@@ -57,6 +57,59 @@ static constexpr DLDataType dl_int32 = {kDLInt, 32, 1};
     TVM_FFI_ICHECK((x).IsContiguous())                                                    \
         << "Tensor must be contiguous (row-major, no padded strides)"
 
+// True when the trailing dimension is contiguous *and* the resulting rows tile
+// the tensor's memory exactly -- no gaps, no overlap, in some order.
+//
+// This is the real precondition of a row-wise kernel that walks
+// `base + row * row_len`, and it is both weaker and stronger than
+// `IsContiguous()` in useful ways:
+//
+//   * Stronger than `stride(-1) == 1`, which was the check these kernels used.
+//     `x[..., :32]` of a wider buffer, or `x[:, -1]` of a `(B, T, D)` tensor,
+//     satisfies that and still has a padded row stride -- the kernel then reads
+//     the wrong memory and returns a plausible wrong answer, silently.
+//
+//   * Weaker than `IsContiguous()`, which needlessly refuses a *permuted* dense
+//     view.  Zipformer works in `(T, B, C)`, a transpose of a contiguous
+//     `(B, T, C)`: its rows still tile memory exactly, just visited in a
+//     different order.  Since normalization is per-row and independent, and the
+//     output carries the same strides (`torch.empty_like` preserves them),
+//     processing rows in *memory* order computes exactly the same result.
+//     Forcing contiguity in the model instead would copy the whole activation
+//     (~18 MiB at T=1500 B=16 d=384) to save a few microseconds of norm.
+//
+// Zero/negative strides (`expand`, reversed views) fail the density test, which
+// is what we want: those alias or run backwards and are not row-tilings.
+inline bool IsRowDense(const TensorView& x) {
+    int n = x.ndim();
+    if (n < 1 || x.stride(n - 1) != 1) return false;
+    int64_t span = 1;
+    for (int i = 0; i < n; ++i) {
+        int64_t extent = x.size(i);
+        int64_t stride = x.stride(i);
+        if (extent > 1 && stride <= 0) return false;
+        span += (extent - 1) * stride;
+    }
+    return span == x.numel();
+}
+
+#define CHECK_ROW_DENSE_INPUT(x)                                                          \
+    TVM_FFI_ICHECK(oasr::IsRowDense(x))                                                   \
+        << "Tensor rows must tile memory exactly (trailing dim contiguous, no "           \
+           "padded row stride); a row-wise kernel walks `base + row * row_len`"
+
+// Two tensors must agree on layout, not just shape.  A row-wise kernel visits
+// rows in memory order, so input row `j` and output row `j` are the same logical
+// row only if the strides match.
+#define CHECK_SAME_LAYOUT(a, b)                                                           \
+    TVM_FFI_ICHECK((a).ndim() == (b).ndim() && [&] {                                       \
+        for (int _i = 0; _i < (a).ndim(); ++_i) {                                          \
+            if ((a).size(_i) != (b).size(_i) || (a).stride(_i) != (b).stride(_i))          \
+                return false;                                                              \
+        }                                                                                  \
+        return true;                                                                       \
+    }()) << "Tensors must have identical shape and strides"
+
 // Rows of a matrix whose trailing dimension is the reduction axis: every
 // leading dimension is flattened.  Lets a launcher take the caller's N-D
 // activation directly instead of making Python `reshape(-1, K)` first, which
