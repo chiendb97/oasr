@@ -21,6 +21,21 @@ executable by, the engine), this tool closes the loop with the real kernels:
      and a ready-to-paste ``_GEMM_HEURISTIC_RULES_SM120`` Python literal for the
      production selector in ``oasr/jit/gemm.py``.
 
+**What this tool cannot see.** Every candidate is timed on its own, in a loop deep
+enough that the next launch overlaps the current kernel — so what comes back is
+kernel throughput with dispatch cost hidden. Two consequences, both hit while
+tuning whisper-tiny:
+
+  * the cuBLAS branch of ``_dispatch_gemm`` costs ~4.9 µs more CPU per call than
+    the CUTLASS launcher (``addmm`` dispatch plus two ``reshape``s). For a model
+    whose forward is CPU-issue-bound — whisper-tiny's encoder at batch 1-2 is:
+    issue 1139 µs against 611 µs of GPU work — a "torch wins" verdict can make the
+    model *slower* while genuinely removing GPU work. Check the winner against the
+    model, and prefer a CUTLASS tile of equal GPU time when there is one.
+  * a single measurement per arm cannot separate 1.05x from a tie; adjacent
+    buckets alternated torch/cutlass/default at 1.02-1.08x and re-measuring them
+    interleaved showed ties. ``--min-speedup`` is the guard.
+
 Two-step capture workflow (recommended)::
 
     export CUDA_VISIBLE_DEVICES=GPU-...          # the healthy GPU (UUID)
@@ -42,7 +57,15 @@ from typing import Dict, List, Optional, Tuple
 
 # Tile-M ladder (aligned to SM120 block_m ∈ {16,32,64,128,256}); a runtime M is
 # routed to the first edge ≥ M.  The last bucket becomes the catch-all (m_max=None).
-_M_LADDER = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+#
+# The top edges exist for the fixed-window frontends.  A Conformer M is
+# ``frames × batch`` at a 40 ms hop, so it stayed under 16384; Whisper pads every
+# request to a 30 s window (1500 encoder frames), which puts a batch of 64 at
+# M=96000.  With the ladder stopping at 32768, ``_ladder_edge`` returned the last
+# edge for everything above it and the three widest batches measured as one
+# bucket — a collapse that is invisible in the emitted rules, because a bucket
+# nothing distinguishes looks exactly like a bucket where the winner agrees.
+_M_LADDER = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
 
 _ACTIVATION_SWISH = 2
 
@@ -388,8 +411,27 @@ def _choice_literal(tactic, sm: int, is_default: bool) -> str:
     return _cutlass_literal(tactic, sm)
 
 
-def emit_rules(per_shape: Dict[Tuple, List[TacticResult]], reps: List[RepShape], sm: int) -> str:
-    """Build the _GEMM_HEURISTIC_RULES_SM<sm> Python literal from sweep winners."""
+def emit_rules(
+    per_shape: Dict[Tuple, List[TacticResult]],
+    reps: List[RepShape],
+    sm: int,
+    min_speedup: float = 1.05,
+) -> str:
+    """Build the _GEMM_HEURISTIC_RULES_SM<sm> Python literal from sweep winners.
+
+    A bucket whose winner is not at least *min_speedup* faster than the fallback
+    keeps the fallback, so it collapses into a neighbour instead of becoming a
+    rule.  Two reasons, both learned from the whisper-tiny run:
+
+    * ``_pick_winner`` can return a tactic **slower than the fallback**.  Its
+      tie-break prefers a smaller tile within 5% of the measured best, and the
+      fallback is often *in* that band — one emitted bucket read ``0.96x vs
+      default``, i.e. a rule that made things worse.
+    * every arm is measured once here, so adjacent buckets came back alternating
+      torch / cutlass / default at 1.02-1.08x.  Re-measuring those pairs with the
+      arms interleaved showed them to be ties.  Encoding a tie costs a compiled
+      variant and a boundary that can be wrong, and buys nothing.
+    """
     # Group reps by (op, N, K) and order by m_max (None last).
     by_key: Dict[Tuple[str, int, int], List[RepShape]] = defaultdict(list)
     for r in reps:
@@ -413,6 +455,23 @@ def emit_rules(per_shape: Dict[Tuple, List[TacticResult]], reps: List[RepShape],
             speedup = (
                 (default.median_ms / winner.median_ms) if default and winner.median_ms > 0 else 1.0
             )
+            if speedup < min_speedup:
+                # Not a measured win — keep the fallback and say so, rather than
+                # emitting a rule that a paired re-measurement would not support.
+                print(
+                    f"[tune] suppressed ({op}, {N}, {K}) m_max={r.m_max}: "
+                    f"{winner.tactic.backend} only {speedup:.2f}x vs default "
+                    f"(< {min_speedup:.2f}x) — keeping the fallback"
+                )
+                rule_entries.append(
+                    (
+                        r.m_max,
+                        fallback_literal,
+                        f"M~{r.M}: fallback ({winner.tactic.backend} was only "
+                        f"{speedup:.2f}x vs default)",
+                    )
+                )
+                continue
             choice = _choice_literal(winner.tactic, sm, winner.is_default)
             if choice != fallback_literal:
                 all_default = False
@@ -506,6 +565,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--emit-rules", metavar="FILE", help="write the _GEMM_HEURISTIC_RULES Python literal here"
     )
+    p.add_argument(
+        "--min-speedup",
+        type=float,
+        default=1.05,
+        help="emit a rule only when the winner beats the fallback by at least this "
+        "factor; suppressed buckets keep the fallback and are logged (default 1.05)",
+    )
     # analytic-mode knobs
     p.add_argument("--families", nargs="+", default=["conformer"])
     p.add_argument("--sizes", nargs="+", default=["base"])
@@ -555,7 +621,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print_report(per_shape, reps, sm)
 
-    rules = emit_rules(per_shape, reps, sm)
+    rules = emit_rules(per_shape, reps, sm, args.min_speedup)
     print(rules)
     if args.emit_rules:
         with open(args.emit_rules, "w") as f:

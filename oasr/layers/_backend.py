@@ -83,10 +83,13 @@ GEMM_ALIGNMENT = 8
 #: exactly a Qwen2-Audio-7B decode step.  A MACs floor cannot see the problem
 #: because the problem is the *shape*, not the size.
 #:
-#: This is a **policy**, not a kernel gap.  The real fix is tuned rules for
-#: these shapes: ``select_default_config`` has no entry for ``(3584, 3584)`` and
-#: falls back to the default tile, and the tuner has only ever been run over
-#: Conformer geometries.
+#: This is a **policy**, not a kernel gap.  The real fix is tuned rules for these
+#: shapes, and coverage is per model width because ``select_default_config`` keys
+#: on the exact ``(op, N, K)``.  Conformer-CTC and whisper-tiny are tuned;
+#: everything else takes the fallback tile.  ``format_gap_report()`` now lists the
+#: untuned shapes a run actually hit (measured: 8 for Qwen2-Audio-7B, 25 for
+#: Zipformer, 7 for Paraformer — and 1 for Conformer, which the table *was* tuned
+#: for, so it drifts), which is the shape list to hand ``tune_asr_gemm.py``.
 #:
 #: It must **not** be conditioned on ``is_current_stream_capturing()``, tempting
 #: as that is (under capture the dispatch cost is paid once and replayed free).
@@ -240,10 +243,19 @@ def policy_hits() -> Dict[str, int]:
 
 
 def reset_backend_stats() -> None:
-    """Clear the counters (per-test isolation, per-benchmark accounting)."""
+    """Clear the counters (per-test isolation, per-benchmark accounting).
+
+    Includes the GEMM rule-miss table, so ``reset`` → run → report stays one call
+    now that :func:`format_gap_report` reports both.
+    """
     _GAP_HITS.clear()
     _POLICY_HITS.clear()
     _OUT_OF_SCOPE.clear()
+    try:
+        from oasr.jit.gemm import reset_rule_misses
+    except Exception:  # noqa: BLE001
+        return
+    reset_rule_misses()
 
 
 def format_gap_report() -> str:
@@ -268,6 +280,21 @@ def format_gap_report() -> str:
             lines.append(f"    {reason:<20} x{n}")
     if not (_GAP_HITS or _POLICY_HITS or _OUT_OF_SCOPE):
         lines.append("  every call reached an OASR kernel")
+    # A GEMM that reached a kernel can still have reached an *untuned* one, which
+    # is a third thing: not debt, not a decision, just nobody having measured this
+    # model's widths.  Imported lazily — ``oasr.jit.gemm`` is deliberately kept off
+    # the layers import path (see the note at the top of ``oasr/gemm.py``).
+    try:
+        from oasr.jit.gemm import rule_misses
+    except Exception:  # noqa: BLE001 — diagnostics must never break the caller
+        return "\n".join(lines)
+    misses = rule_misses()
+    if misses:
+        lines.append("  GEMM shapes with no tuned rule (ran on the fallback tile):")
+        for (op, N, K), (calls, m_lo, m_hi) in sorted(misses.items(), key=lambda kv: -kv[1][0]):
+            span = f"{m_lo}" if m_lo == m_hi else f"{m_lo}..{m_hi}"
+            lines.append(f"    {op:<18} N={N:<6} K={K:<6} x{calls:<7} M={span}")
+        lines.append("    tune with → scripts/tune_asr_gemm.py (see oasr/jit/gemm.py)")
     return "\n".join(lines)
 
 
