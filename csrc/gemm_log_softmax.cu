@@ -49,6 +49,7 @@ void gemm_log_softmax(TensorView output, TensorView A, TensorView B, Optional bi
     int K = A.size(A.ndim() - 1);
     int M = static_cast<int>(FLATTENED_ROWS(A));
     int N = B.size(0);
+    CHECK_GEMM_ALIGNMENT(N, K);
 
     cudaStream_t stream = get_stream(A.device());
 

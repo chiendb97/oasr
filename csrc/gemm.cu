@@ -51,6 +51,7 @@ void gemm(TensorView output, TensorView A, TensorView B, Optional C_opt,
     int K = A.size(A.ndim() - 1);
     int M = static_cast<int>(FLATTENED_ROWS(A));
     int N = B.size(0);
+    CHECK_GEMM_ALIGNMENT(N, K);
 
     cudaStream_t stream = get_stream(A.device());
 
@@ -89,6 +90,7 @@ void gemm_activation(TensorView output, TensorView A, TensorView B, Optional C_o
     int K = A.size(A.ndim() - 1);
     int M = static_cast<int>(FLATTENED_ROWS(A));
     int N = B.size(0);
+    CHECK_GEMM_ALIGNMENT(N, K);
     auto activation = static_cast<ActivationType>(activation_type);
 
     cudaStream_t stream = get_stream(A.device());

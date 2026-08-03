@@ -116,6 +116,23 @@ inline bool IsRowDense(const TensorView& x) {
 // cost ~1.3 us per call on shapes where the kernel itself costs ~10.
 #define FLATTENED_ROWS(x) ((x).numel() / (x).size((x).ndim() - 1))
 
+// CUTLASS 2.x alignment-8 iterators: both GEMM free dimensions must divide by 8.
+//
+// Checked here, in every GEMM-family launcher, for one reason: the *same*
+// question used to get two different answers.  `gemm` let CUTLASS fail and
+// surfaced "GEMM kernel failed", which says nothing about what to do;
+// `gemm_log_softmax` silently rerouted to cuBLAS, which says nothing at all.
+// Neither is acceptable for a precondition the caller can trivially satisfy —
+// every unaligned case in this repo is an output projection, and padding it is
+// the established fix (`oasr.models.base.align_out_features` +
+// `pad_output_projection`, which the WeNet CTC head has used since day one).
+#define CHECK_GEMM_ALIGNMENT(N, K)                                                        \
+    TVM_FFI_ICHECK((N) % 8 == 0 && (K) % 8 == 0)                                          \
+        << "GEMM needs both free dimensions 8-aligned (CUTLASS alignment-8 "              \
+           "iterators), got N=" << (N) << " K=" << (K)                                    \
+        << ". Pad the projection at the model layer -- see "                               \
+           "oasr.models.base.align_out_features / pad_output_projection."
+
 // =============================================================================
 // Dtype dispatch macros
 // =============================================================================

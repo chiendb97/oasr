@@ -181,20 +181,16 @@ def _dispatch_gemm_log_softmax(out, A, B, C, N, K, M) -> None:
         the fused path, but the GEMM tile is shape-selected).
 
     Falls back to the legacy fused launcher (the historical behaviour) when no
-    rule matches, and to torch when CUTLASS cannot run the shape at all
-    (N or K not 8-aligned, e.g. an unpadded vocab).
+    rule matches.
+
+    An unaligned ``N``/``K`` used to be quietly rerouted to cuBLAS here, which
+    made this the one GEMM entry point with a different contract from the rest
+    of the family — ``gemm`` failed on the same input.  The launchers now all
+    raise the same actionable error (``CHECK_GEMM_ALIGNMENT``), and the fix is
+    to pad the projection at the model layer, which every in-tree caller does.
     """
     try:
         from oasr.jit.gemm import GEMM_DEFAULT
-
-        if N % 8 != 0 or K % 8 != 0:
-            # CUTLASS 2.x alignment-8 iterators reject these shapes (both the
-            # fused launcher and the composed variants) — torch is the only
-            # backend that can run them.
-            from oasr.gemm_torch import torch_gemm_log_softmax
-
-            torch_gemm_log_softmax(out.reshape(M, N), A.reshape(M, K), B, C, 1)
-            return
 
         choice = _jit_gemm.select_default_config("gemm_log_softmax", M, N, K, A.dtype, _target_sm())
         if choice == "torch":

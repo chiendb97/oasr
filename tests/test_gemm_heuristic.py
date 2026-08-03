@@ -170,20 +170,31 @@ class TestGemmLogSoftmaxDispatch:
     def _check(self, out, ref):
         torch.testing.assert_close(out.float(), ref, rtol=5e-2, atol=5e-2)
 
-    def test_unaligned_vocab_routes_to_torch(self, monkeypatch):
-        """N % 8 != 0 (unpadded vocab) can't run on CUTLASS — must route to
-        torch instead of raising (the historical behaviour was a crash)."""
-        import oasr.gemm_torch as gt
+    def test_unaligned_vocab_raises_and_names_the_fix(self):
+        """``N % 8 != 0`` (unpadded vocab) raises, with the remedy in the message.
 
-        calls = []
-        orig = gt.torch_gemm_log_softmax
-        monkeypatch.setattr(
-            gt, "torch_gemm_log_softmax", lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
-        )
-        A, B, C, ref = self._mk(N=5002)
-        out = oasr.gemm_log_softmax(A, B, C)
-        assert calls, "expected the torch backend to be used for unaligned N"
-        self._check(out, ref)
+        This assertion is the *reverse* of what it used to be, so the history
+        matters.  It originally required a silent reroute to cuBLAS, because the
+        behaviour before that was a bare ``GEMM kernel failed`` crash — a fair
+        complaint about an unhelpful error, answered by removing the error
+        entirely.  That left ``gemm_log_softmax`` as the one member of the GEMM
+        family with its own contract: ``oasr.gemm`` still failed on the very same
+        input.
+
+        The resolution keeps the honest half of both: the precondition is
+        enforced uniformly (``CHECK_GEMM_ALIGNMENT`` in every launcher) and the
+        message names the fix.  Padding an output projection is cheap and is
+        what every in-tree caller already does — Conformer and Zipformer pad the
+        CTC vocab in their converters (5002 → 5008, 500 → 504), Paraformer and
+        the transducer pad theirs on load.  A quiet reroute would instead leave
+        such a model permanently off the kernel path with nothing to notice.
+        """
+        A, B, C, _ref = self._mk(N=5002)
+        with pytest.raises(Exception) as exc:
+            oasr.gemm_log_softmax(A, B, C)
+        text = str(exc.value)
+        assert "8-aligned" in text and "N=5002" in text, text
+        assert "align_out_features" in text, "the error must say what to do"
 
     def test_choice_torch(self, monkeypatch):
         import oasr.gemm_torch as gt

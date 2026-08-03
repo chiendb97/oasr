@@ -136,5 +136,69 @@ class TestGemmInputLayout:
             oasr.gemm(A, B, None, out=bad)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestGemmAlignmentContract:
+    """Every GEMM-family entry point answers the alignment question the same way.
+
+    They used to disagree.  ``gemm`` let CUTLASS fail and surfaced "GEMM kernel
+    failed", which tells the caller nothing actionable; ``gemm_log_softmax``
+    silently rerouted the same input to cuBLAS, which tells them nothing at all
+    and quietly leaves the model off the kernel path forever.  One precondition,
+    one answer, and the message names the fix — every unaligned case in this repo
+    is an output projection, and padding it at the model layer is the established
+    pattern (``align_out_features`` / ``pad_output_projection``).
+    """
+
+    MSG = "8-aligned"
+
+    @staticmethod
+    def _ab(M, N, K, dtype=torch.float16):
+        return (
+            torch.randn(M, K, device="cuda", dtype=dtype),
+            torch.randn(N, K, device="cuda", dtype=dtype),
+        )
+
+    @pytest.mark.parametrize("N,K", [(500, 64), (64, 60), (30, 24)])
+    def test_gemm_rejects_unaligned(self, N, K):
+        A, B = self._ab(16, N, K)
+        with pytest.raises(Exception, match=self.MSG):
+            oasr.gemm(A, B)
+
+    @pytest.mark.parametrize("N,K", [(500, 64), (64, 60)])
+    def test_gemm_activation_rejects_unaligned(self, N, K):
+        A, B = self._ab(16, N, K)
+        with pytest.raises(Exception, match=self.MSG):
+            oasr.gemm_activation(A, B, None, oasr.ACTIVATION_RELU)
+
+    @pytest.mark.parametrize("N,K", [(500, 64), (64, 60)])
+    def test_gemm_log_softmax_rejects_unaligned(self, N, K):
+        """Regression: this one used to succeed via a silent cuBLAS reroute."""
+        A, B = self._ab(16, N, K)
+        with pytest.raises(Exception, match=self.MSG):
+            oasr.gemm_log_softmax(A, B)
+
+    def test_bmm_rejects_unaligned(self):
+        A = torch.randn(2, 16, 60, device="cuda", dtype=torch.float16)
+        B = torch.randn(2, 64, 60, device="cuda", dtype=torch.float16)
+        with pytest.raises(Exception, match=self.MSG):
+            oasr.bmm(A, B)
+
+    def test_the_message_names_the_fix(self):
+        """An error a caller cannot act on is barely better than a silent one."""
+        A, B = self._ab(16, 500, 64)
+        with pytest.raises(Exception) as exc:
+            oasr.gemm(A, B)
+        text = str(exc.value)
+        assert "N=500" in text and "K=64" in text, text
+        assert "align_out_features" in text, text
+
+    @pytest.mark.parametrize("N,K", [(504, 64), (64, 64), (8, 8)])
+    def test_aligned_shapes_still_work(self, N, K):
+        A, B = self._ab(16, N, K)
+        torch.testing.assert_close(
+            oasr.gemm(A, B), torch.nn.functional.linear(A, B), rtol=2e-2, atol=2e-2
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
