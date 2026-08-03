@@ -35,6 +35,8 @@ def _ref_fmha(
     softmax_scale: float,
     attn_bias: Optional[torch.Tensor] = None,
     cache_seqlens: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    cache_seqstarts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     B, H, T_q, D = q.shape
     H_kv = k.size(1)
@@ -52,9 +54,15 @@ def _ref_fmha(
     if cache_seqlens is not None:
         arange = torch.arange(T_k, device=cache_seqlens.device)
         keep = arange.unsqueeze(0) < cache_seqlens.unsqueeze(1)
+        if cache_seqstarts is not None:
+            keep = keep & (arange.unsqueeze(0) >= cache_seqstarts.unsqueeze(1))
         pad = torch.where(keep, 0.0, float("-inf")).to(q.dtype)
         pad = pad.unsqueeze(1).unsqueeze(1)  # (B,1,1,T_k)
         masks.append(pad)
+    if causal:
+        upper = torch.ones(T_q, T_k, dtype=torch.bool, device=q.device).triu(1)
+        tri = torch.zeros(1, 1, T_q, T_k, dtype=q.dtype, device=q.device)
+        masks.append(tri.masked_fill_(upper.view(1, 1, T_q, T_k), float("-inf")))
 
     full_mask = None
     if masks:
@@ -336,3 +344,369 @@ def test_fmha_finite_mask_floor_stays_finite(fmha, cuda, dtype, mask_floor):
     # only over the unmasked prefix.
     ref = _ref_fmha(q, k, v, scale, attn_bias=bias)
     torch.testing.assert_close(out[:, :, :valid], ref[:, :, :valid], atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# Shared-memory budget / cp.async ring depth
+# ---------------------------------------------------------------------------
+
+
+class TestRingDepthFitsSmem:
+    """The ring depth is sized to the arch, not hardcoded.
+
+    ``num_stages`` was fixed at 3, so the smem a launch needed
+    (``sQ + stages * (sK + sV)``) scaled straight off ``head_dim``.  At
+    ``head_dim=128`` with a 64x64 tile that is 112 KB, over the 99 KB cap on
+    sm_86 / sm_89 / sm_120, so ``can_implement`` returned False and the shape
+    was refused outright — on sm_80's 163 KB it worked fine, which is why it
+    read as "no head_dim-128 config" rather than as a budget bug.  Two stages
+    need 80 KB and fit.  Paraformer's SANM attention is ``d_k=128``.
+    """
+
+    @staticmethod
+    def _cls(arch_str: str):
+        cutlass = pytest.importorskip("cutlass")
+        from oasr.kernels.cute.attention.fmha_sm80 import FmhaSm80
+        from oasr.kernels.cute.attention.fmha_sm120 import FmhaSm120
+
+        del cutlass
+        return {"sm_80": FmhaSm80, "sm_120": FmhaSm120}[arch_str]
+
+    @pytest.mark.parametrize("arch_str", ["sm_80", "sm_120"])
+    @pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
+    def test_selected_ring_fits(self, arch_str, head_dim):
+        cls = self._cls(arch_str)
+        stages = cls.select_num_stages(head_dim=head_dim)
+        if stages == 0:
+            # No ring depth fits at the *default* 64-wide K tile.  That is not a
+            # refusal — narrowing the tile is the other half of the search, and
+            # it is what makes head_dim 256 available on a 99 KB arch (a 1-deep
+            # ring would also "fit" there on paper, but fails IR verification,
+            # which is why MIN_NUM_STAGES is 2 and this branch exists at all).
+            n_block, stages_eff = cls.select_tile(
+                head_dim=head_dim,
+                m_block_size=64,
+                n_block_size=64,
+                paged=False,
+                block_size=0,
+            )
+            assert (
+                stages_eff >= cls.MIN_NUM_STAGES
+            ), f"{arch_str} head_dim={head_dim} fits at no tile at all"
+            assert n_block < 64, "expected a narrowed tile, not the requested one"
+            assert (
+                cls.smem_bytes(
+                    head_dim=head_dim,
+                    m_block_size=64,
+                    n_block_size=n_block,
+                    num_stages=stages_eff,
+                )
+                <= cls._smem_capacity_in_bytes()
+            )
+            return
+        need = cls.smem_bytes(
+            head_dim=head_dim, m_block_size=64, n_block_size=64, num_stages=stages
+        )
+        assert need <= cls._smem_capacity_in_bytes()
+        # …and it must be the *deepest* one that fits, not merely a safe one.
+        if stages < cls.MAX_NUM_STAGES:
+            deeper = cls.smem_bytes(
+                head_dim=head_dim, m_block_size=64, n_block_size=64, num_stages=stages + 1
+            )
+            assert deeper > cls._smem_capacity_in_bytes()
+
+    def test_head_dim_128_is_implementable_on_a_99kb_arch(self):
+        """The regression itself."""
+        cutlass = pytest.importorskip("cutlass")
+        cls = self._cls("sm_120")
+        assert cls._smem_capacity_in_bytes() < 112 * 1024, "premise: 3 stages must not fit"
+        assert cls.select_num_stages(head_dim=128) == 2
+        assert cls.can_implement(dtype=cutlass.Float16, head_dim=128)
+
+    def test_budget_uses_the_padded_head_dim(self):
+        """The layouts allocate ``(head_dim + 31) // 32 * 32``; the budget must
+        agree.  Costing the raw value under-counts by a third at head_dim 72 and
+        can approve a config that will not launch."""
+        cls = self._cls("sm_120")
+        assert cls.smem_bytes(
+            head_dim=72, m_block_size=64, n_block_size=64, num_stages=1
+        ) == cls.smem_bytes(head_dim=96, m_block_size=64, n_block_size=64, num_stages=1)
+
+    def test_impossible_head_dim_still_refused(self):
+        """Degrading the ring is not a licence to approve anything: a head_dim
+        whose *single*-stage layout overflows must still say no."""
+        cutlass = pytest.importorskip("cutlass")
+        cls = self._cls("sm_120")
+        assert cls.select_num_stages(head_dim=512) == 0
+        assert not cls.can_implement(dtype=cutlass.Float16, head_dim=512)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_head_dim_128_matches_reference(self):
+        """And the shallower ring must still compute the right answer."""
+        from oasr.attention import fmha
+
+        torch.manual_seed(0)
+        B, H, T, D = 2, 4, 200, 128
+        q, k, v = (torch.randn(B, H, T, D, device="cuda", dtype=torch.float16) for _ in range(3))
+        lens = torch.tensor([T, T // 2], device="cuda", dtype=torch.int32)
+        scale = 1.0 / math.sqrt(D)
+        out = fmha(q, k, v, softmax_scale=scale, cache_seqlens=lens)
+        ref = _ref_fmha(q, k, v, scale, cache_seqlens=lens)
+        assert not torch.isnan(out).any()
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+class TestCausal:
+    """Causal masking through ``oasr.fmha``, and the block skipping under it.
+
+    The kernel always had the element-wise causal mask (``AttentionMask``); it
+    was simply never plumbed through ``get_compiled_fmha`` / ``oasr.fmha``, so
+    the waist recorded "no causal mode" as a capability gap.  Plumbing it in
+    alone measured **1.4-4.8x slower than SDPA**, because the mask was applied
+    per element while every row block still scanned all of K — SDPA's flash path
+    skips fully-masked blocks and this one did not.  Bounding ``n_block_max`` by
+    the CTA's diagonal is the actual feature (qwen2-prefill shape: 282.6 ->
+    199.8 us, and the fused path overtakes SDPA at T=2048).
+    """
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize(
+        "T_q,T_k",
+        [
+            (64, 64),  # exactly one m-block
+            (65, 65),  # partial trailing block, both axes
+            (128, 128),  # two m-blocks: block 0 must skip block 1's K tile
+            (320, 320),  # several, so skipping is the common case
+            (1, 64),  # degenerate query
+            (20, 64),  # non-square: top-left aligned, same as torch
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_matches_sdpa(self, T_q, T_k, dtype):
+        from oasr.attention import fmha
+
+        torch.manual_seed(0)
+        B, H, D = 2, 4, 64
+        q = torch.randn(B, H, T_q, D, device="cuda", dtype=dtype)
+        k = torch.randn(B, H, T_k, D, device="cuda", dtype=dtype)
+        v = torch.randn(B, H, T_k, D, device="cuda", dtype=dtype)
+        scale = 1.0 / math.sqrt(D)
+        out = fmha(q, k, v, softmax_scale=scale, causal=True)
+        ref = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+        assert not torch.isnan(out).any()
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_composes_with_per_row_lengths(self):
+        """Causal AND a length mask: the kernel applies both, so the skipping
+        bound must be the *tighter* of the two, never the causal one alone."""
+        from oasr.attention import fmha
+
+        torch.manual_seed(1)
+        B, H, T, D = 2, 4, 192, 64
+        q = torch.randn(B, H, T, D, device="cuda", dtype=torch.float16)
+        k = torch.randn(B, H, T, D, device="cuda", dtype=torch.float16)
+        v = torch.randn(B, H, T, D, device="cuda", dtype=torch.float16)
+        lens = torch.tensor([T, 40], device="cuda", dtype=torch.int32)
+        scale = 1.0 / math.sqrt(D)
+        out = fmha(q, k, v, softmax_scale=scale, cache_seqlens=lens, causal=True)
+        ref = _ref_fmha(q, k, v, scale, cache_seqlens=lens, causal=True)
+        assert not torch.isnan(out).any()
+        # Rows past a stream's length have no valid key at all under the
+        # intersection, so compare only where the reference is finite.
+        finite = torch.isfinite(ref)
+        torch.testing.assert_close(out[finite], ref[finite], atol=2e-2, rtol=2e-2)
+
+    def test_waist_keeps_causal_on_sdpa(self):
+        """Routing is a *measured* choice now, not a capability gap — the
+        distinction the backend design exists to keep."""
+        from oasr.layers._backend import gap_hits, policy_hits, reset_backend_stats
+
+        if not torch.cuda.is_available():
+            pytest.skip("requires CUDA")
+        from oasr.layers import Attention
+
+        a = Attention(4, 64)
+        q = torch.randn(2, 4, 40, 64, device="cuda", dtype=torch.float16)
+        reset_backend_stats()
+        a(q, q, q, is_causal=True)
+        assert policy_hits().get("fmha-causal-short") == 1
+        assert not gap_hits(), "causal is a measured routing choice, not a capability gap"
+        reset_backend_stats()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestPerRowKeyStart:
+    """Left padding: valid keys are ``[start, len)``, not ``[0, len)``.
+
+    The kernel used to mask keys by *length* only, so a per-row key **start**
+    had no form to arrive in and left-padded batches (HF's masked-generate
+    convention, which is what a batched LLM prompt is) were stranded on SDPA.
+    ``mCacheSeqStarts`` closes that: one more ``(B,)`` vector, compared against
+    the column index in the same mask predicate that already handles the length.
+    """
+
+    @pytest.mark.parametrize(
+        "B,H,T_q,T_k,D,starts,lens",
+        [
+            (2, 4, 64, 128, 64, [10, 30], [128, 128]),  # start inside tile 0
+            (2, 4, 64, 192, 64, [70, 130], [192, 192]),  # start past a whole tile
+            (3, 4, 64, 192, 64, [70, 10, 100], [180, 128, 192]),  # both ends
+            (2, 8, 64, 128, 128, [33, 65], [128, 100]),  # wide heads
+            (1, 4, 64, 128, 64, [0], [128]),  # degenerate: start 0
+        ],
+    )
+    def test_matches_reference(self, B, H, T_q, T_k, D, starts, lens):
+        from oasr.attention import fmha
+
+        torch.manual_seed(0)
+        q = torch.randn(B, H, T_q, D, device="cuda", dtype=torch.float16)
+        k = torch.randn(B, H, T_k, D, device="cuda", dtype=torch.float16)
+        v = torch.randn(B, H, T_k, D, device="cuda", dtype=torch.float16)
+        st = torch.tensor(starts, device="cuda", dtype=torch.int32)
+        ln = torch.tensor(lens, device="cuda", dtype=torch.int32)
+        scale = 1.0 / math.sqrt(D)
+        out = fmha(q, k, v, softmax_scale=scale, cache_seqlens=ln, cache_seqstarts=st)
+        ref = _ref_fmha(q, k, v, scale, cache_seqlens=ln, cache_seqstarts=st)
+        assert not torch.isnan(out).any()
+        finite = torch.isfinite(ref)
+        torch.testing.assert_close(out[finite], ref[finite], atol=2e-2, rtol=2e-2)
+
+    def test_composes_with_causal(self):
+        """Qwen2 prefill needs both at once: the causal triangle *and* the
+        left-pad window.  Each must be applied, so the result is the
+        intersection — the case SDPA cannot express without materializing a
+        mask, which is exactly why fusing it pays."""
+        from oasr.attention import fmha
+
+        torch.manual_seed(2)
+        B, H, T, D = 2, 4, 128, 64
+        q = torch.randn(B, H, T, D, device="cuda", dtype=torch.float16)
+        k = torch.randn(B, H, T, D, device="cuda", dtype=torch.float16)
+        v = torch.randn(B, H, T, D, device="cuda", dtype=torch.float16)
+        st = torch.tensor([40, 96], device="cuda", dtype=torch.int32)
+        ln = torch.full((B,), T, device="cuda", dtype=torch.int32)
+        scale = 1.0 / math.sqrt(D)
+        out = fmha(q, k, v, softmax_scale=scale, cache_seqlens=ln, cache_seqstarts=st, causal=True)
+        ref = _ref_fmha(q, k, v, scale, cache_seqlens=ln, cache_seqstarts=st, causal=True)
+        assert not torch.isnan(out).any()
+        finite = torch.isfinite(ref)
+        torch.testing.assert_close(out[finite], ref[finite], atol=2e-2, rtol=2e-2)
+
+    def test_fully_masked_row_is_zero_not_nan(self):
+        """A query row whose whole window is padding comes back zero.
+
+        SDPA's math backend returns NaN there, and a NaN pad row is not
+        harmless: in the next layer a masked key still contributes ``0 * NaN``,
+        so it poisons the *real* rows.  The kernel's empty-row clamp is what
+        makes left padding safe to hand it without the caller pre-opening a
+        diagonal."""
+        from oasr.attention import fmha
+
+        torch.manual_seed(3)
+        B, H, T, D = 1, 4, 128, 64
+        q = torch.randn(B, H, T, D, device="cuda", dtype=torch.float16)
+        k = torch.randn(B, H, T, D, device="cuda", dtype=torch.float16)
+        v = torch.randn(B, H, T, D, device="cuda", dtype=torch.float16)
+        # start == len: an empty window for every row.
+        st = torch.tensor([64], device="cuda", dtype=torch.int32)
+        ln = torch.tensor([64], device="cuda", dtype=torch.int32)
+        out = fmha(q, k, v, softmax_scale=1.0 / math.sqrt(D), cache_seqlens=ln, cache_seqstarts=st)
+        assert torch.isfinite(out).all()
+        torch.testing.assert_close(out, torch.zeros_like(out))
+
+    def test_no_starts_is_unchanged(self):
+        """Regression: omitting ``cache_seqstarts`` must compile and run the
+        same kernel as before — the predicate is const-folded out."""
+        from oasr.attention import fmha
+
+        torch.manual_seed(4)
+        B, H, T, D = 2, 4, 128, 64
+        q = torch.randn(B, H, T, D, device="cuda", dtype=torch.float16)
+        k = torch.randn(B, H, T, D, device="cuda", dtype=torch.float16)
+        v = torch.randn(B, H, T, D, device="cuda", dtype=torch.float16)
+        ln = torch.tensor([128, 90], device="cuda", dtype=torch.int32)
+        scale = 1.0 / math.sqrt(D)
+        a = fmha(q, k, v, softmax_scale=scale, cache_seqlens=ln)
+        b = fmha(q, k, v, softmax_scale=scale, cache_seqlens=ln, cache_seqstarts=None)
+        torch.testing.assert_close(a, b)
+        # ... and equals passing an all-zero start vector explicitly.
+        zeros = torch.zeros(B, device="cuda", dtype=torch.int32)
+        c = fmha(q, k, v, softmax_scale=scale, cache_seqlens=ln, cache_seqstarts=zeros)
+        torch.testing.assert_close(a, c, atol=0, rtol=0)
+
+    def test_starts_without_lens_raises(self):
+        """A start with no end is not a window."""
+        from oasr.attention import fmha
+
+        q = torch.randn(1, 4, 8, 64, device="cuda", dtype=torch.float16)
+        st = torch.zeros(1, device="cuda", dtype=torch.int32)
+        with pytest.raises(ValueError, match="requires cache_seqlens"):
+            fmha(q, q, q, softmax_scale=0.125, cache_seqstarts=st)
+
+    def test_paged_kv_takes_a_start_too(self):
+        """The start is read before the paged/dense branch, so one predicate
+        serves both.  Not a combination anything in-tree uses today — paged
+        streaming history grows rightward — but the claim is cheap to pin, and
+        an untested one in a kernel is how it stops being true."""
+        from oasr.attention import _gather_paged_kv, _sdpa_reference, fmha
+
+        torch.manual_seed(5)
+        B, H, D, block, nblk = 2, 4, 64, 16, 8
+        T_q, T_k = 32, block * nblk
+        k_pool = torch.randn(B * nblk, block, H, D, device="cuda", dtype=torch.float16)
+        v_pool = torch.randn(B * nblk, block, H, D, device="cuda", dtype=torch.float16)
+        bt = torch.arange(B * nblk, device="cuda", dtype=torch.int32).view(B, nblk)
+        q = torch.randn(B, H, T_q, D, device="cuda", dtype=torch.float16)
+        ln = torch.tensor([T_k, 100], device="cuda", dtype=torch.int32)
+        st = torch.tensor([20, 48], device="cuda", dtype=torch.int32)
+        scale = 1.0 / math.sqrt(D)
+
+        out = fmha(
+            q,
+            k_pool,
+            v_pool,
+            softmax_scale=scale,
+            cache_seqlens=ln,
+            cache_seqstarts=st,
+            block_table=bt,
+        )
+        k_dense, v_dense = _gather_paged_kv(k_pool, v_pool, bt)
+        ref = _sdpa_reference(q, k_dense, v_dense, scale, None, ln, False, st)
+        assert torch.isfinite(out).all()
+        finite = torch.isfinite(ref)
+        torch.testing.assert_close(out[finite], ref[finite], atol=2e-2, rtol=2e-2)
+
+    def test_finite_stale_data_past_the_length_is_inert(self):
+        """What the whole-buffer / paged-pool convention rests on.
+
+        A caller may hand over a K/V tensor wider than ``cache_seqlens`` — a
+        recycled paged pool, a padded feature batch, a capacity-preallocated
+        decode cache.  The kernel reads up to the K *tile* boundary above the
+        length, so those columns are read; they must not matter.  They do not,
+        for any finite value: the length mask gives them zero softmax weight.
+
+        ``NaN``/``Inf`` in ``v`` are the documented exception — zero weight
+        still yields ``0 * NaN`` inside ``P @ V``, past any mask — which is why
+        a preallocated cache has to be zeroed rather than ``empty``.  That is a
+        precondition on the caller today; predicating the load against the
+        length (as upstream FlashAttention does) is what would retire it.
+        """
+        from oasr.attention import fmha
+
+        torch.manual_seed(7)
+        B, H, D = 2, 4, 64
+        T_k, L = 192, 130  # L % 64 != 0, so a partial last block exists
+        q = torch.randn(B, H, 32, D, device="cuda", dtype=torch.float16)
+        k = torch.randn(B, H, T_k, D, device="cuda", dtype=torch.float16)
+        v = torch.randn(B, H, T_k, D, device="cuda", dtype=torch.float16)
+        ln = torch.full((B,), L, dtype=torch.int32, device="cuda")
+        scale = 1.0 / math.sqrt(D)
+        base = fmha(q, k, v, softmax_scale=scale, cache_seqlens=ln)
+
+        for fill in (0.0, 3.0, -2.0, 1e4):
+            k2, v2 = k.clone(), v.clone()
+            k2[:, :, L:] = fill
+            v2[:, :, L:] = fill
+            got = fmha(q, k2, v2, softmax_scale=scale, cache_seqlens=ln)
+            torch.testing.assert_close(got, base, atol=0, rtol=0)

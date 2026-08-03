@@ -44,7 +44,7 @@ Key features (Tier 2 cp.async ring matching FA's flash_fwd SM80 path):
 # PEP 563 (deferred annotations) breaks CuteDSL Constexpr detection;
 # do not enable.
 
-from typing import Any
+from typing import Any, Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -102,10 +102,11 @@ class FmhaSm80(FmhaBase):
         window_size_left: int = -1,
         window_size_right: int = -1,
         varlen: bool = False,
+        has_seqstart: bool = False,
         m_block_size: int = 64,
         n_block_size: int = 64,
         num_threads: int = 128,
-        num_stages: int = 3,
+        num_stages: Optional[int] = None,
         q_in_regs: bool = False,
         bias_aligned: bool = False,
     ):
@@ -122,6 +123,10 @@ class FmhaSm80(FmhaBase):
             window_size_right=window_size_right,
             varlen=varlen,
         )
+        # Per-row key *start* (left padding).  A compile-time flag so the mask
+        # specializes: `window_left` cannot express it, being a constexpr, while
+        # the pad amount differs per row.
+        self._has_seqstart = has_seqstart
         self._m_block_size = m_block_size
         self._n_block_size = n_block_size
         # Pad head_dim up to a multiple of 32 so m16n8k16 MMA k-stride works.
@@ -137,6 +142,20 @@ class FmhaSm80(FmhaBase):
         # cp.async latency hiding (FA's expected 2-5% on compute-bound
         # shapes). Default stays at 2 so the OASR perf envelope doesn't
         # shift under the user.
+        if num_stages is None:
+            # Size the ring to the arch's smem budget rather than a constant;
+            # see :meth:`select_num_stages`.
+            num_stages = self.select_num_stages(
+                head_dim=head_dim, m_block_size=m_block_size, n_block_size=n_block_size
+            )
+            if num_stages == 0:
+                raise ValueError(
+                    f"no cp.async ring depth fits {self._smem_arch_str}'s "
+                    f"{self._smem_capacity_in_bytes()} B of shared memory at "
+                    f"head_dim={head_dim}, {m_block_size}x{n_block_size}; "
+                    f"a single stage already needs "
+                    f"{self.smem_bytes(head_dim=head_dim, m_block_size=m_block_size, n_block_size=n_block_size, num_stages=1)} B"
+                )
         if num_stages < 1:
             raise ValueError(f"num_stages must be >= 1, got {num_stages}")
         self._num_stages = num_stages
@@ -178,9 +197,133 @@ class FmhaSm80(FmhaBase):
     # ------------------------------------------------------------------------
     _smem_arch_str = "sm_80"
 
+    #: Deepest cp.async ring we will build.  Beyond this the extra latency
+    #: hiding stops paying for the smem (FlashAttention's own ceiling).
+    MAX_NUM_STAGES = 3
+
+    #: Shallowest ring the *layouts* support, which is not the same as the
+    #: shallowest the mainloop's index arithmetic would accept.  ``sV`` is a
+    #: 3-mode smem tensor ``(N, D, stages)`` and the epilogue takes
+    #: ``sVt[None, None, 0]``; at ``stages == 1`` cute simplifies the size-1
+    #: stage mode away and that index fails IR verification ("coord and shape
+    #: of view are weakly congruent").  Nothing exercised a 1-deep ring until
+    #: the smem budget started choosing one, at which point ``can_implement``
+    #: was cheerfully advertising a config that could not compile.  Narrowing
+    #: the K tile is the cheaper concession, so the floor stays here.
+    MIN_NUM_STAGES = 2
+
     @classmethod
     def _smem_capacity_in_bytes(cls) -> int:
         return cutlass_utils.get_smem_capacity_in_bytes(cls._smem_arch_str)
+
+    @staticmethod
+    def _padded_head_dim(head_dim: int) -> int:
+        """Head dim rounded to the m16n8k16 MMA k-stride, as ``__init__`` does."""
+        return (head_dim + 31) // 32 * 32
+
+    @classmethod
+    def smem_bytes(
+        cls, *, head_dim: int, m_block_size: int, n_block_size: int, num_stages: int
+    ) -> int:
+        """Shared memory a launch would need: ``sQ + num_stages * (sK + sV)``.
+
+        Uses the **padded** head dim, because that is what the smem layouts are
+        built from (``self._head_dim_padded``).  Budgeting with the raw value —
+        which this used to do — under-counts by up to a third (head_dim 72 pads
+        to 96) and can approve a config that will not fit at launch.
+
+        Bias is gmem-direct and not staged through smem, so it does not appear.
+        """
+        d = cls._padded_head_dim(head_dim)
+        return (m_block_size * d + n_block_size * d * num_stages * 2) * 2  # fp16/bf16
+
+    #: Narrower N tiles to fall back on for a head_dim whose requested tile
+    #: cannot fit any ring depth, descending.
+    #:
+    #: 16 is the floor, not 8: the m16n8k16 atom is tiled across 4 warps, so a
+    #: 64x8 S tile leaves the QK accumulator's N mode not matching the
+    #: fragment's and ``cute.gemm`` refuses it ("expects B's N == D's N").
+    #: With a 64-row M tile that caps the reachable head_dim at 320.
+    _N_BLOCK_FALLBACKS = (64, 32, 16)
+
+    @classmethod
+    def select_tile(
+        cls,
+        *,
+        head_dim: int,
+        m_block_size: int = 64,
+        n_block_size: int = 64,
+        paged: bool = False,
+        block_size: int = 0,
+        max_stages: Optional[int] = None,
+    ) -> "tuple[int, int]":
+        """``(n_block, num_stages)`` that fits this arch's smem, or ``(0, 0)``.
+
+        The requested ``n_block_size`` is tried first and at the deepest ring
+        that fits, so nothing already working changes.  Only when *no* ring
+        depth fits does the N tile narrow — which is what closes very wide
+        heads: at ``head_dim=512`` a 64x64 tile needs 192 KB against a 99 KB
+        cap even with a single stage, while 64x16 needs 96 KB.  Narrowing N
+        costs iterations (more, smaller K tiles) and is therefore a last
+        resort, not a default.
+
+        ``m_block`` is not a search axis: ``can_implement`` requires
+        ``(m_block * 2) % num_threads == 0``, so at the default 128 threads it
+        must be a multiple of 64 and cannot usefully shrink.  Between that and
+        the N floor of 16, the reachable range on a 99 KB arch is head_dim
+        <= 320 — comfortably past any real attention head (the widest in tree
+        is Paraformer's 128; 256 is the widest in common use).
+
+        In paged mode the kernel walks ``n_block // block_size`` pool blocks per
+        K tile, so a candidate narrower than ``block_size`` is skipped rather
+        than producing a zero-block walk.
+        """
+        for n_block in cls._N_BLOCK_FALLBACKS:
+            if n_block > n_block_size:
+                continue
+            if paged and (block_size <= 0 or n_block % block_size != 0):
+                continue
+            stages = cls.select_num_stages(
+                head_dim=head_dim,
+                m_block_size=m_block_size,
+                n_block_size=n_block,
+                max_stages=max_stages,
+            )
+            if stages:
+                return n_block, stages
+        return 0, 0
+
+    @classmethod
+    def select_num_stages(
+        cls,
+        *,
+        head_dim: int,
+        m_block_size: int = 64,
+        n_block_size: int = 64,
+        max_stages: Optional[int] = None,
+    ) -> int:
+        """Deepest ring that fits this arch's smem, or ``0`` if none does.
+
+        The ring depth is a property of the *architecture's smem budget*, not a
+        constant.  Hardcoding 3 is what made head_dim 128 unavailable on
+        consumer Blackwell: at ``64x64`` it needs 112 KB against sm_120's 99 KB
+        cap, so the shape was refused outright — while sm_80's 163 KB took it
+        without complaint.  Two stages need 80 KB and fit, and 2 is the depth
+        this kernel shipped with before the 3-stage bump, so nothing exotic is
+        being asked of the mainloop.
+        """
+        limit = cls.MAX_NUM_STAGES if max_stages is None else max_stages
+        capacity = cls._smem_capacity_in_bytes()
+        for stages in range(limit, cls.MIN_NUM_STAGES - 1, -1):
+            need = cls.smem_bytes(
+                head_dim=head_dim,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                num_stages=stages,
+            )
+            if need <= capacity:
+                return stages
+        return 0
 
     @classmethod
     def can_implement(
@@ -190,7 +333,7 @@ class FmhaSm80(FmhaBase):
         m_block_size: int = 64,
         n_block_size: int = 64,
         num_threads: int = 128,
-        num_stages: int = 3,
+        num_stages: Optional[int] = None,
         has_bias: bool = False,
         paged: bool = False,
         block_size: int = 0,
@@ -199,6 +342,7 @@ class FmhaSm80(FmhaBase):
         window_size_right: int = -1,
         varlen: bool = False,
         bias_aligned: bool = False,
+        has_seqstart: bool = False,
         **_kwargs,
     ) -> bool:
         if dtype != cutlass.Float16 and dtype != cutlass.BFloat16:
@@ -209,7 +353,7 @@ class FmhaSm80(FmhaBase):
             return False
         if (m_block_size * 2) % num_threads != 0:
             return False
-        if num_stages < 1:
+        if num_stages is not None and num_stages < 1:
             return False
         if paged:
             if block_size <= 0:
@@ -229,20 +373,40 @@ class FmhaSm80(FmhaBase):
                 return False
         if causal and window_size_right == -1:
             window_size_right = 0  # causal implies right-window 0
-        # Smem budget: sQ + num_stages * (sK + sV). Bias (when has_bias) is
-        # gmem-direct, not staged through smem.
-        del has_bias  # not part of the smem budget
+        del has_seqstart  # a mask predicate; costs no shared memory
+        del has_bias  # gmem-direct; not part of the smem budget
         del causal
         del window_size_left
         del window_size_right
         del varlen
-        smem_bytes = (
-            m_block_size * head_dim
-            + n_block_size * head_dim * num_stages * 2  # num_stages * (sK + sV)
-        ) * 2  # fp16/bf16 = 2B
-        if smem_bytes > cls._smem_capacity_in_bytes():
-            return False
-        return True
+        # Smem budget.  With ``num_stages`` unpinned this asks whether *any*
+        # ring depth fits, because the compile path picks the depth the same
+        # way (:meth:`select_num_stages`).  Answering "no" for a shape that
+        # merely needs a shallower ring is what stranded head_dim 128 on
+        # sm_120 — and it stranded it silently, since the caller sees only a
+        # boolean.
+        if num_stages is None:
+            # Ask the same question the compile path asks: is there *any*
+            # (n_block, ring depth) that fits?  Checking only the requested
+            # n_block would refuse a wide head that merely needs a narrower
+            # K tile.
+            return (
+                cls.select_tile(
+                    head_dim=head_dim,
+                    m_block_size=m_block_size,
+                    n_block_size=n_block_size,
+                    paged=paged,
+                    block_size=block_size,
+                )[1]
+                > 0
+            )
+        need = cls.smem_bytes(
+            head_dim=head_dim,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+            num_stages=num_stages,
+        )
+        return need <= cls._smem_capacity_in_bytes()
 
     # ------------------------------------------------------------------------
     # Host launcher
@@ -256,6 +420,7 @@ class FmhaSm80(FmhaBase):
         mO: cute.Tensor,
         mBias: cute.Tensor,
         mCacheSeqlens: cute.Tensor,
+        mCacheSeqStarts: cute.Tensor,
         mBlockTable: cute.Tensor,
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
@@ -362,6 +527,7 @@ class FmhaSm80(FmhaBase):
             mO,
             mBias,
             mCacheSeqlens,
+            mCacheSeqStarts,
             mBlockTable,
             softmax_scale,
             softmax_scale_log2,
@@ -391,6 +557,7 @@ class FmhaSm80(FmhaBase):
         mO: cute.Tensor,
         mBias: cute.Tensor,
         mCacheSeqlens: cute.Tensor,
+        mCacheSeqStarts: cute.Tensor,
         mBlockTable: cute.Tensor,
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
@@ -431,7 +598,58 @@ class FmhaSm80(FmhaBase):
         # offline mode; the streaming engine never dispatches empty streams,
         # and paged mode would have an undefined block_table for them).
         seqlen_k = mCacheSeqlens[batch_size]
+        # Left padding: keys below this index are pad.  Zero when the caller
+        # passed no starts (the wrapper hands over a dummy in that case), so the
+        # mask predicate compiles out entirely.
+        seqstart_k = cutlass.Int32(0)
+        if cutlass.const_expr(self._has_seqstart):
+            seqstart_k = mCacheSeqStarts[batch_size]
         n_block_max = cute.ceil_div(seqlen_k, self._n_block_size)
+
+        # Tier 1B: for causal attention, also bound the loop by this CTA's
+        # diagonal.  Row block ``m_block`` covers q rows
+        # ``[m_block*M, (m_block+1)*M)``, and causal masks ``k_col > q_row``, so
+        # every K block past ``ceil_div((m_block+1)*M, N)`` is entirely -inf.
+        # Without this the mask is still *correct* -- it is applied per element
+        # -- but every row block scans all of K, which is why plumbing a causal
+        # flag through on its own measured 1.4-4.8x SLOWER than SDPA: SDPA's
+        # flash path skips those blocks and this one did not.  Halving the
+        # average work is the whole point of a causal kernel.
+        if cutlass.const_expr(self._causal):
+            n_block_causal = cute.ceil_div((m_block + 1) * self._m_block_size, self._n_block_size)
+            if n_block_causal < n_block_max:
+                n_block_max = n_block_causal
+
+        # ...and bound it from *below* by whatever masks the low columns, for the
+        # same reason.  Upstream FlashAttention's ``BlockInfo.get_n_block_min_max``
+        # computes both ends; this kernel only had the upper one, so a left-padded
+        # batch loaded, MMA'd and then -inf-masked every block below its start --
+        # exactly the waste that made unbounded causal slower than SDPA.
+        #
+        # FA expresses a per-row key start as a tensor *offset* instead
+        # (``SeqlenInfo.offset_k`` / ``PagedKV.leftpad_k``), so it needs no start
+        # predicate at all.  That is the better answer where it applies, but it
+        # relies on FA's **bottom-right** causal alignment: shifting K also shifts
+        # the diagonal consistently.  This kernel is top-left aligned to match
+        # ``torch``'s ``is_causal`` (which is what every parity test here compares
+        # against), and under that convention a K-only offset would move the
+        # diagonal out from under the mask.  Bounding the loop keeps the
+        # convention and recovers the block-level work.
+        n_block_min = cutlass.Int32(0)
+        if cutlass.const_expr(self._has_seqstart):
+            n_block_min = seqstart_k // self._n_block_size
+        if cutlass.const_expr(self._window_size_left >= 0):
+            left_col = m_block * self._m_block_size - self._window_size_left
+            n_block_min = cutlass.max(n_block_min, left_col // self._n_block_size)
+        # Leave at least one block: a work-free CTA is safe here (acc_O is zeroed
+        # and the softmax epilogue clamps a zero row_sum), but the mainloop below
+        # runs its first block unconditionally, so clamping is what keeps the
+        # cp.async prologue and its barriers on one code path.  A fully-masked
+        # block costs one iteration and returns zeros via the empty-row clamp.
+        if n_block_min > n_block_max - 1:
+            n_block_min = n_block_max - 1
+        if n_block_min < 0:
+            n_block_min = cutlass.Int32(0)
 
         # ---- Gmem tiles ------------------------------------------------------
         gQ = cute.local_tile(
@@ -643,7 +861,7 @@ class FmhaSm80(FmhaBase):
         for stage in cutlass.range_constexpr(self._num_stages):
             # K: stage 0 already loaded above in the q_in_regs path.
             if cutlass.const_expr(not self._q_in_regs) or stage > 0:
-                if stage == 0 or n_block_init - stage >= 0:
+                if stage == 0 or n_block_init - stage >= n_block_min:
                     self._load_kv_tile(
                         mK,
                         sK,
@@ -664,7 +882,7 @@ class FmhaSm80(FmhaBase):
             # V: load num_stages - 1 V stages here; the last V stage is
             # loaded by iter 0's body.
             if cutlass.const_expr(stage < self._num_stages - 1):
-                if stage == 0 or n_block_init - stage >= 0:
+                if stage == 0 or n_block_init - stage >= n_block_min:
                     self._load_kv_tile(
                         mV,
                         sV,
@@ -700,6 +918,7 @@ class FmhaSm80(FmhaBase):
             window_right=self._window_size_right,
             has_seqlen_k=True,
             has_seqlen_q=True,
+            has_seqstart_k=self._has_seqstart,
         )
         seqlen_q = mQ.shape[2]
         inv_scale = 1.0 / softmax_scale
@@ -750,9 +969,11 @@ class FmhaSm80(FmhaBase):
             t_kv_logical=t_kv_logical,
             seqlen_q=seqlen_q,
             seqlen_k=seqlen_k,
+            seqstart_k=seqstart_k,
             inv_scale=inv_scale,
             m_block=m_block,
             n_block=n_block_init,
+            n_block_min=n_block_min,
             smem_pipe_read=smem_pipe_read,
             smem_pipe_write=smem_pipe_write,
             is_first=True,
@@ -760,7 +981,7 @@ class FmhaSm80(FmhaBase):
         smem_pipe_read = self._advance_pipeline(smem_pipe_read)
         smem_pipe_write = self._advance_pipeline(smem_pipe_write)
 
-        for n_tile in range(1, n_block_max, 1):
+        for n_tile in range(1, n_block_max - n_block_min, 1):
             n_block_cur = n_block_max - n_tile - 1
             self._compute_one_n_block(
                 mQ,
@@ -801,9 +1022,11 @@ class FmhaSm80(FmhaBase):
                 t_kv_logical=t_kv_logical,
                 seqlen_q=seqlen_q,
                 seqlen_k=seqlen_k,
+                seqstart_k=seqstart_k,
                 inv_scale=inv_scale,
                 m_block=m_block,
                 n_block=n_block_cur,
+                n_block_min=n_block_min,
                 smem_pipe_read=smem_pipe_read,
                 smem_pipe_write=smem_pipe_write,
                 is_first=False,
@@ -1084,7 +1307,23 @@ class FmhaSm80(FmhaBase):
             mBlockTable = None
             batch_size = cutlass.Int32(0)
             t_kv_logical = seqlen_k
+            # Varlen exposes neither a key start nor a window, so its low blocks
+            # are never fully masked and the loop's lower bound stays 0.
+            seqstart_k = cutlass.Int32(0)
+            n_block_min = cutlass.Int32(0)
             n_block_max = cute.ceil_div(seqlen_k, self._n_block_size)
+
+            # Tier 1B, mirroring the dense mainloop (see there for the
+            # rationale).  Inert today: ``fmha_varlen`` exposes no ``causal``
+            # argument, so ``self._causal`` is always False on this path and the
+            # branch never traces.  Kept so the two mainloops do not silently
+            # diverge the day packed causal attention is wanted.
+            if cutlass.const_expr(self._causal):
+                n_block_causal = cute.ceil_div(
+                    (m_block + 1) * self._m_block_size, self._n_block_size
+                )
+                if n_block_causal < n_block_max:
+                    n_block_max = n_block_causal
 
             gQ = cute.local_tile(
                 mQ[batch_size, num_head, None, None],
@@ -1287,6 +1526,7 @@ class FmhaSm80(FmhaBase):
                 window_right=self._window_size_right,
                 has_seqlen_k=True,
                 has_seqlen_q=True,
+                has_seqstart_k=self._has_seqstart,
             )
             inv_scale = 1.0 / softmax_scale
 
@@ -1332,9 +1572,11 @@ class FmhaSm80(FmhaBase):
                 t_kv_logical=t_kv_logical,
                 seqlen_q=seqlen_q,
                 seqlen_k=seqlen_k,
+                seqstart_k=seqstart_k,
                 inv_scale=inv_scale,
                 m_block=m_block,
                 n_block=n_block_init,
+                n_block_min=n_block_min,
                 smem_pipe_read=smem_pipe_read,
                 smem_pipe_write=smem_pipe_write,
                 is_first=True,
@@ -1383,9 +1625,11 @@ class FmhaSm80(FmhaBase):
                     t_kv_logical=t_kv_logical,
                     seqlen_q=seqlen_q,
                     seqlen_k=seqlen_k,
+                    seqstart_k=seqstart_k,
                     inv_scale=inv_scale,
                     m_block=m_block,
                     n_block=n_block_cur,
+                    n_block_min=n_block_min,
                     smem_pipe_read=smem_pipe_read,
                     smem_pipe_write=smem_pipe_write,
                     is_first=False,
@@ -1495,9 +1739,11 @@ class FmhaSm80(FmhaBase):
         t_kv_logical: cutlass.Int32,
         seqlen_q: cutlass.Int32,
         seqlen_k: cutlass.Int32,
+        seqstart_k: cutlass.Int32,
         inv_scale: cutlass.Float32,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
+        n_block_min: cutlass.Int32,
         smem_pipe_read: cutlass.Int32,
         smem_pipe_write: cutlass.Int32,
         is_first: cutlass.Constexpr,
@@ -1531,7 +1777,9 @@ class FmhaSm80(FmhaBase):
         # This V is consumed `num_stages - 1` iters from now; the lead lets
         # the cp.async overlap with the QK gemm below + the subsequent
         # softmax. Skipped when the look-ahead would go past block 0.
-        if cutlass.const_expr(self._num_stages == 1) or (n_block - self._num_stages + 1 >= 0):
+        if cutlass.const_expr(self._num_stages == 1) or (
+            n_block - self._num_stages + 1 >= n_block_min
+        ):
             n_block_v_next = (
                 n_block
                 if cutlass.const_expr(self._num_stages == 1)
@@ -1592,7 +1840,7 @@ class FmhaSm80(FmhaBase):
         if cutlass.const_expr(self._num_stages == 1):
             cute.arch.cp_async_wait_group(wait_count)
             self.cta_sync_barrier.arrive_and_wait()
-            if n_block - 1 >= 0:
+            if n_block - 1 >= n_block_min:
                 self._load_kv_tile(
                     mK,
                     sK,
@@ -1632,7 +1880,7 @@ class FmhaSm80(FmhaBase):
             (m_block, n_block),
         )
         tScS = thr_mma.partition_C(cS)
-        mask.apply(acc_S, tScS, seqlen_q=seqlen_q, seqlen_k=seqlen_k)
+        mask.apply(acc_S, tScS, seqlen_q=seqlen_q, seqlen_k=seqlen_k, seqstart_k=seqstart_k)
         softmax.online_softmax(acc_S, acc_O, is_first=is_first)
 
         rP = cute.make_fragment_like(acc_S, self._dtype)
@@ -1658,7 +1906,7 @@ class FmhaSm80(FmhaBase):
         if cutlass.const_expr(self._num_stages > 1):
             cute.arch.cp_async_wait_group(wait_count)
             self.cta_sync_barrier.arrive_and_wait()
-            if n_block - self._num_stages >= 0:
+            if n_block - self._num_stages >= n_block_min:
                 self._load_kv_tile(
                     mK,
                     sK,

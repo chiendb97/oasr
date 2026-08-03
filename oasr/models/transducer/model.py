@@ -20,7 +20,13 @@ from typing import Any, List, Mapping, Optional
 
 import torch
 
-from ..base import BaseAsrModel, BaseEncoder, LoadReport
+from ..base import (
+    BaseAsrModel,
+    BaseEncoder,
+    LoadReport,
+    align_out_features,
+    pad_output_projection,
+)
 from ..decoders.base import BaseDecoder, Joiner
 from .config import TransducerModelConfig
 from .decoder import StatelessDecoder
@@ -61,6 +67,9 @@ class TransducerModel(BaseAsrModel):
         self.decoder = decoder  # stateless predictor; carries decode_type
         self.joiner = joiner
         self._blank_id = blank_id
+        # Aligned width of the joiner's vocabulary head, so ``load_weights``
+        # can widen a checkpoint without reaching through the ``Joiner`` ABC.
+        self._joiner_out = align_out_features(int(getattr(joiner, "vocab_size", 0)))
 
     @property
     def blank_id(self) -> int:
@@ -142,6 +151,9 @@ class TransducerModel(BaseAsrModel):
             else:
                 dropped.append(k)
 
+        # The joiner's vocabulary head is allocated GEMM-aligned; widen the
+        # checkpoint's rows to match (no-op if already padded).
+        pad_output_projection(remapped, "joiner.output_linear.", self._joiner_out)
         missing, unexpected = self.load_state_dict(remapped, strict=strict)
         expected_missing_suffixes = self._computed_buffer_suffixes
         real_missing = [

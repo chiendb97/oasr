@@ -14,7 +14,7 @@ The base class only defines the contract. The dispatcher in
 
 from __future__ import annotations
 
-from typing import Any, Type
+from typing import Any, Optional, Tuple, Type
 
 # CuteDSL imports are deferred so this module can be imported on machines
 # without a working CuteDSL install (e.g., for documentation builds).
@@ -82,7 +82,20 @@ class FmhaBase:
         window_size_left: int = -1,
         window_size_right: int = -1,
         varlen: bool = False,
+        m_block_size: int = 64,
+        n_block_size: int = 64,
+        num_threads: int = 128,
+        num_stages: Optional[int] = None,
+        bias_aligned: bool = False,
+        has_seqstart: bool = False,
+        **kwargs: Any,
     ):
+        # The CTA tile, the cp.async ring depth, the bias-load path and the
+        # per-row key-start mask are per-arch choices, but they are set by the
+        # *caller* (``oasr.jit.attention`` builds the class it was handed), so
+        # they belong in the shared signature rather than only in a subclass's.
+        del m_block_size, n_block_size, num_threads, num_stages
+        del bias_aligned, has_seqstart, kwargs
         if num_heads % num_kv_heads != 0:
             raise ValueError(
                 f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
@@ -145,6 +158,18 @@ class FmhaBase:
 
         Must be overridden. Should check head_dim divisibility, smem capacity,
         thread count constraints, and any arch-specific feature gates.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def select_tile(cls, **kwargs) -> Tuple[int, int]:
+        """Resolve ``(n_block, num_stages)`` for a shape, or ``(0, 0)``.
+
+        Must be overridden.  A head_dim too wide for the requested K tile is a
+        *tile* question, not a capability one: the arch knows its own shared
+        memory budget, so it narrows the tile (and shortens the cp.async ring)
+        rather than refusing.  ``(0, 0)`` means nothing fits and the caller
+        should treat the config as unsupported.
         """
         raise NotImplementedError
 

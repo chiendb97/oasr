@@ -18,6 +18,9 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
+from oasr.layers import Embedding, FeedForward, LayerNorm, Linear
+from oasr.models.base import align_out_features
+
 from .config import ParaformerModelConfig
 from .modules import LAYER_NORM_EPS, DecoderFeedForward, FsmnBlock, SanmCrossAttention
 
@@ -32,24 +35,24 @@ class DecoderLayerSANM(nn.Module):
         size: int,
         self_attn: Optional[FsmnBlock],
         src_attn: Optional[SanmCrossAttention],
-        feed_forward: DecoderFeedForward,
+        feed_forward: FeedForward,
     ) -> None:
         super().__init__()
         self.self_attn = self_attn
         self.src_attn = src_attn
         self.feed_forward = feed_forward
-        self.norm1 = nn.LayerNorm(size, eps=LAYER_NORM_EPS)
+        self.norm1 = LayerNorm(size, eps=LAYER_NORM_EPS)
         if self_attn is not None:
-            self.norm2 = nn.LayerNorm(size, eps=LAYER_NORM_EPS)
+            self.norm2 = LayerNorm(size, eps=LAYER_NORM_EPS)
         if src_attn is not None:
-            self.norm3 = nn.LayerNorm(size, eps=LAYER_NORM_EPS)
+            self.norm3 = LayerNorm(size, eps=LAYER_NORM_EPS)
 
     def forward(
         self,
         tgt: torch.Tensor,
         tgt_mask: torch.Tensor,
         memory: torch.Tensor,
-        memory_mask: torch.Tensor,
+        memory_lens: torch.Tensor,
     ) -> torch.Tensor:
         residual = tgt
         tgt = self.norm1(tgt)
@@ -64,7 +67,7 @@ class DecoderLayerSANM(nn.Module):
         if self.src_attn is not None:
             residual = x
             x = self.norm3(x)
-            x = residual + self.src_attn(x, memory, memory_mask)
+            x = residual + self.src_attn(x, memory, memory_lens)
 
         return x
 
@@ -78,7 +81,7 @@ class ParaformerSANMDecoder(nn.Module):
     def __init__(self, config: ParaformerModelConfig) -> None:
         super().__init__()
         d = config.encoder_output_size
-        self.embed = nn.Sequential(nn.Embedding(config.vocab_size, d))
+        self.embed = nn.Sequential(Embedding(config.vocab_size, d))
         self.decoders = nn.ModuleList(
             [
                 DecoderLayerSANM(
@@ -93,8 +96,16 @@ class ParaformerSANMDecoder(nn.Module):
         self.decoders3 = nn.ModuleList(
             [DecoderLayerSANM(d, None, None, DecoderFeedForward(d, config.decoder_linear_units))]
         )
-        self.after_norm = nn.LayerNorm(d, eps=LAYER_NORM_EPS)
-        self.output_layer = nn.Linear(d, config.vocab_size)
+        self.after_norm = LayerNorm(d, eps=LAYER_NORM_EPS)
+        # The vocabulary head is widened to what the GEMM kernels can address
+        # (8404 -> 8408 for paraformer-zh).  ``config.vocab_size`` stays the
+        # true vocabulary — the tokenizer and the sos/eos ids are defined
+        # against it — and ``ParaformerModel.load_weights`` pads the checkpoint
+        # rows to match, giving the padding classes a bias far below any real
+        # logit.  Without this the head is the one projection in the model that
+        # can never reach a kernel.
+        self.vocab_size = config.vocab_size
+        self.output_layer = Linear(d, align_out_features(config.vocab_size))
 
     def forward(
         self,
@@ -105,23 +116,20 @@ class ParaformerSANMDecoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """One parallel NAR pass → ``(log_probs (B, U, V), token_lens)``."""
         B, U, _ = acoustic_embeds.shape
-        T = memory.size(1)
         device = memory.device
         tgt_mask = (
             (torch.arange(U, device=device).unsqueeze(0) < token_lens.to(device).unsqueeze(1))
             .unsqueeze(-1)
             .to(acoustic_embeds.dtype)
-        )  # (B, U, 1)
-        memory_mask = (
-            (torch.arange(T, device=device).unsqueeze(0) < memory_lens.to(device).unsqueeze(1))
-            .unsqueeze(1)
-            .to(memory.dtype)
-        )  # (B, 1, T)
+        )  # (B, U, 1) — multiplicative, consumed by the FSMN branch
+        memory_lens = memory_lens.to(device)
 
         x = acoustic_embeds
         for layer in self.decoders:
-            x = layer(x, tgt_mask, memory, memory_mask)
-        x = self.decoders3[0](x, tgt_mask, memory, memory_mask)
+            x = layer(x, tgt_mask, memory, memory_lens)
+        x = self.decoders3[0](x, tgt_mask, memory, memory_lens)
         x = self.after_norm(x)
-        logits = self.output_layer(x)
+        # Drop the alignment padding before the softmax so the returned width is
+        # the true vocabulary and the normalizer is exactly the unpadded one.
+        logits = self.output_layer(x)[..., : self.vocab_size]
         return torch.log_softmax(logits, dim=-1), token_lens

@@ -17,7 +17,12 @@ from typing import Any, Mapping, Tuple
 
 import torch
 
-from oasr.models.base import BaseAsrModel, LoadReport
+from oasr.models.base import (
+    BaseAsrModel,
+    LoadReport,
+    align_out_features,
+    pad_output_projection,
+)
 
 from .config import ParaformerModelConfig
 from .decoder import ParaformerSANMDecoder
@@ -66,6 +71,13 @@ class ParaformerModel(BaseAsrModel):
                 sd[k] = v
             else:
                 dropped.append(k)
+        # The vocabulary head and the CIF alpha head are allocated GEMM-aligned;
+        # widen the checkpoint's rows to match (no-op for a native bundle
+        # already saved padded).
+        pad_output_projection(
+            sd, "decoder.output_layer.", align_out_features(self.config.vocab_size)
+        )
+        pad_output_projection(sd, "predictor.cif_output.", align_out_features(1))
         missing, unexpected = self.load_state_dict(sd, strict=strict)
         if unexpected:
             logger.warning("Unexpected keys in Paraformer checkpoint: %s", unexpected[:8])

@@ -16,8 +16,10 @@ Module/parameter names mirror the WeNet checkpoint layout exactly
 :class:`BiTransformerDecoder` composes a left-to-right decoder with an optional
 right-to-left branch (``r_num_blocks > 0``) for the U2++ reverse-scoring pass.
 
-Attention uses ``F.scaled_dot_product_attention`` with boolean masks — the math
-matches WeNet's explicit softmax/masked_fill within fp tolerance (verified by
+Projections, norms, the embedding and the FFN go through ``oasr.layers`` (the
+waist); attention runs on :class:`oasr.layers.Attention`, which picks the fused
+kernel or SDPA per mask shape.  The math matches WeNet's explicit
+softmax/masked_fill within fp tolerance (verified by
 ``tests/test_transformer_decoder.py`` against the upstream reference).
 """
 
@@ -28,8 +30,19 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
+
+from oasr.layers import (
+    TORCH_EPS,
+    Attention,
+    ColumnParallelLinear,
+    Embedding,
+    FeedForward,
+    LayerNorm,
+    Linear,
+    RowParallelLinear,
+)
+from oasr.models.base import align_out_features, init_pad_rows
 
 from .base import BaseDecoder, DecoderState
 
@@ -168,46 +181,43 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 
 class _DecoderAttention(nn.Module):
-    """Multi-head attention with WeNet parameter names (``linear_q/k/v/out``)."""
+    """Multi-head attention with WeNet parameter names (``linear_q/k/v/out``).
+
+    Projections keep the checkpoint's names; the compute is the shared
+    :class:`oasr.layers.Attention`.
+    """
 
     def __init__(self, n_head: int, d_model: int) -> None:
         super().__init__()
         assert d_model % n_head == 0, f"d_model={d_model} not divisible by heads={n_head}"
         self.h = n_head
         self.d_k = d_model // n_head
-        self.linear_q = nn.Linear(d_model, d_model)
-        self.linear_k = nn.Linear(d_model, d_model)
-        self.linear_v = nn.Linear(d_model, d_model)
-        self.linear_out = nn.Linear(d_model, d_model)
+        self.linear_q = ColumnParallelLinear(d_model, d_model)
+        self.linear_k = ColumnParallelLinear(d_model, d_model)
+        self.linear_v = ColumnParallelLinear(d_model, d_model)
+        self.linear_out = RowParallelLinear(d_model, d_model)
+        self.attn = Attention(n_head, self.d_k)
 
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        mask: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor] = None,
+        kv_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """``mask``: bool ``(B, L_q or 1, L_k)`` — True = attend; None = full."""
-        B = query.size(0)
-        q = self.linear_q(query).view(B, -1, self.h, self.d_k).transpose(1, 2)
-        k = self.linear_k(key).view(B, -1, self.h, self.d_k).transpose(1, 2)
-        v = self.linear_v(value).view(B, -1, self.h, self.d_k).transpose(1, 2)
+        """``mask``: bool ``(B, L_q or 1, L_k)`` — True = attend; None = full.
+
+        ``kv_lens`` ``(B,)`` says the same thing for the cross-attention case
+        (keys ``[0, len)`` valid) in the form the fused kernel can enforce
+        without a materialized mask, so pass that instead where it applies.
+        """
+        q = self.attn.split_heads(self.linear_q(query))
+        k = self.attn.split_kv_heads(self.linear_k(key))
+        v = self.attn.split_kv_heads(self.linear_v(value))
         attn_mask = mask.unsqueeze(1) if mask is not None else None  # (B, 1, L_q, L_k)
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        x = x.transpose(1, 2).contiguous().view(B, -1, self.h * self.d_k)
-        return self.linear_out(x)
-
-
-class _PositionwiseFeedForward(nn.Module):
-    """WeNet ``PositionwiseFeedForward`` (ReLU) with ``w_1`` / ``w_2`` names."""
-
-    def __init__(self, d_model: int, hidden: int) -> None:
-        super().__init__()
-        self.w_1 = nn.Linear(d_model, hidden)
-        self.w_2 = nn.Linear(hidden, d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w_2(F.relu(self.w_1(x)))
+        x = self.attn(q, k, v, attn_mask=attn_mask, kv_lens=kv_lens)
+        return self.linear_out(self.attn.merge_heads(x))
 
 
 class DecoderLayer(nn.Module):
@@ -217,24 +227,28 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = _DecoderAttention(n_head, d_model)
         self.src_attn = _DecoderAttention(n_head, d_model)
-        self.feed_forward = _PositionwiseFeedForward(d_model, linear_units)
-        self.norm1 = nn.LayerNorm(d_model, eps=1e-5)
-        self.norm2 = nn.LayerNorm(d_model, eps=1e-5)
-        self.norm3 = nn.LayerNorm(d_model, eps=1e-5)
+        # WeNet's ``PositionwiseFeedForward``: w_1 → ReLU → w_2.  The names are
+        # the checkpoint's; ReLU folds into the GEMM epilogue on the CUDA path.
+        self.feed_forward = FeedForward(
+            d_model, linear_units, activation="relu", names=("w_1", "w_2")
+        )
+        self.norm1 = LayerNorm(d_model, eps=TORCH_EPS)
+        self.norm2 = LayerNorm(d_model, eps=TORCH_EPS)
+        self.norm3 = LayerNorm(d_model, eps=TORCH_EPS)
 
     def forward(
         self,
         x: torch.Tensor,
         tgt_mask: Optional[torch.Tensor],
         memory: torch.Tensor,
-        memory_mask: Optional[torch.Tensor],
+        memory_lens: Optional[torch.Tensor],
     ) -> torch.Tensor:
         residual = x
         x = self.norm1(x)
         x = residual + self.self_attn(x, x, x, tgt_mask)
         residual = x
         x = self.norm2(x)
-        x = residual + self.src_attn(x, memory, memory, memory_mask)
+        x = residual + self.src_attn(x, memory, memory, kv_lens=memory_lens)
         residual = x
         x = self.norm3(x)
         return residual + self.feed_forward(x)
@@ -259,7 +273,7 @@ class TransformerDecoder(nn.Module):
         # nn.Sequential only for the checkpoint key layout (``embed.0.weight``);
         # forward() indexes the parts explicitly.
         self.embed = nn.Sequential(
-            nn.Embedding(config.vocab_size, d_model),
+            Embedding(config.vocab_size, d_model),
             SinusoidalPositionalEncoding(d_model),
         )
         self.decoders = nn.ModuleList(
@@ -268,8 +282,16 @@ class TransformerDecoder(nn.Module):
                 for _ in range(blocks)
             ]
         )
-        self.after_norm = nn.LayerNorm(d_model, eps=1e-5)
-        self.output_layer = nn.Linear(d_model, config.vocab_size)
+        self.after_norm = LayerNorm(d_model, eps=TORCH_EPS)
+        # Allocated at an aligned width, like every other output projection in
+        # the tree (Paraformer's 8404 head, the transducer joiner's 500): the
+        # CUTLASS alignment-8 iterators cannot address a raw vocabulary such as
+        # U2++'s 5002, and padding here — with the checkpoint widened on load —
+        # is what puts it on a kernel instead of stranding it.  Padding classes
+        # get a PAD_LOGIT bias so they can never win an argmax, and contribute
+        # ~0 to a softmax denominator, so rescoring scores are unchanged.
+        self.output_layer = Linear(d_model, align_out_features(config.vocab_size))
+        init_pad_rows(self.output_layer, config.vocab_size)
 
     def forward(
         self,
@@ -299,14 +321,11 @@ class TransformerDecoder(nn.Module):
         tgt_mask = (pos.unsqueeze(0) <= pos.unsqueeze(1)).unsqueeze(0) & (
             pos.unsqueeze(0) < ys_in_lens.to(device).unsqueeze(1)
         ).unsqueeze(1)
-        t_enc = torch.arange(memory.size(1), device=device)
-        memory_mask = (t_enc.unsqueeze(0) < memory_lens.to(device).unsqueeze(1)).unsqueeze(
-            1
-        )  # (B, 1, T_enc)
+        memory_lens = memory_lens.to(device)
 
         x = self.embed[1](self.embed[0](ys_in_pad))
         for layer in self.decoders:
-            x = layer(x, tgt_mask, memory, memory_mask)
+            x = layer(x, tgt_mask, memory, memory_lens)
         x = self.after_norm(x)
         return self.output_layer(x)
 
@@ -327,8 +346,7 @@ class TransformerDecoder(nn.Module):
         integration).
         """
         device = tokens.device
-        t_enc = torch.arange(memory.size(1), device=device)
-        memory_mask = (t_enc.unsqueeze(0) < memory_lens.to(device).unsqueeze(1)).unsqueeze(1)
+        memory_lens = memory_lens.to(device)
 
         x = self.embed[1](self.embed[0](tokens.unsqueeze(1)), offset=offset)  # (B, 1, D)
         new_caches = []
@@ -341,7 +359,7 @@ class TransformerDecoder(nn.Module):
             x = residual + layer.self_attn(q, kv, kv, None)
             residual = x
             x = layer.norm2(x)
-            x = residual + layer.src_attn(x, memory, memory, memory_mask)
+            x = residual + layer.src_attn(x, memory, memory, kv_lens=memory_lens)
             residual = x
             x = layer.norm3(x)
             x = residual + layer.feed_forward(x)

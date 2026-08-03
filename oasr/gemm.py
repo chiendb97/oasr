@@ -7,7 +7,13 @@ from typing import Optional
 
 import torch
 
+# Module-attribute indirection, not ``from ... import``: the per-call
+# ``from oasr.jit.gemm import select_default_config`` cost ~0.3 us of importlib
+# machinery, but binding the name locally would also break monkeypatching of
+# the heuristic at its source, which the dispatch tests rely on.
+import oasr.jit.gemm as _jit_gemm
 from oasr.api_logging import oasr_api
+from oasr.tune import is_tuning_enabled
 
 
 @functools.cache
@@ -69,6 +75,16 @@ def _target_sm() -> int:
     return _get_target_sm()
 
 
+def _gemm_io(A: torch.Tensor, N: int, out: Optional[torch.Tensor]):
+    """``(A, out)`` → ``(A_contig, out, M)``.  No reshaping: the launcher flattens."""
+    if not A.is_contiguous():
+        A = A.contiguous()
+    if out is None:
+        shape = A.shape
+        out = A.new_empty(shape[0], N) if len(shape) == 2 else A.new_empty(*shape[:-1], N)
+    return A, out, A.numel() // A.shape[-1]
+
+
 @functools.cache
 def _gemm_fn(compile_name: str, activation: bool):
     """Resolve a compiled GEMM variant by ``compile_name`` (cached → a stable
@@ -77,47 +93,45 @@ def _gemm_fn(compile_name: str, activation: bool):
     return getattr(_get_gemm_module(), f"gemm_{compile_name}{suffix}")
 
 
-def _dispatch_gemm(out2d, A2d, B, C, N, K) -> None:
+def _dispatch_gemm(out, A, B, C, N, K, M) -> None:
     """Shape-aware non-tuning dispatch for ``gemm``.
 
     Picks a per-shape config via the heuristic rules (CUTLASS variant or torch/
     cuBLAS); any failure falls through to the fixed ``GEMM_DEFAULT`` so a bad rule
     can never break inference.
+
+    ``A``/``out`` arrive N-D — the CUTLASS launchers flatten internally.  Only
+    the cuBLAS escape needs 2-D views, and it is the rare branch (5 of 27 rules),
+    so it pays for its own reshapes.
     """
     try:
-        from oasr.jit.gemm import select_default_config
-
-        choice = select_default_config("gemm", A2d.shape[0], N, K, A2d.dtype, _target_sm())
+        choice = _jit_gemm.select_default_config("gemm", M, N, K, A.dtype, _target_sm())
         if choice == "torch":
             from oasr.gemm_torch import torch_gemm
 
-            torch_gemm(out2d, A2d, B, C, 1)
+            torch_gemm(out.reshape(M, N), A.reshape(M, K), B, C, 1)
         else:
-            _gemm_fn(choice.compile_name, False)(out2d, A2d, B, C, choice.split_k)
+            _gemm_fn(choice.compile_name, False)(out, A, B, C, choice.split_k)
         return
     except Exception:
         pass
-    _default_gemm_fn()(out2d, A2d, B, C, 1)
+    _default_gemm_fn()(out, A, B, C, 1)
 
 
-def _dispatch_gemm_activation(out2d, A2d, B, C, activation_type, N, K) -> None:
+def _dispatch_gemm_activation(out, A, B, C, activation_type, N, K, M) -> None:
     """Shape-aware non-tuning dispatch for ``gemm_activation`` (see ``_dispatch_gemm``)."""
     try:
-        from oasr.jit.gemm import select_default_config
-
-        choice = select_default_config(
-            "gemm_activation", A2d.shape[0], N, K, A2d.dtype, _target_sm()
-        )
+        choice = _jit_gemm.select_default_config("gemm_activation", M, N, K, A.dtype, _target_sm())
         if choice == "torch":
             from oasr.gemm_torch import torch_gemm_activation
 
-            torch_gemm_activation(out2d, A2d, B, C, activation_type, 1)
+            torch_gemm_activation(out.reshape(M, N), A.reshape(M, K), B, C, activation_type, 1)
         else:
-            _gemm_fn(choice.compile_name, True)(out2d, A2d, B, C, activation_type, choice.split_k)
+            _gemm_fn(choice.compile_name, True)(out, A, B, C, activation_type, choice.split_k)
         return
     except Exception:
         pass
-    _default_gemm_activation_fn()(out2d, A2d, B, C, activation_type, 1)
+    _default_gemm_activation_fn()(out, A, B, C, activation_type, 1)
 
 
 @functools.cache
@@ -135,9 +149,7 @@ def _dispatch_bmm(out, A, B, N, K) -> None:
     tile.  Any failure falls through to the fixed default.
     """
     try:
-        from oasr.jit.gemm import select_default_config
-
-        choice = select_default_config("bmm", A.shape[1], N, K, A.dtype, _target_sm())
+        choice = _jit_gemm.select_default_config("bmm", A.shape[1], N, K, A.dtype, _target_sm())
         if choice == "torch":
             from oasr.gemm_torch import torch_bmm
 
@@ -157,7 +169,7 @@ def _log_softmax_inplace(out2d) -> None:
     _get_softmax_module().log_softmax(out2d, out2d)
 
 
-def _dispatch_gemm_log_softmax(out2d, A2d, B, C, N, K) -> None:
+def _dispatch_gemm_log_softmax(out, A, B, C, N, K, M) -> None:
     """Shape-aware non-tuning dispatch for ``gemm_log_softmax`` (the CTC head).
 
     Choices (per the ``("gemm_log_softmax", N, K)`` rules):
@@ -169,36 +181,32 @@ def _dispatch_gemm_log_softmax(out2d, A2d, B, C, N, K) -> None:
         the fused path, but the GEMM tile is shape-selected).
 
     Falls back to the legacy fused launcher (the historical behaviour) when no
-    rule matches, and to torch when CUTLASS cannot run the shape at all
-    (N or K not 8-aligned, e.g. an unpadded vocab).
+    rule matches.
+
+    An unaligned ``N``/``K`` used to be quietly rerouted to cuBLAS here, which
+    made this the one GEMM entry point with a different contract from the rest
+    of the family — ``gemm`` failed on the same input.  The launchers now all
+    raise the same actionable error (``CHECK_GEMM_ALIGNMENT``), and the fix is
+    to pad the projection at the model layer, which every in-tree caller does.
     """
     try:
-        from oasr.jit.gemm import GEMM_DEFAULT, select_default_config
+        from oasr.jit.gemm import GEMM_DEFAULT
 
-        if N % 8 != 0 or K % 8 != 0:
-            # CUTLASS 2.x alignment-8 iterators reject these shapes (both the
-            # fused launcher and the composed variants) — torch is the only
-            # backend that can run them.
-            from oasr.gemm_torch import torch_gemm_log_softmax
-
-            torch_gemm_log_softmax(out2d, A2d, B, C, 1)
-            return
-
-        choice = select_default_config(
-            "gemm_log_softmax", A2d.shape[0], N, K, A2d.dtype, _target_sm()
-        )
+        choice = _jit_gemm.select_default_config("gemm_log_softmax", M, N, K, A.dtype, _target_sm())
         if choice == "torch":
             from oasr.gemm_torch import torch_gemm_log_softmax
 
-            torch_gemm_log_softmax(out2d, A2d, B, C, 1)
+            torch_gemm_log_softmax(out.reshape(M, N), A.reshape(M, K), B, C, 1)
             return
         if choice != "fused" and choice is not GEMM_DEFAULT:
-            _gemm_fn(choice.compile_name, False)(out2d, A2d, B, C, choice.split_k)
-            _log_softmax_inplace(out2d)
+            _gemm_fn(choice.compile_name, False)(out, A, B, C, choice.split_k)
+            # The online log_softmax kernel normalises the trailing dim, so it
+            # takes the N-D buffer as-is.
+            _log_softmax_inplace(out)
             return
     except Exception:
         pass
-    _get_gemm_log_softmax_module().gemm_log_softmax(out2d, A2d, B, C, 1)
+    _get_gemm_log_softmax_module().gemm_log_softmax(out, A, B, C, 1)
 
 
 @oasr_api
@@ -221,17 +229,12 @@ def gemm(
     """
     K = A.shape[-1]
     N = B.shape[0]
-    if out is None:
-        out_shape = list(A.shape[:-1]) + [N]
-        out = torch.empty(out_shape, device=A.device, dtype=A.dtype)
-
-    from oasr.tune import is_tuning_enabled
+    A, out, M = _gemm_io(A, N, out)
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner
         from oasr.tune.autotuner import OpKey
 
-        M = out.reshape(-1, N).shape[0]
         get_tuner().dispatch(
             op_key=OpKey("gemm", "gemm"),
             shape_sig=(M, N, K),
@@ -241,7 +244,7 @@ def gemm(
         )
         return out
 
-    _dispatch_gemm(out.reshape(-1, N), A.reshape(-1, K), B, C, N, K)
+    _dispatch_gemm(out, A, B, C, N, K, M)
     return out
 
 
@@ -350,17 +353,12 @@ def gemm_activation(
     """
     K = A.shape[-1]
     N = B.shape[0]
-    if out is None:
-        out_shape = list(A.shape[:-1]) + [N]
-        out = torch.empty(out_shape, device=A.device, dtype=A.dtype)
-
-    from oasr.tune import is_tuning_enabled
+    A, out, M = _gemm_io(A, N, out)
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner
         from oasr.tune.autotuner import OpKey
 
-        M = out.reshape(-1, N).shape[0]
         get_tuner().dispatch(
             op_key=OpKey("gemm", "gemm_activation"),
             shape_sig=(M, N, K),
@@ -370,7 +368,7 @@ def gemm_activation(
         )
         return out
 
-    _dispatch_gemm_activation(out.reshape(-1, N), A.reshape(-1, K), B, C, activation_type, N, K)
+    _dispatch_gemm_activation(out, A, B, C, activation_type, N, K, M)
     return out
 
 
@@ -397,17 +395,12 @@ def gemm_log_softmax(
     """
     K = A.shape[-1]
     N = B.shape[0]
-    if out is None:
-        out_shape = list(A.shape[:-1]) + [N]
-        out = torch.empty(out_shape, device=A.device, dtype=A.dtype)
-
-    from oasr.tune import is_tuning_enabled
+    A, out, M = _gemm_io(A, N, out)
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner
         from oasr.tune.autotuner import OpKey
 
-        M = out.reshape(-1, N).shape[0]
         get_tuner().dispatch(
             op_key=OpKey("gemm", "gemm_log_softmax"),
             shape_sig=(M, N, K),
@@ -417,5 +410,5 @@ def gemm_log_softmax(
         )
         return out
 
-    _dispatch_gemm_log_softmax(out.reshape(-1, N), A.reshape(-1, K), B, C, N, K)
+    _dispatch_gemm_log_softmax(out, A, B, C, N, K, M)
     return out

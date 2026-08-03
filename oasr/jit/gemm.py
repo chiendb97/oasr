@@ -877,6 +877,18 @@ else:
 # deep-K contract GEMMs split between torch and pk/Stream-K/serial-split-K
 # variants, and the CTC head leaves the fixed 16x128 fused tile above M=64
 # (up to 1.8x at offline M).
+#
+# **Coverage is per model width, and a miss is silent by construction.**  The key
+# is the exact ``(op, N, K)``, so a table tuned on one architecture says nothing
+# about another: until 2026-08-03 every entry came from a Conformer-CTC capture,
+# and Whisper's ``K=384`` therefore took ``GEMM_DEFAULT`` for every GEMM it
+# issues — up to **4.6x** off the best available backend at prefill M, with
+# nothing anywhere reporting that a shape had no rule.  Whisper-tiny is now
+# covered; ``whisper-{base,small,medium,large}`` (d_model 512/768/1024/1280),
+# Paraformer, the transducer joiner, Zipformer and Qwen2-Audio are not.  What
+# changed is that the fall-through is now *counted*: ``rule_miss_report()``
+# prints the untuned ``(op, N, K, M)`` a workload actually hit, which is both the
+# check that a model is covered and the shape list to hand the tuner.
 _GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
     ("gemm", 256, 256): [
         (
@@ -1031,6 +1043,109 @@ _GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
             ),
         ),  # M~15872: cutlass 0.2112ms (1.25x vs default)
     ],
+    # ---- whisper-tiny (HF), bf16, added 2026-08-03 -------------------------
+    # Three (N, K) pairs are all that reach this selector: d_model 384 gives the
+    # attention projections (384, 384) and the two feed-forward halves, and the
+    # ``fc1`` half is a plain ``gemm`` rather than ``gemm_activation`` because
+    # Whisper's GELU is exact-erf and deliberately unfused.  Nothing else clears
+    # ``GEMM_MIN_ROWS``: the AR decoder's per-step GEMMs are M=batch and the
+    # 51865-wide vocab head is not 8-aligned, so both are cuBLAS by policy.
+    #
+    # M here is not free-form.  A fixed 30 s window makes the encoder's M exactly
+    # ``1500 x batch``, and the only other shapes above the row floor are the
+    # B=32/64 prefills at M = 4 x batch — so the boundaries below sit between
+    # *measured* values (128, 256, 1500, 3000, 6000, 12000, 24000, 48000, 96000)
+    # and interpolate over nothing.  Timings are min-of-3 interleaved rounds
+    # against GEMM_DEFAULT and cuBLAS, RTX 5090 / SM120, locked clocks; the
+    # single-pass sweep alternated torch/cutlass at 1.02-1.08x across adjacent
+    # buckets, which is what a tie looks like when each arm is measured once.
+    ("gemm", 384, 384): [
+        (
+            2048,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=64,
+                block_k=64,
+                warp_m=32,
+                warp_n=32,
+                warp_k=64,
+                kStages=4,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M 128/256/1500: 8.2/8.2/9.6us (2.00x/2.00x/1.70x vs default)
+        (
+            4096,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=64,
+                block_k=64,
+                warp_m=32,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M 3000 (batch 2): 12.3us (1.50x vs default)
+        # M 6000 (batch 4) is the one cell where the 128x128 default really is
+        # the best tile of the candidate space — 18.4us vs 20.5 for cuBLAS.  The
+        # entry exists to *stop* this M reaching the catch-all, not to change it.
+        (8192, GEMM_DEFAULT),  # M 6000: 18.4us (1.11x vs torch)
+        (None, "torch"),  # M 12000/24000/48000/96000: 1.06x/1.11x/1.13x/1.14x
+    ],
+    # FF down-projection — the shape where the fallback tile is worst (47us vs
+    # 10-18 for anything else at small M) and the one place where "which kernel is
+    # faster" turned out to be the wrong question.
+    #
+    # Routing all of it to cuBLAS is what the kernel timings say, and it made the
+    # **batch-1 encoder 0.90x**: the profile shows GPU work *dropping* 115us while
+    # wall time grew 125us, because at B=1/B=2 this encoder is CPU-issue-bound
+    # (issue 1139us ~= wall 1140us, GPU busy only 611us of it) and the cuBLAS
+    # branch of ``_dispatch_gemm`` costs ~4.9us more CPU per call than the CUTLASS
+    # launcher (15.96 vs 11.06us through ``oasr.gemm``: ``addmm`` dispatch plus the
+    # two ``reshape``s that branch needs).  A GPU saving is unspendable when the
+    # GPU is already waiting on Python.
+    #
+    # It resolves without a trade-off only because a CUTLASS tile *ties* cuBLAS on
+    # the GPU here (18.4us both at M=1500, 30.7 both at M=3000) while staying on
+    # the cheap dispatch path — so the small-M entries take the tile and cuBLAS
+    # keeps the large-M cells, where the encoder is GPU-bound and its extra
+    # dispatch cost is hidden.  Ordering an autotuner cannot discover: it times
+    # kernels one at a time, where a deep queue hides exactly this cost.
+    ("gemm", 384, 1536): [
+        (256, "torch"),  # B=32/64 decoder prefill: 10.2/12.3us (4.60x/3.83x); GPU-bound
+        (
+            2048,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=64,
+                block_k=64,
+                warp_m=32,
+                warp_n=32,
+                warp_k=64,
+                kStages=4,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M 1500 (batch 1): 18.4us, == cuBLAS on GPU, ~5us/call cheaper to issue
+        (
+            4096,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=64,
+                block_k=64,
+                warp_m=32,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M 3000 (batch 2): 30.7us, == cuBLAS on GPU (1.60x vs default)
+        (8192, GEMM_DEFAULT),  # M 6000 (batch 4): 51.3us, best of the three
+        (None, "torch"),  # M 12000/24000/48000/96000: 1.05x/1.13x/1.09x/1.07x
+    ],
     ("gemm", 512, 256): [
         (
             1024,
@@ -1089,6 +1204,41 @@ _GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
                 split_k=1,
             ),
         ),  # M~16768: cutlass 0.0348ms (1.12x vs default)
+    ],
+    # whisper-tiny FF up-projection (see the (384, *) keys above).
+    ("gemm", 1536, 384): [
+        (
+            256,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=64,
+                block_k=64,
+                warp_m=32,
+                warp_n=32,
+                warp_k=64,
+                kStages=4,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M 128/256: 8.2/8.2us (2.01x/2.00x vs default, 1.24x vs torch at 256)
+        # Boundary entry: at M=1500 the default ties cuBLAS (18.4us both) and the
+        # next rule's tile costs 20.5, so what this pins is the *edge*.
+        (2048, GEMM_DEFAULT),  # M 1500 (batch 1): 18.4us
+        (
+            16384,
+            CutlassGemmConfig(
+                block_m=64,
+                block_n=64,
+                block_k=64,
+                warp_m=32,
+                warp_n=32,
+                warp_k=64,
+                kStages=3,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),  # M 3000/6000/12000: 1.07x/1.15x/1.04x vs default
+        (None, "torch"),  # M 24000/48000/96000: 1.07x/1.06x/1.11x
     ],
     ("gemm_activation", 2048, 256): [
         (
@@ -1204,6 +1354,68 @@ _HEURISTIC_DTYPES = ("torch.float16", "torch.bfloat16")
 _HEURISTIC_ENABLED = os.environ.get("OASR_GEMM_HEURISTIC", "1") != "0"
 
 
+class _RuleMiss:
+    """How often an untuned ``(op, N, K)`` was asked for, and over what M."""
+
+    __slots__ = ("calls", "m_min", "m_max")
+
+    def __init__(self, M: int):
+        self.calls = 1
+        self.m_min = M
+        self.m_max = M
+
+    def add(self, M: int) -> None:
+        self.calls += 1
+        if M < self.m_min:
+            self.m_min = M
+        elif M > self.m_max:
+            self.m_max = M
+
+
+#: ``(op, N, K)`` with no tuned rule -> :class:`_RuleMiss`.  Bounded by the number
+#: of distinct GEMM shapes a model has, so this cannot grow with request count.
+_RULE_MISSES: Dict[Tuple[str, int, int], _RuleMiss] = {}
+
+
+def rule_misses() -> Dict[Tuple[str, int, int], Tuple[int, int, int]]:
+    """Untuned shapes this process asked about: ``(op, N, K) -> (calls, Mmin, Mmax)``."""
+    return {k: (v.calls, v.m_min, v.m_max) for k, v in _RULE_MISSES.items()}
+
+
+def reset_rule_misses() -> None:
+    """Clear the miss table (per-test isolation, per-benchmark accounting)."""
+    _RULE_MISSES.clear()
+
+
+def rule_miss_report() -> str:
+    """Which GEMM shapes ran on the untuned fallback tile, and how often.
+
+    A missing rule is not an error — ``GEMM_DEFAULT`` computes the right answer —
+    which is exactly why it needs reporting.  The table is keyed on the exact
+    ``(op, N, K)``, so it only ever covers model widths somebody tuned, and for a
+    year it covered one architecture while five others silently took a fallback
+    tile that is up to 4.6x off the best backend.  Nothing failed, no counter
+    moved, and no log line was emitted; the only way to find out was to read the
+    table and compare it against a capture by hand.
+
+    Run a workload, print this, and the output is both the answer to "is this
+    model covered?" and the shape list to feed ``scripts/tune_asr_gemm.py``.
+    """
+    if not _HEURISTIC_ENABLED:
+        return "GEMM heuristic disabled (OASR_GEMM_HEURISTIC=0) — every shape used GEMM_DEFAULT."
+    if not _RULE_MISSES:
+        return "GEMM heuristic: every shape this process issued had a tuned rule."
+    lines = [
+        f"GEMM heuristic: {len(_RULE_MISSES)} shape(s) had no tuned rule and used "
+        f"GEMM_DEFAULT (tune with scripts/tune_asr_gemm.py):",
+        f"    {'op':<18} {'N':>7} {'K':>7} {'calls':>8} {'M range':>19}",
+    ]
+    for (op, N, K), st in sorted(_RULE_MISSES.items(), key=lambda kv: -kv[1].calls):
+        span = f"{st.m_min}" if st.m_min == st.m_max else f"{st.m_min}..{st.m_max}"
+        lines.append(f"    {op:<18} {N:>7} {K:>7} {st.calls:>8} {span:>19}")
+    return "\n".join(lines)
+
+
 def select_default_config(op: str, M: int, N: int, K: int, dtype, sm: int):
     """Pick a GEMM config for the non-autotuned production path.
 
@@ -1215,11 +1427,21 @@ def select_default_config(op: str, M: int, N: int, K: int, dtype, sm: int):
     safe (same choice on every capture/replay).  Unknown ops/shapes,
     non-SM120 arches, and non-half dtypes fall back to ``GEMM_DEFAULT`` — i.e.
     byte-identical to the previous fixed behaviour.
+
+    A shape with no rule is recorded in :func:`rule_miss_report`.  Only the
+    *arch/dtype* fall-throughs above are left uncounted: those are properties of
+    the run, not of the table, and would report every shape on an SM80 box.
     """
     if not _HEURISTIC_ENABLED or sm != 120 or str(dtype) not in _HEURISTIC_DTYPES:
         return GEMM_DEFAULT
     rules = _GEMM_HEURISTIC_RULES_SM120.get((op, int(N), int(K)))
     if rules is None:
+        key = (op, int(N), int(K))
+        st = _RULE_MISSES.get(key)
+        if st is None:
+            _RULE_MISSES[key] = _RuleMiss(int(M))
+        else:
+            st.add(int(M))
         return GEMM_DEFAULT
     for m_max, choice in rules:
         if m_max is None or M <= m_max:

@@ -23,6 +23,7 @@ import assets
 import pytest
 import torch
 
+from oasr.models.base import pad_output_projection
 from oasr.models.decoders import (
     BiTransformerDecoder,
     TransformerDecoderConfig,
@@ -124,6 +125,17 @@ class TestInputHelpers:
 # ---------------------------------------------------------------------------
 
 
+def _narrow_heads(sd, vocab_size):
+    """Trim aligned output projections back to the raw vocabulary width."""
+    out = dict(sd)
+    for branch in ("left_decoder", "right_decoder"):
+        for name in ("weight", "bias"):
+            key = f"{branch}.output_layer.{name}"
+            if key in out:
+                out[key] = out[key][:vocab_size]
+    return out
+
+
 class TestWenetParity:
     def _random_inputs(self, cfg, B=3, T=17, Lmax=6, seed=0):
         torch.manual_seed(seed)
@@ -153,7 +165,11 @@ class TestWenetParity:
             src_attention_dropout_rate=0.0,
         ).eval()
         # Same key layout by construction: copy our random weights into the ref.
-        ref.load_state_dict(ours.state_dict(), strict=True)
+        # Our output projections are allocated at an aligned width (CUTLASS
+        # cannot address a raw vocabulary), so narrow them back to the raw vocab
+        # on the way to the reference — the padding rows are inert by
+        # construction and the comparison below only reads the real classes.
+        ref.load_state_dict(_narrow_heads(ours.state_dict(), cfg.vocab_size), strict=True)
 
         memory, memory_lens, hyps, lens = self._random_inputs(cfg)
         ys_in, _ = add_sos_eos(hyps, cfg.sos_id, cfg.eos_id, -1)
@@ -167,8 +183,12 @@ class TestWenetParity:
             l_ref, r_ref, _ = ref(memory, memory_mask, ys_in, lens + 1, r_ys_in, 0.3)
 
         valid = torch.arange(ys_in.size(1)).unsqueeze(0) < (lens + 1).unsqueeze(1)
-        assert (l_ours - l_ref).abs()[valid].max().item() < 2e-5
-        assert (r_ours - r_ref).abs()[valid].max().item() < 2e-5
+        V = cfg.vocab_size
+        assert (l_ours[..., :V] - l_ref).abs()[valid].max().item() < 2e-5
+        assert (r_ours[..., :V] - r_ref).abs()[valid].max().item() < 2e-5
+        # The padding classes must never be able to win: their logit is
+        # PAD_LOGIT-dominated, i.e. far below every real one.
+        assert l_ours.argmax(-1)[valid].max().item() < V
 
     def test_real_checkpoint_parity(self):
         """Bit-level oracle on the real U2++ decoder weights (fp32, CPU)."""
@@ -191,7 +211,17 @@ class TestWenetParity:
             reverse_weight=0.3,
         )
         ours = BiTransformerDecoder(cfg).eval()
-        ours.load_state_dict(dsd, strict=True)
+        # Widen the checkpoint's heads exactly as ``ConformerModel.load_weights``
+        # does — 5002 is not 8-aligned, so the allocation is 5008 wide.  Widen a
+        # *copy*: the reference below loads the same dict at its true width.
+        wide = dict(dsd)
+        for branch in ("left_decoder", "right_decoder"):
+            pad_output_projection(
+                wide,
+                f"{branch}.output_layer.",
+                getattr(ours, branch).output_layer.weight.shape[0],
+            )
+        ours.load_state_dict(wide, strict=True)
         ref = WenetBiDecoder(
             vocab_size=5002,
             encoder_output_size=256,
@@ -221,8 +251,10 @@ class TestWenetParity:
             l_ours, r_ours = ours(memory, memory_lens, ys_in, lens + 1, r_ys_in)
             l_ref, r_ref, _ = ref(memory, memory_mask, ys_in, lens + 1, r_ys_in, 0.3)
         valid = torch.arange(ys_in.size(1)).unsqueeze(0) < (lens + 1).unsqueeze(1)
-        assert (l_ours - l_ref).abs()[valid].max().item() < 5e-5
-        assert (r_ours - r_ref).abs()[valid].max().item() < 5e-5
+        V = 5002
+        assert (l_ours[..., :V] - l_ref).abs()[valid].max().item() < 5e-5
+        assert (r_ours[..., :V] - r_ref).abs()[valid].max().item() < 5e-5
+        assert l_ours.argmax(-1)[valid].max().item() < V
 
 
 # ---------------------------------------------------------------------------

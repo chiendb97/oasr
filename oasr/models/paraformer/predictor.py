@@ -20,6 +20,9 @@ from typing import Tuple
 import torch
 from torch import nn
 
+from oasr.layers import Linear
+from oasr.models.base import align_out_features
+
 from .config import ParaformerModelConfig
 
 
@@ -104,7 +107,10 @@ class CifPredictor(nn.Module):
         self.cif_conv1d = nn.Conv1d(
             idim, idim, config.predictor_l_order + config.predictor_r_order + 1
         )
-        self.cif_output = nn.Linear(idim, 1)
+        # A one-wide output has no GEMM kernel either (alignment 8), so the
+        # alpha head is allocated aligned like the vocabulary heads and column
+        # 0 is taken; ``ParaformerModel.load_weights`` widens the checkpoint.
+        self.cif_output = Linear(idim, align_out_features(1))
         self.threshold = config.predictor_threshold
         self.tail_threshold = config.predictor_tail_threshold
 
@@ -134,7 +140,8 @@ class CifPredictor(nn.Module):
         # Alpha head in the module's own dtype (fp16 under the engine); the
         # integration below is always fp32.
         h = self.pad(hidden.to(self.cif_output.weight.dtype).transpose(1, 2))
-        alphas = torch.sigmoid(self.cif_output(torch.relu(self.cif_conv1d(h)).transpose(1, 2)))
+        alpha_logits = self.cif_output(torch.relu(self.cif_conv1d(h)).transpose(1, 2))
+        alphas = torch.sigmoid(alpha_logits[..., :1])
         hidden = hidden.float()
         mask = mask.float()
         alphas = torch.relu(alphas.squeeze(-1).float()) * mask  # (B, T)

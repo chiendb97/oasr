@@ -74,6 +74,7 @@ def set_backend_mode(mode: str) -> None:
     # Clear the per-config compile cache when switching modes so re-tests see the change.
     _compiled_fmha.cache_clear()
     _capability_probe.cache_clear()
+    fmha_config_supported.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +178,8 @@ def _compiled_fmha(
     n_block: int,
     num_threads: int,
     bias_aligned: bool = False,
+    causal: bool = False,
+    has_seqstart: bool = False,
 ):
     """Return a compiled CuteDSL callable for the given configuration.
 
@@ -200,6 +203,19 @@ def _compiled_fmha(
     from oasr.kernels.cute.attention.base import pick_arch_cls
 
     cls = pick_arch_cls(*arch)
+    # Resolve the tile before validating/building: a head_dim whose requested
+    # 64-wide K tile cannot fit any ring depth gets a narrower one rather than
+    # being refused (``select_tile``).  The cache key keeps the *requested*
+    # n_block, which is fine — the resolution is a pure function of the key.
+    n_block_eff, num_stages_eff = cls.select_tile(
+        head_dim=head_dim,
+        m_block_size=m_block,
+        n_block_size=n_block,
+        paged=paged,
+        block_size=block_size,
+    )
+    if num_stages_eff:
+        n_block = n_block_eff
     if not cls.can_implement(
         dtype=cute_dtype,
         head_dim=head_dim,
@@ -210,6 +226,8 @@ def _compiled_fmha(
         paged=paged,
         block_size=block_size,
         bias_aligned=bias_aligned,
+        causal=causal,
+        has_seqstart=has_seqstart,
     ):
         raise RuntimeError(
             f"{cls.__name__}.can_implement returned False for "
@@ -230,6 +248,9 @@ def _compiled_fmha(
         n_block_size=n_block,
         num_threads=num_threads,
         bias_aligned=bias_aligned,
+        causal=causal,
+        has_seqstart=has_seqstart,
+        num_stages=num_stages_eff or None,
     )
 
     # Build dummy descriptor tensors for cute.compile — shapes only matter for
@@ -304,6 +325,19 @@ def _compiled_fmha(
         leading_dim=0
     )
 
+    if has_seqstart:
+        seqstarts = torch.zeros(B, dtype=torch.int32, device=device)
+        mCacheSeqStarts = from_dlpack(
+            seqstarts, assumed_align=4, enable_tvm_ffi=True
+        ).mark_layout_dynamic(leading_dim=0)
+    else:
+        # Zero-rank dummy; the mask predicate that reads it is compiled out.
+        mCacheSeqStarts = from_dlpack(
+            torch.empty((), dtype=torch.int32, device=device),
+            assumed_align=4,
+            enable_tvm_ffi=True,
+        )
+
     if paged:
         block_table = torch.zeros(
             B,
@@ -335,11 +369,66 @@ def _compiled_fmha(
         mO,
         mBias,
         mCacheSeqlens,
+        mCacheSeqStarts,
         mBlockTable,
         softmax_scale,
         stream,
         options="--enable-tvm-ffi",
     )
+
+
+@functools.cache
+def fmha_config_supported(
+    *,
+    head_dim: int,
+    dtype_str: str,
+    has_bias: bool = False,
+    paged: bool = False,
+    block_size: int = 0,
+    m_block: int = 64,
+    n_block: int = 64,
+    num_threads: int = 128,
+    bias_aligned: bool = False,
+    causal: bool = False,
+) -> bool:
+    """Would :func:`get_compiled_fmha` accept this configuration?
+
+    ``get_compiled_fmha`` *raises* on a shape the arch class cannot implement
+    — head_dim 128 on sm_120, for instance — which is the right contract for a
+    caller that asked for the kernel by name (``OASR_ATTN_BACKEND=cute`` means
+    "require it").  A caller that is merely *choosing* a backend needs to ask
+    first, so :class:`oasr.layers.Attention` uses this and quietly stays on
+    SDPA for shapes the kernel does not cover.  Answered from the arch class's
+    own ``can_implement``, so it cannot go stale as the kernel gains shapes.
+    """
+    cap = _capability_probe()[0]
+    if cap is None or select_backend() != "cute":
+        return False
+    try:
+        import cutlass
+
+        from oasr.kernels.cute.attention.base import pick_arch_cls
+
+        # CuteDSL ships no stubs, so its dtype singletons are invisible to mypy.
+        f16 = cutlass.Float16  # type: ignore[attr-defined]
+        bf16 = cutlass.BFloat16  # type: ignore[attr-defined]
+        cute_dtype = f16 if dtype_str == "float16" else bf16
+        return bool(
+            pick_arch_cls(*cap).can_implement(
+                dtype=cute_dtype,
+                head_dim=head_dim,
+                m_block_size=m_block,
+                n_block_size=n_block,
+                num_threads=num_threads,
+                has_bias=has_bias,
+                paged=paged,
+                block_size=block_size,
+                bias_aligned=bias_aligned,
+                causal=causal,
+            )
+        )
+    except Exception:  # CuteDSL missing / probe failed -> SDPA is the answer
+        return False
 
 
 def get_compiled_fmha(
@@ -355,6 +444,8 @@ def get_compiled_fmha(
     n_block: int = 64,
     num_threads: int = 128,
     bias_aligned: bool = False,
+    causal: bool = False,
+    has_seqstart: bool = False,
 ):
     """Public accessor — returns a compiled CuteDSL callable, compiling on first call."""
     cap = _capability_probe()[0]
@@ -373,6 +464,8 @@ def get_compiled_fmha(
         n_block,
         num_threads,
         bias_aligned,
+        causal,
+        has_seqstart,
     )
 
 

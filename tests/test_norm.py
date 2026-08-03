@@ -257,3 +257,94 @@ class TestBiasNorm:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestRowLayoutPrecondition:
+    """What the norm kernels actually require of their input layout.
+
+    Every norm kernel walks rows as ``base + row * hidden_size``.  The launchers
+    used to check only ``stride(-1) == 1``, which is both too weak and too
+    strong:
+
+    * **too weak** — a padded row stride (``x[..., :H]`` of a wider buffer, or
+      ``x[:, -1]`` of a ``(B, T, D)`` tensor) satisfies it, and the kernel then
+      reads the wrong memory and returns a plausible wrong answer *silently*;
+    * **too strong** in the sense that the fix "require ``is_contiguous()``"
+      needlessly refuses a *permuted* dense view.  Zipformer works in
+      ``(T, B, C)`` — a transpose of a contiguous ``(B, T, C)`` — whose rows
+      still tile memory exactly, so processing them in memory order is
+      identical (normalization is per-row and independent, and
+      ``torch.empty_like`` preserves the strides).
+
+    The precondition is therefore "rows tile memory exactly", which the
+    launchers now check via ``IsRowDense``.
+    """
+
+    HIDDEN = 64
+
+    def _params(self, dtype=torch.float16):
+        H = self.HIDDEN
+        return (
+            torch.randn(H, device="cuda", dtype=dtype),
+            torch.randn(H, device="cuda", dtype=dtype),
+        )
+
+    def test_permuted_dense_view_matches_torch(self):
+        """The Zipformer layout: accepted, and right."""
+        H = self.HIDDEN
+        torch.manual_seed(0)
+        x = torch.randn(2, 96, H, device="cuda", dtype=torch.float16).transpose(0, 1)
+        assert not x.is_contiguous(), "the test input must actually be permuted"
+        w, b = self._params()
+        got = oasr.layer_norm(x, w, b, 1e-5)
+        ref = torch.nn.functional.layer_norm(x, (H,), w, b, 1e-5)
+        assert got.stride() == x.stride(), "output must keep the input's layout"
+        torch.testing.assert_close(got, ref, rtol=1e-2, atol=1e-2)
+
+    def test_permuted_dense_view_rms_and_bias_norm(self):
+        H = self.HIDDEN
+        torch.manual_seed(1)
+        x = torch.randn(2, 96, H, device="cuda", dtype=torch.float16).transpose(0, 1)
+        w, b = self._params()
+        xf = x.float()
+        torch.testing.assert_close(
+            oasr.rms_norm(x, w, None, 1e-6),
+            (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6) * w.float()).half(),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        log_scale = torch.tensor(1.0, device="cuda", dtype=torch.float16)
+        scales = (torch.mean((x - b) ** 2, dim=-1, keepdim=True) ** -0.5) * log_scale.exp()
+        torch.testing.assert_close(
+            oasr.bias_norm(x, b, log_scale), x * scales, rtol=1e-2, atol=1e-2
+        )
+
+    @pytest.mark.parametrize("kind", ["trailing_slice", "row_slice"])
+    def test_padded_row_stride_is_rejected(self, kind):
+        """Regression: these used to return silently wrong data."""
+        H = self.HIDDEN
+        if kind == "trailing_slice":
+            x = torch.randn(4, 6, 2 * H, device="cuda", dtype=torch.float16)[:, :, :H]
+        else:
+            x = torch.randn(4, 6, H, device="cuda", dtype=torch.float16)[:, -1]
+        assert x.stride(-1) == 1, "premise: the weak check would have passed this"
+        w, b = self._params()
+        with pytest.raises(Exception, match="tile memory exactly"):
+            oasr.layer_norm(x, w, b, 1e-5)
+
+    def test_waist_predicate_agrees_with_the_launcher(self):
+        """``is_row_dense`` mirrors ``IsRowDense``; they must not drift apart, or
+        the waist would route something the launcher rejects."""
+        from oasr.layers._backend import is_row_dense
+
+        H = self.HIDDEN
+        cases = {
+            "contiguous": (torch.randn(8, H), True),
+            "permuted dense": (torch.randn(2, 96, H).transpose(0, 1), True),
+            "trailing slice": (torch.randn(4, 6, 2 * H)[:, :, :H], False),
+            "row slice": (torch.randn(4, 6, H)[:, -1], False),
+            "expanded (aliasing)": (torch.randn(1, H).expand(8, H), False),
+        }
+        for name, (t, expected) in cases.items():
+            assert is_row_dense(t) is expected, name

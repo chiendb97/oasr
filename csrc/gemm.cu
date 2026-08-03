@@ -42,12 +42,16 @@ void gemm(TensorView output, TensorView A, TensorView B, Optional C_opt,
     CHECK_INPUT(A);
     CHECK_INPUT(B);
     CHECK_INPUT(output);
-    CHECK_DIM(2, A);
+    CHECK_CONTIGUOUS_INPUT(A);
+    CHECK_CONTIGUOUS_INPUT(output);
     CHECK_DIM(2, B);
 
-    int M = A.size(0);
-    int K = A.size(1);
+    // A and output may be N-D; every leading dimension is a row.  Flattening
+    // here rather than in Python removes two `reshape` calls per GEMM.
+    int K = A.size(A.ndim() - 1);
+    int M = static_cast<int>(FLATTENED_ROWS(A));
     int N = B.size(0);
+    CHECK_GEMM_ALIGNMENT(N, K);
 
     cudaStream_t stream = get_stream(A.device());
 
@@ -79,12 +83,14 @@ void gemm_activation(TensorView output, TensorView A, TensorView B, Optional C_o
     CHECK_INPUT(A);
     CHECK_INPUT(B);
     CHECK_INPUT(output);
-    CHECK_DIM(2, A);
+    CHECK_CONTIGUOUS_INPUT(A);
+    CHECK_CONTIGUOUS_INPUT(output);
     CHECK_DIM(2, B);
 
-    int M = A.size(0);
-    int K = A.size(1);
+    int K = A.size(A.ndim() - 1);
+    int M = static_cast<int>(FLATTENED_ROWS(A));
     int N = B.size(0);
+    CHECK_GEMM_ALIGNMENT(N, K);
     auto activation = static_cast<ActivationType>(activation_type);
 
     cudaStream_t stream = get_stream(A.device());

@@ -22,7 +22,7 @@ from oasr.layers.linear import Linear, LinearActivation
 from oasr.layers.norm import GlobalCMVN, LayerNorm
 from oasr.utils import get_norm, get_norm_activation
 
-from ..base import BaseAsrModel, BaseEncoder, LoadReport
+from ..base import BaseAsrModel, BaseEncoder, LoadReport, pad_output_projection
 from ..decoders.transformer_decoder import BiTransformerDecoder
 from ..heads.ctc import CTCHead
 from .config import ConformerEncoderConfig, ConformerModelConfig
@@ -1135,6 +1135,20 @@ class ConformerModel(BaseAsrModel):
                     sd[k] = v
                 else:
                     sd["decoder.left_decoder." + k[len("decoder.") :]] = v
+            # The AED branch's output projections are allocated at an aligned
+            # width (the raw U2++ vocabulary, 5002, is not 8-aligned and so has
+            # no CUTLASS kernel), so widen the checkpoint's to match.  The
+            # target is read off the module rather than recomputed from the
+            # config, like the CTC head below — it cannot drift from what was
+            # actually allocated.
+            for branch in ("left_decoder", "right_decoder"):
+                sub = getattr(self.decoder, branch, None)
+                if sub is not None:
+                    pad_output_projection(
+                        sd,
+                        f"decoder.{branch}.output_layer.",
+                        sub.output_layer.weight.shape[0],
+                    )
         dropped = [
             k
             for k in state_dict

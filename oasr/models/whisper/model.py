@@ -24,6 +24,15 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from oasr.layers import (
+    TORCH_EPS,
+    Attention,
+    ColumnParallelLinear,
+    Embedding,
+    LayerNorm,
+    RowParallelLinear,
+)
+
 from ..base import BaseAsrModel, BaseEncoder, LoadReport
 from ..decoders.base import BaseDecoder, DecoderState
 from .config import WhisperModelConfig
@@ -32,24 +41,28 @@ logger = logging.getLogger(__name__)
 
 
 class _WhisperAttention(nn.Module):
-    """HF-compatible MHA (``k_proj`` bias-free, SDPA math)."""
+    """HF-layout MHA (``k_proj`` bias-free) over the shared attention core.
+
+    Projections keep HF's names so the checkpoint loads 1:1; the compute is
+    :class:`oasr.layers.Attention`, shared with every other architecture.
+    """
 
     def __init__(self, d_model: int, n_head: int) -> None:
         super().__init__()
         self.h = n_head
         self.d_k = d_model // n_head
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-
-    def _shape(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, _ = x.shape
-        return x.view(B, T, self.h, self.d_k).transpose(1, 2)  # (B, h, T, d_k)
+        self.q_proj = ColumnParallelLinear(d_model, d_model)
+        self.k_proj = ColumnParallelLinear(d_model, d_model, bias=False)
+        self.v_proj = ColumnParallelLinear(d_model, d_model)
+        self.out_proj = RowParallelLinear(d_model, d_model)
+        # Whisper attention is never masked (the 30 s window is real input and
+        # generation is causal), so the shared core routes it to SDPA — see the
+        # measurement table in ``oasr/layers/attention/core.py``.
+        self.attn = Attention(n_head, self.d_k)
 
     def kv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Project keys/values only (cross-attention prefill / cache append)."""
-        return self._shape(self.k_proj(x)), self._shape(self.v_proj(x))
+        return self.attn.split_heads(self.k_proj(x)), self.attn.split_heads(self.v_proj(x))
 
     def forward(
         self,
@@ -59,21 +72,25 @@ class _WhisperAttention(nn.Module):
         is_causal: bool = False,
     ) -> torch.Tensor:
         """``query (B, T_q, D)`` × pre-projected ``k``/``v`` ``(B, h, T_k, d_k)``."""
-        B, T_q, _ = query.shape
-        q = self._shape(self.q_proj(query))
-        x = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
-        x = x.transpose(1, 2).contiguous().view(B, T_q, self.h * self.d_k)
-        return self.out_proj(x)
+        q = self.attn.split_heads(self.q_proj(query))
+        x = self.attn(q, k, v, is_causal=is_causal)
+        return self.out_proj(self.attn.merge_heads(x))
 
 
 class _EncoderLayer(nn.Module):
+    """``fc1``/``fc2`` stay flat rather than becoming a ``FeedForward``: HF puts
+    them directly on the layer, and nesting them would add a level to every
+    checkpoint key.  GELU is the exact erf form (HF's ``activation_function:
+    gelu``), which is why it is not folded into the GEMM epilogue — the OASR
+    fused epilogue implements the tanh approximation."""
+
     def __init__(self, cfg: WhisperModelConfig) -> None:
         super().__init__()
         self.self_attn = _WhisperAttention(cfg.d_model, cfg.encoder_attention_heads)
-        self.self_attn_layer_norm = nn.LayerNorm(cfg.d_model)
-        self.fc1 = nn.Linear(cfg.d_model, cfg.encoder_ffn_dim)
-        self.fc2 = nn.Linear(cfg.encoder_ffn_dim, cfg.d_model)
-        self.final_layer_norm = nn.LayerNorm(cfg.d_model)
+        self.self_attn_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
+        self.fc1 = ColumnParallelLinear(cfg.d_model, cfg.encoder_ffn_dim)
+        self.fc2 = RowParallelLinear(cfg.encoder_ffn_dim, cfg.d_model)
+        self.final_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -97,9 +114,9 @@ class WhisperEncoder(BaseEncoder):
         self.conv1 = nn.Conv1d(cfg.num_mel_bins, cfg.d_model, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(cfg.d_model, cfg.d_model, kernel_size=3, stride=2, padding=1)
         # HF materializes the sinusoidal table as a real (frozen) weight.
-        self.embed_positions = nn.Embedding(cfg.max_source_positions, cfg.d_model)
+        self.embed_positions = Embedding(cfg.max_source_positions, cfg.d_model)
         self.layers = nn.ModuleList([_EncoderLayer(cfg) for _ in range(cfg.encoder_layers)])
-        self.layer_norm = nn.LayerNorm(cfg.d_model)
+        self.layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
 
     def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(B, 3000, n_mels)`` log-mel → ``(hidden (B, 1500, D), mask (B, 1, 1500))``.
@@ -111,7 +128,12 @@ class WhisperEncoder(BaseEncoder):
         x = xs.transpose(1, 2)  # (B, n_mels, T)
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
-        x = x.transpose(1, 2)  # (B, T/2, D)
+        # ``.contiguous()`` is load-bearing, not hygiene: without it the whole
+        # residual stream inherits the conv's (B, D, T) layout with a strided
+        # last dimension, which the norm kernels refuse outright and every
+        # projection has to copy around anyway.  One copy here, contiguous
+        # after.
+        x = x.transpose(1, 2).contiguous()  # (B, T/2, D)
         T = x.size(1)
         if T > self._cfg.max_source_positions:
             raise ValueError(
@@ -144,12 +166,12 @@ class _DecoderLayer(nn.Module):
     def __init__(self, cfg: WhisperModelConfig) -> None:
         super().__init__()
         self.self_attn = _WhisperAttention(cfg.d_model, cfg.decoder_attention_heads)
-        self.self_attn_layer_norm = nn.LayerNorm(cfg.d_model)
+        self.self_attn_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
         self.encoder_attn = _WhisperAttention(cfg.d_model, cfg.decoder_attention_heads)
-        self.encoder_attn_layer_norm = nn.LayerNorm(cfg.d_model)
-        self.fc1 = nn.Linear(cfg.d_model, cfg.decoder_ffn_dim)
-        self.fc2 = nn.Linear(cfg.decoder_ffn_dim, cfg.d_model)
-        self.final_layer_norm = nn.LayerNorm(cfg.d_model)
+        self.encoder_attn_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
+        self.fc1 = ColumnParallelLinear(cfg.d_model, cfg.decoder_ffn_dim)
+        self.fc2 = RowParallelLinear(cfg.decoder_ffn_dim, cfg.d_model)
+        self.final_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
 
 
 class WhisperDecoder(BaseDecoder):
@@ -168,10 +190,10 @@ class WhisperDecoder(BaseDecoder):
     def __init__(self, cfg: WhisperModelConfig) -> None:
         super().__init__()
         self._cfg = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.embed_positions = nn.Embedding(cfg.max_target_positions, cfg.d_model)
+        self.embed_tokens = Embedding(cfg.vocab_size, cfg.d_model)
+        self.embed_positions = Embedding(cfg.max_target_positions, cfg.d_model)
         self.layers = nn.ModuleList([_DecoderLayer(cfg) for _ in range(cfg.decoder_layers)])
-        self.layer_norm = nn.LayerNorm(cfg.d_model)
+        self.layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
 
     def init_state(
         self,

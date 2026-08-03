@@ -39,6 +39,7 @@ from .common import (
     list_rope_styles,
     register_apply_rotary_emb,
 )
+from .neox import NeoxRotaryEmbedding, apply_rotary_pos_emb, rotate_half
 from .ntk_scaling_rope import NTKScalingRotaryEmbedding
 from .yarn_scaling_rope import YaRNScalingRotaryEmbedding
 
@@ -114,6 +115,10 @@ __all__ = [
     "get_apply_rotary_emb",
     "list_rope_styles",
     "register_apply_rotary_emb",
+    # NeoX / HF style (real cos/sin tables, arbitrary position tensors)
+    "NeoxRotaryEmbedding",
+    "apply_rotary_pos_emb",
+    "rotate_half",
     # Variants
     "NTKScalingRotaryEmbedding",
     "YaRNScalingRotaryEmbedding",

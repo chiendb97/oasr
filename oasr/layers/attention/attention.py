@@ -26,6 +26,7 @@ import torch
 from torch import nn
 
 from oasr.cache.paged_kv import PagedKVCache
+from oasr.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 if TYPE_CHECKING:
     from oasr.models.conformer.packing import PackedLayout
@@ -107,10 +108,10 @@ class RelPositionMultiHeadedAttention(nn.Module):
         self._qkv_bias_flags = (query_bias, key_bias, value_bias)
         qkv_bias = any(self._qkv_bias_flags)
 
-        self.linear_qkv = nn.Linear(n_feat, sum(self._qkv_split), bias=qkv_bias)
-        self.linear_out = nn.Linear(self.inner_dim, n_feat, bias=query_bias)
+        self.linear_qkv = ColumnParallelLinear(n_feat, sum(self._qkv_split), bias=qkv_bias)
+        self.linear_out = RowParallelLinear(self.inner_dim, n_feat, bias=query_bias)
 
-        self.linear_pos = nn.Linear(n_feat, n_feat, bias=False)
+        self.linear_pos = ColumnParallelLinear(n_feat, n_feat, bias=False)
         self.pos_bias_u = nn.Parameter(torch.empty(self.h, self.d_k))
         self.pos_bias_v = nn.Parameter(torch.empty(self.h, self.d_k))
         nn.init.xavier_uniform_(self.pos_bias_u)

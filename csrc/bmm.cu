@@ -48,6 +48,7 @@ void bmm(TensorView output, TensorView A, TensorView B) {
     int M = A.size(1);
     int K = A.size(2);
     int N = B.size(1);
+    CHECK_GEMM_ALIGNMENT(N, K);
 
     cudaStream_t stream = get_stream(A.device());
 

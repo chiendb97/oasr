@@ -12,7 +12,9 @@ icefall so checkpoints load 1:1.
 from __future__ import annotations
 
 import torch
-from torch import nn
+
+from oasr.layers import ColumnParallelLinear, Linear
+from oasr.models.base import align_out_features
 
 from ..decoders.base import Joiner
 
@@ -22,9 +24,14 @@ class TransducerJoiner(Joiner):
         self, encoder_dim: int, decoder_dim: int, joiner_dim: int, vocab_size: int
     ) -> None:
         super().__init__()
-        self.encoder_proj = nn.Linear(encoder_dim, joiner_dim)
-        self.decoder_proj = nn.Linear(decoder_dim, joiner_dim)
-        self.output_linear = nn.Linear(joiner_dim, vocab_size)
+        self.encoder_proj = ColumnParallelLinear(encoder_dim, joiner_dim)
+        self.decoder_proj = ColumnParallelLinear(decoder_dim, joiner_dim)
+        # Vocabulary out-features are rarely 8-aligned (500 for the icefall BPE
+        # releases) and the GEMM kernels cannot address an unaligned width at
+        # all, so the head is allocated aligned and
+        # ``TransducerModel.load_weights`` widens the checkpoint to match.
+        self.vocab_size = vocab_size
+        self.output_linear = Linear(joiner_dim, align_out_features(vocab_size))
 
     def forward(
         self,
@@ -42,4 +49,7 @@ class TransducerJoiner(Joiner):
             x = self.encoder_proj(encoder_out) + self.decoder_proj(decoder_out)
         else:
             x = encoder_out + decoder_out
-        return self.output_linear(torch.tanh(x))
+        # Slice off the alignment padding so the logit width is the true
+        # vocabulary; the padding rows carry a hugely negative bias anyway, so
+        # this is presentation, not masking.
+        return self.output_linear(torch.tanh(x))[..., : self.vocab_size]

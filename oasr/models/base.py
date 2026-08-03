@@ -36,7 +36,18 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 from torch import nn
@@ -129,6 +140,79 @@ class LoadReport:
             dropped=list(dropped or ()) + list(unexpected),
             missing=[k for k in missing if k not in skip],
         )
+
+
+#: Bias given to padding rows of an aligned output projection.  Large enough
+#: that ``exp`` underflows to 0 in fp16 (whose max is 65504, so this is
+#: representable), small enough not to be an inf that could make a softmax
+#: denominator NaN.
+PAD_LOGIT = -1e4
+
+
+def align_out_features(out_features: int, alignment: int = 8) -> int:
+    """Round an output width up to what the GEMM kernels can address.
+
+    CUTLASS 2.x alignment-8 iterators reject an unpadded vocabulary outright,
+    so a projection of that width has no kernel at all.  Padding it is how the
+    gap gets *closed* — the alternative, routing the call to torch, leaves the
+    model permanently off the kernel path and hides the fact.
+    """
+    return ((out_features + alignment - 1) // alignment) * alignment
+
+
+def init_pad_rows(projection: Any, raw_out_features: int) -> None:
+    """Neutralize the padding rows of a freshly constructed aligned projection.
+
+    :func:`pad_output_projection` establishes "a padding class can never win an
+    argmax" when a *checkpoint* is loaded.  A module that has only been
+    constructed has random values there, so the invariant would hold by load
+    order rather than by construction — and a test (or any consumer that loads a
+    state dict non-strictly) can observe a padding class winning.  Setting the
+    rows here makes it true unconditionally; a subsequent load overwrites them
+    with the same values.
+    """
+    with torch.no_grad():
+        if projection.weight.shape[0] > raw_out_features:
+            projection.weight[raw_out_features:].zero_()
+        bias = getattr(projection, "bias", None)
+        if bias is not None and bias.shape[0] > raw_out_features:
+            bias[raw_out_features:].fill_(PAD_LOGIT)
+
+
+def pad_output_projection(
+    state_dict: MutableMapping[str, torch.Tensor],
+    prefix: str,
+    target_out: int,
+) -> None:
+    """Widen an output projection in a checkpoint to ``target_out`` rows, in place.
+
+    Alignment happens **here**, when the checkpoint is loaded, rather than as a
+    pad-and-slice inside the layer: the released weights keep their true width,
+    the waist's :class:`~oasr.layers.linear.Linear` stays a plain projection,
+    and the cost is paid once instead of per forward.
+
+    Padding rows get zero weights and a :data:`PAD_LOGIT` bias, so a
+    padding class emits a logit far below any real one and can never win an
+    argmax or take meaningful mass in a softmax.  Zeroing the bias too — the
+    obvious thing, and what this codebase did first — leaves the pad classes
+    at logit ``0.0``, which beats every real class whenever they are all
+    negative.  It has never been observed to bite, but it is free to rule out.
+
+    ``prefix`` names the projection (``"decoder.output_layer."``); missing keys
+    and already-wide keys are left alone, so this is safe to call
+    unconditionally and safe to call on a native checkpoint that was already
+    saved padded.
+    """
+    weight = state_dict.get(prefix + "weight")
+    if weight is None or weight.shape[0] >= target_out:
+        return
+    pad = target_out - weight.shape[0]
+    state_dict[prefix + "weight"] = torch.cat(
+        [weight, weight.new_zeros(pad, weight.shape[1])], dim=0
+    )
+    bias = state_dict.get(prefix + "bias")
+    if bias is not None:
+        state_dict[prefix + "bias"] = torch.cat([bias, bias.new_full((pad,), PAD_LOGIT)], dim=0)
 
 
 def coerce_config(cls: type, d: Mapping[str, Any]) -> Any:
