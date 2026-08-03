@@ -107,8 +107,13 @@ image = (
         "transformers",
         "soundfile",
         # CuteDSL FMHA; without it oasr.jit.attention falls back to SDPA and the
-        # cute-backend tests stop covering the kernel that ships.
-        "nvidia-cutlass-dsl==4.5.2",
+        # cute-backend tests stop covering the kernel that ships.  Pinned, and
+        # kept in step with the 3rdparty/cutlass submodule tag: the two halves
+        # of CUTLASS are versioned together upstream, and a CI that compiles
+        # kernels against one release while tracing them on another is testing a
+        # combination nobody runs.  Floor lives in
+        # oasr/jit/attention.py::MIN_CUTEDSL_VERSION.
+        "nvidia-cutlass-dsl==4.6.1",
         "pytest==8.1.1",
     )
     # `pip install -e . --no-build-isolation` below needs pyproject's

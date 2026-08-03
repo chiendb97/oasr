@@ -82,6 +82,51 @@ def set_backend_mode(mode: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: Oldest CuTeDSL these kernels are verified against.  4.6.1 is what CI runs;
+#: 4.5.2 is the oldest release whose API surface they still resolve on (4.6.0
+#: removed ``cute.make_fragment`` and ``cute.core.ThrMma``/``ThrCopy``, none of
+#: which are used here, so the range is genuinely both).  Older releases are
+#: refused *by version* rather than left to fail mid-trace: the kernels build a
+#: config, validate it, then explode inside ``cute.compile`` on a missing
+#: attribute, which reads as a kernel bug rather than a stale dependency.
+MIN_CUTEDSL_VERSION = (4, 5, 2)
+
+
+def _version_tuple(text: str) -> Tuple[int, ...]:
+    parts: list = []
+    for chunk in text.split("."):
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _check_cutedsl_version() -> None:
+    """Raise if the installed CuTeDSL predates :data:`MIN_CUTEDSL_VERSION`.
+
+    Called from the capability probe, so ``auto`` degrades to SDPA with a
+    warning naming the version and ``cute`` re-raises — the same handling as a
+    missing CuTeDSL install, which is what a too-old one amounts to.
+    """
+    import cutlass
+
+    raw = getattr(cutlass, "__version__", "")
+    found = _version_tuple(raw)
+    # An unparseable version is not evidence of anything; let the kernels try.
+    if found and found < MIN_CUTEDSL_VERSION:
+        want = ".".join(str(p) for p in MIN_CUTEDSL_VERSION)
+        raise RuntimeError(
+            f"CuTeDSL {raw} is older than the minimum this build targets "
+            f"({want}). Upgrade with `pip install -U 'nvidia-cutlass-dsl>={want},<5'`, "
+            f"or set OASR_ATTN_BACKEND=sdpa to use the PyTorch fallback."
+        )
+
+
 @functools.cache
 def _capability_probe() -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
     """Detect (major, minor) compute capability and which backend is usable.
@@ -111,6 +156,7 @@ def _capability_probe() -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
         try:
             from oasr.kernels.cute.attention.base import pick_arch_cls
 
+            _check_cutedsl_version()
             pick_arch_cls(*cap)
         except Exception as exc:
             if _BACKEND_MODE == "cute":

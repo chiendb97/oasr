@@ -75,7 +75,11 @@ def make_block_info(
     if cutlass.const_expr(causal or (window_right >= 0)):
         wr = cutlass.Int32(window_right if window_right >= 0 else 0)
         upper_row = (m_block + 1) * m_block_size + wr
-        n_max_row = cute.arch.min_s32(seqlen_k, upper_row)
+        # ``cutlass.min`` / ``cutlass.max`` are the integer min/max on DSL
+        # values; there is no ``cute.arch.min_s32`` in any CuTeDSL release this
+        # project supports (4.5 / 4.6), and referencing one raised AttributeError
+        # the moment a causal or windowed config was traced.
+        n_max_row = cutlass.min(seqlen_k, upper_row)
     else:
         n_max_row = seqlen_k
 
@@ -85,7 +89,7 @@ def make_block_info(
     if cutlass.const_expr(window_left >= 0):
         wl = cutlass.Int32(window_left)
         lower_row = m_block * m_block_size - wl
-        n_min_row = cute.arch.max_s32(cutlass.Int32(0), lower_row)
+        n_min_row = cutlass.max(cutlass.Int32(0), lower_row)
     else:
         n_min_row = cutlass.Int32(0)
 

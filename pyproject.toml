@@ -78,6 +78,24 @@ tokenizers = [
     "sentencepiece>=0.1.99",
     "tokenizers>=0.15.0",
 ]
+attention = [
+    # CuTeDSL, which compiles the fused-attention kernels under
+    # oasr/kernels/cute/.  Genuinely optional: with it missing, the default
+    # OASR_ATTN_BACKEND=auto logs a warning and oasr.fmha runs on PyTorch
+    # SDPA, so `import oasr` and every non-attention kernel are unaffected.
+    #
+    # Floor is the oldest release the kernels resolve against (see
+    # oasr/jit/attention.py::MIN_CUTEDSL_VERSION); 4.6.1 is what is tested.
+    # 4.6.0 deleted cute.make_fragment and cute.core.ThrMma/ThrCopy, and
+    # nothing here used them, so the whole range works.  Capped below 5 because
+    # a major bump is where CuTeDSL removes long-deprecated APIs.
+    #
+    # NB: installing this pulls protobuf>=6.30 for the (unused, beta) IKET
+    # profiler.  On an environment pinned to protobuf 4.x — e.g. one whose
+    # grpcio-tools generates the _pb2 modules scripts/grpc_stream.py imports —
+    # install it with --no-deps and let the DSL's own wheels resolve.
+    "nvidia-cutlass-dsl>=4.5.2,<5",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -91,7 +109,7 @@ wfst = [
     "kaldilm",
 ]
 all = [
-    "oasr[audio,serving,hub,tokenizers]",
+    "oasr[audio,serving,hub,tokenizers,attention]",
 ]
 
 [project.urls]

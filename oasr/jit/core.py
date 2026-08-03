@@ -145,6 +145,13 @@ class JitSpec:
         for root, hdr in _project_headers():
             h.update(str(hdr.relative_to(root)).encode())
             h.update(hdr.read_bytes())
+        # Third-party headers count too: a CUTLASS submodule bump changes the
+        # generated code for every GEMM/BMM/Conv2D module.  See
+        # ``env.cutlass_version_stamp`` for why this is version.h and not the
+        # whole tree.
+        for inc, version_h in env.cutlass_version_stamp():
+            h.update(inc.encode())
+            h.update(version_h)
         return h.hexdigest()[:16]
 
     def _get_lib_dir(self) -> Path:
