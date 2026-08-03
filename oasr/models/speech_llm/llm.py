@@ -25,10 +25,16 @@ length + the batch's generation cap), the per-layer K/V buffers are
 place — removing the per-step ``torch.cat`` that re-copies the whole cache
 (measured ~10% of a 7B decode step at B=4, growing with B).  Without
 ``capacity`` the legacy cat-growth path is used (direct ``prefill``/``step``
-callers, tests).  Paged-KV storage (``DecoderKVCacheManager`` + the paged
-FMHA) remains blocked on the CuteDSL masked-tile fix — left-padded prompts
-are exactly the heavily key-padded batch shape that kernel currently NaNs on,
-so attention stays on SDPA.
+callers, tests).
+
+Attention splits by call: :meth:`prefill` hands the shared core its causal +
+left-padded window as ``kv_lens``/``kv_starts``/``is_causal`` and lands on the
+fused kernel — 1.8-3.3x on the attention op over the materialized-mask SDPA it
+used to build, 1.03-1.05x over the whole prefill, which is GEMM-dominated — while
+:meth:`step` stays on SDPA because its K/V are capacity-buffer slices the fused
+kernel would have to copy whole, once per layer per step.  Paged-KV storage
+(``DecoderKVCacheManager``) is still the open optimization; it is what would let
+``step`` reach the kernel too.
 """
 
 from __future__ import annotations
@@ -64,10 +70,9 @@ class _Qwen2Attention(nn.Module):
         self.k_proj = ColumnParallelLinear(d, self.h_kv * self.d_k, bias=True)
         self.v_proj = ColumnParallelLinear(d, self.h_kv * self.d_k, bias=True)
         self.o_proj = RowParallelLinear(self.h * self.d_k, d, bias=False)
-        # Every mask this decoder builds is either causal or left-padded (valid
-        # keys are ``[P - len, P)``, which is not a length), so the shared core
-        # resolves to SDPA on every call.  It is here for the head bookkeeping,
-        # the GQA handling and so a future paged/fused path is one edit.
+        # Prefill's causal + left-padded window is now a form the shared core
+        # can fuse (two length vectors, no materialized mask); step's is not,
+        # for a cache-stride reason documented at its call site.
         self.attn = Attention(self.h, self.d_k, num_kv_heads=self.h_kv)
 
     def qkv(
@@ -85,7 +90,8 @@ class _Qwen2Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        attn_mask: Optional[torch.Tensor],
+        mask_kwargs: Dict[str, Any],
+        kv_extent: int,
     ) -> torch.Tensor:
         """Attention over the (possibly grouped) KV → ``(B, T_q, D)``.
 
@@ -96,7 +102,7 @@ class _Qwen2Attention(nn.Module):
         published Qwen2-Audio-7B has ``h_kv == h``, so this only bites a
         grouped-KV speech-LLM — but that is the common shape elsewhere.)
         """
-        out = self.attn(q, k, v, attn_mask=attn_mask)
+        out = self.attn(q, k, v, kv_extent=kv_extent, **mask_kwargs)
         return self.o_proj(self.attn.merge_heads(out))
 
 
@@ -149,7 +155,7 @@ class Qwen2Lm(BaseDecoder):
         cos: torch.Tensor,
         sin: torch.Tensor,
         state: Dict[str, Any],
-        attn_mask: Optional[torch.Tensor],
+        mask_kwargs: Dict[str, Any],
     ) -> torch.Tensor:
         """Shared prefill/step trunk: run every layer, appending to the KV state."""
         t_prev = state["len"]
@@ -158,8 +164,8 @@ class Qwen2Lm(BaseDecoder):
             residual = x
             h = layer.input_layernorm(x)
             q, k_new, v_new = layer.self_attn.qkv(h, cos, sin)
-            k, v = self._append_kv(state, i, t_prev, k_new, v_new)
-            x = residual + layer.self_attn.attend(q, k, v, attn_mask)
+            k, v, kv_extent = self._append_kv(state, i, t_prev, k_new, v_new)
+            x = residual + layer.self_attn.attend(q, k, v, mask_kwargs, kv_extent)
             residual = x
             h = layer.post_attention_layernorm(x)
             x = residual + layer.mlp(h)
@@ -173,12 +179,19 @@ class Qwen2Lm(BaseDecoder):
         t_prev: int,
         k_new: torch.Tensor,
         v_new: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Append layer ``i``'s new K/V and return the full cache views.
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Append layer ``i``'s new K/V; return ``(k, v, valid_len)``.
 
-        Preallocated mode (``state["cap"]`` set and roomy): write the new
-        tokens into their slots in place, return ``[:t]`` views — no copy of
-        the existing cache.  Legacy mode (no capacity, or overflow): cat-grow.
+        Preallocated mode (``state["cap"]`` set and roomy): write the new tokens
+        into their slots in place and return the **whole buffer** plus the cached
+        length — upstream FlashAttention's KV-cache convention.  Returning a
+        ``[:t]`` view instead (which this did) looks free but is not: the slice
+        has a stride gap, so the fused attention kernel cannot address it and
+        copies the entire K and V cache, per layer, per call.  The length bounds
+        the K loop just as tightly, so the buffer form costs nothing and is
+        measured 1.23-1.54x (prefill) / 1.45-1.88x (decode step) faster,
+        bit-identical.  Legacy mode (no capacity, or overflow): cat-grow, where
+        the tensor is already exactly ``valid_len`` long.
         """
         t_new = k_new.size(2)
         cap = state["cap"]
@@ -186,13 +199,23 @@ class Qwen2Lm(BaseDecoder):
         if cap is not None and k_buf is None:
             # First append (prefill): allocate the full-capacity buffers.
             B, h_kv, _, d = k_new.shape
-            k_buf = k_new.new_empty(B, h_kv, cap, d)
-            v_buf = v_new.new_empty(B, h_kv, cap, d)
+            # Zeroed, not ``new_empty``.  Handing the attention kernel the whole
+            # buffer (above) means its last, partially-valid K block reads
+            # columns in ``[t, round_up(t, n_block))`` that are now *in bounds*
+            # of the tensor, so the load's bounds predicate no longer zero-fills
+            # them.  Uninitialized memory there can hold NaN/Inf bit patterns,
+            # and the result was a kernel path whose repeated runs on identical
+            # input disagreed (SDPA's did not) — caught by a determinism check,
+            # not by parity, because every individual run looked plausible.
+            # Zeroing costs one pass over the cache per request (~0.6% of a 7B
+            # batch) and makes the region harmless whatever the mask does.
+            k_buf = k_new.new_zeros(B, h_kv, cap, d)
+            v_buf = v_new.new_zeros(B, h_kv, cap, d)
             state["k"][i], state["v"][i] = k_buf, v_buf
         if cap is not None and t_prev + t_new <= cap:
             k_buf[:, :, t_prev : t_prev + t_new] = k_new
             v_buf[:, :, t_prev : t_prev + t_new] = v_new
-            return k_buf[:, :, : t_prev + t_new], v_buf[:, :, : t_prev + t_new]
+            return k_buf, v_buf, t_prev + t_new
         # Legacy growth (no capacity hint, or capacity overflow).  An
         # overflowing preallocated buffer degrades to cat of the valid slice.
         if k_buf is not None:
@@ -202,7 +225,7 @@ class Qwen2Lm(BaseDecoder):
             k, v = k_new, v_new
         state["k"][i], state["v"][i] = k, v
         state["cap"] = None  # buffers are now exact-length; stay on cat-growth
-        return k, v
+        return k, v, k.size(2)
 
     def prefill(
         self,
@@ -228,14 +251,23 @@ class Qwen2Lm(BaseDecoder):
         position_ids = (valid.long().cumsum(dim=1) - 1).clamp(min=0)
         cos, sin = self.rotary(position_ids)  # (B, P, d)
 
-        # Causal + key-padding mask; the diagonal stays open so fully-padded
-        # query rows attend themselves instead of softmaxing over -inf only.
-        causal = torch.ones(P, P, dtype=torch.bool, device=device).tril()
-        allowed = causal.unsqueeze(0) & valid.unsqueeze(1)
-        eye = torch.eye(P, dtype=torch.bool, device=device)
-        allowed = allowed | eye.unsqueeze(0)
-        attn_mask = torch.zeros(B, 1, P, P, dtype=inputs_embeds.dtype, device=device)
-        attn_mask.masked_fill_(~allowed.unsqueeze(1), float("-inf"))
+        # Causal + key padding.  Left padding is contiguous by construction (the
+        # strategy left-pads the batch, HF's masked-generate convention), so the
+        # whole mask is the window ``[P - len, P)`` intersected with the causal
+        # triangle — two length vectors rather than a ``(B, 1, P, P)`` tensor.
+        # That form is what the fused kernel takes, and materializing it instead
+        # costs SDPA its flash path: 1.8-3.3x on the attention op at the 7B
+        # prefill shapes, 1.03-1.05x over the whole prefill.
+        # ``Attention`` decides which backend actually runs it, and rebuilds the
+        # explicit mask itself on the SDPA side (diagonal kept open, so a fully
+        # padded query row cannot come back NaN and poison real rows downstream).
+        kv_lens = torch.full((B,), P, dtype=torch.int32, device=device)
+        kv_starts = (P - valid.sum(dim=1)).to(torch.int32)
+        mask_kwargs: Dict[str, Any] = {
+            "kv_lens": kv_lens,
+            "kv_starts": kv_starts,
+            "is_causal": True,
+        }
 
         n = len(self.layers)
         state: Dict[str, Any] = {
@@ -246,7 +278,7 @@ class Qwen2Lm(BaseDecoder):
             "len": 0,  # tokens cached so far (uniform across layers)
             "cap": None if capacity is None else max(int(capacity), P),
         }
-        x = self._forward_layers(inputs_embeds, cos, sin, state, attn_mask)
+        x = self._forward_layers(inputs_embeds, cos, sin, state, mask_kwargs)
         logits = self.lm_head(self.norm(x[:, -1:]))
         return logits[:, -1], state
 
@@ -262,10 +294,18 @@ class Qwen2Lm(BaseDecoder):
             [state["key_valid"], torch.ones(B, 1, dtype=torch.bool, device=x.device)], dim=1
         )
         state["key_valid"] = key_valid
-        attn_mask = torch.zeros(B, 1, 1, key_valid.size(1), dtype=x.dtype, device=x.device)
-        attn_mask.masked_fill_(~key_valid.view(B, 1, 1, -1), float("-inf"))
+        # Key padding only -- no causal component, since the single query row
+        # attends the whole cache.  Left padding is contiguous per row, so the
+        # window form reaches the fused kernel; ``_append_kv`` now hands over the
+        # capacity buffer plus its length rather than a stride-gapped slice, which
+        # is what used to make the kernel copy the whole cache per layer per step
+        # and kept this call on SDPA.  With that gone the kernel is 1.45-1.88x
+        # faster here even at ``T_q == 1``.
+        t_k = key_valid.size(1)
+        kv_lens = torch.full((B,), t_k, dtype=torch.int32, device=x.device)
+        kv_starts = (t_k - key_valid.sum(dim=1)).to(torch.int32)
 
-        x = self._forward_layers(x, cos, sin, state, attn_mask)
+        x = self._forward_layers(x, cos, sin, state, {"kv_lens": kv_lens, "kv_starts": kv_starts})
         logits = self.lm_head(self.norm(x))
         state["pos"] = state["pos"] + 1
         return logits[:, -1], state

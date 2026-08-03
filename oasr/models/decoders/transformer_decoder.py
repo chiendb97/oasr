@@ -42,6 +42,7 @@ from oasr.layers import (
     Linear,
     RowParallelLinear,
 )
+from oasr.models.base import align_out_features, init_pad_rows
 
 from .base import BaseDecoder, DecoderState
 
@@ -282,7 +283,15 @@ class TransformerDecoder(nn.Module):
             ]
         )
         self.after_norm = LayerNorm(d_model, eps=TORCH_EPS)
-        self.output_layer = Linear(d_model, config.vocab_size)
+        # Allocated at an aligned width, like every other output projection in
+        # the tree (Paraformer's 8404 head, the transducer joiner's 500): the
+        # CUTLASS alignment-8 iterators cannot address a raw vocabulary such as
+        # U2++'s 5002, and padding here — with the checkpoint widened on load —
+        # is what puts it on a kernel instead of stranding it.  Padding classes
+        # get a PAD_LOGIT bias so they can never win an argmax, and contribute
+        # ~0 to a softmax denominator, so rescoring scores are unchanged.
+        self.output_layer = Linear(d_model, align_out_features(config.vocab_size))
+        init_pad_rows(self.output_layer, config.vocab_size)
 
     def forward(
         self,

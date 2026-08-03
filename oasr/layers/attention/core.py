@@ -50,10 +50,26 @@ regardless of how little work the attention itself does — so the fusion rule i
 necessary but not sufficient, and closing the canonical-stride requirement is
 worth more than any further tuning of it.
 
-Left over for SDPA for structural reasons: a causal mask, an arbitrary boolean
-mask, and **left** padding (valid keys are ``[P - len, P)``, which is not a
-length).  Materializing any of those into a full bias tensor to reach the
-fused kernel would cost more than it saves.
+``kv_starts`` is the left-padding half of the same window — valid keys are
+``[kv_starts[b], kv_lens[b])`` — pushed into the kernel as a second length
+vector rather than a materialized mask, so a left-padded batched prompt (HF's
+masked-generate convention, which is how the speech-LLM decoder arrives) is
+kernel-eligible on the same terms as right padding.
+
+``is_causal`` splits on whether anything else is masked, and the two halves go
+opposite ways.  Causal *alone* stays on SDPA: it has a flash path for exactly
+that and needs no mask tensor.  Causal *combined* with a window is fused above
+:data:`~oasr.layers._backend.FMHA_CAUSAL_WINDOW_MIN_MACS`, because SDPA refuses
+``is_causal`` alongside ``attn_mask`` — so the caller has to materialize a
+``(B, 1, T_q, T_k)`` tensor and loses flash with it.  Worth 1.8-3.3× on the
+attention op at Qwen2-Audio-7B prefill shapes, which dilutes to 1.03-1.05× over
+the full 32-layer prefill (the layer is GEMM-dominated).
+
+Left over for SDPA: an arbitrary boolean/broadcast ``attn_mask``.  Not a missing
+kernel — any boolean mask is expressible as an additive ``attn_bias`` — but
+expanding a broadcast mask to reach the kernel would allocate the very tensor the
+fused path exists to avoid.  Padding should arrive as ``kv_lens``/``kv_starts``,
+which need no materialization at all.
 
 Shapes the CuteDSL kernel cannot compile at all also land on SDPA.  That is
 asked, not assumed: ``oasr.fmha`` *raises* on such a config, because a caller
@@ -75,7 +91,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .._backend import SERVED_DTYPES, out_of_scope, take_gap, take_policy, use_fmha_kernel
+from .._backend import (
+    FMHA_CAUSAL_WINDOW_MIN_MACS,
+    SERVED_DTYPES,
+    out_of_scope,
+    take_gap,
+    take_policy,
+    use_fmha_kernel,
+)
 
 
 def split_heads(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
@@ -90,10 +113,21 @@ def merge_heads(x: torch.Tensor) -> torch.Tensor:
     return x.transpose(1, 2).contiguous().view(B, T, H * D)
 
 
-def kv_length_mask(kv_lens: torch.Tensor, t_k: int) -> torch.Tensor:
-    """``(B,)`` valid key lengths → broadcastable bool mask ``(B, 1, 1, T_k)``."""
+def kv_length_mask(
+    kv_lens: torch.Tensor,
+    t_k: int,
+    kv_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """``(B,)`` valid key lengths → broadcastable bool mask ``(B, 1, 1, T_k)``.
+
+    With ``kv_starts`` the valid window is ``[start, len)`` (left *and* right
+    padding) instead of ``[0, len)``.
+    """
     idx = torch.arange(t_k, device=kv_lens.device)
-    return (idx.unsqueeze(0) < kv_lens.to(kv_lens.device).unsqueeze(1)).view(-1, 1, 1, t_k)
+    keep = idx.unsqueeze(0) < kv_lens.to(kv_lens.device).unsqueeze(1)
+    if kv_starts is not None:
+        keep = keep & (idx.unsqueeze(0) >= kv_starts.to(kv_lens.device).unsqueeze(1))
+    return keep.view(-1, 1, 1, t_k)
 
 
 class Attention(nn.Module):
@@ -166,6 +200,8 @@ class Attention(nn.Module):
         v: torch.Tensor,
         *,
         kv_lens: Optional[torch.Tensor] = None,
+        kv_starts: Optional[torch.Tensor] = None,
+        kv_extent: Optional[int] = None,
         attn_bias: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         is_causal: bool = False,
@@ -178,8 +214,25 @@ class Attention(nn.Module):
         Parameters
         ----------
         kv_lens : Tensor, optional
-            ``(B,)`` — keys ``[0, kv_lens[b])`` are valid.  Right padding only;
-            left padding is not a length and must come in as ``attn_mask``.
+            ``(B,)`` — keys ``[0, kv_lens[b])`` are valid (right padding).
+        kv_extent : int, optional
+            Logical length of the cache when ``k``/``v`` are a **capacity
+            buffer** wider than the cached region — upstream FlashAttention's
+            KV-cache convention, and the reason it exists: a
+            ``k_buf[:, :, :t]`` slice has a stride gap, so the fused kernel
+            (which needs a compact layout) has to copy the whole cache, once
+            per layer per call.  Handing over the buffer plus its length instead
+            costs nothing — the K loop is bounded by ``kv_lens`` either way —
+            and measured **1.23-1.54×** on prefill geometry and **1.45-1.88×**
+            at a decode step, bit-identical.  The SDPA path has the opposite
+            preference (it would compute the whole buffer), so it slices here.
+        kv_starts : Tensor, optional
+            ``(B,)`` — first valid key index, i.e. **left** padding; requires
+            ``kv_lens``, which supplies the other end of the window.  Both are
+            kernel-eligible: the pair travels as two length vectors, not as a
+            materialized mask.  A fully masked query row comes back as zeros
+            (the kernel's documented empty-row clamp) where SDPA's math backend
+            would give NaN.
         attn_bias : Tensor, optional
             Additive float bias shaped exactly ``(B, num_heads, T_q, T_k)``.
             Kernel-eligible.  A bias that only broadcasts (``(B, 1, 1, T_k)``)
@@ -192,7 +245,12 @@ class Attention(nn.Module):
             Causal masking over the ``(T_q, T_k)`` grid.  Forces the SDPA path,
             which has a dedicated flash implementation for it.
         """
-        if self._kernel_eligible(q, kv_lens, attn_bias, attn_mask, is_causal):
+        if kv_starts is not None and kv_lens is None:
+            raise ValueError("kv_starts requires kv_lens — together they bound the key window")
+        if kv_extent is not None and kv_lens is None:
+            raise ValueError("kv_extent requires kv_lens — the length is what bounds the loop")
+
+        if self._kernel_eligible(q, k, kv_lens, kv_starts, attn_bias, attn_mask, is_causal):
             from oasr.attention import fmha
 
             fused: torch.Tensor = fmha(
@@ -202,15 +260,28 @@ class Attention(nn.Module):
                 softmax_scale=self.softmax_scale,
                 attn_bias=attn_bias,
                 cache_seqlens=kv_lens,
+                cache_seqstarts=kv_starts,
+                causal=is_causal,
             )
             return fused
 
+        # SDPA computes every column it is handed, so trim a capacity buffer back
+        # to its cached extent here — the mirror of the kernel path above, which
+        # wants the buffer whole precisely because slicing it would force a copy.
+        if kv_extent is not None and kv_extent < k.size(2):
+            k, v = k[:, :, :kv_extent], v[:, :, :kv_extent]
+
         mask = attn_mask
         if kv_lens is not None:
-            length_mask = kv_length_mask(kv_lens, k.size(2))
+            length_mask = kv_length_mask(kv_lens, k.size(2), kv_starts)
             mask = length_mask if mask is None else _combine_masks(mask, length_mask)
         if attn_bias is not None:
             mask = attn_bias if mask is None else _combine_masks(mask, attn_bias)
+
+        if is_causal and mask is not None:
+            # SDPA raises when given both, so fold the triangle into the mask.
+            mask = _fold_causal(mask, q.size(2), k.size(2))
+            is_causal = False
 
         out: torch.Tensor = F.scaled_dot_product_attention(
             q,
@@ -226,7 +297,9 @@ class Attention(nn.Module):
     def _kernel_eligible(
         self,
         q: torch.Tensor,
+        k: torch.Tensor,
         kv_lens: Optional[torch.Tensor],
+        kv_starts: Optional[torch.Tensor],
         attn_bias: Optional[torch.Tensor],
         attn_mask: Optional[torch.Tensor],
         is_causal: bool,
@@ -237,14 +310,41 @@ class Attention(nn.Module):
             return out_of_scope("CPU tensor")
         if q.dtype not in SERVED_DTYPES:
             return out_of_scope(f"dtype {q.dtype}")
-        if attn_mask is not None or is_causal:
-            # A kernel gap, not a fact of life: the FMHA kernel has no causal
-            # mode and no left-padding mode, so these shapes cannot be
-            # expressed to it at all.
-            return take_gap(
-                "fmha-mask-form", "causal" if is_causal else "boolean / left-padded mask"
-            )
-        if kv_lens is None and attn_bias is None:
+        if attn_mask is not None:
+            # An arbitrary mask, in whatever form and broadcast shape SDPA
+            # takes.  The kernel absorbs a full `(B, H, T_q, T_k)` additive
+            # bias, so this is expressible — but expanding a broadcast mask to
+            # get there allocates exactly the tensor the fused path exists to
+            # avoid.  A caller who already has the full grid should pass it as
+            # `attn_bias`; left/right padding should come in as `kv_starts` /
+            # `kv_lens`, which need no materialization at all.
+            return take_policy("fmha-mask-materialize")
+        if is_causal and kv_lens is None and attn_bias is None:
+            # Causal and *nothing else*: SDPA has a flash implementation for
+            # exactly this and needs no mask tensor, while the fused path pays a
+            # ~78 us floor at any T (the canonical-stride copies plus the
+            # wrapper).  Measured 0.22x at T=32, 0.83x at T=800 (D=128), 1.19x
+            # at T=2048 (D=64), and every causal-only shape in this repo is
+            # short — Whisper's SOT prefill is 4 tokens, the WeNet decoder's
+            # teacher-forced pass ~40.  Revisit when the stride requirement
+            # goes; the crossover moves with it.
+            #
+            # Causal *combined* with a window is a different question and is
+            # handled below: SDPA rejects `is_causal` alongside `attn_mask`, so
+            # the combination costs it a materialized (B, 1, T_q, T_k) tensor
+            # **and** its flash path.  That is where the fusion pays: measured
+            # 1.80-3.29x on the attention op at Qwen2-Audio-7B prefill shapes
+            # (causal + left pad, B2-8, P512-1600, D128, bf16, real call-site
+            # strides), 1.03-1.05x over the whole prefill.
+            return take_policy("fmha-causal-short")
+        if is_causal:
+            # Causal + a window.  Worth fusing only above the work floor that
+            # amortizes the fused path's fixed cost — see
+            # FMHA_CAUSAL_WINDOW_MIN_MACS for the sweep.
+            macs = q.size(0) * q.size(1) * q.size(2) * k.size(2) * q.size(3)
+            if macs < FMHA_CAUSAL_WINDOW_MIN_MACS:
+                return take_policy("fmha-causal-window-small")
+        if kv_lens is None and attn_bias is None and kv_starts is None:
             # Nothing to fuse, and SDPA measured faster — see the table above.
             # A policy call today; closing it is kernel work.
             return take_policy("fmha-unmasked")
@@ -256,6 +356,7 @@ class Attention(nn.Module):
             dtype_str="float16" if q.dtype is torch.float16 else "bfloat16",
             has_bias=attn_bias is not None,
             bias_aligned=attn_bias is not None and attn_bias.size(-1) % 2 == 0,
+            causal=is_causal,
         ):
             return take_gap("fmha-head-dim", f"head_dim={self.head_dim}")
         return True
@@ -266,6 +367,30 @@ class Attention(nn.Module):
             f"num_kv_heads={self.num_kv_heads}, scale={self.softmax_scale}, "
             f"backend={self.backend}"
         )
+
+
+def _fold_causal(mask: torch.Tensor, t_q: int, t_k: int) -> torch.Tensor:
+    """Intersect ``mask`` with a top-left causal triangle, diagonal kept open.
+
+    Needed because SDPA refuses ``is_causal`` alongside an explicit mask, so a
+    causal *window* has to arrive as one tensor.  Keeping the diagonal open is a
+    NaN guard, not a semantic change: for a query row inside the valid window
+    the diagonal is allowed by both the triangle and the window already, so this
+    only affects rows outside it — a left pad row, whose every causal key is
+    padding.  Those rows would otherwise softmax over all ``-inf`` and come back
+    NaN, and a NaN pad row poisons *real* rows in the next layer (a masked key
+    contributes weight 0, and ``0 * NaN`` is NaN).  The fused kernel avoids the
+    same trap differently, via its empty-row clamp to zero, so the two backends
+    agree on every row a caller can legitimately read.
+    """
+    device = mask.device
+    idx_q = torch.arange(t_q, device=device).unsqueeze(1)
+    idx_k = torch.arange(t_k, device=device).unsqueeze(0)
+    combined = _combine_masks(mask, (idx_k <= idx_q).view(1, 1, t_q, t_k))
+    eye = (idx_k == idx_q).view(1, 1, t_q, t_k)
+    if combined.dtype == torch.bool:
+        return combined | eye
+    return combined.masked_fill(eye.expand_as(combined), 0.0)
 
 
 def _combine_masks(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

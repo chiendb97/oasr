@@ -218,7 +218,7 @@ def _extract_tokens(
     for b in range(batch):
         batch_tokens = []
         for k in range(beam_size):
-            length = out_lengths_cpu[b, k].item()
+            length = int(out_lengths_cpu[b, k])
             batch_tokens.append(out_tokens_cpu[b, k, :length].tolist())
         tokens.append(batch_tokens)
     return tokens
@@ -938,6 +938,9 @@ class GpuStreamingDecoder:
         device = states[0].buffer.device
         use_paged = 1 if cfg.use_paged_memory else 0
         self._ensure_peek_buffers(n, beam, msl, device)
+        assert self._peek_dev_tokens is not None  # postcondition of _ensure_peek_buffers
+        assert self._peek_dev_lengths is not None
+        assert self._peek_dev_scores is not None
         dev_tok = self._peek_dev_tokens[:n]
         dev_len = self._peek_dev_lengths[:n]
         dev_sco = self._peek_dev_scores[:n]
@@ -981,6 +984,9 @@ class GpuStreamingDecoder:
             return []
         if handle.eager is not None:
             return handle.eager
+        assert handle.event is not None  # a non-eager handle carries the async trio
+        assert handle.tokens_cpu is not None
+        assert handle.lengths_cpu is not None
         handle.event.synchronize()
         n, beam = handle.n, handle.beam
         tok = handle.tokens_cpu

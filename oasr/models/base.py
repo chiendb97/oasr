@@ -160,6 +160,25 @@ def align_out_features(out_features: int, alignment: int = 8) -> int:
     return ((out_features + alignment - 1) // alignment) * alignment
 
 
+def init_pad_rows(projection: Any, raw_out_features: int) -> None:
+    """Neutralize the padding rows of a freshly constructed aligned projection.
+
+    :func:`pad_output_projection` establishes "a padding class can never win an
+    argmax" when a *checkpoint* is loaded.  A module that has only been
+    constructed has random values there, so the invariant would hold by load
+    order rather than by construction — and a test (or any consumer that loads a
+    state dict non-strictly) can observe a padding class winning.  Setting the
+    rows here makes it true unconditionally; a subsequent load overwrites them
+    with the same values.
+    """
+    with torch.no_grad():
+        if projection.weight.shape[0] > raw_out_features:
+            projection.weight[raw_out_features:].zero_()
+        bias = getattr(projection, "bias", None)
+        if bias is not None and bias.shape[0] > raw_out_features:
+            bias[raw_out_features:].fill_(PAD_LOGIT)
+
+
 def pad_output_projection(
     state_dict: MutableMapping[str, torch.Tensor],
     prefix: str,

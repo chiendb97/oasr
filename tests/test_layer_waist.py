@@ -404,6 +404,27 @@ class TestBackendSelection:
 class TestKernelGapRegistry:
     """Missing kernels are declared debt, not invisible fallbacks."""
 
+    #: The gaps declared when this line was last updated.  Closing one is the
+    #: goal, so removing an entry passes; *adding* one has to be a deliberate
+    #: edit here, which is what puts it in front of a reviewer.
+    #:
+    #: ``norm-strided-rows`` was closed by fixing the launchers' row-density
+    #: precondition, ``fmha-mask-form`` by giving the kernel a per-row key start
+    #: (left padding), and unaligned output projections never became a gap at
+    #: all — they were closed at the model layer by widening the head on load.
+    PINNED = {"fmha-head-dim"}
+
+    def test_declared_gap_set_only_shrinks(self):
+        from oasr.layers._backend import KERNEL_GAPS
+
+        new = set(KERNEL_GAPS) - self.PINNED
+        assert not new, (
+            f"new kernel gap(s) declared: {sorted(new)}. A gap is coverage debt — "
+            f"if it is genuinely unavoidable, add it to PINNED in this test so the "
+            f"declaration is visible in review; otherwise fix it at the kernel or "
+            f"model layer."
+        )
+
     def test_every_declared_gap_says_where_to_fix_it(self):
         from oasr.layers._backend import KERNEL_GAPS
 
@@ -556,3 +577,112 @@ class TestKernelAndTorchPathsAgree:
                 ref = a(q, k, v, **kwargs)
             assert not torch.isnan(got).any()
             torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestLeftPaddedWindowRouting:
+    """``kv_starts`` is a kernel-eligible mask form, and the causal combination
+    is routed on measured work — the two halves of what closed
+    ``fmha-mask-form``."""
+
+    @staticmethod
+    def _qkv(B, H, T_q, T_k, D, dtype=torch.float16):
+        torch.manual_seed(0)
+        q = torch.randn(B, H, T_q, D, device="cuda", dtype=dtype)
+        k = torch.randn(B, H, T_k, D, device="cuda", dtype=dtype)
+        v = torch.randn(B, H, T_k, D, device="cuda", dtype=dtype)
+        return q, k, v
+
+    def test_left_padding_reaches_the_kernel(self):
+        from oasr.layers import Attention
+        from oasr.layers._backend import gap_hits, policy_hits, reset_backend_stats
+
+        a = Attention(4, 64)
+        q, k, v = self._qkv(2, 4, 96, 128, 64)
+        lens = torch.tensor([128, 128], device="cuda", dtype=torch.int32)
+        starts = torch.tensor([16, 48], device="cuda", dtype=torch.int32)
+        reset_backend_stats()
+        a(q, k, v, kv_lens=lens, kv_starts=starts)
+        assert not gap_hits(), "left padding is no longer a declared gap"
+        assert not policy_hits(), "a plain left-padded window should fuse"
+
+    def test_kernel_and_torch_agree_on_a_left_padded_window(self):
+        from oasr.layers import Attention
+        from oasr.layers._backend import layers_backend_override
+
+        a = Attention(4, 64)
+        q, k, v = self._qkv(3, 4, 128, 160, 64)
+        lens = torch.tensor([160, 120, 160], device="cuda", dtype=torch.int32)
+        starts = torch.tensor([32, 8, 100], device="cuda", dtype=torch.int32)
+        got = a(q, k, v, kv_lens=lens, kv_starts=starts)
+        with layers_backend_override("torch"):
+            ref = a(q, k, v, kv_lens=lens, kv_starts=starts)
+        finite = torch.isfinite(ref)
+        torch.testing.assert_close(got[finite], ref[finite], atol=2e-2, rtol=2e-2)
+
+    def test_causal_window_fuses_above_the_work_floor(self):
+        """Causal + a window costs SDPA a materialized mask *and* its flash
+        path, so above the measured floor the fused kernel is the right call."""
+        from oasr.layers import Attention
+        from oasr.layers._backend import (
+            FMHA_CAUSAL_WINDOW_MIN_MACS,
+            gap_hits,
+            policy_hits,
+            reset_backend_stats,
+        )
+
+        B, H, T, D = 4, 28, 512, 128
+        assert B * H * T * T * D >= FMHA_CAUSAL_WINDOW_MIN_MACS
+        a = Attention(H, D)
+        q, k, v = self._qkv(B, H, T, T, D, dtype=torch.bfloat16)
+        lens = torch.full((B,), T, device="cuda", dtype=torch.int32)
+        starts = torch.tensor([0, 32, 64, 96], device="cuda", dtype=torch.int32)
+        reset_backend_stats()
+        out = a(q, k, v, kv_lens=lens, kv_starts=starts, is_causal=True)
+        assert not gap_hits()
+        assert not policy_hits(), f"expected the fused path, got {policy_hits()}"
+        assert torch.isfinite(out).all()
+
+    def test_causal_window_stays_on_sdpa_below_the_work_floor(self):
+        """Below it the fused path's fixed stride-copy cost dominates — measured
+        0.34x at 4 MMACs.  A capability that is not always a win."""
+        from oasr.layers import Attention
+        from oasr.layers._backend import (
+            FMHA_CAUSAL_WINDOW_MIN_MACS,
+            policy_hits,
+            reset_backend_stats,
+        )
+
+        B, H, T, D = 1, 4, 128, 64
+        assert B * H * T * T * D < FMHA_CAUSAL_WINDOW_MIN_MACS
+        a = Attention(H, D)
+        q, k, v = self._qkv(B, H, T, T, D)
+        lens = torch.full((B,), T, device="cuda", dtype=torch.int32)
+        starts = torch.tensor([16], device="cuda", dtype=torch.int32)
+        reset_backend_stats()
+        a(q, k, v, kv_lens=lens, kv_starts=starts, is_causal=True)
+        assert policy_hits().get("fmha-causal-window-small") == 1
+
+    def test_sdpa_side_keeps_a_fully_padded_row_finite(self):
+        """The SDPA path must not hand back NaN pad rows: a masked key still
+        contributes ``0 * NaN`` in the next layer, so one NaN pad row poisons
+        every real row.  The kernel clamps empty rows to zero; the torch path
+        keeps the diagonal open to the same end."""
+        from oasr.layers import Attention
+        from oasr.layers._backend import layers_backend_override
+
+        a = Attention(4, 64)
+        q, k, v = self._qkv(2, 4, 64, 64, 64)
+        lens = torch.full((2,), 64, device="cuda", dtype=torch.int32)
+        starts = torch.tensor([32, 40], device="cuda", dtype=torch.int32)
+        with layers_backend_override("torch"):
+            out = a(q, k, v, kv_lens=lens, kv_starts=starts, is_causal=True)
+        assert torch.isfinite(out).all()
+
+    def test_start_without_length_raises(self):
+        from oasr.layers import Attention
+
+        a = Attention(4, 64)
+        q, k, v = self._qkv(1, 4, 8, 8, 64)
+        with pytest.raises(ValueError, match="requires kv_lens"):
+            a(q, k, v, kv_starts=torch.zeros(1, device="cuda", dtype=torch.int32))

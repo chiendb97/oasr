@@ -56,12 +56,105 @@ closed. Three cases, kept apart on purpose:
 optional backend, used by the CPU oracles and as the "is this the kernels'
 fault" A/B). There is no `auto`.
 
-The remaining declared gaps, all of them kernel-side:
+One declared gap remains, kernel-side:
 
 | Gap | Missing | Costs |
 |---|---|---|
 | `fmha-head-dim` | head dims so wide that even a 1-deep cp.async ring overflows smem (>256 on a 99 KB arch) | nothing in-tree reaches it |
-| `fmha-mask-form` | FMHA has no causal mode and no left-padding mode | Whisper's prefill and Qwen2's left-padded prompts stay on SDPA |
+
+`fmha-mask-form` was here and is closed. The kernel masked keys by per-row
+*length* only — `[0, len)` — so a per-row key **start** had no form to arrive in
+and left padding (HF's masked-generate convention, which is what a batched LLM
+prompt is) could not be expressed at all. It now takes a second `(B,)` vector,
+`mCacheSeqStarts`, compared against the column index in the same mask predicate
+that already handled the length; when the caller passes no starts the wrapper
+hands over a zero-rank dummy and the predicate const-folds away, so the existing
+path compiles to the same kernel it did before. Verified against SDPA across
+start-inside-a-tile / start-past-a-whole-tile / both-ends / wide-head / bf16
+shapes, and composed with causal.
+
+The interesting part was the *routing*, not the kernel. `is_causal` was already
+implemented and deliberately routed to SDPA (`fmha-causal-short`) because SDPA
+has a flash path for it and the fused path has a fixed ~68 µs floor. But causal
+*combined* with a window is the opposite case: SDPA refuses `is_causal` alongside
+`attn_mask`, so the caller must materialize a `(B, 1, T_q, T_k)` tensor and
+forfeits flash with it. Measured on Qwen2-Audio-7B prefill geometry, bf16, with
+the strides the real call site produces — **1.80–3.29× faster fused on the
+attention op**. That is the op, not the model: a 7B prefill layer is dominated by
+its d=3584 GEMMs, so the same change is **1.03–1.05×** over the whole 32-layer
+prefill and **1.013×** over an engine `transcribe_offline` with a short
+generation, transcript-identical. Both of those were measured with the arms
+**interleaved**, which matters — a single-order A/B first read 0.876× and that was
+the second arm benefiting from a warm allocator, not the fused path losing.
+
+The crossover is at ~1 G MACs (`FMHA_CAUSAL_WINDOW_MIN_MACS`), and the two shapes
+either side of it land on the same ratio despite different B, H, P and D — which
+is what a fixed floor being amortized predicts and a shape rule would not. One
+LJSpeech utterance at B=1 or B=2 falls below it and stays on SDPA, so the win
+lands on batched prefill, which is the serving case.
+`Qwen2Lm.prefill` now hands the core its window instead of building the mask;
+`step` keeps its explicit mask, for a reason that is about the *cache* rather
+than the mask (in capacity-preallocated mode its K/V are `k_buf[:, :, :t]`
+slices, which the fused kernel would copy whole, once per layer per step).
+
+One consequence worth knowing: a query row whose entire window is padding comes
+back **zero** from the kernel (its documented empty-row clamp) where SDPA's math
+backend gives NaN. Zero is the safe answer — a NaN pad row is not inert, because
+in the next layer a masked key still contributes `0 * NaN` and poisons the *real*
+rows. The torch path reaches the same end differently, by keeping the diagonal
+open, so both backends agree on every row a caller can legitimately read.
+
+### What a pass over upstream FlashAttention's CuteDSL kernels changed
+
+Read against `flash_attn/cute` (`block_info.py`, `mask.py`, `seqlen_info.py`,
+`interface.py`), three differences mattered.
+
+**FA bounds the K loop at both ends; this kernel only bounded the top.**
+`BlockInfo.get_n_block_min_max` computes `n_block_min` from the window-left edge
+as well as `n_block_max` from the diagonal. Ours ran to block 0 always, so a
+left-padded batch loaded, MMA'd and then `-inf`-masked every block below its
+start — the exact waste that made unbounded causal *slower* than SDPA. Fixed.
+Measured at Qwen2 prefill geometry, cost is now proportional to what is actually
+attended: with the bound 258/214/183/164 µs at 0/25/50/75 % padding, against a
+flat ~257 µs without it. Zero padding costs the same either way, so nothing on
+the existing path regressed.
+
+**FA expresses a per-row key start as a tensor offset, not a mask.**
+`SeqlenInfo.offset_k` and `PagedKV.leftpad_k` shift the K/V base so padded rows
+are never touched, and FA has no start predicate at all. That is the better
+answer where it applies, but it depends on FA's **bottom-right** causal
+alignment: shifting K also shifts the diagonal. This kernel is top-left aligned
+to match `torch`'s `is_causal`, which every parity test compares against, so a
+K-only offset would move the diagonal out from under the mask. Keeping the
+predicate and bounding the loop gets the block-level work back without changing
+the convention.
+
+**FA never slices a KV cache — and that was costing us more than the mask.**
+FA requires only `stride(-1) == 1` and passes the tensor's real `dim_order()`
+into `mark_compact_shape_dynamic`; our `_ensure_canonical` demands strictly
+C-order strides and copies otherwise. A `k_buf[:, :, :t]` capacity slice has a
+stride *gap*, so it is not expressible either way — which is why FA passes the
+**whole buffer plus `cache_seqlens`** and lets the length bound the loop. Doing
+the same (`Attention(kv_extent=...)`, `Qwen2Lm._append_kv` returning buffer +
+length) is bit-identical and **1.23–1.54×** on prefill geometry, **1.45–1.88×**
+at a decode step. It also retired the reason `Qwen2Lm.step` was on SDPA: that
+reason was the per-layer cache copy, and the copy was avoidable. Paired,
+interleaved, on the real 7B: putting Qwen2's attention on the kernel is now
+**1.082×** end-to-end at 8 new tokens and **1.109×** at 32, transcript-identical
+— against 1.013× for prefill-only fusion before this pass.
+
+That change also surfaced a precondition worth stating: **`v` must be finite
+wherever the kernel can read**, which is up to the K *tile* boundary above
+`cache_seqlens`, not up to the length itself. Columns past the length get zero
+softmax weight and *finite* stale data there is provably inert (verified to
+1e4 — that is what makes a recycled paged pool and a padded feature batch safe).
+`NaN`/`Inf` are not: the weight is zero, but `0 * NaN` is `NaN` and it enters
+through `P @ V` where no mask can intercept it. A `new_empty` capacity cache
+therefore corrupted output — and did so *non-deterministically*, which parity
+tests structurally cannot catch, since each individual run looks plausible. The
+cache is zeroed now, and the guard is a zeroed-tail assertion rather than a
+parity check. Predicating the load against the length, as FA does, is what would
+retire the precondition entirely.
 
 `norm-strided-rows` was also here and is closed. Every norm kernel walks rows
 as `base + row * hidden`, and the launchers checked only `stride(-1) == 1` —
@@ -99,6 +192,16 @@ one. `test_no_architecture_needs_an_unaligned_gemm` keeps them closed.
 Capability is necessary but not sufficient, and the two measured policies that
 make up the rest live here rather than in any model:
 
+* **Causal stays on SDPA — measured, not missing.** The kernel does causal
+  masking with per-CTA block skipping (`n_block_max` bounded by the diagonal),
+  verified against SDPA. Plumbing the flag through *without* the skipping
+  measured 1.4–4.8× slower, because the mask was applied per element while every
+  row block still scanned all of K; adding the bound took a qwen2-prefill shape
+  from 282.6 → 199.8 µs and the fused path now overtakes SDPA at T=2048. It is
+  still not selected, because the fused path has a ~78 µs floor at any T
+  (canonical-stride copies + wrapper) and every causal shape in this repo is
+  short: Whisper's SOT prefill is 4 tokens, the WeNet decoder's teacher-forced
+  pass ~40. The crossover moves when the stride requirement goes.
 * **Attention fuses only when there is a mask to fuse.** Measured with
   head-split views, which is what real call sites pass: `kv_lens` shapes range
   1.16–2.10× faster, unmasked is a wash at 1.01×, and a masked shape with a

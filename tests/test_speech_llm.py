@@ -681,3 +681,63 @@ class TestRealCheckpoint:
             "printing in the only sense with which we are at present concerned" in texts[0].lower()
         )
         assert "in being comparatively modern" in texts[1].lower()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestDecoderCacheIsKernelSafe:
+    """The capacity-preallocated KV cache is handed to the attention kernel
+    *whole* (buffer + length), which is what lets it skip a per-layer copy of a
+    stride-gapped slice.  That makes the buffer's untouched tail readable by the
+    kernel's last partial K block, so it must be zeroed: uninitialized memory
+    there can hold NaN, and a NaN in ``v`` survives any mask through ``P @ V``.
+
+    The symptom is not a wrong answer on one run — it is *different* answers on
+    repeated identical runs, which parity tests cannot see because each run
+    looks plausible on its own.
+    """
+
+    def _lm(self):
+        from oasr.models.speech_llm.config import SpeechLlmModelConfig
+        from oasr.models.speech_llm.llm import Qwen2Lm
+
+        torch.manual_seed(0)
+        cfg = SpeechLlmModelConfig(
+            vocab_size=256,
+            text_hidden_size=4 * 64,
+            text_num_attention_heads=4,
+            text_num_key_value_heads=4,
+            text_num_hidden_layers=2,
+            text_intermediate_size=256,
+        )
+        return Qwen2Lm(cfg).cuda().to(torch.float16).eval()
+
+    def test_preallocated_cache_tail_is_zeroed(self):
+        lm = self._lm()
+        B, P = 2, 96
+        with torch.inference_mode():
+            emb = lm.embed_tokens(torch.randint(0, 256, (B, P), device="cuda"))
+            valid = torch.ones(B, P, dtype=torch.bool, device="cuda")
+            _, state = lm.prefill(emb, valid, capacity=P + 40)
+        for buf in list(state["k"]) + list(state["v"]):
+            tail = buf[:, :, P:]
+            assert torch.isfinite(buf).all(), "cache holds non-finite values"
+            torch.testing.assert_close(tail, torch.zeros_like(tail))
+
+    def test_repeated_runs_agree(self):
+        """Determinism, which is what the uninitialized tail actually broke."""
+        lm = self._lm()
+        B, P = 2, 96
+        outs = []
+        for _ in range(4):
+            with torch.inference_mode():
+                emb = lm.embed_tokens(torch.arange(B * P, device="cuda").remainder(256).view(B, P))
+                valid = torch.ones(B, P, dtype=torch.bool, device="cuda")
+                valid[1, :16] = False
+                logits, state = lm.prefill(emb, valid, capacity=P + 8)
+                toks = [logits.argmax(-1)]
+                for _ in range(4):
+                    logits, state = lm.step(toks[-1], state)
+                    toks.append(logits.argmax(-1))
+            outs.append(torch.stack(toks))
+        for i, o in enumerate(outs[1:], 1):
+            assert torch.equal(o, outs[0]), f"run {i} disagrees with run 0"

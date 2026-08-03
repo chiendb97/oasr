@@ -167,10 +167,17 @@ def _length_to_pad_bias(
     cache_seqlens: torch.Tensor,
     T_kv: int,
     dtype: torch.dtype,
+    cache_seqstarts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Build (B, 1, 1, T_kv) additive mask: 0 in [0, len), -inf outside."""
+    """Build (B, 1, 1, T_kv) additive mask: 0 in ``[start, len)``, -inf outside.
+
+    ``cache_seqstarts`` is the left-padding half of the same window: without it
+    the valid region is ``[0, len)`` (right padding), with it ``[start, len)``.
+    """
     arange = torch.arange(T_kv, device=cache_seqlens.device)
     keep = arange.unsqueeze(0) < cache_seqlens.unsqueeze(1)
+    if cache_seqstarts is not None:
+        keep = keep & (arange.unsqueeze(0) >= cache_seqstarts.unsqueeze(1))
     return torch.where(keep, 0.0, float("-inf")).to(dtype).unsqueeze(1).unsqueeze(1)
 
 
@@ -245,6 +252,8 @@ def _sdpa_reference(
     softmax_scale: float,
     attn_bias: Optional[torch.Tensor],
     cache_seqlens: Optional[torch.Tensor],
+    causal: bool = False,
+    cache_seqstarts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Functional SDPA path producing the same result as the cute kernel."""
     B, H, T_q, D = q.shape
@@ -265,20 +274,32 @@ def _sdpa_reference(
         attn_bias = attn_bias[..., :T_q, :T_kv]
 
     if attn_bias is not None and cache_seqlens is not None:
-        pad = _length_to_pad_bias(cache_seqlens, T_kv, q.dtype)
+        pad = _length_to_pad_bias(cache_seqlens, T_kv, q.dtype, cache_seqstarts)
         full_mask = attn_bias + pad
     elif attn_bias is not None:
         full_mask = attn_bias
     elif cache_seqlens is not None:
-        full_mask = _length_to_pad_bias(cache_seqlens, T_kv, q.dtype)
+        full_mask = _length_to_pad_bias(cache_seqlens, T_kv, q.dtype, cache_seqstarts)
     else:
         full_mask = None
+
+    if causal and full_mask is not None:
+        # SDPA refuses ``is_causal`` alongside an explicit mask, so fold the
+        # triangle in — the kernel composes the two the same way (both masks are
+        # applied, either one is enough to zero the entry).  A length/start mask
+        # is ``(B, 1, 1, T_kv)``, so broadcast to the full grid before writing
+        # the triangle into it.
+        upper = torch.ones(T_q, T_kv, dtype=torch.bool, device=q.device).triu(1)
+        full_mask = full_mask.expand(B, full_mask.size(1), T_q, T_kv).clone()
+        full_mask.masked_fill_(upper.view(1, 1, T_q, T_kv), float("-inf"))
+        causal = False
 
     return F.scaled_dot_product_attention(
         q,
         k,
         v,
         attn_mask=full_mask,
+        is_causal=causal,
         scale=softmax_scale,
     )
 
@@ -379,7 +400,9 @@ def fmha(
     softmax_scale: float,
     attn_bias: Optional[torch.Tensor] = None,
     cache_seqlens: Optional[torch.Tensor] = None,
+    cache_seqstarts: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
+    causal: bool = False,
     out: Optional[torch.Tensor] = None,
     validate: bool = True,
 ) -> torch.Tensor:
@@ -398,9 +421,34 @@ def fmha(
         ``(B, H, T_q, T_k_max)`` additive bias (Transformer-XL matrix_bd, etc.).
         Treated as a post-scale logit (SDPA semantics).
     cache_seqlens : Tensor, optional
-        ``(B,)`` int32. Per-stream valid k-length.
+        ``(B,)`` int32. Per-stream valid k-length — the *end* of the window.
+
+        **Precondition:** ``v`` must be finite everywhere the kernel can read,
+        which is up to the K tile boundary above ``cache_seqlens`` — not just up
+        to ``cache_seqlens`` itself. Columns past the length are correctly given
+        zero softmax weight, and *finite* stale data there is provably inert
+        (verified for magnitudes up to 1e4, which is what makes it safe to hand
+        over a recycled paged pool or a padded feature batch). ``NaN``/``Inf``
+        are not: the weight is zero but ``0 * NaN`` is ``NaN``, and it enters
+        through the ``P @ V`` matmul where no mask can intercept it. So a
+        capacity-preallocated cache must be **zero-initialized**, never
+        ``empty``. Upstream FlashAttention removes the precondition instead, by
+        predicating the K/V load against the sequence length rather than the
+        tensor bounds; doing the same here would be the way to retire it.
+    cache_seqstarts : Tensor, optional
+        ``(B,)`` int32. Per-stream first valid k-index — the *start* of the
+        window, i.e. **left** padding.  Requires ``cache_seqlens``; together
+        they mask everything outside ``[start, len)``.  This is the form a
+        left-padded batched prompt needs (HF's masked-generate convention),
+        which a length vector alone cannot express.
     block_table : Tensor, optional
         ``(B, max_blocks_per_seq)`` int32. When provided, k/v are paged.
+    causal : bool, default False
+        Mask ``k_col > q_row`` — a **top-left**-aligned causal diagonal, which
+        is what ``torch``'s ``is_causal`` also does, so the two agree.  Only
+        meaningful when ``T_q == T_k``: with a shorter query the top-left
+        diagonal is not the "attend everything up to me" a decode step wants.
+        Composes with ``cache_seqlens`` (both masks are applied).
     out : Tensor, optional
         Pre-allocated ``(B, H, T_q, D)`` output.
     validate : bool, default True
@@ -417,6 +465,7 @@ def fmha(
     B, H, T_q, D = q.shape
     paged = block_table is not None
     if paged:
+        assert block_table is not None  # narrowing for the type checker
         H_kv = k.size(2)
         block_size = k.size(1)
         # Pad the caller's bias up to the cute kernel's CTA tile and trim
@@ -457,7 +506,16 @@ def fmha(
             attn_bias = attn_bias.to(q.dtype)
         if cache_seqlens is not None and cache_seqlens.dtype != torch.int32:
             cache_seqlens = cache_seqlens.to(torch.int32)
-        if paged and block_table.dtype != torch.int32:
+        if cache_seqstarts is not None:
+            if cache_seqlens is None:
+                raise ValueError("cache_seqstarts requires cache_seqlens (it bounds the window)")
+            if cache_seqstarts.dim() != 1 or cache_seqstarts.size(0) != B:
+                raise ValueError(
+                    f"cache_seqstarts must be (B,) = ({B},); got {tuple(cache_seqstarts.shape)}"
+                )
+            if cache_seqstarts.dtype != torch.int32:
+                cache_seqstarts = cache_seqstarts.to(torch.int32)
+        if block_table is not None and block_table.dtype != torch.int32:
             block_table = block_table.to(torch.int32)
 
     if out is None:
@@ -478,7 +536,7 @@ def fmha(
     # ---- Backend dispatch ---------------------------------------------------
     backend = select_backend()
     if backend == "sdpa" or q.dtype not in (torch.float16, torch.bfloat16):
-        if paged:
+        if block_table is not None:
             k_dense, v_dense = _gather_paged_kv(k, v, block_table)
         else:
             k_dense, v_dense = k, v
@@ -490,6 +548,8 @@ def fmha(
                 softmax_scale,
                 attn_bias,
                 cache_seqlens,
+                causal,
+                cache_seqstarts,
             )
         )
         return out
@@ -510,7 +570,9 @@ def fmha(
         softmax_scale=softmax_scale,
         attn_bias=attn_bias,
         cache_seqlens=cache_seqlens,
+        cache_seqstarts=cache_seqstarts,
         block_table=block_table,
+        causal=causal,
     )
 
 
@@ -802,6 +864,8 @@ def _call_cute_dsl(
     attn_bias: Optional[torch.Tensor],
     cache_seqlens: Optional[torch.Tensor],
     block_table: Optional[torch.Tensor],
+    causal: bool = False,
+    cache_seqstarts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Invoke the TVM-FFI compiled CuteDSL kernel with raw torch tensors.
 
@@ -835,6 +899,8 @@ def _call_cute_dsl(
         paged=paged,
         block_size=block_size,
         bias_aligned=bias_aligned,
+        causal=causal,
+        has_seqstart=(cache_seqstarts is not None),
     )
 
     # Q/K/V/O must have strictly canonical row-major strides; see
@@ -856,14 +922,32 @@ def _call_cute_dsl(
     else:
         seqlens_t = _get_offline_seqlens(B, T_k, device)
 
-    if paged:
+    # cache_seqstarts: a zero-rank dummy when absent — the kernel was compiled
+    # with ``has_seqstart=False``, so the predicate reading it is compiled out.
+    if cache_seqstarts is not None:
+        seqstarts_t = _ensure_canonical(cache_seqstarts)
+    else:
+        seqstarts_t = _get_dummy_block_table(device)
+
+    if block_table is not None:
         block_table_t = _ensure_canonical(block_table)
     else:
         block_table_t = _get_dummy_block_table(device)
 
     stream = _CUstream(torch.cuda.current_stream().cuda_stream)
     # TVM-FFI compiled callable accepts torch tensors directly.
-    fn(q_t, k_t, v_t, o_t, bias_t, seqlens_t, block_table_t, _Float32(float(softmax_scale)), stream)
+    fn(
+        q_t,
+        k_t,
+        v_t,
+        o_t,
+        bias_t,
+        seqlens_t,
+        seqstarts_t,
+        block_table_t,
+        _Float32(float(softmax_scale)),
+        stream,
+    )
     # When ``out`` had non-canonical strides (e.g. caller passed a transpose
     # view) ``_ensure_canonical`` allocated a fresh canonical buffer that the
     # cute kernel writes to; copy the result back so the caller's reference

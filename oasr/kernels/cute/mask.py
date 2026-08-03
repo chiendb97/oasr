@@ -7,7 +7,8 @@ Notes
 Structurally modelled on FlashAttention's ``flash_attn/cute/mask.py``. The
 implementation is OASR-native; only the element-wise ``-inf`` mask path is
 supported (no SM100 R2P bitmask). Causal, local (sliding-window), per-stream
-length, and a generic ``score_mod`` callable are all supported.
+length, per-stream *start* (left padding), and a generic ``score_mod`` callable
+are all supported.
 
 The class operates on the mn-view of an MMA-C accumulator: ``acc_S_mn[r, c]``
 is the (row, col) entry within the Q-tile x K-tile mma output. The tile's
@@ -40,6 +41,13 @@ class AttentionMask:
     side. ``causal == True`` is equivalent to ``window_right == 0`` plus an
     implicit unbounded left window; we keep ``causal`` as a separate flag
     purely for readability.
+
+    ``has_seqstart_k`` adds a per-stream *lower* bound on the key index, which
+    is what left padding needs and what the window bounds cannot express: they
+    are compile-time constants, while the pad amount differs per row. With both
+    ``seqstart_k`` and ``seqlen_k`` the valid range is ``[start, len)``, so an
+    HF-convention left-padded batch (valid keys ``[P - n_b, P)``) arrives as
+    ``start = P - n_b``, ``len = P``.
     """
 
     def __init__(
@@ -50,12 +58,14 @@ class AttentionMask:
         window_right: cutlass.Constexpr,
         has_seqlen_k: cutlass.Constexpr,
         has_seqlen_q: cutlass.Constexpr,
+        has_seqstart_k: cutlass.Constexpr = False,
     ):
         self.causal = causal
         self.window_left = window_left
         self.window_right = window_right
         self.has_seqlen_k = has_seqlen_k
         self.has_seqlen_q = has_seqlen_q
+        self.has_seqstart_k = has_seqstart_k
 
     @cute.jit
     def apply(
@@ -65,6 +75,7 @@ class AttentionMask:
         seqlen_q: cutlass.Int32,
         seqlen_k: cutlass.Int32,
         score_mod=None,
+        seqstart_k: cutlass.Int32 = cutlass.Int32(0),
     ):
         """Mutate ``acc_S`` in place: apply score_mod, then mask to -inf.
 
@@ -92,6 +103,9 @@ class AttentionMask:
                 masked = row_oob
                 if cutlass.const_expr(self.has_seqlen_k):
                     masked = masked or cute.elem_less(seqlen_k, k_col + 1)
+                if cutlass.const_expr(self.has_seqstart_k):
+                    # Keys before this stream's start are padding.
+                    masked = masked or cute.elem_less(k_col, seqstart_k)
                 if cutlass.const_expr(self.causal):
                     # k_col > q_row  -> mask
                     masked = masked or cute.elem_less(q_row, k_col)

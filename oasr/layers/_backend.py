@@ -97,6 +97,50 @@ GEMM_ALIGNMENT = 8
 #: call.
 GEMM_MIN_ROWS = 128
 
+#: Work floor below which a **causal + windowed** attention stays on SDPA.
+#:
+#: Causal alone belongs to SDPA (it has a flash path and needs no mask tensor).
+#: Causal *combined* with a key window is the opposite case: SDPA refuses
+#: ``is_causal`` alongside ``attn_mask``, so the caller must materialize a
+#: ``(B, 1, T_q, T_k)`` tensor and thereby forfeits flash, while the fused kernel
+#: takes the same window as two length vectors and skips whole K blocks below the
+#: diagonal.  That is worth 1.8-3.3x **on the attention op** — but only once the
+#: fused path's fixed ~68 µs floor (the ``_ensure_canonical`` copies of q/k/v plus
+#: the wrapper) is amortized.  Measured on an RTX 5090, bf16, with the strides the
+#: real call site produces (q a ``split_heads`` view, k/v slices of a
+#: capacity-preallocated KV buffer):
+#:
+#: =========================  =======  ========  =======
+#: shape                      MACs     SDPA      ratio
+#: =========================  =======  ========  =======
+#: B1 H4 P128 D64             0.004 G  23.1 µs   0.34×
+#: B4 H8 P256 D64             0.134 G  32.9 µs   0.48×
+#: B4 H12 P384 D64            0.453 G  48.1 µs   0.67×
+#: B2 H28 P384 D128           1.057 G  85.1 µs   1.02×
+#: B4 H16 P512 D64            1.074 G  82.2 µs   0.99×
+#: B4 H28 P512 D128           3.758 G  255.8 µs  1.99×
+#: B4 H28 P1600 D128          45.9 G   2106 µs   3.29×
+#: =========================  =======  ========  =======
+#:
+#: Unlike :data:`GEMM_MIN_ROWS`, a *work* measure is the right one here, and the
+#: two rows either side of the threshold are why: 1.057 G at D=128 and 1.074 G at
+#: D=64 land on the same ratio despite different B, H, P and D.  A fixed floor
+#: being amortized predicts exactly that coincidence; a shape rule would not.
+#:
+#: Read the ratio as an *op-level* one.  A Qwen2-7B prefill layer is dominated by
+#: its GEMMs (d=3584 qkv/o/mlp), so the same change is 1.03-1.05x over the whole
+#: 32-layer prefill and 1.013x over an engine ``transcribe_offline`` with a short
+#: generation — real, small, and transcript-identical.  Both of those were
+#: measured with the arms **interleaved**: a single-order A/B first read 0.876x,
+#: which was the second arm benefiting from a warm allocator rather than the
+#: fused path losing.  The op-level number is still the right one to set this
+#: threshold from, because it is what the threshold decides.
+#:
+#: Scoped to the causal+window combination, which is what was swept.  The
+#: window-only routing is measured separately (see ``attention/core.py``), where
+#: a short query extent — not total work — is what loses.
+FMHA_CAUSAL_WINDOW_MIN_MACS = 1 << 30
+
 
 @dataclass(frozen=True)
 class KernelGap:
@@ -131,18 +175,6 @@ KERNEL_GAPS: Dict[str, KernelGap] = {
                 "budget instead of hardcoded (FmhaSm80.select_num_stages), which "
                 "is what stranded Paraformer's d_k=128 SANM attention on SDPA. No "
                 "in-tree model reaches the remaining limit"
-            ),
-        ),
-        KernelGap(
-            id="fmha-mask-form",
-            what=(
-                "the FMHA kernel takes a length vector or a full (B, H, T_q, T_k) "
-                "additive bias; it has no causal mode and no left-padding mode"
-            ),
-            fix=(
-                "kernel: a causal flag and a key-offset vector. Whisper's prefill is "
-                "causal and Qwen2's prompts are left-padded (valid keys [P-len, P), "
-                "which is not a length), so both stay on SDPA"
             ),
         ),
     )
