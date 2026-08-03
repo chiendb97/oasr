@@ -336,3 +336,87 @@ def test_fmha_finite_mask_floor_stays_finite(fmha, cuda, dtype, mask_floor):
     # only over the unmasked prefix.
     ref = _ref_fmha(q, k, v, scale, attn_bias=bias)
     torch.testing.assert_close(out[:, :, :valid], ref[:, :, :valid], atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# Shared-memory budget / cp.async ring depth
+# ---------------------------------------------------------------------------
+
+
+class TestRingDepthFitsSmem:
+    """The ring depth is sized to the arch, not hardcoded.
+
+    ``num_stages`` was fixed at 3, so the smem a launch needed
+    (``sQ + stages * (sK + sV)``) scaled straight off ``head_dim``.  At
+    ``head_dim=128`` with a 64x64 tile that is 112 KB, over the 99 KB cap on
+    sm_86 / sm_89 / sm_120, so ``can_implement`` returned False and the shape
+    was refused outright — on sm_80's 163 KB it worked fine, which is why it
+    read as "no head_dim-128 config" rather than as a budget bug.  Two stages
+    need 80 KB and fit.  Paraformer's SANM attention is ``d_k=128``.
+    """
+
+    @staticmethod
+    def _cls(arch_str: str):
+        cutlass = pytest.importorskip("cutlass")
+        from oasr.kernels.cute.attention.fmha_sm80 import FmhaSm80
+        from oasr.kernels.cute.attention.fmha_sm120 import FmhaSm120
+
+        del cutlass
+        return {"sm_80": FmhaSm80, "sm_120": FmhaSm120}[arch_str]
+
+    @pytest.mark.parametrize("arch_str", ["sm_80", "sm_120"])
+    @pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
+    def test_selected_ring_fits(self, arch_str, head_dim):
+        cls = self._cls(arch_str)
+        stages = cls.select_num_stages(head_dim=head_dim)
+        assert stages >= 1, f"{arch_str} head_dim={head_dim} should be implementable"
+        need = cls.smem_bytes(
+            head_dim=head_dim, m_block_size=64, n_block_size=64, num_stages=stages
+        )
+        assert need <= cls._smem_capacity_in_bytes()
+        # …and it must be the *deepest* one that fits, not merely a safe one.
+        if stages < cls.MAX_NUM_STAGES:
+            deeper = cls.smem_bytes(
+                head_dim=head_dim, m_block_size=64, n_block_size=64, num_stages=stages + 1
+            )
+            assert deeper > cls._smem_capacity_in_bytes()
+
+    def test_head_dim_128_is_implementable_on_a_99kb_arch(self):
+        """The regression itself."""
+        cutlass = pytest.importorskip("cutlass")
+        cls = self._cls("sm_120")
+        assert cls._smem_capacity_in_bytes() < 112 * 1024, "premise: 3 stages must not fit"
+        assert cls.select_num_stages(head_dim=128) == 2
+        assert cls.can_implement(dtype=cutlass.Float16, head_dim=128)
+
+    def test_budget_uses_the_padded_head_dim(self):
+        """The layouts allocate ``(head_dim + 31) // 32 * 32``; the budget must
+        agree.  Costing the raw value under-counts by a third at head_dim 72 and
+        can approve a config that will not launch."""
+        cls = self._cls("sm_120")
+        assert cls.smem_bytes(
+            head_dim=72, m_block_size=64, n_block_size=64, num_stages=1
+        ) == cls.smem_bytes(head_dim=96, m_block_size=64, n_block_size=64, num_stages=1)
+
+    def test_impossible_head_dim_still_refused(self):
+        """Degrading the ring is not a licence to approve anything: a head_dim
+        whose *single*-stage layout overflows must still say no."""
+        cutlass = pytest.importorskip("cutlass")
+        cls = self._cls("sm_120")
+        assert cls.select_num_stages(head_dim=512) == 0
+        assert not cls.can_implement(dtype=cutlass.Float16, head_dim=512)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_head_dim_128_matches_reference(self):
+        """And the shallower ring must still compute the right answer."""
+        from oasr.attention import fmha
+
+        torch.manual_seed(0)
+        B, H, T, D = 2, 4, 200, 128
+        q, k, v = (torch.randn(B, H, T, D, device="cuda", dtype=torch.float16) for _ in range(3))
+        lens = torch.tensor([T, T // 2], device="cuda", dtype=torch.int32)
+        scale = 1.0 / math.sqrt(D)
+        out = fmha(q, k, v, softmax_scale=scale, cache_seqlens=lens)
+        ref = _ref_fmha(q, k, v, scale, cache_seqlens=lens)
+        assert not torch.isnan(out).any()
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)

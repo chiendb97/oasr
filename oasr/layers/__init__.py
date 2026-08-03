@@ -8,7 +8,16 @@ and fall back to torch wherever a kernel cannot run.  See
 ``tests/test_layer_waist.py`` is what keeps architectures inside it.
 """
 
-from ._backend import layers_backend, layers_backend_override, set_layers_backend
+from ._backend import (
+    KERNEL_GAPS,
+    format_gap_report,
+    gap_hits,
+    layers_backend,
+    layers_backend_override,
+    policy_hits,
+    reset_backend_stats,
+    set_layers_backend,
+)
 from .attention import Attention, RelPositionMultiHeadedAttention
 from .conv import Conv2d, Conv2dActivation, DepthwiseConv1d, PointwiseConv1d
 from .ctc import CtcProjection
@@ -33,10 +42,15 @@ from .softmax import Softmax
 from .topk import TopK
 
 __all__ = [
-    # Backend selection
+    # Backend selection + kernel-coverage reporting
     "layers_backend",
     "layers_backend_override",
     "set_layers_backend",
+    "KERNEL_GAPS",
+    "format_gap_report",
+    "gap_hits",
+    "policy_hits",
+    "reset_backend_stats",
     # Attention
     "Attention",
     "RelPositionMultiHeadedAttention",

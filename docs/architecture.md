@@ -39,12 +39,47 @@ quantized path apply to all six architectures instead of one.
 | Position-wise FFN | `FeedForward`, `GatedMLP` — where the upstream layout already nests them under a name |
 | Rotary | `NeoxRotaryEmbedding` + `apply_rotary_pos_emb` for HF-style per-row positions; `RotaryEmbedding` for the complex `freqs_cis` form |
 
-Each layer owns **both** a kernel path and a torch path and chooses in
-`oasr.layers._backend`. The kernels have preconditions the reference does not
-— GEMM needs CUDA, fp16/bf16 and both dimensions 8-aligned; norms need CUDA and
-a contiguous input; the CuteDSL FMHA cannot compile every head dim — so the
-choice is per call, not per model. That is what lets the same model file serve
-fp16 on a 5090 and run the fp32 CPU parity oracle.
+### OASR is the backend; torch is one you select
+
+OASR targets GPU inference, so `oasr.layers._backend` does **not** treat
+PyTorch as a safety net. A layer that quietly reroutes an unsupported shape to
+`F.linear` makes a missing kernel invisible, and an invisible gap never gets
+closed. Three cases, kept apart on purpose:
+
+| Case | What happens |
+|---|---|
+| **Out of scope** — CPU tensor, fp32 | Torch serves it, reported once. The framework does not target these; they exist so the upstream parity oracles can run. Not debt — there is nothing to close. |
+| **In scope, no kernel** | A **kernel gap**. It must be declared in `KERNEL_GAPS` naming what is missing and *which layer has to fix it*, or the call **raises**. Declared gaps are counted and printable (`format_gap_report()`). |
+| **Kernel is slower** | A performance choice, counted separately so it is never mistaken for a gap — and itself a standing argument for kernel work. |
+
+`OASR_LAYERS_BACKEND` selects the backend: `oasr` (default) or `torch` (the
+optional backend, used by the CPU oracles and as the "is this the kernels'
+fault" A/B). There is no `auto`.
+
+The remaining declared gaps, all of them kernel-side:
+
+| Gap | Missing | Costs |
+|---|---|---|
+| `norm-strided-rows` | norm kernels address rows as `input + row * hidden` | Zipformer works in `(T, B, C)`; forcing contiguity in the model would copy the whole activation (~18 MiB at T=1500 B=16 d=384) to save ~5 µs |
+| `fmha-head-dim` | head dims so wide that even a 1-deep cp.async ring overflows smem (>256 on a 99 KB arch) | nothing in-tree reaches it |
+| `fmha-mask-form` | FMHA has no causal mode and no left-padding mode | Whisper's prefill and Qwen2's left-padded prompts stay on SDPA |
+
+One gap that *was* here got closed in the kernel: the cp.async ring depth was
+hardcoded at 3 stages, so smem scaled straight off `head_dim` and a 64×64 tile
+at `head_dim=128` needed 112 KB against sm_120's 99 KB cap — refused outright,
+while sm_80's 163 KB took it fine, which is why it read as "no head_dim-128
+config" rather than as a budget bug. `FmhaSm80.select_num_stages` now sizes the
+ring to the arch (2 stages, 80 KB), and Paraformer's `d_k=128` SANM attention
+runs **2.05–2.56× faster** than the SDPA it was stranded on. The budget also
+now costs the *padded* head dim, matching what the layouts allocate — it used
+the raw value and under-counted by a third at e.g. `head_dim=72`.
+
+And gaps that got closed at the model layer rather than declared:
+every unaligned output projection. Paraformer's 8404-token head, the
+transducer joiner's 500 and the CIF alpha head's 1 are now allocated at an
+aligned width (`align_out_features`) and the checkpoint is widened on load
+(`pad_output_projection`) — the pattern the WeNet CTC head has used since day
+one. `test_no_architecture_needs_an_unaligned_gemm` keeps them closed.
 
 Capability is necessary but not sufficient, and the two measured policies that
 make up the rest live here rather than in any model:
@@ -54,33 +89,36 @@ make up the rest live here rather than in any model:
   all it is 1.25–1.87× *slower*, because the win was the fusion. Whisper, whose
   attention is never masked, therefore runs SDPA end to end without any
   model-side flag.
-* **GEMM has a work floor** (`GEMM_MIN_MACS`). Reaching CUTLASS costs a fixed
-  ~20 µs of Python; a batched encoder forward amortizes that, an eager
-  autoregressive decode step does not. The rule is a pure function of the call
-  — deliberately *not* relaxed under CUDA-graph capture, even though the cost
-  is free there: a capture-dependent branch makes the graph pick a different
-  kernel than eager, and that one-ulp fp16 difference reached the transducer
-  decoder as different tokens the first time it was tried.
+* **GEMM has a row floor** (`GEMM_MIN_ROWS`). CUTLASS tiles the M axis at 128
+  rows, so a GEMM with fewer rows leaves most of every tile empty and cuBLAS's
+  GEMV-shaped kernel wins. This started life as a floor on *total work* and
+  that was wrong: `(4, 3584, 3584)` — a Qwen2-Audio-7B decode step — is 51 M
+  MACs, far above any sane work floor, and is the worst shape measured at
+  **5.34× slower** than cuBLAS. The problem is the shape, not the size. The
+  rule is a pure function of the call, deliberately *not* relaxed under
+  CUDA-graph capture even though the dispatch cost is free there: a
+  capture-dependent branch makes the graph pick a different kernel than eager,
+  and that one-ulp fp16 difference reached the transducer decoder as different
+  tokens the first time it was tried.
 
-Net effect on the WER benchmark: Conformer and Zipformer within run-to-run
-noise, whisper-tiny p50 +5%, and every architecture now on the kernels at all.
-The residual is fixed per-call dispatch on the smallest model in the repo — the
-worst case for any waist — and its two fixes (cheaper GEMM dispatch, CUDA-graph
-capture of the AR step) are tracked separately.
-
-`OASR_LAYERS_BACKEND` overrides it process-wide: `torch` never calls a kernel
-(the debugging fallback — a numerical difference that survives it is not the
-kernels' fault), `oasr` raises instead of degrading for GEMM and norm (how you
-*prove* a model is on the kernel path rather than assuming it).
+Dispatch cost used to be the third policy here and is now gone. The GEMM
+launchers take the caller's N-D tensors and flatten with `FLATTENED_ROWS`
+instead of making Python `reshape(-1, K)` twice, and the output is allocated
+with `new_empty` varargs rather than `torch.empty` on a freshly built list.
+That removed ~5 µs per call: `Linear(384, 384)` fp16 went from **1.49× slower
+than `F.linear` to 1.08×**, and whisper-tiny's encoder and 30-step decode are
+both at **1.01×**. Allocating in the C++ launcher was measured too and is
+*worse* (`Tensor::FromEnvAlloc` plus the round trip is 2.38 µs against
+`new_empty`'s 1.88), so allocation stays in Python.
 
 `tests/test_layer_waist.py` is the ratchet: it builds every registered
 architecture tiny on CPU, walks `named_modules()`, and fails on a bare torch
 layer. Its tiny-config table is keyed off `list_models()`, so a new
 architecture with no entry fails rather than going uncovered.
 
-Two gaps are deliberate and named rather than papered over. Dense `nn.Conv1d`
-stems (Whisper-geometry encoders, the CIF alpha head) have no `oasr.layers`
-counterpart yet, so convolutions are not banned. And `fc1`/`fc2` stay flat
+One structural gap is deliberate: dense `nn.Conv1d` stems (the
+Whisper-geometry encoders, Paraformer's CIF conv) have no `oasr.layers`
+counterpart yet, so convolutions are not in the banned set. And `fc1`/`fc2` stay flat
 `Linear`s in HF Whisper and the Qwen2-Audio tower: composing a `FeedForward`
 there would insert a level into every checkpoint key to save one `F.gelu`.
 

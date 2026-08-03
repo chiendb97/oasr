@@ -360,29 +360,111 @@ class TestLayersRunOnCpu:
         torch.testing.assert_close(q_rot[:, :, 0], q[:, :, 0])
 
 
-class TestBackendSwitch:
-    def test_torch_mode_is_the_debug_fallback(self):
+class TestBackendSelection:
+    """OASR is the backend; torch is an optional backend you *select*.
+
+    The distinction is the point of this class.  A framework that silently
+    slides into torch when a kernel is missing can never tell you that the
+    kernel is missing.
+    """
+
+    def test_oasr_is_the_default(self):
+        from oasr.layers import layers_backend
+
+        assert layers_backend() == "oasr"
+
+    def test_torch_is_selectable(self):
         from oasr.layers import Linear, layers_backend
 
         with layers_backend_override("torch"):
             assert layers_backend() == "torch"
             assert Linear(8, 16)(torch.randn(2, 8)).shape == (2, 16)
-        assert layers_backend() == "auto"
+        assert layers_backend() == "oasr"
 
-    def test_strict_mode_explains_the_fallback(self):
-        """``oasr`` mode is how a benchmark *proves* it is on the kernel path
-        rather than assuming it; on CPU everything must refuse, loudly."""
-        from oasr.layers import Linear
-
-        with layers_backend_override("oasr"):
-            with pytest.raises(RuntimeError, match="kernels are CUDA-only"):
-                Linear(8, 16)(torch.randn(2, 8))
-
-    def test_invalid_mode_rejected(self):
+    def test_there_is_no_auto_mode(self):
+        """``auto`` was the old name and the old idea; both are gone."""
         from oasr.layers import set_layers_backend
 
-        with pytest.raises(ValueError):
-            set_layers_backend("fastest")
+        for bad in ("auto", "fastest"):
+            with pytest.raises(ValueError):
+                set_layers_backend(bad)
+
+    def test_cpu_is_out_of_scope_not_a_gap(self):
+        """The framework targets GPU inference, so a CPU tensor is served by
+        torch and reported — but it is not kernel debt, and it must not be
+        counted as one."""
+        from oasr.layers import Linear
+        from oasr.layers._backend import gap_hits, reset_backend_stats
+
+        reset_backend_stats()
+        Linear(8, 16)(torch.randn(2, 8))
+        assert gap_hits() == {}
+
+
+class TestKernelGapRegistry:
+    """Missing kernels are declared debt, not invisible fallbacks."""
+
+    def test_every_declared_gap_says_where_to_fix_it(self):
+        from oasr.layers._backend import KERNEL_GAPS
+
+        for gid, gap in KERNEL_GAPS.items():
+            assert gap.id == gid
+            assert gap.what, f"{gid} does not say what is missing"
+            assert gap.fix.startswith(("kernel:", "model:")), (
+                f"{gid}.fix must name the layer that has to fix it "
+                f"('kernel:' or 'model:'), got {gap.fix[:40]!r}"
+            )
+
+    def test_undeclared_refusal_raises(self):
+        """A kernel that cannot run a shape nobody wrote down is a bug or an
+        unfinished kernel.  It must stop the run, not cost throughput forever."""
+        from oasr.layers._backend import take_gap
+
+        with pytest.raises(RuntimeError, match="no declared gap"):
+            take_gap("gemm-unaligned", "Linear(7 -> 13)")
+
+    def test_declared_gap_is_counted(self):
+        from oasr.layers._backend import gap_hits, reset_backend_stats, take_gap
+
+        reset_backend_stats()
+        assert take_gap("fmha-head-dim", "head_dim=128") is False
+        assert gap_hits() == {"fmha-head-dim": 1}
+
+    def test_report_separates_debt_from_choice(self):
+        from oasr.layers._backend import (
+            format_gap_report,
+            reset_backend_stats,
+            take_gap,
+            take_policy,
+        )
+
+        reset_backend_stats()
+        take_gap("fmha-head-dim", "head_dim=128")
+        take_policy("gemm-below-work-floor")
+        report = format_gap_report()
+        assert "kernel gaps taken" in report and "fmha-head-dim" in report
+        assert "performance grounds" in report
+        reset_backend_stats()
+
+    @pytest.mark.parametrize("arch", list_models())
+    def test_no_architecture_needs_an_unaligned_gemm(self, arch):
+        """Every output projection is allocated at a width the kernels can
+        address.  An unpadded vocabulary head is fixable at the model layer
+        (``oasr.models.base.align_out_features``), so it is deliberately *not*
+        a declared gap — this asserts none crept back."""
+        from oasr.layers.linear import Linear as OasrLinear
+
+        offenders = [
+            f"{name}: {mod.in_features} -> {mod.out_features}"
+            for name, mod in _build(arch).named_modules()
+            if isinstance(mod, OasrLinear) and (mod.in_features % 8 or mod.out_features % 8)
+        ]
+        assert not offenders, (
+            f"{arch} has projections the GEMM kernels cannot address:\n  "
+            + "\n  ".join(offenders)
+            + "\nPad them with align_out_features() and widen the checkpoint in "
+            "load_weights (see oasr/models/base.py::pad_output_projection)."
+        )
 
 
 @pytest.mark.cuda

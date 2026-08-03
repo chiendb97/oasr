@@ -1,114 +1,193 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Where a layer picks between an OASR kernel and the torch reference.
+"""Which backend an :mod:`oasr.layers` module computes on.
 
-``oasr/layers/`` is the narrow waist every model implementation goes through
-(see ``docs/architecture.md``).  A layer is **one** module class, not two: it
-owns a kernel path *and* a reference path and chooses between them here.  That
-is what lets a model written against the waist run unchanged on CPU/fp32 — the
-parity oracles and the whole CPU test suite — while picking up the CUDA kernels
-on the serving path with no model-side edit.
+OASR targets **GPU inference**.  ``oasr`` is the backend; PyTorch is an
+*optional backend you select*, not a safety net the framework slides into.
+The difference is not cosmetic: a layer that quietly routes an unsupported
+shape to ``F.linear`` makes a missing kernel invisible, and an invisible gap
+never gets closed.  Everything here exists to keep gaps visible.
 
-The kernels have hard preconditions the reference does not:
+Two tiers, and they are not the same thing:
 
-==========  ================================================================
-GEMM        CUDA, fp16/bf16, and ``in_features`` **and** ``out_features``
-            8-aligned.  CUTLASS 2.x alignment-8 iterators reject anything
-            else outright — ``oasr.gemm`` on ``N=8404`` (Paraformer's vocab)
-            raises rather than degrading, so the check has to happen here.
-            Plus a **work floor**: see :data:`GEMM_MIN_MACS`.
-Norm        CUDA, fp32/fp16/bf16, **contiguous**.  The kernels address rows as
-            ``input + row * hidden_size``, so a transposed activation (the
-            layout a conv encoder's ``transpose(1, 2)`` leaves behind) has to
-            take the torch path.  Any hidden size is fine: the launchers drop
-            to the scalar kernel when it is not a multiple of the vector width.
-FMHA        CUDA, fp16/bf16 for the CuteDSL kernel; ``oasr.fmha`` itself
-            degrades to SDPA otherwise, so only the ``torch`` override
-            below needs handling here.
-==========  ================================================================
+**Out of scope.**  CPU tensors and fp32.  The framework does not target them —
+they exist so the upstream parity oracles and the CPU test suite can run at
+all — so the torch backend serves them.  Reported once per process, never an
+error, and not a gap: there is nothing to close.
 
-``OASR_LAYERS_BACKEND`` overrides the choice process-wide:
+**In scope, unimplemented.**  A CUDA fp16/bf16 shape an OASR kernel refuses.
+That is a **kernel gap**.  It must be declared in :data:`KERNEL_GAPS`, naming
+what is missing and which layer has to fix it, or the module *raises* rather
+than degrading.  Declared gaps are counted and printable
+(:func:`format_gap_report`), and ``tests/test_layer_waist.py`` asserts the
+declared set only shrinks.
 
-``auto`` (default)
-    Kernel where it can run, torch otherwise.
+Separately from both, a few calls go to torch because the kernel is measurably
+**slower**, not because it cannot run — see :data:`GEMM_MIN_ROWS` and the
+attention table in ``oasr/layers/attention/core.py``.  Those are performance
+policy, counted under their own heading so they are never mistaken for gaps.
+Each one is also a standing argument for kernel work.
+
+``OASR_LAYERS_BACKEND`` selects the backend for the process:
+
+``oasr`` (default)
+    OASR kernels.  Out-of-scope inputs use torch; an undeclared in-scope
+    refusal raises.
 ``torch``
-    Never call a kernel — the debugging fallback the layer waist is supposed
-    to have.  A numerical difference that survives ``OASR_LAYERS_BACKEND=torch``
-    is not the kernels' fault.
-``oasr``
-    Kernel or raise, for GEMM and norm.  Nothing degrades silently, which is
-    how you *prove* a model reaches the kernels instead of assuming it —
-    ``tests/test_layer_waist.py`` runs every registered architecture under it.
-    Attention is deliberately exempt: it has its own ``OASR_ATTN_BACKEND``
-    switch, and several legitimate mask shapes (left padding, causal) are
-    SDPA-only by construction rather than by omission.
+    The optional backend, selected deliberately: never calls a kernel.  Used
+    by the CPU parity oracles and as the A/B for "is this the kernels' fault".
 """
 
 from __future__ import annotations
 
+import logging
 import os
+from collections import Counter
 from contextlib import contextmanager
-from typing import Iterator, Optional
+from dataclasses import dataclass
+from typing import Dict, Iterator, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 #: dtypes the CUTLASS GEMM kernels accept.
 GEMM_DTYPES = (torch.float16, torch.bfloat16)
 #: dtypes the handwritten norm kernels accept.
-NORM_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+NORM_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+#: dtypes the framework actually serves.  fp32 is out of scope (oracles only).
+SERVED_DTYPES = (torch.float16, torch.bfloat16)
 #: CUTLASS 2.x alignment-8 iterators: both GEMM free dimensions must divide by 8.
 GEMM_ALIGNMENT = 8
 
-#: Work floor (multiply-accumulates) below which ``oasr.gemm`` loses to
-#: ``F.linear`` on *launch overhead* rather than on kernel quality.
+#: Row floor below which a GEMM should not go to CUTLASS.
 #:
-#: Reaching the CUTLASS kernel costs a fixed ~20 µs of Python per call — the
-#: shape-aware heuristic lookup, a workspace allocation, two reshapes, the
-#: ``@oasr_api`` wrapper.  Measured on an RTX 5090, ``Linear(384, 384)`` in
-#: fp16: 22 µs through the kernel vs 15 µs through ``F.linear``, and the two
-#: only converge around 4e9 MACs.  A batched encoder forward amortizes it
-#: (Conformer and Zipformer measure within ±3% either way end to end); an
-#: **eager autoregressive decode step** does not — whisper-tiny's 30-step loop
-#: measured 75.0 ms on the kernel against 47.1 ms on torch, 1.59×, which is
-#: the whole of a 1.4× end-to-end regression.
+#: CUTLASS tiles the M axis, and the default config's tile is 128 rows wide, so
+#: a GEMM with ``M < 128`` leaves most of every tile empty.  cuBLAS switches to
+#: a GEMV-shaped kernel instead and wins — by a little when the problem is
+#: small, by a lot when it is not.  Measured on an RTX 5090, fp16, kernel vs
+#: ``F.linear``:
 #:
-#: The floor must **not** be conditioned on ``is_current_stream_capturing()``,
-#: tempting as that is — under capture the dispatch cost is paid once and
-#: replayed for free, so the kernel looks unconditionally right.  But a graph's
-#: contract is to reproduce the eager result, and a capture-dependent branch
-#: silently breaks it: the captured path picked CUTLASS while the eager path
-#: picked cuBLAS for the same shape, and the one-ulp fp16 difference reached
-#: the decoder as *different tokens*
-#: (``test_streaming_graph_capture_is_token_identical_to_eager``).  Any future
-#: refinement of this rule has to stay a pure function of the call.
+#: ===================  ========  =======  =========
+#: shape (M, K, N)      CUTLASS   cuBLAS   ratio
+#: ===================  ========  =======  =========
+#: (8, 384, 384)        16.2 µs   14.8 µs  1.10×
+#: (64, 384, 384)       16.2 µs   14.8 µs  1.10×
+#: (4, 3584, 3584)      81.2 µs   15.2 µs  **5.34×**
+#: (3000, 384, 384)     16.8 µs   15.6 µs  1.07×
+#: ===================  ========  =======  =========
 #:
-#: Placement has ~1.5 orders of magnitude of room, so it is not a knife edge:
-#: whisper-tiny's decode step is 2.4e6 MACs at ``B=16`` and Qwen2-Audio-7B's is
-#: 5.1e7 at ``B=4`` — and where the 7B does fall below (``B=1``), torch is the
-#: right answer for the same reason.  The real fix is cheaper dispatch or
-#: CUDA-graph capture of the AR step; this is the honest interim.
-GEMM_MIN_MACS = 1 << 24
+#: That last skinny-but-large row is why this is a **row** count and not the
+#: work product it started as: ``4 × 3584 × 3584`` is 51 M MACs, comfortably
+#: over any sane work floor, yet it is the worst shape of the set — and it is
+#: exactly a Qwen2-Audio-7B decode step.  A MACs floor cannot see the problem
+#: because the problem is the *shape*, not the size.
+#:
+#: This is a **policy**, not a kernel gap.  The real fix is tuned rules for
+#: these shapes: ``select_default_config`` has no entry for ``(3584, 3584)`` and
+#: falls back to the default tile, and the tuner has only ever been run over
+#: Conformer geometries.
+#:
+#: It must **not** be conditioned on ``is_current_stream_capturing()``, tempting
+#: as that is (under capture the dispatch cost is paid once and replayed free).
+#: A graph's contract is to reproduce the eager result, and a capture-dependent
+#: branch breaks it: capture picked CUTLASS while eager picked cuBLAS for the
+#: same shape, and the one-ulp fp16 difference reached the transducer decoder
+#: as *different tokens*.  Any refinement has to stay a pure function of the
+#: call.
+GEMM_MIN_ROWS = 128
 
-_VALID_MODES = ("auto", "torch", "oasr")
+
+@dataclass(frozen=True)
+class KernelGap:
+    """A shape OASR has no kernel for, on hardware and in a dtype it serves."""
+
+    #: Stable slug, used as the counter key and in the conformance test.
+    id: str
+    #: What the kernels cannot do.
+    what: str
+    #: Where it has to be fixed, and how.  Not "why we gave up".
+    fix: str
+
+
+#: Every in-scope shape currently served by torch because no kernel exists.
+#:
+#: This list is the project's honest kernel-coverage debt.  Adding an entry is
+#: a deliberate act that shows up in review; removing one is the goal.  A
+#: refusal with no entry here raises instead of silently degrading.
+KERNEL_GAPS: Dict[str, KernelGap] = {
+    g.id: g
+    for g in (
+        KernelGap(
+            id="norm-strided-rows",
+            what=(
+                "norm kernels address rows as `input + row * hidden_size`, so they "
+                "reject any input whose rows are not contiguous"
+            ),
+            fix=(
+                "kernel: take a row stride. Zipformer works in (T, B, C) and its "
+                "layer norm sees a transposed view; forcing contiguity in the model "
+                "instead would copy the whole activation (~18 MiB at T=1500 B=16 "
+                "d=384) to save ~5 us of norm, so the model layer is the wrong place"
+            ),
+        ),
+        KernelGap(
+            id="fmha-head-dim",
+            what=(
+                "a head_dim so large that even a single-stage cp.async ring "
+                "overflows shared memory (>256 on a 99 KB arch)"
+            ),
+            fix=(
+                "kernel: a smaller n_block for very wide heads, which would trade "
+                "occupancy for the tile. head_dim 128 used to land here and no "
+                "longer does — the ring depth is now sized to the arch's smem "
+                "budget instead of hardcoded (FmhaSm80.select_num_stages), which "
+                "is what stranded Paraformer's d_k=128 SANM attention on SDPA. No "
+                "in-tree model reaches the remaining limit"
+            ),
+        ),
+        KernelGap(
+            id="fmha-mask-form",
+            what=(
+                "the FMHA kernel takes a length vector or a full (B, H, T_q, T_k) "
+                "additive bias; it has no causal mode and no left-padding mode"
+            ),
+            fix=(
+                "kernel: a causal flag and a key-offset vector. Whisper's prefill is "
+                "causal and Qwen2's prompts are left-padded (valid keys [P-len, P), "
+                "which is not a length), so both stay on SDPA"
+            ),
+        ),
+    )
+}
+
+_VALID_MODES = ("oasr", "torch")
 
 _MODE: Optional[str] = None
+#: gap id -> times taken this process.
+_GAP_HITS: Counter = Counter()
+#: policy reason -> times taken this process.
+_POLICY_HITS: Counter = Counter()
+#: out-of-scope reason -> times taken (reported once each).
+_OUT_OF_SCOPE: Counter = Counter()
 
 
 def layers_backend() -> str:
-    """Resolved ``OASR_LAYERS_BACKEND`` mode (cached after the first read)."""
+    """Resolved ``OASR_LAYERS_BACKEND`` (cached after the first read)."""
     global _MODE
     if _MODE is None:
-        mode = os.environ.get("OASR_LAYERS_BACKEND", "auto").strip().lower()
+        mode = os.environ.get("OASR_LAYERS_BACKEND", "oasr").strip().lower()
         if mode not in _VALID_MODES:
             raise ValueError(
-                f"OASR_LAYERS_BACKEND={mode!r} is not one of {_VALID_MODES}",
+                f"OASR_LAYERS_BACKEND={mode!r} is not one of {_VALID_MODES}. "
+                "(There is no 'auto': torch is a backend you select, not a fallback.)"
             )
         _MODE = mode
     return _MODE
 
 
 def set_layers_backend(mode: str) -> None:
-    """Override the mode for this process (tests, benchmarks, A/B switches)."""
+    """Select the backend for this process (tests, benchmarks, A/B switches)."""
     if mode not in _VALID_MODES:
         raise ValueError(f"mode must be one of {_VALID_MODES}, got {mode!r}")
     global _MODE
@@ -126,66 +205,165 @@ def layers_backend_override(mode: str) -> Iterator[None]:
         set_layers_backend(previous)
 
 
-def _refuse(what: str, reason: str) -> bool:
-    """Honour strict mode: either explain the fallback or take it silently."""
-    if layers_backend() == "oasr":
-        raise RuntimeError(
-            f"OASR_LAYERS_BACKEND=oasr but the {what} kernel cannot run: {reason}. "
-            "Set OASR_LAYERS_BACKEND=auto to fall back to torch."
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+
+def gap_hits() -> Dict[str, int]:
+    """Declared kernel gaps taken this process, by id."""
+    return dict(_GAP_HITS)
+
+
+def policy_hits() -> Dict[str, int]:
+    """Torch calls made on *performance* grounds, by reason."""
+    return dict(_POLICY_HITS)
+
+
+def reset_backend_stats() -> None:
+    """Clear the counters (per-test isolation, per-benchmark accounting)."""
+    _GAP_HITS.clear()
+    _POLICY_HITS.clear()
+    _OUT_OF_SCOPE.clear()
+
+
+def format_gap_report() -> str:
+    """Human-readable summary of what did not reach a kernel, and why.
+
+    Deliberately separates the three categories: a gap is debt, a policy hit is
+    a decision, an out-of-scope hit is neither.
+    """
+    lines = [f"oasr.layers backend: {layers_backend()}"]
+    if _GAP_HITS:
+        lines.append("  kernel gaps taken (missing kernels — debt):")
+        for gid, n in sorted(_GAP_HITS.items()):
+            lines.append(f"    {gid:<20} x{n:<8} {KERNEL_GAPS[gid].what}")
+            lines.append(f"    {'':<20}  {'':<8} fix at → {KERNEL_GAPS[gid].fix}")
+    if _POLICY_HITS:
+        lines.append("  torch chosen on performance grounds (measured, not missing):")
+        for reason, n in sorted(_POLICY_HITS.items()):
+            lines.append(f"    {reason:<20} x{n}")
+    if _OUT_OF_SCOPE:
+        lines.append("  out of scope for a GPU inference framework:")
+        for reason, n in sorted(_OUT_OF_SCOPE.items()):
+            lines.append(f"    {reason:<20} x{n}")
+    if not (_GAP_HITS or _POLICY_HITS or _OUT_OF_SCOPE):
+        lines.append("  every call reached an OASR kernel")
+    return "\n".join(lines)
+
+
+def out_of_scope(reason: str) -> bool:
+    """CPU / fp32: served by torch because the framework does not target them."""
+    first = _OUT_OF_SCOPE[reason] == 0
+    _OUT_OF_SCOPE[reason] += 1
+    if first:
+        logger.info(
+            "oasr.layers: %s — using the torch backend (OASR targets GPU fp16/bf16 "
+            "inference; this path exists for the CPU parity oracles).",
+            reason,
         )
     return False
 
 
+def take_gap(gap_id: str, detail: str) -> bool:
+    """Record a declared kernel gap, or raise if it is not declared.
+
+    Returning ``False`` (use torch) is only legitimate for a gap somebody has
+    written down. An undeclared refusal is a bug or an unfinished kernel, and
+    it should stop the run rather than quietly cost throughput forever.
+    """
+    gap = KERNEL_GAPS.get(gap_id)
+    if gap is None:
+        raise RuntimeError(
+            f"no OASR kernel for this call ({detail}) and no declared gap "
+            f"{gap_id!r}. Fix it at the kernel or model layer, or — if it "
+            f"genuinely cannot be fixed yet — add a KernelGap to "
+            f"oasr/layers/_backend.py saying where it must be fixed."
+        )
+    first = _GAP_HITS[gap_id] == 0
+    _GAP_HITS[gap_id] += 1
+    if first:
+        logger.warning(
+            "oasr.layers: kernel gap %r taken (%s) — %s. Fix at → %s",
+            gap_id,
+            detail,
+            gap.what,
+            gap.fix,
+        )
+    return False
+
+
+def take_policy(reason: str) -> bool:
+    _POLICY_HITS[reason] += 1
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Per-family backend decisions
+# ---------------------------------------------------------------------------
+
+
 def use_gemm_kernel(x: torch.Tensor, in_features: int, out_features: int) -> bool:
-    """Can (and should) this projection go through ``oasr.gemm``?"""
-    mode = layers_backend()
-    if mode == "torch":
+    """Should this projection go through ``oasr.gemm``?"""
+    if layers_backend() == "torch":
         return False
     if not x.is_cuda:
-        return _refuse("GEMM", f"input is on {x.device}, kernels are CUDA-only")
-    if x.dtype not in GEMM_DTYPES:
-        return _refuse("GEMM", f"dtype {x.dtype} is not one of {GEMM_DTYPES}")
+        return out_of_scope("CPU tensor")
+    if x.dtype not in SERVED_DTYPES:
+        return out_of_scope(f"dtype {x.dtype}")
+
     if in_features % GEMM_ALIGNMENT or out_features % GEMM_ALIGNMENT:
-        return _refuse(
-            "GEMM",
-            f"({in_features} -> {out_features}) is not {GEMM_ALIGNMENT}-aligned on both axes",
+        # Not declared as a gap: every in-tree case is fixable at the model
+        # layer by padding the projection, which the WeNet CTC head has done
+        # since day one.  So this raises, and the fix is to pad.
+        return take_gap(
+            "gemm-unaligned",
+            f"Linear({in_features} -> {out_features}) is not "
+            f"{GEMM_ALIGNMENT}-aligned on both axes; pad the projection "
+            f"(see oasr/models/conformer/convert.py for the CTC-head precedent)",
         )
-    if mode == "oasr":
-        # Strict mode answers "can the kernel run here", not "should it": the
-        # work floor below is a performance policy, and applying it would make
-        # the reach check under-report.
-        return True
-    if x.numel() * out_features < GEMM_MIN_MACS:
-        return False
+
+    if x.numel() // in_features < GEMM_MIN_ROWS:
+        return take_policy("gemm-below-row-floor")
     return True
 
 
 def use_norm_kernel(x: torch.Tensor) -> bool:
-    """Can (and should) this normalization go through the OASR norm kernels?"""
-    mode = layers_backend()
-    if mode == "torch":
+    """Should this normalization go through the OASR norm kernels?"""
+    if layers_backend() == "torch":
         return False
     if not x.is_cuda:
-        return _refuse("norm", f"input is on {x.device}, kernels are CUDA-only")
+        return out_of_scope("CPU tensor")
     if x.dtype not in NORM_DTYPES:
-        return _refuse("norm", f"dtype {x.dtype} is not one of {NORM_DTYPES}")
+        return out_of_scope(f"dtype {x.dtype}")
     if not x.is_contiguous():
-        return _refuse("norm", f"input is not contiguous (strides {tuple(x.stride())})")
+        return take_gap("norm-strided-rows", f"strides {tuple(x.stride())}")
     return True
 
 
 def use_fmha_kernel() -> bool:
-    """Is ``oasr.fmha`` allowed at all?  (It picks cute vs SDPA internally.)"""
+    """Is the OASR attention kernel selectable at all?"""
     return layers_backend() != "torch"
 
 
 __all__ = [
     "GEMM_ALIGNMENT",
     "GEMM_DTYPES",
+    "GEMM_MIN_ROWS",
+    "KERNEL_GAPS",
+    "KernelGap",
     "NORM_DTYPES",
+    "SERVED_DTYPES",
+    "format_gap_report",
+    "gap_hits",
     "layers_backend",
     "layers_backend_override",
+    "policy_hits",
+    "reset_backend_stats",
     "set_layers_backend",
+    "out_of_scope",
+    "take_gap",
+    "take_policy",
     "use_fmha_kernel",
     "use_gemm_kernel",
     "use_norm_kernel",

@@ -86,5 +86,55 @@ class TestBmm:
         torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestGemmInputLayout:
+    """The launchers flatten N-D inputs themselves and require contiguity.
+
+    Both properties are load-bearing.  Flattening in C++ (``FLATTENED_ROWS``)
+    is what removed the two per-call ``reshape(-1, K)`` calls that made
+    ``oasr.gemm`` lose to ``F.linear`` on small shapes.  The contiguity check is
+    a correctness fix that came with it.
+    """
+
+    @staticmethod
+    def _weight(N, K):
+        return torch.randn(N, K, device="cuda", dtype=torch.float16)
+
+    @pytest.mark.parametrize("shape", [(64,), (8, 64), (4, 6, 64), (2, 3, 5, 64)])
+    def test_leading_dims_are_flattened(self, shape):
+        """1-D through 4-D activations all work; the launcher computes M."""
+        A = torch.randn(*shape, device="cuda", dtype=torch.float16)
+        B = self._weight(32, 64)
+        got = oasr.gemm(A, B)
+        assert tuple(got.shape) == tuple(shape[:-1]) + (32,)
+        torch.testing.assert_close(got, torch.nn.functional.linear(A, B), rtol=2e-2, atol=2e-2)
+
+    def test_row_strided_2d_input_is_correct(self):
+        """Regression: ``x[:, -1]`` of a ``(B, T, D)`` tensor.
+
+        ``reshape(-1, K)`` is a *no-op* on an already-2-D tensor, so it never
+        delivered the row-major layout the kernel assumes — the launcher only
+        checked that the tensor was on CUDA, and the kernel indexes rows as
+        ``A + row * K``.  This shape used to come back with a max error of ~30
+        against ``F.linear``, silently.  The N-D path was accidentally safe
+        because flattening a strided N-D tensor cannot be a view.
+        """
+        x = torch.randn(4, 6, 64, device="cuda", dtype=torch.float16)
+        A = x[:, -1]
+        assert not A.is_contiguous(), "the test input must actually be strided"
+        B = self._weight(64, 64)
+        torch.testing.assert_close(
+            oasr.gemm(A, B), torch.nn.functional.linear(A, B), rtol=2e-2, atol=2e-2
+        )
+
+    def test_noncontiguous_out_is_rejected(self):
+        """A strided ``out`` would be written at the wrong rows; say so."""
+        A = torch.randn(8, 64, device="cuda", dtype=torch.float16)
+        B = self._weight(64, 64)
+        bad = torch.empty(8, 2, 64, device="cuda", dtype=torch.float16)[:, 0]
+        with pytest.raises(Exception, match="[Cc]ontiguous"):
+            oasr.gemm(A, B, None, out=bad)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

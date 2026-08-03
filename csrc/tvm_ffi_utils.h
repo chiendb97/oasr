@@ -48,6 +48,21 @@ static constexpr DLDataType dl_int32 = {kDLInt, 32, 1};
     TVM_FFI_ICHECK((x).stride((x).ndim() - 1) == 1)                                     \
         << "Tensor must be contiguous along the last dimension"
 
+// Full row-major contiguity.  Stronger than CHECK_LAST_DIM_CONTIGUOUS_INPUT and
+// what a kernel indexing rows as `base + row * row_len` actually needs: a
+// tensor can have stride(-1) == 1 and still have a padded row stride (any
+// `x[:, -1]`-style slice of a wider buffer), in which case the weaker check
+// passes and the kernel reads the wrong memory.
+#define CHECK_CONTIGUOUS_INPUT(x)                                                         \
+    TVM_FFI_ICHECK((x).IsContiguous())                                                    \
+        << "Tensor must be contiguous (row-major, no padded strides)"
+
+// Rows of a matrix whose trailing dimension is the reduction axis: every
+// leading dimension is flattened.  Lets a launcher take the caller's N-D
+// activation directly instead of making Python `reshape(-1, K)` first, which
+// cost ~1.3 us per call on shapes where the kernel itself costs ~10.
+#define FLATTENED_ROWS(x) ((x).numel() / (x).size((x).ndim() - 1))
+
 // =============================================================================
 // Dtype dispatch macros
 // =============================================================================

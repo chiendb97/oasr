@@ -25,30 +25,43 @@ a mask **and** it is one the fused kernel can absorb:
 * ``attn_bias``: an additive bias already shaped ``(B, H, T_q, T_k)`` (the
   Conformer rel-pos ``matrix_bd``).
 
-**Unmasked attention goes to SDPA**, and that is a measurement rather than an
-oversight: the fused kernel's win is the fusion, so with nothing to fuse
-PyTorch's own flash kernel is simply better.  On an RTX 5090, fp16 —
+**Unmasked attention goes to SDPA.**  The fused kernel's win is the fusion, so
+with nothing to fuse there is nothing to gain.  Measured on an RTX 5090, fp16,
+with **head-split views** as inputs — which is what every real call site hands
+in, and which matters a great deal: the fused kernel needs canonical row-major
+q/k/v, so ``_ensure_canonical`` copies all three (35.3 → 68.7 µs at
+``B8 H4 T500 D128``).  An earlier version of this table was measured on freshly
+allocated contiguous tensors and overstated both directions.
 
-=================================  ==========  =========
-shape                              fused       vs SDPA
-=================================  ==========  =========
-B16 H6 T1500 D64, no mask          329 µs      1.25× slower
-B16 H6 Tq1 T1500 D64, no mask      47 µs       1.87× slower
-B4 H20 T1500 D64, ``kv_lens``      281 µs      1.9× faster
-B16 H4 Tq20 T400 D64, ``kv_lens``  35 µs       1.7× faster
-=================================  ==========  =========
+=====================================  =========  ========  =============
+shape                                  fused      SDPA      speedup
+=====================================  =========  ========  =============
+B16 H6 T1500 D64, no mask              262 µs     265 µs    1.01× (wash)
+B4 H20 T1500 D64, ``kv_lens``          252 µs     528 µs    **2.10×**
+B16 H4 Tq20 T400 D64, ``kv_lens``      66 µs      59 µs     0.90× (loses)
+B8 H4 T500 D128, ``kv_lens``           68 µs      91 µs     1.34×
+B8 H4 T100 D128, ``kv_lens``           64 µs      74 µs     1.16×
+=====================================  =========  ========  =============
+
+Two things to read off it.  Unmasked is a wash rather than a loss, so routing it
+to SDPA costs nothing and keeps the rule simple.  And a *masked* shape with a
+short query extent can still lose — the stride copies are paid per call
+regardless of how little work the attention itself does — so the fusion rule is
+necessary but not sufficient, and closing the canonical-stride requirement is
+worth more than any further tuning of it.
 
 Left over for SDPA for structural reasons: a causal mask, an arbitrary boolean
 mask, and **left** padding (valid keys are ``[P - len, P)``, which is not a
 length).  Materializing any of those into a full bias tensor to reach the
 fused kernel would cost more than it saves.
 
-Shapes the CuteDSL kernel cannot compile (head_dim 128 on sm_120, say) also
-land on SDPA.  That is asked, not assumed: ``oasr.fmha`` *raises* on such a
-config, because a caller naming the kernel explicitly should hear about it, so
-the waist queries ``jit.attention.fmha_config_supported`` first.  Nothing here
-enumerates head dims — the arch class answers for itself and the answer tracks
-the kernel.
+Shapes the CuteDSL kernel cannot compile at all also land on SDPA.  That is
+asked, not assumed: ``oasr.fmha`` *raises* on such a config, because a caller
+naming the kernel explicitly should hear about it, so the waist queries
+``jit.attention.fmha_config_supported`` first.  Nothing here enumerates head
+dims — the arch class answers for itself, and it sizes its cp.async ring to the
+arch's shared memory rather than refusing (which is what used to strand
+head_dim 128 on the 99 KB parts).
 
 ``OASR_LAYERS_BACKEND=torch`` forces SDPA here too, so the waist's debugging
 switch covers attention as well as GEMM and norm.
@@ -62,7 +75,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .._backend import GEMM_DTYPES, use_fmha_kernel
+from .._backend import SERVED_DTYPES, out_of_scope, take_gap, take_policy, use_fmha_kernel
 
 
 def split_heads(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
@@ -220,21 +233,32 @@ class Attention(nn.Module):
     ) -> bool:
         if self.backend == "sdpa" or not use_fmha_kernel():
             return False
+        if not q.is_cuda:
+            return out_of_scope("CPU tensor")
+        if q.dtype not in SERVED_DTYPES:
+            return out_of_scope(f"dtype {q.dtype}")
         if attn_mask is not None or is_causal:
-            return False
+            # A kernel gap, not a fact of life: the FMHA kernel has no causal
+            # mode and no left-padding mode, so these shapes cannot be
+            # expressed to it at all.
+            return take_gap(
+                "fmha-mask-form", "causal" if is_causal else "boolean / left-padded mask"
+            )
         if kv_lens is None and attn_bias is None:
-            # Nothing to fuse — see the table in the module docstring.
-            return False
-        if not q.is_cuda or q.dtype not in GEMM_DTYPES:
-            return False
+            # Nothing to fuse, and SDPA measured faster — see the table above.
+            # A policy call today; closing it is kernel work.
+            return take_policy("fmha-unmasked")
+
         from oasr.jit.attention import fmha_config_supported
 
-        return fmha_config_supported(
+        if not fmha_config_supported(
             head_dim=self.head_dim,
             dtype_str="float16" if q.dtype is torch.float16 else "bfloat16",
             has_bias=attn_bias is not None,
             bias_aligned=attn_bias is not None and attn_bias.size(-1) % 2 == 0,
-        )
+        ):
+            return take_gap("fmha-head-dim", f"head_dim={self.head_dim}")
+        return True
 
     def extra_repr(self) -> str:
         return (

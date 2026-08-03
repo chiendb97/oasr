@@ -42,11 +42,12 @@ void gemm_log_softmax(TensorView output, TensorView A, TensorView B, Optional bi
     CHECK_INPUT(A);
     CHECK_INPUT(B);
     CHECK_INPUT(output);
-    CHECK_DIM(2, A);
+    CHECK_CONTIGUOUS_INPUT(A);
+    CHECK_CONTIGUOUS_INPUT(output);
     CHECK_DIM(2, B);
 
-    int M = A.size(0);
-    int K = A.size(1);
+    int K = A.size(A.ndim() - 1);
+    int M = static_cast<int>(FLATTENED_ROWS(A));
     int N = B.size(0);
 
     cudaStream_t stream = get_stream(A.device());

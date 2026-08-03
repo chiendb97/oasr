@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from oasr.layers import Embedding, FeedForward, LayerNorm, Linear
+from oasr.models.base import align_out_features
 
 from .config import ParaformerModelConfig
 from .modules import LAYER_NORM_EPS, DecoderFeedForward, FsmnBlock, SanmCrossAttention
@@ -96,7 +97,15 @@ class ParaformerSANMDecoder(nn.Module):
             [DecoderLayerSANM(d, None, None, DecoderFeedForward(d, config.decoder_linear_units))]
         )
         self.after_norm = LayerNorm(d, eps=LAYER_NORM_EPS)
-        self.output_layer = Linear(d, config.vocab_size)
+        # The vocabulary head is widened to what the GEMM kernels can address
+        # (8404 -> 8408 for paraformer-zh).  ``config.vocab_size`` stays the
+        # true vocabulary — the tokenizer and the sos/eos ids are defined
+        # against it — and ``ParaformerModel.load_weights`` pads the checkpoint
+        # rows to match, giving the padding classes a bias far below any real
+        # logit.  Without this the head is the one projection in the model that
+        # can never reach a kernel.
+        self.vocab_size = config.vocab_size
+        self.output_layer = Linear(d, align_out_features(config.vocab_size))
 
     def forward(
         self,
@@ -120,5 +129,7 @@ class ParaformerSANMDecoder(nn.Module):
             x = layer(x, tgt_mask, memory, memory_lens)
         x = self.decoders3[0](x, tgt_mask, memory, memory_lens)
         x = self.after_norm(x)
-        logits = self.output_layer(x)
+        # Drop the alignment padding before the softmax so the returned width is
+        # the true vocabulary and the normalizer is exactly the unpadded one.
+        logits = self.output_layer(x)[..., : self.vocab_size]
         return torch.log_softmax(logits, dim=-1), token_lens
