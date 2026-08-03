@@ -88,7 +88,14 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.matrix.outputs.suites) }}
     steps:
+      # CUTLASS lives in the 3rdparty/cutlass submodule and every GEMM / BMM /
+      # Conv2D kernel is JIT-compiled against its headers, so a checkout without
+      # it either fails to compile or -- worse, on a persistent runner -- picks
+      # up whatever CUTLASS version was left in the workspace.  The pinned
+      # commit is the one the JIT cache key stamps.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Report the environment
         run: |
@@ -106,7 +113,10 @@ jobs:
     name: slow + concurrent
     runs-on: [self-hosted, oasr-gpu]
     steps:
+      # submodules: 3rdparty/cutlass, as above.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: pytest -m slow
         run: python -m pytest tests/ -m "slow" -q -rs $STRICT
       - name: pytest -m concurrent
@@ -118,7 +128,10 @@ jobs:
     name: full suite
     runs-on: [self-hosted, oasr-gpu]
     steps:
+      # submodules: 3rdparty/cutlass, as above.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: pytest tests/
         run: |
           python -m pytest tests/ \
