@@ -53,9 +53,15 @@ class EngineConfig:
         defaults ``feature_graph_batch_buckets`` when that is unset.  Every
         value must be ``<= max_batch_size``; sorted/deduped on init.  ``None``
         keeps the legacy "admit greedily up to ``max_batch_size``" behaviour.
-    max_num_blocks : int
+    max_num_blocks : int or None
         Total number of physical KV-cache blocks in the shared block pool.
         Should satisfy ``max_num_blocks >= max_batch_size * max_blocks_per_seq``.
+        ``None`` means **derive it from free VRAM** at engine construction (H4)
+        — see :attr:`gpu_memory_utilization`.
+    gpu_memory_utilization : float
+        Fraction of the device the engine may occupy in total, weights included.
+        Only read when a capacity is left to derive (``max_num_blocks=None`` in
+        streaming mode, ``decode_kv_budget_gib=None`` for an AR decode family).
     block_size_frames : int
         Frames per KV-cache block (page).  Setting this equal to ``chunk_size``
         means each chunk maps to exactly one block.
@@ -218,10 +224,26 @@ class EngineConfig:
     # near the kernel's efficient occupancy without exhausting smem/registers.
     max_packed_frames: int = 8192
 
-    # Paged KV cache
-    max_num_blocks: int = 2048
+    # Paged KV cache.  ``max_num_blocks=None`` derives the pool size from free
+    # VRAM at construction (H4): the operator otherwise hand-computes it from
+    # layers x heads x head_dim x dtype and either wastes memory or hits the
+    # crash path — an undersized pool raises ``BlockPool exhausted`` from inside
+    # the encoder forward, an oversized one OOMs at allocation — and one config
+    # cannot move between a 24 GB and an 80 GB card.  The default stays an
+    # explicit number so no existing deployment changes size under it; see
+    # ``oasr/engine/memory.py`` for the derivation and
+    # ``gpu_memory_utilization`` for the knob.
+    #
+    # Inert in ``service_mode="offline"``, which allocates no paged pool at all.
+    max_num_blocks: Optional[int] = 2048
     block_size_frames: int = 16
     max_blocks_per_seq: int = 512
+    # Share of the device the engine may occupy *in total* — weights, caches and
+    # activations together — when it derives a capacity from VRAM.  The unspent
+    # remainder is headroom for what the derivation cannot see (CUDA-graph
+    # capture pools, an AR family's prefill transient, allocator fragmentation),
+    # which is why it is not 1.0.  Read only when something is left to derive.
+    gpu_memory_utilization: float = 0.90
 
     # CUDA Graph capture for the steady-state streaming encoder forward.
     # The cute DSL fmha is compiled with TVM-FFI (``--enable-tvm-ffi``)
@@ -326,8 +348,15 @@ class EngineConfig:
     #                   * (prompt_positions + max_new_tokens)
     #
     # Both factors are knowable before the encode for these families because
-    # they run a fixed-window frontend.  ``None`` (default) leaves the byte
-    # budget off and keeps the slot cap as the only limit.
+    # they run a fixed-window frontend.  ``None`` (default) **derives** the
+    # ceiling from free VRAM at engine construction (H4, the same profile that
+    # sizes the paged pool — see ``oasr/engine/memory.py``); ``0`` turns the byte
+    # budget off entirely and keeps the slot cap as the only limit.  Deriving is
+    # the default because the alternative to a byte ceiling is not "no ceiling",
+    # it is an OOM at prefill: ``max_decode_slots`` bounds rows, and rows are not
+    # bytes.  The derived value is whatever the card has left over after weights
+    # and the activation reserve, so it binds only where admission would
+    # otherwise have run the device out of memory.
     decode_kv_budget_gib: Optional[float] = None
 
     # Long-form decoding for fixed-window frontends (``whisper_logmel``).  With
@@ -475,10 +504,19 @@ class EngineConfig:
             raise ValueError(
                 "long_form_overlap_seconds must be >= 0, got " f"{self.long_form_overlap_seconds!r}"
             )
-        if self.decode_kv_budget_gib is not None and self.decode_kv_budget_gib <= 0:
+        if self.decode_kv_budget_gib is not None and self.decode_kv_budget_gib < 0:
             raise ValueError(
-                "decode_kv_budget_gib must be > 0 or None (disabled), got "
-                f"{self.decode_kv_budget_gib!r}"
+                "decode_kv_budget_gib must be > 0, 0 (disabled) or None "
+                f"(derive from VRAM), got {self.decode_kv_budget_gib!r}"
+            )
+        if self.max_num_blocks is not None and self.max_num_blocks < 1:
+            raise ValueError(
+                "max_num_blocks must be a positive int or None (derive from "
+                f"VRAM), got {self.max_num_blocks!r}"
+            )
+        if not 0.0 < self.gpu_memory_utilization <= 1.0:
+            raise ValueError(
+                "gpu_memory_utilization must be in (0, 1], got " f"{self.gpu_memory_utilization!r}"
             )
         if self.max_decode_slots is not None and self.max_decode_slots < 1:
             raise ValueError(
@@ -613,7 +651,21 @@ class EngineConfig:
         cache_spec : CacheSpec
             Architecture-agnostic cache descriptor, e.g. ``model.cache_spec``
             (live model) or ``model_config.cache_spec`` (config object).
+
+        Raises
+        ------
+        ValueError
+            When ``max_num_blocks`` is still ``None``.  ``None`` means "derive
+            from VRAM", which :class:`~oasr.engine.engine.ASREngine` resolves
+            before it gets here; reaching this point unresolved means the caller
+            asked for a pool on a device with no VRAM to measure.
         """
+        if self.max_num_blocks is None:
+            raise ValueError(
+                "max_num_blocks=None means 'derive from free VRAM', which needs "
+                "a CUDA device (ASREngine resolves it at construction). Set an "
+                "explicit block count to build a cache config directly."
+            )
         return CacheConfig(
             num_layers=cache_spec.num_layers,
             n_kv_head=cache_spec.n_kv_head,

@@ -21,7 +21,7 @@ the fused-head fast path; raw hidden states for autoregressive families).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Callable, ClassVar, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, ClassVar, Dict, List, Optional, Sequence, Type, cast
 
 import torch
 
@@ -45,6 +45,16 @@ class StreamingEncoderBackend(ABC):
 
     #: Encoder ``streaming_kind`` this backend serves.
     streaming_kind: ClassVar[str]
+
+    #: Whether this runtime allocates from the shared paged KV pool
+    #: (:class:`~oasr.cache.block_pool.BlockPool`).  Declared rather than inferred
+    #: because it decides two engine-level questions before the backend exists:
+    #: whether a :class:`~oasr.cache.types.CacheConfig` is built at all, and
+    #: whether ``EngineConfig.max_num_blocks=None`` has anything to derive (H4).
+    #: A recurrent-state runtime allocates its caches per request and needs
+    #: neither, so probing VRAM for it would be work — and a possible startup
+    #: failure — over a pool nothing will build.
+    allocates_paged_pool: ClassVar[bool] = False
 
     # -- per-request cache lifecycle ---------------------------------------
     @abstractmethod
@@ -93,7 +103,7 @@ class StreamingEncoderBackend(ABC):
 # Registry
 # ----------------------------------------------------------------------------
 
-_REGISTRY: Dict[str, Callable[..., StreamingEncoderBackend]] = {}
+_REGISTRY: Dict[str, Type[StreamingEncoderBackend]] = {}
 
 
 def register_streaming_backend(name: str):
@@ -104,6 +114,24 @@ def register_streaming_backend(name: str):
         return cls
 
     return _wrap
+
+
+def get_streaming_backend_class(streaming_kind: str) -> Type[StreamingEncoderBackend]:
+    """The registered backend **class** for ``streaming_kind``.
+
+    The engine needs a couple of class-level declarations
+    (:attr:`StreamingEncoderBackend.allocates_paged_pool`) *before* it can build
+    the backend — sizing the paged pool has to happen before something allocates
+    it.  Same lookup and same error as :func:`build_streaming_backend`.
+    """
+    cls = _REGISTRY.get(streaming_kind)
+    if cls is None:
+        raise NotImplementedError(
+            f"No streaming backend registered for streaming_kind={streaming_kind!r}. "
+            f"Registered: {sorted(_REGISTRY)}.  Add one by subclassing "
+            "StreamingEncoderBackend + @register_streaming_backend."
+        )
+    return cls
 
 
 def build_streaming_backend(
@@ -124,11 +152,10 @@ def build_streaming_backend(
     (listing the registered kinds) when the encoder declares a kind with no
     backend — the extension point for new streaming runtimes.
     """
-    cls = _REGISTRY.get(streaming_kind)
-    if cls is None:
-        raise NotImplementedError(
-            f"No streaming backend registered for streaming_kind={streaming_kind!r}. "
-            f"Registered: {sorted(_REGISTRY)}.  Add one by subclassing "
-            "StreamingEncoderBackend + @register_streaming_backend."
-        )
-    return cls(model, config, cache_config, graph_pool=graph_pool, consumes=consumes)
+    # Called as a factory, not as the ABC: the base class deliberately declares
+    # no ``__init__`` (each runtime takes what its cache model needs), so the
+    # constructor signature is a convention of this call site.
+    factory = cast(
+        Callable[..., StreamingEncoderBackend], get_streaming_backend_class(streaming_kind)
+    )
+    return factory(model, config, cache_config, graph_pool=graph_pool, consumes=consumes)

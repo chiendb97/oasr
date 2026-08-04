@@ -28,10 +28,22 @@ from .executor import (
 from .graph_cache import round_up_bucket
 from .input_processor import InputProcessor
 from .longform import LongFormTracker
+from .memory import (
+    MIN_BLOCKS_PER_STREAM,
+    PROBE_AUDIO_SECONDS,
+    UNMEASURED_ACTIVATION_FRACTION,
+    MemoryProfile,
+    bytes_per_kv_block,
+    derive_decode_kv_budget,
+    derive_pool_blocks,
+    measure_peak_activation,
+    read_device_memory,
+)
 from .model_runner import ModelRunner
 from .output_processor import OutputProcessor
 from .request import DecodingOptions, Request, RequestOutput
 from .scheduler import Scheduler
+from .streaming_backend import get_streaming_backend_class
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +100,12 @@ class ASREngine:
     #: would make those entry points depend on construction order.
     _longform: Optional["LongFormTracker"] = None
 
+    #: Device-memory profile taken during construction, ``None`` unless a
+    #: capacity was left to derive (H4).  Class-level for the same reason as
+    #: ``_longform``: the concurrency tests drive a hand-built engine through
+    #: ``__new__``, and a read must not depend on construction having run.
+    _memory_profile: Optional[MemoryProfile] = None
+
     def __init__(self, config: EngineConfig) -> None:
         # Engine-wide re-entrant lock guarding scheduler queues and per-request
         # audio mutations. Held by every public entry (add_*, feed_chunk,
@@ -123,9 +141,17 @@ class ASREngine:
         # built at all — previously every engine allocated the paged KV pool plus
         # the CNN-cache tensors (~0.4 GB at the defaults) even when nothing could
         # ever read them, on exactly the LLM/offline deployments where VRAM is
-        # tightest (H13).
+        # tightest (H13).  An engine pinned to ``service_mode="offline"`` gets the
+        # same treatment for the same reason: ``ModelRunner`` selects the
+        # ``none`` streaming backend there, so a cache config would describe a
+        # pool nothing allocates.
         cache_spec = model.cache_spec
-        cache_config = config.build_cache_config(cache_spec) if cache_spec is not None else None
+        # Streaming geometry the *encoder* declares (the backend-derived window /
+        # stride are stamped further down, once the backend exists).  Resolved
+        # here because the VRAM probe below needs the real chunk window to pick a
+        # representative shape.
+        config._subsampling_rate_override = model.encoder.subsampling_rate
+        config._right_context_override = model.encoder.right_context
 
         # CUDA Graph capture: each cache type (encoder, feature extraction,
         # CTC) owns its own ``torch.cuda.graph_pool_handle()``. Sharing one
@@ -187,17 +213,27 @@ class ASREngine:
                 decode_method,
                 "hidden-states" if consumes == "hidden" else "hidden+log-probs",
             )
+        # Size the paged KV pool from free VRAM when the operator left it to the
+        # engine (``max_num_blocks=None``).  Must happen before the pool is
+        # allocated, and after everything else that is already resident, so the
+        # profile sees the real occupancy.
+        cache_config = None
+        if (
+            cache_spec is not None
+            and config.service_mode == "streaming"
+            and get_streaming_backend_class(model.encoder.streaming_kind).allocates_paged_pool
+        ):
+            # Only the pool-owning runtime needs a cache config — and only it has
+            # a pool size to derive.  A recurrent-state backend (Zipformer) would
+            # otherwise pay a VRAM probe, and could fail at startup, over a pool
+            # nothing builds.
+            if config.max_num_blocks is None:
+                self._autosize_kv_pool(config, cache_spec, consumes)
+            cache_config = config.build_cache_config(cache_spec)
         self._model_runner = ModelRunner(
             model, config, cache_config, graph_pool=self._graph_pool, consumes=consumes
         )
 
-        # Source the streaming geometry from the model's encoder + the streaming
-        # backend so the executor / input processor window the feature buffer per
-        # the actual architecture (Conformer paged vs Zipformer stateful) rather
-        # than hardcoded Conformer constants.  For Conformer these equal the old
-        # defaults (4 / 6 / 67 / 64) — zero behaviour change.
-        config._subsampling_rate_override = model.encoder.subsampling_rate
-        config._right_context_override = model.encoder.right_context
         # A backend that allocates no streaming state reports ``0`` for both (the
         # offline-only ``none`` backend, and any engine pinned to offline mode, which
         # now selects it — see ``ModelRunner``).  Leave the config's own values in
@@ -211,6 +247,13 @@ class ASREngine:
         self._output_processor = OutputProcessor(
             config, decode_type=decode_method, model=model, tokenizer=tokenizer
         )
+
+        # Ceiling on in-flight decoder KV for the AR families, derived from free
+        # VRAM unless the operator supplied one (``0`` disables it).  Needs the
+        # strategy — it owns the per-row footprint — so it lands after the output
+        # processor and before the executor that reads the budget.
+        if strategy_cls.incremental and config.decode_kv_budget_gib is None:
+            self._autosize_decode_kv_budget(config, consumes)
 
         # Build exactly one executor matching ``config.service_mode``.
         # The other mode's machinery (paged KV cache vs. persistent
@@ -344,6 +387,183 @@ class ASREngine:
                     window_s,
                     self._longform_overlap_samples / sr,
                 )
+
+    # ------------------------------------------------------------------
+    # VRAM-aware capacity sizing (H4)
+    # ------------------------------------------------------------------
+
+    def _autosize_kv_pool(self, config: EngineConfig, cache_spec, consumes: str) -> None:
+        """Resolve ``max_num_blocks=None`` into a block count that fits the card.
+
+        Sets ``config.max_num_blocks`` in place, so everything downstream (the
+        cache config, the pool, the per-stream ceiling) sees a plain number and
+        needs no knowledge that it was derived.
+
+        Raises
+        ------
+        ValueError
+            On a non-CUDA device (nothing to measure), or when not even the
+            minimum viable pool fits — see
+            :func:`~oasr.engine.memory.derive_pool_blocks`.
+        """
+        if self._device.type != "cuda":
+            raise ValueError(
+                "max_num_blocks=None derives the paged KV pool from free VRAM, "
+                f"which needs a CUDA device (got device={config.device!r}). Set "
+                "an explicit max_num_blocks for a non-CUDA engine."
+            )
+        per_block = bytes_per_kv_block(
+            num_layers=cache_spec.num_layers,
+            block_size_frames=int(config.block_size_frames),
+            n_kv_head=cache_spec.n_kv_head,
+            head_dim=cache_spec.head_dim,
+            dtype=config.dtype,
+        )
+        # Blocks one stream can hold, hence the ceiling past which the pool is
+        # memory nothing can hand out.  With eviction the retained history is an
+        # exact requirement (the pool has no capacity gate — see
+        # ``CacheConfig.__post_init__``), so the floor and the ceiling coincide
+        # and the derivation degenerates into "check that it fits".
+        batch = max(1, int(config.max_batch_size))
+        if config.num_left_chunks >= 0:
+            frames = int(config.chunk_size) * int(config.num_left_chunks)
+            per_stream = max(1, -(-frames // int(config.block_size_frames)))
+            per_stream = min(per_stream, int(config.max_blocks_per_seq))
+            floor_per_stream = per_stream
+        else:
+            per_stream = int(config.max_blocks_per_seq)
+            floor_per_stream = min(per_stream, MIN_BLOCKS_PER_STREAM)
+        profile = self._profile_device_memory(config, consumes)
+        sizing = derive_pool_blocks(
+            profile,
+            per_block,
+            min_blocks=batch * floor_per_stream,
+            max_blocks=batch * per_stream,
+        )
+        config.max_num_blocks = sizing.blocks
+        logger.info(
+            "paged KV pool derived from VRAM: %s | %s",
+            sizing.describe(),
+            profile.describe(),
+        )
+        if sizing.limited_by == "block_table" and config.num_left_chunks < 0:
+            # The card could afford more, but no stream could address it.  Say so:
+            # the remaining lever is the per-stream ceiling, not the pool size, and
+            # the operator has no way to tell those apart from the number alone.
+            logger.info(
+                "the pool is capped by max_blocks_per_seq (%d) x max_batch_size "
+                "(%d), not by VRAM (%.2fGiB was available). Raise "
+                "max_blocks_per_seq to spend it on a longer per-stream history.",
+                config.max_blocks_per_seq,
+                batch,
+                profile.available_bytes / float(1024**3),
+            )
+
+    def _autosize_decode_kv_budget(self, config: EngineConfig, consumes: str) -> None:
+        """Resolve ``decode_kv_budget_gib=None`` into a byte ceiling for AR decode.
+
+        Leaves the budget off (``None``) on a non-CUDA device: there is no VRAM
+        ceiling to enforce, and inventing one would throttle admission for no
+        reason.  The executor reads any falsey value as "no byte budget".
+        """
+        if self._device.type != "cuda":
+            return
+        try:
+            per_row = self._output_processor.strategy.kv_bytes_per_row()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("kv_bytes_per_row failed (%s); budgeting without it", exc)
+            per_row = None
+        profile = self._profile_device_memory(config, consumes)
+        budget = derive_decode_kv_budget(profile, bytes_per_row=per_row)
+        config.decode_kv_budget_gib = budget.gib
+        log = logger.warning if budget.clamped_to_one_row else logger.info
+        log(
+            "decoder-KV budget derived from VRAM: %s | %s",
+            budget.describe(),
+            profile.describe(),
+        )
+
+    def _profile_device_memory(self, config: EngineConfig, consumes: str) -> MemoryProfile:
+        """Measure the device: what is resident, and what one forward costs.
+
+        Cached for the engine's lifetime — both derivations describe the same
+        moment, and the probe forward is not free.
+        """
+        if self._memory_profile is not None:
+            return self._memory_profile
+        activation = 0
+        measured = True
+        try:
+            activation = measure_peak_activation(
+                lambda: self._probe_forward(config, consumes), self._device
+            )
+        except Exception as exc:
+            measured = False
+            logger.warning(
+                "activation probe failed (%s); reserving %.0f%% of the budget for "
+                "transients instead of a measured peak",
+                exc,
+                100.0 * UNMEASURED_ACTIVATION_FRACTION,
+            )
+        free, total = read_device_memory(self._device)
+        profile = MemoryProfile(
+            total_bytes=total,
+            free_bytes=free,
+            activation_bytes=activation,
+            utilization=float(config.gpu_memory_utilization),
+            activation_measured=measured,
+        )
+        self._memory_profile = profile
+        return profile
+
+    def _probe_forward(self, config: EngineConfig, consumes: str) -> None:
+        """One representative forward at the widest shape the engine will run.
+
+        Widest, not longest: the peak transient scales with ``max_batch_size`` x
+        the per-row input length, and the engine's own ceiling on both is what
+        the reserve has to cover.
+
+        * streaming — one encoder chunk window at the full cohort width, which is
+          exactly the shape ``forward_step`` issues at steady state.
+        * offline — the frontend's fixed window if it has one (Whisper /
+          Qwen2-Audio's 30 s, where every row costs the same), else
+          :data:`~oasr.engine.memory.PROBE_AUDIO_SECONDS` of audio.
+
+        Goes through ``InputProcessor.collate`` and the same ``consumes`` routing
+        as production, so fbank staging and the head's ``(B, T, V)`` log-probs are
+        in the measurement rather than assumed away.  Calls the **model** rather
+        than ``ModelRunner``: the pool derivation runs before the runner exists
+        (the runner is what allocates the pool), and the runner only delegates.
+        """
+        fc = config.feature_config
+        assert fc is not None  # EngineConfig.__post_init__ always materialises one
+        sr = int(fc.sample_rate)
+        if config.service_mode == "streaming":
+            # Feature frames one chunk consumes -> samples, snip_edges geometry.
+            frames = int(config.decoding_window)
+            n = fc.frame_length_samples + max(0, frames - 1) * fc.frame_shift_samples
+        else:
+            window_s = fc.fixed_window_seconds or PROBE_AUDIO_SECONDS
+            n = int(sr * float(window_s))
+        batch = max(1, int(config.max_batch_size))
+        reqs = [
+            Request(audio=torch.zeros(n, dtype=torch.float32), streaming=False, sample_rate=sr)
+            for _ in range(batch)
+        ]
+        feats, lengths = self._input_processor.collate(reqs)
+        with torch.no_grad():
+            if consumes == "hidden":
+                self._model.encode_offline(feats, lengths)
+            elif consumes == "both":
+                hidden, _ = self._model.encode_offline(feats, lengths)
+                self._model.head(hidden)
+            else:
+                self._model.forward_offline(feats, lengths)
+        if config.service_mode == "streaming":
+            # ``collate`` is the *offline* ingest path; a streaming engine will
+            # never touch the staging buffers it just grew, so give them back
+            # rather than leaving pinned host memory resident for the process.
+            self._input_processor.release_staging()
 
     # ------------------------------------------------------------------
     # Request management

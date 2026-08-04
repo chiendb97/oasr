@@ -108,7 +108,10 @@ Derived properties of interest:
 
 With eviction enabled (`num_left_chunks ≥ 0`) memory is bounded by construction:
 size the pool so `max_num_blocks ≥ max_batch_size * max_logical_blocks`, with
-headroom for short-lived oversubscription during cohort transitions.
+headroom for short-lived oversubscription during cohort transitions.  Or don't
+size it at all: `EngineConfig.max_num_blocks=None` derives the block count from
+free VRAM at engine construction and, with eviction on, reduces to *checking*
+that the retained history fits (see [engine.md §6.1](engine.md#61-vram-aware-capacity-sizing)).
 
 **With unlimited history (`num_left_chunks = -1`, the default) eviction is off,
 so every stream has a finite ceiling** — `max_stream_frames`, logged at INFO when
@@ -257,7 +260,7 @@ the loaded model. The fields you typically tune:
 | `chunk_size` | 16 | Must match training. Longer chunk = higher accuracy, higher per-chunk latency. |
 | `num_left_chunks` | -1 | -1 is unlimited; set to a positive value (e.g. 4) to bound memory in long-running streams. |
 | `block_size_frames` | 16 | Equal to `chunk_size` is simplest (one block per chunk). Smaller values reduce eviction granularity but increase block-table size. |
-| `max_num_blocks` | 2048 | Pool capacity. Must cover all concurrent streams' worst-case logical block counts plus overhead. |
+| `max_num_blocks` | 2048 | Pool capacity. Must cover all concurrent streams' worst-case logical block counts plus overhead. `EngineConfig.max_num_blocks=None` derives it from free VRAM instead. |
 | `max_blocks_per_seq` | 512 | Width of the per-stream `block_table`. Must be ≥ `max_logical_blocks`. |
 | `dtype` | `float16` | `bfloat16` works on Ampere+. The K/V pool is the dominant memory consumer. |
 
@@ -269,7 +272,10 @@ Pool memory in bytes:
 ```
 
 For a default Conformer (`num_layers=12, n_kv_head=4, head_dim=64,
-block_size=16, max_num_blocks=2048`) with FP16 this is ~6 GiB.
+block_size=16, max_num_blocks=2048`) with FP16 this is 192 KiB per block and
+**384 MiB** for the pool.  `oasr.engine.memory.bytes_per_kv_block` is the same
+arithmetic in code, and `tests/test_vram_sizing.py` pins it against a real
+`BlockPool` allocation — the formula and the allocator must not drift.
 
 ## 7. Usage Examples
 
@@ -376,6 +382,8 @@ thread that performs the GPU forward calls into them.
 1. **Pool over-provisioning.** Allocate enough `max_num_blocks` to cover
    peak concurrent demand. Falling back into a `RuntimeError` mid-stream
    is fatal; running out is the most common production failure mode.
+   `EngineConfig.max_num_blocks=None` removes the hand-computation: it fills
+   what free VRAM allows, capped at what the block table can address.
 2. **Avoid `cudaMalloc` in the hot loop.** Per-stream allocations
    (`block_table`, `cache_seqlens`) are lazy — they happen on first
    `prepare_chunk`. CTC states are pooled. The CNN cache tensor is

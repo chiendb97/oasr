@@ -51,6 +51,8 @@ class PagedStreamingBackend(StreamingEncoderBackend):
     """
 
     streaming_kind: ClassVar[str] = "paged"
+    #: Owns the shared :class:`BlockPool`, so its size is the engine's to derive.
+    allocates_paged_pool: ClassVar[bool] = True
 
     def __init__(
         self,

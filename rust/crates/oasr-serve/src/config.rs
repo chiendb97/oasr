@@ -41,6 +41,26 @@ pub struct Cli {
     /// Encoder chunk size (frames).
     #[arg(long)]
     pub chunk_size: Option<u32>,
+    /// Streaming: physical blocks in the shared paged KV pool.  Pass `0` to
+    /// **derive it from free VRAM** at startup (the engine's
+    /// `max_num_blocks=None`) instead of hand-computing it from layers x heads x
+    /// head_dim x dtype; unset keeps the engine default (2048).
+    ///
+    /// An undersized pool raises `BlockPool exhausted` from inside the encoder
+    /// forward — where it takes out the tick for every concurrent stream — and an
+    /// oversized one OOMs at startup, so deriving is how one config moves between
+    /// a 24 GB and an 80 GB card.  Inert in `--service-mode offline`, which
+    /// allocates no pool.
+    #[arg(long)]
+    pub max_num_blocks: Option<u32>,
+    /// Share of the device the engine may occupy in total — weights, caches and
+    /// activations together — when it derives a capacity from VRAM
+    /// (`--max-num-blocks 0`, or an AR decode family with no
+    /// `--decode-kv-budget-gib`).  Engine default 0.90; the unspent remainder is
+    /// headroom for CUDA-graph pools, AR prefill transients and allocator
+    /// fragmentation.
+    #[arg(long)]
+    pub gpu_memory_utilization: Option<f64>,
     /// Decoder type: `ctc_cuda` (GPU CTC beam, engine default) or `ctc_wfst`
     /// (in-tree GPU WFST beam search). Forwarded verbatim to the Python
     /// `EngineConfig.decoder_type`.
@@ -74,7 +94,9 @@ pub struct Cli {
     /// `--max-decode-slots` bounds admission by request *count*, which does not
     /// bound memory: a row's KV footprint is its position budget (prompt +
     /// generation cap) times the model's per-token rate, and prefill
-    /// preallocates all of it.  Unset leaves the byte budget off.
+    /// preallocates all of it.  Unset **derives** the ceiling from free VRAM
+    /// (see `--gpu-memory-utilization`); pass `0` to turn the byte budget off
+    /// and leave the slot cap as the only limit.
     #[arg(long)]
     pub decode_kv_budget_gib: Option<f64>,
     /// Streaming: recycle the oldest KV block when a stream reaches its cache
@@ -359,6 +381,22 @@ impl Cli {
         if let Some(v) = self.chunk_size {
             obj.entry("chunk_size").or_insert(Value::Number(v.into()));
         }
+        if let Some(v) = self.max_num_blocks {
+            // `0` is the CLI spelling of "derive from VRAM": clap cannot pass a
+            // three-state Option<Option<u32>>, and the engine's sentinel for
+            // derive is `null`.
+            obj.entry("max_num_blocks").or_insert(if v == 0 {
+                Value::Null
+            } else {
+                Value::Number(v.into())
+            });
+        }
+        if let Some(v) = self.gpu_memory_utilization {
+            if let Some(num) = serde_json::Number::from_f64(v) {
+                obj.entry("gpu_memory_utilization")
+                    .or_insert(Value::Number(num));
+            }
+        }
         if let Some(s) = &self.decoder_type {
             obj.entry("decoder_type")
                 .or_insert(Value::String(s.clone()));
@@ -545,6 +583,46 @@ mod tests {
             cli(&["--stream-idle-timeout-secs", "0"]).stream_idle_timeout(),
             None
         );
+    }
+
+    /// `--max-num-blocks 0` is the CLI spelling of the engine's `None` sentinel
+    /// ("derive the paged KV pool from free VRAM").  A `0` forwarded literally
+    /// would be rejected by `EngineConfig` as an empty pool, and an omitted flag
+    /// must leave the engine default alone rather than deriving behind the
+    /// operator's back.
+    #[test]
+    fn zero_blocks_asks_the_engine_to_derive_the_pool() {
+        let derive: Value = serde_json::from_str(
+            &cli(&["--max-num-blocks", "0"])
+                .build_engine_config_json()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(derive.get("max_num_blocks"), Some(&Value::Null));
+
+        let explicit: Value = serde_json::from_str(
+            &cli(&["--max-num-blocks", "4096"])
+                .build_engine_config_json()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(explicit["max_num_blocks"], 4096);
+
+        let untouched: Value =
+            serde_json::from_str(&cli(&[]).build_engine_config_json().unwrap()).unwrap();
+        assert!(untouched.get("max_num_blocks").is_none());
+        assert!(untouched.get("gpu_memory_utilization").is_none());
+    }
+
+    #[test]
+    fn utilization_reaches_the_engine() {
+        let cfg: Value = serde_json::from_str(
+            &cli(&["--gpu-memory-utilization", "0.75"])
+                .build_engine_config_json()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg["gpu_memory_utilization"], 0.75);
     }
 
     #[test]
