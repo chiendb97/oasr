@@ -401,6 +401,27 @@ Beyond `--max-batch-size` / `--chunk-size` / `--preferred-batch-sizes` /
 and the (default-off, **keep off** — measured to regress) `--use-ctc-cuda-graphs`
 / `--use-feature-cuda-graphs`. `oasr-server --help` lists them all.
 
+**Memory sizing.** `--max-num-blocks 0` hands the paged KV pool to the engine,
+which derives it from free VRAM at startup (`--gpu-memory-utilization`, default
+0.90, is the share of the card it may occupy in total). That is what makes one
+launch command portable across card sizes; unset keeps the fixed 2048-block
+default. The same profile sizes the AR decoder-KV ceiling: leave
+`--decode-kv-budget-gib` unset and it is derived, pass `0` to switch the byte
+budget off. Both derivations are logged with their full arithmetic — see
+[engine.md §6.1](engine.md#61-vram-aware-capacity-sizing).
+
+Caveat on that log: the front-end configures `tracing`, not Python's `logging`,
+so **no** engine-side INFO line reaches the server's output today (this predates
+H4 — the streaming-cache ceiling and long-form messages are invisible the same
+way). Only Python warnings surface, via the root logger's last-resort handler. To
+see a derivation, construct the engine from Python with `logging.basicConfig(
+level=logging.INFO)`; wiring Python logging into the tracing stream is a separate
+change. Meanwhile the resolved footprint is observable from the outside:
+`nvidia-smi` per-process memory moved 1430 → 2590 MiB when the same conformer
+went from the fixed 2048-block pool to a derived one at `--max-batch-size 16
+--gpu-memory-utilization 0.5` (8192 blocks — exactly `(8192 − 2048) × 192 KiB`
+more).
+
 Multi-paradigm serving: `--decode-method` selects among the checkpoint's
 advertised capabilities (e.g. `ctc_aed_rescoring` on a U2++ hybrid, `llm` on
 a Qwen2-Audio checkpoint; unset = model default, validated at startup).  The

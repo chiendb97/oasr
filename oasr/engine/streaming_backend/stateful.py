@@ -54,7 +54,12 @@ class StatefulStreamingBackend(StreamingEncoderBackend):
         self,
         model: "BaseAsrModel",
         config: "EngineConfig",
-        cache_config: "CacheConfig",
+        # ``None`` in practice: this runtime allocates no paged pool
+        # (``allocates_paged_pool = False``), so the engine builds no
+        # ``CacheConfig`` for it.  Accepted for signature uniformity with the
+        # registry, and ignored — the per-request recurrent state comes from the
+        # encoder's own ``get_streaming_init_states``.
+        cache_config: "Optional[CacheConfig]" = None,
         *,
         graph_pool: Optional[Tuple[int, int]] = None,
         consumes: str = "log_probs",

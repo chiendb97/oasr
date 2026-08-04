@@ -13,11 +13,13 @@ from . import none, paged, stateful  # noqa: E402,F401
 from .base import (
     StreamingEncoderBackend,
     build_streaming_backend,
+    get_streaming_backend_class,
     register_streaming_backend,
 )
 
 __all__ = [
     "StreamingEncoderBackend",
     "build_streaming_backend",
+    "get_streaming_backend_class",
     "register_streaming_backend",
 ]

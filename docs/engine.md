@@ -320,10 +320,54 @@ prepare_offline                    prepare_streaming
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_num_blocks` | 2048 | Total physical blocks in the shared pool. |
+| `max_num_blocks` | 2048 | Total physical blocks in the shared pool. `None` derives it from free VRAM — see [§6.1](#61-vram-aware-capacity-sizing). Inert in `service_mode="offline"`, which builds no pool. |
+| `gpu_memory_utilization` | 0.90 | Share of the device the engine may occupy in total (weights + caches + activations) when it derives a capacity. Read only when something is left to derive. |
 | `block_size_frames` | 16 | Frames per block (= chunk_size by default). |
-| `max_blocks_per_seq` | 512 | Block-table width. |
+| `max_blocks_per_seq` | 512 | Block-table width. With unlimited history this, times `max_batch_size`, is also the ceiling a derived pool is capped at — blocks past it cannot be addressed. |
 | `use_paged_cache` | `True` | False falls back to dense `forward_chunk`. |
+
+### 6.1 VRAM-aware capacity sizing
+
+Two capacities are memory rather than compute, and both can be left to the
+engine (`oasr/engine/memory.py`):
+
+| Left unset | Derived as |
+|---|---|
+| `max_num_blocks=None` (streaming) | `available / bytes_per_block`, capped at `max_batch_size × blocks_per_seq` |
+| `decode_kv_budget_gib=None` (AR families) | `available`, clamped up to one row so a tight card still admits work |
+
+where
+
+```
+available = total × gpu_memory_utilization − resident − activation_reserve
+```
+
+`resident` is read from the driver (`torch.cuda.mem_get_info`) after the model
+is on the device, so it covers the weights, the CUDA context **and** anything
+another process holds — there is no separate "weights" term to get wrong.
+`activation_reserve` is `1.5 ×` a *measured* probe forward at the widest shape
+the engine will run (one chunk window at `max_batch_size` in streaming mode; the
+frontend's fixed window, else 30 s, in offline mode), floored at 256 MiB. The
+unspent `1 − utilization` is the headroom for what the probe cannot see: CUDA
+graph capture pools, an AR family's prefill transient, allocator fragmentation.
+
+The derivation is logged in full (`paged KV pool derived from VRAM: … | total=…
+resident=… cap=… activation_reserve=… → available=…`) so the numbers are
+auditable. Nothing is measured — and no probe forward runs — unless a capacity
+was actually left unset.
+
+Failure modes are explicit rather than silent: on a non-CUDA device
+`max_num_blocks=None` raises (there is nothing to measure), and when not even
+the minimum viable pool fits, construction fails with the arithmetic and the
+levers (`max_batch_size`, `num_left_chunks`, `gpu_memory_utilization`, or an
+explicit `max_num_blocks`) rather than deriving a pool that OOMs at allocation
+or degrades every transcript. `decode_kv_budget_gib=0` turns the byte budget off
+outright; `None` derives it.
+
+Worth knowing: on a large card the pool is usually capped by
+`max_blocks_per_seq × max_batch_size`, not by VRAM (a 32 GiB card had 27 GiB
+available and took 3 GiB). The engine logs when that happens — the remaining
+lever is then the *per-stream* ceiling, not the pool size.
 
 ### Feature extraction
 
@@ -430,7 +474,7 @@ engine = ASREngine(EngineConfig(
 | Situation | Behaviour |
 |-----------|-----------|
 | `feed_chunk` for unknown / finalised id | `KeyError` from `Scheduler.find_request → None`. |
-| Block pool exhaustion | `RuntimeError` from `BlockPool.allocate`. Currently fatal — size `max_num_blocks` for worst case. |
+| Block pool exhaustion | `RuntimeError` from `BlockPool.allocate`. Currently fatal — size `max_num_blocks` for worst case, or set it to `None` and let the engine derive it ([§6.1](#61-vram-aware-capacity-sizing)). With eviction on (`num_left_chunks >= 0`) the invariant is checked at construction instead. |
 | Audio shorter than one window with `audio_final=True` | `_forward_single` flushes whatever frames remain (special `is_final_window` path). |
 | `chunk.size(1) < context` (less than `right_context+1` input frames) and not final | Skipped — the engine waits for more audio. |
 | First chunk of paged stream | `prepare_chunks_batched` lazily allocates `block_table` / `cache_seqlens` before writing the first physical block. |
@@ -465,7 +509,9 @@ engine = ASREngine(EngineConfig(
 5. **Pool sizing.** The engine's most common production failure is
    `BlockPool` exhaustion. Size `max_num_blocks` for
    `max_batch_size × max_logical_blocks` plus headroom; trade off
-   against GPU memory.
+   against GPU memory. Or hand it over: `max_num_blocks=None` derives the
+   pool from free VRAM at construction ([§6.1](#61-vram-aware-capacity-sizing)),
+   which is what makes one config portable across card sizes.
 
 ## 10. Extension Points
 
