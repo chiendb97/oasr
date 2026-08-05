@@ -144,6 +144,14 @@ _ASSET_LIST: List[Asset] = [
         how="huggingface.co/Qwen/Qwen2-Audio-7B-Instruct",
     ),
     Asset(
+        env="NEMOTRON_CKPT",
+        kind=CHECKPOINT,
+        what="HF-format Nemotron ASR (FastConformer + RNN-T) checkpoint",
+        default="/data01/kilm/users/chiendb/models/asr/nemotron-3.5-asr-streaming-0.6b",
+        marker="model.safetensors",
+        how="huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b",
+    ),
+    Asset(
         env="LANG_DIR",
         kind=GRAPH,
         what="prebuilt lang dir (HLG.pt + words.txt) for the CPU WFST decoder",

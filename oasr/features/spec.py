@@ -11,8 +11,9 @@ but a spec-vs-override mismatch logs loudly.
 
 ``kind`` keys the extractor registry (:mod:`oasr.features.registry`):
 ``"kaldi_fbank"`` / ``"kaldi_mfcc"`` map onto the Kaldi backends,
-``"whisper_logmel"`` onto the fixed-window Whisper recipe; ``"raw"`` lands with
-its model package.  ``lfr_m`` / ``lfr_n`` describe low-frame-rate stacking
+``"whisper_logmel"`` onto the fixed-window Whisper recipe, ``"nemotron_logmel"``
+onto the NeMo pre-emphasis + natural-log mel recipe; ``"raw"`` lands with its
+model package.  ``lfr_m`` / ``lfr_n`` describe low-frame-rate stacking
 (Paraformer consumes 80×7 = 560-dim LFR features); ``1/1`` means off.
 
 Not every field applies to every kind — the ``whisper_logmel`` recipe fixes its
@@ -58,6 +59,13 @@ class FeatureSpec:
     # Without this a converter cannot pin a non-30 s window, and the engine's
     # admission duration check and batching cost model both read the window.
     window_seconds: Optional[float] = None
+    # Pre-emphasis coefficient applied to the waveform before framing, for the
+    # frontends that do it in the *frontend* rather than per Kaldi frame
+    # (``nemotron_logmel``); ``None`` keeps the frontend default.  Expressible
+    # here for the same reason ``audio_scale`` is: NeMo configs carry it per
+    # checkpoint (0.0 disables the filter), and a value that silently defaulted
+    # would shift every mel bin — the ``audio_scale`` failure mode.
+    preemphasis: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -71,6 +79,16 @@ class FeatureSpec:
     #: cannot honour, mapped to the value that means "not requested". A converter
     #: setting one of these is stating something that would be silently dropped,
     #: so :meth:`mismatches` reports it rather than ignoring it.
+    #: Spec fields the ``nemotron_logmel`` recipe fixes internally (a non-periodic
+    #: Hann window, no dither, no LFR), mapped to the value that means "not
+    #: requested".  Unlike Whisper's, the *frame geometry* is honoured.
+    _NEMOTRON_FIXED_FIELDS = {
+        "dither": 0.0,
+        "window_type": "povey",  # the recipe uses a non-periodic Hann window
+        "lfr_m": 1,
+        "lfr_n": 1,
+    }
+
     _WHISPER_FIXED_FIELDS = {
         "frame_length_ms": 25.0,  # n_fft 400 @ 16 kHz
         "frame_shift_ms": 10.0,  # hop 160 @ 16 kHz
@@ -82,6 +100,20 @@ class FeatureSpec:
 
     def to_feature_config(self) -> FeatureConfig:
         """Materialize a :class:`FeatureConfig` for the supported kinds."""
+        if self.kind == "nemotron_logmel":
+            cfg = FeatureConfig(
+                feature_type="nemotron_logmel",
+                sample_rate=self.sample_rate,
+                num_mel_bins=self.feature_dim,
+                frame_length_ms=self.frame_length_ms,
+                frame_shift_ms=self.frame_shift_ms,
+            )
+            # Not fixed-window, so the frame geometry above *is* honoured (the
+            # extractor derives n_fft from ``frame_length_ms``).  Only the
+            # Hann window and the ``log(x + 2**-24)`` guard are fixed.
+            if self.preemphasis is not None:
+                cfg.preemphasis_coefficient = self.preemphasis
+            return cfg
         if self.kind == "whisper_logmel":
             cfg = FeatureConfig(
                 feature_type="whisper_logmel",
@@ -123,6 +155,28 @@ class FeatureSpec:
         Only the fields the spec pins are compared; returns human-readable
         ``"name: spec=... config=..."`` strings (empty list = compatible).
         """
+        if self.kind == "nemotron_logmel":
+            diffs = []
+            pairs = [
+                ("feature_type", "nemotron_logmel", config.feature_type),
+                ("sample_rate", self.sample_rate, config.sample_rate),
+                ("feature_dim", self.feature_dim, config.num_mel_bins),
+                ("frame_length_ms", self.frame_length_ms, config.frame_length_ms),
+                ("frame_shift_ms", self.frame_shift_ms, config.frame_shift_ms),
+            ]
+            if self.preemphasis is not None:
+                pairs.append(("preemphasis", self.preemphasis, config.preemphasis_coefficient))
+            for name, spec_v, cfg_v in pairs:
+                if spec_v != cfg_v:
+                    diffs.append(f"{name}: spec={spec_v!r} config={cfg_v!r}")
+            for name, inert in self._NEMOTRON_FIXED_FIELDS.items():
+                asked = getattr(self, name)
+                if asked != inert:
+                    diffs.append(
+                        f"{name}: spec={asked!r} but the nemotron_logmel recipe "
+                        f"fixes it at {inert!r} and cannot honour the request"
+                    )
+            return diffs
         if self.kind == "whisper_logmel":
             diffs = []
             pairs = [

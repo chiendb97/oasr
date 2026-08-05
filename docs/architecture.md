@@ -418,7 +418,7 @@ recipe):
 kind is what makes it legal — no edit to the config, the `InputProcessor`, or the
 CUDA-graph feature cache.
 
-## Paradigm status (all five wired)
+## Paradigm status (all five paradigms wired, seven architectures)
 
 | Paradigm | Model package | Strategy | Mode |
 |---|---|---|---|
@@ -428,6 +428,19 @@ CUDA-graph feature cache.
 | AED (Whisper) | `whisper` (HF converter) | `aed` (incremental greedy) | offline |
 | Paraformer (NAR) | `paraformer` (FunASR converter) | `paraformer` (one-shot, CIF timestamps) | offline |
 | LLM-ASR (Qwen2-Audio) | `speech_llm` (HF converter) | `llm` (incremental greedy, token-streaming partials) | offline |
+| Transducer, recurrent predictor (Nemotron ASR) | `nemotron` (HF converter) | `transducer` (`consumes="hidden"`, greedy only) | offline |
+
+The last row is the one that reshaped an interface rather than adding a leaf.
+Its predictor is a 2-layer LSTM, and an LSTM state cannot be recomputed from
+the last `k` labels the way the icefall predictor's can — which is what the
+greedy loop assumed when it shifted a `(B, context_size)` int tensor itself.
+The state is now opaque to the strategy behind
+`TransducerPredictor.init_state` / `predict` / `advance` / `stack_states` /
+`unstack_states` (`oasr/models/decoders/base.py`), so one loop serves both.
+Beam search is the exception and says so: it keeps the beam's states in one
+`(B, k, ctx)` buffer and gather-reorders them onto their parents, which only
+expresses a label window, so `beam_size > 1` is refused at construction for a
+recurrent predictor rather than silently reordering something else.
 
 Per-request `DecodingOptions` (`oasr.engine.DecodingOptions` — n-best, generation
 cap, sampling knobs, LLM prompt override) ride on `Request` and through the

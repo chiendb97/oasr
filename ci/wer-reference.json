@@ -7,8 +7,9 @@
     "the error cancels. The audio_scale defect shipped through exactly that gap.",
     "",
     "These numbers are for REGRESSION DETECTION, not publication. LJSpeech is",
-    "out-of-domain for all three (LibriSpeech-trained), and the subset is 200",
-    "utterances. Do not quote them as OASR's WER.",
+    "out-of-domain for all of them, and the subset is 200 utterances. Do not",
+    "quote them as OASR's WER, and do not read them as a ranking either: the",
+    "checkpoints differ in size, training data and license.",
     "",
     "To re-record after a deliberate accuracy change, run the command in",
     "`recorded_with` for each entry and update `error_rate_pct` in the same commit",
@@ -70,6 +71,31 @@
       "substitutions": 58,
       "deletions": 71,
       "insertions": 9
+    },
+    {
+      "_comment": [
+        "Recorded 2026-08-05. Bit-stable across max_batch_size 1/8/16/32 —",
+        "identical error counts — which is the property that had to be earned:",
+        "the first measurement was 2.70% at bs16 and 2.62% at bs1, and the",
+        "difference was a fused-attention defect on -inf mask floors, not noise",
+        "(see oasr/models/nemotron/encoder.py::MASK_FLOOR). float32 gives 2.59%",
+        "(one fewer deletion), so the fp16 cost is ~0.03 absolute.",
+        "Decoded with the checkpoint's own default language prompt (slot 101,",
+        "'auto'); pinning en-US does not change this manifest's rate."
+      ],
+      "key": "nemotron",
+      "asset": "NEMOTRON_CKPT",
+      "architecture": "nemotron-3.5-asr-streaming-0.6b (FastConformer RNNT)",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "error_rate_pct": 2.62,
+      "ref_units": 3403,
+      "substitutions": 69,
+      "deletions": 9,
+      "insertions": 11
     }
   ]
 }

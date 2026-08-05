@@ -12,6 +12,11 @@ the declared properties (streamability, fixed window), not new maths:
 * ``whisper_logmel`` — the 30 s Whisper recipe (:mod:`oasr.features.whisper`),
   shared by Qwen2-Audio.  Fixed-window and therefore **not** streamable: it
   normalises over the whole padded window, so it cannot consume a growing buffer.
+* ``nemotron_logmel`` — the NeMo pre-emphasis + ``log(mel + 2**-24)`` recipe
+  (:mod:`oasr.features.nemotron`).  Not fixed-window, and frame-local rather than
+  normalised — but still declared non-streamable, for a different reason than
+  Whisper's: its frame grid comes from one ``center=True`` pass, so chunking it
+  needs a ``n_fft // 2`` look-back the streaming path does not yet supply.
 
 LFR stacking is deliberately *not* here — it is a post-transform over any
 extractor's output, applied once by the caller.
@@ -33,7 +38,7 @@ from .batched import (
 from .config import FeatureConfig
 from .registry import ExtractorSpec, register_extractor
 
-__all__ = ["kaldi_extract", "whisper_extract"]
+__all__ = ["kaldi_extract", "nemotron_extract", "whisper_extract"]
 
 
 def _per_utterance(
@@ -67,6 +72,15 @@ def whisper_extract(
     return batched_whisper_logmel(waveforms, lengths, config)
 
 
+def nemotron_extract(
+    waveforms: torch.Tensor, lengths: torch.Tensor, config: FeatureConfig
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """NeMo pre-emphasis + natural-log mel spectrogram (Nemotron / Parakeet)."""
+    from .nemotron import batched_nemotron_logmel
+
+    return batched_nemotron_logmel(waveforms, lengths, config)
+
+
 register_extractor(ExtractorSpec(kind="fbank", fn=kaldi_extract, supports_streaming=True))
 register_extractor(ExtractorSpec(kind="mfcc", fn=kaldi_extract, supports_streaming=True))
 register_extractor(
@@ -79,5 +93,17 @@ register_extractor(
         # The window itself is a config knob (default 30 s); the registration only
         # declares that this frontend *has* one and where to read it.
         window_seconds_attr="whisper_chunk_seconds",
+    )
+)
+register_extractor(
+    ExtractorSpec(
+        kind="nemotron_logmel",
+        fn=nemotron_extract,
+        # Frame-local (no normalisation to couple frames), but the grid is defined
+        # by a single centered STFT over the whole utterance; see the note in
+        # ``oasr/features/nemotron.py``.
+        supports_streaming=False,
+        # Cost tracks the real utterance length — no padded window.
+        window_seconds_attr=None,
     )
 )

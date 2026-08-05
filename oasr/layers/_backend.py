@@ -180,6 +180,22 @@ KERNEL_GAPS: Dict[str, KernelGap] = {
                 "in-tree model reaches the remaining limit"
             ),
         ),
+        KernelGap(
+            id="conv2d-groups",
+            what=(
+                "a grouped (incl. depthwise) 2-D convolution: csrc/conv2d.cu takes "
+                "no `groups` argument at all, so this is an absent kernel rather "
+                "than a refused shape"
+            ),
+            fix=(
+                "kernel: `groups` on the CUTLASS implicit-GEMM conv2d "
+                "(include/oasr/conv/conv2d.cuh + csrc/conv2d.cu), which is KG3 in "
+                ".artifacts/kernel_coverage.md — measured there at 26.7% of offline "
+                "GPU time for the conv front-end as a whole. Reached today by "
+                "Zipformer's 7x7 ConvNeXt depthwise and Nemotron's "
+                "depthwise-separable 8x subsampling"
+            ),
+        ),
     )
 }
 
@@ -410,6 +426,31 @@ def use_norm_kernel(x: torch.Tensor) -> bool:
     return True
 
 
+def use_conv_kernel(x: torch.Tensor) -> bool:
+    """Should this convolution / activation go through an OASR kernel?
+
+    Deliberately **only** the out-of-scope gate — CPU tensors and dtypes the
+    handwritten kernels do not dispatch (``DISPATCH_DLPACK_HALF_DTYPE`` in
+    ``csrc/conv.cu`` / ``csrc/conv2d.cu`` / ``csrc/activation.cu`` covers fp16
+    and bf16 only).  No alignment rule and no row floor: those belong to the
+    launchers, which already raise with a message naming the fix, and adding
+    them here would silently reroute calls that work today.
+
+    This exists because ``oasr.layers.conv`` used to have no torch path at all:
+    every class called its kernel unconditionally, so a conv-front-end
+    architecture could not be built *and run* on CPU, which is what every fp32
+    parity oracle in this repo needs.  The waist's contract is that each layer
+    owns both paths (see the module docstring); conv was the exception.
+    """
+    if layers_backend() == "torch":
+        return False
+    if not x.is_cuda:
+        return out_of_scope("CPU tensor")
+    if x.dtype not in SERVED_DTYPES:
+        return out_of_scope(f"dtype {x.dtype}")
+    return True
+
+
 def use_fmha_kernel() -> bool:
     """Is the OASR attention kernel selectable at all?"""
     return layers_backend() != "torch"
@@ -434,6 +475,7 @@ __all__ = [
     "out_of_scope",
     "take_gap",
     "take_policy",
+    "use_conv_kernel",
     "use_fmha_kernel",
     "use_gemm_kernel",
     "use_norm_kernel",

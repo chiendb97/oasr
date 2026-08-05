@@ -346,6 +346,93 @@ def test_fmha_finite_mask_floor_stays_finite(fmha, cuda, dtype, mask_floor):
     torch.testing.assert_close(out[:, :, :valid], ref[:, :, :valid], atol=2e-2, rtol=2e-2)
 
 
+class TestInfiniteMaskFloorWithALargeBias:
+    """The other end of the mask-floor question: ``-inf`` plus a *large* bias.
+
+    ``test_fmha_finite_mask_floor_stays_finite`` above covers a large finite
+    floor.  ``-inf`` is the form upstream HuggingFace models write, and it is
+    accurate here only while the **finite** part of the bias stays small.  Found
+    via Nemotron's Transformer-XL relative-position bias, which reaches ~±120: the
+    fp16 encoder output came out 0.69 off an fp32 reference (HF's own fp16 run:
+    0.004-0.02) and two LJSpeech-200 transcripts were truncated mid-word.
+
+    Measured boundary on an RTX 5090, fp16, ``B3 H8 T122 D128``, 38%-dense mask,
+    error against fp32 SDPA — accurate to ±20, broken from ±40:
+
+    ========  ==========  =========
+    range     fused       SDPA fp16
+    ========  ==========  =========
+    ±20       0.00093     0.00081
+    ±40       **1.365**   0.00066
+    ±80       **1.494**   0.00090
+    ========  ==========  =========
+
+    It is **not** the bias magnitude alone, and it is not the K remainder: at the
+    same magnitude and density a *banded* mask is accurate at every ``T`` tried
+    (122 / 128 / 120 / 130 / 192).  Narrowed to one query row at a time — at
+    ``B=1`` exactly **one** row of 122 is wrong (0.46 absolute), and it is a row
+    whose window leaves only **4** unmasked keys out of 122, so the online
+    softmax rescales across ~2 entirely-``-inf`` K-blocks while carrying a large
+    finite row max.  Neighbouring rows with the same 4 keys are fine, i.e. it is
+    a numerical coincidence in that bookkeeping rather than a structural
+    mis-index.  In the real encoder that one bad row per layer spreads over 24
+    layers and the convolution's left context, which is how it reached 0.69 at
+    the output.  Same family as the finite-floor bug fixed in ``08c12cc``.
+
+    The finite-floor arm below is the property the Nemotron model *depends on*
+    (``oasr.models.nemotron.encoder.MASK_FLOOR``), so it is a hard assertion; the
+    ``-inf`` arm is a strict xfail, which fails the suite when the kernel is fixed
+    so the workaround and this note get removed together.
+    """
+
+    @staticmethod
+    def _case(cuda, dtype, floor):
+        B, H, T, D, magnitude = 3, 8, 122, 128, 80.0
+        torch.manual_seed(0)
+        q = torch.randn(B, H, T, D, device=cuda, dtype=dtype) * 0.5
+        k = torch.randn(B, H, T, D, device=cuda, dtype=dtype) * 0.5
+        v = torch.randn(B, H, T, D, device=cuda, dtype=dtype) * 0.5
+        # NeMo's ``chunked_limited`` window, inline so this file stays independent
+        # of the model package: frames are grouped into chunks of ``right + 1 = 4``
+        # and a query sees its own chunk plus the previous ``56 // 4 = 14``.  The
+        # first chunk therefore leaves only 4 unmasked keys, which is the row that
+        # fails.  Every row keeps its own diagonal, so none is empty and the
+        # comparison is about accuracy, not empty-row handling.
+        chunk = torch.arange(T, device=cuda).div(4, rounding_mode="trunc")
+        diff = chunk.unsqueeze(1) - chunk.unsqueeze(0)
+        keep = (diff >= 0) & (diff <= 14)
+        bias = (torch.randn(B, H, T, T, device=cuda, dtype=dtype) * magnitude).masked_fill(
+            ~keep.view(1, 1, T, T), floor
+        )
+        scale = 1.0 / math.sqrt(D)
+        return q, k, v, bias, scale
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_large_bias_with_a_finite_floor_matches_sdpa(self, fmha, cuda, dtype):
+        q, k, v, bias, scale = self._case(cuda, dtype, -1.0e4)
+        out = fmha(q, k, v, softmax_scale=scale, attn_bias=bias)
+        ref = _ref_fmha(q, k, v, scale, attn_bias=bias)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "known kernel defect: -inf in attn_bias is inaccurate once the finite "
+            "part of the bias exceeds ~±32 (see .artifacts/known_issues.md). Pass a "
+            "large finite floor instead; remove this xfail when the kernel is fixed"
+        ),
+    )
+    def test_large_bias_with_an_infinite_floor_matches_sdpa(self, fmha, cuda):
+        from oasr.jit.attention import select_backend
+
+        if select_backend() != "cute":
+            pytest.skip("defect is in the CuteDSL kernel; SDPA fallback is accurate")
+        q, k, v, bias, scale = self._case(cuda, torch.float16, float("-inf"))
+        out = fmha(q, k, v, softmax_scale=scale, attn_bias=bias)
+        ref = _ref_fmha(q, k, v, scale, attn_bias=bias)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
 # ---------------------------------------------------------------------------
 # Shared-memory budget / cp.async ring depth
 # ---------------------------------------------------------------------------

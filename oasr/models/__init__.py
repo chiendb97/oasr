@@ -34,6 +34,12 @@ from .conformer import (
 )
 from .heads import CTCHead
 from .loaders import PretrainedModel, from_pretrained, load_pretrained
+from .nemotron import (
+    NemotronEncoder,
+    NemotronEncoderConfig,
+    NemotronModel,
+    NemotronModelConfig,
+)
 from .paraformer import ParaformerModel, ParaformerModelConfig
 from .registry import (
     ModelEntry,
@@ -106,4 +112,9 @@ __all__ = [
     # Speech-LLM (Qwen2-Audio)
     "SpeechLlmModel",
     "SpeechLlmModelConfig",
+    # Nemotron (FastConformer + RNNT)
+    "NemotronModel",
+    "NemotronEncoder",
+    "NemotronEncoderConfig",
+    "NemotronModelConfig",
 ]

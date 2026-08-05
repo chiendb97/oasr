@@ -10,7 +10,7 @@ future converter can load icefall pruned-transducer checkpoints 1:1.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import ClassVar, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -18,18 +18,20 @@ from torch import nn
 
 from oasr.layers import Embedding
 
-from ..decoders.base import BaseDecoder
+from ..decoders.base import TransducerPredictor
 
 
-class StatelessDecoder(BaseDecoder):
+class StatelessDecoder(TransducerPredictor):
     """Label predictor: ``(B, context_size)`` token window → ``(B, decoder_dim)``.
 
     The transducer "decode state" is just the last ``context_size`` emitted
     labels (blank-filled at init); :class:`~oasr.engine.decode.TransducerDecodeStrategy`
-    shifts a new label in after each emission.
+    shifts a new label in after each emission via :meth:`advance`.
     """
 
     decode_type = "transducer"
+    #: The state *is* a label window, so beam search can gather-reorder it.
+    label_window_state: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -79,3 +81,32 @@ class StatelessDecoder(BaseDecoder):
         emb = F.relu(emb)
         # (B, U_out, dim) -> (B, dim): decode feeds exactly one window per step.
         return emb[:, -1, :]
+
+    # -- TransducerPredictor protocol ---------------------------------------
+    #
+    # These are the lines the greedy loop used to inline.  Stateless is the
+    # degenerate case of the protocol: the state carries no history beyond the
+    # window, so ``predict`` is a full recompute and ``advance`` is a shift.
+
+    def predict(self, state: torch.Tensor) -> torch.Tensor:
+        """Recompute the prediction from the label window."""
+        return self(state)
+
+    def advance(
+        self, state: torch.Tensor, tokens: torch.Tensor, emit: torch.Tensor
+    ) -> torch.Tensor:
+        """Shift ``tokens`` into the window of every row where ``emit``.
+
+        Rows that did not emit keep their window untouched, which is what makes
+        the batched :meth:`predict` that follows reproduce their previous
+        projection exactly rather than approximately.
+        """
+        shifted = torch.cat([state[:, 1:], tokens.unsqueeze(1)], dim=1)
+        merged: torch.Tensor = torch.where(emit.unsqueeze(1), shifted, state)
+        return merged
+
+    def stack_states(self, states: Sequence[torch.Tensor]) -> torch.Tensor:
+        return torch.cat(list(states), dim=0)
+
+    def unstack_states(self, state: torch.Tensor) -> List[torch.Tensor]:
+        return [state[b : b + 1] for b in range(state.size(0))]
