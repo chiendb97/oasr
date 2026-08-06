@@ -103,6 +103,7 @@ python examples/web/server.py \
     --offline-addr  127.0.0.1:50051 \   # default: same as --streaming-addr
     --sample-rate 16000 \
     --chunk-ms 320 \
+    --log-level info --log-file bridge.log \        # tracing, see below
     --ssl-certfile cert.pem --ssl-keyfile key.pem   # optional, enables HTTPS
 ```
 
@@ -119,6 +120,36 @@ oasr-server --ckpt-dir /path/to/ckpt --service-mode streaming --grpc-bind 127.0.
 python examples/web/server.py \
     --offline-addr 127.0.0.1:50051 --streaming-addr 127.0.0.1:50052
 ```
+
+## Logging
+
+Every hop is traced: browser request in → gRPC call out → each audio chunk →
+each interim/final result → response out. Lines belonging to one request share a
+correlation id (`[http-…]` / `[ws-…]`), which is also returned to the page as the
+`x-oasr-trace` response header, and every upstream line carries OASR's own
+`rid=` so bridge logs join against server logs.
+
+`--log-level info` (the default) is one line per lifecycle event:
+
+```
+INFO [http-074ccac0] webdemo.http: -> POST /api/recognize from 127.0.0.1:4926
+INFO [http-074ccac0] webdemo.http: offline request: 64000 B / 16000 frames / 1.00s @ 16000 Hz, route=stream(shared)
+INFO [http-074ccac0] webdemo.grpc: offline/stream -> 127.0.0.1:50051 | ... as 4 chunk(s) of 20480 B
+INFO [http-074ccac0] webdemo.grpc: offline/stream <- rid=r-91 2 partial / 1 final in 8.3 ms (first 7.8 ms, 120.4x RT)
+INFO [http-074ccac0] webdemo.http: <- POST /api/recognize 200 in 10.2 ms
+...
+INFO [ws-1853d0d7] webdemo.grpc: first response after 22.5 ms (rid=r-92)
+INFO [ws-1853d0d7] webdemo.ws:   closed: rid=r-92 in 6 chunk(s) / 1.92s, out 3 partial / 1 final, session 128.0 ms
+```
+
+`--log-level debug` adds every audio chunk, every interim result, gRPC channel
+setup timings and uvicorn's access + WebSocket frame log. `--log-file PATH`
+appends the same stream to a file.
+
+Failures are logged where they happen: a 4xx says what was rejected
+(`rejected: bad sample_rate='abc'`), and an upstream failure logs the gRPC
+status plus `debug_error_string()` before the bridge answers `502` / an
+`{"type":"error"}` frame.
 
 ## Notes
 
