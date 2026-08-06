@@ -78,7 +78,7 @@ The engine no longer has a separate `OfflineEngine` subclass — pass
 | `model_runner.py` | `ModelRunner` | Wraps `ConformerModel`. Owns the cache managers; runs `forward_offline`, `forward_streaming_step`, and the batched paged path. |
 | `executor/offline.py` | `OfflineExecutor` | Runs each scheduler-partitioned micro-batch (fbank → forward → decode → finalise) back-to-back; sequence-packed forward when `enable_sequence_packing` is set. |
 | `executor/streaming.py` | `StreamingExecutor` | Chunk-by-chunk streaming with paged KV cache; partial outputs per tick, final on drain. |
-| `output_processor.py` | `OutputProcessor` | CTC decode (GPU beam / k2 WFST) and SentencePiece-or-units detokenization. |
+| `output_processor.py` | `OutputProcessor` | CTC decode (GPU prefix beam / GPU WFST) and SentencePiece-or-units detokenization. |
 
 ## 4. Core Algorithms and Workflows
 
@@ -382,10 +382,10 @@ lever is then the *per-stream* ceiling, not the pool size.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `decoder_type` | `"ctc_cuda"` | `ctc_cuda` (GPU CTC beam) / `ctc_wfst` (k2 WFST, GPU). |
+| `decoder_type` | `"ctc_cuda"` | `ctc_cuda` (GPU CTC beam) / `ctc_wfst` (in-tree GPU WFST). |
 | `ctc_decoder_config` | `GpuDecoderConfig()` | GPU CTC config (beam, blank ID, thresholds). |
-| `wfst_decoder_config` | `DecoderConfig(search_type="wfst")` | k2 WFST decoder config. |
-| `fst_path` | `None` | Required for `ctc_wfst`. |
+| `wfst_decoder_config` | `DecoderConfig(search_type="wfst")` | GPU WFST decoder config. |
+| `fst_path` | `None` | Required for `ctc_wfst`: a prebuilt `.img`, or a k2 `HLG.pt` exported at load. |
 | `sentencepiece_model` | auto-detected | `.model` in `ckpt_dir`. |
 | `unit_table` | auto-detected | `units.txt` / `words.txt` fallback. |
 

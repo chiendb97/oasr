@@ -31,6 +31,10 @@ oasr-server \
     --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051
 ```
 
+`--ckpt-dir` takes the same sources as `EngineConfig.ckpt_dir`: a directory in
+any supported checkpoint format, or a HuggingFace Hub repo id (downloaded on
+first use — see `docs/checkpoints.md`).
+
 `oasr-server --help` lists every flag.  `--service-mode` pins the engine to
 either `offline` or `streaming` for its entire lifecycle.  A `streaming` engine
 rejects the unary `Recognize` with `FAILED_PRECONDITION`; an `offline` engine

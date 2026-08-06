@@ -444,6 +444,17 @@ CUDA-graph feature cache.
 | LLM-ASR (Qwen2-Audio) | `speech_llm` (HF converter) | `llm` (incremental greedy, token-streaming partials) | offline |
 | Transducer, recurrent predictor (Nemotron ASR) | `nemotron` (HF converter) | `transducer` (`consumes="hidden"`, greedy only) | offline + streaming |
 
+`list_models()` prints this table's model column as the registry sees it at runtime,
+including any out-of-tree architecture that arrived through the `oasr.models` entry
+point group.
+
+The first row is one capability with two decoders behind it, not two model families:
+a CTC checkpoint decodes through the GPU prefix-beam decoder by default, and
+`EngineConfig.decoder_type="ctc_wfst"` plus an `fst_path` (a prebuilt `.img` or a k2
+`HLG.pt`) routes the *same* checkpoint through the in-tree GPU WFST decoder, offline
+and streaming alike. That split is on `decoder_type`, below `decode_method` — see
+`docs/wfst_decoder_gpu.md`.
+
 The last row reshaped **two** interfaces rather than adding a leaf.
 
 Its streaming path did the second one. A chunk carries four kinds of state, and
