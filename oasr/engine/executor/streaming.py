@@ -200,8 +200,11 @@ class StreamingExecutor(Executor):
         #    one kernel call for the whole active pool rather than N
         #    sequential fbank calls.  Issued on the dedicated feat stream
         #    when running on CUDA so it can overlap with the previous
-        #    step's encoder forward; the default stream waits on the
-        #    recorded event before reading feature_buffer.
+        #    step's encoder forward.  The producer→consumer ordering lives
+        #    inside ``extract_streaming_batch`` (it is the one that appends
+        #    into feature_buffer on this stream); the wait below is a
+        #    redundant belt for our own read of feature_buffer, not the
+        #    protection — putting the only wait here raced the append.
         needs_feat = [r for r in running if r.has_pending_audio]
         if needs_feat:
             nvtx_push("extract_fbank")

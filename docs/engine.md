@@ -211,7 +211,10 @@ def step(self) -> List[RequestOutput]:
     if running:
         # 3. batched fbank across every active stream with pending audio,
         #    on the dedicated _feat_stream so it overlaps the previous
-        #    step's encoder forward
+        #    step's encoder forward.  extract_streaming_batch orders the
+        #    producer->consumer hand-off itself (it appends into
+        #    feature_buffer on *this* stream); the wait below is a belt for
+        #    our own read, not the protection.  See known_issues.md §5.
         needs_feat = [r for r in running if r.has_pending_audio]
         if needs_feat:
             self._input_processor.extract_streaming_batch(

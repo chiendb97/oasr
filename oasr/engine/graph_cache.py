@@ -395,6 +395,12 @@ class _CapturedFeatureShape:
     # Captured output. Aliases the graph pool's output allocation; callers
     # must consume (or copy) before the next replay.
     feats_out: torch.Tensor  # (B_bucket, num_frames_max, feat_dim)
+    # Completion of the previous replay, recorded on the issuing stream.  The
+    # captured graph's *first* ops are async H2Ds **out of the pinned host
+    # buffers above**, whose addresses are baked into the graph and so cannot be
+    # rotated the way the eager staging pair is.  The host must therefore wait
+    # here before refilling them.  ``None`` until the first replay.
+    ready: Optional["torch.cuda.Event"] = None
 
 
 class GraphedFeatureExtraction:
@@ -560,12 +566,27 @@ class GraphedFeatureExtraction:
         # (host-side ``feat_lens_cpu`` discards their outputs) so they don't
         # need zeroing either, even if stale data persists between replays.
         if B_active > 0:
+            # The previous replay's captured H2D reads these pinned buffers, and
+            # the launch returns before the DMA runs.  Rewriting them without
+            # waiting corrupts the *previous* step's features whenever the copy
+            # has not drained — invisible on an idle GPU, catastrophic with any
+            # co-tenant process on the device (`.artifacts/known_issues.md` §5).
+            # Unlike the eager staging pair this cannot be double-buffered away:
+            # the addresses are captured inside the graph.  In steady state a
+            # full step of encoder work separates two replays, so the event has
+            # long since fired and this does not park.
+            if state.ready is not None:
+                state.ready.synchronize()
+                state.ready = None
             if T < self._t_pad:
                 state.padded_host_buf[:B_active, T:].zero_()
             if T > 0:
                 state.padded_host_buf[:B_active, :T].copy_(padded_cpu)
             state.lengths_host_buf[:B_active].copy_(lengths_cpu)
         state.graph.replay()
+        event = torch.cuda.Event()
+        event.record()
+        state.ready = event
         return state.feats_out
 
     # ------------------------------------------------------------------

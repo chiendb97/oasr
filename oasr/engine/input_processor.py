@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -19,6 +20,28 @@ from oasr.utils.nvtx import nvtx_pop, nvtx_push
 from .config import EngineConfig
 from .graph_cache import GraphedFeatureExtraction
 from .request import Request
+
+#: Streaming staging slots rotated through by :meth:`InputProcessor._next_stream_slot`.
+#: Two is the pipeline depth the feature stream introduces — one pair in flight
+#: while the next is filled.
+_STREAM_STAGING_SLOTS = 2
+
+
+@dataclass
+class _StreamStagingSlot:
+    """One streaming staging buffer pair, plus the event that retires it.
+
+    The pair is *pinned host* memory read by an async H2D, so it may not be
+    rewritten until that copy has actually run.  ``ready`` records the copy's
+    completion on the stream it was issued to; a slot is only safe to refill
+    once that event has fired.  See
+    :meth:`InputProcessor._next_stream_slot` for why both the rotation and the
+    event are load-bearing.
+    """
+
+    flat: Optional[torch.Tensor] = None
+    lens: Optional[torch.Tensor] = None
+    ready: Optional["torch.cuda.Event"] = None
 
 
 class InputProcessor:
@@ -79,8 +102,13 @@ class InputProcessor:
         self._wav_flat: Optional[torch.Tensor] = None
         self._wav_padded: Optional[torch.Tensor] = None
         # Streaming staging (M5) — grow-once, so a step does not page-lock.
-        self._stream_flat: Optional[torch.Tensor] = None
-        self._stream_lens: Optional[torch.Tensor] = None
+        # **Double-buffered and event-retired**: unlike the offline pair above,
+        # these are read by an async H2D on a *separate* stream and rewritten by
+        # the next engine step, so reuse has to be ordered explicitly.
+        self._stream_slots: List[_StreamStagingSlot] = [
+            _StreamStagingSlot() for _ in range(_STREAM_STAGING_SLOTS)
+        ]
+        self._stream_slot_idx = 0
         # Ceiling on a *retained* staging buffer, in float32 elements (M4).
         # Default 256 Mi elements = 1 GiB, comfortably above
         # ``max_batch_size`` x a full-length utterance at 16 kHz; a batch past
@@ -280,8 +308,15 @@ class InputProcessor:
         """
         self._wav_flat = None
         self._wav_padded = None
-        self._stream_flat = None
-        self._stream_lens = None
+        # Wait out any copy still reading a slot before dropping the pinned pages
+        # under it — freeing host memory a queued DMA reads is worse than the
+        # race this fixes.
+        for slot in self._stream_slots:
+            if slot.ready is not None:
+                slot.ready.synchronize()
+            slot.flat = None
+            slot.lens = None
+            slot.ready = None
 
     def _padded_device(self, batch: int, t_max: int) -> torch.Tensor:
         """Reused **device** buffer viewed as ``(batch, t_max)`` (geometric
@@ -300,34 +335,88 @@ class InputProcessor:
             )
         return self._wav_padded[:need].view(batch, t_max)
 
-    def _stream_host(self, batch: int, t_max: int) -> torch.Tensor:
-        """Reused pinned ``(batch, t_max)`` host buffer for streaming staging.
+    def _next_stream_slot(self) -> _StreamStagingSlot:
+        """Rotate to the next staging slot and block until it is safe to rewrite.
 
-        Same grow-once discipline as :meth:`_flat_host`, and safe for the same
-        reason plus one more: the streaming H2D is issued on the feature stream
-        and the caller inserts an event-wait before the next step reads the
-        result, so the copy has completed before this buffer is rewritten.
+        **Both halves matter, and neither is sufficient alone.**
+
+        The streaming H2D is `non_blocking=True` out of *pinned* host memory on
+        the feature stream, so the DMA reads this buffer at some point after the
+        launch returns.  The step loop then inserts
+        ``current_stream().wait_stream(feat_stream)`` — but that is a
+        **device-side** ordering primitive.  It sequences GPU work; it does
+        nothing to stop the host from overwriting page-locked memory that a
+        queued copy still has to read.  With a single buffer the next step's
+        refill races the previous step's copy, and the H2D ships a mixture of two
+        steps' waveforms.  On an idle GPU the copy always wins, which is why this
+        went unseen; with any co-tenant process computing on the same device the
+        host wins instead and transcripts come back empty (`.artifacts/
+        known_issues.md` §5 — conformer streaming 3.70% → 99.32% WER, 195 of 200
+        utterances empty, with no error raised anywhere).
+
+        The **event** is what makes reuse correct: a slot cannot be refilled
+        before the copy that reads it has completed.  The **rotation** is what
+        makes that correctness free — by the time a slot comes round again a full
+        step of encoder work has been issued and drained, so ``synchronize()``
+        finds the event already fired and returns without parking.  A host sync on
+        a single buffer would be correct too, but it would serialise the host
+        against the feature stream every step, giving back the overlap the pinned
+        staging exists to buy.
+
+        Why the depth is 2 and not 1: a step that produces features but no full
+        encoder window (the frontend needs several chunks per window) issues no
+        forward and therefore no host sync, so two such steps can run
+        back-to-back with nothing draining the queue in between.
+        """
+        self._stream_slot_idx = (self._stream_slot_idx + 1) % len(self._stream_slots)
+        slot = self._stream_slots[self._stream_slot_idx]
+        if slot.ready is not None:
+            slot.ready.synchronize()
+            slot.ready = None
+        return slot
+
+    def _stream_host(self, slot: _StreamStagingSlot, batch: int, t_max: int) -> torch.Tensor:
+        """This slot's pinned ``(batch, t_max)`` host buffer (geometric growth).
+
+        Same grow-once discipline as :meth:`_flat_host`; safety comes from the
+        caller having taken the slot through :meth:`_next_stream_slot`.
         """
         need = batch * t_max
-        cur = 0 if self._stream_flat is None else self._stream_flat.numel()
+        cur = 0 if slot.flat is None else slot.flat.numel()
         if cur < need:
-            self._stream_flat = torch.empty(
+            slot.flat = torch.empty(
                 max(need, cur * 2),
                 dtype=torch.float32,
                 pin_memory=(self._device.type == "cuda"),
             )
-        return self._stream_flat[:need].view(batch, t_max)
+        assert slot.flat is not None
+        return slot.flat[:need].view(batch, t_max)
 
-    def _stream_lengths_host(self, batch: int) -> torch.Tensor:
-        """Reused pinned ``(batch,)`` int64 host buffer for streaming lengths."""
-        cur = 0 if self._stream_lens is None else self._stream_lens.numel()
+    def _stream_lengths_host(self, slot: _StreamStagingSlot, batch: int) -> torch.Tensor:
+        """This slot's pinned ``(batch,)`` int64 host buffer for stream lengths."""
+        cur = 0 if slot.lens is None else slot.lens.numel()
         if cur < batch:
-            self._stream_lens = torch.empty(
+            slot.lens = torch.empty(
                 max(batch, cur * 2),
                 dtype=torch.int64,
                 pin_memory=(self._device.type == "cuda"),
             )
-        return self._stream_lens[:batch]
+        assert slot.lens is not None
+        return slot.lens[:batch]
+
+    def _retire_stream_slot(self, slot: _StreamStagingSlot) -> None:
+        """Record, on the issuing stream, the event that releases *slot*.
+
+        Called once per step **after** every device op that reads the slot's
+        buffers has been enqueued, and from inside the feature-stream context so
+        the event lands on the stream carrying the copy.  A CPU engine records
+        nothing: there is no async copy and the buffers are not pinned.
+        """
+        if self._device.type != "cuda":
+            return
+        event = torch.cuda.Event()
+        event.record()
+        slot.ready = event
 
     def collate(
         self,
@@ -597,9 +686,13 @@ class InputProcessor:
         cuda_stream : torch.cuda.Stream, optional
             When provided (and the engine is on CUDA) the H2D copy and
             the batched feature kernel run on this stream so they can
-            overlap with the encoder forward on the default stream.  The
-            caller is responsible for synchronising the default stream
-            against feature completion before reading ``feature_buffer``.
+            overlap with the encoder forward on the default stream.
+            **This method orders the hand-off itself**: the append into
+            ``feature_buffer`` happens on the current stream, so the wait on
+            ``cuda_stream`` (and the ``record_stream`` that keeps the allocator
+            from recycling the output) belong here, not in the caller.  A caller
+            that also waits before its own read of ``feature_buffer`` is then
+            merely redundant, not load-bearing.
         """
         if not requests:
             return
@@ -617,6 +710,28 @@ class InputProcessor:
             return
 
         feats, feat_lens_cpu = self._run_streaming_features(fbank_inputs, fbank_flush, cuda_stream)
+        # ``feats`` was produced on ``cuda_stream``; the append below copies out of
+        # it on the **current** stream.  That cross-stream read has to be ordered
+        # here, at the consumer — the step loop's `wait_stream` fires only after
+        # this method returns, which is after the racing copy has been issued.
+        #
+        # Without this the append reads feature memory the extractor has not
+        # finished writing.  On an idle GPU the kernels always win (the host is
+        # slower than they are), which is why it never showed; with any co-tenant
+        # process computing on the device they do not, and the buffer takes NaN —
+        # one whole mel frame at a time, which is all-blank for CTC and deletions
+        # for the transducer, with nothing raised.  Measured conformer streaming
+        # 3.70% -> 99.32% WER, 195 of 200 transcripts empty
+        # (`.artifacts/known_issues.md` §5).
+        #
+        # ``record_stream`` is the second half: the caching allocator releases
+        # ``feats`` back to ``cuda_stream``'s pool when this frame drops it, so
+        # without marking the consumer a later feature step could be handed the
+        # same block while the append is still reading it.
+        if cuda_stream is not None and self._device.type == "cuda":
+            consumer = torch.cuda.current_stream(self._device)
+            consumer.wait_stream(cuda_stream)
+            feats.record_stream(consumer)
         self._distribute_streaming_features(
             fbank_reqs, fbank_inputs, fbank_flush, feats, feat_lens_cpu
         )
@@ -704,13 +819,17 @@ class InputProcessor:
         # which is off by default).  Page-locking is a kernel-level operation
         # that also serialises against the driver, so at streaming cadence it is
         # a per-step tax for a buffer whose shape barely changes.
-        padded_cpu = self._stream_host(len(fbank_inputs), t_max)
+        # Double-buffered + event-retired — see :meth:`_next_stream_slot`.  The
+        # rotation is what keeps the pinned-staging win while making the reuse
+        # ordering explicit instead of accidental.
+        slot = self._next_stream_slot()
+        padded_cpu = self._stream_host(slot, len(fbank_inputs), t_max)
         for i, w in enumerate(fbank_inputs):
             n = w.numel()
             padded_cpu[i, :n] = w
             if n < t_max:
                 padded_cpu[i, n:].zero_()
-        lengths_cpu = self._stream_lengths_host(len(fbank_inputs)).copy_(lengths_cpu)
+        lengths_cpu = self._stream_lengths_host(slot, len(fbank_inputs)).copy_(lengths_cpu)
         nvtx_pop()
 
         if device.type != "cuda":
@@ -729,7 +848,9 @@ class InputProcessor:
 
         # A dedicated feature stream (when provided) overlaps the H2D + kernel
         # with the encoder forward on the default stream; the caller inserts the
-        # event-wait before reading ``feature_buffer``.
+        # event-wait before reading ``feature_buffer``.  That wait orders the two
+        # *streams* — it says nothing about when the host may reuse ``slot``,
+        # which is what :meth:`_next_stream_slot` is for.
         stream_ctx = torch.cuda.stream(cuda_stream) if cuda_stream is not None else nullcontext()
 
         # Captured-graph fast path: steady state only (no flush) and within the
@@ -740,6 +861,11 @@ class InputProcessor:
                 nvtx_push("feature_graph_replay")
                 feats_view = fg.replay(len(fbank_inputs), padded_cpu, lengths_cpu)
                 nvtx_pop()
+                # ``replay`` only host-memcpies out of ``slot`` into the graph's
+                # own captured buffers, so the slot is already free here — but
+                # retire it on the stream anyway rather than encoding that
+                # cross-file detail as an unchecked assumption.
+                self._retire_stream_slot(slot)
             if feats_view is not None:
                 return feats_view[: len(fbank_inputs)], feat_lens_cpu
 
@@ -748,6 +874,10 @@ class InputProcessor:
             wav_device = padded_cpu.to(device=device, non_blocking=True)
             lengths_device = lengths_cpu.to(device=device, non_blocking=True)
             nvtx_pop()
+            # Both H2Ds are enqueued; the event that releases ``slot`` goes in
+            # behind them on the same stream.  Everything below reads the device
+            # copies, not the host buffers.
+            self._retire_stream_slot(slot)
             nvtx_push("feature")
             feats_f32, _ = self._extractor.extract_streaming(wav_device, lengths_device, fcfg)
             feats = feats_f32.to(dtype=dtype)

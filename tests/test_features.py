@@ -807,24 +807,117 @@ class TestStagingBuffers:
         p._flat_host(4096)
         assert p._wav_flat.numel() <= 4096
 
-    def test_streaming_staging_is_reused(self):
+    def test_streaming_staging_is_reused_within_a_slot(self):
         p = self._proc()
-        a = p._stream_host(4, 100)
-        b = p._stream_host(4, 100)
+        slot = p._next_stream_slot()
+        a = p._stream_host(slot, 4, 100)
+        b = p._stream_host(slot, 4, 100)
         assert a.data_ptr() == b.data_ptr()
-        la = p._stream_lengths_host(4)
-        lb = p._stream_lengths_host(4)
+        la = p._stream_lengths_host(slot, 4)
+        lb = p._stream_lengths_host(slot, 4)
         assert la.data_ptr() == lb.data_ptr()
+
+    def test_consecutive_streaming_steps_get_different_buffers(self):
+        """Double buffering: back-to-back steps must not share staging memory.
+
+        The pinned pair is read by an async H2D, so a step that rewrites the
+        buffer the previous step's copy is still reading corrupts it — measured
+        as nemotron streaming WER 2.44% -> 2.53% under a co-tenant GPU load, and
+        the *reason* the buffers rotate rather than being reused in place
+        (`.artifacts/known_issues.md` §5).  Reuse two steps apart is fine, and
+        gated by the slot's completion event on CUDA.
+        """
+        p = self._proc()
+        seen = []
+        for _ in range(4):
+            slot = p._next_stream_slot()
+            seen.append(p._stream_host(slot, 4, 100).data_ptr())
+            p._stream_lengths_host(slot, 4)
+        assert seen[0] != seen[1], "consecutive steps shared a staging buffer"
+        assert seen[0] == seen[2] and seen[1] == seen[3], "slots should cycle, not grow"
 
     def test_release_drops_everything(self):
         p = self._proc()
         p._flat_host(64)
-        p._stream_host(2, 8)
-        p._stream_lengths_host(2)
+        slot = p._next_stream_slot()
+        p._stream_host(slot, 2, 8)
+        p._stream_lengths_host(slot, 2)
         p.release_staging()
         assert p._wav_flat is None
-        assert p._stream_flat is None
-        assert p._stream_lens is None
+        assert all(s.flat is None and s.lens is None for s in p._stream_slots)
+        assert all(s.ready is None for s in p._stream_slots)
+
+
+class TestStreamingFeatureStreamHandoff:
+    """The feature stream → default stream hand-off must be ordered.
+
+    ``extract_streaming_batch`` runs the H2D and the frontend on a caller-supplied
+    stream so they overlap the previous step's encoder forward, then appends the
+    result into each request's ``feature_buffer`` **on the current stream**.  That
+    cross-stream read has to be ordered inside the method: the step loop's own
+    ``wait_stream`` fires only after it returns, which is after the append has
+    already been issued.
+
+    Unordered, the append reads feature memory the frontend has not finished
+    writing.  An idle GPU always hides it — the kernels beat the host to it — so
+    the reproduction here **congests the feature stream on purpose** rather than
+    relying on timing.  Measured cost of the missing wait on real audio: conformer
+    streaming 3.70% → 99.32% WER with 195 of 200 transcripts empty, nemotron
+    2.44% → 59.71%, in both cases NaN arriving one whole mel frame at a time with
+    nothing raised (`.artifacts/known_issues.md` §5).
+    """
+
+    def _processor_and_requests(self, device, n=3, samples=8000):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.input_processor import InputProcessor
+        from oasr.engine.request import Request
+        from oasr.features import FeatureConfig
+
+        cfg = EngineConfig(
+            ckpt_dir="x",
+            device=str(device),
+            dtype=torch.float32,
+            max_batch_size=8,
+            feature_config=FeatureConfig(feature_type="fbank", num_mel_bins=80, dither=0.0),
+            use_cuda_graphs=False,  # exercise the eager path; the graph path
+            # stages through its own captured buffers
+        )
+        proc = InputProcessor(cfg, device)
+        torch.manual_seed(1234)  # same audio in both arms
+        reqs = []
+        for i in range(n):
+            req = Request(None, request_id=f"r{i}", streaming=True)
+            proc.prepare_streaming(req)
+            proc.append_streaming_chunk(req, torch.randn(samples).clamp(-1, 1))
+            reqs.append(req)
+        return proc, reqs
+
+    @pytest.mark.cuda
+    def test_features_survive_a_congested_feature_stream(self, device):
+        """Features must match the single-stream result, however backed-up the
+        feature stream is when the append is issued."""
+        proc_ref, reqs_ref = self._processor_and_requests(device)
+        proc_ref.extract_streaming_batch(reqs_ref, cuda_stream=None)
+        torch.cuda.synchronize()
+        reference = [r.feature_buffer[: r.feature_frames].clone() for r in reqs_ref]
+
+        proc, reqs = self._processor_and_requests(device)
+        feat_stream = torch.cuda.Stream(device=device)
+        # Queue enough work on the feature stream that the frontend's kernels
+        # cannot possibly have completed by the time the append is enqueued.
+        with torch.cuda.stream(feat_stream):
+            a = torch.randn(2048, 2048, device=device)
+            b = torch.randn(2048, 2048, device=device)
+            for _ in range(60):
+                a = (a @ b).mul_(1e-4)
+        proc.extract_streaming_batch(reqs, cuda_stream=feat_stream)
+        torch.cuda.synchronize()
+
+        for i, (req, ref) in enumerate(zip(reqs, reference)):
+            got = req.feature_buffer[: req.feature_frames]
+            assert not torch.isnan(got).any(), f"stream {i}: NaN in features"
+            assert got.shape == ref.shape
+            torch.testing.assert_close(got, ref, rtol=0, atol=0)
 
 
 # ===========================================================================
