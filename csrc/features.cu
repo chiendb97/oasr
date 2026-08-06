@@ -24,7 +24,72 @@ inline int product_until_last(const TensorView& t) {
     return p;
 }
 
+inline void check_int32(const TensorView& t, const char* what) {
+    TVM_FFI_ICHECK(t.dtype().code == kDLInt && t.dtype().bits == 32) << what << " must be int32";
+}
+
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// stft_frame(output, waveform, lengths, window, hop_length, center_offset,
+//            win_offset, preemph_coef, preemph_replicate)
+//   waveform : (B, T_wav)                 float32
+//   lengths  : (B,)                       int32
+//   window   : (win_length,)              float32
+//   output   : (B, num_frames, n_fft)     float32
+// ---------------------------------------------------------------------------
+void stft_frame(TensorView output, TensorView waveform, TensorView lengths, TensorView window,
+                int64_t hop_length, int64_t center_offset, int64_t win_offset,
+                double preemph_coef, bool preemph_replicate) {
+    CHECK_INPUT(waveform);
+    CHECK_INPUT(lengths);
+    CHECK_INPUT(window);
+    CHECK_INPUT(output);
+    CHECK_DEVICE(waveform, output);
+    CHECK_DEVICE(waveform, lengths);
+    CHECK_DEVICE(waveform, window);
+    CHECK_CONTIGUOUS_INPUT(waveform);
+    CHECK_CONTIGUOUS_INPUT(output);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(window);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(lengths);
+    check_fp32(waveform, "waveform");
+    check_fp32(window, "window");
+    check_fp32(output, "output");
+    check_int32(lengths, "lengths");
+
+    CHECK_DIM(2, waveform);
+    CHECK_DIM(3, output);
+    TVM_FFI_ICHECK(window.ndim() == 1) << "window must be 1-D";
+    TVM_FFI_ICHECK(lengths.ndim() == 1) << "lengths must be 1-D";
+
+    const int batch = static_cast<int>(waveform.size(0));
+    const int wav_stride = static_cast<int>(waveform.size(1));
+    const int num_frames = static_cast<int>(output.size(1));
+    const int n_fft = static_cast<int>(output.size(2));
+    const int win_length = static_cast<int>(window.size(0));
+
+    TVM_FFI_ICHECK(output.size(0) == batch)
+        << "output batch (" << output.size(0) << ") must equal waveform batch (" << batch << ")";
+    TVM_FFI_ICHECK(lengths.size(0) == batch)
+        << "lengths must have " << batch << " entries, got " << lengths.size(0);
+    TVM_FFI_ICHECK(win_length <= n_fft)
+        << "win_length (" << win_length << ") must be <= n_fft (" << n_fft << ")";
+    TVM_FFI_ICHECK(win_offset >= 0 && win_offset + win_length <= n_fft)
+        << "window [" << win_offset << ", " << win_offset + win_length
+        << ") must lie inside [0, n_fft=" << n_fft << ")";
+    TVM_FFI_ICHECK(hop_length > 0) << "hop_length must be positive, got " << hop_length;
+
+    cudaStream_t stream = get_stream(waveform.device());
+    cudaError_t status = features::StftFrame(
+        static_cast<const float*>(waveform.data_ptr()),
+        static_cast<const int32_t*>(lengths.data_ptr()),
+        static_cast<const float*>(window.data_ptr()), static_cast<float*>(output.data_ptr()),
+        batch, wav_stride, num_frames, n_fft, win_length, static_cast<int>(win_offset),
+        static_cast<int>(hop_length), static_cast<int>(center_offset),
+        static_cast<float>(preemph_coef), preemph_replicate, stream);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "stft_frame kernel failed: " << cudaGetErrorString(status);
+}
 
 // ---------------------------------------------------------------------------
 // fbank_preprocess(output, frames, window, preemph, remove_dc, apply_preemph)
@@ -74,12 +139,14 @@ void fbank_preprocess(TensorView output, TensorView frames, TensorView window,
 }
 
 // ---------------------------------------------------------------------------
-// mel_log(output, power, mel_mat, log_floor)
-//   power   : (..., n_fft/2+1)               float32
-//   mel_mat : (num_mel, n_fft/2+1)           float32
-//   output  : (..., num_mel)                 float32
+// mel_log(output, power, mel_mat, log_floor, log_offset, frame_lengths)
+//   power         : (..., n_fft/2+1)         float32
+//   mel_mat       : (num_mel, n_fft/2+1)     float32
+//   frame_lengths : optional (B,)            int32 -- requires 3-D power
+//   output        : (..., num_mel)           float32
 // ---------------------------------------------------------------------------
-void mel_log(TensorView output, TensorView power, TensorView mel_mat, double log_floor) {
+void mel_log(TensorView output, TensorView power, TensorView mel_mat, double log_floor,
+             double log_offset, Optional frame_lengths_opt) {
     CHECK_INPUT(power);
     CHECK_INPUT(mel_mat);
     CHECK_INPUT(output);
@@ -107,12 +174,30 @@ void mel_log(TensorView output, TensorView power, TensorView mel_mat, double log
     TVM_FFI_ICHECK(product_until_last(output) == total_frames)
         << "output and power must have matching leading dims";
 
+    const int32_t* frame_lengths_ptr = nullptr;
+    int frames_per_row = total_frames;
+    if (frame_lengths_opt.has_value()) {
+        const TensorView frame_lengths = frame_lengths_opt.value();
+        CHECK_LAST_DIM_CONTIGUOUS_INPUT(frame_lengths);
+        check_int32(frame_lengths, "frame_lengths");
+        TVM_FFI_ICHECK(power.ndim() == 3)
+            << "frame_lengths requires a 3-D (B, num_frames, n_freq) power tensor, got "
+            << power.ndim() << "-D";
+        TVM_FFI_ICHECK(frame_lengths.numel() == power.size(0))
+            << "frame_lengths must have " << power.size(0) << " entries, got "
+            << frame_lengths.numel();
+        frame_lengths_ptr = static_cast<const int32_t*>(frame_lengths.data_ptr());
+        frames_per_row = static_cast<int>(power.size(1));
+    }
+
     cudaStream_t stream = get_stream(power.device());
     cudaError_t status = features::MelLog(static_cast<const float*>(power.data_ptr()),
                                           static_cast<const float*>(mel_mat.data_ptr()),
+                                          frame_lengths_ptr,
                                           static_cast<float*>(output.data_ptr()),
-                                          total_frames, num_freq, num_mel,
-                                          static_cast<float>(log_floor), stream);
+                                          total_frames, num_freq, num_mel, frames_per_row,
+                                          static_cast<float>(log_floor),
+                                          static_cast<float>(log_offset), stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "mel_log kernel failed: " << cudaGetErrorString(status);
 }

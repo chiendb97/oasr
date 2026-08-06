@@ -825,3 +825,213 @@ class TestStagingBuffers:
         assert p._wav_flat is None
         assert p._stream_flat is None
         assert p._stream_lens is None
+
+
+# ===========================================================================
+# stft_frame / mel_log kernels (KG23's shared primitives)
+# ===========================================================================
+
+
+def _torch_stft_frame(
+    wav: torch.Tensor,
+    lengths: torch.Tensor,
+    window: torch.Tensor,
+    n_fft: int,
+    hop: int,
+    num_frames: int,
+    *,
+    center_offset: int,
+    win_offset: int,
+    preemph_coef: float,
+    preemph_replicate: bool,
+) -> torch.Tensor:
+    """Reference for :func:`oasr.stft_frame`, written straight off its contract."""
+    B, T = wav.shape
+    out = wav.new_zeros(B, num_frames, n_fft)
+    win_length = window.numel()
+    for b in range(B):
+        n = int(lengths[b])
+        for f in range(num_frames):
+            for i in range(win_offset, win_offset + win_length):
+                t = f * hop - center_offset + i
+                if t < 0 or t >= n:
+                    continue
+                y = float(wav[b, t])
+                if preemph_coef:
+                    if t == 0:
+                        prev = y if preemph_replicate else 0.0
+                    else:
+                        prev = float(wav[b, t - 1])
+                    y -= preemph_coef * prev
+                out[b, f, i] = y * window[i - win_offset]
+    return out
+
+
+@requires_cuda
+class TestStftFrameKernel:
+    """The framing primitive KG16 named as its missing piece, tested directly."""
+
+    @pytest.mark.parametrize("center_offset", [0, 8, -1])
+    @pytest.mark.parametrize("preemph", [0.0, 0.97])
+    @pytest.mark.parametrize("replicate", [False, True])
+    def test_matches_the_reference_contract(self, center_offset, preemph, replicate):
+        import oasr
+
+        torch.manual_seed(0)
+        n_fft, hop, win_length = 32, 8, 20
+        B, T = 3, 200
+        wav = torch.randn(B, T)
+        lengths = torch.tensor([T, T - 17, 40], dtype=torch.int64)
+        window = torch.hann_window(win_length, periodic=False)
+        win_offset = (n_fft - win_length) // 2
+        num_frames = 12
+
+        ref = _torch_stft_frame(
+            wav,
+            lengths,
+            window,
+            n_fft,
+            hop,
+            num_frames,
+            center_offset=center_offset,
+            win_offset=win_offset,
+            preemph_coef=preemph,
+            preemph_replicate=replicate,
+        )
+        got = oasr.stft_frame(
+            wav.cuda(),
+            lengths.cuda(),
+            window.cuda(),
+            n_fft,
+            hop,
+            num_frames,
+            center_offset=center_offset,
+            preemph_coef=preemph,
+            preemph_replicate=replicate,
+        )
+        torch.testing.assert_close(got.cpu(), ref, rtol=0, atol=1e-6)
+
+    def test_centered_framing_reproduces_torch_stft(self):
+        """``center_offset = n_fft // 2`` == ``torch.stft(center=True, constant)``."""
+        import oasr
+
+        torch.manual_seed(1)
+        n_fft, hop, win_length = 512, 160, 400
+        T = 4000
+        wav = torch.randn(1, T) * 0.1
+        window = torch.hann_window(win_length, periodic=False)
+        num_frames = T // hop + 1
+
+        frames = oasr.stft_frame(
+            wav.cuda(),
+            torch.tensor([T]).cuda(),
+            window.cuda(),
+            n_fft,
+            hop,
+            num_frames,
+            center_offset=n_fft // 2,
+        )
+        got = torch.fft.rfft(frames.cpu(), n=n_fft)
+        ref = torch.stft(
+            wav,
+            n_fft,
+            hop_length=hop,
+            win_length=win_length,
+            window=window,
+            center=True,
+            pad_mode="constant",
+            return_complex=True,
+        ).transpose(1, 2)
+        torch.testing.assert_close(got, ref, rtol=1e-4, atol=2e-4)
+
+    def test_window_is_zero_outside_its_offset(self):
+        import oasr
+
+        n_fft, win_length = 64, 20
+        wav = torch.ones(1, 128)
+        window = torch.ones(win_length)
+        out = oasr.stft_frame(
+            wav.cuda(), torch.tensor([128]).cuda(), window.cuda(), n_fft, 8, 4, center_offset=0
+        )
+        off = (n_fft - win_length) // 2
+        assert out[:, :, :off].abs().max() == 0
+        assert out[:, :, off + win_length :].abs().max() == 0
+        assert out[:, :, off : off + win_length].abs().min() > 0
+
+    def test_zero_frames_returns_an_empty_tensor(self):
+        import oasr
+
+        out = oasr.stft_frame(
+            torch.zeros(2, 10).cuda(),
+            torch.tensor([10, 10]).cuda(),
+            torch.ones(8).cuda(),
+            8,
+            4,
+            0,
+        )
+        assert out.shape == (2, 0, 8)
+
+    def test_rejects_a_window_wider_than_the_transform(self):
+        import oasr
+
+        with pytest.raises(ValueError, match="win_length"):
+            oasr.stft_frame(
+                torch.zeros(1, 64).cuda(),
+                torch.tensor([64]).cuda(),
+                torch.ones(16).cuda(),
+                8,
+                4,
+                2,
+            )
+
+
+@requires_cuda
+class TestMelLogGuards:
+    """The floor and the additive guard set a silent bin differently."""
+
+    def _power(self):
+        torch.manual_seed(2)
+        return torch.rand(2, 5, 33, device="cuda") * 1e-3
+
+    def _filters(self):
+        torch.manual_seed(3)
+        return torch.rand(8, 33, device="cuda")
+
+    def test_additive_guard_matches_log_of_the_sum(self):
+        import oasr
+
+        power, filters = self._power(), self._filters()
+        got = oasr.mel_log(power, filters, log_floor=0.0, log_offset=2.0**-24)
+        ref = torch.log(power @ filters.t() + 2.0**-24)
+        torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
+
+    def test_floor_still_works_and_is_independent(self):
+        import oasr
+
+        power, filters = self._power(), self._filters()
+        got = oasr.mel_log(power, filters, log_floor=1e-2, log_offset=0.0)
+        ref = torch.log((power @ filters.t()).clamp_min(1e-2))
+        torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
+
+    def test_frame_lengths_zero_the_padded_tail(self):
+        """A padded frame's log is a large negative constant, not zero."""
+        import oasr
+
+        power, filters = self._power(), self._filters()
+        lens = torch.tensor([5, 2], dtype=torch.int32, device="cuda")
+        got = oasr.mel_log(power, filters, log_floor=0.0, log_offset=2.0**-24, frame_lengths=lens)
+        unmasked = oasr.mel_log(power, filters, log_floor=0.0, log_offset=2.0**-24)
+        assert got[1, 2:].abs().max() == 0
+        assert unmasked[1, 2:].abs().min() > 1.0, "the tail was already zero — bad fixture"
+        torch.testing.assert_close(got[0], unmasked[0])
+        torch.testing.assert_close(got[1, :2], unmasked[1, :2])
+
+    def test_frame_lengths_needs_a_batched_power_tensor(self):
+        import oasr
+
+        with pytest.raises(ValueError, match="3-D"):
+            oasr.mel_log(
+                torch.rand(5, 33, device="cuda"),
+                self._filters(),
+                frame_lengths=torch.tensor([5], dtype=torch.int32, device="cuda"),
+            )

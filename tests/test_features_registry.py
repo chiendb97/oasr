@@ -88,6 +88,41 @@ class TestDeclaredProperties:
         whisper = FeatureConfig(feature_type="whisper_logmel", num_mel_bins=128)
         assert build_extractor(whisper).supports_streaming is False
 
+    def test_streamability_is_the_framing_declaration(self):
+        """``supports_streaming`` is derived, so it cannot disagree with the grid."""
+        kaldi = FeatureConfig(num_mel_bins=80)
+        spec = build_extractor(kaldi)
+        assert spec.supports_streaming is (spec.framing is not None)
+
+        whisper = FeatureConfig(feature_type="whisper_logmel", num_mel_bins=128)
+        wspec = build_extractor(whisper)
+        assert wspec.framing is None
+        with pytest.raises(NotImplementedError, match="no streaming framing"):
+            wspec.framing_for(whisper)
+
+    def test_kaldi_framing_is_the_snip_edges_grid_the_engine_already_used(self):
+        """Declaring the Kaldi grid must reproduce it, not redefine it."""
+        cfg = FeatureConfig(num_mel_bins=80, frame_length_ms=25.0, frame_shift_ms=10.0)
+        framing = build_extractor(cfg).framing_for(cfg)
+        assert (framing.span, framing.hop) == (400, 160)
+        # No history and no prefill: Kaldi pre-emphasises inside a frame, and
+        # frame 0 starts at sample 0.
+        assert (framing.history, framing.prefill) == (0, 0)
+        # The count the streaming path has always computed host-side.
+        for n in (0, 399, 400, 401, 560, 1000, 16000):
+            expected = max(0, (n - 400) // 160 + 1) if n >= 400 else 0
+            assert framing.frames_for(n) == expected
+
+    def test_framing_frame_count_and_min_samples_agree(self):
+        from oasr.features import StreamingFraming
+
+        framing = StreamingFraming(span=512, hop=160, history=1, prefill=257)
+        assert framing.min_samples == 513
+        assert framing.frames_for(512) == 0
+        assert framing.frames_for(513) == 1
+        assert framing.frames_for(513 + 160) == 2
+        assert framing.frames_for(513 + 159) == 1
+
     def test_fixed_window_is_declared_by_the_extractor_not_a_name_check(self):
         """``FeatureConfig.fixed_window_seconds`` reads the registration."""
         whisper = FeatureConfig(feature_type="whisper_logmel", num_mel_bins=128)
@@ -114,7 +149,7 @@ class TestDeclaredProperties:
             ExtractorSpec(
                 kind="raw",
                 fn=lambda w, ln, c: (w, ln),
-                supports_streaming=False,
+                framing=None,  # not streamable
                 window_seconds_attr="whisper_chunk_seconds",
             )
         )

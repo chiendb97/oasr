@@ -11,8 +11,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from oasr.features import FeatureConfig, build_extractor
-from oasr.features.backends import _extract as _extract_single
+from oasr.features import FeatureConfig, StreamingFraming, build_extractor
 from oasr.features.batched import supports_batched_fbank, supports_batched_mfcc
 from oasr.features.lfr import apply_lfr_batch, lfr_output_length
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
@@ -61,6 +60,10 @@ class InputProcessor:
         # construction — for an unregistered ``feature_type`` rather than on the
         # first request.
         self._extractor = build_extractor(self._feature_config)
+        # Resolved on first streaming use, not here: a frontend's framing carries
+        # preconditions (Kaldi's ``snip_edges``) that an offline-only engine has no
+        # business paying.
+        self._streaming_framing: Optional[StreamingFraming] = None
 
         # Offline collate staging buffers, reused across micro-batches so the
         # slow allocations (``cudaHostAlloc`` for pinned host, device malloc)
@@ -457,8 +460,14 @@ class InputProcessor:
                 "LFR feature stacking is offline-only; the streaming feature "
                 "path does not window LFR frames across chunks"
             )
+        framing = self.streaming_framing
         request.audio_chunks = deque()
-        request.audio_tail = torch.empty(0, dtype=torch.float32)
+        # The buffer starts with the frontend's implicit left padding rather than
+        # empty: a centered STFT's frame 0 begins ``n_fft // 2`` samples *before*
+        # the signal, and NeMo's signal-domain pre-emphasis reaches one sample
+        # further still.  Kaldi declares ``prefill = 0`` and gets the old
+        # zero-length tail, unchanged.
+        request.audio_tail = torch.zeros(framing.prefill, dtype=torch.float32)
         request.audio_final = False
         request.num_frames = 0
         request.feature_buffer = None
@@ -517,13 +526,47 @@ class InputProcessor:
             # decodes the trailing silence to blanks.  Opt out via
             # ``EngineConfig.finalize_silence_pad = False``.
             if getattr(self._config, "finalize_silence_pad", True):
-                pad = self._config.decoding_window * self._feature_config.frame_shift_samples
+                pad_frames = self._finalize_pad_frames(request.samples_enqueued)
+                pad = pad_frames * self._feature_config.frame_shift_samples
                 request.audio_chunks.append(torch.zeros(pad, dtype=torch.float32))
                 request.samples_enqueued += pad
             request.audio_final = True
         # Keep the scheduler's bucket estimate roughly in sync.  O(1) using
         # the running total instead of re-summing the deque per chunk.
         request.num_frames = self._estimate_num_frames(request.samples_enqueued)
+
+    def _finalize_pad_frames(self, samples_enqueued: int) -> int:
+        """Feature frames of silence to append when a stream is closed.
+
+        One ``decoding_window``, plus — when the streaming runtime declares an
+        alignment (``StreamingEncoderBackend.finalize_align_frames``) — however
+        many frames it takes to round the stream up to a whole window first.
+
+        Without the rounding, a runtime that skips its sub-window tail hands the
+        decoder ``window - (frames % window)`` frames of flush silence, i.e. one
+        frame in the worst case: the trailing subword then never gets emitted, and
+        *which* utterances lose it depends on their length.  With it, every stream
+        gets at least a full window, whatever its length.
+        """
+        window = int(self._config.decoding_window)
+        align = int(getattr(self._config, "_finalize_align_frames", 0) or 0)
+        if align <= 0:
+            return window
+        framing = self.streaming_framing
+        frames = framing.frames_for(framing.prefill + int(samples_enqueued))
+        return window + (-frames) % align
+
+    @property
+    def streaming_framing(self) -> StreamingFraming:
+        """The frontend's declared streaming frame grid (memoised).
+
+        Raises ``NotImplementedError`` for a frontend that declares none, or whose
+        framing has a config precondition this deployment violates (Kaldi needs
+        ``snip_edges=True``).
+        """
+        if self._streaming_framing is None:
+            self._streaming_framing = self._extractor.framing_for(self._feature_config)
+        return self._streaming_framing
 
     @property
     def streaming_audio_chunk_samples(self) -> int:
@@ -560,9 +603,16 @@ class InputProcessor:
         """
         if not requests:
             return
-        frame_len = self._feature_config.frame_length_samples
+        # Samples one frame reads, from the frontend's declared grid.  For Kaldi
+        # this is ``frame_length_samples`` (what the old hardcoded value was); for
+        # a centered STFT it is ``n_fft`` plus any pre-emphasis history, and using
+        # the window length there would emit a frame before its last samples had
+        # arrived.
+        min_samples = self.streaming_framing.min_samples
 
-        fbank_inputs, fbank_reqs, fbank_flush = self._collect_streaming_inputs(requests, frame_len)
+        fbank_inputs, fbank_reqs, fbank_flush = self._collect_streaming_inputs(
+            requests, min_samples
+        )
         if not fbank_reqs:
             return
 
@@ -631,18 +681,16 @@ class InputProcessor:
         and a per-utterance CPU extraction for non-standard configs.
         """
         fcfg = self._feature_config
-        frame_shift = fcfg.frame_shift_samples
-        frame_len = fcfg.frame_length_samples
-        feat_dim = fcfg.output_dim
+        framing = self.streaming_framing
         dtype = self._config.dtype
         device = self._device
 
         nvtx_push("pad+pin")
         sample_counts = [w.numel() for w in fbank_inputs]
         t_max = max(sample_counts)
-        feat_lens_cpu: List[int] = [
-            ((n - frame_len) // frame_shift + 1) if n >= frame_len else 0 for n in sample_counts
-        ]
+        # Host-side, from the declared grid, so the extractor's output-length
+        # tensor is never D->H synced.
+        feat_lens_cpu: List[int] = [framing.frames_for(n) for n in sample_counts]
         lengths_cpu = torch.tensor(sample_counts, dtype=torch.int64)
         # Zero only the *pad tail* of each row, not the whole buffer: the
         # [0:n] region is immediately overwritten by the waveform copy, so the
@@ -665,17 +713,17 @@ class InputProcessor:
         lengths_cpu = self._stream_lengths_host(len(fbank_inputs)).copy_(lengths_cpu)
         nvtx_pop()
 
-        use_batched = device.type == "cuda" and (
-            supports_batched_fbank(fcfg) or supports_batched_mfcc(fcfg)
-        )
-        if not use_batched:
-            # Per-utterance CPU/torchaudio fallback (non-Povey configs, CPU).
-            feat_list = [_extract_single(w, fcfg) for w in fbank_inputs]
-            feat_lens_cpu = [f.size(0) for f in feat_list]
-            max_nf = max(feat_lens_cpu) if feat_lens_cpu else 0
-            feats_cpu = torch.zeros(len(feat_list), max_nf, feat_dim, dtype=torch.float32)
-            for i, f in enumerate(feat_list):
-                feats_cpu[i, : f.size(0)] = f
+        if device.type != "cuda":
+            # CPU engine: run the frontend on the host buffers so nothing pays an
+            # H2D for a device that has none.  Which implementation the extractor
+            # picks (fused kernels, batched torch, or its own per-utterance
+            # fallback for a config the kernels cannot express) is the extractor's
+            # decision — this used to be a hardcoded ``_extract_single`` call,
+            # which is Kaldi-only and silently produced Kaldi features for any
+            # other registered frontend.
+            feats_cpu, _ = self._extractor.extract_streaming(
+                padded_cpu[:, :t_max], lengths_cpu, fcfg
+            )
             feats = feats_cpu.to(device=device, dtype=dtype, non_blocking=True)
             return feats, feat_lens_cpu
 
@@ -701,7 +749,7 @@ class InputProcessor:
             lengths_device = lengths_cpu.to(device=device, non_blocking=True)
             nvtx_pop()
             nvtx_push("feature")
-            feats_f32, _ = self._extractor(wav_device, lengths_device, fcfg)
+            feats_f32, _ = self._extractor.extract_streaming(wav_device, lengths_device, fcfg)
             feats = feats_f32.to(dtype=dtype)
             nvtx_pop()
         return feats, feat_lens_cpu
@@ -715,15 +763,22 @@ class InputProcessor:
         feat_lens_cpu: List[int],
     ) -> None:
         """Append each stream's new feature frames to its ring buffer and reset
-        its ``audio_tail`` to the samples beyond the last consumed frame."""
-        frame_shift = self._feature_config.frame_shift_samples
+        its ``audio_tail`` to the samples beyond the last consumed frame.
+
+        The retained tail is ``buf[F * hop:]`` — written in *buffer* coordinates,
+        which is why it needs no adjustment for a frontend whose grid starts before
+        sample 0: frame ``F`` reads from buffer offset ``F * hop`` whatever the
+        absolute alignment, so the same rule keeps a centered grid's look-back and
+        a pre-emphasis history sample without knowing about either.
+        """
+        hop = self.streaming_framing.hop
         feat_dim = self._feature_config.output_dim
         nvtx_push("distribute")
         for i, req in enumerate(fbank_reqs):
             new_nf = int(feat_lens_cpu[i])
             if new_nf > 0:
                 self._append_features(req, feats[i, :new_nf, :], feat_dim)
-            consumed = new_nf * frame_shift
+            consumed = new_nf * hop
             cat = fbank_inputs[i]
             if fbank_flush[i] or consumed >= cat.numel():
                 req.audio_tail = cat.new_empty(0)
