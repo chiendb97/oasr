@@ -85,7 +85,8 @@ class PositionwiseFeedForward(nn.Module):
         self.w_2 = Linear(hidden_units, idim, bias=bias)
 
     def forward(self, xs: torch.Tensor) -> torch.Tensor:
-        return self.w_2(self.w_1(xs))
+        out: torch.Tensor = self.w_2(self.w_1(xs))
+        return out
 
 
 # -----------------------------------------------------------------------------

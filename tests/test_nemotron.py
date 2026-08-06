@@ -2,12 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Nemotron ASR (FastConformer + RNN-T) tests.
 
-Three tiers, deliberately separated by what each one can actually prove:
+Four tiers, deliberately separated by what each one can actually prove:
 
 **Structure, no checkpoint** — the pieces that are easy to get subtly wrong and
 whose wrongness a parity test would hide behind a tolerance: the Transformer-XL
 relative shift, the ``chunked_limited`` window, the LSTM predictor's protocol,
 and the fact that the start-of-sequence state is *not* zeros.
+
+**Streaming equals offline, no checkpoint** — a chunked pass against a
+whole-utterance one on random weights, fp32, CPU, with ``rtol=0``.  Every cache in
+the streaming path is a *replacement for padding an offline pass applies*, so
+equality is the right bar and a tolerance would hide exactly the failures worth
+catching: a stride-grid phase shift, a mis-sized left context, a position table
+built for the wrong length.  This tier does not need the real checkpoint and it is
+where a regression will be diagnosable.
 
 **Frontend parity** — the ``nemotron_logmel`` recipe against HuggingFace's own
 feature extractor.  Bit-exact once the mel filterbank is the same table, which is
@@ -16,11 +24,17 @@ parity test (both sides get the same features) and only shows up as WER.  That i
 how the ``audio_scale`` defect shipped.
 
 **Real-checkpoint parity** — encoder tensors and greedy *token ids* against
-``transformers``, then the engine end to end.  Token exactness is the strong
-claim here; the tensor comparisons are what localise a failure when it breaks.
+``transformers``, then the engine end to end in both service modes.  Token
+exactness is the strong claim here; the tensor comparisons are what localise a
+failure when it breaks.  The streaming class compares *words* rather than exact
+strings against the offline engine, and says why: sentence-final punctuation is
+allowed to differ, because offline uniquely produces the encoder frame its
+utterance-end right pad creates while a stream's equivalent frames see the
+finalize silence pad instead.
 
-The end-to-end accuracy number lives in ``ci/wer-reference.json`` and is checked
-by ``tests/test_accuracy.py``, not here.
+The end-to-end accuracy numbers live in ``ci/wer-reference.json`` — one entry per
+service mode, on the same manifest and denominator — and are checked by
+``tests/test_accuracy.py``, not here.
 """
 
 from __future__ import annotations
@@ -302,25 +316,259 @@ class TestTinyModel:
         model = NemotronModel.from_config(_tiny_config())
         assert model.default_decode_type == "transducer"
         assert model.capabilities == frozenset({"transducer"})
-        assert model.streaming_kind == "none"
-        assert model.cache_spec is None
+        assert model.streaming_kind == "paged"
         assert model.head is None
         assert model.blank_id == 31
 
-    def test_offline_only_model_advertises_no_streaming(self):
-        """The checkpoint *is* a streaming model; OASR does not yet carry its
-        subsampling conv cache, so the engine must refuse a streaming request at
-        construction rather than serve one with a reset front-end."""
-        from oasr.engine.streaming_backend import build_streaming_backend  # noqa: F401
-
+    def test_cache_spec_declares_everything_a_chunk_carries(self):
+        """The engine builds the whole streaming cache from this one descriptor, so
+        a missing declaration is a silently reset piece of state rather than an
+        error.  Four things: paged K/V geometry, the conv left-context width, the
+        per-subsampling-stage tails, and the *trained* attention window that makes
+        the engine pre-fill the K/V window instead of growing it."""
         model = NemotronModel.from_config(_tiny_config())
-        assert model.encoder.streaming_kind == "none"
+        spec = model.cache_spec
+        assert spec is not None
+        assert (spec.num_layers, spec.n_kv_head, spec.hidden_dim) == (2, 2, 32)
+        assert spec.conv_kernel_size == 9  # -> 8 frames of conv left-context
+        assert [s.name for s in spec.stream_states] == [
+            "subsample.0",
+            "subsample.1",
+            "subsample.2",
+        ]
+        # sliding_window - 1: part of the trained mask, not a cache preference.
+        assert spec.fixed_attention_window == 12
 
     def test_transducer_capability_surface_is_satisfied(self):
         from oasr.models.interfaces import missing_members
 
         model = NemotronModel.from_config(_tiny_config())
         assert missing_members(model, "transducer") == []
+
+
+# ---------------------------------------------------------------------------
+# Streaming, no checkpoint: does a chunked pass equal a whole-utterance one?
+# ---------------------------------------------------------------------------
+
+
+def _streaming_harness(enc, chunk_size, *, max_batch_size=2):
+    """A hand-driven paged streaming rig for one encoder, on CPU fp32.
+
+    Deliberately not the engine: this isolates the *encoder's* four caches from
+    scheduling, feature extraction and decode, so a failure here is arithmetic
+    rather than plumbing.  fp32 on CPU because the claim being tested is
+    equality, and fp16 would replace it with a tolerance.
+    """
+    from oasr.cache import AttentionCacheManager, BlockPool, CacheConfig, SlotStateCache
+    from oasr.cache.cnn_cache import conv_state_spec
+
+    spec = enc.cache_spec
+    num_left_chunks = -(-enc.fixed_attention_window // chunk_size) + 1
+    cfg = CacheConfig(
+        num_layers=spec.num_layers,
+        n_kv_head=spec.n_kv_head,
+        head_dim=spec.head_dim,
+        hidden_dim=spec.hidden_dim,
+        kernel_size=spec.conv_kernel_size,
+        stream_states=spec.stream_states,
+        prefill_kv_window=True,
+        chunk_size=chunk_size,
+        num_left_chunks=num_left_chunks,
+        block_size_frames=chunk_size,
+        max_num_blocks=max_batch_size * num_left_chunks + 8,
+        max_blocks_per_seq=num_left_chunks + 4,
+        max_batch_size=max_batch_size,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    att = AttentionCacheManager(BlockPool(cfg), cfg)
+    states = SlotStateCache(
+        [conv_state_spec(cfg), *cfg.stream_states],
+        max_batch_size=cfg.max_batch_size,
+        device=cfg.device,
+        dtype=cfg.dtype,
+    )
+    return cfg, att, states
+
+
+def _stream_encoder(enc, cfg, att, states, feats, chunk_size, *, admit_at=None):
+    """Feed ``feats (B, T, F)`` chunk by chunk; return ``(B, n_enc, D)`` per row.
+
+    ``admit_at`` optionally staggers admission (``{row: step}``) so a *young*
+    stream shares a cohort with a mature one — the case the prefilled window's
+    leading zero columns exist for.
+    """
+    from oasr.cache.cnn_cache import CONV_STATE
+
+    B, total, _ = feats.shape
+    window = chunk_size * enc.subsampling_rate
+    cache_t1 = cfg.prefilled_cache_frames
+    admit_at = admit_at or dict.fromkeys(range(B), 0)
+    offsets = [0] * B
+    outs: dict = {b: [] for b in range(B)}
+    live = []
+    for step in range(total // window):
+        for b in range(B):
+            if admit_at[b] == step:
+                att.allocate_stream(b, slot_id=b)
+                states.allocate_stream(b, slot_id=b)
+                live.append(b)
+        if not live:
+            continue
+        slot_ids = torch.tensor(live, dtype=torch.long)
+        att.prepare_chunks_batched(live)
+        assert (att.cache_seqlens.index_select(0, slot_ids) == cache_t1).all()
+        caches, _, _ = att.get_batched_paged_caches(slot_ids)
+        views = states.views(slot_ids)
+        xs = torch.stack(
+            [
+                feats[b, (step - admit_at[b]) * window : (step - admit_at[b] + 1) * window]
+                for b in live
+            ]
+        )
+        out = enc.forward_chunk_paged(
+            xs,
+            torch.tensor([offsets[b] for b in live], dtype=torch.int32),
+            caches,
+            views[CONV_STATE],
+            cache_t1=cache_t1,
+            states=views,
+        )
+        att.commit_chunks_paged_batched(live, out.size(1))
+        for i, b in enumerate(live):
+            offsets[b] += out.size(1)
+            outs[b].append(out[i : i + 1])
+    return {b: torch.cat(v, dim=1) for b, v in outs.items() if v}
+
+
+class TestStreamingEqualsOffline:
+    """The gate for the whole streaming path, on arithmetic rather than transcripts.
+
+    Every cache in play is a *replacement for padding an offline pass applies*, so
+    "equal" is the right bar and a tolerance would hide exactly the failures worth
+    catching — a stride-grid phase shift, a mis-sized left context, a position
+    table built for the wrong length.
+    """
+
+    @staticmethod
+    def _encoder(**overrides):
+        from oasr.models.nemotron.encoder import NemotronEncoder
+
+        kwargs = {
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "intermediate_size": 64,
+            "conv_kernel_size": 9,
+            "num_mel_bins": 32,
+            "subsampling_conv_channels": 16,
+            "sliding_window": 13,
+            "default_num_lookahead_tokens": 1,
+            "max_position_embeddings": 500,
+        }
+        kwargs.update(overrides)
+        cfg = NemotronEncoderConfig(**kwargs)
+        torch.manual_seed(0)
+        enc = NemotronEncoder(cfg).eval()
+        for p in enc.parameters():
+            torch.nn.init.normal_(p, std=0.05)
+        return enc
+
+    @pytest.mark.parametrize("chunk_size", [2, 4, 8])
+    def test_a_chunked_pass_equals_the_whole_utterance(self, chunk_size):
+        enc = self._encoder()
+        cfg, att, states = _streaming_harness(enc, chunk_size)
+        window = chunk_size * enc.subsampling_rate
+        feats = torch.randn(2, window * 10, enc.config.num_mel_bins)
+        with torch.no_grad():
+            offline, _ = enc(feats, torch.tensor([feats.size(1)] * 2, dtype=torch.int32))
+            streamed = _stream_encoder(enc, cfg, att, states, feats, chunk_size)
+        got = torch.cat([streamed[0], streamed[1]], dim=0)
+        n = got.size(1)
+        # Offline emits one extra frame per stage from the utterance-end right pad;
+        # in a stream those frames arrive with the next chunk.
+        assert offline.size(1) >= n
+        torch.testing.assert_close(got, offline[:, :n], rtol=0, atol=2e-6)
+
+    @pytest.mark.parametrize("lookahead", [0, 3])
+    def test_every_trained_lookahead_streams(self, lookahead):
+        """The chunk width *is* ``lookahead + 1``, so this varies the mask geometry
+        and the number of trained chunks a step covers at once."""
+        enc = self._encoder(
+            default_num_lookahead_tokens=lookahead, sliding_window=4 * (lookahead + 1) + 1
+        )
+        chunk_size = 2 * (lookahead + 1)
+        cfg, att, states = _streaming_harness(enc, chunk_size)
+        window = chunk_size * enc.subsampling_rate
+        feats = torch.randn(1, window * 8, enc.config.num_mel_bins)
+        with torch.no_grad():
+            offline, _ = enc(feats, torch.tensor([feats.size(1)], dtype=torch.int32))
+            streamed = _stream_encoder(enc, cfg, att, states, feats, chunk_size)[0]
+        n = streamed.size(1)
+        torch.testing.assert_close(streamed, offline[:, :n], rtol=0, atol=2e-6)
+
+    def test_a_stream_admitted_late_still_matches_its_own_offline_pass(self):
+        """The prefilled window's leading columns are zero placeholders for history
+        a young stream does not have; if the mask let them through, or if the
+        position table assumed they were real, this is where it shows."""
+        enc = self._encoder()
+        chunk_size = 2
+        cfg, att, states = _streaming_harness(enc, chunk_size)
+        window = chunk_size * enc.subsampling_rate
+        steps, late = 14, 5
+        feats = torch.randn(2, window * steps, enc.config.num_mel_bins)
+        with torch.no_grad():
+            streamed = _stream_encoder(
+                enc, cfg, att, states, feats, chunk_size, admit_at={0: 0, 1: late}
+            )
+            # Row 1 only ever saw its first ``steps - late`` windows.
+            own = feats[1:2, : window * (steps - late)]
+            ref_late, _ = enc(own, torch.tensor([own.size(1)], dtype=torch.int32))
+            ref_early, _ = enc(feats[0:1], torch.tensor([feats.size(1)], dtype=torch.int32))
+        for got, ref in ((streamed[0], ref_early), (streamed[1], ref_late)):
+            n = got.size(1)
+            torch.testing.assert_close(got, ref[:, :n], rtol=0, atol=2e-6)
+
+
+class TestSubsamplingStreamGrid:
+    """The cached left context is ``kernel - 1``, and the precondition is real."""
+
+    def test_cache_width_is_kernel_minus_one_not_kernel_minus_stride(self):
+        """Upstream uses ``kernel - stride`` plus a first-chunk top-up, which shifts
+        the stride grid from chunk two onward (measured ~3 absolute against its own
+        offline pass at kernel 3 / stride 2).  With ``S`` a multiple of ``stride`` —
+        which every legal chunk is — the frames the next output still needs are
+        exactly ``kernel - 1``, uniformly and with no first-chunk case.
+        """
+        from oasr.models.nemotron.subsampling import NemotronSubsampling
+
+        cfg = NemotronEncoderConfig(num_mel_bins=32, subsampling_conv_channels=16)
+        sub = NemotronSubsampling(cfg)
+        pad = sub._pad  # noqa: SLF001
+        assert pad.stream_left == cfg.subsampling_conv_kernel_size - 1
+        assert pad.stream_left != cfg.subsampling_conv_kernel_size - pad.stride
+
+    def test_declared_specs_match_the_stage_shapes(self):
+        from oasr.models.nemotron.subsampling import NemotronSubsampling
+
+        cfg = NemotronEncoderConfig(num_mel_bins=128, subsampling_conv_channels=256)
+        sub = NemotronSubsampling(cfg)
+        specs = sub.state_specs(cfg.num_mel_bins, cfg.subsampling_conv_channels)
+        # 128 mels -> 65 -> 33 bins; channels 1 into the stem, then 256.
+        assert [s.shape for s in specs] == [(2, 128, 1), (2, 65, 256), (2, 33, 256)]
+        assert [s.slot_axis for s in specs] == [0, 0, 0]
+
+    def test_a_misaligned_chunk_is_refused_with_the_multiple_named(self):
+        from oasr.models.nemotron.encoder import NemotronEncoder
+
+        enc = NemotronEncoder(NemotronEncoderConfig(default_num_lookahead_tokens=3))
+        assert enc.streaming_geometry(4) == (32, 32)
+        assert enc.streaming_geometry(8) == (64, 64)
+        with pytest.raises(ValueError, match="multiple of 4"):
+            enc.streaming_geometry(6)
+        with pytest.raises(ValueError, match="multiple of 4"):
+            enc.streaming_geometry(0)
 
 
 class TestFrontendGeometry:
@@ -350,12 +598,64 @@ class TestFrontendGeometry:
         # Frames past a row's count are zeroed, not left at the log floor.
         assert feats[1, feat_lengths[1] :].abs().max() == 0
 
-    def test_registered_as_non_streaming(self):
+    def test_registered_as_streamable_with_a_declared_grid(self):
         from oasr.features import FeatureConfig, build_extractor
 
-        spec = build_extractor(FeatureConfig(feature_type="nemotron_logmel"))
-        assert spec.supports_streaming is False
-        assert spec.window_seconds_attr is None
+        cfg = FeatureConfig(feature_type="nemotron_logmel")
+        spec = build_extractor(cfg)
+        assert spec.supports_streaming is True
+        assert spec.window_seconds_attr is None  # cost tracks the real length
+        framing = spec.framing_for(cfg)
+        # ``span`` is n_fft, not win_length: a centered STFT reads the whole
+        # transform width, so keying readiness off the 400-sample window would
+        # emit a frame before its last samples had arrived.
+        assert (framing.span, framing.hop) == (512, 160)
+        # One sample of pre-emphasis history (NeMo pre-emphasises the *signal*),
+        # plus n_fft // 2 for the centered grid's implicit left pad.
+        assert (framing.history, framing.prefill) == (1, 257)
+
+    def test_streaming_extraction_reproduces_the_offline_grid(self):
+        """Bit-exact, which is the only acceptable answer for a frame grid.
+
+        The offline pass is one ``center=True`` STFT over the utterance; a chunked
+        caller reproduces it by starting the buffer with ``prefill`` zeros, framing
+        past ``history`` context samples, and retaining ``buf[F * hop:]``.  Any
+        drift here shifts every frame the encoder sees.
+        """
+        from oasr.features import FeatureConfig, build_extractor
+        from oasr.features.nemotron import batched_nemotron_logmel
+
+        cfg = FeatureConfig(feature_type="nemotron_logmel", num_mel_bins=128)
+        framing = build_extractor(cfg).framing_for(cfg)
+        spec = build_extractor(cfg)
+
+        torch.manual_seed(0)
+        total = 16000
+        wav = torch.randn(1, total) * 0.1
+        offline, off_len = batched_nemotron_logmel(wav, torch.tensor([total]), cfg)
+        n_valid = int(off_len[0])
+
+        for chunk_samples in (1280, 2560, 5120):
+            buf = torch.zeros(framing.prefill)
+            pos, emitted = 0, []
+            while pos < total:
+                buf = torch.cat([buf, wav[0, pos : pos + chunk_samples]])
+                pos += chunk_samples
+                n_frames = framing.frames_for(buf.numel())
+                if n_frames <= 0:
+                    continue
+                feats, lens = spec.extract_streaming(
+                    buf.unsqueeze(0), torch.tensor([buf.numel()]), cfg
+                )
+                assert int(lens[0]) == n_frames
+                emitted.append(feats[0, :n_frames])
+                buf = buf[n_frames * framing.hop :]
+            got = torch.cat(emitted, 0)
+            m = min(got.size(0), n_valid)
+            # The last frame needs right context and arrives with the engine's
+            # finalize silence pad, so streaming is one short mid-stream.
+            assert m >= n_valid - 1
+            torch.testing.assert_close(got[:m], offline[0, :m], rtol=0, atol=0)
 
     def test_feature_spec_round_trips_and_maps(self):
         from oasr.features import FeatureSpec
@@ -634,26 +934,167 @@ class TestEngineEndToEnd:
         ]
         assert wide == narrow
 
-    def test_streaming_mode_is_refused_at_construction(self):
-        """An offline-only encoder must be refused when the engine is *built*, so
-        the failure names the checkpoint rather than surfacing as a mysterious
-        rejection on the first request.  The model's name says streaming; what is
-        missing is OASR's side of its subsampling conv cache."""
+    def test_streaming_request_is_refused_by_an_offline_engine(self, engine):
+        with pytest.raises(ValueError, match="service_mode"):
+            engine.add_streaming_request("nemotron-stream-1")
+
+
+@pytest.mark.slow
+@pytest.mark.cuda
+@pytest.mark.requires_assets("NEMOTRON_CKPT", "WAV_DIR")
+class TestStreamingEngine:
+    """The streaming service mode on the real checkpoint."""
+
+    @staticmethod
+    def _audios(n):
+        import soundfile as sf
+
+        return [sf.read(p, dtype="float32")[0] for p in assets.require_wavs(n)]
+
+    @staticmethod
+    def _texts(outputs):
+        return [o if isinstance(o, str) else o.text for o in outputs]
+
+    @pytest.fixture(scope="class")
+    def streaming_engine(self, device):
         from oasr.engine import ASREngine, EngineConfig
 
-        with pytest.raises(ValueError, match="offline-only"):
-            ASREngine(
+        eng = ASREngine(
+            EngineConfig(
+                ckpt_dir=assets.require("NEMOTRON_CKPT"),
+                service_mode="streaming",
+                dtype=torch.float16,
+                max_batch_size=4,
+            )
+        )
+        yield eng
+        del eng
+        torch.cuda.empty_cache()
+
+    def test_the_engine_derives_the_trained_window_not_the_config_default(self, streaming_engine):
+        """``num_left_chunks`` is not a knob for this encoder — the mask is trained.
+
+        The engine derives the retained cache from
+        ``CacheSpec.fixed_attention_window`` and pre-fills it, which is what makes
+        ``cache_seqlens`` uniform across the cohort and therefore the *shared*
+        relative-position table correct.
+        """
+        backend = streaming_engine._model_runner.streaming_backend  # noqa: SLF001
+        cache_config = backend._cache_config  # noqa: SLF001
+        assert cache_config.prefill_kv_window is True
+        # 56 trained left-context frames, retained in chunk-sized pages.
+        window = streaming_engine._model.encoder.fixed_attention_window  # noqa: SLF001
+        assert cache_config.prefilled_cache_frames >= window
+        assert cache_config.block_size_frames == cache_config.chunk_size
+        # Every declared state got a buffer: the conv left-context plus one tail
+        # per subsampling stage.
+        names = backend.state_cache.names
+        assert names[0] == "conv"
+        assert [n for n in names if n.startswith("subsample.")] == [
+            "subsample.0",
+            "subsample.1",
+            "subsample.2",
+        ]
+
+    def test_window_equals_stride_for_a_cached_causal_frontend(self, streaming_engine):
+        """No lookahead: a chunk consumes exactly ``chunk_size * 8`` input frames.
+
+        The generic formula would ask for ``(chunk_size - 1) * 8 + right_context + 1``,
+        which describes a *centred* subsampling front-end and is one stride grid
+        away from this one.
+        """
+        cfg = streaming_engine._config  # noqa: SLF001
+        assert cfg.decoding_window == cfg.stride == cfg.chunk_size * 8
+
+    def test_streaming_transcript_matches_offline_word_for_word(self, streaming_engine):
+        """The gate for the whole streaming path.
+
+        Sentence-final punctuation is allowed to differ: offline uniquely produces
+        the encoder frame that the utterance-end right pad creates, and a stream's
+        equivalent frames see the finalize silence pad instead.  Words must not.
+        """
+        from oasr.engine import ASREngine, EngineConfig
+
+        audios = self._audios(4)
+        streamed = self._texts(streaming_engine.transcribe(audios))
+
+        offline_engine = ASREngine(
+            EngineConfig(
+                ckpt_dir=assets.require("NEMOTRON_CKPT"),
+                service_mode="offline",
+                dtype=torch.float16,
+                max_batch_size=4,
+            )
+        )
+        try:
+            offline = self._texts(offline_engine.transcribe_offline(audios))
+        finally:
+            del offline_engine
+            torch.cuda.empty_cache()
+
+        def words(text):
+            return "".join(c for c in text.lower() if c.isalnum() or c.isspace()).split()
+
+        for a, b in zip(offline, streamed):
+            assert words(a) == words(b), f"offline={a!r} streaming={b!r}"
+
+    def test_batch_size_does_not_change_the_streaming_transcript(self, streaming_engine):
+        audios = self._audios(4)
+        wide = self._texts(streaming_engine.transcribe(audios))
+        solo = [self._texts(streaming_engine.transcribe([a]))[0] for a in audios]
+        assert wide == solo
+
+    @pytest.mark.parametrize("chunk_size", [4, 8, 32])
+    def test_a_wider_or_narrower_chunk_still_matches(self, chunk_size, device):
+        """Any multiple of the trained attention chunk must decode the same words.
+
+        A step wider than one trained chunk needs the ``chunked_limited`` structure
+        *within* the step, which rides in the same additive bias as the rel-pos
+        term; a narrower one exercises the case where the convolution cache is
+        wider than a chunk's own output.
+        """
+        from oasr.engine import ASREngine, EngineConfig
+
+        audios = self._audios(2)
+        texts = {}
+        for cs in (16, chunk_size):
+            eng = ASREngine(
                 EngineConfig(
                     ckpt_dir=assets.require("NEMOTRON_CKPT"),
                     service_mode="streaming",
                     dtype=torch.float16,
                     max_batch_size=2,
+                    chunk_size=cs,
                 )
             )
+            try:
+                texts[cs] = self._texts(eng.transcribe(audios))
+            finally:
+                del eng
+                torch.cuda.empty_cache()
+        assert texts[chunk_size] == texts[16]
 
-    def test_streaming_request_is_refused_by_an_offline_engine(self, engine):
-        with pytest.raises(ValueError, match="service_mode"):
-            engine.add_streaming_request("nemotron-stream-1")
+    def test_a_misaligned_chunk_size_is_refused_at_construction(self):
+        """``chunk_size`` must be a whole number of trained attention chunks.
+
+        The ``chunked_limited`` mask groups **absolute** frame positions, so a
+        partial trained chunk would need keys from the future — which fails
+        silently, producing a plausible transcript from arithmetic that no longer
+        matches the offline pass.  Hence a construction-time refusal naming the
+        multiple.
+        """
+        from oasr.engine import ASREngine, EngineConfig
+
+        with pytest.raises(ValueError, match="multiple of"):
+            ASREngine(
+                EngineConfig(
+                    ckpt_dir=assets.require("NEMOTRON_CKPT"),
+                    service_mode="streaming",
+                    dtype=torch.float16,
+                    max_batch_size=1,
+                    chunk_size=6,  # not a multiple of num_lookahead_tokens + 1 == 4
+                )
+            )
 
 
 @pytest.mark.slow

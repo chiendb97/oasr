@@ -202,6 +202,7 @@ class Attention(nn.Module):
         kv_lens: Optional[torch.Tensor] = None,
         kv_starts: Optional[torch.Tensor] = None,
         kv_extent: Optional[int] = None,
+        block_table: Optional[torch.Tensor] = None,
         attn_bias: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         is_causal: bool = False,
@@ -213,6 +214,14 @@ class Attention(nn.Module):
 
         Parameters
         ----------
+        block_table : Tensor, optional
+            ``(B, max_blocks_per_seq)`` int32 logical→physical block map.  When
+            given, ``k``/``v`` are **pool views** ``(num_blocks, block_size, H_kv,
+            D)`` rather than per-batch tensors, and ``kv_lens`` is required.  This
+            mode delegates wholesale to :func:`oasr.attention.fmha`, which owns
+            both the paged CuteDSL kernel and a paged SDPA reference — so unlike
+            every other path here there is no separate fallback to route to, and
+            fp32/CPU stays available for the parity oracles.
         kv_lens : Tensor, optional
             ``(B,)`` — keys ``[0, kv_lens[b])`` are valid (right padding).
         kv_extent : int, optional
@@ -249,6 +258,33 @@ class Attention(nn.Module):
             raise ValueError("kv_starts requires kv_lens — together they bound the key window")
         if kv_extent is not None and kv_lens is None:
             raise ValueError("kv_extent requires kv_lens — the length is what bounds the loop")
+
+        if block_table is not None:
+            if kv_lens is None:
+                raise ValueError(
+                    "block_table requires kv_lens — a paged cache carries no shape "
+                    "the key length could be read from"
+                )
+            if attn_mask is not None:
+                raise ValueError(
+                    "block_table is incompatible with attn_mask: the paged path has "
+                    "no materialized key axis to broadcast a mask against. Pass the "
+                    "full (B, H, T_q, T_k) grid as attn_bias instead."
+                )
+            from oasr.attention import fmha
+
+            paged: torch.Tensor = fmha(
+                q,
+                k,
+                v,
+                softmax_scale=self.softmax_scale,
+                attn_bias=attn_bias,
+                cache_seqlens=kv_lens,
+                cache_seqstarts=kv_starts,
+                block_table=block_table,
+                causal=is_causal,
+            )
+            return paged
 
         if self._kernel_eligible(q, k, kv_lens, kv_starts, attn_bias, attn_mask, is_causal):
             from oasr.attention import fmha

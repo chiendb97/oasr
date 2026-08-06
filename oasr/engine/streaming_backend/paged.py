@@ -20,11 +20,12 @@ import torch
 from oasr.cache import (
     AttentionCacheManager,
     BlockPool,
-    CnnCacheManager,
+    SlotStateCache,
     StreamContext,
     StreamSlotPool,
 )
-from oasr.cache.slot_cnn import SlotCnnCache
+from oasr.cache.cnn_cache import CONV_STATE, conv_state_spec
+from oasr.cache.state import SlotTensor
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from ..graph_cache import GraphedEncoderForward, round_up_bucket
@@ -32,6 +33,7 @@ from ..request import Request
 from .base import StreamingEncoderBackend, register_streaming_backend
 
 if TYPE_CHECKING:
+    from oasr.cache.paged_kv import PagedKVCache
     from oasr.cache.types import CacheConfig
     from oasr.models.base import BaseAsrModel
 
@@ -80,19 +82,59 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         # Window geometry derived from the *encoder* (not hardcoded): a chunk of
         # ``chunk_size`` encoder frames needs ``(chunk_size-1)*sub + right_context
         # + 1`` input frames, advancing ``sub*chunk_size`` per step.
+        # An encoder whose front-end the generic formula does not describe declares
+        # its own (and validates the chunk size while it is there — the backend
+        # calls this once, at construction, which is where an unserviceable chunk
+        # size should fail).
         enc = model.encoder
-        sub = int(enc.subsampling_rate)
-        rc = int(enc.right_context)
         cs = int(config.chunk_size)
-        self._window = (cs - 1) * sub + rc + 1
-        self._stride = sub * cs
-        self._context = rc + 1
+        geometry = enc.streaming_geometry(cs)
+        #: Whether the encoder *declared* its geometry, which is what decides
+        #: whether a sub-window tail can be forwarded.  Kept as its own flag rather
+        #: than inferred from ``_context == _window``: that comparison is also true
+        #: for a *generic* geometry at ``chunk_size = 1``, where a partial tail is
+        #: perfectly forwardable.
+        self._exact_geometry = geometry is not None
+        if geometry is None:
+            sub = int(enc.subsampling_rate)
+            rc = int(enc.right_context)
+            self._window = (cs - 1) * sub + rc + 1
+            self._stride = sub * cs
+            self._context = rc + 1
+        else:
+            self._window, self._stride = (int(v) for v in geometry)
+            # A declared geometry is exact: a short tail cannot be forwarded at all
+            # (its length would fall off the subsampling stride grid), so the
+            # minimum forwardable chunk is a whole window.  The finalize silence
+            # pad makes the last real-audio window full, so nothing is dropped.
+            self._context = self._window
 
-        # Build shared cache infrastructure.
+        # Build shared cache infrastructure.  The fixed-extent stream state is one
+        # slot-addressed cache over the convolutional left-context plus whatever
+        # else the encoder declared (``CacheSpec.stream_states``) — one buffer per
+        # declaration, one ``slot_ids`` index for all of them.
         self._block_pool = BlockPool(cache_config)
         self._att_mgr = AttentionCacheManager(self._block_pool, cache_config)
-        self._cnn_mgr = CnnCacheManager(cache_config)
+        self._state_mgr = SlotStateCache(
+            [conv_state_spec(cache_config), *cache_config.stream_states],
+            max_batch_size=cache_config.max_batch_size,
+            device=cache_config.device,
+            dtype=cache_config.dtype,
+        )
+        # Names beyond ``"conv"``: passed to the chunk forward as ``states=`` only
+        # when non-empty, so an encoder that needs nothing more (Conformer, the
+        # conformer-encoder transducer) is called with exactly the signature it
+        # always had — including inside the CUDA-graph capture.
+        self._extra_states = [s.name for s in cache_config.stream_states]
         self._slot_pool = StreamSlotPool(cache_config.max_batch_size)
+
+        # A trained fixed attention window is prefilled at admission, so
+        # ``cache_seqlens`` — and therefore the host-side ``cache_t1`` the encoder
+        # sizes its relative-position table from — is a constant.  Using the real
+        # per-stream offset there would size the table for the wrong key length.
+        self._fixed_cache_t1: Optional[int] = (
+            cache_config.prefilled_cache_frames if cache_config.prefill_kv_window else None
+        )
 
         # CUDA Graph cache for the steady-state batched paged forward.
         # Captures lazily on first encounter of each (B_active, cache_t1
@@ -108,9 +150,10 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             self._graph_cache: Optional[GraphedEncoderForward] = GraphedEncoderForward(
                 self._chunk_forward,
                 self._att_mgr,
-                self._cnn_mgr,
+                self._state_mgr,
                 device=torch.device(config.device),
                 pool=self._graph_pool,
+                extra_states=self._extra_states,
             )
         else:
             self._graph_cache = None
@@ -128,9 +171,49 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         return self._stride
 
     @property
+    def finalize_align_frames(self) -> int:
+        """``stride`` when a partial final window cannot be forwarded, else ``0``.
+
+        The declared-geometry case (see ``streaming_geometry``) skips its sub-window
+        tail, so the closing silence has to be measured from a *rounded* stream
+        length or the decoder's flush budget varies with the utterance.
+        """
+        return self._stride if self._exact_geometry else 0
+
+    @property
     def block_pool(self) -> BlockPool:
         """The shared paged-KV block pool (used by memory-cleanup tests)."""
         return self._block_pool
+
+    @property
+    def state_cache(self) -> SlotStateCache:
+        """Slot-addressed fixed-extent stream state (conv + declared extras)."""
+        return self._state_mgr
+
+    def _call_chunk_forward(
+        self,
+        xs: torch.Tensor,
+        offsets: torch.Tensor,
+        att_caches: List["PagedKVCache"],
+        cnn_cache: SlotTensor,
+        cache_t1: int,
+        states: Dict[str, SlotTensor],
+    ) -> torch.Tensor:
+        """Invoke the routed chunk forward, passing ``states`` only when declared.
+
+        Conformer's chunk forward is then called with exactly the arguments it has
+        always been called with, which keeps its CUDA-graph capture and its
+        signature untouched by this axis existing.
+        """
+        if self._extra_states:
+            out: torch.Tensor = self._chunk_forward(
+                xs, offsets, att_caches, cnn_cache, cache_t1=cache_t1, states=states
+            )
+            return out
+        eager: torch.Tensor = self._chunk_forward(
+            xs, offsets, att_caches, cnn_cache, cache_t1=cache_t1
+        )
+        return eager
 
     # ------------------------------------------------------------------
     # Encoder graph pre-warm
@@ -176,8 +259,12 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         if seen[-1] > cap:
             raise ValueError(f"prewarm batch size {seen[-1]} exceeds max_batch_size {cap}")
 
-        if cache_t1_buckets is None:
-            buckets: List[int] = [0]
+        if self._fixed_cache_t1 is not None:
+            # A prefilled window has exactly one cache length, ever, so the whole
+            # ladder collapses to one capture per batch size.
+            buckets: List[int] = [self._fixed_cache_t1]
+        elif cache_t1_buckets is None:
+            buckets = [0]
         else:
             buckets = sorted(
                 {round_up_bucket(int(c)) for c in cache_t1_buckets if int(c) >= 0}
@@ -220,9 +307,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         request.slot_id = slot_id
 
         self._att_mgr.allocate_stream(sid, slot_id=slot_id)
-        self._cnn_mgr.allocate_stream(sid, slot_id=slot_id)
+        self._state_mgr.allocate_stream(sid, slot_id=slot_id)
 
-        ctx = StreamContext(sid, self._att_mgr, self._cnn_mgr)
+        ctx = StreamContext(sid, self._att_mgr, self._state_mgr)
         request.stream_context = ctx
         return ctx
 
@@ -321,18 +408,27 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             # one paged forward regardless of offset. FlexAttention's
             # block-mask is built from per-stream cache_seqlens, and the
             # encoder builds per-stream pos_emb when offsets differ.
-            # ``_forward_single`` always replays at ``B=1``, so a cohort wider
-            # than one row can never share a shape key with one — only a B=1
-            # cohort followed by a single needs the copy.  That keeps the
-            # steady-state hot path (a full cohort, no finalizing stream)
-            # allocation-free.
+            #
+            # ``detach`` when *any* fallback follows, for two independent reasons.
+            # The narrow one is same-key reuse: ``_forward_single`` always replays
+            # at ``B=1``, so a B=1 cohort shares its shape key with a single.  The
+            # broader one is that a fallback may hit a **new** key and trigger a
+            # *capture* — and a capture reuses the shared graph memory pool, which
+            # can hand out the block an earlier capture's output buffer occupies.
+            # Measured: a stream finalizing in the same step as a fresh capture lost
+            # its trailing words (5 of 40 LJSpeech utterances), deterministically,
+            # only with graphs enabled.  Predicting *which* fallback would capture
+            # is possible (``GraphedEncoderForward.have``) but fragile; gating on
+            # "is there anything after us at all" costs one ``(B, chunk, C)`` copy
+            # on the steps where a stream finishes and keeps the steady-state hot
+            # path (a full cohort, no finalizing stream) allocation-free.
             self._forward_batched_paged(
                 batchable,
                 window,
                 stride,
                 context,
                 results,
-                detach=len(batchable) == 1 and bool(fallback),
+                detach=bool(fallback),
             )
 
         for i, req in enumerate(fallback):
@@ -392,11 +488,16 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         #    the encoder itself via the SlotCnnCache descriptor (mirroring
         #    how K/V are written through PagedKVCache).
         max_offset = max(req.offset for req in group)
+        # The host-side cache length the encoder sizes its position table from.
+        # Constant under a prefilled window; the growing per-stream offset
+        # otherwise.
+        cache_t1 = self._fixed_cache_t1 if self._fixed_cache_t1 is not None else max_offset
         feature_chunks = [
             req.feature_buffer[req.feature_cursor : req.feature_cursor + window] for req in group
         ]
         xs = torch.stack(feature_chunks, dim=0)  # (B, window, F)
-        cnn_cache = SlotCnnCache(buffer=self._cnn_mgr.buffer, slot_ids=slot_ids_device)
+        states = self._state_mgr.views(slot_ids_device)
+        cnn_cache = states[CONV_STATE]
 
         # 3. Per-stream encoder-frame offsets (always a tensor for the
         #    graphed path; the eager fallback accepts the same tensor).
@@ -413,7 +514,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         #    because the scheduler keeps streams in lockstep cohorts and
         #    cache_t1 grows in N_BLOCK-sized steps.
         nvtx_push("encoder_call")
-        cache_t1_bucket = round_up_bucket(max_offset)
+        cache_t1_bucket = (
+            cache_t1 if self._fixed_cache_t1 is not None else round_up_bucket(max_offset)
+        )
         out = None
         if self._use_cuda_graphs and self._graph_cache is not None:
             out = self._graph_cache.replay(
@@ -434,13 +537,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         if out is None:
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_device)
             for c in batched_att_caches:
-                c.host_seqlen_max = max_offset
-            out = self._chunk_forward(
-                xs,
-                offsets_device,
-                batched_att_caches,
-                cnn_cache,
-                cache_t1=max_offset,
+                c.host_seqlen_max = cache_t1
+            out = self._call_chunk_forward(
+                xs, offsets_device, batched_att_caches, cnn_cache, cache_t1, states
             )
         actual_frames = out.size(1)
         nvtx_pop()
@@ -521,9 +620,13 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         device = self._att_mgr.block_table.device
         slot_ids_device = torch.tensor([req.slot_id], dtype=torch.long, device=device)
         offsets_device = torch.tensor([req.offset], dtype=torch.int32, device=device)
-        cnn_cache = SlotCnnCache(buffer=self._cnn_mgr.buffer, slot_ids=slot_ids_device)
+        states = self._state_mgr.views(slot_ids_device)
+        cnn_cache = states[CONV_STATE]
 
-        cache_t1_bucket = round_up_bucket(req.offset)
+        cache_t1 = self._fixed_cache_t1 if self._fixed_cache_t1 is not None else req.offset
+        cache_t1_bucket = (
+            cache_t1 if self._fixed_cache_t1 is not None else round_up_bucket(req.offset)
+        )
         nvtx_push("single.encoder_call")
         out = None
         # Only graph **full-window** chunks. Sub-window (partial/final-tail)
@@ -549,13 +652,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         if out is None:
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_device)
             for c in batched_att_caches:
-                c.host_seqlen_max = req.offset
-            out = self._chunk_forward(
-                chunk,
-                offsets_device,
-                batched_att_caches,
-                cnn_cache,
-                cache_t1=req.offset,
+                c.host_seqlen_max = cache_t1
+            out = self._call_chunk_forward(
+                chunk, offsets_device, batched_att_caches, cnn_cache, cache_t1, states
             )
         nvtx_pop()
         actual_frames = out.size(1)

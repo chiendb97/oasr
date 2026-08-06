@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -15,6 +16,8 @@ from oasr.ctc_decode import GpuDecoderConfig
 from oasr.decode import DecoderConfig
 from oasr.features import FeatureConfig
 from oasr.models.base import BaseModelConfig, CacheSpec
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -666,16 +669,41 @@ class EngineConfig:
                 "a CUDA device (ASREngine resolves it at construction). Set an "
                 "explicit block count to build a cache config directly."
             )
+        block_size = self.block_size_frames
+        num_left_chunks = self.num_left_chunks
+        window = cache_spec.fixed_attention_window
+        prefill = window is not None
+        if window is not None:
+            # A trained fixed window is not a knob: how much history the model may
+            # attend to is baked into its mask, so the engine derives the retained
+            # cache from the model rather than from ``EngineConfig``.  One page per
+            # chunk keeps eviction aligned with the trained chunk grid, and the
+            # retained window is rounded *up* — any excess is masked by the
+            # encoder's own ``chunked_limited`` bias, which it builds regardless.
+            block_size = self.chunk_size
+            num_left_chunks = -(-int(window) // self.chunk_size) + 1  # ceil + current
+            if self.num_left_chunks != -1:
+                logger.warning(
+                    "num_left_chunks=%d ignored: this encoder declares a trained "
+                    "attention window of %d frames, so the retained cache is "
+                    "derived (%d chunks of %d frames)",
+                    self.num_left_chunks,
+                    window,
+                    num_left_chunks,
+                    self.chunk_size,
+                )
         return CacheConfig(
             num_layers=cache_spec.num_layers,
             n_kv_head=cache_spec.n_kv_head,
             head_dim=cache_spec.head_dim,
             hidden_dim=cache_spec.hidden_dim,
             kernel_size=cache_spec.conv_kernel_size,
+            stream_states=tuple(cache_spec.stream_states),
+            prefill_kv_window=prefill,
             chunk_size=self.chunk_size,
-            num_left_chunks=self.num_left_chunks,
+            num_left_chunks=num_left_chunks,
             recycle_streaming_history=self.recycle_streaming_history,
-            block_size_frames=self.block_size_frames,
+            block_size_frames=block_size,
             max_num_blocks=self.max_num_blocks,
             max_blocks_per_seq=self.max_blocks_per_seq,
             max_batch_size=self.max_batch_size,

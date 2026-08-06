@@ -91,6 +91,28 @@ class StreamingEncoderBackend(ABC):
         """Feature-frame stride between consecutive chunk windows."""
         raise NotImplementedError
 
+    @property
+    def finalize_align_frames(self) -> int:
+        """Alignment the closing silence pad must round the stream up to, or ``0``.
+
+        ``0`` (the default) means this runtime can forward a **partial** final
+        window, so the trailing audio is decoded whatever its length and one
+        ``decoding_window`` of closing silence is enough to flush the decoder.
+
+        A runtime whose geometry is exact cannot: a short tail would fall off its
+        subsampling stride grid, so it is skipped — and then the closing silence
+        the decoder actually gets is ``window - (frames % window)``, i.e. anywhere
+        from **one frame** to a full window depending on the utterance length.  That
+        is not a rounding detail: measured on Nemotron's LJSpeech-200 gate, the
+        trailing subword goes missing when the remainder lands badly (9 deletions
+        at a 128-frame window against 42 at 32, purely from how much silence
+        survived the truncation).  Declaring the alignment lets
+        :class:`~oasr.engine.input_processor.InputProcessor` round the stream up
+        first, so every stream gets *at least* a full window of flush silence
+        regardless of its length.
+        """
+        return 0
+
     # -- optional graph pre-warm -------------------------------------------
     def prewarm(
         self, batch_sizes: Sequence[int], cache_t1_buckets: Optional[Sequence[int]] = None

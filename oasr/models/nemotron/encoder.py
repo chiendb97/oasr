@@ -30,12 +30,13 @@ transposes are simply absent here.
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple, cast
+from typing import TYPE_CHECKING, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from oasr.cache.state import StreamStateSpec
 from oasr.layers import (
     Attention,
     ColumnParallelLinear,
@@ -51,6 +52,10 @@ from oasr.layers.norm import LayerNormActivation
 from ..base import BaseEncoder
 from .config import NemotronEncoderConfig
 from .subsampling import NemotronSubsampling
+
+if TYPE_CHECKING:
+    from oasr.cache.paged_kv import PagedKVCache
+    from oasr.cache.state import SlotTensor
 
 __all__ = [
     "MASK_FLOOR",
@@ -174,6 +179,11 @@ class NemotronConvolutionModule(nn.Module):
     ``kernel - 1``, no right pad), so a padded frame can only influence later
     frames — which are padding too.  That is why zeroing the fully-masked rows
     before it is sufficient to keep a mixed-length batch's valid frames clean.
+
+    Streaming replaces the zero left pad with the previous chunk's post-GLU tail
+    (:meth:`forward_chunk`).  Unlike the subsampling stack this needs no
+    alignment precondition — the convolution has stride 1, so there is no grid to
+    fall off.
     """
 
     def __init__(self, config: NemotronEncoderConfig) -> None:
@@ -198,6 +208,29 @@ class NemotronConvolutionModule(nn.Module):
         if silent is not None:
             x = x.masked_fill(silent, 0.0)
         x = F.pad(x, (0, 0, self.lorder, 0))
+        return self._tail(x)
+
+    def forward_chunk(
+        self, x: torch.Tensor, cache: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(out (B, T, C), new_cache (B, lorder, C))`` given the previous tail.
+
+        ``cache`` is the previous chunk's **post-GLU** activation tail, which is
+        what the offline path zero-pads — so a stream's first chunk (an all-zero
+        cache) computes exactly what an offline pass would.
+
+        The new tail is taken from the *concatenation*, not from ``x``: a chunk
+        shorter than ``lorder`` (``conv_kernel_size - 1`` can exceed the encoder
+        frames one step produces — 8 against 4 on the released config) must carry
+        part of the old cache forward, and slicing the concatenation does that
+        without a special case.
+        """
+        x = self.glu(self.pointwise_conv1(x))
+        padded = torch.cat([cache.to(dtype=x.dtype), x], dim=1)
+        return self._tail(padded), padded[:, -self.lorder :]
+
+    def _tail(self, x: torch.Tensor) -> torch.Tensor:
+        """Everything after the left context is in place: conv → LN+SiLU → pointwise."""
         x = self.depthwise_conv(x)
         x = self.norm(x)
         out: torch.Tensor = self.pointwise_conv2(x)
@@ -244,7 +277,32 @@ class NemotronEncoderLayer(nn.Module):
         x = x + self.self_attn(self.norm_self_att(x), pos_emb, attn_mask, silent)
         x = x + self.conv(self.norm_conv(x), silent)
         x = x + 0.5 * self.feed_forward2(self.norm_feed_forward2(x))
-        return self.norm_out(x)
+        out: torch.Tensor = self.norm_out(x)
+        return out
+
+    def forward_chunk(
+        self,
+        x: torch.Tensor,
+        pos_emb: torch.Tensor,
+        attn_mask: torch.Tensor,
+        att_cache: "PagedKVCache",
+        conv_cache: torch.Tensor,
+        cache_t1: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Streaming counterpart of :meth:`forward` — same arithmetic, cached context.
+
+        ``silent`` has no analogue here and needs none: a streaming chunk is real
+        audio across its whole width for every row, which is exactly the condition
+        the offline path's masking exists to handle.
+        """
+        x = x + 0.5 * self.feed_forward1(self.norm_feed_forward1(x))
+        x = x + self.self_attn.forward_chunk(
+            self.norm_self_att(x), pos_emb, attn_mask, att_cache, cache_t1
+        )
+        conv_out, new_conv_cache = self.conv.forward_chunk(self.norm_conv(x), conv_cache)
+        x = x + conv_out
+        x = x + 0.5 * self.feed_forward2(self.norm_feed_forward2(x))
+        return self.norm_out(x), new_conv_cache
 
 
 class NemotronRelPositionAttention(nn.Module):
@@ -308,16 +366,76 @@ class NemotronRelPositionAttention(nn.Module):
         projected: torch.Tensor = self.o_proj(self.attn.merge_heads(out))
         return projected
 
+    def forward_chunk(
+        self,
+        x: torch.Tensor,
+        pos_emb: torch.Tensor,
+        attn_mask: torch.Tensor,
+        cache: "PagedKVCache",
+        cache_t1: int,
+    ) -> torch.Tensor:
+        """Streaming attention over ``cache_t1`` cached frames plus this chunk.
+
+        The relative-position arithmetic is the offline one with a different
+        length: :func:`rel_shift` over a table built for ``L = cache_t1 + T_q``
+        gives query ``i`` against key ``j`` the distance ``cache_t1 + i - j``,
+        which is the absolute distance exactly when the cached region is
+        right-aligned against the chunk — i.e. when the whole cohort shares
+        ``cache_t1``.  That is what ``CacheConfig.prefill_kv_window`` guarantees,
+        and why the table can be shared: a per-row table would mean running
+        ``relative_k_proj`` per row, which at ``B = 32`` costs more than the layer.
+        """
+        q = self.attn.split_heads(self.q_proj(x))
+        k = self.attn.split_heads(self.k_proj(x))
+        v = self.attn.split_heads(self.v_proj(x))
+        t_q = q.size(2)
+        key_len = cache_t1 + t_q
+
+        # Write this chunk's K/V into the paged pool.  ``cache_t1`` rather than the
+        # ``cache_seqlens`` tensor: a prefilled window puts every stream at the same
+        # committed length, so the homogeneous fast path applies and the
+        # heterogeneous gather/scatter is not paid per layer per chunk.
+        cache.write_kv_chunk(k, v, offset=cache_t1)
+
+        rel_k = self.relative_k_proj(pos_emb)  # (1, 2L-1, C)
+        rel_k = rel_k.view(rel_k.size(0), -1, self.num_heads, self.head_dim)
+        matrix_bd = (q + self.bias_v.unsqueeze(1)) @ rel_k.permute(0, 2, 3, 1)
+        matrix_bd = rel_shift(matrix_bd)[..., :key_len] * self.scaling
+
+        bias = matrix_bd.masked_fill(attn_mask.logical_not(), MASK_FLOOR)
+        out = self.attn(
+            q + self.bias_u.unsqueeze(1),
+            cache.k_cache,
+            cache.v_cache,
+            attn_bias=bias,
+            kv_lens=cache.cache_seqlens + t_q,
+            block_table=cache.block_table,
+        )
+        projected: torch.Tensor = self.o_proj(self.attn.merge_heads(out))
+        return projected
+
 
 class NemotronEncoder(BaseEncoder):
-    """8x-subsampling FastConformer encoder (offline).
+    """8x-subsampling FastConformer encoder, offline **and** cache-aware streaming.
 
-    ``streaming_kind == "none"``: the checkpoint *is* a streaming model, but its
-    streaming state is a per-stage causal-conv cache on the **subsampling** stack
-    plus a sliding-window K/V cache, and the engine's paged backend models a K/V
-    cache plus a single per-layer CNN cache.  Declaring ``"none"`` makes the
-    engine refuse a streaming request at construction rather than serve one with
-    a silently reset front-end; see the note in ``.artifacts/kernel_coverage.md``.
+    Streaming carries four kinds of state across chunks, and each maps onto a
+    declared axis rather than a special case:
+
+    * the **subsampling** stack's per-stage causal-conv tails — three
+      :class:`~oasr.cache.StreamStateSpec` entries (:attr:`streaming_state_specs`);
+    * the convolution module's per-layer post-GLU tail — the engine's existing
+      ``"conv"`` slot cache, whose ``kernel_size - 1`` frames are exactly what this
+      encoder needs;
+    * attention K/V — the engine's paged pool, with the window **prefilled** at
+      admission because :attr:`fixed_attention_window` is a trained constant;
+    * the frame grid of the log-mel frontend — declared on the extractor
+      (:class:`~oasr.features.StreamingFraming`), not here.
+
+    One precondition ties them together and :meth:`streaming_geometry` enforces it:
+    the chunk must be a whole number of trained attention chunks *and* its feature
+    window a multiple of the subsampling factor.  Both are alignment conditions on
+    a strided grid, and violating either is silent — the transcript stays plausible
+    while the arithmetic stops matching the offline pass.
     """
 
     def __init__(self, config: NemotronEncoderConfig) -> None:
@@ -353,13 +471,77 @@ class NemotronEncoder(BaseEncoder):
     def conv_kernel_size(self) -> int:
         return self.config.conv_kernel_size
 
+    #: The engine's paged-KV + slot-state runtime serves this encoder.
+    supports_paged_streaming: bool = True
+
     @property
     def streaming_kind(self) -> str:
-        return "none"
+        return "paged"
+
+    @property
+    def n_kv_head(self) -> int:
+        return self.config.num_key_value_heads
+
+    @property
+    def head_dim(self) -> int:
+        return self.config.head_dim
 
     @property
     def subsampling_rate(self) -> int:
         return self.config.subsampling_factor
+
+    @property
+    def fixed_attention_window(self) -> int:
+        """Trained attention left-context in encoder frames.
+
+        Part of the mask, not a cache-sizing preference — which is why the engine
+        derives the retained window from it and pre-fills it (see
+        :class:`~oasr.models.base.CacheSpec`).
+        """
+        return self.config.sliding_window - 1
+
+    @property
+    def streaming_state_specs(self) -> Tuple[StreamStateSpec, ...]:
+        """Per-stage subsampling tails; the conv cache comes from ``conv_kernel_size``."""
+        return tuple(
+            self.subsampling.state_specs(
+                self.config.num_mel_bins, self.config.subsampling_conv_channels
+            )
+        )
+
+    def streaming_geometry(self, chunk_size: int) -> Tuple[int, int]:
+        """``(decoding_window, stride)`` in feature frames — equal, and validated.
+
+        The window equals the stride because the subsampling is *causal with a
+        cache*: a chunk of ``chunk_size`` encoder frames needs exactly
+        ``chunk_size * 8`` input frames and no lookahead, unlike a centred
+        subsampling front-end which needs a receptive field beyond its chunk.
+
+        Two alignment conditions are checked here rather than discovered later,
+        because both fail silently:
+
+        * ``chunk_size`` must be a whole number of **trained attention chunks**
+          (``num_lookahead_tokens + 1``).  The ``chunked_limited`` mask groups
+          *absolute* frame positions, so a query in the first half of a
+          misaligned step would need keys from the second half — frames that do
+          not exist yet.
+        * the resulting feature window must be a multiple of the **subsampling
+          factor**, so every stage's input length is a multiple of its stride and
+          the cached ``kernel - 1`` frames land on the stride grid (see
+          ``_CausalPad.stream_left``).
+        """
+        chunk = int(self.num_lookahead_tokens) + 1
+        if chunk_size <= 0 or chunk_size % chunk:
+            raise ValueError(
+                f"streaming chunk_size must be a positive multiple of "
+                f"{chunk} (num_lookahead_tokens + 1 = the trained attention chunk), "
+                f"got {chunk_size}. The chunked_limited mask groups absolute frame "
+                "positions, so a partial trained chunk would need keys from the "
+                "future. Use a multiple: "
+                f"{', '.join(str(chunk * m) for m in (1, 2, 4))}, ..."
+            )
+        window = chunk_size * self.subsampling_rate
+        return window, window
 
     def attention_context(self) -> Tuple[int, int]:
         """``(left, right)`` attention context in encoder frames."""
@@ -403,3 +585,103 @@ class NemotronEncoder(BaseEncoder):
         for layer in self.layers:
             hidden = layer(hidden, pos_emb, attn_mask, silent)
         return hidden, keep.unsqueeze(1)
+
+    # ------------------------------------------------------------------
+    # Streaming
+    # ------------------------------------------------------------------
+
+    def forward_chunk_paged(
+        self,
+        xs: torch.Tensor,
+        offset: Union[int, torch.Tensor],
+        att_caches: List["PagedKVCache"],
+        cnn_cache: "SlotTensor",
+        att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
+        cache_t1: int = -1,
+        states: Optional[Mapping[str, "SlotTensor"]] = None,
+    ) -> torch.Tensor:
+        """One streaming chunk → ``(B, chunk_size, hidden)``.
+
+        ``xs`` is ``(B, chunk_size * 8, n_mels)`` — a **full** window for every row,
+        which :meth:`streaming_geometry` is what guarantees.  ``offset`` is the
+        per-row count of encoder frames already produced (a device tensor, so the
+        whole forward is CUDA-graph capturable); ``cache_t1`` is the *constant*
+        number of cached K/V frames the prefilled window reports.
+        """
+        if states is None:
+            raise ValueError(
+                "Nemotron streaming needs its per-stage subsampling caches; the "
+                "backend passes them as `states` when the encoder declares "
+                "`streaming_state_specs` (a raise rather than an assert because "
+                "the failure mode without them is a silently reset front-end)"
+            )
+        if cache_t1 < 0:
+            raise ValueError(
+                "Nemotron streaming needs an explicit cache_t1 (the prefilled "
+                "window's constant cached-frame count)"
+            )
+        hidden = self.subsampling.forward_chunk(xs, states)
+        if self.input_scale != 1.0:
+            hidden = hidden * self.input_scale
+
+        t_q = hidden.size(1)
+        key_len = cache_t1 + t_q
+        offsets = (
+            offset
+            if isinstance(offset, torch.Tensor)
+            else torch.full((hidden.size(0),), int(offset), device=hidden.device)
+        )
+        attn_mask = self._streaming_mask(offsets, t_q, cache_t1)
+        pos_emb = relative_position_embedding(
+            key_len,
+            self.config.hidden_size,
+            hidden.device,
+            hidden.dtype,
+            inv_freq=cast(torch.Tensor, self.inv_freq),
+        )
+
+        conv_in = cnn_cache.gather()  # (L, B, lorder, C)
+        new_conv: List[torch.Tensor] = []
+        for i, layer in enumerate(self.layers):
+            hidden, new_tail = cast(NemotronEncoderLayer, layer).forward_chunk(
+                hidden, pos_emb, attn_mask, att_caches[i], conv_in[i], cache_t1
+            )
+            new_conv.append(new_tail)
+        cnn_cache.scatter(torch.stack(new_conv, dim=0))
+        return hidden
+
+    def _streaming_mask(self, offsets: torch.Tensor, t_q: int, cache_t1: int) -> torch.Tensor:
+        """``(B, 1, T_q, cache_t1 + T_q)`` bool mask for one streaming chunk.
+
+        Two conditions, both expressed against **absolute** frame positions so the
+        result is the same mask the offline pass builds over the whole utterance:
+
+        * ``chunked_limited``: query and key chunk indices come from
+          ``pos // (right_context + 1)``, and the difference must lie in
+          ``[0, left_context // chunk]``;
+        * ``k_abs >= 0``: the leading columns of a *young* stream's prefilled
+          window are zero-filled placeholders for history it does not have yet.
+          They are masked here rather than by ``cache_seqlens`` because the whole
+          point of prefilling is that the reported length is uniform.
+
+        Key column ``j`` sits at absolute ``offsets[b] - cache_t1 + j`` — the cached
+        region is right-aligned against the chunk, which is what makes the shared
+        relative-position table correct too.
+        """
+        device = offsets.device
+        left_context, right_context = self.attention_context()
+        chunk = right_context + 1
+        left_chunks = left_context // chunk if left_context >= 0 else cache_t1 + t_q
+
+        q_abs = offsets.view(-1, 1, 1) + torch.arange(t_q, device=device).view(1, -1, 1)
+        k_abs = (
+            offsets.view(-1, 1, 1)
+            - cache_t1
+            + torch.arange(cache_t1 + t_q, device=device).view(1, 1, -1)
+        )
+        diff = q_abs.div(chunk, rounding_mode="trunc") - k_abs.div(chunk, rounding_mode="trunc")
+        # ``k_abs >= 0`` has to be in the conjunction, not merely implied by it:
+        # ``trunc`` rounds a negative ``k_abs`` *toward zero*, so a prefill column at
+        # absolute -1 would land in chunk 0 and satisfy the window test.
+        keep = (k_abs >= 0) & (diff >= 0) & (diff <= left_chunks)
+        return keep.unsqueeze(1)

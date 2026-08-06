@@ -29,15 +29,22 @@ a mixed-length batch from feeding the encoder invented energy.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from oasr.cache.state import StreamStateSpec
 from oasr.layers import Conv2d, Conv2dActivation, Linear
 
 from .config import NemotronEncoderConfig
+
+if TYPE_CHECKING:
+    from oasr.cache.state import SlotTensor
+
+#: Prefix the per-stage streaming caches are declared and read back under.
+SUBSAMPLE_STATE = "subsample"
 
 
 def _mask_time(x: torch.Tensor, lengths: Optional[torch.Tensor]) -> torch.Tensor:
@@ -63,10 +70,40 @@ class _CausalPad:
         """Pad NHWC ``(B, T, F, C)``: ``F.pad`` counts dims from the last."""
         return F.pad(x, (0, 0, self.freq[0], self.freq[1], self.time[0], self.time[1]))
 
+    def apply_freq(self, x: torch.Tensor) -> torch.Tensor:
+        """Frequency padding only — the streaming path supplies time context itself."""
+        return F.pad(x, (0, 0, self.freq[0], self.freq[1]))
+
     def out_length(self, lengths: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if lengths is None:
             return None
         return (lengths + self.time[0] + self.time[1] - self.kernel) // self.stride + 1
+
+    # -- streaming ------------------------------------------------------------
+    @property
+    def stream_left(self) -> int:
+        """Cached input frames a streaming chunk needs on its left: ``kernel - 1``.
+
+        **Not** upstream's ``kernel - stride``.  With ``stride > 1`` the number of
+        already-seen frames the next output needs is
+        ``S - stride * n + kernel - 1`` where ``S`` is the frames seen so far and
+        ``n`` the outputs already produced; for ``S`` a multiple of ``stride`` —
+        which every chunk is, since the engine's window is a multiple of the total
+        subsampling factor — that is exactly ``kernel - 1``, with no first-chunk
+        special case.  Upstream keeps ``kernel - stride`` in steady state and adds
+        the missing ``stride - 1`` zeros to the *first* chunk only, which shifts
+        the stride grid from chunk two onward: measured against its own offline
+        pass at ``kernel 3 / stride 2``, chunk 1 matches bit-exactly and everything
+        after it diverges by ~3 absolute.  The rule here is bit-exact at every
+        chunk length that is a multiple of the stride (verified 2, 4, 8, 16, 32) and
+        wrong at every length that is not — which is what
+        :meth:`NemotronEncoder.streaming_geometry` enforces up front.
+        """
+        return self.kernel - 1
+
+    def stream_out_length(self, length: int) -> int:
+        """Output frames from ``length`` input frames plus :attr:`stream_left`."""
+        return (length + self.stream_left - self.kernel) // self.stride + 1
 
 
 class NemotronSubsampling(nn.Module):
@@ -106,6 +143,71 @@ class NemotronSubsampling(nn.Module):
         b, t, f, c = x.shape
         return self.linear(x.reshape(b, t, f * c)), lengths
 
+    # ------------------------------------------------------------------
+    # Streaming
+    # ------------------------------------------------------------------
+
+    def state_specs(self, num_mel_bins: int, channels: int) -> List[StreamStateSpec]:
+        """One :class:`StreamStateSpec` per stage: its last ``kernel - 1`` inputs.
+
+        Shapes are NHWC ``(kernel - 1, freq_bins, channels)`` and are declared
+        *pre*-frequency-padding — the freq pad is per-frame zeros on both edges, so
+        caching before it and re-padding on the way in is identical arithmetic over
+        a smaller buffer.  ``slot_axis = 0`` because there is no layer axis to sit
+        in front of: each stage owns its own tensor.
+        """
+        kernel = self._pad.kernel
+        stride = self._pad.stride
+        total_pad = (kernel - 1) + (stride - 1)
+        specs: List[StreamStateSpec] = []
+        bins, chans = num_mel_bins, 1
+        for i in range(len(self.layers) + 1):
+            specs.append(
+                StreamStateSpec(
+                    name=f"{SUBSAMPLE_STATE}.{i}",
+                    shape=(self._pad.stream_left, bins, chans),
+                    slot_axis=0,
+                )
+            )
+            bins = (bins + total_pad - kernel) // stride + 1
+            chans = channels
+        return specs
+
+    def forward_chunk(
+        self, features: torch.Tensor, states: Mapping[str, "SlotTensor"]
+    ) -> torch.Tensor:
+        """Streaming counterpart of :meth:`forward` — ``(B, T, n_mels)`` → ``(B, T/8, hidden)``.
+
+        Each stage prepends its cached tail instead of zero-padding the time axis,
+        then stores this chunk's last ``kernel - 1`` raw input frames.  There is no
+        right pad: the ``stride - 1`` frames an offline pass appends belong to the
+        end of the utterance, and in a stream they arrive with the next chunk.
+
+        No per-stage length masking either — every row of a streaming chunk is real
+        audio for its whole width, which is why the offline path needs the masks and
+        this one does not.
+        """
+        x = features.unsqueeze(-1)  # (B, T, F, 1) NHWC, no copy
+        x = self.conv_in(self._stage_input(x, states, 0))  # ReLU fused in the stem
+        for i, stage in enumerate(self.layers, start=1):
+            x = F.relu(stage(self._stage_input(x, states, i)))
+        b, t, f, c = x.shape
+        out: torch.Tensor = self.linear(x.reshape(b, t, f * c))
+        return out
+
+    def _stage_input(
+        self, x: torch.Tensor, states: Mapping[str, "SlotTensor"], stage: int
+    ) -> torch.Tensor:
+        """Prepend stage ``stage``'s cached tail, store the new one, pad frequency."""
+        view = states[f"{SUBSAMPLE_STATE}.{stage}"]
+        left = self._pad.stream_left
+        cached = view.gather().to(dtype=x.dtype)
+        padded = torch.cat([cached, x], dim=1)
+        # The new tail comes from the *concatenation*, so a chunk shorter than
+        # ``left`` carries part of the old cache forward rather than losing it.
+        view.scatter(padded[:, -left:].to(dtype=view.buffer.dtype))
+        return self._pad.apply_freq(padded)
+
     def flatten_order(self) -> Tuple[int, int]:
         """``(channels, freq_bins)`` of the pre-projection flatten.
 
@@ -138,4 +240,4 @@ class _SubsamplingStage(nn.Module):
         return out
 
 
-__all__: List[str] = ["NemotronSubsampling"]
+__all__: List[str] = ["SUBSAMPLE_STATE", "NemotronSubsampling"]

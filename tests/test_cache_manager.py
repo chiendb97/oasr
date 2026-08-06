@@ -994,3 +994,197 @@ class TestRecycleStreamingHistory:
             mgr.prepare_chunks_batched([0])
             mgr.commit_chunks_paged_batched([0], 4)
         assert len(mgr._streams[0].logical_blocks) == cfg.blocks_per_stream  # noqa: SLF001
+
+
+# ---------------------------------------------------------------------------
+# SlotStateCache — the generic form of the CNN cache
+# ---------------------------------------------------------------------------
+
+
+class TestSlotStateCache:
+    """The fixed-extent axis: declared shapes, one buffer each, slot-addressed.
+
+    ``CnnCacheManager`` is the single-spec instance of this and keeps its own
+    tests above; these cover what the generic form adds — several states at once,
+    a per-state ``slot_axis``, and the invariants a wrong declaration would break.
+    """
+
+    @staticmethod
+    def _cache(**kw):
+        from oasr.cache import SlotStateCache, StreamStateSpec
+
+        specs = kw.pop(
+            "specs",
+            [
+                StreamStateSpec("conv", (3, 2, 8), slot_axis=1),
+                StreamStateSpec("subsample.0", (2, 5, 1), slot_axis=0),
+            ],
+        )
+        return SlotStateCache(
+            specs, max_batch_size=kw.pop("max_batch_size", 4), device=CPU, dtype=torch.float32
+        )
+
+    def test_slot_axis_places_the_batch_axis_where_declared(self):
+        """This is what preserves the Conformer conv cache's ``(L, B, K-1, D)``
+        layout — and therefore its buffer address, which the graph captures."""
+        cache = self._cache()
+        assert tuple(cache.buffer_of("conv").shape) == (3, 4, 2, 8)
+        assert tuple(cache.buffer_of("subsample.0").shape) == (4, 2, 5, 1)
+
+    def test_views_gather_and_scatter_on_the_declared_axis(self):
+        cache = self._cache()
+        cache.allocate_stream(7, slot_id=1)
+        cache.allocate_stream(9, slot_id=3)
+        slots = torch.tensor([1, 3], dtype=torch.long)
+        views = cache.views(slots)
+        assert tuple(views["conv"].gather().shape) == (3, 2, 2, 8)
+        assert tuple(views["subsample.0"].gather().shape) == (2, 2, 5, 1)
+
+        views["subsample.0"].scatter(
+            torch.arange(2 * 2 * 5 * 1, dtype=torch.float32).view(2, 2, 5, 1)
+        )
+        got = views["subsample.0"].gather()
+        assert got[0, 0, 0, 0] == 0.0 and got[1, 0, 0, 0] == 10.0
+        # Slots outside the view are untouched.
+        assert cache.buffer_of("subsample.0")[0].abs().max() == 0
+        assert cache.buffer_of("subsample.0")[2].abs().max() == 0
+
+    def test_allocation_zeroes_the_slot_because_zero_is_the_initial_state(self):
+        """A zero left-context *is* the padding an offline pass applies, so a
+        stream's first chunk must see zeros rather than the previous tenant's."""
+        cache = self._cache()
+        cache.allocate_stream(1, slot_id=0)
+        cache.buffer_of("conv")[:, 0].fill_(5.0)
+        cache.free_stream(1)
+        cache.allocate_stream(2, slot_id=0)
+        assert cache.buffer_of("conv")[:, 0].abs().max() == 0
+
+    def test_an_empty_declaration_allocates_nothing(self):
+        cache = self._cache(specs=[])
+        assert cache.names == []
+        assert cache.nbytes_per_stream() == 0
+        cache.allocate_stream(1, slot_id=0)  # still tracks the slot
+
+    def test_duplicate_names_are_refused(self):
+        from oasr.cache import StreamStateSpec
+
+        with pytest.raises(ValueError, match="duplicate"):
+            self._cache(specs=[StreamStateSpec("a", (1,)), StreamStateSpec("a", (2,))])
+
+    def test_an_out_of_range_slot_axis_is_refused(self):
+        from oasr.cache import StreamStateSpec
+
+        with pytest.raises(ValueError, match="slot_axis"):
+            self._cache(specs=[StreamStateSpec("a", (2, 3), slot_axis=3)])
+
+    def test_unknown_state_names_say_what_is_declared(self):
+        cache = self._cache()
+        with pytest.raises(KeyError, match="subsample.0"):
+            cache.buffer_of("nope")
+
+    def test_slot_lifecycle_matches_the_other_managers(self):
+        cache = self._cache()
+        cache.allocate_stream(1, slot_id=0)
+        with pytest.raises(ValueError, match="already allocated"):
+            cache.allocate_stream(1, slot_id=1)
+        with pytest.raises(ValueError, match="already in use"):
+            cache.allocate_stream(2, slot_id=0)
+        with pytest.raises(ValueError, match="out of range"):
+            cache.allocate_stream(3, slot_id=99)
+        cache.free_stream(1)
+        with pytest.raises(KeyError):
+            cache.slot_of(1)
+
+    def test_the_cnn_manager_is_a_single_spec_instance_of_this(self):
+        """One implementation, not two: the historical accessors are a facade."""
+        from oasr.cache import SlotStateCache
+
+        mgr = CnnCacheManager(make_config(num_layers=2, kernel_size=3, hidden_dim=8))
+        assert isinstance(mgr, SlotStateCache)
+        assert mgr.names == ["conv"]
+        # ``.buffer`` must be the *same object* the generic accessor returns —
+        # the CUDA-graph cache captures it by address.
+        assert mgr.buffer is mgr.buffer_of("conv")
+
+
+# ---------------------------------------------------------------------------
+# Prefilled K/V window (a trained fixed attention span)
+# ---------------------------------------------------------------------------
+
+
+class TestPrefilledKvWindow:
+    """``prefill_kv_window``: the whole retained window, zeroed, at admission.
+
+    Its purpose is uniformity, not memory: a Transformer-XL relative-position
+    table's distances are ``cache_seqlens + i - j``, so one shared table is only
+    correct if the whole cohort reports the same cached length.
+    """
+
+    @staticmethod
+    def _cfg(**kw):
+        return make_config(
+            num_left_chunks=kw.pop("num_left_chunks", 4),
+            chunk_size=4,
+            block_size_frames=4,
+            max_num_blocks=64,
+            max_batch_size=4,
+            **kw,
+        )
+
+    def test_a_new_stream_reports_the_full_window_immediately(self):
+        cfg = self._cfg()
+        object.__setattr__(cfg, "prefill_kv_window", True)
+        pool = BlockPool(cfg)
+        mgr = AttentionCacheManager(pool, cfg)
+        mgr.allocate_stream(0, slot_id=0)
+        assert int(mgr.cache_seqlens[0]) == cfg.max_logical_blocks * cfg.block_size_frames
+
+    def test_cache_seqlens_is_the_same_constant_at_every_chunk(self):
+        """What the shared position table depends on, so it is asserted rather
+        than assumed: after ``prepare``, every stream is at the same length."""
+        cfg = self._cfg()
+        object.__setattr__(cfg, "prefill_kv_window", True)
+        mgr = AttentionCacheManager(BlockPool(cfg), cfg)
+        for sid in range(3):
+            mgr.allocate_stream(sid, slot_id=sid)
+        expected = cfg.prefilled_cache_frames
+        for _ in range(6):
+            mgr.prepare_chunks_batched([0, 1, 2])
+            assert [int(mgr.cache_seqlens[s]) for s in range(3)] == [expected] * 3
+            mgr.commit_chunks_paged_batched([0, 1, 2], cfg.chunk_size)
+
+    def test_a_young_stream_sees_zeros_not_the_previous_tenant(self):
+        """Masked either way, but "attends over zeros" should be *true*: a recycled
+        block otherwise opens the window on live K/V from another stream."""
+        cfg = self._cfg()
+        object.__setattr__(cfg, "prefill_kv_window", True)
+        pool = BlockPool(cfg)
+        mgr = AttentionCacheManager(pool, cfg)
+        mgr.allocate_stream(0, slot_id=0)
+        k, v = pool.get_kv_view(0)
+        blocks = mgr._streams[0].logical_blocks  # noqa: SLF001
+        for b in blocks:
+            k[b].fill_(7.0)
+        mgr.free_stream(0)
+        mgr.allocate_stream(1, slot_id=0)
+        for b in mgr._streams[1].logical_blocks:  # noqa: SLF001
+            assert k[b].abs().max() == 0
+
+    def test_unlimited_history_cannot_be_prefilled(self):
+        """There is no window to prefill, and silently ignoring the flag would
+        leave the position table wrong instead of the config invalid."""
+        with pytest.raises(ValueError, match="num_left_chunks"):
+            CacheConfig(
+                num_layers=2,
+                n_kv_head=2,
+                head_dim=8,
+                hidden_dim=16,
+                chunk_size=4,
+                num_left_chunks=-1,
+                block_size_frames=4,
+                max_num_blocks=64,
+                max_batch_size=2,
+                prefill_kv_window=True,
+                device=CPU,
+                dtype=torch.float32,
+            )

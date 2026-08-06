@@ -396,8 +396,21 @@ stride           = subsampling_rate * chunk_size              # frame advance
 required_cache_size = chunk_size * num_left_chunks            # dense mode
 ```
 
+That formula describes a **centred** subsampling front-end, which needs a
+receptive field beyond its chunk. An encoder whose front-end it does not describe
+overrides `BaseEncoder.streaming_geometry(chunk_size)` and returns its own
+`(decoding_window, stride)` — for a *cached causal* subsampling those are equal,
+because a chunk consumes exactly `chunk_size * subsampling_rate` frames with no
+lookahead. That hook is also where an encoder **refuses** a chunk size it cannot
+serve; the backend calls it once, at construction, so an unserviceable
+`chunk_size` fails there rather than drifting silently at request time.
+
 `build_cache_config(model_config)` derives a `CacheConfig` from the
-loaded encoder dimensions.
+loaded encoder dimensions — including, when the encoder declares a trained
+`fixed_attention_window`, the retained cache itself (see
+`docs/cache_manager.md` §10.2: how much history the model may attend to is part of
+its mask, not an operator preference, so `num_left_chunks` is ignored there and a
+warning says so).
 
 ## 7. Usage Examples
 

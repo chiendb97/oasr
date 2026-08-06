@@ -405,7 +405,76 @@ thread that performs the GPU forward calls into them.
    chunk is exactly one block, eviction matches chunk granularity, and
    the dense `commit` shape check trivially holds.
 
-## 10. Extension Points
+## 10. Two storage disciplines, and how to add a cache
+
+Every streaming cache here — and every one an encoder has needed so far — is one
+of exactly two things. Knowing which one you are adding is the whole design
+decision:
+
+| | extent | addressing | eviction | examples |
+|---|---|---|---|---|
+| **Fixed, slot-addressed** (`oasr/cache/state.py`) | known when the engine is built; never grows | one persistent tensor per declaration, with the stream's `slot_id` as one of its axes | none — overwritten in place each chunk | convolutional left-context, a subsampling stage's tail, per-layer recurrent state |
+| **Growing, block-addressed** (`attention_cache.py`, `decoder_kv.py`) | grows with the stream | shared `BlockPool` + per-stream block table | LRU shift / recycle | attention K/V, AR decoder K/V |
+
+`StreamSlotPool` is the shared *addressing* primitive for both: the paged
+manager's `block_table` and `cache_seqlens` rows are slot-indexed too.
+
+### 10.1 Adding a fixed-extent cache — declare it
+
+`CnnCacheManager` is the single-spec instance of `SlotStateCache`. To add more,
+an encoder declares them and reads them back by name; nothing in the cache layer
+or the engine changes:
+
+```python
+# on the encoder
+@property
+def streaming_state_specs(self):
+    return (
+        StreamStateSpec("subsample.0", (kernel - 1, freq_bins, channels), slot_axis=0),
+        ...
+    )
+
+# in its chunk forward
+def forward_chunk_paged(self, xs, offset, att_caches, cnn_cache, att_mask, cache_t1, states):
+    view = states["subsample.0"]
+    cached = view.gather()            # (B, kernel-1, F, C)
+    view.scatter(new_tail)            # in place, no per-chunk allocation
+```
+
+Two things carry consequences:
+
+- **`slot_axis` is per spec.** It is why the conv cache keeps its historical
+  `(layers, slots, frames, dim)` layout — and therefore its buffer *address*,
+  which `GraphedEncoderForward` captures by reference. It is also exactly the
+  per-kind batch dimension a Zipformer-style recurrent state needs, which today
+  lives as a hand-written `stack_streaming_states` / `unstack_streaming_states`
+  pair on the encoder rather than as data.
+- **Allocation zeroes the slot, and that is the initial *value*, not hygiene.**
+  A zero left-context is precisely the padding an offline pass applies, so a
+  stream's first chunk computes what an offline pass would.
+
+### 10.2 A trained fixed attention window — prefill it
+
+`CacheConfig.prefill_kv_window` hands a stream its whole retained K/V window,
+zeroed, at admission. This is for an encoder whose attention span is part of the
+trained mask (Nemotron's `sliding_window`) rather than "whatever history fits",
+and its purpose is **uniformity**: a Transformer-XL relative-position table's
+distances are `cache_seqlens + i - j`, so one table shared across a cohort is
+only correct when every stream reports the same cached length. A per-row table
+would mean running the positional projection per row, which at `B = 32` costs
+more than the encoder layer it feeds.
+
+Two things fall out for free, and one obligation:
+
+- `cache_t1` becomes constant, so `GraphedEncoderForward` captures **one** graph
+  per batch size instead of one per `(B, cache_t1 bucket)`;
+- the pool requirement is `max_batch_size * blocks_per_stream` from admission —
+  the invariant `CacheConfig.__post_init__` already enforces when eviction is on;
+- the blocks must be **zeroed**, not merely reserved. `oasr.fmha` gives a
+  past-the-length column zero softmax weight but still multiplies it into
+  `P @ V`, so a `NaN` there propagates where no mask can intercept it.
+
+### 10.3 Other extension points
 
 - **Custom stream identifiers.** Stream IDs are arbitrary integers — the
   engine assigns them monotonically, but external code can use any

@@ -154,6 +154,36 @@ class AttentionCacheManager:
         # Reset persistent rows for the new stream.
         self._block_table[slot_id].zero_()
         self._cache_seqlens[slot_id] = 0
+        if self._config.prefill_kv_window:
+            self._prefill_window(stream_id)
+
+    def _prefill_window(self, stream_id: int) -> None:
+        """Give a new stream its whole retained window up front, zero-filled.
+
+        For an encoder whose attention span is a trained constant
+        (``CacheConfig.prefill_kv_window``).  Without this a young stream reports a
+        shorter ``cache_seqlens`` than its peers, and a Transformer-XL
+        relative-position table's distances are ``cache_seqlens + i - j`` — so the
+        cohort would need one table per distinct cache length, which at ``B = 32``
+        costs more than the encoder layer it feeds.  Prefilling makes the length
+        uniform from chunk one, at the price of attending over zeros the encoder's
+        own bias masks out.
+
+        The blocks are **zeroed**, not merely reserved: ``oasr.fmha`` gives a
+        past-the-length column zero softmax weight but still multiplies it into
+        ``P @ V``, so a ``NaN`` there would propagate where no mask can intercept
+        it.  Finite stale data is inert; uninitialised memory is not.
+        """
+        state = self._get_state(stream_id)
+        blocks = self._config.max_logical_blocks
+        assert blocks is not None  # guaranteed by CacheConfig.__post_init__
+        block_ids = self._pool.allocate(blocks)
+        for logical_idx, block_id in enumerate(block_ids):
+            state.logical_blocks.append(block_id)
+            self._block_table[state.slot_id, logical_idx] = block_id
+        self._pool.zero_blocks(block_ids)
+        state.num_committed_frames = blocks * self._config.block_size_frames
+        self._cache_seqlens[state.slot_id] = state.num_committed_frames
 
     def free_stream(self, stream_id: int) -> None:
         """Release all physical blocks for a stream and remove it.

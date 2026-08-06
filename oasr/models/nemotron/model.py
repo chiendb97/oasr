@@ -5,16 +5,20 @@
 Engine integration: ``decode_type`` is ``"transducer"``, so the engine selects
 :class:`~oasr.engine.decode.TransducerDecodeStrategy`, which consumes raw encoder
 hidden states (``consumes="hidden"``) and drives ``model.decoder`` +
-``model.joiner`` frame-synchronously.  Offline only — see
-:class:`~oasr.models.nemotron.encoder.NemotronEncoder` for why
-``streaming_kind == "none"`` on a model whose name says streaming.
+``model.joiner`` frame-synchronously — offline **and** cache-aware streaming
+(``streaming_kind == "paged"``); see
+:class:`~oasr.models.nemotron.encoder.NemotronEncoder` for the four kinds of state
+a streaming chunk carries and the one alignment precondition that ties them
+together.
 
 Two things this model does that the icefall transducer does not:
 
-**The prompt fusion is part of encoding.**  ``encode_offline`` returns the
-encoder output *after* the language-prompt projector, because that is what the
-joint's encoder projection consumes.  The projector has no residual — its output
-replaces the hidden state — so it is not something a caller can opt out of.
+**The prompt fusion is part of encoding.**  ``encode_offline`` *and*
+``encode_chunk_paged`` return the encoder output **after** the language-prompt
+projector, because that is what the joint's encoder projection consumes.  The
+projector has no residual — its output replaces the hidden state — so it is not
+something a caller can opt out of, and the streaming path cannot inherit the base
+wrapper (which returns the raw encoder output).
 
 **The predictor is recurrent.**  ``model.decoder`` is a 2-layer LSTM exposing the
 :class:`~oasr.models.decoders.base.TransducerPredictor` protocol, and beam search
@@ -25,7 +29,7 @@ strategy refuses ``beam_size > 1`` at construction.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Mapping, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 
@@ -34,6 +38,10 @@ from .config import NemotronEncoderConfig, NemotronModelConfig
 from .encoder import NemotronEncoder
 from .predictor import NemotronPromptProjector, NemotronRnntJoint, NemotronRnntPredictor
 from .subsampling import NemotronSubsampling
+
+if TYPE_CHECKING:
+    from oasr.cache.paged_kv import PagedKVCache
+    from oasr.cache.state import SlotTensor
 
 logger = logging.getLogger(__name__)
 
@@ -154,12 +162,43 @@ class NemotronModel(BaseAsrModel):
         ``get_audio_features``).
         """
         hidden, masks = self.encoder(features, lengths)
-        if self.prompt_projector is not None:
-            prompt_ids = torch.full(
-                (hidden.size(0),), self.prompt_id, dtype=torch.long, device=hidden.device
-            )
-            hidden = self.prompt_projector(hidden, prompt_ids)
-        return hidden, self._lengths_from_mask(masks)
+        return self._fuse_prompt(hidden), self._lengths_from_mask(masks)
+
+    def encode_chunk_paged(
+        self,
+        input_features: torch.Tensor,
+        offset: Union[int, torch.Tensor],
+        att_caches: List["PagedKVCache"],
+        cnn_cache: "SlotTensor",
+        att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
+        cache_t1: int = -1,
+        states: Optional[Mapping[str, "SlotTensor"]] = None,
+    ) -> torch.Tensor:
+        """Streaming counterpart of :meth:`encode_offline` — prompt fused the same way.
+
+        Overridden rather than inherited because the base wrapper returns the raw
+        encoder output: the prompt projector is part of *this* model's encoder
+        representation, and leaving it out of the streaming path would hand the
+        joint a differently-conditioned hidden state than the offline path does.
+        """
+        hidden = self.encoder.forward_chunk_paged(
+            input_features, offset, att_caches, cnn_cache, att_mask, cache_t1, states
+        )
+        return self._fuse_prompt(hidden)
+
+    def _fuse_prompt(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Splice the language prompt onto every frame (upstream ``get_audio_features``).
+
+        The prompt projector runs here, not in the joint, because its output *is*
+        the encoder representation from the joint's point of view.
+        """
+        if self.prompt_projector is None:
+            return hidden
+        prompt_ids = torch.full(
+            (hidden.size(0),), self.prompt_id, dtype=torch.long, device=hidden.device
+        )
+        fused: torch.Tensor = self.prompt_projector(hidden, prompt_ids)
+        return fused
 
     # -- weights --------------------------------------------------------------
 

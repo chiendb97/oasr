@@ -55,6 +55,7 @@ from torch import nn
 if TYPE_CHECKING:
     from oasr.cache.paged_kv import PagedKVCache
     from oasr.cache.slot_cnn import SlotCnnCache
+    from oasr.cache.state import SlotTensor, StreamStateSpec
     from oasr.models.decoders import BaseDecoder
 
 # Streaming-cache model an encoder uses, read by the engine to select a
@@ -78,6 +79,21 @@ class CacheSpec:
     Replaces the engine reaching into Conformer-specific config fields.  An
     encoder with no convolutional left-context (e.g. a plain Transformer)
     reports ``conv_kernel_size == 1`` → zero CNN-cache frames.
+
+    ``stream_states`` is the general form of ``conv_kernel_size``: any *further*
+    fixed-extent per-stream tensor the encoder carries across chunks, declared
+    rather than special-cased.  Nemotron's three subsampling-stage tails arrive
+    this way; Conformer and Zipformer declare none and the axis costs them
+    nothing.  See ``oasr/cache/state.py`` for why the single hardcoded CNN cache
+    was not general enough.
+
+    ``fixed_attention_window`` says the encoder's attention span is a **trained
+    constant** rather than "as much history as fits" (Nemotron's
+    ``sliding_window``).  It lets the engine pre-fill the paged K/V window at
+    admission so every stream reports the same key length from its first chunk,
+    which is what makes one shared relative-position table — and one CUDA graph
+    per batch size — correct.  ``None`` keeps the grow-then-evict behaviour every
+    other encoder has.
     """
 
     num_layers: int
@@ -85,6 +101,8 @@ class CacheSpec:
     head_dim: int
     hidden_dim: int
     conv_kernel_size: int = 1
+    stream_states: Tuple["StreamStateSpec", ...] = ()
+    fixed_attention_window: Optional[int] = None
 
 
 @dataclass
@@ -391,14 +409,21 @@ class BaseEncoder(nn.Module, ABC):
         cnn_cache: "SlotCnnCache",
         att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
         cache_t1: int = -1,
+        states: Optional[Mapping[str, "SlotTensor"]] = None,
     ) -> torch.Tensor:
         """Streaming chunk forward (paged KV + slot CNN cache) → ``(B, chunk, D)``.
 
         Default: unsupported.  Only encoders whose streaming cache maps onto the
         engine's paged-KV + slot-CNN model implement this (``supports_paged_streaming
         = True``).  Other encoders expose their own streaming API.
+
+        ``states`` carries any further fixed-extent per-stream tensors the encoder
+        declared via :attr:`streaming_state_specs`, keyed by name.  ``cnn_cache``
+        stays positional and is ``states["conv"]`` — an encoder that needs only the
+        convolutional left-context can ignore ``states`` entirely, which is why
+        every existing signature is unchanged.
         """
-        del xs, offset, att_caches, cnn_cache, att_mask, cache_t1
+        del xs, offset, att_caches, cnn_cache, att_mask, cache_t1, states
         raise NotImplementedError(f"{type(self).__name__} does not support paged-KV streaming")
 
     def forward_packed(
@@ -454,6 +479,31 @@ class BaseEncoder(nn.Module, ABC):
         """Depthwise-conv kernel for streaming left-context; 1 == no CNN cache."""
         return 1
 
+    @property
+    def streaming_state_specs(self) -> Tuple["StreamStateSpec", ...]:
+        """Fixed-extent per-stream tensors beyond the convolutional left-context.
+
+        Declared here and allocated by the streaming backend as one persistent,
+        slot-addressed buffer each; the encoder reads them back from the ``states``
+        mapping its chunk forward receives.  Default ``()`` — an encoder whose only
+        cross-chunk state is K/V plus the conv cache declares nothing and pays
+        nothing.
+        """
+        return ()
+
+    @property
+    def fixed_attention_window(self) -> Optional[int]:
+        """Trained attention left-context in encoder frames, if it is a constant.
+
+        Returns the number of *past* frames a query may attend to when that span is
+        part of the trained mask rather than "whatever history fits" — Nemotron's
+        ``sliding_window - 1``.  The engine then pre-fills the paged K/V window at
+        admission so every stream reports the same key length from chunk one; see
+        :class:`CacheSpec`.  ``None`` (the default) keeps the grow-then-evict
+        behaviour.
+        """
+        return None
+
     # -- streaming spec (read by the engine to pick a StreamingEncoderBackend) --
     @property
     def streaming_kind(self) -> "StreamingKind":
@@ -480,6 +530,24 @@ class BaseEncoder(nn.Module, ABC):
     def right_context(self) -> int:
         """Extra future input frames the subsampling needs beyond one chunk."""
         return 0
+
+    def streaming_geometry(self, chunk_size: int) -> Optional[Tuple[int, int]]:
+        """``(decoding_window, stride)`` in **input** frames, or ``None`` to derive.
+
+        ``None`` (the default) lets the streaming backend use the generic formula
+        ``window = (chunk_size - 1) * subsampling_rate + right_context + 1``,
+        ``stride = subsampling_rate * chunk_size`` — a centred subsampling
+        front-end that needs a receptive field beyond its chunk.
+
+        Overriding it is for a front-end whose geometry that formula does not
+        describe: a *cached causal* subsampling consumes exactly
+        ``chunk_size * subsampling_rate`` frames with no lookahead, so window and
+        stride are equal.  This is also the natural place to **reject** a chunk
+        size the encoder cannot serve, since the backend calls it once at
+        construction.
+        """
+        del chunk_size
+        return None
 
     # -- stateful streaming (``streaming_kind == "stateful"`` encoders) --------
     def get_streaming_init_states(
@@ -526,6 +594,8 @@ class BaseEncoder(nn.Module, ABC):
             head_dim=self.head_dim,
             hidden_dim=self.output_size,
             conv_kernel_size=self.conv_kernel_size,
+            stream_states=tuple(self.streaming_state_specs),
+            fixed_attention_window=self.fixed_attention_window,
         )
 
 
@@ -669,10 +739,19 @@ class BaseAsrModel(nn.Module, ABC):
         cnn_cache: "SlotCnnCache",
         att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
         cache_t1: int = -1,
+        states: Optional[Mapping[str, "SlotTensor"]] = None,
     ) -> torch.Tensor:
         """Streaming chunk encode → encoder hidden ``(B, chunk, D)`` (no head)."""
+        if states is None:
+            # Forwarded only when there *is* extra state, so an encoder whose
+            # cross-chunk state is K/V plus the conv cache — every in-tree paged
+            # encoder but Nemotron, and any out-of-tree one written before this
+            # axis existed — is called with the signature it declares.
+            return self.encoder.forward_chunk_paged(
+                input_features, offset, att_caches, cnn_cache, att_mask, cache_t1
+            )
         return self.encoder.forward_chunk_paged(
-            input_features, offset, att_caches, cnn_cache, att_mask, cache_t1
+            input_features, offset, att_caches, cnn_cache, att_mask, cache_t1, states
         )
 
     # -- encoder + head fused (CTC fast path; CUDA-graph captured) -------------
@@ -698,9 +777,10 @@ class BaseAsrModel(nn.Module, ABC):
         cnn_cache: "SlotCnnCache",
         att_mask: torch.Tensor = torch.zeros((0, 0, 0)),
         cache_t1: int = -1,
+        states: Optional[Mapping[str, "SlotTensor"]] = None,
     ) -> torch.Tensor:
         """Streaming chunk forward → head output ``(B, chunk, V)``."""
         hidden = self.encode_chunk_paged(
-            input_features, offset, att_caches, cnn_cache, att_mask, cache_t1
+            input_features, offset, att_caches, cnn_cache, att_mask, cache_t1, states
         )
         return self.head(hidden)

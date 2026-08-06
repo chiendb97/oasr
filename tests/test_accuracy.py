@@ -93,19 +93,28 @@ def test_wer_has_not_regressed(spec, device):
     from oasr.engine import ASREngine, EngineConfig
 
     entries = load_manifest(_manifest_path(), audio_root)
+    # ``service_mode`` defaults to offline, which is what every entry recorded
+    # before streaming was gated.  An entry that names ``"streaming"`` measures the
+    # chunk-by-chunk path instead — the same manifest and the same denominator, so
+    # the two rates are directly comparable, which is the point: a streaming
+    # regression that a parity test cannot see (a cache that resets, a flush that
+    # truncates) shows up here as deletions.
+    mode = spec.get("service_mode", "offline")
     cfg_kwargs = {
         "ckpt_dir": ckpt,
-        "service_mode": "offline",
+        "service_mode": mode,
         "dtype": getattr(torch, spec["dtype"]),
         "max_batch_size": spec["max_batch_size"],
     }
     if spec["decode_method"]:
         cfg_kwargs["decode_method"] = spec["decode_method"]
+    if spec.get("chunk_size"):
+        cfg_kwargs["chunk_size"] = spec["chunk_size"]
 
     engine = ASREngine(EngineConfig(**cfg_kwargs))
     try:
         waves, _ = load_audio(entries, engine.sample_rate)
-        hyps, _ = transcribe(engine, waves, spec["max_batch_size"])
+        hyps, _ = transcribe(engine, waves, spec["max_batch_size"], streaming=mode == "streaming")
     finally:
         del engine
         torch.cuda.empty_cache()

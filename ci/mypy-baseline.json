@@ -3,7 +3,7 @@
   "paths": [
     "oasr"
   ],
-  "total": 444,
+  "total": 443,
   "files": {
     "oasr/attention.py": 7,
     "oasr/cache/decoder_kv.py": 3,
@@ -62,7 +62,6 @@
     "oasr/models/converter.py": 3,
     "oasr/models/decoders/transformer_decoder.py": 12,
     "oasr/models/heads/ctc.py": 1,
-    "oasr/models/nemotron/encoder.py": 1,
     "oasr/models/paraformer/convert.py": 3,
     "oasr/models/paraformer/encoder.py": 3,
     "oasr/models/paraformer/model.py": 4,
