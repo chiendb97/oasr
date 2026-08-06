@@ -7,21 +7,27 @@ TVM-FFI via int64 handles; the timing boundary is "GPU-resident log-probs -> wor
 (includes the end-of-batch D2H, host backtrack and word mapping) — the same boundary the
 original benchmark uses, so numbers are directly comparable.
 
-Assets default to the standalone ``wfst`` project's ``data/`` (a graph image + a log-prob
-dump).  Pass ``--compare-external`` to also time the external ``_wfst.so`` build in the
+Assets (a graph image + a log-prob dump) come from the standalone ``wfst`` project's
+``data/``: point ``$OASR_WFST_HOME`` at that checkout, or name ``--graph`` / ``--logprobs``
+directly.  Pass ``--compare-external`` to also time the external ``_wfst.so`` build in the
 same process for a direct A/B (perf parity check).  Exact per-lane output parity is checked
 separately by ``scripts/wfst_parity_check.py``.
 
 Examples::
 
     # in-tree only, sweep batch sizes
-    CUDA_VISIBLE_DEVICES=GPU-... python benchmarks/bench_wfst.py --batch 1 8 32
+    export OASR_WFST_HOME=/path/to/wfst
+    python benchmarks/bench_wfst.py --batch 1 8 32
+
+    # explicit assets, no env var
+    python benchmarks/bench_wfst.py --graph /path/to/hlg.img --logprobs /path/to/dump.pt
 
     # A/B vs the external wfst build (perf parity)
     python benchmarks/bench_wfst.py --batch 8 32 --compare-external
 """
 
 import argparse
+import os
 import statistics
 import sys
 import time
@@ -29,7 +35,15 @@ from pathlib import Path
 
 import torch
 
-DEFAULT_WFST_HOME = Path("/data01/kilm/users/chiendb/projects/wfst")
+#: Root of the external ``wfst`` checkout.  No baked-in default — the assets
+#: live outside this repo and their location is per-machine.
+WFST_HOME_ENV = "OASR_WFST_HOME"
+
+
+def _wfst_asset(*parts: str):
+    """Default path under ``$OASR_WFST_HOME``, or ``None`` when it is unset."""
+    home = os.environ.get(WFST_HOME_ENV)
+    return str(Path(home, *parts)) if home else None
 
 
 def load_dump(path: str):
@@ -201,9 +215,15 @@ def run_time(engine, gpu_batches, args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--graph", default=str(DEFAULT_WFST_HOME / "data/hlg/primary.img"))
     p.add_argument(
-        "--logprobs", default=str(DEFAULT_WFST_HOME / "data/logprobs/primary-ljs2000.pt")
+        "--graph",
+        default=_wfst_asset("data/hlg/primary.img"),
+        help=f"decoding graph image (default: ${WFST_HOME_ENV}/data/hlg/primary.img)",
+    )
+    p.add_argument(
+        "--logprobs",
+        default=_wfst_asset("data/logprobs/primary-ljs2000.pt"),
+        help=f"log-prob dump (default: ${WFST_HOME_ENV}/data/logprobs/primary-ljs2000.pt)",
     )
     p.add_argument("--batch", type=int, nargs="+", default=[1, 8, 32])
     p.add_argument("--search-beam", type=float, default=20.0)
@@ -219,9 +239,27 @@ def main():
         action="store_true",
         help="also time the external _wfst.so build (perf A/B)",
     )
-    p.add_argument("--wfst-home", default=str(DEFAULT_WFST_HOME))
+    p.add_argument(
+        "--wfst-home",
+        default=os.environ.get(WFST_HOME_ENV),
+        help=f"external wfst checkout, holding python/ (default: ${WFST_HOME_ENV}); "
+        "only needed with --compare-external",
+    )
     args = p.parse_args()
     args.max_batch = max(args.batch)
+
+    missing = [
+        flag
+        for flag, value in (("--graph", args.graph), ("--logprobs", args.logprobs))
+        if not value
+    ]
+    if args.compare_external and not args.wfst_home:
+        missing.append("--wfst-home")
+    if missing:
+        raise SystemExit(
+            f"missing {', '.join(missing)} — pass them, or set ${WFST_HOME_ENV} to the "
+            f"external wfst checkout so they default to its data/ layout"
+        )
 
     device = torch.device(args.device)
     torch.cuda.set_device(device)

@@ -27,15 +27,16 @@ Typical usage (paged-only)::
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
 from oasr.cache.attention_cache import AttentionCacheManager
-from oasr.cache.cnn_cache import CnnCacheManager
+from oasr.cache.cnn_cache import CONV_STATE
 from oasr.cache.ctc_state import CtcStateCacheManager
 from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.slot_cnn import SlotCnnCache
+from oasr.cache.state import SlotStateCache, SlotTensor
 from oasr.ctc_decode import GpuStreamingDecoder, StreamHandle, StreamState
 
 
@@ -53,8 +54,10 @@ class StreamContext:
         managers before constructing this object).
     attention_cache : AttentionCacheManager
         Shared paged attention KV cache manager.
-    cnn_cache : CnnCacheManager
-        Per-stream CNN cache manager.
+    cnn_cache : SlotStateCache
+        Slot-addressed fixed-extent stream state.  A :class:`CnnCacheManager` (the
+        single-spec form) or a multi-spec :class:`~oasr.cache.SlotStateCache` for
+        an encoder that declared more than the convolutional left-context.
     ctc_state : CtcStateCacheManager, optional
         Per-stream CTC decoder state manager.  Optional: the engine now owns
         CTC beam state inside the decode strategy (so it works for any encoder
@@ -78,7 +81,7 @@ class StreamContext:
         self,
         stream_id: int,
         attention_cache: AttentionCacheManager,
-        cnn_cache: CnnCacheManager,
+        cnn_cache: SlotStateCache,
         ctc_state: Optional[CtcStateCacheManager] = None,
     ) -> None:
         self._stream_id = stream_id
@@ -109,10 +112,21 @@ class StreamContext:
             tensor for this stream, matching the ``cnn_cache`` parameter of
             :meth:`~oasr.models.conformer.ConformerModel.forward_chunk_paged`.
         """
+        return self.get_states()[CONV_STATE]
+
+    def get_states(self) -> Dict[str, SlotTensor]:
+        """Slot-indexed descriptors for **every** declared stream state.
+
+        One entry per :class:`~oasr.cache.StreamStateSpec` the encoder declared,
+        keyed by name — ``"conv"`` for the convolutional left-context, plus
+        whatever else (Nemotron's per-subsampling-stage tails).  All of them share
+        one ``slot_ids`` tensor, so a chunk forward gathers and scatters each with
+        a single index.
+        """
         slot = self._cnn_cache.slot_of(self._stream_id)
-        buffer = self._cnn_cache.buffer
-        slot_ids = torch.tensor([slot], dtype=torch.long, device=buffer.device)
-        return SlotCnnCache(buffer=buffer, slot_ids=slot_ids)
+        device = self._cnn_cache.buffer_of(self._cnn_cache.names[0]).device
+        slot_ids = torch.tensor([slot], dtype=torch.long, device=device)
+        return self._cnn_cache.views(slot_ids)
 
     def get_decoder(self) -> Union[GpuStreamingDecoder, StreamHandle]:
         """Return the CTC streaming decoder for this stream.

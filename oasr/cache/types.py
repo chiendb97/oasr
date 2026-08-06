@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
+
+from oasr.cache.state import StreamStateSpec
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,36 @@ class CacheConfig:
     Measured on the WeNet conformer (4 streams, vs unlimited history): audio
     *inside* the retained window is bit-identical (0/4 transcripts differ,
     0.00% WER); audio past it decodes in full where unlimited truncates.
+    """
+    stream_states: Tuple[StreamStateSpec, ...] = ()
+    """Fixed-extent per-stream tensors **beyond** the convolutional left-context.
+
+    Declared by the encoder (``CacheSpec.stream_states``) and allocated as one
+    persistent slot-addressed buffer each; see :mod:`oasr.cache.state`.  Empty for
+    every encoder whose only cross-chunk state is K/V plus the conv cache.
+    """
+    prefill_kv_window: bool = False
+    """Allocate a stream's whole retained K/V window, zeroed, at admission.
+
+    For an encoder whose attention span is a **trained constant** rather than
+    "whatever history fits" (Nemotron's ``sliding_window``).  Three things follow,
+    and they are why this is a mode rather than an optimisation:
+
+    * every stream reports the **same** ``cache_seqlens`` from its first chunk, so
+      one shared relative-position table is correct for the whole cohort.  A
+      Transformer-XL table's distances are ``cache + i - j``, so a per-row
+      ``cache`` would need a per-row table — and ``relative_k_proj`` is per layer,
+      which at ``B = 32`` costs more than the encoder layer it serves;
+    * ``cache_t1`` is constant, so the CUDA-graph cache captures **one** graph per
+      batch size instead of one per ``(B, cache_t1 bucket)``;
+    * a young stream's leading key columns are zeros, which the encoder masks with
+      its additive bias.  They are *finite*, which is what
+      ``oasr.fmha``'s "v must be finite where the kernel can read" precondition
+      requires — hence zeroed, never ``empty``.
+
+    Requires ``num_left_chunks >= 0`` (a bounded window is the whole premise) and
+    costs the pool ``max_batch_size * blocks_per_stream`` blocks from admission,
+    which is the invariant :meth:`__post_init__` already enforces there.
     """
     block_size_frames: int = 16
     max_num_blocks: int = 1024
@@ -164,7 +196,29 @@ class CacheConfig:
         """Encoder frames one stream may accumulate at :attr:`blocks_per_stream`."""
         return self.blocks_per_stream * self.block_size_frames
 
+    @property
+    def prefilled_cache_frames(self) -> int:
+        """Constant ``cache_seqlens`` a prefilled window reports during a forward.
+
+        ``prepare_chunks_batched`` evicts to ``max_logical_blocks - 1`` before
+        allocating the chunk's block, so the *past* frames visible to the kernel
+        are exactly that many blocks' worth — and with the window prefilled, every
+        stream is there from its first chunk.
+        """
+        blocks = self.max_logical_blocks
+        if blocks is None:
+            raise ValueError(
+                "prefill_kv_window needs a bounded window (num_left_chunks >= 0); "
+                "with unlimited history there is no window to prefill"
+            )
+        return max(0, blocks - 1) * self.block_size_frames
+
     def __post_init__(self) -> None:
+        if self.prefill_kv_window and self.num_left_chunks < 0:
+            raise ValueError(
+                "prefill_kv_window requires num_left_chunks >= 0: the point is a "
+                "fixed, trained attention window, and unlimited history has none"
+            )
         # One block is allocated per encoder chunk (``prepare_chunks_batched``),
         # so a chunk that doesn't fit in a page would spill into the *next*
         # logical block — which ``PagedKVCache``'s two-block write path reads as

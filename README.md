@@ -27,19 +27,25 @@ OASR is fast with:
 OASR is flexible and easy to use with:
 
 - A single engine for both offline and streaming inference
-- Seamless integration with popular Hugging Face, WeNet, and Icefall models
-- Multiple decoders: CTC greedy, CTC prefix beam (CPU & GPU), and WFST beam search (CPU via k2 and an in-tree GPU decoder)
+- Seven architectures across five decode families — CTC, RNN-T, AED, NAR (CIF), and speech-LLM
+- Checkpoints load directly from Hugging Face, WeNet, icefall, and FunASR — no conversion step
+- Decoders: CTC greedy and prefix beam, GPU WFST beam search, transducer and AED greedy/beam, CTC+AED rescoring
 - A production Rust frontend with HTTP and gRPC APIs
 
 ## Supported Models
 
-| Model        | Status                          |
-|--------------|---------------------------------|
-| Conformer    | ✅ Available (offline + streaming) |
-| Zipformer    | ✅ Available (offline; streaming wired) |
-| Paraformer   | 🔲 Planned                       |
-| Branchformer | 🔲 Planned                       |
-| Transducer   | 🟡 Offline greedy RNNT (streaming/beam WIP) |
+| Architecture | Registry key   | Decode family                | Offline | Streaming | Source format |
+|--------------|----------------|------------------------------|---------|-----------|---------------|
+| Conformer (U2/U2++) | `conformer` | CTC (beam / WFST) + CTC/AED rescoring | ✅ | ✅ | WeNet |
+| Zipformer    | `zipformer`    | CTC (beam / WFST)            | ✅ | ✅ | icefall |
+| Transducer (RNN-T) | `transducer` | Transducer (greedy + beam) | ✅ | ✅ | icefall |
+| Nemotron ASR (FastConformer + RNN-T) | `nemotron` | Transducer | ✅ | ✅ | Hugging Face |
+| Whisper      | `whisper`      | AED (greedy + beam)          | ✅ | — | Hugging Face |
+| Paraformer   | `paraformer`   | NAR / CIF (with timestamps)  | ✅ | — | FunASR |
+| Qwen2-Audio (speech-LLM) | `speech_llm` | LLM (token-streaming partials) | ✅ | — | Hugging Face |
+
+See [`docs/architecture.md`](docs/architecture.md) for the decode-family matrix and how to register
+an architecture of your own.
 
 ---
 
@@ -48,7 +54,7 @@ OASR is flexible and easy to use with:
 ### Requirements
 
 - CUDA ≥ 11.8
-- Python ≥ 3.8
+- Python ≥ 3.10
 - CMake ≥ 3.18
 - NVIDIA GPU (SM70 or newer)
 - Rust toolchain + `protobuf-compiler`
@@ -63,9 +69,13 @@ pip install -e .
 CUDA_ARCHITECTURES="80;86;90" pip install -e .
 
 # Optional extras
-pip install -e ".[audio]"    # torchaudio, soundfile, librosa, kaldifeat
-pip install -e ".[serving]"  # serving client libs (used by bench_service.py)
-pip install -e ".[wfst]"     # k2, kaldilm (WFST decoder)
+pip install -e ".[all]"         # audio + hub + tokenizers + attention + serving
+pip install -e ".[audio]"       # torchaudio, soundfile, librosa, kaldifeat
+pip install -e ".[hub]"         # Hub download + native-checkpoint I/O
+pip install -e ".[tokenizers]"  # sentencepiece + tokenizers
+pip install -e ".[attention]"   # CuTeDSL fused attention (SDPA fallback without it)
+pip install -e ".[serving]"     # client libs for the benchmark scripts
+pip install -e ".[wfst]"        # k2 — offline WFST graph export only, never at decode time
 
 # Optional: standalone server binary at rust/target/release/oasr-server
 cd rust && cargo build --release
@@ -73,11 +83,38 @@ cd rust && cargo build --release
 
 ---
 
+## Checkpoints
+
+WeNet, icefall, FunASR, and Hugging Face checkpoints load as-is: the format is auto-detected, and the
+tokenizer, feature frontend, and decoding defaults travel with the checkpoint.
+
+| Source format | Architectures                          |
+|---------------|----------------------------------------|
+| Hugging Face  | `whisper`, `speech_llm`, `nemotron`    |
+| WeNet         | `conformer`                            |
+| icefall       | `zipformer`, `transducer`              |
+| FunASR        | `paraformer`                           |
+| OASR native   | any                                    |
+
+```python
+from oasr.engine import ASREngine, EngineConfig
+
+# A local directory in any supported format, or a Hugging Face Hub repo id
+engine = ASREngine(EngineConfig(ckpt_dir="openai/whisper-tiny", service_mode="offline"))
+```
+
+`oasr-convert <src> <dst>` materializes any supported directory as a native bundle
+(safetensors + tokenizer assets) that loads with no format conversion.
+
+See [`docs/checkpoints.md`](docs/checkpoints.md) for detection rules, the converter contract, and the
+native format.
+
+---
+
 ## Quick Start
 
-An engine instance is pinned to a single mode for its lifetime via `EngineConfig.service_mode` (`"streaming"` — the default — or `"offline"`); mismatched requests raise `ValueError`.
-
-The checkpoint directory should contain `final.pt`, `train.yaml`, `global_cmvn`, and optionally a tokenizer `.model` file plus `units.txt`.
+An engine is pinned to one mode for its lifetime by `EngineConfig.service_mode` — `"streaming"` (the
+default) or `"offline"`.
 
 ### Offline transcription
 
@@ -114,11 +151,14 @@ engine.feed_chunk(rid, last_chunk, is_last=True)
 final = engine.run()
 ```
 
+See [`docs/engine.md`](docs/engine.md) for the step loop, batching, and the full `EngineConfig`.
+
 ---
 
 ## Serving
 
-`oasr-server` runs one in-process `ASREngine` per process. `--service-mode` pins the engine to either `offline` (sync `Recognize`) or `streaming` (bidi `StreamingRecognize`) for its entire lifetime; the mismatched RPC returns `FAILED_PRECONDITION`. Scale horizontally by launching one process per GPU.
+`oasr-server` hosts one in-process `ASREngine` and serves it over HTTP and gRPC. Scale horizontally
+by launching one process per GPU.
 
 ```bash
 oasr-server \
@@ -143,7 +183,7 @@ REST is synchronous only — streaming clients must use the gRPC `StreamingRecog
 
 ### HTTP example
 
-Audio is carried inline as base64 in `audio.content`. Accepted `encoding` values: `LINEAR16` (16-bit PCM mono), `LINEAR32F` (32-bit float PCM mono), and `WAV`; other codecs return `UNIMPLEMENTED`.
+Audio is carried inline as base64 in `audio.content` (`WAV`, `LINEAR16`, or `LINEAR32F`).
 
 ```bash
 B64=$(base64 -w0 audio.wav)
@@ -156,12 +196,15 @@ curl -sS -X POST http://127.0.0.1:8080/v1/speech:recognize \
 
 ### gRPC streaming
 
-The first inbound message on `StreamingRecognize` must carry `streaming_config.config`; subsequent messages carry `audio_content` (raw PCM bytes). Each response contains a `StreamingRecognitionResult` with `is_final=true` on the terminal frame.
+The first inbound message carries `streaming_config.config`, the rest carry `audio_content` (raw PCM).
 
 ```bash
 grpcurl -plaintext -import-path rust/proto -proto oasr_speech_v1.proto \
         127.0.0.1:50051 oasr.speech.v1.Speech/StreamingRecognize
 ```
+
+See [`docs/serving.md`](docs/serving.md) for the full CLI, the wire format, per-request decoding
+options, and deployment.
 
 ---
 
@@ -170,6 +213,8 @@ grpcurl -plaintext -import-path rust/proto -proto oasr_speech_v1.proto \
 | Document                                             | Covers                                                |
 |------------------------------------------------------|-------------------------------------------------------|
 | [`docs/architecture.md`](docs/architecture.md)       | Engine extension points (the per-axis registries)     |
+| [`docs/checkpoints.md`](docs/checkpoints.md)         | Checkpoint resolution, converter contract, native format |
+| [`docs/tokenizers.md`](docs/tokenizers.md)           | Tokenizer axis: kinds and `TokenizerSpec`             |
 | [`docs/engine.md`](docs/engine.md)                   | Engine step loop, batching, CUDA Graph capture        |
 | [`docs/scheduler.md`](docs/scheduler.md)             | Request scheduling, starvation bounds, micro-batching |
 | [`docs/cache_manager.md`](docs/cache_manager.md)     | Paged streaming cache (`BlockPool`, `StreamContext`)  |

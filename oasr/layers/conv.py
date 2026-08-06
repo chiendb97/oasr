@@ -4,6 +4,26 @@
 
 These classes live under ``oasr.layers`` to mirror structures like
 `vllm.model_executor.layers` while providing a thin, torch.nn-like API.
+
+Like every other member of the waist, each class here owns **two** paths and
+picks per call via :func:`oasr.layers._backend.use_conv_kernel`: the OASR kernel
+on CUDA fp16/bf16, ``torch.nn.functional`` otherwise.  The torch path is what
+lets a convolutional front-end run under the fp32 CPU parity oracles — the
+evidence every model in this repo is verified with — and it is why the layouts
+below are translated rather than assumed:
+
+* :class:`Conv2d` is **NHWC** with a KRSC weight (what the CUTLASS implicit GEMM
+  wants), so the fallback permutes both into ``F.conv2d``'s NCHW/KCRS and back;
+* :class:`DepthwiseConv1d` is ``(B, T, C)`` with a ``(K, 1, C)`` weight, so the
+  fallback permutes into ``F.conv1d``'s ``(B, C, T)`` / ``(C, 1, K)``;
+* :class:`PointwiseConv1d` is a 1x1 convolution, i.e. a GEMM over the channel
+  axis, so the fallback is ``F.linear`` on the squeezed weight.
+
+``groups`` is accepted by :class:`Conv2d` and declared as the ``conv2d-groups``
+kernel gap: ``csrc/conv2d.cu`` has no ``groups`` parameter, so a grouped
+convolution has no kernel at all.  Taking it through the gap machinery is the
+point — a model that reached for ``nn.Conv2d(groups=...)`` instead would leave
+the gap invisible and uncounted (see ``.artifacts/kernel_coverage.md`` §0).
 """
 
 from __future__ import annotations
@@ -12,8 +32,23 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import oasr
+
+from ._backend import take_gap, use_conv_kernel
+
+#: Torch equivalent of each fused-epilogue activation id.  ``gelu`` maps to the
+#: **tanh** approximation because that is what the CUDA epilogue implements
+#: (``include/oasr/common/math.h``); using ``F.gelu``'s exact-erf default here
+#: would make the two paths of :class:`Conv2dActivation` disagree, which is the
+#: one thing this fallback must not do.
+_TORCH_CONV_ACTIVATION = {
+    "relu": F.relu,
+    "swish": F.silu,
+    "silu": F.silu,
+    "gelu": lambda x: F.gelu(x, approximate="tanh"),
+}
 
 
 class DepthwiseConv1d(nn.Module):
@@ -43,10 +78,25 @@ class DepthwiseConv1d(nn.Module):
             self.bias = nn.Parameter(torch.empty(channels, device=device, dtype=dtype))
             torch.nn.init.uniform_(self.bias, -bound, bound)
         else:
-            self.bias = None
+            # ``register_parameter``, not a plain ``None`` attribute:
+            # ``load_state_dict`` reports an unexpected key either way, but only
+            # the registered form keeps ``named_parameters()`` honest (pinned by
+            # ``tests/test_layer_waist.py::test_bias_free_layers_register_bias_as_none``).
+            self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return oasr.depthwise_conv1d(x, self.weight, self.bias, self.padding)
+        """``x: (B, T, C) -> (B, T + 2 * padding - K + 1, C)``."""
+        if use_conv_kernel(x):
+            return oasr.depthwise_conv1d(x, self.weight, self.bias, self.padding)
+        # (K, 1, C) -> (C, 1, K); (B, T, C) -> (B, C, T) and back.
+        out: torch.Tensor = F.conv1d(
+            x.transpose(1, 2),
+            self.weight.permute(2, 1, 0),
+            self.bias,
+            padding=self.padding,
+            groups=self.channels,
+        )
+        return out.transpose(1, 2).contiguous()
 
     def _load_from_state_dict(
         self,
@@ -103,6 +153,7 @@ class PointwiseConv1d(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.activation_name = activation_type
         self.activation = (
             None if activation_type is None else oasr.get_activation_type_id(activation_type)
         )
@@ -117,7 +168,7 @@ class PointwiseConv1d(nn.Module):
             self.bias = nn.Parameter(torch.empty(out_channels, device=device, dtype=dtype))
             torch.nn.init.uniform_(self.bias, -bound, bound)
         else:
-            self.bias = None
+            self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # weight: [out_channels, in_channels, 1] -> [out_channels, in_channels]
@@ -125,9 +176,17 @@ class PointwiseConv1d(nn.Module):
         # preserves the leading dimensions in the output, so no manual reshape
         # is needed here.  This also picks up GEMM autotuning automatically.
         weight = self.weight.squeeze(-1)
-        if self.activation is not None:
-            return oasr.gemm_activation(x, weight, self.bias, self.activation)
-        return oasr.gemm(x, weight, self.bias)
+        if not use_conv_kernel(x):
+            dense: torch.Tensor = F.linear(x, weight, self.bias)
+            if self.activation is None:
+                return dense
+            return _TORCH_CONV_ACTIVATION[str(self.activation_name)](dense)
+        fused: torch.Tensor = (
+            oasr.gemm_activation(x, weight, self.bias, self.activation)
+            if self.activation is not None
+            else oasr.gemm(x, weight, self.bias)
+        )
+        return fused
 
 
 class Conv2d(nn.Module):
@@ -135,13 +194,19 @@ class Conv2d(nn.Module):
 
     Tensors use NHWC layout throughout:
       - input  [N, H, W, in_channels]
-      - weight [out_channels, kernel_h, kernel_w, in_channels]  (KRSC)
+      - weight [out_channels, kernel_h, kernel_w, in_channels / groups]  (KRSC)
       - output [N, P, Q, out_channels]
 
     Alignment requirement (CUTLASS 128-bit loads):
       ``in_channels % 8 == 0``  and  ``out_channels % 8 == 0``.
 
-    Supports FP16 and BF16 dtypes.
+    Supports FP16 and BF16 dtypes on the kernel path; anything else takes
+    ``F.conv2d`` (see the module docstring).
+
+    ``groups > 1`` (including depthwise, ``groups == in_channels``) has **no
+    kernel** — ``csrc/conv2d.cu`` takes no ``groups`` argument — so it is
+    declared as the ``conv2d-groups`` gap and served by torch.  Expressing it
+    here rather than reaching for ``nn.Conv2d`` is what keeps the gap counted.
     """
 
     def __init__(
@@ -152,6 +217,7 @@ class Conv2d(nn.Module):
         padding: int | tuple[int, int] = 0,
         stride: int | tuple[int, int] = 1,
         dilation: int | tuple[int, int] = 1,
+        groups: int = 1,
         bias: bool = True,
         device=None,
         dtype=None,
@@ -165,6 +231,11 @@ class Conv2d(nn.Module):
         dilation_h, dilation_w = (
             (dilation, dilation) if isinstance(dilation, int) else tuple(dilation)
         )
+        if groups < 1 or in_channels % groups or out_channels % groups:
+            raise ValueError(
+                f"groups={groups} must divide in_channels={in_channels} and "
+                f"out_channels={out_channels}"
+            )
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -172,26 +243,64 @@ class Conv2d(nn.Module):
         self.padding = (pad_h, pad_w)
         self.stride = (stride_h, stride_w)
         self.dilation = (dilation_h, dilation_w)
+        self.groups = groups
 
-        # Weight stored as [K, R, S, IC] (KRSC) for NHWC implicit GEMM.
+        # Weight stored as [K, R, S, IC/groups] (KRSC) for NHWC implicit GEMM.
         self.weight = nn.Parameter(
-            torch.empty(out_channels, kernel_h, kernel_w, in_channels, device=device, dtype=dtype)
+            torch.empty(
+                out_channels,
+                kernel_h,
+                kernel_w,
+                in_channels // groups,
+                device=device,
+                dtype=dtype,
+            )
         )
-        # Kaiming uniform with fan_in = IC * R * S.
+        # Kaiming uniform with fan_in = IC/groups * R * S.
         # Viewing as [K, IC*R*S, 1] gives the correct fan_in to nn.init.
         nn.init.kaiming_uniform_(self.weight.view(out_channels, -1, 1), a=math.sqrt(5))
 
         if bias:
-            fan_in = in_channels * kernel_h * kernel_w
+            fan_in = (in_channels // groups) * kernel_h * kernel_w
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             self.bias = nn.Parameter(torch.empty(out_channels, device=device, dtype=dtype))
             nn.init.uniform_(self.bias, -bound, bound)
         else:
-            self.bias = None
+            self.register_parameter("bias", None)
+
+    def _use_kernel(self, x: torch.Tensor) -> bool:
+        # Out-of-scope first, gap second: on CPU or in fp32 there is no kernel to
+        # miss, so counting a *gap* there would inflate the debt with every run of
+        # the CPU suite.  A gap is only a gap on hardware and in a dtype the
+        # framework serves.
+        if not use_conv_kernel(x):
+            return False
+        if self.groups != 1:
+            return take_gap(
+                "conv2d-groups",
+                f"Conv2d({self.in_channels} -> {self.out_channels}, "
+                f"kernel={self.kernel_size}, groups={self.groups})",
+            )
+        return True
+
+    def _torch_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """NHWC/KRSC → ``F.conv2d``'s NCHW/KCRS and back."""
+        out: torch.Tensor = F.conv2d(
+            x.permute(0, 3, 1, 2),
+            self.weight.permute(0, 3, 1, 2),
+            self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+        return out.permute(0, 2, 3, 1).contiguous()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [N, H, W, in_channels] -> [N, P, Q, out_channels]."""
-        return oasr.conv2d(
+        if not self._use_kernel(x):
+            return self._torch_forward(x)
+        out: torch.Tensor = oasr.conv2d(
             x,
             self.weight,
             self.bias,
@@ -202,6 +311,7 @@ class Conv2d(nn.Module):
             self.dilation[0],
             self.dilation[1],
         )
+        return out
 
     def _load_from_state_dict(
         self,
@@ -215,8 +325,8 @@ class Conv2d(nn.Module):
     ):
         """Support loading standard PyTorch Conv2d weights.
 
-        PyTorch nn.Conv2d stores weights as [K, IC, R, S] (NCHW).
-        OASR Conv2d expects [K, R, S, IC] (NHWC), so permute on load.
+        PyTorch nn.Conv2d stores weights as [K, IC/groups, R, S] (NCHW).
+        OASR Conv2d expects [K, R, S, IC/groups] (NHWC), so permute on load.
         """
         weight_key = prefix + "weight"
         if weight_key in state_dict:
@@ -225,7 +335,7 @@ class Conv2d(nn.Module):
                 isinstance(w, torch.Tensor)
                 and w.ndim == 4
                 and w.shape[0] == self.out_channels
-                and w.shape[1] == self.in_channels
+                and w.shape[1] == self.in_channels // self.groups
                 and w.shape[2:] == self.kernel_size
             ):
                 # [K, IC, R, S] -> [K, R, S, IC]
@@ -241,13 +351,26 @@ class Conv2d(nn.Module):
             error_msgs,
         )
 
+    def extra_repr(self) -> str:
+        return (
+            f"{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, "
+            f"stride={self.stride}, padding={self.padding}, groups={self.groups}, "
+            f"bias={self.bias is not None}"
+        )
 
-class Conv2dActivation(nn.Module):
+
+class Conv2dActivation(Conv2d):
     """2D convolution with fused activation backed by CUTLASS Ampere Tensor Core.
 
     Computes ``output = activation(conv2d(input, weight) + bias)``.
-    Same NHWC layout and alignment requirements as :class:`Conv2d`.
+    Same NHWC layout, alignment requirements, ``groups`` handling and torch
+    fallback as :class:`Conv2d`, which it subclasses — the two used to carry
+    identical ``__init__`` and ``_load_from_state_dict`` bodies, and the layout
+    translation the fallback needs is worth having in exactly one place.
+
     Supported activations: ``"relu"``, ``"gelu"``, ``"swish"`` / ``"silu"``.
+    Note ``"gelu"`` is the **tanh** approximation on both paths, matching the
+    CUDA epilogue.
     """
 
     def __init__(
@@ -258,45 +381,37 @@ class Conv2dActivation(nn.Module):
         padding: int | tuple[int, int] = 0,
         stride: int | tuple[int, int] = 1,
         dilation: int | tuple[int, int] = 1,
+        groups: int = 1,
         bias: bool = True,
         activation_type: str = "swish",
         device=None,
         dtype=None,
     ):
-        super().__init__()
-        kernel_h, kernel_w = (
-            (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            stride=stride,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+            device=device,
+            dtype=dtype,
         )
-        pad_h, pad_w = (padding, padding) if isinstance(padding, int) else tuple(padding)
-        stride_h, stride_w = (stride, stride) if isinstance(stride, int) else tuple(stride)
-        dilation_h, dilation_w = (
-            (dilation, dilation) if isinstance(dilation, int) else tuple(dilation)
-        )
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = (kernel_h, kernel_w)
-        self.padding = (pad_h, pad_w)
-        self.stride = (stride_h, stride_w)
-        self.dilation = (dilation_h, dilation_w)
+        if activation_type not in _TORCH_CONV_ACTIVATION:
+            raise ValueError(
+                f"activation_type={activation_type!r} has no torch counterpart; "
+                f"expected one of {sorted(_TORCH_CONV_ACTIVATION)}"
+            )
+        self.activation_name = activation_type
         self.activation = oasr.get_activation_type_id(activation_type)
-
-        self.weight = nn.Parameter(
-            torch.empty(out_channels, kernel_h, kernel_w, in_channels, device=device, dtype=dtype)
-        )
-        nn.init.kaiming_uniform_(self.weight.view(out_channels, -1, 1), a=math.sqrt(5))
-
-        if bias:
-            fan_in = in_channels * kernel_h * kernel_w
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            self.bias = nn.Parameter(torch.empty(out_channels, device=device, dtype=dtype))
-            nn.init.uniform_(self.bias, -bound, bound)
-        else:
-            self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [N, H, W, in_channels] -> [N, P, Q, out_channels]."""
-        return oasr.conv2d_activation(
+        if not self._use_kernel(x):
+            return _TORCH_CONV_ACTIVATION[self.activation_name](self._torch_forward(x))
+        out: torch.Tensor = oasr.conv2d_activation(
             x,
             self.weight,
             self.bias,
@@ -308,39 +423,26 @@ class Conv2dActivation(nn.Module):
             self.dilation[0],
             self.dilation[1],
         )
+        return out
 
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        """Support loading standard PyTorch Conv2d weights ([K, IC, R, S] -> [K, R, S, IC])."""
-        weight_key = prefix + "weight"
-        if weight_key in state_dict:
-            w = state_dict[weight_key]
-            if (
-                isinstance(w, torch.Tensor)
-                and w.ndim == 4
-                and w.shape[0] == self.out_channels
-                and w.shape[1] == self.in_channels
-                and w.shape[2:] == self.kernel_size
-            ):
-                state_dict[weight_key] = w.permute(0, 2, 3, 1).contiguous()
-
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
+    def extra_repr(self) -> str:
+        return f"{super().extra_repr()}, activation={self.activation_name}"
 
 
-__all__ = ["DepthwiseConv1d", "PointwiseConv1d", "Conv2d", "Conv2dActivation"]
+class Glu(nn.Module):
+    """Gated linear unit over the last dimension: ``x[..., :C] * sigmoid(x[..., C:])``.
+
+    Carries no parameters — it exists so a model can reach the ``oasr.glu``
+    kernel *and* still run on CPU/fp32 without the call site re-deriving the
+    backend decision.  ``F.glu(x, dim=-1)`` is the same function; the Conformer
+    convolution module calls ``oasr.glu`` directly and predates this.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if use_conv_kernel(x):
+            gated: torch.Tensor = oasr.glu(x)
+            return gated
+        return F.glu(x, dim=-1)
+
+
+__all__ = ["DepthwiseConv1d", "Glu", "PointwiseConv1d", "Conv2d", "Conv2dActivation"]

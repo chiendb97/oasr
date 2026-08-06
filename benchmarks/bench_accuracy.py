@@ -32,6 +32,11 @@ Examples
         --decode-method ctc ctc_aed_rescoring --dtype float16 float32 \\
         --output-path accuracy.csv
 
+    # Offline vs. streaming on one table, and the chunk-size trade within streaming
+    python benchmarks/bench_accuracy.py --ckpt-dir $CKPT_DIR \\
+        --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $AUDIO_DIR \\
+        --service-mode offline streaming --chunk-size 8 16 32
+
     # CER for a Chinese model
     python benchmarks/bench_accuracy.py --ckpt-dir $OASR_PARAFORMER_CKPT \\
         --manifest my_zh.jsonl --audio-root /data/zh --metric cer --normalizer basic
@@ -65,6 +70,8 @@ CSV_COLUMNS = [
     "manifest",
     "ckpt",
     "decode_method",
+    "service_mode",
+    "chunk_size",
     "dtype",
     "max_batch_size",
     "metric",
@@ -89,6 +96,8 @@ class Row:
     manifest: str
     ckpt: str
     decode_method: str
+    service_mode: str
+    chunk_size: int
     dtype: str
     max_batch_size: int
     metric: str
@@ -239,6 +248,8 @@ def run_one(
     *,
     ckpt_dir: str,
     decode_method: Optional[str],
+    service_mode: str,
+    chunk_size: Optional[int],
     dtype: str,
     max_batch_size: int,
     metric: str,
@@ -253,20 +264,30 @@ def run_one(
     torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[
         dtype
     ]
+    streaming = service_mode == "streaming"
     cfg_kwargs = {
         "ckpt_dir": ckpt_dir,
-        "service_mode": "offline",
+        "service_mode": service_mode,
         "dtype": torch_dtype,
         "max_batch_size": max_batch_size,
     }
     if decode_method:
         cfg_kwargs["decode_method"] = decode_method
-    engine = ASREngine(EngineConfig(**cfg_kwargs))
+    # Only forward a chunk size when asked for one: the engine's default is
+    # model-aware, and an encoder that cannot serve a given chunk refuses it at
+    # construction rather than decoding something subtly wrong.
+    if streaming and chunk_size:
+        cfg_kwargs["chunk_size"] = chunk_size
+    cfg = EngineConfig(**cfg_kwargs)
+    engine = ASREngine(cfg)
+    # Report the chunk actually run, not the flag: 0 on the CLI means "whatever
+    # the model defaults to", and a table that says 0 explains nothing.
+    effective_chunk = int(cfg.chunk_size) if streaming else 0
 
     try:
         waves, audio_seconds = load_audio(entries, engine.sample_rate)
         t0 = time.perf_counter()
-        hyps, per_utt_ms = transcribe(engine, waves, max_batch_size)
+        hyps, per_utt_ms = transcribe(engine, waves, max_batch_size, streaming=streaming)
         wall = time.perf_counter() - t0
     finally:
         del engine
@@ -297,6 +318,8 @@ def run_one(
         manifest=manifest_name,
         ckpt=Path(ckpt_dir).name,
         decode_method=decode_method or "(model default)",
+        service_mode=service_mode,
+        chunk_size=effective_chunk,
         dtype=dtype,
         max_batch_size=max_batch_size,
         metric=metric,
@@ -354,6 +377,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=[""],
         metavar="M",
         help="One row per method (e.g. ctc ctc_aed_rescoring); default: the model's",
+    )
+    p.add_argument(
+        "--service-mode",
+        nargs="+",
+        default=["offline"],
+        choices=["offline", "streaming"],
+        metavar="M",
+        help="One row per mode. `streaming` feeds each utterance chunk by chunk "
+        "through the streaming runtime instead of one padded offline forward — "
+        "same manifest and same denominator, so the two rates are directly "
+        "comparable. A model whose encoder declares no streaming support fails "
+        "this row at engine construction and the sweep carries on.",
+    )
+    p.add_argument(
+        "--chunk-size",
+        nargs="+",
+        type=int,
+        default=[0],
+        metavar="N",
+        help="Encoder chunk size (frames) for --service-mode streaming; 0 keeps "
+        "the model's default. Only expanded into rows when streaming is in the "
+        "sweep, so an offline run is not multiplied by an axis it ignores.",
     )
     p.add_argument(
         "--dtype",
@@ -424,37 +469,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rows: List[Row] = []
     failures: List[str] = []
     for method in args.decode_method:
-        for dtype in args.dtype:
-            for bs in args.max_batch_size:
-                label = f"{method or 'default'}/{dtype}/bs{bs}"
-                print(f"[INFO] running {label} ...", flush=True)
-                try:
-                    row = run_one(
-                        entries,
-                        ckpt_dir=args.ckpt_dir,
-                        decode_method=method or None,
-                        dtype=dtype,
-                        max_batch_size=bs,
-                        metric=args.metric,
-                        normalizer_kind=norm_kind,
-                        manifest_name=manifest.name,
-                        save_transcripts=(
-                            Path(args.save_transcripts) if args.save_transcripts else None
-                        ),
+        # An offline row ignores the chunk size, so folding it into the product
+        # would report the same measurement N times under different labels.
+        for mode, chunk in [
+            (m, c)
+            for m in args.service_mode
+            for c in (args.chunk_size if m == "streaming" else [0])
+        ]:
+            for dtype in args.dtype:
+                for bs in args.max_batch_size:
+                    tag = mode if mode == "offline" else f"{mode}{chunk or ''}"
+                    label = f"{method or 'default'}/{tag}/{dtype}/bs{bs}"
+                    print(f"[INFO] running {label} ...", flush=True)
+                    try:
+                        row = run_one(
+                            entries,
+                            ckpt_dir=args.ckpt_dir,
+                            decode_method=method or None,
+                            service_mode=mode,
+                            chunk_size=chunk or None,
+                            dtype=dtype,
+                            max_batch_size=bs,
+                            metric=args.metric,
+                            normalizer_kind=norm_kind,
+                            manifest_name=manifest.name,
+                            save_transcripts=(
+                                Path(args.save_transcripts) if args.save_transcripts else None
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001 — a sweep must not lose earlier rows
+                        # Not every configuration is supported by every model — the
+                        # conformer's conv2d is fp16/bf16 only, for instance, and an
+                        # offline-only encoder refuses `--service-mode streaming`.
+                        # Report it and carry on rather than discarding rows already
+                        # measured, which is the point of running a sweep at all.
+                        msg = f"{label}: {type(exc).__name__}: {exc}".splitlines()[0]
+                        print(f"       FAILED — {msg}", flush=True)
+                        failures.append(msg)
+                        continue
+                    rows.append(row)
+                    print(
+                        f"       {row.result.summary()}  RTFx {row.rtfx}  "
+                        f"p50 {row.latency_p50_ms} ms"
                     )
-                except Exception as exc:  # noqa: BLE001 — a sweep must not lose earlier rows
-                    # Not every configuration is supported by every model — the
-                    # conformer's conv2d is fp16/bf16 only, for instance.  Report
-                    # it and carry on rather than discarding rows already
-                    # measured, which is the point of running a sweep at all.
-                    msg = f"{label}: {type(exc).__name__}: {exc}".splitlines()[0]
-                    print(f"       FAILED — {msg}", flush=True)
-                    failures.append(msg)
-                    continue
-                rows.append(row)
-                print(
-                    f"       {row.result.summary()}  RTFx {row.rtfx}  p50 {row.latency_p50_ms} ms"
-                )
 
     _print_table(rows)
 
@@ -481,13 +538,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 def _print_table(rows: Sequence[Row]) -> None:
-    hdr = f"{'config':<34} {'metric':>7} {'rate %':>8} {'RTFx':>8} {'p50 ms':>8} {'p99 ms':>8}"
+    hdr = f"{'config':<44} {'metric':>7} {'rate %':>8} {'RTFx':>8} {'p50 ms':>8} {'p99 ms':>8}"
     print("\n" + hdr)
     print("-" * len(hdr))
     for r in rows:
-        cfg = f"{r.decode_method}/{r.dtype}/bs{r.max_batch_size}"
+        mode = r.service_mode if r.service_mode == "offline" else f"streaming{r.chunk_size}"
+        cfg = f"{r.decode_method}/{mode}/{r.dtype}/bs{r.max_batch_size}"
         print(
-            f"{cfg:<34} {r.metric:>7} {r.error_rate_pct:>8.2f} "
+            f"{cfg:<44} {r.metric:>7} {r.error_rate_pct:>8.2f} "
             f"{r.rtfx:>8.1f} {r.latency_p50_ms:>8.1f} {r.latency_p99_ms:>8.1f}"
         )
     print()

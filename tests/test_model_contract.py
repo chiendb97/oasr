@@ -325,7 +325,11 @@ class TestRequireCapability:
         assert "decoder.init_state" in missing_members(model, "transducer")
 
     def test_satisfied_surface_passes(self):
-        decoder = SimpleNamespace(init_state=lambda *a: None)
+        decoder = SimpleNamespace(
+            init_state=lambda *a: None,
+            predict=lambda *a: None,
+            advance=lambda *a: None,
+        )
         joiner = SimpleNamespace(encoder_proj=lambda *a: None, decoder_proj=lambda *a: None)
         model = SimpleNamespace(
             encode_offline=lambda *a: None, blank_id=0, decoder=decoder, joiner=joiner

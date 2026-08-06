@@ -23,6 +23,20 @@ This module makes that visible and, on demand, fatal:
 
 Add an asset by adding an :class:`Asset` to :data:`ASSETS`; nothing else needs
 to change.
+
+Where the paths come from
+-------------------------
+No machine-specific path is baked into the checkout.  An asset resolves from
+its own env var (``CKPT_DIR``, ``WHISPER_CKPT``, ...), which is what CI sets.
+For a box that keeps everything under one tree, ``$OASR_ASSET_ROOT`` plus the
+per-asset :attr:`Asset.relpath` resolves the whole set from a single variable::
+
+    export OASR_ASSET_ROOT=/srv/asr-assets   # holds u2pp_conformer/, wavs/, ...
+
+That reference layout is the one ``ci/modal_app.py`` seeds into the CI Volume,
+so the same tree uploads without renaming.  :attr:`Asset.default` is reserved
+for assets that are *not* machine-specific — upstream source trees a test
+docstring tells you to check out to a fixed place.
 """
 
 from __future__ import annotations
@@ -40,6 +54,9 @@ AUDIO = "audio"  # wav files to transcribe
 REFERENCE = "reference"  # an upstream implementation or a captured oracle
 GRAPH = "graph"  # a decoding graph (HLG / lang dir)
 
+#: Optional single root holding the reference layout of every asset below.
+ROOT_ENV = "OASR_ASSET_ROOT"
+
 
 @dataclass(frozen=True)
 class Asset:
@@ -48,7 +65,14 @@ class Asset:
     env: str
     kind: str
     what: str
-    default: str
+    #: Slot under ``$OASR_ASSET_ROOT`` in the reference layout — the same
+    #: layout ``ci/modal_app.py`` seeds.  Empty means the asset has no
+    #: root-relative slot and must be named by its own env var.
+    relpath: str = ""
+    #: Absolute fallback, for assets that are not machine-specific (an upstream
+    #: source tree a test docstring pins to a fixed path).  Never a model or a
+    #: corpus: those differ per box and belong behind the env var.
+    default: str = ""
     #: Relative path under the root that must exist for the asset to count as
     #: present.  Empty means "the root itself is enough".
     marker: str = ""
@@ -59,12 +83,19 @@ class Asset:
     how: str = ""
 
     def declared(self) -> str:
-        """Path the suite *would* use — env var if set, else the default.
+        """Path the suite *would* use: env var, then ``$OASR_ASSET_ROOT``, then default.
 
+        Empty when none of the three applies — the asset is simply unset.
         Does not consult :data:`_DERIVED_DEFAULTS`; use the module-level
         :func:`declared` for that.
         """
-        return os.environ.get(self.env) or self.default
+        explicit = os.environ.get(self.env)
+        if explicit:
+            return explicit
+        root = os.environ.get(ROOT_ENV)
+        if root and self.relpath:
+            return str(Path(root) / self.relpath)
+        return self.default
 
 
 def _has_nonempty_pt(root: Path) -> bool:
@@ -81,7 +112,7 @@ _ASSET_LIST: List[Asset] = [
         env="CKPT_DIR",
         kind=CHECKPOINT,
         what="WeNet U2++ conformer checkpoint dir (train.yaml + final.pt)",
-        default="/data01/kilm/users/chiendb/models/asr/am/20210610_u2pp_conformer_exp_librispeech",
+        relpath="u2pp_conformer",
         marker="final.pt",
         how="a WeNet release dir; also settable with --ckpt-dir",
     ),
@@ -89,7 +120,7 @@ _ASSET_LIST: List[Asset] = [
         env="WAV_DIR",
         kind=AUDIO,
         what="directory of 16 kHz .wav files for engine/E2E tests",
-        default="/data01/kilm/users/chiendb/data/asr/ljspeech-sr16k-dataset/wavs",
+        relpath="wavs",
         probe=_has_wavs,
         how="any dir of .wav files; also settable with --wav-dir",
     ),
@@ -97,17 +128,13 @@ _ASSET_LIST: List[Asset] = [
         env="AUDIO_PATH",
         kind=AUDIO,
         what="a single .wav file for the CPU decoder integration tests",
-        default="",
         how="export AUDIO_PATH=$(ls $WAV_DIR/*.wav | head -1); also --audio-path",
     ),
     Asset(
         env="ZIPFORMER_CKPT",
         kind=CHECKPOINT,
         what="icefall Zipformer CTC release",
-        default=(
-            "/data01/kilm/users/chiendb/models/asr/"
-            "icefall-asr-librispeech-zipformer-large-cr-ctc-20241018"
-        ),
+        relpath="zipformer_ctc",
         probe=_has_nonempty_pt,
         how="huggingface.co/k2-fsa icefall-asr-librispeech-zipformer-*",
     ),
@@ -115,7 +142,7 @@ _ASSET_LIST: List[Asset] = [
         env="WHISPER_CKPT",
         kind=CHECKPOINT,
         what="HF-format Whisper checkpoint",
-        default="/data01/kilm/users/chiendb/models/asr/whisper-tiny",
+        relpath="whisper_tiny",
         marker="model.safetensors",
         how="huggingface.co/openai/whisper-tiny",
     ),
@@ -123,7 +150,7 @@ _ASSET_LIST: List[Asset] = [
         env="OASR_PARAFORMER_CKPT",
         kind=CHECKPOINT,
         what="FunASR Paraformer checkpoint",
-        default="/data01/kilm/users/chiendb/models/asr/paraformer-zh",
+        relpath="paraformer_zh",
         marker="model.pt",
         how="modelscope / huggingface funasr paraformer-zh",
     ),
@@ -131,7 +158,7 @@ _ASSET_LIST: List[Asset] = [
         env="SPEECH_LLM_TINY",
         kind=CHECKPOINT,
         what="tiny random Qwen2-Audio fixture (fp32 parity oracle)",
-        default="/data01/kilm/users/chiendb/models/asr/qwen2-audio-tiny-random",
+        relpath="qwen2_audio_tiny",
         marker="model.safetensors",
         how="generated fixture — see tests/test_speech_llm.py",
     ),
@@ -139,25 +166,29 @@ _ASSET_LIST: List[Asset] = [
         env="SPEECH_LLM_CKPT",
         kind=CHECKPOINT,
         what="real Qwen2-Audio-7B snapshot",
-        default="/data01/kilm/users/chiendb/models/asr/qwen2-audio-7b-instruct",
+        relpath="qwen2_audio_7b",
         marker="model.safetensors.index.json",
         how="huggingface.co/Qwen/Qwen2-Audio-7B-Instruct",
+    ),
+    Asset(
+        env="NEMOTRON_CKPT",
+        kind=CHECKPOINT,
+        what="HF-format Nemotron ASR (FastConformer + RNN-T) checkpoint",
+        relpath="nemotron_asr_streaming_0.6b",
+        marker="model.safetensors",
+        how="huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b",
     ),
     Asset(
         env="LANG_DIR",
         kind=GRAPH,
         what="prebuilt lang dir (HLG.pt + words.txt) for the CPU WFST decoder",
-        default="",
         how="k2 lang_bpe dir; also settable with --lang-dir",
     ),
     Asset(
         env="OASR_TEST_FST",
         kind=GRAPH,
         what="decoding graph for the GPU WFST decoder smoke tests",
-        default=(
-            "/data01/kilm/users/chiendb/models/asr/lm/"
-            "20210610_u2pp_conformer_exp_librispeech/lang_bpe/HLG.pt"
-        ),
+        relpath="lang_bpe/HLG.pt",
         how="a k2 HLG.pt, or a prebuilt .img",
     ),
     Asset(
@@ -181,7 +212,6 @@ _ASSET_LIST: List[Asset] = [
         kind=REFERENCE,
         what="captured HF greedy output for the tiny Qwen2-Audio fixture",
         # Lives inside the fixture dir; the env var only exists to override it.
-        default="",
         marker="ref.pt",
         how="generated alongside the tiny fixture",
     ),
@@ -189,7 +219,6 @@ _ASSET_LIST: List[Asset] = [
         env="OASR_PARAFORMER_REF",
         kind=REFERENCE,
         what="captured FunASR output for the Paraformer checkpoint",
-        default="",
         marker="ref.pt",
         how="generated alongside the paraformer checkpoint",
     ),
@@ -239,8 +268,12 @@ def _declared(name: str) -> str:
         return explicit
     if name in _DERIVED_DEFAULTS:
         parent, sub = _DERIVED_DEFAULTS[name]
-        return str(Path(ASSETS[parent].declared()) / sub)
-    return asset.default
+        # An unset parent has no subdirectory: composing one would yield the
+        # *relative* path ``oasr_ref``, which resolves against the working
+        # directory and would report a bogus location.
+        root = ASSETS[parent].declared()
+        return str(Path(root) / sub) if root else ""
+    return asset.declared()
 
 
 def declared(name: str) -> str:
@@ -334,7 +367,10 @@ def _gate(name: str) -> None:
 
 def report_lines() -> List[str]:
     """Human-readable status of every declared asset, for the run report."""
-    lines = []
+    root = os.environ.get(ROOT_ENV)
+    lines = [
+        f"  ({ROOT_ENV}={root})" if root else f"  ({ROOT_ENV} unset — per-asset env vars only)"
+    ]
     for name in ASSETS:
         path = resolve(name)
         gated = STATE.gated.get(name, 0)

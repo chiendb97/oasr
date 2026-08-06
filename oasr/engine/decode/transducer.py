@@ -3,32 +3,42 @@
 """Transducer (RNNT) frame-synchronous greedy decode strategy.
 
 Consumes raw encoder hidden states (``consumes="hidden"``) and drives the
-model's stateless predictor (``model.decoder``) + ``model.joiner`` directly. For
+model's label predictor (``model.decoder``) + ``model.joiner`` directly. For
 each encoder frame the joiner combines the frame with the current prediction;
-``argmax`` either emits a label (update the predictor's label window, stay on the
+``argmax`` either emits a label (fold it into the predictor state, stay on the
 frame, bounded by ``max_sym_per_frame``) or is blank (advance to the next frame).
 The predictor projection is recomputed only on steps where at least one row
 emitted; the encoder is projected once up front (the icefall greedy fast path).
+
+**The predictor state is opaque here.**  The loop calls
+``decoder.predict`` / ``advance`` / ``stack_states`` / ``unstack_states``
+(:class:`~oasr.models.decoders.base.TransducerPredictor`) rather than shifting a
+label window itself, which is what lets one loop serve both a stateless
+convolutional predictor (icefall: state == the last ``k`` labels, recomputable)
+and a recurrent one (NeMo's 2-layer LSTM: state == ``(output, h, c)``, *not*
+recomputable from a bounded window).  Inlining the shift, as this file used to,
+made the second impossible to express.
 
 One vectorized greedy core (:meth:`_greedy_loop`) serves both paths:
 
 * **offline** — fresh predictor state per micro-batch row, loop to the row's
   encoder length;
-* **streaming** — per-request :class:`_Session` (label window + predictor
+* **streaming** — per-request :class:`_Session` (predictor state + its
   projection + accumulated hypothesis) threaded across chunks; each tick decodes
   the new chunk's frames in a batch grouped by chunk length.
 
-The per-emit row loop is fully vectorized: label windows shift via a masked
-``torch.cat``, and emitted tokens are collected as per-step snapshots read back
-in one sync at loop end.  Loop *control* costs one host sync per iteration (the
-predictor-recompute gate) plus one per ``_TERMINATION_CHECK_STRIDE`` iterations;
-see that constant for why the second one is amortized and the first is not.
+The per-emit row loop is fully vectorized: the predictor folds the batch's
+emitted labels in under a row mask, and emitted tokens are collected as per-step
+snapshots read back in one sync at loop end.  Loop *control* costs one host sync
+per iteration (the predictor-recompute gate) plus one per
+``_TERMINATION_CHECK_STRIDE`` iterations; see that constant for why the second
+one is amortized and the first is not.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple, cast
 
 import torch
 
@@ -45,6 +55,7 @@ from .transducer_beam import (
 
 if TYPE_CHECKING:
     from oasr.models.base import BaseAsrModel
+    from oasr.models.decoders.base import Joiner, TransducerPredictor
 
     from ..config import EngineConfig
     from .detokenize import Detokenizer
@@ -88,14 +99,16 @@ _TERMINATION_CHECK_STRIDE = 16
 class _Session:
     """Per-stream decode state carried across chunks.
 
-    Greedy uses ``context`` / ``dec_proj`` / ``hyp``; beam search uses ``beam``
+    Greedy uses ``state`` / ``dec_proj`` / ``hyp``; beam search uses ``beam``
     (a ``(1, k, ...)`` :class:`BeamState`) and refreshes ``hyp`` from its best
     hypothesis after each chunk, so the partial/final emission path and the
     incremental detokenizer are shared between the two.
     """
 
-    context: torch.Tensor  # (1, context_size) int64 label window
-    dec_proj: torch.Tensor  # (1, J) predictor projection for that window
+    #: Opaque per-stream predictor state (``B == 1``): a label window for the
+    #: stateless predictor, an ``(output, h, c)`` tuple for a recurrent one.
+    state: Any
+    dec_proj: torch.Tensor  # (1, J) predictor projection for that state
     hyp: List[int] = field(default_factory=list)
     #: Beam-search state, ``None`` for greedy.
     beam: Optional["BeamState"] = None
@@ -178,6 +191,20 @@ class TransducerDecodeStrategy(DecodeStrategy):
         # ``None`` marks a created-but-uninitialized session (state materializes
         # on the first chunk, when the encoder output's device is known).
         self._sessions: Dict[str, Optional[_Session]] = {}
+        if self._beam > 1 and model is not None:
+            # Beam search keeps every hypothesis's state in one ``(B, k, ctx)``
+            # buffer and reorders it onto the new parents with a ``gather``
+            # (``transducer_beam.py``), which only expresses a label window.  A
+            # recurrent predictor would need the same reordering over its hidden
+            # and cell tensors — real work, not a wiring change — so refuse at
+            # engine construction rather than at the first decode.
+            if not getattr(model.decoder, "label_window_state", False):
+                raise ValueError(
+                    f"beam_size={self._beam} is not supported for "
+                    f"{type(model.decoder).__name__}: modified beam search reorders a "
+                    "label-window state across the beam, and this predictor carries "
+                    "recurrent state instead. Use beam_size=1 (greedy)."
+                )
 
     # ------------------------------------------------------------------
     # Vectorized greedy core (shared by offline + streaming)
@@ -188,15 +215,13 @@ class TransducerDecodeStrategy(DecodeStrategy):
         self,
         enc_out: torch.Tensor,  # (B, T, D) encoder hidden
         lengths: torch.Tensor,  # (B,) valid frames per row
-        context: torch.Tensor,  # (B, context_size) label windows (mutated copy returned)
-        dec_proj: torch.Tensor,  # (B, J) predictor projections for those windows
-    ) -> Tuple[List[List[int]], torch.Tensor, torch.Tensor]:
+        state: Any,  # opaque batched predictor state (B rows)
+        dec_proj: torch.Tensor,  # (B, J) predictor projections for that state
+    ) -> Tuple[List[List[int]], Any, torch.Tensor]:
         """Run batched greedy over ``enc_out``; returns newly emitted tokens per
-        row plus the updated ``(context, dec_proj)`` predictor state."""
-        model = self._model
-        joiner = model.joiner
-        decoder = model.decoder
-        blank = int(model.blank_id)
+        row plus the updated ``(state, dec_proj)`` predictor state."""
+        joiner, decoder = self._surface()
+        blank = int(cast(int, self._model.blank_id))
         max_sym = self._max_sym
 
         device = enc_out.device
@@ -237,12 +262,11 @@ class TransducerDecodeStrategy(DecodeStrategy):
                 # just a host round trip, and dropping it costs more than it saves
                 # on blank-dominated audio (measured below).
                 if bool(emit.any()):
-                    # Shift the emitted label into each emitting row's window; rows
-                    # that didn't emit keep their window, so the batched predictor
-                    # recompute reproduces their previous projection exactly.
-                    shifted = torch.cat([context[:, 1:], tok.unsqueeze(1)], dim=1)
-                    context = torch.where(emit.unsqueeze(1), shifted, context)
-                    dec_proj = joiner.decoder_proj(decoder(context))
+                    # Fold the emitted label into each emitting row's state; rows
+                    # that didn't emit keep theirs, so the batched projection that
+                    # follows reproduces their previous value exactly.
+                    state = decoder.advance(state, tok, emit)
+                    dec_proj = joiner.decoder_proj(decoder.predict(state))
                     emitted.append(torch.where(emit, tok, no_emit))
                     sym = sym + emit.long()
 
@@ -258,16 +282,27 @@ class TransducerDecodeStrategy(DecodeStrategy):
             hyps = [[tk for tk in row if tk >= 0] for row in snap]
         else:
             hyps = [[] for _ in range(B)]
-        return hyps, context, dec_proj
+        return hyps, state, dec_proj
 
-    def _init_state(
-        self, batch_size: int, device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        decoder = self._model.decoder
-        joiner = self._model.joiner
-        context = decoder.init_state(batch_size, device)  # (B, context_size) int64
-        dec_proj = joiner.decoder_proj(decoder(context))  # (B, J)
-        return context, dec_proj
+    def _surface(self) -> Tuple["Joiner", "TransducerPredictor"]:
+        """``(joiner, predictor)`` with their real types.
+
+        ``nn.Module.__getattr__`` types every submodule as ``Tensor | Module``, so
+        without this every call through them is an error the type checker cannot
+        see past.  The members themselves are guaranteed by
+        ``CAPABILITIES["transducer"]``, which the base ``DecodeStrategy``
+        constructor already validated.
+        """
+        return (
+            cast("Joiner", self._model.joiner),
+            cast("TransducerPredictor", self._model.decoder),
+        )
+
+    def _init_state(self, batch_size: int, device: torch.device) -> Tuple[Any, torch.Tensor]:
+        joiner, decoder = self._surface()
+        state = decoder.init_state(batch_size, device)
+        dec_proj = joiner.decoder_proj(decoder.predict(state))  # (B, J)
+        return state, dec_proj
 
     # ------------------------------------------------------------------
     # Offline greedy
@@ -280,8 +315,8 @@ class TransducerDecodeStrategy(DecodeStrategy):
         if self._beam > 1:
             return self._decode_offline_beam(enc_out, enc_lengths)
         B = enc_out.size(0)
-        context, dec_proj = self._init_state(B, enc_out.device)
-        hyps, _, _ = self._greedy_loop(enc_out, enc_lengths, context, dec_proj)
+        state, dec_proj = self._init_state(B, enc_out.device)
+        hyps, _, _ = self._greedy_loop(enc_out, enc_lengths, state, dec_proj)
         return [
             RequestOutput(
                 request_id="",
@@ -333,8 +368,8 @@ class TransducerDecodeStrategy(DecodeStrategy):
     def _session(self, request_id: str, device: torch.device) -> _Session:
         s = self._sessions.get(request_id)
         if s is None:
-            context, dec_proj = self._init_state(1, device)
-            s = _Session(context=context, dec_proj=dec_proj)
+            state, dec_proj = self._init_state(1, device)
+            s = _Session(state=state, dec_proj=dec_proj)
             self._sessions[request_id] = s
         return s
 
@@ -377,12 +412,18 @@ class TransducerDecodeStrategy(DecodeStrategy):
         return outputs
 
     def _advance_greedy(self, group, sessions, enc, lengths) -> None:
-        """One batched greedy loop over the group's chunk; append per session."""
-        context = torch.cat([s.context for s in sessions], dim=0)
+        """One batched greedy loop over the group's chunk; append per session.
+
+        The cohort of ready streams changes every tick, so the per-stream states
+        are stacked here and split back afterwards — through the predictor, which
+        is the only thing that knows the state's shape.
+        """
+        _joiner, decoder = self._surface()
+        state = decoder.stack_states([s.state for s in sessions])
         dec_proj = torch.cat([s.dec_proj for s in sessions], dim=0)
-        new_hyps, context, dec_proj = self._greedy_loop(enc, lengths, context, dec_proj)
-        for b, s in enumerate(sessions):
-            s.context = context[b : b + 1]
+        new_hyps, state, dec_proj = self._greedy_loop(enc, lengths, state, dec_proj)
+        for b, (s, row_state) in enumerate(zip(sessions, decoder.unstack_states(state))):
+            s.state = row_state
             s.dec_proj = dec_proj[b : b + 1]
             s.hyp.extend(new_hyps[b])
 

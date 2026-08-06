@@ -48,7 +48,7 @@ from .ctc_decode import (
     StreamState,
     ctc_beam_search_decode,
 )
-from .feature import dct_lifter, fbank_preprocess, mel_log
+from .feature import dct_lifter, fbank_preprocess, mel_log, stft_frame
 from .features import (
     BatchedStreamingFeatureExtractor,
     FeatureConfig,
@@ -67,6 +67,7 @@ from .layers import (
     DepthwiseConv1d,
     Fbank,
     GlobalCMVN,
+    Glu as GluModule,
     GroupNorm,
     LayerNorm,
     Linear,
@@ -217,6 +218,7 @@ __all__ = [
     "FeatureConfig",
     "BatchedStreamingFeatureExtractor",
     # Low-level CUDA feature ops
+    "stft_frame",
     "fbank_preprocess",
     "mel_log",
     "dct_lifter",
@@ -226,6 +228,7 @@ __all__ = [
     "PointwiseConv1d",
     "Conv2dModule",
     "Conv2dActivation",
+    "GluModule",
     "Fbank",
     "Mfcc",
     "Linear",

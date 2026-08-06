@@ -544,8 +544,10 @@ instance per stream/GPU.
 
 `oasr/decoder/wfst_decoder.py` provides the duck-typed searcher
 (`WfstDecoderSearch` + `WfstDecoderOptions`) selected by
-`DecoderConfig.wfst_backend = "gpu"` (the default; `"k2"` keeps the legacy
-CPU path). Graph handles and decoder instances are shared process-wide,
+`DecoderConfig.wfst_backend = "gpu"`. **WFST decoding is GPU-only** — CUDA is a
+hard requirement and the CPU `"k2"` value is an unsupported legacy path, built
+only under `OASR_USE_K2=1` and not exercised by CI.  Graph handles and decoder
+instances are shared process-wide,
 keyed on `(fst, beams, actives, device, …)`; passing an `HLG.pt` exports and
 caches the `.img` next to it on first use.
 

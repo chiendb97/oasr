@@ -104,26 +104,34 @@ def transcribe(
     batch_size: int,
     *,
     warmup: bool = True,
+    streaming: bool = False,
 ) -> Tuple[List[str], List[float]]:
     """Transcribe in batches; returns ``(hypotheses, per_utterance_ms)``.
 
     The warm-up call matters for the *speed* half of a row: JIT compilation and
     CUDA-graph capture happen on first use, so without it the first
     configuration of any sweep reports compile time as if it were inference.
+
+    ``streaming`` drives ``engine.transcribe`` (chunk by chunk) instead of
+    ``transcribe_offline``.  Same manifest, same denominator, so the two rates are
+    directly comparable — which is what makes a streaming accuracy gate meaningful
+    rather than a second number nobody can interpret.
     """
     import time
 
+    go = engine.transcribe if streaming else engine.transcribe_offline
     if warmup and waves:
-        engine.transcribe_offline(list(waves[:1]))
+        go(list(waves[:1]))
 
     hyps: List[str] = []
     per_utt_ms: List[float] = []
     for i in range(0, len(waves), batch_size):
         chunk = list(waves[i : i + batch_size])
         t0 = time.perf_counter()
-        out = engine.transcribe_offline(chunk)
+        out = go(chunk)
         dt_ms = 1000.0 * (time.perf_counter() - t0)
-        hyps.extend(out if isinstance(out, list) else [out])
+        texts = out if isinstance(out, list) else [out]
+        hyps.extend(t if isinstance(t, str) else t.text for t in texts)
         # Batch latency spread across its rows: the per-request number a caller
         # of the batched API actually experiences.
         per_utt_ms.extend([dt_ms / len(chunk)] * len(chunk))

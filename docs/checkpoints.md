@@ -31,7 +31,7 @@ loaded.model, loaded.config, loaded.tokenizer_spec, loaded.feature_spec
 
    | Level | Meaning | Declared by |
    |---|---|---|
-   | `DETECT_KEYED_VALUE` (30) | a named config file whose field names the architecture (`config.json: model_type == "whisper"`, `config.yaml: model: Paraformer`) | `whisper`, `speech_llm`, `paraformer` |
+   | `DETECT_KEYED_VALUE` (30) | a named config file whose field names the architecture (`config.json: model_type == "whisper"`, `config.yaml: model: Paraformer`) | `whisper`, `speech_llm`, `paraformer`, `nemotron` |
    | `DETECT_NAMED_CONFIG` (20) | a framework-specific config file exists (WeNet's `train.yaml`) — identifies the framework, not the architecture | `conformer` |
    | `DETECT_ASSET_LAYOUT` (10) | filename / asset conventions only (`exp/` layout, `epoch-*.pt`, `tokens.txt` beside the weights) — the default for a converter that declares nothing | `zipformer`, `transducer` |
 
@@ -89,6 +89,7 @@ being lost (e.g. dropping a U2++ `decoder.*` branch would lose
 | HF Whisper | `config.json: model_type=whisper` | `whisper` | emits `whisper` tokenizer + `whisper_logmel` features (`audio_scale=1.0`) |
 | HF Qwen2-Audio | `config.json: model_type=qwen2_audio` | `speech_llm` | fills omitted `text_config` fields from Qwen2 defaults; sharded safetensors |
 | FunASR Paraformer | `config.yaml: model: Paraformer` | `paraformer` | parses `am.mvn` CMVN into synthetic state-dict buffers; `funasr_char` tokenizer; LFR 7/6 features |
+| HF Nemotron ASR | `config.json: model_type=nemotron3_5_asr` | `nemotron` | reads the frontend geometry out of `processor_config.json` rather than guessing it; `huggingface` tokenizer with the blank id (which sits *past* the vocabulary) named as a special; `nemotron_logmel` features (`audio_scale=1.0`, `preemphasis=0.97`) |
 
 ## Native format
 

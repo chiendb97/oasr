@@ -23,16 +23,18 @@ HTTP + gRPC surfaces shaped after Google Cloud Speech-to-Text v1.
 
 Examples
 --------
-# Quick smoke (auto-spawns oasr-server)
+# Quick smoke (auto-spawns oasr-server).  CKPT_DIR / AUDIO_DIR are the paths to
+# your checkpoint and wav directory — `.env` (see .env.example) is the usual
+# place to keep them, so they can be passed as "$CKPT_DIR" / "$AUDIO_DIR".
 python benchmarks/bench_service.py \\
-    --ckpt-dir /data01/kilm/users/chiendb/models/asr/am/20210610_u2pp_conformer_exp_librispeech \\
-    --audio-dir /data01/kilm/users/chiendb/data/asr/ljspeech-sr16k-dataset/wavs \\
+    --ckpt-dir CKPT_DIR \\
+    --audio-dir AUDIO_DIR \\
     --subroutines grpc_streaming \\
     --max-batch-size 64 --num-utterances 2000
 
 # Use a running server (skip spawn)
 python benchmarks/bench_service.py \\
-    --audio-dir /path/to/wavs --subroutines offline grpc_streaming \\
+    --audio-dir AUDIO_DIR --subroutines offline grpc_streaming \\
     --server-url http://127.0.0.1:8080 --num-utterances 500
 """
 

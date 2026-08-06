@@ -163,6 +163,33 @@ class BlockPool:
                 free_set.add(bid)
             self._free_list.extend(block_ids)
 
+    def zero_blocks(self, block_ids: List[int]) -> None:
+        """Zero K and V across every layer for the given physical blocks.
+
+        Needed by the prefilled-window mode (``CacheConfig.prefill_kv_window``),
+        which hands a new stream its whole retained window before any of it has
+        been written.  The pool starts zeroed but blocks are recycled, so a
+        prefilled window would otherwise open on the previous tenant's K/V.  Those
+        columns are masked by the encoder's additive bias and are therefore inert
+        either way — this makes "a young stream attends over zeros" true rather
+        than merely harmless, which is the difference between a test that can
+        assert something and one that cannot.
+        """
+        if not block_ids:
+            return
+        idx = torch.tensor(block_ids, dtype=torch.long, device=self._k_pool.device)
+        zeros = torch.zeros(
+            self._config.num_layers,
+            len(block_ids),
+            self._config.block_size_frames,
+            self._config.n_kv_head,
+            self._config.head_dim,
+            dtype=self._config.dtype,
+            device=self._k_pool.device,
+        )
+        self._k_pool.index_copy_(1, idx, zeros)
+        self._v_pool.index_copy_(1, idx, zeros)
+
     # ------------------------------------------------------------------
     # Tensor access
     # ------------------------------------------------------------------

@@ -238,6 +238,17 @@ class _RoutingEncoderStub:
     subsampling_rate = 4
     right_context = 6
 
+    def streaming_geometry(self, chunk_size):
+        """``None`` = "use the generic window formula", the ``BaseEncoder`` default.
+
+        Spelled out rather than left off: the backend calls this at construction to
+        let an encoder declare a front-end the formula does not describe (and to
+        refuse a chunk size it cannot serve), so a stub that omits it is not a stub
+        of the current contract.
+        """
+        del chunk_size
+        return None
+
 
 class _RoutingModelStub:
     """Just enough surface for PagedStreamingBackend.__init__ routing checks."""
@@ -309,20 +320,26 @@ def test_graph_capture_follows_the_device_not_the_consumes_mode():
 
 
 class TestGraphReplayBufferIsNotHandedOutTwice:
-    """Two replays of one shape key in a step must not share an output buffer.
+    """A step's earlier graph results must survive everything that follows them.
 
-    ``GraphedEncoderForward`` reuses one pre-allocated output buffer per
-    ``(B, T_input, cache_t1_bucket)`` key, and ``forward_step`` can replay the
-    same key more than once: a full-window *final* chunk goes through
-    ``_forward_single`` at ``B=1``, so two streams finalizing in the same step
-    at the same offset bucket collide — as does a ``B=1`` batched cohort
-    alongside one such final.  Every earlier caller's tensor was then silently
-    rewritten before the decoder read it.
+    Two independent mechanisms invalidate a ``GraphedEncoderForward`` result, and
+    each one cost real transcripts before it was understood:
 
-    Observed on the CTC path before the fix: three lockstep streams each ending
-    on a full window produced two transcripts whose tails were the *third*
-    stream's final chunk.  This predates hidden-mode capture; extending capture
-    to ``consumes="hidden"`` widened its reach, which is how it surfaced.
+    **Same-key reuse.**  One pre-allocated output buffer per
+    ``(B, T_input, cache_t1_bucket)`` key, and ``forward_step`` can replay one key
+    twice: a full-window *final* chunk goes through ``_forward_single`` at ``B=1``,
+    so two streams finalizing in the same step collide — as does a ``B=1`` batched
+    cohort alongside one such final.  Observed on the CTC path: three lockstep
+    streams each ending on a full window produced two transcripts whose tails were
+    the *third* stream's final chunk.
+
+    **A later capture.**  Captures share one memory pool, so a *first* capture at a
+    new key may be handed the block an earlier capture's output buffer occupies —
+    which invalidates results from keys that were never replayed again.  Observed
+    on Nemotron streaming: 5 of 40 LJSpeech utterances lost their trailing words,
+    deterministically, only with graphs enabled, and only for streams that
+    finalized in the same step as a fresh capture.  This is why a **wide** cohort
+    must detach too, even though no single can share its key.
     """
 
     def _backend_and_reqs(self, n):
@@ -366,11 +383,10 @@ class TestGraphReplayBufferIsNotHandedOutTwice:
         # Among the singles, only the last one may keep the live buffer.
         assert seen["single"] == [True, True, False]
 
-    def test_a_wide_cohort_never_collides_with_a_single(self):
-        """``_forward_single`` always replays at B=1, so B>1 cannot share a key.
-
-        Detaching a wide cohort would copy a ``(B, chunk, V)`` tensor on the
-        steady-state path for a collision that is impossible by construction.
+    def test_a_wide_cohort_detaches_when_anything_follows_it(self):
+        """Not for a key collision — a single always replays at ``B=1`` — but because
+        a following single may **capture**, and a capture can reuse the pool block
+        this cohort's output buffer sits in.  Cheaper to test than to rediscover.
         """
         backend, reqs = self._backend_and_reqs(4)
         seen = self._record_detach(backend)
@@ -379,7 +395,7 @@ class TestGraphReplayBufferIsNotHandedOutTwice:
             r.feature_frames = r.feature_cursor + backend.decoding_window
         backend.forward_step(reqs)
 
-        assert seen["batched"] == [False]
+        assert seen["batched"] == [True]
         assert seen["single"] == [True, False]
 
     def test_a_lone_batched_cohort_still_aliases(self):
@@ -407,10 +423,17 @@ def test_graph_replay_reuses_one_output_buffer_per_shape_key():
     def chunk_forward(xs, offset, caches, cnn_cache, cache_t1=0):
         return xs.sum(-1, keepdim=True) * 2.0
 
+    from oasr.cache.state import SlotStateCache, StreamStateSpec
+
     gc = GraphedEncoderForward(
         chunk_forward,
         att_mgr=_StubAttMgr(),
-        cnn_mgr=SimpleNamespace(buffer=torch.zeros(1, 4, 2, 8, device="cuda")),
+        state_mgr=SlotStateCache(
+            [StreamStateSpec("conv", (1, 2, 8), slot_axis=1)],
+            max_batch_size=4,
+            device=torch.device("cuda"),
+            dtype=torch.float32,
+        ),
         device=torch.device("cuda"),
     )
     dev = torch.device("cuda")

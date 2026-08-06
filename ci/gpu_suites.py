@@ -49,6 +49,7 @@ SUITES: dict[str, list[str]] = {
         "tests/test_attention.py",
         "tests/test_fmha.py",
         "tests/test_fmha_varlen.py",
+        "tests/test_block_info.py",
         "tests/test_autotune.py",
     ],
     "decoders": [
@@ -78,6 +79,7 @@ SUITES: dict[str, list[str]] = {
         "tests/test_decode_options.py",
         "tests/test_decoding_options.py",
         "tests/test_packing_encoder.py",
+        "tests/test_vram_sizing.py",
     ],
     # Its own family so a WER regression is attributable at a glance rather than
     # buried in a model-family failure — and because it is the one suite whose
@@ -91,6 +93,7 @@ SUITES: dict[str, list[str]] = {
         "tests/test_whisper.py",
         "tests/test_paraformer.py",
         "tests/test_speech_llm.py",
+        "tests/test_nemotron.py",
         "tests/test_transducer.py",
         "tests/test_transformer_decoder.py",
         "tests/test_rescoring.py",
@@ -100,6 +103,7 @@ SUITES: dict[str, list[str]] = {
         "tests/test_config_round_trip.py",
         "tests/test_from_pretrained.py",
         "tests/test_tokenizers.py",
+        "tests/test_layer_waist.py",
     ],
 }
 

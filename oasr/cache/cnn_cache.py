@@ -13,18 +13,42 @@ The batched paged forward reads / writes this buffer in place via a
 :class:`~oasr.cache.SlotCnnCache` descriptor (gather at the top of the
 encoder, scatter at the bottom), mirroring how K/V are written through
 :class:`~oasr.cache.PagedKVCache`.
+
+Implementation note: this is a **single-spec** :class:`~oasr.cache.SlotStateCache`
+— the convolutional left-context, under the name it has always had, with the
+accessors callers already use.  The generic form is what an encoder with more than
+one fixed-extent state (Nemotron's per-subsampling-stage tails) declares instead;
+see ``oasr/cache/state.py``.  Subclassing rather than wrapping keeps this the
+*same tensor object*, which matters because the CUDA-graph cache captures the
+buffer by address.
 """
 
 from __future__ import annotations
 
-from typing import Dict
-
 import torch
 
+from oasr.cache.state import SlotStateCache, StreamStateSpec
 from oasr.cache.types import CacheConfig
 
+#: Name the convolutional left-context is declared and read back under.
+CONV_STATE = "conv"
 
-class CnnCacheManager:
+
+def conv_state_spec(config: CacheConfig) -> StreamStateSpec:
+    """The Conformer conv cache as a :class:`StreamStateSpec`.
+
+    ``slot_axis = 1`` is what preserves the historical
+    ``(layers, slots, frames, dim)`` layout — and therefore the gather/scatter
+    the encoder already performs and the buffer address the graph captures.
+    """
+    return StreamStateSpec(
+        name=CONV_STATE,
+        shape=(config.num_layers, config.cnn_cache_frames, config.hidden_dim),
+        slot_axis=1,
+    )
+
+
+class CnnCacheManager(SlotStateCache):
     """Slot-indexed CNN cache for all active streams.
 
     Parameters
@@ -47,60 +71,22 @@ class CnnCacheManager:
     """
 
     def __init__(self, config: CacheConfig) -> None:
-        self._config = config
-        self._slots: Dict[int, int] = {}
-        # Persistent batched cache: (L, max_batch_size, K-1, D).
-        self._buffer = torch.zeros(
-            config.num_layers,
-            config.max_batch_size,
-            config.cnn_cache_frames,
-            config.hidden_dim,
-            dtype=config.dtype,
+        super().__init__(
+            [conv_state_spec(config)],
+            max_batch_size=config.max_batch_size,
             device=config.device,
+            dtype=config.dtype,
         )
+        self._config = config
 
     # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    def allocate_stream(self, stream_id: int, slot_id: int) -> None:
-        """Register a stream at the given slot id with a zeroed cache row.
-
-        Raises
-        ------
-        ValueError
-            If ``stream_id`` is already allocated, or ``slot_id`` is out of
-            range / in use.
-        """
-        if stream_id in self._slots:
-            raise ValueError(f"CNN cache for stream {stream_id} already allocated.")
-        if not (0 <= slot_id < self._config.max_batch_size):
-            raise ValueError(f"slot_id {slot_id} out of range [0, {self._config.max_batch_size})")
-        if slot_id in self._slots.values():
-            raise ValueError(f"slot_id {slot_id} already in use")
-        self._slots[stream_id] = slot_id
-        # Zero this slot's column across all layers.
-        self._buffer[:, slot_id].zero_()
-
-    def free_stream(self, stream_id: int) -> None:
-        """Release the slot mapping for a stream."""
-        if stream_id not in self._slots:
-            raise KeyError(f"CNN cache for stream {stream_id} not found.")
-        del self._slots[stream_id]
-
-    # ------------------------------------------------------------------
-    # Access / update
+    # Single-tensor accessors
     # ------------------------------------------------------------------
 
     @property
     def buffer(self) -> torch.Tensor:
         """The persistent ``(L, max_batch_size, K-1, D)`` buffer."""
-        return self._buffer
-
-    def slot_of(self, stream_id: int) -> int:
-        if stream_id not in self._slots:
-            raise KeyError(f"CNN cache for stream {stream_id} not found.")
-        return self._slots[stream_id]
+        return self.buffer_of(CONV_STATE)
 
     def get_cache(self, stream_id: int) -> torch.Tensor:
         """Return the CNN cache view for a single stream.
@@ -117,8 +103,7 @@ class CnnCacheManager:
         KeyError
             If ``stream_id`` is not allocated.
         """
-        slot = self.slot_of(stream_id)
-        return self._buffer[:, slot : slot + 1]
+        return self.get_state(CONV_STATE, stream_id)
 
     def update(self, stream_id: int, new_cnn_cache: torch.Tensor) -> None:
         """Overwrite the CNN cache for a stream with the new chunk output.
@@ -135,7 +120,6 @@ class CnnCacheManager:
         new_cnn_cache : torch.Tensor
             Shape ``(num_layers, 1, cnn_cache_frames, hidden_dim)``.
         """
-        slot = self.slot_of(stream_id)
         expected = (
             self._config.num_layers,
             1,
@@ -147,4 +131,7 @@ class CnnCacheManager:
                 f"CNN cache shape mismatch for stream {stream_id}: "
                 f"expected {expected}, got {tuple(new_cnn_cache.shape)}."
             )
-        self._buffer[:, slot : slot + 1].copy_(new_cnn_cache)
+        self.get_state(CONV_STATE, stream_id).copy_(new_cnn_cache)
+
+
+__all__ = ["CONV_STATE", "CnnCacheManager", "conv_state_spec"]

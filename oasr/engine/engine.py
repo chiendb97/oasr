@@ -243,6 +243,17 @@ class ASREngine:
         if self._model_runner.decoding_window > 0:
             config._decoding_window_override = self._model_runner.decoding_window
             config._stride_override = self._model_runner.stride
+            # Whether the closing silence pad has to round the stream up to a whole
+            # window first — declared by the runtime, because only it knows whether
+            # a sub-window tail can be forwarded.  See
+            # ``StreamingEncoderBackend.finalize_align_frames``.
+            # Same dynamic-override idiom as the four lines above, and the same
+            # ``attr-defined`` noise: these are engine-stamped private fields, not
+            # dataclass fields, because making them fields would put them in
+            # ``EngineConfig``'s public surface and its round-trip.
+            config._finalize_align_frames = (  # type: ignore[attr-defined]
+                self._model_runner.streaming_backend.finalize_align_frames
+            )
 
         self._output_processor = OutputProcessor(
             config, decode_type=decode_method, model=model, tokenizer=tokenizer

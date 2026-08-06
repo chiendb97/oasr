@@ -171,6 +171,7 @@ _BUILTIN_PACKAGES: Tuple[str, ...] = (
     "whisper",
     "paraformer",
     "speech_llm",
+    "nemotron",
 )
 
 #: setuptools entry-point group for out-of-tree architectures.  A third-party

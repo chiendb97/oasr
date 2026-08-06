@@ -73,11 +73,17 @@ CAPABILITIES: Dict[str, CapabilitySpec] = {
         requires=(
             "encode_offline",
             "blank_id",
+            # The predictor-state protocol
+            # (``oasr.models.decoders.base.TransducerPredictor``): the strategy
+            # treats the state as opaque, so these three are what make a
+            # stateless label window and a recurrent LSTM interchangeable.
             "decoder.init_state",
+            "decoder.predict",
+            "decoder.advance",
             "joiner.encoder_proj",
             "joiner.decoder_proj",
         ),
-        why="frame-synchronous RNNT greedy decoding (stateless predictor + joiner)",
+        why="frame-synchronous RNNT greedy decoding (label predictor + joiner)",
     ),
     "ctc_aed_rescoring": CapabilitySpec(
         capability="ctc_aed_rescoring",

@@ -9,25 +9,39 @@ decoder is the same CUDA source compiled with the same flags/SM arch, so results
 bit-for-bit identical — this guards the migration against drift and is the concrete
 evidence for the "output parity vs the original wfst" acceptance criterion.
 
-Requires: a CUDA build of oasr (the decoder JIT-compiles on first use) and the external
-``wfst`` repo built (``--wfst-home``, default ``/data01/kilm/users/chiendb/projects/wfst``)
-with its ``data/`` assets present.
+Requires: a CUDA build of oasr (the decoder JIT-compiles on first use) and a checkout of
+the external ``wfst`` repo, built, with its ``data/`` assets present.  Point at it with
+``--wfst-home`` or ``$OASR_WFST_HOME``; the graph and log-prob dump then default to that
+tree's ``data/`` layout, and either can be overridden individually.
 
 Example::
 
-    CUDA_VISIBLE_DEVICES=GPU-... python scripts/wfst_parity_check.py \
-        --graph .../data/hlg/icefall.img \
-        --logprobs .../data/logprobs/icefall-ljs2000.pt \
-        --num-utts 256 --batch 1 8 32
+    export OASR_WFST_HOME=/path/to/wfst
+    python scripts/wfst_parity_check.py --num-utts 256 --batch 1 8 32
+
+    # or name the assets directly
+    python scripts/wfst_parity_check.py \
+        --wfst-home /path/to/wfst \
+        --graph /path/to/hlg/icefall.img \
+        --logprobs /path/to/logprobs/icefall-ljs2000.pt
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 import torch
 
-DEFAULT_WFST_HOME = Path("/data01/kilm/users/chiendb/projects/wfst")
+#: Root of the external ``wfst`` checkout.  No baked-in default — the assets
+#: live outside this repo and their location is per-machine.
+WFST_HOME_ENV = "OASR_WFST_HOME"
+
+
+def _wfst_asset(*parts: str):
+    """Default path under ``$OASR_WFST_HOME``, or ``None`` when it is unset."""
+    home = os.environ.get(WFST_HOME_ENV)
+    return str(Path(home, *parts)) if home else None
 
 
 def load_dump(path: str, limit):
@@ -137,11 +151,21 @@ class ExternalDecoder:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--graph", default=str(DEFAULT_WFST_HOME / "data/hlg/primary.img"))
     p.add_argument(
-        "--logprobs", default=str(DEFAULT_WFST_HOME / "data/logprobs/primary-ljs2000.pt")
+        "--graph",
+        default=_wfst_asset("data/hlg/primary.img"),
+        help=f"decoding graph image (default: ${WFST_HOME_ENV}/data/hlg/primary.img)",
     )
-    p.add_argument("--wfst-home", default=str(DEFAULT_WFST_HOME))
+    p.add_argument(
+        "--logprobs",
+        default=_wfst_asset("data/logprobs/primary-ljs2000.pt"),
+        help=f"log-prob dump (default: ${WFST_HOME_ENV}/data/logprobs/primary-ljs2000.pt)",
+    )
+    p.add_argument(
+        "--wfst-home",
+        default=os.environ.get(WFST_HOME_ENV),
+        help=f"external wfst checkout, holding python/ and data/ (default: ${WFST_HOME_ENV})",
+    )
     p.add_argument("--batch", type=int, nargs="+", default=[1, 8, 32])
     p.add_argument("--num-utts", type=int, default=256)
     p.add_argument("--search-beam", type=float, default=20.0)
@@ -158,6 +182,21 @@ def main():
     )
     p.add_argument("--device", default="cuda:0")
     args = p.parse_args()
+
+    missing = [
+        flag
+        for flag, value in (
+            ("--graph", args.graph),
+            ("--logprobs", args.logprobs),
+            ("--wfst-home", args.wfst_home),
+        )
+        if not value
+    ]
+    if missing:
+        raise SystemExit(
+            f"missing {', '.join(missing)} — pass them, or set ${WFST_HOME_ENV} to the "
+            f"external wfst checkout so they default to its data/ layout"
+        )
 
     device = torch.device(args.device)
     torch.cuda.set_device(device)

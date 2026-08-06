@@ -29,7 +29,7 @@ The engine treats it opaquely.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Tuple
+from typing import Any, ClassVar, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -91,11 +91,88 @@ class BaseDecoder(nn.Module, ABC):
         )
 
 
-class PredictionNetwork(nn.Module, ABC):
-    """Transducer label predictor: label history → prediction state/embedding.
+class TransducerPredictor(BaseDecoder):
+    """Label predictor driven by the frame-synchronous transducer strategy.
 
-    Either a stateful RNN (``state`` is the hidden/cell tuple) or a stateless
-    convolutional predictor (``state`` is the last-``k`` label window).
+    Four operations, and between them they are the *whole* reason
+    :class:`~oasr.engine.decode.TransducerDecodeStrategy` serves both a
+    stateless convolutional predictor (icefall) and a recurrent one (NeMo's
+    2-layer LSTM) with one greedy loop:
+
+    ``init_state(B, device[, dtype])``
+        The state before any label has been emitted.  For a recurrent predictor
+        this is *not* zeros — it is the state after the start-of-sequence step,
+        because NeMo/HF run the LSTM once on the blank embedding (which is the
+        zero row) from a zero hidden state, and the resulting prediction is what
+        the first frame's joint sees.
+    ``predict(state) → (B, D_pred)``
+        The prediction the joiner consumes.  A read for a recurrent predictor
+        (the state carries it), a recompute for a stateless one (its state *is*
+        the label window).
+    ``advance(state, tokens, emit) → state``
+        Fold ``tokens`` into the state for the rows where ``emit`` is true, and
+        leave the others exactly as they were.  Row-wise masking rather than a
+        gather because the strategy advances a whole batch per step.
+    ``stack_states`` / ``unstack_states``
+        Regroup per-stream states, which streaming needs because the cohort of
+        ready streams changes every tick.
+
+    Why the state is opaque to the strategy: a label window can be recomputed
+    from the last ``k`` tokens, and an LSTM state cannot.  The strategy used to
+    assume the former — it shifted a ``(B, context_size)`` int tensor with
+    ``torch.cat`` and re-ran the predictor — so a recurrent predictor had no way
+    in at all short of a second copy of the loop.
+    """
+
+    decode_type: DecodeType = "transducer"
+
+    #: Whether ``state`` is a ``(B, context_size)`` label-window tensor.  Beam
+    #: search (``oasr/engine/decode/transducer_beam.py``) keeps the beam's states
+    #: in one ``(B, k, ctx)`` buffer and reorders them onto their parents with a
+    #: ``gather``, which only works for that representation; a recurrent
+    #: predictor leaves this ``False`` and greedy is the supported mode.
+    label_window_state: ClassVar[bool] = False
+
+    @abstractmethod
+    def init_state(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: Optional[torch.dtype] = None,
+    ) -> DecoderState:
+        """Per-hypothesis state before the first emission."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def predict(self, state: DecoderState) -> torch.Tensor:
+        """``state`` → ``(B, D_pred)`` prediction for the joiner."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def advance(
+        self, state: DecoderState, tokens: torch.Tensor, emit: torch.Tensor
+    ) -> DecoderState:
+        """Fold ``tokens (B,)`` into ``state`` where ``emit (B,)`` is true."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def stack_states(self, states: Sequence[DecoderState]) -> DecoderState:
+        """Concatenate per-stream states into one batched state."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def unstack_states(self, state: DecoderState) -> List[DecoderState]:
+        """Split a batched state back into per-stream states (inverse of
+        :meth:`stack_states`)."""
+        raise NotImplementedError
+
+
+class PredictionNetwork(nn.Module, ABC):
+    """Transducer label predictor expressed as a plain step function.
+
+    Retained as the minimal ``(tokens, state) -> (prediction, state)`` shape for
+    a predictor used outside the engine's decode strategy;
+    :class:`TransducerPredictor` is what the strategy drives.
     """
 
     @abstractmethod

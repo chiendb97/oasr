@@ -40,6 +40,7 @@ from .config import FeatureConfig
 from .lfr import apply_lfr_batch
 from .registry import (
     ExtractorSpec,
+    StreamingFraming,
     build_extractor,
     list_extractors,
     register_extractor,
@@ -53,6 +54,7 @@ __all__ = [
     "FeatureSpec",
     "apply_lfr_batch",
     "ExtractorSpec",
+    "StreamingFraming",
     "register_extractor",
     "build_extractor",
     "list_extractors",

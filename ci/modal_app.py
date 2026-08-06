@@ -67,6 +67,7 @@ ASSET_LAYOUT: dict[str, str] = {
     "OASR_PARAFORMER_CKPT": "paraformer_zh",
     "SPEECH_LLM_TINY": "qwen2_audio_tiny",
     "SPEECH_LLM_CKPT": "qwen2_audio_7b",
+    "NEMOTRON_CKPT": "nemotron_asr_streaming_0.6b",
     "OASR_TEST_FST": "lang_bpe/HLG.pt",
 }
 

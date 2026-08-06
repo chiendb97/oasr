@@ -78,7 +78,7 @@ The engine no longer has a separate `OfflineEngine` subclass — pass
 | `model_runner.py` | `ModelRunner` | Wraps `ConformerModel`. Owns the cache managers; runs `forward_offline`, `forward_streaming_step`, and the batched paged path. |
 | `executor/offline.py` | `OfflineExecutor` | Runs each scheduler-partitioned micro-batch (fbank → forward → decode → finalise) back-to-back; sequence-packed forward when `enable_sequence_packing` is set. |
 | `executor/streaming.py` | `StreamingExecutor` | Chunk-by-chunk streaming with paged KV cache; partial outputs per tick, final on drain. |
-| `output_processor.py` | `OutputProcessor` | CTC decode (GPU beam / k2 WFST) and SentencePiece-or-units detokenization. |
+| `output_processor.py` | `OutputProcessor` | CTC decode (GPU prefix beam / GPU WFST) and SentencePiece-or-units detokenization. |
 
 ## 4. Core Algorithms and Workflows
 
@@ -211,7 +211,10 @@ def step(self) -> List[RequestOutput]:
     if running:
         # 3. batched fbank across every active stream with pending audio,
         #    on the dedicated _feat_stream so it overlaps the previous
-        #    step's encoder forward
+        #    step's encoder forward.  extract_streaming_batch orders the
+        #    producer->consumer hand-off itself (it appends into
+        #    feature_buffer on *this* stream); the wait below is a belt for
+        #    our own read, not the protection.  See known_issues.md §5.
         needs_feat = [r for r in running if r.has_pending_audio]
         if needs_feat:
             self._input_processor.extract_streaming_batch(
@@ -379,10 +382,10 @@ lever is then the *per-stream* ceiling, not the pool size.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `decoder_type` | `"ctc_cuda"` | `ctc_cuda` (GPU CTC beam) / `ctc_wfst` (k2 WFST, GPU). |
+| `decoder_type` | `"ctc_cuda"` | `ctc_cuda` (GPU CTC beam) / `ctc_wfst` (in-tree GPU WFST). |
 | `ctc_decoder_config` | `GpuDecoderConfig()` | GPU CTC config (beam, blank ID, thresholds). |
-| `wfst_decoder_config` | `DecoderConfig(search_type="wfst")` | k2 WFST decoder config. |
-| `fst_path` | `None` | Required for `ctc_wfst`. |
+| `wfst_decoder_config` | `DecoderConfig(search_type="wfst")` | GPU WFST decoder config. |
+| `fst_path` | `None` | Required for `ctc_wfst`: a prebuilt `.img`, or a k2 `HLG.pt` exported at load. |
 | `sentencepiece_model` | auto-detected | `.model` in `ckpt_dir`. |
 | `unit_table` | auto-detected | `units.txt` / `words.txt` fallback. |
 
@@ -396,8 +399,21 @@ stride           = subsampling_rate * chunk_size              # frame advance
 required_cache_size = chunk_size * num_left_chunks            # dense mode
 ```
 
+That formula describes a **centred** subsampling front-end, which needs a
+receptive field beyond its chunk. An encoder whose front-end it does not describe
+overrides `BaseEncoder.streaming_geometry(chunk_size)` and returns its own
+`(decoding_window, stride)` — for a *cached causal* subsampling those are equal,
+because a chunk consumes exactly `chunk_size * subsampling_rate` frames with no
+lookahead. That hook is also where an encoder **refuses** a chunk size it cannot
+serve; the backend calls it once, at construction, so an unserviceable
+`chunk_size` fails there rather than drifting silently at request time.
+
 `build_cache_config(model_config)` derives a `CacheConfig` from the
-loaded encoder dimensions.
+loaded encoder dimensions — including, when the encoder declares a trained
+`fixed_attention_window`, the retained cache itself (see
+`docs/cache_manager.md` §10.2: how much history the model may attend to is part of
+its mask, not an operator preference, so `num_left_chunks` is ignored there and a
+warning says so).
 
 ## 7. Usage Examples
 

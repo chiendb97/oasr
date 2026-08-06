@@ -55,7 +55,28 @@ NON_DEFAULT = {
         "blank_id": 5,
     },
     "speech_llm": lambda m: {"vocab_size": 4711, "eos_token_ids": [1, 2, 3]},
+    # ``supported_num_lookahead_tokens`` is a ``Tuple[int, ...]`` on the *nested*
+    # encoder config — the exact combination (nested dataclass + tuple field) that
+    # the hand-written readers got wrong, and JSON has no tuples.
+    "nemotron": lambda m: _nemotron_overrides(),
 }
+
+
+def _nemotron_overrides():
+    """Needs a nested-config instance, which a lambda over the *outer* class
+    cannot build — the ``m`` argument is the config class, not its module."""
+    from oasr.models.nemotron.config import NemotronEncoderConfig
+
+    return {
+        "vocab_size": 4711,
+        "blank_token_id": 4710,
+        "default_prompt_id": 7,
+        "encoder": NemotronEncoderConfig(
+            hidden_size=64,
+            num_hidden_layers=3,
+            supported_num_lookahead_tokens=(0, 5, 11),
+        ),
+    }
 
 
 @pytest.mark.parametrize("arch", list_models())

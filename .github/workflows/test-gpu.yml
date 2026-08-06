@@ -26,8 +26,9 @@ name: test-gpu
 #
 #   The runner's environment must already have: an NVIDIA driver + CUDA toolkit
 #   (the kernels JIT through nvcc), a `pip install -e .` of this repo, and the
-#   checkpoints at the paths in tests/assets.py — or those env vars exported in
-#   the service environment.
+#   checkpoints reachable by the env vars declared in tests/assets.py — either
+#   exported one by one in the service environment, or all at once by pointing
+#   `OASR_ASSET_ROOT` at a tree laid out with the per-asset `relpath` names.
 #
 #   NOTE: this repo is public.  Do NOT add a `pull_request` trigger here: a fork
 #   PR would execute arbitrary code on your machine.  Run PR checks on Modal.

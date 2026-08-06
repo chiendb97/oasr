@@ -64,6 +64,7 @@ def _tiny_configs():
     """
     from oasr.models.conformer.config import ConformerEncoderConfig, ConformerModelConfig
     from oasr.models.decoders.transformer_decoder import TransformerDecoderConfig
+    from oasr.models.nemotron.config import NemotronEncoderConfig, NemotronModelConfig
     from oasr.models.paraformer.config import ParaformerModelConfig
     from oasr.models.speech_llm.config import SpeechLlmModelConfig
     from oasr.models.transducer.config import TransducerModelConfig
@@ -151,6 +152,28 @@ def _tiny_configs():
             joiner_dim=24,
             context_size=2,
             blank_id=0,
+        ),
+        # The 8x subsampling stack is kept at three real stages: its depthwise
+        # Conv2d is the ``conv2d-groups`` gap, so shrinking it away would remove
+        # the only in-tree architecture that exercises that declaration on the
+        # request path.
+        "nemotron": NemotronModelConfig(
+            vocab_size=32,
+            blank_token_id=31,
+            decoder_hidden_size=24,
+            num_decoder_layers=1,
+            num_prompts=8,
+            prompt_intermediate_size=48,
+            encoder=NemotronEncoderConfig(
+                hidden_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                intermediate_size=64,
+                num_mel_bins=32,
+                subsampling_conv_channels=16,
+                sliding_window=13,
+            ),
         ),
     }
 
@@ -412,7 +435,13 @@ class TestKernelGapRegistry:
     #: precondition, ``fmha-mask-form`` by giving the kernel a per-row key start
     #: (left padding), and unaligned output projections never became a gap at
     #: all — they were closed at the model layer by widening the head on load.
-    PINNED = {"fmha-head-dim"}
+    #:
+    #: ``conv2d-groups`` is a *newly declared* gap rather than a newly created
+    #: one: grouped conv2d has never had a kernel, and Zipformer's 7x7 ConvNeXt
+    #: depthwise reached it through a bare ``nn.Conv2d`` where nothing counted it
+    #: (``.artifacts/kernel_coverage.md`` §0 is about exactly that blind spot).
+    #: Declaring it moves the debt from prose into the counter.
+    PINNED = {"conv2d-groups", "fmha-head-dim"}
 
     def test_declared_gap_set_only_shrinks(self):
         from oasr.layers._backend import KERNEL_GAPS

@@ -265,6 +265,20 @@ Request → InputProcessor (fbank) → Scheduler (BatchingPolicy + PartitionPoli
 - The encoder declares `streaming_kind` (`"paged"` / `"stateful"` / `"none"`) plus
   `subsampling_rate` / `right_context` / (stateful) `streaming_chunk_frames`; the
   engine reads streaming geometry from there, not from hardcoded constants.
+- The encoder also declares **what it carries across chunks**, so a new streaming
+  cache is data rather than a new manager: `streaming_state_specs` (extra
+  fixed-extent per-stream tensors — see `docs/cache_manager.md` §10),
+  `fixed_attention_window` (a *trained* attention span, which makes the engine
+  pre-fill the K/V window so one shared position table is correct), and
+  `streaming_geometry(chunk_size)` (a front-end the generic window formula does not
+  describe, and the place to **refuse** a chunk size it cannot serve). All three
+  default to "nothing declared", so an encoder that needs none of them is unaffected
+  by their existence.
+- The **feature frontend** declares its streaming frame grid the same way:
+  `ExtractorSpec.framing` → `StreamingFraming(span, hop, history, prefill)` plus an
+  optional `streaming_fn`. `supports_streaming` is derived from it, so streamability
+  cannot disagree with the arithmetic; every number the streaming feature loop used
+  to hardcode as a Kaldi `snip_edges` assumption now comes from here.
 
 ## Extension cookbook
 
@@ -418,7 +432,7 @@ recipe):
 kind is what makes it legal — no edit to the config, the `InputProcessor`, or the
 CUDA-graph feature cache.
 
-## Paradigm status (all five wired)
+## Paradigm status (all five paradigms wired, seven architectures)
 
 | Paradigm | Model package | Strategy | Mode |
 |---|---|---|---|
@@ -428,6 +442,41 @@ CUDA-graph feature cache.
 | AED (Whisper) | `whisper` (HF converter) | `aed` (incremental greedy) | offline |
 | Paraformer (NAR) | `paraformer` (FunASR converter) | `paraformer` (one-shot, CIF timestamps) | offline |
 | LLM-ASR (Qwen2-Audio) | `speech_llm` (HF converter) | `llm` (incremental greedy, token-streaming partials) | offline |
+| Transducer, recurrent predictor (Nemotron ASR) | `nemotron` (HF converter) | `transducer` (`consumes="hidden"`, greedy only) | offline + streaming |
+
+`list_models()` prints this table's model column as the registry sees it at runtime,
+including any out-of-tree architecture that arrived through the `oasr.models` entry
+point group.
+
+The first row is one capability with two decoders behind it, not two model families:
+a CTC checkpoint decodes through the GPU prefix-beam decoder by default, and
+`EngineConfig.decoder_type="ctc_wfst"` plus an `fst_path` (a prebuilt `.img` or a k2
+`HLG.pt`) routes the *same* checkpoint through the in-tree GPU WFST decoder, offline
+and streaming alike. That split is on `decoder_type`, below `decode_method` — see
+`docs/wfst_decoder_gpu.md`.
+
+The last row reshaped **two** interfaces rather than adding a leaf.
+
+Its streaming path did the second one. A chunk carries four kinds of state, and
+none of them fitted: three per-subsampling-stage conv tails (the engine modelled
+*one* CNN cache), a trained fixed attention window (the paged cache grows and
+evicts), and a frame grid defined by one centred STFT (the streaming feature loop
+assumed Kaldi `snip_edges`). Each is now a **declaration** rather than a special
+case — `streaming_state_specs`, `fixed_attention_window` + `streaming_geometry`,
+and `ExtractorSpec.framing` — which is why adding them changed no other
+architecture. Design, per-model impact and the two shared-code defects the work
+surfaced: `.artifacts/streaming_cache_design.md`.
+
+The first one is the predictor: a 2-layer LSTM, whose state cannot be recomputed
+from the last `k` labels the way the icefall predictor's can — which is what the
+greedy loop assumed when it shifted a `(B, context_size)` int tensor itself.
+The state is now opaque to the strategy behind
+`TransducerPredictor.init_state` / `predict` / `advance` / `stack_states` /
+`unstack_states` (`oasr/models/decoders/base.py`), so one loop serves both.
+Beam search is the exception and says so: it keeps the beam's states in one
+`(B, k, ctx)` buffer and gather-reorders them onto their parents, which only
+expresses a label window, so `beam_size > 1` is refused at construction for a
+recurrent predictor rather than silently reordering something else.
 
 Per-request `DecodingOptions` (`oasr.engine.DecodingOptions` — n-best, generation
 cap, sampling knobs, LLM prompt override) ride on `Request` and through the

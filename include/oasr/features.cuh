@@ -1,20 +1,28 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Pure CUDA kernels for the FBANK / MFCC feature extraction pipeline.
+// Pure CUDA kernels for the log-mel / FBANK / MFCC feature extraction pipelines.
 //
-// Three building blocks run between framing (handled by torch.unfold) and the
-// final feature tensor:
+// Building blocks, in pipeline order:
 //
-//   1. FbankPreprocess  -- DC removal + pre-emphasis + windowing + zero-pad
+//   0. StftFrame        -- framing + signal-domain pre-emphasis + windowing +
+//                          zero-pad, straight off the waveform
+//                          (B, T_wav) -> (B, num_frames, n_fft)
+//   1. FbankPreprocess  -- DC removal + pre-emphasis + windowing + zero-pad for
+//                          input that is *already* framed
 //                          (Total_frames, frame_length) -> (Total_frames, n_fft)
 //   2. (rfft_power)     -- power spectrum  (see oasr/fft.cuh)
-//   3. MelLog           -- mel filterbank + log floor
+//   3. MelLog           -- mel filterbank + log floor / additive guard
 //                          (Total_frames, n_fft/2+1) -> (Total_frames, num_mel)
 //   4. DctLifter        -- DCT-II + cepstral lifter (MFCC only)
 //                          (Total_frames, num_mel) -> (Total_frames, num_ceps)
 //
-// All kernels use `Total_frames = batch * num_frames` and one block per frame.
+// Stage 0 and stage 1 are alternatives, not a sequence: 0 owns the framing (so
+// the caller needs no `unfold` / `torch.stft`) and pre-emphasises in the *signal*
+// domain (NeMo / Nemotron), while 1 takes pre-framed input and pre-emphasises
+// per frame with Kaldi's replicate boundary plus per-frame DC removal.
+//
+// Kernels 1-4 use `Total_frames = batch * num_frames` and one block per frame.
 
 #pragma once
 
@@ -24,6 +32,104 @@
 
 namespace oasr {
 namespace features {
+
+// =============================================================================
+// 0. STFT framing: waveform -> pre-emphasised, windowed, zero-padded frames.
+// =============================================================================
+//
+// One fused pass replacing `preemphasis -> torch.stft(center=...)`'s framing and
+// windowing.  Frame `f` of row `b` covers signal samples
+//
+//     t = f * hop_length - center_offset + i,   i in [0, n_fft)
+//
+// so `center_offset = n_fft / 2` reproduces `torch.stft(center=True,
+// pad_mode="constant")` and `center_offset = 0` reproduces `center=False`
+// (== Kaldi's `snip_edges` framing).  The analysis window occupies
+// `[win_offset, win_offset + win_length)` of the frame and the rest is zero;
+// `win_offset = (n_fft - win_length) / 2` is what `torch.stft` does when
+// `win_length < n_fft`.
+//
+// Everything outside `[0, lengths[b])` reads as zero -- that is *both* the
+// constant STFT padding and the per-row length mask, which are the same thing
+// once the batch is zero-padded.
+//
+// Pre-emphasis is applied in the **signal** domain, which is what NeMo does and
+// what makes it inexpressible as a per-frame transform: `y[t] = x[t] - c*x[t-1]`
+// with `x` already length-masked, then `y` re-masked to zero past the length
+// (at `t == lengths[b]` the difference is `-c*x[len-1]`, not zero).  The `t == 0`
+// boundary has two conventions and both are used in-tree:
+//
+//   preemph_replicate = 0 : x[-1] = 0     -> y[0] = x[0]           (NeMo)
+//   preemph_replicate = 1 : x[-1] = x[0]  -> y[0] = (1-c)*x[0]     (Kaldi)
+//
+// Grid-stride over `B * num_frames * n_fft` elements: purely elementwise, no
+// reduction, and consecutive threads read consecutive `t` so the two loads per
+// element coalesce.
+__global__ inline void StftFrameKernel(const float* __restrict__ waveform,
+                                       const int32_t* __restrict__ lengths,
+                                       const float* __restrict__ window,
+                                       float* __restrict__ output, int64_t total_elems,
+                                       int wav_stride, int num_frames, int n_fft,
+                                       int win_length, int win_offset, int hop_length,
+                                       int center_offset, float preemph_coef,
+                                       int preemph_replicate) {
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total_elems; idx += stride) {
+        const int i = static_cast<int>(idx % n_fft);
+        const int64_t frame_flat = idx / n_fft;
+        const int f = static_cast<int>(frame_flat % num_frames);
+        const int b = static_cast<int>(frame_flat / num_frames);
+
+        const int w = i - win_offset;
+        if (w < 0 || w >= win_length) {
+            output[idx] = 0.0f;
+            continue;
+        }
+
+        const int len = lengths[b];
+        const int t = f * hop_length - center_offset + i;
+        if (t < 0 || t >= len) {
+            // Outside the signal: constant (zero) STFT padding, and the
+            // re-mask that keeps `-c*x[len-1]` out of the padding.
+            output[idx] = 0.0f;
+            continue;
+        }
+
+        const float* row = waveform + static_cast<int64_t>(b) * wav_stride;
+        float y = row[t];
+        if (preemph_coef != 0.0f) {
+            float prev;
+            if (t == 0) {
+                prev = preemph_replicate ? y : 0.0f;
+            } else {
+                prev = row[t - 1];
+            }
+            y -= preemph_coef * prev;
+        }
+        output[idx] = y * window[w];
+    }
+}
+
+inline cudaError_t StftFrame(const float* waveform, const int32_t* lengths, const float* window,
+                            float* output, int batch, int wav_stride, int num_frames, int n_fft,
+                            int win_length, int win_offset, int hop_length, int center_offset,
+                            float preemph_coef, bool preemph_replicate, cudaStream_t stream) {
+    const int64_t total =
+        static_cast<int64_t>(batch) * static_cast<int64_t>(num_frames) * static_cast<int64_t>(n_fft);
+    if (total == 0) {
+        return cudaSuccess;
+    }
+    const int threads = 256;
+    int64_t blocks = (total + threads - 1) / threads;
+    if (blocks > 65535) {
+        blocks = 65535;  // grid-stride handles the remainder
+    }
+    StftFrameKernel<<<static_cast<int>(blocks), threads, 0, stream>>>(
+        waveform, lengths, window, output, total, wav_stride, num_frames, n_fft, win_length,
+        win_offset, hop_length, center_offset, preemph_coef, preemph_replicate ? 1 : 0);
+    return cudaGetLastError();
+}
 
 // =============================================================================
 // 1. Fbank preprocess: DC removal + pre-emphasis + windowing + zero-pad.
@@ -128,7 +234,20 @@ inline cudaError_t FbankPreprocess(const float* frames, const float* window, flo
 // =============================================================================
 //
 // For each frame's power spectrum p[0..F-1] (F = n_fft/2+1), compute
-// log(max(mel_mat[b] @ p, log_floor)) for b = 0..num_mel-1.
+// log(max(mel_mat[b] @ p, log_floor) + log_offset) for b = 0..num_mel-1.
+//
+// The floor and the additive guard are separate knobs because the two recipes
+// in-tree are
+//   Kaldi : log_floor = float32 tiny, log_offset = 0      -> log(max(m, eps))
+//   NeMo  : log_floor = 0,            log_offset = 2^-24  -> log(m + 2^-24)
+// and folding them into one would silently move the floor of every silent bin,
+// which *is* the encoder's input scale.
+//
+// `frame_lengths` (optional; one int32 per row of `frames_per_row` frames) zeroes
+// output frames at or past a row's valid count.  A padded frame's mel energy is
+// 0, whose log is a large negative constant rather than 0, so leaving the tail
+// unmasked hands the model real-looking energy in its padding.  It has to happen
+// *after* the log, which is why it lives here and not in the framing kernel.
 //
 // Layout:
 //   gridDim.x  = total_frames
@@ -138,8 +257,9 @@ inline cudaError_t FbankPreprocess(const float* frames, const float* window, flo
 //   shared     = F floats (cached power spectrum).
 __global__ inline void MelLogKernel(const float* __restrict__ power,
                                     const float* __restrict__ mel_mat,
+                                    const int32_t* __restrict__ frame_lengths,
                                     float* __restrict__ output, int num_freq, int num_mel,
-                                    float log_floor) {
+                                    int frames_per_row, float log_floor, float log_offset) {
     extern __shared__ float spec[];
 
     const int frame_idx = blockIdx.x;
@@ -149,15 +269,26 @@ __global__ inline void MelLogKernel(const float* __restrict__ power,
     const int wid = tid >> 5;
     const int n_warps = bs >> 5;
 
-    const float* in_ptr = power + frame_idx * num_freq;
+    float* out_ptr = output + static_cast<int64_t>(frame_idx) * num_mel;
+
+    if (frame_lengths != nullptr) {
+        const int row = frame_idx / frames_per_row;
+        if (frame_idx - row * frames_per_row >= frame_lengths[row]) {
+            for (int b = tid; b < num_mel; b += bs) {
+                out_ptr[b] = 0.0f;
+            }
+            return;
+        }
+    }
+
+    const float* in_ptr = power + static_cast<int64_t>(frame_idx) * num_freq;
     for (int i = tid; i < num_freq; i += bs) {
         spec[i] = in_ptr[i];
     }
     __syncthreads();
 
-    float* out_ptr = output + frame_idx * num_mel;
     for (int b = wid; b < num_mel; b += n_warps) {
-        const float* fb = mel_mat + b * num_freq;
+        const float* fb = mel_mat + static_cast<int64_t>(b) * num_freq;
         float acc = 0.0f;
         for (int i = lane; i < num_freq; i += WARP_SIZE) {
             acc += fb[i] * spec[i];
@@ -167,18 +298,21 @@ __global__ inline void MelLogKernel(const float* __restrict__ power,
             if (acc < log_floor) {
                 acc = log_floor;
             }
-            out_ptr[b] = logf(acc);
+            out_ptr[b] = logf(acc + log_offset);
         }
     }
 }
 
-inline cudaError_t MelLog(const float* power, const float* mel_mat, float* output,
-                          int total_frames, int num_freq, int num_mel, float log_floor,
+inline cudaError_t MelLog(const float* power, const float* mel_mat, const int32_t* frame_lengths,
+                          float* output, int total_frames, int num_freq, int num_mel,
+                          int frames_per_row, float log_floor, float log_offset,
                           cudaStream_t stream) {
     const int threads = 128;  // 4 warps
     const size_t smem_bytes = static_cast<size_t>(num_freq) * sizeof(float);
-    MelLogKernel<<<total_frames, threads, smem_bytes, stream>>>(power, mel_mat, output,
-                                                                num_freq, num_mel, log_floor);
+    MelLogKernel<<<total_frames, threads, smem_bytes, stream>>>(power, mel_mat, frame_lengths,
+                                                                output, num_freq, num_mel,
+                                                                frames_per_row, log_floor,
+                                                                log_offset);
     return cudaGetLastError();
 }
 
