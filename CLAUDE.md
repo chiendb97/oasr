@@ -1,441 +1,449 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) and other coding agents working in this
+repository. Human contributors should read it too.
 
-## Project Overview
+**OASR** (Open Automatic Speech Recognition) is a high-performance CUDA inference
+framework for ASR. It serves seven encoder architectures across five decode
+paradigms — CTC, transducer (RNN-T), AED, non-autoregressive CIF, and speech-LLM
+— from one engine, with custom CUDA/CUTLASS kernels exposed to Python via TVM-FFI
+JIT compilation (FlashInfer-style) and a Rust HTTP/gRPC serving front-end.
 
-OASR (Open Automatic Speech Recognition) is a high-performance CUDA inference framework for ASR models (Conformer, Zipformer, transducer, Whisper, Paraformer, speech-LLM, Nemotron). It exposes custom CUDA/CUTLASS kernels to Python via TVM-FFI JIT compilation (FlashInfer-style).
+- User-facing overview and quick start: [`README.md`](README.md)
+- Stable technical documentation: [`docs/`](docs/README.md)
+- Point-in-time results, issues and investigations: [`.artifacts/`](.artifacts/README.md)
+  (gitignored — a fresh clone has the pointers, not the files)
 
-## Build
+---
+
+## Rules (read first)
+
+1. **Never edit the engine core to add a variant.** Every extension lands through
+   a registry — subclass a base, register under a name, select by configuration.
+   There are seven such axes; see [Architecture](#architecture).
+2. **Models are built from `oasr.layers`, never from bare `nn.Linear` /
+   `nn.LayerNorm` / `nn.Embedding` / `nn.Conv*`.** `tests/test_layer_waist.py`
+   enforces this and fails on a newly registered architecture that has no tiny
+   config to check.
+3. **A missing kernel must be declared, not routed around.** `oasr.layers._backend`
+   distinguishes *out of scope* (CPU/fp32), *a declared kernel gap*
+   (`KERNEL_GAPS` — or the call raises), and *a performance choice*. A silent
+   reroute to torch makes a missing kernel invisible.
+4. **The output tensor is the first parameter** of every TVM-FFI launcher.
+5. **Do not run `cargo build/test --workspace`**, and run cargo from `rust/`, not
+   the repo root. See [Rust workspace](#rust-workspace).
+6. **Do not add a `pull_request` trigger to `.github/workflows/test-gpu.yml`** —
+   the repo is public and that workflow runs on a self-hosted runner.
+7. **Never read a gating environment variable directly in a test.** Declare the
+   asset in `tests/assets.py` and gate through `assets.require(...)` /
+   `@pytest.mark.requires_assets(...)`, so every skip is counted and reported.
+8. **Per-decode-family knobs go on the strategy's `options_cls`, not on
+   `EngineConfig`.** Engine-level knobs (tick budget, decode slots, KV budget)
+   stay on `EngineConfig`.
+9. **Never pass `-inf` as `attn_bias`.** Use a large finite mask floor —
+   mathematically identical, and the fused kernel is inaccurate above a
+   moderate finite bias magnitude.
+10. **Never branch kernel dispatch on CUDA-graph capture state.** A
+    capture-dependent branch makes the graph pick a different kernel than eager,
+    and the resulting one-ulp difference has changed decoded tokens.
+11. **Keep transient material out of `CLAUDE.md` and `docs/`.** Benchmark
+    numbers, known issues, investigations and experiment results go in
+    `.artifacts/`, with a one-line pointer left behind.
+12. **Do not commit or push unless asked.** Create the branch and the files, then
+    hand off.
+
+---
+
+## Common commands
+
+| Task | Command |
+|---|---|
+| Editable install | `pip install -e .` |
+| Install everything | `pip install -e ".[all]"` |
+| Run all Python tests | `pytest tests/` |
+| One test file / function | `pytest tests/test_conv.py::TestDepthwiseConv1D -v` |
+| Skip slow tests | `pytest tests/ -m "not slow"` |
+| Engine concurrency stress (opt-in) | `pytest tests/test_engine_concurrent.py -m concurrent -v` |
+| Format Python | `black oasr/ tests/ benchmarks/ scripts/ ci/` then `isort` the same paths |
+| Lint Python | `ruff check oasr/ tests/ benchmarks/ scripts/ ci/` |
+| Type check (ratchet) | `python scripts/mypy_ratchet.py` |
+| Format C++/CUDA | `clang-format -i csrc/**/*.cu csrc/**/*.h csrc/**/*.cpp` |
+| Rust build / test / lint | `cd rust && cargo build --release && cargo test && cargo clippy --all-targets -- -D warnings` |
+| Serve a checkpoint | `oasr-server --ckpt-dir <dir> --service-mode offline --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051` |
+| Convert a checkpoint | `oasr-convert <src> <dst>` |
+| Kernel benchmark | `python benchmarks/oasr_benchmark.py --list` |
+| Engine / service / accuracy benchmark | `python benchmarks/bench_{engine,service,accuracy}.py` |
+
+---
+
+## Installation & build
 
 ```bash
-# Editable install (recommended for development)
-pip install -e .
-
-# Target specific GPU architecture
+git submodule update --init          # provides 3rdparty/cutlass — CMake does not
+pip install -e .                     # editable install
 CUDA_ARCHITECTURES=80 pip install -e .
-
-# Install with serving extras (HTTP/WebSocket client libs for benchmarks)
-pip install -e .[serving]
-
-# Optional extras: [hub] (huggingface_hub + safetensors — Hub download & native
-# checkpoint I/O), [tokenizers] (sentencepiece + tokenizers — TokenizerSpec
-# kinds beyond symbol_table)
-pip install -e .[hub,tokenizers]
-
-# Optional: build the Rust serving frontend as a standalone binary
-cd rust && cargo build --release
+pip install -e ".[all]"              # audio + hub + tokenizers + attention + serving
+cd rust && cargo build --release     # optional standalone oasr-server binary
 ```
 
-The build compiles three artifacts into the package: the `_C.so` pybind11 extension (decoder + enums) via CMake, and — via setuptools-rust (`[[tool.setuptools-rust.ext-modules]]` in `pyproject.toml`) — the `oasr._core` PyO3 extension module (the Rust serving core) plus the `oasr-server` console script that loads it. CUDA kernels are JIT-compiled on first use via TVM-FFI and cached in `~/.cache/oasr/jit/`. A Rust toolchain + `protobuf-compiler` must be on `PATH` at build time; with `--no-build-isolation`, `pip install "setuptools-rust>=1.10"` first. `setuptools-rust` runs cargo from the repo root, so the root `.cargo/config.toml` mirrors `rust/.cargo/config.toml`'s target-dir redirect (the repo's NFS mount breaks rustc autocfg probes). The same workspace still builds a standalone `rust/target/release/oasr-server` binary via plain `cargo build`.
+`pip install` produces three artifacts inside the package:
 
-## Testing
+| Artifact | Built by | Contains |
+|---|---|---|
+| `oasr/_C.so` | CMake + pybind11 | CPU-side CTC/WFST decoders, legacy enums |
+| `oasr/_core.so` | setuptools-rust | `oasr._core` — the Rust serving core |
+| `oasr-server` | console script | forwards `sys.argv` into `oasr._core.serve` |
 
-```bash
-# Run all Python unit tests
-pytest tests/
+CUDA kernels are **not** built here: they JIT-compile on first *call* via TVM-FFI
+and cache in `~/.cache/oasr/jit/`. That is why `import oasr` works on a machine
+with no compiled extension, and why `test-cpu.yml` builds nothing.
 
-# Run a single test file
-pytest tests/test_conv.py
+**Build requirements:** CUDA ≥ 11.8, CMake ≥ 3.18, Python ≥ 3.10, a Rust
+toolchain and `protobuf-compiler` on `PATH`, C++17. With `--no-build-isolation`,
+`pip install "setuptools-rust>=1.10"` first.
 
-# Run a single test function
-pytest tests/test_conv.py::TestDepthwiseConv1D -v
+On a filesystem whose I/O semantics break rustc's autocfg probes (an NFS mount,
+for example), redirect cargo's target directory — via `CARGO_TARGET_DIR`, or via
+a **gitignored** `.cargo/config.toml`. Two are needed, because cargo is invoked
+from two places: `rust/.cargo/config.toml` for `cd rust && cargo build`, and one
+at the repo root for `pip install`, which runs cargo from there.
 
-# Skip slow tests
-pytest tests/ -m "not slow"
+Extras: `[audio]`, `[hub]` (Hub download + native checkpoint I/O), `[tokenizers]`
+(kinds beyond `symbol_table`), `[attention]` (CuTeDSL fused attention; SDPA
+fallback without it), `[serving]` (benchmark client libs), `[wfst]` (k2 — offline
+graph export only, never at decode time).
 
-# Run multi-thread engine stress tests (opt-in marker)
-pytest tests/test_engine_concurrent.py -m concurrent -v
-```
+Full details: [`docs/kernels.md`](docs/kernels.md).
 
-Tests live under `tests/`. Functional API tests follow a flat `tests/test_<kernel>.py` layout (FlashInfer convention). The conftest at `tests/conftest.py` provides fixtures: `device` (CUDA, skips if unavailable), `dtype`/`dtype_all` (FP32/FP16/BF16), `batch_seq_hidden` (common shape tuples), plus `ckpt_dir` / `wav_dir` / `audio_path` / `lang_dir` (which now **gate** rather than return `""`). Default pytest options (`-v --tb=short`) are set in `pyproject.toml`. Registered markers: `slow` (long-running, skip with `-m 'not slow'`), `concurrent` (multi-thread engine stress, opt-in), `cuda`, and `requires_assets(*names)`.
-
-**External assets are declared once, in `tests/assets.py`** — checkpoints, audio dirs, decoding graphs, and upstream reference source trees, each with the marker file that proves it is really present (a dangling-LFS-symlink HF snapshot is not a usable checkpoint). `assets.require(...)` / `assets.require_wavs(n)` / `@pytest.mark.requires_assets(...)` are the only skip sites, so every skip is counted and every run prints an `external assets:` table saying what it did **not** cover. Never read the gating env var directly in a test: that ad-hoc pattern is exactly what let `pytest tests/` report a fully green suite while silently skipping every real-checkpoint test (and hid the `audio_scale` bug). `--strict-assets` turns those skips into failures — what `test-gpu.yml` runs — with `--allow-missing-asset NAME` naming each exception in the workflow file. `--min-passed N` is a coverage floor for the CPU job. `tests/test_accuracy.py` is the **end-to-end accuracy gate**: WER on a fixed 200-utterance LJSpeech manifest against recorded rates in `ci/wer-reference.json` (conformer 4.08 / whisper-tiny 3.73 / zipformer 4.06 / nemotron 2.62, tolerance 0.3) — the one check a numerical-parity oracle structurally cannot make, since parity feeds identical features to both sides and a frontend-convention bug cancels on both (reintroducing the `audio_scale` defect moves it 5.74% → 100%). It also catches what parity cannot see on the *kernel* side: nemotron first measured 2.70% at `max_batch_size=16` against 2.62% at 1, and the batch-size dependence was a fused-attention defect on `-inf` mask floors (`.artifacts/known_issues.md` §4), not noise — every rate in the file is now bit-stable across batch 1/8/16/32. See `.artifacts/ci.md`. `tests/test_layer_waist.py` is the **structural** gate: it builds every registered architecture tiny on CPU and fails on a bare `nn.Linear`/`nn.LayerNorm`/`nn.Embedding` in the tree, and its tiny-config table is keyed off `list_models()` so a newly registered architecture with no entry fails instead of going uncovered. It also pins that each layer's kernel and torch paths agree on CUDA — without that, the CPU parity oracles are evidence about nothing the server runs.
-
-## Linting & Formatting
-
-```bash
-pip install -r requirements-dev.txt   # pinned; CI gates on these exact versions
-
-# Format Python code
-black oasr/ tests/ benchmarks/ scripts/
-isort oasr/ tests/ benchmarks/ scripts/
-
-# Lint
-ruff check oasr/ tests/ benchmarks/ scripts/
-
-# Type check (a per-file ratchet, not a zero-error gate)
-python scripts/mypy_ratchet.py
-
-# Format C++/CUDA (requires clang-format)
-clang-format -i csrc/**/*.cu csrc/**/*.h csrc/**/*.cpp
-```
-
-Style: Python uses 100-char line length (black + isort/black profile). C++ uses Google style with 100-char limit and C++17.
-
-`isort` and ruff's `I` rules **both** sort imports and are configured to agree (`known_first_party`/`combine_as_imports`/`force_sort_within_sections` are mirrored between `[tool.isort]` and `[tool.ruff.lint.isort]`); change them together or the two tools will fight and CI will flap. `mypy oasr/` reports ~495 errors, nearly all untyped-torch noise, so `scripts/mypy_ratchet.py` gates on *no file getting worse* against `ci/mypy-baseline.json` (`--update` after a cleanup). `B905` (`zip(strict=)`) is ignored — 38 call sites, each needing a per-site length judgement; enabling it is a follow-up.
-
-CI lives in `.github/workflows/`: `lint.yml` and `test-cpu.yml` on every PR (GitHub-hosted, nothing built — `import oasr` works without `_C.so`/`_core.so` because kernels JIT on first *call*), plus **two GPU backends** running the same per-family split from `ci/gpu_suites.py` with `--strict-assets`: `test-gpu.yml` nightly on the self-hosted `oasr-gpu` runner, and `test-gpu-modal.yml` on Modal's `RTX-PRO-6000` (GB202 — the same sm_120 as the 5090; `ci/modal_app.py`, checkpoints in a Volume seeded by `modal run ci/modal_app.py::seed_assets`). Do **not** add a `pull_request` trigger to the self-hosted workflow — the repo is public. `.pre-commit-config.yaml` mirrors the fast half locally. Full detail in `.artifacts/ci.md`.
-
-### Rust workspace (`rust/`)
+### Rust workspace
 
 ```bash
-cd rust
-cargo build --release      # builds default-members (incl. the oasr-server binary)
-cargo test                 # tests default-members
-cargo test -p oasr-asr     # tests a single crate
-cargo fmt                  # rustfmt (run before committing Rust changes)
+cd rust                                          # always — not the repo root
+cargo build --release                            # default-members (incl. oasr-server)
+cargo test                                       # default-members
+cargo test -p oasr-asr                           # one crate
+cargo fmt                                        # before committing Rust
 cargo clippy --all-targets -- -D warnings
 cargo clippy -p oasr-core --lib -- -D warnings   # excluded from default-members
 ```
 
-**Do not run `cargo build/test --workspace`.** `oasr-core` (the `oasr._core`
-extension module) enables `pyo3/extension-module` while `oasr-server` (binary)
-enables `pyo3/auto-initialize` — those features are mutually exclusive and Cargo
-unifies them per build, so building both crates in one invocation fails to
-compile. `oasr-core` is therefore excluded from `default-members`; plain `cargo`
-commands build the binary, and setuptools-rust builds `oasr-core` on its own
-(`pip install` / `python setup.py build_rust --inplace`). Run cargo from `rust/`
-(not the repo root) so `rust/.cargo/config.toml`'s target-dir redirect applies
-— the repo's NFS mount otherwise breaks rustc autocfg probes.
+**Never `--workspace`.** `oasr-core` enables `pyo3/extension-module` while
+`oasr-server` enables `pyo3/auto-initialize`; those features are mutually
+exclusive and Cargo unifies them per build, so one invocation covering both fails
+to compile. `oasr-core` is therefore excluded from `default-members` and is built
+by setuptools-rust on its own (`pip install`, or
+`python setup.py build_rust --inplace`).
 
-## Benchmarks & Profiling
+---
 
-The unified benchmark framework (`benchmarks/oasr_benchmark.py`) replaces standalone scripts. It uses a routine registry (`benchmarks/routines/`) with per-family modules.
+## Architecture
 
-Backend names differ by kernel family:
-- `cutlass` / `torch` — GEMM, Conv2D (CUTLASS-based)
-- `cuda` / `torch` — Norm, Conv1D, Activation, Composite (handwritten CUDA)
+```
+Request → InputProcessor (GPU fbank) → Scheduler (BatchingPolicy + PartitionPolicy)
+   → ModelRunner
+        ├─ offline:   model.forward_offline / forward_offline_packed → enc_out
+        └─ streaming: StreamingEncoderBackend.forward_step           → enc_out
+   → OutputProcessor → DecodeStrategy (+ Detokenizer) → RequestOutput
+```
+
+Kernels are layered strictly:
+
+```
+Python functional API (oasr/<family>.py)  — @oasr_api
+    └── JIT generator (oasr/jit/<family>.py) → JitSpec / JinjaJitSpec
+            └── TVM-FFI JIT binding (csrc/<family>_jit_binding.cu)
+                    └── TVM-FFI launcher (csrc/<family>.cu)
+                            └── Pure CUDA kernels (include/oasr/<family>.cuh)
+```
+
+### The seven extension axes
+
+Each is a registry. Adding a variant means subclass + register — no engine edits.
+
+| Axis | Base class | Selected by |
+|---|---|---|
+| Encoder architecture | `oasr.models.BaseAsrModel` / `BaseEncoder` | native format → `architecture=` → `CheckpointConverter.detect` |
+| Checkpoint format | `CheckpointConverter` (`oasr/models/converter.py`) | `detect()`, ranked by `detect_specificity` |
+| Decode family | `oasr.engine.decode.DecodeStrategy` | `EngineConfig.decode_method` (validated against `model.capabilities`) |
+| Streaming runtime | `oasr.engine.streaming_backend.StreamingEncoderBackend` | `model.encoder.streaming_kind` |
+| Batching | `oasr.engine.batching.BatchingPolicy` / `PartitionPolicy` | `EngineConfig.schedule_policy` |
+| Tokenizer | `oasr.tokenizers.Tokenizer` | converter-emitted `TokenizerSpec.kind` |
+| Feature frontend | `oasr.features.ExtractorSpec` | `FeatureConfig.feature_type`, from `FeatureSpec` |
+
+Orthogonal to all seven is the **layer waist**: `oasr.layers` is what every
+architecture is built from, so a kernel improvement, CUDA-graph capture or a
+future quantized path applies to all of them.
+
+[`docs/architecture.md`](docs/architecture.md) is the authoritative map, with the
+extension cookbook for each axis.
+
+---
+
+## Key files
+
+| Path | Role |
+|---|---|
+| `oasr/engine/engine.py` | `ASREngine` — the step loop; offline + streaming in one pool |
+| `oasr/engine/config.py` | `EngineConfig` — every engine-level knob |
+| `oasr/engine/scheduler.py` | Batch selection and partition, starvation bounds |
+| `oasr/engine/decode/` | Decode strategies (`ctc_gpu`, `ctc_wfst`, `transducer`, `aed`, `llm`, `paraformer`, `rescoring`) + `options.py` |
+| `oasr/engine/streaming_backend/` | `PagedStreamingBackend`, `StatefulStreamingBackend` |
+| `oasr/engine/graph_cache.py` | CUDA-graph capture of the steady-state streaming encoder |
+| `oasr/engine/memory.py` | VRAM-aware capacity derivation (paged pool, AR decoder KV) |
+| `oasr/models/base.py` | `BaseAsrModel` / `BaseEncoder` / `CacheSpec` / `LoadReport` |
+| `oasr/models/interfaces.py` | `CAPABILITIES` — what each decode family requires of a model |
+| `oasr/models/registry.py` | `register_model`, `build_model_from_checkpoint`, entry-point discovery |
+| `oasr/layers/` | The narrow waist; `_backend.py` holds the routing rules and `KERNEL_GAPS` |
+| `oasr/jit/core.py`, `oasr/jit/env.py` | JIT specs, nvcc flags, the cache key |
+| `oasr/gemm.py`, `oasr/attention.py` | The two families with shape-aware routing |
+| `csrc/tvm_ffi_utils.h` | DLPack dispatch + the validation macros every launcher uses |
+| `rust/crates/oasr-engine-client/` | The GIL-owning dispatcher thread |
+| `rust/crates/oasr-serve/` | Mode-agnostic serving core shared by binary and extension |
+| `tests/assets.py` | The single declaration point for every external test asset |
+| `ci/gpu_suites.py` | The per-family GPU test split, shared by both GPU backends |
+
+---
+
+## Design patterns
+
+| Pattern | Where | Note |
+|---|---|---|
+| Registry per extension axis | `oasr/models`, `oasr/engine/{decode,streaming_backend,batching}`, `oasr/tokenizers`, `oasr/features` | Subclass + register; selection is by configuration |
+| Narrow waist | `oasr/layers` | Every architecture composes the same layers; each layer owns a kernel path **and** a torch path |
+| Config / template / dispatch split | `include/oasr/<family>/` | `cutlass_*_configs.h`, `*_cutlass_template.h`, `*_cutlass.h` |
+| JIT on first call | `oasr/jit/` | Cache key covers sources, `include/`, nvcc flags and the CUTLASS version stamp |
+| Checkpoint-derived specs | `TokenizerSpec`, `FeatureSpec`, `DecodingDefaults` | Converters emit them; the engine materializes config from them |
+| Declared capability | `CAPABILITIES` + `require_capability` | An unserviceable checkpoint fails at engine construction, naming the missing members |
+| Declared cache | `streaming_state_specs`, `fixed_attention_window`, `streaming_geometry`, `ExtractorSpec.framing` | A new streaming cache is data, not a new manager |
+| Per-family options | `DecodeStrategy.options_cls` + `--decode-option k=v` | Adding a family needs no new CLI flag and no `EngineConfig` field |
+| Counted gaps | `KERNEL_GAPS`, `format_gap_report()`, `rule_miss_report()` | What is missing is measurable, not invisible |
+
+---
+
+## Anti-patterns & gotchas
+
+- **Editing a vendored CUTLASS header without bumping `version.h`** leaves the
+  JIT cache short-circuiting on a stale `.so`. Run `rm -rf ~/.cache/oasr/jit`.
+  Always confirm a fresh hash directory before trusting a kernel benchmark.
+- **Forgetting `git submodule update --init`.** CMake fetches only pybind11;
+  CUTLASS comes from the submodule.
+- **Changing `[tool.isort]` without `[tool.ruff.lint.isort]`** (or vice versa).
+  Both sort imports, and `known_first_party` / `combine_as_imports` /
+  `force_sort_within_sections` are mirrored between them. Change them together or
+  the two tools fight and CI flaps.
+- **Assuming a green `pytest tests/` means full coverage.** Without the external
+  assets, real-checkpoint tests skip. Every run prints an `external assets:`
+  table naming what it did *not* cover; `--strict-assets` makes a missing asset
+  fatal.
+- **Trusting a single-order A/B.** Interleave the arms — the second one benefits
+  from a warm allocator. Report a σ, not one run.
+- **Optimizing GPU time at small batch.** The encoders are CPU-issue-bound at
+  batch 1–2, where removing GPU work can make them *slower*. Compare issue time
+  against wall time.
+- **Reusing a CUDA-graph replay buffer's output.** One buffer per shape key: a
+  returned tensor is live only until the next replay *or capture*. Copy when a
+  step can hit the same key twice.
+- **Declaring `streaming_kind` from what the class implements** rather than from
+  what *this config's weights* can do. Over-claiming builds an engine that raises
+  on its first request instead of failing at construction.
+- **Adding an `EngineConfig` field for one decode family.** Use `options_cls`.
+- **`nn.Linear` in a model file.** Use `oasr.layers`.
+- **`LinearActivation(activation="gelu")`.** Only `gelu_tanh` exists — the CUDA
+  epilogue is the tanh approximation, and fusing it under the exact-erf name
+  would be a silent accuracy change.
+- **A row-strided 2D input to a GEMM launcher** (`x[:, -1]` of a `(B, T, D)`).
+  Guarded now by `CHECK_CONTIGUOUS_INPUT`; it used to return garbage silently.
+- **Believing a solo test proves a stream is synchronised.** A missing
+  cross-stream ordering only misbehaves when something else is using the GPU.
+  Congest the other stream on purpose in the test; do not rely on timing. And
+  never accept `CUDA_LAUNCH_BLOCKING=1` "fixing" it as a diagnosis — it
+  serialises everything, including the overlap that may be the actual bug.
+- **Trusting a regression test that has never been seen to fail.** Revert the fix
+  and watch it fail in exactly the predicted parametrisations.
+
+Open defects with repros: `.artifacts/known_issues.md`.
+
+---
+
+## Development workflow
+
+1. Branch from `main` (see [Branching](#branching-policy-and-prs)).
+2. `pip install -r requirements-dev.txt` — pinned; CI gates on these exact
+   versions. Optionally `pip install pre-commit && pre-commit install`, which
+   mirrors the fast half of the lint workflow locally.
+3. Make the change. If it touches a registry axis, follow the cookbook in
+   [`docs/architecture.md`](docs/architecture.md) rather than editing the engine.
+4. Add tests. A new architecture also needs a tiny config in
+   `tests/test_layer_waist.py` and, if it changes decode behaviour, an entry in
+   `ci/wer-reference.json`.
+5. Run locally, in this order:
+   ```bash
+   black oasr/ tests/ benchmarks/ scripts/ ci/ && isort oasr/ tests/ benchmarks/ scripts/ ci/
+   ruff check oasr/ tests/ benchmarks/ scripts/ ci/
+   python scripts/mypy_ratchet.py
+   pytest tests/ -m "not slow"
+   cd rust && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+   ```
+   `mypy` and `cargo test` are deliberately **not** pre-commit hooks — too slow
+   for a commit. Run them before opening a PR, or let CI do it.
+6. Record any measurements in `.artifacts/`, not in `CLAUDE.md` or `docs/`.
+
+Style: Python is 100 characters (black + isort's black profile). C++ is Google
+style, 100 characters, C++17. CUDA flags include `--expt-relaxed-constexpr`,
+`--expt-extended-lambda`, `-O3`, `--use_fast_math`.
+
+### Branching policy and PRs
+
+- `main` is the default and merge target. Never commit to it directly.
+- Branch names follow `<type>/<topic>`: `feat/`, `fix/` or `bugfix/`, `perf/`,
+  `refactor/`, `chore/`, `docs/`.
+- Open a GitHub PR against `main` (`gh pr create`); merges go through PRs.
+- Keep a PR to one concern. Discuss substantial changes in an issue first.
+- Do not commit or push on a maintainer's behalf unless explicitly asked.
+
+---
+
+## CI / testing
+
+Tests live under `tests/`, flat, one file per kernel or component
+(`tests/test_<thing>.py`, FlashInfer convention). `tests/conftest.py` provides
+`device`, `dtype` / `dtype_all`, `batch_seq_hidden`, and the asset fixtures
+`ckpt_dir` / `wav_dir` / `audio_path` / `lang_dir` (which **gate**, not return
+`""`). Default options `-v --tb=short` come from `pyproject.toml`.
+
+Markers: `slow`, `concurrent` (opt-in), `cuda`, `requires_assets(*names)`.
+
+**External assets are declared once, in `tests/assets.py`** — checkpoints, audio
+directories, decoding graphs, upstream reference source trees, each with the
+marker file that proves it is really present (a dangling-LFS-symlink HF snapshot
+is not a usable checkpoint). Flags: `--strict-assets` (missing asset ⇒ failure),
+`--allow-missing-asset NAME` (documented exception), `--min-passed N` (coverage
+floor).
+
+Three gates matter beyond the unit tests:
+
+| Gate | File | Checks |
+|---|---|---|
+| Accuracy | `tests/test_accuracy.py` | WER on a fixed 200-utterance LJSpeech manifest against `ci/wer-reference.json`. The one check a numerical-parity oracle structurally *cannot* make — parity feeds identical features to both sides, so a frontend-convention bug cancels on both. |
+| Structural | `tests/test_layer_waist.py` | No bare torch layer in any registered architecture; every architecture has a tiny config; kernel and torch paths agree on CUDA. |
+| Contract | `tests/test_model_contract.py` | The `CAPABILITIES` table is satisfiable by every registered architecture. |
+
+Workflows in `.github/workflows/`:
+
+| Workflow | Runner | Trigger |
+|---|---|---|
+| `lint.yml` | GitHub-hosted | push to `main`, every PR |
+| `test-cpu.yml` | GitHub-hosted | push to `main`, every PR (Python 3.10 + 3.12, no GPU) |
+| `test-gpu.yml` | self-hosted `oasr-gpu` | nightly + manual — **do not add a `pull_request` trigger** |
+| `test-gpu-modal.yml` | Modal `RTX-PRO-6000` (sm_120) | weekly + manual |
+
+Both GPU backends run the same per-family split from `ci/gpu_suites.py` with
+`--strict-assets`. `mypy` is a **per-file ratchet** against `ci/mypy-baseline.json`,
+not a zero-error gate (`--update` after a cleanup). Full detail:
+[`docs/ci.md`](docs/ci.md).
+
+---
+
+## Benchmarking
+
+Three harnesses, all with defaults from `.env` (copy `.env.example`, edit, then
+`set -a; source .env; set +a`):
+
+| Harness | Measures |
+|---|---|
+| `benchmarks/oasr_benchmark.py` | Kernel level, via a routine registry (`benchmarks/routines/`) |
+| `benchmarks/bench_engine.py` | In-process `ASREngine` — the GPU + Python ceiling |
+| `benchmarks/bench_service.py` | End-to-end `oasr-server` — what clients see |
+| `benchmarks/bench_accuracy.py` | WER/CER **and** RTFx / p50 / p99 in the same CSV row |
 
 ```bash
-# Single kernel benchmark (GEMM family uses cutlass/torch)
-python benchmarks/oasr_benchmark.py --routine gemm --subroutine bmm \
-    --backends cutlass torch --batch-count 256 --M 200 --N 200 --K 64 --dtype float16 --refcheck -vv
-
-# Single kernel benchmark (Norm/Conv1D/Activation family uses cuda/torch)
-python benchmarks/oasr_benchmark.py --routine norm --subroutine layer_norm \
-    --backends cuda torch --batch 64 --seq 250 --hidden 512 --refcheck -vv
-
-# List all available routines/subroutines
 python benchmarks/oasr_benchmark.py --list
-
-# Batch testing from testlist files
+python benchmarks/oasr_benchmark.py --routine gemm --subroutine bmm \
+    --backends cutlass torch --batch-count 256 --M 200 --N 200 --K 64 \
+    --dtype float16 --refcheck -vv
 python benchmarks/oasr_benchmark.py --testlist benchmarks/testlists/conformer_base.txt \
     --output_path results.csv --refcheck
 
-# Engine-level benchmark with CUDA Graph capture of the streaming encoder
-# (toggles EngineConfig.use_cuda_graphs; default is "on")
-python benchmarks/bench_engine.py --cuda-graphs on        # captured (default)
-python benchmarks/bench_engine.py --cuda-graphs off       # eager (apples-to-apples profiling)
-
-# Profiling with Nsight Compute (NVTX markers via --profile)
 ncu --set full -o gemm_profile python benchmarks/oasr_benchmark.py \
     --routine gemm --subroutine gemm --backends cutlass --profile --dry_run_iters 0
 ```
 
-Legacy `bench_*.py` scripts still work as thin wrappers. See `benchmarks/README.md` for full CLI reference.
+Backend names differ by family: `cutlass` / `torch` for GEMM and Conv2D;
+`cuda` / `torch` for Norm, Conv1D, Activation and composites.
 
-`benchmarks/bench_accuracy.py` is the accuracy counterpart: manifest-driven WER/CER (`oasr/testing/wer.py` — **corpus** rate, Whisper `EnglishTextNormalizer` semantics) with RTFx / throughput / p50 / p99 in the same CSV row, so accuracy and speed are visible together. Manifests (`benchmarks/manifests/*.jsonl`) ship without audio; build one with `--build-manifest`, which unwraps `(...)` because the English normalizer deletes bracketed spans and LJSpeech reads them aloud. `oasr/testing/accuracy.py` holds the manifest/transcribe helpers the benchmark and the gate share.
+**Methodology:** interleave the arms, report a σ over several iterations, watch
+issue time against wall time at small batch, and confirm a fresh JIT hash
+directory. Recipes: [`docs/benchmarks.md`](docs/benchmarks.md) and the
+`/benchmark-kernel` skill. Results go in `.artifacts/`.
 
-### Engine vs. service benchmarks
+---
 
-Two top-level perf harnesses pair up to measure the GPU ceiling (`bench_engine.py`)
-and the end-to-end serving cost (`bench_service.py`). Both pick up defaults
-from `.env` — copy `.env.example` to `.env`, edit, then
-`set -a; source .env; set +a` to export.
+## Configuration
 
-| Env var | Becomes the default for |
-|---|---|
-| `CKPT_DIR`, `AUDIO_DIR` | `--ckpt-dir`, `--audio-dir` (expanded in shell, both scripts) |
-| `OASR_RS_BIN` | Path to `oasr-server` (`bench_service.py` reads it directly to spawn the server) |
-| `NUM_UTTERANCES` | `--num-utterances` (both scripts) |
-| `MAX_BATCH_SIZE` | `--max-batch-size` (both scripts) |
-| `CONCURRENCY` | `--concurrency` (`bench_service.py`) |
-| `CHUNK_MS` | `--chunk-ms` (`bench_service.py`) |
-
-CLI flag still wins when both are given. Templates — substitute the bracketed
-placeholders, or drop the flag to pick up the matching `.env` default:
-
-```bash
-# Engine — pure GPU + Python, no IPC/HTTP
-python benchmarks/bench_engine.py \
-    --ckpt-dir [CKPT_DIR] \
-    --audio-dir [AUDIO_DIR] \
-    --subroutines [offline|streaming|offline_wfst|streaming_wfst] \
-    --max-batch-size [MAX_BATCH_SIZE] \
-    --num-utterances [NUM_UTTERANCES] \
-    --chunk-size [CHUNK_SIZE] \
-    --cuda-graphs [on|off]
-
-# Service — Rust + HTTP + PyO3 dispatcher (auto-spawns oasr-server)
-python benchmarks/bench_service.py \
-    --ckpt-dir [CKPT_DIR] \
-    --audio-dir [AUDIO_DIR] \
-    --subroutines [offline|grpc_offline|grpc_streaming|whisper] \
-    --num-utterances [NUM_UTTERANCES] \
-    --concurrency [CONCURRENCY] \
-    --max-batch-size [MAX_BATCH_SIZE] \
-    --chunk-ms [CHUNK_MS] \
-    --wire-encoding [f32_le|i16_le] \
-    --realtime [0|1] \
-    --decoder-type [ctc_cuda|ctc_wfst] \
-    --fst-path [/path/to/lang_bpe/HLG.pt]   # ctc_wfst only
-```
-
-`--wire-encoding` (default `i16_le`) chooses the PCM format the bench client
-sends; `oasr-asr::decode_raw_pcm` widens i16 back to f32 server-side.
-`--service-mode` is auto-derived from `--subroutines`. Full recipe in
-`docs/benchmarks.md`.
-
-## Architecture
-
-### Layered design
-
-```
-Python functional API (oasr/<family>.py)  — @oasr_api decorated
-    └── JIT generator (oasr/jit/<family>.py) → JitSpec / JinjaJitSpec
-            └── TVM-FFI JIT binding (csrc/<family>_jit_binding.cu)
-                    └── TVM-FFI launcher (csrc/<family>.cu)
-                            └── Pure CUDA kernels (include/oasr/<family>.cuh)  — facade
-                                    └── Config  (cutlass_*_configs.h)
-                                    └── Template (*_cutlass_template.h)
-                                    └── Dispatch (*_cutlass.h / *_dispatch.inc)
-```
-
-### C++ / CUDA layer (FlashInfer-style config/template/dispatch split)
-
-Each CUTLASS kernel family uses a three-header pattern:
-
-| Header | Purpose | Example (GEMM) |
-|--------|---------|-----------------|
-| `cutlass_*_configs.h` | Config structs (`GemmConfig`), per-SM MMA traits (`SmMMATraits`), default configs (`DefaultGemmConfig`) | `gemm/cutlass_gemm_configs.h` |
-| `*_cutlass_template.h` | CUTLASS kernel template parameterized by Config + MMATraits | `gemm/gemm_cutlass_template.h` |
-| `*_cutlass.h` | Public dispatch interface (JIT mode via `OASR_TARGET_SM`, AOT mode via `OASR_DISPATCH_SM`) | `gemm/gemm_cutlass.h` |
-
-Non-CUTLASS kernels (Conv1D, Norm, Activation) use `*_dispatch.inc` files with VecSize/block_size dispatch macros instead.
-
-- **`include/oasr/`** — Pure CUDA kernel headers (no framework dependencies):
-  - `common/` — Shared types (`types.h`), vector dtypes (`vec_dtypes.h`), SM dispatch (`arch_dispatch.h`), epilogue functors, math utilities.
-  - `activation.cuh` + `activation_dispatch.inc` — GLU, Swish activation kernels with VecSize dispatch.
-  - `norm.cuh` + `norm_dispatch.inc` — LayerNorm, RMSNorm, BatchNorm1d, GroupNorm, fused norm+activation with VecSize/block_size dispatch.
-  - `conv/` — `conv1d.cuh` + `conv1d_dispatch.inc` (depthwise, pointwise, causal), `conv2d.cuh` facade → `cutlass_conv2d_configs.h` / `conv2d_cutlass_template.h` / `conv2d_cutlass.h`.
-  - `gemm/` — `gemm.cuh` facade → `cutlass_gemm_configs.h` / `gemm_cutlass_template.h` / `gemm_cutlass.h`. Also `bmm.cuh`, `group_gemm.cuh`.
-- **`csrc/`** — TVM-FFI launcher layer (`<family>.cu`) and JIT binding exports (`<family>_jit_binding.cu`). Also contains `tvm_ffi_utils.h` with DLPack dtype dispatch and validation macros.
-- **`csrc/templates/`** — Jinja2 templates for config-specific CUTLASS instantiations (`gemm_cutlass_template.cu.jinja`, `bmm_cutlass_template.cu.jinja`, `group_gemm_cutlass_template.cu.jinja`).
-- **`csrc/decoder/`** — decoder implementations, grouped by decode family:
-  - `ctc/` — **GPU** CTC prefix-beam-search TVM-FFI launcher + JIT binding (`ctc_decoder.cu`, `ctc_decoder_jit_binding.cu`), JIT-compiled at runtime via `oasr/jit/ctc_decoder.py` (this is the one JIT launcher/binding pair that does **not** live at the `csrc/` root — see the binding pattern below). `ctc/cpu/` holds the **CPU-side** C++ decoders compiled into `_C.so` via CMake: CTC greedy search, prefix beam search, WFST beam search (via k2), streaming WFST decoder, `ContextGraph` for phrase boosting, and shared `common/utils`.
-  - `wfst/` — in-tree **GPU WFST** beam-search decoder (TVM-FFI JIT). Its exact-semantics CPU reference oracle is test-only and lives in a separate JIT module under `csrc/tests/wfst/` (kept out of the production decoder library).
-- **`csrc/pybind/`** — pybind11 module for decoder bindings and legacy enums (`pybind_main.cpp`, `pybind_decoder.h`).
-
-### Dispatch modes
-
-| Kernel Family | Dispatch Mode | Config Source | Source Generation |
-|---------------|---------------|---------------|-------------------|
-| GEMM, BMM, GroupGEMM | **jinja** | `cutlass_gemm_configs.h` | Jinja renders `.cu` with baked-in config |
-| Conv2D | **jinja** | `cutlass_conv2d_configs.h` | Jinja renders `.cu` with baked-in config |
-| Conv1D | **dispatch** | `conv1d_dispatch.inc` | Direct compilation, VecSize macro |
-| Norm | **dispatch** | `norm_dispatch.inc` | Direct compilation, block/vec macro |
-| Activation | **dispatch** | `activation_dispatch.inc` | Direct compilation, VecSize macro |
-
-**JIT mode** (`OASR_TARGET_SM` defined): single SM instantiation, optional `JitGemmConfig`/`JitConv2dConfig` via `-D` flags.
-**AOT mode** (no `OASR_TARGET_SM`): `OASR_DISPATCH_SM` macro switches on runtime SM version.
-
-CUTLASS is the **`3rdparty/cutlass` git submodule, pinned to v4.6.1** — `git submodule update --init` is what provides it, not CMake (which fetches only pybind11). Nothing links it: every CUTLASS kernel is JIT-compiled, so `oasr/jit/env.py` hands the include dirs to nvcc at runtime. Its `version.h` is folded into the JIT cache key (`env.cutlass_version_stamp`) — without that, `build_and_load` short-circuits on an existing `.so` and a submodule bump keeps silently loading binaries built against the old headers. Editing a vendored CUTLASS header *without* bumping the version still needs `rm -rf ~/.cache/oasr/jit`. The CuTeDSL half of CUTLASS is the separate `nvidia-cutlass-dsl` wheel (`pip install -e .[attention]`, floor in `oasr/jit/attention.py::MIN_CUTEDSL_VERSION`), kept at the same 4.6.1 release; it is optional, and `OASR_ATTN_BACKEND=auto` degrades `oasr.fmha` to SDPA when it is absent. The 4.4.2 → 4.6.1 move was **measured, not assumed**. On the C++ side it is inert by construction: not one of the headers OASR includes from the classic 2.x device API (`gemm/device/*`, `gemm_splitk_parallel.h`, `threadblock_swizzle_streamk.h`, `layout/*`, `reduction/*`) changed between those tags, and the GEMM / gemm_activation / gemm_log_softmax / BMM / GroupGEMM refchecks and timings came back identical. What it does buy is three upstream fixes on paths we compile: `griddepcontrol.wait` gained a `"memory"` clobber (the compiler could reorder loads across it), `cute/container/*` stopped *unconditionally* including a cccl header on `__CUDACC_VER_MAJOR__ >= 13` and now probes with `__has_include` (CTK 13.2 here ships it under `include/cccl/`, so this was latent for us and fatal for anyone whose 13.x wheel lacks it), and the int4 `SM80_16x8x32_S32S4S4S32_TN` B-layout stride was simply wrong. CuTeDSL 4.5.2 → 4.6.1 is op-level **mixed** and system-level a wash: dense offline attention **+7–8%**, paged+bias (Conformer streaming rel-pos) **−6…−11%** at large `T_q×T_k` but *flat* at the `T_q` 8–16 a real chunk issues, netting engine `transcribe` offline **+1.5%** / streaming **−1.0%**, both far inside a 3–6% σ over 9 iterations with the SDPA column as a drift control. Do not re-derive this from a single-run A/B — the per-shape scatter on 6–14 µs kernels is ±10% and swamps it. 4.6.1 also fixes an Ampere FAv2 perf regression that an sm_120 box cannot measure, so sm_80/86/89 deployments should gain more than this one did. CUDA SM targets default to 70, 75, 80, 86, 89, 90, 100, 120 (CMakeLists.txt); `setup.py` defaults to 70–90 only. Override with `CUDA_ARCHITECTURES` env var.
-
-### Python layer (`oasr/`)
-
-- **`__init__.py`** — Exposes all functional API functions (e.g., `oasr.gemm`, `oasr.layer_norm`) and nn.Module wrappers. Lazy-loads `_C` extension for decoder access.
-- **`activation.py`**, **`norm.py`**, **`conv.py`**, **`gemm.py`** — Functional API: `@oasr_api` decorated, JIT-compile kernels on first call via `@functools.cache`, allocate output tensors, call into compiled modules. `gemm.py` also exposes fused epilogues `gemm_activation` (RELU/GELU/SWISH) and `gemm_log_softmax` (the CTC head fast path), and does **shape-aware backend selection** for `gemm`/`gemm_activation`/`bmm`/`gemm_log_softmax`: `jit.gemm.select_default_config(...)` picks a per-shape CUTLASS variant (incl. serial split-K, parallel split-K "pk", Stream-K), the torch/cuBLAS backend, or (CTC head only) the legacy single-call fused launcher, via measured heuristic rules — falling through to the fixed default on any failure. **Rule coverage is per model width and a miss used to be silent**: the table is keyed on the exact `(op, N, K)`, so a table tuned on one architecture says nothing about another. Every entry came from a Conformer capture until 2026-08-03, which meant Whisper's `K=384` took `GEMM_DEFAULT` for every GEMM it issues — 4.6× off the best available backend at its worst shape — with nothing failing and nothing logged. whisper-tiny is now tuned (three keys: `(384,384)` projections, `(1536,384)` fc1, `(384,1536)` fc2; +2.2–3.8% encoder at batch ≥ 4, WER identical, and bf16-derived rules verified to carry to fp16 within ~1%). The fall-through is now **counted**: `jit.gemm.rule_miss_report()` — also folded into `layers.format_gap_report()` — lists the untuned `(op, N, K, M)` a workload actually hit, which is both the coverage check and the shape list to hand `scripts/tune_asr_gemm.py`. Measured remaining exposure: 8 shapes for Qwen2-Audio-7B, 25 for Zipformer, 7 for Paraformer, and **1 for Conformer**, which the table *was* tuned for — so it drifts. Two traps live in this loop, both now guarded: the tuner's tie-break could emit a rule measured **slower** than the fallback (a bucket read `0.96x vs default`), fixed by `--min-speedup` (default 1.05) which suppresses-and-logs sub-threshold buckets; and the tuner times each candidate in a deep queue, which hides that the cuBLAS branch of `_dispatch_gemm` costs **~4.9 µs more CPU per call** than the CUTLASS launcher. Routing whisper's fc2 to cuBLAS — what the sweep emitted — made the batch-1 encoder **0.90×** while *removing* 115 µs of GPU work per forward, because at batch 1–2 that encoder is CPU-issue-bound (issue 1139 µs ≈ wall 1140 µs against 611 µs of GPU work); a GPU saving is unspendable when the GPU is already waiting on Python. It resolved without a trade-off only because a CUTLASS tile *ties* cuBLAS on the GPU there (18.4 µs both at M=1500) while keeping the cheap dispatch, so small-M takes the tile and cuBLAS keeps the large-M cells where the encoder is GPU-bound. `tests/test_gemm_heuristic.py::TestWhisperShapesAreCovered` pins that ordering (negative-controlled), since a re-tune comparing only kernel timings would silently undo it.
-- **`gemm_torch.py`** — Torch/cuBLAS GEMM runners (`torch_gemm`, `torch_gemm_activation`, `torch_bmm`, `torch_gemm_log_softmax`) mirroring the CUTLASS launcher contract exactly (output-first, in-place/CUDA-graph-safe, `D = A @ Bᵀ`). Doubles as a `Tactic("torch")` autotuner candidate and the production dispatch target selected by `gemm.py`. Deliberately free of any `oasr.tune` import.
-- **`attention.py`** — `fmha(q, k, v, *, softmax_scale, attn_bias, cache_seqlens, block_table, out)` fused multi-head attention. Three cache modes share one signature: **offline** (`block_table is None`, `cache_seqlens is None`), **dense streaming** (`block_table is None`, `cache_seqlens is not None` — caller concatenated old + new K/V), **paged streaming** (`block_table is not None`, `cache_seqlens` required — K/V are pool views). Dispatches via `oasr.jit.attention.select_backend()` to either `_sdpa_reference` (PyTorch SDPA fallback, fp32-friendly) or the CuteDSL kernel (fp16/bf16 only). Also exposes `oasr.fmha.persistent_inputs(...)` — a context manager that caches CuteDSL DLPack descriptors for the hot loop when the engine reuses the same Q/K/V/out/bias/block_table/cache_seqlens tensors every call. A `validate=False` fast path skips checks for proven inputs.
-- **`softmax.py`**, **`topk.py`**, **`fft.py`**, **`feature.py`** — Additional `@oasr_api` functional entry points: `softmax`, `topk`, `rfft`/`rfft_power`, and feature-extraction primitives (`stft_frame`, `dct_lifter`, `fbank_preprocess`, `mel_log`). `stft_frame` is the **general** framing stage (waveform → pre-emphasised, windowed, zero-padded frames): `hop`, `center_offset`, `win_offset` and a pre-emphasis boundary mode are parameters, so one kernel covers the centered NeMo/Whisper grid (`center_offset = n_fft/2`), Kaldi's `snip_edges` (`0`) and a streaming buffer whose head is pre-emphasis history (negative). `mel_log` takes an **additive** guard alongside its floor — Kaldi is `log(max(m, tiny))`, NeMo is `log(m + 2**-24)`, and one knob would move the value of every silent bin, which *is* the encoder's input scale — plus optional per-row `frame_lengths` masking, which has to happen after the log because `log(0 + 2**-24)` is a large negative constant, not zero. Same JIT-on-first-call pattern as the other top-level modules.
-- **`kernels/`** — Low-level kernel implementations that **do not** use the TVM-FFI / Ninja JIT pipeline. `kernels/cute/attention/` holds the CuteDSL FMHA: `base.py` (abstract `FmhaBase` + `pick_arch_cls(major, minor)` dispatcher), `fmha_sm80.py` (`FmhaSm80` — covers sm_80 / sm_86 / sm_89), and `fmha_sm120.py` (`FmhaSm120`, a thin subclass over `FmhaSm80` for consumer Blackwell). `kernels/cute/` also contains FlashAttention-style helper modules used by these backends: `block_info.py`, `seqlen_info.py`, `mask.py`, `softmax.py`, `tile_scheduler.py`, `pack_gqa.py`, `paged_kv.py`, `named_barrier.py`, `copy_utils.py`, `layout_utils.py`, `ampere_helpers.py`, `utils.py`. Compiled via `cutlass.cute.compile()` returning a Python callable; cached per-config in `oasr/jit/attention.py::_compiled_fmha`.
-- **`ctc_decode.py`** — GPU CTC prefix beam search, exposing two orthogonal APIs:
-  - `ctc_beam_search_decode(log_prob, seq_lengths, ...)` — offline batched decode (allocates workspace + output, calls C++ in one shot).
-  - `GpuStreamingDecoder` — streaming decoder with two usage modes:
-    - *Single-request*: `init_stream(batch, vocab_size)` → `decode_chunk(log_prob)` → `finalize_stream()`.
-    - *Multi-request (interleaved)*: `create_state(batch, vocab_size)` returns a `StreamState`; pass it to `decode_chunk(log_prob, state=s)` and `finalize_stream(state=s)`. `StreamHandle` wraps a `(decoder, state)` pair so callers need not carry both objects.
-  - `GpuDecoderConfig` dataclass configures `beam_size`, `blank_id`, `blank_threshold`, `max_seq_len`, paged-memory options.
-  - `GpuDecoderResult` holds `tokens` (nested list), `lengths`, and `scores` tensors.
-- **`decode.py`** — Thin helpers wrapping `oasr.decoder` CPU-side decoders.
-- **`api_logging.py`** — `@oasr_api` decorator for debug logging and exception context on public API functions.
-- **`jit/`** — JIT generators:
-  - `core.py` — `JitSpec` (static sources) and `JinjaJitSpec` (Jinja-rendered sources), `gen_jit_spec()`, `gen_jinja_jit_spec()`.
-  - `templates.py` — Jinja2 rendering utilities (`get_template_env()`, `render_template()`).
-  - `env.py` — Path constants including `OASR_TEMPLATE_DIR`, `OASR_GEN_SRC_DIR`.
-  - Per-family modules: `gemm.py`, `conv.py`, `norm.py`, `activation.py`, `ctc_decoder.py`.
-  - `attention.py` — **Different model**: not a Ninja JIT spec but a `functools.cache`-keyed wrapper around `cutlass.cute.compile()`. Exposes `select_backend()`, `get_compiled_fmha(...)`, `warmup_fmha(...)`, and `set_backend_mode()` (mostly for tests; clears the compile cache). `select_backend()` probes the device capability eagerly at module load and resolves to `"cute"` on sm_80 / sm_86 / sm_89 / sm_120 (when CuteDSL imports cleanly), otherwise `"sdpa"`.
-- **`decoder/`** — Python wrappers for the C++ decoders: `CtcGreedySearch`, `CtcPrefixBeamSearch`, `CtcWfstBeamSearch` (requires k2), `ContextGraph` (phrase boosting trie). Also exposes `k2_available` flag. Each wrapper lazily imports the compiled `_C` extension and delegates to a `_*Core` C++ object.
-- **`engine/`** — Inference engine for offline + streaming ASR on a single GPU. Built around **one registry per extension axis** (see `docs/architecture.md`): decode family (`decode/`), streaming runtime (`streaming_backend/`), batching policy (`batching/`), plus the model + checkpoint registries in `oasr/models/`, the tokenizer registry in `oasr/tokenizers/`, and the feature-frontend registry in `oasr/features/`. New model architectures, decode families, streaming runtimes, batching policies, checkpoint loaders, tokenizers, and feature frontends plug in by subclass + register — no engine-core edits:
-  - `EngineConfig` — unified config aggregating model, cache, feature, decoding, detokenization settings. `long_form=True` fans a request longer than a fixed-window frontend's window out into consecutive windows (`longform.py`), decodes them through the normal batched path and stitches one output — the caller sees one request id, so HTTP/gRPC need no change. Windows decode **in parallel** (a long file costs ~one window of wall clock) rather than OpenAI's sequential previous-text-conditioned loop; `long_form_overlap_seconds` + a word-level overlap merge recover most of the boundary accuracy. `recycle_streaming_history=True` recycles the oldest KV block when a stream reaches its cache ceiling instead of finalising it with `finish_reason="length"` — measured identical (0.00% WER) inside the retained window and, on 90 s streams, 147 vs 110 words. `use_cuda_graphs: bool = True` toggles CUDA Graph capture of the steady-state streaming encoder forward. **Two capacities are memory, not compute, and can be left to the engine** (H4, `engine/memory.py`): `max_num_blocks=None` derives the streaming paged-KV pool and `decode_kv_budget_gib=None` derives the AR decoder-KV ceiling (`0` switches that one off), both from one profile — `available = total * gpu_memory_utilization (0.90) - resident - activation_reserve`, where `resident` is read from the driver *after* the model lands (so it covers weights, context and another process's memory with no separate "weights" term to get wrong) and the reserve is 1.5x a **measured** probe forward at the widest shape the engine will run, floored at 256 MiB. The probe goes through the real `collate` + `consumes` routing, so fbank staging and the `(B,T,V)` head are in the number; what it *cannot* see (graph-capture pools, an AR prefill transient) is what the unspent 10% is for. Nothing is measured unless something was left unset, so the defaults pay nothing. On a 32 GiB card the conformer pool derives to 16384 blocks (3 GiB) — 8x the hardcoded 2048, lifting the per-stream ceiling from ~41 s to ~328 s of audio — and is capped by `max_blocks_per_seq * max_batch_size` rather than by VRAM, which the engine says out loud because the remaining lever is then the per-stream width, not the pool. The failure paths are explicit: no CUDA device raises, and a pool that does not fit raises at startup with the arithmetic and every lever, because the alternatives are an OOM at allocation or a silently degraded transcript. Real Qwen2-Audio-7B derives 11.43 GiB ≈ 27 rows at 429 MiB/row — which *binds* at `max_batch_size=32` (32 rows = 13.7 GiB would have OOM'd against 16.5 GiB of weights), and a derived ceiling can only ever admit fewer rows than the slot cap, so deriving generously is safe by construction.
-  - `ASREngine` — unified streaming + offline engine.  Step loop: schedule → batched GPU fbank ingest → encoder forward (length-bucketed offline micro-batches via `OfflineExecutor` overlap with one chunk per active streaming request) → CTC postprocess.  Handles offline + streaming requests in one pool; starvation bounded by `max_wait_time`.  Convenience helpers: `transcribe(...)` (streaming default) and `transcribe_offline(...)` (batched offline).
-  - `graph_cache.py` — `GraphedEncoderForward` lazily captures one `torch.cuda.CUDAGraph` per `(B, T_input, cache_t1_bucket)` shape, replays via pre-allocated input/output buffers. Persistent paging slots and `cnn_cache` are captured by **address**, so they must be allocated before the first capture and never reallocated. All captures share one CUDA Graph memory pool. Engine paths are slot-based so the captured code path is stable across calls. The captured callable is **injected** (`chunk_forward`) and its output shape is never inspected, so the same machinery serves the fused `forward_chunk_paged` (`(B, chunk, V)`) and the encoder-only `encode_chunk_paged` (`(B, chunk, D)`) — adding a streaming decode family needs no edit here. Two aliasing rules follow from the replay buffer being **reused per shape key**: a returned tensor is only valid until the next replay at that key, and because `_forward_single` always replays at `B=1`, a `B=1` cohort followed by a single (or two singles) in one `forward_step` must copy — `PagedStreamingBackend` passes `detach=` for exactly those cases and the steady-state wide cohort stays allocation-free. Ignoring this silently gave every earlier stream in the step the *last* stream's chunk output. Known kernel defect: capture is bit-exact at head_dim 64 but reads stale pool memory at **head_dim 32** (~1e-1 log-prob delta, varying run to run, at every model width) — pre-existing, hits CTC too, pinned by a strict xfail in `tests/test_streaming_backend.py`.
-  - `Request` / `RequestOutput` / `RequestState` (`WAITING → RUNNING → FINISHED`). `RequestOutput.timestamps` (optional) carries per-token `(start_s, end_s)` spans for the best hypothesis when the decode family produces alignments (Paraformer CIF).
-  - Internal modules: `scheduler.py` (`Scheduler` — delegates offline batch **selection** to a `BatchingPolicy` and **partition** to a `PartitionPolicy`), `model_runner.py` (offline forward + delegates streaming to a `StreamingEncoderBackend`), `input_processor.py`, `output_processor.py`, plus the `executor/` package — `base.py` (`Executor` ABC), `offline.py` (`OfflineExecutor`: runs each scheduler-partitioned micro-batch back-to-back; flips the forward to the gapless varlen `forward_offline_packed` when `enable_sequence_packing` is set), `streaming.py` (`StreamingExecutor`: chunk-by-chunk). Service mode pinning: `EngineConfig.service_mode ∈ {"streaming","offline"}` selects exactly one executor per engine lifecycle; mismatched requests are rejected at admission. **Failure isolation**: both executors contain an exception rather than letting it escape `step()` (which the serving dispatcher turns into an INTERNAL error for *every* in-flight request). Offline re-runs a failed micro-batch one request at a time so only the culprit is rejected — except on OOM, where retrying under memory pressure is how one over-large request cascades. Streaming fails the whole ready cohort: the batched forward has no per-stream boundary, and retrying it per stream would double-commit the chunk for streams that already advanced. Terminal outputs carry `finish_reason="error"` plus `RequestOutput.error_stage`, which becomes the label on `oasr_requests_failed_total{stage}`.
-  - `decode/` — pluggable `DecodeStrategy` (registry keyed on the resolved decode method — `EngineConfig.decode_method` if set (validated against `model.capabilities`), else `model.default_decode_type`; CTC further splits on `config.decoder_type`): `CtcGpuDecodeStrategy` / `CtcWfstDecodeStrategy` (`ctc_gpu.py` / `ctc_wfst.py`, own the CTC beam state), `TransducerDecodeStrategy` (`transducer.py`, `consumes="hidden"`), `CtcAedRescoringStrategy` (`rescoring.py`, `consumes="both"` — offline-only U2++ CTC n-best + one teacher-forced bitransformer pass + WeNet score fusion; knobs `rescoring_ctc_weight`/`rescoring_reverse_weight`), the incremental `AedDecodeStrategy` (`aed.py`, `incremental=True` greedy over the K2 protocol — Whisper), `ParaformerDecodeStrategy` (`paraformer.py`, `consumes="hidden"`, one-shot NAR: `model.predict` CIF → `model.nar_decode` parallel pass → argmax; CIF fire positions become per-token `RequestOutput.timestamps`), the incremental `LlmDecodeStrategy` (`llm.py`, `incremental=True` — speech-LLM: encodes the checkpoint's ChatML template via the tokenizer axis, splices the projected audio embeddings into a **left-padded** embedded prompt (variable per-row audio length), and emits **token-streaming partials** — one `finished=False` output per advanced request per tick; user prompt overridable via `EngineConfig.llm_prompt` or per-request `DecodingOptions.prompt`), and a shared `Detokenizer` (`detokenize.py`). **Per-family options** live on the strategy, not `EngineConfig`: each declares an `options_cls` dataclass (`decode/options.py`) whose fields carry a `legacy=` alias to the old flat config field (same default), and the strategy reads `self.options`. Resolution is defaults → legacy field → `EngineConfig.decode_options`, with an unknown key raising at engine construction; `oasr-server --decode-option k=v` writes into that dict, typed from the declared default, so a new family needs no new flag — and the CTC/WFST beam configs are now built by the CTC strategies' factories rather than by every engine. `Detokenizer` also exposes `detokenize_incremental(new_ids, state)` for the append-only families (T3): `symbol_table` renders piece-locally and `huggingface` uses an anchored window (byte-BPE fragments cannot be decoded alone), so a partial no longer re-decodes its whole prefix. `OutputProcessor` is a thin facade over the active strategy. Strategies declaring `incremental=True` implement `begin_offline`/`advance(StepBudget)`/`has_pending`: the offline executor prefills a micro-batch, parks the requests `RUNNING` in a pending pool, and advances them within a **dual** per-tick budget — ≤ `EngineConfig.decode_steps_per_tick` batched decoder steps **and** ≤ `EngineConfig.max_tick_ms` of wall clock, whichever binds first (a step count alone does not bound tick *time*: ~1.5 ms/step for whisper-tiny at B=8 vs ~18 ms/step for Qwen2-Audio-7B at B=4, so the deadline is what actually bounds the dispatcher's GIL hold — measured 7B tick p99 579 ms → 151 ms for a 0.3% throughput cost). A tick that spends its decode budget does not also prefill (bounded by `_MAX_SKIPPED_ADMITS` so admission cannot starve); admission is additionally gated by `max_decode_slots` and, optionally, by `EngineConfig.decode_admit_window_ms` — a coalescing window that holds a thin waiting queue so near-simultaneous arrivals prefill as **one** decode group. That matters because an AR decoder step is weight-read bound (cost ≈ independent of row count), so total forwards is the *sum over groups* of each group's steps: measured 7B trickle arrivals cost 1.75× burst for identical work, and a 200 ms window recovers 1.62× of it. Groups cannot be merged after the fact — both decoder surfaces keep a **shared scalar** generation offset (`WhisperDecoder.state["pos"]`, `Qwen2Lm.state["len"]`), so per-row KV offsets are the prerequisite (shared with paged decoder KV). Beam search over the same protocol lives in `decode/incremental_beam.py` (`ArBeamGroup`, `beam_size`/`length_penalty` options): the `(B, k)` grid is flattened to `B*k` decoder rows and `select(state, idx)` — an `index_select`, so repeated indices are legal — both *expands* a prefilled batch and *reorders* it onto each new slot's parent, so no model-side method was needed and every AR family gets beam search for free. A slot emitting EOS is banked as a completed candidate rather than retiring its request; a request retires when its whole beam is done. The shared group bookkeeping / budget loop / row retirement lives in `decode/incremental.py` (`IncrementalArStrategy`), so `aed.py` and `llm.py` carry only their prefill, logit filtering, EOS predicate and partial-emission policy. **Per-request `DecodingOptions`** (`oasr.engine.DecodingOptions`, on `Request.decoding`; dict-coercible at the PyO3 boundary): `n_best` (executor detokenizes top-N into `RequestOutput.nbest_texts` on finals — beam families), `max_new_tokens`, `temperature`/`top_k`/`top_p` sampling (AR families via `generation/sampling.py::select_next_tokens` — greedy stays a batched argmax fast path), `prompt` (LLM only, memoized suffix re-encode). AR finals carry `RequestOutput.finish_reason` (`"stop"`/`"length"`).
-  - `generation/` — `StepBudget` (per-tick allowance: batched decoder steps **and** a wall-clock deadline via `StepBudget.for_tick`) + `select_next_tokens` (greedy argmax fast path / per-row sampling) for the incremental AR strategies.
-  - `streaming_backend/` — pluggable `StreamingEncoderBackend` (registry keyed on `encoder.streaming_kind`): `PagedStreamingBackend` (Conformer paged-KV + slot-CNN + CUDA graphs — for **both** `consumes` modes; the graph captures whichever chunk forward the strategy routed to) and `StatefulStreamingBackend` (Zipformer-style per-layer recurrent state). The stateful backend **batches** ready streams: when the encoder exposes `stack_streaming_states`/`unstack_streaming_states` (Zipformer does), same-chunk-length streams run as one `B = N` forward — 3.5–24× over the sequential `B = 1` loop at pool sizes 4–32, argmax-identical (fp16 diffs are one-ulp batched-kernel reduction noise); encoders without the surface keep the sequential path. The engine reads streaming geometry (`decoding_window`/`stride`) from the backend, not hardcoded constants.
-  - `batching/` — pluggable `BatchingPolicy` (`fcfs`/`bucket`/`sjf`) + `PartitionPolicy` (`count`/`frames`/`packing`) the scheduler delegates to.
-  - **The transducer predictor state is opaque to its strategy** (`models/decoders/base.py::TransducerPredictor`): `init_state` / `predict` / `advance(state, tokens, emit)` / `stack_states` / `unstack_states`. One greedy loop therefore serves both a *stateless* label-window predictor (icefall: recomputable from the last `k` labels) and a *recurrent* one (NeMo's 2-layer LSTM: not). The loop used to shift a `(B, context_size)` int tensor itself, which made a recurrent predictor inexpressible short of a second copy of the loop. Two consequences worth knowing: a recurrent predictor's start state is **not zeros** — NeMo runs the LSTM once on the blank embedding (the zero row, via `padding_idx`) from a zero hidden state, and that response is what the first frame's joint sees; and `beam_size > 1` is refused at construction for such a predictor (`label_window_state = False`), because modified beam search keeps the beam's states in one `(B, k, ctx)` buffer and gather-reorders them onto their parents, which only expresses a label window.
-- **`features/`** — Batched audio feature extraction (FBANK / MFCC / Whisper log-mel). **Feature frontend axis (seventh registry)**: `registry.py` holds `ExtractorSpec(kind, fn, framing, streaming_fn, window_seconds_attr)` + `register_extractor` / `build_extractor(config)` / `list_extractors()`, keyed on `FeatureConfig.feature_type`; `extractors.py` registers the built-ins (`fbank`/`mfcc` → the fused Kaldi kernels with a per-utterance fallback for non-fusable configs, `whisper_logmel` → the 30 s recipe). `InputProcessor` and `GraphedFeatureExtraction` each resolve **one** extractor at construction — an unregistered `feature_type` fails at engine build, not on the first request — and `FeatureConfig.__post_init__` validates `feature_type` against the registry, so registering a frontend is the whole change (no edit to the config, the engine, or the graph cache). Two declarations carry consequences. **`framing`** is how to reproduce this frontend's frame grid from a growing sample buffer — a function of the config returning `StreamingFraming(span, hop, history, prefill)`: `span` is what one frame *reads* (`n_fft`, not `win_length`, for a centered STFT), `history` is leading samples that are context only (non-zero exactly when the per-sample transform reaches backwards — NeMo pre-emphasises the *signal*), `prefill` is the zeros an offline pass implicitly starts with. `supports_streaming` is **derived** from it (`framing is not None`), so streamability cannot disagree with the arithmetic, and `prepare_streaming` rejects a frontend that declares none. Every number the streaming feature loop used to hardcode — the per-frame sample span, the frame count, the initial tail, the pre-emphasis reach — now comes from here; the *storage* was never missing (`request.audio_tail` has always been a per-stream sample look-back), only the declaration. `streaming_fn` is the incremental variant of `fn` for a grid that is not simply "restart at buffer position 0" (Kaldi's `snip_edges` framing *is* its streaming semantics, so it declares none). `window_seconds_attr` names the config field holding the window, which `FeatureConfig.fixed_window_seconds/_frames` read — that is what makes per-row cost constant for the batching policies and lets over-long audio be rejected at admission. LFR is deliberately *not* per-extractor: it is a post-transform the caller applies over any extractor's output:
-  - `FeatureConfig` — shared config for sample rate, mel bins, frame length/shift, dither, etc.
-  - `FeatureSpec` (`spec.py`) — **checkpoint-derived** feature description emitted by checkpoint converters (kind / sample rate / dim / frame geometry / LFR / window / normalize / audio_scale). The engine materializes `feature_config` from it unless the caller set one explicitly (mismatch logs a warning). `kind ∈ {"kaldi_fbank", "kaldi_mfcc", "whisper_logmel"}`; `raw` lands with its model package. `whisper.py::batched_whisper_logmel` implements the Whisper recipe (30 s pad/trim, n_fft 400 / hop 160, slaney mels, global max-norm; `audio_scale=1.0`), dispatched by `feature_type="whisper_logmel"`; it returns **real** per-row frame counts (`ceil(len/hop)`, HF attention-mask semantics) — Whisper ignores them, the Qwen2-Audio tower masks by them. The engine also adopts `FeatureSpec.audio_scale` unless the caller set a non-default `audio_scale` explicitly.
-  - `nemotron.py::batched_nemotron_logmel` — the NeMo recipe (`kind="nemotron_logmel"`): pre-emphasis on the waveform, STFT n_fft 512 / hop 160 / win 400 with a **non-periodic** Hann window and constant (not reflect) padding, slaney mels, `log(mel + 2**-24)` — a natural log with no normalization at all. Bit-exact vs HF's extractor when handed librosa's filterbank; the 2.3e-4 residual with torchaudio's is the whole difference. Runs on **kernels** (`oasr.stft_frame` → `oasr.rfft_power` → `oasr.mel_log`: three launches, no waveform temporaries — KG23) with the torch path kept as the CPU path, the fp32 parity oracle and the `OASR_FEATURE_BACKEND=torch` A/B; the kernel differs from torch by 5.9e-4 max on values reaching 15.9 and is *no worse against HF* (1.92e-4 vs 1.73e-4), both dominated by the mel table. **Streamable**: it declares `StreamingFraming(512, 160, 1, 257)` and a `center=False` incremental variant that reproduces the offline centered grid **bit-exactly** (`atol=0`) — `n_fft` span, one sample of pre-emphasis history, `n_fft // 2 + 1` of prefill. `FeatureSpec.preemphasis` exists so a NeMo config that disables the filter can say so — the `audio_scale` failure mode.
-  - `lfr.py::apply_lfr_batch` — batched low-frame-rate stacking (FunASR/Paraformer: 80-mel LFR 7/6 → 560-dim at a 60 ms hop) as a clamped gather, bit-exact vs the FunASR reference loop. Driven by `FeatureConfig.lfr_m/lfr_n` (spec-emitted); `output_dim` folds the stacking in; applied in the offline `_fbank_batch` path only (streaming `prepare_streaming` rejects LFR configs). The fused `batched_fbank` kernel also gained the `hamming` window (FunASR frontends), so Paraformer collate stays on the fast path.
-  - `fbank_batch` / `mfcc_batch` / `extract_features_batch` — offline batch extraction over padded `(B, T)` or list of waveforms.
-  - `BatchedStreamingFeatureExtractor` — `B` parallel chunked streams (`process_chunk` / `flush`).
-  - Backends: `torchaudio.compliance.kaldi` (default) and optional `kaldifeat` GPU path. Batched FBANK/MFCC in `batched.py`.
-- **`tokenizers/`** — Tokenizer axis (sixth registry): `Tokenizer` ABC (`decode`/`encode`/`vocab_size`/`special_ids`) + `TokenizerSpec` (kind + asset files + options) emitted by checkpoint converters and built via `build_tokenizer(spec)`. `Tokenizer.supports_encode` declares whether the encode direction exists (`False` for `symbol_table`: an id→piece map has no reverse) — test that, never `hasattr(tok, 'encode')`, which always passes because `encode` is abstract on the ABC. `special_ids` means exactly *what `decode` strips*. Kinds: `symbol_table` (units.txt/tokens.txt — bit-compatible with the legacy `Detokenizer`, default `special_ids={0,1,2}`, decode-only), `sentencepiece` (icefall bpe.model; ids == piece ids), `huggingface` (tokenizer.json; when the spec carries a `tokenizer_config` file, `added_tokens_decoder` entries missing from tokenizer.json are merged in declared-id order — Qwen2-Audio defines its audio/timestamp specials only there, and prompt encoding breaks without them), `whisper` (HF fast tokenizer + control-token stripping above `eot_id`), `funasr_char` (Paraformer tokens.json; decode ports FunASR's `sentence_postprocess` — CJK join, `@@` subword merge, `b b c`→`BBC` abbreviations — case-validated against funasr 1.3.14). `engine/decode/detokenize.py::Detokenizer` is now a thin adapter over this axis.
-- **`checkpoints/`** — Checkpoint bundles + native format:
-  - `bundle.py` — `ConvertedCheckpoint` (config, aux, weights, `TokenizerSpec`, `FeatureSpec`, `DecodingDefaults`, `source_format`); `convert_checkpoint()` adapts legacy 4-method converters (fills metadata via the historical path sniffing).
-  - `native.py` — round-trippable native format: `oasr_config.json` (format_version 1) + `model.safetensors` (post-`load_weights` state dict — loads via strict `load_state_dict`, no name mapping; model-declared `_computed_buffer_suffixes` like Conformer's `pos_enc.pe` are skipped) + `tokenizer/` assets. Native state dicts get the model's own `_metadata` stamped at load so version-gated `_load_from_state_dict` remaps don't re-fire.
-  - `convert.py` — `oasr-convert <src> <dst>` CLI (also `python -m oasr.checkpoints.convert`) materializing any supported dir as a native bundle.
-- **`cache/`** — Paged-memory streaming cache manager for chunk-by-chunk Conformer inference:
-  - `CacheConfig` — master config (layers, heads, dims, chunk size, block size, pool capacity). `__post_init__` **validates the pool-sizing invariant** `max_num_blocks >= max_batch_size * blocks_per_stream` when eviction is on (`num_left_chunks >= 0`) — with eviction there is no capacity gate (`at_capacity()` always returns `False`, the oldest block is recycled), so an undersized pool used to surface as `BlockPool exhausted` raised *inside the encoder forward*, killing the tick for every concurrent stream. Unlimited history needs no check: `blocks_per_stream` is derived from the pool, so it holds by construction.
-  - `BlockPool` — fixed-size paged KV pool; blocks are allocated/freed per stream.
-  - `AttentionCacheManager` — per-stream paged KV cache; supports both dense (`commit`) and paged (`commit_chunk_paged`) write paths.
-  - `CnnCacheManager` — per-stream depthwise-conv left-context cache. The **single-spec instance** of `state.py::SlotStateCache`, which is the generic form: `StreamStateSpec(name, shape, slot_axis, dtype)` declares any fixed-extent per-stream tensor, `SlotStateCache` owns one persistent buffer each, and `SlotTensor.gather()/scatter()` (== `SlotCnnCache`) is the in-place read/write a chunk forward does. `slot_axis` is per spec and load-bearing twice: it is what keeps the conv cache's historical `(layers, slots, frames, dim)` layout and therefore its buffer *address* (the CUDA-graph cache captures it by reference), and it is exactly the per-kind batch dimension Zipformer's `stack_streaming_states`/`unstack_streaming_states` pair encodes in code rather than data. Encoders declare extras via `CacheSpec.stream_states` and read them back by name from the chunk forward's `states` mapping — Nemotron's three subsampling-stage tails arrive this way; Conformer declares none and is byte-identical. Zeroing on allocate is the initial *value*, not hygiene: a zero left-context is the padding an offline pass applies.
-  - `CtcStateCacheManager` — per-stream `GpuStreamingDecoder` / `StreamHandle` lifecycle.
-  - `DecoderKVCacheManager` (`decoder_kv.py`) — decoder-side KV for AR generation (keystone K6): a **separate** decoder-shaped `BlockPool`, append-per-step growth, per-request block tables, **no eviction**; `create(prefill_len)`/`append_step`/`block_tables`/`cache_seqlens`/`free`. Tested standalone; the `aed` strategy currently uses dense per-request KV (paged integration is the planned optimization).
-  - `StreamContext` — unified handle tying all three managers; call `prepare_chunk()` → `get_att_caches()` / `get_cnn_cache()` → `commit_chunk[_paged]()` → `get_decoder().decode_chunk()` per chunk, then `free()`.
-- **`testing/`** — `bench_gpu_time(fn, args, ...)` utility: CUDA-event timing with optional CUPTI fallback via `triton.testing.do_bench`; returns `(median_s, std_s)`.
-- **`aot.py`** — Ahead-of-time compilation registration for all kernel families. Includes `gen_all_gemm_variants()` for systematic AOT variant enumeration.
-- **`tune/`** — Autotuning framework: backend registry, profiler, cache, kernel configs (`TileConfig`). See `docs/autotuning.md` for design and API (`oasr.autotune()` context manager, `enable_autotune()`/`disable_autotune()` global toggles, persistent JSON cache).
-
-### Companion docs (under `docs/`)
-
-| File | Covers |
-|------|--------|
-| `docs/architecture.md` | One-registry-per-extension-axis design (decode family / streaming backend / batching policy / model / checkpoint) + the `oasr.layers` narrow waist |
-| `docs/autotuning.md` | `oasr.tune` design, `oasr.autotune()` API, JSON cache format |
-| `docs/benchmarks.md` | Engine vs. service bench recipes, `.env` workflow, RTF / latency interpretation |
-| `docs/cache_manager.md` | `BlockPool` / `AttentionCacheManager` / `CnnCacheManager` / `StreamContext` semantics |
-| `docs/checkpoints.md` | Checkpoint resolution precedence, converter contract, native format, `LoadReport` discipline |
-| `docs/ctc_decoder_gpu.md` | `GpuStreamingDecoder` single- vs. multi-request flows, paged-memory options |
-| `docs/engine.md` | `ASREngine` step loop, batching, CUDA Graph capture |
-| `docs/scheduler.md` | Streaming + offline request scheduling, starvation bounds, micro-batching |
-| `docs/serving.md` | Rust `oasr-server` frontend: HTTP/gRPC/WebSocket API, in-process PyO3 engine, wire format, per-request decoding options |
-| `docs/tokenizers.md` | Tokenizer axis: kinds, `TokenizerSpec`, the tokenizer_config added-token merge |
-| `docs/wfst_decoder_gpu.md` | In-tree GPU WFST decoder: k2-parity semantics, kernel pipeline, graph image, lazy-commit memory model, TVM-FFI API, streaming |
-- **`layers/`** — **The narrow waist every model implementation is built from** (H1). `conv.py`, `linear.py`, `norm.py`, `embedding.py`, `mlp.py`, `feature.py`, `softmax.py`, `topk.py`, `attention/`, `rotary_embedding/`, plus `ctc.py` (`CtcProjection` — fused `log_softmax(x @ Wᵀ + b)` via `oasr.gemm_log_softmax`, used by `CTCHead`). Models use these instead of `nn.Linear`/`nn.LayerNorm`/`nn.Embedding` so kernels, CUDA graphs and future quantization apply to **all seven** architectures rather than one and a half. Members beyond the wrappers: `Attention` (`attention/core.py` — generic non-rel-pos MHA over *pre-projected, head-split* q/k/v; the projections stay on the model under their checkpoint's names, so the shared thing is the compute, not the key layout), `FeedForward`/`GatedMLP`, `Embedding`, `ColumnParallelLinear`/`RowParallelLinear` (single-GPU today — they record the TP shard axis at the definition site so M3 is a fill-in), `NeoxRotaryEmbedding`+`apply_rotary_pos_emb` (HF-style real cos/sin over **arbitrary per-row positions** — the left-padded-prompt case the complex `freqs_cis` API cannot express), and the eps constants `TORCH_EPS`/`ESPNET_EPS`/`QWEN2_RMS_EPS`. **Each layer owns a kernel path *and* a torch path** and chooses per call in `_backend.py`: GEMM needs CUDA + fp16/bf16 + both dims 8-aligned (CUTLASS alignment-8 iterators; *every* GEMM-family launcher now enforces this uniformly via `CHECK_GEMM_ALIGNMENT` with a message naming the fix — `gemm` used to surface a bare "GEMM kernel failed" while `gemm_log_softmax` silently rerouted the same input to cuBLAS, so one precondition had two answers), norms need CUDA + **row-dense** (they walk `base + row * hidden`, so the requirement is that rows tile memory exactly — which accepts a *permuted* dense view like Zipformer's `(T,B,C)` transpose and rejects a padded one like `x[...,:H]`; the launchers checked only `stride(-1)==1`, which let a padded row stride read the wrong memory silently), and `Attention` asks `jit.attention.fmha_config_supported` before dispatching because `oasr.fmha` raises on a head_dim the CuteDSL kernel cannot compile (128 on sm_120). That dual path is what lets one model file serve fp16 on the GPU and run the fp32 CPU parity oracles. Backend selection is **not** a fallback ladder: `oasr` is the default backend, `torch` is one you *select* (there is no `auto`), and the three reasons a call can miss a kernel are kept apart — **out of scope** (CPU/fp32; the framework targets GPU inference, reported once, not debt), **a declared kernel gap** (must be named in `KERNEL_GAPS` with the layer that has to fix it, or the call *raises* — counted, printable via `format_gap_report()`), and **a performance choice** (the kernel is measurably slower). A silent reroute would make a missing kernel invisible, which is how it stays missing. Two gaps are declared, both kernel-side: `fmha-head-dim` (head dims whose 1-deep ring still overflows smem, >256 on a 99 KB arch — nothing in-tree reaches it) and `conv2d-groups` (`csrc/conv2d.cu` has no `groups` argument at all, so a grouped or depthwise conv2d is an *absent* kernel rather than a refused shape; taken by Nemotron's depthwise-separable subsampling and, once it migrates, Zipformer's 7×7 ConvNeXt block). `conv2d-groups` arrived by *moving the accounting boundary*, not by adding debt: grouped conv2d never had a kernel, and Zipformer reached it through a bare `nn.Conv2d` that nothing counted — see `.artifacts/kernel_coverage.md` §0. The same change gave the whole conv family the torch path it never had (`Conv2d` / `Conv2dActivation` / `DepthwiseConv1d` / `PointwiseConv1d` / the new `Glu` all called their kernel unconditionally), which is what lets a convolutional front-end run under an fp32 CPU parity oracle at all. `fmha-mask-form` was the second and is closed: the kernel masked keys by per-row *length* only (`[0,len)`), so a per-row key **start** — left padding, i.e. any batched LLM prompt under HF's masked-generate convention — had no form to arrive in. It now takes a second `(B,)` vector (`mCacheSeqStarts`) compared against the column index in the same mask predicate; with no starts the wrapper passes a zero-rank dummy and the predicate const-folds away, so the pre-existing path compiles to the same kernel. Reached via `oasr.fmha(cache_seqstarts=...)` / `Attention(kv_starts=...)`, verified vs SDPA across start-inside-tile / start-past-a-tile / both-ends / wide-head / bf16 shapes and composed with causal. Causal was also listed there and is now implemented **with per-CTA block skipping** (`n_block_max` bounded by the diagonal): plumbing the flag alone measured 1.4-4.8x *slower* than SDPA because every row block still scanned all of K, and the bound took a qwen2-prefill shape 282.6 -> 199.8us. **The routing splits on whether anything else is masked.** Causal *alone* stays on SDPA by policy (`fmha-causal-short`) — flash handles it with no mask tensor and the fused path has a ~68us floor, and every causal-only shape in-tree is short (Whisper SOT prefill 4 tokens, WeNet decoder ~40). Causal *combined* with a window is fused above `FMHA_CAUSAL_WINDOW_MIN_MACS` (1<<30), because SDPA refuses `is_causal` alongside `attn_mask` and so must materialize a `(B,1,T_q,T_k)` tensor, losing flash with it: measured **1.80-3.29x faster fused** on the attention op at Qwen2-Audio-7B prefill geometry (B2-8, P512-1600, D128, bf16, real call-site strides — a contiguous-tensor benchmark said 3.18-4.42x and overstated it by a third). Read that as op-level: a 7B prefill layer is GEMM-dominated, so it dilutes to **1.03-1.05x** over the whole 32-layer prefill and **1.013x** over an engine `transcribe_offline` with a short generation, transcript-identical. Both were measured with the arms **interleaved** — a single-order A/B first read 0.876x, which was the second arm benefiting from a warm allocator, not the fused path losing; the op-level number is still what the threshold is set from, since it is what the threshold decides. At B=1 and B=2 a single LJSpeech utterance's prefill falls *below* the floor and stays on SDPA (`fmha-causal-window-small`), so the win lands on batched prefill — the serving case. A pass over upstream `flash_attn/cute` then found three things. (1) FA's `BlockInfo.get_n_block_min_max` bounds the K loop at **both** ends; ours bounded only the top, so a left-padded batch loaded and `-inf`-masked every block below its start — now `n_block_min` (from the key start, and from window-left), taking Qwen2 prefill geometry from a flat ~257us at any padding fraction to 258/214/183/164us at 0/25/50/75% padding, with no cost when there is no padding. (2) FA expresses a key start as a tensor **offset** (`SeqlenInfo.offset_k`/`PagedKV.leftpad_k`) and has no start predicate at all — better where it applies, but it depends on FA's **bottom-right** causal alignment, whereas this kernel is top-left to match `torch.is_causal`, so a K-only offset would move the diagonal out from under the mask. (3) FA never *slices* a KV cache: a `k_buf[:,:,:t]` slice has a stride gap that no `mark_compact_shape_dynamic` can express, so FA passes the **whole buffer + `cache_seqlens`** and lets the length bound the loop. Doing the same (`Attention(kv_extent=)`, `Qwen2Lm._append_kv` returning buffer+length) is bit-identical and **1.23-1.54x** on prefill, **1.45-1.88x** at a decode step — and it retired the reason `step` was on SDPA (a per-layer cache copy that was avoidable all along). Paired interleaved on the real 7B, Qwen2 attention on the kernel is now **1.082x** end-to-end at 8 new tokens and **1.109x** at 32, transcript-identical, vs 1.013x for prefill-only fusion. **Precondition that came with it:** `v` must be finite wherever the kernel can read, i.e. up to the K *tile* boundary above `cache_seqlens` — finite stale data past the length is provably inert (verified to 1e4, which is what makes a recycled paged pool and padded feature batches safe) but `NaN`/`Inf` are not, since zero weight still gives `0*NaN` inside `P@V`. A `new_empty` capacity cache therefore corrupted output *non-deterministically* (repeated identical runs disagreed; parity tests structurally cannot see this), so the cache is `new_zeros` and the guard is a zeroed-tail assertion. Predicating the K/V load against the length, as FA does, is what would retire the precondition. The crossover sits at ~1G MACs and is a *work* floor rather than a shape one — unlike `GEMM_MIN_ROWS` — because 1.057G at D=128 and 1.074G at D=64 land on the same ratio despite different B/H/P/D, which is what amortizing a fixed cost predicts. `Qwen2Lm.prefill` now passes the window and reaches the kernel; `Qwen2Lm.step` keeps its explicit mask for a *cache* reason, not a mask one (capacity-preallocated K/V are `k_buf[:,:,:t]` slices the fused kernel would copy whole, per layer per step). A fully-masked query row comes back **zero** from the kernel (empty-row clamp) where SDPA's math backend gives NaN; zero is the safe answer, since a NaN pad row poisons real rows in the next layer via `0 * NaN`, and the torch path keeps the diagonal open to reach the same place. **`-inf` in `attn_bias` is currently a kernel defect, not just a style choice**: accurate while the *finite* part of the bias stays within about ±32 and wrong above it (measured 1.4-1.5 absolute error at ±40-±80 against 0.0007 for SDPA; narrowed to a single query row whose window leaves 4 unmasked keys of 122, i.e. the online softmax's rescale across ~2 entirely-`-inf` K-blocks under a large finite row max). Pass a large **finite** floor instead — mathematically the same mask, since the bias is added post-scale and `exp(-1e4 - 120)` underflows to exactly zero. Nemotron does (`MASK_FLOOR`); Conformer writes `-inf` too (`mask_to_bias`'s `-1e10` overflows in fp16) and is unaffected only because its bias is an order of magnitude smaller. Boundary, repro and the xfail pin: `.artifacts/known_issues.md` §4. head_dim 128 *used* to be a gap: the cp.async ring was hardcoded at 3 stages, so a 64x64 tile at d=128 needed 112 KB against sm_120's 99 KB and was refused (sm_80's 163 KB took it, which disguised a budget bug as a missing config). `FmhaSm80.select_num_stages` now sizes the ring to the arch — 2 stages, 80 KB — and Paraformer's d_k=128 SANM attention is **2.05-2.56x faster** than the SDPA it was stranded on. The budget also costs the *padded* head dim now, matching the layouts (it under-counted by a third at d=72). Unaligned output projections used to be a fourth and were closed at the *model* layer instead: Paraformer's 8404 head, the transducer joiner's 500 and the CIF alpha head are allocated at an aligned width (`oasr.models.base.align_out_features`) with the checkpoint widened on load (`pad_output_projection`, padding rows biased to `PAD_LOGIT` so they can never win an argmax) — the pattern the WeNet CTC head has used since day one. `Attention` takes masks as `kv_lens` (right padding — pushed into the kernel as a length vector, no materialized bias), `kv_starts` (left padding, the other end of the same window; requires `kv_lens`), `attn_bias` (`(B,H,T_q,T_k)` additive), `attn_mask` (anything SDPA takes) or `is_causal`. Only `attn_mask` is SDPA-only, and by *choice*: any boolean mask is expressible as an additive bias, but expanding a broadcast one to reach the kernel would allocate the very tensor the fused path exists to avoid (`fmha-mask-materialize`). **The fused kernel is used only when there is a mask to fuse.** Measured fp16 on a 5090 with *head-split views* as inputs (what real call sites pass — an earlier table used freshly-allocated contiguous tensors and overstated both directions): `kv_lens` shapes range 1.16-2.10x *faster* fused, unmasked is a **wash** (1.01x), and a masked shape with a short query extent can still *lose* (0.90x at `B16 H4 Tq20 T400 D64`). The reason is that `oasr.fmha` needs canonical row-major q/k/v, so `_ensure_canonical` copies all three — 35.3 -> 68.7us at `B8 H4 T500 D128` — a per-call cost paid regardless of how little attention work there is. Closing that stride requirement is worth more than further tuning the rule. The GEMM predicate carries the matching rule on the other axis: a **row floor** (`GEMM_MIN_ROWS`, 128) below which CUTLASS's M-tiling leaves most of every tile empty and cuBLAS's GEMV-shaped kernel wins. It was a *work* (MACs) floor first and that was wrong: `(4, 3584, 3584)` — a Qwen2-Audio-7B decode step — is 51M MACs, far above any work floor, and is the worst shape measured at **5.34x slower** than cuBLAS; the problem is the shape, not the size. The rule is a pure function of the call and is deliberately **not** relaxed under CUDA-graph capture even though dispatch is free there: a capture-dependent branch makes the graph pick a different kernel than eager, and that one-ulp fp16 difference came out of the transducer decoder as *different tokens* (`test_streaming_graph_capture_is_token_identical_to_eager` catches it). **Per-call dispatch cost is fixed, not worked around**: the GEMM launchers take N-D tensors and flatten with `FLATTENED_ROWS` (`csrc/tvm_ffi_utils.h`) instead of Python doing two `reshape(-1, K)` calls, and the output uses `new_empty` varargs instead of `torch.empty` on a built list — ~5us/call, `Linear(384,384)` fp16 from 1.49x slower than `F.linear` to **1.08x**, whisper-tiny encoder and 30-step decode both **1.01x**. Allocating in the C++ launcher was measured and is *worse* (`Tensor::FromEnvAlloc` + round trip 2.38us vs `new_empty` 1.88us), so allocation stays in Python. The launchers now also `CHECK_CONTIGUOUS_INPUT`: `reshape(-1, K)` is a no-op on an already-2D tensor, so a row-strided 2D input (`x[:, -1]` of a `(B,T,D)`) used to reach the kernel with the wrong stride and return garbage silently. `LinearActivation` accepts `gelu_tanh` but **not** `gelu`: the CUDA epilogue is the tanh approximation and Whisper/Qwen2-Audio are trained on exact erf, so fusing it under that name would be a silent accuracy change.
-- **`models/`** — Architecture-agnostic model layer (vLLM/SGLang-style). `base.py` (`BaseAsrModel`/`BaseEncoder`/`BaseHead`/`CacheSpec`/`DecodeType`/`LoadReport`/`coerce_config`; `BaseEncoder.n_kv_head`/`head_dim` are **paged-streaming only** — non-abstract with a self-explaining raise, so an offline-only encoder implements neither — and `cache_spec` is `Optional`, `None` when `streaming_kind == "none"`, which is also why `service_mode="offline"` builds no streaming backend at all: measured 607.5 → 145.5 MiB at engine construction): the engine touches a model only through `encode_offline`/`encode_chunk_paged` (raw hidden) + fused `forward_offline`/`forward_chunk_paged` (encoder+head → log-probs, the CTC fast path), `cache_spec`, `decode_type`, and `encoder.streaming_kind`/`subsampling_rate`/`right_context`. Three further encoder declarations make a new streaming cache *data* rather than a new manager, all defaulting to "nothing declared": `streaming_state_specs` (extra fixed-extent per-stream tensors → `CacheSpec.stream_states`), `fixed_attention_window` (a **trained** attention span, which makes the engine pre-fill the paged K/V window so `cache_seqlens` is uniform across the cohort — the precondition for one *shared* relative-position table, since a Transformer-XL table's distances are `cache + i - j` and a per-row table would run the positional projection per row, costing more at `B = 32` than the encoder layer it feeds; it also makes `cache_t1` constant, so the graph cache captures one graph per batch size instead of one per `(B, cache_t1 bucket)`), and `streaming_geometry(chunk_size)` (a front-end the generic `(chunk_size - 1) * sub + right_context + 1` window formula does not describe — a *cached causal* subsampling consumes exactly `chunk_size * sub` frames with no lookahead — and the place to **refuse** a chunk size the encoder cannot serve, since the backend calls it once at construction). `interfaces.py` (`CAPABILITIES` — the declarative table of dotted model-attribute paths each decode family requires, plus `require_capability`, called once from `build_decode_strategy` so a checkpoint advertising an unserviceable capability fails at engine construction naming the missing members; `tests/test_model_contract.py` validates the table against every registered architecture built tiny on CPU), `registry.py` (`register_model`, `build_model_from_checkpoint`, `load_checkpoint_bundle`, `CheckpointConverter`; built-ins come from one `_BUILTIN_PACKAGES` list and out-of-tree architectures from `oasr.models` **entry points**, so adding one needs no registry edit — a broken plugin warns and is skipped rather than taking the built-ins down), `converter.py` (`BaseCheckpointConverter` — declares `architecture`/`source_format`/`default_checkpoint_name`/`default_decode_type` and provides the bundle assembly, the sharded-safetensors→single→`.bin` loader and the shared `whisper_logmel` spec, so a converter is three methods; `build_config_for_convert` lets a shape-inferring format reuse the loaded weights instead of deserialising twice) + `loaders.py` (`from_pretrained` — local dir or HuggingFace Hub id, exposed as `oasr.from_pretrained`; `load_pretrained` additionally returns the tokenizer/feature/decoding specs + `LoadReport`, and is what `ASREngine` uses). Checkpoint resolution precedence: **native format** (`oasr_config.json`) → explicit `architecture=` → converter `detect()`, **ranked** by `detect_specificity` (`DETECT_KEYED_VALUE` 30 = the architecture is named in a config file / `DETECT_NAMED_CONFIG` 20 = a framework config file exists / `DETECT_ASSET_LAYOUT` 10 = filename conventions only, the default) — most specific claim wins, a tie at the top raises, and zero claims **raises** (the `"conformer"` fallback is gone). Ranking is why every `detect()` declares only *positive* markers: several formats share filenames, and the previous answer was `return False` guards for WeNet's and FunASR's markers living inside *icefall's* detector. Model configs inherit one type-driven `from_dict` (`oasr.models.base.coerce_config`: restores `Tuple` fields, recurses into nested dataclasses, unwraps `Optional`); a config overrides `_from_dict_overrides` only for a *flat* encoder dict or a *polymorphic* field (`TransducerModelConfig.encoder`, whose class comes from the sibling `encoder_type`). `load_weights` returns a `LoadReport{mapped,dropped,missing}` (built via `LoadReport.build`, which folds `unexpected` into `dropped` and uses set membership — four of six models previously did neither, so the registry's capability-drop check never saw the keys the model actually refused) — the registry warns on dropped weights per the converter's `expected_unused_prefixes` (silent, e.g. icefall `simple_*_proj`) / `capability_drop_hints` (named warning, e.g. the U2++ `decoder.*` rescoring branch). `decoders/` holds the autoregressive `BaseDecoder`/`PredictionNetwork`/`Joiner` contracts (transducer/AED/LLM extension points). `heads/ctc.py` (`CTCHead`).
-  - **`models/conformer/`** — Conformer (`model.py`, `config.py`), `WenetConverter` (`convert.py`); `streaming_kind="paged"`, supports sequence packing. U2/U2++ dirs whose `train.yaml` declares a `(bi)transformer` decoder get the AED branch loaded as `self.decoder` (`decoder.left_decoder.*` keys 1:1; plain-`transformer` `decoder.decoders.*` keys remapped into `left_decoder`) → `capabilities={"ctc","ctc_aed_rescoring"}`, `default_decode_type="ctc"` (rescoring is opt-in via `EngineConfig.decode_method`). The decoder config (incl. `sos/eos` = raw vocab − 1 and the trained `reverse_weight`) lives in `ConformerModelConfig.decoder`.
-  - **`models/zipformer/`** — Zipformer CTC ported from icefall (`model.py`, `encoder.py`, `subsampling.py`, `scaling.py`, `config.py`), `IcefallConverter` (infers config from checkpoint shapes; emits `FeatureSpec(audio_scale=1.0)` — icefall computes FBANK through lhotse on the `[-1, 1]` waveform, **unlike** WeNet's `1 << 15`, and a wrong scale silently costs the transcript's leading token); `streaming_kind="stateful"` when the config is streaming-capable (`causal=True` and `chunk_size > 0`) and `"none"` otherwise, so a non-causal release (e.g. `zipformer-large-cr-ctc`) is refused in streaming service mode at engine construction rather than raising on its first request, and allocates no paged pool. `ZipformerEncoder.stack_streaming_states`/`unstack_streaming_states` declare the per-kind state batch dims (icefall's `streaming_decode.py` convention: embed + conv caches dim 0, key/nonlin/value caches dim 1) so the stateful backend can batch streams.
-  - **`models/decoders/`** — AR decoder contracts (`base.py`) plus `transformer_decoder.py`: WeNet/ESPnet-compatible `TransformerDecoder`/`BiTransformerDecoder` (state-dict keys mirror WeNet's `embed.0.weight`/`decoders.N.self_attn.linear_q.*` layout — U2++ `decoder.*` weights load 1:1; verified ~6e-6 vs the upstream WeNet implementation), `add_sos_eos`/`reverse_pad_list` helpers, and an incremental `forward_one_step`. Built on `oasr.layers` — WeNet's `linear_q/k/v/out` names over the shared `Attention` core, `feed_forward` as a `FeedForward(names=("w_1","w_2"))` whose ReLU folds into the GEMM epilogue. Cross-attention takes `memory_lens` rather than a materialized memory mask, which is the form the fused kernel enforces directly.
-  - **`models/whisper/`** — HF-format Whisper (`model.py` encoder/decoder with HF key layout, built on `oasr.layers` (projections/norms/embeddings + the shared `Attention` core; `fc1`/`fc2` stay flat `Linear`s because HF's layout puts them on the layer, and GELU stays exact-erf and unfused), + a batched incremental `prefill`/`step`/`select` decoder surface, `config.py` incl. generation-control ids, `convert.py` `HFWhisperConverter` — auto-detects `config.json: model_type=whisper`, reads `model.safetensors` + `generation_config.json`, emits `TokenizerSpec(kind="whisper")` + `FeatureSpec(kind="whisper_logmel", audio_scale=1.0)`). Offline-only (`streaming_kind="none"`, streaming rejected at engine init — a general gate: any `streaming_kind="none"` model is refused in streaming service mode); decoded by the incremental `aed` strategy (greedy; suppress/begin-suppress lists + SOT prompt from the config). Native format round-trips. The post-conv `transpose(1,2)` is followed by `.contiguous()`: without it the whole residual stream carries the conv's strided last dim, which the norm kernels refuse and every projection copies around anyway.
-  - **`models/paraformer/`** — FunASR Paraformer, non-autoregressive (`encoder.py` SANM encoder — FSMN-memory self-attention (via the shared `oasr.layers.Attention`; the explicit matmul+softmax form was 5 kernels × 50 blocks and measured 1.17-1.29x slower paired), 560→512 first layer, sinusoidal PE, **LayerNorm eps 1e-12** (ESPnet convention — parity breaks at PyTorch's 1e-5); `predictor.py` `CifPredictor` — CifPredictorV2 with the vectorized `cif_v1` prefix-sum integrate-and-fire, always fp32; `decoder.py` SANM NAR decoder — FFN-first layer order, FSMN-only self-attn, one parallel pass over the CIF acoustic embeddings; `convert.py` `FunASRParaformerConverter` — auto-detects `config.yaml: model: Paraformer`, parses `am.mvn` CMVN into synthetic `encoder.cmvn_shift/scale` state-dict buffers so native round-trip is automatic, emits `TokenizerSpec(kind="funasr_char")` + `FeatureSpec(kaldi_fbank, hamming, LFR 7/6, audio_scale=32768)`). Offline-only; registered `"paraformer"`; parity vs FunASR 1.3.14 on `paraformer-zh`: encoder ≤2e-5, CIF fires bit-exact, token ids + transcript exact (icefall's detect now yields to dirs holding a FunASR `config.yaml` — `model.pt` alone used to over-claim). The NAR decoder's cross-attention now takes encoder **lengths**, not a mask: the old `(B,1,T)` `{0.,1.}` float mask reached SDPA as an *additive* bias, adding +1.0 to valid logits and leaving padded keys attendable — a constant shift cancels in softmax, so it was invisible at `B=1` and only corrupted mixed-length batches (`TestCrossAttentionPadding`).
-  - **`models/speech_llm/`** — Qwen2-Audio-style LLM-ASR (`audio_tower.py` Whisper-geometry encoder ×32 d=1280 with **key-padding-only** attention mask + `AvgPool1d(2)` + post-pool LayerNorm — valid lengths follow HF's two-stage formula `(mel−1)//2+1` then `(feat−2)//2+1`; `llm.py` `Qwen2Lm` — faithful Qwen2 causal LM built on `oasr.layers` (`RMSNorm`, `NeoxRotaryEmbedding`, `GatedMLP`, `Attention`; the hand-rolled RMSNorm/rotary/MLP copies are gone). RMSNorm accumulates in fp32 to the store where HF rounds before the weight multiply — the more accurate order, one rounding step apart under bf16, gated by the real 7B argmax/top-5 test exposing `prefill(inputs_embeds, valid[, capacity])`/`step`/`select` for **left-padded variable-length** prompts (per-row positions = `cumsum(mask)−1`, HF masked-generate convention); with `capacity` (the `llm` strategy passes prompt + generation cap) the per-layer K/V buffers are preallocated and each step writes its slot in place — no per-step `torch.cat` cache re-copy (17% faster 7B step at B=8, token-identical; overflow degrades to cat-growth). Every mask this decoder builds is causal or **left**-padded (valid keys `[P-len, P)`, not a length), so the shared core resolves to SDPA on every call — by construction, not omission; paged decoder-KV remains the open optimization. `model.py` module names mirror HF 1:1 (`audio_tower`/`multi_modal_projector`/`language_model`) — `load_weights` normalizes 4.x (`language_model.model.*`) and 5.x-resave (`language_model.model.model.*`) key layouts; `convert.py` `HFQwen2AudioConverter` — auto-detects `config.json: model_type=qwen2_audio`, fills omitted `text_config` fields from `Qwen2Config` defaults (the published 7B relies on them), reads sharded safetensors, emits `TokenizerSpec(kind="huggingface")` incl. tokenizer_config.json + `FeatureSpec(whisper_logmel, 128 mels)`). Offline-only; registered `"speech_llm"`; parity: fp32 tiny fixture token-exact vs `transformers` greedy (B=1 + batched left-padded), real 7B bf16 same prefill argmax/top-5, LJ transcripts content-identical. Checkpoint bundles load host-side (`map_location="cpu"`) with dtype cast **before** the device move — an 8.4B checkpoint double-booked on the GPU otherwise.
-  - **`models/nemotron/`** — **NVIDIA Nemotron ASR** (FastConformer + RNN-T; `nvidia/nemotron-3.5-asr-streaming-0.6b`). Registered `"nemotron"`, `decode_type="transducer"`, offline **and** cache-aware streaming (`streaming_kind="paged"`). `encoder.py` — 24-layer macaron Conformer over **causal depthwise-separable 8x Conv2d subsampling** (`subsampling.py`, kept in NHWC so the projection's input columns are permuted once at load, the same trick as `Conv2dSubsampling`'s `_version = 2`), **Transformer-XL** relative position (`rel_shift` — WeNet's convention needs no shift, which is why `oasr.layers.RelPositionMultiHeadedAttention` has none and this is a separate module), and a `chunked_limited` attention mask that **applies offline too** (it is trained, not a streaming-only device: a query sees its own chunk of `num_lookahead_tokens + 1` frames plus `(sliding_window - 1) // chunk` earlier ones). `predictor.py` — 2-layer **LSTM** predictor + additive joint `head(relu(enc_proj + dec_proj))` + the language-prompt projector (a 128-wide one-hot concatenated onto every encoder frame, with **no residual** — its output replaces the hidden state). `convert.py` `HFNemotronConverter` auto-detects `config.json: model_type=nemotron3_5_asr` and emits `TokenizerSpec(kind="huggingface", special_ids=[blank])` — blank 13087 sits *past* the tokenizer's 13087 pieces, so it must be filtered before the backend sees it — plus `FeatureSpec(nemotron_logmel, 128 mels, preemphasis 0.97, audio_scale=1.0)`. Parity vs `transformers` 5.14: encoder ≤6e-6 and greedy **token-exact** on CPU fp32; frontend bit-exact given librosa's mel table (2.3e-4 with torchaudio's, which is the whole residual). **WER 2.62%** on the LJSpeech-200 gate, bit-stable across `max_batch_size` 1/8/16/32. Two traps it surfaced: `scale_input` defaults to `True` upstream and is `False` on the release (a factor of 32), and the released `-inf` mask floor is a **kernel defect** at this bias magnitude — see `MASK_FLOOR` and `.artifacts/known_issues.md` §4.
-    **Streaming** (WER **2.44%**, i.e. *better* than offline — 66S 6D vs 69S 9D — because a closed stream is padded with more trailing silence than offline's single right-pad frame; gated as `nemotron_streaming` in `ci/wer-reference.json`; a chunked pass equals a whole-utterance one to `2e-6` with `rtol=0` at chunk sizes 2/4/8, at every trained lookahead, and for a stream admitted mid-cohort). Four kinds of state, each on a declared axis rather than a special case: the **three subsampling-stage tails** (`streaming_state_specs`), the per-layer post-GLU conv tail (the engine's existing `"conv"` slot cache — `conv_kernel_size - 1` is exactly what this encoder needs), the **prefilled** paged K/V window (`fixed_attention_window`), and the frontend frame grid (on the extractor, not here). The `chunked_limited` mask needs no new form — it rides in the same additive bias as the rel-pos term, which is also where a young stream's zero-filled leading key columns get masked. Two alignment preconditions, both silent if violated, both refused at engine construction by `streaming_geometry`: `chunk_size` must be a whole number of trained attention chunks (`num_lookahead_tokens + 1`; the mask groups *absolute* frame positions, so a partial trained chunk would need keys from the future), and the resulting feature window a multiple of the subsampling factor (so every stage's input length is a multiple of its stride). **Upstream's subsampling cache width is wrong and this is worth knowing:** `NemotronAsrStreamingEncoderCausalConv2D` keeps `kernel - stride` frames plus a first-chunk `stride - 1` top-up, which shifts the stride grid from chunk two onward — measured against its own offline pass at `kernel 3 / stride 2`, chunk 1 is bit-exact and everything after diverges by ~3 absolute. The correct width is `kernel - 1`, uniformly, with no first-chunk case, given the stride-multiple precondition; that is bit-exact at 2/4/8/16/32 and wrong at every length that is not a multiple. The path also surfaced **two pre-existing defects in shared streaming code**, both invisible offline and both fixed: the closing silence pad was one `decoding_window`, leaving a runtime that cannot forward a sub-window tail with **1 to `window`** frames of decoder flush depending on utterance length (42 deletions at a 32-frame window against 9 at 128 — trailing subwords silently missing, worse the shorter the chunk; `StreamingEncoderBackend.finalize_align_frames` now declares the alignment and the stream is rounded up first), and `GraphedEncoderForward`'s returned buffer is invalidated by a later **capture**, not only by a later replay at the same key — captures share one memory pool, so a first capture at a new key can be handed the block an earlier capture's output buffer occupies (5 of 40 LJSpeech utterances lost their trailing words, deterministically, graphs-only; the batched cohort now detaches whenever anything follows it in the step).
-  - **`models/transducer/`** — RNNT model (`model.py` `TransducerModel`, `decoder.py` stateless predictor, `joiner.py`, `config.py`, `convert.py` `IcefallTransducerConverter`); `decode_type="transducer"`, registered as `"transducer"`. `encoder_type ∈ {"conformer", "zipformer"}` selects the acoustic front-end (streaming follows the encoder: paged vs stateful). **Not auto-detected** — icefall dirs sniff as `zipformer` (CTC) and hybrid checkpoints carry both branches; load with `from_pretrained(dir, architecture="transducer")` (config shape-inferred from `decoder.*`/`joiner.*`; `simple_*_proj` declared-dropped, `ctc_output.*` a named capability hint). The matching `TransducerDecodeStrategy` (`engine/decode/transducer.py`, `consumes="hidden"`) implements offline **and** streaming greedy: one vectorized frame-sync loop, per-request sessions (label window + predictor projection + hypothesis) threaded across chunks; `EngineConfig.transducer_max_sym_per_frame` caps per-frame emissions. `beam_size > 1` (decode option) switches to icefall-style **modified beam search** (`decode/transducer_beam.py`, at most one symbol per frame, offline *and* streaming) — hypotheses live in a device-side `(B, k, cap)` buffer because a host-side list-of-lists reorder per frame is Θ(T²); `beam_size=1` is greedy by construction and the exactness gate is that beam width 1 reproduces greedy token-for-token. Loop control costs one host sync per iteration (the predictor-recompute gate) plus one per `_TERMINATION_CHECK_STRIDE = 16` iterations — the termination check is amortized because overshooting a block is inert (all rows inactive ⇒ nothing mutates), but the `emit.any()` gate is **kept**: it skips a real predictor forward, and dropping it measured **0.59×** on blank-dominated audio even though it is token-identical. Test the stride-invariance property, don't re-derive it. Streaming runs through the consumes-aware backends: strategies declaring `consumes="hidden"` get the encoder-only chunk forward (`encode_chunk_paged` / `encoder.streaming_forward`), resolved at engine init via `get_decode_strategy_class(...)` before `ModelRunner` construction — **CUDA-graph captured on the paged backend just like the fused CTC path** (measured 3.5–3.7× on a 12-layer d=256 conformer-transducer at 4–16 streams, token-identical; eager cost is flat in batch width because the chunk forward is launch-bound, so the win does not shrink as the pool grows).
-- **`utils/`** — `validation.py` (`@supported_compute_capability`, `@backend_requirement` decorators), `mappings.py` (dtype/enum helpers), `timer.py`.
-- **`serving/` (removed)** — The Python ZMQ worker (`engine_worker.py` / `ipc.py` / `server.py`) is gone. The serving front-end now embeds the engine in-process via PyO3 (see the Rust serving section below). The `oasr` Python package is a runtime dependency of the front-end — it must be importable at the active Python interpreter. The thin `oasr/_server_cli.py` (the `oasr-server` console-script entry point) just forwards `sys.argv` into `oasr._core.serve`.
-
-### Rust serving frontend (`rust/`)
-
-Cargo workspace that builds the OASR serving core. It ships **two ways** from one shared code path: as `oasr._core`, a PyO3 extension module built by setuptools-rust during `pip install` and run via the `oasr-server` console script (`oasr._server_cli:main`); and as a standalone `oasr-server` binary via `cargo build`. Either hosts **one in-process Python `ASREngine` per process** via PyO3 and serves it over HTTP + gRPC. Multi-GPU = launch N processes behind a process manager, each with `CUDA_VISIBLE_DEVICES` set.
-
-The PyO3 linkage mode is the key split: the binary embeds + links libpython (`pyo3/auto-initialize`), while the extension module is loaded by the host interpreter (`pyo3/extension-module`). These features are mutually exclusive and Cargo unifies features per build, so the shared serving logic lives in `oasr-serve` (mode-agnostic) and the two front-end crates select the mode via `oasr-engine-client`'s `auto-initialize` / `extension-module` features. `oasr-core` is excluded from `default-members` so a plain `cargo build` produces the binary; setuptools-rust builds `oasr-core` on its own.
-
-| Crate | Role |
-|---|---|
-| `oasr-wire` | Shared event/command types (`Cmd`, `Event`, `ErrorCode`, `ModelInfo`). Pure Rust — no codec / no IPC. |
-| `oasr-engine-client` | PyO3-backed driver: `PyEngine` wrapper, `EngineDispatcher` thread that owns the GIL and drives `engine.step()`, `EngineClient`/`EnginePool` async facades. Exposes `auto-initialize` / `extension-module` features forwarding to pyo3. Three request handles: `OfflineHandle` (unary — one terminal event), `StreamingHandle` (chunked audio in), and `OfflineStreamHandle` (audio in one shot, **every** event streamed out — `submit_offline_streaming`, cancel-on-drop armed so a client disconnect stops an AR row from burning decode slots). |
-| `oasr-asr` | Audio decode (WAV via `hound`, raw PCM) to f32 mono `bytes::Bytes`, plus **sample-rate conversion** (`resample.rs`, windowed-sinc via `rubato`). The engine accepts exactly one rate — the model's, now on `ModelInfo.sample_rate` — and *rejects* a mismatched `Request.sample_rate` rather than transcribing at the wrong speed, so the front-ends convert on the way in: `decode_audio(..., target_sample_rate)` for whole clips, `PcmStream` for the streaming RPCs (one resampler per stream so filter state carries across chunks; tail flushed on half-close). Rates outside `[4000, 384000]` Hz are `INVALID_ARGUMENT`; matching rates build no filter. |
-| `oasr-server-http` | axum routes (Google STT v1-shaped REST): `POST /v1/speech:recognize`, `/healthz`, `/readyz`, `/metrics`, `/v1/models` |
-| `oasr-server-grpc` | tonic `oasr.speech.v1.Speech` service (`Recognize` unary + `StreamingRecognize` bidi) plus the standard `grpc.health.v1.Health` service. Proto in `rust/proto/oasr_speech_v1.proto`. `StreamingRecognize` is served in **both** service modes: in `streaming` mode audio is fed chunk-by-chunk; in `offline` mode the handler buffers audio to half-close, submits one offline request, and streams the **text** back — which is what makes the AR families' per-tick partials reachable (they were built, crossed PyO3, reached the router, then were discarded by the unary drain task). `--max-tick-ms` is therefore a user-visible inter-token cadence knob, not just a GIL bound: 7B measured first token 184 ms, median partial gap 39.7 ms. One-shot families (CTC/Paraformer/rescoring) emit a single final through the same path |
-| `oasr-serve` | Mode-agnostic serving core: `Cli` + `run(cli)` (builds the engine, tokio runtime, HTTP + gRPC listeners). Shared by the binary and the extension module. |
-| `oasr-server` | Standalone binary: thin `main.rs` → `oasr_serve::run`; pulls `oasr-engine-client` with `auto-initialize`. **One process per GPU.** |
-| `oasr-core` | cdylib `oasr._core` PyO3 module: `#[pymodule]` exposing `serve(argv)` → `oasr_serve::run` under `allow_threads`; pulls `oasr-engine-client` with `extension-module`. Built by setuptools-rust. |
-
-Routing policy: single in-process engine per process — no sticky map needed at the pool level (the pool exists for symmetry with a future multi-engine-per-process layout). `/readyz` returns 200 once the dispatcher has taken its first tick. Build deps: a Python development install (PyO3 links libpython), `protobuf-compiler`, a C/C++ toolchain.
-
-**Dispatcher (`oasr-engine-client::dispatcher`)** is the GIL-owning thread that drains commands from the tokio mpsc channel, replays them into Python (`add_request`/`feed_chunk`/`cancel`), runs `engine.step()`, and pushes the resulting events back via per-request channels. Key knobs (CLI flags on `oasr-server`):
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--engine-label` | `engine` | tracing label |
-| `--service-mode` | `streaming` | `streaming` or `offline` — pins the engine for its lifetime |
-| `--max-concurrent-requests` | `256` | engine-side admission cap; over-cap admits emit `Event::Overloaded` |
-| `--admit-window-ms` | `3` | wait up to N ms after first envelope for siblings before stepping (HTTP burst coalescing); `0` disables. Entered only for an **admissions-only** batch — a `Cancel`/`FeedChunk` in hand (or landing mid-window) ends the wait, since it used to tax the two most latency-sensitive commands for the full window |
-| `--admit-threshold` | `64` | stop coalescing early when this many envelopes drained |
-| `--max-audio-mib` | `256` | one cap for the HTTP body **and** gRPC `max_decoding_message_size` (tonic's undeclared 4 MiB default was a 64× asymmetry) |
-| `--request-timeout-secs` | `300` | deadline for a unary request, incl. time queued behind the concurrency limit; `0` disables |
-| `--stream-idle-timeout-secs` | `300` | abort a streaming RPC idle this long (no inbound audio, or no decode event after half-close); `0` disables. Not a blanket gRPC deadline — that would cut off healthy long streams |
-| `--max-inflight-connections` | `4 ×` admission cap | per-listener concurrency (bounds resident multi-MiB bodies); `/healthz`,`/readyz`,`/metrics` exempt; `0` disables |
-| `--shutdown-grace-secs` | `10` | drain deadline after SIGTERM before listeners are dropped |
-| `--preferred-batch-sizes` | none | comma list, pre-warms CUDA-Graph capture per B |
-| `--schedule-policy` | engine default (`bucket`) | `bucket` / `fcfs` / `sjf` |
-| `--max-offline-pad-ratio` | engine default (`4.0`) | padded-waste cap for `bucket` policy |
-| `--decoder-type` | engine default (`ctc_cuda`) | `ctc_cuda` / `ctc_wfst` (in-tree GPU WFST) |
-| `--fst-path` | none | WFST graph for `ctc_wfst`: prebuilt `.img` or k2 `HLG.pt` (words.txt beside it = word table) |
-| `--decode-method` | model default | capability selection (e.g. `ctc_aed_rescoring`, `llm`); validated against `model.capabilities` at startup |
-| `--llm-prompt` | checkpoint default | speech-LLM user prompt (per-request `prompt` options override) |
-| `--max-new-tokens` | engine default (448) | AR generation cap per request |
-| `--decode-steps-per-tick` | engine default (32) | bounded batched AR decoder steps per engine tick |
-| `--max-decode-slots` | `max_batch_size` | in-flight AR request cap before admission pauses |
-| `--max-num-blocks` | engine default (2048) | streaming paged-KV pool size; **`0` = derive from free VRAM** (the engine's `None`) |
-| `--gpu-memory-utilization` | engine default (0.90) | share of the card the engine may occupy when it derives a capacity |
-| `--decode-kv-budget-gib` | derived from VRAM | AR decoder-KV byte ceiling; `0` disables the byte budget |
-
-Per-request decoding options travel the whole stack: proto `RecognitionConfig` extensions (`max_alternatives` honored + fields 101–105: `max_new_tokens`/`temperature`/`top_k`/`top_p`/`prompt`) and matching HTTP query params → `oasr_wire::DecodingParams` on `Cmd::Create*` → a `decoding` dict kwarg into `add_request[s_batch]` → `oasr.engine.DecodingOptions`. `Event::Final` carries `nbest_texts` (engine-detokenized alternatives) + `end_time_s` (last CIF timestamp) → proto `result_end_time`; `confidence` is the softmax-normalized posterior among the returned n-best scores (`oasr_wire::score_posteriors`; 0.0 when a family emits a single hypothesis).
-
-Admission coalescing batches contiguous `CreateOffline`/`CreateStreaming` envelopes into one `add_requests_batch` Python call — turns 10–20-deep service batches into 32–64 under `asyncio.gather`-style bursts. `FeedChunk`/`Cancel`/`Ping` flush the admit batch first to preserve `CreateStreaming → FeedChunk` ordering. The command channel's depth is **derived** from `--max-concurrent-requests` (2×, floor 64) rather than fixed, because a queued `CreateOffline` holds its whole audio payload.
-
-Tick pacing has two waits, both a bounded `recv` (an arriving command wakes them in ~10 µs) rather than a sleep: `IDLE_RECV_TIMEOUT` (500 ms) when the engine is empty, and `NO_WORK_BACKOFF` (2 ms) after a tick that received nothing, emitted nothing, **and** ran faster than `NO_WORK_TICK_MAX` (1 ms). The second exists because "the engine has requests" ≠ "the engine has work": one open stream waiting on the client's next 640 ms chunk used to spin the thread through empty steps for the whole session — measured **95.9% → 4.2% of a core**, transcript-identical, with the loaded-path A/B a wash (RTF 552 vs 550, first-partial p50 19 vs 18 ms). Gating on tick *duration* is what keeps it off the working paths; an AR decode group grinding through its per-tick step budget costs far more than 1 ms even when it emits nothing.
-
-All three request handles (`StreamingHandle`, `OfflineStreamHandle`, and now the unary `OfflineHandle` behind HTTP `speech:recognize` / gRPC `Recognize`) arm `CancelOnDrop`, so a client disconnect stops the request instead of letting it run to completion on a slot nobody is waiting for; `oasr_requests_cancelled_total` counts them. Shutdown is `with_graceful_shutdown`/`serve_with_shutdown` + a bounded join, and the gRPC health reporter is driven by a watcher polling the same readiness signal `/readyz` reads (it was previously set once at startup and never re-evaluated, so a wedged engine answered `SERVING` forever). The Python-side `oasr/serving/` directory still exists but is dead code from the binary's perspective; `bench_service.py` rejects `--num-workers > 1` with a helpful error pointing at the new "one process per GPU" topology.
-
-### Engine concurrency
-
-`ASREngine` is **thread-safe** as of v0.1: every public entry (`add_request`, `add_streaming_request`, `feed_chunk`, `abort_request`, `step`, `run`, `num_running`, `num_waiting`, `transcribe`) acquires a process-wide re-entrant `threading.RLock`. Protects the scheduler queues (`_streaming_waiting`, `_offline_waiting`, `_running`, `_index` in `oasr/engine/scheduler.py`) and per-request audio mutation (`request.audio_chunks`, `request.audio_final`). The lock is coarse — `step()` holds it for the full 10–100 ms GPU-bound step — but the GIL serializes Python anyway and CUDA releases the GIL during forward. Under serving, the PyO3 dispatcher (`oasr-engine-client::dispatcher`) is the only Python caller and runs single-threaded; HTTP/gRPC handlers stay on tokio and never touch the GIL. Horizontal scale is **one process per GPU** — launch multiple `oasr-server` processes behind a process manager.
-
-### Binding pattern (FlashInfer-style)
-
-Each kernel group follows the same pattern:
-1. Kernel header in `include/oasr/<family>.cuh`.
-2. TVM-FFI launcher in `csrc/<family>.cu`.
-3. TVM-FFI JIT binding in `csrc/<family>_jit_binding.cu`.
-4. JIT generator in `oasr/jit/<family>.py`.
-5. Python functional API in `oasr/<family>.py`.
-6. nn.Module wrapper in `oasr/layers/<family>.py`.
-7. AOT registration in `oasr/aot.py`.
-
-pybind11 bindings (`csrc/pybind/`) remain only for the CTC decoder (CPU-side C++).
-
-## Developer skills (slash commands)
-
-Two skill files provide step-by-step workflows for common tasks:
-
-- **`/add-cuda-kernel`** — Full walkthrough for adding a new kernel family (CUDA header → csrc launcher → JIT binding → JIT generator → Python API → tests → AOT registration). Use this as the authoritative reference when adding kernels.
-- **`/benchmark-kernel`** — Benchmarking guide for the unified CLI (`oasr_benchmark.py`), including testlist files, CSV output, and Nsight Compute profiling.
-
-### Key patterns for new kernels
-
-- **C++ convention**: output tensor is the **first parameter** in all TVM-FFI launcher functions.
-- **Python compilation context**: `CompilationContext` (in `oasr/compilation_context.py`) detects GPU SMs at import time; pass `supported_major_versions=[...]` to `get_nvcc_flags_list()` for arch-restricted kernels.
-- **Validation decorators** (`oasr.utils`): `@supported_compute_capability([80, 86, ...])` marks check functions with their supported SMs; `@backend_requirement(backend_checks={...}, common_check=fn)` wires validation into the Python API function and adds `.is_backend_supported()` / `.is_compute_capability_supported()` helpers.
-
-## Key constraints
-
-- Requires CUDA >= 11.8, CMake >= 3.18, Python >= 3.10 (`oasr/decoder/wfst/graph_image.py` annotates defaults with PEP 604 unions and has no `from __future__ import annotations`, so 3.9 raises at import; `test-cpu.yml` runs 3.10 so the floor stays tested).
-- cuDNN is optional; some features are disabled if not found.
-- C++ standard: C++17. CUDA flags include `--expt-relaxed-constexpr`, `--expt-extended-lambda`, `-O3`, `--use_fast_math`.
-- The compiled `_C.so` lives inside the Python package at `oasr/`; do not import `oasr` before building.
-
-## Environment variables
+Engine configuration is `EngineConfig` ([`docs/engine.md`](docs/engine.md) §6);
+serving flags are on `oasr-server --help` ([`docs/serving.md`](docs/serving.md)).
+Environment variables:
 
 | Variable | Purpose |
-|----------|---------|
-| `CUDA_ARCHITECTURES` | Override SM targets for build (e.g., `80` or `80;86`) |
-| `OASR_CUDA_ARCH_LIST` | Manual override for JIT CUDA architecture detection |
-| `OASR_ATTN_BACKEND` | `sdpa` (force SDPA), `cute` (require CuteDSL FMHA, raise on unsupported arch or import failure), `auto` (default — use cute on sm_80 / sm_86 / sm_89 / sm_120 when CuteDSL imports, else warn + fall back to SDPA) |
-| `OASR_RS_BIN` | Absolute path to an `oasr-server` executable; overrides the `oasr-server`-on-`$PATH` / `rust/target/release/` lookup used by `bench_service.py` |
-| `OASR_USE_K2` | Set to `1` to build the WFST decoder (requires `pip install k2` and a k2 source tree at `K2_SOURCE_DIR` — default `/opt/k2-src`) |
-| `OASR_CTC_FUSED` | Set to `0` to force the legacy multi-kernel CTC beam-search step (compiles a separate `ctc_decoder_legacy` JIT module). Default: fused single-kernel step for `beam <= 32` (~2.3–3× faster; see `docs/ctc_decoder_gpu.md` §3.4.6). Rollback / A/B-parity switch — set before process start |
-| `OASR_FEATURE_BACKEND` | Set to `torch` to force the reference feature frontend (the `nemotron_logmel` kernel chain's CPU path / fp32 parity oracle). Rollback / A/B-parity switch |
-| `OASR_LAYERS_BACKEND` | `oasr` (default — OASR kernels; an undeclared in-scope refusal raises rather than degrading) or `torch` (the optional backend, selected deliberately: never calls a kernel — used by the CPU parity oracles and as the "is this the kernels' fault" A/B). No `auto`: torch is a backend you select, not a fallback |
-| `OASR_GEMM_HEURISTIC` | Set to `0` to disable shape-aware GEMM backend selection (every shape → the fixed `GEMM_DEFAULT` tile). Rollback / A/B-parity switch |
-| `OASR_GEMM_STREAMK` | Set to `0` to skip compiling the Stream-K GEMM variants (leaner build; they stay out of the autotune candidate space) |
-| `OASR_GEMM_SPLITK_PARALLEL` | Set to `0` to skip compiling the parallel split-K (`GemmSplitKParallel`) GEMM variants |
-| `OASR_GEMM_WS_CACHE` | Set to `0` to disable the persistent split-K/Stream-K workspace cache and fall back to per-call `cudaMallocAsync` + memset workspaces |
+|---|---|
+| `CUDA_ARCHITECTURES` | SM targets for the build (e.g. `80` or `80;86`) |
+| `OASR_CUDA_ARCH_LIST` | Manual override for JIT arch detection |
+| `OASR_ATTN_BACKEND` | `auto` (default) / `cute` (require the kernel) / `sdpa` (force fallback) |
+| `OASR_LAYERS_BACKEND` | `oasr` (default) or `torch` (parity oracles, and the "is this the kernels' fault" A/B). There is no `auto`. |
+| `OASR_GEMM_HEURISTIC` | `0` disables shape-aware GEMM selection (A/B, rollback) |
+| `OASR_GEMM_STREAMK`, `OASR_GEMM_SPLITK_PARALLEL` | `0` skips compiling those GEMM variants |
+| `OASR_GEMM_WS_CACHE` | `0` disables the persistent split-K/Stream-K workspace cache |
+| `OASR_CTC_FUSED` | `0` forces the legacy multi-kernel CTC beam-search step (A/B, rollback) |
+| `OASR_FEATURE_BACKEND` | `torch` forces the reference feature frontend (A/B, parity oracle) |
+| `OASR_USE_K2` | `1` builds the k2-backed WFST decoder (needs `pip install k2` + `K2_SOURCE_DIR`) |
+| `OASR_RS_BIN` | Path to an `oasr-server` executable, for `bench_service.py` |
+
+The five `OASR_*` A/B switches exist so a regression can be attributed. Set them
+before process start.
+
+---
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `ImportError` on `oasr._C` / `oasr._core` | The package was imported before it was built. `pip install -e .` again. |
+| A kernel change has no effect | Stale JIT cache — `rm -rf ~/.cache/oasr/jit`. |
+| CUTLASS headers not found | `git submodule update --init`. |
+| Cargo fails on autocfg probes (bogus generic-argument errors in `tower` / `indexmap`) | The target dir is on a filesystem rustc's probes cannot use. Set `CARGO_TARGET_DIR` to a local path. |
+| Cargo fails on conflicting pyo3 features | You used `--workspace`. Don't. |
+| Green tests but no real coverage | The external assets are absent — read the `external assets:` table, or use `--strict-assets`. |
+| Engine INFO logs missing under `oasr-server` | Known limitation — the front-end configures `tracing`, not Python `logging`. See `.artifacts/serving_perf.md` §5. |
+| `BlockPool exhausted` mid-stream | Size `max_num_blocks`, or set it to `None` and let the engine derive it from free VRAM. |
+
+---
+
+## Key documentation
+
+| Document | Covers |
+|---|---|
+| [`docs/README.md`](docs/README.md) | Documentation index |
+| [`docs/architecture.md`](docs/architecture.md) | The seven seams, the layer waist, the extension cookbook |
+| [`docs/engine.md`](docs/engine.md) | `ASREngine` step loop, executors, `EngineConfig`, VRAM sizing |
+| [`docs/scheduler.md`](docs/scheduler.md) | Batching and partition policies, starvation bounds |
+| [`docs/models.md`](docs/models.md) | Model contracts, capabilities, the seven architectures |
+| [`docs/decoding.md`](docs/decoding.md) | Decode families, the incremental AR protocol, beam search, decoding options |
+| [`docs/kernels.md`](docs/kernels.md) | CUDA/CUTLASS layer, the JIT pipeline, the functional API |
+| [`docs/features.md`](docs/features.md) | Feature frontends, `FeatureSpec`, streaming framing |
+| [`docs/tokenizers.md`](docs/tokenizers.md) | Tokenizer axis and `TokenizerSpec` |
+| [`docs/checkpoints.md`](docs/checkpoints.md) | Resolution precedence, converter contract, native format |
+| [`docs/cache_manager.md`](docs/cache_manager.md) | Paged and slot streaming caches |
+| [`docs/ctc_decoder_gpu.md`](docs/ctc_decoder_gpu.md) | GPU CTC prefix beam search |
+| [`docs/wfst_decoder_gpu.md`](docs/wfst_decoder_gpu.md) | In-tree GPU WFST decoder |
+| [`docs/serving.md`](docs/serving.md) | Rust front-end, HTTP/gRPC APIs, dispatcher, deployment |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Benchmark recipes and measurement protocol |
+| [`docs/ci.md`](docs/ci.md) | The four workflows, the asset gate, the accuracy gate, why mypy is a ratchet |
+| [`docs/autotuning.md`](docs/autotuning.md) | `oasr.tune` API and cache format |
+| [`.artifacts/README.md`](.artifacts/README.md) | Index of measurements, issues and investigations |
+
+### Skills
+
+| Skill | Use for |
+|---|---|
+| `/add-cuda-kernel` | The authoritative walkthrough for a new kernel family — CUDA header → csrc launcher → JIT binding → JIT generator → Python API → layer wrapper → tests → AOT registration |
+| `/benchmark-kernel` | Benchmarking and profiling with `oasr_benchmark.py`, testlists, CSV output, Nsight Compute |

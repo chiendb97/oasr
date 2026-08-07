@@ -6,15 +6,45 @@ Speech-to-Text v1** so existing tooling (REST conventions, `grpcurl`,
 OpenAPI-style clients) feels familiar.
 
 `pip install` compiles the core into the `oasr._core` PyO3 extension module (via
-setuptools-rust) and installs the `oasr-server` console script that runs it, so
-the front-end ships with the wheel — no separate build step.  The same code also
-builds as a standalone binary (`rust/crates/oasr-server`) for `cargo`-only
+setuptools-rust) and installs the `oasr-server` console script that runs it
+(`oasr/_server_cli.py`, which just forwards `sys.argv` into `oasr._core.serve`),
+so the front-end ships with the wheel — no separate build step.  The same code
+also builds as a standalone binary (`rust/crates/oasr-server`) for `cargo`-only
 workflows; both share the `oasr-serve` crate.
+
+The `oasr` Python package is a **runtime dependency** of the front-end: it must
+be importable by the active interpreter.  There is no Python serving process —
+the former ZMQ worker was replaced by the in-process PyO3 engine.
 
 The engine runs **in-process** via PyO3 — one Python `ASREngine` per
 `oasr-server` process.  Multi-GPU scale is achieved by launching N
 `oasr-server` processes (each with `CUDA_VISIBLE_DEVICES` set), not by
 multiplexing inside one process.
+
+## Workspace layout
+
+| Crate | Role |
+|---|---|
+| `oasr-wire` | Shared event/command types (`Cmd`, `Event`, `ErrorCode`, `ModelInfo`, `DecodingParams`). Pure Rust — no codec, no IPC. |
+| `oasr-engine-client` | PyO3-backed driver: the `PyEngine` wrapper, the `EngineDispatcher` thread that owns the GIL and drives `engine.step()`, and the `EngineClient` / `EnginePool` async facades. Exposes `auto-initialize` / `extension-module` features forwarding to pyo3. |
+| `oasr-asr` | Audio decode (WAV via `hound`, raw PCM) to f32 mono `bytes::Bytes`, plus sample-rate conversion (`resample.rs`, windowed-sinc via `rubato`). |
+| `oasr-server-http` | axum routes (Google STT v1-shaped REST). |
+| `oasr-server-grpc` | tonic `oasr.speech.v1.Speech` service plus the standard `grpc.health.v1.Health` service. Proto in `rust/proto/oasr_speech_v1.proto`. |
+| `oasr-serve` | Mode-agnostic serving core: `Cli` + `run(cli)` — builds the engine, the tokio runtime, and both listeners. Shared by the binary and the extension module. |
+| `oasr-server` | Standalone binary: thin `main.rs` → `oasr_serve::run`; pulls `oasr-engine-client` with `auto-initialize`. |
+| `oasr-core` | cdylib `oasr._core` PyO3 module: `#[pymodule]` exposing `serve(argv)` → `oasr_serve::run` under `allow_threads`; pulls `oasr-engine-client` with `extension-module`. Built by setuptools-rust. |
+
+**The PyO3 linkage mode is the key split.** The binary embeds and links
+libpython (`pyo3/auto-initialize`); the extension module is loaded by the host
+interpreter (`pyo3/extension-module`). Those features are mutually exclusive and
+Cargo unifies features per build, which is why the shared logic lives in
+`oasr-serve` and why `oasr-core` is excluded from `default-members`. Never run
+`cargo build/test --workspace`.
+
+Three request handles cross the PyO3 boundary: `OfflineHandle` (unary — one
+terminal event), `StreamingHandle` (chunked audio in), and `OfflineStreamHandle`
+(audio in one shot, **every** event streamed out). All three arm
+`CancelOnDrop`, so a client disconnect stops the request.
 
 ## Quick start
 
@@ -308,9 +338,7 @@ Two consequences to plan for:
 * **`--max-tick-ms` sets the inter-token cadence.**  It bounds how long the
   dispatcher holds the GIL per tick, and one partial is emitted per tick, so it is
   a *user-visible latency knob* here rather than only an internal bound.  Measured
-  on Qwen2-Audio-7B-Instruct, `--max-tick-ms 25`, one 10 s utterance: first token
-  at **184 ms**, 21 interim responses, inter-partial gap min 27.9 / median 39.7 /
-  max 45.9 ms, final at 998 ms.
+  cadence on a real 7B: `.artifacts/serving_perf.md` §4.
 * **One-shot families are unaffected.**  A CTC / Paraformer / rescoring engine
   produces a single final through the same path (`interim_results` simply yields
   nothing extra) — verified against a WeNet Conformer: exactly one response.
@@ -363,37 +391,42 @@ CUDA_VISIBLE_DEVICES=1 oasr-server \
 Put any L4/L7 load balancer (nginx, envoy, …) in front — sticky routing is
 not required since one process serves a request end-to-end.
 
-### Processes per GPU — mode-dependent (measured, RTX 5090/SM120)
+### Processes per GPU is mode-dependent
 
 The right number of `oasr-server` processes **per GPU** differs by service mode:
 
 | Mode | Recommended | Why |
 |---|---|---|
-| **offline** | **1 / GPU** | The batched forward saturates the GPU. Two engines on one GPU thrash on CUDA-graph capture + memory and **regress ~17×** (measured 114 vs 1911 utts/s aggregate). Scale offline only **across** GPUs. |
-| **streaming** | **2–3 / GPU** | Chunk-by-chunk decoding is launch/CPU-bound and leaves the GPU under-utilised. A second process (a second GIL) interleaves kernel launches and fills the idle: **+34% aggregate at 2/GPU** (257→346 utts/s). |
+| **offline** | **1 / GPU** | The batched forward already saturates the GPU. Two engines on one GPU thrash on CUDA-graph capture + memory and regress badly. Scale offline only **across** GPUs. |
+| **streaming** | **2–3 / GPU** | Chunk-by-chunk decoding is launch/CPU-bound and leaves the GPU under-utilised. A second process is a second GIL, which interleaves kernel launches and fills the idle. |
 
 For streaming, enabling **CUDA MPS** (`nvidia-cuda-mps-control -d`) lets the
 processes' kernels run concurrently rather than time-slice, improving the
 multiplier further. Each process is independent — front them with the same
 load balancer.
 
-### Streaming throughput knobs: `--max-batch-size`, `--chunk-size`, processes/GPU
+### Streaming throughput levers
 
-Three composable levers, in order of simplicity (all measured on the reference box):
+Three composable knobs, in order of simplicity:
 
-1. **`--max-batch-size` 64→256: +21%** (262→316 utts/s). Batches more streams into each
-   encoder/fbank/CTC launch, amortising the launch overhead. Simplest (one knob), but
-   **diminishing returns** (64→128 is only +4%) and each step gets ~3–4× longer, so it
-   **raises per-stream chunk latency** — use it for throughput-biased / batch streaming, not
-   interactive. Needs `--max-num-blocks` ≥ `max_batch_size × blocks_per_seq`.
-2. **`--chunk-size` 16→32: +24%** (299→372 utts/s). Twice the audio per step → half the steps.
-   Same latency tradeoff (keep `16` for interactive first-token latency).
-3. **2–3 processes/GPU: +34%** (see table above). The only lever that **also preserves
-   per-stream latency** (each process keeps a modest batch) — it adds a second Python GIL,
-   breaking the single-GIL launch-issuing ceiling that batch/chunk alone cannot.
+1. **`--max-batch-size`** — batches more streams into each encoder / fbank / CTC
+   launch, amortising launch overhead. Simplest, but with **diminishing returns**,
+   and each step gets longer, so it **raises per-stream chunk latency**. Use it
+   for throughput-biased or batch streaming, not interactive. Needs
+   `--max-num-blocks ≥ max_batch_size × blocks_per_seq`.
+2. **`--chunk-size`** — twice the audio per step is half the steps. Same latency
+   trade-off; keep it small for interactive first-token latency.
+3. **Processes per GPU** — the only lever that **also preserves per-stream
+   latency**, because each process keeps a modest batch. It adds a second Python
+   GIL, breaking the single-GIL launch-issuing ceiling that batch and chunk alone
+   cannot.
 
-They stack: throughput-biased → big batch + chunk32 (+ extra processes for the GIL-bound
-remainder); interactive/low-latency → keep batch+chunk modest and scale with processes.
+They stack: throughput-biased → large batch + large chunk, plus extra processes
+for the GIL-bound remainder; interactive → keep batch and chunk modest and scale
+with processes.
+
+Measured deltas for each lever, on a specific box, are in
+`.artifacts/serving_perf.md`.
 
 ### Tuning knobs (exposed on `oasr-server`)
 
@@ -402,8 +435,9 @@ Beyond `--max-batch-size` / `--chunk-size` / `--preferred-batch-sizes` /
 `EngineConfig` tuning surface: `--max-batch-frames`, `--length-bucket-ratio`,
 `--max-wait-time`, `--streaming-cohort-admit`, `--partial-decode-interval`,
 `--overlap-partial-readback`, `--enable-sequence-packing` / `--max-packed-frames`,
-and the (default-off, **keep off** — measured to regress) `--use-ctc-cuda-graphs`
-/ `--use-feature-cuda-graphs`. `oasr-server --help` lists them all.
+and the default-off `--use-ctc-cuda-graphs` / `--use-feature-cuda-graphs`
+(**keep them off** — both measured to regress; `.artifacts/engine_perf.md` §1).
+`oasr-server --help` lists them all.
 
 **Memory sizing.** `--max-num-blocks 0` hands the paged KV pool to the engine,
 which derives it from free VRAM at startup (`--gpu-memory-utilization`, default
@@ -414,17 +448,12 @@ default. The same profile sizes the AR decoder-KV ceiling: leave
 budget off. Both derivations are logged with their full arithmetic — see
 [engine.md §6.1](engine.md#61-vram-aware-capacity-sizing).
 
-Caveat on that log: the front-end configures `tracing`, not Python's `logging`,
-so **no** engine-side INFO line reaches the server's output today (this predates
-H4 — the streaming-cache ceiling and long-form messages are invisible the same
-way). Only Python warnings surface, via the root logger's last-resort handler. To
-see a derivation, construct the engine from Python with `logging.basicConfig(
-level=logging.INFO)`; wiring Python logging into the tracing stream is a separate
-change. Meanwhile the resolved footprint is observable from the outside:
-`nvidia-smi` per-process memory moved 1430 → 2590 MiB when the same conformer
-went from the fixed 2048-block pool to a derived one at `--max-batch-size 16
---gpu-memory-utilization 0.5` (8192 blocks — exactly `(8192 − 2048) × 192 KiB`
-more).
+> **Known limitation.** The front-end configures `tracing`, not Python's
+> `logging`, so **no engine-side INFO line reaches the server's output** — the
+> VRAM derivation, the streaming-cache ceiling and the long-form messages are all
+> invisible. Only Python *warnings* surface. To see a derivation, construct the
+> engine from Python with `logging.basicConfig(level=logging.INFO)`. Details and
+> the outside-in workaround: `.artifacts/serving_perf.md` §5.
 
 Multi-paradigm serving: `--decode-method` selects among the checkpoint's
 advertised capabilities (e.g. `ctc_aed_rescoring` on a U2++ hybrid, `llm` on
@@ -443,37 +472,58 @@ step is weight-read bound, so its cost barely depends on how many rows it carrie
 total decoder forwards is the *sum over groups* of each group's step count, and
 groups cannot be merged after the fact (both decoder surfaces keep a shared scalar
 generation offset — per-row offsets are the prerequisite, shared with paged decoder
-KV). So requests that arrive together are much cheaper than the same requests
-arriving apart. Measured on `Qwen2-Audio-7B-Instruct`, 4 utterances / 124 tokens:
-
-| arrival | window | total | tokens/s |
-|---|---|---|---|
-| together | — | 922 ms | 134.5 |
-| one per tick | 0 (default) | 1588 ms | 78.1 |
-| one per tick | 200 ms | 982 ms | 126.3 |
+KV). **So requests that arrive together are much cheaper than the same requests
+arriving apart.**
 
 The window holds a thin waiting queue until it reaches `max_batch_size` or expires,
-recovering ~92% of the loss. It costs up to one window of first-token latency for an
-*isolated* request, so it is **off by default** — turn it on for
+recovering most of that loss. It costs up to one window of first-token latency for
+an *isolated* request, so it is **off by default** — turn it on for
 throughput-oriented deployments, leave it off when time-to-first-token dominates.
 
 **`--max-tick-ms` is the knob that bounds latency, not `--decode-steps-per-tick`.**
 A step count bounds work, not time, and step cost is model-dependent, so one
-fixed step budget behaves very differently per model. Measured at
-`--decode-steps-per-tick 32`, `B=4`, on `Qwen2-Audio-7B-Instruct`:
+fixed step budget behaves very differently per model. Since the dispatcher holds
+the GIL for a whole tick, tick p99 is the floor on cancel latency, admission
+latency, and the interval between streaming partials — the deadline cuts it
+sharply for a throughput cost inside run-to-run noise.
 
-| `--max-tick-ms` | tick p50 | tick p99 | tokens/s |
-|---|---|---|---|
-| `0` (step cap only) | 173 ms | 579 ms | 135.3 |
-| `25` (default) | 37 ms | 151 ms | 134.8 |
+The residual p99 is the **prefill** tick (audio tower + projector + one LM forward
+over the whole prompt), which the decode deadline deliberately does not bound; a
+tick that spends its decode budget will not also prefill, so the two never stack.
 
-Since the dispatcher holds the GIL for a whole tick, the p99 column is the floor
-on cancel latency, admission latency, and the interval between streaming
-partials — cut 3.8× here for a 0.3% throughput cost (within run-to-run noise).
-The residual 151 ms p99 is the **prefill** tick (audio tower + projector + one LM
-forward over the whole prompt), which the decode deadline deliberately does not
-bound; a tick that spends its decode budget will not also prefill, so the two
-never stack.
+Measurements for both knobs: `.artifacts/engine_perf.md` §3.
+
+## The dispatcher
+
+`oasr-engine-client::dispatcher` is the GIL-owning thread. It drains commands
+from the tokio mpsc channel, replays them into Python (`add_request` /
+`feed_chunk` / `cancel`), runs `engine.step()`, and pushes the resulting events
+back through per-request channels. HTTP and gRPC handlers stay on tokio and never
+touch the GIL.
+
+**Admission coalescing.** Contiguous `CreateOffline` / `CreateStreaming`
+envelopes are batched into one `add_requests_batch` Python call, which turns
+shallow service batches into deep ones under `asyncio.gather`-style bursts.
+`--admit-window-ms` waits that long after the first envelope for siblings;
+`--admit-threshold` stops coalescing early once that many have drained.
+`FeedChunk` / `Cancel` / `Ping` flush the admit batch first, to preserve
+`CreateStreaming → FeedChunk` ordering — and a `Cancel` or `FeedChunk` in hand,
+or landing mid-window, **ends** the wait, since the window used to tax the two
+most latency-sensitive commands for its full duration.
+
+**Tick pacing has two waits**, both a bounded `recv` (an arriving command wakes
+them in microseconds) rather than a sleep:
+
+| Wait | When |
+|---|---|
+| `IDLE_RECV_TIMEOUT` (500 ms) | the engine is empty |
+| `NO_WORK_BACKOFF` (2 ms) | a tick received nothing, emitted nothing, **and** ran faster than `NO_WORK_TICK_MAX` (1 ms) |
+
+The second exists because "the engine has requests" ≠ "the engine has work": one
+open stream waiting on the client's next chunk would otherwise spin the thread
+through empty steps for the whole session. **Gating on tick *duration* is what
+keeps the backoff off the working paths** — an AR decode group grinding through
+its per-tick step budget costs far more than 1 ms even when it emits nothing.
 
 ## Benchmarking
 
@@ -558,8 +608,7 @@ buffers several times the admissible work, each up to `--max-audio-mib`.
 
 **Shutdown is graceful.**  SIGTERM flips the gRPC health check and `/readyz` to
 not-serving, stops both listeners accepting, and waits up to the grace period for
-in-flight requests to complete.  Measured: 64 requests in flight at SIGTERM, 64
-completed `200`, drained in 141 ms.
+in-flight requests to complete — none are dropped.
 
 **Client disconnects cancel.**  All three request handles — streaming, offline
 streaming, and the unary one behind HTTP `speech:recognize` / gRPC `Recognize` —

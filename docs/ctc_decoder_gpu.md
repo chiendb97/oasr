@@ -1190,26 +1190,19 @@ wrong buffer returns stale state from a previous step.
 8. **Alignment.** `align16(beam)` and `align16(max_seq_len)` keep
    strided memcpys aligned. Don't pass tiny `max_seq_len`; you'll pay
    alignment overhead for no benefit.
-9. **Fused step results (RTX 5090, 2026-06).** With the §3.4.6 fused
-   kernel, measured by `benchmarks/bench_ctc_decoder.py` (fused vs
-   legacy in one run):
+9. **The fused step kernel is the default** (§3.4.6) for `beam <= 32`,
+   collapsing the 5-kernel per-step pipeline into one. It is
+   latency-bound rather than throughput-bound, so further gains need
+   restructuring *across* steps — e.g. hoisting the vocab top-K out of
+   the sequential loop as a chunk-level pre-pass — not more
+   micro-optimisation. `OASR_CTC_FUSED=0` restores the legacy
+   multi-kernel step as an A/B and rollback switch (set before process
+   start). Measured speedups, per workload and end to end:
+   `.artifacts/decoder_perf.md` Part 1.
 
-   | Workload | Legacy | Fused | Speedup |
-   |---|---|---|---|
-   | offline (16, 200, 5000, beam 10) | 10.80 ms | 3.92 ms | **2.75×** |
-   | offline (64, 200, 5000, beam 10) | 25.82 ms | 8.57 ms | **3.01×** |
-   | offline (16, 200, 5000, beam 20) | 18.75 ms | 6.60 ms | **2.84×** |
-   | offline (16, 200, 1000, beam 10) | 5.95 ms | 3.38 ms | 1.76× |
-   | streaming (V 5000, beam 10), per decoded frame | 39.4 µs | 16.9 µs | **2.34×** |
-
-   The per-step kernel went from 5 kernels / ~41 µs (of which
-   `topk_phase1` ≈ 31 µs) to 1 kernel / ~10 µs, and the kernel is now
-   latency-bound (SM/memory utilisation < 2 %) — further gains need
-   restructuring across steps (e.g. hoisting the vocab top-K out of
-   the sequential loop as a chunk-level pre-pass), not more
-   micro-optimisation. Engine-level effect (Conformer U2++ Librispeech,
-   `bench_engine.py`, 64 utts, max batch 32): streaming 159 → 190
-   utts/s (+19 %), offline 1328 → 1505 utts/s (+13 %).
+   > **Parity note for refactors.** Compare **fused-old vs fused-new**.
+   > Fused-vs-legacy has pre-existing boundary-tie differences and is
+   > not a clean oracle.
 
 ## 15. Extension Points
 

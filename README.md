@@ -210,18 +210,24 @@ options, and deployment.
 
 ## Documentation
 
+Start at the [documentation index](docs/README.md).
+
 | Document                                             | Covers                                                |
 |------------------------------------------------------|-------------------------------------------------------|
 | [`docs/architecture.md`](docs/architecture.md)       | Engine extension points (the per-axis registries)     |
-| [`docs/checkpoints.md`](docs/checkpoints.md)         | Checkpoint resolution, converter contract, native format |
-| [`docs/tokenizers.md`](docs/tokenizers.md)           | Tokenizer axis: kinds and `TokenizerSpec`             |
 | [`docs/engine.md`](docs/engine.md)                   | Engine step loop, batching, CUDA Graph capture        |
 | [`docs/scheduler.md`](docs/scheduler.md)             | Request scheduling, starvation bounds, micro-batching |
+| [`docs/models.md`](docs/models.md)                   | Model contracts, capabilities, the seven architectures |
+| [`docs/decoding.md`](docs/decoding.md)               | Decode families, beam search, decoding options        |
+| [`docs/kernels.md`](docs/kernels.md)                 | CUDA/CUTLASS layer, the JIT pipeline, the functional API |
+| [`docs/checkpoints.md`](docs/checkpoints.md)         | Checkpoint resolution, converter contract, native format |
+| [`docs/features.md`](docs/features.md)               | Feature frontends, `FeatureSpec`, streaming framing   |
+| [`docs/tokenizers.md`](docs/tokenizers.md)           | Tokenizer axis: kinds and `TokenizerSpec`             |
 | [`docs/cache_manager.md`](docs/cache_manager.md)     | Paged streaming cache (`BlockPool`, `StreamContext`)  |
 | [`docs/ctc_decoder_gpu.md`](docs/ctc_decoder_gpu.md) | GPU CTC decoder, single- and multi-request flows      |
 | [`docs/wfst_decoder_gpu.md`](docs/wfst_decoder_gpu.md) | In-tree GPU WFST decoder: k2-parity semantics, kernel pipeline, streaming |
 | [`docs/serving.md`](docs/serving.md)                 | Serving frontend, wire format, deployment             |
-| [`docs/benchmarks.md`](docs/benchmarks.md)           | Engine and service benchmark recipes                  |
+| [`docs/benchmarks.md`](docs/benchmarks.md)           | Engine, service and accuracy benchmark recipes        |
 | [`docs/autotuning.md`](docs/autotuning.md)           | Kernel auto-tuning API and cache format               |
 
 ---

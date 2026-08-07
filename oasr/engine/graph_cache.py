@@ -570,7 +570,8 @@ class GraphedFeatureExtraction:
             # the launch returns before the DMA runs.  Rewriting them without
             # waiting corrupts the *previous* step's features whenever the copy
             # has not drained — invisible on an idle GPU, catastrophic with any
-            # co-tenant process on the device (`.artifacts/known_issues.md` §5).
+            # co-tenant process on the device (`.artifacts/known_issues.md`,
+            # "Lessons that outlived their bugs").
             # Unlike the eager staging pair this cannot be double-buffered away:
             # the addresses are captured inside the graph.  In steady state a
             # full step of encoder work separates two replays, so the event has

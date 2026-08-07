@@ -567,23 +567,20 @@ caches the `.img` next to it on first use.
 
 ## 12. Performance
 
-RTX 5090 (SM 12.0), primary stack (u2pp HLG, 4.68M states / 88.2M arcs),
-LJSpeech-2000, fp32 log-probs GPU-resident, beams 20/8, min/max_active
-30/10000. Boundary = "GPU log-probs → words" including batch-end D2H and host
-word mapping. Numbers from the 2026-07 optimization pass (this tree vs the
-migration baseline at identical settings; parity-identical output):
+The decoder scales with batch: per-utterance cost grows far slower than `B`,
+because the flattened slot space keeps lanes load-balanced. Kernel time is
+dominated by Expand, then Max, then Finalize and Scan.
 
-| batch | before | after | speedup |
-|---|---|---|---|
-| B=1 | 7.0 ms (1428× RT) | 5.3 ms (1887×) | 1.32× |
-| B=8 | 21.0 ms (3782×) | 14.0 ms (5683×) | 1.50× |
-| B=32 | 55.9 ms, p95 68.5 (5610×) | 31.8 ms, p95 32.8 (9724×) | 1.76× (p95 2.09×) |
-| B=32, full 2000-utt set | 41.8 ms | 25.0 ms | 1.67× |
+Two structural properties drive the memory profile:
 
-Kernel-time shares at B=32 after the pass: Expand ~55%, Max ~25%,
-Finalize ~11%, Scan ~9%. The original k2-vs-ours comparison (5.9–10.2× at
-equal WER; k2 OOMs above B=8 on this graph) is in the standalone project's
-`docs/REPORT.md`.
+- **Lazily-committed regions** (§6.2) mean an idle streaming channel holds
+  essentially nothing, and the workspace grows on overflow rather than being
+  provisioned for the worst case.
+- **Winners-log GC** (§6.3, §8.1) bounds long-form and unbounded-stream memory,
+  which would otherwise grow with utterance length.
+
+Measured throughput, VRAM figures and the comparison against k2:
+`.artifacts/decoder_perf.md` Part 2.
 
 Reproduce:
 
@@ -614,22 +611,19 @@ nsys profile --cuda-graph-trace=node -t cuda python benchmarks/bench_wfst.py ...
   in the test-only `gen_wfst_cpu_reference_module` (kept out of the production
   decoder library).
 
-## 14. Limitations and Follow-Ups
+## 14. Constraints
 
-- **Vocab < 65,535** (u16 ilabel encoding); checked at graph upload.
-- **Lattice records are not exposed over TVM-FFI** yet (C++ API only).
-- **Lattice-mode `tok_fwd`/`tok_bwd` stay prefix-committed** under winners GC
-  (records reference old token ids); token renumbering during interval
-  compaction would bound them.
-- Streaming logical ids hit the int32 wall after ~2^31 appends per channel
-  (~35 h of continuous audio); recycle channels at utterance boundaries.
-- Per-lane eager workspace (hash ≈ half of it) is capacity-policy sized for
-  k2's soft-`max_active` transients; shrinking it safely needs occupancy
-  telemetry first.
-- `FinalizeKernel` is still one CTA per lane (~11% of GPU time, with its own
-  hot-lane tail); a flattened multi-CTA K3 is the next kernel lever, followed
-  by an exact per-token bound (`tok_best`) to strengthen the K2b skip.
-- Overflow rescue for `cand/hash/claims/kept` bits remains the caller's job
-  (the engine wrapper currently reports `ok` but does not auto-rescue).
-- Exact-score ties are run-nondeterministic (same class as k2); a
-  deterministic re-reduction mode is future work.
+These are properties of the design, not a to-do list:
+
+- **Vocab < 65,535** — u16 ilabel encoding; checked at graph upload.
+- **Streaming logical ids hit the int32 wall** after ~2³¹ appends per channel
+  (~35 h of continuous audio). Recycle channels at utterance boundaries.
+- **Exact-score ties are run-nondeterministic** — the same class of
+  nondeterminism as k2. `scripts/wfst_parity_check.py` excludes score ties for
+  this reason.
+- **Overflow rescue is the caller's job.** The decoder reports overflow through
+  the `ok` flag and the per-lane bits; the engine wrapper surfaces them but does
+  not auto-rescue.
+
+Open follow-up levers, with the measurement behind each:
+`.artifacts/decoder_perf.md` §2.3.

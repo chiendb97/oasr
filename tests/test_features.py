@@ -824,7 +824,8 @@ class TestStagingBuffers:
         buffer the previous step's copy is still reading corrupts it — measured
         as nemotron streaming WER 2.44% -> 2.53% under a co-tenant GPU load, and
         the *reason* the buffers rotate rather than being reused in place
-        (`.artifacts/known_issues.md` §5).  Reuse two steps apart is fine, and
+        (`.artifacts/known_issues.md`
+        "Lessons that outlived their bugs").  Reuse two steps apart is fine, and
         gated by the slot's completion event on CUDA.
         """
         p = self._proc()
@@ -864,7 +865,7 @@ class TestStreamingFeatureStreamHandoff:
     relying on timing.  Measured cost of the missing wait on real audio: conformer
     streaming 3.70% → 99.32% WER with 195 of 200 transcripts empty, nemotron
     2.44% → 59.71%, in both cases NaN arriving one whole mel frame at a time with
-    nothing raised (`.artifacts/known_issues.md` §5).
+    nothing raised (`.artifacts/known_issues.md` "Lessons that outlived their bugs").
     """
 
     def _processor_and_requests(self, device, n=3, samples=8000):

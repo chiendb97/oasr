@@ -398,7 +398,7 @@ class TestASREngine:
         refactor: per-step fbank + forward_chunk_paged at B=1 has to agree
         frame-for-frame with the offline batched forward.
 
-        This was briefly ``xfail`` while GPU-DEC-1 (``docs/known_issues.md``)
+        This was briefly ``xfail`` while GPU-DEC-1 (``.artifacts/known_issues.md``)
         was open: the ``ctc_cuda`` decoder's blank-frame-skip mislabelled a
         freshly emitted non-blank token as "ends in blank", so the next
         identical frame extended (CTC repeat) instead of collapsing and
