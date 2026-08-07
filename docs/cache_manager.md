@@ -474,7 +474,24 @@ Two things fall out for free, and one obligation:
   past-the-length column zero softmax weight but still multiplies it into
   `P @ V`, so a `NaN` there propagates where no mask can intercept it.
 
-### 10.3 Other extension points
+### 10.3 What is deliberately *not* on the declared axis
+
+- **The per-layer conv cache is not re-declared as a `StreamStateSpec` by each
+  encoder.** `conv_kernel_size` is already a declaration, just a compact one, and
+  it feeds `CacheConfig.cnn_cache_frames`, `CnnCacheManager.buffer` and the graph
+  cache's *address* capture. Rewriting three call sites for uniformity, on the
+  one path with a known graph-capture invariant, buys nothing functional.
+- **Zipformer has not migrated**, though it is the strongest candidate: its state
+  *is* the fixed-extent kind, and migrating would delete
+  `stack_streaming_states` / `unstack_streaming_states` and make the state
+  graph-capturable, which is worth real throughput. The obstacle is that its
+  state is per-layer **heterogeneous** — icefall's stacks differ in width and
+  downsampling — so it is 20–40 specs generated from the encoder's own geometry,
+  against a working batched path that a subtle stacking bug would silently break.
+  `slot_axis` (§10.1) exists specifically to hold icefall's per-kind batch dims,
+  so the migration is a table plus a deletion whenever it is worth doing.
+
+### 10.4 Other extension points
 
 - **Custom stream identifiers.** Stream IDs are arbitrary integers — the
   engine assigns them monotonically, but external code can use any

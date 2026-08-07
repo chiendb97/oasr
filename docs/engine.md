@@ -214,7 +214,8 @@ def step(self) -> List[RequestOutput]:
         #    step's encoder forward.  extract_streaming_batch orders the
         #    producer->consumer hand-off itself (it appends into
         #    feature_buffer on *this* stream); the wait below is a belt for
-        #    our own read, not the protection.  See known_issues.md §5.
+        #    our own read, not the protection.  See `.artifacts/known_issues.md`
+        #    "Lessons that outlived their bugs".
         needs_feat = [r for r in running if r.has_pending_audio]
         if needs_feat:
             self._input_processor.extract_streaming_batch(
@@ -294,11 +295,29 @@ prepare_offline                    prepare_streaming
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `ckpt_dir` | `""` | WeNet checkpoint dir (`final.pt`, `train.yaml`, `global_cmvn`, optional `.model` and `units.txt`). |
-| `checkpoint_name` | `"final.pt"` | Filename inside `ckpt_dir`. |
+| `ckpt_dir` | `""` | A directory in any supported checkpoint format, or a Hugging Face Hub repo id. See [checkpoints.md](checkpoints.md). |
+| `checkpoint_name` | converter default | Filename inside `ckpt_dir`. |
 | `device` | `"cuda"` | Target device. |
 | `dtype` | `torch.float16` | Model + cache precision. |
-| `audio_scale` | `32768.0` | Multiplied into the float waveform to restore int16 scale used in WeNet training. |
+| `audio_scale` | `32768.0` | Multiplied into the float waveform. **Per framework** — adopted from `FeatureSpec.audio_scale` unless set explicitly. See [features.md](features.md). |
+| `service_mode` | `"streaming"` | Pins the engine to `"streaming"` or `"offline"` for its whole lifecycle; mismatched requests are rejected at admission. `"offline"` builds no streaming backend and no paged pool. |
+| `use_cuda_graphs` | `True` | Capture the steady-state streaming encoder forward (`GraphedEncoderForward`, one graph per shape key). |
+| `long_form` | `False` | Fan a request longer than a fixed-window frontend's window out into consecutive windows, decode them through the normal batched path **in parallel**, and stitch one output. The caller sees one request id, so HTTP/gRPC need no change. `long_form_overlap_seconds` plus a word-level overlap merge recover most of the boundary accuracy. |
+| `recycle_streaming_history` | `False` | At the streaming cache ceiling, recycle the oldest KV block instead of finalising the request with `finish_reason="length"`. |
+
+### Autoregressive decode
+
+Only read by `incremental` decode families — see [decoding.md](decoding.md).
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `decode_method` | model default | Selects among `model.capabilities`; validated at construction. |
+| `decode_options` | `{}` | Per-family knobs, resolved against the strategy's `options_cls`. An unknown key raises. |
+| `decode_steps_per_tick` | 32 | Batched decoder steps allowed per engine tick. |
+| `max_tick_ms` | 25 | Wall-clock cap per tick. **This is the knob that bounds latency**, not the step count. `0` disables. |
+| `max_decode_slots` | `max_batch_size` | In-flight AR requests before admission pauses. |
+| `decode_admit_window_ms` | 0 | Coalesce near-simultaneous arrivals into one decode group. Costs up to one window of first-token latency for an isolated request, so it is off by default. |
+| `decode_kv_budget_gib` | derived | Byte ceiling for AR decoder KV. `0` disables the budget; `None` derives it — see [§6.1](#61-vram-aware-capacity-sizing). |
 
 ### Streaming chunking
 
@@ -502,6 +521,60 @@ engine = ASREngine(EngineConfig(
 | Force-flush firing inside an offline batch | All bucket guards skipped — batch may be highly padded. Acceptable to bound starvation. |
 | Streaming admission gated by cohort | New requests wait until the running pool drains; visible as no `newly_admitted` even with `num_waiting_streaming > 0`. |
 
+### Thread safety
+
+`ASREngine` is thread-safe. Every public entry — `add_request`,
+`add_streaming_request`, `feed_chunk`, `abort_request`, `step`, `run`,
+`num_running` / `num_waiting`, and `transcribe` (which composes them) — acquires a
+process-wide **re-entrant** `threading.RLock` (`run()` re-enters to call `step()`).
+Uncontended cost is negligible next to GPU work.
+
+It guards two pieces of mutable state:
+
+1. the scheduler queues — `_streaming_waiting`, `_offline_waiting`, `_running`,
+   `_index` in `oasr/engine/scheduler.py`;
+2. per-request audio — `request.audio_chunks` and `request.audio_final`, mutated
+   by `feed_chunk` and concurrently read and popped by `step()`.
+
+**The lock is coarse on purpose.** `step()` holds it for the full step, so a
+concurrent `feed_chunk` from another thread waits up to one step. That is
+acceptable because the GIL serializes Python anyway and CUDA releases it during
+the forward — the lock makes data-structure consistency explicit rather than
+buying parallelism. A finer split (scheduler-only lock, per-request audio locks,
+dropping the lock during forward/decode) is possible but has never been the
+bottleneck.
+
+**Do not add threads inside one engine to gain throughput** — CPython's GIL means
+it cannot work, and the engine is GPU-bound and already batching. Horizontal
+scale is one process per GPU; see [serving.md](serving.md#multi-gpu-topology).
+
+Under serving, the PyO3 dispatcher is the only Python caller and runs
+single-threaded; HTTP and gRPC handlers stay on tokio and never touch the GIL.
+
+Concurrency tests live in `tests/test_engine_concurrent.py` behind the
+`concurrent` marker and cover a 16-thread stress on `add_streaming_request`,
+feeders racing aborters on a shared request-id pool, and concurrent readers of
+the queue-depth properties:
+
+```bash
+pytest tests/test_engine_concurrent.py -m concurrent -v
+```
+
+### Failure isolation
+
+An exception escaping `step()` becomes an INTERNAL error for **every** in-flight
+request, so both executors contain it instead.
+
+| Executor | Policy | Why |
+|---|---|---|
+| `OfflineExecutor` | Re-runs a failed micro-batch **one request at a time**, so only the culprit is rejected — **except on OOM**, where the batch fails whole | Retrying under memory pressure is how one over-large request cascades |
+| `StreamingExecutor` | Fails the whole ready cohort | The batched forward has no per-stream boundary, and retrying per stream would double-commit the chunk for streams that already advanced |
+
+Terminal outputs carry `finish_reason="error"` plus `RequestOutput.error_stage`,
+which becomes the `stage` label on the `oasr_requests_failed_total` metric
+(`offline_forward`, `offline_oom`, `prefill_oom`, `streaming_forward`,
+`streaming_features`) — see [serving.md](serving.md).
+
 ## 9. Performance Considerations
 
 1. **Streaming throughput is dominated by `_forward_batched_paged`.**
@@ -547,8 +620,9 @@ core to add a variant.** `docs/architecture.md` is the authoritative map
   label-synchronous AR families, `incremental = True` with the bounded
   `begin_offline` / `advance(StepBudget)` / `has_pending` protocol. Selected
   per deployment by `EngineConfig.decode_method` (validated against
-  `model.capabilities`); per-request knobs ride on
-  `DecodingOptions` (`Request.decoding`).
+  `model.capabilities`); per-family knobs go on the strategy's `options_cls`
+  and per-request knobs ride on `DecodingOptions` (`Request.decoding`). Full
+  axis: `docs/decoding.md`.
 - **New streaming runtime** → `StreamingEncoderBackend` +
   `@register_streaming_backend`, keyed by the encoder's `streaming_kind`.
   Implement `allocate` / `forward_step` / `free` + window geometry. Expose

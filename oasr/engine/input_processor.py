@@ -338,35 +338,18 @@ class InputProcessor:
     def _next_stream_slot(self) -> _StreamStagingSlot:
         """Rotate to the next staging slot and block until it is safe to rewrite.
 
-        **Both halves matter, and neither is sufficient alone.**
+        The streaming H2D is async out of *pinned* host memory, so the DMA reads
+        this buffer after the launch returns.  ``wait_stream`` cannot help — it
+        orders GPU work, not the host's next refill.  The **event** makes reuse
+        correct; the **rotation** makes it free, since a slot comes round a full
+        step later and ``synchronize()`` finds the event already fired.  Depth 2,
+        not 1: a step can produce features without issuing a forward, so two can
+        run back-to-back with nothing draining the queue.
 
-        The streaming H2D is `non_blocking=True` out of *pinned* host memory on
-        the feature stream, so the DMA reads this buffer at some point after the
-        launch returns.  The step loop then inserts
-        ``current_stream().wait_stream(feat_stream)`` — but that is a
-        **device-side** ordering primitive.  It sequences GPU work; it does
-        nothing to stop the host from overwriting page-locked memory that a
-        queued copy still has to read.  With a single buffer the next step's
-        refill races the previous step's copy, and the H2D ships a mixture of two
-        steps' waveforms.  On an idle GPU the copy always wins, which is why this
-        went unseen; with any co-tenant process computing on the same device the
-        host wins instead and transcripts come back empty (`.artifacts/
-        known_issues.md` §5 — conformer streaming 3.70% → 99.32% WER, 195 of 200
-        utterances empty, with no error raised anywhere).
-
-        The **event** is what makes reuse correct: a slot cannot be refilled
-        before the copy that reads it has completed.  The **rotation** is what
-        makes that correctness free — by the time a slot comes round again a full
-        step of encoder work has been issued and drained, so ``synchronize()``
-        finds the event already fired and returns without parking.  A host sync on
-        a single buffer would be correct too, but it would serialise the host
-        against the feature stream every step, giving back the overlap the pinned
-        staging exists to buy.
-
-        Why the depth is 2 and not 1: a step that produces features but no full
-        encoder window (the frontend needs several chunks per window) issues no
-        forward and therefore no host sync, so two such steps can run
-        back-to-back with nothing draining the queue in between.
+        Not the race that emptied streaming transcripts — that was the
+        device-side hand-off in :meth:`extract_streaming_batch`; double-buffering
+        here was measured to change its WER by nothing.  Pinned by
+        ``TestStagingBuffers::test_consecutive_streaming_steps_get_different_buffers``.
         """
         self._stream_slot_idx = (self._stream_slot_idx + 1) % len(self._stream_slots)
         slot = self._stream_slots[self._stream_slot_idx]
@@ -710,24 +693,16 @@ class InputProcessor:
             return
 
         feats, feat_lens_cpu = self._run_streaming_features(fbank_inputs, fbank_flush, cuda_stream)
-        # ``feats`` was produced on ``cuda_stream``; the append below copies out of
-        # it on the **current** stream.  That cross-stream read has to be ordered
-        # here, at the consumer — the step loop's `wait_stream` fires only after
-        # this method returns, which is after the racing copy has been issued.
+        # ``feats`` is produced on ``cuda_stream`` and appended on the current
+        # stream, so the cross-stream read is ordered here rather than by the
+        # caller: the step loop's `wait_stream` fires after this returns, which is
+        # after the racing copy has been issued.  Deleting it silently feeds the
+        # buffer unwritten memory — conformer streaming 3.70% -> 99.32% WER, 195
+        # of 200 transcripts empty, nothing raised.  Negative control:
+        # ``TestStreamingFeatureStreamHandoff``.
         #
-        # Without this the append reads feature memory the extractor has not
-        # finished writing.  On an idle GPU the kernels always win (the host is
-        # slower than they are), which is why it never showed; with any co-tenant
-        # process computing on the device they do not, and the buffer takes NaN —
-        # one whole mel frame at a time, which is all-blank for CTC and deletions
-        # for the transducer, with nothing raised.  Measured conformer streaming
-        # 3.70% -> 99.32% WER, 195 of 200 transcripts empty
-        # (`.artifacts/known_issues.md` §5).
-        #
-        # ``record_stream`` is the second half: the caching allocator releases
-        # ``feats`` back to ``cuda_stream``'s pool when this frame drops it, so
-        # without marking the consumer a later feature step could be handed the
-        # same block while the append is still reading it.
+        # ``record_stream`` is the second half: without it the allocator can hand
+        # ``feats``'s block to a later feature step while the append still reads it.
         if cuda_stream is not None and self._device.type == "cuda":
             consumer = torch.cuda.current_stream(self._device)
             consumer.wait_stream(cuda_stream)

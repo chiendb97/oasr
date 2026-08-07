@@ -1,14 +1,33 @@
-# Benchmarks — engine vs. service
+# Benchmarks — engine, service, accuracy
 
-This document covers the two top-level perf harnesses:
+This document covers the three top-level harnesses:
 
 | Script | Measures |
 |---|---|
 | `benchmarks/bench_engine.py` | In-process `ASREngine` — pure GPU + Python overhead, no IPC, no HTTP/WS. |
 | `benchmarks/bench_service.py` | End-to-end `oasr-server` (Rust + HTTP + PyO3 dispatcher + engine). |
+| `benchmarks/bench_accuracy.py` | WER/CER **and** speed in the same CSV row. |
 
-Run both back-to-back on the same machine for an apples-to-apples comparison —
-the engine number is the ceiling, the service number is what real clients see.
+Run the first two back-to-back on the same machine for an apples-to-apples
+comparison — the engine number is the ceiling, the service number is what real
+clients see.
+
+Kernel-level benchmarking is a separate harness,
+`benchmarks/oasr_benchmark.py` — see [`benchmarks/README.md`](../benchmarks/README.md)
+and the `/benchmark-kernel` skill.
+
+## Measurement protocol
+
+Three rules, each of which has produced a wrong conclusion when skipped:
+
+1. **Interleave the arms.** A single-order A/B lets the second arm benefit from a
+   warm allocator. Report a σ over several iterations, not one run.
+2. **Watch issue time against wall time.** At small batch the encoders are
+   CPU-issue-bound, and a change that removes GPU work can still make them
+   slower.
+3. **Verify a fresh JIT hash directory** before trusting a kernel comparison —
+   `rm -rf ~/.cache/oasr/jit` after editing a header that the cache key does not
+   cover.
 
 ## Setup
 
@@ -202,7 +221,8 @@ python benchmarks/bench_service.py \
 
 The summary block reports `requests`, `wall`, `audio`, RTF (audio_s / wall_s),
 throughput, latency percentiles, and (streaming only) `first-partial` time +
-partials per request:
+partials per request. The numbers below illustrate the **format** — they came
+from one run on one box and are not a target:
 
 ```
 streaming (WS /v1/stream, chunk=640ms, i16_le):
@@ -215,6 +235,34 @@ streaming (WS /v1/stream, chunk=640ms, i16_le):
   first-partial   mean=270 ms  p50=132  p95=599
   partials/req    mean=10.8
 ```
+
+## Accuracy benchmark
+
+`benchmarks/bench_accuracy.py` is the accuracy counterpart: manifest-driven
+WER/CER with RTFx, throughput, p50 and p99 **in the same CSV row**, so accuracy
+and speed are visible together.
+
+```bash
+# Build a manifest from a corpus (audio is not shipped with the repo)
+python benchmarks/bench_accuracy.py --build-manifest \
+    --audio-dir "$AUDIO_DIR" --out benchmarks/manifests/my_corpus.jsonl
+
+# Measure
+python benchmarks/bench_accuracy.py \
+    --ckpt-dir "$CKPT_DIR" --manifest benchmarks/manifests/my_corpus.jsonl \
+    --output_path accuracy.csv
+```
+
+- WER is the **corpus** rate (total errors / total reference words), with
+  Whisper `EnglishTextNormalizer` semantics — `oasr/testing/wer.py`.
+- Manifests under `benchmarks/manifests/` ship **without audio**; build one for
+  your local corpus with `--build-manifest`.
+- `--build-manifest` unwraps `(...)`, because the English normalizer deletes
+  bracketed spans while a reader speaks them aloud. Skipping that step is pure
+  measurement error.
+- `oasr/testing/accuracy.py` holds the manifest and transcribe helpers shared
+  with the CI accuracy gate (`tests/test_accuracy.py`, reference rates in
+  `ci/wer-reference.json`).
 
 ## Notes
 
@@ -229,4 +277,8 @@ streaming (WS /v1/stream, chunk=640ms, i16_le):
   32768, matching the bench's scale-by-32767 encode (one count short of
   saturation at ±1.0).
 - For Nsight-Compute kernel profiling, see `benchmarks/oasr_benchmark.py`
-  with `--profile` (see CLAUDE.md → Benchmarks & Profiling).
+  with `--profile`, and the `/benchmark-kernel` skill.
+- Point-in-time results — engine, serving, decoders and kernels — live under
+  `.artifacts/` (`engine_perf.md`, `serving_perf.md`, `decoder_perf.md`,
+  `fmha_tuning.md`, `gemm_tuning.md`, `profiling_report.md`). Record new
+  measurements there, not in this file.

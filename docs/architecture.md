@@ -11,15 +11,15 @@ transducer/AED/LLM loop).
 
 ## The seven seams
 
-| Axis | Base class | Registry / builder | Selected by |
-|------|-----------|--------------------|-------------|
-| Encoder architecture | `oasr.models.BaseEncoder` / `BaseAsrModel` | `oasr.models.registry` (`register_model`, `build_model_from_checkpoint`) | native format → `architecture=` override → `CheckpointConverter.detect` (see `docs/checkpoints.md`) |
-| Checkpoint format | `oasr.models.registry.CheckpointConverter` | same registry; `oasr.from_pretrained` resolves local dir / HF Hub id | `converter.detect()` |
-| Decode family | `oasr.engine.decode.DecodeStrategy` | `oasr.engine.decode` (`register_decode_strategy`, `build_decode_strategy`) | `EngineConfig.decode_method` validated against `model.capabilities`, else `model.default_decode_type` (+ `config.decoder_type` splits CTC into `ctc_cuda` / `ctc_wfst`) |
-| Streaming runtime | `oasr.engine.streaming_backend.StreamingEncoderBackend` | `oasr.engine.streaming_backend` (`register_streaming_backend`, `build_streaming_backend`) | `model.encoder.streaming_kind` |
-| Batching | `oasr.engine.batching.BatchingPolicy` / `PartitionPolicy` | `oasr.engine.batching` (`register_*_policy`, `build_*_policy`) | `config.schedule_policy` / partition flags |
-| Tokenizer | `oasr.tokenizers.Tokenizer` | `oasr.tokenizers` (`register_tokenizer`, `build_tokenizer`) | converter-emitted `TokenizerSpec.kind` (see `docs/tokenizers.md`) |
-| Feature frontend | `oasr.features.ExtractorSpec` | `oasr.features` (`register_extractor`, `build_extractor`) | `FeatureConfig.feature_type`, materialized from the converter-emitted `FeatureSpec` |
+| Axis | Base class | Registry / builder | Selected by | Detail |
+|------|-----------|--------------------|-------------|--------|
+| Encoder architecture | `oasr.models.BaseEncoder` / `BaseAsrModel` | `oasr.models.registry` (`register_model`, `build_model_from_checkpoint`) | native format → `architecture=` override → `CheckpointConverter.detect` | [models.md](models.md) |
+| Checkpoint format | `oasr.models.registry.CheckpointConverter` | same registry; `oasr.from_pretrained` resolves local dir / HF Hub id | `converter.detect()` | [checkpoints.md](checkpoints.md) |
+| Decode family | `oasr.engine.decode.DecodeStrategy` | `oasr.engine.decode` (`register_decode_strategy`, `build_decode_strategy`) | `EngineConfig.decode_method` validated against `model.capabilities`, else `model.default_decode_type` (+ `config.decoder_type` splits CTC into `ctc_cuda` / `ctc_wfst`) | [decoding.md](decoding.md) |
+| Streaming runtime | `oasr.engine.streaming_backend.StreamingEncoderBackend` | `oasr.engine.streaming_backend` (`register_streaming_backend`, `build_streaming_backend`) | `model.encoder.streaming_kind` | [cache_manager.md](cache_manager.md) |
+| Batching | `oasr.engine.batching.BatchingPolicy` / `PartitionPolicy` | `oasr.engine.batching` (`register_*_policy`, `build_*_policy`) | `config.schedule_policy` / partition flags | [scheduler.md](scheduler.md) |
+| Tokenizer | `oasr.tokenizers.Tokenizer` | `oasr.tokenizers` (`register_tokenizer`, `build_tokenizer`) | converter-emitted `TokenizerSpec.kind` | [tokenizers.md](tokenizers.md) |
+| Feature frontend | `oasr.features.ExtractorSpec` | `oasr.features` (`register_extractor`, `build_extractor`) | `FeatureConfig.feature_type`, materialized from the converter-emitted `FeatureSpec` | [features.md](features.md) |
 
 ## The layer waist
 
@@ -27,7 +27,8 @@ Orthogonal to the seven registries — which are about *what plugs in* — is th
 one about *what every architecture is built from*. Model implementations use
 `oasr.layers`, never `nn.Linear` / `nn.LayerNorm` / `nn.Embedding` directly.
 That is what makes a kernel improvement, CUDA-graph capture or a future
-quantized path apply to all six architectures instead of one.
+quantized path apply to **every** architecture instead of one. The kernels
+underneath are documented in [kernels.md](kernels.md).
 
 | What | Use |
 |---|---|
@@ -56,192 +57,84 @@ closed. Three cases, kept apart on purpose:
 optional backend, used by the CPU oracles and as the "is this the kernels'
 fault" A/B). There is no `auto`.
 
-One declared gap remains, kernel-side:
+Two gaps are declared, both kernel-side:
 
-| Gap | Missing | Costs |
+| Gap | Missing | Reached by |
 |---|---|---|
-| `fmha-head-dim` | head dims so wide that even a 1-deep cp.async ring overflows smem (>256 on a 99 KB arch) | nothing in-tree reaches it |
+| `fmha-head-dim` | head dims so wide that even a 1-deep cp.async ring overflows smem (>256 on a 99 KB arch) | nothing in-tree |
+| `conv2d-groups` | `csrc/conv2d.cu` has no `groups` argument at all, so a grouped or depthwise conv2d is an *absent* kernel rather than a refused shape | Nemotron's depthwise-separable subsampling; Zipformer's 7×7 ConvNeXt block once it migrates |
 
-`fmha-mask-form` was here and is closed. The kernel masked keys by per-row
-*length* only — `[0, len)` — so a per-row key **start** had no form to arrive in
-and left padding (HF's masked-generate convention, which is what a batched LLM
-prompt is) could not be expressed at all. It now takes a second `(B,)` vector,
-`mCacheSeqStarts`, compared against the column index in the same mask predicate
-that already handled the length; when the caller passes no starts the wrapper
-hands over a zero-rank dummy and the predicate const-folds away, so the existing
-path compiles to the same kernel it did before. Verified against SDPA across
-start-inside-a-tile / start-past-a-whole-tile / both-ends / wide-head / bf16
-shapes, and composed with causal.
+`conv2d-groups` arrived by *moving the accounting boundary*, not by adding debt:
+grouped conv2d never had a kernel, and Zipformer reached it through a bare
+`nn.Conv2d` that nothing counted. The same change gave the whole conv family the
+torch path it never had, which is what lets a convolutional front-end run under
+an fp32 CPU parity oracle at all.
 
-The interesting part was the *routing*, not the kernel. `is_causal` was already
-implemented and deliberately routed to SDPA (`fmha-causal-short`) because SDPA
-has a flash path for it and the fused path has a fixed ~68 µs floor. But causal
-*combined* with a window is the opposite case: SDPA refuses `is_causal` alongside
-`attn_mask`, so the caller must materialize a `(B, 1, T_q, T_k)` tensor and
-forfeits flash with it. Measured on Qwen2-Audio-7B prefill geometry, bf16, with
-the strides the real call site produces — **1.80–3.29× faster fused on the
-attention op**. That is the op, not the model: a 7B prefill layer is dominated by
-its d=3584 GEMMs, so the same change is **1.03–1.05×** over the whole 32-layer
-prefill and **1.013×** over an engine `transcribe_offline` with a short
-generation, transcript-identical. Both of those were measured with the arms
-**interleaved**, which matters — a single-order A/B first read 0.876× and that was
-the second arm benefiting from a warm allocator, not the fused path losing.
+`fmha-mask-form` and `norm-strided-rows` were both here and are closed. So were
+`fmha-head-dim`'s 128-wide case (a smem-budget bug, not a missing config) and
+every unaligned output projection (closed at the *model* layer via
+`align_out_features` + `pad_output_projection`, the pattern the WeNet CTC head
+has used since day one). See `.artifacts/fmha_tuning.md` and
+`.artifacts/layer_waist_migration.md`.
 
-The crossover is at ~1 G MACs (`FMHA_CAUSAL_WINDOW_MIN_MACS`), and the two shapes
-either side of it land on the same ratio despite different B, H, P and D — which
-is what a fixed floor being amortized predicts and a shape rule would not. One
-LJSpeech utterance at B=1 or B=2 falls below it and stays on SDPA, so the win
-lands on batched prefill, which is the serving case.
-`Qwen2Lm.prefill` now hands the core its window instead of building the mask;
-`step` keeps its explicit mask, for a reason that is about the *cache* rather
-than the mask (in capacity-preallocated mode its K/V are `k_buf[:, :, :t]`
-slices, which the fused kernel would copy whole, once per layer per step).
+### Routing rules — capability is necessary, not sufficient
 
-One consequence worth knowing: a query row whose entire window is padding comes
-back **zero** from the kernel (its documented empty-row clamp) where SDPA's math
-backend gives NaN. Zero is the safe answer — a NaN pad row is not inert, because
-in the next layer a masked key still contributes `0 * NaN` and poisons the *real*
-rows. The torch path reaches the same end differently, by keeping the diagonal
-open, so both backends agree on every row a caller can legitimately read.
+A kernel that *can* serve a shape is not automatically the one that *should*.
+Three measured policies live here rather than in any model:
 
-### What a pass over upstream FlashAttention's CuteDSL kernels changed
-
-Read against `flash_attn/cute` (`block_info.py`, `mask.py`, `seqlen_info.py`,
-`interface.py`), three differences mattered.
-
-**FA bounds the K loop at both ends; this kernel only bounded the top.**
-`BlockInfo.get_n_block_min_max` computes `n_block_min` from the window-left edge
-as well as `n_block_max` from the diagonal. Ours ran to block 0 always, so a
-left-padded batch loaded, MMA'd and then `-inf`-masked every block below its
-start — the exact waste that made unbounded causal *slower* than SDPA. Fixed.
-Measured at Qwen2 prefill geometry, cost is now proportional to what is actually
-attended: with the bound 258/214/183/164 µs at 0/25/50/75 % padding, against a
-flat ~257 µs without it. Zero padding costs the same either way, so nothing on
-the existing path regressed.
-
-**FA expresses a per-row key start as a tensor offset, not a mask.**
-`SeqlenInfo.offset_k` and `PagedKV.leftpad_k` shift the K/V base so padded rows
-are never touched, and FA has no start predicate at all. That is the better
-answer where it applies, but it depends on FA's **bottom-right** causal
-alignment: shifting K also shifts the diagonal. This kernel is top-left aligned
-to match `torch`'s `is_causal`, which every parity test compares against, so a
-K-only offset would move the diagonal out from under the mask. Keeping the
-predicate and bounding the loop gets the block-level work back without changing
-the convention.
-
-**FA never slices a KV cache — and that was costing us more than the mask.**
-FA requires only `stride(-1) == 1` and passes the tensor's real `dim_order()`
-into `mark_compact_shape_dynamic`; our `_ensure_canonical` demands strictly
-C-order strides and copies otherwise. A `k_buf[:, :, :t]` capacity slice has a
-stride *gap*, so it is not expressible either way — which is why FA passes the
-**whole buffer plus `cache_seqlens`** and lets the length bound the loop. Doing
-the same (`Attention(kv_extent=...)`, `Qwen2Lm._append_kv` returning buffer +
-length) is bit-identical and **1.23–1.54×** on prefill geometry, **1.45–1.88×**
-at a decode step. It also retired the reason `Qwen2Lm.step` was on SDPA: that
-reason was the per-layer cache copy, and the copy was avoidable. Paired,
-interleaved, on the real 7B: putting Qwen2's attention on the kernel is now
-**1.082×** end-to-end at 8 new tokens and **1.109×** at 32, transcript-identical
-— against 1.013× for prefill-only fusion before this pass.
-
-That change also surfaced a precondition worth stating: **`v` must be finite
-wherever the kernel can read**, which is up to the K *tile* boundary above
-`cache_seqlens`, not up to the length itself. Columns past the length get zero
-softmax weight and *finite* stale data there is provably inert (verified to
-1e4 — that is what makes a recycled paged pool and a padded feature batch safe).
-`NaN`/`Inf` are not: the weight is zero, but `0 * NaN` is `NaN` and it enters
-through `P @ V` where no mask can intercept it. A `new_empty` capacity cache
-therefore corrupted output — and did so *non-deterministically*, which parity
-tests structurally cannot catch, since each individual run looks plausible. The
-cache is zeroed now, and the guard is a zeroed-tail assertion rather than a
-parity check. Predicating the load against the length, as FA does, is what would
-retire the precondition entirely.
-
-`norm-strided-rows` was also here and is closed. Every norm kernel walks rows
-as `base + row * hidden`, and the launchers checked only `stride(-1) == 1` —
-both too weak and, once "fixed" to `is_contiguous()`, too strong. Too weak
-because a padded row stride (`x[..., :H]` of a wider buffer, `x[:, -1]` of a
-`(B, T, D)`) passes it and the kernel then reads the wrong memory *silently*.
-Too strong because a **permuted dense** view — Zipformer's `(T, B, C)`
-transpose — has rows that still tile memory exactly, so visiting them in memory
-order gives the identical result (normalization is per-row independent and
-`torch.empty_like` preserves the strides). The launchers now check the real
-precondition, `IsRowDense`: trailing dim contiguous *and* rows tiling memory
-with no gap or overlap. Zipformer's 100 `BiasNorm` calls per encoder forward
-moved onto the kernel, and the padded cases now raise instead of lying.
-
-One gap got closed in the kernel: the cp.async ring depth was
-hardcoded at 3 stages, so smem scaled straight off `head_dim` and a 64×64 tile
-at `head_dim=128` needed 112 KB against sm_120's 99 KB cap — refused outright,
-while sm_80's 163 KB took it fine, which is why it read as "no head_dim-128
-config" rather than as a budget bug. `FmhaSm80.select_num_stages` now sizes the
-ring to the arch (2 stages, 80 KB), so Paraformer's `d_k=128` SANM attention can
-reach the kernel at all — **1.16–1.34×** faster than the SDPA it was stranded
-on, measured with head-split views (see the policy note below; a first
-measurement on freshly allocated contiguous tensors said 2.05–2.56× and was not
-representative). The budget also
-now costs the *padded* head dim, matching what the layouts allocate — it used
-the raw value and under-counted by a third at e.g. `head_dim=72`.
-
-And gaps that got closed at the model layer rather than declared:
-every unaligned output projection. Paraformer's 8404-token head, the
-transducer joiner's 500 and the CIF alpha head's 1 are now allocated at an
-aligned width (`align_out_features`) and the checkpoint is widened on load
-(`pad_output_projection`) — the pattern the WeNet CTC head has used since day
-one. `test_no_architecture_needs_an_unaligned_gemm` keeps them closed.
-
-Capability is necessary but not sufficient, and the two measured policies that
-make up the rest live here rather than in any model:
-
-* **Causal stays on SDPA — measured, not missing.** The kernel does causal
-  masking with per-CTA block skipping (`n_block_max` bounded by the diagonal),
-  verified against SDPA. Plumbing the flag through *without* the skipping
-  measured 1.4–4.8× slower, because the mask was applied per element while every
-  row block still scanned all of K; adding the bound took a qwen2-prefill shape
-  from 282.6 → 199.8 µs and the fused path now overtakes SDPA at T=2048. It is
-  still not selected, because the fused path has a ~78 µs floor at any T
-  (canonical-stride copies + wrapper) and every causal shape in this repo is
-  short: Whisper's SOT prefill is 4 tokens, the WeNet decoder's teacher-forced
-  pass ~40. The crossover moves when the stride requirement goes.
-* **Attention fuses only when there is a mask to fuse.** Measured with
-  head-split views, which is what real call sites pass: `kv_lens` shapes range
-  1.16–2.10× faster, unmasked is a wash at 1.01×, and a masked shape with a
-  short query extent can still *lose* at 0.90×. The fused kernel needs canonical
-  row-major q/k/v, so `_ensure_canonical` copies all three (35.3 → 68.7 µs at
-  `B8 H4 T500 D128`) — a per-call cost paid regardless of how little attention
-  work there is, and now the highest-value FMHA item. Whisper, whose attention is
-  never masked, runs SDPA end to end without any model-side flag.
+* **Attention fuses only when there is a mask to fuse.** The fused kernel needs
+  canonical row-major q/k/v, so `_ensure_canonical` copies all three — a per-call
+  cost paid regardless of how little attention work there is. Masked shapes win,
+  unmasked ones are a wash, and a masked shape with a short query extent can
+  lose. Whisper, whose attention is never masked, runs SDPA end to end without
+  any model-side flag. Closing the canonical-stride requirement is worth more
+  than further tuning this rule.
+* **Causal alone stays on SDPA** (`fmha-causal-short`); **causal combined with a
+  window is fused** above `FMHA_CAUSAL_WINDOW_MIN_MACS`. The kernel implements
+  causal masking with per-CTA block skipping, verified against SDPA — it is a
+  policy, not a gap. SDPA has a flash path for causal alone and the fused path
+  has a fixed floor at any `T`; but SDPA *refuses* `is_causal` alongside
+  `attn_mask`, so the windowed case must materialize a `(B, 1, T_q, T_k)` tensor
+  and forfeits flash with it. The crossover is a **work** floor, not a shape one.
 * **GEMM has a row floor** (`GEMM_MIN_ROWS`). CUTLASS tiles the M axis at 128
   rows, so a GEMM with fewer rows leaves most of every tile empty and cuBLAS's
-  GEMV-shaped kernel wins. This started life as a floor on *total work* and
-  that was wrong: `(4, 3584, 3584)` — a Qwen2-Audio-7B decode step — is 51 M
-  MACs, far above any sane work floor, and is the worst shape measured at
-  **5.34× slower** than cuBLAS. The problem is the shape, not the size. The
-  rule is a pure function of the call, deliberately *not* relaxed under
-  CUDA-graph capture even though the dispatch cost is free there: a
-  capture-dependent branch makes the graph pick a different kernel than eager,
-  and that one-ulp fp16 difference reached the transducer decoder as different
-  tokens the first time it was tried.
+  GEMV-shaped kernel wins. This is a *shape* rule, not a work rule — a 51 M-MAC
+  decode-step GEMM is the worst shape measured. **It is a pure function of the
+  call and is deliberately not relaxed under CUDA-graph capture**, even though
+  dispatch cost is free there: a capture-dependent branch makes the graph pick a
+  different kernel than eager, and that one-ulp fp16 difference has come out of
+  the transducer decoder as different tokens.
 
-Dispatch cost used to be the third policy here and is now gone. The GEMM
-launchers take the caller's N-D tensors and flatten with `FLATTENED_ROWS`
-instead of making Python `reshape(-1, K)` twice, and the output is allocated
-with `new_empty` varargs rather than `torch.empty` on a freshly built list.
-That removed ~5 µs per call: `Linear(384, 384)` fp16 went from **1.49× slower
-than `F.linear` to 1.08×**, and whisper-tiny's encoder and 30-step decode are
-both at **1.01×**. Allocating in the C++ launcher was measured too and is
-*worse* (`Tensor::FromEnvAlloc` plus the round trip is 2.38 µs against
-`new_empty`'s 1.88), so allocation stays in Python.
+The measurements behind each: `.artifacts/fmha_tuning.md`,
+`.artifacts/gemm_tuning.md`.
+
+### Two behaviours to know
+
+* **A fully-masked query row comes back zero** from the fused kernel (its
+  documented empty-row clamp) where SDPA's math backend gives NaN. Zero is the
+  safe answer — a NaN pad row is not inert, because in the next layer a masked
+  key still contributes `0 * NaN` and poisons the *real* rows. The torch path
+  reaches the same end by keeping the diagonal open, so both backends agree on
+  every row a caller can legitimately read.
+* **`v` must be finite wherever the kernel can read**, which is up to the K
+  *tile* boundary above `cache_seqlens`, not up to the length itself. Finite
+  stale data past the length is provably inert; `NaN` / `Inf` are not, and enter
+  through `P @ V` where no mask can intercept them. Capacity caches are therefore
+  zeroed, guarded by a zeroed-tail assertion rather than a parity check — the
+  corruption is non-deterministic, which parity tests structurally cannot catch.
 
 `tests/test_layer_waist.py` is the ratchet: it builds every registered
 architecture tiny on CPU, walks `named_modules()`, and fails on a bare torch
 layer. Its tiny-config table is keyed off `list_models()`, so a new
-architecture with no entry fails rather than going uncovered.
+architecture with no entry fails rather than going uncovered. It also pins that
+each layer's kernel and torch paths agree on CUDA — without that, the CPU parity
+oracles are evidence about nothing the server runs.
 
-One structural gap is deliberate: dense `nn.Conv1d` stems (the
-Whisper-geometry encoders, Paraformer's CIF conv) have no `oasr.layers`
-counterpart yet, so convolutions are not in the banned set. And `fc1`/`fc2` stay flat
-`Linear`s in HF Whisper and the Qwen2-Audio tower: composing a `FeedForward`
-there would insert a level into every checkpoint key to save one `F.gelu`.
+Two non-migrations are deliberate: `fc1` / `fc2` stay flat `Linear`s in HF
+Whisper and the Qwen2-Audio tower (composing a `FeedForward` there would insert a
+level into every checkpoint key to save one `F.gelu`), and `LinearActivation`
+accepts `gelu_tanh` but **not** `gelu` — the CUDA epilogue is the tanh
+approximation, and those models are trained on exact erf.
 
 ## Data flow
 
@@ -323,9 +216,9 @@ Request → InputProcessor (fbank) → Scheduler (BatchingPolicy + PartitionPoli
    (`EngineConfig.decode_steps_per_tick`) and a wall-clock deadline
    (`EngineConfig.max_tick_ms`), whichever binds first.  The deadline is the one
    that matters for a serving deployment — the dispatcher holds the GIL for a
-   whole tick, and step cost is model-dependent (measured: ~1.5 ms/step for
-   whisper-tiny at `B=8` vs ~18 ms/step for Qwen2-Audio-7B at `B=4`), so a step
-   count alone lets one model's tick run 10× longer than another's.  Working
+   whole tick, and step cost is model-dependent — an order of magnitude between
+   a tiny AED decoder and a 7B LM (`.artifacts/engine_perf.md` §3) — so a step
+   count alone lets one model's tick run far longer than another's.  Working
    references: `transducer.py` (frame-sync greedy, offline + streaming sessions),
    `rescoring.py` (`consumes="both"`), `aed.py` / `llm.py` (incremental).
 4. Declare the family's knobs as an **options dataclass** and point
@@ -361,11 +254,11 @@ gets the decode strategy's declared `consumes` and picks the matching chunk
 forward — fused `forward_chunk_paged` (encoder + head → log-probs) or
 encoder-only `encode_chunk_paged` (→ hidden).  Everything downstream of that
 choice, CUDA-graph capture included, must treat the result as an opaque
-`(B, chunk, C)` tensor: `GraphedEncoderForward` takes the *callable* and never
-inspects its output, so `consumes` never decides which optimisations a family
-gets.  It used to — capture was gated on `consumes == "log_probs"`, which made
-streaming transducer ~3.5× slower than it needed to be for no reason beyond a
-hardcoded output-buffer name.
+`(B, chunk, C)` tensor: `GraphedEncoderForward` takes the *callable*
+(`chunk_forward`) and never inspects its output, so `consumes` never decides
+which optimisations a family gets.  It used to — capture was gated on `consumes == "log_probs"`, which left
+streaming transducer several times slower than it needed to be for no reason
+beyond a hardcoded output-buffer name.
 
 One contract the backend owns: a captured graph reuses **one output buffer per
 shape key**, so a tensor it hands out is live only until the next replay at that
@@ -432,65 +325,56 @@ recipe):
 kind is what makes it legal — no edit to the config, the `InputProcessor`, or the
 CUDA-graph feature cache.
 
-## Paradigm status (all five paradigms wired, seven architectures)
+## Paradigm coverage
+
+Five decode paradigms across seven encoder architectures, all through the same
+seams. Per-architecture detail is in [models.md](models.md).
 
 | Paradigm | Model package | Strategy | Mode |
 |---|---|---|---|
 | CTC (GPU prefix-beam / WFST) | `conformer`, `zipformer` | `ctc_cuda` / `ctc_wfst` | offline + streaming |
-| Transducer (RNNT greedy) | `transducer` (icefall converter, explicit `architecture=`) | `transducer` (`consumes="hidden"`) | offline + streaming |
+| Transducer (RNNT) | `transducer` (icefall converter, explicit `architecture=`) | `transducer` (`consumes="hidden"`) | offline + streaming |
 | CTC+AED rescoring (U2++) | `conformer` (decoder branch kept) | `ctc_aed_rescoring` (`consumes="both"`, opt-in via `decode_method`) | offline |
-| AED (Whisper) | `whisper` (HF converter) | `aed` (incremental greedy) | offline |
+| AED (Whisper) | `whisper` (HF converter) | `aed` (incremental) | offline |
 | Paraformer (NAR) | `paraformer` (FunASR converter) | `paraformer` (one-shot, CIF timestamps) | offline |
-| LLM-ASR (Qwen2-Audio) | `speech_llm` (HF converter) | `llm` (incremental greedy, token-streaming partials) | offline |
+| LLM-ASR (Qwen2-Audio) | `speech_llm` (HF converter) | `llm` (incremental, token-streaming partials) | offline |
 | Transducer, recurrent predictor (Nemotron ASR) | `nemotron` (HF converter) | `transducer` (`consumes="hidden"`, greedy only) | offline + streaming |
 
-`list_models()` prints this table's model column as the registry sees it at runtime,
-including any out-of-tree architecture that arrived through the `oasr.models` entry
-point group.
+`list_models()` prints this table's model column as the registry sees it at
+runtime, including any out-of-tree architecture that arrived through the
+`oasr.models` entry point group.
 
-The first row is one capability with two decoders behind it, not two model families:
-a CTC checkpoint decodes through the GPU prefix-beam decoder by default, and
-`EngineConfig.decoder_type="ctc_wfst"` plus an `fst_path` (a prebuilt `.img` or a k2
-`HLG.pt`) routes the *same* checkpoint through the in-tree GPU WFST decoder, offline
-and streaming alike. That split is on `decoder_type`, below `decode_method` — see
-`docs/wfst_decoder_gpu.md`.
+**The first row is one capability with two decoders behind it, not two model
+families.** A CTC checkpoint decodes through the GPU prefix-beam decoder by
+default; `EngineConfig.decoder_type="ctc_wfst"` plus an `fst_path` (a prebuilt
+`.img` or a k2 `HLG.pt`) routes the *same* checkpoint through the in-tree GPU
+WFST decoder, offline and streaming alike. That split is on `decoder_type`, below
+`decode_method` — see [wfst_decoder_gpu.md](wfst_decoder_gpu.md).
 
-The last row reshaped **two** interfaces rather than adding a leaf.
+Two seams were reshaped rather than extended when the last row landed, and both
+are worth reading before adding an eighth architecture:
 
-Its streaming path did the second one. A chunk carries four kinds of state, and
-none of them fitted: three per-subsampling-stage conv tails (the engine modelled
-*one* CNN cache), a trained fixed attention window (the paged cache grows and
-evicts), and a frame grid defined by one centred STFT (the streaming feature loop
-assumed Kaldi `snip_edges`). Each is now a **declaration** rather than a special
-case — `streaming_state_specs`, `fixed_attention_window` + `streaming_geometry`,
-and `ExtractorSpec.framing` — which is why adding them changed no other
-architecture. Design, per-model impact and the two shared-code defects the work
-surfaced: `.artifacts/streaming_cache_design.md`.
-
-The first one is the predictor: a 2-layer LSTM, whose state cannot be recomputed
-from the last `k` labels the way the icefall predictor's can — which is what the
-greedy loop assumed when it shifted a `(B, context_size)` int tensor itself.
-The state is now opaque to the strategy behind
-`TransducerPredictor.init_state` / `predict` / `advance` / `stack_states` /
-`unstack_states` (`oasr/models/decoders/base.py`), so one loop serves both.
-Beam search is the exception and says so: it keeps the beam's states in one
-`(B, k, ctx)` buffer and gather-reorders them onto their parents, which only
-expresses a label window, so `beam_size > 1` is refused at construction for a
-recurrent predictor rather than silently reordering something else.
+* **The transducer predictor state is opaque to its strategy**
+  (`TransducerPredictor.init_state` / `predict` / `advance` / `stack_states` /
+  `unstack_states`), so one greedy loop serves both a stateless label-window
+  predictor and a recurrent one. Beam search is the declared exception. See
+  [models.md](models.md#the-transducer-predictor-state-is-opaque).
+* **A streaming cache is a declaration, not a manager.**
+  `streaming_state_specs`, `fixed_attention_window` + `streaming_geometry`, and
+  `ExtractorSpec.framing` between them cover the four kinds of state a chunk
+  carries, which is why adding them changed no other architecture. See
+  [cache_manager.md §10](cache_manager.md) and [features.md](features.md).
 
 Per-request `DecodingOptions` (`oasr.engine.DecodingOptions` — n-best, generation
 cap, sampling knobs, LLM prompt override) ride on `Request` and through the
 serving front-end; engine-level knobs stay on `EngineConfig`.
 
-The Conformer (paged) and Zipformer (stateful) streaming backends are both wired.
-The stateful backend **batches** ready streams: when the encoder exposes
-`stack_streaming_states` / `unstack_streaming_states` (Zipformer does), all
-same-chunk-length streams run as one `B = N` forward (3.5–24× over the previous
-sequential `B = 1` loop at pool sizes 4–32).  Encoders with
+Both streaming backends are wired: Conformer/Nemotron (paged) and Zipformer
+(stateful). The stateful backend **batches** ready streams when the encoder
+exposes `stack_streaming_states` / `unstack_streaming_states`, running all
+same-chunk-length streams as one `B = N` forward. Encoders with
 `streaming_kind="none"` are rejected in streaming service mode.
 
-Deferred follow-ups (measured rationale in `.artifacts/multi_paradigm.md`):
-AED/transducer beam search, paged decoder-KV via the CuteDSL FMHA (blocked on the
-masked-tile fix for heavily key-padded rows — exactly the left-padded LLM prompt
-shape), and decoder-step CUDA graphs (the prerequisite — capacity-preallocated
-static KV buffers in `Qwen2Lm` — has landed).
+Deferred follow-ups, each with the measurement that justified deferring it:
+`.artifacts/architecture_review.md` §H11 (the autoregressive decode path) and
+`.artifacts/known_issues.md` §6.

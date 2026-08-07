@@ -1,0 +1,266 @@
+# Kernel Layer — CUDA, JIT, and the Functional API
+
+OASR exposes custom CUDA / CUTLASS kernels to Python through TVM-FFI JIT
+compilation, in the style of FlashInfer. Nothing is linked ahead of time in the
+default build: a kernel is compiled by `nvcc` on its first *call* and cached, so
+`import oasr` works on a machine with no compiled extension at all.
+
+This document covers the C++/CUDA layer, the JIT pipeline, and the Python
+functional API. For the `nn.Module` layer that models are built from, see
+[architecture.md § The layer waist](architecture.md#the-layer-waist). For a
+step-by-step walkthrough of adding a kernel, use the `/add-cuda-kernel` skill.
+
+## Layered design
+
+```
+Python functional API (oasr/<family>.py)  — @oasr_api decorated
+    └── JIT generator (oasr/jit/<family>.py) → JitSpec / JinjaJitSpec
+            └── TVM-FFI JIT binding (csrc/<family>_jit_binding.cu)
+                    └── TVM-FFI launcher (csrc/<family>.cu)
+                            └── Pure CUDA kernels (include/oasr/<family>.cuh)  — facade
+                                    └── Config    (cutlass_*_configs.h)
+                                    └── Template  (*_cutlass_template.h)
+                                    └── Dispatch  (*_cutlass.h / *_dispatch.inc)
+```
+
+## The C++/CUDA layer
+
+### Directory map
+
+| Path | Contents |
+|---|---|
+| `include/oasr/common/` | Shared types (`types.h`), vector dtypes (`vec_dtypes.h`), SM dispatch (`arch_dispatch.h`), epilogue functors, math utilities |
+| `include/oasr/activation.cuh` + `activation_dispatch.inc` | GLU, Swish, with VecSize dispatch |
+| `include/oasr/norm.cuh` + `norm_dispatch.inc` | LayerNorm, RMSNorm, BatchNorm1d, GroupNorm, fused norm+activation |
+| `include/oasr/conv/` | `conv1d.cuh` + `conv1d_dispatch.inc` (depthwise, pointwise, causal); `conv2d.cuh` facade |
+| `include/oasr/gemm/` | `gemm.cuh` facade, `bmm.cuh`, `group_gemm.cuh` |
+| `include/oasr/{softmax,topk,fft,features,reduction}.cuh`, `sort/` | The remaining families |
+| `include/oasr/ctc_decoder.cuh`, `include/oasr/wfst/` | GPU decoder kernels |
+| `csrc/<family>.cu` | TVM-FFI launcher |
+| `csrc/<family>_jit_binding.cu` | JIT binding exports |
+| `csrc/tvm_ffi_utils.h` | DLPack dtype dispatch, validation macros (`CHECK_GEMM_ALIGNMENT`, `CHECK_CONTIGUOUS_INPUT`, `FLATTENED_ROWS`) |
+| `csrc/templates/` | Jinja2 templates for config-specific CUTLASS instantiations (`gemm_cutlass_template.cu.jinja`, `bmm_cutlass_template.cu.jinja`, `group_gemm_cutlass_template.cu.jinja`) |
+| `csrc/decoder/ctc/` | GPU CTC launcher + binding (`ctc_decoder.cu`, `ctc_decoder_jit_binding.cu`); `ctc/cpu/` holds the CPU-side C++ decoders compiled into `_C.so` — greedy search, prefix beam search, WFST beam search (via k2), the streaming WFST decoder, `ContextGraph` for phrase boosting, and shared `common/utils` |
+| `csrc/decoder/wfst/` | In-tree GPU WFST decoder (TVM-FFI JIT). Its exact-semantics CPU reference oracle is **test-only** and lives separately under `csrc/tests/wfst/`, out of the production decoder library. |
+| `csrc/pybind/` | pybind11 module for the CPU decoder bindings and legacy enums (`pybind_main.cpp`, `pybind_decoder.h`) |
+
+The GPU CTC launcher/binding pair is the **one** that does not live at the
+`csrc/` root (its JIT generator is `oasr/jit/ctc_decoder.py`); everything else
+follows the flat convention.
+
+### The three-header CUTLASS pattern
+
+Each CUTLASS kernel family splits config, template, and dispatch:
+
+| Header | Purpose | Example (GEMM) |
+|---|---|---|
+| `cutlass_*_configs.h` | Config structs (`GemmConfig`), per-SM MMA traits (`SmMMATraits`), default configs (`DefaultGemmConfig`) | `gemm/cutlass_gemm_configs.h` |
+| `*_cutlass_template.h` | CUTLASS kernel template parameterized by Config + MMATraits | `gemm/gemm_cutlass_template.h` |
+| `*_cutlass.h` | Public dispatch interface (JIT mode via `OASR_TARGET_SM`, AOT mode via `OASR_DISPATCH_SM`) | `gemm/gemm_cutlass.h` |
+
+Non-CUTLASS kernels (Conv1D, Norm, Activation) use `*_dispatch.inc` files with
+VecSize / block_size dispatch macros instead.
+
+### Dispatch modes
+
+| Kernel family | Mode | Config source | Source generation |
+|---|---|---|---|
+| GEMM, BMM, GroupGEMM | **jinja** | `cutlass_gemm_configs.h` | Jinja renders `.cu` with baked-in config |
+| Conv2D | **jinja** | `cutlass_conv2d_configs.h` | Jinja renders `.cu` with baked-in config |
+| Conv1D | **dispatch** | `conv1d_dispatch.inc` | Direct compilation, VecSize macro |
+| Norm | **dispatch** | `norm_dispatch.inc` | Direct compilation, block/vec macro |
+| Activation | **dispatch** | `activation_dispatch.inc` | Direct compilation, VecSize macro |
+
+- **JIT mode** (`OASR_TARGET_SM` defined): a single SM instantiation, with an
+  optional `JitGemmConfig` / `JitConv2dConfig` passed via `-D` flags.
+- **AOT mode** (no `OASR_TARGET_SM`): the `OASR_DISPATCH_SM` macro switches on
+  the runtime SM version.
+
+SM targets default to 70, 75, 80, 86, 89, 90, 100, 120 in `CMakeLists.txt`;
+`setup.py` defaults to 70–90 only. Override either with `CUDA_ARCHITECTURES`.
+
+### Conventions
+
+- **The output tensor is the first parameter** of every TVM-FFI launcher.
+- Launchers take N-D tensors and flatten with `FLATTENED_ROWS` rather than
+  making Python call `reshape(-1, K)`.
+- Output allocation stays in **Python** (`new_empty` varargs) — allocating in
+  the C++ launcher was measured and is slower.
+- Every GEMM-family launcher enforces the CUTLASS alignment-8 rule uniformly via
+  `CHECK_GEMM_ALIGNMENT`, with a message naming the fix.
+
+## The JIT pipeline
+
+| Module | Role |
+|---|---|
+| `oasr/jit/core.py` | `JitSpec` (static sources) and `JinjaJitSpec` (Jinja-rendered), `gen_jit_spec()`, `gen_jinja_jit_spec()`, `build_and_load()` |
+| `oasr/jit/templates.py` | Jinja2 rendering (`get_template_env()`, `render_template()`) |
+| `oasr/jit/env.py` | Path constants (`OASR_TEMPLATE_DIR`, `OASR_GEN_SRC_DIR`), nvcc flags, `cutlass_version_stamp` |
+| `oasr/jit/<family>.py` | Per-family generators: `gemm`, `conv`, `norm`, `activation`, `softmax`, `topk`, `fft`, `features`, `ctc_decoder`, `wfst_decoder` |
+| `oasr/jit/attention.py` | **Different model** — see below |
+| `oasr/compilation_context.py` | `CompilationContext` detects GPU SMs at import time; pass `supported_major_versions=[...]` to `get_nvcc_flags_list()` for arch-restricted kernels |
+
+Compiled modules are cached in `~/.cache/oasr/jit/`, keyed on a hash that covers
+the sources, the `include/` tree, the nvcc flags, **and** the CUTLASS version
+stamp.
+
+`oasr/jit/attention.py` is not a Ninja JIT spec. It is a `functools.cache`-keyed
+wrapper around `cutlass.cute.compile()`, exposing `select_backend()`,
+`get_compiled_fmha(...)`, `warmup_fmha(...)`, `fmha_config_supported(...)` and
+`set_backend_mode()`. `select_backend()` probes the device capability eagerly at
+module load and resolves to `"cute"` on sm_80 / 86 / 89 / 120 when CuteDSL
+imports cleanly, otherwise `"sdpa"`.
+
+### CUTLASS
+
+CUTLASS is the **`3rdparty/cutlass` git submodule, pinned to v4.6.1**.
+`git submodule update --init` is what provides it — CMake fetches only pybind11.
+Nothing links it: every CUTLASS kernel is JIT-compiled, so `oasr/jit/env.py`
+hands the include directories to `nvcc` at runtime.
+
+Its `version.h` is folded into the JIT cache key. Without that, `build_and_load`
+short-circuits on an existing `.so` and a submodule bump keeps silently loading
+binaries built against the old headers. **Editing a vendored CUTLASS header
+without bumping the version still needs `rm -rf ~/.cache/oasr/jit`.**
+
+The CuTeDSL half of CUTLASS is the separate `nvidia-cutlass-dsl` wheel
+(`pip install -e .[attention]`, floor in `oasr/jit/attention.py::MIN_CUTEDSL_VERSION`),
+kept at the same 4.6.1 release. It is **optional**: `OASR_ATTN_BACKEND=auto`
+degrades `oasr.fmha` to SDPA when it is absent.
+
+Evaluation of the 4.4.2 → 4.6.1 move: `.artifacts/cutlass_upgrade.md`.
+
+## The Python functional API
+
+Every entry point is `@oasr_api`-decorated (`oasr/api_logging.py` — debug logging
+plus exception context), JIT-compiles on first call via `@functools.cache`,
+allocates its output tensor, and calls into the compiled module.
+
+| Module | Exposes |
+|---|---|
+| `oasr/gemm.py` | `gemm`, `bmm`, `group_gemm`, and the fused epilogues `gemm_activation` (RELU/GELU/SWISH) and `gemm_log_softmax` (the CTC head fast path) |
+| `oasr/gemm_torch.py` | Torch/cuBLAS runners — `torch_gemm`, `torch_gemm_activation`, `torch_bmm`, `torch_gemm_log_softmax` — mirroring the CUTLASS launcher contract exactly (output-first, in-place / CUDA-graph-safe, `D = A @ Bᵀ`). Doubles as a `Tactic("torch")` autotuner candidate and as the production dispatch target. Deliberately free of any `oasr.tune` import. |
+| `oasr/norm.py` | `layer_norm`, `rms_norm`, `batch_norm1d`, `group_norm`, fused norm+activation |
+| `oasr/conv.py` | depthwise / pointwise / causal Conv1D, Conv2D |
+| `oasr/activation.py` | `glu`, `swish` |
+| `oasr/softmax.py`, `oasr/topk.py`, `oasr/fft.py` | `softmax`, `topk`, `rfft` / `rfft_power` |
+| `oasr/feature.py` | `stft_frame`, `dct_lifter`, `fbank_preprocess`, `mel_log` — see [features.md](features.md) |
+| `oasr/attention.py` | `fmha(...)` and `fmha.persistent_inputs(...)` |
+| `oasr/ctc_decode.py` | `ctc_beam_search_decode`, `GpuStreamingDecoder` — see [ctc_decoder_gpu.md](ctc_decoder_gpu.md) |
+| `oasr/decode.py` | Thin helpers over the CPU-side `oasr.decoder` decoders |
+
+`oasr/decoder/` holds the Python wrappers for the CPU-side C++ decoders —
+`CtcGreedySearch`, `CtcPrefixBeamSearch`, `CtcWfstBeamSearch` (requires k2), and
+`ContextGraph` (a phrase-boosting trie) — plus the `k2_available` flag. Each
+lazily imports the compiled `_C` extension and delegates to a `_*Core` C++
+object.
+
+### Shape-aware backend selection
+
+`gemm`, `gemm_activation`, `bmm` and `gemm_log_softmax` route per shape.
+`jit.gemm.select_default_config(op, M, N, K)` picks:
+
+- a CUTLASS variant — default tile, serial split-K, parallel split-K (`pk`), or
+  Stream-K;
+- the torch/cuBLAS backend (`oasr/gemm_torch.py`);
+- or, for the CTC head only, the legacy single-call fused launcher.
+
+The rules come from measured sweeps (`scripts/tune_asr_gemm.py`) and are keyed on
+the exact `(op, N, K)`, so **the table is per model width**. A shape with no
+rule falls through to the fixed `GEMM_DEFAULT` tile; the fall-through is counted
+and reportable via `jit.gemm.rule_miss_report()` — which is both the coverage
+check and the shape list to feed the tuner.
+
+Two rules are structural rather than tuned:
+
+- **`GEMM_MIN_ROWS`** — a row floor below which CUTLASS's M-tiling leaves most of
+  every tile empty and cuBLAS's GEMV-shaped kernel wins.
+- The dispatch decision is a **pure function of the call** and is deliberately
+  *not* relaxed under CUDA-graph capture, even though dispatch cost is free
+  there: a capture-dependent branch makes the graph pick a different kernel than
+  eager, and the resulting one-ulp fp16 difference has produced different tokens.
+
+`OASR_GEMM_HEURISTIC=0` disables the whole thing. Measurements and re-tuning
+recipe: `.artifacts/gemm_tuning.md`.
+
+### Fused attention
+
+```python
+oasr.fmha(q, k, v, *, softmax_scale, attn_bias, cache_seqlens, cache_seqstarts,
+          block_table, out)
+```
+
+Three cache modes share one signature:
+
+| Mode | `block_table` | `cache_seqlens` |
+|---|---|---|
+| Offline | `None` | `None` |
+| Dense streaming (caller concatenated old + new K/V) | `None` | set |
+| Paged streaming (K/V are pool views) | set | required |
+
+It dispatches to either `_sdpa_reference` (PyTorch SDPA, fp32-friendly) or the
+CuteDSL kernel (fp16/bf16 only). `oasr.fmha.persistent_inputs(...)` caches the
+CuteDSL DLPack descriptors when the engine reuses the same tensors every call;
+`validate=False` skips checks for proven inputs.
+
+Routing policy and measurements: `.artifacts/fmha_tuning.md`.
+
+### CuteDSL kernels (`oasr/kernels/`)
+
+`oasr/kernels/` holds low-level implementations that do **not** use the TVM-FFI /
+Ninja pipeline.
+
+- `kernels/cute/attention/base.py` — abstract `FmhaBase` + `pick_arch_cls(major, minor)`
+- `kernels/cute/attention/fmha_sm80.py` — `FmhaSm80`, covering sm_80 / 86 / 89
+- `kernels/cute/attention/fmha_sm120.py` — `FmhaSm120`, a thin subclass for consumer Blackwell
+- `kernels/cute/` — FlashAttention-style helpers: `block_info.py`, `seqlen_info.py`,
+  `mask.py`, `softmax.py`, `tile_scheduler.py`, `pack_gqa.py`, `paged_kv.py`,
+  `named_barrier.py`, `copy_utils.py`, `layout_utils.py`, `ampere_helpers.py`, `utils.py`
+
+Each is compiled via `cutlass.cute.compile()` into a Python callable and cached
+per config in `oasr/jit/attention.py::_compiled_fmha`.
+
+## Utilities
+
+`oasr/utils/`:
+
+| Module | Contents |
+|---|---|
+| `validation.py` | `@supported_compute_capability([80, 86, ...])` marks a check function with the SMs it supports; `@backend_requirement(backend_checks={...}, common_check=fn)` wires validation into the public API function and adds `.is_backend_supported()` / `.is_compute_capability_supported()` helpers |
+| `mappings.py` | dtype and enum helpers |
+| `timer.py` | timing helpers |
+
+`oasr/testing/bench_gpu_time(fn, args, ...)` is the measurement primitive: CUDA
+event timing with an optional CUPTI fallback via `triton.testing.do_bench`,
+returning `(median_s, std_s)`.
+
+## Ahead-of-time compilation
+
+`oasr/aot.py` registers every kernel family for AOT builds, including
+`gen_all_gemm_variants()` for systematic variant enumeration. AOT is optional —
+the default path is JIT-on-first-call.
+
+## Autotuning
+
+`oasr/tune/` is a separate mechanism from the shape-aware heuristic: a backend
+registry, profiler, persistent JSON cache and `TileConfig` search, driven by the
+`oasr.autotune()` context manager or the `enable_autotune()` / `disable_autotune()`
+toggles. See [autotuning.md](autotuning.md).
+
+## Adding a kernel family
+
+Seven steps, in order:
+
+1. Kernel header in `include/oasr/<family>.cuh`
+2. TVM-FFI launcher in `csrc/<family>.cu`
+3. TVM-FFI JIT binding in `csrc/<family>_jit_binding.cu`
+4. JIT generator in `oasr/jit/<family>.py`
+5. Python functional API in `oasr/<family>.py`
+6. `nn.Module` wrapper in `oasr/layers/<family>.py`
+7. AOT registration in `oasr/aot.py`
+
+The `/add-cuda-kernel` skill (`.claude/skills/add-cuda-kernel/SKILL.md`) walks
+through each with worked code. `/benchmark-kernel` covers measuring the result.
+
+pybind11 bindings (`csrc/pybind/`) remain only for the CPU-side CTC decoders —
+new kernels do not use them.

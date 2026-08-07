@@ -388,8 +388,8 @@ while sched.has_pending():
 4. **No GPU work.** The scheduler is pure Python on dataclasses; it is
    rarely the bottleneck. Profile with NVTX (`engine.step → schedule`)
    to confirm.
-5. **Cohort admission has a measurable throughput effect**: on backlog
-   workloads, enabling it doubles streaming throughput because
+5. **Cohort admission trades latency for throughput.** On backlog
+   workloads it is a large throughput win, because
    `_forward_batched_paged` can take the full `B` path on every step.
    On low-concurrency or interactive workloads it adds idle time at
    cohort boundaries — measure both on your traffic before deciding.
