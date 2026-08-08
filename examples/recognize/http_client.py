@@ -18,15 +18,18 @@ Dependencies::
 
 Usage::
 
-    # WAV container (server reads the embedded sample rate)
+    # Any container — the server sniffs it and reads its sample rate
     python examples/recognize/http_client.py \\
         --server-url http://127.0.0.1:8080 \\
-        --wav tests/fixtures/hello.wav
+        --wav podcast.mp3
 
-    # Headerless raw PCM
+    # Headerless raw PCM (or µ-law / A-law telephony)
     python examples/recognize/http_client.py \\
         --server-url http://127.0.0.1:8080 \\
         --wav audio.f32 --encoding LINEAR32F --sample-rate 16000
+
+For an upload in the OpenAI shape instead, see ``oasr transcribe`` /
+``oasr.client`` — this script exists to show the low-overhead raw-body route.
 """
 
 from __future__ import annotations
@@ -45,13 +48,16 @@ def main(argv: list[str]) -> int:
                    help="Base URL of the oasr-server HTTP listener")
     p.add_argument("--wav", required=True, type=Path,
                    help="Path to the audio file to transcribe")
-    p.add_argument("--encoding", default="WAV",
-                   choices=("WAV", "LINEAR16", "LINEAR32F"),
+    p.add_argument("--encoding", default="AUTO",
+                   choices=("AUTO", "WAV", "FLAC", "MP3", "M4A", "OGG", "AIFF",
+                            "LINEAR16", "LINEAR32F", "MULAW", "ALAW"),
                    help="Audio encoding sent in the `encoding` query parameter "
-                        "(default: WAV; sample rate is taken from the header)")
+                        "(default: AUTO — sniff the container and take its "
+                        "sample rate; the headerless PCM values need "
+                        "--sample-rate)")
     p.add_argument("--sample-rate", type=int, default=16000,
                    help="Sample rate for raw PCM payloads "
-                        "(ignored when encoding=WAV)")
+                        "(ignored for a container, which carries its own)")
     p.add_argument("--timeout", type=float, default=120.0,
                    help="HTTP request timeout in seconds")
     args = p.parse_args(argv)

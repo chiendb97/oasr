@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Mapping, Tuple
 
@@ -33,6 +34,44 @@ logger = logging.getLogger(__name__)
 def _read_json(path: Path) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+#: A Whisper language tag is ``<|xx|>`` / ``<|xxx|>`` — two or three ASCII
+#: letters.  Every control token that is *not* a language (``<|translate|>``,
+#: ``<|notimestamps|>``, ``<|startofprev|>``, …) is longer, and the timestamp
+#: tokens (``<|0.00|>``) are not letters, so the shape alone separates them.
+_LANGUAGE_TOKEN = re.compile(r"^<\|([a-z]{2,3})\|>$")
+
+#: The two task tokens, named rather than numbered: their ids move between
+#: Whisper releases (large-v3 added a language and shifted everything after it).
+_TASK_TOKENS = {"<|transcribe|>": "transcribe", "<|translate|>": "translate"}
+
+
+def _control_token_tables(tok_json: Path) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """``(task_token_ids, language_token_ids)`` from an HF ``tokenizer.json``.
+
+    Read here, at conversion time, so the engine never needs the tokenizer to
+    build a decoder prompt — and so the tables round-trip through the native
+    format like every other checkpoint-derived fact.  A snapshot without them
+    (an English-only Whisper has no language tokens) yields empty tables, and
+    the per-request options then fail with a message saying so.
+    """
+    tasks: Dict[str, int] = {}
+    languages: Dict[str, int] = {}
+    try:
+        added = _read_json(tok_json).get("added_tokens") or []
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("whisper: could not read %s for control tokens: %s", tok_json, exc)
+        return tasks, languages
+    for entry in added:
+        content, tid = entry.get("content"), entry.get("id")
+        if not isinstance(content, str) or not isinstance(tid, int):
+            continue
+        if (task := _TASK_TOKENS.get(content)) is not None:
+            tasks[task] = tid
+        elif (m := _LANGUAGE_TOKEN.match(content)) is not None:
+            languages[m.group(1)] = tid
+    return tasks, languages
 
 
 class HFWhisperConverter(BaseCheckpointConverter):
@@ -90,6 +129,7 @@ class HFWhisperConverter(BaseCheckpointConverter):
                 tok = raw_forced.get(p)
             if tok is not None:
                 forced.append((p, int(tok)))
+        tasks, languages = _control_token_tables(Path(ckpt_dir) / "tokenizer.json")
         return WhisperModelConfig(
             vocab_size=int(raw["vocab_size"]),
             d_model=int(raw["d_model"]),
@@ -107,6 +147,8 @@ class HFWhisperConverter(BaseCheckpointConverter):
             forced_decoder_ids=[(int(p), int(t)) for p, t in forced],
             suppress_tokens=[int(t) for t in (pick("suppress_tokens", []) or [])],
             begin_suppress_tokens=[int(t) for t in (pick("begin_suppress_tokens", []) or [])],
+            task_token_ids=tasks,
+            language_token_ids=languages,
         )
 
     def load_state_dict(

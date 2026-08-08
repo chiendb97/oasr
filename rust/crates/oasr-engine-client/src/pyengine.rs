@@ -511,6 +511,16 @@ fn decoding_params_dict<'py>(
                     d.set_item(key, v.as_str())?;
                 }
             }
+            "task" => {
+                if let Some(v) = &p.task {
+                    d.set_item(key, v.as_str())?;
+                }
+            }
+            "language" => {
+                if let Some(v) = &p.language {
+                    d.set_item(key, v.as_str())?;
+                }
+            }
             other => {
                 return Err(PyRuntimeError::new_err(format!(
                     "DecodingParams::OPTION_KEYS names {other:?} but \

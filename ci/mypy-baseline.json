@@ -3,7 +3,7 @@
   "paths": [
     "oasr"
   ],
-  "total": 441,
+  "total": 431,
   "files": {
     "oasr/attention.py": 7,
     "oasr/cache/decoder_kv.py": 3,
@@ -18,7 +18,7 @@
     "oasr/decoder/ctc_wfst_beam_search.py": 3,
     "oasr/decoder/wfst_decoder.py": 7,
     "oasr/engine/config.py": 2,
-    "oasr/engine/decode/aed.py": 11,
+    "oasr/engine/decode/aed.py": 1,
     "oasr/engine/decode/base.py": 2,
     "oasr/engine/decode/ctc_gpu.py": 2,
     "oasr/engine/decode/ctc_wfst.py": 3,

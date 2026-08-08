@@ -25,11 +25,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Tuple, Type
 
 import torch
 
-from ..request import Request, RequestOutput
+from ..request import DecodingOptions, Request, RequestOutput
 
 if TYPE_CHECKING:
     from oasr.models.base import BaseAsrModel
@@ -103,6 +103,45 @@ class DecodeStrategy(ABC):
         self._model = model
         #: This family's resolved options (``None`` when ``options_cls`` is).
         self.options = build_options(self.options_cls, config)
+
+    # -- per-request options ------------------------------------------------
+
+    #: Per-request :class:`~oasr.engine.request.DecodingOptions` fields that
+    #: select *what is decoded* rather than *how thoroughly*, and which only
+    #: some families can act on.  A family lists what it honours; anything set
+    #: outside the list is rejected at admission.
+    #:
+    #: This list is deliberately short.  ``temperature`` / ``top_k`` / ``top_p``
+    #: are not on it: a frame-synchronous family ignoring a sampling knob
+    #: returns the same transcript either way, which is a performance surprise
+    #: at worst.  ``task`` and ``language`` are different — ignoring them
+    #: returns a transcript of *something else*, in a different language or a
+    #: different task, with nothing in the response to say so.
+    selective_options: ClassVar[Tuple[str, ...]] = ()
+
+    def validate_options(self, options: Optional["DecodingOptions"]) -> None:
+        """Reject per-request options this family cannot act on.
+
+        Called once per request at admission
+        (``ASREngine._admit_one_checked``), so a rejection is scoped to its own
+        request rather than to the admit batch it was coalesced into.
+
+        Subclasses that *can* act on a selective option override this to add
+        the checkpoint-level check — a Whisper checkpoint knows a fixed set of
+        language tokens, and ``language="xx"`` has to fail here rather than
+        silently fall back to the checkpoint's own.
+        """
+        if options is None:
+            return
+        for name in ("task", "language"):
+            if getattr(options, name, None) is None or name in self.selective_options:
+                continue
+            raise ValueError(
+                f"decode_method={self.decode_type!r} cannot honour the "
+                f"per-request {name!r} option (it has no {name} control); "
+                "remove it, or serve a checkpoint whose decode family does "
+                f"(supported here: {list(self.selective_options) or 'none'})"
+            )
 
     # -- offline -----------------------------------------------------------
     @abstractmethod

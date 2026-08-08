@@ -267,6 +267,34 @@ pub struct Cli {
     /// docs recommend gRPC as the higher-throughput offline path.
     #[arg(long, default_value_t = 256)]
     pub max_audio_mib: usize,
+    /// Longest **decoded** audio one request may carry, in seconds.  0
+    /// disables.
+    ///
+    /// `--max-audio-mib` bounds the *encoded* body, and once compressed
+    /// containers are accepted the two stop being related: a few MiB of MP3 is
+    /// hours of waveform, allocated before anything could notice.  The default
+    /// is generous — this is a backstop against a decode bomb, not a product
+    /// limit.
+    #[arg(long, default_value_t = 4 * 3600)]
+    pub max_audio_seconds: u64,
+    /// Names this server answers to on the OpenAI surface's `model` field.
+    /// Repeatable.
+    ///
+    /// Unset (the default) accepts **any** name, which is what keeps a client
+    /// pointed at `whisper-1` working after nothing but a base-URL change. Set
+    /// it and an unrecognised name is a 404, as OpenAI does — worth turning on
+    /// behind a router that fans out to several models.
+    #[arg(long)]
+    pub served_model_name: Vec<String>,
+    /// Origin allowed to call the HTTP API from a browser, repeatable; `*`
+    /// allows any.
+    ///
+    /// Off by default: a browser cannot call this API cross-origin without it,
+    /// and whether an inference endpoint should be callable from any page is an
+    /// operator's decision. Needed for the `examples/web` demo, which talks to
+    /// the server directly.
+    #[arg(long)]
+    pub cors_allow_origin: Vec<String>,
     /// Deadline for a single **unary** request (HTTP `speech:recognize`,
     /// gRPC `Recognize`), in seconds.  0 disables.  Streaming RPCs are bounded
     /// by `--stream-idle-timeout-secs` instead: a blanket deadline would kill
@@ -320,6 +348,13 @@ impl Cli {
     /// Largest accepted audio payload in bytes (shared by both front-ends).
     pub fn max_audio_bytes(&self) -> usize {
         self.max_audio_mib.saturating_mul(1024 * 1024)
+    }
+
+    /// Ceiling on the decoded waveform in samples at `model_sample_rate`, or
+    /// `None` when disabled.
+    pub fn max_audio_samples(&self, model_sample_rate: u32) -> Option<usize> {
+        (self.max_audio_seconds > 0)
+            .then(|| (self.max_audio_seconds as usize).saturating_mul(model_sample_rate as usize))
     }
 
     /// Concurrency limit for each listener, defaulted from the admission cap.

@@ -219,6 +219,8 @@ class TestPerRequestOptionTable:
             "top_k",
             "top_p",
             "prompt",
+            "task",
+            "language",
         )
 
     def test_every_field_survives_a_dict_round_trip(self):
@@ -231,6 +233,8 @@ class TestPerRequestOptionTable:
             "top_k": 5,
             "top_p": 0.9,
             "prompt": "hi",
+            "task": "translate",
+            "language": "fr",
         }
         got = DecodingOptions.coerce(sent)
         for k, v in sent.items():

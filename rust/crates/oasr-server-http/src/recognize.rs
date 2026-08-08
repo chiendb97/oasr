@@ -15,11 +15,12 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use bytes::Bytes;
-use oasr_asr::{decode_audio, PcmEncoding};
-use oasr_wire::{score_posteriors, DecodingParams, ErrorCode, Event};
+use oasr_asr::{decode_audio, parse_encoding, DecodeOptions, EncodingError, SourceEncoding};
+use oasr_wire::{normalize_language, score_posteriors, DecodingParams};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, field, info, info_span, warn, Instrument, Span};
+use tracing::{debug, field, info, info_span, Instrument, Span};
 
+use crate::engine_call::submit_offline_and_wait;
 use crate::router::{AppState, ServiceMode};
 
 /// Fallback body cap, used only when a caller builds a [`ServerState`] without
@@ -78,27 +79,25 @@ fn is_zero_i32(v: &i32) -> bool {
     *v == 0
 }
 
-/// Map the `encoding` query value to a `(pcm_encoding, content_type_hint)`
-/// pair.  Names follow the proto enum spelling so the REST + gRPC surfaces
-/// agree.
+/// Map the `encoding` query value to a `(source_encoding, container_hint)`
+/// pair.  Names follow the proto enum spelling — and the mapping itself is
+/// `oasr_asr::parse_encoding`, shared with the gRPC surface, so the two cannot
+/// disagree about which codecs exist.
 fn map_encoding(
     s: &str,
-) -> Result<(PcmEncoding, Option<&'static str>), (StatusCode, &'static str, String)> {
-    match s.to_ascii_uppercase().as_str() {
-        "" | "ENCODING_UNSPECIFIED" => Err((
+) -> Result<(SourceEncoding, Option<&'static str>), (StatusCode, &'static str, String)> {
+    parse_encoding(s).map_err(|e| match e {
+        EncodingError::Unspecified => (
             StatusCode::BAD_REQUEST,
             "INVALID_ARGUMENT",
             "encoding query parameter must be set".into(),
-        )),
-        "LINEAR16" => Ok((PcmEncoding::I16Le, None)),
-        "LINEAR32F" => Ok((PcmEncoding::F32Le, None)),
-        "WAV" => Ok((PcmEncoding::F32Le, Some("audio/wav"))),
-        other => Err((
+        ),
+        other => (
             StatusCode::NOT_IMPLEMENTED,
             "UNIMPLEMENTED",
-            format!("encoding {other} is not supported"),
-        )),
-    }
+            other.to_string(),
+        ),
+    })
 }
 
 fn build_alternatives(
@@ -164,18 +163,6 @@ fn reject(
     error_response(status, code, message)
 }
 
-fn error_from_event_code(code: ErrorCode) -> (StatusCode, &'static str) {
-    match code {
-        ErrorCode::Busy => (StatusCode::SERVICE_UNAVAILABLE, "RESOURCE_EXHAUSTED"),
-        ErrorCode::UnknownRequest => (StatusCode::NOT_FOUND, "NOT_FOUND"),
-        ErrorCode::InvalidCmd => (StatusCode::BAD_REQUEST, "INVALID_ARGUMENT"),
-        ErrorCode::Shutdown | ErrorCode::WorkerLost => {
-            (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE")
-        }
-        ErrorCode::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
-    }
-}
-
 /// Query parameters for `POST /v1/speech:recognize`.  The request body is the
 /// raw PCM audio; all recognition config travels here in the query string.
 #[derive(Debug, Deserialize)]
@@ -207,6 +194,13 @@ pub struct RawParams {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// `transcribe` (default) or `translate` — Whisper's task token.
+    #[serde(default)]
+    pub task: Option<String>,
+    /// BCP-47 or ISO-639 tag for the families with language control; reduced to
+    /// its primary subtag server-side.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 impl RawParams {
@@ -225,8 +219,32 @@ impl RawParams {
             top_k: self.top_k.filter(|&v| v > 0),
             top_p: self.top_p.filter(|&v| v > 0.0),
             prompt: self.prompt.clone().filter(|s| !s.is_empty()),
+            task: normalize_task(self.task.as_deref()),
+            language: normalize_optional_language(self.language.as_deref())?,
         }
         .validated()
+    }
+}
+
+/// `Some(lowercased)` for a set task; `None` when unset.  Validation of the
+/// *value* is `DecodingParams::validate`'s job, in one place for both surfaces.
+pub(crate) fn normalize_task(task: Option<&str>) -> Option<String> {
+    task.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+}
+
+/// Reduce a client's language tag to a primary subtag, rejecting junk.
+///
+/// Dropping an unparseable tag would transcribe in the checkpoint's own
+/// language while the client believes it asked for another — the response
+/// carries nothing that would reveal it.
+pub(crate) fn normalize_optional_language(lang: Option<&str>) -> Result<Option<String>, String> {
+    match lang.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(tag) => normalize_language(tag)
+            .map(Some)
+            .ok_or_else(|| format!("language {tag:?} is not a language tag")),
     }
 }
 
@@ -273,7 +291,7 @@ pub async fn handle_recognize(
             );
         }
 
-        let (pcm_enc, ct_hint) = match map_encoding(&params.encoding) {
+        let (source_enc, ct_hint) = match map_encoding(&params.encoding) {
             Ok(p) => p,
             Err((status, code, msg)) => return reject(status, code, msg),
         };
@@ -289,7 +307,16 @@ pub async fn handle_recognize(
         // ignores the request's, so 8 kHz telephony or 44.1 kHz media reaching it
         // unconverted produced a confident, wrong transcript.  A WAV body carries
         // its own rate in the header, which is what `decode_audio` converts from.
-        let decoded = match decode_audio(ct_hint, &bytes, pcm_enc, Some(sr), Some(s.sample_rate)) {
+        let decoded = match decode_audio(
+            &bytes,
+            &DecodeOptions {
+                hint: ct_hint,
+                encoding: source_enc,
+                source_sample_rate: Some(sr),
+                target_sample_rate: Some(s.sample_rate),
+                max_samples: s.max_audio_samples,
+            },
+        ) {
             Ok(d) => d,
             Err(e) => {
                 return reject(
@@ -328,9 +355,12 @@ pub async fn handle_recognize(
     .await
 }
 
-/// Shared offline submit → await → response tail for both the JSON and raw-PCM
-/// recognise handlers.  ``audio_buf`` is f32-LE mono samples (already decoded);
-/// records ``rid`` on the current span once the engine assigns one.
+/// Offline submit → await → Google-shaped response.  ``audio_buf`` is f32-LE
+/// mono samples (already decoded); records ``rid`` on the current span once the
+/// engine assigns one.
+///
+/// The submit/await half is [`submit_offline_and_wait`], shared with the
+/// OpenAI-shaped routes; only the rendering below is specific to this surface.
 async fn run_offline(
     s: &AppState,
     audio_buf: Bytes,
@@ -341,88 +371,37 @@ async fn run_offline(
     start: Instant,
 ) -> axum::response::Response {
     let n_samples = audio_buf.len() / 4;
-    let handle = match s
-        .pool
-        .submit_offline(audio_buf, sample_rate, priority, decoding)
-        .await
-    {
-        Ok(h) => h,
-        Err(e) => {
-            warn!(%e, "recognize submit rejected");
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "RESOURCE_EXHAUSTED",
-                format!("submit failed: {e}"),
-            );
-        }
-    };
-    let rid = handle.request_id.clone();
-    Span::current().record("rid", rid.as_str());
-    let ev = match handle.finish().await {
-        Ok(e) => e,
-        Err(_) => {
-            error!(rid = %rid, "engine channel closed before result");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL",
-                "engine channel closed before result",
-            );
-        }
-    };
-    s.pool.release(&rid);
-
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-    match ev {
-        Event::Final {
-            request_id,
-            text,
-            tokens,
-            scores,
-            nbest_texts,
-            end_time_s,
-            finish_reason,
-        } => {
-            let n_tokens = tokens.first().map_or(0, |t| t.len());
-            info!(
-                rid = %request_id,
-                sample_rate,
-                n_samples,
-                n_tokens,
-                elapsed_ms,
-                transcript = %text,
-                "recognize ok"
-            );
-            Json(RecognizeResponse {
-                results: vec![SpeechRecognitionResult {
-                    alternatives: build_alternatives(text, tokens, scores, nbest_texts, max_alts),
-                    channel_tag: 0,
-                    language_code: String::new(),
-                    result_end_time_s: end_time_s,
-                    finish_reason,
-                }],
-                request_id,
-            })
-            .into_response()
-        }
-        Event::Error { code, message, .. } => {
-            let (status, code_name) = error_from_event_code(code);
-            warn!(
-                rid = %rid,
-                code = ?code,
-                status = status.as_u16(),
-                elapsed_ms,
-                reason = %message,
-                "recognize error"
-            );
-            error_response(status, code_name, message)
-        }
-        other => {
-            error!(rid = %rid, elapsed_ms, "unexpected non-terminal event for offline request: {other:?}");
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL",
-                "unexpected event type",
-            )
-        }
-    }
+    let final_ =
+        match submit_offline_and_wait(s, audio_buf, sample_rate, priority, decoding, start).await {
+            Ok(f) => f,
+            Err(e) => return error_response(e.status, e.code, e.message),
+        };
+    Span::current().record("rid", final_.request_id.as_str());
+    let n_tokens = final_.tokens.first().map_or(0, |t| t.len());
+    info!(
+        rid = %final_.request_id,
+        sample_rate,
+        n_samples,
+        n_tokens,
+        elapsed_ms = final_.elapsed_ms,
+        transcript = %final_.text,
+        "recognize ok"
+    );
+    Json(RecognizeResponse {
+        results: vec![SpeechRecognitionResult {
+            alternatives: build_alternatives(
+                final_.text,
+                final_.tokens,
+                final_.scores,
+                final_.nbest_texts,
+                max_alts,
+            ),
+            channel_tag: 0,
+            language_code: String::new(),
+            result_end_time_s: final_.end_time_s,
+            finish_reason: final_.finish_reason,
+        }],
+        request_id: final_.request_id,
+    })
+    .into_response()
 }

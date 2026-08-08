@@ -9,20 +9,30 @@
 //!
 //! - **WAV** containers via `hound` (any bit-depth, multi-channel averaged
 //!   down to mono).
-//! - **Raw PCM** in `f32_le` or `i16_le` formats with a caller-specified
+//! - **Compressed containers** via `symphonia` (`codecs` feature, on by
+//!   default): MP3, FLAC, AAC/M4A, ALAC, OGG-Vorbis, AIFF, CAF and MKV/WebM.
+//! - **Raw PCM** in `f32_le`, `i16_le`, µ-law or A-law with a caller-specified
 //!   sample rate.
 //!
 //! and converts the result to a target rate ([`decode_audio`] for whole clips,
 //! [`PcmStream`] for chunk-by-chunk streaming, which carries the resampler's
 //! filter state across chunks).
 //!
-//! MP3 / Opus / FLAC are deliberately out of scope for v1.  Add them later
-//! behind a `symphonia` feature.
+//! **Opus is the one gap**, and a declared one: there is no pure-Rust decoder,
+//! and pulling in libopus would add a C dependency to every build.  An Opus
+//! track demuxes and then fails with [`AudioError::UnsupportedCodec`].
 
 pub mod audio;
+pub mod codec;
+pub mod encoding;
 pub mod resample;
 
-pub use audio::{decode_audio, decode_raw_pcm, AudioError, DecodedAudio, PcmEncoding, PcmStream};
+pub use audio::{
+    decode_audio, decode_raw_pcm, decode_wav, AudioError, DecodeOptions, DecodedAudio, PcmEncoding,
+    PcmStream, SourceEncoding,
+};
+pub use codec::{container_from_hint, sniff, Container};
+pub use encoding::{parse_encoding, EncodingError};
 pub use resample::{
     resample_mono, validate_sample_rate, Resampler, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
 };

@@ -37,6 +37,16 @@ pub struct DecodingParams {
     /// Speech-LLM user-prompt override (ignored by other families).
     #[serde(default)]
     pub prompt: Option<String>,
+    /// `"transcribe"` or `"translate"` — Whisper's task token.  Frozen at
+    /// checkpoint-conversion time before this existed, which is why
+    /// `/v1/audio/translations` could not be served.
+    #[serde(default)]
+    pub task: Option<String>,
+    /// Language for the families that can select one (Whisper's language
+    /// token).  A primary subtag (`"en"`), not a BCP-47 tag — the front-ends
+    /// reduce `"en-US"` before it gets here.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// Sampling-temperature bounds, mirroring `oasr.engine.request.MIN_TEMPERATURE`
@@ -54,6 +64,31 @@ pub const MAX_N_BEST: u32 = 30;
 /// prompt and output), so an unbounded one silently clamps generation to a
 /// single token.
 pub const MAX_PROMPT_BYTES: usize = 4096;
+/// The task values any decode family understands.  Whisper's own pair; a
+/// checkpoint that cannot do one of them rejects it at admission, where the
+/// token table lives.
+pub const TASKS: &[&str] = &["transcribe", "translate"];
+/// Upper bound on a language tag.  Whisper's are two or three letters; the
+/// slack is for the handful of longer ISO-639-3 codes.
+pub const MAX_LANGUAGE_LEN: usize = 16;
+
+/// Reduce a language tag to the primary subtag, lowercased: `"en-US"` → `"en"`.
+///
+/// Both API surfaces take BCP-47 (`language_code` on the Google shape,
+/// `language` on the OpenAI one) while the models' language tokens are ISO-639
+/// primary subtags. Returns `None` for an empty or non-alphabetic tag, which
+/// the caller turns into `INVALID_ARGUMENT` — silently dropping a language the
+/// client asked for is how a request gets transcribed in the wrong one.
+pub fn normalize_language(tag: &str) -> Option<String> {
+    let primary = tag.trim().split(['-', '_']).next().unwrap_or("");
+    if primary.is_empty()
+        || primary.len() > MAX_LANGUAGE_LEN
+        || !primary.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some(primary.to_ascii_lowercase())
+}
 
 impl DecodingParams {
     /// The per-request option names, in declaration order.
@@ -72,6 +107,8 @@ impl DecodingParams {
         "top_k",
         "top_p",
         "prompt",
+        "task",
+        "language",
     ];
 
     /// Whether every field is `None` — callers skip building the Python-side
@@ -118,6 +155,21 @@ impl DecodingParams {
                 return Err(format!(
                     "prompt must be <= {MAX_PROMPT_BYTES} bytes, got {}",
                     prompt.len()
+                ));
+            }
+        }
+        if let Some(task) = &self.task {
+            if !TASKS.contains(&task.as_str()) {
+                return Err(format!("task must be one of {TASKS:?}, got {task:?}"));
+            }
+        }
+        if let Some(lang) = &self.language {
+            // Already normalized by the front-ends; re-checked because a
+            // mis-normalized tag reaching the engine picks a *different*
+            // language token, which reads as a confident wrong transcript.
+            if normalize_language(lang).as_deref() != Some(lang.as_str()) {
+                return Err(format!(
+                    "language must be a primary subtag like \"en\", got {lang:?}"
                 ));
             }
         }
@@ -356,6 +408,8 @@ mod tests {
             top_k: Some(1),
             top_p: Some(1.0),
             prompt: Some("x".into()),
+            task: Some("transcribe".into()),
+            language: Some("en".into()),
         };
         let json = serde_json::to_value(&all).expect("serialize");
         let mut fields: Vec<&str> = json
@@ -394,8 +448,57 @@ mod tests {
             top_k: Some(40),
             max_new_tokens: Some(64),
             prompt: Some("transcribe".into()),
+            task: Some("translate".into()),
+            language: Some("fr".into()),
         };
         assert_eq!(ok.clone().validated().unwrap(), Some(ok));
+    }
+
+    #[test]
+    fn language_tags_reduce_to_their_primary_subtag() {
+        assert_eq!(normalize_language("en-US").as_deref(), Some("en"));
+        assert_eq!(normalize_language("zh_Hans").as_deref(), Some("zh"));
+        assert_eq!(normalize_language("  FR  ").as_deref(), Some("fr"));
+        assert_eq!(normalize_language("yue").as_deref(), Some("yue"));
+        // Junk is rejected rather than passed through to become a token lookup
+        // miss deep inside the decode strategy.
+        assert_eq!(normalize_language(""), None);
+        assert_eq!(normalize_language("-"), None);
+        assert_eq!(normalize_language("e1"), None);
+        assert_eq!(normalize_language(&"a".repeat(MAX_LANGUAGE_LEN + 1)), None);
+    }
+
+    /// A misspelled task must fail its own request.  Accepting it and running
+    /// the checkpoint's default is the "accepted and ignored" failure this
+    /// option table exists to prevent.
+    #[test]
+    fn an_unknown_task_is_rejected() {
+        let err = DecodingParams {
+            task: Some("summarize".into()),
+            ..Default::default()
+        }
+        .validated()
+        .expect_err("unknown task should be rejected");
+        assert!(err.contains("task"), "{err:?}");
+        for t in TASKS {
+            assert!(DecodingParams {
+                task: Some((*t).into()),
+                ..Default::default()
+            }
+            .validated()
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn an_unnormalized_language_is_rejected() {
+        let err = DecodingParams {
+            language: Some("en-US".into()),
+            ..Default::default()
+        }
+        .validated()
+        .expect_err("a full BCP-47 tag must be normalized by the front-end first");
+        assert!(err.contains("language"), "{err:?}");
     }
 
     #[test]

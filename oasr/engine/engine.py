@@ -800,6 +800,7 @@ class ASREngine:
                 decoding=DecodingOptions.coerce(spec.get("decoding")),
             )
             self._validate_mode(streaming)
+            self._output_processor.strategy.validate_options(req.decoding)
             self._executor.admit(req)
         except Exception as exc:
             return {"request_id": rid or "", "error": f"{type(exc).__name__}: {exc}"}
@@ -837,6 +838,7 @@ class ASREngine:
                     decoding=DecodingOptions.coerce(spec.get("decoding")),
                 )
                 self._validate_mode(req.streaming)  # reads immutable executor.streaming
+                self._output_processor.strategy.validate_options(req.decoding)
                 # Raise here, not on the prep thread, where it would only be logged.
                 self._input_processor.check_audio_duration(req.audio)
             except Exception as exc:
@@ -1248,6 +1250,7 @@ class ASREngine:
         audio: Union[torch.Tensor, "np.ndarray", List[Union[torch.Tensor, "np.ndarray"]]],
         sample_rate: Optional[int] = None,
         streaming: bool = True,
+        decoding: Optional[Union[DecodingOptions, Dict]] = None,
     ) -> Union[str, List[str]]:
         """Transcribe one or more **waveforms**.
 
@@ -1264,12 +1267,19 @@ class ASREngine:
             the batched offline path.  Offline is strictly faster when
             real-time output isn't needed.  See also
             :meth:`transcribe_offline`.
+        decoding : DecodingOptions or dict, optional
+            Per-request options applied to every waveform — ``task`` /
+            ``language`` for the families with those controls, sampling knobs
+            for the AR ones.  Without this the convenience API could not reach
+            options the serving layer can, which is the kind of asymmetry that
+            sends people to the HTTP surface for things the library can do.
         """
         is_single = not isinstance(audio, list)
         audio_list: List = [audio] if is_single else audio  # type: ignore[list-item]
 
         request_ids = [
-            self.add_request(a, sample_rate=sample_rate, streaming=streaming) for a in audio_list
+            self.add_request(a, sample_rate=sample_rate, streaming=streaming, decoding=decoding)
+            for a in audio_list
         ]
         final = self.run()
 
@@ -1281,6 +1291,7 @@ class ASREngine:
         self,
         audio: Union[torch.Tensor, "np.ndarray", List[Union[torch.Tensor, "np.ndarray"]]],
         sample_rate: Optional[int] = None,
+        decoding: Optional[Union[DecodingOptions, Dict]] = None,
     ) -> Union[str, List[str]]:
         """Batch transcription convenience — :meth:`transcribe` with
         ``streaming=False``.
@@ -1290,7 +1301,7 @@ class ASREngine:
         real-time partials are not needed — it's strictly faster than the
         streaming path on the same audio.
         """
-        return self.transcribe(audio, sample_rate=sample_rate, streaming=False)
+        return self.transcribe(audio, sample_rate=sample_rate, streaming=False, decoding=decoding)
 
     # ------------------------------------------------------------------
     # Status

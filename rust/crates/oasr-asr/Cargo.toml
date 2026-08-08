@@ -3,11 +3,19 @@ name = "oasr-asr"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Audio decoding helpers (WAV + raw PCM) used by the OASR Rust frontend."
+description = "Audio decoding (WAV, raw PCM, µ-law/A-law, and compressed codecs) for the OASR Rust frontend."
+
+[features]
+# Compressed-container decoding via symphonia.  On by default: users have MP3
+# podcasts and M4A voice memos, not headerless PCM.  Turning it off leaves the
+# WAV / raw-PCM / µ-law / A-law paths, which need no extra crates.
+default = ["codecs"]
+codecs = ["dep:symphonia"]
 
 [dependencies]
 bytes = { workspace = true }
 hound = { workspace = true }
 rubato = { workspace = true }
+symphonia = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

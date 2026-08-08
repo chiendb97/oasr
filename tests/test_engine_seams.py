@@ -192,6 +192,27 @@ class _FakeExecutor:
         self.admitted.append(request.request_id)
 
 
+class _FakeStrategy:
+    """A decode family with no task / language control.
+
+    ``validate_options`` is the **real** base implementation rather than a stub:
+    admission's job here is to route a family's rejection into that spec's
+    result dict, and a stub that never rejects would test nothing.
+    """
+
+    from oasr.engine.decode.base import DecodeStrategy as _Base
+
+    decode_type = "ctc"
+    selective_options = ()
+    validate_options = _Base.validate_options
+
+
+class _FakeOutputProcessor:
+    """Just the ``strategy`` property admission reads."""
+
+    strategy = _FakeStrategy()
+
+
 def _admission_engine(*, overlap=False):
     """An ``ASREngine`` with only the attributes the admission path touches.
 
@@ -213,6 +234,7 @@ def _admission_engine(*, overlap=False):
         feature_config=FeatureConfig(sample_rate=16000),
     )
     eng._executor = _FakeExecutor()
+    eng._output_processor = _FakeOutputProcessor()
     eng._overlap_admit = overlap
     eng._longform = None
     eng._input_processor = InputProcessor.__new__(InputProcessor)

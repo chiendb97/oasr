@@ -3,7 +3,7 @@ name = "oasr-server-http"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "HTTP routes (axum) for the OASR serving frontend — native + Whisper-compat + WebSocket."
+description = "HTTP routes (axum) for the OASR serving frontend — Google-STT-shaped, OpenAI-compatible, and a realtime WebSocket."
 
 [dependencies]
 oasr-wire = { path = "../oasr-wire" }
@@ -13,6 +13,7 @@ oasr-asr = { path = "../oasr-asr" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
+async-stream = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
@@ -25,3 +26,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+
+[dev-dependencies]
+# `ServiceExt::oneshot` drives the assembled Router without binding a socket.
+tower = { workspace = true }
+tokio = { workspace = true }

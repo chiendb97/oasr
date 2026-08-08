@@ -62,9 +62,10 @@ audio = [
     "kaldifeat>=1.22; python_version>='3.8'",
 ]
 serving = [
-    # Client libs used by benchmarks/bench_service.py + scripts/ws_stream.py.
-    # The server itself is the Rust ``oasr-server`` binary (in-process PyO3
-    # engine — no msgpack / no pyzmq runtime dependency).
+    # Client libs: `oasr.client` / the `oasr` CLI (httpx for the REST routes,
+    # websockets for /v1/realtime) and benchmarks/bench_service.py.  The server
+    # itself is the Rust ``oasr-server`` binary (in-process PyO3 engine — no
+    # msgpack / no pyzmq runtime dependency).
     "httpx>=0.27.0",
     "websockets>=12.0",
 ]
@@ -119,6 +120,10 @@ Repository = "https://github.com/your-org/oasr"
 Issues = "https://github.com/your-org/oasr/issues"
 
 [project.scripts]
+# One command to learn: `oasr transcribe|translate|models|serve|convert`.
+# `serve` and `convert` forward to the two entry points below, which stay for
+# compatibility and for anyone scripting them directly.
+oasr = "oasr.cli:main"
 # Rust serving front-end.  `pip install` builds it into `oasr._core` (below);
 # this wrapper forwards argv to it so `oasr-server` works like the old binary.
 oasr-server = "oasr._server_cli:main"
