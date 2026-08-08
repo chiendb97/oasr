@@ -209,12 +209,23 @@ async fn serve(cli: Cli) -> Result<()> {
 
     let pool = Arc::new(EnginePool::new(vec![client]));
 
+    // The id the OpenAI surface reports and echoes.  The checkpoint path is the
+    // only stable name a single-model process has; `--served-model-name` is how
+    // an operator gives it the one their clients already send.
+    let model_id = model
+        .ckpt_dir
+        .clone()
+        .unwrap_or_else(|| cli.engine_label.clone());
+    let max_audio_samples = cli.max_audio_samples(engine_sample_rate);
     let state = Arc::new(ServerState {
         pool: Arc::clone(&pool),
         prometheus,
         service_mode: http_mode,
         sample_rate: engine_sample_rate,
         max_body_bytes: cli.max_audio_bytes(),
+        max_audio_samples,
+        served_model_names: cli.served_model_name.clone(),
+        model_id,
     });
 
     // One broadcast of the shutdown signal to both listeners; each stops
@@ -228,6 +239,7 @@ async fn serve(cli: Cli) -> Result<()> {
         RouterLimits {
             request_timeout: cli.request_timeout(),
             max_inflight: cli.inflight_limit(),
+            cors_allow_origins: cli.cors_allow_origin.clone(),
         },
     );
     let http_bind = cli.http_bind;
@@ -251,6 +263,7 @@ async fn serve(cli: Cli) -> Result<()> {
     let grpc_idle = cli.stream_idle_timeout();
     let grpc_max_message = cli.max_audio_bytes();
     let grpc_conn_limit = cli.inflight_limit();
+    let grpc_max_audio_samples = max_audio_samples;
 
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     // Start NOT_SERVING and let the watcher below promote us: the reporter has
@@ -303,7 +316,8 @@ async fn serve(cli: Cli) -> Result<()> {
 
     let grpc_handle = tokio::spawn(async move {
         let svc = SpeechService::new(grpc_pool, grpc_mode, engine_sample_rate)
-            .with_stream_idle_timeout(grpc_idle);
+            .with_stream_idle_timeout(grpc_idle)
+            .with_max_audio_samples(grpc_max_audio_samples);
         info!("gRPC listening on {grpc_bind}");
         // Both message-size limits are set explicitly.  tonic's default
         // decoding cap is 4 MiB, which silently rejected any unary `Recognize`

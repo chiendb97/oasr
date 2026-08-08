@@ -8,9 +8,11 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::Stream;
-use oasr_asr::{decode_audio, PcmEncoding, PcmStream};
+use oasr_asr::{
+    decode_audio, parse_encoding, DecodeOptions, EncodingError, PcmStream, SourceEncoding,
+};
 use oasr_engine_client::EnginePool;
-use oasr_wire::{score_posteriors, DecodingParams, ErrorCode, Event};
+use oasr_wire::{normalize_language, score_posteriors, DecodingParams, ErrorCode, Event};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -47,6 +49,10 @@ pub struct SpeechService {
     /// The engine's waveform sample rate in Hz; inbound audio is resampled to
     /// it before submission (the engine does not resample).
     sample_rate: u32,
+    /// Ceiling on the **decoded** waveform, in samples.  `None` disables.
+    /// Distinct from the message-size cap: a compressed body's byte length
+    /// says nothing about how much audio it becomes.
+    max_audio_samples: Option<usize>,
     /// Abort a streaming RPC idle this long.  `None` disables.
     stream_idle_timeout: Option<Duration>,
 }
@@ -57,8 +63,15 @@ impl SpeechService {
             pool,
             mode,
             sample_rate,
+            max_audio_samples: None,
             stream_idle_timeout: None,
         }
+    }
+
+    /// Bound the decoded waveform at `n` samples (at the source rate).
+    pub fn with_max_audio_samples(mut self, n: Option<usize>) -> Self {
+        self.max_audio_samples = n;
+        self
     }
 
     /// Abort a streaming RPC that goes `d` without an inbound audio message
@@ -145,21 +158,40 @@ fn final_response(
     }
 }
 
-/// Map the proto encoding enum to a `(pcm_encoding, content_type_hint)` pair.
+/// Map the proto encoding enum to a `(source_encoding, container_hint)` pair.
+///
+/// The enum's own `as_str_name()` is the bridge to `oasr_asr::parse_encoding`,
+/// which both surfaces share — the two used to carry separate `match`es and
+/// drifted, so a codec added to one returned `UNIMPLEMENTED` on the other.
 ///
 /// Unsupported codecs return `UNIMPLEMENTED`; `ENCODING_UNSPECIFIED` returns
 /// `INVALID_ARGUMENT` (Google STT v1 does the same).
-fn map_encoding(enc: i32) -> Result<(PcmEncoding, Option<&'static str>), Status> {
+fn map_encoding(enc: i32) -> Result<(SourceEncoding, Option<&'static str>), Status> {
     use pb::recognition_config::AudioEncoding;
     let ae = AudioEncoding::try_from(enc).unwrap_or(AudioEncoding::EncodingUnspecified);
-    match ae {
-        AudioEncoding::EncodingUnspecified => Err(Status::invalid_argument("encoding must be set")),
-        AudioEncoding::Linear16 => Ok((PcmEncoding::I16Le, None)),
-        AudioEncoding::Linear32f => Ok((PcmEncoding::F32Le, None)),
-        AudioEncoding::Wav => Ok((PcmEncoding::F32Le, Some("audio/wav"))),
-        other => Err(Status::unimplemented(format!(
-            "encoding {other:?} not supported"
-        ))),
+    parse_encoding(ae.as_str_name()).map_err(|e| match e {
+        EncodingError::Unspecified => Status::invalid_argument(e.to_string()),
+        EncodingError::Unsupported(_) | EncodingError::Unknown(_) => {
+            Status::unimplemented(e.to_string())
+        }
+    })
+}
+
+/// The chunked RPC needs a headerless PCM format: a container header arrives
+/// once, at the front of a stream whose chunks are decoded independently.
+///
+/// Rejecting is the honest answer.  Before this, `encoding=WAV` on
+/// `StreamingRecognize` silently mapped to raw f32 and the client's 44-byte
+/// RIFF header was decoded as eleven samples of noise at the start of every
+/// stream.
+fn streaming_pcm_encoding(enc: i32) -> Result<oasr_asr::PcmEncoding, Status> {
+    match map_encoding(enc)?.0 {
+        SourceEncoding::Pcm(p) => Ok(p),
+        SourceEncoding::Container => Err(Status::invalid_argument(
+            "StreamingRecognize needs a headerless PCM encoding (LINEAR16, \
+             LINEAR32F, MULAW or ALAW); a container cannot be fed chunk by \
+             chunk. Send containers to the unary Recognize RPC.",
+        )),
     }
 }
 
@@ -191,6 +223,19 @@ fn log_reject(st: Status) -> Status {
 /// what keeps a bad value scoped to its own request: bulk admission coalesces
 /// many envelopes into one Python call, so a raise there fails the whole batch.
 fn decoding_params(cfg: &pb::RecognitionConfig) -> Result<Option<DecodingParams>, Status> {
+    // `language_code` is BCP-47 by Google's contract and a primary subtag by
+    // the models' — reduce here, and reject junk rather than dropping it, since
+    // a dropped language decodes confidently in the checkpoint's own.
+    let language = if cfg.language_code.is_empty() {
+        None
+    } else {
+        Some(normalize_language(&cfg.language_code).ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "language_code {:?} is not a language tag",
+                cfg.language_code
+            ))
+        })?)
+    };
     DecodingParams {
         n_best: (cfg.max_alternatives > 1).then_some(cfg.max_alternatives),
         max_new_tokens: (cfg.max_new_tokens > 0).then_some(cfg.max_new_tokens),
@@ -198,6 +243,8 @@ fn decoding_params(cfg: &pb::RecognitionConfig) -> Result<Option<DecodingParams>
         top_k: (cfg.top_k > 0).then_some(cfg.top_k),
         top_p: (cfg.top_p > 0.0).then_some(cfg.top_p),
         prompt: (!cfg.prompt.is_empty()).then(|| cfg.prompt.clone()),
+        task: (!cfg.task.is_empty()).then(|| cfg.task.trim().to_ascii_lowercase()),
+        language,
     }
     .validated()
     .map_err(Status::invalid_argument)
@@ -558,16 +605,22 @@ impl pb::speech_server::Speech for SpeechService {
             } else {
                 cfg.sample_rate_hertz
             };
-            let (pcm_enc, ct_hint) = map_encoding(cfg.encoding).map_err(log_reject)?;
+            let (source_enc, ct_hint) = map_encoding(cfg.encoding).map_err(log_reject)?;
             // Convert to the engine's rate before submitting: the engine derives
             // every frame count from its own feature config and ignores the
             // request's rate, so unconverted 8 kHz / 44.1 kHz audio decoded to a
             // confident, wrong transcript.
-            let decoded =
-                decode_audio(ct_hint, &audio_bytes, pcm_enc, Some(sr), Some(self.sample_rate))
-                    .map_err(|e| {
-                        log_reject(Status::invalid_argument(format!("audio decode: {e}")))
-                    })?;
+            let decoded = decode_audio(
+                &audio_bytes,
+                &DecodeOptions {
+                    hint: ct_hint,
+                    encoding: source_enc,
+                    source_sample_rate: Some(sr),
+                    target_sample_rate: Some(self.sample_rate),
+                    max_samples: self.max_audio_samples,
+                },
+            )
+            .map_err(|e| log_reject(Status::invalid_argument(format!("audio decode: {e}"))))?;
             if decoded.sample_rate != sr {
                 debug!(
                     from_hz = sr,
@@ -685,7 +738,7 @@ impl pb::speech_server::Speech for SpeechService {
         } else {
             rcfg.sample_rate_hertz
         };
-        let (pcm_enc, _ct_hint) = map_encoding(rcfg.encoding).map_err(log_reject)?;
+        let pcm_enc = streaming_pcm_encoding(rcfg.encoding).map_err(log_reject)?;
         // One decoder for the whole stream: it holds the resampler's filter
         // state, so per-chunk construction would stamp a discontinuity into the
         // waveform at every chunk boundary.  Built here, before anything is

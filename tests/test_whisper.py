@@ -44,6 +44,21 @@ def _tiny_config(**overrides):
     return WhisperModelConfig(**base)
 
 
+def _multilingual_config(**overrides):
+    """A tiny config shaped like a *multilingual* Whisper prompt.
+
+    ``[SOT, <|lang|>, <|task|>, <|notimestamps|>]`` — the four-token sequence
+    whose language and task slots a per-request option substitutes.
+    """
+    base = {
+        "forced_decoder_ids": [(1, 50), (2, 55), (3, 59)],
+        "task_token_ids": {"transcribe": 55, "translate": 56},
+        "language_token_ids": {"en": 50, "fr": 51, "de": 52},
+    }
+    base.update(overrides)
+    return _tiny_config(**base)
+
+
 # ---------------------------------------------------------------------------
 # Log-mel frontend
 # ---------------------------------------------------------------------------
@@ -142,7 +157,190 @@ class TestDecoderIncremental:
 
 
 # ---------------------------------------------------------------------------
+# Per-request task / language (H5)
+# ---------------------------------------------------------------------------
+
+
+class TestTaskAndLanguagePrompt:
+    """The SOT slots that used to be frozen at conversion time.
+
+    ``forced_decoder_ids`` pinned language and task when the checkpoint was
+    converted, which is why ``POST /v1/audio/translations`` could not be served
+    at all: there was no request-level way to say "translate".
+    """
+
+    def test_no_override_is_the_checkpoints_own_prompt(self):
+        cfg = _multilingual_config()
+        assert cfg.sot_sequence() == [60, 50, 55, 59]
+
+    def test_task_and_language_substitute_their_own_slot(self):
+        cfg = _multilingual_config()
+        assert cfg.sot_sequence(task="translate") == [60, 50, 56, 59]
+        assert cfg.sot_sequence(language="fr") == [60, 51, 55, 59]
+        assert cfg.sot_sequence(task="translate", language="de") == [60, 52, 56, 59]
+
+    def test_substitution_preserves_the_prompt_length(self):
+        """A batch mixing tasks prefills as one rectangular tensor only because
+        substitution never changes the length; the strategy asserts it, and this
+        pins the property the assert relies on."""
+        cfg = _multilingual_config()
+        n = len(cfg.sot_sequence())
+        for task in (None, "transcribe", "translate"):
+            for lang in (None, "en", "fr", "de"):
+                assert len(cfg.sot_sequence(task=task, language=lang)) == n
+
+    def test_unknown_language_names_the_known_ones(self):
+        cfg = _multilingual_config()
+        with pytest.raises(ValueError, match="unknown language"):
+            cfg.sot_sequence(language="xx")
+        with pytest.raises(ValueError, match="unknown task"):
+            cfg.sot_sequence(task="summarize")
+
+    def test_a_checkpoint_without_the_slot_says_so(self):
+        """An English-only Whisper has no language token at all.  Quietly
+        decoding under the checkpoint's own language instead would return a
+        confident transcript in the wrong one."""
+        cfg = _multilingual_config(
+            forced_decoder_ids=[(1, 55), (2, 59)],  # task + notimestamps, no language
+        )
+        assert cfg.sot_sequence(task="translate") == [60, 56, 59]
+        with pytest.raises(ValueError, match="no language slot"):
+            cfg.sot_sequence(language="fr")
+
+    def test_a_checkpoint_converted_before_the_tables_existed(self):
+        """Old native checkpoints carry empty tables; the message has to say
+        what to do rather than report an unknown language."""
+        cfg = _tiny_config()
+        with pytest.raises(ValueError, match="no task token table"):
+            cfg.sot_sequence(task="translate")
+        with pytest.raises(ValueError, match="no language token table"):
+            cfg.sot_sequence(language="fr")
+
+    # -- strategy-level validation + per-row prefill ------------------------
+
+    @staticmethod
+    def _strategy(cfg=None):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.decode.aed import AedDecodeStrategy
+        from oasr.engine.decode.detokenize import Detokenizer
+
+        model = WhisperModel(cfg or _multilingual_config()).eval()
+        return AedDecodeStrategy(EngineConfig(ckpt_dir="x"), Detokenizer(None, None), model)
+
+    def test_validate_options_resolves_against_the_checkpoint(self):
+        from oasr.engine.request import DecodingOptions
+
+        strat = self._strategy()
+        strat.validate_options(DecodingOptions(task="translate", language="fr"))
+        strat.validate_options(None)
+        strat.validate_options(DecodingOptions())
+        with pytest.raises(ValueError, match="unknown language"):
+            strat.validate_options(DecodingOptions(language="xx"))
+
+    def test_a_family_without_the_control_rejects_the_option(self):
+        """Rule: an option that changes *what is decoded* must never be
+        accepted and ignored.  CTC has no task or language token, so it says so
+        instead of transcribing as if nothing was asked."""
+        from oasr.engine.decode.base import DecodeStrategy
+        from oasr.engine.request import DecodingOptions
+
+        class _NoControl:
+            decode_type = "ctc"
+            selective_options = ()
+            validate_options = DecodeStrategy.validate_options
+
+        for opts in (DecodingOptions(task="translate"), DecodingOptions(language="fr")):
+            with pytest.raises(ValueError, match="cannot honour"):
+                _NoControl().validate_options(opts)
+        # Everything else stays accepted: a sampling knob a family ignores
+        # returns the same transcript, which is a performance surprise at worst.
+        _NoControl().validate_options(DecodingOptions(temperature=0.7, n_best=3))
+
+    def test_prefill_builds_one_prompt_row_per_request(self):
+        from oasr.engine.request import DecodingOptions, Request
+
+        strat = self._strategy()
+        default = Request(audio=torch.zeros(16000), streaming=False)
+        translate = Request(
+            audio=torch.zeros(16000),
+            streaming=False,
+            decoding=DecodingOptions(task="translate", language="fr"),
+        )
+        assert strat._prompt_for(default) == [60, 50, 55, 59]
+        assert strat._prompt_for(translate) == [60, 51, 56, 59]
+        # Cached by (task, language), not rebuilt per request.
+        assert strat._prompt_for(translate) is strat._prompt_for(translate)
+
+    def test_prefill_mixes_tasks_in_one_batch(self):
+        from oasr.engine.request import DecodingOptions, Request
+
+        strat = self._strategy()
+        cfg = strat._mcfg
+        requests = [
+            Request(audio=torch.zeros(16000), streaming=False),
+            Request(
+                audio=torch.zeros(16000),
+                streaming=False,
+                decoding=DecodingOptions(task="translate"),
+            ),
+        ]
+        enc = torch.randn(2, cfg.max_source_positions, cfg.d_model)
+        prefill = strat._prefill(requests, enc, torch.tensor([enc.size(1)] * 2))
+        # Two rows prefilled together despite different prompts — the point of
+        # keeping the substitution length-preserving.
+        assert prefill.logits.size(0) == 2
+
+
+# ---------------------------------------------------------------------------
 # Converter + registry + native round trip (real snapshot)
+# ---------------------------------------------------------------------------
+
+
+class TestControlTokenTables:
+    """Whisper's task / language ids are read from the tokenizer at conversion.
+
+    Hardcoding them would be wrong per release: large-v3 added a language and
+    shifted every id after it, so a table pinned to v2's numbering would select
+    the *neighbouring* language.
+    """
+
+    @staticmethod
+    def _tokenizer_json(tmp_path, added):
+        import json
+
+        p = tmp_path / "tokenizer.json"
+        p.write_text(json.dumps({"added_tokens": added}), encoding="utf-8")
+        return p
+
+    def test_tables_are_read_by_name_not_by_id(self, tmp_path):
+        from oasr.models.whisper.convert import _control_token_tables
+
+        # Ids deliberately unlike any real release.
+        added = [
+            {"id": 900, "content": "<|endoftext|>"},
+            {"id": 901, "content": "<|startoftranscript|>"},
+            {"id": 902, "content": "<|en|>"},
+            {"id": 903, "content": "<|fr|>"},
+            {"id": 904, "content": "<|yue|>"},
+            {"id": 950, "content": "<|translate|>"},
+            {"id": 951, "content": "<|transcribe|>"},
+            {"id": 952, "content": "<|notimestamps|>"},
+            {"id": 953, "content": "<|startoflm|>"},
+            {"id": 954, "content": "<|0.00|>"},
+        ]
+        tasks, languages = _control_token_tables(self._tokenizer_json(tmp_path, added))
+        assert tasks == {"translate": 950, "transcribe": 951}
+        # Only the language tags — every other control token is longer than
+        # three letters or is not letters at all.
+        assert languages == {"en": 902, "fr": 903, "yue": 904}
+
+    def test_a_missing_tokenizer_yields_empty_tables(self, tmp_path):
+        from oasr.models.whisper.convert import _control_token_tables
+
+        tasks, languages = _control_token_tables(tmp_path / "absent.json")
+        assert tasks == {} and languages == {}
+
+
 # ---------------------------------------------------------------------------
 
 

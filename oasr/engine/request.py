@@ -9,7 +9,7 @@ import enum
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Deque, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import ClassVar, Deque, Iterable, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -78,7 +78,24 @@ class DecodingOptions:
     prompt : str, optional
         Per-request user prompt for the speech-LLM strategy, overriding
         ``EngineConfig.llm_prompt`` / the checkpoint default.  Ignored by
-        every other family (Whisper's SOT sequence is checkpoint-fixed).
+        every other family (Whisper's SOT sequence is checkpoint-fixed apart
+        from the ``task`` / ``language`` slots below).
+    task : str, optional
+        ``"transcribe"`` or ``"translate"`` for the families whose prompt
+        carries a task token (Whisper AED).  ``None`` (default) keeps the
+        checkpoint's own task.  This is what backs OpenAI's
+        ``/v1/audio/translations``: before it existed the task was frozen in
+        the checkpoint's ``forced_decoder_ids`` at conversion time.
+    language : str, optional
+        ISO-639 primary subtag (``"en"``, ``"fr"``) for the families whose
+        prompt carries a language token.  ``None`` (default) keeps the
+        checkpoint's own.  The serving layer reduces a BCP-47 tag
+        (``"en-US"``) before it reaches here.
+
+    Both ``task`` and ``language`` are **validated against the running decode
+    family** at admission (:meth:`DecodeStrategy.validate_options`), so a
+    family that cannot honour them rejects the request instead of silently
+    transcribing under the checkpoint's default.
     """
 
     n_best: int = 1
@@ -87,6 +104,12 @@ class DecodingOptions:
     top_k: int = 0
     top_p: float = 1.0
     prompt: Optional[str] = None
+    task: Optional[str] = None
+    language: Optional[str] = None
+
+    #: Task values any family may declare support for.  Mirrored by
+    #: ``oasr_wire::TASKS`` on the other side of the PyO3 boundary.
+    TASKS: ClassVar[Tuple[str, ...]] = ("transcribe", "translate")
 
     def __post_init__(self) -> None:
         if self.n_best < 1:
@@ -111,6 +134,18 @@ class DecodingOptions:
             raise ValueError(f"top_k must be >= 0, got {self.top_k!r}")
         if not (0.0 < self.top_p <= 1.0):
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p!r}")
+        if self.task is not None and self.task not in self.TASKS:
+            raise ValueError(f"task must be one of {list(self.TASKS)}, got {self.task!r}")
+        if self.language is not None:
+            # Whether *this checkpoint* knows the language is the strategy's
+            # question; the shape is this one's.  A tag that still carries a
+            # region ("en-US") would miss the token table and decode in the
+            # checkpoint's default language, confidently.
+            if not self.language.isalpha() or not self.language.islower():
+                raise ValueError(
+                    "language must be a lowercase ISO-639 primary subtag such "
+                    f'as "en", got {self.language!r}'
+                )
 
     @property
     def sampling(self) -> bool:

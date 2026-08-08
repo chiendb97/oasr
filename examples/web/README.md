@@ -4,42 +4,49 @@ A browser demo for OASR: upload a file or record from the microphone, pick **off
 **streaming** mode, and see the transcript.
 
 ```
-Browser ──HTTP / WebSocket──▶ FastAPI bridge (server.py) ──gRPC──▶ oasr-server
+Browser ──HTTP / WebSocket──▶ oasr-server
 ```
 
-The bridge exists because a web page cannot speak gRPC and the server sends no CORS headers.
-`server.py` serves this page *and* relays to OASR, so everything is same-origin: `POST
-/api/recognize` for offline, `WS /api/stream` for streaming.
+There is no bridge process. The page talks to `oasr-server` directly:
+
+| Mode | Call |
+|---|---|
+| Offline | `POST /v1/audio/transcriptions` — the file is uploaded **as-is**; the server decodes MP3 / M4A / FLAC / OGG / WAV |
+| Streaming | `WS /v1/realtime` — a `session.update` frame, then binary PCM chunks, then `input_audio_buffer.commit` |
 
 ## Run it
 
 ```bash
-# 1. An OASR server — one streaming server serves both demo modes
-oasr-server --ckpt-dir /path/to/ckpt --service-mode streaming --grpc-bind 127.0.0.1:50051
+# 1. An OASR server, with this page's origin allowed
+oasr-server --ckpt-dir /path/to/ckpt --service-mode streaming \
+            --http-bind 127.0.0.1:8080 --cors-allow-origin '*'
 
-# 2. The bridge
-pip install -r examples/web/requirements.txt
-python examples/web/server.py
+# 2. Any static file server for the page
+python -m http.server 8000 --directory examples/web/static
 
 # 3. Open http://localhost:8000
 ```
 
-> **Microphone needs a secure context** — HTTPS, or `localhost` / `127.0.0.1`. On a bare LAN
-> address over plain HTTP the browser hides `getUserMedia` entirely. File upload works everywhere.
-> For a remote bridge, forward the port (`ssh -L 8000:localhost:8000 <user>@<host>`) or serve TLS
-> with `--ssl-certfile` / `--ssl-keyfile`.
+Both modes work against either `--service-mode`. A `streaming` server decodes as the audio
+arrives; an `offline` one buffers the utterance and streams the *text* back, so a speech-LLM
+still fills in token by token.
 
-`python examples/web/server.py --help` lists every flag — bind address, upstream addresses,
-`--chunk-ms`, TLS, logging. See `docs/serving.md` for the OASR server itself.
+Point the page at another server with `?server=`:
+`http://localhost:8000/?server=http://gpu-box:8080`.
 
 ## Notes
 
-- Offline mode pushes the whole clip through `StreamingRecognize` and shows only the final
-  transcript. To use the unary `Recognize` RPC instead, run a second `--service-mode offline`
-  server and point `--offline-addr` at it.
-- Streaming + upload paces the file through at ~realtime, so partials stream in as they would live.
-- Every hop is traced under one correlation id, also returned as the `x-oasr-trace` response
-  header; `--log-level debug` adds per-chunk detail, `--log-file PATH` mirrors it to a file.
-- Audio is normalized in-browser to 16 kHz mono little-endian f32 PCM (`LINEAR32F`), the format the
-  gRPC RPCs expect. Stubs are compiled at startup from `rust/proto/oasr_speech_v1.proto`.
-- CLI equivalents: `examples/recognize/grpc_client.py`, `examples/recognize/http_client.py`.
+- **`--cors-allow-origin` is required** and off by default. Whether an inference endpoint
+  should be callable from any page is an operator's decision, so it is never a default.
+  `'*'` is fine for a local demo; name the real origin in production.
+- **Microphone needs a secure context** — HTTPS, or `localhost` / `127.0.0.1`. On a bare LAN
+  address over plain HTTP the browser hides `getUserMedia` entirely. File upload works
+  everywhere. For a remote machine, forward the port
+  (`ssh -L 8000:localhost:8000 -L 8080:localhost:8080 <user>@<host>`).
+- Streaming + upload paces the file through at ~realtime, so partials stream in as they would
+  live. Mic audio is captured as 16 kHz mono `LINEAR32F`, which is what the session declares.
+- Interim events carry both `delta` (the increment) and `text` (the transcript so far); the
+  page renders `text`, so a revised partial replaces rather than appends.
+- CLI equivalents: `oasr transcribe file.mp3`, `examples/recognize/http_client.py`,
+  `examples/recognize/grpc_client.py`. In-process (no server):
+  `examples/recognize/local_engine.py`.

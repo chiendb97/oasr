@@ -30,7 +30,9 @@ OASR is flexible and easy to use with:
 - Seven architectures across five decode families — CTC, RNN-T, AED, NAR (CIF), and speech-LLM
 - Checkpoints load directly from Hugging Face, WeNet, icefall, and FunASR — no conversion step
 - Decoders: CTC greedy and prefix beam, GPU WFST beam search, transducer and AED greedy/beam, CTC+AED rescoring
-- A production Rust frontend with HTTP and gRPC APIs
+- A production Rust frontend with **OpenAI-compatible** HTTP, a realtime WebSocket, and gRPC
+- Real-world audio in: MP3, M4A/AAC, FLAC, OGG, WAV, AIFF and G.711 telephony, at any sample rate
+- An `oasr` CLI and a Python client, so nothing needs writing to try it
 
 ## Supported Models
 
@@ -113,6 +115,23 @@ native format.
 
 ## Quick Start
 
+### From the command line
+
+```bash
+# Against a running server (see Serving below)
+oasr transcribe meeting.mp3
+oasr translate  entretien.m4a --language fr
+oasr transcribe talk.wav --response-format srt -o talk.srt
+
+# Or in-process, no server at all
+oasr transcribe meeting.mp3 --ckpt-dir /path/to/checkpoint
+```
+
+MP3, M4A, FLAC, OGG, WAV, AIFF and G.711 telephony audio all work as-is — no transcoding, and any
+sample rate is resampled to the model's.
+
+### From Python
+
 An engine is pinned to one mode for its lifetime by `EngineConfig.service_mode` — `"streaming"` (the
 default) or `"offline"`.
 
@@ -151,7 +170,9 @@ engine.feed_chunk(rid, last_chunk, is_last=True)
 final = engine.run()
 ```
 
-See [`docs/engine.md`](docs/engine.md) for the step loop, batching, and the full `EngineConfig`.
+See [`docs/engine.md`](docs/engine.md) for the step loop, batching, and the full `EngineConfig`, and
+[`examples/recognize/local_engine.py`](examples/recognize/local_engine.py) for a runnable version of
+the above.
 
 ---
 
@@ -172,27 +193,33 @@ oasr-server \
 
 | Surface | Endpoint                                       | Purpose                                  |
 |---------|------------------------------------------------|------------------------------------------|
-| HTTP    | `POST /v1/speech:recognize`                    | Synchronous unary recognition (offline). |
+| HTTP    | `POST /v1/audio/transcriptions`                | **OpenAI-compatible** upload. Any container; `json`/`text`/`srt`/`vtt`/`verbose_json`; SSE with `stream=true`. |
+| HTTP    | `POST /v1/audio/translations`                  | The same, translating to English (Whisper-family). |
+| HTTP    | `GET /v1/realtime`                             | **WebSocket** streaming transcription.   |
+| HTTP    | `POST /v1/speech:recognize`                    | Google-STT-shaped unary; raw body, config in the query string — the fastest HTTP path. |
 | HTTP    | `GET /v1/models`                               | Loaded model metadata.                   |
 | HTTP    | `GET /healthz` / `/readyz` / `/metrics`        | Liveness, readiness, Prometheus metrics. |
 | gRPC    | `oasr.speech.v1.Speech/Recognize`              | Synchronous unary (offline mode).        |
 | gRPC    | `oasr.speech.v1.Speech/StreamingRecognize`     | Bidi streaming (streaming mode).         |
 | gRPC    | `grpc.health.v1.Health/Check` and `Watch`      | Standard gRPC health checking.           |
 
-REST is synchronous only — streaming clients must use the gRPC `StreamingRecognize` RPC.
-
-### HTTP example
-
-Audio is carried inline as base64 in `audio.content` (`WAV`, `LINEAR16`, or `LINEAR32F`).
+### Point an existing client at it
 
 ```bash
-B64=$(base64 -w0 audio.wav)
-curl -sS -X POST http://127.0.0.1:8080/v1/speech:recognize \
-     -H 'Content-Type: application/json' \
-     -d "$(jq -n --arg b64 "$B64" \
-           '{config:{encoding:"WAV",sampleRateHertz:16000,languageCode:"en-US"},
-             audio:{content:$b64}}')"
+curl -sS http://127.0.0.1:8080/v1/audio/transcriptions \
+     -F file=@meeting.mp3 -F model=whisper-1
+# {"text": "..."}
 ```
+
+```python
+from openai import OpenAI                              # or: from oasr.client import OASRClient
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+client.audio.transcriptions.create(model="whisper-1", file=open("meeting.mp3", "rb")).text
+```
+
+Streaming has three transports: the `/v1/realtime` WebSocket (browsers and scripts), SSE via
+`stream=true`, and the gRPC `StreamingRecognize` RPC (lowest overhead).
+[`examples/web`](examples/web) is a browser client against the first.
 
 ### gRPC streaming
 

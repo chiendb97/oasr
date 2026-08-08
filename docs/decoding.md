@@ -158,8 +158,53 @@ at the PyO3 boundary.
 | `max_new_tokens` | AR families |
 | `temperature`, `top_k`, `top_p` | AR families, via `generation/sampling.py::select_next_tokens`; greedy stays a batched argmax fast path |
 | `prompt` | LLM only (memoized suffix re-encode); also settable deployment-wide as `EngineConfig.llm_prompt` |
+| `task` (`"transcribe"` / `"translate"`) | families with a task token — AED (Whisper). **Rejected** elsewhere |
+| `language` (ISO-639 primary subtag) | families with a language token — AED (Whisper). **Rejected** elsewhere |
 
 AR finals carry `RequestOutput.finish_reason` — `"stop"` or `"length"`.
+
+### Two classes of option
+
+Most options describe *how thoroughly* to decode. A family that ignores one
+returns the same transcript, so ignoring is a performance surprise at worst.
+
+`task` and `language` are different: they describe *what is decoded*. A family
+without the control that silently ignored them would return a transcript of
+something else — a different task, or a different language — with nothing in the
+response to say the request was not honoured.
+
+So a strategy declares what it can act on:
+
+```python
+class AedDecodeStrategy(IncrementalArStrategy):
+    selective_options: ClassVar[Tuple[str, ...]] = ("task", "language")
+```
+
+and `DecodeStrategy.validate_options` rejects anything set outside that list. It
+runs at admission (`ASREngine._admit_one_checked`), so the rejection is scoped to
+its own request rather than to the admit batch it was coalesced into. A family
+that *can* act on an option overrides the method to add the checkpoint-level
+check — whether *this* Whisper snapshot knows `<|yue|>` is a checkpoint question,
+and answering it at admission is what keeps an unknown language out of a prefill
+shared with unrelated requests.
+
+Adding a selective option to a family means listing it and, if the answer depends
+on the checkpoint, overriding `validate_options`. Nothing else changes.
+
+### How `task` / `language` reach the prompt
+
+Whisper's SOT sequence is `[<|startoftranscript|>, <|lang|>, <|task|>,
+<|notimestamps|>]`, built from `forced_decoder_ids` — i.e. **fixed when the
+checkpoint was converted**. `WhisperModelConfig.sot_sequence(task=, language=)`
+substitutes the corresponding slot, identifying it by the forced token *being* one
+of the checkpoint's known task/language ids (recorded by the converter from the
+tokenizer). Positions and ids move between Whisper releases — large-v3 added a
+language and shifted every id after it — so anything pinned to a number would
+select the neighbouring language, silently.
+
+Substitution is **length-preserving**, which is what lets a batch mixing tasks
+prefill as one rectangular tensor; `AedDecodeStrategy._prefill` keeps the single
+`expand` when no request overrode anything.
 
 `DecodingOptions` is mirrored by `oasr_wire::DecodingParams` on the Rust side, and
 the two key sets are asserted equal at engine startup

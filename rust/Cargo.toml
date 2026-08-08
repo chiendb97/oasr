@@ -38,6 +38,9 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
+# `stream!` — the SSE / delta loops read as straight-line async code with it and
+# as a hand-rolled state machine without.
+async-stream = "0.3"
 
 # Errors / logging
 anyhow = "1"
@@ -67,7 +70,9 @@ uuid = { version = "1", features = ["v4"] }
 parking_lot = "0.12"
 
 # HTTP / gRPC
-axum = { version = "0.7", features = ["macros"] }
+# `multipart` backs `POST /v1/audio/transcriptions`; `ws` backs the realtime
+# endpoint that replaces the FastAPI bridge `examples/web` used to need.
+axum = { version = "0.7", features = ["macros", "multipart", "ws"] }
 base64 = "0.22"
 # `limit` gives ConcurrencyLimitLayer (bounds how many multi-MiB bodies are
 # in flight); tower-http's `timeout` gives the per-request deadline.
@@ -82,6 +87,25 @@ hyper = { version = "1", features = ["full"] }
 
 # Audio
 hound = "3.5"
+# Compressed containers/codecs (MP3, FLAC, AAC/M4A, OGG-Vorbis, ALAC, CAF,
+# AIFF, MKV/WebM).  Pure Rust — no C library, so it does not change the build
+# requirements.  `opt-simd` is dropped: it is nightly-only in symphonia and the
+# decode cost is already negligible next to the GPU step.
+symphonia = { version = "0.6", default-features = false, features = [
+    "aac",
+    "adpcm",
+    "aiff",
+    "alac",
+    "caf",
+    "flac",
+    "isomp4",
+    "mkv",
+    "mp3",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
 # Sinc resampling for client audio that is not at the model's sample rate.
 # `default-features = false` drops the optional FFT resampler (and with it the
 # realfft / num-complex / rustfft tree) — the async sinc resampler is the only

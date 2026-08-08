@@ -8,15 +8,16 @@
 //
 // Differences from Google STT v1:
 // - No `LongRunningRecognize` (we do not expose async operations).
-// - `AudioEncoding` only honors LINEAR16, LINEAR32F (custom), and WAV (custom).
-//   Other values are reserved for source-compatibility but return
-//   `UNIMPLEMENTED`.
+// - `AudioEncoding` honors LINEAR16, MULAW, FLAC, MP3 and the OASR extensions
+//   LINEAR32F, WAV, ALAW, M4A, AIFF and AUTO.  AMR, AMR_WB, SPEEX and both
+//   Opus codings return `UNIMPLEMENTED` (there is no pure-Rust Opus decoder;
+//   see docs/serving.md).
 // - `RecognitionConfig.priority` is a non-Google extension preserved for
 //   parity with the previous OASR API.
 // - `RecognitionConfig.max_new_tokens` / `temperature` / `top_k` / `top_p` /
-//   `prompt` are non-Google extensions mapped to the engine's per-request
-//   DecodingOptions (autoregressive decode families only — AED / speech-LLM;
-//   frame-synchronous CTC ignores them).
+//   `prompt` / `task` are non-Google extensions mapped to the engine's
+//   per-request DecodingOptions (autoregressive decode families only — AED /
+//   speech-LLM; frame-synchronous CTC ignores them).
 // - `SpeechRecognitionAlternative.tokens` is a non-Google extension that
 //   carries the raw CTC token IDs alongside the transcript.
 // - `SpeechRecognitionAlternative.confidence` is the softmax-normalized
@@ -32,8 +33,12 @@
 //   n-best hypotheses (beam decode families).
 // - `SpeechRecognitionResult.finish_reason` (extension field 101) reports
 //   "stop" / "length" for the autoregressive decode families.
-// - `language_code`, `model`, `audio_channel_count`, `single_utterance`,
-//   `speech_event_type` are accepted but not honored.
+// - `language_code` is honored by the decode families that can act on it
+//   (Whisper AED: it selects the language token). A BCP-47 tag is accepted and
+//   its primary subtag used ("en-US" -> "en"). Families with no language
+//   control reject a set `language_code` rather than ignoring it.
+// - `model`, `audio_channel_count`, `single_utterance`, `speech_event_type`
+//   are accepted but not honored.
 
 syntax = "proto3";
 
@@ -56,26 +61,36 @@ service Speech {
 // ---------------------------------------------------------------------------
 
 message RecognitionConfig {
-    // Audio encoding.  Only LINEAR16, LINEAR32F, and WAV are honored;
-    // other values are reserved for source-compatibility with Google STT v1
-    // and return `UNIMPLEMENTED` if used.
+    // Audio encoding.  Values marked "not implemented" return `UNIMPLEMENTED`;
+    // they are kept for source-compatibility with Google STT v1.
     enum AudioEncoding {
         ENCODING_UNSPECIFIED = 0;
         LINEAR16             = 1;   // little-endian 16-bit signed PCM (mono)
-        FLAC                 = 2;   // reserved, not implemented
-        MULAW                = 3;   // reserved, not implemented
-        AMR                  = 4;   // reserved, not implemented
-        AMR_WB               = 5;   // reserved, not implemented
-        OGG_OPUS             = 6;   // reserved, not implemented
-        SPEEX_WITH_HEADER_BYTE = 7; // reserved, not implemented
-        WEBM_OPUS            = 9;   // reserved, not implemented
+        FLAC                 = 2;   // FLAC container
+        MULAW                = 3;   // ITU-T G.711 µ-law, 1 byte/sample
+        AMR                  = 4;   // not implemented
+        AMR_WB               = 5;   // not implemented
+        OGG_OPUS             = 6;   // not implemented (no pure-Rust Opus decoder)
+        SPEEX_WITH_HEADER_BYTE = 7; // not implemented
+        MP3                  = 8;   // MPEG audio, bare or ID3-tagged
+        WEBM_OPUS            = 9;   // not implemented (no pure-Rust Opus decoder)
         // OASR extensions in the reserved enum range:
         LINEAR32F            = 100; // little-endian 32-bit float PCM (mono)
         WAV                  = 101; // RIFF/WAV container
+        ALAW                 = 102; // ITU-T G.711 A-law, 1 byte/sample
+        M4A                  = 103; // ISO/MP4 container (AAC or ALAC)
+        AIFF                 = 104; // AIFF/AIFC container
+        // Sniff the container from the body's own header.  The right choice
+        // for a client relaying files it did not create; the named values
+        // exist so a *headerless* body can still be described.
+        AUTO                 = 105;
     }
     AudioEncoding encoding             = 1;
     uint32        sample_rate_hertz    = 2;
-    string        language_code        = 3;  // accepted, ignored
+    // Honored by families with language control (Whisper AED); a BCP-47 tag is
+    // reduced to its primary subtag.  Families without it reject a set value
+    // rather than ignoring it.
+    string        language_code        = 3;
     uint32        max_alternatives     = 4;  // n-best transcripts (beam decode families)
     string        model                = 5;  // accepted, ignored (single model per process)
     uint32        audio_channel_count  = 6;  // accepted, ignored (mono only)
@@ -86,6 +101,10 @@ message RecognitionConfig {
     uint32        top_k                = 103; // 0 = disabled
     float         top_p                = 104; // 0 = disabled (i.e. 1.0)
     string        prompt               = 105; // speech-LLM user prompt override
+    // "transcribe" (default) or "translate" — Whisper's task token, which was
+    // previously frozen at checkpoint-conversion time.  Empty = the
+    // checkpoint's own task.  Backs `POST /v1/audio/translations`.
+    string        task                 = 106;
 }
 
 // ---------------------------------------------------------------------------

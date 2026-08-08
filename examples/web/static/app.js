@@ -1,13 +1,25 @@
 // Copyright 2024 OASR Authors / SPDX-License-Identifier: Apache-2.0
 //
-// Browser side of the OASR web demo.  Captures audio (file upload or mic) as
-// 16 kHz mono Float32 PCM and sends it to the same-origin bridge:
-//   - offline : POST /api/recognize  (whole clip)        -> JSON transcript
-//   - stream  : WS   /api/stream      (config + chunks)   -> partial/final
+// Browser side of the OASR web demo.  Talks to `oasr-server` **directly** —
+// there is no bridge process any more:
+//   - offline : POST {server}/v1/audio/transcriptions  (multipart upload)
+//   - stream  : WS   {server}/v1/realtime              (session + PCM frames)
+//
+// Uploads are sent as the original file, whatever container it is: the server
+// decodes MP3 / M4A / FLAC / OGG / WAV itself.  Only the streaming path decodes
+// in-browser, because a live session is chunked PCM by definition.
+//
+// The server must allow this page's origin:
+//   oasr-server --ckpt-dir ... --cors-allow-origin '*'
 "use strict";
 
 const TARGET_SR = 16000;
-let CHUNK_MS = 320; // overwritten from /api/info
+const CHUNK_MS = 320;
+
+// Where oasr-server listens.  Override with ?server=http://host:port — the page
+// is static, so it can be opened from anywhere and pointed at any server.
+const SERVER = (new URLSearchParams(location.search).get("server") ||
+                "http://127.0.0.1:8080").replace(/\/$/, "");
 
 // ---- DOM -------------------------------------------------------------------
 
@@ -109,39 +121,81 @@ async function decodeFileTo16k(file) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ---- offline (HTTP POST) ---------------------------------------------------
+// Wrap raw f32 PCM in a WAV container so mic audio can go through the same
+// upload endpoint as a file.  16 bytes of header work is cheaper than a second
+// code path.
+function wavFromFloat32(pcm, sampleRate) {
+  const buf = new ArrayBuffer(44 + pcm.length * 4);
+  const view = new DataView(buf);
+  const ascii = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+  ascii(0, "RIFF");
+  view.setUint32(4, 36 + pcm.length * 4, true);
+  ascii(8, "WAVEfmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 3, true);            // IEEE float
+  view.setUint16(22, 1, true);            // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 4, true);
+  view.setUint16(32, 4, true);
+  view.setUint16(34, 32, true);
+  ascii(36, "data");
+  view.setUint32(40, pcm.length * 4, true);
+  new Float32Array(buf, 44).set(pcm);
+  return new Blob([buf], { type: "audio/wav" });
+}
 
-async function postOffline(pcm) {
-  const resp = await fetch(`/api/recognize?sample_rate=${TARGET_SR}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/octet-stream" },
-    body: pcm.buffer,
-  });
+// ---- offline (OpenAI-compatible upload) ------------------------------------
+
+async function postOffline(fileOrBlob, filename) {
+  const form = new FormData();
+  form.append("file", fileOrBlob, filename || fileOrBlob.name || "audio.wav");
+  form.append("response_format", "json");
+  const resp = await fetch(`${SERVER}/v1/audio/transcriptions`, { method: "POST", body: form });
   let data;
   try { data = await resp.json(); } catch { data = {}; }
-  if (!resp.ok || data.error) {
-    throw new Error(data.error || `HTTP ${resp.status}`);
+  if (!resp.ok) {
+    throw new Error((data.error && data.error.message) || `HTTP ${resp.status}`);
   }
-  return data.transcript || "";
+  return data.text || "";
 }
 
 // ---- streaming (WebSocket) -------------------------------------------------
 
 function openStream(onFinalClose) {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/api/stream`);
+  const ws = new WebSocket(SERVER.replace(/^http/, "ws") + "/v1/realtime");
   ws.binaryType = "arraybuffer";
   ws.onmessage = (ev) => {
     let m;
     try { m = JSON.parse(ev.data); } catch { return; }
-    if (m.type === "partial") setPartial(m.transcript);
-    else if (m.type === "final") commitFinal(m.transcript);
-    else if (m.type === "error") setStatus("Server error: " + m.error, "error");
-    else if (m.type === "done") { try { ws.close(); } catch {} }
+    // `delta` is the increment; `text` is the transcript so far, which is what
+    // a caption line wants — a revised partial arrives with an empty delta.
+    if (m.type && m.type.endsWith("input_audio_transcription.delta")) {
+      setPartial(m.text !== undefined ? m.text : m.delta);
+    } else if (m.type && m.type.endsWith("input_audio_transcription.completed")) {
+      commitFinal(m.transcript);
+      try { ws.close(); } catch {}
+    } else if (m.type === "error") {
+      setStatus("Server error: " + ((m.error && m.error.message) || "unknown"), "error");
+    }
   };
-  ws.onerror = () => setStatus("WebSocket error (is the bridge running?)", "error");
+  ws.onerror = () => setStatus(
+    `WebSocket error — is oasr-server running at ${SERVER} with --cors-allow-origin?`, "error");
   ws.onclose = () => onFinalClose && onFinalClose();
   return ws;
+}
+
+// The session frame the realtime endpoint expects before any audio.
+function startSession(ws) {
+  ws.send(JSON.stringify({
+    type: "session.update",
+    session: { sample_rate: TARGET_SR, encoding: "LINEAR32F", interim_results: true },
+  }));
+}
+
+function commitSession(ws) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+  }
 }
 
 function wsReady(ws) {
@@ -155,10 +209,10 @@ function wsReady(ws) {
 // ---- file flows ------------------------------------------------------------
 
 async function runFileOffline(file) {
-  setStatus("Decoding…", "busy");
-  const pcm = await decodeFileTo16k(file);
+  // No in-browser decode: the server reads the container itself, so an MP3 or
+  // an M4A voice memo is uploaded exactly as it sits on disk.
   setStatus("Transcribing…", "busy");
-  const text = await postOffline(pcm);
+  const text = await postOffline(file);
   setOffline(text);
   setStatus(text ? "Done." : "Done (empty transcript).", "ok");
 }
@@ -171,14 +225,14 @@ async function runFileStreaming(file) {
     const ws = openStream(resolve);
     ws.addEventListener("open", async () => {
       setStatus("Streaming…", "busy");
-      ws.send(JSON.stringify({ sample_rate: TARGET_SR, interim: true }));
+      startSession(ws);
       const step = Math.max(1, Math.floor((TARGET_SR * CHUNK_MS) / 1000));
       for (let i = 0; i < pcm.length; i += step) {
         if (ws.readyState !== WebSocket.OPEN) break;
         ws.send(pcm.slice(i, i + step).buffer);
         await sleep(CHUNK_MS); // pace ~realtime so partials are visible
       }
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "eof" }));
+      commitSession(ws);
     }, { once: true });
   });
   setStatus("Done.", "ok");
@@ -260,9 +314,7 @@ async function startMic() {
   if (mode === "streaming") {
     micWs = openStream(() => {});
     await wsReady(micWs).catch(() => {});
-    if (micWs.readyState === WebSocket.OPEN) {
-      micWs.send(JSON.stringify({ sample_rate: TARGET_SR, interim: true }));
-    }
+    if (micWs.readyState === WebSocket.OPEN) startSession(micWs);
   }
 
   proc.onaudioprocess = (e) => {
@@ -297,15 +349,14 @@ async function stopMic() {
   try { await micCtx.close(); } catch {}
 
   if (mode === "streaming") {
-    if (micWs && micWs.readyState === WebSocket.OPEN) {
-      micWs.send(JSON.stringify({ type: "eof" }));
-    }
+    if (micWs) commitSession(micWs);
     setStatus("Finishing…", "busy");
   } else {
     setBusy(true);
     try {
       setStatus("Transcribing…", "busy");
-      const text = await postOffline(mergeFloat32(micChunks));
+      const wav = wavFromFloat32(mergeFloat32(micChunks), TARGET_SR);
+      const text = await postOffline(wav, "recording.wav");
       setOffline(text);
       setStatus(text ? "Done." : "Done (empty transcript).", "ok");
     } catch (err) {
@@ -360,10 +411,19 @@ recordBtn.addEventListener("click", () => { recording ? stopMic() : startMic(); 
 // ---- init ------------------------------------------------------------------
 
 (async function init() {
+  const serverEl = document.getElementById("server-url");
+  if (serverEl) serverEl.textContent = SERVER;
+  // Fail early and specifically: "is the server up" and "did you allow this
+  // origin" are the only two things that go wrong here, and they look identical
+  // from a failed fetch inside a transcription.
   try {
-    const info = await (await fetch("/api/info")).json();
-    if (info.chunk_ms) CHUNK_MS = info.chunk_ms;
-  } catch { /* keep defaults */ }
+    const resp = await fetch(`${SERVER}/v1/models`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  } catch {
+    setStatus(
+      `Cannot reach oasr-server at ${SERVER}. Start it with ` +
+      `--cors-allow-origin '*', or pass ?server=http://host:port.`, "error");
+  }
   const reason = micUnavailableReason();
   if (reason) setStatus(reason);
   refreshControls();

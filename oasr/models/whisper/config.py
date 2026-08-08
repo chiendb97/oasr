@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..base import BaseModelConfig
 
@@ -44,15 +44,76 @@ class WhisperModelConfig(BaseModelConfig):
     suppress_tokens: List[int] = field(default_factory=list)
     # Token ids suppressed only at the first *generated* step.
     begin_suppress_tokens: List[int] = field(default_factory=list)
+    # ``{"transcribe": id, "translate": id}`` and ``{"en": id, ...}``, read off
+    # the checkpoint's tokenizer by the converter.  They exist so the task and
+    # language slots of the SOT prompt can be set **per request** instead of
+    # being frozen at conversion time — which is what blocked
+    # ``POST /v1/audio/translations``.  Empty on a checkpoint converted before
+    # they existed: the per-request options then fail loudly rather than
+    # decoding under the checkpoint's own task.
+    task_token_ids: Dict[str, int] = field(default_factory=dict)
+    language_token_ids: Dict[str, int] = field(default_factory=dict)
 
     @property
     def head_dim(self) -> int:
         return self.d_model // self.encoder_attention_heads
 
-    def sot_sequence(self) -> List[int]:
+    def sot_sequence(self, task: Optional[str] = None, language: Optional[str] = None) -> List[int]:
         """The decoder prompt: ``<|startoftranscript|>`` + forced ids in
-        position order (language, task, ``<|notimestamps|>``)."""
+        position order (language, task, ``<|notimestamps|>``).
+
+        ``task`` / ``language`` substitute the corresponding slot.  A slot is
+        identified by the forced token *being* one of the known task/language
+        ids, so this works for any Whisper-family checkpoint without hardcoding
+        an id or a position — those move between multilingual releases.
+
+        Raises :class:`ValueError` when the checkpoint has no such slot (an
+        English-only Whisper has no language token at all) or does not know the
+        requested value.  Returning the default prompt instead would transcribe
+        in the wrong language, or transcribe when translation was asked for,
+        with nothing in the response to say so.
+        """
         prompt = [self.decoder_start_token_id]
+        task_ids = set(self.task_token_ids.values())
+        lang_ids = set(self.language_token_ids.values())
+        want_task = self._resolve(task, self.task_token_ids, "task")
+        want_lang = self._resolve(language, self.language_token_ids, "language")
+        placed_task = placed_lang = False
         for _pos, tok in sorted(self.forced_decoder_ids, key=lambda pt: pt[0]):
-            prompt.append(int(tok))
+            tok = int(tok)
+            if want_lang is not None and tok in lang_ids:
+                tok, placed_lang = want_lang, True
+            elif want_task is not None and tok in task_ids:
+                tok, placed_task = want_task, True
+            prompt.append(tok)
+        if want_task is not None and not placed_task:
+            raise ValueError(
+                f"this checkpoint's decoder prompt has no task slot, so task={task!r} "
+                "cannot be applied (an English-only Whisper is transcribe-only)"
+            )
+        if want_lang is not None and not placed_lang:
+            raise ValueError(
+                f"this checkpoint's decoder prompt has no language slot, so "
+                f"language={language!r} cannot be applied (an English-only Whisper "
+                "has no language token)"
+            )
         return prompt
+
+    @staticmethod
+    def _resolve(value: Optional[str], table: Dict[str, int], what: str) -> Optional[int]:
+        """``value`` → its token id, or a message naming what is available."""
+        if value is None:
+            return None
+        if not table:
+            raise ValueError(
+                f"this checkpoint carries no {what} token table, so {what}={value!r} "
+                "cannot be applied; re-run `oasr-convert` to record it"
+            )
+        try:
+            return int(table[value])
+        except KeyError:
+            known = sorted(table)
+            shown = known if len(known) <= 12 else known[:12] + ["..."]
+            raise ValueError(
+                f"unknown {what} {value!r} for this checkpoint; known: {shown}"
+            ) from None

@@ -59,6 +59,9 @@ oasr-server \
     --ckpt-dir /path/to/wenet/ckpt \
     --service-mode offline \
     --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051
+
+# Transcribe something
+oasr transcribe meeting.mp3
 ```
 
 `--ckpt-dir` takes the same sources as `EngineConfig.ckpt_dir`: a directory in
@@ -75,12 +78,59 @@ engine](#streaming-text-out-of-an-offline-engine).
 > server as the `rust/target/release/oasr-server` binary; substitute that path
 > for `oasr-server` in the commands below if you go that route.
 
+## Clients
+
+### The `oasr` command
+
+```bash
+oasr transcribe meeting.mp3                        # against a running server
+oasr transcribe meeting.mp3 --ckpt-dir ./ckpt      # in-process, no server
+oasr translate  entretien.m4a --language fr
+oasr transcribe talk.wav --response-format srt -o talk.srt
+oasr models
+oasr serve --ckpt-dir ./ckpt                       # forwards to oasr-server
+oasr convert /path/to/wenet /path/to/native        # forwards to oasr-convert
+```
+
+`--ckpt-dir` switches from "call a server" to "load the engine in this process",
+which is the path `examples/recognize/local_engine.py` spells out; everything
+else uses `--url` (default `http://127.0.0.1:8080`).
+
+### `oasr.client`
+
+```python
+from oasr.client import OASRClient
+
+client = OASRClient("http://127.0.0.1:8080")
+print(client.transcribe("meeting.mp3").text)
+print(client.translate("entretien.m4a", language="fr").text)
+```
+
+and, for live audio, an async iterator over `/v1/realtime`:
+
+```python
+from oasr.client import AsyncOASRClient
+
+async with AsyncOASRClient("http://127.0.0.1:8080") as client:
+    async for event in client.stream(mic_chunks(), sample_rate=16000):
+        print(event.text, end="\n" if event.is_final else "\r")
+```
+
+`chunks` is any (async) iterable of raw PCM; frames go out as binary, skipping
+base64. Both clients need the `serving` extra (`pip install "oasr[serving]"`).
+
+An existing **OpenAI client** works too — see
+[`POST /v1/audio/transcriptions`](#post-v1audiotranscriptions).
+
 ## API surface
 
 | Surface | Path / Service | Notes |
 |---|---|---|
-| HTTP | `POST /v1/speech:recognize` | Synchronous unary recognition (offline mode). Raw PCM body, config in the query string (no base64/JSON). |
-| HTTP | `GET /v1/models` | Loaded model metadata. |
+| HTTP | `POST /v1/audio/transcriptions` | **OpenAI-compatible** multipart upload. Any supported container; `json` / `text` / `srt` / `vtt` / `verbose_json`; `stream=true` for SSE. |
+| HTTP | `POST /v1/audio/translations` | The same, forcing `task=translate` (Whisper-family checkpoints). |
+| HTTP | `GET /v1/realtime` | **WebSocket** streaming transcription. Binary PCM frames or base64; OpenAI realtime-transcription event names. |
+| HTTP | `POST /v1/speech:recognize` | Google-STT-shaped unary recognition (offline mode). Raw body, config in the query string — the lowest-overhead HTTP path. |
+| HTTP | `GET /v1/models` | Loaded model metadata, in OpenAI's list shape. |
 | HTTP | `GET /healthz` | Process liveness. |
 | HTTP | `GET /readyz` | 200 once the engine dispatcher has produced its first Pong. |
 | HTTP | `GET /metrics` | Prometheus exposition. |
@@ -88,14 +138,164 @@ engine](#streaming-text-out-of-an-offline-engine).
 | gRPC | `oasr.speech.v1.Speech/StreamingRecognize` | Bidi streaming. In `streaming` mode audio is fed to the engine chunk by chunk; in `offline` mode audio is buffered until half-close and the **text** streams back (token streaming for AR families). |
 | gRPC | `grpc.health.v1.Health/Check` and `Watch` | Standard gRPC health checking. |
 
-REST is sync only — there is **no HTTP streaming endpoint** (no WebSocket, no
-SSE).  Streaming clients must use the gRPC `StreamingRecognize` RPC, matching
-the Google STT v1 contract.
+**Two request shapes, one engine.** The OpenAI-shaped routes exist because
+every ASR client library, LLM app framework and "swap the endpoint" migration
+already speaks them — pointing existing code at OASR is a base-URL change. The
+Google-shaped route is unchanged and remains the fastest HTTP path (no
+multipart framing, no container parse). Both are thin adapters over the same
+engine handles; neither is privileged.
 
-The previous Whisper-compat (`POST /v1/audio/transcriptions`) and native
-binary (`POST /v1/transcriptions`) endpoints have been removed.
+## HTTP — the OpenAI-compatible surface
 
-## HTTP
+### `POST /v1/audio/transcriptions`
+
+A multipart upload, exactly as OpenAI's audio API takes it:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/audio/transcriptions \
+     -F file=@meeting.mp3 \
+     -F model=whisper-1 \
+     -F response_format=json | jq
+# {"text": "..."}
+```
+
+and from an existing OpenAI client, unchanged apart from the base URL:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+print(client.audio.transcriptions.create(model="whisper-1", file=open("a.mp3", "rb")).text)
+```
+
+| Field | Meaning |
+|---|---|
+| `file` | **Required.** The audio, in any [supported container](#audio-formats). |
+| `model` | Accepted and ignored unless `--served-model-name` is set, in which case an unknown name is `404`. One process serves one model. |
+| `language` | Source language. BCP-47 (`en-US`) or ISO-639 (`en`); reduced to the primary subtag. Honored by families with a language control (Whisper); **rejected** by families without one, rather than ignored. |
+| `prompt` | Prompt override for the speech-LLM family. |
+| `response_format` | `json` (default) · `text` · `srt` · `vtt` · `verbose_json`. |
+| `temperature` | `0` (default) is greedy; `> 0` samples (AR families). |
+| `timestamp_granularities[]` | `segment` is served; `word` returns `501` — see below. |
+| `stream` | `true` streams the transcript as SSE (`json` / `text` formats only). |
+
+**Two deliberate differences from OpenAI, both loud rather than silent:**
+
+* `timestamp_granularities[]=word` returns **`501 UNIMPLEMENTED`**. Word
+  alignment is a real gap (`.artifacts/architecture_review.md` H7); answering
+  without the `words` array a client asked for reads as "this audio had no
+  words".
+* `verbose_json` carries **one segment** spanning the utterance — no decode
+  family produces segment boundaries today — and omits `avg_logprob`,
+  `no_speech_prob` and `compression_ratio` rather than filling them with
+  plausible numbers. `end` is the last token's alignment when the family has one
+  (Paraformer CIF), the audio's duration otherwise. `request_id` and
+  `finish_reason` are OASR extensions.
+
+`srt` / `vtt` produce a single cue over that same span.
+
+### `POST /v1/audio/translations`
+
+Identical, minus `timestamp_granularities`, and it forces `task=translate`.
+`language` is the **source** language hint.
+
+This needs a checkpoint whose decode family has a task control — Whisper today.
+Anything else answers `400` naming the limitation instead of transcribing and
+calling the result a translation. Before OASR had a per-request `task`, the
+transcribe-vs-translate choice was frozen in the checkpoint's
+`forced_decoder_ids` at conversion time, which is why this route did not exist.
+
+### `stream=true` (server-sent events)
+
+```
+data: {"type":"transcript.text.delta","delta":"hello"}
+data: {"type":"transcript.text.delta","delta":" world"}
+data: {"type":"transcript.text.done","text":"hello world"}
+data: [DONE]
+```
+
+The engine's partials are cumulative and the protocol's `delta` is an
+increment, so each event carries what the partial *added*. A frame-synchronous
+family can revise a partial rather than extend it; such an update yields no
+delta, and `transcript.text.done` — always the complete text — settles it.
+
+Only `json` and `text` may stream: `srt`, `vtt` and `verbose_json` need the
+utterance's total duration, which does not exist until the last token.
+
+### `GET /v1/realtime` (WebSocket)
+
+Streaming transcription for clients that cannot speak gRPC — every browser, and
+most scripting clients. Event names follow OpenAI's realtime *transcription*
+session.
+
+Client → server:
+
+| Message | Meaning |
+|---|---|
+| `{"type":"session.update","session":{…}}` | Configure; honoured before the first audio. Keys: `sample_rate`, `encoding`, `language`, `task`, `prompt`, `interim_results`, `model`. |
+| `{"type":"input_audio_buffer.append","audio":"<base64>"}` | One audio chunk. |
+| *a binary frame* | The same chunk without base64 — a third fewer bytes and no JSON parse. |
+| `{"type":"input_audio_buffer.commit"}` | End of utterance. |
+
+Server → client:
+
+| Message | Meaning |
+|---|---|
+| `{"type":"transcription_session.created","session":{…}}` | Handshake, echoing the resolved configuration. |
+| `{"type":"conversation.item.input_audio_transcription.delta","delta":"…","text":"…"}` | Interim. `delta` is the increment; `text` (an OASR extension) is the transcript so far. |
+| `{"type":"conversation.item.input_audio_transcription.completed","transcript":"…"}` | Final. |
+| `{"type":"error","error":{…}}` | Terminal failure. |
+
+Configuration is optional — a client that opens the socket and starts sending
+16 kHz `LINEAR16` gets the defaults. The session takes **headerless PCM only**
+(`LINEAR16`, `LINEAR32F`, `MULAW`, `ALAW`): a container header arrives once, at
+the front of a stream whose chunks are decoded independently. Post containers to
+`/v1/audio/transcriptions`.
+
+Works in both service modes. A `streaming` engine consumes chunks as they
+arrive; an `offline` one buffers them and streams the *text* back, exactly as
+the gRPC surface does and for the same reason.
+
+**Browsers need CORS**, which is off by default:
+
+```bash
+oasr-server --ckpt-dir ... --cors-allow-origin 'https://app.example.com'
+oasr-server --ckpt-dir ... --cors-allow-origin '*'          # local demo
+```
+
+Whether an inference endpoint should be callable from any page is an operator's
+decision, so it is never a default. `examples/web` is a working browser client
+against these two endpoints; it used to ship a 731-line FastAPI relay because
+neither existed.
+
+## Audio formats
+
+The front-end decodes, downmixes to mono and resamples to the model's rate
+before anything crosses PyO3.
+
+| Family | Formats |
+|---|---|
+| Containers | WAV · FLAC · MP3 · AAC / M4A (ISO-MP4) · ALAC · OGG (Vorbis) · AIFF · CAF · MKV/WebM |
+| Headerless PCM | `LINEAR16` (i16-LE) · `LINEAR32F` (f32-LE) · `MULAW` · `ALAW` |
+| **Not supported** | **Opus** (in any container), AMR, AMR-WB, Speex |
+
+Opus is a **declared** gap, not an oversight: there is no pure-Rust decoder, and
+linking libopus would put a C dependency in every build. A WebM/Ogg body
+carrying an Opus track demuxes and then fails with a message naming the codec,
+rather than producing something wrong. Transcode first (`ffmpeg -i in.webm
+out.wav`) or send PCM.
+
+Decoding is `symphonia`, behind the `codecs` feature of `oasr-asr` — on by
+default. Building with `--no-default-features` leaves WAV, raw PCM and G.711
+working and turns every other container into a clear rejection.
+
+**Two caps, and they measure different things.** `--max-audio-mib` (default 256)
+bounds the *encoded* request body on both surfaces. `--max-audio-seconds`
+(default 4 h) bounds the *decoded* waveform — once compressed containers are
+accepted the two stop being related, since a few MiB of MP3 is hours of audio
+and the allocation happens before anything could notice. Exceeding it is `413`,
+never a truncated transcript.
+
+## HTTP — the Google-shaped surface
 
 ### `POST /v1/speech:recognize`
 
@@ -120,21 +320,29 @@ curl -sS -X POST \
 ```
 
 Query parameters: `encoding` (required), `sample_rate` (defaults to the model's
-own rate; ignored for `WAV`), `priority`, `max_alternatives`, plus the per-request decoding
-options (autoregressive decode families only — AED / speech-LLM; CTC ignores
-them): `max_new_tokens`, `temperature` (0 = greedy), `top_k`, `top_p`,
-`prompt` (speech-LLM user-prompt override).  `max_alternatives > 1` makes the
-engine detokenize that many n-best hypotheses (beam decode families), so
-every returned alternative carries a real transcript.
+own rate; ignored when the body carries a container header), `priority`,
+`max_alternatives`, plus the per-request decoding options (autoregressive decode
+families only — AED / speech-LLM; CTC ignores them): `max_new_tokens`,
+`temperature` (0 = greedy), `top_k`, `top_p`, `prompt` (speech-LLM user-prompt
+override), `task` and `language`.  `max_alternatives > 1` makes the engine
+detokenize that many n-best hypotheses (beam decode families), so every returned
+alternative carries a real transcript.
 
-`encoding` accepted values:
+`encoding` accepted values (the same names the proto enum uses, so the REST and
+gRPC surfaces cannot disagree — they share one parser):
 
 | Value | Meaning |
 |---|---|
+| `AUTO` | Sniff the container from the body's own header *(OASR extension — the right choice when relaying files you did not create)*. |
 | `LINEAR16` | Little-endian 16-bit signed PCM, mono. |
 | `LINEAR32F` | Little-endian 32-bit float PCM, mono *(OASR extension)*. |
-| `WAV` | RIFF/WAV container in the body; embedded sample rate wins over `sample_rate` *(OASR extension)*. |
-| any other Google STT v1 codec | Returns `UNIMPLEMENTED`. |
+| `MULAW` / `ALAW` | ITU-T G.711, one byte per sample — what telephony sends. |
+| `WAV`, `FLAC`, `MP3`, `M4A`, `AIFF`, `CAF`, `OGG` | The container in the body; its embedded rate wins over `sample_rate`. |
+| `OGG_OPUS`, `WEBM_OPUS`, `AMR`, `AMR_WB`, `SPEEX_WITH_HEADER_BYTE` | `UNIMPLEMENTED` — see [Audio formats](#audio-formats). |
+
+A body whose magic bytes name a container is decoded as one even when the caller
+declared PCM — except for MP3/AAC, whose 11-bit frame sync headerless PCM hits by
+chance. Sniffing never overrides a declared `LINEAR16` on that basis.
 
 > For the lowest-overhead binary transport, gRPC `Recognize` is still preferred.
 
@@ -240,6 +448,7 @@ mode.
 
 ```json
 {
+  "object": "list",
   "data": [
     {
       "id": "/path/to/ckpt",
@@ -263,7 +472,10 @@ mode.
 }
 ```
 
-Exactly one entry — the single model loaded by this process.
+One entry per name this process answers to: the checkpoint, plus any
+`--served-model-name` aliases. `object: "list"` and the per-row `object` /
+`owned_by` are what an OpenAI client expects; `info` is the OASR extension
+carrying what the engine actually loaded.
 
 `service_mode` / `decode_method` / `capabilities` / `sample_rate` are read back
 **from the
@@ -279,12 +491,24 @@ CTC *kernel* selector (`ctc_cuda` / `ctc_wfst`) — `decode_method` is the famil
 Service: `oasr.speech.v1.Speech` in `rust/proto/oasr_speech_v1.proto`.
 Messages mirror Google's v1 schema; `tokens` (CTC token IDs), `requestId`,
 and the `RecognitionConfig` decoding extensions (`max_new_tokens`,
-`temperature`, `top_k`, `top_p`, `prompt` — per-request `DecodingOptions`
-for the AR decode families) are OASR extensions in the reserved
-field-number range.  `max_alternatives` is honored (n-best transcripts on
-beam decode families), `confidence` carries the softmax-normalized n-best
+`temperature`, `top_k`, `top_p`, `prompt`, `task` — per-request
+`DecodingOptions` for the AR decode families) are OASR extensions in the
+reserved field-number range.  `max_alternatives` is honored (n-best transcripts
+on beam decode families), `confidence` carries the softmax-normalized n-best
 posterior, and `result_end_time` is set when the decode family produces
 token alignments (Paraformer CIF).
+
+`language_code` is **no longer accepted-and-ignored**: it now selects the
+language token on families that have one (Whisper), reduced from BCP-47 to its
+primary subtag (`en-US` → `en`). A family with no language control rejects a set
+value rather than transcribing in the checkpoint's own language while the client
+believes otherwise. `model`, `audio_channel_count`, `single_utterance` and
+`speech_event_type` remain accepted and ignored.
+
+`StreamingRecognize` requires a **headerless PCM** encoding, for the same reason
+the realtime WebSocket does. Previously `encoding=WAV` on a stream silently
+mapped to raw f32, so the client's 44-byte RIFF header was decoded as eleven
+samples of noise at the front of every stream; it is now `INVALID_ARGUMENT`.
 
 ### `Recognize` (unary, offline mode)
 
@@ -595,7 +819,10 @@ the defaults that bit hardest were the ones nobody had written down.
 
 | Flag | Default | What it bounds |
 |---|---|---|
-| `--max-audio-mib` | `256` | Largest audio payload per request. Drives **both** the HTTP body cap and gRPC's `max_decoding_message_size`. One number, because tonic's undeclared 4 MiB default against HTTP's 256 MiB meant the same ~2-minute clip was accepted on REST and rejected on the surface this doc recommends for offline throughput. |
+| `--max-audio-mib` | `256` | Largest audio payload per request. Drives **both** the HTTP body cap (including the multipart routes) and gRPC's `max_decoding_message_size`. One number, because tonic's undeclared 4 MiB default against HTTP's 256 MiB meant the same ~2-minute clip was accepted on REST and rejected on the surface this doc recommends for offline throughput — and axum's own 2 MiB multipart default would have reintroduced exactly that asymmetry on the upload routes. |
+| `--max-audio-seconds` | `14400` (4 h) | Longest **decoded** waveform. A separate bound because a compressed container breaks the relationship between body bytes and audio seconds: a few MiB of MP3 is hours of waveform, allocated before anything could notice. Exceeding it is `413`, never a truncated transcript. `0` disables. |
+| `--served-model-name` | *(unset)* | Names the OpenAI surface's `model` field must match. Unset accepts any name — what makes a client hardcoded to `whisper-1` work after a base-URL change. Set, an unknown name is `404`. Repeatable. |
+| `--cors-allow-origin` | *(unset)* | Origins allowed to call the HTTP API from a browser; `*` allows any. No CORS layer is installed when unset. Repeatable. |
 | `--request-timeout-secs` | `300` | Deadline for one **unary** request (HTTP `speech:recognize`, gRPC `Recognize`), covering time queued behind the concurrency limit. `0` disables. |
 | `--stream-idle-timeout-secs` | `300` | Aborts a streaming RPC that goes this long with no inbound audio (before half-close) or no decode event (after). `0` disables. Deliberately *not* a blanket gRPC deadline — that would cut off healthy long-lived streams; a live stream can only be bounded by inactivity. |
 | `--max-inflight-connections` | `4 x --max-concurrent-requests` | Requests either listener processes at once; the rest queue (and are eventually cut off by the timeout). Bounds how many multi-MiB bodies are resident. `/healthz`, `/readyz` and `/metrics` are **exempt** — a saturated server must still answer its own probes. `0` disables. |
@@ -630,12 +857,17 @@ cancel their engine request when the handler future is dropped.  Watch
 
 ## Out of scope (v1)
 
-- AuthN/AuthZ — rely on a network policy or reverse proxy.
+- AuthN/AuthZ — rely on a network policy or reverse proxy. An `Authorization`
+  header is accepted and forwarded by the clients so a proxy can enforce one;
+  the server itself does not check it.
 - Cross-host engine fleets — single-host only at the binary level; clusters
   go through your LB.
-- Audio codecs beyond PCM/WAV — MP3/Opus/FLAC follow up behind a `symphonia`
-  feature on `oasr-asr`.
+- **Opus**, AMR, AMR-WB and Speex — see [Audio formats](#audio-formats). Every
+  other common container decodes.
+- **Word-level timestamps** — `timestamp_granularities[]=word` returns `501`.
+  Tracked as H7 in `.artifacts/architecture_review.md`.
 - TLS termination — assume a reverse proxy handles it.
 - `LongRunningRecognize` (Google STT v1 LRO) — not implemented.
-- `RecognitionConfig.language_code`, `model`, `audio_channel_count`, and
+- `RecognitionConfig.model`, `audio_channel_count`, and
   `StreamingRecognitionConfig.single_utterance` — accepted, ignored.
+  (`language_code` is now honored where the decode family can act on it.)

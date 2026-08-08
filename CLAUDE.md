@@ -71,6 +71,7 @@ JIT compilation (FlashInfer-style) and a Rust HTTP/gRPC serving front-end.
 | Rust build / test / lint | `cd rust && cargo build --release && cargo test && cargo clippy --all-targets -- -D warnings` |
 | Serve a checkpoint | `oasr-server --ckpt-dir <dir> --service-mode offline --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051` |
 | Convert a checkpoint | `oasr-convert <src> <dst>` |
+| Transcribe (server / in-process) | `oasr transcribe audio.mp3` · `oasr transcribe audio.mp3 --ckpt-dir <dir>` |
 | Kernel benchmark | `python benchmarks/oasr_benchmark.py --list` |
 | Engine / service / accuracy benchmark | `python benchmarks/bench_{engine,service,accuracy}.py` |
 
@@ -199,6 +200,9 @@ extension cookbook for each axis.
 | `csrc/tvm_ffi_utils.h` | DLPack dispatch + the validation macros every launcher uses |
 | `rust/crates/oasr-engine-client/` | The GIL-owning dispatcher thread |
 | `rust/crates/oasr-serve/` | Mode-agnostic serving core shared by binary and extension |
+| `rust/crates/oasr-server-http/src/{openai,realtime}.rs` | The OpenAI-compatible routes and the `/v1/realtime` WebSocket |
+| `rust/crates/oasr-asr/src/{codec,encoding}.rs` | Container decoding (symphonia) + the one `encoding=` parser both front-ends share |
+| `oasr/client.py`, `oasr/cli.py` | The Python client and the `oasr` command |
 | `tests/assets.py` | The single declaration point for every external test asset |
 | `ci/gpu_suites.py` | The per-family GPU test split, shared by both GPU backends |
 
@@ -260,6 +264,18 @@ extension cookbook for each axis.
   serialises everything, including the overlap that may be the actual bug.
 - **Trusting a regression test that has never been seen to fail.** Revert the fix
   and watch it fail in exactly the predicted parametrisations.
+- **Accepting a per-request option a decode family cannot act on.** `task` /
+  `language` change *what is decoded*; a family without the control rejects them
+  at admission (`DecodeStrategy.validate_options`) rather than returning a
+  transcript of something else with nothing to say so. Sampling knobs are
+  different — ignoring one returns the same transcript.
+- **Sniffing a container out of a declared `LINEAR16` body.** MP3 and AAC are
+  identified by an 11-bit frame sync that real PCM hits by chance; only
+  unambiguous magic may override a caller's declared encoding
+  (`oasr-asr::codec::Container::is_unambiguous`).
+- **Bounding audio by request bytes once codecs are accepted.** A few MiB of MP3
+  is hours of waveform. `--max-audio-seconds` bounds the decode; `--max-audio-mib`
+  bounds the body.
 
 Open defects with repros: `.artifacts/known_issues.md`.
 
