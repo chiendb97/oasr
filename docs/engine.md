@@ -24,6 +24,9 @@ cache) work in one pool, with length-aware bucketing and CPU/GPU overlap.
 5. **Exposing a high-level API**:
    - `transcribe(audio | List[audio])` for one-shot streaming use.
    - `transcribe_offline(audio | List[audio])` for batch-only offline use.
+   - `transcribe_outputs(...)` when the strings are not enough — it returns the
+     whole `RequestOutput`, which is where `words`, `confidence`, `timestamps`,
+     `nbest_texts` and `finish_reason` live.
    - `add_request` / `feed_chunk` / `step` / `run` for explicit control.
 
 The engine no longer has a separate `OfflineEngine` subclass — pass
@@ -450,6 +453,15 @@ def wav(p): return torchaudio.load(p)[0].squeeze(0).float()
 
 text  = engine.transcribe_offline(wav("audio.wav"))
 texts = engine.transcribe_offline([wav(p) for p in ("a.wav", "b.wav", "c.wav")])
+
+# Everything a decode produces, not just the string:
+from oasr.engine import DecodingOptions
+
+(out,) = engine.transcribe_outputs(
+    [wav("audio.wav")], streaming=False, decoding=DecodingOptions(word_timestamps=True)
+)
+for w in out.words or ():
+    print(f"{w.start:6.2f}-{w.end:6.2f}  {w.confidence:.2f}  {w.word}")
 ```
 
 ### 7.2 Streaming, attached audio

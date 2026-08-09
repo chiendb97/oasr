@@ -204,7 +204,13 @@ class _FakeStrategy:
 
     decode_type = "ctc"
     selective_options = ()
+    #: No alignment either — so a spec asking for word timestamps is rejected by
+    #: the same real code path, not by a stub.
+    word_timing_modes = ()
+    _clock = None
+    _SELECTIVE_UNSET = _Base._SELECTIVE_UNSET
     validate_options = _Base.validate_options
+    _require_word_timings = _Base._require_word_timings
 
 
 class _FakeOutputProcessor:

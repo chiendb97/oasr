@@ -72,3 +72,35 @@ always present even on the kinds that raise from it.
 yields the tokens `decode` would keep.  Whisper's `decode` drops every id at or
 above `eot_id` (language / task / timestamp markers), so it reports that whole
 range — reporting only `{eot_id}` would let a caller leak control markup.
+
+## Two decode variants, one contract
+
+Beyond `decode(ids) -> str`, two methods answer *the same question in pieces*,
+and both are contractually required to concatenate back to it:
+
+| method | who asks | contract |
+|---|---|---|
+| `decode_incremental(new_ids, state)` | streaming and AR partials, one chunk at a time | concatenating every delta equals `decode(all_ids)` |
+| `token_pieces(ids)` | word timings, once per finished hypothesis | `"".join(token_pieces(ids)) == decode(ids)` |
+
+Both have a **correct default on the ABC** and exist to be overridden for speed,
+not for behaviour.  The defaults re-render the accumulated prefix, so they are
+Θ(n²) in tokens; `symbol_table` and `huggingface` override `decode_incremental`,
+and `symbol_table` overrides `token_pieces` in C++
+(`csrc/tokenizers/symbol_table.cc`) — with no Python twin, rather than
+rendering the same table a second way on the request path.  Its only caller is
+the word grouping, which is C++ too, and both ship in every successful build.
+A kind whose rendering is not piece-local (`funasr_char`'s
+`@@` merges, SentencePiece's word boundaries) is correct on the default and
+simply pays for it.
+
+`decode` deliberately stays in Python for every kind.  It is the same handful of
+operations as `token_pieces`, but it produces the transcript itself and runs on
+every streaming partial: a second implementation there would be a correctness
+surface, where `token_pieces` only has to concatenate back to it — a property one
+test can check exhaustively.
+
+The reason to care: `token_pieces` is what lets the word grouping cut words out
+of the *rendered* transcript rather than rebuild them from pieces, so it runs on
+the decode path for every request that asks for word timestamps.  See
+[`docs/decoding.md`](decoding.md) § Word timings.

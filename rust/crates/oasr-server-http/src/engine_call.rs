@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use axum::http::StatusCode;
 use bytes::Bytes;
-use oasr_wire::{DecodingParams, ErrorCode, Event};
+use oasr_wire::{DecodingParams, ErrorCode, Event, WordTiming};
 use tracing::{error, warn};
 
 use crate::router::AppState;
@@ -28,6 +28,10 @@ pub struct FinalTranscript {
     pub nbest_texts: Option<Vec<String>>,
     /// End time (s) of the last decoded token, for families with alignments.
     pub end_time_s: Option<f32>,
+    /// Per-word timings for the best hypothesis, when the request asked.
+    pub words: Option<Vec<WordTiming>>,
+    /// Mean per-token posterior of the best hypothesis, in [0, 1].
+    pub confidence: Option<f32>,
     /// `"stop"` / `"length"` for the autoregressive families.
     pub finish_reason: Option<String>,
     /// Wall time from the handler's start to the terminal event.
@@ -116,6 +120,8 @@ pub async fn submit_offline_and_wait(
             scores,
             nbest_texts,
             end_time_s,
+            words,
+            confidence,
             finish_reason,
         } => Ok(FinalTranscript {
             request_id,
@@ -124,6 +130,8 @@ pub async fn submit_offline_and_wait(
             scores,
             nbest_texts,
             end_time_s,
+            words,
+            confidence,
             finish_reason,
             elapsed_ms,
         }),

@@ -80,6 +80,13 @@ class Transcription:
     language: Optional[str] = None
     finish_reason: Optional[str] = None
     segments: List[Dict[str, Any]] = field(default_factory=list)
+    #: ``[{"word", "start", "end", "confidence"}]`` — present only when the
+    #: request asked (``timestamp_granularities=["word"]`` with
+    #: ``response_format="verbose_json"``) and the decode family produced them.
+    #: Empty is the honest answer for a request that did not ask; a family that
+    #: *cannot* align rejects the request instead, so an empty list here never
+    #: means "unsupported".
+    words: List[Dict[str, Any]] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
 
     def __str__(self) -> str:  # `print(client.transcribe(...))` should work
@@ -178,6 +185,7 @@ def _to_transcription(status: int, content_type: str, body: bytes) -> Transcript
         language=payload.get("language"),
         finish_reason=payload.get("finish_reason"),
         segments=payload.get("segments") or [],
+        words=payload.get("words") or [],
         raw=payload,
     )
 

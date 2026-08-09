@@ -11,8 +11,8 @@ JIT compilation (FlashInfer-style) and a Rust HTTP/gRPC serving front-end.
 
 - User-facing overview and quick start: [`README.md`](README.md)
 - Stable technical documentation: [`docs/`](docs/README.md)
-- Point-in-time results, issues and investigations: [`.artifacts/`](.artifacts/README.md)
-  (gitignored — a fresh clone has the pointers, not the files)
+- Point-in-time results, issues and investigations: a gitignored `.artifacts/`
+  working directory, never cited from here (see rule 11)
 
 ---
 
@@ -39,16 +39,20 @@ JIT compilation (FlashInfer-style) and a Rust HTTP/gRPC serving front-end.
    `@pytest.mark.requires_assets(...)`, so every skip is counted and reported.
 8. **Per-decode-family knobs go on the strategy's `options_cls`, not on
    `EngineConfig`.** Engine-level knobs (tick budget, decode slots, KV budget)
-   stay on `EngineConfig`.
+   stay on `EngineConfig`. Per-*request* knobs go on `DecodingOptions`, and one
+   that changes *what is decoded* or that a caller will look for in the response
+   must be declared (`selective_options` / `word_timing_modes`) so a family
+   without it rejects rather than ignores.
 9. **Never pass `-inf` as `attn_bias`.** Use a large finite mask floor —
    mathematically identical, and the fused kernel is inaccurate above a
    moderate finite bias magnitude.
 10. **Never branch kernel dispatch on CUDA-graph capture state.** A
     capture-dependent branch makes the graph pick a different kernel than eager,
     and the resulting one-ulp difference has changed decoded tokens.
-11. **Keep transient material out of `CLAUDE.md` and `docs/`.** Benchmark
-    numbers, known issues, investigations and experiment results go in
-    `.artifacts/`, with a one-line pointer left behind.
+11. **Keep transient material out of `CLAUDE.md` and `README.md`, and do not
+    cite `.artifacts/` from them.** Benchmark numbers, known issues,
+    investigations and experiment results go in the gitignored `.artifacts/`;
+    a fresh clone does not have those files, so a pointer to one is a dead link.
 12. **Do not commit or push unless asked.** Create the branch and the files, then
     hand off.
 
@@ -72,6 +76,7 @@ JIT compilation (FlashInfer-style) and a Rust HTTP/gRPC serving front-end.
 | Serve a checkpoint | `oasr-server --ckpt-dir <dir> --service-mode offline --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051` |
 | Convert a checkpoint | `oasr-convert <src> <dst>` |
 | Transcribe (server / in-process) | `oasr transcribe audio.mp3` · `oasr transcribe audio.mp3 --ckpt-dir <dir>` |
+| Word timestamps | `oasr transcribe audio.mp3 --response-format verbose_json --timestamp-granularity word` |
 | Kernel benchmark | `python benchmarks/oasr_benchmark.py --list` |
 | Engine / service / accuracy benchmark | `python benchmarks/bench_{engine,service,accuracy}.py` |
 
@@ -91,7 +96,7 @@ cd rust && cargo build --release     # optional standalone oasr-server binary
 
 | Artifact | Built by | Contains |
 |---|---|---|
-| `oasr/_C.so` | CMake + pybind11 | CPU-side CTC/WFST decoders, legacy enums |
+| `oasr/_C.so` | CMake + pybind11 | CPU-side CTC/WFST decoders, the post-decode alignment pass, legacy enums |
 | `oasr/_core.so` | setuptools-rust | `oasr._core` — the Rust serving core |
 | `oasr-server` | console script | forwards `sys.argv` into `oasr._core.serve` |
 
@@ -188,6 +193,7 @@ extension cookbook for each axis.
 | `oasr/engine/config.py` | `EngineConfig` — every engine-level knob |
 | `oasr/engine/scheduler.py` | Batch selection and partition, starvation bounds |
 | `oasr/engine/decode/` | Decode strategies (`ctc_gpu`, `ctc_wfst`, `transducer`, `aed`, `llm`, `paraformer`, `rescoring`) + `options.py` |
+| `oasr/engine/decode/{alignment,ctc_align,attention_align}.py` | Word timings: the shared frames→words half, and the two per-family aligners |
 | `oasr/engine/streaming_backend/` | `PagedStreamingBackend`, `StatefulStreamingBackend` |
 | `oasr/engine/graph_cache.py` | CUDA-graph capture of the steady-state streaming encoder |
 | `oasr/engine/memory.py` | VRAM-aware capacity derivation (paged pool, AR decoder KV) |
@@ -198,6 +204,7 @@ extension cookbook for each axis.
 | `oasr/jit/core.py`, `oasr/jit/env.py` | JIT specs, nvcc flags, the cache key |
 | `oasr/gemm.py`, `oasr/attention.py` | The two families with shape-aware routing |
 | `csrc/tvm_ffi_utils.h` | DLPack dispatch + the validation macros every launcher uses |
+| `csrc/alignment/` | The post-decode alignment pass and the beam read-back, in C++ (`_C.alignment`) |
 | `rust/crates/oasr-engine-client/` | The GIL-owning dispatcher thread |
 | `rust/crates/oasr-serve/` | Mode-agnostic serving core shared by binary and extension |
 | `rust/crates/oasr-server-http/src/{openai,realtime}.rs` | The OpenAI-compatible routes and the `/v1/realtime` WebSocket |
@@ -220,6 +227,7 @@ extension cookbook for each axis.
 | Declared capability | `CAPABILITIES` + `require_capability` | An unserviceable checkpoint fails at engine construction, naming the missing members |
 | Declared cache | `streaming_state_specs`, `fixed_attention_window`, `streaming_geometry`, `ExtractorSpec.framing` | A new streaming cache is data, not a new manager |
 | Per-family options | `DecodeStrategy.options_cls` + `--decode-option k=v` | Adding a family needs no new CLI flag and no `EngineConfig` field |
+| Declared alignment | `word_timing_modes` + `TokenAlignment` → `word_timings` | Per-family *how*, shared *what happens next*; a family that cannot align says so per mode |
 | Counted gaps | `KERNEL_GAPS`, `format_gap_report()`, `rule_miss_report()` | What is missing is measurable, not invisible |
 
 ---
@@ -249,7 +257,40 @@ extension cookbook for each axis.
   step can hit the same key twice.
 - **Declaring `streaming_kind` from what the class implements** rather than from
   what *this config's weights* can do. Over-claiming builds an engine that raises
-  on its first request instead of failing at construction.
+  on its first request instead of failing at construction. Same for
+  `DecodeStrategy.word_timing_modes`, which is a **property** for exactly this
+  reason: a transducer times both modes under greedy and neither under beam
+  search.
+- **Re-deriving what the decoder already knew.** A frame-synchronous decoder
+  knows the emitting frame *as* it emits it; recovering it afterwards cost 10×
+  the decode and cannot serve a stream at all. Record it in the beam.
+- **Guessing a frame rate, or rebuilding words from tokenizer pieces.** Both
+  produce output that is plausible and wrong. `FrameClock.resolve` returns
+  `None` rather than a guess and the request is refused; words are cut out of
+  the rendered transcript so each is a literal substring of `text`.
+- **Changing the alignment rule without its oracle.** The pass is C++ only
+  (`csrc/alignment/`); Python raises rather than falling back, because a
+  fallback costing more than the decode is one a deployment lands on silently.
+  The Python statement of the same rule lives in `tests/test_alignment_cpp.py`
+  and must agree **exactly**, so a change lands in both. That is also why
+  neither side uses `std::isspace` or `sum()`: both differ across
+  implementations or Python versions, and the difference reaches the published
+  output. Details: [`docs/decoding.md`](docs/decoding.md) § Word timings.
+- **Per-token or per-character Python on the decode path.** The step loop is
+  interpreter-bound at batch and holds the GIL for every request the engine
+  finishes; both the word grouping and the beam read-back cost more than the
+  work they decorated before moving to `_C.alignment`. A worker thread does not
+  help — pure Python holds the GIL — and there is rarely a next forward in
+  flight to hide behind.
+- **Reading a streaming frame index out of `select_seqs`.** It is a ring of
+  width `max_seq_len`, and a stream decodes more frames than its output-token
+  cap, so the value wraps. Use the device-resident absolute counter
+  (`device_frame_idx_ptr`); offline may read the ring, where step == frame.
+- **Adding a field to the paged region without updating both allocators.**
+  `init_paged_state` and `setup_internal_data_paged_pointers` are two bump
+  allocations over the *same* bytes: a field missing from the second does not
+  leave one pointer null, it shifts every pointer after it. The symptom is an
+  illegal access far from the edit.
 - **Adding an `EngineConfig` field for one decode family.** Use `options_cls`.
 - **`nn.Linear` in a model file.** Use `oasr.layers`.
 - **`LinearActivation(activation="gelu")`.** Only `gelu_tanh` exists — the CUDA
@@ -277,7 +318,6 @@ extension cookbook for each axis.
   is hours of waveform. `--max-audio-seconds` bounds the decode; `--max-audio-mib`
   bounds the body.
 
-Open defects with repros: `.artifacts/known_issues.md`.
 
 ---
 
@@ -302,7 +342,7 @@ Open defects with repros: `.artifacts/known_issues.md`.
    ```
    `mypy` and `cargo test` are deliberately **not** pre-commit hooks — too slow
    for a commit. Run them before opening a PR, or let CI do it.
-6. Record any measurements in `.artifacts/`, not in `CLAUDE.md` or `docs/`.
+6. Record any measurements in `.artifacts/`, not in `CLAUDE.md` or `README.md`.
 
 Style: Python is 100 characters (black + isort's black profile). C++ is Google
 style, 100 characters, C++17. CUDA flags include `--expt-relaxed-constexpr`,
@@ -414,7 +454,7 @@ Environment variables:
 | `OASR_USE_K2` | `1` builds the k2-backed WFST decoder (needs `pip install k2` + `K2_SOURCE_DIR`) |
 | `OASR_RS_BIN` | Path to an `oasr-server` executable, for `bench_service.py` |
 
-The five `OASR_*` A/B switches exist so a regression can be attributed. Set them
+These `OASR_*` A/B switches exist so a regression can be attributed. Set them
 before process start.
 
 ---
@@ -424,12 +464,13 @@ before process start.
 | Symptom | Check |
 |---|---|
 | `ImportError` on `oasr._C` / `oasr._core` | The package was imported before it was built. `pip install -e .` again. |
+| `AttributeError: 'NoneType' object has no attribute 'align_…'` on a word-timestamp request | Same cause: the alignment pass is C++ only and `_C` was never built. `pip install -e .`. |
 | A kernel change has no effect | Stale JIT cache — `rm -rf ~/.cache/oasr/jit`. |
 | CUTLASS headers not found | `git submodule update --init`. |
 | Cargo fails on autocfg probes (bogus generic-argument errors in `tower` / `indexmap`) | The target dir is on a filesystem rustc's probes cannot use. Set `CARGO_TARGET_DIR` to a local path. |
 | Cargo fails on conflicting pyo3 features | You used `--workspace`. Don't. |
 | Green tests but no real coverage | The external assets are absent — read the `external assets:` table, or use `--strict-assets`. |
-| Engine INFO logs missing under `oasr-server` | Known limitation — the front-end configures `tracing`, not Python `logging`. See `.artifacts/serving_perf.md` §5. |
+| Engine INFO logs missing under `oasr-server` | Known limitation — the front-end configures `tracing`, not Python `logging`. |
 | `BlockPool exhausted` mid-stream | Size `max_num_blocks`, or set it to `None` and let the engine derive it from free VRAM. |
 
 ---
@@ -455,7 +496,6 @@ before process start.
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Benchmark recipes and measurement protocol |
 | [`docs/ci.md`](docs/ci.md) | The four workflows, the asset gate, the accuracy gate, why mypy is a ratchet |
 | [`docs/autotuning.md`](docs/autotuning.md) | `oasr.tune` API and cache format |
-| [`.artifacts/README.md`](.artifacts/README.md) | Index of measurements, issues and investigations |
 
 ### Skills
 

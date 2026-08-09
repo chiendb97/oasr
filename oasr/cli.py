@@ -58,7 +58,11 @@ def _add_common_transcribe_args(p: argparse.ArgumentParser) -> None:
         action="append",
         dest="timestamp_granularities",
         choices=("segment", "word"),
-        help="request timestamps (repeatable); needs --response-format verbose_json",
+        help=(
+            "request timestamps (repeatable); needs --response-format "
+            "verbose_json.  A decode family that cannot align rejects the "
+            "request rather than answering without them"
+        ),
     )
     p.add_argument("-o", "--output", help="write to this file instead of stdout")
     p.add_argument("--timeout", type=float, default=300.0, help="request timeout in seconds")
@@ -115,7 +119,13 @@ def _render(result: Transcription, response_format: str) -> str:
         return result.text
     if response_format == "json":
         return json.dumps({"text": result.text}, ensure_ascii=False)
-    return json.dumps(result.raw or {"text": result.text}, ensure_ascii=False, indent=2)
+    payload = result.raw or {"text": result.text}
+    if result.words and "words" not in payload:
+        # The in-process path builds its own payload; the server already
+        # includes `words` in a verbose_json body, and overwriting it would
+        # drop fields this dataclass does not model.
+        payload = {**payload, "words": result.words}
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def _cmd_transcribe(args: argparse.Namespace, *, task: str) -> int:
@@ -161,11 +171,6 @@ def _transcribe_locally(args: argparse.Namespace) -> List[Transcription]:
     """
     from oasr.engine import ASREngine, DecodingOptions, EngineConfig
 
-    if args.timestamp_granularities:
-        raise SystemExit(
-            "--timestamp-granularity needs the server path; the in-process API "
-            "returns RequestOutput.timestamps directly"
-        )
     cfg = EngineConfig(ckpt_dir=args.ckpt_dir, service_mode="offline", device=args.device)
     engine = ASREngine(cfg)
     try:
@@ -175,16 +180,41 @@ def _transcribe_locally(args: argparse.Namespace) -> List[Transcription]:
         assert cfg.feature_config is not None
         sample_rate = cfg.feature_config.sample_rate
         audios = [_load_audio(p, sample_rate) for p in args.audio]
+        want_words = "word" in (args.timestamp_granularities or ())
         decoding = None
-        if args.language or args.temperature or args.prompt or args.task != "transcribe":
+        if (
+            args.language
+            or args.temperature
+            or args.prompt
+            or args.task != "transcribe"
+            or want_words
+        ):
             decoding = DecodingOptions(
                 task=args.task if args.task != "transcribe" else None,
                 language=(args.language or "").split("-")[0].lower() or None,
                 temperature=args.temperature or 0.0,
                 prompt=args.prompt or None,
+                word_timestamps=want_words,
             )
-        texts = engine.transcribe_offline(audios, decoding=decoding)
-        return [Transcription(text=t, raw={"text": t}) for t in texts]
+        outputs = engine.transcribe_outputs(audios, streaming=False, decoding=decoding)
+        return [
+            Transcription(
+                text=o.text,
+                request_id=o.request_id,
+                finish_reason=o.finish_reason,
+                words=[
+                    {
+                        "word": w.word,
+                        "start": w.start,
+                        "end": w.end,
+                        "confidence": w.confidence,
+                    }
+                    for w in (o.words or ())
+                ],
+                raw={"text": o.text},
+            )
+            for o in outputs
+        ]
     finally:
         del engine
 

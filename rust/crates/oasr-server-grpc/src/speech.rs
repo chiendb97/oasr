@@ -12,7 +12,9 @@ use oasr_asr::{
     decode_audio, parse_encoding, DecodeOptions, EncodingError, PcmStream, SourceEncoding,
 };
 use oasr_engine_client::EnginePool;
-use oasr_wire::{normalize_language, score_posteriors, DecodingParams, ErrorCode, Event};
+use oasr_wire::{
+    normalize_language, score_posteriors, DecodingParams, ErrorCode, Event, WordTiming,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -120,7 +122,7 @@ fn partial_response(
 ) -> pb::StreamingRecognizeResponse {
     pb::StreamingRecognizeResponse {
         results: vec![pb::StreamingRecognitionResult {
-            alternatives: build_alternatives(text, tokens, scores, None, max_alts),
+            alternatives: build_alternatives(text, tokens, scores, None, max_alts, None),
             is_final: false,
             stability: 0.0,
             result_end_time: None,
@@ -143,10 +145,11 @@ fn final_response(
     end_time_s: Option<f32>,
     finish_reason: Option<String>,
     max_alts: u32,
+    words: Option<Vec<WordTiming>>,
 ) -> pb::StreamingRecognizeResponse {
     pb::StreamingRecognizeResponse {
         results: vec![pb::StreamingRecognitionResult {
-            alternatives: build_alternatives(text, tokens, scores, nbest_texts, max_alts),
+            alternatives: build_alternatives(text, tokens, scores, nbest_texts, max_alts, words),
             is_final: true,
             stability: 1.0,
             result_end_time: end_time_s.map(duration_from_secs),
@@ -245,6 +248,7 @@ fn decoding_params(cfg: &pb::RecognitionConfig) -> Result<Option<DecodingParams>
         prompt: (!cfg.prompt.is_empty()).then(|| cfg.prompt.clone()),
         task: (!cfg.task.is_empty()).then(|| cfg.task.trim().to_ascii_lowercase()),
         language,
+        word_timestamps: cfg.enable_word_time_offsets.then_some(true),
     }
     .validated()
     .map_err(Status::invalid_argument)
@@ -271,6 +275,7 @@ fn build_alternatives(
     scores: Option<Vec<f32>>,
     nbest_texts: Option<Vec<String>>,
     max_alternatives: u32,
+    words: Option<Vec<WordTiming>>,
 ) -> Vec<pb::SpeechRecognitionAlternative> {
     let cap = if max_alternatives == 0 {
         1
@@ -283,6 +288,7 @@ fn build_alternatives(
         tokens
     };
     let confidences = score_posteriors(&scores);
+    let mut words = words;
     rows.into_iter()
         .take(cap)
         .enumerate()
@@ -299,9 +305,28 @@ fn build_alternatives(
                 .as_ref()
                 .and_then(|c| c.get(i).copied())
                 .unwrap_or(0.0),
+            // Only the top alternative is timed; the engine aligns the
+            // hypothesis it returns as `text`, not the whole beam.  `take`
+            // rather than `clone` so the copy happens once.
+            words: if i == 0 {
+                words.take().map(|w| w.into_iter().map(word_info).collect())
+            } else {
+                None
+            }
+            .unwrap_or_default(),
             tokens: ids,
         })
         .collect()
+}
+
+/// Engine word timing → STT v1 `WordInfo`.
+fn word_info(w: WordTiming) -> pb::WordInfo {
+    pb::WordInfo {
+        start_time: Some(duration_from_secs(w.start)),
+        end_time: Some(duration_from_secs(w.end)),
+        word: w.word,
+        confidence: w.confidence,
+    }
 }
 
 /// Inputs for [`SpeechService::streaming_over_offline`], grouped so the call site
@@ -518,6 +543,7 @@ impl SpeechService {
                             scores,
                             nbest_texts,
                             end_time_s,
+                            words,
                             finish_reason,
                             ..
                         } => {
@@ -532,6 +558,7 @@ impl SpeechService {
                                     end_time_s,
                                     finish_reason,
                                     cfg.max_alts,
+                                    words,
                                 )))
                                 .await;
                             handle.finish();
@@ -656,7 +683,9 @@ impl pb::speech_server::Speech for SpeechService {
                     scores,
                     nbest_texts,
                     end_time_s,
+                    words,
                     finish_reason,
+                    ..
                 } => {
                     let n_tokens = tokens.first().map_or(0, |t| t.len());
                     info!(
@@ -676,6 +705,7 @@ impl pb::speech_server::Speech for SpeechService {
                                 scores,
                                 nbest_texts,
                                 max_alts,
+                                words,
                             ),
                             channel_tag: 0,
                             finish_reason: finish_reason.unwrap_or_default(),
@@ -838,12 +868,13 @@ impl pb::speech_server::Speech for SpeechService {
                                 let _ = out_tx.send(Ok(resp)).await;
                             }
                             Some(Event::Final {
-                                text, tokens, scores, nbest_texts, end_time_s, finish_reason, ..
+                                text, tokens, scores, nbest_texts, end_time_s, words,
+                                finish_reason, ..
                             }) => {
                                 let transcript = text.clone();
                                 let resp = final_response(
                                     &rid, text, tokens, scores, nbest_texts, end_time_s,
-                                    finish_reason, max_alts,
+                                    finish_reason, max_alts, words,
                                 );
                                 let _ = out_tx.send(Ok(resp)).await;
                                 handle.finish();
@@ -964,6 +995,7 @@ mod tests {
             Some(1.5),
             Some("length".into()),
             1,
+            None,
         );
         let res = &r.results[0];
         assert!(res.is_final);
@@ -988,6 +1020,7 @@ mod tests {
             None,
             None,
             1,
+            None,
         );
         assert_eq!(r.results[0].finish_reason, "");
     }
@@ -1021,6 +1054,64 @@ mod tests {
         );
     }
 
+    /// Only the transcript the caller is shown is timed.  Copying the word
+    /// list onto every alternative would attach one hypothesis's clock to
+    /// another's text.
+    #[test]
+    fn words_ride_only_on_the_top_alternative() {
+        let words = vec![
+            WordTiming {
+                word: "hello".into(),
+                start: 0.25,
+                end: 0.75,
+                confidence: 0.9,
+            },
+            WordTiming {
+                word: "world".into(),
+                start: 0.75,
+                end: 1.25,
+                confidence: 0.8,
+            },
+        ];
+        let alts = build_alternatives(
+            "hello world".into(),
+            vec![vec![1], vec![2]],
+            Some(vec![-1.0, -2.0]),
+            Some(vec!["hello world".into(), "hello word".into()]),
+            2,
+            Some(words),
+        );
+        assert_eq!(alts.len(), 2);
+        assert_eq!(alts[0].words.len(), 2);
+        assert!(alts[1].words.is_empty(), "alternatives are not timed");
+        let w = &alts[0].words[0];
+        assert_eq!(w.word, "hello");
+        assert_eq!(w.confidence, 0.9);
+        let start = w.start_time.as_ref().expect("start");
+        assert_eq!((start.seconds, start.nanos), (0, 250_000_000));
+    }
+
+    /// A request that did not ask leaves the field empty, not zero-filled.
+    #[test]
+    fn no_words_means_an_empty_list() {
+        let alts = build_alternatives("hi".into(), vec![vec![1]], None, None, 1, None);
+        assert!(alts[0].words.is_empty());
+    }
+
+    #[test]
+    fn enable_word_time_offsets_maps_to_the_engine_option() {
+        let cfg = pb::RecognitionConfig {
+            enable_word_time_offsets: true,
+            ..Default::default()
+        };
+        let params = decoding_params(&cfg).expect("valid").expect("some");
+        assert_eq!(params.word_timestamps, Some(true));
+        // ...and stays unset otherwise, so the engine sees no options dict at all.
+        assert!(decoding_params(&pb::RecognitionConfig::default())
+            .expect("valid")
+            .is_none());
+    }
+
     #[test]
     fn max_alternatives_zero_means_one() {
         let r = final_response(
@@ -1032,6 +1123,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         assert_eq!(r.results[0].alternatives.len(), 1);
     }

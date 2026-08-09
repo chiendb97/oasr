@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple
 import torch
 
 from ..request import DecodingOptions, Request
+from .alignment import TokenAlignment
+from .attention_align import resolve_alignment_heads, token_frame_spans
 from .base import register_decode_strategy
 from .incremental import ArGroup, IncrementalArStrategy, Prefill
 
@@ -89,6 +91,15 @@ class AedDecodeStrategy(IncrementalArStrategy):
         self._suppress_idx: Dict[torch.device, torch.Tensor] = {}
         self._begin_suppress_idx: Dict[torch.device, torch.Tensor] = {}
 
+        # -- word timings ------------------------------------------------
+        # Declared from what *this* decoder can do: the alignment is a DTW over
+        # cross-attention, so a decoder surface without ``cross_attention`` has
+        # no way to produce one, and claiming otherwise would admit the request
+        # and then answer it with the field missing.
+        decoder = getattr(model, "decoder", None) if model is not None else None
+        self._can_align = callable(getattr(decoder, "cross_attention", None))
+        self._align_heads: Optional[List[Tuple[int, int]]] = None
+
     # ------------------------------------------------------------------
     # IncrementalArStrategy hooks
     # ------------------------------------------------------------------
@@ -140,7 +151,21 @@ class AedDecodeStrategy(IncrementalArStrategy):
             self._prompt_cache[key] = cached
         return cached
 
-    def validate_options(self, options: Optional[DecodingOptions]) -> None:
+    @property
+    def word_timing_modes(self) -> Tuple[str, ...]:
+        """Offline only — so is the family — and only for greedy decoding with a
+        decoder that can report its cross-attention.
+
+        Beam search runs in an :class:`ArBeamGroup`, which retains no encoder
+        output to re-forward against and finalizes through its own path; the
+        alignment would silently produce nothing.  Declaring it here is what
+        turns that into a refusal at admission.
+        """
+        return ("offline",) if self._can_align and self._beam <= 1 else ()
+
+    def validate_options(
+        self, options: Optional[DecodingOptions], *, streaming: bool = False
+    ) -> None:
         """Resolve ``task`` / ``language`` against *this checkpoint* now.
 
         The base class only asks whether the family understands the option at
@@ -149,7 +174,7 @@ class AedDecodeStrategy(IncrementalArStrategy):
         language" into a 400 for that request instead of a raise from inside a
         prefill shared with unrelated requests.
         """
-        super().validate_options(options)
+        super().validate_options(options, streaming=streaming)
         if options is None or (options.task is None and options.language is None):
             return
         self._mcfg.sot_sequence(task=options.task, language=options.language)
@@ -188,3 +213,82 @@ class AedDecodeStrategy(IncrementalArStrategy):
             idx = torch.tensor(ids, dtype=torch.long, device=like.device)
             cache[like.device] = idx
         return idx
+
+    # ------------------------------------------------------------------
+    # Word timings (cross-attention DTW)
+    # ------------------------------------------------------------------
+
+    def _heads(self) -> List[Tuple[int, int]]:
+        """The ``(layer, head)`` set to average, resolved once and cached."""
+        if self._align_heads is None:
+            heads, declared = resolve_alignment_heads(
+                getattr(self._mcfg, "alignment_heads", None),
+                int(self._mcfg.decoder_layers),
+                int(self._mcfg.decoder_attention_heads),
+            )
+            if not declared:
+                logger.warning(
+                    "this checkpoint declares no alignment_heads "
+                    "(generation_config.json); word timestamps will average all "
+                    "%d heads of the upper %d decoder layers, which is noisier "
+                    "and needs more transient memory than the published set",
+                    len(heads),
+                    int(self._mcfg.decoder_layers) - int(self._mcfg.decoder_layers) // 2,
+                )
+            self._align_heads = heads
+        return self._align_heads
+
+    @torch.no_grad()
+    def _align_row(
+        self, request: Request, enc_out: torch.Tensor, tokens: List[int]
+    ) -> Optional[List[TokenAlignment]]:
+        """One teacher-forced pass → per-token spans and posteriors.
+
+        The pass covers ``prompt + tokens`` because the decoder is causal and
+        the transcript's attention depends on the prompt preceding it; only the
+        transcript's rows are then aligned — the SOT tokens are control, not
+        speech, and leaving them in drags the first word's span back to frame 0.
+        """
+        prompt = self._prompt_for(request)
+        ids = torch.tensor([prompt + tokens], dtype=torch.long, device=enc_out.device)
+        heads = self._heads()
+        weights, logits = self._decoder().cross_attention(
+            enc_out, ids, heads, max_frames=self._real_frames(request, enc_out)
+        )
+        # Rows ``len(prompt) - 1 .. -2`` of the logits predict ``tokens``: step
+        # j's distribution sits at the position of the token *before* it.
+        lp = torch.log_softmax(logits[0, len(prompt) - 1 : -1].float(), dim=-1)
+        want = torch.tensor(tokens, dtype=torch.long, device=lp.device)
+        probs = lp.gather(1, want.unsqueeze(1)).squeeze(1).exp().clamp_(0.0, 1.0).tolist()
+
+        spans = token_frame_spans(
+            weights[0, :, len(prompt) :].float().cpu().numpy(),
+            num_frames=int(weights.size(-1)),
+        )
+        if spans is None or len(spans) != len(tokens):
+            return None
+        return [
+            TokenAlignment(
+                token=int(tok),
+                start_frame=float(start),
+                end_frame=float(max(end, start + 1)),
+                confidence=float(prob),
+            )
+            for tok, (start, end), prob in zip(tokens, spans, probs)
+        ]
+
+    def _real_frames(self, request: Request, enc_out: torch.Tensor) -> int:
+        """Encoder frames that are audio rather than the padded 30 s window.
+
+        Whisper's encoder always emits ``max_source_positions`` frames, so a 4 s
+        clip is followed by 26 s of silence the DTW would otherwise walk into.
+        The count comes from the request's own feature-frame estimate divided by
+        the encoder's subsampling — accurate to a frame, which at 20 ms is far
+        finer than the boundary it is protecting.
+        """
+        total = int(enc_out.size(1))
+        frames = int(getattr(request, "num_frames", 0) or 0)
+        if frames <= 0:
+            return total
+        rate = int(getattr(self._model.encoder, "subsampling_rate", 1) or 1)
+        return max(1, min(total, -(-frames // rate)))

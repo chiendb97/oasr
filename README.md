@@ -32,6 +32,8 @@ OASR is flexible and easy to use with:
 - Decoders: CTC greedy and prefix beam, GPU WFST beam search, transducer and AED greedy/beam, CTC+AED rescoring
 - A production Rust frontend with **OpenAI-compatible** HTTP, a realtime WebSocket, and gRPC
 - Real-world audio in: MP3, M4A/AAC, FLAC, OGG, WAV, AIFF and G.711 telephony, at any sample rate
+- Word-level timestamps and confidences across CTC, RNN-T, AED and CIF — each from the model's own
+  alignment, and refused rather than faked by the families that have none
 - An `oasr` CLI and a Python client, so nothing needs writing to try it
 
 ## Supported Models
@@ -122,6 +124,7 @@ native format.
 oasr transcribe meeting.mp3
 oasr translate  entretien.m4a --language fr
 oasr transcribe talk.wav --response-format srt -o talk.srt
+oasr transcribe talk.wav --response-format verbose_json --timestamp-granularity word
 
 # Or in-process, no server at all
 oasr transcribe meeting.mp3 --ckpt-dir /path/to/checkpoint
@@ -147,6 +150,15 @@ text = engine.transcribe_offline("audio.wav")
 
 # Batch — dynamic length-bucketed micro-batches
 texts = engine.transcribe_offline(["a.wav", "b.wav", "c.wav"])
+
+# Word timings and confidences (offline; the families that cannot align refuse)
+from oasr.engine import DecodingOptions
+
+(out,) = engine.transcribe_outputs(
+    [wav], streaming=False, decoding=DecodingOptions(word_timestamps=True)
+)
+for w in out.words:
+    print(f"{w.start:6.2f}-{w.end:6.2f}  {w.confidence:.2f}  {w.word}")
 ```
 
 ### Streaming transcription
@@ -193,7 +205,7 @@ oasr-server \
 
 | Surface | Endpoint                                       | Purpose                                  |
 |---------|------------------------------------------------|------------------------------------------|
-| HTTP    | `POST /v1/audio/transcriptions`                | **OpenAI-compatible** upload. Any container; `json`/`text`/`srt`/`vtt`/`verbose_json`; SSE with `stream=true`. |
+| HTTP    | `POST /v1/audio/transcriptions`                | **OpenAI-compatible** upload. Any container; `json`/`text`/`srt`/`vtt`/`verbose_json`; word timestamps; SSE with `stream=true`. |
 | HTTP    | `POST /v1/audio/translations`                  | The same, translating to English (Whisper-family). |
 | HTTP    | `GET /v1/realtime`                             | **WebSocket** streaming transcription.   |
 | HTTP    | `POST /v1/speech:recognize`                    | Google-STT-shaped unary; raw body, config in the query string — the fastest HTTP path. |

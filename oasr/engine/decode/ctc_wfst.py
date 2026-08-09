@@ -62,6 +62,14 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
     decode_type: ClassVar[str] = "ctc"
     consumes: ClassVar[str] = "log_probs"
     options_cls: ClassVar[type] = CtcWfstOptions
+    # No ``word_timing_modes`` override — the base default is "neither mode",
+    # and that is the honest answer here rather than an omission.  This decoder
+    # emits *word* ids through the lexicon FST, not CTC labels, so the forced
+    # alignment the ``ctc_cuda`` path uses has nothing to align: it would have
+    # to expand each word back through the lexicon first.  The decoder does
+    # track per-arc frames internally, but the batched GPU offline path (the one
+    # the engine uses) does not surface them.  Serve ``ctc_cuda`` for word
+    # timings on the same checkpoint.
 
     def __init__(self, config: "EngineConfig", detok: "Detokenizer", model=None) -> None:
         super().__init__(config, detok, model)
@@ -111,8 +119,12 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
     # ------------------------------------------------------------------
 
     def decode_offline(
-        self, enc_out: torch.Tensor, enc_lengths: torch.Tensor
+        self,
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        requests: Optional[List[Request]] = None,
     ) -> List[RequestOutput]:
+        del requests  # no alignment: see ``word_timing_modes`` above
         cfg = self.options.decoder_config
         # Size the GPU offline decoder's lane pool to the engine's batch width so the
         # whole batch decodes in one GPU launch — batched throughput is the headline

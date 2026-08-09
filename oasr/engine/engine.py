@@ -716,6 +716,7 @@ class ASREngine:
         )
         if self._overlap_admit:
             self._validate_mode(streaming)
+            self._validate_decoding(req)
             # Raise on the caller's thread: a fixed-window violation surfaced
             # from the prep thread would only be logged.
             self._input_processor.check_audio_duration(req.audio)
@@ -725,8 +726,23 @@ class ASREngine:
             return req.request_id
         with self._lock:
             self._validate_mode(streaming)
+            self._validate_decoding(req)
             self._executor.admit(req)
         return req.request_id
+
+    def _validate_decoding(self, request: Request) -> None:
+        """Refuse per-request options the running decode family cannot act on.
+
+        The batched admission paths have always done this; the single-request
+        entry point did not, so the *documented* Python API
+        (``transcribe(decoding=...)``) accepted ``task`` / ``language`` /
+        ``word_timestamps`` on a family with no such control and silently
+        returned a transcript of something else — the one failure mode
+        ``DecodeStrategy.validate_options`` exists to make impossible.
+        """
+        self._output_processor.strategy.validate_options(
+            request.decoding, streaming=request.streaming
+        )
 
     def add_requests_batch(self, specs: List[Dict]) -> List[str]:
         """Bulk admission — single Python entry for many requests.
@@ -800,7 +816,7 @@ class ASREngine:
                 decoding=DecodingOptions.coerce(spec.get("decoding")),
             )
             self._validate_mode(streaming)
-            self._output_processor.strategy.validate_options(req.decoding)
+            self._validate_decoding(req)
             self._executor.admit(req)
         except Exception as exc:
             return {"request_id": rid or "", "error": f"{type(exc).__name__}: {exc}"}
@@ -838,7 +854,7 @@ class ASREngine:
                     decoding=DecodingOptions.coerce(spec.get("decoding")),
                 )
                 self._validate_mode(req.streaming)  # reads immutable executor.streaming
-                self._output_processor.strategy.validate_options(req.decoding)
+                self._validate_decoding(req)
                 # Raise here, not on the prep thread, where it would only be logged.
                 self._input_processor.check_audio_duration(req.audio)
             except Exception as exc:
@@ -1274,18 +1290,45 @@ class ASREngine:
             options the serving layer can, which is the kind of asymmetry that
             sends people to the HTTP surface for things the library can do.
         """
-        is_single = not isinstance(audio, list)
-        audio_list: List = [audio] if is_single else audio  # type: ignore[list-item]
+        outputs = self.transcribe_outputs(
+            audio if isinstance(audio, list) else [audio],
+            sample_rate=sample_rate,
+            streaming=streaming,
+            decoding=decoding,
+        )
+        texts = [o.text for o in outputs]
+        return texts if isinstance(audio, list) else texts[0]
 
+    def transcribe_outputs(
+        self,
+        audio: List[Union[torch.Tensor, "np.ndarray"]],
+        sample_rate: Optional[int] = None,
+        streaming: bool = True,
+        decoding: Optional[Union[DecodingOptions, Dict]] = None,
+    ) -> List[RequestOutput]:
+        """:meth:`transcribe` returning the **whole** output, in input order.
+
+        ``transcribe`` answers with strings, which is what nearly every caller
+        wants and is why it exists.  Everything else a decode produces —
+        ``words``, ``confidence``, ``timestamps``, ``nbest_texts``,
+        ``finish_reason`` — is unreachable through it, so asking for word
+        timings from the library used to mean driving ``add_request`` / ``run``
+        by hand while the HTTP surface returned them in one call.  That
+        asymmetry is what this closes.
+
+        A row the engine never returned (aborted, or dropped) yields an empty
+        output rather than shifting the list, so indices always line up with
+        the inputs.
+        """
         request_ids = [
             self.add_request(a, sample_rate=sample_rate, streaming=streaming, decoding=decoding)
-            for a in audio_list
+            for a in audio
         ]
-        final = self.run()
-
-        id_to_text: Dict[str, str] = {o.request_id: o.text for o in final}
-        texts = [id_to_text.get(rid, "") for rid in request_ids]
-        return texts[0] if is_single else texts
+        by_id: Dict[str, RequestOutput] = {o.request_id: o for o in self.run()}
+        return [
+            by_id.get(rid, RequestOutput(request_id=rid, text="", tokens=[[]], finished=True))
+            for rid in request_ids
+        ]
 
     def transcribe_offline(
         self,

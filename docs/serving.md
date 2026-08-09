@@ -87,6 +87,7 @@ oasr transcribe meeting.mp3                        # against a running server
 oasr transcribe meeting.mp3 --ckpt-dir ./ckpt      # in-process, no server
 oasr translate  entretien.m4a --language fr
 oasr transcribe talk.wav --response-format srt -o talk.srt
+oasr transcribe talk.wav --response-format verbose_json --timestamp-granularity word
 oasr models
 oasr serve --ckpt-dir ./ckpt                       # forwards to oasr-server
 oasr convert /path/to/wenet /path/to/native        # forwards to oasr-convert
@@ -104,6 +105,14 @@ from oasr.client import OASRClient
 client = OASRClient("http://127.0.0.1:8080")
 print(client.transcribe("meeting.mp3").text)
 print(client.translate("entretien.m4a", language="fr").text)
+
+# Word timings — `words` is empty unless asked for, and the request is
+# refused outright if the running decode family cannot align.
+timed = client.transcribe(
+    "meeting.mp3", response_format="verbose_json", timestamp_granularities=["word"]
+)
+for w in timed.words:
+    print(f"{w['start']:6.2f}-{w['end']:6.2f}  {w['word']}")
 ```
 
 and, for live audio, an async iterator over `/v1/realtime`:
@@ -175,21 +184,37 @@ print(client.audio.transcriptions.create(model="whisper-1", file=open("a.mp3", "
 | `prompt` | Prompt override for the speech-LLM family. |
 | `response_format` | `json` (default) · `text` · `srt` · `vtt` · `verbose_json`. |
 | `temperature` | `0` (default) is greedy; `> 0` samples (AR families). |
-| `timestamp_granularities[]` | `segment` is served; `word` returns `501` — see below. |
+| `timestamp_granularities[]` | `segment` and `word`. `word` fills a `words` array; needs `response_format=verbose_json`. |
 | `stream` | `true` streams the transcript as SSE (`json` / `text` formats only). |
 
-**Two deliberate differences from OpenAI, both loud rather than silent:**
+**Word timestamps.** `timestamp_granularities[]=word` with
+`response_format=verbose_json` returns a `words` array:
 
-* `timestamp_granularities[]=word` returns **`501 UNIMPLEMENTED`**. Word
-  alignment is a real gap (`.artifacts/architecture_review.md` H7); answering
-  without the `words` array a client asked for reads as "this audio had no
-  words".
-* `verbose_json` carries **one segment** spanning the utterance — no decode
-  family produces segment boundaries today — and omits `avg_logprob`,
-  `no_speech_prob` and `compression_ratio` rather than filling them with
-  plausible numbers. `end` is the last token's alignment when the family has one
-  (Paraformer CIF), the audio's duration otherwise. `request_id` and
-  `finish_reason` are OASR extensions.
+```json
+{"words": [{"word": "PRINTING", "start": 0.4, "end": 0.68, "confidence": 0.995}]}
+```
+
+`confidence` is an OASR extension (OpenAI has no per-word confidence); a client
+that does not know about it ignores the field. Each `word` is a literal
+substring of `text`, in order, so a caller can highlight a span without
+re-tokenizing.
+
+Not every decode family can align, and the ones that can cannot always do it in
+both modes — a transducer under beam search cannot, and an AED decoder without a
+cross-attention surface cannot at all. The refusal is at admission and names the
+modes that work; a response with the array silently missing would read as "this
+audio had no words". Which family aligns how is in
+[decoding.md § Word timings](decoding.md#word-timings).
+
+The array is **absent**, not empty, when nothing asked for it — the two mean
+different things.
+
+**One deliberate difference from OpenAI that stays loud:** `verbose_json`
+carries **one segment** spanning the utterance — no decode family produces
+segment boundaries today — and omits `avg_logprob`, `no_speech_prob` and
+`compression_ratio` rather than filling them with plausible numbers. `end` is
+the last token's alignment when the family has one, the audio's duration
+otherwise. `request_id` and `finish_reason` are OASR extensions.
 
 `srt` / `vtt` produce a single cue over that same span.
 
@@ -496,7 +521,17 @@ and the `RecognitionConfig` decoding extensions (`max_new_tokens`,
 reserved field-number range.  `max_alternatives` is honored (n-best transcripts
 on beam decode families), `confidence` carries the softmax-normalized n-best
 posterior, and `result_end_time` is set when the decode family produces
-token alignments (Paraformer CIF).
+token alignments.
+
+`enable_word_time_offsets` is honored — Google's own field name and shape.  The
+**top** alternative carries `WordInfo{start_time, end_time, word, confidence}`;
+the others do not, because the engine aligns the hypothesis it returns as
+`transcript`, and timing an alternative the caller is not shown would put one
+transcript's words on another's clock.  Word `confidence` is the mean per-token
+posterior, so unlike the alternative-level one it is defined for a
+single-hypothesis decode — which is every request that did not ask for n-best.
+A family that cannot align rejects the request; see
+[decoding.md § Word timings](decoding.md#word-timings).
 
 `language_code` is **no longer accepted-and-ignored**: it now selects the
 language token on families that have one (Whisper), reduced from BCP-47 to its
@@ -864,8 +899,15 @@ cancel their engine request when the handler future is dropped.  Watch
   go through your LB.
 - **Opus**, AMR, AMR-WB and Speex — see [Audio formats](#audio-formats). Every
   other common container decodes.
-- **Word-level timestamps** — `timestamp_granularities[]=word` returns `501`.
-  Tracked as H7 in `.artifacts/architecture_review.md`.
+- **Segment boundaries** — `verbose_json` returns one segment spanning the
+  utterance. *Word* timings do ship (see above); what no decode family produces
+  is a sentence/phrase segmentation to hang them off.
+- **Word timings on a realtime session** — the *engine* produces them for a
+  streaming CTC or transducer request, but `/v1/realtime` has nowhere to put
+  them: the transcript arrives as deltas and a word list is a property of the
+  finished utterance. The gRPC `StreamingRecognize` final carries them.
+- **Speaker labels** — no diarization, so `WordInfo.speaker_tag` is not in the
+  proto at all rather than present and always zero.
 - TLS termination — assume a reverse proxy handles it.
 - `LongRunningRecognize` (Google STT v1 LRO) — not implemented.
 - `RecognitionConfig.model`, `audio_channel_count`, and

@@ -151,3 +151,23 @@ class Tokenizer(ABC):
         if full.startswith(prev):
             return full[len(prev) :]
         return full
+
+    def token_pieces(self, ids: Sequence[int]) -> List[str]:
+        """Per-token text contributions for one whole sequence, in order.
+
+        ``"".join(token_pieces(ids)) == decode(ids)``: the same contract the
+        deltas of :meth:`decode_incremental` obey, materialised in one call.
+        Word timings need exactly this — to cut a word out of the *rendered*
+        transcript rather than reassembling it from pieces, the grouping has to
+        know which token produced each character.  A token that renders to
+        nothing (a special id, a byte-BPE fragment absorbed by its neighbour)
+        yields ``""`` and owns no characters.
+
+        The default drives :meth:`decode_incremental` one id at a time, which is
+        correct for every kind and inherits that method's complexity — constant
+        per token where it is overridden, quadratic where it is not.  A
+        tokenizer whose rendering is piece-local overrides this with a single
+        pass; the rest are correct as they stand.
+        """
+        state = self.new_decode_state()
+        return [self.decode_incremental((int(i),), state) for i in ids]

@@ -42,7 +42,9 @@ Python functional API (oasr/<family>.py)  — @oasr_api decorated
 | `csrc/templates/` | Jinja2 templates for config-specific CUTLASS instantiations (`gemm_cutlass_template.cu.jinja`, `bmm_cutlass_template.cu.jinja`, `group_gemm_cutlass_template.cu.jinja`) |
 | `csrc/decoder/ctc/` | GPU CTC launcher + binding (`ctc_decoder.cu`, `ctc_decoder_jit_binding.cu`); `ctc/cpu/` holds the CPU-side C++ decoders compiled into `_C.so` — greedy search, prefix beam search, WFST beam search (via k2), the streaming WFST decoder, `ContextGraph` for phrase boosting, and shared `common/utils` |
 | `csrc/decoder/wfst/` | In-tree GPU WFST decoder (TVM-FFI JIT). Its exact-semantics CPU reference oracle is **test-only** and lives separately under `csrc/tests/wfst/`, out of the production decoder library. |
-| `csrc/pybind/` | pybind11 module for the CPU decoder bindings and legacy enums (`pybind_main.cpp`, `pybind_decoder.h`) |
+| `csrc/pybind/` | pybind11 module for the CPU decoder bindings, the alignment bindings and legacy enums (`pybind_main.cpp`, `pybind_decoder.h`, `pybind_alignment.h`) |
+| `csrc/alignment/` | The post-decode alignment pass in C++ — emission frames → per-token spans → words, plus `extract_beam_tokens` / `extract_beam_row`, which turn a padded `[batch, beam, max_len]` host tensor into nested lists.  Not a kernel: plain host data shuffling, compiled into `_C.so` |
+| `csrc/tokenizers/` | The rendering half of the `symbol_table` tokenizer kind (`token_pieces`), which the word grouping calls once per finished hypothesis |
 
 The GPU CTC launcher/binding pair is the **one** that does not live at the
 `csrc/` root (its JIT generator is `oasr/jit/ctc_decoder.py`); everything else
@@ -262,5 +264,23 @@ Seven steps, in order:
 The `/add-cuda-kernel` skill (`.claude/skills/add-cuda-kernel/SKILL.md`) walks
 through each with worked code. `/benchmark-kernel` covers measuring the result.
 
-pybind11 bindings (`csrc/pybind/`) remain only for the CPU-side CTC decoders —
-new kernels do not use them.
+pybind11 bindings (`csrc/pybind/`) remain for the work that is **not** a kernel:
+the CPU-side CTC/WFST decoders and the post-decode alignment pass. New *kernels*
+do not use them — TVM-FFI JIT is the route for anything that runs on the device.
+
+The distinction is about where the work runs, not how fast it is. `csrc/alignment/`
+holds no CUDA at all; it is there because the pass runs on the engine's step-loop
+thread, which holds the GIL for every request the engine finishes, and in Python
+it cost more than the CTC decode it decorated. The beam read-back is the same
+story on the *untimed* path: `out_lengths[b, k]` is a 0-d tensor plus an
+`item()`, and a slice is another tensor, so materialising a 16-beam block row by
+row cost more than the decode's own device→host copy.
+
+Neither has a Python twin in the package — `oasr/engine/decode/alignment.py` is
+marshalling only, because a fallback here is a slow path a deployment lands on
+silently. Both files are in `OASR_SOURCES`, so a successful build always has
+them and no call site checks. So these are the one part of the tree where
+`test-cpu.yml`, which compiles nothing, cannot cover the implementation: the
+rule is checked against a Python oracle kept inside `tests/test_alignment_cpp.py`
+(exact agreement over randomised input and the whole Unicode plane), and that
+file skips without the extension.

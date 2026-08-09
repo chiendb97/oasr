@@ -9,7 +9,7 @@
 
 use bytes::Bytes;
 use numpy::{PyArray1, PyArrayMethods};
-use oasr_wire::{DecodingParams, ErrorCode, Event, ModelInfo};
+use oasr_wire::{DecodingParams, ErrorCode, Event, ModelInfo, WordTiming};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
@@ -411,13 +411,32 @@ impl PyEngine {
                     .and_then(|x| x.extract::<Option<Vec<String>>>().ok())
                     .unwrap_or(None);
                 // Last-token end time from the engine's per-token timestamps
-                // (families with alignments — Paraformer CIF); None otherwise.
+                // (families with alignments); None otherwise.  Indexed rather
+                // than extracted: only the final pair is wanted, and a 30 s
+                // utterance carries hundreds of them — marshalling the whole
+                // list to read its tail is pure cost on this thread, which
+                // holds the GIL for every request the engine finishes.
                 let end_time_s: Option<f32> = item
                     .getattr("timestamps")
                     .ok()
-                    .and_then(|x| x.extract::<Option<Vec<(f32, f32)>>>().ok())
-                    .unwrap_or(None)
-                    .and_then(|ts| ts.last().map(|&(_, end)| end));
+                    .filter(|x| !x.is_none())
+                    .and_then(|ts| ts.get_item(-1).ok())
+                    .and_then(|last| last.extract::<(f32, f32)>().ok())
+                    .map(|(_, end)| end);
+                // `words` is a list of `WordTiming` dataclasses; read field by
+                // field rather than via a serde bridge so an engine predating
+                // the field (or a family that produced none) yields `None`
+                // instead of failing the whole event extraction.
+                let words: Option<Vec<WordTiming>> = item
+                    .getattr("words")
+                    .ok()
+                    .and_then(|x| if x.is_none() { None } else { Some(x) })
+                    .and_then(|list| extract_words(&list).ok());
+                let confidence: Option<f32> = item
+                    .getattr("confidence")
+                    .ok()
+                    .and_then(|x| x.extract::<Option<f32>>().ok())
+                    .unwrap_or(None);
                 let finish_reason: Option<String> = item
                     .getattr("finish_reason")
                     .ok()
@@ -446,6 +465,8 @@ impl PyEngine {
                     scores,
                     nbest_texts,
                     end_time_s,
+                    words,
+                    confidence,
                     finish_reason,
                 }
             } else {
@@ -460,6 +481,25 @@ impl PyEngine {
         }
         Ok(events)
     }
+}
+
+/// Marshal `RequestOutput.words` — a list of `WordTiming` dataclasses.
+///
+/// Field-by-field rather than through a serialization bridge: this runs on the
+/// GIL-holding dispatcher thread once per finished request, and a `json.dumps`
+/// round trip there would cost more than the four `getattr`s it replaces.
+fn extract_words(list: &Bound<'_, PyAny>) -> PyResult<Vec<WordTiming>> {
+    let mut out = Vec::new();
+    for w in list.iter()? {
+        let w = w?;
+        out.push(WordTiming {
+            word: w.getattr("word")?.extract()?,
+            start: w.getattr("start")?.extract()?,
+            end: w.getattr("end")?.extract()?,
+            confidence: w.getattr("confidence")?.extract().unwrap_or(0.0),
+        });
+    }
+    Ok(out)
 }
 
 /// Build the Python-side `decoding` kwargs dict from [`DecodingParams`].
@@ -519,6 +559,11 @@ fn decoding_params_dict<'py>(
             "language" => {
                 if let Some(v) = &p.language {
                     d.set_item(key, v.as_str())?;
+                }
+            }
+            "word_timestamps" => {
+                if let Some(v) = p.word_timestamps {
+                    d.set_item(key, v)?;
                 }
             }
             other => {

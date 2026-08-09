@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use bytes::Bytes;
 use oasr_asr::{decode_audio, parse_encoding, DecodeOptions, EncodingError, SourceEncoding};
-use oasr_wire::{normalize_language, score_posteriors, DecodingParams};
+use oasr_wire::{normalize_language, score_posteriors, DecodingParams, WordTiming};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, field, info, info_span, Instrument, Span};
 
@@ -33,8 +33,25 @@ pub const MAX_BODY: usize = 256 * 1024 * 1024;
 pub struct SpeechRecognitionAlternative {
     pub transcript: String,
     pub confidence: f32,
+    /// Per-word timings, on the **top** alternative only and only when the
+    /// request set `enable_word_time_offsets` — the engine aligns the
+    /// hypothesis it returns as `transcript`, not the whole beam.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<WordInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tokens: Vec<u32>,
+}
+
+/// One word of a transcript, in Google's `WordInfo` shape.  Seconds rather
+/// than the proto `Duration` message, matching how the rest of this surface
+/// reports time (`resultEndTimeS`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WordInfo {
+    pub word: String,
+    pub start_time_s: f32,
+    pub end_time_s: f32,
+    pub confidence: f32,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +123,7 @@ fn build_alternatives(
     scores: Option<Vec<f32>>,
     nbest_texts: Option<Vec<String>>,
     max_alts: u32,
+    words: Option<Vec<WordTiming>>,
 ) -> Vec<SpeechRecognitionAlternative> {
     let cap = if max_alts == 0 { 1 } else { max_alts as usize };
     let rows = if tokens.is_empty() {
@@ -114,6 +132,7 @@ fn build_alternatives(
         tokens
     };
     let confidences = score_posteriors(&scores);
+    let mut words = words;
     rows.into_iter()
         .take(cap)
         .enumerate()
@@ -130,9 +149,24 @@ fn build_alternatives(
                 .as_ref()
                 .and_then(|c| c.get(i).copied())
                 .unwrap_or(0.0),
+            words: if i == 0 {
+                words.take().map(|w| w.into_iter().map(word_info).collect())
+            } else {
+                None
+            }
+            .unwrap_or_default(),
             tokens: ids,
         })
         .collect()
+}
+
+fn word_info(w: WordTiming) -> WordInfo {
+    WordInfo {
+        word: w.word,
+        start_time_s: w.start,
+        end_time_s: w.end,
+        confidence: w.confidence,
+    }
 }
 
 fn error_response(
@@ -181,6 +215,11 @@ pub struct RawParams {
     pub priority: i32,
     #[serde(default)]
     pub max_alternatives: u32,
+    /// Per-word start/end times and confidences on the top alternative
+    /// (Google's own field name).  A decode family that cannot align in this
+    /// request's mode rejects the request rather than answering without it.
+    #[serde(default)]
+    pub enable_word_time_offsets: bool,
     /// Per-request DecodingOptions (autoregressive decode families only —
     /// AED / speech-LLM; CTC ignores them).  Mirror the gRPC
     /// `RecognitionConfig` extension fields.
@@ -221,6 +260,7 @@ impl RawParams {
             prompt: self.prompt.clone().filter(|s| !s.is_empty()),
             task: normalize_task(self.task.as_deref()),
             language: normalize_optional_language(self.language.as_deref())?,
+            word_timestamps: self.enable_word_time_offsets.then_some(true),
         }
         .validated()
     }
@@ -395,6 +435,7 @@ async fn run_offline(
                 final_.scores,
                 final_.nbest_texts,
                 max_alts,
+                final_.words,
             ),
             channel_tag: 0,
             language_code: String::new(),

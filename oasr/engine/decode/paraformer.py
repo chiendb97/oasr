@@ -21,11 +21,12 @@ streaming requests at admission, and the streaming session methods raise.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Tuple
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 
 from ..request import Request, RequestOutput
+from .alignment import TokenAlignment, wants_word_timings
 from .base import DecodeStrategy, register_decode_strategy
 
 if TYPE_CHECKING:
@@ -42,6 +43,13 @@ class ParaformerDecodeStrategy(DecodeStrategy):
     decode_type: ClassVar[str] = "paraformer"
     consumes: ClassVar[str] = "hidden"
 
+    @property
+    def word_timing_modes(self) -> Tuple[str, ...]:
+        """Offline only — so is the family.  Alone among the seven, this one
+        gets its alignment for free: CIF integration has to decide token
+        boundaries to produce the acoustic embeddings at all."""
+        return ("offline",)
+
     def __init__(
         self,
         config: "EngineConfig",
@@ -53,9 +61,6 @@ class ParaformerDecodeStrategy(DecodeStrategy):
         # ``oasr.models.interfaces.CAPABILITIES["paraformer"]``.
         mcfg = model.config
         self._filtered_ids = {int(mcfg.blank_id), int(mcfg.sos_id), int(mcfg.eos_id)}
-        # Seconds per encoder frame: feature hop × LFR decimation.
-        fcfg = config.feature_config
-        self._frame_seconds = float(fcfg.frame_shift_ms) / 1000.0 * int(getattr(fcfg, "lfr_n", 1))
 
     # ------------------------------------------------------------------
     # Offline
@@ -63,7 +68,10 @@ class ParaformerDecodeStrategy(DecodeStrategy):
 
     @torch.no_grad()
     def decode_offline(
-        self, enc_out: torch.Tensor, enc_lengths: torch.Tensor
+        self,
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        requests: Optional[List[Request]] = None,
     ) -> List[RequestOutput]:
         B = enc_out.size(0)
         acoustic_embeds, token_lens, fires = self._model.predict(enc_out, enc_lengths)
@@ -89,40 +97,55 @@ class ParaformerDecodeStrategy(DecodeStrategy):
             row_ids = ids_cpu[b, :n].tolist()
             score = float(lp_cpu[b, :n].sum().item())
             spans = self._token_spans(fires_cpu[b], n)
-            kept: List[int] = []
-            kept_ts: List[Tuple[float, float]] = []
+            probs = lp_cpu[b, :n].exp().tolist()
+            kept: List[TokenAlignment] = []
             for k, tok in enumerate(row_ids):
                 if tok in self._filtered_ids:
                     continue
-                kept.append(tok)
-                kept_ts.append(spans[k])
-            text = self._detok.detokenize(kept)
-            outputs.append(
-                RequestOutput(
-                    request_id="",
-                    text=text,
-                    tokens=[kept],
-                    scores=[score],
-                    finished=True,
-                    timestamps=kept_ts,
+                start, end = spans[k]
+                kept.append(
+                    TokenAlignment(
+                        token=int(tok),
+                        start_frame=start,
+                        end_frame=end,
+                        confidence=float(min(max(probs[k], 0.0), 1.0)),
+                    )
                 )
+            out = RequestOutput(
+                request_id="",
+                text=self._detok.detokenize([a.token for a in kept]),
+                tokens=[[a.token for a in kept]],
+                scores=[score],
+                finished=True,
             )
+            # CIF integration produces the boundaries whether or not anyone
+            # asked, so per-token timings and the confidence are always filled;
+            # the token→word pass is what the request opts into.
+            self.attach_alignment(
+                out, kept, words=requests is not None and wants_word_timings(requests[b])
+            )
+            outputs.append(out)
         return outputs
 
     def _token_spans(self, fires_row: torch.Tensor, n_tokens: int) -> List[Tuple[float, float]]:
-        """CIF fire positions → per-token ``(start_s, end_s)`` spans.
+        """CIF fire positions → per-token ``(start_frame, end_frame)`` spans.
 
         Token *k* ends at the *k*-th frame whose integrated weight fired and
         starts where the previous token ended (0 for the first).  If the fire
         count disagrees with the token count (rounding at the tail), missing
         spans reuse the last boundary — timestamps stay monotonic.
+
+        Frames, not seconds: the shared :class:`FrameClock` converts, and for
+        this frontend one encoder frame *is* one LFR frame (``subsampling_rate``
+        1 × ``lfr_n`` 6 × 10 ms = 60 ms), which is the same number this method
+        used to multiply in itself.
         """
         fire_idx = (fires_row >= 1.0).nonzero(as_tuple=False).reshape(-1).tolist()
         spans: List[Tuple[float, float]] = []
         prev = 0.0
         for k in range(n_tokens):
             end_frame = fire_idx[k] if k < len(fire_idx) else (fire_idx[-1] if fire_idx else 0)
-            end = end_frame * self._frame_seconds
+            end = float(end_frame)
             if end < prev:
                 end = prev
             spans.append((prev, end))

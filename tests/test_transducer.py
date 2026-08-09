@@ -664,7 +664,7 @@ class TestTransducerBeamSearch:
         enc, lengths = self._enc(model)
         strat = self._strategy(model, beam=1, max_sym=1)
         ctx, dp = strat._init_state(enc.size(0), enc.device)  # noqa: SLF001
-        greedy, _, _ = strat._greedy_loop(enc, lengths, ctx, dp)  # noqa: SLF001
+        greedy, _, _, _ = strat._greedy_loop(enc, lengths, ctx, dp)  # noqa: SLF001
         rows, _ = self._beam_rows(model, enc, lengths, beam=1)
         assert [r[0] for r in rows] == greedy
 

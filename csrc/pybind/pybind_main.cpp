@@ -8,6 +8,7 @@
 #include <c10/cuda/CUDAFunctions.h>
 
 #include <oasr/common/types.h>
+#include "pybind_alignment.h"
 #include "pybind_decoder.h"
 
 namespace py = pybind11;
@@ -85,4 +86,9 @@ PYBIND11_MODULE(_C, m) {
     // Decoder bindings
     // =========================================================================
     oasr::pybind::registerDecoderBindings(m);
+
+    // =========================================================================
+    // Alignment / word timings (post-decode, off the interpreter)
+    // =========================================================================
+    oasr::pybind::registerAlignmentBindings(m);
 }

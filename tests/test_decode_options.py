@@ -221,6 +221,7 @@ class TestPerRequestOptionTable:
             "prompt",
             "task",
             "language",
+            "word_timestamps",
         )
 
     def test_every_field_survives_a_dict_round_trip(self):
@@ -235,6 +236,7 @@ class TestPerRequestOptionTable:
             "prompt": "hi",
             "task": "translate",
             "language": "fr",
+            "word_timestamps": True,
         }
         got = DecodingOptions.coerce(sent)
         for k, v in sent.items():

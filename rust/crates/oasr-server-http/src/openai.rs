@@ -14,10 +14,12 @@
 //!
 //! Two places where OASR is deliberately *not* silent about a difference:
 //!
-//! * `timestamp_granularities[]=word` is rejected rather than answered without
-//!   the `words` array. Word alignment is a real gap (`.artifacts/architecture_review.md`
-//!   H7), and a `verbose_json` response missing the field the client asked for
-//!   reads as "this audio had no words".
+//! * `timestamp_granularities[]=word` is honoured by the decode families that
+//!   can align, and **rejected at admission** by the ones that cannot (the WFST
+//!   decoder, and any family running in streaming mode without a
+//!   frame-synchronous emission). A `verbose_json` response missing the array a
+//!   client explicitly asked for reads as "this audio had no words", which is a
+//!   worse answer than an error naming the gap.
 //! * `segments` carries one segment spanning the utterance, with only the
 //!   fields OASR can actually compute. `avg_logprob` / `no_speech_prob` /
 //!   `compression_ratio` are omitted rather than filled with plausible numbers.
@@ -297,6 +299,17 @@ impl AudioForm {
             .filter(|ext| oasr_asr::container_from_hint(ext).is_some())
     }
 
+    /// Whether `timestamp_granularities[]` asked for word-level times.
+    ///
+    /// OpenAI only honours the parameter with `response_format=verbose_json`,
+    /// and so does this: the other formats have nowhere to put the array, and
+    /// paying for an alignment whose result is then dropped is worse than
+    /// ignoring a parameter that could not have been rendered anyway.
+    fn wants_words(&self) -> bool {
+        matches!(self.response_format, ResponseFormat::VerboseJson)
+            && self.granularities.iter().any(|g| g == "word")
+    }
+
     /// Map the form's knobs to the engine's per-request decoding options.
     fn decoding_params(&self, endpoint: Endpoint) -> Result<Option<DecodingParams>, String> {
         DecodingParams {
@@ -310,6 +323,7 @@ impl AudioForm {
             // `/v1/audio/translations` *is* the task; there is no form field.
             task: normalize_task(endpoint.task()),
             language: normalize_optional_language(self.language.as_deref())?,
+            word_timestamps: self.wants_words().then_some(true),
         }
         .validated()
     }
@@ -338,6 +352,18 @@ struct VerboseSegment {
     temperature: Option<f32>,
 }
 
+/// One word of a `verbose_json` response — OpenAI's shape exactly.
+#[derive(Debug, Serialize)]
+struct VerboseWord {
+    word: String,
+    start: f32,
+    end: f32,
+    /// OASR extension: the mean per-token posterior over the word's tokens.
+    /// OpenAI does not return a per-word confidence, and a client that does not
+    /// know about it ignores the field.
+    confidence: f32,
+}
+
 #[derive(Debug, Serialize)]
 struct VerboseResponse {
     task: &'static str,
@@ -346,6 +372,11 @@ struct VerboseResponse {
     duration: f32,
     text: String,
     segments: Vec<VerboseSegment>,
+    /// Present only when `timestamp_granularities[]=word` was asked for —
+    /// absent and empty mean different things, so the field is omitted rather
+    /// than serialised as `[]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    words: Option<Vec<VerboseWord>>,
     /// OASR extensions: the server-assigned id (for correlating with logs and
     /// `oasr_requests_*` metrics) and the generation stop reason.
     request_id: String,
@@ -420,17 +451,27 @@ async fn handle_audio(State(s): State<AppState>, form: Multipart, endpoint: Endp
             }
         }
 
-        // Word timestamps are a declared gap, not an omission.  Answering
-        // without the `words` array a client explicitly requested would read as
-        // "no words were found".
-        if form.granularities.iter().any(|g| g == "word") {
-            return api_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "invalid_request_error",
+        // `timestamp_granularities[]` is only meaningful for verbose_json, and
+        // saying so beats silently dropping it: a client that asked for word
+        // times and got `{"text": ...}` has no way to tell the request was
+        // understood.  (The *decode family's* ability to align is checked at
+        // admission, where the engine knows which one is running.)
+        if !form.granularities.is_empty()
+            && !matches!(form.response_format, ResponseFormat::VerboseJson)
+        {
+            return invalid_request(
                 Some("timestamp_granularities"),
-                "word-level timestamps are not available yet; ask for \
-                 timestamp_granularities[]=segment, which returns one segment \
-                 spanning the utterance",
+                "timestamp_granularities[] requires response_format=verbose_json",
+            );
+        }
+        if form
+            .granularities
+            .iter()
+            .any(|g| g != "word" && g != "segment")
+        {
+            return invalid_request(
+                Some("timestamp_granularities"),
+                "timestamp_granularities[] accepts \"word\" and \"segment\"",
             );
         }
         if form.stream && !form.response_format.streamable() {
@@ -534,6 +575,19 @@ async fn handle_audio(State(s): State<AppState>, form: Multipart, endpoint: Endp
                     tokens: final_.tokens.first().cloned().unwrap_or_default(),
                     temperature: form.temperature,
                 }],
+                words: form.wants_words().then(|| {
+                    final_
+                        .words
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|w| VerboseWord {
+                            word: w.word,
+                            start: w.start,
+                            end: w.end,
+                            confidence: w.confidence,
+                        })
+                        .collect()
+                }),
                 text: final_.text,
                 request_id: final_.request_id,
                 finish_reason: final_.finish_reason,

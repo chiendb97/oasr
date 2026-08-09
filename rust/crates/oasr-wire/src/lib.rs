@@ -47,6 +47,11 @@ pub struct DecodingParams {
     /// reduce `"en-US"` before it gets here.
     #[serde(default)]
     pub language: Option<String>,
+    /// Per-word timings and confidences on the final result.  Costs a real
+    /// alignment pass in the engine, so it is opt-in per request; a family that
+    /// cannot align in the request's mode rejects it at admission.
+    #[serde(default)]
+    pub word_timestamps: Option<bool>,
 }
 
 /// Sampling-temperature bounds, mirroring `oasr.engine.request.MIN_TEMPERATURE`
@@ -109,6 +114,7 @@ impl DecodingParams {
         "prompt",
         "task",
         "language",
+        "word_timestamps",
     ];
 
     /// Whether every field is `None` — callers skip building the Python-side
@@ -267,10 +273,20 @@ pub enum Event {
         #[serde(default)]
         nbest_texts: Option<Vec<String>>,
         /// End time (seconds) of the last decoded token, from the engine's
-        /// per-token timestamps (decode families with alignments —
-        /// Paraformer CIF).  Maps to the proto `result_end_time`.
+        /// per-token timestamps (decode families with alignments).  Maps to the
+        /// proto `result_end_time`.
         #[serde(default)]
         end_time_s: Option<f32>,
+        /// Per-word timings for the best hypothesis, present only when the
+        /// request asked for them and the decode family produced them.
+        #[serde(default)]
+        words: Option<Vec<WordTiming>>,
+        /// Mean per-token posterior of the best hypothesis, in [0, 1].  Unlike
+        /// the n-best posterior derived from `scores`, this is defined for a
+        /// single-hypothesis decode — which is every request that did not ask
+        /// for alternatives.
+        #[serde(default)]
+        confidence: Option<f32>,
         /// Why generation stopped: `"stop"` (EOS) or `"length"` (hit
         /// `max_new_tokens` / the cache ceiling).  Without it a transcript
         /// truncated by the generation cap is indistinguishable from a
@@ -332,6 +348,19 @@ pub enum ErrorCode {
     Shutdown,
     #[serde(rename = "WORKER_LOST")]
     WorkerLost,
+}
+
+/// One word of a transcript with its span in seconds and its confidence.
+///
+/// `word` is a literal substring of the final transcript, in order — the engine
+/// cuts words out of the rendered text rather than reassembling them from
+/// tokens, so a client can highlight a span without re-tokenizing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WordTiming {
+    pub word: String,
+    pub start: f32,
+    pub end: f32,
+    pub confidence: f32,
 }
 
 /// Softmax-normalized posteriors over the returned n-best scores.
@@ -410,6 +439,7 @@ mod tests {
             prompt: Some("x".into()),
             task: Some("transcribe".into()),
             language: Some("en".into()),
+            word_timestamps: Some(true),
         };
         let json = serde_json::to_value(&all).expect("serialize");
         let mut fields: Vec<&str> = json
@@ -450,6 +480,7 @@ mod tests {
             prompt: Some("transcribe".into()),
             task: Some("translate".into()),
             language: Some("fr".into()),
+            word_timestamps: Some(true),
         };
         assert_eq!(ok.clone().validated().unwrap(), Some(ok));
     }

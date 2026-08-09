@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -38,6 +38,7 @@ from oasr.models.decoders.transformer_decoder import add_sos_eos, reverse_pad_li
 
 from ..request import Request, RequestOutput
 from .base import DecodeStrategy, EncodeOutput, register_decode_strategy
+from .ctc_align import attach_emission_timings
 from .options import option, option_factory
 
 if TYPE_CHECKING:
@@ -108,6 +109,13 @@ class CtcAedRescoringStrategy(DecodeStrategy):
     consumes = "both"
     options_cls = RescoringOptions
 
+    @property
+    def word_timing_modes(self) -> Tuple[str, ...]:
+        """Offline-only by construction — so is the family.  The alignment runs
+        against the CTC log-probs, on whichever hypothesis *won the fusion*,
+        which is the one the caller is shown."""
+        return ("offline",)
+
     def __init__(
         self,
         config: "EngineConfig",
@@ -144,7 +152,10 @@ class CtcAedRescoringStrategy(DecodeStrategy):
     # ------------------------------------------------------------------
 
     def decode_offline(
-        self, enc_out: EncodeOutput, enc_lengths: torch.Tensor
+        self,
+        enc_out: EncodeOutput,
+        enc_lengths: torch.Tensor,
+        requests: Optional[List[Request]] = None,
     ) -> List[RequestOutput]:
         assert isinstance(enc_out, EncodeOutput), (
             "ctc_aed_rescoring consumes 'both'; the executor must pass an "
@@ -163,6 +174,7 @@ class CtcAedRescoringStrategy(DecodeStrategy):
             max_seq_len=cfg.max_seq_len,
             use_paged_memory=cfg.use_paged_memory,
             page_size=cfg.page_size,
+            want_times=requests is not None,
         )
         B = hidden.size(0)
         device = hidden.device
@@ -236,11 +248,13 @@ class CtcAedRescoringStrategy(DecodeStrategy):
 
         fused_cpu = fused.cpu().tolist()
         outputs: List[RequestOutput] = []
+        winners: List[int] = []
         for b in range(B):
             # Re-rank the CTC beam by fused score (stable, so exact ties keep
             # the CTC order); the head of the ranking is the rescored result.
             order = sorted(range(beam), key=lambda k: fused_cpu[b][k], reverse=True)
             token_seqs = [result.tokens[b][k] for k in order]
+            winners.append(order[0])
             outputs.append(
                 RequestOutput(
                     request_id="",
@@ -249,6 +263,14 @@ class CtcAedRescoringStrategy(DecodeStrategy):
                     scores=[fused_cpu[b][k] for k in order],
                     finished=True,
                 )
+            )
+        if requests is not None and log_probs is not None:
+            # Time the hypothesis that *won the fusion*, not the CTC-best.
+            # Rescoring exists precisely because the two disagree, and the beam
+            # recorded a frame list per row — so the winner's timings are an
+            # index, not a re-derivation.
+            attach_emission_timings(
+                self, requests, outputs, result.times, log_probs, beam_index=winners
             )
         return outputs
 
