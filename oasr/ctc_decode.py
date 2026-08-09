@@ -41,8 +41,9 @@ from __future__ import annotations
 import functools
 import math
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -82,11 +83,19 @@ class GpuDecoderResult:
 
     Attributes:
         tokens: Nested list ``[batch][beam][token_ids]`` of decoded sequences.
+        times: Indexed ``[batch][beam][frame_index]``, aligned 1:1 with
+            ``tokens`` — the encoder frame each token was emitted at.  Empty
+            (``[]``) unless the caller asked (``want_times=True``): the beam
+            records it as it decodes, but reading it back is a device→host copy
+            the transcript-only path should not pay.  When asked, it is a lazy
+            view rather than a nested list, because only one beam per batch row
+            is ever read — index it and the row materialises.
         lengths: Tensor ``[batch, beam]`` of decoded sequence lengths (int32, CUDA).
         scores: Tensor ``[batch, beam]`` of beam log-probabilities (float32, CUDA).
     """
 
     tokens: List[List[List[int]]] = field(default_factory=list)
+    times: Sequence = field(default_factory=list)
     lengths: Optional[torch.Tensor] = None
     scores: Optional[torch.Tensor] = None
 
@@ -166,17 +175,17 @@ class StreamHandle:
         """Process one chunk using the bound state."""
         self._decoder.decode_chunk(log_prob, state=self._state)
 
-    def finalize_stream(self) -> GpuDecoderResult:
+    def finalize_stream(self, want_times: bool = False) -> GpuDecoderResult:
         """Finalize and return results from the bound state."""
-        return self._decoder.finalize_stream(state=self._state)
+        return self._decoder.finalize_stream(state=self._state, want_times=want_times)
 
-    def peek(self) -> GpuDecoderResult:
+    def peek(self, want_times: bool = False) -> GpuDecoderResult:
         """Snapshot the current best hypothesis without finalising.
 
         Safe to call after each :meth:`decode_chunk`; the underlying
         ``read_streaming_results`` kernel is a pure device-to-device copy.
         """
-        return self._decoder.peek_state(state=self._state)
+        return self._decoder.peek_state(state=self._state, want_times=want_times)
 
     @property
     def step(self) -> int:
@@ -208,20 +217,105 @@ def _get_ctc_decoder_module():
     return _get_ctc_decoder_module_variant(use_fused)
 
 
+#: An empty int32 tensor stands for "times not wanted" at the FFI boundary —
+#: the same convention ``is_speech_mask`` uses in the same launcher.
+_NO_TIMES = torch.empty(0, dtype=torch.int32)
+
+
+#: The C++ beam read-back (``oasr._C.alignment``).  In Python it was two tensor
+#: operations per (row, beam) — an index producing a 0-d tensor for the length,
+#: then a slice — which at beam 16 cost more than the decode's own device→host
+#: copy, on the engine's step-loop thread, for every request.  There is no
+#: Python version of it left.
+#:
+#: ``None`` only where the extension is absent or predates it, which
+#: ``pip install -e .`` never leaves behind — so nothing below defends against
+#: the ``None``.  Resolution is tolerant because this module is imported by
+#: ``import oasr`` itself: a hard import here would take the whole package down
+#: on ``test-cpu.yml``, which compiles nothing.
+try:
+    from oasr import _C  # type: ignore[attr-defined]
+
+    _CPP = _C.alignment
+except (ImportError, AttributeError):  # pragma: no cover - no extension built
+    _CPP = None
+
+
+def _times_out(want: bool, like: torch.Tensor) -> torch.Tensor:
+    """The ``out_times`` argument: a real buffer, or the empty sentinel."""
+    return torch.empty_like(like) if want else _NO_TIMES
+
+
+class _LazyBeamTimes(Sequence):
+    """One batch row's per-beam emission frames, materialised on indexing."""
+
+    __slots__ = ("_times", "_lengths", "_b", "_beam")
+
+    def __init__(self, times: torch.Tensor, lengths: torch.Tensor, b: int, beam: int) -> None:
+        self._times, self._lengths, self._b, self._beam = times, lengths, b, beam
+
+    def __len__(self) -> int:
+        return self._beam
+
+    def __getitem__(self, k):  # type: ignore[override]
+        if isinstance(k, slice):
+            return [self[i] for i in range(*k.indices(self._beam))]
+        if k < 0:
+            k += self._beam
+        if not 0 <= k < self._beam:
+            raise IndexError(k)
+        return _CPP.extract_beam_row(self._times, self._lengths, self._b, k)
+
+
+class _LazyTimes(Sequence):
+    """``result.times`` — indexed as ``[batch][beam]``, built where indexed.
+
+    The tensor comes back from the device whole (one copy, riding the sync the
+    tokens already pay for), but turning it into Python lists is the expensive
+    half and only **one beam per row** is ever read: the decode's best, or
+    rescoring's fusion winner.  Materialising all ``beam_size`` of them was
+    ~10× the list-building for nothing, on the decode path.
+    """
+
+    __slots__ = ("_times", "_lengths", "_batch", "_beam")
+
+    def __init__(self, times: torch.Tensor, lengths: torch.Tensor, batch: int, beam: int) -> None:
+        self._times, self._lengths, self._batch, self._beam = times, lengths, batch, beam
+
+    def __len__(self) -> int:
+        return self._batch
+
+    def __getitem__(self, b):  # type: ignore[override]
+        if isinstance(b, slice):
+            return [self[i] for i in range(*b.indices(self._batch))]
+        if b < 0:
+            b += self._batch
+        if not 0 <= b < self._batch:
+            raise IndexError(b)
+        return _LazyBeamTimes(self._times, self._lengths, b, self._beam)
+
+
 def _extract_tokens(
-    out_tokens: torch.Tensor, out_lengths: torch.Tensor, batch: int, beam_size: int
-) -> List[List[List[int]]]:
-    """Convert padded token tensor to nested Python lists."""
+    out_tokens: torch.Tensor,
+    out_lengths: torch.Tensor,
+    batch: int,
+    beam_size: int,
+    out_times: Optional[torch.Tensor] = None,
+) -> Tuple[List[List[List[int]]], Sequence]:
+    """Convert the padded token (and frame) tensors to nested Python lists.
+
+    One device→host copy each — the times ride along in the same sync rather
+    than costing a second one — but the frames are then handed back as a lazy
+    view (:class:`_LazyTimes`): every token row is read, only one frame row per
+    batch row is.
+    """
     out_tokens_cpu = out_tokens.cpu()
     out_lengths_cpu = out_lengths.cpu()
-    tokens = []
-    for b in range(batch):
-        batch_tokens = []
-        for k in range(beam_size):
-            length = int(out_lengths_cpu[b, k])
-            batch_tokens.append(out_tokens_cpu[b, k, :length].tolist())
-        tokens.append(batch_tokens)
-    return tokens
+    times_cpu = out_times.cpu() if out_times is not None and out_times.numel() else None
+    tokens = _CPP.extract_beam_tokens(out_tokens_cpu, out_lengths_cpu, beam_size)
+    if times_cpu is None:
+        return tokens, []
+    return tokens, _LazyTimes(times_cpu, out_lengths_cpu, batch, beam_size)
 
 
 @oasr_api
@@ -234,6 +328,7 @@ def ctc_beam_search_decode(
     max_seq_len: int = 200,
     use_paged_memory: bool = False,
     page_size: int = 16,
+    want_times: bool = False,
 ) -> GpuDecoderResult:
     """GPU-accelerated CTC prefix beam search decode (offline, full sequence).
 
@@ -255,11 +350,17 @@ def ctc_beam_search_decode(
         Use paged-attention-style memory for decoded sequences.
     page_size : int
         Tokens per page when ``use_paged_memory=True`` (default 16).
+    want_times : bool
+        Also return the encoder frame each token was emitted at
+        (:attr:`GpuDecoderResult.times`).  The beam records these while it
+        decodes; this only asks for them to be copied back, which is why it is
+        opt-in rather than always on.
 
     Returns
     -------
     GpuDecoderResult
-        Decoded tokens, lengths, and scores for each batch and beam.
+        Decoded tokens, lengths, and scores for each batch and beam — plus
+        per-token emission frames when ``want_times``.
     """
     mod = _get_ctc_decoder_module()
     batch = log_prob.size(0)
@@ -284,12 +385,14 @@ def ctc_beam_search_decode(
 
     # Allocate outputs
     out_tokens = torch.empty(batch, beam_size, max_seq_len, dtype=torch.int32, device=device)
+    out_times = _times_out(want_times, out_tokens)
     out_lengths = torch.empty(batch, beam_size, dtype=torch.int32, device=device)
     out_scores = torch.empty(batch, beam_size, dtype=torch.float32, device=device)
 
     if use_paged_memory:
         mod.ctc_beam_search_decode_paged(
             out_tokens,
+            out_times,
             out_lengths,
             out_scores,
             log_prob,
@@ -303,6 +406,7 @@ def ctc_beam_search_decode(
     else:
         mod.ctc_beam_search_decode(
             out_tokens,
+            out_times,
             out_lengths,
             out_scores,
             log_prob,
@@ -313,8 +417,8 @@ def ctc_beam_search_decode(
             blank_threshold,
         )
 
-    tokens = _extract_tokens(out_tokens, out_lengths, batch, beam_size)
-    return GpuDecoderResult(tokens=tokens, lengths=out_lengths, scores=out_scores)
+    tokens, times = _extract_tokens(out_tokens, out_lengths, batch, beam_size, out_times)
+    return GpuDecoderResult(tokens=tokens, times=times, lengths=out_lengths, scores=out_scores)
 
 
 class GpuStreamingDecoder:
@@ -762,6 +866,7 @@ class GpuStreamingDecoder:
     def peek_state(
         self,
         state: Optional[StreamState] = None,
+        want_times: bool = False,
     ) -> GpuDecoderResult:
         """Snapshot the current best-so-far hypothesis from ``state``.
 
@@ -792,12 +897,14 @@ class GpuStreamingDecoder:
         out_tokens = torch.empty(
             batch, cfg.beam_size, cfg.max_seq_len, dtype=torch.int32, device=device
         )
+        out_times = _times_out(want_times, out_tokens)
         out_lengths = torch.empty(batch, cfg.beam_size, dtype=torch.int32, device=device)
         out_scores = torch.empty(batch, cfg.beam_size, dtype=torch.float32, device=device)
 
         use_paged = 1 if cfg.use_paged_memory else 0
         self._mod.ctc_beam_search_read_state(
             out_tokens,
+            out_times,
             out_lengths,
             out_scores,
             s.buffer,
@@ -810,12 +917,13 @@ class GpuStreamingDecoder:
             cfg.page_size,
         )
 
-        tokens = _extract_tokens(out_tokens, out_lengths, batch, cfg.beam_size)
-        return GpuDecoderResult(tokens=tokens, lengths=out_lengths, scores=out_scores)
+        tokens, times = _extract_tokens(out_tokens, out_lengths, batch, cfg.beam_size, out_times)
+        return GpuDecoderResult(tokens=tokens, times=times, lengths=out_lengths, scores=out_scores)
 
     def peek_states(
         self,
         states: List[StreamState],
+        want_times: bool = False,
     ) -> List[GpuDecoderResult]:
         """Batched non-destructive snapshot for **many states in ONE D→H sync**.
 
@@ -839,7 +947,7 @@ class GpuStreamingDecoder:
         if n == 0:
             return []
         if any(s.batch != 1 for s in states):
-            return [self.peek_state(state=s) for s in states]
+            return [self.peek_state(state=s, want_times=want_times) for s in states]
 
         cfg = self._config
         beam = cfg.beam_size
@@ -848,11 +956,13 @@ class GpuStreamingDecoder:
         use_paged = 1 if cfg.use_paged_memory else 0
 
         out_tokens = torch.empty(n, beam, msl, dtype=torch.int32, device=device)
+        out_times = _times_out(want_times, out_tokens)
         out_lengths = torch.empty(n, beam, dtype=torch.int32, device=device)
         out_scores = torch.empty(n, beam, dtype=torch.float32, device=device)
         for i, s in enumerate(states):
             self._mod.ctc_beam_search_read_state(
                 out_tokens[i : i + 1],
+                out_times[i : i + 1] if want_times else out_times,
                 out_lengths[i : i + 1],
                 out_scores[i : i + 1],
                 s.buffer,
@@ -865,18 +975,23 @@ class GpuStreamingDecoder:
                 cfg.page_size,
             )
 
-        # Single device→host sync for the entire ready set.
+        # Single device→host sync for the entire ready set; the emission frames
+        # ride in the same one rather than costing a second.
         out_tokens_cpu = out_tokens.cpu()
         out_lengths_cpu = out_lengths.cpu()
+        out_times_cpu = out_times.cpu() if want_times else None
+        all_beams = _CPP.extract_beam_tokens(out_tokens_cpu, out_lengths_cpu, beam)
         results: List[GpuDecoderResult] = []
         for i in range(n):
-            beams: List[List[int]] = []
-            for k in range(beam):
-                length = int(out_lengths_cpu[i, k])
-                beams.append(out_tokens_cpu[i, k, :length].tolist())
+            beams = all_beams[i]
             results.append(
                 GpuDecoderResult(
                     tokens=[beams],
+                    times=(
+                        _LazyTimes(out_times_cpu[i : i + 1], out_lengths_cpu[i : i + 1], 1, beam)
+                        if out_times_cpu is not None
+                        else []
+                    ),
                     lengths=out_lengths[i : i + 1],
                     scores=out_scores[i : i + 1],
                 )
@@ -1003,6 +1118,7 @@ class GpuStreamingDecoder:
     def finalize_stream(
         self,
         state: Optional[StreamState] = None,
+        want_times: bool = False,
     ) -> GpuDecoderResult:
         """Read the final hypothesis from ``state`` at end-of-stream.
 
@@ -1010,7 +1126,7 @@ class GpuStreamingDecoder:
         terminal bookkeeping, it just copies the current beam state out.
         Kept as a separate name so end-of-stream call sites read clearly.
         """
-        return self.peek_state(state=state)
+        return self.peek_state(state=state, want_times=want_times)
 
     # ------------------------------------------------------------------
     # Properties

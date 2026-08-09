@@ -194,7 +194,13 @@ int64_t ctc_decoder_state_size(int64_t batch, int64_t beam,
 // Full offline decode
 // =============================================================================
 
-void ctc_beam_search_decode(TensorView out_tokens, TensorView out_lengths,
+// ``out_times`` is an output like ``out_tokens`` and carries the encoder frame
+// each token was emitted at, in the same [batch, beam, max_out_len] layout.  An
+// **empty** tensor means "not wanted" — the same convention ``is_speech_mask``
+// uses in this file — so the transcript-only path pays neither the allocation
+// nor the copy.
+void ctc_beam_search_decode(TensorView out_tokens, TensorView out_times,
+                            TensorView out_lengths,
                             TensorView out_scores, TensorView log_prob,
                             TensorView seq_lengths, TensorView workspace,
                             int64_t beam, int64_t blank_id,
@@ -239,7 +245,8 @@ void ctc_beam_search_decode(TensorView out_tokens, TensorView out_lengths,
       max_seq_len, max_out_len,
       static_cast<int>(blank_id), -1, // space_id = -1 (unused)
       static_cast<float>(blank_threshold),
-      stream);
+      stream,
+      out_times.numel() > 0 ? static_cast<int*>(out_times.data_ptr()) : nullptr);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "CTC beam search decode failed: " << cudaGetErrorString(status);
@@ -331,7 +338,8 @@ int64_t ctc_decoder_paged_state_size(int64_t batch, int64_t beam,
 // Paged: full offline decode
 // =============================================================================
 
-void ctc_beam_search_decode_paged(TensorView out_tokens, TensorView out_lengths,
+void ctc_beam_search_decode_paged(TensorView out_tokens, TensorView out_times,
+                                  TensorView out_lengths,
                                   TensorView out_scores, TensorView log_prob,
                                   TensorView seq_lengths, TensorView workspace,
                                   int64_t beam, int64_t blank_id,
@@ -378,7 +386,8 @@ void ctc_beam_search_decode_paged(TensorView out_tokens, TensorView out_lengths,
       static_cast<int>(blank_id), -1,
       static_cast<float>(blank_threshold),
       static_cast<int>(page_size), 0,  // num_pages=0 → auto
-      stream);
+      stream,
+      out_times.numel() > 0 ? static_cast<int*>(out_times.data_ptr()) : nullptr);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "CTC paged beam search decode failed: " << cudaGetErrorString(status);
@@ -876,7 +885,8 @@ void ctc_beam_search_chunk_batched(TensorView state_ptrs,
 // Streaming: read results
 // =============================================================================
 
-void ctc_beam_search_read_state(TensorView out_tokens, TensorView out_lengths,
+void ctc_beam_search_read_state(TensorView out_tokens, TensorView out_times,
+                                TensorView out_lengths,
                                 TensorView out_scores, TensorView state_buffer,
                                 int64_t step, int64_t batch, int64_t beam,
                                 int64_t vocab_size, int64_t max_seq_len,
@@ -902,7 +912,8 @@ void ctc_beam_search_read_state(TensorView out_tokens, TensorView out_lengths,
       static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
       static_cast<int>(use_paged_memory), static_cast<int>(page_size),
       0,  // num_pages=0 → auto
-      stream);
+      stream,
+      out_times.numel() > 0 ? static_cast<int*>(out_times.data_ptr()) : nullptr);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "CTC beam search read state failed: " << cudaGetErrorString(status);

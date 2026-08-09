@@ -247,11 +247,19 @@ class TestTaskAndLanguagePrompt:
         class _NoControl:
             decode_type = "ctc"
             selective_options = ()
+            # No alignment either, so the whole selective-option table is
+            # exercised rather than just the two prompt slots.
+            word_timing_modes = ()
+            _clock = None
+            _SELECTIVE_UNSET = DecodeStrategy._SELECTIVE_UNSET
             validate_options = DecodeStrategy.validate_options
+            _require_word_timings = DecodeStrategy._require_word_timings
 
         for opts in (DecodingOptions(task="translate"), DecodingOptions(language="fr")):
             with pytest.raises(ValueError, match="cannot honour"):
                 _NoControl().validate_options(opts)
+        with pytest.raises(ValueError, match="cannot produce word timestamps"):
+            _NoControl().validate_options(DecodingOptions(word_timestamps=True))
         # Everything else stays accepted: a sampling knob a family ignores
         # returns the same transcript, which is a performance surprise at worst.
         _NoControl().validate_options(DecodingOptions(temperature=0.7, n_best=3))

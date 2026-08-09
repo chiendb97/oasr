@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -23,7 +23,9 @@ from oasr.ctc_decode import GpuDecoderConfig, GpuDecoderResult, ctc_beam_search_
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from ..request import Request, RequestOutput
+from .alignment import wants_word_timings
 from .base import DecodeStrategy, register_decode_strategy
+from .ctc_align import attach_emission_timings
 from .options import option_factory
 
 if TYPE_CHECKING:
@@ -55,6 +57,18 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
     decode_type: ClassVar[str] = "ctc"
     consumes: ClassVar[str] = "log_probs"
     options_cls: ClassVar[type] = CtcGpuOptions
+
+    @property
+    def word_timing_modes(self) -> Tuple[str, ...]:
+        """Both modes.
+
+        The beam records the encoder frame it emitted each token at, as it
+        emits it (``ctc_decoder.cuh``'s ``ctime`` / ``time_storage``), so asking
+        for word timings is a read rather than a second pass — and works for a
+        stream, whose log-probs are long gone by the time the transcript is
+        final.
+        """
+        return ("offline", "streaming")
 
     def __init__(self, config: "EngineConfig", detok: "Detokenizer", model=None) -> None:
         super().__init__(config, detok, model)
@@ -99,9 +113,13 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
     # ------------------------------------------------------------------
 
     def decode_offline(
-        self, enc_out: torch.Tensor, enc_lengths: torch.Tensor
+        self,
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        requests: Optional[List[Request]] = None,
     ) -> List[RequestOutput]:
         cfg = self.options.decoder_config
+        want_times = requests is not None
         result: GpuDecoderResult = ctc_beam_search_decode(
             enc_out,
             enc_lengths,
@@ -111,6 +129,7 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
             max_seq_len=cfg.max_seq_len,
             use_paged_memory=cfg.use_paged_memory,
             page_size=cfg.page_size,
+            want_times=want_times,
         )
         outputs = []
         scores_t = result.scores.cpu().tolist() if result.scores is not None else None
@@ -128,6 +147,8 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
                     finished=True,
                 )
             )
+        if want_times:
+            attach_emission_timings(self, requests or [], outputs, result.times, enc_out)
         return outputs
 
     # ------------------------------------------------------------------
@@ -294,16 +315,26 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
     def finalize(self, request: Request) -> RequestOutput:
         sid = request.stream_id
         assert sid is not None
+        want_times = wants_word_timings(request)
         handle = self._ensure_ctc_mgr().get_decoder(sid)
-        result: GpuDecoderResult = handle.finalize_stream()
+        result: GpuDecoderResult = handle.finalize_stream(want_times=want_times)
         token_seqs = result.tokens[0] if result.tokens else []
         best = token_seqs[0] if token_seqs else []
         beam_scores = result.scores.cpu().tolist()[0] if result.scores is not None else None
         text = self._detok.detokenize(best)
-        return RequestOutput(
+        out = RequestOutput(
             request_id=request.request_id,
             text=text,
             tokens=token_seqs,
             scores=beam_scores,
             finished=True,
         )
+        if want_times and result.times and result.times[0]:
+            # The frames are stream-absolute, recorded as the beam decoded each
+            # chunk — no log-probs are retained, which is why this works in
+            # streaming at all.  Confidences are not available here for the same
+            # reason: the distribution those frames were chosen from is gone.
+            frames = result.times[0][0]
+            if len(frames) == len(best):
+                self.attach_emission_alignment(out, best, frames)
+        return out

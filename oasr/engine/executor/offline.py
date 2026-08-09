@@ -518,7 +518,9 @@ class OfflineExecutor(Executor):
             return []
 
         nvtx_push("offline.decode")
-        outputs = self._op.decode_offline(enc_out, output_lengths)
+        # The micro-batch rides along in row order: a family that can time its
+        # own output needs to know, before it decodes, which rows asked.
+        outputs = self._op.decode_offline(enc_out, output_lengths, chunk)
         nvtx_pop()
 
         for req, out in zip(chunk, outputs):

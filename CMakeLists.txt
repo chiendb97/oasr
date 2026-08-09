@@ -142,6 +142,8 @@ endif()
 # Kernel launchers + JIT bindings are compiled at runtime by the JIT system.
 # ---------------------------------------------------------------------------
 set(OASR_SOURCES
+    csrc/alignment/word_timings.cc
+    csrc/tokenizers/symbol_table.cc
     csrc/decoder/ctc/cpu/common/utils.cc
     csrc/decoder/ctc/cpu/context_graph.cc
     csrc/decoder/ctc/cpu/ctc_prefix_beam_search.cc
@@ -149,6 +151,10 @@ set(OASR_SOURCES
 )
 
 set(OASR_HEADERS
+    # Post-decode alignment + tokenizer rendering (CPU, no torch dependency)
+    csrc/alignment/word_timings.h
+    csrc/tokenizers/symbol_table.h
+
     # Common headers (used by JIT-compiled kernels at runtime)
     include/oasr/common/types.h
     include/oasr/common/vec_dtypes.h

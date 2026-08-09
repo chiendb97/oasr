@@ -10,6 +10,7 @@ subclassing :class:`DecodeStrategy` and decorating it with
 
 # Import for side effects: each module registers its strategy on import.
 from . import aed, ctc_gpu, ctc_wfst, llm, paraformer, rescoring, transducer  # noqa: E402,F401
+from .alignment import FrameClock, TokenAlignment, WordTiming, word_timings
 from .base import (
     DecodeStrategy,
     EncodeOutput,
@@ -23,7 +24,11 @@ __all__ = [
     "DecodeStrategy",
     "Detokenizer",
     "EncodeOutput",
+    "FrameClock",
+    "TokenAlignment",
+    "WordTiming",
     "build_decode_strategy",
     "get_decode_strategy_class",
     "register_decode_strategy",
+    "word_timings",
 ]

@@ -92,6 +92,16 @@ fn multipart(parts: &[(&str, &str)], file: Option<(&str, &str, &[u8])>) -> Vec<u
     body
 }
 
+/// A raw-body request for the Google-shaped route (config in the query string).
+fn raw_body(path: &str, bytes: &[u8]) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(bytes.to_vec()))
+        .expect("build request")
+}
+
 fn upload(path: &str, parts: &[(&str, &str)], file: Option<(&str, &str, &[u8])>) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -265,10 +275,59 @@ async fn any_model_name_is_accepted_by_default() {
     );
 }
 
-/// Word timestamps are a declared gap.  Answering a `word` request without the
-/// `words` array would read as "this audio had no words".
+/// H7 landed: `word` granularity is now carried through to the engine instead
+/// of being refused.  A worker-less pool means 503 — the marker that the
+/// request parsed, decoded and reached submission.  (Whether the *decode
+/// family* can align is decided at admission, inside the engine, which is why
+/// the route no longer has an opinion.)
 #[tokio::test]
-async fn word_granularity_is_refused_rather_than_silently_dropped() {
+async fn word_granularity_reaches_the_engine() {
+    let audio = wav(1_600);
+    for granularity in ["word", "segment"] {
+        let (status, body) = send(
+            router(ServiceMode::Offline, &[]),
+            upload(
+                "/v1/audio/transcriptions",
+                &[
+                    ("response_format", "verbose_json"),
+                    ("timestamp_granularities[]", granularity),
+                ],
+                Some(("a.wav", "audio/wav", &audio)),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "granularity={granularity}: {body}"
+        );
+    }
+}
+
+/// The parameter only means something for `verbose_json`; the other formats
+/// have nowhere to render an array.  Saying so beats accepting it and returning
+/// `{"text": ...}`, which a client cannot distinguish from "no words found".
+#[tokio::test]
+async fn granularities_outside_verbose_json_are_rejected() {
+    let audio = wav(1_600);
+    let (status, body) = send(
+        router(ServiceMode::Offline, &[]),
+        upload(
+            "/v1/audio/transcriptions",
+            &[
+                ("response_format", "json"),
+                ("timestamp_granularities[]", "word"),
+            ],
+            Some(("a.wav", "audio/wav", &audio)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json(&body)["error"]["param"], "timestamp_granularities");
+}
+
+#[tokio::test]
+async fn an_unknown_granularity_is_rejected() {
     let audio = wav(1_600);
     let (status, body) = send(
         router(ServiceMode::Offline, &[]),
@@ -276,32 +335,29 @@ async fn word_granularity_is_refused_rather_than_silently_dropped() {
             "/v1/audio/transcriptions",
             &[
                 ("response_format", "verbose_json"),
-                ("timestamp_granularities[]", "word"),
+                ("timestamp_granularities[]", "phoneme"),
             ],
             Some(("a.wav", "audio/wav", &audio)),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert!(
-        body.contains("word-level timestamps"),
-        "the message must name the gap: {body}"
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json(&body)["error"]["param"], "timestamp_granularities");
+}
 
-    // Segment granularity is served.
-    let (status, _) = send(
+/// The Google-shaped route carries the same request through its own spelling.
+#[tokio::test]
+async fn enable_word_time_offsets_reaches_the_engine() {
+    let audio = wav(1_600);
+    let (status, body) = send(
         router(ServiceMode::Offline, &[]),
-        upload(
-            "/v1/audio/transcriptions",
-            &[
-                ("response_format", "verbose_json"),
-                ("timestamp_granularities[]", "segment"),
-            ],
-            Some(("a.wav", "audio/wav", &audio)),
+        raw_body(
+            "/v1/speech:recognize?encoding=WAV&enable_word_time_offsets=true",
+            &audio,
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
 }
 
 #[tokio::test]

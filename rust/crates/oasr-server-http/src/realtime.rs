@@ -179,6 +179,10 @@ fn resolve_session(s: &AppState, update: &SessionUpdate) -> Result<Session, Sess
             .filter(|t| !t.is_empty())
             .map(|t| t.to_ascii_lowercase()),
         language,
+        // A realtime session has no place to put word timings: the transcript
+        // arrives as deltas, and the alignment (where a family has one) is a
+        // property of the finished utterance.
+        word_timestamps: None,
     }
     .validated()
     .map_err(|msg| SessionError::new(None, msg))?;

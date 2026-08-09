@@ -38,11 +38,12 @@ one is amortized and the first is not.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Tuple, cast
 
 import torch
 
 from ..request import Request, RequestOutput
+from .alignment import wants_word_timings
 from .base import DecodeStrategy, register_decode_strategy
 from .options import option
 from .transducer_beam import (
@@ -95,6 +96,17 @@ if TYPE_CHECKING:
 _TERMINATION_CHECK_STRIDE = 16
 
 
+def _unzip_marks(marks: Sequence[Tuple[int, float]]) -> Tuple[List[int], List[float]]:
+    """``(frame, posterior)`` pairs → the two parallel lists the alignment takes.
+
+    The greedy loop collects the two together because they come off the same
+    step.  The span rule itself is shared with the CTC path — both go through
+    ``attach_emission_alignment`` — so the two frame-synchronous families cannot
+    describe a span differently.
+    """
+    return [f for f, _ in marks], [p for _, p in marks]
+
+
 @dataclass
 class _Session:
     """Per-stream decode state carried across chunks.
@@ -115,6 +127,13 @@ class _Session:
     #: Per-hypothesis token lists + scores from the last beam chunk (n-best).
     nbest: Optional[Tuple[List[List[int]], List[float]]] = None
     steps: int = 0  # decoded chunks (drives the partial-emit cadence)
+    #: Encoder frames consumed by previous chunks, so a chunk-local emission
+    #: frame becomes an utterance-absolute one.
+    frames: int = 0
+    #: Accumulated ``(frame, posterior)`` emission marks, in ``hyp`` order.
+    #: Only populated for a stream that asked for word timings — the greedy
+    #: loop's tracking is opt-in per launch.
+    marks: List[Tuple[int, float]] = field(default_factory=list)
     #: Incremental-detokenization state (T3).  Greedy transducer decode only
     #: appends to ``hyp``, so a partial decodes just the new ids rather than
     #: re-rendering the whole transcript every chunk.
@@ -173,6 +192,21 @@ class TransducerDecodeStrategy(DecodeStrategy):
     consumes: ClassVar[str] = "hidden"
     options_cls: ClassVar[type] = TransducerOptions
 
+    @property
+    def word_timing_modes(self) -> Tuple[str, ...]:
+        """Both modes under greedy; **neither** under beam search.
+
+        A transducer's emissions are frame-indexed by construction, so the
+        greedy loop already knows *when* at the moment it decides *what*.  The
+        beam keeps its hypotheses in a device-side ``(B, k, cap)`` buffer that
+        carries labels and no frames, and a later frame can promote a different
+        entry — so the emission marks the greedy loop records have no
+        counterpart there.  Declaring from what *this configuration* can do,
+        rather than from what the class implements, is what keeps an engine from
+        admitting the request and then answering without the field.
+        """
+        return () if self._beam > 1 else ("offline", "streaming")
+
     def __init__(
         self,
         config: "EngineConfig",
@@ -217,9 +251,20 @@ class TransducerDecodeStrategy(DecodeStrategy):
         lengths: torch.Tensor,  # (B,) valid frames per row
         state: Any,  # opaque batched predictor state (B rows)
         dec_proj: torch.Tensor,  # (B, J) predictor projections for that state
-    ) -> Tuple[List[List[int]], Any, torch.Tensor]:
-        """Run batched greedy over ``enc_out``; returns newly emitted tokens per
-        row plus the updated ``(state, dec_proj)`` predictor state."""
+        track: bool = False,  # also record each emission's frame + posterior
+    ) -> Tuple[List[List[int]], List[List[Tuple[int, float]]], Any, torch.Tensor]:
+        """Run batched greedy over ``enc_out``.
+
+        Returns the newly emitted tokens per row, the matching
+        ``(frame, posterior)`` pairs when ``track`` is set (``[]`` otherwise),
+        and the updated ``(state, dec_proj)`` predictor state.
+
+        Tracking is opt-in because it costs a ``logsumexp`` over the vocabulary
+        and two extra ``(B,)`` snapshots per emitting step.  The *frames* are
+        free — this loop already knows ``t`` at the moment it emits, which is
+        the whole reason a transducer can time its output in either mode while
+        a CTC beam needs a second pass.
+        """
         joiner, decoder = self._surface()
         blank = int(cast(int, self._model.blank_id))
         max_sym = self._max_sym
@@ -237,6 +282,8 @@ class TransducerDecodeStrategy(DecodeStrategy):
         no_emit = torch.full((B,), -1, dtype=torch.long, device=device)
         zero_sym = torch.zeros_like(sym)
         emitted: List[torch.Tensor] = []  # per-step (B,) token snapshots, -1 = no emit
+        emit_frame: List[torch.Tensor] = []  # per-step (B,) frame index at emission
+        emit_prob: List[torch.Tensor] = []  # per-step (B,) posterior of that token
 
         max_steps = int(T) * (max_sym + 1) + B + 1  # termination safety bound
         done = 0
@@ -268,6 +315,12 @@ class TransducerDecodeStrategy(DecodeStrategy):
                     state = decoder.advance(state, tok, emit)
                     dec_proj = joiner.decoder_proj(decoder.predict(state))
                     emitted.append(torch.where(emit, tok, no_emit))
+                    if track:
+                        emit_frame.append(t.clone())
+                        # ``logit - logsumexp`` rather than a full softmax: only
+                        # the chosen token's posterior is ever read.
+                        chosen = logits[rows, tok] - logits.logsumexp(dim=-1)
+                        emit_prob.append(chosen.exp())
                     sym = sym + emit.long()
 
                 t = t + advance.long()
@@ -276,13 +329,23 @@ class TransducerDecodeStrategy(DecodeStrategy):
             if not bool((t < lengths).any()):
                 break
 
+        marks: List[List[Tuple[int, float]]] = []
         if emitted:
             # One host readback for the whole loop.
             snap = torch.stack(emitted, dim=1).tolist()  # B × S
             hyps = [[tk for tk in row if tk >= 0] for row in snap]
+            if track:
+                frames = torch.stack(emit_frame, dim=1).tolist()
+                probs = torch.stack(emit_prob, dim=1).tolist()
+                marks = [
+                    [(int(f), float(p)) for tk, f, p in zip(row, fr, pr) if tk >= 0]
+                    for row, fr, pr in zip(snap, frames, probs)
+                ]
         else:
             hyps = [[] for _ in range(B)]
-        return hyps, state, dec_proj
+            if track:
+                marks = [[] for _ in range(B)]
+        return hyps, marks, state, dec_proj
 
     def _surface(self) -> Tuple["Joiner", "TransducerPredictor"]:
         """``(joiner, predictor)`` with their real types.
@@ -310,14 +373,21 @@ class TransducerDecodeStrategy(DecodeStrategy):
 
     @torch.no_grad()
     def decode_offline(
-        self, enc_out: torch.Tensor, enc_lengths: torch.Tensor
+        self,
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        requests: Optional[List[Request]] = None,
     ) -> List[RequestOutput]:
         if self._beam > 1:
             return self._decode_offline_beam(enc_out, enc_lengths)
         B = enc_out.size(0)
         state, dec_proj = self._init_state(B, enc_out.device)
-        hyps, _, _ = self._greedy_loop(enc_out, enc_lengths, state, dec_proj)
-        return [
+        # Timing is decided for the whole micro-batch, not per row: the greedy
+        # core is one batched loop, so tracking is either on for the launch or
+        # off.  The facade only passes ``requests`` when some row asked.
+        track = requests is not None
+        hyps, marks, _, _ = self._greedy_loop(enc_out, enc_lengths, state, dec_proj, track=track)
+        outputs = [
             RequestOutput(
                 request_id="",
                 text=self._detok.detokenize(hyps[b]),
@@ -326,6 +396,12 @@ class TransducerDecodeStrategy(DecodeStrategy):
             )
             for b in range(B)
         ]
+        if track:
+            for b, (req, out) in enumerate(zip(requests or [], outputs)):
+                if wants_word_timings(req):
+                    frames, probs = _unzip_marks(marks[b])
+                    self.attach_emission_alignment(out, hyps[b], frames, probs)
+        return outputs
 
     @torch.no_grad()
     def _decode_offline_beam(
@@ -396,7 +472,11 @@ class TransducerDecodeStrategy(DecodeStrategy):
             if self._beam > 1:
                 self._advance_beam(group, sessions, enc, lengths)
             else:
-                self._advance_greedy(group, sessions, enc, lengths)
+                # One launch serves the group, so tracking is on whenever any
+                # member asked; the sessions that did not simply discard it.
+                self._advance_greedy(
+                    group, sessions, enc, lengths, track=any(map(wants_word_timings, group))
+                )
 
             for req, s in zip(group, sessions):
                 s.steps += 1
@@ -411,21 +491,30 @@ class TransducerDecodeStrategy(DecodeStrategy):
                     )
         return outputs
 
-    def _advance_greedy(self, group, sessions, enc, lengths) -> None:
+    def _advance_greedy(self, group, sessions, enc, lengths, track: bool = False) -> None:
         """One batched greedy loop over the group's chunk; append per session.
 
         The cohort of ready streams changes every tick, so the per-stream states
         are stacked here and split back afterwards — through the predictor, which
         is the only thing that knows the state's shape.
+
+        Emission frames are chunk-local, so each session rebases them by the
+        frames its earlier chunks consumed before appending.
         """
         _joiner, decoder = self._surface()
         state = decoder.stack_states([s.state for s in sessions])
         dec_proj = torch.cat([s.dec_proj for s in sessions], dim=0)
-        new_hyps, state, dec_proj = self._greedy_loop(enc, lengths, state, dec_proj)
+        new_hyps, marks, state, dec_proj = self._greedy_loop(
+            enc, lengths, state, dec_proj, track=track
+        )
+        chunk_frames = int(enc.size(1))
         for b, (s, row_state) in enumerate(zip(sessions, decoder.unstack_states(state))):
             s.state = row_state
             s.dec_proj = dec_proj[b : b + 1]
             s.hyp.extend(new_hyps[b])
+            if track:
+                s.marks.extend((f + s.frames, p) for f, p in marks[b])
+            s.frames += chunk_frames
 
     def _advance_beam(self, group, sessions, enc, lengths) -> None:
         """One batched beam-search pass over the group's chunk.
@@ -488,9 +577,13 @@ class TransducerDecodeStrategy(DecodeStrategy):
                 scores=list(scores),
                 finished=True,
             )
-        return RequestOutput(
+        out = RequestOutput(
             request_id=request.request_id,
             text=s.text(self._detok) if s is not None else "",
             tokens=[hyp],
             finished=True,
         )
+        if s is not None and s.marks and wants_word_timings(request):
+            frames, probs = _unzip_marks(s.marks)
+            self.attach_emission_alignment(out, hyp, frames, probs)
+        return out

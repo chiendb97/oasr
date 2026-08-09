@@ -18,7 +18,7 @@ dense per-layer KV cache carried in an opaque state dict.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import torch
 import torch.nn.functional as F
@@ -174,6 +174,52 @@ class _DecoderLayer(nn.Module):
         self.final_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
 
 
+class _CrossAttnCollector:
+    """Materialises the cross-attention of a declared ``(layer, head)`` set.
+
+    Slices the query to the requested heads **before** the score matmul and
+    truncates the key axis to the real audio right after the softmax, so the
+    only ``(heads, tokens, frames)`` tensors that ever exist are the ones the
+    DTW will read.  Collecting whole layers instead would cost ~200 MB of
+    transient on ``large`` with the all-heads fallback, for data that is then
+    thrown away.
+    """
+
+    def __init__(self, heads: Sequence[Tuple[int, int]], max_frames: Optional[int] = None) -> None:
+        self._order = [(int(layer), int(head)) for layer, head in heads]
+        self._by_layer: Dict[int, List[int]] = {}
+        for layer, head in self._order:
+            self._by_layer.setdefault(layer, []).append(head)
+        self._max_frames = max_frames
+        self._got: Dict[Tuple[int, int], torch.Tensor] = {}
+
+    def capture(
+        self,
+        layer_idx: int,
+        attn: "_WhisperAttention",
+        query: torch.Tensor,
+        cross_k: torch.Tensor,
+    ) -> None:
+        wanted = self._by_layer.get(layer_idx)
+        if not wanted:
+            return
+        idx = torch.tensor(sorted(set(wanted)), device=query.device)
+        q = attn.attn.split_heads(attn.q_proj(query)).index_select(1, idx)  # (B, n, T, d_k)
+        k = cross_k.index_select(1, idx).to(q.dtype)
+        scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * attn.attn.softmax_scale
+        # Softmax over **all** keys — that is the distribution the model used —
+        # then keep only the frames that are real audio rather than 30 s padding.
+        probs = scores.softmax(dim=-1)
+        if self._max_frames is not None:
+            probs = probs[..., : max(1, int(self._max_frames))]
+        for slot, head in enumerate(sorted(set(wanted))):
+            self._got[(layer_idx, head)] = probs[:, slot]
+
+    def stacked(self) -> torch.Tensor:
+        """``(B, len(heads), T_tok, F)`` in the order the heads were requested."""
+        return torch.stack([self._got[pair] for pair in self._order], dim=1)
+
+
 class WhisperDecoder(BaseDecoder):
     """Whisper text decoder with a batched incremental (prefill/step) surface.
 
@@ -214,8 +260,16 @@ class WhisperDecoder(BaseDecoder):
         offset: int,
         state: Dict[str, Any],
         is_prefill: bool,
+        collect: Optional["_CrossAttnCollector"] = None,
     ) -> torch.Tensor:
-        """Shared prefill/step forward over ``ids (B, T)`` starting at ``offset``."""
+        """Shared prefill/step forward over ``ids (B, T)`` starting at ``offset``.
+
+        ``collect`` (word timestamps only) additionally materialises the
+        cross-attention probabilities of a declared set of heads.  It is checked
+        once per layer and is ``None`` for every decode step, so the generation
+        path is unchanged; the alignment pass is a separate teacher-forced
+        forward run after a row finishes.
+        """
         B, T = ids.shape
         pos = torch.arange(offset, offset + T, device=ids.device)
         x = self.embed_tokens(ids) + self.embed_positions(pos).to(self.embed_tokens.weight.dtype)
@@ -234,12 +288,55 @@ class WhisperDecoder(BaseDecoder):
             x = residual + layer.self_attn(h, k, v, is_causal=is_prefill and T > 1)
             residual = x
             h = layer.encoder_attn_layer_norm(x)
+            if collect is not None:
+                # ``nn.Module.__getattr__`` types every submodule as
+                # ``Tensor | Module``; the cast is the same one the transducer
+                # strategy's ``_surface`` makes, for the same reason.
+                collect.capture(
+                    i, cast(_WhisperAttention, layer.encoder_attn), h, state["cross_k"][i]
+                )
             x = residual + layer.encoder_attn(h, state["cross_k"][i], state["cross_v"][i])
             residual = x
             h = layer.final_layer_norm(x)
             x = residual + layer.fc2(F.gelu(layer.fc1(h)))
         x = self.layer_norm(x)
         return x @ self.embed_tokens.weight.t()  # tied projection → (B, T, V)
+
+    @torch.no_grad()
+    def cross_attention(
+        self,
+        enc_out: torch.Tensor,
+        token_ids: torch.Tensor,
+        heads: Sequence[Tuple[int, int]],
+        max_frames: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Teacher-forced pass returning the alignment heads' attention + logits.
+
+        ``(B, len(heads), T_tok, F)`` cross-attention probabilities in the order
+        ``heads`` was given, plus the ``(B, T_tok, V)`` logits of the same pass —
+        which is where the per-token posteriors for ``confidence`` come from, at
+        no extra cost.
+
+        A **second forward** rather than a hook on generation: the decode step is
+        the engine's hottest AR path and a request that wants timings is the
+        exception, so the cost lands on that request instead of on every step of
+        every request.  One prompt-length forward next to the N steps that
+        produced the transcript is a small fraction of the work already done.
+        """
+        n = len(self.layers)
+        state: Dict[str, Any] = {
+            "self_k": [None] * n,
+            "self_v": [None] * n,
+            "cross_k": [None] * n,
+            "cross_v": [None] * n,
+            "pos": 0,
+        }
+        for i, layer in enumerate(self.layers):
+            attn = cast(_WhisperAttention, layer.encoder_attn)
+            state["cross_k"][i], state["cross_v"][i] = attn.kv(enc_out)
+        collector = _CrossAttnCollector(heads, max_frames)
+        logits = self._forward_tokens(token_ids, 0, state, is_prefill=True, collect=collector)
+        return collector.stacked(), logits
 
     def prefill(
         self, enc_out: torch.Tensor, prompt_ids: torch.Tensor

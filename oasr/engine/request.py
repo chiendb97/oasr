@@ -9,12 +9,18 @@ import enum
 import time
 import uuid
 from dataclasses import dataclass
-from typing import ClassVar, Deque, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, ClassVar, Deque, Iterable, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
 from oasr.cache import StreamContext
+
+if TYPE_CHECKING:
+    # Type-only: ``oasr.engine.decode`` imports this module, so a runtime import
+    # would close the cycle.  The word-timing machinery lives next to the
+    # per-family aligners that produce it, not here.
+    from .decode.alignment import WordTiming
 
 
 class RequestState(enum.Enum):
@@ -91,11 +97,19 @@ class DecodingOptions:
         prompt carries a language token.  ``None`` (default) keeps the
         checkpoint's own.  The serving layer reduces a BCP-47 tag
         (``"en-US"``) before it reaches here.
+    word_timestamps : bool
+        Populate :attr:`RequestOutput.words` with per-word ``(start, end)``
+        times and confidences.  ``False`` (default) skips the alignment work
+        entirely — every family that supports it pays a real cost, from a
+        Viterbi pass over the log-probs to an extra teacher-forced decoder
+        forward.
 
-    Both ``task`` and ``language`` are **validated against the running decode
-    family** at admission (:meth:`DecodeStrategy.validate_options`), so a
-    family that cannot honour them rejects the request instead of silently
-    transcribing under the checkpoint's default.
+    ``task``, ``language`` and ``word_timestamps`` are **validated against the
+    running decode family** at admission
+    (:meth:`DecodeStrategy.validate_options`), so a family that cannot honour
+    one rejects the request instead of silently transcribing under the
+    checkpoint's default, or returning a response with the field the caller
+    asked for simply missing.
     """
 
     n_best: int = 1
@@ -106,6 +120,7 @@ class DecodingOptions:
     prompt: Optional[str] = None
     task: Optional[str] = None
     language: Optional[str] = None
+    word_timestamps: bool = False
 
     #: Task values any family may declare support for.  Mirrored by
     #: ``oasr_wire::TASKS`` on the other side of the PyO3 boundary.
@@ -219,7 +234,19 @@ class RequestOutput:
     timestamps : List[Tuple[float, float]], optional
         Per-token ``(start_s, end_s)`` times for the **best** hypothesis,
         aligned with ``tokens[0]``.  Emitted by decode families that produce
-        alignments (Paraformer's CIF fire positions); ``None`` otherwise.
+        alignments; ``None`` otherwise.
+    words : List[WordTiming], optional
+        Per-**word** timings and confidences for the best hypothesis, filled
+        when the request asked for ``DecodingOptions.word_timestamps`` and the
+        decode family can produce them (it rejects the request at admission if
+        it cannot).  Each ``word`` is a literal substring of :attr:`text`, in
+        order — see :mod:`oasr.engine.decode.alignment`.
+    confidence : float, optional
+        Mean per-token posterior for the best hypothesis, in ``[0, 1]``.
+        Unlike the n-best posterior the serving layer derives from ``scores``,
+        this is defined for a single-hypothesis family too — which is every
+        real request, since ``DecodingOptions.n_best`` defaults to 1.  ``None``
+        when the family holds no per-token posteriors.
     nbest_texts : List[str], optional
         Detokenized transcripts for the top hypotheses, aligned with
         ``tokens`` rows (``nbest_texts[0] == text``).  Filled on final
@@ -246,6 +273,8 @@ class RequestOutput:
     scores: Optional[List[float]] = None
     finished: bool = False
     timestamps: Optional[List[Tuple[float, float]]] = None
+    words: Optional[List["WordTiming"]] = None
+    confidence: Optional[float] = None
     nbest_texts: Optional[List[str]] = None
     finish_reason: Optional[str] = None
     error_stage: Optional[str] = None

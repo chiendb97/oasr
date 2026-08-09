@@ -130,6 +130,13 @@ class HFWhisperConverter(BaseCheckpointConverter):
             if tok is not None:
                 forced.append((p, int(tok)))
         tasks, languages = _control_token_tables(Path(ckpt_dir) / "tokenizer.json")
+        # Published alignment heads ride in generation_config.json only; a
+        # snapshot without them still converts, and word timestamps fall back
+        # to the upper decoder layers (noisier, and much more transient memory).
+        heads = [
+            (int(layer), int(head))
+            for layer, head in (gen.get("alignment_heads") or raw.get("alignment_heads") or [])
+        ]
         return WhisperModelConfig(
             vocab_size=int(raw["vocab_size"]),
             d_model=int(raw["d_model"]),
@@ -149,6 +156,7 @@ class HFWhisperConverter(BaseCheckpointConverter):
             begin_suppress_tokens=[int(t) for t in (pick("begin_suppress_tokens", []) or [])],
             task_token_ids=tasks,
             language_token_ids=languages,
+            alignment_heads=heads,
         )
 
     def load_state_dict(

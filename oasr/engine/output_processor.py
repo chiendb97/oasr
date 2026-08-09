@@ -14,12 +14,13 @@ per-request decode state.  Add a decode family by registering a new
 from __future__ import annotations
 
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
 from .config import EngineConfig
 from .decode import Detokenizer, build_decode_strategy
+from .decode.alignment import wants_word_timings
 from .request import Request, RequestOutput
 
 logger = logging.getLogger(__name__)
@@ -62,9 +63,22 @@ class OutputProcessor:
     # Offline
     # ------------------------------------------------------------------
 
-    def decode_offline(self, log_probs: torch.Tensor, lengths: torch.Tensor) -> List[RequestOutput]:
-        """Decode a batched encoder output → one final output per row."""
-        return self._strategy.decode_offline(log_probs, lengths)
+    def decode_offline(
+        self,
+        log_probs: torch.Tensor,
+        lengths: torch.Tensor,
+        requests: Optional[List[Request]] = None,
+    ) -> List[RequestOutput]:
+        """Decode a batched encoder output → one final output per row.
+
+        ``requests`` rides along in row order for the families that read
+        per-request options at decode time (``word_timestamps``); it is dropped
+        when nothing in the micro-batch asked, so the default path hands the
+        strategy exactly what it used to get.
+        """
+        if requests is not None and not any(wants_word_timings(req) for req in requests):
+            requests = None
+        return self._strategy.decode_offline(log_probs, lengths, requests)
 
     # ------------------------------------------------------------------
     # Streaming session lifecycle

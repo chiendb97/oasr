@@ -108,6 +108,17 @@ Two batched decoder shapes exist, and both are driven from
   prefilled batch into a `B × k` grid and reorder it onto each slot's parent,
   with no new model method.
 
+An AR decoder may **optionally** add `cross_attention(enc_out, token_ids, heads,
+max_frames)`, returning the attention probabilities of a declared `(layer, head)`
+set plus the pass's logits. It is what backs word timestamps for the `aed` family
+(DTW over the attention — see
+[decoding.md § Word timings](decoding.md#word-timings)), and it is optional in
+the real sense: a decoder without it makes `AedDecodeStrategy.word_timing_modes`
+report `()`, and the engine then refuses a `word_timestamps` request instead of
+answering it with the field missing. It is deliberately a second teacher-forced
+forward rather than a hook on generation, so the cost lands on the request that
+asked rather than on every decode step of every request.
+
 ### The transducer predictor state is opaque
 
 `TransducerPredictor` declares `init_state` / `predict` / `advance(state, tokens, emit)` /

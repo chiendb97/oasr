@@ -46,6 +46,7 @@ import torch
 
 from ..generation import select_next_tokens
 from ..request import DecodingOptions, Request, RequestOutput
+from .alignment import TokenAlignment, wants_word_timings
 from .base import DecodeStrategy
 from .incremental_beam import (
     DEAD_SCORE,
@@ -97,12 +98,21 @@ class ArGroup:
     #: prefix — at 32 tokens/tick over a 448-token run that is ~3.1k
     #: token-decodes replaced by 448.
     detok_state: List[Dict[str, Any]] = field(default_factory=list)
+    #: Per-row ``(1, T_enc, D)`` encoder output, retained **only** for the rows
+    #: that asked for word timings; ``None`` for every other row.  The
+    #: alignment pass is a second forward against the encoder states, and by
+    #: the time a row finishes the micro-batch's tensor is long gone —
+    #: retaining per row rather than per group is what keeps a single timed
+    #: request from pinning the whole batch's encoder output.
+    align_enc: List[Optional[torch.Tensor]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.tokens:
             self.tokens = [[] for _ in self.requests]
         if not self.detok_state:
             self.detok_state = [{} for _ in self.requests]
+        if not self.align_enc:
+            self.align_enc = [None] * len(self.requests)
 
     @property
     def first_generation_step(self) -> bool:
@@ -116,6 +126,7 @@ class ArGroup:
         self.max_new = [self.max_new[r] for r in keep]
         self.opts = [self.opts[r] for r in keep]
         self.detok_state = [self.detok_state[r] for r in keep]
+        self.align_enc = [self.align_enc[r] for r in keep]
 
 
 @dataclass
@@ -303,6 +314,17 @@ class IncrementalArStrategy(DecodeStrategy):
         if self._beam > 1:
             self._groups.append(self._make_beam_group(requests, plan, opts))
             return
+        # Retain one encoder row per request that asked to be timed.  ``clone``
+        # rather than a view: the micro-batch tensor is far larger than one row
+        # and a view would keep all of it alive until the last row retires.
+        # Greedy only: the beam path returned above, and its group has no slot
+        # for a retained encoder row.  ``word_timing_modes`` says so, so this is
+        # a belt-and-braces guard rather than the check that matters.
+        align_enc: List[Optional[torch.Tensor]] = [None] * len(requests)
+        if self.word_timing_modes:
+            for row, req in enumerate(requests):
+                if wants_word_timings(req):
+                    align_enc[row] = enc_out[row : row + 1].clone()
         self._groups.append(
             ArGroup(
                 requests=list(requests),
@@ -310,6 +332,7 @@ class IncrementalArStrategy(DecodeStrategy):
                 last_logits=plan.logits,
                 max_new=list(plan.max_new),
                 opts=opts,
+                align_enc=align_enc,
             )
         )
 
@@ -574,13 +597,32 @@ class IncrementalArStrategy(DecodeStrategy):
 
     def _finalize_row(self, group: ArGroup, row: int, reason: str) -> RequestOutput:
         tokens = group.tokens[row]
-        return RequestOutput(
+        out = RequestOutput(
             request_id=group.requests[row].request_id,
             text=self._row_text(group, row),
             tokens=[tokens],
             finished=True,
             finish_reason=reason,
         )
+        enc = group.align_enc[row] if row < len(group.align_enc) else None
+        if enc is not None and tokens:
+            # The row's decoder state is about to be dropped, so this is the
+            # last moment its encoder output is still around to align against.
+            align = self._align_row(group.requests[row], enc, list(tokens))
+            if align:
+                self.attach_alignment(out, align)
+        return out
+
+    def _align_row(
+        self, request: Request, enc_out: torch.Tensor, tokens: List[int]
+    ) -> Optional[List["TokenAlignment"]]:
+        """Per-token spans for one finished row, or ``None``.
+
+        Default: nothing.  A family that populates ``ArGroup.align_enc`` — i.e.
+        one that declared ``word_timing_modes`` — implements this.
+        """
+        del request, enc_out, tokens
+        return None
 
     # ------------------------------------------------------------------
     # Session cleanup (abort path)
@@ -625,7 +667,10 @@ class IncrementalArStrategy(DecodeStrategy):
     # ------------------------------------------------------------------
 
     def decode_offline(
-        self, enc_out: torch.Tensor, enc_lengths: torch.Tensor
+        self,
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        requests: Optional[List[Request]] = None,
     ) -> List[RequestOutput]:
         raise NotImplementedError(
             f"{self.decode_type} is an incremental strategy; the executor drives it "

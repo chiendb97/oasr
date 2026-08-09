@@ -219,13 +219,22 @@ class LongFormTracker:
         # compose into alternatives of the file, and inventing a cross product
         # would be worse than reporting one hypothesis.
         stamps: List = []
+        words: List = []
         for out, start in zip(ordered, entry.window_starts_s):
             if out.timestamps:
                 stamps.extend((s + start, e + start) for s, e in out.timestamps)
+            for w in out.words or ():
+                # Word timings shift the same way; ``_replace`` keeps the type
+                # rather than rebuilding it here, so a field added to
+                # ``WordTiming`` survives the merge without an edit.
+                words.append(w._replace(start=w.start + start, end=w.end + start))
         tokens: List[int] = []
+        confidences: List[float] = []
         for out in ordered:
             if out.tokens:
                 tokens.extend(out.tokens[0])
+            if out.confidence is not None:
+                confidences.append(out.confidence)
 
         return RequestOutput(
             request_id=entry.parent_id,
@@ -234,6 +243,11 @@ class LongFormTracker:
             finished=True,
             finish_reason=reason,
             timestamps=stamps or None,
+            words=words or None,
+            # A mean of per-window means, not of per-token posteriors: the
+            # windows are equal-length by construction, so the two agree except
+            # at the tail, and this needs no per-window token count.
+            confidence=(sum(confidences) / len(confidences)) if confidences else None,
         )
 
 

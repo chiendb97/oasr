@@ -127,7 +127,9 @@ def _offline_executor(runner) -> OfflineExecutor:
     ex._pending = {}
     ex._op = SimpleNamespace(
         strategy=SimpleNamespace(incremental=False, consumes="log_probs"),
-        decode_offline=lambda enc, lens: [
+        # ``requests`` rides along for the families that read per-request
+        # options at decode time (word timings); this stub ignores it.
+        decode_offline=lambda enc, lens, requests=None: [
             RequestOutput(request_id=i, text=f"ok-{i}", tokens=[[1]]) for i in enc.ids
         ],
         fill_nbest_texts=lambda req, out: None,

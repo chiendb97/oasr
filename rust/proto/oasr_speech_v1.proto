@@ -31,6 +31,10 @@
 //   are non-Google extensions carrying the server-assigned request UUID.
 // - `max_alternatives` is honored: the engine detokenizes up to that many
 //   n-best hypotheses (beam decode families).
+// - `enable_word_time_offsets` is honored: the top alternative carries
+//   `WordInfo` entries. Decode families that cannot align (WFST; any family in
+//   streaming mode that has no frame-synchronous emission) reject the request
+//   rather than returning an alternative with the field silently empty.
 // - `SpeechRecognitionResult.finish_reason` (extension field 101) reports
 //   "stop" / "length" for the autoregressive decode families.
 // - `language_code` is honored by the decode families that can act on it
@@ -92,6 +96,10 @@ message RecognitionConfig {
     // rather than ignoring it.
     string        language_code        = 3;
     uint32        max_alternatives     = 4;  // n-best transcripts (beam decode families)
+    // Per-word start/end times and confidences on the top alternative.  Google's
+    // own field name and semantics; the decode families that cannot align reject
+    // it at admission rather than returning an alternative with no `words`.
+    bool          enable_word_time_offsets = 8;
     string        model                = 5;  // accepted, ignored (single model per process)
     uint32        audio_channel_count  = 6;  // accepted, ignored (mono only)
     int32         priority             = 100; // OASR extension
@@ -105,6 +113,18 @@ message RecognitionConfig {
     // previously frozen at checkpoint-conversion time.  Empty = the
     // checkpoint's own task.  Backs `POST /v1/audio/translations`.
     string        task                 = 106;
+}
+
+// One word of a transcript with its span in the audio.  Google's `WordInfo`,
+// minus `speaker_tag` (no diarization).  `confidence` is the mean per-token
+// posterior over the word's tokens, and unlike the alternative-level
+// `confidence` it is defined for a single-hypothesis decode — which is every
+// request that did not ask for n-best.
+message WordInfo {
+    google.protobuf.Duration start_time = 1;
+    google.protobuf.Duration end_time   = 2;
+    string                   word       = 3;
+    float                    confidence = 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +145,11 @@ message RecognitionAudio {
 message SpeechRecognitionAlternative {
     string          transcript = 1;
     float           confidence = 2;
+    // Populated on the **top** alternative only, and only when the request set
+    // `enable_word_time_offsets`.  Timing an alternative the caller is not
+    // shown would cost a second alignment pass per hypothesis for output no
+    // client reads.
+    repeated WordInfo words    = 3;
     repeated uint32 tokens     = 100;  // OASR extension: raw CTC token IDs
 }
 

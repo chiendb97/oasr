@@ -53,6 +53,13 @@ class WhisperModelConfig(BaseModelConfig):
     # decoding under the checkpoint's own task.
     task_token_ids: Dict[str, int] = field(default_factory=dict)
     language_token_ids: Dict[str, int] = field(default_factory=dict)
+    # ``[[layer, head], ...]`` — the cross-attention heads that were found to
+    # align with the audio, from ``generation_config.json``.  Word timestamps
+    # average exactly these; see
+    # :mod:`oasr.engine.decode.attention_align` for why averaging *all* heads
+    # produces a near-diagonal path instead of an alignment.  Empty falls back
+    # to the upper half of the decoder stack, with a warning.
+    alignment_heads: List[Tuple[int, int]] = field(default_factory=list)
 
     @property
     def head_dim(self) -> int:

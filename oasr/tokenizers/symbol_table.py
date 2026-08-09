@@ -41,6 +41,20 @@ class SymbolTableTokenizer(Tokenizer):
     def __init__(self, table_path: str, special_ids: Optional[FrozenSet[int]] = None) -> None:
         self._table = load_symbol_table(table_path)
         self._special_ids = DEFAULT_SPECIAL_IDS if special_ids is None else special_ids
+        # C++ rendering for :meth:`token_pieces`, built once here rather than
+        # per call.  Construction tolerates a build without the extension
+        # because ``decode`` — the common case, and every CPU test — does not
+        # need it; :meth:`token_pieces` does, and simply uses it.
+        self._pieces_cpp = self._build_cpp()
+
+    def _build_cpp(self):
+        try:
+            from oasr import _C  # type: ignore[attr-defined]
+
+            pieces_cls = _C.alignment.SymbolTablePieces
+        except (ImportError, AttributeError):  # pragma: no cover - no extension built
+            return None
+        return pieces_cls(self._table, set(self._special_ids))
 
     @classmethod
     def from_spec(cls, spec: TokenizerSpec) -> "SymbolTableTokenizer":
@@ -92,6 +106,25 @@ class SymbolTableTokenizer(Tokenizer):
         # Leading-space stripping means a delta can start mid-word only on the
         # very first emission; after that the prefix is stable.
         return full[len(prev) :] if full.startswith(prev) else full
+
+    def token_pieces(self, ids):
+        """One pass, for the same reason :meth:`decode_incremental` is O(new).
+
+        Rendering is piece-local here, so a piece is a table lookup and a ``▁``
+        substitution; only ``decode``'s outer ``strip`` couples the ends, and
+        the pieces have to lose exactly the characters it would remove or they
+        would no longer concatenate to it.  The base class's generic version
+        re-renders the whole prefix per token, which is quadratic and lands on
+        the CTC decode path — the one place this is called per request.
+
+        Implemented in C++ (``csrc/tokenizers/symbol_table.cc``) and nowhere
+        else, like the alignment pass that is its only caller: a Python twin
+        here would be a second rendering of the same table, checked by nothing
+        at runtime, on the request path where the difference would show up as a
+        word boundary in the wrong place.
+        """
+        # No ``int()`` pass: pybind11's caster does the conversion in C.
+        return self._pieces_cpp.pieces(ids)
 
 
 register_tokenizer("symbol_table", SymbolTableTokenizer.from_spec)

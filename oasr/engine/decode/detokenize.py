@@ -96,3 +96,24 @@ class Detokenizer:
         prev = state.get("text", "")
         state["text"] = full
         return full[len(prev) :] if full.startswith(prev) else full
+
+    def token_pieces(self, token_ids: Sequence[int]) -> List[str]:
+        """Per-token text contributions, concatenating to :meth:`detokenize`.
+
+        What the word grouping needs (see
+        :mod:`oasr.engine.decode.alignment`): the character range each token
+        contributed to the rendered transcript.  Delegates to the tokenizer,
+        which can answer it in one pass where its rendering is piece-local;
+        the id-join fallback splits on its own separator.
+        """
+        if self._tokenizer is not None:
+            return self._tokenizer.token_pieces(token_ids)
+        pieces: List[str] = []
+        seen = False
+        for tok in token_ids:
+            if int(tok) in SPECIAL_IDS:
+                pieces.append("")  # stripped by ``detokenize``; owns no text
+                continue
+            pieces.append(f" {int(tok)}" if seen else str(int(tok)))
+            seen = True
+        return pieces

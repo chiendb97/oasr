@@ -25,11 +25,18 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple, Type
 
 import torch
 
 from ..request import DecodingOptions, Request, RequestOutput
+from .alignment import (
+    AlignmentFields,
+    FrameClock,
+    TokenAlignment,
+    alignment_fields,
+    emission_fields,
+)
 
 if TYPE_CHECKING:
     from oasr.models.base import BaseAsrModel
@@ -103,6 +110,13 @@ class DecodeStrategy(ABC):
         self._model = model
         #: This family's resolved options (``None`` when ``options_cls`` is).
         self.options = build_options(self.options_cls, config)
+        #: Encoder-frame → seconds conversion for word timings, or ``None``
+        #: when the geometry cannot be resolved (no model, no feature config).
+        #: :meth:`validate_options` refuses ``word_timestamps`` in that case
+        #: rather than emitting timings against a guessed frame rate.
+        self._clock: Optional[FrameClock] = FrameClock.resolve(
+            getattr(config, "feature_config", None), model
+        )
 
     # -- per-request options ------------------------------------------------
 
@@ -119,12 +133,51 @@ class DecodeStrategy(ABC):
     #: different task, with nothing in the response to say so.
     selective_options: ClassVar[Tuple[str, ...]] = ()
 
-    def validate_options(self, options: Optional["DecodingOptions"]) -> None:
+    @property
+    def word_timing_modes(self) -> Tuple[str, ...]:
+        """Engine modes in which **this instance** can produce word timings.
+
+        A subset of ``{"offline", "streaming"}``; empty for a family with no
+        alignment, which is the default.
+
+        Separate from :attr:`selective_options` because the answer is not
+        constant per family: a transducer's emissions are frame-indexed in both
+        modes, while a CTC alignment is a Viterbi pass over the whole log-prob
+        sequence, which a stream does not retain.  Declaring the modes is what
+        lets the *same* checkpoint answer word timings offline and say why it
+        cannot live.
+
+        A **property**, not a class attribute, for the same reason
+        ``BaseEncoder.streaming_kind`` is one: the honest answer can depend on
+        the configuration rather than the class.  A transducer under beam search
+        keeps its hypotheses in a device-side buffer that carries no frames, and
+        an AED decoder without a ``cross_attention`` surface has nothing to run
+        DTW over — both narrow this to ``()`` at construction, so the engine
+        refuses at admission instead of returning a response with the field
+        silently missing.
+        """
+        return ()
+
+    #: Selective option → the value that means "the caller did not ask".  Drives
+    #: :meth:`validate_options`; ``word_timestamps`` is a bool, so its unset
+    #: value is ``False`` rather than ``None`` and a hardcoded ``is None`` test
+    #: would silently accept it everywhere.
+    _SELECTIVE_UNSET: ClassVar[Mapping[str, object]] = {
+        "task": None,
+        "language": None,
+        "word_timestamps": False,
+    }
+
+    def validate_options(
+        self, options: Optional["DecodingOptions"], *, streaming: bool = False
+    ) -> None:
         """Reject per-request options this family cannot act on.
 
         Called once per request at admission
         (``ASREngine._admit_one_checked``), so a rejection is scoped to its own
         request rather than to the admit batch it was coalesced into.
+        ``streaming`` is the mode the request will run in — the only selective
+        option whose answer depends on it is ``word_timestamps``.
 
         Subclasses that *can* act on a selective option override this to add
         the checkpoint-level check — a Whisper checkpoint knows a fixed set of
@@ -133,25 +186,125 @@ class DecodeStrategy(ABC):
         """
         if options is None:
             return
-        for name in ("task", "language"):
-            if getattr(options, name, None) is None or name in self.selective_options:
+        for name, unset in self._SELECTIVE_UNSET.items():
+            if getattr(options, name, unset) == unset:
                 continue
+            if name == "word_timestamps":
+                self._require_word_timings(streaming)
+            elif name not in self.selective_options:
+                raise ValueError(
+                    f"decode_method={self.decode_type!r} cannot honour the "
+                    f"per-request {name!r} option (it has no {name} control); "
+                    "remove it, or serve a checkpoint whose decode family does "
+                    f"(supported here: {list(self.selective_options) or 'none'})"
+                )
+
+    def _require_word_timings(self, streaming: bool) -> None:
+        """Raise unless this family can align in the mode the request will run in."""
+        mode = "streaming" if streaming else "offline"
+        if mode not in self.word_timing_modes:
+            supported = ", ".join(self.word_timing_modes) or "neither mode"
             raise ValueError(
-                f"decode_method={self.decode_type!r} cannot honour the "
-                f"per-request {name!r} option (it has no {name} control); "
-                "remove it, or serve a checkpoint whose decode family does "
-                f"(supported here: {list(self.selective_options) or 'none'})"
+                f"decode_method={self.decode_type!r} cannot produce word "
+                f"timestamps for a {mode} request (supported: {supported}); "
+                "drop word_timestamps, or send the audio to an offline engine"
             )
+        if self._clock is None:
+            # Emitting timings against a guessed frame rate is worse than
+            # refusing: every span would be plausible and uniformly wrong.
+            raise ValueError(
+                f"decode_method={self.decode_type!r} cannot resolve its "
+                "encoder frame rate (feature config or encoder subsampling "
+                "unavailable), so word timestamps would be scaled by an "
+                "unknown constant"
+            )
+
+    # -- alignment ----------------------------------------------------------
+
+    def attach_alignment(
+        self,
+        output: RequestOutput,
+        alignments: Sequence[TokenAlignment],
+        *,
+        words: bool = True,
+        offset: float = 0.0,
+    ) -> None:
+        """Fill ``timestamps`` / ``words`` / ``confidence`` from token alignments.
+
+        The one call every family makes once it has produced its own
+        :class:`~oasr.engine.decode.alignment.TokenAlignment` list, so the
+        frames→seconds conversion, the token→word grouping and the confidence
+        aggregation are written once rather than per family.  ``words=False``
+        keeps the per-token timings and the confidence but skips the word pass,
+        for a family (Paraformer) whose alignment is free and therefore always
+        computed, on a request that did not ask for words.
+        """
+        self._write_alignment(
+            output,
+            alignment_fields(alignments, self._detok, self._clock, offset=offset, want_words=words),
+        )
+
+    def attach_emission_alignment(
+        self,
+        output: RequestOutput,
+        tokens: Sequence[int],
+        frames: Sequence[int],
+        confidences: Optional[Sequence[float]] = None,
+        *,
+        offset: float = 0.0,
+        frame_offset: int = 0,
+    ) -> None:
+        """:meth:`attach_alignment` for a family that recorded emission frames.
+
+        Same result as building :class:`TokenAlignment` values and passing them
+        in — and the point of having both is that this route never builds them:
+        frames, posteriors and rendered pieces go into one call and words come
+        back, so a 400-token micro-batch costs no per-token Python object at
+        all.  CTC and the transducer both take it.
+        """
+        self._write_alignment(
+            output,
+            emission_fields(
+                tokens,
+                frames,
+                confidences,
+                self._detok,
+                self._clock,
+                offset=offset,
+                frame_offset=frame_offset,
+            ),
+        )
+
+    @staticmethod
+    def _write_alignment(output: RequestOutput, fields: AlignmentFields) -> None:
+        """Publish an alignment pass onto the output, leaving absent what is absent."""
+        if fields.timestamps is None:
+            return
+        output.timestamps = fields.timestamps
+        output.confidence = fields.confidence
+        if fields.words is not None:
+            output.words = fields.words
 
     # -- offline -----------------------------------------------------------
     @abstractmethod
     def decode_offline(
-        self, enc_out: torch.Tensor, enc_lengths: torch.Tensor
+        self,
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        requests: Optional[List[Request]] = None,
     ) -> List[RequestOutput]:
         """Decode a batched encoder output.
 
         Returns one :class:`RequestOutput` per batch row (``finished=True``,
         ``request_id=""`` — the executor fills the id), in batch order.
+
+        ``requests`` is the micro-batch in the same row order, so a family can
+        read the per-request :class:`~oasr.engine.request.DecodingOptions` that
+        change *what it computes* rather than only what it returns —
+        ``word_timestamps`` today.  It is optional because the prewarm path and
+        the tests decode without requests, and because a family that reads
+        nothing from it must not have to accept one; it mirrors the
+        ``begin_offline(requests, ...)`` the incremental families already get.
         """
         raise NotImplementedError
 

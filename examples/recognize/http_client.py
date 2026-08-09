@@ -58,6 +58,10 @@ def main(argv: list[str]) -> int:
     p.add_argument("--sample-rate", type=int, default=16000,
                    help="Sample rate for raw PCM payloads "
                         "(ignored for a container, which carries its own)")
+    p.add_argument("--word-times", action="store_true",
+                   help="ask for per-word start/end times and confidences "
+                        "(Google's `enable_word_time_offsets`); a decode family "
+                        "that cannot align refuses the request")
     p.add_argument("--timeout", type=float, default=120.0,
                    help="HTTP request timeout in seconds")
     args = p.parse_args(argv)
@@ -70,7 +74,11 @@ def main(argv: list[str]) -> int:
     # Body is the raw audio bytes; recognition config travels in the query string.
     resp = requests.post(
         url,
-        params={"encoding": args.encoding, "sample_rate": args.sample_rate},
+        params={
+            "encoding": args.encoding,
+            "sample_rate": args.sample_rate,
+            **({"enable_word_time_offsets": "true"} if args.word_times else {}),
+        },
         data=args.wav.read_bytes(),
         headers={"Content-Type": "application/octet-stream"},
         timeout=args.timeout,
@@ -88,6 +96,9 @@ def main(argv: list[str]) -> int:
             transcript = alt.get("transcript", "")
             if transcript:
                 print(f"\ntranscript: {transcript}")
+                for w in alt.get("words", []):
+                    print(f"  {w['startTimeS']:7.2f} - {w['endTimeS']:7.2f}  "
+                          f"{w['confidence']:.3f}  {w['word']}")
                 return 0
     return 0
 
