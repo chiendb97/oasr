@@ -3,7 +3,7 @@
 """Functional API for convolution operations."""
 
 import functools
-from typing import Optional
+from typing import Optional, cast
 
 import torch
 
@@ -43,6 +43,39 @@ def _get_cudnn_conv2d_module():
     from oasr.jit.conv import gen_cudnn_conv2d_module
 
     return gen_cudnn_conv2d_module().build_and_load()
+
+
+@functools.cache
+def _get_grouped_conv2d_module():
+    from oasr.jit.conv import gen_grouped_conv2d_module
+
+    return gen_grouped_conv2d_module().build_and_load()
+
+
+def _is_pointwise_conv2d(
+    input: torch.Tensor,
+    filter: torch.Tensor,
+    pad_h: int,
+    pad_w: int,
+    stride_h: int,
+    stride_w: int,
+    dilation_h: int,
+    dilation_w: int,
+    groups: int,
+) -> bool:
+    """Whether NHWC Conv2D is exactly a dense GEMM over its channel axis."""
+    return (
+        groups == 1
+        and filter.shape[1:3] == (1, 1)
+        and pad_h == 0
+        and pad_w == 0
+        and stride_h == 1
+        and stride_w == 1
+        and dilation_h == 1
+        and dilation_w == 1
+        and input.shape[-1] % 8 == 0
+        and filter.shape[0] % 8 == 0
+    )
 
 
 def _default_conv2d_fn():
@@ -380,6 +413,7 @@ def conv2d(
     dilation_h: int = 1,
     dilation_w: int = 1,
     out: Optional[torch.Tensor] = None,
+    groups: int = 1,
 ) -> torch.Tensor:
     """2D convolution (NHWC layout).
 
@@ -391,17 +425,26 @@ def conv2d(
 
     Args:
         input: Input [N, H, W, IC].
-        filter: Filter [K, R, S, IC].
+        filter: Filter [K, R, S, IC / groups].
         bias: Optional per-channel bias [K].
         pad_h, pad_w: Symmetric padding.
         stride_h, stride_w: Convolution stride.
         dilation_h, dilation_w: Dilation.
         out: Optional pre-allocated output tensor.
+        groups: Number of channel groups. ``groups == IC == K`` is depthwise.
 
     Returns:
         Output [N, P, Q, K].
     """
     IC = input.shape[3]
+    K = filter.shape[0]
+    if groups <= 0 or IC % groups or K % groups:
+        raise ValueError(f"groups={groups} must divide input channels={IC} and output channels={K}")
+    if filter.shape[3] != IC // groups:
+        raise ValueError(
+            "conv2d filter must have shape [K,R,S,IC/groups], got trailing "
+            f"dimension {filter.shape[3]} for IC/groups={IC // groups}"
+        )
     if out is None:
         N = input.shape[0]
         H, W = input.shape[1], input.shape[2]
@@ -409,6 +452,41 @@ def conv2d(
         P = (H + 2 * pad_h - dilation_h * (R - 1) - 1) // stride_h + 1
         Q = (W + 2 * pad_w - dilation_w * (S - 1) - 1) // stride_w + 1
         out = torch.empty(N, P, Q, K, device=input.device, dtype=input.dtype)
+
+    if _is_pointwise_conv2d(
+        input,
+        filter,
+        pad_h,
+        pad_w,
+        stride_h,
+        stride_w,
+        dilation_h,
+        dilation_w,
+        groups,
+    ):
+        from oasr.gemm import _dispatch_gemm, gemm
+        from oasr.tune import is_tuning_enabled
+
+        if is_tuning_enabled():
+            return cast(torch.Tensor, gemm(input, filter.reshape(K, IC), bias, out=out))
+        _dispatch_gemm(out, input, filter.reshape(K, IC), bias, K, IC, input.numel() // IC)
+        return out
+
+    if groups != 1:
+        _get_grouped_conv2d_module().grouped_conv2d(
+            out,
+            input,
+            filter,
+            bias,
+            pad_h,
+            pad_w,
+            stride_h,
+            stride_w,
+            dilation_h,
+            dilation_w,
+            groups,
+        )
+        return out
 
     from oasr.tune import is_tuning_enabled
 
@@ -517,6 +595,7 @@ def conv2d_activation(
     dilation_h: int = 1,
     dilation_w: int = 1,
     out: Optional[torch.Tensor] = None,
+    groups: int = 1,
 ) -> torch.Tensor:
     """2D convolution with fused activation (NHWC layout).
 
@@ -524,6 +603,14 @@ def conv2d_activation(
     When autotuning is enabled, the autotuner selects the fastest backend.
     """
     IC = input.shape[3]
+    K = filter.shape[0]
+    if groups <= 0 or IC % groups or K % groups:
+        raise ValueError(f"groups={groups} must divide input channels={IC} and output channels={K}")
+    if filter.shape[3] != IC // groups:
+        raise ValueError(
+            "conv2d_activation filter must have shape [K,R,S,IC/groups], got trailing "
+            f"dimension {filter.shape[3]} for IC/groups={IC // groups}"
+        )
     if out is None:
         N = input.shape[0]
         H, W = input.shape[1], input.shape[2]
@@ -531,6 +618,60 @@ def conv2d_activation(
         P = (H + 2 * pad_h - dilation_h * (R - 1) - 1) // stride_h + 1
         Q = (W + 2 * pad_w - dilation_w * (S - 1) - 1) // stride_w + 1
         out = torch.empty(N, P, Q, K, device=input.device, dtype=input.dtype)
+
+    if _is_pointwise_conv2d(
+        input,
+        filter,
+        pad_h,
+        pad_w,
+        stride_h,
+        stride_w,
+        dilation_h,
+        dilation_w,
+        groups,
+    ):
+        from oasr.gemm import _dispatch_gemm_activation, gemm_activation
+        from oasr.tune import is_tuning_enabled
+
+        if is_tuning_enabled():
+            return cast(
+                torch.Tensor,
+                gemm_activation(
+                    input,
+                    filter.reshape(K, IC),
+                    bias,
+                    activation_type=activation_type,
+                    out=out,
+                ),
+            )
+        _dispatch_gemm_activation(
+            out,
+            input,
+            filter.reshape(K, IC),
+            bias,
+            activation_type,
+            K,
+            IC,
+            input.numel() // IC,
+        )
+        return out
+
+    if groups != 1:
+        _get_grouped_conv2d_module().grouped_conv2d_activation(
+            out,
+            input,
+            filter,
+            bias,
+            activation_type,
+            pad_h,
+            pad_w,
+            stride_h,
+            stride_w,
+            dilation_h,
+            dilation_w,
+            groups,
+        )
+        return out
 
     from oasr.tune import is_tuning_enabled
 

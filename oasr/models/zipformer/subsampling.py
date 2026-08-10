@@ -19,7 +19,7 @@ from typing import Tuple
 import torch
 from torch import Tensor, nn
 
-from oasr.layers.linear import Linear
+from oasr.layers import Conv2d, Linear
 
 from .scaling import BiasNorm, SwooshL, SwooshR
 
@@ -44,16 +44,16 @@ class ConvNeXt(nn.Module):
         self.padding = ((kernel_size[0] - 1) // 2, (kernel_size[1] - 1) // 2)
         hidden_channels = channels * hidden_ratio
 
-        self.depthwise_conv = nn.Conv2d(
+        self.depthwise_conv = Conv2d(
             in_channels=channels,
             out_channels=channels,
             groups=channels,
             kernel_size=kernel_size,
             padding=self.padding,
         )
-        self.pointwise_conv1 = nn.Conv2d(channels, hidden_channels, kernel_size=1)
+        self.pointwise_conv1 = Conv2d(channels, hidden_channels, kernel_size=1)
         self.activation = SwooshL()
-        self.pointwise_conv2 = nn.Conv2d(hidden_channels, channels, kernel_size=1)
+        self.pointwise_conv2 = Conv2d(hidden_channels, channels, kernel_size=1)
 
     def forward(self, x: Tensor) -> Tensor:
         bypass = x
@@ -65,19 +65,13 @@ class ConvNeXt(nn.Module):
 
     def streaming_forward(self, x: Tensor, cached_left_pad: Tensor) -> Tuple[Tensor, Tensor]:
         padding = self.padding
-        T = x.size(2) - padding[0]
-        bypass = x[:, :, :T, :]
-        assert cached_left_pad.size(2) == padding[0], (cached_left_pad.size(2), padding[0])
-        x = torch.cat([cached_left_pad, x], dim=2)
-        cached_left_pad = x[:, :, T : padding[0] + T, :]
+        T = x.size(1) - padding[0]
+        bypass = x[:, :T, :, :]
+        assert cached_left_pad.size(1) == padding[0], (cached_left_pad.size(1), padding[0])
+        x = torch.cat([cached_left_pad, x], dim=1)
+        cached_left_pad = x[:, T : padding[0] + T, :, :]
 
-        x = torch.nn.functional.conv2d(
-            x,
-            weight=self.depthwise_conv.weight,
-            bias=self.depthwise_conv.bias,
-            padding=(0, padding[1]),
-            groups=self.depthwise_conv.groups,
-        )
+        x = self.depthwise_conv(x, padding=(0, padding[1]))
         x = self.pointwise_conv1(x)
         x = self.activation(x)
         x = self.pointwise_conv2(x)
@@ -87,6 +81,10 @@ class ConvNeXt(nn.Module):
 
 class Conv2dSubsampling(nn.Module):
     """Convolutional 2D subsampling to 1/2 length: (N, T, idim) -> (N, (T-7)//2, odim)."""
+
+    # v2 stores the projection against NHWC's natural (frequency, channel)
+    # flatten.  Icefall and v1 use NCHW's (channel, frequency) ordering.
+    _version = 2
 
     def __init__(
         self,
@@ -101,14 +99,14 @@ class Conv2dSubsampling(nn.Module):
 
         # Sequential slots match icefall so conv params keep indices 0 / 4 / 7.
         self.conv = nn.Sequential(
-            nn.Conv2d(1, layer1_channels, kernel_size=3, padding=(0, 1)),  # 0
+            Conv2d(1, layer1_channels, kernel_size=3, padding=(0, 1)),  # 0
             _Identity(),  # 1: ScaleGrad
             _Identity(),  # 2: Balancer
             SwooshR(),  # 3
-            nn.Conv2d(layer1_channels, layer2_channels, kernel_size=3, stride=2),  # 4
+            Conv2d(layer1_channels, layer2_channels, kernel_size=3, stride=2),  # 4
             _Identity(),  # 5: Balancer
             SwooshR(),  # 6
-            nn.Conv2d(layer2_channels, layer3_channels, kernel_size=3, stride=(1, 2)),  # 7
+            Conv2d(layer2_channels, layer3_channels, kernel_size=3, stride=(1, 2)),  # 7
             _Identity(),  # 8: Balancer
             SwooshR(),  # 9
         )
@@ -122,12 +120,12 @@ class Conv2dSubsampling(nn.Module):
         self.out_norm = BiasNorm(out_channels)
 
     def forward(self, x: Tensor, x_lens: Tensor) -> Tuple[Tensor, Tensor]:
-        x = x.unsqueeze(1)  # (N, 1, T, idim)
+        x = x.unsqueeze(-1)  # (N, T, idim, 1) NHWC
         x = self.conv(x)
         x = self.convnext(x)
 
-        b, c, t, f = x.size()
-        x = x.transpose(1, 2).reshape(b, t, c * f)
+        b, t, f, c = x.size()
+        x = x.reshape(b, t, f * c)
         x = self.out(x)
         x = self.out_norm(x)
 
@@ -138,12 +136,12 @@ class Conv2dSubsampling(nn.Module):
     def streaming_forward(
         self, x: Tensor, x_lens: Tensor, cached_left_pad: Tensor
     ) -> Tuple[Tensor, Tensor, Tensor]:
-        x = x.unsqueeze(1)
+        x = x.unsqueeze(-1)
         x = self.conv(x)
         x, cached_left_pad = self.convnext.streaming_forward(x, cached_left_pad=cached_left_pad)
 
-        b, c, t, f = x.size()
-        x = x.transpose(1, 2).reshape(b, t, c * f)
+        b, t, f, c = x.size()
+        x = x.reshape(b, t, f * c)
         x = self.out(x)
         x = self.out_norm(x)
 
@@ -158,8 +156,47 @@ class Conv2dSubsampling(nn.Module):
         device: torch.device = torch.device("cpu"),
         dtype: torch.dtype = torch.float32,
     ) -> Tensor:
-        """Cached left padding for the ConvNeXt module: (N, C, left_pad, freq)."""
+        """Cached left padding for the ConvNeXt module: (N, left_pad, freq, C)."""
         left_pad = self.convnext.padding[0]
         freq = self.out_width
         channels = self.layer3_channels
-        return torch.zeros(batch_size, channels, left_pad, freq, device=device, dtype=dtype)
+        return torch.zeros(batch_size, left_pad, freq, channels, device=device, dtype=dtype)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Reorder the projection once when loading icefall/v1 NCHW weights."""
+        if local_metadata.get("version", 1) < 2:
+            key = prefix + "out.weight"
+            if key in state_dict:
+                weight = state_dict[key]
+                out_features, in_features = weight.shape
+                channels = self.layer3_channels
+                if in_features != channels * self.out_width:
+                    raise ValueError(
+                        f"{key} has {in_features} input features; expected "
+                        f"{channels} channels x {self.out_width} frequency bins"
+                    )
+                state_dict[key] = (
+                    weight.view(out_features, channels, self.out_width)
+                    .transpose(1, 2)
+                    .reshape(out_features, in_features)
+                    .contiguous()
+                )
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )

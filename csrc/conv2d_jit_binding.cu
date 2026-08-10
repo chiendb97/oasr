@@ -6,13 +6,26 @@
 #include "tvm_ffi_utils.h"
 
 // Forward declarations — conv2d launchers
+#ifndef OASR_GROUPED_CONV2D_ONLY
 void conv2d(TensorView output, TensorView input, TensorView filter, Optional bias_opt,
             int64_t pad_h, int64_t pad_w, int64_t stride_h, int64_t stride_w, int64_t dilation_h,
             int64_t dilation_w);
 void conv2d_activation(TensorView output, TensorView input, TensorView filter, Optional bias_opt,
                        int64_t activation_type, int64_t pad_h, int64_t pad_w, int64_t stride_h,
                        int64_t stride_w, int64_t dilation_h, int64_t dilation_w);
+#endif
+void grouped_conv2d(TensorView output, TensorView input, TensorView filter, Optional bias_opt,
+                    int64_t pad_h, int64_t pad_w, int64_t stride_h, int64_t stride_w,
+                    int64_t dilation_h, int64_t dilation_w, int64_t groups);
+void grouped_conv2d_activation(TensorView output, TensorView input, TensorView filter,
+                               Optional bias_opt, int64_t activation_type, int64_t pad_h,
+                               int64_t pad_w, int64_t stride_h, int64_t stride_w,
+                               int64_t dilation_h, int64_t dilation_w, int64_t groups);
 
 // TVM-FFI symbol exports
+#ifndef OASR_GROUPED_CONV2D_ONLY
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(conv2d, conv2d);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(conv2d_activation, conv2d_activation);
+#endif
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(grouped_conv2d, grouped_conv2d);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(grouped_conv2d_activation, grouped_conv2d_activation);

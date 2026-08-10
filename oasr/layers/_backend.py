@@ -180,22 +180,6 @@ KERNEL_GAPS: Dict[str, KernelGap] = {
                 "in-tree model reaches the remaining limit"
             ),
         ),
-        KernelGap(
-            id="conv2d-groups",
-            what=(
-                "a grouped (incl. depthwise) 2-D convolution: csrc/conv2d.cu takes "
-                "no `groups` argument at all, so this is an absent kernel rather "
-                "than a refused shape"
-            ),
-            fix=(
-                "kernel: `groups` on the CUTLASS implicit-GEMM conv2d "
-                "(include/oasr/conv/conv2d.cuh + csrc/conv2d.cu), which is KG3 in "
-                ".artifacts/kernel_coverage.md — measured there at 26.7% of offline "
-                "GPU time for the conv front-end as a whole. Reached today by "
-                "Zipformer's 7x7 ConvNeXt depthwise and Nemotron's "
-                "depthwise-separable 8x subsampling"
-            ),
-        ),
     )
 }
 

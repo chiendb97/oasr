@@ -186,6 +186,56 @@ class TestZipformerRegistry:
         assert log_probs.shape[1] == ((T - 7) // 2 + 1) // 2
         assert out_lens[0].item() == log_probs.shape[1]
 
+    def test_subsampling_nhwc_checkpoint_migration_is_function_preserving(self, monkeypatch):
+        """Icefall's NCHW weights/projector load once into the NHWC runtime layout."""
+        import oasr
+        from oasr.layers import Conv2d
+        from oasr.models.zipformer.subsampling import Conv2dSubsampling
+
+        monkeypatch.setattr(
+            oasr,
+            "swoosh_r",
+            lambda x: torch.logaddexp(torch.zeros((), dtype=x.dtype), x - 1.0)
+            - 0.08 * x
+            - 0.313261687,
+        )
+        monkeypatch.setattr(
+            oasr,
+            "swoosh_l",
+            lambda x: torch.logaddexp(torch.zeros((), dtype=x.dtype), x - 4.0) - 0.08 * x - 0.035,
+        )
+
+        torch.manual_seed(0)
+        source = Conv2dSubsampling(80, 64).eval()
+        legacy = {key: value.clone() for key, value in source.state_dict().items()}
+        for name, module in source.named_modules():
+            if isinstance(module, Conv2d):
+                key = name + ".weight"
+                legacy[key] = legacy[key].permute(0, 3, 1, 2).contiguous()
+
+        out_weight = legacy["out.weight"]
+        legacy["out.weight"] = (
+            out_weight.view(out_weight.shape[0], source.out_width, source.layer3_channels)
+            .transpose(1, 2)
+            .reshape_as(out_weight)
+            .contiguous()
+        )
+
+        migrated = Conv2dSubsampling(80, 64).eval()
+        migrated.load_state_dict(legacy)
+        native_roundtrip = Conv2dSubsampling(80, 64).eval()
+        native_roundtrip.load_state_dict(source.state_dict())
+
+        x = torch.randn(2, 47, 80)
+        lengths = torch.tensor([47, 43], dtype=torch.int32)
+        expected, expected_lengths = source(x, lengths)
+        got, got_lengths = migrated(x, lengths)
+        native, native_lengths = native_roundtrip(x, lengths)
+        torch.testing.assert_close(got, expected)
+        torch.testing.assert_close(native, expected)
+        assert torch.equal(got_lengths, expected_lengths)
+        assert torch.equal(native_lengths, expected_lengths)
+
 
 # --------------------------------------------------------------------------- #
 # Parity tests vs icefall reference

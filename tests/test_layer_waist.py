@@ -39,6 +39,7 @@ from oasr.models.registry import get_model_entry, list_models
 BANNED = (
     nn.Linear,
     nn.Conv1d,
+    nn.Conv2d,
     nn.LayerNorm,
     nn.Embedding,
     nn.RMSNorm,
@@ -151,10 +152,8 @@ def _tiny_configs():
             context_size=2,
             blank_id=0,
         ),
-        # The 8x subsampling stack is kept at three real stages: its depthwise
-        # Conv2d is the ``conv2d-groups`` gap, so shrinking it away would remove
-        # the only in-tree architecture that exercises that declaration on the
-        # request path.
+        # Keep the 8x subsampling stack at three real stages so its depthwise
+        # and pointwise Conv2d kernel paths remain represented in the tiny model.
         "nemotron": NemotronModelConfig(
             vocab_size=32,
             blank_token_id=31,
@@ -329,6 +328,32 @@ class TestLayersRunOnCpu:
         ).transpose(1, 2)
         torch.testing.assert_close(got, (conv + masked) * mask)
 
+    @pytest.mark.parametrize(
+        "in_channels,out_channels,kernel,groups",
+        [(8, 8, 3, 8), (8, 16, 3, 4), (8, 16, 1, 1)],
+    )
+    def test_grouped_and_pointwise_conv2d(self, in_channels, out_channels, kernel, groups):
+        from oasr.layers import Conv2d
+
+        padding = kernel // 2
+        m = Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel,
+            padding=padding,
+            groups=groups,
+        )
+        x = torch.randn(2, 11, 7, in_channels)
+        got = m(x)
+        ref = torch.nn.functional.conv2d(
+            x.permute(0, 3, 1, 2),
+            m.weight.permute(0, 3, 1, 2),
+            m.bias,
+            padding=padding,
+            groups=groups,
+        ).permute(0, 2, 3, 1)
+        torch.testing.assert_close(got, ref)
+
     def test_norms(self):
         from oasr.layers import BiasNorm, LayerNorm, RMSNorm
 
@@ -485,12 +510,7 @@ class TestKernelGapRegistry:
     #: (left padding), and unaligned output projections never became a gap at
     #: all — they were closed at the model layer by widening the head on load.
     #:
-    #: ``conv2d-groups`` is a *newly declared* gap rather than a newly created
-    #: one: grouped conv2d has never had a kernel, and Zipformer's 7x7 ConvNeXt
-    #: depthwise reached it through a bare ``nn.Conv2d`` where nothing counted it
-    #: (``.artifacts/kernel_coverage.md`` §0 is about exactly that blind spot).
-    #: Declaring it moves the debt from prose into the counter.
-    PINNED = {"conv2d-groups", "fmha-head-dim"}
+    PINNED = {"fmha-head-dim"}
 
     def test_declared_gap_set_only_shrinks(self):
         from oasr.layers._backend import KERNEL_GAPS
@@ -633,6 +653,31 @@ class TestKernelAndTorchPathsAgree:
         got = m(x, mask=mask, add_input=True)
         with layers_backend_override("torch"):
             ref = m(x, mask=mask, add_input=True)
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "in_channels,out_channels,kernel,groups",
+        [(128, 128, 7, 128), (16, 32, 3, 4), (128, 384, 1, 1)],
+    )
+    def test_grouped_and_pointwise_conv2d(self, dtype, in_channels, out_channels, kernel, groups):
+        from oasr.layers import Conv2d
+
+        m = (
+            Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel,
+                padding=kernel // 2,
+                groups=groups,
+            )
+            .cuda()
+            .to(dtype)
+        )
+        x = torch.randn(2, 19, 11, in_channels, device="cuda", dtype=dtype)
+        got = m(x)
+        with layers_backend_override("torch"):
+            ref = m(x)
         torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
 
     @pytest.mark.parametrize("hidden", [64, 100])

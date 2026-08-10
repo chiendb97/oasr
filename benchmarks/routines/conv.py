@@ -1,12 +1,14 @@
 """Convolution family benchmark routines.
 
 Covers: depthwise_conv1d, depthwise_conv1d_causal, pointwise_conv1d,
-        pointwise_conv1d_activation, conv2d, conv2d_activation.
+        pointwise_conv1d_activation, conv2d, conv2d_activation,
+        grouped_conv2d, pointwise_conv2d.
 """
 
 from __future__ import annotations
 
 import argparse
+import statistics
 from typing import Any
 
 import torch
@@ -33,6 +35,8 @@ SUBROUTINES = [
     "pointwise_conv1d_activation",
     "conv2d",
     "conv2d_activation",
+    "grouped_conv2d",
+    "pointwise_conv2d",
 ]
 
 # ---------------------------------------------------------------------------
@@ -98,6 +102,62 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
         {"N": 8, "H": 150, "W": 40, "IC": 256, "K": 256, "R": 3, "S": 3, "pad": 0, "stride": 2},
         {"N": 16, "H": 100, "W": 40, "IC": 256, "K": 256, "R": 3, "S": 3, "pad": 1, "stride": 1},
     ],
+    "grouped_conv2d": [
+        {
+            "N": 1,
+            "H": 50,
+            "W": 19,
+            "IC": 128,
+            "K": 128,
+            "R": 7,
+            "S": 7,
+            "pad": 3,
+            "stride": 1,
+            "groups": 128,
+        },
+        {
+            "N": 8,
+            "H": 50,
+            "W": 19,
+            "IC": 128,
+            "K": 128,
+            "R": 7,
+            "S": 7,
+            "pad": 3,
+            "stride": 1,
+            "groups": 128,
+        },
+        {
+            "N": 1,
+            "H": 100,
+            "W": 40,
+            "IC": 256,
+            "K": 256,
+            "R": 3,
+            "S": 3,
+            "pad": 0,
+            "stride": 2,
+            "groups": 256,
+        },
+        {
+            "N": 8,
+            "H": 100,
+            "W": 40,
+            "IC": 256,
+            "K": 256,
+            "R": 3,
+            "S": 3,
+            "pad": 0,
+            "stride": 2,
+            "groups": 256,
+        },
+    ],
+    "pointwise_conv2d": [
+        {"N": 1, "H": 50, "W": 19, "IC": 128, "K": 384, "R": 1, "S": 1, "pad": 0, "stride": 1},
+        {"N": 8, "H": 50, "W": 19, "IC": 128, "K": 384, "R": 1, "S": 1, "pad": 0, "stride": 1},
+        {"N": 1, "H": 50, "W": 19, "IC": 384, "K": 128, "R": 1, "S": 1, "pad": 0, "stride": 1},
+        {"N": 8, "H": 50, "W": 19, "IC": 384, "K": 128, "R": 1, "S": 1, "pad": 0, "stride": 1},
+    ],
 }
 
 PROFILE_CONFIGS: dict[str, tuple] = {
@@ -106,6 +166,8 @@ PROFILE_CONFIGS: dict[str, tuple] = {
     "pointwise_conv1d": (64, 250, 512, 1024),
     "conv2d": (16, 100, 40, 256, 256, 3, 3, 1, 1),
     "conv2d_activation": (16, 100, 40, 256, 256, 3, 3, 1, 1),
+    "grouped_conv2d": (8, 50, 19, 128, 128, 7, 7, 3, 1, 128),
+    "pointwise_conv2d": (8, 50, 19, 128, 384),
 }
 
 
@@ -237,6 +299,30 @@ def setup_conv2d_activation(
     return oasr_fn, pytorch_fn
 
 
+def setup_grouped_conv2d(
+    batch_size, H, W, IC, K, R, S, pad=0, stride=1, groups=1, dtype=torch.float16
+):
+    x_nhwc = torch.randn(batch_size, H, W, IC, device="cuda", dtype=dtype)
+    w_krsc = torch.randn(K, R, S, IC // groups, device="cuda", dtype=dtype)
+    bias = torch.randn(K, device="cuda", dtype=dtype)
+    x_nchw = x_nhwc.permute(0, 3, 1, 2).contiguous()
+    w_kcrs = w_krsc.permute(0, 3, 1, 2).contiguous()
+
+    def oasr_fn():
+        return oasr.conv2d(x_nhwc, w_krsc, bias, pad, pad, stride, stride, groups=groups)
+
+    def pytorch_fn():
+        return F.conv2d(x_nchw, w_kcrs, bias, padding=pad, stride=stride, groups=groups).permute(
+            0, 2, 3, 1
+        )
+
+    return oasr_fn, pytorch_fn
+
+
+def setup_pointwise_conv2d(batch_size, H, W, IC, K, dtype=torch.float16):
+    return setup_grouped_conv2d(batch_size, H, W, IC, K, 1, 1, dtype=dtype)
+
+
 # ---------------------------------------------------------------------------
 # CLI args
 # ---------------------------------------------------------------------------
@@ -253,6 +339,7 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--height", type=int, default=None, help="Input height (2D conv)")
     parser.add_argument("--width", type=int, default=None, help="Input width (2D conv)")
     parser.add_argument("--out-filters", type=int, default=None, help="Output filters (2D conv)")
+    parser.add_argument("--groups", type=int, default=1, help="Channel groups (2D conv)")
     parser.add_argument("--filter-h", type=int, default=3, help="Filter height (2D conv)")
     parser.add_argument("--filter-w", type=int, default=3, help="Filter width (2D conv)")
     parser.add_argument("--pad", type=int, default=0, help="Padding")
@@ -341,7 +428,7 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
 
 
 def _resolve_configs(args, subroutine):
-    if subroutine in ("conv2d", "conv2d_activation"):
+    if subroutine in ("conv2d", "conv2d_activation", "grouped_conv2d", "pointwise_conv2d"):
         return _resolve_conv2d_configs(args, subroutine)
     return _resolve_conv1d_configs(args, subroutine)
 
@@ -374,10 +461,22 @@ def _resolve_conv2d_configs(args, subroutine):
     S = getattr(args, "filter_w", 3)
     pad = getattr(args, "pad", 0)
     stride = getattr(args, "stride", 1)
+    groups = getattr(args, "groups", 1)
 
     if all(v is not None for v in [N, H, W, IC, K]):
         return [
-            {"N": N, "H": H, "W": W, "IC": IC, "K": K, "R": R, "S": S, "pad": pad, "stride": stride}
+            {
+                "N": N,
+                "H": H,
+                "W": W,
+                "IC": IC,
+                "K": K,
+                "R": R,
+                "S": S,
+                "pad": pad,
+                "stride": stride,
+                "groups": groups,
+            }
         ]
 
     return DEFAULT_CONFIGS.get(subroutine, [])
@@ -426,19 +525,36 @@ def _setup_for_config(subroutine, cfg, dtype):
             cfg["stride"],
             dtype=dtype,
         )
+    elif subroutine == "grouped_conv2d":
+        return setup_grouped_conv2d(
+            cfg["N"],
+            cfg["H"],
+            cfg["W"],
+            cfg["IC"],
+            cfg["K"],
+            cfg["R"],
+            cfg["S"],
+            cfg["pad"],
+            cfg["stride"],
+            cfg["groups"],
+            dtype,
+        )
+    elif subroutine == "pointwise_conv2d":
+        return setup_pointwise_conv2d(cfg["N"], cfg["H"], cfg["W"], cfg["IC"], cfg["K"], dtype)
     else:
         raise ValueError(f"Unknown conv subroutine: {subroutine}")
 
 
 def _compute_tflops(subroutine, cfg, time_ms):
-    if subroutine in ("conv2d", "conv2d_activation"):
+    if subroutine in ("conv2d", "conv2d_activation", "grouped_conv2d", "pointwise_conv2d"):
         N, H, W = cfg["N"], cfg["H"], cfg["W"]
         IC, K, R, S = cfg["IC"], cfg["K"], cfg["R"], cfg["S"]
         stride = cfg.get("stride", 1)
         pad = cfg.get("pad", 0)
         OH = (H + 2 * pad - R) // stride + 1
         OW = (W + 2 * pad - S) // stride + 1
-        flops = 2 * N * OH * OW * K * IC * R * S
+        groups = cfg.get("groups", 1)
+        flops = 2 * N * OH * OW * K * (IC // groups) * R * S
         return flops / (time_ms * 1e-3) / 1e12 if time_ms > 0 else 0.0
     elif subroutine in ("pointwise_conv1d", "pointwise_conv1d_activation"):
         b, s = cfg["batch"], cfg["seq"]
@@ -450,9 +566,10 @@ def _compute_tflops(subroutine, cfg, time_ms):
 
 
 def _shape_str(subroutine, cfg):
-    if subroutine in ("conv2d", "conv2d_activation"):
+    if subroutine in ("conv2d", "conv2d_activation", "grouped_conv2d", "pointwise_conv2d"):
         c = cfg
-        return f"[{c['N']},{c['H']},{c['W']},{c['IC']}->{c['K']}] {c['R']}x{c['S']} p={c['pad']} s={c['stride']}"
+        groups = f" g={c['groups']}" if c.get("groups", 1) != 1 else ""
+        return f"[{c['N']},{c['H']},{c['W']},{c['IC']}->{c['K']}] {c['R']}x{c['S']} p={c['pad']} s={c['stride']}{groups}"
     elif subroutine in ("pointwise_conv1d", "pointwise_conv1d_activation"):
         return f"[{cfg['batch']}, {cfg['seq']}, {cfg['channels']}] -> {cfg['out_channels']}"
     else:
@@ -466,8 +583,11 @@ def get_fn_map(subroutine, oasr_fn, pytorch_fn):
         "conv2d_activation",
         "pointwise_conv1d",
         "pointwise_conv1d_activation",
+        "pointwise_conv2d",
     ):
         return {"cutlass": oasr_fn, "torch": pytorch_fn}
+    if subroutine == "grouped_conv2d":
+        return {"cuda": oasr_fn, "torch": pytorch_fn}
     return {"cuda": oasr_fn, "torch": pytorch_fn}
 
 
@@ -578,6 +698,10 @@ def run_standalone(variant: str = "depthwise_conv1d") -> None:
             "title": "Conv2D NHWC Kernels",
             "subroutines": ["conv2d", "conv2d_activation"],
         },
+        "grouped_conv2d": {
+            "title": "Grouped/Pointwise Conv2D NHWC Kernels",
+            "subroutines": ["grouped_conv2d", "pointwise_conv2d"],
+        },
     }
 
     info = _VARIANT_MAP.get(variant, _VARIANT_MAP["depthwise_conv1d"])
@@ -618,6 +742,67 @@ def run_standalone(variant: str = "depthwise_conv1d") -> None:
     run_main(title, pcfg, setup_funcs, benchmark)
 
 
+def run_grouped_conv2d_report(rounds: int = 5, iterations: int = 30) -> None:
+    """Print an interleaved grouped/pointwise Conv2D report against cuDNN."""
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is required")
+
+    col_shape, col_time, col_speedup = 48, 20, 13
+    header = (
+        f"{'shape':>{col_shape}}"
+        f"  {'OASR E2E':>{col_time}}"
+        f"  {'PyTorch/cuDNN':>{col_time}}"
+        f"  {'cuDNN/OASR':>{col_speedup}}"
+    )
+    title = "OASR Grouped/Pointwise Conv2D Benchmark"
+
+    def measure(arms):
+        samples = {name: [] for name in arms}
+        names = list(arms)
+        for round_idx in range(rounds):
+            offset = round_idx % len(names)
+            for name in names[offset:] + names[:offset]:
+                median_ms, _ = bench_fn(arms[name], dry_run_iters=2, num_iters=iterations)
+                samples[name].append(median_ms)
+        return {
+            name: (
+                statistics.median(values),
+                statistics.stdev(values) if len(values) > 1 else 0.0,
+            )
+            for name, values in samples.items()
+        }
+
+    def fmt(timing):
+        return f"{timing[0]:.4f}±{timing[1]:.4f}ms"
+
+    device = torch.cuda.get_device_name()
+    capability = torch.cuda.get_device_capability()
+    print(title)
+    print("=" * len(header))
+    print(
+        f"device={device}, sm={capability[0]}{capability[1]}, "
+        f"rounds={rounds}, iterations={iterations}"
+    )
+    for dtype in (torch.float16, torch.bfloat16):
+        print(f"\n--- {str(dtype).removeprefix('torch.')} ---")
+        print(header)
+        print("-" * len(header))
+        for subroutine in ("grouped_conv2d", "pointwise_conv2d"):
+            for cfg in DEFAULT_CONFIGS[subroutine]:
+                oasr_fn, torch_fn = _setup_for_config(subroutine, cfg, dtype)
+                torch.testing.assert_close(oasr_fn(), torch_fn(), rtol=2e-2, atol=2e-2)
+                timings = measure({"oasr": oasr_fn, "torch": torch_fn})
+                speedup = timings["torch"][0] / timings["oasr"][0]
+                shape = _shape_str(subroutine, cfg)
+                print(
+                    f"{shape:>{col_shape}}"
+                    f"  {fmt(timings['oasr']):>{col_time}}"
+                    f"  {fmt(timings['torch']):>{col_time}}"
+                    f"  {f'{speedup:.2f}x':>{col_speedup}}"
+                )
+    print()
+
+
 def _make_profile_setup(subroutine):
     cfg_tuple = PROFILE_CONFIGS[subroutine]
 
@@ -632,6 +817,10 @@ def _make_profile_setup(subroutine):
             return setup_conv2d(*cfg_tuple)
         elif subroutine == "conv2d_activation":
             return setup_conv2d_activation(*cfg_tuple)
+        elif subroutine == "grouped_conv2d":
+            return setup_grouped_conv2d(*cfg_tuple)
+        elif subroutine == "pointwise_conv2d":
+            return setup_pointwise_conv2d(*cfg_tuple)
         else:
             return setup_depthwise_conv1d(*cfg_tuple)
 

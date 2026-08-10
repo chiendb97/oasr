@@ -22,7 +22,12 @@ def gen_all_modules() -> List:
         List of JitSpec objects for all kernel modules.
     """
     from oasr.jit.activation import gen_activation_module
-    from oasr.jit.conv import gen_conv2d_module, gen_conv_module, gen_cudnn_conv2d_module
+    from oasr.jit.conv import (
+        gen_conv2d_module,
+        gen_conv_module,
+        gen_cudnn_conv2d_module,
+        gen_grouped_conv2d_module,
+    )
     from oasr.jit.ctc_decoder import gen_ctc_decoder_module
     from oasr.jit.features import gen_features_module
     from oasr.jit.fft import gen_fft_module
@@ -42,6 +47,7 @@ def gen_all_modules() -> List:
         gen_conv_module(),
         gen_conv2d_module(),
         gen_cudnn_conv2d_module(),
+        gen_grouped_conv2d_module(),
         gen_gemm_module(),
         gen_bmm_module(),
         gen_group_gemm_module(),
