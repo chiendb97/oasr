@@ -70,6 +70,7 @@ VecSize / block_size dispatch macros instead.
 | GEMM, BMM, GroupGEMM | **jinja** | `cutlass_gemm_configs.h` | Jinja renders `.cu` with baked-in config |
 | Dense Conv1D / Conv2D | **jinja** | `cutlass_conv2d_configs.h` | Jinja renders `.cu` with baked-in config; each tactic exports strict BTC/KSC Conv1D and NHWC/KRSC Conv2D entry points |
 | Depthwise / causal Conv1D | **dispatch** | `conv1d_dispatch.inc` | Direct compilation, VecSize macro |
+| Grouped / depthwise Conv2D | **direct** | `grouped_conv2d.cuh` | NHWC 3×3/7×7 specializations; bias and optional activation share the convolution launch |
 | Norm | **dispatch** | `norm_dispatch.inc` | Direct compilation, block/vec macro |
 | Activation | **dispatch** | `activation_dispatch.inc` | Direct compilation, VecSize macro |
 
@@ -143,7 +144,7 @@ allocates its output tensor, and calls into the compiled module.
 | `oasr/gemm.py` | `gemm`, `bmm`, `group_gemm`, and the fused epilogues `gemm_activation` (RELU/GELU/SWISH) and `gemm_log_softmax` (the CTC head fast path) |
 | `oasr/gemm_torch.py` | Torch/cuBLAS runners — `torch_gemm`, `torch_gemm_activation`, `torch_bmm`, `torch_gemm_log_softmax` — mirroring the CUTLASS launcher contract exactly (output-first, in-place / CUDA-graph-safe, `D = A @ Bᵀ`). Doubles as a `Tactic("torch")` autotuner candidate and as the production dispatch target. Deliberately free of any `oasr.tune` import. |
 | `oasr/norm.py` | `layer_norm`, `rms_norm`, `batch_norm1d`, `group_norm`, fused norm+activation |
-| `oasr/conv.py` | dense / depthwise / pointwise / causal Conv1D and Conv2D; depthwise padding may be an integer or `(left, right)` pair |
+| `oasr/conv.py` | dense / depthwise / pointwise / causal Conv1D; dense, grouped and depthwise Conv2D. Dense NHWC 1×1 Conv2D dispatches as GEMM; Conv1D depthwise padding may be an integer or `(left, right)` pair |
 | `oasr/activation.py` | `glu`, `swish` |
 | `oasr/softmax.py`, `oasr/topk.py`, `oasr/fft.py` | `softmax`, `topk`, `rfft` / `rfft_power` |
 | `oasr/feature.py` | `stft_frame`, `dct_lifter`, `fbank_preprocess`, `mel_log` — see [features.md](features.md) |

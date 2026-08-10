@@ -109,6 +109,14 @@ class TestSelectDefaultConfig:
             assert cfg.block_m < 128  # a tall-thin tile, not the 128-row default
 
     @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
+    @pytest.mark.parametrize("M", [64, 950, 2048, 4096, 7600])
+    def test_zipformer_pointwise_contraction_uses_measured_thin_tile(self, M):
+        cfg = select_default_config("gemm", M, 128, 384, torch.bfloat16, 120)
+        assert isinstance(cfg, CutlassGemmConfig)
+        assert cfg.compile_name != GEMM_DEFAULT.compile_name
+        assert cfg.compile_name in get_unique_compile_configs(120)
+
+    @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
     def test_large_m_contract_avoids_default(self):
         # The deep-K thin contract GEMM (FF-down, N=256 K=2048) at large
         # offline M: the expanded candidate space (thin-N tiles + working

@@ -308,6 +308,77 @@ class TestConv2D:
         assert output.shape == (N, P, Q, K)
 
 
+class TestGroupedConv2D:
+    """Grouped/depthwise direct NHWC kernel and 1x1 GEMM specialization."""
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "N,H,W,IC,K,R,S,pad,stride,groups",
+        [
+            (2, 31, 17, 16, 16, 3, 3, 1, 1, 16),
+            (1, 25, 13, 128, 128, 7, 7, 3, 1, 128),
+            (2, 19, 11, 16, 32, 3, 3, 1, 2, 4),
+            (1, 13, 9, 8, 8, 5, 5, 2, 1, 2),
+        ],
+    )
+    def test_grouped_conv2d(self, dtype, N, H, W, IC, K, R, S, pad, stride, groups):
+        x = torch.randn(N, H, W, IC, device="cuda", dtype=dtype)
+        weight = torch.randn(K, R, S, IC // groups, device="cuda", dtype=dtype)
+        bias = torch.randn(K, device="cuda", dtype=dtype)
+
+        got = oasr.conv2d(x, weight, bias, pad, pad, stride, stride, groups=groups)
+        ref = F.conv2d(
+            x.permute(0, 3, 1, 2),
+            weight.permute(0, 3, 1, 2),
+            bias,
+            padding=pad,
+            stride=stride,
+            groups=groups,
+        ).permute(0, 2, 3, 1)
+
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+        assert got.is_contiguous()
+
+    @pytest.mark.parametrize(
+        "activation,fn",
+        [(0, F.relu), (1, lambda x: F.gelu(x, approximate="tanh")), (2, F.silu)],
+    )
+    def test_grouped_conv2d_activation(self, activation, fn):
+        x = torch.randn(2, 23, 13, 16, device="cuda", dtype=torch.float16)
+        weight = torch.randn(16, 3, 3, 1, device="cuda", dtype=torch.float16)
+        bias = torch.randn(16, device="cuda", dtype=torch.float16)
+
+        got = oasr.conv2d_activation(x, weight, bias, activation, 1, 1, groups=16)
+        ref = fn(
+            F.conv2d(
+                x.permute(0, 3, 1, 2),
+                weight.permute(0, 3, 1, 2),
+                bias,
+                padding=1,
+                groups=16,
+            )
+        ).permute(0, 2, 3, 1)
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_pointwise_conv2d_uses_destination(self, dtype):
+        x = torch.randn(2, 17, 9, 64, device="cuda", dtype=dtype)
+        weight = torch.randn(128, 1, 1, 64, device="cuda", dtype=dtype)
+        bias = torch.randn(128, device="cuda", dtype=dtype)
+        out = torch.empty(2, 17, 9, 128, device="cuda", dtype=dtype)
+
+        got = oasr.conv2d(x, weight, bias, out=out)
+        ref = F.conv2d(x.permute(0, 3, 1, 2), weight.permute(0, 3, 1, 2), bias).permute(0, 2, 3, 1)
+        assert got.data_ptr() == out.data_ptr()
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    def test_invalid_groups_rejected_before_jit(self):
+        x = torch.randn(1, 5, 5, 8, device="cuda", dtype=torch.float16)
+        weight = torch.randn(8, 3, 3, 2, device="cuda", dtype=torch.float16)
+        with pytest.raises(ValueError, match="must divide"):
+            oasr.conv2d(x, weight, groups=3)
+
+
 class TestConv2DCudnn:
     """Tests for oasr.conv2d() with cuDNN backend (small IC, e.g. conformer subsampling)."""
 

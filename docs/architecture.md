@@ -59,20 +59,18 @@ closed. Three cases, kept apart on purpose:
 optional backend, used by the CPU oracles and as the "is this the kernels'
 fault" A/B). There is no `auto`.
 
-Two gaps are declared, both kernel-side:
+One kernel-side gap is declared:
 
 | Gap | Missing | Reached by |
 |---|---|---|
 | `fmha-head-dim` | head dims so wide that even a 1-deep cp.async ring overflows smem (>256 on a 99 KB arch) | nothing in-tree |
-| `conv2d-groups` | `csrc/conv2d.cu` has no `groups` argument at all, so a grouped or depthwise conv2d is an *absent* kernel rather than a refused shape | Nemotron's depthwise-separable subsampling; Zipformer's 7×7 ConvNeXt block once it migrates |
 
-`conv2d-groups` arrived by *moving the accounting boundary*, not by adding debt:
-grouped conv2d never had a kernel, and Zipformer reached it through a bare
-`nn.Conv2d` that nothing counted. The same change gave the whole conv family the
-torch path it never had, which is what lets a convolutional front-end run under
-an fp32 CPU parity oracle at all.
+`conv2d-groups` is closed: grouped and depthwise calls use the direct NHWC
+kernel, dense 1×1 calls use the layout-equivalent GEMM path, and Zipformer's
+subsampler stays NHWC through its ConvNeXt block. The whole conv family retains
+its torch path so convolutional front-ends can run under fp32 CPU parity oracles.
 
-`fmha-mask-form` and `norm-strided-rows` were both here and are closed. So were
+`fmha-mask-form`, `norm-strided-rows`, and `conv2d-groups` were here and are closed. So were
 `fmha-head-dim`'s 128-wide case (a smem-budget bug, not a missing config) and
 every unaligned output projection (closed at the *model* layer via
 `align_out_features` + `pad_output_projection`, the pattern the WeNet CTC head

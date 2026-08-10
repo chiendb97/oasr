@@ -539,6 +539,23 @@ def gen_conv2d_module() -> JitSpec:
     return gen_jit_spec("conv2d", source_paths)
 
 
+def gen_grouped_conv2d_module() -> JitSpec:
+    """Generate the direct NHWC grouped/depthwise Conv2D module.
+
+    This module is deliberately separate from the many dense CUTLASS tile
+    variants: grouped traffic has one direct implementation, so rebuilding it
+    must not recompile every implicit-GEMM tactic.
+    """
+    return gen_jit_spec(
+        "grouped_conv2d",
+        [
+            env.OASR_CSRC_DIR / "conv2d.cu",
+            env.OASR_CSRC_DIR / "conv2d_jit_binding.cu",
+        ],
+        extra_cuda_cflags=["-DOASR_GROUPED_CONV2D_ONLY=1"],
+    )
+
+
 # =============================================================================
 # cuDNN Conv2D (unchanged)
 # =============================================================================

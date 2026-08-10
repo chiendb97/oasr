@@ -890,6 +890,54 @@ else:
 # prints the untuned ``(op, N, K, M)`` a workload actually hit, which is both the
 # check that a model is covered and the shape list to hand the tuner.
 _GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
+    # Zipformer ConvNeXt's 1x1 contraction (NHWC 384 -> 128).  KG3 profiling
+    # covers both FP16/BF16 and M=64..7600; the fixed 128x128 default wastes
+    # work on this thin-N projection.
+    ("gemm", 128, 384): [
+        (
+            1024,
+            CutlassGemmConfig(
+                block_m=32,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=4,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),
+        (
+            2048,
+            CutlassGemmConfig(
+                block_m=128,
+                block_n=16,
+                block_k=64,
+                warp_m=32,
+                warp_n=16,
+                warp_k=64,
+                kStages=4,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),
+        (
+            8192,
+            CutlassGemmConfig(
+                block_m=32,
+                block_n=64,
+                block_k=64,
+                warp_m=16,
+                warp_n=32,
+                warp_k=64,
+                kStages=4,
+                kSmVersion=120,
+                split_k=1,
+            ),
+        ),
+        (None, GEMM_DEFAULT),
+    ],
     ("gemm", 256, 256): [
         (
             512,

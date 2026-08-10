@@ -22,11 +22,8 @@ below are translated rather than assumed:
 * :class:`PointwiseConv1d` is a 1x1 convolution, i.e. a GEMM over the channel
   axis, so the fallback is ``F.linear`` on the squeezed weight.
 
-``groups`` is accepted by :class:`Conv2d` and declared as the ``conv2d-groups``
-kernel gap: ``csrc/conv2d.cu`` has no ``groups`` parameter, so a grouped
-convolution has no kernel at all.  Taking it through the gap machinery is the
-point — a model that reached for ``nn.Conv2d(groups=...)`` instead would leave
-the gap invisible and uncounted (see ``.artifacts/kernel_coverage.md`` §0).
+Grouped and depthwise :class:`Conv2d` calls use the direct NHWC kernel; dense
+1x1 calls use the layout-equivalent GEMM fast path.
 """
 
 from __future__ import annotations
@@ -40,7 +37,7 @@ import torch.nn.functional as F
 
 import oasr
 
-from ._backend import take_gap, use_conv_kernel
+from ._backend import use_conv_kernel
 
 #: Torch equivalent of each fused-epilogue activation id.  ``gelu`` maps to the
 #: **tanh** approximation because that is what the CUDA epilogue implements
@@ -437,10 +434,8 @@ class Conv2d(nn.Module):
     Supports FP16 and BF16 dtypes on the kernel path; anything else takes
     ``F.conv2d`` (see the module docstring).
 
-    ``groups > 1`` (including depthwise, ``groups == in_channels``) has **no
-    kernel** — ``csrc/conv2d.cu`` takes no ``groups`` argument — so it is
-    declared as the ``conv2d-groups`` gap and served by torch.  Expressing it
-    here rather than reaching for ``nn.Conv2d`` is what keeps the gap counted.
+    Grouped convolutions use a direct NHWC CUDA kernel.  Dense 1x1 convolutions
+    are GEMMs over the channel axis and dispatch through the GEMM family.
     """
 
     def __init__(
@@ -503,47 +498,39 @@ class Conv2d(nn.Module):
             self.register_parameter("bias", None)
 
     def _use_kernel(self, x: torch.Tensor) -> bool:
-        # Out-of-scope first, gap second: on CPU or in fp32 there is no kernel to
-        # miss, so counting a *gap* there would inflate the debt with every run of
-        # the CPU suite.  A gap is only a gap on hardware and in a dtype the
-        # framework serves.
-        if not use_conv_kernel(x):
-            return False
-        if self.groups != 1:
-            return take_gap(
-                "conv2d-groups",
-                f"Conv2d({self.in_channels} -> {self.out_channels}, "
-                f"kernel={self.kernel_size}, groups={self.groups})",
-            )
-        return True
+        return use_conv_kernel(x)
 
-    def _torch_forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _torch_forward(
+        self, x: torch.Tensor, padding: tuple[int, int] | None = None
+    ) -> torch.Tensor:
         """NHWC/KRSC → ``F.conv2d``'s NCHW/KCRS and back."""
         out: torch.Tensor = F.conv2d(
             x.permute(0, 3, 1, 2),
             self.weight.permute(0, 3, 1, 2),
             self.bias,
             stride=self.stride,
-            padding=self.padding,
+            padding=self.padding if padding is None else padding,
             dilation=self.dilation,
             groups=self.groups,
         )
         return out.permute(0, 2, 3, 1).contiguous()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, padding: tuple[int, int] | None = None) -> torch.Tensor:
         """x: [N, H, W, in_channels] -> [N, P, Q, out_channels]."""
         if not self._use_kernel(x):
-            return self._torch_forward(x)
+            return self._torch_forward(x, padding)
+        pad_h, pad_w = self.padding if padding is None else padding
         out: torch.Tensor = oasr.conv2d(
             x,
             self.weight,
             self.bias,
-            self.padding[0],
-            self.padding[1],
+            pad_h,
+            pad_w,
             self.stride[0],
             self.stride[1],
             self.dilation[0],
             self.dilation[1],
+            groups=self.groups,
         )
         return out
 
@@ -597,7 +584,7 @@ class Conv2dActivation(Conv2d):
     """2D convolution with fused activation backed by CUTLASS Ampere Tensor Core.
 
     Computes ``output = activation(conv2d(input, weight) + bias)``.
-    Same NHWC layout, alignment requirements, ``groups`` handling and torch
+    Same NHWC layout, alignment requirements, grouped kernel and torch
     fallback as :class:`Conv2d`, which it subclasses — the two used to carry
     identical ``__init__`` and ``_load_from_state_dict`` bodies, and the layout
     translation the fallback needs is worth having in exactly one place.
@@ -641,21 +628,23 @@ class Conv2dActivation(Conv2d):
         self.activation_name = activation_type
         self.activation = oasr.get_activation_type_id(activation_type)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, padding: tuple[int, int] | None = None) -> torch.Tensor:
         """x: [N, H, W, in_channels] -> [N, P, Q, out_channels]."""
         if not self._use_kernel(x):
-            return _TORCH_CONV_ACTIVATION[self.activation_name](self._torch_forward(x))
+            return _TORCH_CONV_ACTIVATION[self.activation_name](self._torch_forward(x, padding))
+        pad_h, pad_w = self.padding if padding is None else padding
         out: torch.Tensor = oasr.conv2d_activation(
             x,
             self.weight,
             self.bias,
             self.activation,
-            self.padding[0],
-            self.padding[1],
+            pad_h,
+            pad_w,
             self.stride[0],
             self.stride[1],
             self.dilation[0],
             self.dilation[1],
+            groups=self.groups,
         )
         return out
 

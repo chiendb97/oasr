@@ -219,14 +219,7 @@ class NemotronSubsampling(nn.Module):
 
 
 class _SubsamplingStage(nn.Module):
-    """Depthwise stride-2 Conv2d + 1x1 pointwise Conv2d (NHWC).
-
-    The depthwise convolution has **no kernel**: ``csrc/conv2d.cu`` takes no
-    ``groups`` argument, so ``oasr.layers.Conv2d`` records the ``conv2d-groups``
-    gap and serves it with ``F.conv2d``.  Reaching for ``nn.Conv2d`` here instead
-    would work identically and count nothing — see ``.artifacts/kernel_coverage.md``
-    §0 for why that distinction is the point.
-    """
+    """Depthwise stride-2 Conv2d + GEMM-backed 1x1 Conv2d (NHWC)."""
 
     def __init__(self, channels: int, kernel: int, stride: int) -> None:
         super().__init__()
