@@ -312,6 +312,23 @@ class TestLayersRunOnCpu:
             torch.randn(2, 7, 8)
         ).shape == (2, 5, 16)
 
+    def test_depthwise_conv1d_asymmetric_masked_residual(self):
+        from oasr.layers import DepthwiseConv1d
+
+        torch.manual_seed(0)
+        m = DepthwiseConv1d(8, 5, padding=(3, 1), bias=False)
+        x = torch.randn(2, 9, 8)
+        mask = (torch.rand(2, 9, 1) > 0.3).to(x.dtype)
+
+        got = m(x, mask=mask, add_input=True)
+        masked = x * mask
+        conv = torch.nn.functional.conv1d(
+            torch.nn.functional.pad(masked.transpose(1, 2), (3, 1)),
+            m.weight.permute(2, 1, 0),
+            groups=8,
+        ).transpose(1, 2)
+        torch.testing.assert_close(got, (conv + masked) * mask)
+
     def test_norms(self):
         from oasr.layers import BiasNorm, LayerNorm, RMSNorm
 
@@ -601,6 +618,21 @@ class TestKernelAndTorchPathsAgree:
         got = m(x)
         with layers_backend_override("torch"):
             ref = m(x)
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("mask_dtype", [torch.bool, None])
+    def test_depthwise_conv1d_asymmetric_masked_residual(self, dtype, mask_dtype):
+        from oasr.layers import DepthwiseConv1d
+
+        m = DepthwiseConv1d(128, 11, padding=(7, 3), bias=False).cuda().to(dtype)
+        x = torch.randn(2, 63, 128, device="cuda", dtype=dtype)
+        bool_mask = torch.rand(2, 63, 1, device="cuda") > 0.2
+        mask = bool_mask if mask_dtype is torch.bool else bool_mask.to(dtype)
+
+        got = m(x, mask=mask, add_input=True)
+        with layers_backend_override("torch"):
+            ref = m(x, mask=mask, add_input=True)
         torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
 
     @pytest.mark.parametrize("hidden", [64, 100])

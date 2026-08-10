@@ -7,9 +7,10 @@
 
 // Forward declarations — conv1d launchers
 void depthwise_conv1d(TensorView output, TensorView input, TensorView weight, Optional bias_opt,
-                      int64_t padding);
+                      int64_t padding_left, int64_t padding_right, Optional mask_opt,
+                      bool add_input);
 void depthwise_conv1d_silu(TensorView output, TensorView input, TensorView weight,
-                           Optional bias_opt, int64_t padding);
+                           Optional bias_opt, int64_t padding_left, int64_t padding_right);
 void causal_conv1d(TensorView output, TensorView input, TensorView state, TensorView weight,
                    Optional bias_opt);
 

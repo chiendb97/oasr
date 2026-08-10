@@ -455,6 +455,38 @@ class TestEngineE2E:
             ASREngine(cfg)
 
 
+class TestFsmnDepthwiseFusion:
+    """KG2: asymmetric padding and both mask multiplies stay behind the waist."""
+
+    @pytest.mark.parametrize("sanm_shift", [0, 2, 5])
+    def test_matches_the_unfused_funasr_expression(self, sanm_shift):
+        import torch.nn.functional as F
+
+        from oasr.models.paraformer.modules import FsmnBlock
+
+        torch.manual_seed(0)
+        block = FsmnBlock(16, kernel_size=11, sanm_shift=sanm_shift).eval()
+        x = torch.randn(2, 23, 16)
+        mask = (torch.rand(2, 23, 1) > 0.2).to(x.dtype)
+
+        got = block(x, mask)
+        masked = x * mask
+        left = 5 + sanm_shift
+        right = 10 - left
+        conv = F.conv1d(
+            F.pad(masked.transpose(1, 2), (left, right)),
+            block.fsmn_block.weight.permute(2, 1, 0),
+            groups=16,
+        ).transpose(1, 2)
+        torch.testing.assert_close(got, (conv + masked) * mask)
+
+    def test_sanm_shift_is_owned_by_the_depthwise_layer(self):
+        from oasr.models.paraformer.modules import FsmnBlock, SanmSelfAttention
+
+        assert FsmnBlock(16, 11, sanm_shift=2).fsmn_block.padding == (7, 3)
+        assert SanmSelfAttention(2, 16, 16, 11, sanm_shift=3).fsmn_block.padding == (8, 2)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

@@ -40,7 +40,7 @@ underneath are documented in [kernels.md](kernels.md).
 | Attention compute | `Attention` — takes projected, head-split q/k/v; the projections stay on the model under their checkpoint's names |
 | Position-wise FFN | `FeedForward`, `GatedMLP` — where the upstream layout already nests them under a name |
 | Rotary | `NeoxRotaryEmbedding` + `apply_rotary_pos_emb` for HF-style per-row positions; `RotaryEmbedding` for the complex `freqs_cis` form |
-| Convolution | BTC-native `Conv1d`, `DepthwiseConv1d`, and `PointwiseConv1d`; NHWC-native `Conv2d` / `Conv2dActivation` |
+| Convolution | BTC-native `Conv1d`, `DepthwiseConv1d`, and `PointwiseConv1d`; `DepthwiseConv1d` accepts `(left, right)` padding and an optional fused masked residual for FSMN blocks; NHWC-native `Conv2d` / `Conv2dActivation` |
 
 ### OASR is the backend; torch is one you select
 

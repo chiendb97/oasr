@@ -11,6 +11,19 @@ import oasr.jit.conv as _jit_conv
 from oasr.api_logging import oasr_api
 
 
+def _padding_pair(padding: int | tuple[int, int]) -> tuple[int, int]:
+    """Normalize a Conv1D padding specification to ``(left, right)``."""
+    if isinstance(padding, int):
+        pair = (padding, padding)
+    elif isinstance(padding, tuple) and len(padding) == 2:
+        pair = padding
+    else:
+        raise TypeError(f"padding must be an int or a (left, right) tuple, got {padding!r}")
+    if not all(isinstance(pad, int) and pad >= 0 for pad in pair):
+        raise ValueError(f"padding entries must be non-negative integers, got {padding!r}")
+    return pair
+
+
 @functools.cache
 def _get_conv_module():
     from oasr.jit.conv import gen_conv_module
@@ -306,24 +319,35 @@ def depthwise_conv1d(
     input: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    padding: int = 0,
+    padding: int | tuple[int, int] = 0,
     out: Optional[torch.Tensor] = None,
+    *,
+    mask: Optional[torch.Tensor] = None,
+    add_input: bool = False,
 ) -> torch.Tensor:
-    """Depthwise separable 1D convolution.
+    """Depthwise separable 1D convolution with optional fused FSMN masking.
 
     Args:
         input: Input [batch, seq_len, channels].
-        weight: Weight [kernel_size, channels].
+        weight: Weight ``[kernel_size, channels]`` or ``[kernel_size, 1, channels]``.
         bias: Optional bias [channels].
-        padding: Padding size.
+        padding: Symmetric padding size or ``(left, right)`` asymmetric padding.
         out: Optional pre-allocated output tensor.
+        mask: Optional ``[batch, seq_len, 1]`` bool or input-dtype mask.  The
+            kernel applies it before convolution and to the output.
+        add_input: Add the (masked, when supplied) input before applying the
+            output mask.  This is Paraformer's FSMN residual contract.
 
     Returns:
-        Output [batch, out_len, channels] where out_len = seq_len + 2*padding - kernel_size + 1.
+        Output ``[batch, out_len, channels]`` where
+        ``out_len = seq_len + left + right - kernel_size + 1``.
     """
+    padding_left, padding_right = _padding_pair(padding)
     if out is None:
         kernel_size = weight.shape[0]
-        out_len = input.shape[1] + 2 * padding - kernel_size + 1
+        out_len = input.shape[1] + padding_left + padding_right - kernel_size + 1
+        if out_len <= 0:
+            raise ValueError(f"depthwise_conv1d has invalid output length {out_len}")
         out = torch.empty(
             input.shape[0],
             out_len,
@@ -331,7 +355,16 @@ def depthwise_conv1d(
             device=input.device,
             dtype=input.dtype,
         )
-    _get_conv_module().depthwise_conv1d(out, input, weight, bias, padding)
+    _get_conv_module().depthwise_conv1d(
+        out,
+        input,
+        weight,
+        bias,
+        padding_left,
+        padding_right,
+        mask,
+        add_input,
+    )
     return out
 
 
@@ -435,13 +468,16 @@ def depthwise_conv1d_silu(
     input: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    padding: int = 0,
+    padding: int | tuple[int, int] = 0,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Fused depthwise 1D convolution + SiLU activation."""
+    """Fused depthwise 1D convolution + SiLU with symmetric or asymmetric padding."""
+    padding_left, padding_right = _padding_pair(padding)
     if out is None:
         kernel_size = weight.shape[0]
-        out_len = input.shape[1] + 2 * padding - kernel_size + 1
+        out_len = input.shape[1] + padding_left + padding_right - kernel_size + 1
+        if out_len <= 0:
+            raise ValueError(f"depthwise_conv1d_silu has invalid output length {out_len}")
         out = torch.empty(
             input.shape[0],
             out_len,
@@ -449,7 +485,7 @@ def depthwise_conv1d_silu(
             device=input.device,
             dtype=input.dtype,
         )
-    _get_conv_module().depthwise_conv1d_silu(out, input, weight, bias, padding)
+    _get_conv_module().depthwise_conv1d_silu(out, input, weight, bias, padding_left, padding_right)
     return out
 
 
