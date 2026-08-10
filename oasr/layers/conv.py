@@ -246,21 +246,30 @@ class Conv1dActivation(Conv1d):
 
 
 class DepthwiseConv1d(nn.Module):
-    """Wrapper for depthwise 1D convolution kernel."""
+    """BTC depthwise convolution with asymmetric padding and fused FSMN masking."""
 
     def __init__(
         self,
         channels: int,
         kernel_size: int,
-        padding: int = 0,
+        padding: int | tuple[int, int] = 0,
         bias: bool = True,
         device=None,
         dtype=None,
     ):
         super().__init__()
+        if channels <= 0 or kernel_size <= 0:
+            raise ValueError(
+                f"channels and kernel_size must be positive, got {channels=}, {kernel_size=}"
+            )
+        padding_pair = (padding, padding) if isinstance(padding, int) else tuple(padding)
+        if len(padding_pair) != 2 or any(
+            not isinstance(pad, int) or pad < 0 for pad in padding_pair
+        ):
+            raise ValueError(f"padding must be an int or non-negative (left, right), got {padding}")
         self.channels = channels
         self.kernel_size = kernel_size
-        self.padding = padding
+        self.padding = padding_pair
 
         self.weight = nn.Parameter(
             torch.empty(kernel_size, 1, channels, device=device, dtype=dtype)
@@ -278,19 +287,50 @@ class DepthwiseConv1d(nn.Module):
             # ``tests/test_layer_waist.py::test_bias_free_layers_register_bias_as_none``).
             self.register_parameter("bias", None)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """``x: (B, T, C) -> (B, T + 2 * padding - K + 1, C)``."""
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        add_input: bool = False,
+    ) -> torch.Tensor:
+        """Apply depthwise convolution, optionally fusing the FSMN masked residual.
+
+        With ``mask`` and ``add_input=True`` this computes exactly
+        ``(conv(x * mask) + x * mask) * mask`` in one CUDA kernel.
+        """
         if use_conv_kernel(x):
-            return oasr.depthwise_conv1d(x, self.weight, self.bias, self.padding)
+            return oasr.depthwise_conv1d(
+                x,
+                self.weight,
+                self.bias,
+                self.padding,
+                mask=mask,
+                add_input=add_input,
+            )
+        masked = x if mask is None else x * mask
         # (K, 1, C) -> (C, 1, K); (B, T, C) -> (B, C, T) and back.
         out: torch.Tensor = F.conv1d(
-            x.transpose(1, 2),
+            F.pad(masked.transpose(1, 2), self.padding),
             self.weight.permute(2, 1, 0),
             self.bias,
-            padding=self.padding,
             groups=self.channels,
         )
-        return out.transpose(1, 2).contiguous()
+        out = out.transpose(1, 2).contiguous()
+        if add_input:
+            if out.shape != masked.shape:
+                raise ValueError("add_input requires a length-preserving depthwise convolution")
+            out = out + masked
+        if mask is not None:
+            if out.shape[:2] != mask.shape[:2]:
+                raise ValueError("masking requires a length-preserving depthwise convolution")
+            out = out * mask
+        return out
+
+    def extra_repr(self) -> str:
+        return (
+            f"{self.channels}, kernel_size={self.kernel_size}, padding={self.padding}, "
+            f"bias={self.bias is not None}"
+        )
 
     def _load_from_state_dict(
         self,

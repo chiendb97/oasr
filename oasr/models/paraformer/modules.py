@@ -26,7 +26,6 @@ import math
 from typing import Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from oasr.layers import (
@@ -96,26 +95,24 @@ def sinusoidal_position_encoding(
 class FsmnBlock(nn.Module):
     """Depthwise-conv FSMN memory block (``MultiHeadedAttentionSANMDecoder``).
 
-    ``x`` is masked, convolved with symmetric zero padding (shifted left by
-    ``sanm_shift`` when positive), residual-added, and re-masked.
+    ``x`` is masked, convolved with length-preserving zero padding (asymmetric
+    when ``sanm_shift`` is positive), residual-added, and re-masked.  The waist
+    layer fuses that complete expression on CUDA.
     """
 
     def __init__(self, n_feat: int, kernel_size: int, sanm_shift: int = 0) -> None:
         super().__init__()
-        self.fsmn_block = DepthwiseConv1d(n_feat, kernel_size, bias=False)
         left_padding = (kernel_size - 1) // 2
         if sanm_shift > 0:
             left_padding = left_padding + sanm_shift
         right_padding = kernel_size - 1 - left_padding
-        self.padding = (left_padding, right_padding)
+        self.fsmn_block = DepthwiseConv1d(
+            n_feat, kernel_size, padding=(left_padding, right_padding), bias=False
+        )
 
     def forward(self, inputs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """``inputs (B, T, D)``, ``mask (B, T, 1)`` float → ``(B, T, D)``."""
-        inputs = inputs * mask
-        x = F.pad(inputs, (0, 0, *self.padding))
-        x = self.fsmn_block(x)
-        x = x + inputs
-        return x * mask
+        """``inputs (B, T, D)``, ``mask (B, T, 1)`` bool/float → ``(B, T, D)``."""
+        return self.fsmn_block(inputs, mask=mask, add_input=True)
 
 
 class SanmSelfAttention(nn.Module):
@@ -137,19 +134,16 @@ class SanmSelfAttention(nn.Module):
         self.linear_out = RowParallelLinear(n_feat, n_feat)
         # ``q`` is pre-scaled below (FunASR's convention), hence scale 1.0.
         self.attn = Attention(n_head, self.d_k, softmax_scale=1.0)
-        self.fsmn_block = DepthwiseConv1d(n_feat, kernel_size, bias=False)
         left_padding = (kernel_size - 1) // 2
         if sanm_shift > 0:
             left_padding = left_padding + sanm_shift
         right_padding = kernel_size - 1 - left_padding
-        self.padding = (left_padding, right_padding)
+        self.fsmn_block = DepthwiseConv1d(
+            n_feat, kernel_size, padding=(left_padding, right_padding), bias=False
+        )
 
     def _forward_fsmn(self, v: torch.Tensor, mask_btd: torch.Tensor) -> torch.Tensor:
-        v = v * mask_btd
-        x = F.pad(v, (0, 0, *self.padding))
-        x = self.fsmn_block(x)
-        x = x + v
-        return x * mask_btd
+        return self.fsmn_block(v, mask=mask_btd, add_input=True)
 
     def forward(
         self, x: torch.Tensor, mask: torch.Tensor, kv_lens: Optional[torch.Tensor] = None
@@ -180,7 +174,10 @@ class SanmSelfAttention(nn.Module):
         """
         b, t, _ = x.shape
         q, k, v = torch.split(self.linear_q_k_v(x), self.h * self.d_k, dim=-1)
-        mask_btd = mask.reshape(b, t, 1).to(v.dtype)
+        # Keep the encoder's bool mask as a view: the depthwise kernel consumes
+        # bool and activation-dtype masks directly, so there is no per-layer
+        # cast kernel before the fused FSMN operation.
+        mask_btd = mask.reshape(b, t, 1)
         fsmn_memory = self._forward_fsmn(v, mask_btd)
 
         q_h = self.attn.split_heads(q) * self.d_k ** (-0.5)

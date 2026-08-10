@@ -20,13 +20,14 @@ namespace conv {
 // Depthwise 1D Convolution Kernel
 // =============================================================================
 
-template <typename T, int VecSize>
-__global__ void depthwiseConv1DKernel(const T* __restrict__ input,  // [batch, seq_len, channels]
-                                         const T* __restrict__ weight,  // [kernel_size, channels]
-                                         const T* __restrict__ bias,    // [channels] or nullptr
-                                         T* __restrict__ output,  // [batch, out_len, channels]
-                                         int batch_size, int seq_len, int channels, int kernel_size,
-                                         int padding) {
+template <typename T, typename MaskT, int VecSize, bool FuseMask, bool AddInput>
+__global__ void depthwiseConv1DKernel(
+    const T* __restrict__ input,     // [batch, seq_len, channels]
+    const T* __restrict__ weight,    // [kernel_size, channels]
+    const T* __restrict__ bias,      // [channels] or nullptr
+    const MaskT* __restrict__ mask,  // [batch, seq_len, 1] or nullptr
+    T* __restrict__ output,          // [batch, out_len, channels]
+    int batch_size, int seq_len, int channels, int kernel_size, int padding_left) {
     // Thread ID in the vectorized channel dimension
     const int vec_id = threadIdx.x;  // which vector chunk [0, channels/VecSize)
     const int s_id = blockIdx.x;     // output sequence position
@@ -35,11 +36,11 @@ __global__ void depthwiseConv1DKernel(const T* __restrict__ input,  // [batch, s
     const int c_offset = vec_id * VecSize;  // starting channel for this thread
 
     // Compute the valid input range for this output position
-    int s_start = s_id - padding;
+    int s_start = s_id - padding_left;
     int s_end = min(s_start + kernel_size, seq_len);
     s_start = max(s_start, 0);
 
-    int k_start = max(padding - s_id, 0);
+    int k_start = max(padding_left - s_id, 0);
 
     // Pointers for this batch element, offset to the vector chunk
     const T* input_base = input + b_id * seq_len * channels + c_offset;
@@ -62,7 +63,11 @@ __global__ void depthwiseConv1DKernel(const T* __restrict__ input,  // [batch, s
 
 #pragma unroll
         for (int v = 0; v < VecSize; v++) {
-            acc[v] += static_cast<float>(in_vec[v]) * static_cast<float>(w_vec[v]);
+            float in_value = static_cast<float>(in_vec[v]);
+            if constexpr (FuseMask) {
+                in_value *= static_cast<float>(mask[b_id * seq_len + i]);
+            }
+            acc[v] += in_value * static_cast<float>(w_vec[v]);
         }
     }
 
@@ -73,6 +78,32 @@ __global__ void depthwiseConv1DKernel(const T* __restrict__ input,  // [batch, s
 #pragma unroll
         for (int v = 0; v < VecSize; v++) {
             acc[v] += static_cast<float>(bias_vec[v]);
+        }
+    }
+
+    // Paraformer's FSMN memory block computes
+    //   (depthwise(input * mask) + input * mask) * mask.
+    // Specializing both flags at launch keeps the ordinary depthwise path free
+    // of mask/residual branches while folding that whole expression into this
+    // one kernel for the FSMN path.
+    if constexpr (AddInput) {
+        Vec<T, VecSize> input_vec;
+        input_vec.load(input_base + s_id * channels);
+        float input_scale = 1.0f;
+        if constexpr (FuseMask) {
+            input_scale = static_cast<float>(mask[b_id * seq_len + s_id]);
+        }
+#pragma unroll
+        for (int v = 0; v < VecSize; v++) {
+            acc[v] += static_cast<float>(input_vec[v]) * input_scale;
+        }
+    }
+
+    if constexpr (FuseMask) {
+        const float output_scale = static_cast<float>(mask[b_id * seq_len + s_id]);
+#pragma unroll
+        for (int v = 0; v < VecSize; v++) {
+            acc[v] *= output_scale;
         }
     }
 
@@ -96,7 +127,7 @@ __global__ void depthwiseConv1DSiluKernel(
     const T* __restrict__ weight,  // [kernel_size, channels]
     const T* __restrict__ bias,    // [channels] or nullptr
     T* __restrict__ output,        // [batch, out_len, channels]
-    int batch_size, int seq_len, int channels, int kernel_size, int padding) {
+    int batch_size, int seq_len, int channels, int kernel_size, int padding_left) {
     // Thread ID in the vectorized channel dimension
     const int vec_id = threadIdx.x;  // which vector chunk [0, channels/VecSize)
     const int s_id = blockIdx.x;     // output sequence position
@@ -105,11 +136,11 @@ __global__ void depthwiseConv1DSiluKernel(
     const int c_offset = vec_id * VecSize;  // starting channel for this thread
 
     // Compute the valid input range for this output position
-    int s_start = s_id - padding;
+    int s_start = s_id - padding_left;
     int s_end = min(s_start + kernel_size, seq_len);
     s_start = max(s_start, 0);
 
-    int k_start = max(padding - s_id, 0);
+    int k_start = max(padding_left - s_id, 0);
 
     // Pointers for this batch element, offset to the vector chunk
     const T* input_base = input + b_id * seq_len * channels + c_offset;
@@ -267,34 +298,65 @@ __global__ void updateConvStateKernel(const T* __restrict__ input,  // [batch, c
  * @param input   Input [batch, seq_len, channels]
  * @param weight  Weight [kernel_size, channels]
  * @param bias    Optional bias [channels], nullptr to skip
- * @param output  Output [batch, out_len, channels] where out_len = seq_len + 2*padding - kernel_size + 1
+ * @param mask    Optional multiplicative mask [batch, seq_len, 1]
+ * @param output  Output [batch, out_len, channels]
  * @param batch_size  Batch dimension
  * @param seq_len     Sequence length
  * @param channels    Number of channels
  * @param kernel_size Convolution kernel size
- * @param padding     Padding size
+ * @param padding_left  Zero padding before the sequence
+ * @param padding_right Zero padding after the sequence
+ * @param add_input     Add the (optionally masked) input before the output mask
  * @param stream      CUDA stream
  */
-template <typename T>
-cudaError_t DepthwiseConv1D(const T* input, const T* weight, const T* bias, T* output,
-                            int batch_size, int seq_len, int channels, int kernel_size, int padding,
+template <typename T, typename MaskT = T>
+cudaError_t DepthwiseConv1D(const T* input, const T* weight, const T* bias, const MaskT* mask,
+                            T* output, int batch_size, int seq_len, int channels, int kernel_size,
+                            int padding_left, int padding_right, bool add_input,
                             cudaStream_t stream) {
-    const int out_len = seq_len + 2 * padding - kernel_size + 1;
+    const int out_len = seq_len + padding_left + padding_right - kernel_size + 1;
     dim3 grid_size(out_len, batch_size);
 
     constexpr int kVecSize = VecTypeTrait<T>::VecSize;
 
-    // Use vectorized kernel when channels are aligned to VecSize
-    // and the thread count fits within hardware limits
+    // Use vectorized kernels when channels are 128-bit aligned.  Mask and
+    // residual modes are compile-time specializations so existing Conformer /
+    // Zipformer calls do not pay for Paraformer's fused FSMN contract.
+#define OASR_LAUNCH_DEPTHWISE(vec_size)                                                            \
+    do {                                                                                           \
+        dim3 block_size(channels / (vec_size));                                                    \
+        if (mask != nullptr) {                                                                     \
+            if (add_input) {                                                                       \
+                depthwiseConv1DKernel<T, MaskT, (vec_size), true, true>                            \
+                    <<<grid_size, block_size, 0, stream>>>(input, weight, bias, mask, output,      \
+                                                           batch_size, seq_len, channels,          \
+                                                           kernel_size, padding_left);             \
+            } else {                                                                               \
+                depthwiseConv1DKernel<T, MaskT, (vec_size), true, false>                           \
+                    <<<grid_size, block_size, 0, stream>>>(input, weight, bias, mask, output,      \
+                                                           batch_size, seq_len, channels,          \
+                                                           kernel_size, padding_left);             \
+            }                                                                                      \
+        } else if (add_input) {                                                                    \
+            depthwiseConv1DKernel<T, MaskT, (vec_size), false, true>                               \
+                <<<grid_size, block_size, 0, stream>>>(input, weight, bias, mask, output,          \
+                                                       batch_size, seq_len, channels, kernel_size, \
+                                                       padding_left);                              \
+        } else {                                                                                   \
+            depthwiseConv1DKernel<T, MaskT, (vec_size), false, false>                              \
+                <<<grid_size, block_size, 0, stream>>>(input, weight, bias, mask, output,          \
+                                                       batch_size, seq_len, channels, kernel_size, \
+                                                       padding_left);                              \
+        }                                                                                          \
+    } while (0)
+
     if (channels % kVecSize == 0 && (channels / kVecSize) <= 1024) {
-        dim3 block_size(channels / kVecSize);
-        depthwiseConv1DKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
-            input, weight, bias, output, batch_size, seq_len, channels, kernel_size, padding);
+        OASR_LAUNCH_DEPTHWISE(kVecSize);
     } else {
-        dim3 block_size(channels);
-        depthwiseConv1DKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
-            input, weight, bias, output, batch_size, seq_len, channels, kernel_size, padding);
+        OASR_LAUNCH_DEPTHWISE(1);
     }
+
+#undef OASR_LAUNCH_DEPTHWISE
 
     return cudaGetLastError();
 }
@@ -307,19 +369,20 @@ cudaError_t DepthwiseConv1D(const T* input, const T* weight, const T* bias, T* o
  * @param input   Input [batch, seq_len, channels]
  * @param weight  Weight [kernel_size, channels]
  * @param bias    Optional bias [channels], nullptr to skip
- * @param output  Output [batch, out_len, channels] where out_len = seq_len + 2*padding - kernel_size + 1
+ * @param output  Output [batch, out_len, channels]
  * @param batch_size  Batch dimension
  * @param seq_len     Sequence length
  * @param channels    Number of channels
  * @param kernel_size Convolution kernel size
- * @param padding     Padding size
+ * @param padding_left  Zero padding before the sequence
+ * @param padding_right Zero padding after the sequence
  * @param stream      CUDA stream
  */
 template <typename T>
 cudaError_t DepthwiseConv1DSilu(const T* input, const T* weight, const T* bias, T* output,
                                 int batch_size, int seq_len, int channels, int kernel_size,
-                                int padding, cudaStream_t stream) {
-    const int out_len = seq_len + 2 * padding - kernel_size + 1;
+                                int padding_left, int padding_right, cudaStream_t stream) {
+    const int out_len = seq_len + padding_left + padding_right - kernel_size + 1;
     dim3 grid_size(out_len, batch_size);
 
     constexpr int kVecSize = VecTypeTrait<T>::VecSize;
@@ -329,11 +392,11 @@ cudaError_t DepthwiseConv1DSilu(const T* input, const T* weight, const T* bias, 
     if (channels % kVecSize == 0 && (channels / kVecSize) <= 1024) {
         dim3 block_size(channels / kVecSize);
         depthwiseConv1DSiluKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
-            input, weight, bias, output, batch_size, seq_len, channels, kernel_size, padding);
+            input, weight, bias, output, batch_size, seq_len, channels, kernel_size, padding_left);
     } else {
         dim3 block_size(channels);
         depthwiseConv1DSiluKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
-            input, weight, bias, output, batch_size, seq_len, channels, kernel_size, padding);
+            input, weight, bias, output, batch_size, seq_len, channels, kernel_size, padding_left);
     }
 
     return cudaGetLastError();
@@ -343,7 +406,8 @@ cudaError_t DepthwiseConv1DSilu(const T* input, const T* weight, const T* bias, 
  * @brief Pointwise (1x1) convolution
  *
  * Essentially a GEMM: output = input * weight^T + bias.
- * Input is reshaped to [batch*seq_len, in_channels] and multiplied by weight [out_channels, in_channels].
+ * Input is reshaped to [batch*seq_len, in_channels] and multiplied by weight [out_channels,
+ * in_channels].
  *
  * @param input        Input [batch * seq_len, in_channels] (pre-reshaped)
  * @param weight       Weight [out_channels, in_channels]
@@ -420,8 +484,8 @@ cudaError_t CausalConv1D(const T* input, T* state, const T* weight, const T* bia
     // Update state buffer
     int state_elements = batch_size * state_len * channels;
     int state_grid = (state_elements + block_size - 1) / block_size;
-    updateConvStateKernel<T><<<state_grid, block_size, 0, stream>>>(
-        input, state, batch_size, chunk_len, channels, state_len);
+    updateConvStateKernel<T><<<state_grid, block_size, 0, stream>>>(input, state, batch_size,
+                                                                    chunk_len, channels, state_len);
 
     return cudaGetLastError();
 }

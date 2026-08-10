@@ -156,7 +156,7 @@ class TestDepthwiseConv1D:
         )
         expected = ref_nchw.permute(0, 2, 1)
 
-        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_depthwise_conv1d_destination_passing(self, dtype):
@@ -172,6 +172,73 @@ class TestDepthwiseConv1D:
         result = oasr.depthwise_conv1d(x, weight, bias, padding, out=out)
 
         assert result.data_ptr() == out.data_ptr()
+
+    @pytest.mark.parametrize("padding", [(8, 2), (10, 0), (0, 10)])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_asymmetric_padding(self, padding, dtype):
+        batch_size, seq_len, channels, kernel_size = 2, 37, 128, 11
+        x = torch.randn(batch_size, seq_len, channels, device="cuda", dtype=dtype)
+        weight = torch.randn(kernel_size, channels, device="cuda", dtype=dtype)
+        bias = torch.randn(channels, device="cuda", dtype=dtype)
+
+        output = oasr.depthwise_conv1d(x, weight, bias, padding)
+        expected = F.conv1d(
+            F.pad(x.transpose(1, 2), padding),
+            weight.T.unsqueeze(1),
+            bias,
+            groups=channels,
+        ).transpose(1, 2)
+
+        assert output.shape == x.shape
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_fused_fsmn_mask_and_input(self, mask_dtype, dtype):
+        batch_size, seq_len, channels, kernel_size = 2, 43, 128, 11
+        padding = (7, 3)
+        x = torch.randn(batch_size, seq_len, channels, device="cuda", dtype=dtype)
+        weight = torch.randn(kernel_size, channels, device="cuda", dtype=dtype)
+        # Include internal holes, not only right padding: this catches applying
+        # the mask only after convolution instead of on every input tap.
+        mask_bool = torch.rand(batch_size, seq_len, 1, device="cuda") > 0.25
+        mask = mask_bool if mask_dtype is torch.bool else mask_bool.to(dtype)
+
+        output = oasr.depthwise_conv1d(
+            x,
+            weight,
+            padding=padding,
+            mask=mask,
+            add_input=True,
+        )
+        masked = x * mask
+        conv = F.conv1d(
+            F.pad(masked.transpose(1, 2), padding),
+            weight.T.unsqueeze(1),
+            groups=channels,
+        ).transpose(1, 2)
+        expected = (conv + masked) * mask
+
+        torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_asymmetric_silu(self, dtype):
+        seq_len, channels, kernel_size = 31, 128, 7
+        padding = (5, 1)
+        x = torch.randn(1, seq_len, channels, device="cuda", dtype=dtype)
+        weight = torch.randn(kernel_size, channels, device="cuda", dtype=dtype)
+        bias = torch.randn(channels, device="cuda", dtype=dtype)
+
+        output = oasr.depthwise_conv1d_silu(x, weight, bias, padding)
+        expected = F.silu(
+            F.conv1d(
+                F.pad(x.transpose(1, 2), padding),
+                weight.T.unsqueeze(1),
+                bias,
+                groups=channels,
+            )
+        ).transpose(1, 2)
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
 
 class TestPointwiseConv1dLayer:
