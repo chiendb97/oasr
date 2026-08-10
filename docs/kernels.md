@@ -32,7 +32,7 @@ Python functional API (oasr/<family>.py)  — @oasr_api decorated
 | `include/oasr/common/` | Shared types (`types.h`), vector dtypes (`vec_dtypes.h`), SM dispatch (`arch_dispatch.h`), epilogue functors, math utilities |
 | `include/oasr/activation.cuh` + `activation_dispatch.inc` | GLU, Swish, with VecSize dispatch |
 | `include/oasr/norm.cuh` + `norm_dispatch.inc` | LayerNorm, RMSNorm, BatchNorm1d, GroupNorm, fused norm+activation |
-| `include/oasr/conv/` | `conv1d.cuh` + `conv1d_dispatch.inc` (depthwise, pointwise, causal); `conv2d.cuh` facade |
+| `include/oasr/conv/` | `conv1d.cuh` + `conv1d_dispatch.inc` (depthwise, pointwise, causal); dense BTC Conv1D is the height-one specialization of the `conv2d.cuh` CUTLASS facade |
 | `include/oasr/gemm/` | `gemm.cuh` facade, `bmm.cuh`, `group_gemm.cuh` |
 | `include/oasr/{softmax,topk,fft,features,reduction}.cuh`, `sort/` | The remaining families |
 | `include/oasr/ctc_decoder.cuh`, `include/oasr/wfst/` | GPU decoder kernels |
@@ -68,8 +68,8 @@ VecSize / block_size dispatch macros instead.
 | Kernel family | Mode | Config source | Source generation |
 |---|---|---|---|
 | GEMM, BMM, GroupGEMM | **jinja** | `cutlass_gemm_configs.h` | Jinja renders `.cu` with baked-in config |
-| Conv2D | **jinja** | `cutlass_conv2d_configs.h` | Jinja renders `.cu` with baked-in config |
-| Conv1D | **dispatch** | `conv1d_dispatch.inc` | Direct compilation, VecSize macro |
+| Dense Conv1D / Conv2D | **jinja** | `cutlass_conv2d_configs.h` | Jinja renders `.cu` with baked-in config; each tactic exports strict BTC/KSC Conv1D and NHWC/KRSC Conv2D entry points |
+| Depthwise / causal Conv1D | **dispatch** | `conv1d_dispatch.inc` | Direct compilation, VecSize macro |
 | Norm | **dispatch** | `norm_dispatch.inc` | Direct compilation, block/vec macro |
 | Activation | **dispatch** | `activation_dispatch.inc` | Direct compilation, VecSize macro |
 

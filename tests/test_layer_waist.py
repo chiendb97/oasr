@@ -38,6 +38,7 @@ from oasr.models.registry import get_model_entry, list_models
 #: always a one-line import change, never a checkpoint change.
 BANNED = (
     nn.Linear,
+    nn.Conv1d,
     nn.LayerNorm,
     nn.Embedding,
     nn.RMSNorm,
@@ -47,11 +48,8 @@ BANNED = (
 )
 
 #: Deliberate exemptions, as ``(architecture, dotted module path) -> reason``.
-#: Convolutions are **not** in :data:`BANNED` at all: ``oasr.layers.conv``
-#: covers depthwise / pointwise / 2-D, but the dense ``nn.Conv1d`` stems in the
-#: Whisper-geometry encoders have no counterpart yet, so banning the class
-#: would mean exempting most of its uses.  That gap is recorded in
-#: ``docs/architecture.md`` rather than pretended away here.
+#: Dense, depthwise, and pointwise ``nn.Conv1d`` now all have BTC-native waist
+#: counterparts, so the torch class is banned alongside the other bypasses.
 ALLOWED_BARE: dict = {}
 
 
@@ -279,6 +277,40 @@ class TestLayersRunOnCpu:
 
         m = Linear(8, 500)
         assert m(torch.randn(2, 8)).shape == (2, 500)
+
+    def test_dense_conv1d(self):
+        from oasr.layers import Conv1d
+
+        m = Conv1d(8, 16, 3, padding=2, stride=2, dilation=2)
+        x = torch.randn(2, 11, 8)
+        got = m(x)
+        ref = torch.nn.functional.conv1d(
+            x.transpose(1, 2),
+            m.weight.permute(0, 2, 1),
+            m.bias,
+            stride=2,
+            padding=2,
+            dilation=2,
+        ).transpose(1, 2)
+        torch.testing.assert_close(got, ref)
+
+    def test_dense_conv1d_loads_torch_weight_layout(self):
+        from oasr.layers import Conv1d
+
+        source = nn.Conv1d(8, 16, 3)
+        target = Conv1d(8, 16, 3)
+        target.load_state_dict(source.state_dict())
+        assert target.weight.shape == (16, 3, 8)
+        torch.testing.assert_close(target.weight, source.weight.permute(0, 2, 1))
+
+    def test_dense_conv1d_activation_refuses_erf_gelu(self):
+        from oasr.layers import Conv1dActivation
+
+        with pytest.raises(ValueError, match="not fusable"):
+            Conv1dActivation(8, 16, 3, activation_type="gelu")
+        assert Conv1dActivation(8, 16, 3, activation_type="gelu_tanh")(
+            torch.randn(2, 7, 8)
+        ).shape == (2, 5, 16)
 
     def test_norms(self):
         from oasr.layers import BiasNorm, LayerNorm, RMSNorm
@@ -543,6 +575,29 @@ class TestKernelAndTorchPathsAgree:
 
         m = LinearActivation(64, 128, activation_type=activation).cuda().half()
         x = torch.randn(4, 16, 64, device="cuda", dtype=torch.float16)
+        got = m(x)
+        with layers_backend_override("torch"):
+            ref = m(x)
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("stride", [1, 2])
+    def test_dense_conv1d(self, dtype, stride):
+        from oasr.layers import Conv1d
+
+        m = Conv1d(80, 384, 3, padding=1, stride=stride).cuda().to(dtype)
+        x = torch.randn(2, 127, 80, device="cuda", dtype=dtype)
+        got = m(x)
+        with layers_backend_override("torch"):
+            ref = m(x)
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("activation", ["relu", "swish", "gelu_tanh"])
+    def test_dense_conv1d_activation(self, activation):
+        from oasr.layers import Conv1dActivation
+
+        m = Conv1dActivation(64, 128, 3, padding=1, activation_type=activation).cuda().half()
+        x = torch.randn(2, 63, 64, device="cuda", dtype=torch.float16)
         got = m(x)
         with layers_backend_override("torch"):
             ref = m(x)

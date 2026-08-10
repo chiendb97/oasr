@@ -28,6 +28,7 @@ from oasr.layers import (
     TORCH_EPS,
     Attention,
     ColumnParallelLinear,
+    Conv1d,
     Embedding,
     LayerNorm,
     RowParallelLinear,
@@ -111,8 +112,8 @@ class WhisperEncoder(BaseEncoder):
     def __init__(self, cfg: WhisperModelConfig) -> None:
         super().__init__()
         self._cfg = cfg
-        self.conv1 = nn.Conv1d(cfg.num_mel_bins, cfg.d_model, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(cfg.d_model, cfg.d_model, kernel_size=3, stride=2, padding=1)
+        self.conv1 = Conv1d(cfg.num_mel_bins, cfg.d_model, kernel_size=3, padding=1)
+        self.conv2 = Conv1d(cfg.d_model, cfg.d_model, kernel_size=3, stride=2, padding=1)
         # HF materializes the sinusoidal table as a real (frozen) weight.
         self.embed_positions = Embedding(cfg.max_source_positions, cfg.d_model)
         self.layers = nn.ModuleList([_EncoderLayer(cfg) for _ in range(cfg.encoder_layers)])
@@ -125,15 +126,8 @@ class WhisperEncoder(BaseEncoder):
         always full (padding is part of the recipe, not attention masking).
         """
         del xs_lens
-        x = xs.transpose(1, 2)  # (B, n_mels, T)
-        x = F.gelu(self.conv1(x))
+        x = F.gelu(self.conv1(xs))
         x = F.gelu(self.conv2(x))
-        # ``.contiguous()`` is load-bearing, not hygiene: without it the whole
-        # residual stream inherits the conv's (B, D, T) layout with a strided
-        # last dimension, which the norm kernels refuse outright and every
-        # projection has to copy around anyway.  One copy here, contiguous
-        # after.
-        x = x.transpose(1, 2).contiguous()  # (B, T/2, D)
         T = x.size(1)
         if T > self._cfg.max_source_positions:
             raise ValueError(

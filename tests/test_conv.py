@@ -8,12 +8,123 @@ import torch
 import torch.nn.functional as F
 
 import oasr
+from oasr.jit.conv import (
+    CONV2D_DEFAULT,
+    get_unique_conv2d_compile_configs,
+    select_default_conv1d_activation_config,
+    select_default_conv1d_config,
+)
 
 # Every test in this module allocates directly on ``device="cuda"`` and calls a
 # JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
 # what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
 # instead of a wall of `RuntimeError: No CUDA GPUs are available`.
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+
+
+class TestDenseConv1D:
+    """Tests for the packed-BTC dense Conv1D functional API."""
+
+    @pytest.mark.parametrize(
+        "batch_size,seq_len,in_channels,out_channels,kernel_size,padding,stride,dilation",
+        [
+            (1, 3000, 80, 384, 3, 1, 1, 1),
+            (1, 3000, 384, 384, 3, 1, 2, 1),
+            (2, 65, 64, 128, 5, 4, 2, 2),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_conv1d(
+        self,
+        batch_size,
+        seq_len,
+        in_channels,
+        out_channels,
+        kernel_size,
+        padding,
+        stride,
+        dilation,
+        dtype,
+    ):
+        x = torch.randn(batch_size, seq_len, in_channels, device="cuda", dtype=dtype)
+        weight = torch.randn(out_channels, kernel_size, in_channels, device="cuda", dtype=dtype)
+        bias = torch.randn(out_channels, device="cuda", dtype=dtype)
+
+        output = oasr.conv1d(x, weight, bias, padding, stride, dilation)
+        expected = F.conv1d(
+            x.transpose(1, 2),
+            weight.permute(0, 2, 1),
+            bias,
+            padding=padding,
+            stride=stride,
+            dilation=dilation,
+        ).transpose(1, 2)
+
+        torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+        assert output.is_contiguous()
+
+    @pytest.mark.parametrize("activation,fn", [(0, F.relu), (2, F.silu)])
+    def test_conv1d_activation(self, activation, fn):
+        x = torch.randn(2, 127, 64, device="cuda", dtype=torch.float16)
+        weight = torch.randn(128, 3, 64, device="cuda", dtype=torch.float16)
+        bias = torch.randn(128, device="cuda", dtype=torch.float16)
+
+        output = oasr.conv1d_activation(x, weight, bias, activation, padding=1)
+        expected = fn(
+            F.conv1d(x.transpose(1, 2), weight.permute(0, 2, 1), bias, padding=1)
+        ).transpose(1, 2)
+        torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_paraformer_conv1d_relu_production_tactic(self, dtype):
+        x = torch.randn(1, 502, 512, device="cuda", dtype=dtype)
+        weight = torch.randn(512, 3, 512, device="cuda", dtype=dtype)
+        bias = torch.randn(512, device="cuda", dtype=dtype)
+
+        output = oasr.conv1d_activation(x, weight, bias, 0)
+        expected = F.relu(F.conv1d(x.transpose(1, 2), weight.permute(0, 2, 1), bias)).transpose(
+            1, 2
+        )
+
+        torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+    def test_conv1d_destination_passing(self):
+        x = torch.randn(2, 31, 64, device="cuda", dtype=torch.float16)
+        weight = torch.randn(128, 3, 64, device="cuda", dtype=torch.float16)
+        out = torch.empty(2, 16, 128, device="cuda", dtype=torch.float16)
+
+        result = oasr.conv1d(x, weight, padding=1, stride=2, out=out)
+
+        assert result.data_ptr() == out.data_ptr()
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 3000, 80, 384, 3, 1, 1, 1),
+            (1, 3000, 384, 384, 3, 1, 2, 1),
+            (1, 3000, 128, 1280, 3, 1, 1, 1),
+            (1, 3000, 1280, 1280, 3, 1, 2, 1),
+            (1, 502, 512, 512, 3, 0, 1, 1),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_sm120_production_tactic_is_compiled(self, shape, dtype):
+        cfg = select_default_conv1d_config(*shape, dtype, 120)
+        assert cfg.compile_name != CONV2D_DEFAULT.compile_name
+        assert cfg.compile_name in get_unique_conv2d_compile_configs(120)
+
+    def test_unmeasured_shape_uses_default(self):
+        shape = (2, 3000, 80, 384, 3, 1, 1, 1)
+        assert select_default_conv1d_config(*shape, torch.float16, 120) is CONV2D_DEFAULT
+        assert select_default_conv1d_config(*shape, torch.bfloat16, 120) is CONV2D_DEFAULT
+        assert select_default_conv1d_config(*shape, torch.float16, 80) is CONV2D_DEFAULT
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_sm120_paraformer_activation_tactic_is_compiled(self, dtype):
+        shape = (1, 502, 512, 512, 3, 0, 1, 1)
+        cfg = select_default_conv1d_activation_config(*shape, dtype, 120)
+        assert cfg.compile_name != CONV2D_DEFAULT.compile_name
+        assert cfg.compile_name in get_unique_conv2d_compile_configs(120)
 
 
 class TestDepthwiseConv1D:

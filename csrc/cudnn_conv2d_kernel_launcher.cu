@@ -49,9 +49,9 @@ __global__ void swish_inplace_kernel(T* data, int n) {
 
 template <typename T>
 cudaError_t cudnn_conv2d_fwd(const T* input, const T* filter, const T* bias, T* output, int N,
-                              int H, int W, int IC, int K, int R, int S, int pad_h, int pad_w,
-                              int stride_h, int stride_w, int dilation_h, int dilation_w,
-                              cudaStream_t stream) {
+                             int H, int W, int IC, int K, int R, int S, int pad_h, int pad_w,
+                             int stride_h, int stride_w, int dilation_h, int dilation_w,
+                             cudaStream_t stream) {
     cudnnHandle_t handle = getCudnnHandle();
     OASR_CUDNN_CHECK(cudnnSetStream(handle, stream));
 
@@ -62,8 +62,8 @@ cudaError_t cudnn_conv2d_fwd(const T* input, const T* filter, const T* bias, T* 
 
     // Input [N, H, W, IC] — NHWC strides
     ScopedTensorDesc x_desc;
-    OASR_CUDNN_CHECK(cudnnSetTensor4dDescriptorEx(x_desc, dtype, N, IC, H, W,
-                                                   H * W * IC, 1, W * IC, IC));
+    OASR_CUDNN_CHECK(
+        cudnnSetTensor4dDescriptorEx(x_desc, dtype, N, IC, H, W, H * W * IC, 1, W * IC, IC));
 
     // Filter [K, R, S, IC] — cuDNN NHWC format
     ScopedFilterDesc w_desc;
@@ -71,40 +71,38 @@ cudaError_t cudnn_conv2d_fwd(const T* input, const T* filter, const T* bias, T* 
 
     // Output [N, P, Q, K] — NHWC strides
     ScopedTensorDesc y_desc;
-    OASR_CUDNN_CHECK(cudnnSetTensor4dDescriptorEx(y_desc, dtype, N, K, P, Q,
-                                                   P * Q * K, 1, Q * K, K));
+    OASR_CUDNN_CHECK(
+        cudnnSetTensor4dDescriptorEx(y_desc, dtype, N, K, P, Q, P * Q * K, 1, Q * K, K));
 
     // Convolution descriptor
     ScopedConvDesc conv_desc;
     OASR_CUDNN_CHECK(cudnnSetConvolution2dDescriptor(conv_desc, pad_h, pad_w, stride_h, stride_w,
-                                                      dilation_h, dilation_w,
-                                                      CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+                                                     dilation_h, dilation_w,
+                                                     CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
     OASR_CUDNN_CHECK(cudnnSetConvolutionMathType(conv_desc, CUDNN_DEFAULT_MATH));
 
     // Algorithm selection (heuristic — avoids benchmarking overhead)
     int returned = 0;
     cudnnConvolutionFwdAlgoPerf_t perf;
     OASR_CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(handle, x_desc, w_desc, conv_desc,
-                                                             y_desc, 1, &returned, &perf));
+                                                            y_desc, 1, &returned, &perf));
     cudnnConvolutionFwdAlgo_t algo = perf.algo;
 
     // Workspace
     size_t ws_size = 0;
     OASR_CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(handle, x_desc, w_desc, conv_desc,
-                                                              y_desc, algo, &ws_size));
+                                                             y_desc, algo, &ws_size));
     void* ws = (ws_size > 0) ? getWorkspace(ws_size) : nullptr;
 
     // Forward convolution
     float alpha = 1.0f, beta = 0.0f;
     OASR_CUDNN_CHECK(cudnnConvolutionForward(handle, &alpha, x_desc, input, w_desc, filter,
-                                              conv_desc, algo, ws, ws_size, &beta, y_desc,
-                                              output));
+                                             conv_desc, algo, ws, ws_size, &beta, y_desc, output));
 
     // Bias: broadcast [K] → [N, P, Q, K]
     if (bias != nullptr) {
         ScopedTensorDesc b_desc;
-        OASR_CUDNN_CHECK(
-            cudnnSetTensor4dDescriptor(b_desc, CUDNN_TENSOR_NCHW, dtype, 1, K, 1, 1));
+        OASR_CUDNN_CHECK(cudnnSetTensor4dDescriptor(b_desc, CUDNN_TENSOR_NCHW, dtype, 1, K, 1, 1));
         float one = 1.0f;
         OASR_CUDNN_CHECK(cudnnAddTensor(handle, &one, b_desc, bias, &one, y_desc, output));
     }
@@ -118,15 +116,15 @@ cudaError_t cudnn_conv2d_fwd(const T* input, const T* filter, const T* bias, T* 
 
 template <typename T>
 cudaError_t cudnn_conv2d_activation_fwd(const T* input, const T* filter, const T* bias, T* output,
-                                         ActivationType activation, int N, int H, int W, int IC,
-                                         int K, int R, int S, int pad_h, int pad_w, int stride_h,
-                                         int stride_w, int dilation_h, int dilation_w,
-                                         cudaStream_t stream) {
+                                        ActivationType activation, int N, int H, int W, int IC,
+                                        int K, int R, int S, int pad_h, int pad_w, int stride_h,
+                                        int stride_w, int dilation_h, int dilation_w,
+                                        cudaStream_t stream) {
     // Run convolution (+ bias)
-    cudaError_t err =
-        cudnn_conv2d_fwd(input, filter, bias, output, N, H, W, IC, K, R, S, pad_h, pad_w,
-                         stride_h, stride_w, dilation_h, dilation_w, stream);
-    if (err != cudaSuccess) return err;
+    cudaError_t err = cudnn_conv2d_fwd(input, filter, bias, output, N, H, W, IC, K, R, S, pad_h,
+                                       pad_w, stride_h, stride_w, dilation_h, dilation_w, stream);
+    if (err != cudaSuccess)
+        return err;
 
     int P = (H + 2 * pad_h - dilation_h * (R - 1) - 1) / stride_h + 1;
     int Q = (W + 2 * pad_w - dilation_w * (S - 1) - 1) / stride_w + 1;
@@ -137,8 +135,8 @@ cudaError_t cudnn_conv2d_activation_fwd(const T* input, const T* filter, const T
         cudnnHandle_t handle = getCudnnHandle();
         constexpr cudnnDataType_t dtype = CudnnDtype<T>::value;
         ScopedTensorDesc y_desc;
-        OASR_CUDNN_CHECK(cudnnSetTensor4dDescriptorEx(y_desc, dtype, N, K, P, Q,
-                                                       P * Q * K, 1, Q * K, K));
+        OASR_CUDNN_CHECK(
+            cudnnSetTensor4dDescriptorEx(y_desc, dtype, N, K, P, Q, P * Q * K, 1, Q * K, K));
         ScopedActivationDesc act;
         OASR_CUDNN_CHECK(
             cudnnSetActivationDescriptor(act, CUDNN_ACTIVATION_RELU, CUDNN_PROPAGATE_NAN, 0.0));
@@ -194,8 +192,8 @@ void cudnn_conv2d(TensorView output, TensorView input, TensorView filter, Option
             reinterpret_cast<const c_type*>(filter.data_ptr()), bias_ptr,
             reinterpret_cast<c_type*>(output.data_ptr()), N, H, W, IC, K, R, S,
             static_cast<int>(pad_h), static_cast<int>(pad_w), static_cast<int>(stride_h),
-            static_cast<int>(stride_w), static_cast<int>(dilation_h),
-            static_cast<int>(dilation_w), stream);
+            static_cast<int>(stride_w), static_cast<int>(dilation_h), static_cast<int>(dilation_w),
+            stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "cuDNN Conv2D kernel failed: " << cudaGetErrorString(status);
         return true;
@@ -203,9 +201,9 @@ void cudnn_conv2d(TensorView output, TensorView input, TensorView filter, Option
 }
 
 void cudnn_conv2d_activation(TensorView output, TensorView input, TensorView filter,
-                              Optional bias_opt, int64_t activation_type, int64_t pad_h,
-                              int64_t pad_w, int64_t stride_h, int64_t stride_w,
-                              int64_t dilation_h, int64_t dilation_w) {
+                             Optional bias_opt, int64_t activation_type, int64_t pad_h,
+                             int64_t pad_w, int64_t stride_h, int64_t stride_w, int64_t dilation_h,
+                             int64_t dilation_w) {
     CHECK_INPUT(input);
     CHECK_INPUT(output);
     CHECK_INPUT(filter);
@@ -234,10 +232,120 @@ void cudnn_conv2d_activation(TensorView output, TensorView input, TensorView fil
             reinterpret_cast<const c_type*>(filter.data_ptr()), bias_ptr,
             reinterpret_cast<c_type*>(output.data_ptr()), activation, N, H, W, IC, K, R, S,
             static_cast<int>(pad_h), static_cast<int>(pad_w), static_cast<int>(stride_h),
-            static_cast<int>(stride_w), static_cast<int>(dilation_h),
-            static_cast<int>(dilation_w), stream);
+            static_cast<int>(stride_w), static_cast<int>(dilation_h), static_cast<int>(dilation_w),
+            stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "cuDNN Conv2DActivation kernel failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
+// =============================================================================
+// Dense Conv1D launchers
+//
+// cuDNN's public convolution API is 2-D here, but packed BTC/KSC tensors are
+// exactly packed NHWC/KRSC tensors with H=R_h=1.  These exports are both the
+// unaligned-channel path and an autotuning baseline for the CUTLASS kernels.
+// =============================================================================
+
+void cudnn_conv1d(TensorView output, TensorView input, TensorView filter, Optional bias_opt,
+                  int64_t padding, int64_t stride, int64_t dilation) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output);
+    CHECK_INPUT(filter);
+    CHECK_DIM(3, input);
+    CHECK_DIM(3, filter);
+    CHECK_DIM(3, output);
+    CHECK_CONTIGUOUS_INPUT(input);
+    CHECK_CONTIGUOUS_INPUT(output);
+    CHECK_CONTIGUOUS_INPUT(filter);
+    CHECK_DEVICE(input, output);
+    CHECK_DEVICE(input, filter);
+    TVM_FFI_ICHECK(padding >= 0 && stride > 0 && dilation > 0)
+        << "padding must be non-negative and stride/dilation must be positive";
+
+    int B = input.size(0);
+    int T = input.size(1);
+    int IC = input.size(2);
+    int K = filter.size(0);
+    int R = filter.size(1);
+    int Q = (T + 2 * static_cast<int>(padding) - static_cast<int>(dilation) * (R - 1) - 1) /
+                static_cast<int>(stride) +
+            1;
+    TVM_FFI_ICHECK(filter.size(2) == IC) << "Conv1D filter/input channel mismatch";
+    TVM_FFI_ICHECK(output.size(0) == B && output.size(1) == Q && output.size(2) == K)
+        << "Conv1D output shape mismatch";
+
+    cudaStream_t stream = get_stream(input.device());
+    DISPATCH_DLPACK_HALF_DTYPE(input.dtype(), c_type, [&] {
+        const c_type* bias_ptr = nullptr;
+        if (bias_opt.has_value()) {
+            CHECK_INPUT(bias_opt.value());
+            CHECK_DIM(1, bias_opt.value());
+            CHECK_DEVICE(input, bias_opt.value());
+            TVM_FFI_ICHECK(bias_opt.value().size(0) == K) << "Conv1D bias shape mismatch";
+            bias_ptr = reinterpret_cast<const c_type*>(bias_opt.value().data_ptr());
+        }
+        cudaError_t status = cudnn_conv2d_fwd<c_type>(
+            reinterpret_cast<const c_type*>(input.data_ptr()),
+            reinterpret_cast<const c_type*>(filter.data_ptr()), bias_ptr,
+            reinterpret_cast<c_type*>(output.data_ptr()), B, 1, T, IC, K, 1, R, 0,
+            static_cast<int>(padding), 1, static_cast<int>(stride), 1, static_cast<int>(dilation),
+            stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "cuDNN Conv1D kernel failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
+void cudnn_conv1d_activation(TensorView output, TensorView input, TensorView filter,
+                             Optional bias_opt, int64_t activation_type, int64_t padding,
+                             int64_t stride, int64_t dilation) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output);
+    CHECK_INPUT(filter);
+    CHECK_DIM(3, input);
+    CHECK_DIM(3, filter);
+    CHECK_DIM(3, output);
+    CHECK_CONTIGUOUS_INPUT(input);
+    CHECK_CONTIGUOUS_INPUT(output);
+    CHECK_CONTIGUOUS_INPUT(filter);
+    CHECK_DEVICE(input, output);
+    CHECK_DEVICE(input, filter);
+    TVM_FFI_ICHECK(padding >= 0 && stride > 0 && dilation > 0)
+        << "padding must be non-negative and stride/dilation must be positive";
+
+    int B = input.size(0);
+    int T = input.size(1);
+    int IC = input.size(2);
+    int K = filter.size(0);
+    int R = filter.size(1);
+    int Q = (T + 2 * static_cast<int>(padding) - static_cast<int>(dilation) * (R - 1) - 1) /
+                static_cast<int>(stride) +
+            1;
+    TVM_FFI_ICHECK(filter.size(2) == IC) << "Conv1D filter/input channel mismatch";
+    TVM_FFI_ICHECK(output.size(0) == B && output.size(1) == Q && output.size(2) == K)
+        << "Conv1D output shape mismatch";
+    auto activation = static_cast<ActivationType>(activation_type);
+
+    cudaStream_t stream = get_stream(input.device());
+    DISPATCH_DLPACK_HALF_DTYPE(input.dtype(), c_type, [&] {
+        const c_type* bias_ptr = nullptr;
+        if (bias_opt.has_value()) {
+            CHECK_INPUT(bias_opt.value());
+            CHECK_DIM(1, bias_opt.value());
+            CHECK_DEVICE(input, bias_opt.value());
+            TVM_FFI_ICHECK(bias_opt.value().size(0) == K) << "Conv1D bias shape mismatch";
+            bias_ptr = reinterpret_cast<const c_type*>(bias_opt.value().data_ptr());
+        }
+        cudaError_t status = cudnn_conv2d_activation_fwd<c_type>(
+            reinterpret_cast<const c_type*>(input.data_ptr()),
+            reinterpret_cast<const c_type*>(filter.data_ptr()), bias_ptr,
+            reinterpret_cast<c_type*>(output.data_ptr()), activation, B, 1, T, IC, K, 1, R, 0,
+            static_cast<int>(padding), 1, static_cast<int>(stride), 1, static_cast<int>(dilation),
+            stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "cuDNN Conv1DActivation kernel failed: " << cudaGetErrorString(status);
         return true;
     });
 }
@@ -248,3 +356,5 @@ void cudnn_conv2d_activation(TensorView output, TensorView input, TensorView fil
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cudnn_conv2d, cudnn_conv2d);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cudnn_conv2d_activation, cudnn_conv2d_activation);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cudnn_conv1d, cudnn_conv1d);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cudnn_conv1d_activation, cudnn_conv1d_activation);

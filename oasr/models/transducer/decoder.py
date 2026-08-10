@@ -14,9 +14,8 @@ from typing import ClassVar, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 
-from oasr.layers import Embedding
+from oasr.layers import DepthwiseConv1d, Embedding
 
 from ..decoders.base import TransducerPredictor
 
@@ -50,14 +49,7 @@ class StatelessDecoder(TransducerPredictor):
         if context_size > 1:
             # Depthwise conv over the label window (no padding: U == context_size
             # in → 1 frame out at decode time).
-            self.conv = nn.Conv1d(
-                decoder_dim,
-                decoder_dim,
-                kernel_size=context_size,
-                padding=0,
-                groups=decoder_dim,
-                bias=False,
-            )
+            self.conv = DepthwiseConv1d(decoder_dim, kernel_size=context_size, bias=False)
 
     def init_state(
         self,
@@ -75,9 +67,7 @@ class StatelessDecoder(TransducerPredictor):
         """``(B, context_size)`` label window → ``(B, decoder_dim)`` prediction."""
         emb = self.embedding(y)  # (B, U, dim)
         if self.context_size > 1:
-            emb = emb.permute(0, 2, 1)  # (B, dim, U)
-            emb = self.conv(emb)  # (B, dim, U - context_size + 1) == (B, dim, 1)
-            emb = emb.permute(0, 2, 1)  # (B, 1, dim)
+            emb = self.conv(emb)  # (B, U - context_size + 1, dim) == (B, 1, dim)
         emb = F.relu(emb)
         # (B, U_out, dim) -> (B, dim): decode feeds exactly one window per step.
         return emb[:, -1, :]

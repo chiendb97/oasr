@@ -337,6 +337,123 @@ else:
     )
 
 
+def _sm120_conv1d_config(
+    block_m: int, block_n: int, warp_m: int, warp_n: int
+) -> CutlassConv2dConfig:
+    return CutlassConv2dConfig(
+        block_m=block_m,
+        block_n=block_n,
+        block_k=64,
+        warp_m=warp_m,
+        warp_n=warp_n,
+        warp_k=64,
+        kStages=3,
+        kSmVersion=120,
+    )
+
+
+# Exact production shapes measured on RTX 5090.  Keeping batch and sequence
+# length in the key is intentional: implicit-GEMM's M dimension is
+# ``batch * out_len``, and the best block_m changes substantially with it.
+_CONV1D_HEURISTIC_RULES_SM120: Dict[
+    str, Dict[Tuple[int, ...], Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]]
+] = {
+    "torch.float16": {
+        # Whisper front-end.
+        (1, 3000, 80, 384, 3, 1, 1, 1): _sm120_conv1d_config(64, 128, 32, 64),
+        (1, 3000, 384, 384, 3, 1, 2, 1): _sm120_conv1d_config(32, 128, 32, 32),
+        # Qwen2-Audio front-end.
+        (1, 3000, 128, 1280, 3, 1, 1, 1): _sm120_conv1d_config(64, 128, 32, 64),
+        (1, 3000, 1280, 1280, 3, 1, 2, 1): _sm120_conv1d_config(128, 32, 32, 32),
+        # Paraformer CIF predictor after its explicit one-frame padding.
+        (1, 502, 512, 512, 3, 0, 1, 1): _sm120_conv1d_config(16, 128, 16, 32),
+    },
+    "torch.bfloat16": {
+        (1, 3000, 80, 384, 3, 1, 1, 1): _sm120_conv1d_config(128, 64, 64, 32),
+        (1, 3000, 384, 384, 3, 1, 2, 1): _sm120_conv1d_config(128, 32, 32, 32),
+        (1, 3000, 128, 1280, 3, 1, 1, 1): _sm120_conv1d_config(64, 128, 32, 64),
+        (1, 3000, 1280, 1280, 3, 1, 2, 1): _sm120_conv1d_config(128, 32, 32, 32),
+        (1, 502, 512, 512, 3, 0, 1, 1): _sm120_conv1d_config(16, 128, 16, 32),
+    },
+}
+
+_CONV1D_ACTIVATION_HEURISTIC_RULES_SM120: Dict[
+    str, Dict[Tuple[int, ...], Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]]
+] = {
+    # Paraformer CIF predictor: the post-convolution ReLU is fused here.
+    "torch.float16": {
+        (1, 502, 512, 512, 3, 0, 1, 1): _sm120_conv1d_config(16, 128, 16, 32),
+    },
+    "torch.bfloat16": {
+        (1, 502, 512, 512, 3, 0, 1, 1): _sm120_conv1d_config(16, 128, 16, 32),
+    },
+}
+
+
+def _select_conv1d_rule(
+    rules_by_dtype: Dict[
+        str, Dict[Tuple[int, ...], Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]]
+    ],
+    shape: Tuple[int, ...],
+    dtype,
+    sm: int,
+) -> Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]:
+    if sm != 120:
+        return CONV2D_DEFAULT
+    rules = rules_by_dtype.get(str(dtype))
+    if rules is None:
+        return CONV2D_DEFAULT
+    return rules.get(tuple(int(value) for value in shape), CONV2D_DEFAULT)
+
+
+def select_default_conv1d_config(
+    batch: int,
+    seq_len: int,
+    in_channels: int,
+    out_channels: int,
+    kernel_size: int,
+    padding: int,
+    stride: int,
+    dilation: int,
+    dtype,
+    sm: int,
+) -> Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]:
+    """Pick a measured dense Conv1D tile for the non-autotuned path.
+
+    The table is deliberately exact and currently covers FP16/BF16 on SM120.
+    An unmeasured architecture, dtype, batch, or length retains
+    :data:`CONV2D_DEFAULT`; callers can opt into the full runtime autotuner for
+    additional shapes.
+    """
+    return _select_conv1d_rule(
+        _CONV1D_HEURISTIC_RULES_SM120,
+        (batch, seq_len, in_channels, out_channels, kernel_size, padding, stride, dilation),
+        dtype,
+        sm,
+    )
+
+
+def select_default_conv1d_activation_config(
+    batch: int,
+    seq_len: int,
+    in_channels: int,
+    out_channels: int,
+    kernel_size: int,
+    padding: int,
+    stride: int,
+    dilation: int,
+    dtype,
+    sm: int,
+) -> Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]:
+    """Pick a measured fused-activation Conv1D tile, with a safe fallback."""
+    return _select_conv1d_rule(
+        _CONV1D_ACTIVATION_HEURISTIC_RULES_SM120,
+        (batch, seq_len, in_channels, out_channels, kernel_size, padding, stride, dilation),
+        dtype,
+        sm,
+    )
+
+
 # =============================================================================
 # Conv1D module (static sources, no variants)
 # =============================================================================
@@ -376,6 +493,7 @@ def _render_all_conv2d_variants() -> List:
                 "conv2d_cutlass_template.cu.jinja",
                 op_name=variant_file_name,
                 func_name=func_name,
+                config_name=cfg.compile_name,
                 tile_m=cfg.block_m,
                 tile_n=cfg.block_n,
                 tile_k=cfg.block_k,
@@ -391,6 +509,7 @@ def _render_all_conv2d_variants() -> List:
                 "conv2d_cutlass_template_sm90.cu.jinja",
                 op_name=variant_file_name,
                 func_name=func_name,
+                config_name=cfg.compile_name,
                 tile_m=cfg.tile_m,
                 tile_n=cfg.tile_n,
                 tile_k=cfg.tile_k,
@@ -447,3 +566,21 @@ def conv2d_func_name(cfg: Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]) -
 def conv2d_activation_func_name(cfg: Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]) -> str:
     """Return the TVM-FFI export name for a Conv2D+activation variant."""
     return f"conv2d_{cfg.compile_name}_activation"
+
+
+def conv1d_func_name(cfg: Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]) -> str:
+    """Return the TVM-FFI export name for a dense BTC Conv1D variant.
+
+    Dense Conv1D is the height-one specialization of the same CUTLASS
+    implicit-GEMM kernel used by Conv2D.  Keeping a distinct export gives the
+    public operation a strict three-dimensional contract without introducing
+    a view/copy in Python.
+    """
+    return f"conv1d_{cfg.compile_name}"
+
+
+def conv1d_activation_func_name(
+    cfg: Union[CutlassConv2dConfig, CutlassConv2dConfigSm90],
+) -> str:
+    """Return the TVM-FFI export name for a dense Conv1D+activation variant."""
+    return f"conv1d_{cfg.compile_name}_activation"

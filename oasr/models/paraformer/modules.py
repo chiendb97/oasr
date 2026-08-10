@@ -26,12 +26,14 @@ import math
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from oasr.layers import (
     ESPNET_EPS,
     Attention,
     ColumnParallelLinear,
+    DepthwiseConv1d,
     FeedForward,
     RowParallelLinear,
 )
@@ -100,20 +102,18 @@ class FsmnBlock(nn.Module):
 
     def __init__(self, n_feat: int, kernel_size: int, sanm_shift: int = 0) -> None:
         super().__init__()
-        self.fsmn_block = nn.Conv1d(
-            n_feat, n_feat, kernel_size, stride=1, padding=0, groups=n_feat, bias=False
-        )
+        self.fsmn_block = DepthwiseConv1d(n_feat, kernel_size, bias=False)
         left_padding = (kernel_size - 1) // 2
         if sanm_shift > 0:
             left_padding = left_padding + sanm_shift
         right_padding = kernel_size - 1 - left_padding
-        self.pad_fn = nn.ConstantPad1d((left_padding, right_padding), 0.0)
+        self.padding = (left_padding, right_padding)
 
     def forward(self, inputs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """``inputs (B, T, D)``, ``mask (B, T, 1)`` float → ``(B, T, D)``."""
         inputs = inputs * mask
-        x = self.pad_fn(inputs.transpose(1, 2))
-        x = self.fsmn_block(x).transpose(1, 2)
+        x = F.pad(inputs, (0, 0, *self.padding))
+        x = self.fsmn_block(x)
         x = x + inputs
         return x * mask
 
@@ -137,19 +137,17 @@ class SanmSelfAttention(nn.Module):
         self.linear_out = RowParallelLinear(n_feat, n_feat)
         # ``q`` is pre-scaled below (FunASR's convention), hence scale 1.0.
         self.attn = Attention(n_head, self.d_k, softmax_scale=1.0)
-        self.fsmn_block = nn.Conv1d(
-            n_feat, n_feat, kernel_size, stride=1, padding=0, groups=n_feat, bias=False
-        )
+        self.fsmn_block = DepthwiseConv1d(n_feat, kernel_size, bias=False)
         left_padding = (kernel_size - 1) // 2
         if sanm_shift > 0:
             left_padding = left_padding + sanm_shift
         right_padding = kernel_size - 1 - left_padding
-        self.pad_fn = nn.ConstantPad1d((left_padding, right_padding), 0.0)
+        self.padding = (left_padding, right_padding)
 
     def _forward_fsmn(self, v: torch.Tensor, mask_btd: torch.Tensor) -> torch.Tensor:
         v = v * mask_btd
-        x = self.pad_fn(v.transpose(1, 2))
-        x = self.fsmn_block(x).transpose(1, 2)
+        x = F.pad(v, (0, 0, *self.padding))
+        x = self.fsmn_block(x)
         x = x + v
         return x * mask_btd
 

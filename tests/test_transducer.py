@@ -307,7 +307,7 @@ def _to_icefall_sd(model):
     sd = {}
     for k, v in model.state_dict().items():
         ik = k[len("encoder.") :] if k.startswith("encoder.") else k
-        if ik.endswith("depthwise_conv.weight") and v.ndim == 3 and v.shape[1] == 1:
+        if ik.endswith(("depthwise_conv.weight", "decoder.conv.weight")) and v.ndim == 3:
             v = v.permute(2, 1, 0).contiguous()
         sd[ik] = v
     return sd

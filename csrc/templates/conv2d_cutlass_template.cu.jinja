@@ -174,3 +174,158 @@ void {{ func_name }}_activation(TensorView output, TensorView input, TensorView 
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}_activation, {{ func_name }}_activation);
 {% endif %}
+
+// =============================================================================
+// Dense Conv1D launchers
+//
+// BTC / KSC are byte-for-byte the packed NHWC / KRSC layouts of a height-one
+// Conv2D problem.  Calling the same implicit-GEMM specialization directly keeps
+// the public contract three-dimensional and avoids framework-side view or copy
+// operations on the hot path.
+// =============================================================================
+
+void conv1d_{{ config_name }}(TensorView output, TensorView input, TensorView filter,
+                              Optional bias_opt, int64_t padding, int64_t stride,
+                              int64_t dilation) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output);
+    CHECK_INPUT(filter);
+    CHECK_DIM(3, input);   // [B, T, IC]
+    CHECK_DIM(3, filter);  // [K, R, IC]
+    CHECK_DIM(3, output);  // [B, Q, K]
+    CHECK_CONTIGUOUS_INPUT(input);
+    CHECK_CONTIGUOUS_INPUT(output);
+    CHECK_CONTIGUOUS_INPUT(filter);
+    CHECK_DEVICE(input, output);
+    CHECK_DEVICE(input, filter);
+
+    int B = input.size(0);
+    int T = input.size(1);
+    int IC = input.size(2);
+    int K = filter.size(0);
+    int R = filter.size(1);
+    TVM_FFI_ICHECK(padding >= 0 && stride > 0 && dilation > 0)
+        << "padding must be non-negative and stride/dilation must be positive";
+    int Q = (T + 2 * static_cast<int>(padding) -
+             static_cast<int>(dilation) * (R - 1) - 1) /
+                static_cast<int>(stride) +
+            1;
+    TVM_FFI_ICHECK(filter.size(2) == IC) << "Conv1D filter/input channel mismatch";
+    TVM_FFI_ICHECK(IC % 8 == 0 && K % 8 == 0)
+        << "CUTLASS Conv1D requires input and output channels to be 8-aligned";
+    TVM_FFI_ICHECK(output.size(0) == B && output.size(1) == Q && output.size(2) == K)
+        << "Conv1D output shape mismatch";
+
+    cudaStream_t stream = get_stream(input.device());
+    DISPATCH_DLPACK_HALF_DTYPE(input.dtype(), c_type, [&] {
+        using CutlassType = typename ToCutlassType<c_type>::type;
+        const CutlassType* bias_ptr = nullptr;
+        if (bias_opt.has_value()) {
+            CHECK_INPUT(bias_opt.value());
+            CHECK_DIM(1, bias_opt.value());
+            CHECK_DEVICE(input, bias_opt.value());
+            TVM_FFI_ICHECK(bias_opt.value().size(0) == K) << "Conv1D bias shape mismatch";
+            bias_ptr = reinterpret_cast<const CutlassType*>(bias_opt.value().data_ptr());
+        }
+        auto status = oasr::conv::CutlassConv2dFpropKernel<
+            Config, CutlassType, CutlassType, CutlassType,
+            oasr::ActivationType::IDENTITY>::run(
+                reinterpret_cast<const CutlassType*>(input.data_ptr()),
+                reinterpret_cast<const CutlassType*>(filter.data_ptr()), bias_ptr,
+                reinterpret_cast<CutlassType*>(output.data_ptr()), B, 1, T, IC, K, 1, R, 0,
+                static_cast<int>(padding), 1, static_cast<int>(stride), 1,
+                static_cast<int>(dilation), 1.0f, stream);
+        TVM_FFI_ICHECK(status == oasr::gemm::GemmStatus::SUCCESS)
+            << "Conv1D kernel failed";
+        return true;
+    });
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(conv1d_{{ config_name }}, conv1d_{{ config_name }});
+
+{% if with_activation %}
+void conv1d_{{ config_name }}_activation(TensorView output, TensorView input, TensorView filter,
+                                         Optional bias_opt, int64_t activation_type,
+                                         int64_t padding, int64_t stride, int64_t dilation) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output);
+    CHECK_INPUT(filter);
+    CHECK_DIM(3, input);
+    CHECK_DIM(3, filter);
+    CHECK_DIM(3, output);
+    CHECK_CONTIGUOUS_INPUT(input);
+    CHECK_CONTIGUOUS_INPUT(output);
+    CHECK_CONTIGUOUS_INPUT(filter);
+    CHECK_DEVICE(input, output);
+    CHECK_DEVICE(input, filter);
+
+    int B = input.size(0);
+    int T = input.size(1);
+    int IC = input.size(2);
+    int K = filter.size(0);
+    int R = filter.size(1);
+    TVM_FFI_ICHECK(padding >= 0 && stride > 0 && dilation > 0)
+        << "padding must be non-negative and stride/dilation must be positive";
+    int Q = (T + 2 * static_cast<int>(padding) -
+             static_cast<int>(dilation) * (R - 1) - 1) /
+                static_cast<int>(stride) +
+            1;
+    TVM_FFI_ICHECK(filter.size(2) == IC) << "Conv1D filter/input channel mismatch";
+    TVM_FFI_ICHECK(IC % 8 == 0 && K % 8 == 0)
+        << "CUTLASS Conv1D requires input and output channels to be 8-aligned";
+    TVM_FFI_ICHECK(output.size(0) == B && output.size(1) == Q && output.size(2) == K)
+        << "Conv1D output shape mismatch";
+    auto activation = static_cast<ActivationType>(activation_type);
+
+    cudaStream_t stream = get_stream(input.device());
+    DISPATCH_DLPACK_HALF_DTYPE(input.dtype(), c_type, [&] {
+        using CutlassType = typename ToCutlassType<c_type>::type;
+        const CutlassType* bias_ptr = nullptr;
+        if (bias_opt.has_value()) {
+            CHECK_INPUT(bias_opt.value());
+            CHECK_DIM(1, bias_opt.value());
+            CHECK_DEVICE(input, bias_opt.value());
+            TVM_FFI_ICHECK(bias_opt.value().size(0) == K) << "Conv1D bias shape mismatch";
+            bias_ptr = reinterpret_cast<const CutlassType*>(bias_opt.value().data_ptr());
+        }
+
+        oasr::gemm::GemmStatus status;
+        if (activation == ActivationType::RELU) {
+            status = oasr::conv::CutlassConv2dFpropKernel<
+                Config, CutlassType, CutlassType, CutlassType,
+                oasr::ActivationType::RELU>::run(
+                    reinterpret_cast<const CutlassType*>(input.data_ptr()),
+                    reinterpret_cast<const CutlassType*>(filter.data_ptr()), bias_ptr,
+                    reinterpret_cast<CutlassType*>(output.data_ptr()), B, 1, T, IC, K, 1, R, 0,
+                    static_cast<int>(padding), 1, static_cast<int>(stride), 1,
+                    static_cast<int>(dilation), 1.0f, stream);
+        } else if (activation == ActivationType::GELU) {
+            status = oasr::conv::CutlassConv2dFpropKernel<
+                Config, CutlassType, CutlassType, CutlassType,
+                oasr::ActivationType::GELU>::run(
+                    reinterpret_cast<const CutlassType*>(input.data_ptr()),
+                    reinterpret_cast<const CutlassType*>(filter.data_ptr()), bias_ptr,
+                    reinterpret_cast<CutlassType*>(output.data_ptr()), B, 1, T, IC, K, 1, R, 0,
+                    static_cast<int>(padding), 1, static_cast<int>(stride), 1,
+                    static_cast<int>(dilation), 1.0f, stream);
+        } else if (activation == ActivationType::SWISH) {
+            status = oasr::conv::CutlassConv2dFpropKernel<
+                Config, CutlassType, CutlassType, CutlassType,
+                oasr::ActivationType::SWISH>::run(
+                    reinterpret_cast<const CutlassType*>(input.data_ptr()),
+                    reinterpret_cast<const CutlassType*>(filter.data_ptr()), bias_ptr,
+                    reinterpret_cast<CutlassType*>(output.data_ptr()), B, 1, T, IC, K, 1, R, 0,
+                    static_cast<int>(padding), 1, static_cast<int>(stride), 1,
+                    static_cast<int>(dilation), 1.0f, stream);
+        } else {
+            TVM_FFI_ICHECK(false) << "Unsupported activation type: " << activation_type;
+        }
+        TVM_FFI_ICHECK(status == oasr::gemm::GemmStatus::SUCCESS)
+            << "Conv1DActivation kernel failed";
+        return true;
+    });
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(conv1d_{{ config_name }}_activation,
+                              conv1d_{{ config_name }}_activation);
+{% endif %}
