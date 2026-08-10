@@ -20,6 +20,8 @@ from oasr.jit.conv import (
     CONV2D_DEFAULT,
     CutlassConv2dConfig,
     CutlassConv2dConfigSm90,
+    conv1d_activation_func_name,
+    conv1d_func_name,
     conv2d_activation_func_name,
     conv2d_func_name,
     get_all_conv2d_autotune_configs,
@@ -95,6 +97,28 @@ def _make_conv2d_activation_runner(cfg: Union[CutlassConv2dConfig, CutlassConv2d
     return runner
 
 
+def _make_conv1d_runner(cfg: Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]):
+    """Create a dense BTC Conv1D runner for a specific implicit-GEMM tile."""
+    fn_name = conv1d_func_name(cfg)
+
+    def runner():
+        mod = _get_conv2d_module()
+        return getattr(mod, fn_name)
+
+    return runner
+
+
+def _make_conv1d_activation_runner(cfg: Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]):
+    """Create a dense Conv1D+activation runner for a specific tile."""
+    fn_name = conv1d_activation_func_name(cfg)
+
+    def runner():
+        mod = _get_conv2d_module()
+        return getattr(mod, fn_name)
+
+    return runner
+
+
 # ---------------------------------------------------------------------------
 # Registration: CUTLASS tile variants for conv2d and conv2d_activation
 # ---------------------------------------------------------------------------
@@ -123,6 +147,26 @@ for _cfg in _all_autotune_configs.values():
         ),
     )
 
+    _global_registry.register(
+        OpKey("conv", "conv1d"),
+        BackendEntry(
+            tactic=_tactic,
+            is_available=lambda: True,
+            get_runner=_make_conv1d_runner(_cfg),
+            is_fallback=_is_default,
+        ),
+    )
+
+    _global_registry.register(
+        OpKey("conv", "conv1d_activation"),
+        BackendEntry(
+            tactic=_tactic,
+            is_available=lambda: True,
+            get_runner=_make_conv1d_activation_runner(_cfg),
+            is_fallback=_is_default,
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Registration: cuDNN backends
@@ -137,6 +181,16 @@ def _cudnn_conv2d_runner():
 def _cudnn_conv2d_activation_runner():
     mod = _get_cudnn_conv2d_module()
     return mod.cudnn_conv2d_activation
+
+
+def _cudnn_conv1d_runner():
+    mod = _get_cudnn_conv2d_module()
+    return mod.cudnn_conv1d
+
+
+def _cudnn_conv1d_activation_runner():
+    mod = _get_cudnn_conv2d_module()
+    return mod.cudnn_conv1d_activation
 
 
 _global_registry.register(
@@ -155,6 +209,26 @@ _global_registry.register(
         tactic=Tactic("cudnn"),
         is_available=_has_cudnn,
         get_runner=_cudnn_conv2d_activation_runner,
+        is_fallback=False,
+    ),
+)
+
+_global_registry.register(
+    OpKey("conv", "conv1d"),
+    BackendEntry(
+        tactic=Tactic("cudnn"),
+        is_available=_has_cudnn,
+        get_runner=_cudnn_conv1d_runner,
+        is_fallback=False,
+    ),
+)
+
+_global_registry.register(
+    OpKey("conv", "conv1d_activation"),
+    BackendEntry(
+        tactic=Tactic("cudnn"),
+        is_available=_has_cudnn,
+        get_runner=_cudnn_conv1d_activation_runner,
         is_fallback=False,
     ),
 )

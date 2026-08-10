@@ -25,6 +25,7 @@ from oasr.layers import (
     TORCH_EPS,
     Attention,
     ColumnParallelLinear,
+    Conv1d,
     Embedding,
     LayerNorm,
     RowParallelLinear,
@@ -93,8 +94,8 @@ class Qwen2AudioTower(BaseEncoder):
         super().__init__()
         self._cfg = cfg
         d = cfg.audio_d_model
-        self.conv1 = nn.Conv1d(cfg.audio_num_mel_bins, d, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(d, d, kernel_size=3, stride=2, padding=1)
+        self.conv1 = Conv1d(cfg.audio_num_mel_bins, d, kernel_size=3, padding=1)
+        self.conv2 = Conv1d(d, d, kernel_size=3, stride=2, padding=1)
         # HF materializes the sinusoidal table as a real (frozen) weight.
         self.embed_positions = Embedding(cfg.audio_max_source_positions, d)
         self.layers = nn.ModuleList([_TowerLayer(cfg) for _ in range(cfg.audio_encoder_layers)])
@@ -125,12 +126,8 @@ class Qwen2AudioTower(BaseEncoder):
                 f"speech_llm expects {expected} mel frames (padded 30 s window, "
                 f"feature_type='whisper_logmel'), got {xs.size(1)}"
             )
-        x = xs.transpose(1, 2)  # (B, n_mels, T)
-        x = F.gelu(self.conv1(x))
+        x = F.gelu(self.conv1(xs))
         x = F.gelu(self.conv2(x))
-        # Contiguous, or the whole residual stream keeps the conv's strided
-        # last dimension and every norm falls off the kernel path.
-        x = x.transpose(1, 2).contiguous()  # (B, T/2, D)
         T = x.size(1)
         x = x + self.embed_positions.weight[:T].to(x.dtype)
 

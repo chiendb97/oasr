@@ -19,7 +19,15 @@ from ._backend import (
     set_layers_backend,
 )
 from .attention import Attention, RelPositionMultiHeadedAttention
-from .conv import Conv2d, Conv2dActivation, DepthwiseConv1d, Glu, PointwiseConv1d
+from .conv import (
+    Conv1d,
+    Conv1dActivation,
+    Conv2d,
+    Conv2dActivation,
+    DepthwiseConv1d,
+    Glu,
+    PointwiseConv1d,
+)
 from .ctc import CtcProjection
 from .embedding import Embedding, VocabParallelEmbedding
 from .feature import Fbank, Mfcc
@@ -55,6 +63,8 @@ __all__ = [
     "Attention",
     "RelPositionMultiHeadedAttention",
     # Convolution
+    "Conv1d",
+    "Conv1dActivation",
     "DepthwiseConv1d",
     "PointwiseConv1d",
     "Conv2d",

@@ -14,6 +14,9 @@ below are translated rather than assumed:
 
 * :class:`Conv2d` is **NHWC** with a KRSC weight (what the CUTLASS implicit GEMM
   wants), so the fallback permutes both into ``F.conv2d``'s NCHW/KCRS and back;
+* :class:`Conv1d` is ``(B, T, C)`` with an ``(out, K, in)`` KSC weight, so the
+  kernel path stays in the residual stream's layout and the fallback translates
+  to ``F.conv1d``;
 * :class:`DepthwiseConv1d` is ``(B, T, C)`` with a ``(K, 1, C)`` weight, so the
   fallback permutes into ``F.conv1d``'s ``(B, C, T)`` / ``(C, 1, K)``;
 * :class:`PointwiseConv1d` is a 1x1 convolution, i.e. a GEMM over the channel
@@ -29,6 +32,7 @@ the gap invisible and uncounted (see ``.artifacts/kernel_coverage.md`` §0).
 from __future__ import annotations
 
 import math
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -49,6 +53,196 @@ _TORCH_CONV_ACTIVATION = {
     "silu": F.silu,
     "gelu": lambda x: F.gelu(x, approximate="tanh"),
 }
+
+_TORCH_CONV1D_ACTIVATION: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
+    "relu": F.relu,
+    "swish": F.silu,
+    "silu": F.silu,
+    "gelu_tanh": lambda x: F.gelu(x, approximate="tanh"),
+}
+
+_FUSED_CONV1D_ACTIVATION = {
+    "relu": "relu",
+    "swish": "swish",
+    "silu": "silu",
+    "gelu_tanh": "gelu",
+}
+
+
+class Conv1d(nn.Module):
+    """Dense cross-channel convolution over packed ``(B, T, C)`` tensors.
+
+    The kernel stores weights as KSC ``(out_channels, kernel_size,
+    in_channels)`` so both activations and filters are directly consumable by
+    the height-one CUTLASS implicit-GEMM convolution.  Standard PyTorch
+    ``(out, in, kernel)`` checkpoint tensors are transposed once by the load
+    hook, never once per request.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        padding: int = 0,
+        stride: int = 1,
+        dilation: int = 1,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        if in_channels <= 0 or out_channels <= 0 or kernel_size <= 0:
+            raise ValueError(
+                "in_channels, out_channels, and kernel_size must be positive, got "
+                f"{in_channels}, {out_channels}, {kernel_size}"
+            )
+        if padding < 0 or stride <= 0 or dilation <= 0:
+            raise ValueError(
+                f"padding must be non-negative and stride/dilation positive, got "
+                f"{padding=}, {stride=}, {dilation=}"
+            )
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.stride = stride
+        self.dilation = dilation
+
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, kernel_size, in_channels, device=device, dtype=dtype)
+        )
+        nn.init.kaiming_uniform_(self.weight.view(out_channels, -1), a=math.sqrt(5))
+        if bias:
+            fan_in = in_channels * kernel_size
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            self.bias = nn.Parameter(torch.empty(out_channels, device=device, dtype=dtype))
+            nn.init.uniform_(self.bias, -bound, bound)
+        else:
+            self.register_parameter("bias", None)
+
+    def _torch_forward(self, x: torch.Tensor) -> torch.Tensor:
+        out: torch.Tensor = F.conv1d(
+            x.transpose(1, 2),
+            self.weight.permute(0, 2, 1),
+            self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+        )
+        return out.transpose(1, 2).contiguous()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``x: (B, T, in_channels) -> (B, T_out, out_channels)``."""
+        if not use_conv_kernel(x):
+            return self._torch_forward(x)
+        out: torch.Tensor = oasr.conv1d(
+            x,
+            self.weight,
+            self.bias,
+            padding=self.padding,
+            stride=self.stride,
+            dilation=self.dilation,
+        )
+        return out
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Load standard ``nn.Conv1d`` OIK weights into native KSC layout."""
+        weight_key = prefix + "weight"
+        if weight_key in state_dict:
+            w = state_dict[weight_key]
+            if (
+                isinstance(w, torch.Tensor)
+                and w.ndim == 3
+                and w.shape == (self.out_channels, self.in_channels, self.kernel_size)
+                and w.shape != self.weight.shape
+            ):
+                state_dict[weight_key] = w.permute(0, 2, 1).contiguous()
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def extra_repr(self) -> str:
+        return (
+            f"{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, "
+            f"stride={self.stride}, padding={self.padding}, dilation={self.dilation}, "
+            f"bias={self.bias is not None}"
+        )
+
+
+class Conv1dActivation(Conv1d):
+    """Dense BTC Conv1D with a fused activation epilogue.
+
+    Exact-erf ``gelu`` is deliberately not accepted.  The shared OASR GELU
+    epilogue is the tanh approximation, so callers must opt into it explicitly
+    as ``gelu_tanh``; Whisper and Qwen2-Audio keep their exact ``F.gelu`` as a
+    separate operation.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        padding: int = 0,
+        stride: int = 1,
+        dilation: int = 1,
+        bias: bool = True,
+        activation_type: str = "swish",
+        device=None,
+        dtype=None,
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            padding=padding,
+            stride=stride,
+            dilation=dilation,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+        if activation_type not in _FUSED_CONV1D_ACTIVATION:
+            raise ValueError(
+                f"activation_type={activation_type!r} is not fusable; "
+                f"expected one of {sorted(_FUSED_CONV1D_ACTIVATION)}"
+            )
+        self.activation_name = activation_type
+        self.activation = oasr.get_activation_type_id(_FUSED_CONV1D_ACTIVATION[activation_type])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not use_conv_kernel(x):
+            return _TORCH_CONV1D_ACTIVATION[self.activation_name](self._torch_forward(x))
+        out: torch.Tensor = oasr.conv1d_activation(
+            x,
+            self.weight,
+            self.bias,
+            self.activation,
+            padding=self.padding,
+            stride=self.stride,
+            dilation=self.dilation,
+        )
+        return out
+
+    def extra_repr(self) -> str:
+        return f"{super().extra_repr()}, activation={self.activation_name}"
 
 
 class DepthwiseConv1d(nn.Module):
@@ -445,4 +639,12 @@ class Glu(nn.Module):
         return F.glu(x, dim=-1)
 
 
-__all__ = ["DepthwiseConv1d", "Glu", "PointwiseConv1d", "Conv2d", "Conv2dActivation"]
+__all__ = [
+    "Conv1d",
+    "Conv1dActivation",
+    "Conv2d",
+    "Conv2dActivation",
+    "DepthwiseConv1d",
+    "Glu",
+    "PointwiseConv1d",
+]

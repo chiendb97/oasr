@@ -18,9 +18,10 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
-from oasr.layers import Linear
+from oasr.layers import Conv1dActivation, Linear
 from oasr.models.base import align_out_features
 
 from .config import ParaformerModelConfig
@@ -103,9 +104,13 @@ class CifPredictor(nn.Module):
     def __init__(self, config: ParaformerModelConfig) -> None:
         super().__init__()
         idim = config.predictor_idim
-        self.pad = nn.ConstantPad1d((config.predictor_l_order, config.predictor_r_order), 0)
-        self.cif_conv1d = nn.Conv1d(
-            idim, idim, config.predictor_l_order + config.predictor_r_order + 1
+        self.left_padding = config.predictor_l_order
+        self.right_padding = config.predictor_r_order
+        self.cif_conv1d = Conv1dActivation(
+            idim,
+            idim,
+            config.predictor_l_order + config.predictor_r_order + 1,
+            activation_type="relu",
         )
         # A one-wide output has no GEMM kernel either (alignment 8), so the
         # alpha head is allocated aligned like the vocabulary heads and column
@@ -139,8 +144,11 @@ class CifPredictor(nn.Module):
         """
         # Alpha head in the module's own dtype (fp16 under the engine); the
         # integration below is always fp32.
-        h = self.pad(hidden.to(self.cif_output.weight.dtype).transpose(1, 2))
-        alpha_logits = self.cif_output(torch.relu(self.cif_conv1d(h)).transpose(1, 2))
+        h = F.pad(
+            hidden.to(self.cif_output.weight.dtype),
+            (0, 0, self.left_padding, self.right_padding),
+        )
+        alpha_logits = self.cif_output(self.cif_conv1d(h))
         alphas = torch.sigmoid(alpha_logits[..., :1])
         hidden = hidden.float()
         mask = mask.float()

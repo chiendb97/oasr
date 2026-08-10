@@ -35,6 +35,8 @@ from .activation import (
 from .attention import fmha
 from .conv import (
     causal_conv1d,
+    conv1d,
+    conv1d_activation,
     conv2d,
     conv2d_activation,
     depthwise_conv1d,
@@ -62,6 +64,8 @@ from .layers import (
     AddLayerNorm,
     BatchNorm1d,
     BiasNorm,
+    Conv1d,
+    Conv1dActivation,
     Conv2d as Conv2dModule,
     Conv2dActivation,
     DepthwiseConv1d,
@@ -197,6 +201,8 @@ __all__ = [
     "batch_norm_swish",
     "cmvn",
     "depthwise_conv1d",
+    "conv1d",
+    "conv1d_activation",
     "conv2d",
     "depthwise_conv1d_silu",
     "causal_conv1d",
@@ -225,6 +231,8 @@ __all__ = [
     # nn.Module wrappers
     "layers",
     "DepthwiseConv1d",
+    "Conv1d",
+    "Conv1dActivation",
     "PointwiseConv1d",
     "Conv2dModule",
     "Conv2dActivation",
