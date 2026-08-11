@@ -430,7 +430,7 @@ impl PyEngine {
                 let words: Option<Vec<WordTiming>> = item
                     .getattr("words")
                     .ok()
-                    .and_then(|x| if x.is_none() { None } else { Some(x) })
+                    .filter(|x| !x.is_none())
                     .and_then(|list| extract_words(&list).ok());
                 let confidence: Option<f32> = item
                     .getattr("confidence")

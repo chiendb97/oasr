@@ -678,6 +678,59 @@ class TestKernelAndTorchPathsAgree:
         torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_depthwise_conv1d_rejects_a_row_strided_input(self, dtype):
+        """The kernel path asserts contiguity instead of quietly copying.
+
+        A last-dim slice of a fused QKV projection — Paraformer's ``v``, from
+        ``torch.split(linear_q_k_v(x), C, dim=-1)`` — is last-dim contiguous
+        with a row stride of ``3 * C``, which the launcher rejects.  The layer
+        does not paper over it: the caller owns the copy, so the cost sits where
+        it is caused (see ``paraformer/modules.py::SanmSelfAttention._forward_fsmn``).
+
+        This is asserted rather than merely documented because the same fused
+        call came back empty for every Paraformer request at fp16 *and* bf16
+        while the suite stayed green — the functional-API tests pass contiguous
+        tensors and the fp32 parity oracles route to torch, where no launcher
+        check is reached.  Needs no asset, so it runs unmarked rather than
+        behind ``-m slow``.
+        """
+        from oasr.layers import DepthwiseConv1d
+
+        channels, seq_len = 128, 63
+        m = DepthwiseConv1d(channels, 11, padding=(7, 3), bias=False).cuda().to(dtype)
+        qkv = torch.randn(2, seq_len, 3 * channels, device="cuda", dtype=dtype)
+        _, _, x = torch.split(qkv, channels, dim=-1)
+        assert not x.is_contiguous() and x.stride(1) == 3 * channels
+        mask = torch.rand(2, seq_len, 1, device="cuda") > 0.2
+
+        with pytest.raises(AssertionError, match="contiguous input"):
+            m(x, mask=mask, add_input=True)
+
+        # A row-strided mask is the same hazard, one argument over.  Slice after
+        # the dtype cast: casting a view materialises a contiguous copy, which
+        # would leave this half asserting nothing.
+        strided_mask = (torch.rand(2, seq_len, 4, device="cuda") > 0.2)[:, :, :1]
+        assert not strided_mask.is_contiguous()
+        with pytest.raises(AssertionError, match="contiguous mask"):
+            m(x.contiguous(), mask=strided_mask, add_input=True)
+
+        # And the contract the caller is told to satisfy does hold.
+        got = m(x.contiguous(), mask=mask, add_input=True)
+        with layers_backend_override("torch"):
+            ref = m(x.contiguous(), mask=mask, add_input=True)
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+        # The torch path has no such requirement — a strided view is fine there,
+        # which is exactly why an fp32/CPU oracle cannot catch the kernel case.
+        with layers_backend_override("torch"):
+            torch.testing.assert_close(
+                m(x, mask=strided_mask, add_input=True),
+                m(x.contiguous(), mask=strided_mask.contiguous(), add_input=True),
+                rtol=2e-2,
+                atol=2e-2,
+            )
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize(
         "in_channels,out_channels,kernel,groups",
         [(128, 128, 7, 128), (16, 32, 3, 4), (128, 384, 1, 1)],

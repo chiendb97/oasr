@@ -106,6 +106,15 @@ def test_wer_has_not_regressed(spec, device):
         "dtype": getattr(torch, spec["dtype"]),
         "max_batch_size": spec["max_batch_size"],
     }
+    # ``load_architecture`` is the *loader* selector, distinct from
+    # ``architecture`` above, which is only the human label in the failure
+    # message.  Set it for an explicit-only converter: an icefall pruned-RNNT dir
+    # sniffs as ``zipformer``, so without it this entry would silently measure a
+    # different branch of the same checkpoint.
+    if spec.get("load_architecture"):
+        cfg_kwargs["architecture"] = spec["load_architecture"]
+    if spec.get("checkpoint_name"):
+        cfg_kwargs["checkpoint_name"] = spec["checkpoint_name"]
     if spec["decode_method"]:
         cfg_kwargs["decode_method"] = spec["decode_method"]
     if spec.get("chunk_size"):

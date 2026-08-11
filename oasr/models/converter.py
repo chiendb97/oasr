@@ -153,14 +153,16 @@ class BaseCheckpointConverter:
     @staticmethod
     def read_json(path: Path) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data: Dict[str, Any] = json.load(f)
+        return data
 
     @staticmethod
     def read_yaml(path: Path) -> Dict[str, Any]:
         import yaml
 
         with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
+            data: Dict[str, Any] = yaml.safe_load(f)
+        return data
 
     @classmethod
     def load_hf_state_dict(
@@ -171,6 +173,11 @@ class BaseCheckpointConverter:
         ``weights_only=True`` on the torch path: a checkpoint is untrusted input
         and an unpickle is arbitrary code execution.
         """
+        # Each reader annotates its result rather than returning the call
+        # directly: `safetensors` is an optional extra, so mypy sees `Any` where
+        # it is absent and a typed dict where it is installed, and an error
+        # count that depends on which extras the checking box happens to have is
+        # a ratchet that fails in CI and passes locally.
         ckpt_dir = Path(ckpt_dir)
         index_path = ckpt_dir / "model.safetensors.index.json"
         if index_path.exists():
@@ -185,10 +192,14 @@ class BaseCheckpointConverter:
         if st_path.exists():
             from safetensors.torch import load_file
 
-            return load_file(str(st_path), device=str(map_location))
+            single: Dict[str, torch.Tensor] = load_file(str(st_path), device=str(map_location))
+            return single
         bin_path = ckpt_dir / "pytorch_model.bin"
         if bin_path.exists():
-            return torch.load(str(bin_path), map_location=map_location, weights_only=True)
+            binary: Dict[str, torch.Tensor] = torch.load(
+                str(bin_path), map_location=map_location, weights_only=True
+            )
+            return binary
         raise FileNotFoundError(
             f"no model.safetensors[.index.json] or pytorch_model.bin under {ckpt_dir}"
         )

@@ -139,6 +139,18 @@ _ASSET_LIST: List[Asset] = [
         how="huggingface.co/k2-fsa icefall-asr-librispeech-zipformer-*",
     ),
     Asset(
+        env="TRANSDUCER_CKPT",
+        kind=CHECKPOINT,
+        what="icefall Zipformer pruned-RNNT release (transducer branch)",
+        relpath="zipformer_transducer",
+        probe=_has_nonempty_pt,
+        how=(
+            "huggingface.co/Zengwei/icefall-asr-librispeech-zipformer-2023-05-15 — "
+            "exp/pretrained.pt + data/lang_bpe_500/tokens.txt; load it with "
+            "architecture='transducer' (the dir sniffs as zipformer)"
+        ),
+    ),
+    Asset(
         env="WHISPER_CKPT",
         kind=CHECKPOINT,
         what="HF-format Whisper checkpoint",

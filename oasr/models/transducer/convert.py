@@ -88,8 +88,13 @@ class IcefallTransducerConverter(IcefallConverter):
             ) from None
         vocab, decoder_dim = int(emb_w.shape[0]), int(emb_w.shape[1])
         joiner_dim = int(joiner_out_w.shape[1])
-        conv_w = sd.get("decoder.conv.weight")  # (decoder_dim, 1, context_size)
+        # (decoder_dim, in_channels_per_group, context_size).  The group size is
+        # read, never assumed: it is 1 in the old `pruned_transducer_stateless2/3/5`
+        # recipes and 4 in every Zipformer one (`groups=decoder_dim // 4`), and
+        # assuming depthwise made every real release fail to load on this tensor.
+        conv_w = sd.get("decoder.conv.weight")
         context_size = int(conv_w.shape[-1]) if conv_w is not None else 1
+        conv_group_size = int(conv_w.shape[1]) if conv_w is not None else 1
         return TransducerModelConfig(
             encoder_type="zipformer",
             encoder=infer_encoder_config(sd),
@@ -99,6 +104,7 @@ class IcefallTransducerConverter(IcefallConverter):
             decoder_dim=decoder_dim,
             joiner_dim=joiner_dim,
             context_size=context_size,
+            decoder_conv_group_size=conv_group_size,
             blank_id=0,  # icefall convention: <blk> = 0
         )
 

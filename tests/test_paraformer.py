@@ -486,6 +486,41 @@ class TestFsmnDepthwiseFusion:
         assert FsmnBlock(16, 11, sanm_shift=2).fsmn_block.padding == (7, 3)
         assert SanmSelfAttention(2, 16, 16, 11, sanm_shift=3).fsmn_block.padding == (8, 2)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="kernel path requires CUDA")
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_sanm_self_attention_runs_on_the_kernel_path(self, dtype):
+        """The encoder block, in a served dtype, on the real strided ``v``.
+
+        ``test_matches_the_unfused_funasr_expression`` above runs on CPU in fp32
+        and exercises ``FsmnBlock``, whose input is already contiguous — so it
+        reaches neither the CUDA kernel nor the call site that broke.  This one
+        drives ``SanmSelfAttention``, where ``v`` is a last-dim slice of the
+        fused QKV projection with a row stride of ``3 * n_feat``, in fp16 and
+        bf16 on CUDA, which is the only configuration the defect appeared in:
+        every Paraformer request returned an empty transcript because the
+        depthwise launcher rejected that view.
+
+        ``_forward_fsmn`` owns the ``.contiguous()``; the layer asserts.  Drop
+        that call and this fails with the assertion, in both dtypes.
+        """
+        from oasr.layers import layers_backend_override
+        from oasr.models.paraformer.modules import SanmSelfAttention
+
+        torch.manual_seed(0)
+        n_head, n_feat, t = 4, 64, 23
+        block = SanmSelfAttention(n_head, n_feat, n_feat, kernel_size=11).cuda().to(dtype).eval()
+        x = torch.randn(2, t, n_feat, device="cuda", dtype=dtype)
+        mask = torch.ones(2, 1, t, device="cuda", dtype=torch.bool)
+        mask[1, :, t - 5 :] = False  # right padding, as the encoder supplies
+
+        with torch.inference_mode():
+            got = block(x, mask)
+            with layers_backend_override("torch"):
+                ref = block(x, mask)
+
+        assert torch.isfinite(got).all()
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

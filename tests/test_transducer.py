@@ -299,13 +299,49 @@ def _tiny_zipformer_transducer():
 def _to_icefall_sd(model):
     """OASR transducer state dict → icefall AsrModel layout (reverse of load).
 
-    Reverses both the key remap (``encoder.encoder_embed.*`` →
-    ``encoder_embed.*`` etc.) and the depthwise-conv weight transpose: OASR's
-    ``DepthwiseConv1d`` stores ``(K, 1, C)`` and its shape-gated
-    ``_load_from_state_dict`` hook converts icefall's ``(C, 1, K)`` on load.
+    Every ``_load_from_state_dict`` hook the load path applies has to be undone
+    here, or the fixture is not the icefall checkpoint it claims to be and the
+    round trip measures the hook against itself:
+
+    * the key remap (``encoder.encoder_embed.*`` → ``encoder_embed.*`` etc.);
+    * :class:`~oasr.layers.Conv2d`, which stores KRSC ``(K, R, S, C)`` against
+      torch's KCRS ``(K, C, R, S)``;
+    * ``Conv2dSubsampling.out``, whose input features are flattened
+      ``(frequency, channel)`` in the NHWC runtime layout and
+      ``(channel, frequency)`` in icefall's NCHW one;
+    * ``DepthwiseConv1d``, which stores ``(K, 1, C)`` against icefall's
+      ``(C, 1, K)``.
+
+    The fixture is saved as a plain ``dict``, so it reaches ``load_state_dict``
+    without ``_metadata`` — version 1, exactly like a real icefall export, which
+    is what arms the version-gated projection hook.
     """
+    from oasr.layers import Conv2d
+    from oasr.models.zipformer.subsampling import Conv2dSubsampling
+
+    nhwc_conv = {
+        f"{name}.weight"
+        for name, module in model.named_modules()
+        if isinstance(module, Conv2d) and module.weight.ndim == 4
+    }
+    projections = {
+        f"{name}.out.weight": (module.out_width, module.layer3_channels)
+        for name, module in model.named_modules()
+        if isinstance(module, Conv2dSubsampling)
+    }
+
     sd = {}
     for k, v in model.state_dict().items():
+        if k in nhwc_conv:
+            v = v.permute(0, 3, 1, 2).contiguous()  # KRSC -> KCRS
+        elif k in projections:
+            width, channels = projections[k]
+            v = (
+                v.view(v.shape[0], width, channels)  # (out, F, C) -> (out, C, F)
+                .transpose(1, 2)
+                .reshape_as(v)
+                .contiguous()
+            )
         ik = k[len("encoder.") :] if k.startswith("encoder.") else k
         if ik.endswith(("depthwise_conv.weight", "decoder.conv.weight")) and v.ndim == 3:
             v = v.permute(2, 1, 0).contiguous()
@@ -741,3 +777,194 @@ class TestTransducerBeamSearch:
         streamed = [s.hypotheses()[0][0] for s in per_stream]
         for b in range(B):
             assert streamed[b] == offline[b], f"stream/offline beam differ on row {b}"
+
+
+# --------------------------------------------------------------------------- #
+# Predictor conv group size
+# --------------------------------------------------------------------------- #
+
+
+class TestPredictorConvGroupSize:
+    """icefall's stateless predictor conv is grouped, not depthwise.
+
+    ``nn.Conv1d(C, C, context_size, groups=C // group_size)``: group size 1 in the
+    old ``pruned_transducer_stateless2/3/5`` recipes, **4** in every Zipformer one
+    (``zipformer``, ``pruned_transducer_stateless7``).  Modelling it as fully
+    depthwise made every real icefall release fail to load on that one tensor —
+    4x the parameters, so no permute recovers it — which is why the size is
+    carried in the config and read off the checkpoint rather than assumed.
+    """
+
+    @pytest.mark.parametrize("group_size", [1, 2, 4])
+    def test_matches_icefall_grouped_conv1d(self, group_size):
+        """The whole predictor, against icefall ``Decoder.forward`` verbatim.
+
+        Compared with a tolerance rather than ``torch.equal`` on purpose: this is
+        ``F.conv2d(groups=...)`` against ``F.conv1d(groups=...)``, two different
+        algorithm choices, and their summation order need not agree.  Measured on
+        this box, group sizes 1 and 4 come out bit-identical while 2 differs by
+        2.4e-07 on 6 of 80 elements — so exactness here is incidental to the
+        algorithm torch picks and is not the contract worth pinning.
+        """
+        import torch.nn.functional as F
+
+        torch.manual_seed(0)
+        vocab, dim, ctx = 32, 16, 2
+        dec = StatelessDecoder(vocab, dim, context_size=ctx, conv_group_size=group_size).eval()
+        # An icefall-layout weight for this group size, loaded through the hook.
+        w_ice = torch.randn(dim, group_size, ctx)
+        sd = dict(dec.state_dict())
+        sd["conv.weight"] = w_ice
+        dec.load_state_dict(sd)
+
+        y = torch.randint(0, vocab, (5, ctx))
+        with torch.inference_mode():
+            got = dec(y)
+            emb = F.embedding(y, dec.embedding.weight, padding_idx=0).permute(0, 2, 1)
+            ref = F.conv1d(emb, w_ice, groups=dim // group_size).permute(0, 2, 1)
+            ref = F.relu(ref)[:, -1, :]
+        torch.testing.assert_close(got, ref, rtol=1e-6, atol=1e-6)
+
+    def test_group_size_one_is_still_the_depthwise_layer(self):
+        """The default must not change which operator the old configs get."""
+        from oasr.layers import Conv2d, DepthwiseConv1d
+
+        assert isinstance(StatelessDecoder(8, 16, context_size=2).conv, DepthwiseConv1d)
+        assert isinstance(
+            StatelessDecoder(8, 16, context_size=2, conv_group_size=4).conv,
+            Conv2d,
+        )
+
+    def test_native_state_dict_round_trips_without_re_permuting(self):
+        """The hook is gated on the 3-D icefall layout, not applied blindly.
+
+        A native OASR checkpoint already holds the 4-D KRSC weight; re-permuting
+        it on load would corrupt a round trip that looks successful.
+        """
+        torch.manual_seed(0)
+        dec = StatelessDecoder(32, 16, context_size=2, conv_group_size=4).eval()
+        reloaded = StatelessDecoder(32, 16, context_size=2, conv_group_size=4).eval()
+        reloaded.load_state_dict(dec.state_dict())
+        for k, v in dec.state_dict().items():
+            assert torch.equal(v, reloaded.state_dict()[k]), k
+
+    def test_bad_group_size_rejected(self):
+        with pytest.raises(ValueError, match="divide decoder_dim"):
+            StatelessDecoder(8, 12, context_size=2, conv_group_size=5)
+
+
+# --------------------------------------------------------------------------- #
+# Real icefall checkpoint
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.requires_assets("TRANSDUCER_CKPT")
+class TestRealIcefallTransducer:
+    """The architecture's first real weights — see `.artifacts/known_issues.md` §3.
+
+    Everything else in this file runs on random weights, which structurally
+    cannot catch a converter that mis-reads a real export (the ``audio_scale``
+    class of bug) or a predictor whose operator is wrong.
+    """
+
+    @pytest.fixture(scope="class")
+    def bundle(self):
+        import assets
+
+        from oasr.models.registry import load_checkpoint_bundle
+
+        return load_checkpoint_bundle(assets.require("TRANSDUCER_CKPT"), architecture="transducer")
+
+    def test_config_is_inferred_from_the_weights(self, bundle):
+        _, b = bundle
+        cfg = b.model_config
+        assert (cfg.vocab_size, cfg.decoder_dim, cfg.joiner_dim, cfg.context_size) == (
+            500,
+            512,
+            512,
+            2,
+        )
+        # The field this checkpoint exists to pin: read, not assumed.
+        assert cfg.decoder_conv_group_size == 4
+        assert cfg.encoder_type == "zipformer"
+        assert cfg.encoder.num_encoder_layers == (2, 2, 3, 4, 3, 2)
+        assert cfg.encoder.encoder_dim == (192, 256, 384, 512, 384, 256)
+
+    def test_every_weight_loads(self, bundle):
+        from oasr.models.registry import instantiate_from_bundle
+
+        arch, b = bundle
+        _, _, report = instantiate_from_bundle(arch, b)
+        assert not report.missing
+        # Only the pruned-RNNT training heads are dropped.
+        assert {k.split(".")[0] for k in report.dropped} == {"simple_am_proj", "simple_lm_proj"}
+
+    def test_predictor_matches_icefall_verbatim(self, bundle):
+        """Bit-exact against ``icefall/.../decoder.py::Decoder.forward``.
+
+        The grouping convention is the thing at risk: get it wrong and decoding
+        degrades quietly instead of failing, because the shapes still line up.
+        Observed bit-identical with these weights, but asserted with a tolerance —
+        the two sides are different conv algorithms, so summation order is not
+        contractual (see ``test_matches_icefall_grouped_conv1d``).
+        """
+        import torch.nn.functional as F
+
+        from oasr.models.registry import instantiate_from_bundle
+
+        arch, b = bundle
+        model, cfg, _ = instantiate_from_bundle(arch, b)
+        model.eval()
+        w_ice = b.state_dict["decoder.conv.weight"]
+        emb_w = b.state_dict["decoder.embedding.weight"]
+        assert tuple(w_ice.shape) == (512, 4, 2)  # as shipped, before the hook
+
+        torch.manual_seed(0)
+        y = torch.randint(0, cfg.vocab_size, (7, cfg.context_size))
+        with torch.inference_mode():
+            got = model.decoder(y)
+            e = F.embedding(y, emb_w, padding_idx=0).permute(0, 2, 1)
+            e = F.conv1d(e, w_ice, groups=cfg.decoder_dim // cfg.decoder_conv_group_size)
+            ref = F.relu(e.permute(0, 2, 1))[:, -1, :]
+        torch.testing.assert_close(got, ref, rtol=1e-6, atol=1e-6)
+
+    @pytest.mark.slow
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
+    def test_engine_transcribes_real_audio_and_beam1_is_greedy(self):
+        """Also the gate that ``beam_size=1`` really is the greedy path.
+
+        Pinned on real weights because a random-weight model emits near-uniform
+        logits, where any tie-break ordering looks correct.
+        """
+        import assets
+        import torchaudio
+
+        from oasr.engine import ASREngine, EngineConfig
+
+        ckpt = assets.require("TRANSDUCER_CKPT")
+        wavs = assets.require_wavs(2)
+        audios = [torchaudio.load(w)[0].squeeze(0) for w in wavs]
+
+        def run(**opts):
+            eng = ASREngine(
+                EngineConfig(
+                    ckpt_dir=ckpt,
+                    architecture="transducer",
+                    service_mode="offline",
+                    dtype=torch.float16,
+                    max_batch_size=2,
+                    decode_options=opts,
+                )
+            )
+            try:
+                return eng.transcribe_offline(list(audios))
+            finally:
+                del eng
+                torch.cuda.empty_cache()
+
+        greedy = run()
+        assert "printing in the only sense with which we are at present concerned" in (
+            greedy[0].lower()
+        )
+        assert "in being comparatively modern" in greedy[1].lower()
+        assert run(beam_size=1) == greedy

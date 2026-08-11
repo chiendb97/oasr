@@ -43,6 +43,7 @@ SUITES: dict[str, list[str]] = {
         "tests/test_gemm_log_softmax.py",
         "tests/test_softmax.py",
         "tests/test_topk.py",
+        "tests/test_pooling.py",
         "tests/test_fft.py",
         "tests/test_cmvn.py",
         "tests/test_jit.py",
@@ -58,6 +59,10 @@ SUITES: dict[str, list[str]] = {
         "tests/test_ctc_decoder_fused_parity.py",
         "tests/test_wfst_decoder.py",
         "tests/test_decoder_kv.py",
+        # Word timings are per-decode-family (`oasr/engine/decode/{alignment,
+        # ctc_align,attention_align}.py`), so they fail with the family.
+        "tests/test_word_timings.py",
+        "tests/test_alignment_cpp.py",
     ],
     "features": [
         "tests/test_features.py",
@@ -80,6 +85,9 @@ SUITES: dict[str, list[str]] = {
         "tests/test_decoding_options.py",
         "tests/test_packing_encoder.py",
         "tests/test_vram_sizing.py",
+        # The Python client / `oasr` CLI: the request-and-response surface the
+        # engine is reached through, against a stub server rather than a GPU.
+        "tests/test_client.py",
     ],
     # Its own family so a WER regression is attributable at a glance rather than
     # buried in a model-family failure — and because it is the one suite whose

@@ -9,7 +9,7 @@ JIT compilation and a Rust HTTP/gRPC serving front-end.
 - User-facing overview and quick start: [`README.md`](README.md)
 - Stable technical documentation: [`docs/`](docs/README.md)
 - Point-in-time results, issues and investigations: a gitignored `.artifacts/`
-  working directory, never cited from here (see rule 11)
+  working directory, never cited from here (see rule 12)
 
 ---
 
@@ -38,34 +38,54 @@ JIT compilation and a Rust HTTP/gRPC serving front-end.
 7. **Never read a gating environment variable directly in a test.** Declare the
    asset in `tests/assets.py` and gate through `assets.require(...)` /
    `@pytest.mark.requires_assets(...)`, so every skip is counted and reported.
-8. **Per-decode-family knobs go on the strategy's `options_cls`, not on
+8. **Run the tests and the benchmarks with the checkpoints exported.** Start every
+   session with `set -a; source .env; set +a` (copy `.env.example` if you have no
+   `.env`); every command in this file assumes it. The dangerous half is silent:
+   without the assets the real-checkpoint tests **skip** and the suite still exits
+   0, so a green run says nothing about the architecture you changed. A benchmark
+   is louder — it refuses (`--ckpt-dir is required`) — but its *sizing* comes from
+   `.env` too (`$NUM_UTTERANCES`, `$MAX_BATCH_SIZE`, `$CONCURRENCY`, `$CHUNK_MS`
+   are argparse defaults), so a missing one changes the measurement without
+   saying so. Then *read* the `external assets:` table pytest prints at the end of
+   the run: the asset covering your change must say `ok`, not `MISSING`. Use
+   `--strict-assets` to make a missing one fail instead of skip. A kernel, layer
+   or model change is not validated until it has been run this way.
+9. **Per-decode-family knobs go on the strategy's `options_cls`, not on
    `EngineConfig`.** Engine-level knobs (tick budget, decode slots, KV budget)
    stay on `EngineConfig`. Per-*request* knobs go on `DecodingOptions`, and one
    that changes *what is decoded* or that a caller will look for in the response
    must be declared (`selective_options` / `word_timing_modes`) so a family
    without it rejects rather than ignores.
-9. **Never pass `-inf` as `attn_bias`.** Use a large finite mask floor —
-   mathematically identical, and the fused kernel is inaccurate above a
-   moderate finite bias magnitude.
-10. **Never branch kernel dispatch on CUDA-graph capture state.** A
+10. **Never pass `-inf` as `attn_bias`.** Use a large finite mask floor —
+    mathematically identical, and the fused kernel is inaccurate above a
+    moderate finite bias magnitude.
+11. **Never branch kernel dispatch on CUDA-graph capture state.** A
     capture-dependent branch makes the graph pick a different kernel than eager,
     and the resulting one-ulp difference has changed decoded tokens.
-11. **Keep transient material out of `CLAUDE.md` and `README.md`, and do not
+12. **Keep transient material out of `CLAUDE.md` and `README.md`, and do not
     cite `.artifacts/` from them.** Benchmark numbers, known issues,
     investigations and experiment results go in the gitignored `.artifacts/`;
     a fresh clone does not have those files, so a pointer to one is a dead link.
-12. **Do not commit or push unless asked.** Create the branch and the files, then
+13. **Do not commit or push unless asked.** Create the branch and the files, then
     hand off.
 
 ---
 
 ## Common commands
 
+Every test and benchmark row below assumes the checkpoints are exported first
+(rule 8). `pytest` does **not** read `.env` itself.
+
+```bash
+set -a; source .env; set +a          # cp .env.example .env first, and edit the paths
+```
+
 | Task | Command |
 |---|---|
 | Editable install | `pip install -e .` |
 | Install everything | `pip install -e ".[all]"` |
 | Run all Python tests | `pytest tests/` |
+| Run them the way CI does | `pytest $(python ci/gpu_suites.py --paths <family>) --strict-assets` (`--list` for the family names) |
 | One test file / function | `pytest tests/test_conv.py::TestDepthwiseConv1D -v` |
 | Skip slow tests | `pytest tests/ -m "not slow"` |
 | Engine concurrency stress (opt-in) | `pytest tests/test_engine_concurrent.py -m concurrent -v` |
@@ -79,7 +99,9 @@ JIT compilation and a Rust HTTP/gRPC serving front-end.
 | Transcribe (server / in-process) | `oasr transcribe audio.mp3` · `oasr transcribe audio.mp3 --ckpt-dir <dir>` |
 | Word timestamps | `oasr transcribe audio.mp3 --response-format verbose_json --timestamp-granularity word` |
 | Kernel benchmark | `python benchmarks/oasr_benchmark.py --list` |
-| Engine / service / accuracy benchmark | `python benchmarks/bench_{engine,service,accuracy}.py` |
+| Engine / service / accuracy benchmark | `python benchmarks/bench_{engine,service,accuracy}.py` — flags default from `.env` |
+| WER for one architecture | `python benchmarks/bench_accuracy.py --ckpt-dir $CKPT_DIR --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR` |
+| …for an explicit-only one | as above with `--ckpt-dir $TRANSDUCER_CKPT --architecture transducer` |
 
 ---
 
@@ -247,7 +269,18 @@ extension cookbook for each axis.
 - **Assuming a green `pytest tests/` means full coverage.** Without the external
   assets, real-checkpoint tests skip. Every run prints an `external assets:`
   table naming what it did *not* cover; `--strict-assets` makes a missing asset
-  fatal.
+  fatal. This is not hypothetical: a fused-mask kernel shipped green and left
+  **every** Paraformer request returning an empty transcript at both fp16 and
+  bf16, because the validating shell had no `$OASR_PARAFORMER_CKPT` and the only
+  tests that touch the real call site skipped. That is what rule 8 is for.
+- **Validating a kernel change with an fp32 parity oracle alone.** `fp32` and CPU
+  route to torch (`use_conv_kernel`), so a *launcher precondition* — contiguity,
+  alignment, a dtype dispatch — is never reached. A new fused op needs a test in
+  a **served dtype** (fp16/bf16, on CUDA) that reaches the launcher.
+- **Benchmarking an explicit-only architecture without naming it.** An icefall
+  pruned-RNNT dir sniffs as `zipformer`, so `--ckpt-dir $TRANSDUCER_CKPT` alone
+  measures a different branch of the same checkpoint or fails outright. Pass
+  `--architecture transducer` (`EngineConfig.architecture`).
 - **Trusting a single-order A/B.** Interleave the arms — the second one benefits
   from a warm allocator. Report a σ, not one run.
 - **Optimizing GPU time at small batch.** The encoders are CPU-issue-bound at
@@ -335,15 +368,23 @@ extension cookbook for each axis.
    `ci/wer-reference.json`.
 5. Run locally, in this order:
    ```bash
+   set -a; source .env; set +a          # rule 8 — without this the real-checkpoint tests skip
    black oasr/ tests/ benchmarks/ scripts/ ci/ && isort oasr/ tests/ benchmarks/ scripts/ ci/
    ruff check oasr/ tests/ benchmarks/ scripts/ ci/
    python scripts/mypy_ratchet.py
+   python ci/gpu_suites.py --check      # a new test file in no family never runs on the matrix
    pytest tests/ -m "not slow"
    cd rust && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
    ```
    `mypy` and `cargo test` are deliberately **not** pre-commit hooks — too slow
    for a commit. Run them before opening a PR, or let CI do it.
-6. Record any measurements in `.artifacts/`, not in `AGENTS.md` or `README.md`.
+6. **Check the `external assets:` table at the end of the pytest run**, not just
+   the pass count. If the asset covering your change reads `MISSING`, the tests
+   that would have exercised it skipped and you have not tested your change. Add
+   `--strict-assets` to make that a failure. If your change touches an
+   architecture, also measure it: `bench_accuracy.py` against that
+   architecture's checkpoint, compared with `ci/wer-reference.json`.
+7. Record any measurements in `.artifacts/`, not in `AGENTS.md` or `README.md`.
 
 Style: Python is 100 characters (black + isort's black profile). C++ is Google
 style, 100 characters, C++17. CUDA flags include `--expt-relaxed-constexpr`,
@@ -377,6 +418,15 @@ is not a usable checkpoint). Flags: `--strict-assets` (missing asset ⇒ failure
 `--allow-missing-asset NAME` (documented exception), `--min-passed N` (coverage
 floor).
 
+**Supplying them is on you, per rule 8.** `pytest` never reads `.env`; the paths
+reach it only from the environment, so `set -a; source .env; set +a` is part of
+running the suite rather than an optimisation. A run without it still exits 0 —
+that is the whole hazard. CI passes `--strict-assets` for exactly this reason and
+names each genuinely-absent asset with `--allow-missing-asset`, so a gap lives in
+the workflow file instead of hiding in a skip. Adding an architecture means
+adding its checkpoint to `tests/assets.py` **and** to `.env.example`, so the next
+person can run what you ran.
+
 Three gates matter beyond the unit tests:
 
 | Gate | File | Checks |
@@ -403,8 +453,12 @@ not a zero-error gate (`--update` after a cleanup). Full detail:
 
 ## Benchmarking
 
-Three harnesses, all with defaults from `.env` (copy `.env.example`, edit, then
-`set -a; source .env; set +a`):
+Four harnesses. All of them take their checkpoint, corpus **and sizing** defaults
+from `.env` (copy `.env.example`, edit the paths, then
+`set -a; source .env; set +a` — rule 8). A missing `$CKPT_DIR` stops the run, but a
+missing `$NUM_UTTERANCES` or `$MAX_BATCH_SIZE` does not: it silently measures a
+different working point than the number you are comparing against, which is the
+same trap as an unsourced test run wearing a different hat.
 
 | Harness | Measures |
 |---|---|

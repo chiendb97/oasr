@@ -9,14 +9,29 @@ exactly the noise the perf work fights), its GPU has fallen off the bus before
 in a way only a *host* reset recovers, and a public repo plus a self-hosted
 runner is a bad combination the day anyone adds a `pull_request` trigger.
 
-    # one-time, from a machine that has the checkpoints
-    modal run ci/modal_app.py::seed_assets
+    # every family, on the default GPU, needing no external input
+    modal run ci/modal_app.py::main
 
-    # everything, on the default GPU
-    modal run ci/modal_app.py
+    # one family, on a different SM
+    OASR_MODAL_GPU=H100 modal run ci/modal_app.py::main --suites kernels
 
-    # one family, non-strict, on a different SM
-    OASR_MODAL_GPU=H100 modal run ci/modal_app.py --suites kernels --no-strict
+    # the checkpoint-backed half, once the Volume has been seeded (~29 GiB)
+    modal run ci/modal_app.py::seed_assets       # one-time, from a box with them
+    modal run ci/modal_app.py::main --assets
+
+    # a shell on the same image, to debug a suite that only fails up there
+    modal shell ci/modal_app.py::run_suite
+
+``::main`` is not optional.  This file defines two local entrypoints, and
+``modal run`` on a file with more than one refuses to pick: bare
+``modal run ci/modal_app.py`` exits with "Specify a Modal Function or local
+entrypoint to run" before it reaches a GPU.
+
+`--assets` is off by default.  Without it no asset env var is set, every
+checkpoint- and audio-gated test skips, and what runs is the coverage that needs
+only a GPU: the kernels, the layer waist, the JIT, the schedulers and the decode
+plumbing on synthetic weights.  That is the half of the suite a rented GPU can
+run on day one; the other half is a seeded Volume away.
 
 The GPU default is **RTX-PRO-6000**: it is the GB202 die at compute capability
 12.0, the same sm_120 as the RTX 5090 this project is tuned for.  Every other
@@ -34,19 +49,36 @@ from pathlib import Path
 
 import modal
 
-CI_DIR = Path(__file__).resolve().parent
-REPO_ROOT = CI_DIR.parent
+REPO_REMOTE = "/repo"
+
+# This module is imported in two places, and only one of them is a checkout.
+# Locally `modal run` imports ci/modal_app.py and `__file__` locates the repo.
+# In the container Modal re-imports it as **/root/modal_app.py** — a bare file,
+# not a package, so the ci/ + tests/ layout around it is gone and
+# `Path(__file__).parent.parent` is `/`.  The repo is at REPO_REMOTE there,
+# copied in by `add_local_dir` below.  Resolve from whichever one exists rather
+# than from `__file__`, or the container import dies before the app is built.
+REPO_ROOT = (
+    Path(REPO_REMOTE)
+    if (Path(REPO_REMOTE) / "ci" / "gpu_suites.py").is_file()
+    else Path(__file__).resolve().parent.parent
+)
+CI_DIR = REPO_ROOT / "ci"
 sys.path.insert(0, str(CI_DIR))
+sys.path.insert(0, str(REPO_ROOT / "tests"))
+import assets as test_assets  # noqa: E402  — both need the sys.path lines above
 from gpu_suites import DEFAULT_MARKER_EXPR, SUITES, paths_for  # noqa: E402
 
 APP_NAME = "oasr-gpu-ci"
-REPO_REMOTE = "/repo"
 ASSETS_MOUNT = "/assets"
 JIT_MOUNT = "/root/.cache/oasr/jit"
 
 # sm_120 (GB202) — same compute capability as the RTX 5090 the kernels target.
 # Override for a second-SM run: OASR_MODAL_GPU=H100 modal run ...
-GPU = os.environ.get("OASR_MODAL_GPU", "RTX-PRO-6000")
+# `or` rather than a get() default: the workflow passes this through from a
+# dispatch input, and an unfilled input arrives as the empty string, which
+# get() treats as a value and Modal then rejects as an accelerator.
+GPU = os.environ.get("OASR_MODAL_GPU") or "RTX-PRO-6000"
 
 # The CMake extension is built at *image build time*, where there is no GPU, so
 # setup.py's torch-based arch detection cannot see one and falls back to 80-90.
@@ -56,24 +88,22 @@ CUDA_ARCHITECTURES = os.environ.get("OASR_MODAL_CUDA_ARCH", "120")
 # Must be a torch build with sm_120 support (CUDA 12.8 or newer).
 TORCH_INDEX = os.environ.get("OASR_MODAL_TORCH_INDEX", "https://download.pytorch.org/whl/cu128")
 
-#: Where each declared asset lands inside the container.  The *names* are the
-#: env vars from tests/assets.py — that module stays the single source of truth
-#: for what an asset is; this is only the layout of the Volume.
+#: Where each declared asset lands inside the container, **derived** from
+#: tests/assets.py rather than restated here.  ``Asset.relpath`` already *is*
+#: the reference layout (see that module's "Where the paths come from"), so a
+#: second copy is a copy that drifts: it did, the run after an architecture was
+#: added — the new checkpoint had a declaration, a slot and an `.env.example`
+#: line, and every suite that needed it still skipped, which `--strict-assets`
+#: then turned into a red run naming an asset the Volume was never told about.
+#: An asset with no ``relpath`` has no root-relative slot and is not seedable.
 ASSET_LAYOUT: dict[str, str] = {
-    "CKPT_DIR": "u2pp_conformer",
-    "WAV_DIR": "wavs",
-    "ZIPFORMER_CKPT": "zipformer_ctc",
-    "WHISPER_CKPT": "whisper_tiny",
-    "OASR_PARAFORMER_CKPT": "paraformer_zh",
-    "SPEECH_LLM_TINY": "qwen2_audio_tiny",
-    "SPEECH_LLM_CKPT": "qwen2_audio_7b",
-    "NEMOTRON_CKPT": "nemotron_asr_streaming_0.6b",
-    "OASR_TEST_FST": "lang_bpe/HLG.pt",
+    asset.env: asset.relpath for asset in test_assets.ASSETS.values() if asset.relpath
 }
 
-#: Assets the Volume is not expected to hold: upstream *source trees* used only
-#: by parity oracles, and the k2 lang dir.  Named here so --strict-assets stays
-#: on for everything else rather than being switched off wholesale.
+#: Assets the Volume is not expected to hold *even when it is seeded*: upstream
+#: source trees used only by parity oracles, and the k2 lang dir.  Named here so
+#: --strict-assets stays on for everything else rather than being switched off
+#: wholesale.
 ALLOW_MISSING = ("WENET_REF_DIR", "ICEFALL_ZIPFORMER_DIR", "LANG_DIR")
 
 app = modal.App(APP_NAME)
@@ -86,7 +116,22 @@ jit_vol = modal.Volume.from_name("oasr-ci-jit-cache", create_if_missing=True)
 image = (
     # -devel, not -runtime: the JIT shells out to nvcc at run time.
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.12")
-    .apt_install("git", "curl", "build-essential", "cmake", "ninja-build", "protobuf-compiler")
+    .apt_install(
+        "git",
+        "curl",
+        "build-essential",
+        "cmake",
+        "ninja-build",
+        "protobuf-compiler",  # tonic's build.rs compiles rust/proto/*.proto
+        # openssl-sys is the one crate in the oasr-core tree that links a system
+        # library, and it needs both: the headers, and pkg-config to locate them
+        # ("Could not find directory of OpenSSL installation").  It arrives via
+        # oasr-serve -> metrics-exporter-prometheus -> hyper-tls -> native-tls,
+        # so nothing in this repo names it and a base image without it fails
+        # only at the very end, in the Rust half of `pip install -e .`.
+        "pkg-config",
+        "libssl-dev",
+    )
     # setuptools-rust builds the oasr._core PyO3 extension during pip install.
     .run_commands(
         "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal",
@@ -146,7 +191,18 @@ image = (
 
 
 def _asset_env() -> dict[str, str]:
-    return {name: f"{ASSETS_MOUNT}/{rel}" for name, rel in ASSET_LAYOUT.items()}
+    """Asset env vars as the container sees them.  Evaluated *remotely*."""
+    env = {name: f"{ASSETS_MOUNT}/{rel}" for name, rel in ASSET_LAYOUT.items()}
+    # AUDIO_PATH is the one asset with no slot of its own: it is "some wav out
+    # of WAV_DIR", a thing to pick rather than a thing to seed — which is what
+    # tests/assets.py tells a human to do (`ls $WAV_DIR/*.wav | head -1`).  Left
+    # unpicked it is simply unset in the container, and --strict-assets turns
+    # that into a failed suite over a file the Volume already holds.  Sorted, so
+    # every suite in a run agrees on which wav that is.
+    wavs = sorted(Path(env["WAV_DIR"]).glob("*.wav")) if "WAV_DIR" in env else []
+    if wavs:
+        env["AUDIO_PATH"] = str(wavs[0])
+    return env
 
 
 @app.function(
@@ -155,12 +211,21 @@ def _asset_env() -> dict[str, str]:
     timeout=3600,
     volumes={ASSETS_MOUNT: assets_vol, JIT_MOUNT: jit_vol},
 )
-def run_suite(name: str, strict: bool = True, extra: str = "") -> str:
-    """Run one family from ci/gpu_suites.py.  Raises on failure."""
-    env = {**os.environ, **_asset_env(), "OASR_JIT_DIR": JIT_MOUNT}
+def run_suite(name: str, strict: bool = True, extra: str = "", assets: bool = True) -> str:
+    """Run one family from ci/gpu_suites.py.  Raises on failure.
+
+    ``assets=False`` runs the suite with the Volume unused: no asset env var is
+    set, so every checkpoint- and audio-gated test skips and what is left is the
+    kernel / layer / plumbing coverage that needs only a GPU.  ``strict`` stays
+    meaningful there — the allow-list simply widens to every declared asset, so
+    the run still *names* what it did not cover instead of turning the gate off.
+    """
+    env = {**os.environ, "OASR_JIT_DIR": JIT_MOUNT}
+    if assets:
+        env.update(_asset_env())
 
     subprocess.run(["nvidia-smi"], check=False)
-    print(f"[modal] suite={name} gpu={GPU} strict={strict}", flush=True)
+    print(f"[modal] suite={name} gpu={GPU} strict={strict} assets={assets}", flush=True)
 
     cmd = [
         "python",
@@ -175,7 +240,8 @@ def run_suite(name: str, strict: bool = True, extra: str = "") -> str:
     ]
     if strict:
         cmd.append("--strict-assets")
-        for missing in ALLOW_MISSING:
+        allowed = ALLOW_MISSING if assets else tuple(test_assets.ASSETS)
+        for missing in allowed:
             cmd += ["--allow-missing-asset", missing]
     if extra:
         cmd += extra.split()
@@ -189,21 +255,29 @@ def run_suite(name: str, strict: bool = True, extra: str = "") -> str:
 
 
 @app.local_entrypoint()
-def main(suites: str = "", strict: bool = True, extra: str = ""):
+def main(suites: str = "", strict: bool = True, extra: str = "", assets: bool = False):
     """Run one, several, or all families concurrently.
 
     ``--suites`` is a comma-separated list of names from ci/gpu_suites.py;
     empty means all of them.
+
+    ``--assets`` reads the checkpoints and audio out of the ``oasr-ci-assets``
+    Volume and is **off by default**, because the Volume has to be seeded first
+    (``seed_assets``, ~29 GiB) and a run against an empty one under
+    ``--strict-assets`` fails on every gated test rather than skipping it.  Off,
+    this is the GPU coverage that needs no external input; on, it is the whole
+    suite.  Turn it on once ``seed_assets`` has run.
     """
     names = [s.strip() for s in suites.split(",") if s.strip()] or list(SUITES)
     unknown = [n for n in names if n not in SUITES]
     if unknown:
         raise SystemExit(f"unknown suite(s): {unknown}; known: {list(SUITES)}")
 
-    print(f"[modal] launching {len(names)} suite(s) on {GPU}: {', '.join(names)}")
+    scope = "with checkpoints" if assets else "no checkpoints (kernels/plumbing only)"
+    print(f"[modal] launching {len(names)} suite(s) on {GPU}, {scope}: {', '.join(names)}")
     results = list(
         run_suite.starmap(
-            [(n, strict, extra) for n in names],
+            [(n, strict, extra, assets) for n in names],
             return_exceptions=True,
         )
     )
@@ -224,19 +298,15 @@ def seed_assets(dry_run: bool = False):
 
     Run once from a machine that has them.  Source paths come from the same
     env vars the test suite reads (see tests/assets.py), so a box already set
-    up for a local GPU run needs no extra configuration:
+    up for a local GPU run needs no extra configuration beyond `.env`:
 
         set -a; source .env; set +a
-        export WAV_DIR="$AUDIO_DIR"
-        export ZIPFORMER_CKPT=/path/to/icefall-...-zipformer-large-cr-ctc-...
+        modal run ci/modal_app.py::seed_assets --dry-run   # check the plan
         modal run ci/modal_app.py::seed_assets
 
-    Roughly 23 GiB in total, dominated by Qwen2-Audio-7B at 16 GiB.  Re-running
+    Roughly 29 GiB in total, dominated by Qwen2-Audio-7B at 16 GiB.  Re-running
     overwrites in place, so it is safe to use for a single refreshed asset.
     """
-    sys.path.insert(0, str(REPO_ROOT / "tests"))
-    import assets as test_assets  # noqa: PLC0415  — needs the sys.path line above
-
     plan, missing = [], []
     for name, rel in ASSET_LAYOUT.items():
         src = test_assets.resolve(name)

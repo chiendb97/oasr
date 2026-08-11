@@ -129,6 +129,7 @@ class ASREngine:
             checkpoint_name=config.checkpoint_name,
             device=device_str,
             dtype=dtype,
+            architecture=config.architecture,
         )
         model, model_config = loaded.model, loaded.config
         self._model = model

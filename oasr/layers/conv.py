@@ -294,8 +294,29 @@ class DepthwiseConv1d(nn.Module):
 
         With ``mask`` and ``add_input=True`` this computes exactly
         ``(conv(x * mask) + x * mask) * mask`` in one CUDA kernel.
+
+        The kernel path requires contiguous operands and **asserts** rather than
+        copying: a model that reaches here with a strided view is doing a
+        transient copy either way, and the copy belongs at the call site that
+        created the view, where its cost is visible.  ``csrc/conv.cu``'s
+        ``check_depthwise_conv1d`` enforces the same contract one layer down;
+        these asserts only fire earlier and name the fix.
         """
         if use_conv_kernel(x):
+            # A last-dim slice of a fused QKV projection is the case that gets
+            # here: last-dim contiguous, row stride a multiple of the channel
+            # count.  See ``oasr/models/paraformer/modules.py``, which calls
+            # ``.contiguous()`` for exactly this reason.
+            assert x.is_contiguous(), (
+                f"DepthwiseConv1d needs a contiguous input on the kernel path, got "
+                f"shape={tuple(x.shape)} strides={x.stride()}; call .contiguous() at "
+                f"the call site (a last-dim slice of a fused projection is the usual cause)"
+            )
+            assert mask is None or mask.is_contiguous(), (
+                f"DepthwiseConv1d needs a contiguous mask on the kernel path, got "
+                f"shape={tuple(mask.shape)} strides={mask.stride()}"  # type: ignore[union-attr]
+                f"; call .contiguous() at the call site"
+            )
             return oasr.depthwise_conv1d(
                 x,
                 self.weight,

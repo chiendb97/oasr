@@ -655,7 +655,20 @@ class TestFrontendGeometry:
             # The last frame needs right context and arrives with the engine's
             # finalize silence pad, so streaming is one short mid-stream.
             assert m >= n_valid - 1
-            torch.testing.assert_close(got[:m], offline[0, :m], rtol=0, atol=0)
+            # Tolerance, not equality: the offline side is one STFT over the whole
+            # utterance and the streaming side is many short ones, so the mel
+            # matmul is a differently-shaped reduction on each and their summation
+            # order need not agree.  On CPU the split also depends on the intra-op
+            # thread count, i.e. on how many cores the runner happens to have —
+            # this assertion was `rtol=0, atol=0` and passed locally and on one
+            # GitHub runner while failing on the next by 9.5e-07.
+            #
+            # 1e-4 is chosen against the thing the test exists to catch: a drift
+            # in the framing grid.  Measured on this input, one frame of
+            # misalignment moves a value by 0.98 on average and 10.2 at worst,
+            # four orders of magnitude above the arithmetic noise, so the bound
+            # sits ~100x above the noise and ~10,000x below a real drift.
+            torch.testing.assert_close(got[:m], offline[0, :m], rtol=1e-4, atol=1e-4)
 
     def test_feature_spec_round_trips_and_maps(self):
         from oasr.features import FeatureSpec

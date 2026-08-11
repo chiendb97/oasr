@@ -15,12 +15,30 @@ name: test-gpu-modal
 # ---------------------------------------------------------------------------
 #   1. `pip install modal && modal token new`
 #   2. Repo Settings -> Secrets -> Actions: MODAL_TOKEN_ID, MODAL_TOKEN_SECRET
-#   3. Seed the checkpoints into the Volume, from a box that has them (~23 GiB):
+#
+# That is the whole of it.  The `checkpoints` input is **off** by default, and
+# off this workflow needs no Volume, no upload and no external file: no asset
+# env var is set, every checkpoint- and audio-gated test skips, and what runs is
+# the coverage a bare GPU can produce — kernels, the layer waist, the JIT, the
+# schedulers, decode plumbing on synthetic weights.  `--strict-assets` stays on
+# either way; with checkpoints off the allow-list simply widens to every
+# declared asset, so a run still reports what it did not cover.
+#
+# ---------------------------------------------------------------------------
+# Setup (later, to also run the checkpoint-backed half)
+# ---------------------------------------------------------------------------
+#   3. Seed the checkpoints into the Volume, from a box that has them (~29 GiB,
+#      dominated by Qwen2-Audio-7B at 16 GiB):
 #        set -a; source .env; set +a
-#        export WAV_DIR="$AUDIO_DIR"
-#        export ZIPFORMER_CKPT=/path/to/icefall-...-zipformer-large-cr-ctc-...
 #        modal run ci/modal_app.py::seed_assets --dry-run   # check the plan
 #        modal run ci/modal_app.py::seed_assets
+#      `.env` is the whole configuration: seeding reads the same per-asset env
+#      vars the suite gates on, and the slots come from `Asset.relpath` in
+#      tests/assets.py, so adding a checkpoint there seeds it here with no edit
+#      to ci/modal_app.py.  Re-running overwrites in place, so a single
+#      refreshed asset is just another `seed_assets`.
+#   4. Dispatch with `checkpoints: true` (and flip the default below once the
+#      Volume is seeded, so the weekly run covers them too).
 #
 # Costs GPU-minutes per run, so this is dispatch + weekly rather than per-push.
 # Point it at a PR by dispatching with the branch selected.
@@ -36,8 +54,13 @@ on:
         description: "Modal accelerator (RTX-PRO-6000 is sm_120, matching the 5090)"
         required: false
         default: "RTX-PRO-6000"
+      checkpoints:
+        description: "Also run the checkpoint/audio tests (needs the seeded Volume — see the header)"
+        type: boolean
+        required: false
+        default: false
       strict:
-        description: "Fail instead of skipping when a checkpoint is missing"
+        description: "Fail instead of skipping when an expected asset is missing"
         type: boolean
         required: false
         default: true
@@ -74,8 +97,13 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # pytest as well as modal: `modal run` *imports* ci/modal_app.py here, on
+      # the runner, to build the app graph, and that module derives the Volume
+      # layout from tests/assets.py, which imports pytest for its skip site.  So
+      # this box needs it even though it never runs a test — the container has
+      # its own pinned copy.  Nothing else the module imports is outside stdlib.
       - name: Install the Modal client
-        run: pip install modal
+        run: pip install modal pytest
 
       # ci/gpu_suites.py is the shared source of truth for the family split;
       # fail here rather than silently not running a new test file.
@@ -92,6 +120,16 @@ jobs:
           if [ "${{ github.event.inputs.strict }}" = "false" ]; then
             strict_flag="--no-strict"
           fi
-          modal run ci/modal_app.py \
+          # Off unless explicitly asked for: `github.event.inputs` is empty on
+          # the schedule trigger, so the cron run is the no-checkpoint one until
+          # the Volume is seeded and this default is flipped.
+          assets_flag="--no-assets"
+          if [ "${{ github.event.inputs.checkpoints }}" = "true" ]; then
+            assets_flag="--assets"
+          fi
+          # `::main` is not optional: the file also defines the `seed_assets`
+          # entrypoint, and `modal run` on a file with more than one refuses to
+          # guess ("Specify a Modal Function or local entrypoint to run").
+          modal run ci/modal_app.py::main \
             --suites "${{ github.event.inputs.suites }}" \
-            $strict_flag
+            $strict_flag $assets_flag

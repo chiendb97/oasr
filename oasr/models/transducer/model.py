@@ -98,7 +98,11 @@ class TransducerModel(BaseAsrModel):
         vocab = config.vocab_size
         assert vocab is not None, "TransducerModelConfig.vocab_size must be set"
         decoder = StatelessDecoder(
-            vocab, config.decoder_dim, blank_id=config.blank_id, context_size=config.context_size
+            vocab,
+            config.decoder_dim,
+            blank_id=config.blank_id,
+            context_size=config.context_size,
+            conv_group_size=config.decoder_conv_group_size,
         )
         joiner = TransducerJoiner(enc_dim, config.decoder_dim, config.joiner_dim, vocab)
         return cls(encoder, decoder, joiner, blank_id=config.blank_id)

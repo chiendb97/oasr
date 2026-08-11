@@ -69,6 +69,7 @@ from oasr.testing.wer import Result, compute, normalizer  # noqa: E402
 CSV_COLUMNS = [
     "manifest",
     "ckpt",
+    "architecture",
     "decode_method",
     "service_mode",
     "chunk_size",
@@ -95,6 +96,7 @@ CSV_COLUMNS = [
 class Row:
     manifest: str
     ckpt: str
+    architecture: str
     decode_method: str
     service_mode: str
     chunk_size: int
@@ -247,6 +249,7 @@ def run_one(
     entries: Sequence[Entry],
     *,
     ckpt_dir: str,
+    architecture: Optional[str],
     decode_method: Optional[str],
     service_mode: str,
     chunk_size: Optional[int],
@@ -271,6 +274,11 @@ def run_one(
         "dtype": torch_dtype,
         "max_batch_size": max_batch_size,
     }
+    # Only for an explicit-only converter (``transducer``): an icefall RNN-T dir
+    # sniffs as ``zipformer``, so without this the sweep silently measures the
+    # CTC branch — or fails on a transducer-only export.
+    if architecture:
+        cfg_kwargs["architecture"] = architecture
     if decode_method:
         cfg_kwargs["decode_method"] = decode_method
     # Only forward a chunk size when asked for one: the engine's default is
@@ -317,6 +325,7 @@ def run_one(
     return Row(
         manifest=manifest_name,
         ckpt=Path(ckpt_dir).name,
+        architecture=architecture or "(detected)",
         decode_method=decode_method or "(model default)",
         service_mode=service_mode,
         chunk_size=effective_chunk,
@@ -362,6 +371,13 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     p.add_argument("--ckpt-dir", default=_envstr("CKPT_DIR", None), metavar="DIR")
+    p.add_argument(
+        "--architecture",
+        metavar="NAME",
+        help="Force a registered architecture instead of checkpoint detection. "
+        "Needed for `transducer`, whose converter is explicit-only because an "
+        "icefall pruned-RNNT dir sniffs as `zipformer`.",
+    )
     p.add_argument("--manifest", metavar="FILE", help="JSON Lines {id, audio, text}")
     p.add_argument(
         "--audio-root",
@@ -485,6 +501,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         row = run_one(
                             entries,
                             ckpt_dir=args.ckpt_dir,
+                            architecture=args.architecture,
                             decode_method=method or None,
                             service_mode=mode,
                             chunk_size=chunk or None,
