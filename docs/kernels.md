@@ -33,6 +33,7 @@ Python functional API (oasr/<family>.py)  — @oasr_api decorated
 | `include/oasr/activation.cuh` + `activation_dispatch.inc` | GLU, Swish, with VecSize dispatch |
 | `include/oasr/norm.cuh` + `norm_dispatch.inc` | LayerNorm, RMSNorm, BatchNorm1d, GroupNorm, fused norm+activation |
 | `include/oasr/conv/` | `conv1d.cuh` + `conv1d_dispatch.inc` (depthwise with asymmetric padding and optional FSMN mask/residual fusion, pointwise, causal); dense BTC Conv1D is the height-one specialization of the `conv2d.cuh` CUTLASS facade |
+| `include/oasr/pooling.cuh` | BTC AvgPool1D; vectorized 2×2 production specialization plus generic padding/ceil/count semantics |
 | `include/oasr/gemm/` | `gemm.cuh` facade, `bmm.cuh`, `group_gemm.cuh` |
 | `include/oasr/{softmax,topk,fft,features,reduction}.cuh`, `sort/` | The remaining families |
 | `include/oasr/ctc_decoder.cuh`, `include/oasr/wfst/` | GPU decoder kernels |
@@ -73,6 +74,7 @@ VecSize / block_size dispatch macros instead.
 | Grouped / depthwise Conv2D | **direct** | `grouped_conv2d.cuh` | NHWC 3×3/7×7 specializations; bias and optional activation share the convolution launch |
 | Norm | **dispatch** | `norm_dispatch.inc` | Direct compilation, block/vec macro |
 | Activation | **dispatch** | `activation_dispatch.inc` | Direct compilation, VecSize macro |
+| Pooling | **direct** | `pooling.cuh` | 128-bit channel vectors in BTC layout; specialized 2×2 and generic launches |
 
 - **JIT mode** (`OASR_TARGET_SM` defined): a single SM instantiation, with an
   optional `JitGemmConfig` / `JitConv2dConfig` passed via `-D` flags.
@@ -99,7 +101,7 @@ SM targets default to 70, 75, 80, 86, 89, 90, 100, 120 in `CMakeLists.txt`;
 | `oasr/jit/core.py` | `JitSpec` (static sources) and `JinjaJitSpec` (Jinja-rendered), `gen_jit_spec()`, `gen_jinja_jit_spec()`, `build_and_load()` |
 | `oasr/jit/templates.py` | Jinja2 rendering (`get_template_env()`, `render_template()`) |
 | `oasr/jit/env.py` | Path constants (`OASR_TEMPLATE_DIR`, `OASR_GEN_SRC_DIR`), nvcc flags, `cutlass_version_stamp` |
-| `oasr/jit/<family>.py` | Per-family generators: `gemm`, `conv`, `norm`, `activation`, `softmax`, `topk`, `fft`, `features`, `ctc_decoder`, `wfst_decoder` |
+| `oasr/jit/<family>.py` | Per-family generators: `gemm`, `conv`, `norm`, `activation`, `pooling`, `softmax`, `topk`, `fft`, `features`, `ctc_decoder`, `wfst_decoder` |
 | `oasr/jit/attention.py` | **Different model** — see below |
 | `oasr/compilation_context.py` | `CompilationContext` detects GPU SMs at import time; pass `supported_major_versions=[...]` to `get_nvcc_flags_list()` for arch-restricted kernels |
 
@@ -146,6 +148,7 @@ allocates its output tensor, and calls into the compiled module.
 | `oasr/norm.py` | `layer_norm`, `rms_norm`, `batch_norm1d`, `group_norm`, fused norm+activation |
 | `oasr/conv.py` | dense / depthwise / pointwise / causal Conv1D; dense, grouped and depthwise Conv2D. Dense NHWC 1×1 Conv2D dispatches as GEMM; Conv1D depthwise padding may be an integer or `(left, right)` pair |
 | `oasr/activation.py` | `glu`, `swish` |
+| `oasr/pooling.py` | BTC/TC `avg_pool1d`, including symmetric padding, ceil mode, and `count_include_pad` |
 | `oasr/softmax.py`, `oasr/topk.py`, `oasr/fft.py` | `softmax`, `topk`, `rfft` / `rfft_power` |
 | `oasr/feature.py` | `stft_frame`, `dct_lifter`, `fbank_preprocess`, `mel_log` — see [features.md](features.md) |
 | `oasr/attention.py` | `fmha(...)` and `fmha.persistent_inputs(...)` |

@@ -20,6 +20,7 @@ ROUTINE_REGISTRY: dict[str, str] = {
     "gemm": "benchmarks.routines.gemm",
     "gemm_log_softmax": "benchmarks.routines.gemm_log_softmax",
     "norm": "benchmarks.routines.norm",
+    "pooling": "benchmarks.routines.pooling",
     "conv": "benchmarks.routines.conv",
     "activation": "benchmarks.routines.activation",
     "attention": "benchmarks.routines.attention",

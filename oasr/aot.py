@@ -38,12 +38,14 @@ def gen_all_modules() -> List:
         gen_group_gemm_module,
     )
     from oasr.jit.norm import gen_norm_module
+    from oasr.jit.pooling import gen_pooling_module
     from oasr.jit.softmax import gen_softmax_module
     from oasr.jit.topk import gen_topk_module
 
     return [
         gen_activation_module(),
         gen_norm_module(),
+        gen_pooling_module(),
         gen_conv_module(),
         gen_conv2d_module(),
         gen_cudnn_conv2d_module(),

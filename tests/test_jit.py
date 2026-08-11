@@ -33,6 +33,14 @@ class TestJitInfrastructure:
         assert spec.name == "norm"
         assert len(spec.sources) == 2
 
+    def test_gen_pooling_module(self):
+        """Verify pooling JIT spec can be created."""
+        from oasr.jit.pooling import gen_pooling_module
+
+        spec = gen_pooling_module()
+        assert spec.name == "pooling"
+        assert len(spec.sources) == 2
+
     def test_gen_conv_module(self):
         """Verify conv JIT spec can be created."""
         from oasr.jit.conv import gen_conv_module
@@ -95,9 +103,11 @@ class TestJitInfrastructure:
         expected = {
             "activation",
             "norm",
+            "pooling",
             "conv",
             "conv2d",
             "cudnn_conv2d",
+            "grouped_conv2d",
             "gemm",
             "bmm",
             "group_gemm",
