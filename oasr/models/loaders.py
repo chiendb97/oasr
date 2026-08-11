@@ -76,12 +76,16 @@ def _resolve_to_local_dir(
         ) from exc
 
     logger.info("Downloading %r from the HuggingFace Hub ...", str(model_id_or_path))
-    return snapshot_download(
+    # Annotated rather than returned directly: `huggingface_hub` is an optional
+    # extra, so mypy sees `Any` wherever it is absent and `str` wherever it is
+    # installed.  Pinning the type here keeps the error count the same in both.
+    local_dir: str = snapshot_download(
         repo_id=str(model_id_or_path),
         revision=revision,
         cache_dir=cache_dir,
         allow_patterns=allow_patterns,
     )
+    return local_dir
 
 
 def from_pretrained(

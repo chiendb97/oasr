@@ -299,13 +299,49 @@ def _tiny_zipformer_transducer():
 def _to_icefall_sd(model):
     """OASR transducer state dict → icefall AsrModel layout (reverse of load).
 
-    Reverses both the key remap (``encoder.encoder_embed.*`` →
-    ``encoder_embed.*`` etc.) and the depthwise-conv weight transpose: OASR's
-    ``DepthwiseConv1d`` stores ``(K, 1, C)`` and its shape-gated
-    ``_load_from_state_dict`` hook converts icefall's ``(C, 1, K)`` on load.
+    Every ``_load_from_state_dict`` hook the load path applies has to be undone
+    here, or the fixture is not the icefall checkpoint it claims to be and the
+    round trip measures the hook against itself:
+
+    * the key remap (``encoder.encoder_embed.*`` → ``encoder_embed.*`` etc.);
+    * :class:`~oasr.layers.Conv2d`, which stores KRSC ``(K, R, S, C)`` against
+      torch's KCRS ``(K, C, R, S)``;
+    * ``Conv2dSubsampling.out``, whose input features are flattened
+      ``(frequency, channel)`` in the NHWC runtime layout and
+      ``(channel, frequency)`` in icefall's NCHW one;
+    * ``DepthwiseConv1d``, which stores ``(K, 1, C)`` against icefall's
+      ``(C, 1, K)``.
+
+    The fixture is saved as a plain ``dict``, so it reaches ``load_state_dict``
+    without ``_metadata`` — version 1, exactly like a real icefall export, which
+    is what arms the version-gated projection hook.
     """
+    from oasr.layers import Conv2d
+    from oasr.models.zipformer.subsampling import Conv2dSubsampling
+
+    nhwc_conv = {
+        f"{name}.weight"
+        for name, module in model.named_modules()
+        if isinstance(module, Conv2d) and module.weight.ndim == 4
+    }
+    projections = {
+        f"{name}.out.weight": (module.out_width, module.layer3_channels)
+        for name, module in model.named_modules()
+        if isinstance(module, Conv2dSubsampling)
+    }
+
     sd = {}
     for k, v in model.state_dict().items():
+        if k in nhwc_conv:
+            v = v.permute(0, 3, 1, 2).contiguous()  # KRSC -> KCRS
+        elif k in projections:
+            width, channels = projections[k]
+            v = (
+                v.view(v.shape[0], width, channels)  # (out, F, C) -> (out, C, F)
+                .transpose(1, 2)
+                .reshape_as(v)
+                .contiguous()
+            )
         ik = k[len("encoder.") :] if k.startswith("encoder.") else k
         if ik.endswith(("depthwise_conv.weight", "decoder.conv.weight")) and v.ndim == 3:
             v = v.permute(2, 1, 0).contiguous()
