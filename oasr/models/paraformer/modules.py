@@ -143,7 +143,18 @@ class SanmSelfAttention(nn.Module):
         )
 
     def _forward_fsmn(self, v: torch.Tensor, mask_btd: torch.Tensor) -> torch.Tensor:
-        return self.fsmn_block(v, mask=mask_btd, add_input=True)
+        """``v`` is a last-dim slice of the fused QKV projection, so it is a view.
+
+        Its row stride is ``3 * n_feat`` while the depthwise kernel requires a
+        contiguous input — it asserts, and ``csrc/conv.cu`` checks again below
+        it.  The copy is explicit here, at the call that created the view,
+        rather than hidden in the waist layer: this is the only reason
+        ``fsmn_block`` costs a transient, and that should be visible where it is
+        caused.  It is *not* new work — the unfused form opened with
+        ``v = v * mask``, which materialised the same copy; folding the mask
+        into the kernel is what left the view exposed.
+        """
+        return self.fsmn_block(v.contiguous(), mask=mask_btd, add_input=True)
 
     def forward(
         self, x: torch.Tensor, mask: torch.Tensor, kv_lens: Optional[torch.Tensor] = None
