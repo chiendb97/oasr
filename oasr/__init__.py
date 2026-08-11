@@ -62,6 +62,7 @@ from .fft import rfft, rfft_power
 from .gemm import bmm, gemm, gemm_activation, gemm_log_softmax, group_gemm
 from .layers import (
     AddLayerNorm,
+    AvgPool1d,
     BatchNorm1d,
     BiasNorm,
     Conv1d,
@@ -95,6 +96,7 @@ from .norm import (
     rms_norm,
     rms_norm_activation,
 )
+from .pooling import avg_pool1d
 from .softmax import log_softmax, softmax
 from .topk import topk
 from .tune import autotune, disable_autotune, enable_autotune
@@ -200,6 +202,7 @@ __all__ = [
     "batch_norm_activation",
     "batch_norm_swish",
     "cmvn",
+    "avg_pool1d",
     "depthwise_conv1d",
     "conv1d",
     "conv1d_activation",
@@ -246,6 +249,7 @@ __all__ = [
     "BiasNorm",
     "BatchNorm1d",
     "AddLayerNorm",
+    "AvgPool1d",
     "GlobalCMVN",
     "SoftmaxModule",
     "TopKModule",

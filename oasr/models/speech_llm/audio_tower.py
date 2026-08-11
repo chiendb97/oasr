@@ -24,6 +24,7 @@ from torch import nn
 from oasr.layers import (
     TORCH_EPS,
     Attention,
+    AvgPool1d,
     ColumnParallelLinear,
     Conv1d,
     Embedding,
@@ -100,7 +101,7 @@ class Qwen2AudioTower(BaseEncoder):
         self.embed_positions = Embedding(cfg.audio_max_source_positions, d)
         self.layers = nn.ModuleList([_TowerLayer(cfg) for _ in range(cfg.audio_encoder_layers)])
         self.layer_norm = LayerNorm(d, eps=TORCH_EPS)
-        self.avg_pooler = nn.AvgPool1d(2, stride=2)
+        self.avg_pooler = AvgPool1d(2, stride=2)
 
     @staticmethod
     def feat_lengths(mel_lengths: torch.Tensor) -> torch.Tensor:
@@ -140,9 +141,7 @@ class Qwen2AudioTower(BaseEncoder):
         for layer in self.layers:
             x = layer(x, feat_lens)
 
-        x = x.permute(0, 2, 1)
         x = self.avg_pooler(x)
-        x = x.permute(0, 2, 1).contiguous()
         x = self.layer_norm(x)
 
         out_lens = self.output_lengths(lens).clamp(min=0)

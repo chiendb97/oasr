@@ -45,6 +45,7 @@ from .norm import (
     LayerNorm,
     RMSNorm,
 )
+from .pooling import AvgPool1d
 from .rotary_embedding import NeoxRotaryEmbedding, RotaryEmbedding, apply_rotary_pos_emb
 from .softmax import Softmax
 from .topk import TopK
@@ -97,6 +98,8 @@ __all__ = [
     "TORCH_EPS",
     "ESPNET_EPS",
     "QWEN2_RMS_EPS",
+    # Pooling
+    "AvgPool1d",
     # Rotary embedding
     "RotaryEmbedding",
     "NeoxRotaryEmbedding",

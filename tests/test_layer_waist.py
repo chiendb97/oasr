@@ -34,12 +34,14 @@ from oasr.models.registry import get_model_entry, list_models
 # ---------------------------------------------------------------------------
 
 #: torch modules an architecture must not instantiate directly.  Each has an
-#: ``oasr.layers`` counterpart with identical parameter layout, so the fix is
-#: always a one-line import change, never a checkpoint change.
+#: ``oasr.layers`` counterpart (or, for parameter-free padding, an operation
+#: already expressible by a waist layer), so the fix never changes a checkpoint.
 BANNED = (
     nn.Linear,
     nn.Conv1d,
     nn.Conv2d,
+    nn.AvgPool1d,
+    nn.ConstantPad1d,
     nn.LayerNorm,
     nn.Embedding,
     nn.RMSNorm,
@@ -49,8 +51,10 @@ BANNED = (
 )
 
 #: Deliberate exemptions, as ``(architecture, dotted module path) -> reason``.
-#: Dense, depthwise, and pointwise ``nn.Conv1d`` now all have BTC-native waist
-#: counterparts, so the torch class is banned alongside the other bypasses.
+#: Dense, depthwise, and pointwise ``nn.Conv1d`` plus ``nn.AvgPool1d`` now have
+#: BTC-native waist counterparts, so the torch classes are banned alongside the
+#: other bypasses. ``nn.ConstantPad1d`` is banned with pooling so model code
+#: cannot reconstruct an explicit pad + pool chain around the kernel.
 ALLOWED_BARE: dict = {}
 
 
@@ -353,6 +357,24 @@ class TestLayersRunOnCpu:
             groups=groups,
         ).permute(0, 2, 3, 1)
         torch.testing.assert_close(got, ref)
+
+    def test_avg_pool1d(self):
+        from oasr.layers import AvgPool1d
+
+        x = torch.randn(2, 11, 8)
+        for kwargs in (
+            {"kernel_size": 2, "stride": 2},
+            {
+                "kernel_size": 3,
+                "stride": 2,
+                "padding": 1,
+                "ceil_mode": True,
+                "count_include_pad": False,
+            },
+        ):
+            got = AvgPool1d(**kwargs)(x)
+            ref = torch.nn.functional.avg_pool1d(x.transpose(1, 2), **kwargs).transpose(1, 2)
+            torch.testing.assert_close(got, ref)
 
     def test_norms(self):
         from oasr.layers import BiasNorm, LayerNorm, RMSNorm
@@ -675,6 +697,24 @@ class TestKernelAndTorchPathsAgree:
             .to(dtype)
         )
         x = torch.randn(2, 19, 11, in_channels, device="cuda", dtype=dtype)
+        got = m(x)
+        with layers_backend_override("torch"):
+            ref = m(x)
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"kernel_size": 2, "stride": 2},
+            {"kernel_size": 3, "stride": 2, "padding": 1, "ceil_mode": True},
+        ],
+    )
+    def test_avg_pool1d(self, dtype, kwargs):
+        from oasr.layers import AvgPool1d
+
+        m = AvgPool1d(**kwargs).cuda()
+        x = torch.randn(2, 31, 128, device="cuda", dtype=dtype)
         got = m(x)
         with layers_backend_override("torch"):
             ref = m(x)

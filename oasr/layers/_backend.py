@@ -435,6 +435,22 @@ def use_conv_kernel(x: torch.Tensor) -> bool:
     return True
 
 
+def use_pooling_kernel(x: torch.Tensor) -> bool:
+    """Should pooling run through the OASR kernel?
+
+    Pooling has the same serving scope as convolution: CUDA FP16/BF16.  The
+    direct kernel covers every argument combination accepted by the waist, so
+    an in-scope refusal is an error rather than a torch fallback.
+    """
+    if layers_backend() == "torch":
+        return False
+    if not x.is_cuda:
+        return out_of_scope("CPU tensor")
+    if x.dtype not in SERVED_DTYPES:
+        return out_of_scope(f"dtype {x.dtype}")
+    return True
+
+
 def use_fmha_kernel() -> bool:
     """Is the OASR attention kernel selectable at all?"""
     return layers_backend() != "torch"
@@ -463,4 +479,5 @@ __all__ = [
     "use_fmha_kernel",
     "use_gemm_kernel",
     "use_norm_kernel",
+    "use_pooling_kernel",
 ]
