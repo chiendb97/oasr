@@ -31,6 +31,16 @@ class EngineConfig:
         ``train.yaml``, ``global_cmvn``, and optionally a SentencePiece model.
     checkpoint_name : str
         Filename of the model weights inside ``ckpt_dir``.
+    architecture : str, optional
+        Force a registered architecture instead of letting
+        ``CheckpointConverter.detect`` rank the candidates.  Needed only for an
+        **explicit-only** converter — one whose ``detect()`` is always False
+        because its directory layout is claimed by another architecture.
+        ``transducer`` is the case: an icefall pruned-RNNT export sniffs as
+        ``zipformer``, and a hybrid export really does carry both branches, so
+        the transducer branch has to be asked for by name.  Without this the
+        only way to reach such a checkpoint from the engine was to re-convert it
+        to native format first.
     device : str
         CUDA device string, e.g. ``"cuda"`` or ``"cuda:0"``.
     dtype : torch.dtype
@@ -102,6 +112,7 @@ class EngineConfig:
 
     ckpt_dir: str = ""
     checkpoint_name: str = "final.pt"
+    architecture: Optional[str] = None
     device: str = "cuda"
     # bfloat16 by default: same exponent range as fp32, so wide-activation
     # models (e.g. conv2d6 subsampling, which can hit ~5e4 at the embed) do

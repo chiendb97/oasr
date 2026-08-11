@@ -19,6 +19,20 @@ class TransducerModelConfig(BaseModelConfig):
     paged-KV streaming) or ``"zipformer"`` (icefall pruned-transducer
     checkpoints, stateful streaming); ``encoder`` holds the matching encoder
     config dataclass.
+
+    ``decoder_conv_group_size`` is the predictor conv's **input channels per
+    group** — icefall's stateless decoder is
+    ``nn.Conv1d(C, C, context_size, groups=C // group_size)``, and the group
+    size is a *recipe* decision, not a layout one, so it has to be carried:
+
+    * ``1`` — fully depthwise (``groups == decoder_dim``), the old
+      ``pruned_transducer_stateless2/3/5`` recipes.  The default, so every
+      existing config and native checkpoint keeps its meaning.
+    * ``4`` — every Zipformer recipe (``zipformer``,
+      ``pruned_transducer_stateless7``), i.e. what a real icefall release ships.
+
+    The converter infers it from ``decoder.conv.weight``, so a checkpoint never
+    depends on the default being right.
     """
 
     model_type: str = "transducer"
@@ -27,6 +41,7 @@ class TransducerModelConfig(BaseModelConfig):
     decoder_dim: int = 512
     joiner_dim: int = 512
     context_size: int = 2
+    decoder_conv_group_size: int = 1
     blank_id: int = 0
 
     @property
