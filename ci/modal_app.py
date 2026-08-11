@@ -49,15 +49,27 @@ from pathlib import Path
 
 import modal
 
-CI_DIR = Path(__file__).resolve().parent
-REPO_ROOT = CI_DIR.parent
+REPO_REMOTE = "/repo"
+
+# This module is imported in two places, and only one of them is a checkout.
+# Locally `modal run` imports ci/modal_app.py and `__file__` locates the repo.
+# In the container Modal re-imports it as **/root/modal_app.py** — a bare file,
+# not a package, so the ci/ + tests/ layout around it is gone and
+# `Path(__file__).parent.parent` is `/`.  The repo is at REPO_REMOTE there,
+# copied in by `add_local_dir` below.  Resolve from whichever one exists rather
+# than from `__file__`, or the container import dies before the app is built.
+REPO_ROOT = (
+    Path(REPO_REMOTE)
+    if (Path(REPO_REMOTE) / "ci" / "gpu_suites.py").is_file()
+    else Path(__file__).resolve().parent.parent
+)
+CI_DIR = REPO_ROOT / "ci"
 sys.path.insert(0, str(CI_DIR))
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 import assets as test_assets  # noqa: E402  — both need the sys.path lines above
 from gpu_suites import DEFAULT_MARKER_EXPR, SUITES, paths_for  # noqa: E402
 
 APP_NAME = "oasr-gpu-ci"
-REPO_REMOTE = "/repo"
 ASSETS_MOUNT = "/assets"
 JIT_MOUNT = "/root/.cache/oasr/jit"
 
