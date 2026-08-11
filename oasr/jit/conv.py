@@ -4,7 +4,8 @@
 
 import itertools
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Union
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 from . import env
 from .core import JitSpec, _get_target_sm, gen_jit_spec
@@ -561,12 +562,51 @@ def gen_grouped_conv2d_module() -> JitSpec:
 # =============================================================================
 
 
+def _torch_cudnn_dirs() -> Tuple[Optional[Path], Optional[Path]]:
+    """Include and library dirs of the cuDNN torch ships, when it ships one.
+
+    torch's CUDA wheels depend on ``nvidia-cudnn-cu12``, which installs headers
+    and libraries under ``site-packages/nvidia/cudnn/``.  A *system* cuDNN is
+    not guaranteed: a stock ``nvidia/cuda:*-devel`` image has none, and this
+    module is the only place in the tree that needs ``cudnn.h`` — so a bare
+    ``-lcudnn`` made cuDNN an undeclared build dependency that fails at first
+    *call* (JIT), long after ``pip install`` said it was fine.
+
+    Preferring the wheel where both exist is deliberate: it is the copy torch
+    itself loads, so the process ends up with one cuDNN rather than linking
+    against one version and loading another.
+
+    Returns ``(None, None)`` when the wheel is absent, which leaves the bare
+    ``-lcudnn`` to find a system install exactly as before.
+    """
+    try:
+        import nvidia
+    except ImportError:  # pragma: no cover - depends on the torch wheel flavour
+        return None, None
+    if not getattr(nvidia, "__file__", None):
+        return None, None
+    root = Path(nvidia.__file__).resolve().parent / "cudnn"
+    include, lib = root / "include", root / "lib"
+    return (
+        include if (include / "cudnn.h").is_file() else None,
+        lib if lib.is_dir() else None,
+    )
+
+
 def gen_cudnn_conv2d_module() -> JitSpec:
     """Generate JIT spec for cuDNN Conv2D kernels (small IC path)."""
+    include, lib = _torch_cudnn_dirs()
+    ldflags = ["-lcudnn"]
+    if lib is not None:
+        # -rpath as well as -L: the module is dlopen'd at first call, so the
+        # dynamic loader has to find libcudnn at *load* time too, not only the
+        # linker at build time.
+        ldflags += [f"-L{lib}", f"-Wl,-rpath,{lib}"]
     return gen_jit_spec(
         "cudnn_conv2d",
         [env.OASR_CSRC_DIR / "cudnn_conv2d_kernel_launcher.cu"],
-        extra_ldflags=["-lcudnn"],
+        extra_cuda_cflags=[f"-I{include}"] if include is not None else None,
+        extra_ldflags=ldflags,
     )
 
 
