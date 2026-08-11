@@ -104,7 +104,22 @@ jit_vol = modal.Volume.from_name("oasr-ci-jit-cache", create_if_missing=True)
 image = (
     # -devel, not -runtime: the JIT shells out to nvcc at run time.
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.12")
-    .apt_install("git", "curl", "build-essential", "cmake", "ninja-build", "protobuf-compiler")
+    .apt_install(
+        "git",
+        "curl",
+        "build-essential",
+        "cmake",
+        "ninja-build",
+        "protobuf-compiler",  # tonic's build.rs compiles rust/proto/*.proto
+        # openssl-sys is the one crate in the oasr-core tree that links a system
+        # library, and it needs both: the headers, and pkg-config to locate them
+        # ("Could not find directory of OpenSSL installation").  It arrives via
+        # oasr-serve -> metrics-exporter-prometheus -> hyper-tls -> native-tls,
+        # so nothing in this repo names it and a base image without it fails
+        # only at the very end, in the Rust half of `pip install -e .`.
+        "pkg-config",
+        "libssl-dev",
+    )
     # setuptools-rust builds the oasr._core PyO3 extension during pip install.
     .run_commands(
         "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal",
