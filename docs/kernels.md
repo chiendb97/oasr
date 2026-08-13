@@ -143,11 +143,11 @@ allocates its output tensor, and calls into the compiled module.
 
 | Module | Exposes |
 |---|---|
-| `oasr/gemm.py` | `gemm`, `bmm`, `group_gemm`, and the fused epilogues `gemm_activation` (RELU/GELU/SWISH) and `gemm_log_softmax` (the CTC head fast path) |
+| `oasr/gemm.py` | `gemm`, `bmm`, `group_gemm`, and the fused epilogues `gemm_activation` (RELU/tanh-GELU/exact-erf GELU/SWISH) and `gemm_log_softmax` (the CTC head fast path) |
 | `oasr/gemm_torch.py` | Torch/cuBLAS runners — `torch_gemm`, `torch_gemm_activation`, `torch_bmm`, `torch_gemm_log_softmax` — mirroring the CUTLASS launcher contract exactly (output-first, in-place / CUDA-graph-safe, `D = A @ Bᵀ`). Doubles as a `Tactic("torch")` autotuner candidate and as the production dispatch target. Deliberately free of any `oasr.tune` import. |
 | `oasr/norm.py` | `layer_norm`, `rms_norm`, `batch_norm1d`, `group_norm`, fused norm+activation |
 | `oasr/conv.py` | dense / depthwise / pointwise / causal Conv1D; dense, grouped and depthwise Conv2D. Dense NHWC 1×1 Conv2D dispatches as GEMM; Conv1D depthwise padding may be an integer or `(left, right)` pair |
-| `oasr/activation.py` | `glu`, `swish` |
+| `oasr/activation.py` | exact-erf `gelu`, `glu`, `swish`, `swoosh_l`, `swoosh_r` |
 | `oasr/pooling.py` | BTC/TC `avg_pool1d`, including symmetric padding, ceil mode, and `count_include_pad` |
 | `oasr/softmax.py`, `oasr/topk.py`, `oasr/fft.py` | `softmax`, `topk`, `rfft` / `rfft_power` |
 | `oasr/feature.py` | `stft_frame`, `dct_lifter`, `fbank_preprocess`, `mel_log` — see [features.md](features.md) |

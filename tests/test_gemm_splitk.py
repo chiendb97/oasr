@@ -157,7 +157,7 @@ class TestParallelSplitK:
         ref = A.float() @ B.float().t()
         assert (out.float() - ref).abs().max().item() < _tol(torch.bfloat16, K)
 
-    @pytest.mark.parametrize("act,ref_fn", [(0, F.relu), (2, F.silu)])
+    @pytest.mark.parametrize("act,ref_fn", [(0, F.relu), (2, F.silu), (4, F.gelu)])
     def test_activation_applied_once(self, act, ref_fn):
         """The activation epilogue runs in the reduction kernel — exactly once
         over the FULL sum (the property serial split-K cannot provide)."""

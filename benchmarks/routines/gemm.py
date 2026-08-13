@@ -62,6 +62,7 @@ PROFILE_CONFIGS: dict[str, tuple] = {
     "gemm": (16000, 256, 2048),
     "bmm": (256, 200, 200, 64),
     "group_gemm": (64, 200, 64, 64),
+    "gemm_activation": (16000, 2048, 512),
 }
 
 
@@ -142,12 +143,13 @@ def setup_group_gemm(problem_sizes: list[tuple[int, int, int]], dtype=torch.bflo
 def setup_gemm_activation(M: int, N: int, K: int, dtype=torch.float16):
     A = torch.randn(M, K, device="cuda", dtype=dtype)
     B = torch.randn(N, K, device="cuda", dtype=dtype)
+    C = torch.randn(N, device="cuda", dtype=dtype)
 
     def oasr_fn():
-        return oasr.gemm_activation(A, B, activation_type=oasr.ACTIVATION_SWISH)
+        return oasr.gemm_activation(A, B, C, activation_type=oasr.ACTIVATION_GELU_ERF)
 
     def pytorch_fn():
-        return F.silu(F.linear(A, B))
+        return F.gelu(F.linear(A, B, C))
 
     return oasr_fn, pytorch_fn
 

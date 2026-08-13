@@ -13,10 +13,13 @@ from oasr.api_logging import oasr_api
 ACTIVATION_RELU = 0
 ACTIVATION_GELU = 1
 ACTIVATION_SWISH = 2
+ACTIVATION_GELU_ERF = 4
 
 _ACTIVATION_NAME_TO_ID = {
     "relu": ACTIVATION_RELU,
     "gelu": ACTIVATION_GELU,
+    "gelu_tanh": ACTIVATION_GELU,
+    "gelu_erf": ACTIVATION_GELU_ERF,
     "swish": ACTIVATION_SWISH,
     "silu": ACTIVATION_SWISH,
 }
@@ -71,6 +74,24 @@ def swish(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tens
     if out is None:
         out = torch.empty_like(input)
     _get_activation_module().swish(out, input)
+    return out
+
+
+@oasr_api
+def gelu(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Exact-erf GELU: ``0.5 * x * (1 + erf(x / sqrt(2)))``.
+
+    Args:
+        input: Input tensor. Non-contiguous inputs are materialized once.
+        out: Optional pre-allocated contiguous output tensor.
+
+    Returns:
+        Output tensor with the same shape as input.
+    """
+    input = input.contiguous()
+    if out is None:
+        out = torch.empty_like(input)
+    _get_activation_module().gelu_erf(out, input)
     return out
 
 

@@ -18,7 +18,6 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from oasr.layers import (
@@ -28,7 +27,9 @@ from oasr.layers import (
     ColumnParallelLinear,
     Conv1d,
     Embedding,
+    Gelu,
     LayerNorm,
+    LinearActivation,
     RowParallelLinear,
 )
 
@@ -72,7 +73,7 @@ class _TowerLayer(nn.Module):
         d = cfg.audio_d_model
         self.self_attn = _TowerAttention(d, cfg.audio_encoder_attention_heads)
         self.self_attn_layer_norm = LayerNorm(d, eps=TORCH_EPS)
-        self.fc1 = ColumnParallelLinear(d, cfg.audio_encoder_ffn_dim)
+        self.fc1 = LinearActivation(d, cfg.audio_encoder_ffn_dim, activation_type="gelu")
         self.fc2 = RowParallelLinear(cfg.audio_encoder_ffn_dim, d)
         self.final_layer_norm = LayerNorm(d, eps=TORCH_EPS)
 
@@ -82,7 +83,7 @@ class _TowerLayer(nn.Module):
         x = residual + self.self_attn(x, kv_lens)
         residual = x
         x = self.final_layer_norm(x)
-        return residual + self.fc2(F.gelu(self.fc1(x)))
+        return residual + self.fc2(self.fc1(x))
 
 
 class Qwen2AudioTower(BaseEncoder):
@@ -97,6 +98,7 @@ class Qwen2AudioTower(BaseEncoder):
         d = cfg.audio_d_model
         self.conv1 = Conv1d(cfg.audio_num_mel_bins, d, kernel_size=3, padding=1)
         self.conv2 = Conv1d(d, d, kernel_size=3, stride=2, padding=1)
+        self.gelu = Gelu()
         # HF materializes the sinusoidal table as a real (frozen) weight.
         self.embed_positions = Embedding(cfg.audio_max_source_positions, d)
         self.layers = nn.ModuleList([_TowerLayer(cfg) for _ in range(cfg.audio_encoder_layers)])
@@ -127,8 +129,8 @@ class Qwen2AudioTower(BaseEncoder):
                 f"speech_llm expects {expected} mel frames (padded 30 s window, "
                 f"feature_type='whisper_logmel'), got {xs.size(1)}"
             )
-        x = F.gelu(self.conv1(xs))
-        x = F.gelu(self.conv2(x))
+        x = self.gelu(self.conv1(xs))
+        x = self.gelu(self.conv2(x))
         T = x.size(1)
         x = x + self.embed_positions.weight[:T].to(x.dtype)
 

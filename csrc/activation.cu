@@ -64,6 +64,39 @@ void swish(TensorView output, TensorView input) {
 }
 
 // =============================================================================
+// Exact-erf GELU launcher (elementwise; input/output must be contiguous)
+// =============================================================================
+
+void gelu_erf(TensorView output, TensorView input) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output);
+    CHECK_CONTIGUOUS_INPUT(input);
+    CHECK_CONTIGUOUS_INPUT(output);
+    CHECK_DEVICE(input, output);
+    CHECK_SAME_LAYOUT(input, output);
+    TVM_FFI_ICHECK(input.dtype().code == output.dtype().code &&
+                   input.dtype().bits == output.dtype().bits &&
+                   input.dtype().lanes == output.dtype().lanes)
+        << "GELU input and output must have the same dtype";
+
+    int64_t n = 1;
+    for (int i = 0; i < input.ndim(); ++i) {
+        n *= input.size(i);
+    }
+
+    cudaStream_t stream = get_stream(input.device());
+
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+        cudaError_t status =
+            activation::GeluErf<c_type>(static_cast<const c_type*>(input.data_ptr()),
+                                        static_cast<c_type*>(output.data_ptr()), n, stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "GeluErf kernel failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
+// =============================================================================
 // Swoosh-L launcher (elementwise; input/output must be contiguous)
 // =============================================================================
 

@@ -345,7 +345,8 @@ def gemm_activation(
         A: Input tensor [M, K] or [batch, M', K].
         B: Input tensor [N, K].
         C: Optional bias tensor.
-        activation_type: Activation type (0=RELU, 1=GELU, 2=SWISH).
+        activation_type: Activation type (0=RELU, 1=tanh-GELU, 2=SWISH,
+            4=exact-erf GELU).
         out: Optional pre-allocated output tensor.
 
     Returns:

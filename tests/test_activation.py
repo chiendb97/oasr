@@ -16,6 +16,50 @@ import oasr
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
 
 
+class TestGelu:
+    """Tests for exact-erf ``oasr.gelu()``."""
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("shape", [(257,), (2, 17, 63)])
+    def test_exact_erf(self, dtype, shape):
+        x = torch.randn(*shape, device="cuda", dtype=dtype)
+
+        output = oasr.gelu(x)
+        expected = F.gelu(x)
+        atol = 2e-6 if dtype == torch.float32 else 2e-3
+        torch.testing.assert_close(output, expected, rtol=0, atol=atol)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_reaches_served_dtype_launcher_and_uses_erf(self, dtype):
+        x = torch.linspace(-5.0, 5.0, 4096, device="cuda", dtype=dtype)
+        output = oasr.gelu(x)
+        exact = F.gelu(x)
+        approximate = F.gelu(x, approximate="tanh")
+
+        torch.testing.assert_close(output, exact, rtol=0, atol=2e-3)
+        assert torch.count_nonzero(output != approximate).item() > 0
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_destination_passing(self, dtype):
+        x = torch.randn(2, 31, 65, device="cuda", dtype=dtype)
+        out = torch.empty_like(x)
+        result = oasr.gelu(x, out=out)
+
+        assert result.data_ptr() == out.data_ptr()
+        torch.testing.assert_close(out, F.gelu(x), rtol=0, atol=2e-3)
+
+    def test_noncontiguous_input(self):
+        x = torch.randn(2, 31, 65, device="cuda", dtype=torch.float16).transpose(1, 2)
+        assert not x.is_contiguous()
+        torch.testing.assert_close(oasr.gelu(x), F.gelu(x), rtol=0, atol=2e-3)
+
+    def test_contiguous_unaligned_storage_offset(self):
+        base = torch.randn(4097, device="cuda", dtype=torch.float16)
+        x = base[1:]
+        assert x.is_contiguous() and x.data_ptr() % 16 != 0
+        torch.testing.assert_close(oasr.gelu(x), F.gelu(x), rtol=0, atol=2e-3)
+
+
 class TestGLU:
     """Tests for oasr.glu() functional API."""
 

@@ -11,7 +11,9 @@
 
 #include <algorithm>
 
+#include <cstdint>
 #include <oasr/common/math.h>
+#include <oasr/common/utils.h>
 #include <oasr/common/vec_dtypes.h>
 
 namespace oasr {
@@ -85,6 +87,27 @@ __global__ void swishKernel(const T* __restrict__ input, T* __restrict__ output,
             v_out[v] = static_cast<T>(oasr::swish(x));
         }
 
+        v_out.store(output + vid * VecSize);
+    }
+}
+
+// =============================================================================
+// Exact-erf GELU Kernel (vectorized, elementwise over a flat buffer)
+// =============================================================================
+
+template <typename T, int VecSize>
+__global__ void geluErfKernel(const T* __restrict__ input, T* __restrict__ output, int64_t n) {
+    const int64_t total_vec_elements = n / VecSize;
+    for (int64_t vid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         vid < total_vec_elements; vid += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        Vec<T, VecSize> v_in;
+        v_in.load(input + vid * VecSize);
+
+        Vec<T, VecSize> v_out;
+#pragma unroll
+        for (int v = 0; v < VecSize; v++) {
+            v_out[v] = static_cast<T>(oasr::gelu_erf(static_cast<float>(v_in[v])));
+        }
         v_out.store(output + vid * VecSize);
     }
 }
@@ -174,6 +197,32 @@ cudaError_t Swish(const T* input, T* output, int batch_size, int seq_len, int ch
         const int grid_size = (total_elements + block_size - 1) / block_size;
         swishKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
             input, output, batch_size, seq_len, channels);
+    }
+
+    return cudaGetLastError();
+}
+
+template <typename T>
+cudaError_t GeluErf(const T* input, T* output, int64_t n, cudaStream_t stream) {
+    if (n == 0) {
+        return cudaSuccess;
+    }
+
+    constexpr int kVecSize = VecTypeTrait<T>::VecSize;
+    constexpr int kBlockSize = 256;
+
+    if (n % kVecSize == 0 && oasr::isAligned<T, kVecSize>(input) &&
+        oasr::isAligned<T, kVecSize>(output)) {
+        const int64_t total_vec_elements = n / kVecSize;
+        int64_t grid_size = (total_vec_elements + kBlockSize - 1) / kBlockSize;
+        grid_size = std::min<int64_t>(grid_size, 65535);
+        geluErfKernel<T, kVecSize>
+            <<<static_cast<int>(grid_size), kBlockSize, 0, stream>>>(input, output, n);
+    } else {
+        int64_t grid_size = (n + kBlockSize - 1) / kBlockSize;
+        grid_size = std::min<int64_t>(grid_size, 65535);
+        geluErfKernel<T, 1>
+            <<<static_cast<int>(grid_size), kBlockSize, 0, stream>>>(input, output, n);
     }
 
     return cudaGetLastError();

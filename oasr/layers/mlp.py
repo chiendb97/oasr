@@ -22,9 +22,9 @@ of :class:`~oasr.layers.linear.Linear`s.  That is the intended outcome, not an
 unfinished migration.
 
 Activation names follow :mod:`oasr.layers.linear`: ``gelu`` is the **exact
-erf** form and is never fused, ``gelu_tanh`` is the approximation the CUDA
-epilogue implements.  Asking for the wrong one is a silent accuracy change on
-an erf-trained model, so the two are separate names rather than one flag.
+erf** form and ``gelu_tanh`` is the approximation. Both have distinct CUDA
+epilogues; asking for the wrong one is a silent accuracy change on an
+erf-trained model, so the two remain separate names rather than one flag.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from .linear import ColumnParallelLinear, LinearActivation, RowParallelLinear
 from .norm import LayerNorm
 
 #: Activations that fold into the GEMM epilogue (see ``LinearActivation``).
-_FUSABLE = frozenset({"relu", "swish", "silu", "gelu_tanh"})
+_FUSABLE = frozenset({"relu", "swish", "silu", "gelu", "gelu_tanh"})
 
 _UNFUSED_ACTIVATION: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "relu": F.relu,

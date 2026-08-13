@@ -151,6 +151,16 @@ void {{ func_name }}_activation(TensorView output, TensorView A, TensorView B, O
                     reinterpret_cast<CutlassType*>(output.data_ptr()),
                     M, N, K, lda, ldb, ldc, alpha, stream,
                     static_cast<int>(split_k_slices));
+        } else if (activation == ActivationType::GELU_ERF) {
+            status = oasr::gemm::CutlassGemmKernel<
+                Config, CutlassType, CutlassType, CutlassType,
+                oasr::ActivationType::GELU_ERF, kUseStreamK, kUseParallelSplitK>::run(
+                    reinterpret_cast<const CutlassType*>(A.data_ptr()),
+                    reinterpret_cast<const CutlassType*>(B.data_ptr()),
+                    C_ptr,
+                    reinterpret_cast<CutlassType*>(output.data_ptr()),
+                    M, N, K, lda, ldb, ldc, alpha, stream,
+                    static_cast<int>(split_k_slices));
         } else if (activation == ActivationType::SWISH) {
             status = oasr::gemm::CutlassGemmKernel<
                 Config, CutlassType, CutlassType, CutlassType,
