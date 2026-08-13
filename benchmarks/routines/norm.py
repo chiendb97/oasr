@@ -1,7 +1,9 @@
 """Normalization family benchmark routines.
 
-Covers: layer_norm, add_layer_norm, layer_norm_activation, rms_norm,
-        batch_norm, batch_norm_swish, batch_norm_activation, group_norm.
+Covers: layer_norm, add_layer_norm, add_layer_norm_residual,
+        layer_norm_activation, rms_norm, add_rms_norm,
+        add_rms_norm_residual, batch_norm, batch_norm_swish,
+        batch_norm_activation, group_norm.
 """
 
 from __future__ import annotations
@@ -20,17 +22,17 @@ from benchmarks.routines.bench_utils import (
     check_close,
     compute_bandwidth_tb_s,
     dtype_size,
-    make_bench_parser,
-    profile_kernel,
     run_main,
-    run_profile,
 )
 
 SUBROUTINES = [
     "layer_norm",
     "add_layer_norm",
+    "add_layer_norm_residual",
     "layer_norm_activation",
     "rms_norm",
+    "add_rms_norm",
+    "add_rms_norm_residual",
     "batch_norm",
     "batch_norm_swish",
     "batch_norm_activation",
@@ -52,10 +54,24 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
         {"batch": 32, "seq": 500, "hidden": 512},
     ],
     "add_layer_norm": [
-        {"batch": 32, "seq": 250, "hidden": 256},
-        {"batch": 64, "seq": 250, "hidden": 256},
-        {"batch": 64, "seq": 250, "hidden": 512},
-        {"batch": 64, "seq": 500, "hidden": 512},
+        {"batch": 16, "seq": 1500, "hidden": 384},  # Whisper / Qwen2-Audio tower
+        {"batch": 32, "seq": 250, "hidden": 512},  # Paraformer
+        {"batch": 8, "seq": 200, "hidden": 1024},  # Nemotron
+    ],
+    "add_layer_norm_residual": [
+        {"batch": 16, "seq": 1500, "hidden": 384},
+        {"batch": 32, "seq": 250, "hidden": 512},
+        {"batch": 8, "seq": 200, "hidden": 1024},
+    ],
+    "add_rms_norm": [
+        {"batch": 1, "seq": 1, "hidden": 3584},  # Qwen2-Audio-7B decode
+        {"batch": 4, "seq": 128, "hidden": 3584},  # Qwen2-Audio-7B prefill
+        {"batch": 8, "seq": 256, "hidden": 512},  # tiny / test geometry
+    ],
+    "add_rms_norm_residual": [
+        {"batch": 1, "seq": 1, "hidden": 3584},
+        {"batch": 4, "seq": 128, "hidden": 3584},
+        {"batch": 8, "seq": 256, "hidden": 512},
     ],
     "layer_norm_activation": [
         {"batch": 64, "seq": 250, "hidden": 256},
@@ -103,8 +119,11 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
 PROFILE_CONFIGS: dict[str, tuple] = {
     "layer_norm": (64, 250, 256),
     "add_layer_norm": (64, 250, 512),
+    "add_layer_norm_residual": (16, 1500, 384),
     "layer_norm_activation": (64, 250, 512),
     "rms_norm": (64, 250, 256),
+    "add_rms_norm": (4, 128, 3584),
+    "add_rms_norm_residual": (4, 128, 3584),
     "batch_norm": (64, 250, 512),
     "batch_norm_swish": (64, 250, 512),
     "batch_norm_activation": (64, 250, 512),
@@ -151,12 +170,32 @@ def setup_add_layer_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
     def oasr_fn():
         return oasr.add_layer_norm(x, residual, gamma, beta, eps)
 
-    ln = torch.nn.LayerNorm(hidden_size, eps=eps, device="cuda", dtype=dtype)
-    ln.weight.data = gamma.clone()
-    ln.bias.data = beta.clone()
+    def pytorch_fn():
+        summed = x.float() + residual.float()
+        return F.layer_norm(summed, (hidden_size,), gamma.float(), beta.float(), eps).to(dtype)
+
+    return oasr_fn, pytorch_fn
+
+
+def setup_add_layer_norm_residual(batch_size, seq_len, hidden_size, dtype=torch.float16):
+    eps = 1e-5
+    alpha = 0.5
+    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+    residual = torch.randn_like(x)
+    gamma = torch.randn(hidden_size, device="cuda", dtype=dtype)
+    beta = torch.randn(hidden_size, device="cuda", dtype=dtype)
+    out = torch.empty_like(x)
+    residual_out = torch.empty_like(x)
+
+    def oasr_fn():
+        normalized, _ = oasr.add_layer_norm_residual(
+            x, residual, gamma, beta, eps, alpha, out=out, residual_out=residual_out
+        )
+        return normalized
 
     def pytorch_fn():
-        return ln(x + residual)
+        summed = residual.float() + alpha * x.float()
+        return F.layer_norm(summed, (hidden_size,), gamma.float(), beta.float(), eps).to(dtype)
 
     return oasr_fn, pytorch_fn
 
@@ -196,8 +235,43 @@ def setup_rms_norm(batch_size, seq_len, hidden_size, dtype=torch.float16):
         return oasr.rms_norm(x, gamma, None, eps)
 
     def pytorch_fn():
-        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-        return x / rms * gamma
+        xf = x.float()
+        return (xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps) * gamma.float()).to(
+            dtype
+        )
+
+    return oasr_fn, pytorch_fn
+
+
+def setup_add_rms_norm(
+    batch_size, seq_len, hidden_size, dtype=torch.float16, return_residual=False
+):
+    eps = 1e-6
+    alpha = 1.0
+    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+    residual = torch.randn_like(x)
+    gamma = torch.randn(hidden_size, device="cuda", dtype=dtype)
+    out = torch.empty_like(x)
+    residual_out = torch.empty_like(x)
+
+    if return_residual:
+
+        def oasr_fn():
+            normalized, _ = oasr.add_rms_norm_residual(
+                x, residual, gamma, None, eps, alpha, out=out, residual_out=residual_out
+            )
+            return normalized
+
+    else:
+
+        def oasr_fn():
+            return oasr.add_rms_norm(x, residual, gamma, None, eps, alpha, out=out)
+
+    def pytorch_fn():
+        summed_f = residual.float() + alpha * x.float()
+        return (
+            summed_f * torch.rsqrt(summed_f.pow(2).mean(dim=-1, keepdim=True) + eps) * gamma.float()
+        ).to(dtype)
 
     return oasr_fn, pytorch_fn
 
@@ -322,12 +396,12 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _norm_bytes(batch, seq, hidden, dtype, extra_inputs=1):
+def _norm_bytes(batch, seq, hidden, dtype, extra_inputs=0, extra_outputs=0):
     """Estimate bytes accessed for norm: read input(s) + weight + write output."""
     elem = dtype_size(dtype)
     input_bytes = batch * seq * hidden * elem * (1 + extra_inputs)  # input(s)
     weight_bytes = hidden * elem * 2  # gamma + beta
-    output_bytes = batch * seq * hidden * elem
+    output_bytes = batch * seq * hidden * elem * (1 + extra_outputs)
     return input_bytes + weight_bytes + output_bytes
 
 
@@ -352,8 +426,9 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
         backends = getattr(args, "backends", None) or list(fn_map.keys())
 
         b, s, h = cfg["batch"], cfg["seq"], cfg["hidden"]
-        extra_inputs = 1 if subroutine == "add_layer_norm" else 0
-        bytes_accessed = _norm_bytes(b, s, h, dtype, extra_inputs)
+        extra_inputs = 1 if subroutine.startswith("add_") else 0
+        extra_outputs = 1 if subroutine.endswith("_residual") else 0
+        bytes_accessed = _norm_bytes(b, s, h, dtype, extra_inputs, extra_outputs)
         shape_str = _shape_str(subroutine, cfg)
 
         if do_check and "torch" in backends and any(b in fn_map and b != "torch" for b in backends):
@@ -411,10 +486,16 @@ def _setup_for_config(subroutine, cfg, dtype, activation_name="swish"):
         return setup_layer_norm(b, s, h, dtype)
     elif subroutine == "add_layer_norm":
         return setup_add_layer_norm(b, s, h, dtype)
+    elif subroutine == "add_layer_norm_residual":
+        return setup_add_layer_norm_residual(b, s, h, dtype)
     elif subroutine == "layer_norm_activation":
         return setup_layer_norm_activation(b, s, h, activation_name, dtype)
     elif subroutine == "rms_norm":
         return setup_rms_norm(b, s, h, dtype)
+    elif subroutine == "add_rms_norm":
+        return setup_add_rms_norm(b, s, h, dtype)
+    elif subroutine == "add_rms_norm_residual":
+        return setup_add_rms_norm(b, s, h, dtype, return_residual=True)
     elif subroutine == "batch_norm":
         return setup_batch_norm(b, s, h, dtype)
     elif subroutine == "batch_norm_swish":
@@ -449,11 +530,24 @@ def get_fn_map(subroutine, cuda_fn, torch_fn):
 _STANDALONE_MAP = {
     "layer_norm": {
         "title": "LayerNorm Kernels",
-        "subroutines": ["layer_norm", "add_layer_norm", "layer_norm_activation"],
+        "subroutines": [
+            "layer_norm",
+            "add_layer_norm",
+            "add_layer_norm_residual",
+            "layer_norm_activation",
+        ],
     },
     "rms_norm": {
         "title": "RMSNorm Kernel",
         "subroutines": ["rms_norm"],
+    },
+    "add_rms_norm": {
+        "title": "AddRMSNorm Kernel",
+        "subroutines": ["add_rms_norm"],
+    },
+    "add_rms_norm_residual": {
+        "title": "AddRMSNormResidual Kernel",
+        "subroutines": ["add_rms_norm_residual"],
     },
     "batch_norm": {
         "title": "BatchNorm Kernels",
@@ -493,7 +587,9 @@ def run_standalone(variant: str = "layer_norm") -> None:
             for cfg in configs:
                 oasr_fn, pytorch_fn = _setup_for_config(sub, cfg, torch.float16)
                 b, s, h = cfg["batch"], cfg["seq"], cfg["hidden"]
-                bytes_accessed = _norm_bytes(b, s, h, torch.float16)
+                extra_inputs = 1 if sub.startswith("add_") else 0
+                extra_outputs = 1 if sub.endswith("_residual") else 0
+                bytes_accessed = _norm_bytes(b, s, h, torch.float16, extra_inputs, extra_outputs)
                 shape_str = _shape_str(sub, cfg)
                 for backend, fn in [("cuda", oasr_fn), ("torch", pytorch_fn)]:
                     median_ms, std_ms = bench_fn(fn)
@@ -529,10 +625,16 @@ def _make_profile_setup(subroutine):
             return setup_batch_norm_activation(*cfg_tuple)
         elif subroutine == "add_layer_norm":
             return setup_add_layer_norm(*cfg_tuple)
+        elif subroutine == "add_layer_norm_residual":
+            return setup_add_layer_norm_residual(*cfg_tuple)
         elif subroutine == "layer_norm_activation":
             return setup_layer_norm_activation(*cfg_tuple)
         elif subroutine == "rms_norm":
             return setup_rms_norm(*cfg_tuple)
+        elif subroutine == "add_rms_norm":
+            return setup_add_rms_norm(*cfg_tuple)
+        elif subroutine == "add_rms_norm_residual":
+            return setup_add_rms_norm(*cfg_tuple, return_residual=True)
         elif subroutine == "cmvn":
             return setup_cmvn(*cfg_tuple)
         else:

@@ -31,7 +31,7 @@ Python functional API (oasr/<family>.py)  — @oasr_api decorated
 |---|---|
 | `include/oasr/common/` | Shared types (`types.h`), vector dtypes (`vec_dtypes.h`), SM dispatch (`arch_dispatch.h`), epilogue functors, math utilities |
 | `include/oasr/activation.cuh` | Vectorized exact GELU, sigmoid, tanh, ReLU, GLU, Swish, and Swoosh activations; unary sigmoid/tanh/ReLU also consume regular padded row strides such as channel chunks without a copy |
-| `include/oasr/norm.cuh` + `norm_dispatch.inc` | LayerNorm, RMSNorm, BatchNorm1d, GroupNorm, fused norm+activation |
+| `include/oasr/norm.cuh` + `norm_dispatch.inc` | LayerNorm, RMSNorm, fused add+LayerNorm/RMSNorm (with optional residual passthrough), BatchNorm1d, GroupNorm, fused norm+activation |
 | `include/oasr/conv/` | `conv1d.cuh` + `conv1d_dispatch.inc` (depthwise with asymmetric padding and optional FSMN mask/residual fusion, pointwise, causal); dense BTC Conv1D is the height-one specialization of the `conv2d.cuh` CUTLASS facade |
 | `include/oasr/pooling.cuh` | BTC AvgPool1D; vectorized 2×2 production specialization plus generic padding/ceil/count semantics |
 | `include/oasr/gemm/` | `gemm.cuh` facade, `bmm.cuh`, `group_gemm.cuh` |

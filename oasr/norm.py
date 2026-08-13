@@ -3,7 +3,7 @@
 """Functional API for normalization operations."""
 
 import functools
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -67,6 +67,54 @@ def rms_norm(
         out = torch.empty_like(input)
     _get_norm_module().rmsnorm(out, input, weight, bias, eps)
     return out
+
+
+@oasr_api
+def add_rms_norm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+    alpha: float = 1.0,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Apply fused residual add + RMSNorm.
+
+    Computes ``RMSNorm(residual + alpha * input)`` with the residual sum kept
+    in fp32 through normalization and no intermediate global-memory tensor.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    _get_norm_module().addrmsnorm(out, input, residual, weight, bias, eps, alpha)
+    return out
+
+
+@oasr_api
+def add_rms_norm_residual(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+    alpha: float = 1.0,
+    out: Optional[torch.Tensor] = None,
+    residual_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply fused residual add + RMSNorm and return the unnormalized sum.
+
+    The normalized output consumes ``residual + alpha * input`` directly in
+    fp32. The returned residual is that sum rounded to the input dtype for the
+    next pre-norm sublayer.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    if residual_out is None:
+        residual_out = torch.empty_like(input)
+    _get_norm_module().addrmsnorm_residual(
+        out, residual_out, input, residual, weight, bias, eps, alpha
+    )
+    return out, residual_out
 
 
 @oasr_api
@@ -163,8 +211,9 @@ def add_layer_norm(
     bias: torch.Tensor,
     eps: float = 1e-5,
     out: Optional[torch.Tensor] = None,
+    alpha: float = 1.0,
 ) -> torch.Tensor:
-    """Apply fused Add + LayerNorm: output = LayerNorm(input + residual).
+    """Apply fused Add + LayerNorm: output = LayerNorm(residual + alpha * input).
 
     Args:
         input: Input tensor [batch, seq_len, hidden_size].
@@ -173,13 +222,14 @@ def add_layer_norm(
         bias: Offset parameter [hidden_size].
         eps: Epsilon for numerical stability.
         out: Optional pre-allocated output tensor.
+        alpha: Scale applied to ``input`` before the residual add.
 
     Returns:
         Normalized tensor with same shape as input.
     """
     if out is None:
         out = torch.empty_like(input)
-    _get_norm_module().addlayernorm(out, input, residual, weight, bias, eps)
+    _get_norm_module().addlayernorm(out, input, residual, weight, bias, eps, alpha)
     return out
 
 
@@ -198,13 +248,15 @@ def add_layer_norm_residual(
 
     Computes, in a single kernel launch::
 
-        s   = residual + alpha * input
-        out = LayerNorm(s)            # == s normalized, scaled, shifted
+        s_float = float(residual) + alpha * float(input)
+        out     = LayerNorm(s_float)
+        s       = cast_to_input_dtype(s_float)
 
     and returns ``(out, s)``.  ``s`` is the value a pre-norm residual stream
     carries forward, so this folds the per-sublayer ``x = residual + a*sub(x)``
     add (and its scale) into the *following* LayerNorm with no extra elementwise
-    kernels.  Bit-identical to ``layer_norm(residual + alpha * input)``.
+    kernels. The normalization consumes the fp32 sum directly; only the
+    carried residual and normalized output are rounded to the input dtype.
 
     Args:
         input: Sub-layer output ``[..., hidden]``.

@@ -250,6 +250,35 @@ def test_models_do_not_call_bare_torch_activations():
     )
 
 
+def test_eligible_residual_norm_paths_use_fused_waist():
+    """Keep KG14's model wiring from silently regressing to separate adds."""
+    models_dir = Path(__file__).resolve().parents[1] / "oasr" / "models"
+    expected = {
+        "whisper/model.py": {"forward_add": 2, "forward_add_residual": 5},
+        "speech_llm/audio_tower.py": {"forward_add_residual": 2},
+        "speech_llm/llm.py": {"forward_add_residual": 2},
+        "paraformer/encoder.py": {"forward_add": 2, "forward_add_residual": 3},
+        "paraformer/decoder.py": {"forward_add": 1, "forward_add_residual": 2},
+        "nemotron/encoder.py": {"forward_add": 2, "forward_add_residual": 6},
+    }
+    missing = []
+    for relative, minimums in expected.items():
+        tree = ast.parse((models_dir / relative).read_text(), filename=relative)
+        counts = dict.fromkeys(minimums, 0)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr in counts:
+                    counts[node.func.attr] += 1
+        for name, minimum in minimums.items():
+            if counts[name] < minimum:
+                missing.append(f"{relative}: {name}={counts[name]} (expected >= {minimum})")
+    assert not missing, (
+        "eligible residual + norm sites no longer use the fused waist:\n  "
+        + "\n  ".join(missing)
+        + "\nZipformer is intentionally absent: its learned lerp bypass + BiasNorm belongs to KG12."
+    )
+
+
 @pytest.mark.parametrize(
     "oasr_cls,torch_cls,args",
     [
@@ -836,7 +865,7 @@ class TestKernelAndTorchPathsAgree:
         """``hidden=100`` is not a multiple of the fp16 vector width (8).  The
         launchers used to take the vectorized path anyway and fault the CUDA
         context with a misaligned address; they now drop to the scalar kernel."""
-        from oasr.layers import AddLayerNorm, BiasNorm, LayerNorm, RMSNorm
+        from oasr.layers import AddLayerNorm, AddRMSNorm, BiasNorm, LayerNorm, RMSNorm
 
         x = torch.randn(4, 8, hidden, device="cuda", dtype=dtype)
         for m in (
@@ -849,12 +878,19 @@ class TestKernelAndTorchPathsAgree:
                 ref = m(x)
             torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
 
-        add = AddLayerNorm(hidden).cuda().to(dtype)
         r = torch.randn_like(x)
-        got = add(x, r)
-        with layers_backend_override("torch"):
-            ref = add(x, r)
-        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+        for add in (
+            AddLayerNorm(hidden).cuda().to(dtype),
+            AddRMSNorm(hidden, bias=False).cuda().to(dtype),
+        ):
+            got = add(x, r)
+            got_norm, got_residual = add.forward_residual(x, r, alpha=0.5)
+            with layers_backend_override("torch"):
+                ref = add(x, r)
+                ref_norm, ref_residual = add.forward_residual(x, r, alpha=0.5)
+            torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(got_norm, ref_norm, rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(got_residual, ref_residual, rtol=0, atol=0)
 
     def test_norm_refuses_non_contiguous_input(self):
         """A conv encoder's ``transpose(1, 2)`` output is not row-contiguous and

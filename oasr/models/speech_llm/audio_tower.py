@@ -15,7 +15,7 @@ proportionally fewer audio embeddings.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Tuple, cast
 
 import torch
 from torch import nn
@@ -77,13 +77,13 @@ class _TowerLayer(nn.Module):
         self.fc2 = RowParallelLinear(cfg.audio_encoder_ffn_dim, d)
         self.final_layer_norm = LayerNorm(d, eps=TORCH_EPS)
 
-    def forward(self, x: torch.Tensor, kv_lens: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.self_attn_layer_norm(x)
-        x = residual + self.self_attn(x, kv_lens)
-        residual = x
-        x = self.final_layer_norm(x)
-        return residual + self.fc2(self.fc1(x))
+    def forward(
+        self, h: torch.Tensor, residual: torch.Tensor, kv_lens: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return this layer's FFN output and updated residual separately."""
+        attn = self.self_attn(h, kv_lens)
+        h, residual = self.final_layer_norm.forward_add_residual(attn, residual)
+        return self.fc2(self.fc1(h)), residual
 
 
 class Qwen2AudioTower(BaseEncoder):
@@ -140,8 +140,20 @@ class Qwen2AudioTower(BaseEncoder):
         # kernel rather than building a (B, 1, 1, T) additive mask.
         feat_lens = self.feat_lengths(lens)
 
-        for layer in self.layers:
-            x = layer(x, feat_lens)
+        layers = [cast(_TowerLayer, layer) for layer in self.layers]
+        if layers:
+            residual = x
+            h = layers[0].self_attn_layer_norm(x)
+            for i, layer in enumerate(layers):
+                ff, residual = layer(h, residual, feat_lens)
+                if i + 1 < len(layers):
+                    h, residual = layers[i + 1].self_attn_layer_norm.forward_add_residual(
+                        ff, residual
+                    )
+                else:
+                    # Average pooling separates the last residual add from the
+                    # tower's final LayerNorm, so this one cannot be fused.
+                    x = residual + ff
 
         x = self.avg_pooler(x)
         x = self.layer_norm(x)

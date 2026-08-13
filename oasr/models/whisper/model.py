@@ -93,14 +93,12 @@ class _EncoderLayer(nn.Module):
         self.fc2 = RowParallelLinear(cfg.encoder_ffn_dim, cfg.d_model)
         self.final_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.self_attn_layer_norm(x)
-        k, v = self.self_attn.kv(x)
-        x = residual + self.self_attn(x, k, v)
-        residual = x
-        x = self.final_layer_norm(x)
-        return residual + self.fc2(self.fc1(x))
+    def forward(self, h: torch.Tensor, residual: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return this layer's FFN output and updated residual separately."""
+        k, v = self.self_attn.kv(h)
+        attn = self.self_attn(h, k, v)
+        h, residual = self.final_layer_norm.forward_add_residual(attn, residual)
+        return self.fc2(self.fc1(h)), residual
 
 
 class WhisperEncoder(BaseEncoder):
@@ -137,9 +135,20 @@ class WhisperEncoder(BaseEncoder):
                 "to the 30 s Whisper window (feature_type='whisper_logmel')"
             )
         x = x + self.embed_positions.weight[:T].to(x.dtype)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.layer_norm(x)
+        layers = [cast(_EncoderLayer, layer) for layer in self.layers]
+        if layers:
+            residual = x
+            h = layers[0].self_attn_layer_norm(x)
+            for i, layer in enumerate(layers):
+                ff, residual = layer(h, residual)
+                if i + 1 < len(layers):
+                    h, residual = layers[i + 1].self_attn_layer_norm.forward_add_residual(
+                        ff, residual
+                    )
+                else:
+                    x = self.layer_norm.forward_add(ff, residual)
+        else:
+            x = self.layer_norm(x)
         masks = torch.ones(x.size(0), 1, T, dtype=torch.bool, device=x.device)
         return x, masks
 
@@ -167,6 +176,38 @@ class _DecoderLayer(nn.Module):
         self.fc1 = LinearActivation(cfg.d_model, cfg.decoder_ffn_dim, activation_type="gelu")
         self.fc2 = RowParallelLinear(cfg.decoder_ffn_dim, cfg.d_model)
         self.final_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        residual: torch.Tensor,
+        self_k: Optional[torch.Tensor],
+        self_v: Optional[torch.Tensor],
+        cross_k: torch.Tensor,
+        cross_v: torch.Tensor,
+        is_causal: bool,
+        collect: Optional["_CrossAttnCollector"] = None,
+        layer_idx: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run one decoder layer from an already-normalized input.
+
+        The FFN output remains separate from the residual so the parent can
+        fuse their addition into the following layer's ``self_attn_layer_norm``.
+        """
+        k_new, v_new = self.self_attn.kv(h)
+        if self_k is not None:
+            k = torch.cat([self_k, k_new], dim=2)
+            v = torch.cat([self_v, v_new], dim=2)
+        else:
+            k, v = k_new, v_new
+
+        self_attn = self.self_attn(h, k, v, is_causal=is_causal)
+        h, residual = self.encoder_attn_layer_norm.forward_add_residual(self_attn, residual)
+        if collect is not None:
+            collect.capture(layer_idx, self.encoder_attn, h, cross_k)
+        cross_attn = self.encoder_attn(h, cross_k, cross_v)
+        h, residual = self.final_layer_norm.forward_add_residual(cross_attn, residual)
+        return self.fc2(self.fc1(h)), residual, k, v
 
 
 class _CrossAttnCollector:
@@ -268,33 +309,30 @@ class WhisperDecoder(BaseDecoder):
         B, T = ids.shape
         pos = torch.arange(offset, offset + T, device=ids.device)
         x = self.embed_tokens(ids) + self.embed_positions(pos).to(self.embed_tokens.weight.dtype)
-        for i, layer in enumerate(self.layers):
-            residual = x
-            h = layer.self_attn_layer_norm(x)
-            k_new, v_new = layer.self_attn.kv(h)
-            if state["self_k"][i] is not None:
-                k = torch.cat([state["self_k"][i], k_new], dim=2)
-                v = torch.cat([state["self_v"][i], v_new], dim=2)
-            else:
-                k, v = k_new, v_new
+        layers = [cast(_DecoderLayer, layer) for layer in self.layers]
+        if not layers:
+            x = self.layer_norm(x)
+            return x @ self.embed_tokens.weight.t()
+
+        residual = x
+        h = layers[0].self_attn_layer_norm(x)
+        for i, layer in enumerate(layers):
+            ff, residual, k, v = layer(
+                h,
+                residual,
+                state["self_k"][i],
+                state["self_v"][i],
+                state["cross_k"][i],
+                state["cross_v"][i],
+                is_causal=is_prefill and T > 1,
+                collect=collect,
+                layer_idx=i,
+            )
             state["self_k"][i], state["self_v"][i] = k, v
-            # Prefill attends causally within the prompt; a single-token step
-            # attends the full cache (its row is the last query position).
-            x = residual + layer.self_attn(h, k, v, is_causal=is_prefill and T > 1)
-            residual = x
-            h = layer.encoder_attn_layer_norm(x)
-            if collect is not None:
-                # ``nn.Module.__getattr__`` types every submodule as
-                # ``Tensor | Module``; the cast is the same one the transducer
-                # strategy's ``_surface`` makes, for the same reason.
-                collect.capture(
-                    i, cast(_WhisperAttention, layer.encoder_attn), h, state["cross_k"][i]
-                )
-            x = residual + layer.encoder_attn(h, state["cross_k"][i], state["cross_v"][i])
-            residual = x
-            h = layer.final_layer_norm(x)
-            x = residual + layer.fc2(layer.fc1(h))
-        x = self.layer_norm(x)
+            if i + 1 < len(layers):
+                h, residual = layers[i + 1].self_attn_layer_norm.forward_add_residual(ff, residual)
+            else:
+                x = self.layer_norm.forward_add(ff, residual)
         return x @ self.embed_tokens.weight.t()  # tied projection → (B, T, V)
 
     @torch.no_grad()

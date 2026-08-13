@@ -13,7 +13,7 @@ features; here it is the first op of the encoder so it travels with the model
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple, cast
 
 import torch
 from torch import nn
@@ -53,16 +53,30 @@ class EncoderLayerSANM(nn.Module):
         self.norm1 = LayerNorm(in_size, eps=LAYER_NORM_EPS)
         self.norm2 = LayerNorm(size, eps=LAYER_NORM_EPS)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.norm1(x)
-        x = self.self_attn(x, mask, kv_lens=lens)
-        if self.in_size == self.size:
-            x = residual + x
+    def forward(
+        self,
+        h: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        mask: torch.Tensor,
+        lens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run one layer from an already-normalized input.
 
-        residual = x
-        x = self.norm2(x)
-        return residual + self.feed_forward(x)
+        Returns the FFN output separately from the updated residual so the
+        parent encoder can fold their addition into the following ``norm1``.
+        The width-changing first layer passes ``residual=None`` because its
+        attention branch has no shape-compatible residual.
+        """
+        attn = self.self_attn(h, mask, kv_lens=lens)
+        if self.in_size == self.size:
+            if residual is None:
+                raise RuntimeError("same-width EncoderLayerSANM requires a residual stream")
+            h, residual = self.norm2.forward_add_residual(attn, residual)
+        else:
+            residual = attn
+            h = self.norm2(attn)
+
+        return self.feed_forward(h), residual
 
 
 class SANMEncoder(BaseEncoder):
@@ -92,10 +106,26 @@ class SANMEncoder(BaseEncoder):
         xs = xs * self._config.encoder_output_size**0.5
         xs = xs + sinusoidal_position_encoding(T, xs.size(-1), xs.device, xs.dtype)
 
-        xs = self.encoders0[0](xs, masks, lens)
-        for layer in self.encoders:
-            xs = layer(xs, masks, lens)
-        return self.after_norm(xs), masks
+        # The width-changing first SANM attention has no residual. Its FFN
+        # residual can still fold into the next layer's first norm (or the
+        # encoder's final norm when this is a one-layer configuration).
+        first = cast(EncoderLayerSANM, self.encoders0[0])
+        h = first.norm1(xs)
+        ff, residual = first(h, None, masks, lens)
+
+        encoders = [cast(EncoderLayerSANM, layer) for layer in self.encoders]
+        if not encoders:
+            return self.after_norm.forward_add(ff, residual), masks
+
+        h, residual = encoders[0].norm1.forward_add_residual(ff, residual)
+        for i, layer in enumerate(encoders):
+            ff, residual = layer(h, residual, masks, lens)
+
+            if i + 1 < len(encoders):
+                h, residual = encoders[i + 1].norm1.forward_add_residual(ff, residual)
+            else:
+                xs = self.after_norm.forward_add(ff, residual)
+        return xs, masks
 
     # -- BaseEncoder introspection ------------------------------------------
     @property

@@ -9,8 +9,11 @@
 # Norm family
 --routine norm --subroutine layer_norm --batch 64 --seq 250 --hidden 512
 --routine norm --subroutine add_layer_norm --batch 64 --seq 250 --hidden 512
+--routine norm --subroutine add_layer_norm_residual --batch 16 --seq 1500 --hidden 384
 --routine norm --subroutine layer_norm_activation --batch 64 --seq 250 --hidden 512
 --routine norm --subroutine rms_norm --batch 64 --seq 250 --hidden 512
+--routine norm --subroutine add_rms_norm --batch 4 --seq 128 --hidden 3584
+--routine norm --subroutine add_rms_norm_residual --batch 4 --seq 128 --hidden 3584
 --routine norm --subroutine batch_norm --batch 64 --seq 250 --hidden 512 --dtype float32
 --routine norm --subroutine batch_norm_swish --batch 64 --seq 250 --hidden 512
 --routine norm --subroutine batch_norm_activation --batch 64 --seq 250 --hidden 512

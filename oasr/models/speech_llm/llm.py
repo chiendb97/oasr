@@ -39,7 +39,7 @@ kernel would have to copy whole, once per layer per step.  Paged-KV storage
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, cast
 
 import torch
 from torch import nn
@@ -118,6 +118,61 @@ class _Qwen2Layer(nn.Module):
             cfg.text_hidden_size, eps=cfg.text_rms_norm_eps, bias=False
         )
 
+    def forward(
+        self,
+        h: torch.Tensor,
+        residual: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        state: Dict[str, Any],
+        layer_idx: int,
+        t_prev: int,
+        mask_kwargs: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run one LM layer and return its MLP output separately."""
+        q, k_new, v_new = self.self_attn.qkv(h, cos, sin)
+        k, v, kv_extent = self._append_kv(state, layer_idx, t_prev, k_new, v_new)
+        attn = self.self_attn.attend(q, k, v, mask_kwargs, kv_extent)
+        h, residual = self.post_attention_layernorm.forward_add_residual(attn, residual)
+        return self.mlp(h), residual
+
+    @staticmethod
+    def _append_kv(
+        state: Dict[str, Any],
+        layer_idx: int,
+        t_prev: int,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Append this layer's new K/V; return ``(k, v, valid_len)``.
+
+        Preallocated mode writes new tokens into a zero-initialized capacity
+        buffer. Legacy mode grows exact-length tensors with ``torch.cat``.
+        """
+        t_new = k_new.size(2)
+        cap = state["cap"]
+        k_buf, v_buf = state["k"][layer_idx], state["v"][layer_idx]
+        if cap is not None and k_buf is None:
+            batch, h_kv, _, head_dim = k_new.shape
+            # The fused attention kernel may read the in-bounds tail of its
+            # final partial K block, so untouched capacity must be zero rather
+            # than uninitialized memory containing a NaN/Inf bit pattern.
+            k_buf = k_new.new_zeros(batch, h_kv, cap, head_dim)
+            v_buf = v_new.new_zeros(batch, h_kv, cap, head_dim)
+            state["k"][layer_idx], state["v"][layer_idx] = k_buf, v_buf
+        if cap is not None and t_prev + t_new <= cap:
+            k_buf[:, :, t_prev : t_prev + t_new] = k_new
+            v_buf[:, :, t_prev : t_prev + t_new] = v_new
+            return k_buf, v_buf, t_prev + t_new
+        if k_buf is not None:
+            k = torch.cat([k_buf[:, :, :t_prev], k_new], dim=2) if t_prev else k_new
+            v = torch.cat([v_buf[:, :, :t_prev], v_new], dim=2) if t_prev else v_new
+        else:
+            k, v = k_new, v_new
+        state["k"][layer_idx], state["v"][layer_idx] = k, v
+        state["cap"] = None
+        return k, v, k.size(2)
+
 
 class Qwen2Lm(BaseDecoder):
     """Qwen2 causal LM (HF parameter names under ``layers.N.*`` / ``norm`` /
@@ -160,72 +215,23 @@ class Qwen2Lm(BaseDecoder):
         """Shared prefill/step trunk: run every layer, appending to the KV state."""
         t_prev = state["len"]
         t_new = x.size(1)
-        for i, layer in enumerate(self.layers):
-            residual = x
-            h = layer.input_layernorm(x)
-            q, k_new, v_new = layer.self_attn.qkv(h, cos, sin)
-            k, v, kv_extent = self._append_kv(state, i, t_prev, k_new, v_new)
-            x = residual + layer.self_attn.attend(q, k, v, mask_kwargs, kv_extent)
-            residual = x
-            h = layer.post_attention_layernorm(x)
-            x = residual + layer.mlp(h)
+        layers = [cast(_Qwen2Layer, layer) for layer in self.layers]
+        if not layers:
+            state["len"] = t_prev + t_new
+            return x
+
+        residual = x
+        h = layers[0].input_layernorm(x)
+        for i, layer in enumerate(layers):
+            mlp, residual = layer(h, residual, cos, sin, state, i, t_prev, mask_kwargs)
+            if i + 1 < len(layers):
+                h, residual = layers[i + 1].input_layernorm.forward_add_residual(mlp, residual)
+            else:
+                # Prefill normalizes only the final token below, so doing the
+                # last RMSNorm here would add work over the whole prompt.
+                x = residual + mlp
         state["len"] = t_prev + t_new
         return x
-
-    @staticmethod
-    def _append_kv(
-        state: Dict[str, Any],
-        i: int,
-        t_prev: int,
-        k_new: torch.Tensor,
-        v_new: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """Append layer ``i``'s new K/V; return ``(k, v, valid_len)``.
-
-        Preallocated mode (``state["cap"]`` set and roomy): write the new tokens
-        into their slots in place and return the **whole buffer** plus the cached
-        length — upstream FlashAttention's KV-cache convention.  Returning a
-        ``[:t]`` view instead (which this did) looks free but is not: the slice
-        has a stride gap, so the fused attention kernel cannot address it and
-        copies the entire K and V cache, per layer, per call.  The length bounds
-        the K loop just as tightly, so the buffer form costs nothing and is
-        measured 1.23-1.54x (prefill) / 1.45-1.88x (decode step) faster,
-        bit-identical.  Legacy mode (no capacity, or overflow): cat-grow, where
-        the tensor is already exactly ``valid_len`` long.
-        """
-        t_new = k_new.size(2)
-        cap = state["cap"]
-        k_buf, v_buf = state["k"][i], state["v"][i]
-        if cap is not None and k_buf is None:
-            # First append (prefill): allocate the full-capacity buffers.
-            B, h_kv, _, d = k_new.shape
-            # Zeroed, not ``new_empty``.  Handing the attention kernel the whole
-            # buffer (above) means its last, partially-valid K block reads
-            # columns in ``[t, round_up(t, n_block))`` that are now *in bounds*
-            # of the tensor, so the load's bounds predicate no longer zero-fills
-            # them.  Uninitialized memory there can hold NaN/Inf bit patterns,
-            # and the result was a kernel path whose repeated runs on identical
-            # input disagreed (SDPA's did not) — caught by a determinism check,
-            # not by parity, because every individual run looked plausible.
-            # Zeroing costs one pass over the cache per request (~0.6% of a 7B
-            # batch) and makes the region harmless whatever the mask does.
-            k_buf = k_new.new_zeros(B, h_kv, cap, d)
-            v_buf = v_new.new_zeros(B, h_kv, cap, d)
-            state["k"][i], state["v"][i] = k_buf, v_buf
-        if cap is not None and t_prev + t_new <= cap:
-            k_buf[:, :, t_prev : t_prev + t_new] = k_new
-            v_buf[:, :, t_prev : t_prev + t_new] = v_new
-            return k_buf, v_buf, t_prev + t_new
-        # Legacy growth (no capacity hint, or capacity overflow).  An
-        # overflowing preallocated buffer degrades to cat of the valid slice.
-        if k_buf is not None:
-            k = torch.cat([k_buf[:, :, :t_prev], k_new], dim=2) if t_prev else k_new
-            v = torch.cat([v_buf[:, :, :t_prev], v_new], dim=2) if t_prev else v_new
-        else:
-            k, v = k_new, v_new
-        state["k"][i], state["v"][i] = k, v
-        state["cap"] = None  # buffers are now exact-length; stay on cat-growth
-        return k, v, k.size(2)
 
     def prefill(
         self,

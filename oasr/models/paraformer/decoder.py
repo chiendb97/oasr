@@ -13,7 +13,7 @@ encoder memory.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, cast
 
 import torch
 from torch import nn
@@ -28,7 +28,13 @@ from .modules import LAYER_NORM_EPS, DecoderFeedForward, FsmnBlock, SanmCrossAtt
 class DecoderLayerSANM(nn.Module):
     """One NAR decoder layer; ``self_attn`` / ``src_attn`` may be ``None``
     (the final ``decoders3`` layer is FFN-only — and per FunASR it returns the
-    FFN output *without* a residual in that case)."""
+    FFN output *without* a residual in that case).
+
+    Regular layers consume the already-normalized input ``h`` plus its
+    unnormalized residual stream. Their cross-attention output is deliberately
+    left unadded: the parent decoder folds that add into the following layer's
+    ``norm1`` (or the final FFN layer's ``norm1``).
+    """
 
     def __init__(
         self,
@@ -49,27 +55,27 @@ class DecoderLayerSANM(nn.Module):
 
     def forward(
         self,
-        tgt: torch.Tensor,
+        h: torch.Tensor,
+        residual: torch.Tensor,
         tgt_mask: torch.Tensor,
         memory: torch.Tensor,
         memory_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = tgt
-        tgt = self.norm1(tgt)
-        tgt = self.feed_forward(tgt)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run one regular layer and return ``(cross_attn, residual)``.
 
-        x = tgt
-        if self.self_attn is not None:
-            tgt = self.norm2(tgt)
-            x = self.self_attn(tgt, tgt_mask)
-            x = residual + x
+        ``h`` is ``norm1(residual)`` from the decoder's cross-layer fused
+        chain. The returned cross-attention output remains separate from the
+        residual so the next ``norm1`` can fuse their addition.
+        """
+        if self.self_attn is None or self.src_attn is None:
+            raise RuntimeError("DecoderLayerSANM.forward requires a regular attention layer")
 
-        if self.src_attn is not None:
-            residual = x
-            x = self.norm3(x)
-            x = residual + self.src_attn(x, memory, memory_lens)
-
-        return x
+        ff = self.feed_forward(h)
+        h = self.norm2(ff)
+        self_attn = self.self_attn(h, tgt_mask)
+        h, residual = self.norm3.forward_add_residual(self_attn, residual)
+        cross_attn = self.src_attn(h, memory, memory_lens)
+        return cross_attn, residual
 
 
 class ParaformerSANMDecoder(nn.Module):
@@ -125,9 +131,24 @@ class ParaformerSANMDecoder(nn.Module):
         memory_lens = memory_lens.to(device)
 
         x = acoustic_embeds
-        for layer in self.decoders:
-            x = layer(x, tgt_mask, memory, memory_lens)
-        x = self.decoders3[0](x, tgt_mask, memory, memory_lens)
+        layers = [cast(DecoderLayerSANM, layer) for layer in self.decoders]
+        final_layer = cast(DecoderLayerSANM, self.decoders3[0])
+        if layers:
+            residual = x
+            h = layers[0].norm1(x)
+            for i, layer in enumerate(layers):
+                cross_attn, residual = layer(h, residual, tgt_mask, memory, memory_lens)
+
+                if i + 1 < len(layers):
+                    h, residual = layers[i + 1].norm1.forward_add_residual(cross_attn, residual)
+                else:
+                    h = final_layer.norm1.forward_add(cross_attn, residual)
+            # The final FFN-only layer intentionally has no residual.
+            x = final_layer.feed_forward(h)
+        else:
+            # A zero-attention-layer configuration still runs the final
+            # FFN-only layer with its own pre-norm.
+            x = final_layer.feed_forward(final_layer.norm1(x))
         x = self.after_norm(x)
         # Drop the alignment padding before the softmax so the returned width is
         # the true vocabulary and the normalizer is exactly the unpadded one.
