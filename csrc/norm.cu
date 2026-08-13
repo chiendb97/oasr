@@ -9,6 +9,49 @@
 
 using namespace oasr;
 
+namespace {
+
+bool same_dtype(const TensorView& lhs, const TensorView& rhs) {
+    return lhs.dtype().code == rhs.dtype().code && lhs.dtype().bits == rhs.dtype().bits &&
+           lhs.dtype().lanes == rhs.dtype().lanes;
+}
+
+void check_add_norm_inputs(TensorView output, TensorView input, TensorView residual,
+                           TensorView weight, Optional bias_opt) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output);
+    CHECK_INPUT(residual);
+    CHECK_INPUT(weight);
+    CHECK_DEVICE(input, output);
+    CHECK_DEVICE(input, residual);
+    CHECK_DEVICE(input, weight);
+    TVM_FFI_ICHECK(input.ndim() >= 1) << "Norm input must have at least one dimension";
+    CHECK_ROW_DENSE_INPUT(input);
+    CHECK_SAME_LAYOUT(input, output);
+    CHECK_SAME_LAYOUT(input, residual);
+    TVM_FFI_ICHECK(same_dtype(input, output) && same_dtype(input, residual) &&
+                   same_dtype(input, weight))
+        << "Input, residual, weight, and output must have the same dtype";
+
+    int64_t hidden_size = input.size(input.ndim() - 1);
+    TVM_FFI_ICHECK(hidden_size > 0) << "Norm hidden dimension must be positive";
+    TVM_FFI_ICHECK(weight.ndim() == 1 && weight.size(0) == hidden_size)
+        << "Norm weight must be 1-D with length equal to the input's last dimension";
+    CHECK_CONTIGUOUS_INPUT(weight);
+
+    if (bias_opt.has_value()) {
+        TensorView bias = bias_opt.value();
+        CHECK_INPUT(bias);
+        CHECK_DEVICE(input, bias);
+        CHECK_CONTIGUOUS_INPUT(bias);
+        TVM_FFI_ICHECK(same_dtype(input, bias)) << "Norm bias must have the input dtype";
+        TVM_FFI_ICHECK(bias.ndim() == 1 && bias.size(0) == hidden_size)
+            << "Norm bias must be 1-D with length equal to the input's last dimension";
+    }
+}
+
+}  // namespace
+
 // =============================================================================
 // LayerNorm launcher
 // =============================================================================
@@ -34,11 +77,11 @@ void layernorm(TensorView output, TensorView input, TensorView weight, Optional 
         if (bias_opt.has_value()) {
             bias_ptr = static_cast<const c_type*>(bias_opt.value().data_ptr());
         }
-        cudaError_t status = norm::LayerNorm<c_type>(
-            static_cast<const c_type*>(input.data_ptr()),
-            static_cast<const c_type*>(weight.data_ptr()), bias_ptr,
-            static_cast<c_type*>(output.data_ptr()), num_rows, hidden_size,
-            static_cast<float>(eps), stream);
+        cudaError_t status =
+            norm::LayerNorm<c_type>(static_cast<const c_type*>(input.data_ptr()),
+                                    static_cast<const c_type*>(weight.data_ptr()), bias_ptr,
+                                    static_cast<c_type*>(output.data_ptr()), num_rows, hidden_size,
+                                    static_cast<float>(eps), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "LayerNorm kernel failed: " << cudaGetErrorString(status);
         return true;
@@ -101,11 +144,11 @@ void rmsnorm(TensorView output, TensorView input, TensorView weight, Optional bi
         if (bias_opt.has_value()) {
             bias_ptr = static_cast<const c_type*>(bias_opt.value().data_ptr());
         }
-        cudaError_t status = norm::RMSNorm<c_type>(
-            static_cast<const c_type*>(input.data_ptr()),
-            static_cast<const c_type*>(weight.data_ptr()), bias_ptr,
-            static_cast<c_type*>(output.data_ptr()), num_rows, hidden_size,
-            static_cast<float>(eps), stream);
+        cudaError_t status =
+            norm::RMSNorm<c_type>(static_cast<const c_type*>(input.data_ptr()),
+                                  static_cast<const c_type*>(weight.data_ptr()), bias_ptr,
+                                  static_cast<c_type*>(output.data_ptr()), num_rows, hidden_size,
+                                  static_cast<float>(eps), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "RMSNorm kernel failed: " << cudaGetErrorString(status);
         return true;
@@ -129,14 +172,14 @@ void batchnorm1d(TensorView output, TensorView input, TensorView weight, TensorV
     cudaStream_t stream = get_stream(input.device());
 
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
-        cudaError_t status = norm::BatchNorm1D<c_type>(
-            static_cast<const c_type*>(input.data_ptr()),
-            static_cast<const c_type*>(weight.data_ptr()),
-            static_cast<const c_type*>(bias.data_ptr()),
-            static_cast<const c_type*>(running_mean.data_ptr()),
-            static_cast<const c_type*>(running_var.data_ptr()),
-            static_cast<c_type*>(output.data_ptr()), batch_size, seq_len, channels,
-            static_cast<float>(eps), stream);
+        cudaError_t status =
+            norm::BatchNorm1D<c_type>(static_cast<const c_type*>(input.data_ptr()),
+                                      static_cast<const c_type*>(weight.data_ptr()),
+                                      static_cast<const c_type*>(bias.data_ptr()),
+                                      static_cast<const c_type*>(running_mean.data_ptr()),
+                                      static_cast<const c_type*>(running_var.data_ptr()),
+                                      static_cast<c_type*>(output.data_ptr()), batch_size, seq_len,
+                                      channels, static_cast<float>(eps), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "BatchNorm1D kernel failed: " << cudaGetErrorString(status);
         return true;
@@ -163,9 +206,9 @@ void groupnorm(TensorView output, TensorView input, TensorView weight, TensorVie
         cudaError_t status = norm::GroupNorm<c_type>(
             static_cast<const c_type*>(input.data_ptr()),
             static_cast<const c_type*>(weight.data_ptr()),
-            static_cast<const c_type*>(bias.data_ptr()),
-            static_cast<c_type*>(output.data_ptr()), batch_size, seq_len, channels,
-            static_cast<unsigned int>(num_groups), static_cast<float>(eps), stream);
+            static_cast<const c_type*>(bias.data_ptr()), static_cast<c_type*>(output.data_ptr()),
+            batch_size, seq_len, channels, static_cast<unsigned int>(num_groups),
+            static_cast<float>(eps), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "GroupNorm kernel failed: " << cudaGetErrorString(status);
         return true;
@@ -177,7 +220,7 @@ void groupnorm(TensorView output, TensorView input, TensorView weight, TensorVie
 // =============================================================================
 
 void addlayernorm(TensorView output, TensorView input, TensorView residual, TensorView weight,
-                  Optional bias_opt, double eps) {
+                  Optional bias_opt, double eps, double alpha) {
     CHECK_INPUT(input);
     CHECK_INPUT(output);
     CHECK_INPUT(residual);
@@ -202,8 +245,8 @@ void addlayernorm(TensorView output, TensorView input, TensorView residual, Tens
             static_cast<const c_type*>(input.data_ptr()),
             static_cast<const c_type*>(residual.data_ptr()),
             static_cast<const c_type*>(weight.data_ptr()), bias_ptr,
-            static_cast<c_type*>(output.data_ptr()), num_rows, hidden_size,
-            static_cast<float>(eps), stream);
+            static_cast<c_type*>(output.data_ptr()), num_rows, hidden_size, static_cast<float>(eps),
+            static_cast<float>(alpha), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "AddLayerNorm kernel failed: " << cudaGetErrorString(status);
         return true;
@@ -246,11 +289,75 @@ void addlayernorm_residual(TensorView output, TensorView residual_out, TensorVie
             static_cast<const c_type*>(input.data_ptr()),
             static_cast<const c_type*>(residual.data_ptr()),
             static_cast<const c_type*>(weight.data_ptr()), bias_ptr,
-            static_cast<c_type*>(output.data_ptr()),
-            static_cast<c_type*>(residual_out.data_ptr()), num_rows, hidden_size,
-            static_cast<float>(eps), static_cast<float>(alpha), stream);
+            static_cast<c_type*>(output.data_ptr()), static_cast<c_type*>(residual_out.data_ptr()),
+            num_rows, hidden_size, static_cast<float>(eps), static_cast<float>(alpha), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "AddLayerNormResidual kernel failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
+// =============================================================================
+// AddRMSNorm launchers
+// =============================================================================
+
+void addrmsnorm(TensorView output, TensorView input, TensorView residual, TensorView weight,
+                Optional bias_opt, double eps, double alpha) {
+    check_add_norm_inputs(output, input, residual, weight, bias_opt);
+
+    unsigned int num_rows = 1;
+    for (int i = 0; i < input.ndim() - 1; ++i) {
+        num_rows *= input.size(i);
+    }
+    unsigned int hidden_size = input.size(input.ndim() - 1);
+    cudaStream_t stream = get_stream(input.device());
+
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+        const c_type* bias_ptr = nullptr;
+        if (bias_opt.has_value()) {
+            bias_ptr = static_cast<const c_type*>(bias_opt.value().data_ptr());
+        }
+        cudaError_t status =
+            norm::AddRMSNorm<c_type>(static_cast<const c_type*>(input.data_ptr()),
+                                     static_cast<const c_type*>(residual.data_ptr()),
+                                     static_cast<const c_type*>(weight.data_ptr()), bias_ptr,
+                                     static_cast<c_type*>(output.data_ptr()), num_rows, hidden_size,
+                                     static_cast<float>(eps), static_cast<float>(alpha), stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "AddRMSNorm kernel failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
+void addrmsnorm_residual(TensorView output, TensorView residual_out, TensorView input,
+                         TensorView residual, TensorView weight, Optional bias_opt, double eps,
+                         double alpha) {
+    check_add_norm_inputs(output, input, residual, weight, bias_opt);
+    CHECK_INPUT(residual_out);
+    CHECK_DEVICE(input, residual_out);
+    CHECK_SAME_LAYOUT(input, residual_out);
+    TVM_FFI_ICHECK(same_dtype(input, residual_out)) << "Residual output must have the input dtype";
+
+    unsigned int num_rows = 1;
+    for (int i = 0; i < input.ndim() - 1; ++i) {
+        num_rows *= input.size(i);
+    }
+    unsigned int hidden_size = input.size(input.ndim() - 1);
+    cudaStream_t stream = get_stream(input.device());
+
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+        const c_type* bias_ptr = nullptr;
+        if (bias_opt.has_value()) {
+            bias_ptr = static_cast<const c_type*>(bias_opt.value().data_ptr());
+        }
+        cudaError_t status = norm::AddRMSNormResidual<c_type>(
+            static_cast<const c_type*>(input.data_ptr()),
+            static_cast<const c_type*>(residual.data_ptr()),
+            static_cast<const c_type*>(weight.data_ptr()), bias_ptr,
+            static_cast<c_type*>(output.data_ptr()), static_cast<c_type*>(residual_out.data_ptr()),
+            num_rows, hidden_size, static_cast<float>(eps), static_cast<float>(alpha), stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "AddRMSNormResidual kernel failed: " << cudaGetErrorString(status);
         return true;
     });
 }
@@ -274,11 +381,11 @@ void cmvn(TensorView output, TensorView input, TensorView mean, TensorView istd)
     cudaStream_t stream = get_stream(input.device());
 
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
-        cudaError_t status = norm::CMVN<c_type>(
-            static_cast<const c_type*>(input.data_ptr()),
-            static_cast<const c_type*>(mean.data_ptr()),
-            static_cast<const c_type*>(istd.data_ptr()),
-            static_cast<c_type*>(output.data_ptr()), num_rows, num_cols, stream);
+        cudaError_t status =
+            norm::CMVN<c_type>(static_cast<const c_type*>(input.data_ptr()),
+                               static_cast<const c_type*>(mean.data_ptr()),
+                               static_cast<const c_type*>(istd.data_ptr()),
+                               static_cast<c_type*>(output.data_ptr()), num_rows, num_cols, stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "CMVN kernel failed: " << cudaGetErrorString(status);
         return true;
@@ -289,8 +396,8 @@ void cmvn(TensorView output, TensorView input, TensorView mean, TensorView istd)
 // Fused norm+activation launchers
 // =============================================================================
 
-void layernorm_activation(TensorView output, TensorView input, TensorView weight,
-                          Optional bias_opt, double eps, int64_t activation_type) {
+void layernorm_activation(TensorView output, TensorView input, TensorView weight, Optional bias_opt,
+                          double eps, int64_t activation_type) {
     CHECK_INPUT(input);
     CHECK_INPUT(output);
     CHECK_INPUT(weight);
@@ -314,8 +421,8 @@ void layernorm_activation(TensorView output, TensorView input, TensorView weight
         cudaError_t status = norm::LayerNormActivation<c_type>(
             static_cast<const c_type*>(input.data_ptr()),
             static_cast<const c_type*>(weight.data_ptr()), bias_ptr,
-            static_cast<c_type*>(output.data_ptr()), num_rows, hidden_size,
-            static_cast<float>(eps), activation, stream);
+            static_cast<c_type*>(output.data_ptr()), num_rows, hidden_size, static_cast<float>(eps),
+            activation, stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "LayerNormActivation kernel failed: " << cudaGetErrorString(status);
         return true;
@@ -347,8 +454,8 @@ void rmsnorm_activation(TensorView output, TensorView input, TensorView weight, 
         cudaError_t status = norm::RMSNormActivation<c_type>(
             static_cast<const c_type*>(input.data_ptr()),
             static_cast<const c_type*>(weight.data_ptr()), bias_ptr,
-            static_cast<c_type*>(output.data_ptr()), num_rows, hidden_size,
-            static_cast<float>(eps), activation, stream);
+            static_cast<c_type*>(output.data_ptr()), num_rows, hidden_size, static_cast<float>(eps),
+            activation, stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "RMSNormActivation kernel failed: " << cudaGetErrorString(status);
         return true;
@@ -397,14 +504,14 @@ void batchnorm_swish(TensorView output, TensorView input, TensorView weight, Ten
     cudaStream_t stream = get_stream(input.device());
 
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
-        cudaError_t status = norm::BatchNormSwish<c_type>(
-            static_cast<const c_type*>(input.data_ptr()),
-            static_cast<const c_type*>(weight.data_ptr()),
-            static_cast<const c_type*>(bias.data_ptr()),
-            static_cast<const c_type*>(running_mean.data_ptr()),
-            static_cast<const c_type*>(running_var.data_ptr()),
-            static_cast<c_type*>(output.data_ptr()), batch_size, seq_len, channels,
-            static_cast<float>(eps), stream);
+        cudaError_t status =
+            norm::BatchNormSwish<c_type>(static_cast<const c_type*>(input.data_ptr()),
+                                         static_cast<const c_type*>(weight.data_ptr()),
+                                         static_cast<const c_type*>(bias.data_ptr()),
+                                         static_cast<const c_type*>(running_mean.data_ptr()),
+                                         static_cast<const c_type*>(running_var.data_ptr()),
+                                         static_cast<c_type*>(output.data_ptr()), batch_size,
+                                         seq_len, channels, static_cast<float>(eps), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "BatchNormSwish kernel failed: " << cudaGetErrorString(status);
         return true;

@@ -8,20 +8,24 @@
 // Forward declarations of launcher functions
 void layernorm(TensorView output, TensorView input, TensorView weight, Optional bias_opt,
                double eps);
-void rmsnorm(TensorView output, TensorView input, TensorView weight, Optional bias_opt,
-             double eps);
+void rmsnorm(TensorView output, TensorView input, TensorView weight, Optional bias_opt, double eps);
 void bias_norm(TensorView output, TensorView input, TensorView bias, TensorView log_scale);
 void batchnorm1d(TensorView output, TensorView input, TensorView weight, TensorView bias,
                  TensorView running_mean, TensorView running_var, double eps);
 void groupnorm(TensorView output, TensorView input, TensorView weight, TensorView bias,
                int64_t num_groups, double eps);
 void addlayernorm(TensorView output, TensorView input, TensorView residual, TensorView weight,
-                  Optional bias_opt, double eps);
+                  Optional bias_opt, double eps, double alpha);
 void addlayernorm_residual(TensorView output, TensorView residual_out, TensorView input,
                            TensorView residual, TensorView weight, Optional bias_opt, double eps,
                            double alpha);
-void layernorm_activation(TensorView output, TensorView input, TensorView weight,
-                          Optional bias_opt, double eps, int64_t activation_type);
+void addrmsnorm(TensorView output, TensorView input, TensorView residual, TensorView weight,
+                Optional bias_opt, double eps, double alpha);
+void addrmsnorm_residual(TensorView output, TensorView residual_out, TensorView input,
+                         TensorView residual, TensorView weight, Optional bias_opt, double eps,
+                         double alpha);
+void layernorm_activation(TensorView output, TensorView input, TensorView weight, Optional bias_opt,
+                          double eps, int64_t activation_type);
 void rmsnorm_activation(TensorView output, TensorView input, TensorView weight, Optional bias_opt,
                         double eps, int64_t activation_type);
 void batchnorm_activation(TensorView output, TensorView input, TensorView weight, TensorView bias,
@@ -39,6 +43,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(batchnorm1d, batchnorm1d);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(groupnorm, groupnorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(addlayernorm, addlayernorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(addlayernorm_residual, addlayernorm_residual);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(addrmsnorm, addrmsnorm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(addrmsnorm_residual, addrmsnorm_residual);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(layernorm_activation, layernorm_activation);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm_activation, rmsnorm_activation);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(batchnorm_activation, batchnorm_activation);

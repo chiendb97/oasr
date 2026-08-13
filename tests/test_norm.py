@@ -100,6 +100,75 @@ class TestRMSNorm:
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
 
+class TestAddRMSNorm:
+    """Tests for fused residual add + RMSNorm, with and without passthrough."""
+
+    @staticmethod
+    def _reference(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        eps: float,
+        alpha: float,
+    ):
+        summed_f = residual.float() + alpha * x.float()
+        normalized = (
+            summed_f * torch.rsqrt(summed_f.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
+        )
+        if bias is not None:
+            normalized = normalized + bias.float()
+        return normalized.to(x.dtype), summed_f.to(x.dtype)
+
+    @pytest.mark.parametrize("hidden_size", [256, 257])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("alpha", [1.0, 0.5])
+    @pytest.mark.parametrize("has_bias", [True, False])
+    def test_add_rms_norm(self, hidden_size, dtype, alpha, has_bias):
+        eps = 1e-6
+        x = torch.randn(2, 17, hidden_size, device="cuda", dtype=dtype)
+        residual = torch.randn_like(x)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+        bias = torch.randn(hidden_size, device="cuda", dtype=dtype) if has_bias else None
+
+        output = oasr.add_rms_norm(x, residual, weight, bias, eps, alpha)
+        expected, _ = self._reference(x, residual, weight, bias, eps, alpha)
+
+        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (2e-2, 2e-2)
+        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("alpha", [1.0, 0.5])
+    def test_add_rms_norm_residual(self, dtype, alpha):
+        eps = 1e-6
+        x = torch.randn(2, 11, 384, device="cuda", dtype=dtype)
+        residual = torch.randn_like(x)
+        weight = torch.randn(384, device="cuda", dtype=dtype)
+        expected, summed = self._reference(x, residual, weight, None, eps, alpha)
+
+        output, residual_out = oasr.add_rms_norm_residual(x, residual, weight, None, eps, alpha)
+
+        torch.testing.assert_close(residual_out, summed, rtol=0, atol=0)
+        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (2e-2, 2e-2)
+        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
+
+    def test_destination_passing(self):
+        x = torch.randn(2, 8, 256, device="cuda", dtype=torch.float16)
+        residual = torch.randn_like(x)
+        weight = torch.randn(256, device="cuda", dtype=torch.float16)
+        out = torch.empty_like(x)
+        residual_out = torch.empty_like(x)
+
+        result = oasr.add_rms_norm(x, residual, weight, out=out)
+        assert result.data_ptr() == out.data_ptr()
+
+        result, result_residual = oasr.add_rms_norm_residual(
+            x, residual, weight, out=out, residual_out=residual_out
+        )
+        assert result.data_ptr() == out.data_ptr()
+        assert result_residual.data_ptr() == residual_out.data_ptr()
+
+
 class TestBatchNorm1D:
     """Tests for oasr.batch_norm_1d() functional API."""
 
@@ -159,7 +228,8 @@ class TestAddLayerNorm:
     """Tests for oasr.add_layer_norm() functional API."""
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-    def test_add_layer_norm(self, dtype):
+    @pytest.mark.parametrize("alpha", [1.0, 0.5])
+    def test_add_layer_norm(self, dtype, alpha):
         batch_size, seq_len, hidden_size = 2, 128, 256
         eps = 1e-5
         x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
@@ -167,11 +237,14 @@ class TestAddLayerNorm:
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
         bias = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
-        output = oasr.add_layer_norm(x, residual, weight, bias, eps)
+        output = oasr.add_layer_norm(x, residual, weight, bias, eps, alpha=alpha)
 
-        # Reference: LayerNorm(x + residual)
-        combined = x + residual
-        expected = torch.nn.functional.layer_norm(combined, (hidden_size,), weight, bias, eps)
+        # The fused add stays in fp32 through normalization and rounds only
+        # when the normalized output is stored.
+        combined = residual.float() + alpha * x.float()
+        expected = torch.nn.functional.layer_norm(
+            combined, (hidden_size,), weight.float(), bias.float(), eps
+        ).to(dtype)
 
         rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
@@ -193,12 +266,16 @@ class TestAddLayerNormResidual:
 
         out, res_out = oasr.add_layer_norm_residual(x, residual, weight, bias, eps, alpha)
 
-        # Reference matches the unfused pre-norm path: the residual sum is
-        # materialised in-dtype (s = residual + alpha*x), then LayerNorm(s).
-        s_ref = residual + alpha * x
-        expected = torch.nn.functional.layer_norm(s_ref, (hidden_size,), weight, bias, eps)
+        # Normalization consumes the sum directly in fp32. The carried residual
+        # is the only copy rounded to the served dtype.
+        s_float = residual.float() + alpha * x.float()
+        s_ref = s_float.to(dtype)
+        bias_float = None if bias is None else bias.float()
+        expected = torch.nn.functional.layer_norm(
+            s_float, (hidden_size,), weight.float(), bias_float, eps
+        ).to(dtype)
 
-        # The carried residual sum is bit-exact to the in-dtype add.
+        # The carried residual is the fp32 sum rounded once on output.
         torch.testing.assert_close(res_out, s_ref, rtol=0, atol=0)
         rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
         torch.testing.assert_close(out, expected, rtol=rtol, atol=atol)

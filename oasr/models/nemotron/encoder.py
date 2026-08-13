@@ -273,11 +273,20 @@ class NemotronEncoderLayer(nn.Module):
         attn_mask: torch.Tensor,
         silent: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        x = x + 0.5 * self.feed_forward1(self.norm_feed_forward1(x))
-        x = x + self.self_attn(self.norm_self_att(x), pos_emb, attn_mask, silent)
-        x = x + self.conv(self.norm_conv(x), silent)
-        x = x + 0.5 * self.feed_forward2(self.norm_feed_forward2(x))
-        out: torch.Tensor = self.norm_out(x)
+        residual = x
+        x = self.norm_feed_forward1(x)
+
+        ff1 = self.feed_forward1(x)
+        x, residual = self.norm_self_att.forward_add_residual(ff1, residual, alpha=0.5)
+
+        attn = self.self_attn(x, pos_emb, attn_mask, silent)
+        x, residual = self.norm_conv.forward_add_residual(attn, residual)
+
+        conv = self.conv(x, silent)
+        x, residual = self.norm_feed_forward2.forward_add_residual(conv, residual)
+
+        ff2 = self.feed_forward2(x)
+        out: torch.Tensor = self.norm_out.forward_add(ff2, residual, alpha=0.5)
         return out
 
     def forward_chunk(
@@ -295,14 +304,20 @@ class NemotronEncoderLayer(nn.Module):
         audio across its whole width for every row, which is exactly the condition
         the offline path's masking exists to handle.
         """
-        x = x + 0.5 * self.feed_forward1(self.norm_feed_forward1(x))
-        x = x + self.self_attn.forward_chunk(
-            self.norm_self_att(x), pos_emb, attn_mask, att_cache, cache_t1
-        )
-        conv_out, new_conv_cache = self.conv.forward_chunk(self.norm_conv(x), conv_cache)
-        x = x + conv_out
-        x = x + 0.5 * self.feed_forward2(self.norm_feed_forward2(x))
-        return self.norm_out(x), new_conv_cache
+        residual = x
+        x = self.norm_feed_forward1(x)
+
+        ff1 = self.feed_forward1(x)
+        x, residual = self.norm_self_att.forward_add_residual(ff1, residual, alpha=0.5)
+
+        attn = self.self_attn.forward_chunk(x, pos_emb, attn_mask, att_cache, cache_t1)
+        x, residual = self.norm_conv.forward_add_residual(attn, residual)
+
+        conv_out, new_conv_cache = self.conv.forward_chunk(x, conv_cache)
+        x, residual = self.norm_feed_forward2.forward_add_residual(conv_out, residual)
+
+        ff2 = self.feed_forward2(x)
+        return self.norm_out.forward_add(ff2, residual, alpha=0.5), new_conv_cache
 
 
 class NemotronRelPositionAttention(nn.Module):

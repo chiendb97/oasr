@@ -3,7 +3,7 @@
 //
 // Pure CUDA normalization kernels — no framework dependencies.
 // Includes LayerNorm, RMSNorm, BatchNorm1D, GroupNorm, AddLayerNorm,
-// and fused norm+activation variants.
+// AddRMSNorm, and fused norm+activation variants.
 
 #pragma once
 
@@ -308,7 +308,8 @@ __global__ void groupNormKernel(const T* __restrict__ input, T* __restrict__ out
 template <typename T, int VecSize>
 __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restrict__ residual,
                                    T* __restrict__ output, const T* __restrict__ weight,
-                                   const T* __restrict__ bias, int hidden_size, float eps) {
+                                   const T* __restrict__ bias, int hidden_size, float eps,
+                                   float alpha) {
     using VecT = oasr::Vec<T, VecSize>;
 
     const int row_idx = blockIdx.x;
@@ -329,7 +330,7 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
 
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            local_sum += static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]);
+            local_sum += static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]);
         }
     }
 
@@ -345,7 +346,7 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
 
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            float diff = static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]) - mean;
+            float diff = static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]) - mean;
             local_var = std::fmaf(diff, diff, local_var);
         }
     }
@@ -364,8 +365,8 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
         oasr::Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            vals[j] = (static_cast<float>(v_in[j]) + static_cast<float>(v_res[j]) - mean) *
-                      inv_std * static_cast<float>(v_weight[j]);
+            float sum = static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]);
+            vals[j] = (sum - mean) * inv_std * static_cast<float>(v_weight[j]);
         }
 
         if (bias != nullptr) {
@@ -389,21 +390,16 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
 //     output   = LayerNorm(s) * weight + bias
 // ``residual_out`` carries the *unnormalized* sum so the caller can chain it
 // as the residual for the next pre-norm sub-layer (Conformer / Transformer
-// pre-norm pattern).  ``s`` is materialised once in ``residual_out`` and the
-// mean / variance / normalize passes read it back, so the output is bit-
-// identical to ``layer_norm(residual + alpha * input)`` performed by two
-// separate ops — but in a single launch with one fewer DRAM round-trip of the
-// intermediate sum.
+// pre-norm pattern). The normalization math keeps the sum in float; only the
+// residual output and normalized output stores round to T.
 // =============================================================================
 
 template <typename T, int VecSize>
 __global__ void addLayerNormResidualKernel(const T* __restrict__ input,
-                                           const T* __restrict__ residual,
-                                           T* __restrict__ output,
+                                           const T* __restrict__ residual, T* __restrict__ output,
                                            T* __restrict__ residual_out,
-                                           const T* __restrict__ weight,
-                                           const T* __restrict__ bias, int hidden_size, float eps,
-                                           float alpha) {
+                                           const T* __restrict__ weight, const T* __restrict__ bias,
+                                           int hidden_size, float eps, float alpha) {
     using VecT = oasr::Vec<T, VecSize>;
 
     const int row_idx = blockIdx.x;
@@ -416,41 +412,44 @@ __global__ void addLayerNormResidualKernel(const T* __restrict__ input,
 
     __shared__ float smem[2];
 
-    // Phase 0: materialise s = residual + alpha * input into residual_out so
-    // the subsequent passes (and the caller's next sub-layer) read one tensor.
+    // Phase 0: materialise the carried residual. The normalization passes
+    // independently recompute the sum in float rather than reading this
+    // rounded T value back.
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
         VecT v_in, v_res, v_s;
         v_in.load(row_input + i * VecSize);
         v_res.load(row_residual + i * VecSize);
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            v_s[j] = static_cast<T>(static_cast<float>(v_res[j]) +
-                                    alpha * static_cast<float>(v_in[j]));
+            v_s[j] =
+                static_cast<T>(static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]));
         }
         v_s.store(row_res_out + i * VecSize);
     }
 
-    // Phase 1: mean of s.
+    // Phase 1: mean of the fp32 sum.
     float local_sum = 0.0f;
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
-        VecT v_s;
-        v_s.load(row_res_out + i * VecSize);
+        VecT v_in, v_res;
+        v_in.load(row_input + i * VecSize);
+        v_res.load(row_residual + i * VecSize);
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            local_sum += static_cast<float>(v_s[j]);
+            local_sum += static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]);
         }
     }
     float mean =
         blockBroadcast(blockReduceSum(local_sum) / static_cast<float>(hidden_size), &smem[0]);
 
-    // Phase 2: variance of s.
+    // Phase 2: variance of the fp32 sum.
     float local_var = 0.0f;
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
-        VecT v_s;
-        v_s.load(row_res_out + i * VecSize);
+        VecT v_in, v_res;
+        v_in.load(row_input + i * VecSize);
+        v_res.load(row_residual + i * VecSize);
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            float diff = static_cast<float>(v_s[j]) - mean;
+            float diff = static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]) - mean;
             local_var = std::fmaf(diff, diff, local_var);
         }
     }
@@ -460,14 +459,16 @@ __global__ void addLayerNormResidualKernel(const T* __restrict__ input,
 
     // Phase 3: normalize + affine.
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
-        VecT v_s, v_weight;
-        v_s.load(row_res_out + i * VecSize);
+        VecT v_in, v_res, v_weight;
+        v_in.load(row_input + i * VecSize);
+        v_res.load(row_residual + i * VecSize);
         v_weight.load(weight + i * VecSize);
 
         oasr::Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            vals[j] = (static_cast<float>(v_s[j]) - mean) * inv_std * static_cast<float>(v_weight[j]);
+            float sum = static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]);
+            vals[j] = (sum - mean) * inv_std * static_cast<float>(v_weight[j]);
         }
 
         if (bias != nullptr) {
@@ -480,6 +481,136 @@ __global__ void addLayerNormResidualKernel(const T* __restrict__ input,
         }
 
         oasr::vecCast<T>(vals).store(row_output + i * VecSize);
+    }
+}
+
+// =============================================================================
+// Add + RMSNorm Fused Kernels
+// =============================================================================
+
+template <typename T, int VecSize>
+__global__ void addRmsNormKernel(const T* __restrict__ input, const T* __restrict__ residual,
+                                 T* __restrict__ output, const T* __restrict__ weight,
+                                 const T* __restrict__ bias, int hidden_size, float eps,
+                                 float alpha) {
+    using VecT = oasr::Vec<T, VecSize>;
+
+    const int row_idx = blockIdx.x;
+    const T* row_input = input + row_idx * hidden_size;
+    const T* row_residual = residual + row_idx * hidden_size;
+    T* row_output = output + row_idx * hidden_size;
+    const int vec_hidden_size = hidden_size / VecSize;
+
+    __shared__ float smem;
+
+    // Keep the residual sum in float throughout the RMS reduction.
+    float local_sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_res;
+        v_in.load(row_input + i * VecSize);
+        v_res.load(row_residual + i * VecSize);
+#pragma unroll
+        for (int j = 0; j < VecSize; ++j) {
+            float sum = static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]);
+            local_sum_sq = std::fmaf(sum, sum, local_sum_sq);
+        }
+    }
+    float inv_rms = rsqrtf(
+        blockBroadcast(blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size), &smem) +
+        eps);
+
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_res, v_weight;
+        v_in.load(row_input + i * VecSize);
+        v_res.load(row_residual + i * VecSize);
+        v_weight.load(weight + i * VecSize);
+
+        oasr::Vec<float, VecSize> values;
+#pragma unroll
+        for (int j = 0; j < VecSize; ++j) {
+            float sum = static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]);
+            values[j] = sum * inv_rms * static_cast<float>(v_weight[j]);
+        }
+        if (bias != nullptr) {
+            VecT v_bias;
+            v_bias.load(bias + i * VecSize);
+#pragma unroll
+            for (int j = 0; j < VecSize; ++j) {
+                values[j] += static_cast<float>(v_bias[j]);
+            }
+        }
+        oasr::vecCast<T>(values).store(row_output + i * VecSize);
+    }
+}
+
+template <typename T, int VecSize>
+__global__ void addRmsNormResidualKernel(const T* __restrict__ input,
+                                         const T* __restrict__ residual, T* __restrict__ output,
+                                         T* __restrict__ residual_out, const T* __restrict__ weight,
+                                         const T* __restrict__ bias, int hidden_size, float eps,
+                                         float alpha) {
+    using VecT = oasr::Vec<T, VecSize>;
+
+    const int row_idx = blockIdx.x;
+    const T* row_input = input + row_idx * hidden_size;
+    const T* row_residual = residual + row_idx * hidden_size;
+    T* row_output = output + row_idx * hidden_size;
+    T* row_residual_out = residual_out + row_idx * hidden_size;
+    const int vec_hidden_size = hidden_size / VecSize;
+
+    __shared__ float smem;
+
+    // Carry the unnormalized residual stream forward without a separate add
+    // launch. The normalization passes recompute the sum in float rather than
+    // reading the rounded T residual output back.
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_res, v_sum;
+        v_in.load(row_input + i * VecSize);
+        v_res.load(row_residual + i * VecSize);
+#pragma unroll
+        for (int j = 0; j < VecSize; ++j) {
+            v_sum[j] =
+                static_cast<T>(static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]));
+        }
+        v_sum.store(row_residual_out + i * VecSize);
+    }
+
+    float local_sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_res;
+        v_in.load(row_input + i * VecSize);
+        v_res.load(row_residual + i * VecSize);
+#pragma unroll
+        for (int j = 0; j < VecSize; ++j) {
+            float sum = static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]);
+            local_sum_sq = std::fmaf(sum, sum, local_sum_sq);
+        }
+    }
+    float inv_rms = rsqrtf(
+        blockBroadcast(blockReduceSum(local_sum_sq) / static_cast<float>(hidden_size), &smem) +
+        eps);
+
+    for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+        VecT v_in, v_res, v_weight;
+        v_in.load(row_input + i * VecSize);
+        v_res.load(row_residual + i * VecSize);
+        v_weight.load(weight + i * VecSize);
+
+        oasr::Vec<float, VecSize> values;
+#pragma unroll
+        for (int j = 0; j < VecSize; ++j) {
+            float sum = static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]);
+            values[j] = sum * inv_rms * static_cast<float>(v_weight[j]);
+        }
+        if (bias != nullptr) {
+            VecT v_bias;
+            v_bias.load(bias + i * VecSize);
+#pragma unroll
+            for (int j = 0; j < VecSize; ++j) {
+                values[j] += static_cast<float>(v_bias[j]);
+            }
+        }
+        oasr::vecCast<T>(values).store(row_output + i * VecSize);
     }
 }
 
@@ -815,8 +946,8 @@ cudaError_t BiasNorm(const T* input, const T* bias, const T* log_scale, T* outpu
             input, output, bias, log_scale, static_cast<int>(hidden_size));
     } else {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size));
-        biasNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
-            input, output, bias, log_scale, static_cast<int>(hidden_size));
+        biasNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(input, output, bias, log_scale,
+                                                                  static_cast<int>(hidden_size));
     }
     return cudaGetLastError();
 }
@@ -910,7 +1041,7 @@ cudaError_t GroupNorm(const T* input, const T* weight, const T* bias, T* output,
 template <typename T>
 cudaError_t AddLayerNorm(const T* input, const T* residual, const T* weight, const T* bias,
                          T* output, unsigned int num_rows, unsigned int hidden_size, float eps,
-                         cudaStream_t stream) {
+                         float alpha, cudaStream_t stream) {
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
@@ -920,11 +1051,11 @@ cudaError_t AddLayerNorm(const T* input, const T* residual, const T* weight, con
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
         addLayerNormKernel<T, VecSize><<<num_rows, block_size, 0, stream>>>(
-            input, residual, output, weight, bias, static_cast<int>(hidden_size), eps);
+            input, residual, output, weight, bias, static_cast<int>(hidden_size), eps, alpha);
     } else {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size));
         addLayerNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
-            input, residual, output, weight, bias, static_cast<int>(hidden_size), eps);
+            input, residual, output, weight, bias, static_cast<int>(hidden_size), eps, alpha);
     }
     return cudaGetLastError();
 }
@@ -945,14 +1076,73 @@ cudaError_t AddLayerNormResidual(const T* input, const T* residual, const T* wei
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
-        addLayerNormResidualKernel<T, VecSize><<<num_rows, block_size, 0, stream>>>(
-            input, residual, output, residual_out, weight, bias, static_cast<int>(hidden_size), eps,
-            alpha);
+        addLayerNormResidualKernel<T, VecSize>
+            <<<num_rows, block_size, 0, stream>>>(input, residual, output, residual_out, weight,
+                                                  bias, static_cast<int>(hidden_size), eps, alpha);
     } else {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size));
-        addLayerNormResidualKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
-            input, residual, output, residual_out, weight, bias, static_cast<int>(hidden_size), eps,
-            alpha);
+        addLayerNormResidualKernel<T, 1>
+            <<<num_rows, block_size, 0, stream>>>(input, residual, output, residual_out, weight,
+                                                  bias, static_cast<int>(hidden_size), eps, alpha);
+    }
+    return cudaGetLastError();
+}
+
+// ---- AddRMSNorm ----
+
+template <typename T>
+cudaError_t AddRMSNorm(const T* input, const T* residual, const T* weight, const T* bias, T* output,
+                       unsigned int num_rows, unsigned int hidden_size, float eps, float alpha,
+                       cudaStream_t stream) {
+    if (num_rows == 0)
+        return cudaSuccess;
+
+    constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
+    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
+                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
+                   isAligned<T, VecSize>(residual) && isAligned<T, VecSize>(output) &&
+                   isAligned<T, VecSize>(weight) &&
+                   (bias == nullptr || isAligned<T, VecSize>(bias));
+
+    if (use_vec) {
+        int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
+        addRmsNormKernel<T, VecSize><<<num_rows, block_size, 0, stream>>>(
+            input, residual, output, weight, bias, static_cast<int>(hidden_size), eps, alpha);
+    } else {
+        int block_size = alignedBlockSize(static_cast<int>(hidden_size));
+        addRmsNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
+            input, residual, output, weight, bias, static_cast<int>(hidden_size), eps, alpha);
+    }
+    return cudaGetLastError();
+}
+
+// ---- AddRMSNormResidual ----
+
+template <typename T>
+cudaError_t AddRMSNormResidual(const T* input, const T* residual, const T* weight, const T* bias,
+                               T* output, T* residual_out, unsigned int num_rows,
+                               unsigned int hidden_size, float eps, float alpha,
+                               cudaStream_t stream) {
+    if (num_rows == 0)
+        return cudaSuccess;
+
+    constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
+    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
+                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
+                   isAligned<T, VecSize>(residual) && isAligned<T, VecSize>(output) &&
+                   isAligned<T, VecSize>(residual_out) && isAligned<T, VecSize>(weight) &&
+                   (bias == nullptr || isAligned<T, VecSize>(bias));
+
+    if (use_vec) {
+        int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
+        addRmsNormResidualKernel<T, VecSize>
+            <<<num_rows, block_size, 0, stream>>>(input, residual, output, residual_out, weight,
+                                                  bias, static_cast<int>(hidden_size), eps, alpha);
+    } else {
+        int block_size = alignedBlockSize(static_cast<int>(hidden_size));
+        addRmsNormResidualKernel<T, 1>
+            <<<num_rows, block_size, 0, stream>>>(input, residual, output, residual_out, weight,
+                                                  bias, static_cast<int>(hidden_size), eps, alpha);
     }
     return cudaGetLastError();
 }

@@ -19,8 +19,11 @@ Currently supports testing the following kernel families:
 - Normalization:
     - `layer_norm` - Layer normalization.
     - `add_layer_norm` - Fused residual add + layer normalization.
+    - `add_layer_norm_residual` - Fused add + LayerNorm with residual passthrough.
     - `layer_norm_activation` - Fused layer normalization + activation.
     - `rms_norm` - Root mean square normalization.
+    - `add_rms_norm` - Fused residual add + RMSNorm.
+    - `add_rms_norm_residual` - Fused add + RMSNorm with residual passthrough.
     - `batch_norm` - Batch normalization (1D, inference mode).
     - `batch_norm_swish` - Fused batch normalization + Swish activation.
     - `batch_norm_activation` - Fused batch normalization + configurable activation.
@@ -102,8 +105,11 @@ Available routines and subroutines:
   norm:
     - layer_norm
     - add_layer_norm
+    - add_layer_norm_residual
     - layer_norm_activation
     - rms_norm
+    - add_rms_norm
+    - add_rms_norm_residual
     - batch_norm
     - batch_norm_swish
     - batch_norm_activation
@@ -240,7 +246,7 @@ The framework automatically selects the best available method.
 | Routine | Subroutines | Backends | Metric | SM 7.0+ | SM 8.0+ |
 |---------|-------------|----------|--------|---------|---------|
 | **gemm** | gemm, bmm, group_gemm, gemm_activation | `cutlass`, `torch` | TFLOPS | yes | yes |
-| **norm** | layer_norm, add_layer_norm, layer_norm_activation, rms_norm, batch_norm, batch_norm_swish, batch_norm_activation, group_norm | `cuda`, `torch` | TB/sec | yes | yes |
+| **norm** | layer_norm, add_layer_norm, add_layer_norm_residual, layer_norm_activation, rms_norm, add_rms_norm, add_rms_norm_residual, batch_norm, batch_norm_swish, batch_norm_activation, group_norm | `cuda`, `torch` | TB/sec | yes | yes |
 | **conv** | depthwise_conv1d, depthwise_conv1d_causal | `cuda`, `torch` | time | yes | yes |
 | **conv** | pointwise_conv1d, pointwise_conv1d_activation | `cuda`, `torch` | TFLOPS | yes | yes |
 | **conv** | conv2d, conv2d_activation | `cutlass`, `torch` | TFLOPS | yes | yes |
@@ -263,7 +269,8 @@ Conformer-base workload (d_model=256, kernel_size=15) -- typical shapes from a W
 ```
 # Normalization
 --routine norm --subroutine layer_norm --batch 64 --seq 250 --hidden 256
---routine norm --subroutine add_layer_norm --batch 64 --seq 250 --hidden 256
+--routine norm --subroutine add_layer_norm_residual --batch 16 --seq 1500 --hidden 384
+--routine norm --subroutine add_rms_norm_residual --batch 4 --seq 128 --hidden 3584
 --routine norm --subroutine batch_norm --batch 64 --seq 250 --hidden 256
 
 # Convolution
@@ -329,8 +336,10 @@ Individual `bench_*.py` scripts are preserved as thin wrappers for backwards com
 | `bench_gemm.py` | gemm | gemm, gemm_activation |
 | `bench_bmm.py` | gemm | bmm |
 | `bench_group_gemm.py` | gemm | group_gemm |
-| `bench_layer_norm.py` | norm | layer_norm, add_layer_norm, layer_norm_activation |
+| `bench_layer_norm.py` | norm | layer_norm, add_layer_norm, add_layer_norm_residual, layer_norm_activation |
 | `bench_rms_norm.py` | norm | rms_norm |
+| `bench_add_rms_norm.py` | norm | add_rms_norm |
+| `bench_add_rms_norm_residual.py` | norm | add_rms_norm_residual |
 | `bench_batch_norm.py` | norm | batch_norm, batch_norm_swish, batch_norm_activation |
 | `bench_group_norm.py` | norm | group_norm |
 | `bench_depthwise_conv1d.py` | conv | depthwise_conv1d, depthwise_conv1d_causal |

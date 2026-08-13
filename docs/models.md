@@ -335,6 +335,14 @@ CIF fire positions become per-token `RequestOutput.timestamps`.
 Checkpoint bundles load host-side (`map_location="cpu"`) with the dtype cast
 **before** the device move — an 8.4B checkpoint double-books the GPU otherwise.
 
+Pre-norm residual streams use the waist's fused add+norm operations: Whisper,
+the Qwen2-Audio tower, Paraformer, and Nemotron reuse add+LayerNorm, while the
+Qwen2 LM uses add+RMSNorm. The residual-returning forms carry the unnormalized
+sum into the next sublayer without a separate elementwise launch. Zipformer is
+intentionally different: its learned bypass is a lerp and its endpoint is
+BiasNorm, so it cannot use the LayerNorm/RMSNorm fusion without changing model
+semantics.
+
 ## Adding an architecture
 
 See the cookbook in [architecture.md](architecture.md#extension-cookbook). In

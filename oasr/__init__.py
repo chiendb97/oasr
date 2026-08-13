@@ -67,6 +67,7 @@ from .fft import rfft, rfft_power
 from .gemm import bmm, gemm, gemm_activation, gemm_log_softmax, group_gemm
 from .layers import (
     AddLayerNorm,
+    AddRMSNorm,
     AvgPool1d,
     BatchNorm1d,
     BiasNorm,
@@ -94,6 +95,8 @@ from .layers import (
 from .norm import (
     add_layer_norm,
     add_layer_norm_residual,
+    add_rms_norm,
+    add_rms_norm_residual,
     batch_norm_1d,
     batch_norm_activation,
     batch_norm_swish,
@@ -211,6 +214,8 @@ __all__ = [
     "group_norm",
     "add_layer_norm",
     "add_layer_norm_residual",
+    "add_rms_norm",
+    "add_rms_norm_residual",
     "layer_norm_activation",
     "rms_norm_activation",
     "batch_norm_activation",
@@ -267,6 +272,7 @@ __all__ = [
     "BiasNorm",
     "BatchNorm1d",
     "AddLayerNorm",
+    "AddRMSNorm",
     "AvgPool1d",
     "GlobalCMVN",
     "SoftmaxModule",

@@ -26,7 +26,7 @@ Constant             Value      Used by
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple, cast
 
 import torch
 import torch.nn as nn
@@ -74,6 +74,46 @@ def _batch_norm_ref(
     return out if bias is None else out + bias
 
 
+def _rms_norm_ref(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], eps: float
+) -> torch.Tensor:
+    """Torch spelling of OASR RMSNorm's fp32 accumulation and affine order."""
+    xf = x.float()
+    out = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
+    if bias is not None:
+        out = out + bias.float()
+    return out.to(x.dtype)
+
+
+def _add_layer_norm_ref(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    eps: float,
+    alpha: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Torch spelling of fused add + LayerNorm with an fp32 sum."""
+    summed = residual.float() + alpha * x.float()
+    bias_float = None if bias is None else bias.float()
+    normalized = F.layer_norm(summed, (x.size(-1),), weight.float(), bias_float, eps).to(x.dtype)
+    return normalized, summed.to(x.dtype)
+
+
+def _add_rms_norm_ref(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    eps: float,
+    alpha: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Torch spelling of fused add + RMSNorm with an fp32 sum."""
+    summed = residual.float() + alpha * x.float()
+    normalized = _rms_norm_ref(summed, weight, bias, eps).to(x.dtype)
+    return normalized, summed.to(x.dtype)
+
+
 class LayerNorm(nn.Module):
     """LayerNorm over the last dimension.
 
@@ -104,6 +144,29 @@ class LayerNorm(nn.Module):
         if use_norm_kernel(x):
             return oasr.layer_norm(x, self.weight, self.bias, self.eps)
         return F.layer_norm(x, (self.normalized_shape,), self.weight, self.bias, self.eps)
+
+    def forward_add(
+        self, x: torch.Tensor, residual: torch.Tensor, alpha: float = 1.0
+    ) -> torch.Tensor:
+        """Normalize ``residual + alpha * x`` with an fp32 fused sum."""
+        if use_norm_kernel(x):
+            return cast(
+                torch.Tensor,
+                oasr.add_layer_norm(x, residual, self.weight, self.bias, self.eps, alpha=alpha),
+            )
+        normalized, _ = _add_layer_norm_ref(x, residual, self.weight, self.bias, self.eps, alpha)
+        return normalized
+
+    def forward_add_residual(
+        self, x: torch.Tensor, residual: torch.Tensor, alpha: float = 1.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(LayerNorm(s), s)`` for ``s = residual + alpha * x``."""
+        if use_norm_kernel(x):
+            return cast(
+                Tuple[torch.Tensor, torch.Tensor],
+                oasr.add_layer_norm_residual(x, residual, self.weight, self.bias, self.eps, alpha),
+            )
+        return _add_layer_norm_ref(x, residual, self.weight, self.bias, self.eps, alpha)
 
     def extra_repr(self) -> str:
         return f"{self.normalized_shape}, eps={self.eps}, bias={self.bias is not None}"
@@ -142,11 +205,30 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if use_norm_kernel(x):
             return oasr.rms_norm(x, self.weight, self.bias, self.eps)
-        xf = x.float()
-        out = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight.float()
-        if self.bias is not None:
-            out = out + self.bias.float()
-        return out.to(x.dtype)
+        return _rms_norm_ref(x, self.weight, self.bias, self.eps)
+
+    def forward_add(
+        self, x: torch.Tensor, residual: torch.Tensor, alpha: float = 1.0
+    ) -> torch.Tensor:
+        """Normalize ``residual + alpha * x`` with an fp32 fused sum."""
+        if use_norm_kernel(x):
+            return cast(
+                torch.Tensor,
+                oasr.add_rms_norm(x, residual, self.weight, self.bias, self.eps, alpha),
+            )
+        normalized, _ = _add_rms_norm_ref(x, residual, self.weight, self.bias, self.eps, alpha)
+        return normalized
+
+    def forward_add_residual(
+        self, x: torch.Tensor, residual: torch.Tensor, alpha: float = 1.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(RMSNorm(s), s)`` for ``s = residual + alpha * x``."""
+        if use_norm_kernel(x):
+            return cast(
+                Tuple[torch.Tensor, torch.Tensor],
+                oasr.add_rms_norm_residual(x, residual, self.weight, self.bias, self.eps, alpha),
+            )
+        return _add_rms_norm_ref(x, residual, self.weight, self.bias, self.eps, alpha)
 
     def extra_repr(self) -> str:
         return f"{self.normalized_shape}, eps={self.eps}, bias={self.bias is not None}"
@@ -315,12 +397,65 @@ class AddLayerNorm(nn.Module):
         self,
         x: torch.Tensor,
         residual: torch.Tensor,
+        alpha: float = 1.0,
     ) -> torch.Tensor:
         if use_norm_kernel(x):
-            return oasr.add_layer_norm(x, residual, self.weight, self.bias, self.eps)
-        return F.layer_norm(
-            x + residual, (self.normalized_shape,), self.weight, self.bias, self.eps
-        )
+            return cast(
+                torch.Tensor,
+                oasr.add_layer_norm(x, residual, self.weight, self.bias, self.eps, alpha=alpha),
+            )
+        normalized, _ = _add_layer_norm_ref(x, residual, self.weight, self.bias, self.eps, alpha)
+        return normalized
+
+    def forward_residual(
+        self, x: torch.Tensor, residual: torch.Tensor, alpha: float = 1.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if use_norm_kernel(x):
+            return cast(
+                Tuple[torch.Tensor, torch.Tensor],
+                oasr.add_layer_norm_residual(x, residual, self.weight, self.bias, self.eps, alpha),
+            )
+        return _add_layer_norm_ref(x, residual, self.weight, self.bias, self.eps, alpha)
+
+
+class AddRMSNorm(nn.Module):
+    """Wrapper for fused add + RMSNorm, with optional residual passthrough."""
+
+    def __init__(
+        self, normalized_shape: int, eps: float = 1e-5, bias: bool = True, device=None, dtype=None
+    ):
+        super().__init__()
+        self.normalized_shape = normalized_shape
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(normalized_shape, device=device, dtype=dtype))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(normalized_shape, device=device, dtype=dtype))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        alpha: float = 1.0,
+    ) -> torch.Tensor:
+        if use_norm_kernel(x):
+            return cast(
+                torch.Tensor,
+                oasr.add_rms_norm(x, residual, self.weight, self.bias, self.eps, alpha),
+            )
+        normalized, _ = _add_rms_norm_ref(x, residual, self.weight, self.bias, self.eps, alpha)
+        return normalized
+
+    def forward_residual(
+        self, x: torch.Tensor, residual: torch.Tensor, alpha: float = 1.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if use_norm_kernel(x):
+            return cast(
+                Tuple[torch.Tensor, torch.Tensor],
+                oasr.add_rms_norm_residual(x, residual, self.weight, self.bias, self.eps, alpha),
+            )
+        return _add_rms_norm_ref(x, residual, self.weight, self.bias, self.eps, alpha)
 
 
 class LayerNormActivation(nn.Module):
@@ -383,11 +518,9 @@ class RMSNormActivation(nn.Module):
             return oasr.rms_norm_activation(
                 x, self.weight, self.bias, self.eps, self.activation_type
             )
-        xf = x.float()
-        out = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight.float()
-        if self.bias is not None:
-            out = out + self.bias.float()
-        return kernel_activation(out.to(x.dtype), self.activation_name)
+        return kernel_activation(
+            _rms_norm_ref(x, self.weight, self.bias, self.eps), self.activation_name
+        )
 
 
 class BatchNormActivation(nn.Module):
@@ -464,6 +597,7 @@ __all__ = [
     "BatchNorm1d",
     "BatchNormSwish",
     "AddLayerNorm",
+    "AddRMSNorm",
     "LayerNormActivation",
     "RMSNormActivation",
     "BatchNormActivation",

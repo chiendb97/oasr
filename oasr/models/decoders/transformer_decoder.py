@@ -253,6 +253,25 @@ class DecoderLayer(nn.Module):
         x = self.norm3(x)
         return residual + self.feed_forward(x)
 
+    def forward_one_step(
+        self,
+        x: torch.Tensor,
+        full: torch.Tensor,
+        memory: torch.Tensor,
+        memory_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Incremental forward for one query against this layer's full history."""
+        residual = x
+        query = self.norm1(x)
+        key_value = self.norm1(full)
+        x = residual + self.self_attn(query, key_value, key_value, None)
+        residual = x
+        x = self.norm2(x)
+        x = residual + self.src_attn(x, memory, memory, kv_lens=memory_lens)
+        residual = x
+        x = self.norm3(x)
+        return residual + self.feed_forward(x)
+
 
 # ----------------------------------------------------------------------------
 # Decoders
@@ -353,16 +372,7 @@ class TransformerDecoder(nn.Module):
         for i, layer in enumerate(self.decoders):
             full = x if caches is None else torch.cat([caches[i], x], dim=1)
             new_caches.append(full)
-            residual = x
-            q = layer.norm1(x)
-            kv = layer.norm1(full)
-            x = residual + layer.self_attn(q, kv, kv, None)
-            residual = x
-            x = layer.norm2(x)
-            x = residual + layer.src_attn(x, memory, memory, kv_lens=memory_lens)
-            residual = x
-            x = layer.norm3(x)
-            x = residual + layer.feed_forward(x)
+            x = layer.forward_one_step(x, full, memory, memory_lens)
         x = self.after_norm(x[:, -1])
         return self.output_layer(x), new_caches
 
