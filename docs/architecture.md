@@ -34,7 +34,7 @@ underneath are documented in [kernels.md](kernels.md).
 | What | Use |
 |---|---|
 | Projections | `Linear`, and the TP-shaped `ColumnParallelLinear` / `RowParallelLinear` where the shard axis is unambiguous (QKV and gate/up are column, output and down are row) |
-| Activation | `Gelu` for standalone exact-erf GELU; `LinearActivation` for fused `relu` / `swish` / exact-erf `gelu` / `gelu_tanh` GEMM epilogues |
+| Activation | `Gelu`, `Relu`, `Sigmoid`, and `Tanh` for standalone activation; `LinearActivation` for fused `relu` / `swish` / exact-erf `gelu` / `gelu_tanh` GEMM epilogues |
 | Normalization | `LayerNorm`, `RMSNorm`, `BiasNorm`, `AddLayerNorm`, … with the eps conventions named (`TORCH_EPS`, `ESPNET_EPS`, `QWEN2_RMS_EPS`) |
 | Embeddings | `Embedding` (alias `VocabParallelEmbedding`) |
 | Attention compute | `Attention` — takes projected, head-split q/k/v; the projections stay on the model under their checkpoint's names |

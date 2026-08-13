@@ -25,8 +25,13 @@
 --routine conv --subroutine conv2d_activation --batch 16 --height 100 --width 40 --channels 256 --out-filters 256 --pad 1 --stride 1
 
 # Activation family
+--routine activation --subroutine gelu --batch 8 --seq 1500 --channels 384
 --routine activation --subroutine glu --batch 64 --seq 250 --channels 512
+--routine activation --subroutine relu --batch 32 --seq 1 --channels 640
+--routine activation --subroutine sigmoid --batch 32 --seq 400 --channels 8
 --routine activation --subroutine swish --batch 64 --seq 250 --channels 512
+--routine activation --subroutine tanh --batch 32 --seq 1 --channels 512
+--routine activation --subroutine tanh --batch 16 --seq 1500 --channels 384 --row-stride-factor 3
 
 # Softmax family
 --routine softmax --subroutine softmax --batch 64 --seq 250 --channels 512

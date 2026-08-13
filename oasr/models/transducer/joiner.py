@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import torch
 
-from oasr.layers import ColumnParallelLinear, Linear
+from oasr.layers import ColumnParallelLinear, Linear, Tanh
 from oasr.models.base import align_out_features
 
 from ..decoders.base import Joiner
@@ -32,6 +32,7 @@ class TransducerJoiner(Joiner):
         # ``TransducerModel.load_weights`` widens the checkpoint to match.
         self.vocab_size = vocab_size
         self.output_linear = Linear(joiner_dim, align_out_features(vocab_size))
+        self.tanh = Tanh()
 
     def forward(
         self,
@@ -52,4 +53,4 @@ class TransducerJoiner(Joiner):
         # Slice off the alignment padding so the logit width is the true
         # vocabulary; the padding rows carry a hugely negative bias anyway, so
         # this is presentation, not masking.
-        return self.output_linear(torch.tanh(x))[..., : self.vocab_size]
+        return self.output_linear(self.tanh(x))[..., : self.vocab_size]

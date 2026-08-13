@@ -21,9 +21,8 @@ from __future__ import annotations
 from typing import ClassVar, List, Optional, Sequence, Union
 
 import torch
-import torch.nn.functional as F
 
-from oasr.layers import Conv2d, DepthwiseConv1d, Embedding
+from oasr.layers import Conv2d, DepthwiseConv1d, Embedding, Relu
 
 from ..decoders.base import TransducerPredictor
 
@@ -61,6 +60,7 @@ class StatelessDecoder(TransducerPredictor):
         self.context_size = context_size
         self.conv_group_size = conv_group_size
         self.embedding = Embedding(vocab_size, decoder_dim, padding_idx=blank_id)
+        self.relu = Relu()
         if context_size > 1:
             # Conv over the label window, no padding: U == context_size in → 1
             # frame out at decode time.  Depthwise is the degenerate group size;
@@ -108,9 +108,9 @@ class StatelessDecoder(TransducerPredictor):
         emb = self.embedding(y)  # (B, U, dim)
         if self.context_size > 1:
             emb = self._label_conv(emb)  # (B, U - context_size + 1, dim) == (B, 1, dim)
-        emb = F.relu(emb)
+        activated: torch.Tensor = self.relu(emb)
         # (B, U_out, dim) -> (B, dim): decode feeds exactly one window per step.
-        return emb[:, -1, :]
+        return activated[:, -1, :]
 
     # -- TransducerPredictor protocol ---------------------------------------
     #

@@ -51,6 +51,9 @@ BANNED = (
     nn.GroupNorm,
     nn.BatchNorm1d,
     nn.MultiheadAttention,
+    nn.ReLU,
+    nn.Sigmoid,
+    nn.Tanh,
 )
 
 #: Deliberate exemptions, as ``(architecture, dotted module path) -> reason``.
@@ -225,10 +228,14 @@ def _dotted_name(node: ast.AST) -> str | None:
     return None
 
 
-def test_models_do_not_call_bare_torch_gelu():
-    """Exact GELU belongs to ``Gelu`` / ``LinearActivation``, not model code."""
+def test_models_do_not_call_bare_torch_activations():
+    """Standalone activations belong to the waist, not model code."""
     models_dir = Path(__file__).resolve().parents[1] / "oasr" / "models"
-    banned = {"F.gelu", "torch.gelu", "torch.functional.gelu", "torch.nn.functional.gelu"}
+    banned = {
+        f"{prefix}.{name}"
+        for prefix in ("F", "torch", "torch.functional", "torch.nn.functional")
+        for name in ("gelu", "relu", "sigmoid", "tanh")
+    }
     offenders = []
     for path in models_dir.rglob("*.py"):
         tree = ast.parse(path.read_text(), filename=str(path))
@@ -236,10 +243,10 @@ def test_models_do_not_call_bare_torch_gelu():
             if isinstance(node, ast.Call) and _dotted_name(node.func) in banned:
                 offenders.append(f"{path.relative_to(models_dir)}:{node.lineno}")
     assert not offenders, (
-        "model code reaches past oasr.layers for exact GELU:\n  "
+        "model code reaches past oasr.layers for standalone activation:\n  "
         + "\n  ".join(offenders)
-        + "\nUse Gelu for standalone activation or LinearActivation(activation_type='gelu') "
-        "for a projection epilogue."
+        + "\nUse Gelu/Relu/Sigmoid/Tanh for standalone activation or a fused waist "
+        "layer when the activation immediately follows its projection."
     )
 
 
@@ -449,11 +456,14 @@ class TestLayersRunOnCpu:
         with pytest.raises(ValueError, match="not known"):
             FeedForward(8, 16, activation="mish")
 
-    def test_gelu_and_linear_activation(self):
-        from oasr.layers import Gelu, LinearActivation
+    def test_standalone_and_linear_activation(self):
+        from oasr.layers import Gelu, LinearActivation, Relu, Sigmoid, Tanh
 
         x = torch.randn(2, 8)
         torch.testing.assert_close(Gelu()(x), torch.nn.functional.gelu(x))
+        torch.testing.assert_close(Relu()(x), torch.relu(x))
+        torch.testing.assert_close(Sigmoid()(x), torch.sigmoid(x))
+        torch.testing.assert_close(Tanh()(x), torch.tanh(x))
         assert LinearActivation(8, 16, activation_type="gelu")(x).shape == (2, 16)
         assert LinearActivation(8, 16, activation_type="gelu_tanh")(x).shape == (2, 16)
 
@@ -673,6 +683,18 @@ class TestKernelAndTorchPathsAgree:
         with layers_backend_override("torch"):
             ref = Gelu()(x)
         torch.testing.assert_close(got, ref, rtol=0, atol=2e-3)
+
+    @pytest.mark.parametrize("module_name", ["Relu", "Sigmoid", "Tanh"])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_standalone_activation(self, module_name, dtype):
+        import oasr.layers as layers
+
+        module = getattr(layers, module_name)()
+        x = torch.linspace(-8.0, 8.0, 4096, device="cuda", dtype=dtype)
+        got = module(x)
+        with layers_backend_override("torch"):
+            ref = module(x)
+        torch.testing.assert_close(got, ref, rtol=1e-5, atol=2e-3)
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("stride", [1, 2])

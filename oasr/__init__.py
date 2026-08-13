@@ -30,9 +30,12 @@ from .activation import (
     gelu,
     get_activation_type_id,
     glu,
+    relu,
+    sigmoid,
     swish,
     swoosh_l,
     swoosh_r,
+    tanh,
 )
 from .attention import fmha
 from .conv import (
@@ -81,8 +84,11 @@ from .layers import (
     Linear,
     Mfcc,
     PointwiseConv1d,
+    Relu as ReluModule,
     RMSNorm,
+    Sigmoid as SigmoidModule,
     Softmax as SoftmaxModule,
+    Tanh as TanhModule,
     TopK as TopKModule,
 )
 from .norm import (
@@ -192,9 +198,12 @@ __all__ = [
     # Functional API
     "gelu",
     "glu",
+    "relu",
+    "sigmoid",
     "swish",
     "swoosh_l",
     "swoosh_r",
+    "tanh",
     "layer_norm",
     "rms_norm",
     "bias_norm",
@@ -246,6 +255,9 @@ __all__ = [
     "Conv2dActivation",
     "GluModule",
     "GeluModule",
+    "ReluModule",
+    "SigmoidModule",
+    "TanhModule",
     "Fbank",
     "Mfcc",
     "Linear",

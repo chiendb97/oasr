@@ -18,7 +18,7 @@ from ._backend import (
     reset_backend_stats,
     set_layers_backend,
 )
-from .activation import Gelu
+from .activation import Gelu, Relu, Sigmoid, Tanh
 from .attention import Attention, RelPositionMultiHeadedAttention
 from .conv import (
     Conv1d,
@@ -66,6 +66,9 @@ __all__ = [
     "RelPositionMultiHeadedAttention",
     # Activation
     "Gelu",
+    "Relu",
+    "Sigmoid",
+    "Tanh",
     # Convolution
     "Conv1d",
     "Conv1dActivation",

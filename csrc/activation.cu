@@ -26,10 +26,9 @@ void glu(TensorView output, TensorView input) {
     cudaStream_t stream = get_stream(input.device());
 
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
-        cudaError_t status = activation::GLU<c_type>(
-            static_cast<const c_type*>(input.data_ptr()),
-            static_cast<c_type*>(output.data_ptr()),
-            batch_size, seq_len, channels, stream);
+        cudaError_t status = activation::GLU<c_type>(static_cast<const c_type*>(input.data_ptr()),
+                                                     static_cast<c_type*>(output.data_ptr()),
+                                                     batch_size, seq_len, channels, stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "GLU kernel failed: " << cudaGetErrorString(status);
         return true;
@@ -53,10 +52,9 @@ void swish(TensorView output, TensorView input) {
     cudaStream_t stream = get_stream(input.device());
 
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
-        cudaError_t status = activation::Swish<c_type>(
-            static_cast<const c_type*>(input.data_ptr()),
-            static_cast<c_type*>(output.data_ptr()),
-            batch_size, seq_len, channels, stream);
+        cudaError_t status = activation::Swish<c_type>(static_cast<const c_type*>(input.data_ptr()),
+                                                       static_cast<c_type*>(output.data_ptr()),
+                                                       batch_size, seq_len, channels, stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "Swish kernel failed: " << cudaGetErrorString(status);
         return true;
@@ -64,20 +62,40 @@ void swish(TensorView output, TensorView input) {
 }
 
 // =============================================================================
-// Exact-erf GELU launcher (elementwise; input/output must be contiguous)
+// Unary activation launchers (elementwise; input/output must be contiguous)
 // =============================================================================
 
-void gelu_erf(TensorView output, TensorView input) {
+template <typename Activation>
+void elementwise_activation(TensorView output, TensorView input, Activation activation_op,
+                            const char* op_name) {
     CHECK_INPUT(input);
     CHECK_INPUT(output);
-    CHECK_CONTIGUOUS_INPUT(input);
     CHECK_CONTIGUOUS_INPUT(output);
     CHECK_DEVICE(input, output);
-    CHECK_SAME_LAYOUT(input, output);
+    const bool regular_rows = input.ndim() == 0 || [&] {
+        if (input.stride(input.ndim() - 1) != 1)
+            return false;
+        for (int i = 0; i < input.ndim() - 2; ++i) {
+            if (input.stride(i) != input.size(i + 1) * input.stride(i + 1))
+                return false;
+        }
+        return true;
+    }();
+    TVM_FFI_ICHECK(regular_rows)
+        << op_name << " input must be contiguous or have regularly strided contiguous rows";
+    TVM_FFI_ICHECK(input.ndim() == output.ndim() &&
+                   [&] {
+                       for (int i = 0; i < input.ndim(); ++i) {
+                           if (input.size(i) != output.size(i))
+                               return false;
+                       }
+                       return true;
+                   }())
+        << op_name << " input and output must have the same shape";
     TVM_FFI_ICHECK(input.dtype().code == output.dtype().code &&
                    input.dtype().bits == output.dtype().bits &&
                    input.dtype().lanes == output.dtype().lanes)
-        << "GELU input and output must have the same dtype";
+        << op_name << " input and output must have the same dtype";
 
     int64_t n = 1;
     for (int i = 0; i < input.ndim(); ++i) {
@@ -85,15 +103,42 @@ void gelu_erf(TensorView output, TensorView input) {
     }
 
     cudaStream_t stream = get_stream(input.device());
+    const int64_t columns = input.ndim() == 0 ? 1 : input.size(input.ndim() - 1);
+    const int64_t rows = columns == 0 ? 0 : n / columns;
+    const int64_t input_row_stride = input.ndim() < 2 ? columns : input.stride(input.ndim() - 2);
 
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
-        cudaError_t status =
-            activation::GeluErf<c_type>(static_cast<const c_type*>(input.data_ptr()),
-                                        static_cast<c_type*>(output.data_ptr()), n, stream);
+        cudaError_t status;
+        if (input.IsContiguous()) {
+            status = activation::Elementwise<c_type>(static_cast<const c_type*>(input.data_ptr()),
+                                                     static_cast<c_type*>(output.data_ptr()), n,
+                                                     activation_op, stream);
+        } else {
+            status = activation::ElementwiseStridedRows<c_type>(
+                static_cast<const c_type*>(input.data_ptr()),
+                static_cast<c_type*>(output.data_ptr()), rows, columns, input_row_stride,
+                activation_op, stream);
+        }
         TVM_FFI_ICHECK(status == cudaSuccess)
-            << "GeluErf kernel failed: " << cudaGetErrorString(status);
+            << op_name << " kernel failed: " << cudaGetErrorString(status);
         return true;
     });
+}
+
+void gelu_erf(TensorView output, TensorView input) {
+    elementwise_activation(output, input, GeluErfActivation{}, "GeluErf");
+}
+
+void sigmoid(TensorView output, TensorView input) {
+    elementwise_activation(output, input, SigmoidActivation{}, "Sigmoid");
+}
+
+void tanh_activation(TensorView output, TensorView input) {
+    elementwise_activation(output, input, TanhActivation{}, "Tanh");
+}
+
+void relu(TensorView output, TensorView input) {
+    elementwise_activation(output, input, ReluActivation{}, "Relu");
 }
 
 // =============================================================================
@@ -113,8 +158,7 @@ void swoosh_l(TensorView output, TensorView input) {
 
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
         cudaError_t status = activation::SwooshL<c_type>(
-            static_cast<const c_type*>(input.data_ptr()),
-            static_cast<c_type*>(output.data_ptr()),
+            static_cast<const c_type*>(input.data_ptr()), static_cast<c_type*>(output.data_ptr()),
             static_cast<int>(n), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "SwooshL kernel failed: " << cudaGetErrorString(status);
@@ -139,8 +183,7 @@ void swoosh_r(TensorView output, TensorView input) {
 
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
         cudaError_t status = activation::SwooshR<c_type>(
-            static_cast<const c_type*>(input.data_ptr()),
-            static_cast<c_type*>(output.data_ptr()),
+            static_cast<const c_type*>(input.data_ptr()), static_cast<c_type*>(output.data_ptr()),
             static_cast<int>(n), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "SwooshR kernel failed: " << cudaGetErrorString(status);
