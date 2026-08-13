@@ -83,6 +83,10 @@ static GemmStatus dispatchGemmActivation(const ElementA* A_ptr, const ElementB* 
             return dispatchGemmWithSmVersion<SM_VERSION, ElementA, ElementB, ElementCD,
                                              ActivationType::GELU>(
                 A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
+        case ActivationType::GELU_ERF:
+            return dispatchGemmWithSmVersion<SM_VERSION, ElementA, ElementB, ElementCD,
+                                             ActivationType::GELU_ERF>(
+                A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
         case ActivationType::SWISH:
             return dispatchGemmWithSmVersion<SM_VERSION, ElementA, ElementB, ElementCD,
                                              ActivationType::SWISH>(

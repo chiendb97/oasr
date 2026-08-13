@@ -22,6 +22,9 @@ CPU parity oracles meaningful evidence about the GPU serving path.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
@@ -210,6 +213,33 @@ def test_architecture_uses_the_layer_waist(arch):
         f"{arch} reaches past oasr.layers:\n  " + "\n  ".join(offenders) + "\n"
         "Every one of these has an oasr.layers counterpart with the same parameter "
         "layout — swapping it changes no checkpoint key."
+    )
+
+
+def _dotted_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _dotted_name(node.value)
+        return f"{parent}.{node.attr}" if parent else None
+    return None
+
+
+def test_models_do_not_call_bare_torch_gelu():
+    """Exact GELU belongs to ``Gelu`` / ``LinearActivation``, not model code."""
+    models_dir = Path(__file__).resolve().parents[1] / "oasr" / "models"
+    banned = {"F.gelu", "torch.gelu", "torch.functional.gelu", "torch.nn.functional.gelu"}
+    offenders = []
+    for path in models_dir.rglob("*.py"):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _dotted_name(node.func) in banned:
+                offenders.append(f"{path.relative_to(models_dir)}:{node.lineno}")
+    assert not offenders, (
+        "model code reaches past oasr.layers for exact GELU:\n  "
+        + "\n  ".join(offenders)
+        + "\nUse Gelu for standalone activation or LinearActivation(activation_type='gelu') "
+        "for a projection epilogue."
     )
 
 
@@ -419,18 +449,13 @@ class TestLayersRunOnCpu:
         with pytest.raises(ValueError, match="not known"):
             FeedForward(8, 16, activation="mish")
 
-    def test_linear_activation_refuses_erf_gelu(self):
-        """``gelu`` must not resolve to the fused epilogue: that one is the tanh
-        approximation, and Whisper / Qwen2-Audio are trained on exact erf.
-        Silently fusing it would be an accuracy change no test would attribute."""
-        from oasr.layers import LinearActivation
+    def test_gelu_and_linear_activation(self):
+        from oasr.layers import Gelu, LinearActivation
 
-        with pytest.raises(ValueError, match="not fusable"):
-            LinearActivation(8, 16, activation_type="gelu")
-        assert LinearActivation(8, 16, activation_type="gelu_tanh")(torch.randn(2, 8)).shape == (
-            2,
-            16,
-        )
+        x = torch.randn(2, 8)
+        torch.testing.assert_close(Gelu()(x), torch.nn.functional.gelu(x))
+        assert LinearActivation(8, 16, activation_type="gelu")(x).shape == (2, 16)
+        assert LinearActivation(8, 16, activation_type="gelu_tanh")(x).shape == (2, 16)
 
     def test_attention_mask_forms(self):
         from oasr.layers import Attention
@@ -628,7 +653,7 @@ class TestKernelAndTorchPathsAgree:
             ref = m(x)
         torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
 
-    @pytest.mark.parametrize("activation", ["relu", "swish", "gelu_tanh"])
+    @pytest.mark.parametrize("activation", ["relu", "swish", "gelu", "gelu_tanh"])
     def test_linear_activation(self, activation):
         from oasr.layers import LinearActivation
 
@@ -638,6 +663,16 @@ class TestKernelAndTorchPathsAgree:
         with layers_backend_override("torch"):
             ref = m(x)
         torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_gelu(self, dtype):
+        from oasr.layers import Gelu
+
+        x = torch.linspace(-5.0, 5.0, 4096, device="cuda", dtype=dtype)
+        got = Gelu()(x)
+        with layers_backend_override("torch"):
+            ref = Gelu()(x)
+        torch.testing.assert_close(got, ref, rtol=0, atol=2e-3)
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("stride", [1, 2])

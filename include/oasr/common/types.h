@@ -48,9 +48,10 @@ enum class ConvType {
 // Activation types
 enum class ActivationType {
     RELU = 0,
-    GELU = 1,
+    GELU = 1,   // tanh approximation
     SWISH = 2,  // SiLU
     IDENTITY = 3,
+    GELU_ERF = 4,  // exact-erf formulation
 };
 
 // Normalization types

@@ -34,7 +34,7 @@ underneath are documented in [kernels.md](kernels.md).
 | What | Use |
 |---|---|
 | Projections | `Linear`, and the TP-shaped `ColumnParallelLinear` / `RowParallelLinear` where the shard axis is unambiguous (QKV and gate/up are column, output and down are row) |
-| Fused GEMM epilogue | `LinearActivation` — `relu` / `swish` / `gelu_tanh` only |
+| Activation | `Gelu` for standalone exact-erf GELU; `LinearActivation` for fused `relu` / `swish` / exact-erf `gelu` / `gelu_tanh` GEMM epilogues |
 | Normalization | `LayerNorm`, `RMSNorm`, `BiasNorm`, `AddLayerNorm`, … with the eps conventions named (`TORCH_EPS`, `ESPNET_EPS`, `QWEN2_RMS_EPS`) |
 | Embeddings | `Embedding` (alias `VocabParallelEmbedding`) |
 | Attention compute | `Attention` — takes projected, head-split q/k/v; the projections stay on the model under their checkpoint's names |
@@ -136,11 +136,12 @@ architecture with no entry fails rather than going uncovered. It also pins that
 each layer's kernel and torch paths agree on CUDA — without that, the CPU parity
 oracles are evidence about nothing the server runs.
 
-Two non-migrations are deliberate: `fc1` / `fc2` stay flat `Linear`s in HF
-Whisper and the Qwen2-Audio tower (composing a `FeedForward` there would insert a
-level into every checkpoint key to save one `F.gelu`), and `LinearActivation`
-accepts `gelu_tanh` but **not** `gelu` — the CUDA epilogue is the tanh
-approximation, and those models are trained on exact erf.
+One non-migration is deliberate: `fc1` / `fc2` stay flat modules in HF Whisper
+and the Qwen2-Audio tower because composing a `FeedForward` there would insert a
+level into every checkpoint key. Their `fc1` is a `LinearActivation("gelu")`,
+which keeps the same `weight` / `bias` keys and selects the exact-erf epilogue;
+the post-conv sites use standalone `Gelu`. `gelu_tanh` remains a distinct name
+for checkpoints trained with the approximation.
 
 ## Data flow
 

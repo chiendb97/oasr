@@ -79,6 +79,7 @@ PYBIND11_MODULE(_C, m) {
     py::enum_<oasr::ActivationType>(m, "ActivationType")
         .value("RELU", oasr::ActivationType::RELU)
         .value("GELU", oasr::ActivationType::GELU)
+        .value("GELU_ERF", oasr::ActivationType::GELU_ERF)
         .value("SWISH", oasr::ActivationType::SWISH)
         .export_values();
 

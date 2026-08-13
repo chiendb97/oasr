@@ -36,15 +36,14 @@ import oasr
 
 from ._backend import use_gemm_kernel
 
-#: Activation ids whose CUDA epilogue is bit-comparable to a torch function.
-#: ``gelu`` is deliberately absent: the OASR epilogue is the **tanh
-#: approximation** (``include/oasr/common/math.h``) while ``F.gelu`` defaults to
-#: the exact erf form, and Whisper / Qwen2-Audio are trained with the latter.
-#: Ask for ``"gelu_tanh"`` to opt into the fused kernel knowingly.
+#: Torch equivalent of each fused CUDA epilogue. Exact-erf ``gelu`` and the
+#: ``gelu_tanh`` approximation deliberately remain separate names so checkpoint
+#: semantics cannot change when a projection becomes fused.
 _TORCH_ACTIVATION = {
     "relu": F.relu,
     "swish": F.silu,
     "silu": F.silu,
+    "gelu": F.gelu,
     "gelu_tanh": lambda x: F.gelu(x, approximate="tanh"),
 }
 
@@ -53,6 +52,7 @@ _FUSED_ACTIVATION_ID = {
     "relu": "relu",
     "swish": "swish",
     "silu": "silu",
+    "gelu": "gelu_erf",
     "gelu_tanh": "gelu",
 }
 
@@ -136,11 +136,8 @@ class RowParallelLinear(Linear):
 class LinearActivation(nn.Module):
     """``y = activation(x @ weightᵀ + bias)`` as one fused GEMM epilogue.
 
-    ``activation`` is one of ``relu`` / ``swish`` (== ``silu``) /
-    ``gelu_tanh``.  There is no plain ``"gelu"``: the CUDA epilogue implements
-    the tanh approximation, so fusing it under that name would silently change
-    the math of every erf-GELU model.  Spell the approximation out or use a
-    :class:`Linear` plus ``F.gelu``.
+    ``activation`` is one of ``relu`` / ``swish`` (== ``silu``) / exact-erf
+    ``gelu`` / ``gelu_tanh``. The two GELU spellings select distinct epilogues.
     """
 
     tp_dim: Optional[int] = None

@@ -137,6 +137,15 @@ void {{ func_name }}_activation(TensorView output, TensorView A, TensorView B, O
                     C_ptr,
                     reinterpret_cast<CutlassType*>(output.data_ptr()),
                     M, N, K, 1.0f, beta, stream);
+        } else if (activation == ActivationType::GELU_ERF) {
+            status = oasr::gemm::CutlassGemmKernelSm90<
+                Config, CutlassType, CutlassType, CutlassType,
+                oasr::ActivationType::GELU_ERF>::run(
+                    reinterpret_cast<const CutlassType*>(A.data_ptr()),
+                    reinterpret_cast<const CutlassType*>(B.data_ptr()),
+                    C_ptr,
+                    reinterpret_cast<CutlassType*>(output.data_ptr()),
+                    M, N, K, 1.0f, beta, stream);
         } else if (activation == ActivationType::SWISH) {
             status = oasr::gemm::CutlassGemmKernelSm90<
                 Config, CutlassType, CutlassType, CutlassType,

@@ -1094,8 +1094,9 @@ _GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
     # ---- whisper-tiny (HF), bf16, added 2026-08-03 -------------------------
     # Three (N, K) pairs are all that reach this selector: d_model 384 gives the
     # attention projections (384, 384) and the two feed-forward halves, and the
-    # ``fc1`` half is a plain ``gemm`` rather than ``gemm_activation`` because
-    # Whisper's GELU is exact-erf and deliberately unfused.  Nothing else clears
+    # ``fc1`` half historically appeared here as plain ``gemm``; exact-erf GELU
+    # now uses ``gemm_activation`` and is intentionally left out of this measured
+    # table until that heavier epilogue is retuned. Nothing else clears
     # ``GEMM_MIN_ROWS``: the AR decoder's per-step GEMMs are M=batch and the
     # 51865-wide vocab head is not 8-aligned, so both are cuBLAS by policy.
     #

@@ -15,6 +15,7 @@
 
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/epilogue/thread/linear_combination_gelu.h>
+#include <cutlass/epilogue/thread/linear_combination_generic.h>
 #include <cutlass/epilogue/thread/linear_combination_relu.h>
 #include <cutlass/epilogue/thread/linear_combination_silu.h>
 #include <cutlass/epilogue/thread/scale_type.h>
@@ -60,6 +61,14 @@ struct FusionEpilogueOp<ActivationType::RELU, Alignment, ElementD, ElementComput
 
 template <int Alignment, typename ElementD, typename ElementCompute, typename ElementC>
 struct FusionEpilogueOp<ActivationType::GELU, Alignment, ElementD, ElementCompute, ElementC> {
+    using type = cutlass::epilogue::thread::LinearCombinationGeneric<
+        cutlass::epilogue::thread::GELU_taylor, ElementD, Alignment, ElementCompute, ElementCompute,
+        cutlass::epilogue::thread::ScaleType::Default, cutlass::FloatRoundStyle::round_to_nearest,
+        true>;
+};
+
+template <int Alignment, typename ElementD, typename ElementCompute, typename ElementC>
+struct FusionEpilogueOp<ActivationType::GELU_ERF, Alignment, ElementD, ElementCompute, ElementC> {
     using type = cutlass::epilogue::thread::LinearCombinationGELU<
         ElementD, Alignment, ElementCompute, ElementCompute,
         cutlass::epilogue::thread::ScaleType::Default>;
@@ -98,6 +107,13 @@ struct FusionEpilogueOpSm90<oasr::ActivationType::RELU, ElementD, ElementCompute
 
 template <typename ElementD, typename ElementCompute, typename ElementC>
 struct FusionEpilogueOpSm90<oasr::ActivationType::GELU, ElementD, ElementCompute, ElementC> {
+    using type =
+        cutlass::epilogue::fusion::LinCombEltAct<cutlass::epilogue::thread::GELU_taylor, ElementD,
+                                                 ElementCompute, ElementC, ElementCompute>;
+};
+
+template <typename ElementD, typename ElementCompute, typename ElementC>
+struct FusionEpilogueOpSm90<oasr::ActivationType::GELU_ERF, ElementD, ElementCompute, ElementC> {
     using type = cutlass::epilogue::fusion::LinCombEltAct<cutlass::epilogue::thread::GELU, ElementD,
                                                           ElementCompute, ElementC, ElementCompute>;
 };

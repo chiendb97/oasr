@@ -1,4 +1,4 @@
-"""Activation family benchmark routines (glu, swish)."""
+"""Activation family benchmark routines (exact GELU, GLU, Swish)."""
 
 from __future__ import annotations
 
@@ -21,13 +21,19 @@ from benchmarks.routines.bench_utils import (
     run_profile,
 )
 
-SUBROUTINES = ["glu", "swish"]
+SUBROUTINES = ["gelu", "glu", "swish"]
 
 # ---------------------------------------------------------------------------
 # Default configs
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
+    "gelu": [
+        {"batch": 8, "seq": 1500, "channels": 384},
+        {"batch": 16, "seq": 1500, "channels": 384},
+        {"batch": 8, "seq": 1500, "channels": 1280},
+        {"batch": 16, "seq": 1500, "channels": 1280},
+    ],
     "glu": [
         {"batch": 32, "seq": 250, "channels": 256},
         {"batch": 64, "seq": 250, "channels": 256},
@@ -44,6 +50,7 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
 }
 
 PROFILE_CONFIGS: dict[str, tuple] = {
+    "gelu": (16, 1500, 384),
     "glu": (64, 250, 512),
     "swish": (64, 250, 512),
 }
@@ -66,6 +73,18 @@ def setup_glu(batch_size, seq_len, channels, dtype=torch.float16):
 
     def pytorch_fn():
         return F.glu(x, dim=-1)
+
+    return oasr_fn, pytorch_fn
+
+
+def setup_gelu(batch_size, seq_len, channels, dtype=torch.float16):
+    x = torch.randn(batch_size, seq_len, channels, device="cuda", dtype=dtype)
+
+    def oasr_fn():
+        return oasr.gelu(x)
+
+    def pytorch_fn():
+        return F.gelu(x)
 
     return oasr_fn, pytorch_fn
 
@@ -180,7 +199,9 @@ def _resolve_configs(args, subroutine):
 
 def _setup_for_config(subroutine, cfg, dtype):
     b, s, c = cfg["batch"], cfg["seq"], cfg["channels"]
-    if subroutine == "glu":
+    if subroutine == "gelu":
+        return setup_gelu(b, s, c, dtype)
+    elif subroutine == "glu":
         return setup_glu(b, s, c, dtype)
     elif subroutine == "swish":
         return setup_swish(b, s, c, dtype)
@@ -250,7 +271,9 @@ def _make_profile_setup(subroutine):
     cfg_tuple = PROFILE_CONFIGS[subroutine]
 
     def _setup():
-        if subroutine == "glu":
+        if subroutine == "gelu":
+            return setup_gelu(*cfg_tuple)
+        elif subroutine == "glu":
             return setup_glu(*cfg_tuple)
         else:
             return setup_swish(*cfg_tuple)

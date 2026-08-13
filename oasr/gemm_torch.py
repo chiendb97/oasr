@@ -12,9 +12,8 @@ shape-aware production selector in :mod:`oasr.gemm`:
   * ``split_k_slices`` is accepted for signature parity and ignored (cuBLAS picks
     its own internal split).
 
-Activation IDs match :mod:`oasr.activation`: RELU=0, GELU=1, SWISH=2 (SiLU).
-GELU uses the erf form to match the CUTLASS ``LinearCombinationGELU`` epilogue
-(``oasr/common/epilogue_functors.h``); SWISH matches ``LinearCombinationSilu``.
+Activation IDs match :mod:`oasr.activation`: RELU=0, tanh-GELU=1, SWISH=2
+(SiLU), exact-erf GELU=4.
 
 Kept deliberately free of any ``oasr.tune`` import so the production GEMM path can
 import it without pulling in the autotuner.
@@ -47,10 +46,12 @@ def torch_gemm_activation(out, A, B, C, activation_type: int, split_k_slices: in
         torch.addmm(C, A, B.t(), out=out)
     if activation_type == 0:  # RELU
         torch.relu_(out)
-    elif activation_type == 1:  # GELU (erf form, matches LinearCombinationGELU)
-        out.copy_(F.gelu(out))
+    elif activation_type == 1:  # GELU tanh approximation
+        out.copy_(F.gelu(out, approximate="tanh"))
     elif activation_type == 2:  # SWISH / SiLU (matches LinearCombinationSilu)
         F.silu(out, inplace=True)
+    elif activation_type == 4:  # exact-erf GELU
+        out.copy_(F.gelu(out))
     else:
         raise ValueError(f"Unsupported activation_type: {activation_type}")
 

@@ -37,6 +37,13 @@ __device__ __forceinline__ T gelu(T x) {
 }
 
 template <typename T>
+__device__ __forceinline__ T gelu_erf(T x) {
+    constexpr float kInvSqrt2 = 0.70710678118654752440f;
+    float xf = float(x);
+    return T(0.5f * xf * (1.0f + erff(xf * kInvSqrt2)));
+}
+
+template <typename T>
 __device__ __forceinline__ T swish(T x) {
     return x * sigmoid(x);
 }
@@ -76,6 +83,10 @@ struct ReluActivation {
 
 struct GeluActivation {
     __device__ __forceinline__ float operator()(float x) const { return gelu(x); }
+};
+
+struct GeluErfActivation {
+    __device__ __forceinline__ float operator()(float x) const { return gelu_erf(x); }
 };
 
 struct SwishActivation {

@@ -276,10 +276,10 @@ Offline-only (`streaming_kind="none"`), decoded by the incremental `aed` strateg
 with suppress / begin-suppress lists and the SOT prompt from the config. The
 decoder exposes a batched incremental `prefill` / `step` / `select` surface.
 
-`fc1` / `fc2` stay flat `Linear`s because HF's layout puts them on the layer, and
-GELU stays exact-erf and unfused. The post-conv `transpose(1,2)` is followed by
-`.contiguous()` — without it the whole residual stream carries the conv's strided
-last dim.
+`fc1` / `fc2` stay flat because HF's layout puts them on the layer; `fc1` is an
+exact-erf `LinearActivation("gelu")`, which preserves the flat checkpoint keys
+while applying GELU in the GEMM epilogue. The two frontend convs use standalone
+`Gelu` over their BTC output.
 
 ### Paraformer (FunASR, non-autoregressive)
 

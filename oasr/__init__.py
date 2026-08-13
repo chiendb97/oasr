@@ -24,8 +24,10 @@ from . import layers, tune
 # =============================================================================
 from .activation import (
     ACTIVATION_GELU,
+    ACTIVATION_GELU_ERF,
     ACTIVATION_RELU,
     ACTIVATION_SWISH,
+    gelu,
     get_activation_type_id,
     glu,
     swish,
@@ -71,6 +73,7 @@ from .layers import (
     Conv2dActivation,
     DepthwiseConv1d,
     Fbank,
+    Gelu as GeluModule,
     GlobalCMVN,
     Glu as GluModule,
     GroupNorm,
@@ -183,9 +186,11 @@ __all__ = [
     # Activation constants
     "ACTIVATION_RELU",
     "ACTIVATION_GELU",
+    "ACTIVATION_GELU_ERF",
     "ACTIVATION_SWISH",
     "get_activation_type_id",
     # Functional API
+    "gelu",
     "glu",
     "swish",
     "swoosh_l",
@@ -240,6 +245,7 @@ __all__ = [
     "Conv2dModule",
     "Conv2dActivation",
     "GluModule",
+    "GeluModule",
     "Fbank",
     "Mfcc",
     "Linear",

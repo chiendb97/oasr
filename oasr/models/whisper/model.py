@@ -21,7 +21,6 @@ import logging
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from oasr.layers import (
@@ -30,7 +29,9 @@ from oasr.layers import (
     ColumnParallelLinear,
     Conv1d,
     Embedding,
+    Gelu,
     LayerNorm,
+    LinearActivation,
     RowParallelLinear,
 )
 
@@ -81,15 +82,14 @@ class _WhisperAttention(nn.Module):
 class _EncoderLayer(nn.Module):
     """``fc1``/``fc2`` stay flat rather than becoming a ``FeedForward``: HF puts
     them directly on the layer, and nesting them would add a level to every
-    checkpoint key.  GELU is the exact erf form (HF's ``activation_function:
-    gelu``), which is why it is not folded into the GEMM epilogue — the OASR
-    fused epilogue implements the tanh approximation."""
+    checkpoint key. GELU is the exact-erf form (HF's ``activation_function:
+    gelu``), selected explicitly on the fused GEMM epilogue."""
 
     def __init__(self, cfg: WhisperModelConfig) -> None:
         super().__init__()
         self.self_attn = _WhisperAttention(cfg.d_model, cfg.encoder_attention_heads)
         self.self_attn_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
-        self.fc1 = ColumnParallelLinear(cfg.d_model, cfg.encoder_ffn_dim)
+        self.fc1 = LinearActivation(cfg.d_model, cfg.encoder_ffn_dim, activation_type="gelu")
         self.fc2 = RowParallelLinear(cfg.encoder_ffn_dim, cfg.d_model)
         self.final_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
 
@@ -100,7 +100,7 @@ class _EncoderLayer(nn.Module):
         x = residual + self.self_attn(x, k, v)
         residual = x
         x = self.final_layer_norm(x)
-        return residual + self.fc2(F.gelu(self.fc1(x)))
+        return residual + self.fc2(self.fc1(x))
 
 
 class WhisperEncoder(BaseEncoder):
@@ -114,6 +114,7 @@ class WhisperEncoder(BaseEncoder):
         self._cfg = cfg
         self.conv1 = Conv1d(cfg.num_mel_bins, cfg.d_model, kernel_size=3, padding=1)
         self.conv2 = Conv1d(cfg.d_model, cfg.d_model, kernel_size=3, stride=2, padding=1)
+        self.gelu = Gelu()
         # HF materializes the sinusoidal table as a real (frozen) weight.
         self.embed_positions = Embedding(cfg.max_source_positions, cfg.d_model)
         self.layers = nn.ModuleList([_EncoderLayer(cfg) for _ in range(cfg.encoder_layers)])
@@ -126,8 +127,8 @@ class WhisperEncoder(BaseEncoder):
         always full (padding is part of the recipe, not attention masking).
         """
         del xs_lens
-        x = F.gelu(self.conv1(xs))
-        x = F.gelu(self.conv2(x))
+        x = self.gelu(self.conv1(xs))
+        x = self.gelu(self.conv2(x))
         T = x.size(1)
         if T > self._cfg.max_source_positions:
             raise ValueError(
@@ -163,7 +164,7 @@ class _DecoderLayer(nn.Module):
         self.self_attn_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
         self.encoder_attn = _WhisperAttention(cfg.d_model, cfg.decoder_attention_heads)
         self.encoder_attn_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
-        self.fc1 = ColumnParallelLinear(cfg.d_model, cfg.decoder_ffn_dim)
+        self.fc1 = LinearActivation(cfg.d_model, cfg.decoder_ffn_dim, activation_type="gelu")
         self.fc2 = RowParallelLinear(cfg.decoder_ffn_dim, cfg.d_model)
         self.final_layer_norm = LayerNorm(cfg.d_model, eps=TORCH_EPS)
 
@@ -292,7 +293,7 @@ class WhisperDecoder(BaseDecoder):
             x = residual + layer.encoder_attn(h, state["cross_k"][i], state["cross_v"][i])
             residual = x
             h = layer.final_layer_norm(x)
-            x = residual + layer.fc2(F.gelu(layer.fc1(h)))
+            x = residual + layer.fc2(layer.fc1(h))
         x = self.layer_norm(x)
         return x @ self.embed_tokens.weight.t()  # tied projection → (B, T, V)
 

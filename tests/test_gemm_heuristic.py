@@ -60,7 +60,15 @@ class TestTorchBackend:
         torch.testing.assert_close(out, F.linear(A, B, C), rtol=2e-2, atol=2e-2)
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    @pytest.mark.parametrize("act,ref", [(0, F.relu), (1, F.gelu), (2, F.silu)])
+    @pytest.mark.parametrize(
+        "act,ref",
+        [
+            (0, F.relu),
+            (1, lambda x: F.gelu(x, approximate="tanh")),
+            (2, F.silu),
+            (4, F.gelu),
+        ],
+    )
     def test_torch_gemm_activation(self, dtype, act, ref):
         M, N, K = 48, 2048, 256
         A = torch.randn(M, K, device="cuda", dtype=dtype)
@@ -256,6 +264,20 @@ class TestProductionDispatch:
         bias = torch.randn(N, device="cuda", dtype=dtype)
         out = oasr.gemm_activation(A, B, bias, oasr.get_activation_type_id("swish"))
         torch.testing.assert_close(out, F.silu(F.linear(A, B, bias)), rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_gemm_activation_exact_erf_gelu(self, dtype):
+        """The new epilogue is the erf form, not activation id 1's approximation."""
+        M = 128
+        values = torch.linspace(-5.0, 5.0, M * 8, device="cuda", dtype=dtype).reshape(M, 8)
+        weight = torch.eye(8, device="cuda", dtype=dtype)
+
+        out = oasr.gemm_activation(values, weight, activation_type=oasr.ACTIVATION_GELU_ERF)
+        exact = F.gelu(values)
+        approximate = F.gelu(values, approximate="tanh")
+
+        torch.testing.assert_close(out, exact, rtol=0, atol=2e-3)
+        assert torch.count_nonzero(out != approximate).item() > 0
 
 
 class TestGemmLogSoftmaxDispatch:
