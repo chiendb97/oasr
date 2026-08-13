@@ -7,7 +7,7 @@ from .core import JitSpec, gen_jit_spec
 
 
 def gen_activation_module() -> JitSpec:
-    """Generate JIT spec for activation kernels (GELU, GLU, Swish, Swoosh)."""
+    """Generate JIT spec for activation kernels (unary activations, GLU, Swoosh)."""
     return gen_jit_spec(
         "activation",
         [

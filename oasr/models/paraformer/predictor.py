@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from oasr.layers import Conv1dActivation, Linear
+from oasr.layers import Conv1dActivation, Linear, Sigmoid
 from oasr.models.base import align_out_features
 
 from .config import ParaformerModelConfig
@@ -116,6 +116,7 @@ class CifPredictor(nn.Module):
         # alpha head is allocated aligned like the vocabulary heads and column
         # 0 is taken; ``ParaformerModel.load_weights`` widens the checkpoint.
         self.cif_output = Linear(idim, align_out_features(1))
+        self.sigmoid = Sigmoid()
         self.threshold = config.predictor_threshold
         self.tail_threshold = config.predictor_tail_threshold
 
@@ -149,10 +150,13 @@ class CifPredictor(nn.Module):
             (0, 0, self.left_padding, self.right_padding),
         )
         alpha_logits = self.cif_output(self.cif_conv1d(h))
-        alphas = torch.sigmoid(alpha_logits[..., :1])
+        # Apply sigmoid before slicing the aligned alpha head. This keeps the
+        # kernel input contiguous and avoids materializing a row-strided view;
+        # only column 0 is a checkpoint output, the padding columns are ignored.
+        alphas = self.sigmoid(alpha_logits)[..., 0]
         hidden = hidden.float()
         mask = mask.float()
-        alphas = torch.relu(alphas.squeeze(-1).float()) * mask  # (B, T)
+        alphas = alphas.float() * mask  # sigmoid is already strictly non-negative
 
         hidden, alphas = self._append_tail(hidden, alphas, mask)
         token_num = torch.floor(alphas.sum(dim=-1))

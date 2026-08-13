@@ -28,7 +28,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from oasr.layers import ColumnParallelLinear, Embedding, Linear, LinearActivation, RowParallelLinear
+from oasr.layers import (
+    ColumnParallelLinear,
+    Embedding,
+    Linear,
+    LinearActivation,
+    Relu,
+    RowParallelLinear,
+)
 
 from ..base import align_out_features, init_pad_rows
 from ..decoders.base import Joiner, TransducerPredictor
@@ -161,6 +168,7 @@ class NemotronRnntJoint(Joiner):
         # but a future vocabulary need not be and the padding rows are made
         # unwinnable at construction as well as at load.
         self.head = Linear(decoder_dim, align_out_features(vocab_size))
+        self.relu = Relu()
         init_pad_rows(self.head, vocab_size)
 
     def forward(
@@ -173,7 +181,7 @@ class NemotronRnntJoint(Joiner):
             x = self.encoder_proj(encoder_out) + self.decoder_proj(decoder_out)
         else:
             x = encoder_out + decoder_out
-        logits: torch.Tensor = self.head(F.relu(x))
+        logits: torch.Tensor = self.head(self.relu(x))
         return logits[..., : self.vocab_size]
 
 

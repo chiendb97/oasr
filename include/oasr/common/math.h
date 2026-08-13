@@ -24,7 +24,9 @@ __device__ __forceinline__ T sigmoid(T x) {
 
 template <typename T>
 __device__ __forceinline__ T relu(T x) {
-    return x > T(0) ? x : T(0);
+    // PyTorch's CUDA ReLU propagates NaN but canonicalizes both signed zeros
+    // to +0. A plain comparison cannot provide both properties.
+    return isnan(float(x)) ? x : (x > T(0) ? x : T(0));
 }
 
 template <typename T>
@@ -79,6 +81,14 @@ struct IdentityActivation {
 
 struct ReluActivation {
     __device__ __forceinline__ float operator()(float x) const { return relu(x); }
+};
+
+struct SigmoidActivation {
+    __device__ __forceinline__ float operator()(float x) const { return sigmoid(x); }
+};
+
+struct TanhActivation {
+    __device__ __forceinline__ float operator()(float x) const { return tanhf(x); }
 };
 
 struct GeluActivation {

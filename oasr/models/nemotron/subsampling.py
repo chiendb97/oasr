@@ -139,7 +139,7 @@ class NemotronSubsampling(nn.Module):
         for stage in self.layers:
             x = stage(self._pad.apply(x))
             lengths = self._pad.out_length(lengths)
-            x = F.relu(_mask_time(x, lengths))
+            x = _mask_time(x, lengths)
         b, t, f, c = x.shape
         return self.linear(x.reshape(b, t, f * c)), lengths
 
@@ -190,7 +190,7 @@ class NemotronSubsampling(nn.Module):
         x = features.unsqueeze(-1)  # (B, T, F, 1) NHWC, no copy
         x = self.conv_in(self._stage_input(x, states, 0))  # ReLU fused in the stem
         for i, stage in enumerate(self.layers, start=1):
-            x = F.relu(stage(self._stage_input(x, states, i)))
+            x = stage(self._stage_input(x, states, i))
         b, t, f, c = x.shape
         out: torch.Tensor = self.linear(x.reshape(b, t, f * c))
         return out
@@ -226,7 +226,11 @@ class _SubsamplingStage(nn.Module):
         self.depthwise_conv = Conv2d(
             channels, channels, kernel_size=kernel, stride=stride, groups=channels
         )
-        self.pointwise_conv = Conv2d(channels, channels, kernel_size=1)
+        # ReLU is immediately after this pointwise projection in both offline
+        # and streaming paths, so reuse the existing fused Conv2D epilogue.
+        self.pointwise_conv = Conv2dActivation(
+            channels, channels, kernel_size=1, activation_type="relu"
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out: torch.Tensor = self.pointwise_conv(self.depthwise_conv(x))

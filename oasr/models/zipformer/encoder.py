@@ -24,6 +24,7 @@ import torch
 from torch import Tensor, nn
 
 import oasr
+from oasr.layers import Tanh
 from oasr.layers.conv import DepthwiseConv1d
 from oasr.layers.linear import Linear
 
@@ -289,7 +290,7 @@ class NonlinAttention(nn.Module):
         super().__init__()
         self.hidden_channels = hidden_channels
         self.in_proj = Linear(channels, hidden_channels * 3, bias=True)
-        self.tanh = nn.Tanh()
+        self.tanh = Tanh()
         self.out_proj = Linear(hidden_channels, channels, bias=True)
 
     def forward(self, x: Tensor, attn_weights: Tensor) -> Tensor:

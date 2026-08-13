@@ -29,4 +29,34 @@ class Gelu(nn.Module):
         return F.gelu(x)
 
 
-__all__ = ["Gelu"]
+class Sigmoid(nn.Module):
+    """Elementwise sigmoid on the OASR kernel for served CUDA dtypes."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if use_conv_kernel(x):
+            activated: torch.Tensor = oasr.sigmoid(x)
+            return activated
+        return torch.sigmoid(x)
+
+
+class Tanh(nn.Module):
+    """Elementwise tanh on the OASR kernel for served CUDA dtypes."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if use_conv_kernel(x):
+            activated: torch.Tensor = oasr.tanh(x)
+            return activated
+        return torch.tanh(x)
+
+
+class Relu(nn.Module):
+    """Elementwise ReLU on the OASR kernel for served CUDA dtypes."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if use_conv_kernel(x):
+            activated: torch.Tensor = oasr.relu(x)
+            return activated
+        return F.relu(x)
+
+
+__all__ = ["Gelu", "Relu", "Sigmoid", "Tanh"]

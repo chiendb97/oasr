@@ -33,8 +33,12 @@ Currently supports testing the following kernel families:
     - `conv2d` - 2D convolution (NHWC layout via CUTLASS Implicit GEMM).
     - `conv2d_activation` - Fused 2D convolution + activation.
 - Activation:
+    - `gelu` - Exact-erf GELU.
     - `glu` - Gated Linear Unit.
+    - `relu` - Rectified linear unit.
+    - `sigmoid` - Logistic sigmoid.
     - `swish` - Swish / SiLU activation.
+    - `tanh` - Hyperbolic tangent.
 - Composite:
     - `conv_block` - End-to-end Conformer convolution block (pointwise conv -> GLU -> depthwise conv -> Swish -> pointwise conv).
 
@@ -112,8 +116,12 @@ Available routines and subroutines:
     - conv2d
     - conv2d_activation
   activation:
+    - gelu
     - glu
+    - relu
+    - sigmoid
     - swish
+    - tanh
   composite:
     - conv_block
 ```
@@ -236,7 +244,7 @@ The framework automatically selects the best available method.
 | **conv** | depthwise_conv1d, depthwise_conv1d_causal | `cuda`, `torch` | time | yes | yes |
 | **conv** | pointwise_conv1d, pointwise_conv1d_activation | `cuda`, `torch` | TFLOPS | yes | yes |
 | **conv** | conv2d, conv2d_activation | `cutlass`, `torch` | TFLOPS | yes | yes |
-| **activation** | glu, swish | `cuda`, `torch` | TB/sec | yes | yes |
+| **activation** | gelu, glu, relu, sigmoid, swish, tanh | `cuda`, `torch` | TB/sec | yes | yes |
 | **composite** | conv_block | `cuda`, `torch` | time | yes | yes |
 
 Backend legend:
@@ -328,8 +336,12 @@ Individual `bench_*.py` scripts are preserved as thin wrappers for backwards com
 | `bench_depthwise_conv1d.py` | conv | depthwise_conv1d, depthwise_conv1d_causal |
 | `bench_pointwise_conv1d.py` | conv | pointwise_conv1d, pointwise_conv1d_activation |
 | `bench_conv2d.py` | conv | conv2d, conv2d_activation |
+| `bench_gelu.py` | activation | gelu |
 | `bench_glu.py` | activation | glu |
+| `bench_relu.py` | activation | relu |
+| `bench_sigmoid.py` | activation | sigmoid |
 | `bench_swish.py` | activation | swish |
+| `bench_tanh.py` | activation | tanh |
 | `bench_conv_block.py` | composite | conv_block |
 
 These support `--profile`, `--kernel`, `--target`, `--warmup`, and `--iters` flags via the legacy API.

@@ -1,4 +1,4 @@
-"""Activation family benchmark routines (exact GELU, GLU, Swish)."""
+"""Activation family benchmark routines."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from benchmarks.routines.bench_utils import (
     run_profile,
 )
 
-SUBROUTINES = ["gelu", "glu", "swish"]
+SUBROUTINES = ["gelu", "glu", "relu", "sigmoid", "swish", "tanh"]
 
 # ---------------------------------------------------------------------------
 # Default configs
@@ -41,18 +41,40 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
         {"batch": 64, "seq": 500, "channels": 256},
         {"batch": 64, "seq": 500, "channels": 512},
     ],
+    "relu": [
+        {"batch": 1, "seq": 1, "channels": 512},
+        {"batch": 8, "seq": 1, "channels": 512},
+        {"batch": 32, "seq": 1, "channels": 640},
+        {"batch": 8, "seq": 250, "channels": 256},
+    ],
+    "sigmoid": [
+        {"batch": 1, "seq": 400, "channels": 8},
+        {"batch": 8, "seq": 400, "channels": 8},
+        {"batch": 32, "seq": 400, "channels": 8},
+        {"batch": 8, "seq": 250, "channels": 256},
+    ],
     "swish": [
         {"batch": 32, "seq": 250, "channels": 256},
         {"batch": 64, "seq": 250, "channels": 256},
         {"batch": 64, "seq": 250, "channels": 512},
         {"batch": 64, "seq": 500, "channels": 512},
     ],
+    "tanh": [
+        {"batch": 1, "seq": 1, "channels": 512},
+        {"batch": 8, "seq": 1, "channels": 512},
+        {"batch": 32, "seq": 1, "channels": 512},
+        {"batch": 16, "seq": 1500, "channels": 384, "row_stride_factor": 3},
+        {"batch": 8, "seq": 250, "channels": 256},
+    ],
 }
 
 PROFILE_CONFIGS: dict[str, tuple] = {
     "gelu": (16, 1500, 384),
     "glu": (64, 250, 512),
+    "relu": (32, 1, 640),
+    "sigmoid": (32, 400, 8),
     "swish": (64, 250, 512),
+    "tanh": (32, 1, 512),
 }
 
 
@@ -101,6 +123,47 @@ def setup_swish(batch_size, seq_len, channels, dtype=torch.float16):
     return oasr_fn, pytorch_fn
 
 
+def setup_relu(batch_size, seq_len, channels, dtype=torch.float16):
+    x = torch.randn(batch_size, seq_len, channels, device="cuda", dtype=dtype)
+
+    def oasr_fn():
+        return oasr.relu(x)
+
+    def pytorch_fn():
+        return torch.relu(x)
+
+    return oasr_fn, pytorch_fn
+
+
+def setup_sigmoid(batch_size, seq_len, channels, dtype=torch.float16):
+    x = torch.randn(batch_size, seq_len, channels, device="cuda", dtype=dtype)
+
+    def oasr_fn():
+        return oasr.sigmoid(x)
+
+    def pytorch_fn():
+        return torch.sigmoid(x)
+
+    return oasr_fn, pytorch_fn
+
+
+def setup_tanh(batch_size, seq_len, channels, dtype=torch.float16, row_stride_factor=1):
+    if row_stride_factor < 1:
+        raise ValueError(f"row_stride_factor must be positive, got {row_stride_factor}")
+    backing = torch.randn(
+        batch_size, seq_len, row_stride_factor * channels, device="cuda", dtype=dtype
+    )
+    x = backing[..., :channels]
+
+    def oasr_fn():
+        return oasr.tanh(x)
+
+    def pytorch_fn():
+        return torch.tanh(x)
+
+    return oasr_fn, pytorch_fn
+
+
 # ---------------------------------------------------------------------------
 # CLI args
 # ---------------------------------------------------------------------------
@@ -110,6 +173,12 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch", type=int, default=None, help="Batch size")
     parser.add_argument("--seq", type=int, default=None, help="Sequence length")
     parser.add_argument("--channels", type=int, default=None, help="Channel dimension")
+    parser.add_argument(
+        "--row-stride-factor",
+        type=int,
+        default=1,
+        help="Tanh input backing-row width as a multiple of channels (Zipformer: 3)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +192,7 @@ def _activation_bytes(batch, seq, channels, dtype, subroutine):
     if subroutine == "glu":
         input_bytes = batch * seq * 2 * channels * elem
         output_bytes = batch * seq * channels * elem
-    else:  # swish
+    else:
         input_bytes = batch * seq * channels * elem
         output_bytes = batch * seq * channels * elem
     return input_bytes + output_bytes
@@ -192,7 +261,17 @@ def _resolve_configs(args, subroutine):
     channels = getattr(args, "channels", None)
 
     if all(v is not None for v in [batch, seq, channels]):
-        return [{"batch": batch, "seq": seq, "channels": channels}]
+        row_stride_factor = getattr(args, "row_stride_factor", 1)
+        if row_stride_factor != 1 and subroutine != "tanh":
+            raise ValueError("--row-stride-factor is only supported by the tanh benchmark")
+        return [
+            {
+                "batch": batch,
+                "seq": seq,
+                "channels": channels,
+                "row_stride_factor": row_stride_factor,
+            }
+        ]
 
     return DEFAULT_CONFIGS.get(subroutine, DEFAULT_CONFIGS["glu"])
 
@@ -203,8 +282,14 @@ def _setup_for_config(subroutine, cfg, dtype):
         return setup_gelu(b, s, c, dtype)
     elif subroutine == "glu":
         return setup_glu(b, s, c, dtype)
+    elif subroutine == "relu":
+        return setup_relu(b, s, c, dtype)
+    elif subroutine == "sigmoid":
+        return setup_sigmoid(b, s, c, dtype)
     elif subroutine == "swish":
         return setup_swish(b, s, c, dtype)
+    elif subroutine == "tanh":
+        return setup_tanh(b, s, c, dtype, cfg.get("row_stride_factor", 1))
     else:
         raise ValueError(f"Unknown activation subroutine: {subroutine}")
 
@@ -213,7 +298,10 @@ def _shape_str(subroutine, cfg):
     b, s, c = cfg["batch"], cfg["seq"], cfg["channels"]
     if subroutine == "glu":
         return f"[{b}, {s}, {2 * c}]"
-    return f"[{b}, {s}, {c}]"
+    shape = f"[{b}, {s}, {c}]"
+    if cfg.get("row_stride_factor", 1) != 1:
+        shape += f" row_stride={cfg['row_stride_factor']}x"
+    return shape
 
 
 def get_fn_map(subroutine, cuda_fn, torch_fn):
@@ -271,11 +359,7 @@ def _make_profile_setup(subroutine):
     cfg_tuple = PROFILE_CONFIGS[subroutine]
 
     def _setup():
-        if subroutine == "gelu":
-            return setup_gelu(*cfg_tuple)
-        elif subroutine == "glu":
-            return setup_glu(*cfg_tuple)
-        else:
-            return setup_swish(*cfg_tuple)
+        cfg = dict(zip(("batch", "seq", "channels"), cfg_tuple))
+        return _setup_for_config(subroutine, cfg, torch.float16)
 
     return _setup

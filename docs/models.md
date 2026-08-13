@@ -210,6 +210,9 @@ construction rather than raising on its first request.
 per-kind state batch dimensions following icefall's `streaming_decode.py`
 convention (embed + conv caches dim 0; key / nonlin / value caches dim 1), which
 is what lets the stateful backend batch streams into one `B = N` forward.
+The NonlinAttention gate uses the standalone `Tanh` waist module; its gate is
+one chunk of a three-way projection output, so a whole-GEMM epilogue cannot
+represent the operation.
 
 ### Transducer (icefall RNNT)
 
@@ -224,12 +227,21 @@ checkpoints carry both branches, so load with
 from `decoder.*` / `joiner.*`; `simple_*_proj` is declared-dropped and
 `ctc_output.*` is a named capability hint.
 
+The predictor's post-embedding/conv ReLU and the joiner's tanh-over-projection-sum
+use standalone activation modules. Neither can use a GEMM epilogue: the former
+also covers the no-conv context-size-one case, and the latter precedes the
+vocabulary projection.
+
 ### Nemotron ASR (FastConformer + RNN-T)
 
 `encoder.py`, `subsampling.py`, `predictor.py`, `convert.py::HFNemotronConverter`
 (auto-detects `config.json: model_type=nemotron3_5_asr`). Offline **and**
 cache-aware streaming. Reference release:
 `nvidia/nemotron-3.5-asr-streaming-0.6b`.
+
+Every subsampling-stage pointwise Conv2D fuses ReLU into its existing epilogue.
+The RNN-T joint still uses standalone `Relu` because activation applies to the
+sum of encoder and decoder projections before the vocabulary head.
 
 - 24-layer macaron Conformer over **causal depthwise-separable 8× Conv2d
   subsampling**, kept in NHWC so the projection's input columns are permuted once
@@ -287,7 +299,9 @@ while applying GELU in the GEMM epilogue. The two frontend convs use standalone
   `oasr.layers.Attention`, 560 → 512 first layer, sinusoidal PE, **LayerNorm
   eps 1e-12** (ESPnet convention; parity breaks at PyTorch's 1e-5).
 - `predictor.py` — `CifPredictor` (CifPredictorV2) with the vectorized `cif_v1`
-  prefix-sum integrate-and-fire, always fp32.
+  prefix-sum integrate-and-fire, always fp32. Sigmoid runs over the contiguous
+  aligned alpha head before selecting its real column; the post-sigmoid ReLU
+  was redundant and is omitted.
 - `decoder.py` — SANM NAR decoder: FFN-first layer order, FSMN-only self-attention,
   one parallel pass over the CIF acoustic embeddings. Cross-attention takes
   encoder **lengths**, not a mask.

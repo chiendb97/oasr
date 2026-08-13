@@ -60,6 +60,117 @@ class TestGelu:
         torch.testing.assert_close(oasr.gelu(x), F.gelu(x), rtol=0, atol=2e-3)
 
 
+class TestUnaryActivations:
+    """Tests for standalone sigmoid / tanh / ReLU."""
+
+    @pytest.mark.parametrize(
+        "fn,ref",
+        [
+            (oasr.sigmoid, torch.sigmoid),
+            (oasr.tanh, torch.tanh),
+            (oasr.relu, torch.relu),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("shape", [(257,), (2, 17, 63)])
+    def test_correctness(self, fn, ref, dtype, shape):
+        x = torch.randn(*shape, device="cuda", dtype=dtype)
+        atol = 2e-6 if dtype == torch.float32 else 2e-3
+        torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=atol)
+
+    @pytest.mark.parametrize(
+        "fn,ref",
+        [
+            (oasr.sigmoid, torch.sigmoid),
+            (oasr.tanh, torch.tanh),
+            (oasr.relu, torch.relu),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_destination_passing(self, fn, ref, dtype):
+        x = torch.randn(2, 31, 65, device="cuda", dtype=dtype)
+        out = torch.empty_like(x)
+        result = fn(x, out=out)
+
+        assert result.data_ptr() == out.data_ptr()
+        torch.testing.assert_close(out, ref(x), rtol=1e-5, atol=2e-3)
+
+    @pytest.mark.parametrize(
+        "fn,ref",
+        [
+            (oasr.sigmoid, torch.sigmoid),
+            (oasr.tanh, torch.tanh),
+            (oasr.relu, torch.relu),
+        ],
+    )
+    def test_noncontiguous_input(self, fn, ref):
+        x = torch.randn(2, 31, 65, device="cuda", dtype=torch.float16).transpose(1, 2)
+        assert not x.is_contiguous()
+        torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=2e-3)
+
+    @pytest.mark.parametrize(
+        "fn,ref",
+        [
+            (oasr.sigmoid, torch.sigmoid),
+            (oasr.tanh, torch.tanh),
+            (oasr.relu, torch.relu),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_regular_row_strided_channel_chunk(self, fn, ref, dtype):
+        base = torch.randn(17, 3, 3 * 64, device="cuda", dtype=dtype)
+        x = base.chunk(3, dim=-1)[1]
+        assert x.stride() == (576, 192, 1) and not x.is_contiguous()
+        output = fn(x)
+        assert output.is_contiguous()
+        atol = 2e-6 if dtype == torch.float32 else 2e-3
+        torch.testing.assert_close(output, ref(x), rtol=1e-5, atol=atol)
+
+    @pytest.mark.parametrize(
+        "fn,ref",
+        [
+            (oasr.sigmoid, torch.sigmoid),
+            (oasr.tanh, torch.tanh),
+            (oasr.relu, torch.relu),
+        ],
+    )
+    def test_contiguous_unaligned_storage_offset(self, fn, ref):
+        base = torch.randn(4097, device="cuda", dtype=torch.float16)
+        x = base[1:]
+        assert x.is_contiguous() and x.data_ptr() % 16 != 0
+        torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=2e-3)
+
+    @pytest.mark.parametrize("fn", [oasr.sigmoid, oasr.tanh, oasr.relu])
+    def test_empty_input(self, fn):
+        x = torch.empty(0, 8, device="cuda", dtype=torch.float16)
+        assert fn(x).shape == x.shape
+
+    @pytest.mark.parametrize("fn,ref", [(oasr.sigmoid, torch.sigmoid), (oasr.tanh, torch.tanh)])
+    def test_large_magnitude(self, fn, ref):
+        x = torch.linspace(-80.0, 80.0, 4096, device="cuda")
+        torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=2e-6)
+
+    @pytest.mark.parametrize(
+        "fn,ref",
+        [
+            (oasr.sigmoid, torch.sigmoid),
+            (oasr.tanh, torch.tanh),
+            (oasr.relu, torch.relu),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_special_values(self, fn, ref, dtype):
+        x = torch.tensor(
+            [float("nan"), float("inf"), -float("inf"), -0.0, 0.0],
+            device="cuda",
+            dtype=dtype,
+        )
+        got = fn(x)
+        expected = ref(x)
+        torch.testing.assert_close(got, expected, rtol=0, atol=0, equal_nan=True)
+        assert torch.equal(torch.signbit(got), torch.signbit(expected))
+
+
 class TestGLU:
     """Tests for oasr.glu() functional API."""
 

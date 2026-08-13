@@ -10,7 +10,6 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-
 #include <cstdint>
 #include <oasr/common/math.h>
 #include <oasr/common/utils.h>
@@ -23,11 +22,10 @@ namespace activation {
 // GLU (Gated Linear Unit) Kernel
 // =============================================================================
 
-
 template <typename T, int VecSize>
-__global__ void gluKernel(const T* __restrict__ input,   // [batch, seq_len, 2 * channels]
-                             T* __restrict__ output,         // [batch, seq_len, channels]
-                             int batch_size, int seq_len, int channels) {
+__global__ void gluKernel(const T* __restrict__ input,  // [batch, seq_len, 2 * channels]
+                          T* __restrict__ output,       // [batch, seq_len, channels]
+                          int batch_size, int seq_len, int channels) {
     const int total_elements = batch_size * seq_len * channels;
     const int total_vec_elements = total_elements / VecSize;
     const int vec_channels = channels / VecSize;
@@ -92,11 +90,12 @@ __global__ void swishKernel(const T* __restrict__ input, T* __restrict__ output,
 }
 
 // =============================================================================
-// Exact-erf GELU Kernel (vectorized, elementwise over a flat buffer)
+// Unary Activation Kernel (vectorized, elementwise over a flat buffer)
 // =============================================================================
 
-template <typename T, int VecSize>
-__global__ void geluErfKernel(const T* __restrict__ input, T* __restrict__ output, int64_t n) {
+template <typename T, int VecSize, typename Activation>
+__global__ void elementwiseKernel(const T* __restrict__ input, T* __restrict__ output, int64_t n,
+                                  Activation activation) {
     const int64_t total_vec_elements = n / VecSize;
     for (int64_t vid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          vid < total_vec_elements; vid += static_cast<int64_t>(gridDim.x) * blockDim.x) {
@@ -106,9 +105,32 @@ __global__ void geluErfKernel(const T* __restrict__ input, T* __restrict__ outpu
         Vec<T, VecSize> v_out;
 #pragma unroll
         for (int v = 0; v < VecSize; v++) {
-            v_out[v] = static_cast<T>(oasr::gelu_erf(static_cast<float>(v_in[v])));
+            v_out[v] = static_cast<T>(activation(static_cast<float>(v_in[v])));
         }
         v_out.store(output + vid * VecSize);
+    }
+}
+
+template <typename T, int VecSize, typename Activation>
+__global__ void elementwiseStridedRowsKernel(const T* __restrict__ input, T* __restrict__ output,
+                                             int64_t rows, int64_t columns,
+                                             int64_t input_row_stride, Activation activation) {
+    const int64_t vec_columns = columns / VecSize;
+    const int64_t total_vec_elements = rows * vec_columns;
+    for (int64_t vid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         vid < total_vec_elements; vid += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int64_t row = vid / vec_columns;
+        const int64_t column = (vid - row * vec_columns) * VecSize;
+
+        Vec<T, VecSize> v_in;
+        v_in.load(input + row * input_row_stride + column);
+
+        Vec<T, VecSize> v_out;
+#pragma unroll
+        for (int v = 0; v < VecSize; v++) {
+            v_out[v] = static_cast<T>(activation(static_cast<float>(v_in[v])));
+        }
+        v_out.store(output + row * columns + column);
     }
 }
 
@@ -166,13 +188,13 @@ cudaError_t GLU(const T* input, T* output, int batch_size, int seq_len, int chan
         const int block_size = 256;
         int grid_size = (total_vec_elements + block_size - 1) / block_size;
         grid_size = std::min(grid_size, 65535);
-        gluKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
-            input, output, batch_size, seq_len, channels);
+        gluKernel<T, kVecSize>
+            <<<grid_size, block_size, 0, stream>>>(input, output, batch_size, seq_len, channels);
     } else {
         const int block_size = 256;
         const int grid_size = (total_elements + block_size - 1) / block_size;
-        gluKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
-            input, output, batch_size, seq_len, channels);
+        gluKernel<T, 1>
+            <<<grid_size, block_size, 0, stream>>>(input, output, batch_size, seq_len, channels);
     }
 
     return cudaGetLastError();
@@ -190,20 +212,21 @@ cudaError_t Swish(const T* input, T* output, int batch_size, int seq_len, int ch
         const int block_size = 256;
         int grid_size = (total_vec_elements + block_size - 1) / block_size;
         grid_size = std::min(grid_size, 65535);
-        swishKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
-            input, output, batch_size, seq_len, channels);
+        swishKernel<T, kVecSize>
+            <<<grid_size, block_size, 0, stream>>>(input, output, batch_size, seq_len, channels);
     } else {
         const int block_size = 256;
         const int grid_size = (total_elements + block_size - 1) / block_size;
-        swishKernel<T, 1><<<grid_size, block_size, 0, stream>>>(
-            input, output, batch_size, seq_len, channels);
+        swishKernel<T, 1>
+            <<<grid_size, block_size, 0, stream>>>(input, output, batch_size, seq_len, channels);
     }
 
     return cudaGetLastError();
 }
 
-template <typename T>
-cudaError_t GeluErf(const T* input, T* output, int64_t n, cudaStream_t stream) {
+template <typename T, typename Activation>
+cudaError_t Elementwise(const T* input, T* output, int64_t n, Activation activation,
+                        cudaStream_t stream) {
     if (n == 0) {
         return cudaSuccess;
     }
@@ -216,16 +239,64 @@ cudaError_t GeluErf(const T* input, T* output, int64_t n, cudaStream_t stream) {
         const int64_t total_vec_elements = n / kVecSize;
         int64_t grid_size = (total_vec_elements + kBlockSize - 1) / kBlockSize;
         grid_size = std::min<int64_t>(grid_size, 65535);
-        geluErfKernel<T, kVecSize>
-            <<<static_cast<int>(grid_size), kBlockSize, 0, stream>>>(input, output, n);
+        elementwiseKernel<T, kVecSize>
+            <<<static_cast<int>(grid_size), kBlockSize, 0, stream>>>(input, output, n, activation);
     } else {
         int64_t grid_size = (n + kBlockSize - 1) / kBlockSize;
         grid_size = std::min<int64_t>(grid_size, 65535);
-        geluErfKernel<T, 1>
-            <<<static_cast<int>(grid_size), kBlockSize, 0, stream>>>(input, output, n);
+        elementwiseKernel<T, 1>
+            <<<static_cast<int>(grid_size), kBlockSize, 0, stream>>>(input, output, n, activation);
     }
 
     return cudaGetLastError();
+}
+
+template <typename T, typename Activation>
+cudaError_t ElementwiseStridedRows(const T* input, T* output, int64_t rows, int64_t columns,
+                                   int64_t input_row_stride, Activation activation,
+                                   cudaStream_t stream) {
+    if (rows == 0 || columns == 0) {
+        return cudaSuccess;
+    }
+
+    constexpr int kVecSize = VecTypeTrait<T>::VecSize;
+    constexpr int kBlockSize = 256;
+    const bool aligned = columns % kVecSize == 0 && input_row_stride % kVecSize == 0 &&
+                         oasr::isAligned<T, kVecSize>(input) &&
+                         oasr::isAligned<T, kVecSize>(output);
+    const int64_t elements_per_row = aligned ? columns / kVecSize : columns;
+    int64_t grid_size = (rows * elements_per_row + kBlockSize - 1) / kBlockSize;
+    grid_size = std::min<int64_t>(grid_size, 65535);
+
+    if (aligned) {
+        elementwiseStridedRowsKernel<T, kVecSize>
+            <<<static_cast<int>(grid_size), kBlockSize, 0, stream>>>(input, output, rows, columns,
+                                                                     input_row_stride, activation);
+    } else {
+        elementwiseStridedRowsKernel<T, 1><<<static_cast<int>(grid_size), kBlockSize, 0, stream>>>(
+            input, output, rows, columns, input_row_stride, activation);
+    }
+    return cudaGetLastError();
+}
+
+template <typename T>
+cudaError_t GeluErf(const T* input, T* output, int64_t n, cudaStream_t stream) {
+    return Elementwise(input, output, n, GeluErfActivation{}, stream);
+}
+
+template <typename T>
+cudaError_t Sigmoid(const T* input, T* output, int64_t n, cudaStream_t stream) {
+    return Elementwise(input, output, n, SigmoidActivation{}, stream);
+}
+
+template <typename T>
+cudaError_t Tanh(const T* input, T* output, int64_t n, cudaStream_t stream) {
+    return Elementwise(input, output, n, TanhActivation{}, stream);
+}
+
+template <typename T>
+cudaError_t Relu(const T* input, T* output, int64_t n, cudaStream_t stream) {
+    return Elementwise(input, output, n, ReluActivation{}, stream);
 }
 
 template <typename T>

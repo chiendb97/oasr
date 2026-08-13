@@ -95,6 +95,55 @@ def gelu(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tenso
     return out
 
 
+def _prepare_elementwise(
+    input: torch.Tensor, out: Optional[torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # A channel slice such as Zipformer's ``x.chunk(3, -1)[0]`` has contiguous
+    # rows separated by a regular padded stride. The CUDA kernel consumes that
+    # layout directly; only arbitrary transposes/expands need materialization.
+    regular_rows = input.dim() == 0 or (
+        input.stride(-1) == 1
+        and all(
+            input.stride(i) == input.shape[i + 1] * input.stride(i + 1)
+            for i in range(input.dim() - 2)
+        )
+    )
+    if not regular_rows:
+        input = input.contiguous()
+    if out is None:
+        out = torch.empty(input.shape, dtype=input.dtype, device=input.device)
+    return input, out
+
+
+@oasr_api
+def sigmoid(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Elementwise logistic sigmoid.
+
+    Contiguous rows with a regular padded stride are consumed directly; other
+    non-contiguous inputs are materialized once. ``out``, when supplied, must be
+    contiguous and have the same shape, dtype, and device as ``input``.
+    """
+    input, out = _prepare_elementwise(input, out)
+    _get_activation_module().sigmoid(out, input)
+    return out
+
+
+@oasr_api
+def tanh(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Elementwise hyperbolic tangent."""
+    input, out = _prepare_elementwise(input, out)
+    _get_activation_module().tanh(out, input)
+    return out
+
+
+@oasr_api
+def relu(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Elementwise rectified linear unit: ``max(input, 0)``."""
+    input, out = _prepare_elementwise(input, out)
+    _get_activation_module().relu(out, input)
+    return out
+
+
 @oasr_api
 def swoosh_l(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Zipformer Swoosh-L activation: ``log(1 + exp(x - 4)) - 0.08 x - 0.035``.
