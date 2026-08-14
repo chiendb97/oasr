@@ -92,7 +92,8 @@ ssh -N -L 8000:127.0.0.1:8000 user@asr-host
 `--host 0.0.0.0` makes the page reachable from other machines, with two consequences worth
 being deliberate about:
 
-- The microphone stops working unless the page is a secure context — see the next section.
+- The microphone keeps working for anyone opening `http://localhost:8000` on the serving
+  machine; it is only gated for visitors on another address — see the next section.
 - Anyone who can open the page can spend the GPU behind it. This is a demo front door: one
   upstream, no authentication, no rate limiting. For anything beyond a demo, put a real
   reverse proxy (nginx, Caddy) in front and let it own TLS, auth and access logs.
@@ -101,9 +102,17 @@ being deliberate about:
 
 Browsers expose `getUserMedia` only in a **secure context**: HTTPS, or a loopback host
 (`localhost`, `127.0.0.1`). That is enforced by the browser, so no server flag, header or
-permissions policy can grant it on a plain-HTTP page served from a hostname or LAN address —
-`server.py` prints these same options when it detects that situation. File upload is
-unaffected by all of it.
+permissions policy can grant it on a plain-HTTP page served from a hostname or LAN address.
+File upload is unaffected by all of it.
+
+What decides this is **the URL in the address bar, not the bind address**. Plain HTTP over
+loopback is a secure context, so the default `--host 127.0.0.1` needs no certificate, and
+neither does `--host 0.0.0.0` for whoever opens `http://localhost:8000` on the serving machine
+— the same server is a secure context via `http://localhost:8000` and not via
+`http://asr-host:8000`. `server.py` says which case you are in at startup, and only warns when
+the microphone is genuinely unreachable.
+
+Three ways to give a *remote* visitor the microphone:
 
 **Simplest — HTTPS with no certificate work:**
 

@@ -40,10 +40,12 @@ Microphone
 
 Browsers expose ``getUserMedia`` only in a secure context — HTTPS, or a loopback
 host — and that is the browser's decision, so nothing this process sends can grant
-it.  ``--tls-self-signed`` is the one-flag answer: HTTPS with a cached self-signed
-certificate, warned about once per browser.  To stay on plain HTTP instead, the
-origin has to be allowlisted in the browser; the startup warning spells out how
-per vendor.  File upload never needs any of this.
+it.  Plain HTTP over loopback is already secure, so ``http://localhost:8000``
+needs no certificate whatever the bind address is; only a visitor arriving on some
+other name or address is gated.  For them, ``--tls-self-signed`` is the one-flag
+answer (HTTPS with a cached self-signed certificate, warned about once per
+browser), or the origin can be allowlisted browser-side — startup says which case
+applies and spells out the vendor specifics.  File upload never needs any of this.
 
 Logging
 -------
@@ -507,12 +509,36 @@ class Handler(SimpleHTTPRequestHandler):
 # grant it — `--tls-self-signed` below removes the certificate work instead, and
 # the warning names the browser-side allowlist for anyone who must stay on plain
 # HTTP.  File upload is unaffected either way.
+#
+# What decides it is the *URL the visitor typed*, not the address this process
+# bound.  Loopback is a secure context by name, so `http://localhost:8000` needs
+# no certificate at all — and a wildcard bind serves both that and a LAN address
+# from the same socket.  Hence `_is_loopback_host` / `_is_wildcard_host` below,
+# rather than one blanket "not localhost ⇒ warn" test.
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for the hosts browsers already treat as a secure context."""
+    if host in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_wildcard_host(host: str) -> bool:
+    """True for 0.0.0.0 / :: — a bind that answers on loopback *and* elsewhere."""
+    try:
+        return ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        return False
 
 
 def _tls_names(bind_host: str, extra: List[str]) -> List[str]:
     """Names a self-signed cert should cover: whatever the user might type."""
     names = {"localhost", "127.0.0.1", "::1"}
-    if bind_host not in ("0.0.0.0", "::"):
+    if not _is_wildcard_host(bind_host):
         names.add(bind_host)
     try:
         hostname = socket.gethostname()
@@ -608,12 +634,37 @@ def ensure_self_signed(names: List[str]) -> tuple[str, str]:
     return str(cert), str(key)
 
 
-def warn_insecure_context(port: int) -> None:
-    """Explain the secure-context gate, and every way around it."""
+def note_microphone_context(host: str, port: int) -> None:
+    """Say what the microphone will and will not do on a plain-HTTP page.
+
+    Called only when the page is served over HTTP from a non-loopback bind, and
+    even then a wildcard bind is *not* a problem for whoever opens the page as
+    ``http://localhost:<port>`` — loopback is a secure context, certificate or
+    not.  Only a visitor on some other address is gated, so that case gets a
+    warning and the local one gets a note.
+    """
+    if _is_wildcard_host(host):
+        LOG.info(
+            "microphone: works over http://localhost:%d on this machine — loopback is a "
+            "secure context, so plain HTTP needs no certificate there",
+            port,
+        )
+        LOG.info(
+            "  from another machine a browser gates it: restart with --tls-self-signed, or "
+            "allowlist the origin (chrome://flags/#unsafely-treat-insecure-origin-as-secure). "
+            "File upload works either way"
+        )
+        return
+
     LOG.warning(
         "the microphone will be unavailable: a plain-HTTP page on a non-loopback "
         "address is not a secure context, and no server-side flag or header can "
         "change that — the browser decides. File upload works regardless. Options:"
+    )
+    LOG.warning(
+        "  local        --host 0.0.0.0 also answers on http://localhost:%d, which *is* "
+        "a secure context",
+        port,
     )
     LOG.warning("  easiest      restart with --tls-self-signed, accept the warning once")
     LOG.warning("  no TLS       tell one browser to trust this origin:")
@@ -733,8 +784,8 @@ def main(argv: List[str]) -> int:
     routed = ", ".join(p_ + "*" if p_.endswith("/") else p_ for p_ in PROXY_PREFIXES)
     LOG.info("  %s → %s", routed, upstream.geturl())
     LOG.info("  same origin: oasr-server needs no --cors-allow-origin")
-    if scheme == "http" and args.host not in ("127.0.0.1", "localhost", "::1"):
-        warn_insecure_context(args.port)
+    if scheme == "http" and not _is_loopback_host(args.host):
+        note_microphone_context(args.host, args.port)
     with httpd:
         try:
             httpd.serve_forever()
