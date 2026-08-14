@@ -78,7 +78,9 @@ ssh -N -L 8000:127.0.0.1:8000 user@asr-host
 |---|---|
 | `--oasr-server URL` | Where to relay the API paths. Defaults to `$OASR_SERVER_URL`, then `http://127.0.0.1:8080` |
 | `--host`, `--port` | Where the page is served (default `127.0.0.1:8000`) |
-| `--ssl-certfile`, `--ssl-keyfile` | Serve the page over HTTPS — required for microphone access from anywhere but localhost |
+| `--tls-self-signed` | Serve HTTPS with a cached self-signed certificate, generated on first use — the one-flag way to get the microphone working off localhost |
+| `--tls-san NAME` | Extra hostname or IP for that certificate to cover; repeatable |
+| `--ssl-certfile`, `--ssl-keyfile` | Serve HTTPS with your own certificate instead |
 | `--log-level debug` | Adds static-asset requests, upstream response headers and relay teardown reasons |
 | `--log-file PATH` | Append the log to a file as well as stderr |
 
@@ -90,12 +92,46 @@ ssh -N -L 8000:127.0.0.1:8000 user@asr-host
 `--host 0.0.0.0` makes the page reachable from other machines, with two consequences worth
 being deliberate about:
 
-- The microphone stops working unless you also pass `--ssl-certfile` — browsers expose
-  `getUserMedia` only in a secure context. TLS here is independent of the upstream: the page
-  can be HTTPS while the relay speaks plain HTTP to `oasr-server` on a private network.
+- The microphone stops working unless the page is a secure context — see the next section.
 - Anyone who can open the page can spend the GPU behind it. This is a demo front door: one
   upstream, no authentication, no rate limiting. For anything beyond a demo, put a real
   reverse proxy (nginx, Caddy) in front and let it own TLS, auth and access logs.
+
+## Microphone on a remote host
+
+Browsers expose `getUserMedia` only in a **secure context**: HTTPS, or a loopback host
+(`localhost`, `127.0.0.1`). That is enforced by the browser, so no server flag, header or
+permissions policy can grant it on a plain-HTTP page served from a hostname or LAN address —
+`server.py` prints these same options when it detects that situation. File upload is
+unaffected by all of it.
+
+**Simplest — HTTPS with no certificate work:**
+
+```bash
+python examples/web/server.py --host 0.0.0.0 --tls-self-signed
+```
+
+The pair is generated on first use and cached in `~/.cache/oasr/web-demo`, covering
+`localhost`, this machine's hostname, and its local IPs; add anything else users will type
+with `--tls-san`. It is deliberately *not* ephemeral: a browser pins its "proceed anyway"
+exception to one certificate, so a fresh certificate per start would mean clicking through the
+warning on every start. Needs `openssl` on `PATH`. Regenerated only when it is missing, near
+expiry, or no longer covers the names being served.
+
+**Staying on plain HTTP** — then the origin must be allowlisted in each browser, once:
+
+| Browser | How |
+|---|---|
+| Chrome / Edge | `chrome://flags/#unsafely-treat-insecure-origin-as-secure` → add the full origin, scheme and port included (`http://asr-host:8000`) |
+| Firefox | `about:config` → `media.devices.insecure.enabled` and `media.getusermedia.insecure.enabled` to `true` (these prefs have moved between releases; check they exist in your build) |
+| Safari | No equivalent — use HTTPS |
+
+**Or reach the page on loopback**, which is a secure context without TLS:
+`ssh -N -L 8000:127.0.0.1:8000 user@asr-host`.
+
+Note that `*.localhost` hostnames do *not* offer a shortcut: Chrome and Firefox both resolve
+that suffix to loopback internally, so a hosts-file entry pointing it at a remote machine
+cannot work.
 
 ## Talking to `oasr-server` directly instead
 
@@ -119,9 +155,9 @@ python -m http.server 8000 --directory examples/web/static
   translated WebSocket ⇆ gRPC and needed fastapi, uvicorn and grpcio; do not reintroduce a
   translator. The cost of not parsing is that the relay's logs count bytes rather than
   partials — the server's own `rid=` lines carry the decode detail.
-- **Microphone needs a secure context** — HTTPS, or `localhost` / `127.0.0.1`. On a bare
-  hostname or LAN address over plain HTTP the browser hides `getUserMedia` entirely and only
-  file upload works.
+- **TLS on the relay is independent of the upstream**: the page can be HTTPS while the relay
+  speaks plain HTTP to `oasr-server` on a private network, so getting the microphone working
+  never requires certificates on the inference server.
 - Every response carries an `x-oasr-trace` header matching the `[http-…]` / `[ws-…]` prefix in
   the log, so a devtools entry joins a log line.
 - Streaming + upload paces the file through at ~realtime, so partials stream in as they would

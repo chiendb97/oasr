@@ -3,16 +3,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Same-origin front door for the OASR web demo: static page + reverse proxy.
 
-    python examples/web/server.py --oasr-server http://gpu-box:8080
+    python examples/web/server.py --oasr-server http://asr-host:8080
     # then open http://localhost:8000
 
 Serves ``static/`` and forwards the API paths to a running ``oasr-server``, so the
 browser only ever talks to *this* origin.  That is the whole point of the process:
 
 * the server needs **no** ``--cors-allow-origin``, because nothing is cross-origin;
-* the page needs no ``?server=`` and no SSH tunnel — one flag names the GPU box;
-* ``oasr-server`` can stay bound to loopback there.  It has no authentication of
-  its own, so being reachable only by this relay is a feature.
+* the page needs no ``?server=`` and no SSH tunnel — one flag names the host;
+* ``oasr-server`` needs no network exposure of its own.  It has no authentication,
+  so being reachable only by this relay is a feature.
 
 Not the bridge this repo used to ship
 -------------------------------------
@@ -35,6 +35,16 @@ example rather than a demo-only protocol.  Consequences worth knowing:
   parse cannot report what it did not read; the server's own ``rid=`` log lines
   have the decode detail.
 
+Microphone
+----------
+
+Browsers expose ``getUserMedia`` only in a secure context — HTTPS, or a loopback
+host — and that is the browser's decision, so nothing this process sends can grant
+it.  ``--tls-self-signed`` is the one-flag answer: HTTPS with a cached self-signed
+certificate, warned about once per browser.  To stay on plain HTTP instead, the
+origin has to be allowlisted in the browser; the startup warning spells out how
+per vendor.  File upload never needs any of this.
+
 Logging
 -------
 
@@ -48,12 +58,15 @@ response headers and the reason a relay tore down::
 """
 
 import argparse
+import ipaddress
 import json
 import logging
 import os
 import selectors
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import time
 import uuid
@@ -68,6 +81,10 @@ from urllib.parse import SplitResult, urlsplit
 
 HERE = Path(__file__).resolve().parent
 STATIC_DIR = HERE / "static"
+
+# Where --tls-self-signed keeps its pair.  Alongside the JIT cache, by the same
+# convention, and *persistent* on purpose: see ensure_self_signed().
+TLS_DIR = Path.home() / ".cache" / "oasr" / "web-demo"
 
 # What the upstream owns; everything else is a file in ``static/``.  An explicit
 # list, not "proxy whatever is not on disk": a typo in an asset path should 404
@@ -103,8 +120,8 @@ LOG_WS = LOG.getChild("ws")  # browser <-> relay, realtime sessions
 LOG_UP = LOG.getChild("upstream")  # relay <-> oasr-server
 
 #: Correlation id of the in-flight request, stamped onto every record by
-#: ``_TraceFilter``.  A ContextVar rather than a parameter so the relay's pump
-#: thread can adopt the same id without it being threaded through every call.
+#: ``_TraceFilter``.  A ContextVar rather than a parameter, so that a handler deep
+#: in a relay loop logs under the right id without it being passed down to it.
 _TRACE: ContextVar[str] = ContextVar("oasr_webdemo_trace", default="-")
 
 _LOG_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)-7s [%(trace)s] %(name)s: %(message)s"
@@ -482,6 +499,137 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------------------
+# Microphone / secure context
+# ---------------------------------------------------------------------------
+#
+# Browsers expose getUserMedia only in a "secure context": HTTPS, or a loopback
+# host.  That is decided by the *browser*, so no flag or header on this side can
+# grant it — `--tls-self-signed` below removes the certificate work instead, and
+# the warning names the browser-side allowlist for anyone who must stay on plain
+# HTTP.  File upload is unaffected either way.
+
+
+def _tls_names(bind_host: str, extra: List[str]) -> List[str]:
+    """Names a self-signed cert should cover: whatever the user might type."""
+    names = {"localhost", "127.0.0.1", "::1"}
+    if bind_host not in ("0.0.0.0", "::"):
+        names.add(bind_host)
+    try:
+        hostname = socket.gethostname()
+        names.update({hostname, socket.getfqdn()})
+        names.update(socket.gethostbyname_ex(hostname)[2])
+    except OSError:  # unresolvable hostname is not fatal — a SAN miss is one click
+        pass
+    try:
+        # The address a *remote* browser would use, which is usually the one
+        # typed into the address bar and often not what the hostname resolves to
+        # (plenty of hosts map their own name to 127.0.0.1). Connecting a UDP
+        # socket sends nothing; it only asks the kernel which source address it
+        # would pick, so this needs a route rather than a reachable peer.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 9))  # TEST-NET-1: reserved, never routed
+            names.add(probe.getsockname()[0])
+    except OSError:
+        pass
+    names.update(extra)
+    return sorted(n for n in names if n)
+
+
+def _san_arg(names: List[str]) -> str:
+    parts = []
+    for name in names:
+        try:
+            ipaddress.ip_address(name)
+            parts.append(f"IP:{name}")
+        except ValueError:
+            parts.append(f"DNS:{name}")
+    return "subjectAltName=" + ",".join(parts)
+
+
+def ensure_self_signed(names: List[str]) -> tuple[str, str]:
+    """Reuse, or generate, a self-signed pair covering ``names``.
+
+    Cached under ``~/.cache/oasr/web-demo`` rather than made fresh per start, and
+    that is the point of the flag: a browser pins its "proceed anyway" exception
+    to one certificate, so a new certificate on every start would mean clicking
+    through the warning on every start.  Regenerated only when it is missing,
+    within a week of expiry, or no longer covers the names being served.
+    """
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        raise RuntimeError(
+            "--tls-self-signed needs the `openssl` command on PATH; pass "
+            "--ssl-certfile/--ssl-keyfile with your own pair instead"
+        )
+    TLS_DIR.mkdir(parents=True, exist_ok=True)
+    cert, key, stamp = TLS_DIR / "cert.pem", TLS_DIR / "key.pem", TLS_DIR / "sans.txt"
+    san = _san_arg(names)
+    covered = stamp.is_file() and stamp.read_text() == san
+    unexpired = (
+        cert.is_file()
+        and not subprocess.run(
+            [openssl, "x509", "-in", str(cert), "-noout", "-checkend", "604800"],
+            capture_output=True,
+        ).returncode
+    )
+
+    if not (covered and unexpired and key.is_file()):
+        # The CN is legacy; browsers read subjectAltName, which is why a name the
+        # user actually types has to be in there.
+        primary = next(
+            (n for n in names if n not in ("localhost", "127.0.0.1", "::1")), "localhost"
+        )
+        base = [
+            openssl, "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "825",
+            "-nodes", "-keyout", str(key), "-out", str(cert), "-subj", f"/CN={primary}",
+        ]  # fmt: skip
+        done = subprocess.run(base + ["-addext", san], capture_output=True, text=True)
+        if done.returncode:
+            # -addext wants OpenSSL >= 1.1.1. Without it the cert has a CN only,
+            # which still serves TLS; it just adds a name-mismatch click.
+            LOG.debug("openssl -addext rejected (%s); retrying without SANs", done.stderr.strip())
+            done = subprocess.run(base, capture_output=True, text=True)
+        if done.returncode:
+            raise RuntimeError(f"openssl failed to generate a certificate: {done.stderr.strip()}")
+        stamp.write_text(san)
+        key.chmod(0o600)
+        LOG.info("generated a self-signed certificate in %s", TLS_DIR)
+    else:
+        LOG.info("reusing the self-signed certificate in %s", TLS_DIR)
+
+    shown = subprocess.run(
+        [openssl, "x509", "-in", str(cert), "-noout", "-fingerprint", "-sha256"],
+        capture_output=True,
+        text=True,
+    )
+    if not shown.returncode:
+        LOG.info("  %s", shown.stdout.strip())
+    LOG.info("  browsers will warn once — accept it, and the microphone works")
+    return str(cert), str(key)
+
+
+def warn_insecure_context(port: int) -> None:
+    """Explain the secure-context gate, and every way around it."""
+    LOG.warning(
+        "the microphone will be unavailable: a plain-HTTP page on a non-loopback "
+        "address is not a secure context, and no server-side flag or header can "
+        "change that — the browser decides. File upload works regardless. Options:"
+    )
+    LOG.warning("  easiest      restart with --tls-self-signed, accept the warning once")
+    LOG.warning("  no TLS       tell one browser to trust this origin:")
+    LOG.warning(
+        "               Chrome/Edge  chrome://flags/#unsafely-treat-insecure-origin-as-secure"
+    )
+    LOG.warning("                            → add the full origin, scheme and port included")
+    LOG.warning("               Firefox      about:config → media.devices.insecure.enabled = true")
+    LOG.warning("                            and media.getusermedia.insecure.enabled = true")
+    LOG.warning("               Safari       no equivalent; use --tls-self-signed")
+    LOG.warning(
+        "  or           reach the page on loopback: ssh -L %d:localhost:%d <host>", port, port
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -509,12 +657,28 @@ def main(argv: List[str]) -> int:
     )
     p.add_argument("--log-file", default=None, help="also append logs to this file")
     p.add_argument(
+        "--tls-self-signed",
+        action="store_true",
+        help="serve HTTPS with a self-signed certificate generated and cached in "
+        f"{TLS_DIR} (needs `openssl` on PATH). The one-flag way to get the "
+        "microphone working on a remote host: browsers only expose it in a secure "
+        "context. They warn once about the certificate; accepting it is remembered.",
+    )
+    p.add_argument(
+        "--tls-san",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="extra hostname or IP for the generated certificate to cover; repeatable. "
+        "The bind address, this machine's hostname and its local IPs are included "
+        "already — add anything else users will type in the address bar.",
+    )
+    p.add_argument(
         "--ssl-certfile",
         default=None,
-        help="TLS cert (PEM) to serve the page over HTTPS. Required for microphone "
-        "access when the page is opened from a non-localhost host, since browsers "
-        "gate getUserMedia to secure contexts. Independent of the upstream: this "
-        "relay may serve HTTPS while talking plain HTTP to oasr-server.",
+        help="TLS cert (PEM) to serve the page over HTTPS, instead of --tls-self-signed. "
+        "Independent of the upstream either way: this relay may serve HTTPS while "
+        "talking plain HTTP to oasr-server.",
     )
     p.add_argument("--ssl-keyfile", default=None, help="TLS private key paired with the cert")
     args = p.parse_args(argv)
@@ -524,8 +688,12 @@ def main(argv: List[str]) -> int:
     upstream = urlsplit(args.oasr_server.rstrip("/"))
     if upstream.scheme not in ("http", "https") or not upstream.hostname:
         p.error(f"--oasr-server must be an http(s) URL with a host, got {args.oasr_server!r}")
+    if args.tls_self_signed and args.ssl_certfile:
+        p.error("--tls-self-signed and --ssl-certfile are alternatives; pass one")
     if args.ssl_certfile and not args.ssl_keyfile:
         p.error("--ssl-certfile also needs --ssl-keyfile")
+    if args.tls_san and not args.tls_self_signed:
+        p.error("--tls-san only applies to the certificate --tls-self-signed generates")
     Handler.upstream = upstream
 
     if not STATIC_DIR.is_dir():
@@ -539,10 +707,17 @@ def main(argv: List[str]) -> int:
         LOG.error("cannot bind %s:%d: %s", args.host, args.port, exc)
         return 1
 
+    certfile, keyfile = args.ssl_certfile, args.ssl_keyfile
+    if args.tls_self_signed:
+        try:
+            certfile, keyfile = ensure_self_signed(_tls_names(args.host, args.tls_san))
+        except RuntimeError as exc:
+            LOG.error("%s", exc)
+            return 1
     scheme = "http"
-    if args.ssl_certfile:
+    if certfile:
         ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        ctx.load_cert_chain(args.ssl_certfile, args.ssl_keyfile)
+        ctx.load_cert_chain(certfile, keyfile)
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
@@ -558,14 +733,8 @@ def main(argv: List[str]) -> int:
     routed = ", ".join(p_ + "*" if p_.endswith("/") else p_ for p_ in PROXY_PREFIXES)
     LOG.info("  %s → %s", routed, upstream.geturl())
     LOG.info("  same origin: oasr-server needs no --cors-allow-origin")
-    if scheme == "http" and args.host not in ("127.0.0.1", "localhost"):
-        LOG.warning(
-            "microphone needs a secure context. Open the page via http://localhost "
-            "(e.g. `ssh -L %d:localhost:%d <host>`), or pass --ssl-certfile/"
-            "--ssl-keyfile to serve HTTPS. File upload works either way.",
-            args.port,
-            args.port,
-        )
+    if scheme == "http" and args.host not in ("127.0.0.1", "localhost", "::1"):
+        warn_insecure_context(args.port)
     with httpd:
         try:
             httpd.serve_forever()

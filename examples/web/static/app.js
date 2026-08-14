@@ -265,10 +265,10 @@ function micUnavailableReason() {
                     navigator.mozGetUserMedia;
   if (hasModern || hasLegacy) return null;
   if (window.isSecureContext === false) {
-    return "Microphone needs a secure context. Open this page via " +
-           "http://localhost (e.g. SSH-tunnel it: ssh -L 8000:localhost:8000 " +
-           "<host>) or serve it over HTTPS (server.py --ssl-certfile). " +
-           "File upload still works.";
+    return "Microphone needs a secure context, which this page is not. Either restart " +
+           "server.py with --tls-self-signed, or allowlist this origin in the browser " +
+           "(Chrome: chrome://flags/#unsafely-treat-insecure-origin-as-secure; Firefox: " +
+           "about:config → media.devices.insecure.enabled). File upload still works.";
   }
   return "Microphone API is unavailable in this browser. File upload still works.";
 }
