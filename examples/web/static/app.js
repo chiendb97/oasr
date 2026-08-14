@@ -1,7 +1,7 @@
 // Copyright 2024 OASR Authors / SPDX-License-Identifier: Apache-2.0
 //
-// Browser side of the OASR web demo.  Talks to `oasr-server` **directly** —
-// there is no bridge process any more:
+// Browser side of the OASR web demo.  Speaks OASR's own HTTP API, never a
+// demo-only protocol — nothing here needs translating:
 //   - offline : POST {server}/v1/audio/transcriptions  (multipart upload)
 //   - stream  : WS   {server}/v1/realtime              (session + PCM frames)
 //
@@ -9,17 +9,31 @@
 // decodes MP3 / M4A / FLAC / OGG / WAV itself.  Only the streaming path decodes
 // in-browser, because a live session is chunked PCM by definition.
 //
-// The server must allow this page's origin:
-//   oasr-server --ckpt-dir ... --cors-allow-origin '*'
+// Two ways to run it, and the default is the quiet one:
+//   examples/web/server.py  — serves this page and relays /v1/* to oasr-server,
+//                             so every call is same-origin and CORS never enters
+//                             into it.  Nothing to configure here.
+//   ?server=http://host:port — talk to oasr-server directly, which is then
+//                             cross-origin and needs --cors-allow-origin.
 "use strict";
 
 const TARGET_SR = 16000;
 const CHUNK_MS = 320;
 
-// Where oasr-server listens.  Override with ?server=http://host:port — the page
-// is static, so it can be opened from anywhere and pointed at any server.
+// Empty means "this origin", i.e. whatever served the page — the relay case.
+// `file://` is the exception: it has no usable origin, so a page opened by
+// double-clicking keeps the absolute default instead of deriving `wss://null`.
 const SERVER = (new URLSearchParams(location.search).get("server") ||
-                "http://127.0.0.1:8080").replace(/\/$/, "");
+                (location.protocol === "file:" ? "http://127.0.0.1:8080" : "")).replace(/\/$/, "");
+
+// Base for the realtime socket.  Derived from SERVER when it is set, from the
+// page's own origin otherwise; either way http->ws and https->wss, so an HTTPS
+// page (which is what the microphone needs off localhost) gets a secure socket.
+const WS_BASE = (SERVER || location.origin).replace(/^http/, "ws");
+
+// What to call the endpoint in a message: an explicit ?server=, or wherever this
+// page came from — which in the relay case is the thing that knows the upstream.
+const SERVER_LABEL = SERVER || location.origin;
 
 // ---- DOM -------------------------------------------------------------------
 
@@ -162,7 +176,7 @@ async function postOffline(fileOrBlob, filename) {
 // ---- streaming (WebSocket) -------------------------------------------------
 
 function openStream(onFinalClose) {
-  const ws = new WebSocket(SERVER.replace(/^http/, "ws") + "/v1/realtime");
+  const ws = new WebSocket(WS_BASE + "/v1/realtime");
   ws.binaryType = "arraybuffer";
   ws.onmessage = (ev) => {
     let m;
@@ -178,8 +192,10 @@ function openStream(onFinalClose) {
       setStatus("Server error: " + ((m.error && m.error.message) || "unknown"), "error");
     }
   };
-  ws.onerror = () => setStatus(
-    `WebSocket error — is oasr-server running at ${SERVER} with --cors-allow-origin?`, "error");
+  ws.onerror = () => setStatus(SERVER
+    ? `WebSocket error — is oasr-server running at ${SERVER} with --cors-allow-origin?`
+    : `WebSocket error — is ${SERVER_LABEL} still up, and can it reach its ` +
+      `--oasr-server? Its log names the reason.`, "error");
   ws.onclose = () => onFinalClose && onFinalClose();
   return ws;
 }
@@ -249,9 +265,10 @@ function micUnavailableReason() {
                     navigator.mozGetUserMedia;
   if (hasModern || hasLegacy) return null;
   if (window.isSecureContext === false) {
-    return "Microphone needs a secure context. Open this page via " +
-           "http://localhost (e.g. SSH-tunnel it: ssh -L 8000:localhost:8000 " +
-           "<host>) or serve it over HTTPS. File upload still works.";
+    return "Microphone needs a secure context, which this page is not. Either restart " +
+           "server.py with --tls-self-signed, or allowlist this origin in the browser " +
+           "(Chrome: chrome://flags/#unsafely-treat-insecure-origin-as-secure; Firefox: " +
+           "about:config → media.devices.insecure.enabled). File upload still works.";
   }
   return "Microphone API is unavailable in this browser. File upload still works.";
 }
@@ -412,17 +429,21 @@ recordBtn.addEventListener("click", () => { recording ? stopMic() : startMic(); 
 
 (async function init() {
   const serverEl = document.getElementById("server-url");
-  if (serverEl) serverEl.textContent = SERVER;
-  // Fail early and specifically: "is the server up" and "did you allow this
-  // origin" are the only two things that go wrong here, and they look identical
-  // from a failed fetch inside a transcription.
+  if (serverEl) serverEl.textContent = SERVER_LABEL;
+  // Fail early and specifically: a dead server and a blocked origin look the
+  // same from a failed fetch inside a transcription, and neither is the page's
+  // fault — so name the two fixes rather than reporting "failed".
   try {
     const resp = await fetch(`${SERVER}/v1/models`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   } catch {
-    setStatus(
-      `Cannot reach oasr-server at ${SERVER}. Start it with ` +
-      `--cors-allow-origin '*', or pass ?server=http://host:port.`, "error");
+    setStatus(SERVER
+      ? `Cannot reach oasr-server at ${SERVER}. Start it with ` +
+        `--cors-allow-origin '*', or drop ?server= and run examples/web/server.py.`
+      : `Cannot reach oasr-server through ${SERVER_LABEL}. Serve this page with ` +
+        `examples/web/server.py --oasr-server http://host:8080 (its log says why ` +
+        `the upstream failed), or pass ?server=http://host:8080 to call it directly.`,
+      "error");
   }
   const reason = micUnavailableReason();
   if (reason) setStatus(reason);
