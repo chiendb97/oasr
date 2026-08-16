@@ -18,9 +18,14 @@ use oasr_wire::{
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use tonic::{Request, Response, Status, Streaming};
+use tonic::{Code, Request, Response, Status, Streaming};
 use tracing::{debug, error, field, info, info_span, warn, Instrument, Span};
 
+use oasr_metrics::f32_pcm_seconds;
+
+use crate::grpc_metrics::{
+    code_of, method, outcome_for, record_rpc, streaming as grpc_streaming, unary as grpc_unary,
+};
 use crate::pb;
 
 /// Service-wide configuration for the gRPC Speech handlers.
@@ -604,7 +609,8 @@ impl pb::speech_server::Speech for SpeechService {
         // Per-request span; `rid` is recorded once the engine admits the
         // request so all downstream events carry it.
         let span = info_span!("grpc.recognize", rid = field::Empty);
-        async move {
+        let rpc_start = Instant::now();
+        let result = async move {
             let start = Instant::now();
 
             if self.mode != ServiceMode::Offline {
@@ -658,6 +664,9 @@ impl pb::speech_server::Speech for SpeechService {
 
             let sample_rate = decoded.sample_rate;
             let n_samples = decoded.samples.len() / 4;
+            let audio_seconds = f32_pcm_seconds(decoded.samples.len(), sample_rate);
+            grpc_unary().audio_ingested(audio_seconds);
+            grpc_unary().audio_duration(audio_seconds);
             let handle = self
                 .pool
                 .submit_offline(decoded.samples, sample_rate, cfg.priority, decoding)
@@ -726,7 +735,15 @@ impl pb::speech_server::Speech for SpeechService {
             }
         }
         .instrument(span)
-        .await
+        .await;
+
+        // Recorded here rather than in a tower layer: this is where the RPC's
+        // terminal status actually exists.
+        let code = code_of(&result);
+        let elapsed = rpc_start.elapsed();
+        record_rpc(method::RECOGNIZE, code, elapsed);
+        grpc_unary().finished(outcome_for(code), elapsed);
+        result
     }
 
     type StreamingRecognizeStream =
@@ -833,9 +850,25 @@ impl pb::speech_server::Speech for SpeechService {
         );
 
         let idle_timeout = self.stream_idle_timeout;
+        let engine_rate = self.sample_rate;
         tokio::spawn(async move {
             let start = Instant::now();
             let mut n_partials: u64 = 0;
+            // Time to first partial is clocked from the first inbound audio,
+            // not from the RPC opening: a client may open the stream and then
+            // stay silent, and timing that silence would report the caller's
+            // behaviour as the server's latency.
+            let mut first_audio_at: Option<Instant> = None;
+            let mut ttfp_recorded = false;
+            // Accumulated so the per-request audio duration can be recorded at
+            // the end: a live stream has no total until it closes, while the
+            // RTFx denominator has to accrue as chunks arrive.
+            let mut audio_seconds = 0.0f64;
+            // The status this RPC really ends with, which a middleware cannot
+            // see: it rides out in the trailers after this task finishes.
+            // Named `rpc_code` because `code` is bound by the `Event::Error`
+            // pattern below — that is the engine's error code, not the RPC's.
+            let mut rpc_code = Code::Ok;
             // ``inbound_done`` flips once the client half-closes so we stop
             // polling the inbound stream — otherwise tokio::select! keeps
             // racing on a fused-None stream and we'd call ``flush_last``
@@ -854,6 +887,7 @@ impl pb::speech_server::Speech for SpeechService {
                             "stream idle timeout; cancelling"
                         );
                         let _ = out_tx.send(Err(Status::deadline_exceeded("stream idle"))).await;
+                        rpc_code = Code::DeadlineExceeded;
                         // Fall through to `pool.release`; dropping `handle`
                         // un-disarmed cancels the request engine-side.
                         break;
@@ -862,6 +896,15 @@ impl pb::speech_server::Speech for SpeechService {
                         idle.set(sleep_opt(idle_timeout));
                         match ev {
                             Some(Event::Partial { text, tokens, scores, .. }) => {
+                                if !ttfp_recorded {
+                                    if let Some(t0) = first_audio_at {
+                                        ttfp_recorded = true;
+                                        grpc_streaming().first_partial(t0.elapsed());
+                                    }
+                                }
+                                // The filter is about what this client wants to
+                                // see; the SLI is about what the engine
+                                // produced, so it is timed above the filter.
                                 if !want_partials { continue; }
                                 n_partials += 1;
                                 let resp = partial_response(&rid, text, tokens, scores, max_alts);
@@ -893,14 +936,18 @@ impl pb::speech_server::Speech for SpeechService {
                                     reason = %message,
                                     "stream error"
                                 );
-                                let _ = out_tx.send(Err(map_error(code, message))).await;
+                                let status = map_error(code, message);
+                                let terminal = status.code();
+                                let _ = out_tx.send(Err(status)).await;
                                 handle.finish();
+                                rpc_code = terminal;
                                 break;
                             }
                             Some(_) => {} // Accepted / Pong / Overloaded — ignored at this layer.
                             None => {
                                 error!("event stream closed before terminal event");
                                 let _ = out_tx.send(Err(Status::internal("event stream closed"))).await;
+                                rpc_code = Code::Internal;
                                 break;
                             }
                         }
@@ -924,8 +971,13 @@ impl pb::speech_server::Speech for SpeechService {
                                     if chunk.is_empty() {
                                         continue;
                                     }
+                                    first_audio_at.get_or_insert_with(Instant::now);
+                                    let seconds = f32_pcm_seconds(chunk.len(), engine_rate);
+                                    audio_seconds += seconds;
+                                    grpc_streaming().audio_ingested(seconds);
                                     if handle.push_chunk(chunk).await.is_err() {
                                         warn!("grpc bidi: audio channel dropped");
+                                        rpc_code = Code::Internal;
                                         break;
                                     }
                                 } else {
@@ -936,6 +988,7 @@ impl pb::speech_server::Speech for SpeechService {
                             Some(Err(e)) => {
                                 warn!(reason = %e, "stream inbound error");
                                 let _ = out_tx.send(Err(Status::internal(format!("inbound: {e}")))).await;
+                                rpc_code = Code::Internal;
                                 break;
                             }
                             None => {
@@ -957,6 +1010,10 @@ impl pb::speech_server::Speech for SpeechService {
                 }
             }
             pool.release(&rid);
+            let elapsed = start.elapsed();
+            record_rpc(method::STREAMING_RECOGNIZE, rpc_code, elapsed);
+            grpc_streaming().audio_duration(audio_seconds);
+            grpc_streaming().finished(outcome_for(rpc_code), elapsed);
         }.instrument(span));
 
         let out_stream = ReceiverStream::new(out_rx);

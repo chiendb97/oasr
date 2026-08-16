@@ -7,13 +7,18 @@
 //! method call acquires the GIL.  The dispatcher serialises access by virtue
 //! of being a single thread.
 
+use std::collections::HashMap;
+
 use bytes::Bytes;
 use numpy::{PyArray1, PyArrayMethods};
+use oasr_metrics as om;
 use oasr_wire::{DecodingParams, ErrorCode, Event, ModelInfo, WordTiming};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use thiserror::Error;
+
+use crate::engine_metrics::{EngineLabels, EngineSnapshot};
 
 /// One unit of admission for [`PyEngine::add_requests_batch_locked`].
 ///
@@ -370,7 +375,7 @@ impl PyEngine {
         bound: &Bound<'py, PyAny>,
     ) -> Result<Vec<Event>, PyEngineError> {
         let list = Self::step_raw(bound)?;
-        Self::extract_events(&list)
+        Self::extract_events(&list, &EngineLabels::none())
     }
 
     /// Call `ASREngine.step()` and return the raw `RequestOutput` list without
@@ -383,10 +388,53 @@ impl PyEngine {
         Ok(list)
     }
 
+    /// Drain `ASREngine.metrics_snapshot()` — the engine-scope metrics that
+    /// only Python can see (batch widths, padding, stage host time, pool
+    /// occupancy, device counters).
+    ///
+    /// Returns `None` rather than an error when the engine has no such method:
+    /// an engine object predating this — or a test double — must still be
+    /// serviceable, and losing observability is not a reason to fail a tick.
+    /// The failure is logged once by the caller, not per tick.
+    pub fn metrics_snapshot_locked(bound: &Bound<'_, PyAny>) -> Option<EngineSnapshot> {
+        let snap = bound.call_method0("metrics_snapshot").ok()?;
+        let dict: &Bound<'_, PyDict> = snap.downcast().ok()?;
+        let get_f64 = |key: &str| -> HashMap<String, f64> {
+            dict.get_item(key)
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract().ok())
+                .unwrap_or_default()
+        };
+        Some(EngineSnapshot {
+            counters: get_f64("counters"),
+            gauges: get_f64("gauges"),
+            hist: dict
+                .get_item("hist")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract().ok())
+                .unwrap_or_default(),
+            keyed_hist: dict
+                .get_item("keyed_hist")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract().ok())
+                .unwrap_or_default(),
+        })
+    }
+
     /// Marshal a `RequestOutput` list (from [`step_raw`]) into native events.
     /// This is the GIL-held per-output `getattr` + `Vec` materialization that
     /// runs on the dispatcher thread after each step.
-    pub fn extract_events(list: &Bound<'_, PyList>) -> Result<Vec<Event>, PyEngineError> {
+    ///
+    /// `labels` are the engine-scope labels for the one metric recorded here —
+    /// a failed request, which is only attributable at the moment its
+    /// `error_stage` is read off the output.
+    pub fn extract_events(
+        list: &Bound<'_, PyList>,
+        labels: &EngineLabels,
+    ) -> Result<Vec<Event>, PyEngineError> {
         let mut events = Vec::with_capacity(list.len());
         for item in list.iter() {
             let rid: String = item.getattr("request_id")?.extract()?;
@@ -455,7 +503,7 @@ impl PyEngine {
                         .and_then(|x| x.extract::<Option<String>>().ok())
                         .flatten()
                         .unwrap_or_else(|| "unknown".to_string());
-                    metrics::counter!(crate::dispatcher::metric::FAILED, "stage" => stage)
+                    metrics::counter!(om::REQUESTS_FAILED, labels.with(om::label::STAGE, stage))
                         .increment(1);
                 }
                 Event::Final {

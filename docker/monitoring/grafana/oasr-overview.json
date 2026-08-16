@@ -1,0 +1,682 @@
+{
+  "title": "OASR \u2014 Serving Overview",
+  "uid": "oasr-overview",
+  "schemaVersion": 39,
+  "editable": true,
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "tags": [
+    "oasr",
+    "asr",
+    "inference"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Datasource",
+        "description": "Defaults to the UID provisioned by docker/monitoring/docker-compose.monitoring.yml. On a manual import into an existing Grafana, pick your own Prometheus here once.",
+        "current": {
+          "text": "Prometheus",
+          "value": "oasr-prometheus"
+        },
+        "hide": 0
+      },
+      {
+        "name": "engine",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(oasr_engine_running, engine)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "model",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(oasr_engine_running{engine=~\"$engine\"}, model)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Golden signals",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "RTFx (audio seconds transcribed per second of request time)",
+      "description": "The ASR throughput unit. Audio ingested divided by request wall time over the same window, so a value of 40 means the fleet transcribes forty seconds of speech per wall-clock second. Below 1 for a streaming deployment means it cannot keep up with real time.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "green",
+                "value": 5
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(oasr_audio_seconds_total[$__rate_interval])) / clamp_min(sum(rate(oasr_request_duration_seconds_sum[$__rate_interval])), 0.001)",
+          "legendFormat": "RTFx"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Requests / s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "unit": "reqps"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (api) (rate(oasr_request_duration_seconds_count[$__rate_interval]))",
+          "legendFormat": "{{api}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Error ratio",
+      "description": "Cancellations are excluded on purpose: a client hanging up mid-stream is normal on a realtime surface and is not the server failing.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(oasr_request_duration_seconds_count{outcome=\"error\"}[$__rate_interval])) / clamp_min(sum(rate(oasr_request_duration_seconds_count[$__rate_interval])), 0.001)",
+          "legendFormat": "errors"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Time to first partial (p99)",
+      "description": "The streaming SLI: first inbound audio byte to first partial transcript.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(oasr_time_to_first_partial_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Latency",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Request latency by surface (p50 / p95 / p99)",
+      "description": "Computed with histogram_quantile over _bucket series, which is only possible because the exporter is configured with explicit buckets. With the library default these would be per-replica summary quantiles and could not be aggregated at all.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, api) (rate(oasr_request_duration_seconds_bucket{outcome=\"ok\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{api}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, api) (rate(oasr_request_duration_seconds_bucket{outcome=\"ok\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{api}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, api) (rate(oasr_request_duration_seconds_bucket{outcome=\"ok\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{api}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Dispatcher tick p99 \u2014 the GIL hold time",
+      "description": "One tick holds the GIL for admit + step + extract, so this p99 is the worst-case latency a cancel, a new admission or a streaming partial can experience. It is model-dependent: a batched 7B decoder step is orders of magnitude slower than a CTC chunk.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, engine) (rate(oasr_dispatch_tick_seconds_bucket{engine=~\"$engine\", model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "tick p99 {{engine}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, engine) (rate(oasr_engine_step_seconds_bucket{engine=~\"$engine\", model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "step p99 {{engine}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue wait (p50 / p90 / p99)",
+      "description": "How long a request sat between admission and the scheduler first picking it up. Read it against the dispatcher tick panel: queue wait rising while tick time stays flat means the engine is saturated (work is arriving faster than it drains), not slow. Both rising together means each step got more expensive.\n\nWas a heatmap; the buckets span 100us to 30s, so on a linear axis a realistic 10-50ms wait was invisible at the bottom of the panel.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "scaleDistribution": {
+              "type": "log",
+              "log": 10
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "p99.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 3
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "p50.*"
+            },
+            "properties": [
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, mode) (rate(oasr_engine_queue_wait_seconds_bucket{engine=~\"$engine\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{mode}}"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le, mode) (rate(oasr_engine_queue_wait_seconds_bucket{engine=~\"$engine\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{mode}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, mode) (rate(oasr_engine_queue_wait_seconds_bucket{engine=~\"$engine\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{mode}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Engine stage host time (p95)",
+      "description": "HOST wall time per stage, not GPU time. CUDA is asynchronous: the encoder forward returns while the GPU is still working and the decode that reads tokens back pays for both. Read this as 'where does the step loop's wall clock go' \u2014 the right question for an interpreter-bound loop. For GPU attribution use Nsight Systems over the NVTX ranges (OASR_NVTX=1).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(oasr_engine_stage_host_seconds_bucket{engine=~\"$engine\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Capacity",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 23
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue depth",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine) (oasr_engine_running{engine=~\"$engine\"})",
+          "legendFormat": "running {{engine}}"
+        },
+        {
+          "expr": "sum by (engine) (oasr_engine_waiting{engine=~\"$engine\"})",
+          "legendFormat": "waiting {{engine}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Paged encoder KV pool",
+      "description": "Approaching capacity is what precedes oasr_engine_kv_exhausted_total, which counts streams cut short with finish_reason=\"length\".",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine) (oasr_engine_kv_blocks_used{engine=~\"$engine\"}) / clamp_min(sum by (engine) (oasr_engine_kv_blocks_capacity{engine=~\"$engine\"}), 1)",
+          "legendFormat": "utilization {{engine}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "AR decode slots",
+      "description": "Zero capacity means the running decode family is not incremental \u2014 a frame-synchronous family parks no generations.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 24
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine) (oasr_engine_decode_slots_in_use{engine=~\"$engine\"})",
+          "legendFormat": "in use {{engine}}"
+        },
+        {
+          "expr": "sum by (engine) (oasr_engine_decode_slots_capacity{engine=~\"$engine\"})",
+          "legendFormat": "capacity {{engine}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "GPU",
+      "description": "NVML's utilization is the fraction of its sampling window in which any kernel was resident \u2014 a saturation hint, not SM occupancy. A kernel using one SM of 170 reads as 1.0.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 31
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "max": 1,
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "expr": "oasr_gpu_utilization_ratio{engine=~\"$engine\"}",
+          "legendFormat": "utilization {{engine}}"
+        },
+        {
+          "expr": "oasr_gpu_memory_used_bytes{engine=~\"$engine\"} / clamp_min(oasr_gpu_memory_total_bytes{engine=~\"$engine\"}, 1)",
+          "legendFormat": "memory {{engine}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Batching",
+      "description": "Padding ratio is the fraction of a padded offline batch that is padding \u2014 whether the bucketing policy is working, which is otherwise pure guesswork.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 31
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, mode) (rate(oasr_engine_batch_size_bucket{engine=~\"$engine\"}[$__rate_interval])))",
+          "legendFormat": "median batch {{mode}}"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(oasr_engine_batch_padding_ratio_bucket{engine=~\"$engine\"}[$__rate_interval])))",
+          "legendFormat": "median padding ratio"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Failures and backpressure",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 38
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Rejections and failures",
+      "description": "oasr_requests_failed_total{stage} rising while oasr_engine_step_failures_total stays flat is failure isolation working, not an outage: the executor contained the failure to the requests responsible and kept ticking.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 39
+      },
+      "targets": [
+        {
+          "expr": "sum by (stage) (rate(oasr_requests_failed_total{engine=~\"$engine\"}[$__rate_interval]))",
+          "legendFormat": "failed {{stage}}"
+        },
+        {
+          "expr": "sum(rate(oasr_requests_busy_total{engine=~\"$engine\"}[$__rate_interval]))",
+          "legendFormat": "busy (at concurrency cap)"
+        },
+        {
+          "expr": "sum(rate(oasr_requests_rejected_total{engine=~\"$engine\"}[$__rate_interval]))",
+          "legendFormat": "rejected at admission"
+        },
+        {
+          "expr": "sum(rate(oasr_engine_step_failures_total{engine=~\"$engine\"}[$__rate_interval]))",
+          "legendFormat": "step failures"
+        },
+        {
+          "expr": "sum(rate(oasr_engine_kv_exhausted_total{engine=~\"$engine\"}[$__rate_interval]))",
+          "legendFormat": "streams truncated (cache full)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP by route and status",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 39
+      },
+      "targets": [
+        {
+          "expr": "sum by (route, status) (rate(oasr_http_requests_total[$__rate_interval]))",
+          "legendFormat": "{{route}} {{status}}"
+        },
+        {
+          "expr": "sum by (method, code) (rate(oasr_grpc_requests_total[$__rate_interval]))",
+          "legendFormat": "{{method}} {{code}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Client backpressure",
+      "description": "Sustained non-zero means clients are reading slower than the engine emits. A dropped partial is harmless \u2014 the next one supersedes it \u2014 but a deferred terminal means a result had to be delivered out of band.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 46
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine) (rate(oasr_events_dropped_total{engine=~\"$engine\"}[$__rate_interval]))",
+          "legendFormat": "partials dropped {{engine}}"
+        },
+        {
+          "expr": "sum by (engine) (rate(oasr_events_deferred_total{engine=~\"$engine\"}[$__rate_interval]))",
+          "legendFormat": "terminals deferred {{engine}}"
+        },
+        {
+          "expr": "sum by (engine) (rate(oasr_requests_cancelled_total{engine=~\"$engine\"}[$__rate_interval]))",
+          "legendFormat": "cancelled {{engine}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Metric-collector health",
+      "description": "Non-zero means the engine's own histograms are showing a TRUNCATED distribution: it buffered more samples between two drains than it may hold. Exported so the cap is visible instead of passing for a complete one.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 46
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine) (rate(oasr_engine_metric_samples_dropped_total{engine=~\"$engine\"}[$__rate_interval]))",
+          "legendFormat": "samples dropped {{engine}}"
+        }
+      ]
+    }
+  ]
+}

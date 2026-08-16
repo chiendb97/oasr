@@ -39,6 +39,7 @@ from .memory import (
     measure_peak_activation,
     read_device_memory,
 )
+from .metrics import TOKENS_GENERATED, EngineMetrics, build_metrics
 from .model_runner import ModelRunner
 from .output_processor import OutputProcessor
 from .request import DecodingOptions, Request, RequestOutput
@@ -165,6 +166,12 @@ class ASREngine:
         # lives). ``InputProcessor`` and ``ModelRunner`` each allocate their
         # own pool internally when ``graph_pool=None``.
         self._graph_pool: Optional[Tuple[int, int]] = None
+
+        # Engine-scope metric collection.  One collector per engine, not a
+        # module global: a process holding an ``EnginePool`` of several engines
+        # must keep their series apart, which is what the ``engine`` label on
+        # the exported metric is for.
+        self._metrics: EngineMetrics = build_metrics(self._device)
 
         self._input_processor = InputProcessor(config, self._device, graph_pool=self._graph_pool)
         self._scheduler = Scheduler(config)
@@ -1156,6 +1163,7 @@ class ASREngine:
                 output_processor=self._output_processor,
                 config=config,
                 device=self._device,
+                metrics=self._metrics,
             )
         # Offline: the scheduler partitions each batch into micro-batches
         # (length-bucketed, padded-frame-capped, or sequence-packed — all
@@ -1179,6 +1187,7 @@ class ASREngine:
             max_tick_ms=config.max_tick_ms,
             decode_admit_window_ms=config.decode_admit_window_ms,
             max_batch_size=config.max_batch_size,
+            metrics=self._metrics,
         )
 
     def _validate_mode(self, streaming: bool) -> None:
@@ -1213,10 +1222,39 @@ class ASREngine:
             nvtx_push("engine.step")
             outputs = self._executor.step()
             nvtx_pop()
+            # Counted before long-form absorption, and only on finished
+            # outputs.  Before, because the windows are what the decoder
+            # actually generated and the stitched parent would report the same
+            # work under a different total; only finished, because a streaming
+            # partial carries the transcript *so far* and adding each one would
+            # count every token once per tick it survived.
+            if self._metrics.enabled:
+                n_tokens = sum(len(o.tokens[0]) for o in outputs if o.finished and o.tokens)
+                if n_tokens:
+                    self._metrics.incr(TOKENS_GENERATED, n_tokens)
             if self._longform is not None and self._longform:
                 # Replace per-window child outputs with one stitched parent.
                 outputs = self._longform.absorb(outputs)
             return outputs
+
+    def metrics_snapshot(self) -> Dict:
+        """Drain engine-scope metrics for the serving front-end's exporter.
+
+        Called by the Rust dispatcher on a rate-limited cadence, inside the GIL
+        scope it already holds for the tick, and replayed into Prometheus
+        there.  Counters and gauges come back **absolute** so the protocol is
+        idempotent — a missed drain loses nothing and a repeated one
+        double-counts nothing — while histogram samples are handed over and
+        cleared.
+
+        The point-in-time gauges are refreshed *here* rather than per tick:
+        occupancy only has to be as fresh as the drain that exports it, and
+        reading the block pool's free list takes a lock that is much better
+        taken a few times a second than a few thousand.
+        """
+        self._executor.record_gauges(self._metrics)
+        self._metrics.observe_gpu()
+        return self._metrics.snapshot()
 
     def run(self) -> List[RequestOutput]:
         """Run the engine until all pending requests are complete.

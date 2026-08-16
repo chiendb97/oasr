@@ -1,0 +1,19 @@
+# Load every dashboard JSON mounted at the path below.
+#
+# `allowUiUpdates: true` so edits in the browser stick for the session — useful
+# while tuning a panel. They are still overwritten from disk on restart, so the
+# file in git stays the source of truth: export your changes back to
+# `docker/monitoring/grafana/oasr-overview.json` or they are lost.
+apiVersion: 1
+
+providers:
+  - name: oasr
+    orgId: 1
+    folder: OASR
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

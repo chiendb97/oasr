@@ -22,7 +22,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use metrics_exporter_prometheus::PrometheusBuilder;
 use oasr_engine_client::{
     client::EngineClientConfig, dispatcher::DispatcherConfig, EngineClient, EnginePool, PyEngine,
 };
@@ -83,7 +82,13 @@ fn init_tracing(log_level: &str, log_format: &str) {
 }
 
 async fn serve(cli: Cli) -> Result<()> {
-    let prometheus = match PrometheusBuilder::new().install_recorder() {
+    // `oasr_metrics::install_recorder` rather than `PrometheusBuilder::new()`
+    // directly: the builder defaults `buckets: None`, and a histogram with no
+    // buckets is not exported as a histogram at all — it becomes a rolling
+    // summary with fixed quantiles, no `_bucket` series, and quantiles that
+    // cannot be aggregated across replicas.  The bucket table lives beside the
+    // metric declarations so a new histogram cannot arrive without one.
+    let prometheus = match oasr_metrics::install_recorder() {
         Ok(h) => Some(h),
         Err(e) => {
             error!("prometheus recorder install failed: {e}");

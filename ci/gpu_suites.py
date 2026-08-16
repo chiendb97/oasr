@@ -85,6 +85,7 @@ SUITES: dict[str, list[str]] = {
         "tests/test_decoding_options.py",
         "tests/test_packing_encoder.py",
         "tests/test_vram_sizing.py",
+        "tests/test_engine_metrics.py",
         # The Python client / `oasr` CLI: the request-and-response surface the
         # engine is reached through, against a stub server rather than a GPU.
         "tests/test_client.py",

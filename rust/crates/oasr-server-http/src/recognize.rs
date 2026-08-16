@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, field, info, info_span, Instrument, Span};
 
 use crate::engine_call::submit_offline_and_wait;
+use crate::http_metrics::google_offline;
 use crate::router::{AppState, ServiceMode};
 
 /// Fallback body cap, used only when a caller builds a [`ServerState`] without
@@ -411,11 +412,20 @@ async fn run_offline(
     start: Instant,
 ) -> axum::response::Response {
     let n_samples = audio_buf.len() / 4;
-    let final_ =
-        match submit_offline_and_wait(s, audio_buf, sample_rate, priority, decoding, start).await {
-            Ok(f) => f,
-            Err(e) => return error_response(e.status, e.code, e.message),
-        };
+    let final_ = match submit_offline_and_wait(
+        s,
+        audio_buf,
+        sample_rate,
+        priority,
+        decoding,
+        start,
+        google_offline(),
+    )
+    .await
+    {
+        Ok(f) => f,
+        Err(e) => return error_response(e.status, e.code, e.message),
+    };
     Span::current().record("rid", final_.request_id.as_str());
     let n_tokens = final_.tokens.first().map_or(0, |t| t.len());
     info!(

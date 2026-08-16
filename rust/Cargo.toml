@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/oasr-wire",
+    "crates/oasr-metrics",
     "crates/oasr-engine-client",
     "crates/oasr-asr",
     "crates/oasr-server-http",
@@ -18,6 +19,7 @@ members = [
 # extension module is built on its own by setuptools-rust (see pyproject.toml).
 default-members = [
     "crates/oasr-wire",
+    "crates/oasr-metrics",
     "crates/oasr-engine-client",
     "crates/oasr-asr",
     "crates/oasr-server-http",
@@ -118,6 +120,8 @@ clap = { version = "4", features = ["derive", "env"] }
 # Metrics
 metrics = "0.22"
 metrics-exporter-prometheus = "0.13"
+# The one declaration point for every metric name, kind and bucket set.
+oasr-metrics = { path = "crates/oasr-metrics" }
 
 [profile.release]
 opt-level = 3

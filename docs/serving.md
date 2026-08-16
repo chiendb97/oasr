@@ -829,7 +829,61 @@ partials-per-request.
 
 ## Metrics (`GET /metrics`)
 
-Prometheus exposition of the values the dispatcher already computes per tick.
+Prometheus exposition. Every metric — name, kind, unit, help text and histogram
+buckets — is declared once, in
+[`rust/crates/oasr-metrics`](../rust/crates/oasr-metrics/src/lib.rs), and
+`oasr_metrics::install_recorder` is the only thing that builds the exporter.
+
+A ready-made Grafana dashboard covering everything below ships at
+[`docker/monitoring/grafana/oasr-overview.json`](../docker/monitoring/grafana/oasr-overview.json), with
+a Prometheus scrape config and a compose file that provisions both next to it.
+**[`docker/monitoring/README.md`](../docker/monitoring/README.md) has the setup steps** — scraping,
+retargeting the stack from the command line, and the datasource scrape-interval
+setting that is the usual reason an imported dashboard looks broken. What to
+page on is below, under [What to alert on](#what-to-alert-on).
+
+### Scopes and labels
+
+Metrics are grouped by *who owns the clock*, and that decides the labels:
+
+| Scope | Owner | Labels |
+|---|---|---|
+| Transport | the HTTP / gRPC listener | `method`, `route` / `code`, `status` |
+| Request | the front-end handler, arrival → terminal event | `api`, `mode`, `outcome` |
+| Dispatcher | the GIL-owning dispatcher thread | `engine`, `model`, `decode_method` |
+| Engine | Python, drained through the dispatcher | `engine`, `model`, `decode_method`, plus a per-metric key |
+
+Only the last two carry `engine`. They are the ones several engines in one
+process would otherwise collide on; a transport metric has no engine to name,
+since one listener fronts the whole pool.
+
+`api` is one of `google`, `openai`, `realtime`, `grpc`, `grpc_streaming`;
+`mode` is `offline` or `streaming`; `outcome` is `ok`, `error` or `cancelled`.
+**A client hanging up is `cancelled`, not `error`** — on a realtime surface
+disconnects are normal, and counting them as failures makes an error-rate alert
+useless. A draining server (`UNAVAILABLE`) stays `error`, because that one is
+the server's problem to see.
+
+### The SLIs
+
+| Metric | Type | What it tells you |
+|---|---|---|
+| `oasr_request_duration_seconds{api,mode,outcome}` | histogram | End-to-end request wall time. The number an SLO is written against. |
+| `oasr_audio_seconds_total{api,mode}` | counter | Audio the front-end accepted — counted **before** the submit, so audio a saturated engine refuses still reaches the denominator. **RTFx** is `rate(oasr_audio_seconds_total) / rate(oasr_request_duration_seconds_sum)`. |
+| `oasr_request_audio_seconds{api,mode}` | histogram | Audio duration of one request — the utterance-length distribution the latency histogram has to be read against. |
+| `oasr_time_to_first_partial_seconds{api}` | histogram | The streaming SLI: **first inbound audio byte** to first partial transcript. Not from the socket opening — a client may hold a realtime session open and stay silent, and timing that would report the caller's behaviour as the server's latency. |
+
+### Transport
+
+| Metric | Type | What it tells you |
+|---|---|---|
+| `oasr_http_requests_total{method,route,status}` | counter | `route` is the **matched axum route pattern**, never the request URI: the raw path is unbounded, so every query string and scanner probe would become a permanent series. An unmatched request collapses to `route="<unmatched>"`. |
+| `oasr_http_request_duration_seconds{method,route}` | histogram | Listener-to-response wall time. |
+| `oasr_http_requests_in_flight{method,route}` | gauge | Requests currently being served. |
+| `oasr_grpc_requests_total{method,code}` | counter | `code` is the canonical gRPC status name, recorded when the RPC really ends — for a server-streaming RPC that is at the trailer, which is why these are recorded in the handler rather than by a tower layer. |
+| `oasr_grpc_request_duration_seconds{method}` | histogram | Same clock: to the terminal status, not to the response head. |
+
+### Dispatcher
 
 | Metric | Type | What it tells you |
 |---|---|---|
@@ -844,8 +898,119 @@ Prometheus exposition of the values the dispatcher already computes per tick.
 | `oasr_requests_failed_total{stage}` | counter | Requests the engine finished with an error, labelled by the stage that failed (`offline_forward`, `offline_oom`, `prefill_oom`, `streaming_forward`, `streaming_features`). Distinct from `oasr_engine_step_failures_total`: this one means the executor *contained* the failure to the requests responsible and kept ticking, so a rising count here with a flat step-failure count is isolation working, not an outage. |
 | `oasr_events_{dropped,deferred}_total` | counter | Per-request channel was full: a partial was dropped (harmless — the next one supersedes it) or a **terminal** event was handed to a background task rather than lost. Sustained non-zero here means clients are reading slower than the engine emits. |
 
-`--trace-dispatch` additionally logs rolling 2 s means of the same sub-stages at
+### Engine internals
+
+Recorded inside Python (`oasr/engine/metrics.py`) and drained by the dispatcher
+every 250 ms, inside the GIL scope the tick already holds. Counters cross as
+**absolute totals** and are replayed with `Counter::absolute`, so a missed drain
+loses nothing and a repeated one double-counts nothing.
+
+| Metric | Type | What it tells you |
+|---|---|---|
+| `oasr_engine_stage_host_seconds{stage}` | histogram | **Host** wall time per engine stage — see the warning below. `stage` is one of `offline.{collate,encode,prefill,decode,advance}` or `streaming.{schedule,allocate,features,encode,decode,finalize}`. |
+| `oasr_engine_batch_size{mode}` | histogram | Rows in one executed batch. |
+| `oasr_engine_batch_padding_ratio` | histogram | Fraction of a padded offline batch that is padding — whether the bucketing policy is working, which is otherwise pure guesswork. Derived from host-side waveform lengths so the collate path gains no device-to-host sync. |
+| `oasr_engine_queue_wait_seconds{mode}` | histogram | Admission to first scheduled. A rising tail with a flat tick time means saturated, not slow. |
+| `oasr_engine_kv_blocks_{used,capacity}` | gauge | Paged streaming-encoder pool occupancy. Absent on a `StatefulStreamingBackend`, which has no pool. |
+| `oasr_engine_kv_exhausted_total` | counter | Streams finalized early because their encoder cache filled — a **truncated transcript**, ending with `finish_reason="length"`. Not "evictions": the pool does not evict, and its capacity gate means it is never asked for a block it cannot give. |
+| `oasr_engine_decode_slots_{in_use,capacity}` | gauge | AR decode slots. A capacity of `0` means no ceiling applies — the family is one-shot and parks nothing. |
+| `oasr_engine_tokens_generated_total` | counter | Tokens on finished outputs, counted once per request. |
+| `oasr_engine_audio_seconds_total` | counter | Audio admitted to the engine. Distinct from the front-end's `oasr_audio_seconds_total`, which the in-process Python API never touches; the gap between them is rejection at admission. |
+| `oasr_engine_metric_samples_dropped_total` | counter | Non-zero means a histogram above is showing a **truncated** distribution — the collector buffered more samples between two drains than it may hold. Exported so the cap is visible instead of passing for a complete one. |
+| `oasr_gpu_{memory_used_bytes,memory_total_bytes}` | gauge | Device memory, sampled once a second. Device-wide, not this process's. |
+| `oasr_gpu_utilization_ratio` | gauge | NVML's fraction of its sampling window in which any kernel was resident — a **saturation hint, not SM occupancy**. A kernel using one SM of 170 reads as `1.0`. |
+
+> **`stage_host_seconds` is host time, and the name says so.** CUDA is
+> asynchronous: the encoder forward returns while the GPU is still working, and
+> the decode that reads tokens back pays for both. Read as *"where does the step
+> loop's wall clock go"* — the right question for a loop that is
+> interpreter-bound at batch — it is exactly right. Read as *"where does GPU
+> time go"* it is worse than nothing. For real GPU attribution use Nsight
+> Systems over the NVTX ranges already in the tree (`OASR_NVTX=1`); see
+> [`benchmarks.md`](benchmarks.md).
+
+Collection is designed to cost nothing worth switching off, and two invariants
+hold it there rather than a benchmark result: batch padding is derived from
+**host-side** waveform lengths, so nothing on the collate path reads the device
+(`tests/test_engine_metrics.py` asserts that against a CUDA event); and each
+series' sample buffer is capped, with the cap short-circuiting before the
+append, so a collector nobody drains neither slows down nor grows. Measured
+overhead: `.artifacts/monitoring_overhead.md`.
+
+`OASR_METRICS=0` binds the engine-side collector to a no-op if you want it gone
+anyway. The front-end and dispatcher metrics have no switch: the dispatcher's
+handles are resolved once at thread start, so its per-tick cost is a direct
+atomic update — *cheaper* than the macro call it replaced.
+
+`--trace-dispatch` additionally logs rolling 2 s means of the tick sub-stages at
 INFO; the histograms above are the ones to alert on.
+
+### Why the buckets matter
+
+`metrics-exporter-prometheus` defaults `buckets: None`, and a histogram with no
+buckets is not exported as a histogram at all — it becomes a **rolling summary**
+with fixed quantiles. No `_bucket` series, so `histogram_quantile` is
+unavailable and heatmaps cannot be drawn; and, the part that actually hurts,
+quantiles that **cannot be aggregated across replicas**.
+`avg(oasr_engine_step_seconds{quantile="0.99"})` over four pods is not the fleet
+p99; it is not any number at all.
+
+Every histogram in `METRICS` therefore carries an explicit bucket set, and
+`metrics_table_is_coherent` fails the build if a new one arrives without —
+because the failure mode is silent: the endpoint still renders, and what it
+renders still looks like a working metric.
+
+### What to alert on
+
+The dashboard is for looking; these are the expressions worth paging on. No
+rules file ships, because every threshold is a decision about *your* SLO and a
+wrong default is worse than none.
+
+```promql
+# Error rate. Cancellations excluded — a client hanging up is not a server fault.
+sum(rate(oasr_request_duration_seconds_count{outcome="error"}[5m]))
+  / sum(rate(oasr_request_duration_seconds_count[5m]))            > 0.01
+
+# Streaming SLI: time to first partial.
+histogram_quantile(0.99,
+  sum by (le) (rate(oasr_time_to_first_partial_seconds_bucket[5m]))) > 0.5
+
+# Falling behind real time. Only meaningful for streaming.
+sum(rate(oasr_audio_seconds_total[5m]))
+  / sum(rate(oasr_request_duration_seconds_sum[5m]))              < 1
+
+# Capacity: the pool is about to start truncating streams.
+sum by (engine) (oasr_engine_kv_blocks_used)
+  / sum by (engine) (oasr_engine_kv_blocks_capacity)              > 0.9
+
+# Already truncating them — transcripts are being cut short.
+sum(rate(oasr_engine_kv_exhausted_total[5m]))                     > 0
+
+# The engine is wedged. Three in a row already flips /readyz; alert before that.
+sum(rate(oasr_engine_step_failures_total[5m]))                    > 0
+
+# Clients cannot keep up with the engine, and a *terminal* event needed
+# out-of-band delivery.
+sum(rate(oasr_events_deferred_total[5m]))                         > 0
+
+# The metrics themselves are lying: a histogram above is truncated because the
+# collector's buffer filled between two drains.
+sum(rate(oasr_engine_metric_samples_dropped_total[5m]))           > 0
+```
+
+`oasr_engine_waiting` is the natural HPA signal for autoscaling — it is queue
+depth the engine itself reports, so it rises before latency does.
+
+**A counter at zero and a counter that is absent are different things**, and
+which one you get depends on the scope it comes from. Dispatcher and
+request-scope handles are resolved once at startup, and resolving a handle
+registers the series, so `oasr_engine_step_failures_total … 0` is in the very
+first scrape. Engine-scope metrics drained from Python appear only once they
+have a value — on a healthy server `oasr_engine_metric_samples_dropped_total`
+and `oasr_engine_kv_exhausted_total` are **missing entirely**. Two of the rules
+above are therefore over absent series: they return *no data* rather than `0`
+and simply never fire, which is the behaviour you want but is indistinguishable
+from a broken query when you test it by hand.
 
 ## Limits, timeouts and shutdown
 

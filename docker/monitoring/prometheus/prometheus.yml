@@ -1,0 +1,56 @@
+# Prometheus scrape configuration for OASR.
+#
+# `scrape_interval` is the one setting that has to agree with something else:
+# Grafana's `$__rate_interval` — which every rate() in the dashboard uses — is
+# derived from the interval declared on the *datasource*, not from this file. If
+# the two disagree, rate() windows come out shorter than the scrape period and
+# the panels go spiky or empty. Change this and change `timeInterval` in
+# `grafana/provisioning/datasources/prometheus.yml` to match.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    # Set per deployment; the dashboard does not use it, but a fleet-wide
+    # Prometheus needs to tell two OASR clusters apart.
+    cluster: local
+
+scrape_configs:
+  - job_name: oasr
+    metrics_path: /metrics
+
+    # The addresses are deliberately **not** in this file. Prometheus has no
+    # `--target` flag and does not expand environment variables in its config
+    # (the one exception is `external_labels`, behind
+    # `--enable-feature=expand-external-labels`), so file-based discovery is the
+    # only way an address reaches it from outside. That makes retargeting the
+    # stack a command-line argument rather than an edit here:
+    #
+    #   OASR_TARGETS=gpu-box:8080 docker compose -f docker-compose.monitoring.yml up -d
+    #
+    # The compose file renders `$OASR_TARGETS` into `targets/oasr.yml`; the
+    # default is `host.docker.internal:8080`, which resolves to the host from
+    # inside the container thanks to the `extra_hosts: host-gateway` mapping.
+    # Scale-out is one oasr-server process per GPU (`docs/serving.md`), so a
+    # two-GPU host is a two-entry list.
+    #
+    # Prometheus watches these files, so adding a GPU's process to the list
+    # takes effect without a restart or a reload POST. `refresh_interval` is the
+    # fallback for the case the watch does not fire — a bind mount on a storage
+    # driver that swallows inotify, which is exactly how this file arrives.
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/*.yml
+        refresh_interval: 30s
+
+    # No `instance` label is set anywhere: Prometheus defaults it to the
+    # target's address, which stays distinct when a second process joins.
+    # Pinning `instance: oasr-0` in a target file would collapse every replica
+    # onto one series — the engine-scope metrics carry their own `engine` label,
+    # but the transport-scope ones have nothing else to separate them by.
+
+    # A scrape must never be the thing that takes the endpoint down. `/metrics`
+    # is deliberately exempt from the server's concurrency limit and request
+    # timeout so a saturated server still answers its own probes, but a scrape
+    # timeout longer than the interval would queue scrapes on top of each other.
+    scrape_timeout: 10s

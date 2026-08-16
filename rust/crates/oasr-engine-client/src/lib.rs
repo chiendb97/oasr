@@ -16,6 +16,7 @@
 
 pub mod client;
 pub mod dispatcher;
+pub mod engine_metrics;
 pub mod handle;
 pub mod pool;
 pub mod pyengine;
@@ -23,6 +24,7 @@ pub mod router;
 
 pub use client::{EngineClient, EngineClientConfig};
 pub use dispatcher::CmdEnvelope;
+pub use engine_metrics::{EngineLabels, EngineSnapshot};
 pub use handle::{OfflineHandle, OfflineStreamHandle, StreamingHandle};
 pub use pool::EnginePool;
 pub use pyengine::{PyEngine, PyEngineError};

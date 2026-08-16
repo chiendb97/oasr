@@ -9,6 +9,7 @@ description = "HTTP routes (axum) for the OASR serving frontend — Google-STT-s
 oasr-wire = { path = "../oasr-wire" }
 oasr-engine-client = { path = "../oasr-engine-client" }
 oasr-asr = { path = "../oasr-asr" }
+oasr-metrics = { workspace = true }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

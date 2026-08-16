@@ -19,6 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use oasr_metrics as om;
 use oasr_wire::{Cmd, ErrorCode, Event, ModelInfo};
 use parking_lot::Mutex;
 use pyo3::prelude::*;
@@ -26,6 +27,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::engine_metrics::{replay, EngineLabels, TickHandles, DRAIN_INTERVAL};
 use crate::pyengine::{engine_error_event, AdmitSpec, PyEngine};
 use crate::router::RouterActor;
 
@@ -62,93 +64,13 @@ const NO_WORK_TICK_MAX: Duration = Duration::from_millis(1);
 /// and staying "ready" would turn every arriving request into an INTERNAL error.
 const MAX_CONSECUTIVE_STEP_FAILURES: u32 = 3;
 
-/// Prometheus metric names exported from the dispatcher tick.
-///
-/// The tick histogram is the load-bearing one: one engine tick holds the GIL for
-/// admit + step + extract, so its p99 *is* the worst-case latency a cancel, a new
-/// admission, or a streaming partial can experience.  Autoregressive decode makes
-/// that number model-dependent (a batched 7B decoder step is orders of magnitude
-/// slower than a CTC chunk), so it has to be observable rather than assumed.
-pub(crate) mod metric {
-    pub const TICK_SECONDS: &str = "oasr_dispatch_tick_seconds";
-    pub const ADMIT_SECONDS: &str = "oasr_dispatch_admit_seconds";
-    pub const STEP_SECONDS: &str = "oasr_engine_step_seconds";
-    pub const EXTRACT_SECONDS: &str = "oasr_dispatch_extract_seconds";
-    pub const ROUTE_SECONDS: &str = "oasr_dispatch_route_seconds";
-    pub const RUNNING: &str = "oasr_engine_running";
-    pub const WAITING: &str = "oasr_engine_waiting";
-    pub const OUTPUTS: &str = "oasr_engine_outputs_total";
-    pub const ADMITTED: &str = "oasr_requests_admitted_total";
-    pub const REJECTED: &str = "oasr_requests_rejected_total";
-    pub const BUSY: &str = "oasr_requests_busy_total";
-    pub const STEP_FAILURES: &str = "oasr_engine_step_failures_total";
-    pub const CANCELLED: &str = "oasr_requests_cancelled_total";
-    pub const FAILED: &str = "oasr_requests_failed_total";
-    pub const EVENTS_DROPPED: &str = "oasr_events_dropped_total";
-    pub const EVENTS_DEFERRED: &str = "oasr_events_deferred_total";
-}
-
-/// Register descriptions once so `/metrics` is self-documenting even before the
-/// first request lands.
-fn describe_metrics() {
-    metrics::describe_histogram!(
-        metric::TICK_SECONDS,
-        metrics::Unit::Seconds,
-        "Wall time of one dispatcher tick (GIL held: admit + step + extract)"
-    );
-    metrics::describe_histogram!(
-        metric::ADMIT_SECONDS,
-        metrics::Unit::Seconds,
-        "Time replaying admission commands into Python per tick"
-    );
-    metrics::describe_histogram!(
-        metric::STEP_SECONDS,
-        metrics::Unit::Seconds,
-        "Time in ASREngine.step() per tick"
-    );
-    metrics::describe_histogram!(
-        metric::EXTRACT_SECONDS,
-        metrics::Unit::Seconds,
-        "Time converting RequestOutputs into events per tick"
-    );
-    metrics::describe_histogram!(
-        metric::ROUTE_SECONDS,
-        metrics::Unit::Seconds,
-        "Time routing events to per-request channels per tick (GIL released)"
-    );
-    metrics::describe_gauge!(
-        metric::RUNNING,
-        "Requests the engine reports as running (incl. parked AR generations)"
-    );
-    metrics::describe_gauge!(metric::WAITING, "Requests waiting for admission");
-    metrics::describe_counter!(metric::OUTPUTS, "RequestOutputs returned by step()");
-    metrics::describe_counter!(metric::ADMITTED, "Requests accepted by the engine");
-    metrics::describe_counter!(
-        metric::REJECTED,
-        "Requests the engine rejected at admission (invalid options, mode mismatch)"
-    );
-    metrics::describe_counter!(
-        metric::BUSY,
-        "Requests refused because max_concurrent_requests was reached"
-    );
-    metrics::describe_counter!(metric::STEP_FAILURES, "ASREngine.step() raised");
-    metrics::describe_counter!(
-        metric::CANCELLED,
-        "Requests aborted before completion (usually a client disconnect)"
-    );
-    metrics::describe_counter!(
-        metric::FAILED,
-        "Requests the engine finished with an error, labelled by the stage that failed"
-    );
-    metrics::describe_counter!(
-        metric::EVENTS_DROPPED,
-        "Non-terminal events (partials) dropped because a client's channel was full"
-    );
-    metrics::describe_counter!(
-        metric::EVENTS_DEFERRED,
-        "Terminal events handed to a background task because the channel was full"
-    );
-}
+// Metric names, kinds, help text and buckets are declared once in
+// `oasr-metrics` and imported here as `om::*`.  The tick histogram is the
+// load-bearing one: one engine tick holds the GIL for admit + step + extract,
+// so its p99 *is* the worst-case latency a cancel, a new admission, or a
+// streaming partial can experience.  Autoregressive decode makes that number
+// model-dependent (a batched 7B decoder step is orders of magnitude slower than
+// a CTC chunk), so it has to be observable rather than assumed.
 
 /// One outbound command + optional binary payload.
 pub struct CmdEnvelope {
@@ -170,16 +92,20 @@ pub(crate) struct DispatcherShared {
     pub(crate) model_info: Mutex<Option<ModelInfo>>,
     pub(crate) router: RouterActor,
     pub(crate) label: String,
+    /// `{engine, model, decode_method}` for every engine-scope series.
+    pub(crate) metric_labels: EngineLabels,
 }
 
 impl DispatcherShared {
-    pub(crate) fn new(label: String) -> Self {
+    pub(crate) fn new(label: String, model: Option<&ModelInfo>) -> Self {
+        let metric_labels = EngineLabels::new(&label, model);
         Self {
             load: AtomicU32::new(0),
             last_event_at_ms: AtomicU64::new(0),
-            model_info: Mutex::new(None),
-            router: RouterActor::new(),
+            model_info: Mutex::new(model.cloned()),
+            router: RouterActor::new(metric_labels.clone()),
             label,
+            metric_labels,
         }
     }
 }
@@ -312,11 +238,12 @@ pub(crate) fn spawn(
     cfg: DispatcherConfig,
     cmd_channel_cap: usize,
 ) -> (Arc<DispatcherShared>, mpsc::Sender<CmdEnvelope>) {
-    let shared = Arc::new(DispatcherShared::new(label.clone()));
-    {
-        let mi = engine.model_info();
-        *shared.model_info.lock() = Some(mi);
-    }
+    // The model has to be known *before* the shared state is built: it
+    // supplies two of the three engine-scope label values, and a handle
+    // resolved without them would publish into a different series than every
+    // later sample.
+    let model_info = engine.model_info();
+    let shared = Arc::new(DispatcherShared::new(label.clone(), Some(&model_info)));
     let (cmd_tx, cmd_rx) = mpsc::channel::<CmdEnvelope>(cmd_channel_cap);
     let rt_handle = Handle::current();
 
@@ -361,7 +288,11 @@ fn run_dispatcher(
     // below.  Reaching MAX_CONSECUTIVE_STEP_FAILURES stops the readiness
     // heartbeat so this process is drained instead of erroring every request.
     let mut consecutive_step_failures: u32 = 0;
-    describe_metrics();
+    // Resolved once: an engine's labels never change, and the loop below
+    // records into these handles up to a thousand times a second on the thread
+    // that owns the GIL.
+    let h = TickHandles::new(&shared.metric_labels);
+    let mut next_drain = Instant::now();
 
     loop {
         // ---- Drain inbound commands (non-blocking up to per-tick budget) ----
@@ -454,7 +385,8 @@ fn run_dispatcher(
         tick_events.clear();
         admit_batch.clear();
         let tick_t0 = Instant::now();
-        let (running, waiting, t_admit, t_step, t_extract, n_out, step_failed): (
+        #[allow(clippy::type_complexity)]
+        let (running, waiting, t_admit, t_step, t_extract, n_out, step_failed, engine_snapshot): (
             u32,
             u32,
             Duration,
@@ -462,6 +394,7 @@ fn run_dispatcher(
             Duration,
             u64,
             bool,
+            Option<crate::engine_metrics::EngineSnapshot>,
         ) = Python::with_gil(|py| {
             let bound = engine.bind_engine(py);
 
@@ -514,7 +447,7 @@ fn run_dispatcher(
                         t_step = step_t0.elapsed();
                         n_out = list.len() as u64;
                         let extract_t0 = Instant::now();
-                        match PyEngine::extract_events(&list) {
+                        match PyEngine::extract_events(&list, &shared.metric_labels) {
                             Ok(events) => tick_events.extend(events),
                             Err(e) => {
                                 let rids = shared.router.all_request_ids();
@@ -562,6 +495,22 @@ fn run_dispatcher(
 
             // Refresh load after step (terminal events drop in-flight count).
             let (running, waiting) = PyEngine::load_locked(&bound);
+
+            // ---- Drain the engine's own metrics ----
+            //
+            // Inside the GIL scope the tick already owns, so it costs one
+            // Python call rather than a second acquisition — but only every
+            // DRAIN_INTERVAL, because at a kilohertz tick rate the call itself
+            // would be the expensive part and a Prometheus scrape arrives
+            // three orders of magnitude less often.  The *replay* happens
+            // after the scope, with the GIL released.
+            let engine_snapshot = if tick_t0 >= next_drain {
+                next_drain = tick_t0 + DRAIN_INTERVAL;
+                PyEngine::metrics_snapshot_locked(&bound)
+            } else {
+                None
+            };
+
             (
                 running,
                 waiting,
@@ -570,6 +519,7 @@ fn run_dispatcher(
                 t_extract,
                 n_out,
                 step_failed,
+                engine_snapshot,
             )
         });
 
@@ -593,19 +543,26 @@ fn run_dispatcher(
         // no step, no outputs) would otherwise flood the tick histogram with
         // near-zero samples and hide the p99 that matters.
         if t_step > Duration::ZERO || n_admit > 0 || n_out > 0 {
-            metrics::histogram!(metric::TICK_SECONDS).record(t_tick.as_secs_f64());
-            metrics::histogram!(metric::ADMIT_SECONDS).record(t_admit.as_secs_f64());
-            metrics::histogram!(metric::EXTRACT_SECONDS).record(t_extract.as_secs_f64());
-            metrics::histogram!(metric::ROUTE_SECONDS).record(t_route.as_secs_f64());
+            h.tick.record(t_tick.as_secs_f64());
+            h.admit.record(t_admit.as_secs_f64());
+            h.extract.record(t_extract.as_secs_f64());
+            h.route.record(t_route.as_secs_f64());
             if t_step > Duration::ZERO {
-                metrics::histogram!(metric::STEP_SECONDS).record(t_step.as_secs_f64());
+                h.step.record(t_step.as_secs_f64());
             }
             if n_out > 0 {
-                metrics::counter!(metric::OUTPUTS).increment(n_out);
+                h.outputs.increment(n_out);
             }
         }
-        metrics::gauge!(metric::RUNNING).set(running as f64);
-        metrics::gauge!(metric::WAITING).set(waiting as f64);
+        h.running.set(running as f64);
+        h.waiting.set(waiting as f64);
+
+        // Replayed with the GIL released: pushing a few hundred samples into
+        // the exporter is pure Rust, and holding the GIL across it would block
+        // every request handler for no reason.
+        if let Some(snapshot) = engine_snapshot {
+            replay(&snapshot, &shared.metric_labels);
+        }
 
         // ---- Dispatch trace accounting (diagnostics; gated by flag) ----
         if trace_enabled && (t_step > Duration::ZERO || n_out > 0) {
@@ -630,7 +587,7 @@ fn run_dispatcher(
         // go NotServing and the load balancer drains this process.
         if step_failed {
             consecutive_step_failures += 1;
-            metrics::counter!(metric::STEP_FAILURES).increment(1);
+            h.step_failures.increment(1);
             if consecutive_step_failures == MAX_CONSECUTIVE_STEP_FAILURES {
                 error!(
                     label = %shared.label,
@@ -786,7 +743,7 @@ fn enqueue_admit_locked(
                     cap = max_concurrent,
                     "admission rejected: at capacity"
                 );
-                metrics::counter!(metric::BUSY).increment(1);
+                metrics::counter!(om::REQUESTS_BUSY, shared.metric_labels.iter()).increment(1);
                 out_events.push(Event::Error {
                     request_id: request_id.clone(),
                     code: ErrorCode::Busy,
@@ -829,7 +786,7 @@ fn enqueue_admit_locked(
                     cap = max_concurrent,
                     "admission rejected: at capacity"
                 );
-                metrics::counter!(metric::BUSY).increment(1);
+                metrics::counter!(om::REQUESTS_BUSY, shared.metric_labels.iter()).increment(1);
                 out_events.push(Event::Error {
                     request_id: request_id.clone(),
                     code: ErrorCode::Busy,
@@ -942,7 +899,8 @@ fn rewrite_rejected_admits(
         }
     }
     if n_rejected > 0 {
-        metrics::counter!(metric::REJECTED).increment(n_rejected as u64);
+        metrics::counter!(om::REQUESTS_REJECTED, shared.metric_labels.iter())
+            .increment(n_rejected as u64);
         warn!(
             label = %shared.label,
             n_rejected,
@@ -952,7 +910,8 @@ fn rewrite_rejected_admits(
     }
     let admitted = n.saturating_sub(n_rejected);
     if admitted > 0 {
-        metrics::counter!(metric::ADMITTED).increment(admitted as u64);
+        metrics::counter!(om::REQUESTS_ADMITTED, shared.metric_labels.iter())
+            .increment(admitted as u64);
     }
 }
 
@@ -990,7 +949,7 @@ fn handle_nonadmit_cmd_locked<'py>(
                 warn!(label = %shared.label, rid = %request_id, "abort failed: {e}");
             }
             shared.router.remove(&request_id);
-            metrics::counter!(metric::CANCELLED).increment(1);
+            metrics::counter!(om::REQUESTS_CANCELLED, shared.metric_labels.iter()).increment(1);
         }
         // Create* should never reach here — the dispatcher routes them to
         // enqueue_admit_locked.  If one slips through, fall back to the

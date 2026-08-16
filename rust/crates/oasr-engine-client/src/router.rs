@@ -5,22 +5,42 @@
 //! tonic streaming RPC).
 
 use dashmap::DashMap;
+use metrics::Counter;
+use oasr_metrics as om;
 use oasr_wire::Event;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::dispatcher::metric;
+use crate::engine_metrics::EngineLabels;
 
 /// Owned per-worker; thread-safe via `Arc<...>` clones.
-#[derive(Clone, Default)]
+///
+/// The two channel-pressure counters are resolved to handles at construction
+/// for the same reason the dispatcher's are: this runs once per routed event,
+/// and re-resolving a labelled key each time would hash and allocate on the
+/// path that delivers every partial.
+#[derive(Clone)]
 pub struct RouterActor {
     inner: Arc<DashMap<String, mpsc::Sender<Event>>>,
+    dropped: Counter,
+    deferred: Counter,
+}
+
+impl Default for RouterActor {
+    fn default() -> Self {
+        Self::new(EngineLabels::none())
+    }
 }
 
 impl RouterActor {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(labels: EngineLabels) -> Self {
+        let l = || labels.iter();
+        Self {
+            inner: Arc::new(DashMap::new()),
+            dropped: metrics::counter!(om::EVENTS_DROPPED, l()),
+            deferred: metrics::counter!(om::EVENTS_DEFERRED, l()),
+        }
     }
 
     /// Register a per-request channel; returns the matching receiver.
@@ -95,7 +115,7 @@ impl RouterActor {
                         // (`Handle::enter`), so a handle is available here.
                         match tokio::runtime::Handle::try_current() {
                             Ok(handle) => {
-                                metrics::counter!(metric::EVENTS_DEFERRED).increment(1);
+                                self.deferred.increment(1);
                                 warn!(
                                     rid = %rid,
                                     "router: channel full on a terminal event; deferring delivery"
@@ -105,7 +125,7 @@ impl RouterActor {
                                 });
                             }
                             Err(_) => {
-                                metrics::counter!(metric::EVENTS_DROPPED).increment(1);
+                                self.dropped.increment(1);
                                 warn!(
                                     rid = %rid,
                                     "router: channel full on a terminal event and no runtime \
@@ -116,11 +136,11 @@ impl RouterActor {
                     }
                     mpsc::error::TrySendError::Full(_) => {
                         // A partial; the next one carries the same transcript.
-                        metrics::counter!(metric::EVENTS_DROPPED).increment(1);
+                        self.dropped.increment(1);
                         debug!(rid = %rid, "router: dropped a partial (channel full)");
                     }
                     mpsc::error::TrySendError::Closed(_) => {
-                        metrics::counter!(metric::EVENTS_DROPPED).increment(1);
+                        self.dropped.increment(1);
                         debug!(rid = %rid, "router: receiver gone; event discarded");
                     }
                 }

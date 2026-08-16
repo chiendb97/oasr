@@ -39,6 +39,7 @@ use tokio_stream::StreamExt;
 use tracing::{debug, field, info, info_span, warn, Instrument, Span};
 
 use crate::engine_call::submit_offline_and_wait;
+use crate::http_metrics::openai_offline;
 use crate::recognize::{normalize_optional_language, normalize_task};
 use crate::router::{AppState, ServiceMode};
 
@@ -522,19 +523,27 @@ async fn handle_audio(State(s): State<AppState>, form: Multipart, endpoint: Endp
             return stream_transcription(s, audio, decoded.sample_rate, decoding, form).await;
         }
 
-        let final_ =
-            match submit_offline_and_wait(&s, audio, decoded.sample_rate, 0, decoding, start).await
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    let kind = if e.status.is_server_error() {
-                        "server_error"
-                    } else {
-                        "invalid_request_error"
-                    };
-                    return api_error(e.status, kind, None, e.message);
-                }
-            };
+        let final_ = match submit_offline_and_wait(
+            &s,
+            audio,
+            decoded.sample_rate,
+            0,
+            decoding,
+            start,
+            openai_offline(),
+        )
+        .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                let kind = if e.status.is_server_error() {
+                    "server_error"
+                } else {
+                    "invalid_request_error"
+                };
+                return api_error(e.status, kind, None, e.message);
+            }
+        };
         Span::current().record("rid", final_.request_id.as_str());
         info!(
             rid = %final_.request_id,
