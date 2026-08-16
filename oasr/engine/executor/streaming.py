@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import ClassVar, Dict, List, Optional, Union
 
 import numpy as np
@@ -12,6 +13,7 @@ import torch
 
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
+from .. import metrics as m
 from ..config import EngineConfig
 from ..input_processor import InputProcessor
 from ..model_runner import ModelRunner
@@ -54,7 +56,10 @@ class StreamingExecutor(Executor):
         output_processor: OutputProcessor,
         config: EngineConfig,
         device: torch.device,
+        metrics: Optional[m.EngineMetrics] = None,
     ) -> None:
+        if metrics is not None:
+            self._metrics = metrics
         self._scheduler = scheduler
         self._inp = input_processor
         self._mr = model_runner
@@ -96,6 +101,8 @@ class StreamingExecutor(Executor):
             wav = torch.as_tensor(request.audio, dtype=torch.float32, device="cpu").reshape(-1)
             chunk_samples = self._inp.streaming_audio_chunk_samples
             n = int(wav.numel())
+            if request.sample_rate:
+                self._metrics.incr(m.AUDIO_SECONDS, n / request.sample_rate)
             if n == 0:
                 request.audio_final = True
             else:
@@ -116,6 +123,13 @@ class StreamingExecutor(Executor):
         req = self._scheduler.find_request(request_id)
         if req is None:
             raise KeyError(f"feed_chunk: unknown or finished request_id {request_id!r}")
+        # Counted per chunk, not per request: a live stream has no total
+        # duration until it closes, and a stream that is abandoned mid-flight
+        # would otherwise contribute nothing to the RTFx denominator despite
+        # having cost the engine every chunk it did send.
+        if self._metrics.enabled and req.sample_rate:
+            n = chunk.shape[-1] if hasattr(chunk, "shape") else len(chunk)
+            self._metrics.incr(m.AUDIO_SECONDS, int(n) / req.sample_rate)
         self._inp.append_streaming_chunk(req, chunk, is_last=is_last)
 
     def abort(self, request_id: str) -> None:
@@ -181,17 +195,22 @@ class StreamingExecutor(Executor):
 
     def step(self) -> List[RequestOutput]:
         nvtx_push("streaming.schedule")
+        t0 = time.perf_counter()
         newly_admitted, running = self._scheduler.schedule_streaming()
         nvtx_pop()
+        self._metrics.observe_stage("streaming.schedule", time.perf_counter() - t0)
 
         outputs: List[RequestOutput] = []
 
         if newly_admitted:
+            self._metrics.observe_queue_wait(m.MODE_STREAMING, newly_admitted)
             nvtx_push("allocate_stream")
+            t0 = time.perf_counter()
             for req in newly_admitted:
                 self._mr.allocate_stream(req)  # encoder KV + CNN cache
                 self._op.create_session(req)  # decode-side beam state
             nvtx_pop()
+            self._metrics.observe_stage("streaming.allocate", time.perf_counter() - t0)
 
         if not running:
             return outputs
@@ -208,6 +227,7 @@ class StreamingExecutor(Executor):
         needs_feat = [r for r in running if r.has_pending_audio]
         if needs_feat:
             nvtx_push("extract_fbank")
+            t0 = time.perf_counter()
             try:
                 self._inp.extract_streaming_batch(
                     needs_feat,
@@ -223,20 +243,26 @@ class StreamingExecutor(Executor):
                     return outputs
             else:
                 nvtx_pop()
+                self._metrics.observe_stage("streaming.features", time.perf_counter() - t0)
 
         # 2. For each stream whose feature buffer now holds at least one
         #    encoder window, run forward_chunk_paged.
         window = self._config.decoding_window
         ready = [r for r in running if r.has_ready_encoder_chunk(window)]
         if ready:
+            self._metrics.observe_batch(m.MODE_STREAMING, len(ready))
             nvtx_push("forward_streaming")
+            t0 = time.perf_counter()
             try:
                 log_probs_map: Dict[str, torch.Tensor] = self._mr.forward_streaming_step(ready)
                 nvtx_pop()
+                self._metrics.observe_stage("streaming.encode", time.perf_counter() - t0)
                 nvtx_push("decode_streaming")
+                t0 = time.perf_counter()
                 partials = self._op.decode_streaming_batch(ready, log_probs_map)
                 outputs.extend(partials)
                 nvtx_pop()
+                self._metrics.observe_stage("streaming.decode", time.perf_counter() - t0)
             except Exception as exc:  # noqa: BLE001 — see _fail_cohort
                 nvtx_pop()
                 outputs.extend(self._fail_cohort(ready, exc, "streaming_forward"))
@@ -258,6 +284,7 @@ class StreamingExecutor(Executor):
         #    further progress, so returning the transcript decoded so far with
         #    ``finish_reason="length"`` beats holding its slot forever.
         nvtx_push("finalize_streams")
+        t0 = time.perf_counter()
         for req in list(running):
             drained = (
                 req.audio_final
@@ -267,16 +294,38 @@ class StreamingExecutor(Executor):
             if drained or req.cache_exhausted:
                 final = self._op.finalize_streaming(req)
                 self._op.fill_nbest_texts(req, final)
-                if req.cache_exhausted and final.finish_reason is None:
-                    final.finish_reason = "length"
+                if req.cache_exhausted:
+                    # A truncated transcript, counted where it is decided.  The
+                    # allocator itself cannot report this: the capacity gate
+                    # exists precisely so the pool is never asked for a block
+                    # it cannot give, so there is no failed allocation to see.
+                    self._metrics.incr(m.KV_EXHAUSTED)
+                    if final.finish_reason is None:
+                        final.finish_reason = "length"
                 req.output = final
                 outputs.append(final)
                 self._op.free_session(req)  # decode-side beam state
                 self._mr.free_stream(req)  # encoder KV + CNN cache
                 self._scheduler.finish_request(req.request_id)
         nvtx_pop()
+        self._metrics.observe_stage("streaming.finalize", time.perf_counter() - t0)
 
         return outputs
+
+    def record_gauges(self, metrics) -> None:
+        """Report paged block-pool occupancy.
+
+        ``None`` when the streaming backend keeps fixed per-slot state rather
+        than a growing paged pool (``StatefulStreamingBackend``): there is no
+        pool to report, and emitting zeros would make a healthy stateful engine
+        look like one whose pool never fills.
+        """
+        pool = getattr(self._mr, "_block_pool", None)
+        if pool is None:
+            return
+        total = pool.num_total_blocks
+        metrics.set_gauge(m.KV_BLOCKS_USED, float(total - pool.num_free_blocks))
+        metrics.set_gauge(m.KV_BLOCKS_CAPACITY, float(total))
 
     def has_pending(self) -> bool:
         return self._scheduler.num_waiting_streaming > 0 or self._scheduler.num_running > 0

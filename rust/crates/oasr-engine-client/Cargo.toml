@@ -7,6 +7,7 @@ description = "In-process driver for the OASR Python ASREngine via PyO3; per-eng
 
 [dependencies]
 oasr-wire = { path = "../oasr-wire" }
+oasr-metrics = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }

@@ -31,6 +31,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+oasr-metrics = { workspace = true }
 axum = { workspace = true }
 tonic = { workspace = true }
 tonic-health = { workspace = true }

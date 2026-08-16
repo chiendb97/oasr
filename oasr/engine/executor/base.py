@@ -25,6 +25,7 @@ from typing import ClassVar, List, Optional, Union
 import numpy as np
 import torch
 
+from ..metrics import EngineMetrics, NullMetrics
 from ..request import Request, RequestOutput
 
 
@@ -35,6 +36,18 @@ class Executor(ABC):
     #: for offline.  Used by :meth:`ASREngine.add_request` to validate that
     #: incoming requests match the configured service mode.
     streaming: ClassVar[bool]
+
+    #: Metric collector, overridden per instance by :class:`ASREngine`.
+    #:
+    #: An instance attribute with a **class-level default** — deliberately not
+    #: a ``ClassVar``, which could not then be overridden per engine.  The
+    #: default is shared because it holds nothing, and it exists because
+    #: instrumentation reaches into the middle of the tick and so must survive
+    #: an executor that was not built through ``__init__``: the isolation tests
+    #: construct one with ``__new__`` and set only what the path under test
+    #: touches, which is the right way to test a failure path and the wrong
+    #: thing to break by adding a field.
+    _metrics: EngineMetrics = NullMetrics()
 
     # ------------------------------------------------------------------
     # Admission
@@ -107,4 +120,21 @@ class Executor(ABC):
 
     def shutdown(self) -> None:
         """Best-effort shutdown hook.  Default is a no-op."""
+        return None
+
+    # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+
+    def record_gauges(self, metrics) -> None:
+        """Refresh the point-in-time gauges this executor owns.
+
+        Called at *drain* time rather than per tick, so an executor with
+        nothing to report costs nothing and one that must take a lock (the
+        block pool's free list) takes it a few times a second instead of a few
+        thousand.  Non-abstract because occupancy is a property of the
+        execution model: an offline one-shot executor has no decode slots and
+        an all-offline engine has no paged pool, and neither should have to
+        write an empty override to say so.
+        """
         return None

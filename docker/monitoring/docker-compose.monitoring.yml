@@ -1,0 +1,107 @@
+# Prometheus + Grafana for an oasr-server that is already running.
+#
+# Deliberately does **not** start oasr-server: it needs a GPU, a checkpoint and
+# a good deal of VRAM, and the common case is attaching monitoring to a server
+# that is already up. Point `prometheus/prometheus.yml` at wherever it runs.
+#
+#   cd deploy && docker compose -f docker-compose.monitoring.yml up -d
+#   open http://localhost:3000   (anonymous admin — see the warning below)
+#
+# Point it somewhere other than the local host with OASR_TARGETS:
+#
+#   OASR_TARGETS=gpu-box:8080 docker compose -f docker-compose.monitoring.yml up -d
+#
+# Image versions are pinned, not `latest`: the dashboard is `schemaVersion: 39`,
+# and Grafana's dashboard schema drifts across majors.
+
+name: oasr-monitoring
+
+configs:
+  # Prometheus' file-SD target list, rendered from the environment when compose
+  # parses this file. It exists so that the scrape address is a command-line
+  # argument instead of an edit inside `prometheus/prometheus.yml` — Prometheus
+  # itself neither takes a target flag nor expands variables in its own config,
+  # so the substitution has to happen out here.
+  #
+  #   OASR_TARGETS=gpu-box:8080                  docker compose -f … up -d
+  #   OASR_TARGETS='gpu-0:8080,gpu-1:8081'       docker compose -f … up -d
+  #
+  # A comma-separated value lands in a YAML flow sequence as-is, so scale-out
+  # (one process per GPU) needs no different syntax. `docker/monitoring/.env` is read
+  # automatically and is gitignored, if you would rather not repeat the variable.
+  #
+  # Inline `content` needs Compose v2.23.1+ (`docker compose version`); on an
+  # older one, bind-mount a directory you write the same one-line file into —
+  # see the fallback in README.md.
+  oasr_targets:
+    content: |
+      - targets: [${OASR_TARGETS:-host.docker.internal:8080}]
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: oasr-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 15 days is enough to see a weekly pattern and cheap enough not to need
+      # a volume plan. Raise it once you care about month-over-month RTFx.
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    configs:
+      # Matches the `files:` glob in prometheus.yml. Mounting one file rather
+      # than a directory keeps a stale hand-written target file from being picked
+      # up alongside this one.
+      - source: oasr_targets
+        target: /etc/prometheus/targets/oasr.yml
+    ports:
+      # Same shape as Grafana's, but bound to the loopback by default: Grafana
+      # reaches Prometheus over the compose network (`http://prometheus:9090`,
+      # in the provisioned datasource), so publishing this at all is only for
+      # your own `curl` against the query API.
+      - "${PROMETHEUS_BIND:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
+    extra_hosts:
+      # Lets the container reach an oasr-server running on the host. Native on
+      # Docker Desktop; on Linux this mapping is what makes the same name work
+      # (Docker 20.10+).
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: oasr-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      # Local-only convenience. This is why both ports are bound to 127.0.0.1
+      # rather than 0.0.0.0 — anonymous admin on a reachable port is a way to
+      # hand someone your dashboards. Remove these three lines and set
+      # GF_SECURITY_ADMIN_PASSWORD before exposing this anywhere.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/oasr-overview.json:/var/lib/grafana/dashboards/oasr-overview.json:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      # Host side is configurable; the container side stays 3000, which is what
+      # Grafana listens on. Set GF_SERVER_HTTP_PORT above as well if you want to
+      # move the *listener* rather than just the published port — but there is
+      # rarely a reason to, and the two are easy to get out of step.
+      #
+      #   GRAFANA_PORT=9000 docker compose -f docker-compose.monitoring.yml up -d
+      #
+      # The bind defaults to 0.0.0.0 so the UI is reachable from another machine.
+      # That is only safe while the anonymous-admin block above is gone: set
+      # GRAFANA_BIND=127.0.0.1, or a password, before leaving it open.
+      - "${GRAFANA_BIND:-0.0.0.0}:${GRAFANA_PORT:-3000}:3000"
+
+volumes:
+  prometheus-data:
+  grafana-data:

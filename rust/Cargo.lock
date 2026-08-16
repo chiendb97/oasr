@@ -1190,6 +1190,7 @@ dependencies = [
  "futures",
  "metrics",
  "numpy",
+ "oasr-metrics",
  "oasr-wire",
  "parking_lot",
  "pyo3",
@@ -1201,6 +1202,14 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "oasr-metrics"
+version = "0.1.0"
+dependencies = [
+ "metrics",
+ "metrics-exporter-prometheus",
 ]
 
 [[package]]
@@ -1216,6 +1225,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "oasr-asr",
  "oasr-engine-client",
+ "oasr-metrics",
  "oasr-server-grpc",
  "oasr-server-http",
  "oasr-wire",
@@ -1247,8 +1257,10 @@ dependencies = [
  "anyhow",
  "bytes",
  "futures",
+ "metrics",
  "oasr-asr",
  "oasr-engine-client",
+ "oasr-metrics",
  "oasr-wire",
  "prost",
  "prost-types",
@@ -1275,6 +1287,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "oasr-asr",
  "oasr-engine-client",
+ "oasr-metrics",
  "oasr-wire",
  "serde",
  "serde_json",

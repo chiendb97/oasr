@@ -232,6 +232,8 @@ extension cookbook for each axis.
 | `rust/crates/oasr-serve/` | Mode-agnostic serving core shared by binary and extension |
 | `rust/crates/oasr-server-http/src/{openai,realtime}.rs` | The OpenAI-compatible routes and the `/v1/realtime` WebSocket |
 | `rust/crates/oasr-asr/src/{codec,encoding}.rs` | Container decoding (symphonia) + the one `encoding=` parser both front-ends share |
+| `rust/crates/oasr-metrics/` | Every metric's name, kind, unit, help and **buckets**, declared once; `install_recorder` is the only place the exporter is built |
+| `oasr/engine/metrics.py` | Engine-scope collection, drained by the dispatcher and replayed into the exporter |
 | `oasr/client.py`, `oasr/cli.py` | The Python client and the `oasr` command |
 | `tests/assets.py` | The single declaration point for every external test asset |
 | `ci/gpu_suites.py` | The per-family GPU test split, shared by both GPU backends |
@@ -507,6 +509,7 @@ Environment variables:
 | `OASR_CTC_FUSED` | `0` forces the legacy multi-kernel CTC beam-search step (A/B, rollback) |
 | `OASR_FEATURE_BACKEND` | `torch` forces the reference feature frontend (A/B, parity oracle) |
 | `OASR_USE_K2` | `1` builds the k2-backed WFST decoder (needs `pip install k2` + `K2_SOURCE_DIR`) |
+| `OASR_METRICS` | `0` binds the engine-side metric collector to a no-op (front-end metrics are unaffected) |
 | `OASR_RS_BIN` | Path to an `oasr-server` executable, for `bench_service.py` |
 
 These `OASR_*` A/B switches exist so a regression can be attributed. Set them

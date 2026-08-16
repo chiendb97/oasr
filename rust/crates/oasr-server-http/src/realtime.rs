@@ -47,7 +47,7 @@
 //! trade the gRPC surface makes, and the reason a speech-LLM still feels
 //! incremental here.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -57,12 +57,14 @@ use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
 use oasr_asr::{parse_encoding, PcmEncoding, PcmStream, SourceEncoding};
 use oasr_engine_client::handle::{OfflineStreamHandle, StreamingHandle};
+use oasr_metrics as om;
 use oasr_wire::{normalize_language, DecodingParams, Event};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_stream::StreamExt;
 use tracing::{debug, info, info_span, warn, Instrument};
 
+use crate::http_metrics::realtime_streaming;
 use crate::router::{AppState, ServiceMode};
 
 /// `GET /v1/realtime` — upgrade and run one transcription session.
@@ -102,6 +104,59 @@ struct Session {
     pcm: PcmStream,
     decoding: Option<DecodingParams>,
     interim_results: bool,
+}
+
+/// Per-session metric state for the streaming SLIs.
+///
+/// Time to first partial is measured from the **first inbound audio byte**, not
+/// from the socket upgrade. A client may hold an open realtime socket for
+/// minutes before it starts speaking, and timing from the upgrade would report
+/// that silence as latency — a p99 that tracks user behaviour instead of
+/// server behaviour, and moves when nothing about the server has changed.
+struct SessionMetrics {
+    started: Instant,
+    first_audio_at: Option<Instant>,
+    partial_recorded: bool,
+    /// Accumulated so the per-request duration can be recorded at the end.
+    /// A live stream has no total until it closes, while the RTFx denominator
+    /// has to accrue as audio arrives — so the two are counted separately
+    /// rather than one being derived from the other.
+    audio_seconds: f64,
+}
+
+impl SessionMetrics {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            first_audio_at: None,
+            partial_recorded: false,
+            audio_seconds: 0.0,
+        }
+    }
+
+    /// Note `bytes` of engine-rate f32 PCM arriving from the client.
+    fn audio(&mut self, bytes: usize, sample_rate: u32) {
+        self.first_audio_at.get_or_insert_with(Instant::now);
+        let seconds = om::f32_pcm_seconds(bytes, sample_rate);
+        self.audio_seconds += seconds;
+        realtime_streaming().audio_ingested(seconds);
+    }
+
+    /// Record TTFP, once, on the first partial that follows some audio.
+    fn partial(&mut self) {
+        if self.partial_recorded {
+            return;
+        }
+        if let Some(t0) = self.first_audio_at {
+            self.partial_recorded = true;
+            realtime_streaming().first_partial(t0.elapsed());
+        }
+    }
+
+    fn finished(&self, outcome: om::Outcome) {
+        realtime_streaming().audio_duration(self.audio_seconds);
+        realtime_streaming().finished(outcome, self.started.elapsed());
+    }
 }
 
 /// A session that failed to configure — reported to the client, then closed.
@@ -406,10 +461,11 @@ async fn chunked_session(
         })?;
     let rid = handle.request_id.clone();
     let mut emitted = Emitted::default();
+    let mut metrics = SessionMetrics::new();
     info!(rid = %rid, resampling = session.pcm.is_resampling(), "realtime stream opened");
 
     if let Some(chunk) = pending_audio {
-        feed(&mut session, &handle, &chunk).await?;
+        feed(&mut session, &handle, &chunk, &mut metrics, s.sample_rate).await?;
     }
     let mut inbound_done = already_committed;
     if inbound_done {
@@ -421,6 +477,10 @@ async fn chunked_session(
         tokio::select! {
             ev = handle.events.next() => match ev {
                 Some(Event::Partial { text, .. }) => {
+                    // Timed on the engine's partial, before the interim-results
+                    // filter: the SLI is how fast the engine produced a
+                    // transcript, not whether this client asked to see it.
+                    metrics.partial();
                     if session.interim_results {
                         if let Some(ev) = emitted.event(&text) {
                             send_json(&mut socket, ev).await?;
@@ -445,7 +505,9 @@ async fn chunked_session(
                 }
             },
             msg = next_client_message(&mut socket), if !inbound_done => match msg {
-                Ok(ClientMessage::Audio(bytes)) => feed(&mut session, &handle, &bytes).await?,
+                Ok(ClientMessage::Audio(bytes)) => {
+                    feed(&mut session, &handle, &bytes, &mut metrics, s.sample_rate).await?
+                }
                 Ok(ClientMessage::Commit) => {
                     inbound_done = true;
                     // The resampler's tail rides out on the final chunk;
@@ -467,15 +529,31 @@ async fn chunked_session(
             },
         }
     };
+    metrics.finished(outcome_of(&result));
     s.pool.release(&rid);
     let _ = socket.send(Message::Close(None)).await;
     result
+}
+
+/// Classify a session's end for the `outcome` label.
+///
+/// A realtime session that ends without a final transcript is almost always a
+/// client that hung up, which is a cancellation rather than a server error —
+/// and counting every browser tab close as an error would make the error-rate
+/// panel useless on exactly the surface where disconnects are normal.
+fn outcome_of(result: &Result<(), SessionEnd>) -> om::Outcome {
+    match result {
+        Ok(()) => om::Outcome::Ok,
+        Err(_) => om::Outcome::Cancelled,
+    }
 }
 
 async fn feed(
     session: &mut Session,
     handle: &StreamingHandle,
     chunk: &[u8],
+    metrics: &mut SessionMetrics,
+    sample_rate: u32,
 ) -> Result<(), SessionEnd> {
     let decoded = session
         .pcm
@@ -486,6 +564,10 @@ async fn feed(
     if decoded.is_empty() {
         return Ok(());
     }
+    // Counted on the *decoded* bytes, at the engine's rate: a client sending
+    // 8 kHz µ-law and one sending 48 kHz f32 have wildly different byte counts
+    // for the same second of speech, and RTFx has to be about the speech.
+    metrics.audio(decoded.len(), sample_rate);
     handle
         .push_chunk(decoded)
         .await
@@ -504,12 +586,14 @@ async fn buffered_session(
     pending_audio: Option<Bytes>,
     already_committed: bool,
 ) -> Result<(), SessionEnd> {
+    let mut metrics = SessionMetrics::new();
     let mut buffered = BytesMut::new();
     if let Some(chunk) = pending_audio {
         let decoded = session
             .pcm
             .decode_chunk(&chunk)
             .map_err(|e| format!("pcm decode: {e}"))?;
+        metrics.audio(decoded.len(), s.sample_rate);
         buffered.extend_from_slice(&decoded);
     }
     let mut committed = already_committed;
@@ -520,6 +604,7 @@ async fn buffered_session(
                     .pcm
                     .decode_chunk(&chunk)
                     .map_err(|e| format!("pcm decode: {e}"))?;
+                metrics.audio(decoded.len(), s.sample_rate);
                 buffered.extend_from_slice(&decoded);
                 if let Some(cap) = s.max_audio_samples {
                     if buffered.len() / 4 > cap {
@@ -566,6 +651,7 @@ async fn buffered_session(
     let result = loop {
         match handle.events.next().await {
             Some(Event::Partial { text, .. }) => {
+                metrics.partial();
                 if session.interim_results {
                     if let Some(ev) = emitted.event(&text) {
                         send_json(&mut socket, ev).await?;
@@ -587,6 +673,7 @@ async fn buffered_session(
             None => break Err("event stream closed".into()),
         }
     };
+    metrics.finished(outcome_of(&result));
     s.pool.release(&rid);
     let _ = socket.send(Message::Close(None)).await;
     result

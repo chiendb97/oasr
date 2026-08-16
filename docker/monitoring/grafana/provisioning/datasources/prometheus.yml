@@ -1,0 +1,22 @@
+# Grafana datasource, provisioned so the dashboard works on first start.
+#
+# `uid` is fixed rather than generated because the dashboard's `datasource`
+# template variable defaults to it — a generated UID would leave every panel
+# pointing at a datasource that does not exist yet.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: oasr-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Must match `scrape_interval` in prometheus/prometheus.yml. This is what
+      # `$__rate_interval` is computed from; leaving it unset makes Grafana
+      # guess, and a guess below the real scrape period turns every rate() panel
+      # into gaps.
+      timeInterval: 15s
+      httpMethod: POST

@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use axum::http::StatusCode;
 use bytes::Bytes;
+use oasr_metrics::{f32_pcm_seconds, Outcome, RequestRecorder};
 use oasr_wire::{DecodingParams, ErrorCode, Event, WordTiming};
 use tracing::{error, warn};
 
@@ -74,6 +75,11 @@ pub fn error_from_event_code(code: ErrorCode) -> (StatusCode, &'static str) {
 ///
 /// `audio` is f32-LE mono at `sample_rate`, already the engine's own rate.
 /// The pool slot is released before returning, on every path.
+///
+/// `metrics` names the API surface this request arrived on.  It is a parameter
+/// rather than something derived here because this function is what makes the
+/// two HTTP shapes one code path — the surface is the only thing that still
+/// differs, so it is the only thing that has to be passed.
 pub async fn submit_offline_and_wait(
     state: &AppState,
     audio: Bytes,
@@ -81,7 +87,15 @@ pub async fn submit_offline_and_wait(
     priority: i32,
     decoding: Option<DecodingParams>,
     start: Instant,
+    metrics: &RequestRecorder,
 ) -> Result<FinalTranscript, EngineFailure> {
+    // Counted before the submit, so audio a saturated engine refuses still
+    // lands in the denominator: RTFx computed only over accepted work makes a
+    // server look most efficient exactly when it is shedding load.
+    let audio_seconds = f32_pcm_seconds(audio.len(), sample_rate);
+    metrics.audio_ingested(audio_seconds);
+    metrics.audio_duration(audio_seconds);
+
     let handle = match state
         .pool
         .submit_offline(audio, sample_rate, priority, decoding)
@@ -90,6 +104,7 @@ pub async fn submit_offline_and_wait(
         Ok(h) => h,
         Err(e) => {
             warn!(%e, "offline submit rejected");
+            metrics.finished(Outcome::Error, start.elapsed());
             return Err(EngineFailure::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "RESOURCE_EXHAUSTED",
@@ -102,6 +117,7 @@ pub async fn submit_offline_and_wait(
         Ok(e) => e,
         Err(_) => {
             error!(rid = %rid, "engine channel closed before result");
+            metrics.finished(Outcome::Error, start.elapsed());
             return Err(EngineFailure::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL",
@@ -111,7 +127,8 @@ pub async fn submit_offline_and_wait(
     };
     state.pool.release(&rid);
 
-    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let elapsed = start.elapsed();
+    let elapsed_ms = elapsed.as_millis() as u64;
     match ev {
         Event::Final {
             request_id,
@@ -134,9 +151,20 @@ pub async fn submit_offline_and_wait(
             confidence,
             finish_reason,
             elapsed_ms,
-        }),
+        })
+        .inspect(|_| metrics.finished(Outcome::Ok, elapsed)),
         Event::Error { code, message, .. } => {
             let (status, code_name) = error_from_event_code(code);
+            // A shutdown-coded terminal is the engine draining out from under
+            // an in-flight request, which is a cancellation from the caller's
+            // point of view rather than a request that failed on its merits.
+            // Splitting them here is what keeps an ordinary rolling restart
+            // out of the error-rate panel.
+            let kind = match code {
+                ErrorCode::Shutdown => Outcome::Cancelled,
+                _ => Outcome::Error,
+            };
+            metrics.finished(kind, elapsed);
             warn!(
                 rid = %rid,
                 code = ?code,
@@ -148,6 +176,7 @@ pub async fn submit_offline_and_wait(
             Err(EngineFailure::new(status, code_name, message))
         }
         other => {
+            metrics.finished(Outcome::Error, elapsed);
             error!(rid = %rid, elapsed_ms, "unexpected non-terminal event for offline request: {other:?}");
             Err(EngineFailure::new(
                 StatusCode::INTERNAL_SERVER_ERROR,

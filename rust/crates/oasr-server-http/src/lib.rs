@@ -15,6 +15,7 @@
 //! privileged.
 
 pub mod engine_call;
+pub mod http_metrics;
 pub mod openai;
 pub mod realtime;
 pub mod recognize;

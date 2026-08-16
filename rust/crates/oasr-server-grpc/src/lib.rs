@@ -11,6 +11,7 @@
 // generated service traits are built around.
 #![allow(clippy::result_large_err)]
 
+pub mod grpc_metrics;
 pub mod speech;
 
 pub mod pb {

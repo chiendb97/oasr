@@ -20,6 +20,7 @@ decode + finalise tail is identical for both.
 from __future__ import annotations
 
 import logging
+import time
 from typing import ClassVar, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -27,6 +28,7 @@ import torch
 
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
+from .. import metrics as m
 from ..decode.base import EncodeOutput
 from ..request import Request, RequestOutput, RequestState
 from ..scheduler import Scheduler
@@ -72,7 +74,10 @@ class OfflineExecutor(Executor):
         max_tick_ms: float = 0.0,
         decode_admit_window_ms: float = 0.0,
         max_batch_size: int = 32,
+        metrics: Optional[m.EngineMetrics] = None,
     ) -> None:
+        if metrics is not None:
+            self._metrics = metrics
         self._scheduler = scheduler
         self._inp = input_processor
         self._mr = model_runner
@@ -116,6 +121,13 @@ class OfflineExecutor(Executor):
     def admit(self, request: Request) -> None:
         """Prepare an offline request and enqueue it for batching."""
         self._inp.prepare_offline(request)
+        if request.audio is not None and request.sample_rate:
+            # After ``prepare_offline`` this is a 1-D float32 CPU waveform, so
+            # the duration is exact rather than derived from a frame estimate.
+            # ``.shape[-1]`` rather than ``.numel()``: the field is declared as
+            # tensor-or-ndarray and only one of the two has ``numel``.
+            n = int(request.audio.shape[-1])
+            self._metrics.incr(m.AUDIO_SECONDS, n / request.sample_rate)
         self._scheduler.add_request(request)
 
     def feed_chunk(
@@ -301,6 +313,21 @@ class OfflineExecutor(Executor):
     def num_waiting(self) -> int:
         return self._scheduler.num_waiting_offline
 
+    def record_gauges(self, metrics) -> None:
+        """Report decode-slot occupancy.
+
+        A capacity of ``0`` means "no ceiling applies" — either the family is
+        one-shot and parks nothing, or no ceiling was configured.  Reported as
+        zero rather than omitted so the series exists from startup: a missing
+        series and a scrape failure look identical on a dashboard, and a flat
+        zero does not.
+        """
+        capacity = 0.0
+        if self._op.strategy.incremental and self._max_decode_slots is not None:
+            capacity = float(self._max_decode_slots)
+        metrics.set_gauge(m.DECODE_SLOTS_IN_USE, float(len(self._pending)))
+        metrics.set_gauge(m.DECODE_SLOTS_CAPACITY, capacity)
+
     def find_request(self, request_id: str) -> Optional[Request]:
         req = self._pending.get(request_id)
         if req is not None:
@@ -322,6 +349,11 @@ class OfflineExecutor(Executor):
         """
         if not batch:
             return []
+
+        # Queue wait is stamped here, at the one moment a request stops
+        # waiting: the scheduler has just selected this batch, and nothing
+        # between here and the forward can send a row back to the queue.
+        self._metrics.observe_queue_wait(m.MODE_OFFLINE, batch)
 
         chunks, orig_indices = self._scheduler.split_offline_batch(batch)
 
@@ -366,7 +398,9 @@ class OfflineExecutor(Executor):
         from ..generation import StepBudget
 
         budget = StepBudget.for_tick(self._decode_steps_per_tick, self._max_tick_ms)
+        t0 = time.perf_counter()
         outputs = self._op.strategy.advance(budget)
+        self._metrics.observe_stage("offline.advance", time.perf_counter() - t0)
         for out in outputs:
             if not out.finished:
                 continue
@@ -414,13 +448,16 @@ class OfflineExecutor(Executor):
         request turns into a cascade, so it rejects the batch outright.
         """
         try:
+            self._record_batch_shape(chunk)
             nvtx_push("offline.collate")
+            t0 = time.perf_counter()
             try:
                 features, lengths = self._collate(chunk)
             finally:
                 # Balanced even when _collate raises: an unpaired push
                 # mis-nests every range for the rest of a profiling session.
                 nvtx_pop()
+            self._metrics.observe_stage("offline.collate", time.perf_counter() - t0)
             return self._run_stage(chunk, features, lengths)
         except torch.cuda.OutOfMemoryError as exc:
             logger.warning(
@@ -454,6 +491,25 @@ class OfflineExecutor(Executor):
                 outputs.extend(self._run_micro_batch([req]))
             return outputs
 
+    def _record_batch_shape(self, chunk: List[Request]) -> None:
+        """Record this micro-batch's width and how much of it is padding.
+
+        Read off the **host-side** waveform lengths, before :meth:`_collate`
+        releases them, for two reasons.  The device ``lengths`` tensor would
+        need a ``.item()`` to sum, putting a device-to-host synchronisation on
+        the collate path — a metric that slows down what it measures.  And the
+        waveforms are gone afterwards: ``collate`` clears ``request.audio``
+        once the GPU feature tensor owns the batch, which is also why the
+        single-request retry path (where a peer's audio is already released)
+        reports width but not padding rather than reporting a wrong ratio.
+        """
+        if not self._metrics.enabled:
+            return
+        self._metrics.observe_batch(m.MODE_OFFLINE, len(chunk))
+        lengths = [int(r.audio.shape[-1]) for r in chunk if r.audio is not None]
+        if len(lengths) == len(chunk):
+            self._metrics.observe_padding(lengths)
+
     def _run_stage(
         self,
         chunk: List[Request],
@@ -467,6 +523,7 @@ class OfflineExecutor(Executor):
         and finalisation are identical for both.
         """
         nvtx_push("offline.forward")
+        t0 = time.perf_counter()
         consumes = self._op.strategy.consumes
         if consumes == "hidden":
             # Autoregressive families (transducer/AED/LLM) consume raw encoder
@@ -484,6 +541,7 @@ class OfflineExecutor(Executor):
         else:
             enc_out, output_lengths = self._mr.forward_offline(features, lengths)
         nvtx_pop()
+        self._metrics.observe_stage("offline.encode", time.perf_counter() - t0)
 
         strategy = self._op.strategy
         if strategy.incremental:
@@ -491,6 +549,7 @@ class OfflineExecutor(Executor):
             # in the pending pool in state RUNNING; ``step()`` drives them via
             # budgeted ``advance`` calls until the strategy finishes each one.
             nvtx_push("offline.prefill")
+            t_prefill = time.perf_counter()
             try:
                 strategy.begin_offline(chunk, enc_out, output_lengths)
             except torch.cuda.OutOfMemoryError as exc:
@@ -515,13 +574,16 @@ class OfflineExecutor(Executor):
                 req.state = RequestState.RUNNING
                 self._pending[req.request_id] = req
             nvtx_pop()
+            self._metrics.observe_stage("offline.prefill", time.perf_counter() - t_prefill)
             return []
 
         nvtx_push("offline.decode")
+        t_decode = time.perf_counter()
         # The micro-batch rides along in row order: a family that can time its
         # own output needs to know, before it decodes, which rows asked.
         outputs = self._op.decode_offline(enc_out, output_lengths, chunk)
         nvtx_pop()
+        self._metrics.observe_stage("offline.decode", time.perf_counter() - t_decode)
 
         for req, out in zip(chunk, outputs):
             out.request_id = req.request_id

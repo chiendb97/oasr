@@ -122,7 +122,12 @@ pub fn build_router(state: AppState, limits: RouterLimits) -> Router {
     if let Some(cors) = cors_layer(&limits.cors_allow_origins) {
         router = router.layer(cors);
     }
-    router.layer(TraceLayer::new_for_http())
+    // Transport metrics wrap everything, including `/healthz` and the
+    // 404 path: a probe that never reaches a handler is exactly the traffic
+    // an operator needs counted.
+    router
+        .layer(axum::middleware::from_fn(crate::http_metrics::track_http))
+        .layer(TraceLayer::new_for_http())
 }
 
 /// Build the CORS layer, or `None` when no origins were configured.
