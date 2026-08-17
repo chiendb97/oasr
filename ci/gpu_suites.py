@@ -80,6 +80,7 @@ SUITES: dict[str, list[str]] = {
         "tests/test_scheduler_split.py",
         "tests/test_streaming_backend.py",
         "tests/test_cache_manager.py",
+        "tests/test_host_staging.py",
         "tests/test_incremental_executor.py",
         "tests/test_decode_options.py",
         "tests/test_decoding_options.py",

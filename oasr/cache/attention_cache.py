@@ -30,6 +30,7 @@ import torch
 from oasr.cache.block_pool import BlockPool
 from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.types import CacheConfig
+from oasr.utils.staging import to_device
 
 
 @dataclass
@@ -285,9 +286,9 @@ class AttentionCacheManager:
             slots.append(state.slot_id)
 
         device = self._block_table.device
-        slots_t = torch.tensor(slots, dtype=torch.long, device=device)
-        logical_t = torch.tensor(logical_indices, dtype=torch.long, device=device)
-        block_ids_t = torch.tensor(block_ids, dtype=torch.int32, device=device)
+        slots_t = to_device(slots, dtype=torch.long, device=device)
+        logical_t = to_device(logical_indices, dtype=torch.long, device=device)
+        block_ids_t = to_device(block_ids, dtype=torch.int32, device=device)
         self._block_table[slots_t, logical_t] = block_ids_t
 
     def get_paged_caches(self, stream_id: int) -> List[PagedKVCache]:
@@ -413,7 +414,12 @@ class AttentionCacheManager:
             state = self._streams[sid]
             state.num_committed_frames += chunk_frames
             slots.append(state.slot_id)
-        slots_t = torch.tensor(slots, dtype=torch.long, device=self._block_table.device)
+        # Staged through pinned memory (:func:`oasr.utils.staging.to_device`):
+        # this is the first host->device copy after the encoder forward is
+        # issued, so a pageable one waits out the whole forward and the host can
+        # never run a step ahead of the device.  Measured at 1.7 ms per call on
+        # a 32-stream pool — 26% of streaming wall time across all such sites.
+        slots_t = to_device(slots, dtype=torch.long, device=self._block_table.device)
         # In-place batched advance — one kernel for all B updates.
         self._cache_seqlens[slots_t] += chunk_frames
         self.evict_oldest_batched(stream_ids)
@@ -475,8 +481,8 @@ class AttentionCacheManager:
                 return
 
             self._pool.free(freed)
-            slots_t = torch.tensor(slots, dtype=torch.long, device=device)
-            kept_t = torch.tensor(kept, dtype=torch.long, device=device)
+            slots_t = to_device(slots, dtype=torch.long, device=device)
+            kept_t = to_device(kept, dtype=torch.long, device=device)
             width = self._block_table.size(1)
             # Shift every affected row left by one.  Advanced indexing on the
             # right builds a copy, so source and destination cannot alias.

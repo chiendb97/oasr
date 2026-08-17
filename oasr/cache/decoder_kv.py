@@ -31,6 +31,8 @@ from typing import Dict, List, Sequence, Tuple
 
 import torch
 
+from oasr.utils.staging import to_device
+
 from .block_pool import BlockPool
 from .types import CacheConfig
 
@@ -186,20 +188,36 @@ class DecoderKVCacheManager:
     # ------------------------------------------------------------------
 
     def block_tables(self, request_ids: Sequence[str], device: torch.device = None) -> torch.Tensor:
-        """``(N, max_blocks)`` int32 block table over the given slots (0-padded)."""
+        """``(N, max_blocks)`` int32 block table over the given slots (0-padded).
+
+        Built in **pinned** host memory when a device is asked for: this runs on
+        every AR decode step, and a pageable host→device copy synchronises the
+        stream before it stages (CUDA's rule), so the plain version parks the
+        host until the previous step's decoder forward has finished — the one
+        thing an incremental decode loop cannot afford to do per step.
+        """
         rows = [self._slots[rid].block_ids for rid in request_ids]
         width = max((len(r) for r in rows), default=1)
-        table = torch.zeros(len(rows), width, dtype=torch.int32)
+        pin = device is not None and torch.device(device).type == "cuda"
+        table = torch.zeros(len(rows), width, dtype=torch.int32, pin_memory=pin)
         for i, r in enumerate(rows):
             table[i, : len(r)] = torch.tensor(r, dtype=torch.int32)
-        return table.to(device) if device is not None else table
+        return table.to(device, non_blocking=True) if device is not None else table
 
     def cache_seqlens(
         self, request_ids: Sequence[str], device: torch.device = None
     ) -> torch.Tensor:
-        """``(N,)`` int32 current sequence length per slot."""
-        lens = torch.tensor([self._slots[rid].seqlen for rid in request_ids], dtype=torch.int32)
-        return lens.to(device) if device is not None else lens
+        """``(N,)`` int32 current sequence length per slot.
+
+        Pinned + async for the same reason as :meth:`block_tables`.
+        """
+        if device is not None:
+            return to_device(
+                [self._slots[rid].seqlen for rid in request_ids],
+                dtype=torch.int32,
+                device=device,
+            )
+        return torch.tensor([self._slots[rid].seqlen for rid in request_ids], dtype=torch.int32)
 
     def kv_view(self, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Full-pool ``(K, V)`` views for one decoder layer (paged FMHA input).

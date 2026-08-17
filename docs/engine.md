@@ -597,17 +597,28 @@ which becomes the `stage` label on the `oasr_requests_failed_total` metric
    runs the streaming fbank kernel; the default stream waits on a recorded
    event before reading `feature_buffer`. The offline executor runs its
    micro-batches sequentially (GPU fbank → forward → decode), so it needs
-   no extra stream.
-3. **Length bucketing trade-off.** `length_bucket_ratio=0` (default)
+   no extra stream — and measurably does not want one: at every batch width
+   the offline step thread, not the GPU, is the critical path, so a prefetch
+   only moves work it cannot remove.
+3. **Per-step host→device metadata goes through `oasr.utils.staging.to_device`.**
+   Slot ids, block ids and per-row offsets are built host-side every step, and
+   CUDA synchronises the stream before staging a *pageable* copy — so the
+   obvious `torch.tensor(ids, device="cuda")` costs whatever is queued, not the
+   40 bytes it moves. One sat immediately after the streaming encoder forward,
+   which meant the host waited out that forward on every step and could never
+   run a step ahead of the device. `to_device` builds the tensor in pinned
+   memory and copies it `non_blocking=True`; readers on the same stream need no
+   further ordering, readers on another stream need the usual `wait_stream`.
+4. **Length bucketing trade-off.** `length_bucket_ratio=0` (default)
    ships one big batch; `0.5` insists on ≥50 % length similarity;
    `max_offline_pad_ratio=4.0` is the safety net against pathological
    mixes.
-4. **NVTX profiling.** The step loop is annotated with
+5. **NVTX profiling.** The step loop is annotated with
    `nvtx_push("engine.step")` → `schedule` / `allocate_stream` /
    `offline_batch` / `extract_fbank` / `forward_streaming` /
    `decode_streaming` / `finalize_streams`. Capture with
    `nsys profile`/`ncu` to get per-stage timing without touching code.
-5. **Pool sizing.** The engine's most common production failure is
+6. **Pool sizing.** The engine's most common production failure is
    `BlockPool` exhaustion. Size `max_num_blocks` for
    `max_batch_size × max_logical_blocks` plus headroom; trade off
    against GPU memory. Or hand it over: `max_num_blocks=None` derives the

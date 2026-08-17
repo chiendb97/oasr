@@ -505,6 +505,61 @@ class TestASREngine:
         assert engine.num_running == 0
         assert engine.num_waiting == 0
 
+    @pytest.mark.parametrize("overlap", [False, True])
+    def test_partial_readback_modes_agree(self, device, ckpt_dir: str, wav_dir: str, overlap: bool):
+        """``overlap_partial_readback`` changes *when* a partial is emitted, not what.
+
+        The overlapped read-back is off by default and was therefore never
+        exercised: it had kept an 11-argument call into a launcher that grew a
+        twelfth (the word-timing buffer), so every stream failed its forward and
+        finalised with ``finish_reason="error"`` and an empty transcript.
+        Nothing noticed, because the only configuration that selects the path is
+        one no test set.  Both modes are checked here, together, so the pair
+        cannot drift again.
+        """
+        from oasr.engine import ASREngine, EngineConfig
+
+        wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
+        if len(wavs) < 2:
+            pytest.skip("Need at least 2 .wav files in WAV directory")
+        waves = _wav_waveforms(wav_dir, 2)
+
+        cfg = EngineConfig(
+            ckpt_dir=ckpt_dir,
+            device=str(device),
+            dtype=torch.float16,
+            decoder_type="ctc_cuda",
+            chunk_size=16,
+            num_left_chunks=-1,
+            max_batch_size=2,
+            overlap_partial_readback=overlap,
+        )
+        engine = ASREngine(cfg)
+        chunk_samples = engine._input_processor.streaming_audio_chunk_samples
+
+        rids = []
+        for wav in waves:
+            rid = engine.add_streaming_request(sample_rate=16000)
+            rids.append(rid)
+            starts = list(range(0, int(wav.numel()), chunk_samples))
+            for s in starts:
+                engine.feed_chunk(rid, wav[s : s + chunk_samples], is_last=(s == starts[-1]))
+
+        partials: list[str] = []
+        finals: dict[str, str] = {}
+        while engine.num_running or engine.num_waiting:
+            for out in engine.step():
+                if out.finished:
+                    assert out.finish_reason != "error", f"stream failed: {out}"
+                    finals[out.request_id] = out.text
+                elif out.text:
+                    partials.append(out.text)
+
+        assert set(finals) == set(rids)
+        assert all(t for t in finals.values()), f"empty final transcript: {finals}"
+        # The whole point of the interim path: a partial has to actually arrive.
+        assert partials, "no interim partial was emitted"
+
     @pytest.mark.slow
     def test_memory_cleanup_after_streaming(self, device, ckpt_dir: str, wav_dir: str):
         from oasr.engine import ASREngine, EngineConfig

@@ -261,118 +261,96 @@ extension cookbook for each axis.
 
 ## Anti-patterns & gotchas
 
-- **Editing a vendored CUTLASS header without bumping `version.h`** leaves the
-  JIT cache short-circuiting on a stale `.so`. Run `rm -rf ~/.cache/oasr/jit`.
-  Always confirm a fresh hash directory before trusting a kernel benchmark.
-- **Forgetting `git submodule update --init`.** CMake fetches only pybind11;
-  CUTLASS comes from the submodule.
-- **Changing `[tool.isort]` without `[tool.ruff.lint.isort]`** (or vice versa).
-  Both sort imports, and `known_first_party` / `combine_as_imports` /
-  `force_sort_within_sections` are mirrored between them. Change them together or
-  the two tools fight and CI flaps.
-- **Assuming a green `pytest tests/` means full coverage.** Without the external
-  assets, real-checkpoint tests skip. Every run prints an `external assets:`
-  table naming what it did *not* cover; `--strict-assets` makes a missing asset
-  fatal. This is not hypothetical: a fused-mask kernel shipped green and left
-  **every** Paraformer request returning an empty transcript at both fp16 and
-  bf16, because the validating shell had no `$OASR_PARAFORMER_CKPT` and the only
-  tests that touch the real call site skipped. That is what rule 8 is for.
-- **Validating a kernel change with an fp32 parity oracle alone.** `fp32` and CPU
-  route to torch (`use_conv_kernel`), so a *launcher precondition* — contiguity,
-  alignment, a dtype dispatch — is never reached. A new fused op needs a test in
-  a **served dtype** (fp16/bf16, on CUDA) that reaches the launcher.
-- **Benchmarking an explicit-only architecture without naming it.** An icefall
-  pruned-RNNT dir sniffs as `zipformer`, so `--ckpt-dir $TRANSDUCER_CKPT` alone
-  measures a different branch of the same checkpoint or fails outright. Pass
-  `--architecture transducer` (`EngineConfig.architecture`).
-- **Trusting a single-order A/B.** Interleave the arms — the second one benefits
-  from a warm allocator. Report a σ, not one run.
-- **Optimizing GPU time at small batch.** The encoders are CPU-issue-bound at
-  batch 1–2, where removing GPU work can make them *slower*. Compare issue time
-  against wall time.
-- **Reusing a CUDA-graph replay buffer's output.** One buffer per shape key: a
-  returned tensor is live only until the next replay *or capture*. Copy when a
-  step can hit the same key twice.
-- **Retrying a CUDA-graph capture that already failed.** A capture costs a
-  warm-up forward before it records anything, so a shape that raised once pays
-  that on *every* step of that shape and then runs eager regardless — strictly
-  worse than never having tried. Remember the failed shape; treat an
-  out-of-memory as a fact about the process and stop capturing altogether
-  (`DecoderStepGraphCache`).
-- **Declaring `streaming_kind` from what the class implements** rather than from
-  what *this config's weights* can do. Over-claiming builds an engine that raises
-  on its first request instead of failing at construction. Same for
-  `DecodeStrategy.word_timing_modes`, which is a **property** for exactly this
-  reason: a transducer times both modes under greedy and neither under beam
-  search.
-- **Re-deriving what the decoder already knew.** A frame-synchronous decoder
-  knows the emitting frame *as* it emits it; recovering it afterwards cost 10×
-  the decode and cannot serve a stream at all. Record it in the beam.
-- **Guessing a frame rate, or rebuilding words from tokenizer pieces.** Both
-  produce output that is plausible and wrong. `FrameClock.resolve` returns
-  `None` rather than a guess and the request is refused; words are cut out of
-  the rendered transcript so each is a literal substring of `text`.
-- **Changing the alignment rule without its oracle.** The pass is C++ only
-  (`csrc/alignment/`); Python raises rather than falling back, because a
-  fallback costing more than the decode is one a deployment lands on silently.
-  The Python statement of the same rule lives in `tests/test_alignment_cpp.py`
-  and must agree **exactly**, so a change lands in both. That is also why
-  neither side uses `std::isspace` or `sum()`: both differ across
-  implementations or Python versions, and the difference reaches the published
-  output. Details: [`docs/decoding.md`](docs/decoding.md) § Word timings.
-- **Per-token or per-character Python on the decode path.** The step loop is
-  interpreter-bound at batch and holds the GIL for every request the engine
-  finishes; both the word grouping and the beam read-back cost more than the
-  work they decorated before moving to `_C.alignment`. A worker thread does not
-  help — pure Python holds the GIL — and there is rarely a next forward in
-  flight to hide behind.
-- **Reading a streaming frame index out of `select_seqs`.** It is a ring of
-  width `max_seq_len`, and a stream decodes more frames than its output-token
-  cap, so the value wraps. Use the device-resident absolute counter
-  (`device_frame_idx_ptr`); offline may read the ring, where step == frame.
-- **A paged block table whose width is not a whole number of K tiles.** The
-  fused kernel's paged loader walks `N_BLOCK // block_size` pages per K tile and
-  indexes them *unpredicated*, so a short table has its last tile read past the
-  tensor and dereference whatever followed it as a page id. Squared up in
-  `oasr.attention.fmha` now; it only bites when a page is smaller than a K tile,
-  which is why chunk-sized encoder pages never showed it and 16-token decoder
-  ones did immediately.
-- **A shared scalar generation offset in an AR decoder.** It is why two decode
-  groups could not be merged, and merging is worth ~1.5× on trickle arrivals.
-  Both surfaces index their KV per row (`oasr/cache/decoder_state.py`); a
-  new AR family should too.
-- **Adding a field to the paged region without updating both allocators.**
-  `init_paged_state` and `setup_internal_data_paged_pointers` are two bump
-  allocations over the *same* bytes: a field missing from the second does not
-  leave one pointer null, it shifts every pointer after it. The symptom is an
-  illegal access far from the edit.
-- **Adding an `EngineConfig` field for one decode family.** Use `options_cls`.
-- **`nn.Linear` in a model file.** Use `oasr.layers`.
-- **`LinearActivation(activation="gelu")`.** Only `gelu_tanh` exists — the CUDA
-  epilogue is the tanh approximation, and fusing it under the exact-erf name
-  would be a silent accuracy change.
-- **A row-strided 2D input to a GEMM launcher** (`x[:, -1]` of a `(B, T, D)`).
-  Guarded now by `CHECK_CONTIGUOUS_INPUT`; it used to return garbage silently.
-- **Believing a solo test proves a stream is synchronised.** A missing
-  cross-stream ordering only misbehaves when something else is using the GPU.
-  Congest the other stream on purpose in the test; do not rely on timing. And
-  never accept `CUDA_LAUNCH_BLOCKING=1` "fixing" it as a diagnosis — it
-  serialises everything, including the overlap that may be the actual bug.
-- **Trusting a regression test that has never been seen to fail.** Revert the fix
-  and watch it fail in exactly the predicted parametrisations.
-- **Accepting a per-request option a decode family cannot act on.** `task` /
-  `language` change *what is decoded*; a family without the control rejects them
-  at admission (`DecodeStrategy.validate_options`) rather than returning a
-  transcript of something else with nothing to say so. Sampling knobs are
-  different — ignoring one returns the same transcript.
-- **Sniffing a container out of a declared `LINEAR16` body.** MP3 and AAC are
-  identified by an 11-bit frame sync that real PCM hits by chance; only
-  unambiguous magic may override a caller's declared encoding
-  (`oasr-asr::codec::Container::is_unambiguous`).
-- **Bounding audio by request bytes once codecs are accepted.** A few MiB of MP3
-  is hours of waveform. `--max-audio-seconds` bounds the decode; `--max-audio-mib`
-  bounds the body.
+### Build & JIT
+- **Stale JIT cache.** Editing a vendored CUTLASS header without bumping `version.h` leaves
+  the cache short-circuiting on an old `.so`. `rm -rf ~/.cache/oasr/jit`, and confirm a fresh
+  hash directory before trusting a kernel benchmark.
+- **Changing `[tool.isort]` without `[tool.ruff.lint.isort]`** (or vice versa). Both sort
+  imports and mirror `known_first_party` / `combine_as_imports` /
+  `force_sort_within_sections`; change them together or the two tools fight and CI flaps.
 
+### Testing & measuring
+- **Assuming a green `pytest tests/` means coverage.** Without the external assets the
+  real-checkpoint tests skip. Read the `external assets:` table, or pass `--strict-assets`.
+  Not hypothetical: a fused-mask kernel shipped green while returning an empty transcript for
+  *every* Paraformer request, because the validating shell had no `$OASR_PARAFORMER_CKPT`.
+- **Validating a kernel change with an fp32 parity oracle alone.** fp32 and CPU route to
+  torch, so a launcher precondition — contiguity, alignment, a dtype dispatch — is never
+  reached. Test in a served dtype (fp16/bf16, on CUDA).
+- **Benchmarking an explicit-only architecture without `--architecture`.** An icefall
+  pruned-RNNT dir sniffs as `zipformer`, so you measure a different branch or fail outright.
+- **Trusting a single-order A/B.** Interleave the arms — the second benefits from a warm
+  allocator. Report a σ, not one run.
+- **Optimizing GPU time at small batch.** Encoders are CPU-issue-bound at batch 1–2, where
+  removing GPU work can make them *slower*. Compare issue time against wall time.
+- **Trusting a regression test that has never been seen to fail.** Revert the fix and watch it
+  fail in exactly the predicted parametrisations.
+- **Believing a solo test proves a stream is synchronised.** A missing cross-stream ordering
+  only misbehaves under concurrent load: congest the other stream on purpose, don't rely on
+  timing. And `CUDA_LAUNCH_BLOCKING=1` "fixing" it is not a diagnosis — it serialises
+  everything, including the overlap that may be the actual bug.
+
+### CUDA graphs & kernels
+- **Reusing a CUDA-graph replay buffer's output.** One buffer per shape key; a returned tensor
+  is live only until the next replay *or capture*. Copy when a step can hit the same key twice.
+- **Retrying a capture that already failed.** Capture costs a warm-up forward before it records
+  anything, then runs eager regardless — strictly worse than never trying. Remember the failed
+  shape; treat an OOM as a fact about the process and stop capturing (`DecoderStepGraphCache`).
+- **A paged block table whose width is not a whole number of K tiles.** The fused kernel's
+  paged loader walks `N_BLOCK // block_size` pages per K tile *unpredicated*, so a short table
+  reads its last tile past the tensor and dereferences whatever followed as a page id. Only
+  bites when a page is smaller than a K tile — hence decoder pages, not encoder ones.
+- **Adding a field to the paged region without updating both allocators.** `init_paged_state`
+  and `setup_internal_data_paged_pointers` bump-allocate the *same* bytes: a missing field
+  shifts every later pointer, and the illegal access lands far from the edit.
+- **`LinearActivation(activation="gelu")`.** Only `gelu_tanh` exists — the CUDA epilogue is the
+  tanh approximation, and fusing it under the exact-erf name is a silent accuracy change.
+
+### Decode path
+- **Per-token or per-character Python on the decode path.** The step loop is interpreter-bound
+  and holds the GIL for every request the engine finishes; word grouping and the beam read-back
+  both cost more than the work they decorated, hence `_C.alignment`. Threads are not a lever —
+  pure Python holds the GIL, and a prefetch producer measured 0.95–0.98× against a 1.2× ceiling.
+- **`torch.tensor(ids, device="cuda")` in a per-step path.** A pageable H2D copy synchronises
+  the stream, so a 40-byte slot-id tensor costs whatever is queued behind it — one of these sat
+  after the streaming encoder forward and the host waited out that forward every step. Use
+  `oasr.utils.staging.to_device`; same for `.to(device, non_blocking=True)` from unpinned memory.
+- **Reading a streaming frame index out of `select_seqs`.** It is a ring of width `max_seq_len`
+  and a stream decodes past its token cap, so the value wraps. Use `device_frame_idx_ptr`;
+  offline may read the ring, where step == frame.
+- **Re-deriving what the decoder already knew.** A frame-synchronous decoder knows the emitting
+  frame *as* it emits it; recovering it afterwards cost 10× the decode and cannot serve a
+  stream. Record it in the beam.
+- **A shared scalar generation offset in an AR decoder.** It is why two decode groups could not
+  be merged, and merging is worth ~1.5× on trickle arrivals. Index KV per row
+  (`oasr/cache/decoder_state.py`).
+- **Guessing a frame rate, or rebuilding words from tokenizer pieces.** Both produce output
+  that is plausible and wrong. `FrameClock.resolve` returns `None` and the request is refused;
+  words are cut out of the rendered transcript so each is a literal substring of `text`.
+- **Changing the alignment rule without its oracle.** The pass is C++ only (`csrc/alignment/`)
+  and Python raises rather than falling back. `tests/test_alignment_cpp.py` states the same rule
+  and must agree **exactly**, so a change lands in both — which is also why neither side uses
+  `std::isspace` or `sum()`: both differ across implementations and the difference reaches the
+  published output. See [`docs/decoding.md`](docs/decoding.md) § Word timings.
+
+### Declare, don't ignore
+- **Declaring `streaming_kind` from what the class implements** rather than what *this config's
+  weights* can do. Over-claiming raises on the first request instead of failing at construction.
+  Same for `word_timing_modes`, a **property** because a transducer times both modes under
+  greedy and neither under beam search.
+- **Accepting a per-request option a decode family cannot act on.** `task` / `language` change
+  *what is decoded*, so a family without the control rejects at admission
+  (`DecodeStrategy.validate_options`). Sampling knobs differ — ignoring one returns the same
+  transcript.
+- **An `EngineConfig` field for one decode family** (use `options_cls`), or **`nn.Linear` in a
+  model file** (use `oasr.layers`).
+
+### Serving
+- **Sniffing a container out of a declared `LINEAR16` body.** MP3 and AAC are identified by an
+  11-bit frame sync that real PCM hits by chance; only unambiguous magic may override a
+  caller's declared encoding (`oasr-asr::codec::Container::is_unambiguous`).
+- **Bounding audio by request bytes once codecs are accepted.** A few MiB of MP3 is hours of
+  waveform. `--max-audio-seconds` bounds the decode; `--max-audio-mib` bounds the body.
 
 ---
 

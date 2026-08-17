@@ -461,6 +461,12 @@ class EngineConfig:
     # partial cadence, less sync).  ``<=0`` disables interim partials entirely
     # (final transcript only) for throughput / non-interactive consumers — the
     # decode state still advances every step; only the read-back is skipped.
+    #
+    # Measured (LJSpeech-128, conformer, pool 32, 640 ms chunks): ``2`` is
+    # **+8%**, ``4`` **+12%**, off **+15%** against the default.  It stays at
+    # ``1`` because that is a *cadence* contract, not a throughput knob — a
+    # partial per chunk is what an interactive consumer is promised — but a
+    # backlog deployment should raise it.
     partial_decode_interval: int = 1
     # Overlap the interim-partial read-back.  When ``False`` (default) each
     # emit step reads the beam buffer back with a blocking
@@ -470,10 +476,15 @@ class EngineConfig:
     # *previous* emit step is emitted instead (a one-chunk lag), taking the
     # blocking sync off the critical path — a backlog/throughput optimization.
     # The final transcript (``finalize_streaming``) is always a blocking read,
-    # so end-of-stream output is identical either way.  Off by default because
-    # the engine's primary streaming target is interactive latency, which the
-    # one-chunk partial lag regresses for no reliable throughput gain at low
-    # concurrency.
+    # so end-of-stream output is identical either way.
+    #
+    # Off by default because the engine's primary streaming target is
+    # interactive latency, and the one-chunk partial lag buys **+1.9%** at pool
+    # 32 (measured with the read-back on the C++ path; the earlier "no reliable
+    # gain" reading was taken while this path was raising a ``TypeError`` on
+    # every stream, so it measured error handling, not overlap).  Raising
+    # ``partial_decode_interval`` is the better throughput lever; this one is
+    # for a deployment that wants both the cadence and the overlap.
     overlap_partial_readback: bool = False
 
     # Detokenization

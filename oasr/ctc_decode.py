@@ -1062,6 +1062,14 @@ class GpuStreamingDecoder:
         for i, s in enumerate(states):
             self._mod.ctc_beam_search_read_state(
                 dev_tok[i : i + 1],
+                # Interim partials never carry emission frames — the empty
+                # sentinel is the launcher's "skip the times write".  Passing it
+                # explicitly rather than omitting the argument: this call site is
+                # opt-in (``overlap_partial_readback``) and therefore untested,
+                # and it silently kept an 11-argument shape after the times
+                # buffer was added to the binding, so every stream under the
+                # overlapped read-back died with a TypeError and finalised empty.
+                _NO_TIMES,
                 dev_len[i : i + 1],
                 dev_sco[i : i + 1],
                 s.buffer,
@@ -1104,16 +1112,14 @@ class GpuStreamingDecoder:
         assert handle.lengths_cpu is not None
         handle.event.synchronize()
         n, beam = handle.n, handle.beam
-        tok = handle.tokens_cpu
-        ln = handle.lengths_cpu
-        results: List[GpuDecoderResult] = []
-        for i in range(n):
-            beams: List[List[int]] = []
-            for k in range(beam):
-                length = int(ln[i, k])
-                beams.append(tok[i, k, :length].tolist())
-            results.append(GpuDecoderResult(tokens=[beams], lengths=None, scores=None))
-        return results
+        # Same C++ read-back the blocking path uses.  The Python double loop this
+        # replaces cost more than the sync it was introduced to hide: ``n * beam``
+        # ``.tolist()`` calls per emit step, on the step thread, holding the GIL —
+        # which is why the overlapped path measured *slower* than the blocking one.
+        all_beams = _CPP.extract_beam_tokens(handle.tokens_cpu, handle.lengths_cpu, beam)
+        return [
+            GpuDecoderResult(tokens=[all_beams[i]], lengths=None, scores=None) for i in range(n)
+        ]
 
     def finalize_stream(
         self,
