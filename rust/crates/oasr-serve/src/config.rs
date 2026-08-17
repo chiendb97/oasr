@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use serde_json::{Map, Value};
+use serde_json::{Map, Number, Value};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -238,6 +238,18 @@ pub struct Cli {
     /// critical path.  Engine default false (lowest first-token latency).
     #[arg(long)]
     pub overlap_partial_readback: Option<bool>,
+    /// Offline: longest single request the front-end may hand over in
+    /// **page-locked** host memory, in seconds of audio.  Engine default 300.
+    ///
+    /// Pinning is what lets the engine DMA each row of a micro-batch straight
+    /// into the padded device batch instead of packing it into staging first —
+    /// one copy of the waveform after the codec instead of two.  Page-locked
+    /// memory is process-global and the allocator keeps what it takes, so the
+    /// high-water is this cap times `--max-concurrent-requests`; `0` turns the
+    /// hand-off off entirely and everything falls back to ordinary heap
+    /// buffers, which is the older, slower, still-correct path.
+    #[arg(long)]
+    pub max_pinned_audio_seconds: Option<f64>,
     /// Offline: pack several utterances into one gapless varlen encoder forward
     /// instead of padding each micro-batch.  Requires ``service_mode=offline``.
     #[arg(long)]
@@ -553,6 +565,12 @@ impl Cli {
             obj.entry("overlap_partial_readback")
                 .or_insert(Value::Bool(b));
         }
+        if let Some(v) = self.max_pinned_audio_seconds {
+            if let Some(n) = Number::from_f64(v) {
+                obj.entry("max_pinned_audio_seconds")
+                    .or_insert(Value::Number(n));
+            }
+        }
         if let Some(b) = self.enable_sequence_packing {
             obj.entry("enable_sequence_packing")
                 .or_insert(Value::Bool(b));
@@ -602,6 +620,41 @@ mod tests {
         let c = cli(&["--max-concurrent-requests", "256"]);
         assert_eq!(c.inflight_limit(), Some(1024));
         assert!(c.inflight_limit().unwrap() > c.max_concurrent_requests as usize);
+    }
+
+    /// The pinned-audio cap must be **absent** from the JSON when the flag is
+    /// unset, or the CLI silently pins the engine default in place and a later
+    /// change to it never reaches a served process (the `--dtype` /
+    /// `--service-mode` drift channel, which this flag deliberately avoids by
+    /// being `Option`).  `0` is a real operator choice — "stop page-locking" —
+    /// so it has to survive as `0`, not be read as "unset".
+    #[test]
+    fn the_pinned_audio_cap_is_only_forwarded_when_asked_for() {
+        let unset: Value =
+            serde_json::from_str(&cli(&[]).build_engine_config_json().unwrap()).unwrap();
+        assert_eq!(unset.get("max_pinned_audio_seconds"), None);
+
+        let off: Value = serde_json::from_str(
+            &cli(&["--max-pinned-audio-seconds", "0"])
+                .build_engine_config_json()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            off.get("max_pinned_audio_seconds").and_then(|v| v.as_f64()),
+            Some(0.0)
+        );
+
+        let set: Value = serde_json::from_str(
+            &cli(&["--max-pinned-audio-seconds", "12.5"])
+                .build_engine_config_json()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            set.get("max_pinned_audio_seconds").and_then(|v| v.as_f64()),
+            Some(12.5)
+        );
     }
 
     #[test]

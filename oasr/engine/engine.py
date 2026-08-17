@@ -752,6 +752,22 @@ class ASREngine:
             request.decoding, streaming=request.streaming
         )
 
+    def new_audio_buffer(self, num_samples: int) -> Optional[torch.Tensor]:
+        """A page-locked float32 host buffer for one request's waveform, or ``None``.
+
+        Offered to whoever decodes the audio — in a served process, the Rust
+        front-end after the codec — so that its copy lands somewhere the engine
+        can DMA from directly, and ``collate`` no longer has to pack the
+        micro-batch into staging first.  Fill all ``num_samples`` elements, then
+        submit the **tensor** as the request's ``audio``.
+
+        ``None`` means "use ordinary memory": a CPU engine, or a request past
+        ``EngineConfig.max_pinned_audio_seconds``.  That path is the older one
+        and still correct, so a caller can treat this as a hint.  See
+        :meth:`oasr.engine.input_processor.InputProcessor.new_audio_buffer`.
+        """
+        return self._input_processor.new_audio_buffer(int(num_samples))
+
     def add_requests_batch(self, specs: List[Dict]) -> List[str]:
         """Bulk admission — single Python entry for many requests.
 

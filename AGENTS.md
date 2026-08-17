@@ -346,6 +346,14 @@ extension cookbook for each axis.
   model file** (use `oasr.layers`).
 
 ### Serving
+- **Handing the engine heap audio.** After the codec, ask
+  `ASREngine.new_audio_buffer(n)` for page-locked memory and decode into that: the engine
+  then DMAs each row of a micro-batch straight into the padded device batch instead of
+  packing it into staging, which is a second full copy of the waveform (**1.13-1.19×**
+  offline). Hand over the **tensor**, never a `numpy()` re-wrap of its pages — PyTorch can
+  only event-track the in-flight copy through the tensor whose storage it allocated, and an
+  anonymous re-wrap can be recycled under a live DMA. The offer is bounded
+  (`max_pinned_audio_seconds`); page-locked memory is process-global.
 - **Sniffing a container out of a declared `LINEAR16` body.** MP3 and AAC are identified by an
   11-bit frame sync that real PCM hits by chance; only unambiguous magic may override a
   caller's declared encoding (`oasr-asr::codec::Container::is_unambiguous`).

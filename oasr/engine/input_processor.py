@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -20,6 +21,8 @@ from oasr.utils.nvtx import nvtx_pop, nvtx_push
 from .config import EngineConfig
 from .graph_cache import GraphedFeatureExtraction
 from .request import Request
+
+logger = logging.getLogger(__name__)
 
 #: Streaming staging slots rotated through by :meth:`InputProcessor._next_stream_slot`.
 #: Two is the pipeline depth the feature stream introduces — one pair in flight
@@ -114,6 +117,16 @@ class InputProcessor:
         # ``max_batch_size`` x a full-length utterance at 16 kHz; a batch past
         # it allocates per call rather than pinning that much for good.
         self._max_staging_elems = int(getattr(config, "max_staging_elems", None) or (256 << 20))
+        # Largest request :meth:`new_audio_buffer` will page-lock, in samples;
+        # ``0`` declines everything (CPU engine, or the knob turned off).
+        self._max_pinned_audio_samples = (
+            int(
+                float(getattr(config, "max_pinned_audio_seconds", 0.0) or 0.0)
+                * self._feature_config.sample_rate
+            )
+            if device.type == "cuda"
+            else 0
+        )
 
         # Shared CUDA Graph memory-pool handle injected by ``ASREngine`` so the
         # feature-extraction graph cache (added in Step 2 of the plan) shares
@@ -299,6 +312,49 @@ class InputProcessor:
             )
         return self._wav_flat[:n]
 
+    def new_audio_buffer(self, num_samples: int) -> Optional[torch.Tensor]:
+        """A **page-locked** 1-D float32 host buffer the caller fills, or ``None``.
+
+        The point of the offer: whoever produces the waveform — the Rust
+        front-end, after the codec — has to copy it somewhere anyway, and if
+        that somewhere is pinned then :meth:`collate` can DMA each row straight
+        into the padded device batch instead of packing the micro-batch into
+        staging first.  One copy of the audio after decode instead of two.  The
+        buffer is uninitialised; the caller must fill all ``num_samples``
+        elements before handing it over as ``Request.audio``.
+
+        Hand back the **tensor**, not a view of it (a ``numpy()`` view is fine
+        to *write* through): the async H2D only stays safe because PyTorch
+        records an event against the caching host allocator's block when the
+        copy is issued, and it finds that block through the storage context of
+        the tensor it allocated.  A ``from_numpy`` re-wrap of the same pages is
+        pinned but anonymous to that bookkeeping, so nothing would stop the
+        block being recycled under an in-flight DMA — one request's audio
+        arriving as another's transcript.  Reasoned from the allocator's
+        contract rather than observed: a probe could not force the reuse
+        ordering, which is the argument for shipping the shape that cannot
+        depend on it.
+
+        Returns ``None`` — meaning "allocate ordinary memory yourself" — for a
+        CPU engine, a non-positive size, or a request longer than
+        ``EngineConfig.max_pinned_audio_seconds``.  Declining is not an error:
+        page-locked memory is process-global and the caching host allocator
+        keeps what it takes, so an unbounded offer would let one long request
+        hold a permanent reservation.
+        """
+        if num_samples <= 0 or num_samples > self._max_pinned_audio_samples:
+            return None
+        try:
+            return torch.empty(num_samples, dtype=torch.float32, pin_memory=True)
+        except RuntimeError:
+            # No usable CUDA context to page-lock against.  The caller's
+            # fallback is a correct, slightly slower path, so this is a
+            # capability answer rather than a failure — but it should never be
+            # reached on a device the engine reported as CUDA, hence the log.
+            logger.warning("cannot allocate pinned host memory; audio buffers stay on the heap")
+            self._max_pinned_audio_samples = 0
+            return None
+
     def release_staging(self) -> None:
         """Drop the reusable staging buffers (called on engine teardown / idle).
 
@@ -447,12 +503,21 @@ class InputProcessor:
         """Pad 1-D waveforms into one ``(B, T_max)`` device tensor, zero-padded
         and ``audio_scale``-scaled — with the GPU doing the heavy lifting.
 
-        On CUDA the CPU does a single copy (packing the waveforms end-to-end
-        into a reused **pinned** host buffer); one async H2D ships them over,
-        then the GPU zeroes a reused ``(B, T_max)`` buffer (the padding),
-        scatters each waveform into its row, and multiplies by ``audio_scale``
-        *after* padding.  This keeps the per-batch ``cudaHostAlloc`` and the
-        ``zero(B*T_max)`` off the CPU.
+        Two paths, chosen by where the waveforms already live:
+
+        * **Already page-locked** (the caller took them from
+          :meth:`new_audio_buffer`) — each row is DMA'd straight into its slice
+          of the padded device batch.  No CPU copy at all: the pack this class
+          used to do was the *second* copy of the audio after the codec, and
+          removing it measures **1.12-1.18x** end-to-end offline.
+        * **Anything else** — the CPU packs the waveforms end-to-end into a
+          reused pinned buffer, one async H2D ships them over, and the GPU
+          scatters each into its row.  Copying once into staging beats B
+          separate copies out of pageable memory, each of which would
+          synchronise the stream before staging itself.
+
+        Both zero the pad region and apply ``audio_scale`` on the GPU, *after*
+        padding, so the two agree bit-for-bit.
         """
         scale = self._config.audio_scale
         wav_sizes = [w.size(0) for w in waveforms]
@@ -464,6 +529,22 @@ class InputProcessor:
                 if n:
                     padded[i, :n] = w
             return padded.mul_(scale) if scale != 1.0 else padded
+
+        # All-or-nothing rather than per row: a mixed batch would pay the pack
+        # for the unpinned rows *and* B extra launches for the pinned ones, and
+        # in practice a process is fed by one producer — the front-end, which
+        # pins, or an in-process caller, which does not.  ``is_pinned`` is a
+        # driver query (~0.7 us), so this costs ~45 us at B=64 against the ~4 ms
+        # of packing it decides about.
+        if all(w.is_pinned() for w in waveforms):
+            padded = self._padded_device(batch, t_max)
+            padded.zero_()  # GPU zero-padding
+            for i, (w, n) in enumerate(zip(waveforms, wav_sizes)):
+                if n:
+                    padded[i, :n].copy_(w, non_blocking=True)  # async H2D, no pack
+            if scale != 1.0:
+                padded.mul_(scale)
+            return padded
 
         flat = self._flat_host(sum(wav_sizes))  # pinned; sole CPU-side copy
         off = 0
