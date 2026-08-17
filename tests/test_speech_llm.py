@@ -1139,6 +1139,7 @@ class TestStepGraphs:
         state["kv"].free()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 class TestDecoderCacheIsKernelSafe:
     """The capacity-preallocated KV cache is handed to the attention kernel
     *whole* (buffer + length), which is what lets it skip a per-layer copy of a
