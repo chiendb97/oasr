@@ -28,6 +28,7 @@ from typing import List, Tuple
 import torch
 
 from oasr.cache.types import CacheConfig
+from oasr.utils.staging import to_device
 
 
 class BlockPool:
@@ -177,7 +178,7 @@ class BlockPool:
         """
         if not block_ids:
             return
-        idx = torch.tensor(block_ids, dtype=torch.long, device=self._k_pool.device)
+        idx = to_device(block_ids, dtype=torch.long, device=self._k_pool.device)
         zeros = torch.zeros(
             self._config.num_layers,
             len(block_ids),
@@ -263,7 +264,7 @@ class BlockPool:
             )
             return empty, empty.clone()
 
-        idx = torch.tensor(block_ids, dtype=torch.long, device=self._k_pool.device)
+        idx = to_device(block_ids, dtype=torch.long, device=self._k_pool.device)
         n, bsf = len(block_ids), cfg.block_size_frames
         k = torch.index_select(self._k_pool[layer], 0, idx).reshape(
             n * bsf, cfg.n_kv_head, cfg.head_dim

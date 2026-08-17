@@ -602,6 +602,66 @@ class TestCtcDecoderInterleaved:
 
 
 # ---------------------------------------------------------------------------
+# Overlapped (non-blocking) interim read-back
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cuda
+class TestCtcDecoderAsyncPeek:
+    """``peek_states_async`` / ``peek_states_collect`` — the read-back behind
+    ``EngineConfig.overlap_partial_readback``.
+
+    It is off by default, which is exactly why it needs a test: the launcher
+    grew an ``out_times`` argument for word timings and this call site kept its
+    old 11-argument shape, so every stream under the overlapped read-back died
+    with a ``TypeError`` and finalised with an empty transcript — a
+    default-off path failing silently in the one mode that selects it.
+    """
+
+    def test_async_peek_matches_blocking_peek(self, device):
+        """The overlapped read-back returns the blocking one's hypotheses."""
+        V = 5
+        config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10)
+        decoder = GpuStreamingDecoder(config)
+
+        states = [decoder.create_state(batch=1, vocab_size=V, device=device) for _ in range(3)]
+        paths = [[1, 0, 2], [3, 0, 4], [2, 2, 0]]
+        for state, path in zip(states, paths):
+            decoder.decode_chunk(_make_logp_gpu(len(path), V, path, device), state=state)
+
+        blocking = decoder.peek_states(states)
+        handle = decoder.peek_states_async(states)
+        overlapped = decoder.peek_states_collect(handle)
+
+        assert len(overlapped) == len(blocking)
+        for over, block in zip(overlapped, blocking):
+            assert over.tokens == block.tokens
+        assert [r.tokens[0][0] for r in overlapped] == [[1, 2], [3, 4], [2]]
+
+    def test_async_peek_keeps_advancing_across_steps(self, device):
+        """Issue at step N, collect at step N+1 — the engine's actual cadence."""
+        V = 5
+        decoder = GpuStreamingDecoder(GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10))
+        state = decoder.create_state(batch=1, vocab_size=V, device=device)
+
+        decoder.decode_chunk(_make_logp_gpu(2, V, [1, 0], device), state=state)
+        handle = decoder.peek_states_async([state])
+        # A whole further step runs before the partial is materialised: the
+        # collected hypothesis is the *previous* step's, one chunk behind.
+        decoder.decode_chunk(_make_logp_gpu(2, V, [2, 0], device), state=state)
+        lagged = decoder.peek_states_collect(handle)
+
+        assert lagged[0].tokens[0][0] == [1]
+        assert decoder.finalize_stream(state=state).tokens[0][0] == [1, 2]
+
+    def test_async_peek_empty_set_is_none(self, device):
+        """No ready streams: no handle, no collected partials."""
+        decoder = GpuStreamingDecoder(GpuDecoderConfig(beam_size=3, max_seq_len=10))
+        assert decoder.peek_states_async([]) is None
+        assert decoder.peek_states_collect(None) == []
+
+
+# ---------------------------------------------------------------------------
 # Workspace size tests
 # ---------------------------------------------------------------------------
 

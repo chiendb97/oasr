@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 
+from oasr.utils.staging import to_device
+
 from ..request import Request
 from .base import StreamingEncoderBackend, register_streaming_backend
 
@@ -190,7 +192,7 @@ class StatefulStreamingBackend(StreamingEncoderBackend):
         end = req.feature_cursor + min(window, available)
         chunk = req.feature_buffer[req.feature_cursor : end].unsqueeze(0)  # (1, T, F)
         chunk = chunk.to(device=self._device, dtype=self._dtype)
-        lens = torch.tensor([chunk.size(1)], dtype=torch.int32, device=self._device)
+        lens = to_device([chunk.size(1)], dtype=torch.int32, device=self._device)
 
         sid = req.stream_id
         out, _out_lens, new_states = self._chunk_forward(chunk, lens, self._states[sid])

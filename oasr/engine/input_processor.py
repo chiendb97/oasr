@@ -424,7 +424,16 @@ class InputProcessor:
         assert requests, "cannot collate empty batch"
 
         waveforms = [r.audio for r in requests]
-        wav_lengths = torch.tensor([w.size(0) for w in waveforms], dtype=torch.int64)
+        # Pinned so :meth:`_fbank_batch`'s ``non_blocking=True`` is a real async
+        # DMA.  A *pageable* source makes CUDA synchronise the stream before
+        # staging the bytes, which here means waiting out the batch's 26 MB
+        # waveform H2D and every scatter behind it — a drain in the middle of
+        # the collate, for 8 bytes per row.
+        wav_lengths = torch.tensor(
+            [w.size(0) for w in waveforms],
+            dtype=torch.int64,
+            pin_memory=(self._device.type == "cuda"),
+        )
 
         wav_device = self._padded_waveform_batch(waveforms)
         features, feat_lengths = self._fbank_batch(wav_device, wav_lengths)

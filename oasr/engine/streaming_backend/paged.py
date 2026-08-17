@@ -27,6 +27,7 @@ from oasr.cache import (
 from oasr.cache.cnn_cache import CONV_STATE, conv_state_spec
 from oasr.cache.state import SlotTensor
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
+from oasr.utils.staging import to_device
 
 from ..graph_cache import GraphedEncoderForward, round_up_bucket
 from ..request import Request
@@ -471,12 +472,12 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         nvtx_push(f"batched_paged[B={len(group)}]")
         B_active = len(group)
         stream_ids = [req.stream_id for req in group]
-        slot_ids_host = [req.slot_id for req in group]
-        assert all(
-            s is not None for s in slot_ids_host
-        ), "all batched streams must have an allocated slot_id"
+        slot_ids_host: List[int] = []
+        for req in group:
+            assert req.slot_id is not None, "all batched streams must have an allocated slot_id"
+            slot_ids_host.append(req.slot_id)
         device = self._att_mgr.block_table.device
-        slot_ids_device = torch.tensor(slot_ids_host, dtype=torch.long, device=device)
+        slot_ids_device = to_device(slot_ids_host, dtype=torch.long, device=device)
 
         # 1. Prepare per-stream write blocks — one allocator call + one
         #    scatter onto the persistent block_table.
@@ -501,7 +502,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
 
         # 3. Per-stream encoder-frame offsets (always a tensor for the
         #    graphed path; the eager fallback accepts the same tensor).
-        offsets_device = torch.tensor(
+        offsets_device = to_device(
             [req.offset for req in group],
             dtype=torch.int32,
             device=device,
@@ -618,8 +619,8 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         self._att_mgr.prepare_chunks_batched([req.stream_id])  # type: ignore[arg-type]
 
         device = self._att_mgr.block_table.device
-        slot_ids_device = torch.tensor([req.slot_id], dtype=torch.long, device=device)
-        offsets_device = torch.tensor([req.offset], dtype=torch.int32, device=device)
+        slot_ids_device = to_device([req.slot_id], dtype=torch.long, device=device)
+        offsets_device = to_device([req.offset], dtype=torch.int32, device=device)
         states = self._state_mgr.views(slot_ids_device)
         cnn_cache = states[CONV_STATE]
 

@@ -38,6 +38,7 @@ from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.slot_cnn import SlotCnnCache
 from oasr.cache.state import SlotStateCache, SlotTensor
 from oasr.ctc_decode import GpuStreamingDecoder, StreamHandle, StreamState
+from oasr.utils.staging import to_device
 
 
 class StreamContext:
@@ -125,7 +126,7 @@ class StreamContext:
         """
         slot = self._cnn_cache.slot_of(self._stream_id)
         device = self._cnn_cache.buffer_of(self._cnn_cache.names[0]).device
-        slot_ids = torch.tensor([slot], dtype=torch.long, device=device)
+        slot_ids = to_device([slot], dtype=torch.long, device=device)
         return self._cnn_cache.views(slot_ids)
 
     def get_decoder(self) -> Union[GpuStreamingDecoder, StreamHandle]:

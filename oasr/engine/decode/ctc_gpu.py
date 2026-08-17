@@ -224,18 +224,22 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
             ordered_states.extend(states)
         nvtx_pop()  # decode_advance
 
-        # Interim-partial cadence.  Reading the beam buffer back to the host is
-        # a blocking ``cudaStreamSynchronize`` that, profiled, costs about as
-        # much as the decode compute itself — and it drains the GPU before the
-        # next step's encoder can be dispatched.  We *overlap* it: each emit
-        # step issues a **non-blocking** batched read-back (``peek_states_async``)
-        # for the current ready set, and emits the partials collected from the
-        # **previous** emit step's handle (whose copy completed during the
-        # intervening step).  Partials therefore lag exactly one emit step
-        # (~one chunk), which the interactive contract allows; the final
-        # transcript still comes from the blocking ``finalize``.
-        # ``partial_decode_interval <= 0`` skips interim partials entirely
-        # (decode state still advances; only the read-back is skipped).
+        # Interim-partial cadence.  Reading the beam buffer back to the host is a
+        # blocking ``cudaStreamSynchronize`` that drains the GPU before the next
+        # step's encoder can be dispatched: emitting every step costs **~15% of
+        # streaming wall** against emitting none (pool 32, 640 ms chunks —
+        # `.artifacts/engine_perf.md` §10.4).  Two knobs trade that against the
+        # cadence.  ``partial_decode_interval <= 0`` skips interim partials
+        # entirely (decode state still advances; only the read-back is skipped),
+        # and ``N > 1`` emits every N-th step.
+        #
+        # ``overlap_partial_readback`` instead keeps the cadence and moves the
+        # sync off the critical path: each emit step issues a **non-blocking**
+        # batched read-back (``peek_states_async``) for the current ready set and
+        # emits the partials collected from the **previous** emit step's handle
+        # (whose copy completed during the intervening step).  Partials then lag
+        # exactly one emit step (~one chunk); the final transcript still comes
+        # from the blocking ``finalize``.
         interval = getattr(self._config, "partial_decode_interval", 1)
         if interval < 1 or (self._stream_decode_step % interval) != 0:
             return []
