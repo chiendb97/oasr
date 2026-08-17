@@ -84,17 +84,16 @@ class ArBeamGroup:
     def batch(self) -> int:
         return len(self.requests)
 
-    @property
-    def first_generation_step(self) -> bool:
-        """Whether no token has been generated yet.
+    def fresh_rows(self) -> List[int]:
+        """Flat slot rows that have not generated a token yet.
 
-        Read by the families' logit processors (Whisper's
-        ``begin_suppress_tokens`` applies only here).  A beam group cannot answer
-        this from ``tokens``: that is ``B x k`` *nested* lists, so
-        ``not tokens[0]`` is ``False`` from the very first step because
-        ``[[], [], ...]`` is a non-empty list.  ``steps`` is unambiguous.
+        A beam group cannot answer this from ``tokens``: that is ``B x k``
+        *nested* lists, so ``not tokens[0]`` is ``False`` from the very first step
+        because ``[[], [], ...]`` is a non-empty list.  ``steps`` is unambiguous —
+        and it stays unambiguous because beam groups are never merged, so every
+        slot really is at the same offset.
         """
-        return self.steps == 0
+        return list(range(self.batch * self.beam)) if self.steps == 0 else []
 
     def best(self, index: int, length_penalty: float) -> Tuple[List[int], float, bool]:
         """Best hypothesis for request ``index``: ``(tokens, score, finished)``.

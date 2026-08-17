@@ -124,10 +124,20 @@ tolerance of 0.3 absolute.
 out-of-domain for every architecture and the subset is 200 utterances. Do not
 quote them as OASR's WER.
 
-The tolerance is slack for a different GPU or torch build, not for noise: each
-rate is bit-identical across consecutive runs *and* across `max_batch_size`
-1 / 8 / 16 / 32, which also makes "batching does not change the answer" a
-measured property rather than an assumption.
+The tolerance is slack for a different GPU or torch build, not for noise: the
+offline rates are bit-identical across consecutive runs *and* across
+`max_batch_size` 1 / 8 / 16 / 32, which also makes "batching does not change the
+answer" a measured property rather than an assumption. Where that does **not**
+hold the entry says so and records the spread instead of widening the tolerance —
+see the `transducer` and `nemotron_streaming` comments.
+
+An entry may pin `decode_options`, which is the decode configuration the rate was
+measured under. The `llm` row does: for a speech-LLM the prompt is part of what
+is being asked, and a different prompt moves the WER with no defect behind it.
+That row is also the family's only end-to-end check — its decode path is the one
+with per-row KV offsets, group merging, paged KV and step CUDA graphs behind it,
+and a graph that captured the wrong thing returns a *plausible transcript*, which
+is exactly what a tensor oracle cannot see.
 
 ### Manifests ship; audio does not
 

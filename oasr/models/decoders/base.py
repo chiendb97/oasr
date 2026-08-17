@@ -52,6 +52,21 @@ class BaseDecoder(nn.Module, ABC):
 
     decode_type: DecodeType = "transducer"
 
+    #: Whether :meth:`prefill` accepts a ``kv_manager`` and will page its
+    #: self-attention KV out of that pool instead of a dense capacity buffer.
+    #: Declared rather than probed: a decoder that ignored the argument would
+    #: silently keep allocating per batch while the engine reserved a pool for it.
+    supports_paged_kv: ClassVar[bool] = False
+
+    #: Whether one :meth:`step` can be recorded into a CUDA graph — i.e. whether
+    #: **every** tensor it reads either lives at a process-stable address (a
+    #: paged KV pool) or is small enough to be copied into a static buffer per
+    #: step.  A decoder carrying a per-group side cache (an AED's
+    #: cross-attention K/V) does not qualify: the graph would bake in a pointer
+    #: to the batch it was captured on and answer every later batch with a
+    #: plausible transcript of that one.  Declared, never inferred.
+    supports_step_graphs: ClassVar[bool] = False
+
     @abstractmethod
     def init_state(
         self,

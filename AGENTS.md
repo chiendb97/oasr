@@ -220,6 +220,8 @@ extension cookbook for each axis.
 | `oasr/engine/streaming_backend/` | `PagedStreamingBackend`, `StatefulStreamingBackend` |
 | `oasr/engine/graph_cache.py` | CUDA-graph capture of the steady-state streaming encoder |
 | `oasr/engine/memory.py` | VRAM-aware capacity derivation (paged pool, AR decoder KV) |
+| `oasr/engine/decoder_graph.py` | CUDA-graph capture of one AR decoder step (needs paged decoder KV) |
+| `oasr/cache/decoder_state.py` | Per-row decoder KV — dense capacity buffers and paged — that both AR decoder surfaces thread |
 | `oasr/models/base.py` | `BaseAsrModel` / `BaseEncoder` / `CacheSpec` / `LoadReport` |
 | `oasr/models/interfaces.py` | `CAPABILITIES` — what each decode family requires of a model |
 | `oasr/models/registry.py` | `register_model`, `build_model_from_checkpoint`, entry-point discovery |
@@ -291,6 +293,12 @@ extension cookbook for each axis.
 - **Reusing a CUDA-graph replay buffer's output.** One buffer per shape key: a
   returned tensor is live only until the next replay *or capture*. Copy when a
   step can hit the same key twice.
+- **Retrying a CUDA-graph capture that already failed.** A capture costs a
+  warm-up forward before it records anything, so a shape that raised once pays
+  that on *every* step of that shape and then runs eager regardless — strictly
+  worse than never having tried. Remember the failed shape; treat an
+  out-of-memory as a fact about the process and stop capturing altogether
+  (`DecoderStepGraphCache`).
 - **Declaring `streaming_kind` from what the class implements** rather than from
   what *this config's weights* can do. Over-claiming builds an engine that raises
   on its first request instead of failing at construction. Same for
@@ -322,6 +330,17 @@ extension cookbook for each axis.
   width `max_seq_len`, and a stream decodes more frames than its output-token
   cap, so the value wraps. Use the device-resident absolute counter
   (`device_frame_idx_ptr`); offline may read the ring, where step == frame.
+- **A paged block table whose width is not a whole number of K tiles.** The
+  fused kernel's paged loader walks `N_BLOCK // block_size` pages per K tile and
+  indexes them *unpredicated*, so a short table has its last tile read past the
+  tensor and dereference whatever followed it as a page id. Squared up in
+  `oasr.attention.fmha` now; it only bites when a page is smaller than a K tile,
+  which is why chunk-sized encoder pages never showed it and 16-token decoder
+  ones did immediately.
+- **A shared scalar generation offset in an AR decoder.** It is why two decode
+  groups could not be merged, and merging is worth ~1.5× on trickle arrivals.
+  Both surfaces index their KV per row (`oasr/cache/decoder_state.py`); a
+  new AR family should too.
 - **Adding a field to the paged region without updating both allocators.**
   `init_paged_state` and `setup_internal_data_paged_pointers` are two bump
   allocations over the *same* bytes: a field missing from the second does not

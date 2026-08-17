@@ -122,7 +122,16 @@ class AedDecodeStrategy(IncrementalArStrategy):
             prompt_ids = torch.tensor(rows, dtype=torch.long, device=device)
         max_new = [self._row_cap(r, self._cap) for r in requests]
         with torch.no_grad():
-            logits, state = self._decoder().prefill(enc_out, prompt_ids)
+            # capacity → the decoder preallocates its KV buffers and every step
+            # writes its own row's slot in place.  It is also what makes the
+            # state mergeable: a cat-grown cache has no room to hold rows at
+            # different offsets.
+            logits, state = self._decoder().prefill(
+                enc_out,
+                prompt_ids,
+                capacity=prompt_ids.size(1) + max(max_new) + 1,
+                kv_manager=self.kv_manager(),
+            )
         return Prefill(state=state, logits=logits, max_new=max_new)
 
     def _prompt_for(self, request: Request) -> List[int]:
@@ -185,24 +194,31 @@ class AedDecodeStrategy(IncrementalArStrategy):
     def _process_logits(self, logits: torch.Tensor, group: ArGroup) -> torch.Tensor:
         """Apply Whisper's suppress lists.
 
-        ``begin_suppress_tokens`` applies only to the first generated position.
-        The group answers that via ``first_generation_step`` rather than this
-        method inspecting ``group.tokens`` — a beam group's ``tokens`` is ``B x k``
-        *nested* lists, so ``not tokens[0]`` would be ``False`` from step one and
-        the begin-suppress list would never be applied.
+        ``begin_suppress_tokens`` applies only to a row's *first* generated
+        position, which the group answers per row (``fresh_rows``) rather than
+        per group: a merged group holds rows prefilled this tick next to rows
+        forty steps in, and a beam group's ``tokens`` is ``B x k`` *nested* lists
+        where ``not tokens[0]`` would be ``False`` from step one.
 
-        Out-of-place (``index_fill``) because ``logits`` may alias
+        Out-of-place (``index_fill`` / ``index_put``) because ``logits`` may alias
         ``group.last_logits``.
         """
         if self._suppress:
             logits = logits.index_fill(
                 1, self._ids(self._suppress_idx, self._suppress, logits), -torch.inf
             )
-        if group.first_generation_step and self._begin_suppress:
-            logits = logits.index_fill(
-                1, self._ids(self._begin_suppress_idx, self._begin_suppress, logits), -torch.inf
-            )
-        return logits
+        if not self._begin_suppress:
+            return logits
+        rows = group.fresh_rows()
+        if not rows:
+            return logits
+        ids = self._ids(self._begin_suppress_idx, self._begin_suppress, logits)
+        if len(rows) == logits.size(0):
+            return logits.index_fill(1, ids, -torch.inf)
+        row_idx = torch.tensor(rows, dtype=torch.long, device=logits.device)
+        out = logits.clone()
+        out[row_idx.unsqueeze(1), ids.unsqueeze(0)] = -torch.inf
+        return out
 
     @staticmethod
     def _ids(

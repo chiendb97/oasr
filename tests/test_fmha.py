@@ -211,6 +211,15 @@ _PAGED_SHAPES = [
     (3, 8, 2, 16, 8, 64, 16),  # GQA, multi-stream, longer kv
     (1, 4, 4, 8, 8, 64, 32),  # different block_size
     (2, 8, 1, 8, 4, 64, 16),  # MQA
+    # Block tables whose width is *not* a whole number of K tiles.  A paged K
+    # tile spans ``N_BLOCK // block_size`` pages and the loader indexes them
+    # unpredicated, so the last tile of a 3-wide table (4 pages per tile) reads
+    # past the tensor and dereferences whatever followed it as a page id.  Every
+    # shape above happens to divide evenly, which is why this went unseen until
+    # AR decode paged its KV 16 tokens to a page.
+    (2, 4, 4, 8, 3, 64, 16),  # 3 pages, 4 per tile
+    (2, 4, 4, 1, 1, 64, 16),  # a decode step: one query, one page
+    (1, 4, 4, 8, 5, 64, 32),  # 5 pages, 2 per tile
 ]
 
 
@@ -736,7 +745,7 @@ class TestPerRowKeyStart:
         serves both.  Not a combination anything in-tree uses today — paged
         streaming history grows rightward — but the claim is cheap to pin, and
         an untested one in a kernel is how it stops being true."""
-        from oasr.attention import _gather_paged_kv, _sdpa_reference, fmha
+        from oasr.attention import _sdpa_reference, fmha, gather_paged_kv
 
         torch.manual_seed(5)
         B, H, D, block, nblk = 2, 4, 64, 16, 8
@@ -758,7 +767,7 @@ class TestPerRowKeyStart:
             cache_seqstarts=st,
             block_table=bt,
         )
-        k_dense, v_dense = _gather_paged_kv(k_pool, v_pool, bt)
+        k_dense, v_dense = gather_paged_kv(k_pool, v_pool, bt)
         ref = _sdpa_reference(q, k_dense, v_dense, scale, None, ln, False, st)
         assert torch.isfinite(out).all()
         finite = torch.isfinite(ref)

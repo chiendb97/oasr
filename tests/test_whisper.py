@@ -6,6 +6,8 @@ use the real ``openai/whisper-tiny`` snapshot at ``WHISPER_CKPT`` and skip
 when it is absent.
 """
 
+from dataclasses import replace
+
 import assets
 import pytest
 import torch
@@ -155,6 +157,195 @@ class TestDecoderIncremental:
             logits_solo, _ = model.decoder.step(seq[2, -1:], solo)
         assert torch.allclose(logits1, logits_solo, atol=1e-4)
 
+    def test_capacity_prefill_matches_cat_growth(self):
+        """Preallocating the KV must be logit-identical to growing it."""
+        cfg = _tiny_config()
+        torch.manual_seed(7)
+        model = WhisperModel(cfg).eval()
+        enc = torch.randn(2, cfg.max_source_positions, cfg.d_model)
+        seq = torch.randint(3, 59, (2, 9))
+
+        def run(capacity):
+            with torch.no_grad():
+                logits, state = model.decoder.prefill(enc, seq[:, :4], capacity=capacity)
+                out = [logits.clone()]
+                for t in range(4, 9):
+                    logits, state = model.decoder.step(seq[:, t], state)
+                    out.append(logits.clone())
+            return out
+
+        for grown, prealloc in zip(run(None), run(20)):
+            torch.testing.assert_close(grown, prealloc)
+
+
+class TestDecoderMerge:
+    """Two groups at *different* generation offsets sharing one forward.
+
+    This is what per-row KV offsets buy: the merged arm feeds exactly the same
+    tokens as two separate arms and must produce exactly the same logits, even
+    though row 0 is five tokens in and row 2 is two.
+    """
+
+    @staticmethod
+    def _model_and_inputs(seed=11):
+        cfg = _tiny_config()
+        torch.manual_seed(seed)
+        model = WhisperModel(cfg).eval()
+        enc = torch.randn(3, cfg.max_source_positions, cfg.d_model)
+        prompt = torch.randint(3, 59, (3, 3))
+        feed = torch.randint(3, 59, (3, 9))  # teacher-forced, identical per arm
+        return model, enc, prompt, feed
+
+    def _arms(self, model, enc, prompt, feed, pre_a, pre_b, post):
+        """``(separate, merged)`` logit sequences over the last ``post`` steps."""
+        dec = model.decoder
+
+        def prefilled(rows, pre):
+            logits, state = dec.prefill(enc[rows], prompt[rows], capacity=24)
+            for t in range(pre):
+                logits, state = dec.step(feed[rows, t], state)
+            return logits, state
+
+        with torch.no_grad():
+            (la, sa), (lb, sb) = prefilled([0, 1], pre_a), prefilled([2], pre_b)
+            separate = []
+            for t in range(post):
+                la, sa = dec.step(feed[[0, 1], pre_a + t], sa)
+                lb, sb = dec.step(feed[[2], pre_b + t], sb)
+                separate.append(torch.cat([la, lb], dim=0))
+
+            (_la, sa), (_lb, sb) = prefilled([0, 1], pre_a), prefilled([2], pre_b)
+            assert dec.can_merge(sa, sb)
+            state = dec.merge(sa, sb)
+            merged = []
+            for t in range(post):
+                toks = torch.cat([feed[[0, 1], pre_a + t], feed[[2], pre_b + t]])
+                logits, state = dec.step(toks, state)
+                merged.append(logits)
+        return separate, merged
+
+    def test_merged_rows_at_different_offsets_match_separate(self):
+        model, enc, prompt, feed = self._model_and_inputs()
+        separate, merged = self._arms(model, enc, prompt, feed, pre_a=5, pre_b=2, post=3)
+        for want, got in zip(separate, merged):
+            torch.testing.assert_close(want, got, atol=1e-5, rtol=1e-4)
+
+    def test_merged_rows_at_the_same_offset_match_separate(self):
+        model, enc, prompt, feed = self._model_and_inputs(seed=12)
+        separate, merged = self._arms(model, enc, prompt, feed, pre_a=4, pre_b=4, post=4)
+        for want, got in zip(separate, merged):
+            torch.testing.assert_close(want, got, atol=1e-5, rtol=1e-4)
+
+    def test_select_after_merge_keeps_each_rows_offset(self):
+        """Retiring the *long* row must leave the short one at its own offset."""
+        model, enc, prompt, feed = self._model_and_inputs(seed=13)
+        dec = model.decoder
+
+        def short_row_state():
+            logits, state = dec.prefill(enc[[2]], prompt[[2]], capacity=24)
+            for t in range(2):
+                logits, state = dec.step(feed[[2], t], state)
+            return state
+
+        with torch.no_grad():
+            _, sa = dec.prefill(enc[[0, 1]], prompt[[0, 1]], capacity=24)
+            for t in range(5):
+                _, sa = dec.step(feed[[0, 1], t], sa)
+            # ``merge`` consumes both operands, so the reference runs first.
+            want, _ = dec.step(feed[[2], 2], short_row_state())
+            merged = dec.merge(sa, short_row_state())
+            merged = dec.select(merged, torch.tensor([2]))  # keep only the short row
+            assert merged["kv"].lens_host == [prompt.size(1) + 2]
+            got, _ = dec.step(feed[[2], 2], merged)
+        torch.testing.assert_close(want, got, atol=1e-5, rtol=1e-4)
+
+    def test_a_consumed_state_says_so(self):
+        """``merge`` releases both operands' tensors into the merged cache; using
+        one afterwards must name that, not surface as a ``None`` key downstream."""
+        model, enc, prompt, feed = self._model_and_inputs(seed=16)
+        dec = model.decoder
+        with torch.no_grad():
+            _, sa = dec.prefill(enc[[0]], prompt[[0]], capacity=24)
+            _, sb = dec.prefill(enc[[1]], prompt[[1]], capacity=24)
+            dec.merge(sa, sb)
+            with pytest.raises(RuntimeError, match="consumed by merge"):
+                dec.step(feed[[0], 0], sa)
+
+    def test_a_cat_grown_state_declares_itself_unmergeable(self):
+        """Without a capacity buffer there is no room for a second offset, so the
+        surface refuses rather than producing a silently wrong cache."""
+        model, enc, prompt, _feed = self._model_and_inputs(seed=14)
+        with torch.no_grad():
+            _, grown = model.decoder.prefill(enc[[0]], prompt[[0]])
+            _, sized = model.decoder.prefill(enc[[1]], prompt[[1]], capacity=24)
+        assert not model.decoder.can_merge(grown, sized)
+
+    @pytest.mark.cuda
+    @pytest.mark.parametrize("block_tokens", [8, 16, 64])
+    def test_paged_storage_matches_dense(self, block_tokens):
+        """Paging the self-attention KV must not change a single logit.
+
+        On CUDA in a **served** dtype, because that is the only way the paged
+        attention kernel is reached at all: fp32 and CPU route to SDPA, where a
+        launcher precondition — the block table's width against the kernel's K
+        tile, say — is never tested.  Several page sizes because the kernel walks
+        ``N_BLOCK // block_size`` pages per tile, so the page size is what decides
+        how many of them one tile spans.
+        """
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        from oasr.cache.decoder_kv import DecoderKVCacheManager
+
+        cfg = _tiny_config(d_model=128, decoder_attention_heads=2, max_target_positions=64)
+        torch.manual_seed(21)
+        model = WhisperModel(cfg).eval().cuda().to(torch.float16)
+        dec = model.decoder
+        B, P, steps, cap = 2, 3, 12, 24
+        enc = torch.randn(
+            B, cfg.max_source_positions, cfg.d_model, device="cuda", dtype=torch.float16
+        )
+        prompt = torch.randint(3, 59, (B, P), device="cuda")
+        feed = torch.randint(3, 59, (B, steps), device="cuda")
+        mgr = DecoderKVCacheManager(
+            DecoderKVCacheManager.build_pool(
+                num_layers=cfg.decoder_layers,
+                n_kv_head=cfg.decoder_attention_heads,
+                head_dim=cfg.d_model // cfg.decoder_attention_heads,
+                block_tokens=block_tokens,
+                max_num_blocks=64,
+                device=torch.device("cuda"),
+                dtype=torch.float16,
+            )
+        )
+
+        def run(manager):
+            with torch.no_grad():
+                logits, state = dec.prefill(enc, prompt, capacity=cap, kv_manager=manager)
+                out = [logits.float().cpu()]
+                for t in range(steps):
+                    logits, state = dec.step(feed[:, t], state)
+                    out.append(logits.float().cpu())
+            return out
+
+        for dense, paged in zip(run(None), run(mgr)):
+            torch.testing.assert_close(dense, paged, atol=0, rtol=0)
+
+    def test_a_different_encoder_window_declares_itself_unmergeable(self):
+        """Whisper reads cross-attention unmasked over the whole window, so two
+        groups whose windows differ cannot share a forward."""
+        cfg = _tiny_config()
+        torch.manual_seed(15)
+        model = WhisperModel(cfg).eval()
+        prompt = torch.randint(3, 59, (1, 3))
+        with torch.no_grad():
+            _, wide = model.decoder.prefill(
+                torch.randn(1, cfg.max_source_positions, cfg.d_model), prompt, capacity=24
+            )
+            _, narrow = model.decoder.prefill(
+                torch.randn(1, cfg.max_source_positions // 2, cfg.d_model), prompt, capacity=24
+            )
+        assert not model.decoder.can_merge(wide, narrow)
+
 
 # ---------------------------------------------------------------------------
 # Per-request task / language (H5)
@@ -297,6 +488,104 @@ class TestTaskAndLanguagePrompt:
         # Two rows prefilled together despite different prompts — the point of
         # keeping the substitution length-preserving.
         assert prefill.logits.size(0) == 2
+
+    @staticmethod
+    def _paged_strategy():
+        strat = TestTaskAndLanguagePrompt._strategy()
+        strat.options = replace(strat.options, kv_storage="paged")
+        return strat
+
+    def test_greedy_pages_its_kv_and_beam_does_not(self):
+        """Storage is chosen, not configured per call.
+
+        Beam search expands and reorders its grid with repeated ``select``
+        indices, which a paged row cannot serve — its pages are its own — so the
+        strategy keeps beam on dense storage rather than the decoder discovering
+        it mid-search.
+        """
+        beam = self._paged_strategy()
+        beam.options = replace(beam.options, beam_size=4)
+        assert self._paged_strategy().kv_manager() is not None
+        assert beam.kv_manager() is None
+
+    def test_kv_storage_auto_keeps_an_aed_dense(self):
+        """``auto`` pages for the sake of step graphs, and an AED has none.
+
+        Paging on its own is a cost, not a win: the block-table indirection is
+        3-9% and, while admission reserves each row's ceiling, it saves no VRAM.
+        What pays for it is capturing the step, which a Whisper decoder cannot —
+        its cross-attention K/V is allocated per prefill, so
+        ``supports_step_graphs`` is False and ``auto`` must land on dense.  A
+        family that resolved to paged anyway would pay the indirection for
+        nothing.
+        """
+        strat = self._strategy()
+        assert strat.options.kv_storage == "auto"
+        # The declaration is the reason, so assert it rather than only the
+        # outcome: on CPU `auto` would land on dense anyway, and a test that
+        # cannot tell the two apart would keep passing if the declaration flipped.
+        assert not strat._decoder().supports_step_graphs
+        assert strat._resolve_storage(strat._decoder()) == "dense"
+        assert strat.kv_manager() is None
+        forced = self._strategy()
+        forced.options = replace(forced.options, step_graphs=True)
+        assert forced._resolve_storage(forced._decoder()) == "dense"
+
+    def test_finished_rows_hand_their_pages_back(self):
+        """Every page a batch took must be free again once it finishes — the
+        engine runs for days and the pool does not evict."""
+        from oasr.engine.generation import StepBudget
+        from oasr.engine.request import Request
+
+        strat = self._paged_strategy()
+        mgr = strat.kv_manager()
+        free0 = mgr.pool.num_free_blocks
+        cfg = strat._mcfg
+        requests = [Request(audio=torch.zeros(16000), streaming=False) for _ in range(3)]
+        enc = torch.randn(3, cfg.max_source_positions, cfg.d_model)
+        strat.begin_offline(requests, enc, torch.tensor([enc.size(1)] * 3))
+        assert mgr.pool.num_free_blocks < free0
+        for _ in range(200):
+            strat.advance(StepBudget(max_steps=8))
+            if not strat.has_pending():
+                break
+        assert not strat.has_pending()
+        assert mgr.pool.num_free_blocks == free0 and mgr.num_active() == 0
+
+    def test_aborting_the_last_row_hands_its_pages_back(self):
+        from oasr.engine.request import Request
+
+        strat = self._paged_strategy()
+        mgr = strat.kv_manager()
+        free0 = mgr.pool.num_free_blocks
+        cfg = strat._mcfg
+        request = Request(audio=torch.zeros(16000), streaming=False)
+        enc = torch.randn(1, cfg.max_source_positions, cfg.d_model)
+        strat.begin_offline([request], enc, torch.tensor([enc.size(1)]))
+        strat.free_session(request)
+        assert mgr.pool.num_free_blocks == free0 and mgr.num_active() == 0
+
+    def test_begin_suppress_is_per_row_in_a_merged_group(self):
+        """``begin_suppress_tokens`` applies at each row's *first* generated
+        position.  A merged group holds rows prefilled this tick next to rows
+        already generating, so a group-wide answer is wrong for one half either
+        way — it would either suppress nothing for the newcomers or re-suppress
+        for the incumbents."""
+        from oasr.engine.decode.incremental import ArGroup
+
+        strat = self._strategy(_tiny_config())  # suppress [0, 1], begin-suppress [2]
+        group = ArGroup(
+            requests=[object(), object()],
+            state={},
+            last_logits=torch.zeros(2, 8),
+            max_new=[5, 5],
+            opts=[None, None],
+            tokens=[[7], []],  # row 0 is generating, row 1 was just prefilled
+        )
+        out = strat._process_logits(torch.zeros(2, 8), group)
+        assert out[:, 0].tolist() == [-torch.inf, -torch.inf]  # always suppressed
+        assert out[0, 2].item() == 0.0  # incumbent: begin-suppress does not apply
+        assert out[1, 2].item() == -torch.inf  # newcomer: it does
 
 
 # ---------------------------------------------------------------------------

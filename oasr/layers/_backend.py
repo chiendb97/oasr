@@ -180,6 +180,23 @@ KERNEL_GAPS: Dict[str, KernelGap] = {
                 "in-tree model reaches the remaining limit"
             ),
         ),
+        KernelGap(
+            id="fmha-paged-config",
+            what=(
+                "a paged attention config the arch class refuses: a head_dim off "
+                "the paged loader's 32-element MMA k-stride (it skips per-element "
+                "head-dim predication), or a page size no K tile is a multiple of"
+            ),
+            fix=(
+                "kernel: predicate the paged loader's head-dim reads, which is "
+                "what the dense path already does, and allow a page size that "
+                "does not divide n_block by walking a partial page. Reached only "
+                "by tiny test configs today — every shipped decoder's head_dim is "
+                "64 or 128 and the pool's page size is a power of two — so the "
+                "fallback here is a gather plus SDPA, correct but a full copy of "
+                "the pages the paged path exists to avoid"
+            ),
+        ),
     )
 }
 

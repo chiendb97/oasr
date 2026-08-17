@@ -419,6 +419,21 @@ decision:
 `StreamSlotPool` is the shared *addressing* primitive for both: the paged
 manager's `block_table` and `cache_seqlens` rows are slot-indexed too.
 
+The **decoder** K/V of the autoregressive families is the second growing kind, on
+its own pool with its own policy: it grows one token per step and never evicts,
+so `DecoderKVCacheManager` allocates a page as a row crosses a boundary and frees
+the whole row when the request finishes. Two consequences follow from having no
+eviction. Admission must reserve each row's declared ceiling
+(`can_admit`) — a pool that can run out mid-generation fails a request that is
+already half-answered, where refusing at admission is one rejected batch with a
+reason. And a row's pages are its own, so the repeated-index `select` that
+expands a beam grid would alias two slots onto one page;
+`PagedDecoderKv.select` refuses, and beam search runs on dense per-group buffers
+instead. This pool is what `kv_storage="auto"` (the default) selects for a
+decoder that captures its steps — a graph needs addresses that outlive a batch,
+and a per-group capacity buffer moves with every prefill. See
+[decoding.md](decoding.md#decoder-kv-storage).
+
 ### 10.1 Adding a fixed-extent cache — declare it
 
 `CnnCacheManager` is the single-spec instance of `SlotStateCache`. To add more,

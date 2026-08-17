@@ -9,30 +9,33 @@ bookkeeping, the budget loop, per-row finalisation, abort, and the four one-shot
 streaming surfaces they cannot serve.  That "everything else" is here, so a third
 AR family is a handful of hooks rather than another 250-line copy.
 
-**Batching model, and why groups are not merged.** Each encoded micro-batch
-becomes one :class:`ArGroup` that generates together, and
+**Batching model, and why groups merge.** Each encoded micro-batch becomes one
+:class:`ArGroup` that generates together, and
 :meth:`IncrementalArStrategy.advance` round-robins one batched decoder step across
 groups until the tick budget is spent.
 
-Groups are **never merged**, and that costs real throughput: an AR decoder step is
-weight-read bound, so its cost barely depends on how many rows it carries.  Total
-decoder forwards is the *sum over groups* of each group's step count, so two
-groups cost roughly twice one group with the same total rows.  Measured on
-Qwen2-Audio-7B (4 utterances, 124 tokens): 922 ms when they arrive together
-(one group) vs 1614 ms one-per-tick (two groups) — identical work.
+Separate groups cost real throughput: an AR decoder step is weight-read bound, so
+its cost barely depends on how many rows it carries.  Total decoder forwards is
+the *sum over groups* of each group's step count, so two groups cost roughly twice
+one group with the same total rows.  Measured on Qwen2-Audio-7B (4 utterances,
+124 tokens): 922 ms when they arrive together (one group) vs 1614 ms one-per-tick
+(two groups) — identical work.
 
-Merging is not currently expressible.  Both decoder surfaces track the generation
-offset as a **shared scalar** — ``WhisperDecoder`` keeps ``state["pos"]`` as an
-``int`` used for both the position embedding and the KV write offset, and
-``Qwen2Lm`` writes new KV at ``state["len"]`` into a shared-``cap`` buffer — so
-rows sitting at different offsets cannot share a forward.  Merging needs per-row
-KV offsets plus padding to a common width, which is the same prerequisite paged
-decoder KV needs (and that is blocked on the CuteDSL FMHA masked-tile fix).
+So a freshly prefilled group is **absorbed** into one already generating
+(:meth:`IncrementalArStrategy._absorb`) whenever the decoder surface can join the
+two states.  What used to make that impossible was a *shared scalar* generation
+offset on both decoder surfaces; both now index their KV per row
+(:class:`~oasr.cache.decoder_state.DecoderKv`), so rows sitting at different
+offsets share a forward and the arrival pattern stops mattering.  A decoder
+without ``merge`` / ``can_merge``, a beam group (its per-request slot grid and
+step counter are lockstep by construction), and a cache grown by ``torch.cat``
+rather than into a capacity buffer all keep the old one-group-per-batch
+behaviour — declared by :meth:`can_merge` returning ``False`` rather than by a
+merge that silently produces a wrong cache.
 
-Until then the lever is admission, not merging: ``EngineConfig.decode_admit_window_ms``
-holds a thin waiting queue briefly so near-simultaneous arrivals prefill as one
-wide group instead of several narrow ones (see
-:meth:`oasr.engine.executor.offline.OfflineExecutor._batch_wide_enough`).
+``EngineConfig.decode_admit_window_ms`` remains as a *latency* knob — holding
+arrivals still saves the merge itself and one prefill — but it is no longer the
+only lever, and its default of ``0`` no longer costs throughput.
 """
 
 from __future__ import annotations
@@ -60,6 +63,7 @@ from .incremental_beam import (
 from .options import option
 
 if TYPE_CHECKING:
+    from oasr.cache.decoder_kv import DecoderKVCacheManager
     from oasr.models.base import BaseAsrModel
 
     from ..config import EngineConfig
@@ -67,6 +71,10 @@ if TYPE_CHECKING:
     from .detokenize import Detokenizer
 
 logger = logging.getLogger(__name__)
+
+#: Sentinel for "the KV pool has not been decided yet" — ``None`` is a real
+#: answer there (dense storage), so it cannot double as "unresolved".
+_UNSET = object()
 
 
 @dataclass(eq=False)
@@ -114,10 +122,17 @@ class ArGroup:
         if not self.align_enc:
             self.align_enc = [None] * len(self.requests)
 
-    @property
-    def first_generation_step(self) -> bool:
-        """Whether no token has been generated yet (rows advance in lockstep)."""
-        return not any(self.tokens)
+    def fresh_rows(self) -> List[int]:
+        """Rows that have not generated a token yet.
+
+        Read by the families' logit processors (Whisper's
+        ``begin_suppress_tokens`` applies only at a row's first generated
+        position).  Per row rather than per group because a merged group holds
+        rows at different offsets: rows that have been generating for 40 steps
+        sit next to rows that were prefilled this tick, and a group-wide
+        "is this the first step" answer is wrong for one half either way.
+        """
+        return [row for row, toks in enumerate(self.tokens) if not toks]
 
     def keep_rows(self, keep: List[int]) -> None:
         """Drop every row not in ``keep`` from the host-side bookkeeping."""
@@ -127,6 +142,22 @@ class ArGroup:
         self.opts = [self.opts[r] for r in keep]
         self.detok_state = [self.detok_state[r] for r in keep]
         self.align_enc = [self.align_enc[r] for r in keep]
+
+    def extend(self, other: "ArGroup", state: Dict[str, Any], logits: torch.Tensor) -> None:
+        """Absorb ``other``'s rows, given the already-joined decoder state.
+
+        The decoder owns the join (its state is opaque here); this is the
+        host-side half — every per-row list grows by ``other``'s rows, in the same
+        order the decoder concatenated them.
+        """
+        self.requests = self.requests + other.requests
+        self.tokens = self.tokens + other.tokens
+        self.max_new = self.max_new + other.max_new
+        self.opts = self.opts + other.opts
+        self.detok_state = self.detok_state + other.detok_state
+        self.align_enc = self.align_enc + other.align_enc
+        self.state = state
+        self.last_logits = logits
 
 
 @dataclass
@@ -169,6 +200,75 @@ class ArOptions:
             "transcripts).  Ignored by greedy."
         ),
     )
+    merge_groups: bool = option(
+        True,
+        doc=(
+            "Absorb a freshly prefilled micro-batch into a group that is already "
+            "generating, so late arrivals do not each cost their own step "
+            "sequence (an AR step is weight-read bound: N groups cost ~N times "
+            "one group of the same total rows).  0 keeps one group per encoded "
+            "micro-batch, which is the A/B for attributing a regression to the "
+            "merge, and the escape hatch if its transient copy is unaffordable."
+        ),
+    )
+    kv_storage: str = option(
+        "auto",
+        doc=(
+            "Where the decoder's self-attention KV lives.  'dense' gives each "
+            "decode group its own capacity buffer; 'paged' allocates one "
+            "persistent block pool and gives each row a block table, so a merge "
+            "moves no K/V, a prefill allocates nothing, and decoder-step CUDA "
+            "graphs become expressible (they need addresses that outlive a "
+            "batch).  'auto' (default) pages exactly where that last point pays "
+            "for the block-table indirection: a decoder that declares "
+            "supports_step_graphs, with step_graphs on.  Paged alone costs a few "
+            "percent for the block-table indirection and buys no extra admission "
+            "capacity (each row's ceiling is reserved either way), so 'auto' does "
+            "not choose it for a family that cannot capture — even though it does "
+            "flatten the peak, since a dense select index_selects the whole "
+            "capacity buffer.  Beam search is dense regardless: "
+            "a paged row's pages are its own, and expanding a beam grid would "
+            "alias two slots onto one."
+        ),
+    )
+    kv_block_tokens: int = option(
+        16,
+        doc="Tokens per page in the paged decoder-KV pool.  Inert when kv_storage='dense'.",
+    )
+    step_graphs: bool = option(
+        True,
+        doc=(
+            "Replay decoder steps from CUDA graphs, captured per (rows, "
+            "block-table width bucket).  Needs paged decoder KV (a graph records "
+            "addresses, and only a pool's are stable), which kv_storage='auto' "
+            "selects for you, and a decoder that declares supports_step_graphs; "
+            "a family without it runs eager and is not an error.  What a graph "
+            "removes is the launch half of a weight-read-bound step, so the win "
+            "is a small-batch one: 0.65x at one row, and a wash (0.99-1.06x, "
+            "paying for the paging rather than the graphs) on a synchronous "
+            "burst of eight.  Every batch *ends* small as rows finish, and on "
+            "the 200-utterance corpus at max_batch_size 16 the pair is 0.899x "
+            "wall with p99 down 47% and transcripts byte-identical.  0 for the "
+            "A/B, or if your load really is wide synchronous bursts."
+        ),
+    )
+    step_graph_width_pages: int = option(
+        8,
+        doc=(
+            "Block-table bucket granularity for step graphs, in pages.  Larger "
+            "buckets capture fewer shapes and mask more columns per step."
+        ),
+    )
+    step_graph_max_captures: int = option(
+        64,
+        doc=(
+            "Ceiling on distinct (rows, width bucket) shapes captured.  Past it a "
+            "step runs eager rather than growing graph memory without bound, "
+            "which matters because rows are an *exact* key: a pool whose width "
+            "changes every tick can reach many shapes.  Lower it to bound graph "
+            "memory without giving up graphs entirely."
+        ),
+    )
 
     def __post_init__(self) -> None:
         if self.max_new_tokens < 1:
@@ -177,6 +277,20 @@ class ArOptions:
             raise ValueError(f"beam_size must be >= 1, got {self.beam_size!r}")
         if self.length_penalty < 0.0:
             raise ValueError(f"length_penalty must be >= 0, got {self.length_penalty!r}")
+        if self.kv_storage not in ("auto", "paged", "dense"):
+            raise ValueError(
+                f"kv_storage must be 'auto', 'paged' or 'dense', got {self.kv_storage!r}"
+            )
+        if self.kv_block_tokens < 1:
+            raise ValueError(f"kv_block_tokens must be >= 1, got {self.kv_block_tokens!r}")
+        if self.step_graph_width_pages < 1:
+            raise ValueError(
+                f"step_graph_width_pages must be >= 1, got {self.step_graph_width_pages!r}"
+            )
+        if self.step_graph_max_captures < 1:
+            raise ValueError(
+                f"step_graph_max_captures must be >= 1, got {self.step_graph_max_captures!r}"
+            )
 
 
 class IncrementalArStrategy(DecodeStrategy):
@@ -202,6 +316,12 @@ class IncrementalArStrategy(DecodeStrategy):
     ) -> None:
         super().__init__(config, detok, model)
         self._groups: List[ArGroup] = []
+        #: Paged decoder-KV pool, or ``None`` for dense storage; ``_UNSET`` until
+        #: the first prefill decides (see :meth:`kv_manager`).
+        self._kv_manager: Any = _UNSET
+        #: Decoder-step graph cache, or ``None`` when steps run eager; ``_UNSET``
+        #: until the first step decides (see :meth:`_step_graphs`).
+        self._graphs: Any = _UNSET
 
     # ------------------------------------------------------------------
     # Hooks
@@ -235,6 +355,195 @@ class IncrementalArStrategy(DecodeStrategy):
     def _decoder(self):
         """The batched incremental decoder surface (``prefill``/``step``/``select``)."""
         return getattr(self._model, "decoder", None)
+
+    # ------------------------------------------------------------------
+    # Decoder-KV storage (H11(2))
+    # ------------------------------------------------------------------
+
+    def kv_manager(self) -> Optional["DecoderKVCacheManager"]:
+        """The paged decoder-KV pool, built on first use, or ``None`` for dense.
+
+        Built lazily rather than in ``__init__`` because its size comes from
+        ``EngineConfig.decode_kv_budget_gib``, which the engine derives from free
+        VRAM *after* the strategy exists (it needs ``kv_bytes_per_row``).
+
+        ``None`` — dense storage — whenever the pool cannot serve the request
+        correctly rather than merely less well: beam search (a paged row's pages
+        are its own, so the repeated-index ``select`` that reorders a beam grid
+        would alias two slots onto one page), a decoder that has not declared
+        ``supports_paged_kv``, a model with no ``decoder_cache_spec`` to shape the
+        pool from, or the operator asking for ``kv_storage='dense'``.
+        """
+        if self._kv_manager is not _UNSET:
+            return self._kv_manager
+        self._kv_manager = self._build_kv_manager()
+        return self._kv_manager
+
+    def _resolve_storage(self, decoder: Any) -> str:
+        """``kv_storage``, with ``'auto'`` answered for this decoder.
+
+        Paging is not free — the block-table indirection costs a few percent —
+        and on its own it buys no capacity while admission reserves each row's
+        ceiling.  What it buys is *step graphs*, which need addresses that
+        outlive a batch.  So ``auto`` pages exactly where that trade closes: a
+        decoder that will capture its steps.  A family that cannot capture (an
+        AED, whose cross-attention K/V is allocated per prefill) keeps the dense
+        buffer it was already paying nothing for.
+        """
+        storage = str(getattr(self.options, "kv_storage", "auto"))
+        if storage != "auto":
+            return storage
+        if not bool(getattr(self.options, "step_graphs", False)):
+            return "dense"
+        if not getattr(decoder, "supports_step_graphs", False):
+            return "dense"
+        # A graph is a CUDA object.  Off the device there is nothing to capture,
+        # so paging would be pure indirection — and it would put every CPU test
+        # of an AR family on a path production never runs.
+        try:
+            param = next(decoder.parameters())
+        except (AttributeError, StopIteration):
+            return "dense"
+        return "paged" if param.device.type == "cuda" else "dense"
+
+    def _build_kv_manager(self) -> Optional["DecoderKVCacheManager"]:
+        decoder = self._decoder()
+        if self._resolve_storage(decoder) != "paged" or self._beam > 1:
+            return None
+        spec = getattr(self._model, "decoder_cache_spec", None)
+        if spec is None or not getattr(decoder, "supports_paged_kv", False):
+            logger.info(
+                "%s: decoder KV stays dense (%s)",
+                self.decode_type,
+                "no decoder_cache_spec" if spec is None else "decoder has no paged surface",
+            )
+            return None
+
+        from oasr.cache.decoder_kv import DecoderKVCacheManager
+
+        # The pool's dtype and device come from the decoder's own weights, not
+        # from ``EngineConfig``: the K/V written into it are that forward's
+        # output, an ``index_put_`` does not cast, and a model placed anywhere
+        # other than the configured device (every CPU test) would otherwise get a
+        # pool it cannot write to.
+        try:
+            param = next(decoder.parameters())
+        except StopIteration:  # pragma: no cover - a decoder with no weights
+            return None
+        block_tokens = int(getattr(self.options, "kv_block_tokens", 16))
+        rows = int(self._config.max_decode_slots or self._config.max_batch_size)
+        # Two ceilings, and the tighter one wins.  The first is what admission
+        # would ever hand the pool: ``max_decode_slots`` rows at their whole
+        # position budget — sizing past it would reserve VRAM no admission path
+        # can use.  The second is the byte budget H4 derives from what the card
+        # has left, which binds on a big model where the first does not fit.
+        tokens = rows * self._position_budget()
+        budget_gib = float(self._config.decode_kv_budget_gib or 0.0)
+        if budget_gib > 0:
+            per_row = self.kv_bytes_per_row()
+            if per_row:
+                per_token = per_row / max(1, self._position_budget())
+                tokens = min(tokens, int(budget_gib * (1024**3) / per_token))
+        blocks = max(1, -(-int(tokens) // block_tokens))
+        pool = DecoderKVCacheManager.build_pool(
+            num_layers=int(spec.num_layers),
+            n_kv_head=int(spec.n_kv_head),
+            head_dim=int(spec.head_dim),
+            block_tokens=block_tokens,
+            max_num_blocks=blocks,
+            max_batch_size=rows,
+            device=param.device,
+            dtype=param.dtype,
+        )
+        gib = (
+            2
+            * int(spec.num_layers)
+            * int(spec.n_kv_head)
+            * int(spec.head_dim)
+            * blocks
+            * block_tokens
+            * param.element_size()
+        ) / float(1024**3)
+        logger.info(
+            "decoder-KV pool: %d blocks x %d tokens (%.2f GiB) for up to %d rows "
+            "of %d positions",
+            blocks,
+            block_tokens,
+            gib,
+            rows,
+            self._position_budget(),
+        )
+        return DecoderKVCacheManager(pool)
+
+    # ------------------------------------------------------------------
+    # Decoder-step CUDA graphs (H11(3))
+    # ------------------------------------------------------------------
+
+    def _step_graphs(self):
+        """The decoder-step graph cache, or ``None`` when steps run eager."""
+        if self._graphs is not _UNSET:
+            return self._graphs
+        self._graphs = None
+        manager = self.kv_manager()
+        decoder = self._decoder()
+        if (
+            bool(getattr(self.options, "step_graphs", False))
+            and manager is not None
+            and bool(getattr(decoder, "supports_step_graphs", False))
+            and manager.pool.config.device.type == "cuda"
+        ):
+            from ..decoder_graph import DecoderStepGraphCache
+
+            self._graphs = DecoderStepGraphCache(
+                decoder,
+                manager,
+                width_pages=int(getattr(self.options, "step_graph_width_pages", 8)),
+                max_captures=int(getattr(self.options, "step_graph_max_captures", 64)),
+            )
+        elif bool(getattr(self.options, "step_graphs", False)):
+            # A family that cannot capture is the normal case, not a mistake, so
+            # this is only worth an INFO when somebody actually asked for graphs
+            # — otherwise every AED engine logs a refusal of a default it never
+            # set.  ``decode_options`` carries exactly what was passed in.
+            asked = "step_graphs" in (getattr(self._config, "decode_options", None) or {})
+            (logger.info if asked else logger.debug)(
+                "%s: step_graphs not available (%s); steps run eager",
+                self.decode_type,
+                "decoder KV is not paged" if manager is None else "decoder does not declare it",
+            )
+        return self._graphs
+
+    def _step(self, tokens: torch.Tensor, state: Any) -> Tuple[torch.Tensor, Any]:
+        """One batched decoder step, replayed from a graph where one exists.
+
+        The graph path advances the KV here because the captured step runs no
+        Python; the eager path advances it inside the forward.  Both leave the
+        state in the same place, which is what lets the two be compared
+        token-for-token.
+        """
+        graphs = self._step_graphs()
+        if graphs is not None:
+            kv = state.get("kv") if isinstance(state, dict) else None
+            if kv is not None:
+                logits = graphs.step(tokens, kv)
+                if logits is not None:
+                    kv.commit(1)
+                    return logits, state
+        return self._decoder().step(tokens, state)
+
+    @staticmethod
+    def _release(state: Any) -> None:
+        """Return a dropped group's paged pages to the pool.
+
+        A no-op for dense storage, which owns nothing outside its own tensors.
+        Called where a group ends *without* a ``select`` — the last row of a
+        group finishing, or an abort taking it — because ``select`` is what frees
+        rows the rest of the time and there is no other owner to notice.
+        """
+        kv = state.get("kv") if isinstance(state, dict) else None
+        free = getattr(kv, "free", None)
+        if callable(free):
+            free()
 
     # ------------------------------------------------------------------
     # Admission budgeting (C3)
@@ -325,16 +634,44 @@ class IncrementalArStrategy(DecodeStrategy):
             for row, req in enumerate(requests):
                 if wants_word_timings(req):
                     align_enc[row] = enc_out[row : row + 1].clone()
-        self._groups.append(
-            ArGroup(
-                requests=list(requests),
-                state=plan.state,
-                last_logits=plan.logits,
-                max_new=list(plan.max_new),
-                opts=opts,
-                align_enc=align_enc,
-            )
+        fresh = ArGroup(
+            requests=list(requests),
+            state=plan.state,
+            last_logits=plan.logits,
+            max_new=list(plan.max_new),
+            opts=opts,
+            align_enc=align_enc,
         )
+        if not self._absorb(fresh):
+            self._groups.append(fresh)
+
+    def _absorb(self, fresh: ArGroup) -> bool:
+        """Join ``fresh`` into a group that is already generating, if it can.
+
+        Returns whether it did.  The condition is the decoder's to answer — its
+        state is opaque here — so this only walks the candidates and asks; a
+        surface with no ``merge`` keeps one group per encoded micro-batch, which
+        is what every AR family did before per-row KV offsets existed.
+
+        Beam groups are skipped: their rows are a per-request slot grid advanced
+        by a group-wide ``steps`` counter, so joining two of them would need a
+        second, per-request counter and a rule for what a shared ``max_new``
+        means across it.  Nothing declares them mergeable, so nothing tries.
+        """
+        if not bool(getattr(self.options, "merge_groups", True)):
+            return False
+        decoder = self._decoder()
+        merge = getattr(decoder, "merge", None)
+        can_merge = getattr(decoder, "can_merge", None)
+        if not callable(merge) or not callable(can_merge):
+            return False
+        for group in self._groups:
+            if isinstance(group, ArBeamGroup) or not can_merge(group.state, fresh.state):
+                continue
+            logits = torch.cat([group.last_logits, fresh.last_logits], dim=0)
+            group.extend(fresh, merge(group.state, fresh.state), logits)
+            return True
+        return False
 
     def _make_beam_group(self, requests, plan, opts) -> ArBeamGroup:
         """Widen a prefilled ``B``-row state into a ``B * k`` beam grid.
@@ -410,10 +747,14 @@ class IncrementalArStrategy(DecodeStrategy):
                 keep_idx = torch.tensor(keep, dtype=torch.long, device=next_tokens.device)
                 group.state = self._decoder().select(group.state, keep_idx)
                 next_tokens = next_tokens.index_select(0, keep_idx)
+            else:
+                # Every row finished together, so no ``select`` runs to hand the
+                # group's storage back; the group itself is about to be dropped.
+                self._release(group.state)
 
         if group.requests:
             with torch.no_grad():
-                group.last_logits, group.state = self._decoder().step(next_tokens, group.state)
+                group.last_logits, group.state = self._step(next_tokens, group.state)
         return outputs
 
     # ------------------------------------------------------------------
@@ -479,7 +820,7 @@ class IncrementalArStrategy(DecodeStrategy):
             if keep is not None:
                 chosen = chosen.index_select(0, keep)
             with torch.no_grad():
-                group.last_logits, group.state = self._decoder().step(chosen, group.state)
+                group.last_logits, group.state = self._step(chosen, group.state)
         return outputs
 
     def _retire_finished_requests(
@@ -659,6 +1000,8 @@ class IncrementalArStrategy(DecodeStrategy):
                 keep_idx = torch.tensor(keep, dtype=torch.long, device=group.last_logits.device)
                 group.state = self._decoder().select(group.state, keep_idx)
                 group.last_logits = group.last_logits.index_select(0, keep_idx)
+            else:
+                self._release(group.state)
             break
         self._groups = [g for g in self._groups if g.requests]
 

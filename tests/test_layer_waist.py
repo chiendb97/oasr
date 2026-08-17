@@ -596,7 +596,13 @@ class TestKernelGapRegistry:
     #: (left padding), and unaligned output projections never became a gap at
     #: all — they were closed at the model layer by widening the head on load.
     #:
-    PINNED = {"fmha-head-dim"}
+    #: ``fmha-paged-config`` arrived with paged decoder KV (H11(2)): the paged
+    #: loader skips per-element head-dim predication, so it refuses a head_dim off
+    #: the 32-element MMA stride, and it walks whole pages per K tile, so it
+    #: refuses a page size no tile is a multiple of.  No shipped decoder reaches
+    #: either — every head_dim is 64 or 128 and the pool's page size is a power of
+    #: two — so today it is taken only by tiny test configs.
+    PINNED = {"fmha-head-dim", "fmha-paged-config"}
 
     def test_declared_gap_set_only_shrinks(self):
         from oasr.layers._backend import KERNEL_GAPS

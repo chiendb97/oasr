@@ -17,15 +17,18 @@ output projections, SiLU gate-up-down MLP — exposing the same
 * :meth:`step` appends one token per active row at that row's own next
   position, attending the full cache through a key-padding mask.
 
-The KV state is a plain dict of dense per-layer tensors; rows are dropped with
-:meth:`select` as requests finish (continuous batching).  When the caller
+The KV state is a :class:`~oasr.cache.decoder_state.DecoderKv` — one
+capacity buffer per layer plus **per-row** write offsets — shared with the AED
+decoder; rows are dropped with :meth:`select` as requests finish (continuous
+batching) and two prefilled states are joined with :meth:`merge`, which is what
+lets a trickle of arrivals still generate in one forward.  When the caller
 passes ``capacity`` to :meth:`prefill` (the ``llm`` strategy does — prompt
 length + the batch's generation cap), the per-layer K/V buffers are
 **preallocated** to that capacity and each step writes its one token slot in
 place — removing the per-step ``torch.cat`` that re-copies the whole cache
 (measured ~10% of a 7B decode step at B=4, growing with B).  Without
 ``capacity`` the legacy cat-growth path is used (direct ``prefill``/``step``
-callers, tests).
+callers, tests); it cannot express per-row offsets and therefore cannot merge.
 
 Attention splits by call: :meth:`prefill` hands the shared core its causal +
 left-padded window as ``kv_lens``/``kv_starts``/``is_causal`` and lands on the
@@ -39,11 +42,12 @@ kernel would have to copy whole, once per layer per step.  Paged-KV storage
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, cast
 
 import torch
 from torch import nn
 
+from oasr.cache import DecoderKv, build_kv
 from oasr.layers import (
     Attention,
     ColumnParallelLinear,
@@ -57,6 +61,9 @@ from oasr.layers import (
 
 from ..decoders.base import BaseDecoder, DecoderState
 from .config import SpeechLlmModelConfig
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from oasr.cache.decoder_kv import DecoderKVCacheManager
 
 
 class _Qwen2Attention(nn.Module):
@@ -91,7 +98,7 @@ class _Qwen2Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         mask_kwargs: Dict[str, Any],
-        kv_extent: int,
+        kv_extent: Optional[int],
     ) -> torch.Tensor:
         """Attention over the (possibly grouped) KV → ``(B, T_q, D)``.
 
@@ -124,54 +131,16 @@ class _Qwen2Layer(nn.Module):
         residual: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        state: Dict[str, Any],
+        kv: DecoderKv,
         layer_idx: int,
-        t_prev: int,
         mask_kwargs: Dict[str, Any],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run one LM layer and return its MLP output separately."""
         q, k_new, v_new = self.self_attn.qkv(h, cos, sin)
-        k, v, kv_extent = self._append_kv(state, layer_idx, t_prev, k_new, v_new)
+        k, v, kv_extent = kv.append(layer_idx, k_new, v_new)
         attn = self.self_attn.attend(q, k, v, mask_kwargs, kv_extent)
         h, residual = self.post_attention_layernorm.forward_add_residual(attn, residual)
         return self.mlp(h), residual
-
-    @staticmethod
-    def _append_kv(
-        state: Dict[str, Any],
-        layer_idx: int,
-        t_prev: int,
-        k_new: torch.Tensor,
-        v_new: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """Append this layer's new K/V; return ``(k, v, valid_len)``.
-
-        Preallocated mode writes new tokens into a zero-initialized capacity
-        buffer. Legacy mode grows exact-length tensors with ``torch.cat``.
-        """
-        t_new = k_new.size(2)
-        cap = state["cap"]
-        k_buf, v_buf = state["k"][layer_idx], state["v"][layer_idx]
-        if cap is not None and k_buf is None:
-            batch, h_kv, _, head_dim = k_new.shape
-            # The fused attention kernel may read the in-bounds tail of its
-            # final partial K block, so untouched capacity must be zero rather
-            # than uninitialized memory containing a NaN/Inf bit pattern.
-            k_buf = k_new.new_zeros(batch, h_kv, cap, head_dim)
-            v_buf = v_new.new_zeros(batch, h_kv, cap, head_dim)
-            state["k"][layer_idx], state["v"][layer_idx] = k_buf, v_buf
-        if cap is not None and t_prev + t_new <= cap:
-            k_buf[:, :, t_prev : t_prev + t_new] = k_new
-            v_buf[:, :, t_prev : t_prev + t_new] = v_new
-            return k_buf, v_buf, t_prev + t_new
-        if k_buf is not None:
-            k = torch.cat([k_buf[:, :, :t_prev], k_new], dim=2) if t_prev else k_new
-            v = torch.cat([v_buf[:, :, :t_prev], v_new], dim=2) if t_prev else v_new
-        else:
-            k, v = k_new, v_new
-        state["k"][layer_idx], state["v"][layer_idx] = k, v
-        state["cap"] = None
-        return k, v, k.size(2)
 
 
 class Qwen2Lm(BaseDecoder):
@@ -179,6 +148,11 @@ class Qwen2Lm(BaseDecoder):
     ``embed_tokens`` / ``lm_head``) with the incremental decode surface."""
 
     decode_type = "llm"
+    supports_paged_kv = True
+    #: Nothing outside the paged pool survives between steps here — a
+    #: decoder-only LM has no cross-attention cache — so a step is capturable
+    #: given paged KV.
+    supports_step_graphs = True
 
     def __init__(self, cfg: SpeechLlmModelConfig) -> None:
         super().__init__()
@@ -209,28 +183,27 @@ class Qwen2Lm(BaseDecoder):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        state: Dict[str, Any],
+        kv: DecoderKv,
         mask_kwargs: Dict[str, Any],
     ) -> torch.Tensor:
         """Shared prefill/step trunk: run every layer, appending to the KV state."""
-        t_prev = state["len"]
         t_new = x.size(1)
         layers = [cast(_Qwen2Layer, layer) for layer in self.layers]
         if not layers:
-            state["len"] = t_prev + t_new
+            kv.commit(t_new)
             return x
 
         residual = x
         h = layers[0].input_layernorm(x)
         for i, layer in enumerate(layers):
-            mlp, residual = layer(h, residual, cos, sin, state, i, t_prev, mask_kwargs)
+            mlp, residual = layer(h, residual, cos, sin, kv, i, mask_kwargs)
             if i + 1 < len(layers):
                 h, residual = layers[i + 1].input_layernorm.forward_add_residual(mlp, residual)
             else:
                 # Prefill normalizes only the final token below, so doing the
                 # last RMSNorm here would add work over the whole prompt.
                 x = residual + mlp
-        state["len"] = t_prev + t_new
+        kv.commit(t_new)
         return x
 
     def prefill(
@@ -238,6 +211,7 @@ class Qwen2Lm(BaseDecoder):
         inputs_embeds: torch.Tensor,
         valid: torch.Tensor,
         capacity: Optional[int] = None,
+        kv_manager: Optional["DecoderKVCacheManager"] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Start generation over a **left-padded** embedded prompt.
 
@@ -250,10 +224,28 @@ class Qwen2Lm(BaseDecoder):
         (prompt + generation cap).  When given, the per-layer K/V buffers are
         preallocated once and each :meth:`step` writes its token slot in
         place instead of re-copying the cache via ``torch.cat``.
+
+        ``kv_manager`` (optional, requires ``capacity``): page the KV out of a
+        shared pool instead of preallocating a per-group buffer.
         """
         B, P, _ = inputs_embeds.shape
-        device = inputs_embeds.device
-        # HF masked-generate positions: cumsum - 1, pads clamped to 0.
+        n = len(self.layers)
+        kv = build_kv(
+            n,
+            B,
+            inputs_embeds.device,
+            prefill_len=P,
+            cap=None if capacity is None else max(int(capacity), P),
+            manager=kv_manager,
+            # Left padding *is* the per-row start offset: HF's masked-generate
+            # convention puts every row's real prompt flush against the right of
+            # the ``(B, P)`` grid, so the valid window is ``[P - len, len)``.
+            starts=(P - valid.sum(dim=1)).to(torch.int32),
+        )
+        # HF masked-generate positions: cumsum - 1, pads clamped to 0.  For the
+        # real (right-flush) region that is exactly ``lens - starts`` counted from
+        # 0, which is what ``DecoderKv.position_ids`` derives; the pads' ids are
+        # never read because their query rows are masked out.
         position_ids = (valid.long().cumsum(dim=1) - 1).clamp(min=0)
         cos, sin = self.rotary(position_ids)  # (B, P, d)
 
@@ -267,24 +259,11 @@ class Qwen2Lm(BaseDecoder):
         # ``Attention`` decides which backend actually runs it, and rebuilds the
         # explicit mask itself on the SDPA side (diagonal kept open, so a fully
         # padded query row cannot come back NaN and poison real rows downstream).
-        kv_lens = torch.full((B,), P, dtype=torch.int32, device=device)
-        kv_starts = (P - valid.sum(dim=1)).to(torch.int32)
-        mask_kwargs: Dict[str, Any] = {
-            "kv_lens": kv_lens,
-            "kv_starts": kv_starts,
-            "is_causal": True,
-        }
+        mask_kwargs: Dict[str, Any] = dict(kv.mask_kwargs(P))
+        mask_kwargs["is_causal"] = True
 
-        n = len(self.layers)
-        state: Dict[str, Any] = {
-            "k": [None] * n,
-            "v": [None] * n,
-            "key_valid": valid,
-            "pos": valid.long().sum(dim=1),  # per-row next rotary position
-            "len": 0,  # tokens cached so far (uniform across layers)
-            "cap": None if capacity is None else max(int(capacity), P),
-        }
-        x = self._forward_layers(inputs_embeds, cos, sin, state, mask_kwargs)
+        state: Dict[str, Any] = {"kv": kv}
+        x = self._forward_layers(inputs_embeds, cos, sin, kv, mask_kwargs)
         logits = self.lm_head(self.norm(x[:, -1:]))
         return logits[:, -1], state
 
@@ -292,39 +271,32 @@ class Qwen2Lm(BaseDecoder):
         self, tokens: torch.Tensor, state: Dict[str, Any]
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """One generation step: ``tokens (B,)`` → ``(logits (B, V), state)``."""
+        kv: DecoderKv = state["kv"]
         x = self.embed_tokens(tokens.unsqueeze(1))  # (B, 1, D)
-        cos, sin = self.rotary(state["pos"].unsqueeze(1))  # (B, 1, d)
+        cos, sin = self.rotary(kv.position_ids(1))  # (B, 1, d)
 
-        B = x.size(0)
-        key_valid = torch.cat(
-            [state["key_valid"], torch.ones(B, 1, dtype=torch.bool, device=x.device)], dim=1
-        )
-        state["key_valid"] = key_valid
         # Key padding only -- no causal component, since the single query row
         # attends the whole cache.  Left padding is contiguous per row, so the
-        # window form reaches the fused kernel; ``_append_kv`` now hands over the
-        # capacity buffer plus its length rather than a stride-gapped slice, which
-        # is what used to make the kernel copy the whole cache per layer per step
-        # and kept this call on SDPA.  With that gone the kernel is 1.45-1.88x
-        # faster here even at ``T_q == 1``.
-        t_k = key_valid.size(1)
-        kv_lens = torch.full((B,), t_k, dtype=torch.int32, device=x.device)
-        kv_starts = (t_k - key_valid.sum(dim=1)).to(torch.int32)
-
-        x = self._forward_layers(x, cos, sin, state, {"kv_lens": kv_lens, "kv_starts": kv_starts})
+        # window form reaches the fused kernel; ``DecoderKv.append`` hands over
+        # the capacity buffer plus its length rather than a stride-gapped slice,
+        # which is what used to make the kernel copy the whole cache per layer per
+        # step and kept this call on SDPA.  With that gone the kernel is
+        # 1.45-1.88x faster here even at ``T_q == 1``.
+        x = self._forward_layers(x, cos, sin, kv, dict(kv.mask_kwargs(1)))
         logits = self.lm_head(self.norm(x))
-        state["pos"] = state["pos"] + 1
         return logits[:, -1], state
 
     @staticmethod
     def select(state: Dict[str, Any], keep: torch.Tensor) -> Dict[str, Any]:
         """Drop finished rows: index-select every cached tensor along batch."""
-        out: Dict[str, Any] = {
-            "key_valid": state["key_valid"].index_select(0, keep),
-            "pos": state["pos"].index_select(0, keep),
-            "len": state["len"],
-            "cap": state["cap"],
-        }
-        for key in ("k", "v"):
-            out[key] = [t.index_select(0, keep) for t in state[key]]
-        return out
+        return {"kv": state["kv"].select(keep)}
+
+    @staticmethod
+    def can_merge(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        """Whether two prefilled states can generate in one forward."""
+        return bool(a["kv"].can_merge(b["kv"]))
+
+    @staticmethod
+    def merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+        """Concatenate ``b``'s rows after ``a``'s into one generating state."""
+        return {"kv": a["kv"].merge(b["kv"])}
