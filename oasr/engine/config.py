@@ -422,25 +422,25 @@ class EngineConfig:
     max_tick_ms: float = 25.0
     # Incremental (AED / LLM) decode: wait up to this many milliseconds for more
     # arrivals before prefilling a decode batch, so requests that arrive close
-    # together generate in **one** batch instead of several.
+    # together are *encoded and prefilled* in one pass instead of several.
     #
-    # Why this matters more than it looks: an AR decoder step is weight-read
-    # bound, so its cost barely depends on how many rows it carries.  Two decode
-    # groups therefore cost about twice one group of the same total rows — total
-    # forwards is the *sum over groups* of each group's step count.  Measured on
-    # Qwen2-Audio-7B, 4 utterances / 124 tokens: arriving together took 922 ms
-    # (134 tok/s); arriving one per tick took 1614 ms (77 tok/s) for identical
-    # work, purely because two groups formed instead of one.
+    # It used to be the only lever on a much larger effect.  An AR decoder step is
+    # weight-read bound, so its cost barely depends on how many rows it carries,
+    # and two decode groups therefore cost about twice one group of the same
+    # total rows — total forwards is the *sum over groups* of each group's step
+    # count.  Measured on Qwen2-Audio-7B, 4 utterances / 124 tokens: arriving
+    # together took 922 ms (134 tok/s); arriving one per tick took 1614 ms
+    # (77 tok/s) for identical work, purely because two groups formed.
     #
-    # Groups cannot be merged after the fact: both decoder surfaces keep a
-    # **shared scalar** generation offset (``WhisperDecoder`` ``state["pos"]``,
-    # ``Qwen2Lm`` ``state["len"]``), so rows at different positions cannot share
-    # a forward.  Per-row offsets are the prerequisite — the same one paged
-    # decoder-KV needs.  Until then, coalescing at admission is the lever.
+    # Groups now **merge** — both decoder surfaces index their KV per row
+    # (``oasr.cache.decoder_state.DecoderKv``), so a freshly prefilled batch
+    # is absorbed into one already generating and the arrival pattern no longer
+    # decides the step count.  What this window still saves is the merge's copy
+    # and one encoder+prefill pass, so it is a smaller knob than it was, and its
+    # default of 0 no longer costs throughput.
     #
     # Trade-off: it delays the first token of an *isolated* request by up to this
-    # window.  Default ``0`` (off) keeps today's latency; raise it for
-    # throughput-oriented deployments.  Bounded by ``max_wait_time`` regardless.
+    # window.  Bounded by ``max_wait_time`` regardless.
     decode_admit_window_ms: float = 0.0
 
     # AR generation length cap (per request), read by incremental strategies.

@@ -153,7 +153,10 @@ class LlmDecodeStrategy(IncrementalArStrategy):
             # capacity → the LM preallocates its KV buffers and steps write
             # in place (no per-step cache re-copy).
             logits, state = self._decoder().prefill(
-                inputs, valid, capacity=inputs.size(1) + max(max_new) + 1
+                inputs,
+                valid,
+                capacity=inputs.size(1) + max(max_new) + 1,
+                kv_manager=self.kv_manager(),
             )
         return Prefill(state=state, logits=logits, max_new=max_new)
 

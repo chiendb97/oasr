@@ -71,6 +71,7 @@ CSV_COLUMNS = [
     "ckpt",
     "architecture",
     "decode_method",
+    "decode_options",
     "service_mode",
     "chunk_size",
     "dtype",
@@ -98,6 +99,7 @@ class Row:
     ckpt: str
     architecture: str
     decode_method: str
+    decode_options: str
     service_mode: str
     chunk_size: int
     dtype: str
@@ -251,6 +253,7 @@ def run_one(
     ckpt_dir: str,
     architecture: Optional[str],
     decode_method: Optional[str],
+    decode_options: Dict[str, str],
     service_mode: str,
     chunk_size: Optional[int],
     dtype: str,
@@ -281,6 +284,12 @@ def run_one(
         cfg_kwargs["architecture"] = architecture
     if decode_method:
         cfg_kwargs["decode_method"] = decode_method
+    # Left as strings on purpose: the owning strategy's ``options_cls`` types
+    # them against its declared defaults, so this harness needs no copy of any
+    # family's option table and an unknown key fails here rather than being
+    # measured as if it had been applied.
+    if decode_options:
+        cfg_kwargs["decode_options"] = dict(decode_options)
     # Only forward a chunk size when asked for one: the engine's default is
     # model-aware, and an encoder that cannot serve a given chunk refuses it at
     # construction rather than decoding something subtly wrong.
@@ -327,6 +336,7 @@ def run_one(
         ckpt=Path(ckpt_dir).name,
         architecture=architecture or "(detected)",
         decode_method=decode_method or "(model default)",
+        decode_options=" ".join(f"{k}={v}" for k, v in sorted(decode_options.items())) or "-",
         service_mode=service_mode,
         chunk_size=effective_chunk,
         dtype=dtype,
@@ -393,6 +403,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=[""],
         metavar="M",
         help="One row per method (e.g. ctc ctc_aed_rescoring); default: the model's",
+    )
+    p.add_argument(
+        "--decode-option",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Per-family decode option, repeatable (e.g. --decode-option "
+        "kv_storage=paged --decode-option step_graphs=1). Applies to every row "
+        "in the sweep and is recorded in the CSV, so two rows that differ only "
+        "by an option are still tellable apart.",
     )
     p.add_argument(
         "--service-mode",
@@ -482,6 +502,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise SystemExit(str(exc)) from None
     print(f"[INFO] {len(entries)} utterance(s) from {manifest}")
 
+    decode_options: Dict[str, str] = {}
+    for pair in args.decode_option:
+        if "=" not in pair:
+            raise SystemExit(f"--decode-option expects k=v, got {pair!r}")
+        key, _, value = pair.partition("=")
+        decode_options[key.strip()] = value
+
     rows: List[Row] = []
     failures: List[str] = []
     for method in args.decode_method:
@@ -503,6 +530,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             ckpt_dir=args.ckpt_dir,
                             architecture=args.architecture,
                             decode_method=method or None,
+                            decode_options=decode_options,
                             service_mode=mode,
                             chunk_size=chunk or None,
                             dtype=dtype,

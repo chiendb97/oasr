@@ -12,17 +12,23 @@ the encoder geometry is fixed at ``max_source_positions`` output frames.  The
 decoder exposes the *batched incremental* surface the ``aed`` strategy drives:
 :meth:`WhisperDecoder.prefill` (SOT prompt + cross-attention KV, computed
 once) and :meth:`WhisperDecoder.step` (one token per active request), with a
-dense per-layer KV cache carried in an opaque state dict.
+per-layer KV cache carried in an opaque state dict and indexed **per row**
+(:class:`~oasr.cache.decoder_state.DecoderKv`).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import torch
 from torch import nn
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from oasr.cache.decoder_kv import DecoderKVCacheManager
+
+from oasr.cache import DecoderKv, build_kv
+from oasr.cache.decoder_state import consume_cat_rows
 from oasr.layers import (
     TORCH_EPS,
     Attention,
@@ -72,10 +78,17 @@ class _WhisperAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         is_causal: bool = False,
+        kv_extent: Optional[int] = None,
+        **mask_kwargs: Any,
     ) -> torch.Tensor:
-        """``query (B, T_q, D)`` × pre-projected ``k``/``v`` ``(B, h, T_k, d_k)``."""
+        """``query (B, T_q, D)`` × pre-projected ``k``/``v`` ``(B, h, T_k, d_k)``.
+
+        ``kv_extent`` / ``mask_kwargs`` are the decoder self-attention's per-row
+        window (see :class:`~oasr.cache.decoder_state.DecoderKv`); the
+        encoder and the cross-attention pass neither.
+        """
         q = self.attn.split_heads(self.q_proj(query))
-        x = self.attn(q, k, v, is_causal=is_causal)
+        x = self.attn(q, k, v, is_causal=is_causal, kv_extent=kv_extent, **mask_kwargs)
         return self.out_proj(self.attn.merge_heads(x))
 
 
@@ -181,33 +194,31 @@ class _DecoderLayer(nn.Module):
         self,
         h: torch.Tensor,
         residual: torch.Tensor,
-        self_k: Optional[torch.Tensor],
-        self_v: Optional[torch.Tensor],
+        kv: DecoderKv,
+        layer_idx: int,
         cross_k: torch.Tensor,
         cross_v: torch.Tensor,
-        is_causal: bool,
+        self_kwargs: Dict[str, Any],
+        trim: bool,
         collect: Optional["_CrossAttnCollector"] = None,
-        layer_idx: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run one decoder layer from an already-normalized input.
 
         The FFN output remains separate from the residual so the parent can
         fuse their addition into the following layer's ``self_attn_layer_norm``.
+        ``kv`` owns the self-attention cache: this layer hands it new K/V and
+        gets back whatever the attention should read, at each row's own offset.
         """
         k_new, v_new = self.self_attn.kv(h)
-        if self_k is not None:
-            k = torch.cat([self_k, k_new], dim=2)
-            v = torch.cat([self_v, v_new], dim=2)
-        else:
-            k, v = k_new, v_new
+        k, v, extent = kv.append(layer_idx, k_new, v_new, trim=trim)
 
-        self_attn = self.self_attn(h, k, v, is_causal=is_causal)
+        self_attn = self.self_attn(h, k, v, kv_extent=extent, **self_kwargs)
         h, residual = self.encoder_attn_layer_norm.forward_add_residual(self_attn, residual)
         if collect is not None:
             collect.capture(layer_idx, self.encoder_attn, h, cross_k)
         cross_attn = self.encoder_attn(h, cross_k, cross_v)
         h, residual = self.final_layer_norm.forward_add_residual(cross_attn, residual)
-        return self.fc2(self.fc1(h)), residual, k, v
+        return self.fc2(self.fc1(h)), residual
 
 
 class _CrossAttnCollector:
@@ -259,15 +270,16 @@ class _CrossAttnCollector:
 class WhisperDecoder(BaseDecoder):
     """Whisper text decoder with a batched incremental (prefill/step) surface.
 
-    The KV state is a plain dict of dense per-layer tensors —
-    ``self_k``/``self_v``: ``List[(B, h, t, d_k)]`` growing one position per
-    step; ``cross_k``/``cross_v``: fixed, computed once at prefill.  Rows are
-    dropped with :meth:`select` as requests finish (continuous batching).
-    Paged-KV storage (``DecoderKVCacheManager``) is the planned optimization;
-    the state layout is already per-request-row so the swap is local.
+    The KV state is a dict of a :class:`~oasr.cache.decoder_state.DecoderKv`
+    (self-attention, one capacity buffer per layer, **per-row** write offsets and
+    position ids) plus ``cross_k``/``cross_v``: fixed, computed once at prefill.
+    Rows are dropped with :meth:`select` as requests finish (continuous
+    batching), and two prefilled states are joined with :meth:`merge` so a
+    trickle of arrivals still generates in one forward.
     """
 
     decode_type = "aed"
+    supports_paged_kv = True
 
     def __init__(self, cfg: WhisperModelConfig) -> None:
         super().__init__()
@@ -293,12 +305,15 @@ class WhisperDecoder(BaseDecoder):
     def _forward_tokens(
         self,
         ids: torch.Tensor,
-        offset: int,
         state: Dict[str, Any],
         is_prefill: bool,
         collect: Optional["_CrossAttnCollector"] = None,
     ) -> torch.Tensor:
-        """Shared prefill/step forward over ``ids (B, T)`` starting at ``offset``.
+        """Shared prefill/step forward over ``ids (B, T)``.
+
+        Each row starts at **its own** position — ``DecoderKv`` derives both the
+        position ids and the KV write offsets from the same per-row length — which
+        is what lets two decode groups be merged into one forward.
 
         ``collect`` (word timestamps only) additionally materialises the
         cross-attention probabilities of a declared set of heads.  It is checked
@@ -306,33 +321,42 @@ class WhisperDecoder(BaseDecoder):
         path is unchanged; the alignment pass is a separate teacher-forced
         forward run after a row finishes.
         """
-        B, T = ids.shape
-        pos = torch.arange(offset, offset + T, device=ids.device)
+        T = ids.size(1)
+        kv: DecoderKv = state["kv"]
+        pos = kv.position_ids(T)  # (B, T)
         x = self.embed_tokens(ids) + self.embed_positions(pos).to(self.embed_tokens.weight.dtype)
+        # A prefill reads the cache trimmed to the prompt and masks with the
+        # causal triangle alone; a step reads the capacity buffer whole and masks
+        # with each row's own length (see ``DecoderKv.append``).
+        trim = is_prefill
+        self_kwargs: Dict[str, Any] = dict(kv.mask_kwargs(T, trimmed=trim))
+        self_kwargs["is_causal"] = is_prefill and T > 1
+
         layers = [cast(_DecoderLayer, layer) for layer in self.layers]
         if not layers:
+            kv.commit(T)
             x = self.layer_norm(x)
             return x @ self.embed_tokens.weight.t()
 
         residual = x
         h = layers[0].self_attn_layer_norm(x)
         for i, layer in enumerate(layers):
-            ff, residual, k, v = layer(
+            ff, residual = layer(
                 h,
                 residual,
-                state["self_k"][i],
-                state["self_v"][i],
+                kv,
+                i,
                 state["cross_k"][i],
                 state["cross_v"][i],
-                is_causal=is_prefill and T > 1,
+                self_kwargs,
+                trim,
                 collect=collect,
-                layer_idx=i,
             )
-            state["self_k"][i], state["self_v"][i] = k, v
             if i + 1 < len(layers):
                 h, residual = layers[i + 1].self_attn_layer_norm.forward_add_residual(ff, residual)
             else:
                 x = self.layer_norm.forward_add(ff, residual)
+        kv.commit(T)
         return x @ self.embed_tokens.weight.t()  # tied projection → (B, T, V)
 
     @torch.no_grad()
@@ -358,60 +382,105 @@ class WhisperDecoder(BaseDecoder):
         """
         n = len(self.layers)
         state: Dict[str, Any] = {
-            "self_k": [None] * n,
-            "self_v": [None] * n,
+            "kv": DecoderKv.empty(n, token_ids.size(0), token_ids.device),
             "cross_k": [None] * n,
             "cross_v": [None] * n,
-            "pos": 0,
         }
         for i, layer in enumerate(self.layers):
             attn = cast(_WhisperAttention, layer.encoder_attn)
             state["cross_k"][i], state["cross_v"][i] = attn.kv(enc_out)
         collector = _CrossAttnCollector(heads, max_frames)
-        logits = self._forward_tokens(token_ids, 0, state, is_prefill=True, collect=collector)
+        logits = self._forward_tokens(token_ids, state, is_prefill=True, collect=collector)
         return collector.stacked(), logits
 
     def prefill(
-        self, enc_out: torch.Tensor, prompt_ids: torch.Tensor
+        self,
+        enc_out: torch.Tensor,
+        prompt_ids: torch.Tensor,
+        capacity: Optional[int] = None,
+        kv_manager: Optional["DecoderKVCacheManager"] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Start generation: cross-KV once + prompt forward.
 
         ``enc_out (B, T_enc, D)``, ``prompt_ids (B, P)`` (identical P across
         the batch — the SOT sequence) → ``(logits (B, V) at the last prompt
         position, state)``.
+
+        ``capacity`` (optional): total self-attention KV length this generation
+        may reach (prompt + generation cap).  When given, the per-layer K/V
+        buffers are preallocated once and each :meth:`step` writes its own row's
+        slot in place — which is also what makes the state **mergeable**, since a
+        ``cat``-grown cache has no room to hold rows at different offsets.
+
+        ``kv_manager`` (optional, requires ``capacity``): page the
+        self-attention KV out of a shared pool instead, one row per slot.  Only
+        the self-attention half — the cross-attention KV is a fixed length
+        computed once here and never grows, so it has no place in a pool built
+        for append-per-step growth.
         """
         n = len(self.layers)
+        P = prompt_ids.size(1)
+        cap = None if capacity is None else max(int(capacity), P)
         state: Dict[str, Any] = {
-            "self_k": [None] * n,
-            "self_v": [None] * n,
+            "kv": build_kv(
+                n,
+                prompt_ids.size(0),
+                prompt_ids.device,
+                prefill_len=P,
+                cap=cap,
+                manager=kv_manager,
+            ),
             "cross_k": [None] * n,
             "cross_v": [None] * n,
-            "pos": 0,
         }
         # Cross K/V project the *raw* encoder output (the decoder layer's
         # encoder_attn_layer_norm applies to the query side only).
         for i, layer in enumerate(self.layers):
             state["cross_k"][i], state["cross_v"][i] = layer.encoder_attn.kv(enc_out)
-        logits = self._forward_tokens(prompt_ids, offset=0, state=state, is_prefill=True)
-        state["pos"] = prompt_ids.size(1)
+        logits = self._forward_tokens(prompt_ids, state, is_prefill=True)
         return logits[:, -1], state
 
     def step(
         self, tokens: torch.Tensor, state: Dict[str, Any]
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """One generation step: ``tokens (B,)`` → ``(logits (B, V), state)``."""
-        logits = self._forward_tokens(
-            tokens.unsqueeze(1), offset=state["pos"], state=state, is_prefill=False
-        )
-        state["pos"] += 1
+        logits = self._forward_tokens(tokens.unsqueeze(1), state, is_prefill=False)
         return logits[:, -1], state
 
     @staticmethod
     def select(state: Dict[str, Any], keep: torch.Tensor) -> Dict[str, Any]:
         """Drop finished rows: index-select every cached tensor along batch."""
-        out: Dict[str, Any] = {"pos": state["pos"]}
-        for key in ("self_k", "self_v", "cross_k", "cross_v"):
+        out: Dict[str, Any] = {"kv": state["kv"].select(keep)}
+        for key in ("cross_k", "cross_v"):
             out[key] = [t.index_select(0, keep) for t in state[key]]
+        return out
+
+    @staticmethod
+    def can_merge(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        """Whether two prefilled states can generate in one forward.
+
+        Beyond the self-attention cache's own conditions: the cross-attention KV
+        is read **unmasked** over the whole encoder window (Whisper's 30 s window
+        is real input, not padding), so two groups can only share a forward when
+        their windows are the same width.  Padding the shorter one would change
+        what the shorter group's rows attend to.
+        """
+        if not a["kv"].can_merge(b["kv"]):
+            return False
+        return all(x.shape[1:] == y.shape[1:] for x, y in zip(a["cross_k"], b["cross_k"]))
+
+    @staticmethod
+    def merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+        """Concatenate ``b``'s rows after ``a``'s into one generating state.
+
+        **Consumes both states** — see :meth:`DecoderKv.merge`.  The
+        cross-attention cache is the larger half here (a Whisper row's is the
+        whole 30 s window, fixed for the run), so releasing it layer by layer is
+        what keeps the merge's transient below one extra copy of the result.
+        """
+        out: Dict[str, Any] = {"kv": a["kv"].merge(b["kv"])}
+        for key in ("cross_k", "cross_v"):
+            out[key] = consume_cat_rows(a[key], b[key])
         return out
 
 

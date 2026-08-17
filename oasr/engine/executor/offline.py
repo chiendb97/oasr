@@ -26,6 +26,7 @@ from typing import ClassVar, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 
+from oasr.cache import DecoderKvExhausted
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from .. import metrics as m
@@ -264,9 +265,10 @@ class OfflineExecutor(Executor):
         ``EngineConfig.decode_admit_window_ms`` is set.  An AR decoder step is
         weight-read bound, so two decode groups cost roughly twice one group of
         the same total rows — total forwards is the sum over groups of each
-        group's step count.  Groups cannot be merged afterwards (both decoder
-        surfaces keep a shared scalar generation offset), so the only lever is to
-        let near-simultaneous arrivals accumulate into **one** batch first.
+        group's step count.  The strategy now merges groups after the fact
+        (``IncrementalArStrategy._absorb``), so this window is no longer what
+        saves those forwards; what it still saves is the merge's copy and one
+        encoder + prefill pass per extra arrival.
 
         Holds until either the queue reaches ``max_batch_size`` or the oldest
         waiting request has waited out the window.
@@ -552,16 +554,17 @@ class OfflineExecutor(Executor):
             t_prefill = time.perf_counter()
             try:
                 strategy.begin_offline(chunk, enc_out, output_lengths)
-            except torch.cuda.OutOfMemoryError as exc:
-                # Prefill preallocates this micro-batch's decoder KV, so it is
-                # where an over-committed pool actually fails.  Reject *this
-                # batch* with an attributable error rather than letting the
-                # exception escape ``step()`` — the serving dispatcher turns a
-                # failed step into an INTERNAL error for every in-flight
-                # request, so one over-large batch would take down its peers.
+            except (torch.cuda.OutOfMemoryError, DecoderKvExhausted) as exc:
+                # Prefill reserves this micro-batch's decoder KV — a capacity
+                # buffer per group, or one paged slot per row — so it is where an
+                # over-committed pool actually fails.  Reject *this batch* with an
+                # attributable error rather than letting the exception escape
+                # ``step()`` — the serving dispatcher turns a failed step into an
+                # INTERNAL error for every in-flight request, so one over-large
+                # batch would take down its peers.
                 nvtx_pop()
                 logger.warning(
-                    "decoder-KV prefill ran out of memory for %d request(s); "
+                    "decoder-KV prefill could not reserve memory for %d request(s); "
                     "rejecting the batch (lower max_decode_slots / "
                     "max_new_tokens, or raise the memory budget): %s",
                     len(chunk),

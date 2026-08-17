@@ -271,20 +271,35 @@ class Attention(nn.Module):
                     "no materialized key axis to broadcast a mask against. Pass the "
                     "full (B, H, T_q, T_k) grid as attn_bias instead."
                 )
-            from oasr.attention import fmha
+            from oasr.attention import fmha, gather_paged_kv
 
-            paged: torch.Tensor = fmha(
-                q,
-                k,
-                v,
-                softmax_scale=self.softmax_scale,
-                attn_bias=attn_bias,
-                cache_seqlens=kv_lens,
-                cache_seqstarts=kv_starts,
-                block_table=block_table,
-                causal=is_causal,
-            )
-            return paged
+            if self._delegate_paged(q, k):
+                paged: torch.Tensor = fmha(
+                    q,
+                    k,
+                    v,
+                    softmax_scale=self.softmax_scale,
+                    attn_bias=attn_bias,
+                    cache_seqlens=kv_lens,
+                    cache_seqstarts=kv_starts,
+                    block_table=block_table,
+                    causal=is_causal,
+                )
+                return paged
+            # A paged config the arch class refuses.  ``fmha`` *raises* there,
+            # which is the right contract for a caller naming the kernel and the
+            # wrong one for the waist, so gather the pages and fall through to
+            # SDPA — having counted the gap.  The gathered key axis is a whole
+            # number of pages and the caller's bias is its own logical key
+            # length; trim both to the shorter, which is what the length mask
+            # bounds anyway.
+            k, v = gather_paged_kv(k, v, block_table)
+            block_table = None
+            kv_extent = None
+            if attn_bias is not None:
+                t_kv = min(attn_bias.size(-1), k.size(2))
+                k, v = k[:, :, :t_kv], v[:, :, :t_kv]
+                attn_bias = attn_bias[..., :t_kv]
 
         if self._kernel_eligible(q, k, kv_lens, kv_starts, attn_bias, attn_mask, is_causal):
             from oasr.attention import fmha
@@ -329,6 +344,38 @@ class Attention(nn.Module):
             enable_gqa=self.num_kv_heads != self.num_heads,
         )
         return out
+
+    def _delegate_paged(self, q: torch.Tensor, k: torch.Tensor) -> bool:
+        """Whether to hand this paged call to :func:`oasr.attention.fmha`.
+
+        Paging is a *storage* decision made by the caller, not a routing choice
+        made here, so unlike :meth:`_kernel_eligible` there are no policy rules.
+        And unlike every other path here there is a second implementation on the
+        other side: ``fmha`` owns a paged SDPA reference and uses it for fp32, for
+        CPU and for ``OASR_ATTN_BACKEND=sdpa``, so those are not gaps — delegating
+        is both correct and closer to the reference than re-deriving the gather
+        here would be.
+
+        What ``fmha`` will not do is fall back on a config the arch class refuses
+        (a head_dim off the paged loader's 32-element MMA stride, a page size no K
+        tile is a multiple of); it raises, which is the right contract for a caller
+        naming the kernel.  That one the waist has to route itself, and count —
+        which is what ``take_gap`` returning ``False`` says here.
+        """
+        from oasr.jit.attention import fmha_config_supported, select_backend
+
+        if select_backend() != "cute" or not q.is_cuda or q.dtype not in SERVED_DTYPES:
+            return True
+        if fmha_config_supported(
+            head_dim=self.head_dim,
+            dtype_str="float16" if q.dtype is torch.float16 else "bfloat16",
+            paged=True,
+            block_size=int(k.size(1)),
+        ):
+            return True
+        return take_gap(
+            "fmha-paged-config", f"head_dim={self.head_dim} block_size={int(k.size(1))}"
+        )
 
     def _kernel_eligible(
         self,

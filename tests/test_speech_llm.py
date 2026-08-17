@@ -354,6 +354,57 @@ class TestLlmStrategy:
         strategy = build_decode_strategy("llm", cfg, detok, loaded.model)
         return strategy, loaded.model
 
+    def test_kv_storage_auto_pages_only_where_steps_are_captured(self):
+        """``auto`` is a trade, not a preference.
+
+        Paging costs the block-table indirection and buys no capacity while
+        admission reserves each row's ceiling; what it buys is a step CUDA graph,
+        which needs addresses that outlive a batch.  So it must follow
+        ``step_graphs`` — on for a decoder that declares it, off otherwise —
+        rather than being chosen because paging sounds better.  An explicit
+        value still wins, which is what makes the A/B possible.
+        """
+        strategy, _ = self._strategy_and_model()
+        assert strategy.options.kv_storage == "auto"
+        assert strategy._decoder().supports_step_graphs
+
+        # Three conditions, and all three have to hold.  This fixture loads on
+        # CPU, where there is no graph to capture and paging would be pure
+        # indirection on a path production never runs — so the device is one of
+        # them, and the CUDA case is checked below on the same weights.
+        off, _ = self._strategy_and_model(decode_options={"step_graphs": False})
+        assert off._resolve_storage(off._decoder()) == "dense"
+        on, _ = self._strategy_and_model(decode_options={"step_graphs": True})
+        assert on._resolve_storage(on._decoder()) == "dense"  # CPU
+
+        if torch.cuda.is_available():
+            cuda_on, model = self._strategy_and_model(decode_options={"step_graphs": True})
+            model.cuda()
+            assert cuda_on._resolve_storage(cuda_on._decoder()) == "paged"
+            cuda_off, model = self._strategy_and_model(decode_options={"step_graphs": False})
+            model.cuda()
+            assert cuda_off._resolve_storage(cuda_off._decoder()) == "dense"
+
+        # An explicit value wins in both directions, which is what makes the A/B
+        # possible at all.
+        forced, _ = self._strategy_and_model(
+            decode_options={"step_graphs": True, "kv_storage": "dense"}
+        )
+        assert forced._resolve_storage(forced._decoder()) == "dense"
+        assert forced.kv_manager() is None
+        asked, _ = self._strategy_and_model(decode_options={"kv_storage": "paged"})
+        assert asked._resolve_storage(asked._decoder()) == "paged"
+
+    def test_beam_search_stays_dense_even_asking_for_graphs(self):
+        """A paged row's pages are its own, and a beam grid reorders onto its
+        parents with repeated ``select`` indices — which would alias two slots
+        onto one page.  Storage is decided for the strategy, so the refusal
+        happens once here rather than being discovered mid-search."""
+        strat, _ = self._strategy_and_model(
+            decode_options={"step_graphs": True, "kv_storage": "paged", "beam_size": 2}
+        )
+        assert strat.kv_manager() is None
+
     def test_partials_then_finals(self):
         from types import SimpleNamespace
 
@@ -383,6 +434,47 @@ class TestLlmStrategy:
             assert partials[rid], "no partials emitted"
             assert partials[rid] == sorted(partials[rid]), "non-monotonic partials"
             assert len(finals[rid].tokens[0]) <= 12
+
+    def test_late_arrivals_are_absorbed_into_one_group(self):
+        """A second prefill joins the group already generating.
+
+        The transcripts must be *identical* to running with ``merge_groups=0``:
+        merging changes how many decoder forwards it takes, never what is
+        decoded.  Which is also the point — two groups cost about twice one group
+        of the same total rows, because an AR step is weight-read bound.
+        """
+        from types import SimpleNamespace
+
+        from oasr.engine.generation import StepBudget
+
+        mel = torch.randn(3, 3000, 128)
+        mlens = torch.tensor([300, 190, 240])
+
+        def run(**opts):
+            strategy, model = self._strategy_and_model(max_new_tokens=10, **opts)
+            with torch.no_grad():
+                emb, elens = model.encode_offline(mel, mlens)
+            reqs = [SimpleNamespace(request_id=f"r{i}") for i in range(3)]
+            strategy.begin_offline(reqs[:2], emb[:2], elens[:2])
+            strategy.advance(StepBudget(max_steps=3))  # get the first group moving
+            strategy.begin_offline(reqs[2:], emb[2:], elens[2:])
+            groups = len(strategy._groups)
+            finals = {}
+            for _ in range(40):
+                for out in strategy.advance(StepBudget(max_steps=4)):
+                    if out.finished:
+                        finals[out.request_id] = out.tokens[0]
+                if not strategy.has_pending():
+                    break
+            assert not strategy.has_pending()
+            return groups, finals
+
+        merged_groups, merged = run()
+        split_groups, split = run(decode_options={"merge_groups": False})
+        assert merged_groups == 1 and split_groups == 2
+        assert set(merged) == set(split) == {"r0", "r1", "r2"}
+        for rid in merged:
+            assert merged[rid] == split[rid], f"{rid} decoded differently after a merge"
 
     def test_free_session_aborts_row(self):
         from types import SimpleNamespace
@@ -684,6 +776,369 @@ class TestRealCheckpoint:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestLmDecoderMerge:
+    """Two speech-LLM groups joined into one forward.
+
+    Harder than the AED case in one way: prompts are variable-length and
+    *left*-padded, so the two groups differ in both the generation offset and the
+    left-pad width, and the merged batch has to keep each row's own window.
+    """
+
+    @staticmethod
+    def _lm():
+        from oasr.models.speech_llm.config import SpeechLlmModelConfig
+        from oasr.models.speech_llm.llm import Qwen2Lm
+
+        torch.manual_seed(0)
+        cfg = SpeechLlmModelConfig(
+            vocab_size=64,
+            text_hidden_size=2 * 16,
+            text_num_attention_heads=2,
+            text_num_key_value_heads=2,
+            text_num_hidden_layers=2,
+            text_intermediate_size=48,
+        )
+        return Qwen2Lm(cfg).eval()
+
+    @staticmethod
+    def _prompt(lm, batch, width, pad):
+        """``(embeds, valid)`` for a left-padded prompt of ``width - pad`` tokens."""
+        ids = torch.arange(batch * width).remainder(64).view(batch, width)
+        valid = torch.ones(batch, width, dtype=torch.bool)
+        valid[:, :pad] = False
+        return lm.embed_tokens(ids), valid
+
+    def _run(self, lm, prompt, steps, feed, start=0):
+        logits, state = lm.prefill(*prompt, capacity=48)
+        for t in range(steps):
+            logits, state = lm.step(feed[:, start + t], state)
+        return logits, state
+
+    def test_merged_groups_match_separate_generation(self):
+        lm = self._lm()
+        feed_a = torch.randint(0, 64, (2, 12))
+        feed_b = torch.randint(0, 64, (1, 12))
+        pa = self._prompt(lm, 2, 11, 3)  # 8 real tokens, 3 left pads
+        pb = self._prompt(lm, 1, 6, 0)  # 6 real tokens, none
+
+        with torch.no_grad():
+            _, sa = self._run(lm, pa, 5, feed_a)
+            _, sb = self._run(lm, pb, 2, feed_b)
+            separate = []
+            for t in range(3):
+                la, sa = lm.step(feed_a[:, 5 + t], sa)
+                lb, sb = lm.step(feed_b[:, 2 + t], sb)
+                separate.append(torch.cat([la, lb], dim=0))
+
+            _, sa = self._run(lm, pa, 5, feed_a)
+            _, sb = self._run(lm, pb, 2, feed_b)
+            assert lm.can_merge(sa, sb)
+            state = lm.merge(sa, sb)
+            assert state["kv"].starts.tolist() == [3, 3, 0]
+            assert state["kv"].lens_host == [16, 16, 8]
+            for t, want in enumerate(separate):
+                toks = torch.cat([feed_a[:, 5 + t], feed_b[:, 2 + t]])
+                got, state = lm.step(toks, state)
+                torch.testing.assert_close(want, got, atol=1e-5, rtol=1e-4)
+
+    def test_positions_survive_the_merge(self):
+        """Rotary positions are ``lens - starts``: the left pad must not count."""
+        lm = self._lm()
+        feed = torch.randint(0, 64, (1, 8))
+        with torch.no_grad():
+            _, sa = self._run(lm, self._prompt(lm, 1, 11, 3), 4, feed)
+            _, sb = self._run(lm, self._prompt(lm, 1, 6, 0), 1, feed)
+            merged = lm.merge(sa, sb)
+        # 8 prompt tokens + 4 generated, and 6 + 1 -- both counted from the first
+        # *real* token, not from the buffer's index 0.
+        assert merged["kv"].positions().tolist() == [12, 7]
+
+    def test_a_cat_grown_state_declares_itself_unmergeable(self):
+        lm = self._lm()
+        with torch.no_grad():
+            _, grown = lm.prefill(*self._prompt(lm, 1, 6, 0))
+            _, sized = lm.prefill(*self._prompt(lm, 1, 6, 0), capacity=48)
+        assert not lm.can_merge(grown, sized)
+
+
+@pytest.mark.cuda
+class TestStepGraphs:
+    """A decoder step replayed from a CUDA graph must be the *same* step.
+
+    The gate is exactness, not closeness: a captured graph that picks a different
+    kernel, reads a stale address, or masks a different key window returns
+    plausible logits, and the only thing that catches it is comparing them
+    against the eager path token for token.
+    """
+
+    @staticmethod
+    def _lm(head_dim: int = 64):
+        from oasr.models.speech_llm.config import SpeechLlmModelConfig
+        from oasr.models.speech_llm.llm import Qwen2Lm
+
+        torch.manual_seed(3)
+        cfg = SpeechLlmModelConfig(
+            vocab_size=128,
+            text_hidden_size=2 * head_dim,
+            text_num_attention_heads=2,
+            text_num_key_value_heads=2,
+            text_num_hidden_layers=2,
+            text_intermediate_size=192,
+        )
+        return Qwen2Lm(cfg).cuda().to(torch.float16).eval()
+
+    @staticmethod
+    def _manager(lm, block_tokens=16):
+        from oasr.cache.decoder_kv import DecoderKVCacheManager
+
+        cfg = lm._cfg
+        return DecoderKVCacheManager(
+            DecoderKVCacheManager.build_pool(
+                num_layers=cfg.text_num_hidden_layers,
+                n_kv_head=cfg.text_num_key_value_heads,
+                head_dim=cfg.text_head_dim,
+                block_tokens=block_tokens,
+                max_num_blocks=128,
+                device=torch.device("cuda"),
+                dtype=torch.float16,
+            )
+        )
+
+    def _generate(self, lm, mgr, graphs, steps=24):
+        B, P = 2, 20
+        torch.manual_seed(5)
+        ids = torch.randint(0, 128, (B, P), device="cuda")
+        valid = torch.ones(B, P, dtype=torch.bool, device="cuda")
+        valid[1, :4] = False
+        feed = torch.randint(0, 128, (B, steps), device="cuda")
+        with torch.no_grad():
+            logits, state = lm.prefill(lm.embed_tokens(ids), valid, capacity=64, kv_manager=mgr)
+            out = [logits.float().cpu()]
+            for t in range(steps):
+                if graphs is not None:
+                    replayed = graphs.step(feed[:, t], state["kv"])
+                    assert replayed is not None, "step was not captured"
+                    state["kv"].commit(1)
+                    logits = replayed
+                else:
+                    logits, state = lm.step(feed[:, t], state)
+                out.append(logits.float().cpu())
+        state["kv"].free()
+        return out
+
+    @pytest.mark.parametrize("head_dim,block_tokens", [(32, 16), (64, 16), (128, 16), (64, 8)])
+    def test_replayed_steps_match_eager_exactly(self, head_dim, block_tokens):
+        """Across head dims, because that is what a second checkpoint changes.
+
+        The only real speech-LLM this is measured on is Qwen2-Audio-7B, whose
+        decoder is `head_dim 128`.  What a different checkpoint would vary is not
+        the weights — a graph does not care — but the *geometry* the paged loader
+        runs at, and this repo's two capture defects were both in that loader and
+        both depended on `head_dim` and `block_size` together: the shared-memory
+        write-after-write race at `head_dim 32`, and the block-table width that
+        must be a whole number of K tiles.  32 is the one that has bitten, and an
+        8-token page is the one that puts more than four pages in a K tile.
+        """
+        from oasr.engine.decoder_graph import DecoderStepGraphCache
+
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        lm = self._lm(head_dim)
+        eager = self._generate(lm, self._manager(lm, block_tokens), None)
+        mgr = self._manager(lm, block_tokens)
+        graphs = DecoderStepGraphCache(lm, mgr, width_pages=2)
+        replayed = self._generate(lm, mgr, graphs)
+        assert graphs.num_captured >= 2  # the table widened mid-run
+        for a, b in zip(eager, replayed):
+            torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+    def _interleaved(self, lm, mgr, graphs, steps=24):
+        """Two live states of *different* row counts, stepped alternately.
+
+        Rows are the graph cache's exact shape key, so the two states capture
+        two keys, and every step of the first after the second's capture is a
+        replay that happened *after* a new capture in the same memory pool.
+        """
+        torch.manual_seed(11)
+        states, feeds = [], []
+        for rows, prompt in ((2, 20), (1, 12)):
+            ids = torch.randint(0, 128, (rows, prompt), device="cuda")
+            valid = torch.ones(rows, prompt, dtype=torch.bool, device="cuda")
+            with torch.no_grad():
+                _, state = lm.prefill(lm.embed_tokens(ids), valid, capacity=64, kv_manager=mgr)
+            states.append(state)
+            feeds.append(torch.randint(0, 128, (rows, steps), device="cuda"))
+
+        out = []
+        with torch.no_grad():
+            for t in range(steps):
+                for i, state in enumerate(states):
+                    if graphs is not None:
+                        logits = graphs.step(feeds[i][:, t], state["kv"])
+                        assert logits is not None, "step was not captured"
+                        state["kv"].commit(1)
+                    else:
+                        logits, state = lm.step(feeds[i][:, t], state)
+                        states[i] = state
+                    out.append(logits.float().cpu())
+        for state in states:
+            state["kv"].free()
+        return out
+
+    def test_a_later_capture_does_not_invalidate_an_earlier_shape(self):
+        """The rule everyone remembers is that a later *replay* invalidates the
+        buffer.  The one that cost real transcripts is that a later **capture**
+        does too: captures share one memory pool, so a capture at a new key can
+        be handed the block an earlier capture's output buffer occupies.  In the
+        streaming encoder's cache that deterministically lost 5 of 40 LJSpeech
+        utterances their trailing words, graphs-only — see the
+        ``nemotron_streaming`` comment in ``ci/wer-reference.json``.
+
+        Two things keep it from happening here, and this drives both: the cache
+        holds every capture's output buffer for its own lifetime, so the
+        allocator cannot hand that block to the next capture, and :meth:`step`
+        clones before returning.  Interleaving two row counts means each state
+        replays *after* the other's capture.
+        """
+        from oasr.engine.decoder_graph import DecoderStepGraphCache
+
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        lm = self._lm()
+        eager = self._interleaved(lm, self._manager(lm), None)
+        mgr = self._manager(lm)
+        graphs = DecoderStepGraphCache(lm, mgr, width_pages=2)
+        replayed = self._interleaved(lm, mgr, graphs)
+        # Two row counts, and the table widens under a 2-page bucket: more keys
+        # than states, which is the point — the later captures land mid-run.
+        assert graphs.num_captured > 2
+        for a, b in zip(eager, replayed):
+            torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+    def test_the_capture_ceiling_falls_back_to_eager(self):
+        """Rows are an *exact* key, so shapes are not bounded by anything else.
+
+        A pool whose row count changes every tick reaches many keys, and each
+        one costs graph memory that is never reclaimed while the engine lives.
+        Past ``step_graph_max_captures`` a step has to run eager rather than keep
+        capturing — a ceiling that silently kept allocating would be worse than
+        no ceiling, because it would look like it was holding.
+        """
+        from oasr.engine.decoder_graph import DecoderStepGraphCache
+
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        lm = self._lm()
+        mgr = self._manager(lm)
+        graphs = DecoderStepGraphCache(lm, mgr, width_pages=2, max_captures=1)
+        eager = self._interleaved(lm, self._manager(lm), None)
+        mixed = self._interleaved_allowing_eager(lm, mgr, graphs)
+        assert graphs.num_captured == 1
+        # Whatever ran eager must still agree with the eager reference exactly:
+        # the fallback is a different code path, not a different answer.
+        for a, b in zip(eager, mixed):
+            torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+    def _interleaved_allowing_eager(self, lm, mgr, graphs, steps=24):
+        """:meth:`_interleaved` without the "must have been captured" assert."""
+        torch.manual_seed(11)
+        states, feeds = [], []
+        for rows, prompt in ((2, 20), (1, 12)):
+            ids = torch.randint(0, 128, (rows, prompt), device="cuda")
+            valid = torch.ones(rows, prompt, dtype=torch.bool, device="cuda")
+            with torch.no_grad():
+                _, state = lm.prefill(lm.embed_tokens(ids), valid, capacity=64, kv_manager=mgr)
+            states.append(state)
+            feeds.append(torch.randint(0, 128, (rows, steps), device="cuda"))
+        out = []
+        with torch.no_grad():
+            for t in range(steps):
+                for i, state in enumerate(states):
+                    logits = graphs.step(feeds[i][:, t], state["kv"])
+                    if logits is None:
+                        logits, state = lm.step(feeds[i][:, t], state)
+                        states[i] = state
+                    else:
+                        state["kv"].commit(1)
+                    out.append(logits.float().cpu())
+        for state in states:
+            state["kv"].free()
+        return out
+
+    def test_a_failed_capture_is_not_retried(self):
+        """Retrying a capture that already failed is the slowest outcome.
+
+        A capture costs a warm-up forward before it records anything, so a shape
+        that raises once would pay that on *every* step of that shape and then
+        run eager regardless — strictly worse than never having tried.  With
+        graphs on by default this is the difference between a bad configuration
+        being slightly slower and being unusable.
+        """
+        from oasr.engine.decoder_graph import DecoderStepGraphCache
+
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        lm = self._lm()
+        mgr = self._manager(lm)
+        graphs = DecoderStepGraphCache(lm, mgr)
+        with torch.no_grad():
+            ids = torch.randint(0, 128, (1, 8), device="cuda")
+            valid = torch.ones(1, 8, dtype=torch.bool, device="cuda")
+            _, state = lm.prefill(lm.embed_tokens(ids), valid, capacity=32, kv_manager=mgr)
+
+        calls = {"n": 0}
+        real_step = lm.step
+
+        def exploding(tokens, st):
+            calls["n"] += 1
+            raise RuntimeError("capture is not going to work today")
+
+        lm.step = exploding
+        try:
+            token = torch.zeros(1, dtype=torch.long, device="cuda")
+            assert graphs.step(token, state["kv"]) is None
+            assert calls["n"] == 1
+            assert graphs.step(token, state["kv"]) is None
+            assert calls["n"] == 1, "the failed shape was attempted a second time"
+        finally:
+            lm.step = real_step
+            state["kv"].free()
+
+    def test_dense_storage_is_refused(self):
+        """A capacity buffer is allocated per group and moves with every prefill,
+        so there is no address for a graph to have captured."""
+        from oasr.engine.decoder_graph import DecoderStepGraphCache
+
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        lm = self._lm()
+        mgr = self._manager(lm)
+        graphs = DecoderStepGraphCache(lm, mgr)
+        with torch.no_grad():
+            ids = torch.randint(0, 128, (1, 8), device="cuda")
+            valid = torch.ones(1, 8, dtype=torch.bool, device="cuda")
+            _, dense = lm.prefill(lm.embed_tokens(ids), valid, capacity=32)
+        assert not graphs.capturable(dense["kv"])
+        assert graphs.step(torch.zeros(1, dtype=torch.long, device="cuda"), dense["kv"]) is None
+
+    def test_a_decoder_that_does_not_declare_it_is_refused(self):
+        from oasr.engine.decoder_graph import DecoderStepGraphCache
+
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        lm = self._lm()
+        mgr = self._manager(lm)
+        graphs = DecoderStepGraphCache(lm, mgr)
+        with torch.no_grad():
+            ids = torch.randint(0, 128, (1, 8), device="cuda")
+            valid = torch.ones(1, 8, dtype=torch.bool, device="cuda")
+            _, state = lm.prefill(lm.embed_tokens(ids), valid, capacity=32, kv_manager=mgr)
+        assert graphs.capturable(state["kv"])
+        graphs._decoder = object()  # a surface with no supports_step_graphs
+        assert not graphs.capturable(state["kv"])
+        state["kv"].free()
+
+
 class TestDecoderCacheIsKernelSafe:
     """The capacity-preallocated KV cache is handed to the attention kernel
     *whole* (buffer + length), which is what lets it skip a per-layer copy of a
@@ -718,7 +1173,8 @@ class TestDecoderCacheIsKernelSafe:
             emb = lm.embed_tokens(torch.randint(0, 256, (B, P), device="cuda"))
             valid = torch.ones(B, P, dtype=torch.bool, device="cuda")
             _, state = lm.prefill(emb, valid, capacity=P + 40)
-        for buf in list(state["k"]) + list(state["v"]):
+        kv = state["kv"]
+        for buf in list(kv.k) + list(kv.v):
             tail = buf[:, :, P:]
             assert torch.isfinite(buf).all(), "cache holds non-finite values"
             torch.testing.assert_close(tail, torch.zeros_like(tail))

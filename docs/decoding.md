@@ -110,12 +110,141 @@ latency, admission latency and inter-partial cadence
 A tick that spends its decode budget does not also prefill — bounded by
 `_MAX_SKIPPED_ADMITS` so admission cannot starve. Admission is additionally gated
 by `max_decode_slots` and, optionally, by `decode_admit_window_ms`: a coalescing
-window that holds a thin waiting queue so near-simultaneous arrivals prefill as
-**one** decode group. That matters because an AR decoder step is weight-read
-bound — total forwards is the sum over groups of each group's step count, and
-groups cannot be merged after the fact (both decoder surfaces keep a **shared
-scalar** generation offset; per-row KV offsets are the prerequisite, shared with
-paged decoder KV).
+window that holds a thin waiting queue so near-simultaneous arrivals are *encoded
+and prefilled* together.
+
+### Groups merge, so arrival order stops mattering
+
+An AR decoder step is **weight-read bound**: its cost barely depends on how many
+rows it carries, so total forwards is the sum over groups of each group's step
+count and two groups cost about twice one group of the same total rows. A freshly
+prefilled micro-batch is therefore *absorbed* into a group already generating
+(`IncrementalArStrategy._absorb`).
+
+What used to make that impossible was a **shared scalar** generation offset on
+both decoder surfaces. Both now index their KV per row
+([`oasr/cache/decoder_state.py`](../oasr/cache/decoder_state.py)):
+
+| Vector | Meaning |
+|---|---|
+| `lens` | keys cached per row — and so the row's next **write index** |
+| `starts` | first valid key per row, i.e. left padding (`None` for a fixed prompt) |
+| `positions` | *derived*, `lens - starts` — a fourth vector could disagree with the other two |
+
+`lens`/`starts` are exactly the `kv_lens` / `kv_starts` window pair
+`oasr.layers.Attention` already takes as two length vectors, so per-row offsets
+cost no materialized mask and reach the fused kernel on the same terms the
+uniform case did.
+
+Merging is declared, not assumed: `can_merge` refuses a cache grown by
+`torch.cat` (no room for a second offset), an encoder window of a different width
+(an AED reads cross-attention unmasked over the whole window), and a beam group
+(its slot grid advances by one group-wide `steps` counter). `merge_groups=0`
+turns it off for an A/B.
+
+### Decoder-KV storage
+
+`kv_storage` picks where the self-attention KV lives. Both are row-indexed and
+present the same surface, so neither decoder branches on the choice.
+
+| | Where | Merge costs | Notes |
+|---|---|---|---|
+| `dense` | a `(B, H_kv, cap, D)` buffer per group | a copy of both caches | what beam search uses regardless |
+| `paged` | one persistent `BlockPool`, one block table per row | nothing — the tables concatenate | a row holds only the pages it filled; required for step graphs |
+| `auto` (default) | whichever of the two the family can *use* | — | paged exactly when steps will be captured |
+
+**`auto` is a trade, not a preference.** Paged storage costs **3%** on
+Qwen2-Audio-7B and **9%** on whisper-tiny — the block-table indirection, one
+gather per layer per step plus a paged loader that gathers rows where the dense
+one reads a run — and it buys no extra *admission* capacity, because each row's
+ceiling is reserved either way. What it buys is a pool allocated once for the
+process instead of a capacity buffer per prefill, a merge that moves no K/V, and
+addresses stable enough to capture a step into a CUDA graph. The first of those
+does flatten the peak — a dense `select` `index_select`s the whole capacity
+buffer, so its transient grows with rows × capacity (2804 MiB at 8 rows on the
+7B, against 323 MiB paged plus a fixed 2120 MiB pool) — but the one that pays for
+the indirection is the last, so `auto` resolves to `paged` when `step_graphs` is
+on *and*
+the decoder declares `supports_step_graphs`, and to `dense` otherwise — an AED
+keeps the buffer it was already paying nothing for. Either value can be named
+explicitly, which is what makes the A/B possible.
+
+The pool reserves each row's whole position budget **at admission**
+(`DecoderKVCacheManager.can_admit`) because there is no eviction to fall back on:
+a pool that can run out mid-generation runs out several seconds into a request
+that is already half-answered. Optimistic admission — reserving what rows are
+*using* rather than what they could use — is what would turn paging into a
+capacity win, and it needs preemption to be safe.
+
+Beam search stays dense: a paged row's pages are its own, so the repeated-index
+`select` that expands and reorders a beam grid would alias two slots onto one
+page, and `PagedDecoderKv.select` refuses rather than corrupting.
+
+### Decoder-step CUDA graphs
+
+`step_graphs` (**on** by default) replays each decoder step from a
+`torch.cuda.CUDAGraph` captured per `(rows, block-table width bucket)` — see
+[`oasr/engine/decoder_graph.py`](../oasr/engine/decoder_graph.py). Paged storage
+is the prerequisite, which `kv_storage="auto"` selects: a graph records the
+addresses it reads, and a capacity buffer is allocated per decode group. A family
+whose decoder does not declare `supports_step_graphs` runs eager, and that is not
+an error — `auto` then keeps it on dense storage too, so it pays nothing.
+
+Rows are an **exact** key and the width is bucketed, so shapes are bounded by
+`max_decode_slots` times a handful of buckets; `step_graph_max_captures` (64) is
+the backstop, past which a step runs eager rather than growing graph memory. A
+capture that fails is remembered rather than retried — each attempt costs a
+warm-up forward and then runs eager anyway — and an out-of-memory during capture
+turns the cache off for the engine, because that is a fact about the process
+rather than about the shape.
+
+**The win is a small-batch win.** A decoder step is weight-read bound, so what a
+graph removes is the *launch* half: at one row that is most of the step, and by
+eight rows the GPU has enough work per step to hide it. Qwen2-Audio-7B, bf16,
+burst arrivals through `engine.step()`, σ over 3 runs:
+
+| rows | dense | paged | paged + graphs |
+|---|---|---|---|
+| 1 | 0.747 s ±0.032 | 0.752 s (1.01×) | **0.483 s ±0.003 (0.65×)** |
+| 8 | 0.920 s ±0.004 | 0.976 s (1.06×) | 0.974 s ±0.001 (1.06×) |
+
+Eight simultaneous rows is a **wash** — repeats put the pair between 0.99× and
+1.06×, and what it is paying there is the *paging*, not the graphs: paged alone
+costs the same 1.06×.
+
+What decides the default is the working point a caller actually hits. Every batch
+**ends** small — rows finish at different steps, so the tail of any decode runs at
+one to three rows — and utterance lengths in a real corpus vary far more than in
+a synthetic burst. On the 200-utterance LJSpeech manifest at `max_batch_size 16`,
+through `transcribe_offline`, encoder and prefill included, σ over 3 interleaved
+rounds:
+
+| arm | wall | RTFx | p50 | p99 |
+|---|---|---|---|---|
+| dense | 16.88 s ±0.05 | 76.3 | 66.1 ms | 160.8 ms |
+| paged | 17.59 s ±0.24 (1.042×) | 73.3 | 67.6 ms | 112.5 ms |
+| **paged + graphs** | **15.17 s ±0.11 (0.899×)** | **85.0** | **55.3 ms** | **84.7 ms** |
+
+Transcripts byte-identical across all three arms, all 200 utterances; that rate
+is pinned in `ci/wer-reference.json`. So: **+11% throughput and −47% p99 where a
+caller actually is, and a wash on a wide synchronous burst.**
+`--decode-option step_graphs=0` is the A/B if your load is the second shape.
+
+So it is **on by default**, and `kv_storage="auto"` follows it into paged storage.
+What earned that is coverage rather than a better number: replayed steps are
+bit-identical to eager across head dims 32/64/128 and 8- and 16-token pages —
+the geometry axis is what a different checkpoint really varies, and both of this
+repo's capture defects lived in the paged loader at particular
+`(head_dim, block_size)` pairs — plus a corpus-scale run saying the transcripts do
+not move, plus the failure handling above. What is still thin, and worth knowing
+before trusting it on a new model: **one** real checkpoint, and no long-running
+soak on the serving path.
+
+Not everything is capturable, and the parts that are not are declared rather than
+discovered (`BaseDecoder.supports_step_graphs`). An AED's cross-attention K/V is
+allocated per prefill and far too large to copy into a static buffer per step, so
+`aed` steps run eager; a decoder-only speech-LLM has no such cache and does
+capture. Beam search does not page its KV at all, so it never reaches this path.
 
 ## Beam search
 

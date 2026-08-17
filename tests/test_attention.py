@@ -192,3 +192,49 @@ def test_paged_path_matches_sdpa(attn, device):
         out_ref = _ref_paged(attn, x, pos_emb, cache)
 
     torch.testing.assert_close(out_new, out_ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.cuda
+def test_a_paged_config_the_kernel_refuses_still_answers():
+    """A declared gap has to *serve* the shape, not raise on it.
+
+    The paged loader skips per-element head-dim predication, so the arch class
+    refuses a head_dim off its 32-element MMA stride.  ``oasr.attention.fmha``
+    raises there — the right contract for a caller naming the kernel by name —
+    which leaves the waist to gather the pages and answer on SDPA, counting the
+    gap so the coverage debt stays visible.  A shipped decoder's head_dim is 64
+    or 128, so this is the tiny-config path; it is also the only thing standing
+    between such a config and a hard failure.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from oasr.layers import Attention
+    from oasr.layers._backend import gap_hits, reset_backend_stats
+
+    torch.manual_seed(0)
+    heads, head_dim, block_size, blocks = 2, 16, 16, 4
+    B, T_q = 2, 1
+    k_pool = torch.randn(blocks, block_size, heads, head_dim, device="cuda", dtype=torch.float16)
+    v_pool = torch.randn(blocks, block_size, heads, head_dim, device="cuda", dtype=torch.float16)
+    table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device="cuda")
+    lens = torch.tensor([20, 9], dtype=torch.int32, device="cuda")
+    q = torch.randn(B, heads, T_q, head_dim, device="cuda", dtype=torch.float16)
+
+    attn = Attention(heads, head_dim)
+    reset_backend_stats()
+    with torch.no_grad():
+        out = attn(q, k_pool, v_pool, kv_lens=lens, block_table=table)
+    assert gap_hits().get("fmha-paged-config"), "the gap was not counted"
+
+    # Reference: gather the addressed pages and mask by length.
+    dense = k_pool[table.long()].reshape(B, -1, heads, head_dim).permute(0, 2, 1, 3)
+    dense_v = v_pool[table.long()].reshape(B, -1, heads, head_dim).permute(0, 2, 1, 3)
+    keep = torch.arange(dense.size(2), device="cuda").unsqueeze(0) < lens.unsqueeze(1)
+    ref = F.scaled_dot_product_attention(
+        q.float(),
+        dense.float(),
+        dense_v.float(),
+        attn_mask=keep.view(B, 1, 1, -1),
+        scale=head_dim**-0.5,
+    )
+    torch.testing.assert_close(out.float(), ref, rtol=2e-3, atol=2e-3)

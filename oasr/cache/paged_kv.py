@@ -20,6 +20,26 @@ from typing import Tuple, Union
 import torch
 
 
+def flat_write_index(
+    block_table: torch.Tensor,
+    offsets: torch.Tensor,
+    t_new: int,
+    block_size: int,
+) -> torch.Tensor:
+    """``(B * t_new,)`` indices into a pool flattened to ``(blocks * size, ...)``.
+
+    ``offsets`` is the ``(B,)`` per-stream logical write position; row ``b``'s
+    ``t``-th new frame lands at logical ``offsets[b] + t``, which the block table
+    maps to a physical page and an offset within it.
+    """
+    steps = torch.arange(t_new, device=offsets.device, dtype=offsets.dtype)
+    time_pos = offsets.unsqueeze(1) + steps.unsqueeze(0)  # (B, t_new)
+    logical = (time_pos // block_size).long()
+    within = (time_pos % block_size).long()
+    physical = torch.gather(block_table.long(), dim=1, index=logical)
+    return (physical * block_size + within).view(-1)
+
+
 @dataclass
 class PagedKVCache:
     """Per-layer paged KV cache descriptor.
@@ -76,13 +96,13 @@ class PagedKVCache:
         offset : int or Tensor
             Logical write offset. ``int`` (homogeneous case): every
             stream writes at the same offset; uses a cheap row-slice fast
-            path with no D2H sync. ``(B,)`` int Tensor (heterogeneous
-            case): per-stream offsets dispatched via a vectorised
-            scatter.
+            path with no D2H sync, and the chunk must land within **two**
+            consecutive pages (which every encoder chunk does, being at most
+            one page wide). ``(B,)`` int Tensor (heterogeneous case):
+            per-stream offsets dispatched via a vectorised scatter, with no
+            such bound.
         """
-        B, _, T, _ = new_k.shape
-        H_kv = new_k.size(1)
-        D = new_k.size(3)
+        T = new_k.size(2)
         block_size = self.block_size
 
         # Frame-major layout matching the pool's per-block tile.
@@ -98,6 +118,16 @@ class PagedKVCache:
                 self.k_cache[phys_blks, blk_offset : blk_offset + T] = k_data
                 self.v_cache[phys_blks, blk_offset : blk_offset + T] = v_data
             else:
+                if blk_offset + T > 2 * block_size:
+                    # Named here rather than surfacing as a broadcast-shape error
+                    # from inside the second index_put: the slice path writes at
+                    # most two pages by construction, and a caller with a wider
+                    # chunk wants the per-row scatter instead.
+                    raise ValueError(
+                        f"homogeneous write of {T} frames at offset {offset} spans "
+                        f"more than two {block_size}-frame pages; pass a per-row "
+                        "offset tensor to take the scatter path"
+                    )
                 first_n = block_size - blk_offset
                 phys_blks = self.block_table[:, blk_logical].long()
                 phys_blks_next = self.block_table[:, blk_logical + 1].long()
@@ -108,18 +138,23 @@ class PagedKVCache:
             return
 
         # Heterogeneous-offset scatter.
-        arange_T = torch.arange(T, device=offset.device, dtype=offset.dtype)
-        time_pos = offset.unsqueeze(1) + arange_T.unsqueeze(0)  # (B, T)
-        blk_logical_t = (time_pos // block_size).long()
-        blk_offset_t = (time_pos % block_size).long()
+        flat_idx = flat_write_index(self.block_table, offset, T, block_size)
+        self.scatter_flat(k_data, v_data, flat_idx)
 
-        phys_blk = torch.gather(self.block_table.long(), dim=1, index=blk_logical_t)
-        flat_idx = (phys_blk * block_size + blk_offset_t).view(-1)
+    def scatter_flat(
+        self, k_data: torch.Tensor, v_data: torch.Tensor, flat_index: torch.Tensor
+    ) -> None:
+        """Write frame-major ``(B, T, H_kv, D)`` K/V at precomputed pool slots.
 
-        k_flat = self.k_cache.view(-1, H_kv, D)
-        v_flat = self.v_cache.view(-1, H_kv, D)
-        k_flat[flat_idx] = k_data.view(B * T, H_kv, D)
-        v_flat[flat_idx] = v_data.view(B * T, H_kv, D)
+        Split out of :meth:`write_kv_chunk` because the index depends only on the
+        block table and the offsets, not on the layer — so a caller writing every
+        layer at the same positions (an AR decode step) computes it once and pays
+        two ``index_put_`` per layer instead of recomputing the address
+        arithmetic each time.
+        """
+        H_kv, D = self.k_cache.size(2), self.k_cache.size(3)
+        self.k_cache.view(-1, H_kv, D)[flat_index] = k_data.reshape(-1, H_kv, D)
+        self.v_cache.view(-1, H_kv, D)[flat_index] = v_data.reshape(-1, H_kv, D)
 
     # ------------------------------------------------------------------
     # K/V access -- gather a contiguous slice for the SDPA fallback
@@ -165,4 +200,4 @@ class PagedKVCache:
         return k_gathered.permute(0, 2, 1, 3), v_gathered.permute(0, 2, 1, 3)
 
 
-__all__ = ["PagedKVCache"]
+__all__ = ["PagedKVCache", "flat_write_index"]

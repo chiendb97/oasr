@@ -51,7 +51,8 @@ from oasr.cache.attention_cache import AttentionCacheManager
 from oasr.cache.block_pool import BlockPool
 from oasr.cache.cnn_cache import CnnCacheManager
 from oasr.cache.ctc_state import CtcStateCacheManager
-from oasr.cache.decoder_kv import DecoderKVCacheManager
+from oasr.cache.decoder_kv import DecoderKVCacheManager, DecoderKvExhausted
+from oasr.cache.decoder_state import DecoderKv, PagedDecoderKv, build_kv
 from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.slot_cnn import SlotCnnCache
 from oasr.cache.slot_pool import StreamSlotPool
@@ -72,5 +73,9 @@ __all__ = [
     "CnnCacheManager",
     "CtcStateCacheManager",
     "DecoderKVCacheManager",
+    "DecoderKvExhausted",
+    "DecoderKv",
+    "PagedDecoderKv",
+    "build_kv",
     "StreamContext",
 ]

@@ -117,6 +117,13 @@ def test_wer_has_not_regressed(spec, device):
         cfg_kwargs["checkpoint_name"] = spec["checkpoint_name"]
     if spec["decode_method"]:
         cfg_kwargs["decode_method"] = spec["decode_method"]
+    # Per-family knobs, pinned by the entry rather than inherited from whatever
+    # the family currently defaults to.  A recorded rate is only comparable to a
+    # later run under the *same* decode configuration, and for a speech-LLM the
+    # prompt is part of that configuration: change it and the model answers a
+    # different question, which is a WER delta with no defect behind it.
+    if spec.get("decode_options"):
+        cfg_kwargs["decode_options"] = dict(spec["decode_options"])
     if spec.get("chunk_size"):
         cfg_kwargs["chunk_size"] = spec["chunk_size"]
 
@@ -144,6 +151,11 @@ def test_wer_has_not_regressed(spec, device):
     )
 
     ceiling = spec["error_rate_pct"] + REFERENCE["tolerance_pct"]
+    # An entry may override the re-record command: the top-level one is the
+    # plain offline invocation, and a row that needed flags to be measured at
+    # all (a dtype the checkpoint declares, a pinned prompt) would otherwise
+    # print a command that reproduces a different number.
+    recorded_with = spec.get("recorded_with", REFERENCE["recorded_with"])
     detail = "\n".join("  " + line for line in result.worst(5))
     assert result.percent <= ceiling, (
         f"{spec['key']} ({spec['architecture']}) regressed: "
@@ -152,5 +164,5 @@ def test_wer_has_not_regressed(spec, device):
         f"{result.summary()}\n"
         f"worst utterances:\n{detail}\n"
         f"If this is a deliberate accuracy change, re-record with:\n"
-        f"  {REFERENCE['recorded_with'].replace('$ASSET', str(ckpt))}"
+        f"  {recorded_with.replace('$ASSET', str(ckpt))}"
     )

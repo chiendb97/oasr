@@ -34,7 +34,16 @@ import torch
 from .block_pool import BlockPool
 from .types import CacheConfig
 
-__all__ = ["DecoderKVCacheManager"]
+__all__ = ["DecoderKVCacheManager", "DecoderKvExhausted"]
+
+
+class DecoderKvExhausted(RuntimeError):
+    """The decoder-KV pool cannot reserve another row at its declared ceiling.
+
+    Its own type because the offline executor treats it the way it treats a
+    prefill OOM — reject *this batch* with a reason, rather than letting the
+    exception escape the step and fail every unrelated request in flight.
+    """
 
 
 @dataclass
@@ -70,6 +79,7 @@ class DecoderKVCacheManager:
         self._pool = pool
         self._block_tokens = pool.config.block_size_frames
         self._slots: Dict[str, _SlotState] = {}
+        self._views: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -85,6 +95,36 @@ class DecoderKVCacheManager:
 
     def seqlen(self, request_id: str) -> int:
         return self._slots[request_id].seqlen
+
+    def num_blocks(self, request_id: str) -> int:
+        """Physical blocks currently mapped for one slot.
+
+        Read by callers that cache a block table across a decode step: the table
+        only changes when a slot crosses a page boundary, so this is what says
+        whether the cached one is still valid.
+        """
+        return len(self._slots[request_id].block_ids)
+
+    def reserved_blocks(self) -> int:
+        """Blocks every live slot could still demand under its declared ceiling.
+
+        Not the same as *allocated*: a slot holds only the pages it has filled,
+        and this is what it would hold at ``prefill_len + max_new_tokens``.
+        """
+        return sum(self._blocks_for(s.max_tokens) for s in self._slots.values())
+
+    def can_admit(self, max_new_tokens: int, prefill_len: int = 0) -> bool:
+        """Whether one more slot fits **at everyone's ceiling**.
+
+        Admission is what makes growth safe: a decode step allocates a page as a
+        row crosses a boundary, and there is no eviction to fall back on, so a
+        pool that can run out mid-generation runs out several seconds into a
+        request that is already half-answered.  Checking the *reserved* total
+        here moves that failure to admission, where it is one rejected batch with
+        a reason.
+        """
+        need = self._blocks_for(prefill_len + max_new_tokens)
+        return self.reserved_blocks() + need <= self._pool.num_blocks
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -162,8 +202,18 @@ class DecoderKVCacheManager:
         return lens.to(device) if device is not None else lens
 
     def kv_view(self, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Full-pool ``(K, V)`` views for one decoder layer (paged FMHA input)."""
-        return self._pool.get_kv_view(layer)
+        """Full-pool ``(K, V)`` views for one decoder layer (paged FMHA input).
+
+        Memoized: the pool's backing tensors never move, so the views never
+        change, and an AR decode step asks for every layer's on every step —
+        rebuilding them there is two tensor allocations per layer per step for an
+        answer that is a constant.
+        """
+        view = self._views.get(layer)
+        if view is None:
+            view = self._pool.get_kv_view(layer)
+            self._views[layer] = view
+        return view
 
     # ------------------------------------------------------------------
     # Helpers

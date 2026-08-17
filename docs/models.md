@@ -103,10 +103,30 @@ Two batched decoder shapes exist, and both are driven from
 
 - **Frame-synchronous** (transducer): `init_state` + `step`.
 - **Label-synchronous AR** (Whisper, speech-LLM): the incremental surface
-  `prefill` / `step` / `select`. `select(state, idx)` is an `index_select`, so
-  repeated indices are legal — which is what lets beam search both *expand* a
-  prefilled batch into a `B × k` grid and reorder it onto each slot's parent,
-  with no new model method.
+  `prefill` / `step` / `select` / `merge`. `select(state, idx)` is an
+  `index_select`, so repeated indices are legal — which is what lets beam search
+  both *expand* a prefilled batch into a `B × k` grid and reorder it onto each
+  slot's parent, with no new model method. `merge(a, b)` joins two prefilled
+  states into one forward, guarded by `can_merge`; it works because the KV is
+  indexed **per row** rather than off a shared generation offset (see
+  [decoding.md § Groups merge](decoding.md#groups-merge-so-arrival-order-stops-mattering)).
+
+  Two class-level declarations go with it, both answered by the decoder rather
+  than probed. `supports_paged_kv` says `prefill` accepts a `kv_manager` and will
+  page its self-attention KV out of that pool; `supports_step_graphs` says a step
+  can be recorded into a CUDA graph — which requires that *everything* it reads
+  either lives at a process-stable address or is small enough to copy into a
+  static buffer per step. A Whisper decoder fails the second: its
+  cross-attention K/V is allocated per prefill, so a graph would bake in a
+  pointer to the batch it was captured on.
+
+  `supports_step_graphs` also decides **storage** under the default
+  `kv_storage="auto"`: paging is what makes a step capturable, and a cost
+  otherwise, so a decoder that declares it gets a paged pool and one that does
+  not keeps its dense capacity buffer. Declare it from what *this config's
+  weights* can do, not from what the class implements — the failure mode is the
+  same as over-claiming `streaming_kind`, an engine that builds and then
+  misbehaves instead of one that refuses at construction.
 
 An AR decoder may **optionally** add `cross_attention(enc_out, token_ids, heads,
 max_frames)`, returning the attention probabilities of a declared `(layer, head)`

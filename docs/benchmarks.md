@@ -263,6 +263,20 @@ python benchmarks/bench_accuracy.py \
 - `oasr/testing/accuracy.py` holds the manifest and transcribe helpers shared
   with the CI accuracy gate (`tests/test_accuracy.py`, reference rates in
   `ci/wer-reference.json`).
+- `--decode-option k=v` (repeatable) reaches the decode family's own knobs, and
+  the CSV carries them, so two rows that differ only by an option stay tellable
+  apart. This is how a storage or capture path is checked *at corpus scale*
+  rather than tensor by tensor:
+
+  ```bash
+  python benchmarks/bench_accuracy.py --ckpt-dir "$SPEECH_LLM_CKPT" \
+      --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root "$WAV_DIR" \
+      --dtype bfloat16 --decode-option kv_storage=dense --decode-option step_graphs=0
+  ```
+
+  An entry in `ci/wer-reference.json` may pin the same options, which the `llm`
+  row does for its prompt: for a speech-LLM the prompt is part of the decode
+  configuration, and changing it moves the WER with no defect behind it.
 
 ## Notes
 

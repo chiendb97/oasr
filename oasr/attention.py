@@ -181,12 +181,18 @@ def _length_to_pad_bias(
     return torch.where(keep, 0.0, float("-inf")).to(dtype).unsqueeze(1).unsqueeze(1)
 
 
-def _gather_paged_kv(
+def gather_paged_kv(
     k_pool: torch.Tensor,
     v_pool: torch.Tensor,
     block_table: torch.Tensor,
 ) -> tuple:
-    """Gather paged K/V into dense ``(B, H_kv, T_kv_logical, D)`` for SDPA."""
+    """Gather paged K/V into dense ``(B, H_kv, T_kv_logical, D)`` for SDPA.
+
+    Public because the layer waist needs it too: :class:`oasr.layers.Attention`
+    routes a paged call the kernel cannot compile (an unsupported head_dim, say)
+    through SDPA, and SDPA has no notion of a block table.  The copy is the cost
+    of the fallback and is exactly what the paged kernel exists to avoid.
+    """
     B = block_table.size(0)
     block_size = k_pool.size(1)
     H_kv = k_pool.size(2)
@@ -537,7 +543,7 @@ def fmha(
     backend = select_backend()
     if backend == "sdpa" or q.dtype not in (torch.float16, torch.bfloat16):
         if block_table is not None:
-            k_dense, v_dense = _gather_paged_kv(k, v, block_table)
+            k_dense, v_dense = gather_paged_kv(k, v, block_table)
         else:
             k_dense, v_dense = k, v
         out.copy_(
@@ -806,18 +812,38 @@ def _pad_paged_inputs(
     *,
     block_size: int,
 ) -> tuple:
-    """Pad ``attn_bias`` and trim ``block_table`` to the kernel tile.
+    """Pad ``attn_bias`` and square ``block_table`` up to the kernel tile.
 
-    The cute fmha kernel reads the full ``(M_BLOCK, N_BLOCK)`` bias tile
-    without per-row predication, so the bias must be padded up to those
-    multiples or an OOB tile read can land in an unmapped segment under
-    CUDA Graph capture (``cudaErrorIllegalAddress``).  The block table is
-    trimmed to match so the kernel's ``ceil(T_kv / N_BLOCK)`` walk only
-    indexes the rows we actually populated.
+    Two separate requirements, both about tiles the kernel walks whole.
 
-    No-op when ``attn_bias is None`` -- the kernel takes its own no-bias
-    path and uses ``cache_seqlens`` directly for the K-block bound.
+    **The block table**, always.  A paged K tile spans ``N_BLOCK // block_size``
+    pool blocks and the loader indexes them *unpredicated* — tile row ``r`` reads
+    ``block_table[b, n_block * blocks_per_tile + r // block_size]``.  A table
+    whose width is not a multiple of ``blocks_per_tile`` therefore has its last
+    tile read past the tensor, and what comes back is not a page id but whatever
+    followed it in memory, which the very next line dereferences as one
+    (``cudaErrorIllegalAddress``).  Widening with a copy of the last mapped page
+    costs nothing real: those columns sit past every row's ``cache_seqlens``, so
+    the kernel gives them zero softmax weight, and a page from the pool is finite
+    — the one thing masked columns must be.  It only bites when a page is smaller
+    than a K tile: ``block_size >= N_BLOCK`` walks one page per tile and can
+    never overrun, which is why the encoder's chunk-sized pages never showed it
+    and the decoder's 16-token ones do immediately.
+
+    **The bias**, when there is one.  The kernel reads the full
+    ``(M_BLOCK, N_BLOCK)`` bias tile without per-row predication, so the bias must
+    be padded up to those multiples or an OOB tile read can land in an unmapped
+    segment under CUDA Graph capture.  The block table is then trimmed to match so
+    the ``ceil(T_kv / N_BLOCK)`` walk only indexes rows we populated — still a
+    whole number of tiles, so the widening above is preserved.
     """
+    blocks_per_tile = max(1, _KERNEL_N_BLOCK // max(1, block_size))
+    width = block_table.size(1)
+    squared = -(-width // blocks_per_tile) * blocks_per_tile
+    if squared > width:
+        tail = block_table[:, -1:].expand(-1, squared - width)
+        block_table = torch.cat([block_table, tail], dim=1)
+
     if attn_bias is None:
         return attn_bias, block_table
 
