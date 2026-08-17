@@ -341,6 +341,35 @@ class TestOfflineTranscribe:
         assert len(texts) == 4
         assert all(isinstance(t, str) and len(t) > 0 for t in texts)
 
+    def test_audio_in_a_pinned_buffer_transcribes_identically(
+        self, device, ckpt_dir: str, wav_dir: str
+    ):
+        """The contract the Rust front-end relies on: fill
+        ``engine.new_audio_buffer(n)``, submit the tensor, get the same
+        transcript as the heap path — which is what lets ``collate`` skip the
+        pack and DMA each row straight into the padded batch."""
+        wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
+        if len(wavs) < 3:
+            pytest.skip("Need at least 3 .wav files in WAV directory")
+        waves = _wav_waveforms(wav_dir, 3)
+
+        engine = self._make_engine(ckpt_dir, device)
+        heap_texts = engine.transcribe_offline(waves)
+
+        staged = []
+        for wav in waves:
+            buf = engine.new_audio_buffer(int(wav.numel()))
+            assert buf is not None, "a CUDA engine should offer pinned audio buffers"
+            assert buf.is_pinned()
+            # Written through a numpy view, exactly as the front-end does; the
+            # *tensor* is what gets submitted, so the async H2D can still be
+            # event-tracked against the caching host allocator's block.
+            buf.numpy()[:] = wav.numpy()
+            staged.append(buf)
+        pinned_texts = engine.transcribe_offline(staged)
+
+        assert pinned_texts == heap_texts
+
 
 # ---------------------------------------------------------------------------
 # Integration tests — ASREngine (streaming)

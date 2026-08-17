@@ -849,6 +849,75 @@ class TestStagingBuffers:
         assert all(s.ready is None for s in p._stream_slots)
 
 
+class TestPinnedAudioBuffers:
+    """``new_audio_buffer`` — the buffer the front-end fills so ``collate``
+    can DMA straight from it instead of packing the batch into staging."""
+
+    def _proc(self, device="cpu", **overrides):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.input_processor import InputProcessor
+
+        cfg = EngineConfig(ckpt_dir="x", device=device, **overrides)
+        return InputProcessor(cfg, torch.device(device))
+
+    def test_cpu_engine_declines(self):
+        """No CUDA context to page-lock against — the caller uses the heap."""
+        assert self._proc().new_audio_buffer(16000) is None
+
+    @pytest.mark.cuda
+    def test_offers_pinned_memory(self, device):
+        p = self._proc(device="cuda")
+        buf = p.new_audio_buffer(16000)
+        assert buf is not None
+        assert buf.is_pinned() and buf.dtype is torch.float32
+        assert buf.numel() == 16000
+
+    @pytest.mark.cuda
+    def test_declines_past_the_cap(self, device):
+        """Page-locked memory is process-global; one long request must not be
+        able to reserve an unbounded amount of it."""
+        p = self._proc(device="cuda", max_pinned_audio_seconds=1.0)
+        sr = p._feature_config.sample_rate
+        assert p.new_audio_buffer(sr) is not None
+        assert p.new_audio_buffer(sr + 1) is None
+
+    @pytest.mark.cuda
+    def test_zero_cap_declines_everything(self, device):
+        p = self._proc(device="cuda", max_pinned_audio_seconds=0.0)
+        assert p.new_audio_buffer(16000) is None
+
+    def test_non_positive_size_declines(self):
+        p = self._proc()
+        assert p.new_audio_buffer(0) is None
+        assert p.new_audio_buffer(-1) is None
+
+    @pytest.mark.cuda
+    def test_pinned_and_unpinned_batches_agree(self, device):
+        """The two collate paths must produce the same device batch.
+
+        The pinned path skips the host pack entirely and DMAs each row into
+        place; the unpinned one packs into staging first.  Padding and
+        ``audio_scale`` are applied identically (on the GPU, after padding), so
+        this is an exact comparison, not a tolerance.
+        """
+        p = self._proc(device="cuda")
+        waves = [torch.randn(n) for n in (16000, 12345, 8000, 1)]
+        plain = p._padded_waveform_batch(list(waves))
+        pinned = p._padded_waveform_batch([w.pin_memory() for w in waves])
+        torch.cuda.synchronize()
+        assert torch.equal(plain, pinned)
+
+    @pytest.mark.cuda
+    def test_mixed_batch_takes_the_pack_path(self, device):
+        """One unpinned row sends the whole micro-batch through the pack — and
+        still produces the same batch."""
+        p = self._proc(device="cuda")
+        waves = [torch.randn(4000), torch.randn(4000)]
+        mixed = [waves[0].pin_memory(), waves[1]]
+        torch.cuda.synchronize()
+        assert torch.equal(p._padded_waveform_batch(list(waves)), p._padded_waveform_batch(mixed))
+
+
 class TestStreamingFeatureStreamHandoff:
     """The feature stream → default stream hand-off must be ordered.
 

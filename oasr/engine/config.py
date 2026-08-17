@@ -497,6 +497,22 @@ class EngineConfig:
     # float32 normalized to [-1, 1], so multiply by 32768 to restore the scale.
     audio_scale: float = 32768.0
 
+    # Longest single request the engine will hand out **page-locked** host
+    # memory for (:meth:`ASREngine.new_audio_buffer`), in seconds of audio.
+    #
+    # A caller that fills a pinned buffer lets ``collate`` DMA each row straight
+    # into the padded device batch instead of packing the batch into staging
+    # first — one copy of the waveform after the codec instead of two, measured
+    # **1.12-1.18x** end-to-end offline (`.artifacts/engine_perf.md` §10.7).
+    # Page-locked memory is a process-global resource that the caching host
+    # allocator holds on to once taken, though, so the offer is bounded: past
+    # this many seconds the engine declines and the caller allocates ordinary
+    # heap memory, which still works and is merely the older, slower path.  The
+    # pinned high-water is therefore this cap times the number of requests
+    # in flight (`--max-concurrent-requests`).  ``0`` declines every request,
+    # which is also what a CPU engine does.
+    max_pinned_audio_seconds: float = 300.0
+
     # Set by the engine after model loading
     _model_config: Optional[BaseModelConfig] = field(default=None, repr=False)
 

@@ -109,6 +109,16 @@ step():
    each micro-batch is one gapless varlen-attention packed row.
 4. Restore the original input order before returning.
 
+**Where the waveform comes from matters to step 2.** A caller that fills
+`ASREngine.new_audio_buffer(n)` — page-locked host memory, which is what the
+Rust front-end does after the codec — lets `collate` DMA each row straight into
+the padded device batch. Anything else is packed into a pinned staging buffer
+first, because B separate copies out of pageable memory would each synchronise
+the stream before staging themselves. The pack is a second full copy of the
+audio, and skipping it measures **1.13–1.19×** on this path;
+`max_pinned_audio_seconds` bounds how much the engine will page-lock per
+request, since that memory is process-global.
+
 ### 4.2 Streaming transcription (chunk-by-chunk)
 
 `add_request(audio, streaming=True)` does **no fbank work**:

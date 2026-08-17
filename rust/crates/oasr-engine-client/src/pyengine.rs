@@ -197,7 +197,7 @@ impl PyEngine {
         priority: i32,
         decoding: Option<&DecodingParams>,
     ) -> Result<(), PyEngineError> {
-        let arr = audio_bytes_to_numpy(py, audio)?;
+        let arr = offline_audio_to_py(py, bound, audio)?;
         let kwargs = PyDict::new_bound(py);
         kwargs.set_item("audio", arr)?;
         kwargs.set_item("request_id", rid)?;
@@ -275,7 +275,7 @@ impl PyEngine {
                     priority,
                     decoding,
                 } => {
-                    let arr = audio_bytes_to_numpy(py, audio)?;
+                    let arr = offline_audio_to_py(py, bound, audio)?;
                     d.set_item("audio", arr)?;
                     d.set_item("request_id", rid.as_str())?;
                     d.set_item("sample_rate", *sample_rate)?;
@@ -641,6 +641,63 @@ pub fn assert_decoding_option_keys_match(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
+/// Set once the engine has told us it will not hand out pinned buffers, so a
+/// CPU engine (or one with the offer turned off) is asked exactly once instead
+/// of on every request.  Process-wide on purpose: whether host memory can be
+/// page-locked at all is a property of the process's CUDA context, not of one
+/// engine in the pool, and the *size* policy stays on the Python side where the
+/// memory lives (`EngineConfig.max_pinned_audio_seconds`).
+static PINNED_AUDIO_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Materialise one offline request's PCM payload into the buffer the engine
+/// will DMA from.
+///
+/// Preferred: `ASREngine.new_audio_buffer(n)` hands back **page-locked** host
+/// memory, so the copy below is the *only* copy of the waveform after the
+/// codec — the engine's `collate` can then DMA each row straight into the
+/// padded device batch instead of packing the micro-batch into staging first
+/// (measured 1.12-1.18x end-to-end offline).  We write through the tensor's
+/// `numpy()` view but hand the **tensor** on: PyTorch can only record the
+/// in-flight-copy event against the caching host allocator's block through the
+/// tensor whose storage it allocated, and an anonymous re-wrap of the same
+/// pages could be recycled under a live DMA.
+///
+/// Fallback: a plain numpy array on the Python heap, which is what this did
+/// before and what a CPU engine still gets.
+fn offline_audio_to_py<'py>(
+    py: Python<'py>,
+    engine: &Bound<'py, PyAny>,
+    audio: &[u8],
+) -> PyResult<Bound<'py, PyAny>> {
+    use std::sync::atomic::Ordering;
+
+    let n = audio.len() / std::mem::size_of::<f32>();
+    if n > 0 && !PINNED_AUDIO_OFF.load(Ordering::Relaxed) {
+        match engine.call_method1("new_audio_buffer", (n,)) {
+            Ok(buf) if !buf.is_none() => {
+                // `numpy()` shares the tensor's storage and keeps it alive
+                // through the array's `base`, so this writes the pinned pages
+                // themselves rather than a copy of them.
+                let view = buf.call_method0("numpy")?;
+                let arr: &Bound<'py, PyArray1<f32>> = view.downcast()?;
+                fill_f32_array(arr, audio)?;
+                return Ok(buf);
+            }
+            // `None` is the engine declining this request (CPU device, or past
+            // the pinned-audio cap) — not an error, and not a reason to stop
+            // asking, since the cap is per request.
+            Ok(_) => {}
+            Err(e) => {
+                // An older engine without the method, or one that cannot pin.
+                // Latch off rather than paying the exception per request.
+                PINNED_AUDIO_OFF.store(true, Ordering::Relaxed);
+                tracing::debug!(error = %e, "engine has no pinned audio buffers; using heap arrays");
+            }
+        }
+    }
+    Ok(audio_bytes_to_numpy(py, audio)?.into_any())
+}
+
 /// Decode raw little-endian f32 audio bytes into a writable numpy array on
 /// the Python heap.  Mirrors the worker's `np.frombuffer(payload, ...).copy()`
 /// fallback — the engine concatenates this with `audio_tail` and needs a
@@ -654,34 +711,49 @@ fn audio_bytes_to_numpy<'py>(py: Python<'py>, audio: &[u8]) -> PyResult<Bound<'p
     // batches.  x86 is little-endian, so the source byte layout matches the
     // destination; ragged tail bytes (len % 4 != 0) are dropped, mirroring
     // `np.frombuffer`.
-    let elem = std::mem::size_of::<f32>();
-    let n = audio.len() / elem;
-    // SAFETY: the array is left uninitialized only until the copy below fills
-    // every one of its `n * elem` bytes.  `f32` has no drop glue, so the early
+    let n = audio.len() / std::mem::size_of::<f32>();
+    // SAFETY: the array is left uninitialized only until `fill_f32_array` fills
+    // every one of its `n * 4` bytes.  `f32` has no drop glue, so the early
     // return on the (unreachable) contiguity error frees it safely too.
     let arr = unsafe { PyArray1::<f32>::new_bound(py, n, false) };
-    {
-        // Contiguity is an invariant of a freshly allocated 1-D array, but it
-        // comes back as a `Result` and this runs on the **dispatcher's OS
-        // thread** — the one thread that owns the GIL and the engine.  An
-        // `expect` here would unwind, drop the command receiver, and kill the
-        // single GPU worker for the life of the process (every later submit
-        // failing `WorkerDown`) without crashing the process or logging a
-        // cause: a silent one-way failure. Propagating turns a violated
-        // invariant into one failed request.
-        // SAFETY: no other reference to `arr` exists; the slice is dropped
-        // before `arr` is handed back.
-        let dst = unsafe { arr.as_slice_mut() }.map_err(|e| {
-            PyRuntimeError::new_err(format!("fresh 1-D numpy array is not contiguous: {e}"))
-        })?;
-        // SAFETY: `dst` is `n` contiguous, f32-aligned elements owned by a
-        // freshly allocated array; `audio` is a distinct allocation of at
-        // least `n * elem` bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(audio.as_ptr(), dst.as_mut_ptr().cast::<u8>(), n * elem);
-        }
-    }
+    fill_f32_array(&arr, audio)?;
     Ok(arr)
+}
+
+/// Bulk-copy `audio` (contiguous little-endian f32) into `arr`, which must hold
+/// exactly `audio.len() / 4` elements.
+///
+/// x86 is little-endian, so the source byte layout matches the destination and
+/// this is one memcpy — the per-element `from_le_bytes` decode it replaced
+/// dominated the dispatcher's per-tick admit cost on offline batches.  Ragged
+/// tail bytes (`len % 4 != 0`) are dropped, mirroring `np.frombuffer`.
+fn fill_f32_array(arr: &Bound<'_, PyArray1<f32>>, audio: &[u8]) -> PyResult<()> {
+    let elem = std::mem::size_of::<f32>();
+    let n = audio.len() / elem;
+    // Contiguity is an invariant of both callers' arrays (a fresh 1-D numpy
+    // allocation, and a 1-D torch tensor's `numpy()` view), but it comes back
+    // as a `Result` and this runs on the **dispatcher's OS thread** — the one
+    // thread that owns the GIL and the engine.  An `expect` here would unwind,
+    // drop the command receiver, and kill the single GPU worker for the life of
+    // the process (every later submit failing `WorkerDown`) without crashing
+    // the process or logging a cause: a silent one-way failure.  Propagating
+    // turns a violated invariant into one failed request.
+    // SAFETY: the caller has just created the array (or taken the sole view of
+    // a freshly allocated tensor); the slice is dropped before either escapes.
+    let dst = unsafe { arr.as_slice_mut() }
+        .map_err(|e| PyRuntimeError::new_err(format!("audio array is not contiguous: {e}")))?;
+    if dst.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "audio buffer holds {} samples, payload has {n}",
+            dst.len()
+        )));
+    }
+    // SAFETY: `dst` is `n` contiguous, f32-aligned elements; `audio` is a
+    // distinct allocation of at least `n * elem` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(audio.as_ptr(), dst.as_mut_ptr().cast::<u8>(), n * elem);
+    }
+    Ok(())
 }
 
 fn collect_model_info(
