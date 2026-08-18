@@ -190,6 +190,32 @@ def _dispatch_conv1d_activation(
 # subsampling).
 _CUDNN_IC_THRESHOLD = 8
 
+#: CUTLASS's implicit-GEMM Conv2D addresses its activation tensors with 32-bit
+#: **byte** offsets, so a single launch cannot span more than 2 GiB per tensor.
+#: Past that the kernel returns a plain failure status, which surfaced as an
+#: engine-wide empty transcript: at ``max_batch_size >= ~220`` the Conformer
+#: subsampling's second conv crosses the limit, the launcher raises, and the
+#: micro-batch retry that would have named the culprit died on already-released
+#: waveforms instead.  Splitting the batch dimension is exact — a batched
+#: convolution is independent across N — so the limit costs a few extra launches
+#: on an over-large batch rather than a failure.
+_CONV2D_MAX_TENSOR_BYTES = 2**31 - 1
+
+
+def _conv2d_rows_per_launch(input: torch.Tensor, out: torch.Tensor) -> int:
+    """How many leading rows the implicit-GEMM conv can address in one launch.
+
+    ``stride(0)`` rather than a shape product so a non-contiguous batch
+    dimension is measured as it is actually addressed.
+    """
+    per_row = max(
+        input.stride(0) * input.element_size(),
+        out.stride(0) * out.element_size(),
+    )
+    if per_row <= 0:
+        return int(input.shape[0])
+    return max(1, _CONV2D_MAX_TENSOR_BYTES // per_row)
+
 
 def _conv1d_output_length(
     seq_len: int, kernel_size: int, padding: int, stride: int, dilation: int
@@ -654,6 +680,31 @@ def conv2d_activation(
             IC,
             input.numel() // IC,
         )
+        return out
+
+    # Both implicit-GEMM backends below address their tensors with 32-bit byte
+    # offsets; a batch too wide for that runs as several launches over slices of
+    # the same tensors.  Checked before the tuner so a tuning run measures the
+    # shape that will actually be launched.
+    rows_per_launch = _conv2d_rows_per_launch(input, out)
+    n_rows = int(input.shape[0])
+    if n_rows > rows_per_launch:
+        for start in range(0, n_rows, rows_per_launch):
+            stop = min(start + rows_per_launch, n_rows)
+            conv2d_activation(
+                input[start:stop],
+                filter,
+                bias,
+                activation_type=activation_type,
+                pad_h=pad_h,
+                pad_w=pad_w,
+                stride_h=stride_h,
+                stride_w=stride_w,
+                dilation_h=dilation_h,
+                dilation_w=dilation_w,
+                out=out[start:stop],
+                groups=groups,
+            )
         return out
 
     if groups != 1:

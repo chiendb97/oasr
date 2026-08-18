@@ -211,6 +211,35 @@ def _load_waveforms(
     return waveforms, durations
 
 
+def _page_lock_waveforms(engine: "ASREngine", waveforms: List[torch.Tensor]) -> List[torch.Tensor]:
+    """Re-home ``waveforms`` into the engine's page-locked audio buffers.
+
+    This is what the Rust front-end does after the codec, and the offline path is
+    measurably different for it: a page-locked row is DMA'd straight into its
+    slice of the padded device batch, while an ordinary heap tensor is first
+    packed into pinned staging — a second full copy of every waveform.  A
+    benchmark that hands the engine ``torchaudio`` output measures the packing
+    path and therefore understates what a served request actually costs.
+
+    The offer is bounded (``max_pinned_audio_seconds``, since page-locked memory
+    is process-global), so ``new_audio_buffer`` returning ``None`` is normal —
+    those rows stay on the heap and the batch simply takes the pack path.
+
+    The **tensor** is what gets handed over, never a re-wrap of its pages: only
+    the tensor whose storage the allocator handed out can event-track an
+    in-flight DMA.
+    """
+    out: List[torch.Tensor] = []
+    for w in waveforms:
+        buf = engine.new_audio_buffer(w.numel())
+        if buf is None:
+            out.append(w)
+            continue
+        buf.copy_(w)
+        out.append(buf)
+    return out
+
+
 def _resolve_fst_file(wfst_path: Optional[str]) -> Optional[str]:
     """Resolve WFST directory or file to the HLG.pt path."""
     if wfst_path is None:
@@ -556,6 +585,7 @@ def _run_config(
     max_batch_frames: Optional[int] = None,
     admit_mode: str = "burst",
     decode_admit_window_ms: float = 0.0,
+    pinned_audio: bool = True,
 ) -> None:
     """Run one benchmark configuration and write results to *output*."""
 
@@ -613,6 +643,12 @@ def _run_config(
                 "chunk_size": chunk_size,
                 "num_left_chunks": num_left_chunks,
                 "max_batch_size": max_batch_size,
+                # One paged block holds one encoder chunk, so a chunk wider than
+                # the block is rejected at construction.  The sweep's own
+                # ``chunk_size: 32`` row hit exactly that and reported an
+                # ``[ERROR]`` line instead of a measurement — the widest chunk,
+                # the one worth comparing against, was the one that never ran.
+                "block_size_frames": max(EngineConfig.block_size_frames, chunk_size),
                 "fst_path": fst_file,
             }
             if decode_method is not None:
@@ -624,7 +660,8 @@ def _run_config(
             if not _family_matches(engine, subroutine, capability):
                 return
             shape_str = (
-                f"N={n}, chunk={chunk_size}, max_bs={max_batch_size}, " f"avg_dur={avg_dur:.1f}s"
+                f"N={n}, chunk={chunk_size}, block={cfg_kwargs['block_size_frames']}, "
+                f"max_bs={max_batch_size}, avg_dur={avg_dur:.1f}s"
             )
             _warmup_engine(engine, waveforms, is_streaming=True)
             median_ms, std_ms, rtf = _time_streaming(engine, waveforms, durations, num_iters)
@@ -659,6 +696,14 @@ def _run_config(
                     shape_str += f", admit={admit_mode}"
                     if decode_admit_window_ms:
                         shape_str += f"+{decode_admit_window_ms:.0f}ms"
+            if pinned_audio:
+                # Measure the path a served request takes.  Off (`--no-pinned-audio`)
+                # is the A/B arm, not the default: leaving it off measures the
+                # engine packing heap waveforms into staging, which no front-end
+                # asks it to do.
+                waveforms = _page_lock_waveforms(engine, waveforms)
+                n_pinned = sum(1 for w in waveforms if w.is_pinned())
+                shape_str += f", pinned={n_pinned}/{n}"
             _warmup_engine(engine, waveforms, is_streaming=False)
             if family is not None:
                 # Family subroutines report tick latency + tokens/s on top of
@@ -863,6 +908,7 @@ def run_test(args: argparse.Namespace, output: OutputWriter) -> None:
             max_packed_frames=max_packed_frames,
             max_batch_frames=max_batch_frames,
             admit_mode=getattr(args, "admit_mode", "burst") or "burst",
+            pinned_audio=not getattr(args, "no_pinned_audio", False),
         )
 
 

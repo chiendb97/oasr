@@ -662,16 +662,16 @@ class InputProcessor:
         if request.audio_final:
             raise RuntimeError(f"feed_chunk after is_last=True for request {request.request_id}")
 
-        # Normalise to a 1-D float32 CPU waveform (shared with the offline path)
-        # and apply the int16 ``audio_scale``.  Streaming keeps its scale on the
-        # CPU: it's a tiny per-chunk multiply feeding the chunk+tail concat, not
-        # the offline batch pad (the GPU scale-after-pad in ``collate`` is
-        # offline-only).
-        wav = torch.as_tensor(chunk, dtype=torch.float32, device="cpu").reshape(-1)
-        scale = self._config.audio_scale
-        if scale != 1.0:
-            wav = wav * scale
-        wav = wav.contiguous()
+        # Normalise to a 1-D float32 CPU waveform (shared with the offline path).
+        # ``audio_scale`` is **not** applied here: the chunk is copied again a
+        # moment later into the padded staging buffer, and a separate multiply
+        # is a whole extra pass over the waveform plus an allocation, per chunk
+        # per stream.  :meth:`_run_streaming_features` folds it into that copy
+        # instead (``torch.mul(..., out=)``), which is elementwise and therefore
+        # bit-identical to scaling before the tail concatenation.  Nothing
+        # between here and there reads the sample *values* — the scheduler and
+        # the streaming backends only ask whether the queue is empty.
+        wav = torch.as_tensor(chunk, dtype=torch.float32, device="cpu").reshape(-1).contiguous()
 
         request.audio_chunks.append(wav)
         request.samples_enqueued += wav.numel()
@@ -887,11 +887,20 @@ class InputProcessor:
         # Double-buffered + event-retired — see :meth:`_next_stream_slot`.  The
         # rotation is what keeps the pinned-staging win while making the reuse
         # ordering explicit instead of accidental.
+        # ``audio_scale`` rides on this copy rather than costing a pass of its
+        # own back in ``append_streaming_chunk`` — same values (the multiply is
+        # elementwise, so scaling before or after the tail concatenation is
+        # bit-identical), one fewer traversal of every waveform per stream per
+        # step, and no per-chunk allocation.
+        scale = self._config.audio_scale
         slot = self._next_stream_slot()
         padded_cpu = self._stream_host(slot, len(fbank_inputs), t_max)
         for i, w in enumerate(fbank_inputs):
             n = w.numel()
-            padded_cpu[i, :n] = w
+            if scale != 1.0:
+                torch.mul(w, scale, out=padded_cpu[i, :n])
+            else:
+                padded_cpu[i, :n] = w
             if n < t_max:
                 padded_cpu[i, n:].zero_()
         lengths_cpu = self._stream_lengths_host(slot, len(fbank_inputs)).copy_(lengths_cpu)
@@ -965,57 +974,97 @@ class InputProcessor:
         sample 0: frame ``F`` reads from buffer offset ``F * hop`` whatever the
         absolute alignment, so the same rule keeps a centered grid's look-back and
         a pre-emphasis history sample without knowing about either.
+
+        Every stream's append is *planned* first and then committed as one
+        ``torch._foreach_copy_``.  Issued one at a time this was the single
+        largest cost in the streaming step — 146 device-to-device copies per step
+        carrying 0.09 ms of work, 21% of the wall clock, because at streaming
+        cadence what a copy costs is the host submitting it, not the bytes.  The
+        multi-tensor form submits one kernel for the whole ready set; the pairs
+        are independent (each writes its own buffer's ``[have, have + n_new)``,
+        which no other pair reads), so batching cannot reorder anything.
         """
         hop = self.streaming_framing.hop
         feat_dim = self._feature_config.output_dim
         nvtx_push("distribute")
+        dsts: List[torch.Tensor] = []
+        srcs: List[torch.Tensor] = []
         for i, req in enumerate(fbank_reqs):
             new_nf = int(feat_lens_cpu[i])
             if new_nf > 0:
-                self._append_features(req, feats[i, :new_nf, :], feat_dim)
+                self._plan_append_features(req, feats[i, :new_nf, :], feat_dim, dsts, srcs)
             consumed = new_nf * hop
             cat = fbank_inputs[i]
             if fbank_flush[i] or consumed >= cat.numel():
                 req.audio_tail = cat.new_empty(0)
             else:
                 req.audio_tail = cat[consumed:].contiguous()
+        if dsts:
+            if len(dsts) == 1:
+                dsts[0].copy_(srcs[0])
+            else:
+                torch._foreach_copy_(dsts, srcs)
         nvtx_pop()
 
-    def _append_features(
+    def _plan_append_features(
         self,
         request: Request,
         new_frames: torch.Tensor,
         feat_dim: int,
+        dsts: List[torch.Tensor],
+        srcs: List[torch.Tensor],
     ) -> None:
-        """Append ``new_frames`` to ``request.feature_buffer``.
+        """Grow/compact ``request.feature_buffer`` and queue the append copies.
 
-        The buffer grows amortised-doubled so we never pay an O(T) copy per
-        chunk at steady state.  Consumed prefix (before ``feature_cursor``)
-        is compacted opportunistically so long utterances don't keep
-        re-allocating.
+        Everything that has to happen in order — the reallocation decision and
+        the frame-count bookkeeping — happens here; the copies themselves are
+        appended to ``dsts`` / ``srcs`` for the caller's single batched submit.
+        The buffer grows amortised-doubled so we never pay an O(T) copy per chunk
+        at steady state, and the consumed prefix (before ``feature_cursor``) is
+        dropped opportunistically so long utterances don't keep re-allocating.
+
+        Every queued pair reads either ``feats`` or *this* request's outgoing
+        buffer and writes a freshly allocated one, so no pair in the batch reads
+        what another writes — which is what lets them go in one
+        ``torch._foreach_copy_``, whose members are unordered with respect to
+        each other.  That is also why dropping the prefix is folded into the
+        reallocation instead of compacting first: a standalone compaction leaves
+        a buffer exactly as long as what it kept, so a grow *always* followed it,
+        chaining old→keep→new — two copies of the same frames, and two copies
+        that could not have shared a batch.
         """
         n_new = new_frames.size(0)
         buf = request.feature_buffer
         have = request.feature_frames
+        cursor = request.feature_cursor
 
-        # Compact the buffer if the consumed prefix is a large share of it
-        # (cheap amortised, avoids unbounded growth on long streams).
-        if buf is not None and request.feature_cursor > 0 and request.feature_cursor >= have // 2:
-            keep = buf[request.feature_cursor : have].contiguous()
-            request.feature_buffer = keep
-            buf = request.feature_buffer
-            request.feature_frames = keep.size(0)
-            have = request.feature_frames
-            request.feature_cursor = 0
+        drop_prefix = buf is not None and cursor > 0 and cursor >= have // 2
+        if drop_prefix:
+            keep_n = have - cursor
+            src_start = cursor
+            # What the old two-step form would have left to double from.
+            old_cap = keep_n
+        else:
+            keep_n = have
+            src_start = 0
+            old_cap = buf.size(0) if buf is not None else 0
 
-        needed = have + n_new
-        if buf is None or needed > buf.size(0):
-            cap = max(needed, (buf.size(0) * 2) if buf is not None else max(needed, 128))
+        needed = keep_n + n_new
+        if buf is None or drop_prefix or needed > buf.size(0):
+            cap = max(needed, old_cap * 2) if buf is not None else max(needed, 128)
             new_buf = new_frames.new_zeros(cap, feat_dim)
-            if buf is not None and have > 0:
-                new_buf[:have] = buf[:have]
+            if buf is not None and keep_n > 0:
+                # Queued before ``request.feature_buffer`` is reassigned, so the
+                # view keeps the outgoing storage alive across the batched submit
+                # — otherwise the allocator could hand it straight back as some
+                # later request's ``new_buf`` while this copy is still pending.
+                dsts.append(new_buf[:keep_n])
+                srcs.append(buf[src_start : src_start + keep_n])
             request.feature_buffer = new_buf
             buf = new_buf
+            if drop_prefix:
+                request.feature_cursor = 0
 
-        buf[have : have + n_new] = new_frames
-        request.feature_frames = have + n_new
+        dsts.append(buf[keep_n : keep_n + n_new])
+        srcs.append(new_frames)
+        request.feature_frames = keep_n + n_new

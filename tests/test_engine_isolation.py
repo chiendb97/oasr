@@ -188,6 +188,55 @@ class TestOfflineIsolation:
         assert all(o.finish_reason is None for o in outs)
         assert len(runner.chunks_seen) == 1
 
+    def test_a_post_collate_failure_isolates_over_the_features(self, caplog):
+        """After collation the waveforms are gone, so the retry cannot re-collate.
+
+        ``InputProcessor.collate`` releases ``request.audio`` once the GPU
+        feature tensor owns the batch.  Re-running the whole micro-batch per
+        request therefore dies on ``NoneType.size`` — and *that* is what every
+        request in the batch got told, including the healthy ones, while the
+        real cause never reached a log line.  It shipped: a conv kernel failing
+        on an over-wide batch (``max_batch_size >= ~220``) returned empty
+        transcripts for the entire corpus under an ``AttributeError`` about
+        waveforms.  Past collate the isolation pass runs over the features
+        already built, which needs no waveform.
+        """
+        import logging
+
+        runner = _Poisoned("bad", ValueError("Conv2DActivation kernel failed"))
+        ex = _offline_executor(runner)
+        base_collate = ex._collate
+
+        def releasing_collate(chunk):
+            # Exactly the real one's hazard: refuses a second pass, because the
+            # waveforms it needs were handed to the GPU on the first.
+            if any(r.audio is None for r in chunk):
+                raise AttributeError("'NoneType' object has no attribute 'size'")
+            out = base_collate(chunk)
+            for r in chunk:
+                r.audio = None
+            return out
+
+        batch = [_request("a"), _request("bad"), _request("c")]
+        for req in batch:
+            req.audio = torch.zeros(4)
+        ex._collate = releasing_collate
+
+        with caplog.at_level(logging.WARNING, logger="oasr.engine.executor.offline"):
+            outs = {o.request_id: o for o in ex.run(batch)}
+
+        # The peers survive — under the old retry they died on the re-collate.
+        assert outs["a"].text == "ok-a" and outs["c"].text == "ok-c"
+        assert outs["a"].finish_reason is None and outs["c"].finish_reason is None
+        assert outs["bad"].finish_reason == "error"
+        assert outs["bad"].error_stage == "offline_forward"
+        # The isolation pass reran the rows, not the collation.
+        assert runner.chunks_seen == [["a", "bad", "c"], ["a"], ["bad"], ["c"]]
+        # And the log names the real cause rather than the released waveform.
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        assert "Conv2DActivation kernel failed" in text
+        assert "NoneType" not in text
+
 
 # ---------------------------------------------------------------------------
 # Streaming: a failed cohort must not drain the pool

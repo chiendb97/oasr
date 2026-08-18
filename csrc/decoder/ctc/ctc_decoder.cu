@@ -918,3 +918,72 @@ void ctc_beam_search_read_state(TensorView out_tokens, TensorView out_times,
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "CTC beam search read state failed: " << cudaGetErrorString(status);
 }
+
+// Batched form of the above: one launch for the whole ready set instead of
+// 3-4 ``cudaMemcpy2DAsync`` (flat) or one kernel (paged) per state.  This is
+// the read half of what ``ctc_beam_search_chunk_batched`` did for the decode —
+// at 64 concurrent streams the per-state form submits ~200 tiny GPU operations
+// per engine step carrying ~0.1 ms of copy, and the host time to issue them
+// dominates the streaming loop.
+//
+// Tensor layout:
+//   * ``state_ptrs``  : ``(N,)`` int64 on **CPU**, state buffer device pointers.
+//   * ``steps``       : ``(N,)`` int32 on **CPU**, each state's decoder step.
+//   * ``out_tokens``  : ``(N, batch, beam, max_out_len)`` int32 on CUDA.
+//   * ``out_times``   : same shape, or empty to skip emission frames.
+//   * ``out_lengths`` : ``(N, batch, beam)`` int32 on CUDA.
+//   * ``out_scores``  : ``(N, batch, beam)`` float32 on CUDA.
+//
+// All N states share one ``GpuDecoderConfig``, hence one ``(batch, beam,
+// vocab_size, max_seq_len, use_paged_memory, page_size)`` for the whole call.
+void ctc_beam_search_read_state_batched(TensorView out_tokens, TensorView out_times,
+                                        TensorView out_lengths,
+                                        TensorView out_scores, TensorView state_ptrs,
+                                        TensorView steps,
+                                        int64_t batch, int64_t beam,
+                                        int64_t vocab_size, int64_t max_seq_len,
+                                        int64_t use_paged_memory, int64_t page_size) {
+  CHECK_INPUT(out_tokens);
+  CHECK_INPUT(out_lengths);
+  CHECK_INPUT(out_scores);
+  CHECK_DIM(4, out_tokens);   // [N, batch, beam, max_out_len]
+  CHECK_DIM(3, out_lengths);  // [N, batch, beam]
+  CHECK_DIM(3, out_scores);
+
+  int n_states = out_tokens.size(0);
+  if (n_states == 0) return;
+
+  TVM_FFI_ICHECK(state_ptrs.dtype().code == kDLInt && state_ptrs.dtype().bits == 64)
+      << "state_ptrs must be int64";
+  TVM_FFI_ICHECK(state_ptrs.size(0) == n_states)
+      << "state_ptrs length (" << state_ptrs.size(0) << ") must equal out_tokens.shape[0] ("
+      << n_states << ")";
+  TVM_FFI_ICHECK(steps.dtype().code == kDLInt && steps.dtype().bits == 32)
+      << "steps must be int32";
+  TVM_FFI_ICHECK(steps.size(0) == n_states)
+      << "steps length (" << steps.size(0) << ") must equal out_tokens.shape[0] ("
+      << n_states << ")";
+  TVM_FFI_ICHECK(out_tokens.size(1) == batch && out_tokens.size(2) == beam)
+      << "out_tokens must be [N, batch, beam, max_out_len]";
+
+  int max_out_len = out_tokens.size(3);
+  cudaStream_t stream = get_stream(out_tokens.device());
+
+  cudaError_t status = ctc_decoder::read_streaming_results_batched(
+      static_cast<const int64_t*>(state_ptrs.data_ptr()),
+      static_cast<const int*>(steps.data_ptr()),
+      n_states,
+      static_cast<int*>(out_tokens.data_ptr()),
+      static_cast<int*>(out_lengths.data_ptr()),
+      static_cast<float*>(out_scores.data_ptr()),
+      max_out_len,
+      static_cast<int>(batch), static_cast<int>(beam),
+      static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
+      static_cast<int>(use_paged_memory), static_cast<int>(page_size),
+      0,  // num_pages=0 → auto
+      stream,
+      out_times.numel() > 0 ? static_cast<int*>(out_times.data_ptr()) : nullptr);
+
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "CTC batched beam search read state failed: " << cudaGetErrorString(status);
+}

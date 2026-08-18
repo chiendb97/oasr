@@ -662,6 +662,141 @@ class TestCtcDecoderAsyncPeek:
 
 
 # ---------------------------------------------------------------------------
+# Batched read-back
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cuda
+class TestCtcDecoderBatchedReadBack:
+    """``ctc_beam_search_read_state_batched`` — one launch for the whole ready set.
+
+    The per-state launcher costs 3-4 ``cudaMemcpy2DAsync`` (flat) or one kernel
+    (paged) *each*, which at streaming pool sizes is the largest source of tiny
+    GPU operations in the step.  The batched form reaches state ``i`` at a
+    constant byte delta off state 0, so what has to hold is that every stream
+    still reads *its own* buffers: an off-by-one in the delta arithmetic returns
+    a neighbouring stream's transcript, which is plausible output rather than a
+    crash.  Hence the comparison against the per-state path rather than against
+    expected tokens.
+    """
+
+    @staticmethod
+    def _decoded_states(decoder, paths, V, device):
+        states = [decoder.create_state(batch=1, vocab_size=V, device=device) for _ in paths]
+        for state, path in zip(states, paths):
+            decoder.decode_chunk(_make_logp_gpu(len(path), V, path, device), state=state)
+        return states
+
+    @pytest.mark.parametrize("use_paged", [False, True], ids=["flat", "paged"])
+    @pytest.mark.parametrize("want_times", [False, True], ids=["tokens", "tokens+times"])
+    # 65 and 130 straddle the 64-stream group the launcher batches in, which is
+    # where a per-group base pointer would be reused for the wrong group.
+    @pytest.mark.parametrize("n_states", [1, 3, 64, 65, 130])
+    def test_matches_per_state_read(self, device, use_paged, want_times, n_states):
+        V = 7
+        decoder = GpuStreamingDecoder(
+            GpuDecoderConfig(
+                beam_size=3, blank_id=0, max_seq_len=16, use_paged_memory=use_paged, page_size=16
+            )
+        )
+        # Distinct per stream, so a stream reading a neighbour's state is visible.
+        paths = [[1 + (i % (V - 1)), 0, 1 + ((i + 1) % (V - 1))] for i in range(n_states)]
+        states = self._decoded_states(decoder, paths, V, device)
+
+        batched = decoder.peek_states(states, want_times=want_times)
+        per_state = [decoder.peek_state(state=s, want_times=want_times) for s in states]
+
+        assert len(batched) == n_states
+        for i, (got, want) in enumerate(zip(batched, per_state)):
+            assert got.tokens[0] == want.tokens[0], f"stream {i} tokens"
+            assert torch.equal(got.lengths.cpu(), want.lengths.cpu()), f"stream {i} lengths"
+            assert torch.equal(got.scores.cpu(), want.scores.cpu()), f"stream {i} scores"
+            if want_times:
+                assert list(got.times[0][0]) == list(want.times[0][0]), f"stream {i} times"
+
+    def test_streams_at_different_steps(self, device):
+        """Per-state ``step`` picks the parity, so a shared one reads stale beams.
+
+        The beam state is double-buffered and the live half is ``(step - 1) % 2``.
+        Streams in one ready set are at different steps — that is the normal
+        condition, not an edge case — so the depths below are unequal *and* the
+        tokens differ per frame: a path of one repeated token writes the same
+        thing into both parities, which would let a shared-step read pass.
+        """
+        V = 5
+        decoder = GpuStreamingDecoder(GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=16))
+        states = [decoder.create_state(batch=1, vocab_size=V, device=device) for _ in range(4)]
+        # Depths 1..4, and every emitted token distinct from its neighbour so the
+        # two parity buffers hold genuinely different sequences.
+        for depth, state in enumerate(states, start=1):
+            path = [1 + (t % (V - 1)) for t in range(depth)]
+            decoder.decode_chunk(_make_logp_gpu(depth, V, path, device), state=state)
+
+        batched = decoder.peek_states(states)
+        per_state = [decoder.peek_state(state=s) for s in states]
+        assert [s.step for s in states] == [1, 2, 3, 4]
+        assert [r.tokens[0][0] for r in batched] == [[1], [1, 2], [1, 2, 3], [1, 2, 3, 4]]
+        assert [r.tokens[0][0] for r in batched] == [r.tokens[0][0] for r in per_state]
+
+
+# ---------------------------------------------------------------------------
+# Blank-mask staging
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cuda
+class TestCtcDecoderBlankMask:
+    """The auto-computed blank mask must decode exactly like an explicit one.
+
+    ``decode_chunk_batch`` reads the mask back through reused page-locked
+    staging rather than a fresh pageable ``.cpu()``.  The mask decides which
+    frames are *decoded at all*, so a stale or mis-strided read is a silent
+    transcript change — and the buffers are grow-only and reused across steps,
+    which is precisely where a stale read would come from.
+    """
+
+    def test_auto_mask_matches_explicit_mask(self, device):
+        import math
+
+        V = 6
+        thresh = 0.98
+        decoder = GpuStreamingDecoder(
+            GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=32, blank_threshold=thresh)
+        )
+        auto = [decoder.create_state(batch=1, vocab_size=V, device=device) for _ in range(5)]
+        explicit = [decoder.create_state(batch=1, vocab_size=V, device=device) for _ in range(5)]
+
+        torch.manual_seed(7)
+        for _ in range(3):
+            log_probs = torch.randn(5, 6, V, device=device).log_softmax(-1)
+            decoder.decode_chunk_batch(log_probs, auto)
+            mask = log_probs[:, :, 0].lt(math.log(thresh)).to(torch.uint8).cpu().contiguous()
+            decoder.decode_chunk_batch(log_probs, explicit, is_speech_mask=mask)
+
+        assert [s.step for s in auto] == [s.step for s in explicit]
+        got = decoder.peek_states(auto)
+        want = decoder.peek_states(explicit)
+        assert [r.tokens[0][0] for r in got] == [r.tokens[0][0] for r in want]
+
+    def test_shrinking_then_growing_ready_set(self, device):
+        """Grow-only staging: a narrower step must not read the wider one's rows."""
+        V = 6
+        decoder = GpuStreamingDecoder(
+            GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=32, blank_threshold=0.98)
+        )
+        pool = [decoder.create_state(batch=1, vocab_size=V, device=device) for _ in range(8)]
+        torch.manual_seed(11)
+        for n_ready in (8, 2, 5, 8):
+            log_probs = torch.randn(n_ready, 4, V, device=device).log_softmax(-1)
+            ready = pool[:n_ready]
+            before = [s.step for s in ready]
+            decoder.decode_chunk_batch(log_probs, ready)
+            # Every frame either decoded or skipped as blank — never more.
+            assert all(0 <= s.step - b <= 4 for s, b in zip(ready, before))
+        assert all(s.step > 0 for s in pool[:2])
+
+
+# ---------------------------------------------------------------------------
 # Workspace size tests
 # ---------------------------------------------------------------------------
 

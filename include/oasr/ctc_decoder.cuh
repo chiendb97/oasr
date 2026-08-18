@@ -4043,6 +4043,240 @@ inline cudaError_t read_streaming_results(void* state_buffer, int* out_tokens, i
 }
 
 // =============================================================================
+// Streaming: read results for MANY states in one launch
+//
+// ``read_streaming_results`` costs 3-4 ``cudaMemcpy2DAsync`` (flat) or one
+// kernel (paged) **per state**.  Called once per stream per engine step to
+// surface partial transcripts, that is the largest source of tiny GPU
+// operations in the streaming loop: at 64 concurrent streams a profile shows
+// ~200 launches carrying ~0.1 ms of actual copy — the host time to submit them
+// is an order of magnitude more than the work they do.
+//
+// The batched form uses the same by-value byte-delta trick as the fused chunk
+// decoder (``FusedStreamGroup``): every streaming state is allocated from one
+// ``GpuDecoderConfig``, so the layouts are identical and stream ``i`` reaches
+// its buffers at a constant offset from stream 0.  One kernel then covers the
+// whole ready set.
+//
+// Output layout matches N stacked single-state reads: ``out_tokens`` is
+// ``[n_states, batch, beam, max_out_len]`` (flattened), ``out_lengths`` and
+// ``out_scores`` are ``[n_states, batch, beam]``.  Only ``[0, length)`` of each
+// token row is written — every consumer clamps to the length, and what the
+// per-state ``cudaMemcpy2DAsync`` copied past it was stale beam state.
+// =============================================================================
+
+namespace read_batched {
+
+//: Streams covered by one launch.  Matched to ``FusedStreamGroup::CAP`` so the
+//: read-back groups the way the decode does; the struct crosses as a kernel
+//: argument, hence a fixed cap rather than a device array whose lifetime the
+//: caller would have to keep alive against an in-flight copy.
+static constexpr int CAP = 64;
+
+struct ReadGroup {
+    long long delta[CAP];  // state-buffer byte offset vs the group's first stream
+    int step[CAP];         // per-state decoder step (picks the parity)
+    int n;
+};
+
+}  // namespace read_batched
+
+__global__ void read_states_dense_kernel(const int* __restrict__ clen0,
+                                         const int* __restrict__ clen1,
+                                         const int* __restrict__ clist0,
+                                         const int* __restrict__ clist1,
+                                         const int* __restrict__ ctime0,
+                                         const int* __restrict__ ctime1,
+                                         const float* __restrict__ score,
+                                         read_batched::ReadGroup grp, int ldbeam, int ldseq_len,
+                                         int* __restrict__ out_tokens, int* __restrict__ out_times,
+                                         int* __restrict__ out_lengths,
+                                         float* __restrict__ out_scores, int batch, int beam,
+                                         int max_out_len) {
+    const int i = blockIdx.x;  // stream slot within the group
+    const int k = blockIdx.y;  // beam
+    const int b = blockIdx.z;  // batch row
+    if (i >= grp.n || k >= beam || b >= batch)
+        return;
+
+    const long long d = grp.delta[i];
+    const int step = grp.step[i];
+    const int parity = (step <= 1) ? 0 : ((step - 1) % 2);
+
+    const int* clen = reinterpret_cast<const int*>(fused::group_shift(parity == 0 ? clen0 : clen1, d));
+    const int* clist = reinterpret_cast<const int*>(fused::group_shift(parity == 0 ? clist0 : clist1, d));
+    const float* sc = reinterpret_cast<const float*>(fused::group_shift(score, d));
+    const int* ct = nullptr;
+    const int* ct_base = (parity == 0) ? ctime0 : ctime1;
+    if (out_times && ct_base)
+        ct = reinterpret_cast<const int*>(fused::group_shift(ct_base, d));
+
+    const int src_scalar = b * ldbeam + k;
+    const int len = clen[src_scalar];
+    const int copy_len = (len < max_out_len) ? len : max_out_len;
+
+    const size_t src_row = static_cast<size_t>(b * beam + k) * ldseq_len;
+    const size_t dst_row =
+        (static_cast<size_t>(i) * batch * beam + static_cast<size_t>(b * beam + k)) * max_out_len;
+    for (int pos = threadIdx.x; pos < copy_len; pos += blockDim.x) {
+        out_tokens[dst_row + pos] = clist[src_row + pos];
+        if (ct)
+            out_times[dst_row + pos] = ct[src_row + pos];
+    }
+
+    if (threadIdx.x == 0) {
+        const int dst_scalar = (i * batch + b) * beam + k;
+        // Raw, not clamped: identical to what the per-state
+        // ``cudaMemcpy2DAsync`` wrote, and every consumer clamps itself.
+        out_lengths[dst_scalar] = len;
+        out_scores[dst_scalar] = sc[src_scalar];
+    }
+}
+
+__global__ void read_states_paged_kernel(
+    const int* __restrict__ page_storage, const int* __restrict__ time_storage,
+    const int* __restrict__ block_table0, const int* __restrict__ block_table1,
+    const int* __restrict__ select_seq_lens, const int* __restrict__ clen0,
+    const int* __restrict__ clen1, const float* __restrict__ score, read_batched::ReadGroup grp,
+    int ldbeam, int* __restrict__ out_tokens, int* __restrict__ out_times,
+    int* __restrict__ out_lengths, float* __restrict__ out_scores, int batch, int beam,
+    int max_out_len, int page_size, int max_lp) {
+    const int i = blockIdx.x;
+    const int k = blockIdx.y;
+    const int b = blockIdx.z;
+    if (i >= grp.n || k >= beam || b >= batch)
+        return;
+
+    const long long d = grp.delta[i];
+    const int max_select_seq_len = grp.step[i];
+
+    const int* ssl = reinterpret_cast<const int*>(fused::group_shift(select_seq_lens, d));
+    // Same parity rule as ``gather_paged_results_kernel``: in streaming mode
+    // ``select_seq_lens`` is the identity mapping (= max_seq_len), so it has to
+    // be clamped to the actual step count before the parity is read off it.
+    int nsteps = ssl[b];
+    if (nsteps > max_select_seq_len)
+        nsteps = max_select_seq_len;
+    const int batch_parity = (nsteps <= 1) ? 0 : (nsteps - 1) % 2;
+    const int final_parity = (max_select_seq_len <= 1) ? 0 : (max_select_seq_len - 1) % 2;
+    const int use_parity = (batch_parity == final_parity) ? final_parity : batch_parity;
+
+    const int* clen = reinterpret_cast<const int*>(fused::group_shift(use_parity == 0 ? clen0 : clen1, d));
+    const int* bt =
+        reinterpret_cast<const int*>(fused::group_shift(use_parity == 0 ? block_table0 : block_table1, d));
+    const int* ps = reinterpret_cast<const int*>(fused::group_shift(page_storage, d));
+    const int* ts =
+        time_storage ? reinterpret_cast<const int*>(fused::group_shift(time_storage, d)) : nullptr;
+    const float* sc = reinterpret_cast<const float*>(fused::group_shift(score, d));
+
+    const int src_scalar = b * ldbeam + k;
+    const int len = clen[src_scalar];
+    const int copy_len = (len < max_out_len) ? len : max_out_len;
+
+    const int bk = b * beam + k;
+    const size_t dst_row =
+        (static_cast<size_t>(i) * batch * beam + static_cast<size_t>(bk)) * max_out_len;
+    for (int pos = threadIdx.x; pos < copy_len; pos += blockDim.x) {
+        const int lp = pos / page_size;
+        const int off = pos - lp * page_size;
+        const int phys = bt[bk * max_lp + lp];
+        out_tokens[dst_row + pos] = ps[phys * page_size + off];
+        if (out_times && ts)
+            out_times[dst_row + pos] = ts[phys * page_size + off];
+    }
+
+    if (threadIdx.x == 0) {
+        const int dst_scalar = (i * batch + b) * beam + k;
+        out_lengths[dst_scalar] = copy_len;
+        out_scores[dst_scalar] = sc[src_scalar];
+    }
+}
+
+// ``state_ptrs`` / ``steps`` are host arrays of length ``n_states``; the outputs
+// are device buffers sized for all N.  Every state must share the ``(batch,
+// beam, vocab_size, max_seq_len, use_paged_memory, page_size)`` config — the
+// engine builds them all from one ``GpuDecoderConfig``.
+//
+// A group whose state pointers are not ALIGN_BYTES-congruent falls back to the
+// per-state path for that group: the internal-pointer round-up would not cancel
+// identically, so the byte deltas would address the wrong buffers.
+inline cudaError_t read_streaming_results_batched(const int64_t* state_ptrs, const int* steps,
+                                                  int n_states, int* out_tokens, int* out_lengths,
+                                                  float* out_scores, int max_out_len, int batch,
+                                                  int beam, int vocab_size, int max_seq_len,
+                                                  int use_paged_memory, int page_size,
+                                                  int num_pages, cudaStream_t stream,
+                                                  int* out_times = nullptr) {
+    using read_batched::ReadGroup;
+
+    const size_t tok_stride = static_cast<size_t>(batch) * beam * max_out_len;
+    const size_t scalar_stride = static_cast<size_t>(batch) * beam;
+
+    for (int g0 = 0; g0 < n_states; g0 += read_batched::CAP) {
+        const int gn = min(read_batched::CAP, n_states - g0);
+
+        void* base0 = reinterpret_cast<void*>(state_ptrs[g0]);
+        void* workspace = reinterpret_cast<char*>(base0) + STATE_HEADER_SIZE;
+        InternalData data;
+        if (use_paged_memory) {
+            setup_internal_data_paged_pointers(&data, workspace, batch, beam, vocab_size,
+                                               max_seq_len, page_size, num_pages);
+        } else {
+            setup_internal_data_pointers(&data, workspace, batch, beam, vocab_size, max_seq_len);
+        }
+
+        ReadGroup grp;
+        grp.n = gn;
+        bool deltas_ok = true;
+        for (int s = 0; s < gn; ++s) {
+            const long long d = static_cast<long long>(state_ptrs[g0 + s] - state_ptrs[g0]);
+            grp.delta[s] = d;
+            grp.step[s] = steps[g0 + s];
+            if (d % ALIGN_BYTES != 0)
+                deltas_ok = false;
+        }
+
+        if (!deltas_ok) {
+            for (int s = 0; s < gn; ++s) {
+                const int i = g0 + s;
+                cudaError_t err = read_streaming_results(
+                    reinterpret_cast<void*>(state_ptrs[i]), out_tokens + i * tok_stride,
+                    out_lengths + i * scalar_stride, out_scores + i * scalar_stride, max_out_len,
+                    steps[i], batch, beam, vocab_size, max_seq_len, use_paged_memory, page_size,
+                    num_pages, stream, out_times ? out_times + i * tok_stride : nullptr);
+                if (err != cudaSuccess)
+                    return err;
+            }
+            continue;
+        }
+
+        const dim3 grid(gn, beam, batch);
+        int* tok_out = out_tokens + static_cast<size_t>(g0) * tok_stride;
+        int* time_out = out_times ? out_times + static_cast<size_t>(g0) * tok_stride : nullptr;
+        int* len_out = out_lengths + static_cast<size_t>(g0) * scalar_stride;
+        float* score_out = out_scores + static_cast<size_t>(g0) * scalar_stride;
+
+        if (use_paged_memory) {
+            auto& ps = data.paged;
+            read_states_paged_kernel<<<grid, 256, 0, stream>>>(
+                ps.page_storage, ps.time_storage, ps.block_table[0], ps.block_table[1],
+                data.select_seq_lens, data.clen[0], data.clen[1], data.score, grp, data.ldbeam,
+                tok_out, time_out, len_out, score_out, batch, beam, max_out_len, ps.page_size,
+                ps.max_logical_pages);
+        } else {
+            read_states_dense_kernel<<<grid, 256, 0, stream>>>(
+                data.clen[0], data.clen[1], data.clist[0], data.clist[1], data.ctime[0],
+                data.ctime[1], data.score, grp, data.ldbeam, data.ldseq_len, tok_out, time_out,
+                len_out, score_out, batch, beam, max_out_len);
+        }
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            return err;
+    }
+    return cudaSuccess;
+}
+
+// =============================================================================
 // Paged kernel: first step — write initial tokens into pre-allocated page 0
 //
 // Each (batch, beam) pair has physical page = bid * beam + k pre-allocated in

@@ -1198,3 +1198,100 @@ class TestMelLogGuards:
                 self._filters(),
                 frame_lengths=torch.tensor([5], dtype=torch.int32, device="cuda"),
             )
+
+
+class TestStreamingFeatureAppend:
+    """``_plan_append_features`` — the batched feature-buffer append.
+
+    Appending each stream's new frames one call at a time was 146 device-to-device
+    copies per streaming step carrying 0.09 ms of work: 21% of the wall clock
+    spent submitting copies, not making them.  The batched form plans every
+    stream's growth on the host and commits the copies as one
+    ``torch._foreach_copy_``, whose members are unordered with respect to each
+    other — so what has to hold is that no queued pair reads what another writes,
+    and that the buffer contents are what the per-stream form produced.
+
+    The compaction path is the one that had to change shape: a standalone
+    compaction left a buffer exactly as long as what it kept, so a grow *always*
+    followed it, chaining old->keep->new.  Two copies of the same frames, and two
+    that could not have shared a batch.
+    """
+
+    def _proc(self):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.input_processor import InputProcessor
+
+        return InputProcessor(EngineConfig(ckpt_dir="x", device="cpu"), torch.device("cpu"))
+
+    @staticmethod
+    def _req():
+        from oasr.engine.request import Request
+
+        req = Request(request_id="r", streaming=True)
+        req.feature_buffer = None
+        req.feature_frames = 0
+        req.feature_cursor = 0
+        return req
+
+    def _append(self, proc, req, frames, feat_dim):
+        dsts, srcs = [], []
+        proc._plan_append_features(req, frames, feat_dim, dsts, srcs)
+        for d, s in zip(dsts, srcs):
+            d.copy_(s)
+        return req
+
+    def test_appends_are_contiguous_and_ordered(self):
+        proc, req, F = self._proc(), self._req(), 4
+        expected = []
+        for step in range(6):
+            frames = torch.full((3, F), float(step))
+            expected.append(frames)
+            self._append(proc, req, frames, F)
+        want = torch.cat(expected)
+        assert req.feature_frames == want.size(0)
+        torch.testing.assert_close(req.feature_buffer[: req.feature_frames], want)
+
+    def test_consumed_prefix_is_dropped_without_losing_live_frames(self):
+        """Compaction moves the cursor to 0 and keeps everything after it."""
+        proc, req, F = self._proc(), self._req(), 4
+        for step in range(4):
+            self._append(proc, req, torch.full((4, F), float(step)), F)
+        assert req.feature_frames == 16
+
+        req.feature_cursor = 12  # >= have // 2, so the next append compacts
+        live = req.feature_buffer[12:16].clone()
+        self._append(proc, req, torch.full((4, F), 99.0), F)
+
+        assert req.feature_cursor == 0, "compaction must rebase the cursor"
+        assert req.feature_frames == 8
+        torch.testing.assert_close(req.feature_buffer[:4], live)
+        torch.testing.assert_close(req.feature_buffer[4:8], torch.full((4, F), 99.0))
+
+    def test_compaction_relocates_once(self):
+        """Not old->keep->new: one allocation, one copy of the retained frames."""
+        proc, req, F = self._proc(), self._req(), 4
+        for step in range(4):
+            self._append(proc, req, torch.full((4, F), float(step)), F)
+        req.feature_cursor = 12
+
+        dsts, srcs = [], []
+        proc._plan_append_features(req, torch.full((4, F), 99.0), F, dsts, srcs)
+        assert len(dsts) == 2, "one relocation copy plus the append, and no more"
+        # Every destination lives in the new buffer; no source does — which is
+        # what makes the pairs safe to run unordered.
+        new_storage = req.feature_buffer.untyped_storage().data_ptr()
+        assert all(d.untyped_storage().data_ptr() == new_storage for d in dsts)
+        assert all(s.untyped_storage().data_ptr() != new_storage for s in srcs)
+
+    def test_growth_preserves_the_unconsumed_prefix(self):
+        """A grow with a small cursor must not drop the frames before it."""
+        proc, req, F = self._proc(), self._req(), 4
+        self._append(proc, req, torch.arange(200 * F, dtype=torch.float32).reshape(200, F), F)
+        req.feature_cursor = 1  # well under have // 2: no compaction, only growth
+        before = req.feature_buffer[:200].clone()
+        self._append(proc, req, torch.full((200, F), 7.0), F)
+
+        assert req.feature_cursor == 1, "growth alone must not rebase the cursor"
+        assert req.feature_frames == 400
+        torch.testing.assert_close(req.feature_buffer[:200], before)
+        torch.testing.assert_close(req.feature_buffer[200:400], torch.full((200, F), 7.0))

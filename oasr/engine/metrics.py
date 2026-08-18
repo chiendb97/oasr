@@ -96,6 +96,7 @@ STAGES = frozenset(
         "offline.encode",
         "offline.prefill",
         "offline.decode",
+        "offline.finalize",
         "offline.advance",
         "streaming.schedule",
         "streaming.allocate",
