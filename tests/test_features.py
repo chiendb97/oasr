@@ -763,6 +763,48 @@ class TestGraphedFeatureExtraction:
         assert gfe.replay(2, wave, lengths) is None
 
 
+class TestCollateOutputIsNotReused:
+    """``collate`` must return a fresh feature tensor every call.
+
+    ``OfflineExecutor``'s collate prefetch holds *two* micro-batches' features
+    alive at once — one being forwarded, one staged for the next tick.  Every
+    other buffer on that path (``_wav_flat``, ``_wav_padded``) is deliberately
+    reused, so the one that must not be is worth pinning: a reused feature
+    buffer would let the staged batch overwrite the one the encoder is reading,
+    which corrupts a transcript rather than raising.  The graph-replay buffers
+    are the same class of hazard, and they *did* ship.
+    """
+
+    def _proc(self):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.input_processor import InputProcessor
+
+        cfg = EngineConfig(ckpt_dir="x", device="cpu", dtype=torch.float32)
+        return InputProcessor(cfg, torch.device("cpu"))
+
+    def _batch(self, proc, n, samples):
+        from oasr.engine.request import Request
+
+        out = []
+        for i in range(n):
+            req = Request(request_id=f"c{i}", streaming=False)
+            req.audio = torch.randn(samples)
+            req.sample_rate = 16000
+            proc.prepare_offline(req)
+            out.append(req)
+        return out
+
+    def test_two_collates_do_not_alias(self):
+        proc = self._proc()
+        # Held simultaneously, which is what the prefetch does — otherwise the
+        # caching allocator could hand back the same address legitimately.
+        f1, l1 = proc.collate(self._batch(proc, 4, 16000))
+        f2, l2 = proc.collate(self._batch(proc, 4, 16000))
+        assert f1.shape == f2.shape
+        assert f1.data_ptr() != f2.data_ptr()
+        assert l1.data_ptr() != l2.data_ptr()
+
+
 class TestStagingBuffers:
     """M4/M5: staging must be reused per step but bounded across the process."""
 

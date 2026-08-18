@@ -1203,6 +1203,7 @@ class ASREngine:
             max_tick_ms=config.max_tick_ms,
             decode_admit_window_ms=config.decode_admit_window_ms,
             max_batch_size=config.max_batch_size,
+            collate_prefetch=config.offline_collate_prefetch,
             metrics=self._metrics,
         )
 

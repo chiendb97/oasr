@@ -139,6 +139,30 @@ class EngineConfig:
     # off; the serving front-end enables it (the GPU step is the overlap
     # window).  No effect in streaming mode.
     overlap_admit: bool = False
+    # Streaming-only: extract the *next* step's features after issuing this
+    # step's encoder forward instead of before it, so the host-side pack —
+    # per-stream concat + ``audio_scale`` + the write into pinned staging, the
+    # largest single block of GPU-idle in a streaming step — runs while the GPU
+    # is busy with the encoder rather than in front of it.
+    #
+    # This adds exactly one step of pipeline depth: a chunk fed during step N is
+    # forwarded by step N+1.  At the default chunk size that trades ~10 ms of
+    # per-chunk latency against ~640 ms of audio per chunk, which is why it is on
+    # by default; set ``False`` to get the strictly-serial order back (it is also
+    # the A/B arm).  No effect in offline mode.
+    streaming_feature_lookahead: bool = True
+    # Offline-only: collate the *next* micro-batch on a side CUDA stream while
+    # the current one's encoder forward runs, so batch selection (host) and the
+    # waveform H2D + fbank (GPU) both overlap the forward instead of sitting in
+    # front of it with an idle GPU.
+    #
+    # The side stream is what makes this work: the decode's device->host readback
+    # synchronises the *main* stream, so a collate issued there would be drained
+    # by it and nothing would overlap.  One extra micro-batch of **features** is
+    # in flight (not activations), so the memory cost is ``B x T x F``, not a
+    # second encoder.  One-shot decode families only — incremental (AED/LLM)
+    # ticks are gated on decode slots the previous batch has not yet released.
+    offline_collate_prefetch: bool = True
 
     # Streaming chunking
     chunk_size: int = 16

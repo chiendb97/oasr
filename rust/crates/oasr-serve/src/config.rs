@@ -238,6 +238,19 @@ pub struct Cli {
     /// critical path.  Engine default false (lowest first-token latency).
     #[arg(long)]
     pub overlap_partial_readback: Option<bool>,
+    /// Streaming: extract the next step's features after issuing this step's
+    /// encoder forward, so the host-side feature pack runs against the GPU
+    /// instead of ahead of it.  Engine default true; costs one step of pipeline
+    /// depth (~10 ms per 640 ms chunk).  Pass `false` to get the strictly
+    /// serial order back.
+    #[arg(long)]
+    pub streaming_feature_lookahead: Option<bool>,
+    /// Offline: collate the next micro-batch on a side CUDA stream while the
+    /// current one's encoder forward runs, so batch selection and the fbank stop
+    /// sitting in front of an idle GPU.  Engine default true; one extra
+    /// micro-batch of features is in flight.  Pass `false` for the serial tick.
+    #[arg(long)]
+    pub offline_collate_prefetch: Option<bool>,
     /// Offline: longest single request the front-end may hand over in
     /// **page-locked** host memory, in seconds of audio.  Engine default 300.
     ///
@@ -563,6 +576,14 @@ impl Cli {
         }
         if let Some(b) = self.overlap_partial_readback {
             obj.entry("overlap_partial_readback")
+                .or_insert(Value::Bool(b));
+        }
+        if let Some(b) = self.streaming_feature_lookahead {
+            obj.entry("streaming_feature_lookahead")
+                .or_insert(Value::Bool(b));
+        }
+        if let Some(b) = self.offline_collate_prefetch {
+            obj.entry("offline_collate_prefetch")
                 .or_insert(Value::Bool(b));
         }
         if let Some(v) = self.max_pinned_audio_seconds {
