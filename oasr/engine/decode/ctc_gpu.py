@@ -224,14 +224,15 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
             ordered_states.extend(states)
         nvtx_pop()  # decode_advance
 
-        # Interim-partial cadence.  Reading the beam buffer back to the host is a
-        # blocking ``cudaStreamSynchronize`` that drains the GPU before the next
-        # step's encoder can be dispatched: emitting every step costs **~15% of
+        # Interim-partial cadence.  Emitting a partial every step costs **~15% of
         # streaming wall** against emitting none (pool 32, 640 ms chunks —
-        # `.artifacts/engine_perf.md` §10.4).  Two knobs trade that against the
-        # cadence.  ``partial_decode_interval <= 0`` skips interim partials
-        # entirely (decode state still advances; only the read-back is skipped),
-        # and ``N > 1`` emits every N-th step.
+        # `.artifacts/engine_perf.md` §10.4).  Most of that is *not* the blocking
+        # ``cudaStreamSynchronize``, which measures 77 us of the stage's 610 at
+        # 64 streams; the rest is materialising the read-back into Python, which
+        # is why ``peek_states_best`` exists.  Two knobs trade the remainder
+        # against the cadence.  ``partial_decode_interval <= 0`` skips interim
+        # partials entirely (decode state still advances; only the read-back is
+        # skipped), and ``N > 1`` emits every N-th step.
         #
         # ``overlap_partial_readback`` instead keeps the cadence and moves the
         # sync off the critical path: each emit step issues a **non-blocking**
@@ -247,19 +248,22 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
         nvtx_push("partial_readback")
         if not getattr(self._config, "overlap_partial_readback", False):
             # Default: blocking read-back, emit this step's partial now (lowest
-            # first-token latency — the interactive path).
-            snaps = decoder.peek_states(ordered_states)
-            partials = []
-            for req, snap in zip(ordered_reqs, snaps):
-                best = snap.tokens[0][0] if snap.tokens and snap.tokens[0] else []
-                partials.append(
-                    RequestOutput(
-                        request_id=req.request_id,
-                        text=self._detok.detokenize(best),
-                        tokens=snap.tokens[0] if snap.tokens else [],
-                        finished=False,
-                    )
+            # first-token latency — the interactive path).  ``peek_states_best``
+            # rather than ``peek_states``: a partial carries the best hypothesis
+            # only, so reading every beam back, turning each into a Python list
+            # and wrapping the set in per-state ``GpuDecoderResult`` views is
+            # work done to be discarded — 470 of the stage's 610 us per step at
+            # 64 streams, none of it the synchronize.
+            bests = decoder.peek_states_best(ordered_states)
+            partials = [
+                RequestOutput(
+                    request_id=req.request_id,
+                    text=self._detok.detokenize(best),
+                    tokens=[best],
+                    finished=False,
                 )
+                for req, best in zip(ordered_reqs, bests)
+            ]
             nvtx_pop()  # partial_readback
             return partials
         # Opt-in: overlapped (non-blocking) read-back — emit the previous emit
@@ -294,7 +298,10 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
                 RequestOutput(
                     request_id=req.request_id,
                     text=self._detok.detokenize(best),
-                    tokens=snap.tokens[0] if snap.tokens else [],
+                    # One row, same as the blocking path: which read-back an
+                    # engine runs is a throughput choice and must not change
+                    # what a client sees.
+                    tokens=[best],
                     finished=False,
                 )
             )
