@@ -616,9 +616,12 @@ class TestCtcDecoderAsyncPeek:
     old 11-argument shape, so every stream under the overlapped read-back died
     with a ``TypeError`` and finalised with an empty transcript — a
     default-off path failing silently in the one mode that selects it.
+
+    Which read-back an engine runs is a throughput choice, so the two must agree
+    on *what a client sees*: both carry the best hypothesis and only that.
     """
 
-    def test_async_peek_matches_blocking_peek(self, device):
+    def test_async_peek_matches_the_blocking_interim_read_back(self, device):
         """The overlapped read-back returns the blocking one's hypotheses."""
         V = 5
         config = GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=10)
@@ -629,14 +632,68 @@ class TestCtcDecoderAsyncPeek:
         for state, path in zip(states, paths):
             decoder.decode_chunk(_make_logp_gpu(len(path), V, path, device), state=state)
 
-        blocking = decoder.peek_states(states)
+        blocking = decoder.peek_states_best(states)
         handle = decoder.peek_states_async(states)
         overlapped = decoder.peek_states_collect(handle)
 
-        assert len(overlapped) == len(blocking)
-        for over, block in zip(overlapped, blocking):
-            assert over.tokens == block.tokens
-        assert [r.tokens[0][0] for r in overlapped] == [[1, 2], [3, 4], [2]]
+        assert blocking == [[1, 2], [3, 4], [2]]
+        assert [r.tokens[0][0] for r in overlapped] == blocking
+
+    def test_both_interim_paths_carry_one_hypothesis(self, device):
+        """The runner-up beams exist on the device and must not cross the bus.
+
+        ``fill_nbest_texts`` declares that interim partials carry the best
+        hypothesis only; shipping the whole beam contradicted it, gave the gRPC
+        front-end alternatives with empty transcripts (``nbest_texts`` is final-
+        only), and cost a full beam's worth of marshalling per stream per step
+        on the GIL-holding dispatcher thread.
+        """
+        V = 5
+        decoder = GpuStreamingDecoder(GpuDecoderConfig(beam_size=4, blank_id=0, max_seq_len=10))
+        states = [decoder.create_state(batch=1, vocab_size=V, device=device) for _ in range(2)]
+        for state, path in zip(states, ([1, 0, 2], [3, 0, 4])):
+            decoder.decode_chunk(_make_logp_gpu(len(path), V, path, device), state=state)
+
+        # The general snapshot still has every beam — this is a property of the
+        # interim path, not of the decoder.
+        assert len(decoder.peek_states(states)[0].tokens[0]) == 4
+
+        overlapped = decoder.peek_states_collect(decoder.peek_states_async(states))
+        assert [len(r.tokens[0]) for r in overlapped] == [1, 1]
+
+    def test_peek_states_best_matches_the_general_snapshot(self, device):
+        """Same hypothesis the full read-back would have selected."""
+        V = 7
+        decoder = GpuStreamingDecoder(GpuDecoderConfig(beam_size=5, blank_id=0, max_seq_len=16))
+        paths = [[1, 0, 2, 3], [3, 0, 4], [2, 2, 0], [5, 0, 6, 0, 1]]
+        states = [decoder.create_state(batch=1, vocab_size=V, device=device) for _ in paths]
+        for state, path in zip(states, paths):
+            decoder.decode_chunk(_make_logp_gpu(len(path), V, path, device), state=state)
+
+        general = [snap.tokens[0][0] for snap in decoder.peek_states(states)]
+        assert decoder.peek_states_best(states) == general
+
+    def test_peek_states_best_empty_set(self, device):
+        decoder = GpuStreamingDecoder(GpuDecoderConfig(beam_size=3, max_seq_len=10))
+        assert decoder.peek_states_best([]) == []
+
+    def test_a_multi_row_state_falls_back_and_is_still_trimmed(self, device):
+        """``batch != 1`` takes the per-state path — which must obey the same
+        contract, or the shape of a partial would depend on how the state was
+        created rather than on what it is."""
+        V = 5
+        decoder = GpuStreamingDecoder(GpuDecoderConfig(beam_size=4, blank_id=0, max_seq_len=10))
+        state = decoder.create_state(batch=2, vocab_size=V, device=device)
+        logp = _make_logp_gpu(3, V, [1, 0, 2], device).repeat(2, 1, 1)
+        decoder.decode_chunk(logp, state=state)
+
+        general = decoder.peek_state(state=state)
+        assert len(general.tokens[0]) == 4, "the fallback still reads every beam"
+
+        assert decoder.peek_states_best([state]) == [general.tokens[0][0]]
+        collected = decoder.peek_states_collect(decoder.peek_states_async([state]))
+        assert [len(r.tokens[0]) for r in collected] == [1]
+        assert collected[0].tokens[0][0] == general.tokens[0][0]
 
     def test_async_peek_keeps_advancing_across_steps(self, device):
         """Issue at step N, collect at step N+1 — the engine's actual cadence."""

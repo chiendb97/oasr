@@ -421,6 +421,16 @@ def ctc_beam_search_decode(
     return GpuDecoderResult(tokens=tokens, times=times, lengths=out_lengths, scores=out_scores)
 
 
+def _best_tokens(result: GpuDecoderResult) -> List[int]:
+    """The best hypothesis of a single-row snapshot, or ``[]``."""
+    return result.tokens[0][0] if result.tokens and result.tokens[0] else []
+
+
+def _best_only(result: GpuDecoderResult) -> GpuDecoderResult:
+    """``result`` with its runner-up hypotheses dropped — the interim contract."""
+    return GpuDecoderResult(tokens=[[_best_tokens(result)]], lengths=None, scores=None)
+
+
 class GpuStreamingDecoder:
     """Streaming GPU CTC prefix beam search decoder.
 
@@ -1091,6 +1101,64 @@ class GpuStreamingDecoder:
             )
         return results
 
+    def peek_states_best(self, states: List[StreamState]) -> List[List[int]]:
+        """Interim-partial read-back: the best hypothesis per stream, and nothing else.
+
+        :meth:`peek_states` is the general snapshot — every beam, plus per-state
+        ``lengths`` / ``scores`` views — and an interim partial uses none of that.
+        The declared contract is that a partial carries the best hypothesis only
+        (``OutputProcessor.fill_nbest_texts``), so everything else on that path
+        is work done to be discarded.  Measured per step at 64 streams, beam 10:
+
+        ============================  ========  ========
+        stage                         general   best-only
+        ============================  ========  ========
+        device→host copy                77 us     ~25 us
+        ``extract_beam_tokens``        171 us     ~20 us
+        building ``GpuDecoderResult``  273 us       0 us
+        ============================  ========  ========
+
+        The copy shrinks because only row 0 crosses the bus; the extraction
+        because it builds a tenth of the Python lists; the last row disappears
+        because the two per-state device slices in a ``GpuDecoderResult`` cost
+        more than everything else combined and the partial path reads neither.
+
+        Note what is *not* here: the ``cudaStreamSynchronize``.  It is 77 us of
+        the 608 — the smallest piece, and the only one
+        ``overlap_partial_readback`` moves.
+
+        States with ``batch != 1`` (not produced by the streaming engine) fall
+        back to the per-state path, trimmed the same way.
+        """
+        n = len(states)
+        if n == 0:
+            return []
+        if any(s.batch != 1 for s in states):
+            return [_best_tokens(self.peek_state(state=s)) for s in states]
+
+        cfg = self._config
+        beam = cfg.beam_size
+        msl = cfg.max_seq_len
+        device = states[0].buffer.device
+        # Shares the persistent device buffers with the overlapped path.  Only
+        # one of the two runs in a given engine (``overlap_partial_readback``
+        # selects it), and in any case both issue on the same stream, so a later
+        # write is ordered behind the copy that reads it.
+        self._ensure_peek_buffers(n, beam, msl, device)
+        assert self._peek_dev_tokens is not None  # postcondition of _ensure_peek_buffers
+        assert self._peek_dev_lengths is not None
+        assert self._peek_dev_scores is not None
+        dev_tok = self._peek_dev_tokens[:n]
+        dev_len = self._peek_dev_lengths[:n]
+        # Interim partials never carry emission frames; ``_NO_TIMES`` is the
+        # launcher's "skip the times write".
+        self._issue_read_states(states, dev_tok, _NO_TIMES, dev_len, self._peek_dev_scores[:n])
+
+        # One beam over the bus, and one sync for the whole ready set.
+        tokens_cpu = dev_tok[:, :1].cpu()
+        lengths_cpu = dev_len[:, :1].cpu()
+        return [rows[0] for rows in _CPP.extract_beam_tokens(tokens_cpu, lengths_cpu, 1)]
+
     # ------------------------------------------------------------------
     # Pipelined (non-blocking) interim read-back
     # ------------------------------------------------------------------
@@ -1109,9 +1177,12 @@ class GpuStreamingDecoder:
         # Scores are required by the read kernel but unused for interim
         # partials; keep a discardable device buffer (never copied to host).
         self._peek_dev_scores = torch.empty(n, beam, dtype=torch.float32, device=device)
+        # The host side is **one beam wide**: an interim partial carries the best
+        # hypothesis only, so the runner-up rows would cross the bus, become
+        # Python lists and then be marshalled over the PyO3 boundary for nothing.
         pin = device.type == "cuda"
-        self._peek_host_tokens = torch.empty(n, beam, msl, dtype=torch.int32, pin_memory=pin)
-        self._peek_host_lengths = torch.empty(n, beam, dtype=torch.int32, pin_memory=pin)
+        self._peek_host_tokens = torch.empty(n, 1, msl, dtype=torch.int32, pin_memory=pin)
+        self._peek_host_lengths = torch.empty(n, 1, dtype=torch.int32, pin_memory=pin)
 
     def peek_states_async(self, states: List[StreamState]) -> Optional["PeekHandle"]:
         """Issue a **non-blocking** batched interim read-back.
@@ -1137,10 +1208,12 @@ class GpuStreamingDecoder:
         beam = cfg.beam_size
         msl = cfg.max_seq_len
         if any(s.batch != 1 for s in states):
+            # Trimmed to one row here too, so the contract does not depend on
+            # which branch a cohort happened to take.
             return PeekHandle(
                 n=n,
-                beam=beam,
-                eager=[self.peek_state(state=s) for s in states],
+                beam=1,
+                eager=[_best_only(self.peek_state(state=s)) for s in states],
             )
 
         device = states[0].buffer.device
@@ -1161,13 +1234,13 @@ class GpuStreamingDecoder:
         self._issue_read_states(states, dev_tok, _NO_TIMES, dev_len, dev_sco)
         host_tok = self._peek_host_tokens[:n]
         host_len = self._peek_host_lengths[:n]
-        host_tok.copy_(dev_tok, non_blocking=True)
-        host_len.copy_(dev_len, non_blocking=True)
+        host_tok.copy_(dev_tok[:, :1], non_blocking=True)
+        host_len.copy_(dev_len[:, :1], non_blocking=True)
         ev = torch.cuda.Event()
         ev.record()
         return PeekHandle(
             n=n,
-            beam=beam,
+            beam=1,  # the buffers' width, and the interim contract: best only
             event=ev,
             tokens_cpu=host_tok,
             lengths_cpu=host_len,
