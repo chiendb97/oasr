@@ -1337,3 +1337,197 @@ class TestStreamingFeatureAppend:
         assert req.feature_frames == 400
         torch.testing.assert_close(req.feature_buffer[:200], before)
         torch.testing.assert_close(req.feature_buffer[200:400], torch.full((200, F), 7.0))
+
+
+class TestStreamingSegmentPack:
+    """The streaming pack keeps each stream's pieces apart until one batched
+    ``cat`` writes them straight into the staging row.
+
+    Two costs were being paid to build a buffer that is copied again a moment
+    later: concatenating the carried-over tail onto every stream's chunk
+    (0.44 ms/step at 64 streams), then copying each result into the padded
+    staging batch (0.46 ms/step).  Packing the pieces directly is one pass
+    instead of two.
+
+    What has to hold is that the packed batch is *exactly* what concatenating
+    would have produced — same bytes, same padding, same lengths — for ragged
+    cohorts as well as steady-state ones, since a wrong row here is a wrong
+    transcript with nothing raised.
+    """
+
+    def _proc(self, **overrides):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.input_processor import InputProcessor
+
+        cfg = EngineConfig(ckpt_dir="x", device="cpu", **overrides)
+        return InputProcessor(cfg, torch.device("cpu"))
+
+    @staticmethod
+    def _inputs(pieces, flush=False):
+        from oasr.engine.input_processor import _StreamInput
+
+        return [
+            _StreamInput(
+                request=None,  # type: ignore[arg-type]
+                segments=segs,
+                n_samples=sum(int(s.numel()) for s in segs),
+                flush=flush,
+            )
+            for segs in pieces
+        ]
+
+    def _pack(self, proc, inputs):
+        """The real packing stage, not a re-implementation of it — a test that
+        restates the layout rule cannot catch the layout rule changing."""
+        t_max = max(inp.n_samples for inp in inputs)
+        slot = proc._next_stream_slot()
+        return proc._pack_streaming_waveforms(inputs, slot, t_max)
+
+    @staticmethod
+    def _reference(pieces, t_max):
+        """What the per-stream concatenate-then-copy form produced."""
+        out = torch.zeros(len(pieces), t_max)
+        for i, segs in enumerate(pieces):
+            cat = torch.cat(segs)
+            out[i, : cat.numel()] = cat
+        return out
+
+    def test_equal_length_rows_match_the_concatenated_form(self):
+        proc = self._proc()
+        pieces = [[torch.randn(37), torch.randn(320)] for _ in range(6)]
+        packed = self._pack(proc, self._inputs(pieces))
+        assert torch.equal(packed, self._reference(pieces, 357))
+
+    def test_ragged_rows_match_and_are_zero_padded(self):
+        proc = self._proc()
+        pieces = [
+            [torch.randn(37), torch.randn(320)],
+            [torch.randn(320)],  # freshly admitted stream: no carry-over tail
+            [torch.randn(11), torch.randn(200), torch.randn(9)],  # closing flush pad
+        ]
+        packed = self._pack(proc, self._inputs(pieces))
+        assert torch.equal(packed, self._reference(pieces, 357))
+        assert torch.equal(packed[1, 320:], torch.zeros(37))
+
+    def test_the_shared_pad_buffer_is_never_written_through(self):
+        """Every ragged row borrows the same zero run, so a row that wrote back
+        into it would silently corrupt its peers in the same step."""
+        proc = self._proc()
+        pieces = [[torch.randn(400)], [torch.randn(10)], [torch.randn(10)]]
+        self._pack(proc, self._inputs(pieces))
+        assert torch.count_nonzero(proc._stream_pad) == 0
+        packed = self._pack(proc, self._inputs(pieces))
+        assert torch.equal(packed, self._reference(pieces, 400))
+
+
+class TestStreamingTailSuffix:
+    """``_suffix`` — the retained carry-over, without materialising the join.
+
+    ``torch.cat(segments)[start:]`` is the rule; the point is to get there
+    without the ``cat``.  In steady state ``start`` lands inside the last
+    segment and the result is a view, which is the whole reason the pieces are
+    kept apart.
+    """
+
+    @staticmethod
+    def _suffix(segments, start):
+        from oasr.engine.input_processor import _suffix
+
+        return _suffix(segments, start)
+
+    @pytest.mark.parametrize("start", [0, 1, 9, 10, 11, 24, 25, 26, 39, 40])
+    def test_matches_the_concatenated_slice(self, start):
+        segs = [torch.randn(10), torch.randn(15), torch.randn(15)]
+        assert torch.equal(self._suffix(segs, start), torch.cat(segs)[start:])
+
+    def test_a_start_inside_the_last_segment_is_a_view(self):
+        segs = [torch.randn(10), torch.randn(15)]
+        out = self._suffix(segs, 20)
+        assert out.data_ptr() == segs[1][10:].data_ptr(), "steady state must not copy"
+
+    def test_a_start_past_the_end_is_empty(self):
+        segs = [torch.randn(10), torch.randn(15)]
+        assert self._suffix(segs, 25).numel() == 0
+
+    def test_a_single_segment_behaves_like_a_slice(self):
+        segs = [torch.randn(20)]
+        assert torch.equal(self._suffix(segs, 7), segs[0][7:])
+
+
+class TestStreamingAudioScaleSites:
+    """``audio_scale`` must be applied exactly once, on whichever copy exists.
+
+    The streaming pack writes **raw** samples so it stays one pass over the
+    batch; the multiply then rides on the device copy.  Two paths have no device
+    copy to ride on — a CPU engine, and the captured feature graph, which owns
+    its own H2D — and scale the pinned host buffer instead.
+
+    The hazard is the seam: a feature-graph *bucket miss* returns ``None`` and
+    falls through to the eager path with a buffer that has already been scaled.
+    Scaling it again is silent — every sample off by ``audio_scale``, which for
+    a WeNet checkpoint is 32768.
+    """
+
+    def _processor(self, device, scale):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.input_processor import InputProcessor
+        from oasr.features import FeatureConfig
+
+        cfg = EngineConfig(
+            ckpt_dir="x",
+            device=str(device),
+            dtype=torch.float32,
+            max_batch_size=8,
+            audio_scale=scale,
+            feature_config=FeatureConfig(feature_type="fbank", num_mel_bins=80, dither=0.0),
+            use_cuda_graphs=False,
+        )
+        return InputProcessor(cfg, device)
+
+    @staticmethod
+    def _inputs(waves):
+        from oasr.engine.input_processor import _StreamInput
+
+        return [
+            _StreamInput(request=None, segments=[w], n_samples=int(w.numel()), flush=False)  # type: ignore[arg-type]
+            for w in waves
+        ]
+
+    @pytest.mark.cuda
+    def test_a_feature_graph_miss_does_not_scale_twice(self, device):
+        if device.type != "cuda":
+            pytest.skip("the fallthrough only exists on the CUDA path")
+        from types import SimpleNamespace
+
+        torch.manual_seed(7)
+        waves = [torch.randn(4000).clamp(-1, 1) for _ in range(3)]
+
+        proc = self._processor(device, 32768.0)
+        expected, _ = proc._run_streaming_features(self._inputs(waves), None)
+
+        # A graph whose bucket never matches: replay returns None, so the eager
+        # path runs on a buffer the graph path has already scaled.
+        missing = self._processor(device, 32768.0)
+        missing._feature_graph = SimpleNamespace(t_pad=1 << 30, replay=lambda *a, **k: None)
+        got, _ = missing._run_streaming_features(self._inputs(waves), None)
+
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+    @pytest.mark.cuda
+    def test_the_device_scale_matches_scaling_on_the_host(self, device):
+        if device.type != "cuda":
+            pytest.skip("compares the device site against the host site")
+        torch.manual_seed(11)
+        waves = [torch.randn(4000).clamp(-1, 1) for _ in range(3)]
+
+        scaled = self._processor(device, 32768.0)
+        got, _ = scaled._run_streaming_features(self._inputs(waves), None)
+
+        # The same audio pre-scaled on the host, through an engine that does not
+        # scale at all — the two must agree bit for bit.
+        plain = self._processor(device, 1.0)
+        expected, _ = plain._run_streaming_features(
+            self._inputs([w * 32768.0 for w in waves]), None
+        )
+
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
