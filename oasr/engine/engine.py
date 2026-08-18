@@ -237,6 +237,8 @@ class ASREngine:
             # nothing builds.
             if config.max_num_blocks is None:
                 self._autosize_kv_pool(config, cache_spec, consumes)
+            else:
+                self._check_explicit_kv_pool(config)
             cache_config = config.build_cache_config(cache_spec)
         self._model_runner = ModelRunner(
             model, config, cache_config, graph_pool=self._graph_pool, consumes=consumes
@@ -410,6 +412,49 @@ class ASREngine:
     # ------------------------------------------------------------------
     # VRAM-aware capacity sizing (H4)
     # ------------------------------------------------------------------
+
+    def _check_explicit_kv_pool(self, config: EngineConfig) -> None:
+        """Warn when an explicit ``max_num_blocks`` cannot serve ``max_batch_size``.
+
+        The derived path already refuses a pool below
+        ``max_batch_size * MIN_BLOCKS_PER_STREAM`` — :func:`derive_pool_blocks`
+        takes that as its floor because below it every stream runs out of
+        encoder cache.  The **explicit** path had no such check, and its default
+        is a flat 2048 blocks *whatever* ``max_batch_size`` is, so widening the
+        pool silently narrows every stream's history:
+
+            frames per stream = max_num_blocks * block_size_frames / max_batch_size
+
+        At the default 2048 blocks and 16 frames that is 512 frames per stream at
+        ``max_batch_size=64`` and **32** at 1024 — one second of audio.  Streams
+        then hit the capacity gate, finalize early with ``finish_reason="length"``
+        and a truncated transcript, and the engine gets *faster*, because it is
+        decoding less.  A throughput benchmark reads that as a win; this is the
+        line that says otherwise.
+
+        A warning rather than a raise: an operator may genuinely want a bounded
+        history, and ``num_left_chunks >= 0`` makes a small pool correct by
+        design.  What must not happen is it going unsaid.
+        """
+        blocks = int(config.max_num_blocks or 0)
+        batch = max(1, int(config.max_batch_size))
+        floor = batch * MIN_BLOCKS_PER_STREAM
+        if blocks >= floor or config.num_left_chunks >= 0:
+            return
+        frames = blocks * int(config.block_size_frames) // batch
+        logger.warning(
+            "max_num_blocks=%d is below the %d blocks max_batch_size=%d needs "
+            "(%d per stream): every stream gets %d encoder frames of history and "
+            "will be finalized early with finish_reason='length'. Raise "
+            "max_num_blocks to >= %d, lower max_batch_size, bound the history with "
+            "num_left_chunks, or set max_num_blocks=None to size the pool from VRAM.",
+            blocks,
+            floor,
+            batch,
+            MIN_BLOCKS_PER_STREAM,
+            frames,
+            floor,
+        )
 
     def _autosize_kv_pool(self, config: EngineConfig, cache_spec, consumes: str) -> None:
         """Resolve ``max_num_blocks=None`` into a block count that fits the card.

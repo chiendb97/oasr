@@ -17,6 +17,7 @@ allocates, and that deriving it changes capacity and not transcripts.
 from __future__ import annotations
 
 import glob
+import logging
 import os
 
 import pytest
@@ -475,3 +476,72 @@ class TestDerivedDecodeKvBudget:
             assert engine._memory_profile is None  # nothing left to derive
         finally:
             engine.shutdown()
+
+
+class TestExplicitPoolFloor:
+    """An explicit ``max_num_blocks`` too small for ``max_batch_size`` must say so.
+
+    :func:`derive_pool_blocks` refuses a pool below
+    ``max_batch_size * MIN_BLOCKS_PER_STREAM`` — that floor is where every stream
+    starts running out of encoder cache.  The *explicit* path had no equivalent,
+    and its default is a flat 2048 blocks whatever ``max_batch_size`` is, so
+    widening the pool silently narrows each stream's history to
+    ``max_num_blocks * block_size_frames / max_batch_size`` frames.
+
+    The failure is not an error: streams hit the capacity gate, finalize with
+    ``finish_reason="length"`` and a truncated transcript, and the engine gets
+    *faster* because it decodes less.  A throughput benchmark reads that as a
+    win — which is exactly how it went unnoticed while it corrupted a whole
+    scale-out study (2048 blocks at ``max_batch_size=1024`` is 32 frames per
+    stream, and every one of 1024 streams was cut short).
+    """
+
+    def _engine(self):
+        from oasr.engine.engine import ASREngine
+
+        return ASREngine.__new__(ASREngine)
+
+    def _config(self, **over):
+        from oasr.engine.config import EngineConfig
+
+        kw = {"ckpt_dir": "x", "device": "cpu", "max_batch_size": 64, "max_num_blocks": 2048}
+        kw.update(over)
+        return EngineConfig(**kw)
+
+    def test_a_pool_below_the_floor_warns_with_the_arithmetic(self, caplog):
+        cfg = self._config(max_batch_size=1024, max_num_blocks=2048)
+        with caplog.at_level(logging.WARNING, logger="oasr.engine.engine"):
+            self._engine()._check_explicit_kv_pool(cfg)
+        assert caplog.records, "an unusable pool must not be silent"
+        msg = caplog.records[0].getMessage()
+        # The numbers an operator needs to act: what they have, what it buys per
+        # stream, and what it should be.
+        assert "2048" in msg and "1024" in msg
+        assert "32 encoder frames" in msg, msg
+        assert "finish_reason='length'" in msg, msg
+
+    def test_a_sufficient_pool_is_silent(self, caplog):
+        cfg = self._config(max_batch_size=64, max_num_blocks=2048)  # 32 blocks/stream
+        with caplog.at_level(logging.WARNING, logger="oasr.engine.engine"):
+            self._engine()._check_explicit_kv_pool(cfg)
+        assert not caplog.records
+
+    def test_a_bounded_history_is_not_a_defect(self, caplog):
+        """``num_left_chunks >= 0`` caps the retained history by design, so a
+        small pool is the correct configuration rather than a starved one."""
+        cfg = self._config(max_batch_size=1024, max_num_blocks=2048, num_left_chunks=4)
+        with caplog.at_level(logging.WARNING, logger="oasr.engine.engine"):
+            self._engine()._check_explicit_kv_pool(cfg)
+        assert not caplog.records
+
+    def test_the_floor_matches_the_one_the_derived_path_enforces(self, caplog):
+        """Both paths must agree on what "too small" means, or an operator who
+        switches between them gets a different answer for the same card."""
+        batch = 128
+        floor = batch * MIN_BLOCKS_PER_STREAM
+        for blocks, expect_warning in ((floor - 1, True), (floor, False)):
+            caplog.clear()
+            cfg = self._config(max_batch_size=batch, max_num_blocks=blocks)
+            with caplog.at_level(logging.WARNING, logger="oasr.engine.engine"):
+                self._engine()._check_explicit_kv_pool(cfg)
+            assert bool(caplog.records) is expect_warning, (blocks, caplog.records)

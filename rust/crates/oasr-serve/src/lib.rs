@@ -203,16 +203,49 @@ async fn serve(cli: Cli) -> Result<()> {
         shutdown_grace_secs = cli.shutdown_grace_secs,
         "serving limits"
     );
-    let client = Arc::new(EngineClient::start(engine, client_cfg));
-
-    // Wait briefly for the dispatcher to take its first tick so /readyz
-    // doesn't flap on startup.
-    match client.ping(Duration::from_secs(10)).await {
-        Ok(_) => debug!(label = %cli.engine_label, "dispatcher ready"),
-        Err(e) => warn!(label = %cli.engine_label, "dispatcher not ready within 10s: {e}"),
+    // Worker 0 is the engine already built above (its `model_info` is what the
+    // front-ends are configured from); `--engine-workers` adds the rest.  They
+    // are identical by construction — same config JSON — so the router can treat
+    // them as interchangeable and only the load differs.
+    let mut workers: Vec<Arc<EngineClient>> =
+        Vec::with_capacity(cli.engine_workers.max(1) as usize);
+    workers.push(Arc::new(EngineClient::start(engine, client_cfg.clone())));
+    for i in 1..cli.engine_workers.max(1) {
+        let t0 = Instant::now();
+        let extra = PyEngine::new(&engine_cfg_json)
+            .with_context(|| format!("build PyEngine for worker {i}"))?;
+        info!(
+            label = %cli.engine_label,
+            worker = i,
+            load_ms = t0.elapsed().as_millis() as u64,
+            "additional ASREngine loaded"
+        );
+        workers.push(Arc::new(EngineClient::start(extra, client_cfg.clone())));
+    }
+    if workers.len() > 1 {
+        // Each worker is a full copy — weights, KV pool, graph pools — so this is
+        // the line that explains the VRAM.  `--max-num-blocks` is per worker and
+        // is *not* divided for you.
+        info!(
+            label = %cli.engine_label,
+            workers = workers.len(),
+            max_batch_size = ?model.max_batch_size,
+            "running multiple engine workers: VRAM, weights and graph pools are              replicated per worker; --max-num-blocks applies to each"
+        );
     }
 
-    let pool = Arc::new(EnginePool::new(vec![client]));
+    // Wait briefly for each dispatcher to take its first tick so /readyz
+    // doesn't flap on startup.
+    for (i, w) in workers.iter().enumerate() {
+        match w.ping(Duration::from_secs(10)).await {
+            Ok(_) => debug!(label = %cli.engine_label, worker = i, "dispatcher ready"),
+            Err(e) => {
+                warn!(label = %cli.engine_label, worker = i, "dispatcher not ready within 10s: {e}")
+            }
+        }
+    }
+
+    let pool = Arc::new(EnginePool::new(workers));
 
     // The id the OpenAI surface reports and echoes.  The checkpoint path is the
     // only stable name a single-model process has; `--served-model-name` is how
