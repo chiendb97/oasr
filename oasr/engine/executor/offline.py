@@ -1,15 +1,25 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Sequential executor for offline batch inference.
+"""Executor for offline batch inference.
 
 Runs a scheduled offline batch to completion: the scheduler partitions the
 batch into encoder micro-batches (:meth:`Scheduler.split_offline_batch` — plain
 length-bucketed chunks, padded-frame chunks, or gapless sequence-packed rows),
-and this executor runs each one back-to-back on the default stream — batched
-GPU fbank (:func:`oasr.features.batched.batched_fbank` / ``mfcc``) → encoder
-forward → CTC decode → finalise.  Feature extraction is GPU-only, so there is no
-CPU prep to hide behind GPU compute; micro-batches run sequentially with no
-cross-step overlap.
+and this executor runs each one on the default stream — batched GPU fbank
+(:func:`oasr.features.batched.batched_fbank` / ``mfcc``) → encoder forward → CTC
+decode → finalise.
+
+Feature extraction is GPU-only, so there is no CPU prep to hide behind GPU
+compute; micro-batches run sequentially with no cross-step overlap.  Software-
+pipelining them — enqueueing micro-batch *i+1*'s collation and forward before
+finishing *i* on the host — was built and measured at **0.999x**, because in
+practice a tick never has more than one micro-batch to pipeline: the frame and
+count budgets are applied by ``schedule_offline`` when it selects the batch, so
+``split_offline_batch`` returns it whole.  The GPU-idle stretch a profile shows
+at the micro-batch boundary is really the *tick* boundary — scheduling and
+admission between ``step()`` calls — and ``offline.finalize`` is instrumented
+here to keep that attributable (it measures ~20 us, not the ~3 ms the boundary
+costs).
 
 Batch *selection* and *partitioning* both live in the scheduler; this class owns
 only execution.  Sequence packing flips the forward call from the padded
@@ -21,7 +31,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import ClassVar, Dict, List, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -448,7 +458,19 @@ class OfflineExecutor(Executor):
         over a batch that already failed, and only over that batch.  OOM is the
         exception: retrying under memory pressure is how a single over-large
         request turns into a cascade, so it rejects the batch outright.
+
+        **Where** the failure happened decides how the retry runs.  ``collate``
+        releases ``request.audio`` once the GPU feature tensor owns the batch, so
+        a failure *after* it cannot re-run from the top — the re-collate dies on
+        ``NoneType.size`` and that, not the real cause, is what every request in
+        the batch is told.  It is not hypothetical: a conv kernel that failed on
+        an over-wide batch reported an ``AttributeError`` about waveforms, and
+        the shape that actually broke never reached a log line.  Past collate the
+        isolation pass therefore re-runs each row against the features already
+        built, which needs no waveform.
         """
+        features: Optional[torch.Tensor] = None
+        lengths: Optional[torch.Tensor] = None
         try:
             self._record_batch_shape(chunk)
             nvtx_push("offline.collate")
@@ -461,7 +483,24 @@ class OfflineExecutor(Executor):
                 nvtx_pop()
             self._metrics.observe_stage("offline.collate", time.perf_counter() - t0)
             return self._run_stage(chunk, features, lengths)
-        except torch.cuda.OutOfMemoryError as exc:
+        except Exception as exc:  # noqa: BLE001 — one bad request must not take the tick
+            return self._isolate_failure(chunk, exc, features, lengths)
+
+    def _isolate_failure(
+        self,
+        chunk: List[Request],
+        exc: BaseException,
+        features: Optional[torch.Tensor],
+        lengths: Optional[torch.Tensor],
+    ) -> List[RequestOutput]:
+        """Turn one micro-batch's failure into per-request terminal outputs.
+
+        ``features`` is what the failing micro-batch had already collated, or
+        ``None`` if collation is where it died — which is what decides whether
+        the isolation pass can start from the waveforms or has to start from the
+        features (see :meth:`_run_micro_batch`).
+        """
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
             logger.warning(
                 "offline micro-batch of %d ran out of memory; rejecting it "
                 "(lower max_batch_size or the padded-waste cap): %s",
@@ -469,29 +508,80 @@ class OfflineExecutor(Executor):
                 exc,
             )
             return [self._reject(req, "out of memory", stage="offline_oom") for req in chunk]
-        except Exception as exc:  # noqa: BLE001 — one bad request must not take the tick
-            if len(chunk) == 1:
-                logger.warning(
-                    "offline request %s failed: %s: %s",
-                    chunk[0].request_id,
-                    type(exc).__name__,
-                    exc,
-                    exc_info=logger.isEnabledFor(logging.DEBUG),
-                )
-                return [
-                    self._reject(chunk[0], f"{type(exc).__name__}: {exc}", stage="offline_forward")
-                ]
+        if len(chunk) == 1:
             logger.warning(
-                "offline micro-batch of %d failed (%s: %s); re-running one at a time "
-                "to isolate the request responsible",
+                "offline request %s failed: %s: %s",
+                chunk[0].request_id,
+                type(exc).__name__,
+                exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            return [self._reject(chunk[0], f"{type(exc).__name__}: {exc}", stage="offline_forward")]
+        outputs: List[RequestOutput] = []
+        if features is None or lengths is None:
+            # Collation itself failed, so the waveforms are still there and
+            # the whole pipeline can be re-run per request.
+            logger.warning(
+                "offline micro-batch of %d failed collating (%s: %s); re-running one "
+                "at a time to isolate the request responsible",
                 len(chunk),
                 type(exc).__name__,
                 exc,
             )
-            outputs: List[RequestOutput] = []
             for req in chunk:
                 outputs.extend(self._run_micro_batch([req]))
             return outputs
+        if self._enable_packing:
+            # Packed rows are a gapless concatenation, not one row per request,
+            # so there is nothing to slice per request.  Reject with the real
+            # error rather than a misleading one.
+            logger.warning(
+                "packed offline micro-batch of %d failed (%s: %s); rejecting it — "
+                "a packed row cannot be split per request to isolate the cause",
+                len(chunk),
+                type(exc).__name__,
+                exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            return [
+                self._reject(req, f"{type(exc).__name__}: {exc}", stage="offline_forward")
+                for req in chunk
+            ]
+        logger.warning(
+            "offline micro-batch of %d failed after collation (%s: %s); re-running "
+            "one row at a time over the features already built",
+            len(chunk),
+            type(exc).__name__,
+            exc,
+            exc_info=logger.isEnabledFor(logging.DEBUG),
+        )
+        for i, req in enumerate(chunk):
+            outputs.extend(self._run_collated_single(req, features[i : i + 1], lengths[i : i + 1]))
+        return outputs
+
+    def _run_collated_single(
+        self,
+        request: Request,
+        features: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> List[RequestOutput]:
+        """Re-run one already-collated row, isolating its failure to itself."""
+        try:
+            return self._run_stage([request], features, lengths)
+        except torch.cuda.OutOfMemoryError as exc:
+            logger.warning(
+                "offline request %s ran out of memory on its own: %s", request.request_id, exc
+            )
+            return [self._reject(request, "out of memory", stage="offline_oom")]
+        except Exception as exc:  # noqa: BLE001 — the whole point is to name this one
+            logger.warning(
+                "offline request %s failed: %s: %s",
+                request.request_id,
+                type(exc).__name__,
+                exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            return [self._reject(request, f"{type(exc).__name__}: {exc}", stage="offline_forward")]
 
     def _record_batch_shape(self, chunk: List[Request]) -> None:
         """Record this micro-batch's width and how much of it is padding.
@@ -524,6 +614,23 @@ class OfflineExecutor(Executor):
         the one packed row; otherwise the padded ``forward_offline``.  Decode
         and finalisation are identical for both.
         """
+        enc_out, output_lengths = self._encode_stage(chunk, features, lengths)
+        if self._op.strategy.incremental:
+            return self._prefill_stage(chunk, enc_out, output_lengths)
+        return self._finalise_decoded(chunk, self._decode_encoded(chunk, enc_out, output_lengths))
+
+    def _encode_stage(
+        self,
+        chunk: List[Request],
+        features: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> Tuple[Any, torch.Tensor]:
+        """Encoder forward for one micro-batch — enqueued, never synchronised.
+
+        Kept separate from the decode so :meth:`_run_micro_batches_pipelined` can
+        issue the next micro-batch's GPU work while the host is still finishing
+        the previous one.
+        """
         nvtx_push("offline.forward")
         t0 = time.perf_counter()
         consumes = self._op.strategy.consumes
@@ -544,42 +651,57 @@ class OfflineExecutor(Executor):
             enc_out, output_lengths = self._mr.forward_offline(features, lengths)
         nvtx_pop()
         self._metrics.observe_stage("offline.encode", time.perf_counter() - t0)
+        return enc_out, output_lengths
 
+    def _prefill_stage(
+        self,
+        chunk: List[Request],
+        enc_out,
+        output_lengths: torch.Tensor,
+    ) -> List[RequestOutput]:
+        """Label-synchronous AR (AED/LLM) prefill: park the batch, emit nothing.
+
+        The requests sit in the pending pool in state RUNNING; ``step()`` drives
+        them via budgeted ``advance`` calls until the strategy finishes each one.
+        """
         strategy = self._op.strategy
-        if strategy.incremental:
-            # Label-synchronous AR (AED/LLM): prefill only.  The requests park
-            # in the pending pool in state RUNNING; ``step()`` drives them via
-            # budgeted ``advance`` calls until the strategy finishes each one.
-            nvtx_push("offline.prefill")
-            t_prefill = time.perf_counter()
-            try:
-                strategy.begin_offline(chunk, enc_out, output_lengths)
-            except (torch.cuda.OutOfMemoryError, DecoderKvExhausted) as exc:
-                # Prefill reserves this micro-batch's decoder KV — a capacity
-                # buffer per group, or one paged slot per row — so it is where an
-                # over-committed pool actually fails.  Reject *this batch* with an
-                # attributable error rather than letting the exception escape
-                # ``step()`` — the serving dispatcher turns a failed step into an
-                # INTERNAL error for every in-flight request, so one over-large
-                # batch would take down its peers.
-                nvtx_pop()
-                logger.warning(
-                    "decoder-KV prefill could not reserve memory for %d request(s); "
-                    "rejecting the batch (lower max_decode_slots / "
-                    "max_new_tokens, or raise the memory budget): %s",
-                    len(chunk),
-                    exc,
-                )
-                return [
-                    self._reject(req, "prefill out of memory", stage="prefill_oom") for req in chunk
-                ]
-            for req in chunk:
-                req.state = RequestState.RUNNING
-                self._pending[req.request_id] = req
+        nvtx_push("offline.prefill")
+        t_prefill = time.perf_counter()
+        try:
+            strategy.begin_offline(chunk, enc_out, output_lengths)
+        except (torch.cuda.OutOfMemoryError, DecoderKvExhausted) as exc:
+            # Prefill reserves this micro-batch's decoder KV — a capacity buffer
+            # per group, or one paged slot per row — so it is where an
+            # over-committed pool actually fails.  Reject *this batch* with an
+            # attributable error rather than letting the exception escape
+            # ``step()`` — the serving dispatcher turns a failed step into an
+            # INTERNAL error for every in-flight request, so one over-large batch
+            # would take down its peers.
             nvtx_pop()
-            self._metrics.observe_stage("offline.prefill", time.perf_counter() - t_prefill)
-            return []
+            logger.warning(
+                "decoder-KV prefill could not reserve memory for %d request(s); "
+                "rejecting the batch (lower max_decode_slots / "
+                "max_new_tokens, or raise the memory budget): %s",
+                len(chunk),
+                exc,
+            )
+            return [
+                self._reject(req, "prefill out of memory", stage="prefill_oom") for req in chunk
+            ]
+        for req in chunk:
+            req.state = RequestState.RUNNING
+            self._pending[req.request_id] = req
+        nvtx_pop()
+        self._metrics.observe_stage("offline.prefill", time.perf_counter() - t_prefill)
+        return []
 
+    def _decode_encoded(
+        self,
+        chunk: List[Request],
+        enc_out,
+        output_lengths: torch.Tensor,
+    ) -> List[RequestOutput]:
+        """Decode one micro-batch's encoder output — the device→host boundary."""
         nvtx_push("offline.decode")
         t_decode = time.perf_counter()
         # The micro-batch rides along in row order: a family that can time its
@@ -587,11 +709,28 @@ class OfflineExecutor(Executor):
         outputs = self._op.decode_offline(enc_out, output_lengths, chunk)
         nvtx_pop()
         self._metrics.observe_stage("offline.decode", time.perf_counter() - t_decode)
+        return outputs
 
+    def _finalise_decoded(
+        self,
+        chunk: List[Request],
+        outputs: List[RequestOutput],
+    ) -> List[RequestOutput]:
+        """Attach ids, render the n-best texts, mark the requests finished.
+
+        Pure host work, and the largest single piece of it in an offline tick:
+        detokenising a micro-batch measured ~3 ms with **no** GPU operation
+        issued for its whole duration.  :meth:`_run_micro_batches_pipelined` runs
+        it against the next micro-batch's forward for exactly that reason.
+        """
+        nvtx_push("offline.finalize")
+        t0 = time.perf_counter()
         for req, out in zip(chunk, outputs):
             out.request_id = req.request_id
             out.finished = True
             self._op.fill_nbest_texts(req, out)
             req.output = out
             req.state = RequestState.FINISHED
+        nvtx_pop()
+        self._metrics.observe_stage("offline.finalize", time.perf_counter() - t0)
         return outputs

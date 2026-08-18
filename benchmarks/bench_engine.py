@@ -221,6 +221,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "forward. Defaults to the engine config setting "
         "(``EngineConfig.use_cuda_graphs``).",
     )
+    parser.add_argument(
+        "--no-pinned-audio",
+        action="store_true",
+        help="Hand the offline engine ordinary heap waveforms instead of the "
+        "page-locked buffers a served request arrives in. The A/B arm for the "
+        "DMA-straight-into-the-batch path; measures the staging pack instead.",
+    )
 
     return parser
 
@@ -266,6 +273,7 @@ def main() -> None:
             use_cuda_graphs=(args.cuda_graphs == "on" if args.cuda_graphs else None),
             admit_mode=args.admit_mode,
             decode_admit_window_ms=args.decode_admit_window_ms,
+            pinned_audio=not args.no_pinned_audio,
         )
 
     output.finalize()

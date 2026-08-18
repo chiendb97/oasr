@@ -495,9 +495,38 @@ class GpuStreamingDecoder:
         self._peek_host_tokens: Optional[torch.Tensor] = None
         self._peek_host_lengths: Optional[torch.Tensor] = None
 
+        # Reused staging for the per-(stream, frame) blank mask.  The mask has
+        # to reach the host — the chunk launcher builds its per-tile bitmasks
+        # there and advances each stream's step counter there — so the read is
+        # unavoidable, but its *cost* was: a fresh ``.cpu()`` onto pageable
+        # memory makes the driver stage the bytes through its own buffer and
+        # synchronise the whole stream, rather than DMA into page-locked memory
+        # and wait on one event.
+        self._mask_dev: Optional[torch.Tensor] = None
+        self._mask_host: Optional[torch.Tensor] = None
+        self._mask_event: Optional[torch.cuda.Event] = None
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _ensure_mask_buffers(self, n: int, chunk_t: int, device: torch.device) -> None:
+        """(Re)allocate the blank-mask device/pinned staging to hold ``(n, chunk_t)``.
+
+        Grow-only, so the steady state — a stable ready-set size and a fixed
+        chunk — allocates once and every later step is a copy into the same
+        pages.
+        """
+        cur = self._mask_dev
+        if cur is not None and cur.size(0) >= n and cur.size(1) >= chunk_t and cur.device == device:
+            return
+        rows = max(n, cur.size(0) if cur is not None else 0)
+        cols = max(chunk_t, cur.size(1) if cur is not None else 0)
+        self._mask_dev = torch.empty(rows, cols, dtype=torch.bool, device=device)
+        self._mask_host = torch.empty(
+            rows, cols, dtype=torch.bool, pin_memory=(device.type == "cuda")
+        )
+        self._mask_event = torch.cuda.Event() if device.type == "cuda" else None
 
     def _state_bytes_for(self, batch: int, vocab_size: int) -> int:
         """Return the required state buffer size in bytes (cached)."""
@@ -815,13 +844,21 @@ class GpuStreamingDecoder:
             # log-prob directly.
             blank_log_thresh = self._blank_log_thresh
             if blank_log_thresh is not None:
-                mask_tensor = (
-                    log_probs[:, :, cfg.blank_id]
-                    .lt(blank_log_thresh)
-                    .to(torch.uint8)
-                    .cpu()
-                    .contiguous()
-                )  # (N, T)
+                # One comparison into a reused device buffer, one DMA into
+                # reused page-locked memory, one event wait — instead of two
+                # kernels plus a pageable ``.cpu()``, which synchronises the
+                # whole stream to stage a kilobyte.  ``bool`` viewed as ``uint8``
+                # rather than a ``.to(uint8)`` cast: same bytes, no second pass.
+                self._ensure_mask_buffers(n, chunk_t, log_probs.device)
+                assert self._mask_dev is not None and self._mask_host is not None
+                dev_view = self._mask_dev[:n, :chunk_t]
+                torch.lt(log_probs[:, :, cfg.blank_id], blank_log_thresh, out=dev_view)
+                host_view = self._mask_host[:n, :chunk_t]
+                host_view.copy_(dev_view, non_blocking=True)
+                if self._mask_event is not None:
+                    self._mask_event.record()
+                    self._mask_event.synchronize()
+                mask_tensor = host_view.view(torch.uint8)
             else:
                 mask_tensor = torch.empty(0, dtype=torch.uint8, device="cpu")
         else:
@@ -920,45 +957,54 @@ class GpuStreamingDecoder:
         tokens, times = _extract_tokens(out_tokens, out_lengths, batch, cfg.beam_size, out_times)
         return GpuDecoderResult(tokens=tokens, times=times, lengths=out_lengths, scores=out_scores)
 
-    def peek_states(
+    def _issue_read_states(
         self,
         states: List[StreamState],
-        want_times: bool = False,
-    ) -> List[GpuDecoderResult]:
-        """Batched non-destructive snapshot for **many states in ONE D→H sync**.
+        out_tokens: torch.Tensor,
+        out_times: torch.Tensor,
+        out_lengths: torch.Tensor,
+        out_scores: torch.Tensor,
+    ) -> None:
+        """Issue the read-back for ``states`` into stacked ``(N, beam, ...)`` outputs.
 
-        Equivalent to calling :meth:`peek_state` once per state, but issues a
-        single device→host copy for the whole ready set instead of one per
-        stream.  The per-stream ``.cpu()`` in a Python loop — not the (tiny)
-        token payload nor the on-GPU read kernel — is the dominant streaming
-        interim-decode cost: each ``.cpu()`` is a full ``cudaStreamSynchronize``
-        that drains the pipeline.  Collapsing N syncs into one keeps live
-        partial transcripts while removing the per-stream stall.
+        Shared by :meth:`peek_states` and :meth:`peek_states_async` so both get
+        the single-launch form.  Every state must have ``batch == 1`` (the
+        callers check) and the output tensors must be sized for ``len(states)``.
 
-        Each read kernel writes into its slice of one preallocated output
-        tensor; the lone ``.cpu()`` then materialises every stream's tokens at
-        once.  Returns one :class:`GpuDecoderResult` per input state, in order.
-
-        States with ``batch != 1`` (not produced by the streaming engine) fall
-        back to the per-state path so the batched fast path can assume one row
-        per state.
+        Prefers ``ctc_beam_search_read_state_batched``, which reaches state ``i``
+        at a constant byte delta off state 0 and so needs one shared layout —
+        hence the homogeneous-vocab check.  A mixed set (only reachable by hand,
+        not through the engine) falls back to the per-state launcher.
         """
-        n = len(states)
-        if n == 0:
-            return []
-        if any(s.batch != 1 for s in states):
-            return [self.peek_state(state=s, want_times=want_times) for s in states]
-
         cfg = self._config
         beam = cfg.beam_size
         msl = cfg.max_seq_len
-        device = states[0].buffer.device
         use_paged = 1 if cfg.use_paged_memory else 0
+        n = len(states)
+        want_times = out_times.numel() > 0
 
-        out_tokens = torch.empty(n, beam, msl, dtype=torch.int32, device=device)
-        out_times = _times_out(want_times, out_tokens)
-        out_lengths = torch.empty(n, beam, dtype=torch.int32, device=device)
-        out_scores = torch.empty(n, beam, dtype=torch.float32, device=device)
+        vocab_size = states[0].vocab_size
+        if all(s.vocab_size == vocab_size for s in states[1:]):
+            state_ptrs = torch.tensor(
+                [s.buffer.data_ptr() for s in states], dtype=torch.int64, device="cpu"
+            )
+            steps = torch.tensor([s.step for s in states], dtype=torch.int32, device="cpu")
+            self._mod.ctc_beam_search_read_state_batched(
+                out_tokens.view(n, 1, beam, msl),
+                out_times.view(n, 1, beam, msl) if want_times else out_times,
+                out_lengths.view(n, 1, beam),
+                out_scores.view(n, 1, beam),
+                state_ptrs,
+                steps,
+                1,  # batch — one row per state, per the caller's check
+                beam,
+                vocab_size,
+                msl,
+                use_paged,
+                cfg.page_size,
+            )
+            return
+
         for i, s in enumerate(states):
             self._mod.ctc_beam_search_read_state(
                 out_tokens[i : i + 1],
@@ -974,6 +1020,53 @@ class GpuStreamingDecoder:
                 use_paged,
                 cfg.page_size,
             )
+
+    def peek_states(
+        self,
+        states: List[StreamState],
+        want_times: bool = False,
+    ) -> List[GpuDecoderResult]:
+        """Batched non-destructive snapshot for **many states in ONE D→H sync**.
+
+        Equivalent to calling :meth:`peek_state` once per state, but issues a
+        single device→host copy for the whole ready set instead of one per
+        stream.  The per-stream ``.cpu()`` in a Python loop — not the (tiny)
+        token payload nor the on-GPU read kernel — is the dominant streaming
+        interim-decode cost: each ``.cpu()`` is a full ``cudaStreamSynchronize``
+        that drains the pipeline.  Collapsing N syncs into one keeps live
+        partial transcripts while removing the per-stream stall.
+
+        The *launches* are collapsed too, by
+        ``ctc_beam_search_read_state_batched``: the per-state launcher costs
+        3-4 ``cudaMemcpy2DAsync`` (flat) or one kernel (paged) **each**, so at 64
+        streams the read-back was ~200 tiny GPU operations per engine step
+        carrying ~0.1 ms of copy — measured as 13% of streaming wall clock, spent
+        almost entirely on the host submitting them.  One kernel now covers the
+        whole set, writing into its slice of one preallocated output tensor; the
+        lone ``.cpu()`` then materialises every stream's tokens at once.  Returns
+        one :class:`GpuDecoderResult` per input state, in order.
+
+        States with ``batch != 1`` (not produced by the streaming engine) fall
+        back to the per-state path so the batched fast path can assume one row
+        per state.
+        """
+        n = len(states)
+        if n == 0:
+            return []
+        if any(s.batch != 1 for s in states):
+            return [self.peek_state(state=s, want_times=want_times) for s in states]
+
+        cfg = self._config
+        beam = cfg.beam_size
+        msl = cfg.max_seq_len
+        device = states[0].buffer.device
+
+        out_tokens = torch.empty(n, beam, msl, dtype=torch.int32, device=device)
+        out_times = _times_out(want_times, out_tokens)
+        out_lengths = torch.empty(n, beam, dtype=torch.int32, device=device)
+        out_scores = torch.empty(n, beam, dtype=torch.float32, device=device)
+
+        self._issue_read_states(states, out_tokens, out_times, out_lengths, out_scores)
 
         # Single device→host sync for the entire ready set; the emission frames
         # ride in the same one rather than costing a second.
@@ -1051,7 +1144,6 @@ class GpuStreamingDecoder:
             )
 
         device = states[0].buffer.device
-        use_paged = 1 if cfg.use_paged_memory else 0
         self._ensure_peek_buffers(n, beam, msl, device)
         assert self._peek_dev_tokens is not None  # postcondition of _ensure_peek_buffers
         assert self._peek_dev_lengths is not None
@@ -1059,28 +1151,14 @@ class GpuStreamingDecoder:
         dev_tok = self._peek_dev_tokens[:n]
         dev_len = self._peek_dev_lengths[:n]
         dev_sco = self._peek_dev_scores[:n]
-        for i, s in enumerate(states):
-            self._mod.ctc_beam_search_read_state(
-                dev_tok[i : i + 1],
-                # Interim partials never carry emission frames — the empty
-                # sentinel is the launcher's "skip the times write".  Passing it
-                # explicitly rather than omitting the argument: this call site is
-                # opt-in (``overlap_partial_readback``) and therefore untested,
-                # and it silently kept an 11-argument shape after the times
-                # buffer was added to the binding, so every stream under the
-                # overlapped read-back died with a TypeError and finalised empty.
-                _NO_TIMES,
-                dev_len[i : i + 1],
-                dev_sco[i : i + 1],
-                s.buffer,
-                s.step,
-                s.batch,
-                beam,
-                s.vocab_size,
-                msl,
-                use_paged,
-                cfg.page_size,
-            )
+        # Interim partials never carry emission frames — the empty ``_NO_TIMES``
+        # sentinel is the launcher's "skip the times write".  Passing it
+        # explicitly rather than omitting the argument: this call site is opt-in
+        # (``overlap_partial_readback``) and therefore untested, and it silently
+        # kept an 11-argument shape after the times buffer was added to the
+        # binding, so every stream under the overlapped read-back died with a
+        # TypeError and finalised empty.
+        self._issue_read_states(states, dev_tok, _NO_TIMES, dev_len, dev_sco)
         host_tok = self._peek_host_tokens[:n]
         host_len = self._peek_host_lengths[:n]
         host_tok.copy_(dev_tok, non_blocking=True)

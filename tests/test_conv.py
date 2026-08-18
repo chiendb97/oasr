@@ -508,5 +508,64 @@ class TestConv2DCudnn:
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
 
+@pytest.mark.cuda
+@pytest.mark.slow
+class TestConv2dLargeTensor:
+    """A Conv2D activation tensor wider than 2 GiB.
+
+    CUTLASS's implicit-GEMM Conv2D addresses its activations with 32-bit **byte**
+    offsets, so one launch cannot span more than 2 GiB per tensor.  Past that the
+    kernel returned a bare failure status, and what a user saw was not an error
+    but an **engine-wide empty transcript**: at ``max_batch_size >= ~220`` the
+    Conformer subsampling's second conv crossed the limit, the launcher raised,
+    and the micro-batch retry that would have named it died on already-released
+    waveforms — reporting an ``AttributeError`` about a ``NoneType`` waveform
+    instead of the conv shape that actually broke.
+
+    ``conv2d_activation`` now splits the batch dimension, which is exact because
+    a batched convolution is independent across N.  The oracle here is therefore
+    the same kernel on one row at a time, not a torch reference: what is being
+    checked is that tiling changes nothing, and a bit-exact comparison says that
+    where a tolerance would not.
+    """
+
+    def test_batch_over_2gib_matches_per_row(self):
+        # 8 * 512 * 520 * 512 * 2 B = 2.03 GiB of input — just past the limit,
+        # and the smallest shape that crosses it without a large output.
+        N, H, W, IC, K = 8, 512, 520, 512, 32
+        assert N * H * W * IC * 2 > 2**31, "shape must exceed the int32 byte limit"
+        dtype = torch.bfloat16
+        torch.manual_seed(0)
+        x = torch.randn(N, H, W, IC, device="cuda", dtype=dtype) * 0.1
+        filt = torch.randn(K, 3, 3, IC, device="cuda", dtype=dtype) * 0.02
+        bias = torch.randn(K, device="cuda", dtype=dtype) * 0.1
+
+        got = oasr.conv2d_activation(x, filt, bias, activation_type=0, stride_h=2, stride_w=2)
+
+        want = torch.empty_like(got)
+        for i in range(N):
+            oasr.conv2d_activation(
+                x[i : i + 1],
+                filt,
+                bias,
+                activation_type=0,
+                stride_h=2,
+                stride_w=2,
+                out=want[i : i + 1],
+            )
+        assert torch.equal(got, want)
+
+    def test_rows_per_launch_bounds_the_byte_extent(self):
+        """The split point is derived from the addressable extent, not guessed."""
+        from oasr.conv import _CONV2D_MAX_TENSOR_BYTES, _conv2d_rows_per_launch
+
+        x = torch.empty(4, 512, 520, 512, device="meta", dtype=torch.bfloat16)
+        out = torch.empty(4, 255, 259, 32, device="meta", dtype=torch.bfloat16)
+        rows = _conv2d_rows_per_launch(x, out)
+        assert rows >= 1
+        assert rows * x.stride(0) * x.element_size() <= _CONV2D_MAX_TENSOR_BYTES
+        assert (rows + 1) * x.stride(0) * x.element_size() > _CONV2D_MAX_TENSOR_BYTES
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
