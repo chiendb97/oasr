@@ -9,17 +9,18 @@ and this executor runs each one on the default stream — batched GPU fbank
 (:func:`oasr.features.batched.batched_fbank` / ``mfcc``) → encoder forward → CTC
 decode → finalise.
 
-Feature extraction is GPU-only, so there is no CPU prep to hide behind GPU
-compute; micro-batches run sequentially with no cross-step overlap.  Software-
-pipelining them — enqueueing micro-batch *i+1*'s collation and forward before
-finishing *i* on the host — was built and measured at **0.999x**, because in
-practice a tick never has more than one micro-batch to pipeline: the frame and
-count budgets are applied by ``schedule_offline`` when it selects the batch, so
-``split_offline_batch`` returns it whole.  The GPU-idle stretch a profile shows
-at the micro-batch boundary is really the *tick* boundary — scheduling and
-admission between ``step()`` calls — and ``offline.finalize`` is instrumented
-here to keep that attributable (it measures ~20 us, not the ~3 ms the boundary
-costs).
+Pipelining *within* a tick buys nothing: a tick never has more than one
+micro-batch, because the frame and count budgets are applied by
+``schedule_offline`` when it selects the batch, so ``split_offline_batch``
+returns it whole.  Built and measured at **0.999x**, with ``offline.finalize``
+instrumented to show why — the host tail it would have hidden is ~20 us.
+
+The GPU-idle stretch a profile shows at the "micro-batch boundary" is really the
+*tick* boundary: batch selection and collation, ahead of the forward, with
+nothing queued for the GPU.  ``offline_collate_prefetch`` is what addresses it —
+the next micro-batch is selected and collated on a side stream *after* this
+one's forward is issued, so both land in the window where the GPU is busy
+(:meth:`OfflineExecutor._step_prefetched`).
 
 Batch *selection* and *partitioning* both live in the scheduler; this class owns
 only execution.  Sequence packing flips the forward call from the padded
@@ -31,7 +32,9 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, ClassVar, Deque, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -53,6 +56,25 @@ logger = logging.getLogger(__name__)
 _MAX_SKIPPED_ADMITS = 8
 
 
+@dataclass
+class _StagedBatch:
+    """One micro-batch whose features are built but whose forward has not run.
+
+    ``ready`` is recorded on the collate stream after the fbank; the main stream
+    waits on it before the forward, and ``features`` / ``lengths`` are
+    ``record_stream``-ed onto the main stream so the caching allocator cannot
+    recycle them out from under a copy the collate stream has not finished.
+    ``None`` on CPU and whenever the prefetch is off, where the collate ran on
+    the main stream and needs no hand-off.
+    """
+
+    chunk: List[Request]
+    features: torch.Tensor
+    lengths: torch.Tensor
+    order: Optional[List[int]] = None
+    ready: Optional["torch.cuda.Event"] = None
+
+
 class OfflineExecutor(Executor):
     """Execute scheduled offline batches as sequential micro-batches.
 
@@ -60,8 +82,14 @@ class OfflineExecutor(Executor):
     protocol.  Each ``step()`` pulls a batch from the scheduler, asks it to
     partition the batch into micro-batches, and runs them back-to-back
     (fbank → forward → decode → finalise), returning one final output per
-    request.  There is no per-request running state and no cross-step
-    overlap.
+    request.
+
+    With ``offline_collate_prefetch`` (one-shot families, CUDA) the tick is
+    pipelined instead: it forwards the micro-batch collated during the previous
+    tick and collates the next one on a side stream while that forward runs, so
+    batch selection and the fbank stop sitting in front of an idle GPU.  One
+    micro-batch of *features* is then in flight between ticks — ``_staged``,
+    with ``_queued`` holding any further chunks of the same scheduled batch.
 
     With ``enable_packing=True`` the scheduler partitions into packed rows and
     the forward runs the gapless varlen attention — zero attention padding,
@@ -85,6 +113,7 @@ class OfflineExecutor(Executor):
         max_tick_ms: float = 0.0,
         decode_admit_window_ms: float = 0.0,
         max_batch_size: int = 32,
+        collate_prefetch: bool = True,
         metrics: Optional[m.EngineMetrics] = None,
     ) -> None:
         if metrics is not None:
@@ -124,6 +153,20 @@ class OfflineExecutor(Executor):
         # Counted so admission can never starve: after ``_MAX_SKIPPED_ADMITS``
         # consecutive skips the next tick admits regardless.
         self._skipped_admits = 0
+        # Cross-tick collate prefetch (one-shot families only) — see
+        # :meth:`_stage_next`.  The side stream is the whole mechanism: the
+        # decode's readback synchronises the *main* stream, so a collate issued
+        # there is drained by it and overlaps nothing.
+        self._prefetch = bool(collate_prefetch) and device.type == "cuda"
+        self._collate_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream(device=device) if self._prefetch else None
+        )
+        #: Micro-batches selected and partitioned but not yet collated.
+        self._queued: Deque[Tuple[List[Request], Optional[List[int]]]] = deque()
+        #: The one micro-batch collated ahead and waiting for its forward.
+        self._staged: Optional[_StagedBatch] = None
+        #: Completion of the most recent collate, gating reuse of its staging.
+        self._collate_done: Optional[torch.cuda.Event] = None
 
     # ------------------------------------------------------------------
     # Executor ABC
@@ -183,6 +226,11 @@ class OfflineExecutor(Executor):
                 pass
             req.state = RequestState.FINISHED
         self._pending.clear()
+        # Rows the prefetch pipeline is carrying have left the scheduler queue
+        # and are referenced only here; dropping the executor without clearing
+        # them strands both the requests and the staged feature tensor.
+        self._queued.clear()
+        self._staged = None
 
     def step(self) -> List[RequestOutput]:
         """One engine tick, always bounded work.
@@ -199,6 +247,15 @@ class OfflineExecutor(Executor):
         budget_spent = False
         if strategy.incremental and strategy.has_pending():
             outputs, budget_spent = self._advance_pending()
+        if self._prefetch and not strategy.incremental:
+            # One-shot families run the pipelined tick: forward the micro-batch
+            # collated last tick, then collate the next one while the GPU is
+            # busy with it.  Incremental families keep the serial path — their
+            # admission is gated on decode slots the in-flight batch has not
+            # released yet, so prefetching would size the next batch against a
+            # slot count that is about to change.
+            outputs.extend(self._step_prefetched())
+            return outputs
         if self._may_admit(budget_spent) and self._batch_wide_enough() and self._admission_open():
             # Cap the batch at the decode slots actually free.  ``_admission_open``
             # only answers "is there *a* slot"; without this limit a tick with one
@@ -314,13 +371,31 @@ class OfflineExecutor(Executor):
         return False
 
     def has_pending(self) -> bool:
-        return self._scheduler.num_waiting_offline > 0 or bool(self._pending)
+        # ``_staged`` / ``_queued`` are rows the scheduler has already handed
+        # over: invisible to ``num_waiting_offline`` and not parked in
+        # ``_pending``, so without them a drain loop would exit one tick before
+        # the pipeline it filled had run.
+        return (
+            self._scheduler.num_waiting_offline > 0
+            or bool(self._pending)
+            or self._staged is not None
+            or bool(self._queued)
+        )
 
     def num_running(self) -> int:
-        """One-shot offline requests admit-and-finalise within a single
-        ``step()`` and never park; incremental requests park in the pending
-        pool until their strategy finishes them."""
-        return len(self._pending)
+        """Requests the executor is carrying between ticks.
+
+        Incremental requests park in the pending pool until their strategy
+        finishes them.  One-shot requests park only when the collate prefetch is
+        on, and then for at most one tick — collated and awaiting their forward
+        (``_staged``), or selected and awaiting their collate (``_queued``).
+        """
+        return len(self._pending) + self._num_in_flight()
+
+    def _num_in_flight(self) -> int:
+        """Rows held by the prefetch pipeline — staged plus queued."""
+        n = len(self._staged.chunk) if self._staged is not None else 0
+        return n + sum(len(chunk) for chunk, _ in self._queued)
 
     def num_waiting(self) -> int:
         return self._scheduler.num_waiting_offline
@@ -383,6 +458,185 @@ class OfflineExecutor(Executor):
         for pos, orig in enumerate(orig_indices):
             restored[orig] = outputs[pos]
         return [r for r in restored if r is not None]
+
+    # ------------------------------------------------------------------
+    # Pipelined tick (one-shot families)
+    # ------------------------------------------------------------------
+
+    def _step_prefetched(self) -> List[RequestOutput]:
+        """One tick with the next micro-batch's collate hidden behind this one's
+        forward.
+
+        The serial tick is ``schedule -> collate -> forward -> decode ->
+        finalise``, and everything before the forward runs with an idle GPU:
+        batch selection is pure host work, and the collate's own GPU work cannot
+        start until the host has finished choosing the batch.  Profiled at
+        ``max_batch_size=256`` that is ~2.2 ms of scheduling and ~2 ms of collate
+        per ~23.5 ms step.
+
+        Here the order is ``forward(N) -> schedule+collate(N+1) -> decode(N)``,
+        so the host chooses and collates the next batch while the GPU runs this
+        one's encoder.  Two things contribute, and a three-way A/B separates
+        them (1024 utterances, ``max_batch_size`` 64, 4 interleaved rounds):
+
+        * **The reordering**, on its own, is worth **1.060x** — batch selection
+          is pure host work, so moving it behind the forward helps even with the
+          collate left on the main stream.
+        * **The side stream** adds a further **1.027x** (1.088x total).  It is
+          what lets the collate's *GPU* work overlap too: ``decode`` ends in a
+          device->host readback that synchronises the main stream, so a collate
+          issued there is drained by it and only its host half overlaps.
+
+        Issuing the collate *before* the forward recovers neither: it would be
+        the thing the GPU is idle for, which is the state this replaces.
+
+        What stays in front of the GPU is the decode's own host tail (~1.5 ms):
+        hiding that needs the *next* forward in flight during it, which is a
+        second batch of encoder activations rather than a second batch of
+        features, and a different trade.
+
+        Not measurable under Nsight Systems, and the direction inverts there.
+        The win *is* host work fitting inside the forward window, and CUPTI
+        inflates exactly that: un-profiled 1.100x, ``-t cuda`` 1.035x,
+        ``-t cuda,nvtx`` 0.954x.  Use wall clock for this one.
+        """
+        outputs: List[RequestOutput] = []
+        if self._staged is None:
+            # Priming, and only here: an empty pipeline has nothing for the GPU
+            # to chew on, so this one collate is unavoidably in front of it.
+            outputs.extend(self._stage_next())
+        staged, self._staged = self._staged, None
+        if staged is None:
+            return outputs
+        outputs.extend(self._run_staged(staged))
+        return outputs
+
+    def _run_staged(self, staged: _StagedBatch) -> List[RequestOutput]:
+        """Forward + decode + finalise one staged micro-batch, staging the next
+        one in the window where the GPU is busy with the forward.
+
+        Failure isolation is the same contract as :meth:`_run_micro_batch`, one
+        stage later: the features already exist, so the isolation pass re-runs
+        each row against *them* rather than from waveforms that ``collate``
+        released.  :meth:`_stage_next` swallows its own failures, so an
+        exception reaching here always belongs to ``staged``.
+        """
+        prefetched: List[RequestOutput] = []
+        try:
+            enc_out, output_lengths = self._encode_staged(staged)
+            prefetched = self._stage_next()
+            outputs = self._finalise_decoded(
+                staged.chunk, self._decode_encoded(staged.chunk, enc_out, output_lengths)
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad batch must not take the tick
+            return self._isolate_failure(staged.chunk, exc, staged.features, staged.lengths) + (
+                prefetched
+            )
+        return self._restore_order(outputs, staged.order) + prefetched
+
+    def _encode_staged(self, staged: _StagedBatch) -> Tuple[Any, torch.Tensor]:
+        """Hand the staged features to the main stream and issue the forward.
+
+        ``wait_event`` orders the forward behind the collate that produced the
+        features; ``record_stream`` tells the caching allocator the main stream
+        is now a consumer, so the blocks cannot be handed to a later collate
+        while the forward still reads them.  Both are no-ops when the collate
+        ran inline on the main stream.
+        """
+        if staged.ready is not None:
+            main = torch.cuda.current_stream(self._device)
+            main.wait_event(staged.ready)
+            staged.features.record_stream(main)
+            staged.lengths.record_stream(main)
+        return self._encode_stage(staged.chunk, staged.features, staged.lengths)
+
+    def _stage_next(self) -> List[RequestOutput]:
+        """Select (when the queue is dry) and collate the next micro-batch.
+
+        Returns error outputs, which is the whole reason it does not raise: it
+        runs *inside* :meth:`_run_staged`'s try block, where an escaping
+        exception would be attributed to the batch being forwarded rather than
+        to the batch being collated.
+        """
+        if self._staged is not None:
+            return []
+        if not self._queued:
+            if not (self._may_admit(False) and self._batch_wide_enough()):
+                return []
+            batch = self._scheduler.schedule_offline(limit=self._admission_limit())
+            if not batch:
+                return []
+            # Stamped where the request stops waiting — the scheduler has just
+            # selected it and nothing between here and the forward sends a row
+            # back to the queue.  One tick earlier than the serial path stamps
+            # it, and one tick earlier is when it actually happens now.
+            self._metrics.observe_queue_wait(m.MODE_OFFLINE, batch)
+            chunks, orig_indices = self._scheduler.split_offline_batch(batch)
+            pos = 0
+            for chunk in chunks:
+                # ``orig_indices`` is flat over the concatenated chunks; each
+                # chunk carries its own slice so its outputs can be restored
+                # even though chunks now finish in different ticks.
+                order = None if orig_indices is None else orig_indices[pos : pos + len(chunk)]
+                self._queued.append((chunk, order))
+                pos += len(chunk)
+        if not self._queued:
+            return []
+
+        chunk, order = self._queued.popleft()
+        nvtx_push("offline.collate")
+        t0 = time.perf_counter()
+        try:
+            self._record_batch_shape(chunk)
+            stream = self._collate_stream
+            if stream is None:
+                features, lengths = self._collate(chunk)
+                ready: Optional[torch.cuda.Event] = None
+            else:
+                # The pinned staging ``collate`` packs into is reused across
+                # calls and read by an async H2D, so the previous collate's
+                # completion is what makes the refill safe.  A full tick of
+                # forward + decode has run since it was issued, so in steady
+                # state this has already fired — it is the priming tick that
+                # actually waits, once per drain.
+                if self._collate_done is not None:
+                    self._collate_done.synchronize()
+                with torch.cuda.stream(stream):
+                    features, lengths = self._collate(chunk)
+                    ready = torch.cuda.Event()
+                    ready.record(stream)
+                self._collate_done = ready
+        except Exception as exc:  # noqa: BLE001 — see _run_micro_batch
+            nvtx_pop()
+            # Nothing was collated, so the isolation pass starts from the
+            # waveforms: ``collate`` only releases them once the features exist.
+            return self._isolate_failure(chunk, exc, None, None)
+        nvtx_pop()
+        self._metrics.observe_stage("offline.collate", time.perf_counter() - t0)
+        self._staged = _StagedBatch(
+            chunk=chunk, features=features, lengths=lengths, order=order, ready=ready
+        )
+        return []
+
+    @staticmethod
+    def _restore_order(
+        outputs: List[RequestOutput], order: Optional[List[int]]
+    ) -> List[RequestOutput]:
+        """Undo the partitioner's length sort within one micro-batch.
+
+        Ordering is per micro-batch rather than per scheduled batch, because a
+        batch's chunks no longer finish in the same tick.  Callers that care
+        about arrival order index by ``request_id``; this keeps the common
+        one-chunk case exact.
+        """
+        if order is None or len(order) != len(outputs):
+            return outputs
+        # Rank, not index: the partitioner length-sorts the whole batch before
+        # chunking it, so a chunk's original indices are scattered over the
+        # batch rather than a contiguous run.  Sorting by them restores relative
+        # arrival order, which for the single-chunk case ``split_offline_batch``
+        # actually returns is the exact permutation the serial path applied.
+        return [outputs[pos] for pos in sorted(range(len(outputs)), key=order.__getitem__)]
 
     # ------------------------------------------------------------------
     # Incremental decode (label-synchronous AR strategies)

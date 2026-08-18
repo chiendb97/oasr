@@ -35,14 +35,23 @@ class StreamingExecutor(Executor):
        paged KV / CNN / CTC caches.
     2. Runs one batched GPU fbank across every active stream that has
        pending audio (one kernel call for the whole pool, on a dedicated
-       feat stream so it overlaps with the previous step's encoder
-       forward).
+       feat stream so it overlaps with the encoder forward).
     3. Runs ``forward_streaming_step`` against every stream whose feature
-       buffer now holds a full encoder window, then decodes a partial
-       per result.
+       buffer holds a full encoder window, then decodes a partial per
+       result.
     4. Finalises streams the client has explicitly closed
        (``audio_final``) once both the audio deque and the feature
        buffer are drained, freeing their cache slots.
+
+    Steps 2 and 3 run in one of two orders, selected by
+    ``streaming_feature_lookahead``:
+
+    * **pipelined** (default, :meth:`_step_pipelined`) — forward first, then
+      extract, so the feature pack's host work runs while the GPU is busy with
+      the encoder.  Features extracted in step *N* are forwarded by step *N+1*.
+    * **serial** (:meth:`_step_serial`) — extract then forward, both in the same
+      step.  The order this executor had before; kept as the A/B arm and for a
+      deployment that would rather not spend one step of pipeline depth.
     """
 
     streaming: ClassVar[bool] = True
@@ -74,6 +83,13 @@ class StreamingExecutor(Executor):
         # both kernels concurrently when they live on different streams).
         self._feat_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        )
+        # Extract the *next* step's features after issuing this step's encoder
+        # forward rather than before it — see
+        # :meth:`_step_pipelined`.  Pointless without a second stream to put the
+        # feature work on, so it follows ``_feat_stream``.
+        self._lookahead: bool = bool(
+            getattr(config, "streaming_feature_lookahead", True) and self._feat_stream is not None
         )
 
     # ------------------------------------------------------------------
@@ -193,6 +209,150 @@ class StreamingExecutor(Executor):
             self._scheduler.finish_request(req.request_id)
         return outputs
 
+    # ------------------------------------------------------------------
+    # Per-step stages
+    # ------------------------------------------------------------------
+
+    def _extract_features(
+        self, running: List[Request], outputs: List[RequestOutput]
+    ) -> List[Request]:
+        """Batched GPU fbank across every stream with pending audio.
+
+        One kernel call for the whole active pool rather than N sequential fbank
+        calls, issued on the dedicated feat stream when running on CUDA.  The
+        producer->consumer ordering lives inside ``extract_streaming_batch`` (it
+        is the one that appends into ``feature_buffer`` on the current stream);
+        the wait here is a redundant belt for our own read of ``feature_buffer``,
+        not the protection — putting the only wait here raced the append.
+
+        Returns the surviving ``running`` set: a failure fails the cohort that
+        was being extracted and leaves the rest of the pool alone.
+        """
+        needs_feat = [r for r in running if r.has_pending_audio]
+        if not needs_feat:
+            return running
+        nvtx_push("extract_fbank")
+        t0 = time.perf_counter()
+        try:
+            self._inp.extract_streaming_batch(needs_feat, cuda_stream=self._feat_stream)
+            if self._feat_stream is not None:
+                torch.cuda.current_stream(self._device).wait_stream(self._feat_stream)
+        except Exception as exc:  # noqa: BLE001 — see _fail_cohort
+            nvtx_pop()
+            outputs.extend(self._fail_cohort(needs_feat, exc, "streaming_features"))
+            return [r for r in running if r.state is not RequestState.FINISHED]
+        nvtx_pop()
+        self._metrics.observe_stage("streaming.features", time.perf_counter() - t0)
+        return running
+
+    def _forward(
+        self, ready: List[Request], outputs: List[RequestOutput]
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Issue one encoder chunk per ready stream.  Enqueued, not synchronised.
+
+        ``None`` on failure, after the cohort has been failed — the caller drops
+        the decode and re-filters its running set.
+        """
+        self._metrics.observe_batch(m.MODE_STREAMING, len(ready))
+        nvtx_push("forward_streaming")
+        t0 = time.perf_counter()
+        try:
+            log_probs_map = self._mr.forward_streaming_step(ready)
+        except Exception as exc:  # noqa: BLE001 — see _fail_cohort
+            nvtx_pop()
+            outputs.extend(self._fail_cohort(ready, exc, "streaming_forward"))
+            return None
+        nvtx_pop()
+        self._metrics.observe_stage("streaming.encode", time.perf_counter() - t0)
+        return log_probs_map
+
+    def _decode(
+        self,
+        ready: List[Request],
+        log_probs_map: Dict[str, torch.Tensor],
+        outputs: List[RequestOutput],
+    ) -> bool:
+        """Decode one partial per forwarded stream — the device->host boundary.
+
+        Returns ``False`` if the cohort failed (the caller re-filters ``running``).
+        """
+        nvtx_push("decode_streaming")
+        t0 = time.perf_counter()
+        try:
+            outputs.extend(self._op.decode_streaming_batch(ready, log_probs_map))
+        except Exception as exc:  # noqa: BLE001 — see _fail_cohort
+            nvtx_pop()
+            outputs.extend(self._fail_cohort(ready, exc, "streaming_forward"))
+            return False
+        nvtx_pop()
+        self._metrics.observe_stage("streaming.decode", time.perf_counter() - t0)
+        return True
+
+    def _step_serial(
+        self, running: List[Request], window: int, outputs: List[RequestOutput]
+    ) -> List[Request]:
+        """Extract -> forward -> decode, all within this step.
+
+        Every stream's chunk is forwarded in the step that extracted it, so the
+        pack's host cost sits in front of the encoder with an idle GPU.  That is
+        the cost ``_step_pipelined`` removes; this order is kept as its A/B arm.
+        """
+        running = self._extract_features(running, outputs)
+        if not running:
+            return running
+        ready = [r for r in running if r.has_ready_encoder_chunk(window)]
+        if not ready:
+            return running
+        log_probs_map = self._forward(ready, outputs)
+        if log_probs_map is None or not self._decode(ready, log_probs_map, outputs):
+            return [r for r in running if r.state is not RequestState.FINISHED]
+        return running
+
+    def _step_pipelined(
+        self, running: List[Request], window: int, outputs: List[RequestOutput]
+    ) -> List[Request]:
+        """Forward -> extract -> decode: the pack runs against the encoder.
+
+        The streams forwarded here are the ones whose features the *previous*
+        step extracted, which is what frees this step's extraction to run behind
+        the encoder instead of in front of it.  The host cost it hides — the
+        per-stream concat + scale + write into pinned staging — was the single
+        largest block of GPU-idle in a streaming step, and removing it from the
+        critical path measures **1.25x** end to end (256 utterances, pool 64,
+        chunk 16, 5 interleaved rounds), transcripts byte-identical.  In the
+        profile the step's GPU-idle goes 7.15 -> 5.87 ms and its idle gaps over
+        0.2 ms total 168.0 -> 96.4 ms; both understate the win, because CUPTI
+        inflates the very host work being hidden.
+
+        Three orderings are load-bearing:
+
+        * The extract must land **after** the forward is issued and **before**
+          the decode.  The decode is the device->host readback, so anything
+          after it is host work with a drained queue and overlaps nothing.
+        * ``extract_streaming_batch`` appends into ``feature_buffer`` on the
+          current stream, so the append is ordered behind the encoder kernels
+          that read the window this step consumed — including the realloc-copy
+          when a buffer grows or drops its consumed prefix.
+        * A stream the extract fails is freed by ``_fail_cohort``, so the decode
+          re-filters ``ready`` rather than reading a released session.  Such a
+          stream still gets the partial for the chunk that *was* forwarded,
+          followed by its terminal error — the same pair the serial order
+          produces when a feature failure follows a successful step.
+        """
+        ready = [r for r in running if r.has_ready_encoder_chunk(window)]
+        log_probs_map = self._forward(ready, outputs) if ready else None
+        if ready and log_probs_map is None:
+            ready = []
+            running = [r for r in running if r.state is not RequestState.FINISHED]
+
+        running = self._extract_features(running, outputs)
+
+        if ready and log_probs_map is not None:
+            alive = [r for r in ready if r.state is not RequestState.FINISHED]
+            if alive and not self._decode(alive, log_probs_map, outputs):
+                running = [r for r in running if r.state is not RequestState.FINISHED]
+        return running
+
     def step(self) -> List[RequestOutput]:
         nvtx_push("streaming.schedule")
         t0 = time.perf_counter()
@@ -215,63 +375,21 @@ class StreamingExecutor(Executor):
         if not running:
             return outputs
 
-        # 1. Batched GPU fbank across every stream with pending audio —
-        #    one kernel call for the whole active pool rather than N
-        #    sequential fbank calls.  Issued on the dedicated feat stream
-        #    when running on CUDA so it can overlap with the previous
-        #    step's encoder forward.  The producer→consumer ordering lives
-        #    inside ``extract_streaming_batch`` (it is the one that appends
-        #    into feature_buffer on this stream); the wait below is a
-        #    redundant belt for our own read of feature_buffer, not the
-        #    protection — putting the only wait here raced the append.
-        needs_feat = [r for r in running if r.has_pending_audio]
-        if needs_feat:
-            nvtx_push("extract_fbank")
-            t0 = time.perf_counter()
-            try:
-                self._inp.extract_streaming_batch(
-                    needs_feat,
-                    cuda_stream=self._feat_stream,
-                )
-                if self._feat_stream is not None:
-                    torch.cuda.current_stream(self._device).wait_stream(self._feat_stream)
-            except Exception as exc:  # noqa: BLE001 — see _fail_cohort
-                nvtx_pop()
-                outputs.extend(self._fail_cohort(needs_feat, exc, "streaming_features"))
-                running = [r for r in running if r.state is not RequestState.FINISHED]
-                if not running:
-                    return outputs
-            else:
-                nvtx_pop()
-                self._metrics.observe_stage("streaming.features", time.perf_counter() - t0)
-
-        # 2. For each stream whose feature buffer now holds at least one
-        #    encoder window, run forward_chunk_paged.
         window = self._config.decoding_window
-        ready = [r for r in running if r.has_ready_encoder_chunk(window)]
-        if ready:
-            self._metrics.observe_batch(m.MODE_STREAMING, len(ready))
-            nvtx_push("forward_streaming")
-            t0 = time.perf_counter()
-            try:
-                log_probs_map: Dict[str, torch.Tensor] = self._mr.forward_streaming_step(ready)
-                nvtx_pop()
-                self._metrics.observe_stage("streaming.encode", time.perf_counter() - t0)
-                nvtx_push("decode_streaming")
-                t0 = time.perf_counter()
-                partials = self._op.decode_streaming_batch(ready, log_probs_map)
-                outputs.extend(partials)
-                nvtx_pop()
-                self._metrics.observe_stage("streaming.decode", time.perf_counter() - t0)
-            except Exception as exc:  # noqa: BLE001 — see _fail_cohort
-                nvtx_pop()
-                outputs.extend(self._fail_cohort(ready, exc, "streaming_forward"))
-                running = [r for r in running if r.state is not RequestState.FINISHED]
+        if self._lookahead:
+            running = self._step_pipelined(running, window, outputs)
+        else:
+            running = self._step_serial(running, window, outputs)
+        if not running:
+            return outputs
 
-        # 3. Finalise streams whose audio is exhausted and whose feature
+        # Finalise streams whose audio is exhausted and whose feature
         #    buffer has been fully consumed.  A stream can reach this
         #    state in the same step it ran its last encoder chunk, so we
-        #    check *after* the forward pass.  Only streams the client
+        #    check *after* the forward pass.  Under lookahead the chunk a
+        #    stream's last audio produced is forwarded by the *next* step,
+        #    and ``has_ready_encoder_chunk`` is exactly what holds the
+        #    stream open for it.  Only streams the client
         #    has explicitly closed (``audio_final``) are eligible — a
         #    freshly admitted streaming request that hasn't yet received
         #    audio is otherwise indistinguishable from a drained one and

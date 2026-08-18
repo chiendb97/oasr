@@ -24,6 +24,7 @@ it should not need a GPU or a checkpoint.
 
 from __future__ import annotations
 
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,7 @@ import torch
 from oasr.cache.types import CacheConfig
 from oasr.engine.executor.offline import OfflineExecutor
 from oasr.engine.executor.streaming import StreamingExecutor
+from oasr.engine.metrics import build_metrics
 from oasr.engine.request import Request, RequestOutput, RequestState
 
 # ---------------------------------------------------------------------------
@@ -321,7 +323,7 @@ class TestStreamingStepDoesNotRaise:
     """
 
     @staticmethod
-    def _executor(rec, *, forward_raises):
+    def _executor(rec, *, forward_raises, lookahead=False):
         ex = StreamingExecutor.__new__(StreamingExecutor)
         ready = [_request("s1"), _request("s2")]
         for r in ready:
@@ -348,11 +350,15 @@ class TestStreamingStepDoesNotRaise:
         )
         ex._config = SimpleNamespace(decoding_window=1)
         ex._feat_stream = None
+        # Both step orders have their own forward/extract/decode sequencing and
+        # therefore their own teardown ordering; the contract is the same.
+        ex._lookahead = lookahead
         return ex, ready
 
-    def test_a_raising_forward_returns_error_outputs(self, monkeypatch):
+    @pytest.mark.parametrize("lookahead", [False, True], ids=["serial", "pipelined"])
+    def test_a_raising_forward_returns_error_outputs(self, monkeypatch, lookahead):
         rec = _Recorder()
-        ex, ready = self._executor(rec, forward_raises=True)
+        ex, ready = self._executor(rec, forward_raises=True, lookahead=lookahead)
         # Every stream has a full window and no pending audio.
         monkeypatch.setattr(Request, "has_ready_encoder_chunk", lambda self, w: True)
         monkeypatch.setattr(Request, "has_pending_audio", property(lambda self: False))
@@ -364,9 +370,10 @@ class TestStreamingStepDoesNotRaise:
         assert all(o.error_stage == "streaming_forward" for o in outs)
         assert rec.finished == ["s1", "s2"]
 
-    def test_a_healthy_forward_is_unaffected(self, monkeypatch):
+    @pytest.mark.parametrize("lookahead", [False, True], ids=["serial", "pipelined"])
+    def test_a_healthy_forward_is_unaffected(self, monkeypatch, lookahead):
         rec = _Recorder()
-        ex, ready = self._executor(rec, forward_raises=False)
+        ex, ready = self._executor(rec, forward_raises=False, lookahead=lookahead)
         monkeypatch.setattr(Request, "has_ready_encoder_chunk", lambda self, w: True)
         monkeypatch.setattr(Request, "has_pending_audio", property(lambda self: False))
 
@@ -374,3 +381,274 @@ class TestStreamingStepDoesNotRaise:
 
         assert outs == []
         assert rec.finished == [], "no stream should be torn down on the happy path"
+
+
+# ---------------------------------------------------------------------------
+# Pipelined ticks (P1 streaming feature lookahead, P3 offline collate prefetch)
+#
+# Both changes are reorderings, so what has to be pinned is the *order* — which
+# is invisible to a transcript comparison but is the entire point.  Each test
+# below fails if its stage is moved back to where it used to be.
+# ---------------------------------------------------------------------------
+
+
+class _OrderRecorder:
+    """Records the sequence of executor stages as they are entered."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def mark(self, name):
+        def _record(*args, **kwargs):
+            self.seen.append(name)
+            return None
+
+        return _record
+
+
+def _lookahead_executor(order: _OrderRecorder, *, lookahead: bool):
+    """A ``StreamingExecutor`` wired to record stage order and nothing else."""
+    ex = StreamingExecutor.__new__(StreamingExecutor)
+    running = [_request("s1")]
+    for r in running:
+        r.stream_id = 0
+
+    def extract(reqs, cuda_stream=None):
+        order.seen.append("extract")
+
+    def forward(reqs):
+        order.seen.append("forward")
+        return {r.request_id: torch.zeros(1) for r in reqs}
+
+    def decode(reqs, m):
+        order.seen.append("decode")
+        return []
+
+    ex._scheduler = SimpleNamespace(
+        schedule_streaming=lambda: ([], list(running)),
+        finish_request=lambda rid: None,
+    )
+    ex._inp = SimpleNamespace(extract_streaming_batch=extract)
+    ex._mr = SimpleNamespace(forward_streaming_step=forward, free_stream=lambda r: None)
+    ex._op = SimpleNamespace(
+        decode_streaming_batch=decode,
+        finalize_streaming=lambda req: RequestOutput(req.request_id, "", [[]]),
+        fill_nbest_texts=lambda req, out: None,
+        free_session=lambda r: None,
+    )
+    ex._config = SimpleNamespace(decoding_window=1)
+    ex._feat_stream = None
+    ex._lookahead = lookahead
+    return ex, running
+
+
+class TestStreamingFeatureLookahead:
+    """The pack has to run *behind* the encoder, not in front of it.
+
+    ``pad+pin`` — the per-stream concat + ``audio_scale`` + write into pinned
+    staging — is host work that issues no GPU operation, and it profiled as the
+    largest single block of GPU-idle in a streaming step precisely because it
+    sat ahead of the forward.  Moving it between the forward and the decode is
+    the fix, and the decode is the boundary that makes the placement matter: it
+    ends in a device->host readback, so anything after it overlaps nothing.
+    """
+
+    @staticmethod
+    def _run(lookahead, monkeypatch):
+        order = _OrderRecorder()
+        ex, _ = _lookahead_executor(order, lookahead=lookahead)
+        monkeypatch.setattr(Request, "has_ready_encoder_chunk", lambda self, w: True)
+        monkeypatch.setattr(Request, "has_pending_audio", property(lambda self: True))
+        ex.step()
+        return order.seen
+
+    def test_pipelined_extracts_between_the_forward_and_the_decode(self, monkeypatch):
+        assert self._run(True, monkeypatch) == ["forward", "extract", "decode"]
+
+    def test_serial_extracts_before_the_forward(self, monkeypatch):
+        assert self._run(False, monkeypatch) == ["extract", "forward", "decode"]
+
+
+class TestStreamingLookaheadDrains:
+    """A stream's last chunk must still be forwarded, one step later.
+
+    Under lookahead the features a step extracts are consumed by the *next*
+    step, so the finalisation check has to keep a stream alive on the strength
+    of a ready encoder chunk alone — its audio deque is already empty.  Getting
+    this wrong finalises the stream one chunk early and silently truncates every
+    transcript's last word.
+    """
+
+    def test_a_stream_is_not_finalised_while_a_chunk_is_still_unforwarded(self, monkeypatch):
+        order = _OrderRecorder()
+        ex, running = _lookahead_executor(order, lookahead=True)
+        req = running[0]
+        req.audio_final = True
+        # The state right after the extract that consumed the last chunk: no
+        # audio left, one encoder window built and not yet forwarded.
+        monkeypatch.setattr(Request, "has_pending_audio", property(lambda self: False))
+        monkeypatch.setattr(Request, "has_ready_encoder_chunk", lambda self, w: True)
+
+        outs = ex.step()
+
+        assert outs == [], "a stream with an unforwarded window is not drained"
+        assert req.state is not RequestState.FINISHED
+
+        # Next step: the window has been forwarded, nothing is left.
+        monkeypatch.setattr(Request, "has_ready_encoder_chunk", lambda self, w: False)
+        outs = ex.step()
+        assert [o.request_id for o in outs] == ["s1"]
+
+
+def _prefetch_executor(order: _OrderRecorder, batches, *, prefetch: bool):
+    """An ``OfflineExecutor`` wired for the pipelined tick, on CPU.
+
+    ``batches`` is consumed one per ``schedule_offline`` call, so the fixture can
+    drive several ticks and watch where each stage lands.  ``_prefetch`` selects
+    the tick shape and ``_collate_stream`` stays ``None``, so the collate runs
+    inline and ``_StagedBatch.ready`` is ``None`` — the ordering under test is
+    the host's, and it is the same with or without the side stream.
+    """
+    ex = OfflineExecutor.__new__(OfflineExecutor)
+    queue = list(batches)
+
+    def schedule_offline(limit=None):
+        order.seen.append("schedule")
+        return queue.pop(0) if queue else []
+
+    def collate(chunk):
+        order.seen.append("collate")
+        return [r.request_id for r in chunk], torch.tensor([1] * len(chunk))
+
+    def forward_offline(features, lengths):
+        order.seen.append("forward")
+        return SimpleNamespace(ids=list(features)), lengths
+
+    def decode_offline(enc, lens, requests=None):
+        order.seen.append("decode")
+        return [RequestOutput(request_id=i, text=f"ok-{i}", tokens=[[1]]) for i in enc.ids]
+
+    ex._scheduler = SimpleNamespace(
+        schedule_offline=schedule_offline,
+        split_offline_batch=lambda batch: ([batch], None),
+        num_waiting_offline=0,
+    )
+    ex._mr = SimpleNamespace(forward_offline=forward_offline)
+    ex._enable_packing = False
+    ex._pending = {}
+    ex._op = SimpleNamespace(
+        strategy=SimpleNamespace(
+            incremental=False, consumes="log_probs", has_pending=lambda: False
+        ),
+        decode_offline=decode_offline,
+        fill_nbest_texts=lambda req, out: None,
+    )
+    ex._collate = collate
+    ex._prefetch = prefetch
+    ex._collate_stream = None
+    ex._collate_done = None
+    ex._queued = deque()
+    ex._staged = None
+    ex._skipped_admits = 0
+    ex._decode_admit_window_ms = 0.0
+    ex._max_batch_size = 8
+    ex._max_decode_slots = None
+    ex._metrics = build_metrics(enabled=False)
+    return ex
+
+
+class TestOfflineCollatePrefetch:
+    """The next batch has to be selected and collated *after* the forward.
+
+    Batch selection is pure host work and the collate's GPU work cannot start
+    until it finishes, so in the serial tick both sit ahead of the encoder with
+    nothing queued for the GPU — ~4 ms of a ~23.5 ms step at ``max_batch_size``
+    256.  Issuing them after the forward puts them in the window where the GPU
+    is busy.  Issued *before* the forward, they are once again the thing the GPU
+    is idle for, which is exactly the state being replaced.
+    """
+
+    @staticmethod
+    def _batches():
+        return [[_request("a1"), _request("a2")], [_request("b1")]]
+
+    def test_pipelined_stages_the_next_batch_after_the_forward(self):
+        order = _OrderRecorder()
+        ex = _prefetch_executor(order, self._batches(), prefetch=True)
+
+        first = ex.step()
+
+        # Priming collates once in front of the GPU — then the second batch's
+        # schedule + collate land between this batch's forward and its decode.
+        assert order.seen == [
+            "schedule",
+            "collate",
+            "forward",
+            "schedule",
+            "collate",
+            "decode",
+        ]
+        assert [o.request_id for o in first] == ["a1", "a2"]
+
+    def test_serial_collates_before_the_forward(self):
+        order = _OrderRecorder()
+        ex = _prefetch_executor(order, self._batches(), prefetch=False)
+
+        ex.step()
+
+        assert order.seen == ["schedule", "collate", "forward", "decode"]
+
+    def test_a_staged_batch_keeps_the_engine_pending(self):
+        """A drain loop asks ``has_pending``; a staged batch is invisible to the
+        scheduler queue and is not parked in ``_pending``, so without it the
+        loop exits one tick before running the batch it just collated."""
+        order = _OrderRecorder()
+        ex = _prefetch_executor(order, self._batches(), prefetch=True)
+
+        ex.step()  # returns batch a, stages batch b
+
+        assert ex._staged is not None
+        assert ex.has_pending(), "the staged batch must keep the drain loop alive"
+        assert ex.num_running() == 1
+
+        second = ex.step()
+        assert [o.request_id for o in second] == ["b1"]
+        assert not ex.has_pending()
+
+    def test_every_request_comes_back_exactly_once(self):
+        """Across ticks, with the pipeline priming and draining."""
+        order = _OrderRecorder()
+        batches = [[_request(f"r{i}")] for i in range(5)]
+        ex = _prefetch_executor(order, [list(b) for b in batches], prefetch=True)
+
+        seen: list[str] = []
+        for _ in range(8):
+            seen.extend(o.request_id for o in ex.step())
+
+        assert seen == [f"r{i}" for i in range(5)]
+
+
+class TestOfflinePrefetchOrdering:
+    """The partitioner's length sort must still be undone per micro-batch.
+
+    ``split_offline_batch`` returns indices that are flat over the *whole*
+    scheduled batch, and its chunks no longer finish in the same tick, so the
+    restore has to work from each chunk's own slice.  Treating those indices as
+    positions within the chunk is an ``IndexError`` waiting for the first batch
+    the scheduler actually splits.
+    """
+
+    def test_scattered_indices_restore_by_rank(self):
+        outs = [RequestOutput(request_id=r, text=r, tokens=[[1]]) for r in ("c", "a", "b")]
+        # Length-sorted chunk whose members came 7th, 2nd and 5th in the batch.
+        restored = OfflineExecutor._restore_order(outs, [7, 2, 5])
+        assert [o.request_id for o in restored] == ["a", "b", "c"]
+
+    def test_a_full_permutation_matches_the_serial_restore(self):
+        outs = [RequestOutput(request_id=r, text=r, tokens=[[1]]) for r in ("c", "a", "b")]
+        order = [2, 0, 1]
+        restored = OfflineExecutor._restore_order(outs, order)
+        expected: list = [None] * 3
+        for pos, orig in enumerate(order):  # the pre-pipeline restore, verbatim
+            expected[orig] = outs[pos]
+        assert restored == expected
