@@ -38,6 +38,18 @@ pub struct Cli {
     /// Optional: max batch size override.
     #[arg(long)]
     pub max_batch_size: Option<u32>,
+    /// Number of engine workers to run behind the request router — each a full
+    /// `ASREngine` with its own scheduler, KV pool and CUDA graphs.  Requests are
+    /// routed to the least-loaded worker and a streaming request stays sticky to
+    /// the one that admitted it (`EnginePool`).
+    ///
+    /// Costs: each worker is a full copy of the weights, KV pool and graph pools,
+    /// so VRAM scales with the count, as does startup time.  Size
+    /// `--max-num-blocks` for **one** worker's `--max-batch-size`; it is not
+    /// divided for you, and a pool too small for its batch truncates every stream
+    /// (see the engine's startup warning).
+    #[arg(long, default_value = "1")]
+    pub engine_workers: u32,
     /// Encoder chunk size (frames).
     #[arg(long)]
     pub chunk_size: Option<u32>,
@@ -402,8 +414,50 @@ impl Cli {
             .then(|| std::time::Duration::from_secs(self.stream_idle_timeout_secs))
     }
 
+    /// Workers to build, validated against the rest of the configuration.
+    ///
+    /// Replication is refused with sequence packing on.  Packing is
+    /// offline-only, and offline is the mode replication has least to offer:
+    /// the forward is already ~88% GPU-busy, so the second worker competes for
+    /// a GPU that is not idle.  Packing also re-partitions the batch by
+    /// `max_packed_frames` rather than by count, which makes the per-worker
+    /// `max_batch_size` — the thing being replicated — no longer the unit of
+    /// work.  Refusing beats silently doing one of the two badly.
+    pub fn engine_worker_count(&self) -> Result<usize> {
+        let n = self.engine_workers as usize;
+        if n == 0 {
+            return Err(anyhow!("--engine-workers must be >= 1, got 0"));
+        }
+        Ok(n)
+    }
+
+    /// Reject replication combined with sequence packing.
+    ///
+    /// Reads the **merged** engine config rather than the flag: packing can
+    /// arrive through `--engine-config` JSON, and a gate that only sees the flag
+    /// would wave that through.
+    fn check_workers_vs_packing(&self, obj: &Map<String, Value>, workers: usize) -> Result<()> {
+        let packing = obj
+            .get("enable_sequence_packing")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if workers > 1 && packing {
+            return Err(anyhow!(
+                "--engine-workers {workers} cannot be combined with \
+                 enable_sequence_packing: packing is offline-only, and an offline \
+                 forward is already ~88% GPU-busy, so extra workers contend for a \
+                 GPU that is not idle rather than filling it. Packing also \
+                 re-partitions the batch by max_packed_frames instead of by count, \
+                 so per-worker max_batch_size stops being the unit of work. Run one \
+                 worker with packing, or several without it."
+            ));
+        }
+        Ok(())
+    }
+
     /// Build the full EngineConfig JSON object handed to `PyEngine::new`.
     pub fn build_engine_config_json(&self) -> Result<String> {
+        let workers = self.engine_worker_count()?;
         let mut obj: Map<String, Value> = if let Some(p) = &self.engine_config {
             let bytes = std::fs::read(p).with_context(|| format!("read engine_config {p:?}"))?;
             let parsed: Value = serde_json::from_slice(&bytes)?;
@@ -602,6 +656,7 @@ impl Cli {
         }
         // device defaults to "cuda" — EngineConfig falls back if absent.
 
+        self.check_workers_vs_packing(&obj, workers)?;
         Ok(serde_json::to_string(&Value::Object(obj))?)
     }
 }
@@ -732,6 +787,71 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg["gpu_memory_utilization"], 0.75);
+    }
+
+    #[test]
+    fn one_worker_is_the_default_and_needs_no_gate() {
+        let c = cli(&[]);
+        assert_eq!(c.engine_worker_count().unwrap(), 1);
+        // Packing with a single worker is the supported offline configuration.
+        assert!(cli(&["--enable-sequence-packing", "true"])
+            .build_engine_config_json()
+            .is_ok());
+    }
+
+    #[test]
+    fn zero_workers_is_refused() {
+        assert!(cli(&["--engine-workers", "0"])
+            .engine_worker_count()
+            .is_err());
+    }
+
+    #[test]
+    fn workers_are_refused_with_packing_from_the_flag() {
+        let err = cli(&["--engine-workers", "2", "--enable-sequence-packing", "true"])
+            .build_engine_config_json()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("enable_sequence_packing"), "{err}");
+    }
+
+    #[test]
+    fn workers_are_refused_with_packing_from_the_config_file() {
+        // The gate reads the *merged* config: packing can arrive through
+        // --engine-config, and a flag-only check would wave that through.
+        let dir = std::env::temp_dir().join(format!("oasr-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("engine.json");
+        std::fs::write(
+            &path,
+            br#"{"ckpt_dir": "/tmp/ckpt", "enable_sequence_packing": true}"#,
+        )
+        .unwrap();
+        let c = cli(&[
+            "--engine-workers",
+            "2",
+            "--engine-config",
+            path.to_str().unwrap(),
+        ]);
+        let err = c.build_engine_config_json().unwrap_err().to_string();
+        assert!(err.contains("enable_sequence_packing"), "{err}");
+        // ... and one worker with the same file is fine.
+        let ok = cli(&["--engine-config", path.to_str().unwrap()]);
+        assert!(ok.build_engine_config_json().is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workers_do_not_leak_into_the_engine_config() {
+        // `engine_workers` is a serving-side count, not an EngineConfig field —
+        // an engine that received it would fail on an unknown key.
+        let cfg: Value = serde_json::from_str(
+            &cli(&["--engine-workers", "3"])
+                .build_engine_config_json()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(cfg.get("engine_workers").is_none());
     }
 
     #[test]
