@@ -47,6 +47,46 @@ class _StreamStagingSlot:
     ready: Optional["torch.cuda.Event"] = None
 
 
+@dataclass
+class _StreamInput:
+    """One stream's combined waveform for this step, kept as its pieces.
+
+    ``segments`` concatenated is the buffer the frontend sees: the carry-over
+    ``audio_tail``, this step's chunk, and on the final chunk a short zero pad.
+    They stay separate until :meth:`InputProcessor._run_streaming_features`
+    packs every stream's pieces into the staging batch with one ``cat`` — a
+    per-stream concatenation here would be a full copy of the chunk, for a
+    buffer that is copied again a moment later.
+
+    ``n_samples`` is their total, carried rather than re-summed because it also
+    picks the frame count off the declared grid.
+    """
+
+    request: Request
+    segments: List[torch.Tensor]
+    n_samples: int
+    flush: bool
+
+
+def _suffix(segments: List[torch.Tensor], start: int) -> torch.Tensor:
+    """``torch.cat(segments)[start:]``, without materialising the concatenation.
+
+    In steady state ``start`` lands inside the last segment — the chunk just
+    consumed — so this is a view and costs nothing, which is the whole point of
+    keeping the pieces apart.  It only concatenates when the retained tail spans
+    a segment boundary, i.e. when a step consumed less than the carry-over it
+    started with.
+    """
+    for i, seg in enumerate(segments):
+        n = seg.numel()
+        if start < n:
+            head = seg[start:] if start else seg
+            rest = segments[i + 1 :]
+            return head if not rest else torch.cat([head, *rest])
+        start -= n
+    return segments[-1].new_empty(0)
+
+
 class InputProcessor:
     """Converts raw **waveforms** into model-ready features.
 
@@ -112,6 +152,9 @@ class InputProcessor:
             _StreamStagingSlot() for _ in range(_STREAM_STAGING_SLOTS)
         ]
         self._stream_slot_idx = 0
+        # Read-only zero run the ragged rows of a streaming step pad with, so a
+        # short row is one more ``cat`` source rather than a separate zero fill.
+        self._stream_pad: Optional[torch.Tensor] = None
         # Ceiling on a *retained* staging buffer, in float32 elements (M4).
         # Default 256 Mi elements = 1 GiB, comfortably above
         # ``max_batch_size`` x a full-length utterance at 16 kHz; a batch past
@@ -663,14 +706,13 @@ class InputProcessor:
             raise RuntimeError(f"feed_chunk after is_last=True for request {request.request_id}")
 
         # Normalise to a 1-D float32 CPU waveform (shared with the offline path).
-        # ``audio_scale`` is **not** applied here: the chunk is copied again a
-        # moment later into the padded staging buffer, and a separate multiply
-        # is a whole extra pass over the waveform plus an allocation, per chunk
-        # per stream.  :meth:`_run_streaming_features` folds it into that copy
-        # instead (``torch.mul(..., out=)``), which is elementwise and therefore
-        # bit-identical to scaling before the tail concatenation.  Nothing
-        # between here and there reads the sample *values* — the scheduler and
-        # the streaming backends only ask whether the queue is empty.
+        # ``audio_scale`` is **not** applied here: that would be a whole extra
+        # pass over the waveform plus an allocation, per chunk per stream, when
+        # :meth:`_run_streaming_features` can do the entire step's batch in one
+        # ``mul_`` over the packed staging buffer.  The multiply is elementwise,
+        # so scaling there is bit-identical to scaling here.  Nothing between
+        # the two reads the sample *values* — the scheduler and the streaming
+        # backends only ask whether the queue is empty.
         wav = torch.as_tensor(chunk, dtype=torch.float32, device="cpu").reshape(-1).contiguous()
 
         request.audio_chunks.append(wav)
@@ -776,13 +818,11 @@ class InputProcessor:
         # arrived.
         min_samples = self.streaming_framing.min_samples
 
-        fbank_inputs, fbank_reqs, fbank_flush = self._collect_streaming_inputs(
-            requests, min_samples
-        )
-        if not fbank_reqs:
+        inputs = self._collect_streaming_inputs(requests, min_samples)
+        if not inputs:
             return
 
-        feats, feat_lens_cpu = self._run_streaming_features(fbank_inputs, fbank_flush, cuda_stream)
+        feats, feat_lens_cpu = self._run_streaming_features(inputs, cuda_stream)
         # ``feats`` is produced on ``cuda_stream`` and appended on the current
         # stream, so the cross-stream read is ordered here rather than by the
         # caller: the step loop's `wait_stream` fires after this returns, which is
@@ -797,66 +837,73 @@ class InputProcessor:
             consumer = torch.cuda.current_stream(self._device)
             consumer.wait_stream(cuda_stream)
             feats.record_stream(consumer)
-        self._distribute_streaming_features(
-            fbank_reqs, fbank_inputs, fbank_flush, feats, feat_lens_cpu
-        )
+        self._distribute_streaming_features(inputs, feats, feat_lens_cpu)
 
     def _collect_streaming_inputs(
         self, requests: List[Request], frame_len: int
-    ) -> Tuple[List[torch.Tensor], List[Request], List[bool]]:
-        """Pop one pending chunk per stream, prepend its ``audio_tail``, and
-        return the per-stream combined waveforms ready for fbank.
+    ) -> List["_StreamInput"]:
+        """Pop one pending chunk per stream and describe the combined waveform.
 
-        Returns ``(fbank_inputs, fbank_reqs, fbank_flush)`` aligned by index.
+        The combined buffer is returned as its **pieces** — the carried-over
+        ``audio_tail``, this step's chunk, and (on the final chunk) a short
+        zero pad — not as a concatenation of them.  Concatenating here cost a
+        full copy of every stream's chunk per step, for a buffer that is copied
+        again into the staging batch a moment later;
+        :meth:`_run_streaming_features` now packs the pieces straight into the
+        staging row, so the intermediate never exists.
+
         A stream whose combined buffer is still shorter than one frame (and is
-        not a final flush) keeps its tail and is skipped this step.  No stream
-        ever looks past its own enqueued audio — we fuse across *different*
-        streams, never across future chunks of the same stream.
+        not a final flush) keeps its tail and is skipped this step — that branch
+        does concatenate, because the pieces have to survive until more audio
+        arrives, but it runs when a chunk is smaller than a single frame.  No
+        stream ever looks past its own enqueued audio: we fuse across
+        *different* streams, never across future chunks of the same stream.
         """
-        fbank_inputs: List[torch.Tensor] = []
-        fbank_reqs: List[Request] = []
-        fbank_flush: List[bool] = []
+        inputs: List[_StreamInput] = []
         for req in requests:
             if req.audio_chunks is None or req.audio_tail is None:
                 continue
+            tail = req.audio_tail
             if req.audio_chunks:
                 chunk = req.audio_chunks.popleft()
-                cat = chunk if req.audio_tail.numel() == 0 else torch.cat([req.audio_tail, chunk])
-                flush = req.audio_final and not req.audio_chunks and cat.numel() >= frame_len
+                segments = [chunk] if tail.numel() == 0 else [tail, chunk]
+                n = tail.numel() + chunk.numel()
+                last = req.audio_final and not req.audio_chunks
+                flush = last and n >= frame_len
                 # On the very last chunk pad the tail so the final partial
                 # frame still gets emitted.
-                if req.audio_final and not req.audio_chunks and cat.numel() < frame_len:
-                    cat = torch.cat([cat, cat.new_zeros(frame_len - cat.numel())])
+                if last and n < frame_len:
+                    segments.append(torch.zeros(frame_len - n, dtype=torch.float32))
+                    n = frame_len
                     flush = True
-            elif req.audio_final and req.audio_tail.numel() > 0:
+            elif req.audio_final and tail.numel() > 0:
                 # No chunks left but the tail still carries unconsumed samples
                 # (whole waveform was < chunk_samples).
-                cat = req.audio_tail
-                if cat.numel() < frame_len:
-                    cat = torch.cat([cat, cat.new_zeros(frame_len - cat.numel())])
+                segments = [tail]
+                n = tail.numel()
+                if n < frame_len:
+                    segments.append(torch.zeros(frame_len - n, dtype=torch.float32))
+                    n = frame_len
                 flush = True
             else:
                 continue
             # Too-short non-final buffers wait for more audio next step.
-            if cat.numel() < frame_len and not flush:
-                req.audio_tail = cat
+            if n < frame_len and not flush:
+                req.audio_tail = segments[0] if len(segments) == 1 else torch.cat(segments)
                 continue
-            fbank_inputs.append(cat)
-            fbank_reqs.append(req)
-            fbank_flush.append(flush)
-        return fbank_inputs, fbank_reqs, fbank_flush
+            inputs.append(_StreamInput(request=req, segments=segments, n_samples=n, flush=flush))
+        return inputs
 
     def _run_streaming_features(
         self,
-        fbank_inputs: List[torch.Tensor],
-        fbank_flush: List[bool],
+        inputs: List["_StreamInput"],
         cuda_stream: Optional["torch.cuda.Stream"],
     ) -> Tuple[torch.Tensor, List[int]]:
-        """Pad the combined waveforms to ``(B, T_max)`` and run fbank/mfcc.
+        """Pack the per-stream pieces into ``(B, T_max)`` and run fbank/mfcc.
 
         Returns ``(feats, feat_lens_cpu)`` — ``feats`` a device tensor, and the
         host-side per-stream frame counts (Kaldi snip_edges formula, so the
-        fbank-output length tensor is never D→H synced).  Prefers the captured
+        fbank-output length tensor is never D->H synced).  Prefers the captured
         feature CUDA-graph in steady state, the eager batched kernel otherwise,
         and a per-utterance CPU extraction for non-standard configs.
         """
@@ -864,20 +911,15 @@ class InputProcessor:
         framing = self.streaming_framing
         dtype = self._config.dtype
         device = self._device
+        batch = len(inputs)
 
         nvtx_push("pad+pin")
-        sample_counts = [w.numel() for w in fbank_inputs]
+        sample_counts = [inp.n_samples for inp in inputs]
         t_max = max(sample_counts)
         # Host-side, from the declared grid, so the extractor's output-length
         # tensor is never D->H synced.
         feat_lens_cpu: List[int] = [framing.frames_for(n) for n in sample_counts]
-        lengths_cpu = torch.tensor(sample_counts, dtype=torch.int64)
-        # Zero only the *pad tail* of each row, not the whole buffer: the
-        # [0:n] region is immediately overwritten by the waveform copy, so the
-        # previous full ``torch.zeros`` spent ~B*T_max of CPU fill per step on
-        # bytes it then clobbered.  In steady state every row is exactly T_max
-        # long (all streams fed equal chunks) so no tail zeroing runs at all;
-        # only ragged / flush steps touch ``zero_``.
+
         # Reused pinned staging: ``pin_memory()`` is a ``cudaHostAlloc`` + copy,
         # and this ran **twice per streaming step** on the default path (the
         # stable-buffer variant existed only behind ``use_feature_cuda_graphs``,
@@ -887,23 +929,11 @@ class InputProcessor:
         # Double-buffered + event-retired — see :meth:`_next_stream_slot`.  The
         # rotation is what keeps the pinned-staging win while making the reuse
         # ordering explicit instead of accidental.
-        # ``audio_scale`` rides on this copy rather than costing a pass of its
-        # own back in ``append_streaming_chunk`` — same values (the multiply is
-        # elementwise, so scaling before or after the tail concatenation is
-        # bit-identical), one fewer traversal of every waveform per stream per
-        # step, and no per-chunk allocation.
-        scale = self._config.audio_scale
         slot = self._next_stream_slot()
-        padded_cpu = self._stream_host(slot, len(fbank_inputs), t_max)
-        for i, w in enumerate(fbank_inputs):
-            n = w.numel()
-            if scale != 1.0:
-                torch.mul(w, scale, out=padded_cpu[i, :n])
-            else:
-                padded_cpu[i, :n] = w
-            if n < t_max:
-                padded_cpu[i, n:].zero_()
-        lengths_cpu = self._stream_lengths_host(slot, len(fbank_inputs)).copy_(lengths_cpu)
+        padded_cpu = self._pack_streaming_waveforms(inputs, slot, t_max)
+
+        lengths_cpu = self._stream_lengths_host(slot, batch)
+        lengths_cpu.copy_(torch.tensor(sample_counts, dtype=torch.int64))
         nvtx_pop()
 
         if device.type != "cuda":
@@ -914,6 +944,7 @@ class InputProcessor:
             # decision — this used to be a hardcoded ``_extract_single`` call,
             # which is Kaldi-only and silently produced Kaldi features for any
             # other registered frontend.
+            self._scale_audio_(padded_cpu)
             feats_cpu, _ = self._extractor.extract_streaming(
                 padded_cpu[:, :t_max], lengths_cpu, fcfg
             )
@@ -930,10 +961,17 @@ class InputProcessor:
         # Captured-graph fast path: steady state only (no flush) and within the
         # pre-built B bucket + ``t_pad``.  Any miss falls through to eager.
         fg = self._feature_graph
-        if fg is not None and not any(fbank_flush) and padded_cpu.size(1) <= fg.t_pad:
+        scaled = False
+        if fg is not None and not any(inp.flush for inp in inputs) and t_max <= fg.t_pad:
+            # The captured graph owns the H2D, so there is no device copy for the
+            # scale to ride on here and it has to happen on the host.  Recorded,
+            # because a bucket miss falls through to the eager path below and
+            # scaling twice would be silent.
+            self._scale_audio_(padded_cpu)
+            scaled = True
             with stream_ctx:
                 nvtx_push("feature_graph_replay")
-                feats_view = fg.replay(len(fbank_inputs), padded_cpu, lengths_cpu)
+                feats_view = fg.replay(batch, padded_cpu, lengths_cpu)
                 nvtx_pop()
                 # ``replay`` only host-memcpies out of ``slot`` into the graph's
                 # own captured buffers, so the slot is already free here — but
@@ -941,12 +979,18 @@ class InputProcessor:
                 # cross-file detail as an unchecked assumption.
                 self._retire_stream_slot(slot)
             if feats_view is not None:
-                return feats_view[: len(fbank_inputs)], feat_lens_cpu
+                return feats_view[:batch], feat_lens_cpu
 
         with stream_ctx:
             nvtx_push("h2d")
             wav_device = padded_cpu.to(device=device, non_blocking=True)
             lengths_device = lengths_cpu.to(device=device, non_blocking=True)
+            if not scaled:
+                # On the device, where it is free and overlapped.  On the host it
+                # is a second full pass over the packed batch — 0.65 ms per step
+                # at 64 streams, which is more than the pack itself costs and
+                # would swallow the whole point of batching it.
+                self._scale_audio_(wav_device)
             nvtx_pop()
             # Both H2Ds are enqueued; the event that releases ``slot`` goes in
             # behind them on the same stream.  Everything below reads the device
@@ -958,22 +1002,89 @@ class InputProcessor:
             nvtx_pop()
         return feats, feat_lens_cpu
 
+    def _pack_streaming_waveforms(
+        self, inputs: List["_StreamInput"], slot: _StreamStagingSlot, t_max: int
+    ) -> torch.Tensor:
+        """Pack every stream's pieces into ``slot``'s pinned ``(B, t_max)`` batch.
+
+        One ``cat`` for the whole step, not one op per stream.  Each row is its
+        pieces followed by a zero pad to ``t_max``, so the concatenation in row
+        order *is* the padded layout and lands directly in the pinned staging —
+        no intermediate per-stream buffer, no per-row copy, no per-row zero fill.
+        The pads come from one shared read-only zero run, and in steady state
+        there are none: every stream is fed the same chunk size and converges on
+        the same carry-over tail.
+
+        What this replaces, measured in-engine at 64 streams x one 640 ms chunk:
+        0.44 ms/step concatenating each stream's tail onto its chunk plus 0.46
+        ms/step copying the results into staging, against 0.61 ms/step for the
+        single ``cat`` — *two* passes over the batch collapsed into one, not
+        just fewer dispatches.
+
+        The obvious alternative — DMA each row straight to the device out of
+        page-locked chunks, as :meth:`_padded_waveform_batch` does offline —
+        measured **worse** here (0.57-1.04 ms for 2B launches).  A streaming row
+        is one chunk, ~40 KB, so B launch overheads outweigh the pack they save;
+        an offline row is a whole utterance and the trade flips.
+
+        Samples are packed **raw**: keeping ``audio_scale`` off this pass is what
+        makes it one pass, and :meth:`_scale_audio_` applies it to whichever copy
+        the caller goes on to use.
+        """
+        padded_cpu = self._stream_host(slot, len(inputs), t_max)
+        segments: List[torch.Tensor] = []
+        for inp in inputs:
+            segments.extend(inp.segments)
+            pad = t_max - inp.n_samples
+            if pad:
+                segments.append(self._pad_zeros(pad))
+        torch.cat(segments, out=padded_cpu.view(-1))
+        return padded_cpu
+
+    def _scale_audio_(self, waveforms: torch.Tensor) -> None:
+        """Apply ``audio_scale`` in place, wherever the batch currently lives.
+
+        The streaming pack writes raw samples so it stays *one* pass over the
+        batch; the multiply then rides on the device copy in the common case.
+        The two paths that consume the pinned host buffer directly — a CPU
+        engine, and the captured feature graph, which owns its own H2D — have no
+        device copy to ride on and scale on the host instead.  Elementwise
+        either way, and fp32 multiply is correctly rounded on both, so all three
+        agree bit for bit.
+        """
+        scale = self._config.audio_scale
+        if scale != 1.0:
+            waveforms.mul_(scale)
+
+    def _pad_zeros(self, n: int) -> torch.Tensor:
+        """A read-only ``n``-sample zero run, from one grow-only shared buffer.
+
+        Only the row padding of a *ragged* step uses this, and a row's pad is
+        never read back: the frame counts come from the declared grid, so
+        everything past ``n_samples`` is discarded downstream.  Shared rather
+        than allocated because it is never written to.
+        """
+        cur = 0 if self._stream_pad is None else self._stream_pad.numel()
+        if cur < n:
+            self._stream_pad = torch.zeros(max(n, cur * 2), dtype=torch.float32)
+        assert self._stream_pad is not None
+        return self._stream_pad[:n]
+
     def _distribute_streaming_features(
         self,
-        fbank_reqs: List[Request],
-        fbank_inputs: List[torch.Tensor],
-        fbank_flush: List[bool],
+        inputs: List["_StreamInput"],
         feats: torch.Tensor,
         feat_lens_cpu: List[int],
     ) -> None:
         """Append each stream's new feature frames to its ring buffer and reset
         its ``audio_tail`` to the samples beyond the last consumed frame.
 
-        The retained tail is ``buf[F * hop:]`` — written in *buffer* coordinates,
-        which is why it needs no adjustment for a frontend whose grid starts before
-        sample 0: frame ``F`` reads from buffer offset ``F * hop`` whatever the
-        absolute alignment, so the same rule keeps a centered grid's look-back and
-        a pre-emphasis history sample without knowing about either.
+        The retained tail is the combined buffer's ``[F * hop:]`` — written in
+        *buffer* coordinates, which is why it needs no adjustment for a frontend
+        whose grid starts before sample 0: frame ``F`` reads from buffer offset
+        ``F * hop`` whatever the absolute alignment, so the same rule keeps a
+        centered grid's look-back and a pre-emphasis history sample without
+        knowing about either.
 
         Every stream's append is *planned* first and then committed as one
         ``torch._foreach_copy_``.  Issued one at a time this was the single
@@ -989,16 +1100,16 @@ class InputProcessor:
         nvtx_push("distribute")
         dsts: List[torch.Tensor] = []
         srcs: List[torch.Tensor] = []
-        for i, req in enumerate(fbank_reqs):
+        for i, inp in enumerate(inputs):
+            req = inp.request
             new_nf = int(feat_lens_cpu[i])
             if new_nf > 0:
                 self._plan_append_features(req, feats[i, :new_nf, :], feat_dim, dsts, srcs)
             consumed = new_nf * hop
-            cat = fbank_inputs[i]
-            if fbank_flush[i] or consumed >= cat.numel():
-                req.audio_tail = cat.new_empty(0)
+            if inp.flush or consumed >= inp.n_samples:
+                req.audio_tail = inp.segments[-1].new_empty(0)
             else:
-                req.audio_tail = cat[consumed:].contiguous()
+                req.audio_tail = _suffix(inp.segments, consumed)
         if dsts:
             if len(dsts) == 1:
                 dsts[0].copy_(srcs[0])
