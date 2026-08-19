@@ -23,7 +23,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from oasr.ctc_decode import GpuDecoderConfig, GpuStreamingDecoder, ctc_beam_search_decode
+from oasr.functionals.ctc_decode import (
+    GpuDecoderConfig,
+    GpuStreamingDecoder,
+    ctc_beam_search_decode,
+)
 
 pytestmark = pytest.mark.slow
 

@@ -178,7 +178,7 @@ Request → InputProcessor (GPU fbank) → Scheduler (BatchingPolicy + Partition
 Kernels are layered strictly:
 
 ```
-Python functional API (oasr/<family>.py)  — @oasr_api
+Python functional API (oasr/functionals/<family>.py)  — @oasr_api
     └── JIT generator (oasr/jit/<family>.py) → JitSpec / JinjaJitSpec
             └── TVM-FFI JIT binding (csrc/<family>_jit_binding.cu)
                     └── TVM-FFI launcher (csrc/<family>.cu)
@@ -227,7 +227,7 @@ extension cookbook for each axis.
 | `oasr/models/registry.py` | `register_model`, `build_model_from_checkpoint`, entry-point discovery |
 | `oasr/layers/` | The narrow waist; `_backend.py` holds the routing rules and `KERNEL_GAPS` |
 | `oasr/jit/core.py`, `oasr/jit/env.py` | JIT specs, nvcc flags, the cache key |
-| `oasr/gemm.py`, `oasr/attention.py` | The two families with shape-aware routing |
+| `oasr/functionals/gemm.py`, `oasr/functionals/attention.py` | The two families with shape-aware routing |
 | `csrc/tvm_ffi_utils.h` | DLPack dispatch + the validation macros every launcher uses |
 | `csrc/alignment/` | The post-decode alignment pass and the beam read-back, in C++ (`_C.alignment`) |
 | `rust/crates/oasr-engine-client/` | The GIL-owning dispatcher thread |

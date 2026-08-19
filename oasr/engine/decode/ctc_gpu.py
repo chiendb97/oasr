@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU CTC prefix-beam-search decode strategy.
 
-Wraps :func:`~oasr.ctc_decode.ctc_beam_search_decode` (offline) and a shared
-:class:`~oasr.ctc_decode.GpuStreamingDecoder` (streaming, via
+Wraps :func:`~oasr.functionals.ctc_decode.ctc_beam_search_decode` (offline) and a shared
+:class:`~oasr.functionals.ctc_decode.GpuStreamingDecoder` (streaming, via
 :class:`~oasr.cache.ctc_state.CtcStateCacheManager`).  Owns its per-request beam
 state so it works regardless of the encoder's streaming kind (paged Conformer or
 stateful Zipformer) — the CTC beam state is decode-side, independent of the
@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Set, Tuple
 import torch
 
 from oasr.cache.ctc_state import CtcStateCacheManager
-from oasr.ctc_decode import GpuDecoderConfig, GpuDecoderResult, ctc_beam_search_decode
+from oasr.functionals.ctc_decode import GpuDecoderConfig, GpuDecoderResult, ctc_beam_search_decode
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from ..request import Request, RequestOutput

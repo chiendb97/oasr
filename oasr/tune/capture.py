@@ -111,7 +111,7 @@ class GemmShapeRecorder:
 def _shapes_of(op: str, args, kwargs) -> Optional[Tuple[int, int, int, int]]:
     """Extract ``(M, N, K, batch)`` from a functional call's args.
 
-    Layout matches :mod:`oasr.gemm`: ``A`` is operand 0, ``B`` (the ``[N, K]``
+    Layout matches :mod:`oasr.functionals.gemm`: ``A`` is operand 0, ``B`` (the ``[N, K]``
     weight, or ``[batch, N, K]`` for bmm/group_gemm) is operand 1.
     """
     A = args[0] if args else kwargs.get("A")

@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 
 import oasr  # noqa: F401  (triggers JIT module availability)
-from oasr.gemm import _get_gemm_module
+from oasr.functionals.gemm import _get_gemm_module
 from oasr.jit.core import _get_target_sm
 from oasr.jit.gemm import CutlassGemmConfig, get_unique_compile_configs
 

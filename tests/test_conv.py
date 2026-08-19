@@ -556,7 +556,7 @@ class TestConv2dLargeTensor:
 
     def test_rows_per_launch_bounds_the_byte_extent(self):
         """The split point is derived from the addressable extent, not guessed."""
-        from oasr.conv import _CONV2D_MAX_TENSOR_BYTES, _conv2d_rows_per_launch
+        from oasr.functionals.conv import _CONV2D_MAX_TENSOR_BYTES, _conv2d_rows_per_launch
 
         x = torch.empty(4, 512, 520, 512, device="meta", dtype=torch.bfloat16)
         out = torch.empty(4, 255, 259, 32, device="meta", dtype=torch.bfloat16)

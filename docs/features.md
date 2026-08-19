@@ -135,7 +135,7 @@ prefill.
 
 ## The feature primitives
 
-`oasr/feature.py` exposes the kernels the recipes are composed from.
+`oasr/functionals/feature.py` exposes the kernels the recipes are composed from.
 
 ### `stft_frame` — the general framing stage
 
@@ -161,7 +161,7 @@ zero.
 
 ### Others
 
-`dct_lifter` (MFCC), `fbank_preprocess`, `rfft` / `rfft_power` (`oasr/fft.py`).
+`dct_lifter` (MFCC), `fbank_preprocess`, `rfft` / `rfft_power` (`oasr/functionals/fft.py`).
 
 ## Extraction entry points
 

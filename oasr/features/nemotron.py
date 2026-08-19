@@ -32,7 +32,7 @@ __all__ = [
 #: sets the floor of every silent bin and therefore the encoder's input scale.
 LOG_ZERO_GUARD = 2.0**-24
 
-#: Widest FFT the OASR ``rfft`` kernel accepts (``oasr/fft.py::_validate_n_fft``).
+#: Widest FFT the OASR ``rfft`` kernel accepts (``oasr/functionals/fft.py::_validate_n_fft``).
 _MAX_KERNEL_N_FFT = 2048
 
 

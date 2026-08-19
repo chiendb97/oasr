@@ -107,7 +107,7 @@ def _dispatch_gemm(out, A, B, C, N, K, M) -> None:
     try:
         choice = _jit_gemm.select_default_config("gemm", M, N, K, A.dtype, _target_sm())
         if choice == "torch":
-            from oasr.gemm_torch import torch_gemm
+            from oasr.functionals.gemm_torch import torch_gemm
 
             torch_gemm(out.reshape(M, N), A.reshape(M, K), B, C, 1)
         else:
@@ -123,7 +123,7 @@ def _dispatch_gemm_activation(out, A, B, C, activation_type, N, K, M) -> None:
     try:
         choice = _jit_gemm.select_default_config("gemm_activation", M, N, K, A.dtype, _target_sm())
         if choice == "torch":
-            from oasr.gemm_torch import torch_gemm_activation
+            from oasr.functionals.gemm_torch import torch_gemm_activation
 
             torch_gemm_activation(out.reshape(M, N), A.reshape(M, K), B, C, activation_type, 1)
         else:
@@ -151,7 +151,7 @@ def _dispatch_bmm(out, A, B, N, K) -> None:
     try:
         choice = _jit_gemm.select_default_config("bmm", A.shape[1], N, K, A.dtype, _target_sm())
         if choice == "torch":
-            from oasr.gemm_torch import torch_bmm
+            from oasr.functionals.gemm_torch import torch_bmm
 
             torch_bmm(out, A, B)
         else:
@@ -164,7 +164,7 @@ def _dispatch_bmm(out, A, B, N, K) -> None:
 
 def _log_softmax_inplace(out2d) -> None:
     """Row-wise in-place log_softmax via the OASR online kernel."""
-    from oasr.softmax import _get_softmax_module
+    from oasr.functionals.softmax import _get_softmax_module
 
     _get_softmax_module().log_softmax(out2d, out2d)
 
@@ -194,7 +194,7 @@ def _dispatch_gemm_log_softmax(out, A, B, C, N, K, M) -> None:
 
         choice = _jit_gemm.select_default_config("gemm_log_softmax", M, N, K, A.dtype, _target_sm())
         if choice == "torch":
-            from oasr.gemm_torch import torch_gemm_log_softmax
+            from oasr.functionals.gemm_torch import torch_gemm_log_softmax
 
             torch_gemm_log_softmax(out.reshape(M, N), A.reshape(M, K), B, C, 1)
             return

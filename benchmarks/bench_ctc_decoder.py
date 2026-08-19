@@ -101,7 +101,7 @@ class _ForcedVariant:
 
 
 def _bench_oasr_offline(log_prob, seq_lengths, beam_size, max_seq_len, use_fused):
-    from oasr.ctc_decode import ctc_beam_search_decode
+    from oasr.functionals.ctc_decode import ctc_beam_search_decode
 
     with _ForcedVariant(use_fused):
 
@@ -122,7 +122,7 @@ def _bench_oasr_offline(log_prob, seq_lengths, beam_size, max_seq_len, use_fused
 
 
 def _bench_oasr_streaming(vocab_size, beam_size, n_streams, use_fused):
-    from oasr.ctc_decode import GpuDecoderConfig, GpuStreamingDecoder
+    from oasr.functionals.ctc_decode import GpuDecoderConfig, GpuStreamingDecoder
 
     with _ForcedVariant(use_fused):
         cfg = GpuDecoderConfig(

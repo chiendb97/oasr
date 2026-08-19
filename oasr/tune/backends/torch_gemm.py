@@ -5,12 +5,13 @@
 Registers a single ``Tactic("torch")`` candidate per op (``gemm`` /
 ``gemm_activation`` / ``bmm``) so the autotuner can discover the shapes where
 cuBLAS beats CUTLASS — typically thin streaming shapes where the fixed CUTLASS
-tile wastes rows.  The runners live in :mod:`oasr.gemm_torch` and are shared with
-the shape-aware production selector in :mod:`oasr.gemm`, so a tuned ``"torch"``
-tactic dispatches identically in both the autotuning and production paths.
+tile wastes rows.  The runners live in :mod:`oasr.functionals.gemm_torch` and
+are shared with the shape-aware production selector in
+:mod:`oasr.functionals.gemm`, so a tuned ``"torch"`` tactic dispatches
+identically in both the autotuning and production paths.
 """
 
-from oasr.gemm_torch import (
+from oasr.functionals.gemm_torch import (
     torch_bmm,
     torch_gemm,
     torch_gemm_activation,

@@ -17,12 +17,19 @@ import types as _types
 # =============================================================================
 # nn.Module wrappers
 # =============================================================================
-from . import layers, tune
+from . import functionals, layers, tune
+from .features import (
+    BatchedStreamingFeatureExtractor,
+    FeatureConfig,
+    extract_features_batch,
+    fbank_batch,
+    mfcc_batch,
+)
 
 # =============================================================================
 # Functional API (FlashInfer style)
 # =============================================================================
-from .activation import (
+from .functionals.activation import (
     ACTIVATION_GELU,
     ACTIVATION_GELU_ERF,
     ACTIVATION_RELU,
@@ -37,8 +44,8 @@ from .activation import (
     swoosh_r,
     tanh,
 )
-from .attention import fmha
-from .conv import (
+from .functionals.attention import fmha
+from .functionals.conv import (
     causal_conv1d,
     conv1d,
     conv1d_activation,
@@ -47,7 +54,7 @@ from .conv import (
     depthwise_conv1d,
     depthwise_conv1d_silu,
 )
-from .ctc_decode import (
+from .functionals.ctc_decode import (
     GpuDecoderConfig,
     GpuDecoderResult,
     GpuStreamingDecoder,
@@ -55,16 +62,28 @@ from .ctc_decode import (
     StreamState,
     ctc_beam_search_decode,
 )
-from .feature import dct_lifter, fbank_preprocess, mel_log, stft_frame
-from .features import (
-    BatchedStreamingFeatureExtractor,
-    FeatureConfig,
-    extract_features_batch,
-    fbank_batch,
-    mfcc_batch,
+from .functionals.feature import dct_lifter, fbank_preprocess, mel_log, stft_frame
+from .functionals.fft import rfft, rfft_power
+from .functionals.gemm import bmm, gemm, gemm_activation, gemm_log_softmax, group_gemm
+from .functionals.norm import (
+    add_layer_norm,
+    add_layer_norm_residual,
+    add_rms_norm,
+    add_rms_norm_residual,
+    batch_norm_1d,
+    batch_norm_activation,
+    batch_norm_swish,
+    bias_norm,
+    cmvn,
+    group_norm,
+    layer_norm,
+    layer_norm_activation,
+    rms_norm,
+    rms_norm_activation,
 )
-from .fft import rfft, rfft_power
-from .gemm import bmm, gemm, gemm_activation, gemm_log_softmax, group_gemm
+from .functionals.pooling import avg_pool1d
+from .functionals.softmax import log_softmax, softmax
+from .functionals.topk import topk
 from .layers import (
     AddLayerNorm,
     AddRMSNorm,
@@ -92,25 +111,6 @@ from .layers import (
     Tanh as TanhModule,
     TopK as TopKModule,
 )
-from .norm import (
-    add_layer_norm,
-    add_layer_norm_residual,
-    add_rms_norm,
-    add_rms_norm_residual,
-    batch_norm_1d,
-    batch_norm_activation,
-    batch_norm_swish,
-    bias_norm,
-    cmvn,
-    group_norm,
-    layer_norm,
-    layer_norm_activation,
-    rms_norm,
-    rms_norm_activation,
-)
-from .pooling import avg_pool1d
-from .softmax import log_softmax, softmax
-from .topk import topk
 from .tune import autotune, disable_autotune, enable_autotune
 
 # =============================================================================
@@ -199,6 +199,7 @@ __all__ = [
     "ACTIVATION_SWISH",
     "get_activation_type_id",
     # Functional API
+    "functionals",
     "gelu",
     "glu",
     "relu",

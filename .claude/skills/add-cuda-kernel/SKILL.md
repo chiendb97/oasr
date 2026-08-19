@@ -389,9 +389,9 @@ def gen_my_universal_module():
 | `[12]` | SM120 | Specific architecture only |
 | `[8, 9, 10, 11, 12]` | SM80, SM90, SM100, SM110, SM120 | Ampere, Hopper, Blackwell |
 
-## Step 5: Create Python API in `oasr/`
+## Step 5: Create Python API in `oasr/functionals`
 
-Create `oasr/scale.py`:
+Create `oasr/functionals/scale.py`:
 
 ```python
 import functools
@@ -454,7 +454,7 @@ def scale(input: torch.Tensor, factor: float,
 - **Destination-passing style**: Output tensor is an optional Python parameter (`out=None`) but **passed first** to the C++ TVM-FFI function
 - Import the JIT module lazily inside the cached function to avoid import-time compilation
 
-**Real example** (from `oasr/activation.py`):
+**Real example** (from `oasr/functionals/activation.py`):
 
 ```python
 @functools.cache
@@ -1053,13 +1053,13 @@ When adding a new kernel, look at these existing families as references:
 
 | Family | Kernel Header | Launcher | Binding | JIT Generator | Python API |
 |--------|--------------|----------|---------|---------------|------------|
-| **Activation** | `include/oasr/activation.cuh` | `csrc/activation.cu` | `csrc/activation_jit_binding.cu` | `jit/activation.py` | `activation.py` |
-| **Norm** | `include/oasr/norm.cuh` | `csrc/norm.cu` | `csrc/norm_jit_binding.cu` | `jit/norm.py` | `norm.py` |
-| **Conv1D** | `include/oasr/conv/conv1d.cuh` | `csrc/conv.cu` | `csrc/conv_jit_binding.cu` | `jit/conv.py` | `conv.py` |
-| **Conv2D** | `include/oasr/conv/conv2d.cuh` | `csrc/conv2d.cu` | `csrc/conv2d_jit_binding.cu` | `jit/conv.py` | `conv.py` |
-| **GEMM** | `include/oasr/gemm/gemm.cuh` | `csrc/gemm.cu` | `csrc/gemm_jit_binding.cu` | `jit/gemm.py` | `gemm.py` |
-| **BMM** | `include/oasr/gemm/bmm.cuh` | `csrc/bmm.cu` | `csrc/bmm_jit_binding.cu` | `jit/gemm.py` | `gemm.py` |
-| **Group GEMM** | `include/oasr/gemm/group_gemm.cuh` | `csrc/group_gemm.cu` | `csrc/group_gemm_jit_binding.cu` | `jit/gemm.py` | `gemm.py` |
+| **Activation** | `include/oasr/activation.cuh` | `csrc/activation.cu` | `csrc/activation_jit_binding.cu` | `jit/activation.py` | `functionals/activation.py` |
+| **Norm** | `include/oasr/norm.cuh` | `csrc/norm.cu` | `csrc/norm_jit_binding.cu` | `jit/norm.py` | `functionals/norm.py` |
+| **Conv1D** | `include/oasr/conv/conv1d.cuh` | `csrc/conv.cu` | `csrc/conv_jit_binding.cu` | `jit/conv.py` | `functionals/conv.py` |
+| **Conv2D** | `include/oasr/conv/conv2d.cuh` | `csrc/conv2d.cu` | `csrc/conv2d_jit_binding.cu` | `jit/conv.py` | `functionals/conv.py` |
+| **GEMM** | `include/oasr/gemm/gemm.cuh` | `csrc/gemm.cu` | `csrc/gemm_jit_binding.cu` | `jit/gemm.py` | `functionals/gemm.py` |
+| **BMM** | `include/oasr/gemm/bmm.cuh` | `csrc/bmm.cu` | `csrc/bmm_jit_binding.cu` | `jit/gemm.py` | `functionals/gemm.py` |
+| **Group GEMM** | `include/oasr/gemm/group_gemm.cuh` | `csrc/group_gemm.cu` | `csrc/group_gemm_jit_binding.cu` | `jit/gemm.py` | `functionals/gemm.py` |
 
 ## Summary of Files Created/Modified
 
@@ -1068,7 +1068,7 @@ include/oasr/scale.cuh                  # NEW: CUDA kernel definition
 csrc/scale.cu                           # NEW: TVM-FFI launcher
 csrc/scale_jit_binding.cu               # NEW: TVM-FFI binding
 oasr/jit/scale.py                       # NEW: JIT generator
-oasr/scale.py                           # NEW: Python API
+oasr/functionals/scale.py                           # NEW: Python API
 oasr/__init__.py                        # MODIFIED: Export API
 oasr/aot.py                             # MODIFIED: Register AOT
 tests/test_scale.py                     # NEW: Unit tests

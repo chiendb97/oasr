@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 import oasr
 from benchmarks.routines.bench_utils import bench_fn
-from oasr.conv import (
+from oasr.functionals.conv import (
     _default_conv1d_activation_fn,
     _default_conv1d_fn,
     _dispatch_conv1d,

@@ -218,7 +218,7 @@ class Attention(nn.Module):
             ``(B, max_blocks_per_seq)`` int32 logical→physical block map.  When
             given, ``k``/``v`` are **pool views** ``(num_blocks, block_size, H_kv,
             D)`` rather than per-batch tensors, and ``kv_lens`` is required.  This
-            mode delegates wholesale to :func:`oasr.attention.fmha`, which owns
+            mode delegates wholesale to :func:`oasr.functionals.attention.fmha`, which owns
             both the paged CuteDSL kernel and a paged SDPA reference — so unlike
             every other path here there is no separate fallback to route to, and
             fp32/CPU stays available for the parity oracles.
@@ -271,7 +271,7 @@ class Attention(nn.Module):
                     "no materialized key axis to broadcast a mask against. Pass the "
                     "full (B, H, T_q, T_k) grid as attn_bias instead."
                 )
-            from oasr.attention import fmha, gather_paged_kv
+            from oasr.functionals.attention import fmha, gather_paged_kv
 
             if self._delegate_paged(q, k):
                 paged: torch.Tensor = fmha(
@@ -302,7 +302,7 @@ class Attention(nn.Module):
                 attn_bias = attn_bias[..., :t_kv]
 
         if self._kernel_eligible(q, k, kv_lens, kv_starts, attn_bias, attn_mask, is_causal):
-            from oasr.attention import fmha
+            from oasr.functionals.attention import fmha
 
             fused: torch.Tensor = fmha(
                 q,
@@ -346,7 +346,7 @@ class Attention(nn.Module):
         return out
 
     def _delegate_paged(self, q: torch.Tensor, k: torch.Tensor) -> bool:
-        """Whether to hand this paged call to :func:`oasr.attention.fmha`.
+        """Whether to hand this paged call to :func:`oasr.functionals.attention.fmha`.
 
         Paging is a *storage* decision made by the caller, not a routing choice
         made here, so unlike :meth:`_kernel_eligible` there are no policy rules.

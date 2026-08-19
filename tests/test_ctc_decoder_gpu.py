@@ -7,7 +7,7 @@ import pytest
 import torch
 
 import oasr
-from oasr.ctc_decode import (
+from oasr.functionals.ctc_decode import (
     GpuDecoderConfig,
     GpuDecoderResult,
     GpuStreamingDecoder,
@@ -864,13 +864,13 @@ class TestGpuDecoderWorkspace:
 
     def test_workspace_size_positive(self, device):
         """Workspace size is positive."""
-        mod = oasr.ctc_decode._get_ctc_decoder_module()
+        mod = oasr.functionals.ctc_decode._get_ctc_decoder_module()
         size = mod.ctc_decoder_workspace_size(1, 10, 5000, 200)
         assert size > 0
 
     def test_state_size_positive(self, device):
         """State buffer size is positive and larger than workspace."""
-        mod = oasr.ctc_decode._get_ctc_decoder_module()
+        mod = oasr.functionals.ctc_decode._get_ctc_decoder_module()
         ws = mod.ctc_decoder_workspace_size(1, 10, 5000, 200)
         state = mod.ctc_decoder_state_size(1, 10, 5000, 200)
         assert state > 0
@@ -878,14 +878,14 @@ class TestGpuDecoderWorkspace:
 
     def test_workspace_scales_with_batch(self, device):
         """Larger batch produces proportionally larger workspace."""
-        mod = oasr.ctc_decode._get_ctc_decoder_module()
+        mod = oasr.functionals.ctc_decode._get_ctc_decoder_module()
         size1 = mod.ctc_decoder_workspace_size(1, 10, 5000, 200)
         size4 = mod.ctc_decoder_workspace_size(4, 10, 5000, 200)
         assert size4 > size1
 
     def test_workspace_scales_with_beam(self, device):
         """Larger beam produces larger workspace."""
-        mod = oasr.ctc_decode._get_ctc_decoder_module()
+        mod = oasr.functionals.ctc_decode._get_ctc_decoder_module()
         size5 = mod.ctc_decoder_workspace_size(1, 5, 5000, 200)
         size20 = mod.ctc_decoder_workspace_size(1, 20, 5000, 200)
         assert size20 > size5
@@ -968,7 +968,7 @@ class TestCtcDecoderPagedOffline:
 
     def test_paged_workspace_smaller_than_flat(self, device):
         """Paged workspace is smaller than flat for large max_seq_len."""
-        mod = oasr.ctc_decode._get_ctc_decoder_module()
+        mod = oasr.functionals.ctc_decode._get_ctc_decoder_module()
         batch, beam, vocab, max_seq = 4, 16, 5000, 1024
         flat_size = mod.ctc_decoder_workspace_size(batch, beam, vocab, max_seq)
         paged_size = mod.ctc_decoder_paged_workspace_size(batch, beam, vocab, max_seq, 16)
@@ -976,7 +976,7 @@ class TestCtcDecoderPagedOffline:
 
     def test_paged_workspace_size_positive(self, device):
         """Paged workspace size is positive."""
-        mod = oasr.ctc_decode._get_ctc_decoder_module()
+        mod = oasr.functionals.ctc_decode._get_ctc_decoder_module()
         size = mod.ctc_decoder_paged_workspace_size(1, 10, 5000, 200, 16)
         assert size > 0
 
@@ -1055,7 +1055,7 @@ class TestCtcDecoderPagedStreaming:
 
     def test_paged_streaming_state_size_positive(self, device):
         """Paged state buffer size is positive."""
-        mod = oasr.ctc_decode._get_ctc_decoder_module()
+        mod = oasr.functionals.ctc_decode._get_ctc_decoder_module()
         size = mod.ctc_decoder_paged_state_size(1, 10, 5000, 200, 16)
         assert size > 0
 

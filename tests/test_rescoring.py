@@ -138,7 +138,7 @@ def _build_strategy(monkeypatch, tmp_path, model, result, **cfg_overrides):
     from oasr.engine.decode.detokenize import Detokenizer
 
     monkeypatch.setattr(rescoring_mod, "ctc_beam_search_decode", lambda *a, **k: result)
-    from oasr.ctc_decode import GpuDecoderConfig
+    from oasr.functionals.ctc_decode import GpuDecoderConfig
 
     cfg = EngineConfig(
         ckpt_dir=str(tmp_path),

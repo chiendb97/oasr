@@ -185,7 +185,7 @@ def _cache_manager_streaming_paged(
         CtcStateCacheManager,
         StreamContext,
     )
-    from oasr.ctc_decode import GpuDecoderConfig
+    from oasr.functionals.ctc_decode import GpuDecoderConfig
 
     n_chunks = len(chunks)
     max_blocks = max(64, (abs(num_left_chunks) if num_left_chunks > 0 else n_chunks) * 4)
@@ -322,7 +322,7 @@ class TestCtcDecode:
     """CTC streaming decoder produces valid, reproducible output."""
 
     def test_streaming_ctc_valid_and_reproducible(self, model, device):
-        from oasr.ctc_decode import GpuDecoderConfig, GpuStreamingDecoder
+        from oasr.functionals.ctc_decode import GpuDecoderConfig, GpuStreamingDecoder
 
         dtype = torch.float16
         n_chunks = 5
@@ -381,7 +381,7 @@ class TestMultiStreamIsolation:
             CtcStateCacheManager,
             StreamContext,
         )
-        from oasr.ctc_decode import GpuDecoderConfig
+        from oasr.functionals.ctc_decode import GpuDecoderConfig
 
         dtype = torch.float16
         n_chunks = 3
@@ -552,7 +552,7 @@ class TestStreamingWithRealAudio:
             CtcStateCacheManager,
             StreamContext,
         )
-        from oasr.ctc_decode import GpuDecoderConfig
+        from oasr.functionals.ctc_decode import GpuDecoderConfig
 
         dtype = torch.float16
         num_left_chunks = 2

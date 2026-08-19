@@ -2,7 +2,7 @@
 """Tests for the shape-aware GEMM selection heuristic + torch/cuBLAS backend.
 
 Covers:
-  * the torch backend runners (oasr.gemm_torch) vs a torch reference;
+  * the torch backend runners (oasr.functionals.gemm_torch) vs a torch reference;
   * select_default_config() routing, fallback, and *actionability* (every CUTLASS
     config it returns must correspond to a compiled kernel);
   * the production (non-autotuned) gemm / gemm_activation path numerics for the
@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 import oasr
-from oasr.gemm_torch import torch_bmm, torch_gemm, torch_gemm_activation
+from oasr.functionals.gemm_torch import torch_bmm, torch_gemm, torch_gemm_activation
 from oasr.jit.core import _get_target_sm
 from oasr.jit.gemm import (
     GEMM_DEFAULT,
@@ -321,7 +321,7 @@ class TestGemmLogSoftmaxDispatch:
         assert "align_out_features" in text, "the error must say what to do"
 
     def test_choice_torch(self, monkeypatch):
-        import oasr.gemm_torch as gt
+        import oasr.functionals.gemm_torch as gt
         import oasr.jit.gemm as jg
 
         calls = []
@@ -349,7 +349,7 @@ class TestGemmLogSoftmaxDispatch:
 
         import oasr.jit.gemm as jg
 
-        og = importlib.import_module("oasr.gemm")
+        og = importlib.import_module("oasr.functionals.gemm")
         cfg = next(
             c
             for c in get_unique_compile_configs(_SM).values()
@@ -381,7 +381,7 @@ class TestBmmDispatch:
         return A, B, ref
 
     def test_choice_torch(self, monkeypatch):
-        import oasr.gemm_torch as gt
+        import oasr.functionals.gemm_torch as gt
         import oasr.jit.gemm as jg
 
         calls = []

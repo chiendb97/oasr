@@ -41,7 +41,7 @@ posterior. It is responsible for:
 
 The decoder is exposed through three TVM-FFI launchers
 (offline, streaming-init, streaming-step / chunk / read-state) which
-the Python `oasr.ctc_decode` module wraps.
+the Python `oasr.functionals.ctc_decode` module wraps.
 
 ## 2. High-Level Architecture
 
@@ -953,7 +953,7 @@ the expected dtypes (`log_prob = float32`, `seq_lengths = int32`), and
 have the expected dimensionality (`CHECK_DIM` macros). On failure
 they raise via `TVM_FFI_ICHECK`.
 
-## 10. Python API (`oasr.ctc_decode`)
+## 10. Python API (`oasr.functionals.ctc_decode`)
 
 The Python layer is a thin wrapper around the TVM-FFI launchers.
 

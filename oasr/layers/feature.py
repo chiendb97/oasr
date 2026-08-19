@@ -28,12 +28,12 @@ import torch
 import torch.nn as nn
 
 import oasr
-from oasr.feature import (
+from oasr.features.config import FeatureConfig
+from oasr.functionals.feature import (
     dct_lifter as _cuda_dct_lifter,
     fbank_preprocess as _cuda_fbank_preprocess,
     mel_log as _cuda_mel_log,
 )
-from oasr.features.config import FeatureConfig
 
 __all__ = ["Fbank", "Mfcc"]
 
