@@ -10,6 +10,7 @@ reference path.
 from __future__ import annotations
 
 import math
+import os
 from functools import lru_cache
 from typing import Tuple
 
@@ -154,7 +155,63 @@ def _next_power_of_two(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
-def _log_mel_pipeline(waveforms: torch.Tensor, cfg: FeatureConfig) -> Tuple[torch.Tensor, int]:
+def _use_kernel(waveforms: torch.Tensor, n_fft: int) -> bool:
+    if os.environ.get("OASR_FEATURE_BACKEND", "").strip().lower() == "torch":
+        return False
+    if not waveforms.is_cuda:
+        return False
+    if not (8 <= n_fft <= 2048 and (n_fft & (n_fft - 1)) == 0):
+        raise NotImplementedError(
+            f"the Kaldi feature kernel requires a power-of-two n_fft in [8, 2048], got "
+            f"{n_fft}; set OASR_FEATURE_BACKEND=torch for the reference path"
+        )
+    return True
+
+
+def _log_mel_kernel(
+    waveforms: torch.Tensor, lengths: torch.Tensor, cfg: FeatureConfig
+) -> Tuple[torch.Tensor, int]:
+    """Kernel chain: frame/DC/pre-emphasis/window -> power FFT -> mel/log."""
+    import oasr
+
+    B, T = waveforms.shape
+    frame_length = cfg.frame_length_samples
+    frame_shift = cfg.frame_shift_samples
+    num_frames = max(0, (T - frame_length) // frame_shift + 1)
+    if num_frames == 0:
+        return waveforms.new_zeros(B, 0, cfg.num_mel_bins), 0
+
+    n_fft = _next_power_of_two(frame_length)
+    device = waveforms.device
+    window = _frame_window(frame_length, cfg.window_type, device, torch.float32)
+    frames = oasr.stft_frame(
+        waveforms,
+        lengths,
+        window,
+        n_fft,
+        frame_shift,
+        num_frames,
+        center_offset=0,
+        win_offset=0,
+        preemph_coef=float(cfg.preemphasis_coefficient),
+        preemph_replicate=True,
+        remove_dc_offset=True,
+    )
+    power = oasr.rfft_power(frames, n=n_fft)
+    mel_mat = _mel_banks(
+        cfg.num_mel_bins,
+        n_fft,
+        cfg.sample_rate,
+        cfg.low_freq,
+        cfg.high_freq,
+        device=device,
+        dtype=torch.float32,
+    )
+    log_mel = oasr.mel_log(power, mel_mat, log_floor=float(torch.finfo(torch.float32).tiny))
+    return log_mel, num_frames
+
+
+def _log_mel_torch(waveforms: torch.Tensor, cfg: FeatureConfig) -> Tuple[torch.Tensor, int]:
     """Shared fbank pipeline producing the log-mel tensor + frame count.
 
     Returns ``(log_mel, num_frames)`` where ``log_mel`` has shape
@@ -218,6 +275,15 @@ def _log_mel_pipeline(waveforms: torch.Tensor, cfg: FeatureConfig) -> Tuple[torc
     return log_mel, log_mel.size(1)
 
 
+def _log_mel_pipeline(
+    waveforms: torch.Tensor, lengths: torch.Tensor, cfg: FeatureConfig
+) -> Tuple[torch.Tensor, int]:
+    n_fft = _next_power_of_two(cfg.frame_length_samples)
+    if _use_kernel(waveforms, n_fft):
+        return _log_mel_kernel(waveforms, lengths, cfg)
+    return _log_mel_torch(waveforms, cfg)
+
+
 def _feat_lengths(lengths: torch.Tensor, frame_length: int, frame_shift: int) -> torch.Tensor:
     """Kaldi snip_edges frame-count formula, returned as int32."""
     if lengths.dtype != torch.int64:
@@ -256,7 +322,7 @@ def batched_fbank(
     B = waveforms.size(0)
     device = waveforms.device
 
-    log_mel, num_frames = _log_mel_pipeline(waveforms, cfg)
+    log_mel, num_frames = _log_mel_pipeline(waveforms, lengths, cfg)
     if num_frames == 0:
         return (
             log_mel,
@@ -298,7 +364,7 @@ def batched_mfcc(
     dtype = torch.float32
     num_ceps = cfg.num_ceps
 
-    log_mel, num_frames = _log_mel_pipeline(waveforms, cfg)
+    log_mel, num_frames = _log_mel_pipeline(waveforms, lengths, cfg)
     if num_frames == 0:
         return (
             torch.zeros(B, 0, num_ceps, device=device, dtype=dtype),
@@ -307,14 +373,18 @@ def batched_mfcc(
 
     # DCT-II + cepstral liftering.
     dct = _dct_matrix(num_ceps, cfg.num_mel_bins, device=device, dtype=dtype)
-    mfcc = torch.matmul(log_mel, dct.t())  # (B, N, num_ceps)
     lifter = _cepstral_lifter(
         num_ceps,
         cfg.cepstral_lifter,
         device=device,
         dtype=dtype,
     )
-    mfcc = mfcc * lifter
+    if _use_kernel(waveforms, _next_power_of_two(cfg.frame_length_samples)):
+        import oasr
+
+        mfcc = oasr.dct_lifter(log_mel, dct, lifter=lifter)
+    else:
+        mfcc = torch.matmul(log_mel, dct.t()) * lifter  # (B, N, num_ceps)
 
     feat_lengths = _feat_lengths(lengths, cfg.frame_length_samples, cfg.frame_shift_samples)
     return mfcc, feat_lengths

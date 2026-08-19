@@ -99,16 +99,20 @@ It is a post-transform the caller applies over any extractor's output.
 `lfr_n` (spec-emitted; FunASR Paraformer is 80-mel LFR 7/6 → 560-dim at a 60 ms
 hop), and `FeatureConfig.output_dim` folds the stacking in. The engine applies it
 in the offline `_fbank_batch` path only; streaming `prepare_streaming` rejects
-LFR configs.
+LFR configs. CUDA inputs use `oasr.lfr_gather`; CPU and
+`OASR_FEATURE_BACKEND=torch` retain the vectorized torch reference.
 
 ## Built-in recipes
 
 ### `fbank` / `mfcc` — Kaldi-compatible
 
-The fused Kaldi kernels (`batched.py::batched_fbank` and friends), with a
-per-utterance fallback for configurations the fused path cannot serve. Windows
-include `hamming` (FunASR frontends), so Paraformer's collate stays on the fast
-path. `snip_edges` framing means the offline grid *is* the streaming grid.
+The batched CUDA chain is `stft_frame(remove_dc_offset=True)` → `rfft_power` →
+`mel_log` → `dct_lifter` (MFCC only). It frames each varlen row directly from
+the padded waveform; there is no `unfold` or framed-waveform copy. Exotic
+configs still use the per-utterance reference. Windows include `hamming`
+(FunASR frontends), so Paraformer's collate stays on the fast path.
+`snip_edges` framing means the offline grid *is* the streaming grid. CPU and
+`OASR_FEATURE_BACKEND=torch` use the batched torch parity oracle.
 
 ### `whisper_logmel`
 
@@ -116,6 +120,13 @@ The Whisper recipe: 30 s pad/trim, `n_fft` 400 / hop 160, slaney mels, global
 max-norm, `audio_scale=1.0`. Returns **real** per-row frame counts
 (`ceil(len/hop)`, HF attention-mask semantics) — Whisper ignores them, the
 Qwen2-Audio tower masks by them. Fixed-window, so not streamable.
+
+CUDA uses `stft_frame(pad_mode="reflect")` → cuFFT's 400-point transform →
+`whisper_logmel`. The last launcher fuses mel projection and
+`log10`, then applies the `row_max - 8` floor and affine normalization in a
+second pass per utterance. The logical 30 s padding is read by the framing
+kernel rather than materialized. CPU and `OASR_FEATURE_BACKEND=torch` retain
+the upstream torch recipe.
 
 ### `nemotron_logmel`
 
@@ -139,15 +150,18 @@ prefill.
 
 ### `stft_frame` — the general framing stage
 
-Waveform → pre-emphasised, windowed, zero-padded frames. `hop`, `center_offset`,
-`win_offset` and a pre-emphasis boundary mode are **parameters**, so one kernel
-covers:
+Waveform → optionally DC-removed, pre-emphasised, windowed, zero-padded frames.
+`hop`, `center_offset`, `win_offset`, `signal_length`, `pad_mode` and the
+pre-emphasis boundary are **parameters**, so one launcher covers:
 
 | Grid | `center_offset` |
 |---|---|
-| Centered NeMo / Whisper | `n_fft / 2` |
+| Centered NeMo / Whisper | `n_fft / 2` (constant / reflect padding respectively) |
 | Kaldi `snip_edges` | `0` |
 | A streaming buffer whose head is pre-emphasis history | negative |
+
+`remove_dc_offset=True` selects the one-block-per-frame reduction used by
+Kaldi and makes pre-emphasis frame-local with its replicate boundary.
 
 ### `mel_log` — an additive guard alongside the floor
 
@@ -161,7 +175,8 @@ zero.
 
 ### Others
 
-`dct_lifter` (MFCC), `fbank_preprocess`, `rfft` / `rfft_power` (`oasr/functionals/fft.py`).
+`dct_lifter` (MFCC), `fbank_preprocess`, `whisper_logmel`, `lfr_gather`, and
+`rfft` / `rfft_power` (`oasr/functionals/fft.py`).
 
 ## Extraction entry points
 

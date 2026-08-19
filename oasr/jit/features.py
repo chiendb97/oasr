@@ -7,7 +7,7 @@ from .core import JitSpec, gen_jit_spec
 
 
 def gen_features_module() -> JitSpec:
-    """Generate JIT spec for fbank_preprocess / mel_log / dct_lifter."""
+    """Generate the feature framing, projection, normalization and LFR module."""
     return gen_jit_spec(
         "features",
         [

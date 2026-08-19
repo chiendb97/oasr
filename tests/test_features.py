@@ -1149,6 +1149,77 @@ class TestStftFrameKernel:
         ).transpose(1, 2)
         torch.testing.assert_close(got, ref, rtol=1e-4, atol=2e-4)
 
+    def test_reflect_padding_reproduces_a_logical_padded_window(self):
+        """Whisper reflects the fixed window, not each row's valid prefix."""
+        import oasr
+
+        torch.manual_seed(4)
+        B, T, signal_length = 2, 41, 64
+        n_fft, hop = 32, 8
+        center = n_fft // 2
+        num_frames = signal_length // hop + 1
+        wav = torch.randn(B, T)
+        lengths = torch.tensor([T, 23])
+        window = torch.hann_window(n_fft)
+
+        logical = torch.zeros(B, signal_length)
+        for b in range(B):
+            logical[b, : lengths[b]] = wav[b, : lengths[b]]
+        padded = torch.nn.functional.pad(logical, (center, center), mode="reflect")
+        ref = padded.unfold(1, n_fft, hop)[:, :num_frames] * window
+        got = oasr.stft_frame(
+            wav.cuda(),
+            lengths.cuda(),
+            window.cuda(),
+            n_fft,
+            hop,
+            num_frames,
+            center_offset=center,
+            pad_mode="reflect",
+            signal_length=signal_length,
+        )
+        torch.testing.assert_close(got.cpu(), ref, rtol=0, atol=1e-6)
+
+    def test_dc_removal_is_per_frame_with_a_replicate_boundary(self):
+        """The KG16 path frames and performs Kaldi preprocessing in one launch."""
+        import oasr
+
+        torch.manual_seed(5)
+        B, T, frame_length, hop, n_fft = 3, 160, 40, 16, 64
+        wav = torch.randn(B, T)
+        lengths = torch.tensor([T, 101, 40])
+        num_frames = (T - frame_length) // hop + 1
+        window = torch.hamming_window(frame_length, periodic=False)
+        frames = wav.unfold(1, frame_length, hop)
+        centered = frames - frames.mean(-1, keepdim=True)
+        preem = torch.empty_like(centered)
+        preem[..., 0] = 0.03 * centered[..., 0]
+        preem[..., 1:] = centered[..., 1:] - 0.97 * centered[..., :-1]
+        ref = torch.nn.functional.pad(preem * window, (0, n_fft - frame_length))
+
+        got = oasr.stft_frame(
+            wav.cuda(),
+            lengths.cuda(),
+            window.cuda(),
+            n_fft,
+            hop,
+            num_frames,
+            win_offset=0,
+            preemph_coef=0.97,
+            preemph_replicate=True,
+            remove_dc_offset=True,
+        ).cpu()
+        valid = torch.clamp((lengths - frame_length) // hop + 1, min=0)
+        for b, count in enumerate(valid.tolist()):
+            torch.testing.assert_close(got[b, :count], ref[b, :count], rtol=0, atol=2e-5)
+            # The general framing primitive preserves the valid prefix of a
+            # partial trailing window (centered STFT recipes need that). Kaldi
+            # rejects that whole frame via the frame lengths passed to mel_log;
+            # only windows whose *start* is beyond the row must be empty here.
+            first_empty = (int(lengths[b]) + hop - 1) // hop
+            if first_empty < num_frames:
+                assert got[b, first_empty:].abs().max() == 0
+
     def test_window_is_zero_outside_its_offset(self):
         import oasr
 
@@ -1239,6 +1310,38 @@ class TestMelLogGuards:
                 torch.rand(5, 33, device="cuda"),
                 self._filters(),
                 frame_lengths=torch.tensor([5], dtype=torch.int32, device="cuda"),
+            )
+
+
+@requires_cuda
+class TestKernelBackedBatchedKaldi:
+    """The production batched extractor reaches the KG16 kernel chain."""
+
+    @pytest.mark.parametrize("feature_type", ["fbank", "mfcc"])
+    def test_varlen_kernel_path_matches_the_torch_oracle(self, feature_type, monkeypatch):
+        from oasr.features import FeatureConfig
+        from oasr.features.batched import batched_fbank, batched_mfcc
+
+        monkeypatch.delenv("OASR_FEATURE_BACKEND", raising=False)
+        torch.manual_seed(6)
+        lengths = torch.tensor([16000, 9371, 400])
+        waveforms = torch.zeros(3, 16000)
+        for b, length in enumerate(lengths.tolist()):
+            waveforms[b, :length] = torch.randn(length) * 1000.0
+        cfg = FeatureConfig(
+            feature_type=feature_type,
+            num_mel_bins=23 if feature_type == "mfcc" else 80,
+            num_ceps=13,
+            dither=0.0,
+        )
+        extract = batched_mfcc if feature_type == "mfcc" else batched_fbank
+        expected, expected_lengths = extract(waveforms, lengths, cfg)
+        got, got_lengths = extract(waveforms.cuda(), lengths.cuda(), cfg)
+
+        assert torch.equal(got_lengths.cpu(), expected_lengths)
+        for b, count in enumerate(expected_lengths.tolist()):
+            torch.testing.assert_close(
+                got[b, :count].cpu(), expected[b, :count], rtol=1e-3, atol=1e-2
             )
 
 

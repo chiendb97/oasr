@@ -76,6 +76,23 @@ class TestLFR:
         out, out_lens = apply_lfr_batch(feats, lens, 1, 1)
         assert out is feats and out_lens is lens
 
+    @pytest.mark.cuda
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_cuda_gather_matches_the_reference_path(self, dtype, monkeypatch):
+        from oasr.features.lfr import apply_lfr_batch
+
+        monkeypatch.delenv("OASR_FEATURE_BACKEND", raising=False)
+        torch.manual_seed(8)
+        lens = torch.tensor([218, 1, 13, 100])
+        feats = torch.randn(4, 218, 8, dtype=dtype)
+        for b, length in enumerate(lens.tolist()):
+            feats[b, length:] = 0
+        expected, expected_lens = apply_lfr_batch(feats, lens, 7, 6, max_length=218)
+        got, got_lens = apply_lfr_batch(feats.cuda(), lens.cuda(), 7, 6, max_length=218)
+        assert torch.equal(got_lens.cpu(), expected_lens)
+        assert torch.equal(got.cpu(), expected)
+
     def test_feature_config_output_dim_folds_lfr(self):
         from oasr.features import FeatureConfig
 

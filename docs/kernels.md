@@ -150,7 +150,7 @@ allocates its output tensor, and calls into the compiled module.
 | `oasr/functionals/activation.py` | standalone exact-erf `gelu`, `sigmoid`, `tanh`, `relu`, `glu`, `swish`, `swoosh_l`, `swoosh_r` |
 | `oasr/functionals/pooling.py` | BTC/TC `avg_pool1d`, including symmetric padding, ceil mode, and `count_include_pad` |
 | `oasr/functionals/softmax.py`, `oasr/functionals/topk.py`, `oasr/functionals/fft.py` | `softmax`, `topk`, `rfft` / `rfft_power` |
-| `oasr/functionals/feature.py` | `stft_frame`, `dct_lifter`, `fbank_preprocess`, `mel_log` — see [features.md](features.md) |
+| `oasr/functionals/feature.py` | `stft_frame`, `dct_lifter`, `fbank_preprocess`, `mel_log`, `whisper_logmel`, `lfr_gather` — see [features.md](features.md) |
 | `oasr/functionals/attention.py` | `fmha(...)` and `fmha.persistent_inputs(...)` |
 | `oasr/functionals/ctc_decode.py` | `ctc_beam_search_decode`, `GpuStreamingDecoder` — see [ctc_decoder_gpu.md](ctc_decoder_gpu.md) |
 | `oasr/decode.py` | Thin helpers over the CPU-side `oasr.decoder` decoders |

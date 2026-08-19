@@ -13,6 +13,7 @@ does — vectorized over a padded batch with per-row valid lengths.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -75,6 +76,12 @@ def apply_lfr_batch(
     if t_out == 0:
         empty = feats.new_zeros(B, 0, F * lfr_m)
         return empty, out_lengths.to(dtype=lengths.dtype)
+
+    if feats.is_cuda and os.environ.get("OASR_FEATURE_BACKEND", "").strip().lower() != "torch":
+        import oasr
+
+        out = oasr.lfr_gather(feats, lengths_dev, lfr_m, lfr_n, t_out)
+        return out, out_lengths.to(dtype=lengths.dtype)
 
     left = (lfr_m - 1) // 2
     # Source frame index for (output frame i, stack slot k): i*lfr_n + k - left,
