@@ -1,30 +1,9 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Position-wise feed-forward blocks — the waist's MLP entry point.
+"""Shared feed-forward blocks with configurable checkpoint key names.
 
-Six models each carried their own two-linears-and-an-activation class
-(``fc1``/``fc2``, ``w_1``/``w_2``, ``gate``/``up``/``down``), differing only in
-the projection *names* and the activation.  What is worth sharing is the
-fusion decision — whether the activation folds into the GEMM epilogue — and
-that is what these classes own.
-
-Projection names stay configurable rather than canonicalised.  Renaming them
-would rewrite every migrated checkpoint's key layout for cosmetic gain, and
-"state-dict keys mirror upstream 1:1" is a property this project has paid to
-keep (see ``docs/checkpoints.md``).
-
-For the same reason these classes are used only where the upstream layout
-*already* nests the FFN under a name (WeNet/FunASR ``feed_forward.w_1``, HF
-``mlp.gate_proj``).  HF Whisper and the Qwen2-Audio tower put ``fc1``/``fc2``
-flat on the layer, so composing a ``FeedForward`` there would insert a level
-into every checkpoint key to save one line of ``F.gelu``; those two keep a pair
-of :class:`~oasr.layers.linear.Linear`s.  That is the intended outcome, not an
-unfinished migration.
-
-Activation names follow :mod:`oasr.layers.linear`: ``gelu`` is the **exact
-erf** form and ``gelu_tanh`` is the approximation. Both have distinct CUDA
-epilogues; asking for the wrong one is a silent accuracy change on an
-erf-trained model, so the two remain separate names rather than one flag.
+Names remain configurable to preserve source state-dict layouts. ``gelu`` and
+``gelu_tanh`` stay distinct because they select numerically different epilogues.
 """
 
 from __future__ import annotations

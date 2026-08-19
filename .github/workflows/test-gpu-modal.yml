@@ -1,47 +1,9 @@
 name: test-gpu-modal
 
-# The same GPU suite as test-gpu.yml, on a rented Blackwell instead of the
-# self-hosted box.  The job itself runs on a GitHub-hosted runner and only
-# holds a Modal token — the GPU work happens in `ci/modal_app.py`, so a fork PR
-# can never reach anyone's hardware.
-#
-# The default accelerator is RTX-PRO-6000: GB202 at compute capability 12.0,
-# the same sm_120 as the RTX 5090 this project is tuned for.  Anything else is
-# a different SM, which silently skips the SM120-gated suites — useful as a
-# second target, wrong as the only one.
-#
-# ---------------------------------------------------------------------------
-# Setup (once)
-# ---------------------------------------------------------------------------
-#   1. `pip install modal && modal token new`
-#   2. Repo Settings -> Secrets -> Actions: MODAL_TOKEN_ID, MODAL_TOKEN_SECRET
-#
-# That is the whole of it.  The `checkpoints` input is **off** by default, and
-# off this workflow needs no Volume, no upload and no external file: no asset
-# env var is set, every checkpoint- and audio-gated test skips, and what runs is
-# the coverage a bare GPU can produce — kernels, the layer waist, the JIT, the
-# schedulers, decode plumbing on synthetic weights.  `--strict-assets` stays on
-# either way; with checkpoints off the allow-list simply widens to every
-# declared asset, so a run still reports what it did not cover.
-#
-# ---------------------------------------------------------------------------
-# Setup (later, to also run the checkpoint-backed half)
-# ---------------------------------------------------------------------------
-#   3. Seed the checkpoints into the Volume, from a box that has them (~29 GiB,
-#      dominated by Qwen2-Audio-7B at 16 GiB):
-#        set -a; source .env; set +a
-#        modal run ci/modal_app.py::seed_assets --dry-run   # check the plan
-#        modal run ci/modal_app.py::seed_assets
-#      `.env` is the whole configuration: seeding reads the same per-asset env
-#      vars the suite gates on, and the slots come from `Asset.relpath` in
-#      tests/assets.py, so adding a checkpoint there seeds it here with no edit
-#      to ci/modal_app.py.  Re-running overwrites in place, so a single
-#      refreshed asset is just another `seed_assets`.
-#   4. Dispatch with `checkpoints: true` (and flip the default below once the
-#      Volume is seeded, so the weekly run covers them too).
-#
-# Costs GPU-minutes per run, so this is dispatch + weekly rather than per-push.
-# Point it at a PR by dispatching with the branch selected.
+# Rented-runner counterpart to test-gpu.yml. Set Modal token secrets once.
+# The default accelerator covers architecture-gated suites; alternate targets
+# are supplemental. Seed assets with ci/modal_app.py::seed_assets, then dispatch
+# with checkpoints enabled. Without them, strict mode reports all skipped assets.
 
 on:
   workflow_dispatch:

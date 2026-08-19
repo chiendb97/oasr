@@ -132,13 +132,8 @@ class OutputProcessor:
         if n <= 1 or not output.tokens:
             return
         if len(output.tokens) <= 1:
-            # A greedy family produced one hypothesis and always will.  Say so
-            # at DEBUG rather than silently returning `max_alternatives` worth
-            # of nothing: a client asking for 5 alternatives from `aed` / `llm`
-            # / `transducer` / `paraformer` cannot otherwise tell the request
-            # was honoured-and-empty from unsupported.  Deliberately reads only
-            # `output` — this method is a pure function of (request, output),
-            # which is what lets it be tested without an engine.
+            # Greedy strategies cannot fill additional alternatives; log the
+            # reduced result instead of fabricating empty hypotheses.
             logger.debug(
                 "n_best=%d requested but this decode family produced a single "
                 "hypothesis; returning one alternative",
@@ -149,11 +144,8 @@ class OutputProcessor:
         for row in output.tokens[1:n]:
             texts.append(self._detok.detokenize(row))
         output.nbest_texts = texts
-        # Truncate the token rows to what was asked for, before they cross the
-        # PyO3 boundary.  CTC ships its **whole** beam (default 10-16 rows) for
-        # every request regardless of `n_best`, and the serving layer discards
-        # all but the first `n` — so the extra rows are pure marshalling cost on
-        # the GIL-holding dispatcher thread.
+        # Truncate before crossing the language boundary to avoid marshalling
+        # beam rows the serving layer will discard.
         if len(output.tokens) > n:
             output.tokens = output.tokens[:n]
             if output.scores is not None and len(output.scores) > n:

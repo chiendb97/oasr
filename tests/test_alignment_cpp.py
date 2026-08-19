@@ -1,34 +1,9 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""The C++ alignment pass, checked against a Python statement of the same rule.
+"""Check compiled alignment against an independent Python oracle.
 
-``csrc/alignment/`` and ``csrc/tokenizers/`` are the *only* implementations the
-engine has: the token→word grouping, the emission tiling and the symbol-table
-rendering run in C++ or not at all.  A rule that exists once still has to be
-checkable, so the Python version lives **here**, as an oracle — independently
-written from the C++, exercised only by this file, and impossible for a
-deployment to land on.
-
-Three classes of divergence are possible and each is pinned below:
-
-1. **Classification.**  Whitespace is Python's ``str.isspace()`` — 29 code
-   points, not ASCII and not ``std::isspace`` — and "space-less script" is six
-   Unicode ranges.  Both are checked against CPython over the *whole plane*,
-   because a single wrong code point silently merges or splits one word in one
-   language.
-2. **Grouping and arithmetic.**  Randomised piece sets through both, compared
-   exactly: same words, same spans, same confidences, same timestamps.  Exact
-   rather than approximate — both do the same operations in the same order, so
-   a difference is a bug and not a rounding artefact.  (This is what caught the
-   oracle using ``sum()``, which CPython 3.12 compensates and 3.10 does not.)
-3. **UTF-8.**  The C++ side works in bytes and the oracle in code points.  They
-   partition identically only because a piece is a whole number of code points;
-   the CJK/emoji/combining cases here are what would catch it if that stopped
-   being true.
-
-Changing the rule in C++ therefore means changing the oracle below in the same
-commit — that is the cost of having the check at all, and it is much cheaper
-than the alternative these tests exist to prevent.
+The suite pins Unicode classification, exact grouping arithmetic, and UTF-8
+boundary behavior. Any rule change must update both implementations.
 """
 
 from __future__ import annotations

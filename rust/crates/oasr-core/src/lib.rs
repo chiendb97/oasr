@@ -2,15 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `oasr._core` — PyO3 extension module exposing the OASR serving core.
 //!
-//! Built by setuptools-rust during `pip install` (see pyproject.toml
-//! `[[tool.setuptools-rust.ext-modules]]`).  The `oasr-server` console script
-//! (`oasr/_server_cli.py`) imports this module and calls [`serve`], so the
-//! Rust front-end ships with the wheel instead of a separately-built binary.
+//! Built into the wheel; the console script imports this module and calls
+//! [`serve`].
 
-// `#[pyfunction]`'s expansion converts the result with `.into()` even when the
-// error type already is `PyErr`.  The lint fires in generated code that a
-// function-level `#[allow]` does not reach, and this crate is only the module
-// glue below, so scoping it to the crate costs no real coverage.
+// The pyfunction expansion triggers this lint outside function-level scope.
 #![allow(clippy::useless_conversion)]
 
 use clap::Parser;
@@ -19,11 +14,8 @@ use pyo3::prelude::*;
 
 /// Run the OASR HTTP + gRPC server to completion.
 ///
-/// `args` is a full command line *including* the program name at index 0
-/// (i.e. pass `sys.argv`), parsed with the same clap CLI as the standalone
-/// binary.  Blocks until SIGINT / SIGTERM.  The GIL is released for the
-/// server's lifetime via `allow_threads` so the engine dispatcher thread can
-/// re-acquire it through `Python::with_gil`.
+/// `args` includes the program name. Blocks until shutdown while releasing the
+/// GIL so the dispatcher may acquire it.
 #[pyfunction]
 fn serve(py: Python<'_>, args: Vec<String>) -> PyResult<()> {
     // `--help` / `--version` / parse errors print and exit the process, matching

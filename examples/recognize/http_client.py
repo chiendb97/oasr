@@ -1,35 +1,10 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Minimal HTTP client for the OASR `oasr.speech.v1` Speech service.
+"""Send one raw-body recognition request and print its JSON response.
 
-Sends a single audio file to ``POST /v1/speech:recognize`` and prints the
-JSON response.  Requires the server to be running in ``--service-mode
-offline``.
-
-The request **body is the raw audio payload** (no base64, no JSON envelope) and
-the config rides in the query string — this skips the ~33% base64 inflation +
-JSON build/parse (~2× the throughput of a base64-JSON body under load).  The
-response is a small JSON ``RecognizeResponse``.
-
-Dependencies::
-
-    pip install requests
-
-Usage::
-
-    # Any container — the server sniffs it and reads its sample rate
-    python examples/recognize/http_client.py \\
-        --server-url http://127.0.0.1:8080 \\
-        --wav podcast.mp3
-
-    # Headerless raw PCM (or µ-law / A-law telephony)
-    python examples/recognize/http_client.py \\
-        --server-url http://127.0.0.1:8080 \\
-        --wav audio.f32 --encoding LINEAR32F --sample-rate 16000
-
-For an upload in the OpenAI shape instead, see ``oasr transcribe`` /
-``oasr.client`` — this script exists to show the low-overhead raw-body route.
+Audio bytes form the body; recognition configuration is passed in the query
+string. Headerless audio requires explicit encoding and sample rate options.
 """
 
 from __future__ import annotations

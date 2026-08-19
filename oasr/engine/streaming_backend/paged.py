@@ -123,9 +123,8 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             dtype=cache_config.dtype,
         )
         # Names beyond ``"conv"``: passed to the chunk forward as ``states=`` only
-        # when non-empty, so an encoder that needs nothing more (Conformer, the
-        # conformer-encoder transducer) is called with exactly the signature it
-        # always had — including inside the CUDA-graph capture.
+        # when non-empty, preserving the narrower call signature for encoders
+        # that need no additional state, including during graph capture.
         self._extra_states = [s.name for s in cache_config.stream_states]
         self._slot_pool = StreamSlotPool(cache_config.max_batch_size)
 
@@ -405,24 +404,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
                 fallback.append(req)
 
         if batchable:
-            # Heterogeneous-offset batching: all batchable streams go into
-            # one paged forward regardless of offset. FlexAttention's
-            # block-mask is built from per-stream cache_seqlens, and the
-            # encoder builds per-stream pos_emb when offsets differ.
-            #
-            # ``detach`` when *any* fallback follows, for two independent reasons.
-            # The narrow one is same-key reuse: ``_forward_single`` always replays
-            # at ``B=1``, so a B=1 cohort shares its shape key with a single.  The
-            # broader one is that a fallback may hit a **new** key and trigger a
-            # *capture* — and a capture reuses the shared graph memory pool, which
-            # can hand out the block an earlier capture's output buffer occupies.
-            # Measured: a stream finalizing in the same step as a fresh capture lost
-            # its trailing words (5 of 40 LJSpeech utterances), deterministically,
-            # only with graphs enabled.  Predicting *which* fallback would capture
-            # is possible (``GraphedEncoderForward.have``) but fragile; gating on
-            # "is there anything after us at all" costs one ``(B, chunk, C)`` copy
-            # on the steps where a stream finishes and keeps the steady-state hot
-            # path (a full cohort, no finalizing stream) allocation-free.
+            # Batch full-window streams regardless of offset; masks and positions
+            # are per stream. Detach before fallbacks because graph replay or
+            # capture may reuse the shared pool storage holding this output.
             self._forward_batched_paged(
                 batchable,
                 window,
@@ -433,10 +417,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             )
 
         for i, req in enumerate(fallback):
-            # Same reasoning as the batched path: every graph replay hands back
-            # a buffer the *next* replay at that shape key overwrites, and two
-            # full-window finals in one step share a key whenever their offsets
-            # land in the same bucket.  Only the last single is safe to alias.
+            # Replay outputs alias their shape-key buffer; detach before reuse.
             self._forward_single(
                 req, window, stride, context, results, detach=i < len(fallback) - 1
             )

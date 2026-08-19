@@ -97,15 +97,8 @@ class ConformerModelConfig(BaseModelConfig):
             conv_kernel_size=conv_kernel,
         )
 
-    # ``encoder`` accepts a **flat** dict as well as a nested one: WeNet-derived
-    # dicts put encoder hyperparameters at the top level.  Everything else —
-    # ``vocab_size``, the optional nested ``decoder`` — is handled by the inherited
-    # type-driven reader.
-    #
-    # This field used to be filtered with ``hasattr(ConformerEncoderConfig, k)``,
-    # which drops any field declared *without* a default (a defaultless dataclass
-    # field is not a class attribute), so such a field silently defaulted itself on
-    # every native round-trip.
+    # Accept both flat upstream encoder fields and the native nested layout.
+    # Dataclass coercion preserves required fields that lack class attributes.
     _from_dict_overrides: ClassVar[Mapping[str, Any]] = {
         "encoder": lambda d: coerce_config(ConformerEncoderConfig, d.get("encoder", d)),
     }

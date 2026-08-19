@@ -45,15 +45,10 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-#: Per-series cap on buffered histogram samples between two drains.  Reached
-#: only if the dispatcher stops draining; the overflow is counted into
-#: :data:`SAMPLES_DROPPED` so a truncated distribution never passes for a
-#: complete one.
+#: Per-series buffer cap; overflow increments :data:`SAMPLES_DROPPED`.
 MAX_SAMPLES_PER_SERIES = 4096
 
-#: How often the device counters are sampled.  ``torch.cuda.utilization`` costs
-#: ~17 us and ``mem_get_info`` ~7 us — trivial once a second, and 2-3% of a core
-#: if a 1 kHz tick loop paid it every tick while holding the GIL.
+#: Device counters are sampled off the per-tick hot path.
 GPU_SAMPLE_INTERVAL_S = 1.0
 
 # --------------------------------------------------------------------------
@@ -82,14 +77,8 @@ GPU_MEMORY_USED = "oasr_gpu_memory_used_bytes"
 GPU_MEMORY_TOTAL = "oasr_gpu_memory_total_bytes"
 GPU_UTILIZATION = "oasr_gpu_utilization_ratio"
 
-#: Every value the ``stage`` label may take.
-#:
-#: Declared, not free-form, for the same reason the NVTX ranges next door are
-#: *not* reusable as label values: ``nvtx_push(f"offline.micro_batch[B={n}]")``
-#: is fine for a profiler timeline and would be a cardinality bomb in a time
-#: series database.  :meth:`EngineMetrics.observe_stage` rejects anything not
-#: listed here, so that mistake fails on its first call instead of after a
-#: monitoring bill.
+#: Fixed stage-label vocabulary; free-form profiler labels would create
+#: unbounded metric cardinality.
 STAGES = frozenset(
     {
         "offline.collate",

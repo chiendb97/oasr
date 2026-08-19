@@ -186,19 +186,14 @@ def _dispatch_conv1d_activation(
 
 # IC threshold below which cuDNN is used instead of CUTLASS.
 # CUTLASS implicit GEMM uses scalar alignment (=1) for all IC values, but
-# cuDNN can pick better algorithms when IC is small (e.g. IC=1 in conformer
-# subsampling).
+# cuDNN can pick better algorithms for small input-channel counts.
 _CUDNN_IC_THRESHOLD = 8
 
 #: CUTLASS's implicit-GEMM Conv2D addresses its activation tensors with 32-bit
 #: **byte** offsets, so a single launch cannot span more than 2 GiB per tensor.
-#: Past that the kernel returns a plain failure status, which surfaced as an
-#: engine-wide empty transcript: at ``max_batch_size >= ~220`` the Conformer
-#: subsampling's second conv crosses the limit, the launcher raises, and the
-#: micro-batch retry that would have named the culprit died on already-released
-#: waveforms instead.  Splitting the batch dimension is exact — a batched
-#: convolution is independent across N — so the limit costs a few extra launches
-#: on an over-large batch rather than a failure.
+#: Splitting the batch dimension is exact because convolution rows are
+#: independent, so oversized inputs use multiple launches instead of overflowing
+#: the kernel's address range.
 _CONV2D_MAX_TENSOR_BYTES = 2**31 - 1
 
 

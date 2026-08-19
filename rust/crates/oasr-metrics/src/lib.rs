@@ -420,18 +420,8 @@ impl Outcome {
     }
 }
 
-/// The request-scope series for one API surface, with every handle resolved up
-/// front.
-///
-/// Shared between the HTTP and gRPC front-ends on purpose.  Those two duplicate
-/// their whole submit → await → map orchestration, and a metric written twice is
-/// a metric that eventually disagrees with itself: one side counts a
-/// disconnect as an error, the other as a cancellation, and the resulting
-/// error-rate panel is wrong in a way nobody can see. Recording through one
-/// type makes the vocabulary structural.
-///
-/// Construct one per surface in a `OnceLock` and share the reference — the
-/// handles are immutable and the recording methods take `&self`.
+/// Pre-resolved request metrics shared by HTTP and gRPC so both surfaces use the
+/// same outcome vocabulary. Construct one immutable instance per surface.
 pub struct RequestRecorder {
     /// Indexed by [`Outcome::index`].
     duration: [metrics::Histogram; 3],
@@ -720,14 +710,8 @@ mod tests {
     /// Record into **every** declared metric and check what the exporter
     /// actually renders for it.
     ///
-    /// The table-level tests above check the declaration; this one checks the
-    /// output, which is not the same thing. A metric can be declared as a
-    /// histogram with perfectly good buckets and still render as a summary if
-    /// the bucket matcher does not reach it — `Matcher::Full` is an exact
-    /// string match, so a name that disagrees with itself between the
-    /// declaration and the bucket wiring fails silently and looks fine.
-    /// Rendering each one and asserting on the type line is the only check
-    /// that closes that gap.
+    /// Rendering catches exact-name mismatches between metric declarations and
+    /// bucket matchers that table-level checks cannot observe.
     #[test]
     fn every_declared_metric_renders_in_its_declared_form() {
         let recorder = builder().unwrap().build_recorder();

@@ -1,36 +1,8 @@
 #!/usr/bin/env python3
-"""Unified OASR benchmark CLI.
+"""Unified kernel benchmark CLI.
 
-Usage:
-  # Single test with defaults
-  python benchmarks/oasr_benchmark.py --routine gemm
-
-  # Specific subroutine and shape
-  python benchmarks/oasr_benchmark.py --routine gemm --subroutine bmm \\
-      --batch-count 256 --M 200 --N 200 --K 64
-
-  # Select backends to compare
-  python benchmarks/oasr_benchmark.py --routine norm --subroutine layer_norm \\
-      --backends cuda torch --batch 64 --seq 250 --hidden 512
-
-  # Correctness check
-  python benchmarks/oasr_benchmark.py --routine gemm --backends cutlass torch --refcheck
-
-  # Export to CSV
-  python benchmarks/oasr_benchmark.py --routine norm --output_path results.csv
-
-  # Batch test from testlist
-  python benchmarks/oasr_benchmark.py --testlist benchmarks/testlists/conformer_base.txt
-
-  # Profiling mode (NVTX markers, run under ncu manually)
-  python benchmarks/oasr_benchmark.py --routine gemm --subroutine gemm \\
-      --M 200 --N 200 --K 64 --backends cutlass --profile --dry_run_iters 0
-
-  # Verbose output
-  python benchmarks/oasr_benchmark.py --routine gemm -vv
-
-  # List available routines
-  python benchmarks/oasr_benchmark.py --list
+Select a routine, shape, and backends; optionally check reference output, load a
+test list, export CSV, or add profiling markers. See ``--help`` for arguments.
 """
 
 from __future__ import annotations
@@ -60,7 +32,6 @@ def _build_global_parser() -> argparse.ArgumentParser:
         epilog=_build_epilog(),
     )
 
-    # Stage-1 global args
     parser.add_argument(
         "--routine",
         type=str,
@@ -254,7 +225,6 @@ def _run_single_test(
     if merged.profile:
         _run_profile_mode(routine_mod, merged)
     else:
-        # Generate repro command
         if merged.generate_repro_command:
             repro = _build_repro_command(merged, remaining)
             output.add_repro_command(repro)

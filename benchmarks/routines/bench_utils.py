@@ -270,7 +270,6 @@ class OutputWriter:
         """Print a [PERF] line and append to CSV."""
         self._results.append(result)
 
-        # Build [PERF] line
         parts = [f"median time {result.median_ms:.3f} ms"]
         parts.append(f"std {result.std_ms:.3f} ms")
         if result.tflops is not None and result.tflops > 0:
@@ -280,7 +279,6 @@ class OutputWriter:
 
         print(f"[PERF] {result.backend:<12} :: {'; '.join(parts)}")
 
-        # CSV
         if self._csv_writer is not None:
             device_info = get_device_info()
             repro = self._repro_commands[-1] if self._repro_commands else ""

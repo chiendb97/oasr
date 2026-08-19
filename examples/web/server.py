@@ -1,62 +1,12 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Same-origin front door for the OASR web demo: static page + reverse proxy.
+"""Serve the web demo and relay API traffic to ``oasr-server``.
 
-    python examples/web/server.py --oasr-server http://asr-host:8080
-    # then open http://localhost:8000
-
-Serves ``static/`` and forwards the API paths to a running ``oasr-server``, so the
-browser only ever talks to *this* origin.  That is the whole point of the process:
-
-* the server needs **no** ``--cors-allow-origin``, because nothing is cross-origin;
-* the page needs no ``?server=`` and no SSH tunnel — one flag names the host;
-* ``oasr-server`` needs no network exposure of its own.  It has no authentication,
-  so being reachable only by this relay is a feature.
-
-Not the bridge this repo used to ship
--------------------------------------
-
-The previous ``server.py`` was a *protocol* bridge: a browser could not reach OASR
-at all, so a FastAPI app translated ``WS /api/stream`` ⇆ gRPC ``StreamingRecognize``
-and ``POST /api/recognize`` ⇆ ``Recognize``, framing raw f32 PCM itself.  It needed
-fastapi, uvicorn and grpcio, and it had to understand every message on the wire —
-so each protocol change broke it.
-
-``oasr-server`` now speaks ``POST /v1/audio/transcriptions`` and ``WS /v1/realtime``
-natively, so this file is a **byte relay instead of a translator**: the WebSocket
-handshake is forwarded verbatim and the connection is then spliced raw, and nothing
-here parses a frame or a JSON event.  A new realtime event type needs no change.
-The page keeps talking to the real OASR API, which is also what makes it a working
-example rather than a demo-only protocol.  Consequences worth knowing:
-
-* the standard library is the only dependency — no ``requirements.txt``;
-* per-request logs count *bytes*, not chunks and partials.  A relay that does not
-  parse cannot report what it did not read; the server's own ``rid=`` log lines
-  have the decode detail.
-
-Microphone
-----------
-
-Browsers expose ``getUserMedia`` only in a secure context — HTTPS, or a loopback
-host — and that is the browser's decision, so nothing this process sends can grant
-it.  Plain HTTP over loopback is already secure, so ``http://localhost:8000``
-needs no certificate whatever the bind address is; only a visitor arriving on some
-other name or address is gated.  For them, ``--tls-self-signed`` is the one-flag
-answer (HTTPS with a cached self-signed certificate, warned about once per
-browser), or the origin can be allowlisted browser-side — startup says which case
-applies and spells out the vendor specifics.  File upload never needs any of this.
-
-Logging
--------
-
-Every request gets a correlation id (``[http-1a2b3c4d]`` / ``[ws-…]``), also
-returned as the ``x-oasr-trace`` response header so browser devtools joins these
-logs.  ``--log-level info`` is one line per API request (and one per realtime
-session, with its byte counts); ``debug`` adds static-asset requests, upstream
-response headers and the reason a relay tore down::
-
-    python examples/web/server.py --log-level debug --log-file /tmp/bridge.log
+The same-origin relay forwards HTTP and WebSocket bytes without interpreting the
+protocol, keeping the upstream service private and avoiding CORS configuration.
+Microphone capture requires loopback or HTTPS; ``--tls-self-signed`` provides a
+local certificate. Correlation IDs connect relay logs with browser requests.
 """
 
 import argparse
@@ -504,17 +454,8 @@ class Handler(SimpleHTTPRequestHandler):
 # Microphone / secure context
 # ---------------------------------------------------------------------------
 #
-# Browsers expose getUserMedia only in a "secure context": HTTPS, or a loopback
-# host.  That is decided by the *browser*, so no flag or header on this side can
-# grant it — `--tls-self-signed` below removes the certificate work instead, and
-# the warning names the browser-side allowlist for anyone who must stay on plain
-# HTTP.  File upload is unaffected either way.
-#
-# What decides it is the *URL the visitor typed*, not the address this process
-# bound.  Loopback is a secure context by name, so `http://localhost:8000` needs
-# no certificate at all — and a wildcard bind serves both that and a LAN address
-# from the same socket.  Hence `_is_loopback_host` / `_is_wildcard_host` below,
-# rather than one blanket "not localhost ⇒ warn" test.
+# Browsers allow microphone access only over HTTPS or a loopback URL. The typed
+# URL, not the bound address, determines this; wildcard binds may serve both.
 
 
 def _is_loopback_host(host: str) -> bool:

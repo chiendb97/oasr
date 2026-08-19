@@ -1,15 +1,9 @@
 # Prometheus + Grafana for an oasr-server that is already running.
 #
-# Deliberately does **not** start oasr-server: it needs a GPU, a checkpoint and
-# a good deal of VRAM, and the common case is attaching monitoring to a server
-# that is already up. Point `prometheus/prometheus.yml` at wherever it runs.
+# Attaches monitoring to an existing server; it does not start one.
 #
 #   cd deploy && docker compose -f docker-compose.monitoring.yml up -d
 #   open http://localhost:3000   (anonymous admin — see the warning below)
-#
-# Point it somewhere other than the local host with OASR_TARGETS:
-#
-#   OASR_TARGETS=gpu-box:8080 docker compose -f docker-compose.monitoring.yml up -d
 #
 # Image versions are pinned, not `latest`: the dashboard is `schemaVersion: 39`,
 # and Grafana's dashboard schema drifts across majors.
@@ -17,22 +11,9 @@
 name: oasr-monitoring
 
 configs:
-  # Prometheus' file-SD target list, rendered from the environment when compose
-  # parses this file. It exists so that the scrape address is a command-line
-  # argument instead of an edit inside `prometheus/prometheus.yml` — Prometheus
-  # itself neither takes a target flag nor expands variables in its own config,
-  # so the substitution has to happen out here.
-  #
-  #   OASR_TARGETS=gpu-box:8080                  docker compose -f … up -d
-  #   OASR_TARGETS='gpu-0:8080,gpu-1:8081'       docker compose -f … up -d
-  #
-  # A comma-separated value lands in a YAML flow sequence as-is, so scale-out
-  # (one process per GPU) needs no different syntax. `docker/monitoring/.env` is read
-  # automatically and is gitignored, if you would rather not repeat the variable.
-  #
-  # Inline `content` needs Compose v2.23.1+ (`docker compose version`); on an
-  # older one, bind-mount a directory you write the same one-line file into —
-  # see the fallback in README.md.
+  # Render file-discovery targets from OASR_TARGETS because Prometheus does not
+  # expand target variables. Comma-separated values form a scale-out list.
+  # Inline content requires Compose 2.23.1+; see README for the bind-mount fallback.
   oasr_targets:
     content: |
       - targets: [${OASR_TARGETS:-host.docker.internal:8080}]
@@ -90,16 +71,8 @@ services:
       - ./grafana/oasr-overview.json:/var/lib/grafana/dashboards/oasr-overview.json:ro
       - grafana-data:/var/lib/grafana
     ports:
-      # Host side is configurable; the container side stays 3000, which is what
-      # Grafana listens on. Set GF_SERVER_HTTP_PORT above as well if you want to
-      # move the *listener* rather than just the published port — but there is
-      # rarely a reason to, and the two are easy to get out of step.
-      #
-      #   GRAFANA_PORT=9000 docker compose -f docker-compose.monitoring.yml up -d
-      #
-      # The bind defaults to 0.0.0.0 so the UI is reachable from another machine.
-      # That is only safe while the anonymous-admin block above is gone: set
-      # GRAFANA_BIND=127.0.0.1, or a password, before leaving it open.
+      # GRAFANA_PORT changes only the published host port. The public default bind
+      # is safe only after disabling anonymous admin or setting a password.
       - "${GRAFANA_BIND:-0.0.0.0}:${GRAFANA_PORT:-3000}:3000"
 
 volumes:

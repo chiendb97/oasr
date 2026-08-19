@@ -350,21 +350,9 @@ struct StreamOverOfflineCfg {
 }
 
 impl SpeechService {
-    /// `StreamingRecognize` against an **offline-pinned** engine: buffer the
-    /// inbound audio, submit it as one offline request, stream the text out.
-    ///
-    /// This is what makes the autoregressive strategies' per-tick partials
-    /// reachable. They were built (`llm` emits one `Event::Partial` per advanced
-    /// request per tick), they crossed PyO3, they reached the router — and then the
-    /// unary path's drain task threw every non-terminal event away, one layer from
-    /// the wire. The inter-token cadence a client sees here is set by
-    /// `EngineConfig.max_tick_ms`, which is why that knob is a user-visible latency
-    /// feature and not merely an internal bound on GIL hold time.
-    ///
-    /// Half-close is the submit trigger: there is nothing useful to do with a
-    /// partial utterance when the frontend has a fixed window. A client that never
-    /// half-closes gets no result, same as a unary client that never finishes its
-    /// request body.
+    /// Buffer streaming input for an offline engine, then forward incremental text.
+    /// Client half-close triggers submission because fixed-window frontends cannot
+    /// process the incomplete utterance.
     async fn streaming_over_offline(
         &self,
         mut inbound: Streaming<pb::StreamingRecognizeRequest>,
@@ -1025,9 +1013,7 @@ impl pb::speech_server::Speech for SpeechService {
 mod tests {
     use super::*;
 
-    /// The response builders were factored out of the streaming loop so the
-    /// offline-engine path (S1) could reuse them instead of duplicating ~40 lines
-    /// of proto construction.  These pin the field values that distinguish an
+    /// These tests pin the field values that distinguish an
     /// interim response from a terminal one — a client renders on `is_final`, so
     /// getting it wrong turns a partial into a premature answer.
     #[test]

@@ -286,7 +286,7 @@ class TestOutputProcessorDetokenize:
         cfg = EngineConfig(ckpt_dir=ckpt_dir)
         # The engine stamps ``_model_config`` after loading the checkpoint; the
         # CTC strategy needs its ``vocab_size`` to size the beam state and now
-        # *raises* rather than falling back to a magic 5002 (N7).  Read the real
+        # *raises* rather than falling back to a magic token ID.  Read the real
         # value off the checkpoint so the stub is not a fiction.
         with open(Path(ckpt_dir) / "units.txt", encoding="utf-8") as f:
             vocab = sum(1 for line in f if line.strip())

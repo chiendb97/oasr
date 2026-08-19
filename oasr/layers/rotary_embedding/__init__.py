@@ -1,27 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""
-Rotary Position Embeddings (RoPE).
-
-This module provides extensible, reusable rotary embedding implementations
-for Transformer-based models (encoder-only, decoder-only, encoder-decoder).
-
-Usage:
-    # Precompute freqs_cis (standalone, e.g. for compatibility with WeNet)
-    from oasr.layers.rotary_embedding import precompute_freqs_cis
-    freqs_cis = precompute_freqs_cis(head_dim, seq_len)
-
-    # Use RotaryEmbedding module (for attention layers)
-    from oasr.layers.rotary_embedding import RotaryEmbedding, get_apply_rotary_emb
-    rope = RotaryEmbedding(head_dim=64, style="llama")
-    freqs_cis = rope.get_freqs_cis(seq_len)
-    q_rot = rope(q, freqs_cis)
-
-    # Factory for different RoPE variants
-    from oasr.layers.rotary_embedding import get_rotary_embedding
-    rope = get_rotary_embedding(head_dim=64, rope_type="ntk", scaling_factor=4.0)
-"""
+"""Reusable rotary position embedding implementations and factories."""
 
 from __future__ import annotations
 

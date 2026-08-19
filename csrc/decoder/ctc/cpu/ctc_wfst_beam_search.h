@@ -30,19 +30,8 @@ struct CtcWfstBeamSearchOptions {
     float blank_skip_thresh = 0.98f;
 };
 
-// WFST-based CTC decoding using K2's public torch_api.h interface.
-//
-// Accepts a decoding graph as a k2::FsaClassPtr (shared pointer to FsaClass).
-// Use the static FromFile() factory to load a graph saved with torch.save().
-//
-// Streaming mode: Search() accumulates log-prob frames; FinalizeSearch() runs
-// the actual k2 intersection and N-best extraction over all accumulated frames.
-// For truly incremental streaming call FinalizeSearch() after each chunk — the
-// state is reset between calls (re-initialize with Reset() to start a new utt).
-//
-// Build requirements:
-//   cmake -DOASR_USE_K2=ON -Dk2_DIR=<k2Config.cmake dir> ...
-//   or:  OASR_USE_K2=1 pip install -e .
+// WFST CTC decoder. Search accumulates frames; FinalizeSearch performs
+// intersection and N-best extraction. Reset starts a new utterance.
 class CtcWfstBeamSearch {
 public:
     CtcWfstBeamSearch(const CtcWfstBeamSearchOptions& opts,

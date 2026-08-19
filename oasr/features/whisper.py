@@ -105,10 +105,9 @@ def batched_whisper_logmel(
     # The engine's ``InputProcessor`` already zeroes the padded tail, so for the
     # engine path this repeats a (B, T) elementwise pass (~61 MB at B=32) that
     # changes nothing.  Kept anyway: skipping it would need an extra argument
-    # only this extractor honours, and the whole point of the feature registry
-    # (F1) is that every frontend has the *same* ``(wav, lengths, cfg)``
-    # signature.  A per-extractor escape hatch would put the branch back in the
-    # shared caller, which is what F1 removed.  Direct callers rely on it too.
+    # only this extractor honours.  The feature registry deliberately gives
+    # every frontend the same ``(wav, lengths, cfg)`` contract, and direct callers
+    # also rely on invalid tails being masked here.
     idx = torch.arange(T, device=device).unsqueeze(0)
     wav = waveforms * (idx < lengths.to(device).unsqueeze(1))
     if T < n_samples:

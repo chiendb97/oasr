@@ -105,40 +105,17 @@ class Tokenizer(ABC):
         """Text → token ids (no special ids added)."""
         raise NotImplementedError
 
-    # -- incremental decode -------------------------------------------------
-    #
-    # Streaming and AR families emit a partial per chunk / per tick, and each
-    # one used to re-decode the whole prefix from scratch: Θ(n²) token-decodes
-    # over a generation (~3.1k for a 448-token LLM run at 32 tokens/tick), worst
-    # on ``funasr_char``, whose ``decode`` runs two all-CJK/all-alpha probes plus
-    # a list-membership abbreviation pass over every token.
-    #
-    # ``decode_incremental`` amortises that: feed it only the ids produced since
-    # the last call and it returns the **new text** plus carry-over state.  The
-    # default below is a correct-but-quadratic fallback (decode the accumulated
-    # prefix, diff off what was already emitted), so a tokenizer opts in to the
-    # fast path by overriding, and none has to.
-    #
-    # Diffing rather than concatenating per-chunk decodes is what keeps this
-    # equal to a full decode: joining is wrong for every kind in the tree —
-    # sentencepiece word boundaries, ``@@`` subword merges and CJK spacing all
-    # depend on neighbouring tokens.
+    # Incremental decoders receive only new ids. The default re-decodes and diffs
+    # the accumulated prefix, preserving context-sensitive spacing and merges.
 
     def new_decode_state(self) -> Dict[str, Any]:
         """Fresh per-request state for :meth:`decode_incremental`."""
         return {"ids": [], "text": ""}
 
     def decode_incremental(self, new_ids: Sequence[int], state: Dict[str, Any]) -> str:
-        """Append ``new_ids`` to the running hypothesis; return the text delta.
+        """Append ids and return text added since the previous call.
 
-        ``state`` is mutated in place.  ``state["text"]`` always holds the full
-        transcript so far, so a caller wanting the whole thing need not
-        accumulate deltas itself.
-
-        The contract is that concatenating every delta equals
-        ``decode(all_ids)`` — a subclass overriding this for speed must preserve
-        that, including when a later token changes how an earlier one renders
-        (the reason the default diffs full decodes instead of joining pieces).
+        Mutates ``state``; concatenated deltas must equal ``decode(all_ids)``.
         """
         ids = state.setdefault("ids", [])
         ids.extend(int(i) for i in new_ids)

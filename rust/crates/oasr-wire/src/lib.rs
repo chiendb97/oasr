@@ -3,12 +3,9 @@
 //! Shared event / command types between the Rust serving frontend and the
 //! embedded Python `ASREngine`.
 //!
-//! Previously these types doubled as a msgpack wire schema for the ZMQ
-//! worker boundary; that transport is gone and the types are now used
-//! purely in-process (the dispatcher constructs `Event` values directly
-//! from `ASREngine.step()` output and the HTTP/gRPC adapters consume
-//! them).  `serde` is retained because the gRPC + HTTP layers convert
-//! `Event` payloads into their own response shapes via `serde_json`.
+//! The dispatcher constructs `Event` values from `ASREngine.step()` output;
+//! HTTP and gRPC adapters consume them.  `serde` supports conversion into each
+//! frontend's response shape.
 
 use serde::{Deserialize, Serialize};
 
@@ -37,13 +34,11 @@ pub struct DecodingParams {
     /// Speech-LLM user-prompt override (ignored by other families).
     #[serde(default)]
     pub prompt: Option<String>,
-    /// `"transcribe"` or `"translate"` — Whisper's task token.  Frozen at
-    /// checkpoint-conversion time before this existed, which is why
-    /// `/v1/audio/translations` could not be served.
+    /// `"transcribe"` or `"translate"` for families with task control.
     #[serde(default)]
     pub task: Option<String>,
-    /// Language for the families that can select one (Whisper's language
-    /// token).  A primary subtag (`"en"`), not a BCP-47 tag — the front-ends
+    /// Language for families with language-token control.  A primary subtag
+    /// (`"en"`), not a BCP-47 tag — the front-ends
     /// reduce `"en-US"` before it gets here.
     #[serde(default)]
     pub language: Option<String>,
@@ -55,9 +50,8 @@ pub struct DecodingParams {
 }
 
 /// Sampling-temperature bounds, mirroring `oasr.engine.request.MIN_TEMPERATURE`
-/// / `MAX_TEMPERATURE`.  Outside this range (and non-zero) the Python side
-/// raises, so the front-ends reject here instead — a raise from inside
-/// `add_requests_batch` used to fail every coalesced admit in the same batch.
+/// / `MAX_TEMPERATURE`.  Frontends validate this before a bad request can fail
+/// a coalesced engine admission batch.
 pub const MIN_TEMPERATURE: f32 = 0.01;
 pub const MAX_TEMPERATURE: f32 = 100.0;
 /// Upper bound on `n_best` (proto `max_alternatives`).  Google's STT caps
@@ -69,12 +63,10 @@ pub const MAX_N_BEST: u32 = 30;
 /// prompt and output), so an unbounded one silently clamps generation to a
 /// single token.
 pub const MAX_PROMPT_BYTES: usize = 4096;
-/// The task values any decode family understands.  Whisper's own pair; a
-/// checkpoint that cannot do one of them rejects it at admission, where the
-/// token table lives.
+/// The task values understood by decode families with task control.  A checkpoint
+/// that cannot do one rejects it at admission, where the token table lives.
 pub const TASKS: &[&str] = &["transcribe", "translate"];
-/// Upper bound on a language tag.  Whisper's are two or three letters; the
-/// slack is for the handful of longer ISO-639-3 codes.
+/// Upper bound on a language tag, including longer ISO-639-3 codes.
 pub const MAX_LANGUAGE_LEN: usize = 16;
 
 /// Reduce a language tag to the primary subtag, lowercased: `"en-US"` → `"en"`.
@@ -399,9 +391,8 @@ pub struct ModelInfo {
     pub decoder_type: Option<String>,
     #[serde(default)]
     pub vocab_size: Option<u32>,
-    /// The mode the engine was actually built for, read back from it rather than
-    /// from the CLI flag: several decode families are offline-only, and the two
-    /// sources used to be able to disagree silently.
+    /// The mode the engine was actually built for, which can differ from the CLI
+    /// request when a decode family supports only one mode.
     #[serde(default)]
     pub service_mode: Option<String>,
     /// The resolved decode family running in this process (`ctc`, `transducer`,
@@ -424,8 +415,8 @@ mod tests {
 
     /// `OPTION_KEYS` must name every field of `DecodingParams`.
     ///
-    /// The first link of the S9 chain: struct → `OPTION_KEYS` → the Python
-    /// dataclass (asserted at engine startup). Without this, adding a field
+    /// `OPTION_KEYS` is cross-checked against the Python dataclass at engine
+    /// startup. Without this, adding a field
     /// here and forgetting the const gives an option that serialises over the
     /// wire, never reaches the dict, and reports nothing.
     #[test]
@@ -534,8 +525,7 @@ mod tests {
 
     #[test]
     fn validated_rejects_out_of_range() {
-        // Each of these used to reach Python and raise from inside
-        // `add_requests_batch`, failing every coalesced admit in the batch.
+        // Invalid options must be rejected before coalesced batch admission.
         let cases = [
             (
                 "top_p",

@@ -60,88 +60,12 @@ SERVED_DTYPES = (torch.float16, torch.bfloat16)
 #: CUTLASS 2.x alignment-8 iterators: both GEMM free dimensions must divide by 8.
 GEMM_ALIGNMENT = 8
 
-#: Row floor below which a GEMM should not go to CUTLASS.
-#:
-#: CUTLASS tiles the M axis, and the default config's tile is 128 rows wide, so
-#: a GEMM with ``M < 128`` leaves most of every tile empty.  cuBLAS switches to
-#: a GEMV-shaped kernel instead and wins — by a little when the problem is
-#: small, by a lot when it is not.  Measured on an RTX 5090, fp16, kernel vs
-#: ``F.linear``:
-#:
-#: ===================  ========  =======  =========
-#: shape (M, K, N)      CUTLASS   cuBLAS   ratio
-#: ===================  ========  =======  =========
-#: (8, 384, 384)        16.2 µs   14.8 µs  1.10×
-#: (64, 384, 384)       16.2 µs   14.8 µs  1.10×
-#: (4, 3584, 3584)      81.2 µs   15.2 µs  **5.34×**
-#: (3000, 384, 384)     16.8 µs   15.6 µs  1.07×
-#: ===================  ========  =======  =========
-#:
-#: That last skinny-but-large row is why this is a **row** count and not the
-#: work product it started as: ``4 × 3584 × 3584`` is 51 M MACs, comfortably
-#: over any sane work floor, yet it is the worst shape of the set — and it is
-#: exactly a Qwen2-Audio-7B decode step.  A MACs floor cannot see the problem
-#: because the problem is the *shape*, not the size.
-#:
-#: This is a **policy**, not a kernel gap.  The real fix is tuned rules for these
-#: shapes, and coverage is per model width because ``select_default_config`` keys
-#: on the exact ``(op, N, K)``.  Conformer-CTC and whisper-tiny are tuned;
-#: everything else takes the fallback tile.  ``format_gap_report()`` now lists the
-#: untuned shapes a run actually hit (measured: 8 for Qwen2-Audio-7B, 25 for
-#: Zipformer, 7 for Paraformer — and 1 for Conformer, which the table *was* tuned
-#: for, so it drifts), which is the shape list to hand ``tune_asr_gemm.py``.
-#:
-#: It must **not** be conditioned on ``is_current_stream_capturing()``, tempting
-#: as that is (under capture the dispatch cost is paid once and replayed free).
-#: A graph's contract is to reproduce the eager result, and a capture-dependent
-#: branch breaks it: capture picked CUTLASS while eager picked cuBLAS for the
-#: same shape, and the one-ulp fp16 difference reached the transducer decoder
-#: as *different tokens*.  Any refinement has to stay a pure function of the
-#: call.
+#: GEMM row floor for the default tiled kernel. Exact shape rules may override
+#: this performance policy; dispatch must remain independent of capture state.
 GEMM_MIN_ROWS = 128
 
-#: Work floor below which a **causal + windowed** attention stays on SDPA.
-#:
-#: Causal alone belongs to SDPA (it has a flash path and needs no mask tensor).
-#: Causal *combined* with a key window is the opposite case: SDPA refuses
-#: ``is_causal`` alongside ``attn_mask``, so the caller must materialize a
-#: ``(B, 1, T_q, T_k)`` tensor and thereby forfeits flash, while the fused kernel
-#: takes the same window as two length vectors and skips whole K blocks below the
-#: diagonal.  That is worth 1.8-3.3x **on the attention op** — but only once the
-#: fused path's fixed ~68 µs floor (the ``_ensure_canonical`` copies of q/k/v plus
-#: the wrapper) is amortized.  Measured on an RTX 5090, bf16, with the strides the
-#: real call site produces (q a ``split_heads`` view, k/v slices of a
-#: capacity-preallocated KV buffer):
-#:
-#: =========================  =======  ========  =======
-#: shape                      MACs     SDPA      ratio
-#: =========================  =======  ========  =======
-#: B1 H4 P128 D64             0.004 G  23.1 µs   0.34×
-#: B4 H8 P256 D64             0.134 G  32.9 µs   0.48×
-#: B4 H12 P384 D64            0.453 G  48.1 µs   0.67×
-#: B2 H28 P384 D128           1.057 G  85.1 µs   1.02×
-#: B4 H16 P512 D64            1.074 G  82.2 µs   0.99×
-#: B4 H28 P512 D128           3.758 G  255.8 µs  1.99×
-#: B4 H28 P1600 D128          45.9 G   2106 µs   3.29×
-#: =========================  =======  ========  =======
-#:
-#: Unlike :data:`GEMM_MIN_ROWS`, a *work* measure is the right one here, and the
-#: two rows either side of the threshold are why: 1.057 G at D=128 and 1.074 G at
-#: D=64 land on the same ratio despite different B, H, P and D.  A fixed floor
-#: being amortized predicts exactly that coincidence; a shape rule would not.
-#:
-#: Read the ratio as an *op-level* one.  A Qwen2-7B prefill layer is dominated by
-#: its GEMMs (d=3584 qkv/o/mlp), so the same change is 1.03-1.05x over the whole
-#: 32-layer prefill and 1.013x over an engine ``transcribe_offline`` with a short
-#: generation — real, small, and transcript-identical.  Both of those were
-#: measured with the arms **interleaved**: a single-order A/B first read 0.876x,
-#: which was the second arm benefiting from a warm allocator rather than the
-#: fused path losing.  The op-level number is still the right one to set this
-#: threshold from, because it is what the threshold decides.
-#:
-#: Scoped to the causal+window combination, which is what was swept.  The
-#: window-only routing is measured separately (see ``attention/core.py``), where
-#: a short query extent — not total work — is what loses.
+#: Work floor for fused causal-plus-window attention. Below it, fixed launch
+#: overhead outweighs avoiding the library path's materialized mask.
 FMHA_CAUSAL_WINDOW_MIN_MACS = 1 << 30
 
 

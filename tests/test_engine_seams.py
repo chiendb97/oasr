@@ -311,7 +311,7 @@ def test_add_requests_batch_still_raises_for_python_callers():
 
 
 # --------------------------------------------------------------------------- #
-# Sample-rate admission (C2)
+# Sample-rate admission
 # --------------------------------------------------------------------------- #
 
 

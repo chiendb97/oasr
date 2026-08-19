@@ -37,34 +37,10 @@ namespace features {
 // 0. STFT framing: waveform -> pre-emphasised, windowed, zero-padded frames.
 // =============================================================================
 //
-// One fused pass replacing `preemphasis -> torch.stft(center=...)`'s framing and
-// windowing.  Frame `f` of row `b` covers signal samples
-//
-//     t = f * hop_length - center_offset + i,   i in [0, n_fft)
-//
-// so `center_offset = n_fft / 2` reproduces `torch.stft(center=True,
-// pad_mode="constant")` and `center_offset = 0` reproduces `center=False`
-// (== Kaldi's `snip_edges` framing).  The analysis window occupies
-// `[win_offset, win_offset + win_length)` of the frame and the rest is zero;
-// `win_offset = (n_fft - win_length) / 2` is what `torch.stft` does when
-// `win_length < n_fft`.
-//
-// Everything outside `[0, lengths[b])` reads as zero -- that is *both* the
-// constant STFT padding and the per-row length mask, which are the same thing
-// once the batch is zero-padded.
-//
-// Pre-emphasis is applied in the **signal** domain, which is what NeMo does and
-// what makes it inexpressible as a per-frame transform: `y[t] = x[t] - c*x[t-1]`
-// with `x` already length-masked, then `y` re-masked to zero past the length
-// (at `t == lengths[b]` the difference is `-c*x[len-1]`, not zero).  The `t == 0`
-// boundary has two conventions and both are used in-tree:
-//
-//   preemph_replicate = 0 : x[-1] = 0     -> y[0] = x[0]           (NeMo)
-//   preemph_replicate = 1 : x[-1] = x[0]  -> y[0] = (1-c)*x[0]     (Kaldi)
-//
-// Grid-stride over `B * num_frames * n_fft` elements: purely elementwise, no
-// reduction, and consecutive threads read consecutive `t` so the two loads per
-// element coalesce.
+// Fused framing, signal-domain pre-emphasis, windowing, and zero padding.
+// `center_offset` selects centered or snip-edges framing; samples outside each
+// row's valid length are zero. `preemph_replicate` selects whether x[-1] is zero
+// or x[0], preserving the two supported boundary conventions.
 __global__ inline void StftFrameKernel(const float* __restrict__ waveform,
                                        const int32_t* __restrict__ lengths,
                                        const float* __restrict__ window,
@@ -233,28 +209,10 @@ inline cudaError_t FbankPreprocess(const float* frames, const float* window, flo
 // 2. Mel filterbank + log-floor.
 // =============================================================================
 //
-// For each frame's power spectrum p[0..F-1] (F = n_fft/2+1), compute
-// log(max(mel_mat[b] @ p, log_floor) + log_offset) for b = 0..num_mel-1.
-//
-// The floor and the additive guard are separate knobs because the two recipes
-// in-tree are
-//   Kaldi : log_floor = float32 tiny, log_offset = 0      -> log(max(m, eps))
-//   NeMo  : log_floor = 0,            log_offset = 2^-24  -> log(m + 2^-24)
-// and folding them into one would silently move the floor of every silent bin,
-// which *is* the encoder's input scale.
-//
-// `frame_lengths` (optional; one int32 per row of `frames_per_row` frames) zeroes
-// output frames at or past a row's valid count.  A padded frame's mel energy is
-// 0, whose log is a large negative constant rather than 0, so leaving the tail
-// unmasked hands the model real-looking energy in its padding.  It has to happen
-// *after* the log, which is why it lives here and not in the framing kernel.
-//
-// Layout:
-//   gridDim.x  = total_frames
-//   blockDim.x = 128 (4 warps); each warp computes one mel bin per pass via a
-//                warp-strided dot product, giving fully-coalesced reads of
-//                `mel_mat`.
-//   shared     = F floats (cached power spectrum).
+// Computes log(max(mel_mat @ power, log_floor) + log_offset). Floor and additive
+// guard remain separate because supported frontends use different silence
+// scales. Invalid frames are zeroed after log; otherwise padded silence becomes
+// a large negative feature value.
 __global__ inline void MelLogKernel(const float* __restrict__ power,
                                     const float* __restrict__ mel_mat,
                                     const int32_t* __restrict__ frame_lengths,

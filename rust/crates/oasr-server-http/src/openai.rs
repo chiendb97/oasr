@@ -62,18 +62,8 @@ enum Endpoint {
 }
 
 impl Endpoint {
-    /// The task to *send*, or `None` to leave the checkpoint's own.
-    ///
-    /// `/v1/audio/transcriptions` sends nothing. Transcription is what every
-    /// decode family does by default, so asserting `task=transcribe` would make
-    /// a plain upload carry an option that a family without a task control has
-    /// to reject — turning "transcribe this file" into a 400 on a CTC engine.
-    /// The absence of a `task` field in the request means "the default", not
-    /// "explicitly transcribe".
-    ///
-    /// `/v1/audio/translations` is the opposite: translation *is* the request,
-    /// so a family that cannot do it must say so rather than transcribe and
-    /// call the result a translation.
+    /// Transcription leaves the engine default unset; translation is explicit so
+    /// unsupported families reject it instead of silently transcribing.
     fn task(self) -> Option<&'static str> {
         match self {
             Endpoint::Transcriptions => None,
@@ -336,10 +326,8 @@ impl AudioForm {
 
 /// One segment of a `verbose_json` response.
 ///
-/// OASR emits exactly one, spanning the utterance: no decode family produces
-/// segment boundaries today. The fields it cannot compute are **omitted**
-/// rather than defaulted — a `no_speech_prob` of 0.0 that was never measured is
-/// a number a client will act on.
+/// One utterance-wide segment. Unavailable measurements are omitted, not
+/// replaced by actionable-looking defaults.
 #[derive(Debug, Serialize)]
 struct VerboseSegment {
     id: u32,
@@ -614,12 +602,8 @@ async fn handle_audio(State(s): State<AppState>, form: Multipart, endpoint: Endp
 
 /// Serve one transcription as SSE, in OpenAI's `transcript.text.*` shape.
 ///
-/// The engine's partials carry the transcript *so far*, while the protocol
-/// wants the increment, so each delta is the suffix the partial added.  A
-/// partial that rewrites rather than extends (the frame-synchronous families
-/// revise a beam) yields no delta: the client's running concatenation then lags
-/// the truth instead of contradicting it, and `transcript.text.done` — which
-/// always carries the complete text — settles it.
+/// Convert cumulative engine partials to suffix deltas. Rewritten hypotheses
+/// emit no delta; the final event always supplies the authoritative full text.
 async fn stream_transcription(
     s: AppState,
     audio: Bytes,

@@ -50,7 +50,7 @@ class StreamingEncoderBackend(ABC):
     #: (:class:`~oasr.cache.block_pool.BlockPool`).  Declared rather than inferred
     #: because it decides two engine-level questions before the backend exists:
     #: whether a :class:`~oasr.cache.types.CacheConfig` is built at all, and
-    #: whether ``EngineConfig.max_num_blocks=None`` has anything to derive (H4).
+    #: whether ``EngineConfig.max_num_blocks=None`` has anything to derive.
     #: A recurrent-state runtime allocates its caches per request and needs
     #: neither, so probing VRAM for it would be work — and a possible startup
     #: failure — over a pool nothing will build.

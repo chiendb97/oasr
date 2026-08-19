@@ -150,21 +150,8 @@ class WenetConverter(BaseCheckpointConverter):
     :meth:`ConformerModel.load_weights`.
     """
 
-    #: Weight-drop accounting (read by the registry after ``load_weights``):
-    #: nothing in a WeNet dir is *expected* to be dropped silently.  The U2++
-    #: (bi)transformer decoder loads as the ``ctc_aed_rescoring`` capability;
-    #: this hint only fires for decoder types OASR does not model (the
-    #: ``decoder.*`` weights are then dropped by ``load_weights``).
-    #: WeNet's ``ConformerEncoderLayer`` / ``DecoderLayer`` build
-    #: ``concat_linear`` unconditionally and only *use* it when
-    #: ``concat_after=True``, so a checkpoint trained with the default carries
-    #: the parameters unused.  Declaring them keeps a normal checkpoint quiet
-    #: (they were reported as two dozen "unrecognized tensors", and the
-    #: ``decoder.*`` ones fell through to the capability hint below, which then
-    #: wrongly announced that attention rescoring was unavailable).
-    #:
-    #: OASR does not implement ``concat_after``; ``build_config_from_wenet``
-    #: rejects a checkpoint that asks for it rather than silently ignoring it.
+    #: Upstream checkpoints create ``concat_linear`` even when unused. The
+    #: converter rejects configurations that enable unsupported ``concat_after``.
     expected_unused_prefixes: Tuple[str, ...] = ("concat_linear",)
     capability_drop_hints: Dict[str, str] = {
         "decoder.": (

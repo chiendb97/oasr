@@ -8,15 +8,12 @@
 
 using namespace oasr;
 
-// Baked-in config for this variant
 using Config = oasr::gemm::CutlassGemmConfigSm90<{{ tile_m }}, {{ tile_n }}, {{ tile_k }},
                                                   {{ cluster_m }}, {{ cluster_n }},
                                                   {{ k_sms }}, {{ stages }}, {{ sm_version }},
                                                   {{ 'true' if pingpong else 'false' }}>;
 
-// =============================================================================
-// Helper: map CUDA types to CUTLASS types
-// =============================================================================
+// Map CUDA types to CUTLASS types.
 
 namespace {
 
@@ -37,9 +34,7 @@ struct ToCutlassType<__nv_bfloat16> {
 
 }  // namespace
 
-// =============================================================================
 // BMM launcher: D[b] = A[b] @ B[b]
-// =============================================================================
 
 void {{ func_name }}(TensorView output, TensorView A, TensorView B) {
     CHECK_INPUT(A);

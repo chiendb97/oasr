@@ -95,8 +95,7 @@ impl PyEngine {
     /// `engine_worker._load_engine_config` did the same.
     pub fn new(engine_config_json: &str) -> Result<Self, PyEngineError> {
         Python::with_gil(|py| {
-            // Before anything else: the per-request option table must agree
-            // across the boundary, or options silently vanish (S9).
+            // Validate the cross-language option contract before loading an engine.
             assert_decoding_option_keys_match(py)?;
 
             // Parse the JSON into a Python dict using `json.loads` so we keep
@@ -244,18 +243,8 @@ impl PyEngine {
         Ok(())
     }
 
-    /// Bulk admission entry — calls `ASREngine.add_requests_batch_checked(list)`
-    /// in **one** Python method invocation across all `specs`.  GIL must already
-    /// be held; intended to be called by the dispatcher inside its tick's
-    /// `Python::with_gil` scope after draining contiguous admit envelopes.
-    ///
-    /// Returns one entry per spec, in order: `None` when that spec was admitted,
-    /// `Some(message)` when the engine rejected it.  A rejection is scoped to its
-    /// own request — the `_checked` Python entry point validates and admits per
-    /// spec instead of raising for the batch, so one client's bad `top_p` can no
-    /// longer error every request that happened to coalesce with it.  `Err` is
-    /// reserved for a genuinely batch-wide failure (the Python call itself
-    /// raising, e.g. an engine-level fault).
+    /// Admit all specs in one GIL-held Python call. Returns one optional rejection
+    /// per spec; `Err` is reserved for failures affecting the whole call.
     pub fn add_requests_batch_locked<'py>(
         py: Python<'py>,
         bound: &Bound<'py, PyAny>,
@@ -627,10 +616,8 @@ fn decoding_params_dict<'py>(
 
 /// Cross-check the per-request option table against Python, once, at startup.
 ///
-/// Silent drift is the failure mode S9 catalogued: a field added on one side
-/// only makes requests carrying that option accepted and ignored, with nothing
-/// logged at either end. One call turns that into a startup error naming the
-/// keys that disagree.
+/// A field added on only one side would otherwise be accepted and ignored.
+/// Checking once turns silent drift into a startup error naming the mismatched keys.
 pub fn assert_decoding_option_keys_match(py: Python<'_>) -> PyResult<()> {
     let request_mod = py.import_bound("oasr.engine.request")?;
     let options = request_mod.getattr("DecodingOptions")?;
@@ -641,29 +628,16 @@ pub fn assert_decoding_option_keys_match(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
-/// Set once the engine has told us it will not hand out pinned buffers, so a
-/// CPU engine (or one with the offer turned off) is asked exactly once instead
-/// of on every request.  Process-wide on purpose: whether host memory can be
-/// page-locked at all is a property of the process's CUDA context, not of one
-/// engine in the pool, and the *size* policy stays on the Python side where the
-/// memory lives (`EngineConfig.max_pinned_audio_seconds`).
+/// Avoid repeated pinned-buffer requests after the process reports them
+/// unavailable. Buffer-size policy remains engine-specific.
 static PINNED_AUDIO_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Materialise one offline request's PCM payload into the buffer the engine
 /// will DMA from.
 ///
-/// Preferred: `ASREngine.new_audio_buffer(n)` hands back **page-locked** host
-/// memory, so the copy below is the *only* copy of the waveform after the
-/// codec — the engine's `collate` can then DMA each row straight into the
-/// padded device batch instead of packing the micro-batch into staging first
-/// (measured 1.12-1.18x end-to-end offline).  We write through the tensor's
-/// `numpy()` view but hand the **tensor** on: PyTorch can only record the
-/// in-flight-copy event against the caching host allocator's block through the
-/// tensor whose storage it allocated, and an anonymous re-wrap of the same
-/// pages could be recycled under a live DMA.
-///
-/// Fallback: a plain numpy array on the Python heap, which is what this did
-/// before and what a CPU engine still gets.
+/// Prefer an engine-owned pinned tensor so collate can transfer it directly.
+/// Return that tensor, not a storage re-wrap, so its allocator tracks in-flight
+/// copies. Fall back to a plain array when pinned buffers are unavailable.
 fn offline_audio_to_py<'py>(
     py: Python<'py>,
     engine: &Bound<'py, PyAny>,

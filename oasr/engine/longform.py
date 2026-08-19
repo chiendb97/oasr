@@ -1,41 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Long-form decoding for fixed-window frontends (the real fix behind C5).
+"""Parallel long-form decoding for fixed-window frontends.
 
-``whisper_logmel`` — shared by Whisper and Qwen2-Audio — pads or trims every
-utterance to a fixed 30 s window.  Before C5 that trim was **silent**: a
-five-minute upload returned a transcript of its first thirty seconds with
-``finish_reason="stop"``, indistinguishable from a correct result.  C5 turned
-that into a clean rejection at admission, which is honest but still refuses work
-the model can do.
-
-This module does the work: a request longer than the window is **fanned out**
-into consecutive windows, each decoded as an ordinary request through the normal
-batched path, then **fanned in** to one output whose text is the windows joined.
-Both halves live at the engine boundary, so nothing in the executor, the
-scheduler, the strategies or the serving layer needs to know long-form exists —
-a caller sees one request id and one final output, and it works over HTTP and
-gRPC unchanged.
-
-Why parallel windows rather than HF's sequential loop
------------------------------------------------------
-OpenAI's reference implementation decodes windows **sequentially**, conditioning
-each on the previous window's text (``<|startofprev|>``) and advancing by the
-last decoded timestamp.  That is more accurate at boundaries, and it is
-fundamentally serial: window *i+1* cannot start until *i* finishes, so a
-five-minute file costs ten sequential decodes and the engine's batching — the
-entire reason this framework exists — cannot help.
-
-Windows here are independent, so all of them are in flight at once and a long
-file costs about as much wall-clock as its longest window.  The price is
-boundary accuracy: a word straddling a cut may be lost or duplicated.
-``overlap_seconds`` buys most of it back — adjacent windows share audio and
-:func:`merge_texts` drops the repeated text — and the sequential/conditioned
-variant remains available as future work behind the same seam (the tracker
-already sees windows in order).
-
-Trade-off stated rather than hidden: this is the batched approximation, chosen
-because a serving deployment cannot afford the serial one.
+Long requests are split into ordinary batched requests and merged at the engine
+boundary. Independent windows preserve batching but may lose or duplicate text
+at cuts; overlap and text deduplication reduce that boundary error.
 """
 
 from __future__ import annotations

@@ -262,12 +262,8 @@ fn alaw_to_i16(byte: u8) -> i16 {
 
 /// How the caller says the body is encoded.
 ///
-/// The split matters for sniffing: a caller that declared `Pcm` has told us
-/// there is no header, so only *unambiguous* container magic may override it
-/// (see [`crate::codec::Container::is_unambiguous`]).  A caller that said
-/// `Container` — the file-upload surfaces, which have no encoding field —
-/// gets the full sniff, and a body matching nothing is an error rather than a
-/// blob reinterpreted as PCM at a guessed rate.
+/// Declared PCM permits only unambiguous container overrides. Container input
+/// uses full sniffing and never falls back to a guessed raw format.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SourceEncoding {
     /// The body carries its own container header.
@@ -608,11 +604,7 @@ mod tests {
 
     // -- G.711 -----------------------------------------------------------
 
-    /// Codeword → sample pairs fixed by ITU-T G.711, cross-checked against
-    /// ffmpeg's `pcm_mulaw` / `pcm_alaw` decoders.  Note the inversion: µ-law
-    /// stores the complement, so `0x00` is *negative* full scale and both
-    /// `0x7F` and `0xFF` are zero.  Getting that backwards inverts every
-    /// telephony waveform, which no downstream check would catch.
+    /// G.711 reference points, including µ-law's complemented sign convention.
     #[test]
     fn mulaw_matches_the_g711_reference_points() {
         assert_eq!(mulaw_to_i16(0x7F), 0); // -0

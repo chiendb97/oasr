@@ -1,49 +1,10 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""OASR Accuracy Benchmark — WER/CER against ground truth, with speed alongside.
+"""Measure WER or CER alongside engine throughput.
 
-The companion to ``bench_engine.py``: that one answers "how fast", this one
-answers "how correct", and a row here carries both so the trade is visible in
-one table.  Every accuracy-affecting change before this had to hand-build a
-transcript comparison and throw it away.
-
-Manifests, not audio
---------------------
-A manifest is JSON Lines, one utterance per line::
-
-    {"id": "LJ001-0001", "audio": "LJ001-0001.wav", "text": "printing in the ..."}
-
-``audio`` is resolved against ``--audio-root``, so a manifest is a few tens of
-KB of text that anyone can check in while the corpus stays on disk.  Build one
-for a corpus you have with ``--build-manifest``.
-
-Examples
---------
-    # WER on the shipped 200-utterance LJSpeech subset
-    python benchmarks/bench_accuracy.py \\
-        --ckpt-dir  $CKPT_DIR \\
-        --manifest  benchmarks/manifests/ljspeech_200.jsonl \\
-        --audio-root $AUDIO_DIR
-
-    # Sweep decode methods, write a CSV
-    python benchmarks/bench_accuracy.py --ckpt-dir $CKPT_DIR \\
-        --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $AUDIO_DIR \\
-        --decode-method ctc ctc_aed_rescoring --dtype float16 float32 \\
-        --output-path accuracy.csv
-
-    # Offline vs. streaming on one table, and the chunk-size trade within streaming
-    python benchmarks/bench_accuracy.py --ckpt-dir $CKPT_DIR \\
-        --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $AUDIO_DIR \\
-        --service-mode offline streaming --chunk-size 8 16 32
-
-    # CER for a Chinese model
-    python benchmarks/bench_accuracy.py --ckpt-dir $OASR_PARAFORMER_CKPT \\
-        --manifest my_zh.jsonl --audio-root /data/zh --metric cer --normalizer basic
-
-    # Turn a corpus into a manifest (LJSpeech metadata.csv, or a dir of .txt/.lab)
-    python benchmarks/bench_accuracy.py --build-manifest out.jsonl \\
-        --audio-root $AUDIO_DIR --transcripts $AUDIO_DIR/../metadata.csv --limit 200
+Input is a JSONL manifest whose audio paths resolve below ``--audio-root``.
+The CLI can also build manifests from common transcript layouts.
 """
 
 from __future__ import annotations
@@ -64,8 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from oasr.testing.accuracy import Entry, load_audio, load_manifest, transcribe  # noqa: E402
 from oasr.testing.wer import Result, compute, normalizer  # noqa: E402
 
-# One row per (model, decode_method, dtype, batch size) — the shape the review
-# asked for, and the shape a published accuracy-and-speed table needs.
+# One row per model, decode method, dtype, and batch size.
 CSV_COLUMNS = [
     "manifest",
     "ckpt",
@@ -277,9 +237,7 @@ def run_one(
         "dtype": torch_dtype,
         "max_batch_size": max_batch_size,
     }
-    # Only for an explicit-only converter (``transducer``): an icefall RNN-T dir
-    # sniffs as ``zipformer``, so without this the sweep silently measures the
-    # CTC branch — or fails on a transducer-only export.
+    # Preserve explicit architecture selection for ambiguous checkpoint layouts.
     if architecture:
         cfg_kwargs["architecture"] = architecture
     if decode_method:
@@ -543,11 +501,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             ),
                         )
                     except Exception as exc:  # noqa: BLE001 — a sweep must not lose earlier rows
-                        # Not every configuration is supported by every model — the
-                        # conformer's conv2d is fp16/bf16 only, for instance, and an
-                        # offline-only encoder refuses `--service-mode streaming`.
-                        # Report it and carry on rather than discarding rows already
-                        # measured, which is the point of running a sweep at all.
+                        # Unsupported sweep cells are reported without discarding
+                        # rows already collected.
                         msg = f"{label}: {type(exc).__name__}: {exc}".splitlines()[0]
                         print(f"       FAILED — {msg}", flush=True)
                         failures.append(msg)

@@ -70,35 +70,12 @@ __all__ = [
 #: upstream writes ``float("-inf")``, and the difference is not cosmetic.
 #:
 #: Masking is exact either way: this bias is added after the softmax scale, the
-#: real logits here reach ~±120, and ``exp(-1e4 - 120)`` underflows to *exactly*
-#: zero in fp32.  What the finite form avoids is a defect in the fused CuteDSL
-#: attention kernel — with ``-inf`` in ``attn_bias`` it is accurate only while the
-#: **finite** part of the bias stays small, and this model's Transformer-XL bias
-#: does not.  Measured on an RTX 5090, fp16, ``B3 H8 T122 D128``, a 38%-dense
-#: ``chunked_limited`` mask, error against an fp32 SDPA reference:
+#: real logits stay far above this floor, and the masked exponent underflows to
+#: zero.  The finite form avoids a fused-attention accuracy defect when an
+#: infinite mask is combined with a large finite relative-position bias.
 #:
-#: ============  ==============  ==========  =========
-#: bias range    floor           fused       SDPA fp16
-#: ============  ==============  ==========  =========
-#: ±10           ``-inf``        0.00086     0.00086
-#: ±20           ``-inf``        0.00093     0.00081
-#: **±40**       ``-inf``        **1.365**   0.00066
-#: **±80**       ``-inf``        **1.494**   0.00090
-#: ±40           ``-1e4``        0.00066     0.00066
-#: ±80           ``-1e4``        0.00090     0.00090
-#: ============  ==============  ==========  =========
-#:
-#: End to end that was worth 0.69 of absolute error on the encoder output (vs
-#: 0.004-0.02 for HF's own fp16 run) and two truncated transcripts in the
-#: LJSpeech-200 gate.  Conformer passes ``-inf`` too — ``mask_to_bias``'s
-#: ``-1e10`` overflows to it in fp16 — and is unaffected only because its
-#: rel-pos bias is an order of magnitude smaller.  The kernel-side fix is
-#: tracked in ``.artifacts/known_issues.md``; until it lands, a large finite
-#: floor is the form to pass.
-#:
-#: A second, smaller reason to prefer it: a *fully* masked query row softmaxes
-#: over a uniform floor and comes back finite, where ``-inf`` gives SDPA a NaN
-#: row that ``0 * NaN`` then spreads to real rows in the next layer.
+#: A fully masked query row also stays finite; an infinite mask can produce a NaN
+#: row that later arithmetic spreads into valid rows.
 MASK_FLOOR = -1.0e4
 
 

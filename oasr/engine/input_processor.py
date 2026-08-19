@@ -122,7 +122,7 @@ class InputProcessor:
         self._device = device
         self._feature_config: FeatureConfig = config.feature_config  # type: ignore[assignment]
         # Resolve the frontend once, through the feature registry, so the batch
-        # path stays architecture-agnostic (F1).  Raises here — at engine
+        # path stays architecture-agnostic.  Raises here — at engine
         # construction — for an unregistered ``feature_type`` rather than on the
         # first request.
         self._extractor = build_extractor(self._feature_config)
@@ -131,23 +131,12 @@ class InputProcessor:
         # business paying.
         self._streaming_framing: Optional[StreamingFraming] = None
 
-        # Offline collate staging buffers, reused across micro-batches so the
-        # slow allocations (``cudaHostAlloc`` for pinned host, device malloc)
-        # are paid once and grown geometrically.
-        #   ``_wav_flat``   — pinned **host** 1-D buffer holding the batch's
-        #                     waveforms packed end-to-end (no padding).  The
-        #                     only CPU-side copy in collate; a single async
-        #                     H2D ships it to the device.
-        #   ``_wav_padded`` — **device** 1-D buffer, viewed as ``(B, T_max)``,
-        #                     into which the packed waveforms are scattered.
-        #                     Zero-padding and the audio-scale multiply both
-        #                     run here on the GPU (see :meth:`collate`).
+        # Geometrically grown offline staging: packed pinned host samples and a
+        # padded device buffer. This keeps collate to one host copy and one H2D.
         self._wav_flat: Optional[torch.Tensor] = None
         self._wav_padded: Optional[torch.Tensor] = None
-        # Streaming staging (M5) — grow-once, so a step does not page-lock.
-        # **Double-buffered and event-retired**: unlike the offline pair above,
-        # these are read by an async H2D on a *separate* stream and rewritten by
-        # the next engine step, so reuse has to be ordered explicitly.
+        # Streaming staging is event-retired because a separate stream reads it
+        # asynchronously while later engine steps prepare new input.
         self._stream_slots: List[_StreamStagingSlot] = [
             _StreamStagingSlot() for _ in range(_STREAM_STAGING_SLOTS)
         ]
@@ -155,10 +144,7 @@ class InputProcessor:
         # Read-only zero run the ragged rows of a streaming step pad with, so a
         # short row is one more ``cat`` source rather than a separate zero fill.
         self._stream_pad: Optional[torch.Tensor] = None
-        # Ceiling on a *retained* staging buffer, in float32 elements (M4).
-        # Default 256 Mi elements = 1 GiB, comfortably above
-        # ``max_batch_size`` x a full-length utterance at 16 kHz; a batch past
-        # it allocates per call rather than pinning that much for good.
+        # Oversized batches allocate per call rather than retaining excess memory.
         self._max_staging_elems = int(getattr(config, "max_staging_elems", None) or (256 << 20))
         # Largest request :meth:`new_audio_buffer` will page-lock, in samples;
         # ``0`` declines everything (CPU engine, or the knob turned off).
@@ -669,9 +655,8 @@ class InputProcessor:
         request.audio_chunks = deque()
         # The buffer starts with the frontend's implicit left padding rather than
         # empty: a centered STFT's frame 0 begins ``n_fft // 2`` samples *before*
-        # the signal, and NeMo's signal-domain pre-emphasis reaches one sample
-        # further still.  Kaldi declares ``prefill = 0`` and gets the old
-        # zero-length tail, unchanged.
+        # the signal.  Signal-domain pre-emphasis may require one additional
+        # sample; frontends without implicit history declare ``prefill = 0``.
         request.audio_tail = torch.zeros(framing.prefill, dtype=torch.float32)
         request.audio_final = False
         request.num_frames = 0

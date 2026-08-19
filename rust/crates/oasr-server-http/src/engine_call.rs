@@ -73,13 +73,8 @@ pub fn error_from_event_code(code: ErrorCode) -> (StatusCode, &'static str) {
 
 /// Submit one fully-buffered utterance and await its terminal event.
 ///
-/// `audio` is f32-LE mono at `sample_rate`, already the engine's own rate.
-/// The pool slot is released before returning, on every path.
-///
-/// `metrics` names the API surface this request arrived on.  It is a parameter
-/// rather than something derived here because this function is what makes the
-/// two HTTP shapes one code path — the surface is the only thing that still
-/// differs, so it is the only thing that has to be passed.
+/// `audio` is f32-LE mono at the engine rate. Releases the pool slot on every
+/// path; `metrics` identifies the calling API surface.
 pub async fn submit_offline_and_wait(
     state: &AppState,
     audio: Bytes,

@@ -80,21 +80,9 @@ tokenizers = [
     "tokenizers>=0.15.0",
 ]
 attention = [
-    # CuTeDSL, which compiles the fused-attention kernels under
-    # oasr/kernels/cute/.  Genuinely optional: with it missing, the default
-    # OASR_ATTN_BACKEND=auto logs a warning and oasr.fmha runs on PyTorch
-    # SDPA, so `import oasr` and every non-attention kernel are unaffected.
-    #
-    # Floor is the oldest release the kernels resolve against (see
-    # oasr/jit/attention.py::MIN_CUTEDSL_VERSION); 4.6.1 is what is tested.
-    # 4.6.0 deleted cute.make_fragment and cute.core.ThrMma/ThrCopy, and
-    # nothing here used them, so the whole range works.  Capped below 5 because
-    # a major bump is where CuTeDSL removes long-deprecated APIs.
-    #
-    # NB: installing this pulls protobuf>=6.30 for the (unused, beta) IKET
-    # profiler.  On an environment pinned to protobuf 4.x — e.g. one whose
-    # grpcio-tools generates the _pb2 modules scripts/grpc_stream.py imports —
-    # install it with --no-deps and let the DSL's own wheels resolve.
+    # Optional fused-attention compiler; auto mode falls back when absent. The
+    # range matches verified APIs and avoids unreviewed major-version changes.
+    # Use --no-deps when an environment must retain an older protobuf.
     "nvidia-cutlass-dsl>=4.5.2,<5",
 ]
 dev = [
@@ -175,14 +163,8 @@ combine_as_imports = true
 force_sort_within_sections = false
 
 [tool.mypy]
-# Deliberately no `python_version`: it applies to third-party *stubs* too, and
-# pinning it below the interpreter makes mypy abort on any dependency whose
-# stubs use newer syntax — numpy's `.pyi` uses PEP 695 `type` statements, so
-# `python_version = "3.10"` died with "Type statement is only supported in
-# Python 3.12 and greater" before checking a single line of this repo (and
-# `"3.8"` died the same way on torch's match statements).  mypy therefore runs
-# at the interpreter's version; CI pins that to 3.12.  Real 3.10 compatibility
-# is covered by test-cpu.yml actually running the suite on 3.10.
+# Use the interpreter version so newer dependency stubs remain parseable.
+# Runtime CI separately covers Python 3.10 compatibility.
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true

@@ -302,7 +302,6 @@ class TestConv2D:
             dilation_w=dilation_w,
         )
 
-        # Check output shape
         P = (H + 2 * pad_h - dilation_h * (R - 1) - 1) // stride_h + 1
         Q = (W + 2 * pad_w - dilation_w * (S - 1) - 1) // stride_w + 1
         assert output.shape == (N, P, Q, K)

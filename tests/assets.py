@@ -1,42 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Registry of the external assets the test suite gates on.
+"""Single registry and skip gate for external test assets.
 
-``pytest tests/`` used to report a fully green suite while silently skipping
-every real-checkpoint test: the gating env vars were read ad hoc in a dozen
-modules, each with its own default path and its own ``pytest.skip`` string, and
-pytest's summary does not distinguish "passed" from "skipped because the
-checkpoint was not on this box".  A green run was not evidence of anything.
-
-This module makes that visible and, on demand, fatal:
-
-* every gated asset is **declared once** here, with the marker file that proves
-  it is really present (an HF snapshot of dangling LFS symlinks is not);
-* :func:`require` is the single skip site, so the reason string is uniform and
-  every skip is *counted*;
-* the counts are printed at the end of every run — see ``conftest.py`` — so a
-  local run says how much it did not check;
-* ``--strict-assets`` turns those skips into failures, which is what CI runs.
-  Assets the runner genuinely cannot have are named one by one with
-  ``--allow-missing-asset NAME``, so the gap is in the workflow file rather
-  than hidden in a skip.
-
-Add an asset by adding an :class:`Asset` to :data:`ASSETS`; nothing else needs
-to change.
-
-Where the paths come from
--------------------------
-No machine-specific path is baked into the checkout.  An asset resolves from
-its own env var (``CKPT_DIR``, ``WHISPER_CKPT``, ...), which is what CI sets.
-For a box that keeps everything under one tree, ``$OASR_ASSET_ROOT`` plus the
-per-asset :attr:`Asset.relpath` resolves the whole set from a single variable::
-
-    export OASR_ASSET_ROOT=/srv/asr-assets   # holds u2pp_conformer/, wavs/, ...
-
-That reference layout is the one ``ci/modal_app.py`` seeds into the CI Volume,
-so the same tree uploads without renaming.  :attr:`Asset.default` is reserved
-for assets that are *not* machine-specific — upstream source trees a test
-docstring tells you to check out to a fixed place.
+Assets resolve from their own environment variable or ``OASR_ASSET_ROOT``.
+Marker files reject incomplete assets. Missing assets are counted, and strict
+mode turns skips into failures.
 """
 
 from __future__ import annotations

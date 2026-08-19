@@ -47,15 +47,8 @@ class SentencePieceTokenizer(Tokenizer):
         return self._special_ids
 
     def decode(self, ids: Sequence[int]) -> str:
-        # Ids at or above the piece count are dropped alongside the special
-        # ids. A CTC head is commonly padded to a GEMM-friendly width -- the
-        # icefall zipformer-large release has ``ctc_lo`` of 504 rows against a
-        # 500-piece bpe.model -- so the search space legitimately contains
-        # classes that are not pieces. They should never win on real audio, but
-        # on silence or noise one can, and SentencePiece answers a padding id
-        # with ``Out of range: piece id is out of range``. Raising there would
-        # turn a junk frame into a failed request (and, under the batched
-        # admit path, take its batch-mates with it), so drop them instead.
+        # Padded output heads may emit ids beyond the tokenizer vocabulary on
+        # degenerate input; discard them instead of failing the request.
         n = self.vocab_size
         filtered = [int(t) for t in ids if t not in self._special_ids and 0 <= int(t) < n]
         if not filtered:

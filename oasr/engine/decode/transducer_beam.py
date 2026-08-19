@@ -1,44 +1,11 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Batched modified beam search for the transducer decode family.
+"""Batched modified beam search with at most one symbol per frame.
 
-This is icefall's ``modified_beam_search`` — the variant that emits **at most one
-symbol per encoder frame** — batched over utterances *and* beam width so a whole
-micro-batch advances in one set of kernels per frame.  It is the practical RNNT
-beam: full ALSD's variable emissions-per-frame make the per-frame hypothesis set
-ragged, which is exactly what stops it from vectorizing, while the modified
-variant keeps a fixed ``(B, k)`` grid throughout.
-
-Per frame, for every one of the ``B * k`` live hypotheses:
-
-1. run the stateless predictor over its label window and join with the frame,
-2. add ``log_softmax`` over the vocabulary to the hypothesis score,
-3. take the top ``k`` over the flattened ``(k, V)`` grid **per utterance**,
-4. blank keeps the parent's label window; a real token shifts it and appends.
-
-Two design points worth keeping:
-
-**Hypothesis tokens live on the device.** The obvious implementation keeps a
-Python ``list`` per hypothesis and reorders them by the parent indices each
-frame, which is ``B * k`` list copies per frame — Θ(T²) over an utterance.  A
-padded ``(B, k, cap)`` int64 tensor plus a length makes the reorder one
-``gather`` and the append one ``scatter_``.
-
-**Blank writes and then doesn't advance.** Appending is unconditional: a blank
-transition writes its token at ``tok_len`` but leaves ``tok_len`` alone, so the
-next real token overwrites it.  That removes a mask from the hot path, and the
-index is always in bounds because at most one symbol is emitted per frame, so
-``tok_len <= t`` when frame ``t`` writes.
-
-Relationship to greedy: with ``max_sym_per_frame = 1``, greedy decoding *is*
-beam search at ``k = 1`` — both take the argmax and advance.  That identity is
-the exactness gate in ``tests/test_transducer.py``; there is no reference
-implementation to diff against otherwise, and a beam search that silently
-disagrees with greedy at ``k=1`` is broken in a way WER on random weights would
-never show.
-
-Hypothesis merging (log-adding the scores of two beam entries that spell the same
-token sequence) is **not** implemented; see :func:`beam_search_step`.
+A fixed ``(B, beam)`` grid keeps tokens and reordering on the device. Blank
+writes do not advance the token length, so the next emitted token overwrites
+them. Beam size one must exactly match one-symbol greedy decoding. Equivalent
+hypotheses are not merged.
 """
 
 from __future__ import annotations

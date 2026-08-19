@@ -1,45 +1,11 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Per-token acoustic alignments → word timings, shared by every decode family.
+"""Convert family-specific token alignments into shared word timings.
 
-Where a token's span *comes from* is per-family and genuinely different — a CTC
-Viterbi alignment, a transducer's emitting frame, Paraformer's CIF fire
-positions, Whisper's cross-attention DTW.  What happens to it afterwards is not:
-frames become seconds, tokens become words, posteriors become word and utterance
-confidences.  That second half lives here so a new family only has to produce
-:class:`TokenAlignment` values.
-
-Two conventions make the shared half work for every tokenizer in the tree.
-
-**Frames, not seconds, cross the boundary.**  A strategy reports *encoder*
-frame indices; :class:`FrameClock` converts.  The conversion needs the feature
-hop, the LFR decimation and the encoder's own subsampling — three numbers that
-are already declared (``FeatureConfig.frame_shift_ms`` / ``lfr_n`` and
-``BaseEncoder.subsampling_rate``) and that no strategy should be restating.
-
-**Words are cut out of the transcript, not reassembled from pieces.**  The
-grouping asks the tokenizer for :meth:`~oasr.tokenizers.Tokenizer.token_pieces`,
-whose contract is that the pieces concatenate to exactly what ``decode``
-returns, and then splits that string.  So every emitted word is a literal
-substring of ``RequestOutput.text``, in order — which is the property a caption
-renderer, a redaction pass and a subtitle muxer all actually depend on, and
-which joining per-token pieces would break for every kind here (sentencepiece
-``▁``, byte-BPE ``Ġ``, FunASR's ``@@`` merges and CJK spacing all depend on
-neighbours).
-
-**This runs on the decode path, so the rule itself is in C++.**  Emission
-frames to spans, spans to words, the aggregations — all of it is
-``csrc/alignment/word_timings.cc``, bound as ``oasr._C.alignment``, and this
-module is the marshalling around it: one call per hypothesis instead of an
-interpreter operation per token and per character, on the thread that holds the
-GIL for every request the engine finishes.  Written the obvious way round in
-Python first, the grouping cost more than the CTC decode it was decorating.
-
-There is no Python implementation to fall back to and no switch to select one.
-A fallback here is a slow path a deployment can land on without noticing — one
-costing more per request than the decode — so the rule exists once.  It is
-still checked against a Python statement of itself, but that oracle lives in
-``tests/test_alignment_cpp.py``, where nothing at runtime can reach it.
+Strategies report encoder-frame spans; :class:`FrameClock` converts them to
+time. Words are sliced from rendered text so they remain literal substrings.
+Grouping runs only in the compiled extension to keep per-token Python off the
+decode path; tests contain the independent Python oracle.
 """
 
 from __future__ import annotations
@@ -64,11 +30,7 @@ __all__ = [
 ]
 
 
-#: The compiled implementation.  ``None`` only where the extension is absent or
-#: predates this module — ``pip install -e .`` always builds it, so nothing
-#: below defends against the ``None``; resolution is tolerant purely so
-#: ``import oasr`` keeps working without a build, which ``test-cpu.yml`` needs
-#: and a stale ``.so`` from an older tree would otherwise break.
+#: Optional at import time so CPU-only environments can import the package.
 try:
     from oasr import _C  # type: ignore[attr-defined]
 

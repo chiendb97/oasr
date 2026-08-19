@@ -62,48 +62,14 @@ if TYPE_CHECKING:
     from .detokenize import Detokenizer
 
 
-#: Greedy iterations between host-side termination checks (H7).
-#:
-#: The loop used to sync **twice** per iteration — once on ``active.any()`` to
-#: decide whether to stop, once on ``emit.any()`` to decide whether to recompute
-#: the predictor — so a 400-frame utterance cost ~800+ blocking device→host round
-#: trips.  Checking termination every N iterations instead trades up to N-1 inert
-#: iterations (one joiner call each, mutating nothing) for N-1 fewer syncs.
-#:
-#: 16 is comfortably past the point where the remaining ``emit.any()`` sync
-#: dominates the count, so a larger stride buys nothing measurable while the
-#: worst-case overshoot grows linearly.  Measured on a 12-layer / d=256 /
-#: vocab-500 transducer, fp16, against the two-sync loop — token-identical at
-#: every shape:
-#:
-#: ===============  ==========  ===============  ===============
-#: shape            tokens/fr   syncs (before)   speedup (after)
-#: ===============  ==========  ===============  ===============
-#: B=1  T=400       0.01        807 → 442        1.11x
-#: B=8  T=400       0.04        863 → 459        1.09x
-#: B=32 T=400       0.06        887 → 476        1.09x
-#: B=32 T=400       3.68        4203 → 2244      1.09x
-#: B=32 T=1500      3.75        14953 → 7956     1.05x
-#: ===============  ==========  ===============  ===============
-#:
-#: The review also proposed dropping the ``emit.any()`` sync (recompute the
-#: predictor unconditionally — semantically identical, since a non-emitting row's
-#: window is left untouched by the ``torch.where`` and so reprojects to the same
-#: value).  Measured, that is **regime-dependent and wrong for real audio**: 1.2x
-#: faster when nearly every frame emits, but **0.59x** — a 1.7x regression — on
-#: blank-dominated audio, which is what a trained transducer actually produces.
-#: The branch skips a real predictor forward, not merely a host round trip.
+#: Greedy iterations between termination checks. Batching checks reduces host
+#: synchronization; 16 bounds inert overshoot. Keep the emission check because
+#: it avoids unnecessary predictor forwards on blank-dominated inputs.
 _TERMINATION_CHECK_STRIDE = 16
 
 
 def _unzip_marks(marks: Sequence[Tuple[int, float]]) -> Tuple[List[int], List[float]]:
-    """``(frame, posterior)`` pairs → the two parallel lists the alignment takes.
-
-    The greedy loop collects the two together because they come off the same
-    step.  The span rule itself is shared with the CTC path — both go through
-    ``attach_emission_alignment`` — so the two frame-synchronous families cannot
-    describe a span differently.
-    """
+    """Split ``(frame, posterior)`` pairs for the shared alignment pass."""
     return [f for f, _ in marks], [p for _, p in marks]
 
 
@@ -134,7 +100,7 @@ class _Session:
     #: Only populated for a stream that asked for word timings — the greedy
     #: loop's tracking is opt-in per launch.
     marks: List[Tuple[int, float]] = field(default_factory=list)
-    #: Incremental-detokenization state (T3).  Greedy transducer decode only
+    #: Incremental-detokenization state.  Greedy transducer decode only
     #: appends to ``hyp``, so a partial decodes just the new ids rather than
     #: re-rendering the whole transcript every chunk.
     detok: Dict[str, Any] = field(default_factory=dict)

@@ -1,36 +1,10 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""
-Compile an HLG decoding graph from H, L, and G.
+"""Compose H, L, and G into an HLG decoding graph.
 
-    HLG = H ∘ L ∘ G
-
-where:
-  - H  = CTC topology (built via ``k2.ctc_topo(max_token_id)``)
-  - L  = Lexicon transducer (loaded from ``{lang_dir}/L_disambig.pt``)
-  - G  = N-gram language model (loaded from ``{lm_dir}/{lm}.fst.txt`` or
-         the pre-compiled ``{lm_dir}/{lm}.pt``)
-
-Adapted from the Icefall AISHELL recipe:
-  egs/aishell/ASR/local/compile_hlg.py
-
-No dependency on the ``icefall`` Python package.
-
-Usage::
-
-    # Convert ARPA LM to OpenFst text format first (requires kaldilm):
-    python -m kaldilm \\
-        --read-symbol-table="data/lang_char/words.txt" \\
-        --disambig-symbol='#0' \\
-        --max-order=3 \\
-        data/lm/G_3_gram.arpa > data/lm/G_3_gram.fst.txt
-
-    # Compile HLG:
-    python scripts/compile_hlg.py \\
-        --lang-dir data/lang_char \\
-        --lm G_3_gram \\
-        --lm-dir data/lm
+Loads the prepared lexicon and language-model FSTs and writes a compiled graph.
+Requires k2; use ``--help`` for input paths.
 """
 
 import argparse

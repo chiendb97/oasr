@@ -1,40 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Nemotron ASR (FastConformer + RNN-T) tests.
+"""Nemotron structure, frontend, streaming, and checkpoint parity tests.
 
-Four tiers, deliberately separated by what each one can actually prove:
-
-**Structure, no checkpoint** — the pieces that are easy to get subtly wrong and
-whose wrongness a parity test would hide behind a tolerance: the Transformer-XL
-relative shift, the ``chunked_limited`` window, the LSTM predictor's protocol,
-and the fact that the start-of-sequence state is *not* zeros.
-
-**Streaming equals offline, no checkpoint** — a chunked pass against a
-whole-utterance one on random weights, fp32, CPU, with ``rtol=0``.  Every cache in
-the streaming path is a *replacement for padding an offline pass applies*, so
-equality is the right bar and a tolerance would hide exactly the failures worth
-catching: a stride-grid phase shift, a mis-sized left context, a position table
-built for the wrong length.  This tier does not need the real checkpoint and it is
-where a regression will be diagnosable.
-
-**Frontend parity** — the ``nemotron_logmel`` recipe against HuggingFace's own
-feature extractor.  Bit-exact once the mel filterbank is the same table, which is
-worth pinning separately: a feature-convention bug cancels in every downstream
-parity test (both sides get the same features) and only shows up as WER.  That is
-how the ``audio_scale`` defect shipped.
-
-**Real-checkpoint parity** — encoder tensors and greedy *token ids* against
-``transformers``, then the engine end to end in both service modes.  Token
-exactness is the strong claim here; the tensor comparisons are what localise a
-failure when it breaks.  The streaming class compares *words* rather than exact
-strings against the offline engine, and says why: sentence-final punctuation is
-allowed to differ, because offline uniquely produces the encoder frame its
-utterance-end right pad creates while a stream's equivalent frames see the
-finalize silence pad instead.
-
-The end-to-end accuracy numbers live in ``ci/wer-reference.json`` — one entry per
-service mode, on the same manifest and denominator — and are checked by
-``tests/test_accuracy.py``, not here.
+Random-weight tests pin cache and framing behavior exactly. Checkpoint tests
+compare encoder tensors and greedy token IDs; end-to-end accuracy is covered by
+``test_accuracy.py``.
 """
 
 from __future__ import annotations
@@ -655,19 +625,8 @@ class TestFrontendGeometry:
             # The last frame needs right context and arrives with the engine's
             # finalize silence pad, so streaming is one short mid-stream.
             assert m >= n_valid - 1
-            # Tolerance, not equality: the offline side is one STFT over the whole
-            # utterance and the streaming side is many short ones, so the mel
-            # matmul is a differently-shaped reduction on each and their summation
-            # order need not agree.  On CPU the split also depends on the intra-op
-            # thread count, i.e. on how many cores the runner happens to have —
-            # this assertion was `rtol=0, atol=0` and passed locally and on one
-            # GitHub runner while failing on the next by 9.5e-07.
-            #
-            # 1e-4 is chosen against the thing the test exists to catch: a drift
-            # in the framing grid.  Measured on this input, one frame of
-            # misalignment moves a value by 0.98 on average and 10.2 at worst,
-            # four orders of magnitude above the arithmetic noise, so the bound
-            # sits ~100x above the noise and ~10,000x below a real drift.
+            # Offline and streaming STFTs reduce differently, so allow arithmetic
+            # noise while keeping tolerance far below a one-frame alignment error.
             torch.testing.assert_close(got[:m], offline[0, :m], rtol=1e-4, atol=1e-4)
 
     def test_feature_spec_round_trips_and_maps(self):

@@ -356,42 +356,11 @@ def test_fmha_finite_mask_floor_stays_finite(fmha, cuda, dtype, mask_floor):
 
 
 class TestInfiniteMaskFloorWithALargeBias:
-    """The other end of the mask-floor question: ``-inf`` plus a *large* bias.
+    """Large finite biases require the finite mask floor.
 
-    ``test_fmha_finite_mask_floor_stays_finite`` above covers a large finite
-    floor.  ``-inf`` is the form upstream HuggingFace models write, and it is
-    accurate here only while the **finite** part of the bias stays small.  Found
-    via Nemotron's Transformer-XL relative-position bias, which reaches ~±120: the
-    fp16 encoder output came out 0.69 off an fp32 reference (HF's own fp16 run:
-    0.004-0.02) and two LJSpeech-200 transcripts were truncated mid-word.
-
-    Measured boundary on an RTX 5090, fp16, ``B3 H8 T122 D128``, 38%-dense mask,
-    error against fp32 SDPA — accurate to ±20, broken from ±40:
-
-    ========  ==========  =========
-    range     fused       SDPA fp16
-    ========  ==========  =========
-    ±20       0.00093     0.00081
-    ±40       **1.365**   0.00066
-    ±80       **1.494**   0.00090
-    ========  ==========  =========
-
-    It is **not** the bias magnitude alone, and it is not the K remainder: at the
-    same magnitude and density a *banded* mask is accurate at every ``T`` tried
-    (122 / 128 / 120 / 130 / 192).  Narrowed to one query row at a time — at
-    ``B=1`` exactly **one** row of 122 is wrong (0.46 absolute), and it is a row
-    whose window leaves only **4** unmasked keys out of 122, so the online
-    softmax rescales across ~2 entirely-``-inf`` K-blocks while carrying a large
-    finite row max.  Neighbouring rows with the same 4 keys are fine, i.e. it is
-    a numerical coincidence in that bookkeeping rather than a structural
-    mis-index.  In the real encoder that one bad row per layer spreads over 24
-    layers and the convolution's left context, which is how it reached 0.69 at
-    the output.  Same family as the finite-floor bug fixed in ``08c12cc``.
-
-    The finite-floor arm below is the property the Nemotron model *depends on*
-    (``oasr.models.nemotron.encoder.MASK_FLOOR``), so it is a hard assertion; the
-    ``-inf`` arm is a strict xfail, which fails the suite when the kernel is fixed
-    so the workaround and this note get removed together.
+    Sparse rows can make fused softmax inaccurate when ``-inf`` is combined with
+    a large finite bias. The finite-floor arm is required behavior; the strict
+    xfail makes removal of the workaround explicit when the kernel is fixed.
     """
 
     @staticmethod

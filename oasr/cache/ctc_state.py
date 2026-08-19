@@ -27,36 +27,10 @@ from oasr.ctc_decode import (
 
 
 class CtcStateCacheManager:
-    """Manages per-stream CTC decoder GPU state with state pooling.
+    """Pool per-stream state behind one shared streaming decoder.
 
-    A **single** :class:`GpuStreamingDecoder` engine is shared across all
-    streams.  Each stream gets its own lightweight :class:`StreamState`;
-    when a stream is freed the state is pooled (not destroyed) so the
-    next ``allocate_stream`` reuses the GPU buffer.
-
-    The :meth:`get_decoder` method returns a :class:`StreamHandle` that
-    presents the same ``decode_chunk`` / ``finalize_stream`` / ``step`` /
-    ``config`` interface as a standalone decoder, so callers do not need
-    to know about the underlying state separation.
-
-    Parameters
-    ----------
-    decoder_config : GpuDecoderConfig, optional
-        CTC decoder configuration (beam size, blank ID, thresholds, etc.).
-        Defaults to ``GpuDecoderConfig()`` if not provided.
-
-    Examples
-    --------
-    >>> mgr = CtcStateCacheManager(GpuDecoderConfig(beam_size=5))
-    >>> mgr.allocate_stream(0, batch=1, vocab_size=5000)
-    >>> mgr.allocate_stream(1, batch=1, vocab_size=5000)
-    >>> # Interleaved chunk processing — both streams share one engine:
-    >>> mgr.get_decoder(0).decode_chunk(chunk_a)
-    >>> mgr.get_decoder(1).decode_chunk(chunk_b)
-    >>> mgr.get_decoder(0).decode_chunk(chunk_c)
-    >>> result_0 = mgr.get_decoder(0).finalize_stream()
-    >>> mgr.free_stream(0)            # state returned to pool
-    >>> mgr.allocate_stream(2, batch=1, vocab_size=5000)  # reuses pooled state
+    :meth:`get_decoder` returns a stream-scoped handle with the standalone
+    decoder interface. Freed state is reset and reused.
     """
 
     def __init__(

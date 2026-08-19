@@ -1,55 +1,10 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""OASR ASR Engine Benchmark — offline and streaming transcription.
+"""Measure engine throughput, latency, and real-time factor.
 
-Measures Real-Time Factor (RTF), latency, and throughput for the ASR
-inference engine across offline and streaming decoding modes.
-
-Batch-size argument
--------------------
---max-batch-size   Encoder forward batch size — in streaming mode caps the
-                   concurrent running pool in the ASREngine scheduler; in
-                   offline mode is the GPU forward width of each pipeline
-                   micro-batch.  The service runs one mode at a time.
-
-Examples
---------
-# Offline benchmark — sweep default batch sizes (1 / 4 / 8)
-python benchmarks/bench_engine.py \\
-    --ckpt-dir CKPT_DIR \\
-    --audio-dir WAV_DIR
-
-# Offline — explicit batch size
-python benchmarks/bench_engine.py \\
-    --ckpt-dir CKPT_DIR \\
-    --audio-dir WAV_DIR \\
-    --subroutines offline \\
-    --max-batch-size MAX_BATCH_SIZE \\
-    --num-utterances NUM_UTTERANCES
-
-# Streaming — custom chunk + concurrency
-python benchmarks/bench_engine.py \\
-    --ckpt-dir CKPT_DIR \\
-    --audio-dir WAV_DIR \\
-    --subroutines streaming \\
-    --chunk-size CHUNK_SIZE \\
-    --max-batch-size MAX_BATCH_SIZE \\
-    --num-utterances NUM_UTTERANCES
-
-# All modes including WFST
-python benchmarks/bench_engine.py \\
-    --ckpt-dir CKPT_DIR \\
-    --audio-dir WAV_DIR \\
-    --wfst-path WFST_DIR \\
-    --subroutines offline streaming offline_wfst streaming_wfst \\
-    --num-utterances NUM_UTTERANCES
-
-# Export results to CSV
-python benchmarks/bench_engine.py \\
-    --ckpt-dir CKPT_DIR \\
-    --audio-dir WAV_DIR \\
-    --output-path engine_results.csv
+``--max-batch-size`` controls the offline micro-batch width or the streaming
+concurrency cap. See ``--help`` for decode families and output options.
 """
 
 import argparse

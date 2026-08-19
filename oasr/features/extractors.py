@@ -1,31 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Built-in feature extractors, registered on the feature axis.
+"""Built-in feature extractor registrations.
 
-Each entry wraps an existing implementation — this module adds the dispatch and
-the declared properties (streamability, fixed window), not new maths:
-
-* ``fbank`` / ``mfcc`` — the fused Kaldi kernels (:mod:`oasr.features.batched`)
-  when the config is exactly Kaldi-compliant, else a per-utterance fallback so
-  unusual configs (non-Povey window, dither, ``use_energy``) still produce correct
-  features rather than silently wrong ones;
-* ``whisper_logmel`` — the 30 s Whisper recipe (:mod:`oasr.features.whisper`),
-  shared by Qwen2-Audio.  Fixed-window and therefore **not** streamable: it
-  normalises over the whole padded window, so it cannot consume a growing buffer.
-* ``nemotron_logmel`` — the NeMo pre-emphasis + ``log(mel + 2**-24)`` recipe
-  (:mod:`oasr.features.nemotron`).  Frame-local, so it *is* streamable — but its
-  grid comes from one ``center=True`` pass, so it declares a
-  :class:`~oasr.features.StreamingFraming` (``n_fft`` span, one sample of
-  pre-emphasis history, ``n_fft // 2 + 1`` of prefill) and a ``center=False``
-  incremental variant rather than restarting the grid per chunk.
-
-Each entry declares its frame grid via ``framing``, which is what
-``supports_streaming`` is derived from.  The Kaldi frontends declare the
-``snip_edges`` grid they have always implemented — the same behaviour, now said
-out loud instead of hardcoded in the engine's streaming loop.
-
-LFR stacking is deliberately *not* here — it is a post-transform over any
-extractor's output, applied once by the caller.
+Each extractor declares its frame grid, streamability, and fixed-window cost.
+Unsupported fused configurations use the per-utterance reference path. LFR is
+a caller-owned post-transform, not an extractor property.
 """
 
 from __future__ import annotations

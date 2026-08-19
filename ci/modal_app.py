@@ -1,43 +1,10 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Run the OASR GPU test suite on Modal.
+"""Run GPU test suites on Modal with optional external assets.
 
-A second GPU backend alongside the self-hosted runner, for three reasons: the
-self-hosted box is also the benchmarking machine (CI competing for clocks is
-exactly the noise the perf work fights), its GPU has fallen off the bus before
-in a way only a *host* reset recovers, and a public repo plus a self-hosted
-runner is a bad combination the day anyone adds a `pull_request` trigger.
-
-    # every family, on the default GPU, needing no external input
-    modal run ci/modal_app.py::main
-
-    # one family, on a different SM
-    OASR_MODAL_GPU=H100 modal run ci/modal_app.py::main --suites kernels
-
-    # the checkpoint-backed half, once the Volume has been seeded (~29 GiB)
-    modal run ci/modal_app.py::seed_assets       # one-time, from a box with them
-    modal run ci/modal_app.py::main --assets
-
-    # a shell on the same image, to debug a suite that only fails up there
-    modal shell ci/modal_app.py::run_suite
-
-``::main`` is not optional.  This file defines two local entrypoints, and
-``modal run`` on a file with more than one refuses to pick: bare
-``modal run ci/modal_app.py`` exits with "Specify a Modal Function or local
-entrypoint to run" before it reaches a GPU.
-
-`--assets` is off by default.  Without it no asset env var is set, every
-checkpoint- and audio-gated test skips, and what runs is the coverage that needs
-only a GPU: the kernels, the layer waist, the JIT, the schedulers and the decode
-plumbing on synthetic weights.  That is the half of the suite a rented GPU can
-run on day one; the other half is a seeded Volume away.
-
-The GPU default is **RTX-PRO-6000**: it is the GB202 die at compute capability
-12.0, the same sm_120 as the RTX 5090 this project is tuned for.  Every other
-Modal accelerator is a different SM, which silently skips the SM120-gated
-suites (`tests/test_gemm_heuristic.py`) and exercises different autotuner
-paths — useful as a *second* target, wrong as the only one.
+Use ``modal run ci/modal_app.py::main``; ``--assets`` mounts the seeded asset
+volume. The default accelerator matches the architecture-specific CI suites.
 """
 
 from __future__ import annotations
@@ -51,13 +18,8 @@ import modal
 
 REPO_REMOTE = "/repo"
 
-# This module is imported in two places, and only one of them is a checkout.
-# Locally `modal run` imports ci/modal_app.py and `__file__` locates the repo.
-# In the container Modal re-imports it as **/root/modal_app.py** — a bare file,
-# not a package, so the ci/ + tests/ layout around it is gone and
-# `Path(__file__).parent.parent` is `/`.  The repo is at REPO_REMOTE there,
-# copied in by `add_local_dir` below.  Resolve from whichever one exists rather
-# than from `__file__`, or the container import dies before the app is built.
+# Container imports lose the checkout-relative package layout, so prefer the
+# copied repository path when it exists and use ``__file__`` locally.
 REPO_ROOT = (
     Path(REPO_REMOTE)
     if (Path(REPO_REMOTE) / "ci" / "gpu_suites.py").is_file()
@@ -73,11 +35,8 @@ APP_NAME = "oasr-gpu-ci"
 ASSETS_MOUNT = "/assets"
 JIT_MOUNT = "/root/.cache/oasr/jit"
 
-# sm_120 (GB202) — same compute capability as the RTX 5090 the kernels target.
-# Override for a second-SM run: OASR_MODAL_GPU=H100 modal run ...
-# `or` rather than a get() default: the workflow passes this through from a
-# dispatch input, and an unfilled input arrives as the empty string, which
-# get() treats as a value and Modal then rejects as an accelerator.
+# Empty workflow inputs must fall back because the service rejects an empty
+# accelerator name.
 GPU = os.environ.get("OASR_MODAL_GPU") or "RTX-PRO-6000"
 
 # The CMake extension is built at *image build time*, where there is no GPU, so
@@ -88,14 +47,8 @@ CUDA_ARCHITECTURES = os.environ.get("OASR_MODAL_CUDA_ARCH", "120")
 # Must be a torch build with sm_120 support (CUDA 12.8 or newer).
 TORCH_INDEX = os.environ.get("OASR_MODAL_TORCH_INDEX", "https://download.pytorch.org/whl/cu128")
 
-#: Where each declared asset lands inside the container, **derived** from
-#: tests/assets.py rather than restated here.  ``Asset.relpath`` already *is*
-#: the reference layout (see that module's "Where the paths come from"), so a
-#: second copy is a copy that drifts: it did, the run after an architecture was
-#: added — the new checkpoint had a declaration, a slot and an `.env.example`
-#: line, and every suite that needed it still skipped, which `--strict-assets`
-#: then turned into a red run naming an asset the Volume was never told about.
-#: An asset with no ``relpath`` has no root-relative slot and is not seedable.
+#: Container asset paths derive from the central declarations. Assets without a
+#: relative slot cannot be seeded into the volume.
 ASSET_LAYOUT: dict[str, str] = {
     asset.env: asset.relpath for asset in test_assets.ASSETS.values() if asset.relpath
 }

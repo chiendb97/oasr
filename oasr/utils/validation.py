@@ -137,13 +137,11 @@ def backend_requirement(
 
             backend = kwargs.get("backend")
 
-            # Run common check
             if common_check is not None:
                 common_check(*args, **kwargs)
 
             if backend_checks:
                 if backend == "auto" and heuristic_func is not None:
-                    # Determine suitable backends
                     cc = _get_device_cc()
                     suitable = []
                     for name, check_fn in backend_checks.items():

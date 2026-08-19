@@ -2,46 +2,9 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
 #
-# End-to-end pipeline for building an HLG decoding graph.
-#
-# Supports three token types (--token-type):
-#   bpe   — SentencePiece BPE/unigram model (requires --bpe-model, --units-file)
-#   char  — Character-level tokens           (requires lang-dir/text and lang-dir/words.txt)
-#   phone — Phone-level tokens               (requires lang-dir/lexicon.txt)
-#
-# Stages:
-#   1  prepare_words   Build words.txt from training text  [bpe only]
-#   2  prepare_lang    Build tokens.txt, lexicon, L.pt
-#   3  make_kn_lm      Train Kneser-Ney n-gram LM
-#   4  kaldilm         Convert ARPA → OpenFst text format
-#   5  compile_hlg     Compile HLG.pt
-#
-# Usage (BPE):
-#   bash scripts/run_hlg.sh \
-#       --token-type bpe \
-#       --am-dir /path/to/am \
-#       --text   corpus/train-100/text corpus/train-360/text corpus/train-500/text \
-#       --lang-dir data/lang_bpe \
-#       --lm-dir   data/lm
-#
-# Usage (char):
-#   bash scripts/run_hlg.sh \
-#       --token-type char \
-#       --lang-dir data/lang_char \
-#       --lm-dir   data/lm
-#
-# Usage (phone):
-#   bash scripts/run_hlg.sh \
-#       --token-type phone \
-#       --lang-dir data/lang_phone \
-#       --lm-dir   data/lm \
-#       --text     corpus/text
-#
-# Resume from a specific stage:
-#   bash scripts/run_hlg.sh ... --stage 3
-#
-# Stop after a specific stage:
-#   bash scripts/run_hlg.sh ... --stop-stage 3
+# Build an HLG graph for BPE, character, or phone tokens.
+# Stages prepare symbols and lexicon, train and convert the LM, then compose HLG.
+# ``--stage`` and ``--stop-stage`` support resuming; run with ``--help`` for inputs.
 
 set -euo pipefail
 

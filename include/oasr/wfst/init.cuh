@@ -54,12 +54,8 @@ __global__ void InitKernel(Workspace ws, Sizes sz, DeviceGraph g, const int32_t*
 // Streaming kernels. A channel == a lane; T = INT32_MAX encodes k2's online beam
 // semantics in the shared formula (all offline-only clauses compare against final_t).
 
-// Marks one lane (or every lane when `lane < 0`) dead. Streaming decoders run this at
-// construction — nothing else initializes streaming LaneCounters, so a never-created
-// lane would carry recycled-allocation garbage into the shared per-step kernels — and
-// at ReleaseStream, so no later kernel (BacktrackKernel gates on status, K3 idle-carry
-// on frontier_size) walks a released channel's stale state after its winners slice is
-// unmapped.
+// Mark one lane, or all lanes for a negative index, dead. Required both at
+// construction to initialize counters and before release to block stale access.
 __global__ void StreamResetKernel(Workspace ws, Sizes sz, int32_t lane) {
   const int32_t l = blockIdx.x * blockDim.x + threadIdx.x;
   if (l >= sz.lanes || (lane >= 0 && l != lane)) return;

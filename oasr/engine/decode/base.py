@@ -120,41 +120,16 @@ class DecodeStrategy(ABC):
 
     # -- per-request options ------------------------------------------------
 
-    #: Per-request :class:`~oasr.engine.request.DecodingOptions` fields that
-    #: select *what is decoded* rather than *how thoroughly*, and which only
-    #: some families can act on.  A family lists what it honours; anything set
-    #: outside the list is rejected at admission.
-    #:
-    #: This list is deliberately short.  ``temperature`` / ``top_k`` / ``top_p``
-    #: are not on it: a frame-synchronous family ignoring a sampling knob
-    #: returns the same transcript either way, which is a performance surprise
-    #: at worst.  ``task`` and ``language`` are different — ignoring them
-    #: returns a transcript of *something else*, in a different language or a
-    #: different task, with nothing in the response to say so.
+    #: Options that change what is decoded. Unsupported entries are rejected;
+    #: sampling-only controls may be ignored when they cannot change the result.
     selective_options: ClassVar[Tuple[str, ...]] = ()
 
     @property
     def word_timing_modes(self) -> Tuple[str, ...]:
-        """Engine modes in which **this instance** can produce word timings.
+        """Supported word-timing modes for this configured strategy instance.
 
-        A subset of ``{"offline", "streaming"}``; empty for a family with no
-        alignment, which is the default.
-
-        Separate from :attr:`selective_options` because the answer is not
-        constant per family: a transducer's emissions are frame-indexed in both
-        modes, while a CTC alignment is a Viterbi pass over the whole log-prob
-        sequence, which a stream does not retain.  Declaring the modes is what
-        lets the *same* checkpoint answer word timings offline and say why it
-        cannot live.
-
-        A **property**, not a class attribute, for the same reason
-        ``BaseEncoder.streaming_kind`` is one: the honest answer can depend on
-        the configuration rather than the class.  A transducer under beam search
-        keeps its hypotheses in a device-side buffer that carries no frames, and
-        an AED decoder without a ``cross_attention`` surface has nothing to run
-        DTW over — both narrow this to ``()`` at construction, so the engine
-        refuses at admission instead of returning a response with the field
-        silently missing.
+        Returns a subset of ``{"offline", "streaming"}``; support may depend on
+        search configuration and available alignment surfaces.
         """
         return ()
 

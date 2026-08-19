@@ -1,15 +1,5 @@
-# Local mirror of the lint workflow, so a contributor finds out before pushing.
-#
-#     pip install pre-commit && pre-commit install
-#     pre-commit run --all-files      # one-off sweep
-#
-# Versions are pinned to the same releases as requirements-dev.txt: black and
-# ruff reformat differently across releases, so a drifting hook produces a diff
-# the lint job then rejects.  Change both files together.
-#
-# Not mirrored here: `mypy` and `cargo test`, which are too slow for a commit
-# hook.  Run `python scripts/mypy_ratchet.py` and `cd rust && cargo test`
-# before opening a PR, or let CI do it.
+# Keep hook versions synchronized with requirements-dev.txt.
+# Mypy and Cargo tests remain manual because they are too slow for commit hooks.
 
 default_language_version:
   python: python3

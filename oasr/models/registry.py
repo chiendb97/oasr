@@ -111,22 +111,10 @@ class CheckpointConverter(Protocol):
     ) -> Mapping[str, torch.Tensor]: ...
 
 
-#: ``detect()`` specificity levels, ranked.  A directory can satisfy several
-#: converters at once — a FunASR Paraformer dir carries a ``model.pt`` that looks
-#: like icefall's, a WeNet dir carries a ``final.pt`` — and the right answer is
-#: always the converter that identified the format most precisely.  Ranking
-#: replaced the alternative, which was negative guards ("``return False`` if
-#: ``config.yaml`` exists") living inside an *unrelated* converter.
-#:
-#: ``DETECT_KEYED_VALUE`` — a named config file whose declared field names this
-#: architecture (``config.json: model_type == "whisper"``).  Unambiguous.
+#: Ranked converter-detection strengths. Prefer declared keyed values, then
+#: framework-specific configuration, then filename/layout conventions.
 DETECT_KEYED_VALUE = 30
-#: ``DETECT_NAMED_CONFIG`` — the presence of a framework-specific config file
-#: (WeNet's ``train.yaml``).  Identifies the framework, not the architecture.
 DETECT_NAMED_CONFIG = 20
-#: ``DETECT_ASSET_LAYOUT`` — filename / asset conventions only (an ``exp/`` layout,
-#: ``epoch-*.pt``, a ``tokens.txt`` beside the weights).  The weakest signal, and
-#: the default for a converter that declares nothing.
 DETECT_ASSET_LAYOUT = 10
 
 
@@ -359,14 +347,8 @@ def _log_load_report(report: Optional[LoadReport], converter: Any, arch: str) ->
     hints: Mapping[str, str] = getattr(converter, "capability_drop_hints", {})
 
     def _is_expected(key: str) -> bool:
-        # A declaration matches either as a key **prefix** (icefall's
-        # ``simple_am_proj``) or as a dotted **component** anywhere in the key
-        # (WeNet's ``concat_linear``, which appears as
-        # ``encoder.encoders.N.concat_linear.weight``).  Prefix-only matching
-        # cannot express the second, and without it a normal WeNet checkpoint
-        # reports two dozen "unrecognized tensors" — and worse, they fall through
-        # to the ``decoder.`` capability hint, which then claims attention
-        # rescoring is unavailable on a checkpoint whose decoder loaded fine.
+        # Declarations match a leading prefix or a dotted component so nested
+        # expected-unused weights do not trigger unrelated capability warnings.
         return any(key.startswith(p) or f".{p}" in key for p in expected)
 
     unexpected = [k for k in report.dropped if not _is_expected(k)]

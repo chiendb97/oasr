@@ -76,8 +76,8 @@ class NemotronRnntPredictor(TransducerPredictor):
         self.num_layers = num_layers
         self.blank_id = blank_id
         self.embedding = Embedding(vocab_size, hidden_size)
-        # No OASR kernel for an LSTM; torch dispatches to cuDNN on CUDA.  Recorded
-        # as a gap in .artifacts/kernel_coverage.md rather than hidden here.
+        # The layer waist has no LSTM implementation; this recurrent decoder
+        # therefore remains on the framework implementation.
         self.lstm = nn.LSTM(
             input_size=hidden_size,
             hidden_size=hidden_size,

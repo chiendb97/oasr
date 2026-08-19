@@ -9,33 +9,14 @@ bookkeeping, the budget loop, per-row finalisation, abort, and the four one-shot
 streaming surfaces they cannot serve.  That "everything else" is here, so a third
 AR family is a handful of hooks rather than another 250-line copy.
 
-**Batching model, and why groups merge.** Each encoded micro-batch becomes one
-:class:`ArGroup` that generates together, and
-:meth:`IncrementalArStrategy.advance` round-robins one batched decoder step across
-groups until the tick budget is spent.
+Each encoded micro-batch becomes an :class:`ArGroup`, and
+:meth:`IncrementalArStrategy.advance` round-robins decoder steps across groups
+until the tick budget is spent.  Fresh groups are absorbed into an active group
+when the decoder can merge per-row state, avoiding duplicate weight-bound
+forwards.  Beam groups and decoders without a safe state merge remain separate.
 
-Separate groups cost real throughput: an AR decoder step is weight-read bound, so
-its cost barely depends on how many rows it carries.  Total decoder forwards is
-the *sum over groups* of each group's step count, so two groups cost roughly twice
-one group with the same total rows.  Measured on Qwen2-Audio-7B (4 utterances,
-124 tokens): 922 ms when they arrive together (one group) vs 1614 ms one-per-tick
-(two groups) — identical work.
-
-So a freshly prefilled group is **absorbed** into one already generating
-(:meth:`IncrementalArStrategy._absorb`) whenever the decoder surface can join the
-two states.  What used to make that impossible was a *shared scalar* generation
-offset on both decoder surfaces; both now index their KV per row
-(:class:`~oasr.cache.decoder_state.DecoderKv`), so rows sitting at different
-offsets share a forward and the arrival pattern stops mattering.  A decoder
-without ``merge`` / ``can_merge``, a beam group (its per-request slot grid and
-step counter are lockstep by construction), and a cache grown by ``torch.cat``
-rather than into a capacity buffer all keep the old one-group-per-batch
-behaviour — declared by :meth:`can_merge` returning ``False`` rather than by a
-merge that silently produces a wrong cache.
-
-``EngineConfig.decode_admit_window_ms`` remains as a *latency* knob — holding
-arrivals still saves the merge itself and one prefill — but it is no longer the
-only lever, and its default of ``0`` no longer costs throughput.
+``EngineConfig.decode_admit_window_ms`` can still avoid a merge copy and an
+extra encoder/prefill pass, at the cost of first-token latency.
 """
 
 from __future__ import annotations
@@ -101,7 +82,7 @@ class ArGroup:
     opts: List[Optional[DecodingOptions]]
     #: Tokens generated so far, per row.
     tokens: List[List[int]] = field(default_factory=list)
-    #: Per-row incremental-detokenization state (T3).  AR generation only ever
+    #: Per-row incremental-detokenization state.  AR generation only ever
     #: appends, so a partial can decode just the new ids instead of the whole
     #: prefix — at 32 tokens/tick over a 448-token run that is ~3.1k
     #: token-decodes replaced by 448.
@@ -357,7 +338,7 @@ class IncrementalArStrategy(DecodeStrategy):
         return getattr(self._model, "decoder", None)
 
     # ------------------------------------------------------------------
-    # Decoder-KV storage (H11(2))
+    # Decoder-KV storage
     # ------------------------------------------------------------------
 
     def kv_manager(self) -> Optional["DecoderKVCacheManager"]:
@@ -435,8 +416,8 @@ class IncrementalArStrategy(DecodeStrategy):
         # Two ceilings, and the tighter one wins.  The first is what admission
         # would ever hand the pool: ``max_decode_slots`` rows at their whole
         # position budget — sizing past it would reserve VRAM no admission path
-        # can use.  The second is the byte budget H4 derives from what the card
-        # has left, which binds on a big model where the first does not fit.
+        # can use.  The second is the byte budget derived from remaining device
+        # memory, which binds when the admission ceiling itself would not fit.
         tokens = rows * self._position_budget()
         budget_gib = float(self._config.decode_kv_budget_gib or 0.0)
         if budget_gib > 0:
@@ -476,7 +457,7 @@ class IncrementalArStrategy(DecodeStrategy):
         return DecoderKVCacheManager(pool)
 
     # ------------------------------------------------------------------
-    # Decoder-step CUDA graphs (H11(3))
+    # Decoder-step CUDA graphs
     # ------------------------------------------------------------------
 
     def _step_graphs(self):
@@ -546,7 +527,7 @@ class IncrementalArStrategy(DecodeStrategy):
             free()
 
     # ------------------------------------------------------------------
-    # Admission budgeting (C3)
+    # Admission budgeting
     # ------------------------------------------------------------------
 
     def kv_bytes_per_row(self) -> Optional[int]:

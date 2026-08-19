@@ -1,32 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Template base class for checkpoint converters (N5).
+"""Shared checkpoint-converter assembly and weight-loading fallbacks.
 
-:class:`~oasr.models.registry.CheckpointConverter` is a ``Protocol``, so nothing
-was inherited and each of the six converters re-implemented the same surface.
-The bodies that mattered — ``detect`` / ``build_config`` / ``load_state_dict`` —
-are genuinely format-specific, but everything around them was not: the
-``convert()`` assembly was the **same twelve lines six times**, differing only in
-four literals, and the safetensors → sharded-safetensors → ``.bin`` fallback
-chain and the ``whisper_logmel`` feature spec were duplicated verbatim between
+Subclasses declare format metadata and implement detection, configuration, and
+state-dict loading. The registry also accepts independent protocol-compatible
 converters.
-
-Subclasses declare four class attributes and implement three methods; the rest
-has a working default::
-
-    class MyConverter(BaseCheckpointConverter):
-        architecture = "my_arch"
-        source_format = "my_format"
-        default_checkpoint_name = "model.pt"
-        default_decode_type = "ctc"
-        detect_specificity = DETECT_KEYED_VALUE
-
-        def detect(self, ckpt_dir): ...
-        def build_config(self, ckpt_dir): ...
-        def load_state_dict(self, ckpt_dir, checkpoint_name, map_location): ...
-
-Inheriting is optional — the registry still accepts any object satisfying the
-protocol, which is what keeps out-of-tree converters working.
 """
 
 from __future__ import annotations

@@ -170,7 +170,7 @@ class TestSplitByFrames:
 
 
 # ---------------------------------------------------------------------------
-# Fixed-window frontends: cost is constant per row (H11)
+# Fixed-window frontends have constant cost per row
 # ---------------------------------------------------------------------------
 
 

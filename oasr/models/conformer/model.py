@@ -47,9 +47,7 @@ def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     assert mask.dtype == torch.bool
     assert dtype in [torch.float32, torch.bfloat16, torch.float16]
     mask = mask.to(dtype)
-    # attention mask bias
-    # NOTE(Mddct): torch.finfo jit issues
-    #     chunk_masks = (1.0 - chunk_masks) * torch.finfo(dtype).min
+    # Keep the mask finite; fused attention is inaccurate with an infinite bias.
     mask = (1.0 - mask) * -1.0e10
     return mask
 
@@ -288,12 +286,8 @@ class RelPositionalEncoding(nn.Module):
         return torch.nn.functional.embedding(index, self.pe[0])
 
 
-# (kernel_size, stride) per Conv2d layer, applied to both the time (H) and
-# frequency (W) axes.  The first layer always has ``in_channels == 1``; the
-# rest have ``in_channels == out_channels == odim``.  These mirror WeNet's
-# Conv2dSubsampling{4,6,8}; rate 2 is the natural single-conv generalization
-# (WeNet's own 2x subsampler is 1-D, for Whisper).  Rate 1 = no convolution
-# (linear-only).
+# Conv2D ``(kernel, stride)`` pairs apply to time and frequency. Rate 1 is the
+# linear-only path; the first convolution has one input channel.
 _SUBSAMPLING_CONV_SPECS = {
     1: (),
     2: ((3, 2),),
@@ -345,10 +339,7 @@ class Conv2dSubsampling(nn.Module):
         self.subsampling_rate = subsampling_rate
         self._conv_specs = _SUBSAMPLING_CONV_SPECS[subsampling_rate]
 
-        # Build the Conv2d -> ReLU stack.  Each conv fuses ReLU via CUTLASS
-        # Ampere Tensor Core Implicit GEMM (NHWC layout).  The first conv has
-        # IC=1 (kAnalytic iterator); subsequent convs have IC=odim.  Both axes
-        # share the same kernel/stride, matching WeNet.
+        # Each convolution fuses ReLU; time and frequency share kernel and stride.
         convs: List[nn.Module] = []
         in_ch = 1
         freq = idim

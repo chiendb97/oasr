@@ -1320,43 +1320,14 @@ __global__ void fixup_parity_kernel(const int* __restrict__ select_seq_lens, int
     }
 }
 
-// =============================================================================
-// Fused single-kernel beam-search step (beam <= FUSED_MAX_BEAM)
-// -----------------------------------------------------------------------------
-// The legacy step pipeline materialises the full [beam x vocab] ptable/ptablen
-// score matrix to global memory and extracts the top-`beam` entries with a
-// streaming block radix sort over all beam*vocab items (5 kernels per frame;
-// topk_phase1 alone is ~75% of decoder GPU time at vocab=5000).
+// Fused beam-search step for small beams. Ordinary-character scores are
+// separable, so the global winners lie in the per-row log-probability top-K plus
+// blank, repeated, space, and merge-patched slots. This avoids materializing the
+// beam-by-vocabulary score table.
 //
-// The score matrix is separable: for an "ordinary" char c of beam k,
-//     score(k, c) = lp[c] + A_k,   A_k = logsumexp(prev_blank, prev_nonblank)
-// so the per-beam ranking of ordinary chars is the ranking of lp itself.  The
-// only per-beam exceptions are the blank slot, the repeated-last-char slot,
-// the optional space slot, and slots zeroed by the duplicate-prefix merge.
-// Hence the global top-`beam` over all (k, c) pairs is contained in
-//     { top-K_all chars of lp } x beams  ∪  per-beam special slots,
-// with K_all = beam + 3 + max_patches  (<= 2*beam + 2), because at most
-// blank/last-char/space/patched chars can displace ordinary candidates.
-//
-// One fused kernel per (batch row, step) therefore: snapshots beam state,
-// builds the merge map, radix-selects the top-K_all lp chars, scores ~beam *
-// (K_all + 3) candidates with the exact legacy formulas, selects + bitonic-
-// sorts the global top-`beam`, and applies the legacy phase-2 state update
-// (flat clist copy or paged fork/CoW).  ptable/ptablen are never materialised
-// (they are not allocated when the fused path is active; see
-// layout_has_prob_tables).
-//
-// Determinism: candidate keys are (score, ~id) composites, so ties resolve by
-// ascending id = beam_idx * ldc + char — matching the stable order of the
-// legacy radix sort.  Unlike the legacy merge_kernel, the duplicate-prefix
-// fold into a beam's blank slot is accumulated in ascending source-beam order
-// instead of racy cross-block read-modify-writes, and the paged fork skips
-// self-forks instead of free+re-acquire (which could push a still-referenced
-// page onto the free pool).  Both legacy behaviours were nondeterministic.
-//
-// The legacy kernels remain for beam > FUSED_MAX_BEAM and for A/B validation
-// (compile with -DOASR_CTC_DISABLE_FUSED, exposed via OASR_CTC_FUSED=0).
-// =============================================================================
+// Composite (score, inverse-id) keys preserve ascending-id tie breaks. Prefix
+// merges accumulate in source order, and paged self-forks are skipped to keep
+// updates deterministic. Larger beams and validation use the legacy pipeline.
 
 static constexpr int FUSED_MAX_BEAM = 32;
 
@@ -2348,35 +2319,11 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_step_kernel(
         ref_counts, next_free_page, free_pool, free_pool_size, page_size, max_lp);
 }
 
-// --- multi-frame fused chunk kernel --------------------------------------------
-//
-// One launch decodes a whole PREPASS_TILE tile of frames: each block owns one
-// batch row and loops the tile's frames in-kernel, carrying beam state across
-// iterations (global state writes by a block are visible to its own reads
-// after __syncthreads()).  This removes the per-frame launch chain — counter
-// kernels, d_lp_frame_buf copies and CUDA-graph replays — that dominated the
-// latency-bound step after the pre-pass hoist.
-//
-// Two modes:
-//   * streaming == 0 (offline): frame row r covers step_begin + r through the
-//     select_seqs indirection; a row returns once step >= select_seq_lens.
-//   * streaming == 1 (chunk): frame row r covers chunk position
-//     chunk_frame_begin + r; bit r of mask_lo/mask_hi gates decoding (clear =
-//     blank-skip frame, which advances only the frame index).  ``step`` and
-//     the actual frame index start at step_begin / frame_begin and advance
-//     in-kernel; the select_seqs ring is maintained inline (replacing
-//     set_select_seq_step_kernel).
-//
-// step == 0 of a stream runs the first-step initialisation from the same
-// pre-pass candidates (a superset of the top-(nb_beams + 1) chars the
-// dedicated first-step kernels select, so the greedy non-blank pick below is
-// identical).  Double-buffer parity is resolved per step in-kernel.
-//
-// The loop lives in ``fused_chunk_loop`` so the single-state kernel and the
-// multi-stream batched kernel share it; callers pass the state's own buffer
-// pointers (paged allocator views already row-localised) plus that block's
-// ``bid``.  ``log_prob`` is the state's lp base — the loop adds
-// ``bid * batch_stride`` itself.
+// Decode one frame tile per launch while carrying beam state in-kernel. Offline
+// mode follows select_seqs; streaming mode uses chunk positions and a bit mask
+// whose clear bits advance only the frame index. Step zero reuses the pre-pass
+// candidates, and each iteration resolves double-buffer parity. Single-state
+// and batched launchers share this loop with row-localized state pointers.
 template <int BLOCK_SIZE, int BEAM_CAP, bool PAGED>
 __device__ __forceinline__ void fused_chunk_loop(
     FusedStepSmem<BLOCK_SIZE, BEAM_CAP>& s, int bid, const float* __restrict__ log_prob,
@@ -2581,20 +2528,9 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_chunk_kernel(
 
 // --- multi-stream batched chunk decode ------------------------------------------
 //
-// ``ctc_beam_search_chunk_batched`` used to launch the (pre-pass + chunk
-// kernel) pair once per stream on one CUDA stream, leaving N independent
-// streams to run as one serial chain N tiles deep.  The batched kernels fold
-// a *group* of up to FusedStreamGroup::CAP streams into a single launch
-// (grid = group_size x batch blocks), so the serial depth per tile drops from
-// N to ceil(N / CAP).
-//
-// All streams of a group share one config (engine invariant) and therefore
-// one workspace layout; per-stream state lives at ``base + delta[slot]``
-// relative to the group's first stream, so the kernels take the first
-// stream's pointers plus a by-value array of byte deltas — no device-side
-// pointer table, no H2D upload.  Per-stream counters and blank-skip masks
-// ride in the same by-value struct (32 B per stream; CAP = 64 keeps the
-// kernel-parameter block ~2.4 KB, comfortably under the 4 KB CUDA limit).
+// Group up to CAP streams in one launch. Shared layouts let byte deltas from
+// the first state locate every buffer without a device pointer table. Counters
+// and masks travel in the same by-value argument below the parameter-size limit.
 struct FusedStreamGroup {
     static constexpr int CAP = 64;
     long long delta[CAP];  // state-buffer byte offset vs the group's first stream
@@ -2688,24 +2624,9 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_chunk_batched_kernel(
 
 // --- chunk-level vocab top-K pre-pass -----------------------------------------
 //
-// The fused step is sequential across frames (beam-state dependency) and
-// latency-bound, but its Phase-3 vocab ranking depends only on the frame's
-// log-probs.  This kernel hoists that ranking out of the step loop: one block
-// per (frame row, batch row) — grid (tile_len, batch) — ranks the frame's
-// vocab once and emits the top-K chars + log-probs (K = 2*beam + 2, an upper
-// bound on any step's k_all = beam + 3 + max_patches) to the pre_chars /
-// pre_lp / pre_cnt workspace buffers, layout [row][batch][MAX_OUT].
-//
-// Two frame-indexing modes:
-//   * select_seqs != nullptr (offline): block row r covers step_begin + r via
-//     the select_seqs indirection; rows with step >= select_seq_lens[bid] are
-//     skipped (the step kernel guards identically, so those buffer rows are
-//     never read).
-//   * select_seqs == nullptr (streaming): block row r covers chunk frame
-//     step_begin + r directly.
-//
-// Bit r of mask_lo/mask_hi gates row r (clear = blank-skip frame, never
-// consumed by the chunk kernel — its block exits immediately).
+// Rank each frame's vocabulary once before the sequential beam-state loop.
+// Offline rows use select_seqs; streaming rows use direct chunk indices. Clear
+// mask bits skip rows. Output K=2*beam+2 bounds every step's candidate count.
 template <int BLOCK_SIZE>
 struct PrepassSmem {
     static constexpr int VKEY_CACHE = 6144;
@@ -4042,28 +3963,9 @@ inline cudaError_t read_streaming_results(void* state_buffer, int* out_tokens, i
     return cudaGetLastError();
 }
 
-// =============================================================================
-// Streaming: read results for MANY states in one launch
-//
-// ``read_streaming_results`` costs 3-4 ``cudaMemcpy2DAsync`` (flat) or one
-// kernel (paged) **per state**.  Called once per stream per engine step to
-// surface partial transcripts, that is the largest source of tiny GPU
-// operations in the streaming loop: at 64 concurrent streams a profile shows
-// ~200 launches carrying ~0.1 ms of actual copy — the host time to submit them
-// is an order of magnitude more than the work they do.
-//
-// The batched form uses the same by-value byte-delta trick as the fused chunk
-// decoder (``FusedStreamGroup``): every streaming state is allocated from one
-// ``GpuDecoderConfig``, so the layouts are identical and stream ``i`` reaches
-// its buffers at a constant offset from stream 0.  One kernel then covers the
-// whole ready set.
-//
-// Output layout matches N stacked single-state reads: ``out_tokens`` is
-// ``[n_states, batch, beam, max_out_len]`` (flattened), ``out_lengths`` and
-// ``out_scores`` are ``[n_states, batch, beam]``.  Only ``[0, length)`` of each
-// token row is written — every consumer clamps to the length, and what the
-// per-state ``cudaMemcpy2DAsync`` copied past it was stale beam state.
-// =============================================================================
+// Batched streaming readback. States from one configuration share layouts, so
+// byte deltas from state zero locate every buffer in one launch. Outputs stack
+// the single-state layouts; only each token row's valid prefix is written.
 
 namespace read_batched {
 

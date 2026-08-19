@@ -1,31 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""HuggingFace ``Nemotron3_5AsrForRNNT`` checkpoint converter.
+"""Convert supported Nemotron ASR snapshots to the native checkpoint contract.
 
-Reads an HF Nemotron ASR snapshot (``config.json`` + ``model.safetensors`` +
-``tokenizer.json`` + ``processor_config.json``) and emits the complete
-:class:`~oasr.checkpoints.ConvertedCheckpoint`.
-
-Two fields are read from ``processor_config.json`` rather than guessed, and both
-are the kind of thing that fails silently:
-
-* the **frontend geometry** (``hop_length`` / ``win_length`` / ``preemphasis`` /
-  ``feature_size``) — the feature extractor's own config is the only authority
-  on it, and a wrong pre-emphasis or mel count shifts every bin;
-* ``audio_scale = 1.0``, because NeMo trains on the ``[-1, 1]`` waveform like
-  icefall and Whisper, *not* WeNet's int16 scale.  A wrong scale costs the
-  transcript's leading token and nothing else, so no parity test can see it.
-
-The blank id is the checkpoint's ``blank_token_id`` (13087 — the slot *past* the
-tokenizer's vocabulary, which is why it must be named as a special id: asking the
-``tokenizers`` runtime to decode it would be an out-of-range lookup).
-
-Only ``model_type == "nemotron3_5_asr"`` is claimed.  The sibling
-``nemotron_asr_streaming`` format is the same architecture without the language
-prompt (which :class:`~oasr.models.nemotron.NemotronModel` already builds
-conditionally, on ``num_prompts > 0``), but no checkpoint of it was available to
-test against, and a converter that claims a format it has never loaded is worse
-than one that asks for ``architecture="nemotron"``.
+Frontend geometry and waveform scale come from processor metadata. The blank ID
+is a special token beyond the tokenizer vocabulary. Detection claims only the
+validated ``nemotron3_5_asr`` model type.
 """
 
 from __future__ import annotations

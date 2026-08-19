@@ -82,15 +82,8 @@ impl Container {
         }
     }
 
-    /// Whether the magic identifying this family is specific enough to
-    /// override a caller's declared raw-PCM encoding.
-    ///
-    /// `Mp3` and `Aac` are not: both are identified by an 11-bit frame sync
-    /// (`0xFF 0xEx`..`0xFF 0xFx`), which headerless PCM hits by chance roughly
-    /// once every 2^11 sample pairs.  Treating that as a container would
-    /// mis-decode real PCM, so those two are honoured only when the caller did
-    /// not declare a PCM encoding (the multipart routes, which have no
-    /// encoding field).
+    /// Whether this magic can override declared raw PCM. Short frame-sync
+    /// patterns are ambiguous and apply only when no PCM encoding was declared.
     fn is_unambiguous(self) -> bool {
         !matches!(self, Container::Mp3 | Container::Aac)
     }
@@ -186,11 +179,8 @@ pub fn container_from_hint(hint: &str) -> Option<Container> {
 
 /// Decode a compressed container to f32 mono PCM at the container's own rate.
 ///
-/// `max_samples` bounds the **decoded** waveform, which is the only bound that
-/// means anything for a compressed body: a 1 MiB Opus file is minutes of audio,
-/// so a byte cap on the request body says nothing about how much memory the
-/// decode will take.  Hitting the cap is an error, not a truncation — a
-/// silently shortened transcript is worse than a rejected upload.
+/// `max_samples` bounds decoded memory independently of compressed body size.
+/// Exceeding it is an error, never silent truncation.
 #[cfg(feature = "codecs")]
 pub fn decode_container(
     body: &[u8],

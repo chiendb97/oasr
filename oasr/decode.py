@@ -1,33 +1,6 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""
-High-level Python decoder API.
-
-Provides a unified :class:`Decoder` interface that wraps the C++ search
-implementations (greedy, prefix beam, K2 WFST) behind a clean API for both
-offline and chunk-based streaming decoding.
-
-Example — greedy offline::
-
-    from oasr.decode import Decoder, DecoderConfig
-    config = DecoderConfig(search_type="greedy")
-    decoder = Decoder(config)
-    result = decoder.decode(logp)           # logp: torch.Tensor [T, V]
-    print(result.tokens[0])                 # best token sequence
-
-Example — beam search streaming with phrase boosting::
-
-    config = DecoderConfig(
-        search_type="prefix_beam",
-        context_phrases=[[45, 67, 89], [12, 34]],
-        context_score=3.0,
-    )
-    decoder = Decoder(config)
-    decoder.init_stream()
-    for chunk_logp in chunks:
-        partial = decoder.decode_chunk(chunk_logp)
-    final = decoder.finalize_stream()
-"""
+"""Unified offline and streaming interface to compiled search decoders."""
 
 from __future__ import annotations
 

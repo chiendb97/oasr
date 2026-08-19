@@ -9,15 +9,12 @@
 
 using namespace oasr;
 
-// Baked-in config for this variant
 using Config = oasr::conv::CutlassConv2dConfigSm90<{{ tile_m }}, {{ tile_n }}, {{ tile_k }},
                                                     {{ cluster_m }}, {{ cluster_n }},
                                                     {{ k_sms }}, {{ stages }}, {{ sm_version }},
                                                     {{ 'true' if pingpong else 'false' }}>;
 
-// =============================================================================
-// Helper: map CUDA types to CUTLASS types
-// =============================================================================
+// Map CUDA types to CUTLASS types.
 
 namespace {
 
@@ -38,9 +35,7 @@ struct ToCutlassType<__nv_bfloat16> {
 
 }  // namespace
 
-// =============================================================================
 // Conv2D SM90 launcher
-// =============================================================================
 
 void {{ func_name }}(TensorView output, TensorView input, TensorView filter, Optional bias_opt,
             int64_t pad_h, int64_t pad_w, int64_t stride_h, int64_t stride_w,
@@ -90,9 +85,7 @@ void {{ func_name }}(TensorView output, TensorView input, TensorView filter, Opt
 TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});
 
 {% if with_activation %}
-// =============================================================================
 // Conv2D SM90 + Activation launcher
-// =============================================================================
 
 void {{ func_name }}_activation(TensorView output, TensorView input, TensorView filter,
                      Optional bias_opt, int64_t activation_type,
@@ -175,10 +168,7 @@ void {{ func_name }}_activation(TensorView output, TensorView input, TensorView 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}_activation, {{ func_name }}_activation);
 {% endif %}
 
-// =============================================================================
-// Dense Conv1D launchers.  Packed BTC/KSC are the height-one specialization of
-// packed NHWC/KRSC, so these call the same CUTLASS kernel without a view/copy.
-// =============================================================================
+// Packed BTC/KSC match height-one NHWC/KRSC, avoiding a framework-side copy.
 
 void conv1d_{{ config_name }}(TensorView output, TensorView input, TensorView filter,
                               Optional bias_opt, int64_t padding, int64_t stride,

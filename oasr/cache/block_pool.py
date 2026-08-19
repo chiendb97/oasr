@@ -1,22 +1,9 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Shared paged block pool for attention KV cache.
+"""Shared fixed-page pool for attention K/V caches.
 
-Inspired by the vLLM v1 ``BlockPool`` design:
-https://github.com/vllm-project/vllm/tree/main/vllm/v1/core
-
-Two large GPU tensors (one for K, one for V) are pre-allocated and divided
-into fixed-size physical blocks (pages).  A CPU-side free list tracks
-available block IDs.  All ``AttentionCacheManager`` instances share one
-``BlockPool``.
-
-The backing tensors have shape::
-
-    (num_layers, max_num_blocks, block_size_frames, n_kv_head, head_dim)
-
-Keeping K and V in separate contiguous tensors is required by
-``flash_attn_with_kvcache``, which expects
-``k_cache: (max_num_blocks, block_size, n_kv_head, head_dim)`` per layer.
+K and V use separate contiguous tensors because the cache kernel consumes a
+``(blocks, block_size, heads, head_dim)`` view per layer.
 """
 
 from __future__ import annotations
@@ -32,31 +19,10 @@ from oasr.utils.staging import to_device
 
 
 class BlockPool:
-    """Shared pool of physical GPU memory blocks for paged KV cache.
+    """Thread-safe pool of preallocated physical K/V blocks.
 
-    Pre-allocates two contiguous GPU tensors (K pool and V pool) and
-    manages allocation via a thread-safe free list.  Multiple
-    ``AttentionCacheManager`` instances share a single pool.
-
-    Each pool has shape::
-
-        (num_layers, max_num_blocks, block_size_frames, n_kv_head, head_dim)
-
-    Indexing ``pool[layer, block_id]`` yields a
-    ``(block_size_frames, n_kv_head, head_dim)`` slab for one physical block
-    in one encoder layer.
-
-    Parameters
-    ----------
-    config : CacheConfig
-        Cache configuration controlling pool dimensions, device, and dtype.
-
-    Examples
-    --------
-    >>> pool = BlockPool(config)
-    >>> ids = pool.allocate(2)
-    >>> k_view, v_view = pool.get_kv_block_view(layer=0, block_id=ids[0])
-    >>> pool.free(ids)
+    ``pool[layer, block_id]`` selects one
+    ``(block_size_frames, n_kv_head, head_dim)`` block.
     """
 
     def __init__(self, config: CacheConfig) -> None:

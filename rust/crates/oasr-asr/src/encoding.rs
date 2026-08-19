@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The one place an `encoding` name is turned into a decode plan.
 //!
-//! Both front-ends name encodings with the same spelling — the proto's
-//! `AudioEncoding` enum on gRPC, the `encoding=` query value on HTTP — and each
-//! used to carry its own `match`.  They drifted by construction: adding a codec
-//! meant remembering two files, and a value honoured on one surface returned
-//! `UNIMPLEMENTED` on the other.
+//! Both frontends use this mapping so adding a codec cannot make HTTP and gRPC
+//! interpret the same encoding name differently.
 
 use crate::audio::{PcmEncoding, SourceEncoding};
 

@@ -478,94 +478,12 @@ def test_capture_is_deterministic_and_exact_at_head_dim_64(dim, heads, batch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require CUDA")
 @pytest.mark.parametrize("dim,heads", _HD32_GEOMETRIES)
 def test_graph_capture_is_reproducible_at_head_dim_32(dim, heads):
-    """Regression guard for a fixed defect: capture must be self-consistent.
+    """Captured forwards must be deterministic for this paged-load geometry.
 
-    Until 2026-07-27 two independent captures of the *same* shape, fed the *same*
-    input, disagreed by ~1e-1 in log-probs at head_dim 32.  Nothing in the
-    computation is random, so a difference between two runs meant unsynchronised
-    concurrency.
-
-    **Generalised by** :func:`test_paged_load_is_race_free_across_block_sizes`:
-    the defect was in the paged K/V load and depended on ``head_dim`` *and*
-    ``block_size_frames`` together, not on ``head_dim`` alone.  This test is the
-    narrower historical case, kept because it is the shape the bug was found on.
-
-    **It was a shared-memory write-after-write race** (not, as recorded for a
-    while, a read of uninitialised memory)::
-
-        compute-sanitizer --tool racecheck --racecheck-report hazard \\
-            pytest "tests/test_streaming_backend.py::\\
-    test_graph_capture_is_reproducible_at_head_dim_32[64-2]"
-
-        Error: Potential WAW hazard detected (invalid memcpy_async
-        synchronization) at __shared__ 0x1800 in block (0,1,1):
-            Write Thread (64,0,0) at ...FmhaSm120...+0x990
-            Write Thread  (0,0,0) at ...FmhaSm120...+0x9c0
-        RACECHECK SUMMARY: 176 errors
-
-    The two writers are in ``_paged_load_kv_tile``, which used to slice smem into
-    ``(block_size, head_dim)`` sub-tiles and re-partition each one; the copy's
-    32-row per-pass extent then spilled 16 rows into the next page.  0x1800 is
-    ``sQ``'s 0x1000 plus 0x800, i.e. ``sK`` stage 0 row 32 — exactly where page
-    1's spill meets page 2's own write, and the reported threads are 0 and 64,
-    exactly the pair the arithmetic predicts.  (It is **not** the cp.async ring's
-    ``num_stages`` / ``cp_async_wait_group`` counts; those match FlashAttention's
-    SM80 path instruction for instruction.)
-
-    Three facts that bound it:
-
-    * It is **not head_dim-32-specific**, and this test's name is therefore too
-      narrow — it fires whenever the copy's per-pass row extent exceeds
-      ``block_size_frames``.  head_dim 64 with ``block_size_frames=8`` races too,
-      and every shipped checkpoint is head_dim 64; only the default page height
-      of 16 kept it out of production.  See
-      :func:`test_paged_load_is_race_free_across_block_sizes`.
-    * ``OASR_ATTN_BACKEND=sdpa`` makes this test XPASS, which is what localises
-      the defect to the cute kernel rather than the capture machinery.  It is
-      also a 1.75 s discriminator versus a 12 s cute run.
-    * ``--tool initcheck`` reports **0** uninitialised reads and the test XPASSes
-      under it, because the sanitizer serialises execution.  That is what refuted
-      the original stale-memory reading.
-
-    Asserting **self**-consistency rather than agreement-with-eager is what makes
-    this test deterministic.  A graph-vs-eager assertion is *flaky* here: whether
-    the racing write lands before or after the read depends on scheduling, so it
-    XPASSes in some processes.  Self-inconsistency needs no oracle and cannot be
-    accidentally satisfied.
-
-    Measured axes (`B` = streams in the cohort):
-
-    ==========  ==========================  ==================
-    head_dim    B = 1                       B >= 2
-    ==========  ==========================  ==================
-    32          marginal (sometimes exact)  always diverges
-    64          exact                       exact
-    ==========  ==========================  ==================
-
-    So it needs a **batched** cohort to manifest reliably — which is the
-    production streaming shape — and it is **not** a hidden-mode problem: it
-    reproduces on the fused CTC path, captured since long before H3.  Any
-    head_dim-32 checkpoint has therefore been streaming non-reproducible
-    log-probs with the default ``use_cuda_graphs=True``.  It surfaced only
-    because extending capture to hidden mode (H3) put the transducer fixture's
-    64/2 geometry on the captured path and made its token-identity gate flaky.
-
-    **Fixed 2026-07-27.** ``_paged_load_kv_tile`` now partitions the whole
-    ``(N_BLOCK, D)`` tile once and varies the *gmem source per row*, mirroring
-    ``flash_attn/cute/paged_kv.py::PagedKVManager.load_KV``, so every smem element
-    has exactly one writer for any ``(head_dim, block_size)`` pair.  Verified:
-    racecheck went **176 errors -> 0**, all three head_dim-32 geometries went from
-    xfail to pass, and reverting only the loader makes
-    :func:`test_paged_load_is_race_free_across_block_sizes` fail on exactly the two
-    spilling parametrisations and pass on the two exact-fit ones.  Streaming
-    throughput is unchanged (the cp.async count per thread is identical).
-
-    Ruled out, recorded so it is not retried: adding a CTA barrier before the
-    epilogue's ``sO``-into-``sQ`` write (FlashAttention's
-    ``if (Share_Q_K_smem) __syncthreads()``).  The alias here *is*
-    unconditional, but racecheck's hazard count is unchanged by the barrier
-    (176 before and after) and reports no ``sQ`` hazard at all, so the epilogue
-    is already correctly synchronised and the barrier only costs the hot path.
+    This is the original regression shape for a shared-memory write race caused
+    when a paged copy exceeded the page height. Self-consistency is asserted
+    because scheduling made graph-versus-eager comparisons flaky. The broader
+    page-size matrix below covers the underlying condition.
     """
     runs = _drive_capture(dim, heads, batch=2)
     assert runs["graph_vs_graph"] == 0.0, f"capture is not reproducible: {runs}"
@@ -687,38 +605,11 @@ _PAGED_RACE_GEOMETRIES = [
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require CUDA")
 @pytest.mark.parametrize("dim,heads,block_size", _PAGED_RACE_GEOMETRIES)
 def test_paged_load_is_race_free_across_block_sizes(dim, heads, block_size):
-    """The paged K/V smem load must not depend on page height vs copy extent.
+    """Paged K/V loading must be deterministic when copy rows exceed page height.
 
-    ``_paged_load_kv_tile`` used to slice smem into ``(block_size, head_dim)``
-    sub-tiles and re-run ``partition_D`` on each one.  The gmem tiled copy covers
-    ``num_threads * async_elems // smem_k_block_size`` **rows** per pass — a
-    function of ``head_dim``, not of ``block_size`` — so whenever that exceeded
-    ``block_size`` the surplus threads wrote rows past the end of their sub-tile,
-    straight into the next page's rows, which that page's own copy also wrote.
-    Two writers, *different* source pages, no synchronisation: the values were
-    wrong, not merely non-reproducible.
-
-    ==========  =============  ==========  =========================
-    head_dim    rows per pass  page height  before the fix
-    ==========  =============  ==========  =========================
-    32          32             16           16 rows spilled
-    64          16             8            8 rows spilled
-    64          16             16           exact fit (shipped default)
-    ==========  =============  ==========  =========================
-
-    Note the ``head_dim 64 / block_size 8`` row: the defect was **not**
-    head_dim-32-specific, and every shipped checkpoint is head_dim 64.  Reaching
-    it needs ``block_size_frames < 16``, and since ``CacheConfig`` also requires
-    ``chunk_size <= block_size_frames`` that means a low-latency streaming
-    deployment (chunk 8) rather than an arbitrary one — plausible, but not the
-    default.  So the shipped default of 16 is the only thing that kept this out
-    of production, which is a thinner margin than "head_dim 64 is clean" implied.
-
-    Asserted as **self**-consistency (two eager runs, two captured runs) rather
-    than against a reference: the computation is deterministic, so any run-to-run
-    difference is a race, and that needs no oracle.  ``eager_vs_eager`` is the
-    load-bearing assertion — it holds with capture switched off, which is what
-    separates a genuine race from a graph-pool artefact.
+    Partitioning each page independently once let surplus copy rows overlap the
+    next page. Eager and captured self-consistency detect the race without a
+    numerical oracle, including non-default low-latency page sizes.
     """
     runs = _drive_capture(dim, heads, batch=2, block_size=block_size)
     assert runs["eager_vs_eager"] == 0.0, f"eager path is not deterministic: {runs}"

@@ -3,9 +3,9 @@
 
 Two layers, both pure bookkeeping and both CPU-only:
 
-* ``DecoderKVCacheManager`` — paged block allocation (K6);
+* ``DecoderKVCacheManager`` — paged block allocation;
 * ``DecoderKv`` / ``PagedDecoderKv`` — the per-row state
-  ``prefill``/``step``/``select``/``merge`` thread through (H11(1), H11(2)).
+  ``prefill``/``step``/``select``/``merge`` thread through.
 """
 
 import pytest
@@ -104,7 +104,7 @@ class TestGrowth:
 
 
 # ---------------------------------------------------------------------------
-# Per-row KV offsets (H11(1)) -- the dense state the AR decoders thread
+# Per-row KV offsets: dense state threaded through AR decoders
 # ---------------------------------------------------------------------------
 
 LAYERS, HEADS, DIM = 2, 3, 4
@@ -260,7 +260,7 @@ class TestMerge:
 
 
 # ---------------------------------------------------------------------------
-# Paged storage (H11(2))
+# Paged storage
 # ---------------------------------------------------------------------------
 
 

@@ -63,16 +63,9 @@ fn expected_out(n_in: u64, from_hz: u32, to_hz: u32) -> u64 {
 
 /// A stateful mono f32 resampler.
 ///
-/// Feed it with [`push`](Self::push) as audio arrives and finish with
-/// [`flush`](Self::flush).  State is carried across calls, so a stream split
-/// into arbitrary chunks resamples identically to the same audio passed in one
-/// piece (see the `streaming_matches_one_shot` test) — resampling each chunk
-/// with a fresh resampler instead would stamp a filter-length discontinuity
-/// into the waveform at every chunk boundary.
-///
-/// The resampler's group delay is trimmed from the head of the output and made
-/// up for at [`flush`](Self::flush), so the output is time-aligned with the
-/// input and has exactly `round(n_in * to/from)` frames overall.
+/// State spans [`push`](Self::push) calls, making arbitrary chunking equivalent
+/// to one-shot input. [`flush`](Self::flush) compensates filter delay and returns
+/// exactly `round(n_in * to/from)` frames overall.
 pub struct Resampler {
     inner: SincFixedIn<f32>,
     from_hz: u32,

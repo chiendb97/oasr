@@ -469,7 +469,7 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# Shared incremental-AR base (H1): the seam a third AR family plugs into
+# Shared incremental-AR extension seam
 # ---------------------------------------------------------------------------
 
 

@@ -53,12 +53,8 @@ pub fn realtime_streaming() -> &'static RequestRecorder {
 
 /// Decrements the in-flight gauge when dropped.
 ///
-/// Not a plain `decrement` after the `await`: a handler that panics, or a
-/// future dropped when the client disconnects mid-request, never reaches the
-/// line after it. Either would leave the gauge permanently one too high, and
-/// since it only ever moves up, an "in flight" reading would drift away from
-/// reality until a restart — a gauge that slowly becomes a lie is worse than
-/// one that was never added.
+/// Drop-based accounting covers panics and disconnected futures that never
+/// reach a post-await decrement.
 struct InFlightGuard(metrics::Gauge);
 
 impl InFlightGuard {
@@ -99,13 +95,8 @@ fn status_label(code: u16) -> &'static str {
 
 /// Count and time every HTTP request, by method, matched route and status.
 ///
-/// Method and status are `&'static` (hyper's method table, and the map above),
-/// so the only per-request allocations are the route string and the label
-/// vectors the `metrics` macros build. Interning the route to make it static
-/// too was tried and reverted: it needs a shared table behind a lock, and a
-/// mutex taken on every HTTP request is a contention point far more expensive,
-/// under the concurrency this server is built for, than the allocation it
-/// removes.
+/// Method and status labels are static; the matched route remains request-owned
+/// to avoid a shared interning lock on every request.
 pub async fn track_http(req: Request, next: Next) -> Response {
     let method = method_label(req.method());
     let route = req

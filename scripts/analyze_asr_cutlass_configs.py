@@ -1,74 +1,11 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""
-enumerate_asr_configs.py — Enumerate GEMM and CONV2D problem sizes for ASR
-model families and query nvMatmulHeuristics for all supported CUTLASS configs.
+"""Analytically enumerate ASR GEMM and Conv2D shapes.
 
-.. note::
-    This script derives shapes *analytically* and asks nvMatmulHeuristics for
-    *predicted* configs.  Two limitations make its output unsuitable for tuning
-    the engine directly: (1) it enumerates a 10×10 (batch × duration) grid over
-    five model families, producing thousands of shapes; (2) the predicted CUTLASS
-    configs do not map to the fixed set OASR actually compiles, and the analytic
-    derivation assumes attention projections / scores hit the OASR GEMM path
-    (they are ``torch.nn.Linear`` / ``oasr.fmha``).
-
-    For actually choosing kernels, use ``scripts/tune_asr_gemm.py`` — it captures
-    the REAL shapes a workload issues (via ``OASR_CAPTURE_GEMM``), buckets them
-    into a representative set, REAL-benchmarks OASR's actual candidate kernels
-    (CUTLASS variants + torch/cuBLAS) on the GPU, and emits the production
-    selection rules.  This module is retained as the analytic shape library
-    (``MODEL_REGISTRY`` + ``derive_problems``) that ``tune_asr_gemm.py``'s
-    ``--mode analytic`` fallback reuses.
-
-Supported model families:  conformer, zipformer, branchformer, paraformer, transducer
-Supported model sizes:     base, large
-Supported CUTLASS targets: CUTLASS2, CUTLASS3 (where supported by nvMatmulHeuristics)
-
-Usage
------
-    # Dry run (no GPU queries) — just enumerate problem sizes:
-    python benchmarks/enumerate_asr_configs.py \\
-        --families conformer branchformer --sizes base \\
-        --batches 1 8 64 --durations 4 16 \\
-        --output /tmp/asr_configs.jsonl --dry-run -v
-
-    # Full run with nvMatmulHeuristics queries:
-    python benchmarks/enumerate_asr_configs.py \\
-        --output results/asr_cutlass_configs.jsonl -vv
-
-    # Single family / GPU subset:
-    python benchmarks/enumerate_asr_configs.py \\
-        --families conformer --sizes large \\
-        --gpus A100_SXM_80GB H100_SXM \\
-        --output out.jsonl -v
-
-Approximation strategy
-----------------------
-Each ASR model is reduced to a deterministic set of GEMM problems derived from
-its published hyperparameters.  The key assumptions are:
-
-  * Frame rate: 100 frames/s (10 ms frame shift).
-  * Subsampling: 4× for all families except Zipformer, which has per-stack strides
-    on top of a global 4× factor.
-  * Attention: full MHSA; head_dim = d_model // num_heads.  Q/K/V/O projections
-    are separate GEMMs; QK and AV are batched GEMMs (batchSize = batch * num_heads).
-  * Feed-forward: two separate GEMMs (expand + contract).  Macaron-style encoders
-    have two FF sub-blocks per layer (same problem sizes, distinct op_name labels).
-  * Conformer conv module: pointwise-expand (d_model → 2*d_model) and
-    pointwise-contract (d_model → d_model) GEMMs.  Depthwise conv1d is not a GEMM.
-  * CONV2D: only the input subsampling stack generates 2D convolutions.
-    nvMatmulHeuristics covers GEMM only; CONV2D records use status="nmh_unsupported".
-
-References
-----------
-  * nvMatmulHeuristics Python API:
-    https://docs.nvidia.com/cuda/nvidia-matmul-heuristics/api_python.html
-  * WeNet Conformer: https://github.com/wenet-e2e/wenet
-  * ESPnet Branchformer: https://arxiv.org/abs/2207.02971
-  * Zipformer (icefall): https://arxiv.org/abs/2310.11230
-  * Paraformer (FunASR): https://arxiv.org/abs/2206.08317
+The script queries predicted configurations for a model grid. Its shapes are an
+approximation; production tuning should use ``tune_asr_gemm.py`` with captured
+workloads and measured candidate kernels.
 """
 
 from __future__ import annotations
@@ -437,22 +374,8 @@ BRANCHFORMER_LARGE = ModelSpec(
     vocab_size=5000,
 )
 
-# ── Paraformer ────────────────────────────────────────────────────────────────
-# FunASR / ModelScope SANMEncoder + ParaformerSANMDecoder.
-#
-# Large: iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
-#   (fetched config.yaml from ModelScope).
-#   encoder: SANMEncoder output_size=512, num_blocks=50, attention_heads=4,
-#            linear_units=2048, kernel_size=11, input_layer=pe (no Conv2D).
-#   decoder: ParaformerSANMDecoder, num_blocks=16, attention_heads=4,
-#            linear_units=2048.
-#   Frontend: LFR (Low Frame Rate) stacking m=7, n=6 → T_prime ≈ T // 6.
-#             Represented as global_subsampling=6 (no Conv2D emitted).
-#   Reference: arXiv:2206.08317; ModelScope model card.
-#
-# Base: no public config.yaml found; values are approximated by scaling the
-#   large config down (256 dim, 12 blocks, 6-layer decoder).
-#   All non-size parameters (SANM kernel=11, LFR=6, no Conv2D) match the large.
+# Paraformer large follows the published SANM configuration. Base dimensions
+# are estimates scaled down from it; kernel, LFR, and frontend choices are kept.
 
 PARAFORMER_BASE = ModelSpec(
     name="paraformer",
@@ -544,35 +467,9 @@ TRANSDUCER_LARGE = ModelSpec(
     vocab_size=5000,
 )
 
-# ── Zipformer ─────────────────────────────────────────────────────────────────
-# k2/icefall Zipformer-M (base) and Zipformer-L (large).
-# Multi-stack encoder with global 4× Conv1D subsampling (no Conv2D mel subsampling).
-# Per-stack sequence length = ceil(T_global / stride), T_global = ceil(T / 4).
-# Reference: arXiv:2310.11230; icefall egs/librispeech/ASR/zipformer/train.py.
-#
-# Column order: (d_model, num_heads, ff_units, num_layers, time_stride, cnn_kernel)
-#
-# Base = Zipformer-M (icefall train.py argparse defaults, verified):
-#   --encoder-dim       "192,256,384,512,384,256"
-#   --feedforward-dim   "512,768,1024,1536,1024,768"
-#   --num-encoder-layers "2,2,3,4,3,2"
-#   --num-heads         "4,4,4,8,4,4"
-#   --downsampling-factor "1,2,4,8,4,2"
-#   --cnn-module-kernel "31,31,15,15,15,31"
-#
-# Large = Zipformer-L (icefall run.sh large variant, derived from known recipes):
-#   --encoder-dim       "192,256,512,768,512,256"
-#   --feedforward-dim   "512,768,1536,2048,1536,768"
-#   --num-encoder-layers "2,2,4,5,4,2"
-#   --num-heads         "4,4,4,8,4,4"     (same as medium)
-#   --downsampling-factor "1,2,4,8,4,2"   (same as medium)
-#   --cnn-module-kernel "31,31,15,15,15,31" (same as medium)
-#
-# Zipformer uses decoupled Q/K and V head dimensions (icefall defaults):
-#   --query-head-dim 32   (qk_head_dim)
-#   --value-head-dim 12   (v_head_dim)
-# These differ from standard d_model // num_heads and materially change the
-# attention Q/K/V projection and BMM problem sizes.
+# Zipformer stack tuples are ``(width, heads, FF width, layers, stride, kernel)``.
+# Base uses upstream defaults; large follows the published large recipe.
+# Q/K and V head widths are decoupled, so projection and BMM shapes use 32 and 12.
 
 _ZM_STACKS = [
     # (d_model, num_heads, ff_units, num_layers, time_stride, cnn_kernel)

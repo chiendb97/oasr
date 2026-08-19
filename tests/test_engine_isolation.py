@@ -384,7 +384,7 @@ class TestStreamingStepDoesNotRaise:
 
 
 # ---------------------------------------------------------------------------
-# Pipelined ticks (P1 streaming feature lookahead, P3 offline collate prefetch)
+# Pipelined ticks: streaming feature lookahead and offline collate prefetch
 #
 # Both changes are reorderings, so what has to be pinned is the *order* — which
 # is invisible to a transcript comparison but is the entire point.  Each test

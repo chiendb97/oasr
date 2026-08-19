@@ -29,11 +29,8 @@ namespace detail {
 
 /// ``AlignmentResult`` -> ``(words, timestamps, confidence)``.
 ///
-/// ``words`` comes back as plain 4-tuples: the Python side turns them into
-/// ``WordTiming`` with ``map(WordTiming._make, ...)``, which keeps the type it
-/// publishes (and its ``_replace``) without this file having to know about it.
-/// ``confidence`` is ``None`` for an empty alignment — a caller cannot tell a
-/// genuinely uncertain utterance from one that had no tokens.
+/// Words cross as tuples and become the public Python type there. Empty
+/// alignments use `None` confidence to distinguish them from uncertainty.
 inline py::tuple toPython(const oasr::alignment::AlignmentResult& result) {
     py::list words;
     for (const auto& w : result.words) {

@@ -102,7 +102,7 @@ class ASREngine:
     _longform: Optional["LongFormTracker"] = None
 
     #: Device-memory profile taken during construction, ``None`` unless a
-    #: capacity was left to derive (H4).  Class-level for the same reason as
+    #: capacity was left to derive.  Class-level for the same reason as
     #: ``_longform``: the concurrency tests drive a hand-built engine through
     #: ``__new__``, and a read must not depend on construction having run.
     _memory_profile: Optional[MemoryProfile] = None
@@ -138,15 +138,9 @@ class ASREngine:
         tokenizer = self._apply_checkpoint_specs(config, loaded)
 
         self._device = torch.device(device_str)
-        # ``cache_spec`` is ``None`` for an offline-only encoder (Whisper,
-        # Paraformer, the Qwen2-Audio tower), in which case no streaming cache is
-        # built at all — previously every engine allocated the paged KV pool plus
-        # the CNN-cache tensors (~0.4 GB at the defaults) even when nothing could
-        # ever read them, on exactly the LLM/offline deployments where VRAM is
-        # tightest (H13).  An engine pinned to ``service_mode="offline"`` gets the
-        # same treatment for the same reason: ``ModelRunner`` selects the
-        # ``none`` streaming backend there, so a cache config would describe a
-        # pool nothing allocates.
+        # An offline-only encoder has no cache spec.  An engine pinned to offline
+        # mode also selects the ``none`` streaming backend, so neither case should
+        # reserve a streaming cache that no execution path can read.
         cache_spec = model.cache_spec
         # Streaming geometry the *encoder* declares (the backend-derived window /
         # stride are stamped further down, once the backend exists).  Resolved
@@ -231,10 +225,7 @@ class ASREngine:
             and config.service_mode == "streaming"
             and get_streaming_backend_class(model.encoder.streaming_kind).allocates_paged_pool
         ):
-            # Only the pool-owning runtime needs a cache config — and only it has
-            # a pool size to derive.  A recurrent-state backend (Zipformer) would
-            # otherwise pay a VRAM probe, and could fail at startup, over a pool
-            # nothing builds.
+            # Only a pool-owning runtime needs a cache config or a memory probe.
             if config.max_num_blocks is None:
                 self._autosize_kv_pool(config, cache_spec, consumes)
             else:
@@ -276,26 +267,11 @@ class ASREngine:
         if strategy_cls.incremental and config.decode_kv_budget_gib is None:
             self._autosize_decode_kv_budget(config, consumes)
 
-        # Build exactly one executor matching ``config.service_mode``.
-        # The other mode's machinery (paged KV cache vs. persistent
-        # producer thread) never wakes up, so there's no point paying
-        # the construction cost or holding the dead references.  All
-        # three building-block singletons (``InputProcessor`` /
-        # ``ModelRunner`` / ``OutputProcessor``) are still shared so
-        # throughput features land in one place regardless of mode.
+        # Construct only the selected mode's executor; processors remain shared.
         self._executor: Executor = self._build_executor(config)
 
-        # Pre-warm the streaming encoder CUDA-Graph cache over a (B, cache_t1)
-        # ladder so a live stream never pays a blocking lazy capture
-        # mid-request (the interactive-latency tail: every new cache_t1 bucket
-        # as the stream grows would otherwise trigger a ~cudaGraphInstantiate
-        # stall).  We capture B in ``{1, max_batch_size} ∪ preferred`` (the
-        # single-live-stream and full-cohort shapes) across a bucket ladder
-        # covering the first ``prewarm_chunks`` encoder chunks — the
-        # latency-critical stream ramp plus most short/medium utterances.
-        # Deeper buckets (long utterances) and intermediate cohort-drain B
-        # values still capture lazily (one-time).  Streaming-only: offline
-        # never runs the streaming encoder forward.  Best-effort.
+        # Best-effort prewarming covers common batch sizes and early cache buckets
+        # so live streams avoid lazy graph-capture stalls. Other shapes stay lazy.
         if (
             self._device.type == "cuda"
             and bool(config.use_cuda_graphs)
@@ -318,13 +294,8 @@ class ASREngine:
                     exc,
                 )
 
-        # Warm up the cute FMHA compile cache so the first request
-        # doesn't pay JIT-compile latency. Skipped on CPU and on archs
-        # where the cute backend isn't available (warmup_fmha is a no-op
-        # in those cases).  Conformer-specific: requires the stacked-layer
-        # layout AND the paged-FMHA attention interface (``self_attn.h_kv``);
-        # encoders with their own attention (Zipformer's torch matmul, the
-        # Paraformer SANM blocks) skip it.
+        # Warm the fused-attention compile cache when the encoder exposes the
+        # paged-attention interface.  The helper is a no-op on unsupported paths.
         if (
             self._device.type == "cuda"
             and hasattr(model.encoder, "encoders")
@@ -350,10 +321,8 @@ class ASREngine:
                     exc,
                 )
 
-        # Pre-warm the offline GPU path (fbank → encoder → CTC decode) so the
-        # first real request doesn't pay one-time cuBLAS/cuDNN/CTC-workspace
-        # initialisation — measured at ~3 s on the cold first ``step()``, which
-        # otherwise dominates short runs and produces a bimodal latency tail.
+        # Pre-warm the offline path so one-time library and workspace setup does
+        # not inflate the first request's latency.
         if self._device.type == "cuda" and config.service_mode == "offline":
             try:
                 self._prewarm_offline()
@@ -382,7 +351,7 @@ class ASREngine:
             )
             self._prep_thread.start()
 
-        # Long-form fan-out (C5's real fix).  Only meaningful for a *fixed-window*
+        # Long-form fan-out is meaningful only for a fixed-window
         # frontend: without one, a long request already decodes end to end and
         # segmenting it would only cost accuracy.
         self._longform: Optional[LongFormTracker] = None
@@ -410,7 +379,7 @@ class ASREngine:
                 )
 
     # ------------------------------------------------------------------
-    # VRAM-aware capacity sizing (H4)
+    # VRAM-aware capacity sizing
     # ------------------------------------------------------------------
 
     def _check_explicit_kv_pool(self, config: EngineConfig) -> None:
@@ -589,8 +558,7 @@ class ASREngine:
 
         * streaming — one encoder chunk window at the full cohort width, which is
           exactly the shape ``forward_step`` issues at steady state.
-        * offline — the frontend's fixed window if it has one (Whisper /
-          Qwen2-Audio's 30 s, where every row costs the same), else
+        * offline — the frontend's fixed window if it has one, else
           :data:`~oasr.engine.memory.PROBE_AUDIO_SECONDS` of audio.
 
         Goes through ``InputProcessor.collate`` and the same ``consumes`` routing
@@ -1166,8 +1134,7 @@ class ASREngine:
             else:
                 config.feature_config = spec.to_feature_config()
             # The waveform scale the checkpoint was trained on travels with
-            # the spec too (Kaldi frontends: 32768.0 int16 scale; Whisper:
-            # 1.0).  An explicit non-default engine value wins with a warning.
+            # the spec too.  An explicit non-default engine value wins with a warning.
             if getattr(config, "_audio_scale_explicit", False):
                 if float(config.audio_scale) != float(spec.audio_scale):
                     logger.warning(

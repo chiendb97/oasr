@@ -8,21 +8,14 @@ this module is only what makes an AED decoder different from the speech-LLM one:
 
 * the prompt is the checkpoint's fixed SOT sequence, identical for every row, so
   the prefill is a plain expand (no per-row padding);
-* Whisper's ``suppress_tokens`` / ``begin_suppress_tokens`` are applied to the
-  logits before selection;
+* the checkpoint's suppression lists are applied before selection;
 * EOS is a single token id;
 * greedy emits finals only — token-streaming partials land with the LLM family.
 
-Drives a decoder exposing the batched incremental surface
-(:meth:`~oasr.models.whisper.WhisperDecoder.prefill` / ``step`` / ``select``)
-plus a model config carrying the generation-control ids — Whisper today; any AED
-checkpoint with the same surface plugs in unchanged.  Per-request
-:class:`~oasr.engine.request.DecodingOptions` carry a generation cap and sampling
-knobs; ``prompt`` is ignored (the free-text prompt has no slot in the SOT
-sequence), while ``task`` and ``language`` *do* apply — they substitute the
-corresponding SOT slot, which is what makes ``POST /v1/audio/translations`` and
-per-request language selection possible on a checkpoint whose
-``forced_decoder_ids`` froze both at conversion time.
+The decoder must expose ``prefill`` / ``step`` / ``select`` and the model config
+must provide generation-control ids.  Per-request options carry a generation cap
+and sampling controls.  Free-text ``prompt`` is ignored because it has no SOT
+slot; ``task`` and ``language`` replace their corresponding SOT ids.
 """
 
 from __future__ import annotations
@@ -49,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 @register_decode_strategy("aed")
 class AedDecodeStrategy(IncrementalArStrategy):
-    """Incremental greedy AED decoding (Whisper-style)."""
+    """Incremental greedy AED decoding."""
 
     decode_type: ClassVar[str] = "aed"
     emit_partials: ClassVar[bool] = False
@@ -67,9 +60,8 @@ class AedDecodeStrategy(IncrementalArStrategy):
         # ``oasr.models.interfaces.CAPABILITIES["aed"]`` — one table, one message.
         # Typed ``Any`` deliberately: the members below are a *duck-typed* AED
         # config surface, declared in that table and checked once at
-        # construction, so naming a concrete class here would tie the family to
-        # Whisper for nothing (and ``nn.Module.__getattr__`` types every
-        # attribute as ``Tensor | Module`` anyway).
+        # construction, so naming a concrete class here would unnecessarily tie
+        # the family to one architecture.
         mcfg: Any = model.config
         self._mcfg = mcfg
         self._prompt = list(mcfg.sot_sequence())

@@ -63,18 +63,8 @@ class Detokenizer:
         filtered = [t for t in token_ids if t not in SPECIAL_IDS]
         return " ".join(str(t) for t in filtered)
 
-    # ------------------------------------------------------------------
-    # Incremental detokenization (T3)
-    # ------------------------------------------------------------------
-    #
-    # For the append-only families — AR generation and transducer greedy — a
-    # partial extends the previous hypothesis rather than replacing it, so
-    # re-decoding the whole prefix every tick is Θ(n²) for no new information.
-    # These two methods let such a strategy feed only what it just produced.
-    #
-    # CTC prefix beam search deliberately does **not** use them: its best
-    # hypothesis can be re-ranked between chunks, so the prefix is not monotone
-    # and "what's new" is undefined.
+    # Incremental decoding applies only to append-only hypotheses; CTC prefixes
+    # can be re-ranked between chunks and therefore have no stable text delta.
 
     def new_state(self) -> Dict[str, Any]:
         """Fresh per-request incremental-decode state."""
@@ -83,11 +73,7 @@ class Detokenizer:
         return {"ids": [], "text": ""}
 
     def detokenize_incremental(self, new_ids: Sequence[int], state: Dict[str, Any]) -> str:
-        """Extend a hypothesis by ``new_ids``; return the text delta.
-
-        ``state["text"]`` carries the full transcript so far.  Concatenating
-        every delta equals :meth:`detokenize` over the accumulated ids.
-        """
+        """Append ids and return a delta whose accumulation equals full decode."""
         if self._tokenizer is not None:
             return self._tokenizer.decode_incremental(new_ids, state)
         ids = state.setdefault("ids", [])

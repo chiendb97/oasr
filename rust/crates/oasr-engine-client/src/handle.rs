@@ -138,15 +138,8 @@ impl StreamingHandle {
 
 /// Offline request handle that streams **every** event, not just the terminal one.
 ///
-/// The audio arrives in one shot (an offline-only decode family cannot consume a
-/// growing buffer), but the *text* comes out incrementally: the autoregressive
-/// strategies emit one `Event::Partial` per advanced request per engine tick, so a
-/// client can render tokens as they are generated. This is what
-/// [`OfflineHandle`] cannot express — it resolves once, with the final.
-///
-/// Cancel-on-drop is armed exactly as for a streaming request, and matters more
-/// here: a client that disconnects mid-generation would otherwise leave an AR row
-/// occupying a decode slot until it hits its `max_new_tokens` cap.
+/// Audio arrives in one shot, while decoded text is emitted incrementally.
+/// Cancel-on-drop prevents a disconnected client from retaining a decode slot.
 pub struct OfflineStreamHandle {
     pub request_id: String,
     pub events: EventStream,

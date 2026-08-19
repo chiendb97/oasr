@@ -55,14 +55,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
 
-# Python embedding — drives the in-process ASREngine dispatcher.  The pyo3
-# linkage mode is chosen per consumer, not here: `oasr-server` (binary) turns
-# on `pyo3/auto-initialize` to embed + link libpython, while `oasr-core` (the
-# `oasr._core` extension module) turns on `pyo3/extension-module` so libpython
-# is resolved by the host interpreter at import time.  Those features are
-# mutually exclusive, so the workspace dep stays feature-less and the consumers
-# opt in via `oasr-engine-client`'s `auto-initialize` / `extension-module`
-# features.
+# Consumers select mutually exclusive PyO3 linkage modes: the binary embeds
+# Python, while the extension resolves it from the host interpreter.
 pyo3 = { version = "0.22", default-features = false }
 numpy = "0.22"
 

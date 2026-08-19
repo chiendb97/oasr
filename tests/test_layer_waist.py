@@ -587,21 +587,12 @@ class TestBackendSelection:
 class TestKernelGapRegistry:
     """Missing kernels are declared debt, not invisible fallbacks."""
 
-    #: The gaps declared when this line was last updated.  Closing one is the
-    #: goal, so removing an entry passes; *adding* one has to be a deliberate
-    #: edit here, which is what puts it in front of a reviewer.
+    #: Removing a pinned gap passes; adding one requires a deliberate update so
+    #: new coverage debt is visible in review.
     #:
-    #: ``norm-strided-rows`` was closed by fixing the launchers' row-density
-    #: precondition, ``fmha-mask-form`` by giving the kernel a per-row key start
-    #: (left padding), and unaligned output projections never became a gap at
-    #: all — they were closed at the model layer by widening the head on load.
-    #:
-    #: ``fmha-paged-config`` arrived with paged decoder KV (H11(2)): the paged
-    #: loader skips per-element head-dim predication, so it refuses a head_dim off
-    #: the 32-element MMA stride, and it walks whole pages per K tile, so it
-    #: refuses a page size no tile is a multiple of.  No shipped decoder reaches
-    #: either — every head_dim is 64 or 128 and the pool's page size is a power of
-    #: two — so today it is taken only by tiny test configs.
+    #: The paged loader requires a head dimension aligned to its 32-element MMA
+    #: stride and a page size that divides every K tile.  Production configs meet
+    #: both constraints; small test configs may not.
     PINNED = {"fmha-head-dim", "fmha-paged-config"}
 
     def test_declared_gap_set_only_shrinks(self):

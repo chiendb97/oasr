@@ -62,14 +62,9 @@ class StatelessDecoder(TransducerPredictor):
         self.embedding = Embedding(vocab_size, decoder_dim, padding_idx=blank_id)
         self.relu = Relu()
         if context_size > 1:
-            # Conv over the label window, no padding: U == context_size in → 1
-            # frame out at decode time.  Depthwise is the degenerate group size;
-            # icefall's Zipformer recipes group 4 input channels together, which
-            # is a different operator (4x the parameters), not a relayout — hence
-            # a second branch rather than a permute.  The grouped form is a
-            # 1-row NHWC conv2d so it stays inside ``oasr.layers`` (no bare
-            # ``nn.Conv1d`` in a model) and keeps both the kernel and torch
-            # paths; the grouped NHWC kernel serves 4 channels per group.
+            # Convolve the unpadded label window to one frame. Grouped predictors
+            # are distinct operators, not depthwise layouts, and use the shared
+            # layer abstraction through a one-row convolution.
             self.conv: Union[DepthwiseConv1d, Conv2d]
             if conv_group_size == 1:
                 self.conv = DepthwiseConv1d(decoder_dim, kernel_size=context_size, bias=False)

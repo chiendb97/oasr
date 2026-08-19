@@ -399,21 +399,15 @@ async fn send_json(socket: &mut WebSocket, value: Value) -> Result<(), SessionEn
 /// Tracks what the client has already been told, so each event can carry a
 /// true increment.
 ///
-/// The engine's partials are *cumulative* — each one is the transcript so far —
-/// while the protocol's `delta` is an increment.  Sending the cumulative text
-/// as a delta makes a client that concatenates deltas render every prefix
-/// again, which is what a naive mapping does.
+/// Converts cumulative engine partials into protocol increments.
 #[derive(Default)]
 struct Emitted(String);
 
 impl Emitted {
     /// The event for one cumulative partial, or `None` when it added nothing.
     ///
-    /// A partial that *revises* rather than extends (the frame-synchronous
-    /// families re-rank a beam, so a word can change) has no increment to
-    /// express: it carries an empty `delta` and the corrected `text`, and a
-    /// client that reads `text` stays right where a delta-concatenating one
-    /// would have to wait for the final.
+    /// Revisions carry corrected full text with an empty delta because they have
+    /// no append-only representation.
     fn event(&mut self, partial: &str) -> Option<Value> {
         let delta = match partial.strip_prefix(self.0.as_str()) {
             Some("") => return None,

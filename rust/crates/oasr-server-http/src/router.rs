@@ -62,12 +62,8 @@ pub struct RouterLimits {
 
 /// Build the axum Router.
 ///
-/// Two request shapes, one engine: the Google-STT-shaped
-/// `POST /v1/speech:recognize` (raw body, query-string config — the lowest
-/// overhead) and the OpenAI-shaped `/v1/audio/*` uploads plus the
-/// `GET /v1/realtime` WebSocket.  Adding the second set did not replace the
-/// first: existing clients keep working, and both are thin adapters over the
-/// same pool handles.
+/// Build raw-body recognition, multipart audio, and realtime routes over the
+/// shared engine pool.
 pub fn build_router(state: AppState, limits: RouterLimits) -> Router {
     // The bounds go on the recognition routes only.  `/healthz`, `/readyz` and
     // `/metrics` are exactly what an operator needs answered *while* the

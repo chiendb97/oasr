@@ -15,30 +15,9 @@
 
 using namespace oasr;
 
-// =============================================================================
-// Step 4: per-state captured CTC graphs
-// -----------------------------------------------------------------------------
-// Each ``StreamState`` lazily captures four CUDA Graphs on its first call
-// with ``use_cuda_graphs=true``:
-//
-//   * graph_first — captures ``streaming_step_persistent(step_for_parity=0)``
-//     plus ``advance_counters``.  Used for the *step==0* frame, which goes
-//     through the ``first_step_kernel`` and writes to ``clen[0]/clist[0]``.
-//   * graph_odd   — captures ``streaming_step_persistent(step_for_parity=1)``
-//     plus ``advance_counters``.  Used for steps 1, 3, 5, …: ``src_parity=0``,
-//     ``dst_parity=1``.
-//   * graph_even  — captures ``streaming_step_persistent(step_for_parity=2)``
-//     plus ``advance_counters``.  Used for steps 2, 4, 6, …: ``src_parity=1``,
-//     ``dst_parity=0``.
-//   * graph_blank — captures only ``advance_frame_idx_kernel``.  Used for
-//     blank frames (where the host-precomputed mask says skip).
-//
-// Per-frame the host loop becomes ``cudaMemcpyAsync(d_lp_frame_buf, ...) +
-// cudaGraphLaunch(picked_graph)`` — two launches replace the six kernels of
-// the eager path.  All step-aware kernels read ``*d_step`` at block entry
-// (Step 3 refactor) so the same captured graph is valid for every step at
-// the matching parity.
-// =============================================================================
+// Each stream lazily captures first-step, odd-parity, even-parity, and blank
+// graphs. Step-aware kernels read d_step at entry, so a graph is reusable for
+// every step with matching parity.
 
 namespace {
 
@@ -418,21 +397,9 @@ void ctc_beam_search_init_state_paged(TensorView state_buffer,
 // Streaming: process a whole chunk of frames in one call
 // =============================================================================
 //
-// Replaces the per-frame Python loop in ``GpuStreamingDecoder.decode_chunk``
-// with a single C++ launcher that iterates ``chunk_T`` frames and calls
-// ``streaming_step`` once per active frame.  Eliminates ~10 μs of Python
-// overhead per frame (Python→C++ trip + tensor-slice bookkeeping) which was
-// dominating wall time for batched streaming workloads.
-//
-// ``is_speech_mask`` is an optional CPU uint8 / bool tensor of length
-// ``chunk_T``: when present, frames where the mask is 0 are skipped (the
-// caller pre-computed the blank-threshold mask on GPU and copied it once).
-// When empty, every frame is decoded.
-//
-// Returns the new ``step`` (= start_step + #active frames decoded, capped at
-// ``max_seq_len``).  ``frame_idx`` after the chunk is always
-// ``start_frame_idx + chunk_T`` (or earlier if ``max_seq_len`` was reached);
-// the caller can compute it without a return value.
+// Decode one chunk without per-frame Python calls. An empty speech mask decodes
+// every frame; otherwise zero entries skip decoding. Returns the capped decoder
+// step, while frame position advances across the whole processed chunk.
 int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk,
                               TensorView is_speech_mask,
                               int64_t beam, int64_t blank_id,
@@ -652,13 +619,8 @@ int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk
 // Streaming: batched process a whole chunk for many streams at once
 // =============================================================================
 //
-// Replaces the per-stream Python loop in ``OutputProcessor.decode_streaming_chunk``
-// with a single C++ entrypoint that takes N state buffer pointers + a stacked
-// ``(N, T, V)`` log-prob tensor and processes every stream's chunk in one
-// call.  The per-frame work is the same as ``ctc_beam_search_chunk`` (per-state
-// graph cache, blank-skip mask, parity-aware graph selection); the only
-// difference is that the outer Python loop is folded into C++, eliminating
-// ~10 μs of Python overhead per stream per step.
+// Decode chunks for N states in one call. Per-frame behavior matches the
+// single-state entry point; all states share one decoder configuration.
 //
 // Tensor layout:
 //   * ``state_ptrs``     : ``(N,)`` int64 on **CPU**, each element is a
@@ -672,9 +634,6 @@ int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk
 //   * ``start_frame_idxs``: ``(N,)`` int32 on **CPU**, same read/mutate
 //                          contract as ``start_steps``.
 //
-// All N streams share the same ``(batch, beam, vocab_size, max_seq_len,
-// use_paged_memory, page_size, blank_id)`` config — the engine constructs
-// every per-stream ``StreamState`` from one ``GpuDecoderConfig``.
 void ctc_beam_search_chunk_batched(TensorView state_ptrs,
                                    TensorView log_prob_chunk,
                                    TensorView is_speech_mask,
@@ -919,13 +878,6 @@ void ctc_beam_search_read_state(TensorView out_tokens, TensorView out_times,
       << "CTC beam search read state failed: " << cudaGetErrorString(status);
 }
 
-// Batched form of the above: one launch for the whole ready set instead of
-// 3-4 ``cudaMemcpy2DAsync`` (flat) or one kernel (paged) per state.  This is
-// the read half of what ``ctc_beam_search_chunk_batched`` did for the decode —
-// at 64 concurrent streams the per-state form submits ~200 tiny GPU operations
-// per engine step carrying ~0.1 ms of copy, and the host time to issue them
-// dominates the streaming loop.
-//
 // Tensor layout:
 //   * ``state_ptrs``  : ``(N,)`` int64 on **CPU**, state buffer device pointers.
 //   * ``steps``       : ``(N,)`` int32 on **CPU**, each state's decoder step.
@@ -934,8 +886,7 @@ void ctc_beam_search_read_state(TensorView out_tokens, TensorView out_times,
 //   * ``out_lengths`` : ``(N, batch, beam)`` int32 on CUDA.
 //   * ``out_scores``  : ``(N, batch, beam)`` float32 on CUDA.
 //
-// All N states share one ``GpuDecoderConfig``, hence one ``(batch, beam,
-// vocab_size, max_seq_len, use_paged_memory, page_size)`` for the whole call.
+// All states share one decoder configuration.
 void ctc_beam_search_read_state_batched(TensorView out_tokens, TensorView out_times,
                                         TensorView out_lengths,
                                         TensorView out_scores, TensorView state_ptrs,

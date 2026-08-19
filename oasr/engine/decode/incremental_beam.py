@@ -1,34 +1,11 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Beam search for the incremental (label-synchronous) AR families.
+"""Beam search for label-synchronous autoregressive decoders.
 
-Greedy AR decode keeps one hypothesis per request and retires a row when it hits
-EOS.  Beam search keeps ``k`` per request, so the decoder grid is ``(B, k)``
-flattened to ``B * k`` rows, and a *request* retires only once its whole beam has
-finished.  Everything else — the tick budget, the round-robin over groups, the
-partial/final emission — is unchanged, which is why this lives beside
-:class:`~oasr.engine.decode.incremental.ArGroup` rather than replacing it.
-
-The enabling observation is that the AR decoder surface already has everything
-beam search needs.  ``select(state, keep)`` is implemented with
-``index_select``, and ``index_select`` permits **repeated** indices — so the same
-one call both *expands* B prefilled rows into ``B * k`` (indices
-``[0,0,..,1,1,..]``) and *reorders* the grid to follow each new beam slot's
-parent.  No new model-side method, and every model that supports greedy AR
-decode supports beam search for free.
-
-Two things are deliberately different from the transducer beam
-(:mod:`oasr.engine.decode.transducer_beam`):
-
-* **Hypotheses are host-side lists here.** The transducer runs one beam step per
-  encoder *frame* with a trivial predictor, so per-frame Python work dominates
-  and the tokens have to live on the device.  An AR step is a full decoder
-  forward — milliseconds — so ``k`` list copies per step are free by comparison,
-  and lists keep the EOS bookkeeping readable.
-* **Finished hypotheses are set aside, not dropped.** A beam slot that emits EOS
-  is complete: its score is final and it must stop competing, but it is still a
-  candidate for the answer.  Greedy has no analogue because its single
-  hypothesis finishing *is* the answer.
+Each request owns ``k`` flattened decoder rows. Repeated ``select`` indices
+expand and reorder states without a model-specific beam API. Hypotheses remain
+host-side because decoder forwards dominate their bookkeeping; completed
+hypotheses stop competing but remain answer candidates.
 """
 
 from __future__ import annotations

@@ -64,16 +64,8 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m pytest tests/ --collect-only -q
 
-      # --min-passed is a coverage floor, not a target: it fails the job if a
-      # bad CUDA guard or a silent import failure shrinks the CPU surface.
-      # 632 is the observed count; 620 leaves room for small dependency drift
-      # without tolerating a module going dark.  Do not lower it to make a red
-      # run pass — find what started skipping.
-      #
-      # It dropped from 642 when the post-decode alignment pass became C++ only
-      # (no Python fallback, so nothing here can run it): tests/test_word_timings.py
-      # skips its grouping and emission-span classes, and tests/test_alignment_cpp.py
-      # skips whole.  Those are covered by test-gpu.yml, which builds the extension.
+      # Coverage floor catches silent import or guard failures. Extension-only
+      # alignment tests are intentionally covered by the GPU workflow.
       - name: pytest
         env:
           PYTHONPATH: ${{ github.workspace }}
