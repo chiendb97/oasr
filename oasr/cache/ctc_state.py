@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-stream CTC decoder GPU state manager.
 
-Uses a **single shared** :class:`~oasr.ctc_decode.GpuStreamingDecoder`
-engine with per-stream :class:`~oasr.ctc_decode.StreamState` objects,
+Uses a **single shared** :class:`~oasr.functionals.ctc_decode.GpuStreamingDecoder`
+engine with per-stream :class:`~oasr.functionals.ctc_decode.StreamState` objects,
 enabling interleaved chunk processing across many concurrent requests
 while sharing the JIT module, config, and blank-threshold computation.
 
@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from oasr.ctc_decode import (
+from oasr.functionals.ctc_decode import (
     GpuDecoderConfig,
     GpuStreamingDecoder,
     StreamHandle,
@@ -142,7 +142,7 @@ class CtcStateCacheManager:
         """Return :class:`StreamState` objects for ``stream_ids`` in order.
 
         Used by the engine to feed
-        :meth:`~oasr.ctc_decode.GpuStreamingDecoder.decode_chunk_batch`
+        :meth:`~oasr.functionals.ctc_decode.GpuStreamingDecoder.decode_chunk_batch`
         with the active set of streams in one call.
 
         Raises

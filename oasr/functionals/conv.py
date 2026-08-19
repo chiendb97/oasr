@@ -485,7 +485,7 @@ def conv2d(
         dilation_w,
         groups,
     ):
-        from oasr.gemm import _dispatch_gemm, gemm
+        from oasr.functionals.gemm import _dispatch_gemm, gemm
         from oasr.tune import is_tuning_enabled
 
         if is_tuning_enabled():
@@ -651,7 +651,7 @@ def conv2d_activation(
         dilation_w,
         groups,
     ):
-        from oasr.gemm import _dispatch_gemm_activation, gemm_activation
+        from oasr.functionals.gemm import _dispatch_gemm_activation, gemm_activation
         from oasr.tune import is_tuning_enabled
 
         if is_tuning_enabled():

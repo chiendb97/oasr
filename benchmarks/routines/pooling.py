@@ -20,7 +20,7 @@ from benchmarks.routines.bench_utils import (
     parse_dtype,
     profile_kernel,
 )
-from oasr.pooling import _avg_pool1d_output_length
+from oasr.functionals.pooling import _avg_pool1d_output_length
 
 SUBROUTINES = ["avg_pool1d"]
 

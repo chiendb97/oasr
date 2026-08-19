@@ -12,9 +12,9 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from oasr.cache import CacheConfig
-from oasr.ctc_decode import GpuDecoderConfig
 from oasr.decode import DecoderConfig
 from oasr.features import FeatureConfig
+from oasr.functionals.ctc_decode import GpuDecoderConfig
 from oasr.models.base import BaseModelConfig, CacheSpec
 
 logger = logging.getLogger(__name__)

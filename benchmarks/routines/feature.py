@@ -10,7 +10,7 @@ Subroutines
 
 Backends
 --------
-* ``cuda``       — OASR's CUDA kernel chain (``oasr.feature.*`` + ``oasr.rfft_power``).
+* ``cuda``       — OASR's CUDA kernel chain (``oasr.functionals.feature.*`` + ``oasr.rfft_power``).
 * ``torch``      — pure-PyTorch GPU equivalent (vectorized over the batch).
 * ``torchaudio`` — per-utterance loop over ``torchaudio.compliance.kaldi``
                     (only for the pipeline subroutines).
@@ -183,7 +183,9 @@ def setup_fbank_preprocess(batch, num_frames, frame_length, n_fft, dtype=torch.f
     coef = 0.97
 
     def oasr_fn():
-        return oasr.feature.fbank_preprocess(frames, window, n_fft=n_fft, preemph_coef=coef)
+        return oasr.functionals.feature.fbank_preprocess(
+            frames, window, n_fft=n_fft, preemph_coef=coef
+        )
 
     def torch_fn():
         # Equivalent vectorized batched op chain matching the OASR kernel.
@@ -207,7 +209,7 @@ def setup_mel_log(batch, num_frames, n_freq, num_mel, dtype=torch.float32):
     eps = torch.finfo(dtype).tiny
 
     def oasr_fn():
-        return oasr.feature.mel_log(power, mel_mat, log_floor=eps)
+        return oasr.functionals.feature.mel_log(power, mel_mat, log_floor=eps)
 
     def torch_fn():
         return torch.matmul(power, mel_mat.t()).clamp_min(eps).log()
@@ -222,7 +224,7 @@ def setup_dct_lifter(batch, num_frames, num_mel, num_ceps, dtype=torch.float32):
     lifter = _cepstral_lifter(num_ceps, 22.0, device)
 
     def oasr_fn():
-        return oasr.feature.dct_lifter(log_mel, dct, lifter=lifter)
+        return oasr.functionals.feature.dct_lifter(log_mel, dct, lifter=lifter)
 
     def torch_fn():
         return torch.matmul(log_mel, dct.t()) * lifter
@@ -247,9 +249,9 @@ def _oasr_fbank_pipeline(
 ) -> torch.Tensor:
     """OASR-kernel chain: unfold → fbank_preprocess → rfft_power → mel_log."""
     frames = waveforms.unfold(-1, frame_length, frame_shift).contiguous()
-    preprocessed = oasr.feature.fbank_preprocess(frames, window, n_fft=n_fft)
+    preprocessed = oasr.functionals.feature.fbank_preprocess(frames, window, n_fft=n_fft)
     power = oasr.rfft_power(preprocessed)
-    return oasr.feature.mel_log(power, mel_mat, log_floor=eps)
+    return oasr.functionals.feature.mel_log(power, mel_mat, log_floor=eps)
 
 
 def _torch_fbank_pipeline(
@@ -368,7 +370,7 @@ def _oasr_mfcc_pipeline(
         mel_mat=mel_mat,
         eps=eps,
     )
-    return oasr.feature.dct_lifter(log_mel, dct, lifter=lifter)
+    return oasr.functionals.feature.dct_lifter(log_mel, dct, lifter=lifter)
 
 
 def _torch_mfcc_pipeline(

@@ -299,7 +299,7 @@ def get_unique_conv2d_compile_configs(
 
 
 # =============================================================================
-# Default configs (used by non-autotuned paths in oasr/conv.py)
+# Default configs (used by non-autotuned paths in oasr/functionals/conv.py)
 # =============================================================================
 
 _sm = _get_target_sm()

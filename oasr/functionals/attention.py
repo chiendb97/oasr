@@ -14,8 +14,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from .api_logging import oasr_api
-from .jit.attention import get_compiled_fmha, select_backend
+from oasr.api_logging import oasr_api
+from oasr.jit.attention import get_compiled_fmha, select_backend
 
 __all__ = ["fmha", "fmha_varlen"]
 
@@ -719,7 +719,7 @@ def _call_cute_dsl_varlen(
     ``domain_offset`` so the dense mainloop + helpers run unchanged with zero
     attention padding and no host-side scatter.
     """
-    from .jit.attention import get_compiled_fmha_varlen
+    from oasr.jit.attention import get_compiled_fmha_varlen
 
     H, D = q.size(1), q.size(2)
     H_kv = k.size(1)

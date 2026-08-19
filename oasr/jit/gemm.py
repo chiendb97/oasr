@@ -811,7 +811,7 @@ def group_gemm_func_name(cfg: Union[CutlassGemmConfig, CutlassGemmConfigSm90]) -
 
 
 # =============================================================================
-# Default configs (used by non-autotuned paths in oasr/gemm.py)
+# Default configs (used by non-autotuned paths in oasr/functionals/gemm.py)
 # =============================================================================
 
 _sm = _get_target_sm()

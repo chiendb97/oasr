@@ -6,7 +6,7 @@ Two-stage offline decode for hybrid checkpoints that carry both a CTC head and
 an AED (bi)transformer decoder:
 
 1. **CTC n-best** — the GPU prefix beam search
-   (:func:`oasr.ctc_decode.ctc_beam_search_decode`) already returns the full
+   (:func:`oasr.functionals.ctc_decode.ctc_beam_search_decode`) already returns the full
    beam per utterance (``tokens[b][k]`` + ``scores[b, k]``).
 2. **One teacher-forced decoder pass** — every hypothesis of every utterance is
    scored in a single batched forward (left-to-right, plus the right-to-left
@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from oasr.ctc_decode import GpuDecoderConfig, ctc_beam_search_decode
+from oasr.functionals.ctc_decode import GpuDecoderConfig, ctc_beam_search_decode
 from oasr.models.decoders.transformer_decoder import add_sos_eos, reverse_pad_list
 
 from ..request import Request, RequestOutput

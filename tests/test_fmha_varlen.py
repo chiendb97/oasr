@@ -18,7 +18,7 @@ import math
 import pytest
 import torch
 
-from oasr.attention import fmha, fmha_varlen
+from oasr.functionals.attention import fmha, fmha_varlen
 
 
 def _tol(dtype):

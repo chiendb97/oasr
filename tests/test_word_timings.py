@@ -314,7 +314,7 @@ class TestKernelEmissionFrames:
 
     @pytest.mark.parametrize("paged", [False, True])
     def test_recorded_frames_are_the_frames_the_labels_fired_at(self, paged):
-        from oasr.ctc_decode import ctc_beam_search_decode
+        from oasr.functionals.ctc_decode import ctc_beam_search_decode
 
         # 12 and 14 fire the same label with a blank between them: two tokens.
         fires = {5: 3, 12: 7, 14: 7, 25: 4, 33: 9}
@@ -333,7 +333,7 @@ class TestKernelEmissionFrames:
 
     def test_times_are_not_copied_back_unless_asked(self):
         """The frames are always recorded; the device→host copy is the opt-in."""
-        from oasr.ctc_decode import ctc_beam_search_decode
+        from oasr.functionals.ctc_decode import ctc_beam_search_decode
 
         lp = _peaky({5: 3, 20: 4}, 30, 10).cuda()
         args = {"beam_size": 5, "blank_id": BLANK}
@@ -357,7 +357,7 @@ class TestKernelEmissionFrames:
         through the chunk loop, the legacy one has to be handed the device
         counter — so only the fused path being right is not the property.
         """
-        from oasr.ctc_decode import GpuDecoderConfig, GpuStreamingDecoder
+        from oasr.functionals.ctc_decode import GpuDecoderConfig, GpuStreamingDecoder
 
         monkeypatch.setenv("OASR_CTC_FUSED", "1" if fused else "0")
         cfg = GpuDecoderConfig(
@@ -381,7 +381,7 @@ class TestKernelEmissionFrames:
         checks the *kernel's* frames against it, so the production path inherits
         that external reference without running a DP per request.
         """
-        from oasr.ctc_decode import ctc_beam_search_decode
+        from oasr.functionals.ctc_decode import ctc_beam_search_decode
 
         rng = np.random.default_rng(4)
         for _ in range(8):

@@ -60,7 +60,7 @@ def _make_inputs(batch: int, seq_len: int, vocab_size: int):
 
 
 def _make_oasr_fn(log_prob, seq_lengths, beam_size, max_seq_len):
-    from oasr.ctc_decode import ctc_beam_search_decode
+    from oasr.functionals.ctc_decode import ctc_beam_search_decode
 
     ctc_beam_search_decode(
         log_prob,

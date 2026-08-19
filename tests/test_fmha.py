@@ -508,7 +508,7 @@ class TestRingDepthFitsSmem:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_head_dim_128_matches_reference(self):
         """And the shallower ring must still compute the right answer."""
-        from oasr.attention import fmha
+        from oasr.functionals.attention import fmha
 
         torch.manual_seed(0)
         B, H, T, D = 2, 4, 200, 128
@@ -548,7 +548,7 @@ class TestCausal:
     )
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_matches_sdpa(self, T_q, T_k, dtype):
-        from oasr.attention import fmha
+        from oasr.functionals.attention import fmha
 
         torch.manual_seed(0)
         B, H, D = 2, 4, 64
@@ -565,7 +565,7 @@ class TestCausal:
     def test_composes_with_per_row_lengths(self):
         """Causal AND a length mask: the kernel applies both, so the skipping
         bound must be the *tighter* of the two, never the causal one alone."""
-        from oasr.attention import fmha
+        from oasr.functionals.attention import fmha
 
         torch.manual_seed(1)
         B, H, T, D = 2, 4, 192, 64
@@ -622,7 +622,7 @@ class TestPerRowKeyStart:
         ],
     )
     def test_matches_reference(self, B, H, T_q, T_k, D, starts, lens):
-        from oasr.attention import fmha
+        from oasr.functionals.attention import fmha
 
         torch.manual_seed(0)
         q = torch.randn(B, H, T_q, D, device="cuda", dtype=torch.float16)
@@ -642,7 +642,7 @@ class TestPerRowKeyStart:
         left-pad window.  Each must be applied, so the result is the
         intersection — the case SDPA cannot express without materializing a
         mask, which is exactly why fusing it pays."""
-        from oasr.attention import fmha
+        from oasr.functionals.attention import fmha
 
         torch.manual_seed(2)
         B, H, T, D = 2, 4, 128, 64
@@ -666,7 +666,7 @@ class TestPerRowKeyStart:
         so it poisons the *real* rows.  The kernel's empty-row clamp is what
         makes left padding safe to hand it without the caller pre-opening a
         diagonal."""
-        from oasr.attention import fmha
+        from oasr.functionals.attention import fmha
 
         torch.manual_seed(3)
         B, H, T, D = 1, 4, 128, 64
@@ -683,7 +683,7 @@ class TestPerRowKeyStart:
     def test_no_starts_is_unchanged(self):
         """Regression: omitting ``cache_seqstarts`` must compile and run the
         same kernel as before — the predicate is const-folded out."""
-        from oasr.attention import fmha
+        from oasr.functionals.attention import fmha
 
         torch.manual_seed(4)
         B, H, T, D = 2, 4, 128, 64
@@ -702,7 +702,7 @@ class TestPerRowKeyStart:
 
     def test_starts_without_lens_raises(self):
         """A start with no end is not a window."""
-        from oasr.attention import fmha
+        from oasr.functionals.attention import fmha
 
         q = torch.randn(1, 4, 8, 64, device="cuda", dtype=torch.float16)
         st = torch.zeros(1, device="cuda", dtype=torch.int32)
@@ -714,7 +714,7 @@ class TestPerRowKeyStart:
         serves both.  Not a combination anything in-tree uses today — paged
         streaming history grows rightward — but the claim is cheap to pin, and
         an untested one in a kernel is how it stops being true."""
-        from oasr.attention import _sdpa_reference, fmha, gather_paged_kv
+        from oasr.functionals.attention import _sdpa_reference, fmha, gather_paged_kv
 
         torch.manual_seed(5)
         B, H, D, block, nblk = 2, 4, 64, 16, 8
@@ -757,7 +757,7 @@ class TestPerRowKeyStart:
         precondition on the caller today; predicating the load against the
         length (as upstream FlashAttention does) is what would retire it.
         """
-        from oasr.attention import fmha
+        from oasr.functionals.attention import fmha
 
         torch.manual_seed(7)
         B, H, D = 2, 4, 64

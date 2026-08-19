@@ -4,7 +4,7 @@
 
 A single inference-only attention class is provided:
 :class:`RelPositionMultiHeadedAttention`. The actual attention compute
-goes through :func:`oasr.attention.fmha` (CuteDSL on supported GPUs,
+goes through :func:`oasr.functionals.attention.fmha` (CuteDSL on supported GPUs,
 SDPA fallback otherwise) for two cache modes:
 
 * offline (``cache=None``)
@@ -263,7 +263,7 @@ class RelPositionMultiHeadedAttention(nn.Module):
         total_kv_lens = cache.cache_seqlens + T_q  # (B,) on GPU
 
         # Local import to avoid a circular import oasr->layers->attention.
-        from oasr.attention import fmha
+        from oasr.functionals.attention import fmha
 
         out = fmha(
             q_with_bias_u,
@@ -307,7 +307,7 @@ class RelPositionMultiHeadedAttention(nn.Module):
         # GQA broadcast happens inside fmha (kernel handles head fan-out),
         # so we pass k/v unexpanded.
         # Local import to avoid a circular import via oasr -> layers -> attention.
-        from oasr.attention import fmha
+        from oasr.functionals.attention import fmha
 
         out = fmha(
             q_with_bias_u,
@@ -339,7 +339,7 @@ class RelPositionMultiHeadedAttention(nn.Module):
         the per-segment SDPA reference.  Bit-exact to ``B=1`` inference.
         """
         assert qkv.size(0) == 1, "packed attention expects a single packed row (B=1)"
-        from oasr.attention import fmha_varlen
+        from oasr.functionals.attention import fmha_varlen
 
         scale = 1.0 / math.sqrt(self.d_k)
         S, Tm = layout.num_segs, layout.max_seg_len

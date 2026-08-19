@@ -224,7 +224,7 @@ def format_gap_report() -> str:
     # A GEMM that reached a kernel can still have reached an *untuned* one, which
     # is a third thing: not debt, not a decision, just nobody having measured this
     # model's widths.  Imported lazily — ``oasr.jit.gemm`` is deliberately kept off
-    # the layers import path (see the note at the top of ``oasr/gemm.py``).
+    # the layers import path (see the note at the top of ``oasr/functionals/gemm.py``).
     try:
         from oasr.jit.gemm import rule_misses
     except Exception:  # noqa: BLE001 — diagnostics must never break the caller

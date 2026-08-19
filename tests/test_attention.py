@@ -199,7 +199,7 @@ def test_a_paged_config_the_kernel_refuses_still_answers():
     """A declared gap has to *serve* the shape, not raise on it.
 
     The paged loader skips per-element head-dim predication, so the arch class
-    refuses a head_dim off its 32-element MMA stride.  ``oasr.attention.fmha``
+    refuses a head_dim off its 32-element MMA stride.  ``oasr.functionals.attention.fmha``
     raises there — the right contract for a caller naming the kernel by name —
     which leaves the waist to gather the pages and answer on SDPA, counting the
     gap so the coverage debt stays visible.  A shipped decoder's head_dim is 64

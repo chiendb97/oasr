@@ -14,7 +14,7 @@ from oasr.cache.ctc_state import CtcStateCacheManager
 from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.slot_cnn import SlotCnnCache
 from oasr.cache.state import SlotStateCache, SlotTensor
-from oasr.ctc_decode import GpuStreamingDecoder, StreamHandle, StreamState
+from oasr.functionals.ctc_decode import GpuStreamingDecoder, StreamHandle, StreamState
 from oasr.utils.staging import to_device
 
 
@@ -91,7 +91,7 @@ class StreamContext:
         """Return the raw per-stream :class:`StreamState`.
 
         Used by the engine's batched streaming-decode path
-        (:meth:`~oasr.ctc_decode.GpuStreamingDecoder.decode_chunk_batch`)
+        (:meth:`~oasr.functionals.ctc_decode.GpuStreamingDecoder.decode_chunk_batch`)
         which feeds an array of states into a single C++ launcher.
         """
         assert self._ctc_state is not None, "StreamContext has no CTC state manager"

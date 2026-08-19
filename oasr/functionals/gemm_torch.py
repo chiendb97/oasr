@@ -4,7 +4,7 @@
 
 These mirror the OASR CUTLASS GEMM launcher contract exactly so they can be used
 interchangeably by the autotuner (as a ``Tactic("torch")`` candidate) and by the
-shape-aware production selector in :mod:`oasr.gemm`:
+shape-aware production selector in :mod:`oasr.functionals.gemm`:
 
   * output tensor first, written **in place** (no new allocations — CUDA-graph safe);
   * ``B`` is the ``[N, K]`` weight (transB), so ``D = A @ Bᵀ`` (== ``F.linear``);
@@ -12,7 +12,7 @@ shape-aware production selector in :mod:`oasr.gemm`:
   * ``split_k_slices`` is accepted for signature parity and ignored (cuBLAS picks
     its own internal split).
 
-Activation IDs match :mod:`oasr.activation`: RELU=0, tanh-GELU=1, SWISH=2
+Activation IDs match :mod:`oasr.functionals.activation`: RELU=0, tanh-GELU=1, SWISH=2
 (SiLU), exact-erf GELU=4.
 
 Kept deliberately free of any ``oasr.tune`` import so the production GEMM path can

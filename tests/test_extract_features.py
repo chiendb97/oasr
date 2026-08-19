@@ -15,8 +15,8 @@ import torch
 torchaudio = pytest.importorskip("torchaudio")
 import torchaudio.compliance.kaldi as kaldi  # noqa: E402
 
-from oasr.feature import dct_lifter, fbank_preprocess, mel_log  # noqa: E402
 from oasr.features import FeatureConfig  # noqa: E402
+from oasr.functionals.feature import dct_lifter, fbank_preprocess, mel_log  # noqa: E402
 from oasr.layers import Fbank, Mfcc  # noqa: E402
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
