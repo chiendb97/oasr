@@ -16,7 +16,12 @@ torchaudio = pytest.importorskip("torchaudio")
 import torchaudio.compliance.kaldi as kaldi  # noqa: E402
 
 from oasr.features import FeatureConfig  # noqa: E402
-from oasr.functionals.feature import dct_lifter, fbank_preprocess, mel_log  # noqa: E402
+from oasr.functionals.feature import (  # noqa: E402
+    dct_lifter,
+    fbank_preprocess,
+    mel_log,
+    whisper_logmel,
+)
 from oasr.layers import Fbank, Mfcc  # noqa: E402
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -144,6 +149,21 @@ class TestDctLifter:
         dct = torch.randn(C, M, device="cuda", dtype=torch.float32)
         out = dct_lifter(log_mel, dct, lifter=None)
         torch.testing.assert_close(out, log_mel @ dct.t(), rtol=1e-4, atol=1e-4)
+
+
+@CUDA
+class TestWhisperLogMelKernel:
+    def test_projection_and_per_row_floor_match_reference(self):
+        torch.manual_seed(9)
+        power = torch.rand(3, 17, 33, device="cuda")
+        filters = torch.rand(8, 33, device="cuda")
+        filters *= torch.linspace(0.1, 1.0, 8, device="cuda").unsqueeze(1)
+
+        got = whisper_logmel(power, filters)
+        ref = torch.log10((power @ filters.t()).clamp_min(1e-10))
+        row_max = ref.amax(dim=(1, 2), keepdim=True)
+        ref = (torch.maximum(ref, row_max - 8.0) + 4.0) / 4.0
+        torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

@@ -104,6 +104,22 @@ class TestWhisperLogmel:
         solo, _ = batched_whisper_logmel(w1.unsqueeze(0), torch.tensor([5000]), self.CFG)
         assert torch.allclose(both[0], solo[0], atol=1e-5)
 
+    @pytest.mark.cuda
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_kernel_path_matches_the_torch_recipe(self, monkeypatch):
+        """KG15: framing, cuFFT power, mel/log10 and per-row max floor."""
+        monkeypatch.delenv("OASR_FEATURE_BACKEND", raising=False)
+        torch.manual_seed(7)
+        lengths = torch.tensor([16000, 7311, 997])
+        waveforms = torch.zeros(3, 16000)
+        for b, length in enumerate(lengths.tolist()):
+            waveforms[b, :length] = torch.randn(length) * (0.1 + b * 0.2)
+
+        expected, expected_lengths = batched_whisper_logmel(waveforms, lengths, self.CFG)
+        got, got_lengths = batched_whisper_logmel(waveforms.cuda(), lengths.cuda(), self.CFG)
+        assert torch.equal(got_lengths.cpu(), expected_lengths)
+        torch.testing.assert_close(got.cpu(), expected, rtol=1e-5, atol=1e-6)
+
     @pytest.mark.requires_assets("WHISPER_CKPT")
     def test_matches_transformers_feature_extractor(self):
         transformers = pytest.importorskip("transformers")

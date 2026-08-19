@@ -2,19 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Low-level CUDA-kernel functional API for the log-mel / FBANK / MFCC pipelines.
 
-Four building blocks, which chain through :func:`oasr.rfft_power`:
+Feature building blocks, several of which chain through :func:`oasr.rfft_power`:
 
-* :func:`stft_frame` -- framing + signal-domain pre-emphasis + windowing +
-  zero-pad, straight off a padded waveform batch. Owns the framing, so the
-  caller needs neither ``unfold`` nor ``torch.stft``; the ``center_offset`` /
-  ``win_offset`` / boundary knobs cover both the centered NeMo/Whisper grid and
-  Kaldi's ``snip_edges`` one.
+* :func:`stft_frame` -- framing + optional per-frame DC removal + pre-emphasis +
+  windowing + zero-pad, straight off a padded waveform batch. Owns the framing,
+  so the caller needs neither ``unfold`` nor ``torch.stft``; the offset, padding
+  and boundary knobs cover centered NeMo/Whisper and Kaldi ``snip_edges`` grids.
 * :func:`fbank_preprocess` -- the pre-framed alternative to the above: per-frame
   DC removal + pre-emphasis + windowing + zero-pad.
 * :func:`mel_log` -- mel filterbank + log (floor and/or additive guard) over a
   power spectrum, with optional per-row frame-count masking.
 * :func:`dct_lifter` -- DCT-II + (optional) cepstral lifter + (optional)
   replace ``c[0]`` with a per-frame log-energy. Used by MFCC.
+* :func:`whisper_logmel` -- mel projection + log10 + Whisper's per-utterance
+  max floor and affine normalization.
+* :func:`lfr_gather` -- varlen low-frame-rate stacking with replicated edges.
 
 :class:`oasr.layers.Fbank` / :class:`oasr.layers.Mfcc` wrap the pre-framed chain;
 :func:`oasr.features.batched_nemotron_logmel` wraps the :func:`stft_frame` one.
@@ -50,14 +52,18 @@ def stft_frame(
     win_offset: Optional[int] = None,
     preemph_coef: float = 0.0,
     preemph_replicate: bool = False,
+    remove_dc_offset: bool = False,
+    pad_mode: str = "constant",
+    signal_length: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Frame, pre-emphasise, window and zero-pad a padded waveform batch.
 
     Frame ``f`` covers signal samples ``f * hop_length - center_offset + i`` for
-    ``i`` in ``[0, n_fft)``.  Everything outside ``[0, lengths[b])`` reads as
-    zero — which is simultaneously the constant STFT padding and the per-row
-    length mask.
+    ``i`` in ``[0, n_fft)``. Samples outside each row's valid length read as
+    zero. ``signal_length`` describes the logical padded/trimmed window; reads
+    outside it use constant or reflect padding without materializing that
+    window.
 
     Args:
         waveform: ``(B, T)`` float32 padded waveforms (CUDA, contiguous).
@@ -81,6 +87,14 @@ def stft_frame(
             domain before windowing. ``0.0`` disables.
         preemph_replicate: Boundary at ``t == 0``: ``False`` gives NeMo's
             ``y[0] = x[0]``, ``True`` gives Kaldi's ``y[0] = (1 - coef) * x[0]``.
+        remove_dc_offset: Subtract the mean of each window before pre-emphasis.
+            This also makes pre-emphasis frame-local, including its leading
+            boundary, as required by Kaldi.
+        pad_mode: ``"constant"`` or ``"reflect"`` for reads outside the logical
+            signal. Whisper uses reflect; NeMo and Kaldi use constant.
+        signal_length: Logical signal width before centered padding. Defaults
+            to the physical waveform width. It may be larger (implicit zero
+            padding) or smaller (logical trimming) than that width.
         out: Optional pre-allocated ``(B, num_frames, n_fft)`` float32 output.
 
     Returns:
@@ -99,6 +113,18 @@ def stft_frame(
         raise ValueError(f"hop_length must be positive, got {hop_length}")
     if num_frames < 0:
         raise ValueError(f"num_frames must be non-negative, got {num_frames}")
+    if pad_mode not in ("constant", "reflect"):
+        raise ValueError(f"pad_mode must be 'constant' or 'reflect', got {pad_mode!r}")
+
+    if signal_length is None:
+        signal_length = int(waveform.shape[1])
+    if signal_length <= 0:
+        raise ValueError(f"signal_length must be positive, got {signal_length}")
+    if pad_mode == "reflect" and (signal_length <= 1 or signal_length <= max(center_offset, 0)):
+        raise ValueError(
+            "reflect padding must be smaller than signal_length, got "
+            f"center_offset={center_offset}, signal_length={signal_length}"
+        )
 
     if win_offset is None:
         win_offset = (n_fft - win_length) // 2
@@ -130,6 +156,9 @@ def stft_frame(
         int(win_offset),
         float(preemph_coef),
         bool(preemph_replicate),
+        bool(remove_dc_offset),
+        bool(pad_mode == "reflect"),
+        int(signal_length),
     )
     return out
 
@@ -322,5 +351,120 @@ def dct_lifter(
         lifter,
         energy,
         bool(replace_c0_with_energy),
+    )
+    return out
+
+
+@oasr_api
+def whisper_logmel(
+    power: torch.Tensor,
+    mel_mat: torch.Tensor,
+    *,
+    log_floor: float = 1e-10,
+    max_floor: float = 8.0,
+    offset: float = 4.0,
+    scale: float = 0.25,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Whisper mel projection, log10 and per-utterance normalization.
+
+    Args:
+        power: ``(B, num_frames, n_freq)`` float32 power spectrum.
+        mel_mat: ``(num_mel, n_freq)`` float32 mel filterbank.
+        log_floor: Clamp floor before ``log10``.
+        max_floor: Floor each row at ``row_max - max_floor``.
+        offset: Value added after flooring.
+        scale: Final multiplicative scale.
+        out: Optional ``(B, num_frames, num_mel)`` float32 output.
+
+    Returns:
+        Float32 Whisper features. The maximum and floor are independent for
+        every batch row, never shared across utterances.
+    """
+    if power.dtype != torch.float32 or mel_mat.dtype != torch.float32:
+        raise ValueError("power and mel_mat must both be float32")
+    if power.dim() != 3:
+        raise ValueError(f"power must be 3-D (B, frames, n_freq), got {power.dim()}-D")
+    if mel_mat.dim() != 2 or mel_mat.shape[1] != power.shape[2]:
+        raise ValueError(
+            "mel_mat must have shape (num_mel, n_freq), got "
+            f"{tuple(mel_mat.shape)} for n_freq={power.shape[2]}"
+        )
+    if log_floor <= 0.0:
+        raise ValueError(f"log_floor must be positive, got {log_floor}")
+    if max_floor < 0.0:
+        raise ValueError(f"max_floor must be non-negative, got {max_floor}")
+
+    out_shape = (power.shape[0], power.shape[1], mel_mat.shape[0])
+    if out is None:
+        out = torch.empty(out_shape, device=power.device, dtype=torch.float32)
+    elif tuple(out.shape) != out_shape or out.dtype != torch.float32:
+        raise ValueError(
+            f"out must have shape {out_shape} and dtype float32, "
+            f"got shape {tuple(out.shape)} dtype {out.dtype}"
+        )
+    if out.numel() == 0:
+        return out
+
+    _get_features_module().whisper_logmel(
+        out,
+        power.contiguous(),
+        mel_mat.contiguous(),
+        float(log_floor),
+        float(max_floor),
+        float(offset),
+        float(scale),
+    )
+    return out
+
+
+@oasr_api
+def lfr_gather(
+    features: torch.Tensor,
+    lengths: torch.Tensor,
+    lfr_m: int,
+    lfr_n: int,
+    num_output_frames: int,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Stack varlen feature frames with FunASR-compatible replicated edges.
+
+    ``output[b, t, m * F + f]`` reads frame
+    ``clamp(t * lfr_n + m - (lfr_m - 1) // 2, 0, lengths[b] - 1)``. Rows at
+    or beyond ``ceil(lengths[b] / lfr_n)`` are zero.
+    """
+    if features.dim() != 3:
+        raise ValueError(f"features must be (B, T, F), got shape {tuple(features.shape)}")
+    if lengths.dim() != 1 or lengths.numel() != features.shape[0]:
+        raise ValueError(
+            f"lengths must have shape ({features.shape[0]},), got {tuple(lengths.shape)}"
+        )
+    if lfr_m < 1 or lfr_n < 1:
+        raise ValueError(f"lfr_m/lfr_n must be >= 1, got {lfr_m}/{lfr_n}")
+    if num_output_frames < 0:
+        raise ValueError(f"num_output_frames must be non-negative, got {num_output_frames}")
+
+    out_shape = (
+        features.shape[0],
+        int(num_output_frames),
+        features.shape[2] * int(lfr_m),
+    )
+    if out is None:
+        out = features.new_empty(out_shape)
+    elif tuple(out.shape) != out_shape or out.dtype != features.dtype:
+        raise ValueError(
+            f"out must have shape {out_shape} and dtype {features.dtype}, "
+            f"got shape {tuple(out.shape)} dtype {out.dtype}"
+        )
+    if out.numel() == 0:
+        return out
+
+    _get_features_module().lfr_gather(
+        out,
+        features.contiguous(),
+        lengths.to(device=features.device, dtype=torch.int32).contiguous(),
+        int(lfr_m),
+        int(lfr_n),
     )
     return out

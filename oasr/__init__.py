@@ -62,7 +62,14 @@ from .functionals.ctc_decode import (
     StreamState,
     ctc_beam_search_decode,
 )
-from .functionals.feature import dct_lifter, fbank_preprocess, mel_log, stft_frame
+from .functionals.feature import (
+    dct_lifter,
+    fbank_preprocess,
+    lfr_gather,
+    mel_log,
+    stft_frame,
+    whisper_logmel,
+)
 from .functionals.fft import rfft, rfft_power
 from .functionals.gemm import bmm, gemm, gemm_activation, gemm_log_softmax, group_gemm
 from .functionals.norm import (
@@ -251,6 +258,8 @@ __all__ = [
     "fbank_preprocess",
     "mel_log",
     "dct_lifter",
+    "whisper_logmel",
+    "lfr_gather",
     # nn.Module wrappers
     "layers",
     "DepthwiseConv1d",

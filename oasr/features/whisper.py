@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from typing import Tuple
 
 import torch
@@ -38,12 +39,12 @@ _HOP = 160
 
 
 @functools.lru_cache(maxsize=8)
-@functools.lru_cache(maxsize=8)
 def _hann_window(device_str: str) -> torch.Tensor:
     """fp32 Hann window for the STFT, cached per device."""
     return torch.hann_window(_N_FFT, device=torch.device(device_str), dtype=torch.float32)
 
 
+@functools.lru_cache(maxsize=8)
 def _mel_filters(sample_rate: int, n_mels: int, device_str: str) -> torch.Tensor:
     """Slaney-normalized slaney-scale mel filterbank ``(n_mels, n_fft//2 + 1)``.
 
@@ -63,6 +64,50 @@ def _mel_filters(sample_rate: int, n_mels: int, device_str: str) -> torch.Tensor
         mel_scale="slaney",
     )  # (n_freqs, n_mels)
     return fb.t().contiguous().to(torch.device(device_str))
+
+
+def _use_kernel(waveforms: torch.Tensor) -> bool:
+    if os.environ.get("OASR_FEATURE_BACKEND", "").strip().lower() == "torch":
+        return False
+    return waveforms.is_cuda
+
+
+def _whisper_logmel_kernel(
+    waveforms: torch.Tensor,
+    lengths: torch.Tensor,
+    cfg: FeatureConfig,
+    n_samples: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Kernel chain over the logical fixed window, without materializing it."""
+    import oasr
+
+    device = waveforms.device
+    lengths_dev = lengths.to(device=device)
+    n_frames = n_samples // _HOP
+    frames = oasr.stft_frame(
+        waveforms.float(),
+        lengths_dev.clamp(max=n_samples),
+        _hann_window(str(device)),
+        _N_FFT,
+        _HOP,
+        n_frames,
+        center_offset=_N_FFT // 2,
+        pad_mode="reflect",
+        signal_length=n_samples,
+    )
+    # Keep cuFFT for Whisper's non-power-of-two transform. A custom 400-point
+    # mixed-radix kernel was measurably close at the tensor level but moved the
+    # Qwen2-Audio WER gate: the autoregressive decoder amplified feature errors
+    # up to 1.3e-3 into changed/truncated transcripts.  The framed input is
+    # bit-identical to torch.stft, so this preserves the quality oracle while
+    # the framing and mel/log/max-floor stages remain OASR kernels.
+    power = torch.fft.rfft(frames, n=_N_FFT).abs().square()
+    features = oasr.whisper_logmel(
+        power,
+        _mel_filters(cfg.sample_rate, cfg.num_mel_bins, str(device)),
+    )
+    feat_lengths = torch.div(lengths_dev + _HOP - 1, _HOP, rounding_mode="floor")
+    return features, feat_lengths.clamp(max=n_frames).to(torch.int32)
 
 
 def batched_whisper_logmel(
@@ -100,6 +145,19 @@ def batched_whisper_logmel(
     device = waveforms.device
     n_samples = int(cfg.sample_rate * cfg.whisper_chunk_seconds)
 
+    if T > n_samples:
+        # The engine rejects over-long audio at admission. A direct caller gets
+        # Whisper's trim semantics, but never silently.
+        logger.warning(
+            "whisper_logmel: trimming %d samples to the %.0fs window (%d samples); "
+            "audio beyond the window is dropped",
+            T,
+            cfg.whisper_chunk_seconds,
+            n_samples,
+        )
+    if _use_kernel(waveforms):
+        return _whisper_logmel_kernel(waveforms, lengths, cfg, n_samples)
+
     # Zero anything past each row's valid length, then pad/trim to 30 s.
     #
     # The engine's ``InputProcessor`` already zeroes the padded tail, so for the
@@ -113,18 +171,6 @@ def batched_whisper_logmel(
     if T < n_samples:
         wav = torch.nn.functional.pad(wav, (0, n_samples - T))
     elif T > n_samples:
-        # The engine rejects over-long audio at admission
-        # (``InputProcessor._check_input_duration``), so reaching here means a
-        # direct caller of this function bypassed that check.  Trim per the
-        # Whisper recipe but say so — a silent trim reads as a correct
-        # transcript of the whole utterance.
-        logger.warning(
-            "whisper_logmel: trimming %d samples to the %.0fs window (%d samples); "
-            "audio beyond the window is dropped",
-            T,
-            cfg.whisper_chunk_seconds,
-            n_samples,
-        )
         wav = wav[:, :n_samples]
 
     # Cached like the mel filters: a 400-point window is small, but rebuilding
