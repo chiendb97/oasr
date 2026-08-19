@@ -63,9 +63,8 @@ class ModelRunner:
         # ``service_mode`` pins the engine to one executor for its lifetime and
         # mismatched requests are rejected at admission, so an offline engine can
         # never reach a streaming forward — building the real backend would hold the
-        # paged KV pool plus the CNN-cache tensors (~0.4 GB at the defaults) for
-        # nothing, on exactly the offline/LLM deployments where VRAM is tightest
-        # (H13).  ``NoStreamingBackend`` allocates nothing and raises with an
+        # paged KV pool plus CNN-cache tensors for nothing.  ``NoStreamingBackend``
+        # allocates nothing and raises with an
         # actionable message if a streaming path is somehow reached.
         streaming_kind = model.encoder.streaming_kind
         if config.service_mode == "offline":

@@ -1,29 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Truly batched FBANK / MFCC matching torchaudio's Kaldi-compliant output.
+"""Batched FBANK and MFCC matching the supported torchaudio/Kaldi defaults.
 
-Replaces the per-utterance Python loop over
-``torchaudio.compliance.kaldi.fbank`` / ``mfcc`` (the throughput ceiling of
-the offline pipeline's GPU feature-extraction path) with a handful of fused
-tensor ops over the whole micro-batch.
-
-Matches :func:`torchaudio.compliance.kaldi.fbank` /
-:func:`torchaudio.compliance.kaldi.mfcc` with the default settings actually
-used by the OASR offline pipeline:
-
-* ``dither=0`` (deterministic inference)
-* ``use_energy=False``
-* ``snip_edges=True``
-* ``window_type='povey'`` or ``'hamming'`` (FunASR/Paraformer frontends)
-* ``preemphasis_coefficient=0.97``
-* ``remove_dc_offset=True`` (default)
-* ``round_to_power_of_two=True``
-* ``use_power=True``
-* ``use_log_fbank=True``
-
-For configurations outside this window callers should fall back to the
-per-utt loop over ``torchaudio.compliance.kaldi.{fbank,mfcc}`` via a thin
-dispatcher.
+Supports deterministic, snip-edges, power-spectrum log features with Povey or
+Hamming windows and no energy term. Other configurations use the per-utterance
+reference path.
 """
 
 from __future__ import annotations

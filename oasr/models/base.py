@@ -60,8 +60,8 @@ if TYPE_CHECKING:
 
 # Streaming-cache model an encoder uses, read by the engine to select a
 # ``StreamingEncoderBackend``.  Values: "paged" (engine paged-KV + slot-CNN,
-# Conformer-style), "stateful" (encoder owns per-layer recurrent state,
-# Zipformer-style), "none" (offline-only).  Kept a plain ``str``.
+# "stateful" (encoder owns per-layer recurrent state), or "none" (offline-only).
+# Kept a plain ``str``.
 StreamingKind = str
 
 # Decode-path selector, resolved to a registered ``DecodeStrategy`` by
@@ -391,9 +391,8 @@ class BaseEncoder(nn.Module, ABC):
     #: Whether :meth:`forward_packed` is implemented (sequence packing).
     supports_packing: bool = False
     #: Whether :meth:`forward_chunk_paged` (paged-KV streaming) is implemented.
-    #: Conformer-style encoders set this True; encoders with a different
-    #: streaming-cache model (e.g. Zipformer) leave it False and expose their
-    #: own streaming API instead.
+    #: Encoders using another streaming-cache model leave this false and expose
+    #: their own streaming API instead.
     supports_paged_streaming: bool = False
 
     @abstractmethod
@@ -440,16 +439,9 @@ class BaseEncoder(nn.Module, ABC):
         """Number of encoder layers (== paged KV cache layers)."""
         raise NotImplementedError
 
-    # ``n_kv_head`` / ``head_dim`` describe the *engine's paged-KV* layout, so only
-    # ``streaming_kind="paged"`` encoders need them.  They were abstract, which
-    # forced every offline-only encoder (Whisper, Paraformer SANM, the Qwen2-Audio
-    # tower) to implement two properties purely to satisfy the ABC — ceremony that
-    # reads as a requirement.  They are now paired with the existing
-    # ``supports_paged_streaming`` flag: an encoder that sets it True must override
-    # both, and one that does not need not.  Deliberately a raising default rather
-    # than a separate mixin the paged encoders inherit — the default is reachable
-    # from any encoder reference and says *why* the geometry is absent, which an
-    # ``AttributeError`` from a missing mixin would not.
+    # These properties describe the engine's paged-KV layout.  Only encoders with
+    # ``streaming_kind="paged"`` override them; the raising defaults make misuse
+    # fail with the missing contract instead of an incidental attribute error.
     @property
     def n_kv_head(self) -> int:
         """Number of KV attention heads per layer (paged streaming only)."""
@@ -744,9 +736,8 @@ class BaseAsrModel(nn.Module, ABC):
         """Streaming chunk encode → encoder hidden ``(B, chunk, D)`` (no head)."""
         if states is None:
             # Forwarded only when there *is* extra state, so an encoder whose
-            # cross-chunk state is K/V plus the conv cache — every in-tree paged
-            # encoder but Nemotron, and any out-of-tree one written before this
-            # axis existed — is called with the signature it declares.
+            # cross-chunk state is only K/V plus the convolution cache is called
+            # with the narrower signature it declares.
             return self.encoder.forward_chunk_paged(
                 input_features, offset, att_caches, cnn_cache, att_mask, cache_t1
             )

@@ -1,38 +1,9 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Per-family decode options, owned by the strategy that reads them.
+"""Strategy-owned decode option declarations and resolution.
 
-Every knob that only one decode family understands used to be a flat field on
-:class:`~oasr.engine.EngineConfig`: ``rescoring_ctc_weight``,
-``transducer_max_sym_per_frame``, ``fst_path``, ``llm_prompt`` … That made
-"add a decode family" an *engine-core* edit, contradicting the extension
-contract in ``docs/architecture.md``, and it left every engine — Whisper and
-speech-LLM included — instantiating a CTC ``GpuDecoderConfig`` and a WFST
-``DecoderConfig`` it would never look at.
-
-Here a strategy declares its own options dataclass::
-
-    @dataclass(frozen=True)
-    class TransducerOptions:
-        max_sym_per_frame: int = option(10, legacy="transducer_max_sym_per_frame")
-
-    class TransducerDecodeStrategy(DecodeStrategy):
-        options_cls = TransducerOptions
-
-and reads ``self.options.max_sym_per_frame``.  :class:`DecodeStrategy`'s
-constructor resolves it once, from three layers, last wins:
-
-1. the dataclass defaults;
-2. the **legacy** ``EngineConfig`` field named by ``legacy=``, if the class
-   still has one — the alias keeps the public API and every ``oasr-server``
-   flag working, and is safe to read unconditionally because the alias carries
-   the same default;
-3. ``EngineConfig.decode_options`` — the generic dict the serving layer's
-   ``--decode-option k=v`` writes into.
-
-An unknown key in ``decode_options`` is an **error** naming the valid ones. The
-alternative — ignoring it — is the silent-drop failure mode S9 was written
-about: a typo'd option that changes nothing and reports nothing.
+Values resolve from dataclass defaults, compatible legacy fields, then generic
+``decode_options`` overrides. Unknown keys fail rather than being ignored.
 """
 
 from __future__ import annotations

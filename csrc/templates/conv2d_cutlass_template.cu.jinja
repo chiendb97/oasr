@@ -10,14 +10,11 @@
 
 using namespace oasr;
 
-// Baked-in config for this variant
 using Config = oasr::conv::CutlassConv2dConfig<{{ tile_m }}, {{ tile_n }}, {{ tile_k }},
                                                {{ warp_m }}, {{ warp_n }}, {{ warp_k }},
                                                {{ stages }}, {{ sm_version }}>;
 
-// =============================================================================
-// Helper: map CUDA types to CUTLASS types
-// =============================================================================
+// Map CUDA types to CUTLASS types.
 
 namespace {
 
@@ -38,9 +35,7 @@ struct ToCutlassType<__nv_bfloat16> {
 
 }  // namespace
 
-// =============================================================================
 // Conv2D launcher
-// =============================================================================
 
 void {{ func_name }}(TensorView output, TensorView input, TensorView filter, Optional bias_opt,
             int64_t pad_h, int64_t pad_w, int64_t stride_h, int64_t stride_w,
@@ -90,9 +85,7 @@ void {{ func_name }}(TensorView output, TensorView input, TensorView filter, Opt
 TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});
 
 {% if with_activation %}
-// =============================================================================
 // Conv2D + Activation launcher
-// =============================================================================
 
 void {{ func_name }}_activation(TensorView output, TensorView input, TensorView filter,
                      Optional bias_opt, int64_t activation_type,
@@ -175,14 +168,7 @@ void {{ func_name }}_activation(TensorView output, TensorView input, TensorView 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}_activation, {{ func_name }}_activation);
 {% endif %}
 
-// =============================================================================
-// Dense Conv1D launchers
-//
-// BTC / KSC are byte-for-byte the packed NHWC / KRSC layouts of a height-one
-// Conv2D problem.  Calling the same implicit-GEMM specialization directly keeps
-// the public contract three-dimensional and avoids framework-side view or copy
-// operations on the hot path.
-// =============================================================================
+// Packed BTC/KSC match height-one NHWC/KRSC, avoiding a framework-side copy.
 
 void conv1d_{{ config_name }}(TensorView output, TensorView input, TensorView filter,
                               Optional bias_opt, int64_t padding, int64_t stride,

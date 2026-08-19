@@ -317,19 +317,8 @@ class Request:
     ) -> None:
         self.request_id: str = request_id or uuid.uuid4().hex
         self.decoding: Optional[DecodingOptions] = decoding
-        # The engine's single audio input slot — always a **waveform** (1-D
-        # float32 samples) or ``None``; the engine never takes file paths
-        # (decode at the entry point).  Its role depends on the mode:
-        #   * offline — the input waveform.  ``prepare_offline`` canonicalises
-        #     it in place (→ 1-D float32 CPU), ``collate`` consumes it and
-        #     then clears it to ``None`` once the GPU feature tensor owns the
-        #     batch.
-        #   * streaming — ``None`` for the chunk-by-chunk API
-        #     (``add_streaming_request`` + ``feed_chunk``), or a pre-loaded
-        #     waveform that ``StreamingExecutor.admit`` splits into chunks
-        #     (``transcribe(..., streaming=True)``).
-        # ndarray / ``(1, T)`` / non-float32 inputs are accepted and normalised
-        # on first use — there is no separate "raw vs. normalised" field.
+        # Waveform input, normalized to 1-D float32 on first use. Offline collate
+        # clears it after transfer; streaming may instead receive chunks later.
         self.audio: Optional[Union[torch.Tensor, "np.ndarray"]] = audio
         self.streaming: bool = streaming
         self.sample_rate: int = sample_rate

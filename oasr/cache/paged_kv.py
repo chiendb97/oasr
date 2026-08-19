@@ -42,31 +42,11 @@ def flat_write_index(
 
 @dataclass
 class PagedKVCache:
-    """Per-layer paged KV cache descriptor.
+    """Per-layer pool views and shared per-batch paging metadata.
 
-    All tensors except ``k_cache`` / ``v_cache`` are shared across
-    encoder layers within the same forward call (one ``block_table`` and
-    one ``cache_seqlens`` per stream batch).
-
-    Attributes
-    ----------
-    k_cache, v_cache : Tensor
-        ``(max_num_blocks, block_size, n_kv_head, head_dim)`` views into
-        the block pool for one encoder layer.
-    block_table : Tensor
-        ``(B, max_blocks_per_seq)`` int32 -- per-stream logical -> physical
-        block mapping.
-    cache_seqlens : Tensor
-        ``(B,)`` int32 -- committed K/V frames in the pool **before** the
-        current chunk's K/V write. Lives on the same device as ``k_cache``.
-    block_size : int
-        Frames per physical block (= ``block_size_frames`` in
-        :class:`~oasr.cache.types.CacheConfig`).
-    host_seqlen_max : int
-        Host-side mirror of ``cache_seqlens.max().item()`` so the encoder
-        can compute the kernel's max key-sequence length without a
-        per-step D2H sync (the engine already tracks ``Request.offset``
-        on the host).
+    ``block_table`` maps logical to physical pages. ``cache_seqlens`` records
+    committed frames before the current write. ``host_seqlen_max`` mirrors its
+    maximum to avoid a per-step device-to-host synchronization.
     """
 
     k_cache: torch.Tensor

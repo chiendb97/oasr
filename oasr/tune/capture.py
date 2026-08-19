@@ -1,34 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Capture the real GEMM shapes a workload issues through the OASR functional API.
+"""Capture GEMM shapes and frequency from a real workload.
 
-The analytic shape derivation in ``scripts/analyze_asr_cutlass_configs.py`` is
-unreliable — it mis-models operator fusion, assumes attention projections hit the
-OASR GEMM path (they are ``torch.nn.Linear``), and fabricates BMM problems that
-actually go through ``oasr.fmha``.  The only trustworthy source of the shapes that
-reach the OASR-tunable CUTLASS path is the workload itself.
-
-This module wraps the functional entry points (:func:`oasr.gemm`,
-:func:`oasr.gemm_activation`, :func:`oasr.bmm`, :func:`oasr.group_gemm`,
-:func:`oasr.gemm_log_softmax`) with thin recorders that log ``(op, M, N, K,
-dtype)`` plus a call count and a FLOP weight, then forward to the original.
-Overhead is one dict update per call — negligible next to a GEMM launch.
-
-Two ways to drive it:
-
-* **Programmatic** — wrap a run in the context manager::
-
-      from oasr.tune.capture import capture_gemm_shapes
-      with capture_gemm_shapes() as rec:
-          engine.transcribe(...)
-      rec.to_json("shapes.json")
-
-* **Env autostart** — set ``OASR_CAPTURE_GEMM=/path/shapes.json`` before launching
-  any script that imports ``oasr`` (e.g. ``benchmarks/bench_engine.py``); capture
-  starts at import and dumps at process exit.  Run streaming with
-  ``--cuda-graphs off`` so every chunk re-enters the Python wrapper and call counts
-  reflect true frequency — captured CUDA graphs replay without re-entering it
-  (shapes are still observed once at capture time, only the weight under-counts).
+Functional entry points are wrapped to record shape, dtype, calls, and FLOP
+weight. Graph replay does not re-enter wrappers, so disable graphs when call
+frequency matters. ``OASR_CAPTURE_GEMM`` enables process-wide capture.
 """
 
 from __future__ import annotations

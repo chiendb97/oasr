@@ -70,11 +70,8 @@ struct CudnnDtype<__nv_bfloat16> {
 // =============================================================================
 // Convolution plan cache (thread-local)
 //
-// Every descriptor here used to be created, configured and destroyed *per call*,
-// and ``cudnnGetConvolutionForwardAlgorithm_v7`` — a heuristic query, not a
-// launch — ran per call too.  On the Conformer subsampling conv that is a
-// per-micro-batch CPU cost on the critical path for a result that depends only
-// on the shape.  Cached, the steady-state call does one lookup.
+// Descriptors and the algorithm heuristic depend only on shape, so rebuilding
+// them per call adds avoidable host work to the critical path.
 //
 // ``fused_relu_ok`` records whether ``cudnnConvolutionBiasActivationForward`` accepts
 // this shape + algorithm, so the probe happens once rather than on every call.

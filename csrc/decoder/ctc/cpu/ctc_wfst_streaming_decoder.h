@@ -31,26 +31,8 @@ namespace decoder {
 
 // Incremental (streaming) WFST CTC decoder for a single utterance.
 //
-// Follows the online_decode.cu pattern from k2:
-//   https://github.com/k2-fsa/k2/blob/master/k2/torch/bin/online_decode.cu
-//
-// The key difference from CtcWfstBeamSearch (offline):
-//   - Offline: accumulates ALL frames then decodes once in FinalizeSearch().
-//   - Streaming: each Search() call feeds a chunk and decodes it incrementally
-//     via k2::OnlineDenseIntersecter, which carries FSA states between chunks.
-//
-// Usage:
-//   auto dec = CtcWfstStreamingDecoder::FromFile(opts, fst_path, device);
-//   while (chunk available) {
-//       dec->Search(chunk_logp);        // decode chunk, update partial result
-//       auto partial = dec->Outputs();
-//   }
-//   dec->FinalizeSearch();              // (no-op; results updated per-chunk)
-//   auto final_result = dec->Outputs();
-//   dec->Reset();                       // ready for next utterance
-//
-// Build requirements:
-//   cmake -DOASR_USE_K2=ON -DK2_SOURCE_DIR=<k2 source root> ...
+// Search feeds chunks to an online intersecter that retains FSA state. Outputs
+// update after each chunk; Reset prepares the decoder for another utterance.
 class CtcWfstStreamingDecoder {
 public:
     CtcWfstStreamingDecoder(const CtcWfstBeamSearchOptions& opts,

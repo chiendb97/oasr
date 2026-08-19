@@ -28,12 +28,8 @@ import oasr
 from oasr.layers._backend import use_gemm_kernel
 from oasr.layers.conv import DepthwiseConv1d
 
-# BiasNorm is the waist's, not a private copy: ``oasr.layers.norm.BiasNorm``
-# already wrapped the ``oasr.bias_norm`` kernel with these exact parameter
-# names (``bias``, ``log_scale``), and Zipformer importing its own duplicate is
-# what H1 in the architecture review calls out as the sharpest case of the
-# layer library going unused by the one model that needs it.  Re-exported here
-# so icefall-shaped imports (``from .scaling import BiasNorm``) keep working.
+# Re-export the shared BiasNorm under the checkpoint-compatible import path and
+# parameter names (``bias``, ``log_scale``).
 from oasr.layers.norm import BiasNorm as BiasNorm
 
 

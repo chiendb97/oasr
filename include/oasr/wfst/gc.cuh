@@ -150,12 +150,9 @@ __global__ void GcFinalizeKernel(Workspace ws, Sizes sz) {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming (per-lane ring) GC — one round per AdvanceChunk. The ring never unmaps
-// while a channel is open, so this is not about physical memory: it advances gc_root
-// (the writer's wrap guard) and drains finalized golden-prefix arcs to the host BEFORE
-// the ring laps them, making stream_log_cap a live-window size instead of a hard cap
-// on stream length (it also lifts the path_cap truncation of long-stream backtracks:
-// device tails stay within the window; the host owns everything older).
+// Per-chunk streaming collection advances the ring guard and drains finalized
+// prefix arcs before overwrite. Device storage then bounds only the live window;
+// the host owns older history.
 
 __global__ void StreamGcStampKernel(Workspace ws, Sizes sz) {
   const int32_t lane = blockIdx.x * blockDim.x + threadIdx.x;

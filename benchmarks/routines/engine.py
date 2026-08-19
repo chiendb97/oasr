@@ -1,38 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""ASR Engine benchmark routines (offline and streaming transcription).
+"""Offline and streaming engine benchmark routines.
 
-Metrics
--------
-* ``median_ms`` — median wall-clock time (ms) to process *N* utterances.
-* ``rtf``       — Real-Time Factor = process_time / total_audio_duration.
-                  RTF < 1 means faster-than-real-time.
-* ``throughput_utts_per_sec`` — utterances processed per second.
-
-Subroutines
------------
-* ``offline``         — ``ASREngine.transcribe_offline`` (batch forward, ctc_cuda).
-* ``streaming``       — ``ASREngine.transcribe`` (chunk-by-chunk, ctc_cuda).
-* ``offline_wfst``    — offline path with WFST decoder (requires --wfst-path).
-* ``streaming_wfst``  — streaming path with WFST decoder (requires --wfst-path).
-
-Per-decode-family subroutines (see :data:`FAMILY_SUBROUTINES`) cover the
-non-CTC paradigms: ``transducer_offline`` / ``transducer_streaming``,
-``paraformer_offline``, ``rescoring_offline``, ``aed_offline``, ``llm_offline``.
-Each requires a ``--ckpt-dir`` whose checkpoint advertises the matching
-capability and **skips with a message** otherwise, so a family subroutine can
-never silently report CTC numbers under a non-CTC name.
-
-They are timed with an explicit ``engine.step()`` loop rather than ``run()``, and
-report two extra metrics the AR families live or die by:
-
-* ``tick_p50_ms`` / ``tick_p99_ms`` — per-``step()`` wall time. One tick is what
-  the serving dispatcher holds the GIL for, so its p99 bounds cancel latency,
-  admission latency, and the streaming-partial cadence. For an incremental
-  strategy a tick is up to ``decode_steps_per_tick`` batched decoder steps, which
-  is why the number is model-dependent and has to be measured.
-* ``tokens_per_sec`` / ``tokens`` — generated (or emitted) tokens, the unit of
-  work for label-synchronous decoding, where ``utts/s`` hides transcript length.
+Family-specific runs require matching checkpoint capabilities. Incremental
+families also report per-tick latency and token throughput because utterances
+per second hides generation length and dispatcher responsiveness.
 """
 
 from __future__ import annotations
@@ -310,38 +282,12 @@ def _time_offline_stepwise(
     num_iters: int,
     admit_mode: str = "burst",
 ) -> tuple[float, float, float, dict[str, Any]]:
-    """Offline timing with an explicit ``step()`` loop, for the decode families.
+    """Time explicit engine ticks for an incremental decode family.
 
-    ``transcribe_offline`` hides the tick structure behind ``run()``, but for the
-    incremental families the tick *is* the unit that matters: the serving
-    dispatcher holds the GIL for exactly one ``step()``, so per-tick p99 bounds
-    how long a cancel, an admission, or a partial can be delayed.  This drives
-    the same public API the dispatcher does — ``add_request`` then ``step()``
-    until the engine drains — and times each tick individually.
-
-    ``admit_mode`` controls *when* requests arrive, which matters a great deal for
-    the incremental families:
-
-    * ``"burst"`` — everything up front, so the scheduler forms one wide batch.
-      The flattering case, and what a batch-transcription job looks like.
-    * ``"trickle"`` — one request per tick, reproducing an interactive service
-      where arrivals are independent. Each arrival is prefilled separately, so
-      this is the case that exposes how well the strategy batches *across*
-      independently-admitted requests (keystone C2).
-
-    Comparing the two isolates batching efficiency from raw decoder speed: the
-    same total work, the same tokens, only the arrival pattern differs.
-
-    Each tick is followed by ``cuda.synchronize()`` so the GPU work it queued is
-    attributed to it rather than to a later tick.  That makes the per-tick numbers
-    slightly conservative and the total directly comparable to
-    :func:`_time_offline`.
-
-    Returns
-    -------
-    (median_ms, std_ms, rtf, extra)
-        ``extra`` carries ``tick_p50_ms`` / ``tick_p99_ms`` / ``ticks`` /
-        ``tokens`` / ``tokens_per_sec`` / ``admit_mode``.
+    ``burst`` admits all requests before stepping; ``trickle`` admits one per
+    tick to measure cross-arrival batching. Device synchronization attributes
+    queued work to the tick that issued it. Returns timing plus tick and token
+    metrics.
     """
     total_duration = sum(durations)
     cuda = torch.cuda.is_available()
@@ -493,34 +439,10 @@ def _time_streaming(
     durations: List[float],
     num_iters: int,
 ) -> tuple[float, float, float]:
-    """Time ASREngine over pre-loaded *waveforms* fed chunk-by-chunk.
+    """Measure backlog streaming over preloaded, pre-split waveforms.
 
-    What this measures
-    ------------------
-    *Backlog-throughput streaming.*  Each waveform is pre-split (outside the
-    timed region) into per-call audio chunks of size ``stride * frame_shift``
-    samples.  Inside the timed region we register a streaming request and
-    push chunks via :meth:`engine.feed_chunk`, exactly mirroring how a
-    real-time client would deliver audio.  ``engine.run()`` then drains the
-    backlog by looping ``step()``; each step processes one chunk per active
-    stream:
-
-    1. Batched GPU FBANK across all streams' next-pending chunks (one
-       kernel call for the whole pool, never sees audio beyond what's
-       already enqueued for each stream).
-    2. Per-stream ``forward_chunk_paged`` on the freshly-produced features.
-    3. Per-stream streaming CTC decode + cache commit.
-
-    Audio is pre-loaded into memory so the number reflects compute only,
-    not disk I/O.  RTF = wall_clock / total_audio_seconds — lower is better;
-    RTF < 1 means the system keeps up with real time.
-
-    For an RTF number that reflects *single-stream* interactive latency
-    (one client sending one chunk every 640 ms), set ``max_batch_size=1``.
-
-    Returns
-    -------
-    (median_ms, std_ms, rtf)
+    The timed region feeds chunks and drains engine steps, excluding disk I/O
+    and chunk construction. Returns median time, standard deviation, and RTF.
     """
     total_duration = sum(durations)
 

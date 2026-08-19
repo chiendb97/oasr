@@ -28,21 +28,18 @@ __global__ void depthwiseConv1DKernel(
     const MaskT* __restrict__ mask,  // [batch, seq_len, 1] or nullptr
     T* __restrict__ output,          // [batch, out_len, channels]
     int batch_size, int seq_len, int channels, int kernel_size, int padding_left) {
-    // Thread ID in the vectorized channel dimension
     const int vec_id = threadIdx.x;  // which vector chunk [0, channels/VecSize)
     const int s_id = blockIdx.x;     // output sequence position
     const int b_id = blockIdx.y;     // batch index
 
     const int c_offset = vec_id * VecSize;  // starting channel for this thread
 
-    // Compute the valid input range for this output position
     int s_start = s_id - padding_left;
     int s_end = min(s_start + kernel_size, seq_len);
     s_start = max(s_start, 0);
 
     int k_start = max(padding_left - s_id, 0);
 
-    // Pointers for this batch element, offset to the vector chunk
     const T* input_base = input + b_id * seq_len * channels + c_offset;
     const T* weight_base = weight + c_offset;
 
@@ -53,7 +50,6 @@ __global__ void depthwiseConv1DKernel(
         acc[v] = 0.0f;
     }
 
-    // Main convolution loop
     for (int i = s_start; i < s_end; i++) {
         Vec<T, VecSize> in_vec;
         in_vec.load(input_base + i * channels);
@@ -71,7 +67,6 @@ __global__ void depthwiseConv1DKernel(
         }
     }
 
-    // Add bias
     if (bias != nullptr) {
         Vec<T, VecSize> bias_vec;
         bias_vec.load(bias + c_offset);
@@ -128,21 +123,18 @@ __global__ void depthwiseConv1DSiluKernel(
     const T* __restrict__ bias,    // [channels] or nullptr
     T* __restrict__ output,        // [batch, out_len, channels]
     int batch_size, int seq_len, int channels, int kernel_size, int padding_left) {
-    // Thread ID in the vectorized channel dimension
     const int vec_id = threadIdx.x;  // which vector chunk [0, channels/VecSize)
     const int s_id = blockIdx.x;     // output sequence position
     const int b_id = blockIdx.y;     // batch index
 
     const int c_offset = vec_id * VecSize;  // starting channel for this thread
 
-    // Compute the valid input range for this output position
     int s_start = s_id - padding_left;
     int s_end = min(s_start + kernel_size, seq_len);
     s_start = max(s_start, 0);
 
     int k_start = max(padding_left - s_id, 0);
 
-    // Pointers for this batch element, offset to the vector chunk
     const T* input_base = input + b_id * seq_len * channels + c_offset;
     const T* weight_base = weight + c_offset;
 
@@ -153,7 +145,6 @@ __global__ void depthwiseConv1DSiluKernel(
         acc[v] = 0.0f;
     }
 
-    // Main convolution loop
     for (int i = s_start; i < s_end; i++) {
         Vec<T, VecSize> in_vec;
         in_vec.load(input_base + i * channels);
@@ -167,7 +158,6 @@ __global__ void depthwiseConv1DSiluKernel(
         }
     }
 
-    // Add bias
     if (bias != nullptr) {
         Vec<T, VecSize> bias_vec;
         bias_vec.load(bias + c_offset);
@@ -177,12 +167,10 @@ __global__ void depthwiseConv1DSiluKernel(
         }
     }
 
-    // Apply SiLU activation
     for (int v = 0; v < VecSize; v++) {
         acc[v] = oasr::swish(acc[v]);
     }
 
-    // Store result
     const int out_offset = (b_id * gridDim.x + s_id) * channels + c_offset;
     Vec<T, VecSize> out_vec;
 #pragma unroll
@@ -217,18 +205,15 @@ __global__ void causalConv1DKernel(const T* __restrict__ input,  // [batch, chun
 
     float sum = 0.0f;
 
-    // Compute convolution using state and current input
     for (int k = 0; k < kernel_size; k++) {
         int input_pos = t - (kernel_size - 1) + k;
         float val;
 
         if (input_pos < 0) {
-            // Read from state buffer
             int state_pos = state_len + input_pos;  // Maps -state_len to 0, etc.
             int state_idx = b * state_len * channels + state_pos * channels + c;
             val = static_cast<float>(state[state_idx]);
         } else {
-            // Read from current input
             int input_idx = b * chunk_len * channels + input_pos * channels + c;
             val = static_cast<float>(input[input_idx]);
         }
@@ -244,7 +229,6 @@ __global__ void causalConv1DKernel(const T* __restrict__ input,  // [batch, chun
     output[idx] = static_cast<T>(sum);
 }
 
-// Update state buffer after processing chunk
 template <typename T>
 __global__ void updateConvStateKernel(const T* __restrict__ input,  // [batch, chunk_len, channels]
                                       T* __restrict__ state,        // [batch, state_len, channels]
@@ -387,8 +371,7 @@ cudaError_t DepthwiseConv1DSilu(const T* input, const T* weight, const T* bias, 
 
     constexpr int kVecSize = VecTypeTrait<T>::VecSize;
 
-    // Use vectorized kernel when channels are aligned to VecSize
-    // and the thread count fits within hardware limits
+    // Vectorization requires aligned channels and at most one hardware thread per vector.
     if (channels % kVecSize == 0 && (channels / kVecSize) <= 1024) {
         dim3 block_size(channels / kVecSize);
         depthwiseConv1DSiluKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(
@@ -481,7 +464,6 @@ cudaError_t CausalConv1D(const T* input, T* state, const T* weight, const T* bia
         return err;
     }
 
-    // Update state buffer
     int state_elements = batch_size * state_len * channels;
     int state_grid = (state_elements + block_size - 1) / block_size;
     updateConvStateKernel<T><<<state_grid, block_size, 0, stream>>>(input, state, batch_size,

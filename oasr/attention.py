@@ -1,29 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Public functional API for the OASR fused multi-head attention.
+"""Functional attention API with fused and library backends.
 
-This is the single entry point that dispatches between the SDPA fallback
-(always available) and the CuteDSL kernel (SM80 / SM86 / SM89 / SM120 in
-this revision) based on ``OASR_ATTN_BACKEND`` and the active GPU's compute
-capability.
-
-Three cache modes are encoded in one signature:
-
-* **offline**         -- ``block_table is None`` and ``cache_seqlens is None``
-                         (attend over the full ``T_k``).
-* **dense streaming** -- ``block_table is None`` and ``cache_seqlens is not None``
-                         (attend over ``[0, cache_seqlens[b])`` per stream;
-                         caller has already concatenated old + new K/V).
-* **paged streaming** -- ``block_table is not None``  (k/v are pool views,
-                         ``cache_seqlens`` required).
-
-The compiled CuteDSL callable is built with ``--enable-tvm-ffi`` (see
-``oasr/jit/attention.py``), so it accepts raw torch tensors at call time and
-is safe to capture into a ``torch.cuda.CUDAGraph``. This wrapper therefore
-only has to: pick the backend, normalise strides, pad bias for the kernel's
-CTA tile, and reuse a couple of small process-cached dummy tensors. A
-``validate=False`` fast path skips shape/dtype checks for callers that have
-already proven their inputs (the inference engine on the hot path).
+The signature supports full, dense-cache, and paged-cache attention. It also
+normalizes layouts, tile-pads bias, and optionally skips validation for trusted
+hot-path callers.
 """
 
 from __future__ import annotations
@@ -42,11 +23,8 @@ __all__ = ["fmha", "fmha_varlen"]
 # ---------------------------------------------------------------------------
 # Hot-path imports (hoisted to module scope)
 # ---------------------------------------------------------------------------
-# The CuteDSL imports below pull in MLIR / compiler infra and are heavy
-# (~100-500 ms cold). We do them once at module-load so each fmha() call
-# pays nothing. On hosts without CuteDSL (CPU-only, doc builds), the
-# imports fail silently and callers transparently route through the SDPA
-# fallback via ``select_backend()``.
+# Hoist optional compiler imports out of the hot path. Missing dependencies
+# leave the library backend available.
 
 try:
     import cuda.bindings.driver as _cuda_driver
@@ -67,24 +45,15 @@ except Exception:
 # Module-scope caches for per-call constants
 # ---------------------------------------------------------------------------
 
-# Process-cached zero-rank dummies for the "no bias" / "no block_table"
-# paths. The kernel never dereferences them, but cute still requires a
-# tensor of the right dtype/rank. Tiny and never freed.
+# Typed dummy tensors satisfy optional kernel arguments without dereferencing.
 _dummy_bias_cache: dict = {}
 _dummy_block_table_cache: dict = {}
 
-# Process-cached cache_seqlens buffer per device. Grown lazily as B
-# increases; filled in-place per call so we don't allocate a fresh tensor
-# each fmha() call in offline mode.
+# Per-device length buffers grow lazily and are reused in offline mode.
 _seqlens_buffer_cache: dict = {}
 
-# Cute fmha CTA tile sizes (must match ``FmhaSm80._m_block_size`` /
-# ``_n_block_size`` defaults).  In the paged path the kernel reads the full
-# ``(M_BLOCK, N_BLOCK)`` bias tile without per-row T_q predication, so the
-# bias must be padded up to these multiples.  Under CUDA Graph capture the
-# allocator fragments the address space and an OOB read can land in an
-# unmapped segment, raising ``cudaErrorIllegalAddress``; padding keeps every
-# tile read in-bounds.
+# Must match the kernel tile. Paged bias reads full tiles, so padding is required
+# to keep every read in bounds, especially with graph-pool allocations.
 _KERNEL_M_BLOCK = 64
 _KERNEL_N_BLOCK = 64
 

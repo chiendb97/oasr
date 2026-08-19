@@ -1,29 +1,6 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Unified per-stream handle for the ASR streaming cache system.
-
-``StreamContext`` ties together the three cache managers for one streaming
-request. Callers interact with a single object rather than three separate
-managers, reducing the risk of mismatched stream IDs and making the
-streaming loop concise.
-
-Typical usage (paged-only)::
-
-    ctx = StreamContext(stream_id, att_mgr, cnn_mgr, ctc_mgr)
-
-    for chunk_audio in audio_chunks:
-        ctx.prepare_chunk()                       # allocate block for next write
-        att_caches = ctx.get_att_caches()         # List[PagedKVCache], one per layer
-        cnn_cache  = ctx.get_cnn_cache()          # SlotCnnCache descriptor
-        logits = model.forward_chunk_paged(
-            chunk_audio, offset, att_caches, cnn_cache, cache_t1=offset,
-        )
-        ctx.commit_chunk_paged(logits.size(1))    # advance cache_seqlens
-        ctx.get_decoder().decode_chunk(logits)
-
-    result = ctx.get_decoder().finalize_stream()
-    ctx.free()
-"""
+"""Unified per-request handle for streaming cache managers."""
 
 from __future__ import annotations
 
@@ -42,40 +19,10 @@ from oasr.utils.staging import to_device
 
 
 class StreamContext:
-    """Unified handle tying all cache managers for one streaming request.
+    """Delegate one allocated stream's cache operations to shared managers.
 
-    A ``StreamContext`` is created after all three managers have already
-    allocated state for the stream (via ``allocate_stream``). It delegates
-    every operation to the appropriate manager using the stored ``stream_id``.
-
-    Parameters
-    ----------
-    stream_id : int
-        Unique stream identifier (must already be allocated in all three
-        managers before constructing this object).
-    attention_cache : AttentionCacheManager
-        Shared paged attention KV cache manager.
-    cnn_cache : SlotStateCache
-        Slot-addressed fixed-extent stream state.  A :class:`CnnCacheManager` (the
-        single-spec form) or a multi-spec :class:`~oasr.cache.SlotStateCache` for
-        an encoder that declared more than the convolutional left-context.
-    ctc_state : CtcStateCacheManager, optional
-        Per-stream CTC decoder state manager.  Optional: the engine now owns
-        CTC beam state inside the decode strategy (so it works for any encoder
-        streaming kind), and builds an *encoder-only* context with
-        ``ctc_state=None``.  Standalone users (and the cache tests) may still
-        pass one to use :meth:`get_decoder` / :meth:`get_ctc_state` directly.
-
-    Examples
-    --------
-    >>> att_mgr.allocate_stream(sid)
-    >>> cnn_mgr.allocate_stream(sid)
-    >>> ctc_mgr.allocate_stream(sid, batch=1, vocab_size=5000)
-    >>> ctx = StreamContext(sid, att_mgr, cnn_mgr, ctc_mgr)
-    >>> ctx.prepare_chunk()
-    >>> ctx.get_att_caches()              # pass to forward_chunk_paged
-    >>> ctx.commit_chunk_paged(n)         # advance KV cache_seqlens
-    >>> ctx.free()                        # release all resources
+    ``ctc_state`` is optional because engine-managed decode strategies own CTC
+    state; standalone callers may provide it to use the decoder accessors.
     """
 
     def __init__(

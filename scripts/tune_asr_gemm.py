@@ -1,49 +1,11 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Real-GPU GEMM tuner for ASR workloads — companion to analyze_asr_cutlass_configs.py.
+"""Benchmark registered GEMM candidates for representative ASR shapes.
 
-Where ``analyze_asr_cutlass_configs.py`` derives shapes *analytically* and asks
-nvMatmulHeuristics for *predicted* configs (neither representative of, nor
-executable by, the engine), this tool closes the loop with the real kernels:
-
-  1. **Shapes** — load the EXACT shapes captured from a real engine run
-     (``--mode capture --shapes shapes.json``, produced by setting
-     ``OASR_CAPTURE_GEMM`` while running ``benchmarks/bench_engine.py``), or
-     derive them analytically and filter to the ops that truly hit the OASR
-     GEMM path (``--mode analytic``).
-  2. **Bucket** — group by ``(op, N, K, dtype)`` and snap the M dimension to a
-     tile-aligned ladder; keep the high-FLOP buckets covering ``--coverage``.
-  3. **Benchmark** — time EVERY registered candidate (all CUTLASS tile/stage/
-     split-k variants + the torch/cuBLAS backend) on GPU 1 for each
-     representative shape, and pick the real winner.
-  4. **Emit** — a human-readable report (winner + speedup vs ``GEMM_DEFAULT``)
-     and a ready-to-paste ``_GEMM_HEURISTIC_RULES_SM120`` Python literal for the
-     production selector in ``oasr/jit/gemm.py``.
-
-**What this tool cannot see.** Every candidate is timed on its own, in a loop deep
-enough that the next launch overlaps the current kernel — so what comes back is
-kernel throughput with dispatch cost hidden. Two consequences, both hit while
-tuning whisper-tiny:
-
-  * the cuBLAS branch of ``_dispatch_gemm`` costs ~4.9 µs more CPU per call than
-    the CUTLASS launcher (``addmm`` dispatch plus two ``reshape``s). For a model
-    whose forward is CPU-issue-bound — whisper-tiny's encoder at batch 1-2 is:
-    issue 1139 µs against 611 µs of GPU work — a "torch wins" verdict can make the
-    model *slower* while genuinely removing GPU work. Check the winner against the
-    model, and prefer a CUTLASS tile of equal GPU time when there is one.
-  * a single measurement per arm cannot separate 1.05x from a tie; adjacent
-    buckets alternated torch/cutlass/default at 1.02-1.08x and re-measuring them
-    interleaved showed ties. ``--min-speedup`` is the guard.
-
-Two-step capture workflow (recommended)::
-
-    export CUDA_VISIBLE_DEVICES=GPU-...          # the healthy GPU (UUID)
-    OASR_CAPTURE_GEMM=/tmp/asr_shapes.json \
-        python benchmarks/bench_engine.py --subroutines offline streaming \
-        --cuda-graphs off --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR"
-    python scripts/tune_asr_gemm.py --mode capture --shapes /tmp/asr_shapes.json \
-        --emit-rules /tmp/gemm_rules.py
+Shapes come from a captured workload or the analytic fallback, are bucketed by
+work weight, and produce selection rules. Candidate timings hide dispatch cost,
+so near ties require end-to-end validation and ``--min-speedup`` filtering.
 """
 
 from __future__ import annotations
@@ -55,16 +17,8 @@ import sys
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 
-# Tile-M ladder (aligned to SM120 block_m ∈ {16,32,64,128,256}); a runtime M is
-# routed to the first edge ≥ M.  The last bucket becomes the catch-all (m_max=None).
-#
-# The top edges exist for the fixed-window frontends.  A Conformer M is
-# ``frames × batch`` at a 40 ms hop, so it stayed under 16384; Whisper pads every
-# request to a 30 s window (1500 encoder frames), which puts a batch of 64 at
-# M=96000.  With the ladder stopping at 32768, ``_ladder_edge`` returned the last
-# edge for everything above it and the three widest batches measured as one
-# bucket — a collapse that is invisible in the emitted rules, because a bucket
-# nothing distinguishes looks exactly like a bucket where the winner agrees.
+# Runtime M uses the first SM120-aligned edge at or above it; the last edge is a
+# catch-all. High edges keep large fixed-window batches in distinct tune buckets.
 _M_LADDER = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
 
 _ACTIVATION_SWISH = 2

@@ -178,12 +178,8 @@ class CtcAedRescoringStrategy(DecodeStrategy):
         )
         B = hidden.size(0)
         device = hidden.device
-        # Rescoring width is decoupled from the CTC kernel's beam.  The decoder
-        # pass is ``B * beam`` rows and the encoder memory is replicated the
-        # same way, so a wide CTC beam used to multiply decoder cost for
-        # hypotheses far below the fusion cutoff.  The beam is already ordered
-        # by CTC score, so the top ``nbest`` are exactly the candidates worth
-        # the decoder pass.  ``None`` keeps the full beam (previous behaviour).
+        # Rescore only the leading CTC candidates because decoder rows and
+        # replicated encoder memory scale with this width. ``None`` keeps all.
         beam = int(cfg.beam_size)
         if self._nbest is not None:
             beam = min(beam, self._nbest)

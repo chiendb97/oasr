@@ -75,15 +75,8 @@ class SpeechLlmModel(BaseAsrModel):
         return frozenset({"llm"})
 
     # -- weights --------------------------------------------------------------
-    #: Accepted checkpoint layouts, normalized to our canonical keys:
-    #: * HF 4.x publishes: ``audio_tower.*`` / ``multi_modal_projector.*`` /
-    #:   ``language_model.model.*`` / ``language_model.lm_head.weight``
-    #: * HF 5.x resaves: same, except the LM trunk gains an extra nesting
-    #:   level (``language_model.model.model.*``) — the leading
-    #:   ``language_model.model…`` chain collapses to ``language_model.``
-    #: * ``model.``-prefixed variants (5.x internal layout) and a top-level
-    #:   ``lm_head.weight`` are accepted too
-    #: * native format: our canonical keys verbatim.
+    #: Normalize supported upstream nesting variants, optional ``model.``
+    #: prefixes, and top-level output heads to canonical native keys.
     @staticmethod
     def _canonical_key(key: str) -> str:
         if key.startswith("model."):

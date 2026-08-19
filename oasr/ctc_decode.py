@@ -222,17 +222,8 @@ def _get_ctc_decoder_module():
 _NO_TIMES = torch.empty(0, dtype=torch.int32)
 
 
-#: The C++ beam read-back (``oasr._C.alignment``).  In Python it was two tensor
-#: operations per (row, beam) — an index producing a 0-d tensor for the length,
-#: then a slice — which at beam 16 cost more than the decode's own device→host
-#: copy, on the engine's step-loop thread, for every request.  There is no
-#: Python version of it left.
-#:
-#: ``None`` only where the extension is absent or predates it, which
-#: ``pip install -e .`` never leaves behind — so nothing below defends against
-#: the ``None``.  Resolution is tolerant because this module is imported by
-#: ``import oasr`` itself: a hard import here would take the whole package down
-#: on ``test-cpu.yml``, which compiles nothing.
+#: C++ beam readback; optional at import time so CPU-only package imports work.
+#: Decode operations still require the extension and fail explicitly without it.
 try:
     from oasr import _C  # type: ignore[attr-defined]
 
@@ -383,7 +374,6 @@ def ctc_beam_search_decode(
         ws_bytes = mod.ctc_decoder_workspace_size(batch, beam_size, vocab_size, ws_seq_len)
     workspace = torch.empty(int(ws_bytes), dtype=torch.uint8, device=device)
 
-    # Allocate outputs
     out_tokens = torch.empty(batch, beam_size, max_seq_len, dtype=torch.int32, device=device)
     out_times = _times_out(want_times, out_tokens)
     out_lengths = torch.empty(batch, beam_size, dtype=torch.int32, device=device)

@@ -249,16 +249,9 @@ class Qwen2Lm(BaseDecoder):
         position_ids = (valid.long().cumsum(dim=1) - 1).clamp(min=0)
         cos, sin = self.rotary(position_ids)  # (B, P, d)
 
-        # Causal + key padding.  Left padding is contiguous by construction (the
-        # strategy left-pads the batch, HF's masked-generate convention), so the
-        # whole mask is the window ``[P - len, P)`` intersected with the causal
-        # triangle — two length vectors rather than a ``(B, 1, P, P)`` tensor.
-        # That form is what the fused kernel takes, and materializing it instead
-        # costs SDPA its flash path: 1.8-3.3x on the attention op at the 7B
-        # prefill shapes, 1.03-1.05x over the whole prefill.
-        # ``Attention`` decides which backend actually runs it, and rebuilds the
-        # explicit mask itself on the SDPA side (diagonal kept open, so a fully
-        # padded query row cannot come back NaN and poison real rows downstream).
+        # Express contiguous left padding plus causality as length vectors. The
+        # selected backend materializes a mask only when required and keeps the
+        # diagonal open so padded query rows remain finite.
         mask_kwargs: Dict[str, Any] = dict(kv.mask_kwargs(P))
         mask_kwargs["is_causal"] = True
 
@@ -275,13 +268,8 @@ class Qwen2Lm(BaseDecoder):
         x = self.embed_tokens(tokens.unsqueeze(1))  # (B, 1, D)
         cos, sin = self.rotary(kv.position_ids(1))  # (B, 1, d)
 
-        # Key padding only -- no causal component, since the single query row
-        # attends the whole cache.  Left padding is contiguous per row, so the
-        # window form reaches the fused kernel; ``DecoderKv.append`` hands over
-        # the capacity buffer plus its length rather than a stride-gapped slice,
-        # which is what used to make the kernel copy the whole cache per layer per
-        # step and kept this call on SDPA.  With that gone the kernel is
-        # 1.45-1.88x faster here even at ``T_q == 1``.
+        # A single query attends the whole cache, so only the contiguous key
+        # padding window is needed. Capacity buffers avoid stride-gapped slices.
         x = self._forward_layers(x, cos, sin, kv, dict(kv.mask_kwargs(1)))
         logits = self.lm_head(self.norm(x))
         return logits[:, -1], state

@@ -111,14 +111,8 @@ class ZipformerEncoder(BaseEncoder):
         out = out.permute(1, 0, 2)  # (B, T'', Cmax)
         return out, out_lens, [new_embed] + new_enc
 
-    # -- batched-state streaming (stateful backend batching) ----------------
-    #
-    # State layout (``get_streaming_init_states``): ``states[0]`` is the
-    # embed ConvNeXt cache ``(B, C, pad, freq)`` — batch dim 0 — followed by
-    # six tensors per layer: ``cached_key (L, B, K)``,
-    # ``cached_nonlin_attn (1, B, L, H)``, ``cached_val1/2 (L, B, V)``
-    # (batch dim 1) and ``cached_conv1/2 (B, C, P)`` (batch dim 0).  Same
-    # per-kind dims as icefall's ``streaming_decode.py`` stack/unstack.
+    # The embedding and convolution caches batch on dimension 0; attention and
+    # value caches batch on dimension 1, repeated in six tensors per layer.
     _STATE_BATCH_DIM_CYCLE = (1, 1, 1, 1, 0, 0)
 
     def _state_batch_dim(self, i: int) -> int:

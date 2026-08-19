@@ -181,10 +181,8 @@ def _get_streaming_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> i
                     3,  # lat_prune_interval, eps_iterations
                     opts.arena_budget_entries,
                     opts.stream_log_entries,
-                    # Streaming GC always on: it runs once per chunk (the value is just the
-                    # enable switch here), drains finalized arcs to the host, and makes the
-                    # per-channel winners region a ring — streams are no longer length-capped
-                    # and long-stream results no longer truncate to the last path_cap arcs.
+                    # Per-chunk collection drains finalized arcs and keeps the
+                    # per-channel winners region bounded.
                     opts.gc_interval or 2,
                 )
             )
@@ -402,8 +400,7 @@ class WfstDecoderSearch:
             logp = logp.cuda()
         if logp.dtype != torch.float32:
             logp = logp.float()
-        # WeNet-style blank skip: drop frames dominated by blank BEFORE the search
-        # (matches the previous k2 path's frame pre-slicing exactly).
+        # Drop blank-dominated frames before search.
         thresh = self._opts.blank_skip_thresh
         if 0.0 < thresh < 1.0 and logp.size(0) > 0:
             keep = logp[:, self._opts.blank] <= math.log(thresh)

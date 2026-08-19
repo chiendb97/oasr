@@ -1,48 +1,16 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// OASR Speech v1 — shaped after google.cloud.speech.v1 so existing developer
-// tooling (grpcurl, REST conventions) feels familiar.  This is *not* the
-// Google package: we use the `oasr.speech.v1` namespace, and Google's
-// official client SDKs cannot connect without re-generating from this file.
+// Google-STT-shaped API in the `oasr.speech.v1` namespace; clients must generate
+// bindings from this schema. There is no asynchronous operation RPC.
 //
-// Differences from Google STT v1:
-// - No `LongRunningRecognize` (we do not expose async operations).
-// - `AudioEncoding` honors LINEAR16, MULAW, FLAC, MP3 and the OASR extensions
-//   LINEAR32F, WAV, ALAW, M4A, AIFF and AUTO.  AMR, AMR_WB, SPEEX and both
-//   Opus codings return `UNIMPLEMENTED` (there is no pure-Rust Opus decoder;
-//   see docs/serving.md).
-// - `RecognitionConfig.priority` is a non-Google extension preserved for
-//   parity with the previous OASR API.
-// - `RecognitionConfig.max_new_tokens` / `temperature` / `top_k` / `top_p` /
-//   `prompt` / `task` are non-Google extensions mapped to the engine's
-//   per-request DecodingOptions (autoregressive decode families only — AED /
-//   speech-LLM; frame-synchronous CTC ignores them).
-// - `SpeechRecognitionAlternative.tokens` is a non-Google extension that
-//   carries the raw CTC token IDs alongside the transcript.
-// - `SpeechRecognitionAlternative.confidence` is the softmax-normalized
-//   posterior of the hypothesis among the returned n-best scores (0.0 when
-//   the decode family emits a single hypothesis, matching Google's
-//   "unset when unavailable").
-// - `SpeechRecognitionResult.result_end_time` is set when the decode family
-//   produces token alignments (Paraformer CIF): the end time of the last
-//   decoded token.
-// - `RecognizeResponse.request_id` / `StreamingRecognizeResponse.request_id`
-//   are non-Google extensions carrying the server-assigned request UUID.
-// - `max_alternatives` is honored: the engine detokenizes up to that many
-//   n-best hypotheses (beam decode families).
-// - `enable_word_time_offsets` is honored: the top alternative carries
-//   `WordInfo` entries. Decode families that cannot align (WFST; any family in
-//   streaming mode that has no frame-synchronous emission) reject the request
-//   rather than returning an alternative with the field silently empty.
-// - `SpeechRecognitionResult.finish_reason` (extension field 101) reports
-//   "stop" / "length" for the autoregressive decode families.
-// - `language_code` is honored by the decode families that can act on it
-//   (Whisper AED: it selects the language token). A BCP-47 tag is accepted and
-//   its primary subtag used ("en-US" -> "en"). Families with no language
-//   control reject a set `language_code` rather than ignoring it.
-// - `model`, `audio_channel_count`, `single_utterance`, `speech_event_type`
-//   are accepted but not honored.
+// Extensions add priority, per-request decoding controls, raw tokens, request
+// ids, result end time, and finish reason. N-best and word timing requests are
+// honored or explicitly rejected when unsupported. Several source-compatible
+// fields are accepted but ignored.
+//
+// Supported audio: LINEAR16/32F, MULAW, ALAW, FLAC, MP3, WAV, M4A, AIFF, and
+// AUTO. AMR, SPEEX, and Opus variants return `UNIMPLEMENTED`.
 
 syntax = "proto3";
 
@@ -91,14 +59,10 @@ message RecognitionConfig {
     }
     AudioEncoding encoding             = 1;
     uint32        sample_rate_hertz    = 2;
-    // Honored by families with language control (Whisper AED); a BCP-47 tag is
-    // reduced to its primary subtag.  Families without it reject a set value
-    // rather than ignoring it.
+    // BCP-47 primary subtag for families with language control; others reject it.
     string        language_code        = 3;
     uint32        max_alternatives     = 4;  // n-best transcripts (beam decode families)
-    // Per-word start/end times and confidences on the top alternative.  Google's
-    // own field name and semantics; the decode families that cannot align reject
-    // it at admission rather than returning an alternative with no `words`.
+    // Request word spans on the top alternative; unsupported families reject it.
     bool          enable_word_time_offsets = 8;
     string        model                = 5;  // accepted, ignored (single model per process)
     uint32        audio_channel_count  = 6;  // accepted, ignored (mono only)
@@ -109,17 +73,12 @@ message RecognitionConfig {
     uint32        top_k                = 103; // 0 = disabled
     float         top_p                = 104; // 0 = disabled (i.e. 1.0)
     string        prompt               = 105; // speech-LLM user prompt override
-    // "transcribe" (default) or "translate" — Whisper's task token, which was
-    // previously frozen at checkpoint-conversion time.  Empty = the
-    // checkpoint's own task.  Backs `POST /v1/audio/translations`.
+    // "transcribe" or "translate"; empty keeps the checkpoint default.
     string        task                 = 106;
 }
 
-// One word of a transcript with its span in the audio.  Google's `WordInfo`,
-// minus `speaker_tag` (no diarization).  `confidence` is the mean per-token
-// posterior over the word's tokens, and unlike the alternative-level
-// `confidence` it is defined for a single-hypothesis decode — which is every
-// request that did not ask for n-best.
+// One word span. Confidence is the mean posterior of its tokens and remains
+// defined for single-hypothesis decoding.
 message WordInfo {
     google.protobuf.Duration start_time = 1;
     google.protobuf.Duration end_time   = 2;
@@ -145,10 +104,7 @@ message RecognitionAudio {
 message SpeechRecognitionAlternative {
     string          transcript = 1;
     float           confidence = 2;
-    // Populated on the **top** alternative only, and only when the request set
-    // `enable_word_time_offsets`.  Timing an alternative the caller is not
-    // shown would cost a second alignment pass per hypothesis for output no
-    // client reads.
+    // Populated only on the top alternative when word offsets were requested.
     repeated WordInfo words    = 3;
     repeated uint32 tokens     = 100;  // OASR extension: raw CTC token IDs
 }
@@ -159,12 +115,8 @@ message SpeechRecognitionResult {
     google.protobuf.Duration              result_end_time = 4;
     string                                language_code   = 5;
 
-    // OASR extension (field 101, outside Google's numbering as with the
-    // RecognitionConfig extensions below).  Why generation stopped:
-    // "stop" (the model emitted EOS) or "length" (it hit max_new_tokens or the
-    // decoder's position capacity).  Empty for the one-shot decode families.
-    // Without it a transcript cut short by the generation cap is
-    // indistinguishable from a complete one.
+    // "stop" for EOS or "length" for a generation/capacity limit. Empty for
+    // one-shot decoding.
     string                                finish_reason   = 101;
 }
 
@@ -206,9 +158,7 @@ message StreamingRecognitionResult {
     google.protobuf.Duration              result_end_time = 4;
     string                                language_code   = 6;
 
-    // OASR extension (field 101): "stop" / "length" on the final result of an
-    // autoregressive decode family.  Empty on interim results and for the
-    // one-shot families.  See SpeechRecognitionResult.finish_reason.
+    // Final incremental-decode finish reason; empty on interim or one-shot results.
     string                                finish_reason   = 101;
 }
 

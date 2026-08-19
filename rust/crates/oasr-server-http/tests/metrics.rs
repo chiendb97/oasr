@@ -101,15 +101,7 @@ async fn metrics_endpoint_renders_histograms_and_labels() {
         .unwrap();
     let body = String::from_utf8(bytes.to_vec()).unwrap();
 
-    // ---- The bucket fix -------------------------------------------------
-    //
-    // This is the assertion the whole crate exists for.  Without
-    // `set_buckets_for_metric` the exporter renders every histogram as a
-    // rolling *summary*: `{quantile="0.99"}` series instead of `_bucket`
-    // ones, no `histogram_quantile`, and quantiles that cannot be aggregated
-    // across replicas.  Both halves are checked, because a regression would
-    // silently swap one form for the other and still render something that
-    // looks like a working metric.
+    // Require aggregatable histogram buckets, not rolling summary quantiles.
     assert!(
         body.contains("oasr_http_request_duration_seconds_bucket"),
         "no _bucket series: histograms regressed to summaries.\n{body}"

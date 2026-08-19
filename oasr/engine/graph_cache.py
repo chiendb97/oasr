@@ -126,38 +126,18 @@ class GraphedEncoderForward:
         self._att_mgr = att_mgr
         self._state_mgr = state_mgr
         # Non-empty only for an encoder that declared state beyond the conv cache;
-        # the captured call then carries a ``states=`` kwarg, and otherwise it is
-        # byte-for-byte the call Conformer has always been captured with.
+        # the captured call then carries a ``states=`` kwarg; otherwise it uses
+        # the narrower compatibility signature.
         self._extra_states = tuple(extra_states)
         self._device = device
 
-        # Captured graph cache, keyed by (B_active, cache_t1_bucket).
-        # All captures share one CUDA Graph memory pool so that the
-        # intermediate-tensor allocations from earlier captures don't
-        # cumulatively fragment the regular caching allocator. The
-        # caller must consume any captured output (log_probs) before the
-        # next replay — that's already the case in the engine step loop
-        # (CTC decode + commit happen synchronously after ``replay()``
-        # returns).
-        #
-        # ``pool`` is optionally injected so this cache shares a single
-        # ``torch.cuda.graph_pool_handle()`` with the other engine-level
-        # graph caches (feature extraction, CTC). Passing ``None`` keeps
-        # the legacy standalone behaviour for tests that instantiate this
-        # cache directly without an ``ASREngine``.
+        # Captures share one memory pool to avoid allocator fragmentation.
+        # Outputs remain valid only until that pool is reused by another replay.
+        # Tests may omit ``pool`` when constructing this cache directly.
         self._pool = pool if pool is not None else torch.cuda.graph_pool_handle()
-        # Keyed by ``(B, T_input, cache_t1_bucket)``. ``T_input`` is the
-        # encoder input frame count for the chunk — the batched path uses
-        # ``T_input == window`` for every cohort, and the B=1 fallback
-        # ``_forward_single`` path lands here too with smaller ``T_input``
-        # for partial / final windows.
+        # Keyed by batch, input length, and cache-length bucket.
         self._captured: Dict[Tuple[int, int, int], _CapturedShape] = {}
-        # Steady-state streaming hits at most ``max_batch_size`` distinct B
-        # values × ``ceil(max_offset / N_BLOCK)`` cache_t1 buckets. The B=1
-        # single fallback adds a handful of ``T_input`` variants on top.
-        # Cap generously so the typical workload is fully captured without
-        # ever falling back to eager mode; ``_capture`` short-circuits
-        # cleanly when the cap is hit.
+        # Bound graph-pool growth; uncached shapes fall back to eager execution.
         self._max_captures = 512
 
     # ------------------------------------------------------------------
@@ -471,7 +451,6 @@ class GraphedFeatureExtraction:
         self._frame_shift = frame_shift
         self._feat_dim = int(feature_config.output_dim)
 
-        # Build the bucket list.
         if batch_buckets is None:
             buckets: List[int] = []
             b = 1
@@ -569,9 +548,8 @@ class GraphedFeatureExtraction:
             # The previous replay's captured H2D reads these pinned buffers, and
             # the launch returns before the DMA runs.  Rewriting them without
             # waiting corrupts the *previous* step's features whenever the copy
-            # has not drained — invisible on an idle GPU, catastrophic with any
-            # co-tenant process on the device (`.artifacts/known_issues.md`,
-            # "Lessons that outlived their bugs").
+            # has not drained.  Load on another stream makes this race easier to
+            # trigger, but the ordering is required even when it usually finishes first.
             # Unlike the eager staging pair this cannot be double-buffered away:
             # the addresses are captured inside the graph.  In steady state a
             # full step of encoder work separates two replays, so the event has

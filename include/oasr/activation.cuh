@@ -37,17 +37,14 @@ __global__ void gluKernel(const T* __restrict__ input,  // [batch, seq_len, 2 * 
 
         const int c_offset = vec_c * VecSize;
 
-        // Load value half: input[pos, c_offset]
         const int input_idx1 = pos * (2 * channels) + c_offset;
         Vec<T, VecSize> val_vec;
         val_vec.load(input + input_idx1);
 
-        // Load gate half: input[pos, channels + c_offset]
         const int input_idx2 = pos * (2 * channels) + channels + c_offset;
         Vec<T, VecSize> gate_vec;
         gate_vec.load(input + input_idx2);
 
-        // Compute x * sigmoid(gate) in float
         Vec<T, VecSize> out_vec;
 #pragma unroll
         for (int v = 0; v < VecSize; v++) {
@@ -57,7 +54,6 @@ __global__ void gluKernel(const T* __restrict__ input,  // [batch, seq_len, 2 * 
             out_vec[v] = static_cast<T>(x * sigmoid_gate);
         }
 
-        // Store result
         const int out_idx = pos * channels + c_offset;
         out_vec.store(output + out_idx);
     }

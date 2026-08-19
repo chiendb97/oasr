@@ -22,7 +22,6 @@ import sys
 import pytest
 import torch
 
-# Add python module to path
 sys.path.insert(0, "python")
 
 # `tests/` has no __init__.py, so make the sibling helper importable by name

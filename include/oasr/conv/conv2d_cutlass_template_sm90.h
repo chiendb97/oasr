@@ -85,13 +85,11 @@ struct CutlassConv2dFpropKernelSm90 {
     using FusionOp =
         typename FusionEpilogueOpSm90<activation_type, ElementCD, ElementCompute, ElementCD>::type;
 
-    // Build epilogue collective
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         ArchTag, OperatorClass, TileShape, ClusterShape, EpilogueTileType, ElementAccumulator,
         ElementCompute, ElementCD, LayoutCD, AlignmentEpilogue, ElementCD, LayoutCD,
         AlignmentEpilogue, EpilogueSchedule, FusionOp>::CollectiveOp;
 
-    // Build mainloop collective (im2col TMA for activation, TMA for filter)
     using CollectiveMainloop = typename cutlass::conv::collective::CollectiveBuilder<
         ArchTag, OperatorClass, cutlass::conv::Operator::kFprop, ElementA, LayoutA, AlignmentA,
         ElementB, LayoutB, AlignmentB, ElementAccumulator, TileShape, ClusterShape,
@@ -99,7 +97,6 @@ struct CutlassConv2dFpropKernelSm90 {
             sizeof(typename CollectiveEpilogue::SharedStorage))>,
         KernelSchedule>::CollectiveOp;
 
-    // Assemble conv kernel and device adapter
     using ConvKernel =
         cutlass::conv::kernel::ConvUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
 
@@ -116,11 +113,9 @@ struct CutlassConv2dFpropKernelSm90 {
                                 int IC, int K, int R, int S, int pad_h, int pad_w, int stride_h,
                                 int stride_w, int dilation_h, int dilation_w, ElementCompute alpha,
                                 cudaStream_t stream) {
-        // Compute output spatial dimensions
         int P = (H + 2 * pad_h - dilation_h * (R - 1) - 1) / stride_h + 1;
         int Q = (W + 2 * pad_w - dilation_w * (S - 1) - 1) / stride_w + 1;
 
-        // Build ConvProblemShape from user parameters
         // shape_act = [N, H, W, IC], shape_flt = [K, R, S, IC]
         // lower_padding = upper_padding = [pad_h, pad_w]
         // traversal_stride = [stride_h, stride_w], dilation = [dilation_h, dilation_w]
@@ -135,7 +130,6 @@ struct CutlassConv2dFpropKernelSm90 {
             1                          // groups
         };
 
-        // Mainloop arguments: just the raw pointers (strides embedded in problem shape)
         typename CollectiveMainloop::Arguments mainloop_args{input, filter};
 
         // Epilogue output stride for NHWC-packed tensor (N, P, Q, K)
@@ -160,7 +154,6 @@ struct CutlassConv2dFpropKernelSm90 {
         // Avoids creating a TMA descriptor with a nullptr address during initialize().
         const ElementCD* ptr_C = (bias != nullptr) ? bias : output;
 
-        // Build epilogue arguments
         typename CollectiveEpilogue::Arguments epilogue_args{
             {alpha, beta},  // thread (FusionCallbacks::Arguments)
             ptr_C,          // ptr_C

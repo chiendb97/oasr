@@ -1,34 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Feature-extractor registry — the sixth-and-a-half extension axis (F1).
+"""Feature extractor registry.
 
-Every other axis in the engine resolves through a registry: models, checkpoint
-converters, decode strategies, streaming backends, batching policies, tokenizers.
-Feature extraction was the exception — :class:`~oasr.features.FeatureSpec` even
-documents ``kind`` as keying "the (future) extractor registry" — so dispatch lived
-as ``if feature_type == ...`` chains, including one inside the *shared*
-:class:`~oasr.engine.input_processor.InputProcessor` complete with a
-function-body import of an architecture-specific module.  Adding a frontend (raw
-waveform for wav2vec, an 8 kHz telephony spec, a different LFR recipe) therefore
-meant editing the engine.
-
-An extractor answers three questions:
-
-* **how** to turn a padded waveform batch into features (``fn``), and — when the
-  frame grid is not simply "restart at buffer position 0" — how to do it
-  incrementally (``streaming_fn``);
-* whether it can run **incrementally** at all, and on what grid
-  (``framing``) — the streaming feature path windows a growing buffer, which a
-  frontend that normalises over a fixed window cannot do;
-* whether its cost is **fixed per row** (``window_seconds_attr``) — the batching
-  policies need this, because a frontend that pads *and trims* every utterance to
-  30 s makes every row cost the same regardless of its length.
-
-Registered under the ``FeatureConfig.feature_type`` value (``"fbank"`` /
-``"mfcc"`` / ``"whisper_logmel"``), which is what the engine holds.  Note the
-``FeatureSpec.kind`` vocabulary is adjacent but distinct (``"kaldi_fbank"`` /
-``"kaldi_mfcc"`` / ``"whisper_logmel"`` / ``"raw"``); ``FeatureSpec.to_feature_config``
-is the one place that maps between them.
+Entries declare batch extraction, optional incremental framing, and fixed-row
+cost. ``FeatureConfig.feature_type`` selects an entry; ``FeatureSpec`` performs
+the external format mapping.
 """
 
 from __future__ import annotations

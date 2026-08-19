@@ -816,7 +816,6 @@ class AutoTuner:
             logger.warning("[Autotuner]: Failed to load config %s: %s", path, exc)
             return False
 
-        # Check metadata for environment mismatch
         saved_meta = data.pop(_METADATA_KEY, data.get("env"))
         if saved_meta is not None:
             current_meta = _collect_metadata()
@@ -836,7 +835,6 @@ class AutoTuner:
                     details,
                 )
 
-        # Load entries
         entries = data.get("entries", {})
         # Handle legacy format (no "entries" wrapper)
         if not entries and "version" not in data:
@@ -944,7 +942,6 @@ def autotune(
     prev_log_level = logger.level
     logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
-    # Load configs from cache file on entry
     cache_valid = True
     if cache is not None:
         with tuner._lock:
@@ -976,7 +973,6 @@ def autotune(
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
 
-        # Save on exit when tuning with a cache path and new results exist
         if cache is not None and cache_valid and tune_mode and tuner._dirty:
             try:
                 tuner.save_configs(cache)

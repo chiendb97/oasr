@@ -57,29 +57,9 @@ static constexpr DLDataType dl_int32 = {kDLInt, 32, 1};
     TVM_FFI_ICHECK((x).IsContiguous())                                                    \
         << "Tensor must be contiguous (row-major, no padded strides)"
 
-// True when the trailing dimension is contiguous *and* the resulting rows tile
-// the tensor's memory exactly -- no gaps, no overlap, in some order.
-//
-// This is the real precondition of a row-wise kernel that walks
-// `base + row * row_len`, and it is both weaker and stronger than
-// `IsContiguous()` in useful ways:
-//
-//   * Stronger than `stride(-1) == 1`, which was the check these kernels used.
-//     `x[..., :32]` of a wider buffer, or `x[:, -1]` of a `(B, T, D)` tensor,
-//     satisfies that and still has a padded row stride -- the kernel then reads
-//     the wrong memory and returns a plausible wrong answer, silently.
-//
-//   * Weaker than `IsContiguous()`, which needlessly refuses a *permuted* dense
-//     view.  Zipformer works in `(T, B, C)`, a transpose of a contiguous
-//     `(B, T, C)`: its rows still tile memory exactly, just visited in a
-//     different order.  Since normalization is per-row and independent, and the
-//     output carries the same strides (`torch.empty_like` preserves them),
-//     processing rows in *memory* order computes exactly the same result.
-//     Forcing contiguity in the model instead would copy the whole activation
-//     (~18 MiB at T=1500 B=16 d=384) to save a few microseconds of norm.
-//
-// Zero/negative strides (`expand`, reversed views) fail the density test, which
-// is what we want: those alias or run backwards and are not row-tilings.
+// True when contiguous trailing rows tile storage without gaps or overlap.
+// Permuted dense views are valid because row-wise operations are independent;
+// padded, expanded, and reversed views are not.
 inline bool IsRowDense(const TensorView& x) {
     int n = x.ndim();
     if (n < 1 || x.stride(n - 1) != 1) return false;
@@ -116,16 +96,8 @@ inline bool IsRowDense(const TensorView& x) {
 // cost ~1.3 us per call on shapes where the kernel itself costs ~10.
 #define FLATTENED_ROWS(x) ((x).numel() / (x).size((x).ndim() - 1))
 
-// CUTLASS 2.x alignment-8 iterators: both GEMM free dimensions must divide by 8.
-//
-// Checked here, in every GEMM-family launcher, for one reason: the *same*
-// question used to get two different answers.  `gemm` let CUTLASS fail and
-// surfaced "GEMM kernel failed", which says nothing about what to do;
-// `gemm_log_softmax` silently rerouted to cuBLAS, which says nothing at all.
-// Neither is acceptable for a precondition the caller can trivially satisfy —
-// every unaligned case in this repo is an output projection, and padding it is
-// the established fix (`oasr.models.base.align_out_features` +
-// `pad_output_projection`, which the WeNet CTC head has used since day one).
+// Alignment-8 iterators require both free dimensions to divide by eight. Check
+// uniformly at the launcher boundary instead of failing or rerouting later.
 #define CHECK_GEMM_ALIGNMENT(N, K)                                                        \
     TVM_FFI_ICHECK((N) % 8 == 0 && (K) % 8 == 0)                                          \
         << "GEMM needs both free dimensions 8-aligned (CUTLASS alignment-8 "              \

@@ -262,12 +262,9 @@ def align_hypotheses(
 #: Frames past the emission frame that a token's posterior peak may sit at.
 #:
 #: A prefix beam commits to an extension at the **leading edge** of the label's
-#: posterior peak — the first frame where it becomes a competitive extension —
-#: which on a real Conformer is the peak frame itself for ~3/4 of tokens and one
-#: frame before it for the rest, never later and never further.  Reading the
-#: posterior strictly at the emission frame therefore under-reports a quarter of
-#: them badly (0.08 where the peak is 1.00).  Two frames is exactly the observed
-#: spread; widening it would start absorbing the *next* label's peak.
+#: posterior peak — the first frame where it becomes a competitive extension.
+#: The posterior maximum may fall one frame later; a wider lookahead risks
+#: absorbing the next label's peak.
 _PEAK_LOOKAHEAD = 1
 
 

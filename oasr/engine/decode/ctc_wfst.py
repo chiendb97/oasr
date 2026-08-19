@@ -62,22 +62,13 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
     decode_type: ClassVar[str] = "ctc"
     consumes: ClassVar[str] = "log_probs"
     options_cls: ClassVar[type] = CtcWfstOptions
-    # No ``word_timing_modes`` override — the base default is "neither mode",
-    # and that is the honest answer here rather than an omission.  This decoder
-    # emits *word* ids through the lexicon FST, not CTC labels, so the forced
-    # alignment the ``ctc_cuda`` path uses has nothing to align: it would have
-    # to expand each word back through the lexicon first.  The decoder does
-    # track per-arc frames internally, but the batched GPU offline path (the one
-    # the engine uses) does not surface them.  Serve ``ctc_cuda`` for word
-    # timings on the same checkpoint.
+    # Word timings are unsupported because this path emits lexicon word ids and
+    # the batched decoder does not surface its per-arc frame positions.
 
     def __init__(self, config: "EngineConfig", detok: "Detokenizer", model=None) -> None:
         super().__init__(config, detok, model)
-        # Streaming decoder sizing (GPU backend): every concurrent stream borrows a
-        # channel from one shared multi-channel decoder, so the pool must cover the
-        # engine's concurrent stream cap. Each channel's winners ring commits only
-        # while the channel is open; one 32 MiB mapping chunk (4Mi entries) per
-        # channel is ample — the per-chunk GC keeps the live window at ~one chunk.
+        # The shared streaming decoder needs one channel per concurrent stream;
+        # per-chunk collection bounds each channel's live winners window.
         cfg = self.options.decoder_config
         max_bs = int(getattr(config, "max_batch_size", 0) or 0)
         if cfg is not None and getattr(cfg, "wfst_backend", "gpu").lower() == "gpu":

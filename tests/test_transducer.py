@@ -519,7 +519,7 @@ class TestEngineTransducer:
         assert backend._consumes == "hidden"  # noqa: SLF001
         # ...and must still get CUDA-graph capture: the capture takes whichever
         # chunk-forward the strategy routed to, so hidden mode is not a
-        # second-class streaming path (H3).
+        # second-class streaming path.
         assert backend._graph_cache is not None  # noqa: SLF001
         torch.manual_seed(9)
         text = engine.transcribe(torch.randn(32000))
@@ -528,7 +528,7 @@ class TestEngineTransducer:
     def test_streaming_graph_capture_is_token_identical_to_eager(self, native_ckpt):
         """Capturing the encoder-only chunk forward must not move a single token.
 
-        The gate for H3: graph replay reuses pre-allocated input/output buffers
+        Graph replay reuses pre-allocated input/output buffers
         and a private memory pool, so a capture that baked in the wrong buffer
         or missed a cache write shows up here as a token divergence rather than
         as a plausible-looking transcript.
@@ -570,7 +570,7 @@ class TestEngineTransducer:
 
     @pytest.mark.parametrize("stride", [1, 2, 3, 64])
     def test_greedy_is_invariant_to_the_termination_check_stride(self, native_ckpt, stride):
-        """The greedy loop checks termination once per block, not per iteration (H7).
+        """The greedy loop checks termination once per block, not per iteration.
 
         Overshooting a block boundary must be **inert**: once every row has
         ``t >= its length``, ``active`` is all-false, so ``emit`` / ``advance`` are
@@ -614,7 +614,7 @@ class TestEngineTransducer:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="beam search runs on the model device")
 class TestTransducerBeamSearch:
-    """Modified beam search (P4), validated by properties rather than an oracle.
+    """Modified beam search, validated by properties rather than an oracle.
 
     There is no conformer-transducer checkpoint in the tree, so WER is not
     available — and a WER number on random weights would be meaningless anyway.

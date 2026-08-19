@@ -1,41 +1,10 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""OASR Serving Benchmark — HTTP + gRPC against the Rust frontend.
+"""Measure HTTP and gRPC serving throughput and latency.
 
-Measures end-to-end serving throughput and latency for the OASR ``oasr-server``
-binary.  Mirrors the CLI shape of ``benchmarks/bench_engine.py`` so the same
-``--ckpt-dir`` / ``--audio-dir`` / ``--num-utterances`` arguments work.
-
-Subroutines (one or more)
--------------------------
-``offline``         ``POST /v1/speech:recognize`` (raw PCM body, config in the
-                    query string — no base64/JSON), N concurrent clients.
-                    Reports RTF, total throughput, p50 / p95 / p99 latency.
-``grpc_offline``    Unary ``oasr.speech.v1.Speech/Recognize``.
-``grpc_streaming``  Bidi ``oasr.speech.v1.Speech/StreamingRecognize``.  Each
-                    client opens one stream, feeds fixed-duration chunks,
-                    and consumes interim + final results.
-
-The pre-refactor ``streaming`` (WebSocket) and ``whisper`` (multipart)
-subroutines are intentionally removed: ``oasr-server`` now exposes only the
-HTTP + gRPC surfaces shaped after Google Cloud Speech-to-Text v1.
-
-Examples
---------
-# Quick smoke (auto-spawns oasr-server).  CKPT_DIR / AUDIO_DIR are the paths to
-# your checkpoint and wav directory — `.env` (see .env.example) is the usual
-# place to keep them, so they can be passed as "$CKPT_DIR" / "$AUDIO_DIR".
-python benchmarks/bench_service.py \\
-    --ckpt-dir CKPT_DIR \\
-    --audio-dir AUDIO_DIR \\
-    --subroutines grpc_streaming \\
-    --max-batch-size 64 --num-utterances 2000
-
-# Use a running server (skip spawn)
-python benchmarks/bench_service.py \\
-    --audio-dir AUDIO_DIR --subroutines offline grpc_streaming \\
-    --server-url http://127.0.0.1:8080 --num-utterances 500
+Supports concurrent HTTP recognition, unary gRPC, and bidirectional streaming
+gRPC. The CLI accepts the same dataset and sizing arguments as ``bench_engine``.
 """
 
 from __future__ import annotations

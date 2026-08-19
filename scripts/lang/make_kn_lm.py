@@ -3,35 +3,9 @@
 #           2018  Ruizhe Huang
 #           2024  OASR Authors
 # Apache 2.0.
-"""
-Train a Kneser-Ney smoothed n-gram language model and write ARPA output.
+"""Train an unmodified Kneser-Ney n-gram model and write ARPA output.
 
-This is a pure-Python implementation of unmodified Kneser-Ney smoothing,
-equivalent to the following SRILM command::
-
-    ngram-count -order 3 -kn-modify-counts-at-end -ukndiscount \\
-        -gt1min 0 -gt2min 0 -gt3min 0 \\
-        -text corpus.txt -lm lm.arpa
-
-Adapted from ``icefall/shared/make_kn_lm.py`` (self-contained, no external
-dependencies beyond the Python standard library).
-
-Usage::
-
-    # Single file
-    python scripts/make_kn_lm.py \\
-        -ngram-order 3 \\
-        -text data/lang/text \\
-        -lm data/lm/G_3_gram.arpa
-
-    # Multiple files (e.g. LibriSpeech train splits)
-    python scripts/make_kn_lm.py \\
-        -ngram-order 3 \\
-        -text train-clean-100/text train-clean-360/text train-other-500/text \\
-        -lm data/lm/G_3_gram.arpa
-
-Input text files must contain plain text with one sentence per line
-(space-separated words).  Utterance IDs must be stripped beforehand.
+Input files contain one tokenized sentence per line without utterance IDs.
 """
 
 import argparse

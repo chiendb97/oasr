@@ -37,16 +37,8 @@ class Executor(ABC):
     #: incoming requests match the configured service mode.
     streaming: ClassVar[bool]
 
-    #: Metric collector, overridden per instance by :class:`ASREngine`.
-    #:
-    #: An instance attribute with a **class-level default** — deliberately not
-    #: a ``ClassVar``, which could not then be overridden per engine.  The
-    #: default is shared because it holds nothing, and it exists because
-    #: instrumentation reaches into the middle of the tick and so must survive
-    #: an executor that was not built through ``__init__``: the isolation tests
-    #: construct one with ``__new__`` and set only what the path under test
-    #: touches, which is the right way to test a failure path and the wrong
-    #: thing to break by adding a field.
+    #: Per-engine collector with a stateless default for minimally constructed
+    #: executors. This remains an instance attribute, not a ``ClassVar``.
     _metrics: EngineMetrics = NullMetrics()
 
     # ------------------------------------------------------------------

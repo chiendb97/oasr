@@ -224,36 +224,17 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
             ordered_states.extend(states)
         nvtx_pop()  # decode_advance
 
-        # Interim-partial cadence.  Emitting a partial every step costs **~15% of
-        # streaming wall** against emitting none (pool 32, 640 ms chunks —
-        # `.artifacts/engine_perf.md` §10.4).  Most of that is *not* the blocking
-        # ``cudaStreamSynchronize``, which measures 77 us of the stage's 610 at
-        # 64 streams; the rest is materialising the read-back into Python, which
-        # is why ``peek_states_best`` exists.  Two knobs trade the remainder
-        # against the cadence.  ``partial_decode_interval <= 0`` skips interim
-        # partials entirely (decode state still advances; only the read-back is
-        # skipped), and ``N > 1`` emits every N-th step.
-        #
-        # ``overlap_partial_readback`` instead keeps the cadence and moves the
-        # sync off the critical path: each emit step issues a **non-blocking**
-        # batched read-back (``peek_states_async``) for the current ready set and
-        # emits the partials collected from the **previous** emit step's handle
-        # (whose copy completed during the intervening step).  Partials then lag
-        # exactly one emit step (~one chunk); the final transcript still comes
-        # from the blocking ``finalize``.
+        # Interval zero disables partial readback; larger values reduce its sync
+        # cost. Overlapped readback emits the previous interval's result, so only
+        # partials lag one interval; finalization remains synchronous.
         interval = getattr(self._config, "partial_decode_interval", 1)
         if interval < 1 or (self._stream_decode_step % interval) != 0:
             return []
 
         nvtx_push("partial_readback")
         if not getattr(self._config, "overlap_partial_readback", False):
-            # Default: blocking read-back, emit this step's partial now (lowest
-            # first-token latency — the interactive path).  ``peek_states_best``
-            # rather than ``peek_states``: a partial carries the best hypothesis
-            # only, so reading every beam back, turning each into a Python list
-            # and wrapping the set in per-state ``GpuDecoderResult`` views is
-            # work done to be discarded — 470 of the stage's 610 us per step at
-            # 64 streams, none of it the synchronize.
+            # Blocking path emits immediately and reads only the best hypothesis;
+            # partial responses discard the remaining beams.
             bests = decoder.peek_states_best(ordered_states)
             partials = [
                 RequestOutput(

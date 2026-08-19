@@ -82,13 +82,8 @@ def set_backend_mode(mode: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-#: Oldest CuTeDSL these kernels are verified against.  4.6.1 is what CI runs;
-#: 4.5.2 is the oldest release whose API surface they still resolve on (4.6.0
-#: removed ``cute.make_fragment`` and ``cute.core.ThrMma``/``ThrCopy``, none of
-#: which are used here, so the range is genuinely both).  Older releases are
-#: refused *by version* rather than left to fail mid-trace: the kernels build a
-#: config, validate it, then explode inside ``cute.compile`` on a missing
-#: attribute, which reads as a kernel bug rather than a stale dependency.
+#: Oldest verified CuTeDSL release. Reject older APIs before compilation so a
+#: dependency mismatch is not reported as a kernel failure.
 MIN_CUTEDSL_VERSION = (4, 5, 2)
 
 
@@ -321,22 +316,9 @@ def _compiled_fmha(
         v = torch.empty(B, H_kv, T_k_dense, head_dim, dtype=torch_dtype, device=device)
         T_k_logical = T_k_dense
 
-    # cp.async with 128-bit copies requires the head-dim ptr to be
-    # 16B-aligned at IR-verify time. ``mark_compact_shape_dynamic`` with
-    # divisibility=128/dtype.width tells the compiler that the leading dim
-    # has guaranteed alignment so the verifier accepts the copy. Without it,
-    # the upstream FA2 example also fails on this same alignment check.
-    #
-    # NB: ``enable_tvm_ffi=True`` on ``from_dlpack`` plus
-    # ``options="--enable-tvm-ffi"`` on ``cute.compile`` together emit a
-    # compiled callable that accepts raw torch tensors at call time
-    # (rather than per-call ``from_dlpack`` wrappers) and is safe to
-    # capture into a ``torch.cuda.CUDAGraph``. The legacy per-call
-    # ``from_dlpack`` path produces fresh Python descriptor objects whose
-    # backing dlpack capsules get GC'd between graph replays, which is
-    # what causes the streaming engine's ``CUDA_ERROR_ILLEGAL_ADDRESS``.
-    # This is the same pattern Flash Attention's ``flash_attn/cute``
-    # uses (cute_dsl_utils.py::to_cute_tensor with enable_tvm_ffi=True).
+    # The compiler needs a 16-byte head-dimension alignment guarantee for
+    # asynchronous copies. TVM-FFI mode also keeps graph-replayed tensor
+    # descriptors alive instead of creating per-call DLPack wrappers.
     elem_bits = 16 if dtype_str == "float16" else 16  # bf16 is also 16b
     align_div = 128 // elem_bits
 

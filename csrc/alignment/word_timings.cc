@@ -130,13 +130,8 @@ AlignmentResult align(const std::vector<TokenSpan>& spans, const std::vector<std
     if (!want_words)
         return result;
 
-    // Character ownership as two parallel arrays rather than one entry per
-    // character: ``ends[j]`` is one past the last *byte* piece ``j``
-    // contributed and ``owner[j]`` is the token that produced it.  Ownership is
-    // monotone in the text, so a word's member tokens are two binary searches
-    // instead of a set built over its characters.  Byte offsets rather than
-    // code-point offsets because a piece is always a whole number of code
-    // points, so the two partition identically and bytes are free.
+    // Monotone byte ends and token owners let each word find its member tokens
+    // with two binary searches. Whole-code-point pieces make byte partitions safe.
     std::string text;
     std::vector<size_t> ends;
     std::vector<size_t> owner;

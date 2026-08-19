@@ -53,13 +53,8 @@ pub fn run(cli: Cli) -> Result<()> {
     runtime.block_on(serve(cli))
 }
 
-/// Install the tracing subscriber.  Uses `try_init` because when imported as
-/// an extension module the host interpreter may already have one — in that
-/// case we keep the existing subscriber instead of panicking.
-///
-/// `log_format` selects the output formatter: `"json"` emits one JSON object
-/// per line (with span fields such as `rid` inlined) for log aggregators; any
-/// other value uses the human-readable text formatter.
+/// Install tracing without replacing an existing host subscriber. `json`
+/// emits structured lines; other values use text formatting.
 fn init_tracing(log_level: &str, log_format: &str) {
     let filter = EnvFilter::try_new(log_level)
         .or_else(|_| EnvFilter::try_from_default_env())
@@ -151,13 +146,8 @@ async fn serve(cli: Cli) -> Result<()> {
         }
     };
 
-    // ---- Engine-authoritative service mode ----
-    //
-    // The engine's mode can differ from `--service-mode`: `--engine-config` JSON
-    // wins on the Python side, and several decode families are offline-only.  If
-    // the front-ends trusted the flag they would reject requests this engine can
-    // serve (and accept ones it cannot, which then fail deep inside admission).
-    // Take the engine's answer and say so when it disagrees with the flag.
+    // Engine configuration and decode capabilities may override the CLI mode;
+    // frontends must follow the engine's authoritative value.
     let effective_mode = match model.service_mode.as_deref() {
         Some(m) => {
             if m != cli.service_mode {

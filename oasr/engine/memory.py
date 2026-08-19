@@ -42,9 +42,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-#: Multiplier on the measured activation peak.  A probe forward at the widest
-#: shape is representative, not exhaustive: decode workspaces, the batched fbank
-#: staging tensors and per-shape graph captures all land after it.
+#: Headroom above the probe peak for workspaces, staging, and graph captures.
 ACTIVATION_SAFETY = 1.5
 
 #: Floor on the activation reserve.  A tiny model measures a tiny peak, and the

@@ -405,20 +405,14 @@ class Attention(nn.Module):
         if is_causal and kv_lens is None and attn_bias is None:
             # Causal and *nothing else*: SDPA has a flash implementation for
             # exactly this and needs no mask tensor, while the fused path pays a
-            # ~78 us floor at any T (the canonical-stride copies plus the
-            # wrapper).  Measured 0.22x at T=32, 0.83x at T=800 (D=128), 1.19x
-            # at T=2048 (D=64), and every causal-only shape in this repo is
-            # short — Whisper's SOT prefill is 4 tokens, the WeNet decoder's
-            # teacher-forced pass ~40.  Revisit when the stride requirement
-            # goes; the crossover moves with it.
+            # fixed canonical-stride copy and wrapper cost.  Revisit if that
+            # stride requirement is removed.
             #
             # Causal *combined* with a window is a different question and is
             # handled below: SDPA rejects `is_causal` alongside `attn_mask`, so
             # the combination costs it a materialized (B, 1, T_q, T_k) tensor
-            # **and** its flash path.  That is where the fusion pays: measured
-            # 1.80-3.29x on the attention op at Qwen2-Audio-7B prefill shapes
-            # (causal + left pad, B2-8, P512-1600, D128, bf16, real call-site
-            # strides), 1.03-1.05x over the whole prefill.
+            # **and** its flash path, which is where fusion can amortize its
+            # fixed overhead.
             return take_policy("fmha-causal-short")
         if is_causal:
             # Causal + a window.  Worth fusing only above the work floor that
@@ -428,8 +422,7 @@ class Attention(nn.Module):
             if macs < FMHA_CAUSAL_WINDOW_MIN_MACS:
                 return take_policy("fmha-causal-window-small")
         if kv_lens is None and attn_bias is None and kv_starts is None:
-            # Nothing to fuse, and SDPA measured faster — see the table above.
-            # A policy call today; closing it is kernel work.
+            # Nothing to fuse; the library path avoids the fused wrapper overhead.
             return take_policy("fmha-unmasked")
 
         from oasr.jit.attention import fmha_config_supported

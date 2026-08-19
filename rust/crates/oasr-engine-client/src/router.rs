@@ -92,14 +92,8 @@ impl RouterActor {
     /// Synchronous-context variant used by the dispatcher thread (a
     /// `std::thread`), which must never block on a slow client.
     ///
-    /// Delivery is `try_send`, so a full per-request channel means something has
-    /// to give.  The policy is **terminal-event-preserving**: partials are
-    /// droppable (the next one supersedes them), but a dropped `Final` / `Error`
-    /// is a lost transcript — the receiver then sees its stream close with no
-    /// terminal event and the front-ends turn that into a 500 / `INTERNAL`.
-    /// So a full channel with a terminal event hands delivery to a background
-    /// task instead of discarding it.  The registration is only removed once the
-    /// terminal event is actually on its way.
+    /// Uses `try_send`: partials may be dropped when full, but terminal events
+    /// are handed to a background task and registration persists until delivery.
     pub fn route_blocking(&self, event: Event) {
         let Some(rid) = event.request_id().map(|s| s.to_owned()) else {
             return;

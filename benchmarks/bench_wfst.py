@@ -1,29 +1,8 @@
 #!/usr/bin/env python3
-"""OASR in-tree GPU WFST decoder throughput benchmark.
+"""Benchmark WFST decoding from device-resident log probabilities to words.
 
-Ported from the standalone ``wfst`` project's ``benchmarks/bench_decode.py`` (the "ours"
-engine).  The in-tree decoder is JIT-compiled (``oasr.jit.wfst_decoder``) and driven over
-TVM-FFI via int64 handles; the timing boundary is "GPU-resident log-probs -> words"
-(includes the end-of-batch D2H, host backtrack and word mapping) — the same boundary the
-original benchmark uses, so numbers are directly comparable.
-
-Assets (a graph image + a log-prob dump) come from the standalone ``wfst`` project's
-``data/``: point ``$OASR_WFST_HOME`` at that checkout, or name ``--graph`` / ``--logprobs``
-directly.  Pass ``--compare-external`` to also time the external ``_wfst.so`` build in the
-same process for a direct A/B (perf parity check).  Exact per-lane output parity is checked
-separately by ``scripts/wfst_parity_check.py``.
-
-Examples::
-
-    # in-tree only, sweep batch sizes
-    export OASR_WFST_HOME=/path/to/wfst
-    python benchmarks/bench_wfst.py --batch 1 8 32
-
-    # explicit assets, no env var
-    python benchmarks/bench_wfst.py --graph /path/to/hlg.img --logprobs /path/to/dump.pt
-
-    # A/B vs the external wfst build (perf parity)
-    python benchmarks/bench_wfst.py --batch 8 32 --compare-external
+The timing includes read-back, host backtracking, and word mapping. Assets may
+be passed directly or resolved below ``$OASR_WFST_HOME``.
 """
 
 import argparse

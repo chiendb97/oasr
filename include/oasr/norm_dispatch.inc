@@ -1,8 +1,6 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// FlashInfer-style dispatch macros for normalization kernels.
-// Dispatches VecSize and block_size based on hidden dimension alignment.
 
 #pragma once
 
@@ -11,8 +9,7 @@
 /**
  * @brief Dispatch vectorized vs scalar normalization based on alignment.
  *
- * Selects VecSize based on data type (4 for FP16/BF16) when hidden_size
- * and pointers are aligned, otherwise falls back to scalar.
+ * Uses VecSize=4 for aligned FP16/BF16 data, otherwise scalar access.
  */
 #define OASR_DISPATCH_NORM_VEC_SIZE(T, vec_size_var, hidden_size, ptr1, ptr2, ...)    \
     do {                                                                               \
@@ -30,8 +27,7 @@
 
 /**
  * @brief Compute warp-aligned block size for normalization kernels.
- *
- * Returns a block size in [WARP_SIZE, 1024] that is a multiple of WARP_SIZE.
+ * Returns a warp-aligned block size in [WARP_SIZE, 1024].
  */
 #define OASR_NORM_BLOCK_SIZE(elements_per_thread)                                     \
     (std::min(1024, std::max(32, (((elements_per_thread) + 31) / 32) * 32)))

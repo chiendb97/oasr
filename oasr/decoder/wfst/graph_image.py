@@ -1,39 +1,9 @@
-"""Binary graph-image format (hlg.img) — canonical definition.
+"""Canonical little-endian WFST graph-image format.
 
-Little-endian, 128-byte-aligned sections, fixed 256-byte header:
-
-    magic            u64   0x31474D4954534657 ("WFSTIMG1" little-endian)
-    version          u32   2 (v1 files remain readable: no epsilon section)
-    flags            u32   bit0 = finals_at_end (final arcs last within a state's range)
-                           bit1 = has_epsilons
-                           bit2 = eps_first (epsilon arcs at the START of the non-final
-                                  range; else at its end)
-    num_states       i64
-    num_arcs         i64
-    vocab_size       i32   (= max ilabel + 1; ilabel -1 marks final arcs)
-    start_state      i32   (k2 convention: 0)
-    aux_pool_size    i64
-    section offsets  7 x i64 (bytes from file start; v1 headers carry 6):
-        row_splits, final_count, arc_dest_ilabel, arc_weight, aux_row_splits, aux_pool,
-        eps_count
-
-Sections:
-    row_splits       i32[num_states + 1]   CSR arc offsets (k2 arc order preserved)
-    final_count      i32[num_states]       #ilabel==-1 arcs in the state's range
-    arc_dest_ilabel  i32[2 * num_arcs]     interleaved {dest, ilabel} (int2 loads on GPU)
-    arc_weight       f32[num_arcs]
-    aux_row_splits   i32[num_arcs + 1]     ragged aux labels (word ids) CSR
-    aux_pool         i32[aux_pool_size]
-    eps_count        i32[num_states]       #epsilon (non-emitting) arcs per state (v2)
-
-Epsilon arcs (OpenFST-style TLG graphs) consume no frame; the decoder identifies them by
-segment, never by their stored ilabel (which is preserved verbatim for arc_map fidelity —
-note that in k2 HLG graphs label 0 means BLANK, an emitting label, so epsilon-ness is an
-export-time declaration via epsilon_id, not a label convention).
-
-Arc order is IDENTICAL to the source k2 FSA: arc index == k2 graph arc index, so lattice
-arc_map_a is the identity mapping (exact aux_labels parity). Final-arc placement within a
-state (start vs end) is detected, asserted contiguous, and recorded in flags.
+The 256-byte header points to 128-byte-aligned CSR graph and auxiliary-label
+sections. Version 2 adds epsilon counts while retaining version 1 reads.
+Epsilon identity is declared at export rather than inferred from labels. Source
+arc order is preserved so graph arc indices remain stable.
 """
 
 import struct

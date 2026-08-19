@@ -606,35 +606,14 @@ class FmhaSm80(FmhaBase):
             seqstart_k = mCacheSeqStarts[batch_size]
         n_block_max = cute.ceil_div(seqlen_k, self._n_block_size)
 
-        # Tier 1B: for causal attention, also bound the loop by this CTA's
-        # diagonal.  Row block ``m_block`` covers q rows
-        # ``[m_block*M, (m_block+1)*M)``, and causal masks ``k_col > q_row``, so
-        # every K block past ``ceil_div((m_block+1)*M, N)`` is entirely -inf.
-        # Without this the mask is still *correct* -- it is applied per element
-        # -- but every row block scans all of K, which is why plumbing a causal
-        # flag through on its own measured 1.4-4.8x SLOWER than SDPA: SDPA's
-        # flash path skips those blocks and this one did not.  Halving the
-        # average work is the whole point of a causal kernel.
+        # Causal rows need not scan K blocks wholly above their diagonal.
         if cutlass.const_expr(self._causal):
             n_block_causal = cute.ceil_div((m_block + 1) * self._m_block_size, self._n_block_size)
             if n_block_causal < n_block_max:
                 n_block_max = n_block_causal
 
-        # ...and bound it from *below* by whatever masks the low columns, for the
-        # same reason.  Upstream FlashAttention's ``BlockInfo.get_n_block_min_max``
-        # computes both ends; this kernel only had the upper one, so a left-padded
-        # batch loaded, MMA'd and then -inf-masked every block below its start --
-        # exactly the waste that made unbounded causal slower than SDPA.
-        #
-        # FA expresses a per-row key start as a tensor *offset* instead
-        # (``SeqlenInfo.offset_k`` / ``PagedKV.leftpad_k``), so it needs no start
-        # predicate at all.  That is the better answer where it applies, but it
-        # relies on FA's **bottom-right** causal alignment: shifting K also shifts
-        # the diagonal consistently.  This kernel is top-left aligned to match
-        # ``torch``'s ``is_causal`` (which is what every parity test here compares
-        # against), and under that convention a K-only offset would move the
-        # diagonal out from under the mask.  Bounding the loop keeps the
-        # convention and recovers the block-level work.
+        # Skip fully masked low-column blocks too. A tensor offset would change
+        # this kernel's top-left causal alignment, so retain an explicit bound.
         n_block_min = cutlass.Int32(0)
         if cutlass.const_expr(self._has_seqstart):
             n_block_min = seqstart_k // self._n_block_size
@@ -785,27 +764,9 @@ class FmhaSm80(FmhaBase):
             tKVcKV = None
             tKVpKV = None
 
-        # ---- Prologue (FA-style cp.async ring fill) -------------------------
-        # Pattern mirrors ``FlashAttentionForwardSm80.__call__``'s prologue.
-        # FIFO drain trick: each stage commits K **before** V so V's commit
-        # lands between K's; the iter loop's
-        # ``wait_group(num_stages * 2 - 2)`` then drains exactly the oldest
-        # K (which we're about to consume), leaving the more recent K/V
-        # loads inflight.
-        #
-        # Q_in_regs ordering: when sQ/sV alias, V's cp.async writes the same
-        # smem region as Q's. So Q must be (a) drained, (b) ldmatrix'd to
-        # rmem, and (c) cross-warp synced before any V issue. We split the
-        # prologue accordingly:
-        #
-        #   1. Q -> sQ; commit
-        #   2. K[N-1] -> sK[0]; commit
-        #   3. (q_in_regs only) wait_group(num_stages * 2 - 1) drains Q;
-        #      barrier; ldmatrix Q; barrier  — sQ is now safe to alias.
-        #   4. For stage in [0, num_stages):
-        #        - if (q_in_regs and stage>0) or not q_in_regs: load_K + commit
-        #        - if stage < num_stages-1: load_V + commit
-        #   5. (no-q_in_regs) wait_group(num_stages * 2 - 1) drains Q.
+        # Commit K before V so each wait drains the oldest K while newer loads
+        # remain in flight. When Q and V share storage, drain and move Q to
+        # registers before issuing any V copy.
         # Q (with predicates) -> sQ
         for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
             if cute.elem_less(tQcQ[0, m, 0][2], mQ.layout.shape[2]):

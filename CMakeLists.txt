@@ -5,10 +5,7 @@ project(oasr LANGUAGES CXX CUDA)
 # =============================================================================
 # Options
 # =============================================================================
-# Note: most kernel-related toggles (FP16/BF16/CUTLASS/FlashAttention) are
-# resolved at runtime by the TVM-FFI JIT pipeline, not at CMake configure time.
-# This CMake graph only builds the CPU-side decoder (oasr_core) and the
-# pybind11 module (_C) that exposes it.
+# Kernels are JIT-compiled; CMake builds the CPU decoder and Python bindings.
 option(BUILD_PYTHON "Build Python bindings (_C pybind11 module)" ON)
 option(OASR_USE_K2 "Enable K2 WFST beam search decoder (requires K2)" OFF)
 
@@ -22,7 +19,6 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Build type
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
@@ -37,13 +33,10 @@ find_package(CUDAToolkit REQUIRED)
 # Put -I flags in compile command (not in .rsp) so compile_commands.json and IntelliSense see them
 set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES OFF)
 
-# Set CUDA architectures if not specified
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    # Support common architectures: Volta, Turing, Ampere, Ada, Hopper, Blackwell
     set(CMAKE_CUDA_ARCHITECTURES 70 75 80 86 89 90 100 120)
 endif()
 
-# CUDA compiler flags
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fPIC")
@@ -62,13 +55,9 @@ endif()
 # runtime (resolved by TVM-FFI / nvcc), not linked into oasr_core. No
 # find_library() calls are needed here.
 
-# Python and dependencies for bindings
 if(BUILD_PYTHON)
     find_package(Python COMPONENTS Interpreter Development REQUIRED)
 
-    # TVM-FFI is only needed at runtime for JIT compilation (not at build time).
-
-    # pybind11 (still needed for decoder bindings)
     execute_process(
         COMMAND ${Python_EXECUTABLE} -c "import pybind11; print(pybind11.get_cmake_dir())"
         OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
@@ -91,7 +80,6 @@ if(BUILD_PYTHON)
         FetchContent_MakeAvailable(pybind11)
     endif()
 
-    # PyTorch (libtorch) — still needed for nn.Module layer wrappers and decoder.
     execute_process(
         COMMAND ${Python_EXECUTABLE} -c "import torch; print(torch.utils.cmake_prefix_path)"
         OUTPUT_VARIABLE TORCH_CMAKE_PREFIX
@@ -135,7 +123,7 @@ if(BUILD_PYTHON)
 endif()
 
 # =============================================================================
-# Source files (FlashInfer-style flat csrc/ layout)
+# Source files
 # =============================================================================
 # ---------------------------------------------------------------------------
 # oasr_core: only the decoder (CPU-side C++) is statically compiled.
@@ -174,17 +162,10 @@ set(OASR_HEADERS
 # Optional: K2 WFST decoder
 # =============================================================================
 if(OASR_USE_K2)
-    # k2 must be installed externally (e.g. built in the Docker image from
-    # https://github.com/chiendb97/k2 branch feat/cuda13).
-    # Pass -Dk2_DIR=<prefix>/share/cmake/k2 if find_package cannot locate it
-    # automatically (e.g. for a non-standard install prefix).
+    # Pass k2_DIR when the package is outside CMake's search path.
     find_package(k2 REQUIRED)
 
-    # K2_SOURCE_DIR must point to the k2 source tree so the streaming decoder
-    # can include internal headers (k2/csrc/, k2/torch/csrc/) that are not
-    # part of the installed package.  In Docker this is /opt/k2-src.
-    # Pass -DK2_SOURCE_DIR=<path> on the cmake command line, or set the
-    # K2_SOURCE_DIR environment variable (picked up by setup.py).
+    # Streaming uses internal headers absent from the installed package.
     if(NOT DEFINED K2_SOURCE_DIR AND DEFINED ENV{K2_SOURCE_DIR})
         set(K2_SOURCE_DIR "$ENV{K2_SOURCE_DIR}")
     endif()
@@ -246,10 +227,7 @@ if(BUILD_PYTHON)
     target_link_libraries(_C PRIVATE oasr_core ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIB})
     target_compile_options(_C PRIVATE ${TORCH_CXX_FLAGS})
 
-    # Set output directory for the Python module (never write into source tree).
-    # - When built via setuptools (setup.py), CMAKE_LIBRARY_OUTPUT_DIRECTORY is
-    #   set and the .so is placed under build/.
-    # - For standalone CMake builds, use the build tree so oasr stays clean.
+    # Standalone builds keep generated modules outside the source tree.
     if(CMAKE_LIBRARY_OUTPUT_DIRECTORY)
         set(PYTHON_MODULE_OUTPUT_DIR ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
     else()

@@ -127,15 +127,9 @@ class OfflineExecutor(Executor):
         # partitioner reads the same flag off ``EngineConfig`` to emit packed
         # rows, so the two stay consistent for the engine's lifetime.
         self._enable_packing = bool(enable_packing)
-        # Incremental (label-synchronous AR) decode support: requests begun
-        # via ``strategy.begin_offline`` park here in state RUNNING and are
-        # driven by ``strategy.advance(StepBudget)`` — at most
-        # ``decode_steps_per_tick`` batched decoder steps **and** at most
-        # ``max_tick_ms`` of wall clock per engine tick, so one tick always does
-        # bounded work *in time* (the serving dispatcher's contract; a step count
-        # alone does not bound it, since step cost is model-dependent).
-        # ``max_decode_slots`` gates new-batch admission while the pending pool
-        # is full.  All three are inert for one-shot strategies.
+        # Incremental requests remain pending across ticks. Step and time budgets
+        # bound each tick; the slot cap gates admission. One-shot strategies ignore
+        # these controls.
         self._decode_steps_per_tick = int(decode_steps_per_tick)
         self._max_decode_slots = max_decode_slots
         self._decode_kv_budget_gib = decode_kv_budget_gib
@@ -146,17 +140,11 @@ class OfflineExecutor(Executor):
         self._decode_admit_window_ms = float(decode_admit_window_ms)
         self._max_batch_size = int(max_batch_size)
         self._pending: Dict[str, Request] = {}
-        # A tick that spent its whole budget advancing does not also prefill a new
-        # micro-batch — prefill is the largest single blob in a tick (audio tower
-        # + projector + an LM forward over the whole prompt), and stacking it on
-        # top of a full decode budget defeats the point of bounding the tick.
-        # Counted so admission can never starve: after ``_MAX_SKIPPED_ADMITS``
-        # consecutive skips the next tick admits regardless.
+        # Avoid prefill after a fully spent decode budget, but force admission
+        # after a bounded number of skips to prevent starvation.
         self._skipped_admits = 0
-        # Cross-tick collate prefetch (one-shot families only) — see
-        # :meth:`_stage_next`.  The side stream is the whole mechanism: the
-        # decode's readback synchronises the *main* stream, so a collate issued
-        # there is drained by it and overlaps nothing.
+        # One-shot collate prefetch uses a side stream so main-stream decode
+        # readback cannot serialize it.
         self._prefetch = bool(collate_prefetch) and device.type == "cuda"
         self._collate_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(device=device) if self._prefetch else None

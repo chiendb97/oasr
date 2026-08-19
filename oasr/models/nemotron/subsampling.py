@@ -1,30 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Nemotron causal depthwise-separable Conv2d subsampling (8x).
+"""Causal 8x depthwise-separable subsampling for the Nemotron encoder.
 
-Three stride-2 stages over the ``(time, frequency)`` plane, all **causally**
-padded on the time axis (``left = kernel - 1``, ``right = stride - 1``) so the
-same weights serve streaming, and symmetrically-ish padded on the frequency
-axis.  The stem is a dense ``1 -> 256`` convolution; the two stages after it are
-depthwise + pointwise, which is what makes an 8x front-end cheap enough for a
-streaming model.
-
-Everything here stays in **NHWC** ``(B, T, F, C)``, the layout OASR's conv2d
-kernel wants, rather than upstream's NCHW.  Two consequences:
-
-* the flattened width handed to the projection is ordered ``(f, c)`` — the
-  natural NHWC flatten — while upstream's ``transpose(1, 2).reshape`` produces
-  ``(c, f)``.  :meth:`NemotronModel.load_weights` permutes the projection's
-  input axis once at load time, so the forward path pays nothing.  This is the
-  same trick (and the same reason) as ``Conv2dSubsampling``'s ``_version = 2``
-  migration on the Conformer side;
-* the ``(B, T, F, 1)`` stem input is just ``mel.unsqueeze(-1)``: no copy.
-
-Per-stage time masking is not optional.  The mel features are zero past each
-row's length, but a convolution with a bias turns zeros into a *nonzero*
-constant, and the ``stride - 1`` right pad means the last valid output frame of a
-short row reads one frame beyond it.  Re-zeroing after every stage is what keeps
-a mixed-length batch from feeding the encoder invented energy.
+Stages stay in NHWC; checkpoint projection weights are permuted at load time to
+match its flattened ``(frequency, channel)`` order. Invalid time positions are
+re-zeroed after every biased convolution so padding cannot become signal.
 """
 
 from __future__ import annotations

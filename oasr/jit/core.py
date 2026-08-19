@@ -169,7 +169,6 @@ class JitSpec:
         build_dir = lib_path.parent
         build_dir.mkdir(parents=True, exist_ok=True)
 
-        # Generate build.ninja
         ninja_content = generate_ninja_build_for_op(
             name=self.name,
             sources=self.sources,
@@ -181,7 +180,6 @@ class JitSpec:
         ninja_file = build_dir / "build.ninja"
         write_if_different(ninja_file, ninja_content)
 
-        # Run ninja
         verbose = logger.isEnabledFor(logging.DEBUG)
         run_ninja(workdir=build_dir, ninja_file=ninja_file, verbose=verbose)
 

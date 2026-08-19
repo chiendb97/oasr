@@ -308,27 +308,8 @@ fn run_dispatcher(
             }
         }
 
-        // ---- Admission coalescing window ----
-        //
-        // After the initial try_recv drain, if we got *some* envelopes but
-        // fewer than `admit_threshold` and the engine isn't already heavily
-        // loaded, briefly wait for sibling envelopes to land.  HTTP / gRPC
-        // handlers under an `asyncio.gather`-style burst feed the channel
-        // over ~1-3 ms, so a 3 ms window grows per-step batches from 10-20
-        // to 32-64 without a measurable p50 hit.  Skipped when:
-        //   * no envelopes arrived this tick (nothing to coalesce);
-        //   * **any** drained envelope is not an admission — see below;
-        //   * already at threshold;
-        //   * engine is at >=25% load cap (admission is no longer the
-        //     bottleneck — step the queue immediately);
-        //   * window is zero (knob disabled).
-        //
-        // The "admissions only" condition is what keeps this a throughput knob
-        // instead of a latency tax on everything else.  The window exists to
-        // batch *admissions*; it used to be entered on envelope count alone, so
-        // a lone `Cancel` or `FeedChunk` — the two most latency-sensitive
-        // commands there are — sat here for the full `--admit-window-ms` before
-        // the dispatcher even entered the GIL.
+        // Briefly wait for sibling admissions when below threshold and lightly
+        // loaded. Never coalesce other commands because their latency takes priority.
         if should_coalesce(&envs, &cfg, shared.load.load(Ordering::Relaxed)) {
             let deadline = Instant::now() + cfg.admit_window;
             while envs.len() < cfg.admit_threshold {
@@ -338,9 +319,7 @@ fn run_dispatcher(
                 };
                 match rt_handle.block_on(tokio::time::timeout(remaining, cmd_rx.recv())) {
                     Ok(Some(env)) => {
-                        // A latency-sensitive command landing mid-window ends
-                        // the wait — same reason the window is not entered with
-                        // one already in hand.
+                        // A non-admission command ends the window immediately.
                         let admit = is_admit(&env.cmd);
                         envs.push(env);
                         if !admit {
@@ -630,28 +609,9 @@ fn run_dispatcher(
             }
         }
 
-        // ---- Idle / no-work wakeup ----
-        //
-        // Two cases wait on the channel rather than looping straight back, and
-        // both are a bounded `recv` — not a sleep — so a command arriving
-        // during the wait resumes the loop in ~10 µs and costs the request
-        // nothing:
-        //
-        // 1. **Fully idle** (nothing received, nothing in the engine): wait up
-        //    to `IDLE_RECV_TIMEOUT`.  The bound exists so the heartbeat keeps
-        //    refreshing during long idle periods, otherwise `/readyz` goes
-        //    stale.
-        //
-        // 2. **Work in flight but this tick did nothing**: wait up to
-        //    `NO_WORK_BACKOFF`.  The engine having requests is not the same as
-        //    the engine having *something to do* — an open streaming session
-        //    spends most of its life waiting for the client's next chunk, and
-        //    the loop used to spin through empty steps for the whole session,
-        //    pinning a core and thrashing the GIL.  `NO_WORK_TICK_MAX` is what
-        //    keeps this off the working paths: a tick that is actually
-        //    computing costs far more than a millisecond even when it emits
-        //    nothing (an AR decode group grinding through its per-tick step
-        //    budget), so it never qualifies.
+        // Block on the channel when idle or when an in-flight tick did no work.
+        // Timeouts refresh the heartbeat and bound backoff; `NO_WORK_TICK_MAX`
+        // prevents compute-heavy ticks with no output from qualifying.
         let idle = !received_any && running == 0 && waiting == 0;
         let spinning = did_nothing(received_any, n_out, t_tick);
         if idle || spinning {
@@ -855,18 +815,8 @@ fn flush_admit_batch_locked<'py>(
 
 /// Turn per-spec rejection messages into `Error` events for the matching rids.
 ///
-/// `errors[i]` corresponds to `admit_batch[i]`; `None` means admitted.  A
-/// rejected spec's previously-pushed `Accepted` is replaced in place, found by
-/// **rid** rather than by position: `enqueue_admit_locked` can interleave
-/// `Error` events (capacity / empty-audio rejections) among the `Accepted`s, so
-/// the tail of `out_events` is not necessarily one `Accepted` per spec.
-///
-/// Note we do **not** decrement `shared.load` here: the event we write is
-/// terminal, and the tick's routing loop decrements once per terminal event.
-/// Decrementing in both places double-counted and briefly under-reported load,
-/// which reads as spare capacity to `EngineClient::load()`.
-///
-/// Empties `admit_batch`.
+/// Replace rejected specs' accepted events by request id and drain the batch.
+/// Load is decremented later by the common terminal-event routing path.
 fn rewrite_rejected_admits(
     admit_batch: &mut Vec<AdmitSpec>,
     shared: &DispatcherShared,

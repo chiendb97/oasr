@@ -36,20 +36,7 @@ inline int getDeviceSmVersion() {
     return cached[device];
 }
 
-/**
- * @brief Map a runtime SM version to the nearest compiled architecture family.
- *
- * Each GPU maps to the highest specialization that does not exceed it:
- *   SM120+       -> 120 (next-gen)
- *   SM103-SM119  -> 103 (Blackwell consumer, e.g. RTX 5090)
- *   SM100-SM102  -> 100 (Blackwell datacenter, e.g. B200)
- *   SM90-SM99    -> 90  (Hopper, e.g. H100)
- *   SM89         -> 89  (Ada Lovelace, e.g. RTX 4090)
- *   SM86-SM88    -> 86  (Ampere GA102, e.g. RTX 3090, A40)
- *   SM80-SM85    -> 80  (Ampere GA100, e.g. A100)
- *   SM75-SM79    -> 75  (Turing)
- *   SM70-SM74    -> 70  (Volta)
- */
+/** Map a runtime SM version to the highest compiled family not exceeding it. */
 inline int resolveSmVersion(int sm) {
     if (sm >= 120) return 120;
     if (sm >= 103) return 103;
@@ -65,19 +52,8 @@ inline int resolveSmVersion(int sm) {
 
 }  // namespace oasr
 
-/**
- * @brief Runtime dispatch macro -- converts runtime SM version to a compile-time constant.
- *
- * When OASR_TARGET_SM is defined (e.g. via JIT -DOASR_TARGET_SM=80), only the
- * target architecture is instantiated, reducing compilation time.
- *
- * Usage:
- *   int sm = oasr::getDeviceSmVersion();
- *   OASR_DISPATCH_SM(sm, SM_VERSION, {
- *       using MMA = oasr::gemm::SmMMATraits<SM_VERSION>;
- *       // ... use SM_VERSION ...
- *   });
- */
+/** Convert a runtime SM to a compile-time constant; JIT builds instantiate only
+ * OASR_TARGET_SM when defined. */
 #ifdef OASR_TARGET_SM
 
 #define OASR_DISPATCH_SM(sm_version, ARCH_VAR, ...)                                        \

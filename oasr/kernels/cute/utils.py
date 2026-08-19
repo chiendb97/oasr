@@ -56,11 +56,8 @@ def quad_reduce_sum(val):
 # ---------------------------------------------------------------------------
 # FastDiv (host-side magic-number generation)
 # ---------------------------------------------------------------------------
-# When a divisor is known at launch time but not at compile time (e.g.
-# ``num_heads // num_kv_heads`` for GQA), we can replace ``/`` and ``%`` with
-# a multiply-high-shift sequence. The kernel only needs ``(divisor, mul_hi,
-# shift)`` -- evaluating them on the host avoids a 70-cycle integer divide
-# inside the kernel.
+# Generate launch-time divisors on the host so kernels replace division and
+# modulo with multiply-high and shift operations.
 
 
 class FastDivmod:
@@ -105,23 +102,14 @@ class FastDivmod:
 
 
 def softcap(x: cutlass.Float32, cap: cutlass.Float32) -> cutlass.Float32:
-    """``softcap(x, c) = c * tanh(x / c)``.
-
-    Used by Gemma / softcap-trained models. Kept here because it's a
-    one-liner ``score_mod`` that the kernel can plug into ``AttentionMask``.
-    """
+    """Apply ``c * tanh(x / c)`` score capping."""
     return cap * cute.math.tanh(x / cap, fastmath=True)
 
 
 # ---------------------------------------------------------------------------
 # mn-view of an MMA accumulator
 # ---------------------------------------------------------------------------
-# The m16n8k16 accumulator layout is ((2, 2), MMA_M, MMA_N) where the inner
-# (2, 2) is (col-pair, row-pair). For per-row softmax we want an mn-view
-# ((row_pair, MMA_M), (col_pair, MMA_N)) so ``acc[r, c]`` is the (row, col)
-# entry within the tile. The shape/stride swizzle below is identical to the
-# old _make_acc_tensor_mn_view in fmha_sm80.py but lives here so other
-# kernels can reuse it.
+# Re-layout inner column/row pairs into direct row/column indexing for softmax.
 
 
 def make_acc_mn_view(acc: cute.Tensor) -> cute.Tensor:

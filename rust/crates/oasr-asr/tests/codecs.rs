@@ -125,13 +125,8 @@ fn the_decoded_length_cap_applies_to_compressed_bodies() {
     assert!(matches!(err, AudioError::TooLong(_, 4_000)), "{err:?}");
 }
 
-/// Telephony's own encodings, checked **sample-exact against ffmpeg's own
-/// decode** of the same bytes.
-///
-/// An energy check would pass with the sign inverted, and µ-law stores the
-/// complement of its codeword — precisely the mistake that inverts every
-/// waveform while every aggregate statistic stays put.  The `*_ref.wav`
-/// fixtures are `ffmpeg -f mulaw -i tone_8k.ulaw`, i.e. a third-party oracle.
+/// Sample-exact G.711 checks against reference decodes; aggregate energy would
+/// not detect an inverted sign convention.
 #[test]
 fn g711_decodes_sample_exactly_against_ffmpeg() {
     for (name, reference, enc) in [

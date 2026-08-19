@@ -163,7 +163,6 @@ __global__ void batchNorm1DKernel(const T* __restrict__ input, T* __restrict__ o
     // Each thread processes VecSize elements at a time
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements / VecSize;
          idx += blockDim.x * gridDim.x) {
-        // Calculate position
         int flat_idx = idx * VecSize;
         int c_start = flat_idx % channels;
 

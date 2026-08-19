@@ -348,7 +348,7 @@ class TestDecoderMerge:
 
 
 # ---------------------------------------------------------------------------
-# Per-request task / language (H5)
+# Per-request task and language
 # ---------------------------------------------------------------------------
 
 
@@ -743,7 +743,7 @@ if __name__ == "__main__":
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
 @pytest.mark.requires_assets("WHISPER_CKPT")
 class TestAedBeamSearch:
-    """Beam search over the incremental AR protocol (P4).
+    """Beam search over the incremental AR protocol.
 
     The decoder surface needs no beam-specific method: ``select`` is an
     ``index_select``, which permits repeated indices, so one call both expands

@@ -282,7 +282,6 @@ class Mfcc(Fbank):
 
     def __init__(self, config: FeatureConfig) -> None:
         super().__init__(config)
-        # Build DCT + lifter on top of FBANK buffers.
         dct_mat = _build_dct_matrix(config.num_ceps, config.num_mel_bins)
         lifter = _build_lifter(config.num_ceps, float(config.cepstral_lifter))
         self.register_buffer("dct_mat", dct_mat, persistent=False)

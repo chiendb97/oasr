@@ -2,15 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Transport and request metrics for the gRPC surface.
 //!
-//! Recorded **inside the handlers**, not by a tower layer, for one reason that
-//! is specific to gRPC: a server-streaming RPC's status arrives in the HTTP/2
-//! *trailers*, long after the response head. A generic middleware sees
-//! `streaming_recognize` return `Ok` the moment the stream is handed back —
-//! typically a few hundred microseconds in, before a single byte of audio has
-//! been transcribed — so it would report a millisecond-scale p99 for an RPC
-//! that ran for a minute, and would label every failed stream `OK`. The only
-//! place that knows when the RPC really ended, and how, is the task draining
-//! it.
+//! Streaming status arrives in HTTP/2 trailers, so handlers record duration and
+//! outcome when stream draining actually ends.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -21,11 +14,7 @@ use tonic::{Code, Status};
 
 /// gRPC method names, as they appear on the wire.
 ///
-/// Literals rather than something built from [`crate::SPEECH_SERVICE_NAME`],
-/// because `concat!` only takes literals — so
-/// `method_paths_match_the_service_name` checks the relationship instead. A
-/// proto package rename would otherwise leave these labelling a method path
-/// that no longer exists, and nothing would fail.
+/// Literals required by `concat!`; a test keeps them aligned with the service name.
 pub mod method {
     pub const RECOGNIZE: &str = "/oasr.speech.v1.Speech/Recognize";
     pub const STREAMING_RECOGNIZE: &str = "/oasr.speech.v1.Speech/StreamingRecognize";
@@ -61,11 +50,8 @@ pub fn record_rpc(method: &'static str, code: Code, elapsed: Duration) {
 
 /// Map a gRPC status to the request-scope `outcome`.
 ///
-/// `CANCELLED` and `DEADLINE_EXCEEDED` are the two a client causes — a hang-up
-/// and a timeout — and folding them into `error` would put every disconnected
-/// stream in the error-rate panel. `UNAVAILABLE` is deliberately *not* in that
-/// set: it is what a draining or overloaded server returns, which is the
-/// server's problem to see.
+/// Client cancellation and deadline expiry are cancellations; server
+/// unavailability remains an error.
 pub fn outcome_for(code: Code) -> om::Outcome {
     match code {
         Code::Ok => om::Outcome::Ok,

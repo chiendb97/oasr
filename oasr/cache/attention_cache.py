@@ -414,11 +414,7 @@ class AttentionCacheManager:
             state = self._streams[sid]
             state.num_committed_frames += chunk_frames
             slots.append(state.slot_id)
-        # Staged through pinned memory (:func:`oasr.utils.staging.to_device`):
-        # this is the first host->device copy after the encoder forward is
-        # issued, so a pageable one waits out the whole forward and the host can
-        # never run a step ahead of the device.  Measured at 1.7 ms per call on
-        # a 32-stream pool — 26% of streaming wall time across all such sites.
+        # Pinned staging avoids synchronizing the preceding encoder forward.
         slots_t = to_device(slots, dtype=torch.long, device=self._block_table.device)
         # In-place batched advance — one kernel for all B updates.
         self._cache_seqlens[slots_t] += chunk_frames
@@ -429,33 +425,10 @@ class AttentionCacheManager:
     # ------------------------------------------------------------------
 
     def evict_oldest_batched(self, stream_ids: List[int], headroom: int = 0) -> None:
-        """Evict over-cap blocks for a whole group in a constant number of kernels.
+        """Evict over-cap blocks for a group with batched device updates.
 
-        ``headroom`` reserves that many logical slots below the cap — the
-        allocation path passes 1 so a stream at its cap gives a block back
-        *before* asking for the next one (see :meth:`prepare_chunks_batched`).
-
-        The per-stream version below ran a GPU ``.clone()`` of the block-table
-        row plus three scalar GPU writes **per stream per chunk**, so a finite
-        ``num_left_chunks`` cost ~4B tiny launches every streaming step — which
-        is why nobody enabled it.  Measured on a 16-stream pool: 10.7% at
-        ``num_left_chunks=8``, 15.4% at 4.
-
-        Here the *decision* is pure host-side bookkeeping (no sync — the block
-        lists are Python), and the device work collapses to a fixed handful of
-        batched ops per eviction round: one gather-scatter for the row shift, one
-        scatter to blank the vacated column, one scatter for ``cache_seqlens``.
-        Steady state needs exactly one round, since the cap is re-checked after
-        every committed chunk.
-
-        Deliberately **not** the ring block table the review proposed.  A ring
-        (per-stream ``first_logical`` with the kernel indexing
-        ``block_table[(first + i) % width]``) would remove the shift entirely,
-        but it is a *kernel* change to the paged CuteDSL FMHA — a path that
-        currently has two known defects (the masked-tile NaN and the head_dim-32
-        stale read).  Batching removes the launch count, which is what the cost
-        actually was, at no kernel risk.  The ring stays worthwhile only if the
-        remaining shift ever shows up in a profile.
+        ``headroom`` reserves slots below the cap so allocation can evict before
+        requesting another block. Decisions use host metadata and do not sync.
         """
         max_blocks = self._config.max_logical_blocks
         if max_blocks is None or not stream_ids:

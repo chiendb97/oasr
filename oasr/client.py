@@ -1,32 +1,9 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""A first-class client for a running ``oasr-server``.
+"""Sync and async clients for the server's HTTP and realtime APIs.
 
-Before this module the only "clients" in the tree were two example scripts and
-a benchmark harness, so the first thing anyone evaluating OASR had to do was
-write one.  The API here is deliberately the shape people already know — the
-same call names and arguments as OpenAI's audio client — over OASR's
-OpenAI-compatible endpoints:
-
-.. code-block:: python
-
-    from oasr.client import OASRClient
-
-    client = OASRClient("http://127.0.0.1:8080")
-    print(client.transcribe("meeting.mp3").text)
-    print(client.translate("entretien.m4a", language="fr").text)
-
-and, for live audio, an async iterator over the ``/v1/realtime`` WebSocket:
-
-.. code-block:: python
-
-    async with AsyncOASRClient("http://127.0.0.1:8080") as client:
-        async for event in client.stream(mic_chunks(), sample_rate=16000):
-            print(event.text, end="\\r" if not event.is_final else "\\n")
-
-``httpx`` (and ``websockets`` for streaming) are needed at call time and come
-from the ``serving`` extra: ``pip install "oasr[serving]"``.  They are imported
-lazily so ``import oasr.client`` costs nothing on a machine that only serves.
+Transport dependencies are imported lazily and provided by the ``serving``
+extra.
 """
 
 from __future__ import annotations

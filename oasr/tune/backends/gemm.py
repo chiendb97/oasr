@@ -225,18 +225,8 @@ for _cfg in _all_autotune_configs.values():
     )
 
 
-# ---------------------------------------------------------------------------
-# Fused GEMM + log_softmax registration (the CTC head)
-# ---------------------------------------------------------------------------
-#
-# Three backend flavours compete per shape:
-#   * ``Tactic("cutlass", config=...)`` — the corresponding GEMM variant
-#     composed with the OASR online log_softmax kernel in-place on the output
-#     (identical numerics to the fused launcher, shape-selectable tile);
-#   * ``Tactic("cutlass_fused")``       — the legacy single-call launcher
-#     (fixed 16x128 tile); registered as the fallback so untuned behaviour
-#     matches the historical path;
-#   * ``Tactic("torch")``               — registered in ``torch_gemm.py``.
+# CTC-head tactics: configurable GEMM plus in-place log-softmax, the fixed-tile
+# fused fallback, and the library implementation registered elsewhere.
 
 
 @functools.cache

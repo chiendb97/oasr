@@ -212,16 +212,8 @@ impl EngineClient {
 
     /// Submit an offline request and keep the **whole** event stream.
     ///
-    /// [`Self::submit_offline`] registers a small channel and spawns a drain task
-    /// that throws away every non-terminal event, so the per-tick
-    /// `Event::Partial`s the autoregressive strategies produce could never reach a
-    /// client — token streaming was built end-to-end and then discarded one layer
-    /// from the wire. This variant hands the stream to the caller instead.
-    ///
-    /// Audio still arrives in one shot: an offline-only decode family (`aed`,
-    /// `llm`, `paraformer`, `ctc_aed_rescoring`) cannot consume a growing buffer.
-    /// What is decoupled here is *chunked audio in* from *incremental text out* —
-    /// only the latter is what a speech-LLM client actually wants.
+    /// Unlike [`Self::submit_offline`], returns non-terminal events to the caller.
+    /// Audio still arrives in one shot; only decoded text is incremental.
     pub async fn submit_offline_streaming(
         &self,
         audio: Bytes,

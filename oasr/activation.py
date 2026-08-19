@@ -98,8 +98,8 @@ def gelu(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tenso
 def _prepare_elementwise(
     input: torch.Tensor, out: Optional[torch.Tensor]
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # A channel slice such as Zipformer's ``x.chunk(3, -1)[0]`` has contiguous
-    # rows separated by a regular padded stride. The CUDA kernel consumes that
+    # Channel slices can have contiguous rows separated by a regular padded
+    # stride. The CUDA kernel consumes that
     # layout directly; only arbitrary transposes/expands need materialization.
     regular_rows = input.dim() == 0 or (
         input.stride(-1) == 1

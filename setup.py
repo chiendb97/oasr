@@ -138,11 +138,9 @@ class CMakeBuild(build_ext):
     """Build extension using CMake."""
 
     def build_extension(self, ext: CMakeExtension) -> None:
-        # Ensure output directory exists
         ext_dir = Path(self.get_ext_fullpath(ext.name)).parent.absolute()
         ext_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build directory
         build_dir = Path(self.build_temp).absolute()
         build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -153,12 +151,10 @@ class CMakeBuild(build_ext):
             "-DBUILD_PYTHON=ON",
         ]
 
-        # Torch cmake prefix (for find_package(Torch))
         torch_prefix = _find_torch_cmake_prefix()
         if torch_prefix:
             cmake_args.append(f"-DCMAKE_PREFIX_PATH={torch_prefix}")
 
-        # Build type
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         cmake_args.append(f"-DCMAKE_BUILD_TYPE={build_type}")
 
@@ -188,22 +184,18 @@ class CMakeBuild(build_ext):
         else:
             cmake_args.append("-DOASR_USE_K2=OFF")
 
-        # Build arguments
         build_args = ["--config", build_type]
 
-        # Parallel build
         if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
             cpu_count = os.cpu_count() or 1
             build_args.extend(["-j", str(cpu_count)])
 
-        # Run CMake configure
         print(f"CMake configure: {' '.join(cmake_args)}")
         subprocess.check_call(
             ["cmake", ext.sourcedir] + cmake_args,
             cwd=build_dir
         )
 
-        # Run CMake build (extension is built directly into ext_dir)
         print(f"CMake build: {' '.join(build_args)}")
         subprocess.check_call(
             ["cmake", "--build", "."] + build_args,

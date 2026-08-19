@@ -156,9 +156,6 @@ def main():
         )
         sys.exit(1)
 
-    # ------------------------------------------------------------------
-    # Load inputs
-    # ------------------------------------------------------------------
     print(f"Loading BPE model from {bpe_model_path}", file=sys.stderr)
     sp = spm.SentencePieceProcessor()
     sp.Load(str(bpe_model_path))
@@ -176,18 +173,13 @@ def main():
     words = [w for w in word_sym_table.symbols if w not in excluded]
     print(f"  {len(words)} words to segment", file=sys.stderr)
 
-    # ------------------------------------------------------------------
-    # Build lexicon
-    # ------------------------------------------------------------------
     print("Segmenting words with BPE model ...", file=sys.stderr)
     lexicon = build_bpe_lexicon(sp, words, token_sym_table)
 
     print("Adding disambiguation symbols ...", file=sys.stderr)
     lexicon_disambig, max_disambig = add_disambig_symbols(lexicon)
 
-    # ------------------------------------------------------------------
-    # Extend token symbol table with disambiguation symbols (#0, #1, ...)
-    # ------------------------------------------------------------------
+    # Disambiguation symbols occupy new IDs; existing checkpoint IDs must stay stable.
     token_sym_table_extended = dict(token_sym_table)
     next_token_id = max(token_sym_table_extended.values()) + 1
     for i in range(max_disambig + 1):
@@ -196,16 +188,12 @@ def main():
             token_sym_table_extended[sym] = next_token_id
             next_token_id += 1
 
-    # Ensure required special symbols exist in word table.
     for w in ("#0", "<s>", "</s>"):
         if w not in word_sym_table:
             word_sym_table.add(w)
 
     word2id = {w: word_sym_table[w] for w in word_sym_table.symbols}
 
-    # ------------------------------------------------------------------
-    # Write outputs
-    # ------------------------------------------------------------------
     tokens_out = lang_dir / "tokens.txt"
     lexicon_out = lang_dir / "lexicon.txt"
     lexicon_disambig_out = lang_dir / "lexicon_disambig.txt"

@@ -151,18 +151,8 @@ class CacheConfig:
         if self.num_left_chunks < 0:
             if not self.recycle_streaming_history:
                 return None
-            # "Recycle at the ceiling": unlimited history is only unlimited until
-            # the stream hits the capacity the block table and pool already
-            # impose, at which point the engine has to either stop the stream or
-            # start dropping history.  This makes it drop history — the same
-            # boundary, a better outcome.
-            #
-            # Measured on the WeNet conformer, 4 streams, vs unlimited:
-            #   30 s audio (inside the retained window): 0/4 transcripts differ,
-            #                                            0.00% WER — identical.
-            #   60 s audio (past it): unlimited finalises early with
-            #                         finish_reason="length"; recycling decodes
-            #                         the whole file with bounded memory.
+            # Unlimited history still has a physical ceiling.  Recycling drops
+            # the oldest block there instead of terminating the stream.
             return self.blocks_per_stream
         total_frames = self.chunk_size * self.num_left_chunks
         return (total_frames + self.block_size_frames - 1) // self.block_size_frames
@@ -238,21 +228,8 @@ class CacheConfig:
                 "cache this config asks for."
             )
         if self.num_left_chunks >= 0:
-            # The pool-sizing invariant, documented in three places and until
-            # now checked in none.  With eviction enabled `at_capacity()`
-            # unconditionally returns False — the oldest block is recycled, so
-            # a stream is never "full" — which means there is no proactive
-            # capacity gate at all and safety rests entirely on the pool being
-            # big enough for every concurrent stream to hold its retained
-            # history.  Violate it and `BlockPool.allocate()` raises
-            # "BlockPool exhausted" from *inside the forward*, where it takes
-            # out the whole tick rather than one stream.  Checking here turns
-            # a runtime crash under load into a startup error with the
-            # arithmetic attached.
-            #
-            # Unlimited history (`num_left_chunks < 0`) needs no check: there
-            # `blocks_per_stream` is derived from `max_num_blocks //
-            # max_batch_size`, so the invariant holds by construction.
+            # Eviction disables the per-stream capacity gate, so the pool must
+            # hold every concurrent stream's retained history.
             needed = self.max_batch_size * self.blocks_per_stream
             if self.max_num_blocks < needed:
                 raise ValueError(

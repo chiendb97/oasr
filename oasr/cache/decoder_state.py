@@ -1,70 +1,14 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Per-row self-attention KV for the incremental (AED / speech-LLM) decoders.
+"""Per-row self-attention KV for incremental decoders.
 
-Both AR decoder surfaces used to track the generation offset as a **shared
-scalar** — ``WhisperDecoder`` kept an ``int`` ``pos`` used for the position
-embedding *and* the KV write offset, ``Qwen2Lm`` wrote new KV at ``len`` into a
-shared-capacity buffer.  That scalar is why two decode groups could never be
-merged after the fact: rows sitting at different offsets cannot share a forward,
-so a trickle of arrivals became N narrow groups whose step counts *add* (an AR
-step is weight-read bound, so N groups cost ~N times one group of the same total
-rows — measured 1.75x on Qwen2-Audio-7B).
+``lens`` gives each row's next write index; ``starts`` marks left padding, so
+valid keys are ``[starts, lens)``. Dense caches support fixed-capacity writes or
+exact-size growth. Paged caches make group merges data-free but reject repeated
+row selection because it would alias writable pages.
 
-This module is the scalar made per-row.  One KV object holds every layer's K/V
-for one decode group plus three row-indexed vectors:
-
-``lens``
-    Keys cached per row — and therefore the row's next **write index**.
-``starts``
-    First valid key per row, i.e. left padding.  The speech-LLM prompt is
-    variable length and left-padded (HF's masked-generate convention), so its
-    valid window is ``[starts, lens)``; an AED prompt is a fixed SOT sequence and
-    leaves this ``None``.
-``positions``
-    Rotary / absolute position ids, which are *derived* (``lens - starts``)
-    rather than stored: a fourth vector that must agree with the other two is a
-    fourth vector that can disagree with them.
-
-Together they are exactly the ``kv_lens`` / ``kv_starts`` window pair
-:class:`oasr.layers.Attention` already takes as two length vectors — so per-row
-offsets cost no materialized mask and reach the fused kernel on the same terms
-the uniform case did.
-
-Storage modes
--------------
-:class:`DecoderKv`, ``cap`` given (the strategies pass prompt + generation cap)
-    One ``(B, H_kv, cap, D)`` buffer per layer, allocated once; a step writes its
-    own slot in place.  Rows at different offsets scatter; the uniform case —
-    every group that has never been merged — keeps the single-slice write it had
-    before.  Overflow **grows** the buffer rather than degrading, because a
-    merged group has no uniform length to degrade to.
-:class:`DecoderKv`, ``cap is None``
-    Exact-size ``torch.cat`` growth, for direct ``prefill``/``step`` callers and
-    the teacher-forced alignment pass.  Legacy mode cannot express per-row
-    offsets (``cat`` appends one width to every row) and therefore cannot merge;
-    :meth:`~DecoderKv.can_merge` says so rather than producing a silently wrong
-    cache.
-:class:`PagedDecoderKv`
-    Pages out of a shared :class:`~oasr.cache.block_pool.BlockPool` via
-    :class:`~oasr.cache.decoder_kv.DecoderKVCacheManager`, addressed by a per-row
-    block table.  A row holds only the pages it has *filled*, the pool is
-    allocated once for the process rather than per prefill, merging becomes free
-    (the block tables concatenate and no K/V moves), and the addresses are stable
-    enough to capture a step into a CUDA graph.  It is **not** the default: the
-    block-table indirection measures 3% slower on Qwen2-Audio-7B and 9% on
-    whisper-tiny, and it saves no VRAM while admission reserves each row's
-    ceiling — see ``.artifacts/engine_perf.md`` §3.2b.  A row's pages are also its
-    own, so the repeated-index ``select`` that expands and reorders a beam grid
-    would alias two slots onto one page; :meth:`~PagedDecoderKv.select` refuses
-    rather than corrupting, and the strategy keeps beam search on dense storage.
-
-The untouched tail of a capacity buffer (and of a recycled page) is zeroed, never
-``empty``: the buffer is handed to the attention kernel *whole* (buffer + length,
-which is what skips a per-layer copy of a stride-gapped slice), so the kernel may
-read the in-bounds tail of its final partial K block.  Uninitialized memory there
-can hold a NaN bit pattern, and a NaN in ``v`` survives any mask through
-``P @ V``.
+Unused capacity is zeroed because attention reads the final in-bounds tile past
+the logical length; uninitialized values there could propagate NaNs.
 """
 
 from __future__ import annotations

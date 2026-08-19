@@ -383,24 +383,9 @@ class StreamingExecutor(Executor):
         if not running:
             return outputs
 
-        # Finalise streams whose audio is exhausted and whose feature
-        #    buffer has been fully consumed.  A stream can reach this
-        #    state in the same step it ran its last encoder chunk, so we
-        #    check *after* the forward pass.  Under lookahead the chunk a
-        #    stream's last audio produced is forwarded by the *next* step,
-        #    and ``has_ready_encoder_chunk`` is exactly what holds the
-        #    stream open for it.  Only streams the client
-        #    has explicitly closed (``audio_final``) are eligible — a
-        #    freshly admitted streaming request that hasn't yet received
-        #    audio is otherwise indistinguishable from a drained one and
-        #    would be finalised with an empty transcript on the very
-        #    first step.
-        #
-        #    A stream whose encoder cache is exhausted (``cache_exhausted``,
-        #    set by the streaming backend's capacity gate) is finalised too,
-        #    regardless of whether the client closed it: it can make no
-        #    further progress, so returning the transcript decoded so far with
-        #    ``finish_reason="length"`` beats holding its slot forever.
+        # Finalize closed streams after their ready features are consumed.
+        # Cache-exhausted streams cannot progress, so return their partial
+        # transcript with ``finish_reason="length"`` instead of holding a slot.
         nvtx_push("finalize_streams")
         t0 = time.perf_counter()
         for req in list(running):

@@ -99,15 +99,7 @@ struct CutlassGemmConfig {
 // SM90 / SM120 schedule adapter — Quack-style pingpong / cooperative
 //==============================================================================
 
-/// Select SM90/SM120 epilogue and mainloop schedules based on kPingpong.
-///
-/// kPingpong=false → Cooperative warp-specialised WGMMA
-///   - Mainloop: KernelTmaWarpSpecializedCooperative
-///   - Epilogue: TmaWarpSpecializedCooperative
-///
-/// kPingpong=true → Pingpong warp-specialised WGMMA
-///   - Mainloop: KernelTmaWarpSpecializedPingpong
-///   - Epilogue: TmaWarpSpecialized  (pingpong uses the base TMA epilogue)
+/// Select cooperative or ping-pong mainloop and epilogue schedules.
 template <bool kPingpong>
 struct Sm90ScheduleAdapter {
     // kPingpong=false: cooperative schedule
@@ -145,12 +137,7 @@ struct SMTypeAdapter<2> {
     using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmSm100;
 };
 
-//==============================================================================
-// GemmScheduleSelector — routes to the correct adapter per SM architecture
-//
-//   SM90  / SM120 → Sm90ScheduleAdapter<kPingpong>
-//   SM100         → SMTypeAdapter<kSMs>
-//==============================================================================
+// Select the schedule adapter for the compiled SM family.
 
 template <int kSmVersion, int kSMs, bool kPingpong>
 struct GemmScheduleSelector {

@@ -108,7 +108,6 @@ class YaRNScalingRotaryEmbedding(RotaryEmbeddingBase):
                 / self.rotary_dim
             )
         )
-        # Apply YaRN interpolation scaling (ramp on same device as inv_freq)
         ramp = self.yarn_ramp.to(inv_freq.device)
         inv_freq = inv_freq / (self.scaling_factor**ramp)
         return inv_freq

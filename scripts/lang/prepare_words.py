@@ -1,34 +1,10 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""
-Build a word symbol table (``words.txt``) from plain-text training data.
+"""Build ``words.txt`` from tokenized training text.
 
-Reads one or more text files (one sentence per line, space-separated words,
-no utterance IDs) and writes ``words.txt`` to ``--lang-dir``.
-
-The output format is ``word id`` per line.  The layout is:
-
-  <eps>   0           epsilon / no-symbol  (leading)
-  <UNK>   1           unknown word         (leading)
-  word1   2           real words, sorted alphabetically
-  ...
-  wordN   N+1
-  #0      N+2         disambiguation symbol — MUST be after real words so that
-  <s>     N+3         compile_hlg.py can use its ID as the first-disambig boundary
-  </s>    N+4         sentence end
-
-Usage::
-
-    python scripts/prepare_words.py \\
-        --text train-clean-100/text train-clean-360/text train-other-500/text \\
-        --lang-dir data/lang_bpe
-
-    # Discard rare words (appear fewer than N times)
-    python scripts/prepare_words.py \\
-        --text corpus/text \\
-        --lang-dir data/lang_bpe \\
-        --min-count 2
+Real words are sorted between the leading special symbols and trailing
+disambiguation and sentence-boundary symbols.
 """
 
 import argparse

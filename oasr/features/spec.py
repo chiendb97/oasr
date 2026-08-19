@@ -54,17 +54,9 @@ class FeatureSpec:
     # straight through (1.0). A wrong value is not noisy -- it offsets every
     # log-mel bin by a constant and costs the transcript's leading token.
     audio_scale: float = 32768.0
-    # Analysis window for a *fixed-window* frontend (``whisper_logmel``), in
-    # seconds; ``None`` keeps the frontend's own default (Whisper's 30 s).
-    # Without this a converter cannot pin a non-30 s window, and the engine's
-    # admission duration check and batching cost model both read the window.
+    # Fixed frontend window; admission and batching use the same declared value.
     window_seconds: Optional[float] = None
-    # Pre-emphasis coefficient applied to the waveform before framing, for the
-    # frontends that do it in the *frontend* rather than per Kaldi frame
-    # (``nemotron_logmel``); ``None`` keeps the frontend default.  Expressible
-    # here for the same reason ``audio_scale`` is: NeMo configs carry it per
-    # checkpoint (0.0 disables the filter), and a value that silently defaulted
-    # would shift every mel bin — the ``audio_scale`` failure mode.
+    # Optional signal-domain pre-emphasis; ``None`` keeps the frontend default.
     preemphasis: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:

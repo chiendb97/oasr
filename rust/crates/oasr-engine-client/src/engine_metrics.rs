@@ -95,10 +95,7 @@ impl EngineLabels {
 
 /// Reduce a checkpoint path to something usable as a label value.
 ///
-/// A full filesystem path as a label is long, leaks the deployment's directory
-/// layout into a metrics endpoint, and changes when the mount does — three
-/// reasons a dashboard built on it breaks. The last path component is the name
-/// people actually use for the model.
+/// Use the last path component to avoid leaking unstable deployment paths.
 fn short_model_name(ckpt_dir: &str) -> String {
     ckpt_dir
         .trim_end_matches('/')
@@ -110,11 +107,7 @@ fn short_model_name(ckpt_dir: &str) -> String {
 
 /// Metric handles resolved once per engine, recorded on **every tick**.
 ///
-/// Deliberately only the per-tick series.  `oasr_requests_{admitted,rejected,
-/// busy,cancelled}_total` fire once per *request*, from free functions that see
-/// only `&DispatcherShared`, and at request rate the macro's hash lookup is
-/// invisible — hoisting them would buy nothing and cost the plumbing to reach
-/// them.  The line between the two is tick rate, not tidiness.
+/// Only hot per-tick series are pre-resolved; request-rate counters remain direct.
 pub(crate) struct TickHandles {
     pub tick: Histogram,
     pub admit: Histogram,

@@ -573,7 +573,6 @@ def run_standalone(variant: str = "layer_norm") -> None:
     # Collect profile configs for relevant subroutines
     pcfg = {k: PROFILE_CONFIGS[k] for k in subs if k in PROFILE_CONFIGS}
 
-    # Build setup_funcs for profiling
     setup_funcs = {}
     for sub in subs:
         if sub in PROFILE_CONFIGS:

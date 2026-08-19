@@ -3,10 +3,8 @@
 //
 // Persistent, stream-keyed workspace cache for CUTLASS kernel workspaces.
 //
-// Motivation (measured on RTX 5090 / SM120, locked clocks): the per-call
-// ``cudaMallocAsync`` + ``cudaMemsetAsync`` + ``cudaFreeAsync`` ritual around
-// split-K / Stream-K workspaces costs ~4 µs — which is the entire
-// CUTLASS-vs-cuBLAS gap on the thin (small-M, N=256, deep-K) ASR GEMMs.
+// Per-call allocation, zeroing and release can dominate thin GEMMs, so reusable
+// workspaces preserve the intended benefit of split-K and Stream-K kernels.
 //
 // Two pools with different contracts:
 //

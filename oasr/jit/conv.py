@@ -166,14 +166,7 @@ def _get_sm89_conv2d_configs(sm: int) -> Dict[str, CutlassConv2dConfig]:
     return _build_sm_lt90_conv2d_configs(sm, TileShapeConfigs, [3], _SM_MAX_SMEM_BYTES[89])
 
 
-# =============================================================================
-# Quack-style SM90 / SM100 / SM120 Conv2D config generation
-#
-# Tile sets and cluster shapes mirror GEMM exactly.  tile_k=128 matches GEMM's
-# WGMMA width.  Schedule selection uses GemmScheduleSelector via
-# CutlassConv2dConfigSm90 (cooperative / pingpong for SM90/SM120; 1SM / 2SM
-# for SM100), identical to CutlassGemmConfigSm90.
-# =============================================================================
+# SM90+ Conv2D tile and cluster choices mirror the corresponding GEMM schedules.
 
 
 def _get_sm90_conv2d_configs(sm: int) -> Dict[str, CutlassConv2dConfigSm90]:
@@ -353,20 +346,19 @@ def _sm120_conv1d_config(
     )
 
 
-# Exact production shapes measured on RTX 5090.  Keeping batch and sequence
-# length in the key is intentional: implicit-GEMM's M dimension is
-# ``batch * out_len``, and the best block_m changes substantially with it.
+# Exact SM120 production shapes. Batch and sequence remain in the key because
+# implicit-GEMM's M dimension changes the best block height.
 _CONV1D_HEURISTIC_RULES_SM120: Dict[
     str, Dict[Tuple[int, ...], Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]]
 ] = {
     "torch.float16": {
-        # Whisper front-end.
+        # Fixed-window frontend, width 384.
         (1, 3000, 80, 384, 3, 1, 1, 1): _sm120_conv1d_config(64, 128, 32, 64),
         (1, 3000, 384, 384, 3, 1, 2, 1): _sm120_conv1d_config(32, 128, 32, 32),
-        # Qwen2-Audio front-end.
+        # Fixed-window frontend, width 1280.
         (1, 3000, 128, 1280, 3, 1, 1, 1): _sm120_conv1d_config(64, 128, 32, 64),
         (1, 3000, 1280, 1280, 3, 1, 2, 1): _sm120_conv1d_config(128, 32, 32, 32),
-        # Paraformer CIF predictor after its explicit one-frame padding.
+        # Padded predictor convolution.
         (1, 502, 512, 512, 3, 0, 1, 1): _sm120_conv1d_config(16, 128, 16, 32),
     },
     "torch.bfloat16": {
@@ -381,7 +373,7 @@ _CONV1D_HEURISTIC_RULES_SM120: Dict[
 _CONV1D_ACTIVATION_HEURISTIC_RULES_SM120: Dict[
     str, Dict[Tuple[int, ...], Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]]
 ] = {
-    # Paraformer CIF predictor: the post-convolution ReLU is fused here.
+    # Predictor convolution with fused ReLU.
     "torch.float16": {
         (1, 502, 512, 512, 3, 0, 1, 1): _sm120_conv1d_config(16, 128, 16, 32),
     },

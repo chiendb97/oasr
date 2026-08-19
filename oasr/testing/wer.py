@@ -1,38 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Word- and character-error-rate measurement.
+"""Corpus-level word and character error rates.
 
-The repo has thorough *numerical parity* testing and, until this module, no
-end-to-end accuracy measurement at all.  Parity oracles structurally cannot
-catch a frontend-convention bug: they feed identical features to both sides, so
-an error in how audio becomes features cancels on both.  The ``audio_scale``
-defect is the sharpest example — it shipped, survived a full tensor-parity
-suite, and was caught only when somebody eyeballed a transcript against ground
-truth.  An empty transcript is 100% WER and a dropped leading token is a
-visible delta; both are trivial for this module and invisible to parity.
-
-Two properties are worth stating because getting either wrong quietly changes
-the number:
-
-**Corpus WER, not the mean of per-utterance WERs.**  The definition is
-``total_edits / total_reference_words`` over the whole set.  Averaging
-per-utterance rates weights a three-word utterance the same as a thirty-word
-one and is not comparable to any published figure.  :func:`compute` returns the
-corpus rate; per-utterance rates come along for debugging, not for averaging.
-
-**Normalization is explicit and never silently degrades.**  ``english`` is
-Whisper's ``EnglishTextNormalizer`` (numbers, contractions, British/American
-spelling), which is what published WER tables use.  It lives in
-``transformers``; if that is not installed, asking for it *raises* rather than
-falling back to something weaker, because a silent fallback would move every
-number in `ci/wer-reference.json` without failing anything.
-
-    from oasr.testing.wer import compute, normalizer
-
-    r = compute(refs, hyps, normalizer=normalizer("english"))
-    print(r.rate, r.substitutions, r.deletions, r.insertions)
-    for line in r.worst(5):
-        print(line)
+Rates use total edits over total reference units, not averaged utterance rates.
+Normalization is explicit and unavailable requested normalizers raise rather
+than silently changing the metric.
 """
 
 from __future__ import annotations

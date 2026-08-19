@@ -1,37 +1,9 @@
 name: test-gpu
 
-# The suite that actually exercises the kernels, on the self-hosted box with a
-# GPU and the checkpoints.  Nightly plus manual, not per-push: a full run is
-# ~5 minutes of GPU and the runner is a single machine.
-#
-# `test-gpu-modal.yml` is the same suite on rented Blackwell.  Use this one for
-# the nightly sweep — it is the SM this project ships on and the checkpoints are
-# already on disk — and Modal when the box is busy benchmarking, wedged, or when
-# you want a second SM.
-#
-# The point of both is `--strict-assets`.  `pytest tests/` reports a fully green
-# suite while silently skipping every real-checkpoint test, so a green nightly
-# proves nothing unless a missing checkpoint is a failure.  Any asset this
-# runner genuinely cannot have is named below with `--allow-missing-asset`, so
-# the gap lives in this file where it can be read, rather than inside a skip
-# nobody reads.
-#
-# ---------------------------------------------------------------------------
-# Registering the runner (once, on the GPU box)
-# ---------------------------------------------------------------------------
-#   Settings -> Actions -> Runners -> New self-hosted runner, then on the box:
-#     ./config.sh --url https://github.com/<owner>/oasr --token <TOKEN> \
-#                 --labels oasr-gpu --name oasr-5090 --unattended
-#     sudo ./svc.sh install && sudo ./svc.sh start
-#
-#   The runner's environment must already have: an NVIDIA driver + CUDA toolkit
-#   (the kernels JIT through nvcc), a `pip install -e .` of this repo, and the
-#   checkpoints reachable by the env vars declared in tests/assets.py — either
-#   exported one by one in the service environment, or all at once by pointing
-#   `OASR_ASSET_ROOT` at a tree laid out with the per-asset `relpath` names.
-#
-#   NOTE: this repo is public.  Do NOT add a `pull_request` trigger here: a fork
-#   PR would execute arbitrary code on your machine.  Run PR checks on Modal.
+# Nightly self-hosted suite with strict checkpoint coverage.
+# The runner needs the CUDA toolchain, an editable install, and assets declared
+# in tests/assets.py. Missing assets must be explicitly allow-listed below.
+# SECURITY: never add a pull_request trigger; fork code must not reach this host.
 
 on:
   schedule:
@@ -52,9 +24,7 @@ permissions:
   contents: read
 
 env:
-  # A checkpoint's absence is a failure, not a skip.  The exceptions are upstream
-  # *source trees* and a k2 lang dir rather than model weights, and are only
-  # needed by parity oracles: install them on the runner to drop these lines.
+  # Only non-checkpoint parity assets are allowed to be absent.
   STRICT: >-
     --strict-assets
     --allow-missing-asset WENET_REF_DIR

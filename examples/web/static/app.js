@@ -1,38 +1,21 @@
 // Copyright 2024 OASR Authors / SPDX-License-Identifier: Apache-2.0
 //
-// Browser side of the OASR web demo.  Speaks OASR's own HTTP API, never a
-// demo-only protocol — nothing here needs translating:
-//   - offline : POST {server}/v1/audio/transcriptions  (multipart upload)
-//   - stream  : WS   {server}/v1/realtime              (session + PCM frames)
-//
-// Uploads are sent as the original file, whatever container it is: the server
-// decodes MP3 / M4A / FLAC / OGG / WAV itself.  Only the streaming path decodes
-// in-browser, because a live session is chunked PCM by definition.
-//
-// Two ways to run it, and the default is the quiet one:
-//   examples/web/server.py  — serves this page and relays /v1/* to oasr-server,
-//                             so every call is same-origin and CORS never enters
-//                             into it.  Nothing to configure here.
-//   ?server=http://host:port — talk to oasr-server directly, which is then
-//                             cross-origin and needs --cors-allow-origin.
+// Browser demo using multipart transcription and the realtime socket. Uploads
+// preserve their container; realtime audio is PCM. The relay is same-origin by
+// default, while `?server=` connects directly and requires CORS.
 "use strict";
 
 const TARGET_SR = 16000;
 const CHUNK_MS = 320;
 
-// Empty means "this origin", i.e. whatever served the page — the relay case.
-// `file://` is the exception: it has no usable origin, so a page opened by
-// double-clicking keeps the absolute default instead of deriving `wss://null`.
+// Empty uses this origin; file URLs retain the absolute fallback.
 const SERVER = (new URLSearchParams(location.search).get("server") ||
                 (location.protocol === "file:" ? "http://127.0.0.1:8080" : "")).replace(/\/$/, "");
 
-// Base for the realtime socket.  Derived from SERVER when it is set, from the
-// page's own origin otherwise; either way http->ws and https->wss, so an HTTPS
-// page (which is what the microphone needs off localhost) gets a secure socket.
+// Mirror HTTP(S) as WS(S) so secure pages use secure sockets.
 const WS_BASE = (SERVER || location.origin).replace(/^http/, "ws");
 
-// What to call the endpoint in a message: an explicit ?server=, or wherever this
-// page came from — which in the relay case is the thing that knows the upstream.
+// Display the explicit server or relay origin.
 const SERVER_LABEL = SERVER || location.origin;
 
 // ---- DOM -------------------------------------------------------------------
@@ -135,9 +118,7 @@ async function decodeFileTo16k(file) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Wrap raw f32 PCM in a WAV container so mic audio can go through the same
-// upload endpoint as a file.  16 bytes of header work is cheaper than a second
-// code path.
+// Wrap microphone PCM as WAV for the existing upload endpoint.
 function wavFromFloat32(pcm, sampleRate) {
   const buf = new ArrayBuffer(44 + pcm.length * 4);
   const view = new DataView(buf);
@@ -256,9 +237,7 @@ async function runFileStreaming(file) {
 
 // ---- mic capture -----------------------------------------------------------
 
-// Browsers only expose getUserMedia in a secure context (HTTPS, or http on
-// localhost/127.0.0.1).  Over plain HTTP to a remote host, navigator.mediaDevices
-// is undefined.  Detect that up front and explain how to fix it.
+// Microphone capture requires HTTPS or a loopback origin; diagnose this early.
 function micUnavailableReason() {
   const hasModern = navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
   const hasLegacy = navigator.getUserMedia || navigator.webkitGetUserMedia ||
@@ -360,7 +339,6 @@ async function stopMic() {
   recording = false;
   exitRecordingUI();
 
-  // Tear down the audio graph.
   try { micNodes.proc.disconnect(); micNodes.source.disconnect(); micNodes.mute.disconnect(); } catch {}
   try { micStream.getTracks().forEach((t) => t.stop()); } catch {}
   try { await micCtx.close(); } catch {}
@@ -430,9 +408,7 @@ recordBtn.addEventListener("click", () => { recording ? stopMic() : startMic(); 
 (async function init() {
   const serverEl = document.getElementById("server-url");
   if (serverEl) serverEl.textContent = SERVER_LABEL;
-  // Fail early and specifically: a dead server and a blocked origin look the
-  // same from a failed fetch inside a transcription, and neither is the page's
-  // fault — so name the two fixes rather than reporting "failed".
+  // Distinguish server reachability and CORS failures before transcription.
   try {
     const resp = await fetch(`${SERVER}/v1/models`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);

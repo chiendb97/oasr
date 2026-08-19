@@ -1,37 +1,14 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Slot-addressed fixed-extent streaming state — the generic form of the CNN cache.
+"""Slot-addressed, fixed-extent streaming state.
 
-Every streaming cache in OASR is one of two storage disciplines:
+Each declaration owns a persistent tensor whose stream slot occupies
+``StreamStateSpec.slot_axis``.  A chunk gathers active slots and scatters updated
+state back in place.  This is distinct from growing attention K/V, which uses a
+block table and eviction in :mod:`oasr.cache.attention_cache`.
 
-**Fixed extent, slot-addressed** (this module).  The size is known when the engine
-is built and never grows: an encoder's convolutional left-context, a subsampling
-stage's tail, a recurrent per-layer state.  One persistent tensor per declaration,
-with the stream's :class:`~oasr.cache.StreamSlotPool` slot id as one of its axes;
-a chunk gathers the active rows, computes, and scatters the new tails back in
-place.  Nothing is ever evicted because nothing accumulates.
-
-**Growing, block-addressed** (:mod:`oasr.cache.attention_cache`).  Attention K/V
-grows with the stream, so it needs a shared :class:`~oasr.cache.BlockPool`, a
-per-stream block table, and eviction.
-
-This module is the first discipline, declared rather than hardcoded.  It began as
-``CnnCacheManager`` + ``SlotCnnCache`` — a perfectly good slot cache whose name,
-shape and place in the encoder signature were all fixed to *the Conformer
-depthwise convolution*, which is why an encoder needing a **second** fixed-extent
-tensor (Nemotron's three subsampling-stage tails) had nowhere to put one.
-
-Two things are worth naming about :attr:`StreamStateSpec.slot_axis`, because it is
-what makes this general rather than merely renamed:
-
-* it is why the Conformer conv cache keeps its exact ``(L, B, K-1, D)`` layout —
-  ``slot_axis = 1`` — and therefore its buffer address, which the CUDA-graph cache
-  captures by reference;
-* it is *the same declaration* as a Zipformer-style encoder's per-kind batch dims
-  (icefall's convention: embed and conv caches batch on dim 0, key/nonlin/value
-  caches on dim 1), which live today as a hand-written
-  ``stack_streaming_states`` / ``unstack_streaming_states`` pair on one encoder.
-  Moving that to this axis is a table plus a deletion, not a rewrite.
+The declared slot axis preserves each encoder's native state layout and stable
+buffer addresses, including addresses captured by execution graphs.
 """
 
 from __future__ import annotations

@@ -270,10 +270,8 @@ class DecoderStepGraphCache:
             return cast(torch.Tensor, logits)
 
         try:
-            # Warm up on the default stream first so cuBLAS/cuDNN finish any
-            # one-time workspace allocation before capture opens.  Both this and
-            # the capture write K/V at each row's next position, which the first
-            # real replay then overwrites with the caller's tokens.
+            # Warm up before capture so libraries allocate workspaces. The first
+            # replay overwrites the temporary next-position KV writes.
             with torch.no_grad():
                 _run()
             torch.cuda.synchronize(device)
@@ -284,10 +282,7 @@ class DecoderStepGraphCache:
                 with tvm_ffi.use_torch_stream(torch.cuda.graph(graph, pool=self._pool)):
                     logits_buf = _run()
         except torch.cuda.OutOfMemoryError as exc:
-            # Out of memory is about the process, not the shape.  Give the
-            # allocator its blocks back and stop capturing entirely: every
-            # further attempt would cost a warm-up forward and then run eager
-            # anyway, which is slower than never having tried.
+            # Treat capture OOM as process-wide and stop retrying costly warmups.
             self._disabled = True
             torch.cuda.empty_cache()
             logger.warning(

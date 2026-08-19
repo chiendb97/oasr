@@ -275,11 +275,9 @@ async fn any_model_name_is_accepted_by_default() {
     );
 }
 
-/// H7 landed: `word` granularity is now carried through to the engine instead
-/// of being refused.  A worker-less pool means 503 — the marker that the
-/// request parsed, decoded and reached submission.  (Whether the *decode
-/// family* can align is decided at admission, inside the engine, which is why
-/// the route no longer has an opinion.)
+/// A worker-less pool returns 503 after `word` granularity reaches submission,
+/// proving the route does not reject it.  Whether the active decode family can
+/// align is decided at engine admission.
 #[tokio::test]
 async fn word_granularity_reaches_the_engine() {
     let audio = wav(1_600);

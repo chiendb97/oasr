@@ -184,19 +184,8 @@ __global__ void topkSortKernel(const T* __restrict__ input, T* __restrict__ valu
 /*!
  * \brief One-block-per-row top-k via bitonic top-k merge.
  *
- * Algorithm:
- *   1. Each thread loads PER_THREAD elements (PT must be a multiple of K).
- *   2. Per-thread top-k: bitonic_sort the first K, then for each subsequent
- *      K-chunk bitonic_sort + bitonic_topk_merge into the running top-K.
- *   3. Warp-level top-k: log2(WARP_SIZE) shuffle stages of bitonic_topk_merge.
- *   4. Cross-warp top-k (if NWARP > 1): each warp's lane 0 publishes its
- *      top-K to shared memory; warp 0 reads back NWARP per-warp top-Ks (one
- *      per lane, padding with -inf) and runs log2(NWARP) shuffle merges.
- *   5. Lane 0 of warp 0 writes the leading k_actual values to global memory.
- *
- * Compared to topkKernel (iter), the merge cost per stage is O(K log K)
- * rather than O(k) full reductions, so total work scales with K log² K once
- * the per-thread sort dominates — much better than O(k) for moderate k.
+ * Each thread maintains a bitonic top-K, shuffle merges combine lanes, and warp
+ * zero merges per-warp results from shared memory before writing k_actual items.
  *
  * \tparam T          Input/output scalar type.
  * \tparam BLOCK_SIZE Threads per block; must be a power of two ≥ WARP_SIZE.

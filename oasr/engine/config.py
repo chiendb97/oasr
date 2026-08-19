@@ -114,112 +114,44 @@ class EngineConfig:
     checkpoint_name: str = "final.pt"
     architecture: Optional[str] = None
     device: str = "cuda"
-    # bfloat16 by default: same exponent range as fp32, so wide-activation
-    # models (e.g. conv2d6 subsampling, which can hit ~5e4 at the embed) do
-    # not overflow the way fp16 (max 65504) does.
+    # bfloat16 avoids overflow in wide-activation encoders while retaining a
+    # served low-precision dtype.
     dtype: torch.dtype = torch.bfloat16
 
-    # Service mode — the engine runs in exactly one mode per lifecycle,
-    # never both.  ``"streaming"`` admits chunk-by-chunk requests (paged
-    # KV cache, partial outputs); ``"offline"`` admits full-audio
-    # requests (length-bucketed micro-batched forward, single final
-    # output).  ``ASREngine.add_request`` validates that the per-request
-    # ``streaming`` flag matches this mode and raises ``ValueError`` on
-    # drift — the Rust dispatcher relies on this to surface
-    # misconfiguration eagerly instead of silently routing into a
-    # quiescent executor.
+    # One mode per engine lifecycle.  Request admission rejects a mismatched
+    # streaming flag instead of routing it to an inactive executor.
     service_mode: str = "streaming"
-    # Offline-only: overlap per-request admission prep (waveform normalise +
-    # frame-count stamp — the GIL-bound CPU cost of ``add_request[s_batch]``)
-    # with the GPU ``step()`` of the previous batch.  A daemon prep thread does
-    # the heavy ``prepare_offline`` lock-free and hands finished requests to
-    # ``step()`` via a thread-safe queue (``step`` drains it under the engine
-    # lock it already holds — no extra locking, no ``run()`` deadlock).  Only
-    # the cheap ``Request`` construction stays on the caller's thread.  Default
-    # off; the serving front-end enables it (the GPU step is the overlap
-    # window).  No effect in streaming mode.
+    # Offline-only: prepare waveform metadata on a daemon thread while the
+    # previous batch runs.  Results cross into ``step()`` through a queue.
     overlap_admit: bool = False
-    # Streaming-only: extract the *next* step's features after issuing this
-    # step's encoder forward instead of before it, so the host-side pack —
-    # per-stream concat + ``audio_scale`` + the write into pinned staging, the
-    # largest single block of GPU-idle in a streaming step — runs while the GPU
-    # is busy with the encoder rather than in front of it.
-    #
-    # This adds exactly one step of pipeline depth: a chunk fed during step N is
-    # forwarded by step N+1.  At the default chunk size that trades ~10 ms of
-    # per-chunk latency against ~640 ms of audio per chunk, which is why it is on
-    # by default; set ``False`` to get the strictly-serial order back (it is also
-    # the A/B arm).  No effect in offline mode.
+    # Streaming-only: overlap next-step feature packing with the current encoder
+    # forward.  This adds one step of pipeline latency; ``False`` restores serial order.
     streaming_feature_lookahead: bool = True
-    # Offline-only: collate the *next* micro-batch on a side CUDA stream while
-    # the current one's encoder forward runs, so batch selection (host) and the
-    # waveform H2D + fbank (GPU) both overlap the forward instead of sitting in
-    # front of it with an idle GPU.
-    #
-    # The side stream is what makes this work: the decode's device->host readback
-    # synchronises the *main* stream, so a collate issued there would be drained
-    # by it and nothing would overlap.  One extra micro-batch of **features** is
-    # in flight (not activations), so the memory cost is ``B x T x F``, not a
-    # second encoder.  One-shot decode families only — incremental (AED/LLM)
-    # ticks are gated on decode slots the previous batch has not yet released.
+    # Offline-only: collate the next micro-batch on a side stream so host work and
+    # feature extraction overlap the encoder.  Keeps one extra feature batch live.
     offline_collate_prefetch: bool = True
 
     # Streaming chunking
     chunk_size: int = 16
     num_left_chunks: int = -1
-    # On the final streaming chunk (``is_last``), append one ``decoding_window``
-    # of trailing silence so the last real-audio encoder window is FULL rather
-    # than a short partial tail.  Recovers the final word the CTC decoder would
-    # otherwise truncate (measured WER 8.54%→6.89% on 100 LJSpeech utts) and
-    # keeps every real-audio window on the encoder CUDA-graph fast path (the
-    # sub-window path is both slow-eager and graph-incorrect at B>1).  The
-    # trailing silence decodes to blanks.  Set ``False`` to disable.
+    # Pad the final streaming chunk with silence to complete an encoder window.
+    # This preserves trailing tokens and avoids the unsupported captured-graph
+    # path for partial windows; the added silence decodes to blanks.
     finalize_silence_pad: bool = True
 
     # Batching
-    # Encoder forward batch size — used in both modes since the service runs
-    # streaming OR offline (never both at once).  In streaming mode it caps
-    # the running pool, sizes the paged KV cache, and is the captured
-    # CUDA-Graph B.  In offline mode it is the GPU forward width: the
-    # scheduler admits one ``max_batch_size`` length-bucketed batch per
-    # ``step()`` and :class:`OfflineExecutor` runs it as a single forward.
+    # Encoder-forward width.  It also caps the streaming pool and sizes its cache.
     max_batch_size: int = 32
-    # Triton-style preferred batch sizes.  When set, the scheduler snaps
-    # streaming admission and offline batch construction to one of these B
-    # values (largest preferred ``<=`` available).  ``max_wait_time`` is the
-    # escape valve when no preferred grouping is reachable.  Also drives the
-    # encoder CUDA-Graph pre-warm at engine init and defaults
-    # ``feature_graph_batch_buckets`` when that field is unset, so the two
-    # graph caches share one bucket set.  Normalised in ``__post_init__``:
-    # values are deduped, sorted ascending, and required to satisfy
-    # ``1 <= v <= max_batch_size``.  ``None`` (default) preserves the legacy
-    # "admit greedily up to ``max_batch_size``" behaviour.
+    # Preferred scheduler widths, normalized to unique ascending values within
+    # ``max_batch_size``.  Also seed graph pre-warm buckets; ``None`` admits greedily.
     preferred_batch_size: Optional[List[int]] = None
-    # Length-bucket tolerance for offline batching.  Requests are grouped so
-    # that ``min_len / max_len >= length_bucket_ratio`` within a batch,
-    # bounding padded-compute waste.  ``0`` disables this ratio entirely and
-    # relies solely on ``max_offline_pad_ratio`` as the safety net.  Splitting
-    # a bursty ``transcribe(list_of_N)`` call into sub-batches saves only a few
-    # percent of padded GPU compute, so off-by-default is faster on real
-    # datasets where adjacent-utterance length spread is moderate.
+    # Minimum ``min_len / max_len`` within an offline batch.  ``0`` disables this
+    # filter and leaves ``max_offline_pad_ratio`` as the padding guard.
     length_bucket_ratio: float = 0.0
-    # Hard cap on padded waste: reject a candidate from an offline batch when
-    # adding it would push ``(max_len * batch_size) / sum_len`` above this ratio.
-    # Last line of defence against mixing very short and very long clips.  The
-    # default is permissive enough to admit e.g. LJSpeech (~1–10 s spread) in a
-    # single batch but still guards against pathological mixes.
+    # Reject a candidate when ``(max_len * batch_size) / sum_len`` exceeds this.
     max_offline_pad_ratio: float = 4.0
-    # Length-aware batching: hard cap on **padded** input frames per offline
-    # micro-batch, i.e. ``max_len * batch_size`` in pre-subsampling feature
-    # frames (the same unit as ``Request.num_frames``).  ``None`` (default)
-    # bounds each :class:`OfflineExecutor` micro-batch solely by
-    # ``max_batch_size``.  When set, length-sorted requests are greedily grouped
-    # into micro-batches bounded by this padded-frame budget (via
-    # ``OfflineExecutor._split_by_frames``) so a mixed short/long pool never
-    # forms an over-padded forward — exact-equivalent to the standard padded
-    # forward, only the batch composition changes.  Independent of sequence
-    # packing (``enable_sequence_packing``), which packs to a gapless varlen
-    # forward instead; packing takes precedence when both are set.
+    # Maximum ``max_len * batch_size`` pre-subsampling frames per offline batch.
+    # ``None`` uses only ``max_batch_size``; sequence packing takes precedence.
     max_batch_frames: Optional[int] = None
     # Maximum time (seconds) a waiting request may sit in the queue before it
     # is flushed even if no ideal length-bucket peer has arrived.  Prevents
@@ -231,313 +163,116 @@ class EngineConfig:
     #   "sjf"     — shortest-job-first (best throughput, can starve long reqs;
     #               starvation is still bounded by ``max_wait_time``)
     schedule_policy: str = "bucket"
-    # Streaming cohort admission: when ``streaming_cohort_admit`` is True the
-    # scheduler only admits new streaming requests when **either** the running
-    # pool is empty **or** every running stream is still at ``offset == 0``
-    # (i.e. has not yet run an encoder chunk).  This keeps every active
-    # cohort in lockstep so that ``_forward_batched_paged`` can dispatch a
-    # single ``B = max_batch_size`` encoder call instead of fragmenting into
-    # many small offset groups.  The biggest streaming throughput win on
-    # backlog-style workloads — at the cost of brief GPU idle time during
-    # cohort transitions.  Set to ``False`` for maximally responsive
-    # admission (one new request per freed slot).
+    # Admit streaming requests in lockstep cohorts to avoid fragmented offset
+    # groups.  ``False`` favors immediate admission over batch width.
     streaming_cohort_admit: bool = True
 
-    # Sequence packing (offline only).  When ``True`` the offline executor
-    # concatenates several utterances into one packed encoder forward instead
-    # of padding each micro-batch to its max length.  Attention is restricted
-    # to same-utterance tokens via ``cu_seqlens`` (varlen FMHA on the cute
-    # path, per-segment SDPA fallback otherwise); the depthwise conv is
-    # isolated per-segment with zero gap-frames; positional encoding + rel-pos
-    # bias are rebuilt per segment.  Subsampling (``embed``) still runs in
-    # normal batched mode so the Conv2d receptive field never crosses an
-    # utterance boundary.  Mutually independent of ``max_batch_frames`` (that
-    # governs the *non*-packing length-aware mode).
+    # Offline-only: pack utterances into one encoder row while isolating
+    # attention, convolution and positional state at segment boundaries.
+    # Subsampling remains batched so its receptive field cannot cross segments.
     enable_sequence_packing: bool = False
-    # Token budget for one packed encoder row, in **post-subsampling** encoder
-    # frames (≈ input_frames / 4).  The offline executor (packing mode) greedily fills a packed
-    # row with whole utterances until the next one would push the summed
-    # post-subsampling length (plus per-segment conv gap-frames) over this
-    # budget, then spills into another row.  Sized to keep one packed forward
-    # near the kernel's efficient occupancy without exhausting smem/registers.
+    # Post-subsampling frame budget per packed row, including segment gaps.
     max_packed_frames: int = 8192
 
-    # Paged KV cache.  ``max_num_blocks=None`` derives the pool size from free
-    # VRAM at construction (H4): the operator otherwise hand-computes it from
-    # layers x heads x head_dim x dtype and either wastes memory or hits the
-    # crash path — an undersized pool raises ``BlockPool exhausted`` from inside
-    # the encoder forward, an oversized one OOMs at allocation — and one config
-    # cannot move between a 24 GB and an 80 GB card.  The default stays an
-    # explicit number so no existing deployment changes size under it; see
-    # ``oasr/engine/memory.py`` for the derivation and
-    # ``gpu_memory_utilization`` for the knob.
-    #
-    # Inert in ``service_mode="offline"``, which allocates no paged pool at all.
+    # Paged-KV block count.  ``None`` derives it from available device memory;
+    # offline engines allocate no pool.
     max_num_blocks: Optional[int] = 2048
     block_size_frames: int = 16
     max_blocks_per_seq: int = 512
-    # Share of the device the engine may occupy *in total* — weights, caches and
-    # activations together — when it derives a capacity from VRAM.  The unspent
-    # remainder is headroom for what the derivation cannot see (CUDA-graph
-    # capture pools, an AR family's prefill transient, allocator fragmentation),
-    # which is why it is not 1.0.  Read only when something is left to derive.
+    # Total device-memory fraction available to derived capacities.  The
+    # remainder covers capture pools, transient activations and fragmentation.
     gpu_memory_utilization: float = 0.90
 
-    # CUDA Graph capture for the steady-state streaming encoder forward.
-    # The cute DSL fmha is compiled with TVM-FFI (``--enable-tvm-ffi``)
-    # and invoked with raw torch tensors, matching Flash Attention's
-    # ``flash_attn/cute`` pattern. Capture + replay collapses the 12-layer
-    # ~200-kernel encoder forward into a single CUDA Graph launch per
-    # ``(B_active, cache_t1_bucket)`` shape; at steady state (B ==
-    # max_batch_size) this is a clean win over the eager dispatch.
-    #
-    # The bias tile in the cute kernel is read unpredicated along T_q —
-    # safe only when adjacent gmem is mapped. Eager calls always landed
-    # adjacent allocations on the default pool so the over-read was
-    # invisible; once graph capture started carving the address space into
-    # private pools the over-read could fall into unmapped pages and trip
-    # ``cudaErrorIllegalAddress``. ``RelPositionMultiHeadedAttention.
-    # _forward_paged`` now pads ``combined_bias`` to the kernel's
-    # ``(M_BLOCK, N_BLOCK)`` tile so every bias read stays in-bounds.
+    # Capture steady-state streaming forwards by ``(B_active, cache_t1_bucket)``.
+    # Bias inputs are tile-padded because the fused kernel reads complete tiles.
     use_cuda_graphs: bool = True
 
-    # Sub-toggles for the two opt-in graph caches (gated by ``use_cuda_graphs``).
-    # ``use_feature_cuda_graphs`` controls ``GraphedFeatureExtraction``
-    # (batched fbank/mfcc capture). ``use_ctc_cuda_graphs`` controls the
-    # per-state captured ``streaming_step`` graphs inside ``GpuStreamingDecoder``.
-    #
-    # Both default OFF. They were experimentally validated at small workloads
-    # (N≈256 utts at B=64) where they shave 5-10% of wall time, but at
-    # production-scale runs (N>=2000) the per-replay CPU work in the feature
-    # graph (zero + copy + pin into the stable bucket buffer) and the per-non-blank
-    # ``cudaMemcpy2DAsync`` of ``log_prob`` slices in the CTC graph outweigh
-    # the kernel-launch savings — the captured intermediates also keep more
-    # memory live in the graph pool. Eager mode is faster at scale; the
-    # captured paths remain available for deployments where the trade-off
-    # flips (small B / many short utterances / fixed preferred batch size).
+    # Optional feature and CTC graph caches, gated by ``use_cuda_graphs``.
+    # Disabled by default because replay staging can outweigh launch savings.
     use_feature_cuda_graphs: bool = False
     use_ctc_cuda_graphs: bool = False
-    # Optional override for the feature-graph B_active buckets. ``None``
-    # selects power-of-two buckets up to ``max_batch_size``
-    # (``[1, 2, 4, 8, 16, 32, ...]``). Services with a fixed preferred batch
-    # size can pin a tighter list (e.g. ``[8, 32]``) to skip unused captures.
+    # Feature-graph batch buckets; ``None`` uses powers of two up to the batch cap.
     feature_graph_batch_buckets: Optional[List[int]] = None
 
     # Feature extraction
     feature_config: Optional[FeatureConfig] = None
 
-    # Decoding.  Default is the GPU CTC prefix beam — a single batched C++
-    # kernel rather than an N-times Python loop (~50× faster per-utt at common
-    # batch sizes, ~5 ms decode for 64 reqs).  Set to ``"ctc_wfst"`` for the
-    # k2 WFST beam search (also GPU) when ``fst_path`` is provided.
+    # CTC kernel implementation; ``ctc_wfst`` requires ``fst_path``.
     decoder_type: str = "ctc_cuda"
     ctc_decoder_config: Optional[GpuDecoderConfig] = None
     wfst_decoder_config: Optional[DecoderConfig] = None
     fst_path: Optional[str] = None
 
-    # Decode-method selection among the model's capabilities.  ``None``
-    # (default) runs ``model.default_decode_type`` — the unchanged production
-    # behaviour.  Set to another capability the checkpoint advertises (e.g.
-    # ``"ctc_aed_rescoring"`` on a U2++ hybrid) to opt in; the engine validates
-    # the name against ``model.capabilities`` at construction.
+    # Decode family.  ``None`` uses the model default; explicit values must be a
+    # declared model capability.
     decode_method: Optional[str] = None
 
-    # Generic per-family decode knobs, validated by the active strategy's
-    # ``options_cls`` (see ``oasr.engine.decode.options``).  This is what lets a
-    # new decode family ship its own configuration **without** adding fields
-    # here — and what ``oasr-server --decode-option k=v`` writes into.  Unknown
-    # keys raise at engine construction, naming the valid ones.
+    # Per-family knobs validated by the active strategy's ``options_cls``.
     decode_options: Dict[str, Any] = field(default_factory=dict)
 
-    # CTC+AED attention rescoring (``decode_method="ctc_aed_rescoring"``).
-    # ``rescoring_ctc_weight`` fuses the CTC n-best score into the decoder
-    # score (WeNet's decode-time ``ctc_weight``; 0.5 is the WeNet U2++ recipe
-    # setting — distinct from the 0.3 *training* loss weight).
-    # ``rescoring_reverse_weight`` weights the right-to-left decoder pass;
-    # ``None`` uses the checkpoint's trained ``reverse_weight`` (0.0 on plain
-    # transformer decoders — the reverse pass is then skipped entirely).
-    # The n-best width is ``ctc_decoder_config.beam_size``.
+    # CTC+AED rescoring weights.  ``None`` uses the checkpoint's trained reverse
+    # weight; zero skips the reverse pass.
     rescoring_ctc_weight: float = 0.5
     rescoring_reverse_weight: Optional[float] = None
 
-    # Transducer (RNNT) greedy decode: cap on non-blank emissions per encoder
-    # frame.  Safety bound against degenerate loops; applied uniformly so
-    # results are deterministic.  Only read by ``decode_type == "transducer"``
-    # models (see ``oasr/engine/decode/transducer.py``).
+    # Transducer safety cap on non-blank emissions per encoder frame.
     transducer_max_sym_per_frame: int = 10
 
-    # Incremental (label-synchronous AR) decode — AED / LLM strategies only.
-    # ``decode_steps_per_tick`` caps the *batched* decoder steps one engine
-    # ``step()`` runs across all pending requests, keeping per-tick work
-    # bounded — the serving dispatcher's contract; see the incremental AR
-    # protocol in ``docs/decoding.md``.  ``max_decode_slots`` caps how many
-    # AR requests may be in flight before new-batch admission pauses;
-    # ``None`` defaults to ``max_batch_size``.  Both are inert for
-    # frame-synchronous strategies (CTC / transducer / rescoring).
+    # Incremental-AR work and admission caps.  ``max_decode_slots=None`` uses
+    # ``max_batch_size``; frame-synchronous strategies ignore both.
     decode_steps_per_tick: int = 32
     max_decode_slots: Optional[int] = None
-    # Ceiling on total **decoder-KV** bytes across in-flight AR requests, in
-    # GiB.  ``max_decode_slots`` bounds admission by request *count*, which does
-    # not bound memory: a row's KV footprint is its position budget (prompt +
-    # generation cap) times the model's per-token rate, and prefill preallocates
-    # all of it.  Sizing formula, mirroring the one used for the WFST arenas:
-    #
-    #     bytes/row = 2 * layers * kv_heads * head_dim * itemsize
-    #                   * (prompt_positions + max_new_tokens)
-    #
-    # Both factors are knowable before the encode for these families because
-    # they run a fixed-window frontend.  ``None`` (default) **derives** the
-    # ceiling from free VRAM at engine construction (H4, the same profile that
-    # sizes the paged pool — see ``oasr/engine/memory.py``); ``0`` turns the byte
-    # budget off entirely and keeps the slot cap as the only limit.  Deriving is
-    # the default because the alternative to a byte ceiling is not "no ceiling",
-    # it is an OOM at prefill: ``max_decode_slots`` bounds rows, and rows are not
-    # bytes.  The derived value is whatever the card has left over after weights
-    # and the activation reserve, so it binds only where admission would
-    # otherwise have run the device out of memory.
+    # Total decoder-KV budget for in-flight AR requests.  ``None`` derives it
+    # from free memory; ``0`` disables byte budgeting.  A request-count cap alone
+    # cannot bound KV memory because row position budgets differ.
     decode_kv_budget_gib: Optional[float] = None
 
-    # Long-form decoding for fixed-window frontends (``whisper_logmel``).  With
-    # a fixed window, audio longer than it is *rejected* at admission (C5) —
-    # honest, but it refuses work the model can do.  Setting this fans a long
-    # request out into consecutive windows, decodes them through the normal
-    # batched path, and stitches one output.
-    #
-    # A request-lifecycle knob, not a per-family option: one request becoming N
-    # encoder passes and one output is the engine's business, the same way
-    # ``max_decode_slots`` is.
-    #
-    # The windows are decoded **in parallel**, so a long file costs about one
-    # window of wall clock rather than N sequential decodes.  The price is
-    # boundary accuracy — see ``oasr/engine/longform.py`` for the trade-off
-    # against OpenAI's sequential, previous-text-conditioned loop.
-    # Streaming: recycle the oldest KV block at capacity instead of terminating
-    # the stream (M1(3)).  With unlimited history a stream grows one block per
-    # encoder chunk until it hits the ceiling the block table and pool impose,
-    # and today it is finalised there with ``finish_reason="length"`` — correct
-    # but a hard limit on stream duration.  Recycling makes memory bounded by
-    # construction and lets a stream run indefinitely.
-    #
-    # Measured on the WeNet conformer: identical transcripts (0.00% WER) for
-    # audio inside the retained window, and past it the recycling run decodes
-    # the whole file where unlimited truncates.  Off by default because it does
-    # change the model's attention span for very long streams; the eviction path
-    # itself now costs ~3-5% (was 11-15% before batching).
+    # Recycle the oldest streaming KV block at capacity instead of terminating.
+    # Disabled by default because eviction shortens the attention span.
     recycle_streaming_history: bool = False
 
+    # Split overlong fixed-window inputs and stitch parallel window results.
+    # Overlap mitigates boundary errors.
     long_form: bool = False
     # Audio shared between adjacent long-form windows.  Overlapping lets the
     # stitcher drop duplicated words at a cut instead of losing one; 0 disables.
     long_form_overlap_seconds: float = 1.0
-    # Wall-clock cap on one engine tick's decode phase, in milliseconds.  The
-    # step cap above bounds *work*, not *time*, and one decoder step spans two
-    # orders of magnitude across models (measured: ~1.5 ms for whisper-tiny at
-    # B=8, ~18 ms for Qwen2-Audio-7B at B=4), so a fixed step count means a
-    # ~50 ms tick on one model and a ~580 ms tick on another.  The serving
-    # dispatcher holds the GIL for a whole tick, so that is the floor on cancel
-    # latency, admission latency, and the gap between streaming partials.
-    #
-    # Whichever limit binds first wins: light models still run many steps per
-    # tick, heavy models stop early and stream tokens at an interactive cadence.
-    # The deadline stops *starting* steps rather than preempting one, so the real
-    # bound is ``max_tick_ms + one step``.  ``0`` disables it (step cap only).
-    # Inert for frame-synchronous strategies (CTC / transducer / rescoring),
-    # which do not use the incremental protocol.
+    # AR decode time cap per tick.  It prevents new steps after the deadline but
+    # cannot preempt one, so the effective bound is this value plus one step.
+    # ``0`` disables the time cap.
     max_tick_ms: float = 25.0
-    # Incremental (AED / LLM) decode: wait up to this many milliseconds for more
-    # arrivals before prefilling a decode batch, so requests that arrive close
-    # together are *encoded and prefilled* in one pass instead of several.
-    #
-    # It used to be the only lever on a much larger effect.  An AR decoder step is
-    # weight-read bound, so its cost barely depends on how many rows it carries,
-    # and two decode groups therefore cost about twice one group of the same
-    # total rows — total forwards is the *sum over groups* of each group's step
-    # count.  Measured on Qwen2-Audio-7B, 4 utterances / 124 tokens: arriving
-    # together took 922 ms (134 tok/s); arriving one per tick took 1614 ms
-    # (77 tok/s) for identical work, purely because two groups formed.
-    #
-    # Groups now **merge** — both decoder surfaces index their KV per row
-    # (``oasr.cache.decoder_state.DecoderKv``), so a freshly prefilled batch
-    # is absorbed into one already generating and the arrival pattern no longer
-    # decides the step count.  What this window still saves is the merge's copy
-    # and one encoder+prefill pass, so it is a smaller knob than it was, and its
-    # default of 0 no longer costs throughput.
-    #
-    # Trade-off: it delays the first token of an *isolated* request by up to this
-    # window.  Bounded by ``max_wait_time`` regardless.
+    # Hold AR arrivals briefly to share one encoder/prefill pass.  This trades up
+    # to one window of first-token latency for less setup work.
     decode_admit_window_ms: float = 0.0
 
     # AR generation length cap (per request), read by incremental strategies.
     max_new_tokens: int = 448
 
-    # Speech-LLM user prompt (``decode_method="llm"``): the text placed in the
-    # checkpoint's chat template next to the audio (e.g. Qwen2-Audio's ASR
-    # prompt).  ``None`` uses the model config's ``default_user_prompt``.
+    # Speech-LLM user prompt (``decode_method="llm"``): text placed in the
+    # checkpoint's chat template next to the audio.  ``None`` uses the model
+    # config's ``default_user_prompt``.
     llm_prompt: Optional[str] = None
 
-    # Streaming interim-partial cadence.  After each streaming decode step the
-    # engine reads the best-so-far hypothesis back to the host to emit a partial
-    # transcript — a per-stream device→host sync that, profiled, is ~17% of
-    # streaming wall time (the token bytes are trivial; the blocking
-    # ``cudaStreamSynchronize`` is the cost).  ``1`` (default) emits a partial
-    # every step but via one batched read-back for the whole ready set rather
-    # than one ``.cpu()`` per stream.  ``N>1`` emits every N-th step (lower
-    # partial cadence, less sync).  ``<=0`` disables interim partials entirely
-    # (final transcript only) for throughput / non-interactive consumers — the
-    # decode state still advances every step; only the read-back is skipped.
-    #
-    # Measured (LJSpeech-128, conformer, pool 32, 640 ms chunks): ``2`` is
-    # **+8%**, ``4`` **+12%**, off **+15%** against the default.  It stays at
-    # ``1`` because that is a *cadence* contract, not a throughput knob — a
-    # partial per chunk is what an interactive consumer is promised — but a
-    # backlog deployment should raise it.
+    # Emit streaming partials every N decode steps.  ``<=0`` disables interim
+    # readbacks without stopping decode-state advancement.
     partial_decode_interval: int = 1
-    # Overlap the interim-partial read-back.  When ``False`` (default) each
-    # emit step reads the beam buffer back with a blocking
-    # ``cudaStreamSynchronize`` and emits *this* step's partial immediately —
-    # the lowest first-token latency, best for **interactive** streaming.  When
-    # ``True`` the read-back is issued non-blocking and the partial from the
-    # *previous* emit step is emitted instead (a one-chunk lag), taking the
-    # blocking sync off the critical path — a backlog/throughput optimization.
-    # The final transcript (``finalize_streaming``) is always a blocking read,
-    # so end-of-stream output is identical either way.
-    #
-    # Off by default because the engine's primary streaming target is
-    # interactive latency, and the one-chunk partial lag buys **+1.9%** at pool
-    # 32 (measured with the read-back on the C++ path; the earlier "no reliable
-    # gain" reading was taken while this path was raising a ``TypeError`` on
-    # every stream, so it measured error handling, not overlap).  Raising
-    # ``partial_decode_interval`` is the better throughput lever; this one is
-    # for a deployment that wants both the cadence and the overlap.
+    # Issue partial readbacks asynchronously and emit the previous result.  This
+    # removes a blocking sync but adds one-chunk lag; final output is unchanged.
     overlap_partial_readback: bool = False
 
     # Detokenization
     sentencepiece_model: Optional[str] = None
     unit_table: Optional[str] = None
 
-    # Audio scale factor applied before feature extraction.
-    # WeNet checkpoints are trained with Kaldi-style features where the audio
-    # is at int16 scale (range ~[-32768, 32768]).  ``torchaudio.load`` returns
-    # float32 normalized to [-1, 1], so multiply by 32768 to restore the scale.
+    # Legacy feature pipelines expect int16-scale samples, while audio loaders
+    # return normalized floats.  A checkpoint FeatureSpec overrides this default
+    # when its frontend was trained on normalized waveforms.
     audio_scale: float = 32768.0
 
-    # Longest single request the engine will hand out **page-locked** host
-    # memory for (:meth:`ASREngine.new_audio_buffer`), in seconds of audio.
-    #
-    # A caller that fills a pinned buffer lets ``collate`` DMA each row straight
-    # into the padded device batch instead of packing the batch into staging
-    # first — one copy of the waveform after the codec instead of two, measured
-    # **1.12-1.18x** end-to-end offline (`.artifacts/engine_perf.md` §10.7).
-    # Page-locked memory is a process-global resource that the caching host
-    # allocator holds on to once taken, though, so the offer is bounded: past
-    # this many seconds the engine declines and the caller allocates ordinary
-    # heap memory, which still works and is merely the older, slower path.  The
-    # pinned high-water is therefore this cap times the number of requests
-    # in flight (`--max-concurrent-requests`).  ``0`` declines every request,
-    # which is also what a CPU engine does.
+    # Maximum request duration eligible for page-locked input memory.  Longer
+    # requests use ordinary heap memory; ``0`` disables pinned allocation.
     max_pinned_audio_seconds: float = 300.0
 
-    # Set by the engine after model loading
     _model_config: Optional[BaseModelConfig] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -609,8 +344,7 @@ class EngineConfig:
         # fill the defaults without overriding a deliberate choice (the engine
         # warns loudly when an explicit value disagrees with the spec).
         # ``audio_scale`` counts as explicit only when it differs from the
-        # class default (32768.0 — setting the default explicitly is a no-op);
-        # Whisper checkpoints need the spec to flip it to 1.0.
+        # class default; setting the default is indistinguishable from omission.
         self._audio_scale_explicit = self.audio_scale != 32768.0
         self._feature_config_explicit = self.feature_config is not None
         self._tokenizer_paths_explicit = (
@@ -620,11 +354,9 @@ class EngineConfig:
             self.feature_config = FeatureConfig(dither=0.0)
         # ``ctc_decoder_config`` / ``wfst_decoder_config`` are deliberately left
         # ``None`` here.  They are **CTC-family** options and are built by the
-        # CTC strategies' ``options_cls`` factories, so an engine running
-        # Whisper / speech-LLM / Paraformer no longer constructs a beam config
-        # and a WFST config it will never read (the leak §3.2 of the design doc
-        # flagged).  Read them through ``strategy.options.decoder_config``.
-        # Normalise preferred_batch_size: dedupe, sort, validate each <= cap.
+        # CTC strategies' ``options_cls`` factories, so other decode families do
+        # not construct configs they never read.  Access them through
+        # ``strategy.options.decoder_config``.
         if self.preferred_batch_size is not None:
             cleaned = sorted({int(v) for v in self.preferred_batch_size})
             if not cleaned:
@@ -664,12 +396,11 @@ class EngineConfig:
     # Subsampling constants for Conv2dSubsampling (4× with right_context=6)
     # ------------------------------------------------------------------
 
-    # These four geometry properties default to the Conformer/Conv2dSubsampling
-    # values so a standalone ``EngineConfig`` (no model) stays usable.  The
+    # These geometry properties retain legacy defaults so a standalone
+    # ``EngineConfig`` stays usable.  The
     # engine **overrides** them after loading the model (``ASREngine`` sets
     # ``_*_override`` from ``model.encoder`` / the streaming backend) so they
-    # reflect the actual architecture's streaming geometry — Conformer is
-    # unchanged (4 / 6 / 67 / 64), Zipformer reports its stateful window.
+    # reflect the loaded architecture's streaming geometry.
 
     @property
     def subsampling_rate(self) -> int:

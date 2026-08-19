@@ -1,63 +1,13 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""NeMo/Nemotron log-mel spectrogram frontend (batched, offline + streaming).
+"""Batched offline and streaming frontend for the Nemotron log-mel recipe.
 
-Reproduces ``NemotronAsrStreamingFeatureExtractor`` (which in turn reproduces
-NeMo's ``AudioToMelSpectrogramPreprocessor`` for the Nemotron ASR releases):
+The recipe uses float-scale audio, pre-emphasis, a centered zero-padded STFT,
+Slaney mel filters, and ``log(mel + 2**-24)`` without normalization. Valid frame
+counts intentionally exclude the final padded frame.
 
-* input waveforms at **[-1, 1] float scale** (``FeatureSpec.audio_scale = 1.0``
-  — like the icefall/Whisper frontends and *unlike* WeNet's int16 scale);
-* per-row **pre-emphasis** ``x[t] - 0.97 * x[t-1]`` with ``x[0]`` kept, applied
-  before the STFT and re-zeroed past each row's valid length;
-* STFT ``n_fft = 512`` (the power of two above ``win_length = 400``),
-  ``hop = 160``, **non-periodic** Hann window, centered with *constant* (zero)
-  padding — not reflect;
-* power spectrum, slaney-scale mel filterbank (``fmin = 0``, ``fmax = sr/2``);
-* ``log(mel + 2**-24)`` — a **log of the raw mel**, not ``log10`` and not
-  normalized in any way.  Nemotron never applies per-feature CMVN, so unlike
-  every other frontend in this package there is nothing to normalize over and
-  the recipe is exactly frame-local.
-
-Two consequences of that last point are worth naming, because they are what make
-this its own extractor rather than a :class:`~oasr.features.FeatureConfig` of the
-Kaldi one:
-
-1. the log guard ``2**-24`` and the missing ``log10``/``dither``/``povey``
-   window put it outside what ``oasr.features.batched`` can express;
-2. the returned frame count is ``floor(L / hop)`` while the tensor is
-   ``floor(L_max / hop) + 1`` frames wide.  That is not an off-by-one: it is
-   HF's ``attention_mask`` convention, and the encoder's causal subsampling
-   reads the mask, so a frontend that claimed the extra frame would feed the
-   encoder one frame of zero-padding as if it were audio.
-
-Two implementations, one recipe
--------------------------------
-:func:`batched_nemotron_logmel` runs on **OASR kernels** when the batch is on
-CUDA (``stft_frame`` → ``rfft_power`` → ``mel_log``: three launches, no
-intermediate waveform copies) and on the torch reference otherwise.  The torch
-path is not dead weight — it is the CPU path, the fp32 parity oracle the tests
-compare the kernel against, and the "is this the kernels' fault" A/B.  Force it
-with ``OASR_FEATURE_BACKEND=torch``.
-
-Streaming
----------
-The recipe is frame-local, so it streams — but the frame *grid* comes from one
-``center=True`` pass over the whole utterance, so a chunked caller has to
-reproduce it rather than restart it.  :func:`nemotron_streaming_framing` declares
-how (:class:`~oasr.features.StreamingFraming`) and
-:func:`batched_nemotron_logmel_streaming` consumes it:
-
-* ``prefill = n_fft // 2 + 1`` zero samples start the buffer — ``n_fft // 2`` for
-  the centered grid's implicit left pad, plus **one** for pre-emphasis, which
-  NeMo applies to the *signal* and which therefore reaches one sample before
-  each frame;
-* ``history = 1`` marks that leading sample as context rather than a frame start;
-* ``span = n_fft`` (not ``win_length``) is what one frame reads.
-
-Verified bit-exact against the offline centered pass (max abs difference 0.0 in
-fp64), which is also what upstream's own docstring promises: feeding
-``audio[hop * frame - n_fft // 2 :]`` with ``center=False`` reproduces it
-frame for frame.
+Streaming reproduces the offline frame grid with half-window prefill, one sample
+of pre-emphasis history, and full-FFT frame spans.
 """
 
 from __future__ import annotations

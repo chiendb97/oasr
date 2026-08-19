@@ -106,7 +106,7 @@ pub struct Cli {
     /// `--max-decode-slots` bounds admission by request *count*, which does not
     /// bound memory: a row's KV footprint is its position budget (prompt +
     /// generation cap) times the model's per-token rate, and prefill
-    /// preallocates all of it.  Unset **derives** the ceiling from free VRAM
+    /// preallocates all of it.  Unset **derives** the ceiling from free device memory
     /// (see `--gpu-memory-utilization`); pass `0` to turn the byte budget off
     /// and leave the slot cap as the only limit.
     #[arg(long)]
@@ -115,15 +115,12 @@ pub struct Cli {
     /// ceiling, instead of finalising it with `finish_reason="length"`.
     ///
     /// Makes streaming memory bounded by construction and lets a stream run
-    /// indefinitely.  Measured identical (0.00% WER) for audio inside the
-    /// retained window; past it the recycling run decodes the whole file where
-    /// unlimited history truncates.  Off by default because it does change the
-    /// attention span for very long streams.
+    /// indefinitely.  Off by default because it changes the attention span of
+    /// long streams.
     #[arg(long, default_value_t = false)]
     pub recycle_streaming_history: bool,
-    /// Decode audio longer than a fixed-window frontend's window (Whisper /
-    /// Qwen2-Audio's 30 s) by splitting it into windows and stitching the
-    /// transcripts, instead of rejecting it.
+    /// Decode audio longer than a fixed-window frontend supports by splitting
+    /// it into windows and stitching the transcripts instead of rejecting it.
     ///
     /// Windows decode in parallel, so a long file costs about one window of
     /// wall clock rather than N sequential decodes; the price is boundary
@@ -135,30 +132,16 @@ pub struct Cli {
     /// Engine default 1.0; 0 disables.
     #[arg(long)]
     pub long_form_overlap_seconds: Option<f64>,
-    /// Generic per-family decode knob, repeatable: `--decode-option k=v`.
-    ///
-    /// Forwarded verbatim to `EngineConfig.decode_options` and validated
-    /// against the **active** decode family's option set at engine
-    /// construction, so an unknown or misspelled key is a startup error naming
-    /// the valid ones rather than a silently ignored flag.  This is what lets a
-    /// newly registered decode family expose its configuration without a new
-    /// flag here — and it reaches the three knobs that never got one
-    /// (`rescoring_ctc_weight`, `rescoring_reverse_weight`,
-    /// `transducer_max_sym_per_frame`) as `ctc_weight`, `reverse_weight` and
-    /// `max_sym_per_frame`.  Values are typed from the option's declared
-    /// default, so `--decode-option ctc_weight=0.3` arrives as a float.
+    /// Repeatable `--decode-option k=v`, typed and validated against the active
+    /// family's declared options during engine construction.
     #[arg(long = "decode-option", value_name = "KEY=VALUE")]
     pub decode_option: Vec<String>,
-    /// Incremental (AED / LLM) decode: max batched decoder steps one engine
-    /// tick runs across all pending requests — the bounded-work-per-tick
-    /// contract that keeps AR decode from starving the dispatcher.  Engine
-    /// default 32.
+    /// Maximum incremental decoder steps per tick; bounds dispatcher starvation.
     #[arg(long)]
     pub decode_steps_per_tick: Option<u32>,
     /// Incremental (AED / LLM) decode: wall-clock cap on one tick's decode phase,
     /// in milliseconds.  The step cap above bounds work, not time, and step cost
-    /// is model-dependent (measured: ~1.5 ms/step for whisper-tiny at B=8 vs
-    /// ~18 ms/step for Qwen2-Audio-7B at B=4), so this is what actually bounds
+    /// varies across architectures, so this is what actually bounds
     /// cancel latency, admission latency and the streaming-partial interval —
     /// the dispatcher holds the GIL for a whole tick.  Engine default 25;
     /// 0 disables (step cap only).
@@ -166,11 +149,9 @@ pub struct Cli {
     pub max_tick_ms: Option<f64>,
     /// Incremental (AED / LLM) decode: hold a thin waiting queue this many
     /// milliseconds so near-simultaneous arrivals prefill as **one** decode
-    /// batch.  An AR decoder step is weight-read bound, so its cost barely
-    /// depends on how many rows it carries — two decode groups cost roughly
-    /// twice one group of the same total rows, and groups cannot be merged after
-    /// the fact (both decoder surfaces keep a shared scalar generation offset).
-    /// Trades first-token latency for throughput; engine default 0 (off).
+    /// batch.  Groups can merge after prefill, so this window primarily avoids
+    /// the merge copy and an extra encoder/prefill pass.  Trades first-token
+    /// latency for throughput; engine default 0 (off).
     #[arg(long)]
     pub decode_admit_window_ms: Option<f64>,
     /// Incremental (AED / LLM) decode: max AR requests in flight before
@@ -552,7 +533,7 @@ impl Cli {
             // Pass the raw `k=v` strings through; the engine types each value
             // from the active family's declared default and rejects unknown
             // keys.  Doing the typing here would mean this crate tracking every
-            // family's option table — exactly the drift S9 is about.
+            // family's option table, which would duplicate the engine registry.
             let mut opts = serde_json::Map::new();
             for pair in &self.decode_option {
                 let (k, v) = pair.split_once('=').ok_or_else(|| {

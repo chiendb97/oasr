@@ -121,9 +121,7 @@ cudaError_t cudnn_conv2d_fwd(const T* input, const T* filter, const T* bias, T* 
 //
 // The bias add and the activation are both full read-modify-write passes over
 // the output, so running conv → addTensor → activation reads and writes the
-// whole [N, P, Q, K] tensor three times for one convolution.  On the Conformer
-// subsampling (IC=1, hence this backend) that measured **10.7% of all offline
-// GPU time** — for arithmetic that is free inside the convolution's epilogue.
+// whole [N, P, Q, K] tensor three times for one convolution.
 //
 // ReLU takes cuDNN's fused entry point, one pass for all three operations.
 // GELU and Swish are not cuDNN activation modes, so they fold the bias into

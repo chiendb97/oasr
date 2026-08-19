@@ -49,22 +49,10 @@ namespace gemm {
 // CutlassGemmKernel — CUTLASS 2.x GEMM template
 //==============================================================================
 
-// ``kStreamK`` selects the Stream-K decomposition (``GemmUniversal`` +
-// ``ThreadblockSwizzleStreamK``) instead of the data-parallel ``device::Gemm``.
-// Stream-K distributes the K-reduction across all SMs and reduces partials with
-// an in-kernel fixup, which fills the GPU on thin GEMMs (small M, few output
-// tiles) where the data-parallel grid leaves most SMs idle.
-//
-// ``kParallelSplitK`` selects ``GemmSplitKParallel``: each K-partition writes
-// fp32 partials to workspace and a reduction kernel applies the epilogue once.
-// Unlike serial split-K it is valid for fused activations (the activation is
-// applied post-reduction) and needs no workspace zeroing.
-//
-// Serial split-K (``kStreamK == kParallelSplitK == false``, split_k_slices > 1)
-// runs as a SINGLE kernel launch: the per-tile semaphores come from a
-// persistent pre-zeroed workspace (``workspace_cache.h``) and the kernel itself
-// restores the locks to zero (final K-slice releases 0), so the per-launch
-// ``cudaMemsetAsync`` of ``device::Gemm::initialize`` is skipped.
+// Stream-K distributes thin reductions across multiprocessors. Parallel split-K
+// stores fp32 partials and applies fused epilogues after reduction. Serial
+// split-K reuses pre-zeroed semaphores and restores them in-kernel, avoiding a
+// per-launch workspace clear.
 template <typename CutlassGemmConfig, typename ElementA, typename ElementB, typename ElementCD,
           ActivationType activation_type, bool kStreamK = false, bool kParallelSplitK = false>
 struct CutlassGemmKernel {

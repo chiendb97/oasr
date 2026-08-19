@@ -3,23 +3,19 @@
 """Cross-attention DTW: an AED transcript → per-token frame spans.
 
 An attention encoder-decoder has no frame-synchronous emission to read a time
-off, so the timing has to come from where the decoder *looked*.  Whisper's
-``word_timestamps=True`` is the reference procedure and this is it: take the
-cross-attention of a handful of heads that were empirically found to align,
-normalize and smooth them into a token × frame affinity matrix, and find the
-monotonic path through it with dynamic time warping.
+off, so timing comes from where the decoder *looked*: take cross-attention from
+heads known to align, normalize and smooth it into a token × frame affinity
+matrix, then find a monotonic path with dynamic time warping.
 
 Two things make it work at all, and both are easy to leave out:
 
 * **Only some heads align.** Averaging every head gives a diffuse matrix whose
   DTW path is close to a straight diagonal — plausible-looking timings that are
-  really just "token k of n is at k/n of the audio".  Whisper publishes the
-  head set per model size; :func:`resolve_alignment_heads` falls back to the
-  upper half of the decoder stack and says so, because that is where the
-  aligning heads sit in every published set.
-* **The padded window is not audio.** Whisper pads every utterance to 30 s, so
-  a 4 s clip is 200 real encoder frames followed by 1300 frames of silence that
-  the DTW will happily walk into. The matrix is cut to the real frames first.
+  really just "token k of n is at k/n of the audio".  A declared head set is
+  preferred; :func:`resolve_alignment_heads` otherwise uses the upper half of
+  the decoder stack and reports the fallback.
+* **The padded window is not audio.** Fixed-window frontends append silence that
+  DTW can walk into, so the matrix is cut to real frames first.
 
 The DP is over anti-diagonals rather than the reference implementation's nested
 Python loops: cells on one anti-diagonal depend only on the two before it, so a
@@ -40,8 +36,8 @@ __all__ = [
     "token_frame_spans",
 ]
 
-#: Median-filter width along the time axis, in encoder frames.  Whisper's value.
-#: Attention peaks are spiky; without smoothing the DTW path oscillates between
+#: Median-filter width along the time axis, in encoder frames.  Attention peaks
+#: are spiky; without smoothing the DTW path oscillates between
 #: neighbouring frames and word boundaries land a frame or two off at random.
 MEDFILT_WIDTH = 7
 
