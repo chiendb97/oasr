@@ -15,6 +15,20 @@ def _copy_to_reference(ours: nn.Module, reference: nn.Module) -> None:
     reference.load_state_dict(ours.state_dict())
 
 
+def _device_sm() -> int:
+    """Compute capability as the JIT spells it, e.g. 90 for Hopper."""
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
+
+
+#: The CUTLASS 3.x recurrent arms are compiled only for these two targets.
+_TMA_TACTICS = [(6, 1), (7, 1)]
+_requires_tma = pytest.mark.skipif(
+    not torch.cuda.is_available() or _device_sm() not in (90, 100),
+    reason="the TMA warp-specialized recurrent tactics are built for SM90/SM100 only",
+)
+
+
 class TestRecurrentCpu:
     @pytest.mark.parametrize("batch_first", [False, True])
     @pytest.mark.parametrize("bias", [False, True])
@@ -163,6 +177,132 @@ class TestRecurrentCuda:
             expected = reference(x, state)
         torch.testing.assert_close(got[0], expected[0], rtol=3e-2, atol=3e-2)
         torch.testing.assert_close(got[1], expected[1], rtol=3e-2, atol=3e-2)
+
+    # The module-level tensor-core gate needs batch >= 16 and hidden >= 1024, so
+    # these are the only parametrisations that reach lstm_gemm_layer /
+    # rnn_gemm_layer through the layer rather than through an explicit tactic.
+    # num_layers > 1 also covers the batch-first handoff: the first layer
+    # consumes BTC and every later one consumes the TBC output of its
+    # predecessor.
+    @pytest.mark.parametrize("layers", [1, 2])
+    @pytest.mark.parametrize("batch_first", [False, True])
+    def test_lstm_tensor_core_layer_matches_cudnn(self, layers, batch_first):
+        torch.manual_seed(7)
+        batch, sequence, hidden_size = 16, 3, 1024
+        ours = LSTM(hidden_size, hidden_size, num_layers=layers, batch_first=batch_first)
+        ours = ours.cuda().half().eval()
+        reference = nn.LSTM(hidden_size, hidden_size, num_layers=layers, batch_first=batch_first)
+        reference = reference.cuda().half().eval()
+        _copy_to_reference(ours, reference)
+        shape = (batch, sequence, hidden_size) if batch_first else (sequence, batch, hidden_size)
+        x = torch.randn(shape, device="cuda", dtype=torch.float16)
+        state = (
+            torch.randn(layers, batch, hidden_size, device="cuda", dtype=torch.float16),
+            torch.randn(layers, batch, hidden_size, device="cuda", dtype=torch.float16),
+        )
+        with torch.no_grad():
+            got = ours(x, state)
+            expected = reference(x, state)
+        assert got[0].shape == expected[0].shape
+        torch.testing.assert_close(got[0], expected[0], rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(got[1][0], expected[1][0], rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(got[1][1], expected[1][1], rtol=3e-2, atol=3e-2)
+
+    @pytest.mark.parametrize("nonlinearity", ["tanh", "relu"])
+    @pytest.mark.parametrize("layers", [1, 2])
+    @pytest.mark.parametrize("batch_first", [False, True])
+    def test_rnn_tensor_core_layer_matches_cudnn(self, nonlinearity, layers, batch_first):
+        torch.manual_seed(8)
+        batch, sequence, hidden_size = 16, 3, 1024
+        ours = RNN(
+            hidden_size,
+            hidden_size,
+            num_layers=layers,
+            nonlinearity=nonlinearity,
+            batch_first=batch_first,
+        )
+        ours = ours.cuda().half().eval()
+        reference = nn.RNN(
+            hidden_size,
+            hidden_size,
+            num_layers=layers,
+            nonlinearity=nonlinearity,
+            batch_first=batch_first,
+        )
+        reference = reference.cuda().half().eval()
+        _copy_to_reference(ours, reference)
+        shape = (batch, sequence, hidden_size) if batch_first else (sequence, batch, hidden_size)
+        x = torch.randn(shape, device="cuda", dtype=torch.float16)
+        state = torch.randn(layers, batch, hidden_size, device="cuda", dtype=torch.float16)
+        with torch.no_grad():
+            got = ours(x, state)
+            expected = reference(x, state)
+        assert got[0].shape == expected[0].shape
+        torch.testing.assert_close(got[0], expected[0], rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(got[1], expected[1], rtol=3e-2, atol=3e-2)
+
+    # The cell history is a two-slice ring, so anything past t=1 wraps it.  A
+    # ring indexed as if it were the whole sequence reads a stale slice.
+    @pytest.mark.parametrize("sequence", [1, 2, 3, 9])
+    @pytest.mark.parametrize("hidden_size", [64, 1024])
+    def test_lstm_cell_ring_matches_cudnn(self, sequence, hidden_size):
+        torch.manual_seed(9)
+        batch = 16
+        ours = LSTM(hidden_size, hidden_size, batch_first=True).cuda().half().eval()
+        reference = nn.LSTM(hidden_size, hidden_size, batch_first=True).cuda().half().eval()
+        _copy_to_reference(ours, reference)
+        x = torch.randn(batch, sequence, hidden_size, device="cuda", dtype=torch.float16)
+        state = (
+            torch.randn(1, batch, hidden_size, device="cuda", dtype=torch.float16),
+            torch.randn(1, batch, hidden_size, device="cuda", dtype=torch.float16),
+        )
+        with torch.no_grad():
+            got = ours(x, state)
+            expected = reference(x, state)
+        torch.testing.assert_close(got[0], expected[0], rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(got[1][0], expected[1][0], rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(got[1][1], expected[1][1], rtol=3e-2, atol=3e-2)
+
+    @pytest.mark.parametrize("module_cls,torch_cls", [(LSTM, nn.LSTM), (RNN, nn.RNN)])
+    def test_non_contiguous_input_matches_pytorch(self, module_cls, torch_cls):
+        """``nn.LSTM``/``nn.RNN`` accept any view; the launcher needs a
+        contiguous tensor, so the layer must materialize one rather than refuse.
+        """
+        torch.manual_seed(10)
+        batch, sequence, hidden_size = 4, 3, 64
+        ours = module_cls(hidden_size, hidden_size, batch_first=True).cuda().half().eval()
+        reference = torch_cls(hidden_size, hidden_size, batch_first=True).cuda().half().eval()
+        _copy_to_reference(ours, reference)
+        # A BTC view of a TBC tensor: right shape, wrong strides.
+        x = torch.randn(sequence, batch, hidden_size, device="cuda", dtype=torch.float16)
+        x = x.transpose(0, 1)
+        assert not x.is_contiguous()
+        state = torch.randn(1, batch, hidden_size, device="cuda", dtype=torch.float16)
+        hx = (state, state.clone()) if module_cls is LSTM else state
+        with torch.no_grad():
+            got = ours(x, hx)
+            expected = reference(x, hx)
+        torch.testing.assert_close(got[0], expected[0], rtol=3e-2, atol=3e-2)
+
+    def test_lstm_accepts_non_contiguous_state_view(self):
+        """``unstack_states`` hands back a batch window of a wider cohort, which
+        is non-contiguous across the layer axis.  Compared against the same call
+        on a materialized copy, because ``nn.LSTM`` refuses such a state outright.
+        """
+        torch.manual_seed(11)
+        hidden_size = 64
+        ours = LSTM(hidden_size, hidden_size, num_layers=2, batch_first=True).cuda().half().eval()
+        cohort_h = torch.randn(2, 8, hidden_size, device="cuda", dtype=torch.float16)
+        cohort_c = torch.randn(2, 8, hidden_size, device="cuda", dtype=torch.float16)
+        view = (cohort_h[:, 2:5], cohort_c[:, 2:5])
+        assert not view[0].is_contiguous()
+        x = torch.randn(3, 1, hidden_size, device="cuda", dtype=torch.float16)
+        with torch.no_grad():
+            from_view = ours(x, view)
+            from_copy = ours(x, (view[0].contiguous(), view[1].contiguous()))
+        torch.testing.assert_close(from_view[0], from_copy[0])
+        torch.testing.assert_close(from_view[1][0], from_copy[1][0])
+        torch.testing.assert_close(from_view[1][1], from_copy[1][1])
 
     def test_functional_destination_passing(self):
         batch, sequence, input_size, hidden_size = 2, 3, 32, 48
@@ -314,6 +454,112 @@ class TestRecurrentCuda:
         actual_output = got[0].transpose(0, 1) if batch_first else got[0]
         torch.testing.assert_close(actual_output, expected[0], rtol=3e-2, atol=3e-2)
         torch.testing.assert_close(got[1], expected[1][0], rtol=3e-2, atol=3e-2)
+
+    @_requires_tma
+    @pytest.mark.parametrize("tactic", _TMA_TACTICS)
+    @pytest.mark.parametrize("batch_first", [False, True])
+    def test_lstm_tma_tactics_match_pytorch(self, tactic, batch_first):
+        torch.manual_seed(12)
+        batch, sequence, hidden_size = 128, 3, 256
+        ours = LSTM(hidden_size, hidden_size, batch_first=batch_first).cuda().half().eval()
+        reference = nn.LSTM(hidden_size, hidden_size, batch_first=batch_first).cuda().half().eval()
+        _copy_to_reference(ours, reference)
+        shape = (batch, sequence, hidden_size) if batch_first else (sequence, batch, hidden_size)
+        x = torch.randn(shape, device="cuda", dtype=torch.float16)
+        h = torch.randn(1, batch, hidden_size, device="cuda", dtype=torch.float16)
+        c = torch.randn_like(h)
+        with torch.no_grad():
+            got = oasr.lstm_gemm_layer(
+                x,
+                h[0],
+                c[0],
+                ours.weight_ih_l0,
+                ours.weight_hh_l0,
+                ours.bias_ih_l0,
+                ours.bias_hh_l0,
+                batch_first=batch_first,
+                _packed_parameters=ours._packed_lstm_parameters(0),
+                _tactic=tactic,
+            )
+            expected = reference(x, (h, c))
+        actual = got[0].transpose(0, 1) if batch_first else got[0]
+        torch.testing.assert_close(actual, expected[0], rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(got[1], expected[1][0][0], rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(got[2], expected[1][1][0], rtol=3e-2, atol=3e-2)
+
+    @_requires_tma
+    @pytest.mark.parametrize("tactic", _TMA_TACTICS)
+    @pytest.mark.parametrize("nonlinearity", ["tanh", "relu"])
+    def test_rnn_tma_tactics_match_pytorch(self, tactic, nonlinearity):
+        torch.manual_seed(13)
+        batch, sequence, hidden_size = 128, 3, 256
+        ours = (
+            RNN(hidden_size, hidden_size, nonlinearity=nonlinearity, batch_first=True)
+            .cuda()
+            .half()
+            .eval()
+        )
+        reference = (
+            nn.RNN(hidden_size, hidden_size, nonlinearity=nonlinearity, batch_first=True)
+            .cuda()
+            .half()
+            .eval()
+        )
+        _copy_to_reference(ours, reference)
+        x = torch.randn(batch, sequence, hidden_size, device="cuda", dtype=torch.float16)
+        h = torch.randn(1, batch, hidden_size, device="cuda", dtype=torch.float16)
+        with torch.no_grad():
+            got = oasr.rnn_gemm_layer(
+                x,
+                h[0],
+                ours.weight_ih_l0,
+                ours.weight_hh_l0,
+                ours.bias_ih_l0,
+                ours.bias_hh_l0,
+                nonlinearity=nonlinearity,
+                batch_first=True,
+                _combined_input_bias=ours._combined_rnn_bias(0),
+                _tactic=tactic,
+            )
+            expected = reference(x, h)
+        torch.testing.assert_close(got[0].transpose(0, 1), expected[0], rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(got[1], expected[1][0], rtol=3e-2, atol=3e-2)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or _device_sm() in (90, 100),
+        reason="covers the refusal on targets that do not build the TMA arms",
+    )
+    @pytest.mark.parametrize("tactic", _TMA_TACTICS)
+    def test_tma_tactics_declared_unavailable_off_sm90(self, tactic):
+        """A tactic the target did not compile must refuse, not silently reroute."""
+        batch, sequence, hidden_size = 16, 2, 64
+        x = torch.randn(sequence, batch, hidden_size, device="cuda", dtype=torch.float16)
+        h = torch.randn(batch, hidden_size, device="cuda", dtype=torch.float16)
+        weight_ih = torch.randn(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
+        weight_hh = torch.randn(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
+        with pytest.raises(RuntimeError, match="TMA warp-specialized"):
+            oasr.rnn_gemm_layer(x, h, weight_ih, weight_hh, _tactic=tactic)
+
+    def test_rejects_unknown_tactic(self):
+        batch, sequence, hidden_size = 16, 2, 64
+        x = torch.randn(sequence, batch, hidden_size, device="cuda", dtype=torch.float16)
+        h = torch.randn(batch, hidden_size, device="cuda", dtype=torch.float16)
+        weight_ih = torch.randn(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
+        weight_hh = torch.randn(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
+        with pytest.raises(RuntimeError, match="unknown recurrent GEMM tactic"):
+            oasr.rnn_gemm_layer(x, h, weight_ih, weight_hh, _tactic=(8, 1))
+
+    def test_rnn_gemm_rejects_serial_split_k(self):
+        """Applying tanh/ReLU to an intermediate K partition is wrong, so the
+        launcher refuses the tactic instead of producing a plausible answer.
+        """
+        batch, sequence, hidden_size = 16, 3, 64
+        x = torch.randn(sequence, batch, hidden_size, device="cuda", dtype=torch.float16)
+        h = torch.randn(batch, hidden_size, device="cuda", dtype=torch.float16)
+        weight_ih = torch.randn(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
+        weight_hh = torch.randn(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
+        with pytest.raises(RuntimeError, match="serial split-K"):
+            oasr.rnn_gemm_layer(x, h, weight_ih, weight_hh, _tactic=(5, 4))
 
 
 class TestRecurrentValidation:

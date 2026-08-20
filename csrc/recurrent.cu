@@ -9,6 +9,16 @@
 #include <oasr/recurrent/recurrent.cuh>
 #include <oasr/recurrent/recurrent_cutlass.cuh>
 
+// The CUTLASS 3.x recurrent compositions exist for the two targets whose
+// OpClassTensorOp builders accept FP16/BF16.  SM120's does not (F8/F6/F4 only),
+// so GeForce Blackwell keeps the 2.x tactics and nothing else changes.
+#if defined(OASR_TARGET_SM) && (OASR_TARGET_SM == 90 || OASR_TARGET_SM == 100)
+    #define OASR_RECURRENT_HAS_TMA 1
+    #include <oasr/recurrent/recurrent_cutlass_sm90.cuh>
+#else
+    #define OASR_RECURRENT_HAS_TMA 0
+#endif
+
 #include "tvm_ffi_utils.h"
 
 using namespace oasr;
@@ -42,6 +52,38 @@ void CheckTensorLike(const TensorView& tensor, const TensorView& reference, cons
     TVM_FFI_ICHECK(SameDtype(tensor, reference)) << name << " dtype must match input";
 }
 
+// Only cell[t-1] is ever read, so the cell history is a two-slice ring (one
+// slice for a single-timestep sequence) rather than the whole sequence.  It is
+// always (slices, batch, hidden) contiguous, whatever layout the input uses,
+// which is what lets the kernels address the ring, the initial cell and the
+// final cell with a single offset.
+int CellRing(int sequence_length) {
+    return sequence_length > 1 ? 2 : 1;
+}
+
+// Validates the LSTM cell buffers shared by both paths: the ring plus the
+// initial and final cell, all (batch, hidden) contiguous slices.
+void CheckCellBuffers(const TensorView& cells, const TensorView& initial_c,
+                      const TensorView& final_c, const TensorView& reference, int sequence_length,
+                      int batch_size, int hidden_size) {
+    CheckTensorLike(cells, reference, "cells");
+    CheckTensorLike(initial_c, reference, "initial_c");
+    CheckTensorLike(final_c, reference, "final_c");
+    CHECK_DIM(3, cells);
+    CHECK_DIM(2, initial_c);
+    CHECK_DIM(2, final_c);
+    const int ring = CellRing(sequence_length);
+    TVM_FFI_ICHECK(cells.size(0) == ring && cells.size(1) == batch_size &&
+                   cells.size(2) == hidden_size)
+        << "cells must be the (" << ring << ", " << batch_size << ", " << hidden_size
+        << ") cell ring, got (" << cells.size(0) << ", " << cells.size(1) << ", " << cells.size(2)
+        << ")";
+    TVM_FFI_ICHECK(initial_c.size(0) == batch_size && initial_c.size(1) == hidden_size)
+        << "initial_c must have shape (" << batch_size << ", " << hidden_size << ")";
+    TVM_FFI_ICHECK(final_c.size(0) == batch_size && final_c.size(1) == hidden_size)
+        << "final_c must have shape (" << batch_size << ", " << hidden_size << ")";
+}
+
 struct RecurrentShape {
     int sequence_length;
     int batch_size;
@@ -68,11 +110,18 @@ enum class RecurrentGemmTactic : int64_t {
     STREAM_K = 3,
     PARALLEL_SPLIT_K = 4,
     SERIAL_SPLIT_K = 5,
+    // CUTLASS 3.x TMA warp-specialized, SM90 / SM100 only.
+    TMA_64 = 6,
+    TMA_128 = 7,
 };
+
+bool IsTmaTactic(RecurrentGemmTactic tactic) {
+    return tactic == RecurrentGemmTactic::TMA_64 || tactic == RecurrentGemmTactic::TMA_128;
+}
 
 void CheckRecurrentTactic(int64_t tactic, int64_t split_k_slices) {
     TVM_FFI_ICHECK(tactic >= static_cast<int64_t>(RecurrentGemmTactic::FUSED_16X64) &&
-                   tactic <= static_cast<int64_t>(RecurrentGemmTactic::SERIAL_SPLIT_K))
+                   tactic <= static_cast<int64_t>(RecurrentGemmTactic::TMA_128))
         << "unknown recurrent GEMM tactic " << tactic;
     TVM_FFI_ICHECK(split_k_slices >= 1 && split_k_slices <= 16)
         << "split_k_slices must be in [1, 16], got " << split_k_slices;
@@ -80,6 +129,19 @@ void CheckRecurrentTactic(int64_t tactic, int64_t split_k_slices) {
         tactic == static_cast<int64_t>(RecurrentGemmTactic::SERIAL_SPLIT_K)) {
         TVM_FFI_ICHECK(split_k_slices > 1)
             << "a split-K recurrent tactic requires split_k_slices > 1";
+    }
+    if (IsTmaTactic(static_cast<RecurrentGemmTactic>(tactic))) {
+#if OASR_RECURRENT_HAS_TMA
+        // The collective mainloop carries its own K pipeline; there is no
+        // split-K knob to honour, so refuse rather than ignore one.
+        TVM_FFI_ICHECK(split_k_slices == 1)
+            << "a TMA warp-specialized recurrent tactic has no split-K; got split_k_slices "
+            << split_k_slices;
+#else
+        TVM_FFI_ICHECK(false)
+            << "recurrent tactic " << tactic
+            << " is CUTLASS 3.x TMA warp-specialized and exists only for SM90 and SM100 targets";
+#endif
     }
 }
 
@@ -162,6 +224,24 @@ gemm::GemmStatus RunRnnTactic(RecurrentGemmTactic tactic, CutlassType* output,
                 input_gate_batch_stride, stream, split_k_slices);
         case RecurrentGemmTactic::SERIAL_SPLIT_K:
             return gemm::GemmStatus::NOT_SUPPORTED;
+        case RecurrentGemmTactic::TMA_64:
+#if OASR_RECURRENT_HAS_TMA
+            return recurrent::RnnStateGemmSm90<recurrent::RecurrentSm90Config64, CutlassType,
+                                               Activation>(output, previous_h, weight_hh,
+                                                           input_gates, batch_size, hidden_size,
+                                                           input_gate_batch_stride, stream);
+#else
+            return gemm::GemmStatus::NOT_SUPPORTED;
+#endif
+        case RecurrentGemmTactic::TMA_128:
+#if OASR_RECURRENT_HAS_TMA
+            return recurrent::RnnStateGemmSm90<recurrent::RecurrentSm90Config128, CutlassType,
+                                               Activation>(output, previous_h, weight_hh,
+                                                           input_gates, batch_size, hidden_size,
+                                                           input_gate_batch_stride, stream);
+#else
+            return gemm::GemmStatus::NOT_SUPPORTED;
+#endif
     }
     return gemm::GemmStatus::NOT_SUPPORTED;
 }
@@ -234,21 +314,18 @@ RecurrentShape CheckCommon(TensorView output, TensorView final_h, TensorView inp
     };
 }
 
-GemmRecurrentShape CheckGemmCommon(TensorView output, TensorView final_h, TensorView workspace,
-                                   TensorView input_gates, TensorView initial_h,
-                                   TensorView weight_hh, Optional bias_hh, int gate_count,
-                                   bool input_batch_first) {
+GemmRecurrentShape CheckGemmCommon(TensorView output, TensorView final_h, TensorView input_gates,
+                                   TensorView initial_h, TensorView weight_hh, Optional bias_hh,
+                                   int gate_count, bool input_batch_first) {
     CHECK_INPUT(input_gates);
     CHECK_CONTIGUOUS_INPUT(input_gates);
     CHECK_DIM(3, input_gates);
     CheckTensorLike(output, input_gates, "output");
     CheckTensorLike(final_h, input_gates, "final_h");
-    CheckTensorLike(workspace, input_gates, "workspace");
     CheckTensorLike(initial_h, input_gates, "initial_h");
     CheckTensorLike(weight_hh, input_gates, "weight_hh");
     CHECK_DIM(3, output);
     CHECK_DIM(2, final_h);
-    CHECK_DIM(2, workspace);
     CHECK_DIM(2, initial_h);
     CHECK_DIM(2, weight_hh);
 
@@ -273,8 +350,6 @@ GemmRecurrentShape CheckGemmCommon(TensorView output, TensorView final_h, Tensor
     TVM_FFI_ICHECK(output.size(0) == sequence_length && output.size(1) == batch_size &&
                    output.size(2) == hidden_size)
         << "tensor-core recurrent output must be time-major (sequence, batch, hidden)";
-    TVM_FFI_ICHECK(workspace.size(0) == batch_size && workspace.size(1) == gate_count * hidden_size)
-        << "workspace must have shape (" << batch_size << ", " << gate_count * hidden_size << ")";
     if (bias_hh.has_value()) {
         TensorView bias = bias_hh.value();
         CheckTensorLike(bias, input_gates, "bias_hh");
@@ -298,20 +373,8 @@ void lstm_layer(TensorView output, TensorView final_h, TensorView final_c, Tenso
                 TensorView weight_hh, Optional bias_ih, Optional bias_hh, bool batch_first) {
     const RecurrentShape shape = CheckCommon(output, final_h, input, initial_h, weight_ih,
                                              weight_hh, bias_ih, bias_hh, 4, batch_first);
-    CheckTensorLike(cells, input, "cells");
-    CheckTensorLike(final_c, input, "final_c");
-    CheckTensorLike(initial_c, input, "initial_c");
-    CHECK_DIM(3, cells);
-    CHECK_DIM(2, final_c);
-    CHECK_DIM(2, initial_c);
-    for (int dim = 0; dim < 3; ++dim) {
-        TVM_FFI_ICHECK(cells.size(dim) == output.size(dim))
-            << "cells must have the same shape as output";
-    }
-    TVM_FFI_ICHECK(initial_c.size(0) == shape.batch_size && initial_c.size(1) == shape.hidden_size)
-        << "initial_c must have shape (" << shape.batch_size << ", " << shape.hidden_size << ")";
-    TVM_FFI_ICHECK(final_c.size(0) == shape.batch_size && final_c.size(1) == shape.hidden_size)
-        << "final_c must have shape (" << shape.batch_size << ", " << shape.hidden_size << ")";
+    CheckCellBuffers(cells, initial_c, final_c, input, shape.sequence_length, shape.batch_size,
+                     shape.hidden_size);
 
     cudaStream_t stream = get_stream(input.device());
     DISPATCH_DLPACK_HALF_DTYPE(input.dtype(), c_type, [&] {
@@ -368,51 +431,43 @@ void lstm_gemm_layer(TensorView output, TensorView final_h, TensorView final_c, 
                      TensorView workspace, TensorView input_gates, TensorView initial_h,
                      TensorView initial_c, TensorView weight_hh, Optional bias_hh,
                      bool input_batch_first, int64_t tactic, int64_t split_k_slices) {
-#if defined(OASR_TARGET_SM) && OASR_TARGET_SM < 80
-    TVM_FFI_ICHECK(false) << "tensor-core recurrent tactics require SM80 or newer";
+#if defined(OASR_TARGET_SM) && OASR_TARGET_SM < 75
+    TVM_FFI_ICHECK(false) << "tensor-core recurrent tactics require SM75 or newer";
 #else
     CheckRecurrentTactic(tactic, split_k_slices);
     TVM_FFI_ICHECK(!bias_hh.has_value())
         << "tensor-core LSTM expects bias_ih + bias_hh in the packed input projection";
-    const GemmRecurrentShape shape =
-        CheckGemmCommon(output, final_h, workspace, input_gates, initial_h, weight_hh, bias_hh, 4,
-                        input_batch_first);
-    CheckTensorLike(cells, input_gates, "cells");
-    CheckTensorLike(final_c, input_gates, "final_c");
-    CheckTensorLike(initial_c, input_gates, "initial_c");
-    CHECK_DIM(3, cells);
-    CHECK_DIM(2, final_c);
-    CHECK_DIM(2, initial_c);
-    for (int dim = 0; dim < 3; ++dim) {
-        TVM_FFI_ICHECK(cells.size(dim) == output.size(dim))
-            << "cells must have the same shape as output";
-    }
-    TVM_FFI_ICHECK(initial_c.size(0) == shape.batch_size && initial_c.size(1) == shape.hidden_size)
-        << "initial_c shape must match initial_h";
-    TVM_FFI_ICHECK(final_c.size(0) == shape.batch_size && final_c.size(1) == shape.hidden_size)
-        << "final_c shape must match final_h";
+    const GemmRecurrentShape shape = CheckGemmCommon(output, final_h, input_gates, initial_h,
+                                                     weight_hh, bias_hh, 4, input_batch_first);
+    CheckCellBuffers(cells, initial_c, final_c, input_gates, shape.sequence_length,
+                     shape.batch_size, shape.hidden_size);
+    CheckTensorLike(workspace, input_gates, "workspace");
+    CHECK_DIM(2, workspace);
+    TVM_FFI_ICHECK(workspace.size(0) == shape.batch_size &&
+                   workspace.size(1) == 4 * shape.hidden_size)
+        << "workspace must have shape (" << shape.batch_size << ", " << 4 * shape.hidden_size
+        << ")";
 
     cudaStream_t stream = get_stream(input_gates.device());
+    const int cell_ring = CellRing(shape.sequence_length);
     DISPATCH_DLPACK_HALF_DTYPE(input_gates.dtype(), c_type, [&] {
         using CutlassType = typename ToCutlassType<c_type>::type;
+        const int64_t state_stride = static_cast<int64_t>(shape.batch_size) * shape.hidden_size;
         for (int timestep = 0; timestep < shape.sequence_length; ++timestep) {
-            c_type* output_t =
-                static_cast<c_type*>(output.data_ptr()) +
-                static_cast<int64_t>(timestep) * shape.batch_size * shape.hidden_size;
+            c_type* output_t = static_cast<c_type*>(output.data_ptr()) +
+                               static_cast<int64_t>(timestep) * state_stride;
             c_type* cell_t = static_cast<c_type*>(cells.data_ptr()) +
-                             static_cast<int64_t>(timestep) * shape.batch_size * shape.hidden_size;
+                             static_cast<int64_t>(timestep % cell_ring) * state_stride;
             const c_type* input_t = static_cast<const c_type*>(input_gates.data_ptr()) +
                                     static_cast<int64_t>(timestep) * shape.input_time_stride;
-            const c_type* previous_h =
-                timestep == 0
-                    ? static_cast<const c_type*>(initial_h.data_ptr())
-                    : static_cast<const c_type*>(output.data_ptr()) +
-                          static_cast<int64_t>(timestep - 1) * shape.batch_size * shape.hidden_size;
+            const c_type* previous_h = timestep == 0
+                                           ? static_cast<const c_type*>(initial_h.data_ptr())
+                                           : static_cast<const c_type*>(output.data_ptr()) +
+                                                 static_cast<int64_t>(timestep - 1) * state_stride;
             const c_type* previous_c =
-                timestep == 0
-                    ? static_cast<const c_type*>(initial_c.data_ptr())
-                    : static_cast<const c_type*>(cells.data_ptr()) +
-                          static_cast<int64_t>(timestep - 1) * shape.batch_size * shape.hidden_size;
+                timestep == 0 ? static_cast<const c_type*>(initial_c.data_ptr())
+                              : static_cast<const c_type*>(cells.data_ptr()) +
+                                    static_cast<int64_t>((timestep - 1) % cell_ring) * state_stride;
             c_type* final_h_ptr = timestep + 1 == shape.sequence_length
                                       ? static_cast<c_type*>(final_h.data_ptr())
                                       : nullptr;
@@ -471,6 +526,29 @@ void lstm_gemm_layer(TensorView output, TensorView final_h, TensorView final_c, 
                     reinterpret_cast<CutlassType*>(workspace.data_ptr()), shape.batch_size,
                     shape.hidden_size, shape.input_batch_stride, shape.hidden_size, stream,
                     static_cast<int>(split_k_slices));
+            } else if (selected == RecurrentGemmTactic::TMA_64) {
+    #if OASR_RECURRENT_HAS_TMA
+                materialized_status = recurrent::LstmStateGemmSm90<recurrent::RecurrentSm90Config64,
+                                                                   CutlassType, c_type>(
+                    output_t, cell_t, final_h_ptr, final_c_ptr,
+                    reinterpret_cast<const CutlassType*>(previous_h),
+                    reinterpret_cast<const CutlassType*>(weight_hh.data_ptr()),
+                    reinterpret_cast<const CutlassType*>(input_t), previous_c,
+                    static_cast<c_type*>(workspace.data_ptr()), shape.batch_size, shape.hidden_size,
+                    shape.input_batch_stride, shape.hidden_size, stream);
+    #endif
+            } else if (selected == RecurrentGemmTactic::TMA_128) {
+    #if OASR_RECURRENT_HAS_TMA
+                materialized_status =
+                    recurrent::LstmStateGemmSm90<recurrent::RecurrentSm90Config128, CutlassType,
+                                                 c_type>(
+                        output_t, cell_t, final_h_ptr, final_c_ptr,
+                        reinterpret_cast<const CutlassType*>(previous_h),
+                        reinterpret_cast<const CutlassType*>(weight_hh.data_ptr()),
+                        reinterpret_cast<const CutlassType*>(input_t), previous_c,
+                        static_cast<c_type*>(workspace.data_ptr()), shape.batch_size,
+                        shape.hidden_size, shape.input_batch_stride, shape.hidden_size, stream);
+    #endif
             } else if (selected == RecurrentGemmTactic::STREAM_K) {
                 materialized_status = RunLstmMaterialized<recurrent::RecurrentConfig32x64, true,
                                                           false, CutlassType, c_type>(
@@ -492,7 +570,7 @@ void lstm_gemm_layer(TensorView output, TensorView final_h, TensorView final_c, 
                     static_cast<int>(split_k_slices));
             }
             if (selected == RecurrentGemmTactic::STREAM_K ||
-                selected == RecurrentGemmTactic::PARALLEL_SPLIT_K) {
+                selected == RecurrentGemmTactic::PARALLEL_SPLIT_K || IsTmaTactic(selected)) {
                 TVM_FFI_ICHECK(materialized_status == cudaSuccess)
                     << "LSTM decomposed GEMM/finalizer failed: "
                     << cudaGetErrorString(materialized_status);
@@ -506,12 +584,12 @@ void lstm_gemm_layer(TensorView output, TensorView final_h, TensorView final_c, 
 #endif
 }
 
-void rnn_gemm_layer(TensorView output, TensorView final_h, TensorView workspace,
-                    TensorView input_gates, TensorView initial_h, TensorView weight_hh,
-                    Optional bias_hh, int64_t activation, bool input_batch_first, int64_t tactic,
+void rnn_gemm_layer(TensorView output, TensorView final_h, TensorView input_gates,
+                    TensorView initial_h, TensorView weight_hh, Optional bias_hh,
+                    int64_t activation, bool input_batch_first, int64_t tactic,
                     int64_t split_k_slices) {
-#if defined(OASR_TARGET_SM) && OASR_TARGET_SM < 80
-    TVM_FFI_ICHECK(false) << "tensor-core recurrent tactics require SM80 or newer";
+#if defined(OASR_TARGET_SM) && OASR_TARGET_SM < 75
+    TVM_FFI_ICHECK(false) << "tensor-core recurrent tactics require SM75 or newer";
 #else
     CheckRecurrentTactic(tactic, split_k_slices);
     TVM_FFI_ICHECK(tactic != static_cast<int64_t>(RecurrentGemmTactic::SERIAL_SPLIT_K))
@@ -520,9 +598,8 @@ void rnn_gemm_layer(TensorView output, TensorView final_h, TensorView workspace,
         << "tensor-core RNN expects bias_ih + bias_hh in the input projection";
     TVM_FFI_ICHECK(activation == 0 || activation == 1)
         << "RNN activation must be 0 (tanh) or 1 (relu), got " << activation;
-    const GemmRecurrentShape shape =
-        CheckGemmCommon(output, final_h, workspace, input_gates, initial_h, weight_hh, bias_hh, 1,
-                        input_batch_first);
+    const GemmRecurrentShape shape = CheckGemmCommon(output, final_h, input_gates, initial_h,
+                                                     weight_hh, bias_hh, 1, input_batch_first);
     cudaStream_t stream = get_stream(input_gates.device());
     DISPATCH_DLPACK_HALF_DTYPE(input_gates.dtype(), c_type, [&] {
         using CutlassType = typename ToCutlassType<c_type>::type;
@@ -571,3 +648,23 @@ void rnn_gemm_layer(TensorView output, TensorView final_h, TensorView workspace,
     });
 #endif
 }
+
+// The gate-major finalizers are the decomposition tactic for a checkpoint-order
+// gate layout: the recurrent GEMM leaves its C operand out and the finalizer
+// sums the two gate tensors itself.  No launcher routes through them yet, and a
+// function template that is never instantiated is never type-checked, so pin
+// both served dtypes here — dead code that does not compile is worse than dead
+// code.
+template cudaError_t oasr::recurrent::LstmGateStep<half>(half*, half*, half*, half*, const half*,
+                                                         const half*, const half*, int, int,
+                                                         int64_t, int64_t, cudaStream_t);
+template cudaError_t oasr::recurrent::LstmGateStep<__nv_bfloat16>(
+    __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, const __nv_bfloat16*,
+    const __nv_bfloat16*, const __nv_bfloat16*, int, int, int64_t, int64_t, cudaStream_t);
+template cudaError_t oasr::recurrent::RnnGateStep<half>(half*, half*, const half*, const half*, int,
+                                                        int, int64_t,
+                                                        oasr::recurrent::RnnActivation,
+                                                        cudaStream_t);
+template cudaError_t oasr::recurrent::RnnGateStep<__nv_bfloat16>(
+    __nv_bfloat16*, __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, int, int, int64_t,
+    oasr::recurrent::RnnActivation, cudaStream_t);

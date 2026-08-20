@@ -21,21 +21,79 @@
 namespace oasr {
 namespace recurrent {
 
-#if defined(OASR_TARGET_SM) && OASR_TARGET_SM == 75
-constexpr int kRecurrentCutlassArch = 75;
+namespace detail {
+
+// Which CUTLASS 2.x composition a JIT target maps onto.
+//
+// These are OpClassTensorOp GEMMs from the CUTLASS 2.x device API, and for
+// FP16/BF16 that API specialises exactly two architecture tags:
+//
+//   Sm75  mma.sync.aligned.m16n8k8, and `kernel::DefaultGemm` specialises the
+//         tensor-op kernel for a *two*-stage pipeline and no other stage count
+//         (cutlass/gemm/kernel/default_gemm.h).
+//   Sm80  mma.sync.aligned.m16n8k16, any stage count.
+//
+// No other tag is usable.  `Sm86` has no `kernel::DefaultGemm` specialisation
+// at all; `Sm89` and `Sm90` do, but `device::DefaultGemmConfiguration`
+// specialises those two for FP8 only, so both are incomplete for half.  Since
+// m16n8k16 is available on every architecture from Ampere up, Ada, Hopper and
+// Blackwell all run the SM80 composition — which also keeps one output-thread
+// mapping for the custom LSTM epilogue to reason about across all of them.
+//
+// Both mappings are compiled for every target the JIT can emit — 75, 80, 86,
+// 89, 90, 100, 103, 120 — across all three configs and both served dtypes, so
+// the two static_asserts below are the only part of this taken on trust.
+template <int Target>
+struct RecurrentArch {
+    static_assert(Target >= 75,
+                  "the recurrent tensor-core path needs SM75 or newer: older targets have no "
+                  "CUTLASS 2.x tensor-op composition, and the CUDA toolkit no longer accepts "
+                  "compute_70 either");
+    // Ampere (80, 86) / Ada (89) / Hopper (90) / Blackwell (100, 103, 120).
+    static constexpr int kCutlassArch = 80;
+    static constexpr int kStages = 3;
+};
+
+// Turing needs its own tag: a narrower MMA and a shallower pipeline.
+template <>
+struct RecurrentArch<75> {
+    static constexpr int kCutlassArch = 75;
+    static constexpr int kStages = 2;
+};
+
+}  // namespace detail
+
+// A JIT build defines OASR_TARGET_SM.  An AOT build compiles one composition
+// covering every arch in CUDA_ARCHITECTURES, where the portable SM80 one is it.
+#if defined(OASR_TARGET_SM)
+constexpr int kRecurrentTargetSm = OASR_TARGET_SM;
 #else
-// mma.sync.m16n8k16 remains available on Hopper and Blackwell.  Using the
-// CUTLASS 2.x SM80 composition also gives the recurrent epilogue one stable
-// output-thread mapping across Ampere through Blackwell.
-constexpr int kRecurrentCutlassArch = 80;
+constexpr int kRecurrentTargetSm = 80;
 #endif
 
+using RecurrentArchTraits = detail::RecurrentArch<kRecurrentTargetSm>;
+constexpr int kRecurrentCutlassArch = RecurrentArchTraits::kCutlassArch;
+constexpr int kRecurrentStages = RecurrentArchTraits::kStages;
+
+// The constraint that made SM75 fail to compile before it was mapped
+// separately: asking the Sm75 tensor-op kernel for three stages selects no
+// specialisation, and the resulting error is an incomplete `DefaultGemm` forty
+// lines deep rather than anything that names the cause.
+static_assert(kRecurrentCutlassArch != 75 || kRecurrentStages == 2,
+              "the CUTLASS 2.x Sm75 tensor-op GEMM is specialised for two pipeline stages only");
+
 using RecurrentConfig16x64 =
-    gemm::CutlassGemmConfig<16, 64, 64, 16, 32, 64, 3, kRecurrentCutlassArch>;
+    gemm::CutlassGemmConfig<16, 64, 64, 16, 32, 64, kRecurrentStages, kRecurrentCutlassArch>;
 using RecurrentConfig32x64 =
-    gemm::CutlassGemmConfig<32, 64, 64, 16, 32, 64, 3, kRecurrentCutlassArch>;
+    gemm::CutlassGemmConfig<32, 64, 64, 16, 32, 64, kRecurrentStages, kRecurrentCutlassArch>;
 using RecurrentConfig64x64 =
-    gemm::CutlassGemmConfig<64, 64, 64, 32, 32, 64, 3, kRecurrentCutlassArch>;
+    gemm::CutlassGemmConfig<64, 64, 64, 32, 32, 64, kRecurrentStages, kRecurrentCutlassArch>;
+
+// The instruction shape rides along with the arch tag in CutlassGemmConfig, so
+// pin the pairing here: a future remap that left SM75 on m16n8k16 would compile
+// and then issue an instruction Turing does not have.
+static_assert(RecurrentConfig16x64::InstructionShape::kK == (kRecurrentCutlassArch == 75 ? 8 : 16),
+              "recurrent instruction shape does not match the selected arch tag");
 
 namespace detail {
 
