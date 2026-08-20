@@ -102,19 +102,18 @@ __global__ void LstmStepKernel(T* __restrict__ output, T* __restrict__ cells,
         const float forget_gate = fastSigmoid(accum[1]);
         const float cell_gate = tanhf(accum[2]);
         const float output_gate = fastSigmoid(accum[3]);
-        const int64_t previous_offset =
-            static_cast<int64_t>(batch) * previous_batch_stride + hidden;
-        const int64_t state_offset = static_cast<int64_t>(batch) * output_batch_stride + hidden;
-        const float cell =
-            forget_gate * toFloat(previous_c[previous_offset]) + input_gate * cell_gate;
+        // The cell ring, the initial cell and the final cell are all
+        // (batch, hidden) contiguous, so one offset addresses every one of them.
+        const int64_t cell_offset = static_cast<int64_t>(batch) * hidden_size + hidden;
+        const int64_t output_offset = static_cast<int64_t>(batch) * output_batch_stride + hidden;
+        const float cell = forget_gate * toFloat(previous_c[cell_offset]) + input_gate * cell_gate;
         const T cell_value = fromFloat<T>(cell);
         const T hidden_value = fromFloat<T>(output_gate * tanhf(cell));
-        cells[state_offset] = cell_value;
-        output[state_offset] = hidden_value;
+        cells[cell_offset] = cell_value;
+        output[output_offset] = hidden_value;
         if (final_h != nullptr) {
-            const int64_t final_offset = static_cast<int64_t>(batch) * hidden_size + hidden;
-            final_h[final_offset] = hidden_value;
-            final_c[final_offset] = cell_value;
+            final_h[cell_offset] = hidden_value;
+            final_c[cell_offset] = cell_value;
         }
     }
 }
@@ -266,19 +265,16 @@ __global__ void LstmCohortStepKernel(
         const float forget_gate = fastSigmoid(accum[1]);
         const float cell_gate = tanhf(accum[2]);
         const float output_gate = fastSigmoid(accum[3]);
-        const int64_t previous_offset =
-            static_cast<int64_t>(batch) * previous_batch_stride + hidden;
+        const int64_t cell_offset = static_cast<int64_t>(batch) * hidden_size + hidden;
         const int64_t output_offset = static_cast<int64_t>(batch) * output_batch_stride + hidden;
-        const float cell =
-            forget_gate * toFloat(previous_c[previous_offset]) + input_gate * cell_gate;
+        const float cell = forget_gate * toFloat(previous_c[cell_offset]) + input_gate * cell_gate;
         const T cell_value = fromFloat<T>(cell);
         const T hidden_value = fromFloat<T>(output_gate * tanhf(cell));
-        cells[output_offset] = cell_value;
+        cells[cell_offset] = cell_value;
         output[output_offset] = hidden_value;
         if (final_h != nullptr) {
-            const int64_t final_offset = static_cast<int64_t>(batch) * hidden_size + hidden;
-            final_h[final_offset] = hidden_value;
-            final_c[final_offset] = cell_value;
+            final_h[cell_offset] = hidden_value;
+            final_c[cell_offset] = cell_value;
         }
     }
 }
@@ -488,16 +484,21 @@ cudaError_t LstmLayerImpl(T* output, T* cells, T* final_h, T* final_c, const T* 
     const size_t cohort_smem = 4 * static_cast<size_t>(input_size + hidden_size) * sizeof(T);
     const bool use_cohort = batch_size >= 8 && cohort_smem <= 48 * 1024;
     const dim3 cohort_grid(hidden_size, (batch_size + cohort_warps - 1) / cohort_warps);
+    // Only cell[t-1] is ever read, so the cell history is a two-slice ring of
+    // (batch, hidden) rather than the whole (sequence, batch, hidden) tensor.
+    const int cell_ring = sequence_length > 1 ? 2 : 1;
+    const int64_t cell_time_stride = static_cast<int64_t>(batch_size) * hidden_size;
     for (int timestep = 0; timestep < sequence_length; ++timestep) {
         T* output_t = output + static_cast<int64_t>(timestep) * output_time_stride;
-        T* cell_t = cells + static_cast<int64_t>(timestep) * output_time_stride;
+        T* cell_t = cells + static_cast<int64_t>(timestep % cell_ring) * cell_time_stride;
         const T* input_t = input + static_cast<int64_t>(timestep) * input_time_stride;
         const T* previous_h =
             timestep == 0 ? initial_h
                           : output + static_cast<int64_t>(timestep - 1) * output_time_stride;
-        const T* previous_c = timestep == 0
-                                  ? initial_c
-                                  : cells + static_cast<int64_t>(timestep - 1) * output_time_stride;
+        const T* previous_c =
+            timestep == 0
+                ? initial_c
+                : cells + static_cast<int64_t>((timestep - 1) % cell_ring) * cell_time_stride;
         const int64_t previous_batch_stride = timestep == 0 ? hidden_size : output_batch_stride;
         T* final_h_t = timestep + 1 == sequence_length ? final_h : nullptr;
         T* final_c_t = timestep + 1 == sequence_length ? final_c : nullptr;

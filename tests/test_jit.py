@@ -104,6 +104,7 @@ class TestJitInfrastructure:
             "activation",
             "norm",
             "pooling",
+            "recurrent",
             "conv",
             "conv2d",
             "cudnn_conv2d",

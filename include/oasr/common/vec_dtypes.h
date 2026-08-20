@@ -41,21 +41,6 @@ __device__ __forceinline__ __nv_bfloat16 fromFloat<__nv_bfloat16>(float value) {
     return __float2bfloat16_rn(value);
 }
 
-template <typename T>
-__device__ __forceinline__ float2 loadPairAsFloat2(const T* ptr) {
-    return make_float2(toFloat(ptr[0]), toFloat(ptr[1]));
-}
-
-template <>
-__device__ __forceinline__ float2 loadPairAsFloat2<half>(const half* ptr) {
-    return __half22float2(*reinterpret_cast<const half2*>(ptr));
-}
-
-template <>
-__device__ __forceinline__ float2 loadPairAsFloat2<__nv_bfloat16>(const __nv_bfloat16* ptr) {
-    return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(ptr));
-}
-
 // =============================================================================
 // Vector Type Traits
 // =============================================================================

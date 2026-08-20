@@ -7,6 +7,7 @@ select an M tile and reduction strategy, so profiling never recompiles code.
 """
 
 import functools
+from typing import Callable, List, Tuple
 
 from oasr.tune.autotuner import BackendEntry, OpKey, Tactic, _global_registry
 
@@ -30,28 +31,55 @@ def _make_runner(function_name: str, tactic: int, split_k_slices: int):
     return get_runner
 
 
-_COMMON_TACTICS = (
-    ("fused_16x64", 0, 1),
-    ("fused_32x64", 1, 1),
-    ("fused_64x64", 2, 1),
-    ("stream_k", 3, 1),
-    ("parallel_split_k_2", 4, 2),
-    ("parallel_split_k_4", 4, 4),
-    ("parallel_split_k_8", 4, 8),
+@functools.cache
+def _has_tma_tactics() -> bool:
+    """Is this device one whose target compiles the CUTLASS 3.x recurrent arms?
+
+    The launcher only builds them for SM90 and SM100 — the two targets whose 3.x
+    OpClassTensorOp builders accept FP16/BF16 — and refuses the tactic ids
+    everywhere else. Gate here so other GPUs never profile a tactic that raises.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor in (90, 100)
+
+
+def _always_available() -> bool:
+    return True
+
+
+#: ``(name, tactic id, split_k_slices, availability predicate)``.
+_TacticSpec = Tuple[str, int, int, Callable[[], bool]]
+
+_COMMON_TACTICS: Tuple[_TacticSpec, ...] = (
+    ("fused_16x64", 0, 1, _always_available),
+    ("fused_32x64", 1, 1, _always_available),
+    ("fused_64x64", 2, 1, _always_available),
+    ("stream_k", 3, 1, _always_available),
+    ("parallel_split_k_2", 4, 2, _always_available),
+    ("parallel_split_k_4", 4, 4, _always_available),
+    ("parallel_split_k_8", 4, 8, _always_available),
+    # CUTLASS 3.x TMA warp-specialized. The collective mainloop owns its own K
+    # pipeline, so these carry no split-K variants.
+    ("tma_64", 6, 1, _has_tma_tactics),
+    ("tma_128", 7, 1, _has_tma_tactics),
 )
 
 
 def _register(op: str, function_name: str, include_serial_split_k: bool) -> None:
-    tactics = list(_COMMON_TACTICS)
+    tactics: List[_TacticSpec] = list(_COMMON_TACTICS)
     if include_serial_split_k:
         tactics.extend(
             (
-                ("serial_split_k_2", 5, 2),
-                ("serial_split_k_4", 5, 4),
-                ("serial_split_k_8", 5, 8),
+                ("serial_split_k_2", 5, 2, _always_available),
+                ("serial_split_k_4", 5, 4, _always_available),
+                ("serial_split_k_8", 5, 8, _always_available),
             )
         )
-    for name, tactic, split_k_slices in tactics:
+    for name, tactic, split_k_slices, is_available in tactics:
         _global_registry.register(
             OpKey("recurrent", op),
             BackendEntry(
@@ -59,7 +87,7 @@ def _register(op: str, function_name: str, include_serial_split_k: bool) -> None
                     "cutlass_recurrent",
                     config=(("name", name), ("split_k_slices", split_k_slices)),
                 ),
-                is_available=lambda: True,
+                is_available=is_available,
                 get_runner=_make_runner(function_name, tactic, split_k_slices),
                 is_fallback=name == "fused_32x64",
             ),

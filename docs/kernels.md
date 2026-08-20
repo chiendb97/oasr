@@ -34,7 +34,7 @@ Python functional API (oasr/<family>.py)  — @oasr_api decorated
 | `include/oasr/norm.cuh` + `norm_dispatch.inc` | LayerNorm, RMSNorm, fused add+LayerNorm/RMSNorm (with optional residual passthrough), BatchNorm1d, GroupNorm, fused norm+activation |
 | `include/oasr/conv/` | `conv1d.cuh` + `conv1d_dispatch.inc` (depthwise with asymmetric padding and optional FSMN mask/residual fusion, pointwise, causal); dense BTC Conv1D is the height-one specialization of the `conv2d.cuh` CUTLASS facade |
 | `include/oasr/pooling.cuh` | BTC AvgPool1D; vectorized 2×2 production specialization plus generic padding/ceil/count semantics |
-| `include/oasr/recurrent/` | LSTM and tanh/ReLU RNN inference: fused GEMV/cohort kernels (`recurrent.cuh`), CUTLASS recurrent GEMM and state epilogues (`recurrent_cutlass.cuh`), and Stream-K/Split-K candidates |
+| `include/oasr/recurrent/` | LSTM and tanh/ReLU RNN inference: fused GEMV/cohort kernels (`recurrent.cuh`), CUTLASS 2.x recurrent GEMM and state epilogues (`recurrent_cutlass.cuh`) with Stream-K/Split-K candidates, and the CUTLASS 3.x TMA warp-specialized path for SM90/SM100 (`recurrent_cutlass_sm90.cuh`) |
 | `include/oasr/gemm/` | `gemm.cuh` facade, `bmm.cuh`, `group_gemm.cuh` |
 | `include/oasr/{softmax,topk,fft,features}.cuh`, `sort/` | The remaining families |
 | `include/oasr/ctc_decoder.cuh`, `include/oasr/wfst/` | GPU decoder kernels |
@@ -76,7 +76,7 @@ VecSize / block_size dispatch macros instead.
 | Norm | **dispatch** | `norm_dispatch.inc` | Direct compilation, block/vec macro |
 | Activation | **dispatch** | `activation_dispatch.inc` | Direct compilation, VecSize macro |
 | Pooling | **direct** | `pooling.cuh` | 128-bit channel vectors in BTC layout; specialized 2×2 and generic launches |
-| Recurrent | **direct + CUTLASS** | `recurrent/recurrent.cuh` + `recurrent/recurrent_cutlass.cuh` | fused low-latency GEMV at small batch, shared-weight batch warps for cohorts, sequence-wide input projection, state epilogues, and autotuned Stream-K/Split-K for wide states |
+| Recurrent | **direct + CUTLASS** | `recurrent/recurrent.cuh` + `recurrent/recurrent_cutlass{,_sm90}.cuh` | fused low-latency GEMV at small batch, shared-weight batch warps for cohorts, sequence-wide input projection, state epilogues, autotuned Stream-K/Split-K for wide states, and TMA warp-specialized collectives on SM90/SM100 |
 
 - **JIT mode** (`OASR_TARGET_SM` defined): a single SM instantiation, with an
   optional `JitGemmConfig` / `JitConv2dConfig` passed via `-D` flags.
@@ -115,12 +115,55 @@ because applying tanh/ReLU to an intermediate K partition is incorrect.
 The direct kernel remains the default for decode-sized and moderate hidden
 states. This is intentional: a tensor-core GEMM can underfill the device at
 small M, and packing/projection plus dependent GEMM launches may cost more than
-the work saved. SM75 also stays on the direct path; the recurrent CUTLASS
-compositions require SM80 or newer. `benchmarks/routines/recurrent.py` exposes
+the work saved. `benchmarks/routines/recurrent.py` exposes
 `native`, `cutlass16`, `cutlass32`, `cutlass64`, `streamk`, `splitk`, and
 `serial_splitk` (LSTM only) arms so architecture-specific crossover changes
 are measured instead of inferred. The focused matrix is
 `benchmarks/testlists/recurrent_tactics.txt`.
+
+**Architecture mapping.** Every target gets a CUTLASS 2.x composition, and
+SM90/SM100 additionally get a 3.x one.
+
+`recurrent_cutlass.cuh` holds the 2.x side. For FP16/BF16 that API specialises
+exactly two arch tags, so every target maps onto one of them:
+
+| JIT target | CUTLASS tag | MMA | Stages |
+|---|---|---|---|
+| 75 (Turing) | `Sm75` | `m16n8k8` | 2 |
+| 80, 86, 89, 90, 100, 103, 120 | `Sm80` | `m16n8k16` | 3 |
+
+Turing needs its own row twice over: a narrower MMA, and a `kernel::DefaultGemm`
+that is specialised for a two-stage pipeline and no other stage count. Nothing
+between the two rows is usable — `Sm86` has no 2.x tensor-op specialisation at
+all, and `Sm89`/`Sm90` have one whose `DefaultGemmConfiguration` covers FP8
+only — so Ada, Hopper and Blackwell all run the SM80 composition, which is
+forward compatible and keeps one epilogue output-thread mapping across them.
+Two `static_assert`s pin the arch/stage and arch/instruction-shape pairings, so
+a remap that would issue an instruction the target lacks fails at compile time
+instead of at decode.
+
+`recurrent_cutlass_sm90.cuh` adds the CUTLASS 3.x collective path — TMA plus
+wgmma on Hopper, tcgen05 on Blackwell datacenter — as two extra tactics,
+`tma_64` (id 6) and `tma_128` (id 7). It is compiled only for targets 90 and
+100, the two whose 3.x `OpClassTensorOp` builders accept FP16/BF16; SM120's is
+restricted to F8/F6/F4, and no `CutlassArch` entry exists for 103. Everywhere
+else the two ids are *refused* rather than rerouted, and the autotuner does not
+offer them. Hopper's cooperative schedule `static_assert`s on an M tile below
+128 rows, so the 64-row tile takes the pingpong schedule; SM100 selects from
+`kSMs` and ignores the flag, which is why one pair of configs covers both.
+
+On the 3.x path the LSTM is *decomposed*: the collective GEMM materialises one
+gate-interleaved tile and the existing finalizer applies the state transition.
+The fused custom epilogue cannot come along — it reconstructs logical
+coordinates from a `PredicatedTileIterator` thread map, and 3.x replaced that
+with cute layouts and an epilogue visitor tree, where a four-gates-to-one-cell
+column reduction is not an elementwise node. The vanilla RNN has one gate, so
+its nonlinearity stays fused in the collective epilogue.
+
+The layer's *automatic* tensor-core selection still requires compute capability
+8.0 (`oasr/layers/recurrent.py`), because the crossover was measured on Ampere
+and later; on Turing the path is reachable through the functional API and the
+autotuner.
 
 ### Conventions
 
