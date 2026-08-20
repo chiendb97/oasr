@@ -30,7 +30,7 @@
 
 #include <cuda_runtime.h>
 
-#include <oasr/reduction.cuh>  // brings in oasr/common/utils.h (WARP_SIZE)
+#include <oasr/common/reduction.h>
 
 namespace oasr {
 namespace features {

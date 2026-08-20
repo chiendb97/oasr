@@ -12,10 +12,10 @@
 #include <cuda_runtime.h>
 
 #include <oasr/common/math.h>
+#include <oasr/common/reduction.h>
 #include <oasr/common/types.h>
 #include <oasr/common/utils.h>
 #include <oasr/common/vec_dtypes.h>
-#include <oasr/reduction.cuh>
 
 namespace oasr {
 namespace norm {

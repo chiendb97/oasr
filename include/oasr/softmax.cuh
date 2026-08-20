@@ -11,10 +11,10 @@
 
 #include <cuda/std/limits>
 #include <oasr/common/math.h>
+#include <oasr/common/reduction.h>
 #include <oasr/common/types.h>
 #include <oasr/common/utils.h>
 #include <oasr/common/vec_dtypes.h>
-#include <oasr/reduction.cuh>
 
 namespace oasr {
 namespace softmax {
@@ -112,7 +112,6 @@ __device__ __forceinline__ float2 blockReduce(float2 val) {
     }
     return val;
 }
-
 
 // One block per row. Two passes: online (max, sum) accumulation, then emit
 // log_softmax(x) = x - row_max - log(sum_exp). The first phase mirrors
