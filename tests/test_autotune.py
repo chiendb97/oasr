@@ -481,7 +481,7 @@ class TestAutotuneContextManager:
 
 
 class TestBackendRegistration:
-    """Verify that the bundled GEMM / Conv2D backends register on import."""
+    """Verify that bundled GEMM, Conv2D, and recurrent backends register."""
 
     def test_gemm_backends_register(self):
         from oasr.tune.backends import gemm as _  # noqa: F401
@@ -502,6 +502,15 @@ class TestBackendRegistration:
         from oasr.tune.backends import conv2d as _  # noqa: F401
 
         assert _global_registry.get_candidates(OpKey("conv", "conv2d"))
+
+    @pytest.mark.parametrize("op", ["lstm", "rnn_tanh", "rnn_relu"])
+    def test_recurrent_backends_register(self, op):
+        from oasr.tune.backends import recurrent as _  # noqa: F401
+
+        candidates = _global_registry.get_candidates(OpKey("recurrent", op))
+        assert candidates
+        assert len({candidate.tactic for candidate in candidates}) == len(candidates)
+        assert _global_registry.get_fallback(OpKey("recurrent", op)) is not None
 
     def test_gemm_has_cutlass_fallback(self):
         from oasr.tune.backends import gemm as _  # noqa: F401

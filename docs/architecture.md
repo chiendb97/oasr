@@ -25,8 +25,8 @@ transducer/AED/LLM loop).
 
 Orthogonal to the seven registries — which are about *what plugs in* — is the
 one about *what every architecture is built from*. Model implementations use
-`oasr.layers`, never `nn.Linear` / `nn.Conv1d` / `nn.AvgPool1d` /
-`nn.LayerNorm` / `nn.Embedding` directly.
+`oasr.layers`, never `nn.Linear` / `nn.Conv1d` / `nn.AvgPool1d` / `nn.LSTM` /
+`nn.RNN` / `nn.LayerNorm` / `nn.Embedding` directly.
 That is what makes a kernel improvement, CUDA-graph capture or a future
 quantized path apply to **every** architecture instead of one. The kernels
 underneath are documented in [kernels.md](kernels.md).
@@ -42,6 +42,7 @@ underneath are documented in [kernels.md](kernels.md).
 | Rotary | `NeoxRotaryEmbedding` + `apply_rotary_pos_emb` for HF-style per-row positions; `RotaryEmbedding` for the complex `freqs_cis` form |
 | Convolution | BTC-native `Conv1d`, `DepthwiseConv1d`, and `PointwiseConv1d`; `DepthwiseConv1d` accepts `(left, right)` padding and an optional fused masked residual for FSMN blocks; NHWC-native `Conv2d` / `Conv2dActivation` |
 | Pooling | BTC-native `AvgPool1d`; the CUDA kernel covers symmetric padding, ceil mode, and include/exclude-pad divisors without transposing the residual stream to BCT |
+| Recurrent | `LSTM` and tanh/ReLU `RNN`; PyTorch-compatible checkpoint parameters with fused CUDA inference and formula-level CPU/fp32 oracles |
 
 ### OASR is the backend; torch is one you select
 

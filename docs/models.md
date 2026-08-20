@@ -273,7 +273,8 @@ sum of encoder and decoder projections before the vocabulary head.
   trained, not a streaming-only device: a query sees its own chunk of
   `num_lookahead_tokens + 1` frames plus `(sliding_window - 1) // chunk` earlier
   ones.
-- `predictor.py` — 2-layer **LSTM** predictor + additive joint
+- `predictor.py` — 2-layer **LSTM** predictor on `oasr.layers.LSTM`'s fused
+  recurrent kernels + additive joint
   `head(relu(enc_proj + dec_proj))` + the language-prompt projector (a 128-wide
   one-hot concatenated onto every encoder frame, with **no residual** — its
   output replaces the hidden state).

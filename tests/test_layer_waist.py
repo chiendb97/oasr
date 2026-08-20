@@ -54,6 +54,8 @@ BANNED = (
     nn.ReLU,
     nn.Sigmoid,
     nn.Tanh,
+    nn.LSTM,
+    nn.RNN,
 )
 
 #: Deliberate exemptions, as ``(architecture, dotted module path) -> reason``.
@@ -288,6 +290,8 @@ def test_eligible_residual_norm_paths_use_fused_waist():
         ("LinearActivation", nn.Linear, (8, 16)),
         ("LayerNorm", nn.LayerNorm, (8,)),
         ("Embedding", nn.Embedding, (10, 8)),
+        ("LSTM", nn.LSTM, (8, 16)),
+        ("RNN", nn.RNN, (8, 16)),
     ],
 )
 def test_layer_parameter_layout_matches_torch(oasr_cls, torch_cls, args):

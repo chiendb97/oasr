@@ -48,6 +48,7 @@ from .norm import (
     RMSNorm,
 )
 from .pooling import AvgPool1d
+from .recurrent import LSTM, RNN
 from .rotary_embedding import NeoxRotaryEmbedding, RotaryEmbedding, apply_rotary_pos_emb
 from .softmax import Softmax
 from .topk import TopK
@@ -108,6 +109,9 @@ __all__ = [
     "QWEN2_RMS_EPS",
     # Pooling
     "AvgPool1d",
+    # Recurrent
+    "LSTM",
+    "RNN",
     # Rotary embedding
     "RotaryEmbedding",
     "NeoxRotaryEmbedding",

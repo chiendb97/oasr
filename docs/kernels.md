@@ -29,13 +29,14 @@ Python functional API (oasr/<family>.py)  — @oasr_api decorated
 
 | Path | Contents |
 |---|---|
-| `include/oasr/common/` | Shared types (`types.h`), vector dtypes (`vec_dtypes.h`), SM dispatch (`arch_dispatch.h`), epilogue functors, math utilities |
+| `include/oasr/common/` | Shared types (`types.h`), scalar/vector dtype conversion (`vec_dtypes.h`), warp/block reduction (`reduction.h`), SM dispatch (`arch_dispatch.h`), epilogue functors, and math utilities |
 | `include/oasr/activation.cuh` | Vectorized exact GELU, sigmoid, tanh, ReLU, GLU, Swish, and Swoosh activations; unary sigmoid/tanh/ReLU also consume regular padded row strides such as channel chunks without a copy |
 | `include/oasr/norm.cuh` + `norm_dispatch.inc` | LayerNorm, RMSNorm, fused add+LayerNorm/RMSNorm (with optional residual passthrough), BatchNorm1d, GroupNorm, fused norm+activation |
 | `include/oasr/conv/` | `conv1d.cuh` + `conv1d_dispatch.inc` (depthwise with asymmetric padding and optional FSMN mask/residual fusion, pointwise, causal); dense BTC Conv1D is the height-one specialization of the `conv2d.cuh` CUTLASS facade |
 | `include/oasr/pooling.cuh` | BTC AvgPool1D; vectorized 2×2 production specialization plus generic padding/ceil/count semantics |
+| `include/oasr/recurrent/` | LSTM and tanh/ReLU RNN inference: fused GEMV/cohort kernels (`recurrent.cuh`), CUTLASS recurrent GEMM and state epilogues (`recurrent_cutlass.cuh`), and Stream-K/Split-K candidates |
 | `include/oasr/gemm/` | `gemm.cuh` facade, `bmm.cuh`, `group_gemm.cuh` |
-| `include/oasr/{softmax,topk,fft,features,reduction}.cuh`, `sort/` | The remaining families |
+| `include/oasr/{softmax,topk,fft,features}.cuh`, `sort/` | The remaining families |
 | `include/oasr/ctc_decoder.cuh`, `include/oasr/wfst/` | GPU decoder kernels |
 | `csrc/<family>.cu` | TVM-FFI launcher |
 | `csrc/<family>_jit_binding.cu` | JIT binding exports |
@@ -75,6 +76,7 @@ VecSize / block_size dispatch macros instead.
 | Norm | **dispatch** | `norm_dispatch.inc` | Direct compilation, block/vec macro |
 | Activation | **dispatch** | `activation_dispatch.inc` | Direct compilation, VecSize macro |
 | Pooling | **direct** | `pooling.cuh` | 128-bit channel vectors in BTC layout; specialized 2×2 and generic launches |
+| Recurrent | **direct + CUTLASS** | `recurrent/recurrent.cuh` + `recurrent/recurrent_cutlass.cuh` | fused low-latency GEMV at small batch, shared-weight batch warps for cohorts, sequence-wide input projection, state epilogues, and autotuned Stream-K/Split-K for wide states |
 
 - **JIT mode** (`OASR_TARGET_SM` defined): a single SM instantiation, with an
   optional `JitGemmConfig` / `JitConv2dConfig` passed via `-D` flags.
@@ -83,6 +85,42 @@ VecSize / block_size dispatch macros instead.
 
 SM targets default to 70, 75, 80, 86, 89, 90, 100, 120 in `CMakeLists.txt`;
 `setup.py` defaults to 70–90 only. Override either with `CUDA_ARCHITECTURES`.
+
+### Recurrent execution paths
+
+The CUDA FP16/BF16 recurrent waist retains two complementary implementations:
+
+- `recurrent/recurrent.cuh` owns the latency path. A CTA computes a complete state row at
+  batch 1, while the cohort specialization stages one output row's weights in
+  shared memory for reuse by several batch warps. Affine accumulation, bias,
+  gate activation, and state writes share a launch.
+- `recurrent/recurrent_cutlass.cuh` owns the throughput path. The input affine is one
+  sequence-wide OASR GEMM. LSTM weights are cached in `[hidden, gate, K]` order,
+  so the four gates for a cell are adjacent; the recurrent CUTLASS epilogue can
+  apply i/f/g/o and write h/c directly. Vanilla RNN uses the common tanh/ReLU
+  CUTLASS epilogue and writes the hidden state directly. Matrix-C and output
+  leading dimensions are independent, so BTC input projections feed the
+  recurrence as strided batch rows without a transpose or intermediate copy.
+
+The recurrent autotuner compares 16/32/64-row M tiles, Stream-K, and parallel
+Split-K. LSTM also exposes serial Split-K: its custom epilogue delays the
+nonlinear state transition until the final K partition and reuses GEMM's
+self-restoring semaphore path, avoiding a workspace clear per timestep.
+Parallel Split-K and
+Stream-K materialize one interleaved LSTM gate tile before the state finalizer;
+this costs one extra launch but is mathematically safe and can expose more SM
+parallelism for a thin M and large K. Vanilla RNN excludes serial Split-K
+because applying tanh/ReLU to an intermediate K partition is incorrect.
+
+The direct kernel remains the default for decode-sized and moderate hidden
+states. This is intentional: a tensor-core GEMM can underfill the device at
+small M, and packing/projection plus dependent GEMM launches may cost more than
+the work saved. SM75 also stays on the direct path; the recurrent CUTLASS
+compositions require SM80 or newer. `benchmarks/routines/recurrent.py` exposes
+`native`, `cutlass16`, `cutlass32`, `cutlass64`, `streamk`, `splitk`, and
+`serial_splitk` (LSTM only) arms so architecture-specific crossover changes
+are measured instead of inferred. The focused matrix is
+`benchmarks/testlists/recurrent_tactics.txt`.
 
 ### Conventions
 
@@ -101,7 +139,7 @@ SM targets default to 70, 75, 80, 86, 89, 90, 100, 120 in `CMakeLists.txt`;
 | `oasr/jit/core.py` | `JitSpec` (static sources) and `JinjaJitSpec` (Jinja-rendered), `gen_jit_spec()`, `gen_jinja_jit_spec()`, `build_and_load()` |
 | `oasr/jit/templates.py` | Jinja2 rendering (`get_template_env()`, `render_template()`) |
 | `oasr/jit/env.py` | Path constants (`OASR_TEMPLATE_DIR`, `OASR_GEN_SRC_DIR`), nvcc flags, `cutlass_version_stamp` |
-| `oasr/jit/<family>.py` | Per-family generators: `gemm`, `conv`, `norm`, `activation`, `pooling`, `softmax`, `topk`, `fft`, `features`, `ctc_decoder`, `wfst_decoder` |
+| `oasr/jit/<family>.py` | Per-family generators: `gemm`, `conv`, `norm`, `activation`, `pooling`, `recurrent`, `softmax`, `topk`, `fft`, `features`, `ctc_decoder`, `wfst_decoder` |
 | `oasr/jit/attention.py` | **Different model** — see below |
 | `oasr/compilation_context.py` | `CompilationContext` detects GPU SMs at import time; pass `supported_major_versions=[...]` to `get_nvcc_flags_list()` for arch-restricted kernels |
 

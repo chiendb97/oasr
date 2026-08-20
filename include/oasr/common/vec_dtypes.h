@@ -9,6 +9,53 @@
 
 namespace oasr {
 
+// Scalar conversion helpers keep the exact CUDA intrinsics used by fused
+// FP16/BF16 kernels instead of relying on implicit host/device conversions.
+template <typename T>
+__device__ __forceinline__ float toFloat(T value) {
+    return static_cast<float>(value);
+}
+
+template <>
+__device__ __forceinline__ float toFloat<half>(half value) {
+    return __half2float(value);
+}
+
+template <>
+__device__ __forceinline__ float toFloat<__nv_bfloat16>(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T fromFloat(float value) {
+    return static_cast<T>(value);
+}
+
+template <>
+__device__ __forceinline__ half fromFloat<half>(float value) {
+    return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 fromFloat<__nv_bfloat16>(float value) {
+    return __float2bfloat16_rn(value);
+}
+
+template <typename T>
+__device__ __forceinline__ float2 loadPairAsFloat2(const T* ptr) {
+    return make_float2(toFloat(ptr[0]), toFloat(ptr[1]));
+}
+
+template <>
+__device__ __forceinline__ float2 loadPairAsFloat2<half>(const half* ptr) {
+    return __half22float2(*reinterpret_cast<const half2*>(ptr));
+}
+
+template <>
+__device__ __forceinline__ float2 loadPairAsFloat2<__nv_bfloat16>(const __nv_bfloat16* ptr) {
+    return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(ptr));
+}
+
 // =============================================================================
 // Vector Type Traits
 // =============================================================================

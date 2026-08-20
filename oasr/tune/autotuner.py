@@ -995,6 +995,7 @@ def _ensure_backends_registered() -> None:
     from .backends import (  # noqa: F401
         conv2d as _conv2d_backends,
         gemm as _gemm_backends,
+        recurrent as _recurrent_backends,
         torch_gemm as _torch_gemm_backends,
     )
 

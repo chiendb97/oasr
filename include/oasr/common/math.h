@@ -22,6 +22,12 @@ __device__ __forceinline__ T sigmoid(T x) {
     return T(1.0f) / (T(1.0f) + expf(-float(x)));
 }
 
+// Explicit fast intrinsic for kernels whose numerical contract was established
+// with --use_fast_math and __expf.
+__device__ __forceinline__ float fastSigmoid(float x) {
+    return 1.0f / (1.0f + __expf(-x));
+}
+
 template <typename T>
 __device__ __forceinline__ T relu(T x) {
     // PyTorch's CUDA ReLU propagates NaN but canonicalizes both signed zeros
