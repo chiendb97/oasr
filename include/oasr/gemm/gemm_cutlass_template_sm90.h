@@ -83,14 +83,18 @@ struct CutlassGemmKernelSm90 {
     using MainloopSchedule = typename CutlassGemmConfig::MainloopSchedule;
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
-    // CUTLASS 3.x fusion operation for epilogue (identity, relu, gelu, swish)
-    using FusionOp =
-        typename FusionEpilogueOpSm90<activation_type, ElementCD, ElementCompute, ElementCD>::type;
+    // D = activation(alpha * (A @ B) + bias[n]).  The bias arrives as a fusion
+    // input rather than the C operand, because the 2.x path's C is a length-N
+    // row with a zero M-stride and TMA has no zero-stride mode.  ElementC is
+    // therefore `void`: there is no source matrix to load, which also means no
+    // TMA descriptor is built over a possibly-null bias pointer.
+    using FusionOp = typename FusionEpilogueOpSm90PerColBias<activation_type, ElementCD,
+                                                            ElementCompute, ElementCD>::type;
 
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         ArchTag, OperatorClass, TileShape, ClusterShape, EpilogueTileType, ElementAccumulator,
-        ElementCompute, ElementCD, LayoutCD, AlignmentEpilogue, ElementCD, LayoutCD,
-        AlignmentEpilogue, EpilogueSchedule, FusionOp>::CollectiveOp;
+        ElementCompute, void, LayoutCD, AlignmentEpilogue, ElementCD, LayoutCD, AlignmentEpilogue,
+        EpilogueSchedule, FusionOp>::CollectiveOp;
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
         ArchTag, OperatorClass, ElementA, LayoutA, AlignmentA, ElementB, LayoutB, AlignmentB,
@@ -109,21 +113,48 @@ struct CutlassGemmKernelSm90 {
     using StrideC = typename Gemm::GemmKernel::StrideC;
     using StrideD = typename Gemm::GemmKernel::StrideD;
 
+    /// Parameter list mirrors the CUTLASS 2.x `CutlassGemmKernel::run`, so the
+    /// two are interchangeable at a dispatch site.  \p C is the length-N bias
+    /// row (or null), \p ldc its unused-but-kept leading dimension.
     static GemmStatus run(const ElementA* A, const ElementB* B, const ElementCD* C, ElementCD* D,
-                          int M, int N, int K, ElementCompute alpha, ElementCompute beta,
-                          cudaStream_t stream) {
-        auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
-        auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
-        auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
-        auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+                          int M, int N, int K, int64_t lda, int64_t ldb, int64_t ldc,
+                          ElementCompute alpha, cudaStream_t stream, int split_k_slices = 1,
+                          bool broadcast_c = true, int64_t ldd = -1) {
+        // A matrix-valued C is different arithmetic from a broadcast bias row,
+        // so refuse it rather than quietly computing the other thing.  (The
+        // recurrent family needs exactly that and builds its own 3.x epilogue
+        // for it: oasr/recurrent/recurrent_cutlass_sm90.cuh.)
+        if (!broadcast_c) {
+            return GemmStatus::NOT_SUPPORTED;
+        }
+        // split_k_slices is accepted and unused on purpose: the collective
+        // mainloop pipelines K itself, so there is no serial or parallel split
+        // to arrange, and the result is the same either way.  Refusing would
+        // break callers for whom this is only ever a performance hint.
+        (void)split_k_slices;
+
+        // Build packed strides so the static and batch modes get the right
+        // types, then substitute the caller's leading dimensions.  Mode 0 is the
+        // dynamic one for A(M,K,L) row-major, B(N,K,L) column-major and
+        // D(M,N,L) row-major alike -- see cutlass/detail/layout.hpp.
+        StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+        StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+        StrideD stride_D =
+            cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+        cute::get<0>(stride_A) = lda;
+        cute::get<0>(stride_B) = ldb;
+        cute::get<0>(stride_D) = (ldd < 0) ? ldc : ldd;
 
         typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGemm,
                                            {M, N, K, 1},  // problem shape (M, N, K, batch=1)
                                            {A, stride_A, B, stride_B},
-                                           {{}, C, stride_C, D, stride_D}};
+                                           {{}, nullptr, StrideC{}, D, stride_D}};
 
         arguments.epilogue.thread.alpha = alpha;
-        arguments.epilogue.thread.beta = beta;
+        // beta multiplies the (absent) source matrix; the bias rides its own
+        // leaf, where a null pointer contributes a literal zero.
+        arguments.epilogue.thread.beta = 0.0f;
+        arguments.epilogue.thread.bias_ptr = C;
 
         Gemm gemm;
 
@@ -286,9 +317,12 @@ struct CutlassGroupGemmKernelSm90 {
     // Group problem shape for variable-size grouped GEMM
     using ProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
 
+    // No C operand: GroupedGemmProblemDesc carries A, B and D only.  void
+    // ElementC also keeps the epilogue from building a TMA descriptor over a C
+    // pointer array that does not exist.
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         ArchTag, OperatorClass, TileShape, ClusterShape, EpilogueTileType, ElementAccumulator,
-        ElementCompute, ElementCD, LayoutCD*, AlignmentEpilogue, ElementCD, LayoutCD*,
+        ElementCompute, void, LayoutCD*, AlignmentEpilogue, ElementCD, LayoutCD*,
         AlignmentEpilogue, EpilogueSchedule, FusionOp>::CollectiveOp;
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -303,10 +337,14 @@ struct CutlassGroupGemmKernelSm90 {
 
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-    using StrideA = typename Gemm::GemmKernel::StrideA;
-    using StrideB = typename Gemm::GemmKernel::StrideB;
-    using StrideC = typename Gemm::GemmKernel::StrideC;
-    using StrideD = typename Gemm::GemmKernel::StrideD;
+    // A grouped kernel's StrideA/B/C/D are *pointer* types -- one stride per
+    // group -- so make_cute_packed_stride cannot be handed them.  The per-group
+    // stride types are the Internal* aliases; the pointer types are what the
+    // Arguments then take, which is exactly `strides_*_device.get()` below.
+    using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+    using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+    using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+    using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 
     static GemmStatus run(GroupedGemmProblemDesc<ElementA, ElementB, ElementCD>& problem_desc,
                           int problem_count, cudaStream_t stream) {
@@ -342,14 +380,16 @@ struct CutlassGroupGemmKernelSm90 {
         typename Gemm::Arguments arguments{
             cutlass::gemm::GemmUniversalMode::kGrouped,
             {problem_count, problem_shapes_device.get(), problem_shapes_host.data()},
-            {reinterpret_cast<const ElementA**>(problem_desc.ptr_A_device.get()),
+            {const_cast<const ElementA**>(problem_desc.ptr_A_device.get()),
              strides_A_device.get(),
-             reinterpret_cast<const ElementB**>(problem_desc.ptr_B_device.get()),
+             const_cast<const ElementB**>(problem_desc.ptr_B_device.get()),
              strides_B_device.get()},
+            // beta = 0 and no C: the epilogue is source-less (void ElementC), so
+            // its C pointer array and stride array are both absent.
             {{1.0f, 0.0f},
              nullptr,
-             strides_D_device.get(),
-             reinterpret_cast<ElementCD**>(problem_desc.ptr_D_device.get()),
+             nullptr,
+             problem_desc.ptr_D_device.get(),
              strides_D_device.get()}};
 
         Gemm gemm;

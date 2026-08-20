@@ -254,13 +254,21 @@ def _default_cuda_cflags() -> List[str]:
     target_sm = _get_target_sm()
     major, minor = _get_cuda_arch()
     sm = major * 10 + minor
+    # Hopper and later need the arch-conditional target ("a").  CUTLASS 3.x
+    # gates every wgmma / tcgen05 atom on __CUDA_ARCH_FEAT_SM90_ALL and friends,
+    # which plain compute_90 does not define: the kernel then *compiles* and
+    # aborts at run time down CUTE_INVALID_CONTROL_PATH ("Arch conditional MMA
+    # instruction used without targeting appropriate compute capability").  Same
+    # rule as CompilationContext.get_nvcc_flags_list, so the JIT and AOT flag
+    # paths agree on the target.
+    arch = f"{sm}a" if major >= 9 else f"{sm}"
     return [
         "-std=c++17",
         "-O3",
         "--use_fast_math",
         "-DENABLE_BF16",
         f"-DOASR_TARGET_SM={target_sm}",
-        f"-gencode=arch=compute_{sm},code=sm_{sm}",
+        f"-gencode=arch=compute_{arch},code=sm_{arch}",
     ]
 
 
