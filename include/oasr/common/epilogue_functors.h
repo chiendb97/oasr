@@ -139,4 +139,46 @@ struct FusionEpilogueOpSm90<oasr::ActivationType::TANH, ElementD, ElementCompute
                                                           ElementCompute, ElementC, ElementCompute>;
 };
 
+//==============================================================================
+// FusionEpilogueOpSm90PerColBias -- alpha * acc + bias[n], then the activation
+//
+// The CUTLASS 2.x path spells a bias as the C operand with a zero M-stride, so
+// one length-N row broadcasts over every row of D.  A 3.x epilogue cannot say
+// that through C: its C operand is a TMA load, and TMA has no zero-stride mode.
+// The 3.x spelling is a fusion input instead, which is also nullptr-safe -- the
+// bias leaf takes a null_default, so a null pointer contributes a literal 0 and
+// one instantiation serves both the biased and the unbiased GEMM.
+//==============================================================================
+
+template <ActivationType fusion_op, typename ElementD, typename ElementCompute,
+          typename ElementBias = ElementD>
+struct FusionEpilogueOpSm90PerColBias {
+    // Default: identity, i.e. no elementwise node above the bias add.
+    using type = cutlass::epilogue::fusion::LinCombPerColBias<ElementD, ElementCompute, ElementBias,
+                                                              void, ElementCompute>;
+};
+
+template <typename ElementD, typename ElementCompute, typename ElementBias>
+struct FusionEpilogueOpSm90PerColBias<oasr::ActivationType::IDENTITY, ElementD, ElementCompute,
+                                      ElementBias> {
+    using type = cutlass::epilogue::fusion::LinCombPerColBias<ElementD, ElementCompute, ElementBias,
+                                                              void, ElementCompute>;
+};
+
+#define OASR_SM90_PER_COL_BIAS_ELT_ACT(ACTIVATION, FN)                                            \
+    template <typename ElementD, typename ElementCompute, typename ElementBias>                   \
+    struct FusionEpilogueOpSm90PerColBias<oasr::ActivationType::ACTIVATION, ElementD,             \
+                                          ElementCompute, ElementBias> {                          \
+        using type = cutlass::epilogue::fusion::LinCombPerColBiasEltAct<                          \
+            FN, ElementD, ElementCompute, ElementBias, void, ElementCompute>;                     \
+    }
+
+OASR_SM90_PER_COL_BIAS_ELT_ACT(RELU, cutlass::epilogue::thread::ReLu);
+OASR_SM90_PER_COL_BIAS_ELT_ACT(GELU, cutlass::epilogue::thread::GELU_taylor);
+OASR_SM90_PER_COL_BIAS_ELT_ACT(GELU_ERF, cutlass::epilogue::thread::GELU);
+OASR_SM90_PER_COL_BIAS_ELT_ACT(SWISH, cutlass::epilogue::thread::SiLu);
+OASR_SM90_PER_COL_BIAS_ELT_ACT(TANH, cutlass::epilogue::thread::Tanh);
+
+#undef OASR_SM90_PER_COL_BIAS_ELT_ACT
+
 }  // namespace oasr

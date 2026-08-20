@@ -3,6 +3,8 @@
 Unit tests for functional GEMM API (TVM-FFI JIT path).
 """
 
+import itertools
+
 import pytest
 import torch
 
@@ -49,6 +51,51 @@ class TestGemm:
         assert result.data_ptr() == out.data_ptr()
         expected = torch.matmul(A, B.T)
         torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
+
+
+class TestGroupGemm:
+    """Tests for oasr.group_gemm() functional API.
+
+    The grouped path had no functional coverage at all, which is how its SM90
+    kernel shipped never having compiled: ``offset`` is the cumulative *end* row
+    of each group, so group ``i`` is ``A[offset[i-1]:offset[i]] @ B[i].T``.
+    """
+
+    @staticmethod
+    def _reference(A, B, rows):
+        start = 0
+        parts = []
+        for group, count in enumerate(rows):
+            parts.append(A[start : start + count] @ B[group].transpose(0, 1))
+            start += count
+        return torch.cat(parts, dim=0)
+
+    @pytest.mark.parametrize("rows", [[32, 16, 48], [64, 64], [8]])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_group_gemm(self, rows, dtype):
+        torch.manual_seed(0)
+        N, K = 128, 64
+        A = torch.randn(sum(rows), K, device="cuda", dtype=dtype)
+        B = torch.randn(len(rows), N, K, device="cuda", dtype=dtype)
+        offset = torch.tensor(list(itertools.accumulate(rows)), device="cuda", dtype=torch.int32)
+
+        D = oasr.group_gemm(A, B, offset)
+
+        torch.testing.assert_close(D, self._reference(A, B, rows), rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_group_gemm_destination_passing(self, dtype):
+        torch.manual_seed(1)
+        rows, N, K = [32, 32], 128, 64
+        A = torch.randn(sum(rows), K, device="cuda", dtype=dtype)
+        B = torch.randn(len(rows), N, K, device="cuda", dtype=dtype)
+        offset = torch.tensor(list(itertools.accumulate(rows)), device="cuda", dtype=torch.int32)
+        out = torch.empty(sum(rows), N, device="cuda", dtype=dtype)
+
+        result = oasr.group_gemm(A, B, offset, out=out)
+
+        assert result.data_ptr() == out.data_ptr()
+        torch.testing.assert_close(result, self._reference(A, B, rows), rtol=1e-2, atol=1e-2)
 
 
 class TestBmm:

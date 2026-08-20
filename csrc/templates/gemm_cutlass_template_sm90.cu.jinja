@@ -62,7 +62,9 @@ void {{ func_name }}(TensorView output, TensorView A, TensorView B, Optional C_o
             C_ptr = reinterpret_cast<const CutlassType*>(C_opt.value().data_ptr());
         }
 
-        float beta = (C_ptr == nullptr) ? 0.0f : 1.0f;
+        int64_t lda = K;
+        int64_t ldb = K;
+        int64_t ldc = N;
 
         auto status = oasr::gemm::CutlassGemmKernelSm90<
             Config, CutlassType, CutlassType, CutlassType,
@@ -71,7 +73,8 @@ void {{ func_name }}(TensorView output, TensorView A, TensorView B, Optional C_o
                 reinterpret_cast<const CutlassType*>(B.data_ptr()),
                 C_ptr,
                 reinterpret_cast<CutlassType*>(output.data_ptr()),
-                M, N, K, 1.0f, beta, stream);
+                M, N, K, lda, ldb, ldc, 1.0f, stream,
+                static_cast<int>(split_k_slices));
         TVM_FFI_ICHECK(status == oasr::gemm::GemmStatus::SUCCESS)
             << "GEMM SM90 kernel failed";
         return true;
@@ -108,7 +111,9 @@ void {{ func_name }}_activation(TensorView output, TensorView A, TensorView B, O
             C_ptr = reinterpret_cast<const CutlassType*>(C_opt.value().data_ptr());
         }
 
-        float beta = (C_ptr == nullptr) ? 0.0f : 1.0f;
+        int64_t lda = K;
+        int64_t ldb = K;
+        int64_t ldc = N;
 
         oasr::gemm::GemmStatus status;
         if (activation == ActivationType::RELU) {
@@ -119,7 +124,8 @@ void {{ func_name }}_activation(TensorView output, TensorView A, TensorView B, O
                     reinterpret_cast<const CutlassType*>(B.data_ptr()),
                     C_ptr,
                     reinterpret_cast<CutlassType*>(output.data_ptr()),
-                    M, N, K, 1.0f, beta, stream);
+                    M, N, K, lda, ldb, ldc, 1.0f, stream,
+                    static_cast<int>(split_k_slices));
         } else if (activation == ActivationType::GELU) {
             status = oasr::gemm::CutlassGemmKernelSm90<
                 Config, CutlassType, CutlassType, CutlassType,
@@ -128,7 +134,8 @@ void {{ func_name }}_activation(TensorView output, TensorView A, TensorView B, O
                     reinterpret_cast<const CutlassType*>(B.data_ptr()),
                     C_ptr,
                     reinterpret_cast<CutlassType*>(output.data_ptr()),
-                    M, N, K, 1.0f, beta, stream);
+                    M, N, K, lda, ldb, ldc, 1.0f, stream,
+                    static_cast<int>(split_k_slices));
         } else if (activation == ActivationType::GELU_ERF) {
             status = oasr::gemm::CutlassGemmKernelSm90<
                 Config, CutlassType, CutlassType, CutlassType,
@@ -137,7 +144,8 @@ void {{ func_name }}_activation(TensorView output, TensorView A, TensorView B, O
                     reinterpret_cast<const CutlassType*>(B.data_ptr()),
                     C_ptr,
                     reinterpret_cast<CutlassType*>(output.data_ptr()),
-                    M, N, K, 1.0f, beta, stream);
+                    M, N, K, lda, ldb, ldc, 1.0f, stream,
+                    static_cast<int>(split_k_slices));
         } else if (activation == ActivationType::SWISH) {
             status = oasr::gemm::CutlassGemmKernelSm90<
                 Config, CutlassType, CutlassType, CutlassType,
@@ -146,7 +154,8 @@ void {{ func_name }}_activation(TensorView output, TensorView A, TensorView B, O
                     reinterpret_cast<const CutlassType*>(B.data_ptr()),
                     C_ptr,
                     reinterpret_cast<CutlassType*>(output.data_ptr()),
-                    M, N, K, 1.0f, beta, stream);
+                    M, N, K, lda, ldb, ldc, 1.0f, stream,
+                    static_cast<int>(split_k_slices));
         } else {
             TVM_FFI_ICHECK(false) << "Unsupported activation type: " << activation_type;
         }

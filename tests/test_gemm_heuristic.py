@@ -353,9 +353,7 @@ class TestGemmLogSoftmaxDispatch:
         cfg = next(
             c
             for c in get_unique_compile_configs(_SM).values()
-            if isinstance(c, CutlassGemmConfig)
-            and not getattr(c, "stream_k", False)
-            and not getattr(c, "parallel_split_k", False)
+            if not getattr(c, "stream_k", False) and not getattr(c, "parallel_split_k", False)
         )
         monkeypatch.setattr(jg, "select_default_config", lambda *a, **k: cfg)
 
@@ -399,8 +397,7 @@ class TestBmmDispatch:
         cfg = next(
             c
             for c in get_unique_compile_configs(_SM).values()
-            if isinstance(c, CutlassGemmConfig)
-            and not getattr(c, "stream_k", False)
+            if not getattr(c, "stream_k", False)
             and not getattr(c, "parallel_split_k", False)
             and c.compile_name != GEMM_DEFAULT.compile_name
         )
@@ -414,3 +411,27 @@ class TestBmmDispatch:
         A, B, ref = self._mk(N=120, K=40)
         out = oasr.bmm(A, B)
         torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-1)
+
+
+class TestDefaultConfigIsBuildable:
+    """The un-autotuned default must be a variant the JIT module compiles.
+
+    The module renders exactly ``get_all_autotune_configs(sm)`` and the
+    functional API looks the default up by ``compile_name``, so a default
+    outside that set raises ``AttributeError: Module has no function ...`` on the
+    first un-tuned call -- on a GPU nobody in CI has.  Two targets were broken
+    this way: SM90's default named a 1x1 cluster the generator never emits, and
+    SM75's named a 3-stage variant when CUTLASS fixes its Sm75 tensor-op kernel
+    at two stages.  Pure Python, so it runs on any device.
+    """
+
+    @pytest.mark.parametrize("sm", [75, 80, 86, 89, 90, 100, 120])
+    def test_default_config_is_generated_for_sm(self, sm):
+        from oasr.jit.gemm import default_config_for_sm, get_all_autotune_configs
+
+        default = default_config_for_sm(sm)
+        generated = get_all_autotune_configs(sm)
+        assert default.compile_name in generated, (
+            f"SM{sm} default {default.compile_name!r} is not among the "
+            f"{len(generated)} generated variants"
+        )

@@ -111,7 +111,11 @@ def _dispatch_gemm(out, A, B, C, N, K, M) -> None:
 
             torch_gemm(out.reshape(M, N), A.reshape(M, K), B, C, 1)
         else:
-            _gemm_fn(choice.compile_name, False)(out, A, B, C, choice.split_k)
+            # See the note in _dispatch_gemm_log_softmax: split_k is a 2.x
+            # field, absent on the SM90+ configs, and the bare except below
+            # turned reading it into a silent fall-through to GEMM_DEFAULT --
+            # which made the whole shape-aware rule table inert on Hopper.
+            _gemm_fn(choice.compile_name, False)(out, A, B, C, getattr(choice, "split_k", 1))
         return
     except Exception:
         pass
@@ -127,7 +131,9 @@ def _dispatch_gemm_activation(out, A, B, C, activation_type, N, K, M) -> None:
 
             torch_gemm_activation(out.reshape(M, N), A.reshape(M, K), B, C, activation_type, 1)
         else:
-            _gemm_fn(choice.compile_name, True)(out, A, B, C, activation_type, choice.split_k)
+            _gemm_fn(choice.compile_name, True)(
+                out, A, B, C, activation_type, getattr(choice, "split_k", 1)
+            )
         return
     except Exception:
         pass
@@ -199,7 +205,12 @@ def _dispatch_gemm_log_softmax(out, A, B, C, N, K, M) -> None:
             torch_gemm_log_softmax(out.reshape(M, N), A.reshape(M, K), B, C, 1)
             return
         if choice != "fused" and choice is not GEMM_DEFAULT:
-            _gemm_fn(choice.compile_name, False)(out, A, B, C, choice.split_k)
+            # split_k is a CUTLASS 2.x field; the SM90+ configs have no such
+            # knob (their collective mainloop pipelines K itself).  Reading it
+            # unconditionally raised AttributeError on SM90, which the bare
+            # ``except`` below turned into a silent fall-through to the fused
+            # launcher -- so the composed path simply did not exist on Hopper.
+            _gemm_fn(choice.compile_name, False)(out, A, B, C, getattr(choice, "split_k", 1))
             # The online log_softmax kernel normalises the trailing dim, so it
             # takes the N-D buffer as-is.
             _log_softmax_inplace(out)
