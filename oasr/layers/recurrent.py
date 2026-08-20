@@ -33,6 +33,15 @@ _TENSOR_CORE_BATCH_FLOOR = 16
 
 @lru_cache(maxsize=None)
 def _supports_recurrent_tensor_core(device_index: int) -> bool:
+    """Should this device's LSTM/RNN reach for the tensor-core path *by default*?
+
+    The kernels themselves go back to SM75 (`recurrent_cutlass.cuh` maps Turing
+    onto its own two-stage `m16n8k8` composition), but the crossover this gate
+    encodes was measured on Ampere and later. Turing's narrower MMA moves that
+    crossover by an unmeasured amount, so it is not selected automatically —
+    `oasr.lstm_gemm_layer` / `oasr.rnn_gemm_layer` and the autotuner still reach
+    it there.
+    """
     major, _ = torch.cuda.get_device_capability(device_index)
     return major >= 8
 
@@ -246,19 +255,18 @@ class _RecurrentBase(nn.Module):
         if input.dim() not in (2, 3):
             raise ValueError(f"recurrent input must be 2-D or 3-D, got {input.dim()}-D tensor")
         unbatched = input.dim() == 2
-        if unbatched:
-            if input.shape[-1] != self.input_size:
-                raise RuntimeError(
-                    f"input.size(-1) must equal input_size. Expected {self.input_size}, "
-                    f"got {input.shape[-1]}"
-                )
-            # Unbatched input is always (T, C); batch_first has no effect.
-            return input.unsqueeze(1), 1, True, False
         if input.shape[-1] != self.input_size:
             raise RuntimeError(
                 f"input.size(-1) must equal input_size. Expected {self.input_size}, "
                 f"got {input.shape[-1]}"
             )
+        # The launcher takes strided batch/time rows but requires the tensor
+        # itself to be contiguous, while nn.LSTM accepts any view.  Materialize
+        # here so a BTC view of a TBC tensor behaves the same as it does in torch.
+        input = input.contiguous()
+        if unbatched:
+            # Unbatched input is always (T, C); batch_first has no effect.
+            return input.unsqueeze(1), 1, True, False
         batch_size = input.shape[0 if self.batch_first else 1]
         return input, batch_size, False, self.batch_first
 
@@ -279,7 +287,11 @@ class _RecurrentBase(nn.Module):
             return input.new_zeros(self.num_layers, batch_size, self.hidden_size)
         if tuple(state.shape) != expected:
             raise RuntimeError(f"Expected {name} size {expected}, got {tuple(state.shape)}")
-        return state.unsqueeze(1) if unbatched else state
+        state = state.unsqueeze(1) if unbatched else state
+        # Each per-layer slice reaches the launcher directly, so the stack has to
+        # be contiguous for `state[layer]` to be.  A state threaded through
+        # `unstack_states` is a non-contiguous view of a wider batch.
+        return state.contiguous()
 
     def _drop_between_layers(self, output: torch.Tensor, layer: int) -> torch.Tensor:
         if self.dropout and self.training and layer + 1 < self.num_layers:

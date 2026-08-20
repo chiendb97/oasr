@@ -119,10 +119,19 @@
         "identical error counts \u2014 which is the property that had to be earned:",
         "the first measurement was 2.70% at bs16 and 2.62% at bs1, and the",
         "difference was a fused-attention defect on -inf mask floors, not noise",
-        "(see oasr/models/nemotron/encoder.py::MASK_FLOOR). float32 gives 2.59%",
-        "(one fewer deletion), so the fp16 cost is ~0.03 absolute.",
+        "(see oasr/models/nemotron/encoder.py::MASK_FLOOR). At the time float32",
+        "gave 2.59% against fp16's 2.62, one fewer deletion.",
         "Decoded with the checkpoint's own default language prompt (slot 101,",
-        "'auto'); pinning en-US does not change this manifest's rate."
+        "'auto'); pinning en-US does not change this manifest's rate.",
+        "",
+        "Re-recorded 2026-08-20 at 2.59 (was 2.62), one fewer deletion, when the",
+        "predictor's LSTM moved from nn.LSTM to oasr.layers.LSTM. Not noise and",
+        "not a defect: the fused kernel accumulates both gate dot products in",
+        "fp32 (float accum[4] + fmaf) where cuDNN's fp16 path does not, so fp16",
+        "now lands on the fp32 rate recorded above. Measured twice, before and",
+        "after the finalizer/cell-ring changes in the same branch, with",
+        "identical error counts (69S 8D 11I) all four times \u2014 so the 0.03 is the",
+        "accumulation precision and nothing else."
       ],
       "key": "nemotron",
       "asset": "NEMOTRON_CKPT",
@@ -132,10 +141,10 @@
       "max_batch_size": 16,
       "metric": "wer",
       "normalizer": "english",
-      "error_rate_pct": 2.62,
+      "error_rate_pct": 2.59,
       "ref_units": 3403,
       "substitutions": 69,
-      "deletions": 9,
+      "deletions": 8,
       "insertions": 11
     },
     {
@@ -165,7 +174,11 @@
         "flush depending on utterance length (42 deletions at chunk_size 4), and a",
         "CUDA-graph *capture* invalidates an earlier replay's output buffer, not",
         "just a later replay at the same key (5 of 40 utterances lost their",
-        "trailing words). See .artifacts/kernel_coverage.md 12a."
+        "trailing words). See .artifacts/kernel_coverage.md 12a.",
+        "",
+        "Re-recorded 2026-08-20 at 2.41 (was 2.44), one fewer deletion, for the",
+        "same reason as the offline row above: the fused LSTM predictor",
+        "accumulates its gates in fp32. See that entry."
       ],
       "key": "nemotron_streaming",
       "asset": "NEMOTRON_CKPT",
@@ -177,10 +190,10 @@
       "max_batch_size": 16,
       "metric": "wer",
       "normalizer": "english",
-      "error_rate_pct": 2.44,
+      "error_rate_pct": 2.41,
       "ref_units": 3403,
       "substitutions": 66,
-      "deletions": 6,
+      "deletions": 5,
       "insertions": 11
     },
     {

@@ -72,6 +72,25 @@ def _output_shape(input: torch.Tensor, hidden_size: int) -> Tuple[int, int, int]
     return (input.shape[0], input.shape[1], hidden_size)
 
 
+def _cell_ring(
+    input: torch.Tensor,
+    sequence_length: int,
+    batch_size: int,
+    hidden_size: int,
+    final_c: torch.Tensor,
+) -> torch.Tensor:
+    """Scratch cell history: ``(slices, batch, hidden)``, time-major always.
+
+    Only ``cell[t-1]`` is ever read, so two slices suffice however long the
+    sequence is.  A single-timestep sequence needs one, and the RNNT hot path is
+    exactly that: reuse ``final_c`` as that slice, avoiding an otherwise
+    needless allocator round-trip.
+    """
+    if sequence_length == 1:
+        return final_c.unsqueeze(0)
+    return input.new_empty(2, batch_size, hidden_size)
+
+
 def _combined_bias(
     bias_ih: Optional[torch.Tensor], bias_hh: Optional[torch.Tensor]
 ) -> Optional[torch.Tensor]:
@@ -184,7 +203,7 @@ def lstm_layer(
     are always ``(batch, hidden)``.  CUDA FP16/BF16 is the intended serving
     scope.  The higher-level :class:`oasr.layers.LSTM` owns CPU/fp32 fallback.
     """
-    _, batch_size, hidden_size = _check_layer_inputs(
+    sequence_length, batch_size, hidden_size = _check_layer_inputs(
         input, initial_h, weight_ih, weight_hh, bias_ih, bias_hh, 4, batch_first
     )
     if tuple(initial_c.shape) != (batch_size, hidden_size):
@@ -199,12 +218,7 @@ def lstm_layer(
         final_h = input.new_empty(batch_size, hidden_size)
     if final_c is None:
         final_c = input.new_empty(batch_size, hidden_size)
-    # The RNNT hot path is one timestep.  Reuse final_c as that timestep's
-    # cell workspace, avoiding an otherwise needless allocator round-trip.
-    if input.shape[1 if batch_first else 0] == 1:
-        cells = final_c.unsqueeze(1 if batch_first else 0)
-    else:
-        cells = input.new_empty(shape)
+    cells = _cell_ring(input, sequence_length, batch_size, hidden_size, final_c)
     _get_recurrent_module().lstm_layer(
         out,
         final_h,
@@ -312,11 +326,7 @@ def lstm_gemm_layer(
         final_h = input.new_empty(batch_size, hidden_size)
     if final_c is None:
         final_c = input.new_empty(batch_size, hidden_size)
-    cells = (
-        final_c.unsqueeze(0)
-        if sequence_length == 1
-        else input.new_empty(sequence_length, batch_size, hidden_size)
-    )
+    cells = _cell_ring(input, sequence_length, batch_size, hidden_size, final_c)
     workspace = input.new_empty(batch_size, 4 * hidden_size)
     runner_args = (
         output,
@@ -373,11 +383,9 @@ def rnn_gemm_layer(
     output = input.new_empty(sequence_length, batch_size, hidden_size)
     if final_h is None:
         final_h = input.new_empty(batch_size, hidden_size)
-    workspace = input.new_empty(batch_size, hidden_size)
     runner_args = (
         output,
         final_h,
-        workspace,
         input_gates,
         initial_h,
         weight_hh,
