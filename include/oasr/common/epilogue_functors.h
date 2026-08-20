@@ -133,4 +133,10 @@ struct FusionEpilogueOpSm90<oasr::ActivationType::SWISH, ElementD, ElementComput
                                                           ElementCompute, ElementC, ElementCompute>;
 };
 
+template <typename ElementD, typename ElementCompute, typename ElementC>
+struct FusionEpilogueOpSm90<oasr::ActivationType::TANH, ElementD, ElementCompute, ElementC> {
+    using type = cutlass::epilogue::fusion::LinCombEltAct<cutlass::epilogue::thread::Tanh, ElementD,
+                                                          ElementCompute, ElementC, ElementCompute>;
+};
+
 }  // namespace oasr

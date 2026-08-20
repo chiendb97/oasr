@@ -31,6 +31,10 @@
 #include <cutlass/epilogue/collective/collective_builder.hpp>
 #include <cutlass/epilogue/fusion/operations.hpp>
 #include <cutlass/gemm/collective/collective_builder.hpp>
+// Declares cutlass::make_cute_packed_stride, used below.  Qualified lookup
+// happens at parse time even inside a template, so without this every
+// translation unit that merely includes this header failed to build.
+#include <cutlass/util/packed_stride.hpp>
 
 #include <cute/tensor.hpp>
 

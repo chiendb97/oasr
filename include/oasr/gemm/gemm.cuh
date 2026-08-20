@@ -52,10 +52,10 @@ static GemmStatus dispatchGemmWithSmVersion(const ElementA* A_ptr, const Element
         return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
 #if !defined(OASR_TARGET_SM) || OASR_TARGET_SM == 90 || OASR_TARGET_SM == 100
     } else if constexpr (SM_VERSION == 90) {
-        using Config = CutlassGemmConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 90>;
+        using Config = CutlassGemmConfigSm90<128, 128, 64, 1, 1, 1, 3, 90>;
         return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
     } else if constexpr (SM_VERSION == 100) {
-        using Config = CutlassGemmConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 100>;
+        using Config = CutlassGemmConfigSm90<128, 128, 64, 1, 1, 1, 3, 100>;
         return CutlassGemmKernelSm90<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
 #endif
     } else if constexpr (SM_VERSION == 120) {
