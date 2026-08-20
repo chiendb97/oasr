@@ -52,6 +52,7 @@ enum class ActivationType {
     SWISH = 2,  // SiLU
     IDENTITY = 3,
     GELU_ERF = 4,  // exact-erf formulation
+    TANH = 5,      // recurrent-cell epilogues
 };
 
 // Normalization types

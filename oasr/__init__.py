@@ -89,9 +89,12 @@ from .functionals.norm import (
     rms_norm_activation,
 )
 from .functionals.pooling import avg_pool1d
+from .functionals.recurrent import lstm_gemm_layer, lstm_layer, rnn_gemm_layer, rnn_layer
 from .functionals.softmax import log_softmax, softmax
 from .functionals.topk import topk
 from .layers import (
+    LSTM,
+    RNN,
     AddLayerNorm,
     AddRMSNorm,
     AvgPool1d,
@@ -230,6 +233,10 @@ __all__ = [
     "batch_norm_swish",
     "cmvn",
     "avg_pool1d",
+    "lstm_layer",
+    "rnn_layer",
+    "lstm_gemm_layer",
+    "rnn_gemm_layer",
     "depthwise_conv1d",
     "conv1d",
     "conv1d_activation",
@@ -247,6 +254,9 @@ __all__ = [
     "topk",
     "rfft",
     "rfft_power",
+    # Recurrent modules
+    "LSTM",
+    "RNN",
     # Feature extraction (batched)
     "fbank_batch",
     "mfcc_batch",

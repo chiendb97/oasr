@@ -13,6 +13,7 @@
     #pragma GCC diagnostic ignored "-Wunused-parameter"
 #endif
 
+#include <cutlass/epilogue/thread/activation.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/epilogue/thread/linear_combination_gelu.h>
 #include <cutlass/epilogue/thread/linear_combination_generic.h>
@@ -79,6 +80,14 @@ struct FusionEpilogueOp<ActivationType::SWISH, Alignment, ElementD, ElementCompu
     using type = cutlass::epilogue::thread::LinearCombinationSilu<
         ElementD, Alignment, ElementCompute, ElementCompute,
         cutlass::epilogue::thread::ScaleType::Default>;
+};
+
+template <int Alignment, typename ElementD, typename ElementCompute, typename ElementC>
+struct FusionEpilogueOp<ActivationType::TANH, Alignment, ElementD, ElementCompute, ElementC> {
+    using type = cutlass::epilogue::thread::LinearCombinationGeneric<
+        cutlass::epilogue::thread::Tanh, ElementD, Alignment, ElementCompute, ElementCompute,
+        cutlass::epilogue::thread::ScaleType::Default, cutlass::FloatRoundStyle::round_to_nearest,
+        true>;
 };
 
 //==============================================================================

@@ -392,6 +392,22 @@ def use_pooling_kernel(x: torch.Tensor) -> bool:
     return True
 
 
+def use_recurrent_kernel(x: torch.Tensor) -> bool:
+    """Should an LSTM/RNN run through the fused recurrent kernels?
+
+    The recurrent family covers every positive unidirectional shape in CUDA
+    FP16/BF16.  CPU/fp32 remains the formula-level parity path; an in-scope
+    refusal is therefore an error, not a silent framework fallback.
+    """
+    if layers_backend() == "torch":
+        return False
+    if not x.is_cuda:
+        return out_of_scope("CPU tensor")
+    if x.dtype not in SERVED_DTYPES:
+        return out_of_scope(f"dtype {x.dtype}")
+    return True
+
+
 def use_fmha_kernel() -> bool:
     """Is the OASR attention kernel selectable at all?"""
     return layers_backend() != "torch"
@@ -421,4 +437,5 @@ __all__ = [
     "use_gemm_kernel",
     "use_norm_kernel",
     "use_pooling_kernel",
+    "use_recurrent_kernel",
 ]

@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from oasr.layers import (
+    LSTM,
     ColumnParallelLinear,
     Embedding,
     Linear,
@@ -76,9 +77,7 @@ class NemotronRnntPredictor(TransducerPredictor):
         self.num_layers = num_layers
         self.blank_id = blank_id
         self.embedding = Embedding(vocab_size, hidden_size)
-        # The layer waist has no LSTM implementation; this recurrent decoder
-        # therefore remains on the framework implementation.
-        self.lstm = nn.LSTM(
+        self.lstm = LSTM(
             input_size=hidden_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
