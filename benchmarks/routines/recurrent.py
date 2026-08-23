@@ -18,7 +18,7 @@ from benchmarks.routines.bench_utils import (
 )
 from oasr.layers import LSTM, RNN
 
-SUBROUTINES = ["lstm", "rnn_tanh", "rnn_relu"]
+SUBROUTINES = ["lstm", "rnn_tanh", "rnn_relu", "lstm_slot_step"]
 
 # The first three rows are the Nemotron prediction-network operating point as
 # decode cohorts fill.  The remaining rows span recurrent sequence workloads
@@ -33,6 +33,18 @@ _SHAPES = [
     (16, 64, 1024, 1),
 ]
 
+# The slot step is one timestep by construction, so it sweeps the batch instead
+# of the sequence: it exists for continuous batching, where the interesting axis
+# is how many concurrent streams a tick carries.
+_SLOT_SHAPES = [
+    (1, 1, 640, 1),
+    (8, 1, 640, 1),
+    (32, 1, 640, 1),
+    (128, 1, 640, 1),
+    (32, 1, 256, 1),
+    (32, 1, 1024, 1),
+]
+
 DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
     subroutine: [
         {
@@ -42,7 +54,9 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
             "hidden_size": hidden,
             "num_layers": layers,
         }
-        for batch, sequence, hidden, layers in _SHAPES
+        for batch, sequence, hidden, layers in (
+            _SLOT_SHAPES if subroutine == "lstm_slot_step" else _SHAPES
+        )
     ]
     for subroutine in SUBROUTINES
 }
@@ -97,6 +111,56 @@ def _setup(
     num_layers = config["num_layers"]
     x = torch.randn(batch, sequence, input_size, device="cuda", dtype=dtype)
     h = torch.randn(num_layers, batch, hidden_size, device="cuda", dtype=dtype)
+
+    if subroutine == "lstm_slot_step":
+        # Slots deliberately exceed the row count so the gather is a real
+        # scattered read, as it is when streams retire and are replaced.
+        slots = max(2 * batch, batch + 1)
+        ours = LSTM(input_size, hidden_size, num_layers=1, device="cuda", dtype=dtype).eval()
+        weight_ih = ours.weight_ih_l0
+        weight_hh = ours.weight_hh_l0
+        bias_ih, bias_hh = ours._biases(0)
+        frames = torch.randn(batch, input_size, device="cuda", dtype=dtype)
+        slot_ids = torch.randperm(slots, device="cuda")[:batch].to(torch.int64)
+        # Mixed parity is the realistic case: rows admitted at different ticks
+        # have taken different numbers of steps.
+        parity = torch.randint(0, 2, (batch,), device="cuda", dtype=torch.int32)
+        base_ring = torch.randn(2, slots, hidden_size, device="cuda", dtype=dtype) * 0.2
+        base_cells = torch.randn(slots, hidden_size, device="cuda", dtype=dtype) * 0.2
+        # Each arm gets its own copy of identical state.  Both mutate it in place
+        # and compute the same function, so they stay in step across iterations
+        # while neither can perturb the other's reference.
+        ring, cells = base_ring.clone(), base_cells.clone()
+        ring_ref, cells_ref = base_ring.clone(), base_cells.clone()
+        long_parity = parity.long()
+
+        # Both arms are read-modify-write on cell state, so a call is not pure and
+        # repeated calls would drift.  Each restores from the pristine copy first,
+        # which costs both arms the same two small copies and keeps the reference
+        # comparison valid however many times the harness invokes either one.
+        @torch.no_grad()
+        def slot_fn():
+            ring.copy_(base_ring)
+            cells.copy_(base_cells)
+            return oasr.lstm_slot_step(
+                frames, ring, cells, slot_ids, parity, weight_ih, weight_hh, bias_ih, bias_hh
+            )
+
+        @torch.no_grad()
+        def gather_fn():
+            """What the same tick costs without a slot-addressed kernel."""
+            ring_ref.copy_(base_ring)
+            cells_ref.copy_(base_cells)
+            h = ring_ref[long_parity, slot_ids].contiguous()
+            c = cells_ref.index_select(0, slot_ids).contiguous()
+            out, final_h, final_c = oasr.lstm_layer(
+                frames.unsqueeze(0), h, c, weight_ih, weight_hh, bias_ih, bias_hh
+            )
+            ring_ref[1 - long_parity, slot_ids] = final_h
+            cells_ref.index_copy_(0, slot_ids, final_c)
+            return out[0]
+
+        return {"oasr": slot_fn, "gather": gather_fn}, gather_fn
 
     if subroutine == "lstm":
         ours = LSTM(
@@ -269,8 +333,14 @@ def _setup(
 
 
 def _assert_close(subroutine: str, actual, expected) -> float:
-    actual_tensors = (actual[0], *actual[1]) if subroutine == "lstm" else actual
-    expected_tensors = (expected[0], *expected[1]) if subroutine == "lstm" else expected
+    if subroutine == "lstm":
+        actual_tensors = (actual[0], *actual[1])
+        expected_tensors = (expected[0], *expected[1])
+    elif subroutine == "lstm_slot_step":
+        # One dense tensor, not a state tuple.
+        actual_tensors, expected_tensors = (actual,), (expected,)
+    else:
+        actual_tensors, expected_tensors = actual, expected
     max_diff = 0.0
     for got, ref in zip(actual_tensors, expected_tensors):
         max_diff = max(max_diff, (got.float() - ref.float()).abs().max().item())
@@ -279,7 +349,7 @@ def _assert_close(subroutine: str, actual, expected) -> float:
 
 
 def _flops(subroutine: str, config: dict[str, Any]) -> int:
-    gates = 4 if subroutine == "lstm" else 1
+    gates = 4 if subroutine.startswith("lstm") else 1
     batch = config["batch"]
     sequence = config["seq"]
     hidden = config["hidden_size"]

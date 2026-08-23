@@ -15,7 +15,7 @@ import math
 import numbers
 import warnings
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, cast
 
 import torch
 import torch.nn.functional as F
@@ -25,10 +25,76 @@ import oasr
 
 from ._backend import use_recurrent_kernel
 
-# Scalar fused GEMV wins decode-sized cohorts because it avoids packing and
-# intermediate gates.  At 16+ rows tensor cores amortize those costs and avoid
-# re-reading every recurrent weight once per batch row.
-_TENSOR_CORE_BATCH_FLOOR = 16
+if TYPE_CHECKING:  # pragma: no cover
+    from oasr.cache.recurrent_state import RecurrentStateCache
+
+# Where the scalar path stops winning.
+#
+# The two paths differ in *what work they repeat*, not only in whether they use
+# MMA.  The scalar path fuses one timestep into a single launch, so it re-reads
+# every weight and recomputes the whole input projection once per timestep.  The
+# tensor-core path evaluates the input projection once for the entire sequence as
+# one fat GEMM and leaves only the dependent recurrent affine per timestep.  That
+# makes the crossover depend on the sequence length as much as on the batch:
+#
+#   * At T == 1 there is no repetition to amortize, and the scalar kernel's one
+#     launch beats the tensor-core path's GEMM + step + finalizer until the step
+#     itself is big enough to fill the device.  Crossover is at a large B*H.
+#   * At T > 1 the scalar path pays the input projection T times at roughly
+#     10 TFLOP/s while the tensor-core path pays it once at over 100, so the
+#     crossover collapses to a much smaller B*H.
+#
+# The thresholds below are the measured crossovers on SM120 (RTX 5090, FP16 and
+# BF16, GPU-only time via CUDA-graph replay) over B in [1, 512] and H in
+# [256, 2048].  They replace a `B >= 16 and H >= 1024` guess that sent every
+# H < 1024 shape to the scalar path at every batch size: at B=512, H=640 --
+# Nemotron's predictor width -- that guess cost 10.5x (7.34 ms against 0.70 ms).
+#
+# The RNN crossover sits at a larger batch than the LSTM one because a single
+# gate is a quarter of the arithmetic per timestep, so the tensor-core path's
+# extra launches amortize later.
+#
+# A single `B * hidden` product does not fit the measurements: the crossover
+# batch falls faster than 1/H, because the scalar path's cost grows with both the
+# width it re-reads and the batch it folds over.  These are therefore tables of
+# (inclusive hidden-width bound, smallest batch that prefers tensor cores),
+# ascending in width, taken directly from the measured grid.
+_WIDTH_BUCKET_SENTINEL = 1 << 30
+
+_TENSOR_CORE_MIN_BATCH_STEP = {  # T == 1
+    4: ((256, 128), (768, 64), (_WIDTH_BUCKET_SENTINEL, 32)),
+    1: ((512, 128), (_WIDTH_BUCKET_SENTINEL, 64)),
+}
+_TENSOR_CORE_MIN_BATCH_SEQ = {  # T > 1
+    # At H >= 1536 even a single row is better off on tensor cores; below 768 the
+    # scalar cohort kernel holds on until 8-32 rows.
+    #
+    # Collapsing every T > 1 into one table costs one cell: the advantage grows
+    # with T, because a longer sequence amortizes the one input-projection GEMM
+    # further.  At H=640, B=8 the scalar path is 11% ahead at T=8 and 22% behind
+    # at T=32, and this table picks tensor cores for both.  Splitting T into bands
+    # would recover that cell at the price of boundaries measured on one GPU.
+    4: ((256, 32), (512, 16), (768, 8), (1536, 2), (_WIDTH_BUCKET_SENTINEL, 1)),
+    1: ((256, 32), (_WIDTH_BUCKET_SENTINEL, 16)),
+}
+
+# `LstmLayerImpl` / `RnnLayerImpl` select the shared-weight cohort kernel at or
+# above this batch; below it they fall back to the one-CTA-per-output GEMV, whose
+# cost grows steeply with hidden width.  Two rows is 64 threads per CTA and
+# measured slower than the GEMV, so the floor is four.  Kept in sync with
+# `use_cohort` in `include/oasr/recurrent/recurrent.cuh`.
+_COHORT_BATCH_FLOOR = 4
+
+
+def _prefer_tensor_core(sequence_length: int, batch: int, hidden: int, gates: int) -> bool:
+    """Should this shape take the tensor-core path rather than the scalar one?"""
+    table = (_TENSOR_CORE_MIN_BATCH_STEP if sequence_length == 1 else _TENSOR_CORE_MIN_BATCH_SEQ)[
+        gates
+    ]
+    for width, min_batch in table:
+        if hidden <= width:
+            return batch >= min_batch
+    raise AssertionError("width bucket table must end in a sentinel")
 
 
 @lru_cache(maxsize=None)
@@ -293,6 +359,23 @@ class _RecurrentBase(nn.Module):
         # `unstack_states` is a non-contiguous view of a wider batch.
         return state.contiguous()
 
+    def _check_step_state(self, frames: torch.Tensor, cache) -> None:
+        if frames.dim() != 2 or frames.shape[1] != self.input_size:
+            raise ValueError(
+                f"step frames must be (rows, {self.input_size}), got {tuple(frames.shape)}"
+            )
+        if cache.num_layers != self.num_layers or cache.hidden_size != self.hidden_size:
+            raise ValueError(
+                f"cache geometry {(cache.num_layers, cache.hidden_size)} does not match this "
+                f"module's {(self.num_layers, self.hidden_size)}"
+            )
+        if not use_recurrent_kernel(frames):
+            raise NotImplementedError(
+                "the slot-addressed step is a CUDA FP16/BF16 kernel; there is no torch "
+                "fallback for it, because a fallback would hide the missing kernel rather "
+                "than report it. Use forward() for CPU or fp32."
+            )
+
     def _drop_between_layers(self, output: torch.Tensor, layer: int) -> torch.Tensor:
         if self.dropout and self.training and layer + 1 < self.num_layers:
             return F.dropout(output, p=self.dropout, training=True)
@@ -392,10 +475,14 @@ class LSTM(_RecurrentBase):
         tensor_core = (
             kernel
             and _supports_recurrent_tensor_core(input.device.index or 0)
-            and batch_size >= _TENSOR_CORE_BATCH_FLOOR
-            and self.hidden_size >= 1024
             and self.input_size % 8 == 0
             and self.hidden_size % 8 == 0
+            and _prefer_tensor_core(
+                input.shape[1 if kernel_batch_first else 0],
+                batch_size,
+                self.hidden_size,
+                self._gate_count,
+            )
         )
         current_batch_first = kernel_batch_first
         final_h: List[torch.Tensor] = []
@@ -465,6 +552,49 @@ class LSTM(_RecurrentBase):
         if unbatched:
             return output.squeeze(1), (h_n.squeeze(1), c_n.squeeze(1))
         return output, (h_n, c_n)
+
+    def step(
+        self,
+        frames: torch.Tensor,
+        cache: "RecurrentStateCache",
+        slot_ids: torch.Tensor,
+        read_parity: torch.Tensor,
+    ) -> torch.Tensor:
+        """Advance ``frames``' rows one timestep against slot-addressed state.
+
+        Row ``i`` of ``frames`` belongs to stream slot ``slot_ids[i]``, so one call
+        may mix rows that are at completely different timesteps of different
+        sequences -- which is what lets
+        :class:`~oasr.cache.RecurrentContinuousBatcher` keep the batch full instead
+        of running a cohort at the length of its longest member.
+
+        The caller is responsible for :meth:`RecurrentStateCache.commit_step` once
+        every layer has been issued: all layers of one tick share a parity.
+
+        Returns
+        -------
+        Tensor
+            ``(rows, hidden_size)`` output of the last layer.
+        """
+        self._check_step_state(frames, cache)
+        if not cache.has_cell:
+            raise ValueError("LSTM.step needs a cache built with cell state (cell=True)")
+        output = frames.contiguous()
+        for layer in range(self.num_layers):
+            bias_ih, bias_hh = self._biases(layer)
+            output = oasr.lstm_slot_step(
+                output,
+                cache.hidden(layer),
+                cache.cell(layer),
+                slot_ids,
+                read_parity,
+                getattr(self, f"weight_ih_l{layer}"),
+                getattr(self, f"weight_hh_l{layer}"),
+                bias_ih,
+                bias_hh,
+            )
+            output = self._drop_between_layers(output, layer)
+        return output
 
 
 class RNN(_RecurrentBase):
@@ -538,10 +668,14 @@ class RNN(_RecurrentBase):
         tensor_core = (
             kernel
             and _supports_recurrent_tensor_core(input.device.index or 0)
-            and batch_size >= _TENSOR_CORE_BATCH_FLOOR
-            and self.hidden_size >= 1024
             and self.input_size % 8 == 0
             and self.hidden_size % 8 == 0
+            and _prefer_tensor_core(
+                input.shape[1 if kernel_batch_first else 0],
+                batch_size,
+                self.hidden_size,
+                self._gate_count,
+            )
         )
         current_batch_first = kernel_batch_first
         final_h: List[torch.Tensor] = []
@@ -606,6 +740,32 @@ class RNN(_RecurrentBase):
         if self.nonlinearity == "relu":
             base += ", nonlinearity='relu'"
         return base
+
+    def step(
+        self,
+        frames: torch.Tensor,
+        cache: "RecurrentStateCache",
+        slot_ids: torch.Tensor,
+        read_parity: torch.Tensor,
+    ) -> torch.Tensor:
+        """Advance ``frames``' rows one timestep.  See :meth:`LSTM.step`."""
+        self._check_step_state(frames, cache)
+        output = frames.contiguous()
+        for layer in range(self.num_layers):
+            bias_ih, bias_hh = self._biases(layer)
+            output = oasr.rnn_slot_step(
+                output,
+                cache.hidden(layer),
+                slot_ids,
+                read_parity,
+                getattr(self, f"weight_ih_l{layer}"),
+                getattr(self, f"weight_hh_l{layer}"),
+                bias_ih,
+                bias_hh,
+                nonlinearity=self.nonlinearity,
+            )
+            output = self._drop_between_layers(output, layer)
+        return output
 
 
 __all__ = ["LSTM", "RNN"]
