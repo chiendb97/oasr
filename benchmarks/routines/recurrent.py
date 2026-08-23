@@ -18,7 +18,7 @@ from benchmarks.routines.bench_utils import (
 )
 from oasr.layers import LSTM, RNN
 
-SUBROUTINES = ["lstm", "rnn_tanh", "rnn_relu", "lstm_slot_step"]
+SUBROUTINES = ["lstm", "rnn_tanh", "rnn_relu", "lstm_slot_step", "lstm_step_cute"]
 
 # The first three rows are the Nemotron prediction-network operating point as
 # decode cohorts fill.  The remaining rows span recurrent sequence workloads
@@ -55,7 +55,7 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
             "num_layers": layers,
         }
         for batch, sequence, hidden, layers in (
-            _SLOT_SHAPES if subroutine == "lstm_slot_step" else _SHAPES
+            _SLOT_SHAPES if subroutine in ("lstm_slot_step", "lstm_step_cute") else _SHAPES
         )
     ]
     for subroutine in SUBROUTINES
@@ -111,6 +111,62 @@ def _setup(
     num_layers = config["num_layers"]
     x = torch.randn(batch, sequence, input_size, device="cuda", dtype=dtype)
     h = torch.randn(num_layers, batch, hidden_size, device="cuda", dtype=dtype)
+
+    if subroutine == "lstm_step_cute":
+        # The CuTeDSL fused step against the tensor-core GEMM it replaces.  Both
+        # consume a precomputed input projection, so this is the recurrent step
+        # alone -- which is the only place the fusion shows up undiluted.
+        from oasr.jit import recurrent_cute
+
+        n = 4 * hidden_size
+        prev_h = torch.randn(batch, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(n, hidden_size, device="cuda", dtype=dtype) * hidden_size**-0.5
+        in_gates = torch.randn(batch, n, device="cuda", dtype=dtype)
+        prev_c = torch.randn(batch, hidden_size, device="cuda", dtype=dtype)
+        out_h = torch.empty(batch, hidden_size, device="cuda", dtype=dtype)
+        out_c = torch.empty(batch, hidden_size, device="cuda", dtype=dtype)
+        gate_buf = torch.empty(batch, n, device="cuda", dtype=dtype)
+        dtype_str = "float16" if dtype is torch.float16 else "bfloat16"
+        try:
+            step = recurrent_cute.get_compiled_step(
+                dtype_str=dtype_str,
+                gate_count=4,
+                activation="lstm",
+                hidden=hidden_size,
+                batch=batch,
+            )
+        except Exception as exc:  # no CuTeDSL, or no tile for this shape
+            print(f"  [WARNING] CuTeDSL step unavailable: {exc}")
+            step = None
+
+        @torch.no_grad()
+        def cute_fn():
+            step(
+                prev_h,
+                weight,
+                in_gates,
+                prev_c,
+                out_h,
+                out_c,
+                recurrent_cute.current_stream(),
+            )
+            return out_h
+
+        @torch.no_grad()
+        def gemm_fn():
+            """Lower bound on the decomposed path: its GEMM, without the epilogue."""
+            return torch.mm(prev_h, weight.t(), out=gate_buf)
+
+        # Named "cublas", not "torch": the routine relabels a "torch" backend as
+        # "cudnn" on output, and this arm is neither.
+        fns = {"cublas": gemm_fn}
+        if step is not None:
+            fns["cute"] = cute_fn
+        # No meaningful benchmark reference: the arms compute different things (the
+        # GEMM alone is a lower bound, not an equivalent).  Correctness is checked
+        # against FP32 equations in tests/test_recurrent_cute.py, which is a
+        # stronger oracle than a refcheck against another kernel would be.
+        return fns, (cute_fn if step is not None else gemm_fn)
 
     if subroutine == "lstm_slot_step":
         # Slots deliberately exceed the row count so the gather is a real
@@ -336,7 +392,7 @@ def _assert_close(subroutine: str, actual, expected) -> float:
     if subroutine == "lstm":
         actual_tensors = (actual[0], *actual[1])
         expected_tensors = (expected[0], *expected[1])
-    elif subroutine == "lstm_slot_step":
+    elif subroutine in ("lstm_slot_step", "lstm_step_cute"):
         # One dense tensor, not a state tuple.
         actual_tensors, expected_tensors = (actual,), (expected,)
     else:

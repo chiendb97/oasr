@@ -280,6 +280,46 @@ def rnn_layer(
     return out, final_h
 
 
+def _lstm_step_cute(
+    input_gates: torch.Tensor,
+    previous_h: torch.Tensor,
+    previous_c: torch.Tensor,
+    packed_weight_hh: torch.Tensor,
+    out_h: torch.Tensor,
+    out_c: torch.Tensor,
+) -> bool:
+    """Run one timestep on the CuTeDSL fused step.  ``False`` if it declined.
+
+    Declining rather than raising is deliberate: the caller has a working path
+    either way, and a compile failure on one shape should cost that shape its
+    speedup, not the request.  A *wrong answer* would still raise -- nothing here
+    swallows anything but construction and compilation.
+    """
+    from oasr.jit import recurrent_cute
+
+    dtype_str = "float16" if input_gates.dtype is torch.float16 else "bfloat16"
+    try:
+        step = recurrent_cute.get_compiled_step(
+            dtype_str=dtype_str,
+            gate_count=4,
+            activation="lstm",
+            hidden=out_h.shape[1],
+            batch=out_h.shape[0],
+        )
+    except Exception:  # unsupported arch, missing CuTeDSL, or an unbuildable tile
+        return False
+    step(
+        previous_h,
+        packed_weight_hh,
+        input_gates,
+        previous_c,
+        out_h,
+        out_c,
+        recurrent_cute.current_stream(),
+    )
+    return True
+
+
 @oasr_api
 def lstm_gemm_layer(
     input: torch.Tensor,
@@ -321,11 +361,36 @@ def lstm_gemm_layer(
     else:
         packed_weight_ih, packed_weight_hh, combined_bias = _packed_parameters
     input_gates = gemm(input, packed_weight_ih, combined_bias)
-    output = input.new_empty(sequence_length, batch_size, hidden_size)
     if final_h is None:
         final_h = input.new_empty(batch_size, hidden_size)
     if final_c is None:
         final_c = input.new_empty(batch_size, hidden_size)
+
+    # A single timestep is exactly the shape the CuTeDSL fused step owns: it does
+    # the recurrent GEMM and the state transition in one launch, where this path
+    # otherwise materializes a gate tile and pays a second kernel for the
+    # transition.  Only inside the measured band -- see oasr/jit/recurrent_cute.py.
+    #
+    # Taken *before* the tensors below are allocated: `output`, `cells` and
+    # `workspace` exist only for the decomposed path, and at these sizes three
+    # unused allocations plus the cell ring cost about as much host time as the
+    # kernel costs GPU time.
+    if sequence_length == 1 and _tactic is None:
+        from oasr.jit import recurrent_cute
+
+        if recurrent_cute.should_use(4, hidden_size, batch_size) and _lstm_step_cute(
+            input_gates[0],
+            initial_h,
+            initial_c,
+            packed_weight_hh,
+            final_h,
+            final_c,
+        ):
+            # h was written straight into final_h, so the (1, B, H) layer output
+            # is a view of it rather than a copy.
+            return final_h.unsqueeze(0), final_h, final_c
+
+    output = input.new_empty(sequence_length, batch_size, hidden_size)
     cells = _cell_ring(input, sequence_length, batch_size, hidden_size, final_c)
     workspace = input.new_empty(batch_size, 4 * hidden_size)
     runner_args = (
