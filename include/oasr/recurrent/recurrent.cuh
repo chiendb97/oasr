@@ -353,6 +353,201 @@ __global__ void RnnCohortStepKernel(T* __restrict__ output, T* __restrict__ fina
     }
 }
 
+// Slot-addressed single timestep.
+//
+// Continuous batching for a recurrence needs a step whose *state* rows are
+// addressed indirectly: row i of this tick's dense input belongs to stream slot
+// `state_slots[i]`, and slot membership changes between ticks as streams retire
+// and new ones are admitted.  The recurrence itself is per-row and carries no
+// history beyond (h, c), so any mix of rows at any mix of timesteps is a legal
+// batch -- which is what makes this cheap for an RNN and expensive for attention.
+//
+// `h` needs a two-slice ring while `c` does not.  A CTA owning hidden unit j
+// reads its row's *whole* h vector but writes only element j, so an in-place h
+// update races against every other CTA on the same row.  Reading one slice and
+// writing the other removes the hazard without a second launch.  Each
+// cell element, by contrast, is read and written by the one CTA that owns it.
+template <typename T, int VecSize>
+__global__ void LstmSlotStepKernel(T* __restrict__ output, T* __restrict__ state_h,
+                                   T* __restrict__ state_c, const T* __restrict__ input,
+                                   const int64_t* __restrict__ state_slots,
+                                   const T* __restrict__ weight_ih, const T* __restrict__ weight_hh,
+                                   const T* __restrict__ bias_ih, const T* __restrict__ bias_hh,
+                                   int batch_size, int input_size, int hidden_size, int slot_count,
+                                   const int32_t* __restrict__ read_parity,
+                                   int64_t input_batch_stride, int64_t output_batch_stride) {
+    const int hidden = static_cast<int>(blockIdx.x);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int batch = static_cast<int>(blockIdx.y) * warps_per_block + warp;
+    extern __shared__ __align__(16) unsigned char shared_bytes[];
+    T* shared_weight_ih = reinterpret_cast<T*>(shared_bytes);
+    T* shared_weight_hh = shared_weight_ih + 4 * input_size;
+
+    using VecT = oasr::Vec<T, VecSize>;
+    const int input_vectors = input_size / VecSize;
+    const int hidden_vectors = hidden_size / VecSize;
+    const int total_vectors = 4 * (input_vectors + hidden_vectors);
+    for (int index = threadIdx.x; index < total_vectors; index += blockDim.x) {
+        if (index < 4 * input_vectors) {
+            const int gate = index / input_vectors;
+            const int k = VecSize * (index - gate * input_vectors);
+            VecT weight;
+            weight.load(weight_ih + static_cast<int64_t>(gate * hidden_size + hidden) * input_size +
+                        k);
+            weight.store(shared_weight_ih + gate * input_size + k);
+        } else {
+            const int recurrent_index = index - 4 * input_vectors;
+            const int gate = recurrent_index / hidden_vectors;
+            const int k = VecSize * (recurrent_index - gate * hidden_vectors);
+            VecT weight;
+            weight.load(weight_hh +
+                        static_cast<int64_t>(gate * hidden_size + hidden) * hidden_size + k);
+            weight.store(shared_weight_hh + gate * hidden_size + k);
+        }
+    }
+    __syncthreads();
+    if (batch >= batch_size)
+        return;
+
+    const int64_t slot = state_slots[batch];
+    // Per row, not per launch: a stream that sits out a tick keeps its current h
+    // in whichever slice it last wrote, so one scalar parity for the whole batch
+    // would read a stale slice for every idle stream.
+    const int32_t parity = read_parity[batch];
+    const int64_t read_base = (static_cast<int64_t>(parity) * slot_count + slot) * hidden_size;
+    const int64_t write_base = (static_cast<int64_t>(1 - parity) * slot_count + slot) * hidden_size;
+    const int64_t cell_offset = slot * hidden_size + hidden;
+
+    const T* x = input + static_cast<int64_t>(batch) * input_batch_stride;
+    const T* h = state_h + read_base;
+    float accum[4] = {};
+    for (int k = VecSize * lane; k < input_size; k += 32 * VecSize) {
+        VecT value;
+        value.load(x + k);
+#pragma unroll
+        for (int gate = 0; gate < 4; ++gate) {
+            VecT weight;
+            weight.load(shared_weight_ih + gate * input_size + k);
+#pragma unroll
+            for (int element = 0; element < VecSize; ++element) {
+                accum[gate] = fmaf(toFloat(value[element]), toFloat(weight[element]), accum[gate]);
+            }
+        }
+    }
+    for (int k = VecSize * lane; k < hidden_size; k += 32 * VecSize) {
+        VecT value;
+        value.load(h + k);
+#pragma unroll
+        for (int gate = 0; gate < 4; ++gate) {
+            VecT weight;
+            weight.load(shared_weight_hh + gate * hidden_size + k);
+#pragma unroll
+            for (int element = 0; element < VecSize; ++element) {
+                accum[gate] = fmaf(toFloat(value[element]), toFloat(weight[element]), accum[gate]);
+            }
+        }
+    }
+#pragma unroll
+    for (int gate = 0; gate < 4; ++gate)
+        accum[gate] = reduction::warpReduceSumDown(accum[gate]);
+    if (lane == 0) {
+#pragma unroll
+        for (int gate = 0; gate < 4; ++gate) {
+            const int offset = gate * hidden_size + hidden;
+            if (bias_ih != nullptr)
+                accum[gate] += toFloat(bias_ih[offset]);
+            if (bias_hh != nullptr)
+                accum[gate] += toFloat(bias_hh[offset]);
+        }
+        const float input_gate = fastSigmoid(accum[0]);
+        const float forget_gate = fastSigmoid(accum[1]);
+        const float cell_gate = tanhf(accum[2]);
+        const float output_gate = fastSigmoid(accum[3]);
+        const float cell = forget_gate * toFloat(state_c[cell_offset]) + input_gate * cell_gate;
+        const T cell_value = fromFloat<T>(cell);
+        const T hidden_value = fromFloat<T>(output_gate * tanhf(cell));
+        state_c[cell_offset] = cell_value;
+        state_h[write_base + hidden] = hidden_value;
+        output[static_cast<int64_t>(batch) * output_batch_stride + hidden] = hidden_value;
+    }
+}
+
+template <typename T, int VecSize, RnnActivation Activation>
+__global__ void RnnSlotStepKernel(T* __restrict__ output, T* __restrict__ state_h,
+                                  const T* __restrict__ input,
+                                  const int64_t* __restrict__ state_slots,
+                                  const T* __restrict__ weight_ih, const T* __restrict__ weight_hh,
+                                  const T* __restrict__ bias_ih, const T* __restrict__ bias_hh,
+                                  int batch_size, int input_size, int hidden_size, int slot_count,
+                                  const int32_t* __restrict__ read_parity,
+                                  int64_t input_batch_stride, int64_t output_batch_stride) {
+    const int hidden = static_cast<int>(blockIdx.x);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int batch = static_cast<int>(blockIdx.y) * warps_per_block + warp;
+    extern __shared__ __align__(16) unsigned char shared_bytes[];
+    T* shared_weight_ih = reinterpret_cast<T*>(shared_bytes);
+    T* shared_weight_hh = shared_weight_ih + input_size;
+
+    using VecT = oasr::Vec<T, VecSize>;
+    const int input_vectors = input_size / VecSize;
+    const int hidden_vectors = hidden_size / VecSize;
+    for (int index = threadIdx.x; index < input_vectors + hidden_vectors; index += blockDim.x) {
+        if (index < input_vectors) {
+            const int k = VecSize * index;
+            VecT weight;
+            weight.load(weight_ih + static_cast<int64_t>(hidden) * input_size + k);
+            weight.store(shared_weight_ih + k);
+        } else {
+            const int k = VecSize * (index - input_vectors);
+            VecT weight;
+            weight.load(weight_hh + static_cast<int64_t>(hidden) * hidden_size + k);
+            weight.store(shared_weight_hh + k);
+        }
+    }
+    __syncthreads();
+    if (batch >= batch_size)
+        return;
+
+    const int64_t slot = state_slots[batch];
+    const int32_t parity = read_parity[batch];
+    const T* x = input + static_cast<int64_t>(batch) * input_batch_stride;
+    const T* h = state_h + (static_cast<int64_t>(parity) * slot_count + slot) * hidden_size;
+    float accum = 0.0f;
+    for (int k = VecSize * lane; k < input_size; k += 32 * VecSize) {
+        VecT value, weight;
+        value.load(x + k);
+        weight.load(shared_weight_ih + k);
+#pragma unroll
+        for (int element = 0; element < VecSize; ++element)
+            accum = fmaf(toFloat(value[element]), toFloat(weight[element]), accum);
+    }
+    for (int k = VecSize * lane; k < hidden_size; k += 32 * VecSize) {
+        VecT value, weight;
+        value.load(h + k);
+        weight.load(shared_weight_hh + k);
+#pragma unroll
+        for (int element = 0; element < VecSize; ++element)
+            accum = fmaf(toFloat(value[element]), toFloat(weight[element]), accum);
+    }
+    accum = reduction::warpReduceSumDown(accum);
+    if (lane == 0) {
+        if (bias_ih != nullptr)
+            accum += toFloat(bias_ih[hidden]);
+        if (bias_hh != nullptr)
+            accum += toFloat(bias_hh[hidden]);
+        const float activated =
+            Activation == RnnActivation::RELU ? fmaxf(accum, 0.0f) : tanhf(accum);
+        const T hidden_value = fromFloat<T>(activated);
+        state_h[(static_cast<int64_t>(1 - parity) * slot_count + slot) * hidden_size + hidden] =
+            hidden_value;
+        output[static_cast<int64_t>(batch) * output_batch_stride + hidden] = hidden_value;
+    }
+}
+
 // Tensor-core path epilogues.  The input projection is computed once for the
 // whole sequence and the recurrent projection once per timestep; these kernels
 // fuse their sum with nonlinearities and state writes.  One thread owns one
@@ -482,7 +677,7 @@ cudaError_t LstmLayerImpl(T* output, T* cells, T* final_h, T* final_c, const T* 
     const dim3 grid(hidden_size, batch_size);
     const int cohort_warps = std::min(32, batch_size);
     const size_t cohort_smem = 4 * static_cast<size_t>(input_size + hidden_size) * sizeof(T);
-    const bool use_cohort = batch_size >= 8 && cohort_smem <= 48 * 1024;
+    const bool use_cohort = batch_size >= 4 && cohort_smem <= 48 * 1024;
     const dim3 cohort_grid(hidden_size, (batch_size + cohort_warps - 1) / cohort_warps);
     // Only cell[t-1] is ever read, so the cell history is a two-slice ring of
     // (batch, hidden) rather than the whole (sequence, batch, hidden) tensor.
@@ -529,7 +724,7 @@ cudaError_t RnnLayerImpl(T* output, T* final_h, const T* input, const T* initial
     const dim3 grid(hidden_size, batch_size);
     const int cohort_warps = std::min(32, batch_size);
     const size_t cohort_smem = static_cast<size_t>(input_size + hidden_size) * sizeof(T);
-    const bool use_cohort = batch_size >= 8 && cohort_smem <= 48 * 1024;
+    const bool use_cohort = batch_size >= 4 && cohort_smem <= 48 * 1024;
     const dim3 cohort_grid(hidden_size, (batch_size + cohort_warps - 1) / cohort_warps);
     for (int timestep = 0; timestep < sequence_length; ++timestep) {
         T* output_t = output + static_cast<int64_t>(timestep) * output_time_stride;
@@ -647,6 +842,130 @@ cudaError_t RnnLayer(T* output, T* final_h, const T* input, const T* initial_h, 
                                       bias_ih, bias_hh, sequence_length, batch_size, input_size,
                                       hidden_size, input_time_stride, input_batch_stride,
                                       output_time_stride, output_batch_stride, activation, stream);
+}
+
+namespace detail {
+
+// The slot step is always one timestep over `batch_size` active rows, so the
+// cohort shape (one CTA per hidden unit, one warp per row) is the only sensible
+// one -- there is no batch fold to collapse and no sequence to amortize over.
+template <typename T, int VecSize, bool kLstm, RnnActivation Activation>
+cudaError_t SlotStepImpl(T* output, T* state_h, T* state_c, const T* input,
+                         const int64_t* state_slots, const T* weight_ih, const T* weight_hh,
+                         const T* bias_ih, const T* bias_hh, int batch_size, int input_size,
+                         int hidden_size, int slot_count, const int32_t* read_parity,
+                         int64_t input_batch_stride, int64_t output_batch_stride,
+                         cudaStream_t stream) {
+    constexpr int kGates = kLstm ? 4 : 1;
+    const size_t smem = kGates * static_cast<size_t>(input_size + hidden_size) * sizeof(T);
+    if (smem > 48 * 1024)
+        return cudaErrorInvalidValue;
+    const int warps = std::min(32, std::max(1, batch_size));
+    const dim3 grid(hidden_size, (batch_size + warps - 1) / warps);
+    if constexpr (kLstm) {
+        LstmSlotStepKernel<T, VecSize><<<grid, warps * 32, smem, stream>>>(
+            output, state_h, state_c, input, state_slots, weight_ih, weight_hh, bias_ih, bias_hh,
+            batch_size, input_size, hidden_size, slot_count, read_parity, input_batch_stride,
+            output_batch_stride);
+    } else {
+        RnnSlotStepKernel<T, VecSize, Activation><<<grid, warps * 32, smem, stream>>>(
+            output, state_h, input, state_slots, weight_ih, weight_hh, bias_ih, bias_hh, batch_size,
+            input_size, hidden_size, slot_count, read_parity, input_batch_stride,
+            output_batch_stride);
+    }
+    return cudaGetLastError();
+}
+
+template <typename T, int VecSize>
+inline bool CanVectorizeSlotStep(const T* output, const T* state_h, const T* input,
+                                 const T* weight_ih, const T* weight_hh, int input_size,
+                                 int hidden_size, int64_t input_batch_stride,
+                                 int64_t output_batch_stride) {
+    static_assert(VecSize > 1, "vectorized dispatch requires VecSize > 1");
+    return input_size % VecSize == 0 && hidden_size % VecSize == 0 &&
+           input_batch_stride % VecSize == 0 && output_batch_stride % VecSize == 0 &&
+           oasr::isAligned<T, VecSize>(output) && oasr::isAligned<T, VecSize>(state_h) &&
+           oasr::isAligned<T, VecSize>(input) && oasr::isAligned<T, VecSize>(weight_ih) &&
+           oasr::isAligned<T, VecSize>(weight_hh);
+}
+
+template <typename T, bool kLstm, RnnActivation Activation>
+cudaError_t SlotStepDispatch(T* output, T* state_h, T* state_c, const T* input,
+                             const int64_t* state_slots, const T* weight_ih, const T* weight_hh,
+                             const T* bias_ih, const T* bias_hh, int batch_size, int input_size,
+                             int hidden_size, int slot_count, const int32_t* read_parity,
+                             int64_t input_batch_stride, int64_t output_batch_stride,
+                             cudaStream_t stream) {
+    constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
+    if constexpr (VecSize > 1) {
+        if (CanVectorizeSlotStep<T, VecSize>(output, state_h, input, weight_ih, weight_hh,
+                                             input_size, hidden_size, input_batch_stride,
+                                             output_batch_stride))
+            return SlotStepImpl<T, VecSize, kLstm, Activation>(
+                output, state_h, state_c, input, state_slots, weight_ih, weight_hh, bias_ih,
+                bias_hh, batch_size, input_size, hidden_size, slot_count, read_parity,
+                input_batch_stride, output_batch_stride, stream);
+    }
+    if constexpr (VecSize > 2) {
+        if (CanVectorizeSlotStep<T, 2>(output, state_h, input, weight_ih, weight_hh, input_size,
+                                       hidden_size, input_batch_stride, output_batch_stride))
+            return SlotStepImpl<T, 2, kLstm, Activation>(
+                output, state_h, state_c, input, state_slots, weight_ih, weight_hh, bias_ih,
+                bias_hh, batch_size, input_size, hidden_size, slot_count, read_parity,
+                input_batch_stride, output_batch_stride, stream);
+    }
+    return SlotStepImpl<T, 1, kLstm, Activation>(output, state_h, state_c, input, state_slots,
+                                                 weight_ih, weight_hh, bias_ih, bias_hh, batch_size,
+                                                 input_size, hidden_size, slot_count, read_parity,
+                                                 input_batch_stride, output_batch_stride, stream);
+}
+
+}  // namespace detail
+
+/// One LSTM timestep over slot-addressed state.
+///
+/// \param output      (batch, hidden) dense rows for this tick
+/// \param state_h     (2, slots, hidden) ring, read at read_parity[i], written at 1 - it
+/// \param read_parity (batch,) int32 slice each row's current h lives in
+/// \param state_c     (slots, hidden), updated in place
+/// \param state_slots (batch,) int64 slot of each input row
+///
+/// Returns cudaErrorInvalidValue when one hidden unit's weights do not fit in
+/// shared memory, so the caller can fall back rather than get a wrong answer.
+template <typename T>
+cudaError_t LstmSlotStep(T* output, T* state_h, T* state_c, const T* input,
+                         const int64_t* state_slots, const T* weight_ih, const T* weight_hh,
+                         const T* bias_ih, const T* bias_hh, int batch_size, int input_size,
+                         int hidden_size, int slot_count, const int32_t* read_parity,
+                         int64_t input_batch_stride, int64_t output_batch_stride,
+                         cudaStream_t stream) {
+    if (batch_size == 0)
+        return cudaSuccess;
+    return detail::SlotStepDispatch<T, true, RnnActivation::TANH>(
+        output, state_h, state_c, input, state_slots, weight_ih, weight_hh, bias_ih, bias_hh,
+        batch_size, input_size, hidden_size, slot_count, read_parity, input_batch_stride,
+        output_batch_stride, stream);
+}
+
+/// One vanilla-RNN timestep over slot-addressed state.  See \ref LstmSlotStep.
+template <typename T>
+cudaError_t RnnSlotStep(T* output, T* state_h, const T* input, const int64_t* state_slots,
+                        const T* weight_ih, const T* weight_hh, const T* bias_ih, const T* bias_hh,
+                        int batch_size, int input_size, int hidden_size, int slot_count,
+                        const int32_t* read_parity, int64_t input_batch_stride,
+                        int64_t output_batch_stride, RnnActivation activation,
+                        cudaStream_t stream) {
+    if (batch_size == 0)
+        return cudaSuccess;
+    if (activation == RnnActivation::RELU)
+        return detail::SlotStepDispatch<T, false, RnnActivation::RELU>(
+            output, state_h, nullptr, input, state_slots, weight_ih, weight_hh, bias_ih, bias_hh,
+            batch_size, input_size, hidden_size, slot_count, read_parity, input_batch_stride,
+            output_batch_stride, stream);
+    return detail::SlotStepDispatch<T, false, RnnActivation::TANH>(
+        output, state_h, nullptr, input, state_slots, weight_ih, weight_hh, bias_ih, bias_hh,
+        batch_size, input_size, hidden_size, slot_count, read_parity, input_batch_stride,
+        output_batch_stride, stream);
 }
 
 template <typename T>

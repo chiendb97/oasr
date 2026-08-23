@@ -89,7 +89,14 @@ from .functionals.norm import (
     rms_norm_activation,
 )
 from .functionals.pooling import avg_pool1d
-from .functionals.recurrent import lstm_gemm_layer, lstm_layer, rnn_gemm_layer, rnn_layer
+from .functionals.recurrent import (
+    lstm_gemm_layer,
+    lstm_layer,
+    lstm_slot_step,
+    rnn_gemm_layer,
+    rnn_layer,
+    rnn_slot_step,
+)
 from .functionals.softmax import log_softmax, softmax
 from .functionals.topk import topk
 from .layers import (
@@ -234,7 +241,9 @@ __all__ = [
     "cmvn",
     "avg_pool1d",
     "lstm_layer",
+    "lstm_slot_step",
     "rnn_layer",
+    "rnn_slot_step",
     "lstm_gemm_layer",
     "rnn_gemm_layer",
     "depthwise_conv1d",

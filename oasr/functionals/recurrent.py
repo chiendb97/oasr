@@ -406,4 +406,151 @@ def rnn_gemm_layer(
     return output, final_h
 
 
-__all__ = ["lstm_gemm_layer", "lstm_layer", "rnn_gemm_layer", "rnn_layer"]
+def _check_slot_step(
+    input: torch.Tensor,
+    state_h: torch.Tensor,
+    state_slots: torch.Tensor,
+    read_parity: torch.Tensor,
+    weight_ih: torch.Tensor,
+    weight_hh: torch.Tensor,
+    gate_count: int,
+) -> Tuple[int, int, int, int]:
+    if input.dim() != 2:
+        raise ValueError(f"slot-step input must be 2-D (batch, input_size), got {input.dim()}-D")
+    if state_h.dim() != 3 or state_h.shape[0] != 2:
+        raise ValueError(
+            "state_h must be the (2, slots, hidden) ring -- one slice is read while the "
+            f"other is written, got {tuple(state_h.shape)}"
+        )
+    batch_size, input_size = input.shape
+    slot_count, hidden_size = state_h.shape[1], state_h.shape[2]
+    if tuple(weight_ih.shape) != (gate_count * hidden_size, input_size):
+        raise ValueError(
+            f"weight_ih must have shape {(gate_count * hidden_size, input_size)}, "
+            f"got {tuple(weight_ih.shape)}"
+        )
+    if tuple(weight_hh.shape) != (gate_count * hidden_size, hidden_size):
+        raise ValueError(
+            f"weight_hh must have shape {(gate_count * hidden_size, hidden_size)}, "
+            f"got {tuple(weight_hh.shape)}"
+        )
+    if state_slots.dim() != 1 or state_slots.shape[0] != batch_size:
+        raise ValueError(
+            f"state_slots must be a 1-D int64 tensor of {batch_size} slot ids, "
+            f"got shape {tuple(state_slots.shape)}"
+        )
+    if state_slots.dtype != torch.int64:
+        raise ValueError(f"state_slots must be int64, got {state_slots.dtype}")
+    if read_parity.dim() != 1 or read_parity.shape[0] != batch_size:
+        raise ValueError(
+            f"read_parity must be a 1-D int32 tensor of {batch_size} entries, "
+            f"got shape {tuple(read_parity.shape)}"
+        )
+    if read_parity.dtype != torch.int32:
+        raise ValueError(f"read_parity must be int32, got {read_parity.dtype}")
+    return batch_size, input_size, slot_count, hidden_size
+
+
+@oasr_api
+def lstm_slot_step(
+    input: torch.Tensor,
+    state_h: torch.Tensor,
+    state_c: torch.Tensor,
+    state_slots: torch.Tensor,
+    read_parity: torch.Tensor,
+    weight_ih: torch.Tensor,
+    weight_hh: torch.Tensor,
+    bias_ih: Optional[torch.Tensor] = None,
+    bias_hh: Optional[torch.Tensor] = None,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """One LSTM timestep over slot-addressed state, for continuous batching.
+
+    Row ``i`` of ``input`` belongs to stream slot ``state_slots[i]``, so the rows
+    of one call may be at completely different timesteps of different sequences
+    and the membership may change every call.  A recurrence carries no history
+    beyond ``(h, c)``, which is what makes that free here.
+
+    ``state_h`` is a ``(2, slots, hidden)`` ring: row ``i`` is read from slice
+    ``read_parity[i]`` and written to the other one, because a CTA owning hidden
+    unit ``j`` reads its row's whole ``h`` vector but writes only element ``j``,
+    so an in-place update would race.  The parity is *per row* rather than per
+    call so that a stream which sits out a tick keeps its current ``h`` where it
+    last wrote it; one parity for the whole batch would read a stale slice for
+    every idle stream.  ``state_c`` is ``(slots, hidden)`` and is updated in
+    place, because each cell element is read and written by its owning thread.
+
+    Returns the ``(batch, hidden)`` dense hidden rows for this timestep.  The
+    caller flips ``read_parity`` for the rows it stepped -- which is what
+    :class:`oasr.cache.RecurrentStateCache` does.
+    """
+    batch_size, _, _, hidden_size = _check_slot_step(
+        input, state_h, state_slots, read_parity, weight_ih, weight_hh, 4
+    )
+    if state_c.dim() != 2 or state_c.shape[1] != hidden_size:
+        raise ValueError(
+            f"state_c must have shape (slots, {hidden_size}), got {tuple(state_c.shape)}"
+        )
+    if out is None:
+        out = input.new_empty(batch_size, hidden_size)
+    _get_recurrent_module().lstm_slot_step(
+        out,
+        state_h,
+        state_c,
+        input,
+        state_slots,
+        read_parity,
+        weight_ih,
+        weight_hh,
+        bias_ih,
+        bias_hh,
+    )
+    return out
+
+
+@oasr_api
+def rnn_slot_step(
+    input: torch.Tensor,
+    state_h: torch.Tensor,
+    state_slots: torch.Tensor,
+    read_parity: torch.Tensor,
+    weight_ih: torch.Tensor,
+    weight_hh: torch.Tensor,
+    bias_ih: Optional[torch.Tensor] = None,
+    bias_hh: Optional[torch.Tensor] = None,
+    *,
+    nonlinearity: str = "tanh",
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """One vanilla-RNN timestep over slot-addressed state.  See :func:`lstm_slot_step`."""
+    if nonlinearity not in ("tanh", "relu"):
+        raise ValueError(f"nonlinearity must be 'tanh' or 'relu', got {nonlinearity!r}")
+    batch_size, _, _, hidden_size = _check_slot_step(
+        input, state_h, state_slots, read_parity, weight_ih, weight_hh, 1
+    )
+    if out is None:
+        out = input.new_empty(batch_size, hidden_size)
+    _get_recurrent_module().rnn_slot_step(
+        out,
+        state_h,
+        input,
+        state_slots,
+        read_parity,
+        weight_ih,
+        weight_hh,
+        bias_ih,
+        bias_hh,
+        0 if nonlinearity == "tanh" else 1,
+    )
+    return out
+
+
+__all__ = [
+    "lstm_gemm_layer",
+    "lstm_layer",
+    "lstm_slot_step",
+    "rnn_gemm_layer",
+    "rnn_layer",
+    "rnn_slot_step",
+]

@@ -18,7 +18,16 @@ void rnn_gemm_layer(TensorView output, TensorView final_h, TensorView input_gate
                     int64_t activation, bool input_batch_first, int64_t tactic,
                     int64_t split_k_slices);
 
+void lstm_slot_step(TensorView output, TensorView state_h, TensorView state_c, TensorView input,
+                    TensorView state_slots, TensorView read_parity, TensorView weight_ih,
+                    TensorView weight_hh, Optional bias_ih, Optional bias_hh);
+void rnn_slot_step(TensorView output, TensorView state_h, TensorView input, TensorView state_slots,
+                   TensorView read_parity, TensorView weight_ih, TensorView weight_hh,
+                   Optional bias_ih, Optional bias_hh, int64_t activation);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(lstm_layer, lstm_layer);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rnn_layer, rnn_layer);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(lstm_gemm_layer, lstm_gemm_layer);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rnn_gemm_layer, rnn_gemm_layer);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(lstm_slot_step, lstm_slot_step);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(rnn_slot_step, rnn_slot_step);

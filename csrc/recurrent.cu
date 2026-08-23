@@ -649,6 +649,153 @@ void rnn_gemm_layer(TensorView output, TensorView final_h, TensorView input_gate
 #endif
 }
 
+namespace {
+
+// Shape/dtype contract shared by both slot steps.  `state_h` is the (2, slots,
+// hidden) ring; `state_slots` is int64 on the same device.
+struct SlotStepShape {
+    int batch_size;
+    int input_size;
+    int hidden_size;
+    int slot_count;
+    int64_t input_batch_stride;
+    int64_t output_batch_stride;
+};
+
+SlotStepShape CheckSlotStep(TensorView output, TensorView state_h, TensorView input,
+                            TensorView state_slots, TensorView read_parity, TensorView weight_ih,
+                            TensorView weight_hh, Optional bias_ih, Optional bias_hh,
+                            int gate_count) {
+    CHECK_INPUT(input);
+    CHECK_CONTIGUOUS_INPUT(input);
+    CHECK_DIM(2, input);
+    CheckTensorLike(output, input, "output");
+    CheckTensorLike(state_h, input, "state_h");
+    CheckTensorLike(weight_ih, input, "weight_ih");
+    CheckTensorLike(weight_hh, input, "weight_hh");
+    CHECK_DIM(2, output);
+    CHECK_DIM(3, state_h);
+    CHECK_DIM(2, weight_ih);
+    CHECK_DIM(2, weight_hh);
+    CHECK_INPUT(state_slots);
+    CHECK_CONTIGUOUS_INPUT(state_slots);
+    CHECK_DIM(1, state_slots);
+    CHECK_DEVICE(state_slots, input);
+    TVM_FFI_ICHECK(state_slots.dtype().code == kDLInt && state_slots.dtype().bits == 64)
+        << "state_slots must be int64";
+    CHECK_INPUT(read_parity);
+    CHECK_CONTIGUOUS_INPUT(read_parity);
+    CHECK_DIM(1, read_parity);
+    CHECK_DEVICE(read_parity, input);
+    TVM_FFI_ICHECK(read_parity.dtype().code == kDLInt && read_parity.dtype().bits == 32)
+        << "read_parity must be int32";
+
+    const int64_t batch_size = input.size(0);
+    const int64_t input_size = input.size(1);
+    const int64_t hidden_size = weight_hh.size(1);
+    const int64_t slot_count = state_h.size(1);
+    TVM_FFI_ICHECK(batch_size > 0 && input_size > 0 && hidden_size > 0 && slot_count > 0)
+        << "slot-step dimensions must be positive, got batch=" << batch_size
+        << " input_size=" << input_size << " hidden_size=" << hidden_size
+        << " slots=" << slot_count;
+    TVM_FFI_ICHECK(batch_size <= 65535 && hidden_size <= 65535)
+        << "slot-step shape exceeds CUDA grid limits";
+    TVM_FFI_ICHECK(state_h.size(0) == 2)
+        << "state_h must be a two-slice ring, got leading dimension " << state_h.size(0);
+    TVM_FFI_ICHECK(state_h.size(2) == hidden_size)
+        << "state_h last dimension must be " << hidden_size;
+    TVM_FFI_ICHECK(state_slots.size(0) == batch_size)
+        << "state_slots must have " << batch_size << " entries";
+    TVM_FFI_ICHECK(read_parity.size(0) == batch_size)
+        << "read_parity must have " << batch_size << " entries";
+    TVM_FFI_ICHECK(weight_ih.size(0) == gate_count * hidden_size && weight_ih.size(1) == input_size)
+        << "weight_ih must have shape (" << gate_count * hidden_size << ", " << input_size << ")";
+    TVM_FFI_ICHECK(weight_hh.size(0) == gate_count * hidden_size)
+        << "weight_hh must have shape (" << gate_count * hidden_size << ", " << hidden_size << ")";
+    TVM_FFI_ICHECK(output.size(0) == batch_size && output.size(1) == hidden_size)
+        << "output must have shape (" << batch_size << ", " << hidden_size << ")";
+    for (const auto& named_bias : {std::pair<const char*, Optional>{"bias_ih", bias_ih},
+                                   std::pair<const char*, Optional>{"bias_hh", bias_hh}}) {
+        if (!named_bias.second.has_value())
+            continue;
+        TensorView bias = named_bias.second.value();
+        CheckTensorLike(bias, input, named_bias.first);
+        CHECK_DIM(1, bias);
+        TVM_FFI_ICHECK(bias.size(0) == gate_count * hidden_size)
+            << named_bias.first << " must have " << gate_count * hidden_size << " elements";
+    }
+    return {static_cast<int>(batch_size),
+            static_cast<int>(input_size),
+            static_cast<int>(hidden_size),
+            static_cast<int>(slot_count),
+            input.stride(0),
+            output.stride(0)};
+}
+
+}  // namespace
+
+void lstm_slot_step(TensorView output, TensorView state_h, TensorView state_c, TensorView input,
+                    TensorView state_slots, TensorView read_parity, TensorView weight_ih,
+                    TensorView weight_hh, Optional bias_ih, Optional bias_hh) {
+    const SlotStepShape shape = CheckSlotStep(output, state_h, input, state_slots, read_parity,
+                                              weight_ih, weight_hh, bias_ih, bias_hh, 4);
+    CheckTensorLike(state_c, input, "state_c");
+    CHECK_DIM(2, state_c);
+    TVM_FFI_ICHECK(state_c.size(0) == shape.slot_count && state_c.size(1) == shape.hidden_size)
+        << "state_c must have shape (" << shape.slot_count << ", " << shape.hidden_size << ")";
+
+    cudaStream_t stream = get_stream(input.device());
+    DISPATCH_DLPACK_HALF_DTYPE(input.dtype(), c_type, [&] {
+        const c_type* bias_ih_ptr =
+            bias_ih.has_value() ? static_cast<const c_type*>(bias_ih.value().data_ptr()) : nullptr;
+        const c_type* bias_hh_ptr =
+            bias_hh.has_value() ? static_cast<const c_type*>(bias_hh.value().data_ptr()) : nullptr;
+        cudaError_t status = recurrent::LstmSlotStep<c_type>(
+            static_cast<c_type*>(output.data_ptr()), static_cast<c_type*>(state_h.data_ptr()),
+            static_cast<c_type*>(state_c.data_ptr()), static_cast<const c_type*>(input.data_ptr()),
+            static_cast<const int64_t*>(state_slots.data_ptr()),
+            static_cast<const c_type*>(weight_ih.data_ptr()),
+            static_cast<const c_type*>(weight_hh.data_ptr()), bias_ih_ptr, bias_hh_ptr,
+            shape.batch_size, shape.input_size, shape.hidden_size, shape.slot_count,
+            static_cast<const int32_t*>(read_parity.data_ptr()), shape.input_batch_stride,
+            shape.output_batch_stride, stream);
+        // cudaErrorInvalidValue is the declared "one unit's weights do not fit in
+        // shared memory" signal, and the Python caller routes around it rather
+        // than silently producing nothing.
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "LSTM slot step failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
+void rnn_slot_step(TensorView output, TensorView state_h, TensorView input, TensorView state_slots,
+                   TensorView read_parity, TensorView weight_ih, TensorView weight_hh,
+                   Optional bias_ih, Optional bias_hh, int64_t activation) {
+    TVM_FFI_ICHECK(activation == 0 || activation == 1)
+        << "RNN activation must be 0 (tanh) or 1 (relu), got " << activation;
+    const SlotStepShape shape = CheckSlotStep(output, state_h, input, state_slots, read_parity,
+                                              weight_ih, weight_hh, bias_ih, bias_hh, 1);
+    cudaStream_t stream = get_stream(input.device());
+    DISPATCH_DLPACK_HALF_DTYPE(input.dtype(), c_type, [&] {
+        const c_type* bias_ih_ptr =
+            bias_ih.has_value() ? static_cast<const c_type*>(bias_ih.value().data_ptr()) : nullptr;
+        const c_type* bias_hh_ptr =
+            bias_hh.has_value() ? static_cast<const c_type*>(bias_hh.value().data_ptr()) : nullptr;
+        cudaError_t status = recurrent::RnnSlotStep<c_type>(
+            static_cast<c_type*>(output.data_ptr()), static_cast<c_type*>(state_h.data_ptr()),
+            static_cast<const c_type*>(input.data_ptr()),
+            static_cast<const int64_t*>(state_slots.data_ptr()),
+            static_cast<const c_type*>(weight_ih.data_ptr()),
+            static_cast<const c_type*>(weight_hh.data_ptr()), bias_ih_ptr, bias_hh_ptr,
+            shape.batch_size, shape.input_size, shape.hidden_size, shape.slot_count,
+            static_cast<const int32_t*>(read_parity.data_ptr()), shape.input_batch_stride,
+            shape.output_batch_stride, static_cast<recurrent::RnnActivation>(activation), stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "RNN slot step failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
 // The gate-major finalizers are the decomposition tactic for a checkpoint-order
 // gate layout: the recurrent GEMM leaves its C operand out and the finalizer
 // sums the two gate tensors itself.  No launcher routes through them yet, and a

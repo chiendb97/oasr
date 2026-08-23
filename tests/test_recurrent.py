@@ -576,3 +576,294 @@ class TestRecurrentValidation:
     def test_module_rejects_wrong_input_width(self):
         with pytest.raises(RuntimeError, match="input_size"):
             LSTM(8, 16)(torch.randn(3, 2, 7))
+
+
+class TestRecurrentSlotStep:
+    """Slot-addressed single timestep -- the continuous-batching primitive.
+
+    The oracle is the dense path: gather the same rows and run the validated
+    ``lstm_layer`` / ``rnn_layer`` at T=1.  Both compute the same equation with
+    the same reduction order, so agreement here should be exact, not approximate.
+    """
+
+    @staticmethod
+    def _weights(gates, hidden, input_size, dtype):
+        g = torch.Generator(device="cuda").manual_seed(11)
+        k = input_size**-0.5
+        return (
+            torch.randn(gates * hidden, input_size, device="cuda", dtype=dtype, generator=g) * k,
+            torch.randn(gates * hidden, hidden, device="cuda", dtype=dtype, generator=g)
+            * hidden**-0.5,
+            torch.randn(gates * hidden, device="cuda", dtype=dtype, generator=g) * 0.1,
+            torch.randn(gates * hidden, device="cuda", dtype=dtype, generator=g) * 0.1,
+        )
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("hidden,input_size", [(640, 640), (256, 320), (64, 64)])
+    def test_lstm_slot_step_matches_dense(self, device, dtype, hidden, input_size):
+        rows, slots = 6, 8
+        wih, whh, bih, bhh = self._weights(4, hidden, input_size, dtype)
+        g = torch.Generator(device="cuda").manual_seed(5)
+        x = torch.randn(rows, input_size, device="cuda", dtype=dtype, generator=g) * 0.5
+        h0 = torch.randn(slots, hidden, device="cuda", dtype=dtype, generator=g) * 0.3
+        c0 = torch.randn(slots, hidden, device="cuda", dtype=dtype, generator=g) * 0.3
+        slot_ids = torch.tensor([5, 0, 7, 2, 1, 6], device="cuda", dtype=torch.int64)
+        # Mixed parities: half the rows currently live in the other ring slice.
+        parity = torch.tensor([1, 0, 1, 0, 1, 0], device="cuda", dtype=torch.int32)
+        ring = torch.zeros(2, slots, hidden, device="cuda", dtype=dtype)
+        for p, s in zip(parity.tolist(), slot_ids.tolist()):
+            ring[p, s] = h0[s]
+        cells = c0.clone()
+
+        out = oasr.lstm_slot_step(x, ring, cells, slot_ids, parity, wih, whh, bih, bhh)
+        ref_out, ref_h, ref_c = oasr.lstm_layer(
+            x.unsqueeze(0), h0[slot_ids].contiguous(), c0[slot_ids].contiguous(), wih, whh, bih, bhh
+        )
+        written = torch.stack([ring[1 - p, s] for p, s in zip(parity.tolist(), slot_ids.tolist())])
+        torch.testing.assert_close(out, ref_out[0], rtol=0, atol=0)
+        torch.testing.assert_close(written, ref_h, rtol=0, atol=0)
+        torch.testing.assert_close(cells[slot_ids], ref_c, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("nonlinearity", ["tanh", "relu"])
+    def test_rnn_slot_step_matches_dense(self, device, dtype, nonlinearity):
+        hidden = input_size = 512
+        rows, slots = 5, 8
+        wih, whh, bih, bhh = self._weights(1, hidden, input_size, dtype)
+        g = torch.Generator(device="cuda").manual_seed(6)
+        x = torch.randn(rows, input_size, device="cuda", dtype=dtype, generator=g) * 0.5
+        h0 = torch.randn(slots, hidden, device="cuda", dtype=dtype, generator=g) * 0.3
+        slot_ids = torch.tensor([3, 0, 6, 1, 7], device="cuda", dtype=torch.int64)
+        parity = torch.tensor([0, 1, 1, 0, 1], device="cuda", dtype=torch.int32)
+        ring = torch.zeros(2, slots, hidden, device="cuda", dtype=dtype)
+        for p, s in zip(parity.tolist(), slot_ids.tolist()):
+            ring[p, s] = h0[s]
+
+        out = oasr.rnn_slot_step(
+            x, ring, slot_ids, parity, wih, whh, bih, bhh, nonlinearity=nonlinearity
+        )
+        ref_out, ref_h = oasr.rnn_layer(
+            x.unsqueeze(0),
+            h0[slot_ids].contiguous(),
+            wih,
+            whh,
+            bih,
+            bhh,
+            nonlinearity=nonlinearity,
+        )
+        written = torch.stack([ring[1 - p, s] for p, s in zip(parity.tolist(), slot_ids.tolist())])
+        torch.testing.assert_close(out, ref_out[0], rtol=0, atol=0)
+        torch.testing.assert_close(written, ref_h, rtol=0, atol=0)
+
+    def test_slot_step_leaves_inactive_slots_alone(self, device):
+        """A slot not named this tick must not move -- an idle stream keeps its state."""
+        hidden = input_size = 128
+        slots = 8
+        wih, whh, bih, bhh = self._weights(4, hidden, input_size, torch.float16)
+        g = torch.Generator(device="cuda").manual_seed(7)
+        x = torch.randn(3, input_size, device="cuda", dtype=torch.float16, generator=g)
+        ring = torch.randn(2, slots, hidden, device="cuda", dtype=torch.float16, generator=g) * 0.2
+        cells = torch.randn(slots, hidden, device="cuda", dtype=torch.float16, generator=g) * 0.2
+        before_ring, before_cells = ring.clone(), cells.clone()
+        slot_ids = torch.tensor([1, 4, 6], device="cuda", dtype=torch.int64)
+        parity = torch.zeros(3, device="cuda", dtype=torch.int32)
+
+        oasr.lstm_slot_step(x, ring, cells, slot_ids, parity, wih, whh, bih, bhh)
+
+        untouched = [s for s in range(slots) if s not in slot_ids.tolist()]
+        torch.testing.assert_close(ring[:, untouched], before_ring[:, untouched], rtol=0, atol=0)
+        torch.testing.assert_close(cells[untouched], before_cells[untouched], rtol=0, atol=0)
+        # The read slice of the *active* slots is untouched too; only 1-parity moves.
+        torch.testing.assert_close(ring[0, slot_ids], before_ring[0, slot_ids], rtol=0, atol=0)
+
+    def test_slot_step_rejects_bad_metadata(self, device):
+        hidden = input_size = 64
+        wih, whh, _, _ = self._weights(4, hidden, input_size, torch.float16)
+        x = torch.randn(2, input_size, device="cuda", dtype=torch.float16)
+        ring = torch.zeros(2, 4, hidden, device="cuda", dtype=torch.float16)
+        cells = torch.zeros(4, hidden, device="cuda", dtype=torch.float16)
+        slot_ids = torch.zeros(2, device="cuda", dtype=torch.int64)
+        parity = torch.zeros(2, device="cuda", dtype=torch.int32)
+        with pytest.raises(ValueError, match="int32"):
+            oasr.lstm_slot_step(x, ring, cells, slot_ids, parity.long(), wih, whh)
+        with pytest.raises(ValueError, match="int64"):
+            oasr.lstm_slot_step(x, ring, cells, slot_ids.int(), parity, wih, whh)
+        with pytest.raises(ValueError, match=r"\(2, slots, hidden\) ring"):
+            oasr.lstm_slot_step(x, ring[0], cells, slot_ids, parity, wih, whh)
+        with pytest.raises(ValueError, match="slot ids"):
+            oasr.lstm_slot_step(x, ring, cells, slot_ids[:1], parity, wih, whh)
+        with pytest.raises(ValueError, match="read_parity"):
+            oasr.lstm_slot_step(x, ring, cells, slot_ids, parity[:1], wih, whh)
+
+
+class TestRecurrentContinuousBatching:
+    """Timestep-granular continuous batching against a per-sequence oracle."""
+
+    LENGTHS = [7, 3, 11, 2, 9, 5, 13, 4, 6, 8]
+
+    def _drive(self, module, cache, batcher, sequences):
+        collected = {key: [] for key in sequences}
+        ticks = 0
+        while True:
+            plan = batcher.next_step()
+            if plan is None:
+                break
+            out = module.step(plan.frames, cache, plan.slot_ids, plan.read_parity)
+            assert out.shape == (len(plan.stream_ids), module.hidden_size)
+            for row, key in enumerate(plan.stream_ids):
+                collected[key].append(out[row].clone())
+            batcher.commit(plan)
+            ticks += 1
+        return collected, ticks
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("cls,layers", [(LSTM, 2), (RNN, 1)])
+    def test_matches_per_sequence_forward(self, device, dtype, cls, layers):
+        from oasr.cache import RecurrentContinuousBatcher, RecurrentStateCache
+
+        hidden = width = 256
+        slots = 4
+        module = cls(width, hidden, layers).cuda().to(dtype)
+        cache = RecurrentStateCache(
+            layers, hidden, slots, torch.device("cuda"), dtype, cell=(cls is LSTM)
+        )
+        batcher = RecurrentContinuousBatcher(cache, width)
+        g = torch.Generator(device="cuda").manual_seed(21)
+        sequences = {
+            i: torch.randn(n, width, device="cuda", dtype=dtype, generator=g) * 0.5
+            for i, n in enumerate(self.LENGTHS)
+        }
+        for key, frames in sequences.items():
+            batcher.submit(key, frames)
+
+        collected, ticks = self._drive(module, cache, batcher, sequences)
+
+        # Every frame was stepped exactly once, and no cohort ran past its length.
+        assert ticks >= max(self.LENGTHS)
+        assert sum(len(v) for v in collected.values()) == sum(self.LENGTHS)
+        for key, frames in sequences.items():
+            assert len(collected[key]) == frames.shape[0]
+            expected = module(frames.unsqueeze(1))[0][:, 0]
+            torch.testing.assert_close(torch.stack(collected[key]), expected, rtol=2e-2, atol=2e-2)
+
+    def test_slots_are_recycled_not_leaked(self, device):
+        from oasr.cache import RecurrentContinuousBatcher, RecurrentStateCache
+
+        cache = RecurrentStateCache(1, 32, 2, torch.device("cuda"), torch.float16)
+        batcher = RecurrentContinuousBatcher(cache, 32)
+        module = LSTM(32, 32, 1).cuda().half()
+        for i, n in enumerate([1, 2, 3, 1, 2]):
+            batcher.submit(i, torch.randn(n, 32, device="cuda", dtype=torch.float16))
+        seen_peak = 0
+        while True:
+            plan = batcher.next_step()
+            if plan is None:
+                break
+            module.step(plan.frames, cache, plan.slot_ids, plan.read_parity)
+            batcher.commit(plan)
+            seen_peak = max(seen_peak, len(plan.stream_ids))
+        # Five streams through two slots: capacity was reused, never exceeded.
+        assert seen_peak == 2
+        assert batcher.active == 0 and batcher.pending == 0
+        assert not batcher
+
+    def test_fresh_slot_starts_from_zero_state(self, device):
+        """An admitted stream must see zero h/c, not the retired stream's tail."""
+        from oasr.cache import RecurrentContinuousBatcher, RecurrentStateCache
+
+        hidden = width = 64
+        module = LSTM(width, hidden, 1).cuda().half()
+        cache = RecurrentStateCache(1, hidden, 1, torch.device("cuda"), torch.float16)
+        batcher = RecurrentContinuousBatcher(cache, width)
+        g = torch.Generator(device="cuda").manual_seed(31)
+        first = torch.randn(4, width, device="cuda", dtype=torch.float16, generator=g)
+        second = torch.randn(3, width, device="cuda", dtype=torch.float16, generator=g)
+        batcher.submit("first", first)
+        batcher.submit("second", second)
+        out = {"first": [], "second": []}
+        while True:
+            plan = batcher.next_step()
+            if plan is None:
+                break
+            y = module.step(plan.frames, cache, plan.slot_ids, plan.read_parity)
+            out[plan.stream_ids[0]].append(y[0].clone())
+            batcher.commit(plan)
+        # The second stream ran on the slot the first one released.
+        expected = module(second.unsqueeze(1))[0][:, 0]
+        torch.testing.assert_close(torch.stack(out["second"]), expected, rtol=2e-2, atol=2e-2)
+
+    def test_step_rejects_geometry_and_dtype_mismatch(self, device):
+        from oasr.cache import RecurrentStateCache
+
+        cache = RecurrentStateCache(1, 32, 2, torch.device("cuda"), torch.float16)
+        module = LSTM(32, 32, 1).cuda().half()
+        slot_ids = torch.zeros(1, device="cuda", dtype=torch.int64)
+        parity = torch.zeros(1, device="cuda", dtype=torch.int32)
+        with pytest.raises(ValueError, match="step frames"):
+            module.step(
+                torch.randn(1, 7, device="cuda", dtype=torch.float16), cache, slot_ids, parity
+            )
+        with pytest.raises(ValueError, match="does not match"):
+            LSTM(32, 64, 1).cuda().half().step(
+                torch.randn(1, 32, device="cuda", dtype=torch.float16), cache, slot_ids, parity
+            )
+        with pytest.raises(NotImplementedError, match="no torch fallback"):
+            module.float().step(
+                torch.randn(1, 32, device="cuda", dtype=torch.float32), cache, slot_ids, parity
+            )
+        rnn_cache = RecurrentStateCache(1, 32, 2, torch.device("cuda"), torch.float16, cell=False)
+        with pytest.raises(ValueError, match="cell state"):
+            LSTM(32, 32, 1).cuda().half().step(
+                torch.randn(1, 32, device="cuda", dtype=torch.float16),
+                rnn_cache,
+                slot_ids,
+                parity,
+            )
+
+    def test_long_run_compacts_retired_frames(self, device):
+        """A batcher that outlives its streams must not retain every one of them.
+
+        Retired frames stay addressable until half the packed buffer is dead, so
+        the buffer is bounded by the live corpus rather than by everything ever
+        submitted -- and the streams that ran after a compaction must still be
+        correct, which is what would break if a base offset went stale.
+        """
+        from oasr.cache import RecurrentContinuousBatcher, RecurrentStateCache
+
+        hidden = width = 64
+        slots = 4
+        module = LSTM(width, hidden, 1).cuda().half()
+        cache = RecurrentStateCache(1, hidden, slots, torch.device("cuda"), torch.float16)
+        batcher = RecurrentContinuousBatcher(cache, width)
+        g = torch.Generator(device="cuda").manual_seed(41)
+        lengths = [3, 9, 5, 12, 4, 7, 6, 11, 2, 8] * 6
+        sequences = {
+            i: torch.randn(n, width, device="cuda", dtype=torch.float16, generator=g) * 0.4
+            for i, n in enumerate(lengths)
+        }
+        # Submitted in waves, as a server receives them -- all-up-front would make
+        # the first pack hold the whole corpus by definition and prove nothing.
+        pending = list(sequences.items())
+        collected = {key: [] for key in sequences}
+        peak_packed = 0
+        while pending or batcher:
+            for key, frames in pending[:10]:
+                batcher.submit(key, frames)
+            pending = pending[10:]
+            for _ in range(20):
+                plan = batcher.next_step()
+                if plan is None:
+                    break
+                out = module.step(plan.frames, cache, plan.slot_ids, plan.read_parity)
+                for row, key in enumerate(plan.stream_ids):
+                    collected[key].append(out[row].clone())
+                batcher.commit(plan)
+                peak_packed = max(peak_packed, batcher._packed.shape[0])
+
+        assert sum(len(v) for v in collected.values()) == sum(lengths)
+        # Compaction happened: the buffer never had to hold every submission.
+        assert peak_packed < sum(lengths)
+        # The last few streams ran entirely after compactions rebased the buffer.
+        for key in list(sequences)[-4:]:
+            expected = module(sequences[key].unsqueeze(1))[0][:, 0]
+            torch.testing.assert_close(torch.stack(collected[key]), expected, rtol=2e-2, atol=2e-2)
