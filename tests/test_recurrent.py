@@ -867,3 +867,103 @@ class TestRecurrentContinuousBatching:
         for key in list(sequences)[-4:]:
             expected = module(sequences[key].unsqueeze(1))[0][:, 0]
             torch.testing.assert_close(torch.stack(collected[key]), expected, rtol=2e-2, atol=2e-2)
+
+
+class TestRecurrentInferenceTensors:
+    """A module built or moved inside ``torch.inference_mode()``.
+
+    ``Tensor._version`` raises on an inference tensor, and the packed-parameter
+    cache read it on every forward — so constructing the layer inside
+    ``inference_mode`` took down the *first forward* with
+    ``RuntimeError: Inference tensors do not track version counter``, far from the
+    construction that caused it.  An inference tensor cannot be mutated in place,
+    so there is nothing for the counter to guard.
+    """
+
+    def test_layer_built_inside_inference_mode_still_runs(self, device):
+        from oasr.layers.recurrent import LSTM
+
+        with torch.inference_mode():
+            layer = LSTM(16, 16, num_layers=1).to(device, torch.float16).eval()
+            x = torch.randn(2, 3, 16, dtype=torch.float16, device=device)
+            out, (h, c) = layer(x)
+        assert out.shape == (2, 3, 16)
+        assert torch.isfinite(out).all()
+
+    def test_packed_parameters_are_reused_across_steps(self, device):
+        """The fast slot must be a hit, not a rebuild, on the second call."""
+        from oasr.layers.recurrent import LSTM
+
+        layer = LSTM(16, 16, num_layers=2).to(device, torch.float16).eval()
+        first = layer._packed_lstm_parameters(0)
+        second = layer._packed_lstm_parameters(0)
+        assert all(a is b for a, b in zip(first, second) if a is not None)
+
+    def test_an_in_place_weight_edit_invalidates(self, device):
+        """The version guard is what makes the fast slot safe to keep."""
+        from oasr.layers.recurrent import LSTM
+
+        layer = LSTM(16, 16, num_layers=1).to(device, torch.float16).eval()
+        before = layer._packed_lstm_parameters(0)[0].clone()
+        with torch.no_grad():
+            layer.weight_ih_l0.add_(1.0)
+        after = layer._packed_lstm_parameters(0)[0]
+        assert not torch.equal(before, after), "an in-place weight edit was served from cache"
+
+    def test_moving_the_module_invalidates(self, device):
+        from oasr.layers.recurrent import LSTM
+
+        layer = LSTM(16, 16, num_layers=1).to(device, torch.float16).eval()
+        packed = layer._packed_lstm_parameters(0)[0]
+        assert packed.dtype is torch.float16
+        layer.to(torch.float32)
+        assert layer._packed_lstm_parameters(0)[0].dtype is torch.float32
+
+
+class TestPackWarning:
+    """A direct functional caller repacks the weights on every call.
+
+    ``_pack_lstm_parameters`` is two permute-copies of the whole weight matrix —
+    40.9 us at LSTM(640, 640), more than the timestep it feeds — and is meant to
+    run once per weight set.  ``oasr.layers.LSTM`` caches it and threads the
+    result in; a caller reaching for ``oasr.lstm_gemm_layer`` directly gets no
+    cache, and nothing used to say so.
+    """
+
+    def _reset(self):
+        import oasr.functionals.recurrent as fr
+
+        fr._PACK_WARNED = False
+
+    def test_a_direct_caller_is_warned_once(self, device, caplog):
+        import logging
+
+        import oasr
+
+        self._reset()
+        H = 16
+        wih = torch.randn(4 * H, H, dtype=torch.float16, device=device) * 0.02
+        whh = torch.randn(4 * H, H, dtype=torch.float16, device=device) * 0.02
+        x = torch.randn(1, 4, H, dtype=torch.float16, device=device)
+        h = torch.zeros(4, H, dtype=torch.float16, device=device)
+        c = torch.zeros(4, H, dtype=torch.float16, device=device)
+        with caplog.at_level(logging.WARNING, logger="oasr.functionals.recurrent"):
+            for _ in range(3):
+                oasr.lstm_gemm_layer(x, h, c, wih, whh)
+        hits = [r for r in caplog.records if "_pack_lstm_parameters" in r.getMessage()]
+        assert len(hits) == 1, f"expected exactly one warning, got {len(hits)}"
+        assert "_packed_parameters" in hits[0].getMessage(), "the warning must name the fix"
+
+    def test_the_layer_is_not_warned(self, device, caplog):
+        import logging
+
+        from oasr.layers.recurrent import LSTM
+
+        self._reset()
+        layer = LSTM(16, 16, num_layers=2).to(device, torch.float16).eval()
+        x = torch.randn(1, 4, 16, dtype=torch.float16, device=device)
+        with caplog.at_level(logging.WARNING, logger="oasr.functionals.recurrent"):
+            for _ in range(3):
+                layer(x)
+        hits = [r for r in caplog.records if "_pack_lstm_parameters" in r.getMessage()]
+        assert not hits, "the layer caches the packed parameters and must stay quiet"

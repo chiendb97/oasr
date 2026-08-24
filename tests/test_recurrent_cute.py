@@ -220,3 +220,106 @@ class TestRecurrentCuteRouting:
             assert recurrent_cute.should_use(4, 640, 64)
         finally:
             recurrent_cute.set_mode(previous)
+
+
+class TestRoutedStepMemo:
+    """``routed_step`` memoises band + arch probe + compile behind one lookup.
+
+    That removed 1.18 us per layer per timestep (two table scans and a
+    ``functools.cache`` key build, twice over for a two-layer predictor).  The
+    hazard it introduces is staleness: a memo that survives ``set_mode`` would
+    make ``OASR_RECURRENT_CUTE=off`` -- the rollback switch -- do nothing.
+    """
+
+    def test_set_mode_invalidates_the_memo(self, device):
+        from oasr.jit import recurrent_cute as rc
+
+        before = rc.get_mode()
+        try:
+            rc.set_mode("auto")
+            routed = rc.routed_step(
+                dtype_str="float16", gate_count=4, activation="lstm", hidden=256, batch=128
+            )
+            if routed is None:
+                pytest.skip("this shape is not routed on this device")
+            rc.set_mode("off")
+            assert (
+                rc.routed_step(
+                    dtype_str="float16", gate_count=4, activation="lstm", hidden=256, batch=128
+                )
+                is None
+            ), "mode=off was served from the route memo"
+            rc.set_mode("auto")
+            assert (
+                rc.routed_step(
+                    dtype_str="float16", gate_count=4, activation="lstm", hidden=256, batch=128
+                )
+                is not None
+            )
+        finally:
+            rc.set_mode(before)
+
+    def test_declines_outside_the_band_without_compiling(self, device):
+        from oasr.jit import recurrent_cute as rc
+
+        before = rc.get_mode()
+        try:
+            rc.set_mode("auto")
+            # gate_count 1 (vanilla RNN) is never routed under auto.
+            assert (
+                rc.routed_step(
+                    dtype_str="float16", gate_count=1, activation="tanh", hidden=256, batch=128
+                )
+                is None
+            )
+        finally:
+            rc.set_mode(before)
+
+
+class TestCuteRuntimeStream:
+    """The shared stream helper (``oasr.jit.cute_runtime``).
+
+    Every compiled CuTeDSL callable needs a ``CUstream``, and the obvious
+    spelling — ``CUstream(torch.cuda.current_stream().cuda_stream)`` — cost 4.1 us
+    per call, which was two thirds of the recurrent step's launch and 15% of an
+    FMHA call.  Correctness is the point here: the handle must identify the
+    *current* stream, including a side stream, or a kernel lands on the wrong one.
+    """
+
+    def test_returns_the_current_stream(self, device):
+        import torch as _t
+
+        from oasr.jit.cute_runtime import current_stream
+
+        default = current_stream()
+        raw = _t._C._cuda_getCurrentRawStream(_t.cuda.current_device())
+        assert int(default) == int(raw)
+
+    def test_tracks_a_stream_switch(self, device):
+        import torch as _t
+
+        from oasr.jit.cute_runtime import current_stream
+
+        outer = int(current_stream())
+        side = _t.cuda.Stream()
+        with _t.cuda.stream(side):
+            inner = int(current_stream())
+        assert inner == side.cuda_stream
+        assert inner != outer, "a side stream must not be served the default handle"
+        assert int(current_stream()) == outer
+
+    def test_handles_are_cached_per_stream(self, device):
+        from oasr.jit.cute_runtime import current_stream
+
+        assert current_stream() is current_stream()
+
+    def test_the_fmha_path_uses_it(self):
+        """The FMHA hot path must go through the same helper, not rebuild it."""
+        import inspect
+
+        from oasr.functionals import attention
+
+        src = inspect.getsource(attention)
+        # The assignment, not the prose: the module documents the old spelling.
+        assert "stream = _CUstream(" not in src, "the 4.1 us spelling is back on the FMHA path"
+        assert src.count("stream = _current_stream()") >= 2

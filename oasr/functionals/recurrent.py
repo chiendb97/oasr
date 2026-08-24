@@ -5,12 +5,19 @@
 from __future__ import annotations
 
 import functools
+import logging
 from typing import Optional, Tuple
 
 import torch
 
 from oasr.api_logging import oasr_api
 from oasr.tune import OpKey, get_tuner, is_tuning_enabled
+
+logger = logging.getLogger("oasr.functionals.recurrent")
+
+#: One warning per process from :func:`_pack_lstm_parameters`; a caller that
+#: repacks per call needs telling once, not per timestep.
+_PACK_WARNED = False
 
 # Private Python/CUDA launcher contract.  The ordinary path uses a cheap
 # shape heuristic; OASR's existing autotuner can replace it per measured shape.
@@ -36,35 +43,42 @@ def _check_layer_inputs(
     gate_count: int,
     batch_first: bool,
 ) -> Tuple[int, int, int]:
-    if input.dim() != 3:
-        raise ValueError(f"recurrent layer expects a 3-D input, got shape {tuple(input.shape)}")
-    sequence_length = input.shape[1 if batch_first else 0]
-    batch_size = input.shape[0 if batch_first else 1]
-    input_size = input.shape[2]
-    if min(sequence_length, batch_size, input_size) <= 0:
+    # A T=1 step runs this once per layer, so a transducer predictor pays it per
+    # emitted label.  ``torch.Size`` is already a tuple and compares equal to
+    # one, so the comparisons below use it directly; wrapping each in ``tuple()``
+    # copied four shapes per call for nothing.  ``tuple()`` stays in the error
+    # messages, which are cold.
+    shape = input.shape
+    if len(shape) != 3:
+        raise ValueError(f"recurrent layer expects a 3-D input, got shape {tuple(shape)}")
+    sequence_length = shape[1] if batch_first else shape[0]
+    batch_size = shape[0] if batch_first else shape[1]
+    input_size = shape[2]
+    if sequence_length <= 0 or batch_size <= 0 or input_size <= 0:
         raise ValueError(
             "recurrent input dimensions must be positive, got "
             f"sequence={sequence_length}, batch={batch_size}, input_size={input_size}"
         )
-    if weight_hh.dim() != 2:
-        raise ValueError(f"weight_hh must be 2-D, got shape {tuple(weight_hh.shape)}")
-    hidden_size = weight_hh.shape[1]
-    expected_ih = (gate_count * hidden_size, input_size)
-    expected_hh = (gate_count * hidden_size, hidden_size)
-    if tuple(weight_ih.shape) != expected_ih:
-        raise ValueError(f"weight_ih must have shape {expected_ih}, got {tuple(weight_ih.shape)}")
-    if tuple(weight_hh.shape) != expected_hh:
-        raise ValueError(f"weight_hh must have shape {expected_hh}, got {tuple(weight_hh.shape)}")
-    if tuple(initial_h.shape) != (batch_size, hidden_size):
+    hh_shape = weight_hh.shape
+    if len(hh_shape) != 2:
+        raise ValueError(f"weight_hh must be 2-D, got shape {tuple(hh_shape)}")
+    hidden_size = hh_shape[1]
+    gated = gate_count * hidden_size
+    if weight_ih.shape != (gated, input_size):
+        raise ValueError(
+            f"weight_ih must have shape {(gated, input_size)}, got {tuple(weight_ih.shape)}"
+        )
+    if hh_shape != (gated, hidden_size):
+        raise ValueError(f"weight_hh must have shape {(gated, hidden_size)}, got {tuple(hh_shape)}")
+    if initial_h.shape != (batch_size, hidden_size):
         raise ValueError(
             f"initial_h must have shape {(batch_size, hidden_size)}, "
             f"got {tuple(initial_h.shape)}"
         )
-    for name, bias in (("bias_ih", bias_ih), ("bias_hh", bias_hh)):
-        if bias is not None and tuple(bias.shape) != (gate_count * hidden_size,):
-            raise ValueError(
-                f"{name} must have shape {(gate_count * hidden_size,)}, got {tuple(bias.shape)}"
-            )
+    if bias_ih is not None and bias_ih.shape != (gated,):
+        raise ValueError(f"bias_ih must have shape {(gated,)}, got {tuple(bias_ih.shape)}")
+    if bias_hh is not None and bias_hh.shape != (gated,):
+        raise ValueError(f"bias_hh must have shape {(gated,)}, got {tuple(bias_hh.shape)}")
     return sequence_length, batch_size, hidden_size
 
 
@@ -107,7 +121,27 @@ def _pack_lstm_parameters(
     bias_ih: Optional[torch.Tensor],
     bias_hh: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Convert PyTorch gate-major parameters to ``[hidden, gate]`` rows."""
+    """Convert PyTorch gate-major parameters to ``[hidden, gate]`` rows.
+
+    Two permute-copies of the whole weight matrix and one of the bias — **40.9 us
+    at LSTM(640, 640)**, which is more than the timestep it feeds.  It is meant to
+    run once per set of weights, not once per call.
+
+    :class:`oasr.layers.LSTM` caches it per layer and threads the result in as
+    ``_packed_parameters``; a caller reaching for ``oasr.lstm_gemm_layer``
+    directly gets no such cache and nothing used to say so.  Hence the warning
+    below: it fires once per process, names the parameter to pass, and stays out
+    of the way of the layer, which never reaches it.
+    """
+    global _PACK_WARNED
+    if not _PACK_WARNED:
+        _PACK_WARNED = True
+        logger.warning(
+            "_pack_lstm_parameters ran inside a recurrent layer call: this repacks "
+            "the whole weight matrix (~41 us at hidden=640, more than the timestep "
+            "it feeds) and is meant to run once per weight set. Pass the result as "
+            "`_packed_parameters=`, or use oasr.layers.LSTM / RNN, which cache it."
+        )
     hidden_size = weight_hh.shape[1]
 
     def pack_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -206,7 +240,7 @@ def lstm_layer(
     sequence_length, batch_size, hidden_size = _check_layer_inputs(
         input, initial_h, weight_ih, weight_hh, bias_ih, bias_hh, 4, batch_first
     )
-    if tuple(initial_c.shape) != (batch_size, hidden_size):
+    if initial_c.shape != (batch_size, hidden_size):
         raise ValueError(
             f"initial_c must have shape {(batch_size, hidden_size)}, "
             f"got {tuple(initial_c.shape)}"
@@ -298,15 +332,14 @@ def _lstm_step_cute(
     from oasr.jit import recurrent_cute
 
     dtype_str = "float16" if input_gates.dtype is torch.float16 else "bfloat16"
-    try:
-        step = recurrent_cute.get_compiled_step(
-            dtype_str=dtype_str,
-            gate_count=4,
-            activation="lstm",
-            hidden=out_h.shape[1],
-            batch=out_h.shape[0],
-        )
-    except Exception:  # unsupported arch, missing CuTeDSL, or an unbuildable tile
+    step = recurrent_cute.routed_step(
+        dtype_str=dtype_str,
+        gate_count=4,
+        activation="lstm",
+        hidden=out_h.shape[1],
+        batch=out_h.shape[0],
+    )
+    if step is None:
         return False
     step(
         previous_h,
@@ -347,7 +380,7 @@ def lstm_gemm_layer(
     sequence_length, batch_size, hidden_size = _check_layer_inputs(
         input, initial_h, weight_ih, weight_hh, bias_ih, bias_hh, 4, batch_first
     )
-    if tuple(initial_c.shape) != (batch_size, hidden_size):
+    if initial_c.shape != (batch_size, hidden_size):
         raise ValueError(
             f"initial_c must have shape {(batch_size, hidden_size)}, "
             f"got {tuple(initial_c.shape)}"
@@ -376,9 +409,11 @@ def lstm_gemm_layer(
     # unused allocations plus the cell ring cost about as much host time as the
     # kernel costs GPU time.
     if sequence_length == 1 and _tactic is None:
-        from oasr.jit import recurrent_cute
-
-        if recurrent_cute.should_use(4, hidden_size, batch_size) and _lstm_step_cute(
+        # ``_lstm_step_cute`` owns the whole decision now -- band, arch probe and
+        # compile all memoise behind one dict lookup in
+        # ``recurrent_cute.routed_step``, so asking ``should_use`` here first only
+        # paid for the table scan twice.
+        if _lstm_step_cute(
             input_gates[0],
             initial_h,
             initial_c,
