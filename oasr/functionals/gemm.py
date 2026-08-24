@@ -262,6 +262,44 @@ def _bmm_fn(compile_name: str):
     return getattr(_get_bmm_module(), f"bmm_{compile_name}")
 
 
+@functools.cache
+def _general_bmm_fn():
+    """Resolve the general (strided / unaligned) CUTLASS BMM dispatcher."""
+    return _get_bmm_module().bmm
+
+
+def _general_bmm_shapes(A, B, out):
+    """``(out, output_shape, M, N, K)`` for the 3-D/4-D broadcasting cases.
+
+    Off the hot path on purpose — every caller that reaches this has at least one
+    4-D operand, which is a shape the pre-KG5 contract could not express at all.
+    """
+    a_batch = A.shape[:-2]
+    b_batch = B.shape[:-2]
+    if not 1 <= len(a_batch) <= 2 or not 1 <= len(b_batch) <= 2:
+        raise ValueError(f"bmm expects 3-D or 4-D operands, got A={A.ndim}D and B={B.ndim}D")
+    M, K = A.shape[-2], A.shape[-1]
+    N, b_k = B.shape[-2], B.shape[-1]
+    if b_k != K:
+        raise ValueError(f"bmm contraction mismatch: A has K={K}, B has K={b_k}")
+
+    width = max(len(a_batch), len(b_batch))
+    a_padded = (1,) * (width - len(a_batch)) + tuple(a_batch)
+    b_padded = (1,) * (width - len(b_batch)) + tuple(b_batch)
+    for x, y in zip(a_padded, b_padded):
+        if x != y and x != 1 and y != 1:
+            raise ValueError(
+                f"bmm batch dimensions are not broadcastable: "
+                f"A{tuple(a_batch)} vs B{tuple(b_batch)}"
+            )
+    output_shape = (*(max(x, y) for x, y in zip(a_padded, b_padded)), M, N)
+    if out is None:
+        out = torch.empty(output_shape, device=A.device, dtype=A.dtype)
+    elif out.shape != output_shape:
+        raise ValueError(f"bmm out has shape {tuple(out.shape)}, expected {output_shape}")
+    return out, output_shape, M, N, K
+
+
 def _dispatch_bmm(out, A, B, N, K) -> None:
     """Shape-aware non-tuning dispatch for ``bmm``.
 
@@ -375,37 +413,89 @@ def bmm(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Batched matrix multiplication: D[b] = A[b] @ B[b].
+    """Batched matrix multiplication: ``D = A @ B.transpose(-1, -2)``.
+
+    One or two batch dimensions, broadcast against each other.  ``B`` is the
+    logical ``[..., N, K]`` operand — the historical OASR contract, and
+    CUTLASS's ColumnMajor layout — but it may be contiguous along *either*
+    trailing axis, so a permuted view is accepted without materializing a
+    transpose.  N and K are arbitrary; contiguous 3-D alignment-8 problems stay
+    on the tuned tile lane.
 
     Args:
-        A: Input [batch_size, M, K].
-        B: Input [batch_size, N, K].
+        A: Input ``[..., M, K]`` with one or two batch dimensions.
+        B: Input ``[..., N, K]``.
         out: Optional pre-allocated output tensor.
 
     Returns:
-        Output [batch_size, M, N].
+        Output ``broadcast(batch shapes) + (M, N)``.
     """
-    batch_size, M, K = A.shape
-    N = B.shape[1]
-    if out is None:
-        out = torch.empty(batch_size, M, N, device=A.device, dtype=A.dtype)
+    # Python cost is the metric that matters here, so the pre-KG5 shape — two
+    # 3-D operands — gets its own minimal branch and never touches the general
+    # broadcast machinery.  That is not premature: a Zipformer forward is
+    # host-issue-bound at every batch size measured (wall time == enqueue time
+    # up to batch 32), and measured against `main`, routing the 3-D case through
+    # the general shape code cost **+2.0 us per call, 1.15x geomean** on exactly
+    # the shapes that were supported before.  Kernel time was unchanged; all of
+    # it was argument handling.  Hence: no `shape[:-2]` slices (each allocates a
+    # tuple), no helper frame around the lane test, and `torch.Size` compared
+    # directly to a tuple rather than through `tuple()`.
+    if A.ndim == 3 and B.ndim == 3:
+        a_batch, M, K = A.shape
+        b_batch, N, b_k = B.shape
+        if b_k != K:
+            raise ValueError(f"bmm contraction mismatch: A has K={K}, B has K={b_k}")
+        if a_batch == b_batch:
+            batch = a_batch
+        elif a_batch == 1 or b_batch == 1:
+            batch = a_batch if b_batch == 1 else b_batch
+        else:
+            raise ValueError(
+                f"bmm batch dimensions are not broadcastable: A({a_batch},) vs B({b_batch},)"
+            )
+        if out is None:
+            # `torch.empty` with varargs, and no shape tuple built at all: this
+            # is the branch every caller that does not pre-allocate takes.
+            out = torch.empty(batch, M, N, device=A.device, dtype=A.dtype)
+            out_is_contiguous = True  # by construction, so do not go ask it
+        else:
+            if out.shape != (batch, M, N):
+                raise ValueError(f"bmm out has shape {tuple(out.shape)}, expected {(batch, M, N)}")
+            out_is_contiguous = out.is_contiguous()
+        # The tuned lane's contract, inlined.  Cheapest clauses first: the batch
+        # compare and the two remainders are integer work, `is_contiguous()`
+        # crosses into C++ and was 0.07 us a call.
+        use_aligned = (
+            a_batch == b_batch
+            and N % 8 == 0
+            and K % 8 == 0
+            and out_is_contiguous
+            and A.is_contiguous()
+            and B.is_contiguous()
+        )
+    else:
+        out, output_shape, M, N, K = _general_bmm_shapes(A, B, out)
+        # A 4-D operand always broadcasts to a 4-D output, so the 3-D tuned lane
+        # is unreachable from here and does not need re-testing.
+        use_aligned = False
 
-    from oasr.tune import is_tuning_enabled
-
-    if is_tuning_enabled():
+    if is_tuning_enabled() and use_aligned:
         from oasr.tune import get_tuner
         from oasr.tune.autotuner import OpKey
 
         get_tuner().dispatch(
             op_key=OpKey("gemm", "bmm"),
-            shape_sig=(batch_size, M, N, K),
+            shape_sig=(A.shape[0], M, N, K),
             dtype=A.dtype,
             device=A.device,
             runner_args=(out, A, B),
         )
         return out
 
-    _dispatch_bmm(out, A, B, N, K)
+    if use_aligned:
+        _dispatch_bmm(out, A, B, N, K)
+    else:
+        _general_bmm_fn()(out, A, B)
     return out
 
 

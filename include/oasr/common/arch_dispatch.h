@@ -36,6 +36,28 @@ inline int getDeviceSmVersion() {
     return cached[device];
 }
 
+/**
+ * @brief Number of SMs on the current CUDA device.
+ *
+ * Cached per device ordinal, like getDeviceSmVersion().  A kernel that has to
+ * choose a tile shape needs this: the CTA count a tile produces is only
+ * meaningful against the device it will run on.
+ */
+inline int getDeviceMultiProcessorCount() {
+    int device = 0;
+    cudaGetDevice(&device);
+
+    static int cached[16] = {};
+    if (cached[device] != 0) {
+        return cached[device];
+    }
+
+    int count = 0;
+    cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device);
+    cached[device] = count > 0 ? count : 1;
+    return cached[device];
+}
+
 /** Map a runtime SM version to the highest compiled family not exceeding it. */
 inline int resolveSmVersion(int sm) {
     if (sm >= 120) return 120;

@@ -48,6 +48,24 @@ _WHISPER_SHAPES = [(384, 384), (1536, 384), (384, 1536)]
 _WHISPER_MS = [128, 256, 1500, 3000, 6000, 12000, 24000, 96000]
 
 
+def test_capture_reads_bmm_shapes_off_the_trailing_axes():
+    """A 4-D BMM must not have its N recorded from the contraction axis.
+
+    ``_shapes_of`` used to read ``B.shape[1]``, which is N only for a 3-D
+    operand.  On Zipformer's 4-D calls that is the *batch* axis, so the tuner
+    would have keyed rules on a shape that never ran.
+    """
+    from oasr.tune.capture import _shapes_of
+
+    A = torch.empty(8, 3, 17, 4, device="cuda", dtype=torch.float16)
+    B = torch.empty(8, 1, 33, 4, device="cuda", dtype=torch.float16)
+    assert _shapes_of("bmm", (A, B), {}) == (17, 33, 4, 24)
+
+    A3 = torch.empty(5, 17, 8, device="cuda", dtype=torch.float16)
+    B3 = torch.empty(5, 33, 8, device="cuda", dtype=torch.float16)
+    assert _shapes_of("bmm", (A3, B3), {}) == (17, 33, 8, 5)
+
+
 class TestTorchBackend:
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_torch_gemm(self, dtype):

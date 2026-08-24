@@ -35,11 +35,19 @@ from .scaling import (
     convert_num_channels,
 )
 
-# NOTE: the attention score / value products stay on ``torch.matmul``.  Zipformer's
-# head dims (pos_head_dim=4, value_head_dim=6/12) and the rel-pos length (always
-# odd: 2*T-1) violate ``oasr.bmm``'s CUTLASS 8-element N/K alignment, so the fused
-# GEMM cannot run these shapes.  The big projections (in_proj/out_proj/linear_pos)
-# and the softmax do go through OASR kernels.
+# Zipformer's attention is decomposed on purpose: the probabilities are
+# materialized once in ``RelPositionMultiheadAttentionWeights`` and *shared* by
+# ``SelfAttention`` and ``NonlinAttention``, so FMHA -- which never materializes
+# them -- cannot express it at any point.  ``oasr.bmm``'s general lane runs the
+# five products directly: 4-D permuted operands, a batch axis broadcast over the
+# request batch, and the small/unaligned head dims (query 32, pos 4, value 12)
+# with an always-odd relative-position extent.
+#
+# The operand handed to ``oasr.bmm`` is always the logical ``[..., N, K]``, and
+# the kernel takes it contiguous along *either* trailing axis.  So the score
+# products keep K in ``[..., time, head_dim]`` form instead of materializing a
+# transpose, and the value products pass ``[..., value_dim, time]`` as a plain
+# permuted view -- neither needs a copy.
 
 
 def _to_tuple(x, length: int):
@@ -146,15 +154,15 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
 
         q = q.permute(2, 1, 0, 3)  # (head, batch, time1, query_head_dim)
         p = p.permute(2, 1, 0, 3)  # (head, batch, time1, pos_head_dim)
-        k = k.permute(2, 1, 3, 0)  # (head, batch, d_k, time2)
+        k = k.permute(2, 1, 0, 3)  # (head, batch, time2, query_head_dim)
 
-        attn_scores = torch.matmul(q, k)
+        attn_scores = oasr.bmm(q, k)
 
         pos_emb = self.linear_pos(pos_emb)
         seq_len2 = 2 * seq_len - 1
-        pos_emb = pos_emb.reshape(-1, seq_len2, num_heads, pos_head_dim).permute(2, 0, 3, 1)
-        # (head, {1 or batch}, pos_dim, seq_len2)
-        pos_scores = torch.matmul(p, pos_emb)
+        pos_emb = pos_emb.reshape(-1, seq_len2, num_heads, pos_head_dim).permute(2, 0, 1, 3)
+        # (head, {1 or batch}, seq_len2, pos_dim)
+        pos_scores = oasr.bmm(p, pos_emb)
         pos_scores = pos_scores.as_strided(
             (num_heads, batch_size, seq_len, seq_len),
             (
@@ -209,14 +217,14 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
 
         q = q.permute(2, 1, 0, 3)  # (head, batch, time1, query_head_dim)
         p = p.permute(2, 1, 0, 3)  # (head, batch, time1, pos_head_dim)
-        k = k.permute(2, 1, 3, 0)  # (head, batch, d_k, k_len)
+        k = k.permute(2, 1, 0, 3)  # (head, batch, k_len, query_head_dim)
 
-        attn_scores = torch.matmul(q, k)
+        attn_scores = oasr.bmm(q, k)
 
         pos_emb = self.linear_pos(pos_emb)
         seq_len2 = 2 * seq_len - 1 + left_context_len
-        pos_emb = pos_emb.reshape(-1, seq_len2, num_heads, pos_head_dim).permute(2, 0, 3, 1)
-        pos_scores = torch.matmul(p, pos_emb)
+        pos_emb = pos_emb.reshape(-1, seq_len2, num_heads, pos_head_dim).permute(2, 0, 1, 3)
+        pos_scores = oasr.bmm(p, pos_emb)
         pos_scores = pos_scores.as_strided(
             (num_heads, batch_size, seq_len, k_len),
             (
@@ -248,8 +256,10 @@ class SelfAttention(nn.Module):
         seq_len, batch_size, embed_dim = x.shape
         num_heads = attn_weights.shape[0]
         x = self.in_proj(x)
-        x = x.reshape(seq_len, batch_size, num_heads, -1).permute(2, 1, 0, 3)
-        x = torch.matmul(attn_weights, x)
+        # (head, batch, value_head_dim, time) -- the logical [N, K] operand, as a
+        # view: its N axis is the contiguous one, which oasr.bmm accepts.
+        x = x.reshape(seq_len, batch_size, num_heads, -1).permute(2, 1, 3, 0)
+        x = oasr.bmm(attn_weights, x)
         x = x.permute(2, 1, 0, 3).contiguous().view(seq_len, batch_size, -1)
         return self.out_proj(x)
 
@@ -263,8 +273,8 @@ class SelfAttention(nn.Module):
         assert cached_val.shape[0] == left_context_len, (cached_val.shape[0], left_context_len)
         x = torch.cat([cached_val, x], dim=0)
         cached_val = x[-left_context_len:, ...]
-        x = x.reshape(seq_len2, batch_size, num_heads, -1).permute(2, 1, 0, 3)
-        x = torch.matmul(attn_weights, x)
+        x = x.reshape(seq_len2, batch_size, num_heads, -1).permute(2, 1, 3, 0)
+        x = oasr.bmm(attn_weights, x)
         x = x.permute(2, 1, 0, 3).contiguous().view(seq_len, batch_size, -1)
         return self.out_proj(x), cached_val
 
@@ -303,8 +313,8 @@ class NonlinAttention(nn.Module):
         x = x * s
 
         num_heads = attn_weights.shape[0]
-        x = x.reshape(seq_len, batch_size, num_heads, -1).permute(2, 1, 0, 3)
-        x = torch.matmul(attn_weights, x)
+        x = x.reshape(seq_len, batch_size, num_heads, -1).permute(2, 1, 3, 0)
+        x = oasr.bmm(attn_weights, x)
         x = x.permute(2, 1, 0, 3).reshape(seq_len, batch_size, -1)
 
         x = x * y
@@ -326,7 +336,9 @@ class NonlinAttention(nn.Module):
         assert cached_x.shape[2] == left_context_len, (cached_x.shape[2], left_context_len)
         x_pad = torch.cat([cached_x, x], dim=2)
         cached_x = x_pad[:, :, -left_context_len:, :]
-        x = torch.matmul(attn_weights, x_pad)
+        # The cache is (head, batch, time, dim), so the [N, K] operand is its
+        # transposed view; ``cat`` already made it contiguous along dim.
+        x = oasr.bmm(attn_weights, x_pad.permute(0, 1, 3, 2))
         x = x.permute(2, 1, 0, 3).reshape(seq_len, batch_size, -1)
 
         x = x * y
