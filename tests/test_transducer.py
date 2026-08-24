@@ -968,3 +968,308 @@ class TestRealIcefallTransducer:
         )
         assert "in being comparatively modern" in greedy[1].lower()
         assert run(beam_size=1) == greedy
+
+
+class TestPredictorStepGraph:
+    """CUDA-graph capture of the predictor step (``oasr.engine.predictor_graph``).
+
+    The step is nine launches for tens of microseconds of GPU work, so capturing
+    it is worth ~1.3x on an offline Nemotron decode.  What has to be true is that
+    it changes *nothing*: the captured graph runs the same kernels in the same
+    order, so state, projections and transcripts must be bit-identical to the
+    eager path.  Every test here is an equality, not a tolerance.
+    """
+
+    @staticmethod
+    def _recurrent_model(vocab=24, enc_dim=16, hidden=32, layers=2, blank=0):
+        """A tiny transducer whose predictor carries recurrent state."""
+        from oasr.models.nemotron.predictor import NemotronRnntJoint, NemotronRnntPredictor
+
+        torch.manual_seed(7)
+        decoder = NemotronRnntPredictor(
+            vocab_size=vocab, hidden_size=hidden, num_layers=layers, blank_id=blank
+        )
+        joiner = NemotronRnntJoint(enc_dim, hidden, vocab)
+        return TransducerModel(nn.Identity(), decoder, joiner, blank_id=blank).eval()
+
+    def _strategy(self, model, graphs, max_sym=3):
+        cfg = SimpleNamespace(
+            device="cuda",
+            transducer_max_sym_per_frame=max_sym,
+            partial_decode_interval=1,
+            use_cuda_graphs=True,
+            use_transducer_cuda_graphs=graphs,
+        )
+        detok = SimpleNamespace(
+            detokenize=lambda ids: " ".join(map(str, ids)),
+            new_state=lambda: {"ids": [], "text": ""},
+            detokenize_incremental=lambda n, st: "",
+        )
+        return TransducerDecodeStrategy(cfg, detok, model)
+
+    # -- contract, no CUDA needed ---------------------------------------
+
+    def test_capturable_only_accepts_a_flat_cuda_tensor_state(self):
+        from oasr.engine.predictor_graph import PredictorStepGraphCache as C
+
+        assert not C.capturable(None)
+        assert not C.capturable(())
+        assert not C.capturable(torch.zeros(2))  # a bare tensor is not a state tuple
+        assert not C.capturable((torch.zeros(2),))  # CPU
+        assert not C.capturable(("x",))
+        if torch.cuda.is_available():
+            assert C.capturable((torch.zeros(2, device="cuda"),))
+            assert not C.capturable((torch.zeros(2, device="cuda"), torch.zeros(2)))
+
+    def test_detach_copies_every_tensor(self):
+        from oasr.engine.predictor_graph import PredictorStepGraphCache as C
+
+        src = (torch.zeros(2), torch.ones(3))
+        out = C.detach(src)
+        assert all(a is not b for a, b in zip(src, out))
+        assert all(torch.equal(a, b) for a, b in zip(src, out))
+        # A state shape it does not understand is handed back untouched.
+        assert C.detach("opaque") == "opaque"
+
+    # -- the graph reproduces the eager step exactly ---------------------
+
+    @pytest.mark.cuda
+    def test_graph_step_is_bit_identical_over_many_steps(self, device):
+        """Replay must equal ``advance`` + ``decoder_proj``, step after step.
+
+        Run the two arms forward together for several steps.  A single step could
+        pass while the write-back into the graph's own input buffers is wrong; a
+        chain cannot, because the second step would read the wrong state.
+        """
+        from oasr.engine.predictor_graph import PredictorStepGraphCache
+
+        model = self._recurrent_model().to(device)
+        decoder, joiner = model.decoder, model.joiner
+        B = 4
+        cache = PredictorStepGraphCache(decoder, joiner)
+        with torch.inference_mode():
+            eager = decoder.init_state(B, device)
+            graphed = tuple(t.clone() for t in eager)
+            for step in range(6):
+                tok = torch.arange(B, device=device, dtype=torch.long) + step + 1
+                emit = torch.tensor([True, False, True, True], device=device)
+                eager = decoder.advance(eager, tok, emit)
+                eager_proj = joiner.decoder_proj(decoder.predict(eager))
+                got = cache.step(graphed, tok, emit)
+                assert got is not None, "capture declined on a capturable state"
+                graphed, proj = got
+                for i, (a, b) in enumerate(zip(eager, graphed)):
+                    assert torch.equal(a, b), f"state[{i}] diverged at step {step}"
+                assert torch.equal(eager_proj, proj), f"projection diverged at step {step}"
+                # Keep the eager arm's own copy: the graph's is about to be reused.
+                graphed = cache.detach(graphed)
+        assert cache.num_captured == 1
+
+    @pytest.mark.cuda
+    def test_steady_state_needs_no_input_copy(self, device):
+        """Handing the graph's own state back must hit the copy-free path."""
+        from oasr.engine.predictor_graph import PredictorStepGraphCache
+
+        model = self._recurrent_model().to(device)
+        cache = PredictorStepGraphCache(model.decoder, model.joiner)
+        B = 2
+        with torch.inference_mode():
+            state = model.decoder.init_state(B, device)
+            tok = torch.zeros(B, dtype=torch.long, device=device)
+            emit = torch.ones(B, dtype=torch.bool, device=device)
+            state, _ = cache.step(state, tok, emit)
+            again, _ = cache.step(state, tok, emit)
+        assert all(
+            a is b for a, b in zip(state, again)
+        ), "the cache must return its own buffers so the next call skips the copy"
+
+    @pytest.mark.cuda
+    def test_capture_budget_declines_rather_than_growing(self, device):
+        from oasr.engine.predictor_graph import PredictorStepGraphCache
+
+        model = self._recurrent_model().to(device)
+        cache = PredictorStepGraphCache(model.decoder, model.joiner, max_captures=1)
+        with torch.inference_mode():
+            for B, expect in ((2, True), (3, False)):
+                state = model.decoder.init_state(B, device)
+                tok = torch.zeros(B, dtype=torch.long, device=device)
+                emit = torch.ones(B, dtype=torch.bool, device=device)
+                got = cache.step(state, tok, emit)
+                assert (got is not None) is expect, f"B={B}"
+        assert cache.num_captured == 1
+
+    @pytest.mark.cuda
+    def test_a_failed_capture_is_not_retried(self, device, monkeypatch):
+        """A capture costs a warm-up forward, so a failure must be remembered."""
+        from oasr.engine import predictor_graph as pg
+
+        model = self._recurrent_model().to(device)
+        cache = pg.PredictorStepGraphCache(model.decoder, model.joiner)
+        calls = []
+
+        def boom(*a, **k):
+            calls.append(1)
+            raise RuntimeError("nope")
+
+        monkeypatch.setattr(model.decoder, "advance", boom)
+        with torch.inference_mode():
+            # Built by hand, not via ``init_state`` — that calls ``_step``, and
+            # the patched ``advance`` is what has to be the thing that fails.
+            state = (
+                torch.zeros(2, 32, device=device),
+                torch.zeros(2, 2, 32, device=device),
+                torch.zeros(2, 2, 32, device=device),
+            )
+            tok = torch.zeros(2, dtype=torch.long, device=device)
+            emit = torch.ones(2, dtype=torch.bool, device=device)
+            assert cache.step(state, tok, emit) is None
+            n = len(calls)
+            assert cache.step(state, tok, emit) is None
+        assert len(calls) == n, "a remembered failure must not pay for another warm-up"
+
+    # -- end to end through the greedy loop ------------------------------
+
+    @pytest.mark.cuda
+    @pytest.mark.parametrize("batch", [1, 3])
+    def test_offline_decode_matches_the_eager_path(self, device, batch):
+        model = self._recurrent_model().to(device)
+        torch.manual_seed(11)
+        enc = torch.randn(batch, 9, 16, device=device)
+        lengths = torch.full((batch,), 9, dtype=torch.long, device=device)
+        off = self._strategy(model, graphs=False)
+        on = self._strategy(model, graphs=True)
+        with torch.inference_mode():
+            s0, p0 = off._init_state(batch, device)
+            a = off._greedy_loop(enc, lengths, s0, p0)[0]
+            s1, p1 = on._init_state(batch, device)
+            b = on._greedy_loop(enc, lengths, s1, p1)[0]
+        assert a == b
+        assert on._pred_graphs is not None and on._pred_graphs.num_captured >= 1
+
+    @pytest.mark.cuda
+    def test_the_loop_syncs_per_iteration_only_for_word_timings(self, device):
+        """``bool(emit.any())`` is a host sync inside the per-frame loop.
+
+        Dropping it lets the loop run fully async: the predictor step is masked by
+        ``emit`` either way, so a no-emission iteration mutates nothing — it only
+        costs one more ``(B,)`` snapshot in ``emitted``, ~1.1 us per entry at the
+        single readback after the loop, against a sync that makes the host wait
+        out everything the iteration queued.  Worth 1.04-1.17x on nemotron.
+
+        It is kept for word timings, where the per-step snapshot adds four eager
+        launches (clone, gather, vocab-wide logsumexp, exp) to *every* iteration
+        instead of to the emitting ones, and at batch 8 that costs more than the
+        sync saves (0.995x).
+
+        Counted, not timed: ``bool(tensor)`` goes through ``Tensor.__bool__``, so
+        the number of per-iteration syncs is observable exactly.  The loop keeps
+        one *other* sync — the termination check, once per
+        ``_TERMINATION_CHECK_STRIDE`` iterations — so the assertion is that the
+        no-timing path is bounded by that, not that it is zero.
+        """
+        from oasr.engine.decode import transducer as td_mod
+
+        model = self._recurrent_model().to(device)
+        strat = self._strategy(model, graphs=False, max_sym=3)
+        B, T = 4, 12
+        torch.manual_seed(11)
+        enc = torch.randn(B, T, 16, device=device)
+        lengths = torch.full((B,), T, dtype=torch.long, device=device)
+
+        counter = {"n": 0}
+        real_bool = torch.Tensor.__bool__
+
+        def counting_bool(self):
+            counter["n"] += 1
+            return real_bool(self)
+
+        def count(track):
+            counter["n"] = 0
+            state, proj = strat._init_state(B, device)
+            torch.Tensor.__bool__ = counting_bool
+            try:
+                with torch.inference_mode():
+                    hyps = strat._greedy_loop(enc, lengths, state, proj, track=track)[0]
+            finally:
+                torch.Tensor.__bool__ = real_bool
+            return counter["n"], hyps
+
+        n_plain, hyps_plain = count(False)
+        n_timed, hyps_timed = count(True)
+
+        # Same tokens either way: the two paths differ only in when the host looks.
+        assert hyps_plain == hyps_timed
+
+        stride = td_mod._TERMINATION_CHECK_STRIDE
+        max_steps = T * (3 + 1) + B + 1
+        budget = max_steps // stride + 4  # termination checks, plus slack
+        assert n_plain <= budget, (
+            f"the no-word-timing path made {n_plain} host syncs for at most "
+            f"{max_steps} iterations; only the termination check (every {stride}) "
+            f"should sync, so at most ~{budget}"
+        )
+        # And the word-timing path still branches per iteration, so it syncs more.
+        assert n_timed > n_plain, (
+            f"word-timing path made {n_timed} syncs vs {n_plain} without — the "
+            "per-iteration branch it needs is gone"
+        )
+
+    @pytest.mark.cuda
+    def test_two_session_groups_in_one_tick_do_not_share_graph_state(self, device):
+        """The state a group keeps must survive *another* group's replay.
+
+        Streams are grouped by chunk length, so one tick can run
+        ``_greedy_loop`` several times.  It hands back the graph's own buffers,
+        and the streaming path stores per-session state sliced out with
+        ``unstack_states`` — which for a recurrent predictor returns *views*.  So
+        group A stores views, group B replays the same graph, and group A's
+        stored state is now group B's.
+
+        The single-group case cannot show this: ``stack_states`` copies, and it
+        runs before the next replay.  Two groups per tick is what opens the
+        window, which is why this keeps A's rows *unrestacked* across B's call.
+
+        The assertion is on the **state tensors**, not on the transcript: a tiny
+        randomly-initialised model's argmax barely depends on the predictor, so
+        comparing hypotheses lets the corruption through.  Revert the ``detach``
+        in ``_greedy_loop`` and this fails on the first tick.
+        """
+        model = self._recurrent_model().to(device)
+        torch.manual_seed(13)
+        a_chunks = [torch.randn(2, 5, 16, device=device) for _ in range(3)]
+        b_chunks = [torch.randn(2, 5, 16, device=device) * 3 for _ in range(3)]
+        lengths = torch.full((2,), 5, dtype=torch.long, device=device)
+
+        def rollout(graphs):
+            strat = self._strategy(model, graphs=graphs)
+            with torch.inference_mode():
+                sa, pa = strat._init_state(2, device)
+                sb, pb = strat._init_state(2, device)
+                trace = []
+                for ca, cb in zip(a_chunks, b_chunks):
+                    ha, _, sa, pa = strat._greedy_loop(ca, lengths, sa, pa)
+                    # What the streaming path stores: per-session rows.
+                    rows_a = model.decoder.unstack_states(sa)
+                    proj_a = [pa[i : i + 1] for i in range(2)]
+                    # ...and then another group runs in the same tick.
+                    hb, _, sb, pb = strat._greedy_loop(cb, lengths, sb, pb)
+                    # ...and only now does A restack what it stored.
+                    sa = model.decoder.stack_states(rows_a)
+                    pa = torch.cat(proj_a, dim=0)
+                    trace.append(
+                        (
+                            [list(h) for h in ha],
+                            [list(h) for h in hb],
+                            [t.clone() for t in sa],
+                            pa.clone(),
+                        )
+                    )
+                return trace
+
+        eager, graphed = rollout(False), rollout(True)
+        for tick, (e, g) in enumerate(zip(eager, graphed)):
+            assert e[0] == g[0], f"tick {tick}: group A hypotheses diverged"
+            assert e[1] == g[1], f"tick {tick}: group B hypotheses diverged"
+            for i, (x, y) in enumerate(zip(e[2], g[2])):
+                assert torch.equal(x, y), f"tick {tick}: group A state[{i}] diverged"
+            assert torch.equal(e[3], g[3]), f"tick {tick}: group A projection diverged"

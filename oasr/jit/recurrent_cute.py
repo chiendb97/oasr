@@ -53,7 +53,8 @@ defaulted to off because those had not been removed yet and the eager path was
 host per call against ``torch.addmm``'s 10.9 for the same projection.
 
 Most of the eager gap was avoidable and is now gone -- ``torch.cuda.current_stream()``
-alone cost 4.1 us per call against a 6 us kernel.  See :func:`current_stream`.
+alone cost 4.1 us per call against a 6 us kernel.  See
+:mod:`oasr.jit.cute_runtime`, which the FMHA call sites now share.
 """
 
 from __future__ import annotations
@@ -161,6 +162,12 @@ def _read_mode() -> str:
 _MODE = _read_mode()
 
 
+#: ``(dtype_str, gate_count, activation, hidden, batch)`` -> the compiled step, or
+#: ``None`` when this shape is outside the band or the kernel is unavailable.
+#: Populated by :func:`routed_step`; cleared by :func:`set_mode`.
+_ROUTE: dict = {}
+
+
 def get_mode() -> str:
     return _MODE
 
@@ -173,6 +180,10 @@ def set_mode(mode: str) -> None:
     _MODE = mode
     _compiled_step.cache_clear()
     _probe.cache_clear()
+    # ``routed_step`` memoises the *whole* decision, gate included, so a mode
+    # change that did not clear it would keep serving the old routing -- which is
+    # exactly what an A/B or a rollback switch is for.
+    _ROUTE.clear()
 
 
 @functools.cache
@@ -320,44 +331,55 @@ def get_compiled_step(*, dtype_str: str, gate_count: int, activation: str, hidde
     return _compiled_step(cap, dtype_str, gate_count, activation, tile)
 
 
-#: Getting the stream handle the obvious way costs 4.8 us per call -- most of it
-#: in ``torch.cuda.current_stream()``, which builds a Python ``Stream`` object --
-#: against a kernel that runs in 6.  So two things happen here: the raw pointer
-#: comes from the C accessor (0.07 us, and inductor uses the same one), and the
-#: ``CUstream`` wrapper is cached against it.  Correctness is unaffected: the
-#: pointer identifies the stream, it is re-read every call so a caller switching
-#: streams is still honoured, and ``CUstream`` is a plain handle wrapper.
-_STREAMS: dict = {}
-_RAW_STREAM = getattr(__import__("torch")._C, "_cuda_getCurrentRawStream", None)
+def routed_step(*, dtype_str: str, gate_count: int, activation: str, hidden: int, batch: int):
+    """The step to run for this shape, or ``None`` to leave it on the other path.
+
+    ``should_use()`` followed by ``get_compiled_step()`` is the readable spelling
+    and costs 1.18 us per call -- two table scans, an arch probe and a
+    ``functools.cache`` key build, twice per ``LSTM.forward`` because a
+    transducer predictor has two layers.  Both are pure functions of the shape,
+    so the whole decision memoises to one dict lookup.
+
+    Deciding *and* compiling under the same key also means a shape whose tile
+    fails to build is remembered as declined rather than retried per step; a
+    compile failure is a property of the configuration, not of the call.
+    """
+    key = (dtype_str, gate_count, activation, hidden, batch)
+    try:
+        return _ROUTE[key]
+    except KeyError:
+        pass
+    step = None
+    if should_use(gate_count, hidden, batch):
+        try:
+            step = get_compiled_step(
+                dtype_str=dtype_str,
+                gate_count=gate_count,
+                activation=activation,
+                hidden=hidden,
+                batch=batch,
+            )
+        except Exception as exc:  # unsupported arch, missing CuTeDSL, unbuildable tile
+            logger.warning(
+                "CuTeDSL recurrent step declined for hidden=%d batch=%d: %s", hidden, batch, exc
+            )
+            step = None
+    _ROUTE[key] = step
+    return step
 
 
-def current_stream():
-    """The active CUDA stream as a cached ``CUstream`` handle."""
-    import cuda.bindings.driver as cuda_driver
-    import torch
-
-    if _RAW_STREAM is not None:
-        raw = _RAW_STREAM(torch.cuda.current_device())
-    else:  # pragma: no cover - private symbol gone; correct but 50x slower
-        raw = torch.cuda.current_stream().cuda_stream
-    handle = _STREAMS.get(raw)
-    if handle is None:
-        handle = cuda_driver.CUstream(raw)
-        _STREAMS[raw] = handle
-    return handle
+#: The stream handle a compiled CuTeDSL callable needs, cached against the raw
+#: pointer -- ``torch.cuda.current_stream()`` alone cost 4.1 us against a 6 us
+#: kernel.  Shared with the FMHA call sites; see :mod:`oasr.jit.cute_runtime`.
+from .cute_runtime import current_stream  # noqa: E402,F401  (re-export)
 
 
 def warmup(*, dtype_str: str, gate_count: int, activation: str, hidden: int, batch: int) -> None:
-    """Populate the compile cache ahead of the first step.  Never raises."""
-    if not should_use(gate_count, hidden, batch):
-        return
-    try:
-        get_compiled_step(
-            dtype_str=dtype_str,
-            gate_count=gate_count,
-            activation=activation,
-            hidden=hidden,
-            batch=batch,
-        )
-    except Exception as exc:
-        logger.warning("CuTeDSL recurrent-step warmup failed: %s", exc)
+    """Populate the route + compile cache ahead of the first step.  Never raises."""
+    routed_step(
+        dtype_str=dtype_str,
+        gate_count=gate_count,
+        activation=activation,
+        hidden=hidden,
+        batch=batch,
+    )

@@ -25,6 +25,41 @@ import oasr
 
 from ._backend import use_recurrent_kernel
 
+
+def _version_of(tensor: torch.Tensor) -> int:
+    """``tensor._version``, or ``-1`` when the counter is not tracked.
+
+    A module constructed or moved to the device inside ``torch.inference_mode()``
+    holds inference tensors, and reading ``_version`` on one raises
+    ``RuntimeError: Inference tensors do not track version counter`` -- which
+    used to take down the first forward rather than the construction that caused
+    it.  An inference tensor cannot be mutated in place, so a constant stands in
+    for its counter.
+    """
+    try:
+        return tensor._version
+    except RuntimeError:
+        return -1
+
+
+def _versions_of(params: tuple) -> Optional[tuple]:
+    """Version counters for a ``(w_ih, w_hh, b_ih, b_hh)`` tuple, or ``None``.
+
+    Spelled out rather than as a generator expression: this runs once per layer
+    per timestep, and the generator's frame cost more than the four reads.
+    """
+    a, b, c, d = params
+    try:
+        return (
+            a._version,
+            b._version,
+            -1 if c is None else c._version,
+            -1 if d is None else d._version,
+        )
+    except RuntimeError:
+        return None
+
+
 if TYPE_CHECKING:  # pragma: no cover
     from oasr.cache.recurrent_state import RecurrentStateCache
 
@@ -171,6 +206,10 @@ class _RecurrentBase(nn.Module):
             Tuple[int, Tuple[Tuple[int, int], ...]],
             Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
         ] = {}
+        #: layer -> (parameter objects, their version counters or None, packed form).
+        #: The hot-path shortcut past ``_packed_parameter_cache``; see
+        #: :meth:`_packed_lstm_parameters`.
+        self._packed_fast_slot: Dict[int, Tuple[tuple, Optional[tuple], tuple]] = {}
 
         factory_kwargs = {"device": device, "dtype": dtype}
         self._flat_weights_names: List[str] = []
@@ -233,6 +272,7 @@ class _RecurrentBase(nn.Module):
         for weight in self.parameters():
             nn.init.uniform_(weight, -stdv, stdv)
         self._packed_parameter_cache.clear()
+        self._packed_fast_slot.clear()
 
     def flatten_parameters(self) -> None:
         """Compatibility no-op; OASR consumes the checkpoint layout directly."""
@@ -241,6 +281,7 @@ class _RecurrentBase(nn.Module):
         # Packed tensors are derived, not parameters or buffers, so Module._apply
         # cannot migrate them. Rebuild lazily after .to()/.cuda() instead.
         self._packed_parameter_cache.clear()
+        self._packed_fast_slot.clear()
         return super()._apply(fn, recurse)
 
     def _biases(self, layer: int) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -251,13 +292,30 @@ class _RecurrentBase(nn.Module):
     @staticmethod
     def _parameter_signature(*parameters: Optional[torch.Tensor]) -> Tuple[Tuple[int, int], ...]:
         return tuple(
-            (-1, -1) if parameter is None else (parameter.data_ptr(), parameter._version)
+            (-1, -1) if parameter is None else (parameter.data_ptr(), _version_of(parameter))
             for parameter in parameters
         )
 
     def _packed_lstm_parameters(
         self, layer: int
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        # Hot path: a T=1 step calls this once per layer, so a transducer
+        # predictor pays it per emitted label.  Building the signature the long
+        # way cost 3.19 us of the 100 us that ``LSTM.forward`` spends on a
+        # 2-layer T=1 step -- four ``getattr`` calls through
+        # ``nn.Module.__getattr__`` (parameters live in ``_parameters``, so every
+        # one is a miss and a walk), four ``data_ptr()``, four ``_version``, a
+        # generator expression and a tuple build, all to hit a dict.
+        #
+        # The fast slot keeps the parameter *objects* alongside their packed
+        # form, so a hit reads no attributes at all and only re-checks the
+        # version counters -- which is the half that can change without
+        # ``_apply`` running.
+        fast = self._packed_fast_slot.get(layer)
+        if fast is not None:
+            params, versions, packed = fast
+            if versions is None or versions == _versions_of(params):
+                return packed
         weight_ih = getattr(self, f"weight_ih_l{layer}")
         weight_hh = getattr(self, f"weight_hh_l{layer}")
         bias_ih, bias_hh = self._biases(layer)
@@ -265,6 +323,7 @@ class _RecurrentBase(nn.Module):
         key = (layer, signature)
         cached = self._packed_parameter_cache.get(key)
         if cached is not None:
+            self._store_fast_slot(layer, (weight_ih, weight_hh, bias_ih, bias_hh), cached)
             return cached
 
         hidden_size = self.hidden_size
@@ -296,7 +355,19 @@ class _RecurrentBase(nn.Module):
             if cache_key[0] != layer
         }
         self._packed_parameter_cache[key] = packed
+        self._store_fast_slot(layer, (weight_ih, weight_hh, bias_ih, bias_hh), packed)
         return packed
+
+    def _store_fast_slot(self, layer: int, params: tuple, packed: tuple) -> None:
+        """Record the per-layer fast slot, or decline to if versions are untracked.
+
+        ``Tensor._version`` raises on an inference tensor (a module constructed or
+        moved to the device inside ``torch.inference_mode()``), which is also why
+        the slow path reads it through :func:`_version_of`.  With no counter to
+        watch there is nothing that could invalidate the slot, and an inference
+        tensor cannot be mutated in place anyway, so ``None`` means "trust it".
+        """
+        self._packed_fast_slot[layer] = (params, _versions_of(params), packed)
 
     def _combined_rnn_bias(self, layer: int) -> Optional[torch.Tensor]:
         bias_ih, bias_hh = self._biases(layer)

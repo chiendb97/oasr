@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from oasr.models.decoders.base import Joiner, TransducerPredictor
 
     from ..config import EngineConfig
+    from ..predictor_graph import PredictorStepGraphCache
     from .detokenize import Detokenizer
 
 
@@ -191,6 +192,17 @@ class TransducerDecodeStrategy(DecodeStrategy):
         # ``None`` marks a created-but-uninitialized session (state materializes
         # on the first chunk, when the encoder output's device is known).
         self._sessions: Dict[str, Optional[_Session]] = {}
+        # The predictor step is nine launches for ~12-39 us of GPU work, and a
+        # real Nemotron decode spends 34% of this loop on it.  Capturing it turns
+        # a host-bound step into a graph replay; see oasr/engine/predictor_graph.py
+        # for what that costs and the three hazards it owns.  Lazily built so a
+        # CPU-only or eager-only run never touches CUDA graphs.
+        self._pred_graphs: Optional["PredictorStepGraphCache"] = None
+        self._pred_graphs_enabled = bool(
+            getattr(config, "use_cuda_graphs", False)
+            and getattr(config, "use_transducer_cuda_graphs", False)
+            and self._beam <= 1
+        )
         if self._beam > 1 and model is not None:
             # Beam search keeps every hypothesis's state in one ``(B, k, ctx)``
             # buffer and reorders it onto the new parents with a ``gather``
@@ -251,6 +263,9 @@ class TransducerDecodeStrategy(DecodeStrategy):
         emit_frame: List[torch.Tensor] = []  # per-step (B,) frame index at emission
         emit_prob: List[torch.Tensor] = []  # per-step (B,) posterior of that token
 
+        graphs = self._predictor_graphs()
+        graphed = False
+
         max_steps = int(T) * (max_sym + 1) + B + 1  # termination safety bound
         done = 0
         while done < max_steps:
@@ -271,15 +286,41 @@ class TransducerDecodeStrategy(DecodeStrategy):
                 emit = active & ~is_blank
                 advance = active & is_blank
 
-                # This sync stays: the branch skips a real predictor forward, not
-                # just a host round trip, and dropping it costs more than it saves
-                # on blank-dominated audio (measured below).
-                if bool(emit.any()):
+                # The host sync is worth paying only when word timings are
+                # wanted.  Dropping it lets the loop run entirely async, and the
+                # predictor step is masked by ``emit`` either way, so a
+                # no-emission iteration mutates nothing -- it just costs one more
+                # ``(B,)`` snapshot in ``emitted``, ~1.1 us per entry at the one
+                # readback after the loop, against a sync that makes the host wait
+                # out whatever the iteration queued.  Measured on nemotron
+                # (transcripts bit-identical in every case):
+                #
+                #     no word timings   offline b8 1.044x  b32 1.055x  streaming 1.111x
+                #                       132 s utterances:  offline 1.057x  streaming 1.168x
+                #     word timings      offline b8 0.995x  b32 1.028x  streaming 1.085x
+                #
+                # The word-timing snapshot is what turns it: it adds a ``t.clone()``,
+                # a gather, a vocab-wide ``logsumexp`` and an ``exp`` -- four eager
+                # launches -- to *every* iteration rather than to the emitting ones,
+                # and at batch 8 that is more than the sync it saves.  So keep the
+                # branch exactly there, and only there.  ``emitted``, ``emit_frame``
+                # and ``emit_prob`` are read back index-aligned, which is also why
+                # this has to be one branch over all three rather than a cheap
+                # unconditional token append plus a guarded timing append.
+                if not track or bool(emit.any()):
                     # Fold the emitted label into each emitting row's state; rows
                     # that didn't emit keep theirs, so the batched projection that
                     # follows reproduces their previous value exactly.
-                    state = decoder.advance(state, tok, emit)
-                    dec_proj = joiner.decoder_proj(decoder.predict(state))
+                    stepped = graphs.step(state, tok, emit) if graphs is not None else None
+                    if stepped is not None:
+                        # Both are graph memory, live until the next replay.  The
+                        # loop only reads them before then; the one copy happens
+                        # after the loop, where the state escapes.
+                        state, dec_proj = stepped
+                        graphed = True
+                    else:
+                        state = decoder.advance(state, tok, emit)
+                        dec_proj = joiner.decoder_proj(decoder.predict(state))
                     emitted.append(torch.where(emit, tok, no_emit))
                     if track:
                         emit_frame.append(t.clone())
@@ -311,7 +352,27 @@ class TransducerDecodeStrategy(DecodeStrategy):
             hyps = [[] for _ in range(B)]
             if track:
                 marks = [[] for _ in range(B)]
+        if graphed:
+            # ``state`` and ``dec_proj`` are the graph's own buffers and the next
+            # replay overwrites them.  The streaming path keeps per-session state
+            # across ticks and slices it with ``unstack_states``, which for a
+            # recurrent predictor hands back *views* — so without this copy a
+            # session would read some later tick's state.  One copy per loop, not
+            # per step.
+            state = cast("PredictorStepGraphCache", graphs).detach(state)
+            dec_proj = dec_proj.clone()
         return hyps, marks, state, dec_proj
+
+    def _predictor_graphs(self) -> Optional["PredictorStepGraphCache"]:
+        """The predictor-step graph cache, built on first use.  ``None`` if off."""
+        if not self._pred_graphs_enabled:
+            return None
+        if self._pred_graphs is None:
+            from oasr.engine.predictor_graph import PredictorStepGraphCache
+
+            joiner, decoder = self._surface()
+            self._pred_graphs = PredictorStepGraphCache(decoder, joiner)
+        return self._pred_graphs
 
     def _surface(self) -> Tuple["Joiner", "TransducerPredictor"]:
         """``(joiner, predictor)`` with their real types.

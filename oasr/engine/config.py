@@ -191,6 +191,10 @@ class EngineConfig:
     # Disabled by default because replay staging can outweigh launch savings.
     use_feature_cuda_graphs: bool = False
     use_ctc_cuda_graphs: bool = False
+    # Capture the transducer predictor step (embedding + recurrent layers + emit
+    # masks + joint projection).  Nine launches for ~12-39 us of GPU work, and a
+    # third of the greedy loop's host time; see oasr/engine/predictor_graph.py.
+    use_transducer_cuda_graphs: bool = True
     # Feature-graph batch buckets; ``None`` uses powers of two up to the batch cap.
     feature_graph_batch_buckets: Optional[List[int]] = None
 
