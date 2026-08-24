@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import argparse
 import os
-import statistics
 import sys
+import time
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -179,28 +179,153 @@ def _oasr_op_for(op_name: str) -> Optional[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _bench(fn, warmup: int, rep: int) -> float:
-    """Median ms via triton.do_bench, CUDA-event fallback."""
-    try:
-        from triton.testing import do_bench
+#: Calls captured per graph for the loop measurement.  A graph launch costs about
+#: 2.6 us, so at 64 calls it adds ~0.04 us to each -- about 1% of the fastest arm
+#: seen at ASR sizes (3.6 us) and less for everything slower.
+_GRAPH_ITERS = 64
 
-        return float(do_bench(fn, warmup=warmup, rep=rep, return_mode="median"))
-    except Exception:
+#: Event-timed replays per arm.  The estimator is the *minimum*: on an idle GPU
+#: noise is additive, so the minimum is the cleanest estimate of the kernel and
+#: the median only adds whatever else the box was doing.
+_GRAPH_REPS = 7
+
+#: One graph memory pool for every capture in the sweep.
+#:
+#: A ``CUDAGraph`` with no pool gets its own, and the pool is not returned
+#: promptly when the graph is dropped; a sweep captures twice per candidate,
+#: ~30 candidates per shape, hundreds of shapes.  Sharing is safe here because
+#: captures are strictly sequential: each graph is captured, replayed and dropped
+#: before the next is captured.
+#:
+#: Fewer pools is strictly better, but this is not what made the first sweeps run
+#: out of memory -- a control run that captured and dropped 40 graphs per config
+#: held reserved memory flat at 22.0 MiB across every variation.  The 30 GiB was
+#: the workspace cache; see ``_side_stream``.
+_POOL = None
+
+
+def _graph_pool():
+    global _POOL
+    if _POOL is None:
         import torch
 
-        for _ in range(warmup):
+        _POOL = torch.cuda.graph_pool_handle()
+    return _POOL
+
+
+#: One side stream for every warm-up in the sweep.
+#:
+#: Not one per capture.  OASR's split-K / Stream-K workspace cache
+#: (``include/oasr/common/workspace_cache.h``) is keyed on ``(device, stream,
+#: pool)`` and never frees, so a stream per capture spread the sweep's workspaces
+#: over every key the cache could hold and kept all of them: 30 GiB of
+#: non-PyTorch memory over a 121-shape sweep, dying on a 66 MiB allocation while
+#: PyTorch itself held 1 GiB.
+#:
+#: Note what the key count is NOT: ``torch.cuda.Stream()`` hands out one of a
+#: POOL of 32 handles per device and cycles, so "a stream per capture" never made
+#: more than 32 keys.  What grew was the bytes behind each -- a parallel split-K
+#: workspace is ``M*N*4*split``, so one 4096x5008 shape is 328 MiB per key.  The
+#: cache now bounds those bytes, but the tuner still should not be spreading its
+#: workspaces over 32 keys to begin with.
+_SIDE_STREAM = None
+
+
+def _side_stream():
+    global _SIDE_STREAM
+    if _SIDE_STREAM is None:
+        import torch
+
+        _SIDE_STREAM = torch.cuda.Stream()
+    return _SIDE_STREAM
+
+
+def _capture(fn, iters: int):
+    """Capture ``iters`` back-to-back calls into one CUDA graph.
+
+    The warm-up runs on a side stream first because a capture on the default
+    stream inherits whatever the allocator did on it, and PyTorch requires the
+    side-stream warm-up before ``torch.cuda.graph``.
+    """
+    import torch
+
+    side = _side_stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
             fn()
-        torch.cuda.synchronize()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=_graph_pool()):
+        for _ in range(iters):
+            fn()
+    torch.cuda.synchronize()
+    for _ in range(2):
+        graph.replay()
+    torch.cuda.synchronize()
+    return graph
+
+
+def _replay_ms(graph, iters: int) -> float:
+    import torch
+
+    samples = []
+    for _ in range(_GRAPH_REPS):
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
-        times = []
-        for _ in range(rep):
-            s.record()
-            fn()
-            e.record()
-            torch.cuda.synchronize()
-            times.append(s.elapsed_time(e))
-        return float(statistics.median(times))
+        s.record()
+        graph.replay()
+        e.record()
+        torch.cuda.synchronize()
+        samples.append(s.elapsed_time(e) / iters)
+    return float(min(samples))
+
+
+def _bench(fn, warmup: int, rep: int) -> Tuple[float, float]:
+    """``(loop_ms, solo_ms)`` per call, both measured through CUDA graphs.
+
+    Two numbers, because neither alone is trustworthy at these sizes.
+
+    ``loop_ms`` -- ``_GRAPH_ITERS`` calls captured in one graph.  This is the
+    number to rank on: it charges no host issue cost and keeps L2 in the state a
+    real inner loop leaves it in.
+
+    ``solo_ms`` -- one call per graph replay.  Back-to-back *independent* launches
+    can overlap on the GPU, which flatters a low-occupancy configuration that
+    would never overlap inside a real layer (a thin tile at small M is 20 CTAs on
+    170 SMs).  A single-call replay cannot overlap with itself.  Every arm carries
+    the same graph-launch constant here, which is additive: it compresses the
+    ratio (2.6 us against a 3.6 us kernel is most of the number) so this must not
+    be *ranked* on, but adding a constant to both sides cannot flip which is
+    larger -- so the *sign* is trustworthy, and that is all the gate needs.  A
+    configuration that beats the fallback on ``loop_ms`` and loses on ``solo_ms``
+    won only by self-overlap, and :func:`emit_rules` refuses it.
+
+    What this replaces: ``triton.do_bench``, an eager back-to-back loop that also
+    wipes L2 between iterations.  Every arm at ASR sizes is faster than the
+    ~9.6 us it costs to *issue* a GEMM call, so that loop read 10-20 us for all of
+    them -- it reported 2.00x where the truth was 4.6x on the LSTM gate projection
+    and picked a tile 22% slower than the best.
+    """
+    import gc
+
+    import torch
+
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    graph = _capture(fn, _GRAPH_ITERS)
+    loop_ms = _replay_ms(graph, _GRAPH_ITERS)
+    # Drop it before capturing the next: the shared pool is only reusable when at
+    # most one graph is holding it.
+    del graph
+    gc.collect()
+    graph = _capture(fn, 1)
+    solo_ms = _replay_ms(graph, 1)
+    del graph
+    gc.collect()
+    return loop_ms, solo_ms
 
 
 def _alloc_args(shape: RepShape):
@@ -242,10 +367,14 @@ def _reference_output(shape: RepShape, args):
 
 
 class TacticResult:
-    def __init__(self, tactic, median_ms, is_default):
+    """One tactic's timings.  ``median_ms`` is the loop measurement (the ranking
+    number); ``solo_ms`` is the single-replay one (see :func:`_bench`)."""
+
+    def __init__(self, tactic, median_ms, is_default, solo_ms=None):
         self.tactic = tactic
         self.median_ms = median_ms
         self.is_default = is_default
+        self.solo_ms = median_ms if solo_ms is None else solo_ms
 
 
 def _pick_winner(results: List["TacticResult"], tie_tol: float = 0.05) -> "TacticResult":
@@ -290,6 +419,8 @@ def _pick_winner(results: List["TacticResult"], tie_tol: float = 0.05) -> "Tacti
 
 
 def benchmark_shape(shape: RepShape, warmup: int, rep: int) -> Optional[List[TacticResult]]:
+    import gc
+
     import torch
 
     from oasr.tune.autotuner import OpKey, _ensure_backends_registered, _global_registry
@@ -329,11 +460,18 @@ def benchmark_shape(shape: RepShape, warmup: int, rep: int) -> Optional[List[Tac
             # Bind `runner` at definition time: it is a loop variable, and the
             # late-binding form only happens to work because _bench calls back
             # synchronously within this iteration.
-            ms = _bench(lambda r=runner: r(*args), warmup, rep)
+            ms, solo = _bench(lambda r=runner: r(*args), warmup, rep)
         except Exception:
-            ms = float("inf")
-        results.append(TacticResult(entry.tactic, ms, entry.is_fallback))
+            ms = solo = float("inf")
+        results.append(TacticResult(entry.tactic, ms, entry.is_fallback, solo))
     results.sort(key=lambda r: r.median_ms)
+    # Release this shape's operands and whatever the captures pooled before the
+    # next shape allocates its own: a full sweep is hundreds of shapes.  Rebound
+    # rather than ``del``'d, because the timing lambdas above close over ``args``
+    # and unbinding the name makes that a static undefined-name error.
+    args = ref = None  # type: ignore[assignment]
+    gc.collect()
+    torch.cuda.empty_cache()
     return results
 
 
@@ -385,6 +523,12 @@ def emit_rules(
       torch / cutlass / default at 1.02-1.08x.  Re-measuring those pairs with the
       arms interleaved showed them to be ties.  Encoding a tie costs a compiled
       variant and a boundary that can be wrong, and buys nothing.
+
+    A third gate came from the protocol change (see :func:`_bench`): a win must
+    hold on the *single-replay* timing as well as the loop timing.  Back-to-back
+    independent launches can overlap on the GPU, which flatters a low-occupancy
+    tile that would never overlap inside a real layer, and self-overlap is not a
+    speedup a model can spend.
     """
     # Group reps by (op, N, K) and order by m_max (None last).
     by_key: Dict[Tuple[str, int, int], List[RepShape]] = defaultdict(list)
@@ -409,6 +553,20 @@ def emit_rules(
             speedup = (
                 (default.median_ms / winner.median_ms) if default and winner.median_ms > 0 else 1.0
             )
+            # The same ratio on the overlap-free timing.  A tile that wins the
+            # loop and loses this one won by overlapping with itself.
+            solo_speedup = (
+                (default.solo_ms / winner.solo_ms)
+                if default and winner.solo_ms > 0 and default.solo_ms < float("inf")
+                else speedup
+            )
+            if speedup >= min_speedup and solo_speedup < 1.0:
+                print(
+                    f"[tune] suppressed ({op}, {N}, {K}) m_max={r.m_max}: "
+                    f"{winner.tactic.backend} is {speedup:.2f}x back-to-back but "
+                    f"{solo_speedup:.2f}x on a single replay — self-overlap only"
+                )
+                speedup = solo_speedup
             if speedup < min_speedup:
                 # Not a measured win — keep the fallback and say so, rather than
                 # emitting a rule that a paired re-measurement would not support.
@@ -457,12 +615,12 @@ def emit_rules(
 
 
 def print_report(per_shape, reps, sm) -> None:
-    print("\n" + "=" * 92)
+    print("\n" + "=" * 108)
     print(
         f"{'op':16} {'N':>6} {'K':>6} {'M':>7} {'m_max':>7}  "
-        f"{'winner':>26} {'win ms':>9} {'dflt ms':>9} {'speedup':>8}"
+        f"{'winner':>26} {'win ms':>9} {'dflt ms':>9} {'speedup':>8} {'solo':>8}"
     )
-    print("-" * 92)
+    print("-" * 108)
     reps_sorted = sorted(reps, key=lambda r: (r.op, r.N, r.K, r.M))
     for r in reps_sorted:
         res = per_shape.get((r.op, r.M, r.N, r.K, r.dtype, r.batch))
@@ -484,10 +642,11 @@ def print_report(per_shape, reps, sm) -> None:
                 f"s{_c.get('kStages')}k{_c.get('split_k')}{_sk}{_pk}"
             )
         mm = "inf" if r.m_max is None else str(r.m_max)
+        solo = (d.solo_ms / w.solo_ms) if d and w.solo_ms > 0 else float("nan")
         print(
             f"{r.op:16} {r.N:>6} {r.K:>6} {r.M:>7} {mm:>7}  "
             f"{wname:>26} {w.median_ms:>9.4f} "
-            f"{(d.median_ms if d else float('nan')):>9.4f} {sp:>7.2f}x"
+            f"{(d.median_ms if d else float('nan')):>9.4f} {sp:>7.2f}x {solo:>7.2f}x"
         )
     print("=" * 92 + "\n")
 
@@ -567,11 +726,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     for r in reps:
         print("  ", r)
 
+    # Progress on stderr, unbuffered.  A full sweep is 165 shapes against ~40
+    # candidates each and takes the better part of an hour, and every line this
+    # script prints used to come from ``print_report`` at the very end: a run that
+    # died at shape 140 looked exactly like a run that had hung at shape 2, and
+    # diagnosing which cost an hour.
     per_shape: Dict[Tuple, List[TacticResult]] = {}
-    for r in reps:
+    t_start = time.perf_counter()
+    for i, r in enumerate(reps, 1):
+        t_shape = time.perf_counter()
         res = benchmark_shape(r, args.warmup, args.rep)
         if res:
             per_shape[(r.op, r.M, r.N, r.K, r.dtype, r.batch)] = res
+        elapsed = time.perf_counter() - t_start
+        eta = elapsed / i * (len(reps) - i)
+        print(
+            f"[tune] {i:3d}/{len(reps)}  {r.op} M={r.M} N={r.N} K={r.K}  "
+            f"{len(res) if res else 0} arm(s) in {time.perf_counter() - t_shape:5.1f}s  "
+            f"(elapsed {elapsed / 60:5.1f}m, eta {eta / 60:5.1f}m)",
+            file=sys.stderr,
+            flush=True,
+        )
 
     print_report(per_shape, reps, sm)
 

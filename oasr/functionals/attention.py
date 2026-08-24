@@ -40,6 +40,14 @@ except Exception:
     _Float32 = None
     _Int32 = None
 
+# The stream handle every compiled CuTeDSL callable needs.  Spelling it
+# ``_CUstream(torch.cuda.current_stream().cuda_stream)`` cost 4.06 us of the
+# 26.4 us it takes to issue one FMHA call -- 15% -- because
+# ``torch.cuda.current_stream()`` builds a Python ``Stream`` object to return one
+# integer.  ``oasr.jit.cute_runtime`` reads the raw pointer through the C
+# accessor and caches the wrapper; see the module docstring for why the handle
+# must be read *inside* a graph capture.
+from oasr.jit.cute_runtime import current_stream as _current_stream
 
 # ---------------------------------------------------------------------------
 # Module-scope caches for per-call constants
@@ -751,7 +759,7 @@ def _call_cute_dsl_varlen(
         bias_t = _get_dummy_bias(q.dtype, q.device)
         bias_off_t = _get_dummy_block_table(q.device)
 
-    stream = _CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = _current_stream()
     fn(
         q_t,
         k_t,
@@ -929,7 +937,7 @@ def _call_cute_dsl(
     else:
         block_table_t = _get_dummy_block_table(device)
 
-    stream = _CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = _current_stream()
     # TVM-FFI compiled callable accepts torch tensors directly.
     fn(
         q_t,

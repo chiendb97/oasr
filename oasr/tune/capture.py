@@ -21,9 +21,28 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger("oasr.tune")
 
 # Functional entry points patched during capture (attribute names on the ``oasr``
-# package, which is how the layers call them: ``oasr.gemm(...)`` etc.).
+# package, which is how most layers call them: ``oasr.gemm(...)`` etc.).
 # ``gemm_log_softmax`` is the CTC head (``oasr.layers.ctc.CtcProjection``).
 _PATCH_NAMES = ("gemm", "gemm_activation", "bmm", "group_gemm", "gemm_log_softmax")
+
+# ...but not every caller goes through the package attribute.  Four in-tree call
+# sites do ``from oasr.functionals.gemm import ...`` inside a function body, so
+# rebinding ``oasr.gemm`` alone left them invisible — and an invisible shape gets
+# no tuned rule.  That is how the recurrent input projection (K=640, N=4H) came
+# to sit on ``GEMM_DEFAULT``, a fixed 128x128x64 tile that is 2-5x slower than
+# cuBLAS at the M this path runs.  Patching the defining module as well covers a
+# function-body import, because that import resolves at call time.
+#
+# ``_dispatch_gemm`` / ``_dispatch_gemm_activation`` are the shape-aware
+# dispatchers that ``oasr.functionals.conv`` calls directly for its im2col path;
+# they take ``(out, A, B, C, [activation,] N, K, M)``, so their shapes are read
+# from the explicit arguments rather than from operand geometry.
+_MODULE_PATCH_NAMES = _PATCH_NAMES
+_DISPATCH_PATCH_SPECS = {
+    # name: (index of N, index of K, index of M) in the positional signature
+    "_dispatch_gemm": (4, 5, 6),
+    "_dispatch_gemm_activation": (5, 6, 7),
+}
 
 
 def _dtype_str(dtype) -> str:
@@ -136,36 +155,96 @@ def _shapes_of(op: str, args, kwargs) -> Optional[Tuple[int, int, int, int]]:
     return M, N, K, 1
 
 
+#: Re-entrancy guard.  ``gemm()`` reaches ``_dispatch_gemm`` through its own
+#: module globals, so with both patched one call would be recorded twice.  Only
+#: the outermost wrapper records; the depth is per-thread because the engine
+#: runs the front-end dispatcher on its own.
+_depth = threading.local()
+
+
+@contextlib.contextmanager
+def _outermost():
+    d = getattr(_depth, "n", 0)
+    _depth.n = d + 1
+    try:
+        yield d == 0
+    finally:
+        _depth.n = d
+
+
+def _make_wrapper(rec, op_name, fn):
+    def wrapper(*args, **kwargs):
+        with _outermost() as record:
+            if record:
+                shp = _shapes_of(op_name, args, kwargs)
+                if shp is not None:
+                    A = args[0] if args else kwargs.get("A")
+                    M, N, K, batch = shp
+                    rec.record(op_name, M, N, K, _dtype_str(A.dtype), batch)
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _make_dispatch_wrapper(rec, op_name, fn, idx):
+    """Wrap a ``_dispatch_*`` entry, whose N/K/M arrive as explicit arguments."""
+    n_i, k_i, m_i = idx
+
+    def wrapper(*args, **kwargs):
+        with _outermost() as record:
+            if record:
+                try:
+                    rec.record(
+                        op_name,
+                        int(args[m_i]),
+                        int(args[n_i]),
+                        int(args[k_i]),
+                        _dtype_str(args[1].dtype),
+                        1,
+                    )
+                except (IndexError, TypeError, AttributeError):
+                    pass
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 @contextlib.contextmanager
 def capture_gemm_shapes(recorder: Optional[GemmShapeRecorder] = None):
     """Monkeypatch the OASR functional GEMM entries to record shapes for the block."""
     import oasr
+    import oasr.functionals.gemm as _fg
 
     rec = recorder if recorder is not None else GemmShapeRecorder()
-    originals = {}
+    originals: List[Tuple[object, str, object]] = []
     try:
         for name in _PATCH_NAMES:
             orig = getattr(oasr, name, None)
             if orig is None:
                 continue
-            originals[name] = orig
-
-            def make_wrapper(op_name, fn):
-                def wrapper(*args, **kwargs):
-                    shp = _shapes_of(op_name, args, kwargs)
-                    if shp is not None:
-                        A = args[0] if args else kwargs.get("A")
-                        M, N, K, batch = shp
-                        rec.record(op_name, M, N, K, _dtype_str(A.dtype), batch)
-                    return fn(*args, **kwargs)
-
-                return wrapper
-
-            setattr(oasr, name, make_wrapper(name, orig))
+            originals.append((oasr, name, orig))
+            setattr(oasr, name, _make_wrapper(rec, name, orig))
+        # The defining module, for callers that import the name directly.  Same
+        # recorder, so a call that goes through both is recorded once: the
+        # package wrapper calls the *original* it captured, not the patched
+        # module attribute.
+        for name in _MODULE_PATCH_NAMES:
+            orig = getattr(_fg, name, None)
+            if orig is None:
+                continue
+            originals.append((_fg, name, orig))
+            setattr(_fg, name, _make_wrapper(rec, name, orig))
+        for name, idx in _DISPATCH_PATCH_SPECS.items():
+            orig = getattr(_fg, name, None)
+            if orig is None:
+                continue
+            op_name = name[len("_dispatch_") :]
+            originals.append((_fg, name, orig))
+            setattr(_fg, name, _make_dispatch_wrapper(rec, op_name, orig, idx))
         yield rec
     finally:
-        for name, orig in originals.items():
-            setattr(oasr, name, orig)
+        for owner, name, orig in reversed(originals):
+            setattr(owner, name, orig)
 
 
 def maybe_autostart() -> None:

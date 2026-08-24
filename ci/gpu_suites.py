@@ -54,6 +54,7 @@ SUITES: dict[str, list[str]] = {
         "tests/test_fmha_varlen.py",
         "tests/test_block_info.py",
         "tests/test_autotune.py",
+        "tests/test_tune_asr_gemm.py",
     ],
     "decoders": [
         "tests/test_decoder.py",

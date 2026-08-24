@@ -532,3 +532,87 @@ class TestBackendRegistration:
         candidates = _global_registry.get_candidates(OpKey("gemm", "gemm"))
         tactics = [c.tactic for c in candidates]
         assert len(tactics) == len(set(tactics))
+
+
+class TestGemmShapeCapture:
+    """``oasr.tune.capture`` must see every GEMM the layers actually issue.
+
+    It rebound only the ``oasr`` package attributes, and four in-tree call sites
+    do ``from oasr.functionals.gemm import ...`` inside a function body — so the
+    recurrent input projection was invisible, never appeared in a captured
+    workload, and therefore never got a tuned rule.  A shape the tuner cannot see
+    is a shape that silently runs the fixed default tile.
+    """
+
+    def _record(self, fn):
+        from oasr.tune.capture import GemmShapeRecorder, capture_gemm_shapes
+
+        rec = GemmShapeRecorder()
+        with capture_gemm_shapes(rec):
+            fn()
+        return {(s.op, s.N, s.K): s for s in rec.aggregate()}
+
+    @pytest.mark.cuda
+    def test_sees_a_module_level_import_of_gemm(self, device):
+        """The spelling the recurrent functional uses."""
+
+        def call():
+            from oasr.functionals.gemm import gemm
+
+            A = torch.randn(8, 32, dtype=torch.float16, device=device)
+            B = torch.randn(64, 32, dtype=torch.float16, device=device)
+            gemm(A, B)
+
+        stats = self._record(call)
+        assert ("gemm", 64, 32) in stats, sorted(stats)
+
+    @pytest.mark.cuda
+    def test_sees_the_package_attribute(self, device):
+        def call():
+            import oasr
+
+            A = torch.randn(8, 32, dtype=torch.float16, device=device)
+            B = torch.randn(64, 32, dtype=torch.float16, device=device)
+            oasr.gemm(A, B)
+
+        assert ("gemm", 64, 32) in self._record(call)
+
+    @pytest.mark.cuda
+    def test_counts_one_call_once(self, device):
+        """``gemm`` reaches ``_dispatch_gemm`` through its own module globals, so
+        with both patched a single call would otherwise be recorded twice."""
+
+        def call():
+            import oasr
+
+            A = torch.randn(8, 32, dtype=torch.float16, device=device)
+            B = torch.randn(64, 32, dtype=torch.float16, device=device)
+            for _ in range(3):
+                oasr.gemm(A, B)
+
+        assert self._record(call)[("gemm", 64, 32)].call_count == 3
+
+    @pytest.mark.cuda
+    def test_restores_every_patched_attribute(self, device):
+        import oasr
+        import oasr.functionals.gemm as fg
+        from oasr.tune.capture import capture_gemm_shapes
+
+        before = (oasr.gemm, fg.gemm, fg._dispatch_gemm, fg._dispatch_gemm_activation)
+        with capture_gemm_shapes():
+            pass
+        assert (oasr.gemm, fg.gemm, fg._dispatch_gemm, fg._dispatch_gemm_activation) == before
+
+    @pytest.mark.cuda
+    def test_sees_the_recurrent_input_projection(self, device):
+        """The shape that was missing: an LSTM layer's gate projection."""
+        from oasr.layers.recurrent import LSTM
+
+        layer = LSTM(64, 64, num_layers=1).to(device, torch.float16).eval()
+
+        def call():
+            x = torch.randn(1, 128, 64, dtype=torch.float16, device=device)
+            layer(x)
+
+        stats = self._record(call)
+        assert ("gemm", 256, 64) in stats, f"the LSTM gate projection is invisible: {sorted(stats)}"

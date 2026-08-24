@@ -435,3 +435,108 @@ class TestDefaultConfigIsBuildable:
             f"SM{sm} default {default.compile_name!r} is not among the "
             f"{len(generated)} generated variants"
         )
+
+
+class TestDispatchPlanCache:
+    """The resolved-dispatch cache in ``oasr.functionals.gemm``.
+
+    The choice is a pure function of ``(op, M, N, K, dtype)`` — that is what makes
+    it CUDA-graph safe — so it is memoised, which removed 1.88 us per GEMM call
+    (``select_default_config`` plus the ``compile_name`` *property*, which is a
+    list build and a join that the "cached" variant lookup paid to rebuild as its
+    own key).  What must not break is the tests' ability to swap the resolver, so
+    the cache holds the resolver it used and re-resolves when that changes.
+    """
+
+    def test_a_hit_does_not_call_the_resolver(self, monkeypatch):
+        import oasr.functionals.gemm as fg
+        import oasr.jit.gemm as jg
+
+        fg._PLANS.clear()
+        calls = []
+        orig = jg.select_default_config
+        monkeypatch.setattr(
+            jg, "select_default_config", lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
+        )
+        for _ in range(5):
+            fg._plan("gemm", False, 64, 256, 2048, torch.bfloat16)
+        assert len(calls) == 1, f"resolved {len(calls)} times, expected one"
+
+    def test_swapping_the_resolver_reresolves(self):
+        """A monkeypatched heuristic must be seen, not served from the cache."""
+        import oasr.functionals.gemm as fg
+        import oasr.jit.gemm as jg
+
+        fg._PLANS.clear()
+        args = ("gemm", False, 64, 256, 2048, torch.bfloat16)
+        first = fg._plan(*args)
+        orig = jg.select_default_config
+        try:
+            jg.select_default_config = lambda *a, **k: "torch"
+            second = fg._plan(*args)
+            assert second[1] == fg._PLAN_TORCH
+            assert second[0] is not first[0], "the plan must record which resolver made it"
+        finally:
+            jg.select_default_config = orig
+        third = fg._plan(*args)
+        assert third[1] == first[1] and third[2] is first[2]
+
+    def test_the_cache_is_bounded(self):
+        """A model with a wide spread of M must not grow this without bound."""
+        import oasr.functionals.gemm as fg
+
+        fg._PLANS.clear()
+        for m in range(fg._PLAN_CACHE_MAX + 16):
+            fg._plan("gemm", False, m + 1, 256, 2048, torch.bfloat16)
+        assert len(fg._PLANS) <= fg._PLAN_CACHE_MAX
+
+    def test_plan_matches_the_resolver_for_every_rule_boundary(self):
+        """Whatever the table says for a shape is what the plan carries."""
+        import oasr.functionals.gemm as fg
+        import oasr.jit.gemm as jg
+
+        fg._PLANS.clear()
+        for (op, N, K), rules in jg._GEMM_HEURISTIC_RULES_SM120.items():
+            if op != "gemm":
+                continue
+            for m_max, _choice in rules:
+                M = 1 if m_max is None else int(m_max)
+                expect = jg.select_default_config(op, M, N, K, torch.bfloat16, 120)
+                kind = fg._plan(op, False, M, N, K, torch.bfloat16)[1]
+                if expect == "torch":
+                    assert kind == fg._PLAN_TORCH, (op, N, K, M)
+                else:
+                    assert kind == fg._PLAN_CUTLASS, (op, N, K, M)
+
+
+class TestRecurrentWidthRules:
+    """The LSTM/RNN gate-projection widths, which used to be a silent rule miss.
+
+    ``oasr.tune.capture`` only rebound the ``oasr`` package attributes, and the
+    recurrent functional imports ``gemm`` from its defining module, so this shape
+    never appeared in a captured workload and the whole M range sat on
+    ``GEMM_DEFAULT`` — a fixed 128x128 tile that costs 17 us where the tuned tile
+    costs 3.6.
+    """
+
+    @pytest.mark.parametrize(
+        "M,expect_tile",
+        [(1, (32, 64)), (64, (32, 64)), (128, (32, 64)), (256, (64, 64)), (768, (64, 64))],
+    )
+    def test_small_m_gets_a_thin_tile(self, M, expect_tile):
+        cfg = select_default_config("gemm", M, 2560, 640, torch.float16, 120)
+        assert cfg is not GEMM_DEFAULT, f"M={M} fell through to the default tile"
+        assert (cfg.block_m, cfg.block_n) == expect_tile
+
+    @pytest.mark.parametrize("M", [1024, 4096])
+    def test_large_m_keeps_the_default(self, M):
+        """Above the boundary cuBLAS leads the default by 1.01-1.05x — a tie."""
+        assert select_default_config("gemm", M, 2560, 640, torch.float16, 120) is GEMM_DEFAULT
+
+    def test_the_recurrent_width_is_no_longer_a_rule_miss(self):
+        import oasr.jit.gemm as jg
+
+        jg._RULE_MISSES.clear()
+        for M in (1, 64, 256, 1024):
+            select_default_config("gemm", M, 2560, 640, torch.float16, 120)
+        assert ("gemm", 2560, 640) not in jg._RULE_MISSES
