@@ -14,6 +14,13 @@
 //! Both are thin adapters over the same `EnginePool` handles; neither is
 //! privileged.
 
+// The fallible helpers here return an already-rendered `axum::response::Response`
+// as their error — 128 bytes, exactly the lint's threshold.  That error *is* the
+// response the client receives, so boxing it would move the bytes to the heap
+// without removing them, while breaking the `?` the handlers are built around.
+// Same call as `oasr-server-grpc`, where the error is tonic's 176-byte `Status`.
+#![allow(clippy::result_large_err)]
+
 pub mod engine_call;
 pub mod http_metrics;
 pub mod openai;
