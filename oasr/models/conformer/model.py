@@ -47,7 +47,9 @@ def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     assert mask.dtype == torch.bool
     assert dtype in [torch.float32, torch.bfloat16, torch.float16]
     mask = mask.to(dtype)
-    # Keep the mask finite; fused attention is inaccurate with an infinite bias.
+    # A finite floor, which fp16 promptly overflows back to -inf -- harmless
+    # either way: the mask is exact for both, and the fused kernel's inaccuracy
+    # with an infinite bias is fixed (see oasr/kernels/cute/softmax.py).
     mask = (1.0 - mask) * -1.0e10
     return mask
 

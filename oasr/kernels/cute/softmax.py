@@ -32,6 +32,19 @@ Both ``exp2`` arguments are formed as ``(a - b) * scale_log2`` and **never**
 as ``a * scale_log2 - b * scale_log2``. The two are algebraically equal but
 not numerically equal under ``fastmath``, and the difference is the
 correctness of the whole block -- see :meth:`Softmax.online_softmax`.
+
+The carried ``row_max`` is the *true* max, ``-inf`` included. A K-tile in
+which every column is masked leaves it at ``-inf``, and the ``exp2``
+reference for that tile alone is clamped to 0 (``exp2((-inf) - (-inf))``
+is NaN). Storing the clamp instead -- which is what this block used to do
+-- turns the running max into ``max(0, m)``, so every later tile whose own
+max ``m`` is negative gets exponentiated about 0 rather than about ``m``.
+Step 2 then no longer has ``max(P) == 1``, which is exactly the invariant
+that makes the caller's cast of ``P`` down to fp16/bf16 lossless: at
+``m = -11`` the whole row lands in fp16's subnormals, and below ``m = -20``
+it flushes to zero while ``row_sum`` (fp32) does not, so the row comes back
+scaled wrong or empty. ``m`` is a *logit*, so plain attention never reaches
+those magnitudes -- an additive ``attn_bias`` does.
 """
 
 # PEP 563 (deferred annotations) breaks CuteDSL Constexpr detection;
@@ -115,9 +128,15 @@ class Softmax:
         JIT drop a register-rich branch.
 
         Caller must have already masked invalid columns/rows in ``acc_S``
-        to ``-inf`` via :class:`AttentionMask`. The empty-row clamp
-        (``row_max == -inf`` => set to 0 to avoid NaN from exp(-inf -
-        -inf)) is applied here.
+        to ``-inf`` via :class:`AttentionMask`.
+
+        A row every one of whose columns is masked has ``row_max == -inf``,
+        and ``exp2((-inf) - (-inf))`` is NaN, so the ``exp2`` *reference*
+        is clamped to 0 for that row -- but the clamp stays local to the
+        tile. The **carried** ``row_max`` keeps the true ``-inf``: storing
+        the clamped 0 would make the running max ``max(0, m) == 0`` for
+        every later tile whose real max ``m`` is negative, and the softmax
+        would then be taken about the wrong point -- see the class notes.
         """
         acc_S_mn = make_acc_mn_view(acc_S)
         acc_O_mn = make_acc_mn_view(acc_O)
@@ -139,32 +158,49 @@ class Softmax:
             if cutlass.const_expr(not is_first):
                 row_max_cur = cute.arch.fmax(row_max_prev[r], row_max_cur)
 
-            # Empty-row clamp: if every column was masked to -inf, the
-            # subsequent ``exp(-inf - -inf)`` is NaN. Replace by 0 so
-            # ``exp(-inf - 0) = 0`` and row_sum stays 0; downstream
-            # arithmetic stays finite.
-            row_max_cur = 0.0 if row_max_cur == -cutlass.Float32.inf else row_max_cur
+            # Carry the *true* running max, ``-inf`` included: an all-masked
+            # tile must leave it at -inf so the next tile's real max wins
+            # outright. Clamping the carried value to 0 (which this used to do)
+            # keeps ``max(0, m) == 0`` for every negative ``m``, and the tile
+            # is then exponentiated about 0 instead of about its own max.
+            self.row_max[r] = row_max_cur
+
+            # Empty-row reference: ``exp2((-inf) - (-inf))`` is NaN, so a row
+            # with no unmasked column so far exponentiates about 0 instead --
+            # every one of its entries is -inf, so every ``row_p`` is 0 and
+            # row_sum stays 0 whatever finite reference is used.
+            row_max_ref = 0.0 if row_max_cur == -cutlass.Float32.inf else row_max_cur
 
             # Subtract before scaling. Under fastmath, the two-multiply form can
             # round the maximum's exponent positive, violating ``exp2(arg) <= 1``.
             # Finite mask floors make this overflow observable on masked blocks;
             # subtract-first preserves the sign and matches the rescale below.
             row_p = cute.math.exp2(
-                (acc_S_row - row_max_cur) * scale_log2,
+                (acc_S_row - row_max_ref) * scale_log2,
                 fastmath=True,
             )
             row_sum_cur = row_p.reduce(cute.ReductionOp.ADD, cutlass.Float32.zero, 0)
 
             if cutlass.const_expr(not is_first):
+                # Rebase the accumulators from the reference they were built
+                # against onto this tile's. A -inf previous max means nothing
+                # has been accumulated yet (row_sum and this acc_O row are both
+                # exactly 0), which is ``exp2(-inf) == 0``; spelling that out
+                # keeps -inf out of the arithmetic, where a
+                # ``0.0 * inf == NaN`` is one overflowing exponent away.
                 # Subtract-first keeps the non-positive rescale exponent exact.
-                delta_exp = cute.math.exp2(
-                    (row_max_prev[r] - row_max_cur) * scale_log2,
-                    fastmath=True,
+                prev_empty = row_max_prev[r] == -cutlass.Float32.inf
+                delta_exp = (
+                    cutlass.Float32(0.0)
+                    if prev_empty
+                    else cute.math.exp2(
+                        (row_max_prev[r] - row_max_ref) * scale_log2,
+                        fastmath=True,
+                    )
                 )
                 row_sum_cur = row_sum_cur + self.row_sum[r] * delta_exp
                 acc_O_mn[r, None] = acc_O_mn[r, None].load() * delta_exp
 
-            self.row_max[r] = row_max_cur
             self.row_sum[r] = row_sum_cur
             acc_S_mn[r, None] = row_p
 

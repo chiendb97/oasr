@@ -356,32 +356,54 @@ def test_fmha_finite_mask_floor_stays_finite(fmha, cuda, dtype, mask_floor):
 
 
 class TestInfiniteMaskFloorWithALargeBias:
-    """Large finite biases require the finite mask floor.
+    """``-inf`` in ``attn_bias`` has to mean what SDPA means by it.
 
-    Sparse rows can make fused softmax inaccurate when ``-inf`` is combined with
-    a large finite bias. The finite-floor arm is required behavior; the strict
-    xfail makes removal of the workaround explicit when the kernel is fixed.
+    The kernel used to write the *empty-row clamp* into the carried
+    ``row_max``: a K-tile with no unmasked column at all left the running max
+    at ``0`` instead of ``-inf``, so every later tile whose own max ``m`` was
+    negative got exponentiated about 0 rather than about ``m``.  ``P`` then
+    lost the ``max(P) == 1`` invariant that makes the cast down to fp16/bf16
+    before ``P @ V`` lossless -- subnormal by ``m ~ -11``, flushed to zero by
+    ``m ~ -20`` -- while ``row_sum`` stayed fp32-exact, so the row came back
+    mis-scaled or empty.  ``m`` is a logit: nothing but an additive bias gets
+    it that far from 0, which is why plain attention -- and FlashAttention,
+    whose softmax block this one mirrors -- never sees it.
+
+    Two things therefore decide a case, and both are in the geometries below:
+    a **fully masked first-visited K-tile** (the n-block loop runs descending,
+    so that is the *last* tile of the row) and a **negative row max**.  A
+    large finite floor (``-1e4``) never triggered it, because a finite floor
+    is itself a finite row max.
     """
 
+    # (B, H, T, D) shared by every case here so each dtype compiles once.
+    SHAPE = (3, 8, 122, 128)
+
     @staticmethod
-    def _case(cuda, dtype, floor):
-        B, H, T, D, magnitude = 3, 8, 122, 128, 80.0
+    def _chunked_window(T, device, chunk_size=4, history=14):
+        """NeMo's ``chunked_limited`` window, inline so this file stays
+        independent of the model package: frames are grouped into chunks of
+        ``right + 1 = 4`` and a query sees its own chunk plus the previous
+        ``56 // 4 = 14``.  The first chunk therefore leaves only 4 unmasked
+        keys, and its rows are the ones that failed.  Every row keeps its own
+        diagonal, so none is empty and the comparison is about accuracy, not
+        empty-row handling.
+        """
+        chunk = torch.arange(T, device=device).div(chunk_size, rounding_mode="trunc")
+        diff = chunk.unsqueeze(1) - chunk.unsqueeze(0)
+        return (diff >= 0) & (diff <= history)
+
+    @classmethod
+    def _case(cls, cuda, dtype, floor, magnitude=80.0, offset=0.0, keep=None):
+        B, H, T, D = cls.SHAPE
         torch.manual_seed(0)
         q = torch.randn(B, H, T, D, device=cuda, dtype=dtype) * 0.5
         k = torch.randn(B, H, T, D, device=cuda, dtype=dtype) * 0.5
         v = torch.randn(B, H, T, D, device=cuda, dtype=dtype) * 0.5
-        # NeMo's ``chunked_limited`` window, inline so this file stays independent
-        # of the model package: frames are grouped into chunks of ``right + 1 = 4``
-        # and a query sees its own chunk plus the previous ``56 // 4 = 14``.  The
-        # first chunk therefore leaves only 4 unmasked keys, which is the row that
-        # fails.  Every row keeps its own diagonal, so none is empty and the
-        # comparison is about accuracy, not empty-row handling.
-        chunk = torch.arange(T, device=cuda).div(4, rounding_mode="trunc")
-        diff = chunk.unsqueeze(1) - chunk.unsqueeze(0)
-        keep = (diff >= 0) & (diff <= 14)
-        bias = (torch.randn(B, H, T, T, device=cuda, dtype=dtype) * magnitude).masked_fill(
-            ~keep.view(1, 1, T, T), floor
-        )
+        if keep is None:
+            keep = cls._chunked_window(T, cuda)
+        bias = torch.randn(B, H, T, T, device=cuda, dtype=dtype) * magnitude + offset
+        bias = bias.masked_fill(~keep.view(1, 1, T, T), floor)
         scale = 1.0 / math.sqrt(D)
         return q, k, v, bias, scale
 
@@ -392,22 +414,117 @@ class TestInfiniteMaskFloorWithALargeBias:
         ref = _ref_fmha(q, k, v, scale, attn_bias=bias)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "known kernel defect: -inf in attn_bias is inaccurate once the finite "
-            "part of the bias exceeds ~±32 (see .artifacts/known_issues.md). Pass a "
-            "large finite floor instead; remove this xfail when the kernel is fixed"
-        ),
-    )
-    def test_large_bias_with_an_infinite_floor_matches_sdpa(self, fmha, cuda):
-        from oasr.jit.attention import select_backend
-
-        if select_backend() != "cute":
-            pytest.skip("defect is in the CuteDSL kernel; SDPA fallback is accurate")
-        q, k, v, bias, scale = self._case(cuda, torch.float16, float("-inf"))
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_large_bias_with_an_infinite_floor_matches_sdpa(self, fmha, cuda, dtype):
+        """The case the strict xfail used to pin.  Off by 1.49 on the pre-fix
+        kernel, on the 4-unmasked-key rows of the first chunk."""
+        q, k, v, bias, scale = self._case(cuda, dtype, float("-inf"))
         out = fmha(q, k, v, softmax_scale=scale, attn_bias=bias)
         ref = _ref_fmha(q, k, v, scale, attn_bias=bias)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_the_two_floors_agree(self, fmha, cuda, dtype):
+        """``-inf`` and a large finite floor are the same mask, so they must
+        give the same answer -- the claim that retires the finite-floor
+        workaround, rather than each arm merely being within tolerance of
+        SDPA.  It is also the sharpest of these cases in bf16, where the wider
+        exponent kept the pre-fix error (0.0039) inside the SDPA tolerance
+        while the two floors still disagreed."""
+        args_inf = self._case(cuda, dtype, float("-inf"))
+        args_fin = self._case(cuda, dtype, -1.0e4)
+        q, k, v, bias_inf, scale = args_inf
+        bias_fin = args_fin[3]
+        out_inf = fmha(q, k, v, softmax_scale=scale, attn_bias=bias_inf)
+        out_fin = fmha(q, k, v, softmax_scale=scale, attn_bias=bias_fin)
+        torch.testing.assert_close(out_inf, out_fin, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("offset", [-200.0, -90.0, -20.0, -11.0, 0.0, 90.0, 200.0])
+    def test_the_bias_offset_does_not_matter(self, fmha, cuda, offset):
+        """Shift the whole bias and watch the sign of the row max decide.
+
+        Softmax is shift-invariant, so adding a constant to every unmasked
+        logit must not move the output at all -- and on the pre-fix kernel it
+        did, at every offset here that left the sparse rows' max negative.  The
+        positive end passes on the broken kernel too, because the poisoned
+        running max is ``max(0, m)``, which is ``m`` exactly when ``m >= 0``:
+        that asymmetry is this defect's fingerprint, and it is why a symmetric
+        ``randn`` bias hides half of it.  With a *constant* bias in place of
+        this one's ``randn * 80``, the damage sets in at ``m ~ -11`` (fp16
+        subnormals) and is total by ``m ~ -20``.
+        """
+        q, k, v, bias, scale = self._case(cuda, torch.float16, float("-inf"), offset=offset)
+        out = fmha(q, k, v, softmax_scale=scale, attn_bias=bias)
+        ref = _ref_fmha(q, k, v, scale, attn_bias=bias)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_several_fully_masked_leading_tiles(self, fmha, cuda, dtype):
+        """Only the first three keys survive, so the descending n-block loop
+        opens on two whole ``-inf`` tiles before it reaches a live column --
+        and with three keys per row the max is negative about half the time.
+        Off by 2.14 pre-fix, in both dtypes.
+        """
+        B, H, T, D = self.SHAPE
+        keep = torch.zeros(T, T, dtype=torch.bool, device=cuda)
+        keep[:, :3] = True
+        q, k, v, bias, scale = self._case(cuda, dtype, float("-inf"), keep=keep)
+        out = fmha(q, k, v, softmax_scale=scale, attn_bias=bias)
+        ref = _ref_fmha(q, k, v, scale, attn_bias=bias)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+    def test_empty_rows_stay_zero_next_to_a_large_bias(self, fmha, cuda):
+        """A row with no unmasked key at all still comes back zero, not NaN --
+        the kernel's documented empty-row behaviour, pinned on its own by
+        ``TestPerRowKeyStart.test_fully_masked_row_is_zero_not_nan`` -- and its
+        neighbours in the same tile are unaffected.  This is the case the
+        rescale has to survive: ``row_max_prev`` is ``-inf`` while
+        ``row_max_cur`` is finite, and forming that delta as
+        ``exp2((-inf) - m)`` rather than special-casing it would multiply an
+        all-zero accumulator by an exponent one overflow away from ``inf``.
+        """
+        B, H, T, D = self.SHAPE
+        keep = self._chunked_window(T, cuda).clone()
+        rows = torch.arange(T, device=cuda)
+        empty = (rows % 8) == 3
+        keep[empty] = False
+        q, k, v, bias, scale = self._case(cuda, torch.float16, float("-inf"), keep=keep)
+        out = fmha(q, k, v, softmax_scale=scale, attn_bias=bias)
+        ref = _ref_fmha(q, k, v, scale, attn_bias=bias)
+        assert torch.isfinite(out).all()
+        torch.testing.assert_close(out[:, :, empty], torch.zeros_like(out[:, :, empty]))
+        torch.testing.assert_close(out[:, :, ~empty], ref[:, :, ~empty], atol=2e-2, rtol=2e-2)
+
+    def test_paged_kv_with_an_infinite_floor(self, fmha, cuda):
+        """The paged path shares the softmax block, and shared is not the same
+        as covered: its tiles come from a block table, so it reaches
+        ``online_softmax`` through a different loader.  Off by 1.53 pre-fix."""
+        from oasr.functionals.attention import gather_paged_kv
+
+        B, H, D, block, nblk = 2, 4, 64, 16, 9
+        T_q, T_k = 128, block * nblk
+        torch.manual_seed(0)
+        k_pool = torch.randn(B * nblk, block, H, D, device=cuda, dtype=torch.float16) * 0.5
+        v_pool = torch.randn(B * nblk, block, H, D, device=cuda, dtype=torch.float16) * 0.5
+        bt = torch.arange(B * nblk, device=cuda, dtype=torch.int32).view(B, nblk)
+        q = torch.randn(B, H, T_q, D, device=cuda, dtype=torch.float16) * 0.5
+        keep = self._chunked_window(max(T_q, T_k), cuda)[:T_q, :T_k]
+        bias = torch.randn(B, H, T_q, T_k, device=cuda, dtype=torch.float16) * 80.0
+        bias = bias.masked_fill(~keep.view(1, 1, T_q, T_k), float("-inf"))
+        scale = 1.0 / math.sqrt(D)
+
+        lens = torch.tensor([T_k, T_k - 20], device=cuda, dtype=torch.int32)
+        out = fmha(
+            q,
+            k_pool,
+            v_pool,
+            softmax_scale=scale,
+            attn_bias=bias,
+            cache_seqlens=lens,
+            block_table=bt,
+        )
+        k_dense, v_dense = gather_paged_kv(k_pool, v_pool, bt)
+        ref = _ref_fmha(q, k_dense, v_dense, scale, attn_bias=bias, cache_seqlens=lens)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 

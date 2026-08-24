@@ -32,8 +32,10 @@ Key features (Tier 2 cp.async ring matching FA's flash_fwd SM80 path):
 * :class:`AttentionMask` carries the per-stream length, causal, and
   sliding-window mask in one constexpr-flagged loop. Causal / window-size
   knobs are wired through ``FmhaBase`` and default off.
-* Online softmax lives in :class:`Softmax`. Empty-row clamp
-  (``row_max == -inf`` => 0) carries over.
+* Online softmax lives in :class:`Softmax`. The empty-row clamp
+  (``row_max == -inf`` => 0) is local to the tile; the carried
+  ``row_max`` keeps ``-inf`` so a fully masked tile does not become the
+  running max.
 * Paged KV uses ``_paged_load_kv_tile`` on this class. Same
   block-aligned-``n_block`` constraint as before
   (``N_BLOCK % block_size == 0``).
