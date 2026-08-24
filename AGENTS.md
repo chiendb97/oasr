@@ -56,9 +56,12 @@ JIT compilation and a Rust HTTP/gRPC serving front-end.
    that changes *what is decoded* or that a caller will look for in the response
    must be declared (`selective_options` / `word_timing_modes`) so a family
    without it rejects rather than ignores.
-10. **Never pass `-inf` as `attn_bias`.** Use a large finite mask floor —
-    mathematically identical, and the fused kernel is inaccurate above a
-    moderate finite bias magnitude.
+10. **Never let a fully masked K-tile become the carried `row_max`.** The online
+    softmax's empty-row clamp (`row_max == -inf` → 0) must stay *local to the
+    tile*: stored, the running max becomes `max(0, m)`, `P` loses `max(P) == 1`,
+    and the fp16 cast before `P @ V` flushes the row to zero. That is what made
+    `-inf` in `attn_bias` wrong beside a large finite bias; fixed and pinned by
+    `tests/test_fmha.py::TestInfiniteMaskFloorWithALargeBias`.
 11. **Never branch kernel dispatch on CUDA-graph capture state.** A
     capture-dependent branch makes the graph pick a different kernel than eager,
     and the resulting one-ulp difference has changed decoded tokens.

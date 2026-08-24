@@ -67,15 +67,19 @@ __all__ = [
 ]
 
 #: Additive bias given to a masked attention key.  A **finite** floor, where
-#: upstream writes ``float("-inf")``, and the difference is not cosmetic.
+#: upstream writes ``float("-inf")``.
 #:
 #: Masking is exact either way: this bias is added after the softmax scale, the
 #: real logits stay far above this floor, and the masked exponent underflows to
-#: zero.  The finite form avoids a fused-attention accuracy defect when an
-#: infinite mask is combined with a large finite relative-position bias.
-#:
-#: A fully masked query row also stays finite; an infinite mask can produce a NaN
-#: row that later arithmetic spreads into valid rows.
+#: zero -- so for any row with at least one unmasked key the two forms are
+#: bit-identical.  The floor was introduced to dodge a fused-attention accuracy
+#: defect that ``-inf`` triggered next to this architecture's large
+#: Transformer-XL bias; that defect is fixed (``oasr/kernels/cute/softmax.py``,
+#: pinned by ``tests/test_fmha.py::TestInfiniteMaskFloorWithALargeBias``), so the
+#: floor is now a choice rather than a workaround.  It stays because the WER this
+#: architecture is gated on was measured with it, and because it keeps a fully
+#: masked query row a finite average instead of leaving the row's value to the
+#: backend.
 MASK_FLOOR = -1.0e4
 
 
@@ -343,9 +347,8 @@ class NemotronRelPositionAttention(nn.Module):
         matrix_bd = (q + self.bias_v.unsqueeze(1)) @ rel_k.permute(0, 2, 3, 1)
         matrix_bd = rel_shift(matrix_bd)[..., :key_len] * self.scaling
 
-        # A large *finite* floor rather than upstream's ``-inf``: mathematically
-        # the same mask, and the one the fused kernel computes correctly at this
-        # bias magnitude.  See :data:`MASK_FLOOR` for the measurement.
+        # A large *finite* floor rather than upstream's ``-inf``: the same mask
+        # for every row with a live key.  See :data:`MASK_FLOOR`.
         bias = matrix_bd.masked_fill(attn_mask.logical_not(), MASK_FLOOR)
         out = self.attn(q + self.bias_u.unsqueeze(1), k, v, attn_bias=bias)
         if silent is not None:
