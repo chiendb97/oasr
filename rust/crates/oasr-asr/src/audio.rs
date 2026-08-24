@@ -81,8 +81,10 @@ impl DecodedAudio {
 /// Reinterpret f32-LE bytes as samples.  A trailing partial sample (which the
 /// decoders never produce) is ignored.
 fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| f32::from_le_bytes(c))
         .collect()
 }
 
@@ -184,8 +186,10 @@ fn pcm_to_f32(body: &[u8], encoding: PcmEncoding) -> Result<Vec<f32>, AudioError
     Ok(match encoding {
         PcmEncoding::F32Le => bytes_to_f32(body),
         PcmEncoding::I16Le => body
-            .chunks_exact(2)
-            .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| f32::from(i16::from_le_bytes(c)) / 32768.0)
             .collect(),
         PcmEncoding::MuLaw => body
             .iter()
@@ -476,8 +480,10 @@ mod tests {
         assert_eq!(dec.sample_rate, 16000);
         let samples: Vec<f32> = dec
             .samples
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
             .collect();
         assert_eq!(samples.len(), src.len());
         for (i, s) in samples.iter().enumerate() {
@@ -497,8 +503,10 @@ mod tests {
         let dec = decode_wav(&wav).unwrap();
         let samples: Vec<f32> = dec
             .samples
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
             .collect();
         assert_eq!(samples.len(), 2);
         assert!((samples[0] - (1000.0 + 3000.0) / 2.0 / 32768.0).abs() < 1e-6);
@@ -513,8 +521,10 @@ mod tests {
         assert_eq!(dec.sample_rate, 16000);
         let back: Vec<f32> = dec
             .samples
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
             .collect();
         assert_eq!(back, src);
     }
@@ -526,8 +536,10 @@ mod tests {
         let dec = decode_raw_pcm(&bytes, PcmEncoding::I16Le, 16000).unwrap();
         let back: Vec<f32> = dec
             .samples
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
             .collect();
         assert!((back[0] - 0.5).abs() < 1e-3);
         assert!((back[1] - -0.5).abs() < 1e-3);
@@ -631,8 +643,10 @@ mod tests {
         let dec = decode_raw_pcm(&body, PcmEncoding::MuLaw, 8_000).unwrap();
         let back: Vec<f32> = dec
             .samples
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
             .collect();
         assert_eq!(back.len(), 4, "µ-law is one byte per sample");
         assert_eq!(back[0], 0.0);
@@ -757,15 +771,14 @@ mod tests {
         streamed.extend_from_slice(&stream.flush().unwrap());
 
         assert_eq!(streamed.len(), one_shot.samples.len());
-        for (i, (a, b)) in streamed
-            .chunks_exact(4)
-            .zip(one_shot.samples.chunks_exact(4))
+        for (i, (&a, &b)) in streamed
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(one_shot.samples.as_chunks::<4>().0.iter())
             .enumerate()
         {
-            let (a, b) = (
-                f32::from_le_bytes(a.try_into().unwrap()),
-                f32::from_le_bytes(b.try_into().unwrap()),
-            );
+            let (a, b) = (f32::from_le_bytes(a), f32::from_le_bytes(b));
             assert!((a - b).abs() < 1e-6, "chunk mismatch at {i}: {a} vs {b}");
         }
     }
