@@ -234,6 +234,16 @@ The NonlinAttention gate uses the standalone `Tanh` waist module; its gate is
 one chunk of a three-way projection output, so a whole-GEMM epilogue cannot
 represent the operation.
 
+**The attention is decomposed on purpose and cannot be fused.**
+`RelPositionMultiheadAttentionWeights` materializes the probabilities once and
+both `SelfAttention` and `NonlinAttention` consume the *same* tensor, so FMHA —
+which never materializes them — has no way to express the sharing. The five
+products per layer therefore go through `oasr.bmm`'s general lane: 4-D permuted
+views, an operand broadcast over the request batch, head dims of 32 / 4 / 12 and
+an always-odd relative-position extent. See
+[`kernels.md`](kernels.md) § "The BMM general lane"; the remaining fusion (score
+add, relative shift, masks, softmax) is the open item.
+
 ### Transducer (icefall RNNT)
 
 `model.py::TransducerModel`, `decoder.py` (stateless predictor), `joiner.py`,

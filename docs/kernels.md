@@ -270,6 +270,65 @@ Two rules are structural rather than tuned:
 `OASR_GEMM_HEURISTIC=0` disables the whole thing. Measurements and re-tuning
 recipe: `.artifacts/gemm_tuning.md`.
 
+### The BMM general lane
+
+`bmm` has a second lane that the shape rules do not reach. The rendered tile
+variants are alignment-8 iterators over contiguous 3-D operands; a decomposed
+attention block does not have that shape. Zipformer's is the case that forced
+the lane: five products per layer, 4-D permuted views of a
+`(time, batch, head, dim)` activation, one operand broadcast over the request
+batch, head dims of 32 / 4 / 12 and a relative-position extent that is always
+odd. FMHA cannot substitute — the probabilities are materialized once and
+*shared* by `SelfAttention` and `NonlinAttention`, and a fused kernel never
+materializes them.
+
+`oasr.bmm` therefore accepts one or two broadcasting batch dimensions, arbitrary
+N and K, and — the part that saves a copy at every call site — a `B` operand
+contiguous along **either** trailing axis, so `[..., N, K]` and its transposed
+view are both legal and neither needs `.contiguous()`. A contiguous 3-D
+alignment-8 call still takes the tuned lane; everything else lands in
+`include/oasr/gemm/bmm.cuh`, which turns three run-time facts into one
+instantiation:
+
+| Chosen from | Values | Why it is compile-time |
+|---|---|---|
+| B's memory layout | CUTLASS `ColumnMajor` / `RowMajor` | the iterator's contiguous axis |
+| operand alignment along K | 8 / 4 / 2 elements | `cp.async` cannot issue a 2-byte copy, so alignment 1 is not a tensor-op case at all |
+| alignment along N (epilogue, and B when RowMajor) | 8 / 4 / 2 / 1 | an odd N has to be able to store one element at a time |
+| threadblock tile | 128×128 / 64×64 / 32×32 / 64×16 (thin-N) | see below |
+
+The grid is 124 instantiations (62 per dtype), rendered one translation unit per
+(layout, dtype) from `csrc/templates/bmm_general_template.cu.jinja` — the same
+template-per-configuration pattern as the tile variants, and for a measured
+reason: nvcc parallelizes across translation units but not within one, so the
+module's cold build is set by its largest TU. Inlining the grid into `bmm.cu`
+costs 112 s; this split costs 40 s.
+
+Anything outside that grid runs on CUTLASS SIMT `GemmBatched`, which constrains
+nothing. **Nothing falls back to PyTorch**: a shape either has a kernel or the
+call raises.
+
+Two properties of the lane are worth knowing before changing it:
+
+- **The tile ladder is the difference between the lane and a regression.** These
+  problems are 2–70 MFLOP, so they are latency-bound and the only thing that
+  matters is how much of the device the grid covers. A single 128×128 tile put
+  8–64 CTAs on an RTX 5090's 170 SMs and burned 246 registers/thread for 8.3%
+  achieved occupancy — 1.74× slower than cuBLAS. Selecting the largest tile that
+  still fills one wave brought that to 1.07×. Note the ceiling: CUTLASS's
+  tensor-op epilogue divides the tile's rows by the warp count in M before it
+  computes an iteration count, so a 32-row tile is a **single-warp** shape and
+  nothing smaller than 64 rows can use 128 threads.
+- **`GemmBatched` advances every operand by one constant stride**, so two batch
+  axes are one launch only when all three tensors are affine in the flattened
+  index. Both flattening orders are tried, because a contiguous output satisfies
+  one and a head-major view of a `(time, batch, head, dim)` activation satisfies
+  the other. A broadcast *inner* axis satisfies neither and costs
+  `min(batch0, batch1)` launches.
+
+Measurements, including the profile that produced the ladder:
+`.artifacts/kg5_strided_bmm.md`.
+
 ### Fused attention
 
 ```python

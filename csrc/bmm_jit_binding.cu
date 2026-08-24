@@ -5,7 +5,8 @@
 
 #include "tvm_ffi_utils.h"
 
-// Forward declaration — BMM launcher
+// Forward declaration — the general BMM launcher (csrc/bmm.cu).  The 23
+// rendered alignment-8 tile variants export their own `bmm_<config>` symbols.
 void bmm(TensorView output, TensorView A, TensorView B);
 
 // TVM-FFI symbol export

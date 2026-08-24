@@ -21,7 +21,7 @@ from benchmarks.routines.bench_utils import (
     run_profile,
 )
 
-SUBROUTINES = ["gemm", "bmm", "group_gemm", "gemm_activation"]
+SUBROUTINES = ["gemm", "bmm", "bmm_strided", "group_gemm", "gemm_activation"]
 
 # ---------------------------------------------------------------------------
 # Default configs (from existing bench_*.py files)
@@ -45,6 +45,15 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
         {"B": 512, "M": 200, "N": 200, "K": 64},
         {"B": 64, "M": 200, "N": 200, "K": 64},
     ],
+    # The general BMM lane (KG5): strided 4-D operands with small/unaligned N
+    # and K.  Sizes are Zipformer-large's own attention products at 10 s of
+    # audio -- ``T`` is the *encoder* frame count of one downsampling stack, so
+    # the four rows are the four stacks.
+    "bmm_strided": [
+        {"product": p, "T": t, "heads": h, "hidden": hid, "batch": 1}
+        for t, h, hid in [(496, 4, 144), (248, 4, 192), (124, 4, 384), (62, 8, 576)]
+        for p in ("qk", "pos", "value", "nonlin")
+    ],
     "group_gemm": [
         {"num_groups": 32, "M": 256, "N": 64, "K": 64},
         {"num_groups": 32, "M": 256, "N": 128, "K": 64},
@@ -61,6 +70,7 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
 PROFILE_CONFIGS: dict[str, tuple] = {
     "gemm": (16000, 256, 2048),
     "bmm": (256, 200, 200, 64),
+    "bmm_strided": ("qk", 496, 4, 144, 1),
     "group_gemm": (64, 200, 64, 64),
     "gemm_activation": (16000, 2048, 512),
 }
@@ -98,6 +108,60 @@ def setup_bmm(B: int, M: int, N: int, K: int, dtype=torch.float16):
 
     def pytorch_fn():
         return torch.bmm(A, B_transposed)
+
+    return oasr_fn, pytorch_fn
+
+
+def _strided_problem(product: str, T: int, heads: int, hidden: int, batch: int):
+    """``(M, N, K)`` for one Zipformer attention product."""
+    if product == "qk":
+        return T, T, 32
+    if product == "pos":
+        return T, 2 * T - 1, 4
+    if product == "value":
+        return T, 12, T
+    if product == "nonlin":
+        return T, hidden, T
+    raise ValueError(f"unknown strided bmm product: {product}")
+
+
+def setup_bmm_strided(
+    product: str, T: int, heads: int, hidden: int, batch: int, dtype=torch.float16
+):
+    """The general BMM lane against ``torch.matmul`` on identical operand memory.
+
+    The arms share their buffers: ``oasr.bmm`` takes the logical ``[..., N, K]``
+    operand and ``torch.matmul`` takes its transposed *view*, which is what the
+    model expression built before KG5.  Neither arm copies, so the comparison is
+    kernel against kernel.  Outputs are preallocated because at these sizes an
+    allocation is a measurable share of the call.
+    """
+    M, N, K = _strided_problem(product, T, heads, hidden, batch)
+    if product == "qk":
+        x = torch.randn(T, batch, heads, 96, device="cuda", dtype=dtype)
+        A = x[..., 0:32].permute(2, 1, 0, 3)
+        B_nk = x[..., 32:64].permute(2, 1, 0, 3)
+        B_torch = x[..., 32:64].permute(2, 1, 3, 0)
+        out = torch.empty(heads, batch, M, N, device="cuda", dtype=dtype)
+    elif product == "pos":
+        A = torch.randn(T, batch, heads, 4, device="cuda", dtype=dtype).permute(2, 1, 0, 3)
+        pos = torch.randn(1, N, heads, 4, device="cuda", dtype=dtype)
+        B_nk = pos.permute(2, 0, 1, 3)
+        B_torch = pos.permute(2, 0, 3, 1)
+        out = torch.empty(heads, batch, M, N, device="cuda", dtype=dtype)
+    else:
+        h = heads if product == "value" else 1
+        A = torch.randn(h, batch, M, K, device="cuda", dtype=dtype)
+        v = torch.randn(T, batch, h, N, device="cuda", dtype=dtype)
+        B_nk = v.permute(2, 1, 3, 0)
+        B_torch = v.permute(2, 1, 0, 3)
+        out = torch.empty(h, batch, M, N, device="cuda", dtype=dtype)
+
+    def oasr_fn():
+        return oasr.bmm(A, B_nk, out=out)
+
+    def pytorch_fn():
+        return torch.matmul(A, B_torch, out=out)
 
     return oasr_fn, pytorch_fn
 
@@ -166,6 +230,14 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--K", type=int, default=None, help="K dimension")
     parser.add_argument(
         "--batch-count", type=int, default=None, help="Batch count (bmm/group_gemm)"
+    )
+    parser.add_argument(
+        "--product",
+        type=str,
+        default=None,
+        choices=["qk", "pos", "value", "nonlin"],
+        help="which Zipformer attention product to measure (bmm_strided only); "
+        "--M is read as the encoder frame count T",
     )
     parser.add_argument("--autotune", action="store_true", help="Enable autotuning (gemm only)")
     parser.add_argument("--cache", type=str, default=None, help="Autotune cache path")
@@ -246,6 +318,20 @@ def _resolve_configs(args: argparse.Namespace, subroutine: str) -> list[dict]:
 
     if subroutine == "bmm" and all(v is not None for v in [M, N, K]) and batch_count is not None:
         return [{"B": batch_count, "M": M, "N": N, "K": K}]
+    elif subroutine == "bmm_strided":
+        # M is read as T (the encoder frame count); the product's own shape
+        # follows from it, so N and K are not free parameters here.
+        if M is not None:
+            return [
+                {
+                    "product": getattr(args, "product", None) or "qk",
+                    "T": M,
+                    "heads": batch_count or 4,
+                    "hidden": N or 144,
+                    "batch": 1,
+                }
+            ]
+        return DEFAULT_CONFIGS["bmm_strided"]
     elif subroutine == "group_gemm" and all(v is not None for v in [M, N, K]):
         num_groups = batch_count or 32
         return [{"num_groups": num_groups, "M": M, "N": N, "K": K}]
@@ -261,6 +347,10 @@ def _setup_for_config(subroutine: str, cfg: dict, dtype: torch.dtype):
         return setup_gemm(cfg["M"], cfg["N"], cfg["K"], dtype)
     elif subroutine == "bmm":
         return setup_bmm(cfg["B"], cfg["M"], cfg["N"], cfg["K"], dtype)
+    elif subroutine == "bmm_strided":
+        return setup_bmm_strided(
+            cfg["product"], cfg["T"], cfg["heads"], cfg["hidden"], cfg["batch"], dtype
+        )
     elif subroutine == "group_gemm":
         num_groups = cfg["num_groups"]
         M, N, K = cfg["M"], cfg["N"], cfg["K"]
@@ -277,6 +367,12 @@ def _setup_for_config(subroutine: str, cfg: dict, dtype: torch.dtype):
 
 
 def _compute_tflops(subroutine: str, cfg: dict, time_ms: float) -> float:
+    if subroutine == "bmm_strided":
+        M, N, K = _strided_problem(
+            cfg["product"], cfg["T"], cfg["heads"], cfg["hidden"], cfg["batch"]
+        )
+        heads = cfg["heads"] if cfg["product"] in ("qk", "pos", "value") else 1
+        return compute_bmm_tflops(heads * cfg["batch"], M, N, K, time_ms)
     if subroutine == "bmm":
         return compute_bmm_tflops(cfg["B"], cfg["M"], cfg["N"], cfg["K"], time_ms)
     elif subroutine == "group_gemm":
@@ -287,6 +383,12 @@ def _compute_tflops(subroutine: str, cfg: dict, time_ms: float) -> float:
 
 
 def _shape_str(subroutine: str, cfg: dict) -> str:
+    if subroutine == "bmm_strided":
+        M, N, K = _strided_problem(
+            cfg["product"], cfg["T"], cfg["heads"], cfg["hidden"], cfg["batch"]
+        )
+        heads = cfg["heads"] if cfg["product"] in ("qk", "pos", "value") else 1
+        return f"{cfg['product']}({heads}x{cfg['batch']}, {M}, {N}, {K})"
     if subroutine == "bmm":
         return f"({cfg['B']}, {cfg['M']}, {cfg['N']}, {cfg['K']})"
     elif subroutine == "group_gemm":

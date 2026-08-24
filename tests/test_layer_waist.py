@@ -252,6 +252,57 @@ def test_models_do_not_call_bare_torch_activations():
     )
 
 
+#: Deliberate ``torch.matmul`` / ``torch.bmm`` sites in model code, as
+#: ``(path relative to oasr/models, symbol) -> reason``.  Keyed by file rather
+#: than line so the ratchet survives an edit above it, and by an explicit count
+#: so a *second* bypass in the same file still fails.
+ALLOWED_TORCH_MATMUL = {
+    ("whisper/model.py", "torch.matmul"): (
+        1,
+        "the word-timing cross-attention probe forms its scores in fp32 on "
+        "purpose; fp32 is outside the OASR BMM kernel contract (fp16/bf16)",
+    ),
+}
+
+
+def test_models_do_not_bypass_bmm_with_torch_matmul():
+    """KG5 ratchet: batched matrix products belong to ``oasr.bmm``.
+
+    Zipformer's five attention products per layer were the reason this rule
+    could not exist before: its head dims (query 32, pos 4, value 12) and its
+    always-odd relative-position extent had no kernel, so the model file called
+    ``torch.matmul`` and no counter anywhere could see it.  The general BMM lane
+    closed that, and this keeps it closed.
+    """
+    models_dir = Path(__file__).resolve().parents[1] / "oasr" / "models"
+    banned = {"torch.matmul", "torch.bmm"}
+    found: dict = {}
+    for path in models_dir.rglob("*.py"):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _dotted_name(node.func) in banned:
+                relative = path.relative_to(models_dir).as_posix()
+                key = (relative, _dotted_name(node.func))
+                found.setdefault(key, []).append(node.lineno)
+
+    offenders = []
+    for key, lines in sorted(found.items()):
+        allowed = ALLOWED_TORCH_MATMUL.get(key)
+        budget = allowed[0] if allowed else 0
+        if len(lines) > budget:
+            offenders.append(
+                f"{key[0]}:{','.join(str(n) for n in lines)} {key[1]} "
+                f"({len(lines)} call(s), {budget} allowed)"
+            )
+    assert not offenders, (
+        "model code bypasses oasr.bmm:\n  "
+        + "\n  ".join(offenders)
+        + "\nUse oasr.bmm — it takes 3-D/4-D operands with broadcasting batch axes, "
+        "either memory layout for B, and arbitrary N/K. Add an entry to "
+        "ALLOWED_TORCH_MATMUL only for a dtype the kernel does not serve."
+    )
+
+
 def test_eligible_residual_norm_paths_use_fused_waist():
     """Keep KG14's model wiring from silently regressing to separate adds."""
     models_dir = Path(__file__).resolve().parents[1] / "oasr" / "models"

@@ -741,6 +741,49 @@ def _render_all_variants(
     return source_paths
 
 
+#: The general BMM lane's instantiation grid, one translation unit per cell.
+#: Splitting it is not cosmetic: nvcc parallelizes across translation units but
+#: not within one, and this module's cold build is set by its largest TU.  On a
+#: 64-core box the whole ``bmm`` module builds in 112 s with the grid in one TU,
+#: 70 s split by B layout, and 42 s split by layout *and* dtype.
+#: ``(cell, CUTLASS LayoutB, CUTLASS element)``.  The C++ entry point for a cell
+#: is ``generalBmm_<cell>``, **declared in** ``include/oasr/gemm/bmm.cuh`` and
+#: called by ``generalBmm`` there — that header owns the name, this table only
+#: has to agree with it, and a disagreement is a link error rather than a silent
+#: miss.
+_BMM_GENERAL_CELLS = (
+    ("column_major_f16", "ColumnMajor", "cutlass::half_t"),
+    ("column_major_bf16", "ColumnMajor", "cutlass::bfloat16_t"),
+    ("row_major_f16", "RowMajor", "cutlass::half_t"),
+    ("row_major_bf16", "RowMajor", "cutlass::bfloat16_t"),
+)
+
+
+def _render_bmm_general_variants() -> List:
+    """Render the general BMM lane's instantiation TUs.
+
+    Same pattern as the tile variants above — the grid lives in one template
+    rather than in near-duplicate files under ``csrc/``.
+    """
+    from .cubin_loader import write_if_different
+    from .templates import render_template
+
+    source_paths = []
+    for cell, layout, element in _BMM_GENERAL_CELLS:
+        op_name = f"bmm_general_{cell}"
+        rendered = render_template(
+            "bmm_general_template.cu.jinja",
+            op_name=op_name,
+            func_name=f"generalBmm_{cell}",
+            layout=layout,
+            element=element,
+        )
+        gen_path = env.OASR_GEN_SRC_DIR / "bmm" / f"{op_name}.cu"
+        write_if_different(gen_path, rendered)
+        source_paths.append(gen_path)
+    return source_paths
+
+
 # =============================================================================
 # Module generators — ALL variants compiled into ONE .so per family
 # =============================================================================
@@ -767,14 +810,26 @@ def gen_gemm_module() -> JitSpec:
 
 
 def gen_bmm_module() -> JitSpec:
-    """Generate JIT spec for BMM with ALL tile variants in one module.
+    """Generate JIT spec for BMM: the tuned tile variants plus the general lane.
 
-    Each variant exports ``bmm_{config_name}`` as a TVM-FFI function.
+    Each tile variant exports ``bmm_{config_name}``; those are the alignment-8
+    contiguous-3-D fast lane the shape heuristic selects from.  ``bmm`` is the
+    general lane — arbitrary batch strides, either B layout, small/unaligned N
+    and K — which is what Zipformer's decomposed attention needs and no tile
+    variant can express (``csrc/bmm.cu`` + the two instantiation halves).
     """
     source_paths = _render_all_variants(
         "bmm_cutlass_template.cu.jinja",
         "bmm_cutlass_template_sm90.cu.jinja",
         "bmm",
+    )
+    source_paths = (
+        source_paths
+        + _render_bmm_general_variants()
+        + [
+            env.OASR_CSRC_DIR / "bmm.cu",
+            env.OASR_CSRC_DIR / "bmm_jit_binding.cu",
+        ]
     )
     return gen_jit_spec("bmm", source_paths)
 

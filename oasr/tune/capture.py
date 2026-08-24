@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import threading
 from collections import Counter
@@ -131,7 +132,7 @@ def _shapes_of(op: str, args, kwargs) -> Optional[Tuple[int, int, int, int]]:
     """Extract ``(M, N, K, batch)`` from a functional call's args.
 
     Layout matches :mod:`oasr.functionals.gemm`: ``A`` is operand 0, ``B`` (the ``[N, K]``
-    weight, or ``[batch, N, K]`` for bmm/group_gemm) is operand 1.
+    weight, or a 3-D/4-D ``[..., N, K]`` operand for bmm/group_gemm) is operand 1.
     """
     A = args[0] if args else kwargs.get("A")
     B = args[1] if len(args) > 1 else kwargs.get("B")
@@ -139,11 +140,13 @@ def _shapes_of(op: str, args, kwargs) -> Optional[Tuple[int, int, int, int]]:
         return None
     K = int(A.shape[-1])
     if op == "bmm":
-        # A: [batch, M, K], B: [batch, N, K]
-        batch = int(A.shape[0])
-        M = int(A.shape[1])
-        N = int(B.shape[1])
-        return M, N, K, batch
+        # A: [..., M, K], B: [..., N, K] with one or two broadcasting batch axes.
+        # Reading N off ``B.shape[1]`` would take it from the *contraction* axis
+        # on a 4-D call, so both are read from the trailing pair.
+        a_batch = (1,) * (max(A.ndim, B.ndim) - A.ndim) + tuple(A.shape[:-2])
+        b_batch = (1,) * (max(A.ndim, B.ndim) - B.ndim) + tuple(B.shape[:-2])
+        batch = math.prod(max(int(x), int(y)) for x, y in zip(a_batch, b_batch))
+        return int(A.shape[-2]), int(B.shape[-2]), K, batch
     if op == "group_gemm":
         # A: [L, K], B: [Bcount, N, K]
         M = int(A.numel() // K)
