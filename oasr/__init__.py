@@ -97,7 +97,7 @@ from .functionals.recurrent import (
     rnn_layer,
     rnn_slot_step,
 )
-from .functionals.softmax import log_softmax, softmax
+from .functionals.softmax import log_softmax, masked_softmax, softmax
 from .functionals.topk import topk
 from .layers import (
     LSTM,
@@ -119,6 +119,7 @@ from .layers import (
     GroupNorm,
     LayerNorm,
     Linear,
+    MaskedSoftmax as MaskedSoftmaxModule,
     Mfcc,
     PointwiseConv1d,
     Relu as ReluModule,
@@ -259,6 +260,7 @@ __all__ = [
     "gemm_activation",
     "gemm_log_softmax",
     "log_softmax",
+    "masked_softmax",
     "softmax",
     "topk",
     "rfft",
@@ -305,6 +307,7 @@ __all__ = [
     "AvgPool1d",
     "GlobalCMVN",
     "SoftmaxModule",
+    "MaskedSoftmaxModule",
     "TopKModule",
     # Autotuning
     "tune",

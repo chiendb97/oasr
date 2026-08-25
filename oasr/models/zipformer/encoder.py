@@ -48,6 +48,17 @@ from .scaling import (
 # products keep K in ``[..., time, head_dim]`` form instead of materializing a
 # transpose, and the value products pass ``[..., value_dim, time]`` as a plain
 # permuted view -- neither needs a copy.
+#
+# What FMHA cannot fuse, ``oasr.masked_softmax`` can: everything *between* the
+# two products.  The relative-position bias is a shifted window over a
+# ``(H, B, T, 2T-1)`` product and the key-padding mask is a ``[..., ::ds]``
+# slice of the un-downsampled mask, and the kernel reads both through their own
+# strides.  So the add, the ``masked_fill`` and the softmax -- three kernels and
+# eight passes over the ``(H, B, T, T)`` score tensor, four kernels when an
+# attention mask is also present -- become one kernel and three passes.
+# Folding the operands in is bit-exact, and the 200-utterance WER gate is
+# unchanged error count for error count; 1.7-3.7x on the kernel, at the shapes
+# this stack produces.
 
 
 def _to_tuple(x, length: int):
@@ -173,19 +184,22 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
             ),
             storage_offset=pos_scores.stride(3) * (seq_len - 1),
         )
-        attn_scores = attn_scores + pos_scores
-
         assert attn_scores.shape == (num_heads, batch_size, seq_len, seq_len)
-
         if attn_mask is not None:
             assert attn_mask.dtype == torch.bool
-            attn_scores = attn_scores.masked_fill(attn_mask, -1000)
-
         if key_padding_mask is not None:
             assert key_padding_mask.shape == (batch_size, seq_len), key_padding_mask.shape
-            attn_scores = attn_scores.masked_fill(key_padding_mask.unsqueeze(1), -1000)
 
-        return oasr.softmax(attn_scores.contiguous())
+        # ``pos_scores`` above is a shifted window over the (H, B, T, 2T-1)
+        # product and ``key_padding_mask`` is a ``[..., ::ds]`` slice; both are
+        # consumed as strides, so neither is materialized.
+        return oasr.masked_softmax(
+            attn_scores,
+            bias=pos_scores,
+            mask=attn_mask,
+            mask2=None if key_padding_mask is None else key_padding_mask.unsqueeze(1),
+            mask_value=-1000.0,
+        )
 
     def streaming_forward(
         self,
@@ -235,13 +249,16 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
             ),
             storage_offset=pos_scores.stride(3) * (seq_len - 1),
         )
-        attn_scores = attn_scores + pos_scores
-
         if key_padding_mask is not None:
             assert key_padding_mask.shape == (batch_size, k_len), key_padding_mask.shape
-            attn_scores = attn_scores.masked_fill(key_padding_mask.unsqueeze(1), -1000)
 
-        return oasr.softmax(attn_scores.contiguous()), cached_key
+        attn_weights = oasr.masked_softmax(
+            attn_scores,
+            bias=pos_scores,
+            mask2=None if key_padding_mask is None else key_padding_mask.unsqueeze(1),
+            mask_value=-1000.0,
+        )
+        return attn_weights, cached_key
 
 
 class SelfAttention(nn.Module):

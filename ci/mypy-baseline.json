@@ -3,14 +3,12 @@
   "paths": [
     "oasr"
   ],
-  "total": 406,
+  "total": 405,
   "files": {
-    "oasr/functionals/attention.py": 7,
     "oasr/cache/decoder_kv.py": 3,
     "oasr/checkpoints/bundle.py": 1,
     "oasr/checkpoints/native.py": 1,
     "oasr/compilation_context.py": 1,
-    "oasr/functionals/ctc_decode.py": 2,
     "oasr/decode.py": 18,
     "oasr/decoder/__init__.py": 1,
     "oasr/decoder/ctc_greedy_search.py": 3,
@@ -41,6 +39,8 @@
     "oasr/features/backends.py": 5,
     "oasr/features/streaming.py": 7,
     "oasr/features/whisper.py": 1,
+    "oasr/functionals/attention.py": 7,
+    "oasr/functionals/ctc_decode.py": 2,
     "oasr/jit/attention.py": 9,
     "oasr/jit/conv.py": 13,
     "oasr/jit/core.py": 2,
@@ -54,7 +54,6 @@
     "oasr/layers/norm.py": 10,
     "oasr/layers/rotary_embedding/ntk_scaling_rope.py": 1,
     "oasr/layers/rotary_embedding/yarn_scaling_rope.py": 2,
-    "oasr/layers/softmax.py": 1,
     "oasr/layers/topk.py": 1,
     "oasr/models/base.py": 3,
     "oasr/models/conformer/convert.py": 5,

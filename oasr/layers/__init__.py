@@ -50,7 +50,7 @@ from .norm import (
 from .pooling import AvgPool1d
 from .recurrent import LSTM, RNN
 from .rotary_embedding import NeoxRotaryEmbedding, RotaryEmbedding, apply_rotary_pos_emb
-from .softmax import Softmax
+from .softmax import MaskedSoftmax, Softmax
 from .topk import TopK
 
 __all__ = [
@@ -118,6 +118,7 @@ __all__ = [
     "apply_rotary_pos_emb",
     # Softmax
     "Softmax",
+    "MaskedSoftmax",
     # TopK
     "TopK",
 ]
