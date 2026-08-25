@@ -7,6 +7,9 @@
 
 void softmax(TensorView output, TensorView input);
 void log_softmax(TensorView output, TensorView input);
+void masked_softmax(TensorView output, TensorView input, Optional bias_opt, Optional mask_opt,
+                    Optional mask2_opt, double mask_value);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(softmax, softmax);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(log_softmax, log_softmax);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(masked_softmax, masked_softmax);

@@ -303,6 +303,88 @@ def test_models_do_not_bypass_bmm_with_torch_matmul():
     )
 
 
+#: Deliberate ``masked_fill`` sites in model code, as ``(path relative to
+#: oasr/models, count) -> reason``.  A ``masked_fill`` on an *attention score*
+#: tensor belongs to ``oasr.masked_softmax``; one on an activation is a
+#: different (still open) gap and is allowed here by name.
+ALLOWED_MASKED_FILL = {
+    "conformer/model.py": (
+        2,
+        "zeroing the hidden state outside the utterance, not a score floor — "
+        "KG12 (broadcast gate / mask-multiply), no kernel yet",
+    ),
+    "zipformer/encoder.py": (
+        2,
+        "the two NonlinAttention activation masks — KG12, not scores",
+    ),
+    "nemotron/encoder.py": (
+        4,
+        "two silence gates on activations (KG12) and two floors applied to the "
+        "rel-pos bias handed to oasr.fmha as attn_bias — that kernel never "
+        "materializes scores, so there is no softmax to fuse into; removing "
+        "the bias pass is KG8 (in-kernel Transformer-XL rel-pos)",
+    ),
+    "decoders/transformer_decoder.py": (
+        2,
+        "token-id padding on the decoder input, not a float score tensor",
+    ),
+}
+
+
+def test_models_do_not_hand_roll_a_masked_softmax():
+    """KG6 ratchet: an attention score's bias + mask + softmax is one kernel.
+
+    Zipformer walked its ``(H, B, T, T)`` scores eight times per layer across
+    three kernels — add the shifted relative-position bias, floor the key
+    padding, softmax — where ``oasr.masked_softmax`` reads the bias and both
+    masks through their own strides in one.  Each entry in
+    :data:`ALLOWED_MASKED_FILL` is a site that is *not* a score floor; a new
+    ``masked_fill`` in any of these files fails until it is classified.
+    """
+    models_dir = Path(__file__).resolve().parents[1] / "oasr" / "models"
+    found: dict = {}
+    for path in models_dir.rglob("*.py"):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr == "masked_fill":
+                    relative = path.relative_to(models_dir).as_posix()
+                    found.setdefault(relative, []).append(node.lineno)
+
+    offenders = []
+    for relative, lines in sorted(found.items()):
+        allowed = ALLOWED_MASKED_FILL.get(relative)
+        budget = allowed[0] if allowed else 0
+        if len(lines) > budget:
+            offenders.append(
+                f"{relative}:{','.join(str(n) for n in lines)} "
+                f"({len(lines)} masked_fill call(s), {budget} allowed)"
+            )
+    assert not offenders, (
+        "model code hand-rolls a masked softmax:\n  "
+        + "\n  ".join(offenders)
+        + "\nUse oasr.masked_softmax — it takes an additive bias and two boolean "
+        "masks, each broadcast against the scores through its own strides, so a "
+        "shifted or step-sliced view needs no copy. Add an entry to "
+        "ALLOWED_MASKED_FILL only for a mask that is not an attention-score floor."
+    )
+
+
+def test_zipformer_attention_weights_use_the_fused_masked_softmax():
+    """The offline and streaming score paths both have to reach the kernel."""
+    encoder = Path(__file__).resolve().parents[1] / "oasr" / "models" / "zipformer" / "encoder.py"
+    tree = ast.parse(encoder.read_text(), filename=str(encoder))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _dotted_name(node.func) == "oasr.masked_softmax"
+    ]
+    assert len(calls) == 2, (
+        f"expected oasr.masked_softmax on both Zipformer attention-weight paths "
+        f"(forward and streaming_forward), found {len(calls)}"
+    )
+
+
 def test_eligible_residual_norm_paths_use_fused_waist():
     """Keep KG14's model wiring from silently regressing to separate adds."""
     models_dir = Path(__file__).resolve().parents[1] / "oasr" / "models"
