@@ -46,6 +46,7 @@ SUITES: dict[str, list[str]] = {
         "tests/test_pooling.py",
         "tests/test_recurrent.py",
         "tests/test_recurrent_cute.py",
+        "tests/test_gated_mlp.py",
         "tests/test_fft.py",
         "tests/test_cmvn.py",
         "tests/test_jit.py",

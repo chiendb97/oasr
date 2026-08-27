@@ -408,6 +408,42 @@ def use_recurrent_kernel(x: torch.Tensor) -> bool:
     return True
 
 
+def use_gated_mlp_kernel(
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    *,
+    activation: str,
+    has_bias: bool = False,
+) -> bool:
+    """Should a gated MLP fuse gate + up + activation + multiply into one kernel?
+
+    Declining is **never** a kernel gap.  The alternative is the two-GEMM path,
+    which is itself fully kernel-backed (``oasr.gemm_activation`` for the gate,
+    ``oasr.gemm`` for the up, and one elementwise multiply); what the fusion
+    removes is four passes over an ``(M, N)`` intermediate and two launches, not
+    a hole in coverage.  So an out-of-band or unsupported shape is a *policy*
+    hit under its own reason, and the measurements behind the band live in
+    :mod:`oasr.jit.mlp`.
+    """
+    if layers_backend() == "torch":
+        return False
+    if not x.is_cuda:
+        return out_of_scope("CPU tensor")
+    if x.dtype not in SERVED_DTYPES:
+        return out_of_scope(f"dtype {x.dtype}")
+    from oasr.jit.mlp import get_gated_mlp_mode
+
+    if get_gated_mlp_mode() == "off":
+        # The rollback switch, not a judgement about this shape.  Counting it
+        # would make an A/B run look like a table of declines.
+        return False
+    from oasr.functionals.mlp import gated_mlp_available
+
+    if gated_mlp_available(x, w_gate, activation=activation, has_bias=has_bias):
+        return True
+    return take_policy("gated-mlp-unfused")
+
+
 def use_fmha_kernel() -> bool:
     """Is the OASR attention kernel selectable at all?"""
     return layers_backend() != "torch"
@@ -434,6 +470,7 @@ __all__ = [
     "take_policy",
     "use_conv_kernel",
     "use_fmha_kernel",
+    "use_gated_mlp_kernel",
     "use_gemm_kernel",
     "use_norm_kernel",
     "use_pooling_kernel",

@@ -515,6 +515,8 @@ Environment variables:
 | `OASR_GEMM_STREAMK`, `OASR_GEMM_SPLITK_PARALLEL` | `0` skips compiling those GEMM variants |
 | `OASR_GEMM_WS_CACHE` | `0` disables the persistent split-K/Stream-K workspace cache |
 | `OASR_CTC_FUSED` | `0` forces the legacy multi-kernel CTC beam-search step (A/B, rollback) |
+| `OASR_GATED_MLP_CUTE` | `auto` (default) / `1` (take the fused gated MLP wherever it fits) / `0` (never) |
+| `OASR_RECURRENT_CUTE` | `auto` (default) / `1` / `0` for the CuTeDSL fused recurrent step |
 | `OASR_FEATURE_BACKEND` | `torch` forces the reference feature frontend (A/B, parity oracle) |
 | `OASR_USE_K2` | `1` builds the k2-backed WFST decoder (needs `pip install k2` + `K2_SOURCE_DIR`) |
 | `OASR_METRICS` | `0` binds the engine-side metric collector to a no-op (front-end metrics are unaffected) |

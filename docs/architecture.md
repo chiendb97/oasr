@@ -38,7 +38,7 @@ underneath are documented in [kernels.md](kernels.md).
 | Normalization | `LayerNorm`, `RMSNorm`, `BiasNorm`, `AddLayerNorm`, and `AddRMSNorm`; LayerNorm/RMSNorm expose fused residual-add methods (including residual passthrough for pre-norm chains), with the eps conventions named (`TORCH_EPS`, `ESPNET_EPS`, `QWEN2_RMS_EPS`) |
 | Embeddings | `Embedding` (alias `VocabParallelEmbedding`) |
 | Attention compute | `Attention` — takes projected, head-split q/k/v; the projections stay on the model under their checkpoint's names |
-| Position-wise FFN | `FeedForward`, `GatedMLP` — where the upstream layout already nests them under a name |
+| Position-wise FFN | `FeedForward`, `GatedMLP` — where the upstream layout already nests them under a name. `GatedMLP` offers its whole gate/up/activation/multiply to `oasr.gated_mlp` as one kernel, inside a measured band |
 | Rotary | `NeoxRotaryEmbedding` + `apply_rotary_pos_emb` for HF-style per-row positions; `RotaryEmbedding` for the complex `freqs_cis` form |
 | Convolution | BTC-native `Conv1d`, `DepthwiseConv1d`, and `PointwiseConv1d`; `DepthwiseConv1d` accepts `(left, right)` padding and an optional fused masked residual for FSMN blocks; NHWC-native `Conv2d` / `Conv2dActivation` |
 | Pooling | BTC-native `AvgPool1d`; the CUDA kernel covers symmetric padding, ceil mode, and include/exclude-pad divisors without transposing the residual stream to BCT |

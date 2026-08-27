@@ -8,12 +8,15 @@ Names remain configurable to preserve source state-dict layouts. ``gelu`` and
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple, cast
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+import oasr
+
+from ._backend import use_gated_mlp_kernel
 from .linear import ColumnParallelLinear, LinearActivation, RowParallelLinear
 from .norm import LayerNorm
 
@@ -121,11 +124,23 @@ class FeedForward(nn.Module):
 class GatedMLP(nn.Module):
     """``down(activation(gate(x)) * up(x))`` — the SwiGLU/GeGLU LLM block.
 
-    Gate and up stay two separate projections rather than one merged
-    column-parallel GEMM: HF checkpoints ship them apart, and fusing them would
-    put a name-mapping step back into ``load_weights`` for a single GEMM launch
-    saved.  ``MergedColumnParallelLinear`` is the natural home for that
-    optimization when a converter can pay for the concatenation at load time.
+    Gate and up stay two separate **parameters** rather than one merged
+    column-parallel GEMM: HF checkpoints ship them apart, and fusing the
+    *storage* would put a name-mapping step back into ``load_weights``.
+    ``MergedColumnParallelLinear`` is the natural home for that when a converter
+    can pay for the concatenation at load time.
+
+    They do not stay two separate **kernels**.  With ``fuse_gate_up`` (the
+    default) both projections, the gate activation and the multiply run as one
+    ``oasr.gated_mlp`` launch that never materializes either ``(M, hidden)``
+    intermediate — a dual-B tensor-core GEMM sharing one A tile, which needs
+    nothing from the checkpoint because it reads ``(out, in)`` weights where
+    they lie.  Whether it is taken is a measured, shape-only decision
+    (:mod:`oasr.jit.mlp`): it is ahead from one row up to ~128 and
+    behind above that, where the block stops being bandwidth bound and a library
+    GEMM's tiling freedom wins.  Outside the band the two-GEMM path below runs,
+    and that path is itself fully kernel-backed — declining the fusion is a
+    performance route, never a kernel gap.
     """
 
     def __init__(
@@ -136,6 +151,7 @@ class GatedMLP(nn.Module):
         activation: str = "silu",
         bias: bool = False,
         names: Tuple[str, str, str] = ("gate_proj", "up_proj", "down_proj"),
+        fuse_gate_up: bool = True,
         device=None,
         dtype=None,
     ) -> None:
@@ -148,6 +164,9 @@ class GatedMLP(nn.Module):
         self.activation = activation
         self._names = names
         self.fused = activation in _FUSABLE
+        #: Offer the whole gate/up/act/multiply to one kernel.  Per *call*, the
+        #: shape still decides; this only says whether to ask.
+        self.fuse_gate_up = bool(fuse_gate_up)
 
         gate_cls = LinearActivation if self.fused else ColumnParallelLinear
         gate_kwargs = {"activation_type": activation} if self.fused else {}
@@ -168,14 +187,31 @@ class GatedMLP(nn.Module):
         return self._modules[self._names[which]]  # type: ignore[return-value]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate: torch.Tensor = self._proj(0)(x)
-        if not self.fused:
-            gate = _UNFUSED_ACTIVATION[self.activation](gate)
-        out: torch.Tensor = self._proj(2)(gate * self._proj(1)(x))
+        gate_proj, up_proj = self._proj(0), self._proj(1)
+        # ``_proj`` resolves through ``_modules``, so the parameter types are
+        # only known to be ``Tensor | Module``; the projections are always
+        # ``Linear``-shaped by construction.
+        w_gate = cast(torch.Tensor, gate_proj.weight)
+        w_up = cast(torch.Tensor, up_proj.weight)
+        b_gate = cast(Optional[torch.Tensor], gate_proj.bias)
+        b_up = cast(Optional[torch.Tensor], up_proj.bias)
+        if self.fuse_gate_up and use_gated_mlp_kernel(
+            x, w_gate, activation=self.activation, has_bias=b_gate is not None
+        ):
+            h = oasr.gated_mlp(x, w_gate, w_up, b_gate, b_up, activation=self.activation)
+        else:
+            gate: torch.Tensor = gate_proj(x)
+            if not self.fused:
+                gate = _UNFUSED_ACTIVATION[self.activation](gate)
+            h = gate * up_proj(x)
+        out: torch.Tensor = self._proj(2)(h)
         return out
 
     def extra_repr(self) -> str:
-        return f"activation={self.activation}, fused={self.fused}"
+        return (
+            f"activation={self.activation}, fused={self.fused}, "
+            f"fuse_gate_up={self.fuse_gate_up}"
+        )
 
 
 __all__ = ["FeedForward", "GatedMLP"]

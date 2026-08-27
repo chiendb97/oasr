@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 ROUTINE_REGISTRY: dict[str, str] = {
     "gemm": "benchmarks.routines.gemm",
     "gemm_log_softmax": "benchmarks.routines.gemm_log_softmax",
+    "mlp": "benchmarks.routines.mlp",
     "norm": "benchmarks.routines.norm",
     "pooling": "benchmarks.routines.pooling",
     "recurrent": "benchmarks.routines.recurrent",
