@@ -233,6 +233,7 @@ allocates its output tensor, and calls into the compiled module.
 | `oasr/functionals/softmax.py`, `oasr/functionals/topk.py`, `oasr/functionals/fft.py` | `softmax`, `log_softmax`, `masked_softmax` (one pass over an attention score tensor: an additive bias and two boolean masks, each **broadcast against the scores through its own strides**, so a shifted `as_strided` relative-position window or a `[..., ::ds]` mask slice is consumed where it is), `topk`, `rfft` / `rfft_power` |
 | `oasr/functionals/feature.py` | `stft_frame`, `dct_lifter`, `fbank_preprocess`, `mel_log`, `whisper_logmel`, `lfr_gather` — see [features.md](features.md) |
 | `oasr/functionals/attention.py` | `fmha(...)` and `fmha.persistent_inputs(...)` |
+| `oasr/functionals/mlp.py` | `gated_mlp` — a whole SwiGLU/GeGLU gate+up+activation+multiply in one CuTeDSL dual-B GEMM, plus `gated_mlp_available` (the routing question, so a layer can ask before building anything). Refuses rather than falling back |
 | `oasr/functionals/ctc_decode.py` | `ctc_beam_search_decode`, `GpuStreamingDecoder` — see [ctc_decoder_gpu.md](ctc_decoder_gpu.md) |
 | `oasr/decode.py` | Thin helpers over the CPU-side `oasr.decoder` decoders |
 
@@ -359,12 +360,34 @@ Ninja pipeline.
 - `kernels/cute/attention/base.py` — abstract `FmhaBase` + `pick_arch_cls(major, minor)`
 - `kernels/cute/attention/fmha_sm80.py` — `FmhaSm80`, covering sm_80 / 86 / 89
 - `kernels/cute/attention/fmha_sm120.py` — `FmhaSm120`, a thin subclass for consumer Blackwell
+- `kernels/cute/recurrent/step.py` — `RecurrentStepCute`, one fused LSTM/RNN
+  timestep as a tensor-core GEMM with the state transition in the epilogue
+- `kernels/cute/mlp/gated.py` — `GatedMlpCute`, a **dual-B** GEMM: one A tile in
+  shared memory feeding *two* `mma.sync` chains against two B tiles, with
+  `activation(gate) * up` applied to the FP32 accumulators. The shape of
+  CUTLASS's `examples/45_dual_gemm`, and the reason a gated MLP needs no
+  intermediate tensor
 - `kernels/cute/` — FlashAttention-style helpers: `block_info.py`, `seqlen_info.py`,
   `mask.py`, `softmax.py`, `tile_scheduler.py`, `pack_gqa.py`, `paged_kv.py`,
   `named_barrier.py`, `copy_utils.py`, `layout_utils.py`, `ampere_helpers.py`, `utils.py`
 
 Each is compiled via `cutlass.cute.compile()` into a Python callable and cached
-per config in `oasr/jit/attention.py::_compiled_fmha`.
+per config — `oasr/jit/attention.py::_compiled_fmha`,
+`oasr/jit/recurrent_cute.py::_compiled_step`,
+`oasr/jit/mlp.py::_compiled_gated_mlp` — always with
+`options="--enable-tvm-ffi"`, which is what lets the callable take torch tensors
+directly and be captured into a CUDA graph.
+
+Each of the three also owns a **routing** module beside its compile cache, because
+a fused kernel that is faster on some shapes and slower on others has to say
+which: `OASR_ATTN_BACKEND`, `OASR_RECURRENT_CUTE`, `OASR_GATED_MLP_CUTE`, each
+`auto` / `1` / `0`, each with the measured band in its module docstring. For the
+gated MLP the band is **one m-tile** (`M <= 64`): with one m-tile every weight
+element is read from DRAM once, which is the bandwidth argument the fusion rests
+on; with two it is an ordinary GEMM reading its operands twice and cuBLAS wins.
+The *tile* inside the band is chosen by `N` rather than by `M` — see
+`select_gated_mlp_tile`, and the ten lines of it that exist because a rows-keyed table lost
+10% at one model width.
 
 ## Utilities
 

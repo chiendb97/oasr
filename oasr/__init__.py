@@ -72,6 +72,7 @@ from .functionals.feature import (
 )
 from .functionals.fft import rfft, rfft_power
 from .functionals.gemm import bmm, gemm, gemm_activation, gemm_log_softmax, group_gemm
+from .functionals.mlp import gated_mlp, gated_mlp_available
 from .functionals.norm import (
     add_layer_norm,
     add_layer_norm_residual,
@@ -260,6 +261,8 @@ __all__ = [
     "gemm_activation",
     "gemm_log_softmax",
     "log_softmax",
+    "gated_mlp",
+    "gated_mlp_available",
     "masked_softmax",
     "softmax",
     "topk",
