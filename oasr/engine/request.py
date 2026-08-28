@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     # Type-only: ``oasr.engine.decode`` imports this module, so a runtime import
     # would close the cycle.  The word-timing machinery lives next to the
     # per-family aligners that produce it, not here.
+    from oasr.vad import SpeechSegment, VadEvent
+
     from .decode.alignment import WordTiming
 
 
@@ -103,8 +105,29 @@ class DecodingOptions:
         entirely — every family that supports it pays a real cost, from a
         Viterbi pass over the log-probs to an extra teacher-forced decoder
         forward.
+    single_utterance : bool
+        Stop recognizing once the speaker has finished one utterance, and
+        report why.  This is the option the proto has carried as *"accepted,
+        ignored"* since the Google-shaped surface landed; honouring it is what
+        makes ``SpeechEventType.END_OF_SINGLE_UTTERANCE`` mean something.
+        Streaming only — an offline request already has exactly one utterance
+        boundary, its end.
+    vad_events : bool
+        Emit speech-activity transitions (``speech_started`` /
+        ``speech_stopped``) alongside the transcript, and fill
+        :attr:`RequestOutput.segments`.  Maps onto Google's
+        ``enable_voice_activity_events``, Deepgram's ``vad_events`` and
+        OpenAI's ``input_audio_buffer.speech_*`` events.
+    endpoint_silence_ms : int, optional
+        Override the trailing silence that ends a turn, in milliseconds.
+        ``None`` keeps the engine's endpoint rules.  Maps onto Google's
+        ``speech_end_timeout``, Deepgram's ``endpointing``, OpenAI's
+        ``silence_duration_ms`` and Speechmatics'
+        ``end_of_utterance_silence_trigger`` — the one knob every provider
+        exposes under a different name.
 
-    ``task``, ``language`` and ``word_timestamps`` are **validated against the
+    ``task``, ``language``, ``word_timestamps``, ``single_utterance``,
+    ``vad_events`` and ``endpoint_silence_ms`` are **validated against the
     running decode family** at admission
     (:meth:`DecodeStrategy.validate_options`), so a family that cannot honour
     one rejects the request instead of silently transcribing under the
@@ -121,6 +144,9 @@ class DecodingOptions:
     task: Optional[str] = None
     language: Optional[str] = None
     word_timestamps: bool = False
+    single_utterance: bool = False
+    vad_events: bool = False
+    endpoint_silence_ms: Optional[int] = None
 
     #: Task values any family may declare support for.  Mirrored by
     #: ``oasr_wire::TASKS`` on the other side of the PyO3 boundary.
@@ -151,6 +177,16 @@ class DecodingOptions:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p!r}")
         if self.task is not None and self.task not in self.TASKS:
             raise ValueError(f"task must be one of {list(self.TASKS)}, got {self.task!r}")
+        if self.endpoint_silence_ms is not None:
+            # Bounded like Google's voice_activity_timeout.  Below ~100 ms the
+            # endpoint fires inside the segmenter's own hysteresis and a turn
+            # ends on a hesitation; past a minute the engine's own rules and the
+            # idle timeout both bind first, so the value could never be reached.
+            if not 100 <= int(self.endpoint_silence_ms) <= 60_000:
+                raise ValueError(
+                    "endpoint_silence_ms must be between 100 and 60000, got "
+                    f"{self.endpoint_silence_ms!r}"
+                )
         if self.language is not None:
             # Whether *this checkpoint* knows the language is the strategy's
             # question; the shape is this one's.  A tag that still carries a
@@ -265,6 +301,27 @@ class RequestOutput:
         Set alongside ``finish_reason`` rather than folded into it so the
         serving layer's error envelope stays a stable two-value vocabulary
         while ``oasr_requests_failed_total{stage}`` still says *where*.
+    segments : List[SpeechSegment], optional
+        Detected speech spans in request-relative seconds — the same time base
+        as :attr:`timestamps` and :attr:`words`, so a segment and a word are
+        directly comparable.  Filled when the request asked for ``vad_events``
+        (or the engine runs a segmenting VAD mode) and a detector was
+        available.  ``None`` — never ``[]`` — when no detector ran, because an
+        empty list would read as "this audio had no speech in it".
+    speech_events : List[VadEvent], optional
+        Speech-activity transitions produced since the previous output.  On a
+        streaming partial these are that tick's events only; the client
+        accumulates.  ``None`` when VAD is off.
+    no_speech_prob : float, optional
+        Probability that the audio carries no speech, where the decode family
+        produces one (Whisper's ``<|nospeech|>``).  Published because callers
+        ask for it — OpenAI returns it per ``verbose_json`` segment — and
+        deliberately *not* used as a segmenter: it is read once per decoding
+        window, and OpenAI's own gate needs a second condition on
+        ``avg_logprob`` before it is usable at all.
+    endpoint_reason : str, optional
+        Which endpoint rule ended this turn (``"rule1"``..``"ruleN"``, or a
+        timeout name).  ``None`` when the turn ended because the audio did.
     """
 
     request_id: str
@@ -278,6 +335,10 @@ class RequestOutput:
     nbest_texts: Optional[List[str]] = None
     finish_reason: Optional[str] = None
     error_stage: Optional[str] = None
+    segments: Optional[List["SpeechSegment"]] = None
+    speech_events: Optional[List["VadEvent"]] = None
+    no_speech_prob: Optional[float] = None
+    endpoint_reason: Optional[str] = None
 
 
 class Request:

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import ClassVar, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -21,6 +21,11 @@ from ..output_processor import OutputProcessor
 from ..request import Request, RequestOutput, RequestState
 from ..scheduler import Scheduler
 from .base import Executor
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from oasr.vad import EndpointDecision
+
+    from ..vad_stage import StreamingVadStage
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +61,14 @@ class StreamingExecutor(Executor):
 
     streaming: ClassVar[bool] = True
 
+    #: Per-engine speech-activity stage, or ``None`` when VAD is off.  A class
+    #: attribute with a ``None`` default, not just an ``__init__`` assignment,
+    #: for the same reason ``Executor._metrics`` is one: the isolation tests
+    #: build executors minimally, and an attribute that only exists after a full
+    #: construction turns "VAD is off" into an AttributeError on the failure
+    #: path — which is exactly the path those tests exercise.
+    _vad: Optional["StreamingVadStage"] = None
+
     def __init__(
         self,
         *,
@@ -66,9 +79,11 @@ class StreamingExecutor(Executor):
         config: EngineConfig,
         device: torch.device,
         metrics: Optional[m.EngineMetrics] = None,
+        vad_stage: Optional["StreamingVadStage"] = None,
     ) -> None:
         if metrics is not None:
             self._metrics = metrics
+        self._vad = vad_stage
         self._scheduler = scheduler
         self._inp = input_processor
         self._mr = model_runner
@@ -148,8 +163,62 @@ class StreamingExecutor(Executor):
             self._metrics.incr(m.AUDIO_SECONDS, int(n) / req.sample_rate)
         self._inp.append_streaming_chunk(req, chunk, is_last=is_last)
 
+    def _open_vad(self, req: Request) -> None:
+        """Allocate this stream's speech-activity state, if VAD is running."""
+        if self._vad is None:
+            return
+        options = getattr(req, "decoding", None)
+        self._vad.open(
+            req.request_id,
+            endpoint=bool(getattr(options, "single_utterance", False)),
+            endpoint_silence_ms=getattr(options, "endpoint_silence_ms", None),
+        )
+
+    def _close_vad(self, request_id: str) -> None:
+        if self._vad is not None:
+            self._vad.close(request_id)
+
+    def _advance_vad(self, ready: List[Request], log_probs_map: Dict[str, torch.Tensor]) -> None:
+        """Feed this tick's per-frame signal into every ready stream's policy.
+
+        Runs *after* the decode, which is the device->host boundary, so the
+        detector's own small readback lands on an already-drained queue rather
+        than adding a second synchronisation to the step.
+        """
+        if self._vad is None or not ready:
+            return
+        nvtx_push("vad_step")
+        t0 = time.perf_counter()
+        try:
+            self._vad.advance_from_map(ready, log_probs_map)
+        except Exception:  # noqa: BLE001 - speech activity must never fail a transcript
+            nvtx_pop()
+            logger.warning("voice activity step failed; continuing without it", exc_info=True)
+            return
+        nvtx_pop()
+        self._metrics.observe_stage("streaming.vad", time.perf_counter() - t0)
+
+    def _attach_vad_events(self, outputs: List[RequestOutput]) -> None:
+        """Hang each stream's new events on the output it already produces.
+
+        Deliberately not synthesised as a separate output: a ``RequestOutput``
+        carries the transcript *so far*, and an event-only one would have to
+        carry an empty ``text``, which a caption client renders by blanking the
+        line.  At the default ``partial_decode_interval`` of 1 every active
+        stream produces an output every tick, so events ride out immediately;
+        at a coarser interval they are held until the next one, and the flush at
+        finalize guarantees none are dropped.
+        """
+        if self._vad is None:
+            return
+        for out in outputs:
+            events = self._vad.drain_events(out.request_id)
+            if events:
+                out.speech_events = events
+
     def abort(self, request_id: str) -> None:
         """Remove a streaming request, freeing its cache slot if any."""
+        self._close_vad(request_id)
         req = self._scheduler.abort_request(request_id)
         # ``stream_id`` is the admission marker (set by the scheduler when a
         # stream is promoted to RUNNING) — present for both paged and stateful
@@ -198,6 +267,7 @@ class StreamingExecutor(Executor):
             req.output = out
             req.state = RequestState.FINISHED
             outputs.append(out)
+            self._close_vad(req.request_id)
             # Free unconditionally: the cache state after a failed forward is
             # unknown, and leaking a slot per failure exhausts the pool in a
             # way that looks like a capacity bug rather than an error path.
@@ -279,13 +349,16 @@ class StreamingExecutor(Executor):
         nvtx_push("decode_streaming")
         t0 = time.perf_counter()
         try:
-            outputs.extend(self._op.decode_streaming_batch(ready, log_probs_map))
+            produced = self._op.decode_streaming_batch(ready, log_probs_map)
         except Exception as exc:  # noqa: BLE001 — see _fail_cohort
             nvtx_pop()
             outputs.extend(self._fail_cohort(ready, exc, "streaming_forward"))
             return False
         nvtx_pop()
         self._metrics.observe_stage("streaming.decode", time.perf_counter() - t0)
+        self._advance_vad(ready, log_probs_map)
+        self._attach_vad_events(produced)
+        outputs.extend(produced)
         return True
 
     def _step_serial(
@@ -369,6 +442,7 @@ class StreamingExecutor(Executor):
             for req in newly_admitted:
                 self._mr.allocate_stream(req)  # encoder KV + CNN cache
                 self._op.create_session(req)  # decode-side beam state
+                self._open_vad(req)  # speech-activity segmenter + endpointer
             nvtx_pop()
             self._metrics.observe_stage("streaming.allocate", time.perf_counter() - t0)
 
@@ -394,9 +468,16 @@ class StreamingExecutor(Executor):
                 and (not req.has_pending_audio)
                 and (not req.has_ready_encoder_chunk(window))
             )
-            if drained or req.cache_exhausted:
+            # An endpoint ends the turn with audio still arriving, which is the
+            # whole point: the client keeps its socket open and the server stops
+            # recognizing.  That is Google's `single_utterance` contract, and the
+            # event it maps to has been declared in the proto and never emitted
+            # since the Google-shaped surface landed.
+            endpoint = self._vad.endpointed(req.request_id) if self._vad is not None else None
+            if drained or req.cache_exhausted or endpoint is not None:
                 final = self._op.finalize_streaming(req)
                 self._op.fill_nbest_texts(req, final)
+                self._finish_vad(req, final, endpoint)
                 if req.cache_exhausted:
                     # A truncated transcript, counted where it is decided.  The
                     # allocator itself cannot report this: the capacity gate
@@ -409,11 +490,40 @@ class StreamingExecutor(Executor):
                 outputs.append(final)
                 self._op.free_session(req)  # decode-side beam state
                 self._mr.free_stream(req)  # encoder KV + CNN cache
+                self._close_vad(req.request_id)
                 self._scheduler.finish_request(req.request_id)
         nvtx_pop()
         self._metrics.observe_stage("streaming.finalize", time.perf_counter() - t0)
 
         return outputs
+
+    def _finish_vad(
+        self,
+        req: Request,
+        final: RequestOutput,
+        endpoint: Optional["EndpointDecision"],
+    ) -> None:
+        """Flush this stream's speech activity onto its final output.
+
+        The flush is what closes a run that was still open when the audio ended,
+        so a stream that stops mid-word still reports a segment rather than
+        dropping it.  ``endpoint_reason`` says *which* rule ended the turn; a
+        turn that ended because the audio did leaves it ``None``, and the two are
+        genuinely different things for a client deciding whether to keep the
+        socket open.
+        """
+        if self._vad is None:
+            return
+        events, segments = self._vad.finish(req.request_id)
+        if events:
+            final.speech_events = (final.speech_events or []) + events
+        if segments:
+            final.segments = segments
+        if endpoint is not None:
+            final.endpoint_reason = endpoint.reason
+            if final.finish_reason is None:
+                final.finish_reason = "stop"
+            self._metrics.incr(m.ENDPOINTS, 1.0)
 
     def record_gauges(self, metrics) -> None:
         """Report paged block-pool occupancy.

@@ -87,17 +87,32 @@ class ParaformerModel(BaseAsrModel):
 
     # -- SupportsParaformer compute contract ----------------------------------
     def predict(
-        self, enc_out: torch.Tensor, enc_lens: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        enc_out: torch.Tensor,
+        enc_lens: torch.Tensor,
+        return_alphas: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
         """CIF → ``(acoustic_embeds (B, U, D) fp32, token_lens (B,) int32,
-        fires (B, T+1) fp32)``."""
+        fires (B, T+1) fp32)``, plus ``alphas (B, T+1) fp32`` when asked.
+
+        ``alphas`` is the predictor's per-frame token weight — a sigmoid whose
+        sum over an utterance is the token count.  It was computed and dropped
+        here before speech activity needed it; ``return_alphas`` keeps the
+        three-value contract every existing caller relies on while making the
+        fourth reachable without a second predictor forward.  It is opt-in
+        rather than always-on for the same reason word timings are: the caller
+        pays only for what it asked for, and here that is one extra live tensor
+        per batch.
+        """
         T = enc_out.size(1)
         mask = (
             torch.arange(T, device=enc_out.device).unsqueeze(0)
             < enc_lens.to(enc_out.device).unsqueeze(1)
         ).float()
-        acoustic_embeds, token_num, _alphas, fires = self.predictor(enc_out, mask)
+        acoustic_embeds, token_num, alphas, fires = self.predictor(enc_out, mask)
         token_lens = token_num.round().long().clamp(min=0).to(torch.int32)
+        if return_alphas:
+            return acoustic_embeds, token_lens, fires, alphas
         return acoustic_embeds, token_lens, fires
 
     def nar_decode(

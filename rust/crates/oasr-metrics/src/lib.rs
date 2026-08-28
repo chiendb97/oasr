@@ -299,6 +299,20 @@ metrics_table! {
         "Tokens emitted by the decode strategies";
     ENGINE_AUDIO_SECONDS = "oasr_engine_audio_seconds_total", Counter, Some(Unit::Seconds), None,
         "Audio duration the engine admitted (the in-process RTFx numerator)";
+    /// `{reason}` — turns the endpointer closed, by the rule that fired
+    /// (`rule1`..`ruleN`, or a timeout name).  A turn that ended because the
+    /// audio ran out is not counted here at all: the two are different events,
+    /// and folding them together would make the rate of *detected* endpoints
+    /// unreadable.
+    ENGINE_ENDPOINTS = "oasr_engine_endpoints_total", Counter, None, None,
+        "Turns ended by voice-activity endpointing";
+    /// Speech spans the offline splitter cut a request into.
+    ENGINE_VAD_SEGMENTS = "oasr_engine_vad_segments_total", Counter, None, None,
+        "Speech segments produced by voice-activity segmentation";
+    /// The other half of the story, and the one that says what VAD bought:
+    /// audio the splitter dropped is encoder work that did not happen.
+    ENGINE_AUDIO_SECONDS_SKIPPED = "oasr_engine_audio_seconds_skipped_total", Counter, Some(Unit::Seconds), None,
+        "Non-speech audio voice-activity segmentation removed before the encoder";
     /// Non-zero means a histogram above is showing a *truncated* distribution:
     /// the engine buffered more samples between two drains than it may hold.
     /// Exported so the cap is visible rather than passing for a complete one.

@@ -28,7 +28,7 @@ import torch
 from ..request import DecodingOptions, Request
 from .alignment import TokenAlignment
 from .attention_align import resolve_alignment_heads, token_frame_spans
-from .base import register_decode_strategy
+from .base import register_decode_strategy, wants_speech_activity
 from .incremental import ArGroup, IncrementalArStrategy, Prefill
 
 if TYPE_CHECKING:
@@ -48,6 +48,21 @@ class AedDecodeStrategy(IncrementalArStrategy):
     emit_partials: ClassVar[bool] = False
     #: Both slots exist in the SOT sequence, so both can be set per request.
     selective_options: ClassVar[Tuple[str, ...]] = ("task", "language")
+    speech_activity_kind: ClassVar[str] = "aed_no_speech"
+
+    @property
+    def asr_speech_activity_modes(self) -> Tuple[str, ...]:
+        """Offline only, and only when the checkpoint carries the token.
+
+        Whisper is trained to predict ``<|nospeech|>`` at the first generated
+        position, so the signal exists — but it is read *once per decoding
+        window* and describes the whole 30 s, which is why it is published as
+        ``no_speech_prob`` rather than as segments.  A snapshot whose converter
+        found no such token declares nothing, and a request asking for speech
+        activity is refused rather than answered from an unrelated logit.
+        """
+        token = getattr(self._mcfg, "no_speech_token_id", None)
+        return ("offline",) if token is not None else ()
 
     def __init__(
         self,
@@ -163,6 +178,29 @@ class AedDecodeStrategy(IncrementalArStrategy):
         turns that into a refusal at admission.
         """
         return ("offline",) if self._can_align and self._beam <= 1 else ()
+
+    def prefill_no_speech(
+        self, requests: List[Request], logits: torch.Tensor
+    ) -> List[Optional[float]]:
+        """``P(<|nospeech|>)`` per row, from the position it is defined at.
+
+        One softmax over ``(B, V)`` and one small device→host copy, and only when
+        a row asked — the copy is a stream synchronisation, which is exactly the
+        kind of cost that must not land on requests that did not ask for it.
+        """
+        if not any(wants_speech_activity(r) for r in requests):
+            return [None] * len(requests)
+        detector = self._speech_detector(
+            no_speech_token_id=getattr(self._mcfg, "no_speech_token_id", None)
+        )
+        if detector is None:
+            return [None] * len(requests)
+        lengths = torch.ones(logits.size(0), dtype=torch.int64, device=logits.device)
+        speech, _frames = detector.detect_from_asr(logits, lengths)
+        values = speech.squeeze(1).detach().to("cpu", dtype=torch.float32).tolist()
+        return [
+            (1.0 - float(v)) if wants_speech_activity(r) else None for r, v in zip(requests, values)
+        ]
 
     def validate_options(
         self, options: Optional[DecodingOptions], *, streaming: bool = False

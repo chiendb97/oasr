@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use numpy::{PyArray1, PyArrayMethods};
 use oasr_metrics as om;
-use oasr_wire::{DecodingParams, ErrorCode, Event, ModelInfo, WordTiming};
+use oasr_wire::{
+    DecodingParams, ErrorCode, Event, ModelInfo, SpeechEvent, SpeechSegment, WordTiming,
+};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
@@ -495,6 +497,16 @@ impl PyEngine {
                     metrics::counter!(om::REQUESTS_FAILED, labels.with(om::label::STAGE, stage))
                         .increment(1);
                 }
+                let no_speech_prob: Option<f32> = item
+                    .getattr("no_speech_prob")
+                    .ok()
+                    .and_then(|x| x.extract::<Option<f32>>().ok())
+                    .unwrap_or(None);
+                let endpoint_reason: Option<String> = item
+                    .getattr("endpoint_reason")
+                    .ok()
+                    .and_then(|x| x.extract::<Option<String>>().ok())
+                    .unwrap_or(None);
                 Event::Final {
                     request_id: rid,
                     text,
@@ -505,6 +517,10 @@ impl PyEngine {
                     words,
                     confidence,
                     finish_reason,
+                    speech_events: extract_speech_events(&item),
+                    segments: extract_speech_segments(&item),
+                    no_speech_prob,
+                    endpoint_reason,
                 }
             } else {
                 Event::Partial {
@@ -512,12 +528,53 @@ impl PyEngine {
                     text,
                     tokens,
                     scores,
+                    speech_events: extract_speech_events(&item),
                 }
             };
             events.push(evt);
         }
         Ok(events)
     }
+}
+
+/// Marshal `RequestOutput.speech_events`, field by field.
+///
+/// Same discipline as [`extract_words`]: this runs on the GIL-holding dispatcher
+/// thread, and an absent attribute (an engine predating the field, or VAD
+/// switched off) must yield `None` rather than fail the whole extraction — one
+/// missing field would otherwise cost every request in the tick.
+fn extract_speech_events(item: &Bound<'_, PyAny>) -> Option<Vec<SpeechEvent>> {
+    let list = item.getattr("speech_events").ok()?;
+    if list.is_none() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for entry in list.iter().ok()? {
+        let entry = entry.ok()?;
+        out.push(SpeechEvent {
+            kind: entry.getattr("kind").ok()?.extract().ok()?,
+            time: entry.getattr("time").ok()?.extract().ok()?,
+        });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Marshal `RequestOutput.segments`, field by field.
+fn extract_speech_segments(item: &Bound<'_, PyAny>) -> Option<Vec<SpeechSegment>> {
+    let list = item.getattr("segments").ok()?;
+    if list.is_none() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for entry in list.iter().ok()? {
+        let entry = entry.ok()?;
+        out.push(SpeechSegment {
+            start: entry.getattr("start").ok()?.extract().ok()?,
+            end: entry.getattr("end").ok()?.extract().ok()?,
+            speech_prob: entry.getattr("speech_prob").ok()?.extract().unwrap_or(0.0),
+        });
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Marshal `RequestOutput.words` — a list of `WordTiming` dataclasses.
@@ -600,6 +657,21 @@ fn decoding_params_dict<'py>(
             }
             "word_timestamps" => {
                 if let Some(v) = p.word_timestamps {
+                    d.set_item(key, v)?;
+                }
+            }
+            "single_utterance" => {
+                if let Some(v) = p.single_utterance {
+                    d.set_item(key, v)?;
+                }
+            }
+            "vad_events" => {
+                if let Some(v) = p.vad_events {
+                    d.set_item(key, v)?;
+                }
+            }
+            "endpoint_silence_ms" => {
+                if let Some(v) = p.endpoint_silence_ms {
                     d.set_item(key, v)?;
                 }
             }

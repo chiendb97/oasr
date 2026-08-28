@@ -458,15 +458,30 @@ class TestTaskAndLanguagePrompt:
             # exercised rather than just the two prompt slots.
             word_timing_modes = ()
             _clock = None
+            # No engine config, so voice activity is off — which is what a
+            # request asking for it should be told.
+            _config = None
             _SELECTIVE_UNSET = DecodeStrategy._SELECTIVE_UNSET
+            _SPEECH_ACTIVITY_OPTIONS = DecodeStrategy._SPEECH_ACTIVITY_OPTIONS
             validate_options = DecodeStrategy.validate_options
             _require_word_timings = DecodeStrategy._require_word_timings
+            _require_speech_activity = DecodeStrategy._require_speech_activity
 
         for opts in (DecodingOptions(task="translate"), DecodingOptions(language="fr")):
             with pytest.raises(ValueError, match="cannot honour"):
                 _NoControl().validate_options(opts)
         with pytest.raises(ValueError, match="cannot produce word timestamps"):
             _NoControl().validate_options(DecodingOptions(word_timestamps=True))
+        # The voice-activity options are selective for the same reason: a
+        # response whose `segments` array is silently missing cannot be told
+        # apart from audio that had no speech in it.
+        for opts in (
+            DecodingOptions(vad_events=True),
+            DecodingOptions(single_utterance=True),
+            DecodingOptions(endpoint_silence_ms=800),
+        ):
+            with pytest.raises(ValueError, match="switched off|streaming control"):
+                _NoControl().validate_options(opts)
         # Everything else stays accepted: a sampling knob a family ignores
         # returns the same transcript, which is a performance surprise at worst.
         _NoControl().validate_options(DecodingOptions(temperature=0.7, n_best=3))

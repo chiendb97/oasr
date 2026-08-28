@@ -262,6 +262,12 @@ impl RawParams {
             task: normalize_task(self.task.as_deref()),
             language: normalize_optional_language(self.language.as_deref())?,
             word_timestamps: self.enable_word_time_offsets.then_some(true),
+            // The JSON `speech:recognize` surface is unary: one buffered
+            // utterance, no turn to end.  Voice activity rides the streaming
+            // RPC and the OpenAI upload route instead.
+            single_utterance: None,
+            vad_events: None,
+            endpoint_silence_ms: None,
         }
         .validated()
     }

@@ -76,6 +76,8 @@ SUITES: dict[str, list[str]] = {
     ],
     "engine": [
         "tests/test_engine.py",
+        "tests/test_vad.py",
+        "tests/test_vad_segmenter.py",
         "tests/test_engine_seams.py",
         "tests/test_engine_isolation.py",
         "tests/test_pipeline.py",

@@ -136,6 +136,34 @@ pub struct Cli {
     /// family's declared options during engine construction.
     #[arg(long = "decode-option", value_name = "KEY=VALUE")]
     pub decode_option: Vec<String>,
+    /// Voice activity: `off` (default), `observe`, `endpoint` or `segment`.
+    ///
+    /// `observe` reports speech spans and events; `endpoint` additionally ends a
+    /// streaming turn on silence, which is what makes the proto's
+    /// `single_utterance` mean something; `segment` cuts long offline audio at
+    /// speech boundaries so the silence between them never reaches the encoder.
+    #[arg(long)]
+    pub vad_mode: Option<String>,
+    /// Which detector to run.  Unset means "the running decode family's own"
+    /// — a CTC head already produces a per-frame blank posterior, so the common
+    /// case needs no second model.  Named detectors are registry keys
+    /// (`energy`, `ctc_blank`, ...).
+    #[arg(long)]
+    pub vad_backend: Option<String>,
+    /// Checkpoint directory for a detector that has weights.
+    #[arg(long)]
+    pub vad_model_dir: Option<String>,
+    /// Where the detector runs; unset follows the engine, except for the offline
+    /// splitter, which stays on the CPU so it does not synchronise the device on
+    /// the admitting thread.
+    #[arg(long)]
+    pub vad_device: Option<String>,
+    /// Repeatable `--vad-option k=v` for the tuning knobs (`threshold`,
+    /// `min_silence_ms`, `speech_pad_ms`, ...), typed by the engine from the
+    /// declared field.  Same split as `--decode-method` / `--decode-option`:
+    /// flags select, options tune, so a new knob never adds a flag.
+    #[arg(long = "vad-option", value_name = "KEY=VALUE")]
+    pub vad_option: Vec<String>,
     /// Maximum incremental decoder steps per tick; bounds dispatcher starvation.
     #[arg(long)]
     pub decode_steps_per_tick: Option<u32>,
@@ -543,6 +571,37 @@ impl Cli {
             }
             obj.entry("decode_options").or_insert(Value::Object(opts));
         }
+        // One `vad` object rather than a flat field per knob, mirroring the
+        // engine's own single `EngineConfig.vad`.  Values go over as strings and
+        // the engine types them from the declared field — the same reason
+        // `--decode-option` does, so this crate needs no copy of the table.
+        let mut vad = serde_json::Map::new();
+        for (key, value) in [
+            ("mode", self.vad_mode.as_ref()),
+            ("backend", self.vad_backend.as_ref()),
+            ("model_dir", self.vad_model_dir.as_ref()),
+            ("device", self.vad_device.as_ref()),
+        ] {
+            if let Some(v) = value {
+                vad.insert(key.to_string(), Value::String(v.clone()));
+            }
+        }
+        for pair in &self.vad_option {
+            let (k, v) = pair
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--vad-option expects KEY=VALUE, got {pair:?}"))?;
+            vad.insert(k.trim().to_string(), Value::String(v.to_string()));
+        }
+        if !vad.is_empty() {
+            // A `--vad-option` without a `--vad-mode` would configure a detector
+            // that never runs, and silently: say so instead.
+            if !vad.contains_key("mode") {
+                anyhow::bail!(
+                    "voice-activity settings were given but --vad-mode is unset, so                      nothing would run; pass --vad-mode observe|endpoint|segment"
+                );
+            }
+            obj.entry("vad").or_insert(Value::Object(vad));
+        }
         if let Some(v) = self.decode_steps_per_tick {
             obj.entry("decode_steps_per_tick")
                 .or_insert(Value::Number(v.into()));
@@ -668,6 +727,49 @@ mod tests {
             cli(&["--max-audio-mib", "8"]).max_audio_bytes(),
             8 * 1024 * 1024
         );
+    }
+
+    /// Voice-activity flags land in one `vad` object, mirroring the engine's
+    /// own single `EngineConfig.vad` field rather than a flat knob per setting.
+    #[test]
+    fn vad_flags_become_one_object() {
+        let json = cli(&[
+            "--vad-mode",
+            "endpoint",
+            "--vad-option",
+            "min_silence_ms=1500",
+            "--vad-option",
+            "threshold=0.6",
+        ])
+        .build_engine_config_json()
+        .expect("build");
+        let value: Value = serde_json::from_str(&json).expect("json");
+        let vad = value.get("vad").expect("vad object");
+        assert_eq!(vad["mode"], "endpoint");
+        // Values cross as strings; the engine types them from the declared
+        // field, the same way `--decode-option` works, so this crate needs no
+        // copy of the table.
+        assert_eq!(vad["min_silence_ms"], "1500");
+        assert_eq!(vad["threshold"], "0.6");
+    }
+
+    /// An engine with no VAD settings must serialize no `vad` key at all, so
+    /// `EngineConfig.vad` stays `None` and every transcript is unchanged.
+    #[test]
+    fn no_vad_flags_means_no_vad_key() {
+        let json = cli(&[]).build_engine_config_json().expect("build");
+        let value: Value = serde_json::from_str(&json).expect("json");
+        assert!(value.get("vad").is_none());
+    }
+
+    /// Tuning a detector that was never switched on would configure nothing,
+    /// silently.  Saying so beats a server that starts and ignores the flags.
+    #[test]
+    fn vad_options_without_a_mode_are_rejected() {
+        let err = cli(&["--vad-option", "threshold=0.6"])
+            .build_engine_config_json()
+            .expect_err("should refuse");
+        assert!(err.to_string().contains("--vad-mode"), "{err}");
     }
 
     /// The connection bound defaults above the engine's admission cap so the

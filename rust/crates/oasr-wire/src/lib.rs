@@ -47,6 +47,22 @@ pub struct DecodingParams {
     /// cannot align in the request's mode rejects it at admission.
     #[serde(default)]
     pub word_timestamps: Option<bool>,
+    /// Stop recognizing at the first utterance boundary and say why.  Backs the
+    /// proto's `single_utterance`, which has been documented as "accepted,
+    /// ignored" since the Google-shaped surface landed.  Streaming only.
+    #[serde(default)]
+    pub single_utterance: Option<bool>,
+    /// Emit `speech_started` / `speech_stopped` and fill the segment list.
+    /// Google spells this `enable_voice_activity_events`, Deepgram `vad_events`,
+    /// OpenAI the `input_audio_buffer.speech_*` events.
+    #[serde(default)]
+    pub vad_events: Option<bool>,
+    /// Trailing silence that ends a turn, in milliseconds; `None` keeps the
+    /// engine's rules.  The one knob every provider exposes under a different
+    /// name — Google `speech_end_timeout`, Deepgram `endpointing`, OpenAI
+    /// `silence_duration_ms`, Speechmatics `end_of_utterance_silence_trigger`.
+    #[serde(default)]
+    pub endpoint_silence_ms: Option<u32>,
 }
 
 /// Sampling-temperature bounds, mirroring `oasr.engine.request.MIN_TEMPERATURE`
@@ -68,6 +84,14 @@ pub const MAX_PROMPT_BYTES: usize = 4096;
 pub const TASKS: &[&str] = &["transcribe", "translate"];
 /// Upper bound on a language tag, including longer ISO-639-3 codes.
 pub const MAX_LANGUAGE_LEN: usize = 16;
+/// Bounds on `endpoint_silence_ms`, mirroring
+/// `oasr.engine.request.DecodingOptions` and, in spirit, Google's
+/// `voice_activity_timeout`.  Below the floor the endpoint fires inside the
+/// segmenter's own hysteresis and a turn ends on a hesitation; above the ceiling
+/// the engine's own rules and the idle timeout both bind first, so the value
+/// could never be reached and accepting it would be accepting a lie.
+pub const MIN_ENDPOINT_SILENCE_MS: u32 = 100;
+pub const MAX_ENDPOINT_SILENCE_MS: u32 = 60_000;
 
 /// Reduce a language tag to the primary subtag, lowercased: `"en-US"` → `"en"`.
 ///
@@ -107,6 +131,9 @@ impl DecodingParams {
         "task",
         "language",
         "word_timestamps",
+        "single_utterance",
+        "vad_events",
+        "endpoint_silence_ms",
     ];
 
     /// Whether every field is `None` — callers skip building the Python-side
@@ -161,6 +188,14 @@ impl DecodingParams {
                 return Err(format!("task must be one of {TASKS:?}, got {task:?}"));
             }
         }
+        if let Some(ms) = self.endpoint_silence_ms {
+            if !(MIN_ENDPOINT_SILENCE_MS..=MAX_ENDPOINT_SILENCE_MS).contains(&ms) {
+                return Err(format!(
+                    "endpoint_silence_ms must be between {MIN_ENDPOINT_SILENCE_MS} and \
+                     {MAX_ENDPOINT_SILENCE_MS}, got {ms}"
+                ));
+            }
+        }
         if let Some(lang) = &self.language {
             // Already normalized by the front-ends; re-checked because a
             // mis-normalized tag reaching the engine picks a *different*
@@ -186,6 +221,28 @@ impl DecodingParams {
         self.validate()?;
         Ok(Some(self))
     }
+}
+
+/// One speech-activity transition, in seconds of **audio** since the start of
+/// the request.
+///
+/// Audio time, never wall clock: Google computes its own speech-event offsets
+/// from bytes received for exactly this reason, so a jittery uplink cannot move
+/// a reported boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpeechEvent {
+    /// `"speech_started"` or `"speech_stopped"` — OpenAI's names, because the
+    /// realtime surface emits them verbatim.
+    pub kind: String,
+    pub time: f32,
+}
+
+/// One detected span of speech, in the same time base as [`WordTiming`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpeechSegment {
+    pub start: f32,
+    pub end: f32,
+    pub speech_prob: f32,
 }
 
 /// Commands sent into the engine dispatcher.
@@ -250,6 +307,13 @@ pub enum Event {
         text: String,
         tokens: Vec<Vec<u32>>,
         scores: Option<Vec<f32>>,
+        /// Speech-activity transitions detected since the previous partial.
+        /// Rides on the partial rather than arriving as its own event: a
+        /// `RequestOutput` carries the transcript *so far*, and an event-only
+        /// one would have to carry an empty `text`, which a caption client
+        /// renders by blanking the line.
+        #[serde(default)]
+        speech_events: Option<Vec<SpeechEvent>>,
     },
 
     /// Final transcript; no further events for this request.
@@ -287,6 +351,23 @@ pub enum Event {
         /// one-shot families, which have no such distinction.
         #[serde(default)]
         finish_reason: Option<String>,
+        /// Any transitions not already reported on a partial, plus the one that
+        /// closes a run still open when the audio ended.
+        #[serde(default)]
+        speech_events: Option<Vec<SpeechEvent>>,
+        /// Detected speech spans over the whole request.
+        #[serde(default)]
+        segments: Option<Vec<SpeechSegment>>,
+        /// `P(no speech)` where the decode family produces one (Whisper's
+        /// `<|nospeech|>`).  Surfaced as `no_speech_prob` on a `verbose_json`
+        /// segment, which is where OpenAI puts it.
+        #[serde(default)]
+        no_speech_prob: Option<f32>,
+        /// Which endpoint rule ended the turn, or `None` when the audio did.
+        /// The two are different things for a client deciding whether to keep
+        /// its socket open, so they are separate fields rather than one.
+        #[serde(default)]
+        endpoint_reason: Option<String>,
     },
 
     /// Per-request error (also used for shutdown / worker-lost notifications).
@@ -431,6 +512,9 @@ mod tests {
             task: Some("transcribe".into()),
             language: Some("en".into()),
             word_timestamps: Some(true),
+            single_utterance: Some(true),
+            vad_events: Some(true),
+            endpoint_silence_ms: Some(700),
         };
         let json = serde_json::to_value(&all).expect("serialize");
         let mut fields: Vec<&str> = json
@@ -472,8 +556,34 @@ mod tests {
             task: Some("translate".into()),
             language: Some("fr".into()),
             word_timestamps: Some(true),
+            single_utterance: Some(true),
+            vad_events: Some(true),
+            endpoint_silence_ms: Some(700),
         };
         assert_eq!(ok.clone().validated().unwrap(), Some(ok));
+    }
+
+    #[test]
+    fn endpoint_silence_is_bounded() {
+        // Below the floor the endpoint fires inside the segmenter's hysteresis;
+        // above the ceiling nothing could ever reach it.  Both are rejected for
+        // the request that sent them rather than clamped, so a client asking for
+        // something unserviceable is told rather than quietly given something
+        // else.
+        for bad in [1_u32, 99, 60_001, 600_000] {
+            let params = DecodingParams {
+                endpoint_silence_ms: Some(bad),
+                ..Default::default()
+            };
+            assert!(params.validate().is_err(), "{bad} should be rejected");
+        }
+        for good in [100_u32, 700, 60_000] {
+            let params = DecodingParams {
+                endpoint_silence_ms: Some(good),
+                ..Default::default()
+            };
+            assert!(params.validate().is_ok(), "{good} should be accepted");
+        }
     }
 
     #[test]

@@ -246,6 +246,30 @@ delta, and `transcript.text.done` — always the complete text — settles it.
 Only `json` and `text` may stream: `srt`, `vtt` and `verbose_json` need the
 utterance's total duration, which does not exist until the last token.
 
+### Voice activity
+
+When the server is started with `--vad-mode`, three surfaces gain speech
+activity; without it they behave exactly as before. Full detail in
+[vad.md](vad.md).
+
+| Surface | What appears |
+|---|---|
+| `POST /v1/audio/transcriptions` | `chunking_strategy` (`"auto"` or a `server_vad` object); real per-segment rows and `no_speech_prob` in `verbose_json` |
+| `GET /v1/realtime` | `turn_detection` in `session.update`; `input_audio_buffer.speech_started` / `.speech_stopped` / `.committed` |
+| gRPC `StreamingRecognize` | `single_utterance` is honoured, `enable_voice_activity_events` emits `SPEECH_ACTIVITY_BEGIN` / `_END`, and `END_OF_SINGLE_UTTERANCE` is finally sent |
+
+Two things are rejected rather than ignored, and deliberately so. Per-session
+`turn_detection.threshold` / `prefix_padding_ms` and per-request
+`chunking_strategy` thresholds are **engine-level** settings here — a client
+setting one and seeing no change would reasonably conclude it had tuned
+something, so the request fails naming `--vad-option` instead. And
+`turn_detection.type: "semantic_vad"` is refused because deciding a turn is over
+from *what was said* needs a model trained to predict end-of-utterance, which
+this engine does not have.
+
+Event offsets are **audio** milliseconds, not wall clock, so transmission jitter
+cannot move a reported boundary.
+
 ### `GET /v1/realtime` (WebSocket)
 
 Streaming transcription for clients that cannot speak gRPC — every browser, and

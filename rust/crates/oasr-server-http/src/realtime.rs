@@ -97,6 +97,77 @@ struct SessionUpdate {
     interim_results: Option<bool>,
     #[serde(default)]
     model: Option<String>,
+    /// Server-side turn detection, in OpenAI's shape.  Absent or `null` keeps
+    /// the session on manual `input_audio_buffer.commit`, which is what it did
+    /// before server VAD existed — so an existing client is unaffected.
+    #[serde(default)]
+    turn_detection: Option<TurnDetection>,
+}
+
+/// OpenAI's `turn_detection` object.
+///
+/// Only `server_vad` is accepted.  `semantic_vad` decides a turn is over from
+/// *what was said*, which needs a model trained to predict end-of-utterance;
+/// there is no such head in this engine, and accepting the value would mean
+/// silently doing acoustic detection under a name that promises otherwise.
+///
+/// `threshold` and `prefix_padding_ms` are rejected rather than ignored. They
+/// are engine-level segmenter settings here (`--vad-option threshold=...`), and
+/// a client that sets one per request and sees no change would reasonably
+/// conclude it had tuned something.
+#[derive(Debug, Clone, Deserialize)]
+struct TurnDetection {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    threshold: Option<f32>,
+    #[serde(default)]
+    prefix_padding_ms: Option<u32>,
+    #[serde(default)]
+    silence_duration_ms: Option<u32>,
+}
+
+impl TurnDetection {
+    fn validate(&self) -> Result<(), SessionError> {
+        match self.kind.as_deref() {
+            None | Some("server_vad") => {}
+            Some(other) => {
+                return Err(SessionError::new(
+                    Some("turn_detection.type"),
+                    format!(
+                        "{other:?} is not supported; this engine detects turns \
+                         acoustically, so only \"server_vad\" is available"
+                    ),
+                ))
+            }
+        }
+        // `param` is `&'static str`, so the field names are literals rather
+        // than formatted — which also keeps the error's `param` a value a client
+        // can match on instead of a sentence.
+        for (param, name, set) in [
+            (
+                "turn_detection.threshold",
+                "threshold",
+                self.threshold.is_some(),
+            ),
+            (
+                "turn_detection.prefix_padding_ms",
+                "prefix_padding_ms",
+                self.prefix_padding_ms.is_some(),
+            ),
+        ] {
+            if set {
+                return Err(SessionError::new(
+                    Some(param),
+                    format!(
+                        "{name} is an engine-level setting on this server; start it \
+                         with --vad-option {name}=... instead of sending it per session"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The resolved session: what the handshake echoes back.
@@ -220,6 +291,10 @@ fn resolve_session(s: &AppState, update: &SessionUpdate) -> Result<Session, Sess
             SessionError::new(Some("language"), format!("{tag:?} is not a language tag"))
         })?),
     };
+    let turn = update.turn_detection.as_ref();
+    if let Some(t) = turn {
+        t.validate()?;
+    }
     let decoding = DecodingParams {
         n_best: None,
         max_new_tokens: None,
@@ -238,6 +313,12 @@ fn resolve_session(s: &AppState, update: &SessionUpdate) -> Result<Session, Sess
         // arrives as deltas, and the alignment (where a family has one) is a
         // property of the finished utterance.
         word_timestamps: None,
+        // Server-side turn detection, in OpenAI's own shape: `turn_detection`
+        // absent or null keeps this session on manual `input_audio_buffer.commit`,
+        // which is what it has always done.
+        single_utterance: turn.as_ref().map(|_| true),
+        vad_events: turn.as_ref().map(|_| true),
+        endpoint_silence_ms: turn.as_ref().and_then(|t| t.silence_duration_ms),
     }
     .validated()
     .map_err(|msg| SessionError::new(None, msg))?;
@@ -470,21 +551,41 @@ async fn chunked_session(
     let result = loop {
         tokio::select! {
             ev = handle.events.next() => match ev {
-                Some(Event::Partial { text, .. }) => {
+                Some(Event::Partial { text, speech_events, .. }) => {
                     // Timed on the engine's partial, before the interim-results
                     // filter: the SLI is how fast the engine produced a
                     // transcript, not whether this client asked to see it.
                     metrics.partial();
+                    for ev in speech_activity_events(speech_events) {
+                        send_json(&mut socket, ev).await?;
+                    }
                     if session.interim_results {
                         if let Some(ev) = emitted.event(&text) {
                             send_json(&mut socket, ev).await?;
                         }
                     }
                 }
-                Some(Event::Final { text, .. }) => {
+                Some(Event::Final { text, speech_events, endpoint_reason, .. }) => {
                     handle.finish();
+                    for ev in speech_activity_events(speech_events) {
+                        send_json(&mut socket, ev).await?;
+                    }
+                    // A turn the endpointer closed is *committed* — the buffer
+                    // became a conversation item without the client asking.
+                    // A turn the audio closed was already committed by the
+                    // client's own `input_audio_buffer.commit`, so re-announcing
+                    // it would double-count the item.
+                    if endpoint_reason.is_some() {
+                        send_json(&mut socket, json!({"type": "input_audio_buffer.committed"}))
+                            .await?;
+                    }
                     send_json(&mut socket, completed_event(&text)).await?;
-                    info!(rid = %rid, transcript = %text, "realtime final");
+                    info!(
+                        rid = %rid,
+                        transcript = %text,
+                        endpoint = endpoint_reason.as_deref().unwrap_or("audio_end"),
+                        "realtime final"
+                    );
                     break Ok(());
                 }
                 Some(Event::Error { code, message, .. }) => {
@@ -527,6 +628,36 @@ async fn chunked_session(
     s.pool.release(&rid);
     let _ = socket.send(Message::Close(None)).await;
     result
+}
+
+/// Map engine speech-activity transitions onto OpenAI's realtime events.
+///
+/// The engine already names them `speech_started` / `speech_stopped` — the
+/// kinds are OpenAI's, chosen there precisely so this is a prefix and not a
+/// translation table that can drift.  `audio_start_ms` / `audio_end_ms` carry
+/// the transition time in **audio** milliseconds, which is what the client can
+/// seek to; wall clock would move with the uplink.
+fn speech_activity_events(events: Option<Vec<oasr_wire::SpeechEvent>>) -> Vec<serde_json::Value> {
+    let Some(events) = events else {
+        return Vec::new();
+    };
+    events
+        .into_iter()
+        .filter_map(|e| {
+            let ms = (e.time.max(0.0) * 1000.0).round() as i64;
+            match e.kind.as_str() {
+                "speech_started" => Some(json!({
+                    "type": "input_audio_buffer.speech_started",
+                    "audio_start_ms": ms,
+                })),
+                "speech_stopped" => Some(json!({
+                    "type": "input_audio_buffer.speech_stopped",
+                    "audio_end_ms": ms,
+                })),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Classify a session's end for the `outcome` label.

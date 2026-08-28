@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 
@@ -62,8 +62,21 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
     decode_type: ClassVar[str] = "ctc"
     consumes: ClassVar[str] = "log_probs"
     options_cls: ClassVar[type] = CtcWfstOptions
+    speech_activity_kind: ClassVar[str] = "ctc_blank"
     # Word timings are unsupported because this path emits lexicon word ids and
     # the batched decoder does not surface its per-arc frame positions.
+
+    def speech_activity_kwargs(self) -> Dict[str, Any]:
+        """The blank id, which is where this family's speech signal lives."""
+        return {"blank_id": int(self.options.decoder_config.blank_id)}
+
+    @property
+    def asr_speech_activity_modes(self) -> Tuple[str, ...]:
+        """Both modes — and note this is the *only* per-frame signal this family
+        can offer, since its word ids carry no frame positions.  The blank
+        column lives in the log-probs the strategy is handed, upstream of the
+        lattice, so the WFST's opacity does not reach it."""
+        return ("offline", "streaming")
 
     def __init__(self, config: "EngineConfig", detok: "Detokenizer", model=None) -> None:
         super().__init__(config, detok, model)
@@ -115,7 +128,9 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
         enc_lengths: torch.Tensor,
         requests: Optional[List[Request]] = None,
     ) -> List[RequestOutput]:
-        del requests  # no alignment: see ``word_timing_modes`` above
+        # ``requests`` is still read for speech activity: this family has no
+        # alignment (see ``word_timing_modes`` above) but the blank posterior is
+        # upstream of the lattice and is unaffected by that.
         cfg = self.options.decoder_config
         # Size the GPU offline decoder's lane pool to the engine's batch width so the
         # whole batch decodes in one GPU launch — batched throughput is the headline
@@ -141,6 +156,9 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
                     finished=True,
                 )
             )
+        self.attach_asr_speech_activity(
+            outputs, enc_out, enc_lengths, requests, blank_id=cfg.blank_id
+        )
         return outputs
 
     # ------------------------------------------------------------------

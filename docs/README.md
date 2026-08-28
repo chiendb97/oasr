@@ -33,6 +33,7 @@ interfaces and operation.
 | Document | Covers |
 |---|---|
 | [features.md](features.md) | Feature frontends: `FeatureSpec`, the extractor registry, streaming framing, the built-in recipes |
+| [vad.md](vad.md) | Voice activity: the detector registry, the shared segmenter and endpointer, offline segmentation and streaming turn detection, and what each API surface exposes |
 | [tokenizers.md](tokenizers.md) | Tokenizer axis: kinds, `TokenizerSpec`, the `tokenizer_config.json` added-token merge |
 | [cache_manager.md](cache_manager.md) | Streaming caches: `BlockPool`, `AttentionCacheManager`, `SlotStateCache`, `StreamContext` |
 | [ctc_decoder_gpu.md](ctc_decoder_gpu.md) | GPU CTC prefix beam search: algorithm, kernel pipeline, paged mode, streaming lifecycle |

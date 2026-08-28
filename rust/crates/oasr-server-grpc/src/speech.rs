@@ -135,8 +135,54 @@ fn partial_response(
             finish_reason: String::new(),
         }],
         speech_event_type: pb::SpeechEventType::SpeechEventUnspecified as i32,
+        speech_event_offset: None,
         request_id: rid.to_string(),
     }
+}
+
+/// A response carrying only a speech event.
+///
+/// Separate from the transcript responses on purpose: Google's own surface
+/// sends the event on its own message with an empty `results`, and folding it
+/// onto the next interim would delay a `SPEECH_ACTIVITY_END` until the decoder
+/// happened to produce one — which during silence is exactly when it does not.
+fn event_response(
+    rid: &str,
+    event: pb::SpeechEventType,
+    offset_s: f32,
+) -> pb::StreamingRecognizeResponse {
+    pb::StreamingRecognizeResponse {
+        results: Vec::new(),
+        speech_event_type: event as i32,
+        speech_event_offset: Some(duration_from_secs(offset_s)),
+        request_id: rid.to_string(),
+    }
+}
+
+/// Engine speech-activity transitions → Google's event messages.
+fn speech_activity_responses(
+    rid: &str,
+    events: Option<Vec<oasr_wire::SpeechEvent>>,
+) -> Vec<pb::StreamingRecognizeResponse> {
+    let Some(events) = events else {
+        return Vec::new();
+    };
+    events
+        .into_iter()
+        .filter_map(|e| match e.kind.as_str() {
+            "speech_started" => Some(event_response(
+                rid,
+                pb::SpeechEventType::SpeechActivityBegin,
+                e.time,
+            )),
+            "speech_stopped" => Some(event_response(
+                rid,
+                pb::SpeechEventType::SpeechActivityEnd,
+                e.time,
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The terminal `StreamingRecognizeResponse` (`is_final = true`).
@@ -162,6 +208,7 @@ fn final_response(
             finish_reason: finish_reason.unwrap_or_default(),
         }],
         speech_event_type: pb::SpeechEventType::SpeechEventUnspecified as i32,
+        speech_event_offset: None,
         request_id: rid.to_string(),
     }
 }
@@ -254,9 +301,47 @@ fn decoding_params(cfg: &pb::RecognitionConfig) -> Result<Option<DecodingParams>
         task: (!cfg.task.is_empty()).then(|| cfg.task.trim().to_ascii_lowercase()),
         language,
         word_timestamps: cfg.enable_word_time_offsets.then_some(true),
+        // Filled by the streaming caller, which is the only one with a
+        // `StreamingRecognitionConfig` to read them from — the unary RPC has no
+        // turn to end and no interim stream to annotate.
+        single_utterance: None,
+        vad_events: None,
+        endpoint_silence_ms: None,
     }
     .validated()
     .map_err(Status::invalid_argument)
+}
+
+/// Overlay the streaming-only voice-activity controls onto the shared params.
+///
+/// They live on `StreamingRecognitionConfig` rather than `RecognitionConfig`
+/// because they have no meaning for the unary RPC: one buffered utterance has
+/// no turn to end and no interim stream to annotate.  `voice_activity_timeout`
+/// is *not* forwarded as a decoding option — the engine owns those timers, and
+/// they are configured for the process rather than per request; a request that
+/// sets one is told so rather than having it dropped.
+fn apply_streaming_vad(
+    params: Option<DecodingParams>,
+    single_utterance: bool,
+    voice_activity_events: bool,
+    voice_activity_timeout_set: bool,
+) -> Result<Option<DecodingParams>, Status> {
+    if voice_activity_timeout_set {
+        return Err(Status::unimplemented(
+            "voice_activity_timeout is configured per process on this server (--vad-option speech_start_timeout_s=... / speech_end_timeout_s=...), not per request",
+        ));
+    }
+    if !single_utterance && !voice_activity_events {
+        return Ok(params);
+    }
+    let mut p = params.unwrap_or_default();
+    if single_utterance {
+        p.single_utterance = Some(true);
+    }
+    if voice_activity_events {
+        p.vad_events = Some(true);
+    }
+    p.validated().map_err(Status::invalid_argument)
 }
 
 /// Seconds → protobuf `Duration` (audio times are small and non-negative).
@@ -763,6 +848,12 @@ impl pb::speech_server::Speech for SpeechService {
                 )))
             }
         };
+        // Read the streaming-only controls before `config` is moved out of
+        // `scfg`: they live on the outer message, and taking the inner one
+        // partially moves it.
+        let want_events = scfg.enable_voice_activity_events;
+        let want_single = scfg.single_utterance;
+        let vad_timeout_set = scfg.voice_activity_timeout.is_some();
         let rcfg = scfg
             .config
             .ok_or_else(|| log_reject(Status::invalid_argument("missing recognition config")))?;
@@ -783,6 +874,8 @@ impl pb::speech_server::Speech for SpeechService {
         let want_partials = scfg.interim_results;
         let max_alts = rcfg.max_alternatives;
         let decoding = decoding_params(&rcfg).map_err(log_reject)?;
+        let decoding = apply_streaming_vad(decoding, want_single, want_events, vad_timeout_set)
+            .map_err(log_reject)?;
 
         // An offline-pinned engine cannot take CreateStreaming + FeedChunk — the
         // decode families it serves (`aed`, `llm`, `paraformer`,
@@ -883,11 +976,16 @@ impl pb::speech_server::Speech for SpeechService {
                     ev = handle.events.next() => {
                         idle.set(sleep_opt(idle_timeout));
                         match ev {
-                            Some(Event::Partial { text, tokens, scores, .. }) => {
+                            Some(Event::Partial { text, tokens, scores, speech_events, .. }) => {
                                 if !ttfp_recorded {
                                     if let Some(t0) = first_audio_at {
                                         ttfp_recorded = true;
                                         grpc_streaming().first_partial(t0.elapsed());
+                                    }
+                                }
+                                if want_events {
+                                    for resp in speech_activity_responses(&rid, speech_events) {
+                                        let _ = out_tx.send(Ok(resp)).await;
                                     }
                                 }
                                 // The filter is about what this client wants to
@@ -900,14 +998,34 @@ impl pb::speech_server::Speech for SpeechService {
                             }
                             Some(Event::Final {
                                 text, tokens, scores, nbest_texts, end_time_s, words,
-                                finish_reason, ..
+                                finish_reason, speech_events, endpoint_reason, ..
                             }) => {
                                 let transcript = text.clone();
+                                let ended_at = end_time_s.unwrap_or(0.0);
+                                if want_events {
+                                    for resp in speech_activity_responses(&rid, speech_events) {
+                                        let _ = out_tx.send(Ok(resp)).await;
+                                    }
+                                }
                                 let resp = final_response(
                                     &rid, text, tokens, scores, nbest_texts, end_time_s,
                                     finish_reason, max_alts, words,
                                 );
                                 let _ = out_tx.send(Ok(resp)).await;
+                                // The event the enum has declared since this
+                                // surface landed, and that nothing ever sent.
+                                // After the final result, matching Google: the
+                                // transcript for the utterance comes first, then
+                                // the notice that the utterance is over.
+                                if want_single && endpoint_reason.is_some() {
+                                    let _ = out_tx
+                                        .send(Ok(event_response(
+                                            &rid,
+                                            pb::SpeechEventType::EndOfSingleUtterance,
+                                            ended_at,
+                                        )))
+                                        .await;
+                                }
                                 handle.finish();
                                 info!(
                                     n_partials,

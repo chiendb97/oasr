@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -57,6 +57,25 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
     decode_type: ClassVar[str] = "ctc"
     consumes: ClassVar[str] = "log_probs"
     options_cls: ClassVar[type] = CtcGpuOptions
+    speech_activity_kind: ClassVar[str] = "ctc_blank"
+
+    def speech_activity_kwargs(self) -> Dict[str, Any]:
+        """The blank id, which is where this family's speech signal lives."""
+        return {"blank_id": int(self.options.decoder_config.blank_id)}
+
+    @property
+    def asr_speech_activity_modes(self) -> Tuple[str, ...]:
+        """Both modes, and at no extra forward.
+
+        The signal is a column of the log-probs the fused head already produced,
+        so it is a read rather than a computation — the same argument the
+        emission-frame word timings make.  It is also the *robust* endpointing
+        signal: an acoustic VAD keeps firing on background noise (Deepgram
+        documents exactly this failure of its own endpointer, and added a
+        decoder-derived signal to work around it), whereas the acoustic model
+        has already decided the noise is not a token.
+        """
+        return ("offline", "streaming")
 
     @property
     def word_timing_modes(self) -> Tuple[str, ...]:
@@ -149,6 +168,11 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
             )
         if want_times:
             attach_emission_timings(self, requests or [], outputs, result.times, enc_out)
+        # ``enc_out`` is the (B, T, V) log-softmax, so the blank column is right
+        # here; no second pass over the audio and no second model.
+        self.attach_asr_speech_activity(
+            outputs, enc_out, enc_lengths, requests, blank_id=cfg.blank_id
+        )
         return outputs
 
     # ------------------------------------------------------------------

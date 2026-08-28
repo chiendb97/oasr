@@ -94,6 +94,12 @@ class ArGroup:
     #: retaining per row rather than per group is what keeps a single timed
     #: request from pinning the whole batch's encoder output.
     align_enc: List[Optional[torch.Tensor]] = field(default_factory=list)
+    #: Per-row ``P(no speech)``, read off the prefill logits for the families
+    #: that have such a token.  Captured at prefill because that is the *only*
+    #: position it exists at — Whisper predicts it once, before the first
+    #: generated token — so a row that finishes forty steps later would have
+    #: nothing left to read.
+    no_speech: List[Optional[float]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.tokens:
@@ -102,6 +108,8 @@ class ArGroup:
             self.detok_state = [{} for _ in self.requests]
         if not self.align_enc:
             self.align_enc = [None] * len(self.requests)
+        if not self.no_speech:
+            self.no_speech = [None] * len(self.requests)
 
     def fresh_rows(self) -> List[int]:
         """Rows that have not generated a token yet.
@@ -123,6 +131,7 @@ class ArGroup:
         self.opts = [self.opts[r] for r in keep]
         self.detok_state = [self.detok_state[r] for r in keep]
         self.align_enc = [self.align_enc[r] for r in keep]
+        self.no_speech = [self.no_speech[r] for r in keep]
 
     def extend(self, other: "ArGroup", state: Dict[str, Any], logits: torch.Tensor) -> None:
         """Absorb ``other``'s rows, given the already-joined decoder state.
@@ -137,6 +146,7 @@ class ArGroup:
         self.opts = self.opts + other.opts
         self.detok_state = self.detok_state + other.detok_state
         self.align_enc = self.align_enc + other.align_enc
+        self.no_speech = self.no_speech + other.no_speech
         self.state = state
         self.last_logits = logits
 
@@ -622,6 +632,7 @@ class IncrementalArStrategy(DecodeStrategy):
             max_new=list(plan.max_new),
             opts=opts,
             align_enc=align_enc,
+            no_speech=self.prefill_no_speech(requests, plan.logits),
         )
         if not self._absorb(fresh):
             self._groups.append(fresh)
@@ -917,6 +928,18 @@ class IncrementalArStrategy(DecodeStrategy):
                     )
         return outputs
 
+    def prefill_no_speech(
+        self, requests: List[Request], logits: torch.Tensor
+    ) -> List[Optional[float]]:
+        """``P(no speech)`` per row from the first generated position's logits.
+
+        The default is "this family has no such token", which is the honest
+        answer for every AR family but Whisper.  Overridden rather than
+        conditioned on ``hasattr`` so a family that gains the token later
+        declares it in one place.
+        """
+        return [None] * len(requests)
+
     def _finalize_row(self, group: ArGroup, row: int, reason: str) -> RequestOutput:
         tokens = group.tokens[row]
         out = RequestOutput(
@@ -926,6 +949,8 @@ class IncrementalArStrategy(DecodeStrategy):
             finished=True,
             finish_reason=reason,
         )
+        if row < len(group.no_speech):
+            out.no_speech_prob = group.no_speech[row]
         enc = group.align_enc[row] if row < len(group.align_enc) else None
         if enc is not None and tokens:
             # The row's decoder state is about to be dropped, so this is the

@@ -17,7 +17,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, Mapping, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Mapping, Optional, Tuple
 
 import torch
 
@@ -45,6 +45,33 @@ _LANGUAGE_TOKEN = re.compile(r"^<\|([a-z]{2,3})\|>$")
 #: The two task tokens, named rather than numbered: their ids move between
 #: Whisper releases (large-v3 added a language and shifted everything after it).
 _TASK_TOKENS = {"<|transcribe|>": "transcribe", "<|translate|>": "translate"}
+
+
+#: Spellings of the no-speech control token across Whisper vocabularies.  The
+#: original release used ``<|nocaptions|>``; everything since uses
+#: ``<|nospeech|>``, and both appear in snapshots still in circulation.
+_NO_SPEECH_TOKENS: Tuple[str, ...] = ("<|nospeech|>", "<|nocaptions|>")
+
+
+def _no_speech_token_id(tok_json: Path) -> Optional[int]:
+    """The ``<|nospeech|>`` id from an HF ``tokenizer.json``, or ``None``.
+
+    Read by name rather than derived as ``no_timestamps_token_id - 1``.  The
+    arithmetic happens to hold for the multilingual vocabularies and is exactly
+    the kind of assumption that produces a confident wrong answer on the one
+    snapshot where it does not — here, a probability read off an unrelated
+    token's logit, which would look like a plausible number forever.
+    """
+    try:
+        added = _read_json(tok_json).get("added_tokens") or []
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("whisper: could not read %s for the no-speech token: %s", tok_json, exc)
+        return None
+    for entry in added:
+        content, tid = entry.get("content"), entry.get("id")
+        if isinstance(content, str) and isinstance(tid, int) and content in _NO_SPEECH_TOKENS:
+            return int(tid)
+    return None
 
 
 def _control_token_tables(tok_json: Path) -> Tuple[Dict[str, int], Dict[str, int]]:
@@ -129,7 +156,9 @@ class HFWhisperConverter(BaseCheckpointConverter):
                 tok = raw_forced.get(p)
             if tok is not None:
                 forced.append((p, int(tok)))
-        tasks, languages = _control_token_tables(Path(ckpt_dir) / "tokenizer.json")
+        tok_json = Path(ckpt_dir) / "tokenizer.json"
+        tasks, languages = _control_token_tables(tok_json)
+        no_speech = _no_speech_token_id(tok_json)
         # Published alignment heads ride in generation_config.json only; a
         # snapshot without them still converts, and word timestamps fall back
         # to the upper decoder layers (noisier, and much more transient memory).
@@ -157,6 +186,7 @@ class HFWhisperConverter(BaseCheckpointConverter):
             task_token_ids=tasks,
             language_token_ids=languages,
             alignment_heads=heads,
+            no_speech_token_id=no_speech,
         )
 
     def load_state_dict(

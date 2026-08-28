@@ -16,6 +16,7 @@ from oasr.decode import DecoderConfig
 from oasr.features import FeatureConfig
 from oasr.functionals.ctc_decode import GpuDecoderConfig
 from oasr.models.base import BaseModelConfig, CacheSpec
+from oasr.vad import VadConfig
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +202,13 @@ class EngineConfig:
     # Feature extraction
     feature_config: Optional[FeatureConfig] = None
 
+    # Voice activity detection.  One field, one sub-config, the way
+    # ``feature_config`` is — not a dozen flat knobs.  ``None`` is exactly
+    # ``VadConfig(mode="off")``: nothing runs, and every transcript stays
+    # byte-identical.  Which detector runs is a registry selector
+    # (``vad.backend``), so adding one needs no field here.
+    vad: Optional[VadConfig] = None
+
     # CTC kernel implementation; ``ctc_wfst`` requires ``fst_path``.
     decoder_type: str = "ctc_cuda"
     ctc_decoder_config: Optional[GpuDecoderConfig] = None
@@ -280,6 +288,9 @@ class EngineConfig:
     _model_config: Optional[BaseModelConfig] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        # Accept a plain mapping (the Rust front-end passes one) so a serialized
+        # engine config round-trips without the caller importing VadConfig.
+        self.vad = VadConfig.coerce(self.vad)
         if self.service_mode not in ("streaming", "offline"):
             raise ValueError(
                 f"service_mode must be 'streaming' or 'offline', got " f"{self.service_mode!r}"
