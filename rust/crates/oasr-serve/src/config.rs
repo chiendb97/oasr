@@ -144,17 +144,21 @@ pub struct Cli {
     /// boundaries so the silence between them never reaches the encoder —
     /// offline by fanning the file out, streaming by skipping encoder chunks and
     /// resetting the stream across the gap.  `segment` needs a detector that can
-    /// run ahead of the encoder (`--vad-backend energy`); the engine refuses the
-    /// combination at construction otherwise rather than silently labelling.
+    /// run ahead of the encoder (`--vad-backend silero` or `energy`); the engine
+    /// refuses the combination at construction otherwise rather than silently
+    /// labelling.
     #[arg(long)]
     pub vad_mode: Option<String>,
     /// Which detector to run.  Unset means "the running decode family's own"
     /// — a CTC head already produces a per-frame blank posterior, so the common
-    /// case needs no second model.  Named detectors are registry keys
-    /// (`energy`, `ctc_blank`, ...).
+    /// case needs no second model.  Named detectors are registry keys:
+    /// `silero` (the neural one, needs `--vad-model-dir`), `energy` (the
+    /// dependency-free baseline), `ctc_blank`, ...
     #[arg(long)]
     pub vad_backend: Option<String>,
-    /// Checkpoint directory for a detector that has weights.
+    /// Checkpoint directory for a detector that has weights — `silero` is the
+    /// one that has them, and it is refused at construction without this rather
+    /// than run with an uninitialised network.
     #[arg(long)]
     pub vad_model_dir: Option<String>,
     /// Where the detector runs; unset follows the engine, except for the offline

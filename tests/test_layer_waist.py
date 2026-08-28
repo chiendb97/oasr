@@ -221,6 +221,38 @@ def test_architecture_uses_the_layer_waist(arch):
     )
 
 
+def _vad_nets():
+    """Every registered detector that is a network, built without its weights.
+
+    The VAD axis is not in ``list_models()`` — a detector is registered against
+    :mod:`oasr.vad`, not the model registry — so it would otherwise sit outside
+    the one test that enforces rule 2.  It should not: a detector gating the
+    encoder in ``vad.mode="segment"`` runs on every chunk of every stream, which
+    is exactly the traffic the waist exists to serve.
+    """
+    from oasr.vad import VadConfig, list_vad
+    from oasr.vad.detectors.silero import SileroVadNet
+
+    builders = {"silero": lambda: SileroVadNet(16000)}
+    known = set(list_vad())
+    return [(kind, builders[kind]) for kind in sorted(builders) if kind in known], VadConfig
+
+
+@pytest.mark.parametrize("kind", [k for k, _ in _vad_nets()[0]])
+def test_vad_networks_use_the_layer_waist(kind):
+    """No bare torch layer in a neural speech detector either."""
+    builders = dict(_vad_nets()[0])
+    net = builders[kind]()
+    offenders = [
+        f"{name or '<root>'}: {type(mod).__name__}"
+        for name, mod in net.named_modules()
+        if isinstance(mod, BANNED)
+    ]
+    assert not offenders, f"vad backend {kind!r} reaches past oasr.layers:\n  " + "\n  ".join(
+        offenders
+    )
+
+
 def _dotted_name(node: ast.AST) -> str | None:
     if isinstance(node, ast.Name):
         return node.id

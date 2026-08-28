@@ -10,6 +10,13 @@ Every ASR-derived kind declares ``("stream", "posthoc")`` and never
 encoder.  The registry enforces that at registration rather than at first
 request.
 
+Two waveform detectors ship.  ``silero`` is the one to use when quality matters
+— it is what every open-source pre-ASR segmenter runs, and OASR's segmentation
+knobs are already spelled in its vocabulary — but it needs its weights pointed
+at.  ``energy`` needs nothing and is the baseline the axis can always fall back
+to; its documented failure (a noise floor within ``dynamic_range_db`` of the peak
+reads as continuous speech) is exactly what the neural one fixes.
+
 The energy baseline declares all three roles.  ``"presegment"`` is what lets it
 cut audio before the encoder sees it — offline through the long-form fan-out,
 streaming through the per-window gate — and ``"stream"`` says it can do that
@@ -30,9 +37,12 @@ from ..config import VadConfig
 from ..registry import VadSpec, register_vad
 from .asr import AedNoSpeechDetector, CifAlphaDetector, CtcBlankDetector, FrameActivityDetector
 from .energy import EnergyDetector, build_energy, energy_framing
+from .silero import SileroDetector, SileroVadNet, build_silero, silero_framing
 
 __all__ = [
     "EnergyDetector",
+    "SileroDetector",
+    "SileroVadNet",
     "CtcBlankDetector",
     "FrameActivityDetector",
     "CifAlphaDetector",
@@ -125,6 +135,19 @@ register_vad(
         modes=("presegment", "stream", "posthoc"),
         stateful=True,
         doc="peak-relative log-energy; dependency-free baseline",
+    )
+)
+
+register_vad(
+    VadSpec(
+        kind="silero",
+        factory=build_silero,
+        consumes="waveform",
+        framing=silero_framing,
+        modes=("presegment", "stream", "posthoc"),
+        stateful=True,
+        needs_weights=True,
+        doc="Silero VAD v5 (MIT, 309K params); needs --vad-model-dir",
     )
 )
 

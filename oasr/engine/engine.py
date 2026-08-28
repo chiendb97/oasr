@@ -686,6 +686,14 @@ class ASREngine:
             vad.backend = family_kind
 
         spec = get_vad_spec(vad.backend)
+        if spec.needs_weights and not vad.model_dir:
+            raise ValueError(
+                f"vad.backend={vad.backend!r} is a model with its own weights, and "
+                "no vad.model_dir was given. Pass --vad-model-dir (or "
+                "VadConfig.model_dir); there is no fallback, because a detector "
+                "with uninitialised weights would report an activity trace that "
+                "looks like a distribution and means nothing."
+            )
         if spec.is_asr_derived and vad.backend != family_kind:
             own = repr(family_kind) if family_kind else "none"
             raise ValueError(

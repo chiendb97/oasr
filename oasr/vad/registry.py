@@ -143,6 +143,12 @@ class VadSpec:
     requires: Tuple[str, ...] = ()
     #: True when the detector carries per-stream recurrent state across chunks.
     stateful: bool = False
+    #: True when the detector has weights of its own, so ``VadConfig.model_dir``
+    #: must name them.  Declared here rather than discovered inside the factory
+    #: so the engine can refuse at construction naming the flag — the same reason
+    #: ``consumes`` and ``modes`` are declarations: what a detector needs is part
+    #: of its registration, not something a caller finds out by running it.
+    needs_weights: bool = False
     #: Shortest silence this detector's signal can tell apart from its own
     #: sparsity, in milliseconds.  ``0`` for a genuine frame-level detector.
     #:

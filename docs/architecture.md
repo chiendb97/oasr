@@ -300,7 +300,12 @@ reference implementation.
      there the detector has to decide what the encoder sees, incrementally;
    * `min_silence_floor_ms` is the shortest silence the signal can distinguish
      from its own sparsity. The ASR-derived signals are peaky, and without this
-     the streaming preset's 100 ms would be applied to a spike train.
+     the streaming preset's 100 ms would be applied to a spike train;
+   * `needs_weights` says the detector is a model of its own, so the engine
+     refuses a configuration with no `vad.model_dir` at construction and names
+     the flag — rather than the factory discovering it, or worse, a randomly
+     initialised network producing an activity trace that looks like a
+     distribution.
 3. A detector with a *trained* window declares its own `framing`; one whose grid
    is the encoder's leaves it `None` and is told `seconds_per_frame`.
 4. A detector that carries state across chunks sets `stateful` and implements

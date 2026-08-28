@@ -220,6 +220,12 @@ def wav_dir():
 
 
 @pytest.fixture(scope="session")
+def silero_vad_dir():
+    """Silero VAD weights dir; skips (or fails under --strict-assets)."""
+    return assets.require("SILERO_VAD_DIR")
+
+
+@pytest.fixture(scope="session")
 def device():
     """Return CUDA device if available, otherwise skip."""
     if not torch.cuda.is_available():

@@ -37,6 +37,11 @@ oasr-server --ckpt-dir $CKPT_DIR --service-mode offline \
 oasr-server --ckpt-dir $CKPT_DIR --service-mode streaming \
     --vad-mode segment --vad-backend energy
 
+# With the neural detector instead, which is what to use on anything but clean
+# audio.  `energy` needs no download; `silero` needs its 2.2 MB of weights.
+oasr-server --ckpt-dir $CKPT_DIR --service-mode offline \
+    --vad-mode segment --vad-backend silero --vad-model-dir $SILERO_VAD_DIR
+
 # Tune it.  Named flags select; `--vad-option k=v` tunes, so a new knob never
 # adds a flag — the same split as --decode-method / --decode-option.
 oasr-server ... --vad-mode endpoint --vad-option min_silence_ms=1500
@@ -55,10 +60,10 @@ for s in out.segments or ():
 
 ## Two detector families
 
-| Family | Kinds | Consumes | Can pre-segment? |
-|---|---|---|---|
-| **Standalone** | `energy` | the waveform | yes |
-| **ASR-derived** | `ctc_blank`, `transducer_blank`, `cif_alpha`, `aed_no_speech` | the ASR's own per-frame output | **no** |
+| Family | Kinds | Consumes | Can pre-segment? | Weights? |
+|---|---|---|---|---|
+| **Standalone** | `silero`, `energy` | the waveform | yes | `silero` only |
+| **ASR-derived** | `ctc_blank`, `transducer_blank`, `cif_alpha`, `aed_no_speech` | the ASR's own per-frame output | **no** | no |
 
 `vad.backend = None` (the default) means *auto*: the engine resolves it to the
 detector the running decode family declares, so **"no separate VAD model
@@ -86,16 +91,64 @@ ASR-derived in-decoder one: the first decides what to encode, the second decides
 when a turn ended. That is exactly the split here — `energy` gates the encoder in
 `vad.mode="segment"`, `ctc_blank` endpoints in `vad.mode="endpoint"`.
 
-The waveform detector carries a **running peak** across chunks in streaming
-rather than re-normalising each one against its own loudest frame, which would
-read a chunk of room tone as a chunk of speech. Two consequences are visible in
-the output: the opening chunks of a stream are judged against a reference that
-has not been established yet, so a stream that opens on room tone reads as speech
-and is *encoded* (the safe direction); and a stream with one loud burst raises
-the bar for everything after it, so speech more than `dynamic_range_db` below
-that burst reads as silence. That is the documented failure of every energy VAD —
-Kaldi says as much in `compute-vad`'s own header — and it is why a neural
-detector is the eventual answer.
+### The two standalone detectors
+
+`energy` is peak-relative log energy: no weights, no download, and it carries a
+**running peak** across chunks in streaming rather than re-normalising each one
+against its own loudest frame (which would read a chunk of room tone as a chunk
+of speech). Two consequences are visible in the output: the opening chunks of a
+stream are judged against a reference that has not been established yet, so a
+stream that opens on room tone reads as speech and is *encoded* — the safe
+direction; and a stream with one loud burst raises the bar for everything after
+it, so speech more than `dynamic_range_db` below that burst reads as silence.
+That is the documented failure of every energy VAD — Kaldi says as much in
+`compute-vad`'s own header — and it is what `silero` fixes.
+
+`silero` is **Silero VAD v5** (MIT, 309 633 parameters), rebuilt on
+`oasr.layers` and loaded from the upstream TorchScript archive:
+
+```bash
+mkdir -p silero-vad && curl -L -o silero-vad/silero_vad.jit \
+  https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.jit
+oasr-server ... --vad-mode segment --vad-backend silero --vad-model-dir silero-vad
+```
+
+There is no conversion step: the archive is 2.2 MB, `torch.jit.load` is already
+in the dependency set, and the weights are remapped at construction. A plain
+`torch.save` of either the upstream tensors or the converted ones works too.
+
+Measured on three LJSpeech utterances joined by 6 s of digital silence, with
+additive noise at a level relative to the corpus RMS — the axis energy VAD fails
+on:
+
+| noise | `energy` segments / silence dropped | `silero` segments / silence dropped |
+|---|---|---|
+| clean | 3 / 10.6 s | 3 / 10.5 s |
+| −30 dB | 3 / 10.6 s | 3 / 10.5 s |
+| −20 dB | **2 / 0.0 s** | 3 / 10.4 s |
+| −12 dB | **2 / 0.0 s** | 3 / 10.4 s |
+
+At −20 dB the noise floor is inside `energy`'s dynamic range, so the whole
+recording reads as one continuous utterance and nothing is cut; `silero` is
+unaffected. The transcript follows: against the same audio decoded with the VAD
+off, `energy` scores 0.972 word similarity and `silero` 0.982.
+
+**It is not built from the shipped archive at run time.** Rule 2 says a model is
+composed from the layer waist, and a detector that gates the encoder in
+`vad.mode="segment"` runs on every chunk of every stream — exactly the traffic
+the waist exists to serve. Running the scripted archive (or an ONNX runtime)
+would put a second inference stack in the process to get none of that. Two
+substitutions in the rebuild are worth knowing, and both are exact: the
+"conv-STFT" *is* a convolution against a fixed basis, and the 1×1 output
+convolution over a length-one sequence *is* a linear map, so it batches every
+frame of every stream into one GEMM.
+
+**It runs on the host, and that is the fast placement**, not a compromise:
+measured on this box, 615× realtime on CPU against 345× on the GPU, because a
+128-wide recurrence is launch-bound on a device. `vad.device` overrides it. The
+per-call cost is dominated by small-tensor dispatch rather than arithmetic, so it
+amortises with the pool: one stream's 200 ms chunk costs ~1.2 ms, eight streams'
+cost ~2.0 ms together.
 
 ### The peakiness floor
 
@@ -201,8 +254,10 @@ digital silence, `energy` backend:
 **Requires a waveform detector.** Only a detector that runs before the encoder
 can decide what the encoder sees, so `segment` needs `presegment` — and in
 streaming, `stream` as well, because there it has to reach that verdict
-incrementally. `--vad-backend energy` is the built-in that declares both; an
-ASR-derived backend is refused at construction, naming the gap.
+incrementally. `silero` and `energy` both declare them; an ASR-derived backend is
+refused at construction, naming the gap. A backend whose spec sets
+`needs_weights` is refused too when `--vad-model-dir` is unset — before anything
+is built, rather than discovered inside its factory.
 
 Two combinations are refused rather than degraded: `n_best > 1` (alternatives of
 separate turns do not compose into alternatives of the stream, the same reason

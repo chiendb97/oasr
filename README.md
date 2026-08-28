@@ -35,8 +35,8 @@ OASR is flexible and easy to use with:
 - Word-level timestamps and confidences across CTC, RNN-T, AED and CIF — each from the model's own
   alignment, and refused rather than faked by the families that have none
 - Voice activity detection as its own extension axis — segment long audio at speech boundaries,
-  end streaming turns on silence, with a separate VAD model **or** with the ASR model's own
-  per-frame output when none is configured
+  end streaming turns on silence, with a separate VAD model (Silero v5, rebuilt on `oasr.layers`)
+  **or** with the ASR model's own per-frame output when none is configured
 - An `oasr` CLI and a Python client, so nothing needs writing to try it
 
 ## Supported Models

@@ -256,6 +256,7 @@ extension cookbook for each axis.
 | `oasr/models/interfaces.py` | `CAPABILITIES` — what each decode family requires of a model |
 | `oasr/models/registry.py` | `register_model`, `build_model_from_checkpoint`, entry-point discovery |
 | `oasr/vad/` | Speech detectors (registry), the shared segmenter and the Kaldi-shaped endpointer |
+| `oasr/vad/detectors/silero.py` | Silero VAD v5 rebuilt on `oasr.layers` + the upstream weight conversion |
 | `oasr/engine/vad_stage.py` | The two engine entry points: offline splitter, per-tick streaming stage |
 | `oasr/layers/` | The narrow waist; `_backend.py` holds the routing rules and `KERNEL_GAPS` |
 | `oasr/jit/core.py`, `oasr/jit/env.py` | JIT specs, nvcc flags, the cache key |
