@@ -165,6 +165,47 @@ class SpeechSegmenter:
         return self._offset + self._i * self._spf
 
     @property
+    def open_run_start(self) -> Optional[float]:
+        """Session time of the open speech run's first frame, or ``None``.
+
+        A run stays open through a silence shorter than ``min_silence_ms``, which
+        is exactly the property the streaming gate needs: audio inside an
+        as-yet-unconfirmed pause is still speech, so it is still encoded, and only
+        a silence the machine has *committed* to can authorise skipping.
+        """
+        return None if self._run_start is None else self._time(self._run_start)
+
+    def overlaps_speech(self, start: float, end: float) -> bool:
+        """Whether any closed or open speech run intersects ``[start, end)``.
+
+        The question the encoder gate asks of a window before dropping it.  Scans
+        the closed runs newest-first and stops as soon as one ends before
+        ``start``: they are in order, so everything earlier ends earlier too.
+        """
+        if end <= start:
+            return False
+        run_start = self.open_run_start
+        if run_start is not None and run_start < end:
+            return True
+        for seg in reversed(self._raw):
+            if seg.end <= start:
+                break
+            if seg.start < end:
+                return True
+        return False
+
+    @property
+    def last_segment_end(self) -> Optional[float]:
+        """End of the most recently **closed** speech run, or ``None``.
+
+        A closed run is a decision the machine has committed to — it survived
+        ``min_silence_ms`` of silence — which is what makes it usable as a turn
+        boundary.  ``open_run_start`` is the other half: while a run is open the
+        pause has not been confirmed and nothing may act on it.
+        """
+        return self._raw[-1].end if self._raw else None
+
+    @property
     def raw_segments(self) -> List[SpeechSegment]:
         """Closed segments, **unpadded**, in order."""
         return list(self._raw)

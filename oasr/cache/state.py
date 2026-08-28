@@ -219,6 +219,20 @@ class SlotStateCache:
             buf = self._buffers[spec.name]
             buf.select(spec.slot_axis, slot_id).zero_()
 
+    def reset_stream(self, stream_id: int) -> None:
+        """Zero an *allocated* stream's state without releasing its slot.
+
+        The turn-boundary counterpart of :meth:`allocate_stream`: a convolution
+        cache of zeros is the initial left context, so re-zeroing is exactly
+        "this chunk starts a new stream" — which is what the encoder is being
+        told after a skipped silence.  Subclasses carrying per-stream bookkeeping
+        beside the buffers (a ring parity, a step counter) override this to reset
+        that too; going through ``free_stream`` + ``allocate_stream`` instead
+        would hand the stream a different slot and move buffers a captured graph
+        addressed by row.
+        """
+        self.reset_slot(self.slot_of(stream_id))
+
     def free_stream(self, stream_id: int) -> None:
         """Release the slot mapping for a stream."""
         if stream_id not in self._slots:

@@ -151,12 +151,45 @@ class AttentionCacheManager:
         for s in self._streams.values():
             if s.slot_id == slot_id:
                 raise ValueError(f"slot_id {slot_id} already in use")
-        self._streams[stream_id] = _StreamKVState(slot_id=slot_id)
-        # Reset persistent rows for the new stream.
-        self._block_table[slot_id].zero_()
-        self._cache_seqlens[slot_id] = 0
+        state = _StreamKVState(slot_id=slot_id)
+        self._streams[stream_id] = state
+        self._arm_slot(state)
+
+    def reset_stream(self, stream_id: int) -> None:
+        """Return a stream to the state :meth:`allocate_stream` leaves it in.
+
+        The stream keeps its ``stream_id`` and its **slot**; only the paging
+        state goes back to zero.  That is the difference from ``free_stream`` +
+        ``allocate_stream``, and it is the point: the slot is what the persistent
+        ``block_table`` / ``cache_seqlens`` rows are addressed by and what a
+        captured graph baked in, so a turn boundary that churned it would move
+        the stream to a different row of tensors a CUDA graph captured by
+        address.  Physical blocks *do* go back to the pool, which is why a long
+        silence in ``vad.mode="segment"`` costs nothing while it lasts.
+
+        Pairs with resetting the request's encoder-frame position: together they
+        are what makes advancing past frames the encoder never saw sound rather
+        than a splice (AGENTS.md rule 13).
+        """
+        state = self._get_state(stream_id)
+        if state.logical_blocks:
+            self._pool.free(state.logical_blocks)
+            state.logical_blocks = []
+        state.num_committed_frames = 0
+        self._arm_slot(state)
+
+    def _arm_slot(self, state: _StreamKVState) -> None:
+        """Zero this slot's persistent rows and re-take the prefill window.
+
+        Shared by :meth:`allocate_stream` and :meth:`reset_stream` so the two
+        cannot drift: a reset that skipped the prefill would leave the stream
+        reporting a shorter ``cache_seqlens`` than its cohort, which is exactly
+        the relative-position mismatch ``_prefill_window`` exists to avoid.
+        """
+        self._block_table[state.slot_id].zero_()
+        self._cache_seqlens[state.slot_id] = 0
         if self._config.prefill_kv_window:
-            self._prefill_window(stream_id)
+            self._prefill_window_state(state)
 
     def _prefill_window(self, stream_id: int) -> None:
         """Give a new stream its whole retained window up front, zero-filled.
@@ -175,7 +208,10 @@ class AttentionCacheManager:
         ``P @ V``, so a ``NaN`` there would propagate where no mask can intercept
         it.  Finite stale data is inert; uninitialised memory is not.
         """
-        state = self._get_state(stream_id)
+        self._prefill_window_state(self._get_state(stream_id))
+
+    def _prefill_window_state(self, state: _StreamKVState) -> None:
+        """:meth:`_prefill_window`, given the state rather than the stream id."""
         blocks = self._config.max_logical_blocks
         assert blocks is not None  # guaranteed by CacheConfig.__post_init__
         block_ids = self._pool.allocate(blocks)

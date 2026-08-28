@@ -516,9 +516,13 @@ class _Strategy:
 
     decode_type = "ctc"
     selective_options = ()
+    # No engine config, so voice activity is off and the turn-aware checks are
+    # inert — this stub is here for the alignment half of ``validate_options``.
+    _config = None
     _SELECTIVE_UNSET = _Base._SELECTIVE_UNSET
     validate_options = _Base.validate_options
     _require_word_timings = _Base._require_word_timings
+    _reject_nbest_across_turns = _Base._reject_nbest_across_turns
 
     def __init__(self, modes=(), clock=FrameClock(0.04)):
         self.word_timing_modes = modes

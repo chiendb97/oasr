@@ -10,13 +10,14 @@ Every ASR-derived kind declares ``("stream", "posthoc")`` and never
 encoder.  The registry enforces that at registration rather than at first
 request.
 
-The energy baseline declares ``("presegment", "posthoc")`` and **not**
-``"stream"``.  Incremental waveform detection needs a per-stream sample buffer
-with carried framing state, which is real machinery and is not built yet; a
-detector that claimed the role and then produced frames from a chunk boundary it
-did not carry across would report boundaries that are plausible and wrong.
-Declaring the gap makes a streaming engine configured with ``backend="energy"``
-fail at construction naming it, instead.
+The energy baseline declares all three roles.  ``"presegment"`` is what lets it
+cut audio before the encoder sees it — offline through the long-form fan-out,
+streaming through the per-window gate — and ``"stream"`` says it can do that
+incrementally, which for this detector means carrying a running peak and the
+sub-frame sample remainder across chunk boundaries rather than restarting its
+reference at every chunk.  It is ``stateful`` for that reason: without the carry
+each chunk would be normalised against its own loudest frame and a chunk of pure
+room tone would read as a chunk of pure speech.
 """
 
 from __future__ import annotations
@@ -121,8 +122,9 @@ register_vad(
         factory=build_energy,
         consumes="waveform",
         framing=energy_framing,
-        modes=("presegment", "posthoc"),
-        doc="peak-relative log-energy; dependency-free baseline, offline only",
+        modes=("presegment", "stream", "posthoc"),
+        stateful=True,
+        doc="peak-relative log-energy; dependency-free baseline",
     )
 )
 

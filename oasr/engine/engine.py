@@ -704,16 +704,22 @@ class ASREngine:
                 "configuration."
             )
 
-        if vad.mode == "segment" and streaming:
-            # Checked before the role test so the message names the real reason
-            # rather than reporting that a detector lacks a role it does declare.
-            raise NotImplementedError(
-                "vad.mode='segment' is offline-only for now. In streaming it "
-                "would have to skip encoder chunks during silence, and skipping "
-                "without resetting the stream splices non-adjacent audio at "
-                "contiguous positions — the encoder is told each chunk follows "
-                "the last one (AGENTS.md rule 13). Use vad.mode='endpoint' to "
-                "end turns on silence today."
+        if (
+            vad.mode == "segment"
+            and streaming
+            and getattr(config, "overlap_partial_readback", False)
+        ):
+            # The overlapped read-back emits the *previous* emit step's partial,
+            # and it identifies a still-live stream by ``stream_id``.  A turn
+            # boundary frees and re-creates the decode session under the same
+            # stream_id, so a partial issued against the closed turn would be
+            # collected against the new one and published as if it belonged to
+            # it — the old turn's text, a turn late, in front of the new turn's.
+            raise ValueError(
+                "vad.mode='segment' cannot run with overlap_partial_readback=True: "
+                "a turn boundary recreates the decode session under the same "
+                "stream id, so an in-flight partial would be attributed to the "
+                "turn after the one it came from. Disable one of the two."
             )
         if not streaming and not spec.is_asr_derived and vad.mode != "segment":
             # A waveform detector offline is wired for segmentation and nothing
@@ -729,16 +735,25 @@ class ASREngine:
                 "decode family's own signal."
             )
 
-        role = "stream" if streaming else ("presegment" if vad.mode == "segment" else "posthoc")
-        if not spec.can(role):
+        # ``segment`` needs a detector that can run *ahead* of the encoder, in
+        # both service modes and for the same reason: it is the mode that decides
+        # which audio the model sees.  Streaming needs ``stream`` on top, because
+        # there it has to reach that verdict incrementally.
+        if vad.mode == "segment":
+            roles = ("presegment", "stream") if streaming else ("presegment",)
+        else:
+            roles = ("stream",) if streaming else ("posthoc",)
+        for role in roles:
+            if spec.can(role):
+                continue
             raise ValueError(
                 f"vad.backend={vad.backend!r} declares roles {list(spec.modes)}, "
                 f"which does not include {role!r} — what a "
                 f"{config.service_mode} engine in vad.mode={vad.mode!r} needs. "
                 + (
                     "An ASR-derived detector reads what the encoder produced, so "
-                    "it cannot segment audio before the encoder sees it; "
-                    "configure a waveform detector such as 'energy'."
+                    "it cannot decide what the encoder sees; configure a waveform "
+                    "detector such as 'energy'."
                     if spec.is_asr_derived and role == "presegment"
                     else "Pick a detector that declares it."
                 )
@@ -797,20 +812,35 @@ class ASREngine:
         resolved_cfg = vad.resolve(config.service_mode)
         if streaming and vad.emits_events:
             clock = getattr(strategy, "_clock", None)
-            if clock is None:
-                # Same refusal as word timings, for the same reason: a detector
-                # fed a guessed frame rate reports boundaries that are plausible
-                # and uniformly wrong by a constant factor.
-                raise ValueError(
-                    f"vad.mode={vad.mode!r} needs the encoder frame rate, which "
-                    f"decode_method={decode_method!r} cannot resolve (no feature "
-                    "config or no declared subsampling). Speech-activity times "
-                    "would be scaled by an unknown constant."
+            if spec.is_asr_derived:
+                if clock is None:
+                    # Same refusal as word timings, for the same reason: a detector
+                    # fed a guessed frame rate reports boundaries that are plausible
+                    # and uniformly wrong by a constant factor.
+                    raise ValueError(
+                        f"vad.mode={vad.mode!r} needs the encoder frame rate, which "
+                        f"decode_method={decode_method!r} cannot resolve (no feature "
+                        "config or no declared subsampling). Speech-activity times "
+                        "would be scaled by an unknown constant."
+                    )
+                stage_spf = clock.seconds_per_frame
+                # An ASR-derived detector's tensor is produced on the engine's
+                # device and is large; keeping the detector beside it is free.
+                stage_device = torch.device(vad.device or config.device)
+            else:
+                stage_spf = spec.framing_for(resolved_cfg).seconds_per_frame(
+                    resolved_cfg.sample_rate
                 )
+                # A waveform detector reads the audio, which arrives on the host.
+                # Sending it to the GPU costs an H2D plus the device→host read of
+                # its own answer — a synchronisation per tick, inside the step
+                # loop, for a couple of pooling ops.  The offline splitter defaults
+                # to CPU for the same reason; ``vad.device`` overrides both.
+                stage_device = torch.device(vad.device or "cpu")
             self._vad_stage = StreamingVadStage(
                 resolved_cfg,
-                seconds_per_frame=clock.seconds_per_frame,
-                device=torch.device(vad.device or config.device),
+                seconds_per_frame=stage_spf,
+                device=stage_device,
                 detector_kwargs=strategy.speech_activity_kwargs(),
             )
         # The frame rate is the detector's, not the config's: an ASR-derived
@@ -1314,6 +1344,13 @@ class ASREngine:
         )
         with self._lock:
             self._validate_mode(True)
+            # Same check the batched and single-shot paths already make.  Without
+            # it the *documented* way to open a stream accepted per-request
+            # options the running family cannot act on and answered with a
+            # transcript of something else — and the refusal has to land here,
+            # at open, rather than after the client has been told the stream is
+            # live and has started sending audio.
+            self._validate_decoding(req)
             self._executor.admit(req)
         return req.request_id
 

@@ -13,13 +13,18 @@ three components:
   that rewritten.
 * **streaming** — :class:`StreamingVadStage` holds one segmenter and one
   endpointer per live stream and advances them from whatever per-frame signal
-  the tick produced.
+  the tick produced.  Which signal that is decides where the stage sits: an
+  ASR-derived detector is fed the encoder's output and therefore runs *behind*
+  the encoder, so it can label audio and end a turn but never decide what gets
+  encoded; a waveform detector is fed the audio as it arrives and runs *ahead* of
+  it, which is what makes :meth:`StreamingVadStage.should_encode` a gate rather
+  than a report.  ``vad.mode="segment"`` is the mode that uses the second.
 
-The offline splitter runs on **CPU by default**.  The detector that can
-pre-segment today is a few pooling ops over the waveform, so a device round trip
-buys nothing and costs a synchronisation on the admitting thread — which is the
-dispatcher thread, holding the GIL for every other in-flight request.  Set
-``VadConfig.device`` to move it once a detector exists that is worth the trip.
+Waveform detectors run on **CPU by default**, in both flows.  The one that can
+pre-segment today is a few pooling ops over audio that is already on the host, so
+a device round trip buys nothing and costs a synchronisation — on the admitting
+(dispatcher, GIL-holding) thread offline, and inside the step loop streaming.
+Set ``VadConfig.device`` to move it once a detector exists that is worth the trip.
 """
 
 from __future__ import annotations
@@ -37,8 +42,9 @@ from oasr.vad import (
     VadConfig,
     VadEvent,
     build_detector,
+    get_vad_spec,
 )
-from oasr.vad.detector import as_rows
+from oasr.vad.detector import VadState, as_rows
 
 logger = logging.getLogger(__name__)
 
@@ -107,17 +113,31 @@ class OfflineVadSegmenter:
 class StreamVadState:
     """One live stream's segmenter, endpointer and reporting clock."""
 
-    __slots__ = ("segmenter", "endpointer", "detector_state", "pending", "decision", "frames")
+    __slots__ = (
+        "segmenter",
+        "endpointer",
+        "detector_state",
+        "pending",
+        "decision",
+        "frames",
+        "carry",
+    )
 
     def __init__(self, segmenter: SpeechSegmenter, endpointer: Optional[Endpointer]) -> None:
         self.segmenter = segmenter
         self.endpointer = endpointer
-        self.detector_state = None
+        self.detector_state: Optional[VadState] = None
         #: Events produced this tick, drained by the executor into the output.
         self.pending: List[VadEvent] = []
         #: The endpoint decision this stream has reached, if any.
         self.decision: Optional[EndpointDecision] = None
         self.frames = 0
+        #: Waveform detectors only: the samples of the last chunk that did not
+        #: fill a whole analysis frame.  Dropping them instead would shorten the
+        #: stream by up to one frame per chunk, so a detector's clock would drift
+        #: away from the encoder's a few milliseconds at a time — the class of
+        #: error whose output stays entirely plausible.
+        self.carry: Optional[torch.Tensor] = None
 
 
 class StreamingVadStage:
@@ -130,9 +150,18 @@ class StreamingVadStage:
     per step once accounted for 21 % of the streaming step's wall clock before
     they became a single multi-tensor op.
 
-    Only ASR-derived detectors are wired here today, and they need no batching of
-    their own: the ASR has already produced one tensor for the whole cohort, so
-    this stage slices rather than gathers.
+    Two feeds, chosen by the configured detector's declared ``consumes``:
+
+    * an **ASR-derived** detector is advanced from the tick's encoder output
+      (:meth:`advance_from_map`).  It needs no batching of its own — the ASR has
+      already produced one tensor for the whole cohort, so this stage slices
+      rather than gathers.  It runs *after* the encoder, so it can label audio
+      and end a turn but can never decide what the encoder sees.
+    * a **waveform** detector is advanced from the audio as it is fed
+      (:meth:`advance_audio`), which puts it *ahead* of the encoder and is what
+      makes :meth:`should_encode` a real gate.  That is the second half of the
+      pairing every production system ships: a cheap pre-ASR detector deciding
+      what to encode, and an ASR-derived one deciding when a turn ended.
     """
 
     def __init__(
@@ -150,6 +179,38 @@ class StreamingVadStage:
             config, device=device, seconds_per_frame=seconds_per_frame, **(detector_kwargs or {})
         )
         self._states: Dict[str, StreamVadState] = {}
+        #: Audio fed but not yet classified, per stream.  Keyed independently of
+        #: ``_states`` because a whole-waveform streaming request is fed at
+        #: ``admit`` time, which is before the scheduler promotes it and
+        #: therefore before :meth:`open` runs.
+        self._audio: Dict[str, List[torch.Tensor]] = {}
+        spec = get_vad_spec(str(config.backend))
+        self._consumes = spec.consumes
+        self._stateful = spec.stateful
+        self._pad_s = float(config.speech_pad_ms or 0) / 1000.0
+        if self.needs_audio:
+            framing = self._detector.framing
+            if framing is None:
+                raise ValueError(
+                    f"vad backend={config.backend!r} consumes a waveform but reports no "
+                    "framing, so the stage cannot tell how many samples one frame "
+                    "consumed and would drift against the encoder's clock"
+                )
+            if framing.history or framing.prefill:
+                # The carry rule below keeps ``buf[frames * hop:]``, which is only
+                # the untouched remainder when frames start at multiples of the
+                # hop from the buffer's front.  A detector with leading context
+                # needs a different rule, and guessing one would misalign every
+                # boundary it reports.
+                raise NotImplementedError(
+                    f"vad backend={config.backend!r} declares history/prefill framing, "
+                    "which the incremental waveform feed does not carry yet"
+                )
+            self._hop = int(framing.hop)
+            self._min_samples = int(framing.min_samples)
+        else:
+            self._hop = 0
+            self._min_samples = 0
 
     @property
     def detector(self):
@@ -158,6 +219,26 @@ class StreamingVadStage:
     @property
     def seconds_per_frame(self) -> float:
         return self._detector.seconds_per_frame
+
+    @property
+    def consumes(self) -> str:
+        """What this stage's detector is fed — ``"waveform"`` or an ASR tensor."""
+        return self._consumes
+
+    @property
+    def needs_audio(self) -> bool:
+        """Whether the executor must tee the fed waveform into this stage."""
+        return self._consumes == "waveform"
+
+    @property
+    def gates_encoder(self) -> bool:
+        """Whether this stage decides which encoder windows actually run."""
+        return self._cfg.gates_encoder
+
+    @property
+    def pad_seconds(self) -> float:
+        """``speech_pad_ms`` in seconds — the gate's margin on both sides."""
+        return self._pad_s
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -187,11 +268,14 @@ class StreamingVadStage:
         wants_endpoint = endpoint or cfg.endpoints
         endpointer = Endpointer(cfg, self.seconds_per_frame) if wants_endpoint else None
         state = StreamVadState(segmenter, endpointer)
+        if self._stateful:
+            state.detector_state = self._detector.new_state(1)
         self._states[request_id] = state
         return state
 
     def close(self, request_id: str) -> None:
         self._states.pop(request_id, None)
+        self._audio.pop(request_id, None)
 
     def state(self, request_id: str) -> Optional[StreamVadState]:
         return self._states.get(request_id)
@@ -235,19 +319,10 @@ class StreamingVadStage:
             row = rows[index]
             if not row:
                 continue
-            state.frames += len(row)
-            events = state.segmenter.push(row)
-            if events:
-                state.pending.extend(events)
-                if state.endpointer is not None:
-                    for event in events:
-                        if event.kind == "speech_started":
-                            state.endpointer.note_speech_started()
-            if state.endpointer is not None and state.decision is None:
-                flag = None
-                if decoded_any is not None and index < len(decoded_any):
-                    flag = bool(decoded_any[index])
-                state.decision = state.endpointer.push(row, decoded_any=flag)
+            flag = None
+            if decoded_any is not None and index < len(decoded_any):
+                flag = bool(decoded_any[index])
+            self._consume_row(state, row, flag)
 
     def advance_from_map(
         self,
@@ -282,6 +357,152 @@ class StreamingVadStage:
             batch = torch.cat([tensor_map[rid] for rid in ids], dim=0)
             lengths = torch.full((len(ids),), width, dtype=torch.int64, device=batch.device)
             self.advance(ids, batch, lengths)
+
+    # -- waveform feed (the pre-encoder gate) --------------------------------
+
+    def feed_audio(self, request_id: str, chunk: Any) -> None:
+        """Tee one fed audio chunk to this stage.
+
+        Called from the executor's two ingestion points rather than from the
+        input processor, which has no business knowing about voice activity.
+        Holds a **reference**, not a copy: the same tensor is already queued for
+        feature extraction, and it is released one tick later when
+        :meth:`advance_audio` consumes it.
+        """
+        if not self.needs_audio:
+            return
+        wave = torch.as_tensor(chunk, dtype=torch.float32).reshape(-1)
+        if wave.numel() == 0:
+            return
+        self._audio.setdefault(request_id, []).append(wave.to("cpu", copy=False))
+
+    def advance_audio(self, requests: Sequence[object]) -> None:
+        """Classify every stream's newly fed audio in one batched detector call.
+
+        Runs at the top of the tick, ahead of the encoder, so the gate has a
+        verdict for the window the encoder is about to be handed.  Streams whose
+        buffer does not yet hold a whole analysis frame keep it as carry rather
+        than being called with nothing — a zero-frame row still costs a column in
+        the padded batch.
+        """
+        if not self.needs_audio:
+            return
+        ids: List[str] = []
+        states: List[StreamVadState] = []
+        buffers: List[torch.Tensor] = []
+        for request in requests:
+            request_id = getattr(request, "request_id", None)
+            if request_id is None:
+                continue
+            state = self._states.get(request_id)
+            if state is None:
+                continue
+            chunks = self._audio.pop(request_id, None)
+            parts: List[torch.Tensor] = []
+            if state.carry is not None and state.carry.numel():
+                parts.append(state.carry)
+            if chunks:
+                parts.extend(chunks)
+            if not parts:
+                continue
+            buf = parts[0] if len(parts) == 1 else torch.cat(parts)
+            state.carry = buf
+            if buf.numel() < self._min_samples:
+                continue
+            ids.append(request_id)
+            states.append(state)
+            buffers.append(buf)
+        if not ids:
+            return
+
+        widest = max(int(b.numel()) for b in buffers)
+        batch = torch.zeros(len(buffers), widest, dtype=torch.float32)
+        for slot, buf in enumerate(buffers):
+            batch[slot, : buf.numel()] = buf
+        lengths = torch.tensor([int(b.numel()) for b in buffers], dtype=torch.int64)
+        batch = batch.to(self._device)
+        lengths = lengths.to(self._device)
+
+        stacked = self._detector.stack_states([st.detector_state for st in states])
+        probs, frame_lengths, new_state = self._detector.detect_streaming(batch, lengths, stacked)
+        rows = as_rows(probs, frame_lengths)
+        per_stream = self._detector.unstack_states(new_state, len(states))
+
+        for index, state in enumerate(states):
+            state.detector_state = per_stream[index]
+            row = rows[index] if index < len(rows) else []
+            consumed = len(row) * self._hop
+            buf = buffers[index]
+            # ``clone``, not a view: the remainder is under one analysis window
+            # wide, but a slice of ``buf`` keeps the *whole* concatenated buffer's
+            # storage alive — which for a stream fed a complete waveform at
+            # admission is the entire utterance, held for the life of the stream.
+            state.carry = buf[consumed:].clone() if consumed else buf
+            if row:
+                self._consume_row(state, row)
+
+    @staticmethod
+    def _consume_row(
+        state: StreamVadState, row: Sequence[float], decoded_any: Optional[bool] = None
+    ) -> None:
+        """Push one stream's new probabilities through its policy state.
+
+        Shared by both feeds, so an ASR-derived trace and a waveform trace reach
+        the same state machine by the same route — which is the whole reason the
+        segmenter and the endpointer are detector-agnostic.
+        """
+        state.frames += len(row)
+        events = state.segmenter.push(row)
+        if events:
+            state.pending.extend(events)
+            if state.endpointer is not None:
+                for event in events:
+                    if event.kind == "speech_started":
+                        state.endpointer.note_speech_started()
+        if state.endpointer is not None and state.decision is None:
+            state.decision = state.endpointer.push(row, decoded_any=decoded_any)
+
+    def classified_until(self, request_id: str) -> float:
+        """Audio seconds of this stream the detector has actually judged."""
+        state = self._states.get(request_id)
+        return 0.0 if state is None else state.segmenter.elapsed
+
+    def turn_boundary(self, request_id: str) -> Optional[float]:
+        """Session time after which audio belongs to a **new** turn, or ``None``.
+
+        The end of the last confirmed speech run plus the segment padding.  It is
+        deliberately not the same question :meth:`should_encode` answers: a turn
+        boundary is a fact about audio the detector has already judged, so it can
+        be acted on however far behind the encoder happens to be, while a skip
+        needs the verdict *before* the encoder is dispatched.  Separating them is
+        what makes ``segment`` mode do something useful on a real-time stream,
+        where the encoder keeps pace with the audio and there is never enough
+        lookahead to skip: the silence still gets encoded, but the turn still
+        closes, so the KV cache stops growing and the next turn starts clean.
+        """
+        state = self._states.get(request_id)
+        if state is None:
+            return None
+        end = state.segmenter.last_segment_end
+        return None if end is None else end + self._pad_s
+
+    def should_encode(self, request_id: str, start_s: float, end_s: float) -> bool:
+        """Whether the encoder window covering ``[start_s, end_s)`` must run.
+
+        Two conditions, and the order matters.  The window is encoded unless the
+        detector has already classified past its far edge *and* nothing in it —
+        widened by ``speech_pad_ms`` on both sides — is speech.  An unclassified
+        window is therefore always encoded, which is the only safe direction for
+        this gate: encoding silence costs time, dropping speech costs words, and
+        the two mistakes are not comparable.
+        """
+        state = self._states.get(request_id)
+        if state is None:
+            return True
+        pad = self._pad_s
+        if state.segmenter.elapsed < end_s + pad:
+            return True
+        return state.segmenter.overlaps_speech(start_s - pad, end_s + pad)
 
     def endpointed(self, request_id: str) -> Optional[EndpointDecision]:
         """This stream's endpoint decision, if it has reached one."""

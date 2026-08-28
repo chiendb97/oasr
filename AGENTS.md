@@ -77,10 +77,17 @@ model.
     `req.offset` only on a forward, and `cache_t1` derives from it. Skipping a
     silent chunk tells the encoder "this immediately follows the last one", so
     non-adjacent audio is spliced at contiguous relative positions and the conv
-    cache carries left context across a gap that no longer exists. This is why
-    `vad.mode="segment"` is offline-only; the reset primitive is a separate
-    change. Same family as rules 10 and 11: a silent state error whose output
-    stays plausible.
+    cache carries left context across a gap that no longer exists. The primitive
+    that makes it sound is `StreamingEncoderBackend.reset`, which rewinds
+    *both* halves in one call — halving it is the trap, because either half
+    alone still produces a transcript. `vad.mode="segment"` in streaming is the
+    only caller; a reset also cuts the decoder's context, so the turn is closed
+    and folded into the stream's running transcript, and the *model* clock
+    (`req.offset`) restarts while the *reporting* clock
+    (`req.stream_time_offset`) does not. Same family as rules 10 and 11: a silent
+    state error whose output stays plausible. Pinned bit-exactly, against a fresh
+    stream fed the same chunks, by
+    `tests/test_streaming_backend.py::TestBackendReset`.
 14. **A speech detector declares what its signal can resolve.** The ASR-derived
     signals are peaky — measured on read speech, only ~15 % of CTC frames clear
     `p=0.5` and in-word blank runs reach 840 ms — so

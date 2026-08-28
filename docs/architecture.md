@@ -295,12 +295,19 @@ reference implementation.
      **refuses** a spec that claims `presegment` with an ASR-derived `consumes`,
      at registration rather than at first request;
    * `modes` is the role set (`presegment` / `stream` / `posthoc`), checked
-     against the engine's service mode and `vad.mode` at construction;
+     against the engine's service mode and `vad.mode` at construction — a
+     streaming `vad.mode="segment"` needs `presegment` *and* `stream`, because
+     there the detector has to decide what the encoder sees, incrementally;
    * `min_silence_floor_ms` is the shortest silence the signal can distinguish
      from its own sparsity. The ASR-derived signals are peaky, and without this
      the streaming preset's 100 ms would be applied to a spike train.
 3. A detector with a *trained* window declares its own `framing`; one whose grid
    is the encoder's leaves it `None` and is told `seconds_per_frame`.
+4. A detector that carries state across chunks sets `stateful` and implements
+   `detect_streaming` plus `stack_states` / `unstack_states`. The last pair is
+   what keeps the streaming stage's detector call **batched across the pool**:
+   the stage holds N opaque per-stream states and only the detector knows how to
+   lay them out as a batch — the same protocol the transducer predictor uses.
 
 The segmenter and the endpointer are **not** part of the axis — they are shared
 policy, so every detector produces the same segment semantics, the same knobs and

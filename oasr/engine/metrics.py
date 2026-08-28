@@ -75,9 +75,10 @@ AUDIO_SECONDS = "oasr_engine_audio_seconds_total"
 #: where the decision is made, because nothing downstream can tell the two apart
 #: from the transcript alone.
 ENDPOINTS = "oasr_engine_endpoints_total"
-#: Speech spans the segmenter emitted, and the audio seconds the offline
-#: splitter dropped.  The pair is the honest report of what VAD bought: the
-#: second number is encoder work that did not happen.
+#: Speech spans ``vad.mode="segment"`` cut a request into — offline children or
+#: streaming turns — and the audio seconds it dropped.  The pair is the honest
+#: report of what VAD bought: the second number is encoder work that did not
+#: happen.
 VAD_SEGMENTS = "oasr_engine_vad_segments_total"
 AUDIO_SECONDS_SKIPPED = "oasr_engine_audio_seconds_skipped_total"
 SAMPLES_DROPPED = "oasr_engine_metric_samples_dropped_total"

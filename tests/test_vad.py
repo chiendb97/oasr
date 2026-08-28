@@ -199,11 +199,55 @@ class TestEnergyDetector:
         tail = probs[0, int(frame_lengths[0]) :]
         assert float(tail.abs().max() if tail.numel() else torch.zeros(1).max()) == 0.0
 
-    def test_it_declares_no_streaming_role(self):
-        """Incremental waveform detection needs a per-stream sample buffer that
-        does not exist yet.  Declaring the gap makes a streaming engine
-        configured this way fail at construction naming it."""
-        assert not get_vad_spec("energy").can("stream")
+    def build(self, **kw):
+        return self.detector(**kw)[1]
+
+    def test_it_declares_every_role(self):
+        """It runs on the audio, so it can precede the encoder in either flow —
+        and it carries state, so it can do that incrementally."""
+        spec = get_vad_spec("energy")
+        assert spec.can("presegment") and spec.can("stream") and spec.can("posthoc")
+        assert spec.stateful, "the running peak has to survive a chunk boundary"
+
+    def test_streaming_matches_one_shot_once_the_peak_is_established(self):
+        """The carried state is what makes the two flows agree.
+
+        Without it each chunk is normalised against *its own* loudest frame, so a
+        chunk of room tone reads as a chunk of speech — the failure a single-chunk
+        test cannot see, because with one chunk the two forms are identical.
+        """
+        det = self.build()
+        torch.manual_seed(0)
+        wav = torch.cat([torch.randn(16000) * 0.5, torch.randn(16000) * 1e-4])
+        one_shot, lengths = det.detect(wav.unsqueeze(0), torch.tensor([wav.numel()]))
+        expect = one_shot[0].tolist()
+
+        hop = det.framing.hop
+        state, got, buf = None, [], torch.zeros(0)
+        for start in range(0, wav.numel(), 4000):  # a chunk size that is not a frame multiple
+            buf = torch.cat([buf, wav[start : start + 4000]])
+            probs, frames, state = det.detect_streaming(
+                buf.unsqueeze(0), torch.tensor([buf.numel()]), state
+            )
+            n = int(frames[0])
+            got.extend(probs[0, :n].tolist())
+            buf = buf[n * hop :]
+
+        assert len(got) == len(expect) == int(lengths[0])
+        # The tail, where the running peak has caught up with the utterance peak.
+        assert max(abs(a - b) for a, b in zip(expect[100:], got[100:])) < 1e-5
+        # And the quiet half really is quiet, in both forms.
+        assert max(got[-50:]) < 0.05
+
+    def test_a_chunk_of_pure_silence_does_not_reset_the_reference(self):
+        """The regression the carried peak exists to prevent."""
+        det = self.build()
+        torch.manual_seed(1)
+        loud = (torch.randn(8000) * 0.5).unsqueeze(0)
+        _, _, state = det.detect_streaming(loud, torch.tensor([8000]), None)
+        quiet = (torch.randn(8000) * 1e-4).unsqueeze(0)
+        probs, frames, _ = det.detect_streaming(quiet, torch.tensor([8000]), state)
+        assert probs[0, : int(frames[0])].max().item() < 0.05
 
 
 class TestAsrDerivedDetectors:
@@ -333,7 +377,7 @@ class TestEngineResolution:
         from oasr.engine import ASREngine
 
         cfg = self.config(ckpt_dir, vad={"mode": "segment", "backend": "ctc_blank"})
-        with pytest.raises(ValueError, match="cannot segment audio before the encoder"):
+        with pytest.raises(ValueError, match="cannot decide what the encoder sees"):
             ASREngine(cfg)
 
     def test_endpoint_mode_is_refused_offline(self, ckpt_dir):
@@ -361,15 +405,52 @@ class TestEngineResolution:
         ASREngine(cfg)
         assert cfg.vad.min_silence_ms == get_vad_spec("ctc_blank").min_silence_floor_ms
 
-    def test_streaming_segment_mode_names_the_reason_it_is_unavailable(self, ckpt_dir):
-        """Skipping a chunk tells the encoder the next one follows it, splicing
-        non-adjacent audio at contiguous positions (AGENTS.md rule 13)."""
+    def test_streaming_segment_mode_refuses_the_family_detector(self, ckpt_dir):
+        """ "auto" resolves to the family's own signal, which is produced by the
+        stage it would have to precede.  The refusal names the alternative."""
         from oasr.engine import ASREngine
 
         cfg = self.config(
             ckpt_dir, service_mode="streaming", max_num_blocks=256, vad={"mode": "segment"}
         )
-        with pytest.raises(NotImplementedError, match="offline-only"):
+        with pytest.raises(ValueError, match="cannot decide what the encoder sees"):
+            ASREngine(cfg)
+
+    def test_streaming_segment_mode_accepts_a_waveform_detector(self, ckpt_dir):
+        """The P4 capability: a detector that runs ahead of the encoder can gate it."""
+        from oasr.engine import ASREngine
+
+        cfg = self.config(
+            ckpt_dir,
+            service_mode="streaming",
+            max_num_blocks=256,
+            vad={"mode": "segment", "backend": "energy"},
+        )
+        engine = ASREngine(cfg)
+        try:
+            stage = engine._vad_stage
+            assert stage is not None and stage.needs_audio and stage.gates_encoder
+            # The segmentation preset, not the turn-taking one: this is the mode
+            # that drops audio, so it wants faster-whisper's padding.
+            assert cfg.vad.resolve("streaming").preset == "segment"
+            # And on the host, where the audio already is.
+            assert stage._device.type == "cpu"
+        finally:
+            engine.shutdown()
+
+    def test_streaming_segment_mode_refuses_overlapped_partial_readback(self, ckpt_dir):
+        """A partial issued against the closed turn would be collected against
+        the next one, under the same stream id."""
+        from oasr.engine import ASREngine
+
+        cfg = self.config(
+            ckpt_dir,
+            service_mode="streaming",
+            max_num_blocks=256,
+            overlap_partial_readback=True,
+            vad={"mode": "segment", "backend": "energy"},
+        )
+        with pytest.raises(ValueError, match="overlap_partial_readback"):
             ASREngine(cfg)
 
     def test_a_waveform_detector_offline_without_segment_mode_is_refused(self, ckpt_dir):

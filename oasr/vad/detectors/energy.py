@@ -27,16 +27,16 @@ usable at all.
 from __future__ import annotations
 
 import math
-from typing import Any, ClassVar, Optional, Tuple
+from typing import Any, ClassVar, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from ..config import VadConfig
-from ..detector import SpeechDetector
+from ..detector import SpeechDetector, VadState
 from ..registry import VadFraming
 
-__all__ = ["EnergyDetector", "energy_framing"]
+__all__ = ["EnergyDetector", "EnergyVadState", "energy_framing"]
 
 #: Mean-square power at or below which a row is called digital silence outright.
 #: Without this the peak-relative rule inverts on an all-zero row: the peak is
@@ -54,6 +54,35 @@ def energy_framing(config: VadConfig) -> VadFraming:
     span = max(1, int(round(config.sample_rate * config.frame_ms / 1000.0)))
     hop = max(1, int(round(config.sample_rate * config.hop_ms / 1000.0)))
     return VadFraming(span=span, hop=hop)
+
+
+class EnergyVadState(VadState):
+    """Per-stream running peak power, one entry per row of the current call.
+
+    The peak-relative rule needs a reference loudness, and offline that is the
+    utterance's own maximum.  A stream has no utterance to take a maximum over
+    until it ends, so the reference is the loudest frame **seen so far** and it
+    only ever grows.  Two consequences worth stating, because both are visible in
+    the output rather than in a log:
+
+    * the first chunks of a stream are judged against a peak that has not been
+      established yet, so a stream that opens on room tone reads as speech and is
+      *encoded*.  That is the safe direction — the gate's failure mode must be
+      doing work, never dropping audio.
+    * a stream with one loud burst raises the bar for everything after it, so
+      genuinely quieter speech more than ``dynamic_range_db`` below that burst
+      reads as silence.  This is the documented failure of every energy VAD
+      (Kaldi says as much in ``compute-vad``'s own header) and the reason a
+      neural detector is the eventual answer here.
+    """
+
+    __slots__ = ("peak",)
+
+    def __init__(self, peak: torch.Tensor) -> None:
+        #: ``(B, 1)`` mean-square power, aligned with the rows of the call that
+        #: produced it.  The stage that owns the streams scatters it back per
+        #: stream, because batch membership changes from tick to tick.
+        self.peak = peak
 
 
 class EnergyDetector(SpeechDetector):
@@ -101,9 +130,28 @@ class EnergyDetector(SpeechDetector):
     def framing(self) -> VadFraming:
         return self._framing
 
-    def detect(
+    def new_state(self, batch: int) -> EnergyVadState:
+        """A peak of zero, which reads as "nothing loud seen yet"."""
+        return EnergyVadState(torch.zeros(batch, 1, dtype=torch.float32, device=self._device))
+
+    def stack_states(self, states: Sequence[Optional[VadState]]) -> EnergyVadState:
+        peaks = []
+        for st in states:
+            if isinstance(st, EnergyVadState):
+                peaks.append(st.peak.reshape(1, 1))
+            else:
+                peaks.append(torch.zeros(1, 1, dtype=torch.float32, device=self._device))
+        return EnergyVadState(torch.cat(peaks, dim=0))
+
+    def unstack_states(self, state: Optional[VadState], count: int) -> List[Optional[VadState]]:
+        if not isinstance(state, EnergyVadState):
+            return [self.new_state(1) for _ in range(count)]
+        return [EnergyVadState(state.peak[i : i + 1]) for i in range(count)]
+
+    def _frame_power(
         self, waveform: torch.Tensor, lengths: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(B, T)`` waveform → ``(power (B, F), frame_lengths (B,), valid (B, F))``."""
         if waveform.ndim == 1:
             waveform = waveform.unsqueeze(0)
         if waveform.ndim != 2:
@@ -121,7 +169,11 @@ class EnergyDetector(SpeechDetector):
 
         if wav.size(1) < span:
             empty = wav.new_zeros(batch, 0)
-            return empty, torch.zeros(batch, dtype=torch.int64, device=device)
+            return (
+                empty,
+                torch.zeros(batch, dtype=torch.int64, device=device),
+                empty.to(torch.bool),
+            )
 
         # avg_pool1d over the squared signal rather than ``unfold``: unfold
         # materialises (B, F, span), which for one 30 s utterance is 1.2 M floats
@@ -132,17 +184,61 @@ class EnergyDetector(SpeechDetector):
 
         n_frames = power.size(1)
         valid = torch.arange(n_frames, device=device).unsqueeze(0) < frame_lengths.unsqueeze(1)
-        # Padding is excluded from the peak, or the batch's widest row would set
-        # every shorter row's threshold.
-        peak = power.masked_fill(~valid, 0.0).amax(dim=1, keepdim=True)
-        silent_row = peak <= _SILENCE_POWER_FLOOR
+        return power, frame_lengths, valid
 
+    def _probs_from_power(
+        self, power: torch.Tensor, frame_lengths: torch.Tensor, peak: torch.Tensor
+    ) -> torch.Tensor:
+        """Peak-relative logistic over frame power, given a ``(B, 1)`` reference."""
+        silent_row = peak <= _SILENCE_POWER_FLOOR
         floor = _SILENCE_POWER_FLOOR * 1e-2
         log_e = torch.log(power.clamp_min(floor))
         threshold = torch.log(peak.clamp_min(floor)) - self._dyn_nats
         probs = torch.sigmoid((log_e - threshold) * self._slope)
         probs = torch.where(silent_row.expand_as(probs), torch.zeros_like(probs), probs)
-        return self._mask_padding(probs, frame_lengths), frame_lengths
+        return self._mask_padding(probs, frame_lengths)
+
+    def detect(
+        self, waveform: torch.Tensor, lengths: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        power, frame_lengths, valid = self._frame_power(waveform, lengths)
+        if power.size(1) == 0:
+            return power, frame_lengths
+        # Padding is excluded from the peak, or the batch's widest row would set
+        # every shorter row's threshold.
+        peak = power.masked_fill(~valid, 0.0).amax(dim=1, keepdim=True)
+        return self._probs_from_power(power, frame_lengths, peak), frame_lengths
+
+    def detect_streaming(
+        self,
+        waveform: torch.Tensor,
+        lengths: torch.Tensor,
+        state: Optional[VadState],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[VadState]]:
+        """One chunk per row, against a peak carried across chunks.
+
+        The base class routes ``detect_streaming`` to ``detect``, and for this
+        detector that would be wrong in a way no unit test on a single chunk can
+        see: each chunk would be normalised against *its own* loudest frame, so a
+        chunk of pure room tone would read as a chunk of pure speech.  Carrying
+        the peak is what makes the two flows agree; the running maximum is the
+        only state, and :class:`EnergyVadState` documents what it costs.
+        """
+        power, frame_lengths, valid = self._frame_power(waveform, lengths)
+        prev = state.peak if isinstance(state, EnergyVadState) else None
+        if power.size(1) == 0:
+            # Nothing to measure — hand the reference straight back rather than
+            # dropping it, or the next chunk would restart from its own peak.
+            if prev is None:
+                prev = power.new_zeros(power.size(0), 1)
+            return power, frame_lengths, EnergyVadState(prev)
+        chunk_peak = power.masked_fill(~valid, 0.0).amax(dim=1, keepdim=True)
+        peak = chunk_peak if prev is None else torch.maximum(prev.to(chunk_peak), chunk_peak)
+        return (
+            self._probs_from_power(power, frame_lengths, peak),
+            frame_lengths,
+            EnergyVadState(peak),
+        )
 
 
 def build_energy(

@@ -199,6 +199,30 @@ class DecodeStrategy(ABC):
                     "remove it, or serve a checkpoint whose decode family does "
                     f"(supported here: {list(self.selective_options) or 'none'})"
                 )
+        self._reject_nbest_across_turns(options, streaming)
+
+    def _reject_nbest_across_turns(self, options: "DecodingOptions", streaming: bool) -> None:
+        """Refuse n-best on a stream that will be cut into turns.
+
+        ``vad.mode="segment"`` resets the decoder at every confirmed silence, so
+        the stream's transcript is the concatenation of one hypothesis per turn.
+        Alternatives of independent turns do not compose into alternatives of the
+        stream — the same reason ``longform.py`` refuses to merge n-best across
+        windows — and a cross product would be worse than one hypothesis.  So the
+        request is refused rather than quietly answered with the last turn's
+        alternatives, which is what a caller would otherwise receive.
+        """
+        if not streaming or int(getattr(options, "n_best", 1) or 1) <= 1:
+            return
+        vad = getattr(self._config, "vad", None)
+        if vad is None or not getattr(vad, "gates_encoder", False):
+            return
+        raise ValueError(
+            "n_best > 1 cannot be served with vad.mode='segment': the stream is "
+            "decoded as a sequence of turns and alternatives of separate turns do "
+            "not compose into alternatives of the stream. Ask for one hypothesis, "
+            "or run the engine in vad.mode='observe' or 'endpoint'."
+        )
 
     def _require_word_timings(self, streaming: bool) -> None:
         """Raise unless this family can align in the mode the request will run in."""

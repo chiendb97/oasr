@@ -320,8 +320,11 @@ class RequestOutput:
         window, and OpenAI's own gate needs a second condition on
         ``avg_logprob`` before it is usable at all.
     endpoint_reason : str, optional
-        Which endpoint rule ended this turn (``"rule1"``..``"ruleN"``, or a
-        timeout name).  ``None`` when the turn ended because the audio did.
+        Why this turn ended: ``"rule1"``..``"ruleN"`` for a clause of the
+        endpointer's disjunction, a timeout name, or ``"vad_segment"`` on the
+        interim output that closes a ``vad.mode="segment"`` turn — the first two
+        end the *request*, the last one does not.  ``None`` when the turn ended
+        because the audio did.
     """
 
     request_id: str
@@ -416,6 +419,14 @@ class Request:
         self.feature_frames: int = 0
         # Feature-frame index of the next encoder chunk's start.
         self.feature_cursor: int = 0
+        # Feature frames already dropped off the front of ``feature_buffer`` by
+        # compaction.  ``feature_base + feature_cursor`` is therefore the stream's
+        # **absolute** input-frame index, which ``feature_cursor`` alone is not:
+        # the extractor rebases the cursor to 0 whenever it drops a consumed
+        # prefix.  A speech-activity gate that has to ask "which seconds of this
+        # stream does the next encoder window cover" needs the absolute one, and
+        # deriving it from the cursor would silently restart at every compaction.
+        self.feature_base: int = 0
         # Flips to True when the final audio chunk has been enqueued (no
         # more audio will arrive).  Triggers fbank flush + last-window forward.
         self.audio_final: bool = False
@@ -443,8 +454,33 @@ class Request:
         # allocator raise mid-forward.
         self.cache_exhausted: bool = False
 
+        # --- Turn state (``vad.mode="segment"`` streaming only) -------------
+        # ``offset`` above is the *model* clock: it restarts at zero every time
+        # the stream is reset at a turn boundary, because that is what the
+        # encoder's positions and its ``cache_t1`` are relative to.  This is the
+        # *reporting* clock — the session second the current turn's encoder frame
+        # zero sits at — and it keeps accumulating, so a word in turn three is
+        # still timed from the start of the stream.  Getting these two backwards
+        # makes every turn after the first report timestamps starting at zero.
+        self.stream_time_offset: float = 0.0
+        #: Turns completed on this stream so far.
+        self.turn_index: int = 0
+        #: Transcript of the turns already closed, which the executor prepends to
+        #: every partial and to the final so a segmented stream still reads as one
+        #: growing transcript rather than one that shrinks at each boundary.
+        self.committed_text: str = ""
+        self.committed_tokens: List[int] = []
+        self.committed_timestamps: List[Tuple[float, float]] = []
+        self.committed_words: List["WordTiming"] = []
+        self.committed_confidences: List[float] = []
+
         # Final output
         self.output: Optional[RequestOutput] = None
+
+    @property
+    def has_committed_turns(self) -> bool:
+        """Whether at least one turn has already been closed on this stream."""
+        return self.turn_index > 0
 
     @property
     def is_finished(self) -> bool:

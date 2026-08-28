@@ -186,6 +186,14 @@ class ModelRunner:
         """Release the per-request encoder cache for a finished request."""
         self._streaming_backend.free(request)
 
+    def reset_stream(self, request: Request) -> None:
+        """Rewind a live stream's encoder cache and frame position (delegated).
+
+        Used at a ``vad.mode="segment"`` turn boundary, where the next chunk the
+        encoder sees is **not** the one after the last it saw.
+        """
+        self._streaming_backend.reset(request)
+
     def forward_streaming_step(self, requests: List[Request]) -> Dict[str, torch.Tensor]:
         """Run at most one encoder chunk per ready request (delegated)."""
         return self._streaming_backend.forward_step(requests)

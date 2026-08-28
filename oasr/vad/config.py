@@ -312,8 +312,27 @@ class VadConfig:
 
     @property
     def endpoints(self) -> bool:
-        """Whether this mode ends a turn on detected silence."""
-        return self.mode in ("endpoint", "segment")
+        """Whether this mode ends the **request** on detected silence.
+
+        ``"segment"`` is deliberately not in this set even though it also ends
+        turns.  The two do different things with the same detection: ``endpoint``
+        stops recognising and hands the client its result (Google's
+        ``single_utterance``), while ``segment`` closes the turn, resets the
+        encoder and keeps going on the same connection.  Folding them together
+        would make ``segment`` terminate every stream at its first pause.
+        """
+        return self.mode == "endpoint"
+
+    @property
+    def gates_encoder(self) -> bool:
+        """Whether this mode decides which audio the encoder sees.
+
+        True only for ``"segment"``, and it is the line that separates a mode
+        that *labels* audio from one that *drops* it: a detector serving this
+        mode has to run ahead of the encoder, and its mistakes cost transcript
+        rather than metadata.
+        """
+        return self.mode == "segment"
 
     def resolve(self, service_mode: str) -> "VadConfig":
         """Return a copy with every optional segmentation knob filled in.
@@ -324,8 +343,19 @@ class VadConfig:
         engine is doing turn-taking and wants Silero's short ones.  Getting this
         from the mode rather than from a single global default is the whole
         point of having two presets.
+
+        ``mode="segment"`` takes the segmentation preset in **either** service
+        mode, because it is the mode that drops audio and the padding is what
+        keeps a word onset out of the part that gets dropped.
         """
-        preset_name = self.preset or ("segment" if service_mode == "offline" else "turn")
+        # The preset follows what the VAD is *for*, not only where it runs:
+        # streaming ``segment`` drops audio the encoder never sees, so it wants
+        # faster-whisper's long silences and generous padding for exactly the
+        # reason faster-whisper does — clipping a word onset costs a word.  An
+        # observing or endpointing stream drops nothing and wants Silero's
+        # turn-taking numbers.
+        wants_segmentation = service_mode == "offline" or self.mode == "segment"
+        preset_name = self.preset or ("segment" if wants_segmentation else "turn")
         preset = PRESETS[preset_name]
         threshold = self.threshold if self.threshold is not None else preset["threshold"]
         neg = self.neg_threshold

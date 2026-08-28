@@ -466,6 +466,7 @@ class TestTaskAndLanguagePrompt:
             validate_options = DecodeStrategy.validate_options
             _require_word_timings = DecodeStrategy._require_word_timings
             _require_speech_activity = DecodeStrategy._require_speech_activity
+            _reject_nbest_across_turns = DecodeStrategy._reject_nbest_across_turns
 
         for opts in (DecodingOptions(task="translate"), DecodingOptions(language="fr")):
             with pytest.raises(ValueError, match="cannot honour"):

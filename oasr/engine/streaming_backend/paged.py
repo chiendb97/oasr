@@ -313,6 +313,29 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         request.stream_context = ctx
         return ctx
 
+    def reset(self, request: Request) -> None:
+        """Rewind the stream in place, keeping its slot.
+
+        The base class would ``free`` + ``allocate``, which works but hands the
+        stream a *different* slot: the KV block table, the CNN cache and the
+        feature staging are all persistent tensors addressed by slot row, and the
+        encoder-forward graphs were captured against those addresses.  Churning
+        the row at every turn boundary would also return and re-take a slot from
+        a pool sized exactly to ``max_batch_size``, so a reset could transiently
+        race an admission for it.
+
+        Blocks *are* returned to the pool, which is the reason to reset at the
+        start of a silence rather than at the end of it: a stream waiting out a
+        pause holds no KV.
+        """
+        sid = request.stream_id
+        assert sid is not None, "reset requires an admitted stream"
+        self._att_mgr.reset_stream(sid)
+        self._state_mgr.reset_stream(sid)
+        # The position half of rule 13.  ``cache_t1`` is derived from this, so
+        # leaving it would tell the encoder the new turn continues the old one.
+        request.offset = 0
+
     def free(self, request: Request) -> None:
         """Release all encoder cache resources for a finished streaming request."""
         # ``try/finally``: the slot must come back even if cache teardown

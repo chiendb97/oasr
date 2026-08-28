@@ -140,8 +140,12 @@ pub struct Cli {
     ///
     /// `observe` reports speech spans and events; `endpoint` additionally ends a
     /// streaming turn on silence, which is what makes the proto's
-    /// `single_utterance` mean something; `segment` cuts long offline audio at
-    /// speech boundaries so the silence between them never reaches the encoder.
+    /// `single_utterance` mean something; `segment` cuts audio at speech
+    /// boundaries so the silence between them never reaches the encoder —
+    /// offline by fanning the file out, streaming by skipping encoder chunks and
+    /// resetting the stream across the gap.  `segment` needs a detector that can
+    /// run ahead of the encoder (`--vad-backend energy`); the engine refuses the
+    /// combination at construction otherwise rather than silently labelling.
     #[arg(long)]
     pub vad_mode: Option<String>,
     /// Which detector to run.  Unset means "the running decode family's own"

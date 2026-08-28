@@ -78,6 +78,28 @@ class StreamingEncoderBackend(ABC):
         """
         raise NotImplementedError
 
+    def reset(self, request: Request) -> None:
+        """Return this stream's encoder cache and position to their initial state.
+
+        The primitive AGENTS.md rule 13 asks for.  Both backends assume every
+        chunk is contiguous in encoder-frame time — the paged one derives
+        ``cache_t1`` from ``request.offset``, which it advances only on a forward
+        — so advancing a stream past frames the encoder never saw is only sound
+        when the cache and the position go back to zero together.  That is why
+        both halves live in one call: a caller that reset the cache and forgot
+        the offset would splice the next chunk onto the old turn's positions, and
+        the transcript would stay plausible.
+
+        The default is ``free`` + ``allocate``, which is correct for any backend
+        whose ``allocate`` fully initialises a stream.  A backend that can rewind
+        in place should override — the paged one does, to keep its slot (and with
+        it the persistent rows a CUDA graph captured by address) rather than
+        taking a new one from the pool.
+        """
+        self.free(request)
+        self.allocate(request)
+        request.offset = 0
+
     # -- streaming window geometry (engine windows the feature buffer) -----
     @property
     @abstractmethod

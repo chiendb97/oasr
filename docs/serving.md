@@ -258,6 +258,14 @@ activity; without it they behave exactly as before. Full detail in
 | `GET /v1/realtime` | `turn_detection` in `session.update`; `input_audio_buffer.speech_started` / `.speech_stopped` / `.committed` |
 | gRPC `StreamingRecognize` | `single_utterance` is honoured, `enable_voice_activity_events` emits `SPEECH_ACTIVITY_BEGIN` / `_END`, and `END_OF_SINGLE_UTTERANCE` is finally sent |
 
+`--vad-mode segment --vad-backend energy` works in streaming as well as offline,
+and needs no new wire field: a turn boundary is already a `speech_stopped` event
+(`SPEECH_ACTIVITY_END` on gRPC, `input_audio_buffer.speech_stopped` on realtime),
+and the transcript keeps growing across it rather than restarting, so a client
+accumulating interims needs no change either. What the mode adds server-side is
+that the silence between turns is not encoded and the encoder cache is reset
+across it.
+
 Two things are rejected rather than ignored, and deliberately so. Per-session
 `turn_detection.threshold` / `prefix_padding_ms` and per-request
 `chunking_strategy` thresholds are **engine-level** settings here — a client

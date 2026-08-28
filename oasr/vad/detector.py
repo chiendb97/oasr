@@ -17,9 +17,12 @@ not a silent fallback.
 from __future__ import annotations
 
 from abc import ABC
-from typing import ClassVar, List, Optional, Tuple
+from typing import TYPE_CHECKING, ClassVar, List, Optional, Sequence, Tuple
 
 import torch
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .registry import VadFraming
 
 __all__ = ["SpeechDetector", "VadState", "as_rows"]
 
@@ -68,11 +71,41 @@ class SpeechDetector(ABC):
         """Audio seconds one output frame advances."""
         return self._seconds_per_frame
 
+    @property
+    def framing(self) -> Optional["VadFraming"]:
+        """The waveform grid this detector reads on, or ``None``.
+
+        ``None`` for every ASR-derived kind: its grid is the encoder's, which the
+        engine resolves from the running model.  A caller that has to slice a
+        sample buffer at frame boundaries — the streaming gate keeping the
+        sub-frame remainder between chunks — needs the real thing and must refuse
+        rather than assume one.
+        """
+        return None
+
     # -- per-stream state ---------------------------------------------------
 
     def new_state(self, batch: int) -> Optional[VadState]:
         """Fresh state for ``batch`` streams, or ``None`` when stateless."""
         return None
+
+    def stack_states(self, states: Sequence[Optional[VadState]]) -> Optional[VadState]:
+        """Combine one state per stream into one state for a batched call.
+
+        The batched twin of :meth:`unstack_states`, and the same protocol the
+        transducer predictor uses: the caller holds N opaque per-stream states,
+        the detector alone knows how to lay them out as a batch.  Without this
+        pair a stateful detector would have to be called once per stream, which
+        is the per-item-Python anti-pattern the whole batched stage exists to
+        avoid.  The default is stateless.
+        """
+        del states
+        return None
+
+    def unstack_states(self, state: Optional[VadState], count: int) -> List[Optional[VadState]]:
+        """Split a batched state back into ``count`` per-stream states."""
+        del state
+        return [None] * count
 
     # -- waveform detectors -------------------------------------------------
 

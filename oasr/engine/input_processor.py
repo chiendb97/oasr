@@ -663,6 +663,7 @@ class InputProcessor:
         request.feature_buffer = None
         request.feature_frames = 0
         request.feature_cursor = 0
+        request.feature_base = 0
 
     def append_streaming_chunk(
         self,
@@ -1159,6 +1160,12 @@ class InputProcessor:
             request.feature_buffer = new_buf
             buf = new_buf
             if drop_prefix:
+                # The cursor is rebased, so the frames it used to count move into
+                # ``feature_base``.  Their sum is the stream's absolute input-frame
+                # index, which is the only thing that can answer "which seconds of
+                # audio does the next encoder window cover" — the question the
+                # speech-activity gate asks before deciding to skip one.
+                request.feature_base += cursor
                 request.feature_cursor = 0
 
         dsts.append(buf[keep_n : keep_n + n_new])

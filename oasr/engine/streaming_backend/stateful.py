@@ -121,6 +121,12 @@ class StatefulStreamingBackend(StreamingEncoderBackend):
         # treat this stream as admitted.
         request.stream_context = None
 
+    # ``reset`` is the base class's ``free`` + ``allocate`` + ``offset = 0``, and
+    # that is already exactly right here: ``allocate`` re-seeds the whole state
+    # dict from the model's own initialiser and holds nothing else per stream, so
+    # there is no in-place rewind to be cheaper than it.  Overriding it to write
+    # the same two lines would only be a second copy to keep in step.
+
     def free(self, request: Request) -> None:
         sid = request.stream_id
         if sid is not None:

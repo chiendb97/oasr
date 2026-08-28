@@ -32,6 +32,11 @@ oasr-server --ckpt-dir $CKPT_DIR --service-mode streaming --vad-mode endpoint
 oasr-server --ckpt-dir $CKPT_DIR --service-mode offline \
     --vad-mode segment --vad-backend energy
 
+# Streaming: the same, chunk by chunk — a confirmed silence closes the turn,
+# resets the encoder, and (when the stream is backlogged) is not encoded at all.
+oasr-server --ckpt-dir $CKPT_DIR --service-mode streaming \
+    --vad-mode segment --vad-backend energy
+
 # Tune it.  Named flags select; `--vad-option k=v` tunes, so a new knob never
 # adds a flag — the same split as --decode-method / --decode-option.
 oasr-server ... --vad-mode endpoint --vad-option min_silence_ms=1500
@@ -69,10 +74,28 @@ blank posterior is that signal — the acoustic model has already decided the fa
 in the room is not a token.
 
 What an ASR-derived detector cannot do is run *before* the encoder, so it cannot
-drive offline segmentation. `register_vad` refuses a spec that claims otherwise,
-at registration; asking for `vad.mode="segment"` with one raises at engine
-construction naming the gap. Degrading to one whole-file segment would be
-indistinguishable, to a client, from audio that really was one long utterance.
+drive segmentation in either service mode. `register_vad` refuses a spec that
+claims otherwise, at registration; asking for `vad.mode="segment"` with one
+raises at engine construction naming the gap. Degrading to one whole-file segment
+would be indistinguishable, to a client, from audio that really was one long
+utterance.
+
+The two families are not alternatives, which is why both exist. Riva, FunASR's
+two-pass mode and sherpa-onnx all run a cheap pre-ASR detector *and* an
+ASR-derived in-decoder one: the first decides what to encode, the second decides
+when a turn ended. That is exactly the split here — `energy` gates the encoder in
+`vad.mode="segment"`, `ctc_blank` endpoints in `vad.mode="endpoint"`.
+
+The waveform detector carries a **running peak** across chunks in streaming
+rather than re-normalising each one against its own loudest frame, which would
+read a chunk of room tone as a chunk of speech. Two consequences are visible in
+the output: the opening chunks of a stream are judged against a reference that
+has not been established yet, so a stream that opens on room tone reads as speech
+and is *encoded* (the safe direction); and a stream with one loud burst raises
+the bar for everything after it, so speech more than `dynamic_range_db` below
+that burst reads as silence. That is the documented failure of every energy VAD —
+Kaldi says as much in `compute-vad`'s own header — and it is why a neural
+detector is the eventual answer.
 
 ### The peakiness floor
 
@@ -102,19 +125,90 @@ why the floor exists instead.
 |---|---|---|---|
 | `off` (default) | — | — | n/a; nothing runs |
 | `observe` | labels the audio | events + segments | yes |
-| `endpoint` | **refused** | ends the turn on silence | yes |
-| `segment` | cuts at speech boundaries | **not yet** | offline: no |
+| `endpoint` | **refused** | ends the **request** on silence | yes |
+| `segment` | cuts at speech boundaries | closes the **turn** on silence | no |
 
 `endpoint` is refused offline because an offline request already has exactly one
 utterance boundary: its end.
 
-`segment` is refused in streaming, and the reason is worth stating: both
-streaming backends assume every chunk is contiguous in encoder-frame time — the
-paged backend advances `req.offset` only on a forward, and `cache_t1` derives
-from it. Skipping a chunk tells the encoder "this immediately follows the last
-one", splicing non-adjacent audio at contiguous relative positions, with the
-convolution cache carrying left context across a gap that no longer exists. The
-reset primitive that would make it sound is a separate change.
+`endpoint` and `segment` both act on silence and are not variants of each other.
+`endpoint` stops recognising and hands the client its result — Google's
+`single_utterance` — so the stream ends. `segment` closes the turn, resets the
+encoder, and keeps going on the same connection; the client sees one transcript
+that keeps growing, with the turn structure reported as speech events and
+segments.
+
+### What `segment` does to a stream
+
+A skip is a turn boundary, and not by choice. Both streaming backends assume
+every chunk is contiguous in encoder-frame time — the paged one advances
+`req.offset` only on a forward, and `cache_t1` derives from it — so skipping a
+chunk would otherwise tell the encoder "this immediately follows the last one",
+splicing non-adjacent audio at contiguous relative positions with the convolution
+cache carrying left context across a gap that no longer exists. So the skip is
+paired with `StreamingEncoderBackend.reset`, which rewinds the cache *and* the
+position together (AGENTS.md rule 13). Resetting the encoder cuts the decoder's
+context with it, so the turn is finalized and folded into the stream's running
+transcript.
+
+Two clocks fall out of that, and they are the thing to get right:
+
+| clock | field | behaviour at a turn boundary |
+|---|---|---|
+| model | `Request.offset` | back to **0**, with the encoder cache |
+| reporting | `Request.stream_time_offset` | keeps accumulating |
+
+Positional embeddings and `cache_t1` are relative to the first; word timings,
+token timestamps, segment boundaries and events are relative to the second.
+Swapping them makes every turn after the first report timings that start again
+from zero — monotone within a turn, and wrong for the stream.
+
+```
+audio ─┬─▶ waveform detector ─▶ segmenter ─▶ speech intervals (session time)
+       │                                          │
+       │                            ┌─────────────┴──────────────┐
+       │                        should_encode(t0,t1)      turn_boundary()
+       │                            │                            │
+       └─▶ fbank ─▶ feature buffer ─┴─▶ [encoder chunk] ─▶ decode │
+                                          skip ────────▶ reset ◀──┘
+```
+
+**Skipping and closing are asked separately**, because they need different things
+from the detector. A skip needs a verdict for a window that has not run yet, so
+it happens only while the detector is ahead of the encoder — which is to say
+while the stream is backlogged, exactly when saving encoder work is worth
+something. On a stream arriving at real time the encoder keeps pace and there is
+no lookahead to skip with; the silence is encoded, but the turn still closes
+behind it, so the KV cache stops growing and the next turn starts on a clean
+context. Making the skip a precondition for the close would have made the mode
+inert on live streams.
+
+**What survives the gate.** A window is skipped only when the detector has judged
+past its far edge *and* nothing within it — widened by `speech_pad_ms` on both
+sides — is speech. Everything else is encoded, including anything undecided:
+encoding silence costs time, dropping speech costs words, and the two are not
+comparable. So the fraction of silence actually skipped grows with the gap rather
+than being a constant. Measured on the conformer, LJSpeech utterances joined by
+digital silence, `energy` backend:
+
+| gap | silence | skipped |
+|---|---|---|
+| 1 s | 3 s | 0 % (never reaches `min_silence_ms`) |
+| 3 s | 9 s | 57 % |
+| 6 s | 18 s | 78 % |
+| 12 s | 36 s | 87 % |
+
+**Requires a waveform detector.** Only a detector that runs before the encoder
+can decide what the encoder sees, so `segment` needs `presegment` — and in
+streaming, `stream` as well, because there it has to reach that verdict
+incrementally. `--vad-backend energy` is the built-in that declares both; an
+ASR-derived backend is refused at construction, naming the gap.
+
+Two combinations are refused rather than degraded: `n_best > 1` (alternatives of
+separate turns do not compose into alternatives of the stream, the same reason
+`longform.py` refuses to merge them), and `overlap_partial_readback` (a partial
+issued against the closed turn would be collected against the next one, under the
+same stream id).
 
 ## Configuration
 
