@@ -219,6 +219,139 @@ def build_packed_layout(
     )
 
 
+def build_packed_layout_device(
+    seg_lengths: torch.Tensor,
+    padded_t: int,
+    conv_kernel: int,
+    num_heads: "int | None" = None,
+    *,
+    total_capacity: "int | None" = None,
+    max_seg_capacity: "int | None" = None,
+    bias_capacity: "int | None" = None,
+) -> PackedLayout:
+    """GPU-resident, fixed-shape twin of :func:`build_packed_layout`.
+
+    Same layout, built without a single host round-trip and without a single
+    data-dependent shape, so the packed forward becomes CUDA-graph capturable.
+    :func:`build_packed_layout` cannot be captured, and measurement showed the
+    blocker is not one thing but four, all of them in the layout build (the
+    16-layer body captures unchanged):
+
+    ==============================================  ===============================
+    construct in :func:`build_packed_layout`         replaced here by
+    ==============================================  ===============================
+    ``seg_lengths.tolist()``  (D2H sync)             capacities passed in by caller
+    ``flat_src[valid_mask]``  (bool index)           rank scatter, ``cu[b] + t``
+    ``repeat_interleave(tensor)``                    ``searchsorted(cu_seqlens)``
+    per-segment Python loop over ``seg_list``        arithmetic decomposition of a
+                                                     flat index into ``(s,h,i,j)``
+    ==============================================  ===============================
+
+    The three capacities replace what the D2H was for.  They must be **at least**
+    the true ``sum``, ``max`` and ``sum_s H*T_s^2`` of ``seg_lengths``; pass exact
+    values for an eager call, or bucket constants for a capture.  ``None`` means
+    "derive the exact value", which costs the D2H back and is only useful for
+    testing this function against the host builder.
+
+    Padding beyond the true extent is inert but not free of consequence: a
+    trailing dead region is isolated the same way a real segment is (verified —
+    scaling the dead frames by 100x leaves every real segment bit-exact), yet
+    once it grows past a kernel-selection threshold the *shapes* change and the
+    real segments move by ~1.9e-1 in bf16.  So a bucketed packed forward is
+    bit-exact to itself, not to the unbucketed one.
+
+    Parameters
+    ----------
+    seg_lengths : Tensor
+        ``(S,)`` int32 post-subsampling length per segment.  Trailing zeros are
+        allowed and cost nothing (empty ranges in ``cu_seqlens``, no bias block),
+        which is how the segment axis is padded to a capture bucket.
+    padded_t : int
+        ``Tp``, the padded post-subsampling width of the source batch.
+    conv_kernel, num_heads
+        As :func:`build_packed_layout`.
+    """
+    assert seg_lengths.dim() == 1
+    device = seg_lengths.device
+    S = int(seg_lengths.numel())
+    conv_half = (conv_kernel - 1) // 2
+    sl64 = seg_lengths.to(torch.int64)
+
+    cu_seqlens = torch.zeros(S + 1, dtype=torch.int32, device=device)
+    cu_seqlens[1:] = torch.cumsum(seg_lengths, dim=0).to(torch.int32)
+    cu64 = cu_seqlens.to(torch.int64)
+
+    TT = int(total_capacity) if total_capacity is not None else int(cu_seqlens[S])
+    TM = int(max_seg_capacity) if max_seg_capacity is not None else int(sl64.max())
+    TM = max(1, TM)
+
+    # pack_src_idx: every valid (b, t) knows its own packed rank without a
+    # cumulative count over the mask, because segments are laid out in order --
+    # rank = cu_seqlens[b] + t.  Invalid frames scatter into a dump slot that is
+    # sliced off, which is what replaces the boolean mask index.
+    pos = torch.arange(S * padded_t, device=device, dtype=torch.int64)
+    b = pos // padded_t
+    t = pos - b * padded_t
+    rank = torch.where(t < sl64[b], cu64[b] + t, torch.full_like(pos, TT))
+    scratch = torch.zeros(TT + 1, dtype=torch.int64, device=device)
+    scratch.scatter_(0, rank.clamp_(max=TT), pos)
+    pack_src_idx = scratch[:TT]
+
+    ar = torch.arange(TT, device=device, dtype=torch.int64)
+    seg_id = torch.searchsorted(cu64[1:].contiguous(), ar, right=True).clamp_(max=S - 1)
+    local_pos = ar - cu64[seg_id]
+
+    conv_gather_idx = ar + conv_half * seg_id
+    gapped_len = TT + conv_half * (S - 1) if S > 1 else TT
+    conv_batched_idx = (seg_id * TM + local_pos).clamp_(0, S * TM - 1)
+    seg_valid_mask = torch.arange(TM, device=device, dtype=torch.int64).unsqueeze(
+        0
+    ) < sl64.unsqueeze(1)
+
+    bias_offsets = None
+    bias_gather_idx = None
+    if num_heads is not None and S > 0:
+        H = int(num_heads)
+        block = H * sl64 * sl64
+        bias_offsets = torch.zeros(S + 1, dtype=torch.int32, device=device)
+        bias_offsets[1:] = torch.cumsum(block, dim=0).to(torch.int32)
+        bo64 = bias_offsets.to(torch.int64)
+        BB = int(bias_capacity) if bias_capacity is not None else int(bias_offsets[S])
+        # Decompose a flat packed-bias position into (segment, head, i, j) with
+        # arithmetic instead of concatenating one arange per segment.  Segment
+        # lengths are clamped to >= 1 so a padding segment cannot divide by zero;
+        # its entries are never read, because ``bias_offsets`` bounds each block.
+        p_ar = torch.arange(BB, device=device, dtype=torch.int64)
+        s_id = torch.searchsorted(bo64[1:].contiguous(), p_ar, right=True).clamp_(max=S - 1)
+        t_s = sl64[s_id].clamp(min=1)
+        rem = p_ar - bo64[s_id]
+        t_sq = t_s * t_s
+        head = (rem // t_sq).clamp_(0, H - 1)
+        within = rem - head * t_sq
+        row = within // t_s
+        col = within - row * t_s
+        bias_gather_idx = (
+            ((s_id * H + head) * TM + row.clamp_(max=TM - 1)) * TM + col.clamp_(max=TM - 1)
+        ).clamp_(0, S * H * TM * TM - 1)
+
+    return PackedLayout(
+        num_segs=S,
+        total_tokens=TT,
+        seg_lengths=seg_lengths,
+        cu_seqlens=cu_seqlens,
+        max_seg_len=TM,
+        pack_src_idx=pack_src_idx,
+        conv_gather_idx=conv_gather_idx,
+        gapped_len=gapped_len,
+        conv_batched_idx=conv_batched_idx,
+        seg_valid_mask=seg_valid_mask,
+        bias_offsets=bias_offsets,
+        bias_gather_idx=bias_gather_idx,
+        src_rows=S * padded_t,
+        padded_t=padded_t,
+    )
+
+
 def pack_hidden(xs: torch.Tensor, layout: PackedLayout) -> torch.Tensor:
     """Gather valid frames of padded ``(B, Tp, D)`` into gapless ``(1, T_total, D)``."""
     B, Tp, D = xs.shape

@@ -120,6 +120,7 @@ class Conv2dSubsampling(nn.Module):
         self.out_norm = BiasNorm(out_channels)
 
     def forward(self, x: Tensor, x_lens: Tensor) -> Tuple[Tensor, Tensor]:
+        t_in = x.size(1)
         x = x.unsqueeze(-1)  # (N, T, idim, 1) NHWC
         x = self.conv(x)
         x = self.convnext(x)
@@ -129,13 +130,28 @@ class Conv2dSubsampling(nn.Module):
         x = self.out(x)
         x = self.out_norm(x)
 
+        # Host-side statement of the same invariant the upstream
+        # ``x.size(1) == x_lens.max().item()`` assert made.  The conv stack
+        # contracts the time axis by a fixed rule -- ``(T - 7) // 2``, from
+        # ``-2`` (k3), ``//2 - 1`` (k3 s2) and ``-2`` (k3) -- so the identity
+        # holds against the *padded* width and needs no device read.
+        #
+        # Two things are gained.  It costs no ``.item()``, and a ``.item()``
+        # here is what made this encoder uncapturable: a D2H inside a capture
+        # region raises ``cudaErrorStreamCaptureInvalidated``, so the whole
+        # offline forward fell back to eager (see ``oasr/engine/offline_graph.py``).
+        # And it stays *true* under a bucketed capture, where the batch is
+        # padded past its longest row and ``x_lens.max() < T`` by construction --
+        # the upstream form asserts padding width equals the true maximum, which
+        # a shape-bucketed graph deliberately breaks.
+        assert x.size(1) == (t_in - 7) // 2, (x.size(1), t_in)
         x_lens = (x_lens - 7) // 2
-        assert x.size(1) == x_lens.max().item(), (x.size(1), x_lens.max())
         return x, x_lens
 
     def streaming_forward(
         self, x: Tensor, x_lens: Tensor, cached_left_pad: Tensor
     ) -> Tuple[Tensor, Tensor, Tensor]:
+        t_in = x.size(1)
         x = x.unsqueeze(-1)
         x = self.conv(x)
         x, cached_left_pad = self.convnext.streaming_forward(x, cached_left_pad=cached_left_pad)
@@ -146,8 +162,11 @@ class Conv2dSubsampling(nn.Module):
         x = self.out_norm(x)
 
         assert self.convnext.padding[0] == 3
+        # Same host-side restatement as :meth:`forward`; the streaming
+        # ConvNeXt consumes its ``padding[0]`` left context instead of padding,
+        # hence the extra ``- 3``.
+        assert x.size(1) == (t_in - 7) // 2 - 3, (x.shape, t_in)
         x_lens = (x_lens - 7) // 2 - 3
-        assert x.size(1) == x_lens.max().item(), (x.shape, x_lens.max())
         return x, x_lens, cached_left_pad
 
     def get_init_states(

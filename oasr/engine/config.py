@@ -198,6 +198,24 @@ class EngineConfig:
     use_transducer_cuda_graphs: bool = True
     # Feature-graph batch buckets; ``None`` uses powers of two up to the batch cap.
     feature_graph_batch_buckets: Optional[List[int]] = None
+    # Capture the **offline** encoder forward by ``(B_bucket, T_bucket)``.  The
+    # offline path ran 0% of its kernels inside graphs at any batch width while
+    # streaming ran 92.7%; at ``B=1`` it issued ~437 launches for 0.99 ms of GPU
+    # work.  Gated by ``use_cuda_graphs``; see oasr/engine/offline_graph.py.
+    use_offline_cuda_graphs: bool = True
+    # Offline-graph batch buckets.  ``None`` takes ``preferred_batch_size`` when
+    # set -- the widths the partitioner already emits, so B-padding is zero --
+    # and otherwise powers of two up to ``max_batch_size``.
+    offline_graph_batch_buckets: Optional[List[int]] = None
+    # Time-axis rounding for the offline capture key, in feature frames.  Larger
+    # means fewer captured shapes and more padded compute; the cache reports what
+    # the padding actually cost rather than leaving it assumed.
+    offline_graph_frame_granularity: int = 64
+    # Refuse to capture past this padded width.  Long-form outliers are rare and
+    # are the regime where the GPU is genuinely busy anyway.
+    offline_graph_max_frames: int = 4096
+    # Live offline captures, bounding graph-pool growth.  Past this, eager.
+    offline_graph_max_captures: int = 64
 
     # Feature extraction
     feature_config: Optional[FeatureConfig] = None
@@ -390,6 +408,33 @@ class EngineConfig:
             # caches share one ladder; explicit override still wins.
             if self.feature_graph_batch_buckets is None:
                 self.feature_graph_batch_buckets = list(cleaned)
+
+        if self.offline_graph_frame_granularity < 1:
+            raise ValueError(
+                f"offline_graph_frame_granularity must be >= 1, got "
+                f"{self.offline_graph_frame_granularity!r}"
+            )
+        if self.offline_graph_max_frames < self.offline_graph_frame_granularity:
+            raise ValueError(
+                f"offline_graph_max_frames ({self.offline_graph_max_frames}) must be "
+                f">= offline_graph_frame_granularity "
+                f"({self.offline_graph_frame_granularity})"
+            )
+        if self.offline_graph_max_captures < 1:
+            raise ValueError(
+                f"offline_graph_max_captures must be >= 1, got "
+                f"{self.offline_graph_max_captures!r}"
+            )
+        if self.offline_graph_batch_buckets is not None:
+            buckets = sorted({int(v) for v in self.offline_graph_batch_buckets})
+            if not buckets or buckets[0] < 1:
+                raise ValueError(f"offline_graph_batch_buckets values must be >= 1, got {buckets}")
+            if buckets[-1] > self.max_batch_size:
+                raise ValueError(
+                    f"offline_graph_batch_buckets values must be <= max_batch_size "
+                    f"({self.max_batch_size}), got {buckets}"
+                )
+            self.offline_graph_batch_buckets = buckets
         # Auto-detect SentencePiece model and unit table from checkpoint dir.
         # Deprecated fallback: when the checkpoint conversion emits a
         # TokenizerSpec (WeNet / icefall / native all do), the engine builds the

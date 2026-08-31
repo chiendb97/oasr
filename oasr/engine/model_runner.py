@@ -12,7 +12,7 @@ plug in without touching the runner or the executors.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -20,6 +20,7 @@ from oasr.cache import BlockPool, CacheConfig, StreamContext
 from oasr.models.base import BaseAsrModel
 
 from .config import EngineConfig
+from .offline_graph import ENCODE, FUSED, GraphedOfflineForward, resolve_batch_buckets
 from .request import Request
 from .streaming_backend import StreamingEncoderBackend, build_streaming_backend
 
@@ -78,6 +79,35 @@ class ModelRunner:
             consumes=consumes,
         )
 
+        # Offline forward capture.  Deliberately **not** handed ``graph_pool``:
+        # each capture family owns its own pool, because sharing one across
+        # families once put a feature graph's output at the same device address
+        # as the encoder graph's and a replay clobbered the other's result.
+        # Within this cache the pool is still shared across shape buckets.
+        self._offline_graphs: Optional[GraphedOfflineForward] = None
+        if config.use_cuda_graphs and config.use_offline_cuda_graphs:
+            device = torch.device(config.device)
+            if device.type == "cuda":
+                # A fixed-window frontend (``whisper_logmel``, shared by
+                # Qwen2-Audio) already pads *and trims* every utterance to one
+                # width, so there is nothing to bucket -- and rounding it up is
+                # not merely wasteful but wrong: the encoder discards the real
+                # lengths (``WhisperEncoder.forward`` does ``del xs_lens``) and
+                # its positional embedding is cut for exactly that width, so a
+                # 3000 -> 3008 pad returns an empty transcript rather than an
+                # error.  Granularity 1 makes the key exact, which for a fixed
+                # window is a single T, and makes ``pad_time`` a no-op.
+                fcfg = getattr(config, "feature_config", None)
+                fixed = getattr(fcfg, "fixed_window_frames", None) if fcfg else None
+                granularity = 1 if fixed else config.offline_graph_frame_granularity
+                self._offline_graphs = GraphedOfflineForward(
+                    device=device,
+                    batch_buckets=resolve_batch_buckets(config),
+                    frame_granularity=granularity,
+                    max_frames=max(config.offline_graph_max_frames, int(fixed) if fixed else 0),
+                    max_captures=config.offline_graph_max_captures,
+                )
+
     # ------------------------------------------------------------------
     # Introspection / delegation helpers
     # ------------------------------------------------------------------
@@ -86,6 +116,11 @@ class ModelRunner:
     def streaming_backend(self) -> StreamingEncoderBackend:
         """The active streaming-encoder backend."""
         return self._streaming_backend
+
+    @property
+    def offline_graphs(self) -> Optional[GraphedOfflineForward]:
+        """The offline forward graph cache, or ``None`` when capture is off."""
+        return self._offline_graphs
 
     @property
     def decoding_window(self) -> int:
@@ -105,6 +140,32 @@ class ModelRunner:
     # ------------------------------------------------------------------
     # Offline forward
     # ------------------------------------------------------------------
+
+    def _offline(
+        self,
+        name: str,
+        fn: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
+        features: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run one offline forward, graph-served when its shape buckets.
+
+        The time-axis padding is applied **before** the branch, so the captured
+        and the eager path are handed the identical tensor and cannot disagree.
+        An encoder that is sensitive to trailing padding — both shipped ones are,
+        by ~2.5e-1 in bf16 — would otherwise decode an utterance differently
+        depending on whether its shape was captured, with a fallback to eager as
+        the silent trigger.  See :meth:`GraphedOfflineForward.pad_time`.
+        """
+        cache = self._offline_graphs
+        if cache is None:
+            return fn(features, lengths)
+        served = cache.run(name, fn, features, lengths)
+        if served is not None:
+            # The captured path pads inside its own static buffer, so the
+            # bucket-width tensor is never materialised twice.
+            return served
+        return fn(*cache.pad_time(features, lengths))
 
     @torch.no_grad()
     def forward_offline(
@@ -127,8 +188,11 @@ class ModelRunner:
             ``(B, T_out, vocab_size)`` log-softmax probabilities.
         output_lengths : Tensor
             ``(B,)`` int32 valid encoder output frame counts.
+
+        Served from the CUDA-Graph cache when this ``(B, T)`` buckets to a
+        captured shape; otherwise run eagerly, which the cache counts.
         """
-        return self._model.forward_offline(features, lengths)
+        return self._offline(FUSED, self._model.forward_offline, features, lengths)
 
     @torch.no_grad()
     def forward_offline_packed(
@@ -153,8 +217,13 @@ class ModelRunner:
 
         For autoregressive decode strategies (``consumes == "hidden"``) that own
         their head/decoder (transducer / AED / LLM) instead of the fused CTC head.
+
+        Graph-served on the same terms as :meth:`forward_offline`.  The returned
+        hidden is a clone, which matters more here than there: an AR family holds
+        it as cross-attention memory for the whole decode, long after later
+        replays and captures would have invalidated a pool-backed view.
         """
-        return self._model.encode_offline(features, lengths)
+        return self._offline(ENCODE, self._model.encode_offline, features, lengths)
 
     @torch.no_grad()
     def apply_head(self, hidden: torch.Tensor) -> torch.Tensor:

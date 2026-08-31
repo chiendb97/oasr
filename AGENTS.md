@@ -249,6 +249,7 @@ extension cookbook for each axis.
 | `oasr/engine/decode/{alignment,ctc_align,attention_align}.py` | Word timings: the shared frames→words half, and the two per-family aligners |
 | `oasr/engine/streaming_backend/` | `PagedStreamingBackend`, `StatefulStreamingBackend` |
 | `oasr/engine/graph_cache.py` | CUDA-graph capture of the steady-state streaming encoder |
+| `oasr/engine/offline_graph.py` | CUDA-graph capture of the offline forward, keyed `(B_bucket, T_bucket)` |
 | `oasr/engine/memory.py` | VRAM-aware capacity derivation (paged pool, AR decoder KV) |
 | `oasr/engine/decoder_graph.py` | CUDA-graph capture of one AR decoder step (needs paged decoder KV) |
 | `oasr/cache/decoder_state.py` | Per-row decoder KV — dense capacity buffers and paged — that both AR decoder surfaces thread |
@@ -339,6 +340,19 @@ extension cookbook for each axis.
   shifts every later pointer, and the illegal access lands far from the edit.
 - **`LinearActivation(activation="gelu")`.** Only `gelu_tanh` exists — the CUDA epilogue is the
   tanh approximation, and fusing it under the exact-erf name is a silent accuracy change.
+- **Padding to a capture bucket on the captured path only.** No encoder is obliged to be
+  invariant to how much padding trails its valid frames, and neither shipped one is —
+  Zipformer's `SimpleDownsample` fills its last window by *replicating the final frame*, so the
+  padded width reaches valid outputs (~2.5e-1 in bf16, three orders above rounding). Pad in
+  `GraphedOfflineForward.pad_time`, **before** the graph/eager branch, or an utterance decodes
+  differently depending on whether its shape happened to be captured — with a saturated cache or
+  an oversized batch as the silent trigger.
+- **Bucketing the time axis of a fixed-window frontend.** `whisper_logmel` (shared by
+  Qwen2-Audio) pads *and trims* to one width and the encoder then discards the lengths
+  (`WhisperEncoder.forward` does `del xs_lens`), so rounding 3000 up to 3008 is not waste, it is
+  wrong: capture raises and the eager fallback returns an **empty transcript**. Read
+  `feature_config.fixed_window_frames` and make the key exact — the same field
+  `request_cost_frames` already reads for the same reason.
 
 ### Decode path
 - **Per-token or per-character Python on the decode path.** The step loop is interpreter-bound
