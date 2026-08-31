@@ -29,7 +29,12 @@ from oasr.cache.state import SlotTensor
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 from oasr.utils.staging import to_device
 
-from ..graph_cache import GraphedEncoderForward, round_up_bucket
+from ..graph_cache import (
+    GraphedEncoderForward,
+    cache_bucket_ladder,
+    pick_cache_bucket,
+    round_up_bucket,
+)
 from ..request import Request
 from .base import StreamingEncoderBackend, register_streaming_backend
 
@@ -136,6 +141,27 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             cache_config.prefilled_cache_frames if cache_config.prefill_kv_window else None
         )
 
+        # Every ``cache_t1`` rung a stream can reach, built once from the block
+        # table's own capacity.  Flat 64-frame rounding makes this axis unbounded
+        # under the default ``num_left_chunks=-1``, so a long stream captures a
+        # new graph every 64 encoder frames for as long as it runs; the geometric
+        # tail turns that into a finite ladder the pre-warm can cover completely.
+        # See :func:`~oasr.engine.graph_cache.cache_bucket_ladder`.
+        # Two ceilings, and the ladder honours the lower.  The block table caps
+        # how many frames a stream can cache (``max_stream_frames``); the
+        # encoder's relative-position table caps the *attention key size*
+        # ``cache_t1 + chunk_size`` it can index, and overrunning it is an
+        # out-of-bounds ``F.embedding`` gather rather than an error.
+        pos_limit = getattr(getattr(enc, "embed", None), "pos_enc", None)
+        pos_limit = getattr(pos_limit, "max_len", None)
+        capacity = int(cache_config.max_stream_frames)
+        if pos_limit:
+            capacity = min(capacity, max(0, int(pos_limit) - cs))
+        self._cache_ladder: List[int] = cache_bucket_ladder(
+            capacity,
+            growth=float(getattr(config, "streaming_graph_cache_growth", 1.5)),
+        )
+
         # CUDA Graph cache for the steady-state batched paged forward.
         # Captures lazily on first encounter of each (B_active, cache_t1
         # bucket) shape.  Eager fallback is used for non-CUDA devices, when
@@ -219,6 +245,13 @@ class PagedStreamingBackend(StreamingEncoderBackend):
     # Encoder graph pre-warm
     # ------------------------------------------------------------------
 
+    @property
+    def cache_bucket_ladder(self) -> Sequence[int]:
+        """Every ``cache_t1`` rung a stream on this backend can reach."""
+        if self._fixed_cache_t1 is not None:
+            return (self._fixed_cache_t1,)
+        return tuple(self._cache_ladder)
+
     @torch.no_grad()
     def prewarm(
         self,
@@ -264,10 +297,17 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             # ladder collapses to one capture per batch size.
             buckets: List[int] = [self._fixed_cache_t1]
         elif cache_t1_buckets is None:
-            buckets = [0]
+            # The whole reachable ladder, so no rung is left to capture on a
+            # live tick.  This used to default to ``[0]`` and leave the rest
+            # lazy, which is the tail this pre-warm exists to remove.
+            buckets = list(self._cache_ladder) or [0]
         else:
             buckets = sorted(
-                {round_up_bucket(int(c)) for c in cache_t1_buckets if int(c) >= 0}
+                {
+                    pick_cache_bucket(int(c), self._cache_ladder)
+                    for c in cache_t1_buckets
+                    if int(c) >= 0
+                }
             ) or [0]
 
         device = self._att_mgr.block_table.device
@@ -279,7 +319,15 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             slot_ids = torch.arange(B, dtype=torch.long, device=device)
             xs = torch.zeros(B, window, feat_dim, dtype=dtype, device=device)
             for bucket in buckets:
-                offsets = torch.full((B,), bucket, dtype=torch.int32, device=device)
+                # Zero, not ``bucket``.  These dummy slots report
+                # ``cache_seqlens = 0``, and the encoder derives its positional
+                # index from ``offset - cache_seqlens``; passing ``bucket`` there
+                # asks for row ``2 * bucket + chunk_size`` of a table sized for
+                # ``max_len``, which silently overran it once the ladder reached
+                # far enough.  A real aged stream has ``offset == cache_seqlens``,
+                # so zero is also the *faithful* warm-up.  Only the shape is
+                # captured; the real offsets arrive in the input buffer at replay.
+                offsets = torch.zeros(B, dtype=torch.int32, device=device)
                 self._graph_cache.replay(
                     B,
                     window,
@@ -520,7 +568,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         #    cache_t1 grows in N_BLOCK-sized steps.
         nvtx_push("encoder_call")
         cache_t1_bucket = (
-            cache_t1 if self._fixed_cache_t1 is not None else round_up_bucket(max_offset)
+            cache_t1
+            if self._fixed_cache_t1 is not None
+            else pick_cache_bucket(max_offset, self._cache_ladder)
         )
         out = None
         if self._use_cuda_graphs and self._graph_cache is not None:

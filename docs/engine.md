@@ -315,6 +315,9 @@ prepare_offline                    prepare_streaming
 | `audio_scale` | `32768.0` | Multiplied into the float waveform. **Per framework** — adopted from `FeatureSpec.audio_scale` unless set explicitly. See [features.md](features.md). |
 | `service_mode` | `"streaming"` | Pins the engine to `"streaming"` or `"offline"` for its whole lifecycle; mismatched requests are rejected at admission. `"offline"` builds no streaming backend and no paged pool. |
 | `use_cuda_graphs` | `True` | Capture the steady-state streaming encoder forward (`GraphedEncoderForward`, one graph per shape key). Also the master gate for the offline capture below. |
+| `streaming_graph_cache_growth` | `1.5` | Growth ratio of the streaming `cache_t1` graph-key ladder above 512 frames. `1.0` restores the legacy flat 64-frame rounding, which makes that axis **unbounded** under `num_left_chunks=-1`. See [§9.7](#9-performance-considerations). |
+| `streaming_graph_batch_ladder` | `None` | Batch widths to pre-warm streaming encoder graphs at. `None` = **every** width `1..max_batch_size`, because the graph key is the *active* batch size. |
+| `streaming_graph_max_shapes` | `512` | Ceiling on `widths x cache rungs` pre-warmed at construction (~25 ms and a few MiB each). Past it the ladder is truncated to the low widths plus the cap, and the rest capture lazily. |
 | `use_offline_cuda_graphs` | `True` | Capture the **offline** encoder forward by `(B_bucket, T_bucket)` (`GraphedOfflineForward`). See [§9.7](#9-performance-considerations). |
 | `offline_graph_batch_buckets` | `None` | Batch widths to capture at. `None` takes `preferred_batch_size` when set, else powers of two up to `max_batch_size`. Set it *below* `max_batch_size` to exclude the widest batches, where capture is a small net loss. |
 | `offline_graph_frame_granularity` | `64` | Time-axis rounding, in feature frames. Overridden to `1` — exact, so no padding — for a fixed-window frontend. |
@@ -676,7 +679,32 @@ which becomes the `stage` label on the `oasr_requests_failed_total` metric
    differently depending on whether its shape happened to be captured. See
    `GraphedOfflineForward.pad_time`.
 
-8. **Pool sizing.** The engine's most common production failure is
+8. **The streaming graph ladder is pre-warmed exhaustively, and that is what
+   flattens the tail.** The streaming graph is keyed
+   `(B_active, T_input, cache_t1_bucket)` and a miss captures a graph *on a live
+   tick*, at ~30 ms. Both axes used to be under-covered:
+
+   * `cache_t1` was rounded to a flat 64 frames. With the default
+     `num_left_chunks=-1` that axis is **unbounded**, so a long stream reached a
+     new bucket every 64 encoder frames and captured a graph for as long as it
+     ran — measured on a 120 s stream, 48 captures over 191 ticks, a capture on a
+     **quarter of all ticks**, and it never settled (24 in each half of the run).
+     `streaming_graph_cache_growth` makes the rungs geometric above 512 frames,
+     turning that into 11–16 rungs that cover a stream's whole life. The trade is
+     a wider over-read of the paged K/V, measured at **~1 %** of streaming
+     throughput, because a replay only grows 1.04 → 1.41 ms from an empty cache
+     to 82 s of history while an eager forward is flat at ~12 ms.
+   * the batch axis was pre-warmed at `{1, max_batch_size}` only, so every active
+     width between them captured on first appearance. It now defaults to every
+     width.
+
+   Together: **p99 31.4 → 3.2 ms** on long streams and **max 32.6 → 4.0 ms** at
+   sustained concurrency 16, with zero live-tick captures in both. The cost is
+   startup — ~25 ms and a few MiB per shape, so +2.2 s at `max_batch_size=8` and
+   +9.5 s at 32 — bounded by `streaming_graph_max_shapes`. Transcripts are
+   unchanged.
+
+9. **Pool sizing.** The engine's most common production failure is
    `BlockPool` exhaustion. Size `max_num_blocks` for
    `max_batch_size × max_logical_blocks` plus headroom; trade off
    against GPU memory. Or hand it over: `max_num_blocks=None` derives the

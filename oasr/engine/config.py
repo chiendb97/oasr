@@ -198,6 +198,22 @@ class EngineConfig:
     use_transducer_cuda_graphs: bool = True
     # Feature-graph batch buckets; ``None`` uses powers of two up to the batch cap.
     feature_graph_batch_buckets: Optional[List[int]] = None
+    # Growth ratio of the streaming ``cache_t1`` graph-key ladder above
+    # ``CACHE_BUCKET_KNEE``.  ``1.0`` restores the legacy flat 64-frame rounding,
+    # which makes the axis unbounded under ``num_left_chunks=-1`` and captures a
+    # graph on a live tick every 64 encoder frames for as long as a stream runs.
+    streaming_graph_cache_growth: float = 1.5
+    # Batch widths to pre-warm streaming encoder graphs at.  ``None`` keeps the
+    # cheap default (``1``, ``max_batch_size`` and any ``preferred_batch_size``);
+    # an explicit list — e.g. ``list(range(1, max_batch_size + 1))`` — removes the
+    # remaining capture spikes as the active width walks, at ~28 ms of startup per
+    # captured shape.
+    streaming_graph_batch_ladder: Optional[List[int]] = None
+    # Ceiling on ``batch widths x cache rungs`` pre-warmed at construction, at
+    # ~25 ms and a few MiB each.  Reached only by an unusually wide
+    # ``max_batch_size``; the ladder is then truncated to the low widths plus the
+    # cap and the rest capture lazily, which is a latency tail, not an error.
+    streaming_graph_max_shapes: int = 512
     # Capture the **offline** encoder forward by ``(B_bucket, T_bucket)``.  The
     # offline path ran 0% of its kernels inside graphs at any batch width while
     # streaming ran 92.7%; at ``B=1`` it issued ~437 launches for 0.99 ms of GPU
@@ -408,6 +424,27 @@ class EngineConfig:
             # caches share one ladder; explicit override still wins.
             if self.feature_graph_batch_buckets is None:
                 self.feature_graph_batch_buckets = list(cleaned)
+
+        if self.streaming_graph_max_shapes < 1:
+            raise ValueError(
+                f"streaming_graph_max_shapes must be >= 1, got "
+                f"{self.streaming_graph_max_shapes!r}"
+            )
+        if self.streaming_graph_cache_growth < 1.0:
+            raise ValueError(
+                f"streaming_graph_cache_growth must be >= 1.0 (1.0 = legacy flat "
+                f"rounding), got {self.streaming_graph_cache_growth!r}"
+            )
+        if self.streaming_graph_batch_ladder is not None:
+            rungs = sorted({int(v) for v in self.streaming_graph_batch_ladder})
+            if not rungs or rungs[0] < 1:
+                raise ValueError(f"streaming_graph_batch_ladder values must be >= 1, got {rungs}")
+            if rungs[-1] > self.max_batch_size:
+                raise ValueError(
+                    f"streaming_graph_batch_ladder values must be <= max_batch_size "
+                    f"({self.max_batch_size}), got {rungs}"
+                )
+            self.streaming_graph_batch_ladder = rungs
 
         if self.offline_graph_frame_granularity < 1:
             raise ValueError(
