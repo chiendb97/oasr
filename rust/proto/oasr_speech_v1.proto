@@ -5,9 +5,9 @@
 // bindings from this schema. There is no asynchronous operation RPC.
 //
 // Extensions add priority, per-request decoding controls, raw tokens, request
-// ids, result end time, and finish reason. N-best and word timing requests are
-// honored or explicitly rejected when unsupported. Several source-compatible
-// fields are accepted but ignored.
+// ids, result end time, and finish reason. N-best, word timing and voice
+// activity requests are honored or explicitly rejected when unsupported.
+// Several source-compatible fields are accepted but ignored.
 //
 // Supported audio: LINEAR16/32F, MULAW, ALAW, FLAC, MP3, WAV, M4A, AIFF, and
 // AUTO. AMR, SPEEX, and Opus variants return `UNIMPLEMENTED`.
@@ -138,10 +138,29 @@ message RecognizeResponse {
 // Streaming RPC
 // ---------------------------------------------------------------------------
 
+// Voice-activity timeouts, in Google v1's shape.
+//
+// `speech_start_timeout` closes a stream on which speech never began, and is
+// *cancelled for the rest of the stream* once the first SPEECH_ACTIVITY_BEGIN
+// fires.  `speech_end_timeout` starts on SPEECH_ACTIVITY_END and is reset by a
+// new BEGIN.  Both are bounded to [0.5s, 60s]; outside that they are rejected
+// rather than clamped.
+message VoiceActivityTimeout {
+    google.protobuf.Duration speech_start_timeout = 1;
+    google.protobuf.Duration speech_end_timeout   = 2;
+}
+
 message StreamingRecognitionConfig {
     RecognitionConfig config           = 1;
-    bool              single_utterance = 2;  // accepted, ignored
+    // Stop recognizing at the first utterance boundary and emit
+    // END_OF_SINGLE_UTTERANCE.  Requires the server to be started with a VAD
+    // mode; a request that sets it against an engine without one is rejected
+    // rather than silently transcribing to the end of the audio.
+    bool              single_utterance = 2;
     bool              interim_results  = 3;
+    // Emit SPEECH_ACTIVITY_BEGIN / SPEECH_ACTIVITY_END as they are detected.
+    bool              enable_voice_activity_events = 5;
+    VoiceActivityTimeout voice_activity_timeout    = 6;
 }
 
 message StreamingRecognizeRequest {
@@ -164,11 +183,23 @@ message StreamingRecognitionResult {
 
 enum SpeechEventType {
     SPEECH_EVENT_UNSPECIFIED = 0;
+    // The server detected the end of the user's speech utterance.  Emitted only
+    // when `single_utterance` is set; the stream stops recognizing after it.
     END_OF_SINGLE_UTTERANCE  = 1;
+    // Beginning / end of human voice activity, when
+    // `enable_voice_activity_events` is set.
+    SPEECH_ACTIVITY_BEGIN    = 2;
+    SPEECH_ACTIVITY_END      = 3;
+    // A `voice_activity_timeout` expired.
+    SPEECH_ACTIVITY_TIMEOUT  = 4;
 }
 
 message StreamingRecognizeResponse {
     repeated StreamingRecognitionResult results            = 1;
     SpeechEventType                     speech_event_type  = 2;
+    // Audio offset of `speech_event_type`, measured from the bytes received
+    // rather than from server wall-clock, so transmission jitter cannot move a
+    // reported boundary.
+    google.protobuf.Duration            speech_event_offset = 3;
     string                              request_id         = 100;  // OASR extension
 }

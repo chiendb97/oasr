@@ -21,6 +21,7 @@ import torch
 from .config import EngineConfig
 from .decode import Detokenizer, build_decode_strategy
 from .decode.alignment import wants_word_timings
+from .decode.base import wants_speech_activity
 from .request import Request, RequestOutput
 
 logger = logging.getLogger(__name__)
@@ -72,11 +73,13 @@ class OutputProcessor:
         """Decode a batched encoder output → one final output per row.
 
         ``requests`` rides along in row order for the families that read
-        per-request options at decode time (``word_timestamps``); it is dropped
-        when nothing in the micro-batch asked, so the default path hands the
-        strategy exactly what it used to get.
+        per-request options at decode time (``word_timestamps``,
+        ``vad_events``); it is dropped when nothing in the micro-batch asked, so
+        the default path hands the strategy exactly what it used to get.
         """
-        if requests is not None and not any(wants_word_timings(req) for req in requests):
+        if requests is not None and not any(
+            wants_word_timings(req) or wants_speech_activity(req) for req in requests
+        ):
             requests = None
         return self._strategy.decode_offline(log_probs, lengths, requests)
 

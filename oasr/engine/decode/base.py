@@ -25,7 +25,18 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple, Type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+)
 
 import torch
 
@@ -141,7 +152,20 @@ class DecodeStrategy(ABC):
         "task": None,
         "language": None,
         "word_timestamps": False,
+        "single_utterance": False,
+        "vad_events": False,
+        "endpoint_silence_ms": None,
     }
+
+    #: The subset handled by :meth:`_require_speech_activity` rather than by
+    #: ``selective_options``.  They are not per-family controls a strategy opts
+    #: into; whether they can be honoured depends on the *engine's* VAD
+    #: configuration as much as on the family, so they get their own check.
+    _SPEECH_ACTIVITY_OPTIONS: ClassVar[Tuple[str, ...]] = (
+        "single_utterance",
+        "vad_events",
+        "endpoint_silence_ms",
+    )
 
     def validate_options(
         self, options: Optional["DecodingOptions"], *, streaming: bool = False
@@ -166,6 +190,8 @@ class DecodeStrategy(ABC):
                 continue
             if name == "word_timestamps":
                 self._require_word_timings(streaming)
+            elif name in self._SPEECH_ACTIVITY_OPTIONS:
+                self._require_speech_activity(name, streaming)
             elif name not in self.selective_options:
                 raise ValueError(
                     f"decode_method={self.decode_type!r} cannot honour the "
@@ -173,6 +199,30 @@ class DecodeStrategy(ABC):
                     "remove it, or serve a checkpoint whose decode family does "
                     f"(supported here: {list(self.selective_options) or 'none'})"
                 )
+        self._reject_nbest_across_turns(options, streaming)
+
+    def _reject_nbest_across_turns(self, options: "DecodingOptions", streaming: bool) -> None:
+        """Refuse n-best on a stream that will be cut into turns.
+
+        ``vad.mode="segment"`` resets the decoder at every confirmed silence, so
+        the stream's transcript is the concatenation of one hypothesis per turn.
+        Alternatives of independent turns do not compose into alternatives of the
+        stream — the same reason ``longform.py`` refuses to merge n-best across
+        windows — and a cross product would be worse than one hypothesis.  So the
+        request is refused rather than quietly answered with the last turn's
+        alternatives, which is what a caller would otherwise receive.
+        """
+        if not streaming or int(getattr(options, "n_best", 1) or 1) <= 1:
+            return
+        vad = getattr(self._config, "vad", None)
+        if vad is None or not getattr(vad, "gates_encoder", False):
+            return
+        raise ValueError(
+            "n_best > 1 cannot be served with vad.mode='segment': the stream is "
+            "decoded as a sequence of turns and alternatives of separate turns do "
+            "not compose into alternatives of the stream. Ask for one hypothesis, "
+            "or run the engine in vad.mode='observe' or 'endpoint'."
+        )
 
     def _require_word_timings(self, streaming: bool) -> None:
         """Raise unless this family can align in the mode the request will run in."""
@@ -193,6 +243,210 @@ class DecodeStrategy(ABC):
                 "unavailable), so word timestamps would be scaled by an "
                 "unknown constant"
             )
+
+    # -- speech activity ----------------------------------------------------
+
+    #: Registry kind of the ASR-derived detector this family can feed
+    #: (``"ctc_blank"``, ``"cif_alpha"``, ...), or ``None`` when its output
+    #: carries no per-frame speech signal.  This is what ``vad.backend=None``
+    #: ("auto") resolves to, and it is why the *absence* of a configured VAD
+    #: model is a first-class configuration rather than a degraded one.
+    speech_activity_kind: ClassVar[Optional[str]] = None
+
+    @property
+    def asr_speech_activity_modes(self) -> Tuple[str, ...]:
+        """Modes in which **this family's own output** carries a speech signal.
+
+        A subset of ``{"offline", "streaming"}``.  A property rather than a
+        ClassVar for the same reason :attr:`word_timing_modes` is one: the honest
+        answer depends on configuration.  A transducer answers both under greedy
+        and *neither* under beam search, whose device-side hypothesis buffer
+        carries labels rather than frames — the same restriction, from the same
+        cause, as its word timings.
+
+        This is what "no separate VAD model configured" resolves to.
+        """
+        return ()
+
+    @property
+    def speech_activity_modes(self) -> Tuple[str, ...]:
+        """Modes in which speech activity can be reported at all, here.
+
+        Two independent facts combine: what this family derives from its own
+        per-frame output, and what a separately configured detector declares.
+        Either alone is enough.  Both empty means a request asking for VAD is
+        refused rather than answered with an empty ``segments`` array, which a
+        client cannot distinguish from audio that genuinely had no speech.
+
+        Returns ``()`` whenever the engine's VAD is switched off, so a
+        deployment that has not enabled it refuses the option instead of
+        accepting and dropping it.
+        """
+        vad = getattr(self._config, "vad", None)
+        if vad is None or not vad.enabled:
+            return ()
+        family = set(self.asr_speech_activity_modes)
+        if vad.backend is None:
+            # "auto" — the engine resolves this to the family's own detector.
+            return tuple(sorted(family))
+        from oasr.vad import get_vad_spec
+
+        spec = get_vad_spec(vad.backend)
+        if spec.is_asr_derived:
+            # An ASR-derived backend can only report where the family can supply
+            # it; the engine has already checked the two are compatible.
+            return tuple(sorted(family))
+        if spec.can("presegment") or spec.can("posthoc"):
+            family.add("offline")
+        if spec.can("stream"):
+            family.add("streaming")
+        return tuple(sorted(family))
+
+    def _require_speech_activity(self, name: str, streaming: bool) -> None:
+        """Raise unless this engine can honour a VAD option in this mode."""
+        vad = getattr(self._config, "vad", None)
+        if vad is None or not vad.enabled:
+            raise ValueError(
+                f"the {name!r} option needs voice activity detection, which this "
+                "engine has switched off; start it with --vad-mode "
+                "observe|endpoint|segment (or set EngineConfig.vad)"
+            )
+        if name in ("single_utterance", "endpoint_silence_ms") and not streaming:
+            raise ValueError(
+                f"{name!r} is a streaming control: an offline request already has "
+                "exactly one utterance boundary, its end. Drop it, or open a "
+                "streaming session."
+            )
+        mode = "streaming" if streaming else "offline"
+        if mode not in self.speech_activity_modes:
+            supported = ", ".join(self.speech_activity_modes) or "neither mode"
+            raise ValueError(
+                f"decode_method={self.decode_type!r} cannot report speech activity "
+                f"for a {mode} request (supported: {supported}); configure a "
+                "separate VAD model with --vad-backend, or send the audio to an "
+                "engine whose decode family carries the signal"
+            )
+
+    def resolved_vad(self):
+        """This engine's VAD config with its preset applied, or ``None``.
+
+        Resolved once and cached: the preset depends on the service mode, and
+        re-deriving it per request would let one request's segmenter disagree
+        with another's for the same configuration.
+        """
+        cached = getattr(self, "_vad_resolved", "unset")
+        if cached != "unset":
+            return cached
+        vad = getattr(self._config, "vad", None)
+        resolved = (
+            vad.resolve(getattr(self._config, "service_mode", "offline"))
+            if vad is not None and vad.enabled
+            else None
+        )
+        self._vad_resolved = resolved
+        return resolved
+
+    def speech_activity_kwargs(self) -> Dict[str, Any]:
+        """Extra factory arguments this family's detector needs.
+
+        The registry does not know what a ``blank_id`` is, and it should not
+        have to; the family that owns the tensor owns the ids that index it.
+        """
+        return {}
+
+    def _speech_detector(self, **kwargs: Any):
+        """This family's ASR-derived detector, or ``None`` if it should not run.
+
+        ``None`` in three distinct cases, all of them correct: VAD is off; this
+        family carries no signal; or the operator configured a *different*
+        detector, in which case that one owns the answer and a second, post-hoc
+        one would publish a competing set of segments for the same audio.
+        """
+        resolved = self.resolved_vad()
+        kind = self.speech_activity_kind
+        if resolved is None or kind is None or resolved.backend != kind:
+            return None
+        if self._clock is None:
+            # Same refusal as word timings: a detector fed a guessed frame rate
+            # reports boundaries that are plausible and uniformly wrong.
+            return None
+        cached = getattr(self, "_asr_detector_cache", None)
+        if cached is None:
+            import torch as _torch
+
+            from oasr.vad import build_detector
+
+            factory_kwargs: Dict[str, Any] = dict(self.speech_activity_kwargs())
+            factory_kwargs.update(kwargs)
+            cached = build_detector(
+                resolved,
+                device=_torch.device(getattr(self._config, "device", "cpu")),
+                seconds_per_frame=self._clock.seconds_per_frame,
+                **factory_kwargs,
+            )
+            self._asr_detector_cache = cached
+        return cached
+
+    def attach_asr_speech_activity(
+        self,
+        outputs: Sequence[RequestOutput],
+        tensor: torch.Tensor,
+        lengths: torch.Tensor,
+        requests: Optional[Sequence[Request]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Batched post-hoc pass: one detector call, then one segmenter per row.
+
+        Nothing runs unless a request asked (:func:`wants_speech_activity`), so
+        an ordinary batch takes exactly the path it took before — the same cost
+        discipline word timings follow, and for the same reason: the device→host
+        copy and the per-row Python are real, and most requests want neither.
+        """
+        if requests is None or not any(wants_speech_activity(r) for r in requests):
+            return
+        detector = self._speech_detector(**kwargs)
+        if detector is None:
+            return
+        from oasr.vad import as_rows
+
+        probs, frame_lengths = detector.detect_from_asr(tensor, lengths)
+        rows = as_rows(probs, frame_lengths)
+        spf = detector.seconds_per_frame
+        for index, output in enumerate(outputs):
+            if index >= len(rows):
+                break
+            request = requests[index] if index < len(requests) else None
+            if request is not None and not wants_speech_activity(request):
+                continue
+            self.attach_speech_activity(output, rows[index], seconds_per_frame=spf)
+
+    def attach_speech_activity(
+        self,
+        output: RequestOutput,
+        probs: Sequence[float],
+        *,
+        seconds_per_frame: float,
+        offset: float = 0.0,
+        total_seconds: Optional[float] = None,
+    ) -> None:
+        """Segment one row's probabilities and publish them onto ``output``.
+
+        The one call a family makes once it has a per-frame speech signal, so
+        the hysteresis, the padding and the time conversion are written once
+        rather than per family — the same shape as :meth:`attach_alignment`.
+
+        Post-hoc by construction: this runs after the decode, so it labels audio
+        the encoder has already seen.  Pre-*segmentation*, which is what saves
+        encoder work, needs a detector that runs before the encoder and lives on
+        the engine's admission path instead.
+        """
+        resolved = self.resolved_vad()
+        if resolved is None or not probs:
+            return
+        from oasr.vad import SpeechSegmenter
+
+        segmenter = SpeechSegmenter(resolved, seconds_per_frame, time_offset=offset)
+        output.segments = segmenter.run(probs, total_seconds=total_seconds)
 
     # -- alignment ----------------------------------------------------------
 
@@ -345,6 +599,18 @@ class DecodeStrategy(ABC):
     def finalize(self, request: Request) -> RequestOutput:
         """Finalize a stream and return its complete transcript."""
         raise NotImplementedError
+
+
+def wants_speech_activity(request: Optional[Request]) -> bool:
+    """Whether this request asked for speech-activity output.
+
+    Mirrors ``wants_word_timings``: the per-request opt-in is what keeps the
+    cost off every other request.
+    """
+    options = getattr(request, "decoding", None) if request is not None else None
+    if options is None:
+        return False
+    return bool(getattr(options, "vad_events", False))
 
 
 # ----------------------------------------------------------------------------

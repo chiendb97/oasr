@@ -39,12 +39,19 @@ from .memory import (
     measure_peak_activation,
     read_device_memory,
 )
-from .metrics import TOKENS_GENERATED, EngineMetrics, build_metrics
+from .metrics import (
+    AUDIO_SECONDS_SKIPPED,
+    TOKENS_GENERATED,
+    VAD_SEGMENTS,
+    EngineMetrics,
+    build_metrics,
+)
 from .model_runner import ModelRunner
 from .output_processor import OutputProcessor
 from .request import DecodingOptions, Request, RequestOutput
 from .scheduler import Scheduler
 from .streaming_backend import get_streaming_backend_class
+from .vad_stage import OfflineVadSegmenter, StreamingVadStage
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +267,13 @@ class ASREngine:
             config, decode_type=decode_method, model=model, tokenizer=tokenizer
         )
 
+        # Resolve "auto" VAD and refuse a combination that cannot be served, at
+        # construction rather than on the first request.  Needs the strategy —
+        # which ASR-derived detector exists is a property of the decode family —
+        # so it lands right after the output processor.
+        self._vad_stage: Optional[StreamingVadStage] = None
+        self._resolve_vad(config, decode_method)
+
         # Ceiling on in-flight decoder KV for the AR families, derived from free
         # VRAM unless the operator supplied one (``0`` disables it).  Needs the
         # strategy — it owns the per-row footprint — so it lands after the output
@@ -377,6 +391,42 @@ class ASREngine:
                     window_s,
                     self._longform_overlap_samples / sr,
                 )
+
+        # VAD segmentation reuses the same fan-out and the same fan-in; only the
+        # splitter differs.  It *supersedes* the fixed-window splitter when both
+        # are configured: a cut that lands in silence is strictly better than one
+        # at an arbitrary sample count, and it needs no overlap, so the word-level
+        # dedup ``merge_texts`` does at a window seam becomes unnecessary.  That
+        # holds for a cut in a silence and only for one: a boundary with no gap
+        # around it is merged away in ``OfflineVadSegmenter.spans``, and the one
+        # seam that survives without a silence — a merged span too long for a
+        # fixed-window frontend — is re-split *with* the overlap below.
+        self._vad_splitter: Optional[OfflineVadSegmenter] = None
+        #: Width, in samples, to re-split a VAD span that a fixed-window frontend
+        #: cannot take whole.  ``_resolve_vad`` has already pinned
+        #: ``max_speech_s`` to ``window - 2 * speech_pad`` for such a frontend;
+        #: this is that same budget, and using the *full* window instead costs
+        #: real words — measured at +2.2 WER on whisper-tiny, which drops the
+        #: tail of a window with no padding left in it.
+        self._vad_resplit_samples = 0
+        vad_cfg = config.vad
+        if vad_cfg is not None and vad_cfg.mode == "segment" and config.service_mode == "offline":
+            device = torch.device(vad_cfg.device or "cpu")
+            self._vad_splitter = OfflineVadSegmenter(vad_cfg.resolve("offline"), device)
+            if self._longform is None:
+                self._longform = LongFormTracker()
+            feature_config = config.feature_config
+            assert feature_config is not None, "EngineConfig always materialises one"
+            fixed_window_s = feature_config.fixed_window_seconds
+            if fixed_window_s is not None:
+                budget_s = vad_cfg.resolve("offline").max_speech_s or fixed_window_s
+                self._vad_resplit_samples = int(int(feature_config.sample_rate) * float(budget_s))
+            logger.info(
+                "vad segmentation enabled: backend=%s on %s (supersedes the "
+                "fixed-window splitter)",
+                vad_cfg.backend,
+                device,
+            )
 
     # ------------------------------------------------------------------
     # VRAM-aware capacity sizing
@@ -601,6 +651,243 @@ class ASREngine:
     # Request management
     # ------------------------------------------------------------------
 
+    def _resolve_vad(self, config: EngineConfig, decode_method: str) -> None:
+        """Pin the VAD backend and check the mode is serviceable.
+
+        Three things are settled here, all of them at construction:
+
+        1. the detector's sample rate is the engine's, because the engine is
+           single-rate and never resamples — a detector running at another rate
+           would report spans in a different second than the transcript;
+        2. ``backend=None`` ("auto") becomes the concrete ASR-derived kind the
+           running decode family can feed, which is what makes *"no separate VAD
+           model configured"* a real configuration rather than a degraded one;
+        3. a mode the configured detector cannot serve raises **here**, naming
+           the gap, instead of producing one whole-file segment that a client
+           cannot distinguish from audio that really was one long utterance.
+        """
+        vad = config.vad
+        if vad is None or not vad.enabled:
+            return
+        from oasr.vad import get_vad_spec
+
+        # ``EngineConfig.__post_init__`` always materialises one; binding it here
+        # keeps the rest of this method free of the Optional and gives a clear
+        # failure if that invariant ever breaks.
+        feature_config = config.feature_config
+        assert feature_config is not None, "EngineConfig always materialises a feature_config"
+        feature_rate = int(feature_config.sample_rate)
+        if vad.sample_rate != feature_rate:
+            if vad.sample_rate != 16000:  # 16000 is the field default, i.e. unset
+                logger.warning(
+                    "vad.sample_rate=%d is ignored: the engine is single-rate and "
+                    "serves %d Hz, so the detector runs at that rate",
+                    vad.sample_rate,
+                    feature_rate,
+                )
+            vad.sample_rate = feature_rate
+
+        strategy = self._output_processor.strategy
+        family_kind = strategy.speech_activity_kind
+        streaming = config.service_mode == "streaming"
+
+        if vad.backend is None:
+            if family_kind is None:
+                raise ValueError(
+                    f"vad.mode={vad.mode!r} needs a speech detector, but "
+                    f"decode_method={decode_method!r} carries no per-frame "
+                    "speech signal of its own and no vad.backend was configured. "
+                    "Set --vad-backend (e.g. 'energy'), or run a decode family "
+                    "whose output carries one."
+                )
+            vad.backend = family_kind
+
+        spec = get_vad_spec(vad.backend)
+        if spec.needs_weights and not vad.model_dir:
+            raise ValueError(
+                f"vad.backend={vad.backend!r} is a model with its own weights, and "
+                "no vad.model_dir was given. Pass --vad-model-dir (or "
+                "VadConfig.model_dir); there is no fallback, because a detector "
+                "with uninitialised weights would report an activity trace that "
+                "looks like a distribution and means nothing."
+            )
+        if spec.is_asr_derived and vad.backend != family_kind:
+            own = repr(family_kind) if family_kind else "none"
+            raise ValueError(
+                f"vad.backend={vad.backend!r} reads a tensor that "
+                f"decode_method={decode_method!r} does not produce (this "
+                f"family's own detector is {own}). An ASR-derived detector is "
+                "tied to the family whose output it reads."
+            )
+        if spec.is_asr_derived and not strategy.asr_speech_activity_modes:
+            raise ValueError(
+                f"vad.backend={vad.backend!r} is this family's detector, but the "
+                "current configuration cannot supply it (a transducer under beam "
+                "search records labels rather than frames, and a Whisper snapshot "
+                "without a no-speech token has nothing to read). Configure a "
+                "separate detector with --vad-backend, or change the decode "
+                "configuration."
+            )
+
+        if (
+            vad.mode == "segment"
+            and streaming
+            and getattr(config, "overlap_partial_readback", False)
+        ):
+            # The overlapped read-back emits the *previous* emit step's partial,
+            # and it identifies a still-live stream by ``stream_id``.  A turn
+            # boundary frees and re-creates the decode session under the same
+            # stream_id, so a partial issued against the closed turn would be
+            # collected against the new one and published as if it belonged to
+            # it — the old turn's text, a turn late, in front of the new turn's.
+            raise ValueError(
+                "vad.mode='segment' cannot run with overlap_partial_readback=True: "
+                "a turn boundary recreates the decode session under the same "
+                "stream id, so an in-flight partial would be attributed to the "
+                "turn after the one it came from. Disable one of the two."
+            )
+        if not streaming and not spec.is_asr_derived and vad.mode != "segment":
+            # A waveform detector offline is wired for segmentation and nothing
+            # else: the post-hoc labelling path reads the *decode family's* own
+            # signal, so this combination would resolve cleanly and then produce
+            # no segments at all — a silent no-op, which is the one outcome this
+            # whole resolver exists to prevent.
+            raise ValueError(
+                f"vad.backend={vad.backend!r} is a waveform detector, and an "
+                f"offline engine only runs one for vad.mode='segment' (got "
+                f"{vad.mode!r}). Use --vad-mode segment to cut the audio at "
+                "speech boundaries, or drop --vad-backend to label it with the "
+                "decode family's own signal."
+            )
+
+        # ``segment`` needs a detector that can run *ahead* of the encoder, in
+        # both service modes and for the same reason: it is the mode that decides
+        # which audio the model sees.  Streaming needs ``stream`` on top, because
+        # there it has to reach that verdict incrementally.
+        if vad.mode == "segment":
+            roles = ("presegment", "stream") if streaming else ("presegment",)
+        else:
+            roles = ("stream",) if streaming else ("posthoc",)
+        for role in roles:
+            if spec.can(role):
+                continue
+            raise ValueError(
+                f"vad.backend={vad.backend!r} declares roles {list(spec.modes)}, "
+                f"which does not include {role!r} — what a "
+                f"{config.service_mode} engine in vad.mode={vad.mode!r} needs. "
+                + (
+                    "An ASR-derived detector reads what the encoder produced, so "
+                    "it cannot decide what the encoder sees; configure a waveform "
+                    "detector such as 'energy'."
+                    if spec.is_asr_derived and role == "presegment"
+                    else "Pick a detector that declares it."
+                )
+            )
+        if vad.mode == "endpoint" and not streaming:
+            raise ValueError(
+                "vad.mode='endpoint' is a streaming control: an offline request "
+                "already has exactly one utterance boundary, its end. Use "
+                "vad.mode='segment' to cut long audio at speech boundaries, or "
+                "'observe' to label it."
+            )
+        # A peaky detector cannot resolve a short silence from its own sparsity;
+        # raise the preset to what it declares it can actually tell apart, and
+        # say so, rather than letting the operator discover it from shredded
+        # segments.  Only ever raises: an operator who asked for *longer* keeps
+        # their value.
+        floor = int(spec.min_silence_floor_ms)
+        if floor > 0:
+            resolved = vad.resolve(config.service_mode)
+            if (resolved.min_silence_ms or 0) < floor:
+                logger.info(
+                    "vad.min_silence_ms raised %d -> %d ms: the %r signal is "
+                    "sparse between emissions and cannot resolve a shorter gap",
+                    resolved.min_silence_ms or 0,
+                    floor,
+                    vad.backend,
+                )
+                vad.min_silence_ms = floor
+
+        window_s = feature_config.fixed_window_seconds
+        if vad.mode == "segment" and window_s is not None:
+            # A fixed-window frontend pads and *trims* every utterance to its
+            # window, so a segment longer than it would be silently truncated —
+            # and admission would reject it outright.  The padding counts: a 30 s
+            # segment plus 400 ms on each side is 30.8 s, which does not fit.
+            # Resolve first to read the padding the preset chose, then pin the
+            # cap on the unresolved config so ``resolve`` honours it.
+            resolved = vad.resolve(config.service_mode)
+            budget = float(window_s) - 2.0 * resolved.speech_pad_seconds
+            if budget <= 0:
+                raise ValueError(
+                    f"vad.speech_pad_ms={resolved.speech_pad_ms} leaves no room in "
+                    f"the {feature_config.feature_type!r} frontend's "
+                    f"{window_s:.0f}s window; lower it."
+                )
+            if resolved.max_speech_s is None or resolved.max_speech_s > budget:
+                vad.max_speech_s = budget
+                logger.info(
+                    "vad.max_speech_s capped at %.2fs to fit the %r frontend's "
+                    "%.0fs window with %d ms of padding",
+                    budget,
+                    feature_config.feature_type,
+                    window_s,
+                    resolved.speech_pad_ms or 0,
+                )
+        resolved_cfg = vad.resolve(config.service_mode)
+        if streaming and vad.emits_events:
+            clock = getattr(strategy, "_clock", None)
+            if spec.is_asr_derived:
+                if clock is None:
+                    # Same refusal as word timings, for the same reason: a detector
+                    # fed a guessed frame rate reports boundaries that are plausible
+                    # and uniformly wrong by a constant factor.
+                    raise ValueError(
+                        f"vad.mode={vad.mode!r} needs the encoder frame rate, which "
+                        f"decode_method={decode_method!r} cannot resolve (no feature "
+                        "config or no declared subsampling). Speech-activity times "
+                        "would be scaled by an unknown constant."
+                    )
+                stage_spf = clock.seconds_per_frame
+                # An ASR-derived detector's tensor is produced on the engine's
+                # device and is large; keeping the detector beside it is free.
+                stage_device = torch.device(vad.device or config.device)
+            else:
+                stage_spf = spec.framing_for(resolved_cfg).seconds_per_frame(
+                    resolved_cfg.sample_rate
+                )
+                # A waveform detector reads the audio, which arrives on the host.
+                # Sending it to the GPU costs an H2D plus the device→host read of
+                # its own answer — a synchronisation per tick, inside the step
+                # loop, for a couple of pooling ops.  The offline splitter defaults
+                # to CPU for the same reason; ``vad.device`` overrides both.
+                stage_device = torch.device(vad.device or "cpu")
+            self._vad_stage = StreamingVadStage(
+                resolved_cfg,
+                seconds_per_frame=stage_spf,
+                device=stage_device,
+                detector_kwargs=strategy.speech_activity_kwargs(),
+            )
+        # The frame rate is the detector's, not the config's: an ASR-derived
+        # detector runs on the *encoder* grid (40 ms on a 4x-subsampled
+        # Conformer), and reporting the waveform hop here would understate the
+        # resolution by 4x for every one of them.
+        clock = getattr(strategy, "_clock", None)
+        if self._vad_stage is not None:
+            resolution_ms = 1000.0 * self._vad_stage.seconds_per_frame
+        elif spec.is_asr_derived and clock is not None:
+            resolution_ms = 1000.0 * clock.seconds_per_frame
+        else:
+            resolution_ms = float(resolved_cfg.hop_ms)
+        logger.info(
+            "voice activity: backend=%s mode=%s preset=%s min_silence=%dms " "resolution=%.0fms",
+            vad.backend,
+            vad.mode,
+            resolved_cfg.preset,
+            resolved_cfg.min_silence_ms or 0,
+            resolution_ms,
+        )
+
     def _resolve_sample_rate(self, sample_rate: Optional[int]) -> int:
         """Validate a caller-supplied rate, or default to the model's.
 
@@ -637,23 +924,78 @@ class ASREngine:
         from .longform import split_windows
 
         wave = torch.as_tensor(audio, dtype=torch.float32, device="cpu").reshape(-1)
-        if int(wave.numel()) <= self._longform_window_samples:
-            return None
 
-        windows = split_windows(wave, self._longform_window_samples, self._longform_overlap_samples)
+        spans: Optional[List[Tuple[int, int]]] = None
+        if self._vad_splitter is not None:
+            spans = self._vad_splitter.spans(wave)
+            if spans is None and 0 < self._vad_resplit_samples < int(wave.numel()):
+                # The detector found nothing to cut at, but this frontend cannot
+                # take the request whole.  Having asked for segmentation and got
+                # a rejection is the worst of both, so hand the undivided audio
+                # to the fixed-window splitter below.
+                spans = [(0, int(wave.numel()))]
+
+        if spans is not None:
+            windows: List[torch.Tensor] = []
+            starts: List[float] = []
+            for start, end in spans:
+                piece = wave[start:end]
+                if 0 < self._vad_resplit_samples < int(piece.numel()):
+                    # A span the VAD could find no silence in, longer than the
+                    # frontend's window: it has to be cut somewhere, so cut it at
+                    # the window.  Overlap is *not* added on its own initiative —
+                    # measured on whisper-tiny over noisy long-form audio, a 1 s
+                    # overlap cost +2.26 WER against a clean cut, because
+                    # ``merge_texts`` matches a repeated hallucination at the
+                    # seam and drops real words with it.  ``long_form`` is how a
+                    # caller opts into that trade.
+                    overlap = min(
+                        max(0, self._longform_overlap_samples), self._vad_resplit_samples - 1
+                    )
+                    stride = self._vad_resplit_samples - overlap
+                    subs = split_windows(piece, self._vad_resplit_samples, overlap)
+                    windows.extend(subs)
+                    starts.extend(
+                        (start + k * stride) / float(sample_rate) for k in range(len(subs))
+                    )
+                    continue
+                windows.append(piece)
+                starts.append(start / float(sample_rate))
+        else:
+            # No VAD, or VAD found nothing worth cutting at — fall back to the
+            # fixed-window splitter, which is a no-op for audio that already
+            # fits.  Returning here rather than fanning out a single child keeps
+            # "VAD found one span covering everything" identical to "VAD off".
+            if (
+                self._longform_window_samples <= 0
+                or int(wave.numel()) <= self._longform_window_samples
+            ):
+                return None
+            windows = split_windows(
+                wave, self._longform_window_samples, self._longform_overlap_samples
+            )
+            stride = self._longform_window_samples - self._longform_overlap_samples
+            starts = [(i * stride) / float(sample_rate) for i in range(len(windows))]
+
         parent_id = request_id or uuid.uuid4().hex
-        stride = self._longform_window_samples - self._longform_overlap_samples
-        child_ids: List[str] = []
-        starts: List[float] = []
-        for i, _w in enumerate(windows):
-            child_ids.append(self._longform.child_id(parent_id, i))
-            starts.append((i * stride) / float(sample_rate))
-        self._longform.register(parent_id, child_ids, starts)
+        tracker = self._longform
+        assert tracker is not None, "the caller only fans out when a tracker exists"
+        child_ids: List[str] = [tracker.child_id(parent_id, i) for i in range(len(windows))]
+        tracker.register(parent_id, child_ids, starts)
+        if spans is not None:
+            kept = sum(int(w.numel()) for w in windows)
+            self._metrics.incr(VAD_SEGMENTS, float(len(windows)))
+            self._metrics.incr(
+                AUDIO_SECONDS_SKIPPED,
+                max(0.0, (int(wave.numel()) - kept) / float(sample_rate)),
+            )
         logger.debug(
-            "long-form request %s: %.1fs -> %d windows",
+            "%s request %s: %.1fs -> %d segments (%.1fs of speech)",
+            "vad-segmented" if spans is not None else "long-form",
             parent_id,
             wave.numel() / float(sample_rate),
             len(windows),
+            sum(int(w.numel()) for w in windows) / float(sample_rate),
         )
         # Bulk admission so the windows land in one batch — they are independent,
         # which is exactly what makes the batched path applicable here.
@@ -1056,6 +1398,13 @@ class ASREngine:
         )
         with self._lock:
             self._validate_mode(True)
+            # Same check the batched and single-shot paths already make.  Without
+            # it the *documented* way to open a stream accepted per-request
+            # options the running family cannot act on and answered with a
+            # transcript of something else — and the refusal has to land here,
+            # at open, rather than after the client has been told the stream is
+            # live and has started sending audio.
+            self._validate_decoding(req)
             self._executor.admit(req)
         return req.request_id
 
@@ -1192,6 +1541,7 @@ class ASREngine:
                 config=config,
                 device=self._device,
                 metrics=self._metrics,
+                vad_stage=self._vad_stage,
             )
         # Offline: the scheduler partitions each batch into micro-batches
         # (length-bucketed, padded-frame-capped, or sequence-packed — all

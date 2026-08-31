@@ -222,6 +222,9 @@ class TestPerRequestOptionTable:
             "task",
             "language",
             "word_timestamps",
+            "single_utterance",
+            "vad_events",
+            "endpoint_silence_ms",
         )
 
     def test_every_field_survives_a_dict_round_trip(self):

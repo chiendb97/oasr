@@ -71,6 +71,16 @@ DECODE_SLOTS_IN_USE = "oasr_engine_decode_slots_in_use"
 DECODE_SLOTS_CAPACITY = "oasr_engine_decode_slots_capacity"
 TOKENS_GENERATED = "oasr_engine_tokens_generated_total"
 AUDIO_SECONDS = "oasr_engine_audio_seconds_total"
+#: Turns ended by the endpointer rather than by the audio running out.  Counted
+#: where the decision is made, because nothing downstream can tell the two apart
+#: from the transcript alone.
+ENDPOINTS = "oasr_engine_endpoints_total"
+#: Speech spans ``vad.mode="segment"`` cut a request into — offline children or
+#: streaming turns — and the audio seconds it dropped.  The pair is the honest
+#: report of what VAD bought: the second number is encoder work that did not
+#: happen.
+VAD_SEGMENTS = "oasr_engine_vad_segments_total"
+AUDIO_SECONDS_SKIPPED = "oasr_engine_audio_seconds_skipped_total"
 SAMPLES_DROPPED = "oasr_engine_metric_samples_dropped_total"
 
 GPU_MEMORY_USED = "oasr_gpu_memory_used_bytes"
@@ -92,6 +102,7 @@ STAGES = frozenset(
         "streaming.features",
         "streaming.encode",
         "streaming.decode",
+        "streaming.vad",
         "streaming.finalize",
     }
 )

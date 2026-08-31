@@ -159,6 +159,17 @@ _ASSET_LIST: List[Asset] = [
         how="huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b",
     ),
     Asset(
+        env="SILERO_VAD_DIR",
+        kind=CHECKPOINT,
+        what="Silero VAD v5 weights (the upstream TorchScript archive)",
+        relpath="silero_vad",
+        marker="silero_vad.jit",
+        how=(
+            "curl -L -o silero_vad.jit https://raw.githubusercontent.com/snakers4/"
+            "silero-vad/master/src/silero_vad/data/silero_vad.jit  (MIT, 2.2 MB)"
+        ),
+    ),
+    Asset(
         env="LANG_DIR",
         kind=GRAPH,
         what="prebuilt lang dir (HLG.pt + words.txt) for the CPU WFST decoder",

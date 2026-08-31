@@ -34,6 +34,7 @@ CPU = torch.device("cpu")
 
 def make_config(
     *,
+    prefill_kv_window: bool = False,
     num_layers: int = 4,
     n_kv_head: int = 2,
     head_dim: int = 8,
@@ -60,6 +61,7 @@ def make_config(
         max_batch_size=max_batch_size,
         device=device,
         dtype=dtype,
+        prefill_kv_window=prefill_kv_window,
     )
 
 
@@ -1188,3 +1190,113 @@ class TestPrefilledKvWindow:
                 device=CPU,
                 dtype=torch.float32,
             )
+
+
+# ---------------------------------------------------------------------------
+# Turn-boundary reset (vad.mode="segment")
+# ---------------------------------------------------------------------------
+
+
+class TestStreamReset:
+    """Rewinding a live stream without releasing its slot.
+
+    The alternative — ``free_stream`` + ``allocate_stream`` — is correct on the
+    blocks and wrong on everything addressed by slot: the persistent block table,
+    the CNN cache and the feature staging are rows a CUDA graph captured by
+    address, and a pool sized exactly to ``max_batch_size`` would have to hand
+    the row back and re-take it at every turn boundary.
+    """
+
+    def test_it_returns_the_blocks_and_zeroes_the_slot(self):
+        cfg = make_config(num_layers=2, chunk_size=4, block_size_frames=4, max_num_blocks=16)
+        pool = BlockPool(cfg)
+        mgr = AttentionCacheManager(pool, cfg)
+        mgr.allocate_stream(7, slot_id=3)
+        free_after_allocate = pool.num_free_blocks
+        for _ in range(3):
+            mgr.prepare_chunk(7)
+            mgr.commit_chunk_paged(7, chunk_frames=4)
+        assert int(mgr.cache_seqlens[3].item()) == 12
+        assert pool.num_free_blocks == free_after_allocate - 3
+
+        mgr.reset_stream(7)
+        assert pool.num_free_blocks == free_after_allocate, "blocks did not come back"
+        assert int(mgr.cache_seqlens[3].item()) == 0
+        assert int(mgr.block_table[3].abs().sum().item()) == 0
+        assert mgr.slot_of(7) == 3, "the slot must survive the reset"
+        # And it is usable again, from the top.
+        mgr.prepare_chunk(7)
+        mgr.commit_chunk_paged(7, chunk_frames=4)
+        assert int(mgr.cache_seqlens[3].item()) == 4
+
+    def test_it_leaves_a_neighbours_rows_alone(self):
+        cfg = make_config(num_layers=1, chunk_size=4, block_size_frames=4, max_num_blocks=16)
+        pool = BlockPool(cfg)
+        mgr = AttentionCacheManager(pool, cfg)
+        mgr.allocate_stream(1, slot_id=0)
+        mgr.allocate_stream(2, slot_id=1)
+        for sid in (1, 2):
+            mgr.prepare_chunk(sid)
+            mgr.commit_chunk_paged(sid, chunk_frames=4)
+        mgr.reset_stream(1)
+        assert int(mgr.cache_seqlens[0].item()) == 0
+        assert int(mgr.cache_seqlens[1].item()) == 4, "the other stream was disturbed"
+
+    def test_a_prefilled_window_is_re_armed(self):
+        """A reset that skipped the prefill would leave the stream reporting a
+        shorter ``cache_seqlens`` than its cohort — exactly the relative-position
+        mismatch the prefill exists to avoid."""
+        cfg = make_config(
+            num_layers=1,
+            chunk_size=4,
+            block_size_frames=4,
+            num_left_chunks=2,
+            max_num_blocks=64,
+            prefill_kv_window=True,
+        )
+        pool = BlockPool(cfg)
+        mgr = AttentionCacheManager(pool, cfg)
+        mgr.allocate_stream(5, slot_id=2)
+        armed_seqlen = int(mgr.cache_seqlens[2].item())
+        armed_free = pool.num_free_blocks
+        assert armed_seqlen > 0, "this config is supposed to prefill"
+
+        mgr.prepare_chunks_batched([5])
+        mgr.commit_chunk_paged(5, chunk_frames=4)
+        mgr.reset_stream(5)
+        assert int(mgr.cache_seqlens[2].item()) == armed_seqlen
+        assert pool.num_free_blocks == armed_free
+
+    def test_the_cnn_cache_goes_back_to_its_initial_zeros(self):
+        """Zeroing is not hygiene — a convolutional left context of zeros *is*
+        the initial state, which is what "this chunk starts a new stream" means
+        to the encoder."""
+        cfg = make_config(num_layers=2, kernel_size=5, hidden_dim=16)
+        mgr = CnnCacheManager(cfg)
+        mgr.allocate_stream(4, slot_id=1)
+        mgr.update(4, torch.ones_like(mgr.get_cache(4)))
+        assert mgr.get_cache(4).abs().sum() > 0
+        mgr.reset_stream(4)
+        assert mgr.get_cache(4).abs().sum() == 0
+        assert mgr.slot_of(4) == 1
+
+    def test_a_recurrent_cache_resets_its_ring_parity(self):
+        """The step count is the stream's read parity, so a reset that left it
+        alone would read the new turn's first state out of the half the old turn
+        wrote — stale context wearing a fresh slot."""
+        from oasr.cache.recurrent_state import RecurrentStateCache
+
+        cache = RecurrentStateCache(
+            num_layers=2,
+            hidden_size=8,
+            max_batch_size=4,
+            device=CPU,
+            dtype=torch.float32,
+        )
+        cache.allocate_stream(9, slot_id=0)
+        cache.commit_step([9])
+        assert cache.steps_taken(9) == 1
+        cache.hidden(0)[:, 0].fill_(1.0)
+        cache.reset_stream(9)
+        assert cache.steps_taken(9) == 0
+        assert cache.hidden(0)[:, 0].abs().sum() == 0

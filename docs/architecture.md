@@ -9,7 +9,7 @@ vLLM / SGLang, adapted to ASR (an acoustic **encoder** feeding a **decode** stag
 that is either non-autoregressive CTC/Paraformer or an autoregressive
 transducer/AED/LLM loop).
 
-## The seven seams
+## The eight seams
 
 | Axis | Base class | Registry / builder | Selected by | Detail |
 |------|-----------|--------------------|-------------|--------|
@@ -147,7 +147,7 @@ for checkpoints trained with the approximation.
 ## Data flow
 
 ```
-Request → InputProcessor (fbank) → Scheduler (BatchingPolicy + PartitionPolicy)
+Request → [VAD segmenter] → InputProcessor (fbank) → Scheduler (BatchingPolicy + PartitionPolicy)
    → ModelRunner
         ├─ offline:   model.forward_offline / forward_offline_packed → enc_out
         └─ streaming: StreamingEncoderBackend.forward_step           → enc_out
@@ -284,6 +284,42 @@ expand a prefilled batch into a `B*k` grid and reorder it onto each slot's
 parent.  Both are gated by the same property — beam width 1 must reproduce
 greedy token-for-token — which is the only exactness oracle available without a
 reference implementation.
+
+**Add a speech detector** (e.g. Silero, MarbleNet, FSMN-VAD):
+1. Subclass `oasr.vad.SpeechDetector` and implement whichever entry point your
+   declared `consumes` names — `detect` for a waveform, `detect_from_asr` for a
+   tensor the ASR produced. Build it from `oasr.layers` like any other model.
+2. `register_vad(VadSpec(...))`. Three declarations carry consequences:
+   * `consumes` decides which entry point the engine calls, and makes *"an
+     ASR-derived detector cannot pre-segment"* a fact of the type — the registry
+     **refuses** a spec that claims `presegment` with an ASR-derived `consumes`,
+     at registration rather than at first request;
+   * `modes` is the role set (`presegment` / `stream` / `posthoc`), checked
+     against the engine's service mode and `vad.mode` at construction — a
+     streaming `vad.mode="segment"` needs `presegment` *and* `stream`, because
+     there the detector has to decide what the encoder sees, incrementally;
+   * `min_silence_floor_ms` is the shortest silence the signal can distinguish
+     from its own sparsity. The ASR-derived signals are peaky, and without this
+     the streaming preset's 100 ms would be applied to a spike train;
+   * `needs_weights` says the detector is a model of its own, so the engine
+     refuses a configuration with no `vad.model_dir` at construction and names
+     the flag — rather than the factory discovering it, or worse, a randomly
+     initialised network producing an activity trace that looks like a
+     distribution.
+3. A detector with a *trained* window declares its own `framing`; one whose grid
+   is the encoder's leaves it `None` and is told `seconds_per_frame`.
+4. A detector that carries state across chunks sets `stateful` and implements
+   `detect_streaming` plus `stack_states` / `unstack_states`. The last pair is
+   what keeps the streaming stage's detector call **batched across the pool**:
+   the stage holds N opaque per-stream states and only the detector knows how to
+   lay them out as a batch — the same protocol the transducer predictor uses.
+
+The segmenter and the endpointer are **not** part of the axis — they are shared
+policy, so every detector produces the same segment semantics, the same knobs and
+the same events. That split is what makes a neural VAD and a CTC blank posterior
+interchangeable downstream, and it is why the policy half is tested against
+synthetic probability traces with no GPU and no checkpoint. See
+[vad.md](vad.md).
 
 **Add a batching / partition policy:** `@register_batching_policy("my")` /
 `@register_partition_policy("my")`; set `config.schedule_policy` or the partition

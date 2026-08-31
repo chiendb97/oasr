@@ -89,7 +89,7 @@ from .functionals.norm import (
     rms_norm,
     rms_norm_activation,
 )
-from .functionals.pooling import avg_pool1d
+from .functionals.pooling import avg_pool1d, max_pool1d
 from .functionals.recurrent import (
     lstm_gemm_layer,
     lstm_layer,
@@ -242,6 +242,7 @@ __all__ = [
     "batch_norm_swish",
     "cmvn",
     "avg_pool1d",
+    "max_pool1d",
     "lstm_layer",
     "lstm_slot_step",
     "rnn_layer",

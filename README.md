@@ -34,6 +34,9 @@ OASR is flexible and easy to use with:
 - Real-world audio in: MP3, M4A/AAC, FLAC, OGG, WAV, AIFF and G.711 telephony, at any sample rate
 - Word-level timestamps and confidences across CTC, RNN-T, AED and CIF — each from the model's own
   alignment, and refused rather than faked by the families that have none
+- Voice activity detection as its own extension axis — segment long audio at speech boundaries,
+  end streaming turns on silence, with a separate VAD model (Silero v5, rebuilt on `oasr.layers`)
+  **or** with the ASR model's own per-frame output when none is configured
 - An `oasr` CLI and a Python client, so nothing needs writing to try it
 
 ## Supported Models
@@ -261,6 +264,7 @@ Start at the [documentation index](docs/README.md).
 | [`docs/kernels.md`](docs/kernels.md)                 | CUDA/CUTLASS layer, the JIT pipeline, the functional API |
 | [`docs/checkpoints.md`](docs/checkpoints.md)         | Checkpoint resolution, converter contract, native format |
 | [`docs/features.md`](docs/features.md)               | Feature frontends, `FeatureSpec`, streaming framing   |
+| [`docs/vad.md`](docs/vad.md)                         | Voice activity: detectors, segmentation, endpointing  |
 | [`docs/tokenizers.md`](docs/tokenizers.md)           | Tokenizer axis: kinds and `TokenizerSpec`             |
 | [`docs/cache_manager.md`](docs/cache_manager.md)     | Paged streaming cache (`BlockPool`, `StreamContext`)  |
 | [`docs/ctc_decoder_gpu.md`](docs/ctc_decoder_gpu.md) | GPU CTC decoder, single- and multi-request flows      |

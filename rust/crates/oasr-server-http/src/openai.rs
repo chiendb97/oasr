@@ -168,6 +168,11 @@ struct AudioForm {
     response_format: ResponseFormat,
     temperature: Option<f32>,
     granularities: Vec<String>,
+    /// `chunking_strategy`: `"auto"`, or a JSON `server_vad` object.  Only its
+    /// presence is read here — the thresholds inside it are engine-level
+    /// settings on this server, and the handler rejects them rather than
+    /// accepting numbers it will not apply.
+    chunking_strategy: Option<String>,
     stream: bool,
 }
 
@@ -187,6 +192,7 @@ async fn read_form(mut form: Multipart) -> Result<AudioForm, Response> {
         response_format: ResponseFormat::default(),
         temperature: None,
         granularities: Vec::new(),
+        chunking_strategy: None,
         stream: false,
     };
     loop {
@@ -217,6 +223,11 @@ async fn read_form(mut form: Multipart) -> Result<AudioForm, Response> {
             "timestamp_granularities" | "timestamp_granularities[]" => {
                 if let Ok(v) = field.text().await {
                     out.granularities.push(v.trim().to_ascii_lowercase());
+                }
+            }
+            "chunking_strategy" => {
+                if let Ok(v) = field.text().await {
+                    out.chunking_strategy = Some(v.trim().to_string());
                 }
             }
             "model" | "language" | "prompt" | "response_format" | "temperature" | "stream" => {
@@ -256,7 +267,7 @@ async fn read_form(mut form: Multipart) -> Result<AudioForm, Response> {
                     _ => unreachable!("outer match limits the names"),
                 }
             }
-            // Everything else (`chunking_strategy`, `include[]`, …) is read and
+            // Everything else (`include[]`, …) is read and
             // dropped so the body is fully consumed.
             _ => {
                 let _ = field.bytes().await;
@@ -301,6 +312,18 @@ impl AudioForm {
             && self.granularities.iter().any(|g| g == "word")
     }
 
+    /// Whether this request asked for speech spans.
+    ///
+    /// Two ways in, because OpenAI has two: `chunking_strategy` (`"auto"`, or a
+    /// `server_vad` object) says *cut the audio on speech*, and `verbose_json`
+    /// carries a `segments` array that until now held one whole-file row.  Both
+    /// resolve to the same engine option, because both mean "tell me where the
+    /// speech is".
+    fn wants_segments(&self) -> bool {
+        self.chunking_strategy.is_some()
+            && matches!(self.response_format, ResponseFormat::VerboseJson)
+    }
+
     /// Map the form's knobs to the engine's per-request decoding options.
     fn decoding_params(&self, endpoint: Endpoint) -> Result<Option<DecodingParams>, String> {
         DecodingParams {
@@ -315,6 +338,12 @@ impl AudioForm {
             task: normalize_task(endpoint.task()),
             language: normalize_optional_language(self.language.as_deref())?,
             word_timestamps: self.wants_words().then_some(true),
+            // A buffered upload has no turn to end; `chunking_strategy` asks
+            // for VAD *segmentation*, which is an engine mode rather than a
+            // per-request control, and it is honoured through `vad_events`.
+            single_utterance: None,
+            vad_events: self.wants_segments().then_some(true),
+            endpoint_silence_ms: None,
         }
         .validated()
     }
@@ -323,6 +352,98 @@ impl AudioForm {
 // ---------------------------------------------------------------------------
 // Response bodies
 // ---------------------------------------------------------------------------
+
+/// Build the `verbose_json` segment array.
+///
+/// Without voice activity this is what it has always been: one row spanning the
+/// utterance, because that is the only span the engine actually knows about.
+/// With it, one row per detected speech span — real boundaries, from a detector,
+/// rather than a single row standing in for the file.
+///
+/// The per-segment `text` stays empty on the multi-span path, and that is
+/// deliberate rather than lazy: the engine returns one transcript for the
+/// request, and slicing it by time would need a token→segment assignment that
+/// only the word timings can give. Inventing a split would produce text that
+/// looks authoritative and is guessed. `verbose_json` clients read the top-level
+/// `text` for the transcript and the segment array for the timing, which is what
+/// this gives them.
+fn verbose_segments(
+    text: &str,
+    spans: Option<&[oasr_wire::SpeechSegment]>,
+    tokens: &[u32],
+    end: f32,
+    temperature: Option<f32>,
+    no_speech_prob: Option<f32>,
+) -> Vec<VerboseSegment> {
+    match spans {
+        Some(spans) if !spans.is_empty() => spans
+            .iter()
+            .enumerate()
+            .map(|(i, s)| VerboseSegment {
+                id: i as u32,
+                seek: 0,
+                start: s.start,
+                end: s.end,
+                text: String::new(),
+                tokens: Vec::new(),
+                temperature,
+                // Per span, this is what the detector measured there — which is
+                // a different quantity from the decode family's whole-window
+                // `no_speech_prob`, so only one of the two is ever attached.
+                no_speech_prob: Some((1.0 - s.speech_prob).clamp(0.0, 1.0)),
+            })
+            .collect(),
+        _ => vec![VerboseSegment {
+            id: 0,
+            seek: 0,
+            start: 0.0,
+            end,
+            text: text.to_string(),
+            tokens: tokens.to_vec(),
+            temperature,
+            no_speech_prob,
+        }],
+    }
+}
+
+/// Accept `chunking_strategy`, or say exactly what about it cannot be honoured.
+///
+/// `"auto"` and a bare `{"type": "server_vad"}` are served.  The thresholds
+/// inside the object are engine-level settings on this server, and a request
+/// that set one and saw no change would have no way to tell — the same reason
+/// `timestamp_granularities[]` is rejected outside `verbose_json` rather than
+/// dropped.
+fn validate_chunking_strategy(raw: &str) -> Result<(), String> {
+    let trimmed = raw.trim().trim_matches('"');
+    if trimmed.eq_ignore_ascii_case("auto") {
+        return Ok(());
+    }
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
+        format!("chunking_strategy must be \"auto\" or a server_vad object, got {raw:?}")
+    })?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("chunking_strategy must be \"auto\" or an object, got {raw:?}"))?;
+    match object.get("type").and_then(serde_json::Value::as_str) {
+        Some("server_vad") => {}
+        Some(other) => {
+            return Err(format!(
+                "chunking_strategy type {other:?} is not supported; this server \
+                 segments acoustically, so only \"server_vad\" is available"
+            ))
+        }
+        None => return Err("chunking_strategy object needs a \"type\"".to_string()),
+    }
+    for key in ["threshold", "prefix_padding_ms", "silence_duration_ms"] {
+        if object.contains_key(key) {
+            return Err(format!(
+                "{key} is an engine-level setting on this server; start it with \
+                 --vad-option instead of sending it per request"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// One segment of a `verbose_json` response.
 ///
@@ -339,6 +460,12 @@ struct VerboseSegment {
     tokens: Vec<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// Probability the audio carries no speech, where the decode family
+    /// produces one.  Still omitted rather than defaulted when it does not:
+    /// `0.0` would read as "definitely speech", which is a claim, not an
+    /// absence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_speech_prob: Option<f32>,
 }
 
 /// One word of a `verbose_json` response — OpenAI's shape exactly.
@@ -453,6 +580,23 @@ async fn handle_audio(State(s): State<AppState>, form: Multipart, endpoint: Endp
                 "timestamp_granularities[] requires response_format=verbose_json",
             );
         }
+
+        // Same rule for `chunking_strategy`, for the same reason: only
+        // `verbose_json` has a `segments` array to render the answer into.
+        if form.chunking_strategy.is_some()
+            && !matches!(form.response_format, ResponseFormat::VerboseJson)
+        {
+            return invalid_request(
+                Some("chunking_strategy"),
+                "chunking_strategy requires response_format=verbose_json, which is \
+                 the only format with a segments array to report the spans in",
+            );
+        }
+        if let Some(raw) = form.chunking_strategy.as_deref() {
+            if let Err(message) = validate_chunking_strategy(raw) {
+                return invalid_request(Some("chunking_strategy"), message);
+            }
+        }
         if form
             .granularities
             .iter()
@@ -563,15 +707,14 @@ async fn handle_audio(State(s): State<AppState>, form: Multipart, endpoint: Endp
                     .as_deref()
                     .and_then(oasr_wire::normalize_language),
                 duration: duration_s,
-                segments: vec![VerboseSegment {
-                    id: 0,
-                    seek: 0,
-                    start: 0.0,
+                segments: verbose_segments(
+                    &final_.text,
+                    final_.segments.as_deref(),
+                    final_.tokens.first().map(Vec::as_slice).unwrap_or(&[]),
                     end,
-                    text: final_.text.clone(),
-                    tokens: final_.tokens.first().cloned().unwrap_or_default(),
-                    temperature: form.temperature,
-                }],
+                    form.temperature,
+                    final_.no_speech_prob,
+                ),
                 words: form.wants_words().then(|| {
                     final_
                         .words
@@ -733,6 +876,7 @@ mod tests {
             response_format: ResponseFormat::Json,
             temperature: None,
             granularities: Vec::new(),
+            chunking_strategy: None,
             stream: false,
         };
         assert_eq!(form(Some("audio/mpeg"), None).hint(), Some("audio/mpeg"));
@@ -760,6 +904,7 @@ mod tests {
             response_format: ResponseFormat::Json,
             temperature: None,
             granularities: Vec::new(),
+            chunking_strategy: None,
             stream: false,
         };
         let p = form
@@ -790,6 +935,7 @@ mod tests {
             response_format: ResponseFormat::Json,
             temperature: None,
             granularities: Vec::new(),
+            chunking_strategy: None,
             stream: false,
         };
         assert_eq!(
@@ -829,6 +975,7 @@ mod tests {
             response_format: ResponseFormat::Json,
             temperature: None,
             granularities: Vec::new(),
+            chunking_strategy: None,
             stream: false,
         };
         let err = form

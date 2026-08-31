@@ -33,7 +33,7 @@ Python functional API (oasr/<family>.py)  — @oasr_api decorated
 | `include/oasr/activation.cuh` | Vectorized exact GELU, sigmoid, tanh, ReLU, GLU, Swish, and Swoosh activations; unary sigmoid/tanh/ReLU also consume regular padded row strides such as channel chunks without a copy |
 | `include/oasr/norm.cuh` + `norm_dispatch.inc` | LayerNorm, RMSNorm, fused add+LayerNorm/RMSNorm (with optional residual passthrough), BatchNorm1d, GroupNorm, fused norm+activation |
 | `include/oasr/conv/` | `conv1d.cuh` + `conv1d_dispatch.inc` (depthwise with asymmetric padding and optional FSMN mask/residual fusion, pointwise, causal); dense BTC Conv1D is the height-one specialization of the `conv2d.cuh` CUTLASS facade |
-| `include/oasr/pooling.cuh` | BTC AvgPool1D; vectorized 2×2 production specialization plus generic padding/ceil/count semantics |
+| `include/oasr/pooling.cuh` | BTC AvgPool1D and MaxPool1D; vectorized 2×2 specialization, generic padding/ceil/count semantics, and a flat narrow-channel path for one-channel traces |
 | `include/oasr/recurrent/` | LSTM and tanh/ReLU RNN inference: fused GEMV/cohort kernels (`recurrent.cuh`), CUTLASS 2.x recurrent GEMM and state epilogues (`recurrent_cutlass.cuh`) with Stream-K/Split-K candidates, and the CUTLASS 3.x TMA warp-specialized path for SM90/SM100 (`recurrent_cutlass_sm90.cuh`) |
 | `include/oasr/gemm/` | `gemm.cuh` facade, `bmm.cuh`, `group_gemm.cuh` |
 | `include/oasr/{softmax,topk,fft,features}.cuh`, `sort/` | The remaining families |
@@ -75,7 +75,7 @@ VecSize / block_size dispatch macros instead.
 | Grouped / depthwise Conv2D | **direct** | `grouped_conv2d.cuh` | NHWC 3×3/7×7 specializations; bias and optional activation share the convolution launch |
 | Norm | **dispatch** | `norm_dispatch.inc` | Direct compilation, block/vec macro |
 | Activation | **dispatch** | `activation_dispatch.inc` | Direct compilation, VecSize macro |
-| Pooling | **direct** | `pooling.cuh` | 128-bit channel vectors in BTC layout; specialized 2×2 and generic launches |
+| Pooling | **direct** | `pooling.cuh` | 128-bit channel vectors in BTC layout; specialized 2×2, generic, and narrow-channel launches |
 | Recurrent | **direct + CUTLASS** | `recurrent/recurrent.cuh` + `recurrent/recurrent_cutlass{,_sm90}.cuh` | fused low-latency GEMV at small batch, shared-weight batch warps for cohorts, sequence-wide input projection, state epilogues, autotuned Stream-K/Split-K for wide states, and TMA warp-specialized collectives on SM90/SM100 |
 
 - **JIT mode** (`OASR_TARGET_SM` defined): a single SM instantiation, with an
@@ -229,7 +229,7 @@ allocates its output tensor, and calls into the compiled module.
 | `oasr/functionals/norm.py` | `layer_norm`, `rms_norm`, `batch_norm1d`, `group_norm`, fused norm+activation |
 | `oasr/functionals/conv.py` | dense / depthwise / pointwise / causal Conv1D; dense, grouped and depthwise Conv2D. Dense NHWC 1×1 Conv2D dispatches as GEMM; Conv1D depthwise padding may be an integer or `(left, right)` pair |
 | `oasr/functionals/activation.py` | standalone exact-erf `gelu`, `sigmoid`, `tanh`, `relu`, `glu`, `swish`, `swoosh_l`, `swoosh_r` |
-| `oasr/functionals/pooling.py` | BTC/TC `avg_pool1d`, including symmetric padding, ceil mode, and `count_include_pad` |
+| `oasr/functionals/pooling.py` | BTC/TC `avg_pool1d` and `max_pool1d`, including symmetric padding and ceil mode (`count_include_pad` for avg; `dilation` and `return_indices` are refused, not ignored) |
 | `oasr/functionals/softmax.py`, `oasr/functionals/topk.py`, `oasr/functionals/fft.py` | `softmax`, `log_softmax`, `masked_softmax` (one pass over an attention score tensor: an additive bias and two boolean masks, each **broadcast against the scores through its own strides**, so a shifted `as_strided` relative-position window or a `[..., ::ds]` mask slice is consumed where it is), `topk`, `rfft` / `rfft_power` |
 | `oasr/functionals/feature.py` | `stft_frame`, `dct_lifter`, `fbank_preprocess`, `mel_log`, `whisper_logmel`, `lfr_gather` — see [features.md](features.md) |
 | `oasr/functionals/attention.py` | `fmha(...)` and `fmha.persistent_inputs(...)` |

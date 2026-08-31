@@ -11,11 +11,21 @@ import torch.nn as nn
 
 import oasr
 
+from ._backend import use_softmax_kernel
+
 
 class Softmax(nn.Module):
-    """Wrapper for softmax kernel (operates on the last dimension)."""
+    """Softmax over the last dimension.
+
+    Owns both paths, like every other member of the waist.  It used to call the
+    kernel unconditionally, which made it the one layer that *raised* on a CPU
+    tensor instead of routing to torch — and CPU is an out-of-scope input, not
+    a kernel gap, so raising there contradicts the backend contract.
+    """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not use_softmax_kernel(x):
+            return torch.softmax(x, dim=-1)
         # Annotated rather than returned directly: ``@oasr_api`` is an untyped
         # decorator, so every functional it wraps is ``Any`` to mypy.
         out: torch.Tensor = oasr.softmax(x)

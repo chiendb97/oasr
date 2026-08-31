@@ -34,6 +34,9 @@ CSV_COLUMNS = [
     "decode_options",
     "service_mode",
     "chunk_size",
+    "vad_mode",
+    "vad_backend",
+    "vad_options",
     "dtype",
     "max_batch_size",
     "metric",
@@ -62,6 +65,9 @@ class Row:
     decode_options: str
     service_mode: str
     chunk_size: int
+    vad_mode: str
+    vad_backend: str
+    vad_options: str
     dtype: str
     max_batch_size: int
     metric: str
@@ -216,6 +222,10 @@ def run_one(
     decode_options: Dict[str, str],
     service_mode: str,
     chunk_size: Optional[int],
+    vad_mode: str,
+    vad_backend: Optional[str],
+    vad_model_dir: Optional[str],
+    vad_options: Dict[str, str],
     dtype: str,
     max_batch_size: int,
     metric: str,
@@ -253,6 +263,17 @@ def run_one(
     # construction rather than decoding something subtly wrong.
     if streaming and chunk_size:
         cfg_kwargs["chunk_size"] = chunk_size
+    # Same string-passing discipline as ``decode_options``: ``VadConfig.coerce``
+    # types each key against its declared field, so an unknown or unparseable
+    # one fails here instead of being measured as if it had been applied.
+    if vad_mode and vad_mode != "off":
+        vad_cfg: Dict[str, str] = {"mode": vad_mode}
+        if vad_backend:
+            vad_cfg["backend"] = vad_backend
+        if vad_model_dir:
+            vad_cfg["model_dir"] = vad_model_dir
+        vad_cfg.update(vad_options)
+        cfg_kwargs["vad"] = vad_cfg
     cfg = EngineConfig(**cfg_kwargs)
     engine = ASREngine(cfg)
     # Report the chunk actually run, not the flag: 0 on the CLI means "whatever
@@ -297,6 +318,12 @@ def run_one(
         decode_options=" ".join(f"{k}={v}" for k, v in sorted(decode_options.items())) or "-",
         service_mode=service_mode,
         chunk_size=effective_chunk,
+        vad_mode=vad_mode,
+        # The engine resolves an unset backend to the decode family's own
+        # detector, so record what was asked for and mark the auto case rather
+        # than printing an empty cell.
+        vad_backend=(vad_backend or ("(auto)" if vad_mode != "off" else "-")),
+        vad_options=" ".join(f"{k}={v}" for k, v in sorted(vad_options.items())) or "-",
         dtype=dtype,
         max_batch_size=max_batch_size,
         metric=metric,
@@ -395,6 +422,41 @@ def build_parser() -> argparse.ArgumentParser:
         "sweep, so an offline run is not multiplied by an axis it ignores.",
     )
     p.add_argument(
+        "--vad-mode",
+        nargs="+",
+        default=["off"],
+        choices=["off", "observe", "endpoint", "segment"],
+        metavar="M",
+        help="One row per voice-activity mode. `off` is the negative control "
+        "and must leave every transcript identical; `segment` cuts the audio "
+        "at speech boundaries, so it is the one that can change WER.",
+    )
+    p.add_argument(
+        "--vad-backend",
+        nargs="+",
+        default=[""],
+        metavar="B",
+        help="One row per detector (`energy`, `silero`, `ctc_blank`, ...). "
+        "Empty means the engine's auto choice: the decode family's own "
+        "ASR-derived detector. Only expanded into rows when --vad-mode is not "
+        "`off`, so a control row is not multiplied by an axis it ignores.",
+    )
+    p.add_argument(
+        "--vad-model-dir",
+        default=_envstr("SILERO_VAD_DIR", None),
+        metavar="DIR",
+        help="Weights for a detector that has them (default: $SILERO_VAD_DIR)",
+    )
+    p.add_argument(
+        "--vad-option",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Segmenter/endpointer knob, repeatable (e.g. --vad-option "
+        "min_silence_ms=1500). Applies to every row in the sweep and is "
+        "recorded in the CSV.",
+    )
+    p.add_argument(
         "--dtype",
         nargs="+",
         default=["float16"],
@@ -428,6 +490,29 @@ def build_parser() -> argparse.ArgumentParser:
         "read-aloud parentheticals from the reference. See build_manifest().",
     )
     return p
+
+
+def _vad_tag(vad_mode: str, vad_backend: str) -> str:
+    """Label suffix naming the voice-activity cell, empty for the control."""
+    if vad_mode == "off":
+        return ""
+    return f"/vad:{vad_mode}" + (f":{vad_backend}" if vad_backend else "")
+
+
+def _transcript_path(base: Optional[str], label: str, per_row: bool) -> Optional[Path]:
+    """Where this row's transcripts go.
+
+    A sweep that writes every row to one path keeps only the last one, which is
+    exactly the file a "did the transcript change?" comparison needs — so once
+    there is more than one voice-activity cell, each row gets its own name.
+    """
+    if not base:
+        return None
+    path = Path(base)
+    if not per_row:
+        return path
+    slug = "".join(c if c.isalnum() else "_" for c in label).strip("_")
+    return path.with_name(f"{path.stem}.{slug}{path.suffix}")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -467,6 +552,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         key, _, value = pair.partition("=")
         decode_options[key.strip()] = value
 
+    vad_options: Dict[str, str] = {}
+    for pair in args.vad_option:
+        if "=" not in pair:
+            raise SystemExit(f"--vad-option expects k=v, got {pair!r}")
+        key, _, value = pair.partition("=")
+        vad_options[key.strip()] = value
+
+    # ``off`` ignores the backend, the same way an offline row ignores the chunk
+    # size: folding it into the product would report one measurement twice.
+    vad_cells = [
+        (vm, vb) for vm in args.vad_mode for vb in (args.vad_backend if vm != "off" else [""])
+    ]
+
     rows: List[Row] = []
     failures: List[str] = []
     for method in args.decode_method:
@@ -479,39 +577,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ]:
             for dtype in args.dtype:
                 for bs in args.max_batch_size:
-                    tag = mode if mode == "offline" else f"{mode}{chunk or ''}"
-                    label = f"{method or 'default'}/{tag}/{dtype}/bs{bs}"
-                    print(f"[INFO] running {label} ...", flush=True)
-                    try:
-                        row = run_one(
-                            entries,
-                            ckpt_dir=args.ckpt_dir,
-                            architecture=args.architecture,
-                            decode_method=method or None,
-                            decode_options=decode_options,
-                            service_mode=mode,
-                            chunk_size=chunk or None,
-                            dtype=dtype,
-                            max_batch_size=bs,
-                            metric=args.metric,
-                            normalizer_kind=norm_kind,
-                            manifest_name=manifest.name,
-                            save_transcripts=(
-                                Path(args.save_transcripts) if args.save_transcripts else None
-                            ),
+                    for vad_mode, vad_backend in vad_cells:
+                        tag = mode if mode == "offline" else f"{mode}{chunk or ''}"
+                        vad_tag = _vad_tag(vad_mode, vad_backend)
+                        label = f"{method or 'default'}/{tag}/{dtype}/bs{bs}{vad_tag}"
+                        print(f"[INFO] running {label} ...", flush=True)
+                        try:
+                            row = run_one(
+                                entries,
+                                ckpt_dir=args.ckpt_dir,
+                                architecture=args.architecture,
+                                decode_method=method or None,
+                                decode_options=decode_options,
+                                service_mode=mode,
+                                chunk_size=chunk or None,
+                                vad_mode=vad_mode,
+                                vad_backend=vad_backend or None,
+                                vad_model_dir=args.vad_model_dir,
+                                vad_options=vad_options,
+                                dtype=dtype,
+                                max_batch_size=bs,
+                                metric=args.metric,
+                                normalizer_kind=norm_kind,
+                                manifest_name=manifest.name,
+                                save_transcripts=_transcript_path(
+                                    args.save_transcripts, label, len(vad_cells) > 1
+                                ),
+                            )
+                        except (
+                            Exception
+                        ) as exc:  # noqa: BLE001 — a sweep must not lose earlier rows
+                            # Unsupported sweep cells are reported without
+                            # discarding rows already collected.
+                            msg = f"{label}: {type(exc).__name__}: {exc}".splitlines()[0]
+                            print(f"       FAILED — {msg}", flush=True)
+                            failures.append(msg)
+                            continue
+                        rows.append(row)
+                        print(
+                            f"       {row.result.summary()}  RTFx {row.rtfx}  "
+                            f"p50 {row.latency_p50_ms} ms"
                         )
-                    except Exception as exc:  # noqa: BLE001 — a sweep must not lose earlier rows
-                        # Unsupported sweep cells are reported without discarding
-                        # rows already collected.
-                        msg = f"{label}: {type(exc).__name__}: {exc}".splitlines()[0]
-                        print(f"       FAILED — {msg}", flush=True)
-                        failures.append(msg)
-                        continue
-                    rows.append(row)
-                    print(
-                        f"       {row.result.summary()}  RTFx {row.rtfx}  "
-                        f"p50 {row.latency_p50_ms} ms"
-                    )
 
     _print_table(rows)
 
@@ -543,7 +649,8 @@ def _print_table(rows: Sequence[Row]) -> None:
     print("-" * len(hdr))
     for r in rows:
         mode = r.service_mode if r.service_mode == "offline" else f"streaming{r.chunk_size}"
-        cfg = f"{r.decode_method}/{mode}/{r.dtype}/bs{r.max_batch_size}"
+        vad = "" if r.vad_mode == "off" else f"/vad:{r.vad_mode}:{r.vad_backend}"
+        cfg = f"{r.decode_method}/{mode}/{r.dtype}/bs{r.max_batch_size}{vad}"
         print(
             f"{cfg:<44} {r.metric:>7} {r.error_rate_pct:>8.2f} "
             f"{r.rtfx:>8.1f} {r.latency_p50_ms:>8.1f} {r.latency_p99_ms:>8.1f}"

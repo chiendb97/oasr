@@ -299,6 +299,24 @@ metrics_table! {
         "Tokens emitted by the decode strategies";
     ENGINE_AUDIO_SECONDS = "oasr_engine_audio_seconds_total", Counter, Some(Unit::Seconds), None,
         "Audio duration the engine admitted (the in-process RTFx numerator)";
+    /// `{reason}` — turns the endpointer closed, by the rule that fired
+    /// (`rule1`..`ruleN`, or a timeout name).  A turn that ended because the
+    /// audio ran out is not counted here at all: the two are different events,
+    /// and folding them together would make the rate of *detected* endpoints
+    /// unreadable.
+    ENGINE_ENDPOINTS = "oasr_engine_endpoints_total", Counter, None, None,
+        "Turns ended by voice-activity endpointing";
+    /// Speech spans `vad.mode="segment"` cut a request into: children of an
+    /// offline fan-out, or turns closed on a live stream.
+    ENGINE_VAD_SEGMENTS = "oasr_engine_vad_segments_total", Counter, None, None,
+        "Speech segments produced by voice-activity segmentation";
+    /// The other half of the story, and the one that says what VAD bought:
+    /// audio segmentation dropped is encoder work that did not happen.  Read it
+    /// against `oasr_engine_audio_seconds_total`, not against the silence in the
+    /// input: what survives the gate is the padding plus one window's clearance
+    /// at each edge, so the fraction skipped grows with the length of the gap.
+    ENGINE_AUDIO_SECONDS_SKIPPED = "oasr_engine_audio_seconds_skipped_total", Counter, Some(Unit::Seconds), None,
+        "Non-speech audio voice-activity segmentation removed before the encoder";
     /// Non-zero means a histogram above is showing a *truncated* distribution:
     /// the engine buffered more samples between two drains than it may hold.
     /// Exported so the cap is visible rather than passing for a complete one.

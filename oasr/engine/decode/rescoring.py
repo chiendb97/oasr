@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 
@@ -108,6 +108,18 @@ class CtcAedRescoringStrategy(DecodeStrategy):
     decode_type = "ctc_aed_rescoring"
     consumes = "both"
     options_cls = RescoringOptions
+    speech_activity_kind: ClassVar[str] = "ctc_blank"
+
+    def speech_activity_kwargs(self) -> Dict[str, Any]:
+        """The blank id, which is where this family's speech signal lives."""
+        return {"blank_id": int(self.options.decoder_config.blank_id)}
+
+    @property
+    def asr_speech_activity_modes(self) -> Tuple[str, ...]:
+        """Offline-only, like the family.  ``consumes="both"`` means the CTC
+        log-probs arrive alongside the hidden states, so the blank posterior
+        costs nothing here either."""
+        return ("offline",)
 
     @property
     def word_timing_modes(self) -> Tuple[str, ...]:
@@ -267,6 +279,10 @@ class CtcAedRescoringStrategy(DecodeStrategy):
             # index, not a re-derivation.
             attach_emission_timings(
                 self, requests, outputs, result.times, log_probs, beam_index=winners
+            )
+        if log_probs is not None:
+            self.attach_asr_speech_activity(
+                outputs, log_probs, enc_lengths, requests, blank_id=cfg.blank_id
             )
         return outputs
 

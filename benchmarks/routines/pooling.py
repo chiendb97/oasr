@@ -20,9 +20,9 @@ from benchmarks.routines.bench_utils import (
     parse_dtype,
     profile_kernel,
 )
-from oasr.functionals.pooling import _avg_pool1d_output_length
+from oasr.functionals.pooling import _pool1d_output_length
 
-SUBROUTINES = ["avg_pool1d"]
+SUBROUTINES = ["avg_pool1d", "max_pool1d"]
 
 DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
     "avg_pool1d": [
@@ -37,7 +37,36 @@ DEFAULT_CONFIGS: dict[str, list[dict[str, Any]]] = {
             "count_include_pad": True,
         }
         for batch in (1, 2, 4, 8)
+    ],
+    # The dilation the ASR-derived speech detectors run: a one-channel
+    # per-frame trace, stride 1, half-width padding.  One channel is the
+    # launcher's narrow path, which is the case the CTA-per-row mapping used to
+    # serve at 1/32 occupancy.
+    "max_pool1d": [
+        {
+            "batch": batch,
+            "seq": 1500,
+            "channels": 1,
+            "kernel_size": 5,
+            "stride": 1,
+            "padding": 2,
+            "ceil_mode": False,
+            "count_include_pad": False,
+        }
+        for batch in (1, 8, 32)
     ]
+    + [
+        {
+            "batch": 4,
+            "seq": 500,
+            "channels": 512,
+            "kernel_size": 3,
+            "stride": 2,
+            "padding": 1,
+            "ceil_mode": False,
+            "count_include_pad": False,
+        }
+    ],
 }
 
 
@@ -84,6 +113,37 @@ def setup_avg_pool1d(
     return oasr_fn, pytorch_fn
 
 
+def setup_max_pool1d(
+    batch: int,
+    seq: int,
+    channels: int,
+    kernel_size: int,
+    stride: int,
+    padding: int,
+    ceil_mode: bool,
+    count_include_pad: bool,
+    dtype: torch.dtype = torch.float16,
+):
+    """Return allocation-including OASR/BTC and PyTorch/BCT closures.
+
+    ``count_include_pad`` is accepted and ignored: max pooling has no divisor,
+    and taking the same config shape as ``avg_pool1d`` keeps one testlist able
+    to drive both.
+    """
+    del count_include_pad
+    x_btc = torch.randn(batch, seq, channels, device="cuda", dtype=dtype)
+    x_bct = x_btc.transpose(1, 2).contiguous()
+
+    def oasr_fn():
+        return oasr.max_pool1d(x_btc, kernel_size, stride, padding, ceil_mode)
+
+    def pytorch_fn():
+        # BCT is pre-created: this is the raw PyTorch pooling baseline.
+        return F.max_pool1d(x_bct, kernel_size, stride, padding, 1, ceil_mode).transpose(1, 2)
+
+    return oasr_fn, pytorch_fn
+
+
 def _setup_previous_model(cfg: dict[str, Any], dtype: torch.dtype):
     """The exact pre-KG4 Speech-LLM BTC -> BCT -> BTC expression."""
     x = torch.randn(cfg["batch"], cfg["seq"], cfg["channels"], device="cuda", dtype=dtype)
@@ -117,7 +177,7 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _pool_bytes(cfg: dict[str, Any], dtype: torch.dtype) -> int:
-    output_length = _avg_pool1d_output_length(
+    output_length = _pool1d_output_length(
         cfg["seq"],
         cfg["kernel_size"],
         cfg["stride"],
@@ -136,7 +196,6 @@ def _shape_str(cfg: dict[str, Any]) -> str:
 
 
 def _resolve_configs(args: argparse.Namespace, subroutine: str):
-    del subroutine
     batch = getattr(args, "batch", None)
     seq = getattr(args, "seq", None)
     channels = getattr(args, "channels", None)
@@ -153,13 +212,15 @@ def _resolve_configs(args: argparse.Namespace, subroutine: str):
                 "count_include_pad": not getattr(args, "exclude_pad", False),
             }
         ]
-    return DEFAULT_CONFIGS["avg_pool1d"]
+    return DEFAULT_CONFIGS[subroutine]
 
 
 def _setup_for_config(subroutine: str, cfg: dict[str, Any], dtype: torch.dtype):
-    if subroutine != "avg_pool1d":
-        raise ValueError(f"Unknown pooling subroutine: {subroutine}")
-    return setup_avg_pool1d(**cfg, dtype=dtype)
+    if subroutine == "avg_pool1d":
+        return setup_avg_pool1d(**cfg, dtype=dtype)
+    if subroutine == "max_pool1d":
+        return setup_max_pool1d(**cfg, dtype=dtype)
+    raise ValueError(f"Unknown pooling subroutine: {subroutine}; valid: {SUBROUTINES}")
 
 
 def get_fn_map(subroutine: str, cuda_fn: Callable, torch_fn: Callable):

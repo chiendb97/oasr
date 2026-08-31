@@ -44,7 +44,7 @@ import torch
 
 from ..request import Request, RequestOutput
 from .alignment import wants_word_timings
-from .base import DecodeStrategy, register_decode_strategy
+from .base import DecodeStrategy, register_decode_strategy, wants_speech_activity
 from .options import option
 from .transducer_beam import (
     BeamState,
@@ -158,6 +158,19 @@ class TransducerDecodeStrategy(DecodeStrategy):
     decode_type: ClassVar[str] = "transducer"
     consumes: ClassVar[str] = "hidden"
     options_cls: ClassVar[type] = TransducerOptions
+
+    speech_activity_kind: ClassVar[str] = "transducer_blank"
+
+    @property
+    def asr_speech_activity_modes(self) -> Tuple[str, ...]:
+        """Greedy only, for the same reason word timings are.
+
+        The signal *is* the emission trace, and beam search's device-side
+        hypothesis buffer carries labels rather than frames — so under beam there
+        is nothing to read, and saying so is better than reporting boundaries
+        derived from something else.
+        """
+        return () if self._beam > 1 else ("offline", "streaming")
 
     @property
     def word_timing_modes(self) -> Tuple[str, ...]:
@@ -428,7 +441,42 @@ class TransducerDecodeStrategy(DecodeStrategy):
                 if wants_word_timings(req):
                     frames, probs = _unzip_marks(marks[b])
                     self.attach_emission_alignment(out, hyps[b], frames, probs)
+            self._attach_emission_activity(outputs, marks, enc_out, enc_lengths, requests)
         return outputs
+
+    def _attach_emission_activity(
+        self,
+        outputs: List[RequestOutput],
+        marks: List[List[Tuple[int, float]]],
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        requests: Optional[List[Request]],
+    ) -> None:
+        """Speech activity from the frames the greedy loop already recorded.
+
+        The transducer has no per-frame posterior to read the way CTC does — the
+        joiner is only evaluated at the steps the loop takes — so the signal is
+        the emission trace, which is recorded for word timings anyway.  Building
+        the dense indicator on the host is per-token Python, which is exactly the
+        cost this codebase avoids on the decode path; it is acceptable *here*
+        only because it runs once per finished request and only for the rows that
+        asked, never per step.
+        """
+        if requests is None or not any(wants_speech_activity(r) for r in requests):
+            return
+        detector = self._speech_detector()
+        if detector is None:
+            return
+        rows = len(outputs)
+        frames = int(enc_out.size(1))
+        indicator = torch.zeros(rows, frames, dtype=torch.float32)
+        for b in range(min(rows, len(marks))):
+            if requests[b] is not None and not wants_speech_activity(requests[b]):
+                continue
+            for frame, _posterior in marks[b]:
+                if 0 <= frame < frames:
+                    indicator[b, frame] = 1.0
+        self.attach_asr_speech_activity(outputs, indicator, enc_lengths.cpu(), requests)
 
     @torch.no_grad()
     def _decode_offline_beam(
@@ -502,7 +550,11 @@ class TransducerDecodeStrategy(DecodeStrategy):
                 # One launch serves the group, so tracking is on whenever any
                 # member asked; the sessions that did not simply discard it.
                 self._advance_greedy(
-                    group, sessions, enc, lengths, track=any(map(wants_word_timings, group))
+                    group,
+                    sessions,
+                    enc,
+                    lengths,
+                    track=any(wants_word_timings(r) or wants_speech_activity(r) for r in group),
                 )
 
             for req, s in zip(group, sessions):

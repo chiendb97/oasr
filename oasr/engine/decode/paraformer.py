@@ -27,7 +27,7 @@ import torch
 
 from ..request import Request, RequestOutput
 from .alignment import TokenAlignment, wants_word_timings
-from .base import DecodeStrategy, register_decode_strategy
+from .base import DecodeStrategy, register_decode_strategy, wants_speech_activity
 
 if TYPE_CHECKING:
     from oasr.models.base import BaseAsrModel
@@ -42,6 +42,19 @@ class ParaformerDecodeStrategy(DecodeStrategy):
 
     decode_type: ClassVar[str] = "paraformer"
     consumes: ClassVar[str] = "hidden"
+    speech_activity_kind: ClassVar[str] = "cif_alpha"
+
+    @property
+    def asr_speech_activity_modes(self) -> Tuple[str, ...]:
+        """Offline only — so is the family.
+
+        The signal is the CIF predictor's per-frame weight, which is a token
+        *rate* rather than a speech posterior: it is high where tokens are being
+        integrated and zero in silence.  That makes it usable but the weakest of
+        the four ASR-derived signals, and the detector's gain is a heuristic
+        rather than a calibration.
+        """
+        return ("offline",)
 
     @property
     def word_timing_modes(self) -> Tuple[str, ...]:
@@ -74,9 +87,22 @@ class ParaformerDecodeStrategy(DecodeStrategy):
         requests: Optional[List[Request]] = None,
     ) -> List[RequestOutput]:
         B = enc_out.size(0)
-        acoustic_embeds, token_lens, fires = self._model.predict(enc_out, enc_lengths)
+        want_activity = requests is not None and any(wants_speech_activity(r) for r in requests)
+        # ``predict`` returns three values, or four when asked for the CIF
+        # weights; indexing rather than unpacking keeps both arities readable to
+        # a checker that only sees the variadic return type.
+        predicted = self._model.predict(enc_out, enc_lengths, return_alphas=want_activity)
+        acoustic_embeds, token_lens, fires = predicted[0], predicted[1], predicted[2]
+        alphas = predicted[3] if want_activity else None
         if acoustic_embeds.size(1) == 0 or int(token_lens.max().item()) < 1:
-            return [self._empty_output() for _ in range(B)]
+            empty = [self._empty_output() for _ in range(B)]
+            # An utterance CIF found no tokens in is exactly the case a caller
+            # asking for speech activity most wants an answer to, so the
+            # activity pass still runs; it is the transcript that is empty, not
+            # the audio's description of itself.
+            if alphas is not None:
+                self._attach_alpha_activity(empty, alphas, enc_lengths, requests)
+            return empty
 
         log_probs = self._model.nar_decode(enc_out, enc_lengths, acoustic_embeds, token_lens)
         # Greedy per position; per-row score = sum of best log-probs over the
@@ -125,7 +151,26 @@ class ParaformerDecodeStrategy(DecodeStrategy):
                 out, kept, words=requests is not None and wants_word_timings(requests[b])
             )
             outputs.append(out)
+        if alphas is not None:
+            self._attach_alpha_activity(outputs, alphas, enc_lengths, requests)
         return outputs
+
+    def _attach_alpha_activity(
+        self,
+        outputs: List[RequestOutput],
+        alphas: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        requests: Optional[List[Request]],
+    ) -> None:
+        """Segment on the CIF weights.
+
+        ``alphas`` is ``(B, T + 1)`` — the predictor appends a tail frame so the
+        final token can fire — while ``enc_lengths`` counts the encoder's own
+        frames.  Passing the longer tensor with the shorter lengths is correct
+        and deliberate: the tail is padding as far as the time base is
+        concerned, and the detector masks it.
+        """
+        self.attach_asr_speech_activity(outputs, alphas, enc_lengths, requests)
 
     def _token_spans(self, fires_row: torch.Tensor, n_tokens: int) -> List[Tuple[float, float]]:
         """CIF fire positions → per-token ``(start_frame, end_frame)`` spans.

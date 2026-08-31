@@ -14,7 +14,7 @@ use std::time::Instant;
 use axum::http::StatusCode;
 use bytes::Bytes;
 use oasr_metrics::{f32_pcm_seconds, Outcome, RequestRecorder};
-use oasr_wire::{DecodingParams, ErrorCode, Event, WordTiming};
+use oasr_wire::{DecodingParams, ErrorCode, Event, SpeechSegment, WordTiming};
 use tracing::{error, warn};
 
 use crate::router::AppState;
@@ -35,6 +35,10 @@ pub struct FinalTranscript {
     pub confidence: Option<f32>,
     /// `"stop"` / `"length"` for the autoregressive families.
     pub finish_reason: Option<String>,
+    /// Detected speech spans, when the request asked for voice activity.
+    pub segments: Option<Vec<SpeechSegment>>,
+    /// `P(no speech)` where the decode family produces one.
+    pub no_speech_prob: Option<f32>,
     /// Wall time from the handler's start to the terminal event.
     pub elapsed_ms: u64,
 }
@@ -135,6 +139,13 @@ pub async fn submit_offline_and_wait(
             words,
             confidence,
             finish_reason,
+            segments,
+            no_speech_prob,
+            // The unary path has no turn to end: it is one buffered utterance,
+            // so a speech-activity transition inside it is already described by
+            // `segments`, and an endpoint reason has nothing to report against.
+            speech_events: _,
+            endpoint_reason: _,
         } => Ok(FinalTranscript {
             request_id,
             text,
@@ -145,6 +156,8 @@ pub async fn submit_offline_and_wait(
             words,
             confidence,
             finish_reason,
+            segments,
+            no_speech_prob,
             elapsed_ms,
         })
         .inspect(|_| metrics.finished(Outcome::Ok, elapsed)),

@@ -7,7 +7,7 @@ from .core import JitSpec, gen_jit_spec
 
 
 def gen_pooling_module() -> JitSpec:
-    """Generate the AvgPool1D JIT module."""
+    """Generate the pooling JIT module (AvgPool1D + MaxPool1D)."""
     return gen_jit_spec(
         "pooling",
         [

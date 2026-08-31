@@ -4,7 +4,9 @@
 framework for ASR. It serves seven encoder architectures across five decode
 paradigms — CTC, transducer (RNN-T), AED, non-autoregressive CIF, and speech-LLM
 — from one engine, with custom CUDA/CUTLASS kernels exposed to Python via TVM-FFI
-JIT compilation and a Rust HTTP/gRPC serving front-end.
+JIT compilation and a Rust HTTP/gRPC serving front-end. Voice activity detection
+is an eighth registry axis on top of it, usable with or without a separate VAD
+model.
 
 - User-facing overview and quick start: [`README.md`](README.md)
 - Stable technical documentation: [`docs/`](docs/README.md)
@@ -21,7 +23,7 @@ JIT compilation and a Rust HTTP/gRPC serving front-end.
 
 1. **Never edit the engine core to add a variant.** Every extension lands through
    a registry — subclass a base, register under a name, select by configuration.
-   There are seven such axes; see [Architecture](#architecture).
+   There are eight such axes; see [Architecture](#architecture).
 2. **Models are built from `oasr.layers`, never from bare `nn.Linear` /
    `nn.LayerNorm` / `nn.Embedding` / `nn.Conv*`.** `tests/test_layer_waist.py`
    enforces this and fails on a newly registered architecture that has no tiny
@@ -69,7 +71,31 @@ JIT compilation and a Rust HTTP/gRPC serving front-end.
     cite `.artifacts/` from them.** Benchmark numbers, known issues,
     investigations and experiment results go in the gitignored `.artifacts/`;
     a fresh clone does not have those files, so a pointer to one is a dead link.
-13. **Do not commit or push unless asked.** Create the branch and the files, then
+13. **Never advance a stream past frames the encoder did not see without
+    resetting its cache and position.** Both streaming backends assume every
+    chunk is contiguous in encoder-frame time — the paged one advances
+    `req.offset` only on a forward, and `cache_t1` derives from it. Skipping a
+    silent chunk tells the encoder "this immediately follows the last one", so
+    non-adjacent audio is spliced at contiguous relative positions and the conv
+    cache carries left context across a gap that no longer exists. The primitive
+    that makes it sound is `StreamingEncoderBackend.reset`, which rewinds
+    *both* halves in one call — halving it is the trap, because either half
+    alone still produces a transcript. `vad.mode="segment"` in streaming is the
+    only caller; a reset also cuts the decoder's context, so the turn is closed
+    and folded into the stream's running transcript, and the *model* clock
+    (`req.offset`) restarts while the *reporting* clock
+    (`req.stream_time_offset`) does not. Same family as rules 10 and 11: a silent
+    state error whose output stays plausible. Pinned bit-exactly, against a fresh
+    stream fed the same chunks, by
+    `tests/test_streaming_backend.py::TestBackendReset`.
+14. **A speech detector declares what its signal can resolve.** The ASR-derived
+    signals are peaky — measured on read speech, only ~15 % of CTC frames clear
+    `p=0.5` and in-word blank runs reach 840 ms — so
+    `VadSpec.min_silence_floor_ms` exists and the engine raises a preset to meet
+    it. A detector registered without one gets a 100 ms minimum silence applied
+    to a spike train, and one utterance becomes dozens of segments. See
+    [`docs/vad.md`](docs/vad.md).
+15. **Do not commit or push unless asked.** Create the branch and the files, then
     hand off.
 
 ---
@@ -171,7 +197,7 @@ by setuptools-rust on its own (`pip install`, or
 ## Architecture
 
 ```
-Request → InputProcessor (GPU fbank) → Scheduler (BatchingPolicy + PartitionPolicy)
+Request → [VAD segmenter] → InputProcessor (GPU fbank) → Scheduler (BatchingPolicy + PartitionPolicy)
    → ModelRunner
         ├─ offline:   model.forward_offline / forward_offline_packed → enc_out
         └─ streaming: StreamingEncoderBackend.forward_step           → enc_out
@@ -188,7 +214,7 @@ Python functional API (oasr/functionals/<family>.py)  — @oasr_api
                             └── Pure CUDA kernels (include/oasr/<family>.cuh)
 ```
 
-### The seven extension axes
+### The eight extension axes
 
 Each is a registry. Adding a variant means subclass + register — no engine edits.
 
@@ -201,8 +227,9 @@ Each is a registry. Adding a variant means subclass + register — no engine edi
 | Batching | `oasr.engine.batching.BatchingPolicy` / `PartitionPolicy` | `EngineConfig.schedule_policy` |
 | Tokenizer | `oasr.tokenizers.Tokenizer` | converter-emitted `TokenizerSpec.kind` |
 | Feature frontend | `oasr.features.ExtractorSpec` | `FeatureConfig.feature_type`, from `FeatureSpec` |
+| Speech detector | `oasr.vad.SpeechDetector` / `VadSpec` | `VadConfig.backend`; `None` = the decode family's own |
 
-Orthogonal to all seven is the **layer waist**: `oasr.layers` is what every
+Orthogonal to all eight is the **layer waist**: `oasr.layers` is what every
 architecture is built from, so a kernel improvement, CUDA-graph capture or a
 future quantized path applies to all of them.
 
@@ -228,6 +255,9 @@ extension cookbook for each axis.
 | `oasr/models/base.py` | `BaseAsrModel` / `BaseEncoder` / `CacheSpec` / `LoadReport` |
 | `oasr/models/interfaces.py` | `CAPABILITIES` — what each decode family requires of a model |
 | `oasr/models/registry.py` | `register_model`, `build_model_from_checkpoint`, entry-point discovery |
+| `oasr/vad/` | Speech detectors (registry), the shared segmenter and the Kaldi-shaped endpointer |
+| `oasr/vad/detectors/silero.py` | Silero VAD v5 rebuilt on `oasr.layers` + the upstream weight conversion |
+| `oasr/engine/vad_stage.py` | The two engine entry points: offline splitter, per-tick streaming stage |
 | `oasr/layers/` | The narrow waist; `_backend.py` holds the routing rules and `KERNEL_GAPS` |
 | `oasr/jit/core.py`, `oasr/jit/env.py` | JIT specs, nvcc flags, the cache key |
 | `oasr/functionals/gemm.py`, `oasr/functionals/attention.py` | The two families with shape-aware routing |
@@ -259,6 +289,7 @@ extension cookbook for each axis.
 | Per-family options | `DecodeStrategy.options_cls` + `--decode-option k=v` | Adding a family needs no new CLI flag and no `EngineConfig` field |
 | Declared alignment | `word_timing_modes` + `TokenAlignment` → `word_timings` | Per-family *how*, shared *what happens next*; a family that cannot align says so per mode |
 | Counted gaps | `KERNEL_GAPS`, `format_gap_report()`, `rule_miss_report()` | What is missing is measurable, not invisible |
+| Declared detector role | `VadSpec.consumes` + `modes` + `min_silence_floor_ms` | An ASR-derived detector *cannot* pre-segment, and the registry refuses the claim rather than the request |
 
 ---
 
@@ -555,6 +586,7 @@ before process start.
 | [`docs/decoding.md`](docs/decoding.md) | Decode families, the incremental AR protocol, beam search, decoding options |
 | [`docs/kernels.md`](docs/kernels.md) | CUDA/CUTLASS layer, the JIT pipeline, the functional API |
 | [`docs/features.md`](docs/features.md) | Feature frontends, `FeatureSpec`, streaming framing |
+| [`docs/vad.md`](docs/vad.md) | Speech detectors, segmentation, endpointing, and the API surfaces |
 | [`docs/tokenizers.md`](docs/tokenizers.md) | Tokenizer axis and `TokenizerSpec` |
 | [`docs/checkpoints.md`](docs/checkpoints.md) | Resolution precedence, converter contract, native format |
 | [`docs/cache_manager.md`](docs/cache_manager.md) | Paged and slot streaming caches |

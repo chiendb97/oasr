@@ -122,6 +122,44 @@ class TestStatefulStreamingBackend:
             backend.free(r)
         assert not backend._states  # noqa: SLF001
 
+    def test_reset_starts_a_new_stream_from_the_initial_state(self):
+        """The stateful half of rule 13.
+
+        A reset turn must decode as if the audio after it began the stream.  The
+        oracle is a fresh stream fed the same chunks: identical outputs, not
+        merely plausible ones — a reset that kept the recurrent state would
+        produce a transcript, just one conditioned on audio the new turn never
+        saw.
+        """
+        model = self._build_model()
+        cfg = SimpleNamespace(device="cuda", dtype=torch.float16, chunk_size=16)
+        backend = build_streaming_backend("stateful", model, cfg, None)
+        window = backend.decoding_window
+
+        torch.manual_seed(3)
+        first = torch.randn(window, 80, dtype=torch.float16, device="cuda")
+        second = torch.randn(window * 2, 80, dtype=torch.float16, device="cuda")
+
+        # A stream that runs one chunk, is reset, then runs `second`.
+        reused = _make_request(0, torch.cat([first, second]))
+        backend.allocate(reused)
+        backend.forward_step([reused])
+        assert reused.offset > 0
+        backend.reset(reused)
+        assert reused.offset == 0, "the position half of rule 13 was skipped"
+        reused.feature_cursor = window  # the gate advances past the skipped audio
+        after = [backend.forward_step([reused])[reused.request_id].clone() for _ in range(2)]
+
+        # The oracle: a stream that only ever saw `second`.
+        fresh = _make_request(1, second)
+        backend.allocate(fresh)
+        want = [backend.forward_step([fresh])[fresh.request_id].clone() for _ in range(2)]
+
+        for got, expect in zip(after, want):
+            assert torch.equal(got, expect), "the reset turn carried old state"
+        for r in (reused, fresh):
+            backend.free(r)
+
     def test_batched_grouping_with_short_tail(self):
         """Mixed chunk lengths: full-window streams batch together; a stream
         on its final short tail runs in its own singleton group.  Every
@@ -714,3 +752,159 @@ def test_no_streaming_backend_accepts_a_missing_cache_config():
     assert backend.stride == 0
     with pytest.raises(NotImplementedError, match="does not support streaming"):
         backend.forward_step([])
+
+
+# ---------------------------------------------------------------------------
+# reset() — the turn-boundary primitive (AGENTS.md rule 13)
+# ---------------------------------------------------------------------------
+
+
+class TestBackendReset:
+    """Cache and position rewind together, or not at all.
+
+    Rule 13's failure mode is that halving it still produces a transcript: reset
+    the cache but keep ``offset`` and the next chunk is spliced onto the old
+    turn's positions; keep the cache and reset ``offset`` and the encoder attends
+    over another turn's frames at the wrong distances.  Neither raises.
+    """
+
+    def test_the_paged_backend_rewinds_in_place(self):
+        backend, _model = _paged_backend("log_probs")
+        req = _make_request(stream_id=1, feature_buffer=torch.zeros(64, 80))
+        backend.allocate(req)
+        slot = req.slot_id
+        assert slot is not None
+
+        backend._att_mgr.prepare_chunk(1)  # noqa: SLF001
+        backend._att_mgr.commit_chunk_paged(1, chunk_frames=16)  # noqa: SLF001
+        req.offset = 16
+        free_before = backend._att_mgr._pool.num_free_blocks  # noqa: SLF001
+
+        backend.reset(req)
+        assert req.offset == 0, "the position half of rule 13 was skipped"
+        assert req.slot_id == slot, "a turn boundary must not churn the slot"
+        assert backend._att_mgr._pool.num_free_blocks == free_before + 1  # noqa: SLF001
+        assert int(backend._att_mgr.cache_seqlens[slot].item()) == 0
+
+        # Still a live stream: freeing must still work, and give the slot back.
+        backend.free(req)
+        assert req.slot_id is None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+    @pytest.mark.parametrize("graphs", [False, True], ids=["eager", "cuda_graphs"])
+    def test_a_reset_paged_stream_decodes_as_a_fresh_one(self, graphs):
+        """The composition rule 13 is about, with a bit-exact oracle.
+
+        Resetting the KV blocks, the conv cache and ``offset`` has to add up to
+        "this chunk begins a stream".  Anything less still produces log-probs:
+        stale blocks are attended over at plausible distances, a carried conv
+        cache smears one turn's left context into the next.  So the reference is
+        a *different* stream fed the same chunks, and the two must agree exactly.
+
+        Run under capture as well, because the graph reads ``cache_seqlens`` and
+        the block table from the persistent rows the reset rewrites — a reset
+        that took a new slot would leave the graph pointing at the old row.
+        """
+        from oasr.cache.types import CacheConfig
+        from oasr.engine.streaming_backend.paged import PagedStreamingBackend
+        from oasr.models.conformer.config import ConformerEncoderConfig, ConformerModelConfig
+        from oasr.models.conformer.model import ConformerModel
+
+        dtype, chunk = torch.float16, 16
+        torch.manual_seed(7)
+        model = (
+            ConformerModel.from_config(
+                ConformerModelConfig(
+                    encoder=ConformerEncoderConfig(
+                        input_size=80,
+                        output_size=256,  # head_dim 64, the shipped FMHA geometry
+                        num_blocks=2,
+                        attention_heads=4,
+                        linear_units=256,
+                        cnn_module_kernel=15,
+                        causal=True,
+                        embed_layer_norm=False,
+                    ),
+                    vocab_size=32,
+                )
+            )
+            .eval()
+            .to(device="cuda", dtype=dtype)
+        )
+        spec = model.cache_spec
+        cache_cfg = CacheConfig(
+            num_layers=spec.num_layers,
+            n_kv_head=spec.n_kv_head,
+            head_dim=spec.head_dim,
+            hidden_dim=spec.hidden_dim,
+            kernel_size=spec.conv_kernel_size,
+            chunk_size=chunk,
+            num_left_chunks=-1,
+            block_size_frames=chunk,
+            max_num_blocks=128,
+            max_blocks_per_seq=32,
+            max_batch_size=2,
+            device=torch.device("cuda"),
+            dtype=dtype,
+        )
+        cfg = SimpleNamespace(device="cuda", dtype=dtype, chunk_size=chunk, use_cuda_graphs=graphs)
+        backend = PagedStreamingBackend(model, cfg, cache_cfg)
+        window = backend.decoding_window
+
+        torch.manual_seed(21)
+        head = torch.randn(window * 2, 80, dtype=dtype, device="cuda") * 0.5
+        tail = torch.randn(window * 2, 80, dtype=dtype, device="cuda") * 0.5
+
+        reused = _make_request(0, torch.cat([head, tail]))
+        backend.allocate(reused)
+        for _ in range(2):
+            backend.forward_step([reused])
+        assert reused.offset > 0
+        backend.reset(reused)
+        assert reused.offset == 0 and reused.slot_id is not None
+        reused.feature_cursor = window * 2  # what the gate advanced past
+        got = [backend.forward_step([reused])[reused.request_id].clone() for _ in range(2)]
+
+        fresh = _make_request(1, tail)
+        backend.allocate(fresh)
+        want = [backend.forward_step([fresh])[fresh.request_id].clone() for _ in range(2)]
+
+        for step, (a, b) in enumerate(zip(got, want)):
+            assert torch.equal(a, b), f"chunk {step} of the reset turn carried old state"
+        for r in (reused, fresh):
+            backend.free(r)
+
+    def test_the_base_default_is_free_then_allocate(self):
+        """A backend that fully initialises a stream in ``allocate`` needs no
+        override, and the default must not forget the position."""
+        from oasr.engine.streaming_backend.base import StreamingEncoderBackend
+
+        class _Recording(StreamingEncoderBackend):
+            streaming_kind = "recording"
+
+            def __init__(self):
+                self.calls = []
+
+            def allocate(self, request):
+                self.calls.append("allocate")
+
+            def free(self, request):
+                self.calls.append("free")
+
+            def forward_step(self, requests):
+                return {}
+
+            @property
+            def decoding_window(self):
+                return 8
+
+            @property
+            def stride(self):
+                return 8
+
+        backend = _Recording()
+        req = _make_request(stream_id=2, feature_buffer=torch.zeros(8, 80))
+        req.offset = 40
+        backend.reset(req)
+        assert backend.calls == ["free", "allocate"]
+        assert req.offset == 0

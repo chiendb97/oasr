@@ -23,7 +23,7 @@ def _single_int(value: int | tuple[int], name: str) -> int:
     return value
 
 
-def _avg_pool1d_output_length(
+def _pool1d_output_length(
     input_length: int,
     kernel_size: int,
     stride: int,
@@ -79,7 +79,7 @@ def avg_pool1d(
         raise ValueError(f"avg_pool1d expects TC or BTC input, got shape {tuple(input.shape)}")
 
     input_length = input.shape[-2]
-    output_length = _avg_pool1d_output_length(input_length, kernel, step, pad, ceil_mode)
+    output_length = _pool1d_output_length(input_length, kernel, step, pad, ceil_mode)
     if output_length <= 0:
         raise ValueError(
             f"avg_pool1d produces an invalid output length {output_length} from "
@@ -92,4 +92,54 @@ def avg_pool1d(
     _get_pooling_module().avg_pool1d(
         out, input, kernel, step, pad, bool(ceil_mode), bool(count_include_pad)
     )
+    return out
+
+
+@oasr_api
+def max_pool1d(
+    input: torch.Tensor,
+    kernel_size: int | tuple[int],
+    stride: Optional[int | tuple[int]] = None,
+    padding: int | tuple[int] = 0,
+    ceil_mode: bool = False,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Max pool a contiguous TC or BTC tensor along its time dimension.
+
+    The BTC twin of :func:`avg_pool1d`, with the same layout rationale: no BCT
+    transposes around the operation.  ``dilation`` and ``return_indices`` are
+    **not** accepted rather than silently ignored — a caller that passes either
+    to :func:`torch.nn.functional.max_pool1d` and gets a different answer here
+    would have no way to notice.
+
+    Padding follows PyTorch's ``-inf`` convention, and ``padding`` is bounded at
+    ``kernel_size // 2`` so a window always overlaps real data.
+    """
+    kernel = _single_int(kernel_size, "kernel_size")
+    step = kernel if stride is None else _single_int(stride, "stride")
+    pad = _single_int(padding, "padding")
+    if kernel <= 0:
+        raise ValueError(f"kernel_size must be positive, got {kernel}")
+    if step <= 0:
+        raise ValueError(f"stride must be positive, got {step}")
+    if pad < 0 or pad > kernel // 2:
+        raise ValueError(
+            f"padding must be non-negative and at most half of kernel_size, got "
+            f"padding={pad}, kernel_size={kernel}"
+        )
+    if input.dim() not in (2, 3):
+        raise ValueError(f"max_pool1d expects TC or BTC input, got shape {tuple(input.shape)}")
+
+    input_length = input.shape[-2]
+    output_length = _pool1d_output_length(input_length, kernel, step, pad, ceil_mode)
+    if output_length <= 0:
+        raise ValueError(
+            f"max_pool1d produces an invalid output length {output_length} from "
+            f"T={input_length}, kernel_size={kernel}, stride={step}, padding={pad}"
+        )
+    output_shape = input.shape[:-2] + (output_length, input.shape[-1])
+    if out is None:
+        out = input.new_empty(output_shape)
+
+    _get_pooling_module().max_pool1d(out, input, kernel, step, pad, bool(ceil_mode))
     return out

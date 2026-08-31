@@ -351,6 +351,28 @@ def use_norm_kernel(x: torch.Tensor) -> bool:
     return True
 
 
+def use_softmax_kernel(x: torch.Tensor) -> bool:
+    """Should this softmax go through the OASR softmax kernel?
+
+    Row-wise over the last dimension, so it has the norm kernels' scope
+    (``DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16`` in ``csrc/softmax.cu`` covers
+    fp32/fp16/bf16) and the norm kernels' stride requirement — the launcher
+    asserts a contiguous last dimension.
+
+    Its own gate rather than a reuse of :func:`use_norm_kernel` so a softmax
+    that falls back is counted as a softmax, not filed under a norm reason.
+    """
+    if layers_backend() == "torch":
+        return False
+    if not x.is_cuda:
+        return out_of_scope("CPU tensor")
+    if x.dtype not in NORM_DTYPES:
+        return out_of_scope(f"dtype {x.dtype}")
+    if x.stride(-1) != 1:
+        return take_policy("softmax-last-dim-not-contiguous")
+    return True
+
+
 def use_conv_kernel(x: torch.Tensor) -> bool:
     """Should this convolution / activation go through an OASR kernel?
 
@@ -379,15 +401,22 @@ def use_conv_kernel(x: torch.Tensor) -> bool:
 def use_pooling_kernel(x: torch.Tensor) -> bool:
     """Should pooling run through the OASR kernel?
 
-    Pooling has the same serving scope as convolution: CUDA FP16/BF16.  The
-    direct kernel covers every argument combination accepted by the waist, so
-    an in-scope refusal is an error rather than a torch fallback.
+    The norm kernels' dtype scope, not convolution's: ``csrc/pooling.cu``
+    dispatches through ``DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16``, which covers
+    fp32 as well as fp16/bf16.  It used to refuse fp32 anyway, which sent to
+    torch a call the kernel serves *and* serves faster — measured 1.03x to
+    3.05x on this box across the shapes the waist sees.  A dtype the kernel
+    handles is not out of scope; excluding it only hid the kernel from the one
+    dtype the per-frame detectors work in.
+
+    The direct kernel covers every argument combination accepted by the waist,
+    so an in-scope refusal is an error rather than a torch fallback.
     """
     if layers_backend() == "torch":
         return False
     if not x.is_cuda:
         return out_of_scope("CPU tensor")
-    if x.dtype not in SERVED_DTYPES:
+    if x.dtype not in NORM_DTYPES:
         return out_of_scope(f"dtype {x.dtype}")
     return True
 
@@ -474,5 +503,6 @@ __all__ = [
     "use_gemm_kernel",
     "use_norm_kernel",
     "use_pooling_kernel",
+    "use_softmax_kernel",
     "use_recurrent_kernel",
 ]

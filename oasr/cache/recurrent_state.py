@@ -122,6 +122,13 @@ class RecurrentStateCache(SlotStateCache):
         super().allocate_stream(stream_id, slot_id)
         self._steps[stream_id] = 0
 
+    def reset_stream(self, stream_id: int) -> None:
+        super().reset_stream(stream_id)
+        # The step count is this stream's ring parity, so a reset that left it
+        # alone would read the new turn's first state out of the half the old
+        # turn wrote — stale left context wearing a fresh slot.
+        self._steps[stream_id] = 0
+
     def free_stream(self, stream_id: int) -> None:
         super().free_stream(stream_id)
         self._steps.pop(stream_id, None)

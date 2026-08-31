@@ -60,6 +60,14 @@ class WhisperModelConfig(BaseModelConfig):
     # produces a near-diagonal path instead of an alignment.  Empty falls back
     # to the upper half of the decoder stack, with a warning.
     alignment_heads: List[Tuple[int, int]] = field(default_factory=list)
+    # ``<|nospeech|>`` (a.k.a. ``<|nocaptions|>``), read off the checkpoint's own
+    # tokenizer.  Whisper is trained to predict it at the first generated
+    # position when a window carries no speech, which makes it the only
+    # speech-activity signal this family has.  ``None`` on a snapshot without
+    # the token (English-only builds, and anything converted before this field
+    # existed): the per-request VAD options then fail loudly rather than
+    # reporting a probability derived from some other token's logit.
+    no_speech_token_id: Optional[int] = None
 
     @property
     def head_dim(self) -> int:

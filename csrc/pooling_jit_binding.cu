@@ -9,3 +9,8 @@ void avg_pool1d(TensorView output, TensorView input, int64_t kernel_size, int64_
                 int64_t padding, bool ceil_mode, bool count_include_pad);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(avg_pool1d, avg_pool1d);
+
+void max_pool1d(TensorView output, TensorView input, int64_t kernel_size, int64_t stride,
+                int64_t padding, bool ceil_mode);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(max_pool1d, max_pool1d);
