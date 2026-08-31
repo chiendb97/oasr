@@ -314,7 +314,12 @@ prepare_offline                    prepare_streaming
 | `dtype` | `torch.float16` | Model + cache precision. |
 | `audio_scale` | `32768.0` | Multiplied into the float waveform. **Per framework** — adopted from `FeatureSpec.audio_scale` unless set explicitly. See [features.md](features.md). |
 | `service_mode` | `"streaming"` | Pins the engine to `"streaming"` or `"offline"` for its whole lifecycle; mismatched requests are rejected at admission. `"offline"` builds no streaming backend and no paged pool. |
-| `use_cuda_graphs` | `True` | Capture the steady-state streaming encoder forward (`GraphedEncoderForward`, one graph per shape key). |
+| `use_cuda_graphs` | `True` | Capture the steady-state streaming encoder forward (`GraphedEncoderForward`, one graph per shape key). Also the master gate for the offline capture below. |
+| `use_offline_cuda_graphs` | `True` | Capture the **offline** encoder forward by `(B_bucket, T_bucket)` (`GraphedOfflineForward`). See [§9.7](#9-performance-considerations). |
+| `offline_graph_batch_buckets` | `None` | Batch widths to capture at. `None` takes `preferred_batch_size` when set, else powers of two up to `max_batch_size`. Set it *below* `max_batch_size` to exclude the widest batches, where capture is a small net loss. |
+| `offline_graph_frame_granularity` | `64` | Time-axis rounding, in feature frames. Overridden to `1` — exact, so no padding — for a fixed-window frontend. |
+| `offline_graph_max_frames` | `4096` | Refuse to capture past this padded width; longer requests run eager. |
+| `offline_graph_max_captures` | `64` | Live captures. Past this, new shapes run eager and are counted. |
 | `long_form` | `False` | Fan a request longer than a fixed-window frontend's window out into consecutive windows, decode them through the normal batched path **in parallel**, and stitch one output. The caller sees one request id, so HTTP/gRPC need no change. `long_form_overlap_seconds` plus a word-level overlap merge recover most of the boundary accuracy. |
 | `recycle_streaming_history` | `False` | At the streaming cache ceiling, recycle the oldest KV block instead of finalising the request with `finish_reason="length"`. |
 
@@ -628,7 +633,50 @@ which becomes the `stage` label on the `oasr_requests_failed_total` metric
    `offline_batch` / `extract_fbank` / `forward_streaming` /
    `decode_streaming` / `finalize_streams`. Capture with
    `nsys profile`/`ncu` to get per-stage timing without touching code.
-6. **Pool sizing.** The engine's most common production failure is
+7. **The offline forward is CUDA-graph captured too** (`use_offline_cuda_graphs`,
+   `oasr/engine/offline_graph.py`). It was not, for a long time, and the gap was
+   large: at `B=1` one offline forward issued ~437 kernel launches for **0.99 ms**
+   of GPU work and took ~9.7 ms, so eager wall time stayed flat from `B=1` to
+   `B=32` — the signature of a host-issue-bound path. Capture is worth
+   **7.1x / 3.1x / 1.3x** at `B=1 / 8 / 32` on the u2++ Conformer and
+   **6.7x / 3.4x / 1.5x** on Zipformer-large, transcripts unchanged. At `B=64` it
+   is a ~2% *loss*: the host already keeps up there, so the copy into the static
+   input buffer and the clone out are pure additions. Exclude the widest widths
+   with `offline_graph_batch_buckets` if you serve them.
+
+   Three things about the shape space are worth knowing before tuning it:
+
+   * **It is already small.** 200 mixed-length utterances at `max_batch_size=32`
+     produce **3** captured shapes, not hundreds, because the scheduler
+     length-sorts and bucket-fills before the forward ever sees a batch.
+   * **`preferred_batch_size` is not the lever it looks like.** It changes the
+     captured shape count not at all (the B axis was already 2 wide), and a
+     *single* preferred value costs a `max_wait_time` stall on every queue drain
+     — measured 3.4x slower end-to-end, recovered entirely by lowering
+     `max_wait_time`. Use it for admission shaping, not for capture control.
+   * **Sequence packing enlarges the shape space rather than collapsing it.**
+     The intuition says packing pins `B` at 1 and bounds `T` by
+     `max_packed_frames` — one graph for everything. Measured, the same 200
+     utterances that need 3 keys unpacked need **6** packed, because a packed key
+     is `(S, T_total, max_seg, bias_size)` and the last two are a sum and a
+     sum-of-squares of segment lengths. It *is* capturable —
+     `build_packed_layout_device` rebuilds the layout with no host round-trip and
+     no data-dependent shape — and fully captured it beats the non-packed path by
+     **13–15 % at B=32** and **7–13 % at B=64**, while losing ~10 % at B=8.
+     Wiring it needs a packed-specific 4-axis key and bucket padding of the packed
+     row; that padding moves real segments by ~1.9e-1 in bf16 past a
+     kernel-selection threshold, so it would be bit-exact to itself rather than to
+     `B=1`. Until then packed batches run eager and are counted under
+     `fallback_failed`.
+
+   Padding is applied on **both** paths, not just the captured one. An encoder
+   need not be invariant to trailing padding and the shipped ones are not —
+   Zipformer's `SimpleDownsample` fills its last window by replicating the final
+   frame — so if only the graph padded to a bucket, an utterance would decode
+   differently depending on whether its shape happened to be captured. See
+   `GraphedOfflineForward.pad_time`.
+
+8. **Pool sizing.** The engine's most common production failure is
    `BlockPool` exhaustion. Size `max_num_blocks` for
    `max_batch_size × max_logical_blocks` plus headroom; trade off
    against GPU memory. Or hand it over: `max_num_blocks=None` derives the

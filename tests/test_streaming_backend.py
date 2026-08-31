@@ -722,23 +722,35 @@ class TestOfflineModeSkipsTheStreamingBackend:
     def _model(self, streaming_kind):
         return SimpleNamespace(encoder=SimpleNamespace(streaming_kind=streaming_kind))
 
+    @staticmethod
+    def _cfg(service_mode):
+        """Minimal config ``ModelRunner.__init__`` reads.
+
+        ``use_cuda_graphs=False`` keeps the offline-forward capture cache out of
+        these tests: they are about which *streaming* backend gets selected, and
+        a stub model has no forward to capture.
+        """
+        return SimpleNamespace(
+            service_mode=service_mode, use_cuda_graphs=False, use_offline_cuda_graphs=False
+        )
+
     @pytest.mark.parametrize("encoder_kind", ["paged", "stateful"])
     def test_offline_mode_selects_the_no_op_backend(self, monkeypatch, encoder_kind):
         mr, seen = self._spy(monkeypatch)
-        cfg = SimpleNamespace(service_mode="offline")
+        cfg = self._cfg("offline")
         mr.ModelRunner(self._model(encoder_kind), cfg, object())
         assert seen["kind"] == "none"
 
     @pytest.mark.parametrize("encoder_kind", ["paged", "stateful"])
     def test_streaming_mode_still_selects_the_encoders_own_backend(self, monkeypatch, encoder_kind):
         mr, seen = self._spy(monkeypatch)
-        cfg = SimpleNamespace(service_mode="streaming")
+        cfg = self._cfg("streaming")
         mr.ModelRunner(self._model(encoder_kind), cfg, object())
         assert seen["kind"] == encoder_kind
 
     def test_offline_only_encoder_is_unchanged(self, monkeypatch):
         mr, seen = self._spy(monkeypatch)
-        cfg = SimpleNamespace(service_mode="streaming")
+        cfg = self._cfg("streaming")
         mr.ModelRunner(self._model("none"), cfg, None)
         assert seen["kind"] == "none"
         assert seen["cache_config"] is None
