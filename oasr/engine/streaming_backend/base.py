@@ -135,6 +135,11 @@ class StreamingEncoderBackend(ABC):
         """
         return 0
 
+    @property
+    def cache_bucket_ladder(self) -> Sequence[int]:
+        """Every ``cache_t1`` rung this backend can key a graph on.  Default: none."""
+        return ()
+
     # -- optional graph pre-warm -------------------------------------------
     def prewarm(
         self, batch_sizes: Sequence[int], cache_t1_buckets: Optional[Sequence[int]] = None

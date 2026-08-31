@@ -67,6 +67,87 @@ def round_up_bucket(cache_t1: int, granularity: int = _KERNEL_N_BLOCK) -> int:
     return ((cache_t1 + granularity - 1) // granularity) * granularity
 
 
+#: Below this many cached frames the ladder stays ``_KERNEL_N_BLOCK``-granular,
+#: because that is where a coarse bucket would be a large *relative* over-read.
+CACHE_BUCKET_KNEE = 512
+
+#: Above the knee each rung is this much larger than the last.  1.5 keeps the
+#: worst-case over-read at 50% of the true cache length, which costs ~4% of a
+#: replay -- doubling a bucket was measured at 7-14%, and a replay is about half
+#: a streaming tick.
+CACHE_BUCKET_GROWTH = 1.5
+
+
+def cache_bucket_ladder(
+    capacity: int,
+    *,
+    knee: int = CACHE_BUCKET_KNEE,
+    growth: float = CACHE_BUCKET_GROWTH,
+) -> List[int]:
+    """Every ``cache_t1`` bucket a stream can reach, smallest first.
+
+    The streaming graph is keyed on ``(B_active, T_input, cache_t1_bucket)`` and
+    the last axis grows with stream age.  Rounding it to a flat 64 frames makes
+    that axis *unbounded*: with the default ``num_left_chunks=-1`` a long stream
+    reaches a new bucket every 64 encoder frames and captures a fresh graph each
+    time, for as long as it runs.  Measured on a 120 s stream, that was 48
+    captures over 191 ticks -- a capture on **a quarter of all ticks**, ~30 ms
+    each, and the p99 was 33.3 ms against a 2.7 ms p50.  It also never settles:
+    the captures were split 24/24 between the first and second half of the run,
+    and the cache eventually saturates at ``_max_captures`` and drops the stream
+    to eager permanently.
+
+    Growing the rungs geometrically above ``knee`` turns that unbounded axis into
+    ~10-16 rungs that cover a stream's whole life, so the ladder can be pre-warmed
+    exhaustively and no capture ever lands on a live tick.  The trade is a larger
+    over-read of the paged K/V: the kernel is handed ``host_seqlen_max`` = the
+    rung, and the frames past a stream's real ``cache_seqlens`` are masked.  That
+    is the same over-read the flat rounding already performed, only wider -- and
+    it is cheap, because a replay grows just 1.04 ms -> 1.41 ms from an empty
+    cache to 82 s of history while the eager forward stays flat at ~12 ms.
+
+    ``capacity`` is ``CacheConfig.max_stream_frames``: a stream cannot cache more
+    than its block table can address, so the ladder stops there and the last rung
+    is exactly that bound.  A bucket past it would walk the block table off its
+    end, which is the paged-loader trap in AGENTS.md.
+    """
+    cap = max(0, int(capacity))
+    rungs = [0]
+    step = _KERNEL_N_BLOCK
+    b = step
+    while b < min(knee, cap):
+        rungs.append(b)
+        b += step
+    b = max(step, round_up_bucket(min(knee, cap) if cap else step))
+    while b < cap:
+        rungs.append(b)
+        nxt = round_up_bucket(int(b * growth)) if growth > 1.0 else b + step
+        b = nxt if nxt > b else b + step
+    if cap > 0:
+        # Floor, never ceil: ``capacity`` is a hard ceiling (the block table's
+        # addressable frames, and the encoder's relative-position table), so a
+        # rung rounded *up* past it is exactly the out-of-bounds read the
+        # ceiling exists to prevent.
+        rungs.append((cap // _KERNEL_N_BLOCK) * _KERNEL_N_BLOCK)
+    return sorted({r for r in rungs if 0 <= r <= cap})
+
+
+def pick_cache_bucket(cache_t1: int, ladder: Sequence[int]) -> int:
+    """Smallest rung ``>= cache_t1``; a flat 64-round when it is off the ladder.
+
+    Off-ladder means the stream is longer than the capacity the ladder was built
+    for, which the cache manager is supposed to prevent.  Rounding rather than
+    clamping keeps the contract that the returned bucket is never *below*
+    ``cache_t1`` -- handing the kernel a shorter ``host_seqlen_max`` than the
+    stream's real ``cache_seqlens`` would silently truncate its attention history.
+    """
+    want = int(cache_t1)
+    for rung in ladder:
+        if rung >= want:
+            return rung
+    return round_up_bucket(want)
+
+
 @dataclass
 class _CapturedShape:
     """One captured CUDA graph + the pre-allocated input/output buffers."""
@@ -622,6 +703,10 @@ class GraphedFeatureExtraction:
 # Re-export so callers can probe backend support without reaching into
 # ``oasr.features.batched`` directly.
 __all__ = [
+    "CACHE_BUCKET_GROWTH",
+    "CACHE_BUCKET_KNEE",
+    "cache_bucket_ladder",
+    "pick_cache_bucket",
     "round_up_bucket",
     "GraphedEncoderForward",
     "GraphedFeatureExtraction",

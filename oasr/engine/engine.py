@@ -25,7 +25,6 @@ from .executor import (
     OfflineExecutor,
     StreamingExecutor,
 )
-from .graph_cache import round_up_bucket
 from .input_processor import InputProcessor
 from .longform import LongFormTracker
 from .memory import (
@@ -292,16 +291,38 @@ class ASREngine:
             and config.service_mode == "streaming"
         ):
             try:
-                pref = [int(b) for b in (config.preferred_batch_size or [])]
-                batch_sizes = sorted({1, int(config.max_batch_size), *pref})
-                prewarm_chunks = (
-                    config.num_left_chunks
-                    if config.num_left_chunks and config.num_left_chunks > 0
-                    else 32
-                )
-                cs = int(config.chunk_size)
-                buckets = sorted({round_up_bucket(cs * k) for k in range(int(prewarm_chunks) + 2)})
-                self._model_runner.prewarm_encoder_graphs(batch_sizes, cache_t1_buckets=buckets)
+                cap = max(1, int(config.max_batch_size))
+                ladder = config.streaming_graph_batch_ladder
+                if ladder:
+                    batch_sizes = sorted({int(b) for b in ladder})
+                else:
+                    # Every width, because the graph key is the *active* batch
+                    # size and that walks 1..max as streams join and finish.
+                    # Covering only {1, max} left every width between them to
+                    # capture on a live tick.
+                    batch_sizes = list(range(1, cap + 1))
+                rungs = len(self._model_runner.streaming_backend.cache_bucket_ladder) or 1
+                budget = int(config.streaming_graph_max_shapes)
+                if len(batch_sizes) * rungs > budget:
+                    # Keep the low widths (the ramp, and light load) plus the cap.
+                    keep = max(1, budget // rungs)
+                    dropped = len(batch_sizes) - keep
+                    batch_sizes = sorted(set(batch_sizes[:keep]) | {cap})
+                    logger.info(
+                        "streaming graph pre-warm budget %d shapes: covering batch "
+                        "widths %s (%d widths left lazy; raise "
+                        "streaming_graph_max_shapes to cover them)",
+                        budget,
+                        f"1-{keep} + {cap}",
+                        dropped,
+                    )
+                # ``None`` asks the backend for its own full reachable cache
+                # ladder.  The old hand-rolled list stopped at
+                # ``num_left_chunks + 1`` chunks, and with the default
+                # ``num_left_chunks=-1`` the runtime axis is unbounded, so every
+                # stream older than that walked off the end and captured a graph
+                # on a live tick every 64 encoder frames.
+                self._model_runner.prewarm_encoder_graphs(batch_sizes, cache_t1_buckets=None)
             except Exception as exc:  # pragma: no cover
                 logger.warning(
                     "Encoder graph pre-warm failed (will capture on first " "chunk instead): %s",
