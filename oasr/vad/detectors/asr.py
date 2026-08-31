@@ -21,28 +21,34 @@ judgement for free.
 The limitation is structural and is declared rather than papered over: these
 detectors consume what the encoder produced, so they cannot run *before* it.
 :func:`~oasr.vad.registry.register_vad` refuses a spec that claims otherwise.
+Every kind here declares ``("stream", "posthoc")`` and never ``"presegment"``,
+and every one of them declares a ``min_silence_floor_ms``, because the signals
+are peaky: fed a preset tuned for a frame-level detector they would shred one
+utterance into dozens of segments.
 """
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Optional, Tuple
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
+
+from oasr.layers import AvgPool1d, MaxPool1d, Softmax
 
 from ..config import VadConfig
 from ..detector import SpeechDetector
+from ..registry import VadSpec, register_vad
 
 __all__ = [
     "CtcBlankDetector",
     "FrameActivityDetector",
     "CifAlphaDetector",
     "AedNoSpeechDetector",
+    "build_ctc_blank",
+    "build_transducer_blank",
+    "build_cif_alpha",
+    "build_aed_no_speech",
 ]
-
-
-def _int64(lengths: torch.Tensor, device: torch.device) -> torch.Tensor:
-    return lengths.to(device=device, dtype=torch.int64)
 
 
 class _AsrDetector(SpeechDetector):
@@ -58,6 +64,38 @@ class _AsrDetector(SpeechDetector):
     ) -> None:
         super().__init__(seconds_per_frame=seconds_per_frame, device=device, dtype=dtype)
         self._cfg = config
+        self._width = 1
+        self._pool: Optional[MaxPool1d] = None
+
+    def _set_dilation(self, dilate_s: float) -> None:
+        """Widen each frame by ``dilate_s`` on both sides, as a frame count."""
+        half = max(0, int(round(float(dilate_s) / self.seconds_per_frame)))
+        self._width = 2 * half + 1
+        # A stride-1 max pool with half-width padding *is* a morphological
+        # dilation.  Through the waist, so it takes the OASR kernel wherever
+        # the dtype is served and is counted as out-of-scope where it is not --
+        # a bare ``F.max_pool1d`` would be neither.
+        self._pool = MaxPool1d(self._width, stride=1, padding=self._width // 2)
+
+    def _dilate(self, probs: torch.Tensor) -> torch.Tensor:
+        """Widen each frame's value over its neighbours, on the ``(B, T)`` trace."""
+        if self._pool is None or self._width <= 1 or probs.size(1) < self._width:
+            return probs
+        # BTC is the waist's layout, so a per-frame trace is a one-channel
+        # sequence -- ``unsqueeze(-1)``, not the NCL ``unsqueeze(1)`` torch
+        # wants.  That is the point of the layout: no transpose either side.
+        #
+        # Annotated rather than returned directly: ``nn.Module.__call__`` is
+        # ``Any`` to mypy, so the layer's own return type does not survive it.
+        dilated: torch.Tensor = self._pool(probs.unsqueeze(-1))
+        return dilated.squeeze(-1)
+
+    def _finish(
+        self, probs: torch.Tensor, lengths: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The exit every per-frame kind shares: derive the counts, mask the tail."""
+        frame_lengths = lengths.to(device=probs.device, dtype=torch.int64)
+        return self._mask_padding(probs, frame_lengths), frame_lengths
 
 
 class CtcBlankDetector(_AsrDetector):
@@ -78,13 +116,21 @@ class CtcBlankDetector(_AsrDetector):
         config: VadConfig,
         *,
         blank_id: int,
+        seconds_per_frame: float,
         dilate_s: float = 0.1,
-        **kwargs: Any,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ) -> None:
-        super().__init__(config, **kwargs)  # type: ignore[arg-type]
+        super().__init__(config, seconds_per_frame=seconds_per_frame, device=device, dtype=dtype)
         self._blank_id = int(blank_id)
-        half = max(0, int(round(float(dilate_s) / self.seconds_per_frame)))
-        self._width = 2 * half + 1
+        # A short dilation, for two reasons that are not the same one.  It closes
+        # the one- and two-frame blanks *between* the tokens of a word, and it
+        # makes the endpointer's windowed activity test see a continuous run
+        # rather than a spike train.  It is deliberately far too short to bridge
+        # a real pause — that is what the declared ``min_silence_floor_ms`` is
+        # for, because bridging 840 ms of in-word blank by dilation alone would
+        # smear every boundary by 420.
+        self._set_dilation(dilate_s)
 
     def detect_from_asr(
         self, tensor: torch.Tensor, lengths: torch.Tensor
@@ -100,22 +146,7 @@ class CtcBlankDetector(_AsrDetector):
         # a confident blank from a marginal one.
         blank = tensor[..., self._blank_id].to(torch.float32)
         probs = (1.0 - blank.exp()).clamp_(0.0, 1.0)
-        if self._width > 1 and probs.size(1) >= self._width:
-            # A short dilation, for two reasons that are not the same one.  It
-            # closes the one- and two-frame blanks *between* the tokens of a
-            # word, and it makes the endpointer's windowed activity test see a
-            # continuous run rather than a spike train.  It is deliberately far
-            # too short to bridge a real pause — that is what the declared
-            # ``min_silence_floor_ms`` is for, because bridging 840 ms of
-            # in-word blank by dilation alone would smear every boundary by 420.
-            probs = F.max_pool1d(
-                probs.unsqueeze(1),
-                kernel_size=self._width,
-                stride=1,
-                padding=self._width // 2,
-            ).squeeze(1)
-        frame_lengths = _int64(lengths, probs.device)
-        return self._mask_padding(probs, frame_lengths), frame_lengths
+        return self._finish(self._dilate(probs), lengths)
 
 
 class FrameActivityDetector(_AsrDetector):
@@ -147,10 +178,17 @@ class FrameActivityDetector(_AsrDetector):
 
     kind: ClassVar[str] = "transducer_blank"
 
-    def __init__(self, config: VadConfig, *, dilate_s: float = 0.2, **kwargs: Any) -> None:
-        super().__init__(config, **kwargs)  # type: ignore[arg-type]
-        half = max(0, int(round(float(dilate_s) / self.seconds_per_frame)))
-        self._width = 2 * half + 1
+    def __init__(
+        self,
+        config: VadConfig,
+        *,
+        seconds_per_frame: float,
+        dilate_s: float = 0.2,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        super().__init__(config, seconds_per_frame=seconds_per_frame, device=device, dtype=dtype)
+        self._set_dilation(dilate_s)
 
     def detect_from_asr(
         self, tensor: torch.Tensor, lengths: torch.Tensor
@@ -160,16 +198,7 @@ class FrameActivityDetector(_AsrDetector):
                 f"transducer_blank expects a (B, T) indicator, got {tuple(tensor.shape)}"
             )
         probs = tensor.to(torch.float32).clamp_(0.0, 1.0)
-        if self._width > 1 and probs.size(1) >= self._width:
-            # Morphological dilation, which is what max-pooling with stride 1 is.
-            probs = F.max_pool1d(
-                probs.unsqueeze(1),
-                kernel_size=self._width,
-                stride=1,
-                padding=self._width // 2,
-            ).squeeze(1)
-        frame_lengths = _int64(lengths, probs.device)
-        return self._mask_padding(probs, frame_lengths), frame_lengths
+        return self._finish(self._dilate(probs), lengths)
 
 
 class CifAlphaDetector(_AsrDetector):
@@ -193,17 +222,23 @@ class CifAlphaDetector(_AsrDetector):
         self,
         config: VadConfig,
         *,
+        seconds_per_frame: float,
         smooth_frames: int = 5,
         gain: float = 4.0,
-        **kwargs: Any,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ) -> None:
-        super().__init__(config, **kwargs)  # type: ignore[arg-type]
+        super().__init__(config, seconds_per_frame=seconds_per_frame, device=device, dtype=dtype)
         width = max(1, int(smooth_frames))
         # Odd, so ``avg_pool1d`` with symmetric padding returns exactly T frames;
         # an even width returns T+1 and every span downstream shifts by half a
-        # frame.
+        # frame.  Set directly rather than through ``_set_dilation``: this is a
+        # smoothing window in frames, not a widening in seconds.
         self._width = width if width % 2 == 1 else width + 1
         self._gain = float(gain)
+        self._smooth = AvgPool1d(
+            self._width, stride=1, padding=self._width // 2, count_include_pad=False
+        )
 
     def detect_from_asr(
         self, tensor: torch.Tensor, lengths: torch.Tensor
@@ -212,16 +247,9 @@ class CifAlphaDetector(_AsrDetector):
             raise ValueError(f"cif_alpha expects (B, T) weights, got {tuple(tensor.shape)}")
         alphas = tensor.to(torch.float32).clamp_min(0.0)
         if self._width > 1 and alphas.size(1) >= self._width:
-            alphas = F.avg_pool1d(
-                alphas.unsqueeze(1),
-                kernel_size=self._width,
-                stride=1,
-                padding=self._width // 2,
-                count_include_pad=False,
-            ).squeeze(1)
+            alphas = self._smooth(alphas.unsqueeze(-1)).squeeze(-1)
         probs = (alphas * self._gain).clamp_(0.0, 1.0)
-        frame_lengths = _int64(lengths, probs.device)
-        return self._mask_padding(probs, frame_lengths), frame_lengths
+        return self._finish(probs, lengths)
 
 
 class AedNoSpeechDetector(_AsrDetector):
@@ -242,13 +270,23 @@ class AedNoSpeechDetector(_AsrDetector):
 
     kind: ClassVar[str] = "aed_no_speech"
 
-    def __init__(self, config: VadConfig, *, no_speech_token_id: int, **kwargs: Any) -> None:
-        super().__init__(config, **kwargs)  # type: ignore[arg-type]
+    def __init__(
+        self,
+        config: VadConfig,
+        *,
+        no_speech_token_id: int,
+        seconds_per_frame: float,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        super().__init__(config, seconds_per_frame=seconds_per_frame, device=device, dtype=dtype)
         self._token_id = int(no_speech_token_id)
+        self._softmax = Softmax()
 
     def detect_from_asr(
         self, tensor: torch.Tensor, lengths: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del lengths  # the window is the frame; a per-row length would be 1 either way
         if tensor.ndim != 2:
             raise ValueError(
                 f"aed_no_speech expects (B, V) prefill logits, got {tuple(tensor.shape)}"
@@ -258,8 +296,136 @@ class AedNoSpeechDetector(_AsrDetector):
                 f"no_speech_token_id {self._token_id} is outside the vocabulary "
                 f"({tensor.size(-1)}); this checkpoint's converter did not record one"
             )
-        no_speech = tensor.to(torch.float32).softmax(dim=-1)[:, self._token_id]
+        no_speech = self._softmax(tensor.to(torch.float32))[:, self._token_id]
         probs = (1.0 - no_speech).clamp_(0.0, 1.0).unsqueeze(1)
         frame_lengths = torch.ones(probs.size(0), dtype=torch.int64, device=probs.device)
-        del lengths  # the window is the frame; a per-row length would be 1 either way
         return probs, frame_lengths
+
+
+# ---------------------------------------------------------------------------
+# Factories and registration
+# ---------------------------------------------------------------------------
+
+
+def _require(name: str, kind: str, kwargs: Dict[str, Any]) -> Any:
+    """Pull a mandatory factory argument, or say which caller failed to supply it."""
+    if name not in kwargs or kwargs[name] is None:
+        raise ValueError(
+            f"the {kind!r} detector needs {name!r}, which the engine supplies from the "
+            "running model; it is missing, so this detector was built by hand without it"
+        )
+    return kwargs[name]
+
+
+def build_ctc_blank(
+    config: VadConfig,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+    **kwargs: Any,
+) -> CtcBlankDetector:
+    """Factory for the registry.  Unknown kwargs are other kinds' extras."""
+    return CtcBlankDetector(
+        config,
+        blank_id=int(_require("blank_id", "ctc_blank", kwargs)),
+        seconds_per_frame=float(_require("seconds_per_frame", "ctc_blank", kwargs)),
+        dilate_s=float(kwargs.get("dilate_s", 0.1)),
+        device=device,
+        dtype=dtype,
+    )
+
+
+def build_transducer_blank(
+    config: VadConfig,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+    **kwargs: Any,
+) -> FrameActivityDetector:
+    """Factory for the registry.  Unknown kwargs are other kinds' extras."""
+    return FrameActivityDetector(
+        config,
+        seconds_per_frame=float(_require("seconds_per_frame", "transducer_blank", kwargs)),
+        dilate_s=float(kwargs.get("dilate_s", 0.2)),
+        device=device,
+        dtype=dtype,
+    )
+
+
+def build_cif_alpha(
+    config: VadConfig,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+    **kwargs: Any,
+) -> CifAlphaDetector:
+    """Factory for the registry.  Unknown kwargs are other kinds' extras."""
+    return CifAlphaDetector(
+        config,
+        seconds_per_frame=float(_require("seconds_per_frame", "cif_alpha", kwargs)),
+        smooth_frames=int(kwargs.get("smooth_frames", 5)),
+        gain=float(kwargs.get("gain", 4.0)),
+        device=device,
+        dtype=dtype,
+    )
+
+
+def build_aed_no_speech(
+    config: VadConfig,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+    **kwargs: Any,
+) -> AedNoSpeechDetector:
+    """Factory for the registry.  Unknown kwargs are other kinds' extras."""
+    return AedNoSpeechDetector(
+        config,
+        no_speech_token_id=int(_require("no_speech_token_id", "aed_no_speech", kwargs)),
+        seconds_per_frame=float(_require("seconds_per_frame", "aed_no_speech", kwargs)),
+        device=device,
+        dtype=dtype,
+    )
+
+
+register_vad(
+    VadSpec(
+        kind="ctc_blank",
+        factory=build_ctc_blank,
+        consumes="asr_log_probs",
+        modes=("stream", "posthoc"),
+        min_silence_floor_ms=1000,
+        doc="1 - P(blank) per encoder frame, from the CTC head's own log-probs",
+    )
+)
+
+register_vad(
+    VadSpec(
+        kind="transducer_blank",
+        factory=build_transducer_blank,
+        consumes="asr_frames",
+        modes=("stream", "posthoc"),
+        min_silence_floor_ms=1000,
+        doc="emission-frame activity from the transducer greedy loop (greedy only)",
+    )
+)
+
+register_vad(
+    VadSpec(
+        kind="cif_alpha",
+        factory=build_cif_alpha,
+        consumes="asr_alphas",
+        modes=("posthoc",),
+        min_silence_floor_ms=500,
+        doc="Paraformer CIF token rate, boxcar-smoothed (heuristic gain)",
+    )
+)
+
+register_vad(
+    VadSpec(
+        kind="aed_no_speech",
+        factory=build_aed_no_speech,
+        consumes="asr_prefill_logits",
+        modes=("posthoc",),
+        doc="Whisper <|nospeech|> probability; one frame per decoding window",
+    )
+)

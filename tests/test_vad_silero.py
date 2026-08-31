@@ -166,6 +166,32 @@ class TestUpstreamParity:
             # And nothing leaked into the padding (the longest row has none).
             assert probs[i, n:].abs().sum().item() == 0.0
 
+    def test_the_equal_length_fast_path_matches_the_grouped_one(self, silero_vad_dir):
+        """``_recur``'s two routes must not be free to disagree.
+
+        Every row having the same frame count is the steady state, so the fast
+        path is what actually runs and the grouped path below it is what almost
+        never does -- the arrangement where a divergence hides.  Both are driven
+        here with the same input, and the grouped one is reached by asking for a
+        frame count that is a row short.
+        """
+        torch.manual_seed(7)
+        net = detector(silero_vad_dir).net
+        batch, frames = 4, 6
+        sequence = torch.randn(batch, frames, 128)
+        hidden = torch.randn(1, batch, 128)
+        cell = torch.randn(1, batch, 128)
+
+        with torch.no_grad():
+            fast = net._recur(sequence, [frames] * batch, hidden, cell)
+            # One row short of uniform: same rows, same order, grouped route.
+            grouped = net._recur(sequence, [frames] * (batch - 1) + [frames - 1], hidden, cell)
+
+        for i in range(batch - 1):
+            torch.testing.assert_close(fast[0][i], grouped[0][i])
+            torch.testing.assert_close(fast[1][:, i], grouped[1][:, i])
+            torch.testing.assert_close(fast[2][:, i], grouped[2][:, i])
+
     @pytest.mark.requires_assets("WAV_DIR")
     def test_segment_boundaries_agree_on_real_speech(self, silero_vad_dir, archive, wav_dir):
         """The property a caller actually sees, on audio rather than noise.

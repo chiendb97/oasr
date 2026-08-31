@@ -33,7 +33,14 @@ from typing import Deque, List, Optional, Sequence
 
 from .config import VadConfig
 
-__all__ = ["Endpointer", "EndpointDecision", "TURN_RULES", "START_TIMEOUT", "END_TIMEOUT"]
+__all__ = [
+    "Endpointer",
+    "EndpointDecision",
+    "rule_names",
+    "TURN_RULES",
+    "START_TIMEOUT",
+    "END_TIMEOUT",
+]
 
 #: Reason prefix for a fired :class:`~oasr.vad.config.EndpointRule`.
 TURN_RULES = "rule"

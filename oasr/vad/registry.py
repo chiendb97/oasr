@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
@@ -41,6 +41,7 @@ __all__ = [
     "get_vad_spec",
     "build_detector",
     "list_vad",
+    "describe_vad",
     "CONSUMES",
     "ROLES",
     "ASR_CONSUMES",
@@ -290,7 +291,7 @@ def build_detector(
     *,
     device: Optional["torch.device"] = None,
     dtype: Optional["torch.dtype"] = None,
-    **kwargs: object,
+    **kwargs: Any,
 ) -> "SpeechDetector":
     """Construct the detector named by ``config.backend``.
 

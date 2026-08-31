@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 
+import assets
 import pytest
 import torch
 
@@ -345,6 +346,59 @@ class TestOfflineSegmenter:
     def test_one_span_covering_everything_does_not_fan_out(self):
         seg = self.segmenter(speech_pad_ms=2000)
         assert seg.spans(tone(2.0)) is None
+
+    def test_a_capped_run_is_not_cut_into_independent_requests(self):
+        """``max_speech_s`` closes a run *at the current frame*, not at a
+        silence, so the two segments it leaves touch.  Fanning those out decodes
+        the word on the boundary as two half-words with no shared context and no
+        overlap to dedup against -- measured at +0.94 WER on long-form audio a
+        detector reads as one continuous run.  A boundary with no gap around it
+        drops no audio, so it buys the encoder nothing and is merged away."""
+        seg = self.segmenter(max_speech_s=1.0)
+        wav = tone(5.0)
+        assert len(seg.segments(wav)) > 1, "max_speech_s did not fire"
+        assert seg.spans(wav) is None, "a gapless cut was fanned out"
+
+    def test_a_real_gap_still_cuts_after_the_merge(self):
+        """The merge must not swallow the cuts the mode exists for."""
+        seg = self.segmenter(max_speech_s=1.0)
+        spans = seg.spans(torch.cat([tone(2.0), hiss(4.0), tone(2.0)]))
+        assert spans is not None and len(spans) == 2
+
+
+@pytest.mark.cuda
+@pytest.mark.requires_assets("WHISPER_CKPT")
+class TestFixedWindowResplit:
+    """A span the detector could not divide, on a frontend that pads to a window.
+
+    ``max_speech_s`` is pinned to ``window - 2 * speech_pad`` so every segment
+    fits, but touching segments are merged (nothing is dropped between them), so
+    a merged span can cross the window again and has to be re-split.  The width
+    that re-split uses is the trap: splitting at the *full* window leaves the
+    frontend no padding, and whisper-tiny then drops the tail of every window —
+    +2.2 WER on long-form audio, all of it deletions at the seams.
+    """
+
+    def test_the_resplit_width_keeps_the_frontends_headroom(self):
+        from oasr.engine import ASREngine, EngineConfig
+
+        engine = ASREngine(
+            EngineConfig(
+                ckpt_dir=assets.require("WHISPER_CKPT"),
+                device="cuda",
+                dtype=torch.float16,
+                service_mode="offline",
+                max_batch_size=2,
+                vad={"mode": "segment", "backend": "energy"},
+            )
+        )
+        window_s = engine._config.feature_config.fixed_window_seconds
+        assert window_s is not None, "this checkpoint has no fixed window to test"
+        window = int(engine.sample_rate * window_s)
+        assert 0 < engine._vad_resplit_samples < window
+        assert engine._vad_resplit_samples == int(
+            engine.sample_rate * engine._config.vad.max_speech_s
+        )
 
 
 @pytest.mark.cuda

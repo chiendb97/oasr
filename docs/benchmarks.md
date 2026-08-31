@@ -277,6 +277,22 @@ python benchmarks/bench_accuracy.py \
   An entry in `ci/wer-reference.json` may pin the same options, which the `llm`
   row does for its prompt: for a speech-LLM the prompt is part of the decode
   configuration, and changing it moves the WER with no defect behind it.
+- `--vad-mode` and `--vad-backend` are sweep axes too, with `--vad-model-dir`
+  and a repeatable `--vad-option k=v`; the cell is a CSV column and each row
+  gets its own `--save-transcripts` file, so "did the transcript change?" is a
+  `diff`:
+
+  ```bash
+  python benchmarks/bench_accuracy.py --ckpt-dir "$CKPT_DIR" \
+      --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root "$WAV_DIR" \
+      --vad-mode off segment --vad-backend energy silero
+  ```
+
+  A corpus of **short** utterances measures almost nothing here: the splitter
+  declines to cut audio one padded span already covers, so `segment` scores
+  identically to `off` — a useful negative control, not evidence that
+  segmentation works. Verify that on long-form audio, and read the segment
+  count and the seconds dropped beside the rate.
 
 ## Notes
 

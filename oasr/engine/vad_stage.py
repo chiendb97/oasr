@@ -30,11 +30,13 @@ Set ``VadConfig.device`` to move it once a detector exists that is worth the tri
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
 from oasr.vad import (
+    SPEECH_STARTED,
     EndpointDecision,
     Endpointer,
     SpeechSegment,
@@ -44,7 +46,10 @@ from oasr.vad import (
     build_detector,
     get_vad_spec,
 )
-from oasr.vad.detector import VadState, as_rows
+from oasr.vad.detector import SpeechDetector, VadState, as_rows
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .request import Request
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +73,7 @@ class OfflineVadSegmenter:
         self._detector = build_detector(config, device=device)
 
     @property
-    def detector(self):
+    def detector(self) -> SpeechDetector:
         return self._detector
 
     def segments(self, waveform: torch.Tensor) -> List[SpeechSegment]:
@@ -92,6 +97,17 @@ class OfflineVadSegmenter:
         rather than silently returning nothing), and a single span that already
         covers the whole waveform (fanning out to one child would add a hop for
         no cut).
+
+        Spans that **touch** are merged first, and that is load-bearing rather
+        than tidying: the fan-out decodes each span as an independent request
+        with no shared context and no overlap to dedup against, which is sound
+        for a cut that lands in a silence and wrong for one that does not.  A
+        boundary with no gap on either side drops no audio, so it buys the
+        encoder nothing and costs the word that straddles it.  ``max_speech_s``
+        is the way in — :class:`~oasr.vad.SpeechSegmenter` closes a run that
+        reaches the cap *at the current frame* rather than at a silence — and a
+        real gap shorter than twice ``speech_pad_ms`` is the other, since the
+        padding then meets in the middle.
         """
         total_samples = int(waveform.numel())
         if total_samples <= 0:
@@ -101,8 +117,12 @@ class OfflineVadSegmenter:
         for segment in self.segments(waveform):
             start = max(0, int(round(segment.start * rate)))
             end = min(total_samples, int(round(segment.end * rate)))
-            if end > start:
-                pairs.append((start, end))
+            if end <= start:
+                continue
+            if pairs and start <= pairs[-1][1]:
+                pairs[-1] = (pairs[-1][0], max(pairs[-1][1], end))
+                continue
+            pairs.append((start, end))
         if not pairs:
             return None
         if len(pairs) == 1 and pairs[0] == (0, total_samples):
@@ -187,7 +207,7 @@ class StreamingVadStage:
         spec = get_vad_spec(str(config.backend))
         self._consumes = spec.consumes
         self._stateful = spec.stateful
-        self._pad_s = float(config.speech_pad_ms or 0) / 1000.0
+        self._pad_s = config.speech_pad_seconds
         if self.needs_audio:
             framing = self._detector.framing
             if framing is None:
@@ -213,7 +233,7 @@ class StreamingVadStage:
             self._min_samples = 0
 
     @property
-    def detector(self):
+    def detector(self) -> SpeechDetector:
         return self._detector
 
     @property
@@ -282,8 +302,6 @@ class StreamingVadStage:
 
     @staticmethod
     def _with_silence_override(cfg: VadConfig, seconds: float) -> VadConfig:
-        from dataclasses import replace
-
         rules = []
         for rule in cfg.endpoint_rules or ():
             if rule.min_trailing_silence_s > 0.0 and rule.must_contain_nonsilence:
@@ -326,7 +344,7 @@ class StreamingVadStage:
 
     def advance_from_map(
         self,
-        requests: Sequence[object],
+        requests: Sequence["Request"],
         tensor_map: Dict[str, torch.Tensor],
     ) -> None:
         """Advance every stream from this tick's per-request chunk tensors.
@@ -346,8 +364,8 @@ class StreamingVadStage:
         """
         groups: Dict[int, List[str]] = {}
         for request in requests:
-            request_id = getattr(request, "request_id", None)
-            tensor = tensor_map.get(request_id) if request_id is not None else None
+            request_id = request.request_id
+            tensor = tensor_map.get(request_id)
             if tensor is None or request_id not in self._states:
                 continue
             groups.setdefault(int(tensor.size(-2)), []).append(request_id)
@@ -376,7 +394,7 @@ class StreamingVadStage:
             return
         self._audio.setdefault(request_id, []).append(wave.to("cpu", copy=False))
 
-    def advance_audio(self, requests: Sequence[object]) -> None:
+    def advance_audio(self, requests: Sequence["Request"]) -> None:
         """Classify every stream's newly fed audio in one batched detector call.
 
         Runs at the top of the tick, ahead of the encoder, so the gate has a
@@ -391,9 +409,7 @@ class StreamingVadStage:
         states: List[StreamVadState] = []
         buffers: List[torch.Tensor] = []
         for request in requests:
-            request_id = getattr(request, "request_id", None)
-            if request_id is None:
-                continue
+            request_id = request.request_id
             state = self._states.get(request_id)
             if state is None:
                 continue
@@ -415,11 +431,17 @@ class StreamingVadStage:
         if not ids:
             return
 
-        widest = max(int(b.numel()) for b in buffers)
-        batch = torch.zeros(len(buffers), widest, dtype=torch.float32)
-        for slot, buf in enumerate(buffers):
-            batch[slot, : buf.numel()] = buf
-        lengths = torch.tensor([int(b.numel()) for b in buffers], dtype=torch.int64)
+        sizes = [int(b.numel()) for b in buffers]
+        widest = max(sizes)
+        if all(size == widest for size in sizes):
+            # The steady state: every stream was fed the same chunk, so there is
+            # nothing to pad and one op replaces a Python-level copy per stream.
+            batch = torch.stack(buffers)
+        else:
+            batch = torch.zeros(len(buffers), widest, dtype=torch.float32)
+            for slot, buf in enumerate(buffers):
+                batch[slot, : buf.numel()] = buf
+        lengths = torch.tensor(sizes, dtype=torch.int64)
         batch = batch.to(self._device)
         lengths = lengths.to(self._device)
 
@@ -457,7 +479,7 @@ class StreamingVadStage:
             state.pending.extend(events)
             if state.endpointer is not None:
                 for event in events:
-                    if event.kind == "speech_started":
+                    if event.kind == SPEECH_STARTED:
                         state.endpointer.note_speech_started()
         if state.endpointer is not None and state.decision is None:
             state.decision = state.endpointer.push(row, decoded_any=decoded_any)
@@ -470,7 +492,9 @@ class StreamingVadStage:
     def turn_boundary(self, request_id: str) -> Optional[float]:
         """Session time after which audio belongs to a **new** turn, or ``None``.
 
-        The end of the last confirmed speech run plus the segment padding.  It is
+        The end of the last confirmed speech run plus the segment padding —
+        unless speech has already resumed by then, in which case there is no
+        silence to cut at and this returns ``None``.  It is
         deliberately not the same question :meth:`should_encode` answers: a turn
         boundary is a fact about audio the detector has already judged, so it can
         be acted on however far behind the encoder happens to be, while a skip
@@ -484,7 +508,19 @@ class StreamingVadStage:
         if state is None:
             return None
         end = state.segmenter.last_segment_end
-        return None if end is None else end + self._pad_s
+        if end is None:
+            return None
+        boundary = end + self._pad_s
+        run_start = state.segmenter.open_run_start
+        if run_start is not None and run_start <= boundary:
+            # Speech resumes at or before the boundary, so there is no silence
+            # to cut at: closing the turn here would reset the encoder in the
+            # middle of a word, and streaming cannot replay the audio to recover
+            # it.  ``max_speech_s`` is how a run closes without a silence
+            # (:class:`~oasr.vad.SpeechSegmenter` cuts at the current frame), and
+            # a cap is a length decision, not a turn decision.
+            return None
+        return boundary
 
     def should_encode(self, request_id: str, start_s: float, end_s: float) -> bool:
         """Whether the encoder window covering ``[start_s, end_s)`` must run.

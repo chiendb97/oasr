@@ -30,13 +30,14 @@ import math
 from typing import Any, ClassVar, List, Optional, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
+
+from oasr.layers import AvgPool1d, Sigmoid
 
 from ..config import VadConfig
 from ..detector import SpeechDetector, VadState
-from ..registry import VadFraming
+from ..registry import VadFraming, VadSpec, register_vad
 
-__all__ = ["EnergyDetector", "EnergyVadState", "energy_framing"]
+__all__ = ["EnergyDetector", "EnergyVadState", "energy_framing", "build_energy"]
 
 #: Mean-square power at or below which a row is called digital silence outright.
 #: Without this the peak-relative rule inverts on an all-zero row: the peak is
@@ -125,6 +126,12 @@ class EnergyDetector(SpeechDetector):
         self._framing = framing
         self._dyn_nats = float(dynamic_range_db) / _DB_PER_NAT
         self._slope = float(slope)
+        # Through the waist rather than ``F.avg_pool1d`` / ``torch.sigmoid``:
+        # each takes the OASR kernel wherever the dtype is served and is counted
+        # as out-of-scope where it is not.  A bare torch call is neither, which
+        # is how a missing kernel stays missing.
+        self._pool = AvgPool1d(framing.span, stride=framing.hop, count_include_pad=False)
+        self._sigmoid = Sigmoid()
 
     @property
     def framing(self) -> VadFraming:
@@ -175,12 +182,12 @@ class EnergyDetector(SpeechDetector):
                 empty.to(torch.bool),
             )
 
-        # avg_pool1d over the squared signal rather than ``unfold``: unfold
-        # materialises (B, F, span), which for one 30 s utterance is 1.2 M floats
-        # per row before the reduction even starts.
-        power = F.avg_pool1d(
-            wav.pow(2).unsqueeze(1), kernel_size=span, stride=hop, count_include_pad=False
-        ).squeeze(1)
+        # Average pooling over the squared signal rather than ``unfold``:
+        # unfold materialises (B, F, span), which for one 30 s utterance is
+        # 1.2 M floats per row before the reduction even starts.  ``(B, T, 1)``
+        # is the waist's BTC layout for a one-channel signal, so no transpose is
+        # needed on either side.
+        power = self._pool(wav.pow(2).unsqueeze(-1)).squeeze(-1)
 
         n_frames = power.size(1)
         valid = torch.arange(n_frames, device=device).unsqueeze(0) < frame_lengths.unsqueeze(1)
@@ -194,7 +201,7 @@ class EnergyDetector(SpeechDetector):
         floor = _SILENCE_POWER_FLOOR * 1e-2
         log_e = torch.log(power.clamp_min(floor))
         threshold = torch.log(peak.clamp_min(floor)) - self._dyn_nats
-        probs = torch.sigmoid((log_e - threshold) * self._slope)
+        probs = self._sigmoid((log_e - threshold) * self._slope)
         probs = torch.where(silent_row.expand_as(probs), torch.zeros_like(probs), probs)
         return self._mask_padding(probs, frame_lengths)
 
@@ -253,6 +260,28 @@ def build_energy(
         config,
         device=device,
         dtype=dtype,
-        dynamic_range_db=float(kwargs.get("dynamic_range_db", 35.0)),  # type: ignore[arg-type]
-        slope=float(kwargs.get("slope", 1.0)),  # type: ignore[arg-type]
+        dynamic_range_db=float(kwargs.get("dynamic_range_db", 35.0)),
+        slope=float(kwargs.get("slope", 1.0)),
     )
+
+
+register_vad(
+    VadSpec(
+        kind="energy",
+        factory=build_energy,
+        consumes="waveform",
+        framing=energy_framing,
+        # All three roles.  ``presegment`` is what lets it cut audio before the
+        # encoder sees it -- offline through the long-form fan-out, streaming
+        # through the per-window gate -- and ``stream`` says it can do that
+        # incrementally, which for this detector means carrying a running peak
+        # and the sub-frame sample remainder across chunk boundaries rather than
+        # restarting its reference at every chunk.
+        modes=("presegment", "stream", "posthoc"),
+        # Stateful for that reason: without the carry each chunk would be
+        # normalised against its own loudest frame and a chunk of pure room tone
+        # would read as a chunk of pure speech.
+        stateful=True,
+        doc="peak-relative log-energy; dependency-free baseline",
+    )
+)

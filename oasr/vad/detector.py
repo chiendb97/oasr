@@ -109,7 +109,9 @@ class SpeechDetector(ABC):
 
     # -- waveform detectors -------------------------------------------------
 
-    def detect(self, waveform: torch.Tensor, lengths: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    def detect(
+        self, waveform: torch.Tensor, lengths: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(B, T)`` padded waveform + ``(B,)`` sample counts → probabilities.
 
         Returns ``(probs (B, T_vad) float32, frame_lengths (B,) int64)``, with

@@ -137,6 +137,24 @@ class TestEncoderGate:
         assert boundary is not None
         assert boundary == pytest.approx(2.0 + st.pad_seconds, abs=0.15)
 
+    def test_the_cap_does_not_close_a_turn_mid_speech(self):
+        """``max_speech_s`` closes a run at the current frame rather than at a
+        silence, and a turn closed there resets the encoder in the middle of a
+        word — which streaming, unlike the offline fan-out, cannot recover by
+        re-reading the audio.  A cap is a length decision, not a turn decision:
+        measured at +0.88 WER on long-form audio the detector reads as one run.
+        """
+        st = self.fed(tone(6.0), max_speech_s=1.0)
+        seg = st.state("r").segmenter
+        assert seg.last_segment_end is not None, "max_speech_s did not fire"
+        assert seg.open_run_start is not None, "speech did not resume"
+        assert st.turn_boundary("r") is None, "the turn closed on a gapless cut"
+
+    def test_a_confirmed_silence_still_closes_the_turn_under_a_cap(self):
+        """The guard must not disable turn closing wherever a cap is set."""
+        st = self.fed(torch.cat([tone(3.0), hiss(6.0)]), max_speech_s=1.0)
+        assert st.turn_boundary("r") is not None
+
 
 class TestIncrementalAudioFeed:
     def test_ragged_chunks_do_not_drift_against_a_single_call(self):

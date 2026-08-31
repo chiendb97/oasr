@@ -396,14 +396,31 @@ class ASREngine:
         # splitter differs.  It *supersedes* the fixed-window splitter when both
         # are configured: a cut that lands in silence is strictly better than one
         # at an arbitrary sample count, and it needs no overlap, so the word-level
-        # dedup ``merge_texts`` does at a window seam becomes unnecessary.
+        # dedup ``merge_texts`` does at a window seam becomes unnecessary.  That
+        # holds for a cut in a silence and only for one: a boundary with no gap
+        # around it is merged away in ``OfflineVadSegmenter.spans``, and the one
+        # seam that survives without a silence — a merged span too long for a
+        # fixed-window frontend — is re-split *with* the overlap below.
         self._vad_splitter: Optional[OfflineVadSegmenter] = None
+        #: Width, in samples, to re-split a VAD span that a fixed-window frontend
+        #: cannot take whole.  ``_resolve_vad`` has already pinned
+        #: ``max_speech_s`` to ``window - 2 * speech_pad`` for such a frontend;
+        #: this is that same budget, and using the *full* window instead costs
+        #: real words — measured at +2.2 WER on whisper-tiny, which drops the
+        #: tail of a window with no padding left in it.
+        self._vad_resplit_samples = 0
         vad_cfg = config.vad
         if vad_cfg is not None and vad_cfg.mode == "segment" and config.service_mode == "offline":
             device = torch.device(vad_cfg.device or "cpu")
             self._vad_splitter = OfflineVadSegmenter(vad_cfg.resolve("offline"), device)
             if self._longform is None:
                 self._longform = LongFormTracker()
+            feature_config = config.feature_config
+            assert feature_config is not None, "EngineConfig always materialises one"
+            fixed_window_s = feature_config.fixed_window_seconds
+            if fixed_window_s is not None:
+                budget_s = vad_cfg.resolve("offline").max_speech_s or fixed_window_s
+                self._vad_resplit_samples = int(int(feature_config.sample_rate) * float(budget_s))
             logger.info(
                 "vad segmentation enabled: backend=%s on %s (supersedes the "
                 "fixed-window splitter)",
@@ -800,7 +817,7 @@ class ASREngine:
             # Resolve first to read the padding the preset chose, then pin the
             # cap on the unresolved config so ``resolve`` honours it.
             resolved = vad.resolve(config.service_mode)
-            budget = float(window_s) - 2.0 * (resolved.speech_pad_ms or 0) / 1000.0
+            budget = float(window_s) - 2.0 * resolved.speech_pad_seconds
             if budget <= 0:
                 raise ValueError(
                     f"vad.speech_pad_ms={resolved.speech_pad_ms} leaves no room in "
@@ -911,10 +928,39 @@ class ASREngine:
         spans: Optional[List[Tuple[int, int]]] = None
         if self._vad_splitter is not None:
             spans = self._vad_splitter.spans(wave)
+            if spans is None and 0 < self._vad_resplit_samples < int(wave.numel()):
+                # The detector found nothing to cut at, but this frontend cannot
+                # take the request whole.  Having asked for segmentation and got
+                # a rejection is the worst of both, so hand the undivided audio
+                # to the fixed-window splitter below.
+                spans = [(0, int(wave.numel()))]
 
         if spans is not None:
-            windows = [wave[start:end] for start, end in spans]
-            starts = [start / float(sample_rate) for start, _end in spans]
+            windows: List[torch.Tensor] = []
+            starts: List[float] = []
+            for start, end in spans:
+                piece = wave[start:end]
+                if 0 < self._vad_resplit_samples < int(piece.numel()):
+                    # A span the VAD could find no silence in, longer than the
+                    # frontend's window: it has to be cut somewhere, so cut it at
+                    # the window.  Overlap is *not* added on its own initiative —
+                    # measured on whisper-tiny over noisy long-form audio, a 1 s
+                    # overlap cost +2.26 WER against a clean cut, because
+                    # ``merge_texts`` matches a repeated hallucination at the
+                    # seam and drops real words with it.  ``long_form`` is how a
+                    # caller opts into that trade.
+                    overlap = min(
+                        max(0, self._longform_overlap_samples), self._vad_resplit_samples - 1
+                    )
+                    stride = self._vad_resplit_samples - overlap
+                    subs = split_windows(piece, self._vad_resplit_samples, overlap)
+                    windows.extend(subs)
+                    starts.extend(
+                        (start + k * stride) / float(sample_rate) for k in range(len(subs))
+                    )
+                    continue
+                windows.append(piece)
+                starts.append(start / float(sample_rate))
         else:
             # No VAD, or VAD found nothing worth cutting at — fall back to the
             # fixed-window splitter, which is a no-op for audio that already

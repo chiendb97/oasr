@@ -117,7 +117,7 @@ class SpeechSegmenter:
         self._neg_threshold = float(config.neg_threshold)
         self._min_speech = self._frames(config.min_speech_ms)
         self._min_silence = self._frames(config.min_silence_ms)
-        self._pad = float(config.speech_pad_ms or 0) / 1000.0
+        self._pad = config.speech_pad_seconds
         self._max_speech = (
             None
             if config.max_speech_s is None

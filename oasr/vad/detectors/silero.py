@@ -65,7 +65,7 @@ from oasr.layers import LSTM, Conv1d, Linear, Relu, Sigmoid
 
 from ..config import VadConfig
 from ..detector import SpeechDetector, VadState
-from ..registry import VadFraming
+from ..registry import VadFraming, VadSpec, register_vad
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +154,10 @@ class SileroVadNet(nn.Module):
         #: Real bins of the conv-STFT; the basis holds real and imaginary
         #: halves stacked, so the convolution has twice this many outputs.
         self.cutoff = filter_length // 2 + 1
+        #: Encoder output width and recurrent state width -- a trained
+        #: constant like the geometry above, read through the instance so
+        #: every shape in this class comes from one place.
+        self.hidden_size = _HIDDEN
 
         self.stft = Conv1d(
             1,
@@ -169,12 +173,17 @@ class SileroVadNet(nn.Module):
                 Conv1d(self.cutoff, 128, 3, stride=1, padding=1, device=device, dtype=dtype),
                 Conv1d(128, 64, 3, stride=2, padding=1, device=device, dtype=dtype),
                 Conv1d(64, 64, 3, stride=2, padding=1, device=device, dtype=dtype),
-                Conv1d(64, 128, 3, stride=1, padding=1, device=device, dtype=dtype),
+                # The last width is the one `embed` reshapes to and the LSTM
+                # consumes, so it is the constant above; the 128/64 before it
+                # are independent intermediates that merely happen to match.
+                Conv1d(64, self.hidden_size, 3, stride=1, padding=1, device=device, dtype=dtype),
             ]
         )
         self.activation = Relu()
-        self.lstm = LSTM(_HIDDEN, _HIDDEN, batch_first=True, device=device, dtype=dtype)
-        self.head = Linear(_HIDDEN, 1, device=device, dtype=dtype)
+        self.lstm = LSTM(
+            self.hidden_size, self.hidden_size, batch_first=True, device=device, dtype=dtype
+        )
+        self.head = Linear(self.hidden_size, 1, device=device, dtype=dtype)
         self.output_activation = Sigmoid()
 
     # -- pieces --------------------------------------------------------------
@@ -195,7 +204,7 @@ class SileroVadNet(nn.Module):
         for conv in self.encoder:
             hidden = self.activation(conv(hidden))
         # The encoder's strides collapse the frame axis to one step per window.
-        return hidden.reshape(hidden.size(0), _HIDDEN)
+        return hidden.reshape(hidden.size(0), self.hidden_size)
 
     def _recur(
         self,
@@ -211,10 +220,19 @@ class SileroVadNet(nn.Module):
         a masked per-step loop would be correct too, but it hands the recurrent
         kernel a length-one sequence every time and turns the one part of this
         model that is genuinely sequential into ``F`` launches per stream.  In
-        steady state every stream is fed the same chunk, so there is one group.
+        steady state every stream is fed the same chunk, so there is one group --
+        and then the grouping machinery is pure identity work: gathering every
+        row in order, scattering it back, and copying a state that was never
+        permuted.  That case is taken directly.  It is not a micro-optimisation
+        of a rare path but the common one: the pool is fed the same chunk every
+        tick, so the fast path is what runs, and the general path below is what
+        makes a ragged tick correct.
         """
         batch, n_frames, _ = sequence.shape
-        outputs = sequence.new_zeros(batch, n_frames, _HIDDEN)
+        if n_frames and all(int(count) == n_frames for count in frame_lengths):
+            out, (new_h, new_c) = self.lstm(sequence, (hidden, cell))
+            return out, new_h, new_c
+        outputs = sequence.new_zeros(batch, n_frames, self.hidden_size)
         groups: Dict[int, List[int]] = defaultdict(list)
         for row, count in enumerate(frame_lengths):
             if count > 0:
@@ -247,7 +265,7 @@ class SileroVadNet(nn.Module):
         if n_frames == 0:
             return windows.new_zeros(batch, 0), hidden, cell
         embedded = self.embed(windows.reshape(batch * n_frames, windows.size(-1)))
-        sequence = embedded.reshape(batch, n_frames, _HIDDEN)
+        sequence = embedded.reshape(batch, n_frames, self.hidden_size)
         outputs, hidden, cell = self._recur(sequence, frame_lengths, hidden, cell)
         probs = self.output_activation(self.head(self.activation(outputs)))
         return probs.squeeze(-1), hidden, cell
@@ -422,7 +440,8 @@ class SileroDetector(SpeechDetector):
     # -- state ---------------------------------------------------------------
 
     def new_state(self, batch: int) -> SileroVadState:
-        zeros = torch.zeros(1, batch, _HIDDEN, dtype=self._dtype, device=self._device)
+        width = self._net.hidden_size
+        zeros = torch.zeros(1, batch, width, dtype=self._dtype, device=self._device)
         return SileroVadState(
             zeros,
             zeros.clone(),
@@ -536,3 +555,25 @@ def build_silero(
         device=device,
         dtype=dtype,
     )
+
+
+register_vad(
+    VadSpec(
+        kind="silero",
+        factory=build_silero,
+        consumes="waveform",
+        framing=silero_framing,
+        # A waveform detector, so it can run ahead of the encoder: ``presegment``
+        # drives the offline fan-out and the streaming per-window gate, and
+        # ``stream`` says it can do that incrementally.
+        modes=("presegment", "stream", "posthoc"),
+        # The LSTM's hidden state crosses chunk boundaries, and so do the 64
+        # samples of carried left context (see SileroVadState).
+        stateful=True,
+        # A neural detector with random weights would report an activity trace
+        # that looks like a distribution and means nothing, so the engine refuses
+        # at construction and names the flag rather than letting it happen.
+        needs_weights=True,
+        doc="Silero VAD v5 (MIT, 309K params); needs --vad-model-dir",
+    )
+)

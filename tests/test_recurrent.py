@@ -113,6 +113,83 @@ class TestRecurrentCpu:
         assert repacked[0].data_ptr() != packed_ih.data_ptr()
 
 
+def _lstm_layer_formula(sequence, hidden, cell, weight_ih, weight_hh, bias_ih, bias_hh):
+    """The LSTM recurrence, written out, one timestep at a time.
+
+    An independent statement of the rule ``LSTM._torch_layer`` implements, kept
+    here rather than in the layer for the same reason ``tests/test_alignment_cpp.py``
+    restates the alignment rule: the fast path calls ``torch.lstm``, so without a
+    second, separately written source of truth the layer would only ever be
+    checked against itself.  ``sequence`` is time-major ``(T, B, input)``.
+    """
+    outputs = []
+    for timestep in range(sequence.shape[0]):
+        gates = torch.nn.functional.linear(sequence[timestep], weight_ih, bias_ih)
+        gates = gates + torch.nn.functional.linear(hidden, weight_hh, bias_hh)
+        input_gate, forget_gate, cell_gate, output_gate = gates.chunk(4, dim=-1)
+        cell = torch.sigmoid(forget_gate) * cell + torch.sigmoid(input_gate) * torch.tanh(cell_gate)
+        hidden = torch.sigmoid(output_gate) * torch.tanh(cell)
+        outputs.append(hidden)
+    return torch.stack(outputs), hidden, cell
+
+
+class TestTorchLayerFormula:
+    """``LSTM._torch_layer`` against the recurrence written out by hand.
+
+    This is what makes the fused call safe to have taken.  The gate order
+    ``(i, f, g, o)`` packed into one ``4H`` row block is not a convention the
+    layer may pick for itself -- ``convert_silero_state_dict`` and every
+    PyTorch-shaped checkpoint depend on it -- so it is pinned against a formula
+    that spells it out rather than against another library call.
+    """
+
+    @pytest.mark.parametrize("batch_first", [False, True])
+    @pytest.mark.parametrize("bias", [False, True])
+    @pytest.mark.parametrize("timesteps", [1, 7])
+    def test_fused_layer_matches_the_written_out_recurrence(self, batch_first, bias, timesteps):
+        torch.manual_seed(3)
+        batch, input_size, hidden_size = 4, 6, 10
+        module = LSTM(input_size, hidden_size, bias=bias, batch_first=batch_first)
+        shape = (batch, timesteps, input_size) if batch_first else (timesteps, batch, input_size)
+        x = torch.randn(shape)
+        h0 = torch.randn(batch, hidden_size)
+        c0 = torch.randn(batch, hidden_size)
+        bias_ih, bias_hh = module._biases(0)
+
+        got = LSTM._torch_layer(
+            x, h0, c0, module.weight_ih_l0, module.weight_hh_l0, bias_ih, bias_hh, batch_first
+        )
+        expected = _lstm_layer_formula(
+            x.transpose(0, 1) if batch_first else x,
+            h0,
+            c0,
+            module.weight_ih_l0,
+            module.weight_hh_l0,
+            bias_ih,
+            bias_hh,
+        )
+        expected_output = expected[0].transpose(0, 1) if batch_first else expected[0]
+        torch.testing.assert_close(got[0], expected_output)
+        torch.testing.assert_close(got[1], expected[1])
+        torch.testing.assert_close(got[2], expected[2])
+
+    def test_the_gate_order_is_i_f_g_o(self):
+        """A permuted gate block must fail, or the test above proves nothing."""
+        torch.manual_seed(4)
+        module = LSTM(6, 10, batch_first=True)
+        x = torch.randn(4, 7, 6)
+        h0, c0 = torch.randn(4, 10), torch.randn(4, 10)
+        bias_ih, bias_hh = module._biases(0)
+        swapped = module.weight_ih_l0.detach().clone()
+        # Swap the input and forget blocks -- the classic layout confusion.
+        swapped[:10], swapped[10:20] = module.weight_ih_l0[10:20], module.weight_ih_l0[:10]
+        got = LSTM._torch_layer(x, h0, c0, swapped, module.weight_hh_l0, bias_ih, bias_hh, True)
+        expected = _lstm_layer_formula(
+            x.transpose(0, 1), h0, c0, module.weight_ih_l0, module.weight_hh_l0, bias_ih, bias_hh
+        )
+        assert not torch.allclose(got[0], expected[0].transpose(0, 1), atol=1e-4)
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="recurrent kernels need CUDA")
 class TestRecurrentCuda:

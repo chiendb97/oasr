@@ -301,6 +301,16 @@ class VadConfig:
                 raise ValueError(f"vad backend must be one of {kinds}, got {self.backend!r}")
 
     @property
+    def speech_pad_seconds(self) -> float:
+        """``speech_pad_ms`` in seconds, with the unresolved case as zero.
+
+        Derived here rather than at each of the three use sites -- the
+        segmenter, the streaming gate and the frontend-window budget -- so the
+        ``or 0`` guard for an unresolved config is stated once.
+        """
+        return float(self.speech_pad_ms or 0) / 1000.0
+
+    @property
     def enabled(self) -> bool:
         """Whether any VAD work should run at all."""
         return self.mode != "off"
