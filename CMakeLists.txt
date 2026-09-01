@@ -213,6 +213,9 @@ endif()
 if(BUILD_PYTHON)
     set(PYBIND_SOURCES
         csrc/pybind/pybind_main.cpp
+        # Needs ATen, so it belongs here rather than in ``oasr_core`` — that
+        # library is deliberately torch-free (see OASR_SOURCES).
+        csrc/streaming/feature_ring.cc
     )
 
     pybind11_add_module(_C ${PYBIND_SOURCES})

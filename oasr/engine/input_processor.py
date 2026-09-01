@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -66,6 +67,20 @@ class _StreamInput:
     segments: List[torch.Tensor]
     n_samples: int
     flush: bool
+
+
+#: The C++ feature-ring append, when ``_C`` was built.  ``None`` falls back to the
+#: Python loop below, which is the reference implementation and stays exercised:
+#: ``tests/test_feature_ring_native.py`` pins the two equal.  Set
+#: ``OASR_STREAMING_NATIVE=0`` to force the fallback for an A/B or a rollback.
+_CPP_STREAMING = None
+if os.environ.get("OASR_STREAMING_NATIVE", "1") != "0":
+    try:
+        from oasr import _C as _oasr_C  # type: ignore[attr-defined]
+
+        _CPP_STREAMING = _oasr_C.streaming
+    except (ImportError, AttributeError):  # pragma: no cover - CPU-only install
+        _CPP_STREAMING = None
 
 
 #: Appends a compacted feature buffer should absorb before compacting again.
@@ -1095,24 +1110,73 @@ class InputProcessor:
         hop = self.streaming_framing.hop
         feat_dim = self._feature_config.output_dim
         nvtx_push("distribute")
-        dsts: List[torch.Tensor] = []
-        srcs: List[torch.Tensor] = []
+        if _CPP_STREAMING is not None:
+            self._append_features_native(inputs, feats, feat_lens_cpu, feat_dim)
+        else:
+            dsts: List[torch.Tensor] = []
+            srcs: List[torch.Tensor] = []
+            for i, inp in enumerate(inputs):
+                new_nf = int(feat_lens_cpu[i])
+                if new_nf > 0:
+                    self._plan_append_features(
+                        inp.request, feats[i, :new_nf, :], feat_dim, dsts, srcs
+                    )
+            if dsts:
+                if len(dsts) == 1:
+                    dsts[0].copy_(srcs[0])
+                else:
+                    torch._foreach_copy_(dsts, srcs)
+
+        # The audio tail is per-stream Python either way: it slices a *list* of
+        # host-side waveform segments, which has no batched form to hand across.
         for i, inp in enumerate(inputs):
             req = inp.request
-            new_nf = int(feat_lens_cpu[i])
-            if new_nf > 0:
-                self._plan_append_features(req, feats[i, :new_nf, :], feat_dim, dsts, srcs)
-            consumed = new_nf * hop
+            consumed = int(feat_lens_cpu[i]) * hop
             if inp.flush or consumed >= inp.n_samples:
                 req.audio_tail = inp.segments[-1].new_empty(0)
             else:
                 req.audio_tail = _suffix(inp.segments, consumed)
-        if dsts:
-            if len(dsts) == 1:
-                dsts[0].copy_(srcs[0])
-            else:
-                torch._foreach_copy_(dsts, srcs)
         nvtx_pop()
+
+    def _append_features_native(
+        self,
+        inputs: List["_StreamInput"],
+        feats: torch.Tensor,
+        feat_lens_cpu: List[int],
+        feat_dim: int,
+    ) -> None:
+        """One boundary crossing for the whole ready set, instead of ~5 per stream.
+
+        The loop this replaces is not interpreter-bound — its own control flow
+        costs 1.775 us for sixteen streams while one ``buf[a:b]`` costs 1.603 us.
+        What it is bound by is the Python->ATen boundary, and that is what moving
+        the loop across removes: the same slice measures 1.246 us from Python and
+        0.422 us from C++.
+
+        ``oasr._C.streaming.append_features`` performs the copies itself, so the
+        planned pairs never cross back.  It returns the updated ring state per
+        stream in submission order; a stream with no new frames comes back
+        untouched.
+        """
+        native = _CPP_STREAMING
+        assert native is not None  # only reached when the caller found it built
+        requests = [inp.request for inp in inputs]
+        buffers, frames, cursors, base_delta, _n_realloc = native.append_features(
+            [r.feature_buffer for r in requests],
+            [r.feature_frames for r in requests],
+            [r.feature_cursor for r in requests],
+            feats,
+            [int(n) for n in feat_lens_cpu],
+            feat_dim,
+            _FEATURE_HEADROOM_APPENDS,
+            _FEATURE_HEADROOM_MAX,
+        )
+        for req, buf, n_frames, cursor, base in zip(requests, buffers, frames, cursors, base_delta):
+            req.feature_buffer = buf
+            req.feature_frames = n_frames
+            req.feature_cursor = cursor
+            if base:
+                req.feature_base += base
 
     def _plan_append_features(
         self,

@@ -10,6 +10,7 @@
 #include <oasr/common/types.h>
 #include "pybind_alignment.h"
 #include "pybind_decoder.h"
+#include "pybind_streaming.h"
 
 namespace py = pybind11;
 
@@ -92,4 +93,9 @@ PYBIND11_MODULE(_C, m) {
     // Alignment / word timings (post-decode, off the interpreter)
     // =========================================================================
     oasr::pybind::registerAlignmentBindings(m);
+
+    // =========================================================================
+    // Streaming step-loop host helpers
+    // =========================================================================
+    oasr::pybind::registerStreamingBindings(m);
 }
