@@ -146,7 +146,14 @@ class HuggingFaceTokenizer(Tokenizer):
             return full[len(prev) :] if full.startswith(prev) else full
 
         delta = rendered[len(prev_window) :]
-        state["text"] = state.get("text", "") + delta
+        # ``pop`` then ``+=``, not ``get`` then ``+``.  ``a + b`` always
+        # allocates and copies both operands, so the windowed decode above was
+        # constant-cost while the accumulation beneath it stayed linear in the
+        # transcript.  Growing in place needs the string to be the sole
+        # reference, which is what popping it out of the dict gives.
+        text = state.pop("text", "")
+        text += delta
+        state["text"] = text
         if len(ids) - anchor > 2 * self._INCREMENTAL_WINDOW:
             # Re-anchor, keeping a window of left context so the next decode
             # still has enough neighbours to render byte-BPE fragments.  The

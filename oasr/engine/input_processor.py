@@ -68,6 +68,17 @@ class _StreamInput:
     flush: bool
 
 
+#: Appends a compacted feature buffer should absorb before compacting again.
+#: Compaction reallocates and copies, so its cost is amortised over this many
+#: ticks; 16 takes reallocation from ~91 % of appends to under 7 %.
+_FEATURE_HEADROOM_APPENDS = 16
+
+#: Absolute ceiling on that headroom, in frames.  Without it a fixed-window
+#: frontend (``whisper_logmel``, a 3000-frame ``n_new``) would reserve tens of
+#: thousands of frames per stream for headroom it can never use.
+_FEATURE_HEADROOM_MAX = 1024
+
+
 def _suffix(segments: List[torch.Tensor], start: int) -> torch.Tensor:
     """``torch.cat(segments)[start:]``, without materialising the concatenation.
 
@@ -1135,7 +1146,16 @@ class InputProcessor:
         have = request.feature_frames
         cursor = request.feature_cursor
 
-        drop_prefix = buf is not None and cursor > 0 and cursor >= have // 2
+        # Compact only when the append would not otherwise fit.  Dropping the
+        # prefix eagerly (the old ``cursor >= have // 2``) reallocated on **91 %
+        # of appends** at steady state, because a stream consumes about as many
+        # frames per tick as it gains: ``cursor`` tracks ``have``, the condition
+        # is true almost always, and each drop then re-sized the buffer from the
+        # *live* window rather than from the old capacity — to ``2 x live``,
+        # which one tick refills. A self-perpetuating realloc loop, and
+        # ``new_zeros`` is ~7 us, so it cost ~102 us of every 2.6 ms tick at 16
+        # streams plus an extra copy pair per stream in the batched submit.
+        drop_prefix = buf is not None and cursor > 0 and have + n_new > buf.size(0)
         if drop_prefix:
             keep_n = have - cursor
             src_start = cursor
@@ -1148,7 +1168,15 @@ class InputProcessor:
 
         needed = keep_n + n_new
         if buf is None or drop_prefix or needed > buf.size(0):
-            cap = max(needed, old_cap * 2) if buf is not None else max(needed, 128)
+            # Leave room for several more appends, so compaction is periodic
+            # rather than per-tick.  Sizing from ``old_cap * 2`` cannot do that
+            # after a drop: ``old_cap`` is then the live window, and a buffer
+            # twice the live window is full again on the next append.  The
+            # headroom is capped in absolute frames so a fixed-window frontend,
+            # whose ``n_new`` is a whole 30 s window, does not multiply it.
+            headroom = min(_FEATURE_HEADROOM_APPENDS * n_new, _FEATURE_HEADROOM_MAX)
+            floor = old_cap if buf is not None else 128
+            cap = max(needed + headroom, floor)
             new_buf = new_frames.new_zeros(cap, feat_dim)
             if buf is not None and keep_n > 0:
                 # Queued before ``request.feature_buffer`` is reassigned, so the

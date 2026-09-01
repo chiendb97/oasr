@@ -88,24 +88,60 @@ class SymbolTableTokenizer(Tokenizer):
         ``decode`` is a table lookup, a join, a ``▁`` → space substitution and a
         ``strip``.  Every step but the strip is per-piece, so appending tokens
         cannot change how earlier ones render — the only coupling is the leading
-        / trailing whitespace that ``strip`` removes.  Track the unstripped join
-        and strip on the way out, and the cost is O(new tokens) rather than
-        O(whole prefix) per partial.
+        / trailing whitespace that ``strip`` removes.
+
+        Carrying that coupling as *state* is what makes the cost O(new tokens).
+        The obvious form — keep the raw join and finish with
+        ``raw.replace("▁", " ").strip()`` — is O(whole transcript) on every
+        partial, because both the replace and the strip's copy walk the entire
+        prefix, and so does the ``startswith`` that computes the delta.  At
+        ``partial_decode_interval=1`` every active stream re-rendered its whole
+        transcript every tick: 0.43 us at 50 characters but **17.3 us at 12 800**,
+        growing without bound for a long session.
+
+        Instead the rendered text is kept split in two: ``text`` is what
+        ``decode`` would return right now (no leading or trailing whitespace),
+        and ``pending`` holds trailing whitespace that a later piece may turn
+        into interior whitespace.  Leading whitespace is dropped once, when the
+        first piece with real content arrives.  Nothing then rescans the prefix,
+        and the delta is exactly what was appended.
         """
-        raw = state.get("raw", "")
         ids = state.setdefault("ids", [])
+        # ``pop``, not ``get``: CPython grows a string in place only when the
+        # target is the *sole* reference, so leaving a copy in the dict would put
+        # the O(whole transcript) copy straight back on every ``text += ...``.
+        text = state.pop("text", "")
+        pending = state.pop("pending", "")
+        started = bool(text) or bool(state.get("started"))
+        emitted_from = len(text)
+        table, special = self._table, self._special_ids
+
         for t in new_ids:
             t = int(t)
             ids.append(t)
-            if t not in self._special_ids:
-                raw += self._table.get(t, "")
-        state["raw"] = raw
-        full = raw.replace("▁", " ").strip()
-        prev = state.get("text", "")
-        state["text"] = full
-        # Leading-space stripping means a delta can start mid-word only on the
-        # very first emission; after that the prefix is stable.
-        return full[len(prev) :] if full.startswith(prev) else full
+            if t in special:
+                continue
+            piece = table.get(t, "")
+            if not piece:
+                continue
+            rendered = piece.replace("▁", " ")
+            if not started:
+                rendered = rendered.lstrip()
+                if not rendered:
+                    continue
+                started = True
+            body = rendered.rstrip()
+            if body:
+                # Whatever whitespace was pending is interior now, so it lands.
+                text += pending + body
+                pending = rendered[len(body) :]
+            else:
+                pending += rendered
+
+        state["text"] = text
+        state["pending"] = pending
+        state["started"] = started
+        return text[emitted_from:]
 
     def token_pieces(self, ids):
         """One pass, for the same reason :meth:`decode_incremental` is O(new).
