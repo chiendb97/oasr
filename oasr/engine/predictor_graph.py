@@ -117,21 +117,51 @@ class PredictorStepGraphCache:
     def capturable(state: Any) -> bool:
         """Whether this predictor state is one a captured step can carry.
 
-        A flat sequence of CUDA tensors is; anything else (a nested structure, a
-        Python scalar the predictor keeps alongside) is not, and says so rather
-        than being partially captured.  The state is opaque to the greedy loop by
-        design, so this is the one place that inspects it.
+        A flat sequence of CUDA tensors is, and so is a **single** CUDA tensor:
+        icefall's stateless predictor carries its whole state as one
+        ``(B, context_size)`` label window, and requiring a sequence meant that
+        model never even attempted capture — 0 replays against 304 eager
+        fallbacks on one 32-utterance batch, because this returned ``False``
+        before ``_capture`` was ever reached.
+
+        Anything else (a nested structure, a Python scalar the predictor keeps
+        alongside) is not, and says so rather than being partially captured.  The
+        state is opaque to the greedy loop by design, so this is the one place
+        that inspects it.
         """
+        if isinstance(state, torch.Tensor):
+            return bool(state.is_cuda)
         if not isinstance(state, (tuple, list)) or not state:
             return False
         return all(isinstance(t, torch.Tensor) and t.is_cuda for t in state)
 
     @staticmethod
     def detach(state: Any) -> Any:
-        """An owned copy of ``state``, safe to keep past the next replay."""
+        """An owned copy of ``state``, safe to keep past the next replay.
+
+        The bare-tensor case must clone too.  Returning it unchanged was
+        harmless only while a bare state could never be captured; the moment it
+        can, the caller is holding **graph memory**, and a streaming session that
+        stores it across ticks reads whatever the next replay wrote — the exact
+        failure the module docstring opens with.
+        """
+        if isinstance(state, torch.Tensor):
+            return state.clone()
         if isinstance(state, (tuple, list)):
             return tuple(t.clone() for t in state)
         return state
+
+    @staticmethod
+    def _as_seq(state: Any) -> Tuple[Tuple[torch.Tensor, ...], bool]:
+        """``(buffers, was_bare)`` — one internal shape for both state forms."""
+        if isinstance(state, torch.Tensor):
+            return (state,), True
+        return tuple(state), False
+
+    @staticmethod
+    def _as_state(seq: Sequence[torch.Tensor], bare: bool) -> Any:
+        """Back to the shape the predictor itself expects."""
+        return seq[0] if bare else tuple(seq)
 
     # ------------------------------------------------------------------
     # Step
@@ -152,36 +182,39 @@ class PredictorStepGraphCache:
         """
         if self._disabled or not self.capturable(state):
             return None
+        seq, bare = self._as_seq(state)
         if torch.cuda.is_current_stream_capturing():
             # Nested capture is illegal; the caller's own graph records the same
             # launches.  See the module docstring.
             return None
-        key = self._key(state)
+        key = self._key(seq, bare)
         cap = self._captured.get(key)
         if cap is None:
             if key in self._failed or len(self._captured) >= self._max_captures:
                 return None
-            cap = self._capture(state, tok, emit, key)
+            cap = self._capture(seq, bare, tok, emit, key)
             if cap is None:
                 return None
         # Steady state: the graph wrote its own output back into the buffers it
         # reads, and the caller handed that same tuple straight back, so there is
         # nothing to copy.
-        if not all(a is b for a, b in zip(state, cap.state)):
-            for dst, src in zip(cap.state, state):
+        if not all(a is b for a, b in zip(seq, cap.state)):
+            for dst, src in zip(cap.state, seq):
                 dst.copy_(src)
         cap.tok.copy_(tok)
         cap.emit.copy_(emit)
         cap.graph.replay()
-        return cap.state, cap.dec_proj
+        return self._as_state(cap.state, bare), cap.dec_proj
 
     # ------------------------------------------------------------------
     # Capture
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _key(state: Sequence[torch.Tensor]) -> Tuple[int, ...]:
-        shape: list = [len(state)]
+    def _key(state: Sequence[torch.Tensor], bare: bool = False) -> Tuple[int, ...]:
+        # ``bare`` is in the key so a one-tensor state and a one-element tuple
+        # cannot share a capture; they hand the predictor different shapes.
+        shape: list = [int(bare), len(state)]
         for t in state:
             shape.append(len(t.shape))
             shape.extend(int(d) for d in t.shape)
@@ -190,11 +223,15 @@ class PredictorStepGraphCache:
     def _capture(
         self,
         state: Sequence[torch.Tensor],
+        bare: bool,
         tok: torch.Tensor,
         emit: torch.Tensor,
         key: Tuple[int, ...],
     ) -> Optional[_Captured]:
         static = tuple(t.clone() for t in state)
+        # The buffers are held as a tuple internally; the predictor is always
+        # called with the shape *it* declared.
+        facing = self._as_state(static, bare)
         tok_buf = tok.clone()
         emit_buf = emit.clone()
         try:
@@ -202,19 +239,19 @@ class PredictorStepGraphCache:
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
                 for _ in range(3):
-                    warm = self._predictor.advance(static, tok_buf, emit_buf)
+                    warm = self._predictor.advance(facing, tok_buf, emit_buf)
                     self._joiner.decoder_proj(self._predictor.predict(warm))
             torch.cuda.current_stream().wait_stream(side)
             torch.cuda.synchronize()
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=self._pool):
-                stepped = self._predictor.advance(static, tok_buf, emit_buf)
+                stepped = self._predictor.advance(facing, tok_buf, emit_buf)
                 # Write the new state back into the buffers the graph reads, so
                 # the next replay continues from it with no copy.
-                for dst, src in zip(static, stepped):
+                for dst, src in zip(static, self._as_seq(stepped)[0]):
                     dst.copy_(src)
-                proj = self._joiner.decoder_proj(self._predictor.predict(static))
+                proj = self._joiner.decoder_proj(self._predictor.predict(facing))
             torch.cuda.synchronize()
         except torch.cuda.OutOfMemoryError:
             # A property of the process, not of the shape.  Each further attempt
