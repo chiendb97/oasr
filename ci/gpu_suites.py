@@ -85,6 +85,7 @@ SUITES: dict[str, list[str]] = {
         "tests/test_feature_ring_native.py",
         "tests/test_incremental_detokenize.py",
         "tests/test_offline_graph.py",
+        "tests/test_predictor_graph_state.py",
         "tests/test_streaming_graph_ladder.py",
         "tests/test_packing_device_layout.py",
         "tests/test_engine_isolation.py",
