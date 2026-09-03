@@ -195,7 +195,16 @@ class TestCaptureIsBitExact:
         assert torch.equal(got[1], want_len)
 
     def test_batch_padding_does_not_disturb_valid_rows(self):
-        """B is padded up to a bucket; rows past B_active must stay inert."""
+        """B is padded up to a bucket; rows past B_active must stay inert.
+
+        The oracle is eager at the **same** padded width, not at B=3: widening a
+        GEMM's M changes which cuBLAS kernel runs, and that alone moves the valid
+        rows by an ulp (measured 2.4e-7 in fp32 here) with no contamination at
+        all.  Comparing against B=3 would fold that unavoidable kernel-selection
+        difference into a test whose subject is the padding rows, so it would
+        fail for a reason it does not name.  ``test_eager_fallback_matches_a_graph_hit``
+        below is what pins the property that actually matters end to end.
+        """
         torch.manual_seed(0)
         dev = torch.device("cuda")
         enc = _Encoder().to(dev).eval()
@@ -203,13 +212,23 @@ class TestCaptureIsBitExact:
         feats = torch.randn(3, 128, 16, device=dev)
         lens = torch.tensor([128, 100, 64], device=dev, dtype=torch.int32)
 
+        padded = torch.zeros(8, 128, 16, device=dev)
+        padded[:3] = feats
+        plens = torch.full((8,), 128, device=dev, dtype=torch.int32)
+        plens[:3] = lens
+
         with torch.no_grad():
-            want, _ = enc.forward_offline(feats, lens)
+            want, want_len = enc.forward_offline(padded, plens)
+            unpadded, _ = enc.forward_offline(feats, lens)
             got = c.run(FUSED, enc.forward_offline, feats, lens)
 
         assert got is not None
         assert got[0].size(0) == 3
-        assert torch.equal(got[0], want)
+        assert torch.equal(got[0], want[:3])
+        assert torch.equal(got[1], want_len[:3])
+        # And the B-bucketing tax is rounding, not contamination: if this ever
+        # grows past an ulp, padding is reaching the valid rows for real.
+        assert (want[:3] - unpadded).abs().max() < 1e-5
 
     def test_replays_are_stable_across_shapes(self):
         """A later capture must not corrupt an earlier replay's returned tensor."""
@@ -297,6 +316,14 @@ class TestFallbackAccounting:
 
         The counter proves it: the second ``run`` must add **no** forward call of
         its own beyond the one the caller would make eagerly.
+
+        An abort is also not a per-shape verdict.  What makes a forward
+        uncapturable is a host read in its *code*, so the first abort turns the
+        whole cache off rather than letting every later shape abort in turn --
+        each stranding the memory its attempt allocated inside a pool nothing can
+        reclaim.  The second call is therefore counted under ``fallback_disabled``
+        rather than ``fallback_failed``; what must not change is that it costs no
+        forward of its own.
         """
         torch.manual_seed(0)
         dev = torch.device("cuda")
@@ -309,12 +336,47 @@ class TestFallbackAccounting:
             assert c.run(FUSED, enc.forward_offline, feats, lens) is None
         after_first = enc.calls
         assert c.fallback_failed == 1
+        assert not c.enabled, "an uncapturable forward must switch the cache off"
 
         with torch.no_grad():
             assert c.run(FUSED, enc.forward_offline, feats, lens) is None
         assert enc.calls == after_first, "second attempt re-ran the capture warm-up"
-        assert c.fallback_failed == 2
+        assert c.fallback_disabled == 1
         assert c.captures == 0
+
+    def test_the_capturability_probe_runs_at_the_narrowest_shape(self):
+        """The expensive question is asked at B=1, not at the production width.
+
+        An aborted capture strands whatever it allocated inside its private pool
+        -- unreachable afterwards by ``reset``, ``gc`` or ``empty_cache`` -- so
+        asking "is this capturable" at B=16 costs 16x the memory of asking at
+        B=1, for the same answer.
+        """
+        torch.manual_seed(0)
+        dev = torch.device("cuda")
+        enc = _SyncingEncoder().to(dev).eval()
+        seen = []
+        inner = enc.forward_offline
+
+        def spy(features, lengths):
+            seen.append(tuple(features.shape))
+            return inner(features, lengths)
+
+        c = _cache(frame_granularity=64, batch_buckets=[1, 16])
+        with torch.no_grad():
+            assert (
+                c.run(
+                    FUSED,
+                    spy,
+                    torch.randn(9, 128, 16, device=dev),
+                    torch.full((9,), 128, device=dev, dtype=torch.int32),
+                )
+                is None
+            )
+
+        assert seen, "the probe never called the forward"
+        assert all(s[0] == 1 for s in seen), f"probe widened past B=1: {seen}"
+        assert all(s[1] <= 128 for s in seen), f"probe used more frames than asked: {seen}"
 
     def test_oversized_batch_is_counted_not_silent(self):
         dev = torch.device("cuda")

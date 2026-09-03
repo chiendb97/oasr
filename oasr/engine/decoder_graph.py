@@ -64,6 +64,8 @@ import tvm_ffi
 
 from oasr.cache import PagedDecoderKv
 
+from .capture_recovery import recover_from_failed_capture
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["DecoderStepGraphCache"]
@@ -156,7 +158,9 @@ class DecoderStepGraphCache:
         self._mgr = manager
         self._width_pages = max(1, int(width_pages))
         self._max_captures = int(max_captures)
-        self._pool = pool if pool is not None else torch.cuda.graph_pool_handle()
+        self._pool: Optional[Tuple[int, int]] = (
+            pool if pool is not None else torch.cuda.graph_pool_handle()
+        )
         self._captured: Dict[Tuple[int, int], _Captured] = {}
         self._refused = False
         #: Shapes whose capture failed.  A capture costs a warm-up forward, so
@@ -247,6 +251,22 @@ class DecoderStepGraphCache:
         dst.zero_()
         dst[:, : src.size(1)].copy_(src)
 
+    def release(self) -> None:
+        """Return the graph pool's VRAM.  Idempotent.
+
+        ``CUDAGraph.reset()`` is the only thing that frees a capture's private
+        memory pool; dropping the object and calling ``empty_cache()`` leaves it
+        held for the life of the process.  See
+        :meth:`oasr.engine.offline_graph.GraphedOfflineForward.release`.
+        """
+        for state in self._captured.values():
+            try:
+                state.graph.reset()
+            except Exception:  # pragma: no cover - teardown must not raise
+                pass
+        self._captured.clear()
+        self._failed.clear()
+
     def _capture(
         self, key: Tuple[int, int], tokens: torch.Tensor, kv: PagedDecoderKv
     ) -> Optional[_Captured]:
@@ -279,11 +299,16 @@ class DecoderStepGraphCache:
             # ``tvm_ffi.use_torch_stream`` is what gets a TVM-FFI kernel launch
             # recorded into the graph instead of escaping to the default stream.
             with torch.no_grad():
-                with tvm_ffi.use_torch_stream(torch.cuda.graph(graph, pool=self._pool)):
+                # torch types the pool handle as an opaque ``_POOL_HANDLE``;
+                # the engine passes the ``(int, int)`` tuple it actually is.
+                ctx = torch.cuda.graph(graph, pool=self._pool)  # type: ignore[arg-type]
+                with tvm_ffi.use_torch_stream(ctx):
                     logits_buf = _run()
         except torch.cuda.OutOfMemoryError as exc:
             # Treat capture OOM as process-wide and stop retrying costly warmups.
             self._disabled = True
+            recover_from_failed_capture(device, self._pool)
+            self._pool = None
             torch.cuda.empty_cache()
             logger.warning(
                 "decoder-step graph capture ran out of memory at rows=%d width=%d "
@@ -295,6 +320,8 @@ class DecoderStepGraphCache:
             return None
         except Exception as exc:  # pragma: no cover - capture is best-effort
             self._failed.add(key)
+            recover_from_failed_capture(device, self._pool)
+            self._pool = torch.cuda.graph_pool_handle()
             logger.warning(
                 "decoder-step graph capture failed for rows=%d width=%d (%s); "
                 "this shape runs eager",

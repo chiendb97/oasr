@@ -566,9 +566,18 @@ class NemotronEncoder(BaseEncoder):
         # rows differ enough in length that a padded query's whole chunk window
         # falls past the end.  Zeroed at the attention and before the depthwise
         # convolution, exactly as upstream does.
+        #
+        # Passed unconditionally.  The obvious optimisation -- skip the two
+        # ``masked_fill`` calls per layer when no row is silent -- has to ask
+        # ``bool(silent.any())``, and a host read of a device value is exactly
+        # what a CUDA-graph capture cannot survive: it invalidated the capture
+        # stream, so this encoder was the one architecture whose offline forward
+        # never captured.  Worse than losing the graph, an aborted capture leaves
+        # the caching allocator serving out of the capture's private pool, which
+        # stranded GiB per engine (see oasr/engine/capture_recovery.py).  An
+        # all-false ``masked_fill`` is a numerical no-op, so paying it always is
+        # bit-exact -- and it is what buys the capture back.
         silent = attn_mask.logical_not().all(dim=-1).transpose(1, 2)  # (B, T, 1)
-        if not bool(silent.any()):
-            silent = None
 
         pos_emb = relative_position_embedding(
             t_out,

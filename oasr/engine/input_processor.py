@@ -417,6 +417,10 @@ class InputProcessor:
         as the ``InputProcessor`` does, which for a long-lived server is the
         process.
         """
+        if self._feature_graph is not None:
+            # Same reason as the pinned pages below: a capture's private pool is
+            # returned only by ``CUDAGraph.reset()``.
+            self._feature_graph.release()
         self._wav_flat = None
         self._wav_padded = None
         # Wait out any copy still reading a slot before dropping the pinned pages

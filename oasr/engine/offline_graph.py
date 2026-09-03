@@ -107,6 +107,8 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Set,
 import torch
 import tvm_ffi
 
+from .capture_recovery import recover_from_failed_capture
+
 if TYPE_CHECKING:
     from .config import EngineConfig
 
@@ -206,6 +208,7 @@ class GraphedOfflineForward:
         frame_granularity: int = DEFAULT_FRAME_GRANULARITY,
         max_frames: int = 4096,
         max_captures: int = 64,
+        max_capture_failures: int = 1,
         pool: Optional[Tuple[int, int]] = None,
     ) -> None:
         self._device = device
@@ -213,6 +216,7 @@ class GraphedOfflineForward:
         self._granularity = max(1, int(frame_granularity))
         self._max_frames = int(max_frames)
         self._max_captures = int(max_captures)
+        self._max_capture_failures = max(1, int(max_capture_failures))
         self._enabled = device.type == "cuda" and bool(self._buckets)
         # One pool for this cache, shared across its shape buckets -- that is
         # where the fragmentation win is -- and never with the streaming or
@@ -222,8 +226,13 @@ class GraphedOfflineForward:
             self._pool = torch.cuda.graph_pool_handle()
         self._captured: Dict[Tuple[str, int, int], _Captured] = {}
         self._failed: Set[Tuple[str, int, int]] = set()
+        #: Per forward name: has a cheap B=1 capture of it ever succeeded?
+        self._probed: Dict[str, bool] = {}
         self._disabled = False
         self._refused = False
+        #: Captures that aborted.  Distinct from ``fallback_failed``, which
+        #: counts every *request* that hit an already-known-bad shape.
+        self.capture_failures = 0
 
         # Accounting.  A cache whose fallbacks are invisible is a cache that
         # silently stops working; every miss below has a named counter.
@@ -232,6 +241,7 @@ class GraphedOfflineForward:
         self.fallback_oversized = 0  # B or T past the captured envelope
         self.fallback_saturated = 0  # capture budget spent
         self.fallback_failed = 0  # this shape is not capturable
+        self.fallback_disabled = 0  # capture is off for this engine (OOM / uncapturable)
         self._useful_frames = 0
         self._padded_frames = 0
 
@@ -264,6 +274,58 @@ class GraphedOfflineForward:
             return 0.0
         return self._padded_frames / self._useful_frames
 
+    def recover_after_failed_capture(self) -> None:
+        """Undo an aborted capture's process-global damage, from outside ``_capture``.
+
+        The prewarm path captures through :meth:`run`, so a failure there is
+        already handled; this is for a caller that saw the exception itself.
+        """
+        recover_from_failed_capture(self._device, self._pool)
+        self._retire_poisoned_pool()
+
+    def _retire_poisoned_pool(self) -> None:
+        """Take a fresh graph pool; the old one cannot be used or reclaimed again.
+
+        An aborted capture leaves the caching allocator still diverting
+        allocations into that capture's private mempool: ``endAllocateToPool``
+        never ran, so the pool stays *recording*.  Two things follow, both
+        measured rather than inferred.  Every later capture on the same pool dies
+        with ``beginAllocateToPool: already recording to mempool_id`` -- so one
+        bad shape silently ends capture for the whole process, which is how
+        Nemotron reached ``captures=0`` with the feature nominally on.  And the
+        bytes the aborted attempt allocated are unreachable: ``CUDAGraph.reset``
+        has no graph to reset, and ``torch.cuda.empty_cache()`` will not touch a
+        private pool.  A fresh handle at least restores the first property.
+        """
+        if not self._enabled:
+            return
+        try:
+            self._pool = torch.cuda.graph_pool_handle()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("could not take a fresh graph pool", exc_info=True)
+
+    def release(self) -> None:
+        """Return the graph pool's VRAM.  Idempotent; safe to call twice.
+
+        Dropping the ``CUDAGraph`` objects is **not** enough: the private memory
+        pool a capture allocates out of survives collection, and
+        ``torch.cuda.empty_cache()`` cannot reclaim it -- only
+        ``CUDAGraph.reset()`` releases it.  Measured on a Nemotron offline engine:
+        3.24 GiB stranded per engine lifecycle with the pool left alone, 0.12 GiB
+        with this called.  One long-lived engine never notices; a process that
+        builds several (a benchmark sweep, the accuracy suite, a model swap)
+        bleeds GiB per engine until the largest model can no longer size its KV
+        pool -- which is how this was found, as a 42% WER on a 7B checkpoint that
+        scored 5.6% on its own.
+        """
+        for state in self._captured.values():
+            try:
+                state.graph.reset()
+            except Exception:  # pragma: no cover - teardown must not raise
+                logger.debug("offline graph reset failed", exc_info=True)
+        self._captured.clear()
+        self._failed.clear()
+
     def stats(self) -> Dict[str, float]:
         """Counters for the engine's debug log and the benchmark harness."""
         return {
@@ -273,6 +335,8 @@ class GraphedOfflineForward:
             "fallback_oversized": float(self.fallback_oversized),
             "fallback_saturated": float(self.fallback_saturated),
             "fallback_failed": float(self.fallback_failed),
+            "fallback_disabled": float(self.fallback_disabled),
+            "capture_failures": float(self.capture_failures),
             "pad_overhead": self.pad_overhead,
         }
 
@@ -356,6 +420,10 @@ class GraphedOfflineForward:
         and captures.
         """
         if not self.enabled:
+            # Counted, not silent: an engine whose captures were turned off after
+            # the fact still has to say how much work took the eager path.
+            if self._enabled:
+                self.fallback_disabled += 1
             return None
 
         b_active, t_active = int(features.size(0)), int(features.size(1))
@@ -379,6 +447,9 @@ class GraphedOfflineForward:
                         "offline forward graph cache full (%d shapes); further " "shapes run eager",
                         self._max_captures,
                     )
+                return None
+            if not self._capturable(name, fn, features, lengths, t_bucket):
+                self.fallback_failed += 1
                 return None
             state = self._capture(key, fn, features, lengths)
             if state is None:
@@ -411,6 +482,89 @@ class GraphedOfflineForward:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
+    def _capturable(
+        self,
+        name: str,
+        fn: ForwardFn,
+        features: torch.Tensor,
+        lengths: torch.Tensor,
+        t_bucket: int,
+    ) -> bool:
+        """Is ``fn`` capturable at all?  Answered once per forward, at ``B=1``.
+
+        An aborted capture is not free and it is not recoverable: the bytes it
+        allocated inside the capture's private pool stay unreachable for the life
+        of the process (see :meth:`_retire_poisoned_pool`).  So the expensive
+        question -- "can this forward be captured" -- must not be asked at the
+        production batch width.  ``B=1`` at the same ``T`` answers it for the same
+        cost per frame and 1/B the stranded memory, because what makes a forward
+        uncapturable is a host read in its code, not its batch size.
+
+        Measured on Nemotron offline (FastConformer, which reads a device value
+        host-side): probing at ``B=1`` strands ~0.25 GiB and disables the cache,
+        against 4.04 GiB for two aborted ``B=16`` attempts that captured nothing
+        either way.
+
+        The probe runs in a throwaway pool so a failure cannot poison the pool
+        the real captures allocate from.
+        """
+        known = self._probed.get(name)
+        if known is not None:
+            return known
+        b_probe = self._buckets[0]
+        feat_dim = int(features.size(2))
+
+        def _buffers(t: int):
+            return (
+                torch.zeros(b_probe, t, feat_dim, dtype=features.dtype, device=self._device),
+                torch.full((b_probe,), t, dtype=lengths.dtype, device=self._device),
+            )
+
+        # Warm up *outside* the capture, so an encoder that refuses the tiny
+        # shape (a subsampling minimum) raises here, for free, and we retry at
+        # the caller's width rather than mistaking "too short" for "uncapturable".
+        feats = lens = None
+        for t_try in (min(self._granularity, t_bucket), t_bucket):
+            feats, lens = _buffers(t_try)
+            try:
+                fn(feats, lens)
+                break
+            except Exception:
+                feats = lens = None
+        if feats is None or lens is None:
+            # Neither width even runs eagerly; that is the caller's problem, not
+            # a capture verdict, so leave the cache enabled and decline this shape.
+            return False
+        ok = True
+        graph = None
+        try:
+            torch.cuda.synchronize(self._device)
+            graph = torch.cuda.CUDAGraph()
+            pool = torch.cuda.graph_pool_handle()
+            ctx = torch.cuda.graph(graph, pool=pool)  # type: ignore[arg-type]
+            with tvm_ffi.use_torch_stream(ctx):
+                fn(feats, lens)
+            torch.cuda.synchronize(self._device)
+        except Exception as exc:
+            ok = False
+            torch.cuda.synchronize(self._device)
+            recover_from_failed_capture(self._device, pool)
+            self._disabled = True
+            logger.warning(
+                "offline forward %s is not capturable (%s); offline graphs are "
+                "off for this engine and forwards run eager",
+                name,
+                exc,
+            )
+        finally:
+            if graph is not None and ok:
+                try:
+                    graph.reset()
+                except Exception:  # pragma: no cover - teardown must not raise
+                    pass
+        self._probed[name] = ok
+        return ok
+
     def _capture(
         self,
         key: Tuple[str, int, int],
@@ -444,6 +598,8 @@ class GraphedOfflineForward:
         except torch.cuda.OutOfMemoryError as exc:
             # Capture OOM is a fact about the process, not about this shape.
             self._disabled = True
+            recover_from_failed_capture(self._device, self._pool)
+            self._pool = None
             torch.cuda.empty_cache()
             logger.warning(
                 "offline forward graph capture ran out of memory at %s B=%d T=%d "
@@ -461,6 +617,8 @@ class GraphedOfflineForward:
             # response is to run it eagerly and say so.
             self._failed.add(key)
             torch.cuda.synchronize(self._device)
+            recover_from_failed_capture(self._device, self._pool)
+            self._retire_poisoned_pool()
             logger.warning(
                 "offline forward graph capture failed for %s B=%d T=%d (%s); "
                 "this shape runs eager",
@@ -469,6 +627,19 @@ class GraphedOfflineForward:
                 t_bucket,
                 exc,
             )
+            self.capture_failures += 1
+            if self.capture_failures >= self._max_capture_failures and not self._captured:
+                # Nothing has ever captured, so the forward itself is not
+                # capturable (a host read, a data-dependent extent) and every
+                # further shape would abort the same way -- each stranding its
+                # warm-up allocation.  Measured on Nemotron offline: two aborted
+                # shapes, zero captures, 3.24 GiB gone.
+                self._disabled = True
+                logger.warning(
+                    "offline forward graph capture failed %d times with nothing "
+                    "captured; offline graphs are off for this engine",
+                    self.capture_failures,
+                )
             return None
 
         self.captures += 1

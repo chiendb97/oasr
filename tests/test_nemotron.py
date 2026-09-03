@@ -1138,3 +1138,147 @@ def test_input_scale_is_off_on_the_release():
         _tiny_config(encoder=NemotronEncoderConfig(hidden_size=32, scale_input=True))
     )
     assert scaled.encoder.input_scale == pytest.approx(math.sqrt(32))
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+class TestOfflineForwardStaysCapturable:
+    """The offline encoder must contain no host read of a device value.
+
+    This encoder used to ask ``bool(silent.any())`` to skip two ``masked_fill``
+    calls per layer when no query row was fully masked.  That is a host read, and
+    a host read inside a CUDA-graph capture invalidates the capture stream — so
+    Nemotron was the one shipped architecture whose offline forward never
+    captured.  The cost was not just the lost graph: an aborted capture leaves
+    the caching allocator serving out of the capture's private pool, which
+    stranded GiB per engine and, six engines into the accuracy suite, left the 7B
+    speech-LLM unable to size its decoder KV pool (see
+    ``oasr/engine/capture_recovery.py``).
+
+    ``silent`` is now passed unconditionally.  An all-false ``masked_fill`` is a
+    numerical no-op, so this is bit-exact; what it costs is ~2% of the eager
+    encoder, and what it buys back is capture.
+    """
+
+    @staticmethod
+    def _encoder(**overrides):
+        from oasr.models.nemotron.encoder import NemotronEncoder
+
+        kwargs = {
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "intermediate_size": 64,
+            "conv_kernel_size": 9,
+            "num_mel_bins": 32,
+            "subsampling_conv_channels": 16,
+            "sliding_window": 13,
+            "default_num_lookahead_tokens": 1,
+            "max_position_embeddings": 500,
+        }
+        kwargs.update(overrides)
+        torch.manual_seed(0)
+        enc = NemotronEncoder(NemotronEncoderConfig(**kwargs)).eval().cuda()
+        for p in enc.parameters():
+            torch.nn.init.normal_(p, std=0.05)
+        return enc
+
+    @staticmethod
+    def _silent_rows(enc, feats, lengths) -> int:
+        """How many query rows this batch leaves with nothing to attend to."""
+        with torch.no_grad():
+            hidden, out_lengths = enc.subsampling(feats, lengths.to(torch.long))
+        t = hidden.size(1)
+        keep = torch.arange(t, device=hidden.device).unsqueeze(0) < out_lengths.unsqueeze(1)
+        window = chunked_limited_mask(t, t, *enc.attention_context(), hidden.device)
+        mask = window & keep.view(-1, 1, 1, t)
+        return int(mask.logical_not().all(dim=-1).sum())
+
+    #: ``(name, lengths)`` — one batch with no silent row (the branch that used
+    #: to skip the fill) and one with several (the branch that never could).
+    _BATCHES = {"uniform": [320, 320], "ragged": [320, 200, 96, 24]}
+
+    @pytest.mark.parametrize("case", list(_BATCHES))
+    def test_no_host_synchronisation(self, case):
+        """The property that makes capture possible, pinned directly.
+
+        ``set_sync_debug_mode("error")`` raises on the first synchronising CUDA
+        call, so reintroducing ``bool(...)``/``.item()`` anywhere under this
+        forward fails here rather than as a stranded-memory mystery elsewhere.
+        """
+        enc = self._encoder()
+        lens = self._BATCHES[case]
+        feats = torch.randn(len(lens), max(lens), 32, device="cuda")
+        lengths = torch.tensor(lens, device="cuda", dtype=torch.int32)
+        with torch.no_grad():
+            enc(feats, lengths)  # warm up: one-time setup may sync legitimately
+        torch.cuda.synchronize()
+
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            with torch.no_grad():
+                enc(feats, lengths)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+
+    def test_the_ragged_batch_really_has_silent_rows(self):
+        """Otherwise the case above only ever exercises the easy path."""
+        enc = self._encoder()
+        lens = self._BATCHES["ragged"]
+        feats = torch.randn(len(lens), max(lens), 32, device="cuda")
+        lengths = torch.tensor(lens, device="cuda", dtype=torch.int32)
+        assert self._silent_rows(enc, feats, lengths) > 0
+        uniform = self._BATCHES["uniform"]
+        assert (
+            self._silent_rows(
+                enc,
+                torch.randn(len(uniform), max(uniform), 32, device="cuda"),
+                torch.tensor(uniform, device="cuda", dtype=torch.int32),
+            )
+            == 0
+        ), "the uniform case must exercise the all-false mask, not the same path"
+
+    @pytest.mark.parametrize("case", list(_BATCHES))
+    def test_a_short_neighbour_cannot_disturb_a_full_row(self, case):
+        """What the zeroing is *for*: a padded row must not reach a real one.
+
+        Unconditional masking must not change this, in either direction — so it
+        is checked on the batch that has silent rows and on the one that does not.
+        """
+        enc = self._encoder()
+        lens = self._BATCHES[case]
+        feats = torch.randn(len(lens), max(lens), 32, device="cuda")
+        lengths = torch.tensor(lens, device="cuda", dtype=torch.int32)
+        with torch.no_grad():
+            batched, out_lengths = enc(feats, lengths)
+            alone, alone_len = enc(feats[:1], lengths[:1])
+        n = int(out_lengths[0].sum()) if out_lengths.dim() > 1 else int(alone_len.sum())
+        assert torch.isfinite(batched).all()
+        torch.testing.assert_close(batched[:1, :n], alone[:, :n], rtol=0, atol=2e-6)
+
+    @pytest.mark.parametrize("case", list(_BATCHES))
+    def test_the_offline_forward_captures_and_replays_bit_exactly(self, case):
+        """End to end: it captures now, and capture did not change the numbers."""
+        from oasr.engine.offline_graph import ENCODE, GraphedOfflineForward
+
+        enc = self._encoder()
+        lens = self._BATCHES[case]
+        b = len(lens)
+        feats = torch.randn(b, max(lens), 32, device="cuda")
+        lengths = torch.tensor(lens, device="cuda", dtype=torch.int32)
+
+        def forward(x, n):
+            return enc(x, n)[0], n
+
+        cache = GraphedOfflineForward(
+            device=torch.device("cuda"), batch_buckets=[b], frame_granularity=64
+        )
+        with torch.no_grad():
+            padded, plens = cache.pad_time(feats, lengths)
+            want, _ = forward(padded, plens)
+            got = cache.run(ENCODE, forward, feats, lengths)
+
+        assert got is not None, "the offline forward is not capturable again"
+        assert cache.captures == 1 and cache.fallback_failed == 0
+        assert torch.equal(got[0], want)

@@ -324,6 +324,12 @@ class ASREngine:
                 # on a live tick every 64 encoder frames.
                 self._model_runner.prewarm_encoder_graphs(batch_sizes, cache_t1_buckets=None)
             except Exception as exc:  # pragma: no cover
+                # An aborted capture leaves the allocator serving out of the
+                # capture's pool and the generator in capture mode; neither
+                # undoes itself.  See oasr/engine/capture_recovery.py.  Most
+                # pre-warm failures are not captures at all, so the recovery
+                # must never turn this warning into a crash.
+                self._recover_capture_state()
                 logger.warning(
                     "Encoder graph pre-warm failed (will capture on first " "chunk instead): %s",
                     exc,
@@ -362,6 +368,7 @@ class ASREngine:
             try:
                 self._prewarm_offline()
             except Exception as exc:  # pragma: no cover
+                self._recover_capture_state()
                 logger.warning("Offline prewarm failed (first request will be slow): %s", exc)
 
         # Admission-prep overlap (offline only): a daemon thread runs the
@@ -1314,11 +1321,13 @@ class ASREngine:
         """Release engine-held resources (best-effort, idempotent).
 
         Stops the admission-prep thread, drains the executor, and releases the
-        input processor's staging buffers: incremental AR strategies park
-        requests with live decoder-KV buffers in the executor's pending pool,
-        and the staging buffers hold pinned host memory (a process-global
-        resource) — without an explicit release both only go away when the
-        garbage collector gets to them.
+        input processor's staging buffers and every CUDA-graph pool: incremental
+        AR strategies park requests with live decoder-KV buffers in the
+        executor's pending pool, the staging buffers hold pinned host memory (a
+        process-global resource), and a capture's private VRAM pool is returned
+        only by ``CUDAGraph.reset()`` — ``empty_cache()`` cannot reclaim it, and
+        the garbage collector never will.  Measured: 3.24 GiB stranded per
+        offline Nemotron engine before this released the pools.
         """
         t = self._prep_thread
         if t is not None and t.is_alive():
@@ -1333,6 +1342,17 @@ class ASREngine:
             self._input_processor.release_staging()
         except Exception:  # pragma: no cover - defensive
             logger.exception("staging release failed")
+        try:
+            self._model_runner.release_graphs()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("graph pool release failed")
+
+    def _recover_capture_state(self) -> None:
+        """Best-effort undo of an aborted capture; never raises."""
+        try:
+            self._model_runner.recover_capture_state()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("capture-state recovery failed", exc_info=True)
 
     def _prewarm_offline(self) -> None:
         """Run one dummy offline batch per preferred size to absorb one-time
