@@ -122,6 +122,18 @@ class ModelRunner:
         """The offline forward graph cache, or ``None`` when capture is off."""
         return self._offline_graphs
 
+    def recover_capture_state(self) -> None:
+        """Undo an aborted capture's process-global damage across every cache."""
+        if self._offline_graphs is not None:
+            self._offline_graphs.recover_after_failed_capture()
+        self._streaming_backend.recover_capture_state()
+
+    def release_graphs(self) -> None:
+        """Free every CUDA-graph pool the runner and its backend hold."""
+        if self._offline_graphs is not None:
+            self._offline_graphs.release()
+        self._streaming_backend.release_graphs()
+
     @property
     def decoding_window(self) -> int:
         """Input feature frames consumed per encoder chunk (from the backend)."""

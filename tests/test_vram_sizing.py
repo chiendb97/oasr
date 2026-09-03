@@ -452,7 +452,7 @@ class TestDerivedDecodeKvBudget:
         return ASREngine(cfg)
 
     def test_budget_is_derived_and_admits_work(self, wav_dir, device):
-        from tests import assets
+        import assets
 
         ckpt = assets.require("WHISPER_CKPT")
         engine = self._engine(ckpt)
@@ -467,7 +467,7 @@ class TestDerivedDecodeKvBudget:
             engine.shutdown()
 
     def test_zero_keeps_the_byte_budget_off(self, device):
-        from tests import assets
+        import assets
 
         ckpt = assets.require("WHISPER_CKPT")
         engine = self._engine(ckpt, decode_kv_budget_gib=0)

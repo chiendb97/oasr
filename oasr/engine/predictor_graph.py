@@ -52,6 +52,8 @@ from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
 import torch
 
+from .capture_recovery import recover_from_failed_capture
+
 logger = logging.getLogger("oasr.engine.predictor_graph")
 
 __all__ = ["PredictorStepGraphCache"]
@@ -96,7 +98,9 @@ class PredictorStepGraphCache:
         self._predictor = predictor
         self._joiner = joiner
         self._max_captures = int(max_captures)
-        self._pool = pool if pool is not None else torch.cuda.graph_pool_handle()
+        self._pool: Optional[Tuple[int, int]] = (
+            pool if pool is not None else torch.cuda.graph_pool_handle()
+        )
         self._captured: Dict[Tuple[int, ...], _Captured] = {}
         self._failed: Set[Tuple[int, ...]] = set()
         self._disabled = False
@@ -220,6 +224,22 @@ class PredictorStepGraphCache:
             shape.extend(int(d) for d in t.shape)
         return tuple(shape)
 
+    def release(self) -> None:
+        """Return the graph pool's VRAM.  Idempotent.
+
+        ``CUDAGraph.reset()`` is the only thing that frees a capture's private
+        memory pool; dropping the object and calling ``empty_cache()`` leaves it
+        held for the life of the process.  See
+        :meth:`oasr.engine.offline_graph.GraphedOfflineForward.release`.
+        """
+        for state in self._captured.values():
+            try:
+                state.graph.reset()
+            except Exception:  # pragma: no cover - teardown must not raise
+                pass
+        self._captured.clear()
+        self._failed.clear()
+
     def _capture(
         self,
         state: Sequence[torch.Tensor],
@@ -245,7 +265,9 @@ class PredictorStepGraphCache:
             torch.cuda.synchronize()
 
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self._pool):
+            # torch types the pool handle as an opaque ``_POOL_HANDLE``; the
+            # engine passes the ``(int, int)`` tuple it actually is.
+            with torch.cuda.graph(graph, pool=self._pool):  # type: ignore[arg-type]
                 stepped = self._predictor.advance(facing, tok_buf, emit_buf)
                 # Write the new state back into the buffers the graph reads, so
                 # the next replay continues from it with no copy.
@@ -258,10 +280,14 @@ class PredictorStepGraphCache:
             # would burn a warm-up forward and still run eager.
             logger.warning("predictor step graph capture ran out of memory; disabling capture")
             self._disabled = True
+            recover_from_failed_capture(tok.device, self._pool)
+            self._pool = None
             return None
         except Exception as exc:
             logger.warning("predictor step graph capture failed for %s: %s", key, exc)
             self._failed.add(key)
+            recover_from_failed_capture(tok.device, self._pool)
+            self._pool = torch.cuda.graph_pool_handle()
             return None
         cap = _Captured(graph=graph, state=static, tok=tok_buf, emit=emit_buf, dec_proj=proj)
         self._captured[key] = cap

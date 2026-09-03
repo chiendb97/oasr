@@ -253,6 +253,14 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         return tuple(self._cache_ladder)
 
     @torch.no_grad()
+    def recover_capture_state(self) -> None:
+        if self._graph_cache is not None:
+            self._graph_cache.recover_after_failed_capture()
+
+    def release_graphs(self) -> None:
+        if self._graph_cache is not None:
+            self._graph_cache.release()
+
     def prewarm(
         self,
         batch_sizes: Sequence[int],

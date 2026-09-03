@@ -141,6 +141,23 @@ class StreamingEncoderBackend(ABC):
         return ()
 
     # -- optional graph pre-warm -------------------------------------------
+    def recover_capture_state(self) -> None:
+        """Undo an aborted capture's process-global damage.  Default: nothing to undo.
+
+        A backend that captures overrides this; see
+        :mod:`oasr.engine.capture_recovery` for what an abort leaves behind.
+        """
+        return None
+
+    def release_graphs(self) -> None:
+        """Free any CUDA-graph pools this backend holds.  Default: nothing to free.
+
+        Only ``CUDAGraph.reset()`` returns a capture's private memory pool;
+        dropping the backend does not, and ``torch.cuda.empty_cache()`` cannot
+        reclaim it.  A backend that captures overrides this.
+        """
+        return None
+
     def prewarm(
         self, batch_sizes: Sequence[int], cache_t1_buckets: Optional[Sequence[int]] = None
     ) -> None:

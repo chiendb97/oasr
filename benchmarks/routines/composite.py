@@ -58,7 +58,10 @@ def setup_conv_block(batch_size, seq_len, d_model, kernel_size, dtype=torch.floa
     pw2_weight = torch.randn(d_model, d_model, device="cuda", dtype=dtype)
     pw2_bias = torch.randn(d_model, device="cuda", dtype=dtype)
 
-    dw_weight_pt = dw_weight.view(d_model, 1, kernel_size)
+    # (kernel_size, d_model) -> (d_model, 1, kernel_size): a bare ``view``
+    # reinterprets the bytes rather than transposing, so the reference
+    # convolved with a scrambled filter.  See benchmarks/routines/conv.py.
+    dw_weight_pt = dw_weight.permute(1, 0).reshape(d_model, 1, kernel_size)
 
     def oasr_fn():
         pw1_out = oasr.gemm(x, pw1_weight, pw1_bias)

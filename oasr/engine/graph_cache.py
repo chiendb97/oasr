@@ -58,6 +58,8 @@ from oasr.cache.state import SlotStateCache
 from oasr.features import FeatureConfig, build_extractor
 from oasr.features.batched import supports_batched_fbank, supports_batched_mfcc
 
+from .capture_recovery import recover_from_failed_capture
+
 # N_BLOCK tile size of the FMHA kernel; T_kv must be a multiple of this.
 _KERNEL_N_BLOCK = 64
 
@@ -215,7 +217,9 @@ class GraphedEncoderForward:
         # Captures share one memory pool to avoid allocator fragmentation.
         # Outputs remain valid only until that pool is reused by another replay.
         # Tests may omit ``pool`` when constructing this cache directly.
-        self._pool = pool if pool is not None else torch.cuda.graph_pool_handle()
+        self._pool: Optional[Tuple[int, int]] = (
+            pool if pool is not None else torch.cuda.graph_pool_handle()
+        )
         # Keyed by batch, input length, and cache-length bucket.
         self._captured: Dict[Tuple[int, int, int], _CapturedShape] = {}
         # Bound graph-pool growth; uncached shapes fall back to eager execution.
@@ -323,6 +327,34 @@ class GraphedEncoderForward:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
+    def recover_after_failed_capture(self) -> None:
+        """Undo an aborted capture: release the stuck pool and take a fresh one.
+
+        Captures here are not wrapped in ``try``, so a failure reaches the
+        caller — but the damage is process-global and outlives the exception.
+        See :mod:`oasr.engine.capture_recovery`.
+        """
+        recover_from_failed_capture(self._device, self._pool)
+        try:
+            self._pool = torch.cuda.graph_pool_handle()
+        except Exception:  # pragma: no cover - defensive
+            self._pool = None
+
+    def release(self) -> None:
+        """Return the graph pool's VRAM.  Idempotent.
+
+        ``CUDAGraph.reset()`` is the only thing that frees a capture's private
+        memory pool; dropping the object and calling ``empty_cache()`` leaves it
+        held for the life of the process.  See
+        :meth:`oasr.engine.offline_graph.GraphedOfflineForward.release`.
+        """
+        for state in self._captured.values():
+            try:
+                state.graph.reset()
+            except Exception:  # pragma: no cover - teardown must not raise
+                pass
+        self._captured.clear()
+
     def _capture(
         self,
         B: int,
@@ -514,7 +546,9 @@ class GraphedFeatureExtraction:
         max_batch_size: int,
         batch_buckets: Optional[List[int]] = None,
     ) -> None:
-        self._pool = pool if pool is not None else torch.cuda.graph_pool_handle()
+        self._pool: Optional[Tuple[int, int]] = (
+            pool if pool is not None else torch.cuda.graph_pool_handle()
+        )
         self._device = device
         self._fcfg = feature_config
         self._output_dtype = output_dtype
@@ -654,6 +688,34 @@ class GraphedFeatureExtraction:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
+    def recover_after_failed_capture(self) -> None:
+        """Undo an aborted capture: release the stuck pool and take a fresh one.
+
+        Captures here are not wrapped in ``try``, so a failure reaches the
+        caller — but the damage is process-global and outlives the exception.
+        See :mod:`oasr.engine.capture_recovery`.
+        """
+        recover_from_failed_capture(self._device, self._pool)
+        try:
+            self._pool = torch.cuda.graph_pool_handle()
+        except Exception:  # pragma: no cover - defensive
+            self._pool = None
+
+    def release(self) -> None:
+        """Return the graph pool's VRAM.  Idempotent.
+
+        ``CUDAGraph.reset()`` is the only thing that frees a capture's private
+        memory pool; dropping the object and calling ``empty_cache()`` leaves it
+        held for the life of the process.  See
+        :meth:`oasr.engine.offline_graph.GraphedOfflineForward.release`.
+        """
+        for state in self._captured.values():
+            try:
+                state.graph.reset()
+            except Exception:  # pragma: no cover - teardown must not raise
+                pass
+        self._captured.clear()
+
     def _capture(self, bucket: int) -> _CapturedFeatureShape:
         device = self._device
         T_pad = self._t_pad

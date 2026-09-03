@@ -1360,6 +1360,13 @@ class TestStreamingFeatureAppend:
     compaction left a buffer exactly as long as what it kept, so a grow *always*
     followed it, chaining old->keep->new.  Two copies of the same frames, and two
     that could not have shared a batch.
+
+    Compaction *triggers* only when the append would otherwise not fit.  The
+    eager rule it replaced (``cursor >= have // 2``) was true on ~91 % of appends
+    at steady state, because a stream consumes about as many frames per tick as
+    it gains -- see ``tests/test_feature_buffer_growth.py``.  So a test of
+    compaction has to fill the buffer first; moving the cursor is no longer
+    enough on its own, which is what the two tests below assert around.
     """
 
     def _proc(self):
@@ -1396,27 +1403,52 @@ class TestStreamingFeatureAppend:
         assert req.feature_frames == want.size(0)
         torch.testing.assert_close(req.feature_buffer[: req.feature_frames], want)
 
+    def _fill_to_capacity(self, proc, req, F, chunk=4):
+        """Append ``chunk`` frames at a time until one more would not fit.
+
+        The trigger is "the append overflows", not "the cursor is past half", so
+        reaching the compaction edge means filling the buffer.  The loop stops
+        one append short of the capacity, so nothing inside it reallocates.
+        """
+        self._append(proc, req, torch.zeros(chunk, F), F)
+        while req.feature_frames + chunk <= req.feature_buffer.size(0):
+            self._append(proc, req, torch.full((chunk, F), float(req.feature_frames)), F)
+        assert req.feature_frames == req.feature_buffer.size(0)
+        return req.feature_frames
+
+    def test_a_large_cursor_alone_does_not_compact(self):
+        """The rule that replaced ``cursor >= have // 2``: room still means no copy."""
+        proc, req, F = self._proc(), self._req(), 4
+        self._append(proc, req, torch.zeros(4, F), F)
+        buf, cap = req.feature_buffer, req.feature_buffer.size(0)
+        req.feature_cursor = req.feature_frames  # fully consumed, but there is room
+
+        self._append(proc, req, torch.full((4, F), 99.0), F)
+        assert req.feature_buffer is buf, "reallocated with capacity to spare"
+        assert req.feature_cursor == 4, "rebased the cursor without compacting"
+        assert req.feature_buffer.size(0) == cap
+
     def test_consumed_prefix_is_dropped_without_losing_live_frames(self):
         """Compaction moves the cursor to 0 and keeps everything after it."""
         proc, req, F = self._proc(), self._req(), 4
-        for step in range(4):
-            self._append(proc, req, torch.full((4, F), float(step)), F)
-        assert req.feature_frames == 16
+        have = self._fill_to_capacity(proc, req, F)
 
-        req.feature_cursor = 12  # >= have // 2, so the next append compacts
-        live = req.feature_buffer[12:16].clone()
+        req.feature_cursor = 12  # the append below no longer fits, so it compacts
+        live = req.feature_buffer[12:have].clone()
+        base = req.feature_base
         self._append(proc, req, torch.full((4, F), 99.0), F)
 
+        keep = have - 12
         assert req.feature_cursor == 0, "compaction must rebase the cursor"
-        assert req.feature_frames == 8
-        torch.testing.assert_close(req.feature_buffer[:4], live)
-        torch.testing.assert_close(req.feature_buffer[4:8], torch.full((4, F), 99.0))
+        assert req.feature_base == base + 12, "the rebased frames must move into the base"
+        assert req.feature_frames == keep + 4
+        torch.testing.assert_close(req.feature_buffer[:keep], live)
+        torch.testing.assert_close(req.feature_buffer[keep : keep + 4], torch.full((4, F), 99.0))
 
     def test_compaction_relocates_once(self):
         """Not old->keep->new: one allocation, one copy of the retained frames."""
         proc, req, F = self._proc(), self._req(), 4
-        for step in range(4):
-            self._append(proc, req, torch.full((4, F), float(step)), F)
+        self._fill_to_capacity(proc, req, F)
         req.feature_cursor = 12
 
         dsts, srcs = [], []

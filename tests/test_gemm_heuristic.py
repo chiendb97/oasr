@@ -509,7 +509,15 @@ class TestDispatchPlanCache:
         assert len(fg._PLANS) <= fg._PLAN_CACHE_MAX
 
     def test_plan_matches_the_resolver_for_every_rule_boundary(self):
-        """Whatever the table says for a shape is what the plan carries."""
+        """Whatever the table says for a shape is what the plan carries.
+
+        The rule boundaries come from the SM120 table because that is the only
+        table there is, but the resolver has to be asked at the arch this box
+        actually runs on: ``_plan`` passes ``_target_sm()``, and
+        ``select_default_config`` returns ``GEMM_DEFAULT`` for every shape off
+        SM120.  Pinning the oracle to ``120`` compared an SM120 answer against an
+        SM80 plan and could only ever pass on a 5090.
+        """
         import oasr.functionals.gemm as fg
         import oasr.jit.gemm as jg
 
@@ -519,11 +527,15 @@ class TestDispatchPlanCache:
                 continue
             for m_max, _choice in rules:
                 M = 1 if m_max is None else int(m_max)
-                expect = jg.select_default_config(op, M, N, K, torch.bfloat16, 120)
+                expect = jg.select_default_config(op, M, N, K, torch.bfloat16, _SM)
                 kind = fg._plan(op, False, M, N, K, torch.bfloat16)[1]
                 if expect == "torch":
                     assert kind == fg._PLAN_TORCH, (op, N, K, M)
+                elif expect == "fused":
+                    assert kind == fg._PLAN_FUSED, (op, N, K, M)
                 else:
+                    # A config object, GEMM_DEFAULT included: op "gemm" composes
+                    # it into a CUTLASS variant either way.
                     assert kind == fg._PLAN_CUTLASS, (op, N, K, M)
 
 

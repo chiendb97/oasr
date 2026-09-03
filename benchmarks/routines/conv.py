@@ -190,10 +190,18 @@ def setup_depthwise_conv1d(batch_size, seq_len, channels, kernel_size, dtype=tor
         return oasr.depthwise_conv1d(x, weight, bias, padding)
 
     x_nchw = x.permute(0, 2, 1).contiguous()
-    weight_pt = weight.view(channels, 1, kernel_size)
+    # (kernel_size, channels) -> (channels, 1, kernel_size).  A bare ``view``
+    # reinterprets the bytes instead of transposing, so the reference convolved
+    # with a scrambled filter and --refcheck reported a mismatch that was its
+    # own.  tests/test_conv.py::TestDepthwiseConv1D states the layout.
+    weight_pt = weight.permute(1, 0).reshape(channels, 1, kernel_size)
 
     def pytorch_fn():
-        return F.conv1d(x_nchw, weight_pt, bias, padding=padding, groups=channels)
+        # Back to (B, T, C): ``oasr.depthwise_conv1d`` is channels-last, so
+        # comparing the raw ``F.conv1d`` output made ``--refcheck`` compare a
+        # (B, C, T) tensor against a (B, T, C) one -- which crashed on the shape
+        # rather than reporting a mismatch.
+        return F.conv1d(x_nchw, weight_pt, bias, padding=padding, groups=channels).transpose(1, 2)
 
     return oasr_fn, pytorch_fn
 
@@ -207,10 +215,14 @@ def setup_depthwise_conv1d_causal(batch_size, seq_len, channels, kernel_size, dt
         return oasr.depthwise_conv1d(x, weight, bias, 0)
 
     x_nchw = x.permute(0, 2, 1).contiguous()
-    weight_pt = weight.view(channels, 1, kernel_size)
+    # (kernel_size, channels) -> (channels, 1, kernel_size).  A bare ``view``
+    # reinterprets the bytes instead of transposing, so the reference convolved
+    # with a scrambled filter and --refcheck reported a mismatch that was its
+    # own.  tests/test_conv.py::TestDepthwiseConv1D states the layout.
+    weight_pt = weight.permute(1, 0).reshape(channels, 1, kernel_size)
 
     def pytorch_fn():
-        return F.conv1d(x_nchw, weight_pt, bias, padding=0, groups=channels)
+        return F.conv1d(x_nchw, weight_pt, bias, padding=0, groups=channels).transpose(1, 2)
 
     return oasr_fn, pytorch_fn
 
@@ -248,6 +260,11 @@ def setup_pointwise_conv1d_activation(
         elif activation == oasr.ACTIVATION_RELU:
             return F.relu(out)
         elif activation == oasr.ACTIVATION_GELU:
+            # OASR's fused GELU epilogue is the tanh approximation; the exact
+            # erf form is ACTIVATION_GELU_ERF.  Fusing them under one oracle is
+            # a silent accuracy difference (see AGENTS.md).
+            return F.gelu(out, approximate="tanh")
+        elif activation == oasr.ACTIVATION_GELU_ERF:
             return F.gelu(out)
         return out
 
@@ -266,7 +283,10 @@ def setup_conv2d(batch_size, H, W, IC, K, R, S, pad=0, stride=1, dtype=torch.flo
     w_nchw = w_nhwc.permute(0, 3, 1, 2).contiguous()
 
     def pytorch_fn():
-        return F.conv2d(x_nchw, w_nchw, bias, stride=stride, padding=pad)
+        # Back to NHWC: ``oasr.conv2d`` is channels-last, so the raw NCHW
+        # reference made --refcheck compare mismatched layouts and crash on the
+        # shape.  ``grouped_conv2d`` below already permutes for this reason.
+        return F.conv2d(x_nchw, w_nchw, bias, stride=stride, padding=pad).permute(0, 2, 3, 1)
 
     return oasr_fn, pytorch_fn
 
@@ -289,12 +309,17 @@ def setup_conv2d_activation(
     if activation == oasr.ACTIVATION_RELU:
         act_fn = F.relu
     elif activation == oasr.ACTIVATION_GELU:
+        # The fused epilogue is the tanh approximation; ACTIVATION_GELU_ERF is
+        # the exact one.  One oracle for both is a silent accuracy difference.
+        act_fn = lambda t: F.gelu(t, approximate="tanh")  # noqa: E731
+    elif activation == oasr.ACTIVATION_GELU_ERF:
         act_fn = F.gelu
     else:
         act_fn = F.silu
 
     def pytorch_fn():
-        return act_fn(F.conv2d(x_nchw, w_nchw, bias, stride=stride, padding=pad))
+        out = F.conv2d(x_nchw, w_nchw, bias, stride=stride, padding=pad)
+        return act_fn(out).permute(0, 2, 3, 1)
 
     return oasr_fn, pytorch_fn
 
