@@ -1,26 +1,33 @@
 name: test-gpu-modal
 
-# Rented-runner counterpart to test-gpu.yml. Set Modal token secrets once.
-# The default accelerator covers architecture-gated suites; alternate targets
-# are supplemental. Seed assets with ci/modal_app.py::seed_assets, then dispatch
-# with checkpoints enabled. Without them, strict mode reports all skipped assets.
+# Rented-runner counterpart to test-gpu.yml, and the only place OASR runs on an
+# architecture nobody here owns.  The weekly run sweeps one accelerator per
+# distinct SM (see `ARCH_SWEEP` in ci/modal_app.py); a dispatch can name any
+# subset.  Set the Modal token secrets once.
+#
+# Assets are NOT uploaded from this runner: `ci/modal_assets.py` names each one
+# by (source, pinned revision) and `modal run ci/modal_app.py::fetch_assets`
+# pulls them inside the container into a persistent Volume.  Run that once per
+# Modal workspace; it is idempotent afterwards.  The four assets with no public
+# source are listed in `modal_assets.NO_PUBLIC_SOURCE` and are reported as
+# missing rather than silently skipped.
 
 on:
   workflow_dispatch:
     inputs:
+      gpus:
+        description: "Comma-separated Modal accelerators, or 'all' for one per architecture"
+        required: false
+        default: "all"
       suites:
         description: "Comma-separated suite names (empty = all). See ci/gpu_suites.py --list"
         required: false
         default: ""
-      gpu:
-        description: "Modal accelerator (RTX-PRO-6000 is sm_120, matching the 5090)"
-        required: false
-        default: "RTX-PRO-6000"
       checkpoints:
-        description: "Also run the checkpoint/audio tests (needs the seeded Volume — see the header)"
+        description: "Run the checkpoint/audio tests (needs the Volume — see the header)"
         type: boolean
         required: false
-        default: false
+        default: true
       strict:
         description: "Fail instead of skipping when an expected asset is missing"
         type: boolean
@@ -40,19 +47,17 @@ permissions:
 
 jobs:
   gpu:
-    name: modal (${{ github.event.inputs.gpu || 'RTX-PRO-6000' }})
+    name: modal (${{ github.event.inputs.gpus || 'all' }})
     runs-on: ubuntu-latest
-    # 5 suites in parallel on a rented GPU, plus image build on a cold cache.
-    timeout-minutes: 90
+    # A full sweep is 5 architectures x 6 suites, all concurrent, plus an image
+    # build on a cold cache.
+    timeout-minutes: 150
     steps:
-      # CUTLASS lives in the 3rdparty/cutlass submodule and every GEMM / BMM /
-      # Conv2D kernel is JIT-compiled against its headers, so a checkout without
-      # it either fails to compile or -- worse, on a persistent runner -- picks
-      # up whatever CUTLASS version was left in the workspace.  The pinned
-      # commit is the one the JIT cache key stamps.
+      # No `submodules:` here on purpose.  3rdparty/cutlass is 26 069 files and
+      # 2.0 GiB, and the container fetches the pinned commit itself — the sha
+      # comes from `git ls-tree HEAD 3rdparty/cutlass`, which reads the index
+      # and so is right whether or not the submodule is checked out.
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - uses: actions/setup-python@v5
         with:
@@ -72,26 +77,35 @@ jobs:
       - name: Check the suite split covers every test file
         run: python ci/gpu_suites.py --check
 
-      - name: Run the GPU suite on Modal
+      # Idempotent: every asset already in the Volume costs one marker check.
+      # Kept in the workflow rather than run by hand so a new source in
+      # ci/modal_assets.py reaches CI without anybody remembering to.
+      - name: Fetch the external assets into the Modal Volume
+        if: ${{ github.event.inputs.checkpoints != 'false' }}
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-          OASR_MODAL_GPU: ${{ github.event.inputs.gpu || 'RTX-PRO-6000' }}
+        run: modal run ci/modal_app.py::fetch_assets
+
+      - name: Run the GPU suites on Modal
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
         run: |
           strict_flag="--strict"
           if [ "${{ github.event.inputs.strict }}" = "false" ]; then
             strict_flag="--no-strict"
           fi
-          # Off unless explicitly asked for: `github.event.inputs` is empty on
-          # the schedule trigger, so the cron run is the no-checkpoint one until
-          # the Volume is seeded and this default is flipped.
-          assets_flag="--no-assets"
-          if [ "${{ github.event.inputs.checkpoints }}" = "true" ]; then
-            assets_flag="--assets"
+          # `github.event.inputs` is empty on the schedule trigger, so the cron
+          # run takes the defaults: every architecture, with checkpoints.
+          assets_flag="--assets"
+          if [ "${{ github.event.inputs.checkpoints }}" = "false" ]; then
+            assets_flag="--no-assets"
           fi
-          # `::main` is not optional: the file also defines the `seed_assets`
-          # entrypoint, and `modal run` on a file with more than one refuses to
-          # guess ("Specify a Modal Function or local entrypoint to run").
+          # `::main` is not optional: the file defines three local entrypoints,
+          # and `modal run` on a file with more than one refuses to guess
+          # ("Specify a Modal Function or local entrypoint to run").
           modal run ci/modal_app.py::main \
+            --gpus "${{ github.event.inputs.gpus || 'all' }}" \
             --suites "${{ github.event.inputs.suites }}" \
             $strict_flag $assets_flag
