@@ -8,7 +8,7 @@ the fast half of them locally.
 | `lint.yml` | GitHub-hosted | push to `main`, every PR | black, isort, ruff, the mypy ratchet, `cargo fmt`, `cargo clippy -D warnings`, `cargo test` |
 | `test-cpu.yml` | GitHub-hosted | push to `main`, every PR | `pytest tests/` on Python 3.10 + 3.12 with no GPU, behind a `--min-passed` coverage floor |
 | `test-gpu.yml` | self-hosted `oasr-gpu` | nightly + manual | the full suite **with `--strict-assets`**, split per family, plus the `slow` and `concurrent` markers |
-| `test-gpu-modal.yml` | GitHub-hosted → Modal GPU | weekly + manual | the same per-family split, on rented sm_120 |
+| `test-gpu-modal.yml` | GitHub-hosted → Modal GPU | weekly + manual | the same per-family split, on one rented accelerator per architecture (sm_80 / 89 / 90 / 100 / 120) |
 
 ## Running the gates locally
 
@@ -175,47 +175,111 @@ pre-commit hook and a `lint.yml` step.
 
 |  | self-hosted (`test-gpu.yml`) | Modal (`test-gpu-modal.yml`) |
 |---|---|---|
-| GPU | the reference RTX 5090 — sm_120 | `RTX-PRO-6000` — GB202, also sm_120 |
-| checkpoints | already on disk | a Volume, seeded once |
+| GPU | the reference box — one SM | one accelerator per architecture, `ARCH_SWEEP` |
+| checkpoints | already on disk | a Volume the container fills itself |
 | cost | none | GPU-minutes per run |
 | when | nightly sweep | weekly, on demand, and when the box is busy or wedged |
 
-**Use the self-hosted box as the primary.** It is the SM this project ships on
-and the assets are local. Modal exists because that box is also the benchmarking
-machine (CI competing for clocks is exactly the noise the perf work fights),
-because its GPU has fallen off the bus in a way only a *host* reset recovers, and
-because a second SM is worth having — `test_gemm_heuristic.py` skips its whole
-rule-table suite unless `_SM == 120`, so running once on another architecture is
-the cheapest way to find code that assumed one.
+**Use the self-hosted box as the primary.** The assets are local and it is a
+machine somebody can look at. Modal exists because that box is also the
+benchmarking machine (CI competing for clocks is exactly the noise the perf work
+fights), because its GPU has fallen off the bus in a way only a *host* reset
+recovers, and — the reason that grew — because **one SM is not a test matrix**.
+`test_gemm_heuristic.py` skips its whole rule-table suite unless the running SM
+matches the rules, kernel selection reads the compute capability in half a dozen
+places, and `_default_cuda_cflags` emits a different `-gencode` per arch. Code
+that assumed one architecture is invisible until a second one runs it.
 
 ```bash
-modal run ci/modal_app.py                                  # all families
-modal run ci/modal_app.py --suites kernels,engine          # a subset
-OASR_MODAL_GPU=H100 modal run ci/modal_app.py --no-strict   # second SM
+modal run ci/modal_app.py::main --gpus all                    # one per architecture
+modal run ci/modal_app.py::main --gpus H100,B200              # a subset
+modal run ci/modal_app.py::main --gpus L40S --suites kernels  # one arch, one family
 ```
 
-### Seeding the assets Volume
+`--gpus all` expands to `ARCH_SWEEP` in `ci/modal_app.py`: one accelerator per
+distinct SM rather than one per product, because two L40S-class cards run the
+same kernels. Every (gpu, suite) pair is a separate container and they all run
+concurrently.
 
-Once, from a machine that already has the checkpoints. Source paths come from the
-same environment variables the suite reads, so a box set up for a local GPU run
-needs no extra configuration:
+| accelerator | SM | notes |
+|---|---|---|
+| `A100-40GB` / `A100-80GB` | sm_80 | Ampere; matches the A30 dev box's arch |
+| `A10G` | sm_86 | |
+| `L4` / `L40S` | sm_89 | Ada |
+| `H100` / `H200` | sm_90 | Hopper — the `sm_90a` arch-conditional path |
+| `B200` | sm_100 | Blackwell datacentre |
+| `RTX-PRO-6000` | sm_120 | GB202, the SM the reference box ships on |
+
+### The assets Volume fills itself
+
+`ci/modal_assets.py` names every external asset by `(source, pinned revision)` —
+a Hub repo id, a URL, a handful of raw files out of a git tree — and
+
+```bash
+modal run ci/modal_app.py::fetch_assets            # ~20 GiB, once
+modal run ci/modal_app.py::fetch_assets --dry-run  # the plan, first
+modal run ci/modal_app.py::fetch_assets --skip SPEECH_LLM_CKPT
+```
+
+downloads them **inside the container**, straight into the Volume they will be
+read from. It is idempotent: an asset whose marker file is already in place costs
+one `stat`. The workflow runs it on every dispatch so a new source reaches CI
+without anybody remembering to.
+
+This replaced a 29 GiB upload from whichever developer machine had `.env` set.
+That upload was slow, it was not reproducible — whatever happened to be on that
+box, at whatever revision — and it made a CI whose job is to check the *code*
+depend on one person's filesystem. Revisions are pinned for the same reason
+`ci/wer-reference.json` records a checkpoint: an asset that moves under CI turns
+a WER regression into an unattributable one.
+
+Not everything has a public source. Four assets are listed in
+`modal_assets.NO_PUBLIC_SOURCE` with the reason — WeNet's librispeech
+`u2pp_conformer` release (`wenet.org.cn/downloads` now 404s for it, and the only
+Hub mirror ships an exported TorchScript `final.zip` the converter cannot read),
+the generated tiny Qwen2-Audio fixture, and a locally built k2 `HLG.pt`. Those
+are uploaded once, per asset:
 
 ```bash
 set -a; source .env; set +a
-export WAV_DIR="$AUDIO_DIR"
-export ZIPFORMER_CKPT=/path/to/icefall-...-zipformer-large-cr-ctc-...
-modal run ci/modal_app.py::seed_assets --dry-run   # print the plan first
-modal run ci/modal_app.py::seed_assets
+modal run ci/modal_app.py::seed_assets --dry-run
+modal run ci/modal_app.py::seed_assets --only CKPT_DIR,SPEECH_LLM_TINY
 ```
 
-A second Volume caches `~/.cache/oasr/jit`. Without it every run recompiles the
-kernels from cold, because they JIT on first *call*.
+`ALLOW_MISSING` is derived from that same dict rather than written out again, so
+an asset that gains a public source drops off the allow-list by itself — an
+allow-list that outlives the gap it documented is the exact failure `--strict-assets`
+exists to prevent.
 
-Two image details are load-bearing. The base is `nvidia/cuda:*-devel`, not
-`-runtime`, because the JIT shells out to `nvcc` at run time. And
-`CUDA_ARCHITECTURES=120` is passed explicitly: the CMake extension is built at
-image-build time where there is no GPU, so `setup.py`'s torch-based arch
-detection cannot see one and falls back to 80–90.
+A second Volume caches the JIT artifacts, partitioned per architecture under
+`/jit/sm<cc>`. Without it every run recompiles the kernels from cold, because
+they JIT on first *call*. The partition is not a correctness fix — the cache key
+already covers the target, since `_default_cuda_cflags` puts `-gencode=…sm_XX`
+and `-DOASR_TARGET_SM` into the flags `JitSpec._content_hash` hashes — it is so
+that five suites on five GPUs are not five concurrent writers to one Volume
+prefix.
+
+### The image, and what is *not* in it
+
+One image serves every architecture. The CMake half of the build compiles no
+CUDA (`OASR_SOURCES` is six `.cc` files), so `CUDA_ARCHITECTURES` is the whole
+list `80;86;89;90;100;120` and costs nothing; the kernels that actually differ
+per arch are JIT-compiled on the GPU that will run them. An image per arch would
+mean an image build per arch for no coverage.
+
+The base is `nvidia/cuda:*-devel`, not `-runtime`, because the JIT shells out to
+`nvcc` at run time. Torch comes from the `cu128` index — the first one with
+sm_100 and sm_120 wheels.
+
+**`3rdparty/cutlass` is not uploaded.** It is 26 069 files and 2.0 GiB, and it
+was going into the image context on every `modal run`, dwarfing the code change
+that prompted the run. The container fetches the pinned commit from GitHub as a
+source tarball in its own cached layer, keeps the two include roots
+`oasr/jit/env.py` collects, and symlinks it to `/repo/3rdparty/cutlass` — which
+is the only place that function looks. The sha comes from
+`git ls-tree HEAD 3rdparty/cutlass`, i.e. from the *index*, so it is correct
+whether or not the submodule is checked out. That is why the workflow's
+`actions/checkout` no longer asks for submodules.
 
 ### Security — this repo is public
 

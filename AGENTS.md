@@ -497,12 +497,17 @@ Workflows in `.github/workflows/`:
 | `lint.yml` | GitHub-hosted | push to `main`, every PR |
 | `test-cpu.yml` | GitHub-hosted | push to `main`, every PR (Python 3.10 + 3.12, no GPU) |
 | `test-gpu.yml` | self-hosted `oasr-gpu` | nightly + manual — **do not add a `pull_request` trigger** |
-| `test-gpu-modal.yml` | Modal `RTX-PRO-6000` (sm_120) | weekly + manual |
+| `test-gpu-modal.yml` | Modal, one GPU per arch (sm_80/89/90/100/120) | weekly + manual |
 
 Both GPU backends run the same per-family split from `ci/gpu_suites.py` with
-`--strict-assets`. `mypy` is a **per-file ratchet** against `ci/mypy-baseline.json`,
-not a zero-error gate (`--update` after a cleanup). Full detail:
-[`docs/ci.md`](docs/ci.md).
+`--strict-assets`. Modal runs it across architectures — `modal run
+ci/modal_app.py::main --gpus all` is one accelerator per distinct SM — and fills
+its own asset Volume: `ci/modal_assets.py` names every checkpoint and corpus by
+`(source, pinned revision)` and `fetch_assets` downloads them *inside* the
+container, so neither the checkpoints nor `3rdparty/cutlass` is ever uploaded
+from a developer box. `mypy` is a **per-file ratchet** against
+`ci/mypy-baseline.json`, not a zero-error gate (`--update` after a cleanup).
+Full detail: [`docs/ci.md`](docs/ci.md).
 
 ---
 
