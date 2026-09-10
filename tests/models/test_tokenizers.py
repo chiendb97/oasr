@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import random
+import time
+
 import pytest
 
 from oasr.tokenizers import (
@@ -311,4 +314,100 @@ class TestIncrementalDecode:
         ids = [2, 4, 5, 6]
         deltas, state = self._drive(tok, ids, 2)
         assert "".join(deltas) == tok.decode(ids)
+        assert state["text"] == tok.decode(ids)
+
+
+# ---------------------------------------------------------------------------
+# The two incremental-decode properties ``TestIncrementalDecode`` does not cover
+#
+# Correctness -- deltas concatenating to ``decode(all_ids)`` and ``state["text"]``
+# holding the transcript at every step -- is asserted above, against every
+# registered kind.  What used to live in ``test_incremental_detokenize.py`` and
+# is *not* covered there is the cost model and the state's independence.
+# ---------------------------------------------------------------------------
+
+
+PIECES = [
+    "▁the",
+    "▁quick",
+    "▁brown",
+    "▁fox",
+    "s",
+    "ing",
+    "ed",
+    "▁a",
+    "▁of",
+    "▁print",
+    "er",
+    "▁and",
+    "▁to",
+    "'",
+    "▁",
+    "▁in",
+    "▁i",
+]
+SPECIAL = 99
+
+
+def _tok() -> SymbolTableTokenizer:
+    tok = SymbolTableTokenizer.__new__(SymbolTableTokenizer)
+    tok._table = dict(enumerate(PIECES))
+    tok._special_ids = {SPECIAL}
+    return tok
+
+
+def _feed(tok, ids, step):
+    """Drive decode_incremental in ``step``-sized chunks -> (deltas, state)."""
+    state, out = {}, ""
+    for i in range(0, len(ids), step):
+        out += tok.decode_incremental(ids[i : i + step], state)
+    return out, state
+
+
+class TestCostIsFlatInTranscriptLength:
+    def test_per_partial_cost_does_not_grow_with_the_transcript(self):
+        """The regression this file exists for.
+
+        Times a fixed 4-token append against a short prefix and a long one. The
+        old implementation was ~13x slower on the long prefix; a correct
+        incremental one is flat. The threshold is loose because this is a timing
+        test — it is there to catch a return to *linear*, not to police jitter.
+        """
+        tok = _tok()
+        rng = random.Random(0)
+
+        def per_append_us(prefix_tokens: int) -> float:
+            best = None
+            for _ in range(5):
+                state = {}
+                tok.decode_incremental(
+                    [rng.randrange(len(PIECES)) for _ in range(prefix_tokens)], state
+                )
+                add = [rng.randrange(len(PIECES)) for _ in range(4)]
+                t0 = time.perf_counter()
+                for _ in range(300):
+                    tok.decode_incremental(add, state)
+                us = (time.perf_counter() - t0) / 300 * 1e6
+                best = us if best is None else min(best, us)
+            return best
+
+        short = per_append_us(20)
+        long = per_append_us(6400)
+        assert long < short * 4, (
+            f"per-partial cost grew {long / short:.1f}x from a 20-token prefix "
+            f"({short:.2f} us) to a 6400-token one ({long:.2f} us) — "
+            f"decode_incremental is linear in the transcript again"
+        )
+
+
+class TestStateIsSelfContained:
+    def test_a_resumed_state_keeps_rendering_correctly(self):
+        """The engine carries this dict across ticks; nothing may live outside it."""
+        tok = _tok()
+        rng = random.Random(3)
+        ids = [rng.randrange(len(PIECES)) for _ in range(50)]
+        state = {}
+        for i in range(0, len(ids), 5):
+            state = dict(state)  # as if it round-tripped through the request
+            tok.decode_incremental(ids[i : i + 5], state)
         assert state["text"] == tok.decode(ids)

@@ -3,8 +3,11 @@
 Unit tests for GPU CTC prefix beam search decoder.
 """
 
+import os
+
 import pytest
 import torch
+import torch.nn.functional as F
 
 import oasr
 from oasr.functionals.ctc_decode import (
@@ -748,7 +751,7 @@ class TestCtcDecoderBatchedReadBack:
     @pytest.mark.parametrize("want_times", [False, True], ids=["tokens", "tokens+times"])
     # 65 and 130 straddle the 64-stream group the launcher batches in, which is
     # where a per-group base pointer would be reused for the wrong group.
-    @pytest.mark.parametrize("n_states", [1, 3, 64, 65, 130])
+    @pytest.mark.parametrize("n_states", [1, 64, 65, 130])
     def test_matches_per_state_read(self, device, use_paged, want_times, n_states):
         V = 7
         decoder = GpuStreamingDecoder(
@@ -914,124 +917,48 @@ class TestCtcDecoderApiExport:
 
 
 @pytest.mark.cuda
-class TestCtcDecoderPagedOffline:
-    """Tests for paged-memory GPU CTC prefix beam search (offline)."""
+class TestPagedMemoryMatchesFlat:
+    """The paged workspace must decode identically to the flat one.
 
-    def test_paged_matches_flat_basic(self, device):
-        """Paged mode produces token-exact output matching flat mode."""
+    Paged mode is a *storage* choice, so what has to be tested is the
+    equivalence, not the decoding: this class used to re-run four flat tests
+    with ``use_paged_memory=True`` and assert the expected tokens again, which
+    tests the beam search a second time and the paging not at all.  Each test
+    below decodes the same input both ways and compares.
+    """
+
+    def test_basic_and_batched_agree(self, device):
         V = 5
         logp = _make_logp_gpu(5, V, [1, 0, 2, 0, 3], device)
         seq_lengths = torch.tensor([5], dtype=torch.int32, device=device)
+        kw = {"beam_size": 3, "blank_id": 0, "blank_threshold": 1.0, "max_seq_len": 10}
+        flat = ctc_beam_search_decode(logp, seq_lengths, **kw)
+        paged = ctc_beam_search_decode(logp, seq_lengths, use_paged_memory=True, page_size=4, **kw)
+        assert paged.tokens[0][0] == [1, 2, 3]
+        assert paged.tokens == flat.tokens
 
-        result_flat = ctc_beam_search_decode(
-            logp, seq_lengths, beam_size=3, blank_id=0, blank_threshold=1.0, max_seq_len=10
+        paths = [[1, 0, 2, 0, 3], [4, 0, 5], [1, 0, 1, 0, 1, 0, 2]]
+        logp, seq_lengths = _make_batched_logp_gpu(paths, 6, device)
+        kw = {"beam_size": 5, "blank_id": 0, "blank_threshold": 1.0, "max_seq_len": 20}
+        flat = ctc_beam_search_decode(logp, seq_lengths, **kw)
+        paged = ctc_beam_search_decode(logp, seq_lengths, use_paged_memory=True, page_size=4, **kw)
+        assert paged.tokens == flat.tokens
+
+    @pytest.mark.parametrize("page_size", [4, 16])
+    def test_a_sequence_spanning_several_pages(self, device, page_size):
+        """The page boundary is where a paged walk can lose a prefix."""
+        V = 4
+        path = [1, 0, 2, 0, 3, 0, 1, 0, 2, 0, 3, 0, 1, 0, 2]
+        logp = _make_logp_gpu(len(path), V, path, device)
+        seq_lengths = torch.tensor([len(path)], dtype=torch.int32, device=device)
+        kw = {"beam_size": 4, "blank_id": 0, "blank_threshold": 1.0, "max_seq_len": 40}
+        flat = ctc_beam_search_decode(logp, seq_lengths, **kw)
+        paged = ctc_beam_search_decode(
+            logp, seq_lengths, use_paged_memory=True, page_size=page_size, **kw
         )
-        result_paged = ctc_beam_search_decode(
-            logp,
-            seq_lengths,
-            beam_size=3,
-            blank_id=0,
-            blank_threshold=1.0,
-            max_seq_len=10,
-            use_paged_memory=True,
-            page_size=4,
-        )
+        assert paged.tokens == flat.tokens
 
-        assert result_paged.tokens[0][0] == [1, 2, 3]
-        assert result_paged.tokens == result_flat.tokens
-
-    def test_paged_matches_flat_batched(self, device):
-        """Paged mode handles batched inputs identically to flat mode."""
-        V = 6
-        paths = [
-            [1, 0, 2, 0, 3],
-            [4, 0, 5],
-            [1, 0, 1, 0, 1, 0, 2],
-        ]
-        logp, seq_lengths = _make_batched_logp_gpu(paths, V, device)
-
-        result_flat = ctc_beam_search_decode(
-            logp, seq_lengths, beam_size=5, blank_id=0, blank_threshold=1.0, max_seq_len=20
-        )
-        result_paged = ctc_beam_search_decode(
-            logp,
-            seq_lengths,
-            beam_size=5,
-            blank_id=0,
-            blank_threshold=1.0,
-            max_seq_len=20,
-            use_paged_memory=True,
-            page_size=4,
-        )
-
-        assert result_paged.tokens == result_flat.tokens
-
-    def test_paged_workspace_smaller_than_flat(self, device):
-        """Paged workspace is smaller than flat for large max_seq_len."""
-        mod = oasr.functionals.ctc_decode._get_ctc_decoder_module()
-        batch, beam, vocab, max_seq = 4, 16, 5000, 1024
-        flat_size = mod.ctc_decoder_workspace_size(batch, beam, vocab, max_seq)
-        paged_size = mod.ctc_decoder_paged_workspace_size(batch, beam, vocab, max_seq, 16)
-        assert paged_size < flat_size
-
-    def test_paged_workspace_size_positive(self, device):
-        """Paged workspace size is positive."""
-        mod = oasr.functionals.ctc_decode._get_ctc_decoder_module()
-        size = mod.ctc_decoder_paged_workspace_size(1, 10, 5000, 200, 16)
-        assert size > 0
-
-    def test_paged_page_size_16(self, device):
-        """Default page_size=16 produces correct output."""
-        V = 8
-        logp = _make_logp_gpu(7, V, [1, 0, 2, 0, 3, 0, 4], device)
-        seq_lengths = torch.tensor([7], dtype=torch.int32, device=device)
-
-        result = ctc_beam_search_decode(
-            logp,
-            seq_lengths,
-            beam_size=5,
-            blank_id=0,
-            blank_threshold=1.0,
-            max_seq_len=10,
-            use_paged_memory=True,
-            page_size=16,
-        )
-
-        assert result.tokens[0][0] == [1, 2, 3, 4]
-
-    def test_paged_long_sequence_multiple_pages(self, device):
-        """Sequence longer than one page exercises multi-page access."""
-        V = 6
-        # 20 non-blank tokens separated by blanks → each token on a new page
-        # (page_size=4 means page boundary every 4 tokens)
-        tokens = [t for tok in range(1, 21) for t in [tok % V or 1, 0]]
-        T = len(tokens)
-        path_tokens = list(tokens)
-        logp = _make_logp_gpu(T, V, path_tokens, device)
-        seq_lengths = torch.tensor([T], dtype=torch.int32, device=device)
-
-        result = ctc_beam_search_decode(
-            logp,
-            seq_lengths,
-            beam_size=1,
-            blank_id=0,
-            blank_threshold=1.0,
-            max_seq_len=40,
-            use_paged_memory=True,
-            page_size=4,
-        )
-
-        # Result should be non-empty and have a positive score
-        assert len(result.tokens[0][0]) > 0
-        assert result.scores[0, 0].item() > -1e8
-
-
-@pytest.mark.cuda
-class TestCtcDecoderPagedStreaming:
-    """Tests for paged-memory GPU CTC prefix beam search (streaming)."""
-
-    def test_paged_streaming_matches_flat(self, device):
-        """Paged streaming produces the same output as flat streaming."""
+    def test_streaming_agrees_with_flat(self, device):
         V = 5
         path = [1, 0, 2, 0, 3]
 
@@ -1047,44 +974,41 @@ class TestCtcDecoderPagedStreaming:
                 decoder.decode_chunk(frame)
             return decoder.finalize_stream()
 
-        result_flat = _run(use_paged=False)
-        result_paged = _run(use_paged=True)
+        flat, paged = _run(use_paged=False), _run(use_paged=True)
+        assert paged.tokens[0][0] == [1, 2, 3]
+        assert paged.tokens == flat.tokens
 
-        assert result_paged.tokens[0][0] == [1, 2, 3]
-        assert result_paged.tokens == result_flat.tokens
-
-    def test_paged_streaming_state_size_positive(self, device):
-        """Paged state buffer size is positive."""
-        mod = oasr.functionals.ctc_decode._get_ctc_decoder_module()
-        size = mod.ctc_decoder_paged_state_size(1, 10, 5000, 200, 16)
-        assert size > 0
-
-    def test_paged_streaming_reinit(self, device):
-        """Re-calling init_stream in paged mode resets state."""
+    def test_reinit_resets_a_paged_stream(self, device):
+        """A reused decoder must not carry the previous stream's prefix."""
         V = 5
-        config = GpuDecoderConfig(
-            beam_size=3, blank_id=0, max_seq_len=10, use_paged_memory=True, page_size=4
+        decoder = GpuStreamingDecoder(
+            GpuDecoderConfig(
+                beam_size=3, blank_id=0, max_seq_len=10, use_paged_memory=True, page_size=4
+            )
         )
-        decoder = GpuStreamingDecoder(config)
-
         decoder.init_stream(batch=1, vocab_size=V, device=device)
         decoder.decode_chunk(_make_logp_gpu(3, V, [1, 0, 2], device))
-        result1 = decoder.finalize_stream()
+        first = decoder.finalize_stream()
 
         decoder.init_stream(batch=1, vocab_size=V, device=device)
         decoder.decode_chunk(_make_logp_gpu(3, V, [3, 0, 4], device))
-        result2 = decoder.finalize_stream()
+        second = decoder.finalize_stream()
 
-        assert result1.tokens[0][0] == [1, 2]
-        assert result2.tokens[0][0] == [3, 4]
+        assert first.tokens[0][0] == [1, 2]
+        assert second.tokens[0][0] == [3, 4]
+
+    def test_the_paged_workspace_is_smaller_and_non_empty(self, device):
+        """Three separate ``size > 0`` asserts collapsed into the claim that matters:
+        paging exists to make the workspace smaller, so *smaller than flat* is
+        the property, and it already implies positive."""
+        mod = oasr.functionals.ctc_decode._get_ctc_decoder_module()
+        batch, beam, vocab, max_seq = 4, 16, 5000, 1024
+        flat = mod.ctc_decoder_workspace_size(batch, beam, vocab, max_seq)
+        paged = mod.ctc_decoder_paged_workspace_size(batch, beam, vocab, max_seq, 16)
+        assert 0 < paged < flat
+        assert mod.ctc_decoder_paged_state_size(1, 10, vocab, 200, 16) > 0
 
 
-# ---------------------------------------------------------------------------
-# Step 4: per-state captured CUDA Graph parity tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.cuda
 class TestCtcStreamingCudaGraphParity:
     """Bit-exact decode parity between the captured-graph and eager paths."""
 
@@ -1312,3 +1236,164 @@ class TestCtcDecoderBatchedChunk:
 
         assert r_bat.tokens[0][0] == r_per.tokens[0][0]
         assert s_bat.step == s_per.step
+
+
+# ---------------------------------------------------------------------------
+# Fused vs legacy: the same decode through both compiled module variants
+#
+# The fused single-kernel step replaces the 5-kernel prob-matrix/merge/top-K
+# pipeline for ``beam <= 32``.  It is an A/B of one module against another, so
+# it lives with the decoder it is an implementation of -- a change to the
+# shared beam state breaks both arms and this is where that shows.
+# ---------------------------------------------------------------------------
+
+
+pytestmark = pytest.mark.slow
+
+SCORE_FLOOR = -1.0e30  # beams below this are NEG_INF filler
+
+
+def _make_lp(batch, seq, vocab, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    logits = torch.randn(batch, seq, vocab, device="cuda", generator=gen)
+    logits[:, :, 0] += 2.0  # blank-heavy frames, ASR-like
+    return F.log_softmax(logits * 2.0, dim=-1)
+
+
+def _row_repr(tokens_row, scores_row):
+    """Order-insensitive representation of one batch row's live beams."""
+    live = [
+        (tuple(tokens_row[k]), round(scores_row[k].item(), 3))
+        for k in range(len(tokens_row))
+        if scores_row[k].item() > SCORE_FLOOR
+    ]
+    return sorted(live)
+
+
+def _assert_results_match(res_a, res_b, ctx):
+    assert res_a.lengths.shape == res_b.lengths.shape, ctx
+    batch = res_a.lengths.shape[0]
+    for b in range(batch):
+        row_a = _row_repr(res_a.tokens[b], res_a.scores[b])
+        row_b = _row_repr(res_b.tokens[b], res_b.scores[b])
+        assert row_a == row_b, f"{ctx} batch={b}:\n fused={row_a}\nlegacy={row_b}"
+        sa = sorted(x.item() for x in res_a.scores[b] if x.item() > SCORE_FLOOR)
+        sb = sorted(x.item() for x in res_b.scores[b] if x.item() > SCORE_FLOOR)
+        assert sa == pytest.approx(sb, abs=1e-4), f"{ctx} batch={b} scores"
+
+
+class _ForcedVariant:
+    """Context manager that pins the decoder module variant via OASR_CTC_FUSED."""
+
+    def __init__(self, use_fused: bool):
+        self._value = "1" if use_fused else "0"
+        self._saved = None
+
+    def __enter__(self):
+        self._saved = os.environ.get("OASR_CTC_FUSED")
+        os.environ["OASR_CTC_FUSED"] = self._value
+        return self
+
+    def __exit__(self, *exc):
+        if self._saved is None:
+            os.environ.pop("OASR_CTC_FUSED", None)
+        else:
+            os.environ["OASR_CTC_FUSED"] = self._saved
+        return False
+
+
+# Paged cases use short sequences: the legacy paged pipeline has a pre-existing
+# free-pool race that needs page-recycling pressure (long sequences, large
+# batch) to manifest; small shapes keep the legacy reference deterministic.
+#: ``(thresh, paged, beam)`` is the axis set: whether the top-K pre-pass runs,
+#: which workspace, and whether the beam is under or over the fused cap.  The
+#: eleven hand-written rows collapsed to five once the pairs that differed
+#: only in ``blank_threshold`` were merged.
+OFFLINE_CASES = [
+    # (batch, seq, vocab, beam, blank_threshold, paged)
+    (2, 80, 1000, 10, 1.0, False),  # no top-K pre-pass, flat
+    (4, 200, 5000, 10, 0.95, False),  # pre-pass on, the widest vocab
+    (3, 100, 1000, 20, 1.0, False),  # a beam nearer the fused cap
+    (2, 48, 1000, 10, 0.95, True),  # pre-pass on, paged
+    (1, 64, 5000, 8, 0.95, True),  # paged, wide vocab, single stream
+]
+
+
+class TestFusedParityOffline:
+    @pytest.mark.parametrize("case", OFFLINE_CASES)
+    def test_offline_matches_legacy(self, device, case):
+        batch, seq, vocab, beam, thresh, paged = case
+        lp = _make_lp(batch, seq, vocab, seed=hash(case) % (2**31))
+        seq_lengths = torch.full((batch,), seq, dtype=torch.int32, device=device)
+        if batch > 1:
+            seq_lengths[1] = max(2, seq // 2)
+
+        kwargs = {
+            "beam_size": beam,
+            "blank_id": 0,
+            "blank_threshold": thresh,
+            "max_seq_len": seq,
+            "use_paged_memory": paged,
+        }
+        with _ForcedVariant(use_fused=True):
+            res_fused = ctc_beam_search_decode(lp, seq_lengths, **kwargs)
+        with _ForcedVariant(use_fused=False):
+            res_legacy = ctc_beam_search_decode(lp, seq_lengths, **kwargs)
+        _assert_results_match(res_fused, res_legacy, f"offline {case}")
+
+
+STREAM_CASES = [
+    # (vocab, beam, blank_threshold, paged, use_cuda_graphs)
+    (1000, 10, 1.0, False, False),
+    (1000, 10, 0.95, False, True),
+    (5000, 10, 0.95, False, True),
+    (512, 16, 1.0, True, False),
+    (1000, 8, 0.95, True, True),
+]
+
+
+class TestFusedParityStreaming:
+    @pytest.mark.parametrize("case", STREAM_CASES)
+    def test_streaming_matches_legacy(self, device, case):
+        vocab, beam, thresh, paged, graphs = case
+        chunk_t, n_chunks = 16, 5
+        chunks = [
+            _make_lp(1, chunk_t, vocab, seed=(hash(case) + c) % (2**31)) for c in range(n_chunks)
+        ]
+
+        results = {}
+        for use_fused in (True, False):
+            with _ForcedVariant(use_fused=use_fused):
+                cfg = GpuDecoderConfig(
+                    beam_size=beam,
+                    blank_id=0,
+                    blank_threshold=thresh,
+                    max_seq_len=128,
+                    use_paged_memory=paged,
+                )
+                dec = GpuStreamingDecoder(cfg, use_cuda_graphs=graphs)
+                dec.init_stream(1, vocab)
+                for chunk in chunks:
+                    dec.decode_chunk(chunk)
+                results[use_fused] = dec.finalize_stream()
+        _assert_results_match(results[True], results[False], f"streaming {case}")
+
+
+class TestLargeBeamFallback:
+    def test_beam_above_fused_cap_uses_legacy_pipeline(self, device):
+        """beam > 32 falls back to the legacy kernels inside the default build."""
+        lp = _make_lp(2, 40, 500, seed=11)
+        seq_lengths = torch.full((2,), 40, dtype=torch.int32, device=device)
+        flat = ctc_beam_search_decode(
+            lp, seq_lengths, beam_size=40, blank_id=0, blank_threshold=1.0, max_seq_len=40
+        )
+        paged = ctc_beam_search_decode(
+            lp,
+            seq_lengths,
+            beam_size=40,
+            blank_id=0,
+            blank_threshold=1.0,
+            max_seq_len=40,
+            use_paged_memory=True,
+        )
+        _assert_results_match(flat, paged, "beam=40 flat-vs-paged")

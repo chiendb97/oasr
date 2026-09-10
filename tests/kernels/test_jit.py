@@ -125,3 +125,57 @@ class TestJitInfrastructure:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# The CuTeDSL stream helper, shared by every compiled CuTeDSL callable
+# ---------------------------------------------------------------------------
+
+
+class TestCuteRuntimeStream:
+    """The shared stream helper (``oasr.jit.cute_runtime``).
+
+    Every compiled CuTeDSL callable needs a ``CUstream``, and the obvious
+    spelling — ``CUstream(torch.cuda.current_stream().cuda_stream)`` — cost 4.1 us
+    per call, which was two thirds of the recurrent step's launch and 15% of an
+    FMHA call.  Correctness is the point here: the handle must identify the
+    *current* stream, including a side stream, or a kernel lands on the wrong one.
+    """
+
+    def test_returns_the_current_stream(self, device):
+        import torch as _t
+
+        from oasr.jit.cute_runtime import current_stream
+
+        default = current_stream()
+        raw = _t._C._cuda_getCurrentRawStream(_t.cuda.current_device())
+        assert int(default) == int(raw)
+
+    def test_tracks_a_stream_switch(self, device):
+        import torch as _t
+
+        from oasr.jit.cute_runtime import current_stream
+
+        outer = int(current_stream())
+        side = _t.cuda.Stream()
+        with _t.cuda.stream(side):
+            inner = int(current_stream())
+        assert inner == side.cuda_stream
+        assert inner != outer, "a side stream must not be served the default handle"
+        assert int(current_stream()) == outer
+
+    def test_handles_are_cached_per_stream(self, device):
+        from oasr.jit.cute_runtime import current_stream
+
+        assert current_stream() is current_stream()
+
+    def test_the_fmha_path_uses_it(self):
+        """The FMHA hot path must go through the same helper, not rebuild it."""
+        import inspect
+
+        from oasr.functionals import attention
+
+        src = inspect.getsource(attention)
+        # The assignment, not the prose: the module documents the old spelling.
+        assert "stream = _CUstream(" not in src, "the 4.1 us spelling is back on the FMHA path"
+        assert src.count("stream = _current_stream()") >= 2

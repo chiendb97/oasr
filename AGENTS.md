@@ -376,7 +376,7 @@ extension cookbook for each axis.
   that is plausible and wrong. `FrameClock.resolve` returns `None` and the request is refused;
   words are cut out of the rendered transcript so each is a literal substring of `text`.
 - **Changing the alignment rule without its oracle.** The pass is C++ only (`csrc/alignment/`)
-  and Python raises rather than falling back. `tests/decoders/test_alignment_cpp.py` states the same rule
+  and Python raises rather than falling back. `tests/decoders/test_alignment.py` states the same rule
   and must agree **exactly**, so a change lands in both — which is also why neither side uses
   `std::isspace` or `sum()`: both differ across implementations and the difference reaches the
   published output. See [`docs/decoding.md`](docs/decoding.md) § Word timings.

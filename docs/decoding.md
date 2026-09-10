@@ -410,7 +410,7 @@ resolves to `None` there so `import oasr` keeps working, and the tests that
 exercise the pass skip.
 
 The rule is still checked against a Python statement of itself, but that oracle
-lives in `tests/decoders/test_alignment_cpp.py`, where nothing at runtime can reach it:
+lives in `tests/decoders/test_alignment.py`, where nothing at runtime can reach it:
 randomised input through both, including the whole Unicode plane for the
 whitespace and space-less classifications, required to agree **exactly**.
 Changing the C++ means changing the oracle in the same commit.

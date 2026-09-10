@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-"""End-to-end tests for the Fbank / Mfcc CUDA-backed modules.
+# Copyright 2024 OASR Authors
+# SPDX-License-Identifier: Apache-2.0
+"""The frontend kernels under ``oasr/functionals/feature.py``, and the layers on them.
 
-Validates against ``torchaudio.compliance.kaldi.{fbank,mfcc}`` for the
-inference profile (``dither=0``, ``snip_edges=True``, ``use_energy=False``).
+Validated against ``torchaudio.compliance.kaldi.{fbank,mfcc}`` for the
+inference profile (``dither=0``, ``snip_edges=True``, ``use_energy=False``),
+which is the only oracle that can catch a frontend-convention bug -- a parity
+test against our own batched path feeds both sides the same convention and so
+cancels it out.
+
+CMVN lives here too: it is the last pointwise step of the same frontend and
+the same ``oasr/functionals/feature.py`` neighbourhood, and as its own
+79-line module it was mostly a duplicate grid.
 """
 
 from __future__ import annotations
@@ -11,10 +20,12 @@ import math
 
 import pytest
 import torch
+from helpers import assert_dest_passing, tol
 
 torchaudio = pytest.importorskip("torchaudio")
 import torchaudio.compliance.kaldi as kaldi  # noqa: E402
 
+import oasr  # noqa: E402
 from oasr.features import FeatureConfig  # noqa: E402
 from oasr.functionals.feature import (  # noqa: E402
     dct_lifter,
@@ -283,3 +294,55 @@ class TestMfcc:
         wav = torch.randn(1, 16000, device="cuda")
         feats, _ = mf(wav)
         assert torch.isfinite(feats).all()
+
+
+# ---------------------------------------------------------------------------
+# CMVN -- the last pointwise step of the frontend
+# ---------------------------------------------------------------------------
+
+
+# Every test in this module allocates directly on ``device="cuda"`` and calls a
+# JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
+# what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
+# instead of a wall of `RuntimeError: No CUDA GPUs are available`.
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+
+
+class TestCMVN:
+    """Tests for oasr.cmvn() functional API."""
+
+    #: ``num_cols`` is the only kernel-relevant axis -- it picks the vector
+    #: width.  40 and 80 are the real ASR feature dims; 256 crosses into the
+    #: wide path.  Batch and sequence are grid parallelism over a broadcast
+    #: elementwise op.
+    @pytest.mark.parametrize("num_cols", [40, 256])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_cmvn_correctness(self, num_cols, dtype):
+        """``(x - mean) * istd``, against the torch expression it fuses."""
+        x = torch.randn(4, 200, num_cols, device="cuda", dtype=dtype)
+        mean = torch.randn(num_cols, device="cuda", dtype=dtype)
+        istd = torch.randn(num_cols, device="cuda", dtype=dtype).abs() + 0.1
+
+        output = oasr.cmvn(x, mean, istd)
+
+        torch.testing.assert_close(output, (x - mean) * istd, **tol(dtype))
+
+    def test_cmvn_destination_passing(self):
+        x = torch.randn(2, 128, 256, device="cuda", dtype=torch.float16)
+        mean = torch.randn(256, device="cuda", dtype=torch.float16)
+        istd = torch.randn(256, device="cuda", dtype=torch.float16).abs() + 0.1
+        assert_dest_passing(
+            oasr.cmvn, x, mean, istd, out=torch.empty_like(x), expected=(x - mean) * istd
+        )
+
+    def test_cmvn_2d_input(self):
+        """Test CMVN with 2D input [m, n]."""
+        m, n = 100, 80
+        x = torch.randn(m, n, device="cuda", dtype=torch.float32)
+        mean = torch.randn(n, device="cuda", dtype=torch.float32)
+        istd = torch.randn(n, device="cuda", dtype=torch.float32).abs() + 0.1
+
+        output = oasr.cmvn(x, mean, istd)
+
+        expected = (x - mean) * istd
+        torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)

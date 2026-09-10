@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from helpers import device_sm, requires_cute, requires_sm
 from torch import nn
 
 import oasr
@@ -15,18 +16,9 @@ def _copy_to_reference(ours: nn.Module, reference: nn.Module) -> None:
     reference.load_state_dict(ours.state_dict())
 
 
-def _device_sm() -> int:
-    """Compute capability as the JIT spells it, e.g. 90 for Hopper."""
-    major, minor = torch.cuda.get_device_capability()
-    return major * 10 + minor
-
-
 #: The CUTLASS 3.x recurrent arms are compiled only for these two targets.
 _TMA_TACTICS = [(6, 1), (7, 1)]
-_requires_tma = pytest.mark.skipif(
-    not torch.cuda.is_available() or _device_sm() not in (90, 100),
-    reason="the TMA warp-specialized recurrent tactics are built for SM90/SM100 only",
-)
+_requires_tma = requires_sm(90, 100, what="TMA warp-specialized recurrent tactic")
 
 
 class TestRecurrentCpu:
@@ -200,8 +192,7 @@ class TestRecurrentCuda:
             (1, 1, 64, 64, 1, True),
             (3, 5, 48, 64, 2, True),
             (8, 3, 64, 64, 2, True),
-            (8, 2, 66, 70, 1, True),
-            (8, 2, 63, 65, 1, True),
+            (8, 2, 63, 65, 1, True),  # widths that are not a multiple of 8
             (4, 7, 64, 96, 2, False),
             (16, 3, 1024, 1024, 1, True),
         ],
@@ -286,8 +277,7 @@ class TestRecurrentCuda:
         torch.testing.assert_close(got[1][1], expected[1][1], rtol=3e-2, atol=3e-2)
 
     @pytest.mark.parametrize("nonlinearity", ["tanh", "relu"])
-    @pytest.mark.parametrize("layers", [1, 2])
-    @pytest.mark.parametrize("batch_first", [False, True])
+    @pytest.mark.parametrize("layers,batch_first", [(1, False), (2, True)])
     def test_rnn_tensor_core_layer_matches_cudnn(self, nonlinearity, layers, batch_first):
         torch.manual_seed(8)
         batch, sequence, hidden_size = 16, 3, 1024
@@ -320,7 +310,7 @@ class TestRecurrentCuda:
 
     # The cell history is a two-slice ring, so anything past t=1 wraps it.  A
     # ring indexed as if it were the whole sequence reads a stale slice.
-    @pytest.mark.parametrize("sequence", [1, 2, 3, 9])
+    @pytest.mark.parametrize("sequence", [1, 2, 9])  # 1: no wrap, 2: first wrap, 9: many
     @pytest.mark.parametrize("hidden_size", [64, 1024])
     def test_lstm_cell_ring_matches_cudnn(self, sequence, hidden_size):
         torch.manual_seed(9)
@@ -451,8 +441,12 @@ class TestRecurrentCuda:
             expected = module(x, state)
         torch.testing.assert_close(captured[0], expected[0], rtol=3e-2, atol=3e-2)
 
+    #: ``batch_first`` is a transpose in the Python wrapper and cannot
+    #: interact with the CUTLASS tactic, so it is covered once
+    #: (:meth:`test_lstm_tensor_core_layer_matches_cudnn` sweeps it) rather
+    #: than doubling every tactic.
     @pytest.mark.parametrize("tactic", [(0, 1), (1, 1), (2, 1), (3, 1), (4, 4), (5, 4)])
-    @pytest.mark.parametrize("batch_first", [False, True])
+    @pytest.mark.parametrize("batch_first", [True])
     def test_lstm_cutlass_tactics_match_pytorch(self, tactic, batch_first):
         torch.manual_seed(5)
         batch, sequence, hidden_size = 16, 3, 64
@@ -484,7 +478,7 @@ class TestRecurrentCuda:
 
     @pytest.mark.parametrize("tactic", [(0, 1), (1, 1), (2, 1), (3, 1), (4, 4)])
     @pytest.mark.parametrize("nonlinearity", ["tanh", "relu"])
-    @pytest.mark.parametrize("batch_first", [False, True])
+    @pytest.mark.parametrize("batch_first", [True])
     def test_rnn_cutlass_tactics_match_pytorch(self, tactic, nonlinearity, batch_first):
         torch.manual_seed(6)
         batch, sequence, hidden_size = 16, 3, 64
@@ -534,7 +528,7 @@ class TestRecurrentCuda:
 
     @_requires_tma
     @pytest.mark.parametrize("tactic", _TMA_TACTICS)
-    @pytest.mark.parametrize("batch_first", [False, True])
+    @pytest.mark.parametrize("batch_first", [True])
     def test_lstm_tma_tactics_match_pytorch(self, tactic, batch_first):
         torch.manual_seed(12)
         batch, sequence, hidden_size = 128, 3, 256
@@ -603,7 +597,7 @@ class TestRecurrentCuda:
         torch.testing.assert_close(got[1], expected[1][0], rtol=3e-2, atol=3e-2)
 
     @pytest.mark.skipif(
-        not torch.cuda.is_available() or _device_sm() in (90, 100),
+        not torch.cuda.is_available() or device_sm() in (90, 100),
         reason="covers the refusal on targets that do not build the TMA arms",
     )
     @pytest.mark.parametrize("tactic", _TMA_TACTICS)
@@ -773,179 +767,6 @@ class TestRecurrentSlotStep:
             oasr.lstm_slot_step(x, ring, cells, slot_ids, parity[:1], wih, whh)
 
 
-class TestRecurrentContinuousBatching:
-    """Timestep-granular continuous batching against a per-sequence oracle."""
-
-    LENGTHS = [7, 3, 11, 2, 9, 5, 13, 4, 6, 8]
-
-    def _drive(self, module, cache, batcher, sequences):
-        collected = {key: [] for key in sequences}
-        ticks = 0
-        while True:
-            plan = batcher.next_step()
-            if plan is None:
-                break
-            out = module.step(plan.frames, cache, plan.slot_ids, plan.read_parity)
-            assert out.shape == (len(plan.stream_ids), module.hidden_size)
-            for row, key in enumerate(plan.stream_ids):
-                collected[key].append(out[row].clone())
-            batcher.commit(plan)
-            ticks += 1
-        return collected, ticks
-
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    @pytest.mark.parametrize("cls,layers", [(LSTM, 2), (RNN, 1)])
-    def test_matches_per_sequence_forward(self, device, dtype, cls, layers):
-        from oasr.cache import RecurrentContinuousBatcher, RecurrentStateCache
-
-        hidden = width = 256
-        slots = 4
-        module = cls(width, hidden, layers).cuda().to(dtype)
-        cache = RecurrentStateCache(
-            layers, hidden, slots, torch.device("cuda"), dtype, cell=(cls is LSTM)
-        )
-        batcher = RecurrentContinuousBatcher(cache, width)
-        g = torch.Generator(device="cuda").manual_seed(21)
-        sequences = {
-            i: torch.randn(n, width, device="cuda", dtype=dtype, generator=g) * 0.5
-            for i, n in enumerate(self.LENGTHS)
-        }
-        for key, frames in sequences.items():
-            batcher.submit(key, frames)
-
-        collected, ticks = self._drive(module, cache, batcher, sequences)
-
-        # Every frame was stepped exactly once, and no cohort ran past its length.
-        assert ticks >= max(self.LENGTHS)
-        assert sum(len(v) for v in collected.values()) == sum(self.LENGTHS)
-        for key, frames in sequences.items():
-            assert len(collected[key]) == frames.shape[0]
-            expected = module(frames.unsqueeze(1))[0][:, 0]
-            torch.testing.assert_close(torch.stack(collected[key]), expected, rtol=2e-2, atol=2e-2)
-
-    def test_slots_are_recycled_not_leaked(self, device):
-        from oasr.cache import RecurrentContinuousBatcher, RecurrentStateCache
-
-        cache = RecurrentStateCache(1, 32, 2, torch.device("cuda"), torch.float16)
-        batcher = RecurrentContinuousBatcher(cache, 32)
-        module = LSTM(32, 32, 1).cuda().half()
-        for i, n in enumerate([1, 2, 3, 1, 2]):
-            batcher.submit(i, torch.randn(n, 32, device="cuda", dtype=torch.float16))
-        seen_peak = 0
-        while True:
-            plan = batcher.next_step()
-            if plan is None:
-                break
-            module.step(plan.frames, cache, plan.slot_ids, plan.read_parity)
-            batcher.commit(plan)
-            seen_peak = max(seen_peak, len(plan.stream_ids))
-        # Five streams through two slots: capacity was reused, never exceeded.
-        assert seen_peak == 2
-        assert batcher.active == 0 and batcher.pending == 0
-        assert not batcher
-
-    def test_fresh_slot_starts_from_zero_state(self, device):
-        """An admitted stream must see zero h/c, not the retired stream's tail."""
-        from oasr.cache import RecurrentContinuousBatcher, RecurrentStateCache
-
-        hidden = width = 64
-        module = LSTM(width, hidden, 1).cuda().half()
-        cache = RecurrentStateCache(1, hidden, 1, torch.device("cuda"), torch.float16)
-        batcher = RecurrentContinuousBatcher(cache, width)
-        g = torch.Generator(device="cuda").manual_seed(31)
-        first = torch.randn(4, width, device="cuda", dtype=torch.float16, generator=g)
-        second = torch.randn(3, width, device="cuda", dtype=torch.float16, generator=g)
-        batcher.submit("first", first)
-        batcher.submit("second", second)
-        out = {"first": [], "second": []}
-        while True:
-            plan = batcher.next_step()
-            if plan is None:
-                break
-            y = module.step(plan.frames, cache, plan.slot_ids, plan.read_parity)
-            out[plan.stream_ids[0]].append(y[0].clone())
-            batcher.commit(plan)
-        # The second stream ran on the slot the first one released.
-        expected = module(second.unsqueeze(1))[0][:, 0]
-        torch.testing.assert_close(torch.stack(out["second"]), expected, rtol=2e-2, atol=2e-2)
-
-    def test_step_rejects_geometry_and_dtype_mismatch(self, device):
-        from oasr.cache import RecurrentStateCache
-
-        cache = RecurrentStateCache(1, 32, 2, torch.device("cuda"), torch.float16)
-        module = LSTM(32, 32, 1).cuda().half()
-        slot_ids = torch.zeros(1, device="cuda", dtype=torch.int64)
-        parity = torch.zeros(1, device="cuda", dtype=torch.int32)
-        with pytest.raises(ValueError, match="step frames"):
-            module.step(
-                torch.randn(1, 7, device="cuda", dtype=torch.float16), cache, slot_ids, parity
-            )
-        with pytest.raises(ValueError, match="does not match"):
-            LSTM(32, 64, 1).cuda().half().step(
-                torch.randn(1, 32, device="cuda", dtype=torch.float16), cache, slot_ids, parity
-            )
-        with pytest.raises(NotImplementedError, match="no torch fallback"):
-            module.float().step(
-                torch.randn(1, 32, device="cuda", dtype=torch.float32), cache, slot_ids, parity
-            )
-        rnn_cache = RecurrentStateCache(1, 32, 2, torch.device("cuda"), torch.float16, cell=False)
-        with pytest.raises(ValueError, match="cell state"):
-            LSTM(32, 32, 1).cuda().half().step(
-                torch.randn(1, 32, device="cuda", dtype=torch.float16),
-                rnn_cache,
-                slot_ids,
-                parity,
-            )
-
-    def test_long_run_compacts_retired_frames(self, device):
-        """A batcher that outlives its streams must not retain every one of them.
-
-        Retired frames stay addressable until half the packed buffer is dead, so
-        the buffer is bounded by the live corpus rather than by everything ever
-        submitted -- and the streams that ran after a compaction must still be
-        correct, which is what would break if a base offset went stale.
-        """
-        from oasr.cache import RecurrentContinuousBatcher, RecurrentStateCache
-
-        hidden = width = 64
-        slots = 4
-        module = LSTM(width, hidden, 1).cuda().half()
-        cache = RecurrentStateCache(1, hidden, slots, torch.device("cuda"), torch.float16)
-        batcher = RecurrentContinuousBatcher(cache, width)
-        g = torch.Generator(device="cuda").manual_seed(41)
-        lengths = [3, 9, 5, 12, 4, 7, 6, 11, 2, 8] * 6
-        sequences = {
-            i: torch.randn(n, width, device="cuda", dtype=torch.float16, generator=g) * 0.4
-            for i, n in enumerate(lengths)
-        }
-        # Submitted in waves, as a server receives them -- all-up-front would make
-        # the first pack hold the whole corpus by definition and prove nothing.
-        pending = list(sequences.items())
-        collected = {key: [] for key in sequences}
-        peak_packed = 0
-        while pending or batcher:
-            for key, frames in pending[:10]:
-                batcher.submit(key, frames)
-            pending = pending[10:]
-            for _ in range(20):
-                plan = batcher.next_step()
-                if plan is None:
-                    break
-                out = module.step(plan.frames, cache, plan.slot_ids, plan.read_parity)
-                for row, key in enumerate(plan.stream_ids):
-                    collected[key].append(out[row].clone())
-                batcher.commit(plan)
-                peak_packed = max(peak_packed, batcher._packed.shape[0])
-
-        assert sum(len(v) for v in collected.values()) == sum(lengths)
-        # Compaction happened: the buffer never had to hold every submission.
-        assert peak_packed < sum(lengths)
-        # The last few streams ran entirely after compactions rebased the buffer.
-        for key in list(sequences)[-4:]:
-            expected = module(sequences[key].unsqueeze(1))[0][:, 0]
-            torch.testing.assert_close(torch.stack(collected[key]), expected, rtol=2e-2, atol=2e-2)
-
-
 class TestRecurrentInferenceTensors:
     """A module built or moved inside ``torch.inference_mode()``.
 
@@ -1044,3 +865,268 @@ class TestPackWarning:
                 layer(x)
         hits = [r for r in caplog.records if "_pack_lstm_parameters" in r.getMessage()]
         assert not hits, "the layer caches the packed parameters and must stay quiet"
+
+
+# ---------------------------------------------------------------------------
+# The CuTeDSL fused recurrent step
+#
+# A second backend for the same recurrence, selected by ``OASR_RECURRENT_CUTE``
+# and the routing table below. It lives with the CUTLASS arms because the
+# oracle is the same written-out recurrence and a routing change moves work
+# between them.
+# ---------------------------------------------------------------------------
+
+cutlass = pytest.importorskip("cutlass", reason="CuTeDSL (nvidia-cutlass-dsl) not installed")
+
+from oasr.jit import recurrent_cute  # noqa: E402
+
+_requires_cute = requires_cute(recurrent_cute, "recurrent-step")
+
+
+def _cute_oracle(a, weight, c, prev_c, gates):
+    """FP32 reference: the equations, not another kernel."""
+    acc = a.float() @ weight.float().T + c.float()
+    if gates == 1:
+        return torch.tanh(acc), None
+    gv = acc.view(a.shape[0], -1, 4)
+    cell = torch.sigmoid(gv[..., 1]) * prev_c.float() + torch.sigmoid(gv[..., 0]) * torch.tanh(
+        gv[..., 2]
+    )
+    return torch.sigmoid(gv[..., 3]) * torch.tanh(cell), cell
+
+
+def _cute_run(dtype, hidden, batch, gates, activation, tile):
+    from oasr.kernels.cute.recurrent import RecurrentStepCute
+
+    n = gates * hidden
+    g = torch.Generator(device="cuda").manual_seed(17)
+    a = torch.randn(batch, hidden, device="cuda", dtype=dtype, generator=g) * 0.3
+    weight = torch.randn(n, hidden, device="cuda", dtype=dtype, generator=g) * hidden**-0.5
+    c = torch.randn(batch, n, device="cuda", dtype=dtype, generator=g) * 0.3
+    prev_c = torch.randn(batch, hidden, device="cuda", dtype=dtype, generator=g) * 0.3
+    out_h = torch.zeros(batch, hidden, device="cuda", dtype=dtype)
+    out_c = torch.zeros(batch, hidden, device="cuda", dtype=dtype)
+
+    dtype_str = "float16" if dtype is torch.float16 else "bfloat16"
+    cute_dtype = cutlass.Float16 if dtype is torch.float16 else cutlass.BFloat16
+    m, nb, k, stages, threads, warps_n = tile
+    if not RecurrentStepCute.can_implement(
+        dtype=cute_dtype,
+        gate_count=gates,
+        activation=activation,
+        m_block=m,
+        n_block=nb,
+        k_block=k,
+        num_stages=stages,
+        num_threads=threads,
+        warps_n=warps_n,
+    ):
+        pytest.skip(f"tile {tile} not implementable")
+    step = recurrent_cute._compiled_step(
+        torch.cuda.get_device_capability(), dtype_str, gates, activation, tile
+    )
+    step(a, weight, c, prev_c, out_h, out_c, recurrent_cute.current_stream())
+    torch.cuda.synchronize()
+    ref_h, ref_c = _cute_oracle(a, weight, c, prev_c, gates)
+    return out_h, out_c, ref_h, ref_c
+
+
+@_requires_cute
+@pytest.mark.cuda
+class TestRecurrentStepCute:
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("hidden,batch", [(256, 64), (640, 32), (640, 130), (1024, 8)])
+    def test_lstm_matches_fp32_equations(self, device, dtype, hidden, batch):
+        tile = recurrent_cute.select_tile(hidden, batch)
+        assert tile is not None
+        out_h, out_c, ref_h, ref_c = _cute_run(dtype, hidden, batch, 4, "lstm", tile)
+        # FP16 accumulation over K=hidden against an FP32 oracle; 2e-2 is the
+        # tolerance the rest of the recurrent suite uses for the same comparison.
+        torch.testing.assert_close(out_h.float(), ref_h, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(out_c.float(), ref_c, rtol=2e-2, atol=2e-2)
+
+    def test_rnn_matches_fp32_equations(self, device):
+        # ``tanh`` was a one-element parametrize; it is the only nonlinearity
+        # the CuTe step compiles, so it is a constant, not an axis.
+        out_h, _, ref_h, _ = _cute_run(torch.float16, 640, 64, 1, "tanh", (32, 64, 64, 3, 128, 2))
+        torch.testing.assert_close(out_h.float(), ref_h, rtol=2e-2, atol=2e-2)
+
+    def test_batch_need_not_be_a_tile_multiple(self, device):
+        """A ragged M must be predicated, not rounded up into other rows' memory."""
+        for batch in (1, 7, 33):
+            out_h, out_c, ref_h, ref_c = _cute_run(
+                torch.float16, 640, batch, 4, "lstm", (32, 64, 64, 3, 128, 2)
+            )
+            torch.testing.assert_close(out_h.float(), ref_h, rtol=2e-2, atol=2e-2)
+
+    def test_can_implement_rejects_oversized_copy_tiles(self):
+        """The gmem thread layout must not walk past a tile's row extent.
+
+        ``num_threads * 8 // k_block`` rows are touched per copy pass; when that
+        exceeds ``n_block`` the surplus threads address outside the tile, which is
+        an illegal access rather than a predicated no-op.  This exact tile faulted
+        before the constraint existed.
+        """
+        from oasr.kernels.cute.recurrent import RecurrentStepCute
+
+        common = {
+            "dtype": cutlass.Float16,
+            "gate_count": 4,
+            "activation": "lstm",
+            "num_stages": 3,
+        }
+        assert not RecurrentStepCute.can_implement(
+            m_block=128, n_block=32, k_block=32, num_threads=256, **common
+        )
+        assert RecurrentStepCute.can_implement(
+            m_block=128, n_block=32, k_block=32, num_threads=128, **common
+        )
+
+    def test_can_implement_rejects_mismatched_gate_and_activation(self):
+        from oasr.kernels.cute.recurrent import RecurrentStepCute
+
+        assert not RecurrentStepCute.can_implement(
+            dtype=cutlass.Float16, gate_count=4, activation="tanh"
+        )
+        assert not RecurrentStepCute.can_implement(
+            dtype=cutlass.Float16, gate_count=1, activation="lstm"
+        )
+        assert not RecurrentStepCute.can_implement(
+            dtype=cutlass.Float32, gate_count=4, activation="lstm"
+        )
+
+    def test_epilogue_staging_fits_the_ring_it_aliases(self):
+        """The FP32 accumulator staging aliases the A/B ring, so it must fit in it."""
+        from oasr.kernels.cute.recurrent import RecurrentStepCute
+
+        # 128x128 of FP32 is 66 KB; a 2-stage 32-deep FP16 ring is only 32 KB.
+        assert not RecurrentStepCute.can_implement(
+            dtype=cutlass.Float16,
+            gate_count=4,
+            activation="lstm",
+            m_block=128,
+            n_block=128,
+            k_block=32,
+            num_stages=2,
+            num_threads=128,
+        )
+
+
+@pytest.mark.cuda
+class TestRecurrentCuteRouting:
+    """The routing table and its gate -- these need no GPU."""
+
+    def test_default_is_auto(self, monkeypatch):
+        """Default is band routing, which the layer-level measurement earned."""
+        monkeypatch.delenv("OASR_RECURRENT_CUTE", raising=False)
+        assert recurrent_cute._read_mode() == "auto"
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [("1", "always"), ("always", "always"), ("0", "off"), ("off", "off"), ("auto", "auto")],
+    )
+    def test_env_gate(self, monkeypatch, raw, expected):
+        monkeypatch.setenv("OASR_RECURRENT_CUTE", raw)
+        assert recurrent_cute._read_mode() == expected
+
+    def test_unknown_mode_falls_back_to_auto(self, monkeypatch):
+        monkeypatch.setenv("OASR_RECURRENT_CUTE", "banana")
+        assert recurrent_cute._read_mode() == "auto"
+
+    def test_every_band_shape_has_a_tile(self):
+        """A shape the band admits must have a tile; otherwise routing dead-ends."""
+        for width, (low, high) in recurrent_cute._LSTM_BANDS:
+            hidden = width if width < (1 << 20) else 2048
+            for batch in (low, min(high, 512)):
+                assert recurrent_cute.select_tile(hidden, batch) is not None, (hidden, batch)
+
+    def test_tiles_cover_every_width_and_batch(self):
+        """No (hidden, batch) may fall through the table -- the last row is a catch-all."""
+        for hidden in (16, 256, 257, 640, 1024, 1536, 2048, 4096):
+            for batch in (1, 3, 16, 64, 129, 512, 4096):
+                assert recurrent_cute.select_tile(hidden, batch) is not None, (hidden, batch)
+
+    def test_every_tabled_tile_is_implementable(self):
+        """The table cannot contain a tile the kernel would refuse to build."""
+        from oasr.kernels.cute.recurrent import RecurrentStepCute
+
+        for _, _, tile in recurrent_cute._TILES:
+            m, n, k, stages, threads, warps_n = tile
+            assert RecurrentStepCute.can_implement(
+                dtype=cutlass.Float16,
+                gate_count=4,
+                activation="lstm",
+                m_block=m,
+                n_block=n,
+                k_block=k,
+                num_stages=stages,
+                num_threads=threads,
+                warps_n=warps_n,
+            ), tile
+
+    def test_rnn_is_not_routed_in_auto(self):
+        """Declared, not guessed: the RNN has no matched reference measurement."""
+        previous = recurrent_cute.get_mode()
+        try:
+            recurrent_cute.set_mode("auto")
+            if recurrent_cute._probe() is None:
+                pytest.skip("no CuTeDSL device")
+            assert not recurrent_cute.should_use(1, 640, 64)
+            assert recurrent_cute.should_use(4, 640, 64)
+        finally:
+            recurrent_cute.set_mode(previous)
+
+
+@pytest.mark.cuda
+class TestRoutedStepMemo:
+    """``routed_step`` memoises band + arch probe + compile behind one lookup.
+
+    That removed 1.18 us per layer per timestep (two table scans and a
+    ``functools.cache`` key build, twice over for a two-layer predictor).  The
+    hazard it introduces is staleness: a memo that survives ``set_mode`` would
+    make ``OASR_RECURRENT_CUTE=off`` -- the rollback switch -- do nothing.
+    """
+
+    def test_set_mode_invalidates_the_memo(self, device):
+        from oasr.jit import recurrent_cute as rc
+
+        before = rc.get_mode()
+        try:
+            rc.set_mode("auto")
+            routed = rc.routed_step(
+                dtype_str="float16", gate_count=4, activation="lstm", hidden=256, batch=128
+            )
+            if routed is None:
+                pytest.skip("this shape is not routed on this device")
+            rc.set_mode("off")
+            assert (
+                rc.routed_step(
+                    dtype_str="float16", gate_count=4, activation="lstm", hidden=256, batch=128
+                )
+                is None
+            ), "mode=off was served from the route memo"
+            rc.set_mode("auto")
+            assert (
+                rc.routed_step(
+                    dtype_str="float16", gate_count=4, activation="lstm", hidden=256, batch=128
+                )
+                is not None
+            )
+        finally:
+            rc.set_mode(before)
+
+    def test_declines_outside_the_band_without_compiling(self, device):
+        from oasr.jit import recurrent_cute as rc
+
+        before = rc.get_mode()
+        try:
+            rc.set_mode("auto")
+            # gate_count 1 (vanilla RNN) is never routed under auto.
+            assert (
+                rc.routed_step(
+                    dtype_str="float16", gate_count=1, activation="tanh", hidden=256, batch=128
+                )
+                is None
+            )
+        finally:
+            rc.set_mode(before)

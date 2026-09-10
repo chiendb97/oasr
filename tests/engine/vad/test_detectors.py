@@ -15,6 +15,7 @@ import math
 import assets
 import pytest
 import torch
+from helpers.audio import SR, hiss, tone
 
 from oasr.vad import (
     ROLES,
@@ -27,24 +28,6 @@ from oasr.vad import (
     list_vad,
     register_vad,
 )
-
-SR = 16000
-
-
-def tone(seconds: float, amp: float = 0.3, freq: float = 220.0) -> torch.Tensor:
-    n = int(SR * seconds)
-    t = torch.arange(n, dtype=torch.float32) / SR
-    env = 0.5 + 0.5 * torch.sin(2 * math.pi * 4 * t)
-    return (
-        amp
-        * env
-        * (torch.sin(2 * math.pi * freq * t) + 0.5 * torch.sin(2 * math.pi * 3 * freq * t))
-    )
-
-
-def hiss(seconds: float, amp: float = 1e-4) -> torch.Tensor:
-    g = torch.Generator().manual_seed(7)
-    return amp * torch.randn(int(SR * seconds), generator=g)
 
 
 class TestRegistry:

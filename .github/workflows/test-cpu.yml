@@ -66,10 +66,17 @@ jobs:
 
       # Coverage floor catches silent import or guard failures. Extension-only
       # alignment tests are intentionally covered by the GPU workflow.
+      #
+      # 600, down from 620, is the same *margin* rather than a new measurement:
+      # the 2026-09-10 suite consolidation took the CPU-only pass count from
+      # 1248 to 1213 locally (-2.8 %), so the floor moves by the same fraction.
+      # A floor set from a green CI run would be tighter, but it would also be
+      # a number nobody could re-derive; scale it again the next time the
+      # suite's size changes deliberately, and never to make a red run green.
       - name: pytest
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m pytest tests/ \
             -m "not slow and not concurrent" \
-            -q -rs -rE --tb=short --min-passed 620
+            -q -rs -rE --tb=short --min-passed 600

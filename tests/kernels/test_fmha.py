@@ -22,6 +22,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from oasr.cache import PagedKVCache
+
+# ``fmha`` is also the name of this module's fixture, so the dense function
+# is imported under an alias for the packed reference below.
+from oasr.functionals.attention import fmha as _dense_fmha, fmha_varlen
+from oasr.layers.attention.attention import RelPositionMultiHeadedAttention
+
 # ---------------------------------------------------------------------------
 # Reference: a clean SDPA path that mirrors oasr.fmha_forward's contract.
 # Used to compare both backends against a single source of truth.
@@ -144,48 +151,17 @@ def test_fmha_offline(fmha, cuda, dtype, shape):
 
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("shape", _SHAPES)
-def test_fmha_with_bias(fmha, cuda, dtype, shape):
-    """Offline + additive bias (rel-pos style)."""
-    B, H, H_kv, T_q, T_k, D = shape
-    torch.manual_seed(1)
-    q = torch.randn(B, H, T_q, D, device=cuda, dtype=dtype)
-    k = torch.randn(B, H_kv, T_k, D, device=cuda, dtype=dtype)
-    v = torch.randn(B, H_kv, T_k, D, device=cuda, dtype=dtype)
-    bias = torch.randn(B, H, T_q, T_k, device=cuda, dtype=dtype) * 0.1
-    scale = 1.0 / math.sqrt(D)
-
-    out = fmha(q, k, v, softmax_scale=scale, attn_bias=bias)
-    ref = _ref_fmha(q, k, v, scale, attn_bias=bias)
-    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("shape", _SHAPES)
-def test_fmha_with_length_mask(fmha, cuda, dtype, shape):
-    """Per-stream length mask via cache_seqlens (heterogeneous)."""
-    B, H, H_kv, T_q, T_k, D = shape
-    torch.manual_seed(2)
-    q = torch.randn(B, H, T_q, D, device=cuda, dtype=dtype)
-    k = torch.randn(B, H_kv, T_k, D, device=cuda, dtype=dtype)
-    v = torch.randn(B, H_kv, T_k, D, device=cuda, dtype=dtype)
-    # Half the streams get a short context (~1/4 of T_k), the rest full T_k.
-    base = max(1, T_k // 4)
-    seqlens = torch.tensor(
-        [base if i < B // 2 else T_k for i in range(B)],
-        dtype=torch.int32,
-        device=cuda,
-    )
-    scale = 1.0 / math.sqrt(D)
-
-    out = fmha(q, k, v, softmax_scale=scale, cache_seqlens=seqlens)
-    ref = _ref_fmha(q, k, v, scale, cache_seqlens=seqlens)
-    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("shape", _SHAPES)
 def test_fmha_bias_and_mask(fmha, cuda, dtype, shape):
-    """Combined bias + length mask (matches RelPosMHA paged-streaming usage)."""
+    """Combined bias + length mask (matches RelPosMHA paged-streaming usage).
+
+    This is the *operand-carrying* sweep, and it subsumes bias-alone and
+    mask-alone shape for shape: both operands are folded into one additive
+    mask before the softmax, so a shape that survives the pair survives either
+    half.  What the pair cannot show is that each operand is honoured *at all*
+    when the other is absent -- a launcher that dropped ``attn_bias`` whenever
+    ``cache_seqlens`` was None would still pass here.  That is one case each,
+    below, not a second and third pass over all nine shapes.
+    """
     B, H, H_kv, T_q, T_k, D = shape
     torch.manual_seed(3)
     q = torch.randn(B, H, T_q, D, device=cuda, dtype=dtype)
@@ -202,6 +178,40 @@ def test_fmha_bias_and_mask(fmha, cuda, dtype, shape):
     out = fmha(q, k, v, softmax_scale=scale, attn_bias=bias, cache_seqlens=seqlens)
     ref = _ref_fmha(q, k, v, scale, attn_bias=bias, cache_seqlens=seqlens)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("operand", ["bias", "length_mask"])
+def test_each_operand_alone_is_honoured(fmha, cuda, operand):
+    """One operand, no other: it must change the answer and match the reference.
+
+    The ``!= plain`` assertion is the point. Parity alone would pass on a
+    launcher that silently ignored the operand *if* the reference ignored it
+    too -- so the test first proves the operand does something.
+    """
+    B, H, H_kv, T_q, T_k, D = 2, 8, 2, 8, 64, 64
+    torch.manual_seed(1)
+    dtype = _DTYPES[0]
+    q = torch.randn(B, H, T_q, D, device=cuda, dtype=dtype)
+    k = torch.randn(B, H_kv, T_k, D, device=cuda, dtype=dtype)
+    v = torch.randn(B, H_kv, T_k, D, device=cuda, dtype=dtype)
+    scale = 1.0 / math.sqrt(D)
+
+    if operand == "bias":
+        kw = {"attn_bias": torch.randn(B, H, T_q, T_k, device=cuda, dtype=dtype) * 0.5}
+    else:
+        # Half the streams get a short context (~1/4 of T_k), the rest full T_k.
+        kw = {
+            "cache_seqlens": torch.tensor(
+                [max(1, T_k // 4) if i < B // 2 else T_k for i in range(B)],
+                dtype=torch.int32,
+                device=cuda,
+            )
+        }
+
+    out = fmha(q, k, v, softmax_scale=scale, **kw)
+    torch.testing.assert_close(out, _ref_fmha(q, k, v, scale, **kw), atol=1e-2, rtol=1e-2)
+    plain = fmha(q, k, v, softmax_scale=scale)
+    assert not torch.allclose(out, plain), f"{operand} was ignored"
 
 
 _PAGED_SHAPES = [
@@ -223,9 +233,19 @@ _PAGED_SHAPES = [
 ]
 
 
+#: ``with_bias=True`` is the superset: it adds the bias-tile load, whose
+#: predication is what once read ~500 elements past a short segment.  So every
+#: geometry is swept with the bias on, and the no-bias branch -- the AR-decode
+#: path -- gets three: an even-tile table, a short one, and a decode step.
+_PAGED_CASES = [(shape, True) for shape in _PAGED_SHAPES] + [
+    (_PAGED_SHAPES[0], False),  # MHA, table divides evenly into K tiles
+    (_PAGED_SHAPES[5], False),  # 3 pages, 4 per tile
+    (_PAGED_SHAPES[6], False),  # a decode step: one query, one page
+]
+
+
 @pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("shape", _PAGED_SHAPES)
-@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("shape,with_bias", _PAGED_CASES)
 def test_fmha_paged_matches_sdpa(fmha, cuda, dtype, shape, with_bias):
     """Paged mode produces the same result as SDPA on gathered K/V."""
     B, H, H_kv, T_q, max_blocks_per_seq, D, block_size = shape
@@ -663,12 +683,18 @@ class TestCausal:
             (20, 64),  # non-square: top-left aligned, same as torch
         ],
     )
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_matches_sdpa(self, T_q, T_k, dtype):
+    def test_matches_sdpa(self, T_q, T_k):
+        """The six geometries are the block-skipping branch table.
+
+        No dtype axis: the skip bound is integer arithmetic over block
+        indices, identical in fp16 and bf16, so a second pass would re-run the
+        same decision at twice the cost.
+        """
         from oasr.functionals.attention import fmha
 
         torch.manual_seed(0)
         B, H, D = 2, 4, 64
+        dtype = torch.float16
         q = torch.randn(B, H, T_q, D, device="cuda", dtype=dtype)
         k = torch.randn(B, H, T_k, D, device="cuda", dtype=dtype)
         v = torch.randn(B, H, T_k, D, device="cuda", dtype=dtype)
@@ -892,3 +918,370 @@ class TestPerRowKeyStart:
             v2[:, :, L:] = fill
             got = fmha(q, k2, v2, softmax_scale=scale, cache_seqlens=ln)
             torch.testing.assert_close(got, base, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# Variable-length (sequence-packed) attention
+#
+# ``fmha_varlen`` packs several segments into one ``(total, H, D)`` tensor and
+# restricts each segment to itself via ``cu_seqlens``.  The reference is the
+# dense ``fmha`` above run per segment, so the two live together: a change to
+# the dense kernel that the packed loader does not follow shows up here.
+# ---------------------------------------------------------------------------
+
+
+#: The packed reference accumulates per segment, so the bound is the same in
+#: both served formats -- it never depended on ``dtype``, which is why the
+#: parameter it used to take was ignored.
+_VARLEN_TOL = {"rtol": 2e-2, "atol": 2e-2}
+
+
+def _varlen_make_packed(seg_lens, H, H_kv, D, dtype, device):
+    """Random packed q/k/v + cu_seqlens for the given segment lengths."""
+    total = sum(seg_lens)
+    q = torch.randn(total, H, D, device=device, dtype=dtype)
+    k = torch.randn(total, H_kv, D, device=device, dtype=dtype)
+    v = torch.randn(total, H_kv, D, device=device, dtype=dtype)
+    cu = torch.zeros(len(seg_lens) + 1, dtype=torch.int32, device=device)
+    cu[1:] = torch.tensor(seg_lens, dtype=torch.int32, device=device).cumsum(0)
+    return q, k, v, cu
+
+
+def _build_packed_bias(q, cu, H, D, dtype, device, scale):
+    """A packed block-diagonal additive bias (random) + bias_offsets."""
+    seg_lens = (cu[1:] - cu[:-1]).tolist()
+    sizes = [H * t * t for t in seg_lens]
+    offsets = torch.zeros(len(seg_lens) + 1, dtype=torch.int64, device=device)
+    offsets[1:] = torch.tensor(sizes, dtype=torch.int64, device=device).cumsum(0)
+    bias = torch.randn(int(offsets[-1]), device=device, dtype=dtype) * 0.1
+    return bias, offsets
+
+
+def _ref_per_segment(q, k, v, cu, scale, bias, offsets, H):
+    """Reference: dense fmha per segment, assembled back into packed output."""
+    cu_l = cu.tolist()
+    bo = offsets.tolist() if offsets is not None else None
+    out = torch.empty_like(q)
+    for s in range(len(cu_l) - 1):
+        a, b = cu_l[s], cu_l[s + 1]
+        qs = q[a:b].transpose(0, 1).unsqueeze(0)
+        ks = k[a:b].transpose(0, 1).unsqueeze(0)
+        vs = v[a:b].transpose(0, 1).unsqueeze(0)
+        bias_s = None
+        if bias is not None:
+            # clone() → a fresh 16-byte-aligned allocation (the dense cute
+            # kernel rejects misaligned bias slices of the packed buffer).
+            bias_s = bias[bo[s] : bo[s + 1]].view(1, H, b - a, b - a).clone()
+        out_s = _dense_fmha(qs, ks, vs, softmax_scale=scale, attn_bias=bias_s)
+        out[a:b] = out_s.squeeze(0).transpose(0, 1)
+    return out
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("seg_lens", [[33], [64, 64], [33, 249, 17], [8] * 12])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_varlen_matches_per_segment_dense(dtype, seg_lens, with_bias, device):
+    if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        pytest.skip("bf16 unsupported")
+    torch.manual_seed(0)
+    H, H_kv, D = 4, 4, 64
+    scale = 1.0 / math.sqrt(D)
+    q, k, v, cu = _varlen_make_packed(seg_lens, H, H_kv, D, dtype, device)
+    bias, offsets = (None, None)
+    if with_bias:
+        bias, offsets = _build_packed_bias(q, cu, H, D, dtype, device, scale)
+
+    out = fmha_varlen(
+        q,
+        k,
+        v,
+        softmax_scale=scale,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=max(seg_lens),
+        max_seqlen_k=max(seg_lens),
+        attn_bias=bias,
+        bias_offsets=offsets,
+    )
+    ref = _ref_per_segment(q, k, v, cu, scale, bias, offsets, H)
+    assert out.shape == q.shape
+    torch.testing.assert_close(out, ref, **_VARLEN_TOL)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("gqa", [(8, 2), (8, 1)])
+def test_varlen_gqa(dtype, gqa, device):
+    torch.manual_seed(1)
+    H, H_kv = gqa
+    D = 64
+    scale = 1.0 / math.sqrt(D)
+    seg_lens = [40, 55, 33]
+    q, k, v, cu = _varlen_make_packed(seg_lens, H, H_kv, D, dtype, device)
+    out = fmha_varlen(
+        q,
+        k,
+        v,
+        softmax_scale=scale,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=max(seg_lens),
+        max_seqlen_k=max(seg_lens),
+    )
+    ref = _ref_per_segment(q, k, v, cu, scale, None, None, H)
+    torch.testing.assert_close(out, ref, **_VARLEN_TOL)
+
+
+@pytest.mark.cuda
+def test_varlen_single_segment_equals_dense(device):
+    dtype = torch.float16
+    torch.manual_seed(2)
+    H, D, T = 4, 64, 50
+    scale = 1.0 / math.sqrt(D)
+    q, k, v, cu = _varlen_make_packed([T], H, H, D, dtype, device)
+    out = fmha_varlen(
+        q,
+        k,
+        v,
+        softmax_scale=scale,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=T,
+        max_seqlen_k=T,
+    )
+    dense = (
+        _dense_fmha(
+            q.transpose(0, 1).unsqueeze(0),
+            k.transpose(0, 1).unsqueeze(0),
+            v.transpose(0, 1).unsqueeze(0),
+            softmax_scale=scale,
+        )
+        .squeeze(0)
+        .transpose(0, 1)
+    )
+    torch.testing.assert_close(out, dense, **_VARLEN_TOL)
+
+
+# ---------------------------------------------------------------------------
+# RelPos multi-head attention -- the layer that calls the kernel
+#
+# ``RelPositionMultiHeadedAttention`` is the only in-tree caller of the paged
+# path, and its reference re-implements the WeNet rel-pos algebra (matrix_bd
+# combined with the padding bias before SDPA).  That algebra is *not* the SDPA
+# reference above: this is a guard against drift in the bias/mask plumbing
+# between the module and the kernel it dispatches to.
+# ---------------------------------------------------------------------------
+
+
+# Tests use n_feat=64, n_head=4 → d_k = 16.
+N_HEAD = 4  # RelPosMHA: n_feat=64, n_head=4 -> d_k=16
+N_FEAT = 64
+D_K = N_FEAT // N_HEAD
+
+
+def _ref_qkv(attn, x):
+    """Replicate the module's fused-QKV projection (head-major (B, H, T, D))."""
+    B, T, _ = x.shape
+    qkv = attn.linear_qkv(x)
+    q, k, v = qkv.split((attn.inner_dim, attn.inner_kv_dim, attn.inner_kv_dim), dim=-1)
+    q = q.view(B, T, attn.h, attn.d_k).transpose(1, 2)
+    k = k.view(B, T, attn.h_kv, attn.d_k).transpose(1, 2)
+    v = v.view(B, T, attn.h_kv, attn.d_k).transpose(1, 2)
+    return q, k, v
+
+
+def _ref_offline(attn, x, mask, pos_emb):
+    """SDPA reference for the offline path."""
+    q, k, v = _ref_qkv(attn, x)
+    n_batch_pos = pos_emb.size(0)
+    p = attn.linear_pos(pos_emb).view(n_batch_pos, -1, attn.h, attn.d_k).transpose(1, 2)
+    q_t = q.transpose(1, 2)
+    q_u = (q_t + attn.pos_bias_u).transpose(1, 2)
+    q_v = (q_t + attn.pos_bias_v).transpose(1, 2)
+    matrix_bd = torch.matmul(q_v, p.transpose(-2, -1))
+    attn_bias = (matrix_bd + mask.unsqueeze(1)) / math.sqrt(attn.d_k)
+    out = F.scaled_dot_product_attention(
+        q_u,
+        k,
+        v,
+        attn_mask=attn_bias,
+        scale=1 / math.sqrt(attn.d_k),
+    )
+    out = out.transpose(1, 2).contiguous().view(x.size(0), -1, attn.h * attn.d_k)
+    return attn.linear_out(out)
+
+
+def _ref_paged(attn, x, pos_emb, cache: PagedKVCache):
+    """SDPA reference for the paged-streaming path.
+
+    Mirrors the new path: write new K/V into a copy of the pool, gather
+    up to ``host_seqlen_max + T_q`` frames, then run SDPA with the
+    ``(matrix_bd + padding_bias) / sqrt(d_k)`` mask.
+    """
+    q, k_new, v_new = _ref_qkv(attn, x)
+
+    cache_local = PagedKVCache(
+        k_cache=cache.k_cache.clone(),
+        v_cache=cache.v_cache.clone(),
+        block_table=cache.block_table,
+        cache_seqlens=cache.cache_seqlens,
+        block_size=cache.block_size,
+        host_seqlen_max=cache.host_seqlen_max,
+    )
+    cache_local.write_kv_chunk(k_new, v_new, offset=cache_local.cache_seqlens)
+    T_kv_max = cache.host_seqlen_max + x.size(1)
+    k_full, v_full = cache_local.gather_full_kv(T_kv_max)
+
+    total_kv_lens = cache.cache_seqlens + x.size(1)
+    arange = torch.arange(T_kv_max, device=cache.cache_seqlens.device)
+    keep = arange.unsqueeze(0) < total_kv_lens.unsqueeze(1)  # (B, T_kv_max)
+    pad_bias = torch.where(keep, 0.0, float("-inf")).to(x.dtype)
+    pad_bias = pad_bias.unsqueeze(1).unsqueeze(1)  # broadcast over (H, T_q)
+
+    n_batch_pos = pos_emb.size(0)
+    p = attn.linear_pos(pos_emb).view(n_batch_pos, -1, attn.h, attn.d_k).transpose(1, 2)
+    q_t = q.transpose(1, 2)
+    q_u = (q_t + attn.pos_bias_u).transpose(1, 2)
+    q_v = (q_t + attn.pos_bias_v).transpose(1, 2)
+    matrix_bd = torch.matmul(q_v, p.transpose(-2, -1))
+    attn_bias = (matrix_bd + pad_bias) / math.sqrt(attn.d_k)
+    out = F.scaled_dot_product_attention(
+        q_u,
+        k_full,
+        v_full,
+        attn_mask=attn_bias,
+        scale=1 / math.sqrt(attn.d_k),
+    )
+    out = out.transpose(1, 2).contiguous().view(x.size(0), -1, attn.h * attn.d_k)
+    return attn.linear_out(out)
+
+
+@pytest.fixture
+def attn(device):
+    torch.manual_seed(0)
+    return RelPositionMultiHeadedAttention(N_HEAD, N_FEAT).to(device).eval()
+
+
+@pytest.mark.parametrize("B,T", [(1, 8), (2, 6), (4, 12)])
+def test_offline_path_matches_sdpa(attn, device, B, T):
+    """Offline (cache=None) FlexAttention path matches SDPA reference."""
+    x = torch.randn(B, T, N_FEAT, device=device)
+    pos_emb = torch.randn(B, T, N_FEAT, device=device)
+    mask = torch.zeros(B, 1, T, device=device)
+
+    with torch.no_grad():
+        out_new, cache = attn(x, mask, pos_emb, cache=None)
+        out_ref = _ref_offline(attn, x, mask, pos_emb)
+
+    assert cache is None
+    torch.testing.assert_close(out_new, out_ref, rtol=1e-4, atol=1e-4)
+
+
+def test_paged_path_matches_sdpa(attn, device):
+    """Paged streaming (cache=PagedKVCache) — heterogeneous per-stream lengths.
+
+    Two streams with different ``cache_seqlens`` (10 and 5) sharing one
+    physical block pool. Verifies the per-stream length-mask + rel-pos
+    bias path against the SDPA reference.
+    """
+    torch.manual_seed(1)
+    B = 2
+    T_q = 4
+    max_blocks, block_size = 16, 8
+
+    k_pool = torch.zeros(max_blocks, block_size, N_HEAD, D_K, device=device)
+    v_pool = torch.zeros(max_blocks, block_size, N_HEAD, D_K, device=device)
+
+    block_table = torch.tensor(
+        [[0, 1, 2, 5, 6, 7], [3, 4, 8, 9, 10, 11]],
+        dtype=torch.int32,
+        device=device,
+    )
+    cache_seqlens = torch.tensor([10, 5], dtype=torch.int32, device=device)
+
+    # Pre-fill stream 0's first 10 frames and stream 1's first 5 frames.
+    seed_k0 = torch.randn(10, N_HEAD, D_K, device=device)
+    seed_v0 = torch.randn(10, N_HEAD, D_K, device=device)
+    for t in range(10):
+        phys = int(block_table[0, t // block_size].item())
+        k_pool[phys, t % block_size] = seed_k0[t]
+        v_pool[phys, t % block_size] = seed_v0[t]
+    seed_k1 = torch.randn(5, N_HEAD, D_K, device=device)
+    seed_v1 = torch.randn(5, N_HEAD, D_K, device=device)
+    for t in range(5):
+        phys = int(block_table[1, 0].item())
+        k_pool[phys, t] = seed_k1[t]
+        v_pool[phys, t] = seed_v1[t]
+
+    x = torch.randn(B, T_q, N_FEAT, device=device)
+    T_kv_max = 10 + T_q
+    pos_emb = torch.randn(1, T_kv_max, N_FEAT, device=device)
+
+    cache = PagedKVCache(
+        k_cache=k_pool,
+        v_cache=v_pool,
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
+        block_size=block_size,
+        host_seqlen_max=10,
+    )
+
+    k_pool_save = k_pool.clone()
+    v_pool_save = v_pool.clone()
+
+    with torch.no_grad():
+        cache.k_cache.copy_(k_pool_save)
+        cache.v_cache.copy_(v_pool_save)
+        out_new, _ = attn(x, torch.zeros((0, 0, 0), device=device), pos_emb, cache=cache)
+        cache.k_cache.copy_(k_pool_save)
+        cache.v_cache.copy_(v_pool_save)
+        out_ref = _ref_paged(attn, x, pos_emb, cache)
+
+    torch.testing.assert_close(out_new, out_ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.cuda
+def test_a_paged_config_the_kernel_refuses_still_answers():
+    """A declared gap has to *serve* the shape, not raise on it.
+
+    The paged loader skips per-element head-dim predication, so the arch class
+    refuses a head_dim off its 32-element MMA stride.  ``oasr.functionals.attention.fmha``
+    raises there — the right contract for a caller naming the kernel by name —
+    which leaves the waist to gather the pages and answer on SDPA, counting the
+    gap so the coverage debt stays visible.  A shipped decoder's head_dim is 64
+    or 128, so this is the tiny-config path; it is also the only thing standing
+    between such a config and a hard failure.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from oasr.layers import Attention
+    from oasr.layers._backend import gap_hits, reset_backend_stats
+
+    torch.manual_seed(0)
+    heads, head_dim, block_size, blocks = 2, 16, 16, 4
+    B, T_q = 2, 1
+    k_pool = torch.randn(blocks, block_size, heads, head_dim, device="cuda", dtype=torch.float16)
+    v_pool = torch.randn(blocks, block_size, heads, head_dim, device="cuda", dtype=torch.float16)
+    table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device="cuda")
+    lens = torch.tensor([20, 9], dtype=torch.int32, device="cuda")
+    q = torch.randn(B, heads, T_q, head_dim, device="cuda", dtype=torch.float16)
+
+    attn = Attention(heads, head_dim)
+    reset_backend_stats()
+    with torch.no_grad():
+        out = attn(q, k_pool, v_pool, kv_lens=lens, block_table=table)
+    assert gap_hits().get("fmha-paged-config"), "the gap was not counted"
+
+    # Reference: gather the addressed pages and mask by length.
+    dense = k_pool[table.long()].reshape(B, -1, heads, head_dim).permute(0, 2, 1, 3)
+    dense_v = v_pool[table.long()].reshape(B, -1, heads, head_dim).permute(0, 2, 1, 3)
+    keep = torch.arange(dense.size(2), device="cuda").unsqueeze(0) < lens.unsqueeze(1)
+    ref = F.scaled_dot_product_attention(
+        q.float(),
+        dense.float(),
+        dense_v.float(),
+        attn_mask=keep.view(B, 1, 1, -1),
+        scale=head_dim**-0.5,
+    )
+    torch.testing.assert_close(out.float(), ref, rtol=2e-3, atol=2e-3)

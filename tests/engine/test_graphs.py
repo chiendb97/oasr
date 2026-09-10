@@ -1,29 +1,51 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the offline-forward CUDA-Graph cache (``oasr/engine/offline_graph.py``).
+"""CUDA-graph capture across the engine: four caches, one failure mode.
 
-The shape/bucketing half runs anywhere.  The capture half needs CUDA and pins the
-three properties that make the cache safe to leave on by default:
+``oasr/engine/{offline_graph,graph_cache,predictor_graph,capture_recovery}.py``
+each capture a different forward, and they share what makes capture hazardous:
+it is *best-effort*, so a forward that reads a device value host-side
+invalidates the capture stream and the cache answers by falling back to eager.
+The swallowed failure is the bug -- an aborted ``torch.cuda.graph`` capture
+strands every later allocation in the process and breaks CUDA RNG, so "the
+transcript is still fine" is not evidence that the recovery worked.
 
-* a replay is **bit-exact** against running the same padded input eagerly;
-* a shape that falls back to eager decodes **identically** to one that is
-  graph-served, which is what :meth:`GraphedOfflineForward.pad_time` is for;
-* a capture that fails is remembered and **never retried**.
+They were four files because they were four commits. They are one file
+because ``_SyncingEncoder`` -- the deliberate capture-breaker -- was copied
+verbatim into two of them, three of them declared their own alias for the same
+CUDA marker, and a change to the recovery path touches all four.
+
+The shape/bucketing arithmetic runs anywhere; everything that captures is
+gated by the module-level ``cuda`` marker.
 """
 
 from __future__ import annotations
 
+import gc
+
 import pytest
 import torch
 
+from oasr.engine.capture_recovery import (
+    recover_from_failed_capture,
+    restore_rng_after_failed_capture,
+)
+from oasr.engine.graph_cache import (
+    CACHE_BUCKET_KNEE,
+    cache_bucket_ladder,
+    pick_cache_bucket,
+    round_up_bucket,
+)
 from oasr.engine.offline_graph import (
-    DEFAULT_FRAME_GRANULARITY,
     FUSED,
     GraphedOfflineForward,
     resolve_batch_buckets,
 )
+from oasr.engine.predictor_graph import PredictorStepGraphCache as Cache
 
-cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+# ---------------------------------------------------------------------------
+# The offline forward: shape buckets, bit-exact replay, and fallback accounting
+# ---------------------------------------------------------------------------
 
 
 class _StubConfig:
@@ -135,31 +157,6 @@ class TestResolveBatchBuckets:
         assert resolve_batch_buckets(_StubConfig(max_batch_size=24)) == [1, 2, 4, 8, 16, 24]
 
 
-class TestConfigValidation:
-    @pytest.mark.parametrize(
-        "kw",
-        [
-            {"offline_graph_frame_granularity": 0},
-            {"offline_graph_max_frames": 8, "offline_graph_frame_granularity": 64},
-            {"offline_graph_max_captures": 0},
-            {"offline_graph_batch_buckets": [0]},
-            {"offline_graph_batch_buckets": [1, 999]},
-        ],
-    )
-    def test_rejects_incoherent_knobs(self, kw):
-        from oasr.engine.config import EngineConfig
-
-        with pytest.raises(ValueError):
-            EngineConfig(ckpt_dir="/nonexistent", max_batch_size=32, **kw)
-
-    def test_defaults_are_coherent(self):
-        from oasr.engine.config import EngineConfig
-
-        cfg = EngineConfig(ckpt_dir="/nonexistent")
-        assert cfg.offline_graph_frame_granularity == DEFAULT_FRAME_GRANULARITY
-        assert cfg.use_offline_cuda_graphs is True
-
-
 class TestDisabledCache:
     def test_cpu_device_disables(self):
         c = GraphedOfflineForward(device=torch.device("cpu"), batch_buckets=[1])
@@ -174,7 +171,7 @@ class TestDisabledCache:
 # ---------------------------------------------------------------------------
 
 
-@cuda_only
+@pytest.mark.cuda
 class TestCaptureIsBitExact:
     def test_replay_matches_eager_on_the_same_padded_input(self):
         """The core guarantee: capture changes launch count, never numerics."""
@@ -255,7 +252,7 @@ class TestCaptureIsBitExact:
         assert torch.equal(first[0], held)
 
 
-@cuda_only
+@pytest.mark.cuda
 class TestPaddingConsistency:
     def test_eager_fallback_matches_a_graph_hit(self):
         """A saturated cache must not change the answer, only the speed.
@@ -309,7 +306,7 @@ class TestPaddingConsistency:
         assert not padded[:, 100:].any()
 
 
-@cuda_only
+@pytest.mark.cuda
 class TestFallbackAccounting:
     def test_a_failed_capture_is_never_retried(self):
         """Retrying costs a warm-up forward per call and then runs eager anyway.
@@ -422,3 +419,488 @@ class TestFallbackAccounting:
                 torch.tensor([100, 90], device=dev, dtype=torch.int32),
             )
         assert c.pad_overhead == pytest.approx((4 * 128) / (2 * 100))
+
+
+# --------------------------------------------------------------------------
+# Recovery from a capture that failed halfway through
+# --------------------------------------------------------------------------
+
+
+def _abort_a_capture(device: torch.device, pool=None) -> None:
+    """Fail a capture the way a host read inside a forward does."""
+    x = torch.ones(4, 4, device=device)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        ctx = torch.cuda.graph(graph) if pool is None else torch.cuda.graph(graph, pool=pool)
+        with ctx:
+            _ = int((x * 2).sum().item())
+    except Exception:
+        pass
+    torch.cuda.synchronize(device)
+
+
+def _free_gib(device: torch.device) -> float:
+    torch.cuda.synchronize(device)
+    return torch.cuda.mem_get_info(device)[0] / 2**30
+
+
+def _cuda_rng_works(device: torch.device) -> bool:
+    try:
+        torch.randn(4, 4, device=device)
+        return True
+    except RuntimeError:
+        return False
+
+
+@pytest.mark.cuda
+class TestTheHazardIsReal:
+    """Without a reset, an aborted capture breaks RNG for the whole process."""
+
+    def test_an_aborted_capture_poisons_cuda_rng(self):
+        dev = torch.device("cuda")
+        _abort_a_capture(dev)
+        assert not _cuda_rng_works(dev), (
+            "torch no longer leaks capture state on an aborted capture — "
+            "restore_rng_after_failed_capture and these tests can go"
+        )
+        assert restore_rng_after_failed_capture(dev)
+        assert _cuda_rng_works(dev)
+
+    @pytest.mark.parametrize("fix", [torch.cuda.manual_seed, None])
+    def test_the_obvious_resets_do_not_clear_it(self, fix):
+        """Why the recovery is a throwaway capture and not a seed call."""
+        dev = torch.device("cuda")
+        _abort_a_capture(dev)
+        gen = torch.cuda.default_generators[dev.index or 0]
+        try:
+            fix(0) if fix is not None else gen.set_state(gen.get_state())
+        except RuntimeError:
+            pass  # set_state itself asserts "not capturing" on some builds
+        assert not _cuda_rng_works(dev)
+        assert restore_rng_after_failed_capture(dev)
+
+
+@pytest.mark.cuda
+class TestTheCachesRepairWhatTheySwallow:
+    def test_a_failed_offline_capture_leaves_rng_usable(self):
+        """``GraphedOfflineForward`` returns ``None`` and the process is intact."""
+        dev = torch.device("cuda")
+        assert restore_rng_after_failed_capture(dev)  # start from a clean slate
+        enc = _SyncingEncoder().to(dev).eval()
+        cache = GraphedOfflineForward(device=dev, frame_granularity=64, batch_buckets=[2])
+        feats = torch.randn(2, 64, 16, device=dev)
+        lens = torch.tensor([64, 50], device=dev, dtype=torch.int32)
+
+        with torch.no_grad():
+            assert cache.run(FUSED, enc.forward_offline, feats, lens) is None
+        assert cache.fallback_failed == 1
+
+        assert _cuda_rng_works(dev), "the swallowed capture left the generator capturing"
+
+    def test_sampled_decoding_still_works_after_a_failed_capture(self):
+        """The concrete consequence: ``select_next_tokens`` draws on the GPU."""
+        from oasr.engine.generation.sampling import select_next_tokens
+        from oasr.engine.request import DecodingOptions
+
+        dev = torch.device("cuda")
+        assert restore_rng_after_failed_capture(dev)
+        enc = _SyncingEncoder().to(dev).eval()
+        cache = GraphedOfflineForward(device=dev, frame_granularity=64, batch_buckets=[2])
+        with torch.no_grad():
+            cache.run(
+                FUSED,
+                enc.forward_offline,
+                torch.randn(2, 64, 16, device=dev),
+                torch.tensor([64, 50], device=dev, dtype=torch.int32),
+            )
+
+        opts = DecodingOptions(temperature=1.0, top_p=0.9)
+        assert opts.sampling, "this row must take the multinomial path or nothing is tested"
+        tokens = select_next_tokens(torch.randn(1, 32, device=dev), [opts])
+        assert tokens.shape == (1,) and 0 <= int(tokens[0]) < 32
+
+
+@pytest.mark.cuda
+class TestTheAllocatorHalf:
+    """The half a throwaway capture cannot fix, and the one that costs GiB.
+
+    ``__enter__`` called ``beginAllocateToPool``; when the body raises, the
+    matching ``endAllocateToPool`` never runs and the allocator keeps serving
+    *every* later allocation in the process out of that private pool.  Nothing
+    gives those blocks back -- not ``del``, not ``gc``, not ``empty_cache`` --
+    which is how an uncapturable encoder stranded 3.2 GiB per engine.
+    """
+
+    def test_allocations_after_an_abort_are_stranded(self):
+        dev = torch.device("cuda")
+        pool = torch.cuda.graph_pool_handle()
+        _abort_a_capture(dev, pool)
+
+        before = _free_gib(dev)
+        block = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=dev)
+        del block
+        gc.collect()
+        torch.cuda.empty_cache()
+        stranded = before - _free_gib(dev)
+        assert stranded > 0.2, (
+            "torch no longer strands post-abort allocations "
+            f"(only {stranded:.3f} GiB); capture_recovery can be simplified"
+        )
+
+        assert recover_from_failed_capture(dev, pool)
+        before = _free_gib(dev)
+        block = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=dev)
+        del block
+        gc.collect()
+        torch.cuda.empty_cache()
+        assert before - _free_gib(dev) < 0.05, "the allocator is still bound to the pool"
+
+    def test_the_rng_reset_is_not_a_substitute_for_releasing_the_pool(self):
+        """Why ``recover_from_failed_capture`` releases *first*, then resets RNG.
+
+        The throwaway capture ends the diversion as a side effect of its own
+        ``__exit__``, so allocations made *after* it behave normally.  What it
+        cannot do is hand back what the process already put in the stuck pool —
+        and by then the ordering is fixed: releasing afterwards no longer
+        recovers those blocks.  An engine allocates its KV pool right after the
+        abort, so this is the difference between 0.0 and 3.2 GiB.
+        """
+        dev = torch.device("cuda")
+        pool = torch.cuda.graph_pool_handle()
+        before = _free_gib(dev)
+        _abort_a_capture(dev, pool)
+        block = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=dev)
+
+        assert restore_rng_after_failed_capture(dev)
+        del block
+        gc.collect()
+        torch.cuda.empty_cache()
+        assert before - _free_gib(dev) > 0.2, (
+            "the throwaway capture returned blocks already in the pool; "
+            "the explicit release may be redundant"
+        )
+
+    def test_releasing_first_keeps_the_bytes(self):
+        """The shipped order, against the same abort."""
+        dev = torch.device("cuda")
+        pool = torch.cuda.graph_pool_handle()
+        before = _free_gib(dev)
+        _abort_a_capture(dev, pool)
+        assert recover_from_failed_capture(dev, pool)
+
+        block = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=dev)
+        del block
+        gc.collect()
+        torch.cuda.empty_cache()
+        assert before - _free_gib(dev) < 0.05, "recovery did not restore normal allocation"
+
+
+@pytest.mark.cuda
+class TestAnUncapturableForwardCostsNothingLasting:
+    """End to end: the cache declines, and the engine's VRAM comes back.
+
+    Before the recovery this was 3.24 GiB per Nemotron engine, and six engines
+    into the accuracy suite the 7B checkpoint could no longer size its decoder
+    KV pool.
+    """
+
+    def test_the_engine_returns_its_memory(self):
+        dev = torch.device("cuda")
+        assert recover_from_failed_capture(dev, None)
+        enc = _SyncingEncoder().to(dev).eval()
+        before = _free_gib(dev)
+
+        cache = GraphedOfflineForward(device=dev, frame_granularity=64, batch_buckets=[1, 8])
+        with torch.no_grad():
+            assert (
+                cache.run(
+                    FUSED,
+                    enc.forward_offline,
+                    torch.randn(8, 256, 16, device=dev),
+                    torch.full((8,), 256, device=dev, dtype=torch.int32),
+                )
+                is None
+            )
+        assert not cache.enabled, "an uncapturable forward must switch the cache off"
+        cache.release()
+        del cache, enc
+        gc.collect()
+        torch.cuda.empty_cache()
+        assert before - _free_gib(dev) < 0.05, "the failed capture stranded memory"
+
+
+# --------------------------------------------------------------------------
+# The transducer predictor step, and which shapes of state can be carried
+# --------------------------------------------------------------------------
+
+
+class TestCapturable:
+    @pytest.mark.cuda
+    def test_a_bare_cuda_tensor_is_capturable(self):
+        """The regression: icefall's stateless predictor state is exactly this."""
+        assert Cache.capturable(torch.zeros(4, 2, device="cuda"))
+
+    @pytest.mark.cuda
+    def test_a_sequence_of_cuda_tensors_is_still_capturable(self):
+        t = torch.zeros(4, 2, device="cuda")
+        assert Cache.capturable((t, t))
+        assert Cache.capturable([t, t])
+
+    def test_a_cpu_state_is_not(self):
+        assert not Cache.capturable(torch.zeros(4, 2))
+        assert not Cache.capturable((torch.zeros(4, 2),))
+
+    def test_non_tensor_states_are_refused(self):
+        assert not Cache.capturable(None)
+        assert not Cache.capturable(())
+        assert not Cache.capturable([])
+        assert not Cache.capturable({"h": 1})
+        assert not Cache.capturable(((torch.zeros(1),),))  # nested
+
+
+class TestDetach:
+    @pytest.mark.cuda
+    def test_a_bare_tensor_is_copied_not_aliased(self):
+        """Graph memory must not escape; returning the same object let it."""
+        src = torch.zeros(4, 2, device="cuda")
+        out = Cache.detach(src)
+        assert out is not src, "detach aliased the caller's state"
+        out.fill_(1.0)
+        assert float(src.abs().sum()) == 0.0, "detach returned a view"
+
+    @pytest.mark.cuda
+    def test_a_sequence_is_copied_elementwise(self):
+        src = (torch.zeros(4, 2, device="cuda"), torch.zeros(4, device="cuda"))
+        out = Cache.detach(src)
+        assert all(a is not b for a, b in zip(src, out))
+        out[0].fill_(1.0)
+        assert float(src[0].abs().sum()) == 0.0
+
+
+CONTEXT = 3
+
+
+class _BareStatePredictor:
+    """Minimal stand-in for a stateless predictor: the state is one tensor.
+
+    Shaped like icefall's: ``(B, CONTEXT)`` of label ids, projected to ``dim``.
+    """
+
+    def __init__(self, dim=4, device="cuda"):
+        # Deterministic and RNG-free on purpose.  A *failed* CUDA-graph capture
+        # elsewhere in the process wedges the CUDA generator ("Offset increment
+        # outside graph capture"), so a `torch.randn` here would make these tests
+        # fail for a reason that has nothing to do with them.
+        self.w = (
+            torch.linspace(-1.0, 1.0, CONTEXT * dim, device=device)
+            .reshape(CONTEXT, dim)
+            .contiguous()
+        )
+
+    def advance(self, state, tok, emit):
+        # Shift the label window left and append the emitted token.
+        nxt = torch.roll(state, shifts=-1, dims=1)
+        nxt[:, -1] = tok
+        return torch.where(emit.unsqueeze(1), nxt, state)
+
+    def predict(self, state):
+        return state.float() @ self.w  # (B, CONTEXT) @ (CONTEXT, dim) -> (B, dim)
+
+
+class _Joiner:
+    def decoder_proj(self, x):
+        return x * 2.0
+
+
+@pytest.mark.cuda
+class TestCapturesAndReplaysABareState:
+    def _cache(self):
+        return Cache(_BareStatePredictor(), _Joiner(), max_captures=4)
+
+    def test_step_returns_a_replay_not_none(self):
+        """What ``0 replays, 304 fallbacks`` looked like before the fix."""
+        cache = self._cache()
+        state = torch.zeros(4, CONTEXT, dtype=torch.long, device="cuda")
+        tok = torch.tensor([1, 2, 3, 4], device="cuda")
+        emit = torch.tensor([True, True, False, True], device="cuda")
+        out = cache.step(state, tok, emit)
+        assert out is not None, "bare-tensor state was refused"
+        assert cache.num_captured == 1
+
+    def test_the_returned_state_keeps_the_callers_shape(self):
+        """A bare state in must not become a 1-tuple out."""
+        cache = self._cache()
+        state = torch.zeros(4, CONTEXT, dtype=torch.long, device="cuda")
+        tok = torch.tensor([1, 2, 3, 4], device="cuda")
+        emit = torch.ones(4, dtype=torch.bool, device="cuda")
+        new_state, _proj = cache.step(state, tok, emit)
+        assert isinstance(new_state, torch.Tensor), type(new_state)
+
+    def test_replay_matches_the_eager_step(self):
+        cache = self._cache()
+        pred, join = cache._predictor, cache._joiner
+        state = torch.tensor([[0, 1, 2]] * 4, device="cuda")  # (4, CONTEXT)
+        tok = torch.tensor([5, 6, 7, 8], device="cuda")
+        emit = torch.tensor([True, False, True, False], device="cuda")
+
+        want_state = pred.advance(state, tok, emit)
+        want_proj = join.decoder_proj(pred.predict(want_state))
+        got_state, got_proj = cache.step(state, tok, emit)
+
+        assert torch.equal(got_state, want_state)
+        assert torch.allclose(got_proj, want_proj, atol=0, rtol=0)
+
+    def test_successive_replays_carry_state_forward(self):
+        """The graph writes its output back into the buffers it reads."""
+        cache = self._cache()
+        pred = cache._predictor
+        state = torch.zeros(4, CONTEXT, dtype=torch.long, device="cuda")
+        emit = torch.ones(4, dtype=torch.bool, device="cuda")
+        want = state
+        for step in range(5):
+            tok = torch.full((4,), step + 1, device="cuda")
+            want = pred.advance(want, tok, emit)
+            state, _ = cache.step(state, tok, emit)
+            assert torch.equal(state, want), f"diverged at step {step}"
+
+    def test_a_second_batch_width_gets_its_own_capture(self):
+        cache = self._cache()
+        for b in (2, 4):
+            cache.step(
+                torch.zeros(b, CONTEXT, dtype=torch.long, device="cuda"),
+                torch.ones(b, dtype=torch.long, device="cuda"),
+                torch.ones(b, dtype=torch.bool, device="cuda"),
+            )
+        assert cache.num_captured == 2
+
+    def test_a_bare_state_and_a_one_tuple_do_not_share_a_capture(self):
+        """They hand the predictor different shapes, so the key must differ."""
+        cache = self._cache()
+        s = torch.zeros(4, CONTEXT, dtype=torch.long, device="cuda")
+        assert cache._key((s,), bare=True) != cache._key((s,), bare=False)
+
+
+# --------------------------------------------------------------------------
+# The streaming encoder's cache-bucket ladder
+# --------------------------------------------------------------------------
+
+
+_N_BLOCK = 64
+
+
+class TestLadderShape:
+    @pytest.mark.parametrize("capacity", [64, 512, 1024, 4096, 4984, 8192])
+    def test_rungs_are_kernel_tile_multiples_within_capacity(self, capacity):
+        ladder = cache_bucket_ladder(capacity)
+        assert ladder, "ladder must not be empty"
+        assert ladder == sorted(set(ladder)), "rungs must be sorted and unique"
+        for rung in ladder:
+            assert rung % _N_BLOCK == 0, f"{rung} is not an N_BLOCK multiple"
+            # A rung *above* capacity is the out-of-bounds read the capacity
+            # exists to prevent — the block table cannot address it and the
+            # relative-position table cannot index it.
+            assert rung <= capacity, f"rung {rung} exceeds capacity {capacity}"
+
+    def test_it_is_finite_and_small(self):
+        """The whole point: a flat 64-frame axis is unbounded, this one is not."""
+        for capacity in (4096, 65536, 1 << 20):
+            ladder = cache_bucket_ladder(capacity)
+            assert len(ladder) < 40, f"{capacity} produced {len(ladder)} rungs"
+        # ...and it grows logarithmically, not linearly, in the capacity.
+        small = len(cache_bucket_ladder(4096))
+        big = len(cache_bucket_ladder(4096 * 64))
+        assert big - small <= 12, (small, big)
+
+    def test_below_the_knee_it_is_still_flat_64(self):
+        """Short streams keep the fine granularity; a coarse rung there would be
+        a large *relative* over-read."""
+        ladder = cache_bucket_ladder(4096)
+        fine = [r for r in ladder if r <= CACHE_BUCKET_KNEE]
+        assert fine == list(range(0, CACHE_BUCKET_KNEE + 1, _N_BLOCK))
+
+    def test_growth_one_restores_the_legacy_flat_ladder(self):
+        ladder = cache_bucket_ladder(1024, growth=1.0)
+        assert ladder == list(range(0, 1025, _N_BLOCK))
+
+
+class TestPickMatchesLadder:
+    """The pre-warm captures the ladder; the runtime picks with this function.
+
+    If the two ever disagree, the pre-warm covers shapes the runtime never asks
+    for and misses the ones it does — which is the tail, silently back.
+    """
+
+    @pytest.mark.parametrize("capacity", [512, 1024, 4096])
+    def test_every_reachable_length_maps_onto_a_prewarmed_rung(self, capacity):
+        ladder = cache_bucket_ladder(capacity)
+        rungs = set(ladder)
+        for cache_t1 in range(0, capacity + 1):
+            got = pick_cache_bucket(cache_t1, ladder)
+            assert got in rungs, f"cache_t1={cache_t1} -> {got}, off the ladder"
+
+    @pytest.mark.parametrize("capacity", [512, 4096])
+    def test_a_bucket_is_never_shorter_than_the_cache(self, capacity):
+        """Handing the kernel a ``host_seqlen_max`` below the real
+        ``cache_seqlens`` would truncate a stream's attention history."""
+        ladder = cache_bucket_ladder(capacity)
+        for cache_t1 in range(0, capacity + 1):
+            assert pick_cache_bucket(cache_t1, ladder) >= cache_t1
+
+    def test_over_read_is_bounded_by_the_growth_ratio(self):
+        """The trade for a finite ladder: rungs above the knee over-read by at
+        most ``growth``, which measured ~4% of a replay at 1.5."""
+        ladder = cache_bucket_ladder(8192, growth=1.5)
+        for cache_t1 in range(CACHE_BUCKET_KNEE, 8192, 37):
+            rung = pick_cache_bucket(cache_t1, ladder)
+            assert rung <= cache_t1 * 1.5 + _N_BLOCK, (cache_t1, rung)
+
+    def test_off_ladder_falls_back_to_flat_rounding(self):
+        ladder = cache_bucket_ladder(512)
+        assert pick_cache_bucket(9999, ladder) == round_up_bucket(9999)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+class TestPrewarmCoversTheRuntime:
+    """End-to-end: a stream long enough to walk the whole cache ladder must not
+    capture a single graph on a live tick."""
+
+    def test_a_long_stream_captures_nothing(self, ckpt_dir):
+        from oasr.engine import ASREngine, EngineConfig
+        from oasr.engine.graph_cache import GraphedEncoderForward
+
+        seen: list = []
+        original = GraphedEncoderForward._capture
+
+        def spy(self, B, T, bucket, *a, **kw):
+            seen.append((B, T, bucket))
+            return original(self, B, T, bucket, *a, **kw)
+
+        cfg = EngineConfig(
+            ckpt_dir=ckpt_dir,
+            device="cuda",
+            dtype=torch.bfloat16,
+            service_mode="streaming",
+            max_batch_size=4,
+            num_left_chunks=-1,  # the default: an unbounded cache axis
+        )
+        engine = ASREngine(cfg)
+        try:
+            GraphedEncoderForward._capture = spy
+            seen.clear()
+            samples = engine._input_processor.streaming_audio_chunk_samples
+            # ~60 s of audio walks well past where the old ladder stopped.
+            chunk = torch.zeros(samples, dtype=torch.float32)
+            rid = engine.add_streaming_request(sample_rate=16000)
+            n = int(60 * 16000 / samples)
+            for j in range(n):
+                engine.feed_chunk(rid, chunk, is_last=(j == n - 1))
+            engine.run()
+            torch.cuda.synchronize()
+        finally:
+            GraphedEncoderForward._capture = original
+            engine.shutdown()
+
+        assert not seen, (
+            f"{len(seen)} graph(s) captured on a live tick — the pre-warm ladder "
+            f"no longer covers what the runtime asks for: {seen[:5]}"
+        )

@@ -24,11 +24,18 @@ from __future__ import annotations
 
 import pytest
 import torch
+from helpers.audio import SR, speech_corpus
 
 from oasr.vad import VadConfig, build_detector, get_vad_spec
 from oasr.vad.segmenter import SpeechSegmenter
 
-SR = 16000
+
+def _corpus_audio(wav_dir, gap_s: float = 3.0, n: int = 3):
+    """The shared corpus as ``(1, T)`` audio plus its duration."""
+    wave, total, _spans = speech_corpus(wav_dir, gap_s=gap_s, n=n)
+    return wave.unsqueeze(0), total
+
+
 WINDOW = 512
 
 
@@ -200,7 +207,7 @@ class TestUpstreamParity:
         segmenter is the claim, and it is the one that survives a device whose
         fp32 GEMMs are not bit-exact.
         """
-        wav, _total = _speech_corpus(wav_dir)
+        wav, _total = _corpus_audio(wav_dir)
         want = upstream(archive, wav)
         det = detector(silero_vad_dir)
         got, _ = det.detect(wav, torch.tensor([wav.shape[1]]))
@@ -221,7 +228,7 @@ class TestUpstreamParity:
         segmentation, not the last digit of the trace.  The engine runs this
         detector on the host by default anyway — measured, it is *faster* there,
         because a 128-wide recurrence is launch-bound on a GPU."""
-        wav, _total = _speech_corpus(wav_dir)
+        wav, _total = _corpus_audio(wav_dir)
         want = upstream(archive, wav)
         det = detector(silero_vad_dir, device="cuda")
         got, _ = det.detect(wav.cuda(), torch.tensor([wav.shape[1]], device="cuda"))
@@ -233,28 +240,6 @@ class TestUpstreamParity:
         assert [(round(s.start, 2), round(s.end, 2)) for s in mine] == [
             (round(s.start, 2), round(s.end, 2)) for s in theirs
         ]
-
-
-def _speech_corpus(wav_dir, gap_s: float = 3.0, n: int = 3):
-    """``n`` utterances separated by digital silence, as one ``(1, T)`` waveform."""
-    import pathlib
-
-    import numpy as np
-    import soundfile as sf
-
-    paths = sorted(pathlib.Path(wav_dir).glob("*.wav"))[:n]
-    if len(paths) < n:
-        pytest.skip(f"need {n} wav files")
-    parts, total = [], 0.0
-    for i, path in enumerate(paths):
-        data, rate = sf.read(str(path), dtype="float32")
-        assert rate == SR
-        if i:
-            parts.append(np.zeros(int(gap_s * SR), dtype="float32"))
-            total += gap_s
-        parts.append(data)
-        total += len(data) / SR
-    return torch.from_numpy(np.concatenate(parts)).unsqueeze(0), total
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +369,7 @@ class TestEngineResolution:
         """
         from oasr.engine import ASREngine
 
-        wav, _total = _speech_corpus(wav_dir, gap_s=6.0)
+        wav, _total = _corpus_audio(wav_dir, gap_s=6.0)
         wav = wav.reshape(-1)
         texts, turns = {}, {}
         for tag, vad in (
@@ -427,7 +412,7 @@ class TestEngineResolution:
     def test_it_segments_a_real_file_at_the_speech(self, ckpt_dir, silero_vad_dir, wav_dir):
         from oasr.engine import ASREngine
 
-        wav, total = _speech_corpus(wav_dir)
+        wav, total = _corpus_audio(wav_dir)
         cfg = self.config(
             ckpt_dir,
             vad={"mode": "segment", "backend": "silero", "model_dir": str(silero_vad_dir)},

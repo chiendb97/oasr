@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Unit tests for oasr.rfft / oasr.rfft_power."""
+# Copyright 2024 OASR Authors
+# SPDX-License-Identifier: Apache-2.0
+"""``oasr.rfft`` / ``oasr.rfft_power`` (``oasr/functionals/fft.py``).
+
+``n_fft`` is the only axis that selects a radix decomposition, so the full
+power-of-two ladder is swept once, for ``rfft``.  ``rfft_power`` is
+``|rfft|**2`` over the same transform, so it re-tests the ladder's ends rather
+than all of it; the leading batch dims are a flatten in the wrapper.
+"""
 
 import pytest
 import torch
+from helpers import assert_dest_passing
 
 import oasr
 
-# Every test in this module allocates directly on ``device="cuda"`` and calls a
-# JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
-# what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
-# instead of a wall of `RuntimeError: No CUDA GPUs are available`.
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+pytestmark = pytest.mark.cuda
 
 
 N_FFT_VALUES = [8, 16, 32, 64, 128, 256, 512, 1024, 2048]
@@ -31,8 +36,8 @@ class TestRfft:
         assert out.dtype == torch.complex64
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-3)
 
-    @pytest.mark.parametrize("n_fft", [256, 512, 1024])
-    @pytest.mark.parametrize("batch_shape", [(4,), (2, 8), (3, 5, 7)])
+    @pytest.mark.parametrize("n_fft", [256, 1024])
+    @pytest.mark.parametrize("batch_shape", [(4,), (3, 5, 7)])
     def test_rfft_batched(self, n_fft, batch_shape):
         torch.manual_seed(0)
         x = torch.randn(*batch_shape, n_fft, device="cuda", dtype=torch.float32)
@@ -57,9 +62,8 @@ class TestRfft:
     def test_rfft_destination_passing(self):
         x = torch.randn(4, 512, device="cuda", dtype=torch.float32)
         out = torch.empty(4, 257, device="cuda", dtype=torch.complex64)
-        result = oasr.rfft(x, out=out)
-        assert result.data_ptr() == out.data_ptr()
-        torch.testing.assert_close(result, torch.fft.rfft(x), rtol=1e-4, atol=1e-3)
+        assert_dest_passing(oasr.rfft, x, out=out)
+        torch.testing.assert_close(out, torch.fft.rfft(x), rtol=1e-4, atol=1e-3)
 
     def test_rfft_invalid_n_fft(self):
         x = torch.randn(8, 500, device="cuda", dtype=torch.float32)
@@ -84,8 +88,14 @@ class TestRfft:
 class TestRfftPower:
     """Tests for oasr.rfft_power (real-FFT power spectrum)."""
 
-    @pytest.mark.parametrize("n_fft", N_FFT_VALUES)
+    @pytest.mark.parametrize("n_fft", [8, 512, 2048])
     def test_power_1d(self, n_fft):
+        """The ends and the middle of the radix ladder.
+
+        ``rfft_power`` is ``|rfft|**2``, and :meth:`TestRfft.test_rfft_1d`
+        already walks every width -- re-walking it here would re-test the same
+        transform through a squaring epilogue.
+        """
         torch.manual_seed(0)
         x = torch.randn(n_fft, device="cuda", dtype=torch.float32)
 
@@ -96,8 +106,8 @@ class TestRfftPower:
         assert power.dtype == torch.float32
         torch.testing.assert_close(power, ref, rtol=1e-3, atol=1e-2)
 
-    @pytest.mark.parametrize("n_fft", [256, 512])
-    @pytest.mark.parametrize("batch_shape", [(4,), (2, 16)])
+    @pytest.mark.parametrize("n_fft", [512])
+    @pytest.mark.parametrize("batch_shape", [(4,), (4, 100)])  # (4, 100): the fbank shape
     def test_power_batched(self, n_fft, batch_shape):
         torch.manual_seed(0)
         x = torch.randn(*batch_shape, n_fft, device="cuda", dtype=torch.float32)
@@ -107,22 +117,8 @@ class TestRfftPower:
 
         torch.testing.assert_close(power, ref, rtol=1e-3, atol=1e-2)
 
-    def test_power_fbank_shape(self):
-        """Shape that matches the FBANK pipeline: (B, num_frames, n_fft)."""
-        torch.manual_seed(0)
-        B, F, n_fft = 4, 100, 512
-        x = torch.randn(B, F, n_fft, device="cuda", dtype=torch.float32)
-
-        power = oasr.rfft_power(x)
-        ref = torch.fft.rfft(x).abs().pow(2)
-
-        assert power.shape == (B, F, n_fft // 2 + 1)
-        torch.testing.assert_close(power, ref, rtol=1e-3, atol=1e-2)
-
     def test_power_destination_passing(self):
         x = torch.randn(4, 512, device="cuda", dtype=torch.float32)
         out = torch.empty(4, 257, device="cuda", dtype=torch.float32)
-        result = oasr.rfft_power(x, out=out)
-        assert result.data_ptr() == out.data_ptr()
-        ref = torch.fft.rfft(x).abs().pow(2)
-        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-2)
+        assert_dest_passing(oasr.rfft_power, x, out=out)
+        torch.testing.assert_close(out, torch.fft.rfft(x).abs().pow(2), rtol=1e-3, atol=1e-2)

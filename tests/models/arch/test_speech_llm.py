@@ -14,6 +14,7 @@ import os
 import assets
 import pytest
 import torch
+from conftest import assert_native_weights_round_trip
 
 # Declared once in tests/assets.py; the markers below gate through the same
 # path, so --strict-assets can turn "fixture absent" into a failure.
@@ -170,23 +171,11 @@ class TestConverter:
         assert sorted(model.capabilities) == ["llm"]
 
     def test_native_round_trip(self, tmp_path):
-        pytest.importorskip("safetensors")
-        from oasr.checkpoints.convert import convert_to_native
-        from oasr.models.registry import instantiate_from_bundle, load_checkpoint_bundle
-
-        out = tmp_path / "native"
-        convert_to_native(SPEECH_LLM_TINY, str(out))
-        arch, bundle = load_checkpoint_bundle(out)
-        assert (arch, bundle.source_format) == ("speech_llm", "native")
+        """The weight comparison lives in ``conftest``; the tokenizer kind is ours."""
+        bundle, _converted = assert_native_weights_round_trip(
+            SPEECH_LLM_TINY, tmp_path, "speech_llm"
+        )
         assert bundle.tokenizer.kind == "huggingface"
-        m2, cfg2, _ = instantiate_from_bundle(arch, bundle)
-
-        arch1, b1 = load_checkpoint_bundle(SPEECH_LLM_TINY)
-        m1, _, _ = instantiate_from_bundle(arch1, b1)
-        sd1, sd2 = m1.state_dict(), m2.state_dict()
-        assert set(sd1) == set(sd2)
-        for k in sd1:
-            assert torch.equal(sd1[k], sd2[k]), k
 
 
 # ---------------------------------------------------------------------------

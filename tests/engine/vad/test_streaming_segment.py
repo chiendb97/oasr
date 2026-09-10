@@ -19,31 +19,12 @@ worth pinning are the ones whose failures stay plausible:
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
+from helpers.audio import SR, hiss, speech_corpus, tone
 
 from oasr.engine.vad_stage import StreamingVadStage
 from oasr.vad import SpeechSegmenter, VadConfig
-
-SR = 16000
-
-
-def tone(seconds: float, amp: float = 0.3, freq: float = 220.0) -> torch.Tensor:
-    n = int(SR * seconds)
-    t = torch.arange(n, dtype=torch.float32) / SR
-    env = 0.5 + 0.5 * torch.sin(2 * math.pi * 4 * t)
-    return (
-        amp
-        * env
-        * (torch.sin(2 * math.pi * freq * t) + 0.5 * torch.sin(2 * math.pi * 3 * freq * t))
-    )
-
-
-def hiss(seconds: float, amp: float = 1e-4) -> torch.Tensor:
-    g = torch.Generator().manual_seed(11)
-    return amp * torch.randn(int(SR * seconds), generator=g)
 
 
 class _Req:
@@ -261,29 +242,6 @@ class TestNbestRefusal:
 # ---------------------------------------------------------------------------
 
 
-def _corpus(gap_s: float, wav_dir, n: int = 3):
-    """``n`` utterances separated by ``gap_s`` of digital silence."""
-    import pathlib
-
-    import numpy as np
-    import soundfile as sf
-
-    paths = sorted(pathlib.Path(wav_dir).glob("*.wav"))[:n]
-    if len(paths) < n:
-        pytest.skip(f"need {n} wav files")
-    parts, spans, t = [], [], 0.0
-    for i, path in enumerate(paths):
-        data, sr = sf.read(str(path), dtype="float32")
-        assert sr == SR
-        if i:
-            parts.append(np.zeros(int(gap_s * SR), dtype="float32"))
-            t += gap_s
-        spans.append((t, t + len(data) / SR))
-        parts.append(data)
-        t += len(data) / SR
-    return torch.from_numpy(np.concatenate(parts)), t, spans
-
-
 class TestStreamingSegmentEngine:
     def engine(self, ckpt_dir, vad):
         from oasr.engine import ASREngine, EngineConfig
@@ -322,7 +280,7 @@ class TestStreamingSegmentEngine:
         partial after a boundary would report only the new turn — which a client
         cannot tell apart from the recogniser changing its mind.
         """
-        wav, _total, spans = _corpus(5.0, wav_dir)
+        wav, _total, spans = speech_corpus(wav_dir, gap_s=5.0)
         engine = self.engine(ckpt_dir, {"mode": "segment", "backend": "energy"})
         try:
             final, produced = self.drive(engine, wav, decoding={"word_timestamps": True})
@@ -344,7 +302,7 @@ class TestStreamingSegmentEngine:
         report timings that start again from zero — monotone within a turn, and
         wrong for the stream.
         """
-        wav, total, spans = _corpus(5.0, wav_dir)
+        wav, total, spans = speech_corpus(wav_dir, gap_s=5.0)
         engine = self.engine(ckpt_dir, {"mode": "segment", "backend": "energy"})
         try:
             final, _ = self.drive(engine, wav, decoding={"word_timestamps": True})
@@ -377,7 +335,7 @@ class TestStreamingSegmentEngine:
         engine_vad = {"mode": "segment", "backend": "energy"}
         skipped = {}
         for gap in (3.0, 12.0):
-            wav, total, spans = _corpus(gap, wav_dir)
+            wav, total, spans = speech_corpus(wav_dir, gap_s=gap)
             engine = self.engine(ckpt_dir, engine_vad)
             try:
                 engine.transcribe_outputs([wav], streaming=True)
@@ -399,7 +357,7 @@ class TestStreamingSegmentEngine:
         """
         import difflib
 
-        wav, _total, _spans = _corpus(6.0, wav_dir)
+        wav, _total, _spans = speech_corpus(wav_dir, gap_s=6.0)
         outs = {}
         for tag, vad in (("off", None), ("segment", {"mode": "segment", "backend": "energy"})):
             engine = self.engine(ckpt_dir, vad)
@@ -414,7 +372,7 @@ class TestStreamingSegmentEngine:
     def test_nbest_is_refused_rather_than_answered_with_one_turn(self, ckpt_dir, wav_dir):
         """Alternatives of separate turns do not compose into alternatives of the
         stream — the same reason ``longform.py`` refuses to merge them."""
-        wav, _total, _spans = _corpus(4.0, wav_dir, n=2)
+        wav, _total, _spans = speech_corpus(wav_dir, n=2, gap_s=4.0)
         engine = self.engine(ckpt_dir, {"mode": "segment", "backend": "energy"})
         try:
             with pytest.raises(ValueError, match="n_best > 1 cannot be served"):
@@ -445,7 +403,7 @@ class TestStreamingSegmentEngine:
         this test's blast radius.
         """
         gaps = (4.0, 6.0, 5.0, 7.0)
-        waves = [_corpus(gap, wav_dir, n=3)[0] for gap in gaps]
+        waves = [speech_corpus(wav_dir, n=3, gap_s=gap)[0] for gap in gaps]
 
         from oasr.engine import ASREngine, EngineConfig
 

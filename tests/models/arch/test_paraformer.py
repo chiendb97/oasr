@@ -15,6 +15,7 @@ import assets
 import numpy as np
 import pytest
 import torch
+from conftest import assert_native_weights_round_trip
 
 # Declared once in tests/assets.py so --strict-assets can make a missing
 # checkpoint fatal instead of silently green.
@@ -283,24 +284,10 @@ class TestConverter:
 
     @pytest.mark.slow
     def test_native_round_trip(self, tmp_path):
-        pytest.importorskip("safetensors")
-        from oasr.checkpoints.convert import convert_to_native
-        from oasr.models.registry import instantiate_from_bundle, load_checkpoint_bundle
-
-        out = tmp_path / "native"
-        convert_to_native(PARA_CKPT, str(out))
-        arch, bundle = load_checkpoint_bundle(out)
-        assert (arch, bundle.source_format) == ("paraformer", "native")
+        """The weight comparison lives in ``conftest``; what is FunASR's is here."""
+        bundle, _converted = assert_native_weights_round_trip(PARA_CKPT, tmp_path, "paraformer")
         assert bundle.tokenizer.kind == "funasr_char"
         assert (bundle.features.lfr_m, bundle.features.window_type) == (7, "hamming")
-        m2, _, _ = instantiate_from_bundle(arch, bundle)
-
-        arch1, b1 = load_checkpoint_bundle(PARA_CKPT)
-        m1, _, _ = instantiate_from_bundle(arch1, b1)
-        sd1, sd2 = m1.state_dict(), m2.state_dict()
-        assert set(sd1) == set(sd2)
-        for k in sd1:
-            assert torch.equal(sd1[k], sd2[k]), k
 
 
 # ---------------------------------------------------------------------------

@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-"""Correctness and contract tests for AvgPool1D."""
+# Copyright 2024 OASR Authors
+# SPDX-License-Identifier: Apache-2.0
+"""Correctness and contract tests for AvgPool1D (``oasr/functionals/pooling.py``).
+
+The five geometries are the branch table: ceil vs floor, padded vs not, and
+whether padding counts toward the divisor, plus a rank-2 input.  ``dtype`` is
+*not* a third axis over all of them -- a mean reduction takes the same path in
+each format -- so it stays at the served fp16 plus fp32 as the reference.
+"""
 
 from __future__ import annotations
 
 import pytest
 import torch
 import torch.nn.functional as F
+from helpers import assert_dest_passing, assert_graph_replay
 
 import oasr
 
@@ -33,9 +42,8 @@ def _reference(
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="AvgPool1D kernel needs CUDA")
 class TestAvgPool1d:
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
     @pytest.mark.parametrize(
         "shape,kernel,stride,padding,ceil_mode,count_include_pad",
         [
@@ -72,11 +80,12 @@ class TestAvgPool1d:
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_production_shape_and_destination_passing(self, dtype):
+        """The Whisper-width shape, which is where this kernel actually runs."""
         x = torch.randn(1, 1500, 1280, device="cuda", dtype=dtype)
         out = torch.empty(1, 750, 1280, device="cuda", dtype=dtype)
-        result = oasr.avg_pool1d(x, 2, stride=2, out=out)
-        assert result.data_ptr() == out.data_ptr()
-        torch.testing.assert_close(result, _reference(x, 2, 2, 0, False, True))
+        assert_dest_passing(
+            oasr.avg_pool1d, x, 2, out=out, stride=2, expected=_reference(x, 2, 2, 0, False, True)
+        )
 
     def test_rejects_wrong_destination_shape(self):
         x = torch.randn(2, 16, 32, device="cuda", dtype=torch.float16)
@@ -93,19 +102,12 @@ class TestAvgPool1d:
     def test_cuda_graph_capture_replay(self):
         x = torch.randn(2, 32, 64, device="cuda", dtype=torch.float16)
         out = torch.empty(2, 16, 64, device="cuda", dtype=torch.float16)
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            oasr.avg_pool1d(x, 2, 2, out=out)
-        torch.cuda.synchronize()
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            oasr.avg_pool1d(x, 2, 2, out=out)
-
-        x.normal_()
-        graph.replay()
-        torch.cuda.synchronize()
-        torch.testing.assert_close(out, _reference(x, 2, 2, 0, False, True))
+        assert_graph_replay(
+            lambda: oasr.avg_pool1d(x, 2, 2, out=out),
+            out=out,
+            mutate=x.normal_,
+            expected=lambda: _reference(x, 2, 2, 0, False, True),
+        )
 
 
 class TestAvgPool1dValidation:

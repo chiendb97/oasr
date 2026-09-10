@@ -11,6 +11,7 @@ from dataclasses import replace
 import assets
 import pytest
 import torch
+from conftest import assert_native_weights_round_trip
 
 from oasr.features import FeatureConfig
 from oasr.features.whisper import batched_whisper_logmel
@@ -697,24 +698,13 @@ class TestConverter:
         assert sorted(model.capabilities) == ["aed"]
 
     def test_native_round_trip(self, tmp_path):
-        pytest.importorskip("safetensors")
-        from oasr.checkpoints.convert import convert_to_native
-        from oasr.models.registry import instantiate_from_bundle, load_checkpoint_bundle
+        """The weight comparison lives in ``conftest``; what is Whisper's is here."""
+        from oasr.models.registry import instantiate_from_bundle
 
-        out = tmp_path / "native"
-        convert_to_native(WHISPER_CKPT, str(out))
-        arch, bundle = load_checkpoint_bundle(out)
-        assert (arch, bundle.source_format) == ("whisper", "native")
+        bundle, _converted = assert_native_weights_round_trip(WHISPER_CKPT, tmp_path, "whisper")
         assert bundle.tokenizer.kind == "whisper"
-        m2, cfg2, _ = instantiate_from_bundle(arch, bundle)
-        assert cfg2.sot_sequence() == [50258, 50259, 50359, 50363]
-
-        arch1, b1 = load_checkpoint_bundle(WHISPER_CKPT)
-        m1, _, _ = instantiate_from_bundle(arch1, b1)
-        sd1, sd2 = m1.state_dict(), m2.state_dict()
-        assert set(sd1) == set(sd2)
-        for k in sd1:
-            assert torch.equal(sd1[k], sd2[k]), k
+        _model, cfg, _report = instantiate_from_bundle("whisper", bundle)
+        assert cfg.sot_sequence() == [50258, 50259, 50359, 50363]
 
 
 # ---------------------------------------------------------------------------

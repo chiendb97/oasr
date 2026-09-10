@@ -108,10 +108,17 @@ def test_an_undeclared_stage_is_rejected(collector):
         collector.observe_stage("offline.micro_batch[B=16]", 0.001)
 
 
-@pytest.mark.parametrize("stage", sorted(m.STAGES))
-def test_every_declared_stage_is_recordable(collector, stage):
-    collector.observe_stage(stage, 0.5)
-    assert collector.snapshot()["keyed_hist"][m.STAGE_HOST_SECONDS][stage] == [0.5]
+def test_every_declared_stage_is_recordable(collector):
+    """One test over the whole vocabulary, not one pytest node per member.
+
+    The claim is a property of ``STAGES`` as a set -- the collector accepts
+    every name in it -- and the loop reports which member failed just as well
+    as a parametrize id would, at a thirteenth of the collection.
+    """
+    for stage in sorted(m.STAGES):
+        collector.observe_stage(stage, 0.5)
+    snapshot = collector.snapshot()["keyed_hist"][m.STAGE_HOST_SECONDS]
+    assert {s: snapshot[s] for s in m.STAGES} == {s: [0.5] for s in m.STAGES}
 
 
 def test_stage_names_are_prefixed_by_their_executor():

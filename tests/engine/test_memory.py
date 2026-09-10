@@ -16,12 +16,11 @@ allocates, and that deriving it changes capacity and not transcripts.
 
 from __future__ import annotations
 
-import glob
 import logging
-import os
 
 import pytest
 import torch
+from helpers.audio import waveform
 
 from oasr.cache.block_pool import BlockPool
 from oasr.cache.types import CacheConfig
@@ -282,58 +281,9 @@ class TestPoolOwnershipIsDeclared:
 # ---------------------------------------------------------------------------
 
 
-class TestEngineConfigSurface:
-    def test_none_means_derive_and_is_accepted(self):
-        cfg = EngineConfig(max_num_blocks=None)
-        assert cfg.max_num_blocks is None
-
-    def test_zero_blocks_is_still_a_mistake(self):
-        with pytest.raises(ValueError, match="max_num_blocks"):
-            EngineConfig(max_num_blocks=0)
-
-    @pytest.mark.parametrize("bad", [0.0, -0.1, 1.5])
-    def test_utilization_bounds(self, bad):
-        with pytest.raises(ValueError, match="gpu_memory_utilization"):
-            EngineConfig(gpu_memory_utilization=bad)
-
-    def test_kv_budget_zero_is_off_negative_is_an_error(self):
-        assert EngineConfig(decode_kv_budget_gib=0).decode_kv_budget_gib == 0
-        with pytest.raises(ValueError, match="decode_kv_budget_gib"):
-            EngineConfig(decode_kv_budget_gib=-1.0)
-
-    def test_build_cache_config_refuses_an_unresolved_pool(self):
-        """``None`` is a request for a derivation, not a value.  Reaching the
-        cache config with it unresolved means nobody derived it."""
-        from oasr.models.base import CacheSpec
-
-        spec = CacheSpec(
-            num_layers=4, n_kv_head=2, head_dim=32, hidden_dim=128, conv_kernel_size=15
-        )
-        cfg = EngineConfig(max_num_blocks=None)
-        with pytest.raises(ValueError, match="derive from free VRAM"):
-            cfg.build_cache_config(spec)
-
-    def test_build_cache_config_passes_a_resolved_pool_through(self):
-        from oasr.models.base import CacheSpec
-
-        spec = CacheSpec(
-            num_layers=4, n_kv_head=2, head_dim=32, hidden_dim=128, conv_kernel_size=15
-        )
-        cc = EngineConfig(max_num_blocks=777).build_cache_config(spec)
-        assert cc.max_num_blocks == 777
-
-
 # ---------------------------------------------------------------------------
 # On a real device, with a real checkpoint
 # ---------------------------------------------------------------------------
-
-
-def _first_wav(wav_dir: str) -> torch.Tensor:
-    import torchaudio
-
-    wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
-    wave, _sr = torchaudio.load(wavs[0])
-    return wave.squeeze(0)
 
 
 @pytest.mark.cuda
@@ -381,7 +331,7 @@ class TestDerivedPoolOnDevice:
     def test_deriving_changes_capacity_not_transcripts(self, ckpt_dir, wav_dir, device):
         """A derived pool is bigger, so streams live longer — but a clip that fit
         the old pool must decode to exactly the same text."""
-        wave = _first_wav(wav_dir)
+        wave = waveform(wav_dir)
         explicit = self._engine(ckpt_dir, max_num_blocks=2048)
         try:
             baseline = explicit.transcribe(wave)
@@ -417,7 +367,7 @@ class TestDerivedPoolOnDevice:
             # And the invariant CacheConfig checks is satisfied by construction.
             pool_cfg = engine._model_runner._block_pool.config
             assert pool_cfg.max_num_blocks >= batch * pool_cfg.blocks_per_stream
-            assert engine.transcribe(_first_wav(wav_dir)).strip()
+            assert engine.transcribe(waveform(wav_dir)).strip()
         finally:
             engine.shutdown()
 
@@ -461,7 +411,7 @@ class TestDerivedDecodeKvBudget:
             assert isinstance(budget, float) and budget > 0
             assert engine._memory_profile is not None
             # A derived ceiling must not throttle a batch the card can hold.
-            texts = engine.transcribe_offline([_first_wav(wav_dir)])
+            texts = engine.transcribe_offline([waveform(wav_dir)])
             assert texts and isinstance(texts[0], str) and texts[0].strip()
         finally:
             engine.shutdown()
@@ -502,7 +452,6 @@ class TestExplicitPoolFloor:
         return ASREngine.__new__(ASREngine)
 
     def _config(self, **over):
-        from oasr.engine.config import EngineConfig
 
         kw = {"ckpt_dir": "x", "device": "cpu", "max_batch_size": 64, "max_num_blocks": 2048}
         kw.update(over)
@@ -545,3 +494,58 @@ class TestExplicitPoolFloor:
             with caplog.at_level(logging.WARNING, logger="oasr.engine.engine"):
                 self._engine()._check_explicit_kv_pool(cfg)
             assert bool(caplog.records) is expect_warning, (blocks, caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# The pool invariant, checked at construction
+#
+# Two shipped fixtures were latently wrong before this existed: a pool too
+# small for ``max_batch_size`` streams does not fail until a request arrives,
+# and then it fails as a mid-stream exhaustion rather than as a config error.
+# ---------------------------------------------------------------------------
+
+
+class TestPoolInvariant:
+    def test_undersized_pool_raises_at_construction(self):
+        with pytest.raises(ValueError, match="cannot hold"):
+            CacheConfig(
+                num_left_chunks=16,
+                chunk_size=16,
+                block_size_frames=16,
+                max_batch_size=32,
+                max_num_blocks=64,
+            )
+
+    def test_the_message_carries_the_arithmetic(self):
+        """A capacity error nobody can act on is a crash with extra steps."""
+        with pytest.raises(ValueError) as exc:
+            CacheConfig(
+                num_left_chunks=16,
+                chunk_size=16,
+                block_size_frames=16,
+                max_batch_size=32,
+                max_num_blocks=64,
+            )
+        msg = str(exc.value)
+        for fragment in ("64", "32", "16 blocks each", "512", "max_num_blocks"):
+            assert fragment in msg, f"{fragment!r} missing from: {msg}"
+
+    def test_sufficient_pool_is_accepted(self):
+        cfg = CacheConfig(
+            num_left_chunks=16,
+            chunk_size=16,
+            block_size_frames=16,
+            max_batch_size=32,
+            max_num_blocks=512,
+        )
+        assert cfg.max_num_blocks >= cfg.max_batch_size * cfg.blocks_per_stream
+
+    def test_unlimited_history_is_bounded_by_construction(self):
+        """``num_left_chunks < 0`` derives blocks_per_stream from the pool.
+
+        The check must not fire there: the fair share *is* ``max_num_blocks //
+        max_batch_size``, so the invariant is an identity rather than a
+        constraint, and rejecting a small pool would break the default config.
+        """
+        cfg = CacheConfig(num_left_chunks=-1, max_batch_size=32, max_num_blocks=8)
+        assert cfg.max_num_blocks <= cfg.max_batch_size * cfg.blocks_per_stream

@@ -1,93 +1,70 @@
 #!/usr/bin/env python3
-"""
-Unit tests for functional normalization API (TVM-FFI JIT path).
+# Copyright 2024 OASR Authors
+# SPDX-License-Identifier: Apache-2.0
+"""Normalization kernels (``oasr/functionals/norm.py``) against torch.
+
+Every kernel here reduces over the last dim, so the grid axes that reach a
+different code path are the **row width** (vec4 vs the scalar tail) and the
+**row layout**; batch and sequence are grid parallelism.  ``alpha`` and
+``has_bias`` are a scalar multiply and a vector add in the epilogue, and
+neither can interact with the width or the dtype -- so they are swept as a
+pair of representative combinations rather than as a full product.
+
+:class:`TestRowLayoutPrecondition` is the load-bearing part of the file: the
+launchers used to accept a padded row stride and return a plausible wrong
+answer.
 """
 
 import pytest
 import torch
+from helpers import assert_dest_passing, tol
 
 import oasr
 
-# Every test in this module allocates directly on ``device="cuda"`` and calls a
-# JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
-# what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
-# instead of a wall of `RuntimeError: No CUDA GPUs are available`.
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+pytestmark = pytest.mark.cuda
 
 
 class TestLayerNorm:
     """Tests for oasr.layer_norm() functional API."""
 
-    @pytest.mark.parametrize(
-        "batch_size,seq_len,hidden_size",
-        [
-            (1, 64, 128),
-            (2, 128, 256),
-            (4, 256, 512),
-        ],
-    )
+    #: One vec4-aligned row width and one that is not: the two launcher paths.
+    @pytest.mark.parametrize("hidden_size", [256, 130])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-    def test_layer_norm(self, batch_size, seq_len, hidden_size, dtype):
+    @pytest.mark.parametrize("has_bias", [True, False])
+    def test_layer_norm(self, hidden_size, dtype, has_bias):
         eps = 1e-5
-        x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+        x = torch.randn(2, 128, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
-        bias = torch.randn(hidden_size, device="cuda", dtype=dtype)
+        bias = torch.randn(hidden_size, device="cuda", dtype=dtype) if has_bias else None
 
         output = oasr.layer_norm(x, weight, bias, eps)
+        expected = torch.nn.functional.layer_norm(x, (hidden_size,), weight, bias, eps)
 
-        ln = torch.nn.LayerNorm(hidden_size, eps=eps, device="cuda", dtype=dtype)
-        ln.weight.data = weight.clone()
-        ln.bias.data = bias.clone()
-        expected = ln(x)
+        torch.testing.assert_close(output, expected, **tol(dtype))
 
-        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
-        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
-
-    def test_layer_norm_no_bias(self):
-        """Test LayerNorm without bias."""
-        batch_size, seq_len, hidden_size = 2, 128, 256
-        eps = 1e-5
-        x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float32)
-        weight = torch.randn(hidden_size, device="cuda", dtype=torch.float32)
-
-        output = oasr.layer_norm(x, weight, bias=None, eps=eps)
-
-        ln = torch.nn.LayerNorm(hidden_size, eps=eps, device="cuda", dtype=torch.float32)
-        ln.weight.data = weight.clone()
-        ln.bias.data.zero_()
-        expected = ln(x) - ln.bias.data  # Subtract bias since ref adds it
-        # Simpler: just use F.layer_norm
-        expected = torch.nn.functional.layer_norm(x, (hidden_size,), weight, None, eps)
-
-        torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
-
-    def test_layer_norm_destination_passing(self):
-        """Test LayerNorm with pre-allocated output."""
-        batch_size, seq_len, hidden_size = 2, 128, 256
-        x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float32)
-        weight = torch.randn(hidden_size, device="cuda", dtype=torch.float32)
-        bias = torch.randn(hidden_size, device="cuda", dtype=torch.float32)
-        out = torch.empty_like(x)
-
-        result = oasr.layer_norm(x, weight, bias, 1e-5, out=out)
-
-        assert result.data_ptr() == out.data_ptr()
+    def test_destination_passing(self):
+        x = torch.randn(2, 128, 256, device="cuda", dtype=torch.float32)
+        weight = torch.randn(256, device="cuda", dtype=torch.float32)
+        bias = torch.randn(256, device="cuda", dtype=torch.float32)
+        assert_dest_passing(
+            oasr.layer_norm,
+            x,
+            weight,
+            bias,
+            1e-5,
+            out=torch.empty_like(x),
+            expected=torch.nn.functional.layer_norm(x, (256,), weight, bias, 1e-5),
+        )
 
 
 class TestRMSNorm:
     """Tests for oasr.rms_norm() functional API."""
 
-    @pytest.mark.parametrize(
-        "batch_size,seq_len,hidden_size",
-        [
-            (1, 64, 128),
-            (2, 128, 256),
-        ],
-    )
+    @pytest.mark.parametrize("hidden_size", [256, 130])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-    def test_rms_norm(self, batch_size, seq_len, hidden_size, dtype):
+    def test_rms_norm(self, hidden_size, dtype):
         eps = 1e-6
-        x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+        x = torch.randn(2, 128, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
         output = oasr.rms_norm(x, weight, eps=eps)
@@ -96,8 +73,7 @@ class TestRMSNorm:
         rms = torch.sqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
         expected = (x.float() / rms * weight.float()).to(dtype)
 
-        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
-        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
+        torch.testing.assert_close(output, expected, **tol(dtype))
 
 
 class TestAddRMSNorm:
@@ -120,10 +96,12 @@ class TestAddRMSNorm:
             normalized = normalized + bias.float()
         return normalized.to(x.dtype), summed_f.to(x.dtype)
 
+    #: ``alpha`` is a scalar on the add and ``has_bias`` a vector in the
+    #: epilogue; neither can interact with the row width or the dtype, so they
+    #: are swept as two representative pairs rather than as a 2x2 product.
+    @pytest.mark.parametrize("alpha,has_bias", [(1.0, True), (0.5, False)])
     @pytest.mark.parametrize("hidden_size", [256, 257])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-    @pytest.mark.parametrize("alpha", [1.0, 0.5])
-    @pytest.mark.parametrize("has_bias", [True, False])
     def test_add_rms_norm(self, hidden_size, dtype, alpha, has_bias):
         eps = 1e-6
         x = torch.randn(2, 17, hidden_size, device="cuda", dtype=dtype)
@@ -134,8 +112,7 @@ class TestAddRMSNorm:
         output = oasr.add_rms_norm(x, residual, weight, bias, eps, alpha)
         expected, _ = self._reference(x, residual, weight, bias, eps, alpha)
 
-        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (2e-2, 2e-2)
-        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
+        torch.testing.assert_close(output, expected, **tol(dtype, half=(2e-2, 2e-2)))
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("alpha", [1.0, 0.5])
@@ -149,44 +126,48 @@ class TestAddRMSNorm:
         output, residual_out = oasr.add_rms_norm_residual(x, residual, weight, None, eps, alpha)
 
         torch.testing.assert_close(residual_out, summed, rtol=0, atol=0)
-        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (2e-2, 2e-2)
-        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
+        torch.testing.assert_close(output, expected, **tol(dtype, half=(2e-2, 2e-2)))
 
     def test_destination_passing(self):
         x = torch.randn(2, 8, 256, device="cuda", dtype=torch.float16)
         residual = torch.randn_like(x)
         weight = torch.randn(256, device="cuda", dtype=torch.float16)
-        out = torch.empty_like(x)
-        residual_out = torch.empty_like(x)
+        expected, summed = self._reference(x, residual, weight, None, 1e-6, 1.0)
 
-        result = oasr.add_rms_norm(x, residual, weight, out=out)
-        assert result.data_ptr() == out.data_ptr()
-
-        result, result_residual = oasr.add_rms_norm_residual(
-            x, residual, weight, out=out, residual_out=residual_out
+        assert_dest_passing(
+            oasr.add_rms_norm, x, residual, weight, out=torch.empty_like(x), expected=expected
         )
-        assert result.data_ptr() == out.data_ptr()
-        assert result_residual.data_ptr() == residual_out.data_ptr()
+
+        out, residual_out = torch.empty_like(x), torch.empty_like(x)
+        assert_dest_passing(
+            oasr.add_rms_norm_residual,
+            x,
+            residual,
+            weight,
+            out=out,
+            outs=[residual_out],
+            residual_out=residual_out,
+        )
+        torch.testing.assert_close(residual_out, summed, rtol=0, atol=0)
 
 
 class TestBatchNorm1D:
     """Tests for oasr.batch_norm_1d() functional API."""
 
-    @pytest.mark.parametrize(
-        "batch_size,seq_len,channels",
-        [
-            (2, 128, 64),
-            (4, 256, 128),
-        ],
-    )
+    @pytest.mark.parametrize("channels", [64, 130])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-    def test_batch_norm_1d(self, batch_size, seq_len, channels, dtype):
+    def test_batch_norm_1d(self, channels, dtype):
+        """The affine parameters are deliberately not the identity.
+
+        ``weight=1, bias=0, mean=0, var=1`` makes the whole transform an
+        identity, so the test would pass on a kernel that ignored all four.
+        """
         eps = 1e-5
-        x = torch.randn(batch_size, seq_len, channels, device="cuda", dtype=dtype)
-        weight = torch.ones(channels, device="cuda", dtype=dtype)
-        bias = torch.zeros(channels, device="cuda", dtype=dtype)
-        running_mean = torch.zeros(channels, device="cuda", dtype=dtype)
-        running_var = torch.ones(channels, device="cuda", dtype=dtype)
+        x = torch.randn(2, 128, channels, device="cuda", dtype=dtype)
+        weight = torch.randn(channels, device="cuda", dtype=dtype)
+        bias = torch.randn(channels, device="cuda", dtype=dtype)
+        running_mean = torch.randn(channels, device="cuda", dtype=dtype)
+        running_var = torch.rand(channels, device="cuda", dtype=dtype) + 0.5
 
         output = oasr.batch_norm_1d(x, weight, bias, running_mean, running_var, eps)
 
@@ -198,30 +179,34 @@ class TestBatchNorm1D:
             + bias.float()
         ).to(dtype)
 
-        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
-        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
+        torch.testing.assert_close(output, expected, **tol(dtype))
 
 
 class TestGroupNorm:
     """Tests for oasr.group_norm() functional API."""
 
-    @pytest.mark.parametrize(
-        "batch_size,seq_len,channels,num_groups",
-        [
-            (2, 128, 64, 4),
-            (4, 256, 128, 8),
-        ],
-    )
-    def test_group_norm(self, batch_size, seq_len, channels, num_groups):
+    @pytest.mark.parametrize("channels,num_groups", [(64, 4), (128, 8)])
+    def test_group_norm(self, channels, num_groups):
+        """Against ``F.group_norm`` over the flattened rows.
+
+        This used to assert ``output.shape == x.shape`` and nothing else, so it
+        passed on any kernel that allocated the right buffer -- including one
+        that never wrote to it.
+        """
         eps = 1e-5
-        dtype = torch.float32
-        x = torch.randn(batch_size, seq_len, channels, device="cuda", dtype=dtype)
-        weight = torch.ones(channels, device="cuda", dtype=dtype)
-        bias = torch.zeros(channels, device="cuda", dtype=dtype)
+        B, T = 2, 128
+        x = torch.randn(B, T, channels, device="cuda", dtype=torch.float32)
+        weight = torch.randn(channels, device="cuda", dtype=torch.float32)
+        bias = torch.randn(channels, device="cuda", dtype=torch.float32)
 
         output = oasr.group_norm(x, weight, bias, num_groups, eps)
 
-        assert output.shape == x.shape
+        # The kernel normalizes per (row, group), i.e. each (b, t) row is its
+        # own "batch" of `channels` values split into `num_groups`.
+        expected = torch.nn.functional.group_norm(
+            x.reshape(B * T, channels), num_groups, weight, bias, eps
+        ).reshape(B, T, channels)
+        torch.testing.assert_close(output, expected, **tol(torch.float32))
 
 
 class TestAddLayerNorm:
@@ -246,16 +231,14 @@ class TestAddLayerNorm:
             combined, (hidden_size,), weight.float(), bias.float(), eps
         ).to(dtype)
 
-        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
-        torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
+        torch.testing.assert_close(output, expected, **tol(dtype))
 
 
 class TestAddLayerNormResidual:
     """Tests for oasr.add_layer_norm_residual() (fused add+LN + residual sum)."""
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-    @pytest.mark.parametrize("alpha", [1.0, 0.5])
-    @pytest.mark.parametrize("has_bias", [True, False])
+    @pytest.mark.parametrize("alpha,has_bias", [(1.0, True), (0.5, False)])
     def test_add_layer_norm_residual(self, dtype, alpha, has_bias):
         batch_size, seq_len, hidden_size = 2, 128, 256
         eps = 1e-5
@@ -277,8 +260,7 @@ class TestAddLayerNormResidual:
 
         # The carried residual is the fp32 sum rounded once on output.
         torch.testing.assert_close(res_out, s_ref, rtol=0, atol=0)
-        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
-        torch.testing.assert_close(out, expected, rtol=rtol, atol=atol)
+        torch.testing.assert_close(out, expected, **tol(dtype))
 
 
 def _ref_bias_norm(x: torch.Tensor, bias: torch.Tensor, log_scale: torch.Tensor) -> torch.Tensor:
@@ -295,10 +277,8 @@ class TestBiasNorm:
     @pytest.mark.parametrize(
         "shape",
         [
-            (1, 64, 128),
-            (2, 128, 256),
-            (4, 250, 384),
-            (2, 8, 50, 64),  # 4D
+            (4, 250, 384),  # a real Zipformer width
+            (2, 8, 50, 64),  # 4-D
         ],
     )
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -311,8 +291,9 @@ class TestBiasNorm:
         output = oasr.bias_norm(x, bias, log_scale)
         expected = _ref_bias_norm(x, bias, log_scale)
 
-        rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (2e-2, 2e-2)
-        torch.testing.assert_close(output.float(), expected.float(), rtol=rtol, atol=atol)
+        torch.testing.assert_close(
+            output.float(), expected.float(), **tol(dtype, half=(2e-2, 2e-2))
+        )
 
     def test_bias_norm_non_vec_aligned(self):
         """Hidden size not divisible by 4 must fall back to the scalar path."""
@@ -326,17 +307,20 @@ class TestBiasNorm:
         x = torch.randn(2, 128, 256, device="cuda", dtype=torch.float32)
         bias = torch.randn(256, device="cuda", dtype=torch.float32) * 0.1
         log_scale = torch.tensor(0.3, device="cuda", dtype=torch.float32)
-        out = torch.empty_like(x)
-        result = oasr.bias_norm(x, bias, log_scale, out=out)
-        assert result.data_ptr() == out.data_ptr()
-        torch.testing.assert_close(out, _ref_bias_norm(x, bias, log_scale), rtol=1e-4, atol=1e-4)
+        assert_dest_passing(
+            oasr.bias_norm,
+            x,
+            bias,
+            log_scale,
+            out=torch.empty_like(x),
+            expected=_ref_bias_norm(x, bias, log_scale),
+        )
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 class TestRowLayoutPrecondition:
     """What the norm kernels actually require of their input layout.
 

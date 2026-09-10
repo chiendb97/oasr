@@ -30,7 +30,7 @@ from oasr.jit.gemm import (
 # JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
 # what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
 # instead of a wall of `RuntimeError: No CUDA GPUs are available`.
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+pytestmark = pytest.mark.cuda
 
 
 _SM = _get_target_sm()
@@ -48,36 +48,30 @@ _WHISPER_SHAPES = [(384, 384), (1536, 384), (384, 1536)]
 _WHISPER_MS = [128, 256, 1500, 3000, 6000, 12000, 24000, 96000]
 
 
-def test_capture_reads_bmm_shapes_off_the_trailing_axes():
-    """A 4-D BMM must not have its N recorded from the contraction axis.
-
-    ``_shapes_of`` used to read ``B.shape[1]``, which is N only for a 3-D
-    operand.  On Zipformer's 4-D calls that is the *batch* axis, so the tuner
-    would have keyed rules on a shape that never ran.
-    """
-    from oasr.tune.capture import _shapes_of
-
-    A = torch.empty(8, 3, 17, 4, device="cuda", dtype=torch.float16)
-    B = torch.empty(8, 1, 33, 4, device="cuda", dtype=torch.float16)
-    assert _shapes_of("bmm", (A, B), {}) == (17, 33, 4, 24)
-
-    A3 = torch.empty(5, 17, 8, device="cuda", dtype=torch.float16)
-    B3 = torch.empty(5, 33, 8, device="cuda", dtype=torch.float16)
-    assert _shapes_of("bmm", (A3, B3), {}) == (17, 33, 8, 5)
-
-
 class TestTorchBackend:
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_torch_gemm(self, dtype):
+    """The torch fallback: destination-passing, transposed B, activation ids.
+
+    Numerical parity is *not* what is checked here. ``torch_gemm`` is a thin
+    wrapper over ``F.linear``, so asserting it equals ``F.linear`` asserts
+    nothing about OASR -- it would pass on any wrapper that forwarded its
+    arguments. What can actually go wrong is the plumbing: writing somewhere
+    other than ``out``, forgetting that B arrives transposed, or mapping an
+    activation id to the wrong function. One case per entry point covers the
+    first two; the activation ids get their own sweep because the id table is
+    the part with a real chance of drifting.
+    """
+
+    def test_torch_gemm_writes_into_out_with_b_transposed(self):
         M, N, K = 48, 256, 2048
-        A = torch.randn(M, K, device="cuda", dtype=dtype)
-        B = torch.randn(N, K, device="cuda", dtype=dtype)
-        C = torch.randn(N, device="cuda", dtype=dtype)
-        out = torch.empty(M, N, device="cuda", dtype=dtype)
-        torch_gemm(out, A, B, C)
+        A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+        B = torch.randn(N, K, device="cuda", dtype=torch.float16)
+        C = torch.randn(N, device="cuda", dtype=torch.float16)
+        out = torch.empty(M, N, device="cuda", dtype=torch.float16)
+        ret = torch_gemm(out, A, B, C)
+        if ret is not None:
+            assert ret.data_ptr() == out.data_ptr()
         torch.testing.assert_close(out, F.linear(A, B, C), rtol=2e-2, atol=2e-2)
 
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize(
         "act,ref",
         [
@@ -87,21 +81,22 @@ class TestTorchBackend:
             (4, F.gelu),
         ],
     )
-    def test_torch_gemm_activation(self, dtype, act, ref):
+    def test_torch_gemm_activation_id_table(self, act, ref):
+        """Id 1 is the *tanh* approximation and id 4 the exact erf; swapping
+        them is a silent accuracy change, which is what this pins."""
         M, N, K = 48, 2048, 256
-        A = torch.randn(M, K, device="cuda", dtype=dtype)
-        B = torch.randn(N, K, device="cuda", dtype=dtype)
-        C = torch.randn(N, device="cuda", dtype=dtype)
-        out = torch.empty(M, N, device="cuda", dtype=dtype)
+        A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+        B = torch.randn(N, K, device="cuda", dtype=torch.float16)
+        C = torch.randn(N, device="cuda", dtype=torch.float16)
+        out = torch.empty(M, N, device="cuda", dtype=torch.float16)
         torch_gemm_activation(out, A, B, C, act)
         torch.testing.assert_close(out, ref(F.linear(A, B, C)), rtol=2e-2, atol=2e-2)
 
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_torch_bmm(self, dtype):
+    def test_torch_bmm_writes_into_out_with_b_transposed(self):
         Bc, M, N, K = 8, 64, 128, 256
-        A = torch.randn(Bc, M, K, device="cuda", dtype=dtype)
-        B = torch.randn(Bc, N, K, device="cuda", dtype=dtype)
-        out = torch.empty(Bc, M, N, device="cuda", dtype=dtype)
+        A = torch.randn(Bc, M, K, device="cuda", dtype=torch.float16)
+        B = torch.randn(Bc, N, K, device="cuda", dtype=torch.float16)
+        out = torch.empty(Bc, M, N, device="cuda", dtype=torch.float16)
         torch_bmm(out, A, B)
         torch.testing.assert_close(out, torch.bmm(A, B.transpose(-1, -2)), rtol=2e-2, atol=2e-2)
 
@@ -155,19 +150,22 @@ class TestSelectDefaultConfig:
         )
 
     @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
-    @pytest.mark.parametrize(
-        "op,N,K",
-        [("gemm", n, k) for (n, k) in _FF_CONV_SHAPES + _WHISPER_SHAPES]
-        + [("gemm_activation", 2048, 256)],
-    )
-    @pytest.mark.parametrize("M", [16, 64, 256, 720, 2048, 16000])
-    def test_actionable_configs(self, op, N, K, M):
-        """Every CUTLASS config the heuristic returns must be a compiled kernel."""
-        cfg = select_default_config(op, M, N, K, torch.bfloat16, 120)
-        if cfg == "torch":
-            return
+    def test_actionable_configs(self):
+        """Every CUTLASS config the heuristic returns must be a compiled kernel.
+
+        One test over the whole cross-product rather than 48 pytest nodes: each
+        case is a dict lookup with no setup, so a node per case buys attribution
+        that the assertion message already carries.
+        """
+        ops = [("gemm", n, k) for (n, k) in _FF_CONV_SHAPES + _WHISPER_SHAPES]
+        ops += [("gemm_activation", 2048, 256)]
         compiled = get_unique_compile_configs(120)
-        assert cfg.compile_name in compiled, f"{cfg.compile_name} is not compiled"
+        for op, N, K in ops:
+            for M in (16, 64, 256, 720, 2048, 16000):
+                cfg = select_default_config(op, M, N, K, torch.bfloat16, 120)
+                if cfg == "torch":
+                    continue
+                assert cfg.compile_name in compiled, f"{op} M={M} N={N} K={K}: {cfg.compile_name}"
 
 
 class TestWhisperShapesAreCovered:
@@ -253,8 +251,10 @@ class TestRuleMissReporting:
 class TestProductionDispatch:
     """End-to-end numerics through the non-autotuned production path."""
 
+    #: One M in the small-M rule band and one well above it. The bands between
+    #: them route through the same two rule branches at 4x the launch cost.
     @pytest.mark.parametrize("N,K", _FF_CONV_SHAPES + _WHISPER_SHAPES)
-    @pytest.mark.parametrize("M", [16, 64, 720, 9472])
+    @pytest.mark.parametrize("M", [16, 9472])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_gemm(self, N, K, M, dtype):
         """Whatever backend the rules route to must stay within the same
@@ -273,7 +273,7 @@ class TestProductionDispatch:
         floor = 1e-2 * (K / 256) ** 0.5 * (4.0 if dtype == torch.bfloat16 else 1.0)
         assert our_err <= max(4.0 * torch_err, floor), f"error {our_err} vs torch's own {torch_err}"
 
-    @pytest.mark.parametrize("M", [16, 64, 720, 9472])
+    @pytest.mark.parametrize("M", [16, 9472])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_gemm_activation_swish(self, M, dtype):
         N, K = 2048, 256

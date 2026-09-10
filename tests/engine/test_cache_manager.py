@@ -13,6 +13,9 @@ Tests are grouped into:
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import List, Tuple
+
 import pytest
 import torch
 
@@ -24,6 +27,8 @@ from oasr.cache import (
     CtcStateCacheManager,
     StreamContext,
 )
+from oasr.features import FeatureConfig, extract_features_batch
+from oasr.layers import LSTM, RNN
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1300,3 +1305,712 @@ class TestStreamReset:
         cache.reset_stream(9)
         assert cache.steps_taken(9) == 0
         assert cache.hidden(0)[:, 0].abs().sum() == 0
+
+
+# ---------------------------------------------------------------------------
+# Recurrent state cache and its continuous batcher
+#
+# ``RecurrentStateCache`` / ``RecurrentContinuousBatcher`` are ``oasr/cache``,
+# not kernels: the slot-addressed step primitive they drive is tested next to
+# the LSTM kernel, but the admission and slot bookkeeping belong here with the
+# other cache managers.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cuda
+class TestRecurrentContinuousBatching:
+    """Timestep-granular continuous batching against a per-sequence oracle."""
+
+    LENGTHS = [7, 3, 11, 2, 9, 5, 13, 4, 6, 8]
+
+    def _drive(self, module, cache, batcher, sequences):
+        collected = {key: [] for key in sequences}
+        ticks = 0
+        while True:
+            plan = batcher.next_step()
+            if plan is None:
+                break
+            out = module.step(plan.frames, cache, plan.slot_ids, plan.read_parity)
+            assert out.shape == (len(plan.stream_ids), module.hidden_size)
+            for row, key in enumerate(plan.stream_ids):
+                collected[key].append(out[row].clone())
+            batcher.commit(plan)
+            ticks += 1
+        return collected, ticks
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("cls,layers", [(LSTM, 2), (RNN, 1)])
+    def test_matches_per_sequence_forward(self, device, dtype, cls, layers):
+        from oasr.cache import RecurrentContinuousBatcher, RecurrentStateCache
+
+        hidden = width = 256
+        slots = 4
+        module = cls(width, hidden, layers).cuda().to(dtype)
+        cache = RecurrentStateCache(
+            layers, hidden, slots, torch.device("cuda"), dtype, cell=(cls is LSTM)
+        )
+        batcher = RecurrentContinuousBatcher(cache, width)
+        g = torch.Generator(device="cuda").manual_seed(21)
+        sequences = {
+            i: torch.randn(n, width, device="cuda", dtype=dtype, generator=g) * 0.5
+            for i, n in enumerate(self.LENGTHS)
+        }
+        for key, frames in sequences.items():
+            batcher.submit(key, frames)
+
+        collected, ticks = self._drive(module, cache, batcher, sequences)
+
+        # Every frame was stepped exactly once, and no cohort ran past its length.
+        assert ticks >= max(self.LENGTHS)
+        assert sum(len(v) for v in collected.values()) == sum(self.LENGTHS)
+        for key, frames in sequences.items():
+            assert len(collected[key]) == frames.shape[0]
+            expected = module(frames.unsqueeze(1))[0][:, 0]
+            torch.testing.assert_close(torch.stack(collected[key]), expected, rtol=2e-2, atol=2e-2)
+
+    def test_slots_are_recycled_not_leaked(self, device):
+        from oasr.cache import RecurrentContinuousBatcher, RecurrentStateCache
+
+        cache = RecurrentStateCache(1, 32, 2, torch.device("cuda"), torch.float16)
+        batcher = RecurrentContinuousBatcher(cache, 32)
+        module = LSTM(32, 32, 1).cuda().half()
+        for i, n in enumerate([1, 2, 3, 1, 2]):
+            batcher.submit(i, torch.randn(n, 32, device="cuda", dtype=torch.float16))
+        seen_peak = 0
+        while True:
+            plan = batcher.next_step()
+            if plan is None:
+                break
+            module.step(plan.frames, cache, plan.slot_ids, plan.read_parity)
+            batcher.commit(plan)
+            seen_peak = max(seen_peak, len(plan.stream_ids))
+        # Five streams through two slots: capacity was reused, never exceeded.
+        assert seen_peak == 2
+        assert batcher.active == 0 and batcher.pending == 0
+        assert not batcher
+
+    def test_fresh_slot_starts_from_zero_state(self, device):
+        """An admitted stream must see zero h/c, not the retired stream's tail."""
+        from oasr.cache import RecurrentContinuousBatcher, RecurrentStateCache
+
+        hidden = width = 64
+        module = LSTM(width, hidden, 1).cuda().half()
+        cache = RecurrentStateCache(1, hidden, 1, torch.device("cuda"), torch.float16)
+        batcher = RecurrentContinuousBatcher(cache, width)
+        g = torch.Generator(device="cuda").manual_seed(31)
+        first = torch.randn(4, width, device="cuda", dtype=torch.float16, generator=g)
+        second = torch.randn(3, width, device="cuda", dtype=torch.float16, generator=g)
+        batcher.submit("first", first)
+        batcher.submit("second", second)
+        out = {"first": [], "second": []}
+        while True:
+            plan = batcher.next_step()
+            if plan is None:
+                break
+            y = module.step(plan.frames, cache, plan.slot_ids, plan.read_parity)
+            out[plan.stream_ids[0]].append(y[0].clone())
+            batcher.commit(plan)
+        # The second stream ran on the slot the first one released.
+        expected = module(second.unsqueeze(1))[0][:, 0]
+        torch.testing.assert_close(torch.stack(out["second"]), expected, rtol=2e-2, atol=2e-2)
+
+    def test_step_rejects_geometry_and_dtype_mismatch(self, device):
+        from oasr.cache import RecurrentStateCache
+
+        cache = RecurrentStateCache(1, 32, 2, torch.device("cuda"), torch.float16)
+        module = LSTM(32, 32, 1).cuda().half()
+        slot_ids = torch.zeros(1, device="cuda", dtype=torch.int64)
+        parity = torch.zeros(1, device="cuda", dtype=torch.int32)
+        with pytest.raises(ValueError, match="step frames"):
+            module.step(
+                torch.randn(1, 7, device="cuda", dtype=torch.float16), cache, slot_ids, parity
+            )
+        with pytest.raises(ValueError, match="does not match"):
+            LSTM(32, 64, 1).cuda().half().step(
+                torch.randn(1, 32, device="cuda", dtype=torch.float16), cache, slot_ids, parity
+            )
+        with pytest.raises(NotImplementedError, match="no torch fallback"):
+            module.float().step(
+                torch.randn(1, 32, device="cuda", dtype=torch.float32), cache, slot_ids, parity
+            )
+        rnn_cache = RecurrentStateCache(1, 32, 2, torch.device("cuda"), torch.float16, cell=False)
+        with pytest.raises(ValueError, match="cell state"):
+            LSTM(32, 32, 1).cuda().half().step(
+                torch.randn(1, 32, device="cuda", dtype=torch.float16),
+                rnn_cache,
+                slot_ids,
+                parity,
+            )
+
+    def test_long_run_compacts_retired_frames(self, device):
+        """A batcher that outlives its streams must not retain every one of them.
+
+        Retired frames stay addressable until half the packed buffer is dead, so
+        the buffer is bounded by the live corpus rather than by everything ever
+        submitted -- and the streams that ran after a compaction must still be
+        correct, which is what would break if a base offset went stale.
+        """
+        from oasr.cache import RecurrentContinuousBatcher, RecurrentStateCache
+
+        hidden = width = 64
+        slots = 4
+        module = LSTM(width, hidden, 1).cuda().half()
+        cache = RecurrentStateCache(1, hidden, slots, torch.device("cuda"), torch.float16)
+        batcher = RecurrentContinuousBatcher(cache, width)
+        g = torch.Generator(device="cuda").manual_seed(41)
+        lengths = [3, 9, 5, 12, 4, 7, 6, 11, 2, 8] * 6
+        sequences = {
+            i: torch.randn(n, width, device="cuda", dtype=torch.float16, generator=g) * 0.4
+            for i, n in enumerate(lengths)
+        }
+        # Submitted in waves, as a server receives them -- all-up-front would make
+        # the first pack hold the whole corpus by definition and prove nothing.
+        pending = list(sequences.items())
+        collected = {key: [] for key in sequences}
+        peak_packed = 0
+        while pending or batcher:
+            for key, frames in pending[:10]:
+                batcher.submit(key, frames)
+            pending = pending[10:]
+            for _ in range(20):
+                plan = batcher.next_step()
+                if plan is None:
+                    break
+                out = module.step(plan.frames, cache, plan.slot_ids, plan.read_parity)
+                for row, key in enumerate(plan.stream_ids):
+                    collected[key].append(out[row].clone())
+                batcher.commit(plan)
+                peak_packed = max(peak_packed, batcher._packed.shape[0])
+
+        assert sum(len(v) for v in collected.values()) == sum(lengths)
+        # Compaction happened: the buffer never had to hold every submission.
+        assert peak_packed < sum(lengths)
+        # The last few streams ran entirely after compactions rebased the buffer.
+        for key in list(sequences)[-4:]:
+            expected = module(sequences[key].unsqueeze(1))[0][:, 0]
+            torch.testing.assert_close(torch.stack(collected[key]), expected, rtol=2e-2, atol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# The caches under a real encoder: Conformer + paged cache + CTC decoder
+#
+# ``test_pipeline.py`` wired ``BlockPool`` + ``AttentionCacheManager`` +
+# ``CnnCacheManager`` + ``CtcStateCacheManager`` + ``StreamContext`` by hand,
+# 75 lines of it, to test the same managers this file already builds -- down
+# to a second class also called ``TestMultiStreamIsolation``.  What it adds
+# over the unit tests above is that the wiring holds against a real checkpoint
+# and real audio, so that is what is kept.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Model-architecture constants (specific to the U2++ LibriSpeech checkpoint)
+# ---------------------------------------------------------------------------
+
+NUM_LAYERS = 12
+N_KV_HEAD = 4
+OUTPUT_SIZE = 256
+HEAD_DIM = OUTPUT_SIZE // N_KV_HEAD  # 64
+HIDDEN_DIM = 256
+KERNEL_SIZE = 15  # causal → lorder = 14
+VOCAB_SIZE_RAW = 5002
+VOCAB_SIZE = (VOCAB_SIZE_RAW + 7) // 8 * 8  # 5008 (padded to multiple of 8)
+
+# Streaming parameters
+CHUNK_SIZE = 16
+SUBSAMPLE_RATE = 4
+RIGHT_CONTEXT = 6
+# Input frames per chunk so subsampling yields exactly CHUNK_SIZE output frames:
+#   (chunk_size - 1) * subsample_rate + right_context + 1
+CHUNK_INPUT_TIME = (CHUNK_SIZE - 1) * SUBSAMPLE_RATE + RIGHT_CONTEXT + 1  # 67
+NUM_FEAT = 80  # log-mel bins
+# Waveform scaling the WeNet fbank frontend expects (int16 range); mirrors
+# EngineConfig.audio_scale / FeatureSpec.audio_scale.
+AUDIO_SCALE = 32768.0
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def model(ckpt_dir: str, device):
+    """Load the U2++ Conformer from the checkpoint supplied via --ckpt-dir."""
+    if not ckpt_dir or not (Path(ckpt_dir) / "final.pt").exists():
+        pytest.skip("Checkpoint not found; pass --ckpt-dir <path> or set CKPT_DIR")
+    from oasr.models.conformer import load_wenet_checkpoint
+
+    m, _ = load_wenet_checkpoint(ckpt_dir, device=str(device), dtype=torch.float16)
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Audio helpers
+# ---------------------------------------------------------------------------
+
+
+def _read_audio_and_extract_features(
+    path: str,
+    device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Load a WAV file and compute 80-dim log-mel filterbank features.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(1, T, 80)`` on *device* with the requested *dtype*.
+    """
+    import torchaudio
+
+    audio, sr = torchaudio.load(path)
+    assert sr == 16000, f"expected 16 kHz audio, got {sr}"
+    # WeNet/Kaldi fbank is computed on int16-range samples, so the waveform
+    # must be scaled by AUDIO_SCALE before extraction -- this is what the
+    # engine does with ``FeatureSpec.audio_scale`` / ``EngineConfig.audio_scale``
+    # (oasr/engine/input_processor.py). torchaudio.load returns [-1, 1]
+    # floats; feeding those in unscaled shifts every log-mel bin by
+    # ~log(32768**2) and puts the input far outside the training
+    # distribution, at which point the model correctly emits nothing but
+    # blanks and the CTC transcript comes back empty.
+    audio = audio * AUDIO_SCALE
+    cfg = FeatureConfig(
+        sample_rate=16000,
+        num_mel_bins=NUM_FEAT,
+        frame_length_ms=25.0,
+        frame_shift_ms=10.0,
+        dither=1.0,
+    )
+    feats, _ = extract_features_batch([audio], cfg)
+    return feats.to(device=device, dtype=dtype)
+
+
+def _chunk_features(feats: torch.Tensor) -> List[torch.Tensor]:
+    """Split a ``(1, T, F)`` feature tensor into streaming windows."""
+    T = feats.size(1)
+    stride = SUBSAMPLE_RATE * CHUNK_SIZE
+    chunks = []
+    for cur in range(0, T - RIGHT_CONTEXT, stride):
+        end = min(cur + CHUNK_INPUT_TIME, T)
+        chunks.append(feats[:, cur:end, :])
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# Vocabulary helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_id2word(ckpt_dir: str) -> dict:
+    """Load the ``id → word`` vocabulary from ``<ckpt_dir>/words.txt``."""
+    id2word: dict = {}
+    with open(Path(ckpt_dir) / "words.txt") as fh:
+        for line in fh:
+            parts = line.strip().split()
+            if len(parts) == 2:
+                word, idx = parts
+                id2word[int(idx)] = word
+    return id2word
+
+
+def _tokens_to_text(token_ids: list, id2word: dict) -> str:
+    return "".join(id2word.get(t, "") for t in token_ids).replace("▁", " ").strip()
+
+
+# ---------------------------------------------------------------------------
+# Synthetic-chunk helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_chunks(
+    n: int,
+    seed: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> List[torch.Tensor]:
+    """Return *n* random acoustic feature chunks ``(1, CHUNK_INPUT_TIME, NUM_FEAT)``."""
+    torch.manual_seed(seed)
+    return [
+        torch.randn(1, CHUNK_INPUT_TIME, NUM_FEAT, dtype=dtype, device=device) for _ in range(n)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Paged streaming pipeline
+# ---------------------------------------------------------------------------
+
+
+def _cache_manager_streaming_paged(
+    model,
+    chunks: List[torch.Tensor],
+    num_left_chunks: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    vocab_size: int = VOCAB_SIZE,
+    beam_size: int = 5,
+) -> Tuple:
+    """Run chunk-by-chunk inference using paged KV cache + CTC decoder.
+
+    Returns ``(logits_list, all_logits, streaming_result, pool)``.
+    """
+    from oasr.cache import (
+        AttentionCacheManager,
+        BlockPool,
+        CacheConfig,
+        CnnCacheManager,
+        CtcStateCacheManager,
+        StreamContext,
+    )
+    from oasr.functionals.ctc_decode import GpuDecoderConfig
+
+    n_chunks = len(chunks)
+    max_blocks = max(64, (abs(num_left_chunks) if num_left_chunks > 0 else n_chunks) * 4)
+
+    cfg = CacheConfig(
+        num_layers=NUM_LAYERS,
+        n_kv_head=N_KV_HEAD,
+        head_dim=HEAD_DIM,
+        hidden_dim=HIDDEN_DIM,
+        kernel_size=KERNEL_SIZE,
+        chunk_size=CHUNK_SIZE,
+        num_left_chunks=num_left_chunks,
+        block_size_frames=CHUNK_SIZE,
+        max_num_blocks=max_blocks,
+        max_blocks_per_seq=max(64, n_chunks + 4),
+        device=device,
+        dtype=dtype,
+    )
+    pool = BlockPool(cfg)
+    att_mgr = AttentionCacheManager(pool, cfg)
+    cnn_mgr = CnnCacheManager(cfg)
+    ctc_mgr = CtcStateCacheManager(GpuDecoderConfig(beam_size=beam_size))
+
+    sid = 0
+    att_mgr.allocate_stream(sid, slot_id=0)
+    cnn_mgr.allocate_stream(sid, slot_id=0)
+    ctc_mgr.allocate_stream(sid, batch=1, vocab_size=vocab_size, device=device)
+    ctx = StreamContext(sid, att_mgr, cnn_mgr, ctc_mgr)
+
+    offset = 0
+    logits_list = []
+    with torch.no_grad():
+        for xs in chunks:
+            ctx.prepare_chunk()
+            att_caches = ctx.get_att_caches()
+            cnn_cache = ctx.get_cnn_cache()
+            probs = model.forward_chunk_paged(
+                xs,
+                offset,
+                att_caches,
+                cnn_cache,
+                cache_t1=offset,
+            )
+            ctx.commit_chunk_paged(probs.size(1))
+            ctx.get_decoder().decode_chunk(probs)
+            logits_list.append(probs)
+            offset += probs.size(1)
+
+    streaming_result = ctx.get_decoder().finalize_stream()
+    ctx.free()
+    return logits_list, torch.cat(logits_list, dim=1), streaming_result, pool
+
+
+# ---------------------------------------------------------------------------
+# Test 1: Shape smoke test (random audio, no checkpoint needed)
+# ---------------------------------------------------------------------------
+
+
+class TestPagedStreamingE2E:
+    """Verify cache and forward shapes through the paged streaming pipeline.
+
+    Skips when no checkpoint is provided (we still need a real ``model`` for the
+    forward call, but use random feature chunks rather than real audio).
+    """
+
+    @pytest.mark.parametrize("n_chunks", [1, 3])
+    @pytest.mark.parametrize("num_left_chunks", [-1, 2])
+    def test_shapes(self, model, device, n_chunks: int, num_left_chunks: int):
+        dtype = torch.float16
+        chunks = _make_chunks(n_chunks, seed=0, device=device, dtype=dtype)
+
+        logits_list, _, result, pool = _cache_manager_streaming_paged(
+            model,
+            chunks,
+            num_left_chunks=num_left_chunks,
+            device=device,
+            dtype=dtype,
+        )
+
+        assert len(logits_list) == n_chunks
+        for probs in logits_list:
+            assert probs.shape == torch.Size([1, CHUNK_SIZE, VOCAB_SIZE])
+        assert result.lengths.shape == torch.Size([1, 5])
+        assert result.scores.shape == torch.Size([1, 5])
+        assert pool.num_free_blocks == pool.num_total_blocks
+
+
+# ---------------------------------------------------------------------------
+# Test 2: Paged streaming logits are well-formed log-probabilities
+# ---------------------------------------------------------------------------
+
+
+class TestPagedStreamingLogitsAreLogProbs:
+    """Per-chunk paged streaming outputs are valid log-softmax distributions."""
+
+    @pytest.mark.parametrize(
+        "num_left_chunks,n_chunks",
+        [
+            (-1, 3),
+            (2, 4),
+        ],
+    )
+    def test_log_probs(self, model, device, num_left_chunks: int, n_chunks: int):
+        dtype = torch.float16
+        chunks = _make_chunks(n_chunks, seed=99, device=device, dtype=dtype)
+
+        logits_list, _, _, pool = _cache_manager_streaming_paged(
+            model,
+            chunks,
+            num_left_chunks,
+            device,
+            dtype,
+        )
+
+        for step, probs in enumerate(logits_list):
+            sums = probs.exp().sum(dim=-1).float()
+            torch.testing.assert_close(
+                sums,
+                torch.ones_like(sums),
+                rtol=1e-2,
+                atol=1e-2,
+                msg=f"chunk {step}: log-probs do not sum to 1",
+            )
+
+        assert pool.num_free_blocks == pool.num_total_blocks
+
+
+# ---------------------------------------------------------------------------
+# Test 3: CTC decoding — streaming result is reproducible and logits are valid
+# ---------------------------------------------------------------------------
+
+
+class TestCtcDecode:
+    """CTC streaming decoder produces valid, reproducible output."""
+
+    def test_streaming_ctc_valid_and_reproducible(self, model, device):
+        from oasr.functionals.ctc_decode import GpuDecoderConfig, GpuStreamingDecoder
+
+        dtype = torch.float16
+        n_chunks = 5
+        beam_size = 5
+        num_left_chunks = -1
+        chunks = _make_chunks(n_chunks, seed=7, device=device, dtype=dtype)
+
+        mgr_logits_list, _, mgr_result, pool = _cache_manager_streaming_paged(
+            model,
+            chunks,
+            num_left_chunks,
+            device,
+            dtype,
+            beam_size=beam_size,
+        )
+        assert pool.num_free_blocks == pool.num_total_blocks
+
+        # Fresh decoder fed the same logits → must produce identical top-1.
+        ref_decoder = GpuStreamingDecoder(GpuDecoderConfig(beam_size=beam_size))
+        ref_decoder.init_stream(batch=1, vocab_size=VOCAB_SIZE, device=device)
+        for probs in mgr_logits_list:
+            ref_decoder.decode_chunk(probs)
+        ref_result = ref_decoder.finalize_stream()
+
+        assert mgr_result.tokens[0][0] == ref_result.tokens[0][0], (
+            f"Cache-manager top-1: {mgr_result.tokens[0][0]}\n"
+            f"Reference decoder top-1: {ref_result.tokens[0][0]}"
+        )
+
+        assert mgr_result.lengths.shape == torch.Size([1, beam_size])
+        assert mgr_result.scores.shape == torch.Size([1, beam_size])
+
+        scores = mgr_result.scores[0].cpu()
+        assert (scores[:-1] >= scores[1:]).all(), f"Beam scores not sorted: {scores.tolist()}"
+
+        for beam_tokens in mgr_result.tokens[0]:
+            assert all(
+                0 <= t < VOCAB_SIZE for t in beam_tokens
+            ), f"Token out of range [0, {VOCAB_SIZE}): {beam_tokens}"
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Multi-stream isolation under paged sharing
+# ---------------------------------------------------------------------------
+
+
+def _skip_if_no_audio(audio_path: str) -> None:
+    if not audio_path or not Path(audio_path).exists():
+        pytest.skip("Audio file not found; pass --audio-path <wav> or set AUDIO_PATH")
+
+
+class TestStreamingWithRealAudio:
+    """End-to-end paged streaming on real audio.
+
+    Requires:
+    - ``--ckpt-dir`` / ``CKPT_DIR``: WeNet Conformer checkpoint directory
+      (must contain ``final.pt`` and ``words.txt``).
+    - ``--audio-path`` / ``AUDIO_PATH``: 16 kHz WAV file to transcribe.
+    """
+
+    @staticmethod
+    def _load_chunks(audio_path: str, device, dtype) -> List[torch.Tensor]:
+        feats = _read_audio_and_extract_features(audio_path, device=device, dtype=dtype)
+        chunks = _chunk_features(feats)
+        if len(chunks) < 2:
+            pytest.skip(
+                f"Audio at {audio_path!r} is too short "
+                f"(got {feats.size(1)} frames, need ≥ {2 * CHUNK_INPUT_TIME})."
+            )
+        return chunks
+
+    def test_forward_and_ctc_decode(self, model, ckpt_dir: str, audio_path: str, device):
+        """Paged streaming → CTC beam search → non-empty transcript."""
+        _skip_if_no_audio(audio_path)
+
+        dtype = torch.float16
+        beam_size = 10
+        chunks = self._load_chunks(audio_path, device, dtype)
+        id2word = _build_id2word(ckpt_dir)
+
+        _, _, streaming_result, pool = _cache_manager_streaming_paged(
+            model,
+            chunks,
+            num_left_chunks=-1,
+            device=device,
+            dtype=dtype,
+            vocab_size=VOCAB_SIZE,
+            beam_size=beam_size,
+        )
+
+        assert (
+            pool.num_free_blocks == pool.num_total_blocks
+        ), f"Block pool leak: {pool.num_free_blocks}/{pool.num_total_blocks} free"
+
+        assert streaming_result.lengths.shape == torch.Size([1, beam_size])
+        assert streaming_result.scores.shape == torch.Size([1, beam_size])
+
+        scores = streaming_result.scores[0].cpu()
+        assert (scores[:-1] >= scores[1:]).all(), f"Beam scores not sorted: {scores.tolist()}"
+
+        for beam_idx, beam_tokens in enumerate(streaming_result.tokens[0]):
+            bad = [t for t in beam_tokens if not (0 <= t < VOCAB_SIZE)]
+            assert not bad, f"Beam {beam_idx} contains out-of-range token IDs: {bad}"
+
+        top1_tokens = streaming_result.tokens[0][0]
+        text = _tokens_to_text(top1_tokens, id2word)
+        print(f"\n[paged streaming top-1]  {text!r}")
+        assert len(text.strip()) > 0, "CTC decoder produced an empty transcript"
+
+        for beam_idx, beam_tokens in enumerate(streaming_result.tokens[0]):
+            beam_text = _tokens_to_text(beam_tokens, id2word)
+            print(f"  beam {beam_idx}: {beam_text!r}  (score {scores[beam_idx]:.3f})")
+
+    def test_cache_manager_pool_accounting(self, model, audio_path: str, device):
+        """Two real-audio paged streams share a pool; freeing one leaves the other intact."""
+        _skip_if_no_audio(audio_path)
+
+        from oasr.cache import (
+            AttentionCacheManager,
+            BlockPool,
+            CacheConfig,
+            CnnCacheManager,
+            CtcStateCacheManager,
+            StreamContext,
+        )
+        from oasr.functionals.ctc_decode import GpuDecoderConfig
+
+        dtype = torch.float16
+        num_left_chunks = 2
+
+        chunks_a = self._load_chunks(audio_path, device, dtype)[:3]
+        chunks_b = _make_chunks(3, seed=77, device=device, dtype=dtype)
+
+        max_blocks = 64
+        cfg = CacheConfig(
+            num_layers=NUM_LAYERS,
+            n_kv_head=N_KV_HEAD,
+            head_dim=HEAD_DIM,
+            hidden_dim=HIDDEN_DIM,
+            kernel_size=KERNEL_SIZE,
+            chunk_size=CHUNK_SIZE,
+            num_left_chunks=num_left_chunks,
+            block_size_frames=CHUNK_SIZE,
+            max_num_blocks=max_blocks,
+            device=device,
+            dtype=dtype,
+        )
+        pool = BlockPool(cfg)
+        att_mgr = AttentionCacheManager(pool, cfg)
+        cnn_mgr = CnnCacheManager(cfg)
+        ctc_mgr = CtcStateCacheManager(GpuDecoderConfig(beam_size=5))
+
+        initial_free = pool.num_free_blocks
+
+        sid_a, sid_b = 1, 2
+        for slot, sid in enumerate((sid_a, sid_b)):
+            att_mgr.allocate_stream(sid, slot_id=slot)
+            cnn_mgr.allocate_stream(sid, slot_id=slot)
+            ctc_mgr.allocate_stream(sid, batch=1, vocab_size=VOCAB_SIZE, device=device)
+
+        ctx_a = StreamContext(sid_a, att_mgr, cnn_mgr, ctc_mgr)
+        ctx_b = StreamContext(sid_b, att_mgr, cnn_mgr, ctc_mgr)
+
+        offset_a = offset_b = 0
+
+        with torch.no_grad():
+            for xs_a, xs_b in zip(chunks_a, chunks_b):
+                for ctx, xs, off in (
+                    (ctx_a, xs_a, offset_a),
+                    (ctx_b, xs_b, offset_b),
+                ):
+                    ctx.prepare_chunk()
+                    att_caches = ctx.get_att_caches()
+                    cnn_cache = ctx.get_cnn_cache()
+                    probs = model.forward_chunk_paged(
+                        xs,
+                        off,
+                        att_caches,
+                        cnn_cache,
+                        cache_t1=off,
+                    )
+                    ctx.commit_chunk_paged(probs.size(1))
+                    ctx.get_decoder().decode_chunk(probs)
+                offset_a += CHUNK_SIZE
+                offset_b += CHUNK_SIZE
+
+        bt_b_before, cs_b_before = ctx_b.get_paged_state_views()
+        bt_b_before = bt_b_before.clone()
+        cs_b_before = cs_b_before.clone()
+
+        ctx_a.free()
+
+        bt_b_after, cs_b_after = ctx_b.get_paged_state_views()
+        torch.testing.assert_close(
+            bt_b_after,
+            bt_b_before,
+            rtol=0.0,
+            atol=0.0,
+            msg="Stream B's block_table changed after freeing A",
+        )
+        torch.testing.assert_close(
+            cs_b_after,
+            cs_b_before,
+            rtol=0.0,
+            atol=0.0,
+            msg="Stream B's cache_seqlens changed after freeing A",
+        )
+
+        ctx_b.get_decoder().finalize_stream()
+        ctx_b.free()
+
+        assert (
+            pool.num_free_blocks == initial_free
+        ), f"Pool not fully recovered: {pool.num_free_blocks}/{initial_free} free blocks"

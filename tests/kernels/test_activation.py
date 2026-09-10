@@ -1,238 +1,32 @@
 #!/usr/bin/env python3
-"""
-Unit tests for functional activation API (TVM-FFI JIT path).
+# Copyright 2024 OASR Authors
+# SPDX-License-Identifier: Apache-2.0
+"""Pointwise activations (``oasr/functionals/activation.py``) against torch.
+
+Every op here is elementwise, which decides the grid: the axes that reach a
+different code path are the **last-dim alignment** (vec4 vs the scalar tail)
+and the **layout** the wrapper is handed -- not the batch or sequence extents.
+So one parametrization walks the ops and each test covers both alignments in
+its body, rather than multiplying the node count by shapes that share a branch.
+
+Two groups, because they do not accept the same inputs. The generic ops take
+any rank and any layout; ``swoosh_l`` / ``swoosh_r`` want rank >= 2 and have no
+unaligned-pointer path, so they get their own tests instead of being folded
+into a grid that would assert a surface they never claimed.
+
+``oasr.gelu`` is the exact-erf one. The *fused* GELU epilogues elsewhere are
+the tanh approximation, and :class:`TestGeluIsExactErf` is what keeps the two
+from being quietly swapped.
 """
 
 import pytest
 import torch
 import torch.nn.functional as F
+from helpers import assert_dest_passing
 
 import oasr
 
-# Every test in this module allocates directly on ``device="cuda"`` and calls a
-# JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
-# what lets the CPU CI job run `pytest tests/` and get a green, meaningful run
-# instead of a wall of `RuntimeError: No CUDA GPUs are available`.
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
-
-
-class TestGelu:
-    """Tests for exact-erf ``oasr.gelu()``."""
-
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-    @pytest.mark.parametrize("shape", [(257,), (2, 17, 63)])
-    def test_exact_erf(self, dtype, shape):
-        x = torch.randn(*shape, device="cuda", dtype=dtype)
-
-        output = oasr.gelu(x)
-        expected = F.gelu(x)
-        atol = 2e-6 if dtype == torch.float32 else 2e-3
-        torch.testing.assert_close(output, expected, rtol=0, atol=atol)
-
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_reaches_served_dtype_launcher_and_uses_erf(self, dtype):
-        x = torch.linspace(-5.0, 5.0, 4096, device="cuda", dtype=dtype)
-        output = oasr.gelu(x)
-        exact = F.gelu(x)
-        approximate = F.gelu(x, approximate="tanh")
-
-        torch.testing.assert_close(output, exact, rtol=0, atol=2e-3)
-        assert torch.count_nonzero(output != approximate).item() > 0
-
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_destination_passing(self, dtype):
-        x = torch.randn(2, 31, 65, device="cuda", dtype=dtype)
-        out = torch.empty_like(x)
-        result = oasr.gelu(x, out=out)
-
-        assert result.data_ptr() == out.data_ptr()
-        torch.testing.assert_close(out, F.gelu(x), rtol=0, atol=2e-3)
-
-    def test_noncontiguous_input(self):
-        x = torch.randn(2, 31, 65, device="cuda", dtype=torch.float16).transpose(1, 2)
-        assert not x.is_contiguous()
-        torch.testing.assert_close(oasr.gelu(x), F.gelu(x), rtol=0, atol=2e-3)
-
-    def test_contiguous_unaligned_storage_offset(self):
-        base = torch.randn(4097, device="cuda", dtype=torch.float16)
-        x = base[1:]
-        assert x.is_contiguous() and x.data_ptr() % 16 != 0
-        torch.testing.assert_close(oasr.gelu(x), F.gelu(x), rtol=0, atol=2e-3)
-
-
-class TestUnaryActivations:
-    """Tests for standalone sigmoid / tanh / ReLU."""
-
-    @pytest.mark.parametrize(
-        "fn,ref",
-        [
-            (oasr.sigmoid, torch.sigmoid),
-            (oasr.tanh, torch.tanh),
-            (oasr.relu, torch.relu),
-        ],
-    )
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-    @pytest.mark.parametrize("shape", [(257,), (2, 17, 63)])
-    def test_correctness(self, fn, ref, dtype, shape):
-        x = torch.randn(*shape, device="cuda", dtype=dtype)
-        atol = 2e-6 if dtype == torch.float32 else 2e-3
-        torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=atol)
-
-    @pytest.mark.parametrize(
-        "fn,ref",
-        [
-            (oasr.sigmoid, torch.sigmoid),
-            (oasr.tanh, torch.tanh),
-            (oasr.relu, torch.relu),
-        ],
-    )
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_destination_passing(self, fn, ref, dtype):
-        x = torch.randn(2, 31, 65, device="cuda", dtype=dtype)
-        out = torch.empty_like(x)
-        result = fn(x, out=out)
-
-        assert result.data_ptr() == out.data_ptr()
-        torch.testing.assert_close(out, ref(x), rtol=1e-5, atol=2e-3)
-
-    @pytest.mark.parametrize(
-        "fn,ref",
-        [
-            (oasr.sigmoid, torch.sigmoid),
-            (oasr.tanh, torch.tanh),
-            (oasr.relu, torch.relu),
-        ],
-    )
-    def test_noncontiguous_input(self, fn, ref):
-        x = torch.randn(2, 31, 65, device="cuda", dtype=torch.float16).transpose(1, 2)
-        assert not x.is_contiguous()
-        torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=2e-3)
-
-    @pytest.mark.parametrize(
-        "fn,ref",
-        [
-            (oasr.sigmoid, torch.sigmoid),
-            (oasr.tanh, torch.tanh),
-            (oasr.relu, torch.relu),
-        ],
-    )
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-    def test_regular_row_strided_channel_chunk(self, fn, ref, dtype):
-        base = torch.randn(17, 3, 3 * 64, device="cuda", dtype=dtype)
-        x = base.chunk(3, dim=-1)[1]
-        assert x.stride() == (576, 192, 1) and not x.is_contiguous()
-        output = fn(x)
-        assert output.is_contiguous()
-        atol = 2e-6 if dtype == torch.float32 else 2e-3
-        torch.testing.assert_close(output, ref(x), rtol=1e-5, atol=atol)
-
-    @pytest.mark.parametrize(
-        "fn,ref",
-        [
-            (oasr.sigmoid, torch.sigmoid),
-            (oasr.tanh, torch.tanh),
-            (oasr.relu, torch.relu),
-        ],
-    )
-    def test_contiguous_unaligned_storage_offset(self, fn, ref):
-        base = torch.randn(4097, device="cuda", dtype=torch.float16)
-        x = base[1:]
-        assert x.is_contiguous() and x.data_ptr() % 16 != 0
-        torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=2e-3)
-
-    @pytest.mark.parametrize("fn", [oasr.sigmoid, oasr.tanh, oasr.relu])
-    def test_empty_input(self, fn):
-        x = torch.empty(0, 8, device="cuda", dtype=torch.float16)
-        assert fn(x).shape == x.shape
-
-    @pytest.mark.parametrize("fn,ref", [(oasr.sigmoid, torch.sigmoid), (oasr.tanh, torch.tanh)])
-    def test_large_magnitude(self, fn, ref):
-        x = torch.linspace(-80.0, 80.0, 4096, device="cuda")
-        torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=2e-6)
-
-    @pytest.mark.parametrize(
-        "fn,ref",
-        [
-            (oasr.sigmoid, torch.sigmoid),
-            (oasr.tanh, torch.tanh),
-            (oasr.relu, torch.relu),
-        ],
-    )
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-    def test_special_values(self, fn, ref, dtype):
-        x = torch.tensor(
-            [float("nan"), float("inf"), -float("inf"), -0.0, 0.0],
-            device="cuda",
-            dtype=dtype,
-        )
-        got = fn(x)
-        expected = ref(x)
-        torch.testing.assert_close(got, expected, rtol=0, atol=0, equal_nan=True)
-        assert torch.equal(torch.signbit(got), torch.signbit(expected))
-
-
-class TestGLU:
-    """Tests for oasr.glu() functional API."""
-
-    @pytest.mark.parametrize(
-        "batch_size,seq_len,channels",
-        [
-            (2, 128, 256),
-            (4, 256, 512),
-        ],
-    )
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_glu(self, batch_size, seq_len, channels, dtype):
-        x = torch.randn(batch_size, seq_len, 2 * channels, device="cuda", dtype=dtype)
-
-        output = oasr.glu(x)
-
-        expected = F.glu(x, dim=-1).to(dtype)
-        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
-
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_glu_destination_passing(self, dtype):
-        """Test GLU with pre-allocated output tensor."""
-        batch_size, seq_len, channels = 2, 128, 256
-        x = torch.randn(batch_size, seq_len, 2 * channels, device="cuda", dtype=dtype)
-        out = torch.empty(batch_size, seq_len, channels, device="cuda", dtype=dtype)
-
-        result = oasr.glu(x, out=out)
-
-        assert result.data_ptr() == out.data_ptr()
-        expected = F.glu(x, dim=-1).to(dtype)
-        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
-
-
-class TestSwish:
-    """Tests for oasr.swish() functional API."""
-
-    @pytest.mark.parametrize(
-        "batch_size,seq_len,channels",
-        [
-            (2, 128, 256),
-            (4, 256, 512),
-        ],
-    )
-    def test_swish(self, batch_size, seq_len, channels):
-        x = torch.randn(batch_size, seq_len, channels, device="cuda", dtype=torch.float32)
-
-        output = oasr.swish(x)
-
-        expected = F.silu(x)
-        torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
-
-    def test_swish_destination_passing(self):
-        """Test Swish with pre-allocated output tensor."""
-        batch_size, seq_len, channels = 2, 128, 256
-        x = torch.randn(batch_size, seq_len, channels, device="cuda", dtype=torch.float32)
-        out = torch.empty_like(x)
-
-        result = oasr.swish(x, out=out)
-
-        assert result.data_ptr() == out.data_ptr()
-        expected = F.silu(x)
-        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+pytestmark = pytest.mark.cuda
 
 
 def _ref_swoosh_l(x: torch.Tensor) -> torch.Tensor:
@@ -245,51 +39,165 @@ def _ref_swoosh_r(x: torch.Tensor) -> torch.Tensor:
     return torch.logaddexp(zero, x - 1.0) - 0.08 * x - 0.313261687
 
 
-class TestSwoosh:
-    """Tests for oasr.swoosh_l() / oasr.swoosh_r() functional API."""
+#: Ops sharing one signature and the generic launcher.
+OPS = {
+    "gelu": (oasr.gelu, F.gelu),
+    "sigmoid": (oasr.sigmoid, torch.sigmoid),
+    "tanh": (oasr.tanh, torch.tanh),
+    "relu": (oasr.relu, torch.relu),
+    "swish": (oasr.swish, F.silu),
+}
+NAMES = list(OPS)
+#: The subset whose wrapper has the awkward-layout branches.
+LAYOUT_OPS = ["gelu", "sigmoid", "tanh", "relu"]
+SWOOSH = {"swoosh_l": (oasr.swoosh_l, _ref_swoosh_l), "swoosh_r": (oasr.swoosh_r, _ref_swoosh_r)}
 
-    @pytest.mark.parametrize(
-        "fn,ref", [(oasr.swoosh_l, _ref_swoosh_l), (oasr.swoosh_r, _ref_swoosh_r)]
+#: One shape whose last dim is vec4-aligned and one whose is not: the two
+#: launcher paths. Anything else is the same kernel over more elements.
+_ALIGNED = (2, 128, 256)
+_SCALAR_TAIL = (2, 17, 63)
+
+
+def _atol(dtype: torch.dtype) -> float:
+    if dtype == torch.float32:
+        return 2e-6
+    return 2e-2 if dtype == torch.bfloat16 else 2e-3
+
+
+@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_matches_reference(name, dtype):
+    fn, ref = OPS[name]
+    for shape in (_ALIGNED, _SCALAR_TAIL):
+        x = torch.randn(*shape, device="cuda", dtype=dtype)
+        torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=_atol(dtype))
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_destination_passing(name):
+    """Rule 4, for every op that takes an ``out=``."""
+    fn, ref = OPS[name]
+    x = torch.randn(2, 31, 65, device="cuda", dtype=torch.float16)
+    assert_dest_passing(fn, x, out=torch.empty_like(x))
+    torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=2e-3)
+
+
+@pytest.mark.parametrize("name", LAYOUT_OPS)
+@pytest.mark.parametrize("layout", ["transposed", "unaligned_offset", "row_strided_chunk"])
+def test_awkward_layouts(name, layout):
+    """The three layouts the generic wrapper has a branch for."""
+    fn, ref = OPS[name]
+    if layout == "transposed":
+        x = torch.randn(2, 31, 65, device="cuda", dtype=torch.float16).transpose(1, 2)
+        assert not x.is_contiguous()
+    elif layout == "unaligned_offset":
+        base = torch.randn(4097, device="cuda", dtype=torch.float16)
+        x = base[1:]
+        assert x.is_contiguous() and x.data_ptr() % 16 != 0
+    else:
+        base = torch.randn(17, 3, 3 * 64, device="cuda", dtype=torch.float16)
+        x = base.chunk(3, dim=-1)[1]
+        assert x.stride() == (576, 192, 1) and not x.is_contiguous()
+        assert fn(x).is_contiguous()
+    torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=2e-3)
+
+
+@pytest.mark.parametrize("name", ["sigmoid", "tanh", "relu"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_special_values(name, dtype):
+    """NaN / +-inf / signed zero must survive with torch's own semantics."""
+    fn, ref = OPS[name]
+    x = torch.tensor(
+        [float("nan"), float("inf"), -float("inf"), -0.0, 0.0], device="cuda", dtype=dtype
     )
+    got, expected = fn(x), ref(x)
+    torch.testing.assert_close(got, expected, rtol=0, atol=0, equal_nan=True)
+    assert torch.equal(torch.signbit(got), torch.signbit(expected))
+
+
+def test_saturation_is_stable_over_a_wide_range():
+    """The sigmoids must not wrap at the ends of the representable range."""
+    x = torch.linspace(-80.0, 80.0, 4096, device="cuda")
+    torch.testing.assert_close(oasr.sigmoid(x), torch.sigmoid(x), rtol=1e-5, atol=2e-6)
+    torch.testing.assert_close(oasr.tanh(x), torch.tanh(x), rtol=1e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize("name", ["sigmoid", "tanh", "relu"])
+def test_empty_input_is_a_shape_preserving_noop(name):
+    """Only the unary table claims a zero-element input; the others are not asked."""
+    x = torch.empty(0, 8, device="cuda", dtype=torch.float16)
+    assert OPS[name][0](x).shape == x.shape
+
+
+class TestGeluIsExactErf:
+    """``oasr.gelu`` is erf, not the tanh approximation.
+
+    Fusing the tanh approximation under the exact-erf name is a silent
+    accuracy change, so the difference is asserted rather than assumed: over a
+    dense sweep the two must actually disagree somewhere.
+    """
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_reaches_the_served_dtype_launcher_and_uses_erf(self, dtype):
+        x = torch.linspace(-5.0, 5.0, 4096, device="cuda", dtype=dtype)
+        output = oasr.gelu(x)
+        torch.testing.assert_close(output, F.gelu(x), rtol=0, atol=2e-3)
+        assert torch.count_nonzero(output != F.gelu(x, approximate="tanh")).item() > 0
+
+
+class TestSwoosh:
+    """Zipformer's two softplus activations. Rank >= 2, no unaligned path."""
+
+    @pytest.mark.parametrize("name", list(SWOOSH))
     @pytest.mark.parametrize(
         "shape",
         [
             (2, 128, 256),  # vec4-aligned last dim
-            (4, 250, 384),
-            (2, 8, 50, 19),  # 4D (conv-output-like)
             (2, 128, 255),  # non-vec-aligned last dim -> scalar path
+            (2, 8, 50, 19),  # 4-D, conv-output-like
         ],
     )
-    def test_swoosh_fp32(self, fn, ref, shape):
+    def test_fp32(self, name, shape):
+        fn, ref = SWOOSH[name]
         x = torch.randn(*shape, device="cuda", dtype=torch.float32)
         torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=1e-5)
 
-    @pytest.mark.parametrize(
-        "fn,ref", [(oasr.swoosh_l, _ref_swoosh_l), (oasr.swoosh_r, _ref_swoosh_r)]
-    )
+    @pytest.mark.parametrize("name", list(SWOOSH))
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_swoosh_half(self, fn, ref, dtype):
+    def test_half(self, name, dtype):
+        fn, ref = SWOOSH[name]
         x = torch.randn(4, 200, 512, device="cuda", dtype=dtype)
         torch.testing.assert_close(fn(x), ref(x), rtol=2e-2, atol=2e-2)
 
-    def test_swoosh_large_magnitude(self):
-        """Numerical stability over a wide input range (softplus must not overflow)."""
+    def test_large_magnitude(self):
+        """Softplus must not overflow over a wide input range."""
         x = torch.linspace(-60.0, 60.0, 4096, device="cuda", dtype=torch.float32).reshape(1, 64, 64)
         torch.testing.assert_close(oasr.swoosh_l(x), _ref_swoosh_l(x), rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(oasr.swoosh_r(x), _ref_swoosh_r(x), rtol=1e-5, atol=1e-5)
 
-    def test_swoosh_noncontiguous(self):
-        """A non-contiguous (transposed) input is handled by an internal .contiguous()."""
+    def test_noncontiguous(self):
+        """A transposed input is handled by an internal ``.contiguous()``."""
         x = torch.randn(2, 256, 128, device="cuda", dtype=torch.float32).transpose(1, 2)
         assert not x.is_contiguous()
         torch.testing.assert_close(oasr.swoosh_l(x), _ref_swoosh_l(x), rtol=1e-5, atol=1e-5)
 
-    def test_swoosh_destination_passing(self):
+    def test_destination_passing(self):
         x = torch.randn(2, 128, 256, device="cuda", dtype=torch.float32)
-        out = torch.empty_like(x)
-        result = oasr.swoosh_r(x, out=out)
-        assert result.data_ptr() == out.data_ptr()
-        torch.testing.assert_close(out, _ref_swoosh_r(x), rtol=1e-5, atol=1e-5)
+        assert_dest_passing(oasr.swoosh_r, x, out=torch.empty_like(x), expected=_ref_swoosh_r(x))
+
+
+class TestGlu:
+    """``oasr.glu`` halves the last dim, so it does not share the OPS signature."""
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_matches_torch(self, dtype):
+        x = torch.randn(2, 128, 512, device="cuda", dtype=dtype)
+        torch.testing.assert_close(oasr.glu(x), F.glu(x, dim=-1).to(dtype), rtol=1e-2, atol=1e-2)
+
+    def test_destination_passing(self):
+        x = torch.randn(2, 128, 512, device="cuda", dtype=torch.float16)
+        out = torch.empty(2, 128, 256, device="cuda", dtype=torch.float16)
+        assert_dest_passing(oasr.glu, x, out=out, expected=F.glu(x, dim=-1))
 
 
 if __name__ == "__main__":

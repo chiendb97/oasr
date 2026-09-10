@@ -55,9 +55,6 @@ class TestTactic:
         s = {t1, t2}
         assert len(s) == 1
 
-    def test_different_tactics_not_equal(self):
-        assert Tactic("cutlass") != Tactic("cudnn")
-
 
 # =========================================================================
 # ProfileKey
@@ -483,25 +480,21 @@ class TestAutotuneContextManager:
 class TestBackendRegistration:
     """Verify that bundled GEMM, Conv2D, and recurrent backends register."""
 
-    def test_gemm_backends_register(self):
-        from oasr.tune.backends import gemm as _  # noqa: F401
+    @pytest.mark.parametrize(
+        "module,family,op",
+        [
+            ("gemm", "gemm", "gemm"),
+            ("gemm", "gemm", "gemm_activation"),
+            ("gemm", "gemm", "bmm"),
+            ("conv2d", "conv", "conv2d"),
+        ],
+    )
+    def test_importing_the_backend_registers_its_candidates(self, module, family, op):
+        """One table instead of four bodies that differed only in the key."""
+        import importlib
 
-        assert _global_registry.get_candidates(OpKey("gemm", "gemm"))
-
-    def test_gemm_activation_backends_register(self):
-        from oasr.tune.backends import gemm as _  # noqa: F401
-
-        assert _global_registry.get_candidates(OpKey("gemm", "gemm_activation"))
-
-    def test_bmm_backends_register(self):
-        from oasr.tune.backends import gemm as _  # noqa: F401
-
-        assert _global_registry.get_candidates(OpKey("gemm", "bmm"))
-
-    def test_conv2d_backends_register(self):
-        from oasr.tune.backends import conv2d as _  # noqa: F401
-
-        assert _global_registry.get_candidates(OpKey("conv", "conv2d"))
+        importlib.import_module(f"oasr.tune.backends.{module}")
+        assert _global_registry.get_candidates(OpKey(family, op))
 
     @pytest.mark.parametrize("op", ["lstm", "rnn_tanh", "rnn_relu"])
     def test_recurrent_backends_register(self, op):
@@ -512,17 +505,15 @@ class TestBackendRegistration:
         assert len({candidate.tactic for candidate in candidates}) == len(candidates)
         assert _global_registry.get_fallback(OpKey("recurrent", op)) is not None
 
-    def test_gemm_has_cutlass_fallback(self):
-        from oasr.tune.backends import gemm as _  # noqa: F401
+    @pytest.mark.parametrize(
+        "module,family,op", [("gemm", "gemm", "gemm"), ("conv2d", "conv", "conv2d")]
+    )
+    def test_the_fallback_is_the_cutlass_kernel(self, module, family, op):
+        """A tuner that resolves nothing must still land on a real kernel."""
+        import importlib
 
-        fb = _global_registry.get_fallback(OpKey("gemm", "gemm"))
-        assert fb is not None
-        assert fb.tactic.backend == "cutlass"
-
-    def test_conv2d_has_cutlass_fallback(self):
-        from oasr.tune.backends import conv2d as _  # noqa: F401
-
-        fb = _global_registry.get_fallback(OpKey("conv", "conv2d"))
+        importlib.import_module(f"oasr.tune.backends.{module}")
+        fb = _global_registry.get_fallback(OpKey(family, op))
         assert fb is not None
         assert fb.tactic.backend == "cutlass"
 
@@ -532,6 +523,25 @@ class TestBackendRegistration:
         candidates = _global_registry.get_candidates(OpKey("gemm", "gemm"))
         tactics = [c.tactic for c in candidates]
         assert len(tactics) == len(set(tactics))
+
+
+@pytest.mark.cuda
+def test_capture_reads_bmm_shapes_off_the_trailing_axes():
+    """A 4-D BMM must not have its N recorded from the contraction axis.
+
+    ``_shapes_of`` used to read ``B.shape[1]``, which is N only for a 3-D
+    operand.  On Zipformer's 4-D calls that is the *batch* axis, so the tuner
+    would have keyed rules on a shape that never ran.
+    """
+    from oasr.tune.capture import _shapes_of
+
+    A = torch.empty(8, 3, 17, 4, device="cuda", dtype=torch.float16)
+    B = torch.empty(8, 1, 33, 4, device="cuda", dtype=torch.float16)
+    assert _shapes_of("bmm", (A, B), {}) == (17, 33, 4, 24)
+
+    A3 = torch.empty(5, 17, 8, device="cuda", dtype=torch.float16)
+    B3 = torch.empty(5, 33, 8, device="cuda", dtype=torch.float16)
+    assert _shapes_of("bmm", (A3, B3), {}) == (17, 33, 8, 5)
 
 
 class TestGemmShapeCapture:

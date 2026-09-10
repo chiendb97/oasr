@@ -15,7 +15,6 @@ are covered here without a GPU: emission is a pure function of the timings.
 from __future__ import annotations
 
 import importlib.util
-import pathlib
 import sys
 
 import pytest
@@ -103,29 +102,23 @@ class TestSelfOverlapGate:
 
 
 class TestBenchProtocol:
-    """What ``_bench`` is contracted to do, without running it."""
+    """What ``_bench`` is contracted to do, without running it.
 
-    def test_captures_are_pooled_and_share_one_side_stream(self):
-        """Both were unbounded allocations: a graph pool per capture, and a
-        workspace-cache key per stream.  A sweep hit 30 GiB and died."""
+    Two assertions on module constants, and no assertions on the module's
+    *source text*.  This class used to grep the script for
+    ``"pool=_graph_pool()"`` and ``"side = _side_stream()"`` and read
+    ``_bench``'s docstring for the words ``loop_ms``/``solo_ms``.  Both fail on
+    a rename that changes nothing and pass on a rewrite that reintroduces the
+    per-capture graph pool while keeping the strings -- so they tested the
+    spelling, not the behaviour.  The constants below are the part that is
+    actually load-bearing; the graph-pool sharing itself is enforced by the
+    sweep that used to run out of memory.
+    """
+
+    def test_the_capture_loop_is_deep_enough_to_resolve_a_launch(self):
+        """A one-iteration capture cannot separate a kernel from its launch."""
         assert tune._GRAPH_ITERS > 1
         assert tune._GRAPH_REPS >= 3
-        src = pathlib.Path(REPO_ROOT / "scripts" / "tune_asr_gemm.py").read_text()
-        assert "pool=_graph_pool()" in src, "captures must share one graph pool"
-        assert "side = _side_stream()" in src, "warm-ups must share one side stream"
-        # The call, not the prose: ``_bench``'s docstring names what it replaced.
-        assert (
-            "from triton.testing import do_bench" not in src
-        ), "the eager back-to-back loop must be gone"
-        assert "do_bench(" not in src
-
-    def test_returns_two_timings(self):
-        import inspect
-
-        doc = inspect.getdoc(tune._bench) or ""
-        assert "loop_ms" in doc and "solo_ms" in doc
-        sig = inspect.signature(tune._bench)
-        assert "Tuple" in str(sig.return_annotation) or sig.return_annotation is not inspect._empty
 
 
 class TestMLadder:

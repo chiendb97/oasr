@@ -12,11 +12,14 @@ by the per-family suites (``test_whisper.py``, ``test_speech_llm.py``, ...).
 
 from __future__ import annotations
 
+import dataclasses
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from oasr.engine.decode.base import _REGISTRY as DECODE_REGISTRY, _strategy_name
+from oasr.models.base import coerce_config
 from oasr.models.interfaces import CAPABILITIES, missing_members, require_capability
 from oasr.models.registry import get_model_entry, list_models
 
@@ -77,17 +80,16 @@ class TestRegisteredModels:
             pytest.skip(f"{arch} derives its decode metadata from a live instance")
         assert default in caps, f"{arch}: default_decode_type={default!r} not in {sorted(caps)}"
 
-    def test_config_class_round_trips(self, arch):
-        """``save_native`` writes ``asdict``; ``load_native`` calls ``from_dict``."""
-        import dataclasses
+    def test_config_class_is_natively_serializable(self, arch):
+        """``save_native`` writes ``asdict``; ``load_native`` calls ``from_dict``.
 
-        entry = get_model_entry(arch)
-        cfg_cls = entry.config_cls
+        The round-trip itself is checked field by field further down, in
+        ``test_every_declared_field_survives``; what is checked here is only
+        that the two entry points exist at all.
+        """
+        cfg_cls = get_model_entry(arch).config_cls
         assert dataclasses.is_dataclass(cfg_cls), f"{arch}: config must be a dataclass (asdict)"
         assert hasattr(cfg_cls, "from_dict"), f"{arch}: config needs from_dict (native load)"
-        cfg = cfg_cls()
-        restored = cfg_cls.from_dict(dataclasses.asdict(cfg))
-        assert type(restored) is cfg_cls
 
     def test_converter_surface(self, arch):
         conv = get_model_entry(arch).converter
@@ -169,6 +171,27 @@ TINY_CONFIGS = {
         "decoder_att_layer_num": 1,
     },
     "transducer": {"vocab_size": 64, "decoder_dim": 64, "joiner_dim": 64},
+    # Nemotron was missing, and the only symptom was three silent skips
+    # ("no tiny config for nemotron").  ``test_every_registered_arch_has_a_tiny_config``
+    # below is what turns the next such omission red instead of quiet.
+    "nemotron": {
+        "vocab_size": 32,
+        "blank_token_id": 31,
+        "decoder_hidden_size": 24,
+        "num_decoder_layers": 1,
+        "num_prompts": 8,
+        "prompt_intermediate_size": 48,
+        "encoder": {
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "intermediate_size": 64,
+            "num_mel_bins": 32,
+            "subsampling_conv_channels": 16,
+            "sliding_window": 13,
+        },
+    },
     "speech_llm": {
         "vocab_size": 64,
         "text_num_hidden_layers": 1,
@@ -187,12 +210,22 @@ TINY_CONFIGS = {
 
 
 def _tiny_model(arch: str):
-    """Build ``arch`` at its smallest working size on CPU, or skip."""
-    kwargs = TINY_CONFIGS.get(arch)
-    if kwargs is None:
-        pytest.skip(f"no tiny config for {arch}; add one to TINY_CONFIGS")
+    """Build ``arch`` at its smallest working size on CPU."""
     entry = get_model_entry(arch)
-    return entry.model_cls.from_config(entry.config_cls(**kwargs))
+    return entry.model_cls.from_config(entry.config_cls.from_dict(TINY_CONFIGS[arch]))
+
+
+def test_every_registered_arch_has_a_tiny_config():
+    """A ratchet, not a snapshot.
+
+    ``_tiny_model`` used to ``pytest.skip`` on a missing entry, so registering
+    an architecture without one silently removed it from every test in this
+    file -- which is exactly what happened to ``nemotron``: three tests
+    reported ``SKIPPED [3] no tiny config for nemotron`` and nobody read them.
+    A missing entry is now a failure here.
+    """
+    missing = sorted(set(list_models()) - set(TINY_CONFIGS))
+    assert not missing, f"add a TINY_CONFIGS entry for: {', '.join(missing)}"
 
 
 @pytest.mark.parametrize("arch", list_models())
@@ -336,3 +369,207 @@ class TestRequireCapability:
         )
         assert missing_members(model, "transducer") == []
         require_capability(model, "transducer")
+
+
+# ---------------------------------------------------------------------------
+# Config coercion: what survives a native round-trip, and in what type
+#
+# ``coerce_config`` is how a checkpoint's JSON becomes a typed config, so a
+# dropped field or a tuple that comes back a list is a checkpoint that loads
+# and then behaves differently.  Same subject as the capability table above --
+# what an architecture declares about itself -- so it lives in the same file.
+# ---------------------------------------------------------------------------
+
+
+def _round_trip(cfg):
+    """The exact trip ``save_native`` / ``load_native`` performs."""
+    return type(cfg).from_dict(json.loads(json.dumps(dataclasses.asdict(cfg))))
+
+
+#: Non-default values per architecture, chosen to exercise the field *kinds* that
+#: the old hand-written readers got wrong: nested dataclasses, ``Tuple[int, ...]``,
+#: ``List[Tuple[int, int]]``, and plain scalars that a hardcoded name list could
+#: silently omit.
+NON_DEFAULT = {
+    "conformer": lambda m: {"vocab_size": 4711},
+    "zipformer": lambda m: {"vocab_size": 4711},
+    "whisper": lambda m: {
+        "vocab_size": 4711,
+        "forced_decoder_ids": [(1, 50259), (2, 50359), (3, 50363)],
+        "suppress_tokens": [1, 2, 7],
+        "begin_suppress_tokens": [220, 50257],
+    },
+    "paraformer": lambda m: {"vocab_size": 4711},
+    "transducer": lambda m: {
+        "vocab_size": 4711,
+        "decoder_dim": 99,
+        "joiner_dim": 77,
+        "context_size": 3,
+        "blank_id": 5,
+    },
+    "speech_llm": lambda m: {"vocab_size": 4711, "eos_token_ids": [1, 2, 3]},
+    # ``supported_num_lookahead_tokens`` is a ``Tuple[int, ...]`` on the *nested*
+    # encoder config — the exact combination (nested dataclass + tuple field) that
+    # the hand-written readers got wrong, and JSON has no tuples.
+    "nemotron": lambda m: _nemotron_overrides(),
+}
+
+
+def _nemotron_overrides():
+    """Needs a nested-config instance, which a lambda over the *outer* class
+    cannot build — the ``m`` argument is the config class, not its module."""
+    from oasr.models.nemotron.config import NemotronEncoderConfig
+
+    return {
+        "vocab_size": 4711,
+        "blank_token_id": 4710,
+        "default_prompt_id": 7,
+        "encoder": NemotronEncoderConfig(
+            hidden_size=64,
+            num_hidden_layers=3,
+            supported_num_lookahead_tokens=(0, 5, 11),
+        ),
+    }
+
+
+@pytest.mark.parametrize("arch", list_models())
+def test_every_declared_field_survives(arch):
+    """Field-by-field, so a failure names the field rather than the whole config.
+
+    Plain ``==`` on the dataclass would catch a drop, but reports only "not equal";
+    the whole point of the old bugs was that they were hard to attribute.
+    """
+    cls = get_model_entry(arch).config_cls
+    overrides = NON_DEFAULT.get(arch)
+    cfg = cls(**overrides(cls)) if overrides else cls()
+    restored = _round_trip(cfg)
+    for f in dataclasses.fields(cls):
+        before, after = getattr(cfg, f.name), getattr(restored, f.name)
+        assert after == before, f"{arch}.{f.name}: {before!r} → {after!r}"
+        assert type(after) is type(before), (
+            f"{arch}.{f.name} changed type on round-trip: "
+            f"{type(before).__name__} → {type(after).__name__}"
+        )
+
+
+class TestTupleRestoration:
+    """JSON has no tuples, so a ``Tuple`` field must be restored from its type."""
+
+    def test_zipformer_tuple_fields_come_back_as_tuples(self):
+        from oasr.models.zipformer.config import ZipformerEncoderConfig
+
+        enc = ZipformerEncoderConfig()
+        tuple_fields = [
+            f.name
+            for f in dataclasses.fields(ZipformerEncoderConfig)
+            if isinstance(getattr(enc, f.name), tuple)
+        ]
+        assert tuple_fields, "expected Tuple fields on the Zipformer encoder config"
+
+        restored = coerce_config(
+            ZipformerEncoderConfig, json.loads(json.dumps(dataclasses.asdict(enc)))
+        )
+        for name in tuple_fields:
+            assert isinstance(getattr(restored, name), tuple), name
+
+    def test_list_of_tuples_restores_both_levels(self):
+        """Whisper's ``forced_decoder_ids: List[Tuple[int, int]]`` — the case that
+        needed a hand-written coercion in every config that had one."""
+        from oasr.models.whisper.config import WhisperModelConfig
+
+        cfg = WhisperModelConfig(vocab_size=64, forced_decoder_ids=[(1, 2), (3, 4)])
+        restored = _round_trip(cfg)
+        assert restored.forced_decoder_ids == [(1, 2), (3, 4)]
+        assert all(isinstance(p, tuple) for p in restored.forced_decoder_ids)
+
+
+class TestFlatAndPolymorphicOverrides:
+    """The two field kinds a type annotation genuinely cannot describe."""
+
+    def test_conformer_accepts_a_flat_encoder_dict(self):
+        """WeNet-derived dicts put encoder hyperparameters at the top level."""
+        from oasr.models.conformer.config import ConformerModelConfig
+
+        cfg = ConformerModelConfig.from_dict({"vocab_size": 7, "output_size": 256})
+        assert cfg.vocab_size == 7
+        assert cfg.encoder.output_size == 256
+
+    def test_zipformer_accepts_flat_icefall_args(self):
+        from oasr.models.zipformer.config import ZipformerModelConfig
+
+        cfg = ZipformerModelConfig.from_dict({"vocab_size": 7, "encoder_dim": [64, 96]})
+        assert cfg.encoder.encoder_dim == (64, 96)
+
+    @pytest.mark.parametrize(
+        "encoder_type,expected",
+        [("conformer", "ConformerEncoderConfig"), ("zipformer", "ZipformerEncoderConfig")],
+    )
+    def test_transducer_encoder_class_follows_encoder_type(self, encoder_type, expected):
+        """``encoder: Any`` — the class is decided by a *sibling key*, so this is the
+        one field in the tree that legitimately needs an override hook."""
+        from oasr.models.transducer.config import TransducerModelConfig
+
+        cfg = TransducerModelConfig.from_dict(
+            {"vocab_size": 7, "encoder_type": encoder_type, "encoder": {}}
+        )
+        assert type(cfg.encoder).__name__ == expected
+
+    def test_transducer_scalars_no_longer_come_from_a_hardcoded_list(self):
+        """The old reader listed five field names by hand and omitted
+        ``model_type`` / ``encoder_type``; every scalar now comes from the fields."""
+        from oasr.models.transducer.config import TransducerModelConfig
+
+        cfg = TransducerModelConfig(
+            vocab_size=1,
+            encoder_type="zipformer",
+            decoder_dim=8,
+            joiner_dim=9,
+            context_size=4,
+            blank_id=3,
+        )
+        # keep the encoder consistent with the declared type
+        from oasr.models.zipformer.config import ZipformerEncoderConfig
+
+        cfg.encoder = ZipformerEncoderConfig()
+        restored = _round_trip(cfg)
+        assert restored.encoder_type == "zipformer"
+        assert restored.model_type == cfg.model_type
+        assert (restored.decoder_dim, restored.joiner_dim) == (8, 9)
+        assert (restored.context_size, restored.blank_id) == (4, 3)
+
+
+class TestCoercionEdges:
+    def test_unknown_keys_are_ignored(self):
+        """Checkpoint configs legitimately carry keys we do not model."""
+        from oasr.models.paraformer.config import ParaformerModelConfig
+
+        cfg = ParaformerModelConfig.from_dict({"vocab_size": 5, "trained_by": "someone"})
+        assert cfg.vocab_size == 5
+
+    def test_optional_nested_dataclass_accepts_none(self):
+        from oasr.models.conformer.config import ConformerModelConfig
+
+        assert ConformerModelConfig.from_dict({"vocab_size": 5, "decoder": None}).decoder is None
+
+    def test_optional_nested_dataclass_recurses_when_present(self):
+        from oasr.models.conformer.config import ConformerModelConfig
+
+        cfg = ConformerModelConfig.from_dict(
+            {
+                "vocab_size": 5,
+                "decoder": {
+                    "vocab_size": 5,
+                    "encoder_output_size": 256,
+                    "attention_heads": 2,
+                    "linear_units": 64,
+                    "num_blocks": 1,
+                    "r_num_blocks": 1,
+                    "sos_id": 4,
+                    "eos_id": 4,
+                    "reverse_weight": 0.3,
+                },
+            }
+        )
+        assert cfg.decoder is not None
+        assert cfg.decoder.reverse_weight == 0.3
+        assert type(cfg.decoder).__name__ == "TransformerDecoderConfig"
