@@ -54,7 +54,7 @@ family, the dotted model-attribute paths it requires plus a one-line `why`.
 
 `build_decode_strategy` calls `require_capability` once, so a checkpoint
 advertising a capability it cannot serve **fails at engine construction naming
-the missing members**. `tests/test_model_contract.py` validates the table against
+the missing members**. `tests/models/test_contract.py` validates the table against
 every registered architecture, built tiny on CPU.
 
 This is the answer to "what must a model implement to support family X".
@@ -199,7 +199,7 @@ point group.
 
 Every architecture is built from [`oasr.layers`](architecture.md#the-layer-waist),
 not from bare `nn.Linear` / `nn.LayerNorm` / `nn.Embedding`.
-`tests/test_layer_waist.py` enforces it, and its tiny-config table is keyed off
+`tests/models/test_layer_waist.py` enforces it, and its tiny-config table is keyed off
 `list_models()` so a newly registered architecture with no entry fails rather
 than going uncovered.
 
@@ -386,4 +386,4 @@ brief:
 3. A `CheckpointConverter` + `register_model("foo", ...)` in the package
    `__init__` — or an `oasr.models` entry point, out of tree.
 4. Build it from `oasr.layers` and add a tiny config to
-   `tests/test_layer_waist.py`.
+   `tests/models/test_layer_waist.py`.

@@ -581,13 +581,13 @@ scale is one process per GPU; see [serving.md](serving.md#multi-gpu-topology).
 Under serving, the PyO3 dispatcher is the only Python caller and runs
 single-threaded; HTTP and gRPC handlers stay on tokio and never touch the GIL.
 
-Concurrency tests live in `tests/test_engine_concurrent.py` behind the
+Concurrency tests live in `tests/engine/test_concurrent.py` behind the
 `concurrent` marker and cover a 16-thread stress on `add_streaming_request`,
 feeders racing aborters on a shared request-id pool, and concurrent readers of
 the queue-depth properties:
 
 ```bash
-pytest tests/test_engine_concurrent.py -m concurrent -v
+pytest tests/engine/test_concurrent.py -m concurrent -v
 ```
 
 ### Failure isolation

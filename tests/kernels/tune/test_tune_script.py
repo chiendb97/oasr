@@ -19,9 +19,10 @@ import pathlib
 import sys
 
 import pytest
+from helpers import REPO_ROOT
 
 _SPEC = importlib.util.spec_from_file_location(
-    "tune_asr_gemm", pathlib.Path(__file__).resolve().parents[1] / "scripts" / "tune_asr_gemm.py"
+    "tune_asr_gemm", REPO_ROOT / "scripts" / "tune_asr_gemm.py"
 )
 assert _SPEC and _SPEC.loader
 tune = importlib.util.module_from_spec(_SPEC)
@@ -109,9 +110,7 @@ class TestBenchProtocol:
         workspace-cache key per stream.  A sweep hit 30 GiB and died."""
         assert tune._GRAPH_ITERS > 1
         assert tune._GRAPH_REPS >= 3
-        src = pathlib.Path(
-            pathlib.Path(__file__).resolve().parents[1] / "scripts" / "tune_asr_gemm.py"
-        ).read_text()
+        src = pathlib.Path(REPO_ROOT / "scripts" / "tune_asr_gemm.py").read_text()
         assert "pool=_graph_pool()" in src, "captures must share one graph pool"
         assert "side = _side_stream()" in src, "warm-ups must share one side stream"
         # The call, not the prose: ``_bench``'s docstring names what it replaced.

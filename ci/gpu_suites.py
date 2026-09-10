@@ -15,9 +15,12 @@ dropping off the bus costs one suite instead of the sweep.
     python ci/gpu_suites.py --github-matrix       # JSON for `fromJSON()`
     python ci/gpu_suites.py --check               # every test file is covered
 
-``--check`` is the part worth keeping honest: a new `tests/test_*.py` that
-nobody adds to a family would never run on the split matrix, and the failure
-mode is silence.  It runs in `lint.yml`.
+``--check`` is the part worth keeping honest: a new `tests/**/test_*.py` that
+sits outside every family directory would never run on the split matrix, and
+the failure mode is silence.  It also enforces the one layout rule pytest
+imposes on us -- `tests/` has no `__init__.py`, so modules are keyed by
+basename and two `test_registry.py` in different folders is an import error,
+not a merge.  It runs in `lint.yml`.
 """
 
 from __future__ import annotations
@@ -30,112 +33,31 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = REPO_ROOT / "tests"
 
-#: family -> test paths.  Keep the groupings coarse; the point is isolation of
-#: blast radius, not a taxonomy.
+#: family -> test directories.  Each family is one directory under ``tests/``,
+#: so the split is the layout rather than a list that has to be kept in step
+#: with it.  Keep the groupings coarse; the point is isolation of blast radius,
+#: not a taxonomy.
 SUITES: dict[str, list[str]] = {
-    "kernels": [
-        "tests/test_activation.py",
-        "tests/test_norm.py",
-        "tests/test_conv.py",
-        "tests/test_gemm.py",
-        "tests/test_gemm_splitk.py",
-        "tests/test_gemm_heuristic.py",
-        "tests/test_gemm_log_softmax.py",
-        "tests/test_softmax.py",
-        "tests/test_topk.py",
-        "tests/test_pooling.py",
-        "tests/test_recurrent.py",
-        "tests/test_recurrent_cute.py",
-        "tests/test_gated_mlp.py",
-        "tests/test_fft.py",
-        "tests/test_cmvn.py",
-        "tests/test_jit.py",
-        "tests/test_attention.py",
-        "tests/test_fmha.py",
-        "tests/test_fmha_varlen.py",
-        "tests/test_block_info.py",
-        "tests/test_autotune.py",
-        "tests/test_tune_asr_gemm.py",
-    ],
-    "decoders": [
-        "tests/test_decoder.py",
-        "tests/test_ctc_decoder_gpu.py",
-        "tests/test_ctc_decoder_fused_parity.py",
-        "tests/test_wfst_decoder.py",
-        "tests/test_decoder_kv.py",
-        # Word timings are per-decode-family (`oasr/engine/decode/{alignment,
-        # ctc_align,attention_align}.py`), so they fail with the family.
-        "tests/test_word_timings.py",
-        "tests/test_alignment_cpp.py",
-    ],
-    "features": [
-        "tests/test_features.py",
-        "tests/test_features_registry.py",
-        "tests/test_extract_features.py",
-        "tests/test_sample_rate.py",
-    ],
-    "engine": [
-        "tests/test_engine.py",
-        "tests/test_vad.py",
-        "tests/test_vad_segmenter.py",
-        "tests/test_vad_streaming_segment.py",
-        "tests/test_vad_silero.py",
-        "tests/test_engine_seams.py",
-        "tests/test_feature_buffer_growth.py",
-        "tests/test_feature_ring_native.py",
-        "tests/test_incremental_detokenize.py",
-        "tests/test_capture_recovery.py",
-        "tests/test_offline_graph.py",
-        "tests/test_predictor_graph_state.py",
-        "tests/test_streaming_graph_ladder.py",
-        "tests/test_packing_device_layout.py",
-        "tests/test_engine_isolation.py",
-        "tests/test_pipeline.py",
-        "tests/test_scheduler_length_batch.py",
-        "tests/test_scheduler_preferred_batch.py",
-        "tests/test_scheduler_split.py",
-        "tests/test_streaming_backend.py",
-        "tests/test_cache_manager.py",
-        "tests/test_host_staging.py",
-        "tests/test_incremental_executor.py",
-        "tests/test_decode_options.py",
-        "tests/test_decoding_options.py",
-        "tests/test_packing_encoder.py",
-        "tests/test_vram_sizing.py",
-        "tests/test_engine_metrics.py",
-        # The Python client / `oasr` CLI: the request-and-response surface the
-        # engine is reached through, against a stub server rather than a GPU.
-        "tests/test_client.py",
-    ],
+    # Kernels and the JIT/tuning machinery that selects them.
+    "kernels": ["tests/kernels"],
+    # CPU and GPU decoders, word timings, and the per-family decode options.
+    "decoders": ["tests/decoders"],
+    # Feature frontends and the kernels behind them.
+    "features": ["tests/features"],
+    # The engine and everything it owns: scheduler, executors, caches, CUDA
+    # graphs, VAD, metrics, and the client that reaches it.
+    "engine": ["tests/engine"],
     # Its own family so a WER regression is attributable at a glance rather than
-    # buried in a model-family failure — and because it is the one suite whose
+    # buried in a model-family failure -- and because it is the one suite whose
     # failure means "the output got worse", not "a tensor moved".
-    "accuracy": [
-        "tests/test_accuracy.py",
-    ],
-    "models": [
-        "tests/test_conformer.py",
-        "tests/test_zipformer.py",
-        "tests/test_whisper.py",
-        "tests/test_paraformer.py",
-        "tests/test_speech_llm.py",
-        "tests/test_nemotron.py",
-        "tests/test_transducer.py",
-        "tests/test_transformer_decoder.py",
-        "tests/test_rescoring.py",
-        "tests/test_model_contract.py",
-        "tests/test_model_registry.py",
-        "tests/test_checkpoint_native.py",
-        "tests/test_config_round_trip.py",
-        "tests/test_from_pretrained.py",
-        "tests/test_tokenizers.py",
-        "tests/test_layer_waist.py",
-    ],
+    "accuracy": ["tests/accuracy"],
+    # Architectures, the registry/contract ratchets and checkpoint conversion.
+    "models": ["tests/models"],
 }
 
 #: Files deliberately outside the family split because they are reached through
 #: an opt-in marker instead (`-m concurrent`), in its own job.
-MARKER_ONLY: set[str] = {"tests/test_engine_concurrent.py"}
+MARKER_ONLY: set[str] = {"tests/engine/test_concurrent.py"}
 
 #: Markers the per-family jobs deselect; the opt-in job runs them separately.
 DEFAULT_MARKER_EXPR = "not slow and not concurrent"
@@ -154,33 +76,56 @@ def github_matrix() -> str:
 
 
 def check() -> int:
-    """Every tests/test_*.py must be in exactly one family (or marker-only)."""
-    on_disk = {f"tests/{p.name}" for p in TESTS_DIR.glob("test_*.py")}
-    listed: dict[str, list[str]] = {}
-    for family, paths in SUITES.items():
-        for p in paths:
-            listed.setdefault(p, []).append(family)
+    """Every tests/**/test_*.py lives under exactly one family, with a unique name.
+
+    Two invariants, both of which fail silently otherwise:
+
+    * a file outside every family directory never runs on the split matrix;
+    * two test modules sharing a basename are an "import file mismatch" under
+      pytest's prepend import mode, because ``tests/`` has no ``__init__.py``.
+    """
+    on_disk = sorted(p.relative_to(REPO_ROOT).as_posix() for p in TESTS_DIR.rglob("test_*.py"))
+    families: dict[str, list[str]] = {}
+    for family, roots in SUITES.items():
+        for root in roots:
+            for rel in on_disk:
+                if rel == root or rel.startswith(root + "/"):
+                    families.setdefault(rel, []).append(family)
 
     problems = []
-    missing = sorted(on_disk - set(listed) - MARKER_ONLY)
-    if missing:
+    homeless = [p for p in on_disk if p not in families and p not in MARKER_ONLY]
+    if homeless:
         problems.append(
-            "not in any suite (they would never run on the split matrix):\n"
-            + "".join(f"    {p}\n" for p in missing)
+            "outside every family directory (they would never run on the split "
+            "matrix):\n" + "".join(f"    {p}\n" for p in homeless)
         )
-    dangling = sorted(set(listed) - on_disk)
-    if dangling:
-        problems.append("listed but not on disk:\n" + "".join(f"    {p}\n" for p in dangling))
-    dupes = sorted(p for p, fams in listed.items() if len(fams) > 1)
+    dupes = sorted(p for p, fams in families.items() if len(fams) > 1)
     if dupes:
         problems.append(
             "in more than one suite:\n"
-            + "".join(f"    {p}: {', '.join(listed[p])}\n" for p in dupes)
+            + "".join(f"    {p}: {', '.join(families[p])}\n" for p in dupes)
         )
-    stale_marker = sorted(MARKER_ONLY - on_disk)
+    missing_roots = sorted(
+        root for roots in SUITES.values() for root in roots if not (REPO_ROOT / root).is_dir()
+    )
+    if missing_roots:
+        problems.append(
+            "family directory not on disk:\n" + "".join(f"    {r}\n" for r in missing_roots)
+        )
+    stale_marker = sorted(m for m in MARKER_ONLY if not (REPO_ROOT / m).is_file())
     if stale_marker:
         problems.append(
             "MARKER_ONLY entry not on disk:\n" + "".join(f"    {p}\n" for p in stale_marker)
+        )
+    by_name: dict[str, list[str]] = {}
+    for rel in on_disk:
+        by_name.setdefault(rel.rsplit("/", 1)[-1], []).append(rel)
+    clashes = sorted(n for n, paths in by_name.items() if len(paths) > 1)
+    if clashes:
+        problems.append(
+            "basename used by more than one test module (pytest imports test "
+            "modules by basename; rename one):\n"
+            + "".join(f"    {n}: {', '.join(by_name[n])}\n" for n in clashes)
         )
 
     if problems:
@@ -189,7 +134,8 @@ def check() -> int:
             print("  " + p, file=sys.stderr)
         return 1
     print(
-        f"OK: {len(on_disk)} test file(s) across {len(SUITES)} suites + {len(MARKER_ONLY)} marker-only"
+        f"OK: {len(on_disk)} test file(s) across {len(SUITES)} suites "
+        f"+ {len(MARKER_ONLY)} marker-only"
     )
     return 0
 

@@ -91,7 +91,7 @@ jobs:
       - name: pytest -m slow
         run: python -m pytest tests/ -m "slow" -q -rs $STRICT
       - name: pytest -m concurrent
-        run: python -m pytest tests/test_engine_concurrent.py -m concurrent -q -rs $STRICT
+        run: python -m pytest tests/engine/test_concurrent.py -m concurrent -q -rs $STRICT
 
   # Everything at once, to catch cross-file state the split matrix would hide
   # (JIT cache collisions, CUDA-graph pool reuse, leaked engines).

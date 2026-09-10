@@ -274,7 +274,7 @@ Pool memory in bytes:
 For a default Conformer (`num_layers=12, n_kv_head=4, head_dim=64,
 block_size=16, max_num_blocks=2048`) with FP16 this is 192 KiB per block and
 **384 MiB** for the pool.  `oasr.engine.memory.bytes_per_kv_block` is the same
-arithmetic in code, and `tests/test_vram_sizing.py` pins it against a real
+arithmetic in code, and `tests/engine/test_memory.py` pins it against a real
 `BlockPool` allocation — the formula and the allocator must not drift.
 
 ## 7. Usage Examples

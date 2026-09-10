@@ -598,7 +598,7 @@ nsys profile --cuda-graph-trace=node -t cuda python benchmarks/bench_wfst.py ...
 
 ## 13. Testing
 
-- `tests/test_wfst_decoder.py` — self-contained: toy-FST GPU vs the CPU
+- `tests/decoders/test_wfst.py` — self-contained: toy-FST GPU vs the CPU
   reference oracle (exact costs + backpointer chains, via debug snapshots),
   batched-offline equivalence, wrapper offline/streaming smoke, channel
   lifecycle.

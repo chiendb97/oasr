@@ -25,11 +25,11 @@ from pathlib import Path
 import assets
 import pytest
 import torch
+from helpers import REPO_ROOT
 
 from oasr.testing.accuracy import load_audio, load_manifest, transcribe
 from oasr.testing.wer import compute, normalizer
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 REFERENCE_PATH = REPO_ROOT / "ci" / "wer-reference.json"
 REFERENCE = json.loads(REFERENCE_PATH.read_text())
 ENTRIES = REFERENCE["entries"]

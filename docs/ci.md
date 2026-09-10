@@ -116,7 +116,7 @@ Everything else in this repo compares tensors. That is necessary and it is not
 sufficient: a parity oracle feeds identical features to both sides, so a bug in
 *how audio becomes features* cancels on both and the suite stays green.
 
-`tests/test_accuracy.py` measures WER on a fixed 200-utterance LJSpeech subset and
+`tests/accuracy/test_accuracy.py` measures WER on a fixed 200-utterance LJSpeech subset and
 fails when a rate exceeds its recorded value in `ci/wer-reference.json` plus a
 tolerance of 0.3 absolute.
 
@@ -170,8 +170,11 @@ Sweeping rather than gating is `benchmarks/bench_accuracy.py` — see
 
 The GPU suite runs in two places from **one** family split, `ci/gpu_suites.py`. A
 split maintained twice drifts, and the failure mode is a test file that runs
-nowhere — so `--check` (every `tests/test_*.py` in exactly one family) is both a
-pre-commit hook and a `lint.yml` step.
+nowhere — so `--check` is both a pre-commit hook and a `lint.yml` step. Since
+the families *are* directories under `tests/`, it checks two things: every
+`tests/**/test_*.py` sits under exactly one family directory, and no two test
+modules share a basename (pytest imports them by basename, so a clash is an
+import error rather than a merge).
 
 |  | self-hosted (`test-gpu.yml`) | Modal (`test-gpu-modal.yml`) |
 |---|---|---|
@@ -300,7 +303,7 @@ and `_C` is loaded lazily. The job puts the repo on `PYTHONPATH` and runs pytest
 directly.
 
 Files whose every test allocates on `device="cuda"` carry a module-level
-`pytestmark` skip, `tests/test_decoder.py` carries an `importorskip("oasr._C")`,
+`pytestmark` skip, `tests/decoders/test_ctc_cpp.py` carries an `importorskip("oasr._C")`,
 and `@pytest.mark.cuda` actually gates.
 
 Three rules follow, each of which cost a red run to learn:

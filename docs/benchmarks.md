@@ -261,7 +261,7 @@ python benchmarks/bench_accuracy.py \
   bracketed spans while a reader speaks them aloud. Skipping that step is pure
   measurement error.
 - `oasr/testing/accuracy.py` holds the manifest and transcribe helpers shared
-  with the CI accuracy gate (`tests/test_accuracy.py`, reference rates in
+  with the CI accuracy gate (`tests/accuracy/test_accuracy.py`, reference rates in
   `ci/wer-reference.json`).
 - `--decode-option k=v` (repeatable) reaches the decode family's own knobs, and
   the CSV carries them, so two rows that differ only by an option stay tellable

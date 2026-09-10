@@ -130,7 +130,7 @@ The measurements behind each: `.artifacts/fmha_tuning.md`,
   zeroed, guarded by a zeroed-tail assertion rather than a parity check — the
   corruption is non-deterministic, which parity tests structurally cannot catch.
 
-`tests/test_layer_waist.py` is the ratchet: it builds every registered
+`tests/models/test_layer_waist.py` is the ratchet: it builds every registered
 architecture tiny on CPU, walks `named_modules()`, and fails on a bare torch
 layer. Its tiny-config table is keyed off `list_models()`, so a new
 architecture with no entry fails rather than going uncovered. It also pins that
@@ -199,7 +199,7 @@ Request → [VAD segmenter] → InputProcessor (fbank) → Scheduler (BatchingPo
 3. A `CheckpointConverter` + `register_model("foo", ...)` in the package
    `__init__`. No engine edits.
 4. Build it from `oasr.layers` (see **The layer waist** above) and add a tiny
-   config to `tests/test_layer_waist.py`. Both are enforced: the conformance
+   config to `tests/models/test_layer_waist.py`. Both are enforced: the conformance
    test fails on a bare `nn.Linear`, and it fails again if your architecture
    has no tiny config to check.
 
@@ -213,7 +213,7 @@ Request → [VAD segmenter] → InputProcessor (fbank) → Scheduler (BatchingPo
    `oasr/models/interfaces.py::CAPABILITIES` — dotted attribute paths plus a one-line
    `why`.  `build_decode_strategy` validates every model against it once, so a
    checkpoint advertising a capability it cannot serve fails at engine construction
-   naming the missing members, and `tests/test_model_contract.py` checks the table
+   naming the missing members, and `tests/models/test_contract.py` checks the table
    against every registered architecture (built tiny on CPU).  This is the answer to
    "what must a model implement to support family X".
 3. `@register_decode_strategy("foo")` on a `DecodeStrategy`.  Frame-synchronous:

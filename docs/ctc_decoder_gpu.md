@@ -512,7 +512,7 @@ when the fused path is active (`layout_has_prob_tables`), shrinking a
 `B=1, beam=10, V=5000` streaming state from ~440 KB to ~40 KB.
 
 Determinism notes (differences from the legacy pipeline, validated by
-`tests/test_ctc_decoder_fused_parity.py`):
+`tests/decoders/test_ctc_decoder_fused_parity.py`):
 
 - Exact score ties may rank in a different beam order (legacy radix
   stability vs `(score desc, id asc)` composites). Scores are
@@ -1043,7 +1043,7 @@ The environment variable `OASR_CTC_FUSED=0` selects a separately
 compiled module (`ctc_decoder_legacy`, built with
 `-DOASR_CTC_DISABLE_FUSED`) that forces the legacy multi-kernel step
 pipeline for every beam size — an emergency rollback and the A/B
-baseline for `tests/test_ctc_decoder_fused_parity.py`. The two
+baseline for `tests/decoders/test_ctc_decoder_fused_parity.py`. The two
 variants use different workspace layouts; never share a decoder or
 `StreamState` across a mid-process flag flip.
 

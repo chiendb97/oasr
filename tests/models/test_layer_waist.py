@@ -23,10 +23,10 @@ CPU parity oracles meaningful evidence about the GPU serving path.
 from __future__ import annotations
 
 import ast
-from pathlib import Path
 
 import pytest
 import torch
+from helpers import REPO_ROOT
 from torch import nn
 
 from oasr.layers import layers_backend_override
@@ -264,7 +264,7 @@ def _dotted_name(node: ast.AST) -> str | None:
 
 def test_models_do_not_call_bare_torch_activations():
     """Standalone activations belong to the waist, not model code."""
-    models_dir = Path(__file__).resolve().parents[1] / "oasr" / "models"
+    models_dir = REPO_ROOT / "oasr" / "models"
     banned = {
         f"{prefix}.{name}"
         for prefix in ("F", "torch", "torch.functional", "torch.nn.functional")
@@ -306,7 +306,7 @@ def test_models_do_not_bypass_bmm_with_torch_matmul():
     ``torch.matmul`` and no counter anywhere could see it.  The general BMM lane
     closed that, and this keeps it closed.
     """
-    models_dir = Path(__file__).resolve().parents[1] / "oasr" / "models"
+    models_dir = REPO_ROOT / "oasr" / "models"
     banned = {"torch.matmul", "torch.bmm"}
     found: dict = {}
     for path in models_dir.rglob("*.py"):
@@ -373,7 +373,7 @@ def test_models_do_not_hand_roll_a_masked_softmax():
     :data:`ALLOWED_MASKED_FILL` is a site that is *not* a score floor; a new
     ``masked_fill`` in any of these files fails until it is classified.
     """
-    models_dir = Path(__file__).resolve().parents[1] / "oasr" / "models"
+    models_dir = REPO_ROOT / "oasr" / "models"
     found: dict = {}
     for path in models_dir.rglob("*.py"):
         tree = ast.parse(path.read_text(), filename=str(path))
@@ -404,7 +404,7 @@ def test_models_do_not_hand_roll_a_masked_softmax():
 
 def test_zipformer_attention_weights_use_the_fused_masked_softmax():
     """The offline and streaming score paths both have to reach the kernel."""
-    encoder = Path(__file__).resolve().parents[1] / "oasr" / "models" / "zipformer" / "encoder.py"
+    encoder = REPO_ROOT / "oasr" / "models" / "zipformer" / "encoder.py"
     tree = ast.parse(encoder.read_text(), filename=str(encoder))
     calls = [
         node
@@ -419,7 +419,7 @@ def test_zipformer_attention_weights_use_the_fused_masked_softmax():
 
 def test_eligible_residual_norm_paths_use_fused_waist():
     """Keep KG14's model wiring from silently regressing to separate adds."""
-    models_dir = Path(__file__).resolve().parents[1] / "oasr" / "models"
+    models_dir = REPO_ROOT / "oasr" / "models"
     expected = {
         "whisper/model.py": {"forward_add": 2, "forward_add_residual": 5},
         "speech_llm/audio_tower.py": {"forward_add_residual": 2},
