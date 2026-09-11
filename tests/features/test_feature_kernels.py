@@ -194,7 +194,9 @@ class TestFbank:
         "num_mel_bins,frame_length_ms",
         [(80, 25.0), (40, 25.0), (80, 32.0)],
     )
-    @pytest.mark.parametrize("window_type", ["povey", "hanning", "hamming"])
+    @pytest.mark.parametrize(
+        "window_type", ["povey", "hanning", "hamming", "blackman", "rectangular"]
+    )
     def test_parity_kaldi(self, num_mel_bins, frame_length_ms, window_type):
         cfg = FeatureConfig(
             feature_type="fbank",
@@ -246,11 +248,22 @@ class TestFbank:
         assert feats.shape == (2, 0, 40)
         assert torch.equal(feat_lens, torch.zeros(2, dtype=torch.int32, device="cuda"))
 
-    def test_cpu_input_rejected(self):
+    def test_cpu_runs_the_torch_path(self):
+        """CPU is out of the kernels' scope, not out of the layer's.
+
+        ``Fbank`` owns both paths -- the kernel chain and the torch reference
+        beside it -- so the engine's CPU branch and ``OASR_FEATURE_BACKEND=torch``
+        reach the same module rather than a second implementation.
+        """
         cfg = FeatureConfig(num_mel_bins=40)
-        fb = Fbank(cfg).cuda()
-        with pytest.raises(ValueError):
-            fb(torch.randn(2, 16000))
+        fb = Fbank(cfg)
+        wav = _make_sine(16000, 1.0)
+        cpu_feats, cpu_lens = fb(wav)
+        ref = _kaldi_fbank(wav, cfg)
+        torch.testing.assert_close(cpu_feats[0, : cpu_lens[0]], ref, rtol=1e-3, atol=1e-2)
+
+        cuda_feats, _ = fb(wav.cuda())
+        torch.testing.assert_close(cuda_feats.cpu(), cpu_feats, rtol=1e-3, atol=1e-2)
 
 
 @CUDA
@@ -294,6 +307,84 @@ class TestMfcc:
         wav = torch.randn(1, 16000, device="cuda")
         feats, _ = mf(wav)
         assert torch.isfinite(feats).all()
+
+
+# ---------------------------------------------------------------------------
+# The mel-energy floor -- a frontend *convention*, so only the external oracle
+# can check it
+# ---------------------------------------------------------------------------
+
+
+#: Kaldi's mel-energy floor: ``std::numeric_limits<float>::epsilon()``.  Spelled
+#: out here rather than imported, so these tests keep checking the *convention*
+#: even if OASR's own constant moves.
+_FLT_EPSILON = float(torch.finfo(torch.float32).eps)
+
+
+def _quiet_lowpass(sample_rate: int = 16000, duration_s: float = 1.0) -> torch.Tensor:
+    """A quiet low-frequency tone: real speech's high mel bins, reproducibly.
+
+    Kaldi's floor only shows itself where a mel bin's energy lands under
+    ``FLT_EPSILON``, which needs two things at once -- an ``audio_scale=1.0``
+    convention (icefall, lhotse) and a band with no content.  A 200 Hz tone at
+    amplitude 1e-3 has both, and unlike a real recording it is one line.
+    """
+    t = torch.arange(int(sample_rate * duration_s), dtype=torch.float32) / sample_rate
+    return 1e-3 * torch.sin(2.0 * math.pi * 200.0 * t)
+
+
+@CUDA
+class TestKaldiMelFloor:
+    """``log(max(mel, FLT_EPSILON))`` -- Kaldi's floor, not ``float32`` tiny.
+
+    The two differ by 31 orders of magnitude, so a floored bin is ``-15.94``
+    under Kaldi and ``-87.34`` under ``tiny``.  Nothing internal can catch the
+    difference: both OASR paths would agree with each other, and a parity test
+    feeds the same convention to both sides.  These compare against
+    ``torchaudio.compliance.kaldi``, which is also what the per-utterance
+    reference path inside OASR calls -- so the two in-tree paths that serve the
+    *same* config are pinned to the same answer.
+    """
+
+    CFG = FeatureConfig(num_mel_bins=80, dither=0.0)
+
+    def test_the_fixture_actually_reaches_the_floor(self):
+        """Guard: without floored bins the tests below pass on any floor.
+
+        Asked of the *oracle*, not of us — a guard phrased in terms of OASR's own
+        floor constant moves with the bug it is guarding against.
+        """
+        ref = _kaldi_fbank(_quiet_lowpass(), self.CFG)
+        floored = (ref - math.log(_FLT_EPSILON)).abs() < 1e-4
+        assert floored.any(), "torchaudio floored no bin on this signal — bad fixture"
+
+    @pytest.mark.parametrize("backend", ["oasr", "torch"])
+    @pytest.mark.parametrize("feature_type", ["fbank", "mfcc"])
+    def test_floored_bins_match_torchaudio(self, feature_type, backend, monkeypatch):
+        from oasr.features.batched import batched_fbank, batched_mfcc
+
+        monkeypatch.setenv("OASR_FEATURE_BACKEND", "torch" if backend == "torch" else "")
+        cfg = FeatureConfig(feature_type=feature_type, num_mel_bins=80, dither=0.0)
+        wav = _quiet_lowpass()
+        extract = batched_mfcc if feature_type == "mfcc" else batched_fbank
+        got, lens = extract(wav.unsqueeze(0).cuda(), torch.tensor([wav.numel()]).cuda(), cfg)
+        ref = _kaldi_mfcc(wav, cfg) if feature_type == "mfcc" else _kaldi_fbank(wav, cfg)
+        # ``tiny`` instead of ``FLT_EPSILON`` puts this at 71 (fbank) / 639 (mfcc).
+        torch.testing.assert_close(got[0, : lens[0]].cpu(), ref.cpu(), rtol=1e-3, atol=1e-1)
+
+    def test_digital_silence_is_the_reference_constant(self):
+        """An all-zero row is the floor and nothing else -- the clearest case.
+
+        ``log(FLT_EPSILON) = -15.9424``; under ``float32`` tiny it is ``-87.3365``,
+        a 71.4 step on every bin of every silent frame.
+        """
+        from oasr.features.batched import batched_fbank
+
+        wav = torch.zeros(1, 16000, device="cuda")
+        got, lens = batched_fbank(wav, torch.tensor([16000], device="cuda"), self.CFG)
+        ref = _kaldi_fbank(torch.zeros(16000), self.CFG)
+        torch.testing.assert_close(got[0, : lens[0]].cpu(), ref)
+        assert abs(float(got[0, 0, 0]) - math.log(_FLT_EPSILON)) < 1e-5
 
 
 # ---------------------------------------------------------------------------

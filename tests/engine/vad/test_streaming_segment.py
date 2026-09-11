@@ -393,14 +393,31 @@ class TestStreamingSegmentEngine:
         all of them to keep unlimited history, and gap lengths chosen so their
         turn boundaries do **not** line up.
 
-        Two things make the oracle exact rather than approximate.  The reference
+        Three things make the oracle exact rather than approximate.  The reference
         streams are driven through the *same* chunked feed loop, because pacing
         decides how far ahead of the encoder the detector runs and therefore how
         much gets skipped — comparing a bulk-fed reference against a live-fed run
-        would measure that, not co-tenancy.  And both phases run on **one**
-        engine: building a second one in the same process is its own hazard,
-        unrelated to voice activity, and would put a pre-existing failure inside
-        this test's blast radius.
+        would measure that, not co-tenancy.  Both phases run on **one** engine:
+        building a second one in the same process is its own hazard, unrelated to
+        voice activity, and would put a pre-existing failure inside this test's
+        blast radius.  And the reference runs at the **same cohort width**, which
+        is why it is four identical copies rather than one stream on its own.
+
+        That last one is not theoretical.  A streaming step is a cohort whose
+        width decides the encoder's reduction order, and OASR does not claim
+        batch invariance there — ``ci/wer-reference.json``'s ``nemotron_streaming``
+        entry says so outright.  Measured on this fixture: a **solo** reference
+        disagrees with the co-tenant run on 2 of 4 streams, by one word boundary
+        (``WOODCUTTERS`` / ``WOOD CUTTERS``); a **4-wide** reference agrees on
+        4 of 4; and the disagreement is unchanged by ``max_num_blocks=4096``,
+        i.e. it is not the pool.  A solo reference therefore measures fp16
+        reduction order and calls it corruption, and it passed only while no word
+        in the fixture sat on a tie.
+
+        The reference cohort's own copies are the control that keeps it honest.
+        They are identical audio, so their turn boundaries line up and a block
+        handed to the wrong stream would show up as the four disagreeing with
+        *each other* — which is asserted before they are used as an oracle.
         """
         gaps = (4.0, 6.0, 5.0, 7.0)
         waves = [speech_corpus(wav_dir, n=3, gap_s=gap)[0] for gap in gaps]
@@ -416,14 +433,13 @@ class TestStreamingSegmentEngine:
                 vad={"mode": "segment", "backend": "energy"},
             )
         )
-        try:
-            solo = [self.drive(engine, wav)[0].text for wav in waves]
 
-            rids = [engine.add_streaming_request() for _ in waves]
-            pos, done = [0] * len(waves), {}
-            chunk = SR // 5
-            while len(done) < len(waves):
-                for i, wav in enumerate(waves):
+        def cohort(streams):
+            """Feed several streams at one live-ish cadence; return their finals."""
+            rids = [engine.add_streaming_request() for _ in streams]
+            pos, done, chunk = [0] * len(streams), {}, SR // 5
+            while len(done) < len(streams):
+                for i, wav in enumerate(streams):
                     n = int(wav.numel())
                     if pos[i] < n:
                         end = min(pos[i] + chunk, n)
@@ -432,10 +448,20 @@ class TestStreamingSegmentEngine:
                 for out in engine.step():
                     if out.finished:
                         done[out.request_id] = out
+            return [done[rid].text for rid in rids]
+
+        try:
+            aligned = [cohort([wav] * len(waves)) for wav in waves]
+            mixed = cohort(waves)
             turns = engine.metrics_snapshot()["counters"]["oasr_engine_vad_segments_total"]
         finally:
             engine.shutdown()
 
         assert turns >= 2 * len(waves), "no turn boundary ran, so nothing was under test"
-        for i, rid in enumerate(rids):
-            assert done[rid].text == solo[i], f"stream {i} diverged under co-tenant load"
+        for i, texts in enumerate(aligned):
+            assert len(set(texts)) == 1, (
+                f"reference cohort {i} disagrees with itself — identical audio, "
+                "aligned boundaries, so this is the pool crossing streams"
+            )
+        for i, (ref, got) in enumerate(zip(aligned, mixed)):
+            assert got == ref[0], f"stream {i} diverged under misaligned turn boundaries"

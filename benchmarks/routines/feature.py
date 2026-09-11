@@ -2,7 +2,9 @@
 
 Subroutines
 -----------
-* ``fbank_preprocess`` — DC-removal + pre-emphasis + windowing + zero-pad.
+* ``fbank_preprocess`` — DC-removal + pre-emphasis + windowing + zero-pad, over frames
+  the caller already has.  ``stft_frame`` is what the frontend runs; this is the
+  ``cuda_unfold`` pipeline arm's second stage.
 * ``mel_log``           — mel filterbank + log-floor + log over a power spectrum.
 * ``dct_lifter``        — DCT-II + cepstral lifter.
 * ``fbank_pipeline``    — full FBANK end-to-end (waveform → log-mel features).
@@ -10,7 +12,8 @@ Subroutines
 
 Backends
 --------
-* ``cuda``       — OASR's CUDA kernel chain (``oasr.functionals.feature.*`` + ``oasr.rfft_power``).
+* ``cuda``        — the shipped chain: ``stft_frame`` → ``rfft_power`` → ``mel_log``.
+* ``cuda_unfold`` — the same, framed outside the kernel: ``unfold`` → ``fbank_preprocess``.
 * ``torch``      — pure-PyTorch GPU equivalent (vectorized over the batch).
 * ``torchaudio`` — per-utterance loop over ``torchaudio.compliance.kaldi``
                     (only for the pipeline subroutines).
@@ -206,7 +209,7 @@ def setup_mel_log(batch, num_frames, n_freq, num_mel, dtype=torch.float32):
     power = torch.rand(batch, num_frames, n_freq, device=device, dtype=dtype) + 1e-6
     n_fft = (n_freq - 1) * 2
     mel_mat = _mel_bank(num_mel, n_fft, 16000, 20.0, 0.0, device)
-    eps = torch.finfo(dtype).tiny
+    eps = torch.finfo(dtype).eps  # Kaldi's FLT_EPSILON floor, as the frontend uses
 
     def oasr_fn():
         return oasr.functionals.feature.mel_log(power, mel_mat, log_floor=eps)
@@ -247,7 +250,50 @@ def _oasr_fbank_pipeline(
     mel_mat: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """OASR-kernel chain: unfold → fbank_preprocess → rfft_power → mel_log."""
+    """The shipped chain: stft_frame → rfft_power → mel_log.
+
+    What ``oasr.layers.Fbank`` and every served fbank request run.  Three
+    launches and no framed-waveform copy: the framing is inside ``stft_frame``.
+    """
+    lengths = torch.full(
+        (waveforms.size(0),), waveforms.size(1), dtype=torch.int32, device=waveforms.device
+    )
+    num_frames = (waveforms.size(1) - frame_length) // frame_shift + 1
+    frames = oasr.stft_frame(
+        waveforms,
+        lengths,
+        window,
+        n_fft,
+        frame_shift,
+        num_frames,
+        center_offset=0,
+        win_offset=0,
+        preemph_coef=0.97,
+        preemph_replicate=True,
+        remove_dc_offset=True,
+    )
+    power = oasr.rfft_power(frames, n=n_fft)
+    return oasr.functionals.feature.mel_log(power, mel_mat, log_floor=eps)
+
+
+def _unfold_fbank_pipeline(
+    waveforms: torch.Tensor,
+    *,
+    frame_length: int,
+    frame_shift: int,
+    n_fft: int,
+    window: torch.Tensor,
+    mel_mat: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """The pre-framed chain: unfold → fbank_preprocess → rfft_power → mel_log.
+
+    Kept as its own arm so the cost of framing *outside* the kernel — an
+    ``unfold`` plus a ``(B, N, frame_length)`` contiguous copy, 2.5x the
+    waveform at Kaldi's 25 ms / 10 ms grid — is measured rather than asserted.
+    ``oasr.layers.Fbank`` ran this until the four kernels were wired through
+    ``stft_frame``.
+    """
     frames = waveforms.unfold(-1, frame_length, frame_shift).contiguous()
     preprocessed = oasr.functionals.feature.fbank_preprocess(frames, window, n_fft=n_fft)
     power = oasr.rfft_power(preprocessed)
@@ -313,7 +359,7 @@ def setup_fbank_pipeline(batch, audio_seconds, dtype=torch.float32):
     n_fft = _next_power_of_two(frame_length)
     num_mel = 80
     preemph = 0.97
-    eps = torch.finfo(dtype).tiny
+    eps = torch.finfo(dtype).eps  # Kaldi's FLT_EPSILON floor, as the frontend uses
 
     n_samples = int(audio_seconds * sample_rate)
     waveforms = torch.randn(batch, n_samples, device=device, dtype=dtype)
@@ -346,7 +392,18 @@ def setup_fbank_pipeline(batch, audio_seconds, dtype=torch.float32):
     def torchaudio_fn():
         return _torchaudio_fbank_loop(waveforms, sample_rate, num_mel)
 
-    return oasr_fn, torch_fn, torchaudio_fn
+    def unfold_fn():
+        return _unfold_fbank_pipeline(
+            waveforms,
+            frame_length=frame_length,
+            frame_shift=frame_shift,
+            n_fft=n_fft,
+            window=window,
+            mel_mat=mel_mat,
+            eps=eps,
+        )
+
+    return oasr_fn, torch_fn, torchaudio_fn, unfold_fn
 
 
 def _oasr_mfcc_pipeline(
@@ -436,7 +493,7 @@ def setup_mfcc_pipeline(batch, audio_seconds, dtype=torch.float32):
     num_mel = 23
     num_ceps = 13
     preemph = 0.97
-    eps = torch.finfo(dtype).tiny
+    eps = torch.finfo(dtype).eps  # Kaldi's FLT_EPSILON floor, as the frontend uses
 
     n_samples = int(audio_seconds * sample_rate)
     waveforms = torch.randn(batch, n_samples, device=device, dtype=dtype)
@@ -475,7 +532,19 @@ def setup_mfcc_pipeline(batch, audio_seconds, dtype=torch.float32):
     def torchaudio_fn():
         return _torchaudio_mfcc_loop(waveforms, sample_rate, num_mel, num_ceps)
 
-    return oasr_fn, torch_fn, torchaudio_fn
+    def unfold_fn():
+        log_mel = _unfold_fbank_pipeline(
+            waveforms,
+            frame_length=frame_length,
+            frame_shift=frame_shift,
+            n_fft=n_fft,
+            window=window,
+            mel_mat=mel_mat,
+            eps=eps,
+        )
+        return oasr.functionals.feature.dct_lifter(log_mel, dct, lifter=lifter)
+
+    return oasr_fn, torch_fn, torchaudio_fn, unfold_fn
 
 
 # ---------------------------------------------------------------------------
@@ -584,8 +653,13 @@ def _setup_for_config(subroutine: str, cfg: dict, dtype: torch.dtype):
 def get_fn_map(subroutine: str, *fns: Callable) -> Dict[str, Callable]:
     """Map backend name → callable. Pipelines expose the torchaudio backend too."""
     if subroutine in PIPELINE_SETUP:
-        oasr_fn, torch_fn, torchaudio_fn = fns
-        return {"cuda": oasr_fn, "torch": torch_fn, "torchaudio": torchaudio_fn}
+        oasr_fn, torch_fn, torchaudio_fn, unfold_fn = fns
+        return {
+            "cuda": oasr_fn,
+            "torch": torch_fn,
+            "torchaudio": torchaudio_fn,
+            "cuda_unfold": unfold_fn,
+        }
     oasr_fn, torch_fn = fns[:2]
     return {"cuda": oasr_fn, "torch": torch_fn}
 
