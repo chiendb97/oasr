@@ -49,7 +49,7 @@ repos:
         entry: python ci/gpu_suites.py --check
         language: system
         pass_filenames: false
-        files: '^(tests/test_.*\.py|ci/gpu_suites\.py)$'
+        files: '^(tests/.*test_.*\.py|ci/gpu_suites\.py)$'
 
       # A bare `checkpoints/` in .gitignore matches that directory name at any
       # depth, which silently kept the whole `oasr/checkpoints/` package out of

@@ -25,7 +25,7 @@ model.
    a registry — subclass a base, register under a name, select by configuration.
    There are eight such axes; see [Architecture](#architecture).
 2. **Models are built from `oasr.layers`, never from bare `nn.Linear` /
-   `nn.LayerNorm` / `nn.Embedding` / `nn.Conv*`.** `tests/test_layer_waist.py`
+   `nn.LayerNorm` / `nn.Embedding` / `nn.Conv*`.** `tests/models/test_layer_waist.py`
    enforces this and fails on a newly registered architecture that has no tiny
    config to check.
 3. **A missing kernel must be declared, not routed around.** `oasr.layers._backend`
@@ -63,7 +63,7 @@ model.
     tile*: stored, the running max becomes `max(0, m)`, `P` loses `max(P) == 1`,
     and the fp16 cast before `P @ V` flushes the row to zero. That is what made
     `-inf` in `attn_bias` wrong beside a large finite bias; fixed and pinned by
-    `tests/test_fmha.py::TestInfiniteMaskFloorWithALargeBias`.
+    `tests/kernels/test_fmha.py::TestInfiniteMaskFloorWithALargeBias`.
 11. **Never branch kernel dispatch on CUDA-graph capture state.** A
     capture-dependent branch makes the graph pick a different kernel than eager,
     and the resulting one-ulp difference has changed decoded tokens.
@@ -87,7 +87,7 @@ model.
     (`req.stream_time_offset`) does not. Same family as rules 10 and 11: a silent
     state error whose output stays plausible. Pinned bit-exactly, against a fresh
     stream fed the same chunks, by
-    `tests/test_streaming_backend.py::TestBackendReset`.
+    `tests/engine/test_streaming_backend.py::TestBackendReset`.
 14. **A speech detector declares what its signal can resolve.** The ASR-derived
     signals are peaky — measured on read speech, only ~15 % of CTC frames clear
     `p=0.5` and in-word blank runs reach 840 ms — so
@@ -115,9 +115,9 @@ set -a; source .env; set +a          # cp .env.example .env first, and edit the 
 | Install everything | `pip install -e ".[all]"` |
 | Run all Python tests | `pytest tests/` |
 | Run them the way CI does | `pytest $(python ci/gpu_suites.py --paths <family>) --strict-assets` (`--list` for the family names) |
-| One test file / function | `pytest tests/test_conv.py::TestDepthwiseConv1D -v` |
+| One test file / function | `pytest tests/kernels/test_conv.py::TestDepthwiseConv1D -v` |
 | Skip slow tests | `pytest tests/ -m "not slow"` |
-| Engine concurrency stress (opt-in) | `pytest tests/test_engine_concurrent.py -m concurrent -v` |
+| Engine concurrency stress (opt-in) | `pytest tests/engine/test_concurrent.py -m concurrent -v` |
 | Format Python | `black oasr/ tests/ benchmarks/ scripts/ ci/` then `isort` the same paths |
 | Lint Python | `ruff check oasr/ tests/ benchmarks/ scripts/ ci/` |
 | Type check (ratchet) | `python scripts/mypy_ratchet.py` |
@@ -376,7 +376,7 @@ extension cookbook for each axis.
   that is plausible and wrong. `FrameClock.resolve` returns `None` and the request is refused;
   words are cut out of the rendered transcript so each is a literal substring of `text`.
 - **Changing the alignment rule without its oracle.** The pass is C++ only (`csrc/alignment/`)
-  and Python raises rather than falling back. `tests/test_alignment_cpp.py` states the same rule
+  and Python raises rather than falling back. `tests/decoders/test_alignment.py` states the same rule
   and must agree **exactly**, so a change lands in both — which is also why neither side uses
   `std::isspace` or `sum()`: both differ across implementations and the difference reaches the
   published output. See [`docs/decoding.md`](docs/decoding.md) § Word timings.
@@ -419,7 +419,7 @@ extension cookbook for each axis.
 3. Make the change. If it touches a registry axis, follow the cookbook in
    [`docs/architecture.md`](docs/architecture.md) rather than editing the engine.
 4. Add tests. A new architecture also needs a tiny config in
-   `tests/test_layer_waist.py` and, if it changes decode behaviour, an entry in
+   `tests/models/test_layer_waist.py` and, if it changes decode behaviour, an entry in
    `ci/wer-reference.json`.
 5. Run locally, in this order:
    ```bash
@@ -458,11 +458,36 @@ style, 100 characters, C++17. CUDA flags include `--expt-relaxed-constexpr`,
 
 ## CI / testing
 
-Tests live under `tests/`, flat, one file per kernel or component
-(`tests/test_<thing>.py`, FlashInfer convention). `tests/conftest.py` provides
-`device`, `dtype` / `dtype_all`, `batch_seq_hidden`, and the asset fixtures
-`ckpt_dir` / `wav_dir` / `audio_path` / `lang_dir` (which **gate**, not return
-`""`). Default options `-v --tb=short` come from `pyproject.toml`.
+Tests live under `tests/`, **one directory per GPU-suite family**, one file per
+module under test:
+
+```
+tests/{kernels,models,decoders,features,engine,accuracy}/
+```
+
+The directories *are* the split — `ci/gpu_suites.py` maps a family to its
+directory, so a new file is covered by the matrix the moment it lands in the
+right one. Two rules follow:
+
+- **A test file belongs to the family that owns the module it imports**, not the
+  one that reads well. `test_decoder_kv.py` is `oasr/cache/`, so it is in
+  `engine/`; the sequence-packing tests are `oasr/models/conformer/packing.py`,
+  so they are in `models/`.
+- **Basenames are globally unique.** `tests/` has no `__init__.py`, so pytest
+  keys modules by basename and two `test_registry.py` in different folders is an
+  "import file mismatch", not a merge. `ci/gpu_suites.py --check` enforces both.
+
+`tests/helpers/` holds what more than one file needs — `REPO_ROOT`, the dtype
+tolerance ladder, the destination-passing and graph-replay assertions, the SDPA
+and LSTM oracles, the signal generators, the engine and cache builders. It
+imports by name (`from helpers import ...`) because `tests/` is on `sys.path`.
+Reach for it before writing a fourth copy of a fake model; that is how the suite
+got to eight `ASREngine` builders and four SDPA references.
+
+`tests/conftest.py` provides `device`, `dtype`, and the asset fixtures
+`ckpt_dir` / `wav_dir` / `audio_path` / `lang_dir` / `silero_vad_dir` (which
+**gate**, not return `""`). Default options `-v --tb=short` come from
+`pyproject.toml`.
 
 Markers: `slow`, `concurrent` (opt-in), `cuda`, `requires_assets(*names)`.
 
@@ -486,9 +511,9 @@ Three gates matter beyond the unit tests:
 
 | Gate | File | Checks |
 |---|---|---|
-| Accuracy | `tests/test_accuracy.py` | WER on a fixed 200-utterance LJSpeech manifest against `ci/wer-reference.json`. The one check a numerical-parity oracle structurally *cannot* make — parity feeds identical features to both sides, so a frontend-convention bug cancels on both. |
-| Structural | `tests/test_layer_waist.py` | No bare torch layer in any registered architecture; every architecture has a tiny config; kernel and torch paths agree on CUDA. |
-| Contract | `tests/test_model_contract.py` | The `CAPABILITIES` table is satisfiable by every registered architecture. |
+| Accuracy | `tests/accuracy/test_accuracy.py` | WER on a fixed 200-utterance LJSpeech manifest against `ci/wer-reference.json`. The one check a numerical-parity oracle structurally *cannot* make — parity feeds identical features to both sides, so a frontend-convention bug cancels on both. |
+| Structural | `tests/models/test_layer_waist.py` | No bare torch layer in any registered architecture; every architecture has a tiny config; kernel and torch paths agree on CUDA. |
+| Contract | `tests/models/test_contract.py` | The `CAPABILITIES` table is satisfiable by every registered architecture. |
 
 Workflows in `.github/workflows/`:
 

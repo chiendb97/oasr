@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run the GPU test suites on rented accelerators, one image across every arch.
 
+Usage::
+
     modal run ci/modal_app.py::fetch_assets                     # once, ~20 GiB
     modal run ci/modal_app.py::main --gpus L40S,H100,B200
     modal run ci/modal_app.py::main --gpus H100 --suites engine,models

@@ -976,7 +976,7 @@ loses nothing and a repeated one double-counts nothing.
 Collection is designed to cost nothing worth switching off, and two invariants
 hold it there rather than a benchmark result: batch padding is derived from
 **host-side** waveform lengths, so nothing on the collate path reads the device
-(`tests/test_engine_metrics.py` asserts that against a CUDA event); and each
+(`tests/engine/test_metrics.py` asserts that against a CUDA event); and each
 series' sample buffer is capped, with the cap short-circuiting before the
 append, so a collector nobody drains neither slows down nor grows. Measured
 overhead: `.artifacts/monitoring_overhead.md`.

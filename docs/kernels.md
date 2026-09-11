@@ -448,6 +448,6 @@ marshalling only, because a fallback here is a slow path a deployment lands on
 silently. Both files are in `OASR_SOURCES`, so a successful build always has
 them and no call site checks. So these are the one part of the tree where
 `test-cpu.yml`, which compiles nothing, cannot cover the implementation: the
-rule is checked against a Python oracle kept inside `tests/test_alignment_cpp.py`
+rule is checked against a Python oracle kept inside `tests/decoders/test_alignment.py`
 (exact agreement over randomised input and the whole Unicode plane), and that
 file skips without the extension.
