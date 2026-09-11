@@ -58,6 +58,24 @@
       "insertions": 13
     },
     {
+      "_comment": [
+        "Re-recorded 2026-09-11 at 4.09 (was 4.06), one more deletion, when the",
+        "Kaldi frontend's mel-energy floor moved from float32 tiny to Kaldi's own",
+        "FLT_EPSILON — which is what kaldi, torchaudio.compliance.kaldi and OASR's",
+        "per-utterance reference path all apply. This checkpoint is audio_scale=1.0,",
+        "so the difference reaches real speech: 22% of LJSpeech frames carry at",
+        "least one mel bin under FLT_EPSILON, and those bins were -87.34 instead of",
+        "-15.94, up to 5.1 absolute against torchaudio. Exactly one transcript of",
+        "200 changes (LJ001-0063 loses a leading 'WHICH'), which is the honest",
+        "summary: the frontend was materially wrong and the encoder was nearly",
+        "invariant to it. The reason to take it is that two in-tree paths serving",
+        "the same config now agree, not the rate.",
+        "",
+        "Bit-stable at max_batch_size 8/16/32 (identical counts). max_batch_size 1",
+        "gives 4.32% (58S 80D 9I) — a PRE-EXISTING deviation from the blanket",
+        "batch-invariance claim above, measured identical on both sides of the",
+        "floor change, so it is not this entry's to explain."
+      ],
       "key": "zipformer",
       "asset": "ZIPFORMER_CKPT",
       "architecture": "zipformer-large-cr-ctc (icefall)",
@@ -66,10 +84,10 @@
       "max_batch_size": 16,
       "metric": "wer",
       "normalizer": "english",
-      "error_rate_pct": 4.06,
+      "error_rate_pct": 4.09,
       "ref_units": 3403,
       "substitutions": 58,
-      "deletions": 71,
+      "deletions": 72,
       "insertions": 9
     },
     {
@@ -96,7 +114,15 @@
         "tolerance.",
         "",
         "beam_size=1 is token-identical to greedy on all 200 utterances (the gate);",
-        "beam_size=4 gives 3.03% (62S 26D 15I)."
+        "beam_size=4 gives 3.03% (62S 26D 15I).",
+        "",
+        "Counts re-recorded 2026-09-11 (63S 16I -> 64S 15I); the rate is unchanged",
+        "at 3.23. The Kaldi mel floor moved to FLT_EPSILON — see the zipformer",
+        "entry, same icefall audio_scale=1.0 — which removed one insertion here",
+        "(one transcript of 200 changes, LJ001-0079). The extra substitution is",
+        "NOT from that change: the pre-fix tree measures 64S 31D 16I = 3.26 today,",
+        "so one substitution drifted in from somewhere between 2026-08-11 and now",
+        "and is recorded here rather than silently absorbed."
       ],
       "key": "transducer",
       "asset": "TRANSDUCER_CKPT",
@@ -109,9 +135,9 @@
       "normalizer": "english",
       "error_rate_pct": 3.23,
       "ref_units": 3403,
-      "substitutions": 63,
+      "substitutions": 64,
       "deletions": 31,
-      "insertions": 16
+      "insertions": 15
     },
     {
       "_comment": [

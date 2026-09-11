@@ -16,12 +16,13 @@ Registering a frontend is the whole change — no edit to the config, the
 | `spec.py` | `FeatureSpec` — the **checkpoint-derived** description a converter emits |
 | `registry.py` | `ExtractorSpec`, `register_extractor`, `build_extractor(config)`, `list_extractors()` |
 | `extractors.py` | Registers the built-ins |
-| `batched.py` | `fbank_batch` / `mfcc_batch` / `extract_features_batch` — the fused Kaldi kernels |
+| `batched.py` | `batched_fbank` / `batched_mfcc` — the engine's entry into the Kaldi frontend, and the predicate deciding whether a config is served fused or per-utterance |
 | `whisper.py` | `batched_whisper_logmel` — the 30 s Whisper recipe |
 | `nemotron.py` | `batched_nemotron_logmel` — the NeMo recipe |
 | `lfr.py` | `apply_lfr_batch` — low-frame-rate stacking |
 | `streaming.py` | `BatchedStreamingFeatureExtractor` — `B` parallel chunked streams |
-| `backends.py` | `torchaudio.compliance.kaldi` (default) and the optional `kaldifeat` GPU path |
+| `backends.py` | `torchaudio.compliance.kaldi` (default) and the optional `kaldifeat` GPU path — the per-utterance reference |
+| `oasr/layers/feature.py` | The Kaldi pipeline itself: the four kernels, the torch path beside them, and `Fbank` / `Mfcc` |
 
 ## `FeatureSpec` — what travels with the checkpoint
 
@@ -108,11 +109,32 @@ LFR configs. CUDA inputs use `oasr.lfr_gather`; CPU and
 
 The batched CUDA chain is `stft_frame(remove_dc_offset=True)` → `rfft_power` →
 `mel_log` → `dct_lifter` (MFCC only). It frames each varlen row directly from
-the padded waveform; there is no `unfold` or framed-waveform copy. Exotic
-configs still use the per-utterance reference. Windows include `hamming`
-(FunASR frontends), so Paraformer's collate stays on the fast path.
-`snip_edges` framing means the offline grid *is* the streaming grid. CPU and
-`OASR_FEATURE_BACKEND=torch` use the batched torch parity oracle.
+the padded waveform; there is no `unfold` or framed-waveform copy. `snip_edges`
+framing means the offline grid *is* the streaming grid. CPU and
+`OASR_FEATURE_BACKEND=torch` use the torch path beside the kernels.
+
+**One implementation.** The pipeline lives in `oasr/layers/feature.py` — the
+layer waist — and `batched.py` delegates to it, so `oasr.layers.Fbank` and a
+served request are the same code and produce bit-identical output. That is a
+property worth asserting (`tests/features/test_batched.py::
+test_the_engine_path_and_the_waist_module_are_one_implementation`) rather than
+maintaining: two copies of a frontend convention is how a frontend drifts.
+
+**All five Kaldi windows** — povey, hanning, hamming, blackman, rectangular —
+stay on the fused path. A window is a host-side table built once per config, so
+none of them is a reason to fall back. `dither`, `snip_edges=False` and
+`use_energy` still are, and those configs are served by the per-utterance
+reference: correct and slow beats fused and approximate.
+
+**The mel-energy floor is `FLT_EPSILON`, not `float32` tiny.** Kaldi is
+`mel_energies.ApplyFloor(numeric_limits<float>::epsilon())`, and
+`torchaudio.compliance.kaldi` agrees. The two constants are 31 orders of
+magnitude apart, so a floored bin is `-15.94` under Kaldi and `-87.34` under
+tiny — and which bins get floored depends on `audio_scale`: at `32768` (WeNet,
+FunASR) only digital silence reaches it, at `1.0` (icefall) a fifth of real
+speech frames do. Only the external oracle can see this. A parity test feeds
+the same convention to both sides, which is why the pin lives in
+`tests/features/test_feature_kernels.py::TestKaldiMelFloor` against torchaudio.
 
 ### `whisper_logmel`
 
@@ -165,9 +187,9 @@ Kaldi and makes pre-emphasis frame-local with its replicate boundary.
 
 ### `mel_log` — an additive guard alongside the floor
 
-Kaldi is `log(max(m, tiny))`; NeMo is `log(m + 2**-24)`. One knob would move the
-value of every silent bin — which *is* the encoder's input scale — so both are
-exposed.
+Kaldi is `log(max(m, FLT_EPSILON))`; NeMo is `log(m + 2**-24)`. One knob would
+move the value of every silent bin — which *is* the encoder's input scale — so
+both are exposed.
 
 It also takes optional per-row `frame_lengths` masking, which has to happen
 **after** the log, because `log(0 + 2**-24)` is a large negative constant, not
@@ -175,8 +197,15 @@ zero.
 
 ### Others
 
-`dct_lifter` (MFCC), `fbank_preprocess`, `whisper_logmel`, `lfr_gather`, and
-`rfft` / `rfft_power` (`oasr/functionals/fft.py`).
+`dct_lifter` (MFCC), `whisper_logmel`, `lfr_gather`, and `rfft` / `rfft_power`
+(`oasr/functionals/fft.py`).
+
+`fbank_preprocess` is the same per-frame work as `stft_frame` for a caller that
+*already has frames* — it takes `(..., frame_length)` rather than a waveform.
+Nothing in-tree hands it frames any more: producing them means `unfold` plus a
+`(B, N, frame_length)` copy of the waveform at 2.5× its size, which is exactly
+what `stft_frame` exists to avoid. It stays as a primitive, with its own tests
+and benchmark routine, and is not on the request path.
 
 ## Extraction entry points
 

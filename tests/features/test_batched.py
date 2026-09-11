@@ -902,3 +902,49 @@ class TestKernelBackedBatchedKaldi:
             torch.testing.assert_close(
                 got[b, :count].cpu(), expected[b, :count], rtol=1e-3, atol=1e-2
             )
+
+    @pytest.mark.parametrize(
+        "window_type", ["povey", "hanning", "hamming", "blackman", "rectangular"]
+    )
+    @pytest.mark.parametrize("feature_type", ["fbank", "mfcc"])
+    def test_every_kaldi_window_stays_on_the_fused_path(self, feature_type, window_type):
+        """A window is a host-side table, so none of them is a reason to fall off.
+
+        Three of the five used to drop to :func:`_per_utterance` — a Python loop
+        over rows into torchaudio — for no reason but a two-entry allow-list.
+        """
+        from oasr.features import FeatureConfig
+        from oasr.features.batched import supports_batched_fbank, supports_batched_mfcc
+
+        cfg = FeatureConfig(
+            feature_type=feature_type, window_type=window_type, num_mel_bins=80, dither=0.0
+        )
+        supports = supports_batched_mfcc if feature_type == "mfcc" else supports_batched_fbank
+        assert supports(cfg)
+
+    @pytest.mark.parametrize("feature_type", ["fbank", "mfcc"])
+    def test_the_engine_path_and_the_waist_module_are_one_implementation(self, feature_type):
+        """``batched_fbank`` and ``oasr.layers.Fbank`` must not be two pipelines.
+
+        They were: the module framed with ``unfold`` into ``fbank_preprocess``
+        while the engine framed with ``stft_frame``, and each carried its own
+        window / mel / DCT / lifter tables.  Two copies of a convention is how a
+        frontend drifts, so this asserts identity, not closeness.
+        """
+        from oasr.features import FeatureConfig
+        from oasr.features.batched import batched_fbank, batched_mfcc
+        from oasr.layers import Fbank, Mfcc
+
+        torch.manual_seed(11)
+        lengths = torch.tensor([16000, 7000], device="cuda")
+        waveforms = torch.zeros(2, 16000, device="cuda")
+        for b, n in enumerate(lengths.tolist()):
+            waveforms[b, :n] = torch.randn(n, device="cuda")
+        cfg = FeatureConfig(feature_type=feature_type, num_mel_bins=80, num_ceps=13, dither=0.0)
+        extract = batched_mfcc if feature_type == "mfcc" else batched_fbank
+        module = (Mfcc if feature_type == "mfcc" else Fbank)(cfg).cuda()
+
+        got, got_lengths = extract(waveforms, lengths, cfg)
+        mod_feats, mod_lengths = module(waveforms, lengths=lengths)
+        assert torch.equal(got, mod_feats)
+        assert torch.equal(got_lengths, mod_lengths)

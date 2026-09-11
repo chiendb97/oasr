@@ -227,7 +227,7 @@ def fbank_preprocess(
 def mel_log(
     power: torch.Tensor,
     mel_mat: torch.Tensor,
-    log_floor: float = 1.1754944e-38,
+    log_floor: float = 1.1920929e-07,
     out: Optional[torch.Tensor] = None,
     *,
     log_offset: float = 0.0,
@@ -241,8 +241,11 @@ def mel_log(
     Args:
         power: ``(..., n_freq)`` float32 power spectrum (CUDA).
         mel_mat: ``(num_mel, n_freq)`` float32 mel filterbank.
-        log_floor: Floor applied before ``log`` (default: ``float32`` tiny —
-            Kaldi's convention).
+        log_floor: Floor applied before ``log``.  The default is Kaldi's
+            ``FLT_EPSILON`` (``mel_energies.ApplyFloor(numeric_limits<float>::
+            epsilon())``), which is also what ``torchaudio.compliance.kaldi``
+            applies — *not* ``float32`` tiny, which is 31 orders of magnitude
+            away and sets a silent bin to ``-87.34`` instead of ``-15.94``.
         out: Optional pre-allocated ``(..., num_mel)`` output.
         log_offset: Added after the floor (NeMo's ``2 ** -24`` guard). The two
             are separate knobs because they set the value of a silent bin
