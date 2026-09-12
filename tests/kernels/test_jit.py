@@ -299,13 +299,19 @@ class TestTileSpaceIsBuildable:
         affected shape is 3.5x slower than the right tile.  So the join between
         the two is checked here rather than discovered in a benchmark.
         """
-        from oasr.jit.gemm import _GEMM_HEURISTIC_RULES_SM120, get_unique_compile_configs
+        from oasr.jit.gemm import (
+            _GEMM_HEURISTIC_RULES_SM120,
+            GEMM_DEFAULT,
+            get_unique_compile_configs,
+        )
 
         built = get_unique_compile_configs(120)
         orphans = [
             (op, N, K, m_max, choice.name)
             for (op, N, K), rules in _GEMM_HEURISTIC_RULES_SM120.items()
             for m_max, choice in rules
-            if not isinstance(choice, str) and choice.compile_name not in built
+            if not isinstance(choice, str)
+            and choice is not GEMM_DEFAULT
+            and (choice.kSmVersion != 120 or choice.compile_name not in built)
         ]
-        assert not orphans, f"rules naming a config that is never compiled: {orphans}"
+        assert not orphans, f"rules naming a config SM120 never compiles: {orphans}"
