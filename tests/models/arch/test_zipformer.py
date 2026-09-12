@@ -463,14 +463,14 @@ class TestRealIcefallCheckpoint:
             wavs = assets.require_wavs(n)
             return [torchaudio.load(w)[0].squeeze(0) for w in wavs]
 
-        def _engine(self, mode):
+        def _engine(self, mode, max_batch_size=4):
             from oasr.engine import ASREngine, EngineConfig
 
             return ASREngine(
                 EngineConfig(
                     ckpt_dir=ZIPFORMER_CKPT,
                     service_mode=mode,
-                    max_batch_size=4,
+                    max_batch_size=max_batch_size,
                     dtype=torch.float16,
                 )
             )
@@ -498,6 +498,50 @@ class TestRealIcefallCheckpoint:
                 torch.cuda.empty_cache()
             for got, want in zip(texts, self.GROUND_TRUTH):
                 assert got.lower().strip() == want, f"got={got!r} want={want!r}"
+
+        def test_offline_is_batch_invariant(self):
+            """The same audio, alone and in a batch, must decode the same.
+
+            ``LJ001-0002`` is 1.90 s, which at ``max_batch_size=1`` puts the
+            ConvNeXt pointwise contraction at ``M = 92 * 19 = 1748`` — the band
+            whose tuned GEMM rule used to name a tile CUTLASS's epilogue cannot
+            address.  The wrong values overflowed fp16 to ``inf``, the CTC head
+            produced all-NaN log-probs, and the request came back with an
+            **empty transcript**: 4 words of the 200-utterance manifest silently
+            deleted at batch 1 and not at batch 16.
+
+            A batch is not obliged to be bit-identical to a solo request in
+            general — batching changes M, which changes the tile and so the
+            reduction order — so this asserts the *transcript*, which the recorded
+            spread across ``max_batch_size`` 1/8/16/32 says is stable for this
+            checkpoint.
+            """
+            solo = self._engine("offline", max_batch_size=1)
+            try:
+                one_at_a_time = [solo.transcribe_offline([w])[0] for w in self._audios(2)]
+                one_at_a_time = [t.text if hasattr(t, "text") else t for t in one_at_a_time]
+            finally:
+                del solo
+                torch.cuda.empty_cache()
+
+            for got, want in zip(one_at_a_time, self.GROUND_TRUTH):
+                assert got.strip(), (
+                    "a request decoded on its own returned an empty transcript; "
+                    f"expected {want!r}"
+                )
+                assert got.lower().strip() == want, f"solo got={got!r} want={want!r}"
+
+            batched = self._engine("offline", max_batch_size=4)
+            try:
+                together = batched.transcribe_offline(self._audios(2))
+                together = [t.text if hasattr(t, "text") else t for t in together]
+            finally:
+                del batched
+                torch.cuda.empty_cache()
+            assert one_at_a_time == together, (
+                "solo and batched transcripts differ:\n"
+                f"  solo    = {one_at_a_time}\n  batched = {together}"
+            )
 
         def _is_causal_release(self) -> bool:
             from oasr.models import build_model_from_checkpoint

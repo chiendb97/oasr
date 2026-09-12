@@ -338,6 +338,16 @@ extension cookbook for each axis.
 - **Adding a field to the paged region without updating both allocators.** `init_paged_state`
   and `setup_internal_data_paged_pointers` bump-allocate the *same* bytes: a missing field
   shifts every later pointer, and the illegal access lands far from the edit.
+- **A CUTLASS 2.x tile whose epilogue cannot address it.** The tensor-op epilogue derives its
+  per-warp lane grid from the *tile* and asserts nothing about that grid covering a warp; at
+  half precision's 8-element store, `block_n < 32` maps 16 of 32 lanes and the kernel compiles,
+  launches, writes every row and returns values ~100x off. Nothing in the dispatch or the tuner
+  can see it — one is "is the config compiled?", the other "which is fastest?" — so the
+  constraint lives in the config space (`_epilogue_covers_warp`, and `epilogueCoversWarp` for
+  the BMM general lane, where the store width is chosen at run time from N's alignment). A
+  `block_n=16` rule shipped and returned an **empty transcript** for any 1.1-2.2 s Zipformer
+  request that arrived alone. Pinned by the per-variant fp32 sweeps in
+  `tests/kernels/test_{gemm,conv}.py`.
 - **`LinearActivation(activation="gelu")`.** Only `gelu_tanh` exists — the CUDA epilogue is the
   tanh approximation, and fusing it under the exact-erf name is a silent accuracy change.
 - **Padding to a capture bucket on the captured path only.** No encoder is obliged to be

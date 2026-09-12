@@ -259,10 +259,21 @@ rule falls through to the fixed `GEMM_DEFAULT` tile; the fall-through is counted
 and reportable via `jit.gemm.rule_miss_report()` — which is both the coverage
 check and the shape list to feed the tuner.
 
-Two rules are structural rather than tuned:
+Three rules are structural rather than tuned:
 
 - **`GEMM_MIN_ROWS`** — a row floor below which CUTLASS's M-tiling leaves most of
   every tile empty and cuBLAS's GEMV-shaped kernel wins.
+- **The candidate space is constrained before it is tuned**
+  (`jit.gemm._epilogue_covers_warp`). CUTLASS's tensor-op epilogue folds a
+  warp's 32 lanes into a grid derived from the *tile*, and asserts nothing about
+  that grid covering a warp; a tile where it does not compiles, launches at full
+  speed and returns **wrong numbers**. At the 8-element access width half
+  precision uses, that is every `block_n < 32` tile. Such a tile is refused by
+  the per-SM builders — for GEMM, BMM, grouped GEMM and Conv2D alike, since all
+  four render from the same list — and the refusal is readable through
+  `jit.gemm.rejected_tiles()`. This is not a tuning preference: a rule naming
+  such a tile is a correctness bug that neither dispatch nor timing can see, and
+  one shipped (`.artifacts/gemm_thin_n_tile_epilogue.md`).
 - The dispatch decision is a **pure function of the call** and is deliberately
   *not* relaxed under CUDA-graph capture, even though dispatch cost is free
   there: a capture-dependent branch makes the graph pick a different kernel than
@@ -319,7 +330,13 @@ Two properties of the lane are worth knowing before changing it:
   still fills one wave brought that to 1.07×. Note the ceiling: CUTLASS's
   tensor-op epilogue divides the tile's rows by the warp count in M before it
   computes an iteration count, so a 32-row tile is a **single-warp** shape and
-  nothing smaller than 64 rows can use 128 threads.
+  nothing smaller than 64 rows can use 128 threads. The same ceiling has a
+  *column* half, and that one is not an assert: the epilogue derives its lane
+  width from the tile's columns and its lane rows from the tile's rows
+  independently, and never checks that the two cover a warp — so the 16-column
+  tile is addressable at 4 elements per access and **silently wrong** at 8.
+  `epilogueAlignment` in `bmm.cuh` caps the store width for that tile alone;
+  the `cp.async` load keeps its 8 elements.
 - **`GemmBatched` advances every operand by one constant stride**, so two batch
   axes are one launch only when all three tensors are affine in the flattened
   index. Both flattening orders are tried, because a contiguous output satisfies
