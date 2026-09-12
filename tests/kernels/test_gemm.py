@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from helpers import assert_dest_passing, assert_graph_replay
 
 import oasr
-from oasr.functionals.gemm import _gemm_fn, _get_gemm_module
+from oasr.functionals.gemm import _bmm_fn, _gemm_fn, _get_gemm_module
 from oasr.jit.core import _get_target_sm
 from oasr.jit.gemm import CutlassGemmConfig, get_unique_compile_configs
 
@@ -208,6 +208,26 @@ class TestBmmGeneralLane:
         v = torch.randn(T, batch, heads, 12, device="cuda", dtype=dtype).permute(2, 1, 3, 0)
         assert v.stride(-1) != 1 and v.stride(-2) == 1
         self._check(oasr.bmm(w, v), w, v, (heads, batch, T, 12))
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("value_dim", [4, 8, 12, 16])
+    def test_value_product_every_addressable_n(self, value_dim, dtype):
+        """The same product across the value dims the thin-N tile serves.
+
+        ``N <= 16`` with B row-major selects ``ThinNTile`` (64x16), whose
+        epilogue folds a warp into a ``kAccessRows x kAccessWidth`` grid derived
+        from the tile *and* the runtime N alignment.  At ``kElementsPerAccess =
+        8`` that grid is 8x2 = 16 lanes and the kernel returns wrong numbers at
+        full speed — so ``value_dim`` 8 and 16 were wrong while the shipped 12
+        (alignment 4, grid 8x4) was right, and no test asked about any dim but
+        12.  ``epilogueAlignment`` in ``include/oasr/gemm/bmm.cuh`` caps the
+        store; the ``cp.async`` load keeps its 8 elements.
+        """
+        T, heads, batch = 200, 4, 1
+        w = torch.randn(heads, batch, T, T, device="cuda", dtype=dtype)
+        v = torch.randn(T, batch, heads, value_dim, device="cuda", dtype=dtype).permute(2, 1, 3, 0)
+        assert v.stride(-2) == 1, "must be the row-major-B layout that picks ThinNTile"
+        self._check(oasr.bmm(w, v), w, v, (heads, batch, T, value_dim))
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_value_product_single_head(self, dtype):
@@ -867,3 +887,85 @@ class TestWorkspaceCacheBytesBound:
             torch.cuda.synchronize()
             torch.testing.assert_close(out.float(), ref, rtol=3e-2, atol=3e-1)
             del s
+
+
+# ---------------------------------------------------------------------------
+# Every compiled variant, against an fp32 oracle
+# ---------------------------------------------------------------------------
+
+_ALL_VARIANTS = sorted(
+    {
+        cfg.compile_name: cfg
+        for cfg in get_unique_compile_configs(_SM).values()
+        if isinstance(cfg, CutlassGemmConfig)
+    }.items()
+)
+
+#: Tiles without a K-decomposition — the subset every family exports.
+_PLAIN_VARIANTS = [
+    (name, cfg) for name, cfg in _ALL_VARIANTS if not (cfg.stream_k or cfg.parallel_split_k)
+]
+
+
+class TestEveryCompiledVariantIsCorrect:
+    """The oracle the tuned rule table was missing.
+
+    Selection was covered ("is the chosen config compiled?") and speed was
+    covered (the tuner), and between them sat ``b128x16x64_w32x16x64``: a
+    variant that compiled, launched, timed well and returned values 100-170x off
+    the reference, because CUTLASS's epilogue cannot address a 16-wide tile at
+    8 elements per access.  It was in the candidate space for the GEMM, BMM,
+    grouped-GEMM and Conv2D families and in one production rule, where it
+    emptied the transcript of any 1.1-2.2 s utterance a Zipformer CTC engine
+    decoded on its own.
+
+    So: sweep the whole compiled set, not the configs a rule happens to name
+    today.  The shapes are one production shape (Zipformer's ConvNeXt pointwise
+    contraction, at the M the broken rule covered) and one whose M, N and K are
+    all indivisible by every tile, so partial tiles and predication are exercised
+    too.
+    """
+
+    SHAPES = [(1710, 128, 384), (200, 264, 392)]
+
+    @pytest.mark.parametrize("name,cfg", _ALL_VARIANTS, ids=[n for n, _ in _ALL_VARIANTS])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_matches_an_fp32_reference(self, name, cfg, dtype, device):
+        # Parallel split-K is a decomposition, not a tile: its reduction kernel
+        # requires more than one K slice and refuses split_k == 1 by design.
+        split_k = max(2, int(getattr(cfg, "split_k", 1))) if cfg.parallel_split_k else 1
+        for M, N, K in self.SHAPES:
+            torch.manual_seed(0)
+            A = torch.randn(M, K, device=device, dtype=dtype)
+            B = torch.randn(N, K, device=device, dtype=dtype)
+            C = torch.randn(N, device=device, dtype=dtype)
+            # A sentinel, not ``empty``: an epilogue that skips part of its tile
+            # otherwise returns whatever the caching allocator last held there,
+            # which is often plausible enough to pass a loose tolerance.
+            out = torch.full((M, N), float("nan"), device=device, dtype=dtype)
+            _gemm_fn(cfg.compile_name, False)(out, A, B, C, split_k)
+            ref = torch.addmm(C.float(), A.float(), B.float().t())
+            assert torch.isfinite(out).all(), f"{name} {dtype} {M}x{N}x{K}: left NaN behind"
+            err = (out.float() - ref).abs().max().item()
+            assert err < _tol(dtype, K, split_k, serial=False), (
+                f"{name} {dtype} M={M} N={N} K={K}: max abs err {err:.4g} "
+                f"(reference max {ref.abs().max().item():.4g})"
+            )
+
+    @pytest.mark.parametrize("name,cfg", _PLAIN_VARIANTS, ids=[n for n, _ in _PLAIN_VARIANTS])
+    def test_bmm_variant_matches_an_fp32_reference(self, name, cfg, device):
+        """Same sweep through the BMM launcher, which renders the same tiles.
+
+        Only the plain tiles: Stream-K and parallel split-K are confined to the
+        GEMM family, so ``bmm_*_sk`` / ``bmm_*_pk`` are never exported.
+        """
+        batch, M, N, K = 4, 200, 264, 392
+        torch.manual_seed(0)
+        A = torch.randn(batch, M, K, device=device, dtype=torch.float16)
+        B = torch.randn(batch, N, K, device=device, dtype=torch.float16)
+        out = torch.full((batch, M, N), float("nan"), device=device, dtype=torch.float16)
+        _bmm_fn(cfg.compile_name)(out, A, B)
+        ref = torch.matmul(A.float(), B.float().transpose(-1, -2))
+        assert torch.isfinite(out).all(), f"{name}: left NaN behind"
+        err = (out.float() - ref).abs().max().item()
+        assert err < _tol(torch.float16, K), f"{name}: max abs err {err:.4g}"

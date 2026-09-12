@@ -179,3 +179,133 @@ class TestCuteRuntimeStream:
         # The assignment, not the prose: the module documents the old spelling.
         assert "stream = _CUstream(" not in src, "the 4.1 us spelling is back on the FMHA path"
         assert src.count("stream = _current_stream()") >= 2
+
+
+# ---------------------------------------------------------------------------
+# The CUTLASS 2.x tile space, and the constraint that keeps it buildable
+# ---------------------------------------------------------------------------
+
+
+class TestTileSpaceIsBuildable:
+    """A tile that CUTLASS cannot express must never enter a config space.
+
+    This is the layer where ``block_n=16`` got in.  It passed every gate that
+    existed: the tile divides its warp shape, its operands fit in shared memory,
+    the variant compiled, the launcher ran, and the tuner timed it and liked it
+    well enough to write a production rule.  What none of those could see is that
+    CUTLASS's tensor-op epilogue folds 32 lanes into a ``kAccessRows x
+    kAccessWidth`` grid computed from the *tile*, asserts nothing about the
+    product, and at ``block_n=16`` gets 16 — so half the lanes write rows outside
+    their own slot and the kernel returns wrong numbers at full speed.
+
+    These run without a GPU on purpose: the config space is pure Python, so the
+    CPU job can hold the line for every arch, not just the one in the box.
+    """
+
+    def _all_declared_tiles(self):
+        from oasr.jit.gemm import (
+            _SPLITK_PARALLEL_TILES,
+            _STREAMK_TILES,
+            GemmExtraTileConfigs,
+            TileShapeConfigs,
+        )
+
+        return TileShapeConfigs + GemmExtraTileConfigs + _STREAMK_TILES + _SPLITK_PARALLEL_TILES
+
+    def test_the_lane_grid_covers_a_warp_for_every_built_tile(self):
+        """Every tile that survives the filter maps all 32 lanes of its warps."""
+        from oasr.jit.gemm import _epilogue_covers_warp, _epilogue_output_map
+
+        for tile in self._all_declared_tiles():
+            if not _epilogue_covers_warp(tile):
+                continue  # refused by _tile_is_buildable; covered below
+            width, rows, iters_col, iters_row = _epilogue_output_map(tile)
+            assert width * rows == 32, f"{tile}: lane grid {rows}x{width}"
+            assert iters_col >= 1 and iters_row >= 1, f"{tile}: {iters_row}x{iters_col} iterations"
+
+    def test_block_n_16_is_refused(self):
+        """The tile shape that shipped wrong results, stated as a unit.
+
+        Written against a constructed tile rather than against the list, so it
+        keeps its meaning if the list ever drops the entry.
+        """
+        from oasr.jit.gemm import TileShape, _epilogue_covers_warp, _epilogue_output_map
+
+        tile = TileShape(block_m=128, block_n=16, block_k=64, warp_m=32, warp_n=16, warp_k=64)
+        width, rows, _, _ = _epilogue_output_map(tile)
+        assert (width, rows) == (2, 8), "the lane grid derivation drifted from CUTLASS"
+        assert not _epilogue_covers_warp(tile), "block_n=16 is not addressable at 8 elems/access"
+
+    def test_a_zero_iteration_tile_is_refused(self):
+        """The other way the epilogue under-covers: no access at all.
+
+        ``RowArrangement``'s 1-D branch (taken once ``block_n / warp_n`` reaches
+        8 warps) computes ``kIterationsColumn = block_n / 8 / 32``, which is 0
+        below ``block_n = 256``.  It has no ``static_assert`` either, so the
+        constraint has to name this case as well as the narrow-grid one.
+        """
+        from oasr.jit.gemm import TileShape, _epilogue_covers_warp, _epilogue_output_map
+
+        tile = TileShape(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=16, warp_k=64)
+        assert _epilogue_output_map(tile)[2] == 0
+        assert not _epilogue_covers_warp(tile)
+
+    def test_no_built_config_has_an_unbuildable_tile(self):
+        """Across every family that renders from the shared tile list.
+
+        GEMM, BMM and grouped GEMM render from ``get_unique_compile_configs``
+        and Conv2D from ``get_unique_conv2d_compile_configs``, so one bad tile
+        used to produce four wrong kernels.
+        """
+        from oasr.jit.conv import get_unique_conv2d_compile_configs
+        from oasr.jit.gemm import TileShape, _epilogue_covers_warp, get_unique_compile_configs
+
+        for sm in (75, 80, 86, 89, 120):
+            spaces = {
+                "gemm": get_unique_compile_configs(sm),
+                "conv2d": get_unique_conv2d_compile_configs(sm),
+            }
+            for family, configs in spaces.items():
+                for name, cfg in configs.items():
+                    if not hasattr(cfg, "block_n"):
+                        continue  # SM90+ config: a different epilogue entirely
+                    tile = TileShape(
+                        block_m=cfg.block_m,
+                        block_n=cfg.block_n,
+                        block_k=cfg.block_k,
+                        warp_m=cfg.warp_m,
+                        warp_n=cfg.warp_n,
+                        warp_k=cfg.warp_k,
+                    )
+                    assert _epilogue_covers_warp(tile), f"sm{sm} {family}: {name}"
+
+    def test_the_refusal_is_recorded_with_a_reason(self):
+        """A dropped tile is not silent — it is the reason a tile that looks
+        tuneable never shows up in the autotuner's candidate list."""
+        from oasr.jit.gemm import get_all_autotune_configs, rejected_tiles
+
+        get_all_autotune_configs(120)
+        rejected = rejected_tiles()
+        assert "b128x16x64_w32x16x64" in rejected
+        reason = rejected["b128x16x64_w32x16x64"]
+        assert "block_n=16" in reason and "wrong results" in reason
+
+    def test_every_heuristic_rule_names_a_built_config(self):
+        """The rule table is a hand-carried constant; the config space is derived.
+
+        Dropping a tile from the space silently orphans any rule that named it,
+        and an orphaned rule is not an error at runtime — ``_plan`` catches the
+        ``AttributeError`` and falls back to ``GEMM_DEFAULT``, which at the one
+        affected shape is 3.5x slower than the right tile.  So the join between
+        the two is checked here rather than discovered in a benchmark.
+        """
+        from oasr.jit.gemm import _GEMM_HEURISTIC_RULES_SM120, get_unique_compile_configs
+
+        built = get_unique_compile_configs(120)
+        orphans = [
+            (op, N, K, m_max, choice.name)
+            for (op, N, K), rules in _GEMM_HEURISTIC_RULES_SM120.items()
+            for m_max, choice in rules
+            if not isinstance(choice, str) and choice.compile_name not in built
+        ]
+        assert not orphans, f"rules naming a config that is never compiled: {orphans}"

@@ -19,6 +19,8 @@ from oasr.jit.core import _get_target_sm
 from oasr.jit.gemm import (
     GEMM_DEFAULT,
     CutlassGemmConfig,
+    TileShape,
+    _epilogue_covers_warp,
     get_unique_compile_configs,
     reset_rule_misses,
     rule_miss_report,
@@ -130,12 +132,33 @@ class TestSelectDefaultConfig:
             assert cfg.block_m < 128  # a tall-thin tile, not the 128-row default
 
     @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
-    @pytest.mark.parametrize("M", [64, 950, 2048, 4096, 7600])
+    @pytest.mark.parametrize("M", [64, 950, 1026, 1748, 2048, 4096, 7600])
     def test_zipformer_pointwise_contraction_uses_measured_thin_tile(self, M):
+        """Zipformer's ConvNeXt pointwise contraction, at the M values it issues.
+
+        ``M = batch * embed_frames * 19``, so ``max_batch_size=1`` on a 1.1-2.2 s
+        utterance lands in 1026-2048 — the band that used to be assigned
+        ``b128x16x64_w32x16x64_s4``.  That tile is unbuildable (CUTLASS's
+        epilogue cannot address a 16-wide tile at 8 elements per access), and the
+        rule emptied the transcript of every such utterance while every other
+        gate stayed green: the config *was* compiled, so
+        :meth:`test_actionable_configs` passed, and it *was* timed, so the tuner
+        wrote the rule.  Hence the third assertion.
+        """
         cfg = select_default_config("gemm", M, 128, 384, torch.bfloat16, 120)
         assert isinstance(cfg, CutlassGemmConfig)
         assert cfg.compile_name != GEMM_DEFAULT.compile_name
         assert cfg.compile_name in get_unique_compile_configs(120)
+        assert _epilogue_covers_warp(
+            TileShape(
+                block_m=cfg.block_m,
+                block_n=cfg.block_n,
+                block_k=cfg.block_k,
+                warp_m=cfg.warp_m,
+                warp_n=cfg.warp_n,
+                warp_k=cfg.warp_k,
+            )
+        ), f"M={M} selected {cfg.compile_name}, whose epilogue cannot address its tile"
 
     @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
     def test_large_m_contract_avoids_default(self):

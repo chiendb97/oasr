@@ -229,6 +229,13 @@ class CutlassGemmConfigSm90:
 
 # Retained for backward compatibility (conv.py and external callers).
 # Internal config generation uses the per-SM functions below.
+#
+# ``block_n=16`` entries are declared but never built: CUTLASS's tensor-op
+# epilogue cannot address them at half precision, and
+# ``_epilogue_covers_warp`` drops them (see that function).  They are left in
+# the list rather than deleted so the candidate set stays a record of what was
+# considered, and so the filter that rejects them is exercised by the shipped
+# configuration instead of only by a synthetic test.
 TileShapeConfigs: List[TileShape] = [
     TileShape(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64),
     TileShape(block_m=128, block_n=16, block_k=64, warp_m=32, warp_n=16, warp_k=64),
@@ -273,6 +280,117 @@ def _smem_bytes(BM: int, BN: int, BK: int, kStages: int, dtype_bytes: int = 2) -
     return kStages * (BM + BN) * BK * dtype_bytes
 
 
+# CUTLASS's tensor-op epilogue writes the accumulator in units of 8 output rows,
+# one warp of 32 lanes at a time.  Both numbers are ``kTensorOpRows`` /
+# ``kWarpSize`` in
+# ``cutlass/epilogue/threadblock/default_thread_map_tensor_op.h``.
+_EPILOGUE_TENSOR_OP_ROWS = 8
+_WARP_SIZE = 32
+
+#: Tiles a config builder refused, ``{tile: reason}``.  A rejected tile is not a
+#: runtime gap — it is a static property of the lists above — but it is the
+#: reason a tile that looks tuneable never appears in the autotuner's candidate
+#: set, so it is recorded rather than dropped silently.  Read by
+#: :func:`rejected_tiles`.
+_REJECTED_TILES: Dict[str, str] = {}
+
+
+def rejected_tiles() -> Dict[str, str]:
+    """``{tile: reason}`` for every tile a config builder has refused so far.
+
+    Populated lazily as the per-SM builders run, so call a builder (or
+    :func:`get_all_autotune_configs`) first.
+    """
+    return dict(_REJECTED_TILES)
+
+
+def _epilogue_output_map(tile: TileShape, element_bits: int = 16) -> Tuple[int, int, int, int]:
+    """``(kAccessWidth, kAccessRows, kIterationsColumn, kIterationsRow)`` for *tile*.
+
+    Mirrors ``DefaultThreadMapTensorOp`` → ``OutputTileOptimalThreadMap`` →
+    ``detail::RowArrangement`` for the tensor-op epilogue that every CUTLASS 2.x
+    variant in this file instantiates.  ``element_bits`` is the epilogue's
+    ``ElementC``; the templates take ``kElementsPerAccess = 128 / element_bits``,
+    which is 8 for the fp16/bf16 this path serves (fp32 never reaches it).
+
+    ``kAccessRows × kAccessWidth`` is the grid one warp's 32 lanes are folded
+    into — lane *l* writes row ``l / kAccessWidth``, column ``(l %
+    kAccessWidth) * kElementsPerAccess`` of its own slot — and the two iteration
+    counts are how many such accesses each lane makes.
+    """
+    epa = 128 // element_bits
+    partitions_k = max(1, tile.block_k // tile.warp_k)
+    warps_m = tile.block_m // tile.warp_m
+    warps_n = tile.block_n // tile.warp_n
+    warp_count = warps_m * warps_n * partitions_k
+    shape_width = tile.block_n // epa
+    # Shape::kGroup is the M-warp count; Shape::kCluster is 1 for this epilogue,
+    # so the warps left over for rows are whatever the group split does not use.
+    warps_for_rows = 1 if warps_m > warp_count else warp_count // warps_m
+    if _EPILOGUE_TENSOR_OP_ROWS <= warps_for_rows:
+        # RowArrangement's 1-D specialisation: one row, the whole warp along N.
+        return _WARP_SIZE, 1, shape_width // _WARP_SIZE, 1
+    shape_row = _EPILOGUE_TENSOR_OP_ROWS // warps_for_rows
+    target_width = 256 // (epa * element_bits // 8)  # kTargetMemoryAccessWidth
+    if _WARP_SIZE // target_width > shape_row:
+        width, rows = _WARP_SIZE // shape_row, shape_row
+    else:
+        width = min(shape_width, _WARP_SIZE, target_width)
+        rows = min(_EPILOGUE_TENSOR_OP_ROWS, _WARP_SIZE // width)
+    return width, rows, shape_width // width, shape_row // rows
+
+
+def _epilogue_covers_warp(tile: TileShape, element_bits: int = 16) -> bool:
+    """Whether CUTLASS's epilogue can actually address *tile*'s output.
+
+    Two ways it cannot, and ``RowArrangement`` asserts neither:
+
+    * the ``kAccessRows × kAccessWidth`` lane grid is narrower than a warp, so
+      the surplus lanes address rows outside their own slot.  At
+      ``kElementsPerAccess = 8`` that is ``block_n < 32``: ``kAccessWidth``
+      saturates at ``block_n / 8`` while ``kAccessRows`` saturates at 8.
+    * an iteration count comes out zero, so a lane stores nothing (reachable
+      only on the 1-D arrangement, which needs ``block_n >= 256`` to have a
+      column iteration at all).
+
+    A tile that fails still compiles, still launches and still writes every
+    output row, and the values it writes are **wrong**: measured 100-170x the
+    reference at ``(M, N, K) = (1710, 128, 384)`` for ``b128x16x64_w32x16x64``,
+    in fp16 and bf16, in the GEMM, BMM, grouped-GEMM and Conv2D families alike.
+
+    That is why this is a config-space constraint rather than a note: an
+    unsatisfiable tile that *runs* cannot be caught by dispatch ("is the config
+    compiled?") or by timing ("which config is fastest?"), which is what let
+    ``block_n=16`` sit in the tuned rule table.  One ``block_n=16`` rule reached
+    production and returned an **empty transcript** for any 1.1-2.2 s utterance
+    decoded on its own (Zipformer's ConvNeXt pointwise contraction, N=128 K=384,
+    at ``max_batch_size=1``): the wrong values overflowed fp16 to ``inf`` and the
+    CTC head produced all-NaN log-probs.
+    """
+    width, rows, iters_col, iters_row = _epilogue_output_map(tile, element_bits)
+    return width * rows == _WARP_SIZE and iters_col >= 1 and iters_row >= 1
+
+
+def _tile_is_buildable(tile: TileShape, kStages: int, smem_limit: int) -> bool:
+    """Whether *tile* can be instantiated at *kStages*: SMEM fits, epilogue works."""
+    if _smem_bytes(tile.block_m, tile.block_n, tile.block_k, kStages) > smem_limit:
+        return False
+    if not _epilogue_covers_warp(tile):
+        width, rows, iters_col, iters_row = _epilogue_output_map(tile)
+        _REJECTED_TILES[
+            f"b{tile.block_m}x{tile.block_n}x{tile.block_k}_"
+            f"w{tile.warp_m}x{tile.warp_n}x{tile.warp_k}"
+        ] = (
+            f"CUTLASS's tensor-op epilogue cannot address block_n="
+            f"{tile.block_n} at kElementsPerAccess=8: lane grid "
+            f"{rows}x{width} = {rows * width} of {_WARP_SIZE} lanes, "
+            f"iterations {iters_row}x{iters_col}; the kernel runs and returns "
+            f"wrong results"
+        )
+        return False
+    return True
+
+
 # Maximum shared memory per threadblock per architecture (bytes).
 # CUTLASS 2.x opts in to the maximum via cudaFuncSetAttribute at runtime.
 _SM_MAX_SMEM_BYTES: Dict[int, int] = {
@@ -299,13 +417,16 @@ def _build_sm_lt90_configs(
 
     Iterates over the provided ``tiles`` (``TileShape`` instances from
     ``TileShapeConfigs``), expanding across ``stage_list`` and ``split_k_list``.
-    Three constraints are applied:
+    Four constraints are applied:
 
     1. **SMEM fit** — kStages×(block_m+block_n)×block_k×dtype_bytes ≤ smem_limit.
        Software-pipelined operand buffers must fit in shared memory.
-    2. **split_k applicability** — split_k>1 is only registered when
+    2. **Epilogue expressible** — :func:`_epilogue_covers_warp`.  A tile that
+       fails this compiles and runs and is *wrong*, so it must never enter the
+       space; rejections are recorded in :func:`rejected_tiles`.
+    3. **split_k applicability** — split_k>1 is only registered when
        block_m≤128 and block_n≤128 (shapes likely to be K-bound).
-    3. **deep split_k** — split_k>4 only for block_m≤64 tiles (deep K-splits
+    4. **deep split_k** — split_k>4 only for block_m≤64 tiles (deep K-splits
        exist to fill the GPU on small-M shapes; large-M tiles never need them).
 
     Divisibility and warp-count validity are guaranteed by ``TileShapeConfigs``.
@@ -317,14 +438,14 @@ def _build_sm_lt90_configs(
     seen: Dict[str, CutlassGemmConfig] = {}
     for tile in tiles:
         for kStages in stage_list:
-            # 1. SMEM fit
-            if _smem_bytes(tile.block_m, tile.block_n, tile.block_k, kStages) > smem_limit:
+            # 1. SMEM fit + 2. epilogue expressible
+            if not _tile_is_buildable(tile, kStages, smem_limit):
                 continue
             for split_k in split_k_list:
-                # 2. split_k applicability
+                # 3. split_k applicability
                 if split_k > 1 and (tile.block_m > 128 or tile.block_n > 128):
                     continue
-                # 3. deep split_k only for small-M tiles
+                # 4. deep split_k only for small-M tiles
                 if split_k > 4 and tile.block_m > 64:
                     continue
                 cfg = CutlassGemmConfig(
@@ -518,7 +639,7 @@ def _build_streamk_configs(
     seen: Dict[str, CutlassGemmConfig] = {}
     for tile in tiles:
         for kStages in stage_list:
-            if _smem_bytes(tile.block_m, tile.block_n, tile.block_k, kStages) > smem_limit:
+            if not _tile_is_buildable(tile, kStages, smem_limit):
                 continue
             cfg = CutlassGemmConfig(
                 block_m=tile.block_m,
@@ -560,7 +681,7 @@ def _build_splitk_parallel_configs(
     seen: Dict[str, CutlassGemmConfig] = {}
     for tile in tiles:
         for kStages in stage_list:
-            if _smem_bytes(tile.block_m, tile.block_n, tile.block_k, kStages) > smem_limit:
+            if not _tile_is_buildable(tile, kStages, smem_limit):
                 continue
             for split_k in _SPLIT_K_LIST:
                 if split_k == 1:
@@ -947,36 +1068,22 @@ GEMM_DEFAULT: Union[CutlassGemmConfig, CutlassGemmConfigSm90] = default_config_f
 # entries with an optional catch-all. Misses use ``GEMM_DEFAULT`` and are counted
 # by ``rule_miss_report()`` because rules do not transfer across model widths.
 _GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
-    # Thin-N contraction; a smaller tile avoids wasted columns.
+    # Thin-N contraction; a smaller tile avoids wasted columns.  Zipformer's
+    # ConvNeXt pointwise contraction (384 -> 128), whose M is
+    # ``batch * embed_frames * 19``.
+    #
+    # The M <= 8192 bucket used to be split, with M in (1024, 2048] assigned
+    # ``b128x16x64_w32x16x64_s4``.  That tile is unbuildable (see
+    # ``_epilogue_covers_warp``) and it was also *slower* than the tile on both
+    # sides of it -- graph-captured at N=128 K=384, ``b32x64x64_s4`` runs
+    # 2.87/2.97/3.22/3.52 us at M=1026/1254/1710/2014 against the thin tile's
+    # 3.36/3.34/3.78/4.13, so the bucket is merged rather than re-tuned.  A rule
+    # generated from timings alone could see neither problem, which is why
+    # tests/kernels/test_gemm_heuristic.py now asks this shape's selection
+    # whether the tile it picked is *addressable* and not only whether it is
+    # compiled.  The timings are a four-point measurement recorded in
+    # .artifacts/gemm_thin_n_tile_epilogue.md, not a test.
     ("gemm", 128, 384): [
-        (
-            1024,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            2048,
-            CutlassGemmConfig(
-                block_m=128,
-                block_n=16,
-                block_k=64,
-                warp_m=32,
-                warp_n=16,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
         (
             8192,
             CutlassGemmConfig(

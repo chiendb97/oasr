@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from . import env
 from .core import JitSpec, _get_target_sm, gen_jit_spec
-from .gemm import _SM_MAX_SMEM_BYTES, TileShape, TileShapeConfigs, _smem_bytes
+from .gemm import _SM_MAX_SMEM_BYTES, TileShape, TileShapeConfigs, _tile_is_buildable
 
 # =============================================================================
 # Conv2D config dataclasses  (mirror CutlassGemmConfig / CutlassGemmConfigSm90)
@@ -111,7 +111,7 @@ class CutlassConv2dConfigSm90:
 # SM<90 config generation — SMEM-analysed per-SM tile × stage
 #
 # Uses TileShapeConfigs directly from gemm.py (same 15 tiles as GEMM) and the
-# same _smem_bytes / _SM_MAX_SMEM_BYTES limits.
+# same _tile_is_buildable / _SM_MAX_SMEM_BYTES limits.
 # =============================================================================
 
 
@@ -123,12 +123,16 @@ def _build_sm_lt90_conv2d_configs(
 ) -> Dict[str, CutlassConv2dConfig]:
     """Build the full autotune config dict for a SM<90 Conv2D architecture.
 
-    Identical logic to GEMM's ``_build_sm_lt90_configs`` but without split_k.
+    Identical logic to GEMM's ``_build_sm_lt90_configs`` but without split_k —
+    including the epilogue constraint, because implicit GEMM instantiates the
+    same ``DefaultThreadMapTensorOp`` epilogue from the same tile list.  A
+    ``block_n=16`` conv2d variant is wrong by the same 1.2x relative error its
+    GEMM twin is; see :func:`oasr.jit.gemm._epilogue_covers_warp`.
     """
     seen: Dict[str, CutlassConv2dConfig] = {}
     for tile in tiles:
         for kStages in stage_list:
-            if _smem_bytes(tile.block_m, tile.block_n, tile.block_k, kStages) > smem_limit:
+            if not _tile_is_buildable(tile, kStages, smem_limit):
                 continue
             cfg = CutlassConv2dConfig(
                 block_m=tile.block_m,

@@ -145,10 +145,73 @@ struct SmallTile {
 
 /// For an N that a square tile would mostly predicate away.  Deep kK because
 /// the callers that land here contract over time (K = T, N = 12).
+///
+/// 16 columns is the narrowest tile CUTLASS's tensor-op epilogue can address at
+/// all, and it cannot address it at every access width -- see
+/// ``epilogueCoversWarp`` below, which is why this tile alone needs its store
+/// width capped.
 struct ThinNTile {
     using ThreadblockShape = cutlass::gemm::GemmShape<64, 16, 64>;
     using WarpShape = cutlass::gemm::GemmShape<32, 16, 64>;
 };
+
+/// Whether CUTLASS's tensor-op epilogue can address ``Tile`` at ``kEPA``
+/// elements per access, for a ``kElementBits``-wide output element.
+///
+/// Mirrors ``DefaultThreadMapTensorOp`` -> ``OutputTileOptimalThreadMap`` ->
+/// ``detail::RowArrangement`` (``cutlass/epilogue/threadblock/``), which folds a
+/// warp's 32 lanes into a ``kAccessRows x kAccessWidth`` grid derived from the
+/// tile and asserts nothing about the product covering a warp.  When it does
+/// not, the surplus lanes address rows outside their own slot and the kernel
+/// runs at full speed and returns wrong numbers: measured here as
+/// ``ThinNTile`` with an 8-aligned N (max abs error 6-16 against a reference
+/// max of 5-12), and in ``oasr/jit/gemm.py`` as the ``block_n=16`` tile that
+/// shipped an empty transcript.  Python-side twin:
+/// ``oasr.jit.gemm._epilogue_covers_warp``.
+template <typename Tile, int kEPA, int kElementBits>
+constexpr bool epilogueCoversWarp() {
+    constexpr int kWarpSize = 32;
+    constexpr int kTensorOpRows = 8;  // Detail::kTensorOpRows
+    constexpr int kBN = Tile::ThreadblockShape::kN;
+    constexpr int kWarpsM = Tile::ThreadblockShape::kM / Tile::WarpShape::kM;
+    constexpr int kWarpsN = kBN / Tile::WarpShape::kN;
+    constexpr int kPartitionsK = Tile::ThreadblockShape::kK / Tile::WarpShape::kK;
+    constexpr int kWarpCount = kWarpsM * kWarpsN * (kPartitionsK > 0 ? kPartitionsK : 1);
+    // Shape::kGroup is the M-warp count and Shape::kCluster is 1 here, so the
+    // warps left for rows are what the group split does not take.
+    constexpr int kWarpsForRows = (kWarpsM > kWarpCount) ? 1 : kWarpCount / kWarpsM;
+    constexpr int kShapeWidth = kBN / kEPA;
+    if constexpr (kTensorOpRows <= kWarpsForRows) {
+        // RowArrangement's 1-D specialisation: kAccessWidth is the warp.
+        return kShapeWidth / kWarpSize >= 1;
+    } else {
+        constexpr int kShapeRow = kTensorOpRows / kWarpsForRows;
+        constexpr int kTargetWidth = 256 / (kEPA * kElementBits / 8);
+        constexpr int kWidth = (kWarpSize / kTargetWidth > kShapeRow)
+                                   ? kWarpSize / kShapeRow
+                                   : std::min(kShapeWidth, std::min(kWarpSize, kTargetWidth));
+        constexpr int kRows = (kWarpSize / kTargetWidth > kShapeRow)
+                                  ? kShapeRow
+                                  : std::min(kTensorOpRows, kWarpSize / kWidth);
+        return kWidth * kRows == kWarpSize && kShapeWidth / kWidth >= 1 && kShapeRow / kRows >= 1;
+    }
+}
+
+/// Largest access width <= ``kAlignN`` that the epilogue can address for ``Tile``.
+///
+/// The epilogue's ``kElementsPerAccess`` and the B iterator's alignment are
+/// separate template arguments, so narrowing the store does not cost the load:
+/// a 16-column tile keeps 8-element ``cp.async`` on B and stores 4 at a time.
+template <typename Tile, int kAlignN, int kElementBits>
+constexpr int epilogueAlignment() {
+    if constexpr (epilogueCoversWarp<Tile, kAlignN, kElementBits>()) {
+        return kAlignN;
+    } else if constexpr (kAlignN > 1) {
+        return epilogueAlignment<Tile, kAlignN / 2, kElementBits>();
+    } else {
+        return 1;
+    }
+}
 
 /// N at or below this uses ``ThinNTile``.  It is the tile's own kN, so the
 /// threshold and the tile cannot drift apart.
@@ -203,13 +266,18 @@ struct GeneralBmmKernel {
     static constexpr bool kBIsColumnMajor = std::is_same_v<LayoutB, cutlass::layout::ColumnMajor>;
     /// B's alignment is along whichever axis is contiguous in memory.
     static constexpr int kAlignB = kBIsColumnMajor ? kAlignK : kAlignN;
+    /// ...and the epilogue's is capped by what the *tile* can address, which is
+    /// not the same question.  Only ``ThinNTile`` at ``kAlignN == 8`` is capped;
+    /// every other (tile, width) pair in the grid already covers its warp.
+    static constexpr int kAlignEpilogue =
+        epilogueAlignment<Tile, kAlignN, 8 * static_cast<int>(sizeof(Element))>();
 
     using Gemm = cutlass::gemm::device::GemmBatched<
         Element, cutlass::layout::RowMajor, Element, LayoutB, Element, cutlass::layout::RowMajor,
         float, cutlass::arch::OpClassTensorOp, typename GeneralBmmArch<kSmVersion>::Type,
         typename Tile::ThreadblockShape, typename Tile::WarpShape,
         typename GeneralBmmArch<kSmVersion>::InstructionShape,
-        cutlass::epilogue::thread::LinearCombination<Element, kAlignN, float, float>,
+        cutlass::epilogue::thread::LinearCombination<Element, kAlignEpilogue, float, float>,
         cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, kGeneralStages, kAlignK,
         kAlignB>;
 

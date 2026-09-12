@@ -8,12 +8,15 @@ import torch
 import torch.nn.functional as F
 
 import oasr
+from oasr.functionals.conv import _get_conv2d_module
 from oasr.jit.conv import (
     CONV2D_DEFAULT,
+    conv2d_func_name,
     get_unique_conv2d_compile_configs,
     select_default_conv1d_activation_config,
     select_default_conv1d_config,
 )
+from oasr.jit.core import _get_target_sm
 
 # Every test in this module allocates directly on ``device="cuda"`` and calls a
 # JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
@@ -568,3 +571,46 @@ class TestConv2dLargeTensor:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestEveryCompiledConv2dVariantIsCorrect:
+    """The conv2d half of the sweep in ``test_gemm.py``.
+
+    Implicit GEMM instantiates the same ``DefaultThreadMapTensorOp`` epilogue
+    from the same shared tile list (``oasr.jit.gemm.TileShapeConfigs``), so a
+    tile CUTLASS cannot address produces a wrong conv2d kernel as readily as a
+    wrong GEMM one — ``b128x16x64_w32x16x64`` measured 1.2x relative error here.
+    Conv2D never had a rule naming it, which is exactly why the sweep is over
+    the compiled set rather than over the rules.
+    """
+
+    @pytest.mark.parametrize(
+        "name,cfg",
+        sorted(get_unique_conv2d_compile_configs(_get_target_sm()).items()),
+        ids=sorted(get_unique_conv2d_compile_configs(_get_target_sm())),
+    )
+    def test_matches_an_fp32_reference(self, name, cfg):
+        # IC >= _CUDNN_IC_THRESHOLD and a 3x3 filter, so neither the cuDNN
+        # branch nor the 1x1 GEMM specialisation takes the call away from the
+        # CUTLASS variant under test.
+        N, H, W, IC, OC, R, S = 1, 64, 32, 64, 72, 3, 3
+        torch.manual_seed(0)
+        x = torch.randn(N, H, W, IC, device="cuda", dtype=torch.float16) * 0.5
+        w = torch.randn(OC, R, S, IC, device="cuda", dtype=torch.float16) * 0.05
+        b = torch.randn(OC, device="cuda", dtype=torch.float16) * 0.05
+        # NaN rather than empty: a partially written tile otherwise returns
+        # whatever the allocator last held, which can pass a loose tolerance.
+        out = torch.full((N, H, W, OC), float("nan"), device="cuda", dtype=torch.float16)
+
+        fn = getattr(_get_conv2d_module(), conv2d_func_name(cfg))
+        fn(out, x, w, b, 1, 1, 1, 1, 1, 1)
+
+        ref = F.conv2d(
+            x.permute(0, 3, 1, 2).float(),
+            w.permute(0, 3, 1, 2).float(),
+            b.float(),
+            padding=1,
+        ).permute(0, 2, 3, 1)
+        assert torch.isfinite(out).all(), f"{name}: left NaN behind"
+        rel = (out.float() - ref).abs().max().item() / ref.abs().max().item()
+        assert rel < 2e-2, f"{name}: relative error {rel:.4g}"
