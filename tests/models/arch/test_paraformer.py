@@ -94,6 +94,71 @@ class TestLFR:
         assert torch.equal(got_lens.cpu(), expected_lens)
         assert torch.equal(got.cpu(), expected)
 
+    @pytest.mark.cuda
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_cuda_gather_at_the_served_shape(self):
+        """80 mel / LFR 7/6 / 30 s — the shape Paraformer actually runs.
+
+        The 8-dim fixture above is below one 16-byte transfer per feature row,
+        so it exercises neither the vectorized path's inner loop nor a feature
+        row that spans several of them.
+        """
+        from oasr.features.lfr import apply_lfr_batch
+
+        torch.manual_seed(12)
+        T = 3000
+        lens = torch.tensor([T, 2999, 7, 1801], dtype=torch.int32)
+        feats = torch.randn(4, T, 80)
+        for b, length in enumerate(lens.tolist()):
+            feats[b, length:] = 0
+        expected, expected_lens = apply_lfr_batch(feats, lens, 7, 6, max_length=T)
+        got, got_lens = apply_lfr_batch(feats.cuda(), lens.cuda(), 7, 6, max_length=T)
+        assert got.shape == (4, 500, 560)
+        assert torch.equal(got_lens.cpu(), expected_lens)
+        assert torch.equal(got.cpu(), expected)
+
+    # A feature row is copied 16 bytes at a time when the row divides into whole
+    # vectors *and* both tensors are 16-byte aligned; otherwise element by
+    # element.  Neither condition is a property of the config, so both branches
+    # need a case -- and every in-tree feature dim (80, and the 8 of the fixture
+    # above) satisfies both, which is exactly why they are easy to leave untested.
+    @pytest.mark.cuda
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.parametrize("feature_dim", [5, 8, 17, 80])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_cuda_gather_scalar_and_vector_paths_agree(self, feature_dim, dtype):
+        from oasr.features.lfr import apply_lfr_batch
+
+        torch.manual_seed(feature_dim)
+        lens = torch.tensor([53, 1, 20, 53], dtype=torch.int32)
+        feats = torch.randn(4, 53, feature_dim, dtype=dtype)
+        for b, length in enumerate(lens.tolist()):
+            feats[b, length:] = 0
+        expected, _ = apply_lfr_batch(feats, lens, 7, 6, max_length=53)
+        got, _ = apply_lfr_batch(feats.cuda(), lens.cuda(), 7, 6, max_length=53)
+        assert torch.equal(got.cpu(), expected)
+
+    @pytest.mark.cuda
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_cuda_gather_handles_an_unaligned_input_view(self):
+        """A contiguous view whose storage offset is not a 16-byte multiple.
+
+        ``.contiguous()`` does not copy it — it is already contiguous — so the
+        vectorized path would reinterpret an unaligned pointer as ``int4``.
+        """
+        from oasr.features.lfr import apply_lfr_batch
+
+        torch.manual_seed(31)
+        B, T, F = 2, 40, 80
+        flat = torch.randn(1 + B * T * F, device="cuda")
+        feats = flat[1:].view(B, T, F)  # storage offset 1 float = 4 bytes
+        assert feats.is_contiguous() and feats.data_ptr() % 16 != 0
+        lens = torch.full((B,), T, dtype=torch.int32, device="cuda")
+
+        got, _ = apply_lfr_batch(feats, lens, 7, 6, max_length=T)
+        expected, _ = apply_lfr_batch(feats.cpu(), lens.cpu(), 7, 6, max_length=T)
+        assert torch.equal(got.cpu(), expected)
+
     def test_feature_config_output_dim_folds_lfr(self):
         from oasr.features import FeatureConfig
 

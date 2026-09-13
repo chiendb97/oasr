@@ -30,6 +30,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 #include <oasr/common/reduction.h>
 
 namespace oasr {
@@ -636,32 +638,69 @@ inline cudaError_t WhisperLogMel(const float* input, const float* mel_mat, float
 // 6. Varlen low-frame-rate gather.
 // =============================================================================
 
-template <typename T>
-__global__ void LfrGatherKernel(const T* __restrict__ input, const int32_t* __restrict__ lengths,
-                                T* __restrict__ output, int64_t total_elems, int input_frames,
-                                int output_frames, int feature_dim, int lfr_m, int lfr_n) {
-    const int stacked_dim = feature_dim * lfr_m;
+//: All-zero bytes is zero for every dtype this kernel moves, but the transfer
+//: type is not always the element type, so the constant is a trait.
+template <typename V>
+struct LfrZero {
+    __device__ __forceinline__ static V value() { return static_cast<V>(0.0f); }
+};
+template <>
+struct LfrZero<int4> {
+    __device__ __forceinline__ static int4 value() { return make_int4(0, 0, 0, 0); }
+};
+
+// LFR stacking is a gather and nothing else, so every instruction that is not a
+// load or a store is waste.  The grid carries the batch and the output frame,
+// and a warp owns one stack slot, which leaves the inner loop with a single
+// running index: no integer division anywhere on the element path.  Expressing
+// the same mapping as one flat index over `(b, t, slot, f)` costs five integer
+// divisions per output element -- two of them 64-bit -- and turns a
+// bandwidth-bound copy into an arithmetic-bound one.
+//
+// `V` is the transfer type, not the element type: a 16-byte vector whenever the
+// feature dimension and the pointers allow it, otherwise the element itself.
+template <typename V>
+__global__ void LfrGatherKernel(const V* __restrict__ input,
+                                const int32_t* __restrict__ lengths, V* __restrict__ output,
+                                int input_frames, int output_frames, int feature_vecs, int lfr_m,
+                                int lfr_n) {
+    const int b = blockIdx.y;
     const int left = (lfr_m - 1) / 2;
-    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         idx < total_elems; idx += stride) {
-        const int d = static_cast<int>(idx % stacked_dim);
-        const int64_t row = idx / stacked_dim;
-        const int t = static_cast<int>(row % output_frames);
-        const int b = static_cast<int>(row / output_frames);
-        const int length = lengths[b];
-        const int valid_output = length > 0 ? (length + lfr_n - 1) / lfr_n : 0;
+    const int length = lengths[b];
+    // One division per block, on a value every thread in it shares.
+    const int valid_output = length > 0 ? (length + lfr_n - 1) / lfr_n : 0;
+    const int upper = (length < input_frames ? length : input_frames) - 1;
+
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int wid = tid >> 5;
+    const int n_warps = bs >> 5;
+    const int row_vecs = feature_vecs * lfr_m;
+
+    for (int t = blockIdx.x; t < output_frames; t += gridDim.x) {
+        V* out_row = output + (static_cast<int64_t>(b) * output_frames + t) * row_vecs;
         if (t >= valid_output) {
-            output[idx] = static_cast<T>(0.0f);
+            // Past this row's own LFR length.  The gather would otherwise
+            // replicate the last valid frame into the padding.
+            for (int i = tid; i < row_vecs; i += bs) {
+                out_row[i] = LfrZero<V>::value();
+            }
             continue;
         }
-        const int stack_slot = d / feature_dim;
-        const int f = d - stack_slot * feature_dim;
-        int source_t = t * lfr_n + stack_slot - left;
-        source_t = max(0, min(source_t, min(length, input_frames) - 1));
-        const int64_t source =
-            (static_cast<int64_t>(b) * input_frames + source_t) * feature_dim + f;
-        output[idx] = input[source];
+        for (int slot = wid; slot < lfr_m; slot += n_warps) {
+            // FunASR's `apply_lfr`: `left` copies of the first frame prepended,
+            // and the trailing partial window completed with the last valid
+            // frame -- both are this clamp.
+            int source_t = t * lfr_n + slot - left;
+            source_t = source_t < 0 ? 0 : (source_t > upper ? upper : source_t);
+            const V* src =
+                input + (static_cast<int64_t>(b) * input_frames + source_t) * feature_vecs;
+            V* dst = out_row + slot * feature_vecs;
+            for (int i = lane; i < feature_vecs; i += WARP_SIZE) {
+                dst[i] = src[i];
+            }
+        }
     }
 }
 
@@ -669,17 +708,29 @@ template <typename T>
 inline cudaError_t LfrGather(const T* input, const int32_t* lengths, T* output, int batch,
                              int input_frames, int output_frames, int feature_dim, int lfr_m,
                              int lfr_n, cudaStream_t stream) {
-    const int64_t total = static_cast<int64_t>(batch) * output_frames * feature_dim * lfr_m;
-    if (total == 0) {
+    if (batch == 0 || output_frames == 0 || feature_dim == 0) {
         return cudaSuccess;
     }
     const int threads = 256;
-    int64_t blocks = (total + threads - 1) / threads;
-    if (blocks > 65535) {
-        blocks = 65535;
+    // gridDim.x is capped; the kernel strides over the remaining frames.
+    const int grid_x = output_frames < 65535 ? output_frames : 65535;
+    const dim3 grid(grid_x, batch);
+
+    // Every offset the kernel forms is a whole number of feature rows, so a
+    // 16-byte transfer is safe as soon as one feature row is a whole number of
+    // them and the two base pointers are aligned.  A batch-sliced view is the
+    // case that is not, hence the runtime check rather than a static one.
+    constexpr int kVecElems = static_cast<int>(16 / sizeof(T));
+    const bool aligned = (reinterpret_cast<uintptr_t>(input) % 16 == 0) &&
+                         (reinterpret_cast<uintptr_t>(output) % 16 == 0);
+    if (kVecElems > 0 && feature_dim % kVecElems == 0 && aligned) {
+        LfrGatherKernel<int4><<<grid, threads, 0, stream>>>(
+            reinterpret_cast<const int4*>(input), lengths, reinterpret_cast<int4*>(output),
+            input_frames, output_frames, feature_dim / kVecElems, lfr_m, lfr_n);
+    } else {
+        LfrGatherKernel<T><<<grid, threads, 0, stream>>>(
+            input, lengths, output, input_frames, output_frames, feature_dim, lfr_m, lfr_n);
     }
-    LfrGatherKernel<<<static_cast<int>(blocks), threads, 0, stream>>>(
-        input, lengths, output, total, input_frames, output_frames, feature_dim, lfr_m, lfr_n);
     return cudaGetLastError();
 }
 

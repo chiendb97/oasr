@@ -34,6 +34,7 @@ SUBROUTINES = [
     "mel_log",
     "dct_lifter",
     "whisper_logmel",
+    "lfr_gather",
     "fbank_pipeline",
     "mfcc_pipeline",
     "whisper_pipeline",
@@ -70,6 +71,12 @@ DEFAULT_CONFIGS: Dict[str, list] = {
         {"batch": 1, "num_frames": 3000, "n_freq": 201, "num_mel": 128},
         {"batch": 8, "num_frames": 3000, "n_freq": 201, "num_mel": 80},
         {"batch": 32, "num_frames": 3000, "n_freq": 201, "num_mel": 128},
+    ],
+    # Paraformer's frontend: 80 mel, LFR 7/6 -> 560-dim at a 60 ms hop.
+    "lfr_gather": [
+        {"batch": 1, "num_frames": 1000, "feature_dim": 80, "lfr_m": 7, "lfr_n": 6},
+        {"batch": 8, "num_frames": 1000, "feature_dim": 80, "lfr_m": 7, "lfr_n": 6},
+        {"batch": 32, "num_frames": 3000, "feature_dim": 80, "lfr_m": 7, "lfr_n": 6},
     ],
     "whisper_pipeline": [
         {"batch": 1, "audio_seconds": 30.0},
@@ -211,6 +218,44 @@ def setup_mel_log(batch, num_frames, n_freq, num_mel, dtype=torch.float32):
 
     def torch_fn():
         return torch.matmul(power, mel_mat.t()).clamp_min(eps).log()
+
+    return oasr_fn, torch_fn
+
+
+def setup_lfr_gather(batch, num_frames, feature_dim, lfr_m, lfr_n, dtype=torch.float32):
+    """The kernel against the ``gather`` + mask the torch path still runs.
+
+    Rows are deliberately ragged: the gather clamps each row's source index to
+    its own valid length, and a uniform batch would hide the per-row work.
+    """
+    device = "cuda"
+    feats = torch.randn(batch, num_frames, feature_dim, device=device, dtype=dtype)
+    lengths = torch.randint(
+        num_frames // 2, num_frames + 1, (batch,), device=device, dtype=torch.int32
+    )
+    lengths[0] = num_frames
+    lengths_long = lengths.to(torch.long)
+    t_out = (num_frames + lfr_n - 1) // lfr_n
+    out_lengths = (lengths_long + lfr_n - 1) // lfr_n
+    left = (lfr_m - 1) // 2
+
+    def oasr_fn():
+        return oasr.lfr_gather(feats, lengths, lfr_m, lfr_n, t_out)
+
+    def torch_fn():
+        base = (
+            torch.arange(t_out, device=device).unsqueeze(1) * lfr_n
+            + torch.arange(lfr_m, device=device).unsqueeze(0)
+            - left
+        )
+        idx = base.reshape(1, -1).expand(batch, -1)
+        idx = idx.clamp(min=0).minimum((lengths_long - 1).clamp(min=0).unsqueeze(1))
+        gathered = torch.gather(
+            feats, 1, idx.unsqueeze(-1).expand(batch, t_out * lfr_m, feature_dim)
+        )
+        out = gathered.reshape(batch, t_out, lfr_m * feature_dim)
+        valid = torch.arange(t_out, device=device).unsqueeze(0) < out_lengths.unsqueeze(1)
+        return out.mul_(valid.unsqueeze(-1).to(out.dtype))
 
     return oasr_fn, torch_fn
 
@@ -606,6 +651,7 @@ KERNEL_SETUP = {
     "mel_log": setup_mel_log,
     "dct_lifter": setup_dct_lifter,
     "whisper_logmel": setup_whisper_logmel,
+    "lfr_gather": setup_lfr_gather,
     # Two arms, like the kernel rows: the Whisper frontend's torch path *is*
     # the reference implementation, reached through the same entry point with
     # OASR_FEATURE_BACKEND=torch, so there is no third library to compare.
@@ -635,6 +681,9 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--num-mel", type=int, default=None, help="Mel bins")
     parser.add_argument("--num-ceps", type=int, default=None, help="Cepstral coefficients")
+    parser.add_argument("--feature-dim", type=int, default=None, help="Input feature dim (LFR)")
+    parser.add_argument("--lfr-m", type=int, default=None, help="Frames stacked per LFR frame")
+    parser.add_argument("--lfr-n", type=int, default=None, help="LFR hop in input frames")
     parser.add_argument(
         "--audio-seconds", type=float, default=None, help="Audio duration per utterance (pipelines)"
     )
@@ -646,6 +695,7 @@ _CONFIG_KEYS = {
     "mel_log": ("batch", "num_frames", "n_freq", "num_mel"),
     "dct_lifter": ("batch", "num_frames", "num_mel", "num_ceps"),
     "whisper_logmel": ("batch", "num_frames", "n_freq", "num_mel"),
+    "lfr_gather": ("batch", "num_frames", "feature_dim", "lfr_m", "lfr_n"),
     "whisper_pipeline": ("batch", "audio_seconds"),
     "fbank_pipeline": ("batch", "audio_seconds"),
     "mfcc_pipeline": ("batch", "audio_seconds"),
@@ -696,6 +746,12 @@ def describe(subroutine: str, cfg: dict, dtype: torch.dtype) -> Work:
         # Complex spectrum in, log-mel out, and the normalization pass reads
         # and rewrites that output once more.
         nbytes = b * n * (2 * n_freq + 3 * num_mel) * elem + n_freq * num_mel * elem
+    elif subroutine == "lfr_gather":
+        n, fd, m, lfr_n = cfg["num_frames"], cfg["feature_dim"], cfg["lfr_m"], cfg["lfr_n"]
+        t_out = (n + lfr_n - 1) // lfr_n
+        shape = f"[B={b}, T={n}, F={fd}, lfr={m}/{lfr_n}]"
+        # A gather: every output element is one element read and one written.
+        nbytes = 2 * b * t_out * fd * m * elem
     elif subroutine == "whisper_pipeline":
         seconds = cfg["audio_seconds"]
         shape = f"[B={b}, {seconds}s]"
