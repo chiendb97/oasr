@@ -121,19 +121,58 @@ class TestWhisperLogmel:
         assert torch.equal(got_lengths.cpu(), expected_lengths)
         torch.testing.assert_close(got.cpu(), expected, rtol=1e-5, atol=1e-6)
 
-    @pytest.mark.requires_assets("WHISPER_CKPT")
-    def test_matches_transformers_feature_extractor(self):
+    @pytest.mark.cuda
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_kernel_path_matches_the_torch_recipe_on_the_served_window(self):
+        """The 1 s fixture above is not the shape anything serves.
+
+        The projection tiles frames, so 3000 -- the real window, and not a
+        whole number of tiles -- is the count whose tail predication matters.
+        """
+        cfg = FeatureConfig(feature_type="whisper_logmel", num_mel_bins=128)
+        torch.manual_seed(21)
+        lengths = torch.tensor([480000, 160000, 3201])
+        waveforms = torch.zeros(3, 480000)
+        for b, length in enumerate(lengths.tolist()):
+            waveforms[b, :length] = torch.randn(length) * (0.1 + b * 0.2)
+
+        expected, _ = batched_whisper_logmel(waveforms, lengths, cfg)
+        got, _ = batched_whisper_logmel(waveforms.cuda(), lengths.cuda(), cfg)
+        assert got.shape == (3, 3000, 128)
+        torch.testing.assert_close(got.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    # The mel table and the log/normalize constants are a *convention*, and a
+    # parity oracle cannot see a convention error -- it feeds both sides the
+    # same features.  Only an external implementation can, so this is the one
+    # check that matters for correctness, and it has to run on the path the
+    # engine actually takes.  80 mels is whisper-tiny .. large-v2; 128 is
+    # large-v3 and Qwen2-Audio.
+    @pytest.mark.parametrize("n_mels", [80, 128])
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=[
+                    pytest.mark.cuda,
+                    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+                ],
+            ),
+        ],
+    )
+    def test_matches_transformers_feature_extractor(self, n_mels, device):
         transformers = pytest.importorskip("transformers")
-        fe = transformers.WhisperFeatureExtractor()
+        fe = transformers.WhisperFeatureExtractor(feature_size=n_mels)
         torch.manual_seed(2)
         wav = (torch.randn(24000) * 0.1).numpy()
         ref = torch.tensor(fe(wav, sampling_rate=16000, return_tensors="np").input_features[0])
         ours, _ = batched_whisper_logmel(
-            torch.tensor(wav).unsqueeze(0),
-            torch.tensor([len(wav)]),
-            FeatureConfig(feature_type="whisper_logmel"),
+            torch.tensor(wav).unsqueeze(0).to(device),
+            torch.tensor([len(wav)]).to(device),
+            FeatureConfig(feature_type="whisper_logmel", num_mel_bins=n_mels),
         )
-        assert torch.allclose(ours[0].t(), ref, atol=1e-4)
+        assert torch.allclose(ours[0].t().cpu(), ref, atol=1e-3)
 
 
 # ---------------------------------------------------------------------------

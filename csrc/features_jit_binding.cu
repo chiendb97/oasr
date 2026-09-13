@@ -15,8 +15,9 @@ void mel_log(TensorView output, TensorView power, TensorView mel_mat, double log
              double log_offset, Optional frame_lengths_opt);
 void dct_lifter(TensorView output, TensorView log_mel, TensorView dct_mat, Optional lifter_opt,
                 Optional energy_opt, bool replace_c0_with_energy);
-void whisper_logmel(TensorView output, TensorView power, TensorView mel_mat, double log_floor,
-                    double max_floor, double offset, double scale);
+void whisper_logmel(TensorView output, TensorView row_max, TensorView spectrum,
+                    TensorView mel_mat, double log_floor, double max_floor, double offset,
+                    double scale);
 void lfr_gather(TensorView output, TensorView input, TensorView lengths, int64_t lfr_m,
                 int64_t lfr_n);
 

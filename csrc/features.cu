@@ -270,46 +270,68 @@ void dct_lifter(TensorView output, TensorView log_mel, TensorView dct_mat, Optio
 }
 
 // ---------------------------------------------------------------------------
-// whisper_logmel(output, power, mel_mat, log_floor, max_floor, offset, scale)
-//   power   : (B, num_frames, n_freq)  float32
-//   mel_mat : (num_mel, n_freq)        float32
-//   output  : (B, num_frames, num_mel) float32
+// whisper_logmel(output, row_max, spectrum, mel_mat, log_floor, max_floor, offset, scale)
+//   spectrum : (B, num_frames, n_freq)     float32  -- power spectrum, or
+//              (B, num_frames, n_freq, 2)  float32  -- interleaved re/im, the
+//              transform itself, whose |z|^2 the projection then folds in
+//   mel_mat  : (n_freq, num_mel)           float32  -- the projection matrix,
+//              frequency-major so one thread per mel bin reads it coalesced
+//   output   : (B, num_frames, num_mel)    float32
+//   row_max  : (B,)                        float32  -- scratch for the
+//              per-utterance maximum, written and consumed by this call
 // ---------------------------------------------------------------------------
-void whisper_logmel(TensorView output, TensorView power, TensorView mel_mat, double log_floor,
-                    double max_floor, double offset, double scale) {
-    CHECK_INPUT(power);
+void whisper_logmel(TensorView output, TensorView row_max, TensorView spectrum, TensorView mel_mat,
+                    double log_floor, double max_floor, double offset, double scale) {
+    CHECK_INPUT(spectrum);
     CHECK_INPUT(mel_mat);
     CHECK_INPUT(output);
-    CHECK_DEVICE(power, mel_mat);
-    CHECK_DEVICE(power, output);
-    CHECK_CONTIGUOUS_INPUT(power);
+    CHECK_INPUT(row_max);
+    CHECK_DEVICE(spectrum, mel_mat);
+    CHECK_DEVICE(spectrum, output);
+    CHECK_DEVICE(spectrum, row_max);
+    CHECK_CONTIGUOUS_INPUT(spectrum);
     CHECK_CONTIGUOUS_INPUT(mel_mat);
     CHECK_CONTIGUOUS_INPUT(output);
-    check_fp32(power, "power");
+    CHECK_CONTIGUOUS_INPUT(row_max);
+    check_fp32(spectrum, "spectrum");
     check_fp32(mel_mat, "mel_mat");
     check_fp32(output, "output");
-    CHECK_DIM(3, power);
+    check_fp32(row_max, "row_max");
     CHECK_DIM(2, mel_mat);
     CHECK_DIM(3, output);
+    CHECK_DIM(1, row_max);
 
-    const int batch = static_cast<int>(power.size(0));
-    const int num_frames = static_cast<int>(power.size(1));
-    const int num_freq = static_cast<int>(power.size(2));
-    const int num_mel = static_cast<int>(mel_mat.size(0));
-    TVM_FFI_ICHECK(mel_mat.size(1) == num_freq)
-        << "mel_mat frequency dimension must be " << num_freq << ", got " << mel_mat.size(1);
+    const bool is_complex = spectrum.ndim() == 4;
+    TVM_FFI_ICHECK(spectrum.ndim() == 3 || is_complex)
+        << "spectrum must be 3-D (B, frames, n_freq) power or 4-D (B, frames, n_freq, 2) "
+        << "interleaved complex, got " << spectrum.ndim() << "-D";
+    if (is_complex) {
+        TVM_FFI_ICHECK(spectrum.size(3) == 2)
+            << "a 4-D spectrum must have a trailing complex pair, got " << spectrum.size(3);
+    }
+
+    const int batch = static_cast<int>(spectrum.size(0));
+    const int num_frames = static_cast<int>(spectrum.size(1));
+    const int num_freq = static_cast<int>(spectrum.size(2));
+    const int num_mel = static_cast<int>(mel_mat.size(1));
+    TVM_FFI_ICHECK(mel_mat.size(0) == num_freq)
+        << "mel_mat must be (n_freq, num_mel) with n_freq=" << num_freq << ", got ("
+        << mel_mat.size(0) << ", " << mel_mat.size(1) << ")";
     TVM_FFI_ICHECK(output.size(0) == batch && output.size(1) == num_frames &&
                    output.size(2) == num_mel)
         << "output must have shape (" << batch << ", " << num_frames << ", " << num_mel << ")";
+    TVM_FFI_ICHECK(row_max.size(0) == batch)
+        << "row_max must have shape (" << batch << "), got (" << row_max.size(0) << ")";
     TVM_FFI_ICHECK(log_floor > 0.0) << "log_floor must be positive";
     TVM_FFI_ICHECK(max_floor >= 0.0) << "max_floor must be non-negative";
 
-    cudaStream_t stream = get_stream(power.device());
+    cudaStream_t stream = get_stream(spectrum.device());
     cudaError_t status = features::WhisperLogMel(
-        static_cast<const float*>(power.data_ptr()), static_cast<const float*>(mel_mat.data_ptr()),
-        static_cast<float*>(output.data_ptr()), batch, num_frames, num_freq, num_mel,
-        static_cast<float>(log_floor), static_cast<float>(max_floor), static_cast<float>(offset),
-        static_cast<float>(scale), stream);
+        static_cast<const float*>(spectrum.data_ptr()), static_cast<const float*>(mel_mat.data_ptr()),
+        static_cast<float*>(output.data_ptr()), static_cast<float*>(row_max.data_ptr()), batch,
+        num_frames, num_freq, num_mel, static_cast<float>(log_floor),
+        static_cast<float>(max_floor), static_cast<float>(offset), static_cast<float>(scale),
+        is_complex, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "whisper_logmel kernel failed: " << cudaGetErrorString(status);
 }

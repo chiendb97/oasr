@@ -360,7 +360,7 @@ def dct_lifter(
 
 @oasr_api
 def whisper_logmel(
-    power: torch.Tensor,
+    spectrum: torch.Tensor,
     mel_mat: torch.Tensor,
     *,
     log_floor: float = 1e-10,
@@ -372,8 +372,15 @@ def whisper_logmel(
     """Whisper mel projection, log10 and per-utterance normalization.
 
     Args:
-        power: ``(B, num_frames, n_freq)`` float32 power spectrum.
-        mel_mat: ``(num_mel, n_freq)`` float32 mel filterbank.
+        spectrum: Either a ``(B, num_frames, n_freq)`` float32 **power**
+            spectrum, or the ``(B, num_frames, n_freq)`` **complex64**
+            transform itself, whose ``|z|**2`` the projection folds into the
+            load it already pays. Passing the complex tensor is what the
+            Whisper frontend does: ``abs().square()`` is otherwise two
+            full-size elementwise passes and a full-size temporary.
+        mel_mat: ``(n_freq, num_mel)`` float32 mel filterbank, frequency-major
+            -- the projection matrix of ``power @ mel_mat``, which is the
+            orientation ``torchaudio.functional.melscale_fbanks`` returns.
         log_floor: Clamp floor before ``log10``.
         max_floor: Floor each row at ``row_max - max_floor``.
         offset: Value added after flooring.
@@ -384,23 +391,31 @@ def whisper_logmel(
         Float32 Whisper features. The maximum and floor are independent for
         every batch row, never shared across utterances.
     """
-    if power.dtype != torch.float32 or mel_mat.dtype != torch.float32:
-        raise ValueError("power and mel_mat must both be float32")
-    if power.dim() != 3:
-        raise ValueError(f"power must be 3-D (B, frames, n_freq), got {power.dim()}-D")
-    if mel_mat.dim() != 2 or mel_mat.shape[1] != power.shape[2]:
+    if spectrum.is_complex():
+        if spectrum.dtype != torch.complex64:
+            raise ValueError(f"a complex spectrum must be complex64, got {spectrum.dtype}")
+        # A view, not a copy: (B, F, n_freq) complex64 -> (B, F, n_freq, 2) float32.
+        spectrum = torch.view_as_real(spectrum.contiguous())
+    elif spectrum.dtype != torch.float32:
+        raise ValueError("spectrum must be float32 power or complex64")
+    if mel_mat.dtype != torch.float32:
+        raise ValueError("mel_mat must be float32")
+    if spectrum.dim() not in (3, 4):
+        raise ValueError(f"spectrum must be 3-D (B, frames, n_freq), got {spectrum.dim()}-D")
+    n_freq = spectrum.shape[2]
+    if mel_mat.dim() != 2 or mel_mat.shape[0] != n_freq:
         raise ValueError(
-            "mel_mat must have shape (num_mel, n_freq), got "
-            f"{tuple(mel_mat.shape)} for n_freq={power.shape[2]}"
+            "mel_mat must have shape (n_freq, num_mel), got "
+            f"{tuple(mel_mat.shape)} for n_freq={n_freq}"
         )
     if log_floor <= 0.0:
         raise ValueError(f"log_floor must be positive, got {log_floor}")
     if max_floor < 0.0:
         raise ValueError(f"max_floor must be non-negative, got {max_floor}")
 
-    out_shape = (power.shape[0], power.shape[1], mel_mat.shape[0])
+    out_shape = (spectrum.shape[0], spectrum.shape[1], mel_mat.shape[1])
     if out is None:
-        out = torch.empty(out_shape, device=power.device, dtype=torch.float32)
+        out = torch.empty(out_shape, device=spectrum.device, dtype=torch.float32)
     elif tuple(out.shape) != out_shape or out.dtype != torch.float32:
         raise ValueError(
             f"out must have shape {out_shape} and dtype float32, "
@@ -409,9 +424,13 @@ def whisper_logmel(
     if out.numel() == 0:
         return out
 
+    # Scratch for the per-utterance maximum. The reduction spans a whole
+    # utterance, so it cannot live inside either kernel's block.
+    row_max = torch.empty(out_shape[0], device=spectrum.device, dtype=torch.float32)
     _get_features_module().whisper_logmel(
         out,
-        power.contiguous(),
+        row_max,
+        spectrum.contiguous(),
         mel_mat.contiguous(),
         float(log_floor),
         float(max_floor),

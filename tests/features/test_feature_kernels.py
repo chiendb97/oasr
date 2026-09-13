@@ -162,19 +162,63 @@ class TestDctLifter:
         torch.testing.assert_close(out, log_mel @ dct.t(), rtol=1e-4, atol=1e-4)
 
 
+def _whisper_reference(power: torch.Tensor, filters: torch.Tensor) -> torch.Tensor:
+    """``oasr.whisper_logmel`` written out, for a ``(n_freq, num_mel)`` table."""
+    ref = torch.log10((power @ filters).clamp_min(1e-10))
+    row_max = ref.amax(dim=(1, 2), keepdim=True)
+    return (torch.maximum(ref, row_max - 8.0) + 4.0) / 4.0
+
+
 @CUDA
 class TestWhisperLogMelKernel:
     def test_projection_and_per_row_floor_match_reference(self):
         torch.manual_seed(9)
         power = torch.rand(3, 17, 33, device="cuda")
-        filters = torch.rand(8, 33, device="cuda")
-        filters *= torch.linspace(0.1, 1.0, 8, device="cuda").unsqueeze(1)
+        filters = torch.rand(33, 8, device="cuda")
+        filters *= torch.linspace(0.1, 1.0, 8, device="cuda")
 
         got = whisper_logmel(power, filters)
-        ref = torch.log10((power @ filters.t()).clamp_min(1e-10))
-        row_max = ref.amax(dim=(1, 2), keepdim=True)
-        ref = (torch.maximum(ref, row_max - 8.0) + 4.0) / 4.0
-        torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(got, _whisper_reference(power, filters), rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("num_mel", [8, 80, 128])
+    @pytest.mark.parametrize("num_frames", [1, 13, 3000])
+    def test_shapes_the_frontends_actually_use(self, num_mel, num_frames):
+        """The projection tiles frames; a frame count that is not a whole
+        number of tiles must not read or write past the utterance."""
+        torch.manual_seed(11)
+        power = torch.rand(2, num_frames, 201, device="cuda") * 1e-3
+        filters = torch.rand(201, num_mel, device="cuda") * 0.05
+        got = whisper_logmel(power, filters)
+        torch.testing.assert_close(got, _whisper_reference(power, filters), rtol=1e-5, atol=1e-5)
+
+    def test_complex_spectrum_matches_the_power_it_stands_for(self):
+        """The frontend hands over the transform, not ``abs().square()``."""
+        torch.manual_seed(13)
+        z = torch.fft.rfft(torch.randn(3, 257, 400, device="cuda"), n=400)
+        filters = torch.rand(201, 80, device="cuda") * 0.05
+
+        got = whisper_logmel(z, filters)
+        torch.testing.assert_close(
+            got, _whisper_reference(z.abs().square(), filters), rtol=1e-5, atol=1e-5
+        )
+
+    def test_rows_are_independent(self):
+        """The max floor is per utterance. A loud row must not floor a quiet
+        one -- the reduction is carried on an atomic into a per-row slot, and
+        one slot for the batch would be invisible in any single-row test."""
+        torch.manual_seed(17)
+        filters = torch.rand(201, 80, device="cuda") * 0.05
+        quiet = torch.rand(1, 400, 201, device="cuda") * 1e-9
+        loud = torch.rand(1, 400, 201, device="cuda") * 1e3
+
+        solo = whisper_logmel(quiet, filters)
+        both = whisper_logmel(torch.cat([quiet, loud]), filters)
+        torch.testing.assert_close(both[:1], solo, rtol=0, atol=0)
+
+    def test_rejects_a_mel_table_in_the_wrong_orientation(self):
+        power = torch.rand(1, 4, 33, device="cuda")
+        with pytest.raises(ValueError, match=r"\(n_freq, num_mel\)"):
+            whisper_logmel(power, torch.rand(8, 33, device="cuda"))
 
 
 # ---------------------------------------------------------------------------
