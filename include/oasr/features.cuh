@@ -432,85 +432,203 @@ inline cudaError_t DctLifter(const float* log_mel, const float* dct_mat,
 // =============================================================================
 // 5. Whisper mel + log10 + per-utterance max-floor normalization.
 // =============================================================================
+//
+// Three launches over one `(batch, num_frames, num_mel)` buffer:
+//
+//   InitRowMax        row_max[b] = -FLT_MAX
+//   WhisperMelLog     mel projection + log10, and the per-row max as a
+//                     by-product of the tile each block already holds
+//   WhisperNormalize  floor at `row_max - max_floor`, then the affine
+//
+// The row maximum is a reduction over a *whole utterance* (num_frames * num_mel
+// values), so it cannot be folded into the projection's own block and cannot be
+// recomputed per output element.  Carrying it on an `atomicMax` costs one atomic
+// per block and keeps the normalization a flat elementwise pass -- the previous
+// form reduced and rewrote with one block per batch row, which is `batch` blocks
+// of work however large the GPU is.  `max` is exact and associative, so the
+// atomic changes nothing about the result, including bit-for-bit.
+//
+// The projection tiles `TILE_F` consecutive frames per block.  One frame per
+// block makes every mel bin its own warp reduction and re-reads the filterbank
+// for each frame; a tile amortizes both over `TILE_F` dot products that share
+// one filter load.  The tile never straddles a batch row (gridDim.y is the
+// batch), which is what lets one block own a piece of exactly one row max.
 
-__global__ inline void WhisperMelLogKernel(const float* __restrict__ power,
-                                           const float* __restrict__ mel_mat,
-                                           float* __restrict__ output, int num_freq, int num_mel,
-                                           float log_floor) {
-    extern __shared__ float spec[];
+//: Frames per projection block.  The tile amortizes the filterbank load, which
+//: is otherwise re-read from L2 once per frame: 16 * 201 * 4 = 12.9 KB of
+//: shared memory for Whisper's 400-point transform.
+constexpr int kMelTileFrames = 16;
 
-    const int frame_idx = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int lane = tid & (WARP_SIZE - 1);
-    const int wid = tid >> 5;
-    const int n_warps = blockDim.x >> 5;
-    const float* in = power + static_cast<int64_t>(frame_idx) * num_freq;
-    float* out = output + static_cast<int64_t>(frame_idx) * num_mel;
-
-    for (int i = tid; i < num_freq; i += blockDim.x) {
-        spec[i] = in[i];
+__device__ __forceinline__ void AtomicMaxFloat(float* address, float value) {
+    // Ordered on each sign domain: non-negative floats compare as signed ints,
+    // negative floats compare in reverse as unsigned.  Both start from -FLT_MAX,
+    // whose bit pattern is the largest unsigned of the negative domain and a
+    // negative signed int, so either branch admits any first writer.
+    //
+    // -0.0 is the one value the split mishandles: it takes the non-negative
+    // branch, where its bit pattern is INT_MIN and therefore loses to every
+    // other candidate including the initial -FLT_MAX.  It is unreachable from
+    // log10f, but the helper should not depend on knowing that.
+    if (value == 0.0f) {
+        value = 0.0f;
     }
-    __syncthreads();
-
-    for (int m = wid; m < num_mel; m += n_warps) {
-        const float* filter = mel_mat + static_cast<int64_t>(m) * num_freq;
-        float acc = 0.0f;
-        for (int i = lane; i < num_freq; i += WARP_SIZE) {
-            acc += filter[i] * spec[i];
-        }
-        acc = oasr::reduction::warpReduceSum(acc);
-        if (lane == 0) {
-            out[m] = log10f(acc < log_floor ? log_floor : acc);
-        }
+    if (value >= 0.0f) {
+        atomicMax(reinterpret_cast<int*>(address), __float_as_int(value));
+    } else {
+        atomicMin(reinterpret_cast<unsigned int*>(address), __float_as_uint(value));
     }
 }
 
-__global__ inline void WhisperNormalizeKernel(float* __restrict__ output, int row_elems,
-                                              float max_floor, float offset, float scale) {
-    float* row = output + static_cast<int64_t>(blockIdx.x) * row_elems;
-    float local_max = -3.402823466e+38F;
-    for (int i = threadIdx.x; i < row_elems; i += blockDim.x) {
-        local_max = fmaxf(local_max, row[i]);
+__global__ inline void InitRowMaxKernel(float* __restrict__ row_max, int batch) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch) {
+        row_max[idx] = -3.402823466e+38F;
     }
+}
+
+// `input` is either a `(batch, num_frames, num_freq)` power spectrum or, when
+// `is_complex`, the interleaved real/imaginary halves of the transform itself.
+// Reading the complex spectrum directly is what removes `abs().square()`: two
+// full-size elementwise passes and a full-size temporary, for two multiplies
+// inside a staging loop that already pays the load.
+//
+// `mel_mat` is the projection matrix in `(num_freq, num_mel)` order, so one
+// thread owns one mel bin and reads its filter weights coalesced across the
+// warp.  The alternative -- a warp per mel bin, striding the filter along
+// frequency -- spends five shuffles on every output, which at Whisper's
+// 201-point spectrum is half the kernel's instructions.
+template <int TILE_F>
+__global__ void WhisperMelLogKernel(const float* __restrict__ input,
+                                    const float* __restrict__ mel_mat,
+                                    float* __restrict__ output, float* __restrict__ row_max,
+                                    int num_frames, int num_freq, int num_mel, float log_floor,
+                                    int is_complex) {
+    extern __shared__ float smem[];
+    float* spec = smem;                          // TILE_F * num_freq
+    float* warp_max = smem + TILE_F * num_freq;  // blockDim.x / WARP_SIZE
+
+    const int batch_idx = blockIdx.y;
+    const int frame_base = blockIdx.x * TILE_F;
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    const int64_t row_base = static_cast<int64_t>(batch_idx) * num_frames;
+
+    // Stage the tile.  Frames past the end stage zeros so every thread can run
+    // the same unrolled dot product; their outputs are simply never stored.
+    const int tile_elems = TILE_F * num_freq;
+    for (int idx = tid; idx < tile_elems; idx += bs) {
+        const int t = idx / num_freq;
+        const int i = idx - t * num_freq;
+        const int f = frame_base + t;
+        float v = 0.0f;
+        if (f < num_frames) {
+            const int64_t offset = (row_base + f) * num_freq + i;
+            if (is_complex) {
+                const float2 z = reinterpret_cast<const float2*>(input)[offset];
+                v = z.x * z.x + z.y * z.y;
+            } else {
+                v = input[offset];
+            }
+        }
+        spec[idx] = v;
+    }
+    __syncthreads();
+
+    float local_max = -3.402823466e+38F;
+    for (int m = tid; m < num_mel; m += bs) {
+        float acc[TILE_F];
+#pragma unroll
+        for (int t = 0; t < TILE_F; ++t) {
+            acc[t] = 0.0f;
+        }
+        // `mel_mat[i][m]` is coalesced across the warp; `spec[t][i]` is one
+        // address for every thread, which shared memory broadcasts.
+        const float* filter = mel_mat + m;
+        for (int i = 0; i < num_freq; ++i) {
+            const float fv = filter[static_cast<int64_t>(i) * num_mel];
+            const float* row = spec + i;
+#pragma unroll
+            for (int t = 0; t < TILE_F; ++t) {
+                acc[t] += fv * row[t * num_freq];
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < TILE_F; ++t) {
+            const int f = frame_base + t;
+            if (f < num_frames) {
+                const float v = log10f(acc[t] < log_floor ? log_floor : acc[t]);
+                output[(row_base + f) * num_mel + m] = v;
+                local_max = fmaxf(local_max, v);
+            }
+        }
+    }
+
+    // One atomic per block: reduce across the warp, then across the block.
     for (int delta = WARP_SIZE / 2; delta > 0; delta /= 2) {
         local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, delta));
     }
-    __shared__ float warp_max[32];
-    const int lane = threadIdx.x & (WARP_SIZE - 1);
-    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int wid = tid >> 5;
     if (lane == 0) {
-        warp_max[warp] = local_max;
+        warp_max[wid] = local_max;
     }
     __syncthreads();
-    if (warp == 0) {
-        local_max = lane < blockDim.x / WARP_SIZE ? warp_max[lane] : -3.402823466e+38F;
-        for (int delta = WARP_SIZE / 2; delta > 0; delta /= 2) {
-            local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, delta));
+    if (tid == 0) {
+        const int n_warps = bs >> 5;
+        float block_max = warp_max[0];
+        for (int w = 1; w < n_warps; ++w) {
+            block_max = fmaxf(block_max, warp_max[w]);
         }
-    }
-    __shared__ float s_floor;
-    if (threadIdx.x == 0) {
-        s_floor = local_max - max_floor;
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < row_elems; i += blockDim.x) {
-        row[i] = (fmaxf(row[i], s_floor) + offset) * scale;
+        AtomicMaxFloat(row_max + batch_idx, block_max);
     }
 }
 
-inline cudaError_t WhisperLogMel(const float* power, const float* mel_mat, float* output, int batch,
-                                 int num_frames, int num_freq, int num_mel, float log_floor,
-                                 float max_floor, float offset, float scale, cudaStream_t stream) {
-    const int threads = 256;
-    WhisperMelLogKernel<<<batch * num_frames, threads,
-                          static_cast<size_t>(num_freq) * sizeof(float), stream>>>(
-        power, mel_mat, output, num_freq, num_mel, log_floor);
+__global__ inline void WhisperNormalizeKernel(float* __restrict__ output,
+                                              const float* __restrict__ row_max, int row_elems,
+                                              float max_floor, float offset, float scale) {
+    const int batch_idx = blockIdx.y;
+    const float floor_value = row_max[batch_idx] - max_floor;
+    float* row = output + static_cast<int64_t>(batch_idx) * row_elems;
+    const int stride = blockDim.x * gridDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < row_elems; i += stride) {
+        row[i] = (fmaxf(row[i], floor_value) + offset) * scale;
+    }
+}
+
+inline cudaError_t WhisperLogMel(const float* input, const float* mel_mat, float* output,
+                                 float* row_max, int batch, int num_frames, int num_freq,
+                                 int num_mel, float log_floor, float max_floor, float offset,
+                                 float scale, bool is_complex, cudaStream_t stream) {
+    constexpr int kInitThreads = 256;
+    const int init_blocks = (batch + kInitThreads - 1) / kInitThreads;
+    InitRowMaxKernel<<<init_blocks, kInitThreads, 0, stream>>>(row_max, batch);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
         return status;
     }
-    WhisperNormalizeKernel<<<batch, threads, 0, stream>>>(output, num_frames * num_mel, max_floor,
-                                                          offset, scale);
+
+    // One thread per mel bin, rounded to whole warps: 80 mels take 3 warps and
+    // 128 take 4, rather than a fixed block leaving a third of its lanes idle.
+    int threads = ((num_mel + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+    threads = threads < WARP_SIZE ? WARP_SIZE : (threads > 256 ? 256 : threads);
+    const int n_warps = threads / WARP_SIZE;
+    const size_t smem =
+        (static_cast<size_t>(kMelTileFrames) * num_freq + n_warps) * sizeof(float);
+    const dim3 grid((num_frames + kMelTileFrames - 1) / kMelTileFrames, batch);
+    WhisperMelLogKernel<kMelTileFrames><<<grid, threads, smem, stream>>>(
+        input, mel_mat, output, row_max, num_frames, num_freq, num_mel, log_floor,
+        is_complex ? 1 : 0);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+
+    constexpr int kNormThreads = 256;
+    const int row_elems = num_frames * num_mel;
+    const int tile_blocks = (row_elems + kNormThreads - 1) / kNormThreads;
+    const int norm_blocks = tile_blocks < 1024 ? tile_blocks : 1024;
+    WhisperNormalizeKernel<<<dim3(norm_blocks, batch), kNormThreads, 0, stream>>>(
+        output, row_max, row_elems, max_floor, offset, scale);
     return cudaGetLastError();
 }
 

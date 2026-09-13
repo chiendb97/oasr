@@ -46,11 +46,15 @@ def _hann_window(device_str: str) -> torch.Tensor:
 
 @functools.lru_cache(maxsize=8)
 def _mel_filters(sample_rate: int, n_mels: int, device_str: str) -> torch.Tensor:
-    """Slaney-normalized slaney-scale mel filterbank ``(n_mels, n_fft//2 + 1)``.
+    """Slaney-normalized slaney-scale mel filterbank ``(n_fft//2 + 1, n_mels)``.
 
     ``torchaudio.functional.melscale_fbanks(..., norm="slaney",
     mel_scale="slaney")`` is numerically identical to
-    ``librosa.filters.mel(...)`` — the table Whisper ships in its assets.
+    ``librosa.filters.mel(...)`` — the table Whisper ships in its assets, and
+    the one ``transformers.WhisperFeatureExtractor`` builds.  Kept in
+    torchaudio's own **frequency-major** orientation, which is the projection
+    matrix both paths want: ``oasr.whisper_logmel`` reads one mel bin per
+    thread from it, and the torch path takes a free transposed view.
     """
     from torchaudio.functional import melscale_fbanks
 
@@ -63,7 +67,7 @@ def _mel_filters(sample_rate: int, n_mels: int, device_str: str) -> torch.Tensor
         norm="slaney",
         mel_scale="slaney",
     )  # (n_freqs, n_mels)
-    return fb.t().contiguous().to(torch.device(device_str))
+    return fb.contiguous().to(torch.device(device_str))
 
 
 def _use_kernel(waveforms: torch.Tensor) -> bool:
@@ -101,9 +105,14 @@ def _whisper_logmel_kernel(
     # up to 1.3e-3 into changed/truncated transcripts.  The framed input is
     # bit-identical to torch.stft, so this preserves the quality oracle while
     # the framing and mel/log/max-floor stages remain OASR kernels.
-    power = torch.fft.rfft(frames, n=_N_FFT).abs().square()
+    #
+    # The transform is handed over complex: ``abs().square()`` is two full-size
+    # elementwise passes and a full-size temporary (77 MB at batch 32) on the
+    # widest tensor in the frontend, and the projection folds |z|^2 into a load
+    # it already pays.  It is also the more accurate expression -- ``abs`` is a
+    # square root that ``square`` then undoes.
     features = oasr.whisper_logmel(
-        power,
+        torch.fft.rfft(frames, n=_N_FFT),
         _mel_filters(cfg.sample_rate, cfg.num_mel_bins, str(device)),
     )
     feat_lengths = torch.div(lengths_dev + _HOP - 1, _HOP, rounding_mode="floor")
@@ -185,8 +194,9 @@ def batched_whisper_logmel(
     )
     magnitudes = stft[..., :-1].abs() ** 2  # (B, n_freqs, n_frames)
 
+    # ``.t()`` is a view; cuBLAS takes the transposed operand without a copy.
     filters = _mel_filters(cfg.sample_rate, cfg.num_mel_bins, str(device))
-    mel = filters @ magnitudes  # (B, n_mels, n_frames)
+    mel = filters.t() @ magnitudes  # (B, n_mels, n_frames)
 
     log_spec = torch.clamp(mel, min=1e-10).log10()
     # Per-utterance max floor (amax over mel+time of each row, not the batch).

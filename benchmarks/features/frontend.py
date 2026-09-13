@@ -2,11 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Feature frontend -- ``oasr/functionals/feature.py`` and ``oasr/features/``.
 
-Three stages measured on their own (``fbank_preprocess``, ``mel_log``,
-``dct_lifter``) and the two whole pipelines they compose into.  The pipelines
-carry a ``torchaudio`` arm as a speed reference: it computes the same feature
-through a different FFT order, so its output is compared and reported but never
-gates the run.
+Four stages measured on their own (``fbank_preprocess``, ``mel_log``,
+``dct_lifter``, ``whisper_logmel``) and the three whole pipelines they compose
+into.  The Kaldi pipelines carry a ``torchaudio`` arm as a speed reference: it
+computes the same feature through a different FFT order, so its output is
+compared and reported but never gates the run.
+
+Every row has a ``torch`` arm on purpose.  These kernels replace an expression
+a caller could have written in torch, so "is it faster than what it replaced"
+is the only question that decides whether the kernel should be on the path at
+all -- and a row that is missing cannot answer it.  ``whisper_logmel`` shipped
+without one and spent its first weeks 4-8x slower than the three-line torch
+recipe it displaced.
 """
 
 from __future__ import annotations
@@ -26,8 +33,10 @@ SUBROUTINES = [
     "fbank_preprocess",
     "mel_log",
     "dct_lifter",
+    "whisper_logmel",
     "fbank_pipeline",
     "mfcc_pipeline",
+    "whisper_pipeline",
 ]
 
 #: The frontend kernels are single-precision only.
@@ -41,6 +50,9 @@ NON_GATING_BACKENDS = frozenset({"torchaudio"})
 TOLERANCES = {
     "fbank_pipeline": (5e-2, 5e-2),
     "mfcc_pipeline": (5e-2, 5e-2),
+    # Whisper's output is a normalized [-1, 1] band, so the pipeline's spread
+    # over a different FFT order stays much tighter than the Kaldi rows'.
+    "whisper_pipeline": (1e-3, 1e-3),
 }
 
 # Per-kernel configs shape the intermediate tensor directly; pipeline configs
@@ -50,6 +62,19 @@ DEFAULT_CONFIGS: Dict[str, list] = {
         {"batch": 32, "num_frames": 250, "frame_length": 400, "n_fft": 512},
         {"batch": 64, "num_frames": 500, "frame_length": 400, "n_fft": 512},
         {"batch": 64, "num_frames": 500, "frame_length": 800, "n_fft": 1024},
+    ],
+    # The 30 s window is fixed, so the only free dimension is concurrency:
+    # 3000 frames and 201 bins per request whatever the audio is.  80 mels is
+    # whisper-tiny .. large-v2, 128 is large-v3 and Qwen2-Audio.
+    "whisper_logmel": [
+        {"batch": 1, "num_frames": 3000, "n_freq": 201, "num_mel": 128},
+        {"batch": 8, "num_frames": 3000, "n_freq": 201, "num_mel": 80},
+        {"batch": 32, "num_frames": 3000, "n_freq": 201, "num_mel": 128},
+    ],
+    "whisper_pipeline": [
+        {"batch": 1, "audio_seconds": 30.0},
+        {"batch": 8, "audio_seconds": 30.0},
+        {"batch": 32, "audio_seconds": 30.0},
     ],
     "mel_log": [
         {"batch": 32, "num_frames": 250, "n_freq": 257, "num_mel": 80},
@@ -190,6 +215,30 @@ def setup_mel_log(batch, num_frames, n_freq, num_mel, dtype=torch.float32):
     return oasr_fn, torch_fn
 
 
+def setup_whisper_logmel(batch, num_frames, n_freq, num_mel, dtype=torch.float32):
+    """The kernel against the torch expression ``oasr/features/whisper.py`` ran.
+
+    The input is the *complex* transform, which is what the frontend hands over:
+    the torch arm pays ``abs().square()`` because that is the recipe, and the
+    kernel folds |z|^2 into the load the projection already makes.
+    """
+    device = "cuda"
+    n_fft = (n_freq - 1) * 2
+    frames = torch.randn(batch, num_frames, n_fft, device=device, dtype=dtype)
+    spectrum = torch.fft.rfft(frames, n=n_fft)
+    mel_mat = _mel_bank(num_mel, n_fft, 16000, 0.0, 0.0, device).t().contiguous()
+
+    def oasr_fn():
+        return oasr.whisper_logmel(spectrum, mel_mat)
+
+    def torch_fn():
+        log_spec = torch.matmul(spectrum.abs().square(), mel_mat).clamp_min(1e-10).log10()
+        row_max = log_spec.amax(dim=(1, 2), keepdim=True)
+        return (torch.maximum(log_spec, row_max - 8.0) + 4.0) * 0.25
+
+    return oasr_fn, torch_fn
+
+
 def setup_dct_lifter(batch, num_frames, num_mel, num_ceps, dtype=torch.float32):
     device = "cuda"
     log_mel = torch.randn(batch, num_frames, num_mel, device=device, dtype=dtype)
@@ -319,6 +368,37 @@ def _torchaudio_fbank_loop(waveforms: torch.Tensor, sample_rate: int, num_mel: i
             )
         )
     return torch.stack(out, dim=0)
+
+
+def setup_whisper_pipeline(batch, audio_seconds, dtype=torch.float32):
+    """The served Whisper frontend, kernels against ``OASR_FEATURE_BACKEND=torch``.
+
+    Both arms go through ``batched_whisper_logmel``, so this measures what a
+    request pays -- framing, transform, projection, log and the per-utterance
+    floor -- and not a stage in isolation.
+    """
+    import os
+
+    from oasr.features import FeatureConfig
+    from oasr.features.whisper import batched_whisper_logmel
+
+    cfg = FeatureConfig(feature_type="whisper_logmel", num_mel_bins=128)
+    samples = int(audio_seconds * 16000)
+    waveforms = (torch.randn(batch, samples, device="cuda", dtype=dtype) * 0.1).contiguous()
+    lengths = torch.full((batch,), samples, dtype=torch.int32, device="cuda")
+
+    def oasr_fn():
+        os.environ.pop("OASR_FEATURE_BACKEND", None)
+        return batched_whisper_logmel(waveforms, lengths, cfg)[0]
+
+    def torch_fn():
+        os.environ["OASR_FEATURE_BACKEND"] = "torch"
+        try:
+            return batched_whisper_logmel(waveforms, lengths, cfg)[0]
+        finally:
+            os.environ.pop("OASR_FEATURE_BACKEND", None)
+
+    return oasr_fn, torch_fn
 
 
 def setup_fbank_pipeline(batch, audio_seconds, dtype=torch.float32):
@@ -525,6 +605,11 @@ KERNEL_SETUP = {
     "fbank_preprocess": setup_fbank_preprocess,
     "mel_log": setup_mel_log,
     "dct_lifter": setup_dct_lifter,
+    "whisper_logmel": setup_whisper_logmel,
+    # Two arms, like the kernel rows: the Whisper frontend's torch path *is*
+    # the reference implementation, reached through the same entry point with
+    # OASR_FEATURE_BACKEND=torch, so there is no third library to compare.
+    "whisper_pipeline": setup_whisper_pipeline,
 }
 
 PIPELINE_SETUP = {
@@ -560,6 +645,8 @@ _CONFIG_KEYS = {
     "fbank_preprocess": ("batch", "num_frames", "frame_length", "n_fft"),
     "mel_log": ("batch", "num_frames", "n_freq", "num_mel"),
     "dct_lifter": ("batch", "num_frames", "num_mel", "num_ceps"),
+    "whisper_logmel": ("batch", "num_frames", "n_freq", "num_mel"),
+    "whisper_pipeline": ("batch", "audio_seconds"),
     "fbank_pipeline": ("batch", "audio_seconds"),
     "mfcc_pipeline": ("batch", "audio_seconds"),
 }
@@ -603,6 +690,17 @@ def describe(subroutine: str, cfg: dict, dtype: torch.dtype) -> Work:
         n, num_mel, num_ceps = cfg["num_frames"], cfg["num_mel"], cfg["num_ceps"]
         shape = f"[B={b}, N={n}, num_mel={num_mel}, num_ceps={num_ceps}]"
         nbytes = b * n * (num_mel + num_ceps) * elem + num_mel * num_ceps * elem
+    elif subroutine == "whisper_logmel":
+        n, n_freq, num_mel = cfg["num_frames"], cfg["n_freq"], cfg["num_mel"]
+        shape = f"[B={b}, N={n}, n_freq={n_freq}, num_mel={num_mel}]"
+        # Complex spectrum in, log-mel out, and the normalization pass reads
+        # and rewrites that output once more.
+        nbytes = b * n * (2 * n_freq + 3 * num_mel) * elem + n_freq * num_mel * elem
+    elif subroutine == "whisper_pipeline":
+        seconds = cfg["audio_seconds"]
+        shape = f"[B={b}, {seconds}s]"
+        samples = int(seconds * 16000)
+        nbytes = b * (samples + (samples // 160) * 128) * elem
     else:
         seconds = cfg["audio_seconds"]
         shape = f"[B={b}, {seconds}s]"
