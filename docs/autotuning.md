@@ -125,13 +125,15 @@ The GEMM benchmark script supports autotuning directly:
 
 ```bash
 # Profile all tile variants and show comparison
-python benchmarks/bench_gemm.py --autotune
+python benchmarks/run.py --family gemm --subroutine gemm --autotune
 
 # Save results to a cache file
-python benchmarks/bench_gemm.py --autotune --cache gemm_tune.json
+python benchmarks/run.py --family gemm --subroutine gemm --M 16000 --N 512 --K 2048 \
+    --autotune --cache gemm_tune.json
 
 # Replay cached configs (no profiling overhead)
-python benchmarks/bench_gemm.py --autotune --cache gemm_tune.json --no-tune
+python benchmarks/run.py --family gemm --subroutine gemm --M 16000 --N 512 --K 2048 \
+    --autotune --cache gemm_tune.json --no-tune
 ```
 
 ## Cache file format

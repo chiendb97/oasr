@@ -146,7 +146,7 @@ against `--audio-root`, so 200 utterances is 31 KB of checked-in text. Build one
 for a corpus you have:
 
 ```bash
-python benchmarks/bench_accuracy.py --build-manifest out.jsonl \
+python benchmarks/run.py --family accuracy --build-manifest out.jsonl \
     --audio-root $WAV_DIR --transcripts .../metadata.csv --limit 200
 ```
 
@@ -163,7 +163,7 @@ reference words — not the mean of per-utterance rates. Averaging weights a
 three-word utterance like a thirty-word one and is not comparable to any
 published figure.
 
-Sweeping rather than gating is `benchmarks/bench_accuracy.py` — see
+Sweeping rather than gating is `benchmarks/run.py --family accuracy` — see
 [benchmarks.md](benchmarks.md).
 
 ## Two GPU backends

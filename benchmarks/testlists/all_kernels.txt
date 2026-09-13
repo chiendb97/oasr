@@ -1,46 +1,78 @@
-# Comprehensive benchmark: one representative config per subroutine
+# One representative configuration per subroutine, across every kernel family.
+# Run:  python benchmarks/run.py --testlist benchmarks/testlists/all_kernels.txt \
+#           --output results.csv --refcheck
 
-# GEMM family
---routine gemm --subroutine gemm --M 16000 --N 256 --K 2048
---routine gemm --subroutine bmm --batch-count 256 --M 200 --N 200 --K 64
---routine gemm --subroutine group_gemm --batch-count 64 --M 16000 --N 256 --K 2048 --dtype bfloat16
---routine gemm --subroutine gemm_activation --M 16000 --N 512 --K 512
+# GEMM and its fused epilogues
+--family gemm --subroutine gemm --M 16000 --N 256 --K 2048
+--family gemm --subroutine bmm --batch-count 256 --M 200 --N 200 --K 64
+--family gemm --subroutine bmm_strided --product qk --M 496
+--family gemm --subroutine group_gemm --batch-count 64 --M 16000 --N 256 --K 2048 --dtype bfloat16
+--family gemm --subroutine gemm_activation --M 16000 --N 512 --K 512
+--family gemm --subroutine gemm_log_softmax --M 4000 --N 5000 --K 512
 
-# Norm family
---routine norm --subroutine layer_norm --batch 64 --seq 250 --hidden 512
---routine norm --subroutine add_layer_norm --batch 64 --seq 250 --hidden 512
---routine norm --subroutine add_layer_norm_residual --batch 16 --seq 1500 --hidden 384
---routine norm --subroutine layer_norm_activation --batch 64 --seq 250 --hidden 512
---routine norm --subroutine rms_norm --batch 64 --seq 250 --hidden 512
---routine norm --subroutine add_rms_norm --batch 4 --seq 128 --hidden 3584
---routine norm --subroutine add_rms_norm_residual --batch 4 --seq 128 --hidden 3584
---routine norm --subroutine batch_norm --batch 64 --seq 250 --hidden 512 --dtype float32
---routine norm --subroutine batch_norm_swish --batch 64 --seq 250 --hidden 512
---routine norm --subroutine batch_norm_activation --batch 64 --seq 250 --hidden 512
---routine norm --subroutine group_norm --batch 64 --seq 250 --hidden 512 --num-groups 64 --dtype float32
+# Normalization
+--family norm --subroutine layer_norm --batch 64 --seq 250 --hidden 512
+--family norm --subroutine add_layer_norm --batch 64 --seq 250 --hidden 512
+--family norm --subroutine add_layer_norm_residual --batch 16 --seq 1500 --hidden 384
+--family norm --subroutine layer_norm_activation --batch 64 --seq 250 --hidden 512
+--family norm --subroutine rms_norm --batch 64 --seq 250 --hidden 512
+--family norm --subroutine add_rms_norm --batch 4 --seq 128 --hidden 3584
+--family norm --subroutine add_rms_norm_residual --batch 4 --seq 128 --hidden 3584
+--family norm --subroutine batch_norm --batch 64 --seq 250 --hidden 512 --dtype float32
+--family norm --subroutine batch_norm_swish --batch 64 --seq 250 --hidden 512
+--family norm --subroutine batch_norm_activation --batch 64 --seq 250 --hidden 512
+--family norm --subroutine group_norm --batch 64 --seq 250 --hidden 512 --num-groups 64 --dtype float32
+--family norm --subroutine cmvn --batch 64 --seq 250 --hidden 80
 
-# Conv family
---routine conv --subroutine depthwise_conv1d --batch 64 --seq 250 --channels 512 --kernel-size 31
---routine conv --subroutine depthwise_conv1d_causal --batch 64 --seq 250 --channels 512 --kernel-size 31
---routine conv --subroutine pointwise_conv1d --batch 64 --seq 250 --channels 512 --out-channels 1024
---routine conv --subroutine pointwise_conv1d_activation --batch 64 --seq 250 --channels 512 --out-channels 1024
---routine conv --subroutine conv2d --batch 16 --height 100 --width 40 --channels 256 --out-filters 256 --pad 1 --stride 1
---routine conv --subroutine conv2d_activation --batch 16 --height 100 --width 40 --channels 256 --out-filters 256 --pad 1 --stride 1
+# Convolution
+--family conv --subroutine depthwise_conv1d --batch 64 --seq 250 --channels 512 --kernel-size 31
+--family conv --subroutine depthwise_conv1d_causal --batch 64 --seq 250 --channels 512 --kernel-size 31
+--family conv --subroutine dense_conv1d --batch 1 --seq 3000 --channels 128 --out-channels 1280 --kernel-size 3 --padding 1 --stride 1
+--family conv --subroutine pointwise_conv1d --batch 64 --seq 250 --channels 512 --out-channels 1024
+--family conv --subroutine pointwise_conv1d_activation --batch 64 --seq 250 --channels 512 --out-channels 1024
+--family conv --subroutine conv2d --batch 16 --height 100 --width 40 --channels 256 --out-filters 256 --pad 1 --stride 1
+--family conv --subroutine conv2d_activation --batch 16 --height 100 --width 40 --channels 256 --out-filters 256 --pad 1 --stride 1
+--family conv --subroutine grouped_conv2d --batch 8 --height 50 --width 19 --channels 128 --out-filters 128 --filter-h 7 --filter-w 7 --pad 3 --groups 128
+--family conv --subroutine pointwise_conv2d --batch 8 --height 50 --width 19 --channels 128 --out-filters 384 --filter-h 1 --filter-w 1
+--family conv --subroutine fsmn_chain --batch 8 --seq 500 --channels 512 --kernel-size 11
 
-# Activation family
---routine activation --subroutine gelu --batch 8 --seq 1500 --channels 384
---routine activation --subroutine glu --batch 64 --seq 250 --channels 512
---routine activation --subroutine relu --batch 32 --seq 1 --channels 640
---routine activation --subroutine sigmoid --batch 32 --seq 400 --channels 8
---routine activation --subroutine swish --batch 64 --seq 250 --channels 512
---routine activation --subroutine tanh --batch 32 --seq 1 --channels 512
---routine activation --subroutine tanh --batch 16 --seq 1500 --channels 384 --row-stride-factor 3
+# Activation
+--family activation --subroutine gelu --batch 8 --seq 1500 --channels 384
+--family activation --subroutine glu --batch 64 --seq 250 --channels 512
+--family activation --subroutine relu --batch 32 --seq 1 --channels 640
+--family activation --subroutine sigmoid --batch 32 --seq 400 --channels 8
+--family activation --subroutine swish --batch 64 --seq 250 --channels 512
+--family activation --subroutine tanh --batch 32 --seq 1 --channels 512
+--family activation --subroutine tanh --batch 16 --seq 1500 --channels 384 --row-stride-factor 3
 
-# Softmax family
---routine softmax --subroutine softmax --batch 64 --seq 250 --channels 512
+# Attention
+--family attention --subroutine fmha_offline --B 1 --H 8 --T_q 256 --T_k 1024 --D 64
+--family attention --subroutine fmha_bias --B 1 --H 8 --T_q 256 --T_k 1024 --D 64
+--family attention --subroutine fmha_seqlens --B 4 --H 8 --T_q 256 --T_k 256 --D 64
+--family attention --subroutine fmha_bias_seqlens --B 4 --H 8 --T_q 256 --T_k 256 --D 64
+--family attention --subroutine fmha_paged --B 1 --H 8 --T_q 64 --T_k 512 --D 64
+--family attention --subroutine fmha_paged_bias --B 1 --H 8 --T_q 64 --T_k 512 --D 64
 
-# TopK family
---routine topk --subroutine topk --batch 64 --seq 250 --channels 4096 --k 5
+# Softmax / TopK / FFT / Pooling
+--family softmax --subroutine softmax --batch 64 --seq 250 --channels 512
+--family softmax --subroutine masked_softmax --heads 8 --batch 8 --seq 500
+--family topk --subroutine topk --batch 64 --seq 250 --channels 4096 --k 5
+--family fft --subroutine rfft --batch 64 --num-frames 500 --n-fft 512
+--family fft --subroutine rfft_power --batch 64 --num-frames 500 --n-fft 512
+--family pooling --subroutine avg_pool1d --batch 8 --seq 1500 --channels 1280 --kernel-size 2 --stride 2
+--family pooling --subroutine max_pool1d --batch 8 --seq 1500 --channels 1 --kernel-size 5 --stride 1 --padding 2
+
+# Recurrent and fused MLP
+--family recurrent --subroutine lstm --batch 8 --seq 1 --input-size 640 --hidden-size 640 --num-layers 2 --backends oasr native cudnn
+--family recurrent --subroutine rnn_tanh --batch 32 --seq 128 --input-size 256 --hidden-size 256 --num-layers 2 --backends oasr native cudnn
+--family mlp --subroutine gated_mlp --rows 32 --hidden 4096 --intermediate 11008
+
+# Feature frontend
+--family feature --subroutine fbank_preprocess --batch 64 --num-frames 500 --frame-length 400 --n-fft 512
+--family feature --subroutine mel_log --batch 64 --num-frames 500 --n-freq 257 --num-mel 80
+--family feature --subroutine dct_lifter --batch 64 --num-frames 500 --num-mel 23 --num-ceps 13
+--family feature --subroutine fbank_pipeline --batch 32 --audio-seconds 5.0
+--family feature --subroutine mfcc_pipeline --batch 32 --audio-seconds 5.0
 
 # Composite
---routine composite --subroutine conv_block --batch 64 --seq 250 --d-model 512 --kernel-size 31
+--family composite --subroutine conv_block --batch 64 --seq 250 --d-model 512 --kernel-size 31
