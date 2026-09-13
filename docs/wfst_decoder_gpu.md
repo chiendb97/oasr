@@ -448,7 +448,7 @@ the C++ API (`LastLatticeRecords`).
 | 16 | `kOverflowKept` | surviving frontier > `main_q` | caller: rescue |
 
 Any non-zero overflow means the lane's result may be degraded; the standard
-pattern (see `benchmarks/bench_wfst.py`) is to re-decode flagged lanes on a
+pattern (see `benchmarks/decoders/wfst.py`) is to re-decode flagged lanes on a
 small rescue instance with larger factors. At the wrapper defaults this is
 rare (6 / 2000 LJSpeech utterances, unchanged from the pre-optimization
 decoder).
@@ -586,13 +586,13 @@ Reproduce:
 
 ```bash
 # throughput (add --compare-external for an A/B vs the standalone build)
-CUDA_VISIBLE_DEVICES=<gpu> python benchmarks/bench_wfst.py --batch 1 8 32
+CUDA_VISIBLE_DEVICES=<gpu> python benchmarks/decoders/wfst.py --batch 1 8 32
 
 # bit-exact output parity vs the external _wfst.so
 python scripts/wfst_parity_check.py --num-utts 192 --batch 1 8 32
 
 # kernel timeline (graph nodes need node-level tracing)
-nsys profile --cuda-graph-trace=node -t cuda python benchmarks/bench_wfst.py ...
+nsys profile --cuda-graph-trace=node -t cuda python benchmarks/decoders/wfst.py ...
 # per-kernel metrics: build the decoder with use_cuda_graphs=0, then ncu
 ```
 

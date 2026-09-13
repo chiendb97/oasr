@@ -1,7 +1,7 @@
 # Representative LSTM / vanilla-RNN sweep against PyTorch/cuDNN.
---routine recurrent --subroutine lstm --backends oasr cudnn --dtype float16 --refcheck --num_iters 20 --dry_run_iters 5
---routine recurrent --subroutine lstm --backends oasr cudnn --dtype bfloat16 --refcheck --num_iters 20 --dry_run_iters 5
---routine recurrent --subroutine rnn_tanh --backends oasr cudnn --dtype float16 --refcheck --num_iters 20 --dry_run_iters 5
---routine recurrent --subroutine rnn_tanh --backends oasr cudnn --dtype bfloat16 --refcheck --num_iters 20 --dry_run_iters 5
---routine recurrent --subroutine rnn_relu --backends oasr cudnn --dtype float16 --refcheck --num_iters 20 --dry_run_iters 5
---routine recurrent --subroutine rnn_relu --backends oasr cudnn --dtype bfloat16 --refcheck --num_iters 20 --dry_run_iters 5
+--family recurrent --subroutine lstm --backends oasr cudnn --dtype float16 --refcheck --iters 20 --warmup-iters 5
+--family recurrent --subroutine lstm --backends oasr cudnn --dtype bfloat16 --refcheck --iters 20 --warmup-iters 5
+--family recurrent --subroutine rnn_tanh --backends oasr cudnn --dtype float16 --refcheck --iters 20 --warmup-iters 5
+--family recurrent --subroutine rnn_tanh --backends oasr cudnn --dtype bfloat16 --refcheck --iters 20 --warmup-iters 5
+--family recurrent --subroutine rnn_relu --backends oasr cudnn --dtype float16 --refcheck --iters 20 --warmup-iters 5
+--family recurrent --subroutine rnn_relu --backends oasr cudnn --dtype bfloat16 --refcheck --iters 20 --warmup-iters 5

@@ -708,7 +708,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.shapes:
             print(
                 "ERROR: --mode capture requires --shapes <captured json> "
-                "(produce it via OASR_CAPTURE_GEMM=… python benchmarks/bench_engine.py …)",
+                "(produce it via OASR_CAPTURE_GEMM=… python benchmarks/run.py --family engine …)",
                 file=sys.stderr,
             )
             return 2

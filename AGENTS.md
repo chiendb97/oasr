@@ -127,9 +127,9 @@ set -a; source .env; set +a          # cp .env.example .env first, and edit the 
 | Convert a checkpoint | `oasr-convert <src> <dst>` |
 | Transcribe (server / in-process) | `oasr transcribe audio.mp3` · `oasr transcribe audio.mp3 --ckpt-dir <dir>` |
 | Word timestamps | `oasr transcribe audio.mp3 --response-format verbose_json --timestamp-granularity word` |
-| Kernel benchmark | `python benchmarks/oasr_benchmark.py --list` |
-| Engine / service / accuracy benchmark | `python benchmarks/bench_{engine,service,accuracy}.py` — flags default from `.env` |
-| WER for one architecture | `python benchmarks/bench_accuracy.py --ckpt-dir $CKPT_DIR --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR` |
+| Any benchmark | `python benchmarks/run.py --list` (kernels, decoders, engine, service, accuracy) |
+| Engine / service / accuracy benchmark | `python benchmarks/run.py --family {engine,service,accuracy}` — flags default from `.env` |
+| WER for one architecture | `python benchmarks/run.py --family accuracy --ckpt-dir $CKPT_DIR --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR` |
 | …for an explicit-only one | as above with `--ckpt-dir $TRANSDUCER_CKPT --architecture transducer` |
 
 ---
@@ -557,21 +557,25 @@ same trap as an unsourced test run wearing a different hat.
 
 | Harness | Measures |
 |---|---|
-| `benchmarks/oasr_benchmark.py` | Kernel level, via a routine registry (`benchmarks/routines/`) |
-| `benchmarks/bench_engine.py` | In-process `ASREngine` — the GPU + Python ceiling |
-| `benchmarks/bench_service.py` | End-to-end `oasr-server` — what clients see |
-| `benchmarks/bench_accuracy.py` | WER/CER **and** RTFx / p50 / p99 in the same CSV row |
+| `benchmarks/run.py --family <kernel family>` | Kernel level, via the family registry (`benchmarks/core/registry.py`) |
+| `benchmarks/run.py --family engine` | In-process `ASREngine` — the GPU + Python ceiling |
+| `benchmarks/run.py --family service` | End-to-end `oasr-server` — what clients see |
+| `benchmarks/run.py --family accuracy` | WER/CER **and** RTFx / p50 / p99 in the same row |
+
+Two output schemas, declared once in `benchmarks/core/schema.py` and printable
+with `run.py --print-schema`: **kernel** rows and **workload** rows (engine,
+service, accuracy, decoders). `rtfx = audio_s / wall_s` in all of them.
 
 ```bash
-python benchmarks/oasr_benchmark.py --list
-python benchmarks/oasr_benchmark.py --routine gemm --subroutine bmm \
+python benchmarks/run.py --list
+python benchmarks/run.py --family gemm --subroutine bmm \
     --backends cutlass torch --batch-count 256 --M 200 --N 200 --K 64 \
     --dtype float16 --refcheck -vv
-python benchmarks/oasr_benchmark.py --testlist benchmarks/testlists/conformer_base.txt \
-    --output_path results.csv --refcheck
+python benchmarks/run.py --testlist benchmarks/testlists/conformer_base.txt \
+    --output results.csv --refcheck
 
-ncu --set full -o gemm_profile python benchmarks/oasr_benchmark.py \
-    --routine gemm --subroutine gemm --backends cutlass --profile --dry_run_iters 0
+ncu --set full -o gemm_profile python benchmarks/run.py \
+    --family gemm --subroutine gemm --backends cutlass --profile --warmup-iters 0
 ```
 
 Backend names differ by family: `cutlass` / `torch` for GEMM and Conv2D;
@@ -656,4 +660,4 @@ before process start.
 | Skill | Use for |
 |---|---|
 | `/add-cuda-kernel` | The authoritative walkthrough for a new kernel family — CUDA header → csrc launcher → JIT binding → JIT generator → Python API → layer wrapper → tests → AOT registration |
-| `/benchmark-kernel` | Benchmarking and profiling with `oasr_benchmark.py`, testlists, CSV output, Nsight Compute |
+| `/benchmark-kernel` | Benchmarking and profiling with `benchmarks/run.py`, testlists, CSV output, Nsight Compute |

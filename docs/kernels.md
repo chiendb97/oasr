@@ -115,7 +115,7 @@ because applying tanh/ReLU to an intermediate K partition is incorrect.
 The direct kernel remains the default for decode-sized and moderate hidden
 states. This is intentional: a tensor-core GEMM can underfill the device at
 small M, and packing/projection plus dependent GEMM launches may cost more than
-the work saved. `benchmarks/routines/recurrent.py` exposes
+the work saved. `benchmarks/kernels/recurrent.py` exposes
 `native`, `cutlass16`, `cutlass32`, `cutlass64`, `streamk`, `splitk`, and
 `serial_splitk` (LSTM only) arms so architecture-specific crossover changes
 are measured instead of inferred. The focused matrix is

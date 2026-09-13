@@ -2,19 +2,23 @@
 
 This document covers the three top-level harnesses:
 
-| Script | Measures |
+| Harness | Measures |
 |---|---|
-| `benchmarks/bench_engine.py` | In-process `ASREngine` — pure GPU + Python overhead, no IPC, no HTTP/WS. |
-| `benchmarks/bench_service.py` | End-to-end `oasr-server` (Rust + HTTP + PyO3 dispatcher + engine). |
-| `benchmarks/bench_accuracy.py` | WER/CER **and** speed in the same CSV row. |
+| `run.py --family engine` | In-process `ASREngine` — pure GPU + Python overhead, no IPC, no HTTP/WS. |
+| `run.py --family service` | End-to-end `oasr-server` (Rust + HTTP + PyO3 dispatcher + engine). |
+| `run.py --family accuracy` | WER/CER **and** speed in the same CSV row. |
+
+All three emit the **workload** schema, so an engine row and a service row are
+one query apart rather than a CSV-to-JSON join. `benchmarks/bench_engine.py`,
+`bench_service.py` and `bench_accuracy.py` remain as shims into `run.py`.
 
 Run the first two back-to-back on the same machine for an apples-to-apples
 comparison — the engine number is the ceiling, the service number is what real
 clients see.
 
-Kernel-level benchmarking is a separate harness,
-`benchmarks/oasr_benchmark.py` — see [`benchmarks/README.md`](../benchmarks/README.md)
-and the `/benchmark-kernel` skill.
+Kernel-level benchmarking is the same CLI with a kernel family selected —
+see [`benchmarks/README.md`](../benchmarks/README.md) and the
+`/benchmark-kernel` skill.
 
 ## Measurement protocol
 
@@ -27,7 +31,8 @@ Three rules, each of which has produced a wrong conclusion when skipped:
    slower.
 3. **Verify a fresh JIT hash directory** before trusting a kernel comparison —
    `rm -rf ~/.cache/oasr/jit` after editing a header that the cache key does not
-   cover.
+   cover. Every run records the hashes it used in `<output>.meta.json`, so this
+   is checkable after the fact.
 
 ## Setup
 
@@ -70,10 +75,10 @@ to pick up the matching `.env` default (CLI flag still wins when both are
 given):
 
 ```bash
-python benchmarks/bench_engine.py \
+python benchmarks/run.py --family engine \
     --ckpt-dir [CKPT_DIR] \
     --audio-dir [AUDIO_DIR] \
-    --subroutines [offline|streaming|offline_wfst|streaming_wfst] \
+    --subroutine [offline|streaming|offline_wfst|streaming_wfst] \
     --max-batch-size [MAX_BATCH_SIZE] \
     --num-utterances [NUM_UTTERANCES] \
     --chunk-size [CHUNK_SIZE] \
@@ -85,14 +90,14 @@ Concrete invocations with `.env` sourced:
 
 ```bash
 # Offline — length-bucketed batches
-python benchmarks/bench_engine.py \
+python benchmarks/run.py --family engine \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
     --subroutines offline \
     --max-batch-size "$MAX_BATCH_SIZE" \
     --num-utterances "$NUM_UTTERANCES"
 
 # Streaming — interleaved chunk-by-chunk decode, paged KV cache
-python benchmarks/bench_engine.py \
+python benchmarks/run.py --family engine \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
     --subroutines streaming \
     --max-batch-size "$MAX_BATCH_SIZE" \
@@ -101,7 +106,7 @@ python benchmarks/bench_engine.py \
 # WFST decoding (in-tree GPU decoder) — pass the lang dir (contains HLG.pt;
 # words.txt beside it provides the word table) or a direct .img/.pt path.
 # The HLG.pt is exported to a cached .img next to it on first use.
-python benchmarks/bench_engine.py \
+python benchmarks/run.py --family engine \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
     --wfst-path /path/to/lang_bpe \
     --subroutines offline_wfst streaming_wfst \
@@ -109,22 +114,27 @@ python benchmarks/bench_engine.py \
     --num-utterances "$NUM_UTTERANCES"
 
 # CUDA-Graph toggle — captured (default) vs eager replay for profiling
-python benchmarks/bench_engine.py \
+python benchmarks/run.py --family engine \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
     --subroutines streaming --cuda-graphs off
 
 # Export per-subroutine results to CSV
-python benchmarks/bench_engine.py \
+python benchmarks/run.py --family engine \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
-    --output-path engine_results.csv
+    --output engine_results.csv
 ```
 
 The output is one block per `--subroutines` value:
 
 ```
-[PERF] offline      :: median time 1024 ms; std 87 ms
-         RTF=0.0001  throughput=1951 utts/s  total_audio=13362 s
+[PERF] offline                      :: median time 1024 ms; std 87 ms
+         RTFx=13048.83  1951.00 utts/s  audio=13362.0s
 ```
+
+`RTFx` is `audio_seconds / wall_seconds` — higher is faster — and means the same
+thing in every harness. The engine harness used to report its reciprocal under
+the name `rtf` while the service harness reported `audio/wall` under that same
+name, so the two columns were inverses of each other.
 
 Throughput / RTF here represent the **GPU + scheduler ceiling** for this batch /
 chunk-size config.
@@ -141,10 +151,10 @@ to pick up the matching `.env` default (CLI flag still wins when both are
 given):
 
 ```bash
-python benchmarks/bench_service.py \
+python benchmarks/run.py --family service \
     --ckpt-dir [CKPT_DIR] \
     --audio-dir [AUDIO_DIR] \
-    --subroutines [offline|streaming|grpc_offline|grpc_streaming|whisper] \
+    --subroutine [offline|streaming|grpc_offline|grpc_streaming|whisper] \
     --num-utterances [NUM_UTTERANCES] \
     --concurrency [CONCURRENCY] \
     --max-batch-size [MAX_BATCH_SIZE] \
@@ -158,7 +168,7 @@ Concrete invocations with `.env` sourced:
 
 ```bash
 # Offline (HTTP POST /v1/transcriptions) — i16_le default (halves wire bytes)
-python benchmarks/bench_service.py \
+python benchmarks/run.py --family service \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
     --subroutines offline \
     --num-utterances "$NUM_UTTERANCES" \
@@ -167,7 +177,7 @@ python benchmarks/bench_service.py \
     --wire-encoding i16_le
 
 # Same, explicit f32_le baseline for comparison
-python benchmarks/bench_service.py \
+python benchmarks/run.py --family service \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
     --subroutines offline \
     --num-utterances "$NUM_UTTERANCES" \
@@ -179,7 +189,7 @@ python benchmarks/bench_service.py \
 # --fst-path takes a prebuilt .img or a k2 HLG.pt (exported + cached on first
 # use); the words.txt beside it provides the word table. Works for the
 # grpc_offline / grpc_streaming subroutines the same way.
-python benchmarks/bench_service.py \
+python benchmarks/run.py --family service \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
     --subroutines offline \
     --decoder-type ctc_wfst \
@@ -189,7 +199,7 @@ python benchmarks/bench_service.py \
     --max-batch-size "$MAX_BATCH_SIZE"
 
 # Streaming (WS /v1/stream) — no realtime pacing for max-rate test
-python benchmarks/bench_service.py \
+python benchmarks/run.py --family service \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
     --subroutines streaming --realtime 0 \
     --num-utterances "$NUM_UTTERANCES" \
@@ -199,7 +209,7 @@ python benchmarks/bench_service.py \
     --wire-encoding i16_le
 
 # Streaming under live-mic pacing (each chunk waits chunk-ms wall-time)
-python benchmarks/bench_service.py \
+python benchmarks/run.py --family service \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
     --subroutines streaming --realtime 1 \
     --num-utterances "$NUM_UTTERANCES" \
@@ -207,12 +217,12 @@ python benchmarks/bench_service.py \
     --chunk-ms "$CHUNK_MS"
 
 # gRPC variants — same args, different subroutine
-python benchmarks/bench_service.py \
+python benchmarks/run.py --family service \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
     --subroutines grpc_offline \
     --num-utterances "$NUM_UTTERANCES" --concurrency "$CONCURRENCY"
 
-python benchmarks/bench_service.py \
+python benchmarks/run.py --family service \
     --ckpt-dir "$CKPT_DIR" --audio-dir "$AUDIO_DIR" \
     --subroutines grpc_streaming --realtime 0 \
     --num-utterances "$NUM_UTTERANCES" --concurrency "$CONCURRENCY" \
@@ -248,9 +258,9 @@ python benchmarks/bench_accuracy.py --build-manifest \
     --audio-dir "$AUDIO_DIR" --out benchmarks/manifests/my_corpus.jsonl
 
 # Measure
-python benchmarks/bench_accuracy.py \
+python benchmarks/run.py --family accuracy \
     --ckpt-dir "$CKPT_DIR" --manifest benchmarks/manifests/my_corpus.jsonl \
-    --output_path accuracy.csv
+    --output accuracy.csv
 ```
 
 - WER is the **corpus** rate (total errors / total reference words), with
@@ -306,8 +316,8 @@ python benchmarks/bench_accuracy.py \
   decode (`oasr-asr::decode_raw_pcm`) widens i16 back to f32 by dividing by
   32768, matching the bench's scale-by-32767 encode (one count short of
   saturation at ±1.0).
-- For Nsight-Compute kernel profiling, see `benchmarks/oasr_benchmark.py`
-  with `--profile`, and the `/benchmark-kernel` skill.
+- For Nsight-Compute kernel profiling, see `benchmarks/run.py --profile` and
+  the `/benchmark-kernel` skill.
 - Point-in-time results — engine, serving, decoders and kernels — live under
   `.artifacts/` (`engine_perf.md`, `serving_perf.md`, `decoder_perf.md`,
   `fmha_tuning.md`, `gemm_tuning.md`, `profiling_report.md`). Record new

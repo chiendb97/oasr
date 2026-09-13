@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Manifest loading and batched transcription for accuracy measurement.
 
-Shared by ``benchmarks/bench_accuracy.py`` (the sweep CLI) and
+Shared by ``benchmarks/accuracy/accuracy.py`` (the sweep CLI) and
 ``tests/test_accuracy.py`` (the regression gate) so the two cannot disagree
 about what "run the manifest" means — a gate that measures something slightly
 different from the benchmark is a gate nobody trusts.

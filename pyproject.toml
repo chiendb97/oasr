@@ -239,8 +239,13 @@ ignore = [
 # Benchmark entry points insert the repo root on sys.path before importing
 # `benchmarks.*`; the routine modules import kernels for their registration
 # side effect and re-export helpers the CLI resolves by name.
+# sys.path bootstrap before the package imports, in the CLI and the shims.
 "benchmarks/*.py" = ["E402"]
-"benchmarks/routines/*.py" = ["F401", "E402"]
+"benchmarks/core/*.py" = ["E402"]
+# These three were folded in from standalone scripts that set sys.path first.
+"benchmarks/accuracy/*.py" = ["E402"]
+"benchmarks/service/*.py" = ["E402"]
+"benchmarks/decoders/*.py" = ["E402"]
 
 # Mirror of [tool.isort] — see the note there.
 [tool.ruff.lint.isort]
