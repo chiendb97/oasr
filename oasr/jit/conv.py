@@ -387,11 +387,15 @@ def _sm120_conv1d_config(
     )
 
 
-# Exact SM120 production shapes. Batch and sequence remain in the key because
-# implicit-GEMM's M dimension changes the best block height.
-_CONV1D_HEURISTIC_RULES_SM120: Dict[
+#: One architecture's measured Conv1D tiles: dtype -> shape -> config.
+_Conv1dRuleTable = Dict[
     str, Dict[Tuple[int, ...], Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]]
-] = {
+]
+
+# Exact SM120 production shapes. Batch and sequence remain in the key because
+# implicit-GEMM's M dimension changes the best block height.  Named for the arch
+# it was measured on; a second one is a new literal plus a registry line below.
+_CONV1D_HEURISTIC_RULES_SM120: _Conv1dRuleTable = {
     "torch.float16": {
         # Fixed-window frontend, width 384.
         (1, 3000, 80, 384, 3, 1, 1, 1): _sm120_conv1d_config(64, 128, 32, 64),
@@ -411,9 +415,7 @@ _CONV1D_HEURISTIC_RULES_SM120: Dict[
     },
 }
 
-_CONV1D_ACTIVATION_HEURISTIC_RULES_SM120: Dict[
-    str, Dict[Tuple[int, ...], Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]]
-] = {
+_CONV1D_ACTIVATION_HEURISTIC_RULES_SM120: _Conv1dRuleTable = {
     # Predictor convolution with fused ReLU.
     "torch.float16": {
         (1, 502, 512, 512, 3, 0, 1, 1): _sm120_conv1d_config(16, 128, 16, 32),
@@ -424,15 +426,47 @@ _CONV1D_ACTIVATION_HEURISTIC_RULES_SM120: Dict[
 }
 
 
+#: The Conv1D tables by compiled SM family, the same shape as
+#: ``jit.gemm._GEMM_HEURISTIC_RULES`` and for the same reason: which
+#: architectures are measured is data, not an ``if sm != 120`` in the selector.
+#:
+#: An architecture with no entry takes :data:`CONV2D_DEFAULT` for every call.
+#: Unlike GEMM this is not reported per shape — there is no conv miss table —
+#: so the arch-level fall-through is counted in :data:`_ARCH_INACTIVE` and
+#: surfaced through ``oasr.layers._backend.format_gap_report``, which is the one
+#: place that already answers "what did not reach a tuned kernel?".
+_CONV1D_HEURISTIC_RULES: Dict[int, _Conv1dRuleTable] = {
+    120: _CONV1D_HEURISTIC_RULES_SM120,
+}
+
+_CONV1D_ACTIVATION_HEURISTIC_RULES: Dict[int, _Conv1dRuleTable] = {
+    120: _CONV1D_ACTIVATION_HEURISTIC_RULES_SM120,
+}
+
+#: SM family -> Conv1D lookups that found no rule table for it.  One entry per
+#: architecture: a missing table is one gap covering every shape.
+_ARCH_INACTIVE: Dict[int, int] = {}
+
+
+def heuristic_inactive() -> Dict[int, int]:
+    """SM families this process asked about that have no Conv1D table: ``sm -> calls``."""
+    return dict(_ARCH_INACTIVE)
+
+
+def reset_heuristic_stats() -> None:
+    """Clear the untuned-arch counter (per-test isolation, per-benchmark accounting)."""
+    _ARCH_INACTIVE.clear()
+
+
 def _select_conv1d_rule(
-    rules_by_dtype: Dict[
-        str, Dict[Tuple[int, ...], Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]]
-    ],
+    rules_by_sm: Dict[int, _Conv1dRuleTable],
     shape: Tuple[int, ...],
     dtype,
     sm: int,
 ) -> Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]:
-    if sm != 120:
+    rules_by_dtype = rules_by_sm.get(int(sm))
+    if rules_by_dtype is None:
+        _ARCH_INACTIVE[int(sm)] = _ARCH_INACTIVE.get(int(sm), 0) + 1
         return CONV2D_DEFAULT
     rules = rules_by_dtype.get(str(dtype))
     if rules is None:
@@ -454,13 +488,15 @@ def select_default_conv1d_config(
 ) -> Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]:
     """Pick a measured dense Conv1D tile for the non-autotuned path.
 
-    The table is deliberately exact and currently covers FP16/BF16 on SM120.
-    An unmeasured architecture, dtype, batch, or length retains
-    :data:`CONV2D_DEFAULT`; callers can opt into the full runtime autotuner for
+    The table is deliberately exact and is registered per SM family in
+    :data:`_CONV1D_HEURISTIC_RULES` — SM120 today.  An unmeasured architecture,
+    dtype, batch, or length retains :data:`CONV2D_DEFAULT`; an unmeasured
+    *architecture* is also counted, since that one fall-through covers every
+    call the process makes.  Callers can opt into the full runtime autotuner for
     additional shapes.
     """
     return _select_conv1d_rule(
-        _CONV1D_HEURISTIC_RULES_SM120,
+        _CONV1D_HEURISTIC_RULES,
         (batch, seq_len, in_channels, out_channels, kernel_size, padding, stride, dilation),
         dtype,
         sm,
@@ -481,7 +517,7 @@ def select_default_conv1d_activation_config(
 ) -> Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]:
     """Pick a measured fused-activation Conv1D tile, with a safe fallback."""
     return _select_conv1d_rule(
-        _CONV1D_ACTIVATION_HEURISTIC_RULES_SM120,
+        _CONV1D_ACTIVATION_HEURISTIC_RULES,
         (batch, seq_len, in_channels, out_channels, kernel_size, padding, stride, dilation),
         dtype,
         sm,

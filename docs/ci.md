@@ -188,10 +188,18 @@ machine somebody can look at. Modal exists because that box is also the
 benchmarking machine (CI competing for clocks is exactly the noise the perf work
 fights), because its GPU has fallen off the bus in a way only a *host* reset
 recovers, and — the reason that grew — because **one SM is not a test matrix**.
-`test_gemm_heuristic.py` skips its whole rule-table suite unless the running SM
-matches the rules, kernel selection reads the compute capability in half a dozen
-places, and `_default_cuda_cflags` emits a different `-gencode` per arch. Code
-that assumed one architecture is invisible until a second one runs it.
+Kernel selection reads the compute capability in half a dozen places,
+`_default_cuda_cflags` emits a different `-gencode` per arch, and a kernel that
+compiles for an architecture can still take `CUTE_INVALID_CONTROL_PATH` on the
+silicon — compiling is cross-targetable, running is not. Code that assumed one
+architecture is invisible until a second one runs it.
+
+What a matrix does *not* buy is coverage of the shape-aware rule tables. Those
+are pure functions of `(op, M, N, K, dtype, sm)` — `test_gemm_heuristic.py` used
+to skip its whole rule-table suite unless the running SM matched the rules, which
+meant an SM120 table nobody could validate anywhere else. It now checks every
+*registered* architecture's table from any box, and the matrix is left to do what
+only it can: run the kernels.
 
 ```bash
 modal run ci/modal_app.py::main --gpus all                    # one per architecture

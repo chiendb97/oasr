@@ -839,6 +839,35 @@ class TestKernelGapRegistry:
         assert "performance grounds" in report
         reset_backend_stats()
 
+    def test_report_names_an_untuned_architecture(self):
+        """A fourth category, one level up from an untuned model *width*: a GPU
+        architecture with no rule table at all.
+
+        The shape-aware GEMM and Conv1D selectors are then not consulted and
+        every call takes the fallback tile — which reads as silence in all three
+        counters above, because nothing was missing, nothing was chosen and no
+        rule was missed.  Until the tables were keyed by SM family this report
+        said "every call reached an OASR kernel" and stopped there, on every box
+        that was not the one card somebody had tuned.
+        """
+        from oasr.jit.conv import select_default_conv1d_config
+        from oasr.jit.core import _TARGET_SMS
+        from oasr.jit.gemm import _GEMM_HEURISTIC_RULES, select_default_config
+        from oasr.layers._backend import format_gap_report, reset_backend_stats
+
+        untuned = next((s for s in _TARGET_SMS if s not in _GEMM_HEURISTIC_RULES), None)
+        if untuned is None:
+            pytest.skip("every compiled SM family has a tuned rule table")
+
+        reset_backend_stats()
+        select_default_config("gemm", 720, 256, 2048, torch.bfloat16, untuned)
+        select_default_conv1d_config(1, 3000, 80, 384, 3, 1, 1, 1, torch.float16, untuned)
+        report = format_gap_report()
+        assert "not tuned for this GPU" in report, report
+        assert f"sm{untuned}" in report and "GEMM" in report and "Conv1D" in report, report
+        assert "tune_asr_gemm" in report, "the report must say what to do about it"
+        reset_backend_stats()
+
     @pytest.mark.parametrize("arch", list_models())
     def test_no_architecture_needs_an_unaligned_gemm(self, arch):
         """Every output projection is allocated at a width the kernels can

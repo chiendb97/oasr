@@ -10,13 +10,17 @@ import torch.nn.functional as F
 import oasr
 from oasr.functionals.conv import _get_conv2d_module
 from oasr.jit.conv import (
+    _CONV1D_ACTIVATION_HEURISTIC_RULES,
+    _CONV1D_HEURISTIC_RULES,
     CONV2D_DEFAULT,
     conv2d_func_name,
     get_unique_conv2d_compile_configs,
+    heuristic_inactive,
+    reset_heuristic_stats,
     select_default_conv1d_activation_config,
     select_default_conv1d_config,
 )
-from oasr.jit.core import _get_target_sm
+from oasr.jit.core import _TARGET_SMS, _get_target_sm
 
 # Every test in this module allocates directly on ``device="cuda"`` and calls a
 # JIT-compiled kernel, so the whole file is CUDA-only.  Declaring that here is
@@ -121,6 +125,52 @@ class TestDenseConv1D:
         assert select_default_conv1d_config(*shape, torch.float16, 120) is CONV2D_DEFAULT
         assert select_default_conv1d_config(*shape, torch.bfloat16, 120) is CONV2D_DEFAULT
         assert select_default_conv1d_config(*shape, torch.float16, 80) is CONV2D_DEFAULT
+
+    def test_the_tables_are_registered_per_sm_family(self):
+        """The Conv1D half of the same defect as the GEMM heuristic: the selector
+        opened with ``if sm != 120``, so which architectures are measured was a
+        branch with one possible answer.  It is these dicts' keys now, and a key
+        outside the compiled families would be data no call can reach."""
+        for registry in (_CONV1D_HEURISTIC_RULES, _CONV1D_ACTIVATION_HEURISTIC_RULES):
+            assert registry, "no Conv1D rule table is registered at all"
+            assert set(registry) <= set(_TARGET_SMS), (
+                f"tables registered for {sorted(set(registry) - set(_TARGET_SMS))}, "
+                f"which _SM_FAMILY never resolves to"
+            )
+
+    def test_every_table_only_names_tiles_its_own_arch_compiles(self):
+        """A rule naming a config outside its arch's emitted set raises
+        ``AttributeError: Module has no function …`` on the first call that hits
+        it — on that architecture only.  Both sides are pure functions of ``sm``,
+        so every registered table is checked from any box."""
+        for registry in (_CONV1D_HEURISTIC_RULES, _CONV1D_ACTIVATION_HEURISTIC_RULES):
+            for sm, by_dtype in registry.items():
+                compiled = get_unique_conv2d_compile_configs(sm)
+                for dtype, by_shape in by_dtype.items():
+                    for shape, cfg in by_shape.items():
+                        where = f"sm{sm} {dtype} {shape}"
+                        assert cfg.kSmVersion == sm, (
+                            f"{where}: registered under sm{sm} but names a "
+                            f"kSmVersion={cfg.kSmVersion} config"
+                        )
+                        assert (
+                            cfg.compile_name in compiled
+                        ), f"{where}: {cfg.compile_name} is not in sm{sm}'s emitted set"
+
+    def test_an_untuned_arch_is_counted_not_silent(self):
+        """Conv1D has no per-shape miss table, so an architecture with no rules at
+        all was invisible in every counter — ``format_gap_report`` said "every
+        call reached an OASR kernel" while every conv1d ran the fallback tile."""
+        sm = next((s for s in _TARGET_SMS if s not in _CONV1D_HEURISTIC_RULES), None)
+        if sm is None:
+            pytest.skip("every compiled SM family has a tuned Conv1D table")
+        shape = (1, 3000, 80, 384, 3, 1, 1, 1)
+        reset_heuristic_stats()
+        assert select_default_conv1d_config(*shape, torch.float16, sm) is CONV2D_DEFAULT
+        assert heuristic_inactive() == {sm: 1}
+        reset_heuristic_stats()
+        select_default_conv1d_config(*shape, torch.float16, 120)
+        assert not heuristic_inactive()
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_sm120_paraformer_activation_tactic_is_compiled(self, dtype):
