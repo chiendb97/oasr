@@ -60,25 +60,34 @@ class CutlassConv2dConfig:
 
 @dataclass(frozen=True)
 class CutlassConv2dConfigSm90:
-    """CUTLASS 3.x Conv2D config for SM90, SM100, and SM120.
+    """CUTLASS 3.x implicit-GEMM Conv2D config for SM90 and SM100.
 
-    Mirrors ``CutlassGemmConfigSm90`` field-for-field.  Omitted GEMM-only
-    fields: ``is_dynamic_persistent``, ``swap_ab``, ``max_swizzle_size``,
-    ``use_tma_gather`` (no Conv2D equivalents).  No ``cluster_k`` — CK is
-    always 1 for implicit-GEMM convolution and is hardcoded in the C++ struct.
+    Deliberately **not** a field-for-field mirror of ``CutlassGemmConfigSm90``.
+    It used to be, and two of the borrowed fields were the reason no Conv2D
+    kernel compiled on Hopper or datacenter Blackwell:
+
+    * ``pingpong`` — conv has no persistent schedule on SM90. The tags exist but
+      ``conv/dispatch_policy.hpp`` static_asserts on them, and CUTLASS's own
+      auto-selector has the cooperative branch commented out. Enumerating the
+      axis produced two identically-scheduled kernels under different names.
+    * ``kSMs`` — GEMM doubles the M tile for a 2-SM SM100 atom. Conv does not:
+      ``BM`` *is* the MMA tile M, and the 2-SM atom is chosen from the cluster.
+      ``BM * 2`` trips "Invalid TileShape_M." (see :func:`_sm100_conv_tile_ok`).
+
+    Omitted GEMM-only fields: ``is_dynamic_persistent``, ``swap_ab``,
+    ``max_swizzle_size``, ``use_tma_gather``. No ``cluster_k`` — CK is always 1
+    for implicit-GEMM convolution and is hardcoded in the C++ struct.
 
     Conv2D has no runtime-only parameters, so ``name == compile_name``.
     """
 
     tile_m: int
     tile_n: int
-    tile_k: int  # 128 for SM90/SM120 (WGMMA width), matching GEMM
+    tile_k: int  # the implicit-GEMM K tile (the filter's C extent)
     cluster_m: int
     cluster_n: int
-    pingpong: bool  # True = Pingpong, False = Cooperative (SM90/SM120)
-    kSMs: int  # 1 or 2 (SM100 only; always 1 for SM90/SM120)
     kStages: int
-    kSmVersion: int  # 90, 100, or 120
+    kSmVersion: int  # 90 or 100
 
     @property
     def name(self) -> str:
@@ -89,9 +98,7 @@ class CutlassConv2dConfigSm90:
         parts = [f"sm{self.kSmVersion}"]
         parts.append(f"b{self.tile_m}x{self.tile_n}x{self.tile_k}")
         parts.append(f"c{self.cluster_m}x{self.cluster_n}")
-        parts.append(f"k{self.kSMs}")
         parts.append(f"s{self.kStages}")
-        parts.append("pp" if self.pingpong else "coop")
         return "_".join(parts)
 
     def to_tactic_config(self) -> Tuple[Tuple[str, int], ...]:
@@ -101,8 +108,6 @@ class CutlassConv2dConfigSm90:
             ("tile_k", self.tile_k),
             ("cluster_m", self.cluster_m),
             ("cluster_n", self.cluster_n),
-            ("pingpong", int(self.pingpong)),
-            ("kSMs", self.kSMs),
             ("kStages", self.kStages),
         )
 
@@ -173,85 +178,105 @@ def _get_sm89_conv2d_configs(sm: int) -> Dict[str, CutlassConv2dConfig]:
 # SM90+ Conv2D tile and cluster choices mirror the corresponding GEMM schedules.
 
 
+#: One pipeline stage of the conv mainloop costs ``(BM + BN) * BK * dtype_bytes``
+#: bytes of shared memory, and ``StageCountAutoCarveout`` has to fit **two** of
+#: them plus the epilogue into Hopper's 227 KiB.  Measured by compiling the full
+#: M x N x cluster grid for sm_90a: every tile at or below this builds, and the
+#: next rung up (114,688 B, e.g. 256x192x128 or 192x256x128) fails with
+#: "Specialization requires Stages set to value 1 or more" — the carveout leaves
+#: no room for even one stage.  Stated as a budget rather than a tile list
+#: because one unbuildable variant fails the whole JIT module, not just its own
+#: tactic, so the space must be derived and not remembered.
+_SM90_CONV_SMEM_PER_STAGE_MAX = 106_496
+
+
+def _sm90_conv_tile_ok(tile_m: int, tile_n: int, tile_k: int, dtype_bytes: int = 2) -> bool:
+    """Can SM90's conv mainloop pipeline this tile at all?"""
+    return (tile_m + tile_n) * tile_k * dtype_bytes <= _SM90_CONV_SMEM_PER_STAGE_MAX
+
+
+def _sm100_conv_tile_ok(tile_m: int, cluster_m: int) -> bool:
+    """SM100 pairs a 256-row MMA tile only with the 2-SM atom.
+
+    The atom is selected from the *cluster*, so a 256-row tile needs
+    ``cluster_m == 2``; anything else is "Invalid TileShape_M."  Verified across
+    the full M x N x cluster grid for sm_100a — M of 64 and 128 take every
+    cluster, M of 256 takes only ``cluster_m == 2``.
+    """
+    return tile_m < 256 or cluster_m == 2
+
+
 def _get_sm90_conv2d_configs(sm: int) -> Dict[str, CutlassConv2dConfigSm90]:
-    """SM90 configs following GEMM's ``_get_sm90_configs()`` pattern."""
+    """SM90 (Hopper) conv configs.
+
+    No pingpong/cooperative axis: conv has one schedule on SM90 and the config
+    struct no longer carries the flag.  The M x N space is the GEMM tile ladder
+    filtered by :func:`_sm90_conv_tile_ok`.
+    """
     tile_k = 128
     kStages = 3
 
-    tile_mn_coop = [
-        (256, 128),
-        (256, 160),
-        (256, 192),
-        (256, 208),
-        (128, 224),
-        (128, 256),
-    ]
-    tile_mn_pingpong = [
-        (128, 128),
-        (128, 160),
-        (128, 192),
-        (128, 208),
-        (192, 128),
-    ]
-    tile_mn_vals = [(m, n, False) for m, n in tile_mn_coop] + [
-        (m, n, True) for m, n in tile_mn_pingpong
-    ]
-    cluster_vals = [(1, 2), (2, 1)]
+    # A starter ladder, not a tuned one: nothing has measured conv tile choice on
+    # Hopper, so this spans the M range at two N widths rather than pretending to
+    # a fitted optimum.  Deliberately close to the GEMM SM90 space in size (16
+    # variants) -- each CUTLASS 3.x conv translation unit peaks around 3.7 GB in
+    # `cicc`, and ninja defaults to nproc-way parallelism, so a wide space is a
+    # first-call OOM on a memory-limited box, not just a slow build.  Widen it
+    # from a measurement, and record the measurement in `.artifacts/`.
+    tile_m_vals = [64, 128, 256]
+    tile_n_vals = [128, 256]
+    cluster_vals = [(1, 1), (1, 2), (2, 1)]
 
     seen: Dict[str, CutlassConv2dConfigSm90] = {}
-    for (tile_m, tile_n, pingpong), (cluster_m, cluster_n) in itertools.product(
-        tile_mn_vals, cluster_vals
+    for (tile_m, tile_n), (cluster_m, cluster_n) in itertools.product(
+        itertools.product(tile_m_vals, tile_n_vals), cluster_vals
     ):
+        if not _sm90_conv_tile_ok(tile_m, tile_n, tile_k):
+            continue
         cfg = CutlassConv2dConfigSm90(
             tile_m=tile_m,
             tile_n=tile_n,
             tile_k=tile_k,
             cluster_m=cluster_m,
             cluster_n=cluster_n,
-            pingpong=pingpong,
-            kSMs=1,
             kStages=kStages,
             kSmVersion=sm,
         )
-        key = cfg.compile_name
-        if key not in seen:
-            seen[key] = cfg
+        seen[cfg.compile_name] = cfg
     return seen
 
 
 def _get_sm100_conv2d_configs(sm: int) -> Dict[str, CutlassConv2dConfigSm90]:
-    """SM100 configs following GEMM's ``_get_sm100_configs()`` pattern."""
-    tile_k = 128
+    """SM100 (Blackwell data-center) conv configs.
+
+    ``tile_m`` is the MMA tile M as the builder sees it — never scaled by a
+    co-operating-SM count.  A 256-row tile is admissible only alongside
+    ``cluster_m == 2``; see :func:`_sm100_conv_tile_ok`.
+    """
+    tile_k = 64
     kStages = 3
 
-    tile_n_vals = [64, 128, 160, 192, 224, 256]
-    tile_mn_cluster_vals = (
-        [(128, n, (1, 1)) for n in tile_n_vals]
-        + [(128, n, (1, 2)) for n in tile_n_vals]
-        + [(128, n, (2, 1)) for n in tile_n_vals]
-        + [(128, n, (2, 2)) for n in tile_n_vals]
-        + [(256, n, (2, 1)) for n in tile_n_vals]
-        + [(256, n, (2, 2)) for n in tile_n_vals]
-        + [(256, 512, (2, 1))]
-    )
+    # Same caveat as SM90: unmeasured, and sized against the module's build cost.
+    tile_m_vals = [64, 128, 256]
+    tile_n_vals = [128, 256]
+    cluster_vals = [(1, 1), (1, 2), (2, 1), (2, 2)]
 
     seen: Dict[str, CutlassConv2dConfigSm90] = {}
-    for tile_m, tile_n, (cluster_m, cluster_n) in tile_mn_cluster_vals:
-        kSMs = 2 if cluster_m >= 2 else 1
+    for (tile_m, tile_n), (cluster_m, cluster_n) in itertools.product(
+        itertools.product(tile_m_vals, tile_n_vals), cluster_vals
+    ):
+        if not _sm100_conv_tile_ok(tile_m, cluster_m):
+            continue
         cfg = CutlassConv2dConfigSm90(
             tile_m=tile_m,
             tile_n=tile_n,
             tile_k=tile_k,
             cluster_m=cluster_m,
             cluster_n=cluster_n,
-            pingpong=False,
-            kSMs=kSMs,
             kStages=kStages,
             kSmVersion=sm,
         )
-        key = cfg.compile_name
-        if key not in seen:
-            seen[key] = cfg
+        seen[cfg.compile_name] = cfg
     return seen
 
 
@@ -322,14 +347,18 @@ if _sm < 90 or _sm == 120:
         kSmVersion=_sm,
     )
 else:
+    # It **must** be one of the variants the arch's generator emits: the module
+    # compiles exactly those and the functional API looks the default up by
+    # ``compile_name``, so a default outside the set raises ``AttributeError:
+    # Module has no function ...`` on the first un-tuned call.  SM90 and SM100
+    # differ in the K tile they are generated at, so the default does too;
+    # ``tests/kernels/test_jit.py`` enforces the invariant for both.
     CONV2D_DEFAULT = CutlassConv2dConfigSm90(
         tile_m=128,
         tile_n=128,
-        tile_k=128,
+        tile_k=128 if _sm == 90 else 64,
         cluster_m=1,
         cluster_n=1,
-        pingpong=False,
-        kSMs=1,
         kStages=3,
         kSmVersion=_sm,
     )
@@ -512,10 +541,8 @@ def _render_all_conv2d_variants() -> List:
                 tile_k=cfg.tile_k,
                 cluster_m=cfg.cluster_m,
                 cluster_n=cfg.cluster_n,
-                k_sms=cfg.kSMs,
                 stages=cfg.kStages,
                 sm_version=sm,
-                pingpong=cfg.pingpong,
                 with_activation=True,
             )
 

@@ -70,7 +70,7 @@ VecSize / block_size dispatch macros instead.
 | Kernel family | Mode | Config source | Source generation |
 |---|---|---|---|
 | GEMM, BMM, GroupGEMM | **jinja** | `cutlass_gemm_configs.h` | Jinja renders `.cu` with baked-in config |
-| Dense Conv1D / Conv2D | **jinja** | `cutlass_conv2d_configs.h` | Jinja renders `.cu` with baked-in config; each tactic exports strict BTC/KSC Conv1D and NHWC/KRSC Conv2D entry points |
+| Dense Conv1D / Conv2D | **jinja** | `cutlass_conv2d_configs.h` | Jinja renders `.cu` with baked-in config; each tactic exports strict BTC/KSC Conv1D and NHWC/KRSC Conv2D entry points. SM75–89 and SM120 use the CUTLASS 2.x implicit GEMM; SM90/SM100 use the 3.x `conv::CollectiveBuilder` — see [Conv2D on SM90/SM100](#conv2d-on-sm90--sm100) for why that config is *not* a copy of the GEMM one |
 | Depthwise / causal Conv1D | **dispatch** | `conv1d_dispatch.inc` | Direct compilation, VecSize macro |
 | Grouped / depthwise Conv2D | **direct** | `grouped_conv2d.cuh` | NHWC 3×3/7×7 specializations; bias and optional activation share the convolution launch |
 | Norm | **dispatch** | `norm_dispatch.inc` | Direct compilation, block/vec macro |
@@ -85,6 +85,33 @@ VecSize / block_size dispatch macros instead.
 
 SM targets default to 70, 75, 80, 86, 89, 90, 100, 120 in `CMakeLists.txt`;
 `setup.py` defaults to 70–90 only. Override either with `CUDA_ARCHITECTURES`.
+
+### Conv2D on SM90 / SM100
+
+The CUTLASS 3.x implicit-GEMM conv builder is close enough to the GEMM one to
+invite a copy, and far enough away that the copy does not compile. Four
+differences, each load-bearing:
+
+| | GEMM | Conv |
+|---|---|---|
+| K mode of `TileShape` | flat `Int<BK>` | **nested** `Shape<Int<BK>>` — implicit GEMM's K axis is the filter's (C, S, R) modes |
+| Mainloop schedule | pingpong / cooperative | `conv::KernelScheduleAuto`; SM90 conv has **one** schedule (CUTLASS's own auto-selector has the cooperative branch commented out, and `conv/dispatch_policy.hpp` `static_assert`s on the persistent tags) |
+| 2-SM SM100 atom | M tile doubled | M tile passed as-is; the atom comes from the **cluster**, and `BM * 2` is `"Invalid TileShape_M."` |
+| `Arguments` | leading `GemmUniversalMode` | the mode-less constructor — SM90's `ConvUniversal` inherits `GemmUniversal` and has the mode, SM100's does not |
+
+Two tile rules bound the space, both measured by compiling the grid rather than
+documented upstream, and both enforced as filters in `oasr/jit/conv.py` because
+a single unbuildable variant fails the whole JIT module:
+
+- **SM90** — `(BM + BN) * BK * 2 ≤ 106,496 B`. `StageCountAutoCarveout` has to fit
+  two stages plus the epilogue into Hopper's 227 KiB; above that it resolves to
+  zero stages and the build stops.
+- **SM100** — a 256-row tile requires `cluster_m == 2`.
+
+The tile ladders themselves are **unmeasured**: they span the M range at two N
+widths. They are also sized against build cost — each 3.x conv translation unit
+peaks near 3.7 GB in `cicc`, and `run_ninja` only bounds parallelism when
+`MAX_JOBS` is set.
 
 ### Recurrent execution paths
 
