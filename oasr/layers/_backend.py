@@ -40,6 +40,7 @@ Each one is also a standing argument for kernel work.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from collections import Counter
@@ -190,17 +191,25 @@ def policy_hits() -> Dict[str, int]:
 def reset_backend_stats() -> None:
     """Clear the counters (per-test isolation, per-benchmark accounting).
 
-    Includes the GEMM rule-miss table, so ``reset`` → run → report stays one call
-    now that :func:`format_gap_report` reports both.
+    Includes the GEMM rule-miss table and both shape-aware heuristics'
+    untuned-architecture counters, so ``reset`` → run → report stays one call for
+    everything :func:`format_gap_report` prints.
     """
     _GAP_HITS.clear()
     _POLICY_HITS.clear()
     _OUT_OF_SCOPE.clear()
     try:
         from oasr.jit.gemm import reset_rule_misses
+
+        reset_rule_misses()
     except Exception:  # noqa: BLE001
-        return
-    reset_rule_misses()
+        pass
+    try:
+        from oasr.jit.conv import reset_heuristic_stats
+
+        reset_heuristic_stats()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def format_gap_report() -> str:
@@ -231,15 +240,37 @@ def format_gap_report() -> str:
     # the layers import path (see the note at the top of ``oasr/functionals/gemm.py``).
     try:
         from oasr.jit.gemm import rule_misses
+
+        misses = rule_misses()
     except Exception:  # noqa: BLE001 — diagnostics must never break the caller
-        return "\n".join(lines)
-    misses = rule_misses()
+        misses = {}
     if misses:
         lines.append("  GEMM shapes with no tuned rule (ran on the fallback tile):")
         for (op, N, K), (calls, m_lo, m_hi) in sorted(misses.items(), key=lambda kv: -kv[1][0]):
             span = f"{m_lo}" if m_lo == m_hi else f"{m_lo}..{m_hi}"
             lines.append(f"    {op:<18} N={N:<6} K={K:<6} x{calls:<7} M={span}")
         lines.append("    tune with → scripts/tune_asr_gemm.py (see oasr/jit/gemm.py)")
+    # And a fourth thing, one level up from an untuned *width*: an untuned
+    # *architecture*, where the table is not consulted at all and every shape
+    # takes the fallback tile.  It reads as silence in every other counter --
+    # nothing was missing, nothing was chosen, no rule was missed -- which is
+    # why it is stated here rather than left to whoever notices the table is
+    # named for one SM.
+    inactive: Dict[str, Dict[int, int]] = {}
+    for label, module in (("GEMM", "oasr.jit.gemm"), ("Conv1D", "oasr.jit.conv")):
+        try:
+            mod = importlib.import_module(module)
+            counts = mod.heuristic_inactive()
+        except Exception:  # noqa: BLE001 — diagnostics must never break the caller
+            continue
+        if counts:
+            inactive[label] = counts
+    if inactive:
+        lines.append("  shape-aware tables not tuned for this GPU (every shape used the default):")
+        for label, counts in inactive.items():
+            for sm, calls in sorted(counts.items()):
+                lines.append(f"    {label:<18} sm{sm:<5} x{calls}")
+        lines.append("    tune this card with → scripts/tune_asr_gemm.py")
     return "\n".join(lines)
 
 

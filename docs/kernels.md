@@ -287,6 +287,31 @@ rule falls through to the fixed `GEMM_DEFAULT` tile; the fall-through is counted
 and reportable via `jit.gemm.rule_miss_report()` — which is both the coverage
 check and the shape list to feed the tuner.
 
+**And per architecture.** `jit.gemm._GEMM_HEURISTIC_RULES` maps an SM family to
+that family's table, and Conv1D's `jit.conv._CONV1D_HEURISTIC_RULES` does the
+same; the tuner already emits its literal named for the card it measured
+(`_GEMM_HEURISTIC_RULES_SM<sm>`), so tuning a second architecture is a paste plus
+a registry line, not an edit to the selector. Only **SM120** is measured today.
+
+An architecture with no table is not an error — `GEMM_DEFAULT` computes the right
+answer — but it is the largest gap the heuristic can have, because it is *every*
+shape rather than one width, and it is the one gap that used to be invisible: the
+arch fall-through returned before recording anything, so `rule_miss_report()`
+printed "every shape this process issued had a tuned rule" on a box that had
+never opened the table. It is now counted per architecture (not per shape, which
+would name every GEMM the process issued) and reported by both
+`rule_miss_report()` and `oasr.layers.format_gap_report()`:
+
+```
+GEMM heuristic inactive on sm80: no tuned rule table (tuned: sm120), so all 8
+shape lookup(s) used GEMM_DEFAULT. Tune this card with scripts/tune_asr_gemm.py.
+```
+
+Adding a table is a *measurement*. Rules that were reasoned about rather than
+timed have shipped a 4.6x regression and an empty transcript here; the entries a
+new table may name are held to its own architecture's emitted variant set by
+`tests/kernels/test_gemm_heuristic.py::TestPerArchRuleRegistry`.
+
 Three rules are structural rather than tuned:
 
 - **`GEMM_MIN_ROWS`** — a row floor below which CUTLASS's M-tiling leaves most of

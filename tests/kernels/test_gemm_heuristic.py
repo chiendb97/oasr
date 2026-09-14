@@ -15,13 +15,15 @@ import torch.nn.functional as F
 
 import oasr
 from oasr.functionals.gemm_torch import torch_bmm, torch_gemm, torch_gemm_activation
-from oasr.jit.core import _get_target_sm
+from oasr.jit.core import _TARGET_SMS, _get_target_sm
 from oasr.jit.gemm import (
+    _GEMM_HEURISTIC_RULES,
     GEMM_DEFAULT,
     CutlassGemmConfig,
     TileShape,
     _epilogue_covers_warp,
     get_unique_compile_configs,
+    heuristic_inactive,
     reset_rule_misses,
     rule_miss_report,
     rule_misses,
@@ -112,16 +114,16 @@ class TestSelectDefaultConfig:
         assert select_default_config("gemm", 64, 256, 2048, torch.float32, _SM) is GEMM_DEFAULT
 
     def test_fallback_other_arch(self):
-        # Rules are SM120-specific; any other arch falls back to the default.
+        # Only SM120 has a measured table today, so any other arch falls back to
+        # the default.  Which arches are tuned is ``_GEMM_HEURISTIC_RULES``, not
+        # a condition in the selector -- see TestPerArchRuleRegistry.
         assert select_default_config("gemm", 64, 256, 2048, torch.bfloat16, 80) is GEMM_DEFAULT
 
-    @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
     def test_thin_contract_routes_to_torch(self):
         # Thin FF/subsampling contract GEMMs at small M go to cuBLAS.
         assert select_default_config("gemm", 64, 256, 2048, torch.bfloat16, 120) == "torch"
         assert select_default_config("gemm", 64, 256, 4864, torch.bfloat16, 120) == "torch"
 
-    @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
     def test_small_m_avoids_large_default(self):
         # At small M the selector never wastes the 128-row default: with the
         # thin-N tiles in the candidate space, (256,256) goes to a small-tile
@@ -131,7 +133,6 @@ class TestSelectDefaultConfig:
             assert isinstance(cfg, CutlassGemmConfig)
             assert cfg.block_m < 128  # a tall-thin tile, not the 128-row default
 
-    @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
     @pytest.mark.parametrize("M", [64, 950, 1026, 1748, 2048, 4096, 7600])
     def test_zipformer_pointwise_contraction_uses_measured_thin_tile(self, M):
         """Zipformer's ConvNeXt pointwise contraction, at the M values it issues.
@@ -160,7 +161,6 @@ class TestSelectDefaultConfig:
             )
         ), f"M={M} selected {cfg.compile_name}, whose epilogue cannot address its tile"
 
-    @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
     def test_large_m_contract_avoids_default(self):
         # The deep-K thin contract GEMM (FF-down, N=256 K=2048) at large
         # offline M: the expanded candidate space (thin-N tiles + working
@@ -172,13 +172,21 @@ class TestSelectDefaultConfig:
             and choice.compile_name != GEMM_DEFAULT.compile_name
         )
 
-    @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
     def test_actionable_configs(self):
         """Every CUTLASS config the heuristic returns must be a compiled kernel.
 
         One test over the whole cross-product rather than 48 pytest nodes: each
         case is a dict lookup with no setup, so a node per case buys attribution
         that the assertion message already carries.
+
+        ``GEMM_DEFAULT`` is skipped alongside ``"torch"``, and for the same kind
+        of reason: both are sentinels resolved somewhere other than the table.
+        The tuner emits a literal ``GEMM_DEFAULT`` for a bucket that was not a
+        measured win, and that object is *this process's* default — built from
+        the running box's SM at import — not the queried arch's.  So on an A30
+        the SM120 table hands back an ``sm80_…`` config here, which is right at
+        dispatch time (production only ever queries its own arch) and meaningless
+        as a claim about SM120's compiled set.
         """
         ops = [("gemm", n, k) for (n, k) in _FF_CONV_SHAPES + _WHISPER_SHAPES]
         ops += [("gemm_activation", 2048, 256)]
@@ -186,7 +194,7 @@ class TestSelectDefaultConfig:
         for op, N, K in ops:
             for M in (16, 64, 256, 720, 2048, 16000):
                 cfg = select_default_config(op, M, N, K, torch.bfloat16, 120)
-                if cfg == "torch":
+                if cfg == "torch" or cfg is GEMM_DEFAULT:
                     continue
                 assert cfg.compile_name in compiled, f"{op} M={M} N={N} K={K}: {cfg.compile_name}"
 
@@ -200,7 +208,6 @@ class TestWhisperShapesAreCovered:
     coverage so the same hole cannot reopen unnoticed.
     """
 
-    @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
     @pytest.mark.parametrize("N,K", _WHISPER_SHAPES)
     def test_has_a_tuned_rule(self, N, K):
         reset_rule_misses()
@@ -211,7 +218,6 @@ class TestWhisperShapesAreCovered:
             f"through to GEMM_DEFAULT. Re-tune: scripts/tune_asr_gemm.py"
         )
 
-    @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
     @pytest.mark.parametrize("M", [1500, 3000])
     def test_small_m_ff_down_stays_off_the_cublas_branch(self, M):
         """``(384, 1536)`` at batch 1-2 must NOT route to cuBLAS, though cuBLAS is
@@ -255,7 +261,6 @@ class TestRuleMissReporting:
             select_default_config("gemm", M, 4242, 777, torch.bfloat16, 120)
         assert rule_misses() == {("gemm", 4242, 777): (3, 100, 5000)}
 
-    @pytest.mark.skipif(_SM != 120, reason="heuristic rules are SM120-specific")
     def test_a_tuned_shape_is_not_reported(self):
         reset_rule_misses()
         select_default_config("gemm", 720, 256, 2048, torch.bfloat16, 120)
@@ -263,12 +268,123 @@ class TestRuleMissReporting:
         assert "every shape" in rule_miss_report()
 
     def test_arch_and_dtype_fallthrough_is_not_a_miss(self):
-        """Reporting these would name every shape on any non-SM120 box, where the
-        table is not consulted at all — a property of the run, not of coverage."""
+        """Recording these as rule misses would name every shape on an untuned box,
+        where the table is not consulted at all — a property of the run, not of
+        coverage.  The arch one is still reported, one entry per architecture
+        rather than per shape; see TestPerArchRuleRegistry."""
         reset_rule_misses()
         select_default_config("gemm", 720, 256, 2048, torch.float32, 120)
         select_default_config("gemm", 720, 256, 2048, torch.bfloat16, 80)
         assert not rule_misses()
+        assert heuristic_inactive() == {80: 1}
+
+
+def _an_untuned_arch() -> int:
+    """A compiled SM family with no rule table, or skip.
+
+    Reads the registry rather than naming an arch, so the day somebody tunes a
+    second card these tests keep testing what they are about instead of
+    asserting something false about sm80.
+    """
+    for sm in _TARGET_SMS:
+        if sm not in _GEMM_HEURISTIC_RULES:
+            return sm
+    pytest.skip("every compiled SM family has a tuned rule table")
+
+
+class TestPerArchRuleRegistry:
+    """Which architectures are tuned is data, and an untuned one is *reported*.
+
+    ``select_default_config`` used to open with ``sm != 120``, which made two
+    things wrong at once.  Adding a second architecture meant editing dispatch
+    rather than pasting what the tuner already emits per arch
+    (``emit_rules`` writes ``_GEMM_HEURISTIC_RULES_SM<sm>``).  And the branch
+    returned *before* recording anything, so on the other five families
+    ``rule_miss_report()`` printed "every shape this process issued had a tuned
+    rule" while the table had never been opened — a counter reporting the
+    opposite of the truth, on the largest gap the heuristic can have.
+    """
+
+    def test_the_registry_keys_are_compiled_families(self):
+        """A key that is not a family ``_get_target_sm`` can return is dead data:
+        no production call would ever match it, and the arch it was meant for
+        would go on reporting itself untuned."""
+        assert set(_GEMM_HEURISTIC_RULES) <= set(_TARGET_SMS), (
+            f"rule tables registered for {sorted(set(_GEMM_HEURISTIC_RULES) - set(_TARGET_SMS))}, "
+            f"which _SM_FAMILY never resolves to"
+        )
+
+    def test_every_table_only_names_tiles_its_own_arch_compiles(self):
+        """The invariant that makes a second table safe to paste in.
+
+        A rule naming a config outside its arch's emitted set raises
+        ``AttributeError: Module has no function …`` on the first call that hits
+        it — at run time, on that architecture only, which is exactly the class
+        of defect nobody is holding hardware to catch.  Checked per registered
+        arch from any box, because both sides are pure functions of ``sm``.
+        """
+        for sm, table in _GEMM_HEURISTIC_RULES.items():
+            compiled = get_unique_compile_configs(sm)
+            for (op, N, K), entries in table.items():
+                for m_max, choice in entries:
+                    where = f"sm{sm} ({op}, {N}, {K}) m_max={m_max}"
+                    if choice == "torch":
+                        continue
+                    if choice == "fused":
+                        # The single-call fused launcher exists for the CTC head
+                        # only; _dispatch_gemm has no _PLAN_FUSED branch, so this
+                        # rule would silently do nothing anywhere else.
+                        assert op == "gemm_log_softmax", f'{where}: "fused" is not an op here'
+                        continue
+                    if choice is GEMM_DEFAULT:
+                        continue  # the sentinel; resolved against the running arch
+                    assert choice.kSmVersion == sm, (
+                        f"{where}: table is registered under sm{sm} but names a "
+                        f"kSmVersion={choice.kSmVersion} config"
+                    )
+                    assert (
+                        choice.compile_name in compiled
+                    ), f"{where}: {choice.compile_name} is not in sm{sm}'s emitted set"
+
+    def test_an_untuned_arch_is_counted_once_and_named(self):
+        sm = _an_untuned_arch()
+        reset_rule_misses()
+        for M in (64, 4096):
+            assert select_default_config("gemm", M, 256, 2048, torch.bfloat16, sm) is GEMM_DEFAULT
+        assert heuristic_inactive() == {sm: 2}
+        assert not rule_misses(), "an untuned arch is one gap, not one per shape"
+        text = rule_miss_report()
+        assert f"sm{sm}" in text and "inactive" in text
+        assert (
+            "every shape this process issued had a tuned rule" not in text
+        ), "the sentence this used to print on every non-SM120 box"
+        assert "tune_asr_gemm" in text, "the report must say what to do about it"
+
+    def test_a_tuned_arch_is_not_reported_inactive(self):
+        reset_rule_misses()
+        select_default_config("gemm", 720, 256, 2048, torch.bfloat16, 120)
+        assert not heuristic_inactive()
+
+    def test_fp32_on_an_untuned_arch_is_not_an_arch_gap(self):
+        """The counter means "this card has no table", not "this call missed".
+
+        fp32 takes the fallback on a *tuned* arch too, so counting it here would
+        make an architecture look untuned on the strength of a dtype decision.
+        """
+        sm = _an_untuned_arch()
+        reset_rule_misses()
+        select_default_config("gemm", 720, 256, 2048, torch.float32, sm)
+        assert not heuristic_inactive()
+
+    def test_the_report_still_separates_a_missing_width(self):
+        """Both gaps at once: the fix differs (tune a shape vs sweep a card), so
+        the report says both rather than collapsing them."""
+        sm = _an_untuned_arch()
+        reset_rule_misses()
+        select_default_config("gemm", 512, 4242, 777, torch.bfloat16, 120)
+        select_default_config("gemm", 512, 256, 2048, torch.bfloat16, sm)
+        text = rule_miss_report()
+        assert f"sm{sm}" in text and "4242" in text
 
 
 class TestProductionDispatch:

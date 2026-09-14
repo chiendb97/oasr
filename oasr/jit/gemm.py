@@ -1115,6 +1115,12 @@ GEMM_DEFAULT: Union[CutlassGemmConfig, CutlassGemmConfigSm90] = default_config_f
 # Keys are exact ``(op, N, K)`` tuples; values are ascending ``(m_max, choice)``
 # entries with an optional catch-all. Misses use ``GEMM_DEFAULT`` and are counted
 # by ``rule_miss_report()`` because rules do not transfer across model widths.
+#
+# One table per SM family, registered in ``_GEMM_HEURISTIC_RULES`` below.  The
+# tuner already emits this literal named for the arch it measured
+# (``emit_rules`` writes ``_GEMM_HEURISTIC_RULES_SM<sm>``), so a second
+# architecture is a paste plus one registry line -- not an edit to
+# ``select_default_config``.
 _GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
     # Thin-N contraction; a smaller tile avoids wasted columns.  Zipformer's
     # ConvNeXt pointwise contraction (384 -> 128), whose M is
@@ -2741,6 +2747,29 @@ _GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
     ],
 }
 
+#: Tuned rule tables by compiled SM family (``oasr.jit.core._SM_FAMILY``).
+#:
+#: The heuristic used to be gated on ``sm != 120`` in ``select_default_config``,
+#: which made "which architectures are tuned?" a control-flow question with one
+#: possible answer.  Here it is data, and the answer is this dict's keys.
+#:
+#: An architecture that is absent is neither an error nor a rule miss -- nobody
+#: has measured it, and ``GEMM_DEFAULT`` computes the right answer -- but it is
+#: not silence either: ``select_default_config`` counts the lookups in
+#: ``_ARCH_INACTIVE`` and ``rule_miss_report`` names the arch.  That matters
+#: because the fall-through is the *largest* gap the heuristic can have (every
+#: shape, not one width) and was the only invisible one: the report used to say
+#: "every shape this process issued had a tuned rule" on a box whose table was
+#: never consulted.
+#:
+#: Populating one is a measurement, not a guess.  Rules that were reasoned about
+#: rather than timed have shipped a 4.6x regression and an empty transcript in
+#: this file's history; ``scripts/tune_asr_gemm.py`` on the target card is the
+#: only supported way in.
+_GEMM_HEURISTIC_RULES: Dict[int, Dict[Tuple[str, int, int], list]] = {
+    120: _GEMM_HEURISTIC_RULES_SM120,
+}
+
 # Half-precision dtype strings the rules apply to (the kernels + SMEM budgets
 # assume 2-byte operands; fp32 keeps GEMM_DEFAULT).
 _HEURISTIC_DTYPES = ("torch.float16", "torch.bfloat16")
@@ -2772,15 +2801,38 @@ class _RuleMiss:
 #: of distinct GEMM shapes a model has, so this cannot grow with request count.
 _RULE_MISSES: Dict[Tuple[str, int, int], _RuleMiss] = {}
 
+#: SM family -> lookups that found no rule table for it at all.
+#:
+#: Deliberately *not* folded into ``_RULE_MISSES``: a missing table is one gap
+#: covering every shape, and recording it per ``(op, N, K)`` would name every
+#: GEMM the process issued and drown the widths that are genuinely untuned on a
+#: tuned arch.  One entry per architecture is the true cardinality of the fact.
+_ARCH_INACTIVE: Dict[int, int] = {}
+
 
 def rule_misses() -> Dict[Tuple[str, int, int], Tuple[int, int, int]]:
     """Untuned shapes this process asked about: ``(op, N, K) -> (calls, Mmin, Mmax)``."""
     return {k: (v.calls, v.m_min, v.m_max) for k, v in _RULE_MISSES.items()}
 
 
+def heuristic_inactive() -> Dict[int, int]:
+    """SM families this process asked about that have no rule table: ``sm -> calls``.
+
+    Empty is the good case *and* the uninteresting one: it also covers a process
+    that issued no half-precision GEMM at all.  Read it against
+    :data:`_GEMM_HEURISTIC_RULES`, which says which architectures are tuned.
+    """
+    return dict(_ARCH_INACTIVE)
+
+
 def reset_rule_misses() -> None:
-    """Clear the miss table (per-test isolation, per-benchmark accounting)."""
+    """Clear the miss tables (per-test isolation, per-benchmark accounting).
+
+    Covers the untuned-arch counter as well, so ``reset`` -> run -> report stays
+    one call for both halves of the coverage question.
+    """
     _RULE_MISSES.clear()
+    _ARCH_INACTIVE.clear()
 
 
 def rule_miss_report() -> str:
@@ -2796,12 +2848,30 @@ def rule_miss_report() -> str:
 
     Run a workload, print this, and the output is both the answer to "is this
     model covered?" and the shape list to feed ``scripts/tune_asr_gemm.py``.
+
+    Two kinds of gap, reported separately because the fix differs.  A *shape*
+    with no rule wants that shape tuned; an *architecture* with no table wants a
+    sweep.  The second used to be unreportable — the arch fall-through returned
+    before recording anything — so this function said "every shape this process
+    issued had a tuned rule" on every non-SM120 box, which is the opposite of
+    what happened there.
     """
     if not _HEURISTIC_ENABLED:
         return "GEMM heuristic disabled (OASR_GEMM_HEURISTIC=0) — every shape used GEMM_DEFAULT."
+    lines: List[str] = []
+    if _ARCH_INACTIVE:
+        tuned = ", ".join(f"sm{s}" for s in sorted(_GEMM_HEURISTIC_RULES)) or "none"
+        for sm_, calls in sorted(_ARCH_INACTIVE.items()):
+            lines.append(
+                f"GEMM heuristic inactive on sm{sm_}: no tuned rule table (tuned: {tuned}), so "
+                f"all {calls} shape lookup(s) used GEMM_DEFAULT. "
+                f"Tune this card with scripts/tune_asr_gemm.py."
+            )
     if not _RULE_MISSES:
+        if lines:
+            return "\n".join(lines)
         return "GEMM heuristic: every shape this process issued had a tuned rule."
-    lines = [
+    lines += [
         f"GEMM heuristic: {len(_RULE_MISSES)} shape(s) had no tuned rule and used "
         f"GEMM_DEFAULT (tune with scripts/tune_asr_gemm.py):",
         f"    {'op':<18} {'N':>7} {'K':>7} {'calls':>8} {'M range':>19}",
@@ -2820,17 +2890,27 @@ def select_default_config(op: str, M: int, N: int, K: int, dtype, sm: int):
     ``"torch"`` (dispatch to cuBLAS), the string ``"fused"`` (the single-call
     fused CUTLASS launcher — ``gemm_log_softmax`` only), or
     :data:`GEMM_DEFAULT`.  Pure function of the shape, so it is CUDA-graph
-    safe (same choice on every capture/replay).  Unknown ops/shapes,
-    non-SM120 arches, and non-half dtypes fall back to ``GEMM_DEFAULT`` — i.e.
+    safe (same choice on every capture/replay).  Unknown ops/shapes, untuned
+    arches, and non-half dtypes fall back to ``GEMM_DEFAULT`` — i.e.
     byte-identical to the previous fixed behaviour.
 
-    A shape with no rule is recorded in :func:`rule_miss_report`.  Only the
-    *arch/dtype* fall-throughs above are left uncounted: those are properties of
-    the run, not of the table, and would report every shape on an SM80 box.
+    Which architectures are tuned is :data:`_GEMM_HEURISTIC_RULES`, not a
+    condition here.  Both fall-throughs are counted, at the cardinality of the
+    fact each one is: a shape with no rule in :func:`rule_misses`, an arch with
+    no table in :func:`heuristic_inactive`.
+
+    The dtype gate is checked first on purpose.  An fp32 lookup would take the
+    fallback on a *tuned* arch too, so counting it as an untuned-architecture
+    gap would overstate one — the counter means "this card has no table", not
+    "this call missed".
     """
-    if not _HEURISTIC_ENABLED or sm != 120 or str(dtype) not in _HEURISTIC_DTYPES:
+    if not _HEURISTIC_ENABLED or str(dtype) not in _HEURISTIC_DTYPES:
         return GEMM_DEFAULT
-    rules = _GEMM_HEURISTIC_RULES_SM120.get((op, int(N), int(K)))
+    table = _GEMM_HEURISTIC_RULES.get(int(sm))
+    if table is None:
+        _ARCH_INACTIVE[int(sm)] = _ARCH_INACTIVE.get(int(sm), 0) + 1
+        return GEMM_DEFAULT
+    rules = table.get((op, int(N), int(K)))
     if rules is None:
         key = (op, int(N), int(K))
         st = _RULE_MISSES.get(key)
