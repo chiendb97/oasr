@@ -567,14 +567,25 @@ class TestRingDepthFitsSmem:
 
     @staticmethod
     def _cls(arch_str: str):
-        cutlass = pytest.importorskip("cutlass")
-        from oasr.kernels.cute.attention.fmha_sm80 import FmhaSm80
-        from oasr.kernels.cute.attention.fmha_sm120 import FmhaSm120
+        """The backend an arch resolves to, asked the way production asks.
 
-        del cutlass
-        return {"sm_80": FmhaSm80, "sm_120": FmhaSm120}[arch_str]
+        Through ``pick_arch_cls`` rather than by importing a class directly:
+        the arch → class mapping is half of what this file is testing, and a
+        hand-built dict here would have kept passing while sm_86 and sm_89 were
+        silently served the A100-budgeted :class:`FmhaSm80`.
+        """
+        pytest.importorskip("cutlass")
+        from oasr.kernels.cute.attention.base import pick_arch_cls
 
-    @pytest.mark.parametrize("arch_str", ["sm_80", "sm_120"])
+        sm = int(arch_str.removeprefix("sm_"))
+        return pick_arch_cls(sm // 10, sm % 10)
+
+    #: Every arch ``pick_arch_cls`` serves.  sm_86 / sm_89 were absent here
+    #: while the class they resolved to claimed sm_80's budget, which is
+    #: precisely why the over-budget ring was never seen.
+    ARCH_STRS = ["sm_80", "sm_86", "sm_89", "sm_120"]
+
+    @pytest.mark.parametrize("arch_str", ARCH_STRS)
     @pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
     def test_selected_ring_fits(self, arch_str, head_dim):
         cls = self._cls(arch_str)
@@ -656,6 +667,154 @@ class TestRingDepthFitsSmem:
         ref = _ref_fmha(q, k, v, scale, cache_seqlens=lens)
         assert not torch.isnan(out).any()
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+class TestEveryArchBudgetsItsOwnSmem:
+    """A backend must budget the shared memory of the arch it is serving.
+
+    ``pick_arch_cls`` used to return :class:`FmhaSm80` for sm_80, sm_86 **and**
+    sm_89, and ``FmhaSm80`` asked CuTeDSL for the capacity of the string
+    ``"sm_80"`` -- 166 912 B.  An A10G, an A40, an L4, an L40S and an RTX 4090
+    all cap a block at 101 376 B.  So on those five parts ``can_implement``
+    approved head_dim 128 at a 3-deep ring needing 114 688 B, ``Attention``
+    left SDPA for it because ``fmha_config_supported`` asks the same
+    ``can_implement``, and the launch failed -- ``oasr.fmha`` has no
+    ``try/except`` around the CuteDSL call, only a dtype/backend branch.
+    Paraformer's ``d_k=128`` SANM attention is the first shipped model there.
+
+    These run without a GPU: the budget is a per-class property, which is the
+    whole reason a box with one arch in it can hold the line for four.
+    """
+
+    #: ``(compute capability, SM)`` for every arch ``pick_arch_cls`` serves.
+    SUPPORTED = (((8, 0), 80), ((8, 6), 86), ((8, 9), 89), ((12, 0), 120))
+
+    @staticmethod
+    def _pick(cap):
+        pytest.importorskip("cutlass")
+        from oasr.kernels.cute.attention.base import pick_arch_cls
+
+        return pick_arch_cls(*cap)
+
+    @staticmethod
+    def _device_capacity(sm: int) -> int:
+        """What the hardware actually offers, straight from CuTeDSL's table."""
+        import cutlass.utils as cutlass_utils
+
+        return cutlass_utils.get_smem_capacity_in_bytes(f"sm_{sm}")
+
+    @pytest.mark.parametrize("cap,sm", SUPPORTED)
+    def test_the_class_for_an_sm_declares_that_sm(self, cap, sm):
+        """The one-line invariant that was violated.
+
+        A shared kernel body is fine; a shared *identity* is not, because the
+        class is also what answers the budget.
+        """
+        cls = self._pick(cap)
+        assert cls.arch == sm, (
+            f"pick_arch_cls{cap} returned {cls.__name__} (arch={cls.arch}); a class that "
+            f"answers for an SM it does not name budgets that SM's shared memory wrong"
+        )
+
+    @pytest.mark.parametrize("cap,sm", SUPPORTED)
+    def test_the_budget_never_exceeds_the_hardware(self, cap, sm):
+        cls = self._pick(cap)
+        assert cls._smem_capacity_in_bytes() <= self._device_capacity(sm), (
+            f"sm_{sm} is budgeted {cls._smem_capacity_in_bytes()} B via {cls.__name__}, "
+            f"but the part offers {self._device_capacity(sm)} B"
+        )
+
+    @pytest.mark.parametrize("cap,sm", SUPPORTED)
+    @pytest.mark.parametrize("head_dim", [32, 64, 72, 128, 192, 256])
+    def test_no_arch_approves_a_ring_it_cannot_launch(self, cap, sm, head_dim):
+        """The consequence, stated end to end.
+
+        ``can_implement`` is what ``fmha_config_supported`` -- and therefore
+        ``oasr.layers.Attention`` -- routes on, so an approval that does not fit
+        the device is not a missed optimisation, it is a failed launch.
+        """
+        cutlass = pytest.importorskip("cutlass")
+        cls = self._pick(cap)
+        if not cls.can_implement(dtype=cutlass.Float16, head_dim=head_dim):
+            return  # a declared refusal; KERNEL_GAPS["fmha-head-dim"] owns those
+        n_block, stages = cls.select_tile(head_dim=head_dim)
+        assert n_block and stages, "can_implement said yes but select_tile found no tile"
+        need = cls.smem_bytes(
+            head_dim=head_dim, m_block_size=64, n_block_size=n_block, num_stages=stages
+        )
+        assert need <= self._device_capacity(sm), (
+            f"sm_{sm} head_dim={head_dim}: {cls.__name__} approves a {n_block}x{stages} "
+            f"ring needing {need} B against the part's {self._device_capacity(sm)} B"
+        )
+
+    def test_head_dim_128_is_available_on_every_arch(self):
+        """Paraformer's SANM width, which is why this matters at all.
+
+        It must be *implementable* everywhere -- the fix is a shallower ring on
+        the 99 KB parts, not a refusal -- and the deep ring must survive where
+        there is room for it, so the budget is not merely clamped to the
+        smallest arch.
+        """
+        cutlass = pytest.importorskip("cutlass")
+        for cap, sm in self.SUPPORTED:
+            cls = self._pick(cap)
+            assert cls.can_implement(dtype=cutlass.Float16, head_dim=128), f"sm_{sm}"
+            stages = cls.select_num_stages(head_dim=128)
+            assert stages == (3 if sm == 80 else 2), f"sm_{sm} chose a {stages}-deep ring"
+
+    def test_the_99kb_parts_agree_with_each_other(self):
+        """sm_86, sm_89 and sm_120 share a cap, so they must share every answer.
+
+        Stated separately from the numbers above because it is the cheap check
+        that catches a new arch class copied from the wrong parent.
+        """
+        cutlass = pytest.importorskip("cutlass")
+        classes = [self._pick(cap) for cap, sm in self.SUPPORTED if sm != 80]
+        budgets = {c._smem_capacity_in_bytes() for c in classes}
+        assert len(budgets) == 1, f"99 KB parts disagree on the budget: {budgets}"
+        for head_dim in (32, 64, 128, 192, 256):
+            tiles = {c.select_tile(head_dim=head_dim) for c in classes}
+            assert len(tiles) == 1, f"head_dim={head_dim}: {tiles}"
+            implementable = {
+                c.can_implement(dtype=cutlass.Float16, head_dim=head_dim) for c in classes
+            }
+            assert len(implementable) == 1
+
+    def test_the_budget_leaves_the_driver_its_reserve(self):
+        """The driver takes a slice of every block's smem before the kernel does.
+
+        Budgeting against the architectural maximum is how the recurrent step's
+        ``num_stages=5`` configs cleared ``can_implement`` and then died at
+        launch with an empty error; the gated MLP and the recurrent step both
+        carry the same 1 KB reserve. FMHA did not, so a tile landing in that
+        last kilobyte would have been approved and then failed.
+        """
+        from oasr.kernels.cute.attention.fmha_sm80 import _DRIVER_SMEM_RESERVE
+
+        assert _DRIVER_SMEM_RESERVE > 0
+        for cap, sm in self.SUPPORTED:
+            cls = self._pick(cap)
+            assert (
+                cls._smem_capacity_in_bytes() == self._device_capacity(sm) - _DRIVER_SMEM_RESERVE
+            ), f"sm_{sm}"
+
+    def test_the_arch_string_is_derived_not_written(self):
+        """Why the thin subclasses are safe.
+
+        ``FmhaSm120`` used to set ``arch`` *and* ``_smem_arch_str``; setting one
+        and forgetting the other is exactly the shape of this bug, so the second
+        is now a function of the first and cannot disagree with it.
+        """
+        from oasr.kernels.cute.attention.fmha_sm80 import FmhaSm80
+
+        base = FmhaSm80._smem_arch_str.__func__
+        for cap, sm in self.SUPPORTED:
+            cls = self._pick(cap)
+            assert cls._smem_arch_str() == f"sm_{sm}"
+            assert cls._smem_arch_str.__func__ is base, (
+                f"{cls.__name__} overrides _smem_arch_str; set only `arch` so the two "
+                f"cannot drift apart"
+            )
 
 
 class TestCausal:

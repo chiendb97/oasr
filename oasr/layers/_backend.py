@@ -92,16 +92,20 @@ KERNEL_GAPS: Dict[str, KernelGap] = {
         KernelGap(
             id="fmha-head-dim",
             what=(
-                "a head_dim so large that even a single-stage cp.async ring "
-                "overflows shared memory (>256 on a 99 KB arch)"
+                "a head_dim so large that even the narrowest K tile at the "
+                "shallowest ring overflows shared memory: >384 on a 99 KB arch "
+                "(sm_86 / sm_89 / sm_120), >640 on sm_80's 163 KB"
             ),
             fix=(
-                "kernel: a smaller n_block for very wide heads, which would trade "
-                "occupancy for the tile. head_dim 128 used to land here and no "
-                "longer does — the ring depth is now sized to the arch's smem "
-                "budget instead of hardcoded (FmhaSm80.select_num_stages), which "
-                "is what stranded Paraformer's d_k=128 SANM attention on SDPA. No "
-                "in-tree model reaches the remaining limit"
+                "kernel: an M tile below 64, which is the axis select_tile "
+                "cannot search (can_implement needs (m_block * 2) % num_threads "
+                "== 0). head_dim 128 used to land here and no longer does — the "
+                "ring depth is sized to the budget of the arch actually running "
+                "(FmhaSm80.select_num_stages via pick_arch_cls's per-SM class), "
+                "which is what stranded Paraformer's d_k=128 SANM attention on "
+                "SDPA. The boundary is per-arch because the budget is; quoting "
+                "one number for all of them is what hid sm_86/sm_89 being "
+                "budgeted with sm_80's. No in-tree model reaches either limit"
             ),
         ),
         KernelGap(
