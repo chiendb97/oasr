@@ -39,6 +39,7 @@
     #pragma GCC diagnostic pop
 #endif
 
+#include <oasr/common/arch_dispatch.h>
 #include <oasr/common/epilogue_functors.h>
 #include <oasr/common/graph_safe_workspace.h>
 #include <oasr/common/utils.h>
@@ -75,8 +76,22 @@ struct CutlassConv2dFpropKernelSm90 {
     using TileShape = typename CutlassConv2dConfig::TileShape;
     using ClusterShape = typename CutlassConv2dConfig::ClusterShape;
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
-    using KernelSchedule = typename CutlassConv2dConfig::MainloopSchedule;
-    using EpilogueSchedule = typename CutlassConv2dConfig::EpilogueSchedule;
+
+    // Named here rather than in the config struct because these tags live in the
+    // *builder* headers, which only this file includes -- the config header is
+    // also pulled in by the CUTLASS 2.x lane (sm_75 … sm_89, sm_120) and must
+    // not drag SM90 collectives into those translation units.
+    //
+    // `KernelScheduleAuto` rather than an explicit tag: on SM90 it is the only
+    // schedule conv has (see the config header), and on SM100 it is what picks
+    // the 1-SM or 2-SM UMMA atom from the cluster shape.  Naming a tag by hand
+    // is how this path came to be passing *GEMM* schedules to a conv builder
+    // that is enable_if'd on the conv ones.
+    using KernelSchedule = cutlass::conv::collective::KernelScheduleAuto;
+    using EpilogueSchedule =
+        cute::conditional_t<CutlassConv2dConfig::SmVersion == 90,
+                            cutlass::epilogue::TmaWarpSpecialized,
+                            cutlass::epilogue::collective::EpilogueScheduleAuto>;
 
     // 2D conv fprop problem shape
     using ProblemShape = cutlass::conv::ConvProblemShape<cutlass::conv::Operator::kFprop, 2>;
@@ -162,8 +177,19 @@ struct CutlassConv2dFpropKernelSm90 {
             stride_D        // dD
         };
 
-        typename Conv::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGemm, problem_shape,
-                                           mainloop_args, epilogue_args};
+        // The mode-less constructor.  SM90's ConvUniversal *inherits* GemmUniversal
+        // and so carries a leading `GemmUniversalMode`; SM100's declares its own
+        // Arguments without one.  CUTLASS provides this overload on the GEMM side
+        // precisely so conv can be spelled the same way on both ("This allows us
+        // to set GemmUniversal mode as kGemm for Conv right away"), and it is what
+        // CUTLASS's own shared conv testbed uses.  Passing the mode explicitly
+        // compiles on SM90 and fails on SM100.
+        //
+        // hw_info is populated rather than defaulted: left at zero the persistent
+        // tile scheduler warns and queries the SM count on *every* launch.
+        cutlass::KernelHardwareInfo hw_info;
+        hw_info.sm_count = oasr::getDeviceMultiProcessorCount();
+        typename Conv::Arguments arguments{problem_shape, mainloop_args, epilogue_args, hw_info};
 
         Conv conv_op;
 

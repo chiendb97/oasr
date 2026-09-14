@@ -454,3 +454,127 @@ class TestCutlass2xArchTagIsInstantiable:
                 n.startswith(f"sm{sm}_") for n in names
             ), f"sm{sm} config names are not arch-keyed"
         assert set(get_unique_compile_configs(86)) != set(get_unique_compile_configs(80))
+
+
+# ---------------------------------------------------------------------------
+# The CUTLASS 3.x Conv2D config space
+# ---------------------------------------------------------------------------
+
+
+class TestConv3xConfigSpaceIsBuildable:
+    """Conv is not GEMM, and this config space used to assume it was.
+
+    ``CutlassConv2dConfigSm90`` was written as a field-for-field mirror of
+    ``CutlassGemmConfigSm90``, and three of the borrowed decisions meant **no**
+    dense Conv2D kernel compiled on sm_90 or sm_100 — the whole JIT module, 205
+    errors, on every H100 / H200 / B200 / GB200:
+
+    * the mainloop got GEMM's schedule tags, but ``conv``'s ``CollectiveBuilder``
+      is ``enable_if``'d on ``conv::KernelImplicitTmaWarpSpecialized*``;
+    * the K mode was flat, but implicit GEMM's K axis is the filter's (C, S, R)
+      modes, so the builder wants a nested ``Shape<Int<BK>>``;
+    * the M tile was scaled by a co-operating-SM count, which SM100 rejects
+      outright ("Invalid TileShape_M.") — the 2-SM atom comes from the cluster.
+
+    None of that is visible from Python, so these tests hold the two *shape*
+    rules that bound the emitted space, and the arch-agnostic invariants that
+    let a CPU box speak for a GPU it does not have. The C++ side is gated by
+    compiling the rendered TUs; see ``.artifacts/arch_portability_audit.md`` § A2.
+    """
+
+    #: The two CUTLASS 3.x conv targets.
+    TARGETS = (90, 100)
+
+    def test_the_default_is_a_config_that_gets_compiled(self):
+        """Per arch, because SM90 and SM100 are generated at different K tiles.
+
+        The module compiles exactly what the generator emits and the functional
+        API looks the default up by ``compile_name``, so a default outside the
+        set is an ``AttributeError`` on the first un-tuned call — the same
+        invariant ``default_config_for_sm`` carries on the GEMM side.
+        """
+        from oasr.jit.conv import CutlassConv2dConfigSm90, get_unique_conv2d_compile_configs
+
+        for sm in self.TARGETS:
+            default = CutlassConv2dConfigSm90(
+                tile_m=128,
+                tile_n=128,
+                tile_k=128 if sm == 90 else 64,
+                cluster_m=1,
+                cluster_n=1,
+                kStages=3,
+                kSmVersion=sm,
+            )
+            built = get_unique_conv2d_compile_configs(sm)
+            assert default.compile_name in built, (
+                f"sm{sm}: CONV2D_DEFAULT {default.compile_name} is not in the "
+                f"{len(built)} configs the module compiles"
+            )
+
+    def test_sm90_tiles_fit_the_mainloop_pipeline(self):
+        """One stage has to fit, or ``StageCountAutoCarveout`` resolves to zero.
+
+        The failure is ``"Specialization requires Stages set to value 1 or more"``
+        at compile time, and one unbuildable variant fails the whole module — so
+        the budget is a filter on the space, not a note.
+        """
+        from oasr.jit.conv import _sm90_conv_tile_ok, get_unique_conv2d_compile_configs
+
+        for cfg in get_unique_conv2d_compile_configs(90).values():
+            assert _sm90_conv_tile_ok(cfg.tile_m, cfg.tile_n, cfg.tile_k), cfg.compile_name
+
+        # …and the predicate is the measured boundary, not a guess: 106,496 B
+        # builds and the next rung (114,688 B) does not.
+        assert _sm90_conv_tile_ok(256, 160, 128) and not _sm90_conv_tile_ok(256, 192, 128)
+        assert _sm90_conv_tile_ok(192, 224, 128) and not _sm90_conv_tile_ok(192, 256, 128)
+
+    def test_sm100_pairs_a_256_row_tile_only_with_the_2sm_atom(self):
+        from oasr.jit.conv import _sm100_conv_tile_ok, get_unique_conv2d_compile_configs
+
+        for cfg in get_unique_conv2d_compile_configs(100).values():
+            assert _sm100_conv_tile_ok(cfg.tile_m, cfg.cluster_m), cfg.compile_name
+
+        assert _sm100_conv_tile_ok(256, 2) and not _sm100_conv_tile_ok(256, 1)
+        assert _sm100_conv_tile_ok(128, 1) and _sm100_conv_tile_ok(64, 1)
+
+    def test_the_config_carries_no_gemm_only_axis(self):
+        """``pingpong`` and ``kSMs`` are gone, and must stay gone.
+
+        Both were inert-looking mirrors of the GEMM config. ``pingpong`` doubled
+        the emitted kernel count with a schedule conv does not have on SM90;
+        ``kSMs`` silently doubled the M tile into a shape SM100 refuses. A field
+        that encodes something the kernel cannot express is not harmless.
+        """
+        from oasr.jit.conv import CutlassConv2dConfigSm90
+
+        fields = set(CutlassConv2dConfigSm90.__dataclass_fields__)
+        assert not (fields & {"pingpong", "kSMs"}), f"GEMM-only axis is back: {fields}"
+
+    def test_every_emitted_config_has_a_unique_arch_keyed_name(self):
+        """Two configs under one name would silently compile one kernel twice.
+
+        Dropping ``pingpong`` removed it from ``compile_name`` too, so this is
+        the check that the remaining fields still separate every variant.
+        """
+        from oasr.jit.conv import get_unique_conv2d_compile_configs
+
+        for sm in self.TARGETS:
+            cfgs = get_unique_conv2d_compile_configs(sm)
+            assert cfgs, f"sm{sm} emitted nothing"
+            assert all(n.startswith(f"sm{sm}_") for n in cfgs), f"sm{sm} names are not arch-keyed"
+            rebuilt = {c.compile_name for c in cfgs.values()}
+            assert len(rebuilt) == len(cfgs)
+
+    def test_the_space_stays_within_the_module_build_budget(self):
+        """A wide 3.x space is a first-call OOM, not merely a slow build.
+
+        Each CUTLASS 3.x conv translation unit peaks near 3.7 GB in ``cicc`` and
+        ninja defaults to nproc-way parallelism, so the emitted count is a
+        resource decision. Held near the GEMM SM90 space (16) rather than left
+        to grow silently; raise it from a measurement.
+        """
+        from oasr.jit.conv import get_unique_conv2d_compile_configs
+
+        for sm in self.TARGETS:
+            n = len(get_unique_conv2d_compile_configs(sm))
+            assert n <= 24, f"sm{sm} emits {n} conv TUs; widen deliberately, with a measurement"

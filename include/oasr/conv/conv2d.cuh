@@ -67,7 +67,7 @@ static gemm::GemmStatus dispatchConv2dWithSmVersion(
                                                                     dilation_w, 1.0f, stream);
 #if !defined(OASR_TARGET_SM) || OASR_TARGET_SM == 90 || OASR_TARGET_SM == 100
     } else if constexpr (SM_VERSION == 90) {
-        using Config = conv::CutlassConv2dConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 90>;
+        using Config = conv::CutlassConv2dConfigSm90<128, 128, 128, 1, 1, 3, 90>;
         return conv::CutlassConv2dFpropKernelSm90<Config, ElementA, ElementB, ElementCD,
                                                   activation_type>::run(input_ptr, filter_ptr,
                                                                         bias_ptr, output_ptr, N, H,
@@ -76,7 +76,7 @@ static gemm::GemmStatus dispatchConv2dWithSmVersion(
                                                                         dilation_h, dilation_w,
                                                                         1.0f, stream);
     } else if constexpr (SM_VERSION == 100) {
-        using Config = conv::CutlassConv2dConfigSm90<64, 16, 128, 1, 1, 1, 1, 3, 100>;
+        using Config = conv::CutlassConv2dConfigSm90<128, 128, 64, 1, 1, 3, 100>;
         return conv::CutlassConv2dFpropKernelSm90<Config, ElementA, ElementB, ElementCD,
                                                   activation_type>::run(input_ptr, filter_ptr,
                                                                         bias_ptr, output_ptr, N, H,
