@@ -74,6 +74,8 @@ from ..softmax import Softmax
 from ..utils import LOG2_E, make_acc_mn_view
 from .base import FmhaBase
 
+_DRIVER_SMEM_RESERVE = 1024
+
 
 class FmhaSm80(FmhaBase):
     """SM80 / SM120 FMHA.
@@ -152,7 +154,7 @@ class FmhaSm80(FmhaBase):
             )
             if num_stages == 0:
                 raise ValueError(
-                    f"no cp.async ring depth fits {self._smem_arch_str}'s "
+                    f"no cp.async ring depth fits {self._smem_arch_str()}'s "
                     f"{self._smem_capacity_in_bytes()} B of shared memory at "
                     f"head_dim={head_dim}, {m_block_size}x{n_block_size}; "
                     f"a single stage already needs "
@@ -197,7 +199,6 @@ class FmhaSm80(FmhaBase):
     # ------------------------------------------------------------------------
     # Feasibility
     # ------------------------------------------------------------------------
-    _smem_arch_str = "sm_80"
 
     #: Deepest cp.async ring we will build.  Beyond this the extra latency
     #: hiding stops paying for the smem (FlashAttention's own ceiling).
@@ -215,8 +216,15 @@ class FmhaSm80(FmhaBase):
     MIN_NUM_STAGES = 2
 
     @classmethod
+    def _smem_arch_str(cls) -> str:
+        """CuTeDSL's key for this arch's shared-memory budget.
+        """
+        return f"sm_{cls.arch}"
+
+    @classmethod
     def _smem_capacity_in_bytes(cls) -> int:
-        return cutlass_utils.get_smem_capacity_in_bytes(cls._smem_arch_str)
+        """Shared memory a launch on this arch will actually be granted."""
+        return cutlass_utils.get_smem_capacity_in_bytes(cls._smem_arch_str()) - _DRIVER_SMEM_RESERVE
 
     @staticmethod
     def _padded_head_dim(head_dim: int) -> int:
@@ -272,9 +280,12 @@ class FmhaSm80(FmhaBase):
         ``m_block`` is not a search axis: ``can_implement`` requires
         ``(m_block * 2) % num_threads == 0``, so at the default 128 threads it
         must be a multiple of 64 and cannot usefully shrink.  Between that and
-        the N floor of 16, the reachable range on a 99 KB arch is head_dim
-        <= 320 — comfortably past any real attention head (the widest in tree
-        is Paraformer's 128; 256 is the widest in common use).
+        the N floor of 16, the reachable head_dim is <= 384 on a 99 KB arch
+        (sm_86 / sm_89 / sm_120) and <= 640 on sm_80's 163 KB — comfortably
+        past any real attention head on either (the widest in tree is
+        Paraformer's 128; 256 is the widest in common use).  Two numbers, not
+        one, because ``_smem_capacity_in_bytes`` answers per arch: a single
+        quoted ceiling is what let sm_86 and sm_89 be budgeted with sm_80's.
 
         In paged mode the kernel walks ``n_block // block_size`` pool blocks per
         K tile, so a candidate narrower than ``block_size`` is skipped rather

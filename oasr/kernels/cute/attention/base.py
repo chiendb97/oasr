@@ -181,12 +181,21 @@ def pick_arch_cls(major: int, minor: int) -> Type[FmhaBase]:
     """Return the FmhaBase subclass for the given compute capability.
 
     Mapping:
-      * sm_80 / sm_86 / sm_89 (Ampere + Ada) -> :class:`FmhaSm80`.
-      * sm_120 (consumer Blackwell, RTX 50xx) -> :class:`FmhaSm120`, which
-        is itself a thin subclass over :class:`FmhaSm80`.
+      * sm_80 (A100, A30) -> :class:`FmhaSm80`, which carries the mainloop.
+      * sm_86 (Ampere consumer) / sm_89 (Ada) / sm_120 (consumer Blackwell)
+        -> :class:`FmhaSm86` / :class:`FmhaSm89` / :class:`FmhaSm120`, thin
+        subclasses over :class:`FmhaSm80` that differ only in ``arch``.
       * Anything else (sm_70 / sm_75 / sm_90 / sm_100 / ...) raises --
         the caller in ``oasr.jit.attention`` falls back to PyTorch SDPA
         in ``auto`` mode.
+
+    **Every supported SM needs its own class, even when the kernel body is
+    shared**, because the class is also what answers the shared-memory budget
+    (:meth:`FmhaSm80._smem_arch_str`).  Returning ``FmhaSm80`` for sm_86 and
+    sm_89 -- which this used to do -- budgeted both of them with A100's 163 KB
+    against a real 99 KB cap, so ``can_implement`` approved head_dim 128 at a
+    ring that could not launch.  A class that answers for an SM it does not
+    name is the bug, not an optimisation.
     """
     sm = major * 10 + minor
     # Local imports keep CuteDSL out of base.py's import path.
@@ -194,7 +203,15 @@ def pick_arch_cls(major: int, minor: int) -> Type[FmhaBase]:
         from .fmha_sm120 import FmhaSm120
 
         return FmhaSm120
-    if sm in (80, 86, 89):
+    if sm == 89:
+        from .fmha_sm89 import FmhaSm89
+
+        return FmhaSm89
+    if sm == 86:
+        from .fmha_sm86 import FmhaSm86
+
+        return FmhaSm86
+    if sm == 80:
         from .fmha_sm80 import FmhaSm80
 
         return FmhaSm80

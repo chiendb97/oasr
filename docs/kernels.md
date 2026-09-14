@@ -375,8 +375,9 @@ Routing policy and measurements: `.artifacts/fmha_tuning.md`.
 Ninja pipeline.
 
 - `kernels/cute/attention/base.py` — abstract `FmhaBase` + `pick_arch_cls(major, minor)`
-- `kernels/cute/attention/fmha_sm80.py` — `FmhaSm80`, covering sm_80 / 86 / 89
-- `kernels/cute/attention/fmha_sm120.py` — `FmhaSm120`, a thin subclass for consumer Blackwell
+- `kernels/cute/attention/fmha_sm80.py` — `FmhaSm80`, the mainloop (sm_80: A100, A30)
+- `kernels/cute/attention/fmha_sm{86,89,120}.py` — thin subclasses for Ampere
+  consumer, Ada and consumer Blackwell.
 - `kernels/cute/recurrent/step.py` — `RecurrentStepCute`, one fused LSTM/RNN
   timestep as a tensor-core GEMM with the state transition in the epilogue
 - `kernels/cute/mlp/gated.py` — `GatedMlpCute`, a **dual-B** GEMM: one A tile in
