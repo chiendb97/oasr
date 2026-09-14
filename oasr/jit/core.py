@@ -59,26 +59,103 @@ def _get_cuda_arch() -> Tuple[int, int]:
         return (8, 0)  # Safe default: SM80 (Ampere)
 
 
+#: Raw compute capability -> the kernel family compiled for it.
+#:
+#: An explicit table, not "the highest entry at or below sm".  A nearest-lower
+#: rule is only safe where the family's kernels actually run on the newer part,
+#: and for the CUTLASS 3.x lane they do not: its MMA paths are gated on an exact
+#: ``__CUDA_ARCH__`` (``CUTLASS_ARCH_MMA_SM100_ENABLED`` needs ``== 1000``), so
+#: an sm_103 part resolved down to the 100 family would compile and then take
+#: ``CUTE_INVALID_CONTROL_PATH`` at run time.  Anything absent here raises with
+#: its own number instead.
+#:
+#: Present by family:
+#:   * 2.x lane (mma.sync, forward-compatible): 75, 80, 86/87/88, 89, 120/121.
+#:   * 3.x lane (TMA + wgmma/tcgen05, arch-exact): 90, 100.
+#:
+#: **sm_70 (Volta)** is absent because the toolchain dropped it -- ``nvcc
+#: --list-gpu-arch`` starts at ``compute_75`` -- and no ``CutlassArch<70>``
+#: exists.  It was listed here for a long time and never built.
+#:
+#: **sm_103 (Blackwell Ultra)** is served by the **100** family, not by a tag of
+#: its own.  CUTLASS 4.6.1 has no *dense* FP16/BF16 GEMM collective for
+#: ``arch::Sm103`` -- the SM100 dense builder's ``enable_if`` names ``Sm100``
+#: alone and the only ``sm103_*`` GEMM builder is block-scaled (NVFP4/MXFP8) --
+#: so OASR compiles the Sm100 collectives and reaches B300 through the CUDA
+#: *family* target ``sm_100f`` instead.  See :data:`_GENCODE_TARGET`.
+_SM_FAMILY = {
+    75: 75,
+    80: 80,
+    86: 86,
+    87: 86,
+    88: 86,
+    89: 89,
+    90: 90,
+    100: 100,
+    103: 100,
+    120: 120,
+    121: 120,
+}
+
+#: The distinct families kernels are generated for, ascending.
+_TARGET_SMS = tuple(sorted(set(_SM_FAMILY.values())))
+
+
+#: Capabilities whose kernels must be built for a CUDA **family** target rather
+#: than their own arch-conditional one, and which target that is.
+#:
+#: Default is the capability itself -- ``sm_87``, plain, for an sm_87 device --
+#: with the arch-conditional ``a`` suffix from Hopper up, because CUTLASS 3.x
+#: gates every wgmma / tcgen05 atom on ``__CUDA_ARCH_FEAT_SM90_ALL`` and friends,
+#: which the plain target does not define: the kernel then *compiles* and aborts
+#: at run time down ``CUTE_INVALID_CONTROL_PATH``.
+#:
+#: sm_100 and sm_103 are the exception.  sm_103 runs the Sm100 collectives (it
+#: has no dense FP16/BF16 collective of its own), and an ``sm_103a`` build of
+#: those would define ``__CUDA_ARCH__ == 1030``, where
+#: ``CUTLASS_ARCH_MMA_SM100_ENABLED`` -- gated on ``== 1000`` exactly -- is off
+#: and every tcgen05 atom is preprocessed out.  The family target is the
+#: mechanism CUDA 13 provides for this: ``sm_100f`` defines
+#: ``__CUDA_ARCH__ == 1000`` plus ``__CUDA_ARCH_FAMILY_SPECIFIC__ == 1000``, so
+#: CUTLASS enables ``SM100F`` in place of ``SM100A`` and emits the same code.
+#: Measured: the PTX for one of these kernels is byte-identical between
+#: ``sm_100a`` and ``sm_100f`` (31,588 lines, 162 ``tcgen05`` instructions), and
+#: the whole emitted space compiles identically under both.  Both capabilities
+#: use it, so they also share one JIT cache entry.
+#:
+#: Not applied to sm_121: ``sm_120f`` exists, but sm_121 is served by the 120
+#: family's **CUTLASS 2.x** kernels, whose ``mma.sync`` is not arch-conditional,
+#: so its own ``sm_121a`` target is already correct.  ``sm_90f`` does not exist.
+_GENCODE_TARGET = {
+    100: "100f",
+    103: "100f",
+}
+
+
+def _gencode_target(sm: int, major: int) -> str:
+    """The ``compute_X``/``sm_X`` suffix to build this capability for."""
+    override = _GENCODE_TARGET.get(sm)
+    if override is not None:
+        return override
+    return f"{sm}a" if major >= 9 else f"{sm}"
+
+
 def _get_target_sm() -> int:
-    """Get the resolved target SM version for JIT compilation."""
+    """The compiled kernel family for this device, or raise naming the device.
+
+    Raising is the fix, not a regression: the old rule defaulted to 80 and
+    walked up, so an unlisted card silently got another architecture's kernels
+    -- a wrong answer where "this GPU is not supported" was the right one.
+    """
     major, minor = _get_cuda_arch()
     sm = major * 10 + minor
-    sm_to_arch = {
-        70: 70,
-        75: 75,
-        80: 80,
-        86: 86,
-        89: 89,
-        90: 90,
-        100: 100,
-        103: 103,
-        120: 120,
-    }
-    target_sm = 80
-    for threshold in sorted(sm_to_arch.keys()):
-        if sm >= threshold:
-            target_sm = sm_to_arch[threshold]
-    return target_sm
+    try:
+        return _SM_FAMILY[sm]
+    except KeyError:
+        raise RuntimeError(
+            f"unsupported GPU architecture sm_{sm}: OASR compiles for "
+            f"{', '.join(f'sm_{s}' for s in sorted(_SM_FAMILY))}"
+        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -254,14 +331,7 @@ def _default_cuda_cflags() -> List[str]:
     target_sm = _get_target_sm()
     major, minor = _get_cuda_arch()
     sm = major * 10 + minor
-    # Hopper and later need the arch-conditional target ("a").  CUTLASS 3.x
-    # gates every wgmma / tcgen05 atom on __CUDA_ARCH_FEAT_SM90_ALL and friends,
-    # which plain compute_90 does not define: the kernel then *compiles* and
-    # aborts at run time down CUTE_INVALID_CONTROL_PATH ("Arch conditional MMA
-    # instruction used without targeting appropriate compute capability").  Same
-    # rule as CompilationContext.get_nvcc_flags_list, so the JIT and AOT flag
-    # paths agree on the target.
-    arch = f"{sm}a" if major >= 9 else f"{sm}"
+    arch = _gencode_target(sm, major)
     return [
         "-std=c++17",
         "-O3",

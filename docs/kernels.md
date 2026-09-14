@@ -83,8 +83,9 @@ VecSize / block_size dispatch macros instead.
 - **AOT mode** (no `OASR_TARGET_SM`): the `OASR_DISPATCH_SM` macro switches on
   the runtime SM version.
 
-SM targets default to 70, 75, 80, 86, 89, 90, 100, 120 in `CMakeLists.txt`;
-`setup.py` defaults to 70–90 only. Override either with `CUDA_ARCHITECTURES`.
+SM targets default to 75, 80, 86, 89, 90, 100, 120 in `CMakeLists.txt`;
+`setup.py` queries the host GPUs and falls back to 80;86;89;90. Override either
+with `CUDA_ARCHITECTURES`.
 
 ### Conv2D on SM90 / SM100
 

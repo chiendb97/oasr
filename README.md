@@ -22,7 +22,7 @@ OASR is fast with:
 - Paged KV cache for streaming attention
 - Dynamic batching of offline and streaming requests, with length-bucketing and sequence packing for offline
 - CUDA Graph capture of the steady-state streaming encoder
-- FP16 / BF16 / FP32 paths across Volta through Blackwell (SM70–SM120)
+- FP16 / BF16 / FP32 paths across Turing through Blackwell (SM75–SM120)
 
 OASR is flexible and easy to use with:
 
