@@ -217,8 +217,7 @@ class FmhaSm80(FmhaBase):
 
     @classmethod
     def _smem_arch_str(cls) -> str:
-        """CuTeDSL's key for this arch's shared-memory budget.
-        """
+        """CuTeDSL's key for this arch's shared-memory budget."""
         return f"sm_{cls.arch}"
 
     @classmethod
