@@ -51,14 +51,16 @@ struct CutlassArch<80> {
     using Type = cutlass::arch::Sm80;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
 };
+// Ampere consumer / workstation (A10, A10G, A16, A40, RTX 30-series).
 template <>
 struct CutlassArch<86> {
-    using Type = cutlass::arch::Sm86;
+    using Type = cutlass::arch::Sm80;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
 };
+// Ada Lovelace (L4, L40S, RTX 4090, RTX Ada).
 template <>
 struct CutlassArch<89> {
-    using Type = cutlass::arch::Sm89;
+    using Type = cutlass::arch::Sm80;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
 };
 
@@ -72,12 +74,11 @@ struct CutlassArch<100> {
     using Type = cutlass::arch::Sm100;
 };
 
-// SM120 (GeForce Blackwell / RTX 50 series) note:
-//   The CUTLASS 3.x SM120 CollectiveBuilder for OpClassTensorOp is restricted to
-//   F8/F6/F4 MMA only — it does NOT support FP16/BF16 GEMM.  For FP16/BF16 we
-//   instead drive SM120 through the CUTLASS 2.x path, whose SM80 tensor-op
-//   specialisations (mma.sync.aligned.m16n8k16) are forward-compatible with
-//   SM120 hardware.  So CutlassArch<120> intentionally aliases to Sm80.
+// GeForce Blackwell (RTX 50 series, RTX PRO 6000).  SM120 is here for a second
+// reason on top of the one above: its CUTLASS 3.x CollectiveBuilder for
+// OpClassTensorOp is restricted to F8/F6/F4 MMA and does not accept FP16/BF16
+// at all, so SM120 is routed down the 2.x lane in the first place — see
+// `_get_sm120_configs` and `default_config_for_sm` in `oasr/jit/gemm.py`.
 template <>
 struct CutlassArch<120> {
     using Type = cutlass::arch::Sm80;
