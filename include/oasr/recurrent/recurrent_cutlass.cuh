@@ -41,15 +41,16 @@ namespace detail {
 // mapping for the custom LSTM epilogue to reason about across all of them.
 //
 // Both mappings are compiled for every target the JIT can emit — 75, 80, 86,
-// 89, 90, 100, 103, 120 — across all three configs and both served dtypes, so
-// the two static_asserts below are the only part of this taken on trust.
+// 89, 90, 100, 120 (see `_SM_FAMILY` in oasr/jit/core.py) — across all three
+// configs and both served dtypes, so the two static_asserts below are the only
+// part of this taken on trust.
 template <int Target>
 struct RecurrentArch {
     static_assert(Target >= 75,
                   "the recurrent tensor-core path needs SM75 or newer: older targets have no "
                   "CUTLASS 2.x tensor-op composition, and the CUDA toolkit no longer accepts "
                   "compute_70 either");
-    // Ampere (80, 86) / Ada (89) / Hopper (90) / Blackwell (100, 103, 120).
+    // Ampere (80, 86) / Ada (89) / Hopper (90) / Blackwell (100, 120).
     static constexpr int kCutlassArch = 80;
     static constexpr int kStages = 3;
 };

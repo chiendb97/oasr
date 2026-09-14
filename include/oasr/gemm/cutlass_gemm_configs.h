@@ -138,6 +138,31 @@ struct SMTypeAdapter<2> {
     using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmSm100;
 };
 
+//==============================================================================
+// Grouped-GEMM (ptr-array) schedule adapter
+//
+// A grouped GEMM takes an *array* of problems, so it needs the ptr-array
+// schedules rather than the dense ones above.  These are a parallel family, not
+// a variation: `KernelPtrArrayTmaWarpSpecializedCooperative` has no SM100
+// specialization at all, and asking the SM100 builder for it fails at
+// `CollectiveBuilder ... has no member "CollectiveOp"` rather than degrading.
+//==============================================================================
+
+template <int kSMs>
+struct GroupSMTypeAdapter;
+
+template <>
+struct GroupSMTypeAdapter<1> {
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
+    using MainloopSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmSm100;
+};
+
+template <>
+struct GroupSMTypeAdapter<2> {
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;
+    using MainloopSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100;
+};
+
 // Select the schedule adapter for the compiled SM family.
 
 template <int kSmVersion, int kSMs, bool kPingpong>
@@ -145,6 +170,12 @@ struct GemmScheduleSelector {
     // Default: SM90 and SM120 — pingpong or cooperative
     using EpilogueSchedule = typename Sm90ScheduleAdapter<kPingpong>::EpilogueSchedule;
     using MainloopSchedule = typename Sm90ScheduleAdapter<kPingpong>::MainloopSchedule;
+
+    // SM90 / SM120 grouped GEMM: one cooperative ptr-array schedule, no 1-/2-SM
+    // split to make.  Ping-pong has no ptr-array form, so a pingpong config
+    // still groups cooperatively.
+    using GroupEpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+    using GroupMainloopSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
 };
 
 template <int kSMs, bool kPingpong>
@@ -152,6 +183,9 @@ struct GemmScheduleSelector<100, kSMs, kPingpong> {
     // SM100: 1-SM or 2-SM co-operative scheduling
     using EpilogueSchedule = typename SMTypeAdapter<kSMs>::EpilogueSchedule;
     using MainloopSchedule = typename SMTypeAdapter<kSMs>::MainloopSchedule;
+
+    using GroupEpilogueSchedule = typename GroupSMTypeAdapter<kSMs>::EpilogueSchedule;
+    using GroupMainloopSchedule = typename GroupSMTypeAdapter<kSMs>::MainloopSchedule;
 };
 
 //==============================================================================
@@ -169,15 +203,37 @@ struct GemmScheduleSelector<100, kSMs, kPingpong> {
 template <int BM, int BN, int BK, int CM, int CN, int kSMs, int kStages, int kSmVersion,
           bool kPingpong = false>
 struct CutlassGemmConfigSm90 {
-    // TileShape: for SM100 with kSMs=2 the tile M dimension is doubled so that
-    // both SMs together cover BM*2 rows.  For SM90/SM120 kSMs=1 so no scaling.
-    using TileShape = cute::Shape<cute::Int<BM * kSMs>, cute::Int<BN>, cute::Int<BK>>;
+    // BM is the MMA tile M as the builder sees it, never scaled by kSMs.
+    //
+    // It used to be `BM * kSMs`, on the belief that a 2-SM SM100 atom needs the
+    // tile doubled so both SMs together cover BM*2 rows.  They do cover 2x the
+    // rows, but CUTLASS wants the *combined* extent: its own SM100 dense-GEMM
+    // tests pass `MmaTileShape = Shape<_256,_128,_64>` alongside
+    // `ClusterShape = Shape<_2,_1,_1>`, and the doubling turned OASR's 256-row
+    // configs into 512 and tripped
+    // `static_assert(M == 128 || M == 256, "Invalid TileShape_M.")`
+    // (`gemm/collective/builders/sm100_common.inl:375`).  That is 13 of the 37
+    // emitted sm_100 variants, and one unbuildable variant fails the whole JIT
+    // module -- so no GEMM, BMM or grouped GEMM built on B200 at all.
+    //
+    // kSMs stays a parameter: unlike the conv path, which lets
+    // `KernelScheduleAuto` pick the atom from the cluster, the GEMM path still
+    // selects `KernelTmaWarpSpecialized{1,2}SmSm100` through `SMTypeAdapter`.
+    // It selects the *schedule*; it does not scale the *tile*.
+    //
+    // SM90 and SM120 always pass kSMs=1, so this is an SM100-only correction and
+    // their generated kernels are byte-identical either way.
+    using TileShape = cute::Shape<cute::Int<BM>, cute::Int<BN>, cute::Int<BK>>;
     using ClusterShape = cute::Shape<cute::Int<CM>, cute::Int<CN>, cute::Int<1>>;
     using SmArch = typename CutlassArch<kSmVersion>::Type;
 
     using _ScheduleSelector = GemmScheduleSelector<kSmVersion, kSMs, kPingpong>;
     using EpilogueSchedule = typename _ScheduleSelector::EpilogueSchedule;
     using MainloopSchedule = typename _ScheduleSelector::MainloopSchedule;
+
+    // The grouped (ptr-array) counterparts, for CutlassGroupGemmKernelSm90.
+    using GroupEpilogueSchedule = typename _ScheduleSelector::GroupEpilogueSchedule;
+    using GroupMainloopSchedule = typename _ScheduleSelector::GroupMainloopSchedule;
 
     static constexpr int Stages = kStages;
 };

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 from . import env
-from .core import JitSpec, _get_target_sm, gen_jit_spec
+from .core import _TARGET_SMS, JitSpec, _get_target_sm, gen_jit_spec
 from .gemm import _SM_MAX_SMEM_BYTES, TileShape, TileShapeConfigs, _tile_is_buildable
 
 # =============================================================================
@@ -298,6 +298,10 @@ def get_all_conv2d_autotune_configs(
 
     Conv2D has no runtime-only parameters (no split-K), so ``name ==
     compile_name`` and this set equals the compile set.
+
+    An unrecognised SM **raises** rather than inheriting SM120's space; see
+    :func:`oasr.jit.gemm.get_all_autotune_configs` for why that ``else`` was a
+    defect rather than a convenience.
     """
     if sm == 75:
         return _get_sm75_conv2d_configs(sm)  # type: ignore[return-value]
@@ -311,8 +315,12 @@ def get_all_conv2d_autotune_configs(
         return _get_sm90_conv2d_configs(sm)  # type: ignore[return-value]
     elif sm == 100:
         return _get_sm100_conv2d_configs(sm)  # type: ignore[return-value]
-    else:
+    elif sm == 120:
         return _get_sm120_conv2d_configs(sm)  # type: ignore[return-value]
+    raise ValueError(
+        f"no Conv2D config space for sm_{sm}; OASR compiles for "
+        f"{', '.join(f'sm_{t}' for t in _TARGET_SMS)}"
+    )
 
 
 def get_unique_conv2d_compile_configs(

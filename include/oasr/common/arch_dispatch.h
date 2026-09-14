@@ -61,15 +61,14 @@ inline int getDeviceMultiProcessorCount() {
 /** Map a runtime SM version to the highest compiled family not exceeding it. */
 inline int resolveSmVersion(int sm) {
     if (sm >= 120) return 120;
-    if (sm >= 103) return 103;
     if (sm >= 100) return 100;
     if (sm >= 90) return 90;
     if (sm >= 89) return 89;
     if (sm >= 86) return 86;
     if (sm >= 80) return 80;
     if (sm >= 75) return 75;
-    if (sm >= 70) return 70;
-    throw std::runtime_error("Unsupported GPU architecture: SM" + std::to_string(sm));
+    throw std::runtime_error("Unsupported GPU architecture: SM" + std::to_string(sm) +
+                             " (OASR requires SM75 / Turing or newer)");
 }
 
 }  // namespace oasr
@@ -94,10 +93,6 @@ inline int resolveSmVersion(int sm) {
                 constexpr int ARCH_VAR = 120;                                               \
                 __VA_ARGS__                                                                 \
             } break;                                                                        \
-            case 103: {                                                                     \
-                constexpr int ARCH_VAR = 103;                                               \
-                __VA_ARGS__                                                                 \
-            } break;                                                                        \
             case 100: {                                                                     \
                 constexpr int ARCH_VAR = 100;                                               \
                 __VA_ARGS__                                                                 \
@@ -120,10 +115,6 @@ inline int resolveSmVersion(int sm) {
             } break;                                                                        \
             case 75: {                                                                      \
                 constexpr int ARCH_VAR = 75;                                                \
-                __VA_ARGS__                                                                 \
-            } break;                                                                        \
-            case 70: {                                                                      \
-                constexpr int ARCH_VAR = 70;                                                \
                 __VA_ARGS__                                                                 \
             } break;                                                                        \
             default:                                                                        \

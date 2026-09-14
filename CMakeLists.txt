@@ -33,8 +33,12 @@ find_package(CUDAToolkit REQUIRED)
 # Put -I flags in compile command (not in .rsp) so compile_commands.json and IntelliSense see them
 set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES OFF)
 
+# Turing is the floor: compute_70 was dropped by the toolchain (`nvcc
+# --list-gpu-arch` starts at compute_75) and OASR has no CUTLASS arch binding
+# for it.  Must stay in step with `_TARGET_SMS` in oasr/jit/core.py and
+# `resolveSmVersion` in include/oasr/common/arch_dispatch.h.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 70 75 80 86 89 90 100 120)
+    set(CMAKE_CUDA_ARCHITECTURES 75 80 86 89 90 100 120)
 endif()
 
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")

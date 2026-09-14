@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Union
 
 from . import env
-from .core import JitSpec, _get_target_sm, gen_jit_spec
+from .core import _TARGET_SMS, JitSpec, _get_target_sm, gen_jit_spec
 
 # =============================================================================
 # Tile configuration helpers (SM<90)
@@ -565,6 +565,40 @@ def _get_sm90_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
     return seen
 
 
+def _sm100_gemm_tile_ok(tile_m: int, tile_n: int, k_sms: int) -> bool:
+    """Can CUTLASS build this SM100 tile at all?
+
+    Three constraints, none of them documented outside CUTLASS's own asserts and
+    none previously checked here.  They matter more than they look: **one
+    unbuildable variant fails the whole JIT module**, so an ungated space means
+    no GEMM on the architecture rather than one missing tactic.
+
+    1. MMA tile M -- ``{64, 128}`` for the 1-SM atom, ``{128, 256}`` for the
+       2-SM one (``gemm/collective/builders/sm100_common.inl:309,375``).
+    2. MMA tile N -- a multiple of 8, at most 256 (same file, ``:313,379``).
+    3. The 2-SM TMA epilogue, at 16-bit output with an auto epilogue tile,
+       additionally needs ``N <= 128`` or ``N % 64 == 0``
+       (``epilogue/collective/builders/sm100_builder.inl:1220``), because at
+       ``N % 64 != 0`` the epilogue tile falls back to N and produces
+       non-64-aligned smem swizzle strides.  CUTLASS spells out the remedy in
+       the assert text: "Use a CtaN that is a multiple of 64 (e.g. 128, 192,
+       256) or use a 32-bit output type (f32)."
+
+    Verified by compiling the full emitted space for ``sm_100a``: the predicate
+    reproduces the pass/fail split exactly.
+    """
+    mma_m = tile_m
+    if k_sms == 2:
+        if mma_m not in (128, 256):
+            return False
+        # The 16-bit epilogue's N restriction applies to the 2-SM path only.
+        if tile_n > 128 and tile_n % 64:
+            return False
+    elif mma_m not in (64, 128):
+        return False
+    return tile_n % 8 == 0 and tile_n <= 256
+
+
 def _get_sm100_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
     """SM100 (Blackwell data-center) configs following Quack's ``_get_sm100_configs()`` pattern.
 
@@ -588,8 +622,11 @@ def _get_sm100_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
 
     seen: Dict[str, CutlassGemmConfigSm90] = {}
     for tile_m, tile_n, (cluster_m, cluster_n) in tile_mn_cluster_vals:
-        # kSMs=2 enables 2-SM co-operative TileShape (BM*2 × BN) when cluster_m ≥ 2
+        # kSMs=2 selects the 2-SM co-operative *schedule* when cluster_m >= 2.
+        # It does not scale the tile; see CutlassGemmConfigSm90's comment.
         kSMs = 2 if cluster_m >= 2 else 1
+        if not _sm100_gemm_tile_ok(tile_m, tile_n, kSMs):
+            continue
         cfg = CutlassGemmConfigSm90(
             tile_m=tile_m,
             tile_n=tile_n,
@@ -732,6 +769,13 @@ def get_all_autotune_configs(
 
     For SM < 90 this includes all split_k and kStages variants; for SM ≥ 90
     it matches the Quack-style set (split_k is not applicable there).
+
+    An unrecognised SM **raises** rather than silently receiving SM120's config
+    space.  That ``else`` is how sm_70 and sm_103 came to emit CUTLASS 2.x
+    configs and then be rendered through the 3.x template, failing with
+    ``AttributeError: 'CutlassGemmConfig' object has no attribute 'tile_m'`` --
+    a target that is merely *unlisted* should say so, not inherit another
+    architecture's tiles.
     """
     if sm == 75:
         return _get_sm75_configs(sm)  # type: ignore[return-value]
@@ -745,8 +789,12 @@ def get_all_autotune_configs(
         return _get_sm90_configs(sm)  # type: ignore[return-value]
     elif sm == 100:
         return _get_sm100_configs(sm)  # type: ignore[return-value]
-    else:
+    elif sm == 120:
         return _get_sm120_configs(sm)  # type: ignore[return-value]
+    raise ValueError(
+        f"no GEMM config space for sm_{sm}; OASR compiles for "
+        f"{', '.join(f'sm_{t}' for t in _TARGET_SMS)}"
+    )
 
 
 def get_unique_compile_configs(

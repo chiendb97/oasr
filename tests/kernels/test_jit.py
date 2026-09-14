@@ -578,3 +578,388 @@ class TestConv3xConfigSpaceIsBuildable:
         for sm in self.TARGETS:
             n = len(get_unique_conv2d_compile_configs(sm))
             assert n <= 24, f"sm{sm} emits {n} conv TUs; widen deliberately, with a measurement"
+
+
+# ---------------------------------------------------------------------------
+# Which architectures the JIT claims, and which it refuses
+# ---------------------------------------------------------------------------
+
+
+class TestTargetArchitectures:
+    """The served set is a table, and everything reads the same table.
+
+    It used to be a nearest-lower walk over a map that listed ``70`` and
+    ``103`` as *families*, neither of which could build:
+
+    * **sm_70** — the toolchain dropped ``compute_70`` (``nvcc
+      --list-gpu-arch`` starts at ``compute_75``) and no ``CutlassArch<70>``
+      exists. It is refused by name.
+    * **sm_103** — CUTLASS 4.6.1 has no *dense* FP16/BF16 GEMM collective for
+      ``arch::Sm103``; the SM100 dense builder's ``enable_if`` names ``Sm100``
+      alone, and the only ``sm103_*`` GEMM builder is block-scaled. So there is
+      no 103 *family* -- but a B300 still runs the SM100 collectives, so sm_103
+      is a *raw capability served by family 100*, built as ``sm_100f``.
+
+    Both reached ``_render_all_variants`` and died on
+    ``AttributeError: 'CutlassGemmConfig' object has no attribute 'tile_m'`` --
+    a 2.x config handed to the 3.x template, forty frames from the cause.
+
+    A nearest-lower rule is also unsafe in its own right for the 3.x lane:
+    ``CUTLASS_ARCH_MMA_SM100_ENABLED`` requires ``__CUDA_ARCH__ == 1000``
+    exactly, so a part resolved *down* onto the 100 family would compile and
+    then take ``CUTE_INVALID_CONTROL_PATH`` at run time. Refusing by name is
+    the only answer that is neither a crash nor a wrong kernel.
+
+    CPU-only: the tables are pure Python.
+    """
+
+    def test_volta_is_gone_from_every_table(self):
+        """sm_70 is not a target, anywhere that names targets."""
+        from helpers import REPO_ROOT
+
+        from oasr.jit.core import _SM_FAMILY, _TARGET_SMS
+
+        assert 70 not in _SM_FAMILY and 70 not in _TARGET_SMS
+
+        # The C++ runtime table has to agree, or an AOT build would dispatch to
+        # a family the JIT never emits.
+        arch_dispatch = (REPO_ROOT / "include/oasr/common/arch_dispatch.h").read_text()
+        assert "if (sm >= 70) return 70;" not in arch_dispatch
+        assert "case 70:" not in arch_dispatch
+
+        # …and so does the build default.
+        cmake = (REPO_ROOT / "CMakeLists.txt").read_text()
+        assert "CMAKE_CUDA_ARCHITECTURES 70 " not in cmake
+
+    def test_the_cpp_family_table_matches_the_python_one(self):
+        """AOT and JIT must resolve a device to the *same* family.
+
+        ``resolveSmVersion`` is the AOT half of ``_SM_FAMILY``. If it names a
+        family the generators do not emit, an AOT build dispatches into a
+        ``CutlassArch`` specialization that does not exist -- which is what a
+        leftover ``103`` did after sm_103 moved onto the 100 family: the JIT
+        built a B300 as family 100 while the C++ switch still claimed 103.
+        """
+        import re
+
+        from helpers import REPO_ROOT
+
+        from oasr.jit.core import _TARGET_SMS
+
+        src = (REPO_ROOT / "include/oasr/common/arch_dispatch.h").read_text()
+        resolve = src[src.index("inline int resolveSmVersion") :]
+        resolve = resolve[: resolve.index("\n}")]
+        families = {int(m) for m in re.findall(r"if \(sm >= \d+\) return (\d+);", resolve)}
+        assert families == set(_TARGET_SMS), (
+            f"C++ resolveSmVersion families {sorted(families)} != "
+            f"Python _TARGET_SMS {sorted(_TARGET_SMS)}"
+        )
+
+        cases = {int(m) for m in re.findall(r"case (\d+):", src)}
+        assert cases == set(
+            _TARGET_SMS
+        ), f"C++ dispatch cases {sorted(cases)} != Python _TARGET_SMS {sorted(_TARGET_SMS)}"
+
+    def test_an_unserved_capability_raises_naming_itself(self):
+        """Not a silent resolve-down, and not an AttributeError later."""
+        import oasr.jit.core as core
+
+        # sm_103 is *not* here: it is served by the 100 family via sm_100f.
+        for sm, cap in ((70, (7, 0)), (110, (11, 0)), (72, (7, 2)), (62, (6, 2))):
+            original = core._get_cuda_arch
+            core._get_cuda_arch = lambda cap=cap: cap
+            try:
+                with pytest.raises(RuntimeError, match=rf"sm_{sm}\b"):
+                    core._get_target_sm()
+            finally:
+                core._get_cuda_arch = original
+
+    def test_every_served_capability_resolves_to_a_family_with_a_config_space(self):
+        """The join: what the device map promises, the generators must supply."""
+        from oasr.jit.conv import get_unique_conv2d_compile_configs
+        from oasr.jit.core import _SM_FAMILY, _TARGET_SMS
+        from oasr.jit.gemm import get_unique_compile_configs
+
+        assert set(_SM_FAMILY.values()) == set(_TARGET_SMS)
+        for raw, family in _SM_FAMILY.items():
+            assert family in _TARGET_SMS, raw
+            for name, fn in (
+                ("gemm", get_unique_compile_configs),
+                ("conv2d", get_unique_conv2d_compile_configs),
+            ):
+                cfgs = fn(family)
+                assert cfgs, f"sm_{raw} -> family {family}: {name} space is empty"
+
+    def test_the_config_spaces_refuse_an_unserved_family(self):
+        """No ``else`` fallthrough: an unlisted SM must not inherit SM120's tiles."""
+        from oasr.jit.conv import get_unique_conv2d_compile_configs
+        from oasr.jit.gemm import get_unique_compile_configs
+
+        for sm in (70, 103, 110, 999):
+            for fn in (get_unique_compile_configs, get_unique_conv2d_compile_configs):
+                with pytest.raises(ValueError, match=rf"sm_{sm}\b"):
+                    fn(sm)
+
+    def test_a_3x_family_only_serves_another_part_through_a_family_target(self):
+        """The rule that makes the explicit table necessary rather than tidy.
+
+        A capability may be served by a *different* capability's kernels only
+        when those kernels actually run there. For the 2.x ``mma.sync`` lane
+        that is free (sm_87/88 on the 86 family, sm_121 on the 120 one). For
+        the CUTLASS 3.x lane it is not: those MMA paths are gated on an exact
+        ``__CUDA_ARCH__``, so the build must name a CUDA **family** target or
+        every atom is preprocessed out and the kernel traps at run time.
+
+        sm_103 on the 100 family is the one case, and ``_GENCODE_TARGET`` is
+        what makes it sound.
+        """
+        from oasr.jit.core import _GENCODE_TARGET, _SM_FAMILY
+
+        THREE_X = {90, 100}
+        for raw, family in _SM_FAMILY.items():
+            if family in THREE_X and raw != family:
+                target = _GENCODE_TARGET.get(raw, "")
+                assert target.endswith("f"), (
+                    f"sm_{raw} is served by the arch-exact 3.x family {family} but builds "
+                    f"for {target or f'sm_{raw}a'}; its MMA paths are gated on "
+                    f"__CUDA_ARCH__ == {family * 10} and would be compiled out, leaving "
+                    f"CUTE_INVALID_CONTROL_PATH at run time"
+                )
+
+    def test_blackwell_ultra_rides_the_sm100_family_target(self):
+        """sm_103 is served by sm_100's kernels, through a CUDA *family* target.
+
+        Two halves, both load-bearing:
+
+        * **The family.** CUTLASS 4.6.1 has no dense FP16/BF16 GEMM collective
+          for ``arch::Sm103`` -- the SM100 dense builder's ``enable_if`` names
+          ``Sm100`` alone and the only ``sm103_*`` GEMM builder is block-scaled
+          -- so 103 compiles the Sm100 collectives.
+        * **The target.** Those cannot be built as ``sm_103a``:
+          ``CUTLASS_ARCH_MMA_SM100_ENABLED`` is gated on ``__CUDA_ARCH__ ==
+          1000`` exactly, so at 1030 every tcgen05 atom is preprocessed out and
+          the kernel reaches ``CUTE_INVALID_CONTROL_PATH`` at run time -- it
+          *compiles*, which is what makes it dangerous. ``sm_100f`` defines
+          ``__CUDA_ARCH__ == 1000`` plus the family macro, so CUTLASS enables
+          ``SM100F`` and emits the same code (measured byte-identical PTX).
+
+        sm_100 uses the same target, so both share one JIT cache entry.
+        """
+        import oasr.jit.core as core
+
+        flags = {}
+        original = core._get_cuda_arch
+        try:
+            for cap in ((10, 0), (10, 3)):
+                core._get_cuda_arch = lambda cap=cap: cap
+                assert core._get_target_sm() == 100
+                flags[cap] = [f for f in core._default_cuda_cflags() if "gencode" in f]
+        finally:
+            core._get_cuda_arch = original
+
+        assert flags[(10, 0)] == flags[(10, 3)], f"must be one binary: {flags}"
+        assert "sm_100f" in flags[(10, 3)][0], (
+            f"sm_103 needs the family target; an arch-conditional one compiles the "
+            f"tcgen05 atoms out: {flags[(10, 3)]}"
+        )
+        assert "103a" not in flags[(10, 3)][0]
+
+    def test_only_the_sm100_family_overrides_its_gencode_target(self):
+        """Everything else builds for its own capability, and must keep doing so.
+
+        A family target is not a free generalisation: ``code=sm_86`` produces
+        sm_86 SASS, which will not load on an sm_87 device, and these flags
+        embed no PTX to JIT from. So sm_87 / sm_88 / sm_121 stay on their own
+        targets -- safe because the 2.x ``mma.sync`` lane they land on is not
+        arch-conditional.
+        """
+        import oasr.jit.core as core
+
+        assert set(core._GENCODE_TARGET) == {100, 103}
+        original = core._get_cuda_arch
+        try:
+            for cap, expect in (
+                ((8, 7), "compute_87,code=sm_87"),
+                ((8, 8), "compute_88,code=sm_88"),
+                ((9, 0), "compute_90a,code=sm_90a"),
+                ((12, 1), "compute_121a,code=sm_121a"),
+            ):
+                core._get_cuda_arch = lambda cap=cap: cap
+                got = [f for f in core._default_cuda_cflags() if "gencode" in f][0]
+                assert expect in got, f"sm_{cap[0] * 10 + cap[1]}: {got}"
+        finally:
+            core._get_cuda_arch = original
+
+
+class TestSm100GemmTileSpace:
+    """Every emitted SM100 GEMM tile must be one CUTLASS can build.
+
+    17 of 37 could not. Thirteen because ``CutlassGemmConfigSm90`` scaled the
+    tile M by the co-operating-SM count -- ``BM * kSMs`` made the 256-row
+    configs 512 and tripped ``static_assert(M == 128 || M == 256, "Invalid
+    TileShape_M.")`` -- the *same* defect the conv config inherited from this
+    one, and that A2 fixed on the conv side only. Four more because the 2-SM
+    16-bit epilogue refuses a ``CtaN`` above 128 that is not a multiple of 64.
+
+    One unbuildable variant fails the whole JIT module, so the effect was that
+    **no** GEMM, BMM or grouped GEMM built on B200 at all.
+    """
+
+    def test_every_emitted_tile_satisfies_the_cutlass_constraints(self):
+        from oasr.jit.gemm import _sm100_gemm_tile_ok, get_unique_compile_configs
+
+        cfgs = get_unique_compile_configs(100)
+        assert cfgs
+        for name, cfg in cfgs.items():
+            assert _sm100_gemm_tile_ok(cfg.tile_m, cfg.tile_n, cfg.kSMs), name
+
+    def test_the_predicate_is_the_measured_boundary(self):
+        """Stated as units so the rules survive a rewrite of the ladder."""
+        from oasr.jit.gemm import _sm100_gemm_tile_ok
+
+        # 1-SM atom: M in {64, 128}; 2-SM atom: M in {128, 256}.
+        assert _sm100_gemm_tile_ok(128, 128, 1) and not _sm100_gemm_tile_ok(256, 128, 1)
+        assert _sm100_gemm_tile_ok(256, 128, 2) and not _sm100_gemm_tile_ok(512, 128, 2)
+        assert not _sm100_gemm_tile_ok(64, 128, 2)
+        # N: a multiple of 8, at most 256.
+        assert not _sm100_gemm_tile_ok(128, 512, 2) and not _sm100_gemm_tile_ok(128, 132, 1)
+        # 2-SM 16-bit epilogue: N above 128 must divide by 64…
+        assert not _sm100_gemm_tile_ok(128, 160, 2) and not _sm100_gemm_tile_ok(128, 224, 2)
+        assert _sm100_gemm_tile_ok(128, 192, 2) and _sm100_gemm_tile_ok(128, 256, 2)
+        # …and that restriction is 2-SM only.
+        assert _sm100_gemm_tile_ok(128, 160, 1) and _sm100_gemm_tile_ok(128, 224, 1)
+
+    def test_the_tile_m_is_not_scaled_by_the_sm_count(self):
+        """``kSMs`` selects the schedule; it must never scale the tile.
+
+        Read out of the header, not inferred from the Python config: the
+        scaling lived in the C++ ``TileShape`` alias, so the emitted config
+        still says ``tile_m=256`` either way and a Python-side assertion would
+        pass while the build failed. This is the half a config-space test
+        cannot see, which is why the compile matrix in
+        ``.artifacts/arch_portability_audit.md`` § A11 is the real gate.
+        """
+        import re
+
+        from helpers import REPO_ROOT
+
+        src = (REPO_ROOT / "include/oasr/gemm/cutlass_gemm_configs.h").read_text()
+        tile = re.search(r"struct CutlassGemmConfigSm90 \{.*?using TileShape = ([^;]+);", src, re.S)
+        assert tile, "CutlassGemmConfigSm90's TileShape alias moved"
+        assert "kSMs" not in tile.group(1), (
+            f"TileShape scales M by kSMs again: {tile.group(1).strip()} — CUTLASS wants the "
+            f"combined MMA extent, so 256 becomes 512 and trips 'Invalid TileShape_M.'"
+        )
+
+        # …and the 256-row tiles the doubling broke are in the space.
+        from oasr.jit.gemm import get_unique_compile_configs
+
+        m256 = [c for c in get_unique_compile_configs(100).values() if c.tile_m == 256]
+        assert m256, "every 256-row SM100 tile was filtered out"
+        assert all(c.kSMs == 2 for c in m256), "a 256-row MMA tile needs the 2-SM atom"
+
+    def test_sm90_is_unaffected(self):
+        """SM90 always passes kSMs=1, so removing the scaling changed nothing.
+
+        Pinned because the fix touched a struct both architectures share.
+        """
+        from oasr.jit.gemm import get_unique_compile_configs
+
+        cfgs = get_unique_compile_configs(90)
+        assert len(cfgs) == 16
+        assert all(c.kSMs == 1 for c in cfgs.values())
+
+
+def _struct_body(src: str, name: str) -> str:
+    """Slice one ``struct <name> { ... };`` out of a header, braces balanced."""
+    start = src.index(f"struct {name} {{")
+    depth, i = 0, src.index("{", start)
+    for j in range(i, len(src)):
+        if src[j] == "{":
+            depth += 1
+        elif src[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start : j + 1]
+    raise AssertionError(f"unbalanced braces in struct {name}")
+
+
+class TestSm100BatchedAndGroupedGemm:
+    """BMM and grouped GEMM had their *own* SM100 breakage, past the tile space.
+
+    A11 fixed the shared tile ladder and ``gemm`` built -- but ``bmm`` and
+    ``group_gemm`` still failed, for two unrelated reasons, and one unbuildable
+    variant fails the whole JIT module either way:
+
+    * **BMM** declared a source operand (``ElementC = ElementCD``) it never
+      used. Both call sites hardcode ``beta = 0`` and ``oasr.functionals.bmm``
+      has no C parameter, but a non-void ElementC reserves C-tile smem
+      unconditionally at compile time. Measured carveout on SM100 at
+      ``128xNx128`` fp16 -- 25600 / 33792 / 82944 / 51200 / 115712 / 67584
+      bytes for N = 64…256, against a flat 17408 for void C -- left
+      ``(232448 - carveout) / stage_bytes`` below the required two stages at
+      N = 224 and N = 256.
+    * **Grouped GEMM** named ``KernelPtrArrayTmaWarpSpecializedCooperative``
+      unconditionally. That schedule has no SM100 specialization, so the
+      builder fell through to its primary template and failed with
+      ``has no member "CollectiveOp"``.
+
+    Both live in C++ template arguments, so no config-space assertion can see
+    them; these read the headers.
+    """
+
+    @staticmethod
+    def _template_src() -> str:
+        from helpers import REPO_ROOT
+
+        return (REPO_ROOT / "include/oasr/gemm/gemm_cutlass_template_sm90.h").read_text()
+
+    @staticmethod
+    def _config_src() -> str:
+        from helpers import REPO_ROOT
+
+        return (REPO_ROOT / "include/oasr/gemm/cutlass_gemm_configs.h").read_text()
+
+    def test_the_bmm_epilogue_declares_no_source_operand(self):
+        body = _struct_body(self._template_src(), "CutlassBmmKernelSm90")
+        epilogue = body[body.index("using CollectiveEpilogue") :]
+        epilogue = epilogue[: epilogue.index(";")]
+        # ElementC is the argument following ElementCompute.
+        assert "ElementCompute, void," in " ".join(epilogue.split()), (
+            "BMM's epilogue took a source operand again. D = alpha * (A @ B^T) has none, "
+            "and a non-void ElementC reserves C-tile smem unconditionally, which drops the "
+            "SM100 mainloop below two stages at tile N of 224 and 256."
+        )
+
+    def test_the_bmm_refuses_a_beta_it_cannot_honour(self):
+        """Declare, don't ignore: no source operand means beta must be zero."""
+        body = _struct_body(self._template_src(), "CutlassBmmKernelSm90")
+        assert "if (beta != 0.0f)" in body and "NOT_SUPPORTED" in body, (
+            "BMM must refuse a non-zero beta rather than silently return "
+            "alpha * A @ B^T to a caller expecting D to be accumulated into."
+        )
+
+    def test_the_grouped_schedules_are_taken_from_the_config(self):
+        body = _struct_body(self._template_src(), "CutlassGroupGemmKernelSm90")
+        for alias in ("EpilogueSchedule", "MainloopSchedule"):
+            line = next(ln for ln in body.splitlines() if ln.strip().startswith(f"using {alias} ="))
+            assert "CutlassGemmConfig::Group" in line, (
+                f"grouped {alias} is hardcoded again ({line.strip()}); the cooperative "
+                f"ptr-array schedule has no SM100 specialization, so this must come from "
+                f"the config's per-arch selector."
+            )
+
+    def test_the_config_maps_sm100_to_the_sm100_grouped_schedules(self):
+        body = _struct_body(self._config_src(), "GemmScheduleSelector<100, kSMs, kPingpong>")
+        assert "GroupSMTypeAdapter<kSMs>" in body
+        for k, sched in ((1, "1SmSm100"), (2, "2SmSm100")):
+            adapter = _struct_body(self._config_src(), f"GroupSMTypeAdapter<{k}>")
+            assert f"KernelPtrArrayTmaWarpSpecialized{sched}" in adapter
+            assert f"PtrArrayTmaWarpSpecialized{k}Sm" in adapter
+
+    def test_sm90_keeps_the_cooperative_grouped_schedule(self):
+        """The SM100 split must not disturb the arch that already worked."""
+        src = self._config_src()
+        primary = _struct_body(src, "GemmScheduleSelector")
+        assert "KernelPtrArrayTmaWarpSpecializedCooperative" in primary
+        assert "PtrArrayTmaWarpSpecializedCooperative" in primary

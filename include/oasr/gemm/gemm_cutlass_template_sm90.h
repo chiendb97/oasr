@@ -213,9 +213,27 @@ struct CutlassBmmKernelSm90 {
     using FusionOp = cutlass::epilogue::fusion::LinearCombination<ElementCD, ElementCompute,
                                                                   ElementCD, ElementCompute>;
 
+    // ElementC is `void`: D = alpha * (A @ B^T) with no source matrix.  Both
+    // call sites pass beta = 0 and the Python API (`oasr.functionals.bmm`) has
+    // no C operand to pass, so the source was only ever D aliased to itself and
+    // scaled by zero -- but a non-void ElementC makes the epilogue reserve smem
+    // for a C tile *unconditionally*, at compile time, whatever beta turns out
+    // to be.  Measured on SM100 with EpilogueTileAuto at 128xNx128 fp16, the
+    // carveout that costs is severe and wildly non-monotonic in N:
+    //
+    //     N        64     128     160     192     224     256
+    //     C=CD  25600   33792   82944   51200  115712   67584   bytes
+    //     C=void 17408   17408   17408   17408   17408   17408   bytes
+    //
+    // The mainloop gets `(232448 - carveout) / stage_bytes` stages
+    // (`sm100_umma_builder.inl:84`) and asserts at least two, so N=224 and
+    // N=256 landed on one stage and failed to compile -- and N=160 passed with
+    // 2 KB to spare, which is not a margin anyone chose.  With void C every
+    // tile in the space builds, and builds with more stages.  SM90 is
+    // unaffected in kind and simply gains the same headroom.
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         ArchTag, OperatorClass, TileShape, ClusterShape, EpilogueTileType, ElementAccumulator,
-        ElementCompute, ElementCD, LayoutCD, AlignmentEpilogue, ElementCD, LayoutCD,
+        ElementCompute, void, LayoutCD, AlignmentEpilogue, ElementCD, LayoutCD,
         AlignmentEpilogue, EpilogueSchedule, FusionOp>::CollectiveOp;
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -249,10 +267,18 @@ struct CutlassBmmKernelSm90 {
         typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGemm,
                                            {M, N, K, batch_size},
                                            {A, cute_stride_A, B, cute_stride_B},
-                                           {{}, D, cute_stride_D, D, cute_stride_D}};
+                                           {{}, nullptr, StrideC{}, D, cute_stride_D}};
 
         arguments.epilogue.thread.alpha = alpha;
-        arguments.epilogue.thread.beta = beta;
+        // beta multiplies the source matrix, and there is none (ElementC is
+        // void -- see the epilogue above).  Refuse rather than return
+        // alpha * A @ B^T under a caller's belief that D was accumulated into:
+        // that is the same arithmetic-changed-silently trap as the 3.x GEMM's
+        // `broadcast_c` check.
+        if (beta != 0.0f) {
+            return GemmStatus::NOT_SUPPORTED;
+        }
+        arguments.epilogue.thread.beta = 0.0f;
 
         Gemm gemm;
 
@@ -305,9 +331,15 @@ struct CutlassGroupGemmKernelSm90 {
     static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
     static constexpr int AlignmentEpilogue = 128 / cutlass::sizeof_bits<ElementCD>::value;
 
-    // Ptr-array schedule types for grouped GEMM (different from regular GEMM schedules)
-    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
-    using MainloopSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
+    // Ptr-array schedule types for grouped GEMM (different from regular GEMM
+    // schedules), and per-arch: the cooperative ptr-array schedule these used to
+    // name unconditionally exists only for SM90/SM120.  On SM100 it has no
+    // specialization, so the epilogue builder resolved to the primary template
+    // and failed with `has no member "CollectiveOp"` -- taking grouped GEMM, and
+    // therefore the whole JIT module, down on every Blackwell data-center part.
+    // The SM100 equivalents are KernelPtrArrayTmaWarpSpecialized{1,2}SmSm100.
+    using EpilogueSchedule = typename CutlassGemmConfig::GroupEpilogueSchedule;
+    using MainloopSchedule = typename CutlassGemmConfig::GroupMainloopSchedule;
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
     // Linear combination epilogue (no activation for group GEMM)
