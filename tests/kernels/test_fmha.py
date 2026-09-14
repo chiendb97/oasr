@@ -29,6 +29,25 @@ from oasr.cache import PagedKVCache
 from oasr.functionals.attention import fmha as _dense_fmha, fmha_varlen
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention
 
+
+def _require_cute_backend():
+    """Skip unless every import the CuteDSL FMHA backend pulls is available.
+
+    ``cutlass`` is the obvious one.  ``fmha_sm80`` *also* does
+    ``import cuda.bindings.driver`` at module scope, and ``pick_arch_cls``
+    imports ``fmha_sm80``, so a guard naming only ``cutlass`` leaves the second
+    import unguarded.  On the CPU CI image neither package is installed, which
+    hid the gap: the ``cutlass`` guard skipped first.  Two tests here imported
+    the backend module *before* reaching that guard and so reported
+    ``ModuleNotFoundError: No module named 'cuda'`` instead of skipping.
+
+    The rule this encodes: guard on what the import chain needs, not on the
+    package the test is about.
+    """
+    pytest.importorskip("cutlass")
+    pytest.importorskip("cuda.bindings.driver")
+
+
 # ---------------------------------------------------------------------------
 # Reference: a clean SDPA path that mirrors oasr.fmha_forward's contract.
 # Used to compare both backends against a single source of truth.
@@ -574,7 +593,7 @@ class TestRingDepthFitsSmem:
         hand-built dict here would have kept passing while sm_86 and sm_89 were
         silently served the A100-budgeted :class:`FmhaSm80`.
         """
-        pytest.importorskip("cutlass")
+        _require_cute_backend()
         from oasr.kernels.cute.attention.base import pick_arch_cls
 
         sm = int(arch_str.removeprefix("sm_"))
@@ -691,7 +710,7 @@ class TestEveryArchBudgetsItsOwnSmem:
 
     @staticmethod
     def _pick(cap):
-        pytest.importorskip("cutlass")
+        _require_cute_backend()
         from oasr.kernels.cute.attention.base import pick_arch_cls
 
         return pick_arch_cls(*cap)
@@ -789,6 +808,7 @@ class TestEveryArchBudgetsItsOwnSmem:
         carry the same 1 KB reserve. FMHA did not, so a tile landing in that
         last kilobyte would have been approved and then failed.
         """
+        _require_cute_backend()
         from oasr.kernels.cute.attention.fmha_sm80 import _DRIVER_SMEM_RESERVE
 
         assert _DRIVER_SMEM_RESERVE > 0
@@ -805,6 +825,7 @@ class TestEveryArchBudgetsItsOwnSmem:
         and forgetting the other is exactly the shape of this bug, so the second
         is now a function of the first and cannot disagree with it.
         """
+        _require_cute_backend()
         from oasr.kernels.cute.attention.fmha_sm80 import FmhaSm80
 
         base = FmhaSm80._smem_arch_str.__func__

@@ -358,20 +358,20 @@ class TestCutlass2xArchTagIsInstantiable:
         looked buildable.
         """
         import re
+        from pathlib import Path
 
-        from helpers import REPO_ROOT
+        import assets
 
-        header = (
-            REPO_ROOT
-            / "3rdparty"
-            / "cutlass"
-            / "include"
-            / "cutlass"
-            / "gemm"
-            / "device"
-            / "default_gemm_configuration.h"
+        # Gated, not asserted.  The submodule is a build prerequisite, not a
+        # checkout one -- ``test-cpu.yml`` deliberately initialises no
+        # submodules because it compiles nothing -- so a hard assert turned the
+        # one job this test was written for red.  Going through the registry
+        # makes the skip *counted*: it shows up in the end-of-run ``external
+        # assets:`` table, and ``--strict-assets`` (which both GPU workflows
+        # pass, and where the submodule is really present) still fails on it.
+        header = Path(assets.require("CUTLASS_DIR")) / (
+            "include/cutlass/gemm/device/default_gemm_configuration.h"
         )
-        assert header.is_file(), f"CUTLASS submodule missing: {header}"
         pattern = re.compile(
             r"struct\s+DefaultGemmConfiguration<\s*"
             r"arch::OpClassTensorOp\s*,\s*arch::(Sm\d+)\s*,\s*"

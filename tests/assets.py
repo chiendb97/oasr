@@ -183,6 +183,18 @@ _ASSET_LIST: List[Asset] = [
         how="a k2 HLG.pt, or a prebuilt .img",
     ),
     Asset(
+        env="CUTLASS_DIR",
+        kind=REFERENCE,
+        what="the vendored CUTLASS headers (the 3rdparty/cutlass submodule)",
+        # Not machine-specific and not fetched: it is a submodule of this repo,
+        # so the default is the checkout itself and the env var exists only to
+        # point at one held elsewhere (ci/modal_app.py symlinks /opt/cutlass
+        # into that slot rather than setting it).
+        default=str(Path(__file__).resolve().parents[1] / "3rdparty" / "cutlass"),
+        marker="include/cutlass/gemm/device/default_gemm_configuration.h",
+        how="git submodule update --init",
+    ),
+    Asset(
         env="WENET_REF_DIR",
         kind=REFERENCE,
         what="upstream WeNet v2.0.1 decoder sources (transformer decoder oracle)",
