@@ -315,3 +315,142 @@ class TestTileSpaceIsBuildable:
             and (choice.kSmVersion != 120 or choice.compile_name not in built)
         ]
         assert not orphans, f"rules naming a config SM120 never compiles: {orphans}"
+
+
+# ---------------------------------------------------------------------------
+# The CUTLASS 2.x architecture tag, and the trait coverage that bounds it
+# ---------------------------------------------------------------------------
+
+
+class TestCutlass2xArchTagIsInstantiable:
+    """A JIT target must name a CUTLASS tag that CUTLASS can build for half.
+
+    ``device::Gemm`` / ``device::GemmUniversal`` default their ``Operator_``
+    parameter from ``device::DefaultGemmConfiguration<OpClassTensorOp, ArchTag,
+    ElementA, ElementB, ElementC, ElementAccumulator>``, and CUTLASS specialises
+    that trait for *generic* element types at three tags only: Sm70, Sm75, Sm80.
+    ``Sm86`` has none; ``Sm89``'s are FP8-only.  Naming either for fp16/bf16
+    selects the undefined primary template, so every rendered TU in the gemm,
+    bmm, group_gemm and gemm_log_softmax modules fails with 67 "incomplete type"
+    errors — i.e. **no OASR GEMM builds at all** on A10 / A40 / L4 / L40S /
+    RTX 4090.  Conv2D and the recurrent family were unaffected and green, which
+    is why nothing else caught it.
+
+    Nothing here restates the allowed set: it is parsed back out of the vendored
+    CUTLASS headers, so a submodule bump that adds (or drops) a tag moves this
+    test with it rather than leaving a stale constant behind.
+
+    CPU-only and arch-independent, like the tile-space tests above — the whole
+    point is to hold the line for targets that are not in the box.
+    """
+
+    #: The 2.x lane.  SM90/SM100 use the 3.x CollectiveBuilder, whose arch tags
+    #: are a different constraint entirely, so they are out of scope here.
+    CUTLASS_2X_TARGETS = (75, 80, 86, 89, 120)
+
+    @staticmethod
+    def _generic_tensorop_tags():
+        """Arch tags with a generic-element ``DefaultGemmConfiguration``.
+
+        "Generic" is the point: a specialisation written against concrete types
+        (``float_e4m3_t``, ``int8_t``, ``double``) does not answer for half, and
+        ``Sm89`` has four of those and nothing else — which is exactly how it
+        looked buildable.
+        """
+        import re
+
+        from helpers import REPO_ROOT
+
+        header = (
+            REPO_ROOT
+            / "3rdparty"
+            / "cutlass"
+            / "include"
+            / "cutlass"
+            / "gemm"
+            / "device"
+            / "default_gemm_configuration.h"
+        )
+        assert header.is_file(), f"CUTLASS submodule missing: {header}"
+        pattern = re.compile(
+            r"struct\s+DefaultGemmConfiguration<\s*"
+            r"arch::OpClassTensorOp\s*,\s*arch::(Sm\d+)\s*,\s*"
+            r"ElementA\s*,\s*ElementB\s*,",
+            re.MULTILINE,
+        )
+        tags = set(pattern.findall(header.read_text()))
+        assert tags, "the DefaultGemmConfiguration parse found nothing; CUTLASS moved"
+        return tags
+
+    @staticmethod
+    def _declared_arch_tags():
+        """``sm -> "SmNN"`` as ``CutlassArch`` declares it, parsed from the header.
+
+        Read from the source rather than instantiated, because the mapping is a
+        C++ type alias with no Python surface — and because a *missing*
+        specialisation has to be visible as a missing key, not as an exception.
+        """
+        import re
+
+        from helpers import REPO_ROOT
+
+        header = REPO_ROOT / "include" / "oasr" / "gemm" / "cutlass_gemm_configs.h"
+        pattern = re.compile(
+            r"struct\s+CutlassArch<(\d+)>\s*\{\s*using\s+Type\s*=\s*cutlass::arch::(Sm\d+)\s*;",
+            re.MULTILINE,
+        )
+        return {int(sm): tag for sm, tag in pattern.findall(header.read_text())}
+
+    def test_cutlass_specialises_the_trait_for_sm80_and_not_for_sm86_or_sm89(self):
+        """The fact the mapping rests on, asserted against CUTLASS itself.
+
+        If a CUTLASS bump ever adds half support for Sm86/Sm89, this fails and
+        the collapse below becomes a choice rather than a requirement.
+        """
+        tags = self._generic_tensorop_tags()
+        assert "Sm80" in tags, "Sm80 lost its generic tensor-op configuration"
+        assert "Sm86" not in tags
+        assert "Sm89" not in tags
+
+    def test_every_2x_target_names_a_buildable_tag(self):
+        """The join: declared tag ∈ what CUTLASS can actually instantiate."""
+        buildable = self._generic_tensorop_tags()
+        declared = self._declared_arch_tags()
+        for sm in self.CUTLASS_2X_TARGETS:
+            assert sm in declared, f"sm{sm} is a JIT target with no CutlassArch specialisation"
+            assert declared[sm] in buildable, (
+                f"CutlassArch<{sm}>::Type is cutlass::arch::{declared[sm]}, which has no "
+                f"generic DefaultGemmConfiguration — every gemm/bmm/group_gemm TU for sm{sm} "
+                f"fails to compile. Buildable tags: {sorted(buildable)}"
+            )
+
+    def test_ampere_and_later_collapse_onto_sm80(self):
+        """Stated as a unit so the intent survives the join above.
+
+        Keeps its meaning if CUTLASS ever grows a *non-half* Sm86 tag: the
+        collapse is deliberate, not merely whatever happens to pass.
+        """
+        declared = self._declared_arch_tags()
+        for sm in (80, 86, 89, 120):
+            assert (
+                declared[sm] == "Sm80"
+            ), f"CutlassArch<{sm}> should map to Sm80, got {declared[sm]}"
+        assert declared[75] == "Sm75", "Turing has its own m16n8k8 composition"
+
+    def test_the_collapse_does_not_merge_the_tile_spaces(self):
+        """Each target keeps its own smem budget, config space and cache key.
+
+        The tag is the only thing that collapses.  If ``compile_name`` ever
+        dropped the ``smNN`` prefix, two architectures would share one autotune
+        cache entry and one JIT hash directory.
+        """
+        from oasr.jit.gemm import _SM_MAX_SMEM_BYTES, get_unique_compile_configs
+
+        assert _SM_MAX_SMEM_BYTES[80] != _SM_MAX_SMEM_BYTES[86], "sm_86 took A100's smem budget"
+        for sm in (80, 86, 89, 120):
+            names = get_unique_compile_configs(sm)
+            assert names, f"sm{sm} produced an empty config space"
+            assert all(
+                n.startswith(f"sm{sm}_") for n in names
+            ), f"sm{sm} config names are not arch-keyed"
+        assert set(get_unique_compile_configs(86)) != set(get_unique_compile_configs(80))
