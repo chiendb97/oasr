@@ -475,24 +475,198 @@ _GEMM_TILES: List[TileShape] = TileShapeConfigs + GemmExtraTileConfigs
 _SPLIT_K_LIST = [1, 2, 4, 8, 16]
 
 
+# =============================================================================
+# K-decompositions for the CUTLASS 2.x lane (sm_75 / 80 / 86 / 89 / 120)
+#
+# These lived below, among the Quack-style SM90+ builders, which is where the
+# sm_120-only reachability came from: they read as an SM120 detail because they
+# were filed as one.  They belong to the 2.x lane, so they sit in it.
+# =============================================================================
+
+# Stream-K variants are part of the autotune candidate space by default, so
+# ``oasr.autotune()`` can select them where they win — e.g. deep-K thin GEMMs, or
+# other models / GPUs where the data-parallel grid starves the SMs.  Set
+# OASR_GEMM_STREAMK=0 for a leaner production build (skips compiling them).
+#
+# The knob is sharper than it looks: ``_GEMM_HEURISTIC_RULES_SM120`` *does* name
+# Stream-K and parallel split-K configs — the sweep that produced the current
+# table found them winning on the deep-K thin shapes, which is not what the
+# earlier comment here said.  Turning either knob off therefore leaves a rule
+# pointing at a variant that was not compiled; ``_plan`` catches the resulting
+# ``AttributeError`` and degrades to GEMM_DEFAULT with one warning per shape, so
+# it is a slowdown rather than a failure — but it is not the no-op "they remain
+# tunable" implied.
+_STREAMK_ENABLED = os.environ.get("OASR_GEMM_STREAMK", "1") != "0"
+
+# Curated tile set for Stream-K variants.  Stream-K helps when there are too few
+# output tiles to fill the GPU (small M, N=256, large K), so we cover small
+# block_m tiles plus a couple of large tiles for the single-output-tile case.
+_STREAMK_TILES: List[TileShape] = [
+    TileShape(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=32, block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64),
+    TileShape(block_m=64, block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64),
+    TileShape(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=64, warp_k=64),
+    TileShape(block_m=128, block_n=256, block_k=64, warp_m=64, warp_n=64, warp_k=64),
+]
+
+
+def _build_streamk_configs(
+    sm: int, tiles: List[TileShape], stage_list: List[int], smem_limit: int
+) -> Dict[str, CutlassGemmConfig]:
+    """Build Stream-K GEMM configs (split_k=1; the swizzle balances K across SMs)."""
+    seen: Dict[str, CutlassGemmConfig] = {}
+    for tile in tiles:
+        for kStages in stage_list:
+            if not _tile_is_buildable(tile, kStages, smem_limit):
+                continue
+            cfg = CutlassGemmConfig(
+                block_m=tile.block_m,
+                block_n=tile.block_n,
+                block_k=tile.block_k,
+                warp_m=tile.warp_m,
+                warp_n=tile.warp_n,
+                warp_k=tile.warp_k,
+                kStages=kStages,
+                kSmVersion=sm,
+                split_k=1,
+                stream_k=True,
+            )
+            seen[cfg.name] = cfg
+    return seen
+
+
+# Parallel split-K (GemmSplitKParallel) variants: partials + reduction kernel,
+# epilogue applied once post-reduction — the only split-K decomposition that is
+# valid for fused activations.  Confined to the gemm family (like Stream-K).
+# Set OASR_GEMM_SPLITK_PARALLEL=0 to skip compiling these variants.
+_SPLITK_PARALLEL_ENABLED = os.environ.get("OASR_GEMM_SPLITK_PARALLEL", "1") != "0"
+
+# Curated tiles for parallel split-K: small block_m (the deep splits exist for
+# small-M shapes) across the thin-N and 128-wide column tiles.
+_SPLITK_PARALLEL_TILES: List[TileShape] = [
+    TileShape(block_m=16, block_n=64, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=32, block_n=64, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=64, block_n=64, block_k=64, warp_m=32, warp_n=32, warp_k=64),
+    TileShape(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64),
+    TileShape(block_m=32, block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64),
+]
+
+
+def _build_splitk_parallel_configs(
+    sm: int, tiles: List[TileShape], stage_list: List[int], smem_limit: int
+) -> Dict[str, CutlassGemmConfig]:
+    """Build parallel split-K GEMM configs (runtime split_k ∈ {2,4,8,16})."""
+    seen: Dict[str, CutlassGemmConfig] = {}
+    for tile in tiles:
+        for kStages in stage_list:
+            if not _tile_is_buildable(tile, kStages, smem_limit):
+                continue
+            for split_k in _SPLIT_K_LIST:
+                if split_k == 1:
+                    continue  # parallel split-K requires > 1 slices
+                cfg = CutlassGemmConfig(
+                    block_m=tile.block_m,
+                    block_n=tile.block_n,
+                    block_k=tile.block_k,
+                    warp_m=tile.warp_m,
+                    warp_n=tile.warp_n,
+                    warp_k=tile.warp_k,
+                    kStages=kStages,
+                    kSmVersion=sm,
+                    split_k=split_k,
+                    parallel_split_k=True,
+                )
+                seen[cfg.name] = cfg
+    return seen
+
+
+#: Pipeline depths the two K-decomposition families are built at, per SM family.
+#:
+#: They mirror each architecture's own base stage list — Stream-K keeps the
+#: single depth it has always been curated at, parallel split-K the arch's full
+#: list — with one entry that is a hardware fact rather than a preference:
+#: **Turing has no 3-stage tensor-op GEMM at all.**  Compiled here, `sm_75` at
+#: three or four stages fails identically to the plain path,
+#:
+#:     default_gemm_universal.h(214): error: incomplete type
+#:       "cutlass::gemm::kernel::DefaultGemmUniversal<...>"
+#:
+#: which is the same `kernel::DefaultGemm` 2-stage-only specialisation that makes
+#: `RecurrentArch<75>` set `kStages = 2`.  Measured for every (arch, depth, family)
+#: cell: 80/86/89/120 build at 2, 3 and 4; sm_75 builds at 2 and nothing else.
+#:
+#: A 2.x family with no entry raises `KeyError` at config-generation time, which
+#: is the intended failure: silently receiving no decompositions is how this
+#: became an sm_120-only feature in the first place.
+_SM_STREAMK_STAGES: Dict[int, List[int]] = {75: [2], 80: [3], 86: [3], 89: [3], 120: [3]}
+_SM_SPLITK_PARALLEL_STAGES: Dict[int, List[int]] = {
+    75: [2],
+    80: [3, 4],
+    86: [3],
+    89: [3],
+    120: [3, 4],
+}
+
+
+def _add_k_decompositions(
+    cfgs: Dict[str, CutlassGemmConfig], sm: int, smem_limit: int
+) -> Dict[str, CutlassGemmConfig]:
+    """Add the Stream-K and parallel split-K variants for *sm* to *cfgs*, and return it.
+
+    Both were reachable on SM120 alone until 2026-09-14 — the two ``if
+    _..._ENABLED`` blocks lived inside ``_get_sm120_configs`` — which made
+    ``OASR_GEMM_STREAMK`` and ``OASR_GEMM_SPLITK_PARALLEL`` inert on every other
+    card despite ``AGENTS.md`` documenting them as global build knobs, and left
+    ``oasr.autotune()`` with no Stream-K arm to find on an A100.  It also left
+    ``gemm_activation`` with no *valid* split-K anywhere but SM120: serial
+    split-K cannot fuse an activation (it would apply per K-partition), so
+    parallel split-K is the only decomposition that can, and it was not in the
+    space.
+
+    Each architecture's own ``smem_limit`` still decides which tiles survive, so
+    Turing keeps only the four Stream-K tiles that fit in 64 KB.
+    """
+    if _STREAMK_ENABLED:
+        cfgs.update(_build_streamk_configs(sm, _STREAMK_TILES, _SM_STREAMK_STAGES[sm], smem_limit))
+    if _SPLITK_PARALLEL_ENABLED:
+        cfgs.update(
+            _build_splitk_parallel_configs(
+                sm, _SPLITK_PARALLEL_TILES, _SM_SPLITK_PARALLEL_STAGES[sm], smem_limit
+            )
+        )
+    return cfgs
+
+
 def _get_sm75_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
-    """SM75 (Turing): kStages ∈ {2,3}, tiles from _GEMM_TILES."""
-    return _build_sm_lt90_configs(sm, _GEMM_TILES, [2, 3], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[75])
+    """SM75 (Turing): kStages ∈ {2,3}, tiles from _GEMM_TILES.
+
+    The ``[2, 3]`` is a live defect, not a description: Turing's
+    ``kernel::DefaultGemm`` tensor-op specialisation exists at two stages and no
+    other, so every ``_s3`` variant this emits fails to compile and takes the
+    whole module with it (audit A10 — untouched here, a different concern).  The
+    K-decompositions added below are deliberately *not* built at three stages for
+    exactly that reason, so this change adds no new broken TU to Turing.
+    """
+    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [2, 3], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[75])
+    return _add_k_decompositions(cfgs, sm, _SM_MAX_SMEM_BYTES[75])
 
 
 def _get_sm80_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
     """SM80 (Ampere A100): kStages ∈ {3,4}, tiles from _GEMM_TILES."""
-    return _build_sm_lt90_configs(sm, _GEMM_TILES, [3, 4], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[80])
+    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [3, 4], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[80])
+    return _add_k_decompositions(cfgs, sm, _SM_MAX_SMEM_BYTES[80])
 
 
 def _get_sm86_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
     """SM86 (Ampere RTX 30-series): kStages=3, tiles from _GEMM_TILES."""
-    return _build_sm_lt90_configs(sm, _GEMM_TILES, [3], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[86])
+    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [3], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[86])
+    return _add_k_decompositions(cfgs, sm, _SM_MAX_SMEM_BYTES[86])
 
 
 def _get_sm89_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
     """SM89 (Ada Lovelace): kStages=3, tiles from _GEMM_TILES."""
-    return _build_sm_lt90_configs(sm, _GEMM_TILES, [3], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[89])
+    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [3], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[89])
+    return _add_k_decompositions(cfgs, sm, _SM_MAX_SMEM_BYTES[89])
 
 
 # =============================================================================
@@ -648,97 +822,6 @@ def _get_sm100_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
     return seen
 
 
-# Stream-K variants are part of the autotune candidate space by default, so
-# ``oasr.autotune()`` can select them where they win — e.g. deep-K thin GEMMs, or
-# other models / GPUs where the data-parallel grid starves the SMs.  On the
-# captured ASR workload they narrow the data-parallel→cuBLAS gap but don't beat
-# cuBLAS (see scripts/tune_asr_gemm.py), so the production heuristic rules don't
-# reference them — but they remain tunable.  Set OASR_GEMM_STREAMK=0 for a leaner
-# production build that never autotunes (skips compiling the Stream-K kernels).
-_STREAMK_ENABLED = os.environ.get("OASR_GEMM_STREAMK", "1") != "0"
-
-# Curated tile set for Stream-K variants.  Stream-K helps when there are too few
-# output tiles to fill the GPU (small M, N=256, large K), so we cover small
-# block_m tiles plus a couple of large tiles for the single-output-tile case.
-_STREAMK_TILES: List[TileShape] = [
-    TileShape(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64),
-    TileShape(block_m=32, block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64),
-    TileShape(block_m=64, block_n=128, block_k=64, warp_m=32, warp_n=64, warp_k=64),
-    TileShape(block_m=128, block_n=128, block_k=64, warp_m=64, warp_n=64, warp_k=64),
-    TileShape(block_m=128, block_n=256, block_k=64, warp_m=64, warp_n=64, warp_k=64),
-]
-
-
-def _build_streamk_configs(
-    sm: int, tiles: List[TileShape], stage_list: List[int], smem_limit: int
-) -> Dict[str, CutlassGemmConfig]:
-    """Build Stream-K GEMM configs (split_k=1; the swizzle balances K across SMs)."""
-    seen: Dict[str, CutlassGemmConfig] = {}
-    for tile in tiles:
-        for kStages in stage_list:
-            if not _tile_is_buildable(tile, kStages, smem_limit):
-                continue
-            cfg = CutlassGemmConfig(
-                block_m=tile.block_m,
-                block_n=tile.block_n,
-                block_k=tile.block_k,
-                warp_m=tile.warp_m,
-                warp_n=tile.warp_n,
-                warp_k=tile.warp_k,
-                kStages=kStages,
-                kSmVersion=sm,
-                split_k=1,
-                stream_k=True,
-            )
-            seen[cfg.name] = cfg
-    return seen
-
-
-# Parallel split-K (GemmSplitKParallel) variants: partials + reduction kernel,
-# epilogue applied once post-reduction — the only split-K decomposition that is
-# valid for fused activations.  Confined to the gemm family (like Stream-K).
-# Set OASR_GEMM_SPLITK_PARALLEL=0 to skip compiling these variants.
-_SPLITK_PARALLEL_ENABLED = os.environ.get("OASR_GEMM_SPLITK_PARALLEL", "1") != "0"
-
-# Curated tiles for parallel split-K: small block_m (the deep splits exist for
-# small-M shapes) across the thin-N and 128-wide column tiles.
-_SPLITK_PARALLEL_TILES: List[TileShape] = [
-    TileShape(block_m=16, block_n=64, block_k=64, warp_m=16, warp_n=32, warp_k=64),
-    TileShape(block_m=32, block_n=64, block_k=64, warp_m=16, warp_n=32, warp_k=64),
-    TileShape(block_m=64, block_n=64, block_k=64, warp_m=32, warp_n=32, warp_k=64),
-    TileShape(block_m=16, block_n=128, block_k=64, warp_m=16, warp_n=32, warp_k=64),
-    TileShape(block_m=32, block_n=128, block_k=64, warp_m=32, warp_n=32, warp_k=64),
-]
-
-
-def _build_splitk_parallel_configs(
-    sm: int, tiles: List[TileShape], stage_list: List[int], smem_limit: int
-) -> Dict[str, CutlassGemmConfig]:
-    """Build parallel split-K GEMM configs (runtime split_k ∈ {2,4,8,16})."""
-    seen: Dict[str, CutlassGemmConfig] = {}
-    for tile in tiles:
-        for kStages in stage_list:
-            if not _tile_is_buildable(tile, kStages, smem_limit):
-                continue
-            for split_k in _SPLIT_K_LIST:
-                if split_k == 1:
-                    continue  # parallel split-K requires > 1 slices
-                cfg = CutlassGemmConfig(
-                    block_m=tile.block_m,
-                    block_n=tile.block_n,
-                    block_k=tile.block_k,
-                    warp_m=tile.warp_m,
-                    warp_n=tile.warp_n,
-                    warp_k=tile.warp_k,
-                    kStages=kStages,
-                    kSmVersion=sm,
-                    split_k=split_k,
-                    parallel_split_k=True,
-                )
-                seen[cfg.name] = cfg
-    return seen
-
-
 def _get_sm120_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
     """SM120 (GeForce Blackwell / RTX 50 series) configs.
 
@@ -751,15 +834,7 @@ def _get_sm120_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
     them to GEMM).
     """
     cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [3, 4], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[120])
-    if _STREAMK_ENABLED:
-        cfgs.update(_build_streamk_configs(sm, _STREAMK_TILES, [3], _SM_MAX_SMEM_BYTES[120]))
-    if _SPLITK_PARALLEL_ENABLED:
-        cfgs.update(
-            _build_splitk_parallel_configs(
-                sm, _SPLITK_PARALLEL_TILES, [3, 4], _SM_MAX_SMEM_BYTES[120]
-            )
-        )
-    return cfgs
+    return _add_k_decompositions(cfgs, sm, _SM_MAX_SMEM_BYTES[120])
 
 
 def get_all_autotune_configs(

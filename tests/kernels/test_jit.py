@@ -322,6 +322,124 @@ class TestTileSpaceIsBuildable:
 # ---------------------------------------------------------------------------
 
 
+#: The architectures served by the CUTLASS 2.x lane.  SM90 and SM100 take the 3.x
+#: collective builders, whose mainloop pipelines K itself.
+_SM_2X = (75, 80, 86, 89, 120)
+
+
+class TestKDecompositionsAreArchUniform:
+    """Stream-K and parallel split-K exist on every CUTLASS 2.x architecture.
+
+    Both were built inside ``_get_sm120_configs`` and nowhere else, so on an
+    A100, a T4, an L40S or an RTX 30-series card they were not in the config
+    space at all.  Three things followed, none of them visible from a passing
+    test run: ``oasr.autotune()`` had no Stream-K arm to find on a shape that
+    starves the data-parallel grid; ``OASR_GEMM_STREAMK`` and
+    ``OASR_GEMM_SPLITK_PARALLEL`` were inert despite ``AGENTS.md`` documenting
+    them as global build knobs; and ``gemm_activation`` had no *valid* split-K
+    anywhere but SM120, because serial split-K applies its epilogue per
+    K-partition and the registration refuses it for a fused activation.
+
+    Pure Python, so the CPU job holds this for every architecture rather than
+    for whichever card the runner happens to have.
+    """
+
+    def _space(self, sm):
+        from oasr.jit.gemm import get_unique_compile_configs
+
+        return get_unique_compile_configs(sm)
+
+    @pytest.mark.parametrize("sm", _SM_2X)
+    def test_every_2x_arch_gets_both_decompositions(self, sm):
+        configs = self._space(sm)
+        sk = [c for c in configs.values() if getattr(c, "stream_k", False)]
+        pk = [c for c in configs.values() if getattr(c, "parallel_split_k", False)]
+        assert sk, f"sm_{sm} has no Stream-K variant in its compile set"
+        assert pk, f"sm_{sm} has no parallel split-K variant in its compile set"
+
+    @pytest.mark.parametrize("sm", [90, 100])
+    def test_the_3x_arches_get_neither(self, sm):
+        """Not an oversight there: the 3.x collective mainloop pipelines K itself,
+        and the SM90+ template has no Stream-K path to render one into."""
+        configs = self._space(sm)
+        assert not [c for c in configs.values() if getattr(c, "stream_k", False)]
+        assert not [c for c in configs.values() if getattr(c, "parallel_split_k", False)]
+
+    def test_turing_builds_them_at_two_pipeline_stages_only(self):
+        """Measured, not assumed: sm_75 at three or four stages fails with
+        ``incomplete type "cutlass::gemm::kernel::DefaultGemmUniversal<...>"``,
+        the same 2-stage-only tensor-op specialisation that makes
+        ``RecurrentArch<75>`` set ``kStages = 2``.  80/86/89/120 build at 2, 3
+        and 4.  A uniform stage list would put unbuildable TUs into Turing's
+        space, and one of those fails the whole module."""
+        for cfg in self._space(75).values():
+            if getattr(cfg, "stream_k", False) or getattr(cfg, "parallel_split_k", False):
+                assert cfg.kStages == 2, (
+                    f"sm_75 {cfg.compile_name} is a {cfg.kStages}-stage decomposition; "
+                    f"Turing's kernel::DefaultGemm has no such specialisation"
+                )
+
+    def test_the_stage_tables_cover_exactly_the_2x_families(self):
+        """A family missing from either table raises ``KeyError`` when its config
+        space is generated — deliberately, because silently receiving no
+        decompositions is how this became SM120-only.  An extra key is dead data
+        that nothing will ever read."""
+        from oasr.jit.gemm import _SM_SPLITK_PARALLEL_STAGES, _SM_STREAMK_STAGES
+
+        assert set(_SM_STREAMK_STAGES) == set(_SM_2X)
+        assert set(_SM_SPLITK_PARALLEL_STAGES) == set(_SM_2X)
+
+    @pytest.mark.parametrize("sm", _SM_2X)
+    def test_gemm_activation_has_a_valid_split_k(self, sm):
+        """The consequence with teeth.
+
+        ``oasr/tune/backends/gemm.py`` skips a ``split_k > 1`` config for
+        ``gemm_activation`` unless it is the *parallel* decomposition, since
+        serial split-K would apply the activation to each K-partition's partial
+        sum.  With parallel split-K absent, the count of fused-activation
+        split-K candidates was exactly zero on four of the five 2.x arches.
+        """
+        from oasr.jit.gemm import get_all_autotune_configs
+
+        valid = [
+            c
+            for c in get_all_autotune_configs(sm).values()
+            if getattr(c, "split_k", 1) > 1 and getattr(c, "parallel_split_k", False)
+        ]
+        assert valid, (
+            f"sm_{sm} has no split-K candidate a fused-activation GEMM can use; "
+            f"serial split-K is refused for gemm_activation by construction"
+        )
+
+    @pytest.mark.parametrize("sm", _SM_2X)
+    def test_the_build_knobs_are_global(self, sm, monkeypatch):
+        """``OASR_GEMM_STREAMK=0`` / ``OASR_GEMM_SPLITK_PARALLEL=0`` must take
+        effect on every architecture, which is what ``AGENTS.md`` promises.  They
+        were read inside the SM120 branch, so on any other card they changed
+        nothing at all."""
+        from oasr.jit import gemm as jit_gemm
+
+        monkeypatch.setattr(jit_gemm, "_STREAMK_ENABLED", False)
+        monkeypatch.setattr(jit_gemm, "_SPLITK_PARALLEL_ENABLED", False)
+        configs = jit_gemm.get_unique_compile_configs(sm)
+        assert not [c for c in configs.values() if getattr(c, "stream_k", False)]
+        assert not [c for c in configs.values() if getattr(c, "parallel_split_k", False)]
+
+    def test_a_larger_smem_budget_never_yields_fewer_tiles(self):
+        """sm_80's 164 KB must admit at least what sm_86's 100 KB does.
+
+        A relationship rather than a magic count: it catches a transposed or
+        mistyped entry in the stage tables, which a fixed number would only
+        catch by accident.
+        """
+        from oasr.jit.gemm import _SM_MAX_SMEM_BYTES
+
+        assert _SM_MAX_SMEM_BYTES[80] > _SM_MAX_SMEM_BYTES[86]
+        sk80 = [c for c in self._space(80).values() if getattr(c, "stream_k", False)]
+        sk86 = [c for c in self._space(86).values() if getattr(c, "stream_k", False)]
+        assert len(sk80) >= len(sk86)
+
+
 class TestCutlass2xArchTagIsInstantiable:
     """A JIT target must name a CUTLASS tag that CUTLASS can build for half.
 
